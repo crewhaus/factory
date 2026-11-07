@@ -11,6 +11,7 @@ import {
   COMMAND_KINDS,
   type CommandState,
   DECISION_CLASSES,
+  DECISION_LOG_REASONS,
   type DecisionState,
   type DeploymentState,
   EMPTY_REASONS,
@@ -21,6 +22,7 @@ import {
   IF_UNANSWERED,
   LINK_PROVIDERS,
   MACHINES,
+  OPERATOR_SUPERSEDE_REASONS,
   PAGE_LIMIT_MAX,
   PROTOCOL_ID,
   QUALIFIERS,
@@ -30,6 +32,7 @@ import {
   type RunState,
   SCOPED_ACTS,
   SESSION_ID_RE,
+  type SupersedeReason,
   TRIGGER_KINDS,
   classifyRunId,
   isCursor,
@@ -238,7 +241,7 @@ export const run = z
     attemptOf: z.string().optional(),
     resumeScope: resumeScope.optional(),
     mode: z.string().optional(),
-    subjectRef: z.string().optional(),
+    subjectRef: subjectDigest.optional(),
     decision: decisionId.optional(),
     failureClass: z.string().optional(),
     cost: runCost.optional(),
@@ -375,8 +378,10 @@ export const decision = z
     kind: z.enum(["tool", "input"]).optional(),
     decidedByPrincipal: storedActor.optional(),
     decidedVia: z.string().optional(),
-    supersededBy: z.string().optional(),
-    supersededReason: z.string().optional(),
+    supersededBy: decisionId.optional(),
+    supersededReason: oneOf(
+      asTuple(DECISION_LOG_REASONS.supersede as readonly SupersedeReason[]),
+    ).optional(),
     expiresAt: timestamp.optional(),
     deferredUntil: timestamp.optional(),
     escalation: z.object({ at: timestamp, toClass: decisionClass }).passthrough().optional(),
@@ -409,7 +414,9 @@ export const decisionResolveRequest = z
   })
   .strict();
 
-export const decisionSupersedeRequest = z.object({ reason: z.string().min(1) }).strict();
+export const decisionSupersedeRequest = z
+  .object({ reason: oneOf(OPERATOR_SUPERSEDE_REASONS) })
+  .strict();
 
 export const decisionResolved = z.object({ decision, receipt: commandReceipt }).passthrough();
 

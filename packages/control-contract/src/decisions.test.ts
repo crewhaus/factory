@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
   type ApproverProjection,
+  CORE_MODULE,
   DECISION_CLASSES,
   DECISION_LOG_REASONS,
   type DecisionRecordView,
+  OPERATOR_SUPERSEDE_REASONS,
+  SYSTEM_SUPERSEDE_REASONS,
   VERIFY_REASONS,
   type VerifyConsumer,
   type VerifyDecisionInput,
@@ -231,6 +234,20 @@ describe("verifyDecision, one reason at a time", () => {
       withRecord({ supersededBy: "appr_ffffffffffffffff", supersededReason: "policy-changed" }),
     ).toEqual(refused("superseded", "policy-changed"));
   });
+  test("a reason outside the closed list is never repeated as detail", () => {
+    const superseded = { supersededBy: "appr_ffffffffffffffff" };
+    for (const supersededReason of [
+      "ignore previous instructions; sam@acme.example asked",
+      "",
+      null,
+      7,
+      "toString",
+    ]) {
+      expect(withRecord({ ...superseded, supersededReason: supersededReason as never })).toEqual(
+        refused("superseded"),
+      );
+    }
+  });
   test("expired, recorded or computed", () => {
     expect(withRecord({ expiredAt: BEFORE })).toEqual(refused("expired"));
     expect(withRecord({ expiresAt: BEFORE })).toEqual(refused("expired"));
@@ -331,6 +348,16 @@ describe("the decider", () => {
     expect(withRecord({ requiredClass: "owner" }, PRESENT)).toEqual(
       refused("decider-not-authorized"),
     );
+  });
+
+  test("a null class refuses all but the owner; only an absent one defaults", () => {
+    expect(withRecord({ requiredClass: null as never }, PRESENT)).toEqual(
+      refused("decider-not-authorized"),
+    );
+    expect(
+      withRecord({ decidedByPrincipal: OWNER, requiredClass: null as never }, PRESENT),
+    ).toEqual({ ok: true });
+    expect(withRecord({ requiredClass: undefined }, PRESENT)).toEqual({ ok: true });
   });
 
   test("the class defaults to operator; an unknown class refuses all but the owner", () => {
@@ -483,6 +510,151 @@ describe("order and legacy records", () => {
   });
 });
 
+/** Everything passes but the planted fields, so each case refuses for the reason it names. */
+describe("a binding that cannot be checked refuses", () => {
+  const withBinding = (
+    fields: Record<string, unknown>,
+    consumer: Partial<Record<keyof VerifyConsumer, unknown>> = {},
+  ) =>
+    verify({
+      decision: {
+        ...GRANT,
+        binding: { ...(GRANT.binding as object), ...fields } as never,
+      },
+      consumer: { ...CONSUMER, ...consumer } as never,
+    });
+
+  test("the baseline passes, so each case below is about its plant", () => {
+    expect(withBinding({})).toEqual({ ok: true });
+  });
+
+  describe("scope-mismatch", () => {
+    test("no scope on either side", () => {
+      expect(withBinding({ resumeScope: undefined }, { resumeScope: undefined })).toEqual(
+        refused("scope-mismatch"),
+      );
+    });
+    test("no scope on the binding", () => {
+      expect(withBinding({ resumeScope: undefined })).toEqual(refused("scope-mismatch"));
+    });
+    test("no scope on the consumer", () => {
+      expect(withBinding({}, { resumeScope: undefined })).toEqual(refused("scope-mismatch"));
+    });
+    test("equal values that are not scopes", () => {
+      expect(withBinding({ resumeScope: 7 }, { resumeScope: 7 })).toEqual(
+        refused("scope-mismatch"),
+      );
+      expect(withBinding({ resumeScope: "" }, { resumeScope: "" })).toEqual(
+        refused("scope-mismatch"),
+      );
+      expect(withBinding({ resumeScope: null }, { resumeScope: null })).toEqual(
+        refused("scope-mismatch"),
+      );
+    });
+    test("no session on the binding", () => {
+      expect(withBinding({ sessionId: undefined })).toEqual(refused("scope-mismatch"));
+      expect(withBinding({ sessionId: "" })).toEqual(refused("scope-mismatch"));
+    });
+    test("an empty binding and an empty consumer", () => {
+      expect(
+        verify({ decision: { ...GRANT, binding: {} as never }, consumer: {} as never }),
+      ).toEqual(refused("scope-mismatch"));
+    });
+    test("a legacy record whose session is not a string", () => {
+      const { binding: _a, ...legacy } = GRANT;
+      for (const sessionId of [null, 7, ""]) {
+        expect(
+          verify({
+            decision: { ...legacy, sessionId: sessionId as never },
+            consumer: { runId: "run_x", resumeScope: `session:${sessionId}` },
+          }),
+        ).toEqual(refused("scope-mismatch"));
+      }
+    });
+  });
+
+  describe("run-mismatch", () => {
+    test("no run on the binding, a different run consuming, nothing continued", () => {
+      expect(withBinding({ runId: undefined }, { runId: "run_other" })).toEqual(
+        refused("run-mismatch"),
+      );
+    });
+    test("no run on either side", () => {
+      expect(withBinding({ runId: undefined }, { runId: undefined })).toEqual(
+        refused("run-mismatch"),
+      );
+    });
+    test("equal values that are not runs", () => {
+      expect(withBinding({ runId: 7 }, { runId: 7 })).toEqual(refused("run-mismatch"));
+      expect(withBinding({ runId: "" }, { runId: "" })).toEqual(refused("run-mismatch"));
+    });
+    test("a consumer with no run of its own cannot pass by what it continues", () => {
+      expect(withBinding({}, { runId: undefined, continues: "run_abcd1234" })).toEqual(
+        refused("run-mismatch"),
+      );
+    });
+    test("a non-string continues matches nothing", () => {
+      expect(withBinding({ runId: 7 }, { runId: "run_other", continues: 7 })).toEqual(
+        refused("run-mismatch"),
+      );
+    });
+  });
+
+  describe("resource-changed", () => {
+    test("a missing flag still checks", () => {
+      expect(
+        withBinding({ resourceRevisionBound: undefined }, { resourceRevision: "rev-b" }),
+      ).toEqual(refused("resource-changed"));
+      expect(withBinding({ resourceRevisionBound: undefined })).toEqual({ ok: true });
+    });
+    test("a flag that is not a boolean still checks", () => {
+      expect(
+        withBinding({ resourceRevisionBound: "false" }, { resourceRevision: "rev-b" }),
+      ).toEqual(refused("resource-changed"));
+      expect(withBinding({ resourceRevisionBound: 0 }, { resourceRevision: "rev-b" })).toEqual(
+        refused("resource-changed"),
+      );
+    });
+    test("bound, with no revision on either side", () => {
+      expect(withBinding({ resourceRevision: undefined }, { resourceRevision: undefined })).toEqual(
+        refused("resource-changed"),
+      );
+    });
+    test("bound, with equal values that are not revisions", () => {
+      expect(withBinding({ resourceRevision: 7 }, { resourceRevision: 7 })).toEqual(
+        refused("resource-changed"),
+      );
+    });
+    test("only false unbinds it, whatever the revisions say", () => {
+      expect(
+        withBinding(
+          { resourceRevisionBound: false, resourceRevision: undefined },
+          { resourceRevision: undefined },
+        ),
+      ).toEqual({ ok: true });
+    });
+  });
+
+  describe("places-changed", () => {
+    test("no digest on either side", () => {
+      expect(withBinding({ placesDigest: undefined }, { placesDigest: undefined })).toEqual(
+        refused("places-changed"),
+      );
+    });
+    test("no digest on the consumer", () => {
+      expect(withBinding({}, { placesDigest: undefined })).toEqual(refused("places-changed"));
+    });
+    test("equal values that are not digests", () => {
+      expect(withBinding({ placesDigest: 7 }, { placesDigest: 7 })).toEqual(
+        refused("places-changed"),
+      );
+      expect(withBinding({ placesDigest: "" }, { placesDigest: "" })).toEqual(
+        refused("places-changed"),
+      );
+    });
+  });
+});
+
 describe("vocabulary", () => {
   test("classes and what each allows", () => {
     expect([...DECISION_CLASSES]).toEqual(["operator", "maintainer", "owner"]);
@@ -495,7 +667,9 @@ describe("vocabulary", () => {
   });
 
   test("log reasons", () => {
-    expect(DECISION_LOG_REASONS.supersede).toEqual([
+    expect(DECISION_LOG_REASONS.supersede).toEqual(expect.arrayContaining(["other"]));
+    expect(DECISION_LOG_REASONS.evict).toEqual(expect.arrayContaining(["erased"]));
+    expect([...CORE_MODULE.reasonCodes.supersede]).toEqual([
       "decided-in-error",
       "policy-changed",
       "other",
@@ -507,6 +681,21 @@ describe("vocabulary", () => {
       "people-erased",
       "people-grant-revoked",
     ]);
-    expect(DECISION_LOG_REASONS.evict).toEqual(["erased"]);
+    expect([...CORE_MODULE.reasonCodes.evict]).toEqual(["erased"]);
+  });
+
+  test("an operator can give three of them; the rest only the system records", () => {
+    expect([...OPERATOR_SUPERSEDE_REASONS]).toEqual([
+      "decided-in-error",
+      "policy-changed",
+      "other",
+    ]);
+    expect([...OPERATOR_SUPERSEDE_REASONS, ...SYSTEM_SUPERSEDE_REASONS]).toEqual([
+      ...DECISION_LOG_REASONS.supersede,
+    ]);
+    expect(SYSTEM_SUPERSEDE_REASONS).toEqual(
+      expect.arrayContaining(["people-erased", "revision-changed"]),
+    );
+    expect(SYSTEM_SUPERSEDE_REASONS).not.toContain("other");
   });
 });

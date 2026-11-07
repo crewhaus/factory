@@ -1,4 +1,6 @@
 /** One minimal valid value per schema id, built from the real minters. */
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
 import { type CommandReceipt, type Decision, encodeCursor, mintId, mintRunId } from "../index.js";
 
 export const HRN = "hrn_0123456789abcdef";
@@ -208,3 +210,18 @@ export const EXAMPLES: Readonly<Record<string, unknown>> = {
   tokenRow: TOKEN_ROW,
   trigger: { kind: "api" },
 };
+
+/** An area's examples live in its own `__test__/<area>.examples.ts`, exporting `EXAMPLES`. */
+const areaExamples: readonly { readonly EXAMPLES: Readonly<Record<string, unknown>> }[] =
+  await Promise.all(
+    readdirSync(import.meta.dir)
+      .filter((name) => name.endsWith(".examples.ts"))
+      .map((name) => import(join(import.meta.dir, name))),
+  );
+
+/** The core's examples and every area's. */
+export const ALL_EXAMPLES: Readonly<Record<string, unknown>> = Object.assign(
+  {},
+  EXAMPLES,
+  ...areaExamples.map((module) => module.EXAMPLES),
+);

@@ -169,14 +169,14 @@ export function unwrap(schema: z.ZodTypeAny): z.ZodTypeAny {
  */
 export function walkFieldNames(
   schema: z.ZodTypeAny,
-  visit: (name: string, path: string) => void,
+  visit: (name: string, path: string, field: z.ZodTypeAny) => void,
   path = "",
 ): void {
   const inner = unwrap(schema);
   if (inner instanceof z.ZodObject) {
     for (const [name, field] of Object.entries(inner.shape as Record<string, z.ZodTypeAny>)) {
       const here = path === "" ? name : `${path}.${name}`;
-      visit(name, here);
+      visit(name, here, field);
       walkFieldNames(field, visit, here);
     }
     return;
@@ -206,6 +206,43 @@ export function walkFieldNames(
     return;
   }
   throw new Error(`unhandled zod type at "${path}": ${inner.constructor.name}`);
+}
+
+/** A field that names a person or a principal, by its name. */
+const ACTOR_FIELD_RE = /^(?:by|actor|owner|to|principal|subjectRef)$|By$|ByPrincipal$|[a-z]To$/;
+
+/** Display text that carries no authority: the one name the walk lets through. */
+export const FREE_TEXT_ACTOR_FIELDS: readonly string[] = ["decidedBy"];
+
+export type ActorWalk = {
+  /** Fields, as `<schema>.<path>`, that accept a raw local actor. */
+  readonly holes: readonly string[];
+  /** The field names the walk looked at. */
+  readonly names: readonly string[];
+  /** The exempt names it met. */
+  readonly exempt: readonly string[];
+  readonly checked: number;
+};
+
+/** Walk every actor-named field and try a raw local actor on it. */
+export function walkActorFields(schemas: Readonly<Record<string, z.ZodTypeAny>>): ActorWalk {
+  const holes: string[] = [];
+  const names = new Set<string>();
+  const exempt = new Set<string>();
+  let checked = 0;
+  for (const [id, schema] of Object.entries(schemas)) {
+    walkFieldNames(schema, (name, path, field) => {
+      if (!ACTOR_FIELD_RE.test(name)) return;
+      if (FREE_TEXT_ACTOR_FIELDS.includes(name)) {
+        exempt.add(name);
+        return;
+      }
+      names.add(name);
+      checked++;
+      if (field.safeParse("local:sam@laptop").success) holes.push(`${id}.${path}`);
+    });
+  }
+  return { holes, names: [...names].sort(), exempt: [...exempt].sort(), checked };
 }
 
 function objectFields(schema: z.ZodTypeAny | undefined): readonly string[] {

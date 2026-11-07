@@ -1,8 +1,10 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { MODULES } from "./areas/index.js";
 import {
   APPROVAL_ID_PATTERN,
   APPROVAL_ID_RE,
   CANONICAL_RUN_ID_RE,
+  CORE_MODULE,
   EXECUTION_RUN_ID_RE,
   GRAPH_RUN_ID_RE,
   HARNESS_ID_RE,
@@ -172,7 +174,8 @@ describe("grammars", () => {
   });
 
   test("the declared grammars, pinned", () => {
-    expect(ID_GRAMMARS.map((g) => `${g.prefix}:${g.grammar}`)).toEqual([
+    expect(ID_GRAMMARS).toEqual(MODULES.flatMap((module) => module.grammars ?? []));
+    expect(CORE_MODULE.grammars.map((g) => `${g.prefix}:${g.grammar}`)).toEqual([
       "dep:ulid",
       "run:ulid",
       "dec:ulid",

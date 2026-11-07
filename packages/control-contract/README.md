@@ -53,15 +53,23 @@ the grammar alone cannot say which, so `classifyRunId` answers `hex16` and lists
 
 A feature area is static data: one `AreaModule` in `src/areas/<area>.ts`, with its operations, ref
 kinds, event families, state machines, command kinds and permissions. Every vocabulary this package
-exports is the union of `AREA_MODULES`, so it stays closed per build, and the tests walk the
-composition, so they cover a new area by construction.
+exports is the union of `AREA_MODULES`, so it stays closed per build. The tests walk the composition,
+so they cover a new area by construction. The literal pins read `CORE_MODULE`, so an area never edits
+one. `simulated-area.test.ts` adds an area this way to a copy of the package and runs its tests.
 
-1. Write the module, and its schemas in `src/schemas/<area>.ts`.
-2. Uncomment the area's two lines in `src/areas/index.ts` and its two in `src/schemas/areas.ts`.
+1. Write the module, `as const satisfies AreaModule`, and its schemas in `src/schemas/<area>.ts`,
+   exporting `<AREA>_SCHEMAS`.
+2. Add one minimal valid value per schema in `src/__test__/<area>.examples.ts`, exporting `EXAMPLES`,
+   and hold each schema to its type in `src/schemas/<area>.type-checks.ts`, with `Expect` and `Same`
+   from `./type-checks.js`. Both are found by their file names.
+3. Uncomment the area's two lines in `src/areas/index.ts` and its two in `src/schemas/areas.ts`.
    Touch nothing else there. Each placeholder sits between blank lines so two areas never conflict;
    `areas.test.ts` proves it with `git merge-file`.
-3. An area's state machines are `MACHINES` entries checked by `canTransition()`, never a separate
+4. An area's state machines are `MACHINES` entries checked by `canTransition()`, never a separate
    transition export. A `people.*` permission has floor `none`: no role implies it.
+
+`PATH_PARAMS`, `CLI_VERBS` and `TWIN_PLACEHOLDERS` are closed lists outside the modules. An area that
+needs a new path parameter or a new CLI verb adds it there, with its pin, on purpose.
 
 ## Field names survive the masker
 

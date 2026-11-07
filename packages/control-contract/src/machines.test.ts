@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { checkMachine } from "./__test__/checkers.js";
 import type { MachineDef } from "./areas/types.js";
-import { HARNESS_DISPLAY_STATES, MACHINES, canTransition } from "./index.js";
+import { CORE_MODULE, HARNESS_DISPLAY_STATES, MACHINES, canTransition } from "./index.js";
 
 const ENTRIES = Object.entries(MACHINES) as [string, MachineDef][];
 
@@ -74,6 +74,142 @@ describe("the checker sees a planted defect", () => {
     expect(checkMachine("m", { ...sound, transitions: { a: ["b"] } })).toEqual([
       "m: b has no transitions entry",
     ]);
+  });
+});
+
+/**
+ * The core's four machines, whole. A fold applies only legal moves, so a dropped edge
+ * turns real rows into anomalies and an added one makes an illegal move legal, and
+ * neither is something the soundness walk above can see.
+ */
+describe("the core's tables, literally", () => {
+  test("a run", () => {
+    expect(CORE_MODULE.machines.run).toEqual({
+      states: [
+        "queued",
+        "preparing",
+        "running",
+        "waiting-for-approval",
+        "waiting-for-input",
+        "paused",
+        "interrupted",
+        "succeeded",
+        "failed",
+        "cancelled",
+      ],
+      entry: ["queued", "running"],
+      terminal: ["interrupted", "succeeded", "failed", "cancelled"],
+      transitions: {
+        queued: ["preparing", "running", "paused", "cancelled"],
+        preparing: ["running", "failed", "cancelled", "interrupted"],
+        running: [
+          "waiting-for-approval",
+          "waiting-for-input",
+          "succeeded",
+          "failed",
+          "cancelled",
+          "interrupted",
+        ],
+        "waiting-for-approval": ["preparing", "running", "succeeded", "failed", "cancelled"],
+        "waiting-for-input": ["running", "cancelled", "failed"],
+        paused: ["queued", "cancelled"],
+        interrupted: [],
+        succeeded: [],
+        failed: [],
+        cancelled: [],
+      },
+      recoveryOwner: {
+        queued: "control-core",
+        preparing: "control-core",
+        running: "runtime",
+        "waiting-for-approval": "decision",
+        "waiting-for-input": "attention",
+        paused: "operator",
+        interrupted: "operator",
+        succeeded: "none",
+        failed: "none",
+        cancelled: "none",
+      },
+    } as never);
+  });
+
+  test("a command", () => {
+    expect(CORE_MODULE.machines.command).toEqual({
+      states: ["accepted", "running", "unknown", "succeeded", "failed", "rejected", "cancelled"],
+      entry: ["accepted"],
+      terminal: ["succeeded", "failed", "rejected", "cancelled"],
+      transitions: {
+        accepted: ["running", "succeeded", "failed", "unknown", "rejected", "cancelled"],
+        running: ["succeeded", "failed", "unknown"],
+        unknown: ["succeeded", "failed"],
+        succeeded: [],
+        failed: [],
+        rejected: [],
+        cancelled: [],
+      },
+      recoveryOwner: {
+        accepted: "control-core",
+        running: "control-core",
+        unknown: "reconcile",
+        succeeded: "none",
+        failed: "none",
+        rejected: "none",
+        cancelled: "none",
+      },
+    } as never);
+  });
+
+  test("a decision", () => {
+    expect(CORE_MODULE.machines.decision).toEqual({
+      states: ["pending", "granted", "denied", "consumed", "superseded", "expired"],
+      entry: ["pending"],
+      terminal: ["consumed", "superseded", "expired"],
+      transitions: {
+        pending: ["granted", "denied", "superseded", "expired"],
+        granted: ["consumed", "superseded", "expired"],
+        denied: ["superseded"],
+        consumed: [],
+        superseded: [],
+        expired: [],
+      },
+      recoveryOwner: {
+        pending: "operator",
+        granted: "runtime",
+        denied: "operator",
+        consumed: "none",
+        superseded: "none",
+        expired: "none",
+      },
+    } as never);
+  });
+
+  test("a deployment", () => {
+    expect(CORE_MODULE.machines.deployment).toEqual({
+      states: ["prepared", "active", "superseded", "disabled", "retired"],
+      entry: ["prepared"],
+      terminal: ["retired"],
+      transitions: {
+        prepared: ["active"],
+        active: ["superseded", "disabled"],
+        superseded: ["retired"],
+        disabled: ["active", "retired"],
+        retired: [],
+      },
+      recoveryOwner: {
+        prepared: "operator",
+        active: "operator",
+        superseded: "operator",
+        disabled: "operator",
+        retired: "none",
+      },
+    } as never);
+  });
+
+  test("the core has these four, and MACHINES holds them as they are", () => {
+    expect(Object.keys(CORE_MODULE.machines)).toEqual(["run", "command", "decision", "deployment"]);
+    for (const [name, machine] of Object.entries(CORE_MODULE.machines)) {
+      expect(MACHINES[name as keyof typeof MACHINES]).toBe(machine as never);
+    }
   });
 });
 

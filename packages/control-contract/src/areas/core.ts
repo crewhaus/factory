@@ -15,7 +15,18 @@ import { META_OPERATIONS } from "../operations/meta.js";
 import { RULE_OPERATIONS } from "../operations/rules.js";
 import { RUN_OPERATIONS } from "../operations/runs.js";
 import { TWINS } from "../operations/shared.js";
+import { deepFreeze } from "../util.js";
 import type { AreaModule } from "./types.js";
+
+/**
+ * The reasons an operator can give for superseding a decision. The rest of the
+ * `supersede` list is what the system records on its own, and no request can claim one.
+ */
+export const OPERATOR_SUPERSEDE_REASONS = deepFreeze([
+  "decided-in-error",
+  "policy-changed",
+  "other",
+] as const);
 
 const ULID = "ulid";
 const HEX16 = "hex16";
@@ -519,9 +530,7 @@ export const CORE_MODULE = {
   scopedActs: ["run.events.read", "run.result.read"],
   reasonCodes: {
     supersede: [
-      "decided-in-error",
-      "policy-changed",
-      "other",
+      ...OPERATOR_SUPERSEDE_REASONS,
       "revision-changed",
       "run-cancelled",
       "retired",

@@ -8,6 +8,9 @@
  * types are not compared here: the minimal examples the tests hold pin those.
  *
  * Requests with a default compare on `z.input`, the form a client sends.
+ *
+ * This file holds the core's schemas. An area holds its own to its types in
+ * `schemas/<area>.type-checks.ts`, with `Expect` and `Same` from here.
  */
 import type { z } from "zod";
 import type * as T from "../index.js";
@@ -27,9 +30,9 @@ type Norm<V> = V extends readonly (infer E)[]
       }
     : V;
 
-type Same<A, B> = Equals<Norm<A>, Norm<B>>;
+export type Same<A, B> = Equals<Norm<A>, Norm<B>>;
 
-type Expect<Check extends true> = Check;
+export type Expect<Check extends true> = Check;
 
 // @ts-expect-error The helper must refuse an extra field, or none of these checks bites.
 export type HelperBites = Expect<Same<{ a: string; extra: number }, { a: string }>>;

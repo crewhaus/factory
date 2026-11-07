@@ -34,12 +34,10 @@ describe("the main entry", () => {
       .filter((file) => /from "zod"/.test(readFileSync(file, "utf8")))
       .map((file) => relative(SRC, file))
       .sort();
-    expect(zodImporters).toEqual([
-      "schemas/areas.ts",
-      "schemas/core.ts",
-      "schemas/index.ts",
-      "schemas/type-checks.ts",
-    ]);
+    expect(zodImporters.filter((file) => !file.startsWith("schemas/"))).toEqual([]);
+    for (const file of ["schemas/areas.ts", "schemas/core.ts", "schemas/index.ts"]) {
+      expect(zodImporters).toContain(file);
+    }
     const manifest = JSON.parse(readFileSync(join(SRC, "..", "package.json"), "utf8"));
     expect(manifest.dependencies).toEqual({ zod: "^3.23.8" });
     expect(manifest.exports).toEqual({

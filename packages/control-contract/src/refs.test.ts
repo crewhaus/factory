@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { SEAL } from "./__test__/schema-examples.js";
+import { z } from "zod";
+import { FREE_TEXT_ACTOR_FIELDS, walkActorFields } from "./__test__/checkers.js";
+import { AT, EXAMPLES, SEAL } from "./__test__/schema-examples.js";
 import {
-  REF_KINDS,
+  CORE_MODULE,
   RUN_CAUSE_KINDS,
   TRIGGER_KINDS,
   classifyRunId,
@@ -18,6 +20,7 @@ import {
   parseResumeScope,
 } from "./index.js";
 import {
+  SCHEMAS,
   approverProjection,
   decision,
   link,
@@ -65,7 +68,7 @@ describe("refs", () => {
       expect(text).toBe(`${scope}/${kind}/${id}`);
       expect(parseRef(text)).toEqual({ scope, kind, id });
     }
-    expect(new Set(good.map(([, kind]) => kind)).size).toBe(REF_KINDS.length);
+    expect(new Set(good.map(([, kind]) => kind)).size).toBe(CORE_MODULE.refKinds.length);
   });
 
   const bad: readonly (readonly [string, unknown, string])[] = [
@@ -167,17 +170,118 @@ describe("actors", () => {
     expect(isStoredActor("free text")).toBe(false);
   });
 
-  test("record schemas refuse a raw local actor on every actor field", () => {
-    const base = { id: mintRunId(), state: "queued", trigger: { kind: "api" } };
-    expect(run.safeParse({ ...base, by: mintId("prn") }).success).toBe(true);
-    expect(run.safeParse({ ...base, by: "local:sam@laptop" }).success).toBe(false);
-    const record = { id: APPR, createdAt: "2026-01-01T00:00:00Z", state: "pending" };
-    expect(decision.safeParse({ ...record, decidedByPrincipal: `local:#${HEX64}` }).success).toBe(
-      true,
-    );
-    expect(decision.safeParse({ ...record, decidedByPrincipal: "local:sam@laptop" }).success).toBe(
-      false,
-    );
+  describe("every actor field of a record refuses a raw local actor", () => {
+    /** Schema id, the field's path, and the record with a value at that path. */
+    const ACTOR_FIELDS: readonly (readonly [string, string, (actor: string) => unknown])[] = [
+      ["run", "by", (by) => ({ ...(EXAMPLES["run"] as object), by })],
+      [
+        "decision",
+        "decidedByPrincipal",
+        (decidedByPrincipal) => ({ ...(EXAMPLES["decision"] as object), decidedByPrincipal }),
+      ],
+      [
+        "decision",
+        "assignedTo",
+        (assignedTo) => ({ ...(EXAMPLES["decision"] as object), assignedTo }),
+      ],
+      ["decisionOverlays", "assigned.to", (to) => ({ assigned: { to, at: AT } })],
+      [
+        "commandReceipt",
+        "actor",
+        (actor) => ({ ...(EXAMPLES["commandReceipt"] as object), actor }),
+      ],
+      ["grant", "grantedBy", (grantedBy) => ({ ...(EXAMPLES["grant"] as object), grantedBy })],
+      ["invite", "createdBy", (createdBy) => ({ ...(EXAMPLES["invite"] as object), createdBy })],
+      [
+        "standingRule",
+        "createdBy",
+        (createdBy) => ({ ...(EXAMPLES["standingRule"] as object), createdBy }),
+      ],
+      [
+        "deployment",
+        "activatedBy",
+        (activatedBy) => ({ ...(EXAMPLES["deployment"] as object), activatedBy }),
+      ],
+      ["eventEnvelope", "actor", (actor) => ({ ...(EXAMPLES["eventEnvelope"] as object), actor })],
+      [
+        "harnessOverview",
+        "owner",
+        (owner) => ({ ...(EXAMPLES["harnessOverview"] as object), owner }),
+      ],
+    ];
+
+    for (const [id, path, withActor] of ACTOR_FIELDS) {
+      test(`${id}.${path}`, () => {
+        const schema = SCHEMAS[id] as z.ZodTypeAny;
+        for (const good of [mintId("prn"), `local:#${HEX64}`, "sys:runtime"]) {
+          const parsed = schema.safeParse(withActor(good));
+          if (!parsed.success) throw new Error(`${good}: ${parsed.error.message}`);
+        }
+        const refused = schema.safeParse(withActor("local:sam@laptop"));
+        expect(refused.success).toBe(false);
+        expect(refused.error?.issues[0]?.path.join(".")).toBe(path);
+      });
+    }
+
+    test("the table is every one the core has", () => {
+      expect(ACTOR_FIELDS).toHaveLength(11);
+      expect(new Set(ACTOR_FIELDS.map(([id, path]) => `${id}.${path}`)).size).toBe(11);
+    });
+
+    test("and a walk of every schema finds no field that takes one", () => {
+      const walk = walkActorFields(SCHEMAS);
+      expect(walk.holes).toEqual([]);
+      for (const name of [
+        "activatedBy",
+        "actor",
+        "assignedTo",
+        "by",
+        "createdBy",
+        "decidedByPrincipal",
+        "grantedBy",
+        "owner",
+        "principal",
+        "subjectRef",
+        "supersededBy",
+        "to",
+      ]) {
+        expect(walk.names).toContain(name);
+      }
+      expect(walk.checked).toBeGreaterThanOrEqual(40);
+    });
+
+    test("decidedBy is the one exception: display text with no authority", () => {
+      expect(FREE_TEXT_ACTOR_FIELDS).toEqual(["decidedBy"]);
+      expect(walkActorFields(SCHEMAS).exempt).toEqual(["decidedBy"]);
+      const record = { ...(EXAMPLES["decision"] as object), decidedBy: "local:sam@laptop" };
+      expect(decision.safeParse(record).success).toBe(true);
+    });
+
+    test("the walk reports a planted plain string, at any depth", () => {
+      const planted = {
+        flat: z.object({ createdBy: z.string() }),
+        deep: z.object({ rows: z.array(z.object({ assignedTo: z.string().optional() })) }),
+        fine: z.object({ actor: z.string().regex(/^prn_/), note: z.string() }),
+      };
+      expect(walkActorFields(planted).holes).toEqual(["flat.createdBy", "deep.rows[].assignedTo"]);
+      expect(walkActorFields(planted).checked).toBe(3);
+    });
+  });
+
+  describe("a run row holds a subject only as a keyed digest", () => {
+    const base = EXAMPLES["run"] as object;
+
+    test("a digest passes", () => {
+      expect(run.safeParse({ ...base, subjectRef: HEX64 }).success).toBe(true);
+    });
+
+    for (const subject of ["local:max@laptop", "slack:T1:U1", "github:12345", "max@acme.example"]) {
+      test(`refused: ${subject}`, () => {
+        const refused = run.safeParse({ ...base, subjectRef: subject });
+        expect(refused.success).toBe(false);
+        expect(refused.error?.issues[0]?.path).toEqual(["subjectRef"]);
+      });
+    }
   });
 
   test("schemas refuse a raw local link", () => {

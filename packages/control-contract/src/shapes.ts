@@ -21,7 +21,7 @@ import type {
 } from "./areas/types.js";
 import type { CapabilityDescriptor } from "./capabilities.js";
 import type { CommandReceipt } from "./commands.js";
-import type { DecisionRecordView, IfUnanswered } from "./decisions.js";
+import type { DecisionRecordView, IfUnanswered, OperatorSupersedeReason } from "./decisions.js";
 import type { ListEnvelope } from "./lists.js";
 import type { DecisionState, DeploymentState, HarnessDisplay, RunState } from "./machines.js";
 import type { Permission } from "./permissions.js";
@@ -95,8 +95,9 @@ export type DecisionResolveRequest = {
   readonly note?: string;
 };
 
+/** A code an operator may give, from a closed list. The system's own reasons are not among them. */
 export type DecisionSupersedeRequest = {
-  readonly reason: string;
+  readonly reason: OperatorSupersedeReason;
 };
 
 export type RuleCreateRequest = {
@@ -194,6 +195,7 @@ export type Run = {
   readonly attemptOf?: string;
   readonly resumeScope?: string;
   readonly mode?: string;
+  /** A keyed digest of the subject: a run row is append-only and never holds the person. */
   readonly subjectRef?: string;
   readonly decision?: string;
   readonly failureClass?: string;

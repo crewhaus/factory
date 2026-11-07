@@ -3,24 +3,28 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkModules } from "../__test__/checkers.js";
+import {
+  SEED_AREAS,
+  type SeedSuffix,
+  allCommented,
+  seedLines,
+  uncomment,
+} from "../__test__/seed.js";
+import {
+  CAPABILITY_NAMES,
+  COMMAND_KINDS,
+  DECISION_LOG_REASONS,
+  EVENT_TYPES,
+  ID_GRAMMARS,
+  MACHINES,
+  OPERATIONS,
+  PERMISSIONS,
+  REF_KINDS,
+  SCOPED_ACTS,
+} from "../index.js";
 import { CORE_MODULE } from "./core.js";
 import { AREA_MODULES, MODULES } from "./index.js";
 import type { AreaModule } from "./types.js";
-
-const AREAS = [
-  "attention",
-  "compiler",
-  "creation",
-  "delegation",
-  "home",
-  "inspection",
-  "integrations",
-  "knowledge",
-  "people",
-  "quality",
-  "runtime",
-  "verification",
-] as const;
 
 const EMPTY: AreaModule = {
   area: "planted",
@@ -107,6 +111,28 @@ describe("the composition", () => {
     });
   }
 
+  test("every exported vocabulary is the union of the modules, the core's first", () => {
+    const families = MODULES.flatMap((m) => m.eventFamilies);
+    expect(OPERATIONS).toEqual(MODULES.flatMap((m) => m.operations));
+    expect([...REF_KINDS]).toEqual(MODULES.flatMap((m) => m.refKinds.map((d) => d.kind)) as never);
+    expect([...EVENT_TYPES]).toEqual(
+      families.flatMap((family) => family.types.map((row) => row.type)) as never,
+    );
+    expect(Object.keys(MACHINES)).toEqual(MODULES.flatMap((m) => Object.keys(m.machines)));
+    expect(Object.keys(COMMAND_KINDS)).toEqual(
+      MODULES.flatMap((m) => m.commandKinds.map((kind) => kind.id)),
+    );
+    expect([...PERMISSIONS]).toEqual(
+      MODULES.flatMap((m) => m.permissions.map((d) => d.id)) as never,
+    );
+    expect([...SCOPED_ACTS]).toEqual(MODULES.flatMap((m) => m.scopedActs ?? []) as never);
+    expect([...CAPABILITY_NAMES]).toEqual(MODULES.flatMap((m) => m.capabilityKeys ?? []) as never);
+    expect([...ID_GRAMMARS]).toEqual(MODULES.flatMap((m) => m.grammars ?? []));
+    expect([...DECISION_LOG_REASONS.supersede]).toEqual(
+      MODULES.flatMap((m) => m.reasonCodes?.["supersede"] ?? []),
+    );
+  });
+
   test("a people permission with a role is reported, and without one is not", () => {
     const decl = { id: "people.read", scope: "home", service: "never" } as const;
     expect(withPlanted({ permissions: [{ ...decl, floor: "viewer" }] })).toEqual([
@@ -132,52 +158,47 @@ function mergesClean(base: string, ours: string, theirs: string, name: string): 
 describe.each([
   ["areas/index.ts", join(import.meta.dir, "index.ts"), "MODULE"],
   ["schemas/areas.ts", join(import.meta.dir, "..", "schemas", "areas.ts"), "SCHEMAS"],
-] as const)("the seed in %s", (name, file, suffix) => {
+] as const)("the seed in %s", (_name, file, suffix: SeedSuffix) => {
   const source = readFileSync(file, "utf8");
   const lines = source.split("\n");
-  const importLine = (area: string) =>
-    `// import { ${area.toUpperCase()}_${suffix} } from "./${area}.js";`;
-  const entryLine = (area: string) => `  // ${area.toUpperCase()}_${suffix},`;
 
-  test("holds one placeholder per area in each block, each between blank lines", () => {
-    expect(AREAS).toHaveLength(12);
-    for (const area of AREAS) {
-      for (const line of [importLine(area), entryLine(area)]) {
-        const at = lines.indexOf(line);
-        expect(`${line} at ${at > -1}`).toBe(`${line} at true`);
-        expect(lines.lastIndexOf(line)).toBe(at);
+  test("holds one line per area in each block, commented or not, between blank lines", () => {
+    expect(SEED_AREAS).toHaveLength(12);
+    for (const area of SEED_AREAS) {
+      const { importLine, entryLine } = seedLines(area, suffix);
+      for (const { commented, live } of [importLine, entryLine]) {
+        const hits = lines.flatMap((line, at) => (line === commented || line === live ? [at] : []));
+        expect(`${commented}: ${hits.length}`).toBe(`${commented}: 1`);
+        const at = hits[0] as number;
         expect(lines[at - 1]).toBe("");
         // The last entry closes the array instead of opening a blank line.
-        if (area !== "verification" || line === importLine(area)) expect(lines[at + 1]).toBe("");
+        if (area !== "verification" || commented === importLine.commented) {
+          expect(lines[at + 1]).toBe("");
+        }
       }
     }
   });
 
+  /** The merge cases run on the seed with nothing landed, so they outlast every area's landing. */
+  const seed = allCommented(source, suffix);
+
   test("two areas uncommenting neighbouring lines merge clean", () => {
-    const edit = (area: string, base: string) =>
-      base
-        .replace(importLine(area), importLine(area).replace("// ", ""))
-        .replace(entryLine(area), entryLine(area).replace("// ", ""));
     const merged = mergesClean(
-      source,
-      edit("attention", source),
-      edit("compiler", source),
+      seed,
+      uncomment(seed, "attention", suffix),
+      uncomment(seed, "compiler", suffix),
       `clean-${suffix}`,
     );
     expect(merged).toBe(true);
   });
 
   test("and conflict without the blank lines, which is why they are there", () => {
-    const tight = source.replace(/(\/\/ [^\n]+\n)\n(?=\s*\/\/ )/g, "$1");
-    expect(tight).not.toBe(source);
-    const edit = (area: string, base: string) =>
-      base
-        .replace(importLine(area), importLine(area).replace("// ", ""))
-        .replace(entryLine(area), entryLine(area).replace("// ", ""));
+    const tight = seed.replace(/(\/\/ [^\n]+\n)\n(?=\s*\/\/ )/g, "$1");
+    expect(tight).not.toBe(seed);
     const merged = mergesClean(
       tight,
-      edit("attention", tight),
-      edit("compiler", tight),
+      uncomment(tight, "attention", suffix),
+      uncomment(tight, "compiler", suffix),
       `tight-${suffix}`,
     );
     expect(merged).toBe(false);

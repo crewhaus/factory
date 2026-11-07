@@ -29,6 +29,480 @@ const ENV: OperationEnv = {
 const byId = new Map(OPERATIONS.map((op) => [op.id, op]));
 const row = (id: string) => byId.get(id) as OperationRow;
 
+/** The core's own rows. Pins read these, so an area's rows never disturb them. */
+const CORE: readonly OperationRow[] = CORE_MODULE.operations;
+const coreRow = (id: string) => CORE.find((op) => op.id === id) as OperationRow;
+
+/** Every core row: id, method, path, permission, receipt, request, response. */
+const CORE_ROWS = [
+  ["meta.discover", "GET", "/api/v1", "public", "none", "noBody", "discovery"],
+  ["me.get", "GET", "/api/v1/me", "authenticated", "none", "noBody", "me"],
+  ["refs.resolve", "GET", "/api/v1/refs/{ref}", "authenticated", "none", "noBody", "refResolved"],
+  ["harnesses.list", "GET", "/api/v1/harnesses", "home.read", "none", "listQuery", "harnessList"],
+  ["harnesses.get", "GET", "/api/v1/harnesses/{h}", "h.read", "none", "noBody", "harnessOverview"],
+  [
+    "harnesses.capabilities",
+    "GET",
+    "/api/v1/harnesses/{h}/capabilities",
+    "h.read",
+    "none",
+    "noBody",
+    "harnessCapabilities",
+  ],
+  [
+    "harnesses.health",
+    "GET",
+    "/api/v1/harnesses/{h}/health",
+    "h.read",
+    "none",
+    "noBody",
+    "harnessHealth",
+  ],
+  [
+    "deployments.list",
+    "GET",
+    "/api/v1/harnesses/{h}/deployments",
+    "h.read",
+    "none",
+    "listQuery",
+    "deploymentList",
+  ],
+  [
+    "deployments.get",
+    "GET",
+    "/api/v1/harnesses/{h}/deployments/{dep}",
+    "h.read",
+    "none",
+    "noBody",
+    "deployment",
+  ],
+  [
+    "deployments.activate",
+    "POST",
+    "/api/v1/harnesses/{h}/deployments",
+    "h.deploy",
+    "harness",
+    "deploymentActivateRequest",
+    "commandAccepted",
+  ],
+  [
+    "controls.pause",
+    "POST",
+    "/api/v1/harnesses/{h}/controls/pause",
+    "h.control",
+    "harness",
+    "pauseRequest",
+    "commandAccepted",
+  ],
+  [
+    "controls.resume",
+    "POST",
+    "/api/v1/harnesses/{h}/controls/resume",
+    "h.control",
+    "harness",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "controls.drain",
+    "POST",
+    "/api/v1/harnesses/{h}/controls/drain",
+    "h.control",
+    "harness",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "controls.stop",
+    "POST",
+    "/api/v1/harnesses/{h}/controls/stop",
+    "h.control",
+    "harness",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "controls.start",
+    "POST",
+    "/api/v1/harnesses/{h}/controls/start",
+    "h.control",
+    "harness",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "controls.restart",
+    "POST",
+    "/api/v1/harnesses/{h}/controls/restart",
+    "h.control",
+    "harness",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "controls.disable",
+    "POST",
+    "/api/v1/harnesses/{h}/controls/disable",
+    "h.deploy",
+    "harness",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "controls.enable",
+    "POST",
+    "/api/v1/harnesses/{h}/controls/enable",
+    "h.deploy",
+    "harness",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "controls.retire",
+    "POST",
+    "/api/v1/harnesses/{h}/controls/retire",
+    "h.retire",
+    "harness",
+    "retireRequest",
+    "retireResponse",
+  ],
+  ["runs.list", "GET", "/api/v1/harnesses/{h}/runs", "h.read", "none", "listQuery", "runList"],
+  ["runs.get", "GET", "/api/v1/runs/{run}", "h.read", "none", "noBody", "run"],
+  [
+    "runs.create",
+    "POST",
+    "/api/v1/harnesses/{h}/runs",
+    "h.run.submit",
+    "harness",
+    "runCreateRequest",
+    "runCreated",
+  ],
+  [
+    "runs.cancel",
+    "POST",
+    "/api/v1/runs/{run}/cancel",
+    "h.control",
+    "harness",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "runs.resume",
+    "POST",
+    "/api/v1/runs/{run}/resume",
+    "h.run.submit",
+    "harness",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "runs.result",
+    "GET",
+    "/api/v1/runs/{run}/result",
+    "h.read.content",
+    "none",
+    "noBody",
+    "runResult",
+  ],
+  [
+    "runs.events",
+    "GET",
+    "/api/v1/runs/{run}/events",
+    "h.read",
+    "none",
+    "streamQuery",
+    "eventFrame",
+  ],
+  ["decisions.list", "GET", "/api/v1/decisions", "home.read", "none", "listQuery", "decisionList"],
+  ["decisions.get", "GET", "/api/v1/decisions/{ref}", "h.read", "none", "noBody", "decision"],
+  [
+    "decisions.resolve",
+    "POST",
+    "/api/v1/decisions/{ref}/resolve",
+    "h.decision.resolve",
+    "harness",
+    "decisionResolveRequest",
+    "decisionResolved",
+  ],
+  [
+    "decisions.supersede",
+    "POST",
+    "/api/v1/decisions/{ref}/supersede",
+    "h.decision.resolve",
+    "harness",
+    "decisionSupersedeRequest",
+    "decisionResolved",
+  ],
+  [
+    "rules.list",
+    "GET",
+    "/api/v1/harnesses/{h}/standing-rules",
+    "h.read",
+    "none",
+    "listQuery",
+    "ruleList",
+  ],
+  [
+    "rules.create",
+    "POST",
+    "/api/v1/harnesses/{h}/standing-rules",
+    "h.standing-rule.manage",
+    "harness",
+    "ruleCreateRequest",
+    "commandAccepted",
+  ],
+  [
+    "rules.revoke",
+    "POST",
+    "/api/v1/harnesses/{h}/standing-rules/{rule}/revoke",
+    "h.standing-rule.manage",
+    "harness",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  ["commands.get", "GET", "/api/v1/commands/{cmd}", "h.read", "none", "noBody", "commandReceipt"],
+  [
+    "commands.list",
+    "GET",
+    "/api/v1/harnesses/{h}/commands",
+    "h.read",
+    "none",
+    "listQuery",
+    "commandList",
+  ],
+  ["events.fleet", "GET", "/api/v1/events", "home.read", "none", "streamQuery", "eventFrame"],
+  [
+    "events.harness",
+    "GET",
+    "/api/v1/harnesses/{h}/events",
+    "h.read",
+    "none",
+    "streamQuery",
+    "eventFrame",
+  ],
+  [
+    "access.members.list",
+    "GET",
+    "/api/v1/access/members",
+    "home.access.manage",
+    "none",
+    "listQuery",
+    "memberList",
+  ],
+  [
+    "access.invites.list",
+    "GET",
+    "/api/v1/access/invites",
+    "home.access.manage",
+    "none",
+    "listQuery",
+    "inviteList",
+  ],
+  [
+    "access.grants.list",
+    "GET",
+    "/api/v1/access/grants",
+    "home.access.manage",
+    "none",
+    "listQuery",
+    "grantList",
+  ],
+  [
+    "access.tokens.list",
+    "GET",
+    "/api/v1/access/tokens",
+    "home.access.manage",
+    "none",
+    "listQuery",
+    "tokenList",
+  ],
+  [
+    "access.links.list",
+    "GET",
+    "/api/v1/access/links",
+    "home.access.manage",
+    "none",
+    "listQuery",
+    "linkList",
+  ],
+  [
+    "access.devices.list",
+    "GET",
+    "/api/v1/access/devices",
+    "home.access.manage",
+    "none",
+    "listQuery",
+    "deviceList",
+  ],
+  [
+    "access.invites.create",
+    "POST",
+    "/api/v1/access/invites",
+    "home.access.manage",
+    "workspace",
+    "inviteCreateRequest",
+    "inviteIssued",
+  ],
+  [
+    "access.grants.create",
+    "POST",
+    "/api/v1/access/grants",
+    "home.access.manage",
+    "workspace",
+    "grantCreateRequest",
+    "commandAccepted",
+  ],
+  [
+    "access.tokens.mint",
+    "POST",
+    "/api/v1/access/tokens",
+    "home.access.manage",
+    "workspace",
+    "tokenMintRequest",
+    "tokenIssued",
+  ],
+  [
+    "access.links.create",
+    "POST",
+    "/api/v1/access/links",
+    "home.access.manage",
+    "workspace",
+    "linkCreateRequest",
+    "commandAccepted",
+  ],
+  [
+    "access.invites.revoke",
+    "POST",
+    "/api/v1/access/invites/{inv}/revoke",
+    "home.access.manage",
+    "workspace",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "access.grants.revoke",
+    "POST",
+    "/api/v1/access/grants/{grt}/revoke",
+    "home.access.manage",
+    "workspace",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "access.tokens.revoke",
+    "POST",
+    "/api/v1/access/tokens/{crd}/revoke",
+    "home.access.manage",
+    "workspace",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "access.links.revoke",
+    "POST",
+    "/api/v1/access/links/{lnk}/revoke",
+    "home.access.manage",
+    "workspace",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "access.devices.revoke",
+    "POST",
+    "/api/v1/access/devices/{dev}/revoke",
+    "home.access.manage",
+    "workspace",
+    "emptyRequest",
+    "commandAccepted",
+  ],
+  [
+    "access.scopedTokens.mint",
+    "POST",
+    "/api/v1/access/scoped-tokens",
+    "authenticated",
+    "none",
+    "scopedTokenMintRequest",
+    "tokenIssued",
+  ],
+  ["auth.challenge", "GET", "/api/v1/auth/challenge", "public", "none", "noBody", "authChallenge"],
+  [
+    "auth.session",
+    "POST",
+    "/api/v1/auth/session",
+    "public",
+    "none",
+    "authSessionRequest",
+    "sessionIssued",
+  ],
+  [
+    "auth.exchange",
+    "POST",
+    "/api/v1/auth/exchange",
+    "public",
+    "none",
+    "authExchangeRequest",
+    "sessionIssued",
+  ],
+  [
+    "auth.acceptInvite",
+    "POST",
+    "/api/v1/auth/accept-invite",
+    "public",
+    "workspace",
+    "authAcceptInviteRequest",
+    "sessionIssued",
+  ],
+  [
+    "auth.refresh",
+    "POST",
+    "/api/v1/auth/refresh",
+    "authenticated",
+    "none",
+    "authRefreshRequest",
+    "sessionIssued",
+  ],
+  [
+    "auth.signOut",
+    "POST",
+    "/api/v1/auth/sign-out",
+    "authenticated",
+    "none",
+    "emptyRequest",
+    "signedOut",
+  ],
+] as const;
+
+/** What each core command kind needs, written apart from its row. */
+const CORE_KIND_PERMISSIONS = {
+  "deployments.activate": "h.deploy",
+  "controls.pause": "h.control",
+  "controls.resume": "h.control",
+  "controls.drain": "h.control",
+  "controls.stop": "h.control",
+  "controls.start": "h.control",
+  "controls.restart": "h.control",
+  "controls.disable": "h.deploy",
+  "controls.enable": "h.deploy",
+  "controls.retire": "h.retire",
+  "runs.create": "h.run.submit",
+  "runs.cancel": "h.control",
+  "runs.resume": "h.run.submit",
+  "decisions.resolve": "h.decision.resolve",
+  "decisions.supersede": "h.decision.resolve",
+  "rules.create": "h.standing-rule.manage",
+  "rules.revoke": "h.standing-rule.manage",
+  "access.invites.create": "home.access.manage",
+  "access.grants.create": "home.access.manage",
+  "access.tokens.mint": "home.access.manage",
+  "access.links.create": "home.access.manage",
+  "access.invites.revoke": "home.access.manage",
+  "access.grants.revoke": "home.access.manage",
+  "access.tokens.revoke": "home.access.manage",
+  "access.links.revoke": "home.access.manage",
+  "access.devices.revoke": "home.access.manage",
+  "auth.acceptInvite": "public",
+} as const;
+
 describe("the table holds together", () => {
   test("no rule is broken", () => {
     expect(checkOperations(OPERATIONS, ENV)).toEqual([]);
@@ -36,8 +510,8 @@ describe("the table holds together", () => {
   });
 
   test("the core has exactly 59 rows, and rollback is not one of them", () => {
-    expect(CORE_MODULE.operations).toHaveLength(59);
-    expect(byId.has("deployments.rollback")).toBe(false);
+    expect(CORE).toHaveLength(59);
+    expect(CORE.some((op) => op.id === "deployments.rollback")).toBe(false);
   });
 
   test("every twin verb and placeholder is used", () => {
@@ -211,6 +685,28 @@ describe("each rule sees its own planted defect", () => {
 });
 
 describe("rows, pinned", () => {
+  test("every core row, cell by cell", () => {
+    const actual = CORE.map((op) => [
+      op.id,
+      op.method,
+      op.path,
+      op.permission,
+      op.receipt,
+      op.request,
+      op.response,
+    ]);
+    expect(actual).toEqual(CORE_ROWS.map((cells) => [...cells]));
+    expect(actual).toHaveLength(59);
+  });
+
+  test("each core command kind's permission, written apart from its row", () => {
+    const actual = Object.fromEntries(
+      CORE_MODULE.commandKinds.map((kind) => [kind.id, kind.permission]),
+    );
+    expect(actual).toEqual(CORE_KIND_PERMISSIONS);
+    expect(Object.keys(actual)).toHaveLength(27);
+  });
+
   test("permissions where the cell is not a member", () => {
     const expected: Readonly<Record<string, string>> = {
       "meta.discover": "public",
@@ -227,9 +723,9 @@ describe("rows, pinned", () => {
       "auth.acceptInvite": "public",
     };
     for (const [id, permission] of Object.entries(expected)) {
-      expect(`${id} ${row(id).permission}`).toBe(`${id} ${permission}`);
+      expect(`${id} ${coreRow(id).permission}`).toBe(`${id} ${permission}`);
     }
-    for (const op of OPERATIONS) {
+    for (const op of CORE) {
       if (op.id.startsWith("access.") && op.id !== "access.scopedTokens.mint") {
         expect(`${op.id} ${op.permission}`).toBe(`${op.id} home.access.manage`);
       }
@@ -237,9 +733,10 @@ describe("rows, pinned", () => {
   });
 
   test("the reasons a mutating row has no receipt", () => {
-    const reasons = OPERATIONS.filter((op) => op.method !== "GET" && op.receipt === "none").map(
-      (op) => [op.id, op.noReceiptReason],
-    );
+    const reasons = CORE.filter((op) => op.method !== "GET" && op.receipt === "none").map((op) => [
+      op.id,
+      op.noReceiptReason,
+    ]);
     expect(reasons).toEqual([
       ["access.scopedTokens.mint", "stateless"],
       ["auth.session", "authentication, not a command"],
@@ -250,7 +747,7 @@ describe("rows, pinned", () => {
   });
 
   test("workspace receipts", () => {
-    expect(OPERATIONS.filter((op) => op.receipt === "workspace").map((op) => op.id)).toEqual([
+    expect(CORE.filter((op) => op.receipt === "workspace").map((op) => op.id)).toEqual([
       "access.invites.create",
       "access.grants.create",
       "access.tokens.mint",
@@ -262,12 +759,12 @@ describe("rows, pinned", () => {
       "access.devices.revoke",
       "auth.acceptInvite",
     ]);
-    expect(row("runs.create").idempotency).toBe("required-for-services");
+    expect(coreRow("runs.create").idempotency).toBe("required-for-services");
   });
 
   test("qualifiers", () => {
     const withQualifier = (qualifier: string) =>
-      OPERATIONS.filter((op) => (op.qualifiers as readonly string[]).includes(qualifier))
+      CORE.filter((op) => (op.qualifiers as readonly string[]).includes(qualifier))
         .map((op) => op.id)
         .sort();
     const expected: Readonly<Record<string, readonly string[]>> = {
@@ -299,25 +796,25 @@ describe("rows, pinned", () => {
   });
 
   test("streams and secret fields", () => {
-    expect(OPERATIONS.filter((op) => op.stream === "sse").map((op) => op.id)).toEqual([
+    expect(CORE.filter((op) => op.stream === "sse").map((op) => op.id)).toEqual([
       "runs.events",
       "events.fleet",
       "events.harness",
     ]);
-    expect(OPERATIONS.filter((op) => op.secretFields !== undefined).map((op) => op.id)).toEqual([
+    expect(CORE.filter((op) => op.secretFields !== undefined).map((op) => op.id)).toEqual([
       "auth.exchange",
       "auth.acceptInvite",
     ]);
-    expect(row("auth.exchange").secretFields).toEqual(["code"]);
-    expect(row("auth.acceptInvite").secretFields).toEqual(["code"]);
+    expect(coreRow("auth.exchange").secretFields).toEqual(["code"]);
+    expect(coreRow("auth.acceptInvite").secretFields).toEqual(["code"]);
   });
 
   test("no core row declares modelBound yet", () => {
-    expect(CORE_MODULE.operations.filter((op) => "modelBound" in op)).toEqual([]);
+    expect(CORE.filter((op) => "modelBound" in op)).toEqual([]);
   });
 
   test("twins, every non-null one", () => {
-    const twins = OPERATIONS.filter((op) => op.cliTwin !== null).map((op) => [
+    const twins = CORE.filter((op) => op.cliTwin !== null).map((op) => [
       op.id,
       op.cliTwin?.argv.join(" "),
     ]);
@@ -331,12 +828,12 @@ describe("rows, pinned", () => {
       ["decisions.get", "approvals show {appr} --dir {dir}"],
       ["decisions.resolve", "approvals {choice} {appr} --dir {dir}"],
     ]);
-    expect(row("runs.resume").cliTwin).toBeNull();
-    expect(row("runs.resume").noTwinReason).toContain("cli session");
+    expect(coreRow("runs.resume").cliTwin).toBeNull();
+    expect(coreRow("runs.resume").noTwinReason).toContain("cli session");
   });
 
   test("idempotent command kinds", () => {
-    const idempotent = Object.values(COMMAND_KINDS)
+    const idempotent = CORE_MODULE.commandKinds
       .filter((kind) => kind.idempotent)
       .map((kind) => kind.id)
       .sort();
@@ -358,23 +855,23 @@ describe("rows, pinned", () => {
         "access.devices.revoke",
       ].sort(),
     );
-    const receipted = CORE_MODULE.operations.filter((op) => op.receipt !== "none");
+    const receipted = CORE.filter((op) => op.receipt !== "none");
     expect(receipted).toHaveLength(27);
     expect(CORE_MODULE.commandKinds).toHaveLength(27);
     expect(CORE_MODULE.commandKinds.every((kind) => kind.effect === "local")).toBe(true);
   });
 
   test("request and response bodies", () => {
-    expect(row("controls.pause").request).toBe("pauseRequest");
-    expect(row("controls.retire").response).toBe("retireResponse");
-    expect(row("runs.create").response).toBe("runCreated");
-    expect(row("decisions.resolve").response).toBe("decisionResolved");
-    expect(row("decisions.supersede").response).toBe("decisionResolved");
-    expect(row("auth.exchange").request).toBe("authExchangeRequest");
-    expect(row("access.invites.create").response).toBe("inviteIssued");
-    expect(row("access.tokens.mint").response).toBe("tokenIssued");
-    expect(row("auth.signOut").response).toBe("signedOut");
-    const accepted = OPERATIONS.filter((op) => op.response === "commandAccepted").length;
+    expect(coreRow("controls.pause").request).toBe("pauseRequest");
+    expect(coreRow("controls.retire").response).toBe("retireResponse");
+    expect(coreRow("runs.create").response).toBe("runCreated");
+    expect(coreRow("decisions.resolve").response).toBe("decisionResolved");
+    expect(coreRow("decisions.supersede").response).toBe("decisionResolved");
+    expect(coreRow("auth.exchange").request).toBe("authExchangeRequest");
+    expect(coreRow("access.invites.create").response).toBe("inviteIssued");
+    expect(coreRow("access.tokens.mint").response).toBe("tokenIssued");
+    expect(coreRow("auth.signOut").response).toBe("signedOut");
+    const accepted = CORE.filter((op) => op.response === "commandAccepted").length;
     expect(accepted).toBeGreaterThanOrEqual(15);
   });
 });

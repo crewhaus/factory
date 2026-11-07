@@ -7,6 +7,7 @@
  * Bad input never throws. It answers the safe way: a time that cannot be read
  * counts as passed, and a check that cannot be made refuses.
  */
+import { OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
 import { MODULES, type ModuleField } from "./areas/index.js";
 import type { Role } from "./areas/types.js";
 import type { DecisionState } from "./machines.js";
@@ -41,8 +42,16 @@ export type IfUnanswered = (typeof IF_UNANSWERED)[number];
 
 type ReasonTable = ModuleField<"reasonCodes">;
 
+type EventsOf<T> = T extends unknown ? keyof T & string : never;
+
+type ReasonsOf<T, Event extends string> = T extends {
+  readonly [K in Event]: readonly (infer Reason)[];
+}
+  ? Reason
+  : never;
+
 /** Closed reason lists for the decision log, by event, composed from the modules. */
-export const DECISION_LOG_REASONS: Readonly<Record<keyof ReasonTable & string, readonly string[]>> =
+export const DECISION_LOG_REASONS: Readonly<Record<EventsOf<ReasonTable>, readonly string[]>> =
   deepFreeze(
     MODULES.reduce<Record<string, string[]>>((table, module) => {
       for (const [event, reasons] of Object.entries(module.reasonCodes ?? {})) {
@@ -50,7 +59,21 @@ export const DECISION_LOG_REASONS: Readonly<Record<keyof ReasonTable & string, r
       }
       return table;
     }, {}),
-  ) as unknown as Readonly<Record<keyof ReasonTable & string, readonly string[]>>;
+  ) as unknown as Readonly<Record<EventsOf<ReasonTable>, readonly string[]>>;
+
+/** Why a decision was superseded: a code from a closed list, never free text. */
+export type SupersedeReason = ReasonsOf<ReasonTable, "supersede">;
+
+export { OPERATOR_SUPERSEDE_REASONS };
+
+export type OperatorSupersedeReason = (typeof OPERATOR_SUPERSEDE_REASONS)[number];
+
+/** The supersede reasons only the system records. A request can never claim one. */
+export const SYSTEM_SUPERSEDE_REASONS: readonly SupersedeReason[] = deepFreeze(
+  (DECISION_LOG_REASONS.supersede as readonly SupersedeReason[]).filter(
+    (reason) => !(OPERATOR_SUPERSEDE_REASONS as readonly string[]).includes(reason),
+  ),
+);
 
 // ---------------------------------------------------------------------------
 // Shapes
@@ -115,7 +138,7 @@ export type DecisionRecordView = {
   readonly decidedByPrincipal?: string;
   readonly decidedVia?: string;
   readonly supersededBy?: string;
-  readonly supersededReason?: string;
+  readonly supersededReason?: SupersedeReason;
   readonly expiresAt?: string;
   readonly deferredUntil?: string;
   readonly escalation?: DecisionEscalation;
@@ -300,6 +323,18 @@ function differs(bound: string | undefined, current: string | undefined): boolea
   return bound !== undefined && current !== undefined && bound !== current;
 }
 
+/** The only thing a scope, a run or a digest can match on: two absent values never match. */
+function isText(value: unknown): value is string {
+  return typeof value === "string" && value !== "";
+}
+
+/** A recorded reason, if it is one. Anything else is not repeated to whoever reads the verdict. */
+function knownSupersedeReason(reason: unknown): string | undefined {
+  return (DECISION_LOG_REASONS.supersede as readonly unknown[]).includes(reason)
+    ? (reason as string)
+    : undefined;
+}
+
 /** A principal's current authority, read from a present projection. */
 function principalMayDecide(
   principal: string,
@@ -330,7 +365,8 @@ function verifyDecider(record: DecisionRecordView, approvers: VerifyApprovers): 
     return refuse("approvers-unreadable");
   }
   if (decider?.form === "principal") {
-    const required = record.requiredClass ?? "operator";
+    // Only an absent class defaults. One that is present and unreadable refuses all but the owner.
+    const required = record.requiredClass === undefined ? "operator" : record.requiredClass;
     return principalMayDecide(decider.id, approvers.projection, required)
       ? OK
       : refuse("decider-not-authorized");
@@ -358,19 +394,26 @@ export function verifyDecision(input: VerifyDecisionInput): VerifyVerdict {
   if (typeof record !== "object" || record === null) return refuse("not-a-grant");
   if (record.decision !== "grant") return refuse("not-a-grant");
   if (record.consumedAt !== undefined) return refuse("consumed");
-  if (record.supersededBy !== undefined) return refuse("superseded", record.supersededReason);
+  if (record.supersededBy !== undefined) {
+    return refuse("superseded", knownSupersedeReason(record.supersededReason));
+  }
   if (effectiveDecisionState(record, overlays, now).state === "expired") return refuse("expired");
 
   if (typeof consumer !== "object" || consumer === null) return refuse("scope-mismatch");
+  if (!isText(consumer.resumeScope)) return refuse("scope-mismatch");
   const binding = record.binding;
   if (binding === undefined) {
     // Parked before grants were bound: bound to its session, with no run check.
-    if (record.sessionId === undefined || consumer.resumeScope !== `session:${record.sessionId}`) {
+    if (!isText(record.sessionId) || consumer.resumeScope !== `session:${record.sessionId}`) {
       return refuse("scope-mismatch");
     }
   } else {
     if (typeof binding !== "object" || binding === null) return refuse("scope-mismatch");
+    if (!isText(binding.resumeScope) || !isText(binding.sessionId)) {
+      return refuse("scope-mismatch");
+    }
     if (consumer.resumeScope !== binding.resumeScope) return refuse("scope-mismatch");
+    if (!isText(binding.runId) || !isText(consumer.runId)) return refuse("run-mismatch");
     if (consumer.runId !== binding.runId && consumer.continues !== binding.runId) {
       return refuse("run-mismatch");
     }
@@ -380,10 +423,16 @@ export function verifyDecision(input: VerifyDecisionInput): VerifyVerdict {
     ) {
       return refuse("revision-changed");
     }
-    if (binding.resourceRevisionBound && binding.resourceRevision !== consumer.resourceRevision) {
+    // Only an explicit `false` unbinds the resource: a flag that is missing or torn still checks.
+    if (
+      binding.resourceRevisionBound !== false &&
+      (!isText(binding.resourceRevision) || binding.resourceRevision !== consumer.resourceRevision)
+    ) {
       return refuse("resource-changed");
     }
-    if (binding.placesDigest !== consumer.placesDigest) return refuse("places-changed");
+    if (!isText(binding.placesDigest) || binding.placesDigest !== consumer.placesDigest) {
+      return refuse("places-changed");
+    }
   }
 
   return verifyDecider(record, approvers);
