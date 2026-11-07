@@ -3,10 +3,12 @@
  * `crewhaus compile --check` reads that stop as a first-boot gate.
  *
  * A `$VAR` in a `tool_config` or `chains` block is read when the bundle
- * starts. A daemon shape (channel, managed, crew) checks every such variable
- * before any registration and exits 2 with one line naming the first one
- * unset, as its other boot gates do; the other shapes stop with the
- * registration's `BuiltinToolError` (exit 1), which carries the same sentence.
+ * starts. A daemon shape (channel, managed, crew) checks each such variable
+ * just before the registration that reads it, and exits 2 with one line
+ * naming it when it is unset, as its other boot gates do; the other shapes
+ * stop at the same point with the registration's `BuiltinToolError` (exit 1),
+ * which carries the same sentence. A registration ahead of that point still
+ * runs, so a block its registrar refuses there keeps the check red.
  *
  * Real boots: each bundle is compiled in-process, written into an os.tmpdir()
  * mkdtemp, and started with `bun --no-install` against THIS working tree's
@@ -165,6 +167,29 @@ const CHANNEL = [
   "routing:",
   "  sessionKey: thread",
 ].join("\n");
+/**
+ * A managed agent with two blocks: an image block that compiles, but that its
+ * registrar refuses at boot in every environment (a base URL with a query),
+ * and an http block that reads a variable. `tools` sets the order the two
+ * registrations run in.
+ */
+const managedWithRefusedBlock = (tools: string): string =>
+  [
+    "name: m",
+    "target: managed",
+    "agent:",
+    "  model: claude-sonnet-4-6",
+    "  instructions: i",
+    `  tools: [${tools}]`,
+    "  tool_config:",
+    "    imageGenerate:",
+    '      openaiBaseUrl: "https://h.example.invalid/v1?x=1"',
+    "    http:",
+    "      allowed_origins: [$TOOL_GATE_ORIGIN]",
+    "tenants:",
+    "  - id: t1",
+    "    budget: { maxInputTokens: 1000, maxOutputTokens: 1000 }",
+  ].join("\n");
 /** A workflow whose step reads a chain: the form of the wallet-gated-action walkthrough. */
 const WORKFLOW = [
   "name: usdc-payout",
@@ -283,31 +308,58 @@ describe("compile --check on a bundle whose tool config reads an unset variable"
     };
   }
 
+  /** Compile `yaml` and run the check on it: the verdict, its boot step, and how the boot stopped. */
+  async function check(target: string, yaml: string) {
+    const { out, bundle } = build(yaml);
+    const boots: CheckRunResult[] = [];
+    const result = await runCompileCheck({
+      target,
+      bundle,
+      outDir: out,
+      runner: checkRunner((b) => boots.push(b)),
+      bootTimeoutMs: 60_000,
+      env: { PATH: process.env["PATH"] ?? "", HOME: newTmp("crewhaus-tool-gate-home-") },
+    });
+    return {
+      green: result.green,
+      boot: result.steps.find((s) => s.step === "boot"),
+      // A timeout would read "ok"; this says the boot really stopped, and with what code.
+      exits: boots.map((b) => ({ exitCode: b.exitCode, timedOut: b.timedOut })),
+    };
+  }
+
   for (const [target, yaml, exitCode] of [
     ["crew", CREW, 2],
     ["workflow", WORKFLOW, 1],
   ] as const) {
     test(`${target}: GREEN, gated at the tool config env refs gate (boot exit ${exitCode})`, async () => {
-      const { out, bundle } = build(yaml);
-      const boots: CheckRunResult[] = [];
-      const result = await runCompileCheck({
-        target,
-        bundle,
-        outDir: out,
-        runner: checkRunner((b) => boots.push(b)),
-        bootTimeoutMs: 60_000,
-        env: { PATH: process.env["PATH"] ?? "", HOME: newTmp("crewhaus-tool-gate-home-") },
-      });
-      expect(result.steps.find((s) => s.step === "boot")).toEqual({
-        step: "boot",
-        status: "gated",
-        detail: GATE_DETAIL,
-      });
-      expect(result.green).toBe(true);
-      // A timeout would read "ok"; the boot really stopped, with this code.
-      expect(boots.map((b) => ({ exitCode: b.exitCode, timedOut: b.timedOut }))).toEqual([
-        { exitCode, timedOut: false },
-      ]);
+      const r = await check(target, yaml);
+      expect(r.boot).toEqual({ step: "boot", status: "gated", detail: GATE_DETAIL });
+      expect(r.green).toBe(true);
+      expect(r.exits).toEqual([{ exitCode, timedOut: false }]);
     }, 120_000);
   }
+
+  // A block its registrar refuses at boot stops the boot in every environment,
+  // so the check must read it red. A daemon checks each variable just before
+  // the registration that reads it, so a registration ahead of that one still
+  // runs, and refuses with its own error.
+  test("managed: a block refused at boot, registered before the variable is read, stays RED", async () => {
+    const r = await check("managed", managedWithRefusedBlock("imageGenerate, httpRequest"));
+    expect(r.boot?.status).toBe("failed");
+    expect(r.boot?.detail).toStartWith(
+      "boot exited 1: ImageGenerationError: the OpenAI base URL for https://h.example.invalid has a query or fragment.",
+    );
+    expect(r.green).toBe(false);
+    expect(r.exits).toEqual([{ exitCode: 1, timedOut: false }]);
+  }, 120_000);
+
+  test("managed: the same blocks the other way round stop at the variable first: GREEN, gated", async () => {
+    // A gate stops the boot before whatever comes after it, as every
+    // first-boot gate does; here that is the refused block.
+    const r = await check("managed", managedWithRefusedBlock("httpRequest, imageGenerate"));
+    expect(r.boot).toEqual({ step: "boot", status: "gated", detail: GATE_DETAIL });
+    expect(r.green).toBe(true);
+    expect(r.exits).toEqual([{ exitCode: 2, timedOut: false }]);
+  }, 120_000);
 });

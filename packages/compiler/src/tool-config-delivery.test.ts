@@ -338,7 +338,7 @@ describe("$VAR in tool_config", () => {
   });
 });
 
-describe("a daemon bundle checks its tool-config variables before any registration", () => {
+describe("a daemon bundle checks each tool-config variable just before the registration that reads it", () => {
   const check = (path: string, name: string): string =>
     `if (!process.env["${name}"]) { process.stderr.write("${path} reads $${name}, but ${name} is not set. Set ${name} in the environment the harness starts in.\\n"); process.exit(2); }`;
   const RPC_CHECK = check("chains[0].rpcUrls[0]", "TOOL_GATE_RPC");
@@ -412,12 +412,52 @@ describe("a daemon bundle checks its tool-config variables before any registrati
     }
   });
 
+  test("crew: each role module checks only its own variables, ahead of its own registration", () => {
+    // Each role is resolved on its own and its module runs whole before the
+    // next one, so a role's registrations can run before a later role's check.
+    const { files } = compile(
+      [
+        "name: two-roles",
+        "target: crew",
+        "model: claude-sonnet-4-6",
+        "entry: a",
+        "roles:",
+        "  a:",
+        "    instructions: i",
+        "    tools: [httpRequest]",
+        "    tool_config:",
+        "      http:",
+        "        allowed_origins: [$VAR_A]",
+        "  b:",
+        "    instructions: i",
+        "    tools: [imageGenerate]",
+        "    tool_config:",
+        "      imageGenerate:",
+        "        model: $VAR_B",
+      ].join("\n"),
+    );
+    const CHECK_A = 'if (!process.env["VAR_A"]) {';
+    const CHECK_B = 'if (!process.env["VAR_B"]) {';
+    const a = content(files, "agent_a.ts");
+    const b = content(files, "agent_b.ts");
+    inOrder(a, `\n${CHECK_A}`, "applyToolConfig(registerHttpConfig, ");
+    inOrder(b, `\n${CHECK_B}`, "applyToolConfig(registerImageGenerationConfig, ");
+    expect(a.includes(CHECK_B)).toBe(false);
+    expect(b.includes(CHECK_A)).toBe(false);
+    for (const path of ["daemon.ts", "orchestrator.ts"]) {
+      expect({ path, check: content(files, path).includes("if (!process.env[") }).toEqual({
+        path,
+        check: false,
+      });
+    }
+  });
+
   test("managed: agent.ts checks at load, before its registration", () => {
     const agent = content(compile(managed("$TOOL_GATE_ORIGIN")).files, "agent.ts");
     inOrder(agent, `\n${ORIGIN_CHECK}\n`, "applyToolConfig(registerHttpConfig, ");
   });
 
-  test("channel: main() checks after the channel secrets, before any registration", () => {
+  test("channel: main() checks after the channel secrets, before the registration that reads it", () => {
     const { files } = compile(CHANNEL);
     const daemon = content(files, "daemon.ts");
     // The startup check names the channel secrets first; the variable check

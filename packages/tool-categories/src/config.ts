@@ -15,9 +15,11 @@
  * A string value written as `$UPPER_SNAKE` is read from the environment when
  * the bundle starts, never compiled in, the way `mcp_servers` env values
  * work. A value read that way is never repeated in an error. A daemon shape's
- * bundle (channel, managed, crew) checks every variable its blocks read before
- * any registration runs, and stops with exit 2 and one line naming the first
- * one unset ({@link renderToolConfigEnvGate}).
+ * bundle (channel, managed, crew) checks each variable its blocks read just
+ * before the registration that reads it, and an unset one stops the boot there
+ * with exit 2 and one line naming it ({@link renderToolConfigEnvGate}). A crew
+ * does this role by role: each role checks its variables before its own
+ * registrations.
  *
  * Pure functions over data, except {@link applyToolConfig}, which calls the
  * registrar it is handed. Nothing here imports a tool package.
@@ -773,14 +775,24 @@ export function renderToolConfigInit(init: ToolConfigInit): {
 }
 
 /**
- * The check a daemon shape's bundle runs before its registrations: one
- * statement per variable the plan's blocks read, in registration order,
- * naming the first place each is read. An unset or empty variable prints the
- * sentence {@link resolveToolConfigEnv} throws and exits 2, as the daemons'
- * other boot gates do (a channel's missing secrets, a crew's empty stdin),
- * instead of exiting 1 with an uncaught error's stack. The checks come before
- * the registrations beside them, so no registrar runs with a variable missing.
- * Empty when no block reads a variable, so such a bundle keeps its bytes.
+ * The checks a daemon shape's bundle runs among its registrations: one list
+ * per registration of `plan`, in order, to run just before it. A list holds a
+ * statement for each variable its block reads that no earlier registration
+ * read, naming the first place it is read. An unset or empty variable prints
+ * the sentence {@link resolveToolConfigEnv} throws and exits 2, as the
+ * daemons' other boot gates do (a channel's missing secrets, a crew's empty
+ * stdin), instead of exiting 1 with an uncaught error's stack.
+ *
+ * So the boot stops where the registration reading the variable would have
+ * thrown, naming the same variable at the same path. The registrations ahead
+ * of it run as they always have, and one that refuses its block at boot still
+ * stops the boot with its own error. Every list is empty when no block reads
+ * a variable, so such a bundle keeps its bytes.
+ *
+ * `plan` is one resolve's. A crew resolves each role on its own, so each role
+ * module checks only its own variables, ahead of its own registrations. The
+ * modules load one after another, so when a later role's check stops the boot,
+ * an earlier role's registrations have already run.
  *
  * Plain code with no import, on purpose: a compiled bundle runs the
  * `@crewhaus` packages of the version that compiled it, so a check inside a
@@ -790,10 +802,10 @@ export function renderToolConfigInit(init: ToolConfigInit): {
  */
 export function renderToolConfigEnvGate(
   plan: ReadonlyArray<ToolConfigInit>,
-): ReadonlyArray<string> {
-  const lines: string[] = [];
+): ReadonlyArray<ReadonlyArray<string>> {
   const named = new Set<string>();
-  for (const init of plan) {
+  return plan.map((init) => {
+    const lines: string[] = [];
     for (const { path, name } of toolConfigEnvRefs(init.config, init.where)) {
       if (named.has(name)) continue;
       named.add(name);
@@ -802,8 +814,8 @@ export function renderToolConfigEnvGate(
         `if (!process.env[${JSON.stringify(name)}]) { process.stderr.write(${sentence}); process.exit(2); }`,
       );
     }
-  }
-  return lines;
+    return lines;
+  });
 }
 
 // ---------------------------------------------------------------------------

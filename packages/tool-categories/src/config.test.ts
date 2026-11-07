@@ -553,7 +553,7 @@ describe("a daemon shape's check of the variables its blocks read", () => {
       thrown = err;
     }
     expect(thrown).toBeInstanceOf(BuiltinToolError);
-    const lines = renderToolConfigEnvGate([httpInit(block)]);
+    const [lines = []] = renderToolConfigEnvGate([httpInit(block)]);
     expect(lines).toHaveLength(2);
     expect(written(lines[0])).toBe((thrown as Error).message);
     // The second variable is checked the same way, at its own path.
@@ -575,15 +575,19 @@ describe("a daemon shape's check of the variables its blocks read", () => {
       ],
     };
     expect(renderToolConfigEnvGate(planChainInits(["evmCall"], chains))).toEqual([
-      'if (!process.env["ETH_RPC"]) { process.stderr.write("chains[0].rpcUrls[0] reads $ETH_RPC, but ETH_RPC is not set. Set ETH_RPC in the environment the harness starts in.\\n"); process.exit(2); }',
+      [
+        'if (!process.env["ETH_RPC"]) { process.stderr.write("chains[0].rpcUrls[0] reads $ETH_RPC, but ETH_RPC is not set. Set ETH_RPC in the environment the harness starts in.\\n"); process.exit(2); }',
+      ],
     ]);
     expect(renderToolConfigEnvGate([httpInit({ allowed_origins: ["$ORIGIN"] })])).toEqual([
-      'if (!process.env["ORIGIN"]) { process.stderr.write("tool_config.http.allowed_origins[0] reads $ORIGIN, but ORIGIN is not set. Set ORIGIN in the environment the harness starts in.\\n"); process.exit(2); }',
+      [
+        'if (!process.env["ORIGIN"]) { process.stderr.write("tool_config.http.allowed_origins[0] reads $ORIGIN, but ORIGIN is not set. Set ORIGIN in the environment the harness starts in.\\n"); process.exit(2); }',
+      ],
     ]);
   });
 
   test("a quoted key in the path is escaped, so the line still parses", () => {
-    const [line] = renderToolConfigEnvGate([httpInit({ nested: { 'odd "key"': "$A" } })]);
+    const [line] = renderToolConfigEnvGate([httpInit({ nested: { 'odd "key"': "$A" } })]).flat();
     expect(written(line)).toStartWith('tool_config.http.nested["odd \\"key\\""] reads $A,');
     // Parsed as a bundle's TypeScript, never run.
     const parse = (source: string) => new Bun.Transpiler({ loader: "ts" }).transformSync(source);
@@ -591,25 +595,72 @@ describe("a daemon shape's check of the variables its blocks read", () => {
     expect(() => parse(`process.stderr.write("${written(line)}");`)).toThrow();
   });
 
-  test("one line per variable, in registration order, naming where it is first read", () => {
-    const a = httpInit({ allowed_origins: ["$A"] });
-    const b = {
-      ...httpInit({ url: "$B", again: "$A" }, "tool_config.fetch"),
-      initSymbol: "registerFetchConfig",
-    };
-    const names = (plan: ReadonlyArray<ToolConfigInit>) =>
-      renderToolConfigEnvGate(plan).map((l) => written(l).split(" reads ")[0]);
-    expect(names([a, b])).toEqual(["tool_config.http.allowed_origins[0]", "tool_config.fetch.url"]);
-    // Read twice, by two inits or at two paths of one: named once, at the first.
-    expect(names([a, httpInit({ again: "$A" }, "tool_config.other")])).toEqual([
-      "tool_config.http.allowed_origins[0]",
-    ]);
-    expect(names([httpInit({ first: "$A", second: ["$A"] })])).toEqual(["tool_config.http.first"]);
-    // No reference, no check: such a bundle keeps its bytes.
-    expect(renderToolConfigEnvGate([httpInit({ allowed_origins: ["https://a.example"] })])).toEqual(
+  const literal = httpInit({ allowed_origins: ["https://a.example"] }, "tool_config.literal");
+  const readsA = httpInit({ allowed_origins: ["$A"] });
+  const readsBThenA = {
+    ...httpInit({ url: "$B", again: "$A" }, "tool_config.fetch"),
+    initSymbol: "registerFetchConfig",
+  };
+
+  test("each variable is checked once, just before the first registration that reads it", () => {
+    // Per registration, the paths its checks name.
+    const paths = (plan: ReadonlyArray<ToolConfigInit>) =>
+      renderToolConfigEnvGate(plan).map((lines) =>
+        lines.map((l) => written(l).split(" reads ")[0]),
+      );
+    // A registration that reads nothing gets no check, and runs ahead of the
+    // checks of the ones after it.
+    expect(paths([literal, readsA, readsBThenA])).toEqual([
       [],
-    );
+      ["tool_config.http.allowed_origins[0]"],
+      ["tool_config.fetch.url"],
+    ]);
+    // Read twice, by two registrations or at two paths of one: checked once, at the first.
+    expect(paths([readsA, httpInit({ again: "$A" }, "tool_config.other")])).toEqual([
+      ["tool_config.http.allowed_origins[0]"],
+      [],
+    ]);
+    expect(paths([httpInit({ first: "$A", second: ["$A"] })])).toEqual([
+      ["tool_config.http.first"],
+    ]);
+    // No reference, no check: such a bundle keeps its bytes.
+    expect(renderToolConfigEnvGate([literal])).toEqual([[]]);
     expect(renderToolConfigEnvGate([])).toEqual([]);
+  });
+
+  test("the boot stops where the registration reading the variable would have thrown, naming the same", () => {
+    const plan = [literal, readsA, readsBThenA];
+    /** The registration a boot stops before, and what it says: the throw, as the bundle ran without a check. */
+    const thrown = (env: Record<string, string>) => {
+      for (const [at, init] of plan.entries()) {
+        try {
+          resolveToolConfigEnv(init.config, init.where, env);
+        } catch (err) {
+          return { at, says: (err as Error).message };
+        }
+      }
+      return undefined;
+    };
+    /** The same, from the checks: the first one whose variable is unset or empty. */
+    const checked = (env: Record<string, string>) => {
+      for (const [at, lines] of renderToolConfigEnvGate(plan).entries()) {
+        for (const line of lines) {
+          const says = written(line);
+          const name = says.match(/ reads \$([A-Z_][A-Z0-9_]*),/)?.[1] ?? "";
+          expect(name).not.toBe("");
+          if (!env[name]) return { at, says };
+        }
+      }
+      return undefined;
+    };
+    const envs = [{}, { A: "a" }, { A: "" }, { B: "b" }, { A: "a", B: "" }, { A: "a", B: "b" }];
+    for (const env of envs) {
+      expect({ env, stop: checked(env) }).toEqual({ env, stop: thrown(env) });
+    }
+    // Not vacuous: unset A stops before the second registration, after the first ran.
+    expect(checked({})?.at).toBe(1);
+    expect(checked({ A: "a" })?.at).toBe(2);
+    expect(checked({ A: "a", B: "b" })).toBeUndefined();
   });
 
   test("the lines run: an unset or empty variable exits 2 naming it, a set one passes", async () => {
@@ -629,7 +680,7 @@ describe("a daemon shape's check of the variables its blocks read", () => {
       return { exitCode, stdout, stderr };
     };
     try {
-      const one = renderToolConfigEnvGate([httpInit({ allowed_origins: ["$A"] })]);
+      const one = renderToolConfigEnvGate([httpInit({ allowed_origins: ["$A"] })]).flat();
       expect(await run(one, {})).toEqual({
         exitCode: 2,
         stdout: "",
@@ -642,7 +693,7 @@ describe("a daemon shape's check of the variables its blocks read", () => {
         stdout: "",
         stderr: "",
       });
-      const two = renderToolConfigEnvGate([httpInit({ allowed_origins: ["$A", "$B"] })]);
+      const two = renderToolConfigEnvGate([httpInit({ allowed_origins: ["$A", "$B"] })]).flat();
       const onlyB = await run(two, { A: "https://origin.example.invalid" });
       expect(onlyB.exitCode).toBe(2);
       expect(onlyB.stderr).toStartWith(
