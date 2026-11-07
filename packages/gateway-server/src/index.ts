@@ -26,7 +26,7 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { type AppendInput, type AuditLog, openAuditLog } from "@crewhaus/audit-log";
-import { classifyBoundary } from "@crewhaus/boundary-classifier";
+import { boundaryRuleIds, classifyBoundary } from "@crewhaus/boundary-classifier";
 import { type BudgetStore, InMemoryBudgetStore } from "@crewhaus/durable-state";
 import { CrewhausError } from "@crewhaus/errors";
 import {
@@ -54,6 +54,7 @@ import {
   encodeSseEvent,
   encodeSuccess,
 } from "@crewhaus/gateway-protocol";
+import { withInboundContent } from "@crewhaus/run-context";
 import { type Tenant, buildTenant, validateTenantId, withTenant } from "@crewhaus/tenancy";
 
 export class GatewayServerError extends CrewhausError {
@@ -656,16 +657,67 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
         );
       }
       try {
-        // Audit every authenticated gateway request.
+        // Run input enters here. The input of `runs.create` / `runs.continue`
+        // (the only methods whose params carry text a run is given; a string
+        // once decoded) is classified at TrustOrigin "api" after
+        // authentication, the intake gate and the reservation, and before the
+        // run's handler: authenticated is not classified (AGENTS.md, Pillar
+        // 3). A malicious verdict refuses the call with `input_blocked`, so no
+        // handler and no model call run (the `finally` still releases the
+        // reservation); kept text runs inside run-context's inbound scope,
+        // which tags it into the run's first context at "api".
+        const input =
+          decoded.method === "runs.create" || decoded.method === "runs.continue"
+            ? (decoded.params as { readonly input: string }).input
+            : undefined;
+        const boundary =
+          input === undefined ? undefined : await classifyBoundary(input, { origin: "api" });
+        const rules = boundary === undefined ? [] : boundaryRuleIds(boundary.verdict);
+        // Audit every authenticated gateway request. A flagged input adds its
+        // verdict (rule ids and score, never the text) to the call's record.
         const log = await getAuditLog(tenant);
         const requestPayload: AppendInput["payload"] = {
           method: decoded.method,
           tenantId: tenant.id,
           sub: claims.sub,
+          ...(boundary !== undefined && boundary.verdict.classification !== "clean"
+            ? {
+                inputVerdict: {
+                  origin: "api",
+                  classification: boundary.verdict.classification,
+                  rules,
+                  score: boundary.verdict.score,
+                },
+              }
+            : {}),
         };
         await log.append({ kind: "gateway_request", payload: requestPayload });
+        if (boundary?.action === "redact") {
+          return encodeError(
+            id,
+            ErrorCode.InputBlocked,
+            `input refused by the prompt-injection check (rules: ${rules.join(", ")})`,
+            { origin: "api", rules, score: boundary.verdict.score },
+          );
+        }
+        const handle = () =>
+          opts.handler({ method: decoded.method, params: decoded.params, tenant });
         const result = await withTenant(tenant, () =>
-          opts.handler({ method: decoded.method, params: decoded.params, tenant }),
+          input === undefined || boundary === undefined
+            ? handle()
+            : withInboundContent(
+                [
+                  {
+                    content: input,
+                    origin: "api",
+                    door: decoded.method,
+                    ...(boundary.action === "warn"
+                      ? { warning: { rules, score: boundary.verdict.score } }
+                      : {}),
+                  },
+                ],
+                handle,
+              ),
         );
         return encodeSuccess(id, result);
       } finally {
@@ -855,6 +907,8 @@ export function statusFor(code: string): number {
       return 429;
     case ErrorCode.InternalError:
       return 500;
+    case ErrorCode.InputBlocked:
+      return 422;
     default:
       return 200;
   }
@@ -870,6 +924,10 @@ export function statusFor(code: string): number {
  *     `invalid tenantId`, `TenancyError`) → `unauthorized`
  *   - any other `GatewayServerError` → `bad_request`
  *   - anything else → `internal_error`
+ *
+ * `input_blocked` is not one of these mappings: `handleEnvelope` answers it
+ * itself, when the prompt-injection check refuses a run's input, and nothing
+ * throws it.
  */
 function errorEnvelopeFor(err: unknown, id: string): ResponseEnvelopeT {
   if (err instanceof GatewayProtocolError) {

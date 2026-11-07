@@ -5,9 +5,12 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../boundary-classifier" },
+    { "path": "../egress-classifier" },
     { "path": "../errors" },
     { "path": "../idempotency-keys" },
-    { "path": "../queue-protocol" }
+    { "path": "../queue-protocol" },
+    { "path": "../run-context" }
   ],
   "include": ["src/**/*"]
 }

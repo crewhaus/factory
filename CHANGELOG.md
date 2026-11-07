@@ -24,6 +24,28 @@ these on: they reach every harness that uses what each one names.
   every case errored, as they already refused a budget-aborted run. The eval
   still prints its result and keeps the baseline it had.
 
+- **Run input is screened where it enters.** Text that starts or continues a
+  run through the managed API (`runs.create`, `runs.continue`) and batch queue
+  payloads are classified at a new trust origin, `api`. Messages sent to a
+  Cloudflare Worker's `/chat` endpoint, whatever their role, and a voice
+  caller's speech, once the OpenAI Realtime adapter transcribes it, are
+  classified at `channel`. A malicious API, queue or Worker input is refused
+  before any model call, as is one too long for the check to read: the managed
+  API answers `input_blocked` (HTTP 422), the queue job fails with
+  `input_blocked` without a retry, and the Worker request ends with an `error`
+  event. A malicious voice transcript cancels the reply in progress and is
+  removed from the conversation, and malicious text an application sends into
+  a voice session is not sent. A suspicious input runs, with a warning. Kept
+  API and queue text carries its origin: a call to an external tool that
+  carries a match goes out with a warning, the run's log line names `api` in
+  `originsFound`, and the egress audit records it where the harness keeps one.
+  On a Worker, what a tool returns is classified at
+  `tool`, and a malicious output reaches the model as a redaction notice.
+  Voice sessions now ask the realtime provider to transcribe the caller, which
+  the provider bills as transcription.
+  Recompile a managed daemon, batch worker or voice harness, and recompile and
+  redeploy a Worker, to pick this up.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what

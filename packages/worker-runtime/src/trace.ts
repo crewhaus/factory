@@ -23,6 +23,7 @@ import type {
   CostAccrualEvent,
   ModelRequestEvent,
   ModelResponseEvent,
+  PermissionDecisionEvent,
   RunFailedEvent,
   ToolCallEndEvent,
   ToolCallStartEvent,
@@ -37,10 +38,12 @@ type Core<E> = Omit<E, keyof TraceEventEnvelope>;
 
 /**
  * The subset of the canonical trace vocabulary this v1 loop emits: the turn
- * lifecycle, the model round-trip, per-tool spans, cost accrual, and a
- * classified terminal failure. Each arm is a `Core<…>` of the matching
- * `@crewhaus/trace-event-bus` type, so adding a field there surfaces here as
- * a type error rather than silent drift.
+ * lifecycle, the model round-trip, per-tool spans, cost accrual, a
+ * classified terminal failure, and the warning for a message the
+ * prompt-injection check kept (`permission_decision`, `outcome: "warned"`).
+ * Each arm is a `Core<…>` of the matching `@crewhaus/trace-event-bus` type,
+ * so adding a field there surfaces here as a type error rather than silent
+ * drift.
  */
 export type WorkerTraceEvent =
   | Core<TurnStartEvent>
@@ -50,7 +53,8 @@ export type WorkerTraceEvent =
   | Core<ToolCallStartEvent>
   | Core<ToolCallEndEvent>
   | Core<CostAccrualEvent>
-  | Core<RunFailedEvent>;
+  | Core<RunFailedEvent>
+  | Core<PermissionDecisionEvent>;
 
 /**
  * Where the loop hands its core trace events. Synchronous and best-effort:

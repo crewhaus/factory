@@ -399,3 +399,117 @@ describe("auditBoundarySite — anchored reply paths", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Run input: the api and channel sites, and the ingress signals that find a
+// new package taking run input without the classifier.
+// ---------------------------------------------------------------------------
+
+describe("run-input boundary sites", () => {
+  const repoRoot = join(import.meta.dir, "..", "..", "..");
+  const site = (name: string) => {
+    const found = BOUNDARY_SITES.find((s) => s.name === name);
+    if (found === undefined) throw new Error(`site ${name} missing`);
+    return found;
+  };
+
+  test("the four sites hold against this tree", () => {
+    const expected: Record<string, string[]> = {
+      "gateway-server-run-input": [
+        "gateway-server-run-input:true:false",
+        "gateway-server-run-input-lineage:true:false",
+      ],
+      "queue-consumer": ["queue-consumer:true:false", "queue-consumer-lineage:true:false"],
+      "worker-runtime-loop": ["worker-runtime-loop:true:false"],
+      "voice-runtime": ["voice-runtime:true:false"],
+    };
+    for (const [name, symbols] of Object.entries(expected)) {
+      const s = site(name);
+      const findings = auditBoundarySite(s, readFileSync(join(repoRoot, s.path), "utf8"));
+      expect(findings.map((f) => `${f.symbol}:${f.pass}:${f.warn ?? false}`)).toEqual(symbols);
+    }
+  });
+
+  test("the gateway row reads the run-input check, not the federation one", () => {
+    const s = site("gateway-server-run-input");
+    const source = readFileSync(join(repoRoot, s.path), "utf8");
+    const anchor = s.anchor ?? "\u0000";
+    const at = source.indexOf(anchor);
+    expect(at).toBeGreaterThan(-1);
+    expect(source.indexOf(anchor, at + 1)).toBe(-1); // the anchor is unique
+    const windowText = source.slice(Math.max(0, at - (s.window ?? 0)), at);
+    expect(windowText).toContain('classifyBoundary(input, { origin: "api" })');
+    expect(windowText).toContain("withInboundContent(");
+    expect(windowText).not.toContain('origin: "federation"');
+    // Without the run-input call the row fails, though the file still
+    // classifies federation payloads.
+    const stripped = source.replace(
+      'classifyBoundary(input, { origin: "api" })',
+      "Promise.resolve(undefined)",
+    );
+    expect(stripped).not.toBe(source);
+    expect(stripped).toContain('classifyBoundary(envelope.payload, { origin: "federation" })');
+    const findings = auditBoundarySite(s, stripped);
+    expect(findings[0]?.symbol).toBe("gateway-server-run-input");
+    expect(findings[0]?.pass).toBe(false);
+    expect(findings[0]?.reason).toContain("security regression");
+  });
+
+  test("the lineage check accepts run-context's inbound scope in place of tagContent", () => {
+    const s = { name: "x", path: "packages/x/src/index.ts", requireTag: true as const };
+    const scoped = auditBoundarySite(
+      s,
+      'await classifyBoundary(t, { origin: "api" }); withInboundContent([entry], run);',
+    );
+    expect(scoped.map((f) => f.pass)).toEqual([true, true]);
+    const neither = auditBoundarySite(s, 'await classifyBoundary(t, { origin: "api" });');
+    expect(neither.map((f) => f.pass)).toEqual([true, false]);
+  });
+
+  test("a package taking run input without the classifier is reported, and exempt once it classifies", () => {
+    const planted: Record<string, { file: string; symbol: string; origin: string }> = {
+      "my-rpc-gateway": {
+        file: "const req = decodeRequest(body);\n",
+        symbol: "run-request-ingress",
+        origin: "api",
+      },
+      "my-job-runner": {
+        file: "const jobs = await opts.queue.pull({ maxBatch: 1 });\n",
+        symbol: "queue-job-ingress",
+        origin: "api",
+      },
+      "my-voice-bridge": {
+        file: 'send({ type: "input_audio_buffer.append", audio });\n',
+        symbol: "realtime-voice-ingress",
+        origin: "channel",
+      },
+    };
+    for (const [name, { file }] of Object.entries(planted)) {
+      mkdirSync(join(root, "packages", name, "src"), { recursive: true });
+      writeFileSync(join(root, "packages", name, "src", "index.ts"), file);
+    }
+    const findings = detectBoundaryDrift(root);
+    expect(findings).toHaveLength(3);
+    for (const [name, { symbol, origin }] of Object.entries(planted)) {
+      const f = findings.find((x) => x.file === `packages/${name}/src`);
+      expect(f?.symbol).toBe(symbol);
+      expect(f?.reason).toContain(`(origin: ${origin})`);
+      expect(f?.pass).toBe(true);
+      expect(f?.warn).toBe(true);
+    }
+    for (const name of Object.keys(planted)) {
+      writeFileSync(
+        join(root, "packages", name, "src", "screen.ts"),
+        'import { classifyBoundary } from "@crewhaus/boundary-classifier";\n',
+      );
+    }
+    expect(detectBoundaryDrift(root)).toEqual([]);
+  });
+
+  test("this tree's run-input packages classify, so the drift scan does not flag them", () => {
+    const keys = detectBoundaryDrift(repoRoot).map((f) => f.file);
+    for (const pkg of ["gateway-server", "queue-consumer", "voice-runtime", "worker-runtime"]) {
+      expect(keys).not.toContain(`packages/${pkg}/src`);
+    }
+  });
+});

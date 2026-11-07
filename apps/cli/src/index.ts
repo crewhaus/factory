@@ -6413,6 +6413,7 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     );
   }
 
+  checks.push((await import("./doctor-screening")).injectionCheckStatus(process.env));
   const bunCheck = checkBunVersion(Bun.version);
   checks.push({
     label: `Bun runtime (${Bun.version})`,

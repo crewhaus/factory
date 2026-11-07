@@ -34,8 +34,12 @@
  * "performance") is a security regression, not a perf optimisation.
  *
  * Catalog layer: R8 (extension of §18 safety primitives). Brief: 277.
+ *
+ * The package runs wherever `fetch` does: it imports no Node builtin (the
+ * cache key is hashed by Bun, or with WebCrypto where Bun is absent), so a
+ * Cloudflare Worker loads the same chokepoint, with the same policy table, as
+ * a Bun process.
  */
-import { createHash } from "node:crypto";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   type ClassifyOptions as PiClassifyOptions,
@@ -46,6 +50,7 @@ import {
 } from "@crewhaus/prompt-injection-detector";
 
 export { buildRedactionNotice };
+export { valueText } from "./value-text";
 export type { PromptInjectionClassification, PromptInjectionResult };
 
 export class BoundaryClassifierError extends CrewhausError {
@@ -84,7 +89,8 @@ export type TrustOrigin =
   | "tool"
   | "chain"
   | "memory"
-  | "consult";
+  | "consult"
+  | "api";
 
 export type BoundarySeverity = "block" | "warn" | "pass";
 
@@ -131,6 +137,11 @@ const ORIGIN_DEFAULT_POLICY: Record<TrustOrigin, BoundarySeverity> = {
   // re-enters the parent's context verbatim, so it is classified exactly
   // once, here, at the tool. Block by default, the "skill" / "memory" tier.
   consult: "block",
+  // Text a caller hands to a run through an API, an SDK or a queue.
+  // Authenticated is not trusted: the caller is not the developer at the
+  // keyboard, and the text is often written by someone else. Block by
+  // default, the channel tier.
+  api: "block",
 };
 
 /**
@@ -150,6 +161,16 @@ export const TRUST_ORIGINS: ReadonlyArray<TrustOrigin> = Object.keys(
  */
 export function defaultBoundarySeverity(origin: TrustOrigin): BoundarySeverity {
   return ORIGIN_DEFAULT_POLICY[origin];
+}
+
+/**
+ * The rule ids a verdict is reported by: its first six distinct rules, in hit
+ * order, the same ones {@link buildRedactionNotice} names. A site that refuses
+ * or flags input puts these (and the score), never the text, in its error,
+ * trace event or audit record, so every site reports a verdict the same way.
+ */
+export function boundaryRuleIds(verdict: PromptInjectionResult): string[] {
+  return [...new Set(verdict.hits.map((h) => h.rule))].slice(0, 6);
 }
 
 export type ClassifyBoundaryOptions = {
@@ -233,9 +254,30 @@ const cache = new LruCache<{ verdict: PromptInjectionResult; origin: TrustOrigin
   DEFAULT_CACHE_CAP,
 );
 
-function cacheKey(text: string, origin: TrustOrigin): string {
-  const h = createHash("sha256").update(text, "utf8").digest("hex");
-  return `${origin}:${h}`;
+const UTF8 = new TextEncoder();
+const HEX_BYTE = Array.from({ length: 256 }, (_, b) => b.toString(16).padStart(2, "0"));
+
+/**
+ * `<origin>:<lowercase hex sha256 of the UTF-8 text>` (a lone surrogate encodes
+ * as U+FFFD), the same key on every runtime. On Bun the hash is computed
+ * synchronously, so a lookup costs no event-loop turn; where the runtime has no
+ * synchronous hash (a Cloudflare Worker) it is computed with WebCrypto, and the
+ * key is a promise.
+ */
+function cacheKey(text: string, origin: TrustOrigin): string | Promise<string> {
+  const bytes = UTF8.encode(text);
+  if (typeof Bun !== "undefined") {
+    return `${origin}:${new Bun.CryptoHasher("sha256").update(bytes).digest("hex")}`;
+  }
+  return webCryptoHex(bytes).then((hex) => `${origin}:${hex}`);
+}
+
+/** Lowercase hex SHA-256 through WebCrypto, which a Worker provides. */
+async function webCryptoHex(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  let hex = "";
+  for (const byte of digest) hex += HEX_BYTE[byte];
+  return hex;
 }
 
 /**
@@ -307,8 +349,11 @@ export async function classifyBoundary(
     };
   }
 
-  const key = cacheKey(text, origin);
-  if (opts.bypassCache !== true) {
+  // The key is computed only when the cache is read and written, and awaited
+  // only where it is a promise (see cacheKey).
+  const keyed = opts.bypassCache === true ? undefined : cacheKey(text, origin);
+  const key = typeof keyed === "object" ? await keyed : keyed;
+  if (key !== undefined) {
     const hit = cache.get(key);
     if (hit !== undefined) {
       return makeResult(text, origin, severity, hit.verdict, true);
@@ -320,7 +365,7 @@ export async function classifyBoundary(
   const llmClassifier = opts.llmClassifier ?? defaultLlmClassifier;
   const verdict = await classifyText(text, llmClassifier !== undefined ? { llmClassifier } : {});
 
-  if (opts.bypassCache !== true) {
+  if (key !== undefined) {
     cache.set(key, { verdict, origin });
   }
 
@@ -391,3 +436,15 @@ export async function classifyBoundaryRaw(
   const res = await classifyBoundary(text, { ...opts, severity: "warn" });
   return { verdict: res.verdict, origin: res.origin, fromCache: res.fromCache };
 }
+
+/**
+ * Internal seams exposed ONLY for unit tests. Not part of the public API and
+ * not subject to semver: the test suite checks the cache key against a
+ * reference digest through the function the cache itself uses, and the
+ * WebCrypto digest a Worker computes it with. Do not import from application
+ * code.
+ */
+export const __internals = {
+  cacheKey,
+  webCryptoHex,
+} as const;

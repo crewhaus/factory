@@ -354,6 +354,12 @@ export const ErrorCode = {
   BadRequest: "bad_request",
   BudgetExceeded: "budget_exceeded",
   InternalError: "internal_error",
+  /**
+   * The run input (`runs.create` / `runs.continue` `input`) was refused by the
+   * prompt-injection check before any model call. `data` carries the verdict,
+   * `{ origin, rules, score }`, never the text. HTTP 422.
+   */
+  InputBlocked: "input_blocked",
 } as const;
 
 export type ErrorCodeT = (typeof ErrorCode)[keyof typeof ErrorCode];

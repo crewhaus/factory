@@ -169,3 +169,26 @@ describe("gradeVoiceSession + aggregate (#65)", () => {
     expect(report).toContain("FAIL b");
   });
 });
+
+describe("the input-check events a voice harness logs", () => {
+  test("input_blocked and input_warned lines parse, and no metric reads them", () => {
+    const withChecks = `${CLEAN}${[
+      { ts: 1050, kind: "input_warned", itemId: "item_1", rules: ["anthropic-tag-injection"] },
+      { ts: 1950, kind: "input_blocked", itemId: "item_2", rules: ["ignore-previous"] },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n")}\n`;
+    const session = parseReplayLog("sess_checked", withChecks);
+    expect(session.events.map((e) => e.kind)).toContain("input_blocked");
+    expect(session.events.map((e) => e.kind)).toContain("input_warned");
+    // The smoke daemon's envelope parses too.
+    const wrapped = parseReplayLog(
+      "sess_wrapped",
+      `${JSON.stringify({ ts: 7, kind: "voice_event", event: { kind: "input_blocked", rules: ["x"] } })}\n`,
+    );
+    expect(wrapped.events[0]?.kind).toBe("input_blocked");
+    const { sessionId: _a, ...checked } = computeVoiceMetrics(session);
+    const { sessionId: _b, ...plain } = computeVoiceMetrics(parseReplayLog("sess_plain", CLEAN));
+    expect(checked).toEqual(plain);
+  });
+});

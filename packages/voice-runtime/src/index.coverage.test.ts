@@ -249,7 +249,7 @@ describe("createOpenAIRealtimeAdapter — commitInput (334-340)", () => {
 describe("createOpenAIRealtimeAdapter — sendText (343-352)", () => {
   test("creates a user message item then requests a response", async () => {
     const { adapter, socket } = await connectedOpenAI();
-    adapter.sendText("hello there");
+    await adapter.sendText("hello there");
     expect(socket.sent).toHaveLength(2);
     expect(socket.sent[0]).toEqual({
       type: "conversation.item.create",
@@ -544,7 +544,7 @@ describe("createVapiRealtimeAdapter — send path methods (501-518)", () => {
 
   test("sendText sends response.create with the text input", async () => {
     const { adapter, socket } = await connectedVapi({});
-    adapter.sendText("say hi");
+    await adapter.sendText("say hi");
     expect(socket.sent[0]).toEqual({
       type: "response.create",
       response: { modalities: ["text", "audio"], input: "say hi" },
