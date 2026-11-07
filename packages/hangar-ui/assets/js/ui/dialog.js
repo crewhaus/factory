@@ -82,9 +82,18 @@ export function openDialog(opts) {
   const finish = () => {
     if (finished) return;
     finished = true;
+    // Focus goes back only if nothing else has taken it since: the native
+    // `close` event comes a task later, and by then the reader may have moved.
+    const active = document.activeElement;
+    const unclaimed = active === null || active === document.body || node.contains(active);
     leaveDialog(node);
     node.remove();
-    if (opener instanceof HTMLElement && opener.isConnected && opener !== document.body) {
+    if (
+      unclaimed &&
+      opener instanceof HTMLElement &&
+      opener.isConnected &&
+      opener !== document.body
+    ) {
       opener.focus({ preventScroll: true });
     }
     if (typeof o.onClose === "function") o.onClose();

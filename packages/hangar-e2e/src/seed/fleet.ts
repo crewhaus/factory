@@ -42,9 +42,12 @@ export type SeedFleetOptions = {
    * Seed what the accessibility journeys need on screen: three pending
    * approvals (a keyboard tour spends two grants and needs one left to hold
    * focus), an open review item, an eval history below its pinned baseline
-   * (the charts, the trend, an Advisor item to explain), and a spec registry
-   * with one archived version (the version dialogs open from its row). Off
-   * by default, so every other journey's fleet is unchanged.
+   * (the charts, the trend, an Advisor item to explain), a spec registry
+   * with one archived version (the version dialogs open from its row), and,
+   * for the cli shape, a stand-in compiled bundle, so a start can be planned
+   * on a machine with no `crewhaus` CLI installed (a journey answers the
+   * start itself; nothing is ever spawned). Off by default, so every other
+   * journey's fleet is unchanged.
    */
   readonly rich?: boolean;
 };
@@ -144,10 +147,12 @@ function richRecords(
       [RICH_SPEC_VERSION]: `name: ${specName}\ntarget: ${target}\nagent:\n  model: ${model}\n`,
     },
   };
+  // Never run: the journeys that press Start answer the request themselves.
+  const bundle = target === "cli" ? { bundle: { entry: "agent.ts", body: "// stand-in\n" } } : {};
   return {
     approvalIds,
     reviewId,
-    options: { approvals, reviewQueue, evalIndex, baselines, specRegistry },
+    options: { approvals, reviewQueue, evalIndex, baselines, specRegistry, ...bundle },
   };
 }
 

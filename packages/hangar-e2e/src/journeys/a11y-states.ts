@@ -137,11 +137,17 @@ export async function waitFor(page: Page, selector: string, what: string): Promi
 /** Close every open dialog and tooltip, so the next state starts clean. */
 export async function resetOverlays(page: Page): Promise<void> {
   await page.evaluate(async () => {
-    for (const dialog of document.querySelectorAll("dialog[open]")) {
-      (dialog as HTMLDialogElement).close();
-    }
-    // A dialog's `close` event, and the focus it gives back, come a task later.
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // A dialog's `close` event, and the focus it gives back, come a task
+    // later: wait for each one before the next state starts.
+    const closed = [...document.querySelectorAll<HTMLDialogElement>("dialog[open]")].map(
+      (dialog) =>
+        new Promise<void>((resolve) => {
+          dialog.addEventListener("close", () => setTimeout(resolve, 0), { once: true });
+          setTimeout(resolve, 1_000);
+          dialog.close();
+        }),
+    );
+    await Promise.all(closed);
     (document.activeElement as HTMLElement | null)?.blur?.();
   });
 }

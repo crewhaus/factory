@@ -441,6 +441,14 @@ a.chip {
   align-items: center;
   gap: 6px;
   white-space: nowrap;
+  max-width: 100%;
+}
+/* A long state wraps on a narrow screen rather than widening the page. */
+.sup-strip .chip,
+.proc-facts .dot-pair,
+.proc-facts .dot-label {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .dot {
   width: 8px;

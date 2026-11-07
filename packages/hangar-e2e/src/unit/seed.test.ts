@@ -206,6 +206,8 @@ describe("with rich: true", () => {
       readFileSync(join(crewhaus, "specs", harness.specName, "manifest.json"), "utf8"),
     ) as { versions: string[] };
     expect(manifest.versions).toEqual([RICH_SPEC_VERSION]);
+    // A start can be planned without a CLI on PATH.
+    expect(readFileSync(join(harness.dir, "dist", "agent.ts"), "utf8")).toContain("stand-in");
   });
 
   test("is off by default", async () => {
