@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { PreflightItem, PreflightReport } from "@crewhaus/preflight";
 import { buildReport } from "@crewhaus/preflight";
 import { evaluateGate, formatGateRefusal, isUnforceable, runPreflightGate } from "./gate";
+import { findHarnessRoot } from "./spawn-contracts";
 
 const item = (over: Partial<PreflightItem>): PreflightItem => ({
   id: "x.1",
@@ -85,7 +86,7 @@ describe("runPreflightGate", () => {
       },
     });
     expect(decision.allowed).toBe(false);
-    expect(seen[0]?.["harnessDir"]).toBe("/h");
+    expect(seen[0]?.["harnessDir"]).toBe(findHarnessRoot("/h"));
     expect((seen[0]?.["env"] as Record<string, string>)["ANTHROPIC_API_KEY"]).toBe("present");
     expect(seen[0]?.["ports"]).toEqual([{ port: 3000, source: "allocator" }]);
   });
