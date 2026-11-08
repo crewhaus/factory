@@ -46,6 +46,7 @@ import {
   writeSync,
 } from "node:fs";
 import * as path from "node:path";
+import { protectedRootLinkedInto, protectedWriteRefusal } from "@crewhaus/tool-safety/fs";
 import { compareStrings } from "./lib/names";
 import {
   type SafePath,
@@ -54,6 +55,7 @@ import {
   resolveSafe,
   resolveWithin,
   toPosix,
+  workspaceRoot,
 } from "./paths";
 
 /** Where state lives when the caller does not say otherwise. */
@@ -74,12 +76,34 @@ export type ReadOutcome<T> =
   | { readonly kind: "missing" }
   | { readonly kind: "corrupt"; readonly reason: string };
 
+/** A state directory, and the roots a call that writes beneath it keeps out of. */
+export type StateRoot = SafePath & { readonly protectedRoots?: readonly string[] };
+
+/**
+ * Raised by {@link statePath} when a link would carry a write into a protected
+ * root. Its message is the refusal the tool returns.
+ */
+class ProtectedStateWrite extends ToolPermissionError {
+  constructor(toolName: string, label: string) {
+    super(toolName, label);
+    this.message = protectedWriteRefusal(toolName, `"${label}"`);
+  }
+}
+
 /**
  * Resolve the state directory for this call. Throws `ToolPermissionError`
- * when the caller points it outside the workspace.
+ * when the caller points it outside the workspace. A tool that writes passes
+ * the roots on its call's bridge, and every interior path it then asks for is
+ * held to them: the floor reads the directory the call names, and where a
+ * record lands beneath it is read here.
  */
-export function stateRoot(toolName: string, stateDir: string | undefined): SafePath {
-  return resolveSafe(toolName, stateDir ?? DEFAULT_STATE_DIR);
+export function stateRoot(
+  toolName: string,
+  stateDir: string | undefined,
+  protectedRoots: readonly string[] = [],
+): StateRoot {
+  const root = resolveSafe(toolName, stateDir ?? DEFAULT_STATE_DIR);
+  return protectedRoots.length > 0 ? { ...root, protectedRoots } : root;
 }
 
 /**
@@ -96,8 +120,11 @@ export function stateRoot(toolName: string, stateDir: string | undefined): SafeP
  * The returned path is the lexical one, which is what the result messages and
  * `relativeToRoot` are expressed in; the residual check-to-use window is the
  * usual one, and is narrower than the lifetime of any single tool call.
+ *
+ * For a root opened to write, a path that resolves into a protected root
+ * through a link is refused here, before anything is opened or created.
  */
-export function statePath(toolName: string, root: SafePath, ...segments: string[]): string {
+export function statePath(toolName: string, root: StateRoot, ...segments: string[]): string {
   const label = segments.join("/");
   // One string, not one argument per segment: Bun's `path.join` keeps only
   // (argument count mod 65,536) of its arguments, and StateImport's count is
@@ -105,7 +132,13 @@ export function statePath(toolName: string, root: SafePath, ...segments: string[
   // so `a/` still names `a` and not `a/`.
   const joined = path.join(root.abs, segments.filter((s) => s !== "").join(path.sep));
   if (!isInside(root.abs, joined)) throw new ToolPermissionError(toolName, label);
-  resolveWithin(toolName, root.real, joined, label);
+  const landsAt = resolveWithin(toolName, root.real, joined, label);
+  if (
+    root.protectedRoots !== undefined &&
+    protectedRootLinkedInto(joined, landsAt, root.protectedRoots, workspaceRoot()) !== undefined
+  ) {
+    throw new ProtectedStateWrite(toolName, label);
+  }
   return joined;
 }
 

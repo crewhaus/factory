@@ -185,7 +185,9 @@ named.** Containing a directory and not its leaves contains nothing:
 - `routing/freeze.json` and its `.tmp`, `routing/priors.json`.
 - `experiments/<sanitized>.jsonl` — under the name `experimentFileName`
   produces, not the one the caller typed. A batch append groups by
-  `record.experiment` and can touch several ledgers; each is contained.
+  `record.experiment` and can touch several ledgers; each is contained, and
+  `ExperimentLedger` refuses one a link leads into a root the runtime hands the
+  call on its bridge, in every permission mode.
 - Every run directory and stage path a `readdir` of `.crewhaus/flywheel` hands
   back, and every experiment name a `readdir` of `.crewhaus/experiments` hands
   back. A name a listing produced is exactly as untrusted as one a caller

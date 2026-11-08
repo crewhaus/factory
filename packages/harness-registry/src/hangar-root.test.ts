@@ -10,9 +10,10 @@
 import { describe, expect, test } from "bun:test";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { hangarStateRoots, resolveHangarRoot } from "./hangar-root";
+import { hangarStateRoots, registryStateFiles, resolveHangarRoot } from "./hangar-root";
 import {
   resolveHangarRoot as exportedHangarRoot,
+  registryStateFiles as exportedRegistryFiles,
   hangarStateRoots as exportedStateRoots,
 } from "./index";
 
@@ -73,6 +74,7 @@ describe("resolveHangarRoot", () => {
   test("the package entry exports this resolver itself", () => {
     expect(exportedHangarRoot).toBe(resolveHangarRoot);
     expect(exportedStateRoots).toBe(hangarStateRoots);
+    expect(exportedRegistryFiles).toBe(registryStateFiles);
   });
 });
 
@@ -119,5 +121,35 @@ describe("hangarStateRoots: every Hangar root the environment names, and the def
       expect(hangarStateRoots()).toContain(elsewhere);
       expect(hangarStateRoots({})).toEqual([DEFAULT]);
     });
+  });
+});
+
+describe("registryStateFiles: the registry file the environment names, and the default always", () => {
+  const DEFAULT_FILE = join(homedir(), ".crewhaus", "harnesses.json");
+
+  test("with no variable, only the default", () => {
+    expect(registryStateFiles({})).toEqual([DEFAULT_FILE]);
+    expect(registryStateFiles({ CREWHAUS_REGISTRY_ROOT: "" })).toEqual([DEFAULT_FILE]);
+  });
+
+  test("a registry root adds its file and keeps the default", () => {
+    expect(registryStateFiles({ CREWHAUS_REGISTRY_ROOT: "/srv/reg" })).toEqual([
+      resolve("/srv/reg", "harnesses.json"),
+      DEFAULT_FILE,
+    ]);
+  });
+
+  test("a registry root that is the default is one file, and a relative one resolves", () => {
+    expect(registryStateFiles({ CREWHAUS_REGISTRY_ROOT: join(homedir(), ".crewhaus") })).toEqual([
+      DEFAULT_FILE,
+    ]);
+    expect(registryStateFiles({ CREWHAUS_REGISTRY_ROOT: "reg" })).toEqual([
+      resolve("reg", "harnesses.json"),
+      DEFAULT_FILE,
+    ]);
+  });
+
+  test("the Hangar root's variable moves no registry file", () => {
+    expect(registryStateFiles({ CREWHAUS_HANGAR_ROOT: "/srv/h" })).toEqual([DEFAULT_FILE]);
   });
 });

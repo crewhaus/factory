@@ -1186,3 +1186,92 @@ test("an unpredictable registration whose content IS the pinned version is not r
   expect(versionsOnDisk()).toEqual(["v1", "v2"]);
   expect(pinsOnDisk()).toEqual({ prod: "v2" });
 });
+
+// ---------------------------------------------------------------------------
+// the roots on the call's bridge
+// ---------------------------------------------------------------------------
+
+const ROOTS = [".crewhaus/graders", ".crewhaus/retention.json", "bunfig.toml", "reg/_tenants/held"];
+const onBridge = { bridge: { protectedRoots: ROOTS } };
+const onTheBridge = async (tool: RegisteredTool, input: unknown): Promise<Json> =>
+  JSON.parse(String(await tool.execute(input as never, onBridge as never))) as Json;
+
+test("SpecPin and DeployRollback refuse a spec that lands in a root, by the registry and the name together", async () => {
+  writeFileSync(path.join(tmp, "x.yaml"), "name: x\n");
+  for (const [registryDir, name] of [
+    [".crewhaus", "graders"],
+    [".crewhaus", "retention.json"],
+    [".", "bunfig.toml"],
+  ] as const) {
+    const pin = await onTheBridge(specPin, { name, registryDir, specFile: "x.yaml", env: "prod" });
+    expect({ name, status: pin["status"], code: pin["code"] }).toEqual({
+      name,
+      status: "refused",
+      code: "refused",
+    });
+    expect(String(pin["reason"])).toContain("Nothing was written.");
+    const dry = await onTheBridge(specPin, {
+      name,
+      registryDir,
+      specFile: "x.yaml",
+      env: "prod",
+      dryRun: true,
+    });
+    expect(dry["status"]).toBe("refused");
+    const back = await onTheBridge(deployRollback, {
+      name,
+      registryDir,
+      env: "prod",
+      toVersion: "v1",
+      dryRun: false,
+    });
+    expect(back["status"]).toBe("refused");
+    expect(String(back["reason"])).toContain("Nothing was written.");
+    expect(existsSync(path.join(tmp, registryDir, name))).toBe(false);
+  }
+});
+
+test("SpecPin refuses a tenant's overlay that lands in a root, and writes the same spec without it", async () => {
+  writeFileSync(path.join(tmp, "x.yaml"), "name: x\n");
+  const base = { name: "spec", registryDir: "reg", specFile: "x.yaml", env: "prod" };
+  const held = await onTheBridge(specPin, { ...base, tenant: "held" });
+  expect(held["status"]).toBe("refused");
+  expect(existsSync(path.join(tmp, "reg", "_tenants"))).toBe(false);
+  expect((await onTheBridge(specPin, base))["status"]).toBe("pinned");
+});
+
+test("SpecPin refuses a version file or manifest that resolves through a link into a root", async () => {
+  writeFileSync(path.join(tmp, "x.yaml"), "name: x\n");
+  writeFileSync(path.join(tmp, "bunfig.toml"), "kept\n");
+  mkdirSync(path.join(tmp, "reg", "spec"), { recursive: true });
+  symlinkSync(path.join("..", "..", "bunfig.toml"), path.join(tmp, "reg", "spec", "v1.yaml"));
+  const base = { name: "spec", registryDir: "reg", specFile: "x.yaml" };
+  const out = await onTheBridge(specPin, base);
+  expect(out["status"]).toBe("refused");
+  expect(String(out["reason"])).toContain("Nothing was written.");
+  expect(readFileSync(path.join(tmp, "bunfig.toml"), "utf8")).toBe("kept\n");
+  // A link whose target does not exist yet is read where it lands.
+  rmSync(path.join(tmp, "bunfig.toml"));
+  expect((await onTheBridge(specPin, base))["status"]).toBe("refused");
+  expect(existsSync(path.join(tmp, "bunfig.toml"))).toBe(false);
+});
+
+test("a default registry and one elsewhere write with the roots on the bridge", async () => {
+  writeFileSync(path.join(tmp, "x.yaml"), "name: x\n");
+  // The name is a root's beneath `.crewhaus`, and is no root's in the registry.
+  const pin = await onTheBridge(specPin, { name: "graders", specFile: "x.yaml", env: "prod" });
+  expect(pin["status"]).toBe("pinned");
+  expect(existsSync(path.join(tmp, ".crewhaus", "specs", "graders", "manifest.json"))).toBe(true);
+  expect(existsSync(path.join(tmp, ".crewhaus", "graders"))).toBe(false);
+});
+
+test("with no roots on the call, the registry goes wherever it is named", async () => {
+  writeFileSync(path.join(tmp, "x.yaml"), "name: x\n");
+  const out = await call(specPin, {
+    name: "graders",
+    registryDir: ".crewhaus",
+    specFile: "x.yaml",
+    env: "prod",
+  });
+  expect(out["status"]).toBe("pinned");
+});

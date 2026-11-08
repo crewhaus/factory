@@ -14,7 +14,8 @@ Pure registry-file layer by design: it never parses specs (callers supply
 
 - Registry root: the directory containing `harnesses.json` —
   `CREWHAUS_REGISTRY_ROOT`, default `~/.crewhaus`. An explicit `root`
-  option wins over the env var.
+  option wins over the env var. The runtime-state floor protects the file
+  there and `~/.crewhaus/harnesses.json` always (`registryStateFiles`).
 - Hangar root: where Hangar (`crewhaus hangar`) keeps its token, settings,
   cache and job ledger — `CREWHAUS_HANGAR_ROOT`, else
   `<registryRoot>/hangar`, so `~/.crewhaus/hangar` by default. The CLI, the

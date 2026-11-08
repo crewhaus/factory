@@ -27,10 +27,11 @@
  * - {@link protectedRootsOf} / {@link protectedRootHolding} /
  *   {@link protectedRootBeneath}: the run's own record (session logs,
  *   spilled tool results, proof bundles) and the files that control it (the
- *   harness's run files and settings, Hangar's directory), which a tool that
- *   writes beneath a directory refuses to reach.
+ *   harness's run files, settings, gate records and environment files, Hangar's
+ *   directory), which a tool that writes beneath a directory refuses to reach.
  *   {@link protectedRootLinkedInto} names the root a link carries a path into,
- *   and {@link foldedName} is one name as a filesystem that folds names
+ *   {@link rootsBesideStore} leaves out the root a tool keeps its own store
+ *   in, and {@link foldedName} is one name as a filesystem that folds names
  *   compares it.
  *
  * Every refusal is a {@link SafeFsFailure} naming the caller's path and the
@@ -107,4 +108,5 @@ export {
   protectedRootsBeneath,
   protectedRootsOf,
   protectedWriteRefusal,
+  rootsBesideStore,
 } from "./protected";

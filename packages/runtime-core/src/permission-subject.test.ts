@@ -145,13 +145,14 @@ const gitBranchDelete = buildTool({
 });
 const envUpsert = buildTool({
   name: "EnvUpsert",
-  description: "fills `path` with .env in execute, like EnvFileUpsert",
+  description: "fills `path` with deploy.env in execute, like EnvFileUpsert with its own default",
   inputSchema: z.object({
     path: z.string().optional(),
     entries: z.array(z.object({ key: z.string(), value: z.string() })),
   }),
   destructive: true,
-  operativeArgs: [{ field: "path", kind: "path", default: ".env" }],
+  // Not the working directory's `.env`, which the floor keeps: a rule decides this one.
+  operativeArgs: [{ field: "path", kind: "path", default: "deploy.env" }],
   execute: record("EnvUpsert"),
 });
 const paginate = buildTool({
@@ -354,7 +355,7 @@ describe("an extra argument in front of a scoped deny/ask (permission-integratio
 });
 
 describe("a left-out field the tool fills with a default (permission-integration#0)", () => {
-  const denyEnv = rules(["alwaysDeny", "EnvUpsert(.env)"], ["alwaysAllow", "EnvUpsert"]);
+  const denyEnv = rules(["alwaysDeny", "EnvUpsert(deploy.env)"], ["alwaysAllow", "EnvUpsert"]);
   test("deny: omitting the path does not dodge a deny on the default", async () => {
     await expectBlocked(
       { name: "EnvUpsert", input: { entries: [{ key: "API_KEY", value: "attacker" }] } },

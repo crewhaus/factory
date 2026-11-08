@@ -1296,4 +1296,28 @@ describe("DatasetPut, where a dataset lands against the roots on its bridge", ()
     const out = await put({ name: "qa" }, ".crewhaus/run");
     expect(JSON.parse(out).wrote).toBe(true);
   });
+
+  test("its own registry is a root it adds to, and every other root still holds", async () => {
+    const roots = [".crewhaus/datasets", ".crewhaus/graders", ".crewhaus/run"];
+    for (const input of [{ name: "qa" }, { registryDir: ".crewhaus/datasets", name: "named" }]) {
+      expect(JSON.parse(await put(input, ...roots)).wrote).toBe(true);
+    }
+    for (const input of [
+      { registryDir: ".crewhaus", name: "graders" },
+      { registryDir: ".crewhaus", name: "datasets" },
+      { registryDir: "x", name: "qa" },
+    ]) {
+      const held = input.registryDir === "x" ? ["x", ...roots] : roots;
+      const out = await put(input, ...held);
+      expect({ input, refused: out.startsWith("DatasetPut: refused") }).toEqual({
+        input,
+        refused: true,
+      });
+    }
+  });
+
+  test("a registry named by another path that is a root keeps no store there", async () => {
+    const out = await put({ registryDir: "elsewhere", name: "qa" }, "elsewhere");
+    expect(out.startsWith("DatasetPut: refused")).toBe(true);
+  });
 });

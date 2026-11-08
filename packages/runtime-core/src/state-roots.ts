@@ -19,8 +19,18 @@
  *   and control files a daemon keeps there), its settings file
  *   (`.crewhaus/settings.json`: permission rules, runtime hooks and the
  *   manager's spawn hooks) and Hangar's directory (the Hangar root, where
- *   `crewhaus hangar` keeps its token and settings). CrewHaus's own code
- *   still writes them; the floor applies to tool calls only.
+ *   `crewhaus hangar` keeps its token and settings) and registry file.
+ * - The records a harness's gates and janitors keep: the deploy approvals and
+ *   environments, the graders, the judge calibration, the evals, datasets,
+ *   retention pins, audit trail, graph checkpoints and advice.
+ * - The operator's configuration in the working directory: the environment
+ *   files Bun loads there, any file `manager.envFiles` declares, and the
+ *   `bunfig.toml` and `.npmrc` there.
+ * - A managed run's whole tenants root, and the approvals file beside session
+ *   logs that a session directory puts at the working directory.
+ *
+ * CrewHaus's own code still writes all of them; the floor applies to tool
+ * calls only.
  *
  * Each root is given every way a path the canonicaliser produces can spell
  * it: absolute as resolved, absolute with symlinks followed (macOS's
@@ -30,13 +40,14 @@
  * operative arguments carries, and what the floor compares a directory the
  * call acts beneath with).
  */
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DEFAULT_ROOT_DIR } from "@crewhaus/event-log";
-import { hangarStateRoots } from "@crewhaus/harness-registry";
+import { hangarStateRoots, registryStateFiles } from "@crewhaus/harness-registry";
+import { DEFAULT_APPROVALS_FILENAME } from "@crewhaus/session-store";
 import type { Tenant } from "@crewhaus/tenancy";
 import { DEFAULT_ROOT_DIR as TOOL_RESULTS_ROOT_DIR } from "@crewhaus/tool-result-store";
-import { protectedRootHolding } from "@crewhaus/tool-safety/fs";
+import { protectedRootHolding, rootsBesideStore } from "@crewhaus/tool-safety/fs";
 
 /**
  * The files that control a run, relative to its working directory: the run
@@ -48,6 +59,43 @@ const CONTROL_FILES: readonly string[] = [
   join(".crewhaus", "run"),
   join(".crewhaus", "settings.json"),
 ];
+
+/** The records a harness's gates and janitors keep. */
+const GATE_RECORDS: readonly string[] = [
+  join(".crewhaus", "approvals"),
+  join(".crewhaus", "environments.json"),
+  join(".crewhaus", "graders"),
+  join(".crewhaus", "judge-calibration.json"),
+  join(".crewhaus", "evals"),
+  join(".crewhaus", "datasets"),
+  join(".crewhaus", "retention.json"),
+  join(".crewhaus", "audit"),
+  join(".crewhaus", "graphs"),
+  join(".crewhaus", "advice"),
+];
+
+/** Every file Bun loads into a process started here, whichever NODE_ENV. */
+const ENV_FILES: readonly string[] = [
+  ".env",
+  ".env.local",
+  ".env.development",
+  ".env.development.local",
+  ".env.production",
+  ".env.production.local",
+  ".env.test",
+  ".env.test.local",
+];
+
+/** What Bun and npm read from the working directory of any process. */
+const START_CONFIG: readonly string[] = ["bunfig.toml", ".npmrc"];
+
+/**
+ * The gate records a tool keeps its own store in, through a format of its own:
+ * `DatasetPut` adds a version to `.crewhaus/datasets` and `EvalBaselinePin` a
+ * pin to `.crewhaus/evals` ({@link relocatingFieldLeftOut}). Written out, so a
+ * root added later is the floor's until someone puts it here on purpose.
+ */
+const TOOL_STORES: readonly string[] = [join(".crewhaus", "datasets"), join(".crewhaus", "evals")];
 
 /** `path` with every symlink on its existing part followed, or `undefined` when nothing of it exists. */
 function followed(path: string): string | undefined {
@@ -97,6 +145,44 @@ function recordRootPaths(
   return [sessions, toolResults, proofs];
 }
 
+/**
+ * The directory a managed run's tenants live under, when the session root has
+ * the shape `buildTenant` gives it (`<tenantsRoot>/<id>/sessions`). An override
+ * puts it somewhere else, and its parent is then no tenants root.
+ */
+function tenantsRootPaths(tenant: Tenant | undefined, cwd: string): string[] {
+  if (tenant === undefined) return [];
+  const sessions = resolve(cwd, tenant.sessionRoot);
+  return basename(sessions) === "sessions" && basename(dirname(sessions)) === tenant.id
+    ? [resolve(sessions, "..", "..")]
+    : [];
+}
+
+/**
+ * The files `manager.envFiles` declares in `<cwd>/.crewhaus/settings.json`,
+ * resolved against `cwd`. Tolerant as the supervisor's own reader is, and equal
+ * to it (a test holds the two together): a missing or malformed file, a key of
+ * the wrong type and a bad entry each read as nothing.
+ */
+export function declaredEnvFiles(cwd: string): string[] {
+  let settings: unknown;
+  try {
+    settings = JSON.parse(readFileSync(resolve(cwd, ".crewhaus", "settings.json"), "utf8"));
+  } catch {
+    return [];
+  }
+  if (typeof settings !== "object" || settings === null) return [];
+  const manager = (settings as Record<string, unknown>)["manager"];
+  if (typeof manager !== "object" || manager === null || Array.isArray(manager)) return [];
+  const declared = (manager as Record<string, unknown>)["envFiles"];
+  if (!Array.isArray(declared)) return [];
+  return declared
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "")
+    .map((entry) => resolve(cwd, entry));
+}
+
 /** Every way the canonicaliser can spell `root`, added to `into`. */
 function addSpellings(into: Set<string>, root: string, cwd: string): void {
   into.add(root);
@@ -110,7 +196,7 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
 }
 
 /**
- * The runtime-state roots of a run, in three groups.
+ * The runtime-state roots of a run, in these groups.
  *
  * - The run's record: its session-log root (`sessionRootDir` as
  *   `runChatLoop` resolved it — the tenant's, `CREWHAUS_SESSION_DIR`, or
@@ -118,18 +204,32 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   `toolResultRoot`, else `<cwd>/.crewhaus/tool-results`, where the runtime
  *   saves an output too long for the log — `@crewhaus/tool-result-store`) and
  *   its proofs root (the tenant's `proofs/`, else `<cwd>/.crewhaus/proofs`,
- *   where every spec's bundles and artifacts live).
+ *   where every spec's bundles and artifacts live). With them, a managed
+ *   run's whole tenants root, when the tenant has `buildTenant`'s shape, so
+ *   the files under it are the operator's and each tenant's own store's.
  * - The files that control the run, against `cwd` whatever the tenant:
- *   `.crewhaus/run` and `.crewhaus/settings.json`. They are the files the
+ *   `.crewhaus/run` and `.crewhaus/settings.json`, which are the files the
  *   run loads its settings layer and hooks from, and the supervisor keeps
- *   its run files in, both in the harness directory the run works in.
- * - Hangar's directory: every Hangar root `env` names (`CREWHAUS_HANGAR_ROOT`,
- *   `<registryRoot>/hangar`) and `~/.crewhaus/hangar` always
- *   (`hangarStateRoots` in `@crewhaus/harness-registry`, beside the
- *   `resolveHangarRoot` the CLI and the fleet tools use), so a variable can
- *   add a protected root and never move one. `env` is read for those two
- *   variables alone; the default follows the home directory (`homedir()`),
- *   as the Hangar server's own fallback does.
+ *   its run files in, both in the harness directory the run works in; the
+ *   records a harness's gates and janitors keep; the environment files Bun
+ *   loads from there; and its `bunfig.toml` and `.npmrc`. These hold at every
+ *   working directory, with or without a spec. Exact files stay exact: a
+ *   neighbour such as `.env.example` or `.crewhaus/graders.yaml` is not one.
+ * - The approvals file beside session logs a session directory puts at the
+ *   working directory or above it. The record's group leaves such a root to
+ *   the rules; this one file stays protected. A default run adds nothing.
+ * - The files `manager.envFiles` declares ({@link declaredEnvFiles}), read
+ *   from the settings file once per call. One that holds the working
+ *   directory (a declared `.` or `..`) is left to the rules.
+ * - Hangar's directory and registry file: every Hangar root `env` names
+ *   (`CREWHAUS_HANGAR_ROOT`, `<registryRoot>/hangar`) and `~/.crewhaus/hangar`
+ *   always (`hangarStateRoots` in `@crewhaus/harness-registry`, beside the
+ *   `resolveHangarRoot` the CLI and the fleet tools use), and the
+ *   `harnesses.json` of `<registryRoot>` and of `~/.crewhaus`
+ *   (`registryStateFiles`), so a variable can add a protected root and never
+ *   move one. `env` is read for those two variables alone; the default
+ *   follows the home directory (`homedir()`), as the Hangar server's own
+ *   fallback does.
  *
  * The floor reads calls that write. A read of the run's record, a spilled
  * output's parts included, goes on as before.
@@ -140,6 +240,7 @@ export function runtimeStateRoots(
   cwd: string = process.cwd(),
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): string[] {
+  const sessions = resolve(cwd, sessionRootDir ?? DEFAULT_ROOT_DIR);
   /**
    * Each group of roots, and what becomes of a root that holds the working
    * directory itself. A new kind of root is one more entry here.
@@ -152,14 +253,30 @@ export function runtimeStateRoots(
     // session dir pointed at the workspace) would refuse every write the
     // agent makes: it is left to the permission rules rather than walled
     // off whole.
-    { roots: recordRootPaths(sessionRootDir, tenant, cwd), holdingCwd: "skip" },
+    // A tenants root that holds it is left to them the same way.
+    {
+      roots: [...recordRootPaths(sessionRootDir, tenant, cwd), ...tenantsRootPaths(tenant, cwd)],
+      holdingCwd: "skip",
+    },
     // The files that control the run: the working directory's, whatever the
     // tenant. They lie inside it, so they never hold it.
-    { roots: CONTROL_FILES.map((file) => resolve(cwd, file)), holdingCwd: "protect" },
-    // Hangar's directory, every root the environment names and the default.
-    // One that holds the working directory stays protected: the floor refuses
-    // a run inside Hangar's directory that writes there.
-    { roots: hangarStateRoots(env), holdingCwd: "protect" },
+    {
+      roots: [...CONTROL_FILES, ...GATE_RECORDS, ...ENV_FILES, ...START_CONFIG].map((file) =>
+        resolve(cwd, file),
+      ),
+      holdingCwd: "protect",
+    },
+    // The approvals file of a session root the record's group left out above.
+    {
+      roots: within(cwd, sessions) ? [join(sessions, DEFAULT_APPROVALS_FILENAME)] : [],
+      holdingCwd: "protect",
+    },
+    // A declared `.` or `..` must not wall off the working directory.
+    { roots: declaredEnvFiles(cwd), holdingCwd: "skip" },
+    // Hangar's directory, every root the environment names and the default, and
+    // its registry file. One that holds the working directory stays protected:
+    // the floor refuses a run inside Hangar's directory that writes there.
+    { roots: [...hangarStateRoots(env), ...registryStateFiles(env)], holdingCwd: "protect" },
   ];
   const roots = new Set<string>();
   for (const group of groups) {
@@ -191,12 +308,14 @@ export function runtimeRecordRoots(
 /**
  * Does the floor leave out this field declared `relocates`? A store the tool
  * reads whole (`beneath`) and a service it is moved off (`url`) are not where
- * it writes, so they stay out. A path is the store the call writes: it stays
- * out only while it lies in the run's record (EmitTraceEvent's namespaced
- * `custom.*` lines in a session log) and in no other root. The value is the
- * one the call names, else the field's default, and anything else the floor
- * reads as it reads any path. A link is followed, so a store is placed by where
- * it leads too.
+ * it writes, so they stay out. A path is the store the call writes, and it
+ * stays out only where that store is the field's own: a session log's field
+ * (the one whose default is the session directory, EmitTraceEvent's namespaced
+ * `custom.*` lines) in the run's record, or a field whose default is a gate
+ * record ({@link TOOL_STORES}: DatasetPut's versions, EvalBaselinePin's pins) in
+ * that record, and in no other root. The value is the one the call names, else
+ * the field's default, and anything else the floor reads as it reads any path.
+ * A link is followed, so a store is placed by where it leads too.
  */
 export function relocatingFieldLeftOut(
   arg: {
@@ -219,7 +338,19 @@ export function relocatingFieldLeftOut(
       : undefined;
   const store = given === undefined || given === null ? arg.default : given;
   if (typeof store !== "string" || store === "") return false;
-  if (protectedRootHolding(store, recordRoots, cwd) === undefined) return false;
+  const fieldDefault = arg.default;
+  if (fieldDefault === undefined) return false;
+  if (TOOL_STORES.some((kept) => resolve(cwd, kept) === resolve(cwd, fieldDefault))) {
+    if (protectedRootHolding(store, [fieldDefault], cwd) === undefined) return false;
+    return (
+      protectedRootHolding(store, rootsBesideStore(fieldDefault, roots, cwd), cwd) === undefined
+    );
+  }
+  // The session directory is the field's own wherever the run has moved it.
+  const keepsLogs =
+    resolve(cwd, fieldDefault) === resolve(cwd, DEFAULT_ROOT_DIR) ||
+    protectedRootHolding(fieldDefault, recordRoots, cwd) !== undefined;
+  if (!keepsLogs || protectedRootHolding(store, recordRoots, cwd) === undefined) return false;
   const others = roots.filter((root) => !recordRoots.includes(root));
   return protectedRootHolding(store, others, cwd) === undefined;
 }

@@ -71,6 +71,11 @@ read is not exempt from any of this: that one path was reached with no
 containment at all, and a symlink planted at it returned a file from outside
 the workspace as the tenant's pinned version.
 
+`SpecPin` and `DeployRollback` hold the same paths to the roots the runtime hands
+each call on its bridge (the run's own record and the files that control it):
+one that lands in a root, by the registry and the name together or through a
+link, is refused in every permission mode, and nothing is written.
+
 **Could not determine is not no.** A manifest that will not parse is never "no
 versions". A `manifest.json` that is a dangling symlink is never an absent one:
 the registry probes with `existsSync`, which follows the link and answers

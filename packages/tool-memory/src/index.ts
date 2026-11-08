@@ -123,6 +123,7 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): MemoryToolBun
 
   const remember: RegisteredTool = buildTool({
     name: "Remember",
+    operativeArgs: [],
     description:
       "Store a fact for future sessions. Use sparingly — once a user mentions something they want you to remember (preferences, important dates, contact details, opinions), call this. The memory persists in `.crewhaus/memories/<spec>.jsonl` and is searchable via Recall. An optional ttlDays makes the memory expire.",
     inputSchema: rememberSchema,
@@ -170,6 +171,7 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): MemoryToolBun
 
   const forget: RegisteredTool = buildTool({
     name: "MemoryForget",
+    operativeArgs: [],
     description:
       "Explicitly forget stored memories that are wrong, stale, or superseded. Provide either an exact id (mem_…, from Recall/Remember output) or a query — a query forgets EVERY matching memory, so prefer ids when possible. Forgotten memories stop being recalled but remain in the file as superseded (audit trail; never a hard delete).",
     inputSchema: forgetSchema,

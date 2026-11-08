@@ -27,6 +27,9 @@
       "path": "../tool-math"
     },
     {
+      "path": "../tool-safety"
+    },
+    {
       "path": "../watchme-store"
     }
   ],

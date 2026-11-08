@@ -4087,9 +4087,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    *
    *  - one declared `relocates` that names a store the tool works in through
    *    its own format inside the run's record (EmitTraceEvent's namespaced
-   *    `custom.*` lines), or one it reads whole (IncidentBundle's sessions).
-   *    A store anywhere else is read as any path is
-   *    (`relocatingFieldLeftOut`, `./state-roots`);
+   *    `custom.*` lines) or in the gate record that is its own store
+   *    (DatasetPut's versions, EvalBaselinePin's pins), or one it reads whole
+   *    (IncidentBundle's sessions). A store anywhere else is read as any path
+   *    is (`relocatingFieldLeftOut`, `./state-roots`);
    *  - one declared `source` holds where the tool takes a value FROM (the
    *    files IndexBuild indexes, the file DatasetPut reads, the reference
    *    EnvFileUpsert copies a secret out of): reading a spilled output or a
@@ -4108,12 +4109,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * Every other operative value counts — a secret reference's file included
    * (SecretRotate's `ref` names the file it writes). `undefined` ⇒ the
    * call's operative values as they are (a tool with neither kind of field).
+   *
+   * A tool that declares `[]` says no argument decides where it acts: what it
+   * carries is text (a memory, a plan step, a clipboard's contents), so the
+   * floor reads none of it as a path. One that declares nothing (an MCP or
+   * plugin tool) says nothing, and the floor reads every string it carries.
    */
   const floorValuesOf = (
     tool: RegisteredTool,
     parsedInput: unknown,
   ): ReturnType<typeof operativeValuesFor> => {
     const args = tool.operativeArgs;
+    if (args !== undefined && args.length === 0) return [];
     const named = (name: string): boolean => {
       if (typeof parsedInput !== "object" || parsedInput === null) return false;
       const value = (parsedInput as Record<string, unknown>)[name];

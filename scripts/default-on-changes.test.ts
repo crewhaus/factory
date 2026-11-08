@@ -40,6 +40,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
 import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
+import { buildTenant } from "../packages/tenancy/src/index";
 import {
   SHAPE_TOOL_PROFILES,
   type ToolShape,
@@ -600,7 +601,9 @@ describe("the release notes name every change a harness without provability: see
       const expected = [
         join(base, "hangar"),
         join(base, "registry", "hangar"),
+        join(base, "registry", "harnesses.json"),
         join(homedir(), ".crewhaus", "hangar"),
+        join(homedir(), ".crewhaus", "harnesses.json"),
       ];
       expect(rootsDiffer(outside, expected)).toEqual({ unexpected: [], missing: [] });
       // The comparison reports a root nobody listed, and one that went missing.
@@ -623,9 +626,28 @@ describe("the release notes name every change a harness without provability: see
       .filter((root) => !isAbsolute(root))
       .map((root) => root.split(sep).join("/"));
     const floor = bullets.find((b) => roots.every((root) => b.includes(`\`${root}\``))) ?? "";
-    for (const name of ["~/.crewhaus/hangar", "CREWHAUS_HANGAR_ROOT", "CREWHAUS_REGISTRY_ROOT"]) {
+    for (const name of [
+      "~/.crewhaus/hangar",
+      "~/.crewhaus/harnesses.json",
+      "CREWHAUS_HANGAR_ROOT",
+      "CREWHAUS_REGISTRY_ROOT",
+    ]) {
       expect({ name, named: floor.includes(`\`${name}\``) }).toEqual({ name, named: true });
     }
+  });
+
+  test("the runtime-state floor: a managed run's tenants root is named with the rest", () => {
+    // Only a tenant of `buildTenant`'s shape adds it, so the no-spec check above
+    // never sees it.
+    const cwd = join(tmpdir(), "crewhaus-default-on-changes");
+    const tenantsRoot = join(cwd, "live", "tenants");
+    const tenant = buildTenant("acme", { tenantsRoot });
+    expect(runtimeStateRoots(tenant.sessionRoot, tenant, cwd, {})).toContain(tenantsRoot);
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {})
+      .filter((root) => !isAbsolute(root))
+      .map((root) => root.split(sep).join("/"));
+    const floor = bullets.find((b) => roots.every((root) => b.includes(`\`${root}\``))) ?? "";
+    expect(floor).toContain("tenants root");
   });
 
   test("every tool that refuses a write into those roots on its own is named", () => {
@@ -644,11 +666,12 @@ describe("the release notes name every change a harness without provability: see
       }
     }
     expect(unattributed).toEqual([]);
-    // CopyPath, MovePath, RemovePath, ArchiveExtract (tool-fsx),
-    // GitApplyPatch (tool-git), StateImport (tool-state), StoreMigrate
-    // (tool-lifecycle), EmitTraceEvent (tool-obs) and DatasetPut (tool-dataset)
-    // today.
-    expect(tools.size).toBe(9);
+    // CopyPath, MovePath, RemovePath, ArchiveExtract (tool-fsx), GitApplyPatch
+    // (tool-git), StateImport and the nine tools that keep a store through it
+    // (tool-state), StoreMigrate (tool-lifecycle), EmitTraceEvent (tool-obs),
+    // DatasetPut (tool-dataset), SpecPin and DeployRollback (tool-deploy) and
+    // ExperimentLedger (tool-routing) today.
+    expect(tools.size).toBe(21);
     const unnamed = unlisted(tools, notes, { shipped: SHIPPED_TOOLS, laterNotes }).sort();
     expect(unnamed).toEqual([]);
   });

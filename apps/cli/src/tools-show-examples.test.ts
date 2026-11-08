@@ -436,8 +436,12 @@ const CALLS: Readonly<Record<string, Record<string, unknown>>> = {
   RunTimeline: {},
   SearchCode: { ...REPO, query: "deploy" },
   SearchIssues: { ...REPO, query: "flaky" },
-  SecretLookup: { refs: ["envfile:.env#DEPLOY_TOKEN"] },
-  SecretRotate: { ref: "envfile:.env#DEPLOY_TOKEN", generate: { bytes: 32, encoding: "hex" } },
+  // The printed example names `deploy.env`: the floor keeps the working directory's `.env`.
+  SecretLookup: { refs: ["envfile:deploy.env#DEPLOY_TOKEN"] },
+  SecretRotate: {
+    ref: "envfile:deploy.env#DEPLOY_TOKEN",
+    generate: { bytes: 32, encoding: "hex" },
+  },
   SecretScan: { path: "src/app" },
   SendMessage: { channel: "slack:T0123:C0123:1700000000.1", text: "hi" },
   SeoLint: { file: "src/index.html" },

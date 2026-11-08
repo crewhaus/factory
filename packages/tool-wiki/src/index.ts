@@ -738,6 +738,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
 
   const write: RegisteredTool = buildTool({
     name: "wiki_write",
+    operativeArgs: [],
     description:
       "UPSERT a durable article into the wiki by slug (creates, or patches the existing one). This is how the expert commits time-tested, high-value knowledge to long-term memory. Include sources and a confidenceScore.",
     inputSchema: writeSchema,
@@ -881,6 +882,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
 
   const setSignals: RegisteredTool = buildTool({
     name: "wiki_set_signals",
+    operativeArgs: [],
     description:
       "Set quality signals on an article after verification: `verified` (fact-checked against a primary source) and/or `confidenceScore` (0–1). Use in reflection to promote or demote knowledge.",
     inputSchema: setSignalsSchema,
@@ -937,6 +939,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
 
   const logKnowledgeGap: RegisteredTool = buildTool({
     name: "log_knowledge_gap",
+    operativeArgs: [],
     description:
       "Record a knowledge gap when the expert could NOT confidently answer. These gaps become the highest-priority items for the next study pass — this is how the expert learns WHAT to learn.",
     inputSchema: logGapSchema,

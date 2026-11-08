@@ -1107,24 +1107,30 @@ describe("critic8 — a secret reference is read where its file lands", () => {
     expect(await gate("SecretLookup", { refs: [" env:PATH"] }, env)).toBe("allow");
   }, 60_000);
 
-  test("EnvFileUpsert: a deny reads where valueFrom copies a secret from; .env is untouched", async () => {
-    const before = readFileSync(join(ws, ".env"), "utf8");
-    const copy = (valueFrom: string) => ({ entries: [{ key: "COPIED", valueFrom }] });
+  test("EnvFileUpsert: a deny reads where valueFrom copies a secret from; the file is untouched", async () => {
+    // Another file than the working directory's `.env`, which the floor keeps.
+    const target = join(ws, "public.env");
+    writeFileSync(target, "KEPT=1\n");
+    const before = readFileSync(target, "utf8");
+    const copy = (valueFrom: string) => ({
+      path: "public.env",
+      entries: [{ key: "COPIED", valueFrom }],
+    });
     for (const deny of ["EnvFileUpsert(file:secrets/**)", "*(secrets/**)"]) {
-      const rs = rules(["alwaysDeny", deny], ["alwaysAllow", "EnvFileUpsert(.env)"]);
+      const rs = rules(["alwaysDeny", deny], ["alwaysAllow", "EnvFileUpsert(public.env)"]);
       for (const ref of ["file:secrets/token", "file:pub/lnk/token", " file:./secrets/token"]) {
         expect({ deny, ref, got: await gate("EnvFileUpsert", copy(ref), rs) }).toEqual({
           deny,
           ref,
           got: "deny",
         });
-        expect(readFileSync(join(ws, ".env"), "utf8")).toBe(before);
+        expect(readFileSync(target, "utf8")).toBe(before);
       }
     }
     // Control: the allow on the file still covers a copy from anywhere else.
-    const rs = rules(["alwaysDeny", "*(secrets/**)"], ["alwaysAllow", "EnvFileUpsert(.env)"]);
+    const rs = rules(["alwaysDeny", "*(secrets/**)"], ["alwaysAllow", "EnvFileUpsert(public.env)"]);
     expect(await gate("EnvFileUpsert", copy("file:pub/token"), rs)).toBe("allow");
-    expect(readFileSync(join(ws, ".env"), "utf8")).toContain("COPIED=public-value");
+    expect(readFileSync(target, "utf8")).toContain("COPIED=public-value");
   }, 60_000);
 
   test("a bare NAME: a deny on a file its chain reads fires, an allow by name still grants it", async () => {

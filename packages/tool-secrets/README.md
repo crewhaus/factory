@@ -74,6 +74,9 @@ is written through a temp file created at mode 0600 — `writeFileSync`'s `mode`
 applies at creation only, and a chmod afterwards is a race the plaintext loses —
 and a `.env` never comes back more permissive than it went in.
 
+`EnvFileUpsert` names a file other than the working directory's `.env*`: the
+runtime-state floor keeps those.
+
 ### There is no `.env` quoter here, on purpose
 
 This repo has already shipped the bug a second `.env` codec causes: a writer
