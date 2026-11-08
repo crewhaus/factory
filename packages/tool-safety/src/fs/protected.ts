@@ -32,7 +32,17 @@
  * and {@link landsInGitDirectory} also reads where its links lead.
  */
 import { realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  normalize,
+  parse,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 
 /** Code points HFS+ leaves out when it compares two names. */
 const IGNORED_BY_HFS = /[\u200C-\u200F\u202A-\u202E\u206A-\u206F\uFEFF]/g;
@@ -74,15 +84,37 @@ function foldedPath(path: string): string {
   return `${root}${path.slice(root.length).split(sep).map(foldedName).join(sep)}`;
 }
 
-/** The roots on a tool call's bridge, or none when the run declares none. */
-export function protectedRootsOf(ctx: unknown): readonly string[] {
+/** One list of roots on a tool call's bridge, or none when the run declares none. */
+function bridgeRoots(ctx: unknown, field: "protectedRoots" | "credentialRoots"): readonly string[] {
   if (typeof ctx !== "object" || ctx === null) return [];
   const bridge = (ctx as { readonly bridge?: unknown }).bridge;
   if (typeof bridge !== "object" || bridge === null) return [];
-  const roots = (bridge as { readonly protectedRoots?: unknown }).protectedRoots;
+  const roots = (bridge as Readonly<Record<string, unknown>>)[field];
   return Array.isArray(roots)
     ? roots.filter((root): root is string => typeof root === "string" && root.trim() !== "")
     : [];
+}
+
+/** The roots on a tool call's bridge, or none when the run declares none. */
+export function protectedRootsOf(ctx: unknown): readonly string[] {
+  return bridgeRoots(ctx, "protectedRoots");
+}
+
+/** The credential roots on a tool call's bridge, or none when the run declares none. */
+export function credentialRootsOf(ctx: unknown): readonly string[] {
+  return bridgeRoots(ctx, "credentialRoots");
+}
+
+const CREDENTIAL_FILE_NAME = /^(?:\.env(?:\.(?!(?:example|sample|template)$)[^/\\]+)?|\.npmrc)$/i;
+
+/** A file name that holds credentials wherever it sits: a dotenv file, an npm config. */
+export function isCredentialFileName(name: string): boolean {
+  return CREDENTIAL_FILE_NAME.test(name);
+}
+
+/** Is this name, as a volume that folds names reads it, one {@link isCredentialFileName} matches? */
+function foldsToCredentialName(path: string): boolean {
+  return isCredentialFileName(foldedName(basename(path)));
 }
 
 /** `path` with every link on its existing part followed; itself when nothing of it exists. */
@@ -131,6 +163,46 @@ export function protectedRootHolding(
     if (mine.some((p) => theirs.some((r) => within(p, r)))) return root;
   }
   return undefined;
+}
+
+/**
+ * Whether `path` is a file a run keeps from its tools: by its last name, written
+ * or where its links lead, or inside one of `held` (`credentialRootsOf`).
+ */
+export function isHeldFile(
+  path: string,
+  held: readonly string[],
+  cwd: string = process.cwd(),
+): boolean {
+  const abs = resolve(cwd, path);
+  return (
+    foldsToCredentialName(abs) ||
+    foldsToCredentialName(followed(abs)) ||
+    protectedRootHolding(abs, held, cwd) !== undefined
+  );
+}
+
+/**
+ * For a tool reading the tree at `dir` without following a link: whether a file
+ * at this path relative to `dir` is one a run keeps from its tools. Where `held`
+ * stands against `dir` is worked out once, so the check costs no file system call
+ * per file. No `held` holds nothing.
+ */
+export function heldInTree(
+  dir: string,
+  held: readonly string[],
+  cwd: string = process.cwd(),
+): (rel: string) => boolean {
+  if (held.length === 0) return () => false;
+  if (protectedRootHolding(dir, held, cwd) !== undefined) return () => true;
+  const folded = (rel: string): string => normalize(rel).split(sep).map(foldedName).join(sep);
+  const below = protectedRootsBeneath(dir, held, cwd).map(({ rel }) => folded(rel));
+  return (rel) => {
+    const key = folded(rel);
+    return (
+      foldsToCredentialName(key) || below.some((root) => key === root || key.startsWith(root + sep))
+    );
+  };
 }
 
 /**
@@ -263,4 +335,9 @@ export function gitDirectoryWriteRefusal(tool: string, what: string): string {
 /** The refusal a tool returns for a write into a protected root. */
 export function protectedWriteRefusal(tool: string, what: string): string {
   return `${tool}: refused — ${what} would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records, environment files, compiled bundle and dependencies, Hangar's directory), which no tool may change. Nothing was written.`;
+}
+
+/** The refusal a tool returns for an input that names a file a run keeps from its tools. */
+export function heldFileRefusal(tool: string, what: string): string {
+  return `${tool}: refused — ${what} names a credential file this run keeps from its tools. Nothing was written.`;
 }

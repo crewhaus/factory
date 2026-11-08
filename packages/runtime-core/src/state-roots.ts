@@ -50,6 +50,7 @@
  * operative arguments carries, and what the floor compares a directory the
  * call acts beneath with).
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DEFAULT_ROOT_DIR } from "@crewhaus/event-log";
@@ -606,3 +607,39 @@ export function relocatingFieldLeftOut(
   const others = roots.filter((root) => !recordRoots.includes(root));
   return protectedRootHolding(store, others, cwd) === undefined;
 }
+
+/**
+ * The files a run that answers people other than its operator keeps from its
+ * agent's tools, relative to its working directory. Exact names: the rest of
+ * `.crewhaus/run`, such as a daemon's status file, stays readable.
+ */
+const CREDENTIAL_ROOTS: readonly string[] = [
+  ".env", // a directory of that name; the file is caught by name too
+  join(".crewhaus", "secrets"),
+  join(".crewhaus", "identity.json"),
+  join(".crewhaus", "run", "control-token"),
+  join(".crewhaus", "run", "mcp-token"),
+  join(".crewhaus", "run", "gateway-jwt-secret"),
+  join(".crewhaus", "run", "logs"),
+  join(".crewhaus", "run", "control", "keys"),
+];
+
+/**
+ * The roots behind permission-engine's `EvaluateOptions.credentialRoots`, spelled
+ * as {@link runtimeStateRoots} spells its own: resolved, with links followed, and
+ * workspace-relative. A file `manager.envFiles` declares joins them
+ * ({@link declaredEnvFiles}), and a declared `.` or `..`, which holds the working
+ * directory, is left to the rules. A file named as `isCredentialFileName` matches
+ * is found by its name, in any directory, so it needs no root here.
+ */
+export function credentialFileRoots(cwd: string = process.cwd()): string[] {
+  const roots = new Set<string>();
+  for (const root of CREDENTIAL_ROOTS) addSpellings(roots, resolve(cwd, root), cwd);
+  for (const root of declaredEnvFiles(cwd)) {
+    if (!within(cwd, root)) addSpellings(roots, root, cwd);
+  }
+  return [...roots];
+}
+
+/** Set for the whole of a run that answers people other than its operator, nested loops included. */
+export const credentialFloorScope = new AsyncLocalStorage<true>();

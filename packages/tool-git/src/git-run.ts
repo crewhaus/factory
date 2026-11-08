@@ -265,6 +265,56 @@ export function checkPathspecs(
   return { ok: true, value: paths.map((spec) => `${LITERAL_PATHSPEC}${spec}`) };
 }
 
+/** The `.env.<name>` names `isCredentialFileName` leaves open. */
+const OPEN_ENV_NAMES = ["example", "sample", "template"] as const;
+
+/**
+ * Globs for each `.env.<name>` a run keeps from its tools, leaving the
+ * {@link OPEN_ENV_NAMES} out: git's exclude pathspecs have no way to put a name
+ * back, so each is spelled around, a letter at a time.
+ */
+function heldEnvGlobs(): string[] {
+  const nextLetters = (prefix: string): string =>
+    [...new Set(OPEN_ENV_NAMES.filter((n) => n.startsWith(prefix)).map((n) => n[prefix.length]))]
+      .sort()
+      .join("");
+  const globs = [`.env.[!${nextLetters("")}]*`];
+  for (const name of OPEN_ENV_NAMES) {
+    for (let length = 1; length < name.length; length++) {
+      const prefix = name.slice(0, length);
+      globs.push(`.env.${prefix}`, `.env.${prefix}[!${nextLetters(prefix)}]*`);
+    }
+    globs.push(`.env.${name}?*`);
+  }
+  return globs;
+}
+
+const HELD_NAME_GLOBS: readonly string[] = [".env", ".npmrc", ...heldEnvGlobs()];
+
+/**
+ * Exclude pathspecs that keep a run's held files out of what git reads or
+ * stages, for a tool that acts on the whole tree: the names
+ * `isCredentialFileName` matches, at any depth, and each of `held` that lies in
+ * the repository at `repoRoot`. Read from the top of the repository wherever git
+ * runs, ignoring case. No `held` gives none, and the argv is unchanged.
+ */
+export function credentialExcludes(repoRoot: string, held: readonly string[]): string[] {
+  if (held.length === 0) return [];
+  const top = realOrUndefined(repoRoot) ?? repoRoot;
+  const inRepository = new Set<string>();
+  for (const root of held) {
+    const rel = path.relative(top, path.resolve(root));
+    if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+      continue;
+    }
+    inRepository.add(rel.split(path.sep).join("/"));
+  }
+  return [
+    ...HELD_NAME_GLOBS.map((name) => `:(top,exclude,glob,icase)**/${name}`),
+    ...[...inRepository].map((rel) => `:(top,exclude,literal,icase)${rel}`),
+  ];
+}
+
 /** How much of an offending value an error message repeats back. */
 const ECHO_CHARS = 80;
 

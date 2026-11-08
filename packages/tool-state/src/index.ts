@@ -48,7 +48,10 @@ import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
 import {
+  credentialRootsOf,
   gitDirectoryWriteRefusal,
+  heldFileRefusal,
+  isHeldFile,
   landsInGitDirectory,
   protectedRootBeneath,
   protectedRootHolding,
@@ -1653,7 +1656,7 @@ export const indexSearch: RegisteredTool = stateTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const badName = validateName("name", input.name);
     if (badName !== undefined) return badName;
     const root = stateRoot("IndexSearch", input.stateDir);
@@ -1675,12 +1678,21 @@ export const indexSearch: RegisteredTool = stateTool({
       ...(input.minScore !== undefined ? { minScore: input.minScore } : {}),
     });
     const snippetChars = input.snippetChars ?? 0;
+    const held = credentialRootsOf(ctx);
 
     const hits = result.hits.map((hit) => {
       let state: "current" | "changed" | "missing" = "current";
       let text: string | undefined;
       try {
         const safe = resolveSafe("IndexSearch", hit.id);
+        if (held.length > 0 && isHeldFile(safe.abs, held)) {
+          return {
+            path: hit.id,
+            score: hit.score,
+            matchedTerms: hit.matchedTerms,
+            file: "missing" as const,
+          };
+        }
         const stats = statSync(safe.abs);
         const sizeChanged = hit.entry.bytes !== undefined && hit.entry.bytes !== stats.size;
         const timeChanged =
@@ -1767,12 +1779,18 @@ export const stateExport: RegisteredTool = stateTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const root = stateRoot("StateExport", input.stateDir);
     const { files, truncated } = walkFiles(root.abs, MAX_EXPORT_FILES);
-    const selected = files.filter(
+    const asked = files.filter(
       (file) => input.prefix === undefined || file.path.startsWith(input.prefix),
     );
+    // A run that keeps files from its tools gets a document without them, and
+    // the count of what it left out: a refusal would give it no document at all.
+    const held = credentialRootsOf(ctx);
+    const selected =
+      held.length === 0 ? asked : asked.filter((file) => !isHeldFile(file.abs, held));
+    const heldBack = asked.length - selected.length;
     const totalBytes = selected.reduce((sum, file) => sum + file.bytes, 0);
     if (totalBytes > MAX_EXPORT_BYTES) {
       return `the state directory holds ${totalBytes} bytes, over the ${MAX_EXPORT_BYTES} export limit — narrow it with \`prefix\`, or copy the directory with the filesystem tools instead`;
@@ -1820,6 +1838,7 @@ export const stateExport: RegisteredTool = stateTool({
       truncated,
       files: entries,
       ...(unreadable.length > 0 ? { unreadable } : {}),
+      ...(heldBack > 0 ? { heldBack } : {}),
     });
   },
 });
@@ -1865,6 +1884,7 @@ export const stateImport: RegisteredTool = stateTool({
     // forged fetch grounds any text. Refused in every mode, before anything
     // is written, as CopyPath and MovePath refuse.
     const protectedRoots = protectedRootsOf(ctx);
+    const held = credentialRootsOf(ctx);
     if (
       mode === "replace" &&
       protectedRoots.length > 0 &&
@@ -1901,6 +1921,9 @@ export const stateImport: RegisteredTool = stateTool({
       // no such name of its own, and neither does an entry behind a link.
       if (protectedRoots.length > 0 && landsInGitDirectory(target)) {
         return gitDirectoryWriteRefusal("StateImport", `importing ${file.path}`);
+      }
+      if (held.length > 0 && isHeldFile(target, held)) {
+        return heldFileRefusal("StateImport", `importing ${file.path}`);
       }
       const body =
         file.encoding === "utf8"

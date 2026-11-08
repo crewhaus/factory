@@ -27,6 +27,9 @@ import * as nodePath from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
+  credentialRootsOf,
+  heldFileRefusal,
+  isHeldFile,
   protectedRootBeneath,
   protectedRootHolding,
   protectedRootsOf,
@@ -42,6 +45,7 @@ import {
   checkPathspecs,
   checkRefArgs,
   conflictedPatchPaths,
+  credentialExcludes,
   failure,
   json,
   neutralisedNote,
@@ -97,6 +101,11 @@ const pathsField = z
   .describe(
     "limit to these paths, relative to `cwd`: files, or directories with everything under them; literal, never wildcards",
   );
+
+/** `-- <pathspecs>` for git's argv, or nothing when there are none. */
+function pathspecArgs(paths: readonly string[], excludes: readonly string[]): string[] {
+  return paths.length + excludes.length > 0 ? ["--", ...paths, ...excludes] : [];
+}
 
 /**
  * Safety flags for a tool that only interrogates the repository. Reading still
@@ -241,7 +250,7 @@ export const gitDiff: RegisteredTool = buildTool({
       ...(input.staged === true ? ["--cached"] : []),
       ...(input.range !== undefined ? [input.range] : []),
       ...(input.ref !== undefined ? [input.ref] : []),
-      ...(paths.length > 0 ? ["--", ...checked.value] : []),
+      ...pathspecArgs(checked.value, credentialExcludes(repo.root, credentialRootsOf(ctx))),
     ];
     const run = await repo.run(args, { readOnly: true });
     if (run.code !== 0) return failure("GitDiff", run);
@@ -384,9 +393,11 @@ export const gitShow: RegisteredTool = buildTool({
     if (commit === undefined) return `GitShow could not read a commit from "${ref}".`;
     if (input.patch === false) return json({ commit });
 
-    const patch = await repo.run(["show", "--no-ext-diff", "--patch", "--format=", ref], {
-      readOnly: true,
-    });
+    const excludes = credentialExcludes(repo.root, credentialRootsOf(ctx));
+    const patch = await repo.run(
+      ["show", "--no-ext-diff", "--patch", "--format=", ref, ...pathspecArgs([], excludes)],
+      { readOnly: true },
+    );
     if (patch.code !== 0) return failure("GitShow", patch);
     return json({
       commit,
@@ -1184,8 +1195,7 @@ export const gitAdd: RegisteredTool = buildTool({
     const run = await repo.run([
       "add",
       ...(input.update === true ? ["--update"] : []),
-      "--",
-      ...checked.value,
+      ...pathspecArgs(checked.value, credentialExcludes(repo.root, credentialRootsOf(ctx))),
     ]);
     if (run.code !== 0) return failure("GitAdd", run);
     const staged = await repo.run(["diff", "--cached", "--numstat", "-z"], { readOnly: true });
@@ -1446,7 +1456,10 @@ export const gitStashPush: RegisteredTool = buildTool({
     const paths = input.paths ?? [];
     const checked = checkPathspecs("GitStashPush", paths, repo.cwd);
     if (!checked.ok) return checked.message;
-    const pathspec = paths.length > 0 ? ["--", ...checked.value] : [];
+    // The preview and the push read one pathspec, so the names checked are the
+    // names the stash takes: a run that keeps files from its tools leaves them out.
+    const excludes = credentialExcludes(repo.root, credentialRootsOf(ctx));
+    const pathspec = pathspecArgs(checked.value, excludes);
     const roots = protectedRootsOf(ctx);
     if (roots.length > 0) {
       const names = await stashPushNames(
@@ -1610,12 +1623,40 @@ function escapingSymlink(
   if (rootReal === undefined) return undefined;
   for (const link of symlinksCreatedByPatch(patchText, strip)) {
     if (link.target === "") continue; // a rename with no hunk keeps the target
-    const linkAbs = nodePath.resolve(repo.cwd, link.path);
-    const parentReal = realOrUndefined(nodePath.dirname(linkAbs)) ?? nodePath.dirname(linkAbs);
-    const resolved = nodePath.isAbsolute(link.target)
-      ? nodePath.resolve(link.target)
-      : nodePath.resolve(parentReal, link.target);
-    if (!isInside(rootReal, resolved)) return link.path;
+    if (!isInside(rootReal, linkTarget(link, repo))) return link.path;
+  }
+  return undefined;
+}
+
+/** Where a symbolic link a diff creates leads: its parent realpath'd, its target joined on. */
+function linkTarget(
+  link: { readonly path: string; readonly target: string },
+  repo: { readonly cwd: string },
+): string {
+  const linkAbs = nodePath.resolve(repo.cwd, link.path);
+  const parentReal = realOrUndefined(nodePath.dirname(linkAbs)) ?? nodePath.dirname(linkAbs);
+  return nodePath.isAbsolute(link.target)
+    ? nodePath.resolve(link.target)
+    : nodePath.resolve(parentReal, link.target);
+}
+
+/**
+ * The first symbolic link a diff creates that leads to a file a run keeps from
+ * its tools, or to a directory holding one in `held`, as the link's own path, or
+ * undefined.
+ */
+function linkOntoHeld(
+  patchText: string,
+  repo: { readonly cwd: string },
+  strip: number,
+  held: readonly string[],
+): string | undefined {
+  for (const link of symlinksCreatedByPatch(patchText, strip)) {
+    if (link.target === "") continue; // a rename with no hunk keeps the target
+    const target = linkTarget(link, repo);
+    if (isHeldFile(target, held) || protectedRootBeneath(target, held) !== undefined) {
+      return link.path;
+    }
   }
   return undefined;
 }
@@ -1735,8 +1776,11 @@ export const gitApplyPatch: RegisteredTool = buildTool({
     // 1). Every name it writes — each file's new name, and each rename's or
     // deletion's old one — is checked against the run's roots, read from
     // the repository's top and from cwd alike, before anything is written.
+    // A run that keeps files from its tools holds the same names to its list,
+    // for each name the diff reads from too: a copy's or a rename's source.
     const roots = protectedRootsOf(ctx);
-    if (roots.length > 0) {
+    const held = credentialRootsOf(ctx);
+    if (roots.length > 0 || held.length > 0) {
       const named: string[] = [];
       for (const reverse of [false, true]) {
         const listed = await repo.run(
@@ -1781,6 +1825,18 @@ export const gitApplyPatch: RegisteredTool = buildTool({
           reason: protectedWriteRefusal("GitApplyPatch", `the patch's ${hit}`),
         });
       }
+      // A link a run keeps from its tools is named as such, before the floor's
+      // own reading of where a link leads.
+      const onto =
+        held.length === 0 ? undefined : linkOntoHeld(input.patch, repo, input.strip ?? 1, held);
+      if (onto !== undefined) {
+        return json({
+          applied: false,
+          checkedOnly,
+          wouldApply: false,
+          reason: heldFileRefusal("GitApplyPatch", `the symbolic link ${onto} in the diff`),
+        });
+      }
       const linked = symlinkIntoProtectedRoot(input.patch, repo, input.strip ?? 1, roots);
       if (linked !== undefined) {
         return json({
@@ -1788,6 +1844,20 @@ export const gitApplyPatch: RegisteredTool = buildTool({
           checkedOnly,
           wouldApply: false,
           reason: protectedWriteRefusal("GitApplyPatch", `the patch's link ${linked}`),
+        });
+      }
+      const heldName =
+        held.length === 0
+          ? undefined
+          : named.find((name) =>
+              [repo.root, repo.cwd].some((base) => isHeldFile(nodePath.resolve(base, name), held)),
+            );
+      if (heldName !== undefined) {
+        return json({
+          applied: false,
+          checkedOnly,
+          wouldApply: false,
+          reason: heldFileRefusal("GitApplyPatch", `the diff's ${heldName}`),
         });
       }
     }

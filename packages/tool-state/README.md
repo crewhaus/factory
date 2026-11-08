@@ -85,6 +85,12 @@ The tools here that write check where each record resolves against the same
 roots, and refuse one a link leads into, in every permission mode and before
 anything is written.
 
+On a `channel` or `managed` harness, `StateExport` leaves out a file named
+`.env`, `.env.<name>` or `.npmrc` and the credential files the run keeps from
+its tools, and says how many under `heldBack`. There `IndexSearch` reports such a
+file as `missing` with no snippet, and `StateImport` refuses a document that names
+one, whole.
+
 **Determinism.** Same inputs against the same state, same bytes out. Listings
 are sorted by plain code-unit comparison — never `localeCompare`, whose order
 depends on the machine's locale. Nothing samples a random source. And **no

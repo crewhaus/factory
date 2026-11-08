@@ -1258,6 +1258,93 @@ describe("StateExport / StateImport", () => {
     expect(listing.files[0].content).toBeUndefined();
   });
 
+  test("a run with credential roots gets a document without those files, and the count", async () => {
+    const dir = path.join(tmp, "tree");
+    mkdirSync(path.join(dir, "sub"), { recursive: true });
+    mkdirSync(path.join(dir, "held"), { recursive: true });
+    writeFileSync(path.join(dir, "notes.md"), "kept");
+    writeFileSync(path.join(dir, ".env"), "SENTINEL_A");
+    writeFileSync(path.join(dir, "sub", ".env.staging"), "SENTINEL_B");
+    writeFileSync(path.join(dir, "sub", ".NPMRC"), "SENTINEL_C");
+    writeFileSync(path.join(dir, ".env.example"), "kept too");
+    writeFileSync(path.join(dir, "held", "file"), "SENTINEL_D");
+    const exportWith = async (roots: readonly string[] | undefined, input: object) =>
+      stateExport.execute(
+        { stateDir: "tree", ...input },
+        roots === undefined ? {} : { bridge: { credentialRoots: roots } },
+      );
+
+    const held = String(await exportWith([path.join("tree", "held")], {}));
+    expect(held).not.toContain("SENTINEL");
+    const doc = JSON.parse(held);
+    expect(doc.files.map((f: { path: string }) => f.path)).toEqual([".env.example", "notes.md"]);
+    expect(doc.fileCount).toBe(2);
+    expect(doc.heldBack).toBe(4);
+
+    // Counted within what the call asked for.
+    const narrowed = JSON.parse(String(await exportWith(["no-such-root"], { prefix: "sub/" })));
+    expect(narrowed.files).toEqual([]);
+    expect(narrowed.heldBack).toBe(2);
+    const clean = JSON.parse(String(await exportWith(["no-such-root"], { prefix: "notes" })));
+    expect(clean.files.map((f: { path: string }) => f.path)).toEqual(["notes.md"]);
+    expect("heldBack" in clean).toBe(false);
+
+    // A run with no roots: the document has no new key.
+    for (const roots of [undefined, []]) {
+      const whole = JSON.parse(String(await exportWith(roots, {})));
+      expect(whole.fileCount).toBe(6);
+      expect("heldBack" in whole).toBe(false);
+    }
+  });
+
+  test("IndexSearch reports a held file a stored index names as missing, with no snippet", async () => {
+    writeFileSync(path.join(tmp, "visible.txt"), "K=SENTINEL_A");
+    writeFileSync(path.join(tmp, ".env"), "K=SENTINEL_A");
+    await run(indexBuild, { name: "x", paths: ["visible.txt"] });
+    const search = async (ctx: unknown) =>
+      JSON.parse(
+        String(
+          await indexSearch.execute(
+            { name: "x", query: "sentinel_a", snippetChars: 2000 },
+            ctx as never,
+          ),
+        ),
+      );
+    const indexes = path.join(tmp, ".crewhaus", "state", "indexes");
+    const file = path.join(indexes, readdirSync(indexes)[0] as string);
+    const stored = readFileSync(file, "utf8");
+    // The file an index names as it was built, then the same index naming another.
+    const held = { bridge: { credentialRoots: ["no-such-root"] } };
+    expect((await search(held)).hits[0].snippet).toContain("SENTINEL_A");
+    writeFileSync(file, stored.replaceAll("visible.txt", ".env"));
+    const named = await search(held);
+    expect(named.hits[0]).toMatchObject({ path: ".env", file: "missing" });
+    expect(JSON.stringify(named)).not.toContain("K=SENTINEL_A");
+  });
+
+  test("StateImport refuses a document that names a held file, whole", async () => {
+    const ctx = { bridge: { credentialRoots: [path.join("tree", "held")] } };
+    const importing = (entry: string) =>
+      stateImport.execute(
+        {
+          stateDir: "tree",
+          document: {
+            version: 1,
+            files: [
+              { path: "fine.txt", encoding: "utf8", content: "x" },
+              { path: entry, encoding: "utf8", content: "x" },
+            ],
+          },
+        },
+        ctx as never,
+      );
+    for (const entry of [".env", "sub/.env.staging", "sub/.NPMRC", "held/file"]) {
+      expect(String(await importing(entry))).toContain("names a credential file");
+      expect(existsSync(path.join(tmp, "tree", "fine.txt"))).toBe(false);
+    }
+    expect(JSON.parse(String(await importing(".env.example"))).written).toBe(2);
+  });
+
   test("a binary state file is carried as base64", async () => {
     writeFileSync(statePath("blob.bin"), Buffer.from([0x00, 0xff, 0x10]));
     const out = await run(stateExport, { prefix: "blob" });

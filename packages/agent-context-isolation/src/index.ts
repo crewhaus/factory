@@ -547,6 +547,15 @@ export type RuntimeBridge = ParentRunHandle & {
    * built elsewhere carries none, and the tools then rely on the floor.
    */
   readonly protectedRoots?: ReadonlyArray<string>;
+  /**
+   * The files a `channel` or `managed` run keeps from its agent's tools, as the
+   * runtime spells them (runtime-core's `credentialFileRoots`). `StateExport`,
+   * `Grep`, `IndexSearch`, `GitAdd`, `GitStashPush`, `GitDiff` and `GitShow` read
+   * them here to leave those files out, and `GitApplyPatch` and `StateImport` to
+   * refuse an input that names one (`@crewhaus/tool-safety/fs`
+   * `credentialRootsOf`). Absent on any other run.
+   */
+  readonly credentialRoots?: ReadonlyArray<string>;
 };
 
 /**
