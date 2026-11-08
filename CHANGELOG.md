@@ -42,6 +42,22 @@ these on: they reach every harness that uses what each one names.
   Recompile a managed daemon, batch worker or voice harness, and recompile and
   redeploy a Worker, to pick this up.
 
+- **The runtime-state floor also covers a harness's settings, its run files
+  and Hangar's directory.** Beside `.crewhaus/sessions`,
+  `.crewhaus/tool-results` and `.crewhaus/proofs`, no permission rule lets an
+  agent's tool write `.crewhaus/run` (the runfiles, logs and control files a
+  daemon keeps there), the settings file `.crewhaus/settings.json` (permission
+  rules, hooks and manager settings) or Hangar's directory, where
+  `crewhaus hangar` keeps its token and settings: `~/.crewhaus/hangar` always,
+  and wherever the run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT`
+  puts it. The floor also reads the directory a call keeps a tool's store in.
+  Only `bypass` mode skips the floor, and the file tools that check their own
+  targets refuse even then, as `DatasetPut` does for a dataset that lands in one
+  of these and `EmitTraceEvent` for a log a link leads to one. CrewHaus itself
+  still writes these files. The floor refuses `HooksManage` on the harness it
+  runs in; it manages other harnesses as before. `Bash` and `RunCommand` remain
+  outside what the floor can see. Recompile a daemon to pick this up.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what

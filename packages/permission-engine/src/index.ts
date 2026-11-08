@@ -14,9 +14,11 @@
  *   sandbox       — a `requiresSandbox` tool needs a real sandbox backend and,
  *                   outside plan mode, an explicit alwaysAllow
  *   runtime state — a call that is not read-only never writes inside
- *                   `EvaluateOptions.protectedRoots` (0.8.0: the session logs
- *                   and proof bundles the gates read as evidence), nor acts
- *                   beneath a workspace directory that holds one
+ *                   `EvaluateOptions.protectedRoots` (the session logs,
+ *                   spilled tool results and proof bundles the gates read as
+ *                   evidence, and the files that control the run: the
+ *                   harness's run files and settings, Hangar's directory), nor
+ *                   acts beneath a workspace directory that holds one
  *
  * Rule sources (priority high → low)
  *   flag → settings → yaml → hooks → builtin
@@ -48,7 +50,7 @@ import {
   compilePattern,
   matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
-import { writeFileSafe } from "@crewhaus/tool-safety/fs";
+import { foldedName, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 
 export type PermissionMode = "default" | "plan" | "auto" | "bypass";
@@ -87,11 +89,12 @@ export type ToolCallContext = {
   /**
    * 0.8.0 — what the runtime-state floor reads (`EvaluateOptions
    * .protectedRoots`): the values of the fields the call WRITES. The runtime
-   * leaves out a field declared `relocates` — the store a tool works in
-   * through its own format (EmitTraceEvent's namespaced `custom.*` lines,
-   * IncidentBundle's sessions it reads whole), not a file the call names —
-   * and one declared `source`, where the tool takes a value FROM (the files
-   * IndexBuild indexes). Absent ⇒ `operativeValues`.
+   * leaves out a field declared `relocates` that names a store inside the
+   * run's record, which the tool works in through its own format
+   * (EmitTraceEvent's namespaced `custom.*` lines), or one the tool reads whole
+   * (IncidentBundle's sessions), and one declared `source`, where the tool
+   * takes a value FROM (the files IndexBuild indexes). Absent ⇒
+   * `operativeValues`.
    */
   readonly floorValues?: ReadonlyArray<OperativeValue>;
   readonly readOnly: boolean;
@@ -117,26 +120,34 @@ export type EvaluateOptions = {
   readonly sandboxAvailable?: boolean;
   /**
    * 0.8.0 (design/0.8.0-provability-release.md §1 principle 1, §5.2) — the
-   * runtime's own record of the run: directories (absolute, or relative to
-   * the workspace) the runtime writes and the gates read as evidence — the
-   * session event logs (every `tool_use` and `tool_result` the provability
-   * gate grounds a claim on, and `continuity.proof` resolves), the tool
-   * results the runtime spilled to a file (read whole as a long fetch's
-   * body) and the proof bundles. A call that is not read-only and names a path inside one is
-   * DENIED whatever a rule says — the runtime-state floor, beside the
-   * sandbox floor: a hand-written log line holding a fetch that never ran
-   * would otherwise ground any text under any URL. Only `bypass` mode, which
-   * consults nothing, lets such a call through. Absent ⇒ no floor.
+   * runtime's own record of the run, and the files that control it: paths
+   * (absolute, or relative to the workspace) that the runtime and CrewHaus's
+   * own code write and no agent tool may. A root is a directory, protecting
+   * everything under it, or an exact file, protecting that file alone. The
+   * record is what the gates read as evidence — the session event logs
+   * (every `tool_use` and `tool_result` the provability gate grounds a claim
+   * on, and `continuity.proof` resolves), the tool results the runtime
+   * spilled to a file (read whole as a long fetch's body) and the proof
+   * bundles. The files that control the run decide what the agent may do
+   * next — the harness's run files (`.crewhaus/run`), its settings file
+   * (`.crewhaus/settings.json`: permission rules, runtime hooks and the
+   * manager's spawn hooks) and Hangar's directory (the Hangar root). A call
+   * that is not read-only and names a path inside one is DENIED whatever a
+   * rule says — the runtime-state floor, beside the sandbox floor: a
+   * hand-written log line holding a fetch that never ran would otherwise
+   * ground any text under any URL. Only `bypass` mode, which consults
+   * nothing, lets such a call through. Absent ⇒ no floor.
    *
    * The floor reads the call's operative values, so it covers every tool that
    * names where it writes (Write, Edit, MultiEdit, the fsx writers' paths).
    * A writer that acts BENEATH a directory it names (`beneath`) — a tree
    * removed, emptied, imported into, migrated, copied, moved or extracted
    * onto it — is denied when a root lies under that directory and the
-   * directory is inside the workspace (`.crewhaus` holds `.crewhaus/sessions`:
-   * StateImport's `stateDir`, StoreMigrate's `to`). The workspace root itself
-   * is left to the rules, since a git pathspec, a patch's `cwd` or a harness
-   * directory defaults to `.` and every such call would otherwise be refused;
+   * directory is inside the workspace (`.crewhaus` holds `.crewhaus/run` and
+   * `.crewhaus/settings.json`: StateImport's `stateDir`, StoreMigrate's
+   * `to`). The workspace root itself is left to the rules, since a git
+   * pathspec, a patch's `cwd` or a harness directory defaults to `.` and
+   * every such call would otherwise be refused;
    * a writer that acts beneath it checks its own targets against the same
    * roots, which the runtime hands it on the bridge
    * (`RuntimeBridge.protectedRoots`; CopyPath, MovePath, RemovePath,
@@ -144,6 +155,12 @@ export type EvaluateOptions = {
    * writes: `Bash` / `RunCommand` stay a documented residual, closed only by
    * keyed integrity on the log lines themselves (a MAC with a key outside
    * the tree the agent can write), as does `bypass` mode.
+   *
+   * A value is compared by name, as a filesystem that folds names compares
+   * it (`foldedName`), where the canonicaliser marks it `caseInsensitive`, and
+   * where nothing says how its volume compares names: a path outside the
+   * workspace, and the text of a tool that declares no paths. Any other value
+   * compares exactly.
    */
   readonly protectedRoots?: ReadonlyArray<string>;
 };
@@ -324,8 +341,9 @@ const DRIVE_PATH = /^[A-Za-z]:(?:[\\/]|$)/;
 /**
  * A path as the floor compares it: `\\` as `/`, `.` and `..` collapsed, no
  * trailing `/`, in Unicode normal form C (a name spelled with a combining
- * accent is the precomposed one, as on macOS), and lower-cased where the
- * filesystem does not tell names apart by case. One pass over the string, and
+ * accent is the precomposed one, as on macOS), and with each name folded
+ * ({@link foldedName}) where the filesystem does not tell names apart by case.
+ * One pass over the string, and
  * no `node:path`: the path is model-written and can be long (critic8).
  *
  * A drive path is absolute, as a UNC one (`\\host\share`) already is: its
@@ -343,7 +361,8 @@ function floorKey(path: string, fold: boolean, drives = true): string {
   const absolute = drive || path.startsWith("/") || path.startsWith("\\");
   const names: string[] = drive ? [path.slice(0, 2).toLowerCase()] : [];
   const pinned = names.length;
-  for (const name of (drive ? path.slice(2) : path).split(/[\\/]/)) {
+  for (const written of (drive ? path.slice(2) : path).split(/[\\/]/)) {
+    const name = fold ? foldedName(written) : written;
     if (name === "" || name === ".") continue;
     if (name === "..") {
       if (names.length > pinned && names[names.length - 1] !== "..") names.pop();
@@ -353,8 +372,7 @@ function floorKey(path: string, fold: boolean, drives = true): string {
     names.push(name);
   }
   const joined = `${absolute ? "/" : ""}${names.join("/")}`;
-  const key = (joined === "" ? "." : joined).normalize("NFC");
-  return fold ? key.toLowerCase() : key;
+  return (joined === "" ? "." : joined).normalize("NFC");
 }
 
 /** Whether `path` is `root` or lies under it (both {@link floorKey}s). */
@@ -418,7 +436,9 @@ function protectedRootHit(
   if (values !== undefined) {
     for (const value of values) {
       if (value.kind !== "path" || value.globPattern === true) continue;
-      const fold = value.caseInsensitive === true;
+      // A path outside the workspace was not walked: how its volume compares
+      // names is not known, and folding it only widens what the floor catches.
+      const fold = value.caseInsensitive === true || value.outsideWorkspace === true;
       for (const path of [...value.canonical, ...(value.spellings ?? [])]) {
         candidates.push({ path, fold });
       }
@@ -430,7 +450,8 @@ function protectedRootHit(
       }
     }
   } else {
-    for (const path of inputStrings(call.input)) candidates.push({ path, fold: false });
+    // Text as written: nothing says how the volume it lands on compares names.
+    for (const path of inputStrings(call.input)) candidates.push({ path, fold: true });
   }
   // Each spelling read once, however many roots there are. A drive path is
   // also read as written, relative: on POSIX `C:/../.crewhaus/sessions/x`
@@ -445,7 +466,7 @@ function protectedRootHit(
   for (const root of opts.protectedRoots) {
     if (root.trim() === "") continue;
     const plain = floorKey(root, false);
-    const folded = plain.toLowerCase();
+    const folded = floorKey(root, true);
     for (const { key, fold } of keys) {
       if (liesUnder(key, fold ? folded : plain)) return { root };
     }
@@ -486,14 +507,14 @@ export function evaluateWithReason(
   if (mode === "bypass") return { decision: "allow" };
   // 0.8.0 — the runtime-state floor (`EvaluateOptions.protectedRoots`): no
   // rule, in any source, lets the agent's own tools write the record the
-  // gates read as evidence. The reason says what the floor saw — a path
-  // inside the record, or a directory the call acts beneath that holds it —
-  // and that the tool is not read-only; it does not guess whether the call
-  // reads or writes there.
+  // gates read as evidence, or the files that decide what the agent may do
+  // next. The reason says what the floor saw — a path inside a root, or a
+  // directory the call acts beneath that holds one — and that the tool is
+  // not read-only; it does not guess whether the call reads or writes there.
   const floorHit = protectedRootHit(call, opts);
   if (floorHit !== undefined) {
     const RECORD =
-      "the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles)";
+      "the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files and settings, Hangar's directory)";
     return {
       decision: "deny",
       reason:

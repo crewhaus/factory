@@ -56,6 +56,7 @@
  * reachable from any schema here.
  */
 import { readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import {
   DEFAULT_SPLIT_SPEC,
   type LintFinding,
@@ -94,6 +95,11 @@ import {
 import type { Sample } from "@crewhaus/eval-dataset";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  protectedRootHolding,
+  protectedRootsOf,
+  protectedWriteRefusal,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   DEFAULT_DEDUPE_PARAMS,
@@ -130,7 +136,7 @@ import {
   traceRel,
 } from "./lib/sessions";
 import { type SplitMode, planSplits, splitCounts } from "./lib/splits";
-import { ToolPermissionError, resolveSafe } from "./paths";
+import { ToolPermissionError, resolveSafe, workspaceRoot } from "./paths";
 
 export { ToolPermissionError } from "./paths";
 export { planSplits, splitCounts, type SplitMode, type SplitPlan } from "./lib/splits";
@@ -416,7 +422,7 @@ export const datasetPut: RegisteredTool = buildTool({
   // changes which data every eval of that dataset runs on.
   destructive: true,
   concurrencySafe: false,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const toolName = "DatasetPut";
     if ((input.samples === undefined) === (input.path === undefined)) {
       return `${toolName}: pass either "samples" (inline) or "path" (a dataset file), not both and not neither`;
@@ -427,6 +433,11 @@ export const datasetPut: RegisteredTool = buildTool({
     const opened = openRoot(toolName, input.registryDir);
     if (!opened.ok) return opened.message;
     const { root, registry } = opened.value;
+    // The version lands in `<registry>/<name>`, wherever that resolves.
+    const dataset = join(root.safe.abs, input.name);
+    if (protectedRootHolding(dataset, protectedRootsOf(ctx), workspaceRoot()) !== undefined) {
+      return protectedWriteRefusal(toolName, `dataset "${renderGiven(input.name)}"`);
+    }
 
     const versions = await listVersions(registry, input.name);
     if (!versions.ok) return `${toolName}: ${versions.message}`;

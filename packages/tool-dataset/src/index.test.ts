@@ -1266,3 +1266,34 @@ describe("tool declarations", () => {
     for (const name of names) expect(name).toMatch(/^[A-Z][A-Za-z0-9]*$/);
   });
 });
+
+describe("DatasetPut, where a dataset lands against the roots on its bridge", () => {
+  const onBridge = (...roots: string[]) => ({ bridge: { protectedRoots: roots } }) as never;
+  const put = async (input: Record<string, unknown>, ...roots: string[]): Promise<string> =>
+    String(await datasetPut.execute({ samples: rows(4), ...input } as never, onBridge(...roots)));
+
+  test("a dataset in a root is refused, by the registry it names, its name or a link", async () => {
+    mkdirSync(path.join(tmp, ".crewhaus", "run"), { recursive: true });
+    mkdirSync(path.join(tmp, "x"));
+    symlinkSync(path.join(tmp, ".crewhaus", "run"), path.join(tmp, "x", "ds"));
+    for (const input of [
+      { registryDir: ".crewhaus/run", name: "control" },
+      { registryDir: ".crewhaus", name: "run" },
+      { registryDir: "x", name: "ds" },
+      { registryDir: ".crewhaus/run", name: "control", dryRun: true },
+    ]) {
+      const out = await put(input, ".crewhaus/run");
+      expect({ input, refused: out.startsWith("DatasetPut: refused") }).toEqual({
+        input,
+        refused: true,
+      });
+      expect(out).toContain("Nothing was written.");
+    }
+    expect(readdirSync(path.join(tmp, ".crewhaus", "run"))).toEqual([]);
+  });
+
+  test("a dataset elsewhere is written, with the roots on the bridge", async () => {
+    const out = await put({ name: "qa" }, ".crewhaus/run");
+    expect(JSON.parse(out).wrote).toBe(true);
+  });
+});

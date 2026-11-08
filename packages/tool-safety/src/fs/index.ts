@@ -26,8 +26,12 @@
  *   opening it.
  * - {@link protectedRootsOf} / {@link protectedRootHolding} /
  *   {@link protectedRootBeneath}: the run's own record (session logs,
- *   spilled tool results, proof bundles), which a tool that writes beneath a
- *   directory refuses to reach.
+ *   spilled tool results, proof bundles) and the files that control it (the
+ *   harness's run files and settings, Hangar's directory), which a tool that
+ *   writes beneath a directory refuses to reach.
+ *   {@link protectedRootLinkedInto} names the root a link carries a path into,
+ *   and {@link foldedName} is one name as a filesystem that folds names
+ *   compares it.
  *
  * Every refusal is a {@link SafeFsFailure} naming the caller's path and the
  * reason, never where an escaping path led or what is there.
@@ -96,8 +100,10 @@ export {
   copyTreeSafe,
 } from "./copy";
 export {
+  foldedName,
   protectedRootBeneath,
   protectedRootHolding,
+  protectedRootLinkedInto,
   protectedRootsBeneath,
   protectedRootsOf,
   protectedWriteRefusal,
