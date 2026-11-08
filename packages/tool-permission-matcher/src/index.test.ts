@@ -3,6 +3,7 @@ import { CrewhausError } from "@crewhaus/errors";
 import {
   GLOB_METACHARS,
   OPERATIVE_ARG_FIELDS,
+  type OperativeValue,
   PatternParseError,
   compilePattern,
   escapeGlobLiteral,
@@ -362,5 +363,118 @@ describe("OPERATIVE_ARG_FIELDS (exported single source of truth)", () => {
     for (const t of ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Fetch", "WebFetch"]) {
       expect(OPERATIVE_ARG_FIELDS[t]?.length ?? 0).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("a deny or ask on a path, under the full case fold a folding filesystem uses", () => {
+  const fires = (glob: string, path: string, caseInsensitive: boolean): boolean =>
+    matchesPattern(
+      compilePattern(`Write(${glob})`),
+      "Write",
+      {},
+      {
+        polarity: "restrict",
+        operativeValues: [
+          {
+            kind: "path",
+            canonical: [path],
+            ...(caseInsensitive ? { caseInsensitive: true } : {}),
+          },
+        ],
+      },
+    );
+  test("each spelling is caught where the volume folds, and is another name where it does not", () => {
+    for (const [glob, path] of [
+      ["secrets/**", "ſecrets/k"],
+      ["**/settings.json", "x/ſettingſ.json"],
+      ["**/sessions/**", "x/seßions/y"],
+      ["Straße/**", "STRASSE/x"],
+      ["lists/**", "liﬆs/x"],
+    ] as const) {
+      expect({ glob, path, hit: fires(glob, path, true) }).toEqual({ glob, path, hit: true });
+      expect({ glob, path, hit: fires(glob, path, false) }).toEqual({ glob, path, hit: false });
+    }
+  });
+  test("an allow is not widened by it", () => {
+    const value = { kind: "path" as const, canonical: ["ſecrets/k"], caseInsensitive: true };
+    expect(
+      matchesPattern(
+        compilePattern("Write(secrets/**)"),
+        "Write",
+        {},
+        { operativeValues: [value] },
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("a deny or ask on a value that is not a path, spelled in another case", () => {
+  // Letters whose full case fold differs from their lower case: a value no
+  // filesystem compares keeps them, on the rule and on the value alike.
+  const fires = (rule: string, tool: string, value: OperativeValue): boolean =>
+    matchesPattern(
+      compilePattern(rule),
+      tool,
+      {},
+      {
+        polarity: "restrict",
+        operativeValues: [value],
+      },
+    );
+  for (const [what, rule, tool, value] of [
+    [
+      "a recipient",
+      "EmailSend(groß@example.de)",
+      "EmailSend",
+      { kind: "recipient", canonical: ["GROß@EXAMPLE.DE"] },
+    ],
+    [
+      "a recipient with a final sigma",
+      "EmailSend(λόγος@example.gr)",
+      "EmailSend",
+      { kind: "recipient", canonical: ["ΛΌΓΟς@EXAMPLE.GR"] },
+    ],
+    ["an id", "Thing(Straße)", "Thing", { kind: "id", canonical: ["STRAßE"] }],
+    ["a command", "Bash(curl groß*)", "Bash", { kind: "command", canonical: ["CURL GROß"] }],
+    [
+      "a URL",
+      "WebFetch(https://example.com/straße/**)",
+      "WebFetch",
+      { kind: "url", canonical: ["HTTPS://EXAMPLE.COM/STRAßE/x"] },
+    ],
+    [
+      "a value marked caseInsensitive",
+      "Thing(Straße)",
+      "Thing",
+      { kind: "text", canonical: ["STRAßE"], caseInsensitive: true },
+    ],
+    [
+      "a value that stands for any",
+      "Thing(Straße/x)",
+      "Thing",
+      { kind: "id", canonical: ["*"], standsForAny: ["STRAßE/"] },
+    ],
+  ] as const) {
+    test(`${what}: the rule fires`, () => {
+      expect(fires(rule, tool, value as OperativeValue)).toBe(true);
+    });
+  }
+  test("each of them still fires on the spelling the rule writes", () => {
+    expect(
+      fires("EmailSend(groß@example.de)", "EmailSend", {
+        kind: "recipient",
+        canonical: ["groß@example.de"],
+      }),
+    ).toBe(true);
+    expect(fires("Thing(Straße)", "Thing", { kind: "id", canonical: ["Straße"] })).toBe(true);
+  });
+  test("a value that is not a path takes no path fold: `gross` is not `groß`", () => {
+    expect(
+      fires("EmailSend(groß@example.de)", "EmailSend", {
+        kind: "recipient",
+        canonical: ["GROSS@EXAMPLE.DE"],
+      }),
+    ).toBe(false);
+    expect(fires("Thing(Straße)", "Thing", { kind: "id", canonical: ["STRASSE"] })).toBe(false);
   });
 });

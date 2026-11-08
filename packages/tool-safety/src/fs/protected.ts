@@ -3,8 +3,13 @@
  * runtime-state roots a run hands its tools on the bridge
  * (`RuntimeBridge.protectedRoots`, runtime-core's `runtimeStateRoots`): the
  * session logs, the spilled tool results and the proof bundles, which the
- * provability gate and `continuity.proof` read as evidence. Evidence is
- * checked only while the agent cannot write it.
+ * provability gate and `continuity.proof` read as evidence, and the files
+ * that control the run, which decide what the agent may do next — the
+ * harness's run files (`.crewhaus/run`) and settings file
+ * (`.crewhaus/settings.json`), and Hangar's directory. Evidence is checked only
+ * while the agent cannot write it, and the files that control the run are not
+ * its tools' to write. A root is a directory, holding everything under it, or
+ * an exact file, holding only itself.
  *
  * permission-engine's runtime-state floor denies a call that NAMES a path
  * inside one. A tool that writes BENEATH a directory it names reaches past
@@ -16,10 +21,53 @@
  * Every root is given as the runtime spells it — absolute, absolute with
  * links followed, workspace-relative — and a path is compared as resolved
  * and with links followed as far as it exists, so a link on the way
- * neither hides a root nor invents one.
+ * neither hides a root nor invents one. Each name is compared by
+ * {@link foldedName} on every volume: a tool is not told how the volume it
+ * writes to compares names, and refusing a name that folds to a root's costs
+ * nothing.
  */
 import { realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+
+/** Code points HFS+ leaves out when it compares two names. */
+const IGNORED_BY_HFS = /[\u200C-\u200F\u202A-\u202E\u206A-\u206F\uFEFF]/g;
+const NOT_ASCII = /[\u0080-\uFFFF]/;
+
+/**
+ * One name as a filesystem that does not tell names apart compares it, so a
+ * root is found under the spellings that open it, including a name that does
+ * not exist yet (there is no stored spelling to read): Unicode normal form C,
+ * the full case fold APFS uses (`ſ` is `s`, `ß` is `ss`, `ﬁ` is `fi`), without
+ * the code points HFS+ ignores, the stream Windows reads after a `:` or the
+ * dots and spaces it trims from a name's end. A name that is only dots and
+ * spaces is kept as written, and so is one that would fold to nothing, `.` or
+ * `..`: it is a name, and a path must not climb out of a root through it. This
+ * only ever widens what the floor catches. One pass over the string: a name
+ * can be model-written and long.
+ */
+export function foldedName(name: string): string {
+  const stream = name.indexOf(":");
+  const bare = stream > 0 ? name.slice(0, stream) : name;
+  let end = bare.length;
+  while (end > 0 && (bare[end - 1] === "." || bare[end - 1] === " ")) end--;
+  const trimmed = end === 0 ? name : bare.slice(0, end);
+  if (!NOT_ASCII.test(trimmed)) return trimmed.toLowerCase();
+  const folded = trimmed
+    .replace(IGNORED_BY_HFS, "")
+    .normalize("NFC")
+    .toLowerCase()
+    .toUpperCase()
+    .toLowerCase()
+    .replaceAll("\u03C2", "\u03C3")
+    .normalize("NFC");
+  return folded === "" || folded === "." || folded === ".." ? name : folded;
+}
+
+/** An absolute path with each name folded ({@link foldedName}); its root is kept as it is. */
+function foldedPath(path: string): string {
+  const { root } = parse(path);
+  return `${root}${path.slice(root.length).split(sep).map(foldedName).join(sep)}`;
+}
 
 /** The roots on a tool call's bridge, or none when the run declares none. */
 export function protectedRootsOf(ctx: unknown): readonly string[] {
@@ -50,9 +98,9 @@ function followed(path: string): string {
   return path;
 }
 
-/** Is `inner` `outer` or inside it (both absolute)? */
+/** Is `inner` `outer` or inside it (both absolute, each name compared by {@link foldedName})? */
 function within(inner: string, outer: string): boolean {
-  const rel = relative(outer, inner);
+  const rel = relative(foldedPath(outer), foldedPath(inner));
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
@@ -76,6 +124,31 @@ export function protectedRootHolding(
   for (const root of roots) {
     const theirs = spellings(root, cwd);
     if (mine.some((p) => theirs.some((r) => within(p, r)))) return root;
+  }
+  return undefined;
+}
+
+/**
+ * The protected root a link carries `path` into, or `undefined`. `landsAt` is
+ * where the path resolves, which a caller's own resolver also knows for a link
+ * whose target does not exist yet. A path named inside a root that stays in it
+ * has come through no such link, however that root is itself reached: a tool
+ * that keeps a store in a root by name goes on working where an operator has
+ * linked the directory that holds it.
+ */
+export function protectedRootLinkedInto(
+  path: string,
+  landsAt: string,
+  roots: readonly string[],
+  cwd: string = process.cwd(),
+): string | undefined {
+  const named = resolve(cwd, path);
+  for (const root of roots) {
+    const abs = resolve(cwd, root);
+    if (within(named, abs) && within(landsAt, followed(abs))) return undefined;
+  }
+  for (const root of roots) {
+    if (spellings(root, cwd).some((r) => within(landsAt, r))) return root;
   }
   return undefined;
 }
@@ -116,7 +189,11 @@ export function protectedRootsBeneath(
     let rel: string | undefined;
     for (const d of mine) {
       for (const r of theirs) {
-        if (rel === undefined && within(r, d)) rel = relative(d, r);
+        if (rel === undefined && within(r, d)) {
+          // The root's own names below `dir`, as `dir` may spell its part another way.
+          const below = relative(foldedPath(d), foldedPath(r));
+          rel = below === "" ? "" : r.split(sep).slice(-below.split(sep).length).join(sep);
+        }
       }
     }
     if (rel !== undefined) out.push({ root, rel });
@@ -126,5 +203,5 @@ export function protectedRootsBeneath(
 
 /** The refusal a tool returns for a write into a protected root. */
 export function protectedWriteRefusal(tool: string, what: string): string {
-  return `${tool}: refused — ${what} would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles), which no tool may change. Nothing was written.`;
+  return `${tool}: refused — ${what} would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files and settings, Hangar's directory), which no tool may change. Nothing was written.`;
 }

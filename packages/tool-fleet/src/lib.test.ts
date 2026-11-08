@@ -13,6 +13,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
+import { resolveHangarRoot as registryHangarRoot } from "@crewhaus/harness-registry";
 import type { BundleFreshness } from "@crewhaus/harness-supervisor";
 import { classify, spawnEnv } from "./lib/bundle";
 import { countByState, filterJobs, parseIsoInstant, probeLedger, sortJobs } from "./lib/jobs";
@@ -93,14 +94,18 @@ test("classify carries the library's own exactness and stamp through untouched",
 test("the machine roots come from the environment, and the hangar root nests under the registry root", () => {
   const env = { CREWHAUS_REGISTRY_ROOT: "/srv/reg" };
   expect(registryFilePath(env)).toBe(path.join("/srv/reg", "harnesses.json"));
-  // The rule mirrored from apps/cli's resolveHangarRoot: an explicit root
-  // wins, otherwise <registryRoot>/hangar. If the app ever changes it, this
-  // is the test that fails.
+  // One resolver for the CLI, these tools and the floor: the identity test below holds it.
   expect(resolveHangarRoot(env)).toBe(path.join("/srv/reg", "hangar"));
   expect(jobLedgerPath(env)).toBe(path.join("/srv/reg", "hangar", "jobs.jsonl"));
   expect(resolveHangarRoot({ ...env, CREWHAUS_HANGAR_ROOT: "/srv/hangar" })).toBe("/srv/hangar");
   // No env at all: the documented default, under the home directory.
   expect(registryFilePath({})).toBe(path.join(homedir(), ".crewhaus", "harnesses.json"));
+});
+
+test("the hangar root is the registry package's resolver itself, not a copy of it", () => {
+  // The CLI and the runtime-state floor resolve Hangar's directory with the same
+  // function, so a copy reintroduced here, however faithful today, fails.
+  expect(resolveHangarRoot).toBe(registryHangarRoot);
 });
 
 // ---------------------------------------------------------------------------

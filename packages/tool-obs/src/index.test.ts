@@ -1516,3 +1516,48 @@ describe("configured path templates", () => {
     expect(result.url).not.toContain("/../");
   });
 });
+
+describe("EmitTraceEvent, where a log resolves against the roots on its bridge", () => {
+  const onBridge = (...roots: string[]) => ({ bridge: { protectedRoots: roots } });
+
+  test("a log a link leads into a root is refused in every mode, and the file keeps its bytes", async () => {
+    const { symlinkSync } = await import("node:fs");
+    mkdirSync(path.join(tmp, ".crewhaus", "run"), { recursive: true });
+    const token = path.join(tmp, ".crewhaus", "run", "control-token");
+    writeFileSync(token, "kept");
+    mkdirSync(path.join(tmp, "x"));
+    symlinkSync(token, path.join(tmp, "x", "s.jsonl"));
+    const out = await run(
+      emitTraceEvent,
+      { dir: "x", sessionId: "s", name: "marked", create: true },
+      onBridge(".crewhaus/run"),
+    );
+    expect(out).toContain("EmitTraceEvent: refused");
+    expect(out).toContain("Nothing was written.");
+    expect(readFileSync(token, "utf8")).toBe("kept");
+  });
+
+  test("a link to a file that does not exist yet is refused and creates nothing", async () => {
+    const { symlinkSync } = await import("node:fs");
+    mkdirSync(path.join(tmp, ".crewhaus"), { recursive: true });
+    const settings = path.join(tmp, ".crewhaus", "settings.json");
+    mkdirSync(path.join(tmp, "x"));
+    symlinkSync(settings, path.join(tmp, "x", "s.jsonl"));
+    const out = await run(
+      emitTraceEvent,
+      { dir: "x", sessionId: "s", name: "marked", create: true },
+      onBridge(".crewhaus/settings.json"),
+    );
+    expect(out).toContain("EmitTraceEvent: refused");
+    expect(existsSync(settings)).toBe(false);
+  });
+
+  test("a log in its own directory, on the bridge, is appended to", async () => {
+    const made = await run(
+      emitTraceEvent,
+      { sessionId: "sess_kept", name: "marked", tsMs: T0, create: true },
+      onBridge(".crewhaus/sessions"),
+    );
+    expect(made.appended).toBe(true);
+  });
+});

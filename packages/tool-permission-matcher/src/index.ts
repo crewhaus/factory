@@ -1113,18 +1113,29 @@ function fallbackValues(toolName: string, input: unknown): OperativeValue[] {
   return stringValues(input).map(undeclaredValue);
 }
 
-/** A path as a deny or ask rule compares it: NFC, and lower-cased when the filesystem ignores case. */
+/** A path as a deny or ask rule compares it: NFC, and case-folded when the filesystem ignores case. */
 function foldPath(value: string, ignoreCase: boolean): string {
   const nfc = value.normalize("NFC");
-  return ignoreCase ? nfc.toLowerCase() : nfc;
+  // The full case fold such a filesystem uses: `ſ` is `s`, `ß` is `ss`, `ﬁ` is `fi`.
+  return ignoreCase
+    ? nfc.toLowerCase().toUpperCase().toLowerCase().replaceAll("\u03C2", "\u03C3").normalize("NFC")
+    : nfc;
 }
 
 /**
  * How a deny or ask rule's glob is folded before it is compared with a
  * value's folded spellings: `nfc` keeps letter case (a path on a filesystem
- * that tells case apart), `lower` also lower-cases.
+ * that tells case apart), `path` takes the full case fold of a filesystem
+ * that does not, and `lower` lower-cases, for a value no filesystem compares
+ * (a URL, a recipient, an id, a command, `0x` hex).
  */
-type GlobFold = "nfc" | "lower";
+type GlobFold = "nfc" | "path" | "lower";
+
+/** A rule's argument glob in one of the folds a value is compared under. */
+function foldedGlob(glob: string, fold: GlobFold): string {
+  if (fold === "lower") return glob.normalize("NFC").toLowerCase();
+  return foldPath(glob, fold === "path");
+}
 
 /** Argument globs compiled in folded form, per pattern, built on first use. */
 const foldedArgGlobs = new WeakMap<CompiledPattern, Map<GlobFold, GlobMatcher>>();
@@ -1137,7 +1148,7 @@ function foldedArgMatcher(compiled: CompiledPattern, fold: GlobFold): GlobMatche
   }
   let matcher = byMode.get(fold);
   if (matcher === undefined) {
-    matcher = compileGlob(foldPath(compiled.argGlob ?? "", fold === "lower"));
+    matcher = compileGlob(foldedGlob(compiled.argGlob ?? "", fold));
     byMode.set(fold, matcher);
   }
   return matcher;
@@ -1553,7 +1564,7 @@ function valueMatches(
   // and another letter case where the filesystem ignores case.
   if (value.kind === "path") {
     const ignoreCase = value.caseInsensitive === true;
-    const folded = foldedArgMatcher(compiled, ignoreCase ? "lower" : "nfc");
+    const folded = foldedArgMatcher(compiled, ignoreCase ? "path" : "nfc");
     for (const candidate of candidates) {
       if (isAbsoluteSpelling(candidate) !== absoluteGlob) continue;
       if (folded.test(foldPath(candidate, ignoreCase))) return true;
@@ -1729,7 +1740,7 @@ function globFoldsToItself(compiled: CompiledPattern): boolean {
   let same = globFoldCache.get(compiled);
   if (same === undefined) {
     const glob = compiled.argGlob ?? "";
-    same = foldPath(glob, true) === glob;
+    same = foldedGlob(glob, "lower") === glob;
     globFoldCache.set(compiled, same);
   }
   return same;
@@ -1787,7 +1798,7 @@ function standsForAnyFires(
   if (prefixes.some((prefix) => someAfter(argRe, prefix))) return true;
   if (value.kind === "path") {
     const ignoreCase = value.caseInsensitive === true;
-    const folded = foldedArgMatcher(compiled, ignoreCase ? "lower" : "nfc");
+    const folded = foldedArgMatcher(compiled, ignoreCase ? "path" : "nfc");
     return prefixes.some((prefix) => someAfter(folded, foldPath(prefix, ignoreCase)));
   }
   const foldsCase =
@@ -1868,7 +1879,7 @@ function beneathFires(
   );
   if (prefixes.some((prefix) => argRe.matchesSomeAfter(prefix, tail))) return true;
   const ignoreCase = value.caseInsensitive === true;
-  const folded = foldedArgMatcher(compiled, ignoreCase ? "lower" : "nfc");
+  const folded = foldedArgMatcher(compiled, ignoreCase ? "path" : "nfc");
   return prefixes.some((prefix) => folded.matchesSomeAfter(foldPath(prefix, ignoreCase), tail));
 }
 

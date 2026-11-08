@@ -63,13 +63,14 @@ each file through a temp created with `O_EXCL|O_NOFOLLOW` and renamed into
 place, and refuse a part or destination name that is a symlink, with or
 without `overwrite`. `copy-containment.test.ts` holds these.
 
-The run's own record is out of reach as well (0.8.0). The runtime hands
-each tool call the directories where it keeps that record: the session
-logs, the tool results it saved to a file, and the proof bundles. The
-permission engine already denies a write that names a path inside one, or
-that acts beneath a workspace directory holding one, but it leaves a write
-beneath the workspace root itself to the rules, and lets every call through
-in `bypass` mode. So `CopyPath`, `MovePath`, `RemovePath` and
+The run's own record is out of reach as well (0.8.0). The runtime hands each
+tool call the directories where it keeps that record: the session logs, the
+tool results it saved to a file, and the proof bundles, with the files that
+control the run (the harness's run files and settings, Hangar's directory).
+The permission engine already denies a write that names a path inside one,
+or that acts beneath a workspace directory holding one, but it leaves a
+write beneath the workspace root itself to the rules, and lets every call
+through in `bypass` mode. So `CopyPath`, `MovePath`, `RemovePath` and
 `ArchiveExtract` check their own targets against the same directories before
 they write, and refuse in every permission mode, `bypass` included. Their
 check is exact. A file copied onto a directory that holds one is refused; a
