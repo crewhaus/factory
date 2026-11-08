@@ -73,6 +73,7 @@ Run `crewhaus` with no arguments for the full usage text, or any subcommand with
 |---|---|
 | `compile <spec.yaml> -o <out-dir>` | Compile a spec to a runnable bundle; `--emit-ir` prints the lowered IR as JSON instead |
 | `run <spec.yaml>` | Compile in-memory and execute the agent (`--model`, `--resume <id>` / `--continue`, `--prompt <text>`, …) |
+| `serve --mcp <spec.yaml>` | Project the agent as an MCP server over stdio; with `--sse` it listens on this computer and answers a request that carries `Authorization: Bearer <token>`, where the token is `CREWHAUS_MCP_TOKEN`, else one saved at each start to `.crewhaus/run/mcp-token` (0600) |
 | `eval <spec.yaml> --dataset <data> --graders <graders.yaml>` | Run the agent against a dataset and grade (deterministic graders + LLM-as-judge); every run is indexed and auto-diffed against the pinned baseline (`--gate` exits non-zero on regression, `--no-promote` keeps the pin); the per-spec `<specName>-regressions` suite is unioned in by default (`--no-regressions` skips) |
 | `eval-report diff <prev> <new>` | Compare two eval runs and emit a diff report; `history` lists recorded runs, `baseline show\|set <runId>` inspects or pins baselines |
 | `optimize <spec.yaml> --dataset <data> --graders <graders.yaml>` | Active eval-driven optimization; `--write-back` rewrites the spec in place; accepted patches pin their fail→pass recoveries into `<specName>-regressions` (`--no-pin-regressions` skips) |

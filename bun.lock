@@ -55,6 +55,7 @@
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/federation-discovery": "workspace:*",
         "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/gateway-server": "workspace:*",
         "@crewhaus/grader-safety-classifiers": "workspace:*",
         "@crewhaus/hangar-server": "workspace:*",

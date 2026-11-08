@@ -1518,10 +1518,11 @@ import {
   assertToolsModeSatisfiable,
   buildMcpSubAgentDescriptors,
   filterChildTools,
-  isLoopbackRequest,
   resolveMcpToolsMode,
   resolveMcpTransport,
+  resolveServeBearer,
   resolveServePort,
+  serveRequestRefusal,
 } from "./serve-mcp";
 // `crewhaus services setup` — the OPERATOR-tier provisioner for a harness's
 // external services (a Slack app, a Cloudflare named tunnel, a Thredz wiki
@@ -5820,6 +5821,10 @@ async function runServeMcp(args: ParsedArgs): Promise<void> {
     transport === "sse"
       ? resolveServePort(strFlag(args, "port"), process.env["CREWHAUS_MCP_PORT"])
       : SERVE_MCP_DEFAULT_PORT;
+  // The `--sse` listener's bearer, before any wiring: a token that fails to be
+  // saved ends the start through `die()`, which skips the cleanup path.
+  const bearer =
+    transport === "sse" ? resolveServeBearer({ cwd: process.cwd(), env: process.env }) : undefined;
 
   // stdio → keep the agent's stdout off the JSON-RPC channel (see the docblock).
   let protocolStdout: Writable | undefined;
@@ -5868,17 +5873,16 @@ async function runServeMcp(args: ParsedArgs): Promise<void> {
       `[serve] MCP stdio server for "${cliIr.name}" ready (tools: ${toolsMode}) — add it to your MCP client's config\n`,
     );
   } else {
+    if (bearer === undefined) throw new ServeMcpError("an --sse start has no bearer token");
     sseServer = Bun.serve({
       port,
       hostname: "127.0.0.1",
-      fetch: (req) =>
-        isLoopbackRequest(req)
-          ? handle.fetch(req)
-          : new Response("this server only answers on this computer", { status: 403 }),
+      fetch: (req) => serveRequestRefusal(req, bearer.token) ?? handle.fetch(req),
     });
     process.stdout.write(
       `[serve] MCP SSE server for "${cliIr.name}" on http://127.0.0.1:${port}, this computer only (tools: ${toolsMode}) — POST MCP requests to /\n`,
     );
+    process.stdout.write(`[serve] bearer: ${bearer.source}\n`);
   }
 
   const shutdown = async (): Promise<void> => {

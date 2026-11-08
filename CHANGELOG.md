@@ -149,8 +149,8 @@ these on: they reach every harness that uses what each one names.
 
 - **`crewhaus serve --mcp --sse` listens on this computer only.** The server
   binds `127.0.0.1` and answers a request whose `Host`, and `Origin` if it sends
-  one, name this computer. To reach it from another machine, use an SSH tunnel,
-  or a channel bundle's `/mcp`, which takes a bearer.
+  one, name this computer, and that carries its bearer token. To reach it from
+  another machine, use an SSH tunnel, or a channel bundle's `/mcp`.
 
 - **A managed daemon saves a signing secret it generates to
   `.crewhaus/run/gateway-jwt-secret`.** With no `CREWHAUS_GATEWAY_JWT_SECRET`,
@@ -186,6 +186,12 @@ these on: they reach every harness that uses what each one names.
   that starts in such a directory also prints one `[workspace]` line on stderr,
   which a compiled bundle picks up at its next compile. A harness in a directory
   of its own, under the home directory or elsewhere, sees neither.
+
+- **`crewhaus serve --mcp --sse` asks for a bearer token.** The token is
+  `CREWHAUS_MCP_TOKEN`, or one saved at each start to `.crewhaus/run/mcp-token`
+  (0600), and the start banner names which, never its value. Send it as
+  `Authorization: Bearer <token>`, as for a channel bundle's `/mcp`. A second
+  `--sse` start in one directory replaces the file; set the variable to run two.
 
 ## [0.8.0] - 2026-10-25
 

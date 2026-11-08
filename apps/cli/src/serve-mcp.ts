@@ -14,6 +14,10 @@
  * Mirrors the `dev.ts` / `marketplace-cli.ts` split.
  */
 
+import { randomBytes } from "node:crypto";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { constantTimeEquals } from "@crewhaus/gateway-protocol/control";
 import type { McpSubAgentDescriptor, McpToolsMode, McpTransportKind } from "@crewhaus/mcp-server";
 
 /** Thrown for a misconfigured `serve --mcp` invocation (unsupported target,
@@ -34,7 +38,9 @@ export const SERVE_MCP_USAGE =
   "  --mcp        required — the projection kind (the only kind today).\n" +
   "  --sse        serve over HTTP+SSE (a `fetch` server on --port) instead of\n" +
   "               stdio; overrides the spec's `expose.mcp.transport`.\n" +
-  "               listens on this computer only.\n" +
+  "               listens on this computer only, and asks for\n" +
+  "               `Authorization: Bearer <token>`: CREWHAUS_MCP_TOKEN, else a\n" +
+  "               token saved at each start to .crewhaus/run/mcp-token (0600).\n" +
   "  --port <n>   SSE listen port (default 8000, or CREWHAUS_MCP_PORT). Ignored\n" +
   "               for stdio.\n" +
   "  The tool projection follows the spec's `expose.mcp.tools` (default `chat` —\n" +
@@ -83,6 +89,74 @@ export function isLoopbackRequest(req: Request): boolean {
   } catch {
     return false; // `null` from a sandboxed page, or anything unparseable.
   }
+}
+
+/** The variable that sets the `--sse` listener's bearer, as for a channel bundle's `/mcp`. */
+export const SERVE_TOKEN_ENV = "CREWHAUS_MCP_TOKEN";
+/** Where a start saves the bearer it made when {@link SERVE_TOKEN_ENV} is unset, under the cwd. */
+export const SERVE_TOKEN_FILE = ".crewhaus/run/mcp-token";
+
+/** The `--sse` listener's bearer, and where it came from, for the banner. */
+export type ServeBearer = { readonly token: string; readonly source: string };
+
+/**
+ * The bearer an `--sse` start answers to. {@link SERVE_TOKEN_ENV} wins and
+ * nothing is written. Otherwise 32 random bytes, as hex, are saved at
+ * {@link SERVE_TOKEN_FILE} under `cwd` at 0600, beside a `.gitignore` of `*`
+ * when that directory has none. The file is removed and then created with
+ * `wx`, so a link already at that path is replaced and its target is left as
+ * it was, and a token left by an earlier start does not answer for this one.
+ * Throws {@link ServeMcpError} naming the variable when saving the file fails.
+ */
+export function resolveServeBearer(opts: {
+  readonly cwd: string;
+  readonly env: Readonly<Record<string, string | undefined>>;
+}): ServeBearer {
+  const fromEnv = opts.env[SERVE_TOKEN_ENV];
+  if (fromEnv !== undefined && fromEnv !== "") return { token: fromEnv, source: SERVE_TOKEN_ENV };
+  const file = join(opts.cwd, SERVE_TOKEN_FILE);
+  const token = randomBytes(32).toString("hex");
+  try {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    rmSync(file, { force: true });
+    try {
+      writeFileSync(join(dirname(file), ".gitignore"), "*\n", { flag: "wx" });
+    } catch {
+      // A `.gitignore` is already there, and it stays as it is.
+    }
+    writeFileSync(file, `${token}\n`, { mode: 0o600, flag: "wx" });
+  } catch (err) {
+    throw new ServeMcpError(
+      `set ${SERVE_TOKEN_ENV}: no token is set, and one could not be saved to ${file}: ${(err as Error).message}`,
+    );
+  }
+  return { token, source: `${SERVE_TOKEN_FILE} (minted this boot, 0600)` };
+}
+
+/**
+ * The refusal for a request the `--sse` listener does not answer, or
+ * undefined for one it does. The Host and Origin check
+ * ({@link isLoopbackRequest}) comes first and answers 403. Then the request
+ * must carry `Authorization: Bearer <token>` with this listener's token,
+ * compared in constant time, or it is answered 401 with `www-authenticate:
+ * Bearer`, as a channel bundle's `/mcp` answers. It runs before the MCP
+ * handler, so before any session is looked up.
+ */
+export function serveRequestRefusal(req: Request, token: string): Response | undefined {
+  if (!isLoopbackRequest(req)) {
+    return new Response("this server only answers on this computer", { status: 403 });
+  }
+  const auth = req.headers.get("authorization") ?? "";
+  if (!auth.startsWith("Bearer ") || !constantTimeEquals(auth.slice(7), token)) {
+    return new Response(
+      JSON.stringify({ error: "unauthorized: send Authorization: Bearer <token>" }),
+      {
+        status: 401,
+        headers: { "content-type": "application/json", "www-authenticate": "Bearer" },
+      },
+    );
+  }
+  return undefined;
 }
 
 /**
