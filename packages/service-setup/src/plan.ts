@@ -28,6 +28,7 @@
  * harness; the Cloudflare token, the Slack config token and the Thredz key
  * are read, used, and dropped.
  */
+import { randomBytes } from "node:crypto";
 import {
   type CloudflareAuth,
   type CloudflareDeps,
@@ -510,6 +511,8 @@ export async function applySlack(
   const actionsUrl = `https://${hostname}${SLACK_ACTIONS_PATH}`;
   const callbackPath = "/crewhaus/oauth/callback";
   const redirectUri = `https://${hostname}${callbackPath}`;
+  // One per run: it ties the authorize URL this run opens to its callback.
+  const oauthState = randomBytes(16).toString("hex");
   const scopes = slackScopes(slack.channelReactions);
 
   const manifest = buildManifest({
@@ -547,7 +550,7 @@ export async function applySlack(
           port: target.eventsPort,
           eventsPath: SLACK_EVENTS_PATH,
           callbackPath,
-          expectedState: STATE_TOKEN,
+          expectedState: oauthState,
         });
   if (responder !== undefined) {
     io.info(`stand-in listener on :${target.eventsPort} (answers Slack's URL verification)`);
@@ -648,7 +651,7 @@ export async function applySlack(
       clientId,
       scopes,
       redirectUri,
-      state: STATE_TOKEN,
+      state: oauthState,
     });
     // ALWAYS print the URL, then try to open it. An opener that silently
     // fails — no browser on a headless box, a sandboxed launcher — would
@@ -677,15 +680,6 @@ export async function applySlack(
     await responder?.stop();
   }
 }
-
-/**
- * The `state` value tying an authorize URL to its callback. It is a constant
- * rather than a random value on purpose: this package must stay deterministic
- * for tests, and the parameter's job here is only to reject a redirect that
- * did not come from the URL setup just opened — the listener is loopback-only
- * and lives for one exchange.
- */
-const STATE_TOKEN = "crewhaus-services-setup";
 
 // ---------------------------------------------------------------------------
 // Rendering
