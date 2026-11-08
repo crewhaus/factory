@@ -31,8 +31,22 @@
  */
 
 import { api } from "../api.js";
-import { asOf, clear, dot, el, emptyState, jsonPre, mdBlocks, skeleton, toast } from "../dom.js";
+import {
+  asOf,
+  clear,
+  dot,
+  el,
+  emptyState,
+  jsonPre,
+  mdBlocks,
+  scrollRegion,
+  skeleton,
+  toast,
+} from "../dom.js";
 import { hrefHarness } from "../router.js";
+import { confirmAction } from "../ui/dialog.js";
+import { emptyFor } from "../ui/empty.js";
+import { panelNav } from "../ui/panels.js";
 import { clampText, fmtRelativeTime } from "../util.js";
 
 /** The sub-tabs of the Thredz tab, in display order. */
@@ -166,8 +180,8 @@ function fetchedChip(payload) {
   return payload && typeof payload.fetchedAt === "string" ? asOf(payload.fetchedAt) : null;
 }
 
-function table(headers, rows) {
-  return el("div", { class: "table-scroll" }, [
+function table(headers, rows, label = "table") {
+  return scrollRegion(label, [
     el("table", { class: "fleet" }, [
       el(
         "thead",
@@ -251,27 +265,21 @@ export async function renderThredz(root, ctx) {
   }
   const host = el("div", { class: "tab-section" });
   const state = { panel: "wiki" };
-  const nav = el("nav", { class: "tabs", "aria-label": "thredz panels" });
   const paint = () => {
-    clear(nav);
-    for (const [key, label] of PANELS) {
-      nav.appendChild(
-        el("button", {
-          class: `tab${state.panel === key ? " active" : ""}`,
-          type: "button",
-          "aria-current": state.panel === key ? "page" : null,
-          text: label,
-          onClick: () => {
-            state.panel = key;
-            paint();
-          },
-        }),
-      );
-    }
     clear(host).appendChild(skeleton(4));
     void renderPanel(host, ctx, state.panel);
   };
-  root.appendChild(nav);
+  // The panel buttons update in place, so the one pressed keeps focus.
+  const nav = panelNav({
+    label: "thredz panels",
+    panels: PANELS,
+    current: state.panel,
+    onSelect: (key) => {
+      state.panel = key;
+      paint();
+    },
+  });
+  root.appendChild(nav.node);
   root.appendChild(host);
   paint();
 }
@@ -293,7 +301,15 @@ function renderPanel(host, ctx, panel) {
  */
 function statusCard(status, ctx) {
   if (!status) {
-    return card("Thredz", emptyState("The manager did not answer for this harness", null));
+    return card(
+      "Thredz",
+      emptyFor({
+        cause: "connection-failed",
+        subject: "Thredz",
+        detail: "The manager did not answer for this harness.",
+        onAction: typeof ctx?.reload === "function" ? () => ctx.reload() : undefined,
+      }),
+    );
   }
   const spec = status.spec && typeof status.spec === "object" ? status.spec : {};
   const { state, label } = proxyState(status);
@@ -769,14 +785,21 @@ async function renderRecordsPanel(host, ctx, state = { type: "", status: "", tag
               class: "btn btn-ghost",
               type: "button",
               text: "Soft-delete",
-              onClick: async () => {
+              onClick: () => {
                 const label = str(r.title, recordId);
-                if (!window.confirm(`Soft-delete "${label}"? It stays restorable.`)) return;
-                const res = await write(
-                  () => api.thredzRecordDelete({ id: ctx.id, recordId }),
-                  "Soft-deleted — restore is one click away",
-                );
-                if (res && res.ok === true) void reload();
+                confirmAction({
+                  level: "confirm",
+                  title: `Soft-delete “${label}”?`,
+                  lead: "It stays restorable: Restore brings it back.",
+                  action: "Soft-delete",
+                  onConfirm: async () => {
+                    const res = await write(
+                      () => api.thredzRecordDelete({ id: ctx.id, recordId }),
+                      "Soft-deleted — restore is one click away",
+                    );
+                    if (res && res.ok === true) void reload();
+                  },
+                });
               },
             }),
       ),

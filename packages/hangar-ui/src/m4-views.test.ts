@@ -9,7 +9,15 @@
  */
 import { describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { bindingSheet, globalKey, initialKeyState, keyShape } from "../assets/js/keys.js";
+import {
+  GLOBAL_BINDINGS,
+  INBOX_BINDINGS,
+  bindingSheet,
+  globalKey,
+  initialKeyState,
+  isCharacterKey,
+  keyShape,
+} from "../assets/js/keys.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { createNotificationPoll } from "../assets/js/notify.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
@@ -32,7 +40,10 @@ type KeyShape = {
   meta?: boolean;
   ctrl?: boolean;
   alt?: boolean;
+  shift?: boolean;
   inField?: boolean;
+  inboxFocused?: boolean;
+  dialogOpen?: boolean;
 };
 
 const press = (
@@ -67,11 +78,29 @@ describe("globalKey — HM-190 ownership", () => {
     }
   });
 
-  test("while the omnibox is open it owns every key except Escape", () => {
+  // Changed deliberately: the open menu used to claim every key outside its
+  // field, so an armed action's "Run it" could be reached only by a mouse —
+  // Tab never moved and Enter and Space never pressed it.
+  test("while the omnibox is open no shortcut fires, and its controls keep their keys", () => {
     const open = { ...initialKeyState(), omniboxOpen: true };
-    const j = press(open, { key: "j" });
-    expect(j.claimed).toBe(true);
-    expect(j.effect).toBeNull();
+    for (const shape of [
+      { key: "Tab" },
+      { key: "Tab", shift: true },
+      { key: "Enter" },
+      { key: " " },
+      { key: "j" },
+    ] as KeyShape[]) {
+      const r = press(open, shape);
+      expect(`${shape.key}:${r.claimed}:${r.effect}`).toBe(`${shape.key}:false:null`);
+      expect(r.state.omniboxOpen).toBe(true);
+    }
+    // `/` and `?` stack nothing on the menu.
+    for (const key of ["/", "?"]) {
+      const r = press(open, { key });
+      expect(`${key}:${r.effect}`).toBe(`${key}:null`);
+      expect(r.state.sheetOpen).toBe(false);
+      expect(r.state.omniboxOpen).toBe(true);
+    }
     const esc = press(open, { key: "Escape" });
     expect(esc.effect).toBe("close-omnibox");
     expect(esc.state.omniboxOpen).toBe(false);
@@ -101,16 +130,79 @@ describe("globalKey — HM-190 ownership", () => {
     }
   });
 
-  test("`?` opens the app sheet only when no inbox is mounted", () => {
+  // Changed deliberately: the inbox's keys belong to its LIST now, so `?` is
+  // the inbox's only while focus is inside that list. Keyed off the mounted
+  // screen, `?` would do nothing anywhere else on it.
+  test("`?` opens the app sheet unless focus is inside an inbox list", () => {
     const noInbox = press(initialKeyState(), { key: "?" });
     expect(noInbox.effect).toBe("toggle-sheet");
     expect(noInbox.state.sheetOpen).toBe(true);
 
-    // On the approvals/review screens the inbox binds `?` for its own sheet;
-    // claiming it here would open two sheets on one keypress.
-    const inbox = press({ ...initialKeyState(), inboxMounted: true }, { key: "?" });
-    expect(inbox.claimed).toBe(false);
-    expect(inbox.effect).toBeNull();
+    // Focus in the list: the inbox binds `?` for its own help; claiming it
+    // here would open two sheets on one keypress.
+    const inList = press(
+      { ...initialKeyState(), inboxMounted: true },
+      {
+        key: "?",
+        inboxFocused: true,
+      },
+    );
+    expect(inList.claimed).toBe(false);
+    expect(inList.effect).toBeNull();
+
+    // The inbox screen, focus outside the list: the global sheet opens.
+    const onScreen = press(
+      { ...initialKeyState(), inboxMounted: true },
+      {
+        key: "?",
+        inboxFocused: false,
+      },
+    );
+    expect(onScreen.effect).toBe("toggle-sheet");
+    expect(onScreen.claimed).toBe(true);
+  });
+
+  test("`/` opens the command menu, but never from a field", () => {
+    const open = press(initialKeyState(), { key: "/" });
+    expect(open.effect).toBe("open-omnibox");
+    expect(open.claimed).toBe(true);
+    expect(open.state.omniboxOpen).toBe(true);
+    // It also takes over from the sheet.
+    expect(press({ ...initialKeyState(), sheetOpen: true }, { key: "/" }).state.sheetOpen).toBe(
+      false,
+    );
+    const typing = press(initialKeyState(), { key: "/", inField: true });
+    expect(typing.claimed).toBe(false);
+    expect(typing.effect).toBeNull();
+  });
+
+  test("single-key shortcuts off: no character key is claimed, and the overlays still close", () => {
+    const off = { ...initialKeyState(), singleKeys: false };
+    for (const key of ["/", "?", "g", "j", "."]) {
+      const r = press(off, { key });
+      expect(`${key}:${r.claimed}:${r.effect}`).toBe(`${key}:false:null`);
+    }
+    // The chord is not a single key, and Escape still closes what is open.
+    expect(press(off, { key: "k", meta: true }).effect).toBe("open-omnibox");
+    expect(press({ ...off, sheetOpen: true }, { key: "Escape" }).effect).toBe("close-sheet");
+    expect(press({ ...off, omniboxOpen: true }, { key: "Escape" }).effect).toBe("close-omnibox");
+    expect(isCharacterKey("?")).toBe(true);
+    expect(isCharacterKey("ArrowDown")).toBe(false);
+    expect(isCharacterKey("Enter")).toBe(false);
+  });
+
+  test("over a dialog the reducer does not own, `/`, `?` and ⌘K claim nothing", () => {
+    for (const shape of [
+      { key: "/" },
+      { key: "?" },
+      { key: "k", meta: true },
+      { key: "k", ctrl: true },
+      { key: "Escape" },
+    ] as KeyShape[]) {
+      const r = press(initialKeyState(), { ...shape, dialogOpen: true });
+      expect(`${shape.key}:${r.claimed}:${r.effect}`).toBe(`${shape.key}:false:null`);
+      expect(r.state).toEqual(initialKeyState());
+    }
   });
 
   test("the inbox's own keys always fall through unclaimed", () => {
@@ -154,6 +246,31 @@ describe("globalKey — HM-190 ownership", () => {
     expect(sections).toHaveLength(2);
     expect(sections.every((s) => s.bindings.length > 0)).toBe(true);
     expect((bindingSheet(true) as Array<{ section: string }>)[1]?.section).toBe("This inbox");
+  });
+
+  test("the sheet tells the truth: a letter chooses a verdict and Enter confirms it", () => {
+    const inbox = INBOX_BINDINGS as Array<{ keys: string; does: string }>;
+    const verdicts = inbox.filter((b) => b.keys === "g / d" || b.keys === "u / d / p / f");
+    expect(verdicts).toHaveLength(2);
+    for (const binding of verdicts) {
+      expect(binding.does).toContain("choose");
+      expect(binding.does).toContain("then Enter");
+    }
+    expect(inbox.some((b) => b.does === "grant or deny (approvals inbox)")).toBe(false);
+    expect(inbox.map((b) => b.keys)).toContain("Enter");
+    const global = GLOBAL_BINDINGS as Array<{ keys: string }>;
+    expect(global.map((b) => b.keys)).toEqual(["⌘K / Ctrl-K", "/", "?", "Esc"]);
+  });
+
+  test("keyShape reads whether focus is inside an inbox list off the event", () => {
+    const inList = {
+      tagName: "LI",
+      closest: (sel: string) => (sel === "[data-triage]" ? {} : null),
+    };
+    expect(keyShape({ key: "?", target: inList }).inboxFocused).toBe(true);
+    const outside = { tagName: "BUTTON", closest: () => null };
+    expect(keyShape({ key: "?", target: outside }).inboxFocused).toBe(false);
+    expect(keyShape({ key: "?", target: { tagName: "BODY" } }).inboxFocused).toBe(false);
   });
 });
 

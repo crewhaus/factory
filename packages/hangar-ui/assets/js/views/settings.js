@@ -1,6 +1,8 @@
 /**
- * HM-198's console half — Settings: notification rules (HM-183), read-only
- * mode (HM-187), and the installed-plugin inventory (HM-179).
+ * HM-198's console half — Settings: Readability (this device's text size,
+ * density, motion, contrast, shortcuts and theme), notification rules
+ * (HM-183), read-only mode (HM-187), and the installed-plugin inventory
+ * (HM-179).
  *
  * Three deliberate choices show up here as UI:
  *
@@ -21,8 +23,17 @@
  */
 
 import { api } from "../api.js";
-import { clear, dot, el, emptyState, skeleton, toast } from "../dom.js";
+import { clear, dot, el, emptyState, scrollRegion, skeleton, toast } from "../dom.js";
 import { notifications } from "../notify.js";
+import {
+  applyPrefs,
+  applyTheme,
+  readPrefs,
+  readTheme,
+  takeFocusRequest,
+  writePrefs,
+  writeTheme,
+} from "../prefs.js";
 import { hrefHarness } from "../router.js";
 import { fmtRelativeTime } from "../util.js";
 
@@ -68,11 +79,126 @@ export async function renderSettings(root) {
       el("span", { class: "muted", text: "manager preferences — never harness state" }),
     ]),
   );
+  const readability = readabilityCard();
+  root.appendChild(readability);
   root.appendChild(readOnlyCard(settled(readOnlyRes)));
   root.appendChild(
     notificationCard(settled(notifRes), settled(groupsRes), () => renderSettings(root)),
   );
   root.appendChild(pluginCard(settled(pluginsRes)));
+  // The first-run card's Adjust lands here, with focus in Readability.
+  if (takeFocusRequest("readability")) {
+    const first = readability.querySelector("input:checked") ?? readability.querySelector("input");
+    if (first instanceof HTMLElement) first.focus();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Readability (this device)
+// ---------------------------------------------------------------------------
+
+/** The Readability choices, in display order. `pref` names the field in the
+ *  preferences record; `theme` is stored on its own key. Pure data. */
+export const READABILITY_GROUPS = [
+  {
+    pref: "textSize",
+    legend: "Text size",
+    options: [
+      ["default", "Default"],
+      ["large", "Large"],
+      ["larger", "Larger"],
+    ],
+  },
+  {
+    pref: "density",
+    legend: "Density",
+    options: [
+      ["comfortable", "Comfortable"],
+      ["compact", "Compact"],
+    ],
+  },
+  {
+    pref: "motion",
+    legend: "Motion",
+    options: [
+      ["system", "System"],
+      ["reduce", "Reduce"],
+    ],
+  },
+  {
+    pref: "contrast",
+    legend: "Contrast",
+    options: [
+      ["system", "System"],
+      ["more", "More"],
+    ],
+  },
+  {
+    pref: "singleKeys",
+    legend: "Single-key shortcuts",
+    options: [
+      ["on", "On"],
+      ["off", "Off"],
+    ],
+  },
+  {
+    pref: "theme",
+    legend: "Theme",
+    options: [
+      ["dark", "Dark"],
+      ["light", "Light"],
+    ],
+  },
+];
+
+/** The current value of one Readability group, as its radio value. */
+function readabilityValue(pref, prefs, theme) {
+  if (pref === "theme") return theme;
+  if (pref === "singleKeys") return prefs.singleKeys ? "on" : "off";
+  return prefs[pref];
+}
+
+/**
+ * Readability: native radios in a fieldset per choice, applied the moment
+ * one is picked. Stored in this browser only; nothing here is sent anywhere.
+ */
+function readabilityCard() {
+  const prefs = readPrefs();
+  const theme = readTheme();
+  const groups = READABILITY_GROUPS.map((group) => {
+    const current = readabilityValue(group.pref, prefs, theme);
+    return el("fieldset", null, [
+      el("legend", { text: group.legend }),
+      ...group.options.map(([value, label]) => {
+        const radio = el("input", {
+          type: "radio",
+          name: `readability-${group.pref}`,
+          value,
+          checked: value === current,
+        });
+        radio.addEventListener("change", () => {
+          if (!radio.checked) return;
+          const root = document.documentElement;
+          if (group.pref === "theme") applyTheme(root, writeTheme(value));
+          else if (group.pref === "singleKeys") writePrefs({ singleKeys: value === "on" });
+          else applyPrefs(root, writePrefs({ [group.pref]: value }));
+        });
+        return el("label", { class: "read-choice" }, [radio, el("span", { text: label })]);
+      }),
+    ]);
+  });
+  return el(
+    "section",
+    { class: "card", id: "readability", "aria-labelledby": "readability-title" },
+    [
+      el("h3", { class: "card-title", id: "readability-title", text: "Readability" }),
+      el("p", {
+        class: "muted",
+        text: "How this browser shows the console. Each choice applies at once and stays on this device.",
+      }),
+      el("div", { class: "read-grid" }, groups),
+    ],
+  );
 }
 
 function settled(res) {
@@ -209,7 +335,7 @@ function notificationCard(state, groupsPayload, reload) {
     tbody.appendChild(row);
   }
   table.appendChild(tbody);
-  card.appendChild(el("div", { class: "table-scroll" }, [table]));
+  card.appendChild(scrollRegion("Notification rules", [table]));
 
   // Quiet hours + muting + webhook.
   const start = numberField(draft.quietHours.startHour, "quiet hours start (0–23)");

@@ -154,15 +154,64 @@ Two conventions make that surface cheap to extend:
    to show, why is it empty, and which CLI verb creates it. Most of this
    surface is normally empty on a given harness, so the views render that
    triple directly through `emptyState(message, verb)`; an empty panel is
-   never indistinguishable from a broken one.
+   never indistinguishable from a broken one. The screens rebuilt on the
+   shared components use `emptyFor({cause, …})` from `js/ui/empty.js`
+   instead, which also says WHY a list is empty — one of six causes (no data
+   yet, no access, connection failed, unsupported, filtered, not indexed),
+   each with its own words and its way forward ("Clear filters", "Retry").
 
 ### UX invariants
 
 Dark theme default with an explicit light toggle; traffic-light dots are
 always paired with text; every empty state names the CLI verb that creates
-its data; 404s render as "nothing yet", never as errors; loading skeletons
-everywhere; cached figures show their as-of time; the footer shows the
-hangar version + wire-protocol pair. No animation beyond opacity.
+its data, and on the rebuilt screens its cause; 404s render as "nothing
+yet", never as errors; loading skeletons everywhere; cached figures show
+their as-of time, kept current by one shared ticker that stops in a hidden
+tab; the footer shows the hangar version + wire-protocol pair. No animation
+beyond the skeleton's opacity pulse, and none at all under reduced motion
+(the system's setting, or Readability's).
+
+### Accessibility
+
+The target is WCAG 2.2 AA, held by tests rather than intentions:
+
+- **Tokens.** Every text token holds 4.5:1 on all four surfaces of its
+  theme, and in the More-contrast variants the secondary inks hold 7:1; a
+  control's edge (`--boundary`), the focus ring (`--focus`, never derived
+  from a shape) and a status dot hold 3:1. Each shape's accent has a dark
+  and a light value (`SHAPE_ACCENTS`, `SHAPE_ACCENTS_LIGHT`), applied with
+  `data-shape-accent` and `shapeAccentVars()`. `src/hangar-css.test.ts`
+  computes every pair from the stylesheet, washes included.
+- **Readability** (Settings, per device): text size, density, motion,
+  contrast, single-key shortcuts and theme, as native radios applied at
+  once. `js/prefs.js` keeps them in this browser's `localStorage` and puts
+  them on the root element; sizes are in rem, so the browser's own text size
+  works too. A first-run card offers them once.
+- **Keyboard.** A skip link is the first stop; one focus ring everywhere;
+  every overlay is a native `<dialog>` from `js/ui/dialog.js` (focus moves
+  in and comes back, the page behind is inert, a dialog holding typed input
+  never closes on a backdrop click). The inboxes' keys work only while the
+  list has focus, and a verdict takes two keys: a letter arms it, Enter on
+  the row confirms. The command menu is a combobox whose actions are armed,
+  never run, by Enter. Readability can turn single-key shortcuts off.
+- **Announcements.** One polite and one assertive live region
+  (`js/ui/live.js`): information is polite, only an error interrupts.
+  Errors stay until dismissed.
+- **Content.** Charts (`js/ui/chart.js`) carry a summary sentence and a data
+  table, and a value nobody could obtain reads "unknown", never zero. Wide
+  tables scroll inside a named region a keyboard can reach, so the page
+  reflows at 320 px. A background refresh updates rows in place
+  (`js/ui/keyed.js`), so an open editor and its typing survive; unsent prose
+  survives a reload in this tab (`js/ui/draft.js`), and a field that can
+  hold a secret is never kept. A wiki draft keeps the version it was typed
+  against, so a restored one saves against that version and a newer one
+  comes back as a conflict instead of being written over. After a spec
+  conflict, an edit that needed the spec's name typed asks for it again.
+
+`packages/hangar-e2e` drives all of this in a browser: an axe sweep that
+fails the build on any violation on the screens moved onto these
+components, a keyboard tour, and the reflow, text-spacing, ARIA and
+reduced-motion floor.
 
 Three more that M2 adds, because a console that drives things can lie in
 new ways:
@@ -184,7 +233,11 @@ Rendering is 100% `createElement`/`textContent` via a tiny `el()`/`text()`
 toolkit — markup-string assignment is banned and a unit test scans every
 embedded module for it. The wiki renderer parses a minimal markdown subset
 (headings, bold, inline code, lists, fenced code) into tokens and renders
-them as text nodes; raw HTML in an article body stays literal text.
+them as text nodes; raw HTML in an article body stays literal text. The same
+holds for the components: the tooltip's words go in with `textContent`, and
+a toast, a chart label, a dialog title and a conflict diff are text nodes
+(the browser suite plants script in each and checks that it shows as
+characters and never runs).
 
 ## Server routes consumed
 
@@ -249,10 +302,12 @@ background `?hydrate=1` refetch with freshly computed rollups.
 **Keyboard ownership is a reducer, not a race.** M2 shipped the inbox half of
 HM-190 (`triageKey` in `supervision.js`: j/k, one-key verdicts, `.`, `?`).
 `keys.js` adds the layer above it and decides between them: a field owns its
-keys (including ⌘K), the open omnibox owns everything but Escape, and `?`
-goes to the app sheet only when no inbox is mounted — two sheets opening on
-one keypress is the bug that rule exists to prevent. The reducer claims
-nothing else, so the inbox keeps receiving j/k/g/d untouched.
+keys (including ⌘K), the open omnibox lets no other shortcut fire and leaves
+Tab, Enter and Space to its own controls (so an armed action's "Run it" is
+reachable by keyboard), and `?` goes to the app sheet unless focus is inside
+an inbox list — two sheets opening on one keypress is the bug that rule
+exists to prevent. The reducer claims nothing else, so the inbox keeps
+receiving j/k/g/d untouched.
 
 The field rule has exactly one exception, and the omnibox is it: the overlay
 focuses its own input, so from the moment it opens every key arrives from a
@@ -296,10 +351,9 @@ screen (`#/advisor`):
 
 - **The feed** — every alert, suggestion and optimization signal the manager
   can derive about the harness, in one severity-ranked list. Every item
-  carries a hover TOOLTIP (`withTip`/`tipIcon` in `dom.js`: a `data-tip`
-  attribute the stylesheet renders via `attr()` — text only, so the
-  injection ban holds) explaining why it matters, the fact it was derived
-  from, guidance on what to do, and a quick action: an executable button for
+  carries an inline "Why this matters" disclosure explaining why it matters,
+  the fact it was derived from, guidance on what to do, and a quick action:
+  an executable button for
   a queued CLI verb (with its CLI twin beside it) or a deep link into the
   tab that owns the fix. Acting opens an inline confirm where a COMMENT can
   be attached — it is recorded in the harness-local decisions ledger next to
@@ -310,8 +364,11 @@ screen (`#/advisor`):
 - **The trend** — "is it improving?": the eval pass-rate bars, the decision
   counts, and a one-line verdict, all folded from durable sources.
 - **Reports** — generate model-usage / costs / usefulness / optimization
-  reports (each button tooltipped with what it measures); saved reports are
-  listed and re-readable in place.
+  reports (each button carries a tooltip saying what it measures —
+  `withTip`/`tipIcon` in `dom.js` set a `data-tip`, and the one tooltip
+  element in `js/ui/tooltip.js` shows it on hover AND focus, can itself be
+  hovered, and closes on Escape); saved reports are listed and re-readable
+  in place.
 - **Issues** — describe a problem and it is tuned into an update ready to
   run: the kind selector (tooltipped per kind) picks what gets queued, with
   `optimize` — the eval→patch loop whose artifact is a reviewable spec
@@ -354,3 +411,12 @@ stubbed `fetch`, and `creds-views.test.ts` / `memory-fabric.test.ts` unit-test
 the pure decisions those tabs make. The embed-map suite additionally asserts
 that no module is ORPHANED — reachable from `app.js`'s import graph — so a
 view that loses its last importer cannot keep shipping to the browser.
+
+The components in `js/ui/` follow it too: each keeps its decisions in a pure
+export (`comboboxKey`, `chartModel`, `emptyModel`, `keyedPlan`, `canStash`,
+`conflictModel`, `createTicker`, `confirmReady`, `tipPlacement`), with a test
+beside it, and `prefs.test.ts` drives the preferences against a fake and a
+throwing storage. The embed suite also guards the accessibility choices that
+a later edit could quietly undo: one module builds a `<dialog>`, one holds
+the only `role="alert"`, `app.js` holds the only document key listener, no
+module passes a style string, and nothing can be dragged.

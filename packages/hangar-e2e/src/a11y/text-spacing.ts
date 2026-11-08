@@ -20,7 +20,23 @@ export async function textSpacingFindings(page: Page): Promise<readonly A11yFind
         overflowY === "hidden" || overflowY === "clip" ? node.scrollHeight - node.clientHeight : 0;
       return Math.max(across, down);
     };
-    const nodes = [...document.querySelectorAll<HTMLElement>("body *")];
+    // Two boxes clip by design and lose nothing to spacing. Text for a screen
+    // reader only is a 1px box that was never shown. A single-line text field
+    // scrolls its own value: the caret reaches every character, whatever the
+    // spacing. A `<select>` is not exempt: its closed face really truncates.
+    const exempt = (node: HTMLElement): boolean => {
+      if (node instanceof HTMLInputElement) return true;
+      const style = getComputedStyle(node);
+      return (
+        style.position === "absolute" &&
+        node.offsetWidth <= 1 &&
+        node.offsetHeight <= 1 &&
+        (style.overflow === "hidden" || style.overflow === "clip")
+      );
+    };
+    const nodes = [...document.querySelectorAll<HTMLElement>("body *")].filter(
+      (node) => !exempt(node),
+    );
     const before = new Map(nodes.map((node) => [node, hiddenOverflow(node)]));
     for (const node of [document.body, ...nodes]) {
       node.style.setProperty("line-height", "1.5", "important");

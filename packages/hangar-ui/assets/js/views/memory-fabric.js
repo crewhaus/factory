@@ -37,10 +37,14 @@ import {
   emptyState,
   jsonPre,
   mdBlocks,
+  scrollRegion,
   skeleton,
   toast,
 } from "../dom.js";
 import { hrefHarness } from "../router.js";
+import { confirmAction } from "../ui/dialog.js";
+import { bindDraft, draftKey } from "../ui/draft.js";
+import { panelNav } from "../ui/panels.js";
 import { fmtCount, fmtPct, fmtRelativeTime, fmtUsd, usdFromMicros } from "../util.js";
 
 const PANELS = [
@@ -285,11 +289,12 @@ function kv(k, v) {
   ]);
 }
 
-/** A table from a header list and row-node builder. */
-function table(headers, rows) {
+/** A table from a header list and row-node builder, in a scroll region a
+ *  keyboard can reach. */
+function table(headers, rows, label = "table") {
   const tbody = el("tbody");
   for (const row of rows) tbody.appendChild(row);
-  return el("div", { class: "table-scroll" }, [
+  return scrollRegion(label, [
     el("table", { class: "fleet" }, [
       el(
         "thead",
@@ -355,29 +360,23 @@ function sessionLink(ctx, sessionId, label) {
 export async function renderMemoryFabric(root, ctx) {
   const state = { panel: "facts" };
   clear(root);
-  const nav = el("nav", { class: "tabs", "aria-label": "memory fabric panels" });
   const host = el("div", { class: "tab-body" });
   const draw = () => {
-    clear(nav);
-    for (const [id, label] of PANELS) {
-      nav.appendChild(
-        el("button", {
-          class: `tab${state.panel === id ? " active" : ""}`,
-          type: "button",
-          "aria-current": state.panel === id ? "page" : null,
-          text: label,
-          onClick: () => {
-            state.panel = id;
-            draw();
-          },
-        }),
-      );
-    }
     clear(host).appendChild(skeleton(6));
     void panelFor(state.panel)(host, ctx, () => draw());
   };
+  // The panel buttons update in place, so the one pressed keeps focus.
+  const nav = panelNav({
+    label: "memory fabric panels",
+    panels: PANELS,
+    current: state.panel,
+    onSelect: (id) => {
+      state.panel = id;
+      draw();
+    },
+  });
   root.appendChild(el("h3", { class: "sub-title", text: "Memory fabric" }));
-  root.appendChild(nav);
+  root.appendChild(nav.node);
   root.appendChild(host);
   draw();
 }
@@ -547,50 +546,28 @@ function factRow(fact, ctx, host, reload, spec) {
 }
 
 /** Forget = a supersede tombstone with a REASON. The reason is required, and
- *  the control says what actually happens before the click. */
+ *  the confirmation says what actually happens before the click. */
 function forgetControl(ctx, spec, factId, host, reload) {
   const wrap = el("div", { class: "row-editor" });
   const open = el("button", { class: "btn btn-ghost", type: "button", text: "Forget…" });
   open.addEventListener("click", () => {
-    clear(wrap);
-    const reason = field("why (recorded on the tombstone)", { placeholder: "superseded by …" });
-    const confirm = el("button", { class: "btn btn-danger", type: "button", text: "Forget" });
-    confirm.addEventListener("click", () => {
-      if (reason.input.value.trim() === "") {
-        toast("a reason is required — it is what the tombstone records");
-        return;
-      }
-      void run(
-        confirm,
-        "Forget",
-        () =>
-          api.memoryForget(
-            { id: ctx.id, spec },
-            { factId, reason: reason.input.value.trim(), confirm: true },
-          ),
-        (res) => {
-          if (res.ok && res.body?.ok !== false) void factsPanel(host, ctx, reload, spec);
-        },
-      );
-    });
-    wrap.appendChild(
-      el("div", { class: "editor-actions" }, [
-        reason.node,
-        confirm,
-        el("button", {
-          class: "btn btn-ghost",
-          type: "button",
-          text: "Cancel",
-          onClick: () => {
-            clear(wrap).appendChild(open);
+    confirmAction({
+      level: "confirm",
+      title: "Forget this fact",
+      lead: "This appends a tombstone. The original line stays on disk and stays auditable.",
+      reason: { label: "Why (recorded on the tombstone)", placeholder: "superseded by …" },
+      action: "Forget",
+      onConfirm: (reason) => {
+        void run(
+          open,
+          "Forget",
+          () => api.memoryForget({ id: ctx.id, spec }, { factId, reason, confirm: true }),
+          (res) => {
+            if (res.ok && res.body?.ok !== false) void factsPanel(host, ctx, reload, spec);
           },
-        }),
-        el("span", {
-          class: "muted gated-why",
-          text: "this appends a tombstone — the original line stays on disk and stays auditable",
-        }),
-      ]),
-    );
+        );
+      },
+    });
   });
   wrap.appendChild(open);
   return wrap;
@@ -1193,11 +1170,13 @@ function editorCard(ctx, host, reload, state, row) {
     class: "input editor-body",
     rows: "12",
     spellcheck: "false",
+    "aria-label": "article body",
     "aria-describedby": guardId,
   });
   const versionLabel = el("span", { class: "muted" });
   const status = el("div", { role: "status" });
   const conflict = el("div");
+  const draftNote = el("div", { role: "status" });
   const expected = { version: row ? Number(row.version ?? 0) : 0 };
 
   const setVersion = (v) => {
@@ -1206,6 +1185,43 @@ function editorCard(ctx, host, reload, state, row) {
       expected.version > 0 ? `saving against version ${expected.version}` : "new article";
   };
   setVersion(row ? Number(row.version ?? 0) : 0);
+
+  // An unsent article survives a reload of this tab; it is cleared once saved.
+  // It keeps the version it was typed against, and a restored draft saves
+  // against THAT version: if someone wrote a newer one meanwhile, Save comes
+  // back stale and shows what moved, instead of writing over it.
+  const bodyDraft = bindDraft(
+    area,
+    draftKey(`h/${ctx.id}/memory/wiki/${row ? String(row.slug) : "new"}`, "body"),
+    { base: () => expected.version },
+  );
+  const showRestored = (draft, current, onDiscard) => {
+    const moved = current !== null && current !== draft.base;
+    const discard = el("button", { class: "btn btn-ghost", type: "button", text: "Discard draft" });
+    discard.addEventListener("click", () => {
+      bodyDraft.clear();
+      onDiscard();
+      clear(draftNote);
+      area.focus();
+    });
+    draftNote.replaceChildren(
+      el("p", { class: "muted" }, [
+        el("span", {
+          text: moved
+            ? `Restored your unsent draft, written against version ${draft.base}. This article is at version ${current} now, so Save will show you what changed before anything is written.`
+            : "Restored your unsent draft.",
+        }),
+        " ",
+        discard,
+      ]),
+    );
+  };
+  if (!row && bodyDraft.kept !== null) {
+    area.value = bodyDraft.kept.body;
+    showRestored(bodyDraft.kept, null, () => {
+      area.value = "";
+    });
+  }
 
   // Held with aria-disabled rather than `disabled`: Save stays in the Tab order
   // and describes why, and a click says so instead of doing nothing.
@@ -1263,11 +1279,22 @@ function editorCard(ctx, host, reload, state, row) {
         article = null;
       }
       if (article !== null && typeof article.body === "string") {
-        if (area.value === "") area.value = article.body;
+        const loaded = typeof article.version === "number" ? article.version : null;
+        const draft = bodyDraft.kept;
+        if (draft !== null && draft.base > 0) {
+          area.value = draft.body;
+          setVersion(draft.base);
+          showRestored(draft, loaded, () => {
+            area.value = article.body;
+            if (loaded !== null) setVersion(loaded);
+          });
+        } else {
+          if (area.value === "") area.value = article.body;
+          if (loaded !== null) setVersion(loaded);
+        }
         if (typeof article.title === "string" && titleField.input.value === titleBeforeLoad) {
           titleField.input.value = article.title;
         }
-        if (typeof article.version === "number") setVersion(article.version);
       }
       applyGate(editorGate({ existing: true, article }));
     })();
@@ -1301,6 +1328,8 @@ function editorCard(ctx, host, reload, state, row) {
         if (!res.ok) return;
         const outcome = writeOutcome(res.body);
         if (outcome.kind === "ok") {
+          bodyDraft.clear();
+          clear(draftNote);
           status.appendChild(
             el("p", { class: "muted" }, [
               dot("ok", "saved"),
@@ -1323,7 +1352,9 @@ function editorCard(ctx, host, reload, state, row) {
         );
         if (outcome.kind === "stale") {
           const diff = String(res.body?.diff ?? "");
-          if (diff !== "") conflict.appendChild(el("pre", { class: "rawjson", text: diff }));
+          if (diff !== "") {
+            conflict.appendChild(el("pre", { class: "rawjson", tabindex: "0", text: diff }));
+          }
           const retry = el("button", {
             class: "btn",
             type: "button",
@@ -1349,6 +1380,9 @@ function editorCard(ctx, host, reload, state, row) {
             }
             area.value = outcome.currentBody;
             setVersion(outcome.retryVersion);
+            // The version on disk replaced the draft: nothing is unsent now.
+            bodyDraft.clear();
+            clear(draftNote);
             applyGate(gate);
           });
           conflictActions = el("div", { class: "editor-actions" }, [takeTheirs, retry]);
@@ -1373,6 +1407,7 @@ function editorCard(ctx, host, reload, state, row) {
       : null,
     el("div", { class: "editor-actions" }, [slugField.node, titleField.node, versionLabel]),
     el("label", { class: "field" }, [el("span", { text: "article text" }), area]),
+    draftNote,
     guard,
     el("div", { class: "editor-actions" }, [
       save,
@@ -1481,7 +1516,11 @@ async function showVersion(host, ctx, slug, version) {
   }
   host.appendChild(el("h4", { class: "sub-title", text: `v${version} → live` }));
   host.appendChild(
-    el("pre", { class: "rawjson", text: String(data.diff ?? "") || "(no textual difference)" }),
+    el("pre", {
+      class: "rawjson",
+      tabindex: "0",
+      text: String(data.diff ?? "") || "(no textual difference)",
+    }),
   );
   host.appendChild(
     collapsible(
@@ -1609,7 +1648,7 @@ async function dreamPanel(host, ctx) {
         el("span", { class: "mono", text: `cron: ${String(data.cron ?? "")}` }),
         copyBtn(String(data.workflow ?? ""), "copy the workflow"),
       ]),
-      el("pre", { class: "rawjson", text: String(data.workflow ?? "") }),
+      el("pre", { class: "rawjson", tabindex: "0", text: String(data.workflow ?? "") }),
     ]),
   );
 }
@@ -1940,7 +1979,7 @@ function proposalBlock(proposal, ctx, host, reload) {
       el("div", { class: "editor-actions" }, [nameField.node, apply]),
       collapsible(
         [el("span", { class: "muted", text: "the proposed spec" })],
-        [el("pre", { class: "rawjson", text: String(proposal.yaml ?? "") })],
+        [el("pre", { class: "rawjson", tabindex: "0", text: String(proposal.yaml ?? "") })],
       ),
     ],
   );

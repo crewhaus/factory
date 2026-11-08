@@ -1,6 +1,7 @@
 /**
  * M5 — the Advisor: every alert, suggestion and optimization signal about a
- * harness on ONE screen, each item explained (hover for the why), each with
+ * harness on ONE screen, each item explained (a "Why this matters"
+ * disclosure, which a keyboard reaches like anything else), each with
  * its quick action (a queued CLI verb or a deep link), and each decision
  * recorded — acting takes an optional comment, dismissing REQUIRES a reason,
  * and a dismissal can always be reopened.
@@ -25,11 +26,15 @@ import {
   emptyState,
   jsonPre,
   skeleton,
+  statusBadge,
   tipIcon,
   toast,
   withTip,
 } from "../dom.js";
 import { hrefGlobal, hrefHarness } from "../router.js";
+import { chart, chartModel } from "../ui/chart.js";
+import { bindDraft, draftKey } from "../ui/draft.js";
+import { fmtPct } from "../util.js";
 
 /** severity → the traffic-light dot state (always paired with text). */
 export function severityDot(severity) {
@@ -87,7 +92,20 @@ export function rankAdvisorRows(payload) {
     );
 }
 
-/** Eval-series points → bar heights in [0.05, 1]. Pure (unit-tested). */
+/**
+ * Eval-series points → the trend chart's rows: one per recorded run, with a
+ * rate that is not a number left unknown (no bar, never zero). Pure.
+ */
+export function trendRows(series) {
+  const points = Array.isArray(series) ? series : [];
+  return points.map((p, i) => ({
+    label: String(p?.ts ?? p?.runId ?? `run ${i + 1}`),
+    value: typeof p?.passRate === "number" ? Math.max(0, Math.min(1, p.passRate)) : null,
+  }));
+}
+
+/** Eval-series points → bar heights in [0.05, 1]. Pure (unit-tested); the
+ *  chart's rate scale draws the same heights. */
 export function trendBars(series) {
   const points = Array.isArray(series) ? series : [];
   return points
@@ -183,19 +201,25 @@ function feedCard(feed, ctx, reload) {
 export function itemRow(item, ctx, reload) {
   const severity = String(item.severity ?? "suggestion");
   const model = itemActionModel(item, ctx.id);
+  const explain = String(item.explain ?? "");
   const row = el("div", { class: `adv-item adv-${severity}` });
-  row.appendChild(
-    withTip(el("div", null, [dot(severityDot(severity), severity)]), String(item.explain ?? "")),
-  );
+  // The severity is a word in a badge; its colour only repeats the word.
+  const tone = severityDot(severity);
+  row.appendChild(el("div", null, [statusBadge(tone === "unknown" ? "info" : tone, severity)]));
+  // The why is inline and folded, not a hover: a keyboard reaches a
+  // disclosure, and nobody has to find it by pointing at the title.
   const main = el("div", { class: "adv-main" }, [
-    withTip(
-      el("div", { class: "adv-title", text: String(item.title ?? "") }),
-      String(item.explain ?? ""),
-    ),
+    el("div", { class: "adv-title", text: String(item.title ?? "") }),
     el("div", { class: "adv-detail muted", text: String(item.detail ?? "") }),
     el("div", { class: "adv-guidance" }, [
       el("span", { text: `→ ${String(item.guidance ?? "")}` }),
     ]),
+    explain === ""
+      ? null
+      : collapsible(
+          [el("span", { text: "Why this matters" })],
+          [el("p", { class: "adv-explain", text: explain })],
+        ),
   ]);
   if (item.lastAction && typeof item.lastAction === "object") {
     const la = item.lastAction;
@@ -246,6 +270,7 @@ function openActForm(row, item, ctx, reload, model) {
     placeholder: "optional comment, recorded with the action",
     "aria-label": "comment recorded with this action",
   });
+  const draft = bindDraft(comment, draftKey(`h/${ctx.id}/advisor/${String(item.id)}`, "comment"));
   const form = el("form", { class: "adv-form" }, [
     model.cliTwin ? el("code", { class: "mono", text: model.cliTwin }) : null,
     comment,
@@ -264,6 +289,7 @@ function openActForm(row, item, ctx, reload, model) {
       "Act",
       () => api.advisorAct({ id: ctx.id, itemId: String(item.id) }, body),
       (result) => {
+        draft.clear();
         toast(
           result?.body?.acted === true
             ? "Queued — watch it in the job queue"
@@ -361,22 +387,19 @@ function trendCard(trend) {
     return card;
   }
   card.appendChild(el("p", { class: "adv-note", text: String(trend.summary ?? "") }));
-  const bars = trendBars(trend.evalSeries);
-  if (bars.length > 0) {
+  const rows = trendRows(trend.evalSeries);
+  if (rows.length > 0) {
     card.appendChild(
-      withTip(
-        el(
-          "div",
-          {
-            class: "trend-bars",
-            role: "img",
-            "aria-label": "eval pass rate per run, oldest first",
-          },
-          bars.map((h) =>
-            el("div", { class: "trend-bar", style: { height: `${Math.round(h * 100)}%` } }),
-          ),
-        ),
-        "Eval pass rate per recorded run, oldest first — the improvement curve the optimizer climbs.",
+      chart(
+        chartModel({
+          kind: "bars",
+          scale: "rate",
+          title: "Eval pass rate per recorded run, oldest first",
+          rows,
+          format: fmtPct,
+          noun: "run",
+        }),
+        { labelHead: "Run", valueHead: "Pass rate" },
       ),
     );
   }
@@ -491,18 +514,18 @@ function issuesCard(issues, ctx, reload) {
     placeholder: "details (optional)",
     "aria-label": "issue detail",
   });
+  // Unsent words survive a reload of this tab (prose only — never a secret).
+  const titleDraft = bindDraft(title, draftKey(`h/${ctx.id}/advisor`, "issue-title"));
+  const detailDraft = bindDraft(detail, draftKey(`h/${ctx.id}/advisor`, "issue-detail"));
   const kinds = Array.isArray(issues?.kinds) ? issues.kinds : Object.keys(ISSUE_KIND_TIPS);
   const kindSel = el("select", { class: "input", "aria-label": "update kind" });
   for (const kind of kinds) {
     kindSel.appendChild(el("option", { value: String(kind), text: String(kind) }));
   }
-  // The kind's tooltip follows the selection: `withTip` seeds the class and
-  // the initial text; the change listener rewrites BOTH faces of the tip
-  // (the hover bubble reads data-tip, assistive tech reads title).
+  // The kind's tooltip follows the selection: `withTip` seeds the text, and
+  // the change listener rewrites it (the tooltip reads data-tip when it opens).
   const retip = () => {
-    const tipText = ISSUE_KIND_TIPS[kindSel.value] ?? "";
-    kindSel.dataset.tip = tipText;
-    kindSel.setAttribute("title", tipText);
+    kindSel.dataset.tip = ISSUE_KIND_TIPS[kindSel.value] ?? "";
   };
   kindSel.addEventListener("change", retip);
   withTip(kindSel, ISSUE_KIND_TIPS[String(kinds[0] ?? "optimize")] ?? "");
@@ -532,6 +555,8 @@ function issuesCard(issues, ctx, reload) {
           },
         ),
       (result) => {
+        titleDraft.clear();
+        detailDraft.clear();
         toast(String(result?.body?.issue?.update?.note ?? "Submitted"), "info");
         reload();
       },
@@ -614,9 +639,14 @@ export async function renderAdvisorBoard(root) {
           class: "muted small",
           text: `${row.critical} critical · ${row.warn} warn · ${row.suggestion} suggested`,
         }),
+        // The tip is on a link, so a keyboard reaches it: a span takes no focus.
         row.topItem
           ? withTip(
-              el("span", { class: "muted", text: String(row.topItem.title ?? "") }),
+              el("a", {
+                class: "adv-top-link",
+                href: hrefHarness(row.id, "advisor"),
+                text: String(row.topItem.title ?? ""),
+              }),
               "The worst open item — the feed on the harness's Advisor tab has the full explanation and the quick action.",
             )
           : el("span", { class: "muted", text: "—" }),

@@ -15,8 +15,9 @@
  *     sentence. Only `tick_in_flight` retries.
  */
 
-import { copyBtn, dot, el, toast } from "../dom.js";
+import { copyBtn, dot, el, statusBadge, toast } from "../dom.js";
 import { NO_TWIN_NOTES, cliTwinFor, controlOutcome } from "../supervision.js";
+import { openDialog } from "../ui/dialog.js";
 
 /**
  * The CLI twin line: the exact command, monospaced, with a copy button.
@@ -32,9 +33,11 @@ export function cliTwin(command, note = null) {
           el("span", { class: "muted", text: note }),
         ]);
   }
+  // The command scrolls sideways rather than wrapping (a wrapped command is
+  // hard to read back), so it is a Tab stop: a keyboard can reach its end.
   return el("div", { class: "twin" }, [
     el("span", { class: "twin-label", text: "CLI twin" }),
-    el("code", { class: "twin-cmd", text: command }),
+    el("code", { class: "twin-cmd", tabindex: "0", text: command }),
     copyBtn(command, "copy"),
   ]);
 }
@@ -146,19 +149,18 @@ export function controlBtn(label, gate, call, twinArgs, onSettled) {
 }
 
 /**
- * The preflight-refusal modal. Every refused item lists its remediation, and
+ * The preflight-refusal dialog. Every refused item lists its remediation, and
  * "Start anyway" appears ONLY when every item is acknowledgeable — a missing
  * channel secret is unforceable because the compiled daemon's own boot gate
  * exits 2 on exactly that set, so forcing it would spawn a process
- * guaranteed to die.
+ * guaranteed to die. It is the console's one dialog primitive
+ * (`ui/dialog.js`): focus moves in, Escape closes it, focus comes back.
  */
 export function refusalModal(model, handlers = {}) {
-  const backdrop = el("div", { class: "modal-backdrop", role: "presentation" });
-  const close = () => backdrop.remove();
-  const body = el("div", { class: "modal-body" });
-
+  const body = [];
   if (model.items.length > 0) {
-    body.appendChild(
+    body.push(el("p", { class: "muted", text: model.message }));
+    body.push(
       el(
         "ul",
         { class: "refusal-list" },
@@ -188,66 +190,68 @@ export function refusalModal(model, handlers = {}) {
       ),
     );
   } else {
-    body.appendChild(el("p", { text: model.message }));
+    body.push(el("p", { text: model.message }));
   }
-  if (model.forceHint) body.appendChild(el("p", { class: "muted", text: model.forceHint }));
-
-  const actions = el("div", { class: "modal-actions" });
+  if (model.forceHint) body.push(el("p", { class: "muted", text: model.forceHint }));
   if (model.canForce && handlers.onForce) {
-    const forceBtn = el("button", {
-      class: "btn btn-danger",
-      type: "button",
-      text: "Start anyway",
-    });
-    forceBtn.addEventListener("click", () => {
-      close();
-      handlers.onForce(model.acknowledge);
-    });
-    actions.appendChild(forceBtn);
+    body.push(
+      cliTwin(
+        cliTwinFor("start", {
+          dir: handlers.dir,
+          force: true,
+          acknowledge: model.acknowledge,
+        }),
+      ),
+    );
+  }
+
+  const actions = [];
+  let dialog = null;
+  if (model.canForce && handlers.onForce) {
+    actions.push(
+      el("button", {
+        class: "btn btn-danger",
+        type: "button",
+        text: "Start anyway",
+        onClick: () => {
+          dialog?.close();
+          handlers.onForce(model.acknowledge);
+        },
+      }),
+    );
   }
   if (model.action && model.action.jobKind !== null && handlers.onRemedy) {
     // A remedy is a BUTTON, never a toast: "no compiled bundle" has an
     // obvious next step and the console can run it.
-    const remedyBtn = el("button", {
-      class: "btn btn-primary",
-      type: "button",
-      text: model.action.label,
-    });
-    remedyBtn.addEventListener("click", () => {
-      close();
-      handlers.onRemedy(model.action.jobKind);
-    });
-    actions.appendChild(remedyBtn);
+    actions.push(
+      el("button", {
+        class: "btn btn-primary",
+        type: "button",
+        text: model.action.label,
+        onClick: () => {
+          dialog?.close();
+          handlers.onRemedy(model.action.jobKind);
+        },
+      }),
+    );
   } else if (model.action) {
-    actions.appendChild(el("span", { class: "muted", text: model.action.hint }));
+    actions.push(el("span", { class: "muted", text: model.action.hint }));
   }
-  actions.appendChild(
-    el("button", { class: "btn btn-ghost", type: "button", text: "Close", onClick: close }),
+  actions.push(
+    el("button", {
+      class: "btn btn-ghost",
+      type: "button",
+      text: "Close",
+      onClick: () => dialog?.close(),
+    }),
   );
-
-  backdrop.appendChild(
-    el("div", { class: "modal card", role: "dialog", "aria-modal": "true" }, [
-      el("h3", { class: "card-title" }, [
-        el("span", { text: model.title }),
-        model.canForce ? null : el("span", { class: "chip chip-warn", text: "not forceable" }),
-      ]),
-      model.items.length > 0 ? el("p", { class: "muted", text: model.message }) : null,
-      body,
-      model.canForce && handlers.onForce
-        ? cliTwin(
-            cliTwinFor("start", {
-              dir: handlers.dir,
-              force: true,
-              acknowledge: model.acknowledge,
-            }),
-          )
-        : null,
-      actions,
-    ]),
-  );
-  backdrop.addEventListener("click", (e) => {
-    if (e.target === backdrop) close();
+  dialog = openDialog({
+    title: model.title,
+    titleExtra: model.canForce ? null : statusBadge("warn", "not forceable"),
+    body,
+    actions,
+    dismissOnBackdrop: true,
+    initialFocus: "heading",
   });
-  document.body.appendChild(backdrop);
-  return backdrop;
+  return dialog.node;
 }

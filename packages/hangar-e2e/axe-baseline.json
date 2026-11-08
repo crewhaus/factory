@@ -3,407 +3,161 @@
   "axe": "4.14.0",
   "tags": ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"],
   "rows": {
-    "#/activity|dark|1280": {
-      "color-contrast": 7
-    },
-    "#/activity|dark|320": {
-      "color-contrast": 7
-    },
-    "#/activity|light|1280": {
-      "color-contrast": 7
-    },
-    "#/activity|light|320": {
-      "color-contrast": 7
-    },
-    "#/advisor|dark|1280": {
-      "color-contrast": 1
-    },
-    "#/advisor|dark|320": {
-      "color-contrast": 1
-    },
-    "#/advisor|light|1280": {
-      "color-contrast": 1
-    },
-    "#/advisor|light|320": {
-      "color-contrast": 1
-    },
-    "#/approvals|dark|1280": {
-      "color-contrast": 2
-    },
-    "#/approvals|dark|320": {
-      "color-contrast": 2
-    },
-    "#/approvals|light|1280": {
-      "color-contrast": 3
-    },
-    "#/approvals|light|320": {
-      "color-contrast": 3
-    },
-    "#/credentials|dark|1280": {
-      "color-contrast": 7
-    },
+    "#/activity|dark|1280": {},
+    "#/activity|dark|320": {},
+    "#/activity|light|1280": {},
+    "#/activity|light|320": {},
+    "#/advisor|dark|1280": {},
+    "#/advisor|dark|320": {},
+    "#/advisor|light|1280": {},
+    "#/advisor|light|320": {},
+    "#/approvals|dark|1280": {},
+    "#/approvals|dark|320": {},
+    "#/approvals|light|1280": {},
+    "#/approvals|light|320": {},
+    "#/credentials|dark|1280": {},
     "#/credentials|dark|320": {
-      "color-contrast": 6,
       "scrollable-region-focusable": 1
     },
-    "#/credentials|light|1280": {
-      "color-contrast": 11
-    },
+    "#/credentials|light|1280": {},
     "#/credentials|light|320": {
-      "color-contrast": 9,
       "scrollable-region-focusable": 1
     },
-    "#/feedback|dark|1280": {
-      "color-contrast": 7
-    },
+    "#/feedback|dark|1280": {},
     "#/feedback|dark|320": {
-      "color-contrast": 7,
       "scrollable-region-focusable": 1
     },
-    "#/feedback|light|1280": {
-      "color-contrast": 8
-    },
+    "#/feedback|light|1280": {},
     "#/feedback|light|320": {
-      "color-contrast": 8,
       "scrollable-region-focusable": 1
     },
-    "#/h/:id/advisor|dark|1280": {
-      "color-contrast": 5
-    },
-    "#/h/:id/advisor|dark|320": {
-      "color-contrast": 5
-    },
-    "#/h/:id/advisor|light|1280": {
-      "color-contrast": 8
-    },
-    "#/h/:id/advisor|light|320": {
-      "color-contrast": 8
-    },
-    "#/h/:id/channels|dark|1280": {
-      "color-contrast": 7
-    },
-    "#/h/:id/channels|dark|320": {
-      "color-contrast": 7
-    },
-    "#/h/:id/channels|light|1280": {
-      "color-contrast": 11
-    },
-    "#/h/:id/channels|light|320": {
-      "color-contrast": 10
-    },
-    "#/h/:id/costs|dark|1280": {
-      "color-contrast": 9
-    },
-    "#/h/:id/costs|dark|320": {
-      "color-contrast": 9,
-      "scrollable-region-focusable": 1
-    },
-    "#/h/:id/costs|light|1280": {
-      "color-contrast": 10
-    },
-    "#/h/:id/costs|light|320": {
-      "color-contrast": 10,
-      "scrollable-region-focusable": 1
-    },
-    "#/h/:id/creds|dark|1280": {
-      "color-contrast": 14
-    },
-    "#/h/:id/creds|dark|320": {
-      "color-contrast": 14
-    },
-    "#/h/:id/creds|light|1280": {
-      "color-contrast": 24
-    },
-    "#/h/:id/creds|light|320": {
-      "color-contrast": 24
-    },
-    "#/h/:id/data|dark|1280": {
-      "color-contrast": 8
-    },
-    "#/h/:id/data|dark|320": {
-      "color-contrast": 8
-    },
-    "#/h/:id/data|light|1280": {
-      "color-contrast": 12
-    },
-    "#/h/:id/data|light|320": {
-      "color-contrast": 12
-    },
-    "#/h/:id/deploy|dark|1280": {
-      "color-contrast": 4
-    },
-    "#/h/:id/deploy|dark|320": {
-      "color-contrast": 3
-    },
-    "#/h/:id/deploy|light|1280": {
-      "color-contrast": 5
-    },
-    "#/h/:id/deploy|light|320": {
-      "color-contrast": 4
-    },
-    "#/h/:id/dev|dark|1280": {
-      "color-contrast": 22
-    },
-    "#/h/:id/dev|dark|320": {
-      "color-contrast": 22,
-      "scrollable-region-focusable": 2
-    },
-    "#/h/:id/dev|light|1280": {
-      "color-contrast": 30
-    },
-    "#/h/:id/dev|light|320": {
-      "color-contrast": 29,
-      "scrollable-region-focusable": 2
-    },
-    "#/h/:id/evals|dark|1280": {
-      "color-contrast": 31
-    },
+    "#/h/:id/advisor|dark|1280": {},
+    "#/h/:id/advisor|dark|320": {},
+    "#/h/:id/advisor|light|1280": {},
+    "#/h/:id/advisor|light|320": {},
+    "#/h/:id/channels|dark|1280": {},
+    "#/h/:id/channels|dark|320": {},
+    "#/h/:id/channels|light|1280": {},
+    "#/h/:id/channels|light|320": {},
+    "#/h/:id/costs|dark|1280": {},
+    "#/h/:id/costs|dark|320": {},
+    "#/h/:id/costs|light|1280": {},
+    "#/h/:id/costs|light|320": {},
+    "#/h/:id/creds|dark|1280": {},
+    "#/h/:id/creds|dark|320": {},
+    "#/h/:id/creds|light|1280": {},
+    "#/h/:id/creds|light|320": {},
+    "#/h/:id/data|dark|1280": {},
+    "#/h/:id/data|dark|320": {},
+    "#/h/:id/data|light|1280": {},
+    "#/h/:id/data|light|320": {},
+    "#/h/:id/deploy|dark|1280": {},
+    "#/h/:id/deploy|dark|320": {},
+    "#/h/:id/deploy|light|1280": {},
+    "#/h/:id/deploy|light|320": {},
+    "#/h/:id/dev|dark|1280": {},
+    "#/h/:id/dev|dark|320": {},
+    "#/h/:id/dev|light|1280": {},
+    "#/h/:id/dev|light|320": {},
+    "#/h/:id/evals|dark|1280": {},
     "#/h/:id/evals|dark|320": {
-      "color-contrast": 31
+      "scrollable-region-focusable": 2
     },
-    "#/h/:id/evals|light|1280": {
-      "color-contrast": 47
-    },
+    "#/h/:id/evals|light|1280": {},
     "#/h/:id/evals|light|320": {
-      "color-contrast": 47
+      "scrollable-region-focusable": 2
     },
-    "#/h/:id/feedback|dark|1280": {
-      "color-contrast": 16
-    },
+    "#/h/:id/feedback|dark|1280": {},
     "#/h/:id/feedback|dark|320": {
-      "color-contrast": 16,
       "scrollable-region-focusable": 1
     },
-    "#/h/:id/feedback|light|1280": {
-      "color-contrast": 25
-    },
+    "#/h/:id/feedback|light|1280": {},
     "#/h/:id/feedback|light|320": {
-      "color-contrast": 24,
       "scrollable-region-focusable": 1
     },
-    "#/h/:id/inspect|dark|1280": {
-      "color-contrast": 27
-    },
-    "#/h/:id/inspect|dark|320": {
-      "color-contrast": 25
-    },
-    "#/h/:id/inspect|light|1280": {
-      "color-contrast": 29
-    },
-    "#/h/:id/inspect|light|320": {
-      "color-contrast": 27
-    },
-    "#/h/:id/memory|dark|1280": {
-      "color-contrast": 16,
-      "scrollable-region-focusable": 1
-    },
-    "#/h/:id/memory|dark|320": {
-      "color-contrast": 16,
-      "scrollable-region-focusable": 1
-    },
-    "#/h/:id/memory|light|1280": {
-      "color-contrast": 17,
-      "scrollable-region-focusable": 1
-    },
-    "#/h/:id/memory|light|320": {
-      "color-contrast": 17,
-      "scrollable-region-focusable": 1
-    },
-    "#/h/:id/models|dark|1280": {
-      "color-contrast": 11
-    },
+    "#/h/:id/inspect|dark|1280": {},
+    "#/h/:id/inspect|dark|320": {},
+    "#/h/:id/inspect|light|1280": {},
+    "#/h/:id/inspect|light|320": {},
+    "#/h/:id/memory|dark|1280": {},
+    "#/h/:id/memory|dark|320": {},
+    "#/h/:id/memory|light|1280": {},
+    "#/h/:id/memory|light|320": {},
+    "#/h/:id/models|dark|1280": {},
     "#/h/:id/models|dark|320": {
-      "color-contrast": 11,
       "scrollable-region-focusable": 2
     },
-    "#/h/:id/models|light|1280": {
-      "color-contrast": 12
-    },
+    "#/h/:id/models|light|1280": {},
     "#/h/:id/models|light|320": {
-      "color-contrast": 12,
       "scrollable-region-focusable": 2
     },
-    "#/h/:id/overview|dark|1280": {
-      "color-contrast": 24
-    },
-    "#/h/:id/overview|dark|320": {
-      "color-contrast": 24,
-      "scrollable-region-focusable": 1
-    },
-    "#/h/:id/overview|light|1280": {
-      "color-contrast": 35
-    },
-    "#/h/:id/overview|light|320": {
-      "color-contrast": 35,
-      "scrollable-region-focusable": 1
-    },
-    "#/h/:id/panes|dark|1280": {
-      "color-contrast": 5
-    },
-    "#/h/:id/panes|dark|320": {
-      "color-contrast": 5
-    },
-    "#/h/:id/panes|light|1280": {
-      "color-contrast": 8
-    },
-    "#/h/:id/panes|light|320": {
-      "color-contrast": 8
-    },
-    "#/h/:id/runs|dark|1280": {
-      "color-contrast": 10
-    },
-    "#/h/:id/runs|dark|320": {
-      "color-contrast": 10,
-      "scrollable-region-focusable": 1
-    },
-    "#/h/:id/runs|light|1280": {
-      "color-contrast": 12
-    },
-    "#/h/:id/runs|light|320": {
-      "color-contrast": 12,
-      "scrollable-region-focusable": 1
-    },
+    "#/h/:id/overview|dark|1280": {},
+    "#/h/:id/overview|dark|320": {},
+    "#/h/:id/overview|light|1280": {},
+    "#/h/:id/overview|light|320": {},
+    "#/h/:id/panes|dark|1280": {},
+    "#/h/:id/panes|dark|320": {},
+    "#/h/:id/panes|light|1280": {},
+    "#/h/:id/panes|light|320": {},
+    "#/h/:id/runs|dark|1280": {},
+    "#/h/:id/runs|dark|320": {},
+    "#/h/:id/runs|light|1280": {},
+    "#/h/:id/runs|light|320": {},
     "#/h/:id/schedulers|dark|1280": {
-      "color-contrast": 16
+      "color-contrast": 12
     },
     "#/h/:id/schedulers|dark|320": {
-      "color-contrast": 16
-    },
-    "#/h/:id/schedulers|light|1280": {
-      "color-contrast": 17
-    },
-    "#/h/:id/schedulers|light|320": {
-      "color-contrast": 17
-    },
-    "#/h/:id/security|dark|1280": {
-      "color-contrast": 23
-    },
-    "#/h/:id/security|dark|320": {
-      "color-contrast": 23
-    },
-    "#/h/:id/security|light|1280": {
-      "color-contrast": 38
-    },
-    "#/h/:id/security|light|320": {
-      "color-contrast": 38
-    },
-    "#/h/:id/sessions|dark|1280": {
-      "color-contrast": 10,
-      "target-size": 1
-    },
-    "#/h/:id/sessions|dark|320": {
-      "color-contrast": 10
-    },
-    "#/h/:id/sessions|light|1280": {
-      "color-contrast": 12,
-      "target-size": 1
-    },
-    "#/h/:id/sessions|light|320": {
       "color-contrast": 12
     },
-    "#/h/:id/spec|dark|1280": {
-      "color-contrast": 19
+    "#/h/:id/schedulers|light|1280": {
+      "color-contrast": 12
     },
-    "#/h/:id/spec|dark|320": {
-      "color-contrast": 19,
-      "scrollable-region-focusable": 2,
+    "#/h/:id/schedulers|light|320": {
+      "color-contrast": 12
+    },
+    "#/h/:id/security|dark|1280": {},
+    "#/h/:id/security|dark|320": {},
+    "#/h/:id/security|light|1280": {},
+    "#/h/:id/security|light|320": {},
+    "#/h/:id/sessions|dark|1280": {
       "target-size": 1
     },
-    "#/h/:id/spec|light|1280": {
-      "color-contrast": 44
-    },
-    "#/h/:id/spec|light|320": {
-      "color-contrast": 43,
-      "scrollable-region-focusable": 2,
+    "#/h/:id/sessions|dark|320": {},
+    "#/h/:id/sessions|light|1280": {
       "target-size": 1
     },
-    "#/h/:id/thredz|dark|1280": {
-      "color-contrast": 13
-    },
-    "#/h/:id/thredz|dark|320": {
-      "color-contrast": 14
-    },
-    "#/h/:id/thredz|light|1280": {
-      "color-contrast": 14
-    },
-    "#/h/:id/thredz|light|320": {
-      "color-contrast": 15
-    },
-    "#/health|dark|1280": {
-      "color-contrast": 1
-    },
-    "#/health|dark|320": {
-      "color-contrast": 1
-    },
-    "#/health|light|1280": {
-      "color-contrast": 5
-    },
-    "#/health|light|320": {
-      "color-contrast": 5
-    },
-    "#/review|dark|1280": {
-      "color-contrast": 2
-    },
-    "#/review|dark|320": {
-      "color-contrast": 2
-    },
-    "#/review|light|1280": {
-      "color-contrast": 3
-    },
-    "#/review|light|320": {
-      "color-contrast": 3
-    },
-    "#/runs|dark|1280": {
-      "color-contrast": 16,
-      "scrollable-region-focusable": 1
-    },
-    "#/runs|dark|320": {
-      "color-contrast": 16,
-      "scrollable-region-focusable": 1
-    },
-    "#/runs|light|1280": {
-      "color-contrast": 19,
-      "scrollable-region-focusable": 1
-    },
-    "#/runs|light|320": {
-      "color-contrast": 19,
-      "scrollable-region-focusable": 1
-    },
-    "#/settings|dark|1280": {
-      "color-contrast": 4
-    },
-    "#/settings|dark|320": {
-      "color-contrast": 4
-    },
-    "#/settings|light|1280": {
-      "color-contrast": 8
-    },
-    "#/settings|light|320": {
-      "color-contrast": 8
-    },
-    "#/thredz|dark|1280": {
-      "color-contrast": 9
-    },
-    "#/thredz|dark|320": {
-      "color-contrast": 9
-    },
-    "#/thredz|light|1280": {
-      "color-contrast": 9
-    },
-    "#/thredz|light|320": {
-      "color-contrast": 9
-    },
-    "#/|dark|1280": {
-      "color-contrast": 15
-    },
-    "#/|dark|320": {
-      "color-contrast": 16
-    },
-    "#/|light|1280": {
-      "color-contrast": 18
-    },
-    "#/|light|320": {
-      "color-contrast": 18
-    }
+    "#/h/:id/sessions|light|320": {},
+    "#/h/:id/spec|dark|1280": {},
+    "#/h/:id/spec|dark|320": {},
+    "#/h/:id/spec|light|1280": {},
+    "#/h/:id/spec|light|320": {},
+    "#/h/:id/thredz|dark|1280": {},
+    "#/h/:id/thredz|dark|320": {},
+    "#/h/:id/thredz|light|1280": {},
+    "#/h/:id/thredz|light|320": {},
+    "#/health|dark|1280": {},
+    "#/health|dark|320": {},
+    "#/health|light|1280": {},
+    "#/health|light|320": {},
+    "#/review|dark|1280": {},
+    "#/review|dark|320": {},
+    "#/review|light|1280": {},
+    "#/review|light|320": {},
+    "#/runs|dark|1280": {},
+    "#/runs|dark|320": {},
+    "#/runs|light|1280": {},
+    "#/runs|light|320": {},
+    "#/settings|dark|1280": {},
+    "#/settings|dark|320": {},
+    "#/settings|light|1280": {},
+    "#/settings|light|320": {},
+    "#/thredz|dark|1280": {},
+    "#/thredz|dark|320": {},
+    "#/thredz|light|1280": {},
+    "#/thredz|light|320": {},
+    "#/|dark|1280": {},
+    "#/|dark|320": {},
+    "#/|light|1280": {},
+    "#/|light|320": {}
   }
 }

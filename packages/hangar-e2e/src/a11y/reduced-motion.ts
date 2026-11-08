@@ -2,9 +2,18 @@
 import type { Page } from "playwright";
 import type { A11yFinding } from "./finding";
 
-/** Ask for reduced motion, and report every animation still running. */
-export async function reducedMotionFindings(page: Page): Promise<readonly A11yFinding[]> {
-  await page.emulateMedia({ reducedMotion: "reduce" });
+/**
+ * Ask for reduced motion, and report every animation still running. With
+ * `{ emulate: false }` it leaves the media query as the caller set it, so a
+ * page's own reduce switch (an attribute, not the media query) is what is
+ * tested: called as it stands, the helper would turn the media query on
+ * itself, and a page with no rule of its own would pass.
+ */
+export async function reducedMotionFindings(
+  page: Page,
+  opts: { readonly emulate?: boolean } = {},
+): Promise<readonly A11yFinding[]> {
+  if (opts.emulate !== false) await page.emulateMedia({ reducedMotion: "reduce" });
   const animations = await page.evaluate(() =>
     document.getAnimations().map((animation) => {
       const target =

@@ -43,9 +43,12 @@ import {
   el,
   emptyState,
   jsonPre,
+  scrollRegion,
   skeleton,
   toast,
 } from "../dom.js";
+import { conflictView } from "../ui/conflict.js";
+import { confirmAction, openDialog } from "../ui/dialog.js";
 
 // ---------------------------------------------------------------------------
 // small shared pieces
@@ -65,9 +68,10 @@ function noteLine(body) {
   return note === null ? null : el("p", { class: "muted", text: note });
 }
 
-/** A table with a scroll container (wide content never scrolls the page). */
-function table(headers, rows) {
-  return el("div", { class: "table-scroll" }, [
+/** A table with a scroll container (wide content never scrolls the page),
+ *  named and in the Tab order so a keyboard can scroll it too. */
+function table(headers, rows, label = "table") {
+  return scrollRegion(label, [
     el("table", { class: "fleet" }, [
       el(
         "thead",
@@ -83,9 +87,10 @@ function table(headers, rows) {
   ]);
 }
 
-/** Monospace block for a rendered diff or a YAML body. */
+/** Monospace block for a rendered diff or a YAML body. In the Tab order,
+ *  because a long line scrolls sideways. */
 function pre(text) {
-  return el("pre", { class: "rawjson", text: text === "" ? "(no change)" : text });
+  return el("pre", { class: "rawjson", tabindex: "0", text: text === "" ? "(no change)" : text });
 }
 
 /** The tier badge — colour is never alone, the tier word rides with it. */
@@ -97,15 +102,31 @@ function tierBadge(row) {
 /**
  * Report the outcome of a write.
  *
- * Three distinct answers live behind one call, and collapsing them would
+ * Four distinct answers live behind one call, and collapsing them would
  * throw away the interesting one: a transport failure, a typed refusal the
  * server answered 200 with (`ok:false` — "that version is not in the
- * registry"), and a 409 gate ("type the spec name"). Each gets its own
- * sentence.
+ * registry"), a 409 gate ("type the spec name"), and a 412 that says the
+ * spec changed on disk since the editor read it. Each gets its own answer.
+ *
+ * The 412, when it carries the server's current state (`body.current`),
+ * opens the conflict view rather than a toast, so the draft is never lost:
+ * `conflict.retry(rev)` re-sends the same edit against the new revision,
+ * `conflict.reload()` takes the version on disk, and `conflict.draft` is
+ * what "Download my draft" saves.
+ *
+ * Only an auto-tunable write may be re-sent as it was. A write that needed
+ * the spec's name typed carries `conflict.reconfirm(rev)` instead, which
+ * shows the diff against the version on disk now and asks for the name
+ * again: a confirmation typed against one version of the spec never applies
+ * an edit on top of another.
  */
-function reportWrite(res, okMessage) {
+function reportWrite(res, okMessage, conflict = null) {
   if (res === null || res === undefined) {
     toast("No answer from the manager");
+    return false;
+  }
+  if (res.status === 412 && res.body?.current && typeof res.body.current === "object") {
+    openConflict(res.body.current, okMessage, conflict);
     return false;
   }
   if (!res.ok) {
@@ -122,73 +143,119 @@ function reportWrite(res, okMessage) {
   return true;
 }
 
+/** The conflict view, in a dialog. Nothing is written until a choice is made.
+ *  Focus goes back to the control that made the write (`conflict.opener`). */
+function openConflict(current, okMessage, conflict) {
+  const c = conflict && typeof conflict === "object" ? conflict : {};
+  let dialog = null;
+  const view = conflictView({
+    current: { ...current, draft: typeof c.draft === "string" ? c.draft : current.draft },
+    onReapply: async (rev) => {
+      dialog?.close();
+      if (typeof c.reconfirm === "function") {
+        await c.reconfirm(rev);
+        return;
+      }
+      if (typeof c.retry !== "function") return;
+      const again = await c.retry(rev);
+      if (reportWrite(again, okMessage, c) && typeof c.done === "function") c.done();
+    },
+    onUseDisk: () => {
+      dialog?.close();
+      if (typeof c.reload === "function") c.reload();
+    },
+  });
+  dialog = openDialog({
+    title: "This changed since you opened it",
+    body: [view],
+    actions: [
+      el("button", {
+        class: "btn btn-ghost",
+        type: "button",
+        text: "Close",
+        onClick: () => dialog?.close(),
+      }),
+    ],
+    initialFocus: "heading",
+    returnFocus: c.opener instanceof HTMLElement ? c.opener : undefined,
+  });
+  return dialog;
+}
+
 /**
  * The typed-confirmation dialog: the operator types the spec's name and the
  * SERVER verifies it. The button stays disabled until the text matches, so
- * the dialog cannot be dismissed by muscle memory.
+ * the dialog cannot be dismissed by muscle memory — and a click on the
+ * backdrop does not close it, so a half-typed name is never lost.
  */
 function confirmModal({ title, lead, detail, confirmName, action, onConfirm }) {
-  const backdrop = el("div", { class: "modal-backdrop", role: "presentation" });
-  const close = () => backdrop.remove();
-  const input = el("input", {
-    class: "input",
-    type: "text",
-    placeholder: confirmName,
-    "aria-label": `type ${confirmName} to confirm`,
+  return confirmAction({
+    level: "typed",
+    title,
+    titleExtra: dot("warn", "human-owned"),
+    lead,
+    detail,
+    confirmName,
+    action,
+    onConfirm: () => onConfirm(),
   });
-  const go = el("button", {
-    class: "btn btn-danger",
-    type: "button",
-    text: action,
-    disabled: true,
-  });
-  input.addEventListener("input", () => {
-    go.disabled = input.value.trim() !== confirmName;
-  });
-  go.addEventListener("click", () => {
-    close();
-    onConfirm();
-  });
-  backdrop.appendChild(
-    el("div", { class: "modal card", role: "dialog", "aria-modal": "true" }, [
-      el("h3", { class: "card-title" }, [el("span", { text: title }), dot("warn", "human-owned")]),
-      el("p", { class: "muted", text: lead }),
-      el("div", { class: "modal-body" }, detail),
-      el("label", { class: "field" }, [
-        el("span", { text: `Type ${confirmName} to confirm` }),
-        input,
-      ]),
-      el("div", { class: "modal-actions" }, [
-        go,
-        el("button", { class: "btn btn-ghost", type: "button", text: "Cancel", onClick: close }),
-      ]),
-    ]),
-  );
-  backdrop.addEventListener("click", (e) => {
-    if (e.target === backdrop) close();
-  });
-  document.body.appendChild(backdrop);
-  return backdrop;
 }
 
-/** A plain (untyped) dialog for previews — a version's YAML, a diff. */
-function viewModal(title, children) {
-  const backdrop = el("div", { class: "modal-backdrop", role: "presentation" });
-  const close = () => backdrop.remove();
-  backdrop.appendChild(
-    el("div", { class: "modal card", role: "dialog", "aria-modal": "true" }, [
-      el("h3", { class: "card-title" }, [el("span", { text: title })]),
-      el("div", { class: "modal-body" }, children),
-      el("div", { class: "modal-actions" }, [
-        el("button", { class: "btn btn-ghost", type: "button", text: "Close", onClick: close }),
-      ]),
-    ]),
-  );
-  backdrop.addEventListener("click", (e) => {
-    if (e.target === backdrop) close();
+/**
+ * Re-apply a typed-confirm edit after a conflict: diff it against the spec
+ * as it is on disk now, then ask for the spec's name again. Nothing is sent
+ * until the name is typed; the name the first dialog took is never reused.
+ */
+async function reconfirmEdit(ctx, { edits, rev, label, okMessage, conflict }) {
+  const preview = await api.specDiff({ id: ctx.id }, { edits });
+  if (!preview?.ok) {
+    toast(preview?.body?.error ?? `HTTP ${preview?.status ?? "?"}`);
+    return;
+  }
+  const body = preview.body ?? {};
+  if (body.ok === false) {
+    toast(`${body.code ?? "refused"}: ${body.reason ?? "this edit does not apply"}`);
+    return;
+  }
+  const confirmName = String(body.confirmName ?? "");
+  if (confirmName === "") {
+    toast("The manager sent no spec name to confirm, so nothing was applied");
+    return;
+  }
+  confirmModal({
+    title: `Re-apply ${label}`,
+    lead: "The spec changed since you confirmed this edit. Read the diff against the version on disk now, then type the spec name again to apply it on top.",
+    detail: [pre(String(body.diff ?? ""))],
+    confirmName,
+    action: "Apply to the live spec",
+    onConfirm: async () => {
+      const res = await api.specEdit({ id: ctx.id }, { edits, confirmName, expectedRev: rev });
+      if (reportWrite(res, okMessage, conflict) && typeof conflict.done === "function") {
+        conflict.done();
+      }
+    },
   });
-  document.body.appendChild(backdrop);
-  return backdrop;
+}
+
+/** A plain (untyped) dialog for previews — a version's YAML, a diff — or for
+ *  a form (`holdsInput`), which a stray backdrop click must not close. */
+function viewModal(title, children, holdsInput = false) {
+  let dialog = null;
+  dialog = openDialog({
+    title,
+    body: children,
+    actions: [
+      el("button", {
+        class: "btn btn-ghost",
+        type: "button",
+        text: "Close",
+        onClick: () => dialog?.close(),
+      }),
+    ],
+    dismissOnBackdrop: !holdsInput,
+    initialFocus: holdsInput ? undefined : "heading",
+  });
+  return dialog;
 }
 
 /** A 501 stub, rendered as the fact it is rather than as a broken panel. */
@@ -253,7 +320,7 @@ function effectiveCard(body) {
         ]),
       ]),
     );
-    inner.push(table(["Path", "Value", "Source"], body_));
+    inner.push(table(["Path", "Value", "Source"], body_, "Effective configuration"));
   }
   const issues = Array.isArray(body.issues) ? body.issues : [];
   if (issues.length > 0) {
@@ -359,7 +426,7 @@ function trustCard(ctx, trust, valueByPath, reload) {
         class: "muted",
         text: "Auto-tunable fields are the ones the optimizer may write, so the console may write them too. Everything else needs a review of the diff and a typed confirmation — the server enforces the same split.",
       }),
-      table(["Path", "Tier", "Why", ""], body),
+      table(["Path", "Tier", "Why", ""], body, "Fields and trust tiers"),
       addForm(
         "Rows list what this spec DECLARES. A block it has never declared, or a field inside a list item, is reachable by path — same diff, same tier, same typed confirmation.",
       ),
@@ -379,13 +446,21 @@ function autoTunableEditor(ctx, path, current, reload) {
   });
   const save = el("button", { class: "btn btn-primary", type: "button", text: "Save" });
   save.addEventListener("click", async () => {
-    save.disabled = true;
-    const res = await api.specPatch(
-      { id: ctx.id },
-      { edit: { path, value: coerce(input.value, current) } },
-    );
-    save.disabled = false;
-    if (reportWrite(res, `Saved ${path}`)) reload();
+    // Held with aria-disabled, not `disabled`: a disabled button drops focus
+    // to the page, and the answer may open a dialog that must return it here.
+    if (save.getAttribute("aria-disabled") === "true") return;
+    save.setAttribute("aria-disabled", "true");
+    const edit = { path, value: coerce(input.value, current) };
+    const res = await api.specPatch({ id: ctx.id }, { edit });
+    save.removeAttribute("aria-disabled");
+    const conflict = {
+      opener: save,
+      draft: JSON.stringify(edit, null, 2),
+      retry: (rev) => api.specPatch({ id: ctx.id }, { edit, expectedRev: rev }),
+      reload,
+      done: reload,
+    };
+    if (reportWrite(res, `Saved ${path}`, conflict)) reload();
   });
   return el("div", { class: "row-editor" }, [input, save]);
 }
@@ -472,7 +547,7 @@ function jsonPaneButton(ctx, path, current, reload) {
  * and this screen stays the explanation.
  */
 function valueDialog(ctx, { path, value, pathEditable, reload }) {
-  let backdrop = null;
+  let dialog = null;
   const pathInput = el("input", {
     class: "input grow",
     type: "text",
@@ -522,10 +597,29 @@ function valueDialog(ctx, { path, value, pathEditable, reload }) {
     out.appendChild(pre(String(body.diff ?? "")));
     const apply = async (extra) => {
       const wrote = await api.specEdit({ id: ctx.id }, { edits: batch.edits, ...extra });
-      if (reportWrite(wrote, `Applied ${target}`)) {
-        if (backdrop !== null) backdrop.remove();
-        reload();
+      const typed = typeof extra.confirmName === "string";
+      const conflict = {
+        draft: JSON.stringify(batch.edits, null, 2),
+        reload,
+        done: reload,
+      };
+      if (typed) {
+        conflict.reconfirm = (rev) =>
+          reconfirmEdit(ctx, {
+            edits: batch.edits,
+            rev,
+            label: target,
+            okMessage: `Applied ${target}`,
+            conflict,
+          });
+      } else {
+        conflict.retry = (rev) =>
+          api.specEdit({ id: ctx.id }, { edits: batch.edits, expectedRev: rev });
       }
+      if (reportWrite(wrote, `Applied ${target}`, conflict)) {
+        if (dialog !== null) dialog.close();
+        reload();
+      } else if (wrote?.status === 412 && dialog !== null) dialog.close();
     };
     if (body.autoApplicable === true) {
       const go = el("button", { class: "btn btn-primary", type: "button", text: "Apply" });
@@ -574,7 +668,7 @@ function valueDialog(ctx, { path, value, pathEditable, reload }) {
           "Proposal staged — the review bundle is a dry run until you open the PR",
         )
       ) {
-        if (backdrop !== null) backdrop.remove();
+        if (dialog !== null) dialog.close();
         reload();
       }
     });
@@ -593,22 +687,26 @@ function valueDialog(ctx, { path, value, pathEditable, reload }) {
     out.appendChild(el("div", { class: "modal-actions" }, [go, propose]));
   });
 
-  backdrop = viewModal(pathEditable ? "Edit a spec path" : `Edit ${path}`, [
-    pathEditable
-      ? el("label", { class: "field grow" }, [
-          el("span", { text: "Path (dotted; a number is a list index)" }),
-          pathInput,
-        ])
-      : el("p", { class: "muted mono", text: path }),
-    el("p", {
-      class: "muted",
-      text: "The value is JSON. An empty pane deletes the path. Nothing is written until the diff below has been read.",
-    }),
-    editor,
-    el("div", { class: "modal-actions" }, [preview]),
-    out,
-  ]);
-  return backdrop;
+  dialog = viewModal(
+    pathEditable ? "Edit a spec path" : `Edit ${path}`,
+    [
+      pathEditable
+        ? el("label", { class: "field grow" }, [
+            el("span", { text: "Path (dotted; a number is a list index)" }),
+            pathInput,
+          ])
+        : el("p", { class: "muted mono", text: path }),
+      el("p", {
+        class: "muted",
+        text: "The value is JSON. An empty pane deletes the path. Nothing is written until the diff below has been read.",
+      }),
+      editor,
+      el("div", { class: "modal-actions" }, [preview]),
+      out,
+    ],
+    true,
+  );
+  return dialog;
 }
 
 /** "Review & apply" (diff → typed confirm) and "Propose" for a human-owned
@@ -644,7 +742,14 @@ function humanOwnedActions(ctx, path, current, confirmName, reload) {
       action: "Apply to the live spec",
       onConfirm: async () => {
         const res = await api.specEdit({ id: ctx.id }, { edits, confirmName });
-        if (reportWrite(res, `Applied ${path}`)) reload();
+        const conflict = {
+          draft: JSON.stringify(edits, null, 2),
+          reload,
+          done: reload,
+        };
+        conflict.reconfirm = (rev) =>
+          reconfirmEdit(ctx, { edits, rev, label: path, okMessage: `Applied ${path}`, conflict });
+        if (reportWrite(res, `Applied ${path}`, conflict)) reload();
       },
     });
   });
@@ -704,6 +809,7 @@ function versionsCard(ctx, body, reload) {
       table(
         ["Version", "Pinned to", "Provenance", "", ""],
         versions.map((version) => versionRow(ctx, version, confirmName, reload)),
+        "Version history",
       ),
     );
   }
@@ -804,9 +910,9 @@ function pinDialog(ctx, version, confirmName, reload) {
     lead: "Pins move through the deploy verbs, so the audit record and a protected environment's approval quorum are preserved. The manager never writes the manifest itself.",
     detail: [
       el("label", { class: "field" }, [el("span", { text: "Environment" }), envInput]),
-      el("label", { class: "field" }, [
+      el("label", { class: "check modal-check" }, [
         rollback,
-        el("span", { text: " this is a rollback (the environment is moving backwards)" }),
+        el("span", { text: "This is a rollback (the environment is moving backwards)" }),
       ]),
     ],
     confirmName,
@@ -860,6 +966,7 @@ function connectorsCard(ctx, body, catalog, reload) {
       table(
         ["Server", "Transport", "Command / URL", "Env refs", ""],
         servers.map((server) => connectorRow(ctx, server, confirmName, reload)),
+        "MCP connectors",
       ),
     );
   }
@@ -1027,6 +1134,7 @@ function gradersCard(ctx, body, confirmName, reload) {
             el("td", null, [el("span", { class: "chip", text: String(grader.type ?? "—") })]),
           ]),
         ),
+        "Graders",
       ),
     );
   }
@@ -1100,6 +1208,7 @@ function wizardCard(body) {
     table(
       ["Template", "Shape", "What it scaffolds", ""],
       templates.map((template) => wizardRow(template)),
+      "Templates",
     ),
   ]);
 }
@@ -1193,12 +1302,16 @@ function wizardDialog(template) {
     );
     out.appendChild(el("div", { class: "modal-actions" }, [write]));
   });
-  viewModal(`New ${template.title ?? template.id}`, [
-    el("label", { class: "field grow" }, [el("span", { text: "Directory (absolute)" }), dir]),
-    el("label", { class: "field" }, [el("span", { text: "Spec name" }), nameInput]),
-    el("div", { class: "modal-actions" }, [plan]),
-    out,
-  ]);
+  viewModal(
+    `New ${template.title ?? template.id}`,
+    [
+      el("label", { class: "field grow" }, [el("span", { text: "Directory (absolute)" }), dir]),
+      el("label", { class: "field" }, [el("span", { text: "Spec name" }), nameInput]),
+      el("div", { class: "modal-actions" }, [plan]),
+      out,
+    ],
+    true,
+  );
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,14 @@ import { createMemoryStore } from "@crewhaus/memory-store";
 import { createSessionStore } from "@crewhaus/session-store";
 import { createWikiStore } from "@crewhaus/wiki-store";
 import { loadConsoleGrammar } from "../console-routes";
-import { MARKUP_PAYLOAD, digestFleet, digestTree, seedFleet } from "../seed/fleet";
+import {
+  MARKUP_PAYLOAD,
+  RICH_APPROVAL_TOOLS,
+  RICH_SPEC_VERSION,
+  digestFleet,
+  digestTree,
+  seedFleet,
+} from "../seed/fleet";
 import {
   childEnv,
   crewhausArgv,
@@ -143,6 +150,70 @@ describe("seedFleet", () => {
       const plainCrewhaus = join(plain.harnesses[0]?.dir ?? "", ".crewhaus");
       expect(readFileSync(join(plainCrewhaus, articlePath), "utf8")).not.toContain("__e2eSentinel");
     });
+  });
+});
+
+describe("with rich: true", () => {
+  const jsonl = (path: string): Array<Record<string, unknown>> =>
+    readFileSync(path, "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+  test("is deterministic, and the plain seed is unchanged by it", async () => {
+    const dir = tempDir();
+    const first = digestFleet(
+      await seedFleet(dir, { seed: "s", now: NOW, shapes: ["cli"], rich: true }),
+    );
+    rmSync(dir, { recursive: true, force: true });
+    const second = digestFleet(
+      await seedFleet(dir, { seed: "s", now: NOW, shapes: ["cli"], rich: true }),
+    );
+    expect(second).toEqual(first);
+    rmSync(dir, { recursive: true, force: true });
+    const plain = digestFleet(await seedFleet(dir, { seed: "s", now: NOW, shapes: ["cli"] }));
+    expect(plain["cli"]).not.toBe(first["cli"]);
+  });
+
+  test("carries three pending approvals, an open review item, an eval history and a spec version", async () => {
+    const fleet = await seedFleet(tempDir(), { seed: "s", now: NOW, shapes: ["cli"], rich: true });
+    const [harness] = fleet.harnesses;
+    if (harness === undefined) throw new Error("no harness");
+    const crewhaus = join(harness.dir, ".crewhaus");
+
+    const approvals = jsonl(join(crewhaus, "sessions", "approvals.jsonl"));
+    expect(approvals.map((a) => a["toolName"])).toEqual([...RICH_APPROVAL_TOOLS]);
+    expect(approvals.map((a) => a["id"])).toEqual([...harness.approvalIds]);
+    for (const id of harness.approvalIds) expect(id).toMatch(/^appr_[0-9a-f]{16}$/);
+
+    const review = jsonl(join(crewhaus, "review", "queue.jsonl"));
+    expect(review).toHaveLength(1);
+    expect(review[0]?.["id"]).toBe(harness.reviewId);
+    expect(review[0]?.["status"]).toBe("open");
+
+    const runs = jsonl(join(crewhaus, "evals", "index.jsonl"));
+    const rates = runs.map((r) => r["passRate"] as number);
+    expect(rates).toHaveLength(3);
+    // The newest run is below the pinned baseline, which is the oldest.
+    const baselines = JSON.parse(
+      readFileSync(join(crewhaus, "evals", "baselines.json"), "utf8"),
+    ) as Record<string, { runId: string }>;
+    const pinned = Object.values(baselines)[0]?.runId;
+    expect(pinned).toBe(runs[0]?.["runId"] as string);
+    expect(rates[2]).toBeLessThan(rates[0] as number);
+
+    const manifest = JSON.parse(
+      readFileSync(join(crewhaus, "specs", harness.specName, "manifest.json"), "utf8"),
+    ) as { versions: string[] };
+    expect(manifest.versions).toEqual([RICH_SPEC_VERSION]);
+    // A start can be planned without a CLI on PATH.
+    expect(readFileSync(join(harness.dir, "dist", "agent.ts"), "utf8")).toContain("stand-in");
+  });
+
+  test("is off by default", async () => {
+    const fleet = await seedFleet(tempDir(), { seed: "s", now: NOW, shapes: ["cli"] });
+    expect(fleet.harnesses[0]?.approvalIds).toEqual([]);
+    expect(fleet.harnesses[0]?.reviewId).toBeNull();
   });
 });
 

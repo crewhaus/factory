@@ -1,7 +1,7 @@
 /**
  * The review queue — `.crewhaus/review/queue.jsonl` folded across the fleet,
- * with the same triage ergonomics as the approvals inbox (j/k, one-key
- * verdicts, `.` row menu, `?` bindings).
+ * with the same triage ergonomics as the approvals inbox (j/k, a letter to
+ * choose a verdict and Enter to confirm, `.` row menu, `?` keys).
  *
  * THE VERDICTS DIFFER BY ITEM. An item that points at a session TURN can be
  * ADJUDICATED — up/down take the same path `crewhaus rate --adjudicate`
@@ -13,62 +13,94 @@
  */
 
 import { api } from "../api.js";
-import { clear, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
+import { clear, dot, el, jsonPre, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { REVIEW_KEYS, reviewRow } from "../supervision.js";
+import { emptyFor } from "../ui/empty.js";
+import { toggleBtn } from "../ui/toggle.js";
 import { actionTwin } from "./control.js";
 import { mountTriage } from "./inbox.js";
 
 export async function renderReview(root) {
   clear(root).appendChild(skeleton(6));
-  await draw(root, false);
+  await draw(root, { showResolved: false, seq: 0, toolbar: null, rollup: null, body: null });
 }
 
-async function draw(host, showResolved) {
+/**
+ * The toolbar, and the "Show resolved" toggle in it, are built once per mount and
+ * kept; only the body under them is repainted. A toggle rebuilt by its own
+ * redraw would drop focus to the page.
+ */
+function frame(host, view) {
+  if (view.body !== null) {
+    clear(view.body);
+    return view.body;
+  }
+  view.rollup = el("span", { class: "rollup" });
+  view.toolbar = el("div", { class: "toolbar" }, [
+    view.rollup,
+    el("span", { class: "spacer" }),
+    toggleBtn({
+      label: "Show resolved",
+      pressed: view.showResolved,
+      onToggle: (next) => {
+        view.showResolved = next;
+        void draw(host, view);
+      },
+    }),
+  ]);
+  view.body = el("div");
+  clear(host).append(view.toolbar, view.body);
+  return view.body;
+}
+
+async function draw(host, view) {
+  const { showResolved } = view;
+  view.seq = (view.seq ?? 0) + 1;
+  const mine = view.seq;
   let payload;
   try {
     payload = await api.review(showResolved);
   } catch (err) {
-    clear(host).appendChild(
-      el("div", { class: "card error-card" }, [
-        el("p", { class: "muted", text: err instanceof Error ? err.message : String(err) }),
-      ]),
-    );
+    const failed = el("div", { class: "card error-card" }, [
+      el("p", { class: "muted", text: err instanceof Error ? err.message : String(err) }),
+    ]);
+    if (mine !== view.seq) return;
+    if (view.body === null) clear(host).appendChild(failed);
+    else frame(host, view).appendChild(failed);
     return;
   }
-  clear(host);
+  // A newer toggle or reload already asked: this answer is out of date.
+  if (mine !== view.seq) return;
+  const body = frame(host, view);
   const nowMs = Date.now();
   const rows = (payload && Array.isArray(payload.items) ? payload.items : []).map((r) =>
     reviewRow(r, nowMs),
   );
   const open = payload && typeof payload.open === "number" ? payload.open : 0;
-  const reload = () => draw(host, showResolved);
+  const reload = () => draw(host, view);
 
-  host.appendChild(
-    el("div", { class: "toolbar" }, [
-      el("span", { class: "rollup", text: `${open} open · ${rows.length} shown` }),
-      el("span", { class: "spacer" }),
-      el("button", {
-        class: `btn btn-ghost${showResolved ? " active" : ""}`,
-        type: "button",
-        text: showResolved ? "Showing resolved too" : "Show resolved",
-        onClick: () => draw(host, !showResolved),
-      }),
-    ]),
-  );
+  view.rollup.textContent = `${open} open · ${rows.length} shown`;
   if (rows.length === 0) {
-    host.appendChild(
-      emptyState(
-        showResolved ? "No review items on this fleet" : "Nothing waiting for review",
-        "crewhaus review list",
-      ),
+    body.appendChild(
+      emptyFor({
+        cause: "no-data",
+        detail: showResolved
+          ? "No review items are recorded on this fleet."
+          : "Nothing is waiting for review. A split rating or a quarantined case lands here.",
+        verb: "crewhaus review list",
+      }),
     );
     return;
   }
-  mountTriage(host, rows, {
+  mountTriage(body, rows, {
+    name: "review",
+    label: "Review queue",
     keys: REVIEW_KEYS,
     reload,
     render: reviewCard,
+    rowLabel: (row) => `${row.kind} for ${row.specName}, ${row.status}`,
+    prompt: (row, verdict) => `Record ${verdict} for ${row.specName}?`,
     perform: adjudicate,
   });
 }
@@ -94,8 +126,8 @@ async function adjudicate(row, verdict, reload) {
   reload();
 }
 
-function reviewCard(row, index, state, redraw, reload) {
-  const selected = state.index === index;
+/** One row's content; the triage shell owns the row (see approvals.js). */
+function reviewCard(row, { perform }) {
   const verdictBtn = (verdict) => {
     const btn = el("button", {
       class: `btn${verdict === "up" || verdict === "pass" ? " btn-primary" : ""}`,
@@ -104,61 +136,51 @@ function reviewCard(row, index, state, redraw, reload) {
       title: row.open ? `record ${verdict}` : `already ${row.status}`,
     });
     if (!row.open) btn.disabled = true;
-    else btn.addEventListener("click", () => adjudicate(row, verdict, reload));
+    else btn.addEventListener("click", () => perform(verdict));
     return btn;
   };
-  return el(
-    "section",
-    {
-      class: `card inbox-card${selected ? " selected" : ""}`,
-      "aria-current": selected ? "true" : null,
-      onClick: () => {
-        if (!selected) redraw({ ...state, index });
-      },
-    },
-    [
-      el("div", { class: "inbox-head" }, [
-        dot(row.dot, row.status),
-        el("span", { class: "chip", text: row.kind }),
-        el("a", { class: "name-link", href: hrefHarness(row.harnessId), text: row.specName }),
-        row.adjudicable
-          ? el("span", { class: "chip chip-group", text: "adjudicable" })
-          : el("span", { class: "chip", text: "item verdict only" }),
-        el("span", { class: "muted", text: row.age }),
-      ]),
-      row.context !== "" ? el("pre", { class: "prose-pre", text: row.context }) : null,
-      row.sessionId !== null
-        ? el("div", { class: "muted reason" }, [
-            el("span", { text: "turn " }),
-            el("span", { class: "mono", text: String(row.turn ?? "?") }),
-            el("span", { text: " of " }),
-            el("a", {
-              class: "mono",
-              href: hrefHarness(row.harnessId, "sessions", row.sessionId),
-              text: row.sessionId,
-            }),
-          ])
+  return [
+    el("div", { class: "inbox-head" }, [
+      dot(row.dot, row.status),
+      el("span", { class: "chip", text: row.kind }),
+      el("a", { class: "name-link", href: hrefHarness(row.harnessId), text: row.specName }),
+      row.adjudicable
+        ? el("span", { class: "chip chip-group", text: "adjudicable" })
+        : el("span", { class: "chip", text: "item verdict only" }),
+      el("span", { class: "muted", text: row.age }),
+    ]),
+    row.context !== "" ? el("pre", { class: "prose-pre", text: row.context }) : null,
+    row.sessionId !== null
+      ? el("div", { class: "muted reason" }, [
+          el("span", { text: "turn " }),
+          el("span", { class: "mono", text: String(row.turn ?? "?") }),
+          el("span", { text: " of " }),
+          el("a", {
+            class: "mono",
+            href: hrefHarness(row.harnessId, "sessions", row.sessionId),
+            text: row.sessionId,
+          }),
+        ])
+      : null,
+    el("div", { class: "muted reason", text: row.verdictNote }),
+    el("div", { class: "inbox-actions" }, row.verdicts.map(verdictBtn)),
+    el("div", { class: "inbox-twins" }, [
+      row.adjudicable
+        ? actionTwin("adjudicate", {
+            sessionId: row.sessionId,
+            turn: row.turn ?? 0,
+            verdict: "up",
+          })
         : null,
-      el("div", { class: "muted reason", text: row.verdictNote }),
-      el("div", { class: "inbox-actions" }, row.verdicts.map(verdictBtn)),
-      el("div", { class: "inbox-twins" }, [
-        row.adjudicable
-          ? actionTwin("adjudicate", {
-              sessionId: row.sessionId,
-              turn: row.turn ?? 0,
-              verdict: "up",
-            })
-          : null,
-        actionTwin("review", { id: row.id }),
-      ]),
-      Object.keys(row.sourceRef).length > 0
-        ? el("details", { class: "fold" }, [
-            el("summary", { class: "fold-summary" }, [
-              el("span", { class: "muted", text: "source reference" }),
-            ]),
-            el("div", { class: "fold-body" }, [jsonPre(row.sourceRef)]),
-          ])
-        : null,
-    ],
-  );
+      actionTwin("review", { id: row.id }),
+    ]),
+    Object.keys(row.sourceRef).length > 0
+      ? el("details", { class: "fold" }, [
+          el("summary", { class: "fold-summary" }, [
+            el("span", { class: "muted", text: "source reference" }),
+          ]),
+          el("div", { class: "fold-body" }, [jsonPre(row.sourceRef)]),
+        ])
+      : null,
+  ];
 }

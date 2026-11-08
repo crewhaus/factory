@@ -3,13 +3,32 @@
  * and computed smart groups. All writes on this screen are registry CRUD
  * (the only write surface in the read-only alpha): add/scan, group
  * create/assign, tags/pin/notes, missing-dir relocate/remove.
+ *
+ * The first paint comes from the cached feed and a background refresh
+ * replaces it. That refresh is KEYED (`ui/keyed.js`): each harness's rows
+ * live in their own `<tbody>`, kept and updated in place, so an open row
+ * editor, what is typed in it, and whatever holds focus all survive the
+ * refresh.
  */
 
 import { api } from "../api.js";
-import { asOf, clear, copyBtn, dot, el, emptyState, skeleton, toast, withTip } from "../dom.js";
+import {
+  asOf,
+  clear,
+  copyBtn,
+  dot,
+  el,
+  emptyState,
+  scrollRegion,
+  skeleton,
+  toast,
+  withTip,
+} from "../dom.js";
 import { hrefHarness } from "../router.js";
-import { shapeAccent, shapeLabel } from "../shapes.js";
+import { shapeAccentVars, shapeLabel } from "../shapes.js";
 import { procStatePill } from "../supervision.js";
+import { confirmAction } from "../ui/dialog.js";
+import { reconcile } from "../ui/keyed.js";
 import {
   deriveSmartGroups,
   dirTail,
@@ -94,7 +113,53 @@ async function hydrateInBackground(root, groups) {
     return; // the cold paint stands; the next reload retries
   }
   if (!root.isConnected) return; // navigated away meanwhile
-  draw(root, normalizeRows(feed), groups, { hydrating: false });
+  refresh(root, normalizeRows(feed), groups);
+}
+
+/** root → what `draw` put there, so a refresh can update it in place. */
+const views = new WeakMap();
+
+/**
+ * Bring the screen up to date with fresh rows WITHOUT rebuilding what is
+ * still wanted: the rail is redrawn only when focus is not in it, the rollup
+ * line is rewritten, and the table's rows are reconciled by harness id. When
+ * the screen's shape changed (a filter now matches nothing, a directory went
+ * missing), it is drawn again from scratch.
+ */
+function refresh(root, rows, groups) {
+  const view = views.get(root);
+  const nowMs = Date.now();
+  const missing = rows.filter((r) => r.missingSince !== null);
+  const visible = applyFilter(
+    rows.filter((r) => r.missingSince === null),
+    nowMs,
+  );
+  if (
+    view === undefined ||
+    !view.layout.isConnected ||
+    view.table === null ||
+    !view.table.isConnected ||
+    visible.length === 0 ||
+    missing.length !== view.missingCount
+  ) {
+    draw(root, rows, groups, { hydrating: false });
+    return;
+  }
+  view.rows = rows;
+  view.groups = groups;
+  const active = document.activeElement;
+  if (!view.rail.contains(active)) {
+    const rail = renderRail(rows, groups, nowMs, view.redraw, view.reload);
+    view.rail.replaceWith(rail);
+    view.rail = rail;
+  }
+  view.rollup.replaceChildren(...rollupChildren(rows, false));
+  const col = COLUMNS.find((c) => c.key === state.sortKey) ?? COLUMNS[0];
+  reconcile(view.table, sortRows(visible, col.get, state.sortDir), {
+    keyOf: (row) => row.id,
+    create: (row) => harnessGroup(row, groups, view.reload),
+    update: (node, row) => updateGroup(node, row, groups),
+  });
 }
 
 function normalizeGroups(payload, rows) {
@@ -149,27 +214,37 @@ function applyFilter(rows, nowMs) {
   return out;
 }
 
+/** The rollup line's contents. */
+function rollupChildren(rows, hydrating) {
+  const cachedAt = oldestCachedAt(rows);
+  return [
+    el("span", { text: rollupLine(rows) }),
+    cachedAt ? asOf(cachedAt) : null,
+    hydrating === true ? el("span", { class: "muted", text: "· refreshing…" }) : null,
+  ].filter((node) => node !== null);
+}
+
 function draw(root, rows, groups, opts = {}) {
   const nowMs = Date.now();
-  const redraw = () => draw(root, rows, groups, opts);
+  // Sorting and filtering redraw from the newest rows a refresh brought.
+  const redraw = () => {
+    const view = views.get(root);
+    draw(root, view?.rows ?? rows, view?.groups ?? groups, { hydrating: false });
+  };
   const reload = () => renderLibrary(root);
   clear(root);
 
   const layout = el("div", { class: "lib" });
-  layout.appendChild(renderRail(rows, groups, nowMs, redraw, reload));
+  const rail = renderRail(rows, groups, nowMs, redraw, reload);
+  layout.appendChild(rail);
 
   const main = el("section", { class: "lib-main" });
   main.appendChild(renderToolbar(reload));
-  const cachedAt = oldestCachedAt(rows);
-  main.appendChild(
-    el("div", { class: "rollup" }, [
-      el("span", { text: rollupLine(rows) }),
-      cachedAt ? asOf(cachedAt) : null,
-      opts.hydrating === true ? el("span", { class: "muted", text: "· refreshing…" }) : null,
-    ]),
-  );
+  const rollup = el("div", { class: "rollup" }, rollupChildren(rows, opts.hydrating));
+  main.appendChild(rollup);
 
-  for (const row of rows.filter((r) => r.missingSince !== null)) {
+  const missing = rows.filter((r) => r.missingSince !== null);
+  for (const row of missing) {
     main.appendChild(missingCard(row, reload));
   }
 
@@ -177,6 +252,7 @@ function draw(root, rows, groups, opts = {}) {
     rows.filter((r) => r.missingSince === null),
     nowMs,
   );
+  let table = null;
   if (rows.length === 0) {
     main.appendChild(
       emptyState(
@@ -187,10 +263,23 @@ function draw(root, rows, groups, opts = {}) {
   } else if (visible.length === 0) {
     main.appendChild(emptyState("No harnesses match this filter"));
   } else {
-    main.appendChild(renderTable(visible, groups, nowMs, redraw, reload));
+    const region = renderTable(visible, groups, nowMs, redraw, reload);
+    table = region.querySelector("table");
+    main.appendChild(region);
   }
   layout.appendChild(main);
   root.appendChild(layout);
+  views.set(root, {
+    layout,
+    rail,
+    rollup,
+    table,
+    rows,
+    groups,
+    redraw,
+    reload,
+    missingCount: missing.length,
+  });
 }
 
 function renderRail(rows, groups, nowMs, redraw, reload) {
@@ -493,11 +582,13 @@ function missingCard(row, reload) {
   });
   const removeBtn = el("button", { class: "btn btn-danger", type: "button", text: "Remove entry" });
   removeBtn.addEventListener("click", () => {
-    const sure = window.confirm(
-      `Remove "${name}" from the registry? Only the registry row is deleted — no harness data.`,
-    );
-    if (!sure) return;
-    tryWrite("Remove", () => api.removeHarness(row.id), reload);
+    confirmAction({
+      level: "confirm",
+      title: `Remove “${name}” from the registry?`,
+      lead: "Only the registry row is deleted — no harness data.",
+      action: "Remove entry",
+      onConfirm: () => tryWrite("Remove", () => api.removeHarness(row.id), reload),
+    });
   });
   return el("div", { class: "card missing-card" }, [
     el("div", { class: "missing-head" }, [
@@ -554,14 +645,48 @@ function renderTable(rows, groups, nowMs, redraw, reload) {
     ),
   );
 
-  const tbody = el("tbody");
+  const table = el("table", { class: "fleet" }, [thead]);
   for (const row of sorted) {
-    tbody.appendChild(harnessRow(row, groups, reload));
+    const group = harnessGroup(row, groups, reload);
+    group.dataset.key = row.id;
+    table.appendChild(group);
   }
-  return el("div", { class: "table-scroll" }, [el("table", { class: "fleet" }, [thead, tbody])]);
+  return scrollRegion("Harnesses", [table]);
 }
 
-function harnessRow(row, groups, reload) {
+/** tbody → its controller: the row it shows, and its open editor. */
+const groupControllers = new WeakMap();
+
+/** One harness: its own `<tbody>` holding its row and, when open, its
+ *  editor, so a refresh can keep both. */
+function harnessGroup(row, groups, reload) {
+  const ctl = { row, groups, reload, editorTr: null, node: null, mainTr: null };
+  ctl.node = el("tbody", { class: "row-group" });
+  ctl.mainTr = harnessRow(ctl);
+  ctl.node.appendChild(ctl.mainTr);
+  groupControllers.set(ctl.node, ctl);
+  return ctl.node;
+}
+
+/** Fresh data for a kept harness: every cell is rebuilt except one that holds
+ *  focus, and an open editor is left as it is. */
+function updateGroup(node, row, groups) {
+  const ctl = groupControllers.get(node);
+  if (ctl === undefined) return;
+  ctl.row = row;
+  ctl.groups = groups;
+  const fresh = harnessRow(ctl);
+  const active = document.activeElement;
+  const nextCells = [...fresh.children];
+  [...ctl.mainTr.children].forEach((cell, i) => {
+    const next = nextCells[i];
+    if (next === undefined || cell.contains(active)) return;
+    cell.replaceWith(next);
+  });
+}
+
+function harnessRow(ctl) {
+  const { row, reload } = ctl;
   const health = evalHealth(row.lastEval);
   const name = row.specName || dirTail(row.dir, 1) || row.id;
 
@@ -587,7 +712,8 @@ function harnessRow(row, groups, reload) {
     el("td", null, [
       el("span", {
         class: "shape-badge",
-        style: { "--accent": shapeAccent(row.target) },
+        "data-shape-accent": "",
+        style: shapeAccentVars(row.target),
         text: shapeLabel(row.target),
       }),
     ]),
@@ -646,15 +772,17 @@ function harnessRow(row, groups, reload) {
     text: "Edit",
     "aria-label": `edit registry fields for ${name}`,
   });
-  let editorTr = null;
+  editBtn.setAttribute("aria-expanded", ctl.editorTr !== null ? "true" : "false");
   editBtn.addEventListener("click", () => {
-    if (editorTr) {
-      editorTr.remove();
-      editorTr = null;
+    if (ctl.editorTr !== null) {
+      ctl.editorTr.remove();
+      ctl.editorTr = null;
+      editBtn.setAttribute("aria-expanded", "false");
       return;
     }
-    editorTr = editorRow(row, groups, reload);
-    tr.after(editorTr);
+    ctl.editorTr = editorRow(ctl.row, ctl.groups, ctl.reload);
+    ctl.node.appendChild(ctl.editorTr);
+    editBtn.setAttribute("aria-expanded", "true");
   });
   tr.querySelector(".cell-edit").appendChild(editBtn);
   return tr;
@@ -680,20 +808,21 @@ function editorRow(row, groups, reload) {
     cb.checked = row.groups.includes(g.name);
     return { name: g.name, cb };
   });
-  const hiddenCb = el("input", { type: "checkbox", "aria-label": "hide from the library" });
+  // The tip sits on the checkbox, which takes focus; a label does not.
+  const hiddenCb = withTip(
+    el("input", { type: "checkbox", "aria-label": "hide from the library" }),
+    "Hiding is curation, not removal: state, groups and history survive, and the Hidden bucket in the rail lists it until you bring it back.",
+  );
   hiddenCb.checked = row.hidden === true;
   const form = el("form", { class: "row-editor" }, [
     el("label", { class: "field" }, [el("span", { text: "Tags" }), tags]),
     el("label", { class: "field" }, [el("span", { text: "Notes" }), notes]),
     el("div", { class: "field" }, [
       el("span", { text: "Visibility" }),
-      withTip(
-        el("label", { class: "check" }, [
-          hiddenCb,
-          el("span", { text: "Hidden — keep registered, out of the default view" }),
-        ]),
-        "Hiding is curation, not removal: state, groups and history survive, and the Hidden bucket in the rail lists it until you bring it back.",
-      ),
+      el("label", { class: "check" }, [
+        hiddenCb,
+        el("span", { text: "Hidden — keep registered, out of the default view" }),
+      ]),
     ]),
     el("div", { class: "field" }, [
       el("span", { text: groups.length > 0 ? "Groups" : "Groups (none defined yet)" }),

@@ -7,8 +7,9 @@
  */
 
 import { api } from "../api.js";
-import { clear, el, emptyState, skeleton, svgEl } from "../dom.js";
-import { barRects, fmtCount, fmtUsd, usdFromMicros } from "../util.js";
+import { clear, el, emptyState, scrollRegion, skeleton } from "../dom.js";
+import { chart, chartModel } from "../ui/chart.js";
+import { fmtCount, fmtUsd, usdFromMicros } from "../util.js";
 
 export async function renderCosts(root, ctx) {
   clear(root).appendChild(skeleton(6));
@@ -25,9 +26,11 @@ export async function renderCosts(root, ctx) {
   }
 
   if (days.length > 0) {
-    const shown = days.slice(-7);
-    const values = shown.map((d) => usdFromMicros(d.usdMicros) ?? 0);
-    const rects = barRects(values, 420, 64);
+    // A day with no figure is unknown: no bar, and never $0.
+    const rows = days.slice(-7).map((d) => ({
+      label: String(d.day ?? ""),
+      value: usdFromMicros(d.usdMicros),
+    }));
     root.appendChild(
       el("div", { class: "card" }, [
         el("h3", { class: "card-title" }, [
@@ -44,20 +47,17 @@ export async function renderCosts(root, ctx) {
               })
             : null,
         ]),
-        svgEl(
-          "svg",
-          {
-            class: "bars bars-lg",
-            viewBox: "0 0 420 64",
-            role: "img",
-            "aria-label": "daily spend",
-          },
-          rects.map((r) => svgEl("rect", { x: r.x, y: r.y, width: r.w, height: r.h, rx: "1.5" })),
-        ),
-        el(
-          "div",
-          { class: "bar-labels" },
-          shown.map((d) => el("span", { class: "muted", text: String(d.day ?? "").slice(5) })),
+        chart(
+          chartModel({
+            kind: "bars",
+            title: "Spend per day, last 7 days",
+            rows,
+            format: fmtUsd,
+            noun: "day",
+            width: 420,
+            height: 64,
+          }),
+          { labelHead: "Day", valueHead: "Spend" },
         ),
       ]),
     );
@@ -78,7 +78,7 @@ export async function renderCosts(root, ctx) {
       );
     }
     root.appendChild(
-      el("div", { class: "table-scroll" }, [
+      scrollRegion("Spend by model", [
         el("table", { class: "fleet" }, [
           el(
             "thead",

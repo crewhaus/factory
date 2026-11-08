@@ -2,8 +2,14 @@
    Hangar — calm, dense "drafting paper" console.
    Dark default; light theme is an explicit [data-theme="light"] override
    (no prefers-color-scheme auto-switch — the toggle owns it). System font
-   stack, subtle borders, per-shape accent via the --accent custom property,
-   no animation beyond opacity.
+   stack, subtle borders, per-shape accent via [data-shape-accent], no
+   animation beyond opacity, and none at all under reduced motion.
+
+   Accessibility target: WCAG 2.2 AA. Every text token holds 4.5:1 on all
+   four surfaces of its theme, and every control border, the focus ring and
+   the status dot hold 3:1 — `src/hangar-css.test.ts` computes each pair
+   from this file, so a value that fails cannot land. Sizes are in rem, so
+   the root carries the reader's text size.
    ========================================================================== */
 
 :root {
@@ -16,9 +22,9 @@
   /* ink */
   --ink: #e8efe9;
   --ink-2: #98a39e;
-  --ink-3: #5e6a65;
+  --ink-3: #8a958f;
 
-  /* accent (mint default; per-shape values are set inline where scoped) */
+  /* accent (mint default; a shape's accent applies under [data-shape-accent]) */
   --mint: #2ecc8b;
   --accent: var(--mint);
   --accent-ghost: rgba(46, 204, 139, 0.12);
@@ -28,6 +34,7 @@
   --warn: #e6b450;
   --bad: #ef6f6f;
   --info: #64b5ff;
+  /* a status dot's fill only: a graphical token, 3:1 */
   --off: #5e6a65;
   /* words beside a status dot: a verdict is read, so these hold AA on every panel */
   --ok-text: #2ecc8b;
@@ -36,9 +43,12 @@
   --warn-ghost: rgba(230, 180, 80, 0.12);
   --bad-ghost: rgba(239, 111, 111, 0.12);
 
-  /* rules */
+  /* rules: decorative. A control's edge is --boundary, which holds 3:1. */
   --rule: rgba(140, 180, 165, 0.14);
   --rule-2: rgba(140, 180, 165, 0.24);
+  --boundary: #626f69;
+  /* the focus ring: never derived from a shape, so no accent can weaken it */
+  --focus: var(--mint);
 
   --radius: 10px;
   --radius-sm: 7px;
@@ -56,23 +66,70 @@
 
   --ink: #16221b;
   --ink-2: #45524b;
-  --ink-3: #6d7b73;
+  --ink-3: #56625b;
 
-  --accent-ghost: rgba(46, 204, 139, 0.16);
+  --accent: #0a6e47;
+  --accent-ghost: rgba(10, 110, 71, 0.08);
 
-  --ok: #1e9664;
-  --warn: #b7791f;
-  --bad: #d0463f;
-  --info: #2f7fd6;
+  --ok: #13744b;
+  --warn: #8a5a0f;
+  --bad: #b0302a;
+  --info: #1d62b0;
   --off: #6d7b73;
   --ok-text: #12704a;
   --warn-text: #7f5210;
   --bad-text: #ab2f29;
-  --warn-ghost: rgba(183, 121, 31, 0.14);
-  --bad-ghost: rgba(208, 70, 63, 0.12);
+  --warn-ghost: rgba(138, 90, 15, 0.12);
+  --bad-ghost: rgba(176, 48, 42, 0.1);
 
   --rule: rgba(40, 62, 50, 0.16);
   --rule-2: rgba(40, 62, 50, 0.28);
+  --boundary: #7a877f;
+  --focus: #0a6e47;
+}
+
+/* More contrast: chosen in Readability, or asked for by the system. The two
+   media blocks repeat the attribute blocks exactly; a test holds them equal. */
+:root[data-contrast="more"] {
+  --ink-2: #b5bfba;
+  --ink-3: #a3ada8;
+  --rule: rgba(140, 180, 165, 0.3);
+  --rule-2: rgba(140, 180, 165, 0.45);
+  --boundary: #87948e;
+}
+:root[data-theme="light"][data-contrast="more"] {
+  --ink-2: #38443d;
+  --ink-3: #404c45;
+  --rule: rgba(40, 62, 50, 0.32);
+  --rule-2: rgba(40, 62, 50, 0.5);
+  --boundary: #5f6b64;
+}
+@media (prefers-contrast: more) {
+  :root {
+    --ink-2: #b5bfba;
+    --ink-3: #a3ada8;
+    --rule: rgba(140, 180, 165, 0.3);
+    --rule-2: rgba(140, 180, 165, 0.45);
+    --boundary: #87948e;
+  }
+  :root[data-theme="light"] {
+    --ink-2: #38443d;
+    --ink-3: #404c45;
+    --rule: rgba(40, 62, 50, 0.32);
+    --rule-2: rgba(40, 62, 50, 0.5);
+    --boundary: #5f6b64;
+  }
+}
+
+/* A shape's accent: two custom properties set on the node (`shapeAccentVars`
+   in js/shapes.js), so switching theme needs no re-render. */
+[data-shape-accent] {
+  --accent: var(--accent-dark);
+  --accent-ghost: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+:root[data-theme="light"] [data-shape-accent] {
+  --accent: var(--accent-light);
+  --accent-ghost: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
 * {
@@ -85,11 +142,24 @@ body {
   min-height: 100%;
 }
 
+/* The root carries the text size: Readability's choice on top of the
+   browser's own setting, which a percentage keeps. */
+html {
+  font-size: 100%;
+  scroll-padding-top: 12px;
+}
+:root[data-text-size="large"] {
+  font-size: 112.5%;
+}
+:root[data-text-size="larger"] {
+  font-size: 125%;
+}
+
 body {
   background: var(--bg);
   color: var(--ink);
   font-family: var(--sans);
-  font-size: 13.5px;
+  font-size: 0.84375rem;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
@@ -110,6 +180,52 @@ code,
 
 .muted {
   color: var(--ink-2);
+}
+
+/* ── focus, skip link, screen-reader text ──────────────────────────────── */
+
+/* One ring for every control, from a token no shape accent can weaken. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+/* Inside a container that scrolls sideways, an outer ring would be clipped. */
+.tabs :focus-visible,
+.app-nav :focus-visible,
+.table-scroll :focus-visible,
+.table-scroll:focus-visible,
+.omni-panel :focus-visible,
+#view:focus-visible {
+  outline-offset: -2px;
+}
+
+/* Text for a screen reader only. Clipped to one pixel, never display:none. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The first stop on every page. Off-screen until it holds focus. */
+.skip-link {
+  position: absolute;
+  left: 12px;
+  top: -200px;
+  z-index: 300;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--panel-3);
+  color: var(--ink);
+  border: 1px solid var(--boundary);
+}
+.skip-link:focus {
+  top: 8px;
 }
 
 /* ── shell ─────────────────────────────────────────────────────────────── */
@@ -157,7 +273,7 @@ code,
 }
 .brand-sub {
   color: var(--ink-3);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 .spacer {
@@ -180,7 +296,7 @@ code,
   padding: 8px 18px;
   border-top: 1px solid var(--rule);
   color: var(--ink-3);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 /* ── controls ──────────────────────────────────────────────────────────── */
@@ -189,9 +305,11 @@ code,
   font: inherit;
   color: var(--ink);
   background: var(--panel-2);
-  border: 1px solid var(--rule-2);
+  border: 1px solid var(--boundary);
   border-radius: var(--radius-sm);
   padding: 5px 11px;
+  min-height: 24px;
+  min-width: 24px;
   cursor: pointer;
 }
 .btn:hover {
@@ -212,10 +330,19 @@ code,
   border-color: transparent;
   color: var(--ink-2);
 }
+/* `.active` is a look only: the control also says so, with aria-pressed and
+   a check glyph (ui/toggle.js), so colour is never the only cue. */
 .btn-ghost:hover,
-.btn-ghost.active {
+.btn-ghost.active,
+.btn-ghost[aria-pressed="true"] {
   color: var(--ink);
-  border-color: var(--rule-2);
+  border-color: var(--boundary);
+}
+.toggle-check {
+  display: inline-block;
+  width: 1em;
+  margin-right: 4px;
+  text-align: center;
 }
 .btn-danger {
   border-color: var(--bad);
@@ -230,12 +357,12 @@ code,
   font: inherit;
   color: var(--ink);
   background: var(--panel-2);
-  border: 1px solid var(--rule-2);
+  border: 1px solid var(--boundary);
   border-radius: var(--radius-sm);
   padding: 5px 9px;
+  min-height: 24px;
 }
 .input:focus {
-  outline: none;
   border-color: var(--accent);
 }
 .grow {
@@ -258,7 +385,7 @@ code,
   align-items: baseline;
   gap: 10px;
   margin: 0 0 10px;
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 650;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -269,6 +396,14 @@ code,
   letter-spacing: 0;
   font-weight: 400;
 }
+/* A title's status words wrap on a narrow screen rather than widen the page. */
+.card-title {
+  flex-wrap: wrap;
+}
+.card-title .dot-pair,
+.card-title .dot-label {
+  white-space: normal;
+}
 
 .chip {
   display: inline-block;
@@ -276,13 +411,19 @@ code,
   margin: 1px 3px 1px 0;
   border: 1px solid var(--rule-2);
   border-radius: 999px;
-  font-size: 11.5px;
+  font-size: 0.71875rem;
   color: var(--ink-2);
   background: var(--panel-2);
   white-space: nowrap;
 }
+/* A chip that is a link is a target: 24px tall, whatever its text size. */
+a.chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+}
 .chip-warn {
-  color: var(--warn);
+  color: var(--warn-text);
   border-color: var(--warn);
   background: var(--warn-ghost);
 }
@@ -300,6 +441,14 @@ code,
   align-items: center;
   gap: 6px;
   white-space: nowrap;
+  max-width: 100%;
+}
+/* A long state wraps on a narrow screen rather than widening the page. */
+.sup-strip .chip,
+.proc-facts .dot-pair,
+.proc-facts .dot-label {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .dot {
   width: 8px;
@@ -320,7 +469,7 @@ code,
   background: var(--info);
 }
 .dot-label {
-  font-size: 12.5px;
+  font-size: 0.78125rem;
 }
 .dot-ok .dot-label {
   color: var(--ok-text);
@@ -337,7 +486,7 @@ code,
 
 .asof {
   margin-left: 6px;
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--ink-3);
   white-space: nowrap;
 }
@@ -354,6 +503,16 @@ code,
   background: var(--panel-3);
   opacity: 0.7;
   animation: pulse 1.2s ease-in-out infinite alternate;
+}
+/* Reduced motion, from the system or from Readability: the skeleton holds
+   still. Nothing else in the console moves. */
+@media (prefers-reduced-motion: reduce) {
+  .skel-line {
+    animation: none;
+  }
+}
+:root[data-motion="reduce"] .skel-line {
+  animation: none;
 }
 @keyframes pulse {
   from {
@@ -382,11 +541,17 @@ code,
 }
 .empty-verb {
   margin-top: 5px;
-  font-size: 12.5px;
+  font-size: 0.78125rem;
   color: var(--ink-3);
 }
 .empty-verb code {
   color: var(--accent);
+}
+.empty-detail {
+  margin-top: 4px;
+}
+.empty .btn {
+  margin-top: 8px;
 }
 
 /* ── library ───────────────────────────────────────────────────────────── */
@@ -410,7 +575,7 @@ code,
 }
 .rail-head {
   margin: 12px 0 3px;
-  font-size: 11px;
+  font-size: 0.6875rem;
   text-transform: uppercase;
   letter-spacing: 0.07em;
   color: var(--ink-3);
@@ -446,7 +611,7 @@ code,
   white-space: nowrap;
 }
 .rail-count {
-  font-size: 11.5px;
+  font-size: 0.71875rem;
   color: var(--ink-3);
 }
 .rail-new {
@@ -468,6 +633,7 @@ code,
 .toolbar,
 .add-form {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
   margin: 0 0 10px;
@@ -495,11 +661,11 @@ code,
 table.fleet {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 .fleet th {
   text-align: left;
-  font-size: 11.5px;
+  font-size: 0.71875rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--ink-3);
@@ -513,7 +679,7 @@ table.fleet {
   border-bottom: 1px solid var(--rule);
   vertical-align: top;
 }
-.fleet tbody tr:last-child td {
+.fleet tbody:last-child tr:last-child td {
   border-bottom: none;
 }
 .fleet tbody tr:hover td {
@@ -555,7 +721,7 @@ table.fleet {
   color: var(--accent);
 }
 .sub {
-  font-size: 11.5px;
+  font-size: 0.71875rem;
   color: var(--ink-3);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -578,11 +744,11 @@ table.fleet {
   display: inline-block;
   padding: 1px 8px;
   border-radius: 999px;
-  font-size: 11.5px;
+  font-size: 0.71875rem;
   font-weight: 600;
   color: var(--accent);
   border: 1px solid var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
   white-space: nowrap;
 }
 
@@ -600,7 +766,7 @@ table.fleet {
   display: flex;
   flex-direction: column;
   gap: 3px;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--ink-2);
 }
 .notes {
@@ -617,6 +783,17 @@ table.fleet {
   align-items: center;
   gap: 4px;
   color: var(--ink);
+}
+/* A checkbox or radio is a target: a 16px box with room around it, so the
+   24px around its centre touches no other control. */
+input[type="checkbox"],
+input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  margin: 4px;
+}
+.modal-check {
+  margin-top: 10px;
 }
 
 .missing-card {
@@ -651,7 +828,7 @@ table.fleet {
 }
 .h-title h2 {
   margin: 0;
-  font-size: 19px;
+  font-size: 1.1875rem;
 }
 .h-dir {
   display: flex;
@@ -679,11 +856,16 @@ table.fleet {
 }
 .tab {
   padding: 6px 12px;
+  font: inherit;
   color: var(--ink-2);
+  background: transparent;
   border: 1px solid transparent;
   border-bottom: none;
   border-radius: var(--radius-sm) var(--radius-sm) 0 0;
   white-space: nowrap;
+}
+button.tab {
+  cursor: pointer;
 }
 .tab:hover {
   color: var(--ink);
@@ -749,7 +931,7 @@ table.fleet {
 .reason {
   display: block;
   margin-left: 14px;
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 .big-stat {
@@ -759,7 +941,7 @@ table.fleet {
   margin-bottom: 8px;
 }
 .stat-num {
-  font-size: 22px;
+  font-size: 1.375rem;
   font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
@@ -769,12 +951,12 @@ table.fleet {
   flex-wrap: wrap;
 }
 .mini-num {
-  font-size: 17px;
+  font-size: 1.0625rem;
   font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
 .mini-label {
-  font-size: 11.5px;
+  font-size: 0.71875rem;
   color: var(--ink-3);
 }
 
@@ -792,7 +974,7 @@ table.fleet {
 .bar-labels {
   display: flex;
   justify-content: space-between;
-  font-size: 10.5px;
+  font-size: 0.65625rem;
 }
 
 /* 0.6.0 — the Models tab's share meter and its chip row. A share is always
@@ -860,14 +1042,14 @@ tr.row-best td {
   color: var(--bad);
 }
 .pf-level {
-  font-size: 11px;
+  font-size: 0.6875rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--ink-3);
   min-width: 52px;
 }
 .pf-area {
-  font-size: 11.5px;
+  font-size: 0.71875rem;
   min-width: 74px;
 }
 .pf-msg {
@@ -899,7 +1081,7 @@ tr.row-best td {
   background: var(--panel);
   overflow-x: auto;
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: 0.78125rem;
   line-height: 1.6;
   padding: 8px 0;
 }
@@ -951,7 +1133,7 @@ tr.deflated td {
   border-color: var(--rule-2);
 }
 .bubble-role {
-  font-size: 10.5px;
+  font-size: 0.65625rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--ink-3);
@@ -966,11 +1148,11 @@ tr.deflated td {
   align-items: center;
   gap: 7px;
   padding-left: 8px;
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 .tool-summary {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 0.71875rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -982,7 +1164,7 @@ tr.deflated td {
   padding: 10px 12px;
   overflow-x: auto;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 0.75rem;
   white-space: pre;
 }
 
@@ -1025,7 +1207,7 @@ tr.deflated td {
 }
 .sub-title {
   margin: 8px 0 4px;
-  font-size: 12px;
+  font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--ink-3);
@@ -1034,7 +1216,7 @@ tr.deflated td {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-family: var(--sans);
-  font-size: 13px;
+  font-size: 0.8125rem;
   background: var(--panel-2);
   border: 1px solid var(--rule);
   border-radius: var(--radius-sm);
@@ -1049,9 +1231,22 @@ tr.deflated td {
 .kv-k {
   flex: 0 0 110px;
   color: var(--ink-3);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 .kv-v {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* A definition list of many pairs: a two-column grid, so it wraps into rows
+   instead of running off the side of a narrow screen. */
+dl.kv {
+  display: grid;
+  grid-template-columns: minmax(6rem, max-content) minmax(0, 1fr);
+  gap: 3px 10px;
+  margin: 0;
+}
+dl.kv dd {
+  margin: 0;
   min-width: 0;
   overflow-wrap: anywhere;
 }
@@ -1082,7 +1277,7 @@ tr.deflated td {
   padding: 8px 10px;
   overflow-x: auto;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 .mdcode code {
   background: none;
@@ -1119,31 +1314,45 @@ tr.deflated td {
   gap: 8px;
 }
 .editor-body {
-  font-size: 13.5px;
+  font-size: 0.84375rem;
 }
 .foot-version {
   white-space: nowrap;
 }
 
+/* A toast is shown here and spoken through the live regions (ui/live.js);
+   the box itself is not a live region, so nothing is read twice. */
 .toast {
   position: fixed;
   right: 16px;
   bottom: 16px;
   z-index: 100;
-  max-width: 420px;
-  padding: 10px 14px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 10px 10px 10px 14px;
   border-radius: 8px;
   background: var(--panel-3);
   color: var(--ink);
-  border: 1px solid var(--rule-2);
+  border: 1px solid var(--boundary);
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
 }
+.toast-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* Opaque, so the words hold their contrast over whatever is behind. */
 .toast-error {
   border-color: var(--bad);
-  background: var(--bad-ghost);
+  background: color-mix(in srgb, var(--bad) 12%, var(--panel-3));
 }
 .toast-info {
   border-color: var(--ok);
+}
+.toast-close {
+  flex: 0 0 auto;
 }
 
 .transcript-meta {
@@ -1190,9 +1399,9 @@ tr.deflated td {
   min-width: 17px;
   padding: 0 5px;
   border-radius: 999px;
-  font-size: 11px;
+  font-size: 0.6875rem;
   text-align: center;
-  color: var(--warn);
+  color: var(--warn-text);
   border: 1px solid var(--warn);
   background: var(--warn-ghost);
 }
@@ -1205,11 +1414,11 @@ tr.deflated td {
   gap: 7px;
   margin: 5px 0;
   min-width: 0;
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 .twin-label {
   flex: 0 0 auto;
-  font-size: 10.5px;
+  font-size: 0.65625rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--ink-3);
@@ -1235,7 +1444,7 @@ tr.deflated td {
   display: none;
 }
 .gated-why {
-  font-size: 11.5px;
+  font-size: 0.71875rem;
   max-width: 460px;
 }
 
@@ -1251,24 +1460,44 @@ tr.deflated td {
   min-height: 18px;
 }
 
-/* ── modal (the preflight refusal) ─────────────────────────────────────── */
+/* ── dialogs: one native <dialog> for every overlay (ui/dialog.js) ───────── */
 
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 200;
-  display: grid;
-  place-items: center;
-  padding: 20px;
+dialog.modal {
+  max-width: min(680px, calc(100vw - 24px));
+  width: 100%;
+  max-height: 86vh;
+  overflow-y: auto;
+  margin: auto;
+  color: var(--ink);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+}
+dialog.modal::backdrop {
   background: rgba(0, 0, 0, 0.55);
 }
-.modal {
-  max-width: 680px;
-  width: 100%;
-  max-height: 82vh;
-  overflow-y: auto;
+.modal-title {
+  margin: 0 0 10px;
+  font-size: 0.9375rem;
+  font-weight: 650;
+}
+.modal-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.modal-head .modal-title {
   margin: 0;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+}
+.modal-detail {
+  margin: 6px 0;
+}
+.omni-panel .modal-body {
+  margin: 0;
+}
+.conflict-diff {
+  max-height: 40vh;
+  overflow: auto;
 }
 .modal-body {
   margin: 6px 0;
@@ -1331,7 +1560,7 @@ tr.deflated td {
   display: flex;
   gap: 14px;
   margin-top: 10px;
-  font-size: 12.5px;
+  font-size: 0.78125rem;
 }
 .exit-banner {
   display: flex;
@@ -1424,7 +1653,7 @@ tr.deflated td {
 .feed-prose {
   margin: 4px 0;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 /* ── four-lane timeline ────────────────────────────────────────────────── */
@@ -1460,7 +1689,7 @@ tr.deflated td {
 /* ── inboxes ───────────────────────────────────────────────────────────── */
 
 .inbox-hint {
-  font-size: 12px;
+  font-size: 0.75rem;
   margin: 6px 0;
 }
 .keyhelp,
@@ -1477,12 +1706,31 @@ tr.deflated td {
   gap: 8px;
   flex-wrap: wrap;
 }
+.inbox {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
 .inbox-card {
   border-left: 3px solid transparent;
 }
+/* The look of the selected row. The row also carries the word "Selected"
+   (statusBadge), so the colour is never the only cue. */
 .inbox-card.selected {
   border-left-color: var(--accent);
   background: var(--panel-2);
+}
+.inbox-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.inbox-state:empty {
+  display: none;
+}
+.inbox-armed {
+  font-weight: 550;
 }
 .inbox-head {
   display: flex;
@@ -1524,7 +1772,7 @@ tr.deflated td {
   padding: 8px 16px;
   border-bottom: 1px solid var(--rule);
   background: var(--panel-2);
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 .banner-warn {
   border-left: 3px solid var(--warn);
@@ -1543,7 +1791,7 @@ tr.deflated td {
 }
 .health-score {
   font-family: var(--mono);
-  font-size: 30px;
+  font-size: 1.875rem;
   font-weight: 600;
   line-height: 1.1;
 }
@@ -1557,7 +1805,7 @@ tr.deflated td {
   color: var(--bad);
 }
 .health-of {
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 .health-row-head {
   margin-bottom: 4px;
@@ -1591,11 +1839,11 @@ tr.deflated td {
 }
 .ded-detail {
   grid-column: 2 / 4;
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 .ded-fix {
   color: var(--accent);
-  font-size: 12px;
+  font-size: 0.75rem;
   white-space: nowrap;
 }
 
@@ -1610,33 +1858,47 @@ tr.deflated td {
   border: 1px solid var(--rule-2);
   border-radius: 4px;
   padding: 0 4px;
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--ink-2);
 }
-.omni-backdrop,
-.sheet-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  background: rgba(0, 0, 0, 0.45);
-  display: flex;
-  justify-content: center;
-  align-items: flex-start;
-  padding: 10vh 16px 16px;
-  overflow-y: auto;
-}
-.omni-panel {
-  width: min(760px, 100%);
+dialog.omni-panel {
+  width: min(760px, calc(100vw - 32px));
+  max-width: none;
+  margin: 10vh auto auto;
+  padding: 0;
   background: var(--panel);
+  color: var(--ink);
   border: 1px solid var(--rule-2);
   border-radius: var(--radius);
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.4);
   overflow: hidden;
 }
+dialog.omni-panel::backdrop {
+  background: rgba(0, 0, 0, 0.45);
+}
+.omni-status {
+  padding: 14px 16px;
+  color: var(--ink-2);
+}
+.omni-status:empty {
+  display: none;
+}
+.omni-confirm-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--rule);
+  background: var(--panel-2);
+}
+.omni-confirm-row[hidden] {
+  display: none;
+}
 .omni-input {
   width: 100%;
   font: inherit;
-  font-size: 16px;
+  font-size: 1rem;
   color: var(--ink);
   background: transparent;
   border: 0;
@@ -1644,7 +1906,6 @@ tr.deflated td {
   padding: 14px 16px;
 }
 .omni-input:focus {
-  outline: none;
   border-bottom-color: var(--accent);
 }
 .omni-list {
@@ -1659,6 +1920,7 @@ tr.deflated td {
   padding: 8px 16px;
   border-bottom: 1px solid var(--rule);
   color: var(--ink);
+  cursor: pointer;
 }
 .omni-row.selected {
   background: var(--panel-2);
@@ -1666,7 +1928,7 @@ tr.deflated td {
 }
 .omni-kind {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--ink-2);
   text-transform: lowercase;
 }
@@ -1674,7 +1936,7 @@ tr.deflated td {
   font-weight: 500;
 }
 .omni-sub {
-  font-size: 12px;
+  font-size: 0.75rem;
   justify-self: end;
   max-width: 46%;
   overflow: hidden;
@@ -1686,7 +1948,7 @@ tr.deflated td {
 }
 .omni-twin {
   grid-column: 2 / 3;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--ink-2);
 }
 .omni-confirm {
@@ -1695,18 +1957,18 @@ tr.deflated td {
 }
 .omni-hint {
   padding: 8px 16px;
-  font-size: 12px;
+  font-size: 0.75rem;
   border-top: 1px solid var(--rule);
 }
 
 /* ── the `?` bindings sheet (HM-190) ───────────────────────────────────── */
 
-.sheet {
-  width: min(520px, 100%);
+dialog.sheet {
+  width: min(520px, calc(100vw - 32px));
 }
 .sheet-section {
   margin: 12px 0 4px;
-  font-size: 12px;
+  font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--ink-2);
@@ -1729,14 +1991,14 @@ tr.deflated td {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--ink-2);
 }
 .num-input {
   width: 84px;
 }
 .note {
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 .rules-table td,
 .rules-table th {
@@ -1763,13 +2025,12 @@ tr.deflated td {
 /* ── narrow screens: the overlays become full-bleed ────────────────────── */
 
 @media (max-width: 720px) {
-  .omni-backdrop,
-  .sheet-backdrop {
-    padding: 0;
-  }
-  .omni-panel,
-  .sheet {
+  dialog.omni-panel,
+  dialog.sheet {
     width: 100%;
+    max-width: 100%;
+    max-height: 100%;
+    margin: 0;
     border-radius: 0;
     min-height: 100%;
   }
@@ -1788,53 +2049,58 @@ tr.deflated td {
   }
 }
 
-/* ── tooltips (M5): data-tip rendered via attr() — text only, never markup */
+/* ── tooltips: one real element (ui/tooltip.js), never CSS-generated text ─ */
 
-.has-tip {
-  position: relative;
-  cursor: help;
-}
-.has-tip::after {
-  content: attr(data-tip);
-  position: absolute;
-  left: 0;
-  bottom: calc(100% + 7px);
-  z-index: 60;
-  width: max-content;
-  max-width: min(34rem, 78vw);
+/* Opens on hover and on focus, can itself be hovered, and Escape closes it
+   (WCAG 1.4.13). Fixed, so it never widens the page. */
+.tip {
+  position: fixed;
+  z-index: 250;
+  max-width: min(34rem, calc(100vw - 16px));
   padding: 7px 10px;
-  border: 1px solid var(--rule-2);
+  border: 1px solid var(--boundary);
   border-radius: var(--radius-sm);
   background: var(--panel-3);
   color: var(--ink);
-  font-size: 12.5px;
+  font-size: 0.78125rem;
   font-weight: 400;
   font-family: var(--sans);
   line-height: 1.45;
   white-space: normal;
   text-align: left;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 120ms ease;
   box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
 }
-.has-tip:hover::after,
-.has-tip:focus-visible::after {
-  opacity: 1;
+.tip[hidden] {
+  display: none;
 }
+/* A 24px target around a 15px mark: the box grows, the mark does not. */
 .tip-icon {
+  position: relative;
+  isolation: isolate;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  margin-left: 2px;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 0.65625rem;
+  color: var(--ink-2);
+  vertical-align: middle;
+  cursor: help;
+}
+.tip-icon::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
   width: 15px;
   height: 15px;
-  border: 1px solid var(--rule-2);
+  border: 1px solid var(--boundary);
   border-radius: 50%;
-  font-size: 10.5px;
-  color: var(--ink-3);
   background: var(--panel-2);
-  vertical-align: middle;
-  margin-left: 5px;
 }
 
 /* ── advisor (M5): the unified alert/suggestion feed ───────────────────── */
@@ -1868,11 +2134,11 @@ tr.deflated td {
 }
 .adv-detail {
   margin-top: 2px;
-  font-size: 12.5px;
+  font-size: 0.78125rem;
 }
 .adv-guidance {
   margin-top: 4px;
-  font-size: 12.5px;
+  font-size: 0.78125rem;
   color: var(--ink-2);
 }
 .adv-actions {
@@ -1882,7 +2148,7 @@ tr.deflated td {
   gap: 6px;
 }
 .adv-cli {
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--ink-2);
   font-family: var(--mono);
   max-width: 100%;
@@ -1907,11 +2173,11 @@ tr.deflated td {
   margin: 10px 0;
 }
 .adv-note {
-  font-size: 12.5px;
+  font-size: 0.78125rem;
   color: var(--ink-2);
 }
 .adv-decision {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--ink-3);
 }
 .adv-board-row {
@@ -1954,10 +2220,153 @@ tr.deflated td {
 }
 
 @media (max-width: 720px) {
-  .adv-item {
+  .adv-item,
+  .adv-board-row {
     grid-template-columns: minmax(0, 1fr);
   }
   .adv-actions {
     align-items: flex-start;
   }
+}
+
+/* ==========================================================================
+   The accessible foundation: status badges, charts, the first-run card,
+   Readability, density.
+   ========================================================================== */
+
+/* A state in words beside its mark (dom.js statusBadge). */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px;
+  border: 1px solid var(--boundary);
+  border-radius: 999px;
+  font-size: 0.71875rem;
+  color: var(--ink);
+  background: var(--panel-3);
+  white-space: nowrap;
+}
+.status-badge .dot {
+  flex: 0 0 auto;
+}
+.status-badge-ok .dot {
+  background: var(--ok);
+}
+.status-badge-warn .dot {
+  background: var(--warn);
+}
+.status-badge-bad .dot {
+  background: var(--bad);
+}
+.status-badge-info .dot {
+  background: var(--info);
+}
+
+/* A chart: the picture is decoration, the caption and the table are the data. */
+figure.chart {
+  margin: 6px 0;
+}
+figure.chart svg {
+  display: block;
+  width: 100%;
+  max-width: 440px;
+  height: auto;
+}
+.chart-bars rect {
+  fill: var(--accent);
+}
+.chart-line path {
+  stroke: var(--accent);
+  fill: none;
+}
+.chart-caption {
+  margin-top: 4px;
+  font-size: 0.75rem;
+  color: var(--ink-2);
+}
+.chart-data {
+  margin-top: 4px;
+  font-size: 0.75rem;
+}
+.chart-data summary {
+  cursor: pointer;
+  color: var(--ink-2);
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+}
+.chart-data table {
+  border-collapse: collapse;
+  margin-top: 4px;
+}
+.chart-data th,
+.chart-data td {
+  text-align: left;
+  padding: 2px 10px 2px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.chart-data .num {
+  text-align: right;
+}
+
+/* The first-run card, in its own slot above the screen. */
+.firstrun-slot:empty {
+  display: none;
+}
+.firstrun {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 10px auto 0;
+  max-width: 1240px;
+  width: calc(100% - 36px);
+}
+.firstrun p {
+  flex: 1 1 16rem;
+  margin: 0;
+}
+
+/* Readability: native radios, one fieldset per choice. */
+.read-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 10px 18px;
+}
+.read-grid fieldset {
+  margin: 0;
+  padding: 6px 10px 8px;
+  border: 1px solid var(--rule-2);
+  border-radius: var(--radius-sm);
+}
+.read-grid legend {
+  padding: 0 4px;
+  font-weight: 600;
+}
+.read-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  margin-right: 12px;
+}
+
+/* Compact density: tighter boxes, never a target under 24px. */
+:root[data-density="compact"] .card {
+  padding: 9px 12px;
+  margin: 6px 0;
+}
+:root[data-density="compact"] .view {
+  padding: 10px 12px 28px;
+}
+:root[data-density="compact"] .fleet td {
+  padding: 4px 8px;
+}
+:root[data-density="compact"] .btn {
+  padding: 2px 9px;
+}
+:root[data-density="compact"] .ov-grid,
+:root[data-density="compact"] .lanes {
+  gap: 6px;
 }

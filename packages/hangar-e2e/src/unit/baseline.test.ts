@@ -169,13 +169,30 @@ describe("the rest of the format", () => {
     });
   });
 
-  test("the summary says it never fails the build, and names what is new", () => {
+  // Changed deliberately: the sweep now gates some screens, so only the rows
+  // outside the gate are the ones that never fail the build, and the summary
+  // leads with the gate's own result.
+  test("the summary says the rows outside the gate never fail the build, and names what is new", () => {
     const base = report({ "#/|dark|1": {} });
     const now = report({ "#/|dark|1": { a: 1 } });
     const markdown = diffMarkdown(diffAgainstBaseline(base, now), now);
-    expect(markdown).toContain("never fails the build");
+    expect(markdown).toContain(
+      "outside the gate are reported against the baseline and never fail the build",
+    );
+    expect(markdown).not.toContain("Gate passed");
     expect(markdown).toContain("New against the baseline");
     expect(markdown).toContain("#/|dark|1: a (1)");
+  });
+
+  test("the summary leads with the gate's result when there is one", () => {
+    const now = report({ "#/|dark|1": {} });
+    const diff = diffAgainstBaseline(now, now);
+    expect(diffMarkdown(diff, now, { gated: 13, failures: 0, missing: 0 })).toContain(
+      "**Gate passed:** 13 gated screens",
+    );
+    expect(diffMarkdown(diff, now, { gated: 13, failures: 2, missing: 1 })).toContain(
+      "**Gate failed:** 2 violation(s) and 1 missing row(s)",
+    );
   });
 
   test("the tag set includes the rule target size lives under", () => {

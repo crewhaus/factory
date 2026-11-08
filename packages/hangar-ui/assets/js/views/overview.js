@@ -6,16 +6,16 @@
  */
 
 import { api } from "../api.js";
-import { clear, collapsible, dot, el, emptyState, skeleton, svgEl } from "../dom.js";
+import { clear, collapsible, dot, el, emptyState, skeleton } from "../dom.js";
+import { chart, chartModel } from "../ui/chart.js";
 import {
-  barRects,
   fmtCount,
+  fmtPct,
   fmtUsd,
   healthChecks,
   measuredNothing,
   notMeasuredCopy,
   passRateWord,
-  sparklinePath,
   usdFromMicros,
 } from "../util.js";
 import { procCard } from "./proc.js";
@@ -83,13 +83,16 @@ export function evalTrendCard(evals) {
     return card("Eval trend", emptyState(copy.message, copy.verb));
   }
   const chronological = [...runs].reverse();
-  const rates = chronological
-    .filter((r) => r.partial !== true && !measuredNothing(r))
-    .map((r) => (typeof r.passRate === "number" ? r.passRate : null))
-    .filter((v) => v !== null)
-    .slice(-12);
+  // A run that measured nothing, or stopped at its budget, has no rate: it
+  // is a row that reads "unknown", never a point at zero.
+  const points = chronological.slice(-12).map((r) => ({
+    label: String(r.ts ?? r.runId ?? ""),
+    value:
+      r.partial !== true && !measuredNothing(r) && typeof r.passRate === "number"
+        ? r.passRate
+        : null,
+  }));
   const latest = passRateWord(runs[0]);
-  const path = sparklinePath(rates, 220, 44);
   const children = [
     el("div", { class: "big-stat" }, [
       el("span", { class: "stat-num", text: latest }),
@@ -99,15 +102,18 @@ export function evalTrendCard(evals) {
       }),
     ]),
   ];
-  if (path !== "") {
-    children.push(
-      svgEl(
-        "svg",
-        { class: "spark", viewBox: "0 0 220 44", role: "img", "aria-label": "pass-rate trend" },
-        [svgEl("path", { d: path, fill: "none", "stroke-width": "2" })],
-      ),
-    );
-  }
+  children.push(
+    chart(
+      chartModel({
+        kind: "line",
+        title: "Pass rate per run, oldest first",
+        rows: points,
+        format: fmtPct,
+        noun: "run",
+      }),
+      { labelHead: "Run", valueHead: "Pass rate" },
+    ),
+  );
   return card("Eval trend", children);
 }
 
@@ -146,16 +152,18 @@ function costCard(payload) {
       emptyState("No cost data yet", "crewhaus run (cost tracking is on by default)"),
     );
   }
-  const values = days.map((d) => usdFromMicros(d.usdMicros) ?? 0);
+  // A day with no figure is unknown, never $0.
+  const rows = days.slice(-7).map((d) => ({
+    label: String(d.day ?? ""),
+    value: usdFromMicros(d.usdMicros),
+  }));
   const total = usdFromMicros(costs.spend7dUsdMicros);
-  const rects = barRects(values.slice(-7), 220, 44);
   return card("Spend (7d)", [
     el("div", { class: "big-stat" }, [el("span", { class: "stat-num", text: fmtUsd(total) })]),
-    svgEl(
-      "svg",
-      { class: "bars", viewBox: "0 0 220 44", role: "img", "aria-label": "daily spend bars" },
-      rects.map((r) => svgEl("rect", { x: r.x, y: r.y, width: r.w, height: r.h, rx: "1" })),
-    ),
+    chart(chartModel({ kind: "bars", title: "Spend per day", rows, format: fmtUsd, noun: "day" }), {
+      labelHead: "Day",
+      valueHead: "Spend",
+    }),
   ]);
 }
 
