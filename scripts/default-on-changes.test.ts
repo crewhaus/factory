@@ -21,10 +21,10 @@
  * unset tool-config variable with an exit code of its own, with that code,
  * every `HarnessRegister` change it keeps to rows in its workspace, every leaf
  * the optimizer refuses that 0.8.0 did not, the address
- * `crewhaus serve --mcp --sse` listens on, the file a managed daemon saves a
- * generated signing secret to, and the preflight finding for a harness
- * directory that holds the home directory, with its start line. A change
- * reverted or scoped to the block stops being found, and a new root, tool,
+ * `crewhaus serve --mcp --sse` listens on and the bearer it asks for, the file a
+ * managed daemon saves a generated signing secret to, and the preflight finding
+ * for a harness directory that holds the home directory, with its start line. A
+ * change reverted or scoped to the block stops being found, and a new root, tool,
  * header line, edge warning, verdict that moved, stopping shape or refused leaf
  * fails until the notes name it. Each scan also asserts it found something, so a
  * scan that silently matches nothing fails too.
@@ -50,6 +50,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { serveRequestRefusal } from "../apps/cli/src/serve-mcp";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
@@ -1109,12 +1110,29 @@ describe("the release notes name every change a harness without provability: see
     expect(end).toBeGreaterThan(start);
     const block = source.slice(start, end);
     expect(block.split("Bun.serve(")).toHaveLength(2);
-    const required = ['hostname: "127.0.0.1"', "isLoopbackRequest(req)"];
+    const required = ['hostname: "127.0.0.1"', "serveRequestRefusal(req"];
     expect(required.filter((text) => !block.includes(text))).toEqual([]);
     expect(block.includes("Bun.serve({ port, fetch")).toBe(false);
-    // Named in a later list, since 0.8.0 did not ship it.
+    // The gate the block calls checks Host first: this computer passes (the
+    // control), another name is refused even with the right bearer.
+    const asked = (host: string) =>
+      serveRequestRefusal(
+        new Request("http://127.0.0.1:8000/", {
+          method: "POST",
+          headers: { host, authorization: "Bearer probe-token" },
+        }),
+        "probe-token",
+      );
+    expect(asked("127.0.0.1:8000")).toBeUndefined();
+    expect(asked("other.example")?.status).toBe(403);
+    // Named in a later list, since 0.8.0 did not ship it. More than one bullet
+    // names the command, so this one is found by its own headline.
     const later = defaultOnBullets(changelog, LATER_HEADINGS);
-    const bullet = later.find((b) => b.includes("`crewhaus serve --mcp --sse`")) ?? "";
+    const own = later.filter((b) =>
+      b.includes("`crewhaus serve --mcp --sse` listens on this computer only."),
+    );
+    expect(own).toHaveLength(1);
+    const bullet = own[0] ?? "";
     expect(bullet).toContain("`127.0.0.1`");
     expect(bullet).toContain("`Host`");
     expect(bullet).toContain("`Origin`");
@@ -1198,6 +1216,52 @@ describe("the release notes name every change a harness without provability: see
     const later = defaultOnBullets(changelog, LATER_HEADINGS);
     const bullet = later.find((b) => b.includes("`workspace.holds-home`")) ?? "";
     expect(bullet).toContain("`[workspace]`");
+  });
+
+  test("crewhaus serve --mcp --sse: the bearer it asks for is named", async () => {
+    // The gate, with this computer in Host: the right bearer passes (the
+    // control), and a request with none is answered 401 for a bearer.
+    const asked = (headers: Record<string, string>) =>
+      serveRequestRefusal(
+        new Request("http://127.0.0.1:8000/", {
+          method: "POST",
+          headers: { host: "127.0.0.1:8000", ...headers },
+        }),
+        "probe-token",
+      );
+    expect(asked({ authorization: "Bearer probe-token" })).toBeUndefined();
+    const refused = asked({});
+    expect(refused?.status).toBe(401);
+    expect(refused?.headers.get("www-authenticate")).toBe("Bearer");
+    expect(await refused?.json()).toEqual({
+      error: "unauthorized: send Authorization: Bearer <token>",
+    });
+    // The serve block holds the gate's call, with the token it resolved.
+    const source = readFileSync(join(ROOT, "apps", "cli", "src", "index.ts"), "utf8");
+    const start = source.indexOf("async function runServeMcp(");
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf("\nasync function ", start + 1);
+    expect(end).toBeGreaterThan(start);
+    const block = source.slice(start, end);
+    const required = [
+      "resolveServeBearer({ cwd: process.cwd(), env: process.env })",
+      "serveRequestRefusal(req, bearer.token) ?? handle.fetch(req)",
+    ];
+    expect(required.filter((text) => !block.includes(text))).toEqual([]);
+    // Named in a later list, since 0.8.0 did not ship it.
+    const named = defaultOnBullets(changelog, LATER_HEADINGS).filter((b) =>
+      b.includes("`crewhaus serve --mcp --sse`"),
+    );
+    expect(named.length).toBeGreaterThan(0);
+    const words = ["`CREWHAUS_MCP_TOKEN`", "`.crewhaus/run/mcp-token`", "`Authorization: Bearer"];
+    expect(named.filter((b) => words.every((word) => b.includes(word)))).toHaveLength(1);
+    // The bullet for the address it listens on names the bearer too, so the two
+    // read together.
+    const listens = named.filter((b) =>
+      b.includes("`crewhaus serve --mcp --sse` listens on this computer only."),
+    );
+    expect(listens).toHaveLength(1);
+    expect(listens[0]).toContain("carries its bearer token");
   });
 
   test("FactCrossCheck: every kind of spelling whose verdict moved since 0.7.x is named", async () => {
