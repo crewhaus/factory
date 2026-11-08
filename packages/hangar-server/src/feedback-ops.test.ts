@@ -10,11 +10,14 @@
  *   - channel reactions carry their PRECONDITION: a `thread` sessionKey
  *     collects nothing, and the panel says so;
  *   - the advice feed is advisory, tiers each proposal, and refuses to write
- *     a human-owned path — routing it to `crewhaus propose` instead.
+ *     a human-owned path — routing it to `crewhaus propose` instead;
+ *   - the tier is the editor's answer, so a security surface is human-owned
+ *     even where the optimizer may tune it.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isOptimizable } from "@crewhaus/spec-patch";
 import { sessionKeyOf, tierFor } from "./feedback-ops";
 import { feedbackRecord, logLine, makeFixtureHarness } from "./fixture";
 import { type TestServer, bootTestServer } from "./testkit";
@@ -47,7 +50,8 @@ function write(dir: string, relative: readonly string[], body: string): void {
 
 /** A harness with ratings in both sinks, a distill watermark, a few-shot
  *  pool, a generated FAQ skill, lessons, and an advice feed carrying one
- *  auto-tunable and one human-owned proposal. */
+ *  auto-tunable proposal, one human-owned proposal, and one on a security
+ *  surface the optimizer may tune. */
 function loopHarness(t: TestServer, specExtra?: string): string {
   const dir = makeFixtureHarness(join(t.harnessesRoot, "loop"), {
     specName: "loop",
@@ -143,6 +147,18 @@ function loopHarness(t: TestServer, specExtra?: string): string {
             rationale: "the roster is human-owned",
           },
         },
+        {
+          findingId: "adv_transaction_policy",
+          severity: "warn",
+          summary: "the on-chain ceiling looks tight",
+          patch: {
+            target: "cli",
+            path: ["transaction_policy"],
+            op: "replace",
+            value: { maxValueWei: "1000", allowedContracts: [] },
+            rationale: "observed spend near the ceiling",
+          },
+        },
       ],
     })}\n`,
   );
@@ -150,6 +166,20 @@ function loopHarness(t: TestServer, specExtra?: string): string {
 }
 
 describe("pure feedback rules", () => {
+  test("the tier is the editor's answer, so a security surface is human-owned where the optimizer may tune it", () => {
+    for (const path of [
+      ["transaction_policy"],
+      ["transaction_policy", "maxValueWei"],
+      ["security", "justification"],
+      ["agent", "model_pool", "learning"],
+    ]) {
+      // Inside the optimizer's table, so only the security surface can answer.
+      expect(isOptimizable("cli", path)).toBe(true);
+      expect(tierFor("cli", path)).toBe("human-owned");
+    }
+    expect(tierFor("cli", ["agent", "model_pool", "learning", "epsilon"])).toBe("human-owned");
+  });
+
   test("the optimizable tier is the same prefix rule the spec write path enforces", () => {
     expect(tierFor("cli", ["agent", "instructions"])).toBe("auto-tunable");
     // The model ROSTER is human-owned: learning tunes selection within the
@@ -340,6 +370,260 @@ describe("the advisory feed", () => {
     expect(refusal.diff.length).toBeGreaterThan(0);
     expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
   });
+
+  test("a row on a security surface shows as human-owned, with the editor's reason and the route", async () => {
+    const t = boot();
+    const id = await register(t, loopHarness(t));
+    const { body } = await t.api(`/api/h/${id}/feedback/advice`);
+    const proposals = body["proposals"] as Array<{
+      adviceId: string;
+      tier: string;
+      tierReason: string;
+    }>;
+    const row = proposals.find((p) => p.adviceId === "adv_transaction_policy");
+    expect(row?.tier).toBe("human-owned");
+    expect(row?.tierReason).toContain("the transaction policy gates on-chain writes");
+    expect(row?.tierReason).toContain("`crewhaus propose`");
+    // A control: the row the optimizer's table alone decides keeps its text.
+    expect(proposals.find((p) => p.adviceId === "adv_instructions")?.tierReason).toContain(
+      "the console may write it directly",
+    );
+  });
+
+  test("a row on a security surface is refused with confirm: true, the diff and the route, and writes nothing", async () => {
+    const t = boot();
+    const dir = loopHarness(t);
+    const id = await register(t, dir);
+    const before = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
+    for (const request of [{ confirm: true }, {}]) {
+      const { status, body } = await t.api(
+        `/api/h/${id}/feedback/advice/adv_transaction_policy/apply`,
+        { method: "POST", body: JSON.stringify(request) },
+      );
+      expect(status).toBe(409);
+      const refusal = JSON.parse(String(body["error"])) as {
+        route: string;
+        tier: string;
+        reason: string;
+        diff: unknown[];
+      };
+      expect(refusal.route).toBe("crewhaus propose");
+      expect(refusal.tier).toBe("human-owned");
+      // The row's own reason, so the feed and the refusal say one thing.
+      expect(refusal.reason).toContain("the transaction policy gates on-chain writes");
+      expect(refusal.diff.length).toBeGreaterThan(0);
+      expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
+    }
+  });
+
+  test.each([
+    [
+      "a step's tool list",
+      [
+        "name: routed",
+        "target: workflow",
+        "model: anthropic/claude-sonnet-4",
+        "steps:",
+        "  - name: draft",
+        "    instructions: Draft it.",
+        "",
+      ],
+      "workflow",
+      ["steps", "0", "tools"],
+      "replace",
+      ["Read"],
+    ],
+    [
+      "a game's contract address",
+      [
+        "name: routed",
+        "target: onchain-game",
+        "agent:",
+        "  model: m",
+        "  instructions: hi",
+        "chain:",
+        "  id: base",
+        "  kind: evm",
+        "  rpcUrls:",
+        "    - https://rpc.example",
+        "  finality:",
+        "    kind: confirmations",
+        "    count: 1",
+        "wallet:",
+        "  id: player",
+        "  chainId: base",
+        "  custody: local",
+        "game:",
+        "  contract:",
+        "    id: game",
+        "    chainId: base",
+        "    address: '0xgame'",
+        "    abiRef: abi://game",
+        "  stateReader: readState",
+        "",
+      ],
+      "onchain-game",
+      ["game", "contract", "address"],
+      "replace",
+      "0xother",
+    ],
+    [
+      "a daemon's triggers",
+      [
+        "name: routed",
+        "target: onchain",
+        "agent:",
+        "  model: m",
+        "  instructions: hi",
+        "chains:",
+        "  - id: base",
+        "    kind: evm",
+        "    rpcUrls:",
+        "      - https://rpc.example",
+        "    finality:",
+        "      kind: confirmations",
+        "      count: 12",
+        "contracts:",
+        "  - id: treasury",
+        "    chainId: base",
+        "    address: '0xtreasury'",
+        "    abiRef: abi://safe",
+        "triggers:",
+        "  - kind: event",
+        "    chainId: base",
+        "    contract: treasury",
+        "    event: Transfer",
+        "",
+      ],
+      "onchain",
+      ["triggers"],
+      "replace",
+      [{ kind: "event", chainId: "base", contract: "treasury", event: "Approval" }],
+    ],
+    [
+      "a whole step",
+      [
+        "name: routed",
+        "target: workflow",
+        "model: anthropic/claude-sonnet-4",
+        "steps:",
+        "  - name: draft",
+        "    instructions: Draft it.",
+        "",
+      ],
+      "workflow",
+      ["steps", "0"],
+      "replace",
+      { name: "draft", instructions: "Draft it.", tools: ["Bash"] },
+    ],
+    [
+      "a graph's node map",
+      [
+        "name: routed",
+        "target: graph",
+        "model: anthropic/claude-sonnet-4",
+        "entry: draft",
+        "nodes:",
+        "  draft:",
+        "    instructions: Draft it.",
+        "  review:",
+        "    instructions: Review it.",
+        "    hitl:",
+        "      prompt: Ship it?",
+        "edges:",
+        "  - from: draft",
+        "    to: review",
+        "",
+      ],
+      "graph",
+      ["nodes"],
+      "replace",
+      { draft: { instructions: "Draft it." }, review: { instructions: "Review it." } },
+    ],
+    [
+      "a whole role",
+      [
+        "name: routed",
+        "target: crew",
+        "model: anthropic/claude-sonnet-4",
+        "entry: lead",
+        "roles:",
+        "  lead:",
+        "    instructions: Lead it.",
+        "",
+      ],
+      "crew",
+      ["roles", "lead"],
+      "replace",
+      { instructions: "Lead it.", tools: ["Bash"] },
+    ],
+    [
+      "a daemon's idempotency window",
+      [
+        "name: routed",
+        "target: onchain",
+        "agent:",
+        "  model: m",
+        "  instructions: hi",
+        "chains:",
+        "  - id: base",
+        "    kind: evm",
+        "    rpcUrls:",
+        "      - https://rpc.example",
+        "    finality:",
+        "      kind: confirmations",
+        "      count: 12",
+        "contracts:",
+        "  - id: treasury",
+        "    chainId: base",
+        "    address: '0xtreasury'",
+        "    abiRef: abi://safe",
+        "triggers:",
+        "  - kind: event",
+        "    chainId: base",
+        "    contract: treasury",
+        "    event: Transfer",
+        "idempotencyWindowMs: 60000",
+        "",
+      ],
+      "onchain",
+      ["idempotencyWindowMs"],
+      "replace",
+      1,
+    ],
+  ] as const)(
+    "%s is refused on its own spec, where the optimizer's table lists it",
+    async (_label, spec, target, path, op, value) => {
+      const t = boot();
+      const dir = loopHarness(t);
+      write(dir, ["crewhaus.yaml"], spec.join("\n"));
+      write(
+        dir,
+        [".crewhaus", "advice", "suggestions.json"],
+        `${JSON.stringify({
+          suggestions: [
+            {
+              findingId: "adv_surface",
+              summary: "a hosted surface",
+              patch: { target, path, op, value, rationale: "observed" },
+            },
+          ],
+        })}\n`,
+      );
+      expect(isOptimizable(target, path)).toBe(true);
+      const id = await register(t, dir);
+      const before = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
+      const { status, body } = await t.api(`/api/h/${id}/feedback/advice/adv_surface/apply`, {
+        method: "POST",
+        body: JSON.stringify({ confirm: true }),
+      });
+      expect(status).toBe(409);
+      const refusal = JSON.parse(String(body["error"])) as { route: string; tier: string };
+      expect(refusal.route).toBe("crewhaus propose");
+      expect(refusal.tier).toBe("human-owned");
+      expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
+    },
+  );
 
   test("a proposal that is no longer in the feed refuses without erroring", async () => {
     const t = boot();

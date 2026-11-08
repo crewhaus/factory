@@ -22933,12 +22933,16 @@ async function runOnchain(args: ParsedArgs, action: "tune" | "sentinel"): Promis
   // onchain-game carry it directly; other shapes may carry it optionally).
   const irPolicy = (ir as { transactionPolicy?: unknown }).transactionPolicy as
     | {
+        defaultWriteApproval?: string;
         maxValueWei?: string;
         allowedContracts?: readonly string[];
         simulationRequired?: boolean;
       }
     | undefined;
   const current: CurrentPolicy = {
+    ...(irPolicy?.defaultWriteApproval !== undefined
+      ? { defaultWriteApproval: irPolicy.defaultWriteApproval }
+      : {}),
     ...(irPolicy?.maxValueWei !== undefined ? { maxValueWei: irPolicy.maxValueWei } : {}),
     ...(irPolicy?.allowedContracts !== undefined
       ? { allowedContracts: irPolicy.allowedContracts }

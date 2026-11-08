@@ -19,10 +19,11 @@
  * besides `provability:` itself, every kind of spelling FactCrossCheck
  * no longer reads the way 0.7.x did, and every shape whose daemon stops on an
  * unset tool-config variable with an exit code of its own, with that code, and
- * every `HarnessRegister` change it keeps to rows in its workspace. A
+ * every `HarnessRegister` change it keeps to rows in its workspace, and every
+ * leaf the optimizer refuses that 0.8.0 did not. A
  * change reverted or scoped to the block stops being found, and a new root,
- * tool, header line, edge warning, verdict that moved or stopping shape fails
- * until the notes name it. Each scan also
+ * tool, header line, edge warning, verdict that moved, stopping shape or refused
+ * leaf fails until the notes name it. Each scan also
  * asserts it found something, so a scan that silently matches nothing fails
  * too.
  *
@@ -57,6 +58,7 @@ import {
 } from "../packages/permission-engine/src/index";
 import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
+import { OPTIMIZER_REFUSED_LEAVES } from "../packages/spec-patch/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
 import {
   SHAPE_TOOL_PROFILES,
@@ -99,6 +101,12 @@ const SHIPPED_TOOLS = [
   "RemovePath",
   "StateImport",
   "StoreMigrate",
+] as const;
+/** The leaves the optimizer refused when 0.8.0 shipped: a later row is a default-on change. */
+const SHIPPED_REFUSED_LEAVES = [
+  "model_pool.learning.seed",
+  "provability.level",
+  "provability.on_fail",
 ] as const;
 
 /**
@@ -980,6 +988,18 @@ describe("the release notes name every change a harness without provability: see
     );
     expect(verbs).toContain("crewhaus harness relocate");
     expect(verbs.filter((verb) => !bullet.includes(`\`${verb}\``))).toEqual([]);
+  });
+
+  test("the optimizer: every leaf it refuses that 0.8.0 did not is named in a later list", () => {
+    // A refused leaf decides which patches pass for a harness that sets nothing
+    // new, so a row 0.8.0 did not ship is named in a later list.
+    const rows = OPTIMIZER_REFUSED_LEAVES.map((row) => row.join("."));
+    expect(rows).toEqual(expect.arrayContaining([...SHIPPED_REFUSED_LEAVES]));
+    const added = rows.filter(
+      (row) => !(SHIPPED_REFUSED_LEAVES as readonly string[]).includes(row),
+    );
+    expect(added.length).toBeGreaterThan(0);
+    expect(unlisted(added, notes, { shipped: [], laterNotes })).toEqual([]);
   });
 
   test("FactCrossCheck: every kind of spelling whose verdict moved since 0.7.x is named", async () => {

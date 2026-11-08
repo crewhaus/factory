@@ -32,6 +32,7 @@ import {
 } from "./builders";
 import { makeFixtureHarness } from "./fixture";
 import {
+  SECURITY_SURFACES,
   classifyPath,
   declaredPaths,
   effectiveConfig,
@@ -149,6 +150,126 @@ describe("trust tiers", () => {
     // different questions, and the badge's reason says which is which.
     expect(isAutoTunable("cli", ["transaction_policy"])).toBe(true);
     expect(classifyPath("cli", ["transaction_policy"]).reason).toContain("typed confirmation");
+  });
+
+  test("a security surface on a step, a node or a role is human-owned", () => {
+    for (const [target, path] of [
+      ["workflow", ["steps", "0", "tools"]],
+      ["workflow", ["steps", "0", "tool_config"]],
+      ["workflow", ["steps", "0", "model"]],
+      ["workflow", ["steps", "0", "model_pool", "policy"]],
+      ["workflow", ["steps", "0", "model_pool", "learning"]],
+      ["workflow", ["steps", "0", "permissions", "allow"]],
+      ["workflow", ["steps", "0", "mcp_servers", "docs"]],
+      ["graph", ["nodes", "a", "tools"]],
+      ["graph", ["nodes", "b", "hitl"]],
+      ["crew", ["roles", "lead", "tools"]],
+    ] as const) {
+      // Inside the optimizer's table, so only the security surface can answer.
+      expect(`${target}:${path.join(".")}:${isAutoTunable(target, [...path])}`).toBe(
+        `${target}:${path.join(".")}:true`,
+      );
+      const row = classifyPath(target, [...path]);
+      expect(`${target}:${path.join(".")}:${row.tier}:${row.securitySurface}`).toBe(
+        `${target}:${path.join(".")}:human-owned:true`,
+      );
+    }
+    // The fields beside them stay tunable, on each host.
+    for (const [target, path] of [
+      ["workflow", ["steps", "0", "instructions"]],
+      ["workflow", ["steps", "0", "temperature"]],
+      ["graph", ["nodes", "a", "instructions"]],
+      ["crew", ["roles", "lead", "instructions"]],
+    ] as const) {
+      expect(`${target}:${path.join(".")}:${classifyPath(target, [...path]).tier}`).toBe(
+        `${target}:${path.join(".")}:auto-tunable`,
+      );
+    }
+  });
+
+  test("the rows for a step, a node and a role carry their own tool_config row", () => {
+    // The group starts at its `tools` row, after the root `tool_config` row, so a
+    // step's tool config is human-owned whatever that root row matches.
+    const start = SECURITY_SURFACES.findIndex(
+      (row) => row.anywhere === true && row.prefix.join(".") === "tools",
+    );
+    expect(start).toBeGreaterThan(-1);
+    const rootRow = SECURITY_SURFACES.findIndex((row) => row.prefix.join(".") === "tool_config");
+    expect(rootRow).toBeGreaterThan(-1);
+    expect(rootRow).toBeLessThan(start);
+    const own = SECURITY_SURFACES.slice(start).filter(
+      (row) => row.prefix.join(".") === "tool_config",
+    );
+    expect(own).toEqual([
+      {
+        prefix: ["tool_config"],
+        anywhere: true,
+        reason: "tool config decides what the agent's tools may reach",
+      },
+    ]);
+  });
+
+  test("a whole step, node or role, and the list or map of them, takes the typed confirmation", () => {
+    for (const [target, path] of [
+      ["workflow", ["steps"]],
+      ["workflow", ["steps", "0"]],
+      ["graph", ["nodes"]],
+      ["graph", ["nodes", "a"]],
+      ["crew", ["roles"]],
+      ["crew", ["roles", "lead"]],
+    ] as const) {
+      // Inside the optimizer's table, so only the security surface can answer.
+      expect(`${target}:${path.join(".")}:${isAutoTunable(target, [...path])}`).toBe(
+        `${target}:${path.join(".")}:true`,
+      );
+      const row = classifyPath(target, [...path]);
+      expect(`${target}:${path.join(".")}:${row.tier}:${row.securitySurface}`).toBe(
+        `${target}:${path.join(".")}:human-owned:true`,
+      );
+      expect(row.reason).toContain("tools, permissions");
+      expect(row.reason).toContain("typed confirmation");
+    }
+    // A field inside one is classified on its own.
+    for (const [target, path] of [
+      ["workflow", ["steps", "0", "instructions"]],
+      ["graph", ["nodes", "a", "instructions"]],
+      ["crew", ["roles", "lead", "instructions"]],
+    ] as const) {
+      expect(`${target}:${path.join(".")}:${classifyPath(target, [...path]).tier}`).toBe(
+        `${target}:${path.join(".")}:auto-tunable`,
+      );
+    }
+  });
+
+  test("the idempotency window takes the typed confirmation", () => {
+    expect(isAutoTunable("onchain", ["idempotencyWindowMs"])).toBe(true);
+    const row = classifyPath("onchain", ["idempotencyWindowMs"]);
+    expect([row.tier, row.securitySurface]).toEqual(["human-owned", true]);
+    expect(row.reason).toContain("the idempotency window");
+  });
+
+  test("an on-chain binding is human-owned, and the game's objective and timing stay tunable", () => {
+    for (const [target, path] of [
+      ["onchain-game", ["game"]],
+      ["onchain-game", ["game", "contract"]],
+      ["onchain-game", ["game", "contract", "address"]],
+      ["onchain-game", ["game", "actionsContract"]],
+      ["onchain", ["triggers"]],
+      ["onchain", ["triggers", "0", "contract"]],
+    ] as const) {
+      expect(`${target}:${path.join(".")}:${isAutoTunable(target, [...path])}`).toBe(
+        `${target}:${path.join(".")}:true`,
+      );
+      const row = classifyPath(target, [...path]);
+      expect(`${target}:${path.join(".")}:${row.tier}:${row.securitySurface}`).toBe(
+        `${target}:${path.join(".")}:human-owned:true`,
+      );
+    }
+    for (const field of ["objective", "moveTimeoutMs", "turnSemantics", "stateReader"]) {
+      expect(`${field}:${classifyPath("onchain-game", ["game", field]).tier}`).toBe(
+        `${field}:auto-tunable`,
+      );
+    }
   });
 
   test("a container of tunable fields is itself human-owned, and says why", () => {
@@ -1387,5 +1508,54 @@ describe("the MCP connector form refuses a credential in an SSE url", () => {
     // …and an ordinary endpoint is left alone.
     expect(sseUrlCredential("https://mcp.example.com/sse")).toBeUndefined();
     expect(sseUrlCredential("https://mcp.example.com/v2/events?mode=stream")).toBeUndefined();
+  });
+});
+
+const WORKFLOW_SPEC = [
+  "name: spec-edit-fixture",
+  "target: workflow",
+  "model: anthropic/claude-sonnet-4",
+  "steps:",
+  "  - name: draft",
+  "    instructions: Draft it.",
+  "",
+].join("\n");
+
+describe("a whole step on the editor", () => {
+  test("a step, or the step list, is refused without the typed confirmation; a field inside one is not", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "workflow", WORKFLOW_SPEC);
+      const specPath = join(dir, "crewhaus.yaml");
+      const before = readFileSync(specPath, "utf8");
+      const id = await register(t, dir);
+      const step = { name: "draft", instructions: "Draft it.", tools: ["Bash"] };
+      for (const edit of [
+        { path: "steps.0", value: step },
+        { path: "steps", value: [step] },
+      ]) {
+        const { status, body } = await t.api(`/api/h/${id}/spec/patch`, post({ edit }));
+        expect(`${edit.path}:${status}`).toBe(`${edit.path}:409`);
+        expect(`${edit.path}:${String(body["error"])}`).toContain(edit.path);
+      }
+      expect(readFileSync(specPath, "utf8")).toBe(before);
+
+      const field = await t.api(
+        `/api/h/${id}/spec/patch`,
+        post({ edit: { path: "steps.0.instructions", value: "Draft it carefully." } }),
+      );
+      expect(field.status).toBe(200);
+      expect(readFileSync(specPath, "utf8")).toContain("Draft it carefully.");
+
+      // The typed confirmation carries the whole step.
+      const confirmed = await t.api(
+        `/api/h/${id}/spec/patch`,
+        post({ edit: { path: "steps.0", value: step }, confirmName: "spec-edit-fixture" }),
+      );
+      expect(confirmed.status).toBe(200);
+      expect(readFileSync(specPath, "utf8")).toContain("Bash");
+    } finally {
+      await t.stop();
+    }
   });
 });

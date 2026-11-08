@@ -22,9 +22,9 @@
  *     `.crewhaus/feedback/.distill-state.json` plus the unprocessed count.
  *     Both are shown; "N new ratings" with no watermark is a guess.
  *   - ADVICE IS ADVISORY. `.crewhaus/advice/` holds proposals. Applying one
- *     goes through the spec write path, and any non-optimizable path is
- *     refused with the diff and routed to `crewhaus propose` — the advice
- *     feed gets no privileged channel into the spec.
+ *     goes through the spec write path, and any non-optimizable path, and any
+ *     security surface, is refused with the diff and routed to `crewhaus
+ *     propose` — the advice feed gets no privileged channel into the spec.
  *   - CHANNEL REACTIONS HAVE A PRECONDITION. Reaction feedback only works
  *     when the channel's `sessionKey` is `channel` or `user`; a `thread`
  *     sessionKey silently collects nothing, and a panel that did not say so
@@ -46,12 +46,7 @@ import {
   ratingsDatasetName,
   readDistillState,
 } from "@crewhaus/feedback-distill";
-import {
-  OPTIMIZABLE_PATHS,
-  applySpecEdits,
-  diffSpecYaml,
-  isOptimizable,
-} from "@crewhaus/spec-patch";
+import { applySpecEdits, diffSpecYaml } from "@crewhaus/spec-patch";
 import { MAX_JSONL_LINES, SESSION_JSONL_RE } from "./constants";
 import {
   absent,
@@ -74,6 +69,7 @@ import { jobArg } from "./m3";
 import { maskDeep, maskSpecYaml, maskText } from "./mask";
 import { resolveContained } from "./safety";
 import { readSpecYaml } from "./schedulers";
+import { classifyPath } from "./spec-edit";
 import { keyedScalar } from "./spec-lines";
 
 const FEEDBACK_SEGMENTS: readonly string[] = [".crewhaus", "feedback"];
@@ -502,23 +498,19 @@ type AdviceProposal = {
   readonly target: string;
   readonly value: unknown;
   readonly rationale: string;
-  /** Auto-tunable = inside OPTIMIZABLE_PATHS for this target. Everything else
-   *  is human-owned and cannot be applied from this feed. */
+  /** Auto-tunable = inside OPTIMIZABLE_PATHS for this target and not a security
+   *  surface. Everything else is human-owned and cannot be applied from this
+   *  feed. */
   readonly tier: "auto-tunable" | "human-owned";
   readonly tierReason: string;
 };
 
-/** The same prefix rule `applySpecEdits({ restrictToOptimizable: true })`
- *  enforces on write, evaluated here so the feed can SHOW what applying
- *  would cost before the operator clicks. Enforced on the server either way —
- *  this is a label, not the gate. */
+/** The same answer the editor gives, so a security surface stays human-owned
+ *  even where the optimizer may tune it. Evaluated here so the feed can SHOW
+ *  what applying would cost before the operator clicks; `adviceApply` refuses
+ *  on this answer too, so the label and the refusal read one rule. */
 function tierFor(target: string, path: readonly string[]): AdviceProposal["tier"] {
-  // spec-patch's own matcher (exact + wildcard + the structural rule), so the
-  // label can never disagree with the gate.
-  if (!(target in OPTIMIZABLE_PATHS)) return "human-owned";
-  return isOptimizable(target as keyof typeof OPTIMIZABLE_PATHS, path)
-    ? "auto-tunable"
-    : "human-owned";
+  return classifyPath(target, path).tier;
 }
 
 function readProposals(ctx: M3Context): AdviceProposal[] {
@@ -545,7 +537,7 @@ function readProposals(ctx: M3Context): AdviceProposal[] {
       tierReason:
         tier === "auto-tunable"
           ? "inside OPTIMIZABLE_PATHS for this target — the console may write it directly"
-          : "outside OPTIMIZABLE_PATHS — human-owned; applying routes to `crewhaus propose` instead of writing the spec",
+          : `${classifyPath(target, path).reason}; applying routes to \`crewhaus propose\` instead of writing the spec`,
     });
   });
   return out;
@@ -605,11 +597,13 @@ export const adviceRun: M3Handler = (ctx) => {
 /**
  * `POST /api/h/:id/feedback/advice/:adviceId/apply` — apply one proposal.
  *
- * Goes through `applySpecEdits(..., { restrictToOptimizable: true })`, the
- * SAME restriction the optimizer runs under: the console can never write what
- * the machine may not. A non-optimizable path is refused with the
- * credential-redacted diff and `crewhaus propose` named in the refusal — not
- * silently dropped, and never quietly written.
+ * A row the feed labels human-owned is refused first, on the same answer the
+ * editor gives: a security surface goes through `crewhaus propose` or the
+ * editor's typed confirmation, so `confirm: true` does not lift this refusal.
+ * Everything else goes through `applySpecEdits(..., { restrictToOptimizable:
+ * true })`, the path check the optimizer runs under. A refused path
+ * answers with the credential-redacted diff and `crewhaus propose` named in
+ * the refusal — not silently dropped, and not quietly written.
  */
 export const adviceApply: M3Handler = (ctx) => {
   const adviceId = ctx.params["adviceId"] as string;
@@ -642,31 +636,36 @@ export const adviceApply: M3Handler = (ctx) => {
     ...(proposal.rationale !== "" ? { rationale: proposal.rationale } : {}),
   };
 
-  let applied: ReturnType<typeof applySpecEdits>;
-  try {
-    applied = applySpecEdits(before, [edit], { restrictToOptimizable: true });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    // The human-owned refusal is a FIRST-CLASS state: show what the edit
-    // would have done, then name the route that CAN carry it.
+  // The human-owned refusal is a FIRST-CLASS state: show what the edit would
+  // have done, then name the route that CAN carry it.
+  const humanOwnedRefusal = (reason: string): HttpError => {
     let diff: unknown = [];
     try {
       diff = diffSpecYaml(before, applySpecEdits(before, [edit]).yaml).map((d) => ({ ...d }));
     } catch {
       diff = [];
     }
-    throw new HttpError(
+    return new HttpError(
       409,
       JSON.stringify({
         error: "this proposal touches a human-owned path — the advice feed cannot write it",
         adviceId,
         path: proposal.path,
         tier: proposal.tier,
-        reason: message,
+        reason,
         route: "crewhaus propose",
         diff,
       }),
     );
+  };
+
+  if (proposal.tier !== "auto-tunable") throw humanOwnedRefusal(proposal.tierReason);
+
+  let applied: ReturnType<typeof applySpecEdits>;
+  try {
+    applied = applySpecEdits(before, [edit], { restrictToOptimizable: true });
+  } catch (err) {
+    throw humanOwnedRefusal(err instanceof Error ? err.message : String(err));
   }
 
   if (ctx.body["confirm"] !== true) {

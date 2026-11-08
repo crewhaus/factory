@@ -3465,6 +3465,39 @@ triggers:
     expect(patch.op).toBe("replace");
   }, 20_000);
 
+  test("the patch keeps who approves a write, so it passes validatePatch on a spec with or without a block", async () => {
+    const { parseSpec } = await import("@crewhaus/spec");
+    const { applySpecPatch, validatePatch } = await import("@crewhaus/spec-patch");
+    const historyPath = writeHistory();
+    for (const [specYaml, approval] of [
+      [ONCHAIN_BASE, "required"],
+      [
+        `${ONCHAIN_BASE}transaction_policy:\n  defaultWriteApproval: policy\n  allowedContracts: []\n`,
+        "policy",
+      ],
+    ] as const) {
+      const specPath = join(tmp, "crewhaus.yaml");
+      writeFileSync(specPath, specYaml);
+      const patchPath = join(tmp, "patch.json");
+      const result = await runCli([
+        "onchain",
+        "tune",
+        specPath,
+        "--history",
+        historyPath,
+        "-o",
+        patchPath,
+      ]);
+      expect(result.exitCode).toBe(0);
+      const patch = JSON.parse(readFileSync(patchPath, "utf-8"));
+      expect(patch.value.defaultWriteApproval).toBe(approval);
+      expect(() => validatePatch(parseSpec(specYaml), patch)).not.toThrow();
+      expect(applySpecPatch(specYaml, patch).spec).toMatchObject({
+        transaction_policy: { defaultWriteApproval: approval },
+      });
+    }
+  }, 20_000);
+
   test("quoted transaction_policy key — parsed-CST check agrees with applySpecPatch, unlike the old raw-text regex", async () => {
     // `/^transaction_policy:/m` (the old check) does NOT match a quoted key
     // like `"transaction_policy":`, even though it's valid YAML and the

@@ -812,7 +812,8 @@ export const OPTIMIZABLE_PATHS: Readonly<
     // §47 blockchain subsystem (slice 0). Whole-block replacement so the
     // optimizer can tune `chains[*].finality.count`, `chains[*].rpcPolicy`,
     // `transaction_policy.maxValueWei`, and `transaction_policy.simulationRequired`
-    // by patching their parent block.
+    // by patching their parent block. Who approves a write stays as it stands:
+    // `transaction_policy.defaultWriteApproval` is an OPTIMIZER_REFUSED_LEAVES row.
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
     // Adaptive model routing — the pool's POLICY knobs are tunable (advise
@@ -1426,6 +1427,12 @@ export const HUMAN_OWNED_PATHS: ReadonlyArray<{
     reason:
       "an SLO threshold decides when production is alerted, paused or rolled back — an operator's call, never an eval loop's (the routing rates added in 0.6.0 follow the existing keys)",
   },
+  // -- transaction_policy: the block is tunable as a whole, and this leaf is not --
+  {
+    pattern: ["transaction_policy", "defaultWriteApproval"],
+    reason:
+      "who approves a write is human-owned — an eval cannot see a human approval go away (also an OPTIMIZER_REFUSED_LEAVES row)",
+  },
   // -- provability (0.8.0 §9.2): everything but the four dials in
   //    PROVABILITY_DIALS — the bar the optimizer is graded against, posture,
   //    and what counts as evidence --
@@ -1617,11 +1624,17 @@ export function wildcardPlacementIssues(
  * row is refused with the row's own reason, never "add it to
  * OPTIMIZABLE_PATHS" (an entry could not admit it). `crewhaus doctor
  * --philosophy-alignment` checks the same path.
+ *
+ * `transaction_policy.defaultWriteApproval` is who approves an on-chain write.
+ * `transaction_policy` is whitelisted WHOLESALE so the optimizer can tune the
+ * value ceiling and simulation against an eval, and an eval cannot see a human
+ * approval go away. A block patch that carries the spec's value passes.
  */
 export const OPTIMIZER_REFUSED_LEAVES: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
   Object.freeze(["model_pool", "learning", "seed"]),
   Object.freeze(["provability", "level"]),
   Object.freeze(["provability", "on_fail"]),
+  Object.freeze(["transaction_policy", "defaultWriteApproval"]),
 ]);
 
 /**
@@ -1636,6 +1649,8 @@ const REFUSED_LEAF_REASONS: Readonly<Record<string, string>> = Object.freeze({
     "the provability floor is the bar the optimizer is graded against — moving it would blind the critic (design §9.2)",
   "provability.on_fail":
     "what a below-floor answer becomes (retry / halt / note / escalate) is human-owned semantics the optimizer is graded under (design §9.2)",
+  "transaction_policy.defaultWriteApproval":
+    "who approves a write is human-owned, because an eval cannot see a human approval go away",
 });
 
 function refusedLeafReason(pattern: ReadonlyArray<string>): string {
