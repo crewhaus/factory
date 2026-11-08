@@ -449,6 +449,179 @@ test("HarnessRegister removes only the row, and only with dryRun:false", async (
   expect(existsSync(path.join(tmp, "h1", "crewhaus.yaml"))).toBe(true);
 });
 
+// A row outside the workspace, the normal case for a machine-wide registry.
+// Written through the library, as the operator's own commands write it.
+function operatorRow(dir: string): string {
+  return openHangarRegistry({ root: registryRoot }).upsert({
+    dir,
+    specName: "operator-bot",
+    target: "cli",
+    origin: "manual",
+    originDetail: "operator",
+  }).id;
+}
+
+const CHANGES_KEPT_TO_THE_WORKSPACE: ReadonlyArray<{
+  readonly name: string;
+  readonly fields: Record<string, unknown>;
+  readonly verbs: readonly string[];
+}> = [
+  { name: "relocate", fields: { action: "relocate", dir: "new" }, verbs: ["harness relocate"] },
+  { name: "remove", fields: { action: "remove" }, verbs: ["harness remove"] },
+  {
+    name: "update groups",
+    fields: { action: "update", groups: ["core"] },
+    verbs: ["harness group"],
+  },
+  {
+    name: "update group and order",
+    fields: { action: "update", group: "core", order: 1 },
+    verbs: ["harness group"],
+  },
+  { name: "update order", fields: { action: "update", order: 1 }, verbs: ["harness group"] },
+  { name: "update hidden", fields: { action: "update", hidden: true }, verbs: ["crewhaus hangar"] },
+  {
+    name: "update groups and hidden",
+    fields: { action: "update", groups: [], hidden: false },
+    verbs: ["harness group", "crewhaus hangar"],
+  },
+  {
+    name: "update tags with groups",
+    fields: { action: "update", tags: ["t"], groups: ["core"] },
+    verbs: ["harness group"],
+  },
+];
+
+for (const { name, fields, verbs } of CHANGES_KEPT_TO_THE_WORKSPACE) {
+  for (const dryRun of [true, false]) {
+    test(`HarnessRegister refuses ${name} (dryRun ${dryRun}) on a live row outside the workspace`, async () => {
+      harness("new");
+      const elsewhere = outsideDir();
+      const id = operatorRow(elsewhere);
+      const before = readFileSync(registryFile());
+
+      const r = await call(harnessRegister, { ...fields, id, dryRun });
+      expect(r["status"]).toBe("refused");
+      expect(r["code"]).toBe("refused");
+      expect(String(r["reason"])).toContain(`${id} points at a directory outside this workspace`);
+      for (const verb of verbs) expect(String(r["reason"])).toContain(verb);
+      expect(at(r, "entry", "id")).toBe(id);
+      // Nothing landed, including the fields of a call that also set others.
+      expect(readFileSync(registryFile()).equals(before)).toBe(true);
+      expect(existsSync(elsewhere)).toBe(true);
+    });
+  }
+}
+
+for (const { name, fields } of CHANGES_KEPT_TO_THE_WORKSPACE.filter(
+  // `order` alone is bad input on any row, so it has no applied case.
+  (change) => change.name !== "update order",
+)) {
+  test(`HarnessRegister applies ${name} on a row whose directory is gone`, async () => {
+    harness("new");
+    const elsewhere = outsideDir();
+    const id = operatorRow(elsewhere);
+    rmSync(elsewhere, { recursive: true, force: true });
+
+    const r = await call(harnessRegister, { ...fields, id, dryRun: false });
+    expect(r["status"]).toBe("applied");
+    const row = readRegistry().harnesses.find((h) => h["id"] === id);
+    if (fields["action"] === "remove") expect(row).toBeUndefined();
+    else expect(row).toBeDefined();
+    if (fields["action"] === "relocate") expect(row?.["dir"]).toBe(path.join(tmp, "new"));
+  });
+
+  test(`HarnessRegister applies ${name} on a row inside the workspace`, async () => {
+    harness("new");
+    harness("mine");
+    const created = await call(harnessRegister, { action: "register", dir: "mine", dryRun: false });
+    const id = String(at(created, "entry", "id"));
+
+    const r = await call(harnessRegister, { ...fields, id, dryRun: false });
+    expect(r["status"]).toBe("applied");
+    // The old directory is still there, and that makes no difference here.
+    expect(existsSync(path.join(tmp, "mine"))).toBe(true);
+  });
+}
+
+test("HarnessRegister annotates a live row outside the workspace", async () => {
+  const elsewhere = outsideDir();
+  const id = operatorRow(elsewhere);
+
+  const r = await call(harnessRegister, {
+    action: "update",
+    id,
+    tags: ["nightly"],
+    notes: "kept by the operator",
+    pinned: true,
+    dryRun: false,
+  });
+  expect(r["status"]).toBe("applied");
+  expect(r["applied"]).toEqual(["tags", "pinned", "notes"]);
+  const row = readRegistry().harnesses.find((h) => h["id"] === id);
+  expect(row?.["dir"]).toBe(elsewhere);
+  expect(row?.["tags"]).toEqual(["nightly"]);
+  expect(row?.["notes"]).toBe("kept by the operator");
+  expect(row?.["pinned"]).toBe(true);
+});
+
+test("HarnessRegister reports a row selected by a directory outside the workspace as escaping it", async () => {
+  harness("new");
+  const elsewhere = outsideDir();
+  operatorRow(elsewhere);
+  const before = readFileSync(registryFile());
+
+  const r = await call(harnessRegister, {
+    action: "relocate",
+    from: elsewhere,
+    dir: "new",
+    dryRun: false,
+  });
+  expect(r["status"]).toBe("refused");
+  expect(String(r["reason"])).toContain("escapes the workspace root");
+  expect(readFileSync(registryFile()).equals(before)).toBe(true);
+});
+
+test("HarnessRegister judges a row by where its directory really is", async () => {
+  harness("new");
+  // Spelled inside the workspace, standing outside it.
+  const elsewhere = outsideDir();
+  symlinkSync(elsewhere, path.join(tmp, "spelled-inside"));
+  const out = operatorRow(path.join(tmp, "spelled-inside"));
+  const refused = await call(harnessRegister, {
+    action: "relocate",
+    id: out,
+    dir: "new",
+    dryRun: false,
+  });
+  expect(refused["status"]).toBe("refused");
+  expect(String(refused["reason"])).toContain("crewhaus harness relocate");
+
+  // Spelled outside the workspace, standing inside it.
+  harness("mine");
+  const link = path.join(outsideDir(), "spelled-outside");
+  symlinkSync(path.join(tmp, "mine"), link);
+  const inside = operatorRow(link);
+  const applied = await call(harnessRegister, { action: "remove", id: inside, dryRun: false });
+  expect(applied["status"]).toBe("applied");
+  expect(existsSync(path.join(tmp, "mine", "crewhaus.yaml"))).toBe(true);
+});
+
+test("HarnessRegister takes a directory it could not read as still there, not gone", async () => {
+  harness("new");
+  // A symlink loop: `existsSync` answers false, and so would an unreadable
+  // parent, yet nothing says the directory went away.
+  const loop = path.join(outsideDir(), "loop");
+  symlinkSync(loop, loop);
+  const id = operatorRow(loop);
+  const before = readFileSync(registryFile());
+
+  const r = await call(harnessRegister, { action: "relocate", id, dir: "new", dryRun: false });
+  expect(r["status"]).toBe("refused");
+  expect(String(r["reason"])).toContain("crewhaus harness relocate");
+  expect(readFileSync(registryFile()).equals(before)).toBe(true);
+});
+
 test("HarnessRegister refuses to mutate an unparseable registry, and leaves it byte-for-byte", async () => {
   harness("h1");
   mkdirSync(registryRoot, { recursive: true });

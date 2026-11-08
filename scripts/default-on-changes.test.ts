@@ -18,7 +18,8 @@
  * line 0.7.x did not print, every block the edge says it does not run
  * besides `provability:` itself, every kind of spelling FactCrossCheck
  * no longer reads the way 0.7.x did, and every shape whose daemon stops on an
- * unset tool-config variable with an exit code of its own, with that code. A
+ * unset tool-config variable with an exit code of its own, with that code, and
+ * every `HarnessRegister` change it keeps to rows in its workspace. A
  * change reverted or scoped to the block stops being found, and a new root,
  * tool, header line, edge warning, verdict that moved or stopping shape fails
  * until the notes name it. Each scan also
@@ -48,6 +49,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
+import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import {
   type RuleSet,
   type ToolCallContext,
@@ -63,6 +65,7 @@ import {
   resolveBuiltinTools,
 } from "../packages/tool-categories/src/index";
 import { planPin } from "../packages/tool-evalops/src/lib/pin";
+import { harnessRegister } from "../packages/tool-fleet/src/index";
 import { TOOL_REGISTRY } from "../packages/tool-registry-manifest/src/generated";
 import { factCrossCheck } from "../packages/tool-verify/src/index";
 
@@ -909,6 +912,76 @@ describe("the release notes name every change a harness without provability: see
     expect(named[0]).toContain("bypass");
     expect(named[0]).toContain("`Bash`");
     expect(named[0]).toContain("`RunCommand`");
+  });
+
+  test("HarnessRegister: every change it keeps to rows in its workspace is named, with the operator's verb", async () => {
+    // Found by asking the tool, on a live row outside its workspace: a change
+    // it refuses there is named in the list, a check reverted refuses nothing,
+    // and a field newly refused fails until the bullet names it. A preview is
+    // enough, since the check runs before the dry-run branches.
+    const asks = [
+      { name: "relocate", input: { action: "relocate", dir: "." } },
+      { name: "remove", input: { action: "remove" } },
+      { name: "groups", input: { action: "update", groups: ["g"] } },
+      { name: "group", input: { action: "update", group: "g" } },
+      { name: "order", input: { action: "update", order: 1 } },
+      { name: "hidden", input: { action: "update", hidden: true } },
+      { name: "tags", input: { action: "update", tags: ["t"] } },
+      { name: "notes", input: { action: "update", notes: "n" } },
+      { name: "pinned", input: { action: "update", pinned: true } },
+    ];
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-rows-")));
+    const workspace = join(base, "workspace");
+    const elsewhere = join(base, "elsewhere");
+    mkdirSync(workspace);
+    mkdirSync(elsewhere);
+    const cwd = process.cwd();
+    const was = process.env["CREWHAUS_REGISTRY_ROOT"];
+    process.env["CREWHAUS_REGISTRY_ROOT"] = join(base, "registry");
+    process.chdir(workspace);
+    const reasons = new Map<string, string>();
+    try {
+      const { id } = openHangarRegistry({ root: join(base, "registry") }).upsert({
+        dir: elsewhere,
+        specName: "row",
+        target: "cli",
+        origin: "manual",
+        originDetail: "guard",
+      });
+      for (const { name, input } of asks) {
+        const raw = String(await harnessRegister.execute({ ...input, id } as never));
+        const result = JSON.parse(raw) as { status?: string; reason?: string };
+        // By this reason alone: `order` with no `group` is refused on any row.
+        if (result.reason?.includes("outside this workspace")) reasons.set(name, result.reason);
+      }
+    } finally {
+      process.chdir(cwd);
+      if (was === undefined) Reflect.deleteProperty(process.env, "CREWHAUS_REGISTRY_ROOT");
+      else process.env["CREWHAUS_REGISTRY_ROOT"] = was;
+      rmSync(base, { recursive: true, force: true });
+    }
+    expect([...reasons.keys()]).toContain("relocate");
+    const later = defaultOnBullets(changelog, LATER_HEADINGS);
+    const bullet = later.find((b) => b.includes("`HarnessRegister`")) ?? "";
+    const headline = bullet.match(/\*\*(.+?)\*\*/)?.[1] ?? "";
+    const rest = bullet.slice(bullet.indexOf(headline) + headline.length);
+    expect(headline).toContain("relocates or removes");
+    const names = asks.map((ask) => ask.name).filter((n) => n !== "relocate" && n !== "remove");
+    const kept = names.filter((name) => reasons.has(name));
+    expect(kept.length).toBeGreaterThan(0);
+    expect(kept.filter((field) => !headline.includes(`\`${field}\``))).toEqual([]);
+    // A field the tool still changes on such a row is the bullet's last
+    // sentence, so a field moved from one side to the other moves the notes.
+    const open = names.filter((name) => !reasons.has(name));
+    expect(open.length).toBeGreaterThan(0);
+    expect(open.filter((field) => !rest.includes(`\`${field}\``))).toEqual([]);
+    // Each verb a refusal names is in the bullet, so the list says where the
+    // operator makes the change.
+    const verbs = [...reasons.values()].flatMap((reason) =>
+      [...reason.matchAll(/`(crewhaus [^`]+)`/g)].map((m) => m[1] ?? ""),
+    );
+    expect(verbs).toContain("crewhaus harness relocate");
+    expect(verbs.filter((verb) => !bullet.includes(`\`${verb}\``))).toEqual([]);
   });
 
   test("FactCrossCheck: every kind of spelling whose verdict moved since 0.7.x is named", async () => {
