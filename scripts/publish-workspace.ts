@@ -41,7 +41,32 @@
  *   bun scripts/publish-workspace.ts --dry-run                  # plan only
  *   bun scripts/publish-workspace.ts --filter @crewhaus/errors  # canary a leaf first
  *   bun scripts/publish-workspace.ts                            # full run
+ *   bun scripts/publish-workspace.ts --dist-tag next            # a release candidate
  *   bun scripts/publish-workspace.ts --dry-run --no-registry    # pack check, no registry (CI)
+ *
+ * The release workflow's dry-run dispatch runs `--dry-run` (with `--dist-tag next`
+ * for a release candidate) against the real registry: every check below runs, the
+ * first-publish preflight included, and nothing is published.
+ *
+ * Dist tags: a stamped version with a prerelease part (`0.9.0-rc.1`) publishes only
+ * with `--dist-tag next`, so a candidate never becomes what `npm install crewhaus`
+ * picks, and a final version refuses `--dist-tag`. `next` is the only value taken.
+ * Both are checked over every discovered package before anything is asked of the
+ * registry, so a wrong flag refuses the whole run rather than part of it. Under
+ * `--no-registry` (CI's pack check over a tree stamped `0.0.0-ci`) a prerelease needs
+ * no tag, since nothing is published; a bad value and a tag on a final version still
+ * refuse.
+ *
+ * First-publish preflight: before npm is asked what any tarball would hold, and before
+ * any `npm publish`, the registry is asked once about every package in the run (the
+ * ownership lookup below, a few at a time; the loop reads those answers instead of
+ * asking again). A name the registry has never seen (E404) needs its first publish,
+ * which OIDC trusted publishing cannot do, and a name it could not answer about may be
+ * one; either needs a working token. So when there are any, `npm whoami` is asked
+ * (once per run, on every path, the dry run and OIDC included), and if no token works
+ * the run stops before publishing anything and names the packages. whoami's own
+ * output is never printed, only npm's error code, so a token cannot reach the log.
+ * Skipped under `--no-registry`, which says so.
  *
  * Every form needs `npm` on PATH (checked once, up front): npm itself says what
  * each tarball would carry. Every form except --no-registry also needs a
@@ -97,6 +122,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { entryPoints, preflight, wouldInclude } from "../packages/tool-pkg/src/lib/preflight";
+import { isPublishableManifest } from "./publishable.ts";
 
 type PkgInfo = {
   name: string;
@@ -123,6 +149,9 @@ const FILTER = flag("filter");
 // and dependency-plan checks on every PR without a network. Ownership is then NOT
 // checked, and a dependency outside the run cannot be confirmed (so it blocks).
 const NO_REGISTRY = has("no-registry");
+// The npm dist tag a release candidate publishes under. `next` is the only value
+// taken; main() refuses anything else, and a tag on a final version.
+const DIST_TAG: string | undefined = has("dist-tag") ? (flag("dist-tag") ?? "") : undefined;
 const ROOT = resolve(flag("root") ?? process.cwd());
 
 function readJson<T = unknown>(path: string): T {
@@ -159,11 +188,11 @@ function discoverPackages(): PkgInfo[] {
   const raw: { dir: string; pkg: Record<string, unknown> }[] = [];
   for (const dir of dirs) {
     const pkg = readJson<Record<string, unknown>>(join(dir, "package.json"));
-    if (pkg.private === true) continue;
-    const name = pkg.name as string | undefined;
-    // Publishable names: the scoped library packages plus the unscoped
-    // flagship `crewhaus` CLI (apps/cli — the bare package users install).
-    if (!name || !(name === "crewhaus" || name.startsWith("@crewhaus/"))) continue;
+    // Publishable: the scoped library packages plus the unscoped flagship
+    // `crewhaus` CLI (apps/cli — the bare package users install), and never a
+    // `private` one. The one rule release-prep stamps by (./publishable.ts).
+    if (!isPublishableManifest(pkg)) continue;
+    const name = pkg.name;
     allNames.add(name);
     raw.push({ dir, pkg });
   }
@@ -471,16 +500,161 @@ export function ownershipVerdict(
 }
 
 /**
- * Ownership guard: if the name already exists on the registry, its
- * `repository` (url + directory) must match this local package. Two
- * different local packages publishing to one npm name is otherwise a
+ * The ownership lookup for one package: `npm view <name> repository --json`.
+ * Asked once per package per run, in the pooled pre-pass in main(), and read
+ * twice: by the first-publish preflight (is the name new?) and by the ownership
+ * guard in the loop (ownershipVerdict). If the name already exists on the
+ * registry, its `repository` (url + directory) must match this local package.
+ * Two different local packages publishing to one npm name is otherwise a
  * SILENT hijack — `@crewhaus/plugin-sdk` was two distinct packages
  * (factory §41 vs utilities Studio SDK) across 0.1.1→0.1.2 and nobody
- * was told. Returns null when ok (or name not on the registry yet),
- * else a human-readable reason to refuse.
+ * was told.
  */
-function ownershipMismatch(p: PkgInfo): string | null {
-  return ownershipVerdict(npmView([p.name, "repository", "--json"]), p);
+function ownershipLookup(p: Pick<PkgInfo, "name">): Promise<ViewResult> {
+  return npmAsync(["view", p.name, "repository", "--json"]);
+}
+
+/** Does a version carry a prerelease part (`0.9.0-rc.1`, `0.0.0-ci`)? Build metadata is not one. */
+export function hasPrereleasePart(version: string): boolean {
+  return (version.split("+")[0] ?? "").includes("-");
+}
+
+/**
+ * Why `--dist-tag` (or its absence) refuses this run, over every discovered
+ * package: an empty list means it may go on. `notes` are lines to log instead.
+ */
+export function distTagProblems(
+  pkgs: readonly Pick<PkgInfo, "name" | "version">[],
+  distTag: string | undefined,
+  noRegistry: boolean,
+): { readonly problems: string[]; readonly notes: string[] } {
+  const problems: string[] = [];
+  const notes: string[] = [];
+  if (distTag !== undefined && distTag !== "next") {
+    problems.push(
+      `--dist-tag ${JSON.stringify(distTag)} is not taken: the one dist tag a release publishes under is next.`,
+    );
+  }
+  // By name, so the one a message names does not depend on directory order.
+  const byName = [...pkgs].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const finals = byName.filter((p) => !hasPrereleasePart(p.version));
+  const pre = byName.filter((p) => hasPrereleasePart(p.version));
+  const more = (list: readonly unknown[]) =>
+    list.length > 1 ? ` (and ${list.length - 1} more)` : "";
+  const [firstFinal] = finals;
+  if (distTag !== undefined && firstFinal !== undefined) {
+    problems.push(
+      `--dist-tag ${distTag} was given, but ${firstFinal.name}@${firstFinal.version}${more(finals)} is a final version: a final version publishes under npm's default tag, so drop --dist-tag.`,
+    );
+  }
+  const [firstPre] = pre;
+  if (distTag === undefined && firstPre !== undefined) {
+    if (noRegistry) {
+      notes.push(
+        `${firstPre.name}@${firstPre.version}${more(pre)} is a prerelease; no registry, so no dist tag is needed.`,
+      );
+    } else {
+      problems.push(
+        `${firstPre.name}@${firstPre.version}${more(pre)} is a prerelease: publish it with --dist-tag next, so it never becomes the version \`npm install\` picks (npm refuses a prerelease without a tag).`,
+      );
+    }
+  }
+  return { problems, notes };
+}
+
+/** What the ownership lookups say about which names this run must create. */
+export type FirstPublishSplit = {
+  /** E404: never published, a first publish OIDC cannot do. */
+  readonly fresh: readonly string[];
+  /** Any other failure, with npm's error code (or why npm did not run). */
+  readonly unknown: readonly { readonly name: string; readonly code: string }[];
+};
+
+/** Split ownership lookups into new names and names the registry did not answer about. */
+export function splitFirstPublish(
+  answers: readonly { readonly name: string; readonly result: ViewResult }[],
+): FirstPublishSplit {
+  const fresh: string[] = [];
+  const unknown: { name: string; code: string }[] = [];
+  for (const { name, result } of answers) {
+    if (result.status === 0) continue;
+    const c = classifyViewFailure(result);
+    if (c.absent) {
+      fresh.push(name);
+    } else {
+      unknown.push({
+        name,
+        code:
+          spawnProblem(result) ??
+          npmErrorCode(result.stdout, result.stderr) ??
+          `exit ${result.status}`,
+      });
+    }
+  }
+  const byName = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  return {
+    fresh: fresh.sort(byName),
+    unknown: unknown.sort((a, b) => byName(a.name, b.name)),
+  };
+}
+
+/** The answer of `npm whoami`: who, or npm's error code. Never its raw output. */
+export type Whoami =
+  | { readonly ok: true; readonly user: string }
+  | { readonly ok: false; readonly why: string };
+
+/** Classify a spawned `npm whoami`. stderr is read only for npm's error code. */
+export function whoamiOf(r: ViewResult): Whoami {
+  const spawn = spawnProblem(r);
+  if (spawn !== undefined) return { ok: false, why: spawn };
+  if (r.status === 0 && r.stdout.trim() !== "") return { ok: true, user: r.stdout.trim() };
+  const code = npmErrorCode(r.stdout, r.stderr);
+  return { ok: false, why: `npm whoami exited ${r.status}${code ? ` with code ${code}` : ""}` };
+}
+
+function npmWhoami(): Whoami {
+  return whoamiOf(toViewResult(spawnSync("npm", ["whoami"], { encoding: "utf-8" })));
+}
+
+/**
+ * The refusal when this run must create names and no token works: names sorted,
+ * the unknown ones on their own line with npm's error code.
+ */
+export function firstPublishRefusal(split: FirstPublishSplit, whoamiWhy: string): string[] {
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  const parts: string[] = [];
+  if (split.fresh.length > 0) {
+    parts.push(
+      plural(
+        split.fresh.length,
+        "new package name needs its first publish",
+        "new package names need their first publish",
+      ),
+    );
+  }
+  if (split.unknown.length > 0) {
+    parts.push(
+      plural(
+        split.unknown.length,
+        "package name could not be checked on the registry",
+        "package names could not be checked on the registry",
+      ),
+    );
+  }
+  const lines = [
+    `✗ ${parts.join(" and ")}, and no working npm token is set. Nothing was published.`,
+    "  USER ACTION REQUIRED (credential): create a granular npm access token (read and write, bypass 2FA)",
+    "  for the @crewhaus scope and the crewhaus package, save it as the NPM_TOKEN repository secret,",
+    "  then re-run this job.",
+  ];
+  if (split.fresh.length > 0) lines.push(`  New names: ${split.fresh.join(", ")}`);
+  if (split.unknown.length > 0) {
+    lines.push(
+      `  Could not be checked (npm's error code): ${split.unknown.map((u) => `${u.name} (${u.code})`).join(", ")}`,
+    );
+  }
+  lines.push(`  (${whoamiWhy}.)`);
+  return lines;
 }
 
 type PublishResult = "ok" | "already" | "failed";
@@ -544,7 +718,11 @@ function publish(p: PkgInfo, pack: PackList): PublishResult {
  * npm reject the publish outright rather than degrade.
  */
 const OIDC_AVAILABLE = process.env["ACTIONS_ID_TOKEN_REQUEST_URL"] !== undefined;
-const PUBLISH_FLAGS: readonly string[] = OIDC_AVAILABLE ? ["--provenance"] : [];
+/** `--tag next` for a release candidate; main() has refused any other --dist-tag by now. */
+const PUBLISH_FLAGS: readonly string[] = [
+  ...(OIDC_AVAILABLE ? ["--provenance"] : []),
+  ...(DIST_TAG === "next" ? ["--tag", DIST_TAG] : []),
+];
 
 /** Every workspace package name; populated from discovery before publishing starts. */
 const INTERNAL_NAMES = new Set<string>();
@@ -855,26 +1033,25 @@ async function main(): Promise<void> {
   if (NO_REGISTRY) {
     console.log("Registry not consulted (--no-registry): ownership is NOT checked.");
   }
+  if (DIST_TAG !== undefined && DIST_TAG !== "next") {
+    for (const problem of distTagProblems([], DIST_TAG, NO_REGISTRY).problems) {
+      console.error(`✗ ${problem}`);
+    }
+    console.error("✗ Nothing was published.");
+    process.exit(1);
+  }
   // `npm whoami` is a TOKEN identity check and there is no equivalent under OIDC:
   // trusted publishing mints a short-lived, package-scoped credential during
   // `npm publish` itself, so there is no logged-in user to report and whoami
-  // legitimately fails. Only demand it on the token path.
+  // legitimately fails. Only demand it on the token path — and on any path where
+  // this run must create a name (the first-publish preflight below), which only a
+  // token can. Asked at most once per run: the preflight reuses this answer.
+  let whoami: Whoami | undefined;
   if (!DRY && !OIDC_AVAILABLE) {
-    const whoamiResult = spawnSync("npm", ["whoami"], { encoding: "utf-8" });
-    if (whoamiResult.status !== 0) {
-      console.error("✗ npm whoami failed — no usable npm credential.");
-      console.error("  In CI this means the NPM_TOKEN secret is missing or revoked. Note that npm");
-      console.error(
-        "  permanently revoked ALL classic automation tokens on 2025-12-09; they cannot",
-      );
-      console.error(
-        "  be recreated. Mint a granular access token scoped to the @crewhaus scope plus",
-      );
-      console.error("  the unscoped `crewhaus` package, with bypass-2FA enabled.");
-      console.error(`  stderr: ${whoamiResult.stderr?.trim()}`);
-      process.exit(1);
-    }
-    console.log(`✓ Logged in as: ${whoamiResult.stdout.trim()}`);
+    whoami = npmWhoami();
+    // A failure is reported once the packages are known, so the report can name
+    // the ones that need the token; nothing is published before then.
+    if (whoami.ok) console.log(`✓ Logged in as: ${whoami.user}`);
   } else if (!DRY) {
     console.log("✓ OIDC trusted publishing detected (ACTIONS_ID_TOKEN_REQUEST_URL set)");
     console.log("  publishing with --provenance; no npm token required");
@@ -890,11 +1067,64 @@ async function main(): Promise<void> {
   for (const p of pkgs) INTERNAL_NAMES.add(p.name);
   console.log(`Discovered ${pkgs.length} publishable packages (crewhaus + @crewhaus/*) in ${ROOT}`);
 
+  // Over every discovered package, before the registry is asked anything: a
+  // prerelease without `next`, or a final version with a tag, refuses the run.
+  const tags = distTagProblems(pkgs, DIST_TAG, NO_REGISTRY);
+  for (const note of tags.notes) console.log(note);
+  if (tags.problems.length > 0) {
+    for (const problem of tags.problems) console.error(`✗ ${problem}`);
+    console.error("✗ Nothing was published.");
+    process.exit(1);
+  }
+
   const sorted = topoSort(pkgs);
   const byName = new Map(pkgs.map((p) => [p.name, p]));
   const filtered = FILTER ? sorted.filter((p) => p.name === FILTER) : sorted;
   if (FILTER && filtered.length === 0) {
     console.error(`No package matched --filter ${FILTER}`);
+    process.exit(1);
+  }
+
+  // The ownership lookup of every package in the run, asked once, a few at a time.
+  // The first-publish preflight reads it now, the ownership guard in the loop later.
+  const ownership = new Map<string, ViewResult>();
+  if (NO_REGISTRY) {
+    console.log(
+      "First-publish preflight skipped (--no-registry): no registry says which names are new.",
+    );
+  } else {
+    console.log(`Asking the registry about ${filtered.length} package name(s)...`);
+    const answers = await mapPool(filtered, NPM_POOL, ownershipLookup);
+    filtered.forEach((p, i) => ownership.set(p.name, answers[i] as ViewResult));
+    const split = splitFirstPublish(
+      filtered.map((p, i) => ({ name: p.name, result: answers[i] as ViewResult })),
+    );
+    if (split.fresh.length > 0 || split.unknown.length > 0) {
+      whoami ??= npmWhoami();
+      if (!whoami.ok) {
+        for (const line of firstPublishRefusal(split, whoami.why)) console.error(line);
+        process.exit(1);
+      }
+      const unknown =
+        split.unknown.length > 0
+          ? `, and ${split.unknown.length} name(s) the registry could not be asked about`
+          : "";
+      console.log(
+        `✓ A working npm token covers the first publish of ${split.fresh.length} name(s)${unknown}.`,
+      );
+    }
+  }
+  if (whoami !== undefined && !whoami.ok) {
+    // The token path, and nothing this run must create.
+    console.error(`✗ npm whoami failed — no usable npm credential (${whoami.why}).`);
+    console.error("  In CI this means the NPM_TOKEN secret is missing or revoked. Note that npm");
+    console.error("  permanently revoked ALL classic automation tokens on 2025-12-09; they cannot");
+    console.error(
+      "  be recreated. Mint a granular access token scoped to the @crewhaus scope plus",
+    );
+    console.error(
+      "  the unscoped `crewhaus` package, with bypass-2FA enabled. Nothing was published.",
+    );
     process.exit(1);
   }
 
@@ -944,8 +1174,14 @@ async function main(): Promise<void> {
   for (const p of filtered) {
     // Ownership first, even on the would-skip path: a version-exists skip is
     // exactly how a hijacked name hides ("already on registry" tells you
-    // nothing about WHOSE content that is). Runs in dry-run too.
-    const mismatch = NO_REGISTRY ? null : ownershipMismatch(p);
+    // nothing about WHOSE content that is). Runs in dry-run too, from the
+    // lookup the pre-pass already made.
+    const lookup = ownership.get(p.name);
+    const mismatch = NO_REGISTRY
+      ? null
+      : lookup === undefined
+        ? "the registry was not asked who owns this name — refusing"
+        : ownershipVerdict(lookup, p);
     if (mismatch) {
       fail(p, `${p.name}@${p.version} (ownership)`);
       console.error(`✗ ${p.name}: ${mismatch}`);

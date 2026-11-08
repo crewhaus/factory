@@ -315,6 +315,32 @@ test("every publishable manifest is stamped with the root's engines.bun, on both
   }
 }, 30_000);
 
+test("--for-publish says a package that declares engines.node runs on Node, and keeps its engines.node", () => {
+  const { tmp, root } = makeRoot({ engines: { bun: ">=1.2.0" }, biome: true });
+  try {
+    // No README.md in either: the generated one is written only where none exists.
+    const node = addPkg(root, "node-pkg", {
+      name: "@crewhaus/node-pkg",
+      version: "0.0.0",
+      engines: { node: ">=20" },
+    });
+    const bunOnly = addPkg(root, "bun-pkg", { name: "@crewhaus/bun-pkg", version: "0.0.0" });
+    const r = runPrep(root, "--for-publish");
+    expect(r.stderr).toBe("");
+    expect(r.exitCode).toBe(0);
+    const readme = readFileSync(join(node, "README.md"), "utf8");
+    expect(readme).toContain("Runs on Node.js `>=20` and Bun `>=1.2.0`.");
+    expect(readme).not.toContain("plain Node is not supported");
+    expect(readPkg(node).engines).toEqual({ node: ">=20", bun: ">=1.2.0" });
+    // The rest keep the Bun-only sentence.
+    const other = readFileSync(join(bunOnly, "README.md"), "utf8");
+    expect(other).toContain("Bun](https://bun.sh) `>=1.2.0`; plain Node is not supported.");
+    expect(other).not.toContain("Runs on Node.js");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}, 30_000);
+
 test("a package's own engines.bun is kept when it asks for a newer Bun, and raised when it is older", () => {
   for (const mode of [[], ["--for-publish"]]) {
     const { tmp, root } = makeRoot({ engines: { bun: ">=1.2.0" }, biome: true });
@@ -337,8 +363,9 @@ test("a package's own engines.bun is kept when it asks for a newer Bun, and rais
         expect(readFileSync(join(newer, "README.md"), "utf8")).toContain(
           "Bun](https://bun.sh) `>=1.3`; plain Node is not supported.",
         );
+        // It declares engines.node, so its README says it runs on Node as well.
         expect(readFileSync(join(older, "README.md"), "utf8")).toContain(
-          "Bun](https://bun.sh) `>=1.2.0`; plain Node is not supported.",
+          "Runs on Node.js `>=22` and Bun `>=1.2.0`.",
         );
       }
       // And a second run leaves both where they are.

@@ -91,6 +91,7 @@ import {
   shutdownReportLines,
 } from "@crewhaus/harness-supervisor";
 import { encodeQr, renderQrLines, renderedWidth } from "@crewhaus/qr-code";
+import { assetSmokeCheck, problemSummary } from "./hangar-smoke";
 import {
   type InterfaceMap,
   type LanAddress,
@@ -558,6 +559,13 @@ async function runSmokeChecks(server: HangarServer, write: (line: string) => voi
         if (!text.includes(UI_SHELL_MARKER)) {
           throw new Error(`response is not the embedded console (missing "${UI_SHELL_MARKER}")`);
         }
+      },
+    },
+    {
+      name: "every embedded console file serves with its content type",
+      run: async () => {
+        const result = await assetSmokeCheck(get, hangarAssets);
+        if (!result.ok) throw new Error(problemSummary(result.problems));
       },
     },
     {

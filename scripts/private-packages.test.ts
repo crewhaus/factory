@@ -2,9 +2,10 @@
  * A test package must never reach npm, and nothing that ships may depend on one.
  *
  * Two locks keep a private package out of the publish scripts: release-prep stamps
- * and un-privates only `crewhaus` and `@crewhaus/...`-shaped names, and
- * publish-workspace skips `"private": true` and every other name. These guards hold
- * the rule those locks rely on:
+ * and un-privates only the names `isPublishableName` (scripts/publishable.ts) accepts,
+ * `crewhaus` and `@crewhaus/<x>`, and publish-workspace skips `"private": true` and
+ * every other name by the same predicate. These guards hold the rule those locks
+ * rely on:
  *
  *  1. Every private workspace package has a name release-prep does not stamp, and
  *     its tests are in the root `test` script, which otherwise runs only the
@@ -33,6 +34,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { isPublishableName } from "./publishable.ts";
 
 const ROOT = dirname(import.meta.dir);
 
@@ -47,9 +49,6 @@ type Manifest = {
 
 const SHIPPING_BLOCKS = ["dependencies", "peerDependencies", "optionalDependencies"] as const;
 const ALL_BLOCKS = [...SHIPPING_BLOCKS, "devDependencies"] as const;
-
-/** The names release-prep stamps with the release version and un-privates. */
-const isStamped = (name: string): boolean => name === "crewhaus" || /^@?crewhaus[-/]/.test(name);
 
 /** The package names in the root test script's `--filter '<name>'` tokens. */
 const testFilters = (rootTestScript: string): string[] =>
@@ -66,7 +65,7 @@ function privatePackageProblems(manifests: readonly Manifest[], rootTestScript: 
   for (const manifest of manifests) {
     const name = manifest.name ?? "(unnamed)";
     if (manifest.private === true) {
-      if (isStamped(name)) {
+      if (isPublishableName(name)) {
         problems.push(`${name}: release-prep would stamp this private name and un-private it`);
       }
       if (!filters.includes(name)) {
@@ -96,24 +95,25 @@ const SCRIPT = "--filter 'service-fakes' --filter 'crewhaus' test";
 const PRIVATE_FAKES: Manifest = { name: "service-fakes", private: true };
 
 describe("guard 1: a private package's name and tests", () => {
-  test("a private crewhaus- name is one release-prep would stamp", () => {
+  test("a private @crewhaus/ name is one release-prep would stamp", () => {
     const problems = privatePackageProblems(
-      [{ name: "crewhaus-x", private: true }],
-      "--filter 'crewhaus-x'",
+      [{ name: "@crewhaus/x", private: true }],
+      "--filter '@crewhaus/x'",
     );
     expect(problems).toEqual([
-      "crewhaus-x: release-prep would stamp this private name and un-private it",
+      "@crewhaus/x: release-prep would stamp this private name and un-private it",
     ]);
   });
 
-  test("so is a private @crewhaus-examples/ name", () => {
+  test("a private crewhaus- or @crewhaus-examples/ name is not: the predicate takes neither", () => {
     const problems = privatePackageProblems(
-      [{ name: "@crewhaus-examples/y", private: true }],
-      "--filter '@crewhaus-examples/y'",
+      [
+        { name: "crewhaus-x", private: true },
+        { name: "@crewhaus-examples/y", private: true },
+      ],
+      "--filter 'crewhaus-x' --filter '@crewhaus-examples/y'",
     );
-    expect(problems).toEqual([
-      "@crewhaus-examples/y: release-prep would stamp this private name and un-private it",
-    ]);
+    expect(problems).toEqual([]);
   });
 
   test("a private package no filter names never has its tests run", () => {
@@ -252,7 +252,7 @@ describe("the real publish scripts", () => {
     ...fields,
   });
 
-  test("release-prep leaves a private test package alone, and un-privates a stamped name", () => {
+  test("release-prep leaves a private test package and other names alone, and un-privates a stamped name", () => {
     // release-prep keys repo metadata off a root directory named this.
     const root = join(tempDir("private-packages-prep-"), "factory");
     write(
@@ -283,8 +283,15 @@ describe("the real publish scripts", () => {
       "service-fakes",
       manifestOf("service-fakes", { private: true }, "service-fakes"),
     );
-    const stamped = add("crewhaus-x", manifestOf("crewhaus-x", { private: true }, "crewhaus-x"));
-    const before = readFileSync(fakes, "utf8");
+    // Names publish-workspace skips: release-prep must not stamp them either.
+    const untouched = [
+      fakes,
+      add("crewhaus-x", manifestOf("crewhaus-x", { private: true }, "crewhaus-x")),
+      add("crewhaus-client", manifestOf("crewhaus-client", {}, "crewhaus-client")),
+      add("labs-x", manifestOf("@crewhaus-labs/x", {}, "labs-x")),
+    ];
+    const stamped = add("zz-x", manifestOf("@crewhaus/zz-x", { private: true }, "zz-x"));
+    const before = untouched.map((file) => readFileSync(file, "utf8"));
 
     const run = Bun.spawnSync(
       [
@@ -302,11 +309,15 @@ describe("the real publish scripts", () => {
       exitCode: 0,
       stderr: expect.any(String),
     });
-    expect(readFileSync(fakes, "utf8")).toBe(before);
-    expect((JSON.parse(readFileSync(stamped, "utf8")) as Manifest).private).toBeUndefined();
-    // The planted name is what the guard calls stamped, and the other is not.
-    expect(isStamped("crewhaus-x")).toBe(true);
-    expect(isStamped("service-fakes")).toBe(false);
+    expect(untouched.map((file) => readFileSync(file, "utf8"))).toEqual(before);
+    const after = JSON.parse(readFileSync(stamped, "utf8")) as Manifest & { version?: string };
+    expect(after.private).toBeUndefined();
+    expect(after.version).toBe("0.3.1");
+    // The planted names are what the predicate calls stamped, and the others are not.
+    expect(isPublishableName("@crewhaus/zz-x")).toBe(true);
+    for (const name of ["crewhaus-x", "crewhaus-client", "@crewhaus-labs/x", "service-fakes"]) {
+      expect(isPublishableName(name)).toBe(false);
+    }
   }, 20_000); // a real script, and the real biome over its output
 
   const NPM = Bun.which("npm");
@@ -340,6 +351,25 @@ describe("the real publish scripts", () => {
         ),
       );
       add("service-fakes", manifestOf("service-fakes", { private: true }, "service-fakes"));
+      // Not private, built and packable: only the name keeps these out of the plan.
+      for (const [dir, name] of [
+        ["crewhaus-client", "crewhaus-client"],
+        ["labs-x", "@crewhaus-labs/x"],
+      ] as const) {
+        add(
+          dir,
+          manifestOf(
+            name,
+            {
+              version: "0.7.1",
+              main: "dist/index.js",
+              files: ["dist", "README.md", "LICENSE", "NOTICE"],
+              publishConfig: { access: "public", registry: deadRegistry },
+            },
+            dir,
+          ),
+        );
+      }
 
       write(join(root, "user-npmrc"), "");
       write(join(root, "global-npmrc"), "");
@@ -377,6 +407,8 @@ describe("the real publish scripts", () => {
       expect(stdout).toContain("Discovered 1 publishable packages");
       expect(stdout).toContain("@crewhaus/zz-ok");
       expect(stdout).not.toContain("service-fakes");
+      expect(stdout).not.toContain("crewhaus-client");
+      expect(stdout).not.toContain("@crewhaus-labs/x");
     },
     90_000, // the script runs the real npm pack
   );
