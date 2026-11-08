@@ -3,8 +3,8 @@
  * injected environment and returns the typed report a manager renders
  * before spawning a harness process.
  *
- * Area order (and therefore item order): spec → env → credentials →
- * channels → mcp → ports → bundle → durability → hooks.
+ * Area order (and therefore item order): spec → workspace → env →
+ * credentials → channels → mcp → ports → bundle → durability → hooks.
  *
  * Classification stances, chosen to match what the spawn would actually do:
  *
@@ -44,6 +44,7 @@ import {
   buildReport,
   isEnvSet,
 } from "./types";
+import { workspaceItems } from "./workspace";
 
 export type RunPreflightOptions = {
   /** Harness root (the directory holding crewhaus.yaml). Optional when
@@ -157,7 +158,8 @@ function collectPortRequests(
  * Run every preflight area and assemble the typed report. Pure with
  * respect to the environment (only the injected `env` is consulted); the
  * filesystem is touched only to read `crewhaus.yaml` (when `specYaml` is
- * not supplied) and to stat the bundle (when `harnessDir` is supplied),
+ * not supplied), to resolve the harness directory and to stat the bundle
+ * (both when `harnessDir` is supplied),
  * and the network is never touched — every check is the offline
  * counterpart of its live cousin.
  */
@@ -181,6 +183,9 @@ export async function runPreflight(opts: RunPreflightOptions): Promise<Preflight
   items.push(...specAreaItems(specYaml, readError, opts.compileWarnings ?? []));
 
   const spec = specYaml !== undefined ? tolerantParse(specYaml) : undefined;
+
+  // workspace
+  if (opts.harnessDir !== undefined) items.push(...workspaceItems(opts.harnessDir, opts.env));
 
   // env chain — WHICH files the injected `env` was merged from. Before the
   // credentials area, because "the key is missing" and "the file that holds

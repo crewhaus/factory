@@ -17,7 +17,7 @@ if (!report.ok) {
 ```
 
 `PreflightReport` is `{ ok, blocking, items }`; each `PreflightItem` carries a
-stable `id`, an `area` (`spec | credentials | channels | mcp | ports | bundle |
+stable `id`, an `area` (`spec | workspace | credentials | channels | mcp | ports | bundle |
 durability`), a `level` (`info | warn | blocking`), a `message`, and optional
 `remediation` / `envVar` fields (the fleet credentials matrix keys on
 `envVar`).
@@ -27,6 +27,7 @@ durability`), a `level` (`info | warn | blocking`), a `message`, and optional
 | Area | What runs | Blocking when |
 |---|---|---|
 | `spec` | `parseSpecIssues` from `@crewhaus/spec`, plus caller-injected compiler warnings (this package never runs the compiler itself) | any spec issue — `parseSpec` (and so the compiler) throws on all of them |
+| `workspace` | the harness directory, links followed, against the account's home and the `HOME` and `USERPROFILE` of the injected env | the directory is a home directory or an ancestor of one. `workspace.holds-home` is acknowledgeable: `--ack workspace.holds-home`, `--force` or Start anyway clears it for one start, and nothing stores the acknowledgement |
 | `credentials` | provider env-var matrix over the UNION of every model the spec can route to: `agent.model`, `model_fallbacks`, `model_tiers`, `model_pool` candidates, the `evaluation` judge model, the `budget` degrade model — mapped through the `@crewhaus/model-router` grammar | a required key group is unset (Bedrock, Vertex ADC, and `local/` endpoints are informational — their credentials are ambient or unneeded) |
 | `channels` | the channel daemon's boot-gate secret env refs, offline (pure env presence — the exact set the compiled daemon exits 2 on) | an env-ref secret is unset, or a credential value would fail compilation |
 | `mcp` | dry-run of boot-time secret-ref resolution via `@crewhaus/mcp-host`, plus lint for `$FOO`/`${FOO}` literals (the MCP transports never expand `$…` values) and credentials pasted inline | an env-ref is unset (the predicted `ConfigError` is the byte-identical one the boot would throw) |

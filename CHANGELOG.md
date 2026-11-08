@@ -182,6 +182,15 @@ these on: they reach every harness that uses what each one names.
   Only `bypass` mode skips this, and `Bash` and `RunCommand` remain outside what
   it can see. Recompile a daemon to pick this up.
 
+- **A harness directory that holds the home directory stops a supervised start
+  for an acknowledgement.** `crewhaus daemon start`, `restart` and `submit` and
+  Hangar's Start report the blocking preflight finding `workspace.holds-home`.
+  `--ack workspace.holds-home`, `--force` or Start anyway proceeds for that
+  start, and the next start asks again, an automatic restart included. A run
+  that starts in such a directory also prints one `[workspace]` line on stderr,
+  which a compiled bundle picks up at its next compile. A harness in a directory
+  of its own, under the home directory or elsewhere, sees neither.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what

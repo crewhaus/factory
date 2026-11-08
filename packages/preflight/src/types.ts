@@ -16,6 +16,7 @@
 /** Which subsystem a preflight item belongs to. */
 export type PreflightArea =
   | "spec"
+  | "workspace"
   | "env"
   | "credentials"
   | "channels"
@@ -29,8 +30,9 @@ export type PreflightArea =
  * Severity of one item.
  *
  *   - `blocking` — the spawn is known to fail (or exit 2 at boot) with the
- *     environment as-is. Managers refuse to start until it is fixed or the
- *     operator explicitly overrides.
+ *     environment as-is, or (`workspace`) the layout asks an operator to say
+ *     so first. Managers refuse to start until it is fixed or the operator
+ *     explicitly overrides.
  *   - `warn`     — the spawn will work but something is degraded or
  *     approximate (stale bundle, literal secret in the spec, missing
  *     durability env).

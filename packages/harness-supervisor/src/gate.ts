@@ -23,7 +23,7 @@ import type { PortRequest } from "@crewhaus/preflight";
 import { MANAGER_HOOK_NAMES, readManagerSettings } from "./manager-settings";
 import { readHookRunLog } from "./prepare";
 import { recentRuns } from "./runfiles";
-import { type EnvFileRef, loadEnvChain } from "./spawn-contracts";
+import { type EnvFileRef, findHarnessRoot, loadEnvChain } from "./spawn-contracts";
 
 /**
  * What preflight should say about this harness's operator hooks.
@@ -126,7 +126,8 @@ export type RunGateOptions = GateOptions & {
 export async function runPreflightGate(options: RunGateOptions): Promise<GateDecision> {
   const run = options.preflight ?? runPreflight;
   const report = await run({
-    harnessDir: options.harnessDir,
+    // The directory the spawn runs in: `buildSpawnPlan` resolves the same root.
+    harnessDir: findHarnessRoot(options.harnessDir),
     env: options.env,
     envFiles: options.envFiles ?? loadEnvChain(options.harnessDir).refs,
     hooks: options.hooks ?? harnessHookDisclosures(options.harnessDir),

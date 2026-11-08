@@ -12,7 +12,7 @@
  * what the console renders.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -353,6 +353,122 @@ describe("process control", () => {
       expect(t.ops?.children.length ?? 0).toBe(0);
     } finally {
       await t.stop();
+    }
+  }, 20_000);
+
+  test("a harness directory holding the home directory answers 409 with an acknowledgeable item", async () => {
+    const home = mkdtempSync(join(tmpdir(), "hangar-holds-home-"));
+    const t = bootTestServer({ now: () => NOW, preflight: true, env: { HOME: home } });
+    try {
+      makeFixtureHarness(home, {
+        specName: "holds-home",
+        target: "channel",
+        bundle: { entry: "daemon.ts" },
+      });
+      const id = await register(t, home);
+
+      const refused = await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+      expect(refused.status).toBe(409);
+      expect(refused.body["reason"]).toBe("preflight-blocked");
+      const items = refused.body["refused"] as Array<{ id: string; acknowledgeable: boolean }>;
+      const item = items.find((i) => i.id === "workspace.holds-home");
+      expect(item?.acknowledgeable).toBe(true);
+      expect(t.ops?.children.length ?? 0).toBe(0);
+    } finally {
+      await t.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("Start anyway with the acknowledgement starts one child", async () => {
+    const home = mkdtempSync(join(tmpdir(), "hangar-holds-home-ack-"));
+    const t = bootTestServer({
+      now: () => NOW,
+      preflight: true,
+      env: {
+        HOME: home,
+        ANTHROPIC_API_KEY: "present",
+        HOLDS_HOME_SLACK_BOT_VALUE: "present",
+        HOLDS_HOME_SLACK_SIGNING_VALUE: "present",
+      },
+    });
+    try {
+      makeFixtureHarness(home, {
+        specName: "holds-home-ack",
+        target: "channel",
+        // A spec that COMPILES, so this finding is the only one standing.
+        noSpec: true,
+        bundle: { entry: "daemon.ts" },
+      });
+      writeFileSync(
+        join(home, "crewhaus.yaml"),
+        [
+          "name: holds-home-ack",
+          "target: channel",
+          "agent:",
+          "  model: anthropic/claude-sonnet-4",
+          "  instructions: |",
+          "    You are a fixture.",
+          "routing:",
+          "  sessionKey: channel",
+          "channels:",
+          "  slack:",
+          "    botToken: $HOLDS_HOME_SLACK_BOT_VALUE",
+          "    signingSecret: $HOLDS_HOME_SLACK_SIGNING_VALUE",
+          "",
+        ].join("\n"),
+      );
+      const id = await register(t, home);
+
+      const refused = await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+      expect(refused.status).toBe(409);
+      const items = refused.body["refused"] as Array<{ id: string }>;
+      expect(items.map((i) => i.id)).toEqual(["workspace.holds-home"]);
+
+      const started = await t.api(`/api/h/${id}/proc/start`, {
+        method: "POST",
+        body: JSON.stringify({ acknowledge: ["workspace.holds-home"] }),
+      });
+      expect(started.status).toBe(200);
+      expect(t.ops?.children.length ?? 0).toBe(1);
+    } finally {
+      await t.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("a row with no spec of its own is gated at the directory the spawn runs in", async () => {
+    const home = mkdtempSync(join(tmpdir(), "hangar-holds-home-row-"));
+    const t = bootTestServer({ now: () => NOW, preflight: true, env: { HOME: home } });
+    try {
+      makeFixtureHarness(home, {
+        specName: "holds-home-root",
+        target: "channel",
+        bundle: { entry: "daemon.ts" },
+      });
+      const row = makeFixtureHarness(join(home, "harnesses", "bot"), {
+        specName: "bot",
+        target: "channel",
+      });
+      const id = await register(t, row);
+      rmSync(join(row, "crewhaus.yaml"));
+
+      const refused = await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+      expect(refused.status).toBe(409);
+      const items = refused.body["refused"] as Array<{ id: string; message: string }>;
+      const item = items.find((i) => i.id === "workspace.holds-home");
+      expect(item?.message).toContain(`(${home})`);
+      expect(t.ops?.children.length ?? 0).toBe(0);
+
+      const spec = await t.api(`/api/h/${id}/proc/start`, {
+        method: "POST",
+        body: JSON.stringify({ acknowledge: ["spec.missing"] }),
+      });
+      expect(spec.status).toBe(409);
+      expect(t.ops?.children.length ?? 0).toBe(0);
+    } finally {
+      await t.stop();
+      rmSync(home, { recursive: true, force: true });
     }
   }, 20_000);
 
