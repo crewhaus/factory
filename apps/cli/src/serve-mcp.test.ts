@@ -8,6 +8,7 @@ import {
   assertToolsModeSatisfiable,
   buildMcpSubAgentDescriptors,
   filterChildTools,
+  isLoopbackRequest,
   resolveMcpToolsMode,
   resolveMcpTransport,
   resolveServePort,
@@ -24,6 +25,67 @@ describe("resolveMcpTransport", () => {
   });
   test("no flag + no expose block → stdio (the default projection)", () => {
     expect(resolveMcpTransport(false, undefined)).toBe("stdio");
+  });
+});
+
+describe("isLoopbackRequest", () => {
+  /** A request with exactly these headers; `Request` itself never adds a Host or an Origin. */
+  const request = (headers: Record<string, string>): Request =>
+    new Request("http://127.0.0.1:8000/", { method: "POST", headers });
+
+  test.each(["127.0.0.1:8000", "localhost:8000", "localhost", "[::1]:8000", "[::1]", "LOCALHOST"])(
+    "a Host of %s names this computer",
+    (host) => {
+      expect(isLoopbackRequest(request({ host }))).toBe(true);
+    },
+  );
+
+  test.each([
+    "other.example",
+    "other.example:8000",
+    "127.0.0.1.other.example",
+    "localhost.other.example",
+    "[::1].other.example",
+    "[::1",
+    "127.0.0.1:8000:9",
+    "localhost:8000, other.example",
+    "",
+  ])("a Host of '%s' does not", (host) => {
+    expect(isLoopbackRequest(request({ host }))).toBe(false);
+  });
+
+  test("a request with no Host at all does not", () => {
+    expect(request({}).headers.get("host")).toBeNull();
+    expect(isLoopbackRequest(request({}))).toBe(false);
+  });
+
+  test.each([
+    "http://127.0.0.1:1",
+    "http://localhost",
+    "http://localhost:3000",
+    "http://[::1]:3000",
+  ])("with a loopback Host, an Origin of %s names this computer", (origin) => {
+    expect(isLoopbackRequest(request({ host: "127.0.0.1:8000", origin }))).toBe(true);
+  });
+
+  test.each([
+    "https://other.example",
+    "http://127.0.0.1.other.example",
+    "http://localhost.other.example",
+    "null",
+    "not a url",
+  ])("with a loopback Host, an Origin of %s does not", (origin) => {
+    expect(isLoopbackRequest(request({ host: "127.0.0.1:8000", origin }))).toBe(false);
+  });
+
+  test("a loopback Host with no Origin is enough", () => {
+    expect(isLoopbackRequest(request({ host: "127.0.0.1:8000" }))).toBe(true);
+  });
+
+  test("a loopback Origin does not make up for another Host", () => {
+    expect(isLoopbackRequest(request({ host: "other.example", origin: "http://localhost" }))).toBe(
+      false,
+    );
   });
 });
 
@@ -113,5 +175,8 @@ describe("SERVE_MCP_USAGE", () => {
     expect(SERVE_MCP_USAGE).toContain("--mcp");
     expect(SERVE_MCP_USAGE).toContain("--sse");
     expect(SERVE_MCP_USAGE).toContain("--port");
+  });
+  test("says where --sse listens", () => {
+    expect(SERVE_MCP_USAGE).toContain("listens on this computer only");
   });
 });

@@ -34,6 +34,7 @@ export const SERVE_MCP_USAGE =
   "  --mcp        required — the projection kind (the only kind today).\n" +
   "  --sse        serve over HTTP+SSE (a `fetch` server on --port) instead of\n" +
   "               stdio; overrides the spec's `expose.mcp.transport`.\n" +
+  "               listens on this computer only.\n" +
   "  --port <n>   SSE listen port (default 8000, or CREWHAUS_MCP_PORT). Ignored\n" +
   "               for stdio.\n" +
   "  The tool projection follows the spec's `expose.mcp.tools` (default `chat` —\n" +
@@ -67,6 +68,21 @@ export function resolveMcpTransport(
   exposeTransport: McpTransportKind | undefined,
 ): McpTransportKind {
   return sseFlag || exposeTransport === "sse" ? "sse" : "stdio";
+}
+
+const LOOPBACK_NAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/** True when a request names this computer in its Host, and in its Origin when it sends one. */
+export function isLoopbackRequest(req: Request): boolean {
+  const name = (req.headers.get("host") ?? "").toLowerCase().replace(/:\d+$/, "");
+  if (!LOOPBACK_NAMES.has(name)) return false;
+  const origin = req.headers.get("origin");
+  if (origin === null) return true;
+  try {
+    return LOOPBACK_NAMES.has(new URL(origin).hostname.toLowerCase());
+  } catch {
+    return false; // `null` from a sandboxed page, or anything unparseable.
+  }
 }
 
 /**
