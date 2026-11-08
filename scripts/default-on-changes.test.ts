@@ -18,14 +18,14 @@
  * line 0.7.x did not print, every block the edge says it does not run
  * besides `provability:` itself, every kind of spelling FactCrossCheck
  * no longer reads the way 0.7.x did, and every shape whose daemon stops on an
- * unset tool-config variable with an exit code of its own, with that code, and
- * every `HarnessRegister` change it keeps to rows in its workspace, and every
- * leaf the optimizer refuses that 0.8.0 did not. A
- * change reverted or scoped to the block stops being found, and a new root,
- * tool, header line, edge warning, verdict that moved, stopping shape or refused
- * leaf fails until the notes name it. Each scan also
- * asserts it found something, so a scan that silently matches nothing fails
- * too.
+ * unset tool-config variable with an exit code of its own, with that code,
+ * every `HarnessRegister` change it keeps to rows in its workspace, every leaf
+ * the optimizer refuses that 0.8.0 did not, and the address
+ * `crewhaus serve --mcp --sse` listens on. A change reverted or scoped to the
+ * block stops being found, and a new root, tool, header line, edge warning,
+ * verdict that moved, stopping shape or refused leaf fails until the notes name
+ * it. Each scan also asserts it found something, so a scan that silently
+ * matches nothing fails too.
  *
  * The guard reads 0.8.0's list, under `PROVABILITY_HEADING`, and every later
  * release's list, under `DEFAULT_ON_HEADING`, which sits in `## [Unreleased]`
@@ -1090,6 +1090,27 @@ describe("the release notes name every change a harness without provability: see
     ]) {
       expect(bullets[0]).toContain(named);
     }
+  });
+
+  test("crewhaus serve --mcp --sse: the address it listens on and the requests it answers are named", () => {
+    // The serve block, from its function to the next one. A listener added to
+    // it, or either half of the change reverted, is found here.
+    const source = readFileSync(join(ROOT, "apps", "cli", "src", "index.ts"), "utf8");
+    const start = source.indexOf("async function runServeMcp(");
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf("\nasync function ", start + 1);
+    expect(end).toBeGreaterThan(start);
+    const block = source.slice(start, end);
+    expect(block.split("Bun.serve(")).toHaveLength(2);
+    const required = ['hostname: "127.0.0.1"', "isLoopbackRequest(req)"];
+    expect(required.filter((text) => !block.includes(text))).toEqual([]);
+    expect(block.includes("Bun.serve({ port, fetch")).toBe(false);
+    // Named in a later list, since 0.8.0 did not ship it.
+    const later = defaultOnBullets(changelog, LATER_HEADINGS);
+    const bullet = later.find((b) => b.includes("`crewhaus serve --mcp --sse`")) ?? "";
+    expect(bullet).toContain("`127.0.0.1`");
+    expect(bullet).toContain("`Host`");
+    expect(bullet).toContain("`Origin`");
   });
 
   test("FactCrossCheck: every kind of spelling whose verdict moved since 0.7.x is named", async () => {

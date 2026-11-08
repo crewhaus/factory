@@ -1518,6 +1518,7 @@ import {
   assertToolsModeSatisfiable,
   buildMcpSubAgentDescriptors,
   filterChildTools,
+  isLoopbackRequest,
   resolveMcpToolsMode,
   resolveMcpTransport,
   resolveServePort,
@@ -5867,9 +5868,16 @@ async function runServeMcp(args: ParsedArgs): Promise<void> {
       `[serve] MCP stdio server for "${cliIr.name}" ready (tools: ${toolsMode}) — add it to your MCP client's config\n`,
     );
   } else {
-    sseServer = Bun.serve({ port, fetch: (req) => handle.fetch(req) });
+    sseServer = Bun.serve({
+      port,
+      hostname: "127.0.0.1",
+      fetch: (req) =>
+        isLoopbackRequest(req)
+          ? handle.fetch(req)
+          : new Response("this server only answers on this computer", { status: 403 }),
+    });
     process.stdout.write(
-      `[serve] MCP SSE server for "${cliIr.name}" on http://localhost:${port} (tools: ${toolsMode}) — POST MCP requests to /\n`,
+      `[serve] MCP SSE server for "${cliIr.name}" on http://127.0.0.1:${port}, this computer only (tools: ${toolsMode}) — POST MCP requests to /\n`,
     );
   }
 
