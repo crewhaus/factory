@@ -6,6 +6,7 @@
   },
   "include": ["src/**/*"],
   "references": [
+    { "path": "../../packages/access-control" },
     { "path": "../../packages/adapter-anthropic" },
     { "path": "../../packages/adapter-bedrock" },
     { "path": "../../packages/adapter-gemini" },

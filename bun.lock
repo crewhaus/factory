@@ -19,6 +19,7 @@
         "crewhaus": "src/index.ts",
       },
       "dependencies": {
+        "@crewhaus/access-control": "workspace:*",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
@@ -230,6 +231,18 @@
     "packages/abort-controller": {
       "name": "@crewhaus/abort-controller",
       "version": "0.8.0",
+    },
+    "packages/access-control": {
+      "name": "@crewhaus/access-control",
+      "version": "0.8.0",
+      "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/spec-patch": "workspace:*",
+      },
     },
     "packages/adapter-anthropic": {
       "name": "@crewhaus/adapter-anthropic",
@@ -3942,6 +3955,8 @@
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
+
+    "@crewhaus/access-control": ["@crewhaus/access-control@workspace:packages/access-control"],
 
     "@crewhaus/adapter-anthropic": ["@crewhaus/adapter-anthropic@workspace:packages/adapter-anthropic"],
 

@@ -23620,6 +23620,24 @@ switch (subcommand) {
     }
     break;
   }
+  case "access": {
+    // Who may use this Home: members, roles, invites, links and service tokens,
+    // in direct mode. The verbs read and write the access records under the
+    // Hangar root themselves, so they work with Home stopped. Heavy lifting
+    // lives in the side-effect-free ./access-cmd module (this entry file runs
+    // an argv switch on import); it throws plain Errors on bad arguments,
+    // routed through die() like `daemon`.
+    try {
+      const { runAccessCommand } = await import("./access-cmd");
+      const out = await runAccessCommand(rest);
+      for (const line of out.lines) process.stdout.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "knowledge": {
     // Item 63 — cross-harness knowledge sync (memories/graders/prompts).
     const action = rest[0] ?? "";
