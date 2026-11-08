@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-money",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "type": "module",
   "description": "Deterministic money tools: payment identifier checksums, tax, refund allocation, three-way match, cost basis, spend controls and statement parsing",
   "main": "src/index.ts",

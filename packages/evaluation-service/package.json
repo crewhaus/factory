@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/evaluation-service",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "type": "module",
   "description": "The composition root for in-loop gates: wireEvaluation builds the evaluation judge and the provability gate for every emitter and the interpreter",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-fsx",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "type": "module",
   "description": "Deterministic filesystem tools beyond read and write: trees, stats, hashes, copies, moves, archives, frontmatter and notebooks",
   "main": "src/index.ts",

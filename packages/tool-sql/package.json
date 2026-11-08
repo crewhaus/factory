@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-sql",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "type": "module",
   "description": "Deterministic SQL tools over SQLite: queries, schema introspection, migrations, import and export",
   "main": "src/index.ts",

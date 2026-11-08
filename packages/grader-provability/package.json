@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/grader-provability",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "type": "module",
   "description": "Deterministic eval graders over proof bundles: claim coverage, rung achieved, citation validity, assumption rate, replay integrity, cost per proven claim",
   "main": "src/index.ts",

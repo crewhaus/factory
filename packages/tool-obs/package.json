@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-obs",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "type": "module",
   "description": "Deterministic observability tools: query traces, logs, metrics and costs, evaluate service levels and assemble incident reports",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-categories",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "type": "module",
   "description": "The builtin tool table, the per-shape tool profiles and resolver, the category registry, and the all-<category> / -<tool> selector grammar a spec's tools: list accepts",
   "main": "src/index.ts",
