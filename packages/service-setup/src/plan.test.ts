@@ -1094,9 +1094,11 @@ describe("applySlack", () => {
       `https://${HOSTNAME}/crewhaus/oauth/callback`,
     ]);
 
-    // The authorize URL carries the state token the responder checks.
+    // The authorize URL carries the state the responder checks.
     expect(io.opened).toHaveLength(1);
-    expect(io.opened[0]).toContain("state=crewhaus-services-setup");
+    const openedState = new URL(io.opened[0] ?? "").searchParams.get("state");
+    expect(openedState).toMatch(/^[0-9a-f]{32}$/);
+    expect(responder.startCalls[0]?.expectedState).toBe(openedState ?? "");
     expect(io.opened[0]).toContain("client_id=111.222");
 
     const exchange = calls.find((c) => c.path.endsWith("oauth.v2.access"));
@@ -1306,10 +1308,38 @@ describe("applySlack", () => {
         port: 4321,
         eventsPath: "/slack/events",
         callbackPath: "/crewhaus/oauth/callback",
-        expectedState: "crewhaus-services-setup",
+        expectedState: expect.stringMatching(/^[0-9a-f]{32}$/),
       },
     ]);
     expect(io.infos.join("\n")).toContain("stand-in listener on :4321");
+  });
+
+  test("two runs make two different OAuth states", async () => {
+    const states: (string | null)[] = [];
+    for (const envFile of [envPath(), `${envPath()}.second`]) {
+      const { fetchImpl } = router({
+        "POST /api/apps.manifest.validate": slackOk({}),
+        "POST /api/apps.manifest.create": CREATED_APP,
+        "POST /api/oauth.v2.access": slackOk({
+          access_token: BOT_TOKEN,
+          team: { id: "T0ACME", name: "Acme" },
+          scope: "chat:write",
+        }),
+      });
+      const responder = fakeResponder();
+      const io = testIo({ withOpenUrl: true });
+      await applySlack(
+        slackContext(fetchImpl, {}, io, { start: responder.start }),
+        HOSTNAME,
+        envFile,
+      );
+      const opened = new URL(io.opened[0] ?? "").searchParams.get("state");
+      expect(responder.startCalls[0]?.expectedState).toBe(opened ?? "");
+      states.push(opened);
+    }
+    expect(states[0]).toMatch(/^[0-9a-f]{32}$/);
+    expect(states[1]).toMatch(/^[0-9a-f]{32}$/);
+    expect(states[0]).not.toBe(states[1]);
   });
 
   test("the responder is stopped in a finally even when a later step throws", async () => {

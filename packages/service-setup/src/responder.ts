@@ -29,10 +29,12 @@
  * Security posture: the responder answers only two paths, echoes only the
  * challenge string Slack sent, holds the OAuth `code` in memory for a single
  * exchange, and is closed in a `finally`. It never writes to disk and never
- * logs a request body.
+ * logs a request body. A callback without this run's `state` gets a 400 and
+ * the install keeps waiting for the real one. Stopping it ends any connection
+ * still open, so the run's result does not wait on one.
  */
 import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
-import { createConnection } from "node:net";
+import { type Socket, createConnection } from "node:net";
 
 /** How a request was answered — surfaced so setup can report what Slack did. */
 export type ResponderEvent =
@@ -49,7 +51,10 @@ export type ResponderOptions = {
   readonly eventsPath?: string;
   /** Path the OAuth redirect lands on. */
   readonly callbackPath?: string;
-  /** The `state` value the authorize URL carried, checked on callback. */
+  /**
+   * The `state` value the authorize URL carried. The callback checks it before
+   * anything else; a request that fails answers 400 and ends nothing.
+   */
   readonly expectedState?: string;
 };
 
@@ -114,6 +119,13 @@ export function startResponder(opts: ResponderOptions): Promise<Responder> {
     });
   });
 
+  // Tracked so stop() can end each one itself.
+  const sockets = new Set<Socket>();
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", `http://${host}`);
 
@@ -122,17 +134,19 @@ export function startResponder(opts: ResponderOptions): Promise<Responder> {
       const code = url.searchParams.get("code");
       const state = url.searchParams.get("state");
 
+      // The state check comes first, and a request that fails it ends nothing:
+      // this listener sits on a public hostname while the operator is mid-install.
+      if (opts.expectedState !== undefined && state !== opts.expectedState) {
+        // One event however many requests fail: the array lives for the whole wait.
+        if (!events.some((e) => e.kind === "oauth-error")) {
+          events.push({ kind: "oauth-error", at: Date.now(), error: "OAuth state mismatch" });
+        }
+        respondHtml(res, 400, "Unexpected callback", "This request was ignored.");
+        return;
+      }
       if (error !== null) {
         finishOauth(undefined, new Error(`Slack returned "${error}" — the install was declined`));
         respondHtml(res, 400, "Install declined", "You can close this tab and re-run setup.");
-        return;
-      }
-      if (opts.expectedState !== undefined && state !== opts.expectedState) {
-        // A mismatched state means this redirect did not originate from the
-        // authorize URL we built. Refuse it rather than exchanging a code of
-        // unknown provenance.
-        finishOauth(undefined, new Error("OAuth state mismatch — refusing the callback"));
-        respondHtml(res, 400, "Unexpected callback", "You can close this tab and re-run setup.");
         return;
       }
       if (code === null || code === "") {
@@ -216,9 +230,11 @@ export function startResponder(opts: ResponderOptions): Promise<Responder> {
         stop: () =>
           new Promise<void>((done) => {
             server.close(() => done());
-            // A browser keep-alive socket would otherwise hold the port past
-            // close(), and the daemon needs it back immediately.
+            // The daemon needs the port back and the run's result waits on this
+            // promise, so stop() ends each open connection itself: a browser
+            // keep-alive socket, or a request whose body is still arriving.
             server.closeAllConnections?.();
+            for (const socket of sockets) socket.destroy();
           }),
       });
     });
