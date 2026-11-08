@@ -19,4 +19,9 @@ The version bump in a release moves no digest: `compile()` emits no `package.jso
 
 ## Delta notes
 
-None yet.
+**Managed secret delta — `managed`'s `daemon.ts` only.** A generated signing secret is saved to
+`.crewhaus/run/gateway-jwt-secret` (0600), beside a `.gitignore` holding `*`, and the log names the
+path; the imports gain `lstatSync`, `mkdirSync`, `rmSync`, `writeFileSync` and `dirname`. The boot
+lines about where `CREWHAUS_TENANTS_ROOT` belongs are emitted only for a spec that declares a tool that
+may work on files, or `provability:`, and the managed spec here declares neither. No other digest
+moves.

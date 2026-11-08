@@ -407,7 +407,12 @@ describe("GET /api/runs/:id/proof — spec directories and the managed shape", (
     expect(String(none.body["error"])).toContain(
       "a managed harness files its bundles under its tenants root",
     );
-    expect(String(none.body["error"])).toContain(`crewhaus provability show --session ${SESS}`);
+    // The twin names the root it reads, and the answer sends no one back inside.
+    expect(String(none.body["error"])).toContain(
+      `crewhaus provability show --session ${SESS} --tenants-root '${outside}'`,
+    );
+    expect(String(none.body["error"])).not.toContain("set CREWHAUS_TENANTS_ROOT");
+    expect(String(none.body["error"])).not.toContain("inside it");
     expect(JSON.stringify(none.body)).not.toContain('"bundle"');
 
     // With a bundle elsewhere the answer is a 200 that still names the unread root.
