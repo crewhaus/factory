@@ -114,6 +114,13 @@ jobs:
           bun scripts/release-prep.ts --version 0.0.0-ci --for-publish
           bun scripts/publish-workspace.ts --dry-run --no-registry
 
+      - name: Node load smoke
+        # Every package that declares engines.node, packed with its internal
+        # closure, installed into a temp project and loaded and type-checked
+        # under the Node set up above. Over the tree the pack pre-flight built
+        # and stamped.
+        run: bun scripts/node-load-smoke.ts
+
   # HM-188 — the harness manager's process layer, executed on Windows.
   #
   # `createWindowsProcessOps` (PowerShell `Get-Process` for liveness and start

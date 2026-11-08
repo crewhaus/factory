@@ -27,6 +27,9 @@ import { join } from "node:path";
 import {
   type ViewResult,
   classifyViewFailure,
+  distTagProblems,
+  firstPublishRefusal,
+  hasPrereleasePart,
   mapPool,
   npmErrorCode,
   npmPackList,
@@ -35,9 +38,11 @@ import {
   packedContentsProblems,
   parsePackJson,
   rerunAdvice,
+  splitFirstPublish,
   toViewResult,
   unmetDependencies,
   versionState,
+  whoamiOf,
 } from "./publish-workspace";
 
 const SCRIPT = join(import.meta.dir, "publish-workspace.ts");
@@ -347,7 +352,16 @@ const fail = (code) => {
 };
 if (args[0] === "--fake-probe") { process.stdout.write("FAKE-NPM"); process.exit(0); }
 if (args[0] === "--version") { process.stdout.write("11.0.0-fake\\n"); process.exit(0); }
-if (args[0] === "whoami") { process.stdout.write("fake-user\\n"); process.exit(0); }
+if (args[0] === "whoami") {
+  // A failing whoami also prints the token it was given, as a careless npm could:
+  // a run that relays whoami's raw output puts it in the log.
+  if (cfg.whoamiError) {
+    process.stderr.write("npm error code " + cfg.whoamiError + "\\nnpm error token " + (process.env.NPM_TOKEN || "") + "\\n");
+    process.exit(1);
+  }
+  process.stdout.write("fake-user\\n");
+  process.exit(0);
+}
 if (args[0] === "view") {
   const spec = args[1];
   if (cfg.viewError) fail(cfg.viewError);
@@ -413,11 +427,15 @@ type FakeNpm = {
   persist?: boolean;
   /** Package names whose `npm pack` fails. */
   failPack?: string[];
+  /** `npm whoami` fails with this code (and prints $NPM_TOKEN on stderr). */
+  whoamiError?: string;
 };
 
 type PkgSpec = {
   name: string;
   dir: string;
+  /** The stamped version; V when absent. */
+  version?: string;
   deps?: Record<string, string>;
   optionalDeps?: Record<string, string>;
   /** Files to leave out of the package dir. */
@@ -443,7 +461,7 @@ function makeWorkspace(pkgs: PkgSpec[]): string {
       join(dir, "package.json"),
       JSON.stringify({
         name: spec.name,
-        version: V,
+        version: spec.version ?? V,
         type: "module",
         main: "dist/index.js",
         files: spec.files ?? ["dist", "README.md", "LICENSE", "NOTICE"],
@@ -476,7 +494,11 @@ function isolatedNpmConfig(root: string): Record<string, string> {
 }
 
 /** `cfg: null` keeps the fake registry's state from the previous run. */
-function childEnv(root: string, cfg: FakeNpm | null): Record<string, string> {
+function childEnv(
+  root: string,
+  cfg: FakeNpm | null,
+  extra: Record<string, string> = {},
+): Record<string, string> {
   const cfgPath = join(root, "fake-npm.json");
   if (cfg !== null) writeFileSync(cfgPath, JSON.stringify(cfg));
   const log = join(root, "npm-calls.log");
@@ -491,11 +513,22 @@ function childEnv(root: string, cfg: FakeNpm | null): Record<string, string> {
     REAL_NPM: REAL_NPM ?? "",
     ...isolatedNpmConfig(root),
     npm_config_registry: DEAD_REGISTRY,
+    ...extra,
   };
 }
 
 function run(root: string, cfg: FakeNpm | null, ...flags: string[]) {
-  const env = childEnv(root, cfg);
+  return runWith(root, cfg, {}, ...flags);
+}
+
+/** run(), with variables added to the child's from-scratch environment. */
+function runWith(
+  root: string,
+  cfg: FakeNpm | null,
+  extra: Record<string, string>,
+  ...flags: string[]
+) {
+  const env = childEnv(root, cfg, extra);
   // Lock 1: the npm the script will spawn is the fake.
   const probe = Bun.spawnSync(["npm", "--fake-probe"], { env, cwd: root });
   expect(probe.stdout.toString()).toBe("FAKE-NPM");
@@ -829,6 +862,317 @@ withNpm(
   },
   RUN_BUDGET,
 );
+
+// ─── dist tags: a prerelease publishes only under `next` ──────────────────────
+
+const RC = "0.9.0-rc.1";
+const publishCalls = (calls: string[][]) => calls.filter((a) => a[0] === "publish");
+
+withNpm(
+  "a release candidate with --dist-tag next gives every npm publish --tag next",
+  () => {
+    const root = makeWorkspace([
+      { ...A, version: RC },
+      { ...D, version: RC },
+    ]);
+    const r = run(root, {}, "--dist-tag", "next");
+    expect(r.stderr).toBe("");
+    expect(r.exitCode).toBe(0);
+    const publishes = publishCalls(r.calls);
+    expect(publishes).toHaveLength(2);
+    for (const argv of publishes) {
+      const i = argv.indexOf("--tag");
+      expect(i).toBeGreaterThan(-1);
+      expect(argv[i + 1]).toBe("next");
+    }
+  },
+  RUN_BUDGET,
+);
+
+withNpm(
+  "a release candidate without --dist-tag is refused before anything is asked or published",
+  () => {
+    const root = makeWorkspace([
+      { ...A, version: RC },
+      { ...D, version: RC },
+    ]);
+    for (const flags of [[], ["--dry-run"], ["--filter", "@crewhaus/zz-a"]]) {
+      const r = run(root, {}, ...flags);
+      expect(r.exitCode).toBe(1);
+      expect(publishCalls(r.calls)).toEqual([]);
+      // Refused over the discovered packages, before the registry or npm pack.
+      expect(r.calls.filter((a) => a[0] === "view" || a[0] === "pack")).toEqual([]);
+      expect(r.stderr).toContain(`@crewhaus/zz-a@${RC} (and 1 more) is a prerelease`);
+      expect(r.stderr).toContain("--dist-tag next");
+      expect(r.stderr).toContain("Nothing was published.");
+    }
+  },
+  RUN_BUDGET,
+);
+
+withNpm(
+  "a final version publishes without a tag, and refuses --dist-tag",
+  () => {
+    const root = makeWorkspace([{ ...D, version: "0.9.0" }]);
+    const plain = run(root, {});
+    expect(plain.exitCode).toBe(0);
+    const [argv] = publishCalls(plain.calls);
+    expect(argv).toBeDefined();
+    expect(argv).not.toContain("--tag");
+
+    const tagged = run(root, {}, "--dist-tag", "next");
+    expect(tagged.exitCode).toBe(1);
+    expect(publishCalls(tagged.calls)).toEqual([]);
+    expect(tagged.stderr).toContain(
+      "--dist-tag next was given, but @crewhaus/zz-d@0.9.0 is a final version",
+    );
+    expect(tagged.stderr).toContain("drop --dist-tag");
+  },
+  RUN_BUDGET,
+);
+
+withNpm(
+  "next is the only dist tag taken, on every form",
+  () => {
+    const root = makeWorkspace([{ ...D, version: RC }]);
+    for (const flags of [
+      ["--dist-tag", "latest"],
+      ["--dist-tag", "beta", "--dry-run"],
+      ["--dry-run", "--no-registry", "--dist-tag", "latest"],
+      ["--dist-tag"],
+    ]) {
+      const r = run(root, {}, ...flags);
+      expect(r.exitCode).toBe(1);
+      expect(publishCalls(r.calls)).toEqual([]);
+      expect(r.stderr).toContain("the one dist tag a release publishes under is next");
+    }
+  },
+  RUN_BUDGET,
+);
+
+withNpm(
+  "CI's pack pre-flight: a tree stamped 0.0.0-ci passes --dry-run --no-registry without a dist tag",
+  () => {
+    const root = makeWorkspace([
+      { ...A, version: "0.0.0-ci" },
+      { ...B, version: "0.0.0-ci", deps: { "@crewhaus/zz-a": "0.0.0-ci" } },
+    ]);
+    const r = run(root, {}, "--dry-run", "--no-registry");
+    expect(r.stderr).toBe("");
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "@crewhaus/zz-a@0.0.0-ci (and 1 more) is a prerelease; no registry, so no dist tag is needed.",
+    );
+    expect(r.stdout).toContain("First-publish preflight skipped (--no-registry)");
+    expect(r.calls.filter((a) => a[0] === "whoami" || a[0] === "view")).toEqual([]);
+    // A tag on a final version is still refused there.
+    const final = makeWorkspace([{ ...D, version: "0.9.0" }]);
+    const tagged = run(final, {}, "--dry-run", "--no-registry", "--dist-tag", "next");
+    expect(tagged.exitCode).toBe(1);
+    expect(tagged.stderr).toContain("is a final version");
+  },
+  RUN_BUDGET,
+);
+
+test("hasPrereleasePart and distTagProblems, unit", () => {
+  expect(hasPrereleasePart("0.9.0-rc.1")).toBe(true);
+  expect(hasPrereleasePart("0.0.0-ci")).toBe(true);
+  expect(hasPrereleasePart("0.9.0")).toBe(false);
+  expect(hasPrereleasePart("0.9.0+build.1")).toBe(false);
+  const pre = [{ name: "@crewhaus/a", version: RC }];
+  const fin = [{ name: "@crewhaus/a", version: "0.9.0" }];
+  expect(distTagProblems(pre, "next", false)).toEqual({ problems: [], notes: [] });
+  expect(distTagProblems(fin, undefined, false)).toEqual({ problems: [], notes: [] });
+  expect(distTagProblems(pre, undefined, false).problems).toHaveLength(1);
+  expect(distTagProblems(pre, undefined, true)).toEqual({
+    problems: [],
+    notes: [`@crewhaus/a@${RC} is a prerelease; no registry, so no dist tag is needed.`],
+  });
+  expect(distTagProblems(fin, "next", true).problems).toHaveLength(1);
+});
+
+// ─── the first-publish preflight ──────────────────────────────────────────────
+// OIDC cannot publish a name the registry has never seen, so a run that must
+// create one needs a working token, and without one it publishes nothing at all.
+
+/** A secret-shaped value, built from parts so no literal of its shape is committed. */
+const FAKE_TOKEN = ["npm", "_", "Zx9Q", "fixture", "000", "only"].join("");
+const OIDC_ENV = { ACTIONS_ID_TOKEN_REQUEST_URL: "http://127.0.0.1:9/oidc" };
+
+withNpm(
+  "new names and no working token: every form stops before npm pack or any publish, and names them, sorted",
+  () => {
+    // Discovered in directory order zz-d, zz-a, zz-b, cli; reported sorted.
+    const root = makeWorkspace([D, A, B, CLI]);
+    const forms: Array<{ flags: string[]; env: Record<string, string> }> = [
+      { flags: ["--dry-run"], env: {} },
+      { flags: [], env: {} },
+      { flags: [], env: OIDC_ENV },
+      { flags: ["--dry-run"], env: OIDC_ENV },
+    ];
+    for (const form of forms) {
+      const r = runWith(
+        root,
+        { whoamiError: "E401" },
+        { NPM_TOKEN: FAKE_TOKEN, ...form.env },
+        ...form.flags,
+      );
+      expect({ form, exitCode: r.exitCode }).toEqual({ form, exitCode: 1 });
+      expect(publishCalls(r.calls)).toEqual([]);
+      expect(r.calls.filter((a) => a[0] === "pack")).toEqual([]);
+      expect(r.calls.filter((a) => a[0] === "whoami")).toHaveLength(1);
+      expect(r.stderr).toContain(
+        "✗ 4 new package names need their first publish, and no working npm token is set. Nothing was published.",
+      );
+      expect(r.stderr).toContain("USER ACTION REQUIRED (credential)");
+      expect(r.stderr).toContain("save it as the NPM_TOKEN repository secret");
+      expect(r.stderr).toContain(
+        "  New names: @crewhaus/zz-a, @crewhaus/zz-b, @crewhaus/zz-d, crewhaus\n",
+      );
+      expect(r.stderr).toContain("npm whoami exited 1 with code E401");
+      // The fake printed the token on whoami's stderr; none of it reaches the log.
+      expect(r.stdout).not.toContain(FAKE_TOKEN);
+      expect(r.stderr).not.toContain(FAKE_TOKEN);
+      expect(r.stderr).not.toContain("npm error token");
+    }
+  },
+  RUN_BUDGET,
+);
+
+withNpm(
+  "every name already known: the token is not needed, and OIDC publishes as before",
+  () => {
+    const root = makeWorkspace([A, B, CLI]);
+    const repos = Object.fromEntries(
+      [A, B, CLI].map((p) => [p.name, { url: REPO_URL, directory: `packages/${p.dir}` }]),
+    );
+    const r = runWith(root, { repos, whoamiError: "E401" }, { ...OIDC_ENV });
+    expect(r.stderr).toBe("");
+    expect(r.exitCode).toBe(0);
+    expect(r.calls.filter((a) => a[0] === "whoami")).toEqual([]);
+    expect(publishedNames(r.stdout)).toEqual(["@crewhaus/zz-a", "@crewhaus/zz-b", "crewhaus"]);
+    for (const argv of publishCalls(r.calls)) expect(argv).toContain("--provenance");
+  },
+  RUN_BUDGET,
+);
+
+withNpm(
+  "a name the registry could not answer about needs the token too, and is named with npm's code",
+  () => {
+    const root = makeWorkspace([{ name: "@crewhaus/tool-fs", dir: "tool-fs" }]);
+    const r = runWith(root, { viewError: "E429", whoamiError: "E401" }, OIDC_ENV, "--dry-run");
+    expect(r.exitCode).toBe(1);
+    expect(publishCalls(r.calls)).toEqual([]);
+    expect(r.stderr).toContain(
+      "✗ 1 package name could not be checked on the registry, and no working npm token is set. Nothing was published.",
+    );
+    expect(r.stderr).toContain(
+      "  Could not be checked (npm's error code): @crewhaus/tool-fs (E429)",
+    );
+    expect(r.stderr).not.toContain("New names:");
+  },
+  RUN_BUDGET,
+);
+
+withNpm(
+  "with a working token the preflight says so once, and the run goes on",
+  () => {
+    const root = makeWorkspace([A, B, CLI, D]);
+    const r = runWith(root, {}, { NPM_TOKEN: FAKE_TOKEN });
+    expect(r.stderr).toBe("");
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("✓ A working npm token covers the first publish of 4 name(s).");
+    // Asked once on the token path: the preflight reused the up-front answer.
+    expect(r.calls.filter((a) => a[0] === "whoami")).toHaveLength(1);
+    expect(publishedNames(r.stdout).sort()).toEqual([
+      "@crewhaus/zz-a",
+      "@crewhaus/zz-b",
+      "@crewhaus/zz-d",
+      "crewhaus",
+    ]);
+  },
+  RUN_BUDGET,
+);
+
+withNpm(
+  "each ownership lookup is asked once per package, before npm pack, and the guard reads it",
+  () => {
+    const root = makeWorkspace([A, B, CLI, D]);
+    const r = run(root, {}, "--dry-run");
+    expect(r.exitCode).toBe(0);
+    const lookups = r.calls
+      .filter((a) => a[0] === "view" && a[2] === "repository")
+      .map((a) => a[1]);
+    expect(lookups.sort()).toEqual([
+      "@crewhaus/zz-a",
+      "@crewhaus/zz-b",
+      "@crewhaus/zz-d",
+      "crewhaus",
+    ]);
+    const firstPack = r.calls.findIndex((a) => a[0] === "pack");
+    const lastLookup = r.calls.findLastIndex((a) => a[0] === "view" && a[2] === "repository");
+    expect(firstPack).toBeGreaterThan(-1);
+    expect(lastLookup).toBeLessThan(firstPack);
+    // And a mismatching owner is still refused per package, from that one answer.
+    const hijack = run(
+      root,
+      {
+        repos: {
+          "@crewhaus/zz-d": { url: "git+https://github.com/someone/else.git", directory: "" },
+        },
+      },
+      "--dry-run",
+    );
+    expect(hijack.exitCode).toBe(1);
+    expect(hijack.stderr).toContain("this npm name appears to belong to a DIFFERENT package");
+    expect(
+      hijack.calls.filter(
+        (a) => a[0] === "view" && a[1] === "@crewhaus/zz-d" && a[2] === "repository",
+      ),
+    ).toHaveLength(1);
+  },
+  RUN_BUDGET,
+);
+
+test("firstPublishRefusal and splitFirstPublish, unit", () => {
+  const split = splitFirstPublish([
+    { name: "@crewhaus/c", result: view(1, E404_JSON) },
+    { name: "@crewhaus/known", result: view(0, '{"url":"x"}') },
+    { name: "@crewhaus/a", result: view(1, "", "npm error code E404\n") },
+    { name: "@crewhaus/z", result: view(1, "", "npm error code E500\n") },
+    { name: "@crewhaus/b", result: view(1, E404_JSON) },
+    {
+      name: "@crewhaus/y",
+      result: view(undefined, "", "", { error: { code: "ENOENT", message: "x" } }),
+    },
+  ]);
+  expect(split).toEqual({
+    fresh: ["@crewhaus/a", "@crewhaus/b", "@crewhaus/c"],
+    unknown: [
+      { name: "@crewhaus/y", code: "npm could not be run (ENOENT)" },
+      { name: "@crewhaus/z", code: "E500" },
+    ],
+  });
+  const lines = firstPublishRefusal(
+    { fresh: ["@crewhaus/a", "@crewhaus/b", "@crewhaus/c"], unknown: [] },
+    "npm whoami exited 1 with code E401",
+  );
+  expect(lines.slice(0, 5)).toEqual([
+    "✗ 3 new package names need their first publish, and no working npm token is set. Nothing was published.",
+    "  USER ACTION REQUIRED (credential): create a granular npm access token (read and write, bypass 2FA)",
+    "  for the @crewhaus scope and the crewhaus package, save it as the NPM_TOKEN repository secret,",
+    "  then re-run this job.",
+    "  New names: @crewhaus/a, @crewhaus/b, @crewhaus/c",
+  ]);
+  expect(firstPublishRefusal({ fresh: ["@crewhaus/a"], unknown: [] }, "x")[0]).toBe(
+    "✗ 1 new package name needs its first publish, and no working npm token is set. Nothing was published.",
+  );
+  expect(whoamiOf(view(0, "someone\n"))).toEqual({ ok: true, user: "someone" });
+  expect(whoamiOf(view(1, "", `npm error code E401\nnpm error ${FAKE_TOKEN}\n`))).toEqual({
+    ok: false,
+    why: "npm whoami exited 1 with code E401",
+  });
+});
 
 // ─── packed contents ──────────────────────────────────────────────────────────
 
@@ -1316,20 +1660,34 @@ test("with no npm on PATH every form stops once and says so", () => {
 // in-process registry, under --dry-run (nothing is ever published), with npm's
 // config pointed away from the developer's own.
 
-async function runWithRealNpm(root: string, status: number) {
+/**
+ * `withToken`: the user npmrc carries a fixture token for the local registry, which
+ * answers `npm whoami` with a user. Without it real npm has no credential and its
+ * whoami fails the way CI's does when NPM_TOKEN is unset.
+ */
+async function runWithRealNpm(root: string, status: number, withToken = true) {
   const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
-    fetch: () =>
-      status === 404
-        ? Response.json({ error: "Not found" }, { status: 404 })
-        : new Response("upstream down", { status }),
+    fetch: (req) =>
+      new URL(req.url).pathname === "/-/whoami"
+        ? Response.json({ username: "fixture-user" })
+        : status === 404
+          ? Response.json({ error: "Not found" }, { status: 404 })
+          : new Response("upstream down", { status }),
   });
   try {
+    const npmConfig = isolatedNpmConfig(root);
+    if (withToken) {
+      writeFileSync(
+        npmConfig.npm_config_userconfig as string,
+        `//127.0.0.1:${server.port}/:_authToken=${["fixture", "token", "for", "tests"].join("-")}\n`,
+      );
+    }
     const env: Record<string, string> = {
       PATH: process.env.PATH ?? "",
       HOME: root,
-      ...isolatedNpmConfig(root),
+      ...npmConfig,
       npm_config_registry: `http://127.0.0.1:${server.port}/`,
       npm_config_fetch_retries: "0",
     };
@@ -1364,7 +1722,24 @@ withNpm(
     const free = await runWithRealNpm(root, 404);
     expect(free.stderr).toBe("");
     expect(free.exitCode).toBe(0);
+    expect(free.stdout).toContain("✓ A working npm token covers the first publish of 1 name(s).");
     expect(free.stdout).toContain("Published: 1  Skipped: 0  Failed: 0");
+  },
+  60_000,
+);
+
+withNpm(
+  "with the real npm and no token: a first publish is refused up front, with npm's own whoami code",
+  async () => {
+    const root = makeWorkspace([{ name: "@crewhaus/tool-fs", dir: "tool-fs" }]);
+    const r = await runWithRealNpm(root, 404, false);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain(
+      "✗ 1 new package name needs its first publish, and no working npm token is set. Nothing was published.",
+    );
+    expect(r.stderr).toContain("  New names: @crewhaus/tool-fs\n");
+    expect(r.stderr).toContain("npm whoami exited 1 with code ENEEDAUTH");
+    expect(r.stdout).not.toContain("Published:");
   },
   60_000,
 );

@@ -702,6 +702,7 @@ describe("hangar serve --smoke", () => {
     expect(stdout).toContain("smoke: booted http://127.0.0.1:");
     expect(stdout).toContain("✓ GET /healthz answers ok");
     expect(stdout).toContain("✓ GET / serves the embedded UI shell");
+    expect(stdout).toContain("✓ every embedded console file serves with its content type");
     expect(stdout).toContain("✓ GET /api/harnesses with the bearer token answers 200 JSON");
     expect(stdout).toContain("✓ GET /api/harnesses without a token is refused (401)");
     expect(stdout).toContain("smoke: all checks passed");

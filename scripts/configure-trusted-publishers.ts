@@ -42,6 +42,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { isPublishableManifest } from "./publishable.ts";
 
 const args = process.argv.slice(2);
 const has = (n: string) => args.includes(`--${n}`);
@@ -92,7 +93,8 @@ type Pkg = { name: string; dir: string };
 
 /**
  * Discovered from the workspace globs — the same source of truth publish-workspace.ts
- * uses — so the trust list cannot drift from the publish list. A hand-maintained list
+ * uses, and filtered by the same rule (./publishable.ts) — so the trust list cannot
+ * drift from the publish list. A hand-maintained list
  * would silently miss a new package, and a package with no trusted publisher falls
  * back to token auth, which is exactly what this migration removes.
  */
@@ -112,7 +114,7 @@ function discoverPackages(): Pkg[] {
         name?: string;
         private?: boolean;
       };
-      if (j.private === true || typeof j.name !== "string") continue;
+      if (!isPublishableManifest(j)) continue;
       out.push({ name: j.name, dir });
     }
   }
