@@ -28,6 +28,16 @@
  *   `bunfig.toml` and `.npmrc` there.
  * - A managed run's whole tenants root, and the approvals file beside session
  *   logs that a session directory puts at the working directory.
+ * - In a harness's own directory, what its next start runs. Each test here is
+ *   the weakest that matches what it protects ({@link Standing}): a directory
+ *   that holds a spec keeps `dist`, `build` and `node_modules` as generated
+ *   trees; a compiled non-interactive bundle running from there also keeps the
+ *   spec and the root `package.json`, `tsconfig.json` and `jsconfig.json`; a
+ *   bundle started from inside its own directory keeps its code files, its
+ *   manifest and lockfile, its dependencies and the spec's names; a compiled
+ *   non-interactive bundle in a directory below keeps that directory and what
+ *   lies between it and the working directory. A plain project, a project under
+ *   another harness and an interactive target keep editing their own files.
  *
  * CrewHaus's own code still writes all of them; the floor applies to tool
  * calls only.
@@ -40,7 +50,7 @@
  * operative arguments carries, and what the floor compares a directory the
  * call acts beneath with).
  */
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DEFAULT_ROOT_DIR } from "@crewhaus/event-log";
 import { hangarStateRoots, registryStateFiles } from "@crewhaus/harness-registry";
@@ -88,6 +98,66 @@ const ENV_FILES: readonly string[] = [
 
 /** What Bun and npm read from the working directory of any process. */
 const START_CONFIG: readonly string[] = ["bunfig.toml", ".npmrc"];
+
+/** The names a spec goes by at a harness's root. */
+const SPEC_NAMES: readonly string[] = ["crewhaus.yaml", "crewhaus.yml"];
+
+/** The trees `crewhaus compile` and a package manager generate at a harness's root. */
+const INSTALLED_TREES: readonly string[] = ["dist", "build", "node_modules"];
+
+/** What a compiled non-interactive harness reads when it starts or compiles again. */
+const COMPILED_INPUTS: readonly string[] = [
+  ...SPEC_NAMES,
+  "tsconfig.json",
+  "jsconfig.json",
+  "package.json",
+];
+
+/**
+ * The name `crewhaus compile` stamps in the manifest beside a bundle's entry.
+ * Mirrors `BUNDLE_MANIFEST_NAME` in `@crewhaus/harness-supervisor`, which this
+ * package does not depend on; a test holds the two equal.
+ */
+export const COMPILED_BUNDLE_NAME = "crewhaus-compiled-bundle";
+
+/** The spec's own `target:` line. */
+const TARGET_LINE = /^target:\s*["']?([A-Za-z-]+)/m;
+
+/** The spellings of a code file's name, which all stand for one module. */
+const CODE_EXTENSIONS: readonly string[] = [
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".mts",
+  ".cts",
+];
+
+/** A bundle's code, at the top of the directory it runs from. */
+const BUNDLE_CODE = /\.(?:ts|tsx|js|jsx|mjs|cjs|mts|cts)$/;
+
+/** A lockfile at the top of the directory a bundle runs from. */
+const BUNDLE_LOCK = /\.lock$/;
+
+/**
+ * What a bundle resolves its modules and installs its dependencies from, whether
+ * or not each exists yet. Other JSON at the top of its directory is an agent's
+ * own data: `crewhaus compile` emits no other JSON file there.
+ */
+const BUNDLE_CONFIG: readonly string[] = [
+  "node_modules",
+  "tsconfig.json",
+  "jsconfig.json",
+  "package.json",
+];
+
+/** The lockfile a bundle's install reads, whether or not it exists yet. */
+const BUNDLE_LOCKFILES: readonly string[] = ["bun.lock", "bun.lockb"];
+
+/** The header a target's emitter writes at the top of a bundle's entry. */
+const ENTRY_TARGET = /^\/\/ Source spec: .*\(target: ([A-Za-z-]+),/m;
 
 /**
  * The gate records a tool keeps its own store in, through a format of its own:
@@ -183,6 +253,175 @@ export function declaredEnvFiles(cwd: string): string[] {
     .map((entry) => resolve(cwd, entry));
 }
 
+/**
+ * What the working directory is to this process, which decides how much of it
+ * is the harness's own installation rather than a project the run was asked to
+ * edit. The same files can be both, so each answer is the weakest test that
+ * matches what it protects.
+ */
+type Standing = {
+  /**
+   * A spec sits at the working directory. Its `dist`, `build` and
+   * `node_modules` are generated or installed, and a tool that works on the
+   * directory recompiles or installs rather than editing them by hand. A
+   * project with no spec keeps them as ordinary directories.
+   */
+  readonly holdsSpec: boolean;
+  /**
+   * The process is a compiled non-interactive bundle of that spec: its entry
+   * lies inside the working directory and not under `node_modules`, and the
+   * spec's `target:` is present and is neither `cli` nor `browser`. The
+   * directory is then this harness's installation alone, so the spec and the
+   * root `package.json`, `tsconfig.json` and `jsconfig.json` are its compiled
+   * inputs. An interactive target keeps editing them, as its project's files.
+   */
+  readonly compiledDaemon: boolean;
+  /**
+   * The bundle this process started from, by names relative to the working
+   * directory, when the manifest `crewhaus compile` stamps sits beside the
+   * entry. A directory below the working directory is named whole; when the
+   * entry is a non-interactive target's, so are the spec's names at the working
+   * directory and the dependencies, manifest and resolver config of each
+   * directory from the bundle's parent up to it, and an interactive target's
+   * bundle leaves its project to the rules. A bundle started from inside itself
+   * has no spec beside it, so the manifest is the test: its dependencies, its
+   * manifest, its lockfile, its resolver config and the spec's names are named,
+   * whether or not each exists, with the code files and lockfiles at the top of
+   * the directory present when the run starts and every other spelling of each
+   * code file's name (`agent.js` and `agent.js.ts` for `agent.ts`). A file an
+   * agent adds there for its own notes or data, such as `state.json`, stays the
+   * rules' to decide. An interactive target in its own directory names nothing
+   * here.
+   */
+  readonly ownBundle: readonly string[];
+};
+
+/**
+ * The answers so far, by working directory and entry. Answered once per
+ * process: a child loop computes its roots again, and a call that moves the
+ * spec does not change the answer for the rest of the process.
+ */
+const STANDINGS = new Map<string, Standing>();
+
+/** `entry` relative to the working directory, when it really lies inside it and not under `node_modules`. */
+function entryInside(cwd: string, entry: string | undefined): string | undefined {
+  if (entry === undefined) return undefined;
+  let real: string;
+  try {
+    // A compiled binary's virtual entry has no real path, and lies in no directory here.
+    real = realpathSync(entry);
+  } catch {
+    return undefined;
+  }
+  const rel = insideSpelling(followed(cwd) ?? cwd, real);
+  return rel === undefined || rel.split(sep).includes("node_modules") ? undefined : rel;
+}
+
+/** The `target:` of the spec at `cwd`, in the order the supervisor finds a spec. */
+function specTarget(cwd: string): string | undefined {
+  for (const name of SPEC_NAMES) {
+    let source: string;
+    try {
+      source = readFileSync(join(cwd, name), "utf8");
+    } catch {
+      continue;
+    }
+    return TARGET_LINE.exec(source)?.[1];
+  }
+  return undefined;
+}
+
+/** Does the manifest in `dir` carry the name `crewhaus compile` stamps? */
+function holdsBundleManifest(dir: string): boolean {
+  try {
+    const manifest: unknown = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+    return (
+      typeof manifest === "object" &&
+      manifest !== null &&
+      (manifest as Record<string, unknown>)["name"] === COMPILED_BUNDLE_NAME
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Is the entry a non-interactive target's? Its header names the target; an entry
+ * with no such header goes by the file name the daemon targets give it.
+ */
+function entryNonInteractive(cwd: string, entryRel: string): boolean {
+  let source: string;
+  try {
+    source = readFileSync(join(cwd, entryRel), "utf8");
+  } catch {
+    return false;
+  }
+  const target = ENTRY_TARGET.exec(source)?.[1];
+  return target !== undefined
+    ? target !== "cli" && target !== "browser"
+    : basename(entryRel) === "daemon.ts";
+}
+
+/** {@link Standing.ownBundle} for a bundle in `dir`, a directory below the working directory. */
+function bundleBelowNames(dir: string, nonInteractive: boolean): readonly string[] {
+  if (!nonInteractive) return [dir];
+  const names = new Set([dir, ...SPEC_NAMES]);
+  let at = dir;
+  do {
+    at = dirname(at);
+    for (const name of BUNDLE_CONFIG) names.add(join(at, name));
+  } while (at !== ".");
+  return [...names];
+}
+
+/** {@link Standing.ownBundle}, for an entry at `entryRel` in `cwd`. */
+function ownBundleNames(cwd: string, entryRel: string, compiledDaemon: boolean): readonly string[] {
+  const dir = dirname(entryRel);
+  if (!holdsBundleManifest(join(cwd, dir))) return [];
+  if (dir !== ".") {
+    return bundleBelowNames(dir, compiledDaemon || entryNonInteractive(cwd, entryRel));
+  }
+  const names = new Set([...BUNDLE_CONFIG, ...BUNDLE_LOCKFILES, ...SPEC_NAMES]);
+  try {
+    for (const file of readdirSync(cwd, { withFileTypes: true })) {
+      if (!file.isFile()) continue;
+      if (BUNDLE_LOCK.test(file.name)) names.add(file.name);
+      if (!BUNDLE_CODE.test(file.name)) continue;
+      names.add(file.name);
+      const stem = file.name.slice(0, file.name.lastIndexOf("."));
+      for (const extension of CODE_EXTENSIONS) {
+        names.add(`${stem}${extension}`);
+        names.add(`${stem}.js${extension}`);
+      }
+      names.add(`${stem}.js.json`);
+    }
+  } catch {
+    // An unreadable directory lists no files; the names above still hold.
+  }
+  return [...names];
+}
+
+/** {@link Standing}, read from the disk the first time and remembered after. */
+function standingOf(cwd: string, entry: string | undefined): Standing {
+  const key = `${cwd}\0${entry ?? ""}`;
+  const known = STANDINGS.get(key);
+  if (known !== undefined) return known;
+  const holdsSpec = SPEC_NAMES.some((name) => existsSync(join(cwd, name)));
+  const entryRel = entryInside(cwd, entry);
+  const target = entryRel !== undefined && holdsSpec ? specTarget(cwd) : undefined;
+  const compiledDaemon = target !== undefined && target !== "cli" && target !== "browser";
+  const standing: Standing = {
+    holdsSpec,
+    compiledDaemon,
+    ownBundle:
+      entryRel !== undefined && (!holdsSpec || compiledDaemon)
+        ? ownBundleNames(cwd, entryRel, compiledDaemon)
+        : [],
+  };
+  STANDINGS.set(key, standing);
+  return standing;
+}
+
 /** Every way the canonicaliser can spell `root`, added to `into`. */
 function addSpellings(into: Set<string>, root: string, cwd: string): void {
   into.add(root);
@@ -230,6 +469,11 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   move one. `env` is read for those two variables alone; the default
  *   follows the home directory (`homedir()`), as the Hangar server's own
  *   fallback does.
+ * - What the harness's next start runs, by what the working directory is to
+ *   this process ({@link Standing}): `dist`, `build` and `node_modules`; the
+ *   compiled inputs; and the bundle the process started from. `entry` is the
+ *   process's entry file, `Bun.main` unless a test names another, and the
+ *   answer is kept for the life of the process.
  *
  * The floor reads calls that write. A read of the run's record, a spilled
  * output's parts included, goes on as before.
@@ -239,8 +483,11 @@ export function runtimeStateRoots(
   tenant: Tenant | undefined,
   cwd: string = process.cwd(),
   env: Readonly<Record<string, string | undefined>> = process.env,
+  entry: string | undefined = (globalThis as { Bun?: { main?: string } }).Bun?.main,
 ): string[] {
   const sessions = resolve(cwd, sessionRootDir ?? DEFAULT_ROOT_DIR);
+  const standing = standingOf(cwd, entry);
+  const atCwd = (names: readonly string[]): string[] => names.map((name) => resolve(cwd, name));
   /**
    * Each group of roots, and what becomes of a root that holds the working
    * directory itself. A new kind of root is one more entry here.
@@ -277,6 +524,11 @@ export function runtimeStateRoots(
     // its registry file. One that holds the working directory stays protected:
     // the floor refuses a run inside Hangar's directory that writes there.
     { roots: [...hangarStateRoots(env), ...registryStateFiles(env)], holdingCwd: "protect" },
+    // What the harness's next start runs. Each lies inside the working
+    // directory, so none holds it.
+    { roots: standing.holdsSpec ? atCwd(INSTALLED_TREES) : [], holdingCwd: "protect" },
+    { roots: standing.compiledDaemon ? atCwd(COMPILED_INPUTS) : [], holdingCwd: "protect" },
+    { roots: atCwd(standing.ownBundle), holdingCwd: "protect" },
   ];
   const roots = new Set<string>();
   for (const group of groups) {

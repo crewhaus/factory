@@ -535,8 +535,9 @@ export type RuntimeBridge = ParentRunHandle & {
   /**
    * 0.8.0 (design §1 principle 1, §5.2) — the run's runtime-state roots:
    * its session logs, spilled tool results and proof bundles, and the files
-   * that control it (the harness's run files, settings, gate records and
-   * environment files, Hangar's directory), every way the runtime spells them
+   * that control it (the harness's run files, settings, gate records,
+   * environment files, compiled bundle and dependencies, Hangar's directory),
+   * every way the runtime spells them
    * (runtime-core's `runtimeStateRoots`). The permission
    * floor denies a call that names a path inside one; a tool that writes
    * beneath a directory it names (CopyPath, MovePath, RemovePath,

@@ -66,8 +66,8 @@ without `overwrite`. `copy-containment.test.ts` holds these.
 The run's own record is out of reach as well (0.8.0). The runtime hands each
 tool call the directories where it keeps that record: the session logs, the
 tool results it saved to a file, and the proof bundles, with the files that
-control the run (the harness's run files, settings, gate records and
-environment files, Hangar's directory).
+control the run (the harness's run files, settings, gate records, environment
+files, compiled bundle and dependencies, Hangar's directory).
 The permission engine already denies a write that names a path inside one,
 or that acts beneath a workspace directory holding one, but it leaves a
 write beneath the workspace root itself to the rules, and lets every call

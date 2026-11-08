@@ -17,9 +17,9 @@
  *                   `EvaluateOptions.protectedRoots` (the session logs,
  *                   spilled tool results and proof bundles the gates read as
  *                   evidence, and the files that control the run: the
- *                   harness's run files, settings, gate records and
- *                   environment files, Hangar's directory), nor acts beneath a
- *                   workspace directory that holds one
+ *                   harness's run files, settings, gate records, environment
+ *                   files, compiled bundle and dependencies, Hangar's directory),
+ *                   nor acts beneath a workspace directory that holds one
  *
  * Rule sources (priority high → low)
  *   flag → settings → yaml → hooks → builtin
@@ -161,7 +161,9 @@ export type EvaluateOptions = {
    * it (`foldedName`), where the canonicaliser marks it `caseInsensitive`, and
    * where nothing says how its volume compares names: a path outside the
    * workspace, and the text of a tool that declares no paths. Any other value
-   * compares exactly.
+   * compares exactly. The text of a tool that declares no paths is not compared
+   * with the relative roots of {@link NAMES_IN_TEXT}, which are ordinary words
+   * and file names there; their absolute spellings still are.
    */
   readonly protectedRoots?: ReadonlyArray<string>;
 };
@@ -400,6 +402,20 @@ function insideWorkspace(key: string): boolean {
 }
 
 /**
+ * Relative roots that mean something else in the text of a tool that declares no
+ * paths: words for a label, a channel or a branch, and file names that every
+ * repository in another system holds.
+ */
+const NAMES_IN_TEXT: ReadonlySet<string> = new Set([
+  "dist",
+  "build",
+  "node_modules",
+  "package.json",
+  "tsconfig.json",
+  "jsconfig.json",
+]);
+
+/**
  * The protected root a call reaches (see `EvaluateOptions.protectedRoots`),
  * and how, or `undefined`. Read from the call's `path` operative values (its
  * `floorValues` when the runtime names the written fields) — every
@@ -407,8 +423,13 @@ function insideWorkspace(key: string): boolean {
  * absolute, symlinks followed, the name as sent), case folded where the
  * filesystem folds it — or, for a tool that declares none, from the strings
  * in its input as written (the runtime passes empty `floorValues` for one that
- * declares `[]`, whose strings are text). A path is caught when it IS a protected root or
- * lies under one (`inside`), and a directory the call acts BENEATH (its
+ * declares `[]`, whose strings are text). Read from a tool that declares none,
+ * the relative roots of {@link NAMES_IN_TEXT}, and any name below one, are not
+ * taken for paths, so a label, a channel or a branch of that name, or a file of
+ * that name in another system, is not refused: an absolute spelling is still
+ * read, as every other root is. A plugin tool that writes such a file declares
+ * `operativeArgs`, and an MCP tool that writes files is decided by a rule on that
+ * tool. A path is caught when it IS a protected root or lies under one (`inside`), and a directory the call acts BENEATH (its
  * value's `beneath` prefixes: a tree removed, emptied, imported into or
  * migrated onto) when a root lies under it (`above`) — `.crewhaus` for the
  * session logs at `.crewhaus/sessions`, which StateImport and StoreMigrate
@@ -468,6 +489,7 @@ function protectedRootHit(
   for (const root of opts.protectedRoots) {
     if (root.trim() === "") continue;
     const plain = floorKey(root, false);
+    if (values === undefined && NAMES_IN_TEXT.has(plain)) continue;
     const folded = floorKey(root, true);
     for (const { key, fold } of keys) {
       if (liesUnder(key, fold ? folded : plain)) return { root };
@@ -516,7 +538,7 @@ export function evaluateWithReason(
   const floorHit = protectedRootHit(call, opts);
   if (floorHit !== undefined) {
     const RECORD =
-      "the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory)";
+      "the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records, environment files, compiled bundle and dependencies, Hangar's directory)";
     return {
       decision: "deny",
       reason:
