@@ -132,6 +132,15 @@ function initRepo(dir: string): void {
 
 let workspace: string;
 let repo: string;
+
+function lstatExists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
 let originalCwd: string;
 let savedGlobal: string | undefined;
 let savedSystem: string | undefined;
@@ -1501,6 +1510,40 @@ describe("GitApplyPatch", () => {
     const out = await call(gitApplyPatch, { patch: bogus, check: true });
     expect(out.applied).toBe(false);
     expect(out.reason).toContain("GitApplyPatch failed");
+  });
+
+  test("a patch creating a link into the run's own record is refused whole", async () => {
+    const sessions = join(repo, ".crewhaus", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    const ctx = { bridge: { protectedRoots: [sessions] } };
+    const linking = (linkPath: string, target: string): string =>
+      [
+        `diff --git a/${linkPath} b/${linkPath}`,
+        "new file mode 120000",
+        "--- /dev/null",
+        `+++ b/${linkPath}`,
+        "@@ -0,0 +1 @@",
+        `+${target}`,
+        "\\ No newline at end of file",
+        "",
+      ].join("\n");
+    const apply = async (patch: string): Promise<{ applied: boolean; reason?: string }> =>
+      JSON.parse(String(await gitApplyPatch.execute({ cwd: "repo", patch }, ctx)));
+
+    for (const [linkPath, target] of [
+      [".crewhaus/journal", "sessions"],
+      ["notes/log", "../.crewhaus/sessions/sess_00000000000000aa.jsonl"],
+    ] as const) {
+      const out = await apply(linking(linkPath, target));
+      expect(`${linkPath} → ${out.applied}`).toBe(`${linkPath} → false`);
+      expect(out.reason).toContain("would write where the runtime keeps its own record of the run");
+      expect(out.reason).toContain(linkPath);
+      expect(lstatExists(join(repo, linkPath))).toBe(false);
+    }
+
+    // A link that stays out of the record applies.
+    const fine = await apply(linking("docs-link", "README.md"));
+    expect(fine.applied).toBe(true);
   });
 
   test("a patch writing into the run's own record (session logs, spilled results, proofs) is refused whole", async () => {

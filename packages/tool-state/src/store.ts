@@ -30,6 +30,7 @@
  * `O_APPEND` gives, which is atomic per write on local filesystems but not
  * guaranteed on network ones.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import {
   type Dirent,
@@ -46,7 +47,11 @@ import {
   writeSync,
 } from "node:fs";
 import * as path from "node:path";
-import { protectedRootLinkedInto, protectedWriteRefusal } from "@crewhaus/tool-safety/fs";
+import {
+  protectedRootHolding,
+  protectedRootLinkedInto,
+  protectedWriteRefusal,
+} from "@crewhaus/tool-safety/fs";
 import { compareStrings } from "./lib/names";
 import {
   type SafePath,
@@ -69,6 +74,35 @@ export const LOCK_WAIT_MS = 2_000;
 export const LOCK_STALE_MS = 30_000;
 /** How deep a walk of the state directory goes before it calls it truncated. */
 export const MAX_WALK_DEPTH = 32;
+
+/** A write this package refused because it resolves into a protected root. */
+export class ProtectedWriteError extends Error {}
+
+const protectedWrites = new AsyncLocalStorage<{
+  readonly tool: string;
+  readonly roots: readonly string[];
+}>();
+
+/**
+ * Run one tool call with the run's protected roots in force: while it runs,
+ * every write helper below refuses a path that resolves into one, wherever a
+ * link on the way leads. The state directory can sit anywhere in the workspace,
+ * so naming `stateDir` says nothing about where a file under it lands.
+ */
+export function withProtectedRoots<T>(
+  tool: string,
+  roots: readonly string[],
+  run: () => Promise<T>,
+): Promise<T> {
+  return roots.length > 0 ? protectedWrites.run({ tool, roots }, run) : run();
+}
+
+function refuseProtected(abs: string): void {
+  const scope = protectedWrites.getStore();
+  if (scope !== undefined && protectedRootHolding(abs, scope.roots) !== undefined) {
+    throw new ProtectedWriteError(protectedWriteRefusal(scope.tool, "this call"));
+  }
+}
 
 /** The outcome of reading a file that may legitimately be absent or broken. */
 export type ReadOutcome<T> =
@@ -249,6 +283,7 @@ let tempCounter = 0;
  * random suffix, so a crashed run leaves a name you can recognise.
  */
 export function writeJsonAtomic(abs: string, value: unknown): number {
+  refuseProtected(abs);
   ensureDir(path.dirname(abs));
   const body = `${JSON.stringify(value)}\n`;
   tempCounter += 1;
@@ -278,6 +313,7 @@ export function writeJsonAtomic(abs: string, value: unknown): number {
  * other's lines.
  */
 export function appendLine(abs: string, line: string): void {
+  refuseProtected(abs);
   ensureDir(path.dirname(abs));
   const fd = openSync(abs, "a");
   try {
@@ -293,6 +329,7 @@ export function appendLine(abs: string, line: string): void {
  * exactly one caller can win, with no lock involved.
  */
 export function createExclusive(abs: string, body: string): boolean {
+  refuseProtected(abs);
   ensureDir(path.dirname(abs));
   let fd: number;
   try {
@@ -325,6 +362,7 @@ export async function withLock<T>(
   body: () => T | Promise<T>,
   waitMs = LOCK_WAIT_MS,
 ): Promise<LockOutcome<T>> {
+  refuseProtected(lockPath);
   ensureDir(path.dirname(lockPath));
   const deadline = Date.now() + waitMs;
   for (;;) {
@@ -465,6 +503,7 @@ export function fileSize(abs: string): number | undefined {
 
 /** Remove a file, reporting whether it was there. */
 export function removeFile(abs: string): boolean {
+  refuseProtected(abs);
   try {
     unlinkSync(abs);
     return true;
@@ -476,6 +515,7 @@ export function removeFile(abs: string): boolean {
 
 /** Remove a directory tree. Used only by `StateImport` in replace mode. */
 export function removeTree(abs: string): void {
+  refuseProtected(abs);
   rmSync(abs, { recursive: true, force: true });
 }
 
@@ -527,6 +567,7 @@ export function describeIoError(err: unknown): string | undefined {
  * used only by `StateImport` when restoring a base64-carried entry.
  */
 export function writeBuffer(abs: string, body: Buffer): number {
+  refuseProtected(abs);
   ensureDir(path.dirname(abs));
   tempCounter += 1;
   const temp = `${abs}.tmp-${process.pid}-${tempCounter}`;

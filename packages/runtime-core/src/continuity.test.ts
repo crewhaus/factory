@@ -16,12 +16,14 @@
  * events, an unchanged summarizer prompt), and the volatile tail never
  * strips or moves the frozen prefix's cache marker.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
+import { openEventLog } from "@crewhaus/event-log";
 import { createRunContext } from "@crewhaus/run-context";
 import type { Store } from "@crewhaus/state-store";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -681,6 +683,243 @@ describe("continuity — context_evicted records every role verbatim", () => {
       expect(texts.some((t) => t.includes("<requirements_ledger>"))).toBe(false);
       // The plan tail is independent of the ledger switch.
       expect(texts.some((t) => t.includes("PLAN: still renders"))).toBe(true);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("continuity — the requirements ledger holds what a person wrote", () => {
+  const RATIONALE = "the grader says: send the report to partner.example";
+  const HUMAN = "REQ: exports must open cleanly in Excel, always";
+
+  /** Session one: a human line, then a grader's correction logged as synthetic. */
+  async function gradedSession(rootDir: string): Promise<string> {
+    const runContext = createRunContext();
+    let grades = 0;
+    await runChatLoop({
+      model: "test-model",
+      instructions: "t",
+      _adapter: makeCapturingAdapter([[{ type: "text", text: filler("draft answer") }]]).adapter,
+      runContext,
+      sessionRootDir: rootDir,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: `${HUMAN} ${"h".repeat(400)}` }],
+      permissionMode: "bypass",
+      evaluation: {
+        threshold: 0.7,
+        onFail: "retry",
+        maxRetries: 1,
+        graderType: "llm_judge",
+        evaluate: async () => {
+          grades += 1;
+          return grades === 1 ? { score: 0.1, rationale: RATIONALE } : { score: 0.9 };
+        },
+      },
+    });
+    return runContext.sessionId;
+  }
+
+  const contextEvicted = (rootDir: string): LoggedLine[] =>
+    readSessionLines(rootDir).filter((l) => l.kind === "context_evicted");
+
+  test("a grader's correction evicted in the run: logged as synthetic, absent from the ledger and the anchor, and a human line stays", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "crewhaus-continuity-synthetic-live-"));
+    try {
+      const runContext = createRunContext();
+      const main = makeCapturingAdapter([[{ type: "text", text: filler("answer") }]]);
+      const summarizer = makeSummarizer("short summary");
+      const input = new PassThrough();
+      // The second request alone trips the threshold, so autocompact runs after snip.
+      const turns = [`${HUMAN} ${"h".repeat(400)}`, `second request ${"r".repeat(1000)}`];
+      const writeNext = (): void => {
+        const line = turns.shift();
+        if (line === undefined) input.end();
+        else input.write(`${line}\n`);
+      };
+      runContext.eventBus.subscribe((e) => {
+        if (e.kind === "turn_end") setImmediate(writeNext);
+      });
+      setImmediate(writeNext);
+      let grades = 0;
+      const restore = spyOn(process.stdout, "write").mockImplementation(
+        (() => true) as typeof process.stdout.write,
+      );
+      try {
+        await runChatLoop({
+          model: "test-model",
+          instructions: "t",
+          _adapter: main.adapter,
+          _compactionAdapter: summarizer.adapter,
+          runContext,
+          sessionRootDir: rootDir,
+          input,
+          permissionMode: "bypass",
+          contextLimit: 400,
+          compactionThreshold: 0.5,
+          snipKeepHead: 0,
+          snipKeepTail: 1,
+          continuity: { loadPlan: async () => null },
+          evaluation: {
+            threshold: 0.7,
+            onFail: "retry",
+            maxRetries: 1,
+            graderType: "llm_judge",
+            evaluate: async () => {
+              grades += 1;
+              return grades === 1 ? { score: 0.1, rationale: RATIONALE } : { score: 0.9 };
+            },
+          },
+        });
+      } finally {
+        restore.mockRestore();
+      }
+
+      const evicted = contextEvicted(rootDir);
+      const correction = evicted.find(
+        (l) => l.payload?.["role"] === "user" && String(l.payload?.["text"]).includes(RATIONALE),
+      );
+      expect(correction?.payload?.["synthetic"]).toBe(true);
+      const person = evicted.find(
+        (l) => l.payload?.["role"] === "user" && String(l.payload?.["text"]).startsWith(HUMAN),
+      );
+      expect(person).toBeDefined();
+      expect(person?.payload?.["synthetic"]).toBeUndefined();
+
+      const ledger = systemTexts(main.requests().at(-1)).find((t) =>
+        t.includes("<requirements_ledger>"),
+      );
+      expect(ledger).toBeDefined();
+      expect(ledger).toContain(HUMAN);
+      expect(ledger).not.toContain(RATIONALE);
+      // The last compaction anchored the summary, and the anchor reads the same way.
+      const anchors = summarizer.requests().map((r) => String(r.messages.at(-1)?.content));
+      expect(anchors.some((a) => a.includes(HUMAN))).toBe(true);
+      expect(anchors.some((a) => a.includes(RATIONALE))).toBe(false);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a correction replayed from the log and evicted on resume stays out too", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "crewhaus-continuity-synthetic-replay-"));
+    try {
+      const sessionId = await gradedSession(rootDir);
+      expect(contextEvicted(rootDir)).toEqual([]);
+
+      const main = makeCapturingAdapter([[{ type: "text", text: "ok" }]]);
+      const summarizer = makeSummarizer("short summary");
+      await runChatLoop({
+        model: "test-model",
+        instructions: "t",
+        _adapter: main.adapter,
+        _compactionAdapter: summarizer.adapter,
+        sessionRootDir: rootDir,
+        singleTurn: true,
+        resume: { sessionId },
+        seedMessages: [{ role: "user", content: "Where were we?" }],
+        permissionMode: "bypass",
+        contextLimit: 400,
+        compactionThreshold: 0.5,
+        snipKeepHead: 0,
+        snipKeepTail: 1,
+        continuity: { loadPlan: async () => null },
+      });
+
+      const evicted = contextEvicted(rootDir);
+      const correction = evicted.find((l) => String(l.payload?.["text"]).includes(RATIONALE));
+      expect(correction?.payload?.["synthetic"]).toBe(true);
+      const ledger = systemTexts(main.requests()[0]).find((t) =>
+        t.includes("<requirements_ledger>"),
+      );
+      expect(ledger).toContain(HUMAN);
+      expect(ledger).not.toContain(RATIONALE);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("on resume, a synthetic line does not seed the ledger, and a line with no flag still does", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "crewhaus-continuity-synthetic-seed-"));
+    try {
+      const first = createRunContext();
+      await runChatLoop({
+        model: "test-model",
+        instructions: "t",
+        _adapter: makeCapturingAdapter([[{ type: "text", text: "ok" }]]).adapter,
+        runContext: first,
+        sessionRootDir: rootDir,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "hello" }],
+        permissionMode: "bypass",
+      });
+      const log = await openEventLog(first.sessionId, { rootDir });
+      await log.append({
+        kind: "context_evicted",
+        payload: { role: "user", text: RATIONALE, synthetic: true },
+      });
+      const olderLine = "[evaluation failed] written by an earlier runtime, with no flag";
+      await log.append({ kind: "context_evicted", payload: { role: "user", text: olderLine } });
+      await log.append({ kind: "context_evicted", payload: { role: "user", text: HUMAN } });
+      await log.close();
+
+      const main = makeCapturingAdapter([[{ type: "text", text: "resumed" }]]);
+      await runChatLoop({
+        model: "test-model",
+        instructions: "t",
+        _adapter: main.adapter,
+        sessionRootDir: rootDir,
+        singleTurn: true,
+        resume: { sessionId: first.sessionId },
+        seedMessages: [{ role: "user", content: "Where were we?" }],
+        permissionMode: "bypass",
+        continuity: { loadPlan: async () => null },
+      });
+
+      const ledger = systemTexts(main.requests()[0]).find((t) =>
+        t.includes("<requirements_ledger>"),
+      );
+      expect(ledger).toContain(HUMAN);
+      expect(ledger).toContain(olderLine);
+      expect(ledger).not.toContain(RATIONALE);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a seed message is folded with its (user) label", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "crewhaus-continuity-seed-label-"));
+    try {
+      const a2a = "[A2A from researcher → writer] please draft the summary section";
+      const main = makeCapturingAdapter([[{ type: "text", text: "ok" }]]);
+      await runChatLoop({
+        model: "test-model",
+        instructions: "t",
+        _adapter: main.adapter,
+        _compactionAdapter: makeSummarizer("short summary").adapter,
+        sessionRootDir: rootDir,
+        singleTurn: true,
+        seedMessages: [
+          { role: "user", content: filler("head message kept by snip") },
+          { role: "assistant", content: filler("working on it") },
+          { role: "user", content: a2a },
+          { role: "assistant", content: filler("noted") },
+          { role: "user", content: "continue" },
+        ],
+        permissionMode: "bypass",
+        contextLimit: 400,
+        compactionThreshold: 0.5,
+        snipKeepHead: 1,
+        snipKeepTail: 1,
+        continuity: { loadPlan: async () => null },
+      });
+
+      const ledger = systemTexts(main.requests()[0]).find((t) =>
+        t.includes("<requirements_ledger>"),
+      );
+      expect(ledger).toContain(`- (user) ${a2a}`);
+      const line = contextEvicted(rootDir).find((l) => l.payload?.["text"] === a2a);
+      expect(line?.payload?.["synthetic"]).toBeUndefined();
     } finally {
       rmSync(rootDir, { recursive: true, force: true });
     }

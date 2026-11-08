@@ -267,6 +267,159 @@ describe("tagContent — token-level tagging", () => {
   });
 });
 
+describe("tagContent — the value of a NAME=value line", () => {
+  // Secret-shaped values are built from parts at runtime.
+  const githubPat = `${"gh"}${"p_"}${"a1B2c3D4".repeat(4)}`;
+  const stripeKey = `${"sk_"}${"live_"}${"e5F6g7H8".repeat(3)}`;
+  const awsKeyId = `${"AK"}${"IA"}${"QWERTY234567ASDF"}`;
+  const pemBody = `${"MI"}${"IE"}${"vQIBADANBgkqhkiG9w0BAQEFAASC"}`;
+
+  test("a credential-shaped value is tagged on its own, whatever the name", () => {
+    for (const [name, value] of [
+      ["GITHUB_PAT", githubPat],
+      ["STRIPE", stripeKey],
+      ["AWS_ACCESS_KEY_ID", awsKeyId],
+      ["GH_APP_PEM", pemBody],
+    ] as const) {
+      const ctx = createRunContext();
+      tagContent(ctx, `# read from the file\n${name}=${value}\n`, "tool");
+      expect({ name, origin: ctx.dataLineage?.get(value) }).toEqual({ name, origin: "tool" });
+    }
+  });
+
+  test("quotes and a leading export are read past", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, `GITHUB_PAT="${githubPat}"\nexport STRIPE='${stripeKey}'`, "tool");
+    expect(ctx.dataLineage?.get(githubPat)).toBe("tool");
+    expect(ctx.dataLineage?.get(stripeKey)).toBe("tool");
+  });
+
+  test("a value with no credential shape is not tagged", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "see LOG_LEVEL=debug-verbose-mode for details", "tool");
+    expect(ctx.dataLineage?.has("debug-verbose-mode")).toBe(false);
+    expect(ctx.dataLineage?.size).toBe(1);
+  });
+
+  test("a secret-named line keeps its value tagged", () => {
+    const ctx = createRunContext();
+    const value = `${"sk-"}${"ant-"}${"i9J0k1L2".repeat(3)}`;
+    tagContent(ctx, `ANTHROPIC_API_KEY=${value}`, "tool");
+    expect(ctx.dataLineage?.get(value)).toBe("tool");
+  });
+
+  test("a URL's query value stays inside its token", () => {
+    const cursor = `${"ey"}${"J"}${"hbGciOiJIUzI1NiJ9abcDEF"}`;
+    const ctx = createRunContext();
+    tagContent(ctx, `next page: https://api.example.com/items?cursor=${cursor} and more`, "tool");
+    expect(ctx.dataLineage?.has(cursor)).toBe(false);
+  });
+
+  test("only an upper-case name counts as NAME=value", () => {
+    const cursor = `${"ey"}${"J"}${"hbGciOiJIUzI1NiJ9abcDEF"}`;
+    const ctx = createRunContext();
+    tagContent(ctx, `first cursor=${cursor} then the rest of the sentence`, "tool");
+    expect(ctx.dataLineage?.has(cursor)).toBe(false);
+    expect(ctx.dataLineage?.has(`cursor=${cursor}`)).toBe(true);
+  });
+
+  test("eight lines take eight token tags, not more", () => {
+    const values = Array.from(
+      { length: 8 },
+      (_, i) => `${"gh"}${"p_"}${"m3N4p5Q6".repeat(3)}${i}x`,
+    );
+    const content = values.map((value, i) => `SERVICE_${i}=${value}`).join("\n");
+    const ctx = createRunContext();
+    tagContent(ctx, content, "tool");
+    const keys = [...(ctx.dataLineage?.keys() ?? [])];
+    // The whole blob, each line once, and each value once.
+    expect(keys.length).toBe(1 + 8 + 8);
+    expect(keys.filter((k) => values.includes(k)).length).toBe(8);
+  });
+
+  test("a pair takes no token slot, so a full cap holds that many values", () => {
+    const values = Array.from(
+      { length: MAX_TOKEN_TAGS },
+      (_, i) => `${"Secret"}${"Value"}9x${"a".repeat(30)}${i}`,
+    );
+    const content = values.map((value, i) => `SERVICE_${i}_TOKEN=${value}`).join("\n");
+    const ctx = createRunContext();
+    tagContent(ctx, content, "tool");
+    expect(values.filter((value) => ctx.dataLineage?.get(value) !== "tool")).toEqual([]);
+  });
+});
+
+describe("tagContent — the value of an assignment, wherever it sits in its token", () => {
+  // Built from parts at runtime.
+  const secret = `${"gh"}${"p_"}${"a1B2c3D4".repeat(4)}`;
+  const shaped = `${"Zx9"}${"kQ2w".repeat(7)}`;
+
+  const tagsAlone = (text: string, value: string = secret): boolean => {
+    const ctx = createRunContext();
+    tagContent(ctx, text, "tool");
+    return ctx.dataLineage?.has(value) === true;
+  };
+
+  const forms: ReadonlyArray<readonly [string, string]> = [
+    ["a file:line: prefix", `deploy.conf:2:GITHUB_PAT=${secret}`],
+    ["a commented-out line", `#OLD_PAT=${secret}`],
+    ["a patch's added line", `+GITHUB_PAT=${secret}`],
+    ["a leading underscore", `_GITHUB_PAT=${secret}`],
+    ["`:=`", `GITHUB_PAT:=${secret}`],
+    ["`?=`", `GITHUB_PAT?=${secret}`],
+    ["`+=`", `GITHUB_PAT+=${secret}`],
+    ["`:`", `GITHUB_PAT:${secret}`],
+    ["a flag", `--env=GITHUB_PAT=${secret}`],
+    ["a shell's scope", `$env:GITHUB_PAT=${secret}`],
+    ["a name assigned to a name", `GITHUB_PAT=PREFIX=${secret}`],
+    ["a quoted key", `"GITHUB_PAT":"${secret}"`],
+  ];
+  for (const [name, text] of forms) {
+    test(`${name}: the value is tagged alone`, () => {
+      expect(tagsAlone(text)).toBe(true);
+      // A value with no well-known prefix takes the same path.
+      expect(tagsAlone(text.replace(secret, shaped), shaped)).toBe(true);
+    });
+  }
+
+  test("minified JSON: a string leaf is read", () => {
+    expect(tagsAlone(`{"GITHUB_PAT":"${secret}"}`)).toBe(true);
+    expect(tagsAlone(JSON.stringify({ env: `GITHUB_PAT=${shaped}` }), shaped)).toBe(true);
+    expect(tagsAlone(JSON.stringify([{ deep: [{ text: shaped }] }]), shaped)).toBe(true);
+  });
+
+  test("JSON that does not parse: an escaped line break still starts a new token", () => {
+    const cut = `{"patch":"diff\\n+++ b/deploy.conf\\nGITHUB_PAT=${shaped}\\nDEBUG=1`;
+    expect(tagsAlone(cut, shaped)).toBe(true);
+    expect(tagsAlone(`{"patch":"x\\n+GITHUB_PAT=${shaped}`, shaped)).toBe(true);
+  });
+
+  test("the tail of a longer word is not a name", () => {
+    expect(tagsAlone(`fooBAR=${shaped}`, shaped)).toBe(false);
+    expect(tagsAlone(`foo_BAR=${shaped}`, shaped)).toBe(false);
+    expect(tagsAlone(`1BAR=${shaped}`, shaped)).toBe(false);
+  });
+
+  test("a URL's query stays whole, in either case", () => {
+    expect(tagsAlone(`https://example.test/list?cursor=${shaped}`, shaped)).toBe(false);
+    expect(tagsAlone(`https://example.test/list?CURSOR=${shaped}`, shaped)).toBe(false);
+    expect(tagsAlone(`https://example.test/list?a=1&CURSOR=${shaped}`, shaped)).toBe(false);
+  });
+
+  test("a base64 value's own tail does not hide the value", () => {
+    const padded = `${shaped}/ABC=`;
+    expect(tagsAlone(`GITHUB_PAT=${padded}`, padded)).toBe(true);
+  });
+
+  test("a token of nothing but assignments is read to its end and tags nothing", () => {
+    // A value test per assignment would be quadratic here; only the last few
+    // are read. bun's per-test deadline is what fails if that stops holding.
+    const ctx = createRunContext();
+    tagContent(ctx, "A=".repeat(200_000), "tool");
+    expect([...(ctx.dataLineage?.keys() ?? [])].every((k) => k.startsWith("A=A=A="))).toBe(true);
+  });
+});
+
 describe("formatAgentIdentity", () => {
   test("undefined identity renders as <top-level>", () => {
     expect(formatAgentIdentity(undefined)).toBe("<top-level>");

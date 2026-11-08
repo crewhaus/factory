@@ -103,6 +103,7 @@ import {
 import {
   DEFAULT_STATE_DIR,
   MAX_FILE_BYTES,
+  ProtectedWriteError,
   appendLine,
   createExclusive,
   describeIoError,
@@ -120,6 +121,7 @@ import {
   stateRoot,
   walkFiles,
   withLock,
+  withProtectedRoots,
   writeBuffer,
   writeJsonAtomic,
 } from "./store";
@@ -212,9 +214,12 @@ function stateTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     ...def,
     execute: async (input, ctx) => {
       try {
-        return await inner(input, ctx);
+        return await withProtectedRoots(def.name, protectedRootsOf(ctx), async () =>
+          inner(input, ctx),
+        );
       } catch (err) {
         if (err instanceof ToolPermissionError) return err.message;
+        if (err instanceof ProtectedWriteError) return err.message;
         const io = describeIoError(err);
         if (io !== undefined) return `${def.name} could not complete: ${io}`;
         throw err;
