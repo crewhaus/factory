@@ -36,7 +36,9 @@ import { z } from "zod";
 import { blameIgnoreRevs } from "./blame-ignore";
 import {
   DEFAULT_TIMEOUT_MS,
+  type GitRun,
   MAX_TIMEOUT_MS,
+  type Repo,
   checkPathspecs,
   checkRefArgs,
   conflictedPatchPaths,
@@ -801,6 +803,358 @@ export const gitWorktreeList: RegisteredTool = buildTool({
 });
 
 // ---------------------------------------------------------------------------
+// what a call that moves the working tree would change
+
+/**
+ * `GitSwitch`, `GitCherryPick`, `GitStashPush` and `GitStashPop` write the files
+ * a commit, a stash or the index say, and name none of them, so the
+ * runtime-state floor has no path to read. As `CopyPath` and `GitApplyPatch` do,
+ * each works out its own targets and refuses, in every permission mode and
+ * before the real command, a call with one that lands on a root on its bridge
+ * (`RuntimeBridge.protectedRoots`). A name is one git would write there, or one
+ * above a root, which decides what the root is.
+ *
+ * The names are git's own answer. A pick or a pop is a three-way merge that
+ * follows renames, so a commit's own names do not say what it changes: its
+ * result comes from `git merge-tree`, which leaves the working tree alone. A git
+ * that cannot run that merge here runs the real command with rename detection
+ * off, and then the commit's own names are exact.
+ *
+ * Names that cannot be listed are not an empty list: running out of time or
+ * cutting a list off refuses the call.
+ */
+
+/**
+ * Every changed name as it is, whatever the config asks of a diff: both sides of
+ * a rename, and a submodule's pointer. `dirty` is as far as a read looks into a
+ * submodule (`./hardening`): its working tree is another repository's.
+ */
+const NAME_ONLY = [
+  "diff",
+  "--no-renames",
+  "--no-ext-diff",
+  "--ignore-submodules=dirty",
+  "--name-only",
+  "-z",
+] as const;
+/** The merge a git that cannot preview one runs instead, whose changes are the commit's own names. */
+const RENAMES_OFF = ["-c", "merge.renames=false", "-c", "merge.directoryRenames=false"] as const;
+
+/** The reads of one call's preview, under one deadline however many there are. */
+type TreePreview = {
+  /** `undefined` when the deadline passed, the call was aborted or the output was cut. */
+  readonly read: (args: readonly string[], stdin?: string) => Promise<GitRun | undefined>;
+};
+
+function previewOf(repo: Repo): TreePreview {
+  const deadline = Date.now() + repo.timeoutMs;
+  return {
+    read: async (args, stdin) => {
+      const left = deadline - Date.now();
+      if (left <= 0 || repo.signal?.aborted === true) return undefined;
+      const run = await repo.run(args, {
+        readOnly: true,
+        timeoutMs: left,
+        ...(stdin !== undefined ? { stdin } : {}),
+      });
+      return run.timedOut || run.truncated ? undefined : run;
+    },
+  };
+}
+
+const linesOf = (stdout: string): string[] =>
+  stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+
+/**
+ * The first of `names`, relative to the repository's top, that lands on a root.
+ * A name lies in a root or above one only if its directory does, so each
+ * directory is asked once and a long list costs its directories.
+ */
+function protectedAmong(
+  repo: Repo,
+  names: readonly string[],
+  roots: readonly string[],
+): string | undefined {
+  const landsOnRoot = (at: string): boolean =>
+    protectedRootHolding(at, roots) !== undefined || protectedRootBeneath(at, roots) !== undefined;
+  const dirs = new Map<string, boolean>();
+  return names.find((name) => {
+    const at = nodePath.resolve(repo.root, name);
+    const dir = nodePath.dirname(at);
+    const near = dirs.get(dir) ?? landsOnRoot(dir);
+    dirs.set(dir, near);
+    return near && landsOnRoot(at);
+  });
+}
+
+/**
+ * The names a diff with `args` lists, or `undefined`. A git older than 2.28 has
+ * neither `diff.relative` nor the flag that clears it, and exits 129 on the flag.
+ */
+async function diffNames(p: TreePreview, args: readonly string[]): Promise<string[] | undefined> {
+  const run = await p.read([...NAME_ONLY, "--no-relative", ...args]);
+  const listed = run?.code === 129 ? await p.read([...NAME_ONLY, ...args]) : run;
+  return listed === undefined || listed.code !== 0 ? undefined : splitNul(listed.stdout);
+}
+
+const namesBetween = (p: TreePreview, from: string, to: string): Promise<string[] | undefined> =>
+  diffNames(p, [from, to]);
+
+/** This repository's empty tree: a root commit's base, and what an unborn HEAD holds. */
+async function emptyTree(p: TreePreview): Promise<string | undefined> {
+  const run = await p.read(["hash-object", "-t", "tree", "--stdin"], "");
+  return run === undefined || run.code !== 0 ? undefined : linesOf(run.stdout)[0];
+}
+
+/** The tree the index holds: what a stash, and a pick with `noCommit`, merge into, not HEAD. */
+async function indexTree(p: TreePreview): Promise<string | undefined> {
+  const run = await p.read(["write-tree"]);
+  return run === undefined || run.code !== 0 ? undefined : linesOf(run.stdout)[0];
+}
+
+/**
+ * Whether this git has `merge-tree --merge-base` (2.40). "Could not determine"
+ * is its own answer, and the caller takes the same path as for "no".
+ */
+async function hasMergeTreeBase(p: TreePreview): Promise<boolean | undefined> {
+  const run = await p.read(["version"]);
+  const found = run?.code === 0 ? /^git version (\d+)\.(\d+)/.exec(run.stdout) : null;
+  if (found === null) return undefined;
+  const [major, minor] = [Number(found[1]), Number(found[2])];
+  return major > 2 || (major === 2 && minor >= 40);
+}
+
+/**
+ * The tree a three-way merge gives. A conflict (exit 1) still gives one, holding
+ * what the real command would write. `{}` when git could not run this merge
+ * (exit 129, not this option; exit 128, a tree where a git before 2.45 takes only
+ * a commit, or a blob a partial clone does not hold, which a read does not
+ * fetch). `undefined` for anything else.
+ */
+async function mergedTree(
+  p: TreePreview,
+  base: string,
+  ours: string,
+  theirs: string,
+): Promise<{ readonly tree?: string } | undefined> {
+  const run = await p.read([
+    "merge-tree",
+    "--write-tree",
+    "--no-messages",
+    `--merge-base=${base}`,
+    ours,
+    theirs,
+  ]);
+  if (run === undefined) return undefined;
+  if (run.code === 128 || run.code === 129) return {};
+  if (run.code !== 0 && run.code !== 1) return undefined;
+  const tree = linesOf(run.stdout)[0];
+  return tree === undefined ? undefined : { tree };
+}
+
+/** One commit of a replay, the change from `base` to `theirs`. */
+type ReplayStep = { readonly base: string; readonly theirs: string };
+
+/**
+ * The names replaying `steps` onto `ours` changes, or `undefined`. With
+ * `configArgs`, the real command runs under them: that is what makes these names
+ * exact when the merge itself could not be previewed.
+ */
+async function replayNames(
+  p: TreePreview,
+  ours: string,
+  steps: readonly ReplayStep[],
+): Promise<{ readonly names: string[]; readonly configArgs?: readonly string[] } | undefined> {
+  if ((await hasMergeTreeBase(p)) === true) {
+    const names = new Set<string>();
+    let current = ours;
+    let previewed = true;
+    for (const { base, theirs } of steps) {
+      const merged = await mergedTree(p, base, current, theirs);
+      if (merged === undefined) return undefined;
+      if (merged.tree === undefined) {
+        previewed = false;
+        break;
+      }
+      const changed = await namesBetween(p, current, merged.tree);
+      if (changed === undefined) return undefined;
+      for (const name of changed) names.add(name);
+      current = merged.tree;
+    }
+    if (previewed) return { names: [...names] };
+  }
+  const names = new Set<string>();
+  for (const { base, theirs } of steps) {
+    const changed = await namesBetween(p, base, theirs);
+    if (changed === undefined) return undefined;
+    for (const name of changed) names.add(name);
+  }
+  return { names: [...names], configArgs: RENAMES_OFF };
+}
+
+/**
+ * The commits `git switch` may land on for this name; none when it resolves to
+ * nothing. It reads `refs/heads/<name>` first in every form, where `rev-parse`
+ * prefers a tag, but only for a name that can be a branch's, as
+ * `check-ref-format --branch` says: `b~1` is `git switch`'s revision syntax over
+ * whatever `b` resolves to, and `@{-1}` names a branch. `HEAD` and `@` are the
+ * two names that command turns down or leaves alone and `git switch` still reads
+ * as `refs/heads/HEAD`. A plain switch that finds no commit by that name guesses
+ * a remote-tracking branch: `checkout.defaultRemote` can pick among several, so
+ * all of them count. `A...B` is their merge base to `git switch` and a range to
+ * `rev-parse`, which prints that base with a `^`.
+ *
+ * A name resolves first and peels after: `:/text` is a search that takes
+ * everything after it, a `^{commit}` included.
+ */
+async function switchTargets(
+  p: TreePreview,
+  name: string,
+  plain: boolean,
+): Promise<string[] | undefined> {
+  const commitOf = async (rev: string): Promise<string[] | undefined> => {
+    const resolved = await p.read(["rev-parse", "--verify", "--quiet", rev]);
+    if (resolved === undefined) return undefined;
+    const oid = resolved.code === 0 ? linesOf(resolved.stdout)[0] : undefined;
+    if (oid === undefined) return [];
+    const peeled = await p.read(["rev-parse", "--verify", "--quiet", `${oid}^{commit}`]);
+    if (peeled === undefined) return undefined;
+    return peeled.code === 0 ? linesOf(peeled.stdout) : [];
+  };
+  const asBranch = await p.read(["check-ref-format", "--branch", name]);
+  if (asBranch === undefined) return undefined;
+  const branchName =
+    name === "HEAD" || name === "@"
+      ? "HEAD"
+      : asBranch.code === 0
+        ? linesOf(asBranch.stdout)[0]
+        : undefined;
+  const branch = branchName === undefined ? [] : await commitOf(`refs/heads/${branchName}`);
+  if (branch === undefined || branch.length > 0) return branch;
+  const named = await commitOf(name);
+  if (named === undefined || named.length > 0) return named;
+  if (name.includes("...")) {
+    const range = await p.read(["rev-parse", "--revs-only", name]);
+    if (range === undefined || range.code !== 0) return undefined;
+    return linesOf(range.stdout)
+      .filter((rev) => rev.startsWith("^"))
+      .map((rev) => rev.slice(1));
+  }
+  if (!plain) return [];
+  const guess = await p.read(["for-each-ref", "--format=%(objectname)", `refs/remotes/**/${name}`]);
+  return guess === undefined || guess.code !== 0 ? undefined : linesOf(guess.stdout);
+}
+
+/** The names a switch to `name` changes, from HEAD to each commit it may land on. */
+async function switchNames(
+  p: TreePreview,
+  name: string,
+  plain: boolean,
+): Promise<{ readonly names: string[]; readonly targets: readonly string[] } | undefined> {
+  const targets = await switchTargets(p, name, plain);
+  const head = await p.read(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+  if (targets === undefined || head === undefined) return undefined;
+  const from = head.code === 0 ? linesOf(head.stdout)[0] : await emptyTree(p);
+  if (from === undefined) return undefined;
+  const names: string[] = [];
+  for (const target of targets) {
+    const changed = await namesBetween(p, from, target);
+    if (changed === undefined) return undefined;
+    for (const changedName of changed) names.push(changedName);
+  }
+  return { names, targets };
+}
+
+/**
+ * Each commit `git cherry-pick <refs>` replays, in its order, against the parent
+ * it replays from: `mainline`'s, or the empty tree for a root commit. A range
+ * walks as cherry-pick walks it, oldest first.
+ */
+async function pickSteps(
+  p: TreePreview,
+  refs: readonly string[],
+  mainline: number | undefined,
+): Promise<ReplayStep[] | undefined> {
+  const revs = await p.read(["rev-parse", "--revs-only", ...refs]);
+  if (revs === undefined || revs.code !== 0) return undefined;
+  const listed = linesOf(revs.stdout);
+  if (listed.length === 0) return [];
+  const walk = listed.some((rev) => rev.startsWith("^")) ? "--reverse" : "--no-walk=unsorted";
+  const commits = await p.read(["rev-list", "--parents", walk, ...listed]);
+  if (commits === undefined || commits.code !== 0) return undefined;
+  const steps: ReplayStep[] = [];
+  let empty: string | undefined;
+  for (const line of linesOf(commits.stdout)) {
+    const [theirs, ...parents] = line.split(" ");
+    if (theirs === undefined) continue;
+    const parent = parents[(mainline ?? 1) - 1];
+    if (parent === undefined) empty ??= await emptyTree(p);
+    const base = parent ?? empty;
+    if (base === undefined) return undefined;
+    steps.push({ base, theirs });
+  }
+  return steps;
+}
+
+/**
+ * The names `git stash push` changes: what it takes back to HEAD, what
+ * `keepIndex` leaves from the index, and the untracked files it removes. A push
+ * covers the whole repository unless it names paths, and `ls-files` lists only
+ * `cwd` unless told otherwise.
+ */
+async function stashPushNames(
+  p: TreePreview,
+  pathspec: readonly string[],
+  includeUntracked: boolean,
+): Promise<string[] | undefined> {
+  const worktree = await diffNames(p, ["HEAD", ...pathspec]);
+  const index = await diffNames(p, ["--cached", "HEAD", ...pathspec]);
+  if (worktree === undefined || index === undefined) return undefined;
+  if (!includeUntracked) return [...worktree, ...index];
+  const untracked = await p.read([
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "--full-name",
+    "-z",
+    ...(pathspec.length > 0 ? pathspec : ["--", ":/"]),
+  ]);
+  if (untracked === undefined || untracked.code !== 0) return undefined;
+  return [...worktree, ...index, ...splitNul(untracked.stdout)];
+}
+
+/** The names `git stash apply <entry>` changes, the entry's untracked files with them. */
+async function stashApplyNames(
+  p: TreePreview,
+  entry: string,
+): Promise<{ readonly names: string[]; readonly configArgs?: readonly string[] } | undefined> {
+  const stash = await p.read(["rev-parse", "--verify", "--quiet", `${entry}^{commit}`]);
+  if (stash === undefined) return undefined;
+  const commit = stash.code === 0 ? linesOf(stash.stdout)[0] : undefined;
+  if (commit === undefined) return { names: [] };
+  const ours = await indexTree(p);
+  if (ours === undefined) return undefined;
+  const replayed = await replayNames(p, ours, [{ base: `${commit}^1`, theirs: commit }]);
+  if (replayed === undefined) return undefined;
+  const third = await p.read(["rev-parse", "--verify", "--quiet", `${commit}^3^{commit}`]);
+  if (third === undefined) return undefined;
+  if (third.code !== 0) return replayed;
+  const untracked = await p.read([
+    "ls-tree",
+    "-r",
+    "--name-only",
+    "--full-tree",
+    "-z",
+    `${commit}^3`,
+  ]);
+  if (untracked === undefined || untracked.code !== 0) return undefined;
+  return { ...replayed, names: [...replayed.names, ...splitNul(untracked.stdout)] };
+}
+
+// ---------------------------------------------------------------------------
 // write tools
 
 export const gitAdd: RegisteredTool = buildTool({
@@ -939,11 +1293,37 @@ export const gitSwitch: RegisteredTool = buildTool({
     const bad = checkRefArgs("GitSwitch", [input.branch, input.startPoint]);
     if (bad !== undefined) return bad.message;
     const repo = opened.value;
+    const roots = protectedRootsOf(ctx);
+    const plain = input.create !== true && input.detach !== true;
+    let nameFound = true;
+    let landing = input.branch;
+    // `-c` with no start point moves no file, and is what works on an unborn HEAD.
+    if (roots.length > 0 && (input.create !== true || input.startPoint !== undefined)) {
+      const name = input.create === true ? (input.startPoint ?? input.branch) : input.branch;
+      const listed = await switchNames(previewOf(repo), name, plain);
+      if (listed === undefined) {
+        return protectedWriteRefusal("GitSwitch", "a switch whose changes could not be listed");
+      }
+      const hit = protectedAmong(repo, listed.names, roots);
+      if (hit !== undefined) return protectedWriteRefusal("GitSwitch", `the change to ${hit}`);
+      nameFound = listed.targets.length > 0;
+      // Only a plain switch can go on to guess. With a name that resolves to nothing
+      // git fails this form too, so nothing is lost by stopping here.
+      if (!plain && !nameFound) {
+        return protectedWriteRefusal("GitSwitch", "a switch whose changes could not be listed");
+      }
+      // A detached HEAD lands on what was checked. `-c` keeps the name, which is
+      // what sets a new branch's upstream.
+      const [only, ...others] = listed.targets;
+      if (input.detach === true && only !== undefined && others.length === 0) landing = only;
+    }
     const run = await repo.run([
       "switch",
       ...(input.create === true ? ["-c"] : []),
       ...(input.detach === true ? ["--detach"] : []),
-      input.branch,
+      // Nothing was found for this name, so git has nothing checked to guess at.
+      ...(plain && !nameFound ? ["--no-guess"] : []),
+      landing,
       ...(input.startPoint !== undefined ? [input.startPoint] : []),
     ]);
     if (run.code !== 0) return failure("GitSwitch", run);
@@ -1066,13 +1446,27 @@ export const gitStashPush: RegisteredTool = buildTool({
     const paths = input.paths ?? [];
     const checked = checkPathspecs("GitStashPush", paths, repo.cwd);
     if (!checked.ok) return checked.message;
+    const pathspec = paths.length > 0 ? ["--", ...checked.value] : [];
+    const roots = protectedRootsOf(ctx);
+    if (roots.length > 0) {
+      const names = await stashPushNames(
+        previewOf(repo),
+        pathspec,
+        input.includeUntracked === true,
+      );
+      if (names === undefined) {
+        return protectedWriteRefusal("GitStashPush", "a stash whose changes could not be listed");
+      }
+      const hit = protectedAmong(repo, names, roots);
+      if (hit !== undefined) return protectedWriteRefusal("GitStashPush", `the change to ${hit}`);
+    }
     const run = await repo.run([
       "stash",
       "push",
       ...(input.includeUntracked === true ? ["--include-untracked"] : []),
       ...(input.keepIndex === true ? ["--keep-index"] : []),
       ...(input.message !== undefined ? ["-m", input.message] : []),
-      ...(paths.length > 0 ? ["--", ...checked.value] : []),
+      ...pathspec,
     ]);
     if (run.code !== 0) return failure("GitStashPush", run);
     const list = await repo.run(["stash", "list", `--format=${STASH_FORMAT}`, "--max-count=1"], {
@@ -1111,11 +1505,25 @@ export const gitStashPop: RegisteredTool = buildTool({
     const opened = await openRepo("GitStashPop", input, ctx?.signal);
     if (!opened.ok) return opened.message;
     const repo = opened.value;
-    const run = await repo.run([
-      "stash",
-      input.apply === true ? "apply" : "pop",
-      ...(input.stash !== undefined ? [input.stash] : []),
-    ]);
+    const roots = protectedRootsOf(ctx);
+    let configArgs: readonly string[] | undefined;
+    if (roots.length > 0) {
+      const listed = await stashApplyNames(previewOf(repo), input.stash ?? "stash@{0}");
+      if (listed === undefined) {
+        return protectedWriteRefusal("GitStashPop", "a stash whose changes could not be listed");
+      }
+      const hit = protectedAmong(repo, listed.names, roots);
+      if (hit !== undefined) return protectedWriteRefusal("GitStashPop", `the change to ${hit}`);
+      configArgs = listed.configArgs;
+    }
+    const run = await repo.run(
+      [
+        "stash",
+        input.apply === true ? "apply" : "pop",
+        ...(input.stash !== undefined ? [input.stash] : []),
+      ],
+      configArgs !== undefined ? { configArgs } : {},
+    );
     if (run.code !== 0) return failure("GitStashPop", run);
     return json({
       restored: input.stash ?? "stash@{0}",
@@ -1455,12 +1863,33 @@ export const gitCherryPick: RegisteredTool = buildTool({
     const bad = checkRefArgs("GitCherryPick", input.refs);
     if (bad !== undefined) return bad.message;
     const repo = opened.value;
-    const run = await repo.run([
-      "cherry-pick",
-      ...(input.noCommit === true ? ["--no-commit"] : []),
-      ...(input.mainline !== undefined ? ["--mainline", String(input.mainline)] : []),
-      ...input.refs,
-    ]);
+    const roots = protectedRootsOf(ctx);
+    let configArgs: readonly string[] | undefined;
+    if (roots.length > 0) {
+      const refused = protectedWriteRefusal(
+        "GitCherryPick",
+        "a pick whose changes could not be listed",
+      );
+      const p = previewOf(repo);
+      const steps = await pickSteps(p, input.refs, input.mainline);
+      if (steps === undefined) return refused;
+      const ours = input.noCommit === true ? await indexTree(p) : "HEAD";
+      if (ours === undefined) return refused;
+      const listed = await replayNames(p, ours, steps);
+      if (listed === undefined) return refused;
+      const hit = protectedAmong(repo, listed.names, roots);
+      if (hit !== undefined) return protectedWriteRefusal("GitCherryPick", `the change to ${hit}`);
+      configArgs = listed.configArgs;
+    }
+    const run = await repo.run(
+      [
+        "cherry-pick",
+        ...(input.noCommit === true ? ["--no-commit"] : []),
+        ...(input.mainline !== undefined ? ["--mainline", String(input.mainline)] : []),
+        ...input.refs,
+      ],
+      configArgs !== undefined ? { configArgs } : {},
+    );
     if (run.code !== 0) {
       const conflicted = await repo.run(["diff", "--name-only", "--diff-filter=U", "-z"], {
         readOnly: true,
@@ -1517,7 +1946,7 @@ export const gitResetPaths: RegisteredTool = buildTool({
 
 export const gitWorktreeAdd: RegisteredTool = buildTool({
   name: "GitWorktreeAdd",
-  operativeArgs: [{ field: "path", kind: "path" }],
+  operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
   description:
     "Create an additional worktree inside the workspace, checked out at a ref or on a new branch. Use it to work on two branches at once without stashing; the path must be inside the working directory.",
   inputSchema: z.object({

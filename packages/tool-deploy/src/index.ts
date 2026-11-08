@@ -86,7 +86,7 @@ import { autoRegisterSpecVersion, nextVersion } from "@crewhaus/spec-changelog";
 import { type RegistryAdapter, createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { openForReadSync, protectedRootsOf, protectedWriteRefusal } from "@crewhaus/tool-safety/fs";
+import { openForReadSync, protectedRootsOf } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   AUDIT_LOG_UNAVAILABLE,
@@ -106,7 +106,6 @@ import {
   predictRegistration,
   probeTenantOverlay,
   probeVersion,
-  protectedRootOfSpec,
   readManifest,
   reservedRegistryRoot,
   resolveName,
@@ -180,6 +179,9 @@ type Opened = {
  * passed in rather than read here because the two writers need different
  * sets: a rollback touches one version, a registration reads every stored one
  * and writes the next.
+ *
+ * `protectedRoots` is what a call that may write is refused for landing in: the
+ * roots on its bridge. A read leaves it out.
  */
 function open(
   tool: string,
@@ -187,7 +189,7 @@ function open(
   registryDirRel: string | undefined,
   knownVersions: ReadonlyArray<string>,
   tenant: string | undefined,
-  protectedRoots: readonly string[],
+  protectedRoots: readonly string[] = [],
 ): Loaded<Opened> {
   const name = resolveName(rawName);
   if (!name.ok) return name;
@@ -203,25 +205,26 @@ function open(
       `registry root "${render(rootRel)}" is not written to: ${reserved}. Point registryDir at a registry's own root, such as "${DEFAULT_REGISTRY_RELDIR}".`,
     );
   }
-  const specPaths = containSpecPaths(tool, root.value, name.value.registryName, knownVersions);
+  const specPaths = containSpecPaths(
+    tool,
+    root.value,
+    name.value.registryName,
+    knownVersions,
+    protectedRoots,
+  );
   if (specPaths !== undefined) return specPaths;
   if (tenant !== undefined) {
     if (tenant.includes("\u0000")) {
       return fail("bad-input", `tenant id "${render(tenant)}" contains a NUL byte`);
     }
-    const tenantPaths = containTenantPaths(tool, root.value, tenant, name.value.registryName);
+    const tenantPaths = containTenantPaths(
+      tool,
+      root.value,
+      tenant,
+      name.value.registryName,
+      protectedRoots,
+    );
     if (tenantPaths !== undefined) return tenantPaths;
-  }
-  const held = protectedRootOfSpec(
-    tool,
-    root.value,
-    name.value.registryName,
-    knownVersions,
-    tenant,
-    protectedRoots,
-  );
-  if (held !== undefined) {
-    return fail("refused", protectedWriteRefusal(tool, `spec "${render(rawName)}"`));
   }
   return {
     ok: true,
@@ -454,6 +457,7 @@ export const specPin: RegisteredTool = buildTool({
     const tool = "SpecPin";
     const dryRun = input.dryRun ?? false;
     const repin = input.repin ?? false;
+    const protectedRoots = protectedRootsOf(ctx);
 
     // The spec file first: there is no point containing a registry for a
     // registration whose input cannot be read.
@@ -490,14 +494,7 @@ export const specPin: RegisteredTool = buildTool({
     // Contain the root and the leaves. The version files are not known yet, so
     // this first pass contains what does not depend on them; the manifest read
     // below then yields the version list and the set is re-contained in full.
-    const first = open(
-      tool,
-      input.name,
-      input.registryDir,
-      [],
-      input.tenant,
-      protectedRootsOf(ctx),
-    );
+    const first = open(tool, input.name, input.registryDir, [], input.tenant, protectedRoots);
     if (!first.ok) return refusal(tool, first.code, first.reason);
 
     const manifestState = await readManifest(
@@ -524,7 +521,7 @@ export const specPin: RegisteredTool = buildTool({
       input.registryDir,
       [...versions, candidate],
       input.tenant,
-      protectedRootsOf(ctx),
+      protectedRoots,
     );
     if (!opened.ok) return refusal(tool, opened.code, opened.reason);
     const { registry, name, rootAbs, rootRel } = opened.value;
@@ -952,6 +949,7 @@ export const deployRollback: RegisteredTool = buildTool({
   execute: async (input, ctx) => {
     const tool = "DeployRollback";
     const dryRun = input.dryRun ?? true;
+    const protectedRoots = protectedRootsOf(ctx);
 
     if (input.actor !== undefined && input.actor.length > MAX_ACTOR_CHARS) {
       return refusal(tool, "bad-input", `actor is longer than ${MAX_ACTOR_CHARS} characters`);
@@ -967,14 +965,7 @@ export const deployRollback: RegisteredTool = buildTool({
     }
 
     // First pass with no version files; the manifest read yields the list.
-    const first = open(
-      tool,
-      input.name,
-      input.registryDir,
-      [],
-      input.tenant,
-      protectedRootsOf(ctx),
-    );
+    const first = open(tool, input.name, input.registryDir, [], input.tenant, protectedRoots);
     if (!first.ok) return refusal(tool, first.code, first.reason);
     const manifestState = await readManifest(
       first.value.registry,
@@ -1005,7 +996,7 @@ export const deployRollback: RegisteredTool = buildTool({
       input.registryDir,
       versions,
       input.tenant,
-      protectedRootsOf(ctx),
+      protectedRoots,
     );
     if (!opened.ok) return refusal(tool, opened.code, opened.reason);
     const { registry, name, rootRel } = opened.value;

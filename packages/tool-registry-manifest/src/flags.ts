@@ -2416,7 +2416,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "path", kind: "path" }],
+    operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
   },
   gitWorktreeList: {
     key: "gitWorktreeList",

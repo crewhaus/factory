@@ -44,6 +44,11 @@ import { randomBytes as cryptoRandomBytes } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import {
+  protectedRootHolding,
+  protectedRootsOf,
+  protectedWriteRefusal,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { classifyWrite, helperName } from "./lib/backends";
 import {
@@ -58,6 +63,8 @@ import {
 } from "./lib/envfile";
 import { describeValue, fingerprint } from "./lib/fingerprint";
 import {
+  JOURNAL_PATH,
+  LOCK_PATH,
   _setClock,
   acquireLock,
   appendJournal,
@@ -78,7 +85,7 @@ import {
 import { type Resolution, _setEnv, reasonOf, resolveChain, resolveOne } from "./lib/resolve";
 import { _setRunner, runCommand } from "./lib/run";
 import { writeFileAtomic } from "./lib/write";
-import { ToolPermissionError, resolveSafe } from "./paths";
+import { ToolPermissionError, resolveSafe, workspaceRoot } from "./paths";
 
 /** The seams. Every test in this package drives these instead of the host. */
 export { _setRunner, _setEnv, _setClock };
@@ -794,6 +801,23 @@ export const secretRotate: RegisteredTool = buildTool({
     const wantFrom = input.newValueFrom !== undefined;
     if (wantGenerate === wantFrom) {
       return `[SecretRotate error] give exactly one of generate or newValueFrom (${wantGenerate ? "both were given" : "neither was given"}). There is no default new value: guessing one would write a credential nobody chose.`;
+    }
+
+    // The lock, the journal and a `file:` secret's kept copy are written at
+    // paths no field names, each where its links lead, so they meet the
+    // runtime-state roots here: before the lock, so a dry run refuses too.
+    const kept = previousRef(ref);
+    for (const rel of [LOCK_PATH, JOURNAL_PATH, ...(kept?.kind === "file" ? [kept.path] : [])]) {
+      let real: string;
+      try {
+        real = resolveSafe("SecretRotate", rel).real;
+      } catch {
+        // Outside the workspace: the write that would reach it refuses it.
+        continue;
+      }
+      if (protectedRootHolding(real, protectedRootsOf(ctx), workspaceRoot()) !== undefined) {
+        return protectedWriteRefusal("SecretRotate", `rotating ${label}`);
+      }
     }
 
     // The whole rotation runs under the lock, including the dry run, because a

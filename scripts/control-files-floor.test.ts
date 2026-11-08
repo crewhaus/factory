@@ -24,12 +24,15 @@
  *   writers, go on adding to it.
  * - in a harness's own directory, the real Write, Edit and the tools that check
  *   their own writes through the run, then the real spawn plan and a real start;
+ * - a tool that moves the working tree, through runChatLoop, whose targets no
+ *   path field names: what it would change is what it checks.
  *
  * No test here writes under the real home directory: the default Hangar
  * root is only ever named in decisions, and a Write there lies outside the
  * workspace, which the tool refuses on its own.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -108,15 +111,21 @@ import {
   removePath,
   tempDir as tempDirTool,
 } from "../packages/tool-fsx/src/index";
-import { GIT_TOOLS, gitApplyPatch } from "../packages/tool-git/src/index";
+import {
+  GIT_TOOLS,
+  gitApplyPatch,
+  gitCherryPick,
+  gitStashPop,
+  gitSwitch,
+} from "../packages/tool-git/src/index";
 import { imageGenerate } from "../packages/tool-image-generation/src/index";
-import { storeMigrate } from "../packages/tool-lifecycle/src/index";
+import { harnessRetire, knowledgeSync, storeMigrate } from "../packages/tool-lifecycle/src/index";
 import { createMemoryTools } from "../packages/tool-memory/src/index";
 import { createAllMouseKeyboardTools } from "../packages/tool-mouse-keyboard/src/index";
 import { emitTraceEvent, incidentBundle } from "../packages/tool-obs/src/index";
 import { createPlanTools } from "../packages/tool-plan/src/index";
 import { TOOL_REGISTRY } from "../packages/tool-registry-manifest/src/generated";
-import { experimentLedger } from "../packages/tool-routing/src/index";
+import { experimentLedger, routeControl } from "../packages/tool-routing/src/index";
 import { envFileUpsert, secretRotate } from "../packages/tool-secrets/src/index";
 import { doctorFix } from "../packages/tool-specops/src/index";
 import {
@@ -3797,6 +3806,1416 @@ describe("what a harness's next start runs, in its own directory", () => {
       expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
       const out = JSON.parse(r.result ?? "{}") as { dryRun?: boolean };
       expect(out.dryRun).toBe(true);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The tools that move the working tree
+// ---------------------------------------------------------------------------
+
+describe("a tool that writes the files it names refuses one that lands on the floor", () => {
+  const TOOLS = [
+    specPin,
+    deployRollback,
+    knowledgeSync,
+    harnessRetire,
+    experimentLedger,
+    routeControl,
+  ];
+  const RULES = allowIn(...TOOLS.map((tool) => tool.name));
+  const SETTINGS_FILE = join(".crewhaus", "settings.json");
+  const DENIES = `${JSON.stringify({
+    permissions: { rules: [{ type: "alwaysDeny", pattern: "Bash" }] },
+  })}\n`;
+  const ALLOWS = DENIES.replace("alwaysDeny", "alwaysAllow");
+  const JUSTIFICATION = "control files floor";
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    base = tempDir("crewhaus-floor-named-");
+    ws = join(base, "harness");
+    mkdirSync(ws);
+    env = { CREWHAUS_HANGAR_ROOT: join(base, "home"), CREWHAUS_REGISTRY_ROOT: join(base, "reg") };
+    put(SETTINGS_FILE, DENIES);
+    process.chdir(ws);
+  });
+  afterEach(() => {
+    process.chdir(originalCwd);
+  });
+
+  const linkToSettings = (rel: string): void => {
+    mkdirSync(dirname(join(ws, rel)), { recursive: true });
+    symlinkSync(relative(dirname(join(ws, rel)), join(ws, SETTINGS_FILE)), join(ws, rel));
+  };
+  const rulesNow = (): string[] =>
+    loadSettingsRules(ws).map((rule) => `${rule.type} ${rule.pattern}`);
+  /** One call through the run loop, refused for what it would write, with the settings as they were. */
+  const refusedInBothModes = async (
+    name: string,
+    input: Record<string, unknown>,
+  ): Promise<void> => {
+    for (const mode of ["auto", "bypass"] as const) {
+      const r = await turn(
+        { name, input: { justification: JUSTIFICATION, ...input } },
+        TOOLS,
+        RULES,
+        mode,
+      );
+      expect(r.result ?? "").toContain(REFUSED);
+      expect(readFileSync(join(ws, SETTINGS_FILE), "utf8")).toBe(DENIES);
+      expect(rulesNow()).toEqual(["alwaysDeny Bash"]);
+    }
+  };
+
+  test("SpecPin: the next version's file and the changelog", async () => {
+    put("spec.yaml", ALLOWS);
+    for (const leaf of ["v1.yaml", "CHANGELOG.md"]) {
+      linkToSettings(`s/sp/${leaf}`);
+      await refusedInBothModes("SpecPin", { name: "sp", specFile: "spec.yaml", registryDir: "s" });
+      rmSync(join(ws, "s", "sp", leaf));
+    }
+  });
+
+  test("DeployRollback: a tenant's overlay", async () => {
+    put("spec.yaml", "name: sp\n");
+    await specPin.execute(
+      { name: "sp", specFile: "spec.yaml", registryDir: "s", env: "prod" } as never,
+      undefined,
+    );
+    linkToSettings("s/_tenants/acme/sp.json");
+    await refusedInBothModes("DeployRollback", {
+      name: "sp",
+      env: "prod",
+      toVersion: "v1",
+      registryDir: "s",
+      tenant: "acme",
+      dryRun: false,
+    });
+  });
+
+  test("KnowledgeSync: the name a pull lands a fragment under, and a push's manifest", async () => {
+    const hash = createHash("sha256").update(ALLOWS.trim()).digest("hex");
+    put(`shared/prompts/${hash}.md`, ALLOWS);
+    linkToSettings(`fleet/other/.crewhaus/prompts/shared-${hash.slice(0, 12)}.md`);
+    await refusedInBothModes("KnowledgeSync", {
+      direction: "pull",
+      dir: "fleet/other",
+      sharedDir: "shared",
+      dryRun: false,
+    });
+    put("fleet/mine/.crewhaus/knowledge.json", '{"share":true}');
+    put(
+      "fleet/mine/.crewhaus/memories/m.jsonl",
+      `${JSON.stringify({ id: "m1", text: "keep it brief", tags: [] })}\n`,
+    );
+    linkToSettings("pool/manifest.jsonl");
+    await refusedInBothModes("KnowledgeSync", {
+      direction: "push",
+      dir: "fleet/mine",
+      sharedDir: "pool",
+      allowWithoutPiiRedaction: true,
+      dryRun: false,
+    });
+  });
+
+  test("HarnessRetire: the files it keeps in the archive", async () => {
+    put("fleet/other/.crewhaus/sessions/sess_00000000000000bb.json", '{"id":"b"}');
+    for (const name of ["retirement.json", "state-manifest.json"]) {
+      linkToSettings(`arch/${name}`);
+      await refusedInBothModes("HarnessRetire", {
+        spec: "other",
+        dir: "fleet/other",
+        archiveDir: "arch",
+        dryRun: false,
+        acceptUnverified: true,
+        overwriteArchive: true,
+      });
+      expect(existsSync(join(ws, "fleet", "other", ".crewhaus"))).toBe(true);
+      rmSync(join(ws, "arch", name));
+    }
+  });
+
+  test("ExperimentLedger: the ledger a record appends to, and RouteControl: its freeze marker", async () => {
+    linkToSettings("s/e.jsonl");
+    await refusedInBothModes("ExperimentLedger", {
+      action: "record",
+      name: "e",
+      experimentsDir: "s",
+      version: "v",
+      outcome: "success",
+      allowUnknownVersion: true,
+      dryRun: false,
+    });
+    linkToSettings("fleet/other/.crewhaus/routing/freeze.json");
+    await refusedInBothModes("RouteControl", {
+      action: "freeze",
+      dir: "fleet/other",
+      policyVersion: "p",
+      dryRun: false,
+    });
+  });
+});
+
+describe("a tool that moves the working tree refuses a change that lands on the floor", () => {
+  const TOOLS = [write, edit, movePath, ...GIT_TOOLS, harnessRetire];
+  const RULES = allowIn(
+    "Write",
+    "Edit",
+    "MovePath",
+    ...GIT_TOOLS.map((tool) => tool.name),
+    "HarnessRetire",
+  );
+  // Slow by construction: a whole run per call, and each call spawns git many times.
+  const CHAIN_MS = 60_000;
+  const DENIES = `${JSON.stringify({
+    permissions: { rules: [{ type: "alwaysDeny", pattern: "Bash" }] },
+    pad: "a".repeat(80),
+  })}\n`;
+  const ALLOWS = DENIES.replace("alwaysDeny", "alwaysAllow");
+  const SETTINGS_FILE = join(".crewhaus", "settings.json");
+  const GUARD_RULE = ["alwaysDeny Bash"];
+  const LINK_DIFF =
+    "diff --git a/.crewhaus b/.crewhaus\nnew file mode 120000\n--- /dev/null\n+++ b/.crewhaus\n@@ -0,0 +1 @@\n+fake\n\\ No newline at end of file\n";
+
+  const VARS = {
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_AUTHOR_NAME: "A U Thor",
+    GIT_AUTHOR_EMAIL: "author@example.com",
+    GIT_COMMITTER_NAME: "A U Thor",
+    GIT_COMMITTER_EMAIL: "author@example.com",
+  };
+  const saved = new Map<string, string | undefined>();
+  const setVar = (name: string, value: string): void => {
+    if (!saved.has(name)) saved.set(name, process.env[name]);
+    process.env[name] = value;
+  };
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    base = tempDir("crewhaus-floor-tree-");
+    ws = join(base, "harness");
+    mkdirSync(ws);
+    env = { CREWHAUS_HANGAR_ROOT: join(base, "home"), CREWHAUS_REGISTRY_ROOT: join(base, "reg") };
+    for (const [name, value] of Object.entries({ ...VARS, ...env })) setVar(name, value);
+    process.chdir(ws);
+  });
+  afterEach(() => {
+    process.chdir(originalCwd);
+    for (const [name, value] of saved) {
+      if (value === undefined) Reflect.deleteProperty(process.env, name);
+      else process.env[name] = value;
+    }
+    saved.clear();
+  });
+
+  const git = (args: readonly string[], opts: { cwd?: string; stdin?: string } = {}): string => {
+    const ran = Bun.spawnSync(["git", ...args], {
+      cwd: opts.cwd ?? ws,
+      env: process.env,
+      stdin: opts.stdin === undefined ? "ignore" : new TextEncoder().encode(opts.stdin),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (ran.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${ran.stderr.toString()}`);
+    return ran.stdout.toString();
+  };
+  /** What HEAD is now, with an unborn one answered as such. */
+  const head = (): string => {
+    const at = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", "HEAD"], {
+      cwd: ws,
+      env: process.env,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    return at.exitCode === 0 ? at.stdout.toString().trim() : "(unborn)";
+  };
+  const commitAll = (message: string): void => {
+    git(["add", "-A"]);
+    git(["commit", "-q", "-m", message]);
+  };
+  const seedRepo = (
+    opts: { tracked?: boolean; ignored?: boolean; noSettings?: boolean } = {},
+  ): void => {
+    git(["init", "-q", "-b", "main", "."]);
+    put("a.txt", "hi\n");
+    if (opts.noSettings !== true) put(SETTINGS_FILE, DENIES);
+    put(".gitignore", opts.ignored === true ? ".crewhaus/\nwt/\n" : "wt/\n");
+    git(["add", "a.txt", ".gitignore"]);
+    if (opts.tracked === true) git(["add", SETTINGS_FILE]);
+    git(["commit", "-q", "-m", "base"]);
+  };
+  /** A commit on HEAD with `entries` (`mode oid<TAB>name` lines) added, made in an index of its own. */
+  const commitOver = (entries: string, message: string): string => {
+    setVar("GIT_INDEX_FILE", join(base, "scratch-index"));
+    try {
+      git(["read-tree", "HEAD"]);
+      git(["update-index", "--index-info"], { stdin: entries });
+      return git(["commit-tree", git(["write-tree"]).trim(), "-p", "HEAD", "-m", message]).trim();
+    } finally {
+      Reflect.deleteProperty(process.env, "GIT_INDEX_FILE");
+    }
+  };
+  const settingsNow = (): string => {
+    const at = join(ws, SETTINGS_FILE);
+    return existsSync(at) ? readFileSync(at, "utf8") : "(gone)";
+  };
+  const rulesNow = (): string[] =>
+    loadSettingsRules(ws).map((rule) => `${rule.type} ${rule.pattern}`);
+  const roots = (): string[] => runtimeStateRoots(undefined, undefined, ws, env);
+
+  /** One call that must run: a chain that stops early proves nothing about its last call. */
+  const call = async (
+    name: string,
+    input: Record<string, unknown>,
+    mode: PermissionMode = "auto",
+  ): Promise<string> => {
+    const r = await turn({ name, input }, TOOLS, RULES, mode);
+    expect({ name, decision: r.decision }).toEqual({ name, decision: "allow" });
+    expect(r.result ?? "").not.toContain(REFUSED);
+    return r.result ?? "";
+  };
+  /** One call that must be refused for what it would write, with the settings file as it was. */
+  const refused = async (
+    name: string,
+    input: Record<string, unknown>,
+    phrase = "the change to",
+    mode: PermissionMode = "auto",
+  ): Promise<string> => {
+    const before = { settings: settingsNow(), rules: rulesNow(), head: head() };
+    const r = await turn({ name, input }, TOOLS, RULES, mode);
+    expect(r.result ?? "").toContain(REFUSED);
+    expect(r.result ?? "").toContain(phrase);
+    expect({ settings: settingsNow(), rules: rulesNow(), head: head() }).toEqual(before);
+    return r.result ?? "";
+  };
+
+  /** A second worktree on branch `b`, whose settings file a commit there changes. */
+  const branchChangingSettings = async (mode: PermissionMode = "auto"): Promise<void> => {
+    await call("GitWorktreeAdd", { path: "wt", createBranch: "b" }, mode);
+    await call(
+      "Edit",
+      {
+        path: join("wt", SETTINGS_FILE),
+        oldString: "alwaysDeny",
+        newString: "alwaysAllow",
+      },
+      mode,
+    );
+    await call("GitAdd", { cwd: "wt", paths: ["."] }, mode);
+    await call("GitCommit", { cwd: "wt", message: "c" }, mode);
+  };
+  /** The settings file moved to `foo.json` in `wt` and committed, with an edit to `foo.json` left uncommitted. */
+  const branchRenamingSettings = async (): Promise<void> => {
+    await call("GitWorktreeAdd", { path: "wt", createBranch: "b" });
+    await call("MovePath", { source: join("wt", SETTINGS_FILE), destination: "wt/foo.json" });
+    await call("GitAdd", { cwd: "wt", paths: ["."] });
+    await call("GitCommit", { cwd: "wt", message: "move" });
+    await call("Edit", {
+      path: "wt/foo.json",
+      oldString: "alwaysDeny",
+      newString: "alwaysAllow",
+    });
+  };
+  const namesOnly = (args: readonly string[]): string[] =>
+    git(args, { cwd: join(ws, "wt") })
+      .trim()
+      .split("\n");
+
+  describe("a call refused, with the settings file and the rules it loads unchanged", () => {
+    test(
+      "a pick that changes the settings file",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchChangingSettings();
+        const out = await refused("GitCherryPick", { refs: ["b"] });
+        expect(out).toContain(".crewhaus/settings.json");
+        expect(rulesNow()).toEqual(GUARD_RULE);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a pick that follows a rename onto the settings file, though the commit lists only another file",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchRenamingSettings();
+        await call("GitAdd", { cwd: "wt", paths: ["."] });
+        await call("GitCommit", { cwd: "wt", message: "c" });
+        expect(namesOnly(["diff-tree", "-r", "--name-only", "--no-commit-id", "b^", "b"])).toEqual([
+          "foo.json",
+        ]);
+        await refused("GitCherryPick", { refs: ["b"] }, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a pick with `noCommit` replays onto the index, so a rename staged there counts",
+      async () => {
+        git(["init", "-q", "-b", "main", "."]);
+        put("foo.json", DENIES);
+        commitAll("base");
+        git(["switch", "-q", "-c", "b"]);
+        put("foo.json", ALLOWS);
+        commitAll("c");
+        git(["switch", "-q", "main"]);
+        mkdirSync(join(ws, ".crewhaus"));
+        git(["mv", "foo.json", SETTINGS_FILE]);
+        await refused("GitCherryPick", { refs: ["b"], noCommit: true }, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a pick of a root commit that holds the settings file",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "--orphan", "r"]);
+        put(SETTINGS_FILE, ALLOWS);
+        git(["add", SETTINGS_FILE]);
+        git(["commit", "-q", "-m", "root"]);
+        const root = git(["rev-parse", "HEAD"]).trim();
+        git(["switch", "-q", "--force", "main"]);
+        await refused("GitCherryPick", { refs: [root] }, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a pick of a range, whichever commit of it reaches the settings file",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "s"]);
+        put("one.txt", "1\n");
+        commitAll("one");
+        put(SETTINGS_FILE, ALLOWS);
+        commitAll("two");
+        put("three.txt", "3\n");
+        commitAll("three");
+        git(["switch", "-q", "main"]);
+        await refused("GitCherryPick", { refs: ["main..s"] }, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a pick of a merge reads the parent `mainline` names",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "side"]);
+        put(SETTINGS_FILE, ALLOWS);
+        commitAll("side");
+        git(["switch", "-q", "-c", "m", "main"]);
+        put("m.txt", "m\n");
+        commitAll("m");
+        git(["merge", "-q", "--no-ff", "-m", "merge", "side"]);
+        const merge = head();
+        git(["switch", "-q", "main"]);
+        // From its first parent the merge brings the settings file; from its second, `m.txt`.
+        await refused("GitCherryPick", { refs: [merge], mainline: 1 }, ".crewhaus/settings.json");
+        expect(
+          JSON.parse(await call("GitCherryPick", { refs: [merge], mainline: 2 })),
+        ).toMatchObject({ picked: true });
+        expect(readFileSync(join(ws, "m.txt"), "utf8")).toBe("m\n");
+        expect(settingsNow()).toBe(DENIES);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a change to a file in a directory root, and one to a file beside the roots runs",
+      async () => {
+        seedRepo({ tracked: true });
+        put(".crewhaus/run/daemon.json", "{}\n");
+        put(".crewhaus/notes.md", "one\n");
+        commitAll("tracked under .crewhaus");
+        git(["switch", "-q", "-c", "b"]);
+        put(".crewhaus/run/daemon.json", '{"pid":1}\n');
+        commitAll("c");
+        git(["switch", "-q", "-c", "n", "main"]);
+        put(".crewhaus/notes.md", "two\n");
+        commitAll("n");
+        git(["switch", "-q", "main"]);
+        await refused("GitSwitch", { branch: "b" }, ".crewhaus/run/daemon.json");
+        expect(JSON.parse(await call("GitSwitch", { branch: "n" }))).toMatchObject({
+          switched: true,
+        });
+        expect(readFileSync(join(ws, ".crewhaus/notes.md"), "utf8")).toBe("two\n");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a pick of several commits replays each onto the result of the one before",
+      async () => {
+        seedRepo({ tracked: true });
+        put("foo.json", DENIES);
+        commitAll("a copy");
+        git(["switch", "-q", "-c", "drops"]);
+        git(["rm", "-q", "foo.json"]);
+        git(["commit", "-q", "-m", "drops the copy"]);
+        const first = head();
+        git(["switch", "-q", "--orphan", "other"]);
+        put("foo.json", DENIES);
+        git(["add", "foo.json"]);
+        git(["commit", "-q", "-m", "no settings here"]);
+        put("foo.json", ALLOWS);
+        git(["add", "foo.json"]);
+        git(["commit", "-q", "-m", "an edit"]);
+        const second = head();
+        git(["switch", "-q", "--force", "main"]);
+        // The fixture is live: run plainly, the second commit lands on the settings file.
+        git(["worktree", "add", "-q", "--detach", "wt", "main"]);
+        git(["cherry-pick", first, second], { cwd: join(ws, "wt") });
+        expect(readFileSync(join(ws, "wt", SETTINGS_FILE), "utf8")).toBe(ALLOWS);
+        await refused("GitCherryPick", { refs: [first, second] }, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a switch that overwrites an ignored settings file",
+      async () => {
+        seedRepo({ ignored: true });
+        await call("GitWorktreeAdd", { path: "wt", createBranch: "b" });
+        await call("Write", { path: join("wt", SETTINGS_FILE), content: ALLOWS });
+        git(["add", "-f", SETTINGS_FILE], { cwd: join(ws, "wt") });
+        await call("GitCommit", { cwd: "wt", message: "c" });
+        await refused("GitSwitch", { branch: "b", detach: true });
+        expect(rulesNow()).toEqual(GUARD_RULE);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a switch that lays a link where `.crewhaus` is, with the session log kept",
+      async () => {
+        seedRepo({ ignored: true });
+        put(".crewhaus/sessions/s.jsonl", "log\n");
+        await call("GitWorktreeAdd", { path: "wt", createBranch: "b" });
+        await call("Write", { path: "wt/fake/settings.json", content: ALLOWS });
+        await call("GitApplyPatch", { cwd: "wt", index: true, patch: LINK_DIFF });
+        await call("GitAdd", { cwd: "wt", paths: ["fake"] });
+        await call("GitCommit", { cwd: "wt", message: "c" });
+        await refused("GitSwitch", { branch: "b", detach: true });
+        expect(readFileSync(join(ws, ".crewhaus/sessions/s.jsonl"), "utf8")).toBe("log\n");
+        expect(lstatSync(join(ws, ".crewhaus")).isSymbolicLink()).toBe(false);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a worktree at a directory that would hold a root is denied before any rule",
+      async () => {
+        seedRepo({ noSettings: true });
+        await call("GitWorktreeAdd", { path: "wt", createBranch: "b" });
+        await call("Write", { path: "wt/settings.json", content: ALLOWS });
+        await call("GitAdd", { cwd: "wt", paths: ["."] });
+        await call("GitCommit", { cwd: "wt", message: "c" });
+        for (const path of [".crewhaus", "./.crewhaus", ".crewhaus/"]) {
+          const r = await turn(
+            { name: "GitWorktreeAdd", input: { path, ref: "b", detach: true } },
+            TOOLS,
+            RULES,
+            "auto",
+          );
+          expect({ path, decision: r.decision, floor: r.reason?.includes(FLOOR) }).toEqual({
+            path,
+            decision: "deny",
+            floor: true,
+          });
+        }
+        expect(existsSync(join(ws, ".crewhaus"))).toBe(false);
+        expect(rulesNow()).toEqual([]);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a pop from the stack worktrees share that changes the settings file",
+      async () => {
+        seedRepo({ tracked: true });
+        await call("GitWorktreeAdd", { path: "wt", createBranch: "b" });
+        await call("Edit", {
+          path: join("wt", SETTINGS_FILE),
+          oldString: "alwaysDeny",
+          newString: "alwaysAllow",
+        });
+        await call("GitStashPush", { cwd: "wt", message: "m", paths: [SETTINGS_FILE] });
+        await refused("GitStashPop", {}, ".crewhaus/settings.json");
+        expect(git(["stash", "list"])).toContain("m");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a pop that follows a rename onto the settings file, though the entry lists only another file",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchRenamingSettings();
+        await call("GitStashPush", { cwd: "wt", message: "m" });
+        expect(namesOnly(["stash", "show", "--name-only", "stash@{0}"])).toEqual(["foo.json"]);
+        await refused("GitStashPop", {}, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a pop merges into the index, so a rename staged there counts",
+      async () => {
+        git(["init", "-q", "-b", "main", "."]);
+        put("foo.json", DENIES);
+        commitAll("base");
+        put("foo.json", ALLOWS);
+        git(["stash", "push", "-q", "-m", "m"]);
+        mkdirSync(join(ws, ".crewhaus"));
+        git(["mv", "foo.json", SETTINGS_FILE]);
+        await refused("GitStashPop", {}, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a pop that restores an untracked settings file",
+      async () => {
+        seedRepo({ noSettings: true });
+        await call("GitWorktreeAdd", { path: "wt", createBranch: "b" });
+        await call("Write", { path: join("wt", SETTINGS_FILE), content: ALLOWS });
+        await call("GitStashPush", { cwd: "wt", includeUntracked: true, message: "m" });
+        await refused("GitStashPop", { apply: true }, ".crewhaus/settings.json");
+        expect(existsSync(join(ws, ".crewhaus"))).toBe(false);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a push that keeps an index holding other settings",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchChangingSettings();
+        await call("GitResetPaths", { paths: ["."], ref: "b" });
+        await refused("GitStashPush", { keepIndex: true, message: "k" }, ".crewhaus/settings.json");
+        expect(rulesNow()).toEqual(GUARD_RULE);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a push that takes an untracked settings file away",
+      async () => {
+        seedRepo();
+        await refused("GitStashPush", { includeUntracked: true, message: "u" });
+        expect(settingsNow()).toBe(DENIES);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a push from a subdirectory covers the whole repository",
+      async () => {
+        seedRepo();
+        put("sub/kept.txt", "kept\n");
+        await refused("GitStashPush", { cwd: "sub", includeUntracked: true, message: "u" });
+        expect(settingsNow()).toBe(DENIES);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a push that takes back a changed settings file, and one that names its paths runs",
+      async () => {
+        seedRepo({ tracked: true });
+        const changed = DENIES.replace('"Bash"', '"Write"');
+        put(SETTINGS_FILE, changed);
+        put("a.txt", "dirty\n");
+        await refused("GitStashPush", { message: "u" }, ".crewhaus/settings.json");
+        expect(settingsNow()).toBe(changed);
+        await call("GitStashPush", { message: "named", paths: ["a.txt"] });
+        expect(readFileSync(join(ws, "a.txt"), "utf8")).toBe("hi\n");
+        expect(settingsNow()).toBe(changed);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a retire of the harness it runs in, as a preview and for real, with `.crewhaus` left in place",
+      async () => {
+        seedRepo({ tracked: true });
+        const input = {
+          spec: "x",
+          archiveDir: "arch",
+          justification: "the control files floor says this harness is finished",
+        };
+        for (const extra of [{}, { dryRun: false, acceptUnverified: true }]) {
+          await refused("HarnessRetire", { ...input, ...extra }, "retiring .");
+          expect(existsSync(join(ws, "arch"))).toBe(false);
+          expect(settingsNow()).toBe(DENIES);
+        }
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a switch by a name that is both a branch and a tag reads the branch, as git switch does",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "b"]);
+        put(SETTINGS_FILE, ALLOWS);
+        commitAll("c");
+        git(["switch", "-q", "main"]);
+        git(["tag", "b", "main"]);
+        expect(git(["rev-parse", "b"]).trim()).toBe(git(["rev-parse", "main"]).trim());
+        await refused("GitSwitch", { branch: "b" }, ".crewhaus/settings.json");
+        await refused("GitSwitch", { branch: "b", detach: true }, ".crewhaus/settings.json");
+        await refused(
+          "GitSwitch",
+          { branch: "n", create: true, startPoint: "b" },
+          ".crewhaus/settings.json",
+        );
+        // The branch before this one, by the name `git switch` reads it under.
+        git(["switch", "-q", "b"]);
+        git(["switch", "-q", "main"]);
+        await refused("GitSwitch", { branch: "@{-1}" }, ".crewhaus/settings.json");
+        await refused("GitSwitch", { branch: "@{-1}", detach: true }, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a switch to a commit that moves the settings file away, though a diff shows only where it went",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "b"]);
+        git(["mv", SETTINGS_FILE, "x.json"]);
+        git(["commit", "-q", "-m", "moved"]);
+        git(["switch", "-q", "main"]);
+        expect(git(["diff", "--name-only", "-M", "main", "b"]).trim()).toBe("x.json");
+        await refused("GitSwitch", { branch: "b" }, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a switch to a tree that spells `.crewhaus` another way, on any volume",
+      async () => {
+        seedRepo({ ignored: true });
+        const blob = git(["hash-object", "-w", "--stdin"], { stdin: ALLOWS }).trim();
+        git([
+          "update-ref",
+          "refs/heads/b",
+          commitOver(`100644 ${blob}\t.CREWHAUS/settings.json\n`, "e"),
+        ]);
+        await refused("GitSwitch", { branch: "b", detach: true }, ".CREWHAUS/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a switch across a submodule's pointer at `.crewhaus`, which the repository's config would hide",
+      async () => {
+        seedRepo({ noSettings: true });
+        git(["update-ref", "refs/heads/b", commitOver(`160000 ${head()}\t.crewhaus\n`, "s")]);
+        git(["config", "diff.ignoreSubmodules", "all"]);
+        expect(git(["diff", "--name-only", "HEAD", "b"]).trim()).toBe("");
+        await refused("GitSwitch", { branch: "b" }, "the change to .crewhaus");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a switch to the merge base `A...B` names",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "side"]);
+        put("side.txt", "s\n");
+        commitAll("side");
+        git(["switch", "-q", "main"]);
+        put(SETTINGS_FILE, ALLOWS);
+        commitAll("moved on");
+        await refused("GitSwitch", { branch: "main...side", detach: true });
+        await refused("GitSwitch", {
+          branch: "n",
+          create: true,
+          startPoint: "main...side",
+        });
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a guess among remotes: one remote's branch changes the settings file and another's does not",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "side"]);
+        put(SETTINGS_FILE, ALLOWS);
+        commitAll("c");
+        const changed = head();
+        git(["switch", "-q", "main"]);
+        git(["remote", "add", "a", "https://example.invalid/a.git"]);
+        git(["remote", "add", "c", "https://example.invalid/c.git"]);
+        git(["update-ref", "refs/remotes/a/b", changed]);
+        git(["update-ref", "refs/remotes/c/b", "main"]);
+        git(["config", "checkout.defaultRemote", "a"]);
+        await refused("GitSwitch", { branch: "b" }, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a name nothing was found for reaches no remote's branch by another mapping",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "side"]);
+        put(SETTINGS_FILE, ALLOWS);
+        commitAll("c");
+        const changed = head();
+        git(["switch", "-q", "main"]);
+        git(["remote", "add", "o", "https://example.invalid/o.git"]);
+        git(["config", "remote.o.fetch", "+refs/heads/*:refs/mirror/*"]);
+        git(["update-ref", "refs/mirror/feat", changed]);
+        const r = await turn(
+          { name: "GitSwitch", input: { branch: "feat" } },
+          TOOLS,
+          RULES,
+          "auto",
+        );
+        expect(r.result ?? "").toContain("invalid reference");
+        expect(settingsNow()).toBe(DENIES);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a switch to a commit named by a search of its messages, in `auto` and in `bypass`",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchChangingSettings();
+        const forms = [
+          { branch: ":/c", detach: true },
+          { branch: "n", create: true, startPoint: ":/c" },
+        ];
+        for (const mode of ["auto", "bypass"] as const) {
+          for (const input of forms) {
+            await refused("GitSwitch", input, ".crewhaus/settings.json", mode);
+          }
+        }
+        // A search that lands where the settings file is the same is an ordinary switch.
+        expect(
+          JSON.parse(await call("GitSwitch", { branch: ":/base", detach: true })),
+        ).toMatchObject({ switched: true, detached: true });
+        expect(settingsNow()).toBe(DENIES);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a detached or new branch on a name that resolves to nothing is refused",
+      async () => {
+        seedRepo({ tracked: true });
+        for (const mode of ["auto", "bypass"] as const) {
+          for (const input of [
+            { branch: "nosuch", detach: true },
+            { branch: ":/nosuch", detach: true },
+            { branch: "n", create: true, startPoint: "nosuch" },
+            { branch: "n", create: true, startPoint: ":/nosuch" },
+            // A tree resolves, and no commit is there to land on.
+            { branch: "HEAD^{tree}", detach: true },
+          ]) {
+            await refused("GitSwitch", input, "could not be listed", mode);
+          }
+        }
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a revision over a name that is both a branch and a tag reads what git reads, not the branch",
+      async () => {
+        seedRepo({ tracked: true });
+        // The tag, and its parent, carry the settings change; the branch of that name does not.
+        git(["switch", "-q", "-c", "side"]);
+        put(SETTINGS_FILE, ALLOWS);
+        commitAll("settings");
+        put("t.txt", "t\n");
+        commitAll("top");
+        git(["tag", "b"]);
+        git(["switch", "-q", "-c", "b", "main"]);
+        put("h.txt", "h\n");
+        commitAll("other");
+        git(["switch", "-q", "main"]);
+        for (const name of [
+          "b~0",
+          "b^0",
+          "b^{commit}",
+          "b^{}",
+          "b^",
+          "b~",
+          "b~1",
+          "b^1",
+          "b^{/top}",
+        ]) {
+          // What raw git lands on, so this table cannot drift from git itself.
+          expect({
+            name,
+            settings: git(["show", `${git(["rev-parse", name]).trim()}:${SETTINGS_FILE}`]),
+          }).toEqual({ name, settings: ALLOWS });
+          await refused("GitSwitch", { branch: name, detach: true }, ".crewhaus/settings.json");
+          await refused(
+            "GitSwitch",
+            { branch: "n", create: true, startPoint: name },
+            ".crewhaus/settings.json",
+          );
+        }
+        await refused("GitSwitch", { branch: "tags/b", detach: true }, ".crewhaus/settings.json");
+        // The bare name is the branch's, in the form that takes it as one.
+        expect(JSON.parse(await call("GitSwitch", { branch: "b", detach: true }))).toMatchObject({
+          switched: true,
+          detached: true,
+        });
+        expect(existsSync(join(ws, "h.txt"))).toBe(true);
+        expect(settingsNow()).toBe(DENIES);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a branch git reads under `HEAD` or `@` is read too",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "side"]);
+        put(SETTINGS_FILE, ALLOWS);
+        commitAll("settings");
+        git(["switch", "-q", "main"]);
+        git(["update-ref", "refs/heads/HEAD", "side"]);
+        for (const branch of ["HEAD", "@"]) {
+          await refused("GitSwitch", { branch }, ".crewhaus/settings.json");
+          await refused("GitSwitch", { branch, detach: true }, ".crewhaus/settings.json");
+        }
+        expect(git(["rev-parse", "--abbrev-ref", "main"]).trim()).toBe("main");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a repository's `diff.relative` hides no name from a `cwd` below the top",
+      async () => {
+        seedRepo({ tracked: true });
+        put("sub/s.txt", "s\n");
+        commitAll("sub");
+        git(["switch", "-q", "-c", "b"]);
+        put(SETTINGS_FILE, ALLOWS);
+        commitAll("c");
+        git(["switch", "-q", "main"]);
+        git(["config", "diff.relative", "true"]);
+        expect(git(["diff", "--name-only", "main", "b"], { cwd: join(ws, "sub") })).toBe("");
+        await refused("GitSwitch", { cwd: "sub", branch: "b" }, ".crewhaus/settings.json");
+        await refused("GitCherryPick", { cwd: "sub", refs: ["b"] }, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "in `bypass` mode too",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchChangingSettings("bypass");
+        await refused("GitCherryPick", { refs: ["b"] }, ".crewhaus/settings.json", "bypass");
+        await refused("GitSwitch", { branch: "b" }, ".crewhaus/settings.json", "bypass");
+      },
+      CHAIN_MS,
+    );
+  });
+
+  describe("a change that touches no floor file goes through", () => {
+    test(
+      "switch, `switch -c`, a pick and a range pick",
+      async () => {
+        seedRepo({ tracked: true });
+        await call("GitSwitch", { branch: "f", create: true });
+        await call("Write", { path: "a.txt", content: "f\n" });
+        await call("GitAdd", { paths: ["a.txt"] });
+        await call("GitCommit", { message: "f" });
+        await call("GitSwitch", { branch: "main" });
+        expect(readFileSync(join(ws, "a.txt"), "utf8")).toBe("hi\n");
+        expect(JSON.parse(await call("GitCherryPick", { refs: ["f"] }))).toMatchObject({
+          picked: true,
+        });
+        expect(readFileSync(join(ws, "a.txt"), "utf8")).toBe("f\n");
+        git(["switch", "-q", "-c", "s"]);
+        for (const n of ["1", "2", "3"]) {
+          put(`f${n}.txt`, n);
+          commitAll(n);
+        }
+        git(["switch", "-q", "main"]);
+        expect(JSON.parse(await call("GitCherryPick", { refs: ["main..s"] }))).toMatchObject({
+          picked: true,
+        });
+        expect(existsSync(join(ws, "f1.txt")) && existsSync(join(ws, "f3.txt"))).toBe(true);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "`switch -c` on an unborn HEAD",
+      async () => {
+        git(["init", "-q", "-b", "main", "."]);
+        expect(JSON.parse(await call("GitSwitch", { branch: "x", create: true }))).toMatchObject({
+          switched: true,
+        });
+        expect(git(["symbolic-ref", "--short", "HEAD"]).trim()).toBe("x");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a switch from an unborn HEAD lists every file it lays down, and one with none of the floor's runs",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "other"]);
+        git(["switch", "-q", "--orphan", "bare"]);
+        put("b.txt", "b\n");
+        git(["add", "b.txt"]);
+        git(["commit", "-q", "-m", "no floor files"]);
+        git(["switch", "-q", "--orphan", "empty"]);
+        await refused("GitSwitch", { branch: "other" }, ".crewhaus/settings.json");
+        expect(existsSync(join(ws, ".crewhaus"))).toBe(false);
+        expect(JSON.parse(await call("GitSwitch", { branch: "bare" }))).toMatchObject({
+          switched: true,
+          branch: "bare",
+        });
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a switch that guesses a remote's branch",
+      async () => {
+        seedRepo();
+        git(["remote", "add", "origin", "https://example.invalid/o.git"]);
+        git(["update-ref", "refs/remotes/origin/feat", "HEAD"]);
+        expect(JSON.parse(await call("GitSwitch", { branch: "feat" }))).toMatchObject({
+          switched: true,
+          branch: "feat",
+        });
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a conflicted pick is reported as git reports it",
+      async () => {
+        seedRepo({ ignored: true });
+        git(["switch", "-q", "-c", "c"]);
+        put("a.txt", "one\n");
+        commitAll("one");
+        git(["switch", "-q", "main"]);
+        put("a.txt", "two\n");
+        commitAll("two");
+        expect(JSON.parse(await call("GitCherryPick", { refs: ["c"] }))).toMatchObject({
+          picked: false,
+          conflicted: ["a.txt"],
+        });
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a root commit's pick",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "--orphan", "r"]);
+        put("r.txt", "r\n");
+        git(["add", "r.txt"]);
+        git(["commit", "-q", "-m", "root"]);
+        const root = head();
+        git(["switch", "-q", "--force", "main"]);
+        expect(JSON.parse(await call("GitCherryPick", { refs: [root] }))).toMatchObject({
+          picked: true,
+        });
+        expect(readFileSync(join(ws, "r.txt"), "utf8")).toBe("r\n");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a stash round trip with an untracked file",
+      async () => {
+        seedRepo({ ignored: true });
+        put("n.txt", "n\n");
+        put("a.txt", "dirty\n");
+        await call("GitStashPush", { includeUntracked: true, message: "m" });
+        expect(existsSync(join(ws, "n.txt"))).toBe(false);
+        expect(JSON.parse(await call("GitStashPop", {}))).toMatchObject({ dropped: true });
+        expect(readFileSync(join(ws, "a.txt"), "utf8")).toBe("dirty\n");
+        expect(readFileSync(join(ws, "n.txt"), "utf8")).toBe("n\n");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a retire of another harness in the workspace",
+      async () => {
+        seedRepo({ tracked: true });
+        put("fleet/other/.crewhaus/settings.json", DENIES);
+        const out = await call("HarnessRetire", {
+          spec: "x",
+          dir: "fleet/other",
+          archiveDir: "arch",
+          dryRun: false,
+          acceptUnverified: true,
+          justification: "the control files floor says this harness is finished",
+        });
+        expect(JSON.parse(out)).toMatchObject({ harnessDir: "fleet/other", dryRun: false });
+        expect(existsSync(join(ws, "fleet/other/.crewhaus"))).toBe(false);
+        expect(settingsNow()).toBe(DENIES);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a change inside `wt` is `wt`'s own, not the harness's",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchChangingSettings();
+        await call("GitSwitch", { cwd: "wt", branch: "w2", create: true, startPoint: "main" });
+        expect(readFileSync(join(ws, "wt", SETTINGS_FILE), "utf8")).toBe(DENIES);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a run with no roots on its bridge runs them as git does",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchChangingSettings();
+        expect(JSON.parse(await text(gitSwitch, { branch: "b", detach: true }, []))).toMatchObject({
+          switched: true,
+        });
+        expect(settingsNow()).toBe(ALLOWS);
+      },
+      CHAIN_MS,
+    );
+  });
+
+  describe("names that cannot be listed are not an empty list", () => {
+    test(
+      "a range that outlasts the preview's one deadline is refused, and the tree is left alone",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "s"]);
+        for (const n of ["1", "2", "3", "4"]) {
+          put(`f${n}.txt`, n);
+          commitAll(n);
+        }
+        git(["switch", "-q", "main"]);
+        const before = head();
+        // Each look at the clock costs five seconds: no single read is late, and
+        // thirty seconds pass a few reads in.
+        let clockNow = Date.now();
+        let looks = 0;
+        const clock = spyOn(Date, "now").mockImplementation(() => {
+          looks += 1;
+          clockNow += 5_000;
+          return clockNow;
+        });
+        let out: string;
+        try {
+          out = await text(gitCherryPick, { refs: ["main..s"] }, roots());
+        } finally {
+          clock.mockRestore();
+        }
+        expect(looks).toBeGreaterThan(6);
+        expect(out).toContain(REFUSED);
+        expect(out).toContain("a pick whose changes could not be listed");
+        expect(head()).toBe(before);
+        expect(existsSync(join(ws, "f1.txt"))).toBe(false);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a list cut off at the output cap is refused",
+      async () => {
+        seedRepo({ tracked: true });
+        const blob = git(["hash-object", "-w", "--stdin"], { stdin: "x\n" }).trim();
+        const entries = Array.from(
+          { length: 5_000 },
+          (_, i) => `100644 ${blob}\tdeep/${"n".repeat(90)}${i}\n`,
+        ).join("");
+        git(["update-ref", "refs/heads/big", commitOver(entries, "big")]);
+        await refused("GitSwitch", { branch: "big" }, "a switch whose changes could not be listed");
+        expect(existsSync(join(ws, "deep"))).toBe(false);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a treeless clone's switch across trees a read will not fetch is refused",
+      async () => {
+        const src = join(base, "src");
+        mkdirSync(src);
+        git(["init", "-q", "-b", "main", "."], { cwd: src });
+        git(["config", "uploadpack.allowFilter", "true"], { cwd: src });
+        writeFileSync(join(src, "a.txt"), "a\n");
+        git(["add", "-A"], { cwd: src });
+        git(["commit", "-q", "-m", "base"], { cwd: src });
+        git(["switch", "-q", "-c", "b"], { cwd: src });
+        writeFileSync(join(src, "a.txt"), "b\n");
+        git(["add", "-A"], { cwd: src });
+        git(["commit", "-q", "-m", "b"], { cwd: src });
+        git(["switch", "-q", "main"], { cwd: src });
+        git(["clone", "-q", "--filter=tree:0", "--no-local", `file://${src}`, ws], { cwd: base });
+        git(["fetch", "-q", "origin", "b:refs/heads/b"]);
+        // What a read pins, here for the writes too: nothing reaches the promisor.
+        setVar("GIT_NO_LAZY_FETCH", "1");
+        setVar("GIT_ALLOW_PROTOCOL", "");
+        const out = await text(gitSwitch, { branch: "b" }, roots());
+        expect(out).toContain(REFUSED);
+        expect(out).toContain("a switch whose changes could not be listed");
+        expect(git(["rev-parse", "--abbrev-ref", "HEAD"]).trim()).toBe("main");
+      },
+      CHAIN_MS,
+    );
+  });
+
+  describe("a git that cannot run the merge first runs the real one with rename detection off", () => {
+    /** A `git` first on PATH that answers as `shell` says, and is the real one otherwise. */
+    const gitThatAnswers = (shell: string): void => {
+      const real = Bun.which("git");
+      expect(real).not.toBeNull();
+      const bin = join(base, "older-git");
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, "git"),
+        `#!/bin/sh\nfor arg in "$@"; do\n  case "$arg" in\n${shell}\n  esac\ndone\nexec "${real}" "$@"\n`,
+      );
+      chmodSync(join(bin, "git"), 0o755);
+      setVar("PATH", `${bin}:${process.env["PATH"] ?? ""}`);
+    };
+    const NO_MERGE_BASE = `    version) echo "git version 2.39.5"; exit 0 ;;
+    merge-tree) echo "usage: git merge-tree" >&2; exit 129 ;;`;
+    const NO_BLOB = `    merge-tree) echo "fatal: could not fetch" >&2; exit 128 ;;`;
+    const NO_OPTION = `    merge-tree) echo "usage: git merge-tree" >&2; exit 129 ;;`;
+    const NO_ANSWER = `    version) echo "not a version"; exit 0 ;;`;
+
+    for (const [label, shell] of [
+      ["older than 2.40", NO_MERGE_BASE],
+      ["whose merge stops on a blob or a tree it will not take", NO_BLOB],
+      ["whose merge does not take the option", NO_OPTION],
+      ["whose version could not be read", NO_ANSWER],
+    ] as const) {
+      test(
+        `${label}: a pick across a rename reports a conflict and the settings file stays`,
+        async () => {
+          seedRepo({ tracked: true });
+          await branchRenamingSettings();
+          await call("GitAdd", { cwd: "wt", paths: ["."] });
+          await call("GitCommit", { cwd: "wt", message: "c" });
+          gitThatAnswers(shell);
+          const out = JSON.parse(await call("GitCherryPick", { refs: ["b"] })) as {
+            picked: boolean;
+            conflicted: string[];
+          };
+          expect(out.picked).toBe(false);
+          expect(out.conflicted).toEqual(["foo.json"]);
+          expect(settingsNow()).toBe(DENIES);
+          expect(rulesNow()).toEqual(GUARD_RULE);
+        },
+        CHAIN_MS,
+      );
+
+      test(
+        `${label}: a pop across a rename reports a conflict and the settings file stays`,
+        async () => {
+          seedRepo({ tracked: true });
+          await branchRenamingSettings();
+          await call("GitStashPush", { cwd: "wt", message: "m" });
+          gitThatAnswers(shell);
+          const out = await call("GitStashPop", {});
+          expect(out).toContain("CONFLICT");
+          expect(git(["status", "--porcelain"])).toContain("DU foo.json");
+          expect(settingsNow()).toBe(DENIES);
+          expect(rulesNow()).toEqual(GUARD_RULE);
+        },
+        CHAIN_MS,
+      );
+    }
+
+    test(
+      "older than 2.40: a commit's own names still refuse a pick, a pop and a switch",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchChangingSettings();
+        await call("Edit", {
+          path: join("wt", SETTINGS_FILE),
+          oldString: "alwaysAllow",
+          newString: "alwaysAsk",
+        });
+        await call("GitStashPush", { cwd: "wt", message: "m", paths: [SETTINGS_FILE] });
+        gitThatAnswers(NO_MERGE_BASE);
+        await refused("GitCherryPick", { refs: ["b"] }, ".crewhaus/settings.json");
+        await refused("GitStashPop", {}, ".crewhaus/settings.json");
+        await refused("GitSwitch", { branch: "b" }, ".crewhaus/settings.json");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "older than 2.28, which has no `--no-relative`: a switch is still read, and still runs",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchChangingSettings();
+        git(["branch", "plain", "main"]);
+        gitThatAnswers(`    --no-relative) echo "usage: git diff" >&2; exit 129 ;;
+    version) echo "git version 2.25.1"; exit 0 ;;
+    merge-tree) exit 129 ;;`);
+        await refused("GitSwitch", { branch: "b" }, ".crewhaus/settings.json");
+        expect(JSON.parse(await call("GitSwitch", { branch: "plain" }))).toMatchObject({
+          switched: true,
+        });
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a range is replayed oldest first, as cherry-pick walks it",
+      async () => {
+        seedRepo({ tracked: true });
+        git(["switch", "-q", "-c", "s"]);
+        const commits: string[] = [];
+        for (const n of ["1", "2", "3"]) {
+          put(`f${n}.txt`, n);
+          commitAll(n);
+          commits.push(head());
+        }
+        git(["switch", "-q", "main"]);
+        const log = join(base, "merges.log");
+        gitThatAnswers(`    merge-tree) echo "$*" >> "${log}" ;;`);
+        expect(JSON.parse(await call("GitCherryPick", { refs: ["main..s"] }))).toMatchObject({
+          picked: true,
+        });
+        const replayed = readFileSync(log, "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => line.split(" ").at(-1));
+        expect(replayed).toEqual(commits);
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a read past its deadline is not an answer: no entry, no such branch",
+      async () => {
+        seedRepo({ tracked: true });
+        put("a.txt", "dirty\n");
+        git(["stash", "push", "-q", "-m", "m"]);
+        git(["branch", "b"]);
+        gitThatAnswers(`    *'^{commit}') exec sleep 30 ;;`);
+        const pop = await text(gitStashPop, { timeout: 3_000 }, roots());
+        expect(pop).toContain("a stash whose changes could not be listed");
+        const moved = await text(gitSwitch, { branch: "b", timeout: 3_000 }, roots());
+        expect(moved).toContain("a switch whose changes could not be listed");
+        expect(readFileSync(join(ws, "a.txt"), "utf8")).toBe("hi\n");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a merge that fails any other way is refused, not retried without renames",
+      async () => {
+        seedRepo({ tracked: true });
+        await branchChangingSettings();
+        gitThatAnswers("    merge-tree) exit 137 ;;");
+        await refused("GitCherryPick", { refs: ["b"] }, "a pick whose changes could not be listed");
+      },
+      CHAIN_MS,
+    );
+
+    test(
+      "a merge past its deadline is refused, not retried without renames",
+      async () => {
+        seedRepo({ tracked: true });
+        put("b.txt", "b\n");
+        commitAll("b");
+        git(["branch", "b"]);
+        git(["reset", "-q", "--hard", "HEAD^"]);
+        gitThatAnswers("    merge-tree) exec sleep 30 ;;");
+        const out = await text(gitCherryPick, { refs: ["b"], timeout: 3_000 }, roots());
+        expect(out).toContain(REFUSED);
+        expect(out).toContain("a pick whose changes could not be listed");
+        expect(existsSync(join(ws, "b.txt"))).toBe(false);
+      },
+      CHAIN_MS,
+    );
+  });
+
+  test(
+    "the roots are whatever the run carries: a tracked file named as one stops a switch and a pick across it",
+    async () => {
+      seedRepo({ tracked: true });
+      // A spec in the working directory puts its build output among the roots.
+      put("crewhaus.yaml", "name: x\n");
+      put(".npmrc", "one\n");
+      put(".env.development", "ONE=1\n");
+      put("dist/out.js", "one\n");
+      put("site.conf", "one\n");
+      commitAll("tracked config");
+      const changing = (branch: string, file: string, body: string): void => {
+        git(["switch", "-q", "-c", branch, "main"]);
+        put(file, body);
+        commitAll(branch);
+      };
+      changing("b", ".npmrc", "two\n");
+      changing("e", ".env.development", "ONE=2\n");
+      changing("d", "dist/out.js", "two\n");
+      changing("s", "site.conf", "two\n");
+      git(["switch", "-q", "main"]);
+      // The run's own roots name these files; none is added to them here.
+      const own = roots();
+      const named = own
+        .filter((root) => !isAbsolute(root))
+        .map((root) => root.split(sep).join("/"));
+      for (const root of [".npmrc", ".env.development", "dist"]) {
+        expect({ root, carried: named.includes(root) }).toEqual({ root, carried: true });
+      }
+      for (const [tool, input, name] of [
+        [gitSwitch, { branch: "b" }, ".npmrc"],
+        [gitCherryPick, { refs: ["e"] }, ".env.development"],
+        [gitCherryPick, { refs: ["d"] }, "dist/out.js"],
+      ] as const) {
+        const out = await text(tool, input, own);
+        expect(out).toContain(REFUSED);
+        expect(out).toContain(`the change to ${name}`);
+      }
+      expect(readFileSync(join(ws, ".npmrc"), "utf8")).toBe("one\n");
+      expect(readFileSync(join(ws, ".env.development"), "utf8")).toBe("ONE=1\n");
+      expect(readFileSync(join(ws, "dist", "out.js"), "utf8")).toBe("one\n");
+      // A root a run carries beyond these stops the same calls on its file.
+      const carried = [...own, "site.conf"];
+      for (const [tool, input] of [
+        [gitSwitch, { branch: "s" }],
+        [gitCherryPick, { refs: ["s"] }],
+      ] as const) {
+        const out = await text(tool, input, carried);
+        expect(out).toContain(REFUSED);
+        expect(out).toContain("the change to site.conf");
+      }
+      expect(readFileSync(join(ws, "site.conf"), "utf8")).toBe("one\n");
+      // A run that carries no root for that file runs the same call.
+      expect(JSON.parse(await text(gitSwitch, { branch: "s" }, own))).toMatchObject({
+        switched: true,
+      });
+      expect(readFileSync(join(ws, "site.conf"), "utf8")).toBe("two\n");
+    },
+    CHAIN_MS,
+  );
+
+  test("the manifest declares GitWorktreeAdd's path as a directory the floor reads", () => {
+    expect(TOOL_REGISTRY["gitWorktreeAdd"]?.operativeArgs?.[0]).toEqual({
+      field: "path",
+      kind: "path",
+      beneath: "all",
     });
   });
 });

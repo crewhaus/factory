@@ -99,6 +99,22 @@ these on: they reach every harness that uses what each one names.
   report an object that is not on disk as missing. `Bash` and `RunCommand` remain
   outside what the floor can see.
 
+- **Tools that move a tree or write beneath a directory they are given check
+  what they would write.** `GitSwitch`, `GitCherryPick`, `GitStashPush` and
+  `GitStashPop` work out the files a call would change, renames included, and
+  refuse in every mode one that lands on the runtime-state floor. `HarnessRetire`
+  refuses the harness it runs in, and `GitWorktreeAdd` is denied a path that
+  holds a floor root. `SpecPin`, `DeployRollback`, `KnowledgeSync`,
+  `ExperimentLedger`, `RouteControl`, `HarnessRetire` and `StoreMigrate` refuse
+  in every mode a file they would write whose path resolves onto the floor.
+  `ManifestDependencySet` refuses in every mode, a preview included, a manifest
+  it finds in a directory when that file is on the floor, and `SecretRotate` a
+  rotation whose lock, journal or kept copy of a `file:` secret would land there.
+  A person runs those from a terminal.
+  On git older than 2.40, a pick or pop runs with rename detection off, as does a
+  pop or a pick of several commits on git older than 2.45, so a rename across
+  such a change is reported as a conflict.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what

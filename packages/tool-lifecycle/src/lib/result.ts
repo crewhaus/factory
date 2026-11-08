@@ -12,6 +12,7 @@
  */
 import { statSync } from "node:fs";
 import * as path from "node:path";
+import { protectedRootHolding, protectedWriteRefusal } from "@crewhaus/tool-safety/fs";
 import { MAX_PATH_CHARS, type SafePath, ToolPermissionError, resolveSafe } from "../paths";
 
 /** Compact JSON — the reader is a model, and every byte is context. */
@@ -123,21 +124,33 @@ export function contain(toolName: string, rel: string): Loaded<SafePath> {
  * through — symlink-aware, dangling links followed by hand — rather than a
  * second symlink walker written here. Returns the refusal, or `undefined`
  * when every write path stays inside the workspace.
+ *
+ * With `protectedRoots` (`RuntimeBridge.protectedRoots`, for a call that writes
+ * these paths), a path also has to land outside each of them. The landing place
+ * is the one `resolveSafe` worked out, which a dangling link's target counts in.
  */
 export function containWritePaths(
   toolName: string,
   root: SafePath,
   rels: ReadonlyArray<string>,
+  protectedRoots: readonly string[] = [],
 ): Failure | undefined {
   const shownRoot = root.rel === "" ? "." : root.rel;
   for (const rel of rels) {
     const under = root.rel === "" ? rel : `${root.rel}/${rel}`;
     // Too long to open or create: it leads nowhere, so it is no escape.
     if (pastPathLimit(under)) continue;
-    if (!contain(toolName, under).ok) {
+    const resolved = contain(toolName, under);
+    if (!resolved.ok) {
       return fail(
         "refused",
         `"${renderPath(rel)}" under "${renderPath(shownRoot)}" resolves outside the workspace root — a symlink on that path leads out, so the write would land on the link's target rather than inside "${renderPath(shownRoot)}". Remove the link and run again; there is no flag for writing through it.`,
+      );
+    }
+    if (protectedRootHolding(resolved.value.real, protectedRoots) !== undefined) {
+      return fail(
+        "refused",
+        protectedWriteRefusal(toolName, `"${renderPath(rel)}" under "${renderPath(shownRoot)}"`),
       );
     }
   }

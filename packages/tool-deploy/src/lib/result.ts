@@ -20,6 +20,7 @@
  */
 import { lstatSync, statSync } from "node:fs";
 import * as path from "node:path";
+import { protectedRootHolding, protectedWriteRefusal } from "@crewhaus/tool-safety/fs";
 import { MAX_PATH_CHARS, type SafePath, ToolPermissionError, resolveSafe } from "../paths";
 
 /** Compact JSON — the reader is a model, and every byte is context. */
@@ -168,21 +169,34 @@ export function contain(toolName: string, rel: string): Loaded<SafePath> {
  * Each path therefore goes through the SAME `resolveSafe` the root went
  * through — symlink-aware, dangling links followed by hand. Returns the
  * refusal, or `undefined` when every path stays inside the workspace.
+ *
+ * With `protectedRoots` (`RuntimeBridge.protectedRoots`, for a call that may
+ * write these paths), a path also has to land outside each of them. The landing
+ * place is the one `resolveSafe` worked out, which a dangling link's target
+ * counts in.
  */
 export function containUnder(
   toolName: string,
   root: SafePath,
   rels: ReadonlyArray<string>,
+  protectedRoots: readonly string[] = [],
 ): Failure | undefined {
   const shownRoot = root.rel === "" ? "." : root.rel;
   for (const rel of rels) {
     const under = root.rel === "" ? rel : `${root.rel}/${rel}`;
     // Too long to open or create: it leads nowhere, so it is no escape.
     if (pastPathLimit(under)) continue;
-    if (!contain(toolName, under).ok) {
+    const resolved = contain(toolName, under);
+    if (!resolved.ok) {
       return fail(
         "refused",
         `"${render(rel)}" under "${render(shownRoot)}" resolves outside the workspace root — a symlink on that path leads out, so the registry would read or write the link's target rather than something inside "${render(shownRoot)}". Remove the link and run again; there is no flag for working through it.`,
+      );
+    }
+    if (protectedRootHolding(resolved.value.real, protectedRoots) !== undefined) {
+      return fail(
+        "refused",
+        protectedWriteRefusal(toolName, `"${render(rel)}" under "${render(shownRoot)}"`),
       );
     }
   }

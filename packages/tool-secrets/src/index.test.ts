@@ -18,6 +18,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1268,6 +1269,52 @@ describe("SecretRotate", () => {
       OTHER_SECRET,
     );
     expect(statSync(join(workspace, ".crewhaus/secrets/TOKEN")).mode & 0o077).toBe(0);
+  });
+});
+
+describe("SecretRotate and the runtime-state roots on its bridge", () => {
+  const RUN_ROOT = { bridge: { protectedRoots: [".crewhaus/run"] } };
+  const CONTROL = "control token\n";
+  const rotateWith = (input: Record<string, unknown>, withCtx: unknown) =>
+    raw(secretRotate, { generate: { bytes: 32, encoding: "hex" }, ...input }, withCtx);
+  const seedRun = (): void => {
+    mkdirSync(join(workspace, ".crewhaus/run"), { recursive: true });
+    writeFileSync(join(workspace, ".crewhaus/run/control-token"), CONTROL);
+  };
+
+  for (const dryRun of [true, false]) {
+    test(`a kept copy that leads into a root is refused before the lock, dryRun ${dryRun}`, async () => {
+      seedRun();
+      writeFileSync(join(workspace, "token"), OTHER_SECRET);
+      symlinkSync(join(".crewhaus", "run", "control-token"), join(workspace, "token.previous"));
+      const text = await rotateWith({ ref: "file:token", dryRun }, RUN_ROOT);
+      expect(text).toContain("SecretRotate: refused — rotating file:token");
+      expect(text).toContain("Nothing was written.");
+      expect(readFileSync(join(workspace, ".crewhaus/run/control-token"), "utf8")).toBe(CONTROL);
+      expect(readFileSync(join(workspace, "token"), "utf8")).toBe(OTHER_SECRET);
+      expect(existsSync(join(workspace, ".crewhaus/secrets/rotation.lock"))).toBe(false);
+    });
+
+    test(`a lock and journal that lead into a root are refused, dryRun ${dryRun}`, async () => {
+      seedRun();
+      symlinkSync("run", join(workspace, ".crewhaus", "secrets"));
+      writeFileSync(envFile(), `TOKEN=${OTHER_SECRET}\n`);
+      const text = await rotateWith({ ref: "envfile:.env#TOKEN", dryRun }, RUN_ROOT);
+      expect(text).toContain("SecretRotate: refused — rotating envfile:.env#TOKEN");
+      expect(readEnv()).toBe(`TOKEN=${OTHER_SECRET}\n`);
+      expect(existsSync(join(workspace, ".crewhaus/run/rotation.lock"))).toBe(false);
+      expect(existsSync(join(workspace, ".crewhaus/run/rotations.json"))).toBe(false);
+    });
+  }
+
+  test("an ordinary rotation goes on with roots on the bridge, its kept copy and journal written", async () => {
+    seedRun();
+    writeFileSync(join(workspace, "token"), OTHER_SECRET);
+    const roots = { bridge: { protectedRoots: [".crewhaus/run", ".crewhaus/settings.json"] } };
+    const result = JSON.parse(await rotateWith({ ref: "file:token" }, roots)) as Json;
+    expect(result.ok).toBe(true);
+    expect(readFileSync(join(workspace, "token.previous"), "utf8")).toBe(OTHER_SECRET);
+    expect(existsSync(join(workspace, ".crewhaus/secrets/rotations.json"))).toBe(true);
   });
 });
 
