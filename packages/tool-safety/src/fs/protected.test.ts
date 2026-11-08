@@ -256,28 +256,54 @@ describe("a root under another spelling, the name not there yet", () => {
   });
 });
 
-// What foldedName says of Windows, asked of Windows: the job that runs this
-// suite there fails if the volume ever opens these another way.
-test.if(process.platform === "win32")("Windows opens each of these as the plain name", () => {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "tool-safety-names-")));
-  try {
-    for (const written of ["probe.", "probe ", "probe. .", "probe::$DATA"]) {
-      writeFileSync(join(dir, written), written);
-      expect({ written, stored: readdirSync(dir) }).toEqual({ written, stored: ["probe"] });
-      expect(readFileSync(join(dir, "probe"), "utf8")).toBe(written);
-      expect(foldedName(written)).toBe("probe");
+// What foldedName says of Windows, asked of Windows. Depending on the path form
+// the runtime uses, the volume opens each of these spellings as the plain name
+// or keeps it as written; foldedName reads the plain name either way, so the
+// floor refuses both.
+test.if(process.platform === "win32")(
+  "Windows stores each of these as the plain name or as written, and foldedName reads the plain name",
+  () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "tool-safety-names-")));
+    try {
+      for (const written of ["probe.", "probe ", "probe. .", "probe::$DATA"]) {
+        writeFileSync(join(dir, written), written);
+        const stored = readdirSync(dir);
+        const name = stored[0] ?? "";
+        expect({
+          written,
+          stored: stored.length,
+          plainOrWritten: name === "probe" || name === written,
+        }).toEqual({
+          written,
+          stored: 1,
+          plainOrWritten: true,
+        });
+        if (name === "probe") expect(readFileSync(join(dir, "probe"), "utf8")).toBe(written);
+        expect(foldedName(written)).toBe("probe");
+        rmSync(join(dir, name), { force: true });
+      }
+      // A directory spelling opens the plain directory or names one that does
+      // not exist; the write never lands anywhere else.
+      mkdirSync(join(dir, "held"));
+      for (const [spelling, file] of [
+        ["held::$INDEX_ALLOCATION", "x"],
+        ["held.", "y"],
+      ] as const) {
+        let wrote = true;
+        try {
+          writeFileSync(join(dir, spelling, file), file);
+        } catch {
+          wrote = false;
+        }
+        if (wrote) expect(readFileSync(join(dir, "held", file), "utf8")).toBe(file);
+        expect(readdirSync(dir)).toEqual(["held"]);
+        expect(foldedName(spelling)).toBe("held");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
-    mkdirSync(join(dir, "held"));
-    writeFileSync(join(dir, "held::$INDEX_ALLOCATION", "x"), "x");
-    expect(readFileSync(join(dir, "held", "x"), "utf8")).toBe("x");
-    writeFileSync(join(dir, "held.", "y"), "y");
-    expect(readFileSync(join(dir, "held", "y"), "utf8")).toBe("y");
-    expect(foldedName("held::$INDEX_ALLOCATION")).toBe("held");
-    expect(foldedName("held.")).toBe("held");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
+  },
+);
 
 describe("protectedRootLinkedInto", () => {
   const roots = [".crewhaus/sessions", ".crewhaus/settings.json"];
