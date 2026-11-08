@@ -13,7 +13,8 @@
     { "path": "../ir" },
     { "path": "../memory-service" },
     { "path": "../model-service" },
-    { "path": "../tool-categories" }
+    { "path": "../tool-categories" },
+    { "path": "../tool-registry-manifest" }
   ],
   "include": ["src/**/*"]
 }

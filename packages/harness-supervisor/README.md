@@ -41,6 +41,8 @@ harness copied to another machine carries its own history with it.
   logs/<runId>.events.jsonl   extracted TraceEvents, already scrubbed
   logs/<runId>.cursor         the pump's byte-exact resume point
   control-token               minted control.v1 bearer, 0600
+  gateway-jwt-secret          a managed daemon's generated signing secret, 0600, replaced each boot
+  .gitignore                  `*`, written beside that secret and left alone when one exists
 ```
 
 Retention keeps the last 20 runs or 50 MB, configurable per harness in

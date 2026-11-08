@@ -14,6 +14,8 @@
  *     on the supervisor's read path, not on the file, so a generic text
  *     browser over that directory would serve in cleartext exactly what the
  *     run console masks. The run routes stay the only way in.
+ *   - `run/gateway-jwt-secret` — a managed daemon's generated signing secret.
+ *     A bare value carries no key for a masker to read, so it is refused whole.
  * Those exclusions are enforced HERE, in the store allowlist and in the
  * generic raw browser, not in the UI — and they are matched CASE-FOLDED,
  * because the default filesystem on darwin and Windows resolves
@@ -108,7 +110,7 @@ export function isInspectStore(value: string): value is InspectStore {
 
 /** Referenced by the module docblock so the store list has one home. */
 export const INSPECT_STORE_NOTE =
-  "secrets/, raw audit files, .env and the raw run captures are excluded from every inspect route";
+  "secrets/, raw audit files, .env, the raw run captures and a generated signing secret are excluded from every inspect route";
 
 /** Cap on directory entries listed for one store (a runaway `logs/` must not
  *  make a fleet console paint unbounded). */
@@ -245,6 +247,12 @@ export const INSPECT_EXCLUSIONS: readonly InspectExclusion[] = [
       "the raw captured output of supervised runs — unscrubbed by construction, because the credential scrubber sits on the read path rather than on the file",
     where: "Runs → the run console, which scrubs on the way out",
   },
+  {
+    path: ".crewhaus/run/gateway-jwt-secret",
+    reason:
+      "a managed daemon's generated signing secret — a bare value, with no key for a masker to read",
+    where: "the file itself, on the daemon's machine, or set CREWHAUS_GATEWAY_JWT_SECRET",
+  },
 ];
 
 /**
@@ -254,7 +262,7 @@ export const INSPECT_EXCLUSIONS: readonly InspectExclusion[] = [
  * `secrets` is refused, wherever it sits, and any name that starts `.env`.
  * Over-refusing a browser is recoverable; under-refusing it is not.
  *
- * CASE-FOLDED, ALL FOUR OF THEM. The default filesystem on darwin (APFS) and
+ * CASE-FOLDED, ALL FIVE OF THEM. The default filesystem on darwin (APFS) and
  * on Windows (NTFS) is case-INSENSITIVE, so the OS happily resolves
  * `.crewhaus/AUDIT` and `.crewhaus/Run/Logs` to the real directories — and
  * `resolveContained` answers with the caller's casing rather than the
@@ -275,6 +283,9 @@ export function exclusionFor(segments: readonly string[]): InspectExclusion | nu
   if (lower[1] === "audit") return INSPECT_EXCLUSIONS[1] as InspectExclusion;
   if (lower[1] === "run" && lower[2] === "logs") {
     return INSPECT_EXCLUSIONS[3] as InspectExclusion;
+  }
+  if (lower[1] === "run" && lower[2] === "gateway-jwt-secret") {
+    return INSPECT_EXCLUSIONS[4] as InspectExclusion;
   }
   return null;
 }
@@ -906,8 +917,7 @@ function modelledStoreFor(segments: readonly string[]): InspectStore | null {
  * `GET /api/h/:id/inspect/raw` — the generic raw browser.
  *
  * `?path=` is harness-relative and resolved through the same containment
- * check as every other read. Refuse `secrets/`, the raw audit files and
- * `.env*`. Directory paths list; file paths return capped, masked text.
+ * check as every other read. Refuse every {@link INSPECT_EXCLUSIONS} row. Directory paths list; file paths return capped, masked text.
  * READ-ONLY — this route has no write twin, deliberately.
  */
 export const inspectRaw: M3Handler = (ctx) => {

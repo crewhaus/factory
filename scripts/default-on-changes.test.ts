@@ -20,12 +20,13 @@
  * no longer reads the way 0.7.x did, and every shape whose daemon stops on an
  * unset tool-config variable with an exit code of its own, with that code,
  * every `HarnessRegister` change it keeps to rows in its workspace, every leaf
- * the optimizer refuses that 0.8.0 did not, and the address
- * `crewhaus serve --mcp --sse` listens on. A change reverted or scoped to the
- * block stops being found, and a new root, tool, header line, edge warning,
- * verdict that moved, stopping shape or refused leaf fails until the notes name
- * it. Each scan also asserts it found something, so a scan that silently
- * matches nothing fails too.
+ * the optimizer refuses that 0.8.0 did not, the address
+ * `crewhaus serve --mcp --sse` listens on, and the file a managed daemon saves a
+ * generated signing secret to. A change reverted or scoped to the block stops
+ * being found, and a new root, tool, header line, edge warning, verdict that
+ * moved, stopping shape or refused leaf fails until the notes name it. Each scan
+ * also asserts it found something, so a scan that silently matches nothing
+ * fails too.
  *
  * The guard reads 0.8.0's list, under `PROVABILITY_HEADING`, and every later
  * release's list, under `DEFAULT_ON_HEADING`, which sits in `## [Unreleased]`
@@ -51,6 +52,7 @@ import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
+import type { IrManagedV0 } from "../packages/ir/src/index";
 import {
   type RuleSet,
   type ToolCallContext,
@@ -61,6 +63,7 @@ import { createRunContext, tagContent } from "../packages/run-context/src/index"
 import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
 import { OPTIMIZER_REFUSED_LEAVES } from "../packages/spec-patch/src/index";
+import { emitManaged } from "../packages/target-managed/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
 import {
   SHAPE_TOOL_PROFILES,
@@ -1111,6 +1114,32 @@ describe("the release notes name every change a harness without provability: see
     expect(bullet).toContain("`127.0.0.1`");
     expect(bullet).toContain("`Host`");
     expect(bullet).toContain("`Origin`");
+  });
+
+  test("a managed daemon's generated signing secret: the file it goes to is named", () => {
+    const managed: IrManagedV0 = {
+      version: 0,
+      name: "default-on-guard",
+      target: "managed",
+      agent: { model: "claude-sonnet-4-6", instructions: "Answer." },
+      tenants: [{ id: "tenant-a", budget: { maxInputTokens: 1, maxOutputTokens: 1 } }],
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    const daemonOf = (over: Partial<IrManagedV0>): string =>
+      emitManaged({ ...managed, ...over }, { readme: false }).files.find(
+        (file) => file.path === "daemon.ts",
+      )?.content ?? "";
+    const daemon = daemonOf({});
+    expect(daemon).toContain("gateway-jwt-secret");
+    expect(daemon).not.toContain("export CREWHAUS_GATEWAY_JWT_SECRET=");
+    // Named in a later list, since 0.8.0 did not ship it.
+    const later = defaultOnBullets(changelog, LATER_HEADINGS);
+    const bullet = later.find((b) => b.includes("`.crewhaus/run/gateway-jwt-secret`")) ?? "";
+    expect(bullet).not.toBe("");
+    // The boot line about the tenants root rides the same bullet.
+    expect(daemonOf({ tools: ["read"] })).toContain("keep CREWHAUS_TENANTS_ROOT outside");
+    expect(bullet).toContain("`CREWHAUS_TENANTS_ROOT` belongs");
   });
 
   test("FactCrossCheck: every kind of spelling whose verdict moved since 0.7.x is named", async () => {

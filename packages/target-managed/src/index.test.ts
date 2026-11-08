@@ -582,6 +582,79 @@ describe("emitManaged — the default session id honors session-store's id contr
   });
 });
 
+describe("emitManaged — a generated signing secret", () => {
+  const daemonOf = (over: Partial<IrManagedV0> = {}): string =>
+    emitManaged({ ...ir, ...over }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("goes to a 0600 file in the run directory, and the log names the path", () => {
+    const daemon = daemonOf();
+    expect(daemon).toContain("`${process.cwd()}/.crewhaus/run/gateway-jwt-secret`");
+    expect(daemon).toContain(
+      'writeFileSync(secretFile, `${JWT_SECRET}\\n`, { mode: 0o600, flag: "wx" });',
+    );
+    expect(daemon).toContain("saved it to .crewhaus/run/gateway-jwt-secret");
+    expect(daemon).not.toContain("export CREWHAUS_GATEWAY_JWT_SECRET=${");
+  });
+
+  test("an existing entry is removed before the exclusive write, and the daemon does not read the value back", () => {
+    const daemon = daemonOf();
+    const removed = daemon.indexOf("rmSync(secretFile, { force: true });");
+    const written = daemon.indexOf("writeFileSync(secretFile,");
+    expect(removed).toBeGreaterThan(-1);
+    expect(written).toBeGreaterThan(removed);
+    expect(daemon).not.toContain("readFileSync(secretFile");
+  });
+
+  test("the run directory keeps a .gitignore, and an existing one stays", () => {
+    const daemon = daemonOf();
+    expect(daemon).toContain("const ignoreFile = `${dirname(secretFile)}/.gitignore`;");
+    expect(daemon).toContain('writeFileSync(ignoreFile, "*\\n", { flag: "wx" });');
+    expect(daemon).toContain("if (!lstatSync(ignoreFile).isFile()) {");
+  });
+
+  test("the feedback handler's import does not name mkdirSync a second time", () => {
+    const imports = daemonOf({ feedback: { modality: "binary" } })
+      .split("\n")
+      .filter((line) => line.startsWith("import ") && line.includes("mkdirSync"));
+    expect(imports).toEqual([
+      'import { lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";',
+    ]);
+  });
+});
+
+describe("emitManaged — where the tenants root belongs", () => {
+  const LINE =
+    "[managed] keep CREWHAUS_TENANTS_ROOT outside the harness directory, so tenant data stays apart from the harness's own files.";
+  const daemonOf = (over: Partial<IrManagedV0> = {}): string =>
+    emitManaged({ ...ir, ...over }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test.each([
+    ["read", "takes a path"],
+    ["grep", "takes a path beside its pattern"],
+    ["bash", "runs a command"],
+    ["readLines", "declares no operative argument"],
+    ["tailFile", "declares no operative argument"],
+    ["sqlQuery", "declares no operative argument"],
+  ])("%s declared (%s): the boot line is emitted", (tool) => {
+    expect(daemonOf({ tools: [tool] })).toContain(LINE);
+  });
+
+  test.each([
+    ["no tools", undefined],
+    ["an empty list", []],
+    ["a tool that names no path", ["webFetch"]],
+  ])("%s: not a byte of it", (_name, tools) => {
+    const over = tools === undefined ? {} : { tools };
+    const daemon = daemonOf(over);
+    expect(daemon).not.toContain(LINE);
+    expect(daemon).not.toContain("onDisk");
+    expect(daemon).toContain('import { dirname } from "node:path";');
+    expect(daemon).toContain(
+      'import { lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";',
+    );
+  });
+});
+
 describe("TargetEmitError", () => {
   test("is a compiler-coded CrewhausError carrying message and cause", () => {
     const cause = new Error("underlying");
@@ -663,7 +736,9 @@ describe("emitManaged — SLO wiring (ops item 37)", () => {
     expect(daemon).toContain("intakeGate: readIntakeGate");
     expect(daemon).toContain(".crewhaus/slo/intake.json");
     expect(daemon).toContain("function readIntakeGate");
-    expect(daemon).toContain('import { readFileSync } from "node:fs"');
+    expect(daemon).toContain(
+      'import { lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"',
+    );
   });
 
   test("agent.ts threads sloTargets into runChatLoop when the spec declares SLO (F4)", () => {
@@ -1031,6 +1106,16 @@ describe("emitManaged — the in-loop gates (loop contract 0.4 G02; 0.8.0 §4.4 
     );
     // Without the block, not a byte of it.
     expect(daemonOf({ provability: undefined })).not.toContain("proof bundles go to");
+  });
+
+  test("provability: the boot line names a durable root outside the harness", () => {
+    const daemon =
+      emitManaged({ ...ir, provability: PROVABILITY }).files.find((f) => f.path === "daemon.ts")
+        ?.content ?? "";
+    expect(daemon).toContain(
+      "Set CREWHAUS_TENANTS_ROOT to an absolute path outside the harness directory to keep them, such as /home/you/.crewhaus/tenants/<harness>.",
+    );
+    expect(daemon).not.toContain("for example .crewhaus/tenants");
   });
 
   test("provability with the memory fabric: the observer and the tenant both reach runOneTurn", () => {

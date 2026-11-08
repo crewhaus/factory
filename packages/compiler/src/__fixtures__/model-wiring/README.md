@@ -78,3 +78,13 @@ and request from outside the container was refused while the in-container
 healthcheck stayed green. Nothing else in either bundle moved; the eight added
 and two removed lines are entirely that change, and the continuity opt-out
 contract is untouched.
+
+**Managed secret delta — `managed.daemon.ts` only.** A generated signing secret
+is saved to `.crewhaus/run/gateway-jwt-secret` (0600), beside a `.gitignore`
+holding `*`, which replaces anything at that name but a regular file, and the
+log names the path; the imports gain `lstatSync`, `mkdirSync`, `rmSync`,
+`writeFileSync` and `dirname`. The boot lines about where
+`CREWHAUS_TENANTS_ROOT` belongs ride the same change. They are emitted only for
+a spec that declares a tool that may work on files, or `provability:`, and the
+spec pinned here declares neither, so they move no byte of this pin. Nothing
+else in the bundle moves.
