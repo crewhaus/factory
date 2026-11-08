@@ -1,7 +1,7 @@
 /** Invites: one use, a bounded lifetime, settled by a claim. */
 import { afterAll, describe, expect, test } from "bun:test";
 import { ISSUED_SECRET_RES } from "@crewhaus/control-contract";
-import { publishClaim } from "@crewhaus/control-records";
+import { append, publishClaim } from "@crewhaus/control-records";
 import { INVITE_TTL_MS, redeemInvite } from "./access";
 import { accessLedger, accessPaths, inviteEndClaim } from "./paths";
 import { DAY, HOUR, homeFixture, ok, removeTempDirs, rowCount } from "./test-helpers";
@@ -176,6 +176,99 @@ describe("redeemInvite", () => {
     expect(answer.ok).toBe(true);
     expect(home.snapshot().invites[0]).toEqual(
       expect.objectContaining({ principal: home.owner, by: home.owner }),
+    );
+  });
+});
+
+describe("an invite works only while its creator may manage access", () => {
+  async function coOwnerWithInvite() {
+    const home = await homeFixture({ harnesses: [[]] });
+    const co = ok(
+      await home.access.grant(home.actor, {
+        member: "Co",
+        create: true,
+        role: "owner",
+        scope: "home",
+      }),
+    );
+    const minted = ok(
+      await home.access.createInvite({ principal: co.principal }, { role: "owner", scope: "home" }),
+    );
+    expect(home.snapshot().invites.find((row) => row.id === minted.invite.id)?.createdBy).toBe(
+      co.principal,
+    );
+    return { home, co, ...minted };
+  }
+
+  test("removing the creator withdraws their open invites, and the code is refused as revoked", async () => {
+    const { home, co, invite, code } = await coOwnerWithInvite();
+    const mine = await inviteIn(home);
+    const removed = ok(await home.access.removeMember(home.actor, co.principal));
+    expect(removed.revoked.invites).toBe(1);
+    const states = Object.fromEntries(home.snapshot().invites.map((row) => [row.id, row.state]));
+    expect(states).toEqual({ [invite.id]: "revoked", [mine.invite.id]: "open" });
+    expect(await redeemInvite(home.root, code, { now: home.clock.now })).toEqual(
+      expect.objectContaining({ ok: false, code: "revoked" }),
+    );
+    expect((await redeemInvite(home.root, mine.code, { now: home.clock.now })).ok).toBe(true);
+  });
+
+  test("revoking the grant that let the creator manage access withdraws their invites; another grant does not", async () => {
+    const { home, co, invite, code } = await coOwnerWithInvite();
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    const viewer = ok(
+      await home.access.grant(home.actor, {
+        member: co.principal,
+        role: "viewer",
+        scope: `harness:${h.id}`,
+      }),
+    );
+    ok(await home.access.revoke(home.actor, viewer.grant.id));
+    expect(home.snapshot().invites.find((row) => row.id === invite.id)?.state).toBe("open");
+    ok(await home.access.revoke(home.actor, co.grant.id));
+    expect(home.snapshot().invites.find((row) => row.id === invite.id)?.state).toBe("revoked");
+    expect(await redeemInvite(home.root, code, { now: home.clock.now })).toEqual(
+      expect.objectContaining({ ok: false, code: "revoked" }),
+    );
+  });
+
+  test("redeeming re-checks the creator: an invite still open after they lost access is revoked", async () => {
+    const { home, co, invite, code } = await coOwnerWithInvite();
+    // The creator's grant ended by a record that did not withdraw the invite.
+    const grant = home.snapshot().grants.find((row) => row.id === co.grant.id);
+    const at = new Date(home.clock.now()).toISOString();
+    const appended = append(accessLedger(home.root, "grants"), {
+      ...grant,
+      state: "revoked",
+      revokedAt: at,
+      at,
+      by: home.owner,
+    });
+    expect(appended.ok).toBe(true);
+    expect(home.snapshot().invites.find((row) => row.id === invite.id)?.state).toBe("open");
+    const epoch = home.snapshot().epoch;
+    expect(await redeemInvite(home.root, code, { now: home.clock.now })).toEqual(
+      expect.objectContaining({ ok: false, code: "revoked" }),
+    );
+    expect(home.snapshot().invites.find((row) => row.id === invite.id)?.state).toBe("open");
+    expect(home.snapshot().epoch).toBe(epoch);
+  });
+
+  test("a removal still lands when one of their invites was already claimed by a redemption", async () => {
+    const { home, co, invite, code } = await coOwnerWithInvite();
+    const row = home.snapshot().invites.find((other) => other.id === invite.id);
+    const claimed = publishClaim(accessLedger(home.root, "invites"), inviteEndClaim(invite.id), {
+      ...row,
+      state: "consumed",
+      consumedAt: new Date(home.clock.now()).toISOString(),
+      by: "sys:executor",
+    });
+    expect(claimed.ok).toBe(true);
+    ok(await home.access.removeMember(home.actor, co.principal));
+    expect(home.snapshot().principals.find((p) => p.id === co.principal)?.state).toBe("removed");
+    expect(await redeemInvite(home.root, code, { now: home.clock.now })).toEqual(
+      expect.objectContaining({ ok: false }),
     );
   });
 });

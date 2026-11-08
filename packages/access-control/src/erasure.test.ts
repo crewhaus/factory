@@ -52,7 +52,7 @@ describe("revoke --member", () => {
     expect(holding(before, SLACK).sort()).toEqual(["access/subjects.json", "h0/approvers.json"]);
     expect(holding(before, ana.principal).length).toBeGreaterThan(2);
     const removed = ok(await home.access.removeMember(home.actor, NAME));
-    expect(removed.revoked).toEqual({ grants: 1, tokens: 0, links: 2 });
+    expect(removed.revoked).toEqual({ grants: 1, tokens: 0, links: 2, invites: 0 });
     const after = everything(home);
     expect(holding(after, NAME)).toEqual([]);
     expect(holding(after, SLACK)).toEqual([]);

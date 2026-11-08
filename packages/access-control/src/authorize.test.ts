@@ -67,11 +67,13 @@ function snapshotOf(
   principals: readonly PrincipalRow[] = [principal(OWNER), principal(ALICE)],
   tokens: readonly CredentialRow[] = [],
 ): AccessSnapshot {
+  const own = grant(OWNER, "owner", "home", { grantedBy: OWNER });
   return {
     epoch: 1,
     owner: OWNER,
+    ownerGrant: own.id,
     principals,
-    grants: [grant(OWNER, "owner", "home", { grantedBy: OWNER }), ...grants],
+    grants: [own, ...grants],
     tokens,
     invites: [],
     links: [],

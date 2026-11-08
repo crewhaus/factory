@@ -86,14 +86,23 @@ CrewHaus secret is masked wherever it appears.
   checker. With no checker it is refused; no role implies it; a core prefix (`home`, `h`, `self`) or a
   second registration throws. Two handles never share domains.
 - **What stays.** The last owner of the whole Home cannot be revoked. The home owner, the principal the
-  migration created, keeps its grant, its local link and the bootstrap credential: hand-over is not
-  part of this stage.
+  migration created, keeps the owner grant that made it the home owner, its local link and the
+  bootstrap credential: hand-over is not part of this stage. Any other grant it holds can be revoked.
+- **Expiry.** Only a viewer grant can carry an end time, and a grant with one is never copied into a
+  projection as a decider.
+- **Invites** work only while their creator may still manage access: removing the creator, or revoking
+  the grant that let them manage access, withdraws their open invites, and redeeming one re-checks.
+- **The same OS user on a renamed computer** is still the owner: when the user part of the local actor
+  matches the owner's local link and the Hangar root belongs to that user, the new name is linked too.
 - **Projections** are written only for a governed harness: one a live grant other than the home
   owner's covers, or one on which a principal with a live Slack link may decide. GitHub and proxy links
   are never projected. A harness stays governed, and its `governedSince` comes from `governed.jsonl`,
   so deleting the file never resets it. A change rewrites only the projections whose content differs
-  from the file, or whose file is absent or unreadable, and never replaces a file with a higher epoch.
-  A failure never undoes the change; it is reported per harness, and `crewhaus access sync` retries.
+  from the file, or whose file is absent or unreadable. Every change moves the revision above the
+  highest epoch of any registered harness's file, so a lost `revision.json` never leaves a file ahead
+  of the records; one still ahead is reported as not updated, and `sync` moves the revision above it
+  and replaces it. A failure never undoes the change; it is reported per harness, the verb exits 1,
+  and `crewhaus access sync` retries.
   `sync` also follows registry group edits, which move coverage without an access change.
 
 ## `crewhaus access`

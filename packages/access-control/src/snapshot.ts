@@ -26,6 +26,8 @@ export type AccessSnapshot = {
   readonly epoch: number;
   /** The home owner: the principal the bootstrap migration created. */
   readonly owner: string | undefined;
+  /** The grant that makes `owner` the home owner, which can never be revoked. */
+  readonly ownerGrant: string | undefined;
   readonly principals: readonly PrincipalRow[];
   readonly grants: readonly GrantRow[];
   /** The credential rows (`credentials.jsonl`), named so the masker never hides the list. */
@@ -49,12 +51,12 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-/** The home owner: the earliest member who granted themselves owner of the whole Home. */
-function homeOwnerOf(grants: readonly GrantRow[]): string | undefined {
+/** The home owner's grant: the earliest a member gave themselves, owner of the whole Home. */
+function homeOwnerGrantOf(grants: readonly GrantRow[]): GrantRow | undefined {
   return grants.find(
     (grant) =>
       grant.grantedBy === grant.principal && grant.role === "owner" && grant.scope === "home",
-  )?.principal;
+  );
 }
 
 function foldKind<K extends LedgerKind>(
@@ -109,9 +111,11 @@ export function loadAccessSnapshot(root: string): AccessSnapshotRead {
   const subjects = readSubjects(root);
   if (subjects.state === "unreadable") return subjects;
   const grants = folded.grants ?? [];
+  const ownerGrant = homeOwnerGrantOf(grants);
   const snapshot: AccessSnapshot = {
     epoch: revision.state === "present" ? revision.value.epoch : 0,
-    owner: homeOwnerOf(grants),
+    owner: ownerGrant?.principal,
+    ownerGrant: ownerGrant?.id,
     principals: folded.principals ?? [],
     grants,
     tokens: folded.credentials ?? [],

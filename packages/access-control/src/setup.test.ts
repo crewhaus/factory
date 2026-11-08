@@ -166,6 +166,37 @@ describe("ensureAccessSetUp", () => {
     expect(counts(root)).toEqual(before);
   });
 
+  test("the same OS user under a renamed computer is linked again; another user still is not", async () => {
+    const root = freshRoot();
+    const first = ok(await ensureAccessSetUp(root, { localActor: "local:max@maxs-mbp.local" }));
+    const renamed = ok(await ensureAccessSetUp(root, { localActor: "local:max@maxs-mbp" }));
+    expect(renamed.localPrincipal).toBe(first.owner);
+    expect(renamed.created).toEqual(["local-link"]);
+    const read = loadAccessSnapshot(root);
+    if (read.state !== "present") throw new Error("no records");
+    const locals = read.snapshot.links.filter((link) => link.provider === "local");
+    expect(locals.map((link) => link.principal)).toEqual([first.owner, first.owner]);
+    expect(locals.every((link) => link.verifiedVia === "bootstrap")).toBe(true);
+    // The readable subject is only in subjects.json; the row holds its keyed digest.
+    expect(readFileSync(join(root, accessPaths().ledgers.links), "utf8")).not.toContain("maxs-mbp");
+    expect(Object.values(read.snapshot.subjects.links).sort()).toEqual([
+      "local:max@maxs-mbp",
+      "local:max@maxs-mbp.local",
+    ]);
+    // Idempotent once linked.
+    const before = counts(root);
+    const again = ok(await ensureAccessSetUp(root, { localActor: "local:max@maxs-mbp" }));
+    expect(again).toEqual(expect.objectContaining({ localPrincipal: first.owner, created: [] }));
+    expect(counts(root)).toEqual(before);
+    for (const other of ["local:eve@maxs-mbp", "local:maxi@maxs-mbp", "local:Max@elsewhere"]) {
+      if (process.platform === "win32" && other === "local:Max@elsewhere") continue;
+      const refused = ok(await ensureAccessSetUp(root, { localActor: other }));
+      expect(refused.localPrincipal).toBeUndefined();
+      expect(refused.created).toEqual([]);
+    }
+    expect(counts(root)).toEqual(before);
+  });
+
   test("files are owner-only", async () => {
     if (process.platform === "win32") return; // Windows has no POSIX mode bits to check.
     const root = freshRoot();

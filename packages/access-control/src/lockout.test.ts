@@ -3,7 +3,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { LEDGER_KINDS, accessPaths } from "./paths";
-import { homeFixture, ok, readProjection, removeTempDirs, rowCount } from "./test-helpers";
+import { HOUR, homeFixture, ok, readProjection, removeTempDirs, rowCount } from "./test-helpers";
 
 afterAll(removeTempDirs);
 
@@ -44,6 +44,40 @@ describe("lockout", () => {
     expect(refused).toEqual(expect.objectContaining({ ok: false, code: "home-owner" }));
     expect(counts(home.root)).toEqual(before);
     ok(await home.access.revoke(home.actor, bo.grant.id));
+  });
+
+  test("only the grant that makes the home owner is kept: any other grant they gave themselves can go", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    const ownerGrant = home.snapshot().ownerGrant;
+    expect(ownerGrant).toMatch(/^grt_/);
+    const viewer = ok(
+      await home.access.grant(home.actor, {
+        member: home.owner,
+        role: "viewer",
+        scope: `harness:${h.id}`,
+      }),
+    );
+    const timed = ok(
+      await home.access.grant(home.actor, {
+        member: home.owner,
+        role: "viewer",
+        scope: "home",
+        expiresAt: new Date(home.clock.now() + HOUR).toISOString(),
+      }),
+    );
+    const second = ok(
+      await home.access.grant(home.actor, { member: home.owner, role: "owner", scope: "home" }),
+    );
+    for (const id of [viewer.grant.id, timed.grant.id, second.grant.id]) {
+      const revoked = ok(await home.access.revoke(home.actor, id));
+      expect(revoked.kind === "grant" && revoked.grant.state).toBe("revoked");
+    }
+    expect(home.snapshot().ownerGrant).toBe(ownerGrant);
+    const refused = await home.access.revoke(home.actor, ownerGrant as string);
+    expect(refused).toEqual(expect.objectContaining({ ok: false }));
+    if (!refused.ok) expect(["lockout", "home-owner"]).toContain(refused.code);
   });
 
   test("the home owner cannot be removed, and the reason says why", async () => {

@@ -370,6 +370,7 @@ export function usageText(): string {
     "       members [--json] | tokens [--json]   who has access, and the service tokens",
     "       invite --role R (--home | --group G | --harness H) [--expires D]   a one-use link",
     "       grant --member M --role R (--home | --group G | --harness H) [--expires D] [--create]",
+    "                                        (only the viewer role takes --expires)",
     "       revoke <id> | revoke --member M  take back a grant, invite or token; remove someone",
     "       link <slack:T:U|github:N|proxy:H:V> --member M [--create] | unlink <id|account>",
     "       mint --service S --permission P... [--harness H...] [--content] [--subject]",

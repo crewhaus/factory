@@ -32,7 +32,6 @@ import {
   listTokens,
   loadAccessSnapshot,
   localActorOf,
-  localPrincipalOf,
   openAccess,
 } from "@crewhaus/access-control";
 import { type HangarRegistry, openHangarRegistry } from "@crewhaus/harness-registry";
@@ -64,7 +63,8 @@ const ACCESS_USAGE_LINES: readonly string[] = [
   "  crewhaus access invite --role <role> (--home | --group <g> | --harness <h>) [--expires <dur>]",
   "                                               a link that works once (24h by default, 7d at most)",
   "  crewhaus access grant --member <name|id> --role <role> (--home | --group <g> | --harness <h>)",
-  "       [--expires <dur>] [--create]            give someone a role; --create adds them by name",
+  "       [--expires <dur>] [--create]            give someone a role; --create adds them by name;",
+  "                                               only the viewer role takes --expires",
   "  crewhaus access revoke <grt_…|inv_…|crd_…>   take back a grant, an invite or a token",
   "  crewhaus access revoke --member <name|id>    remove someone, with their grants, tokens and links",
   "  crewhaus access link <slack:T:U|github:N|proxy:H:V> --member <name|id|me> [--create]",
@@ -531,11 +531,12 @@ async function revokeVerb(session: Session, argv: readonly string[]): Promise<Ac
   if (member !== undefined) {
     const done = await session.access.removeMember(actor, memberRef(member, acting.principal));
     if (!done.ok) return refused(done, acting.lines);
-    const { grants, tokens, links } = done.result.revoked;
+    const { grants, tokens, links, invites } = done.result.revoked;
     const parts = [
       grants === 1 ? "1 grant" : `${grants} grants`,
       tokens === 1 ? "1 token" : `${tokens} tokens`,
       links === 1 ? "1 link" : `${links} links`,
+      ...(invites > 0 ? [invites === 1 ? "1 open invite" : `${invites} open invites`] : []),
     ];
     return finish(session, done, [
       ...acting.lines,
@@ -645,20 +646,19 @@ async function syncVerb(session: Session, argv: readonly string[]): Promise<Acce
   if (read.state === "unreadable") {
     return { lines: [`The access records cannot be read: ${read.reason}.`], exitCode: 1 };
   }
-  const principal = localPrincipalOf(read.snapshot, session.localActor);
-  if (principal === undefined) {
-    return { lines: ["This Home belongs to another user on this computer."], exitCode: 1 };
-  }
-  const done = await session.access.sync({ principal });
-  if (!done.ok) return refused(done);
-  const { written, unchanged, newer } = done.result;
+  const acting = await actingPrincipal(session);
+  if ("ok" in acting) return refused(acting);
+  const done = await session.access.sync({ principal: acting.principal });
+  if (!done.ok) return refused(done, acting.lines);
+  const { written, unchanged, failed } = done.result;
+  const governed = written.length + unchanged.length + failed.length;
   const lines = [
-    written.length === 0 && unchanged.length === 0
+    ...acting.lines,
+    governed === 0
       ? "No harness has anyone else who may approve, so there is nothing to write."
-      : `Updated ${written.length} of ${written.length + unchanged.length} approver lists; the rest were current.`,
-    ...(newer.length > 0
-      ? [`${newer.length} had a newer list written by another change and were left alone.`]
-      : []),
+      : failed.length === 0
+        ? `Updated ${written.length} of ${governed} approver lists; the rest were current.`
+        : `Updated ${written.length} of ${governed} approver lists.`,
   ];
   return finish(session, done, lines);
 }

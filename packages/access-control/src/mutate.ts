@@ -1,8 +1,9 @@
 /**
  * The one way an access record changes. Under the access lock: load the snapshot, check
  * that the actor holds `home.access.manage`, plan the rows, check every row's size, rewrite
- * `subjects.json` when it changed, append the rows, move the access revision, and bring the
- * governed harnesses' projections to the new snapshot. Then release.
+ * `subjects.json` when it changed, append the rows, move the access revision (above every
+ * registered harness's approver file), and bring the governed harnesses' projections to the
+ * new snapshot. Then release.
  *
  * The lock is control-records' `withFileLock`, which is not re-entrant, so a mutation that
  * touches several ledgers takes it once and writes each ledger's rows with `append` while
@@ -17,6 +18,7 @@ import {
   type AccessHarness,
   EMPTY_REPORT,
   type ProjectionReport,
+  highestProjectionEpoch,
   writeApproverProjections,
 } from "./projection";
 import { lineBytes } from "./records";
@@ -59,8 +61,14 @@ export type AccessContext = {
 
 export type PlannedRow = { readonly kind: LedgerKind; readonly row: Record<string, unknown> };
 
-/** A row whose append is decided by an exclusive claim; `taken` answers when it was already. */
-export type PlannedClaim = PlannedRow & { readonly claim: string; readonly taken: Refusal };
+/**
+ * A row whose append is decided by an exclusive claim. `taken` answers when the claim was
+ * already made: a refusal of the whole change, or `"skip"` to leave this one row out.
+ */
+export type PlannedClaim = PlannedRow & {
+  readonly claim: string;
+  readonly taken: Refusal | "skip";
+};
 
 export type Change<T> = {
   readonly rows: readonly PlannedRow[];
@@ -96,12 +104,14 @@ export type MutationOptions = {
 
 const HOME = { scope: "home" } as const;
 
-function rowsOf(change: Change<unknown>): PlannedRow[] {
+function rowsOf(change: Change<unknown>, skipped: ReadonlySet<string> = new Set()): PlannedRow[] {
   return [
-    ...(change.claims ?? []).map((claim) => ({
-      kind: claim.kind,
-      row: { ...claim.row, claim: claim.claim },
-    })),
+    ...(change.claims ?? [])
+      .filter((claim) => !skipped.has(claim.claim))
+      .map((claim) => ({
+        kind: claim.kind,
+        row: { ...claim.row, claim: claim.claim },
+      })),
     ...change.rows,
   ];
 }
@@ -168,15 +178,15 @@ async function runLocked<T>(
   const by = options.setup?.by(snapshot) ?? (actor as AccessActor).principal;
   const planned = await plan({ snapshot, now, at, by });
   if ("ok" in planned) return planned;
-  const rows = rowsOf(planned);
+  const plannedRows = rowsOf(planned);
   const subjectsChanged =
     planned.subjects !== undefined &&
     (snapshot === undefined || subjectsText(planned.subjects) !== subjectsText(snapshot.subjects));
   const epoch = snapshot?.epoch ?? 0;
-  if (rows.length === 0 && !subjectsChanged) {
+  if (plannedRows.length === 0 && !subjectsChanged) {
     return { ok: true, result: planned.result, epoch, projections: EMPTY_REPORT };
   }
-  for (const { row } of rows) {
+  for (const { row } of plannedRows) {
     if (lineBytes(row) >= MAX_ROW_BYTES) {
       return refusal(
         "too-large",
@@ -184,16 +194,22 @@ async function runLocked<T>(
       );
     }
   }
+  const skipped = new Set<string>();
   for (const claim of planned.claims ?? []) {
     const published = publishClaim(accessLedger(ctx.root, claim.kind), claim.claim, {
       ...claim.row,
     });
     if (!published.ok) {
+      if (published.code === "exists" && claim.taken === "skip") {
+        skipped.add(claim.claim);
+        continue;
+      }
       return published.code === "exists"
-        ? claim.taken
+        ? (claim.taken as Refusal)
         : refusal("io-error", `The access records could not be changed: ${published.reason}`);
     }
   }
+  const rows = rowsOf(planned, skipped);
   // Names go first: an erasure that stops part-way has already erased, and a name written
   // for a member whose rows then fail to land belongs to no principal.
   if (subjectsChanged && planned.subjects !== undefined) {
@@ -216,7 +232,7 @@ async function runLocked<T>(
     }
     landed += 1;
   }
-  const next = landed > 0 || subjectsChanged ? epoch + 1 : epoch;
+  const next = landed > 0 || subjectsChanged ? nextEpoch(ctx, epoch, now) : epoch;
   if (next !== epoch) {
     const moved = writeRevision(ctx.root, next, at);
     if (!moved.ok && failure === undefined) failure = moved.reason;
@@ -231,6 +247,24 @@ async function runLocked<T>(
     ? projectAfter(ctx, { epoch: next, now, by })
     : EMPTY_REPORT;
   return { ok: true, result: planned.result, epoch: next, projections };
+}
+
+/**
+ * The revision after a change: one above both the recorded revision and every registered
+ * harness's approver file, so a lost or rewound `revision.json` cannot leave a file ahead
+ * of the records. Under the access lock only.
+ */
+export function nextEpoch(ctx: AccessContext, epoch: number, now: number): number {
+  return Math.max(epoch, projectionEpochFloor(ctx, now)) + 1;
+}
+
+/** The highest `epoch` of any registered harness's approver file; 0 when none can be read. */
+export function projectionEpochFloor(ctx: AccessContext, now: number): number {
+  try {
+    return highestProjectionEpoch(ctx.harnesses(), now);
+  } catch {
+    return 0;
+  }
 }
 
 /** Bring the projections to the records as they are now. Under the access lock only. */

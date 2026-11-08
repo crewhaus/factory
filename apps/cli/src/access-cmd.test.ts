@@ -357,6 +357,99 @@ describe("the verbs", () => {
     );
   });
 
+  test("the undo line a grant prints works, even for a grant the owner gave themselves", async () => {
+    const hrn = registerHarness();
+    const granted = await run(["grant", "--member", "me", "--role", "viewer", "--harness", hrn]);
+    expect(granted.exitCode).toBe(0);
+    const undo = granted.lines.find((line) => line.startsWith("To undo: crewhaus access "));
+    if (undo === undefined) throw new Error("no undo line");
+    const argv = undo.slice("To undo: crewhaus access ".length).split(" ");
+    expect(argv[0]).toBe("revoke");
+    expect(await run(argv)).toEqual({ lines: ["Revoked the viewer role on alpha."], exitCode: 0 });
+  });
+
+  test("--expires on a role that may approve is refused; on a viewer it works", async () => {
+    const hrn = registerHarness();
+    const refused = await run([
+      "grant",
+      "--member",
+      "Ana",
+      "--create",
+      "--role",
+      "operator",
+      "--harness",
+      hrn,
+      "--expires",
+      "1h",
+    ]);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.lines.at(-1)).toContain("Only the viewer role can be given with an end date.");
+    expect(existsSync(approversOf(harnessDir))).toBe(false);
+    const viewer = await run([
+      "grant",
+      "--member",
+      "Ana",
+      "--create",
+      "--role",
+      "viewer",
+      "--harness",
+      hrn,
+      "--expires",
+      "1h",
+    ]);
+    expect(viewer.exitCode).toBe(0);
+  });
+
+  test("the same user on a renamed computer still administers; another user name does not", async () => {
+    const hrn = registerHarness();
+    const first = { username: "max", hostname: "Maxs-MacBook-Pro.local" };
+    expect((await run(["link", "github:7", "--member", "me"], first)).exitCode).toBe(0);
+    const renamed = { username: "max", hostname: "maxs-macbook-pro" };
+    const granted = await run(
+      ["grant", "--member", "Ana", "--create", "--role", "operator", "--harness", hrn],
+      renamed,
+    );
+    expect(granted.exitCode).toBe(0);
+    expect((await run(["sync"], renamed)).exitCode).toBe(0);
+    const before = treeOf(join(hangarRoot, "access"));
+    const stranger = await run(["sync"], { username: "eve", hostname: "maxs-macbook-pro" });
+    expect(stranger).toEqual({
+      lines: ["This Home belongs to another user on this computer."],
+      exitCode: 1,
+    });
+    expect(treeOf(join(hangarRoot, "access"))).toEqual(before);
+  });
+
+  test("a list ahead of the records is still brought to the revoke", async () => {
+    const hrn = registerHarness();
+    await run(["grant", "--member", "Ana", "--create", "--role", "operator", "--harness", hrn]);
+    const ana = (await membersJson()).members.find((member) => member.displayName === "Ana");
+    const grantId = ana?.grants[0]?.id as string;
+    const planted = { ...projection(), epoch: projection().epoch + 50 };
+    writeFileSync(approversOf(harnessDir), JSON.stringify(planted));
+    const revoked = await run(["revoke", grantId]);
+    expect(revoked).toEqual({ lines: ["Revoked the operator role on alpha."], exitCode: 0 });
+    expect(projection().members).toEqual([]);
+    expect(projection().epoch).toBe(planted.epoch + 1);
+  });
+
+  test("a harness whose list could not be updated is named, and the verb exits 1 naming sync", async () => {
+    const hrn = registerHarness();
+    await run(["grant", "--member", "Ana", "--create", "--role", "operator", "--harness", hrn]);
+    const ana = (await membersJson()).members.find((member) => member.displayName === "Ana");
+    rmSync(harnessDir, { recursive: true, force: true });
+    const revoked = await run(["revoke", ana?.grants[0]?.id as string]);
+    expect(revoked.exitCode).toBe(1);
+    expect(revoked.lines).toEqual([
+      "Revoked the operator role on alpha.",
+      "Could not update who may approve on alpha: the harness directory is missing.",
+      "The change is recorded. Once that is fixed, run `crewhaus access sync`.",
+    ]);
+    const synced = await run(["sync"]);
+    expect(synced.exitCode).toBe(1);
+    expect(synced.lines[0]).toBe("Updated 0 of 1 approver lists.");
+  });
+
   test("sync rewrites an approver list that was deleted", async () => {
     registerHarness();
     expect(

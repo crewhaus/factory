@@ -9,18 +9,21 @@
  * governed. A single-owner install, and a harness never governed, never gets a file.
  *
  * A write rewrites only a governed harness whose content differs from its file, or whose
- * file is absent or unreadable, and never replaces a file with a higher `epoch`. A harness
- * the change does not touch keeps its file and its older `epoch`.
+ * file is absent or unreadable. A harness the change does not touch keeps its file and its
+ * older `epoch`. Every change moves the access revision above the highest `epoch` of any
+ * registered harness's file, so a lost or rewound `revision.json` never leaves a file
+ * ahead of the records; a file still ahead when it is written is reported as not updated.
  */
 import { statSync } from "node:fs";
 import {
   type ApproverProjection,
   type DecisionClass,
+  type Role,
   parseLinkSubject,
 } from "@crewhaus/control-contract";
 import { append, controlPaths, createApproverReader } from "@crewhaus/control-records";
 import { ensureDirContained, writeFileSafe } from "@crewhaus/tool-safety/fs";
-import { type AccessTarget, coveringGrants, credentialHolds, effectiveRole } from "./authorize";
+import { type AccessTarget, coveringGrants, credentialHolds } from "./authorize";
 import { sealTornLine } from "./files";
 import { accessLedger, accessPaths } from "./paths";
 import { type GovernedRow, lineBytes } from "./records";
@@ -40,8 +43,6 @@ export type ProjectionReport = {
   readonly written: readonly string[];
   /** Governed harnesses whose file already held this content. */
   readonly unchanged: readonly string[];
-  /** Governed harnesses whose file has a higher epoch, left alone. */
-  readonly newer: readonly string[];
   /** Governed harnesses that could not be updated, each with why. */
   readonly failed: readonly ProjectionFailure[];
 };
@@ -49,7 +50,6 @@ export type ProjectionReport = {
 export const EMPTY_REPORT: ProjectionReport = Object.freeze({
   written: [],
   unchanged: [],
-  newer: [],
   failed: [],
 });
 
@@ -64,6 +64,39 @@ export function _setProjectionWriteTapForTest(next: ((harness: string) => void) 
 
 function targetOf(harness: AccessHarness): AccessTarget {
   return { scope: "harness", harness: harness.id, groups: harness.groups };
+}
+
+/**
+ * The highest `epoch` among the approver files of these harnesses, or 0. Unreadable files
+ * count for nothing. The next access revision is set above it.
+ */
+export function highestProjectionEpoch(harnesses: readonly AccessHarness[], now: number): number {
+  const reader = createApproverReader({ now: () => now });
+  let highest = 0;
+  for (const harness of harnesses) {
+    const current = reader(harness.dir);
+    if (current.state !== "present") continue;
+    const epoch = current.projection.epoch;
+    if (epoch > highest && Number.isSafeInteger(epoch + 1)) highest = epoch;
+  }
+  return highest;
+}
+
+/**
+ * The highest class a member's grants let them decide at, counting only grants with no
+ * end time: the harness's file carries no end time, so an expiring grant is never copied
+ * into it as a decider.
+ */
+function standingRole(
+  snapshot: AccessSnapshot,
+  principal: string,
+  target: AccessTarget,
+  now: number,
+): Role | null {
+  const grant = coveringGrants(snapshot, principal, target, now).find(
+    (row) => row.expiresAt === undefined,
+  );
+  return grant?.role ?? null;
 }
 
 /** The highest class a principal may decide at on a harness, or `null`. */
@@ -88,7 +121,7 @@ export function decideClassOf(
     );
     return holds ? "operator" : null;
   }
-  const role = effectiveRole(snapshot, principal, target, now);
+  const role = standingRole(snapshot, principal, target, now);
   return role === null || role === "viewer" ? null : role;
 }
 
@@ -215,7 +248,7 @@ export function writeApproverProjections(input: WriteProjectionsInput): Projecti
   const reader = createApproverReader({ now: () => now });
   const governed = new Map(snapshot.governed.map((row) => [row.id, row]));
   const ledger = accessLedger(root, "governed");
-  const report = { written: [] as string[], unchanged: [] as string[], newer: [] as string[] };
+  const report = { written: [] as string[], unchanged: [] as string[] };
   const failed: ProjectionFailure[] = [];
   const seen = new Set<string>();
   for (const harness of input.harnesses) {
@@ -251,8 +284,13 @@ export function writeApproverProjections(input: WriteProjectionsInput): Projecti
         report.unchanged.push(harness.id);
         continue;
       }
+      // The revision is set above every file before this runs, so a file still ahead of
+      // it was not written by these records: report it rather than write behind it.
       if (current.projection.epoch > epoch) {
-        report.newer.push(harness.id);
+        failed.push({
+          harness: harness.id,
+          reason: "its list names a later revision than the access records",
+        });
         continue;
       }
     }

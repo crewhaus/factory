@@ -2,10 +2,12 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { mintId } from "@crewhaus/control-contract";
 import { approverProjection } from "@crewhaus/control-contract/schemas";
-import { createApproverReader } from "@crewhaus/control-records";
-import { accessPaths } from "./paths";
-import { _setProjectionWriteTapForTest } from "./projection";
+import { append, createApproverReader } from "@crewhaus/control-records";
+import { authorize } from "./authorize";
+import { accessLedger, accessPaths } from "./paths";
+import { _setProjectionWriteTapForTest, writeApproverProjections } from "./projection";
 import {
   HOUR,
   homeFixture,
@@ -180,7 +182,63 @@ describe("how a projection is kept", () => {
     expect(existsSync(projectionPath(h))).toBe(true);
   });
 
-  test("a file with a higher epoch is not replaced", async () => {
+  test("a file ahead of the revision is replaced by the next change, whose revision moves above it", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    const ana = ok(
+      await home.access.grant(home.actor, {
+        member: "Ana",
+        create: true,
+        role: "operator",
+        scope: `harness:${h.id}`,
+      }),
+    );
+    const planted = { ...readProjection(h), epoch: 999, members: [] };
+    writeFileSync(projectionPath(h), JSON.stringify(planted));
+    const writes = countWrites();
+    const done = await home.access.grant(home.actor, {
+      member: "Bo",
+      create: true,
+      role: "operator",
+      scope: `harness:${h.id}`,
+    });
+    if (!done.ok) throw new Error(done.reason);
+    expect(done.epoch).toBe(1000);
+    expect(done.projections.failed).toEqual([]);
+    expect(writes).toEqual([h.id]);
+    expect(home.snapshot().epoch).toBe(1000);
+    const after = readProjection(h);
+    expect(after["epoch"]).toBe(1000);
+    expect((after["members"] as { principal: string }[]).map((m) => m.principal).sort()).toEqual(
+      [ana.principal, done.result.principal].sort(),
+    );
+  });
+
+  test("after revision.json is lost, a revoke still takes the member off the list", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    const ana = ok(
+      await home.access.grant(home.actor, {
+        member: "Ana",
+        create: true,
+        role: "operator",
+        scope: `harness:${h.id}`,
+      }),
+    );
+    const listed = readProjection(h)["epoch"] as number;
+    rmSync(join(home.root, accessPaths().revision));
+    expect(home.snapshot().epoch).toBe(0);
+    const done = await home.access.revoke(home.actor, ana.grant.id);
+    if (!done.ok) throw new Error(done.reason);
+    expect(done.projections).toEqual({ written: [h.id], unchanged: [], failed: [] });
+    expect(done.epoch).toBe(listed + 1);
+    expect(readProjection(h)["members"]).toEqual([]);
+    expect(readProjection(h)["epoch"]).toBe(listed + 1);
+  });
+
+  test("sync moves the revision above a file ahead of it and replaces it", async () => {
     const home = await homeFixture({ harnesses: [[]] });
     const [h] = home.harnesses;
     if (h === undefined) throw new Error("no harness");
@@ -192,22 +250,47 @@ describe("how a projection is kept", () => {
         scope: `harness:${h.id}`,
       }),
     );
-    const planted = { ...readProjection(h), epoch: 999, members: [] };
-    writeFileSync(projectionPath(h), JSON.stringify(planted));
-    const writes = countWrites();
-    const answer = ok(
+    const good = readProjection(h);
+    writeFileSync(projectionPath(h), JSON.stringify({ ...good, epoch: 999, members: [] }));
+    const synced = await home.access.sync(home.actor);
+    if (!synced.ok) throw new Error(synced.reason);
+    expect(synced.result.written).toEqual([h.id]);
+    expect(synced.epoch).toBe(1000);
+    expect(home.snapshot().epoch).toBe(1000);
+    expect(readProjection(h)["members"]).toEqual(good["members"]);
+    expect(readProjection(h)["epoch"]).toBe(1000);
+  });
+
+  test("the writer reports a file still ahead of its epoch as not updated, never as current", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    ok(
       await home.access.grant(home.actor, {
-        member: "Bo",
+        member: "Ana",
         create: true,
         role: "operator",
         scope: `harness:${h.id}`,
       }),
     );
-    expect(answer.principal).toMatch(/^prn_/);
-    expect(writes).toEqual([]);
-    expect(readProjection(h)["epoch"]).toBe(999);
-    const synced = ok(await home.access.sync(home.actor));
-    expect(synced.newer).toEqual([h.id]);
+    const snapshot = home.snapshot();
+    writeFileSync(
+      projectionPath(h),
+      JSON.stringify({ ...readProjection(h), epoch: snapshot.epoch + 5, members: [] }),
+    );
+    const report = writeApproverProjections({
+      root: home.root,
+      snapshot,
+      harnesses: home.harnesses,
+      epoch: snapshot.epoch,
+      now: home.clock.now(),
+      by: home.owner,
+    });
+    expect(report.written).toEqual([]);
+    expect(report.unchanged).toEqual([]);
+    expect(report.failed).toEqual([
+      { harness: h.id, reason: "its list names a later revision than the access records" },
+    ]);
   });
 
   test("a current file is rewritten neither by sync nor by a change to another harness", async () => {
@@ -333,5 +416,78 @@ describe("how a projection is kept", () => {
     );
     expect(statSync(projectionPath(h)).mode & 0o777).toBe(0o600);
     expect(statSync(join(h.dir, ".crewhaus", "run", "control")).mode & 0o777).toBe(0o700);
+  });
+});
+
+describe("a grant with an end time", () => {
+  test("only a viewer grant can be given one; a role that may approve is refused and nothing is written", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    const expiresAt = new Date(home.clock.now() + HOUR).toISOString();
+    const before = rowCount(home.root, accessPaths().ledgers.grants);
+    for (const role of ["operator", "maintainer", "owner"]) {
+      const answer = await home.access.grant(home.actor, {
+        member: "Ana",
+        create: true,
+        role,
+        scope: `harness:${h.id}`,
+        expiresAt,
+      });
+      expect(answer).toEqual(expect.objectContaining({ ok: false, code: "invalid" }));
+      if (!answer.ok) expect(answer.reason).toContain("Only the viewer role");
+    }
+    expect(rowCount(home.root, accessPaths().ledgers.grants)).toBe(before);
+    expect(existsSync(projectionPath(h))).toBe(false);
+    const viewer = ok(
+      await home.access.grant(home.actor, {
+        member: "Ana",
+        create: true,
+        role: "viewer",
+        scope: `harness:${h.id}`,
+        expiresAt,
+      }),
+    );
+    expect(viewer.grant.expiresAt).toBe(expiresAt);
+  });
+
+  test("an expiring decider's grant is honoured by authorize until it ends, and never copied into the list", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    const ana = ok(
+      await home.access.grant(home.actor, {
+        member: "Ana",
+        create: true,
+        role: "viewer",
+        scope: `harness:${h.id}`,
+      }),
+    );
+    // A decider's grant with an end time, written straight to the ledger: the verb refuses one.
+    const at = new Date(home.clock.now()).toISOString();
+    const expiring = {
+      id: mintId("grt"),
+      principal: ana.principal,
+      role: "operator",
+      scope: `harness:${h.id}`,
+      grantedBy: home.owner,
+      expiresAt: new Date(home.clock.now() + HOUR).toISOString(),
+      state: "active",
+      at,
+      by: home.owner,
+    };
+    expect(append(accessLedger(home.root, "grants"), expiring).ok).toBe(true);
+    const target = { scope: "harness" as const, harness: h.id, groups: [] };
+    const decides = (): boolean =>
+      authorize(home.snapshot(), { principal: ana.principal }, "h.decision.resolve", target, {
+        now: home.clock.now(),
+      }).allow;
+    expect(decides()).toBe(true);
+    ok(await home.access.sync(home.actor));
+    expect(readProjection(h)["members"]).toEqual([]);
+    home.clock.advance(2 * HOUR);
+    expect(decides()).toBe(false);
+    ok(await home.access.sync(home.actor));
+    expect(readProjection(h)["members"]).toEqual([]);
   });
 });

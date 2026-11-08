@@ -4,7 +4,7 @@
  * redemption runs through `runMutation`, so it is authorized, size-checked and recorded
  * whole under the access lock, and moves the access revision once.
  */
-import { mkdirSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import {
   ISSUED_SECRET_RES,
   LOCAL_ACTOR_RE,
@@ -45,9 +45,11 @@ import {
   type AccessContext,
   type Change,
   type Done,
+  type PlannedClaim,
   type Planning,
   type Refusal,
   projectAfter,
+  projectionEpochFloor,
   refusal,
   runMutation,
 } from "./mutate";
@@ -321,12 +323,40 @@ function defaultDisplayName(localActor: string): string {
   return localActor.slice("local:".length, localActor.lastIndexOf("@"));
 }
 
+/** Whether two local actors name the same OS user name, whatever the host. */
+function sameLocalUser(a: string, b: string): boolean {
+  if (!LOCAL_ACTOR_RE.test(a) || !LOCAL_ACTOR_RE.test(b)) return false;
+  const userA = defaultDisplayName(a);
+  const userB = defaultDisplayName(b);
+  // Windows user names ignore case.
+  return process.platform === "win32"
+    ? userA.toLowerCase() === userB.toLowerCase()
+    : userA === userB;
+}
+
+/**
+ * Whether the Hangar root belongs to the OS user running this process. Where there are no
+ * numeric user ids (Windows), the user name alone decides, and this answers `true`.
+ */
+function rootBelongsToCaller(root: string): boolean {
+  const getuid = process.getuid;
+  if (typeof getuid !== "function") return true;
+  try {
+    return statSync(root).uid === getuid.call(process);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Make sure `<hangarRoot>/access` has an owner, idempotently and piece by piece, under the
  * access lock: the owner principal and its `owner` grant over the whole Home, a `local`
  * link from the local actor (its readable subject only in `subjects.json`), and, when
  * `<hangarRoot>/token` holds a token, its sha256 as the `bootstrap` credential. The token
  * file is only read. A piece already there is left alone; a later call adds a missing one.
+ * When the owner's OS user comes back under another computer name, and the Hangar root
+ * belongs to that user, the new name is linked to the owner as well; another user name
+ * never is.
  *
  * First consumer: every mutating `crewhaus access` verb, before its change.
  */
@@ -377,10 +407,22 @@ export async function ensureAccessSetUp(
         subjects.principals[owner] = { displayName: ownerName };
         created.push("owner");
       }
-      const ownerLinked = (snapshot?.links ?? []).some(
+      const ownerLocalLinks = (snapshot?.links ?? []).filter(
         (link) => link.principal === owner && link.provider === "local" && link.state === "active",
       );
-      if (!ownerLinked) {
+      const ownerLinked = ownerLocalLinks.length > 0;
+      // The same OS user under a new computer name (a network change can rename the host):
+      // link the new name too, when the user part matches and the Home's directory is theirs.
+      const renamedHost =
+        ownerLinked &&
+        snapshot !== undefined &&
+        localPrincipalOf(snapshot, localActor) === undefined &&
+        ownerLocalLinks.some((link) => {
+          const linked = snapshot.subjects.links[link.id];
+          return linked !== undefined && sameLocalUser(linked, localActor);
+        }) &&
+        rootBelongsToCaller(hangarRoot);
+      if (!ownerLinked || renamedHost) {
         const key = await subjectKey(hangarRoot, true);
         if (isRefusal(key)) return key;
         const link: LinkRow = {
@@ -425,11 +467,12 @@ export async function ensureAccessSetUp(
           created.push("bootstrap");
         }
       }
-      const localPrincipal = ownerLinked
-        ? snapshot === undefined
-          ? undefined
-          : localPrincipalOf(snapshot, localActor)
-        : owner;
+      const localPrincipal =
+        ownerLinked && !renamedHost
+          ? snapshot === undefined
+            ? undefined
+            : localPrincipalOf(snapshot, localActor)
+          : owner;
       return {
         rows,
         subjects: { v: 1, ...subjects },
@@ -560,6 +603,8 @@ export async function redeemInvite(
   if (invite.state === "consumed") return redeemRefusal("consumed");
   if (invite.state === "revoked") return redeemRefusal("revoked");
   if (hasPassed(invite.expiresAt, now)) return redeemRefusal("expired");
+  // An invite is only as good as its creator's authority to manage access, now.
+  if (!mayManageAccess(read.snapshot, invite.createdBy, now)) return redeemRefusal("revoked");
   const at = new Date(now).toISOString();
   const by = options.principal ?? "sys:executor";
   const row: InviteRow = {
@@ -609,6 +654,13 @@ export type GrantResult = {
   readonly createdMember: boolean;
 };
 
+/**
+ * Only a viewer grant can carry an end time: who may approve is copied into each harness,
+ * and that copy names no end time, so a role that may approve is given without one.
+ */
+const EXPIRING_ROLE_REASON =
+  "Only the viewer role can be given with an end date. Give this role without --expires, and revoke it when it should end.";
+
 async function grantRole(
   ctx: AccessContext,
   actor: AccessActor,
@@ -619,6 +671,9 @@ async function grantRole(
   const role = input.role;
   if (input.expiresAt !== undefined && Number.isNaN(Date.parse(input.expiresAt))) {
     return refusal("invalid", "The expiry is not a time.");
+  }
+  if (input.expiresAt !== undefined && role !== "viewer") {
+    return refusal("invalid", EXPIRING_ROLE_REASON);
   }
   return runMutation<GrantResult>(
     ctx,
@@ -686,6 +741,36 @@ function ended<T extends { state: string }>(row: T, state: Planning): T & { revo
   return { ...row, state: "revoked", revokedAt: state.at, at: state.at, by: state.by };
 }
 
+function mayManageAccess(
+  snapshot: AccessSnapshot,
+  principal: string,
+  now: number,
+  domains?: ReadonlyMap<string, DomainChecker>,
+): boolean {
+  return (
+    authorize(snapshot, { principal }, "home.access.manage", HOME, {
+      now,
+      ...(domains !== undefined ? { domains } : {}),
+    }).allow === true
+  );
+}
+
+/**
+ * The open invites a principal created, each ended through the claim a redemption also
+ * publishes, so ending one cannot race spending it. One already spent or withdrawn is
+ * left out of the change, not a reason to refuse it.
+ */
+function openInvitesBy(snapshot: AccessSnapshot, creator: string, state: Planning): PlannedClaim[] {
+  return snapshot.invites
+    .filter((invite) => invite.createdBy === creator && invite.state === "open")
+    .map((invite) => ({
+      kind: "invites" as const,
+      claim: inviteEndClaim(invite.id),
+      row: ended(invite, state),
+      taken: "skip" as const,
+    }));
+}
+
 async function revokeById(
   ctx: AccessContext,
   actor: AccessActor,
@@ -718,12 +803,21 @@ async function revokeById(
             );
           }
         }
-        if (grant.principal === snapshot.owner && grant.grantedBy === grant.principal) {
-          return refusal("home-owner", HOME_OWNER_REASON);
-        }
+        if (grant.id === snapshot.ownerGrant) return refusal("home-owner", HOME_OWNER_REASON);
         const row = ended(grant, state);
+        // An invite works only while whoever created it may still manage access.
+        const after: AccessSnapshot = {
+          ...snapshot,
+          grants: snapshot.grants.map((other) => (other.id === id ? row : other)),
+        };
+        const invites = mayManageAccess(snapshot, grant.principal, state.now, ctx.domains)
+          ? mayManageAccess(after, grant.principal, state.now, ctx.domains)
+            ? []
+            : openInvitesBy(snapshot, grant.principal, state)
+          : [];
         return {
           rows: [{ kind: "grants", row }],
+          claims: invites,
           result: { kind: "grant", grant: grantView(snapshot, row, state.now) },
         };
       }
@@ -766,7 +860,13 @@ async function revokeById(
 
 export type RemoveResult = {
   readonly principal: string;
-  readonly revoked: { readonly grants: number; readonly tokens: number; readonly links: number };
+  readonly revoked: {
+    readonly grants: number;
+    readonly tokens: number;
+    readonly links: number;
+    /** Open invites they created, withdrawn with them. */
+    readonly invites: number;
+  };
 };
 
 async function removeMember(
@@ -798,6 +898,7 @@ async function removeMember(
         (row) => row.principal === target.id && row.state === "active",
       );
       const links = snapshot.links.filter((row) => row.principal === target.id);
+      const invites = openInvitesBy(snapshot, target.id, state);
       const subjects = withNamesOf(snapshot.subjects);
       delete subjects.principals[target.id];
       for (const link of links) delete subjects.links[link.id];
@@ -814,6 +915,7 @@ async function removeMember(
       ];
       return {
         rows,
+        claims: invites,
         subjects: { v: 1, ...subjects },
         result: {
           principal: target.id,
@@ -821,6 +923,7 @@ async function removeMember(
             grants: grants.length,
             tokens: credentials.length,
             links: links.filter((row) => row.state === "active").length,
+            invites: invites.length,
           },
         },
       };
@@ -1081,8 +1184,9 @@ export type SyncResult = ProjectionReport & { readonly setUp: boolean };
 /**
  * Bring every governed harness's projection to the records and registry as they are now,
  * under the access lock: a file that is absent, unreadable or different in content is
- * rewritten, and a current one is left alone whatever its epoch. Over a Home nobody else
- * has access to, it does nothing and creates nothing.
+ * rewritten, and a current one is left alone whatever its epoch. When a file is ahead of
+ * the revision, the revision first moves above it. Over a Home nobody else has access to,
+ * it does nothing and creates nothing.
  *
  * First consumer: `crewhaus access sync`.
  */
@@ -1093,24 +1197,35 @@ async function syncProjections(
   if (loadAccessSnapshot(ctx.root).state === "absent") {
     return {
       ok: true,
-      result: { setUp: false, written: [], unchanged: [], newer: [], failed: [] },
+      result: { setUp: false, written: [], unchanged: [], failed: [] },
       epoch: 0,
-      projections: { written: [], unchanged: [], newer: [], failed: [] },
+      projections: { written: [], unchanged: [], failed: [] },
     };
   }
   let report: ProjectionReport | undefined;
+  let synced: number | undefined;
   const done = await runMutation<SyncResult>(
     ctx,
     actor,
     (state) => {
       const snapshot = requireSnapshot(state);
-      report = projectAfter(ctx, { epoch: snapshot.epoch, now: state.now, by: state.by });
+      // A file ahead of the revision (one left after revision.json was lost) is replaced:
+      // the revision moves above it first, so the rewrite is never behind it.
+      let epoch = snapshot.epoch;
+      const floor = projectionEpochFloor(ctx, state.now);
+      if (floor > epoch) {
+        const moved = writeRevision(ctx.root, floor + 1, state.at);
+        if (!moved.ok) return refusal("io-error", `Nothing was changed: ${moved.reason}`);
+        epoch = floor + 1;
+      }
+      synced = epoch;
+      report = projectAfter(ctx, { epoch, now: state.now, by: state.by });
       return { rows: [], result: { setUp: true, ...report } };
     },
     { projections: false },
   );
   if (!done.ok) return done;
-  return { ...done, projections: report ?? done.projections };
+  return { ...done, epoch: synced ?? done.epoch, projections: report ?? done.projections };
 }
 
 // ---------------------------------------------------------------------------
