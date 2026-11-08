@@ -350,7 +350,9 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * dumps every file under its `stateDir`). The runtime-state floor reads a
  * relocating path as any path it writes, unless it lies in the run's record or
  * in the gate record that is the field's own store (`DatasetPut`'s registry,
- * `EvalBaselinePin`'s evals), or the tool reads it whole.
+ * `EvalBaselinePin`'s evals), or the tool reads it whole. Its name check for a
+ * git directory leaves a relocating path out, as the tool adds its own
+ * subdirectories and suffixes there.
  *
  * `env`, for a `command` only, names a top-level field holding the
  * variables the call sets in the child's environment, a map of names to

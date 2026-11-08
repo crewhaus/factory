@@ -53,6 +53,9 @@ import {
   checkRelocatedLinks,
   copyTreeSafe,
   ensureDirContained,
+  gitDirectoryWriteRefusal,
+  landsInGitDirectory,
+  namesGitDirectory,
   protectedRootBeneath,
   protectedRootHolding,
   protectedRootsBeneath,
@@ -2303,6 +2306,20 @@ export const archiveExtract: RegisteredTool = buildTool({
           `extracting ${archive.rel} (its ${reaching.join(", ")}) into ${destination.rel === "" ? "." : destination.rel}`,
         );
       }
+      // A repository's git directory may lie at any depth, so every member is
+      // read, with the destination in front: `config` extracted to `.git` has
+      // no such name of its own. Refused in every mode, as the floor cannot see
+      // a member's name.
+      const member = landsInGitDirectory(destination.abs)
+        ? (entries[0]?.name ?? ".")
+        : entries.find((entry) => namesGitDirectory(path.posix.join(destination.rel, entry.name)))
+            ?.name;
+      if (member !== undefined) {
+        return gitDirectoryWriteRefusal(
+          "ArchiveExtract",
+          `extracting ${archive.rel} (its ${member}) into ${destination.rel === "" ? "." : destination.rel}`,
+        );
+      }
     }
 
     const summary = {
@@ -2380,8 +2397,9 @@ export const archiveExtract: RegisteredTool = buildTool({
     // Second gate, after the extractor has had its say: the staged tree is
     // what gets promoted, so it is what is checked. A link that leads out of
     // it, a file hard-linked from outside it, content beyond the cap or
-    // beyond what the index declared, or a top-level name the index did not
-    // list means something got past the first gate, and nothing is accepted.
+    // beyond what the index declared, a top-level name the index did not list,
+    // or a name inside a repository's git directory means something got past
+    // the first gate, and nothing is accepted.
     // An INCOMPLETE scan is refused on the same terms — a gate that could not
     // read part of the tree has not cleared it.
     const scan = scanStagedTree(staging);
@@ -2414,6 +2432,17 @@ export const archiveExtract: RegisteredTool = buildTool({
                   : "the extracted tree could not be fully checked; it was discarded",
         refused: [...scan.escaping, ...scan.linkedOut, ...scan.special, ...unlisted].slice(0, 50),
       });
+    }
+    // The index was read for these names at the first gate, with the destination
+    // in front, and a destination with such a name stopped there. What the
+    // extractor wrote is read here, at any depth.
+    const gitNamed = roots.length > 0 ? scan.gitNamed[0] : undefined;
+    if (gitNamed !== undefined) {
+      rmSync(staging, { recursive: true, force: true });
+      return gitDirectoryWriteRefusal(
+        "ArchiveExtract",
+        `extracting ${archive.rel} (its ${gitNamed}) into ${destination.rel === "" ? "." : destination.rel}`,
+      );
     }
     if (scan.bytes > maxBytes || understated) {
       rmSync(staging, { recursive: true, force: true });

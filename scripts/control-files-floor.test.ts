@@ -108,7 +108,7 @@ import {
   removePath,
   tempDir as tempDirTool,
 } from "../packages/tool-fsx/src/index";
-import { gitApplyPatch } from "../packages/tool-git/src/index";
+import { GIT_TOOLS, gitApplyPatch } from "../packages/tool-git/src/index";
 import { imageGenerate } from "../packages/tool-image-generation/src/index";
 import { storeMigrate } from "../packages/tool-lifecycle/src/index";
 import { createMemoryTools } from "../packages/tool-memory/src/index";
@@ -1142,6 +1142,150 @@ describe("end to end: Write, Edit and HooksManage on the harness they run in", (
 // ---------------------------------------------------------------------------
 // A directory cleared above a root the working directory reaches through a link
 // ---------------------------------------------------------------------------
+
+describe("end to end: a repository's git directory, under a tool-wide allow", () => {
+  const GIT_FLOOR = "names a path inside a repository's git directory";
+  const GIT_REFUSED = "would write inside a repository's git directory";
+  const TOOLS = [write, edit, movePath, archiveExtract, stateImport, ...GIT_TOOLS];
+  const RULES = allowIn(
+    "Write",
+    "Edit",
+    "MovePath",
+    "ArchiveExtract",
+    "StateImport",
+    "GitAdd",
+    "GitCommit",
+  );
+  const git = (...args: string[]): string => {
+    const r = Bun.spawnSync(["git", ...args], { cwd: ws, stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+    return r.stdout.toString();
+  };
+  const denied = async (name: string, input: Record<string, unknown>) => {
+    const r = await turn({ name, input }, TOOLS, RULES, "auto");
+    return { name, decision: r.decision, floor: r.reason?.includes(GIT_FLOOR) === true };
+  };
+  let hook = "";
+  let ran = "";
+  const hookBody = (label: string): string => `#!/bin/sh\necho ${label} >> "${ran}"\n`;
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    base = tempDir("crewhaus-floor-git-");
+    ws = join(base, "harness");
+    seedHarness(ws);
+    put("a.txt", "one\n");
+    put(".gitignore", ".crewhaus/\n");
+    git("init", "-q", "-b", "main", ".");
+    git("config", "user.name", "A U Thor");
+    git("config", "user.email", "author@example.com");
+    git("config", "commit.gpgsign", "false");
+    git("add", "a.txt", ".gitignore");
+    git("commit", "-qm", "base");
+    ran = join(base, "ran.log");
+    hook = join(ws, ".git", "hooks", "pre-commit");
+    writeFileSync(hook, hookBody("seeded"));
+    chmodSync(hook, 0o755);
+    process.chdir(ws);
+  });
+  afterEach(() => {
+    process.chdir(originalCwd);
+  });
+
+  test("a Write of its config is denied, and git reads the config that was there", async () => {
+    const before = readFileSync(join(ws, ".git", "config"), "utf8");
+    const answer = await denied("Write", {
+      path: ".git/config",
+      content: `${before}[user]\n\tname = changed\n`,
+    });
+    expect(answer).toEqual({ name: "Write", decision: "deny", floor: true });
+    expect(readFileSync(join(ws, ".git", "config"), "utf8")).toBe(before);
+  });
+
+  test("a Write over a hook is denied, and the hook that runs is the one that was there", async () => {
+    const answer = await denied("Write", {
+      path: ".git/hooks/pre-commit",
+      content: hookBody("written"),
+    });
+    expect(answer).toEqual({ name: "Write", decision: "deny", floor: true });
+    expect(
+      await denied("MovePath", {
+        source: ".git/hooks/pre-commit.sample",
+        destination: ".git/hooks/pre-push",
+      }),
+    ).toEqual({ name: "MovePath", decision: "deny", floor: true });
+    put("a.txt", "two\n");
+    await turn({ name: "GitAdd", input: { paths: ["a.txt"] } }, TOOLS, RULES, "auto");
+    await turn({ name: "GitCommit", input: { message: "two" } }, TOOLS, RULES, "auto");
+    expect(readFileSync(ran, "utf8").trim().split("\n")).toEqual(["seeded"]);
+  });
+
+  test("a nested repository, a directory or a file named `.git`, is not written", async () => {
+    expect(
+      await denied("Write", { path: "n/.git/HEAD", content: "ref: refs/heads/main\n" }),
+    ).toEqual({ name: "Write", decision: "deny", floor: true });
+    expect(await denied("Write", { path: "n/.git", content: "gitdir: ../store\n" })).toEqual({
+      name: "Write",
+      decision: "deny",
+      floor: true,
+    });
+    expect(existsSync(join(ws, "n", ".git"))).toBe(false);
+    // `n` is still a directory of the outer repository: GitAdd stages there.
+    put("n/x.md", "hi\n");
+    await turn({ name: "GitAdd", input: { cwd: "n", paths: ["x.md"] } }, TOOLS, RULES, "auto");
+    expect(git("diff", "--cached", "--name-only").trim()).toBe("n/x.md");
+  });
+
+  test("its neighbours are the rules' to decide, and a store's own layout is left alone", async () => {
+    for (const path of [".gitattributes", "n/.gitignore", ".github/x", "foo.git/x"]) {
+      const r = await turn(
+        { name: "Write", input: { path, content: "x\n" } },
+        TOOLS,
+        RULES,
+        "auto",
+      );
+      expect({ path, decision: r.decision }).toEqual({ path, decision: "allow" });
+      expect(existsSync(join(ws, path))).toBe(true);
+    }
+    const store = await turn(
+      { name: "KvSet", input: { namespace: "n", key: "k", value: "v", stateDir: "n/.git" } },
+      [kvSet],
+      allowIn("KvSet"),
+      "auto",
+    );
+    expect(store.decision).toBe("allow");
+  });
+
+  test("in bypass, ArchiveExtract and StateImport refuse on their own", async () => {
+    writeFileSync(join(ws, "repo.tar"), buildTar([{ name: "n/.git/config", data: "[core]\n" }]));
+    const extracted = await turn(
+      { name: "ArchiveExtract", input: { archive: "repo.tar", destination: "." } },
+      TOOLS,
+      emptyRuleSet,
+      "bypass",
+    );
+    expect(extracted.decision).toBe("allow");
+    expect(extracted.result).toContain(GIT_REFUSED);
+    const imported = await turn(
+      {
+        name: "StateImport",
+        input: {
+          stateDir: ".",
+          document: {
+            version: 1,
+            files: [{ path: "n/.git/config", encoding: "utf8", content: "[core]\n" }],
+          },
+        },
+      },
+      TOOLS,
+      emptyRuleSet,
+      "bypass",
+    );
+    expect(imported.decision).toBe("allow");
+    expect(imported.result).toContain(GIT_REFUSED);
+    expect(existsSync(join(ws, "n"))).toBe(false);
+  }, 20_000); // slow by construction: two model turns and an archive read
+});
 
 describe("a directory cleared above a root that lies behind a link", () => {
   const TOOLS = [tempDirTool];

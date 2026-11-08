@@ -33,6 +33,9 @@
  *   {@link rootsBesideStore} leaves out the root a tool keeps its own store
  *   in, and {@link foldedName} is one name as a filesystem that folds names
  *   compares it.
+ * - {@link namesGitDirectory} / {@link landsInGitDirectory}: whether a path
+ *   lies in a repository's git directory, which a tool that writes beneath a
+ *   directory also refuses to reach ({@link gitDirectoryWriteRefusal}).
  *
  * Every refusal is a {@link SafeFsFailure} naming the caller's path and the
  * reason, never where an escaping path led or what is there.
@@ -102,6 +105,9 @@ export {
 } from "./copy";
 export {
   foldedName,
+  gitDirectoryWriteRefusal,
+  landsInGitDirectory,
+  namesGitDirectory,
   protectedRootBeneath,
   protectedRootHolding,
   protectedRootLinkedInto,

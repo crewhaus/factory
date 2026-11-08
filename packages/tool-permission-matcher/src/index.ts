@@ -966,6 +966,10 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   allow rule skips it, because the grant is about the record the call
  *   names (`alwaysAllow KvSet(scratch/*)`). Also a prefix read without its
  *   qualifier, for a deny written that way (`alwaysDeny KvGet(apikey)`).
+ * - `relocates` — a path of a field declared `relocates`: a store the tool
+ *   writes beneath only through its own fixed subdirectories and suffixes, or
+ *   the repository a branch operation runs in. A rule reads it like any value.
+ *   The runtime-state floor's name check for a git directory leaves it out.
  *
  * For a `path` value, a glob that starts with `/` is compared with the
  * absolute spellings and any other glob with the relative ones, so
@@ -1005,6 +1009,7 @@ export type OperativeValue = {
   readonly globPattern?: boolean;
   readonly shell?: boolean;
   readonly restrictOnly?: boolean;
+  readonly relocates?: boolean;
 };
 
 export type MatchOptions = {
