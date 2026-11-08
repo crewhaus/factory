@@ -48,6 +48,12 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
+import {
+  type RuleSet,
+  type ToolCallContext,
+  emptyRuleSet,
+  evaluateWithReason,
+} from "../packages/permission-engine/src/index";
 import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
@@ -858,6 +864,39 @@ describe("the release notes name every change a harness without provability: see
     const bullet = later.find((b) => b.includes("`tool_config`") && b.includes("`chains`")) ?? "";
     expect(found.filter(({ shape }) => !bullet.includes(`\`${shape}\``))).toEqual([]);
     expect(found.filter(({ exit }) => !bullet.includes(`exits ${exit} `))).toEqual([]);
+  });
+
+  test("a path named `.git` and a read's fetch: the floor and the pin are there, and a bullet names them", () => {
+    // A call that writes one is denied beside a root it never reaches, and its
+    // neighbour is the rules' to decide. Reverted, the first allows.
+    const write = (path: string): ToolCallContext => ({
+      toolName: "Write",
+      input: { path },
+      operativeValues: [{ kind: "path", canonical: [path] }],
+      readOnly: false,
+      destructive: true,
+    });
+    const allow: RuleSet = {
+      ...emptyRuleSet,
+      flag: [{ type: "alwaysAllow", pattern: "Write", source: "flag" }],
+    };
+    const decide = (path: string) =>
+      evaluateWithReason(write(path), "auto", allow, { protectedRoots: [".crewhaus/sessions"] })
+        .decision;
+    expect(decide("n/.git/config")).toBe("deny");
+    expect(decide(".gitignore")).toBe("allow");
+    // A read's environment says it fetches nothing. A write's is left alone.
+    const source = readFileSync(join(ROOT, "packages", "tool-git", "src", "git-run.ts"), "utf8");
+    const pin = /\breadOnly\s*\?\s*\{[^}]*\}/.exec(source)?.[0] ?? "";
+    expect(pin).toContain('GIT_NO_LAZY_FETCH: "1"');
+    expect(pin).toContain('GIT_ALLOW_PROTOCOL: ""');
+    const named = bullets.filter((b) => b.includes("`.git`") && b.includes("partial clone"));
+    expect(named.length).toBe(1);
+    expect(named[0]).toContain("`ArchiveExtract`");
+    expect(named[0]).toContain("`StateImport`");
+    expect(named[0]).toContain("bypass");
+    expect(named[0]).toContain("`Bash`");
+    expect(named[0]).toContain("`RunCommand`");
   });
 
   test("FactCrossCheck: every kind of spelling whose verdict moved since 0.7.x is named", async () => {

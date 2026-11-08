@@ -26,6 +26,10 @@
  * {@link foldedName} on every volume: a tool is not told how the volume it
  * writes to compares names, and refusing a name that folds to a root's costs
  * nothing.
+ *
+ * A repository's git directory is held by name, not by root: it may lie
+ * anywhere in the workspace. {@link namesGitDirectory} reads a path's names,
+ * and {@link landsInGitDirectory} also reads where its links lead.
  */
 import { realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
@@ -221,6 +225,39 @@ export function rootsBesideStore(
     const abs = resolve(cwd, root);
     return abs !== named && abs !== landsAt && followed(abs) !== landsAt;
   });
+}
+
+/**
+ * Does `path` have a name git treats as its own directory? Each name is compared
+ * by {@link foldedName} on every volume, so `.GIT`, `.git.`, `.git ` and
+ * `.git::$INDEX_ALLOCATION` count, as does the short name `git~1`; `.gitignore`,
+ * `.github` and `foo.git` do not. Give a workspace-relative path: a workspace
+ * that itself sits under such a name is not inside a git directory of its own.
+ */
+export function namesGitDirectory(path: string): boolean {
+  return path.split(/[\\/]/).some((name) => {
+    const folded = foldedName(name);
+    return folded === ".git" || folded === "git~1";
+  });
+}
+
+/**
+ * Does `path` lie under a name git treats as its own directory, read from the
+ * workspace `cwd` both as resolved and with every link on its existing part
+ * followed?
+ */
+export function landsInGitDirectory(path: string, cwd: string = process.cwd()): boolean {
+  const root = resolve(cwd);
+  const abs = resolve(root, path);
+  return (
+    namesGitDirectory(relative(root, abs)) ||
+    namesGitDirectory(relative(followed(root), followed(abs)))
+  );
+}
+
+/** The refusal a tool returns for a write into a repository's git directory. */
+export function gitDirectoryWriteRefusal(tool: string, what: string): string {
+  return `${tool}: refused — ${what} would write inside a repository's git directory, which belongs to git and to the person running it. Nothing was written.`;
 }
 
 /** The refusal a tool returns for a write into a protected root. */

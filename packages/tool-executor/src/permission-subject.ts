@@ -692,6 +692,15 @@ function valuesOf(
         values[i] = { ...(values[i] as OperativeValue), restrictOnly: true };
       }
     }
+    // A store the call names, or the repository it runs in, is where the tool
+    // acts through its own layout: the floor's git-directory name check leaves
+    // it out (`relocates` on OperativeValue). A default is a place the call did
+    // not name, and none is a git directory.
+    if (arg.relocates === true && arg.kind === "path") {
+      for (let i = from; i < values.length; i++) {
+        values[i] = { ...(values[i] as OperativeValue), relocates: true };
+      }
+    }
   }
   // A relocating field's default is a place the call did not name. When the
   // call names a record there, an allow is about the record and skips the

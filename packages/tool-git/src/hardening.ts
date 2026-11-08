@@ -67,6 +67,11 @@
  *     the mailmap, and `mailmap.file` names a file anywhere on the disk, so
  *     a line of it shaped `Name <email>` would come back as an author name.
  *     The repository's committed `.mailmap` is still honoured.
+ *   - Every read: `GIT_NO_LAZY_FETCH=1` and an empty `GIT_ALLOW_PROTOCOL`:
+ *     lazy fetch is off and no transport is allowed, so a read answers from
+ *     what is on disk. A partial clone's missing object is reported as
+ *     missing, and nothing is fetched. The second variable holds on a git
+ *     older than 2.45, which does not read the first.
  *   - Filters have no global off switch, so each read first lists the
  *     `filter.*` keys the repository's own config sets (`--show-scope`:
  *     `local` and `worktree`; the operator's global and system config are

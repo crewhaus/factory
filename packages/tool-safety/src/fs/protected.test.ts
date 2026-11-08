@@ -20,6 +20,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   foldedName,
+  gitDirectoryWriteRefusal,
+  landsInGitDirectory,
+  namesGitDirectory,
   protectedRootBeneath,
   protectedRootHolding,
   protectedRootLinkedInto,
@@ -377,5 +380,83 @@ describe("rootsBesideStore: the root a tool keeps its own store in, left out", (
   });
   test("no roots, no store's", () => {
     expect(rootsBesideStore(STORE, [], realpathSync(ws))).toEqual([]);
+  });
+});
+
+describe("namesGitDirectory", () => {
+  test("a name git treats as its own directory, in each spelling that opens it", () => {
+    for (const path of [
+      ".git",
+      ".git/config",
+      "n/.git",
+      "n/.git/HEAD",
+      "n\\.git\\config",
+      ".GIT/config",
+      ".Git/config",
+      ".git./config",
+      ".git /config",
+      ".git::$INDEX_ALLOCATION/config",
+      "git~1/config",
+      "GIT~1",
+    ]) {
+      expect({ path, named: namesGitDirectory(path) }).toEqual({ path, named: true });
+    }
+  });
+
+  test("a name that only starts or ends like one does not count", () => {
+    for (const path of [
+      ".gitignore",
+      ".gitattributes",
+      ".gitmodules",
+      ".github/x",
+      "foo.git/x",
+      "git/config",
+      "git~2/config",
+      "",
+      ".",
+    ]) {
+      expect({ path, named: namesGitDirectory(path) }).toEqual({ path, named: false });
+    }
+  });
+});
+
+describe("landsInGitDirectory", () => {
+  test("reads a path as resolved and with its links followed, from the workspace", () => {
+    const ws = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-safety-git-")));
+    try {
+      mkdirSync(join(ws, ".git"));
+      mkdirSync(join(ws, "plain"));
+      symlinkSync(".git", join(ws, "lnk"));
+      symlinkSync("plain", join(ws, "other"));
+      expect(landsInGitDirectory(join(ws, ".git", "config"), ws)).toBe(true);
+      expect(landsInGitDirectory(join(ws, "n", ".git", "config"), ws)).toBe(true);
+      expect(landsInGitDirectory("lnk/config", ws)).toBe(true);
+      expect(landsInGitDirectory("lnk", ws)).toBe(true);
+      expect(landsInGitDirectory("other/config", ws)).toBe(false);
+      expect(landsInGitDirectory("plain/.gitignore", ws)).toBe(false);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  test("a workspace that itself sits under such a name is not inside one", () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-safety-git-")));
+    try {
+      const ws = join(base, ".git", "ws");
+      mkdirSync(ws, { recursive: true });
+      expect(landsInGitDirectory("notes.md", ws)).toBe(false);
+      expect(landsInGitDirectory(".git/config", ws)).toBe(true);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("gitDirectoryWriteRefusal", () => {
+  test("names the tool and what it refused, and says nothing was written", () => {
+    const out = gitDirectoryWriteRefusal("StateImport", "importing n/.git/config");
+    expect(out).toContain("StateImport: refused — importing n/.git/config");
+    expect(out).toContain("a repository's git directory");
+    expect(out).toContain("Nothing was written.");
   });
 });
