@@ -1275,3 +1275,122 @@ test("with no roots on the call, the registry goes wherever it is named", async 
   });
   expect(out["status"]).toBe("pinned");
 });
+
+// ---------------------------------------------------------------------------
+// a write that lands in a root on the bridge
+// ---------------------------------------------------------------------------
+
+const FLOOR_CTX = { bridge: { protectedRoots: [".crewhaus/settings.json", ".crewhaus/run"] } };
+const SETTINGS_REL = ".crewhaus/settings.json";
+const SETTINGS_BYTES = '{"permissions":{"rules":[{"type":"alwaysDeny","pattern":"Bash"}]}}\n';
+const REGISTRY = { name: "sp", registryDir: "s" };
+
+/** A link at `rel` leading to `target`, a workspace-relative path that may not exist yet. */
+function linkTo(rel: string, target: string): void {
+  const abs = path.join(tmp, rel);
+  mkdirSync(path.dirname(abs), { recursive: true });
+  symlinkSync(path.relative(path.dirname(abs), path.join(tmp, target)), abs);
+}
+
+/** A call refused for landing in a root, with the target as it was: its bytes, or still absent. */
+async function refusedOnFloor(tool: RegisteredTool, input: unknown, target: string): Promise<void> {
+  const at = path.join(tmp, target);
+  const before = existsSync(at) ? readFileSync(at, "utf8") : "(absent)";
+  const out = JSON.parse(String(await tool.execute(input as never, FLOOR_CTX as never))) as Json;
+  expect(out["status"]).toBe("refused");
+  expect(String(out["reason"])).toContain("where the runtime keeps its own record");
+  expect(existsSync(at) ? readFileSync(at, "utf8") : "(absent)").toBe(before);
+}
+
+function specFile(body = "name: sp\n"): void {
+  mkdirSync(path.join(tmp), { recursive: true });
+  writeFileSync(path.join(tmp, "spec.yaml"), body);
+}
+
+for (const [state, settings] of [
+  ["that exists", SETTINGS_BYTES],
+  ["that does not exist yet", undefined],
+] as const) {
+  const seedSettings = (): void => {
+    if (settings === undefined) return;
+    mkdirSync(path.join(tmp, ".crewhaus"), { recursive: true });
+    writeFileSync(path.join(tmp, SETTINGS_REL), settings);
+  };
+
+  test(`SpecPin refuses a registry file that leads to a settings file ${state}`, async () => {
+    seedSettings();
+    specFile();
+    for (const leaf of ["sp/v1.yaml", "sp/CHANGELOG.md", "_tenants/acme/sp.json"]) {
+      linkTo(`s/${leaf}`, SETTINGS_REL);
+      for (const dryRun of [true, false]) {
+        await refusedOnFloor(
+          specPin,
+          { ...REGISTRY, specFile: "spec.yaml", tenant: "acme", dryRun },
+          SETTINGS_REL,
+        );
+      }
+      rmSync(path.join(tmp, "s", leaf));
+    }
+  });
+
+  test(`DeployRollback refuses a registry file that leads to a settings file ${state}`, async () => {
+    seedSettings();
+    specFile();
+    const ran = JSON.parse(
+      String(
+        await specPin.execute(
+          { ...REGISTRY, specFile: "spec.yaml", env: "prod" } as never,
+          undefined,
+        ),
+      ),
+    ) as Json;
+    expect(ran["status"]).not.toBe("refused");
+    for (const leaf of ["sp/CHANGELOG.md", "_tenants/acme/sp.json"]) {
+      rmSync(path.join(tmp, "s", leaf), { force: true });
+      linkTo(`s/${leaf}`, SETTINGS_REL);
+      for (const dryRun of [true, false]) {
+        await refusedOnFloor(
+          deployRollback,
+          { ...REGISTRY, env: "prod", toVersion: "v1", tenant: "acme", dryRun },
+          SETTINGS_REL,
+        );
+      }
+      rmSync(path.join(tmp, "s", leaf));
+    }
+  });
+}
+
+test("SpecPin refuses a spec directory that leads into a root", async () => {
+  mkdirSync(path.join(tmp, ".crewhaus/run"), { recursive: true });
+  specFile();
+  linkTo("s/sp", ".crewhaus/run");
+  await refusedOnFloor(
+    specPin,
+    { ...REGISTRY, specFile: "spec.yaml", dryRun: false },
+    ".crewhaus/run/v1.yaml",
+  );
+});
+
+test("SpecPin with those roots registers elsewhere, and DeployInspect only reads", async () => {
+  specFile();
+  const pinned = JSON.parse(
+    String(
+      await specPin.execute(
+        { ...REGISTRY, specFile: "spec.yaml", env: "prod" } as never,
+        FLOOR_CTX as never,
+      ),
+    ),
+  ) as Json;
+  expect(pinned["status"]).not.toBe("refused");
+  expect(existsSync(path.join(tmp, "s/sp/v1.yaml"))).toBe(true);
+  // The changelog beside it leads into a root: a read is not a write there.
+  rmSync(path.join(tmp, "s/sp/CHANGELOG.md"));
+  writeFileSync(path.join(tmp, "elsewhere.md"), "");
+  mkdirSync(path.join(tmp, ".crewhaus"), { recursive: true });
+  writeFileSync(path.join(tmp, SETTINGS_REL), SETTINGS_BYTES);
+  linkTo("s/sp/CHANGELOG.md", SETTINGS_REL);
+  const inspected = JSON.parse(
+    String(await deployInspect.execute(REGISTRY as never, FLOOR_CTX as never)),
+  ) as Json;
+  expect(inspected["status"]).not.toBe("refused");
+});

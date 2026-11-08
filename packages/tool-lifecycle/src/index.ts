@@ -80,7 +80,7 @@ import {
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
-  protectedRootHolding,
+  protectedRootBeneath,
   protectedRootsOf,
   protectedWriteRefusal,
 } from "@crewhaus/tool-safety/fs";
@@ -296,7 +296,7 @@ export const harnessRetire: RegisteredTool = buildTool({
   }),
   destructive: true,
   requireJustification: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const tool = "HarnessRetire";
     const dryRun = input.dryRun ?? true;
 
@@ -316,6 +316,11 @@ export const harnessRetire: RegisteredTool = buildTool({
     if (!registry.ok) return refusal(tool, registry.code, registry.reason);
 
     const stateDir = path.join(harness.value.real, STATE_RELDIR);
+    // Retiring moves the state directory away, so a run cannot retire the harness
+    // it runs in. Refused for a preview too: it says what a real run would do.
+    if (protectedRootBeneath(stateDir, protectedRootsOf(ctx)) !== undefined) {
+      return protectedWriteRefusal(tool, `retiring ${dirRel}`);
+    }
     if (overlaps(archive.value.real, stateDir)) {
       return refusal(
         tool,
@@ -373,11 +378,12 @@ export const harnessRetire: RegisteredTool = buildTool({
     // symlink named like one of these would send the retirement log or the
     // fingerprint manifest out of the workspace — the two files that are the
     // whole evidence of the decommission.
-    const archiveEscapes = containWritePaths(tool, archive.value, [
-      STATE_MANIFEST_FILENAME,
-      RETIREMENT_LOG_FILENAME,
-      ARCHIVED_STATE_DIRNAME,
-    ]);
+    const archiveEscapes = containWritePaths(
+      tool,
+      archive.value,
+      [STATE_MANIFEST_FILENAME, RETIREMENT_LOG_FILENAME, ARCHIVED_STATE_DIRNAME],
+      protectedRootsOf(ctx),
+    );
     if (archiveEscapes !== undefined) {
       return refusal(tool, archiveEscapes.code, archiveEscapes.reason);
     }
@@ -689,22 +695,13 @@ export const storeMigrate: RegisteredTool = buildTool({
     // the workspace — and a DANGLING one does not even register as a
     // conflict. Checked on the preview too, so the refusal is visible before
     // the run that would have written through it.
-    const escaping = containWritePaths(tool, dest.value, written);
-    if (escaping !== undefined) return refusal(tool, escaping.code, escaping.reason);
+    //
     // 0.8.0 — no copy lands in the run's own record (`RuntimeBridge
     // .protectedRoots`): a destination of `.crewhaus` would write
     // `.crewhaus/sessions/<id>.jsonl` over the live session log. Refused in
     // every mode, as StateImport and CopyPath refuse.
-    const protectedRoots = protectedRootsOf(ctx);
-    if (protectedRoots.length > 0) {
-      const into = written.find(
-        (rel) =>
-          protectedRootHolding(path.join(dest.value.real, rel), protectedRoots) !== undefined,
-      );
-      if (into !== undefined) {
-        return protectedWriteRefusal(tool, `migrating onto ${input.to} (${into})`);
-      }
-    }
+    const escaping = containWritePaths(tool, dest.value, written, protectedRootsOf(ctx));
+    if (escaping !== undefined) return refusal(tool, escaping.code, escaping.reason);
     const destState = inspectDestination(dest.value.real, written);
     if (!destState.ok) return refusal(tool, destState.code, destState.reason);
     const previousReceipt = destState.value.receipt;
@@ -1177,9 +1174,10 @@ export const knowledgeSync: RegisteredTool = buildTool({
   }),
   destructive: true,
   requireJustification: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const tool = "KnowledgeSync";
     const dryRun = input.dryRun ?? true;
+    const protectedRoots = protectedRootsOf(ctx);
     const maxArtifacts = input.maxArtifacts ?? DEFAULT_MAX_ARTIFACTS;
     const harnessDir = containExistingDir(tool, input.dir ?? ".");
     if (!harnessDir.ok) return refusal(tool, harnessDir.code, harnessDir.reason);
@@ -1315,7 +1313,7 @@ export const knowledgeSync: RegisteredTool = buildTool({
         SHARED_MANIFEST_RELPATH,
         ...plan.fragments.map(sharedFragmentRelPath),
       ];
-      const pushEscapes = containWritePaths(tool, shared.value, pushWrites);
+      const pushEscapes = containWritePaths(tool, shared.value, pushWrites, protectedRoots);
       if (pushEscapes !== undefined) {
         return refusal(tool, pushEscapes.code, pushEscapes.reason, { ...common, plan: planReport });
       }
@@ -1419,7 +1417,7 @@ export const knowledgeSync: RegisteredTool = buildTool({
       ...(plan.memories.length > 0 ? [PULLED_MEMORIES_RELPATH] : []),
       ...plan.fragments.map(pulledFragmentRelPath),
     ];
-    const pullEscapes = containWritePaths(tool, harnessDir.value, pullWrites);
+    const pullEscapes = containWritePaths(tool, harnessDir.value, pullWrites, protectedRoots);
     if (pullEscapes !== undefined) {
       return refusal(tool, pullEscapes.code, pullEscapes.reason, { ...common, plan: planReport });
     }

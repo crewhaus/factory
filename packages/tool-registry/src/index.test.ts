@@ -5,7 +5,7 @@
  * assert that the seam was never called at all.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -42,10 +42,10 @@ function serve(
   });
 }
 
-async function raw(tool: RegisteredTool, input: unknown): Promise<string> {
+async function raw(tool: RegisteredTool, input: unknown, withCtx: unknown = ctx): Promise<string> {
   const parsed = tool.inputSchema.safeParse(input);
   if (!parsed.success) throw new Error(`schema rejected the input: ${parsed.error.message}`);
-  return (await tool.execute(parsed.data, ctx)) as string;
+  return (await tool.execute(parsed.data, withCtx as typeof ctx)) as string;
 }
 
 async function call<T = Record<string, unknown>>(tool: RegisteredTool, input: unknown): Promise<T> {
@@ -936,5 +936,55 @@ dependencies = [
     });
     expect(text).toContain("does not scan as TOML");
     expect(readFileSync(join(workspace, "Cargo.toml"), "utf-8")).toBe(broken);
+  });
+
+  describe("the runtime-state roots on its bridge", () => {
+    const MANIFEST = `{\n  "name": "demo",\n  "dependencies": { "zod": "^3.23.8" }\n}\n`;
+    const EDIT = [{ name: "zod", spec: "3.24.0" }];
+    /** The root manifest is a root, as it is for a compiled daemon running here. */
+    const roots = { bridge: { protectedRoots: ["package.json"] } };
+
+    for (const dryRun of [true, false]) {
+      test(`a directory whose manifest is a root is refused, dryRun ${dryRun}`, async () => {
+        writeFileSync(join(workspace, "package.json"), MANIFEST);
+        const text = await raw(
+          manifestDependencySet,
+          { manifest: ".", edits: EDIT, dryRun },
+          roots,
+        );
+        expect(text).toContain('ManifestDependencySet: refused — editing "package.json"');
+        expect(text).toContain("Nothing was written.");
+        expect(readFileSync(join(workspace, "package.json"), "utf-8")).toBe(MANIFEST);
+      });
+
+      test(`a directory whose manifest is a link to a root is refused, dryRun ${dryRun}`, async () => {
+        writeFileSync(join(workspace, "package.json"), MANIFEST);
+        mkdirSync(join(workspace, "app"));
+        symlinkSync(join("..", "package.json"), join(workspace, "app", "package.json"));
+        const text = await raw(
+          manifestDependencySet,
+          { manifest: "app", edits: EDIT, dryRun },
+          roots,
+        );
+        expect(text).toContain("ManifestDependencySet: refused");
+        expect(readFileSync(join(workspace, "package.json"), "utf-8")).toBe(MANIFEST);
+      });
+    }
+
+    test("a manifest in another directory is edited as before, and with no roots the root one is too", async () => {
+      mkdirSync(join(workspace, "packages", "app"), { recursive: true });
+      writeFileSync(join(workspace, "packages", "app", "package.json"), MANIFEST);
+      const other = JSON.parse(
+        await raw(manifestDependencySet, { manifest: "packages/app", edits: EDIT }, roots),
+      ) as Record<string, unknown>;
+      expect(other["applied"]).toBe(true);
+      expect(readFileSync(join(workspace, "packages", "app", "package.json"), "utf-8")).toContain(
+        '"zod": "^3.24.0"',
+      );
+
+      writeFileSync(join(workspace, "package.json"), MANIFEST);
+      const own = await call(manifestDependencySet, { manifest: ".", edits: EDIT });
+      expect(own["applied"]).toBe(true);
+    });
   });
 });

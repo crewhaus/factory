@@ -550,9 +550,7 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     ),
     // The tool creates this entry, or a named one in it, and touches nothing
     // already beneath it.
-    ...Object.fromEntries(
-      ["GitWorktreeAdd.path", "MakeDirectory.path", "TouchFile.path"].map((k) => [k, "created"]),
-    ),
+    ...Object.fromEntries(["MakeDirectory.path", "TouchFile.path"].map((k) => [k, "created"])),
     // Where git runs. These act on the repository's refs, or on its whole
     // working tree as a commit or a stash names it, which no path argument
     // bounds: gate the tool itself (documented 0.7.1 limit).
@@ -714,7 +712,7 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     // A reviewed entry that now declares beneath, or no longer exists, is stale.
     const known = new Set(fields.map((f) => f.key));
     expect(Object.keys(ONE_PLACE).filter((k) => !known.has(k) || walked.includes(k))).toEqual([]);
-    expect(walked.length).toBe(77);
+    expect(walked.length).toBe(78);
     expect(walked).toContain("Grep.path");
     // Critic8: the store dump and the readers of every log in a directory.
     expect(walked).toContain("StateExport.stateDir");

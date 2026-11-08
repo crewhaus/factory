@@ -27,7 +27,12 @@ import { chmodSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { openForReadSync } from "@crewhaus/tool-safety/fs";
+import {
+  openForReadSync,
+  protectedRootHolding,
+  protectedRootsOf,
+  protectedWriteRefusal,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   type DependencySite,
@@ -628,9 +633,15 @@ export const manifestDependencySet: RegisteredTool = buildTool({
   destructive: true,
   requireJustification: true,
   concurrencySafe: false,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const loaded = loadManifest("ManifestDependencySet", input.manifest);
     if (!loaded.ok) return loaded.message;
+    // A directory names the manifest this tool finds in it, and the floor reads
+    // the directory, so the file it would write meets the runtime-state roots
+    // here, links followed: before the dryRun branch, so a preview refuses too.
+    if (protectedRootHolding(loaded.real, protectedRootsOf(ctx), workspaceRoot()) !== undefined) {
+      return protectedWriteRefusal("ManifestDependencySet", `editing "${loaded.rel}"`);
+    }
     if (!loaded.lossless) {
       // The splice happens on the decoded string and is written back as
       // UTF-8, so a byte the decoder could not represent comes back as U+FFFD
