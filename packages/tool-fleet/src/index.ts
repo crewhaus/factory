@@ -114,7 +114,13 @@ import {
   probeLedger,
   sortJobs,
 } from "./lib/jobs";
-import { entryView, mutationBlockedBy, probeRegistryFile, sortEntries } from "./lib/registry";
+import {
+  entryView,
+  mutationBlockedBy,
+  probeRegistryFile,
+  rowDirIsElsewhere,
+  sortEntries,
+} from "./lib/registry";
 import {
   type Loaded,
   compareStrings,
@@ -300,6 +306,31 @@ const updateFields = {
     .optional()
     .describe("this member's 1-based boot order inside `group`; omit with `group` to clear it"),
 };
+
+/**
+ * Where the operator makes the change a `HarnessRegister` call asks for, for
+ * each change this tool makes only on a row inside its workspace or gone. Empty
+ * for the rest: `register` and `list` select no row, and `tags`, `notes` and
+ * `pinned` annotate a row without changing where it runs or what starts it.
+ */
+function operatorVerbsFor(input: {
+  readonly action: string;
+  readonly groups?: unknown;
+  readonly group?: unknown;
+  readonly order?: unknown;
+  readonly hidden?: unknown;
+}): string[] {
+  const { action, groups, group, order, hidden } = input;
+  if (action === "relocate") return ["`crewhaus harness relocate`"];
+  if (action === "remove") return ["`crewhaus harness remove`"];
+  if (action !== "update") return [];
+  return [
+    ...(groups !== undefined || group !== undefined || order !== undefined
+      ? ["`crewhaus harness group`"]
+      : []),
+    ...(hidden !== undefined ? ["the Library in `crewhaus hangar`"] : []),
+  ];
+}
 
 export const harnessRegister: RegisteredTool = buildTool({
   name: "HarnessRegister",
@@ -551,6 +582,19 @@ export const harnessRegister: RegisteredTool = buildTool({
     const selectedId = entry.id;
     const selectedDir = entry.dir;
     const selected = entryView(entry, root);
+
+    // The tool works inside its workspace, and a row elsewhere is the
+    // operator's. Before the dry-run branches, so the preview says what the
+    // real call would do. A moved harness (old directory gone) stays open.
+    const operatorVerbs = operatorVerbsFor(input);
+    if (operatorVerbs.length > 0 && rowDirIsElsewhere(root, entry.dir)) {
+      return refusal(
+        tool,
+        "refused",
+        `${selectedId} points at a directory outside this workspace that still exists. This change is the operator's: ${operatorVerbs.join(" or ")}.`,
+        { ...base, entry: selected },
+      );
+    }
 
     if (action === "remove") {
       if (dryRun) {

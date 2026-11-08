@@ -27,7 +27,7 @@
  * whose file exists but did not parse is REFUSED here, and a listing says
  * `unparseable` rather than reporting zero harnesses.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
 import {
   type Loaded,
@@ -127,6 +127,22 @@ export function mutationBlockedBy(probe: RegistryFileProbe): Loaded<undefined> {
     probe.state === "unreadable" || probe.state === "not-a-file" ? "unreadable" : "refused",
     `${probe.path}: ${probe.detail ?? probe.state}. ${shared}`,
   );
+}
+
+/**
+ * True when a row's directory exists and stands outside the workspace,
+ * resolved through its symlinks. Absent is the one answer that makes a row
+ * "gone": a directory that could not be read (a permission, a symlink loop) is
+ * still taken to be there, and judged by the path the row holds.
+ */
+export function rowDirIsElsewhere(workspaceRoot: string, dir: string): boolean {
+  try {
+    return !isInside(workspaceRoot, realpathSync(dir));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    return !isInside(workspaceRoot, dir);
+  }
 }
 
 /** The entry fields a result carries, in a stable order. */

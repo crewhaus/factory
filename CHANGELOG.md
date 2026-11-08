@@ -115,6 +115,13 @@ these on: they reach every harness that uses what each one names.
   pop or a pick of several commits on git older than 2.45, so a rename across
   such a change is reported as a conflict.
 
+- **`HarnessRegister` relocates or removes a row, or sets its `hidden`, `groups`,
+  `group` or `order`, only when its directory is inside the agent's workspace or
+  is gone.** Any other row stays as it is, and the operator changes it with
+  `crewhaus harness relocate`, `crewhaus harness remove`, `crewhaus harness group`
+  or the Library in `crewhaus hangar`. `tags`, `notes` and `pinned` work on every
+  row.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what
