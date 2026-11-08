@@ -1571,6 +1571,7 @@
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
         "@crewhaus/spec": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/prompt-cache-manager": {

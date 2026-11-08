@@ -372,6 +372,37 @@ describe("crewhaus daemon", () => {
     }
   });
 
+  test("an acknowledgement clears one start and the next start asks again", async () => {
+    const f = fixture();
+    try {
+      const opts = { ...f.opts, env: { ...f.opts.env, HOME: f.dir } };
+      const refused = await runDaemonCommand(["start"], opts);
+      expect(refused.exitCode).toBe(1);
+      expect(refused.lines.join("\n")).toContain("holds the home directory");
+      expect(f.ops.children.length).toBe(0);
+
+      // The fixture's spec has a blocking finding of its own, so the id clears
+      // this line and the refusal stands on the other one.
+      const acked = await runDaemonCommand(["start", "--ack", "workspace.holds-home"], opts);
+      expect(acked.exitCode).toBe(1);
+      expect(acked.lines.join("\n")).toContain("preflight refused the spawn");
+      expect(acked.lines.join("\n")).not.toContain("holds the home directory");
+      expect(f.ops.children.length).toBe(0);
+
+      const forced = await runDaemonCommand(["start", "--force"], opts);
+      expect(forced.exitCode).toBe(0);
+      expect(f.ops.children.length).toBe(1);
+
+      f.ops.last()?.exit(0);
+      const next = await runDaemonCommand(["start"], opts);
+      expect(next.exitCode).toBe(1);
+      expect(next.lines.join("\n")).toContain("holds the home directory");
+      expect(f.ops.children.length).toBe(1);
+    } finally {
+      f.cleanup();
+    }
+  });
+
   test("stop adopts a daemon this process did not spawn, then signals it", async () => {
     const f = fixture();
     try {

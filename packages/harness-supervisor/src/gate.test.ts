@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { PreflightItem, PreflightReport } from "@crewhaus/preflight";
 import { buildReport } from "@crewhaus/preflight";
 import { evaluateGate, formatGateRefusal, isUnforceable, runPreflightGate } from "./gate";
+import { findHarnessRoot } from "./spawn-contracts";
 
 const item = (over: Partial<PreflightItem>): PreflightItem => ({
   id: "x.1",
@@ -82,9 +86,77 @@ describe("runPreflightGate", () => {
       },
     });
     expect(decision.allowed).toBe(false);
-    expect(seen[0]?.["harnessDir"]).toBe("/h");
+    expect(seen[0]?.["harnessDir"]).toBe(findHarnessRoot("/h"));
     expect((seen[0]?.["env"] as Record<string, string>)["ANTHROPIC_API_KEY"]).toBe("present");
     expect(seen[0]?.["ports"]).toEqual([{ port: 3000, source: "allocator" }]);
+  });
+
+  test("an acknowledgement clears one start and the next start asks again", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "chsup-gate-"));
+    try {
+      writeFileSync(
+        join(dir, "crewhaus.yaml"),
+        [
+          "name: gate-home",
+          "target: cli",
+          "agent:",
+          "  model: claude-sonnet-4-5",
+          "  instructions: Help briefly.",
+          "",
+        ].join("\n"),
+      );
+      const id = "workspace.holds-home";
+      const env = { HOME: dir, ANTHROPIC_API_KEY: "present" };
+
+      const refused = await runPreflightGate({ harnessDir: dir, env });
+      expect(refused.allowed).toBe(false);
+      const finding = refused.refused.find((i) => i.id === id);
+      expect(finding?.area).toBe("workspace");
+      if (finding === undefined) throw new Error("unreachable");
+      expect(isUnforceable(finding)).toBe(false);
+      expect(refused.unforceable).toEqual([]);
+
+      const acknowledged = await runPreflightGate({ harnessDir: dir, env, acknowledge: [id] });
+      expect(acknowledged.allowed).toBe(true);
+      expect(acknowledged.acknowledged.map((i) => i.id)).toEqual([id]);
+
+      const forced = await runPreflightGate({ harnessDir: dir, env, force: true });
+      expect(forced.allowed).toBe(true);
+      expect(forced.acknowledged.map((i) => i.id)).toEqual([id]);
+
+      const next = await runPreflightGate({ harnessDir: dir, env });
+      expect(next.allowed).toBe(false);
+      expect(next.refused.map((i) => i.id)).toContain(id);
+      expect(next.acknowledged).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the report covers the directory the spawn runs in", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "chsup-gate-root-"));
+    try {
+      writeFileSync(
+        join(dir, "crewhaus.yaml"),
+        [
+          "name: gate-root",
+          "target: cli",
+          "agent:",
+          "  model: claude-sonnet-4-5",
+          "  instructions: Help briefly.",
+          "",
+        ].join("\n"),
+      );
+      const row = join(dir, "harnesses", "bot");
+      mkdirSync(row, { recursive: true });
+      const env = { HOME: dir, ANTHROPIC_API_KEY: "present" };
+
+      const decision = await runPreflightGate({ harnessDir: row, env });
+      expect(decision.refused.map((i) => i.id)).toEqual(["workspace.holds-home"]);
+      expect(decision.refused[0]?.message).toContain(`(${dir})`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

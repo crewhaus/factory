@@ -21,12 +21,13 @@
  * unset tool-config variable with an exit code of its own, with that code,
  * every `HarnessRegister` change it keeps to rows in its workspace, every leaf
  * the optimizer refuses that 0.8.0 did not, the address
- * `crewhaus serve --mcp --sse` listens on, and the file a managed daemon saves a
- * generated signing secret to. A change reverted or scoped to the block stops
- * being found, and a new root, tool, header line, edge warning, verdict that
- * moved, stopping shape or refused leaf fails until the notes name it. Each scan
- * also asserts it found something, so a scan that silently matches nothing
- * fails too.
+ * `crewhaus serve --mcp --sse` listens on, the file a managed daemon saves a
+ * generated signing secret to, and the preflight finding for a harness
+ * directory that holds the home directory, with its start line. A change
+ * reverted or scoped to the block stops being found, and a new root, tool,
+ * header line, edge warning, verdict that moved, stopping shape or refused leaf
+ * fails until the notes name it. Each scan also asserts it found something, so a
+ * scan that silently matches nothing fails too.
  *
  * The guard reads 0.8.0's list, under `PROVABILITY_HEADING`, and every later
  * release's list, under `DEFAULT_ON_HEADING`, which sits in `## [Unreleased]`
@@ -59,6 +60,7 @@ import {
   emptyRuleSet,
   evaluateWithReason,
 } from "../packages/permission-engine/src/index";
+import { runPreflight } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
 import { credentialFileRoots, runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
@@ -1173,6 +1175,27 @@ describe("the release notes name every change a harness without provability: see
       later.find((b) => b.includes("`.crewhaus/secrets`") && b.includes("`StateExport`")) ?? "";
     expect(bullet).not.toBe("");
     expect(names.filter((name) => !bullet.includes(name))).toEqual([]);
+  });
+
+  test("a harness directory holding the home directory: the finding and the start line are named", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-default-on-workspace-"));
+    try {
+      const report = await runPreflight({
+        harnessDir: dir,
+        specYaml: "name: workspace\ntarget: cli\n",
+        env: { HOME: dir },
+        checkPort: async () => ({ free: true }),
+      });
+      const finding = report.items.find((item) => item.id === "workspace.holds-home");
+      expect(finding?.level).toBe("blocking");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const runtime = readFileSync(join(ROOT, "packages/runtime-core/src/index.ts"), "utf8");
+    expect(runtime.includes("  reportWorkspaceHoldsHome();\n")).toBe(true);
+    const later = defaultOnBullets(changelog, LATER_HEADINGS);
+    const bullet = later.find((b) => b.includes("`workspace.holds-home`")) ?? "";
+    expect(bullet).toContain("`[workspace]`");
   });
 
   test("FactCrossCheck: every kind of spelling whose verdict moved since 0.7.x is named", async () => {

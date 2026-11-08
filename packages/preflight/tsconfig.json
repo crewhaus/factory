@@ -8,7 +8,8 @@
     { "path": "../errors" },
     { "path": "../mcp-host" },
     { "path": "../model-router" },
-    { "path": "../spec" }
+    { "path": "../spec" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }

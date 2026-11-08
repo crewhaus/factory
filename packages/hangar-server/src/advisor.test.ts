@@ -115,6 +115,28 @@ describe("deriveAdvisorItems (pure)", () => {
     for (const item of items) expect(item.action?.cliTwin).toContain("crewhaus");
   });
 
+  test("a workspace finding explains what Start anyway does; other areas keep the boot text", () => {
+    const items = deriveAdvisorItems({
+      ...CLEAN,
+      preflight: {
+        items: [
+          {
+            id: "workspace.holds-home",
+            area: "workspace",
+            level: "blocking",
+            message: "this harness's directory holds the home directory",
+          },
+          { id: "bundle.stale", area: "bundle", level: "blocking", message: "recompile" },
+        ],
+      },
+    });
+    const workspace = items.find((i) => i.id === "preflight-workspace.holds-home");
+    expect(workspace?.explain).toContain("Start anyway runs it");
+    expect(workspace?.explain).not.toContain("exit on boot");
+    const bundle = items.find((i) => i.id === "preflight-bundle.stale");
+    expect(bundle?.explain).toContain("exit on boot");
+  });
+
   test("a regression below baseline proposes the optimize loop", () => {
     const items = deriveAdvisorItems({
       ...CLEAN,

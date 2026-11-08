@@ -2,9 +2,10 @@
  * @crewhaus/preflight — typed pre-spawn health checks for harnesses.
  *
  * "Will not boot: SLACK_SIGNING_SECRET unset" instead of a relayed stack
- * trace. The package composes nine areas into one report:
+ * trace. The package composes ten areas into one report:
  *
  *   - spec        — `parseSpecIssues` lint (+ injected compiler warnings)
+ *   - workspace   — a harness directory that holds the home directory
  *   - env         — the env-file chain the injected `env` was merged from,
  *                   including shared fleet files declared in
  *                   `manager.envFiles` (warn when a declared one is absent)
@@ -87,6 +88,8 @@ export {
   lowerSpecChannels,
   platformSecretRefs,
 } from "./channels";
+
+export { workspaceItems } from "./workspace";
 
 export type { EnvChainFile } from "./env-chain";
 export { envChainItems } from "./env-chain";
