@@ -1,0 +1,372 @@
+/**
+ * `crewhaus access` through `runAccessCommand`, against temporary roots and an injected
+ * identity. HOME, the Hangar root, the registry root and the watchme root are all set, so
+ * nothing reaches the real `~/.crewhaus`, and no Home process runs.
+ */
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, relative } from "node:path";
+import { openHangarRegistry } from "@crewhaus/harness-registry";
+import { type AccessCommandResult, parseDuration, runAccessCommand } from "./access-cmd";
+
+let base: string;
+let hangarRoot: string;
+let harnessDir: string;
+let env: Record<string, string | undefined>;
+let clock: number;
+
+const T0 = Date.parse("2026-11-01T00:00:00.000Z");
+const ME = { username: "max", hostname: "laptop" };
+const OTHER = { username: "eve", hostname: "laptop" };
+
+beforeEach(() => {
+  base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-access-cmd-")));
+  hangarRoot = join(base, "hangar");
+  harnessDir = join(base, "alpha");
+  mkdirSync(harnessDir);
+  writeFileSync(join(harnessDir, "crewhaus.yaml"), "name: alpha\ntarget: cli\n");
+  env = {
+    HOME: join(base, "home"),
+    CREWHAUS_HANGAR_ROOT: hangarRoot,
+    CREWHAUS_REGISTRY_ROOT: join(base, "registry"),
+    CREWHAUS_WATCHME_ROOT: join(base, "watchme"),
+  };
+  clock = T0;
+});
+
+afterEach(() => {
+  rmSync(base, { recursive: true, force: true });
+});
+
+function run(argv: readonly string[], identity = ME): Promise<AccessCommandResult> {
+  return runAccessCommand(argv, { env, now: () => clock, identity, isPidAlive: () => false });
+}
+
+/** Register the fixture harness, in a group, through the real registry. */
+function registerHarness(group?: string): string {
+  const registry = openHangarRegistry({ env, now: () => clock });
+  const entry = registry.upsert({ dir: harnessDir, specName: "alpha", target: "cli" });
+  if (group !== undefined) {
+    registry.addGroup({ name: group });
+    registry.setGroups(entry.id, [group]);
+  }
+  return entry.id;
+}
+
+function treeOf(dir: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (at: string): void => {
+    if (!existsSync(at)) return;
+    for (const name of readdirSync(at)) {
+      const path = join(at, name);
+      if (statSync(path).isDirectory()) walk(path);
+      else out[relative(dir, path)] = readFileSync(path, "utf8");
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+const approversOf = (dir: string): string =>
+  join(dir, ".crewhaus", "run", "control", "approvers.json");
+
+function projection(): { epoch: number; members: { principal: string; decide: string }[] } {
+  return JSON.parse(readFileSync(approversOf(harnessDir), "utf8"));
+}
+
+async function membersJson(): Promise<{
+  members: { id: string; displayName?: string; grants: { id: string }[] }[];
+}> {
+  const out = await run(["members", "--json"]);
+  return JSON.parse(out.lines.join("\n"));
+}
+
+describe("help", () => {
+  test("bare access, --help and -h print usage on stdout and exit 0", async () => {
+    for (const argv of [[], ["--help"], ["-h"], ["grant", "--help"]]) {
+      const out = await run(argv);
+      expect(out.exitCode).toBe(0);
+      expect(out.lines[0]).toBe("usage:");
+      expect(out.lines.join("\n")).toContain("crewhaus access sync");
+    }
+    expect(existsSync(hangarRoot)).toBe(false);
+  });
+
+  test("an unknown verb or flag throws, naming what is expected", async () => {
+    await expect(run(["nope"])).rejects.toThrow(/expected: members, invite/);
+    await expect(run(["members", "--bogus"])).rejects.toThrow(/unknown flag "--bogus"/);
+  });
+});
+
+describe("reads over a Home nobody else uses", () => {
+  test("members and tokens print the single-owner view and create nothing", async () => {
+    mkdirSync(hangarRoot);
+    writeFileSync(join(hangarRoot, "token"), `${"ab".repeat(32)}\n`);
+    const before = treeOf(base);
+    const members = await run(["members"]);
+    expect(members).toEqual({ lines: ["Only you have access to this Home."], exitCode: 0 });
+    const tokens = await run(["tokens"]);
+    expect(tokens.exitCode).toBe(0);
+    expect(tokens.lines[0]).toContain("No access tokens yet");
+    expect((await run(["members", "--json"])).exitCode).toBe(0);
+    expect((await run(["tokens", "--json"])).exitCode).toBe(0);
+    expect((await run(["sync"])).exitCode).toBe(0);
+    expect(treeOf(base)).toEqual(before);
+    expect(existsSync(join(hangarRoot, "access"))).toBe(false);
+  });
+
+  test("after setup with only the owner, members still says only you", async () => {
+    await run(["link", "github:1", "--member", "me"]);
+    expect((await run(["members"])).lines).toEqual([
+      "Only you have access to this Home.",
+      "max (Home's owner): owner on all of this Home; linked: GitHub",
+    ]);
+    await run(["unlink", "github:1"]);
+    expect((await run(["members"])).lines).toEqual(["Only you have access to this Home."]);
+  });
+});
+
+describe("a revoke with Home stopped rewrites the projection", () => {
+  test("grant puts the member in approvers.json; revoke takes them out and moves the epoch", async () => {
+    const hrn = registerHarness();
+    const granted = await run([
+      "grant",
+      "--member",
+      "Ana",
+      "--create",
+      "--role",
+      "operator",
+      "--harness",
+      hrn,
+    ]);
+    expect(granted.exitCode).toBe(0);
+    expect(granted.lines).toContain("Ana is now an operator on alpha.");
+    const ana = (await membersJson()).members.find((member) => member.displayName === "Ana");
+    if (ana === undefined) throw new Error("Ana is not listed");
+    const first = projection();
+    expect(first.members).toEqual([{ principal: ana.id, decide: "operator" }]);
+    const grantId = ana.grants[0]?.id as string;
+    expect(granted.lines.join("\n")).toContain(`crewhaus access revoke ${grantId}`);
+    clock += 60_000;
+    const revoked = await run(["revoke", grantId]);
+    expect(revoked).toEqual({ lines: ["Revoked the operator role on alpha."], exitCode: 0 });
+    const second = projection();
+    expect(second.members).toEqual([]);
+    expect(second.epoch).toBeGreaterThan(first.epoch);
+  });
+
+  test("a harness given by directory resolves; an unregistered one names `crewhaus harness add`", async () => {
+    registerHarness("team");
+    expect(
+      (
+        await run([
+          "grant",
+          "--member",
+          "Bo",
+          "--create",
+          "--role",
+          "viewer",
+          "--harness",
+          harnessDir,
+        ])
+      ).exitCode,
+    ).toBe(0);
+    await expect(
+      run(["grant", "--member", "Bo", "--role", "viewer", "--harness", join(base, "nowhere")]),
+    ).rejects.toThrow(/crewhaus harness add <dir>/);
+    await expect(
+      run(["grant", "--member", "Bo", "--role", "viewer", "--group", "nogroup"]),
+    ).rejects.toThrow(/crewhaus harness group/);
+    expect(
+      (await run(["grant", "--member", "Bo", "--role", "operator", "--group", "team"])).exitCode,
+    ).toBe(0);
+    expect(projection().members.map((member) => member.decide)).toEqual(["operator"]);
+  });
+
+  test("the verb never writes the registry", async () => {
+    registerHarness();
+    const registryFile = join(base, "registry", "harnesses.json");
+    rmSync(harnessDir, { recursive: true });
+    const before = readFileSync(registryFile, "utf8");
+    const out = await run(["grant", "--member", "Ana", "--create", "--role", "operator", "--home"]);
+    expect(readFileSync(registryFile, "utf8")).toBe(before);
+    // The vanished harness is governed now and could not be written: say so and name sync.
+    expect(out.exitCode).toBe(1);
+    expect(out.lines.join("\n")).toContain("crewhaus access sync");
+    expect(out.lines.join("\n")).toContain("Ana is now an operator on all of this Home.");
+  });
+});
+
+describe("the verbs", () => {
+  test("grant without --create is refused, and with it works; a name in use cannot be created twice", async () => {
+    const refused = await run(["grant", "--member", "Ana", "--role", "viewer", "--home"]);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.lines.join("\n")).toContain("Add --create");
+    expect(
+      (await run(["grant", "--member", "Ana", "--create", "--role", "viewer", "--home"])).exitCode,
+    ).toBe(0);
+    const twice = await run(["grant", "--member", "ana", "--create", "--role", "viewer", "--home"]);
+    expect(twice.exitCode).toBe(1);
+    expect(twice.lines.join("\n")).toContain("already in use");
+    expect((await run(["grant", "--member", "ana", "--role", "operator", "--home"])).exitCode).toBe(
+      0,
+    );
+  });
+
+  test("link slack:T0:U0 --member me links the local owner", async () => {
+    const out = await run(["link", "slack:T0:U0", "--member", "me"]);
+    expect(out.exitCode).toBe(0);
+    expect(out.lines).toContain("Linked slack:T0:U0 to max.");
+    expect((await run(["members"])).lines).toContain(
+      "max (Home's owner): owner on all of this Home; linked: Slack",
+    );
+  });
+
+  test("mint prints chs_… once, and tokens never shows it", async () => {
+    const hrn = registerHarness();
+    const minted = await run([
+      "mint",
+      "--service",
+      "ci",
+      "--permission",
+      "h.decision.resolve",
+      "--harness",
+      hrn,
+    ]);
+    expect(minted.exitCode).toBe(0);
+    const secrets = minted.lines.filter((line) => /^chs_[A-Za-z0-9_-]{43}$/.test(line));
+    expect(secrets).toHaveLength(1);
+    const secret = secrets[0] as string;
+    const listed = await run(["tokens"]);
+    const json = await run(["tokens", "--json"]);
+    for (const out of [listed, json]) {
+      expect(out.lines.join("\n")).not.toContain(secret.slice(8));
+      expect(out.lines.join("\n")).not.toContain("sha256");
+    }
+    expect(listed.lines).toEqual([
+      `ci (service): ${secret.slice(0, 8)}…, active, until 2027-04-30`,
+    ]);
+    expect(JSON.stringify(treeOf(base))).not.toContain(secret.slice(4));
+  });
+
+  test("every mutating verb refuses an OS user the Home does not belong to", async () => {
+    const hrn = registerHarness();
+    expect((await run(["link", "github:5", "--member", "me"])).exitCode).toBe(0);
+    const before = treeOf(join(hangarRoot, "access"));
+    for (const argv of [
+      ["invite", "--role", "viewer", "--home"],
+      ["grant", "--member", "Eve", "--create", "--role", "owner", "--home"],
+      ["revoke", "--member", "max"],
+      ["link", "slack:T0:U0", "--member", "me"],
+      ["unlink", "github:5"],
+      ["mint", "--service", "x", "--permission", "home.read"],
+      ["sync"],
+      ["revoke", "grt_01m6wfq4a6mvwrzywdy10enb4t"],
+      ["grant", "--member", "Eve", "--create", "--role", "viewer", "--harness", hrn],
+    ]) {
+      const out = await run(argv, OTHER);
+      expect(`${argv[0]} ${out.exitCode} ${out.lines.at(-1)}`).toBe(
+        `${argv[0]} 1 This Home belongs to another user on this computer.`,
+      );
+    }
+    expect(treeOf(join(hangarRoot, "access"))).toEqual(before);
+  });
+
+  test("invite prints the path when Home is not running, and the full link when it is", async () => {
+    const stopped = await run(["invite", "--role", "viewer", "--home"]);
+    expect(stopped.exitCode).toBe(0);
+    expect(stopped.lines.some((line) => /^\/invite#c=chi_[A-Za-z0-9_-]{43}$/.test(line))).toBe(
+      true,
+    );
+    expect(stopped.lines.join("\n")).toContain("open this path on Home's address");
+    writeFileSync(
+      join(hangarRoot, "hangar.lock"),
+      JSON.stringify({ pid: 4242, startedAt: "x", port: 4321, url: "http://127.0.0.1:4321/" }),
+    );
+    const running = await runAccessCommand(
+      ["invite", "--role", "operator", "--home", "--expires", "30m"],
+      {
+        env,
+        now: () => clock,
+        identity: ME,
+        isPidAlive: (pid) => pid === 4242,
+      },
+    );
+    expect(
+      running.lines.some((line) =>
+        /^http:\/\/127\.0\.0\.1:4321\/invite#c=chi_[A-Za-z0-9_-]{43}$/.test(line),
+      ),
+    ).toBe(true);
+    const stale = await run(["invite", "--role", "viewer", "--home"]);
+    expect(stale.lines.some((line) => line.startsWith("/invite#c="))).toBe(true);
+  });
+
+  test("a bad duration, a bound, a bad role and a bad subject name the expected form", async () => {
+    await expect(run(["invite", "--role", "viewer", "--home", "--expires", "1w"])).rejects.toThrow(
+      /like 30m, 24h or 7d/,
+    );
+    await expect(run(["invite", "--role", "viewer", "--home", "--expires", "8d"])).rejects.toThrow(
+      /at most 7 days/,
+    );
+    await expect(
+      run(["mint", "--service", "s", "--permission", "home.read", "--expires", "181d"]),
+    ).rejects.toThrow(/at most 180 days/);
+    await expect(run(["invite", "--role", "boss", "--home"])).rejects.toThrow(
+      /viewer, operator, maintainer, owner/,
+    );
+    await expect(run(["invite", "--role", "viewer"])).rejects.toThrow(
+      /--home, --group <name> or --harness/,
+    );
+    const subject = await run(["link", "slack:lowercase:u0", "--member", "me"]);
+    expect(subject.exitCode).toBe(1);
+    expect(subject.lines.at(-1)).toBe(
+      "A link is slack:<team>:<user>, github:<numeric id> or proxy:<header>:<value>.",
+    );
+    expect(parseDuration("30m")).toBe(30 * 60_000);
+    expect(parseDuration("24h")).toBe(24 * 3_600_000);
+    expect(parseDuration("7d")).toBe(7 * 86_400_000);
+  });
+
+  test("revoke --member erases the member; the owner and the bootstrap stay", async () => {
+    mkdirSync(hangarRoot, { recursive: true });
+    writeFileSync(join(hangarRoot, "token"), `${"cd".repeat(32)}\n`);
+    expect((await run(["link", "slack:T9:U9", "--member", "Zed", "--create"])).exitCode).toBe(0);
+    const removed = await run(["revoke", "--member", "Zed"]);
+    expect(removed.exitCode).toBe(0);
+    expect(JSON.stringify(treeOf(join(hangarRoot, "access")))).not.toContain("Zed");
+    expect(JSON.stringify(treeOf(join(hangarRoot, "access")))).not.toContain("slack:T9:U9");
+    const owner = await run(["revoke", "--member", "me"]);
+    expect(owner.exitCode).toBe(1);
+    const tokens = JSON.parse((await run(["tokens", "--json"])).lines.join("\n")) as {
+      tokens: { id: string; kind: string }[];
+    };
+    const bootstrap = tokens.tokens.find((token) => token.kind === "bootstrap");
+    expect((await run(["revoke", bootstrap?.id as string])).lines.at(-1)).toBe(
+      "Home's own sign-in token cannot be revoked here.",
+    );
+  });
+
+  test("sync rewrites an approver list that was deleted", async () => {
+    registerHarness();
+    expect(
+      (await run(["grant", "--member", "Ana", "--create", "--role", "operator", "--home"]))
+        .exitCode,
+    ).toBe(0);
+    rmSync(approversOf(harnessDir));
+    const synced = await run(["sync"]);
+    expect(synced.exitCode).toBe(0);
+    expect(synced.lines[0]).toBe("Updated 1 of 1 approver lists; the rest were current.");
+    expect(existsSync(approversOf(harnessDir))).toBe(true);
+  });
+});

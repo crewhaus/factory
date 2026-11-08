@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { isStoredActor } from "@crewhaus/control-contract";
 import { ensureDigestKey, keyedDigest, readDigestKey } from "./digest";
 import { controlFile, plant, removeTempDirs, tempDir } from "./test-helpers";
@@ -148,5 +149,56 @@ describe("the key file", () => {
     expect(read.reason).toContain("digest.key");
     expect(read.reason).not.toContain("zzzz");
     expect(existsSync(controlFile(root, "keys/digest.key"))).toBe(true);
+  });
+});
+
+describe("a key file named by the caller", () => {
+  const OTHER = "access/keys/subject.key";
+
+  test("ensure creates it at that path, owner-only, and leaves the default path alone", async () => {
+    const root = tempDir();
+    const created = await ensureDigestKey(root, { file: OTHER });
+    expect(created.state).toBe("present");
+    expect(readFileSync(join(root, OTHER), "utf8")).toMatch(/^[0-9a-f]{64}\n$/);
+    expect(existsSync(controlFile(root, "keys/digest.key"))).toBe(false);
+    expect(await readDigestKey(root)).toEqual({ state: "absent" });
+    if (process.platform !== "win32") {
+      expect(statSync(join(root, OTHER)).mode & 0o777).toBe(0o600);
+      expect(statSync(join(root, "access", "keys")).mode & 0o777).toBe(0o700);
+    }
+  });
+
+  test("read finds it, creates nothing when it is absent, and keys stay apart", async () => {
+    const root = tempDir();
+    expect(await readDigestKey(root, { file: OTHER })).toEqual({ state: "absent" });
+    expect(readdirSync(root)).toEqual([]);
+    const named = await ensureDigestKey(root, { file: OTHER });
+    const fallback = await ensureDigestKey(root);
+    if (named.state !== "present" || fallback.state !== "present") throw new Error("absent");
+    const again = await readDigestKey(root, { file: OTHER });
+    if (again.state !== "present") throw new Error(again.state);
+    expect(await keyedDigest(again.hmac, "l", ["x"])).toBe(
+      await keyedDigest(named.hmac, "l", ["x"]),
+    );
+    expect(await keyedDigest(named.hmac, "l", ["x"])).not.toBe(
+      await keyedDigest(fallback.hmac, "l", ["x"]),
+    );
+  });
+
+  test("an unreadable named key is refused, not replaced, and the reason names its file", async () => {
+    const root = tempDir();
+    plant(join(root, OTHER), "short\n");
+    const read = await readDigestKey(root, { file: OTHER });
+    if (read.state !== "unreadable") throw new Error(read.state);
+    expect(read.reason).toContain("subject.key");
+    expect((await ensureDigestKey(root, { file: OTHER })).state).toBe("unreadable");
+    expect(readFileSync(join(root, OTHER), "utf8")).toBe("short\n");
+  });
+
+  test("a named path that leaves the root is refused", async () => {
+    const root = tempDir();
+    const ensured = await ensureDigestKey(root, { file: "../outside.key" });
+    expect(ensured.state).toBe("unreadable");
+    expect(existsSync(join(root, "..", "outside.key"))).toBe(false);
   });
 });

@@ -28,6 +28,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/access-control": "workspace:*",
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/audit-log": "workspace:*",

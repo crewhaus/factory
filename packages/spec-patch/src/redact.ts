@@ -9,10 +9,10 @@
  *   2. `maskCredentialTokens` — value-based: strings that are NOT under a
  *      credential key (instructions prose, command args, URLs) are scanned
  *      for well-known credential token shapes (`sk-…`, `ghp_…`, `xoxb-…`,
- *      `AKIA…`, `Bearer <token>`) plus high-length opaque tokens preceded by
- *      key-ish context words. Deliberately conservative: a bare 32-char
- *      identifier with no "key/token/secret/password" context is left alone
- *      so normal prose never gets chewed up.
+ *      `AKIA…`, CrewHaus's `ch*_…`, `Bearer <token>`) plus high-length opaque
+ *      tokens preceded by key-ish context words. Deliberately conservative: a
+ *      bare 32-char identifier with no "key/token/secret/password" context is
+ *      left alone so normal prose never gets chewed up.
  *
  * KEEP IN SYNC: this module is intentionally duplicated as
  * `packages/ir/src/redact.ts` and `packages/spec-patch/src/redact.ts`.
@@ -83,7 +83,17 @@ const TOKEN_SHAPE_RES: ReadonlyArray<RegExp> = [
   /\bgh[oprsu]_[A-Za-z0-9]{16,}/g, // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
   /\bxox[abprs]-[A-Za-z0-9-]{10,}/g, // Slack tokens
   /\bAKIA[A-Z0-9]{12,}/g, // AWS access key ids
+  /\bch[apsi]_[A-Za-z0-9_-]{43,}/g, // CrewHaus session, personal, service and invite secrets
 ];
+
+/**
+ * A CrewHaus scoped token, `chx_<payload>.<mac>`. Its `.<mac>` is OPTIONAL in the
+ * pattern, and only a match that carries it is masked: a run of `chx_` with no mac is
+ * then consumed whole and the search resumes after it. With the mac required, a run like
+ * `chx_-chx_-…` was rescanned to its end from every `chx_` in it, quadratic in the run.
+ * No class spans the dot, so neither part can give characters back to the other.
+ */
+const SCOPED_TOKEN_RE = /\bchx_[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]{43,})?/g;
 
 /** `Bearer <token>` — the scheme word is kept, the token is masked. */
 const BEARER_RE = /\b(bearer)\s+[A-Za-z0-9._~+/-]{8,}=*/gi;
@@ -103,6 +113,9 @@ const CONTEXTUAL_OPAQUE_RE =
 export function maskCredentialTokens(text: string): string {
   let out = text;
   for (const re of TOKEN_SHAPE_RES) out = out.replace(re, MASKED_TOKEN);
+  out = out.replace(SCOPED_TOKEN_RE, (whole: string, mac: string | undefined) =>
+    mac === undefined ? whole : MASKED_TOKEN,
+  );
   out = out.replace(BEARER_RE, `$1 ${MASKED_TOKEN}`);
   out = out.replace(CONTEXTUAL_OPAQUE_RE, `$1${MASKED_TOKEN}`);
   return out;

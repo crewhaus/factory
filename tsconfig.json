@@ -300,6 +300,7 @@
     { "path": "./packages/sandbox-image-z3" },
     { "path": "./packages/sandbox-image-lean4" },
     { "path": "./packages/grader-provability" },
+    { "path": "./packages/access-control" },
     { "path": "./packages/control-contract" },
     { "path": "./packages/control-records" },
     { "path": "./apps/cli" }

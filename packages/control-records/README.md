@@ -114,8 +114,8 @@ for the fixed text.
 
 | Export | Contract | First consumer |
 |---|---|---|
-| `readDigestKey(harnessDir)` | `{state: "absent"}`, `{state: "present", hmac}` or `{state: "unreadable", reason}`. Creates nothing. | the decision log |
-| `ensureDigestKey(harnessDir)` | For writers. Publishes exclusively; a racing creator reads the winner's key. An unreadable key is refused, never replaced. | the decision log |
+| `readDigestKey(harnessDir, {file?})` | `{state: "absent"}`, `{state: "present", hmac}` or `{state: "unreadable", reason}`. Creates nothing. `file` names another key file under the same root. | the decision log; access-control's subject key |
+| `ensureDigestKey(harnessDir, {file?})` | For writers. Publishes exclusively; a racing creator reads the winner's key. An unreadable key is refused, never replaced. | the decision log; access-control's subject key |
 | `keyedDigest(key, label, parts)` | HMAC-SHA256, lowercase hex, over the UTF-8 of `JSON.stringify([label, ...parts])`. | the decision log |
 
 Stored digests join forever, so this format is a pin. The label keeps two purposes from joining.
