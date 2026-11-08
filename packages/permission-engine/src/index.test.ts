@@ -1918,3 +1918,296 @@ describe("the names a tool that declares no paths uses in its text", () => {
     expect(r.reason).toContain("acts on everything beneath `out`");
   });
 });
+
+describe("credential files (credentialRoots)", () => {
+  const ROOTS = [
+    ".env",
+    ".crewhaus/secrets",
+    ".crewhaus/identity.json",
+    ".crewhaus/run/control-token",
+    "/srv/ws/.crewhaus/run/control-token",
+  ];
+  const read = (rel: string, over: Record<string, unknown> = {}): ToolCallContext => ({
+    toolName: "Read",
+    input: { path: rel },
+    operativeValues: [{ kind: "path", canonical: [rel, `/srv/ws/${rel}`], ...over }],
+    readOnly: true,
+    destructive: false,
+  });
+  /** A tool that declares nothing: its strings are read as written. */
+  const undeclared = (text: string): ToolCallContext => ({
+    toolName: "SomeTool",
+    input: { text },
+    readOnly: true,
+    destructive: false,
+  });
+  const decide = (call: ToolCallContext, mode: PermissionMode = "auto", rules = emptyRuleSet) =>
+    evaluateWithReason(call, mode, rules, { credentialRoots: ROOTS });
+  const REASON = "`Read` names a credential file this run keeps from its tools";
+
+  test("with the option absent, the rules decide a read", () => {
+    expect(evaluateWithReason(read(".env"), "auto", emptyRuleSet, {}).decision).toBe("allow");
+    expect(
+      evaluateWithReason(read(".env"), "auto", emptyRuleSet, {
+        protectedRoots: [".env"],
+      }).decision,
+    ).toBe("allow");
+  });
+
+  for (const mode of ["auto", "default", "plan"] as const) {
+    test(`a read-only call is denied in ${mode}, with the reason`, () => {
+      const details = decide(read(".env"), mode);
+      expect(details.decision).toBe("deny");
+      expect(details.reason).toContain(REASON);
+    });
+  }
+
+  test("only bypass skips it", () => {
+    expect(decide(read(".env"), "bypass").decision).toBe("allow");
+  });
+
+  test("a call that writes is denied by this check too, and the write floor's reason comes first", () => {
+    const write: ToolCallContext = {
+      toolName: "Write",
+      input: { path: "sub/.env" },
+      operativeValues: [{ kind: "path", canonical: ["sub/.env"] }],
+      readOnly: false,
+      destructive: true,
+    };
+    const details = decide(write);
+    expect(details.decision).toBe("deny");
+    expect(details.reason).toContain("`Write` names a credential file");
+    const both = evaluateWithReason({ ...write, input: { path: ".env" } }, "auto", emptyRuleSet, {
+      protectedRoots: ["sub/.env"],
+      credentialRoots: ROOTS,
+    });
+    expect(both.reason).toContain("is not read-only and names a path where");
+  });
+
+  for (const name of [
+    ".env",
+    ".env.local",
+    ".env.staging",
+    ".env.example.local",
+    "sub/.env",
+    "a/b/.env.production",
+    ".npmrc",
+    "sub/.npmrc",
+    ".ENV",
+    "SUB/.Env.Local",
+    ".NPMRC",
+  ]) {
+    test(`the file name ${name} is denied`, () => {
+      const details = decide(read(name));
+      expect(details.decision).toBe("deny");
+      expect(details.reason).toContain(REASON);
+    });
+  }
+
+  for (const name of [
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+    "sub/.env.example",
+    ".ENV.EXAMPLE",
+    ".envrc",
+    "env",
+    "notes.env",
+    "my.npmrc",
+    ".npmrc.bak",
+    ".env-local",
+    "notes.md",
+    ".crewhaus/run/daemon.json",
+    ".crewhaus/tool-results/part-1.txt",
+    ".git/HEAD",
+  ]) {
+    test(`the file name ${name} is allowed`, () => {
+      expect(decide(read(name)).decision).toBe("allow");
+    });
+  }
+
+  test("a name a folding volume opens as the same file is denied where the value folds", () => {
+    for (const name of [".ENV", ".env.teſt", ".e\u200Cnv", ".env.", ".env::$DATA"]) {
+      expect({ name, ...pick(decide(read(name, { caseInsensitive: true }))) }).toEqual({
+        name,
+        decision: "deny",
+      });
+    }
+    // Compared exactly, a zero-width joiner is another file's name.
+    expect(decide(read(".e\u200Cnv")).decision).toBe("allow");
+  });
+
+  test("a listed root and what lies under it are denied, in each spelling", () => {
+    for (const path of [
+      ".crewhaus/secrets",
+      ".crewhaus/secrets/anything",
+      ".crewhaus/identity.json",
+      ".crewhaus/run/control-token",
+      ".env/inner",
+      "sub/../.crewhaus/secrets/x",
+    ]) {
+      expect({ path, ...pick(decide(read(path))) }).toEqual({ path, decision: "deny" });
+    }
+    expect(decide(read("x", { spellings: [".crewhaus/secrets/y"] })).decision).toBe("deny");
+    expect(decide(read(".CREWHAUS/SECRETS/x", { caseInsensitive: true })).decision).toBe("deny");
+    expect(decide(read(".CREWHAUS/SECRETS/x")).decision).toBe("allow");
+  });
+
+  test("a neighbour of an exact file is allowed", () => {
+    expect(decide(read(".crewhaus/identity.json.bak")).decision).toBe("allow");
+    expect(decide(read(".crewhaus/run/control-token.old")).decision).toBe("allow");
+  });
+
+  test("a directory the call reads beneath that holds a root is denied", () => {
+    const beneath = (dir: string): ToolCallContext => ({
+      toolName: "Tree",
+      input: { path: dir },
+      operativeValues: [{ kind: "path", canonical: [dir], beneath: [dir] }],
+      readOnly: true,
+      destructive: false,
+    });
+    expect(decide(beneath(".crewhaus")).decision).toBe("deny");
+    expect(decide(beneath(".crewhaus/run")).decision).toBe("deny");
+    expect(decide(beneath("src")).decision).toBe("allow");
+    const inSub = { credentialRoots: ["sub/.hidden/file"] };
+    expect(evaluateWithReason(beneath("sub"), "auto", emptyRuleSet, inSub).decision).toBe("deny");
+  });
+
+  test("a value the write floor's reading leaves out counts here", () => {
+    const attached: ToolCallContext = {
+      toolName: "EmailSend",
+      input: { to: "a@example.test", attachments: [{ path: ".env" }] },
+      operativeValues: [{ kind: "path", canonical: [".env"] }],
+      floorValues: [],
+      readOnly: false,
+      destructive: true,
+    };
+    const details = decide(attached);
+    expect(details.decision).toBe("deny");
+    expect(details.reason).toContain("`EmailSend` names a credential file");
+    // The same call with no option: the write floor reads the empty list.
+    expect(
+      evaluateWithReason(attached, "auto", emptyRuleSet, { protectedRoots: [".env"] }).decision,
+    ).toBe("ask");
+  });
+
+  test("a tool that declares nothing has its strings read as written", () => {
+    expect(decide(undeclared(".env")).decision).toBe("deny");
+    expect(decide(undeclared("deploy/.env")).decision).toBe("deny");
+    expect(decide(undeclared(".crewhaus/secrets/x")).decision).toBe("deny");
+    expect(decide(undeclared("the settings live in .env for now")).decision).toBe("allow");
+    expect(decide(undeclared("notes about .npmrc and .env")).decision).toBe("allow");
+  });
+
+  test("a string that reads as text goes on, from a tool that declares nothing", () => {
+    for (const text of [
+      ".env.local is where the region goes",
+      ".env.example is what you copy",
+      "the region lives in config/.env.local for now",
+      "see config/.env: it holds the region",
+      "see config/.env.",
+      "see config/.env.local,",
+      ".env: missing",
+      ".npmrc: holds the registry",
+      "a/.env.production\nline two of a longer body with no slash",
+      "https://example.test/docs/.env.example?x=1",
+      "https://example.test/.env",
+      ".crewhaus/identity.json is where it lives",
+      ".crewhaus/secrets: the directory",
+    ]) {
+      expect({ text, ...pick(decide(undeclared(text))) }).toEqual({ text, decision: "allow" });
+    }
+  });
+
+  test("a string that reads as a path is denied, from a tool that declares nothing", () => {
+    for (const text of [
+      ".env",
+      "deploy/.env",
+      "my dir/.env",
+      "my dir/.env.local",
+      ".env.local",
+      "./.env",
+      ".env/",
+      ".ENV",
+      ".env.",
+      ".env ",
+      "sub/.env.",
+      ".env::$DATA",
+      "x://../.env",
+      "line one\nsub/.env",
+      ".crewhaus/secrets/api",
+      ".crewhaus/secrets/two words",
+      ".CREWHAUS/Secrets/two words",
+      ".crewhaus/run/control-token",
+    ]) {
+      expect({ text, ...pick(decide(undeclared(text))) }).toEqual({ text, decision: "deny" });
+    }
+  });
+
+  test("a listed file whose own name holds a space is denied as written", () => {
+    const opts = { credentialRoots: ["config/my secrets.env"] };
+    for (const text of ["config/my secrets.env", "CONFIG/My Secrets.env"]) {
+      expect(evaluateWithReason(undeclared(text), "auto", emptyRuleSet, opts).decision).toBe(
+        "deny",
+      );
+    }
+    expect(
+      evaluateWithReason(undeclared("config/my secrets.env is here"), "auto", emptyRuleSet, opts)
+        .decision,
+    ).toBe("allow");
+  });
+
+  test("a declared value is read as a path whatever it holds", () => {
+    expect(decide(read("my dir/.env")).decision).toBe("deny");
+    expect(decide(read(".env: missing", { caseInsensitive: true })).decision).toBe("deny");
+    expect(decide(read(".crewhaus/secrets/two words")).decision).toBe("deny");
+  });
+
+  test("the write floor reads text as it did, with no name check", () => {
+    const write: ToolCallContext = {
+      toolName: "SomeWriter",
+      input: { text: ".env: missing" },
+      readOnly: false,
+      destructive: true,
+    };
+    const details = evaluateWithReason(write, "auto", emptyRuleSet, { protectedRoots: [".env"] });
+    expect(details.decision).toBe("deny");
+    expect(details.reason).toContain("is not read-only and names a path where");
+  });
+
+  test("a tool that declares `[]` carries text, read-only or not", () => {
+    const text = (readOnly: boolean): ToolCallContext => ({
+      toolName: "TodoWrite",
+      input: { items: ["update deploy/.env"] },
+      floorValues: [],
+      readOnly,
+      destructive: false,
+    });
+    expect(decide(text(false)).decision).toBe("allow");
+    expect(decide(text(true)).decision).toBe("allow");
+  });
+
+  test("an allow rule loses, in each source", () => {
+    const allow: RuleSet = {
+      ...emptyRuleSet,
+      flag: [rule("alwaysAllow", "Read(.env)", "flag")],
+      settings: [rule("alwaysAllow", "Read", "settings")],
+      yaml: [rule("alwaysAllow", "Read(**)")],
+    };
+    expect(evaluateWithReason(read(".env"), "auto", allow, {}).decision).toBe("allow");
+    const details = decide(read(".env"), "auto", allow);
+    expect(details.decision).toBe("deny");
+    expect(details.reason).toContain(REASON);
+  });
+
+  test("a long name reads in one pass", () => {
+    expect(decide(read(`.env.${"a".repeat(1 << 20)}`)).decision).toBe("deny");
+    expect(decide(read(`${"a/".repeat(1 << 19)}notes.md`)).decision).toBe("allow");
+    expect(decide(undeclared(`${".env ".repeat(1 << 18)}and more`)).decision).toBe("allow");
+  });
+});
+
+/** A decision without its reason, for a table that names the input it checks. */
+function pick(details: { readonly decision: string }): { readonly decision: string } {
+  return { decision: details.decision };
+}

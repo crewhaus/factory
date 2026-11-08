@@ -428,6 +428,20 @@ describe("Grep tool", () => {
     expect(result).toBe("no matches");
   });
 
+  test("a run that keeps files from its tools searches around them, and says how many", async () => {
+    await mkdir(path.join(tmp, "config"));
+    await writeFile(path.join(tmp, "config", "prod.secrets"), "K=one\n");
+    await writeFile(path.join(tmp, "prod.env"), "K=two\n");
+    await writeFile(path.join(tmp, "notes.md"), "K=three\n");
+    const ctx = { bridge: { credentialRoots: ["config/prod.secrets", "prod.env"] } };
+    for (const at of [undefined, ".", "./", "config/..", process.cwd()]) {
+      const result = String(await grep.execute({ pattern: "K=", path: at }, ctx as never));
+      expect(result).toBe(
+        "notes.md:1:K=three\n[Grep: 2 file(s) this run keeps from its tools left out]",
+      );
+    }
+  });
+
   test("scopes to subdirectory when path provided", async () => {
     await mkdir(path.join(tmp, "sub"));
     await writeFile(path.join(tmp, "sub", "x.txt"), "needle\n");

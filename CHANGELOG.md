@@ -168,6 +168,20 @@ these on: they reach every harness that uses what each one names.
   daemon whose spec declares a tool that may work on files says so at boot when
   the root lies inside.
 
+- **On a `channel` or `managed` harness, a tool call that names a credential file
+  is refused.** Whatever a rule says, an agent's tool call that names one of
+  these is denied: a file named `.env` or `.env.<name>`, or `.npmrc`, in any
+  directory (`.env.example`, `.env.sample` and `.env.template` are fine); a file
+  `manager.envFiles` names; `.crewhaus/secrets`; `.crewhaus/identity.json`; and
+  `.crewhaus/run/control-token`, `.crewhaus/run/mcp-token`,
+  `.crewhaus/run/gateway-jwt-secret`, `.crewhaus/run/logs` and
+  `.crewhaus/run/control/keys`. A sub-agent of such a run follows the same rule.
+  There `StateExport`, `Grep`, `IndexSearch`, `GitAdd`, `GitStashPush`, `GitDiff`
+  and `GitShow` leave these files out, `GitApplyPatch` and `StateImport` refuse an
+  input that names one, and `SecretLookup` refuses a reference that reads one.
+  Only `bypass` mode skips this, and `Bash` and `RunCommand` remain outside what
+  it can see. Recompile a daemon to pick this up.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what

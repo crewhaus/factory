@@ -5,6 +5,8 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   type SafeFsFailure,
+  credentialRootsOf,
+  heldInTree,
   openForReadFd,
   resolveContained,
   writeFileSafe,
@@ -693,6 +695,9 @@ export const grep: RegisteredTool = buildTool({
     const hits: string[] = [];
     const hiddenDirs = new Set<string>();
     let hidden = 0;
+    // A run that keeps files from its tools searches around them, and says how many.
+    const isHeld = heldInTree(baseAbs, credentialRootsOf(ctx), root);
+    let heldBack = 0;
     const session = limits.openSession();
     let batch = emptyBatch();
     const where = lineRef;
@@ -814,6 +819,10 @@ export const grep: RegisteredTool = buildTool({
         if (skippedBy !== undefined) {
           hidden++;
           hiddenDirs.add(skippedBy);
+          continue;
+        }
+        if (isHeld(rel)) {
+          heldBack++;
           continue;
         }
         const display = baseRel === "" ? rel : path.join(baseRel, rel);
@@ -948,8 +957,13 @@ export const grep: RegisteredTool = buildTool({
         : incomplete
           ? "no matches in the lines searched"
           : "no matches";
+    const heldNote =
+      heldBack > 0 ? `\n[Grep: ${heldBack} file(s) this run keeps from its tools left out]` : "";
     return (
-      body + unsearchedNote(unsearched, lineCap, chain) + hiddenNote("Grep", hidden, hiddenDirs)
+      body +
+      unsearchedNote(unsearched, lineCap, chain) +
+      hiddenNote("Grep", hidden, hiddenDirs) +
+      heldNote
     );
   },
 });
