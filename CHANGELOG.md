@@ -130,6 +130,23 @@ these on: they reach every harness that uses what each one names.
   does. `maxValueWei` and `simulationRequired` stay tunable. Change who approves
   a write by hand or with `crewhaus propose`.
 
+- **The egress check's lineage covers a resumed run and the value of a
+  `NAME=value` line.** A run resumed from a session log tags the tool results it
+  replays at `tool`, and a credential-shaped value on an upper-case `NAME=value`
+  line is tagged on its own. A later call to a model-chosen destination that
+  carries such text verbatim is refused, as it is within one run, and a
+  configured sink records a warning. A call a person approved on a parked
+  approval goes out as approved, also under the rule an always-allow saves, for
+  the call that repeats the approved input: the egress audit records its match
+  as a warning that names the
+  approval, and every other call in the run meets the check as any call does.
+  The approval stays unspent when the justification check or a tool's rate limit
+  refuses its call.
+  State tools and `GitApplyPatch` refuse a write or a link that resolves into
+  the runtime's own record of a run. The requirements ledger holds what a person
+  wrote: a grader's correction and other runtime-authored turns stay out of it.
+  Recompile a daemon to pick this up.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what

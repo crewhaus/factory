@@ -267,6 +267,8 @@ export const MAX_LINE_TAGS = 64;
 export const MIN_TOKEN_TAG_LENGTH = 8;
 /** Cap on per-call token tags (longest kept) so noise can't flood lineage. */
 export const MAX_TOKEN_TAGS = 16;
+/** Assignments read per token, counted back from its last, so a token of them stays linear. */
+const MAX_TOKEN_ASSIGNMENTS = 4;
 
 /**
  * Well-known credential prefixes (Stripe sk-/sk_live_/rk_live_, GitHub
@@ -287,6 +289,15 @@ const BASE64_SHAPE = /^[A-Za-z0-9+/_=-]{24,}$/;
  */
 const SECRET_ASSIGNMENT =
   /(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|authorization|bearer|credential)["']?\s*[:=]\s*["']?([^\s"'`,;]{8,})/gi;
+/**
+ * An upper-case name and its assignment, wherever it sits in a token: after a
+ * `file:line:` prefix, a `#`, a flag or a JSON key's quote. A lower-case letter,
+ * digit or `_` before the name means it is the tail of a longer word, and a `?`
+ * or `&` means it is a URL's query, which stays whole.
+ */
+const ENV_ASSIGNMENT = /(?<![A-Za-z0-9_?&])[A-Z_][A-Z0-9_]*["']?(?::=|\?=|\+=|=|:)["']?/g;
+/** A line break or tab as JSON or a shell prints it: `\\n` starts a new token. */
+const ESCAPED_WHITESPACE = /\\[nrt]/g;
 
 /**
  * High-confidence "this token IS a secret" shapes ONLY. A bare
@@ -311,15 +322,32 @@ function isCredentialShaped(token: string): boolean {
 }
 
 /**
- * Extract credential-shaped tokens (see `isCredentialShaped`) plus values of
- * secret-keyed assignments. Capped at `MAX_TOKEN_TAGS`, longest first — the
- * longest candidates are the likeliest real secrets.
+ * The credential-shaped value of the last assignment in `token` that has one,
+ * or `undefined`. The last, so `NAME=KEY=value` yields `value`, and working back
+ * from it, so a base64 value's own `/ABC=` tail does not hide the value.
  */
-function credentialTokens(content: string): string[] {
-  const candidates = new Set<string>();
-  for (const raw of content.split(/[\s,;|()<>[\]{}\\]+/)) {
+function assignedValue(token: string): string | undefined {
+  const ends: number[] = [];
+  for (const m of token.matchAll(ENV_ASSIGNMENT)) {
+    ends.push(m.index + m[0].length);
+    if (ends.length > MAX_TOKEN_ASSIGNMENTS) ends.shift();
+  }
+  for (const end of ends.reverse()) {
+    const value = trimToken(token.slice(end));
+    if (value.length >= MIN_TOKEN_TAG_LENGTH && isCredentialShaped(value)) return value;
+  }
+  return undefined;
+}
+
+/** Credential-shaped tokens and assigned values in one run of text, into `candidates`. */
+function collectCredentialTokens(content: string, candidates: Set<string>): void {
+  const unescaped = content.includes("\\") ? content.replace(ESCAPED_WHITESPACE, " ") : content;
+  for (const raw of unescaped.split(/[\s,;|()<>[\]{}\\]+/)) {
     const token = trimToken(raw);
-    if (token.length >= MIN_TOKEN_TAG_LENGTH && isCredentialShaped(token)) {
+    const value = assignedValue(token);
+    if (value !== undefined) {
+      candidates.add(value);
+    } else if (token.length >= MIN_TOKEN_TAG_LENGTH && isCredentialShaped(token)) {
       candidates.add(token);
     }
   }
@@ -327,6 +355,46 @@ function credentialTokens(content: string): string[] {
     const value = trimToken(m[1] ?? "");
     if (value.length >= MIN_TOKEN_TAG_LENGTH) {
       candidates.add(value);
+    }
+  }
+}
+
+/** Every string leaf of a parsed JSON value, walked with a stack so depth costs no recursion. */
+function jsonStringLeaves(root: unknown): string[] {
+  const leaves: string[] = [];
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const value = stack.pop();
+    if (typeof value === "string") {
+      leaves.push(value);
+    } else if (typeof value === "object" && value !== null) {
+      for (const child of Object.values(value)) stack.push(child);
+    }
+  }
+  return leaves;
+}
+
+/**
+ * Extract credential-shaped tokens (see `isCredentialShaped`) plus values of
+ * secret-keyed assignments. A credential-shaped value on an upper-case
+ * `NAME=value` token is the candidate on its own, so the value matches where
+ * it is copied without its name and the pair takes no slot of its own. Content
+ * that parses as JSON is also read through its string leaves, as the egress
+ * check reads a payload, so a value in an escaped field is found as written.
+ * Capped at `MAX_TOKEN_TAGS`, longest first — the longest candidates are the
+ * likeliest real secrets.
+ */
+function credentialTokens(content: string): string[] {
+  const candidates = new Set<string>();
+  collectCredentialTokens(content, candidates);
+  const opens = content.trimStart()[0];
+  if (opens === "{" || opens === "[") {
+    try {
+      for (const leaf of jsonStringLeaves(JSON.parse(content))) {
+        collectCredentialTokens(leaf, candidates);
+      }
+    } catch {
+      // Not JSON: the text was read above.
     }
   }
   return [...candidates].sort((a, b) => b.length - a.length).slice(0, MAX_TOKEN_TAGS);
