@@ -147,6 +147,10 @@ const MAX_SCAN_CHARS = 4 * 1024 * 1024;
 const VIEW_BUDGET_RATIO = 8;
 const VIEW_BUDGET_SLACK = 4096;
 
+// How many levels of JSON string escaping the rules read through: the JSON a
+// host wraps a text in, a JSON text a caller passed as that text, and one more.
+const JSON_ESCAPE_DEPTH = 3;
+
 // What the optional model layer (Layer 3) is shown of a longer text: its head
 // and tail, so a classification is still one model call of bounded size. The
 // regex and structural layers have read the rest, window by window.
@@ -1047,14 +1051,25 @@ function shifted(hit: PromptInjectionHit, at: number): PromptInjectionHit {
   return at === 0 ? hit : { ...hit, span: [hit.span[0] + at, hit.span[1] + at] };
 }
 
+/** A whitespace character spelled as a JSON string escape, at most eight backslashes deep. */
+const ESCAPED_SPACE = String.raw`\\{1,8}(?:[nrtf]|u00(?:20|0[9a-dA-D]))`;
+
+/** A run of whitespace, written or JSON-escaped. Each step starts on one character, so it is linear. */
+const PADDING_RUN = new RegExp(String.raw`(?:\s|${ESCAPED_SPACE})+`, "g");
+const ESCAPED_SPACE_ONE = new RegExp(ESCAPED_SPACE, "g");
+
 /**
  * The text the windows are cut from: `text` itself when it fits one window
  * (read exactly as before), otherwise `text` without its padding (see
- * {@link WHITESPACE_RUN_KEEP}). Spans are offsets into this text.
+ * {@link WHITESPACE_RUN_KEEP}). A run spelled with JSON string escapes is
+ * padding too; a long one is written as plain line breaks, so no cut lands
+ * inside an escape. Spans are offsets into this text.
  */
 function scanTextOf(text: string): string {
   if (text.length <= WINDOW_CHARS) return text;
-  return text.replace(INVISIBLE_RE, "").replace(/\s+/g, (run) => {
+  return text.replace(INVISIBLE_RE, "").replace(PADDING_RUN, (spelled) => {
+    if (spelled.length <= 2 * WHITESPACE_RUN_KEEP) return spelled;
+    const run = spelled.replace(ESCAPED_SPACE_ONE, "\n");
     if (run.length <= 2 * WHITESPACE_RUN_KEEP) return run;
     const head = run.slice(0, WHITESPACE_RUN_KEEP);
     const tail = run.slice(-WHITESPACE_RUN_KEEP);
@@ -1103,20 +1118,67 @@ function* windowsOf(text: string): Generator<readonly [number, string]> {
   }
 }
 
+const JSON_ESCAPE = /\\(?:u[0-9A-Fa-f]{4}|["\\/bfnrt])/g;
+const JSON_ESCAPE_CHARS: Readonly<Record<string, string>> = {
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+};
+
+/** `text` with its JSON string escapes decoded, a backslash that starts none left as written. */
+function decodeJsonEscapes(text: string): string {
+  return text.replace(JSON_ESCAPE, (spelled) =>
+    spelled[1] === "u"
+      ? String.fromCharCode(Number.parseInt(spelled.slice(2), 16))
+      : (JSON_ESCAPE_CHARS[spelled.charAt(1)] ?? spelled),
+  );
+}
+
 /**
- * A window as written, its normalized match view, and its decoded blobs; or
- * undefined when the views outgrow the window's budget (see
- * {@link VIEW_BUDGET_RATIO}), so the window is not read. `continued` says the
- * window is not the first, so it may open inside a blob.
+ * JSON text read through its string escapes: a line break or a tab in a string
+ * is a backslash and a letter once it is JSON, and the rules read whitespace,
+ * so these views say the same words the model reads. Each level of escaping is
+ * one view as decoded (the line-anchored rules need its lines) and its match
+ * view, with the blobs it decodes to, up to {@link JSON_ESCAPE_DEPTH} levels
+ * (a text inside JSON inside JSON). A text with no escape adds nothing.
+ */
+function jsonEscapeViews(window: string, budget: { left: number }, seen: Set<string>): View[] {
+  const out: View[] = [];
+  let text = window;
+  for (let depth = 0; depth < JSON_ESCAPE_DEPTH; depth++) {
+    const decoded = decodeJsonEscapes(text);
+    if (decoded === text) break;
+    text = decoded;
+    const normalized = normalizeForMatch(decoded);
+    budget.left -= decoded.length + normalized.length;
+    if (budget.left < 0) break;
+    out.push({ text: decoded }, { text: normalized }, ...decodedVariants(decoded, budget, seen));
+  }
+  return out;
+}
+
+/**
+ * A window as written, its normalized match view, its decoded blobs, and its
+ * JSON-escaped text read as decoded; or undefined when the views outgrow the
+ * window's budget (see {@link VIEW_BUDGET_RATIO}), so the window is not read.
+ * `continued` says the window is not the first, so it may open inside a blob.
  */
 function viewsOf(window: string, continued: boolean): View[] | undefined {
   const budget = { left: VIEW_BUDGET_RATIO * window.length + VIEW_BUDGET_SLACK };
   const normalized = normalizeForMatch(window);
   budget.left -= normalized.length;
   if (budget.left < 0) return undefined;
-  const decoded = decodedVariants(window, budget, new Set(), 2, continued);
+  const seen = new Set<string>();
+  const decoded = decodedVariants(window, budget, seen, 2, continued);
   if (budget.left < 0) return undefined;
-  return [{ text: window }, { text: normalized }, ...decoded];
+  const escapes = jsonEscapeViews(window, budget, seen);
+  if (budget.left < 0) return undefined;
+  return [{ text: window }, { text: normalized }, ...decoded, ...escapes];
 }
 
 /**
@@ -1306,6 +1368,7 @@ export const __internals = {
   tryDecodeBase64,
   tryDecodeHex,
   tryDecodePercent,
+  decodeJsonEscapes,
   MIN_CORPUS_RULES,
   MAX_SCAN_CHARS,
   MODEL_VIEW_CHARS,

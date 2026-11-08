@@ -322,6 +322,28 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
     pending:
       "the verifier (grader rationale) reply path is classified by the 0.6.0 cascade PR (9c); until it lands this is a drift watch, not a failure",
   },
+  // Run input at TrustOrigin "api": managed `runs.create` / `runs.continue`
+  // input is classified in the envelope path before the run's handler, and
+  // kept text tags the run's first context through run-context's inbound
+  // scope. The file also classifies federation payloads, so the row reads
+  // only the window before the success return, which holds the run-input
+  // check and the scope and stops short of the federation call.
+  {
+    name: "gateway-server-run-input",
+    path: "packages/gateway-server/src/index.ts",
+    requireTag: true,
+    anchor: "return encodeSuccess(id, result);",
+    window: 3000,
+  },
+  // A batch job's payload, classified at "api" before the job's handler and
+  // tagged into its run the same way.
+  { name: "queue-consumer", path: "packages/queue-consumer/src/index.ts", requireTag: true },
+  // Every message a Worker build's loop is handed, at "channel", before its
+  // first model call. The edge keeps no lineage: refused, not tagged.
+  { name: "worker-runtime-loop", path: "packages/worker-runtime/src/loop.ts" },
+  // A voice caller's transcribed speech and text sent into a session, at
+  // "channel". A voice session has no run context to tag.
+  { name: "voice-runtime", path: "packages/voice-runtime/src/index.ts" },
 ];
 
 /**
@@ -380,8 +402,9 @@ export function auditBoundarySite(
   });
   if (site.requireTag === true) {
     // §10.1 — a reply path that classifies but never tags leaves the egress
-    // fabric blind to the content it admitted.
-    const tags = body.includes("tagContent");
+    // fabric blind to the content it admitted. Run input is tagged through
+    // run-context's inbound scope, which tags the run's first context.
+    const tags = body.includes("tagContent") || body.includes("withInboundContent");
     findings.push({
       class: "boundary-site",
       file: site.path,
@@ -455,6 +478,28 @@ const DRIFT_SIGNALS: ReadonlyArray<DriftSignal> = [
     description:
       'runs a nested model side call in the "consult" role whose reply re-enters the parent context',
     contentNeedle: 'modelRole: "consult"',
+  },
+  // Run input taken in by a library: crewhaus.v1 requests, queue jobs and a
+  // realtime voice session. (Worker chat has no needle of its own: the
+  // provider adapters share its message types; its BOUNDARY_SITES row guards
+  // it.)
+  {
+    symbol: "run-request-ingress",
+    origin: "api",
+    description: "decodes crewhaus.v1 requests, whose run input enters here",
+    contentNeedle: "= decodeRequest(",
+  },
+  {
+    symbol: "queue-job-ingress",
+    origin: "api",
+    description: "pulls queue jobs whose payloads become run input",
+    contentNeedle: "queue.pull(",
+  },
+  {
+    symbol: "realtime-voice-ingress",
+    origin: "channel",
+    description: "streams a caller's audio to a realtime model",
+    contentNeedle: "input_audio_buffer.append",
   },
 ];
 

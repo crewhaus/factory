@@ -47,11 +47,12 @@ describe("TrustOrigin mirror bridge (boundary-classifier ↔ run-context)", () =
       chain: true,
       memory: true,
       consult: true,
+      api: true,
     };
     expect([...TRUST_ORIGINS].sort()).toEqual(Object.keys(exhaustive).sort());
     // Declaration order is the table's order — "user" first, the newest last.
     expect(TRUST_ORIGINS[0]).toBe("user");
-    expect(TRUST_ORIGINS[TRUST_ORIGINS.length - 1]).toBe("consult");
+    expect(TRUST_ORIGINS[TRUST_ORIGINS.length - 1]).toBe("api");
   });
 
   test("consult sits at the block tier, like skill and memory (design §10.1)", () => {
@@ -59,5 +60,10 @@ describe("TrustOrigin mirror bridge (boundary-classifier ↔ run-context)", () =
     expect(defaultBoundarySeverity("skill")).toBe("block");
     expect(defaultBoundarySeverity("memory")).toBe("block");
     expect(defaultBoundarySeverity("user")).toBe("pass");
+  });
+
+  test("api, the text a caller hands to a run, sits at the block tier with channel", () => {
+    expect(defaultBoundarySeverity("api")).toBe("block");
+    expect(defaultBoundarySeverity("channel")).toBe("block");
   });
 });

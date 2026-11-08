@@ -15,6 +15,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.96.0",
     "@crewhaus/adapter-anthropic": "workspace:*",
+    "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/token-budget": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",

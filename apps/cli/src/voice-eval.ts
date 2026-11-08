@@ -58,7 +58,11 @@ export type ReplayEvent = {
     | "interrupt"
     | "barge_in"
     | "disconnect"
-    | "error";
+    | "error"
+    /** The prompt-injection check refused / flagged the caller's input.
+     *  Parsed so a log carrying them replays; no metric reads them. */
+    | "input_blocked"
+    | "input_warned";
   readonly role?: "user" | "agent";
   readonly text?: string;
   /** For barge_in: how many consecutive speech frames triggered it. */
@@ -99,6 +103,8 @@ const VALID_KINDS: ReadonlySet<string> = new Set([
   "barge_in",
   "disconnect",
   "error",
+  "input_blocked",
+  "input_warned",
 ]);
 
 /**

@@ -10,7 +10,10 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { type Logger, createLogger } from "@crewhaus/logging";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
+import { type InboundContent, takePendingInbound } from "./scope";
 import { trimToken } from "./token-trim";
+
+export { type InboundContent, withInboundContent } from "./scope";
 
 /**
  * Where content currently flowing through the runtime originated. Mirrors
@@ -32,7 +35,8 @@ export type TrustOrigin =
   | "tool"
   | "chain"
   | "memory"
-  | "consult";
+  | "consult"
+  | "api";
 
 export type RunContext = {
   readonly runId: string;
@@ -166,6 +170,11 @@ function generateSessionId(): string {
  * never-aborted signal, a logger that has the run/session ids
  * pre-bound so every log line is tagged automatically, and a fresh
  * `TraceEventBus`.
+ *
+ * Created inside a {@link withInboundContent} scope, the first context
+ * adopts the run input a library classified and kept (see `./scope`): the
+ * text is tagged into its lineage at its origin, and a warning is published
+ * and logged for text kept with one. Outside a scope nothing is adopted.
  */
 export function createRunContext(opts: RunContextOptions = {}): RunContext {
   const runId = opts.runId ?? `run_${shortId()}`;
@@ -183,7 +192,38 @@ export function createRunContext(opts: RunContextOptions = {}): RunContext {
     eventBus,
     ...(opts.originStack !== undefined ? { originStack: opts.originStack } : {}),
   };
+  adoptInbound(ctx, takePendingInbound());
   return ctx;
+}
+
+/**
+ * Tag each kept input into `ctx`'s lineage at its origin, and report the ones
+ * kept with a warning: one `permission_decision` event each (the template
+ * runtime-core uses for suspicious tool output) and one log line. Neither
+ * carries the text.
+ */
+function adoptInbound(ctx: RunContext, entries: readonly InboundContent[]): void {
+  for (const entry of entries) {
+    tagContent(ctx, entry.content, entry.origin);
+    if (entry.warning === undefined) continue;
+    const rules = [...entry.warning.rules];
+    ctx.eventBus.publish({
+      ...ctx.eventBus.envelope(),
+      kind: "permission_decision",
+      toolName: entry.door,
+      decision: "allow",
+      mode: "inbound",
+      outcome: "warned",
+      rules,
+      reason: `input from origin ${entry.origin} kept with a warning`,
+    });
+    ctx.logger.warn("input kept with a warning", {
+      origin: entry.origin,
+      door: entry.door,
+      rules,
+      score: entry.warning.score,
+    });
+  }
 }
 
 /**

@@ -18,6 +18,12 @@
 // no mid-run summariser. The loop runs one user→assistant turn with its tool
 // inner-loop (the `singleTurn` shape), so a stateless worker serves one
 // request→response and the client re-POSTs history for the next turn.
+//
+// Every message the loop is handed is screened at TrustOrigin "channel" before
+// the first model call, whatever its role (`screenMessages`): a client sends
+// the conversation back, assistant turns included, so all of it is input. What
+// a tool returns is classified at "tool" before the next model call
+// (`screenToolResult`), as on a Node run.
 
 import type {
   CanonicalContentBlock,
@@ -30,6 +36,7 @@ import type {
   ProviderRequest,
   StreamEvent,
 } from "@crewhaus/adapter-anthropic";
+import { boundaryRuleIds, classifyBoundary, valueText } from "@crewhaus/boundary-classifier";
 import {
   EXIT_CODES,
   type FailureClass,
@@ -48,7 +55,7 @@ import {
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { createEdgeAnthropicAdapter } from "./edge-anthropic";
 import type { WorkerPlatform } from "./platform";
-import { type TraceSink, noopTraceSink } from "./trace";
+import { type TraceSink, type WorkerTraceEvent, noopTraceSink } from "./trace";
 
 /** Default max OUTPUT tokens per model call (mirrors the inlined cf-worker client). */
 export const DEFAULT_MAX_TOKENS = 4096;
@@ -191,6 +198,14 @@ export async function runWorkerLoop(options: RunWorkerLoopOptions): Promise<Work
 
   let state: TurnState = initialState;
   try {
+    // A refused message ends the run through the tail below, like any failing
+    // stop, before any model call (the token estimate included).
+    const refusal = await screenMessages(options.messages, emit);
+    if (refusal !== undefined) {
+      failure = refusal;
+      stop = "error";
+      state = transition(state, { kind: "Aborted" });
+    }
     while (state.kind !== "Done") {
       if (options.signal?.aborted) {
         stop = "aborted";
@@ -360,6 +375,9 @@ export async function runWorkerLoop(options: RunWorkerLoopOptions): Promise<Work
                 is_error: executed.isError,
               };
             }
+            if (tool?.classifyOutput !== false) {
+              result = await screenToolResult(tu.name, result, emit);
+            }
             results.push(result);
             emit({
               kind: "tool_call_end",
@@ -419,6 +437,171 @@ export async function runWorkerLoop(options: RunWorkerLoopOptions): Promise<Work
     iterations,
     ...(failure !== undefined ? { failure } : {}),
   };
+}
+
+// --------------------------------------------------------------------------
+// Input screening
+// --------------------------------------------------------------------------
+
+/**
+ * Screen the loop's seed at TrustOrigin "channel": every message once, then,
+ * when there are several, all of them joined with a newline, so an
+ * instruction split across two messages is caught too. A malicious verdict,
+ * or a text too long for the check to read, returns the `input_blocked`
+ * refusal, which names the message (counted from 1, with its role) or "the
+ * messages together" and the rule ids, never the text. A suspicious message
+ * is kept and reported with one `permission_decision` warning.
+ *
+ * Refused, not tagged: the edge keeps no lineage, and a refused text never
+ * reaches a model. Each call screens its own seed, so a Worker that runs the
+ * loop once per graph node or workflow step screens each node's or step's
+ * seed, earlier nodes' output included. A message seen before is a cache hit
+ * in the isolate; the joined text is new each request.
+ */
+async function screenMessages(
+  messages: ReadonlyArray<CanonicalMessage>,
+  emit: TraceSink,
+): Promise<FailureReport | undefined> {
+  const texts: string[] = [];
+  let warned = false;
+  for (const [i, message] of messages.entries()) {
+    const where = `message ${i + 1} (${message.role})`;
+    const text = messageText(message);
+    if (text === undefined) {
+      return buildFailure("input_blocked", "input refused", `${where} could not be read as text`);
+    }
+    texts.push(text);
+    const boundary = await classifyBoundary(text, { origin: "channel" });
+    const rules = boundaryRuleIds(boundary.verdict);
+    if (boundary.action === "redact") {
+      return buildFailure(
+        "input_blocked",
+        "input refused",
+        `${where} matched the prompt-injection check (rules: ${rules.join(", ")})`,
+      );
+    }
+    if (boundary.action === "warn") {
+      warned = true;
+      emit(inputWarning(rules, `message ${i + 1} kept with a warning`));
+    }
+  }
+  if (texts.length > 1) {
+    const boundary = await classifyBoundary(texts.join("\n"), { origin: "channel" });
+    const rules = boundaryRuleIds(boundary.verdict);
+    if (boundary.action === "redact") {
+      return buildFailure(
+        "input_blocked",
+        "input refused",
+        `the messages together matched the prompt-injection check (rules: ${rules.join(", ")})`,
+      );
+    }
+    if (boundary.action === "warn" && !warned) {
+      emit(inputWarning(rules, "the messages together kept with a warning"));
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Classify a tool's output at TrustOrigin "tool" before the next model call,
+ * an error's text too. A malicious verdict, or a text too long for the check
+ * to read, replaces the output with the redaction notice, and the run goes on:
+ * the model is told the output was withheld, as on a Node run. A suspicious
+ * one is kept and reported with one `permission_decision` warning. Output that
+ * cannot be read as text is withheld the same way.
+ */
+async function screenToolResult(
+  toolName: string,
+  result: CanonicalToolResultBlockParam,
+  emit: TraceSink,
+): Promise<CanonicalToolResultBlockParam> {
+  const text = blockText(result);
+  if (text === undefined) {
+    emit(toolOutputDecision(toolName, "redacted", [], "tool output could not be read as text"));
+    return { ...result, content: "[tool output redacted: it could not be read as text]" };
+  }
+  if (text === "") return result;
+  const boundary = await classifyBoundary(text, { origin: "tool" });
+  const rules = boundaryRuleIds(boundary.verdict);
+  if (boundary.action === "redact") {
+    emit(toolOutputDecision(toolName, "redacted", rules, "prompt injection in tool output"));
+    return { ...result, content: boundary.redacted ?? "[tool output redacted]" };
+  }
+  if (boundary.action === "warn") {
+    emit(toolOutputDecision(toolName, "warned", rules, "suspicious tool output"));
+  }
+  return result;
+}
+
+function toolOutputDecision(
+  toolName: string,
+  outcome: "redacted" | "warned",
+  rules: string[],
+  reason: string,
+): WorkerTraceEvent {
+  return {
+    kind: "permission_decision",
+    toolName,
+    decision: "allow",
+    mode: "inbound",
+    outcome,
+    rules,
+    reason,
+  };
+}
+
+function inputWarning(rules: string[], reason: string): WorkerTraceEvent {
+  return {
+    kind: "permission_decision",
+    toolName: "messages",
+    decision: "allow",
+    mode: "inbound",
+    outcome: "warned",
+    rules,
+    reason,
+  };
+}
+
+/**
+ * The text a message carries to the model: its string content, or, for block
+ * content, its text blocks, its tool results' text and the strings in its tool
+ * calls' input, one per line. Image and thinking blocks carry none; a block of
+ * any other kind is read for the strings it holds. `undefined` when a part
+ * cannot be read: what the check cannot read is refused.
+ */
+function messageText(message: CanonicalMessage): string | undefined {
+  if (typeof message.content === "string") return message.content;
+  return blocksText(message.content);
+}
+
+function blocksText(blocks: ReadonlyArray<unknown>): string | undefined {
+  const parts: string[] = [];
+  for (const block of blocks) {
+    const text = blockText(block);
+    if (text === undefined) return undefined;
+    if (text !== "") parts.push(text);
+  }
+  return parts.join("\n");
+}
+
+function blockText(block: unknown): string | undefined {
+  const b = (typeof block === "object" && block !== null ? block : {}) as Record<string, unknown>;
+  switch (b["type"]) {
+    case "text":
+      return typeof b["text"] === "string" ? b["text"] : valueText(block);
+    case "image":
+    case "thinking":
+      return "";
+    case "tool_use":
+      return valueText(b["input"]);
+    case "tool_result": {
+      const content = b["content"];
+      if (content === undefined || typeof content === "string") return content ?? "";
+      return Array.isArray(content) ? blocksText(content) : valueText(content);
+    }
+    default:
+      return valueText(block);
+  }
 }
 
 // --------------------------------------------------------------------------

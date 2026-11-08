@@ -43,16 +43,103 @@
  * complete + ack. `stop()` is `drain()` plus a wait — used by the
  * SIGTERM path so the daemon shuts down cleanly without orphaning
  * mid-flight jobs.
+ *
+ * Run input: a job's payload becomes the input of the run its handler
+ * starts, so it is classified at TrustOrigin "api" before the handler runs
+ * (a string as written, any other payload as the strings it holds, one per
+ * line). A malicious payload, or one that cannot be read as text, never
+ * reaches the handler: the job fails `permanent` with an
+ * {@link InputBlockedError} on its first delivery (a retry would meet the
+ * same verdict), so the queue dead-letters it. A kept payload runs inside
+ * run-context's inbound scope, which tags it into the run's first context at
+ * "api" and reports a suspicious one there.
  */
-import { CrewhausError } from "@crewhaus/errors";
+import { boundaryRuleIds, classifyBoundary, valueText } from "@crewhaus/boundary-classifier";
+import { CrewhausError, type FailureClass } from "@crewhaus/errors";
 import { type IdempotencyStore, idempotencyKey, withIdempotency } from "@crewhaus/idempotency-keys";
 import type { Job, NackReason, QueueAdapter } from "@crewhaus/queue-protocol";
+import { type InboundContent, withInboundContent } from "@crewhaus/run-context";
 
 export class QueueConsumerError extends CrewhausError {
-  override readonly name = "QueueConsumerError";
+  // `: string` (not the literal) so a subclass can name itself.
+  override readonly name: string = "QueueConsumerError";
   constructor(message: string, cause?: unknown) {
     super("runtime", message, cause);
   }
+}
+
+/**
+ * A job's payload the prompt-injection check refused before its handler ran:
+ * the verdict was malicious, or the payload could not be read as text. The
+ * message starts `input_blocked:` and names the rule ids; neither it nor any
+ * field carries the payload.
+ */
+export class InputBlockedError extends QueueConsumerError {
+  override readonly name: string = "InputBlockedError";
+  readonly failureClass: Extract<FailureClass, "input_blocked"> = "input_blocked";
+  readonly origin = "api" as const;
+  readonly rules: readonly string[];
+  readonly score: number;
+  constructor(detail: string, rules: readonly string[], score: number) {
+    super(`input_blocked: ${detail}`);
+    this.rules = rules;
+    this.score = score;
+  }
+}
+
+/** A content block a model reads and the check cannot: its bytes are not text. */
+function isUnreadableBlock(block: unknown): boolean {
+  if (typeof block !== "object" || block === null) return false;
+  const { type, content } = block as { type?: unknown; content?: unknown };
+  if (type === "image" || type === "document") return true;
+  return type === "tool_result" && Array.isArray(content) && content.some(isUnreadableBlock);
+}
+
+/**
+ * The text a payload carries into a run: a string as written, anything else
+ * as the strings it holds, one per line (see `valueText`), so an instruction
+ * in a structured payload reads as it would in a message, and each line is
+ * tagged on its own. A payload the check cannot read has no text
+ * (`undefined`): one that cannot be walked, or an array holding a block whose
+ * bytes a model reads, an image or a document.
+ */
+function payloadText(input: unknown): string | undefined {
+  const text = valueText(input);
+  if (text === undefined || (Array.isArray(input) && input.some(isUnreadableBlock))) {
+    return undefined;
+  }
+  return text;
+}
+
+/**
+ * Classify a job's payload at "api": the entry its run adopts when the
+ * payload is kept, or the refusal when it is not.
+ */
+async function screenJobInput(input: unknown): Promise<InboundContent | InputBlockedError> {
+  const text = payloadText(input);
+  if (text === undefined) {
+    return new InputBlockedError(
+      "the job's payload could not be read as text",
+      ["payload-unreadable"],
+      1,
+    );
+  }
+  const boundary = await classifyBoundary(text, { origin: "api" });
+  const rules = boundaryRuleIds(boundary.verdict);
+  const score = boundary.verdict.score;
+  if (boundary.action === "redact") {
+    return new InputBlockedError(
+      `input refused by the prompt-injection check (rules: ${rules.join(", ")})`,
+      rules,
+      score,
+    );
+  }
+  return {
+    content: text,
+    origin: "api",
+    door: "queue",
+    ...(boundary.action === "warn" ? { warning: { rules, score } } : {}),
+  };
 }
 
 export type ConsumerHandlerOutcome<TResult> =
@@ -229,10 +316,19 @@ export function startConsumer<TInput, TResult>(
     const stopRenew = startVisibilityRenew(opts.queue, job.id, visRenewMs, ts, tc);
     let outcome: ConsumerHandlerOutcome<TResult>;
     try {
-      const r = wrappedHandler
-        ? await wrappedHandler({ input: job.input, job }, key)
-        : { value: await opts.handler(job.input, { key, job }), fromCache: false };
-      outcome = { kind: "ok", value: r.value, fromCache: r.fromCache };
+      // Classified at "api" after the lease renewal starts and before the
+      // handler (and its idempotency cache) run; see the module docblock.
+      const screened = await screenJobInput(job.input);
+      if (screened instanceof InputBlockedError) {
+        outcome = { kind: "fail", reason: "permanent", error: screened };
+      } else {
+        const r = await withInboundContent([screened], async () =>
+          wrappedHandler
+            ? wrappedHandler({ input: job.input, job }, key)
+            : { value: await opts.handler(job.input, { key, job }), fromCache: false },
+        );
+        outcome = { kind: "ok", value: r.value, fromCache: r.fromCache };
+      }
     } catch (err) {
       if (isApprovalPending(err)) {
         // A park is NOT a failure — it is a run waiting on a human, and the

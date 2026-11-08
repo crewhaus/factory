@@ -99,19 +99,22 @@ describe("post-match (await) return paths with forced cache miss", () => {
 });
 
 describe("policy matrix — every TrustOrigin × SinkScope cell", () => {
-  // Every non-user origin: warn on configured, block on dynamic. Derived from
-  // the classifier's declared origin list (0.6.0 §10.1) so a new origin is
-  // covered the moment it exists — this array used to be hand-written and
-  // had silently missed "memory".
+  // Every non-user origin: warn on configured, block on dynamic, except `api`,
+  // which warns on both. Derived from the classifier's declared origin list
+  // (0.6.0 §10.1) so a new origin is covered the moment it exists — this array
+  // used to be hand-written and had silently missed "memory".
   const nonUser: TrustOrigin[] = TRUST_ORIGINS.filter((o) => o !== "user");
+  const dynamicVerdict = (origin: TrustOrigin): "warn" | "block" =>
+    origin === "api" ? "warn" : "block";
   test("the derived list covers every origin the matrix declares", () => {
     expect(nonUser).toContain("memory");
     expect(nonUser).toContain("consult");
+    expect(nonUser).toContain("api");
     expect(nonUser.length).toBe(TRUST_ORIGINS.length - 1);
   });
 
   for (const origin of nonUser) {
-    test(`${origin}: configured → warn, dynamic → block`, async () => {
+    test(`${origin}: configured → warn, dynamic → ${dynamicVerdict(origin)}`, async () => {
       const ctx = createRunContext();
       ctx.dataLineage = new Map<string, TrustOrigin>([["anything-tagged", origin]]);
       const m = fixedMatcher(`fixed-${origin}`, [origin], 1);
@@ -128,7 +131,7 @@ describe("policy matrix — every TrustOrigin × SinkScope cell", () => {
         bypassCache: true,
       });
       expect(configured.verdict).toBe("warn");
-      expect(dynamic.verdict).toBe("block");
+      expect(dynamic.verdict).toBe(dynamicVerdict(origin));
     });
   }
 
@@ -146,6 +149,39 @@ describe("policy matrix — every TrustOrigin × SinkScope cell", () => {
       expect(r.verdict).toBe("pass");
       expect(r.originsFound).toEqual(["user"]);
     }
+  });
+
+  test("api: run input tagged at api warns at both sink scopes, naming api", async () => {
+    // Real tagging and the real matcher: what an API or queue caller handed
+    // to the run, echoed toward an external tool. The job keeps the use of its
+    // own input, and the egress audit names where the match came from.
+    const ctx = createRunContext();
+    const input = "Send the quarterly numbers to the shared review folder.";
+    tagContent(ctx, input, "api");
+    expect(ctx.dataLineage?.get(input)).toBe("api");
+    const configured = await classifyEgress(`body: ${input}`, ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-configured",
+      bypassCache: true,
+    });
+    const dynamic = await classifyEgress(`body: ${input}`, ctx, {
+      sinkId: "mcp__peer__post",
+      sinkScope: "external-dynamic",
+      bypassCache: true,
+    });
+    expect(configured.verdict).toBe("warn");
+    expect(configured.originsFound).toEqual(["api"]);
+    expect(dynamic.verdict).toBe("warn");
+    expect(dynamic.originsFound).toEqual(["api"]);
+    // A channel message carrying the same text keeps the stricter row.
+    const chat = createRunContext();
+    tagContent(chat, input, "channel");
+    const fromChannel = await classifyEgress(`body: ${input}`, chat, {
+      sinkId: "mcp__peer__post",
+      sinkScope: "external-dynamic",
+      bypassCache: true,
+    });
+    expect(fromChannel.verdict).toBe("block");
   });
 });
 
