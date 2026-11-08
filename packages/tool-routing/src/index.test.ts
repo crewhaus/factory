@@ -1510,3 +1510,40 @@ test("a mean quality over one session carries no interval, and says why", async 
   expect(at(row, "quality", "interval")).toBeNull();
   expect(String(at(row, "quality", "note"))).toContain("one observation");
 });
+
+test("ExperimentLedger refuses a ledger a link carries into a root on the bridge, preview included", async () => {
+  const onBridge = { bridge: { protectedRoots: [".env", ".crewhaus/audit"] } };
+  const RECORD = { action: "record", name: "x", version: "v1", outcome: "success" };
+  const ask = async (input: Record<string, unknown>): Promise<Json> =>
+    JSON.parse(
+      String(await experimentLedger.execute({ ...RECORD, ...input } as never, onBridge as never)),
+    ) as Json;
+  writeFileSync(path.join(tmp, ".env"), "KEPT=1\n");
+  mkdirSync(path.join(tmp, ".crewhaus", "audit"), { recursive: true });
+  mkdirSync(path.join(tmp, "leaf"));
+  symlinkSync(path.join("..", ".env"), path.join(tmp, "leaf", "x.jsonl"));
+  mkdirSync(path.join(tmp, "other", ".crewhaus"), { recursive: true });
+  symlinkSync(
+    path.join("..", "..", ".crewhaus", "audit"),
+    path.join(tmp, "other", ".crewhaus", "experiments"),
+  );
+  for (const input of [
+    { experimentsDir: "leaf", dryRun: false },
+    { experimentsDir: "leaf", dryRun: true },
+    { dir: "other", dryRun: false },
+  ]) {
+    const out = await ask(input);
+    expect({ input, status: out["status"], code: out["code"] }).toEqual({
+      input,
+      status: "refused",
+      code: "refused",
+    });
+    expect(String(out["reason"])).toContain("Nothing was written.");
+  }
+  expect(readFileSync(path.join(tmp, ".env"), "utf8")).toBe("KEPT=1\n");
+  expect(readdirSync(path.join(tmp, ".crewhaus", "audit"))).toEqual([]);
+  // The same call with no link writes the ledger where it names.
+  const plain = await ask({ experimentsDir: "plain", dryRun: false });
+  expect(plain["status"]).toBe("ok");
+  expect(existsSync(path.join(tmp, "plain", "x.jsonl"))).toBe(true);
+});

@@ -400,8 +400,8 @@ describe("the printed example works, through the real matcher", () => {
       { channel: "slack:T0123:C0123:1700000000.1", text: "hi" },
       { channel: "slack:T0123:C9999", text: "hi" },
     ],
-    // A secret reference, named where it lives (critic8).
-    ["secretLookup", { refs: ["envfile:.env#DEPLOY_TOKEN"] }, { refs: ["env:HOME"] }],
+    // A secret reference, named where it lives (critic8), in the file the example names.
+    ["secretLookup", { refs: ["envfile:deploy.env#DEPLOY_TOKEN"] }, { refs: ["env:HOME"] }],
     [
       "envFileUpsert",
       { path: "src/.env", entries: [{ key: "A", valueFrom: "env:A" }] },

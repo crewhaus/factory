@@ -46,21 +46,36 @@ these on: they reach every harness that uses what each one names.
   Recompile a managed daemon, batch worker or voice harness, and recompile and
   redeploy a Worker, to pick this up.
 
-- **The runtime-state floor also covers a harness's settings, its run files
-  and Hangar's directory.** Beside `.crewhaus/sessions`,
-  `.crewhaus/tool-results` and `.crewhaus/proofs`, no permission rule lets an
-  agent's tool write `.crewhaus/run` (the runfiles, logs and control files a
-  daemon keeps there), the settings file `.crewhaus/settings.json` (permission
-  rules, hooks and manager settings) or Hangar's directory, where
-  `crewhaus hangar` keeps its token and settings: `~/.crewhaus/hangar` always,
-  and wherever the run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT`
-  puts it. The floor also reads the directory a call keeps a tool's store in.
-  Only `bypass` mode skips the floor, and the file tools that check their own
-  targets refuse even then, as `DatasetPut` does for a dataset that lands in one
-  of these and `EmitTraceEvent` for a log a link leads to one. CrewHaus itself
-  still writes these files. The floor refuses `HooksManage` on the harness it
-  runs in; it manages other harnesses as before. `Bash` and `RunCommand` remain
-  outside what the floor can see. Recompile a daemon to pick this up.
+- **The runtime-state floor also covers a harness's settings, run files, gate
+  records and environment files, and Hangar's directory.** Beside
+  `.crewhaus/sessions`, `.crewhaus/tool-results` and `.crewhaus/proofs`, no
+  permission rule lets an agent's tool write: `.crewhaus/run` (the runfiles, logs
+  and control files a daemon keeps there); the settings file
+  `.crewhaus/settings.json`; what a harness's gates and janitors read,
+  `.crewhaus/approvals`, `.crewhaus/environments.json`, `.crewhaus/graders`,
+  `.crewhaus/judge-calibration.json`, `.crewhaus/evals`, `.crewhaus/datasets`,
+  `.crewhaus/retention.json`, `.crewhaus/audit`, `.crewhaus/graphs` and
+  `.crewhaus/advice`; the working directory's `.env`, `.env.local`,
+  `.env.development`, `.env.development.local`, `.env.production`,
+  `.env.production.local`, `.env.test` and `.env.test.local`, and any file
+  `manager.envFiles` names; its `bunfig.toml` and `.npmrc`; the `approvals.jsonl`
+  beside session logs that `CREWHAUS_SESSION_DIR` puts at the working directory;
+  a managed run's whole tenants root; and Hangar's directory and registry:
+  `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always, and wherever the
+  run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT` puts them. The floor
+  also reads the directory a call keeps a tool's store in. Only `bypass` mode
+  skips the floor, and the file tools that check their own targets refuse even
+  then, as `DatasetPut`, `SpecPin` and `DeployRollback` do for what lands in one
+  of these, and `EmitTraceEvent`, `ExperimentLedger`, `KvSet`, `KvDelete`,
+  `CounterIncrement`, `CheckpointSave`, `JournalAppend`, `BlackboardPost`,
+  `NoteWrite`, `IndexBuild` and `DedupeMark` for a record a link leads to one.
+  CrewHaus itself still writes these files, and a tool that keeps its own store
+  there, `EmitTraceEvent` in the run's own record, `DatasetPut` in
+  `.crewhaus/datasets` and `EvalBaselinePin` in `.crewhaus/evals`, still adds to
+  it. The floor refuses `HooksManage` on the harness it runs in, and
+  `EnvFileUpsert`, `SecretRotate` or `DoctorFix` on those environment files; they
+  work on other files and other harnesses as before. `Bash` and `RunCommand`
+  remain outside what the floor can see. Recompile a daemon to pick this up.
 
 ## [0.8.0] - 2026-10-25
 

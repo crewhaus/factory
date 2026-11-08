@@ -349,7 +349,8 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * `beneath` when it reads or writes what is inside (StateExport, which
  * dumps every file under its `stateDir`). The runtime-state floor reads a
  * relocating path as any path it writes, unless it lies in the run's record or
- * the tool reads it whole.
+ * in the gate record that is the field's own store (`DatasetPut`'s registry,
+ * `EvalBaselinePin`'s evals), or the tool reads it whole.
  *
  * `env`, for a `command` only, names a top-level field holding the
  * variables the call sets in the child's environment, a map of names to
@@ -754,7 +755,9 @@ export interface ToolDefinition<TInput = unknown> {
    * it writes to the clipboard, or stops a process by a handle only this
    * session has. A rule with an argument pattern is then matched against the
    * call's string values, exactly as for a tool that declares nothing, and
-   * `crewhaus lint` points out that such a rule scopes nothing.
+   * `crewhaus lint` points out that such a rule scopes nothing. The runtime-state
+   * floor reads those strings as paths for a tool that declares nothing, and
+   * reads none of them for one that declares `[]`.
    *
    * Every builtin that is not read-only, or is `scope: "external"`, declares
    * this (an empty array included); `apps/cli/src/operative-args.test.ts`

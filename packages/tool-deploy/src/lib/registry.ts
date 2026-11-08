@@ -40,8 +40,17 @@ import { join, relative, sep } from "node:path";
 import { contentHash, registrySpecName } from "@crewhaus/spec-changelog";
 import type { Manifest, RegistryAdapter } from "@crewhaus/spec-registry";
 import { SpecRegistryError } from "@crewhaus/spec-registry";
-import type { SafePath } from "../paths";
-import { type Failure, type Loaded, containUnder, fail, probeName, render } from "./result";
+import { protectedRootHolding } from "@crewhaus/tool-safety/fs";
+import { type SafePath, workspaceRoot } from "../paths";
+import {
+  type Failure,
+  type Loaded,
+  contain,
+  containUnder,
+  fail,
+  probeName,
+  render,
+} from "./result";
 
 /** Default registry root, matching `@crewhaus/spec-registry`'s file backend. */
 export const DEFAULT_REGISTRY_RELDIR = ".crewhaus/specs";
@@ -214,13 +223,53 @@ export function containSpecPaths(
   registryName: string,
   versions: ReadonlyArray<string>,
 ): Failure | undefined {
-  const rels = [
+  return containUnder(toolName, root, specPathRels(registryName, versions));
+}
+
+/** Every path under a registry root a call for this spec can open. */
+function specPathRels(registryName: string, versions: ReadonlyArray<string>): string[] {
+  return [
     registryName,
     `${registryName}/${MANIFEST_FILENAME}`,
     `${registryName}/${CHANGELOG_FILENAME}`,
     ...versions.map((v) => `${registryName}/${versionFilename(v)}`),
   ];
-  return containUnder(toolName, root, rels);
+}
+
+/** The paths under a registry root a tenant-scoped call reads or writes. */
+function tenantPathRels(tenantId: string, registryName: string): string[] {
+  return [
+    TENANTS_DIRNAME,
+    `${TENANTS_DIRNAME}/${tenantId}`,
+    `${TENANTS_DIRNAME}/${tenantId}/${registryName}.json`,
+  ];
+}
+
+/**
+ * The protected root a call for this spec would land in, wherever its names
+ * resolve, or `undefined`. The floor reads the registry the call names; this
+ * reads each name below it, links at the leaves included.
+ */
+export function protectedRootOfSpec(
+  toolName: string,
+  root: SafePath,
+  registryName: string,
+  versions: ReadonlyArray<string>,
+  tenant: string | undefined,
+  protectedRoots: readonly string[],
+): string | undefined {
+  if (protectedRoots.length === 0) return undefined;
+  const rels = [
+    ...specPathRels(registryName, versions),
+    ...(tenant !== undefined ? tenantPathRels(tenant, registryName) : []),
+  ];
+  for (const rel of rels) {
+    const leaf = contain(toolName, root.rel === "" ? rel : `${root.rel}/${rel}`);
+    if (!leaf.ok) continue;
+    const hit = protectedRootHolding(leaf.value.real, protectedRoots, workspaceRoot());
+    if (hit !== undefined) return hit;
+  }
+  return undefined;
 }
 
 /**
@@ -275,11 +324,7 @@ export function containTenantPaths(
   tenantId: string,
   registryName: string,
 ): Failure | undefined {
-  return containUnder(toolName, root, [
-    TENANTS_DIRNAME,
-    `${TENANTS_DIRNAME}/${tenantId}`,
-    `${TENANTS_DIRNAME}/${tenantId}/${registryName}.json`,
-  ]);
+  return containUnder(toolName, root, tenantPathRels(tenantId, registryName));
 }
 
 // ---------------------------------------------------------------------------

@@ -175,7 +175,8 @@ puts the reason in its result:
 - An env var name is parsed to `^[A-Z_][A-Z0-9_]*$` before it is written,
   because the fixer writes `# ${name}=` verbatim and a name carrying a newline
   would append an uncommented line to the operator's `.env`. There is no field
-  anywhere in these schemas to pass a credential VALUE.
+  anywhere in these schemas to pass a credential VALUE. `DoctorFix`'s defaults
+  name `.env`, so name another `envPath` for a run in its own harness.
 - A scaffolded spec's name is parsed the same way, for the same reason: it is
   interpolated into the YAML. The charset check is the injection floor and not
   the whole gate — the scaffolded document is re-parsed before it is written,

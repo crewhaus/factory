@@ -17,8 +17,9 @@
  *                   `EvaluateOptions.protectedRoots` (the session logs,
  *                   spilled tool results and proof bundles the gates read as
  *                   evidence, and the files that control the run: the
- *                   harness's run files and settings, Hangar's directory), nor
- *                   acts beneath a workspace directory that holds one
+ *                   harness's run files, settings, gate records and
+ *                   environment files, Hangar's directory), nor acts beneath a
+ *                   workspace directory that holds one
  *
  * Rule sources (priority high → low)
  *   flag → settings → yaml → hooks → builtin
@@ -151,7 +152,7 @@ export type EvaluateOptions = {
    * a writer that acts beneath it checks its own targets against the same
    * roots, which the runtime hands it on the bridge
    * (`RuntimeBridge.protectedRoots`; CopyPath, MovePath, RemovePath,
-   * ArchiveExtract, GitApplyPatch). Neither can see where a shell command
+   * ArchiveExtract, GitApplyPatch, SpecPin, DeployRollback). Neither can see where a shell command
    * writes: `Bash` / `RunCommand` stay a documented residual, closed only by
    * keyed integrity on the log lines themselves (a MAC with a key outside
    * the tree the agent can write), as does `bypass` mode.
@@ -405,7 +406,8 @@ function insideWorkspace(key: string): boolean {
  * spelling the runtime's canonicaliser gives (workspace-relative and
  * absolute, symlinks followed, the name as sent), case folded where the
  * filesystem folds it — or, for a tool that declares none, from the strings
- * in its input as written. A path is caught when it IS a protected root or
+ * in its input as written (the runtime passes empty `floorValues` for one that
+ * declares `[]`, whose strings are text). A path is caught when it IS a protected root or
  * lies under one (`inside`), and a directory the call acts BENEATH (its
  * value's `beneath` prefixes: a tree removed, emptied, imported into or
  * migrated onto) when a root lies under it (`above`) — `.crewhaus` for the
@@ -514,7 +516,7 @@ export function evaluateWithReason(
   const floorHit = protectedRootHit(call, opts);
   if (floorHit !== undefined) {
     const RECORD =
-      "the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files and settings, Hangar's directory)";
+      "the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory)";
     return {
       decision: "deny",
       reason:

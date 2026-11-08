@@ -26,6 +26,7 @@ import {
   protectedRootsBeneath,
   protectedRootsOf,
   protectedWriteRefusal,
+  rootsBesideStore,
 } from "./protected";
 
 let ws: string;
@@ -101,7 +102,7 @@ describe("protected roots", () => {
       "would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles)",
     );
     expect(text).toContain(
-      "or the files that control it (the harness's run files and settings, Hangar's directory)",
+      "or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory)",
     );
     expect(text).toContain("Nothing was written.");
     expect(
@@ -306,5 +307,75 @@ describe("protectedRootLinkedInto", () => {
   });
   test("no roots, no answer", () => {
     expect(protectedRootLinkedInto("a", "b", [], realpathSync(ws))).toBe(undefined);
+  });
+});
+
+describe("rootsBesideStore: the root a tool keeps its own store in, left out", () => {
+  const STORE = ".crewhaus/datasets";
+  test("the store's spellings go, every other root stays", () => {
+    const real = realpathSync(ws);
+    const roots = [
+      join(real, STORE),
+      join(".crewhaus", "datasets"),
+      join(real, ".crewhaus", "run"),
+      join(".crewhaus", "run"),
+      join(real, ".crewhaus", "datasets.bak"),
+    ];
+    expect(rootsBesideStore(STORE, roots, real)).toEqual([
+      join(real, ".crewhaus", "run"),
+      join(".crewhaus", "run"),
+      join(real, ".crewhaus", "datasets.bak"),
+    ]);
+  });
+  test("a store that is no root changes nothing", () => {
+    const real = realpathSync(ws);
+    const roots = [join(real, ".crewhaus", "run"), join(".crewhaus", "run")];
+    expect(rootsBesideStore(STORE, roots, real)).toEqual(roots);
+  });
+  test("a root that holds the store, and one inside it, stay", () => {
+    const real = realpathSync(ws);
+    const roots = [real, join(real, STORE, "inner")];
+    expect(rootsBesideStore(STORE, roots, real)).toEqual(roots);
+  });
+  test("an operator's link above the store: the place it leads to goes with it", () => {
+    const real = realpathSync(ws);
+    mkdirSync(join(real, "data", "crew"), { recursive: true });
+    const linked = join(real, "harness");
+    mkdirSync(linked);
+    symlinkSync(join("..", "data", "crew"), join(linked, ".crewhaus"));
+    const roots = [
+      join(linked, STORE),
+      join(".crewhaus", "datasets"),
+      join(real, "data", "crew", "datasets"),
+      join(real, "data", "crew", "run"),
+    ];
+    expect(rootsBesideStore(STORE, roots, linked)).toEqual([join(real, "data", "crew", "run")]);
+  });
+  test("a working directory reached through a link: a root's relative name goes with it", () => {
+    const real = realpathSync(ws);
+    mkdirSync(join(real, "target", "harness", "data", "crew"), { recursive: true });
+    symlinkSync(join(real, "target"), join(real, "via"));
+    const cwd = join(real, "via", "harness");
+    symlinkSync(join("data", "crew"), join(cwd, ".crewhaus"));
+    const roots = [
+      join(cwd, STORE),
+      join(".crewhaus", "datasets"),
+      join("data", "crew", "datasets"),
+      join("data", "crew", "run"),
+    ];
+    expect(rootsBesideStore(STORE, roots, cwd)).toEqual([join("data", "crew", "run")]);
+  });
+  test("a link at the store itself keeps where it leads, so another root still holds it", () => {
+    const real = realpathSync(ws);
+    mkdirSync(join(real, ".crewhaus", "run"), { recursive: true });
+    symlinkSync("run", join(real, ".crewhaus", "datasets"));
+    const run = join(real, ".crewhaus", "run");
+    const roots = [join(real, STORE), run];
+    const beside = rootsBesideStore(STORE, roots, real);
+    expect(beside).toEqual([run]);
+    expect(protectedRootHolding(STORE, beside, real)).toBe(run);
+  });
+  test("no roots, no store's", () => {
+    expect(rootsBesideStore(STORE, [], realpathSync(ws))).toEqual([]);
   });
 });

@@ -1848,7 +1848,7 @@ function placeGlob(arg: OperativeArgLike): string {
       return "git status";
     default: {
       // A secret reference, named where it lives.
-      if (arg.secretRef === true) return "envfile:.env#DEPLOY_*";
+      if (arg.secretRef === true) return "envfile:deploy.env#DEPLOY_*";
       if (arg.within !== undefined) {
         const qualifier = QUALIFIER_SAMPLES[arg.within] ?? "prod";
         return arg.prefix === true ? `${qualifier}/**` : `${qualifier}/*`;
