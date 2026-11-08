@@ -376,6 +376,8 @@ export const SECURITY_SURFACES: ReadonlyArray<{
    * `roles.r` and every `sub_agents.<n>` alike.
    */
   readonly anywhere?: true;
+  /** Match this path only, not the fields under it: a block whose own dials stay tunable. */
+  readonly exact?: true;
 }> = [
   {
     prefix: ["permissions"],
@@ -428,6 +430,11 @@ export const SECURITY_SURFACES: ReadonlyArray<{
     reason: "the transaction policy gates on-chain writes and approvals",
   },
   {
+    prefix: ["idempotencyWindowMs"],
+    reason:
+      "the idempotency window decides how long an event or job already acted on is not acted on again",
+  },
+  {
     prefix: ["mcp_servers"],
     reason:
       "an MCP server is third-party code plus its credentials — write it through the connectors tab",
@@ -470,6 +477,107 @@ export const SECURITY_SURFACES: ReadonlyArray<{
     reason:
       "the profile allowlist is what a model-filled Task profile argument is validated against — a roster decision for the child",
   },
+  // A step, a node and a role each carry their own copy of these, and one row
+  // covers all three. Last, so a narrower row's reason answers first.
+  {
+    prefix: ["tools"],
+    anywhere: true,
+    reason: "the tool list decides what this agent can do",
+  },
+  // This group keeps its own `tool_config` row, so a step's, node's or role's
+  // tool config is human-owned whatever the root row above matches.
+  {
+    prefix: ["tool_config"],
+    anywhere: true,
+    reason: "tool config decides what the agent's tools may reach",
+  },
+  {
+    prefix: ["permissions"],
+    anywhere: true,
+    reason:
+      "permissions decide what the agent may do — a widened rule is a security change, not a quality one",
+  },
+  {
+    prefix: ["mcp_servers"],
+    anywhere: true,
+    reason:
+      "an MCP server is third-party code plus its credentials — write it through the connectors tab",
+  },
+  {
+    prefix: ["hitl"],
+    anywhere: true,
+    reason: "a human gate decides where a person signs off on the work",
+  },
+  {
+    prefix: ["model"],
+    anywhere: true,
+    reason:
+      "the model roster is never auto-patched: a swap moves cost, latency and behaviour at once",
+  },
+  {
+    prefix: ["model_pool"],
+    anywhere: true,
+    reason: "the candidate pool decides which models may serve traffic",
+  },
+  // A whole step, node or role, and the list or map that holds them: one value
+  // there can carry every row above at once. A field inside one
+  // (`steps[0].instructions`) is classified on its own.
+  {
+    prefix: ["steps"],
+    exact: true,
+    reason:
+      "the step list holds each step's tools, permissions, models and human gates; a step's own fields stay tunable one at a time",
+  },
+  {
+    prefix: ["steps", WILDCARD_SEGMENT],
+    exact: true,
+    reason:
+      "a step holds its own tools, permissions, models and human gates; its fields stay tunable one at a time",
+  },
+  {
+    prefix: ["nodes"],
+    exact: true,
+    reason:
+      "the node map holds each node's tools, permissions, models and human gates; a node's own fields stay tunable one at a time",
+  },
+  {
+    prefix: ["nodes", WILDCARD_SEGMENT],
+    exact: true,
+    reason:
+      "a node holds its own tools, permissions, models and human gate; its fields stay tunable one at a time",
+  },
+  {
+    prefix: ["roles"],
+    exact: true,
+    reason:
+      "the role map holds each role's tools, permissions and models; a role's own fields stay tunable one at a time",
+  },
+  {
+    prefix: ["roles", WILDCARD_SEGMENT],
+    exact: true,
+    reason:
+      "a role holds its own tools, permissions and models; its fields stay tunable one at a time",
+  },
+  // On-chain bindings. A policy that allows a contract by id reads the address
+  // from these, so they sit beside `contracts` and `chains`.
+  {
+    prefix: ["game", "contract"],
+    reason: "the game contract binding decides which address is called",
+  },
+  {
+    prefix: ["game", "actionsContract"],
+    reason: "the actions contract decides which address a move is sent to",
+  },
+  {
+    prefix: ["game"],
+    exact: true,
+    reason:
+      "the game block holds the contract bindings; its objective and timing stay tunable one field at a time",
+  },
+  {
+    prefix: ["triggers"],
+    reason: "triggers decide which addresses and events wake the agent",
+  },
   // Every security row of the owner-keys table, derived, never a hand copy.
   ...DELTA_090_KEYS.filter((key) => key.security).map((key) => ({
     prefix: key.pattern,
@@ -488,11 +596,14 @@ function isPrefix(prefix: readonly string[], path: readonly string[]): boolean {
   return matchesFrom(prefix, path, 0);
 }
 
-/** A security-surface row matches a path root-anchored, or anywhere when the row says so. */
+/** A security-surface row matches a path root-anchored, or anywhere or exactly when the row says so. */
 function surfaceMatches(
   surface: (typeof SECURITY_SURFACES)[number],
   path: readonly string[],
 ): boolean {
+  if (surface.exact === true) {
+    return path.length === surface.prefix.length && isPrefix(surface.prefix, path);
+  }
   if (surface.anywhere !== true) return isPrefix(surface.prefix, path);
   for (let start = 0; start + surface.prefix.length <= path.length; start++) {
     if (matchesFrom(surface.prefix, path, start)) return true;

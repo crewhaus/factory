@@ -1249,6 +1249,143 @@ describe("watchme synthesize", () => {
     expect(afterApply).toContain("model: anthropic/claude-sonnet-4");
   });
 
+  test("a security surface in a proposal is labelled human-owned and takes the typed confirmation", async () => {
+    const t = boot();
+    const dir = fabricHarness(t);
+    const synth = join(dir, ".crewhaus", "watchme", "synthesized");
+    mkdirSync(synth, { recursive: true });
+    writeFileSync(
+      join(synth, "20260803T000000Z.yaml"),
+      [
+        "name: fabric-mimic",
+        "target: cli",
+        "agent:",
+        "  model: anthropic/claude-sonnet-4",
+        "  instructions: |",
+        "    You are a fixture. Answer briefly.",
+        "security:",
+        "  justification:",
+        "    judge: rule-based",
+        "transaction_policy:",
+        "  defaultWriteApproval: policy",
+        "  maxValueWei: '1000000'",
+        "  simulationRequired: false",
+        "  allowedContracts: []",
+        "",
+      ].join("\n"),
+    );
+    const id = await register(t, dir);
+    const specBefore = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
+
+    const listed = await t.api(`/api/h/${id}/memory/watchme/synthesized`);
+    const proposals = listed.body["proposals"] as Array<Record<string, unknown>>;
+    const edits = proposals[0]?.["edits"] as Array<Record<string, unknown>>;
+    const surfaceEdits = edits.filter((e) =>
+      /^(transaction_policy|security)/.test(String(e["path"])),
+    );
+    expect(surfaceEdits.length).toBeGreaterThan(0);
+    for (const edit of surfaceEdits) {
+      expect(`${String(edit["path"])}:${String(edit["tier"])}`).toBe(
+        `${String(edit["path"])}:human-owned`,
+      );
+    }
+
+    const route = `/api/h/${id}/memory/watchme/synthesized/20260803T000000Z/apply`;
+    for (const path of [
+      "transaction_policy",
+      "transaction_policy.defaultWriteApproval",
+      "transaction_policy.maxValueWei",
+      "transaction_policy.simulationRequired",
+      "security.justification",
+    ]) {
+      const { body } = await t.api(route, {
+        method: "POST",
+        body: JSON.stringify({ edits: [path], confirm: true }),
+      });
+      expect(`${path}:${String(body["code"])}:${String(body["applied"])}`).toBe(
+        `${path}:needs_typed_confirm:false`,
+      );
+      expect(body["tier"]).toBe("human-owned");
+      expect((body["diff"] as unknown[]).length).toBeGreaterThan(0);
+      expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(specBefore);
+    }
+
+    // One human-owned path holds the batch.
+    const mixed = await t.api(route, {
+      method: "POST",
+      body: JSON.stringify({
+        edits: ["agent.instructions", "transaction_policy"],
+        confirm: true,
+      }),
+    });
+    expect(mixed.body["code"]).toBe("needs_typed_confirm");
+    expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(specBefore);
+
+    // A wrong name is not the confirmation.
+    const wrongName = await t.api(route, {
+      method: "POST",
+      body: JSON.stringify({
+        edits: ["transaction_policy"],
+        confirm: true,
+        confirmName: "not-fabric",
+      }),
+    });
+    expect(wrongName.body["code"]).toBe("needs_typed_confirm");
+    expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(specBefore);
+
+    // The typed confirmation is what carries it.
+    const confirmed = await t.api(route, {
+      method: "POST",
+      body: JSON.stringify({ edits: ["transaction_policy"], confirm: true, confirmName: "fabric" }),
+    });
+    expect(confirmed.body["applied"]).toBe(true);
+    expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toContain("simulationRequired: false");
+  });
+
+  test("a proposal that adds a whole step takes the typed confirmation", async () => {
+    const t = boot();
+    const dir = fabricHarness(t);
+    const workflow = (steps: readonly string[]): string =>
+      [
+        "name: fabric",
+        "target: workflow",
+        "model: anthropic/claude-sonnet-4",
+        "steps:",
+        ...steps,
+        "",
+      ].join("\n");
+    const draft = ["  - name: draft", "    instructions: Draft it."];
+    const ship = ["  - name: ship", "    instructions: Ship it.", "    tools:", "      - Bash"];
+    writeFileSync(join(dir, "crewhaus.yaml"), workflow(draft));
+    const synth = join(dir, ".crewhaus", "watchme", "synthesized");
+    mkdirSync(synth, { recursive: true });
+    writeFileSync(join(synth, "20260804T000000Z.yaml"), workflow([...draft, ...ship]));
+    const id = await register(t, dir);
+    const specBefore = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
+
+    const listed = await t.api(`/api/h/${id}/memory/watchme/synthesized`);
+    const proposals = listed.body["proposals"] as Array<Record<string, unknown>>;
+    const edits = proposals[0]?.["edits"] as Array<Record<string, unknown>>;
+    const added = edits.find((e) => String(e["path"]) === "steps[1]");
+    expect(added?.["tier"]).toBe("human-owned");
+
+    const route = `/api/h/${id}/memory/watchme/synthesized/20260804T000000Z/apply`;
+    const unconfirmed = await t.api(route, {
+      method: "POST",
+      body: JSON.stringify({ edits: ["steps[1]"], confirm: true }),
+    });
+    expect(unconfirmed.body["code"]).toBe("needs_typed_confirm");
+    expect(unconfirmed.body["applied"]).toBe(false);
+    expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(specBefore);
+
+    const confirmed = await t.api(route, {
+      method: "POST",
+      body: JSON.stringify({ edits: ["steps[1]"], confirm: true, confirmName: "fabric" }),
+    });
+    expect(confirmed.body["applied"]).toBe(true);
+    expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toContain("Bash");
+  });
+
   test("publish previews the articles it would upsert before it can run", async () => {
     const t = boot();
     const dir = fabricHarness(t);

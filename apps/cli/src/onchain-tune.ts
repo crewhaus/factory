@@ -44,6 +44,8 @@ export type ReceiptRecord = {
 
 /** The current transaction_policy (subset the tuner reads/proposes). */
 export type CurrentPolicy = {
+  /** Carried through unchanged: who approves a write is not the tuner's call. */
+  readonly defaultWriteApproval?: string;
   readonly maxValueWei?: string;
   readonly allowedContracts?: readonly string[];
   readonly simulationRequired?: boolean;
@@ -216,6 +218,9 @@ export function proposePolicy(
   if (opts.optimizable && proposedMaxValueWei !== undefined) {
     // Whole-block replace so the write-back preserves the other policy fields.
     const value: Record<string, unknown> = {
+      ...(current.defaultWriteApproval !== undefined
+        ? { defaultWriteApproval: current.defaultWriteApproval }
+        : {}),
       ...(current.simulationRequired !== undefined
         ? { simulationRequired: current.simulationRequired }
         : { simulationRequired: true }),
