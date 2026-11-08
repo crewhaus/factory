@@ -815,7 +815,7 @@ printf 'Name:      %s\\nMediaType: application/vnd.oci.image.index.v1+json\\nDig
         _comment: "Pinned image digests.",
         _format_version: 1,
         cli: {
-          "0.8.0": { sha256: `sha256:${"a".repeat(64)}`, builtAt: "2026-10-25T00:00:00.000Z" },
+          "1.0.0": { sha256: `sha256:${"a".repeat(64)}`, builtAt: "2026-01-01T00:00:00.000Z" },
         },
       };
       writeFileSync(join(seed, DIGESTS), `${JSON.stringify(initial, null, 2)}\n`);
@@ -829,7 +829,7 @@ printf 'Name:      %s\\nMediaType: application/vnd.oci.image.index.v1+json\\nDig
     function job(w: ReturnType<typeof world>, meanwhile: () => void): Run {
       const checkout = join(w.dir, "job");
       w.git(w.dir, "clone", "-q", w.origin, checkout);
-      const stepEnv = w.env({ VERSION: "0.9.0", TARGETS_JSON: '["cli"]' });
+      const stepEnv = w.env({ VERSION: "2.0.0", TARGETS_JSON: '["cli"]' });
       const recorded = runStep(RECORD, { cwd: checkout, env: stepEnv });
       expect(recorded.stderr).toBe("");
       expect(recorded.exitCode).toBe(0);
@@ -846,7 +846,7 @@ printf 'Name:      %s\\nMediaType: application/vnd.oci.image.index.v1+json\\nDig
           process.execPath,
           join(ROOT, "scripts", "record-image-digests.ts"),
           "--version",
-          "0.8.1",
+          "1.1.0",
           "--targets",
           "cli",
           "--digests",
@@ -860,7 +860,7 @@ printf 'Name:      %s\\nMediaType: application/vnd.oci.image.index.v1+json\\nDig
         },
       );
       expect(r.exitCode).toBe(0);
-      w.git(other, "commit", "-q", "-am", "chore(release): record GHCR image digests for v0.8.1");
+      w.git(other, "commit", "-q", "-am", "chore(release): record GHCR image digests for v1.1.0");
       w.git(other, "push", "-q", "origin", "HEAD:main");
     }
 
@@ -880,20 +880,20 @@ printf 'Name:      %s\\nMediaType: application/vnd.oci.image.index.v1+json\\nDig
         "push attempt 1 failed — re-recording on a fresh origin/main and retrying",
       );
       const digests = mainDigests(w);
-      expect(Object.keys(digests.cli)).toEqual(["0.8.0", "0.8.1", "0.9.0"]);
+      expect(Object.keys(digests.cli)).toEqual(["1.0.0", "1.1.0", "2.0.0"]);
       expect(digests._comment).toBe("Pinned image digests.");
       expect(digests._format_version).toBe(1);
-      expect(digests.cli["0.9.0"]?.sha256).toBe(`sha256:${"b".repeat(64)}`);
+      expect(digests.cli["2.0.0"]?.sha256).toBe(`sha256:${"b".repeat(64)}`);
       // Re-recorded once, for exactly the docker job's targets; never a rebase.
       expect(lines(join(w.dir, "bun.log"))).toEqual([
-        "--version 0.9.0 --targets cli",
-        "--version 0.9.0 --targets cli",
+        "--version 2.0.0 --targets cli",
+        "--version 2.0.0 --targets cli",
       ]);
       expect(
         w.git(w.dir, "--git-dir", w.origin, "log", "--format=%s", "main").trim().split("\n"),
       ).toEqual([
-        "chore(release): record GHCR image digests for v0.9.0",
-        "chore(release): record GHCR image digests for v0.8.1",
+        "chore(release): record GHCR image digests for v2.0.0",
+        "chore(release): record GHCR image digests for v1.1.0",
         "seed",
       ]);
     }, 30_000);
@@ -903,8 +903,8 @@ printf 'Name:      %s\\nMediaType: application/vnd.oci.image.index.v1+json\\nDig
       const r = job(w, () => {});
       expect(r.exitCode).toBe(0);
       expect(r.stdout).not.toContain("push attempt");
-      expect(lines(join(w.dir, "bun.log"))).toEqual(["--version 0.9.0 --targets cli"]);
-      expect(Object.keys(mainDigests(w).cli)).toEqual(["0.8.0", "0.9.0"]);
+      expect(lines(join(w.dir, "bun.log"))).toEqual(["--version 2.0.0 --targets cli"]);
+      expect(Object.keys(mainDigests(w).cli)).toEqual(["1.0.0", "2.0.0"]);
     }, 30_000);
 
     test("a main that refuses every push: three attempts, two re-records, then the error", () => {
