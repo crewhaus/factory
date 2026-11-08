@@ -87,6 +87,12 @@ import {
 } from "@crewhaus/harness-supervisor";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  protectedRootBeneath,
+  protectedRootHolding,
+  protectedRootsOf,
+  protectedWriteRefusal,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   CLI_VERSION_RE,
@@ -945,7 +951,7 @@ export const compileBundle: RegisteredTool = buildTool({
   destructive: true,
   scope: "external",
   ioCapability: "process",
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const tool = "CompileBundle";
     const dryRun = input.dryRun ?? true;
     const root = workspaceRoot();
@@ -1004,6 +1010,29 @@ export const compileBundle: RegisteredTool = buildTool({
           ? { resolved: false }
           : { resolved: true, bin: cli.bin, where: cli.where, inWorkspace: cli.inWorkspace },
     };
+
+    // The working directory's own compile is the run's to ask for, and the
+    // floor leaves it to the rules. Any other directory's output, entry and
+    // manifest stay out of the runtime-state roots, with links followed, and
+    // its output directory holds none of them, since the install writes
+    // `node_modules` and the lockfile there: before the dryRun branch, so the
+    // preview and the real call refuse identically.
+    if (safe.value.rel !== "") {
+      const roots = protectedRootsOf(ctx);
+      const output = path.join(harness, outDir);
+      const written = [
+        output,
+        ...(located === undefined
+          ? []
+          : [located.entryPath, path.join(located.bundleDir, "package.json")]),
+      ];
+      if (
+        written.some((name) => protectedRootHolding(name, roots, root) !== undefined) ||
+        protectedRootBeneath(output, roots, root) !== undefined
+      ) {
+        return refusal(tool, "refused", protectedWriteRefusal(tool, `compiling ${shownDir}`), view);
+      }
+    }
 
     if (dryRun) {
       return json({

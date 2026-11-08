@@ -522,7 +522,7 @@ describe("0.8.0 — the runtime-state floor (protectedRoots)", () => {
     });
     expect(above.decision).toBe("deny");
     expect(above.reason).toBe(
-      "`ArchiveExtract` is not read-only and acts on everything beneath `.crewhaus`, where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory) — no rule can allow that",
+      "`ArchiveExtract` is not read-only and acts on everything beneath `.crewhaus`, where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records, environment files, compiled bundle and dependencies, Hangar's directory) — no rule can allow that",
     );
   });
 
@@ -826,7 +826,7 @@ describe("the runtime-state floor: the files that control a run, one root an exa
   ];
   const RECORD = "where the runtime keeps its own record of the run";
   const CONTROL =
-    "or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory) — no rule can allow that";
+    "or the files that control it (the harness's run files, settings, gate records, environment files, compiled bundle and dependencies, Hangar's directory) — no rule can allow that";
   type Value = NonNullable<ToolCallContext["operativeValues"]>[number];
   const writing = (name: string, value: Value, toolName = "Write"): ToolCallContext => ({
     toolName,
@@ -1625,5 +1625,119 @@ describe("the runtime-state floor: a root under the spellings a folding filesyst
 
   test("a name of dots a megabyte long is read in one pass", () => {
     expect(decision(call(`${".".repeat(1 << 20)}x/y`, { caseInsensitive: true }))).toBe("allow");
+  });
+});
+
+describe("the names a tool that declares no paths uses in its text", () => {
+  const ABSOLUTE = "/srv/ws/dist";
+  const ROOTS = ["dist", "build", "node_modules", ".env", "crewhaus.yaml", ABSOLUTE];
+  const allow: RuleSet = { ...emptyRuleSet, flag: [rule("alwaysAllow", "*", "flag")] };
+  /** A tool with no declared fields: every MCP tool, which is never read-only. */
+  const mcp = (input: Record<string, unknown>): ToolCallContext => ({
+    toolName: "mcp__server__do_thing",
+    input,
+    readOnly: false,
+    destructive: false,
+  });
+  const decide = (call: ToolCallContext, roots: readonly string[] = ROOTS) =>
+    evaluateWithReason(call, "auto", allow, { protectedRoots: roots });
+
+  test("is not a path: labels, a channel, a branch and a title with those names", () => {
+    for (const input of [
+      { labels: ["build"] },
+      { channel: "dist" },
+      { head: "build/fix-ci" },
+      { title: "Node_Modules" },
+      { title: "node_modules" },
+      { nested: { deep: ["dist/release-notes"] } },
+    ]) {
+      expect({ input, decision: decide(mcp(input)).decision }).toEqual({
+        input,
+        decision: "allow",
+      });
+    }
+  });
+
+  test("a file of another system with one of those names is not a path either", () => {
+    const roots = ["package.json", "tsconfig.json", "jsconfig.json"];
+    for (const path of roots) {
+      expect({ path, decision: decide(mcp({ path }), roots).decision }).toEqual({
+        path,
+        decision: "allow",
+      });
+    }
+  });
+
+  test("any other relative root is read, with or without a dot in it", () => {
+    for (const [root, path] of [
+      ["logs/sessions", "logs/sessions/s1.jsonl"],
+      ["home", "home/token"],
+      ["config/secrets", "config/secrets"],
+      ["secrets", "secrets"],
+      ["live/tenants", "live/tenants/a/x"],
+      ["out", "out/daemon.ts"],
+      ["sub/dist", "sub/dist/daemon.ts"],
+    ] as const) {
+      const r = decide(mcp({ path }), [root]);
+      expect({ root, decision: r.decision }).toEqual({ root, decision: "deny" });
+      expect(r.reason).toContain("no rule can allow that");
+    }
+  });
+
+  test("a dotted root is still read, and so is an absolute spelling", () => {
+    for (const input of [
+      { path: ".env" },
+      { path: "./.env" },
+      { path: "crewhaus.yaml" },
+      { path: `${ABSOLUTE}/x` },
+      { path: ABSOLUTE },
+      { nested: { deep: [".env"] } },
+    ]) {
+      const r = decide(mcp(input));
+      expect({ input, decision: r.decision }).toEqual({ input, decision: "deny" });
+      expect(r.reason).toContain("no rule can allow that");
+    }
+  });
+
+  test("a root beneath a dotted directory and a dotted name below a word stay read", () => {
+    const roots = [".crewhaus/run", "config/shared.env"];
+    expect(decide(mcp({ path: ".crewhaus/run/x" }), roots).decision).toBe("deny");
+    expect(decide(mcp({ path: "config/shared.env" }), roots).decision).toBe("deny");
+  });
+
+  test("a tool that declares its path is read whichever the root's spelling", () => {
+    for (const path of ["build/x", "dist", "node_modules/.bin/crewhaus"]) {
+      const declared: ToolCallContext = {
+        toolName: "Write",
+        input: { path, content: "x" },
+        operativeValues: [{ kind: "path", canonical: [path] }],
+        readOnly: false,
+        destructive: true,
+      };
+      const r = decide(declared);
+      expect({ path, decision: r.decision }).toEqual({ path, decision: "deny" });
+      expect(r.reason).toContain("no rule can allow that");
+    }
+  });
+
+  test("a tool the runtime names the written fields of is read the same way", () => {
+    const floorValues: NonNullable<ToolCallContext["floorValues"]> = [
+      { kind: "path", canonical: ["build/x"] },
+    ];
+    const call: ToolCallContext = { ...mcp({ path: "build/x" }), floorValues };
+    expect(decide(call).decision).toBe("deny");
+  });
+
+  test("a directory acted beneath is read the same way for a word root", () => {
+    const call: ToolCallContext = {
+      toolName: "RemovePath",
+      input: { path: "out" },
+      operativeValues: [{ kind: "path", canonical: ["out"], beneath: ["out/"] }],
+      readOnly: false,
+      destructive: true,
+    };
+    const r = decide(call, ["out/dist"]);
+    expect(r.decision).toBe("deny");
+    expect(r.reason).toContain("acts on everything beneath `out`");
   });
 });

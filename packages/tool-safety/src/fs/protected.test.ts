@@ -102,7 +102,7 @@ describe("protected roots", () => {
       "would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles)",
     );
     expect(text).toContain(
-      "or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory)",
+      "or the files that control it (the harness's run files, settings, gate records, environment files, compiled bundle and dependencies, Hangar's directory)",
     );
     expect(text).toContain("Nothing was written.");
     expect(

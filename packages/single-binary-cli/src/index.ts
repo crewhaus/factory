@@ -117,6 +117,10 @@ export async function buildBinary(opts: BuildBinaryOptions): Promise<BuildBinary
     "bun",
     "build",
     "--compile",
+    // The binary is started in other people's projects, and reads its own
+    // settings: a `bunfig.toml` in the working directory is theirs. Tools it
+    // runs as child processes still read one. `.env` loading is unaffected.
+    "--no-compile-autoload-bunfig",
     "--target",
     bunCompileTarget(t),
     // Embed the version: inside a compiled binary import.meta.url points

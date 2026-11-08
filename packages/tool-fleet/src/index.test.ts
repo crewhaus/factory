@@ -22,7 +22,7 @@
  * The compile tests spawn a fixture CLI and are given an explicit budget: CI
  * is a loaded two-core box. None of them asserts on elapsed time.
  */
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -751,6 +751,95 @@ test("CompileBundle reports a failed compile with its output and leaves the stal
   expect(readFileSync(path.join(tmp, "h1", "dist", "package.json"), "utf8")).toContain(oldStamp);
   expect(at(r, "after", "verdict")).toBe("stale");
 }, 30_000);
+
+describe("CompileBundle and the runtime-state roots on its bridge", () => {
+  const withRoots = async (input: unknown, roots: readonly string[]): Promise<Json> => {
+    const raw = await compileBundle.execute(
+      input as never,
+      {
+        bridge: { protectedRoots: roots },
+      } as never,
+    );
+    return JSON.parse(String(raw)) as Json;
+  };
+  /** A protected bundle at `dist`, and a sibling harness whose bundle directory is `linked`. */
+  const seed = (linked: "dir" | "entry" | "manifest"): void => {
+    write("dist/daemon.ts", "// the bundle\n");
+    write("dist/package.json", '{"name":"crewhaus-compiled-bundle"}\n');
+    harness("other", "name: other\ntarget: channel\n");
+    if (linked === "dir") {
+      symlinkSync(path.join("..", "dist"), path.join(tmp, "other", "dist"));
+      return;
+    }
+    mkdirSync(path.join(tmp, "other", "dist"));
+    const up = path.join("..", "..", "dist");
+    const [name, other] =
+      linked === "entry" ? ["daemon.ts", "package.json"] : ["package.json", "daemon.ts"];
+    symlinkSync(path.join(up, name), path.join(tmp, "other", "dist", name));
+    write(path.join("other", "dist", other), "{}\n");
+  };
+
+  for (const linked of ["dir", "entry", "manifest"] as const) {
+    for (const dryRun of [true, false]) {
+      test(`a sibling whose ${linked} leads into a root is refused, dryRun ${dryRun}`, async () => {
+        seed(linked);
+        fakeCli("other", "#!/bin/sh\nprintf changed > dist/daemon.ts\nexit 0\n");
+        const out = await withRoots(
+          { dir: "other", target: "channel", dryRun, allowExternalCli: true },
+          ["dist"],
+        );
+        expect(out["status"]).toBe("refused");
+        expect(String(out["reason"])).toContain("CompileBundle: refused — compiling other");
+        expect(String(out["reason"])).toContain("compiled bundle and dependencies");
+        expect(readFileSync(path.join(tmp, "dist", "daemon.ts"), "utf8")).toBe("// the bundle\n");
+      });
+    }
+  }
+
+  // The compile writes its output there and the install adds `node_modules` and
+  // the lockfile, so an output directory that holds a root is refused too.
+  for (const [linkTo, roots] of [
+    ["..", ["dist"]],
+    [path.join("..", "state"), [path.join("state", "run")]],
+  ] as const) {
+    for (const dryRun of [true, false]) {
+      test(`a sibling whose output directory leads to ${linkTo}, which holds a root, is refused, dryRun ${dryRun}`, async () => {
+        write("dist/daemon.ts", "// the bundle\n");
+        write("state/run/control-token", "token\n");
+        harness("other", "name: other\ntarget: channel\n");
+        symlinkSync(linkTo, path.join(tmp, "other", "dist"));
+        fakeCli("other", '#!/bin/sh\nprintf changed > "$4/written"\nexit 0\n');
+        const out = await withRoots(
+          { dir: "other", target: "channel", dryRun, allowExternalCli: true },
+          roots,
+        );
+        expect(out["status"]).toBe("refused");
+        expect(String(out["reason"])).toContain("CompileBundle: refused — compiling other");
+        expect(existsSync(path.join(tmp, "written"))).toBe(false);
+        expect(existsSync(path.join(tmp, "state", "written"))).toBe(false);
+      });
+    }
+  }
+
+  test("a sibling that stays out of the roots goes on, and the working directory's own too", async () => {
+    harness("other", "name: other\ntarget: channel\n");
+    write("other/dist/daemon.ts", "// its own\n");
+    write("other/dist/package.json", '{"name":"crewhaus-compiled-bundle"}\n');
+    const sibling = await withRoots({ dir: "other", target: "channel" }, ["dist"]);
+    expect(sibling["status"]).toBe("preview");
+
+    write("crewhaus.yaml", "name: here\ntarget: channel\n");
+    write("dist/daemon.ts", "// the bundle\n");
+    write("dist/package.json", '{"name":"crewhaus-compiled-bundle"}\n');
+    const own = await withRoots({ dir: ".", target: "channel" }, ["dist"]);
+    expect(own["status"]).toBe("preview");
+  });
+
+  test("with no roots on the bridge, the sibling is the rules' to decide", async () => {
+    seed("dir");
+    expect((await withRoots({ dir: "other", target: "channel" }, []))["status"]).toBe("preview");
+  });
+});
 
 test("CompileBundle hands the compile a minimal environment, forwarding only what it was asked to", async () => {
   harness("h1");

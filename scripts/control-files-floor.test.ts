@@ -5,9 +5,10 @@
  * janitors keep, its environment files, the `bunfig.toml` and `.npmrc` in the
  * working directory, a managed run's tenants root, and Hangar's directory and
  * registry file (every Hangar root the run's environment names, and
- * `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always). These are the
- * operator's configuration and the harness's records, so its own tools are not
- * the ones that write them. Held here with runtime-core's own roots
+ * `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always), and in a
+ * harness's own directory what its next start runs. These are the operator's
+ * configuration and the harness's records, so its own tools are not the ones
+ * that write them. Held here with runtime-core's own roots
  * (`runtimeStateRoots`), from these sides:
  *
  * - the write matrix: every builtin that is not read-only, through each path
@@ -21,6 +22,8 @@
  *   floor protects;
  * - a tool that keeps its own store in a gate record, and CrewHaus's library
  *   writers, go on adding to it.
+ * - in a harness's own directory, the real Write, Edit and the tools that check
+ *   their own writes through the run, then the real spawn plan and a real start;
  *
  * No test here writes under the real home directory: the default Hangar
  * root is only ever named in decisions, and a Write there lies outside the
@@ -43,6 +46,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { BUNDLE_MANIFEST_NAME as CLI_BUNDLE_MANIFEST_NAME } from "../apps/cli/src/bundle-manifest";
 import { writeCalibrationFileAtomic } from "../apps/cli/src/judge-calibrate";
 import type { ProviderAdapter } from "../packages/adapter-anthropic/src/index";
 import { DEFAULT_ROOT_DIR as CHECKPOINT_ROOT_DIR } from "../packages/checkpoint-store/src/index";
@@ -50,11 +54,18 @@ import { appendRetentionPins, createContinuityStore } from "../packages/continui
 import { RETENTION_CONFIG_RELPATH } from "../packages/data-retention-engine/src/retention-config";
 import { DEFAULT_EVALS_DIR } from "../packages/eval-report/src/history";
 import { JUDGE_CALIBRATION_RELPATH } from "../packages/eval-runner/src/index";
+import { BUNDLE_MANIFEST_NAME } from "../packages/harness-supervisor/src/bundle-freshness";
 import {
   MANAGER_SETTINGS_SEGMENTS,
   readManagerSettings,
 } from "../packages/harness-supervisor/src/manager-settings";
-import { ENV_FILENAMES } from "../packages/harness-supervisor/src/spawn-contracts";
+import {
+  BUNDLE_DIR_CANDIDATES,
+  ENV_FILENAMES,
+  SPEC_FILENAMES,
+  buildSpawnPlan,
+  findSpecPath,
+} from "../packages/harness-supervisor/src/spawn-contracts";
 import { RUN_DIR_SEGMENTS } from "../packages/harness-supervisor/src/types";
 import {
   BUILTIN_DEFAULT_RULES,
@@ -73,6 +84,7 @@ import { createRunContext } from "../packages/run-context/src/index";
 import { runChatLoop } from "../packages/runtime-core/src/index";
 import { placeRecordingCanonicalizer } from "../packages/runtime-core/src/path-canonical";
 import {
+  COMPILED_BUNDLE_NAME,
   declaredEnvFiles,
   relocatingFieldLeftOut,
   runtimeRecordRoots,
@@ -86,7 +98,7 @@ import { deployRollback, specPin } from "../packages/tool-deploy/src/index";
 import { clipboardWrite, desktopNotify } from "../packages/tool-desktop/src/index";
 import { evalBaselinePin } from "../packages/tool-evalops/src/index";
 import { operativeValuesOf } from "../packages/tool-executor/src/index";
-import { hooksManage } from "../packages/tool-fleet/src/index";
+import { compileBundle, hooksManage } from "../packages/tool-fleet/src/index";
 import { edit, write } from "../packages/tool-fs/src/index";
 import { buildTar } from "../packages/tool-fsx/src/archive-fixtures";
 import {
@@ -127,10 +139,10 @@ import { createWikiStore } from "../packages/wiki-store/src/index";
 const ROOT = dirname(import.meta.dir);
 /** What the floor's reason adds, in both of its forms. */
 const FLOOR =
-  "or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory) — no rule can allow that";
+  "or the files that control it (the harness's run files, settings, gate records, environment files, compiled bundle and dependencies, Hangar's directory) — no rule can allow that";
 /** What a tool that checks its own writes says when it refuses one. */
 const REFUSED =
-  "where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory), which no tool may change. Nothing was written.";
+  "where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records, environment files, compiled bundle and dependencies, Hangar's directory), which no tool may change. Nothing was written.";
 const DEFAULT_HOME = join(homedir(), ".crewhaus", "hangar");
 const DEFAULT_REGISTRY = join(homedir(), ".crewhaus", "harnesses.json");
 
@@ -1574,7 +1586,7 @@ describe("the records a harness's gates read, its environment files and its star
       test(`Write ${path}: denied, and the file is absent`, async () => {
         const r = await writeTo(path);
         expect(floorAnswer(r)).toEqual(DENIED);
-        expect(r.reason).toContain("gate records and environment files");
+        expect(r.reason).toContain("gate records, environment files");
         expect(existsSync(join(ws, path))).toBe(false);
       });
     }
@@ -2734,4 +2746,913 @@ describe("a spelling that opens a protected name when nothing is stored under it
     },
     20_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// What a harness's next start runs, in its own directory
+// ---------------------------------------------------------------------------
+
+describe("what a harness's next start runs, in its own directory", () => {
+  /** A provider key's shape, built from parts so no real-looking value is ever written whole. */
+  const FIXTURE_KEY = ["sk", "fixture", "0".repeat(12)].join("-");
+  const SPEC = "name: h\ntarget: channel\n";
+  const ORIGINAL = 'console.log("ORIGINAL BUNDLE");\n';
+  const EDITED = 'console.log("EDITED BUNDLE");\n';
+  const MANIFEST = JSON.stringify({ name: BUNDLE_MANIFEST_NAME });
+  /** Every Write the run asks for: the yaml layer's broad rule, read in default mode. */
+  const WRITE_ALL: RuleSet = {
+    ...emptyRuleSet,
+    yaml: [{ type: "alwaysAllow", pattern: "Write(**)", source: "yaml" }],
+  };
+  const EDIT_ALL: RuleSet = {
+    ...emptyRuleSet,
+    yaml: [{ type: "alwaysAllow", pattern: "Edit(**)", source: "yaml" }],
+  };
+  const floorAnswer = (r: { decision?: string; reason?: string }) => ({
+    decision: r.decision,
+    floor: r.reason?.includes(FLOOR) === true,
+  });
+  const DENIED = { decision: "deny", floor: true };
+  const writeTo = (path: string, content = "chosen\n") =>
+    turn({ name: "Write", input: { path, content } }, [write], WRITE_ALL, "default");
+
+  const bun = Bun as unknown as { main: string };
+  const savedMain = bun.main;
+  /** The process's entry, as it is in the flow a test is about. */
+  const startedFrom = (rel: string): void => {
+    bun.main = join(ws, rel);
+  };
+
+  /** A harness with a compiled bundle in `dist`, its `.env` and its project files. */
+  function seedCompiled(spec: string | null = SPEC): void {
+    base = tempDir("crewhaus-floor-compiled-");
+    ws = join(base, "harness");
+    mkdirSync(ws, { recursive: true });
+    if (spec !== null) put("crewhaus.yaml", spec);
+    put(".env", `PROVIDER_KEY=${FIXTURE_KEY}\n`);
+    put("dist/daemon.ts", ORIGINAL);
+    put("dist/package.json", MANIFEST);
+    put("package.json", '{"name":"proj"}\n');
+    put("tsconfig.json", '{"compilerOptions":{}}\n');
+    process.chdir(ws);
+  }
+  beforeEach(() => {
+    originalCwd = process.cwd();
+  });
+  afterEach(() => {
+    bun.main = savedMain;
+    process.chdir(originalCwd);
+  });
+
+  /** The next supervised start, through the real plan: what it prints. */
+  function nextStart(): string {
+    const plan = buildSpawnPlan({
+      harnessDir: ws,
+      target: "channel",
+      processEnv: { PATH: process.env["PATH"], HOME: process.env["HOME"] },
+      crewhausBin: undefined,
+    });
+    const ran = Bun.spawnSync([...plan.argv], {
+      cwd: plan.cwd,
+      env: plan.env as Record<string, string>,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return `${ran.stdout.toString()}${ran.stderr.toString()}`.trim();
+  }
+
+  test("the name a run looks for is the one compile stamps and the supervisor reads", () => {
+    expect(COMPILED_BUNDLE_NAME).toBe(BUNDLE_MANIFEST_NAME);
+    expect(COMPILED_BUNDLE_NAME).toBe(CLI_BUNDLE_MANIFEST_NAME);
+  });
+
+  test("the spec names a run looks for are the ones the supervisor finds", () => {
+    const cwd = tempDir("crewhaus-floor-spec-names-");
+    const entry = join(cwd, "dist", "daemon.ts");
+    mkdirSync(dirname(entry));
+    writeFileSync(entry, "");
+    writeFileSync(join(cwd, SPEC_FILENAMES[0]), SPEC);
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {}, entry);
+    expect(SPEC_FILENAMES.length).toBeGreaterThan(0);
+    for (const name of SPEC_FILENAMES) {
+      expect({ name, held: roots.includes(name) }).toEqual({ name, held: true });
+    }
+    for (const name of SPEC_FILENAMES) {
+      const one = tempDir("crewhaus-floor-spec-name-");
+      writeFileSync(join(one, name), SPEC);
+      expect(findSpecPath(one)).toBe(join(one, name));
+      const trees = runtimeStateRoots(undefined, undefined, one, {}, "/opt/elsewhere/agent.ts");
+      expect({ name, held: trees.includes("dist") }).toEqual({ name, held: true });
+    }
+  });
+
+  test("the bundle directories a start looks in are held", () => {
+    const cwd = tempDir("crewhaus-floor-bundle-dirs-");
+    writeFileSync(join(cwd, "crewhaus.yaml"), SPEC);
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {}, "/opt/elsewhere/agent.ts");
+    const dirs = BUNDLE_DIR_CANDIDATES.filter((dir) => dir !== ".");
+    expect(dirs.length).toBeGreaterThan(0);
+    for (const dir of dirs) {
+      expect({ dir, held: roots.includes(dir) }).toEqual({ dir, held: true });
+    }
+  });
+
+  describe("under a spec, through the run, whatever the process's entry", () => {
+    beforeEach(() => seedCompiled());
+
+    for (const path of [
+      "dist/daemon.ts",
+      "dist/package.json",
+      "dist/.npmrc",
+      "dist/bunfig.toml",
+      "dist/tsconfig.json",
+      "dist/node_modules/x/i.ts",
+      "build/daemon.ts",
+      "node_modules/.bin/crewhaus",
+      "node_modules/crewhaus/src/index.ts",
+    ]) {
+      test(`Write ${path}: denied, and nothing changes`, async () => {
+        const before = filesUnder(ws);
+        expect(floorAnswer(await writeTo(path))).toEqual(DENIED);
+        expect(filesUnder(ws)).toEqual(before);
+      });
+    }
+
+    for (const path of [
+      "package.json",
+      "tsconfig.json",
+      "crewhaus.yaml",
+      "src/x.ts",
+      "run.sh",
+      "other/dist/daemon.ts",
+      "other/bunfig.toml",
+      "daemon.ts",
+    ]) {
+      test(`Write ${path}: a rule decides, and it is written`, async () => {
+        const r = await writeTo(path);
+        expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+        expect(readFileSync(join(ws, path), "utf8")).toBe("chosen\n");
+      });
+    }
+
+    test("RemovePath of a tree, and an MCP tool's call with a word for a label", async () => {
+      const r = await turn(
+        { name: "RemovePath", input: { path: "node_modules", recursive: true } },
+        [removePath],
+        allowIn("RemovePath"),
+        "auto",
+      );
+      expect(floorAnswer(r)).toEqual(DENIED);
+      const { remember } = createMemoryTools({ specName: "floor", rootDir: join(ws, "memories") });
+      const { operativeArgs: _declared, ...undeclared } = remember;
+      const remote: RegisteredTool = {
+        ...undeclared,
+        name: "add_labels",
+        execute: async () => "ran",
+      };
+      const rules = allowIn(remote.name);
+      for (const text of [
+        "build",
+        "dist",
+        "build/fix-ci",
+        "Node_Modules",
+        "package.json",
+        "tsconfig.json",
+        "jsconfig.json",
+      ]) {
+        const labelled = await turn(
+          { name: remote.name, input: { text } },
+          [remote],
+          rules,
+          "auto",
+        );
+        expect({ text, ...floorAnswer(labelled) }).toEqual({
+          text,
+          decision: "allow",
+          floor: false,
+        });
+      }
+      const named = await turn(
+        { name: remote.name, input: { text: join(ws, "dist", "daemon.ts") } },
+        [remote],
+        rules,
+        "auto",
+      );
+      expect(floorAnswer(named)).toEqual(DENIED);
+    });
+  });
+
+  describe("a project with no spec keeps its directories", () => {
+    beforeEach(() => seedCompiled(null));
+
+    for (const path of ["dist/x", "build/x", "node_modules/x/i.ts"]) {
+      test(`Write ${path}: a rule decides, and it is written`, async () => {
+        const r = await writeTo(path);
+        expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+        expect(readFileSync(join(ws, path), "utf8")).toBe("chosen\n");
+      });
+    }
+
+    test("the start config there still holds", async () => {
+      expect(floorAnswer(await writeTo("bunfig.toml"))).toEqual(DENIED);
+      expect(existsSync(join(ws, "bunfig.toml"))).toBe(false);
+    });
+
+    (IGNORES_CASE ? test : test.skip)(
+      "and by another case of its name, on a volume that folds them",
+      async () => {
+        expect(floorAnswer(await writeTo("BUNFIG.TOML"))).toEqual(DENIED);
+        expect(readdirSync(ws).filter((name) => name.toLowerCase() === "bunfig.toml")).toEqual([]);
+      },
+    );
+  });
+
+  describe("a compiled bundle running from its harness's directory", () => {
+    for (const path of ["package.json", "tsconfig.json", "jsconfig.json", "crewhaus.yaml"]) {
+      test(`non-interactive: Write ${path} is denied, and the file is as it was`, async () => {
+        seedCompiled();
+        startedFrom("dist/daemon.ts");
+        const before = filesUnder(ws);
+        expect(floorAnswer(await writeTo(path))).toEqual(DENIED);
+        expect(filesUnder(ws)).toEqual(before);
+      });
+
+      test(`\`target: cli\`: Write ${path} is a rule's to decide`, async () => {
+        seedCompiled("name: h\ntarget: cli\n");
+        startedFrom("dist/agent.ts");
+        put("dist/agent.ts", ORIGINAL);
+        const r = await writeTo(path);
+        expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+        expect(readFileSync(join(ws, path), "utf8")).toBe("chosen\n");
+      });
+    }
+
+    test("non-interactive: the other spec name is held too, and a project file beside them is not", async () => {
+      seedCompiled();
+      startedFrom("dist/daemon.ts");
+      expect(floorAnswer(await writeTo("crewhaus.yml"))).toEqual(DENIED);
+      expect(existsSync(join(ws, "crewhaus.yml"))).toBe(false);
+      const r = await writeTo("src/x.ts");
+      expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+    });
+  });
+
+  describe("a bundle started from inside its own directory", () => {
+    const seedInside = (manifest: string = MANIFEST): void => {
+      base = tempDir("crewhaus-floor-inside-");
+      ws = join(base, "dist");
+      mkdirSync(ws, { recursive: true });
+      put("daemon.ts", ORIGINAL);
+      put("agent.ts", "export {};\n");
+      put("package.json", manifest);
+      put("node_modules/x/i.ts", "export {};\n");
+      put("README.md", "# bundle\n");
+      process.chdir(ws);
+      startedFrom("daemon.ts");
+    };
+
+    for (const path of [
+      "daemon.ts",
+      "agent.ts",
+      "package.json",
+      "node_modules/x/i.ts",
+      "tsconfig.json",
+      "jsconfig.json",
+    ]) {
+      test(`Write ${path}: denied, and nothing changes`, async () => {
+        seedInside();
+        const before = filesUnder(ws);
+        expect(floorAnswer(await writeTo(path))).toEqual(DENIED);
+        expect(filesUnder(ws)).toEqual(before);
+      });
+
+      test(`another project's manifest: Write ${path} is a rule's to decide`, async () => {
+        seedInside('{"name":"proj"}\n');
+        const r = await writeTo(path);
+        expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+        expect(readFileSync(join(ws, path), "utf8")).toBe("chosen\n");
+      });
+    }
+
+    for (const path of ["README.md", "GOAL.md", "notes.md", "new.ts", "src/added.ts"]) {
+      test(`Write ${path}: a rule decides, and it is written`, async () => {
+        seedInside();
+        const r = await writeTo(path);
+        expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+        expect(readFileSync(join(ws, path), "utf8")).toBe("chosen\n");
+      });
+    }
+  });
+
+  describe("the tools that check their own writes, in bypass, with a spec at the working directory", () => {
+    const inBypass = (name: string, input: Record<string, unknown>, tools: RegisteredTool[]) =>
+      turn({ name, input }, tools, emptyRuleSet, "bypass");
+    const refused = (r: { decision?: string; result?: string }) => {
+      expect(r.decision).toBe("allow");
+      expect(r.result).toContain(REFUSED);
+    };
+    beforeEach(() => seedCompiled());
+
+    test("CopyPath into `dist/`", async () => {
+      put("staged.ts", EDITED);
+      const before = filesUnder(join(ws, "dist"));
+      refused(
+        await inBypass("CopyPath", { source: "staged.ts", destination: "dist/added.ts" }, [
+          copyPath,
+        ]),
+      );
+      refused(
+        await inBypass(
+          "CopyPath",
+          { source: "staged.ts", destination: "dist/daemon.ts", overwrite: true },
+          [copyPath],
+        ),
+      );
+      expect(filesUnder(join(ws, "dist"))).toEqual(before);
+    });
+
+    test("ArchiveExtract of a top-level `dist/`", async () => {
+      writeFileSync(join(ws, "a.tar"), buildTar([{ name: "dist/daemon.ts", data: EDITED }]));
+      const before = filesUnder(join(ws, "dist"));
+      refused(
+        await inBypass("ArchiveExtract", { archive: "a.tar", destination: ".", overwrite: true }, [
+          archiveExtract,
+        ]),
+      );
+      expect(filesUnder(join(ws, "dist"))).toEqual(before);
+    });
+
+    test("RemovePath and MovePath of `dist`", async () => {
+      const before = filesUnder(join(ws, "dist"));
+      refused(await inBypass("RemovePath", { path: "dist", recursive: true }, [removePath]));
+      refused(await inBypass("MovePath", { source: "dist", destination: "old" }, [movePath]));
+      expect(filesUnder(join(ws, "dist"))).toEqual(before);
+      expect(existsSync(join(ws, "old"))).toBe(false);
+    });
+
+    describe("GitApplyPatch", () => {
+      let saved: { global: string | undefined; system: string | undefined };
+      beforeEach(() => {
+        saved = {
+          global: process.env["GIT_CONFIG_GLOBAL"],
+          system: process.env["GIT_CONFIG_SYSTEM"],
+        };
+        process.env["GIT_CONFIG_GLOBAL"] = "/dev/null";
+        process.env["GIT_CONFIG_SYSTEM"] = "/dev/null";
+        const ran = Bun.spawnSync(["git", "init", "-q", "-b", "main"], {
+          cwd: ws,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        expect(ran.exitCode).toBe(0);
+      });
+      afterEach(() => {
+        for (const [name, value] of [
+          ["GIT_CONFIG_GLOBAL", saved.global],
+          ["GIT_CONFIG_SYSTEM", saved.system],
+        ] as const) {
+          if (value === undefined) Reflect.deleteProperty(process.env, name);
+          else process.env[name] = value;
+        }
+      });
+
+      const applyRefused = async (diff: string): Promise<void> => {
+        const before = filesUnder(join(ws, "dist"));
+        const r = await inBypass("GitApplyPatch", { patch: diff, cwd: "." }, [gitApplyPatch]);
+        expect(r.decision).toBe("allow");
+        const out = JSON.parse(r.result ?? "{}") as { applied?: boolean; reason?: string };
+        expect(out.applied).toBe(false);
+        expect(out.reason).toContain(REFUSED);
+        expect(filesUnder(join(ws, "dist"))).toEqual(before);
+      };
+
+      test("touching a file in `dist/`", async () => {
+        await applyRefused(
+          [
+            "diff --git a/dist/daemon.ts b/dist/daemon.ts",
+            "--- a/dist/daemon.ts",
+            "+++ b/dist/daemon.ts",
+            "@@ -1 +1 @@",
+            `-${ORIGINAL.trimEnd()}`,
+            `+${EDITED.trimEnd()}`,
+            "",
+          ].join("\n"),
+        );
+      });
+
+      test("creating a link in `dist/`", async () => {
+        await applyRefused(
+          [
+            "diff --git a/dist/agent.ts b/dist/agent.ts",
+            "new file mode 120000",
+            "--- /dev/null",
+            "+++ b/dist/agent.ts",
+            "@@ -0,0 +1 @@",
+            "+../src/x.ts",
+            "\\ No newline at end of file",
+            "",
+          ].join("\n"),
+        );
+        expect(existsSync(join(ws, "dist", "agent.ts"))).toBe(false);
+      });
+    });
+  });
+
+  describe("the next start, through the real plan, after an agent's tools were refused", () => {
+    test("control: the bundle's file decides what starts", () => {
+      seedCompiled();
+      expect(nextStart()).toBe("ORIGINAL BUNDLE");
+      put("dist/daemon.ts", EDITED);
+      expect(nextStart()).toBe("EDITED BUNDLE");
+    }, 20_000); // slow by construction: two child processes
+
+    test("a Write of the bundle's entry: the original starts", async () => {
+      seedCompiled();
+      const r = await writeTo(
+        "dist/daemon.ts",
+        'console.log("EDITED BUNDLE " + process.env.PROVIDER_KEY);\n',
+      );
+      expect(floorAnswer(r)).toEqual(DENIED);
+      const started = nextStart();
+      expect(started).toBe("ORIGINAL BUNDLE");
+      expect(started).not.toContain(FIXTURE_KEY);
+    }, 20_000); // slow by construction: a model turn and a child process
+
+    const IMPORTS = [
+      'import { x } from "@crewhaus/fixture-module";',
+      'console.log("BUNDLE " + x);',
+      "",
+    ].join("\n");
+    const MODULE_FILE = "dist/node_modules/@crewhaus/fixture-module/i.ts";
+    const EDITED_MODULE = 'export const x = "EDITED";\n';
+    const seedImports = (): void => {
+      seedCompiled();
+      put("dist/daemon.ts", IMPORTS);
+      put(
+        "dist/node_modules/@crewhaus/fixture-module/package.json",
+        '{"name":"@crewhaus/fixture-module","main":"i.ts","type":"module"}',
+      );
+      put(MODULE_FILE, 'export const x = "INSTALLED";\n');
+    };
+
+    test("control: an installed module's file decides what starts", () => {
+      seedImports();
+      expect(nextStart()).toBe("BUNDLE INSTALLED");
+      put(MODULE_FILE, EDITED_MODULE);
+      expect(nextStart()).toBe("BUNDLE EDITED");
+    }, 20_000); // slow by construction: two child processes
+
+    test("a Write of an installed module: the installed one starts", async () => {
+      seedImports();
+      expect(nextStart()).toBe("BUNDLE INSTALLED");
+      const r = await writeTo(MODULE_FILE, EDITED_MODULE);
+      expect(floorAnswer(r)).toEqual(DENIED);
+      expect(nextStart()).toBe("BUNDLE INSTALLED");
+    }, 20_000); // slow by construction: a model turn and two child processes
+
+    test("in a compiled daemon, an Edit of the root resolver config: refused, and its bytes unchanged", async () => {
+      seedImports();
+      startedFrom("dist/daemon.ts");
+      const before = readFileSync(join(ws, "tsconfig.json"), "utf8");
+      const r = await turn(
+        {
+          name: "Edit",
+          input: {
+            path: "tsconfig.json",
+            oldString: '{"compilerOptions":{}}',
+            newString: '{"compilerOptions":{"strict":true}}',
+          },
+        },
+        [edit],
+        EDIT_ALL,
+        "default",
+      );
+      expect(floorAnswer(r)).toEqual(DENIED);
+      expect(readFileSync(join(ws, "tsconfig.json"), "utf8")).toBe(before);
+    }, 20_000); // slow by construction: a model turn
+  });
+
+  describe("a start from inside a bundle whose entry imports a module by its `.js` name", () => {
+    /** What `bun daemon.ts` prints from the working directory. */
+    const startHere = (): string => {
+      const ran = Bun.spawnSync(["bun", "daemon.ts"], {
+        cwd: ws,
+        env: { PATH: process.env["PATH"], HOME: process.env["HOME"] },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      return `${ran.stdout.toString()}${ran.stderr.toString()}`.trim();
+    };
+    const seedLayout = (spec: string | null): void => {
+      base = tempDir("crewhaus-floor-imports-");
+      ws = join(base, "bundle");
+      mkdirSync(ws, { recursive: true });
+      if (spec !== null) put("crewhaus.yaml", spec);
+      put("package.json", MANIFEST);
+      put("daemon.ts", 'import { x } from "./agent.js";\nconsole.log(x);\n');
+      put("agent.ts", 'export const x = "ORIGINAL BUNDLE";\n');
+      process.chdir(ws);
+      startedFrom("daemon.ts");
+    };
+
+    for (const [flow, spec] of [
+      ["started from inside itself", null],
+      ["written at its spec's directory", SPEC],
+    ] as const) {
+      for (const name of ["agent.js", "agent.js.ts", "agent.js.json", "agent.tsx", "agent.mjs"]) {
+        test(`${flow}: Write ${name} is denied, and the original starts`, async () => {
+          seedLayout(spec);
+          expect(startHere()).toBe("ORIGINAL BUNDLE");
+          const body = name.endsWith(".json")
+            ? '{"x":"EDITED BUNDLE"}'
+            : 'export const x = "EDITED BUNDLE";\n';
+          expect(floorAnswer(await writeTo(name, body))).toEqual(DENIED);
+          expect(existsSync(join(ws, name))).toBe(false);
+          expect(startHere()).toBe("ORIGINAL BUNDLE");
+        }, 20_000); // slow by construction: a model turn and two child processes
+      }
+
+      for (const name of ["new.ts", "GOAL.md", "notes.md", "state.json", "src/added.ts"]) {
+        test(`${flow}: Write ${name} is a rule's to decide`, async () => {
+          seedLayout(spec);
+          const r = await writeTo(name);
+          expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+          expect(readFileSync(join(ws, name), "utf8")).toBe("chosen\n");
+        });
+      }
+    }
+
+    for (const name of ["bun.lock", "bun.lockb", "crewhaus.yaml", "crewhaus.yml"]) {
+      test(`started from inside itself: Write ${name} is denied, though none is there yet`, async () => {
+        seedLayout(null);
+        expect(floorAnswer(await writeTo(name))).toEqual(DENIED);
+        expect(existsSync(join(ws, name))).toBe(false);
+      });
+    }
+  });
+
+  describe("a compiled bundle in a directory below, with no spec at the working directory", () => {
+    const HEADER = (target: string): string =>
+      `// GENERATED\n//\n// Source spec: "h" (target: ${target}, ir version: 1)\n`;
+
+    for (const path of [
+      "dist/daemon.ts",
+      "dist/x",
+      "tsconfig.json",
+      "jsconfig.json",
+      "package.json",
+      "node_modules/x/i.ts",
+      "crewhaus.yaml",
+      "crewhaus.yml",
+    ]) {
+      test(`a daemon: Write ${path} is denied, and nothing changes`, async () => {
+        seedCompiled(null);
+        put("dist/daemon.ts", `${HEADER("channel")}${ORIGINAL}`);
+        startedFrom("dist/daemon.ts");
+        const before = filesUnder(ws);
+        expect(floorAnswer(await writeTo(path))).toEqual(DENIED);
+        expect(filesUnder(ws)).toEqual(before);
+      });
+    }
+
+    test("a daemon: what lies between it and the working directory is held as well", async () => {
+      seedCompiled(null);
+      put("tools/dist/daemon.ts", ORIGINAL);
+      put("tools/dist/package.json", MANIFEST);
+      startedFrom("tools/dist/daemon.ts");
+      for (const path of [
+        "tools/tsconfig.json",
+        "tools/package.json",
+        "tools/node_modules/x/i.ts",
+      ]) {
+        expect({ path, ...floorAnswer(await writeTo(path)) }).toEqual({ path, ...DENIED });
+      }
+    });
+
+    test("a daemon: another file there is a rule's to decide", async () => {
+      seedCompiled(null);
+      startedFrom("dist/daemon.ts");
+      const r = await writeTo("stage/x.ts");
+      expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+      expect(readFileSync(join(ws, "stage", "x.ts"), "utf8")).toBe("chosen\n");
+    });
+
+    for (const path of ["tsconfig.json", "package.json", "crewhaus.yaml", "node_modules/x/i.ts"]) {
+      test(`an interactive target: Write ${path} is a rule's to decide`, async () => {
+        seedCompiled(null);
+        put("dist/agent.ts", `${HEADER("cli")}${ORIGINAL}`);
+        startedFrom("dist/agent.ts");
+        const r = await writeTo(path);
+        expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+        expect(readFileSync(join(ws, path), "utf8")).toBe("chosen\n");
+      });
+    }
+
+    test("an interactive target: its own bundle is still held", async () => {
+      seedCompiled(null);
+      put("dist/agent.ts", `${HEADER("cli")}${ORIGINAL}`);
+      startedFrom("dist/agent.ts");
+      expect(floorAnswer(await writeTo("dist/x"))).toEqual(DENIED);
+    });
+  });
+
+  describe("a tool that declares no paths, with what a run really protects", () => {
+    /** An MCP-shaped call with one string, under a rule that allows it, through the engine. */
+    const decide = (
+      path: string,
+      roots: readonly string[],
+    ): { decision: string; floor: boolean } => {
+      const r = evaluateWithReason(
+        {
+          toolName: "mcp__github__get_file_contents",
+          input: { path },
+          readOnly: false,
+          destructive: false,
+        },
+        "auto",
+        allowIn("mcp__github__get_file_contents"),
+        { protectedRoots: roots },
+      );
+      return { decision: r.decision, floor: r.reason?.includes(FLOOR) === true };
+    };
+    const ALLOWED = { decision: "allow", floor: false };
+
+    test("a compiled daemon: its manifest and resolver config's names pass, and the rest are read", () => {
+      seedCompiled();
+      const roots = runtimeStateRoots(undefined, undefined, ws, {}, join(ws, "dist", "daemon.ts"));
+      for (const path of ["package.json", "tsconfig.json", "jsconfig.json", "dist/daemon.ts"]) {
+        expect({ path, ...decide(path, roots) }).toEqual({ path, ...ALLOWED });
+      }
+      for (const path of ["crewhaus.yaml", "crewhaus.yml", ".env", "bunfig.toml"]) {
+        expect({ path, ...decide(path, roots) }).toEqual({ path, ...DENIED });
+      }
+      for (const path of [join(ws, "package.json"), join(ws, "dist", "daemon.ts")]) {
+        expect({ path, ...decide(path, roots) }).toEqual({ path, ...DENIED });
+      }
+    });
+
+    test("a bundle started from inside itself: its code's own names are read", () => {
+      base = tempDir("crewhaus-floor-inside-text-");
+      ws = join(base, "dist");
+      mkdirSync(ws, { recursive: true });
+      put("daemon.ts", ORIGINAL);
+      put("agent.ts", "export {};\n");
+      put("package.json", MANIFEST);
+      const roots = runtimeStateRoots(undefined, undefined, ws, {}, join(ws, "daemon.ts"));
+      for (const path of ["package.json", "tsconfig.json"]) {
+        expect({ path, ...decide(path, roots) }).toEqual({ path, ...ALLOWED });
+      }
+      for (const path of ["agent.ts", "daemon.ts", "agent.js", "crewhaus.yaml"]) {
+        expect({ path, ...decide(path, roots) }).toEqual({ path, ...DENIED });
+      }
+    });
+
+    test("the run's record and Hangar's directory stay read by their relative names", () => {
+      seedCompiled(null);
+      const roots = runtimeStateRoots(
+        "logs/sessions",
+        undefined,
+        ws,
+        { CREWHAUS_HANGAR_ROOT: join(ws, "home") },
+        "/opt/elsewhere/agent.ts",
+      );
+      for (const path of ["logs/sessions/s1.jsonl", "logs/sessions/x", "home/token", "home/x"]) {
+        expect({ path, ...decide(path, roots) }).toEqual({ path, ...DENIED });
+      }
+    });
+  });
+
+  describe("CompileBundle on another directory, whose output leads into a root", () => {
+    const LINK_AND_SPEC = (): Buffer | Uint8Array =>
+      buildTar([
+        { name: "other/dist", kind: "symlink", linkTarget: "../dist" },
+        { name: "other/crewhaus.yaml", data: "name: other\ntarget: channel\n" },
+      ]);
+
+    for (const dryRun of [true, false]) {
+      test(`extracted, then compiled with dryRun ${dryRun}: refused, and the bundle is as it was`, async () => {
+        seedCompiled();
+        startedFrom("dist/daemon.ts");
+        writeFileSync(join(ws, "other.tar"), LINK_AND_SPEC());
+        const extracted = await turn(
+          {
+            name: "ArchiveExtract",
+            input: { archive: "other.tar", destination: ".", overwrite: true },
+          },
+          [archiveExtract],
+          allowIn("ArchiveExtract"),
+          "auto",
+        );
+        expect(extracted.decision).toBe("allow");
+        expect(lstatSync(join(ws, "other", "dist")).isSymbolicLink()).toBe(true);
+        const before = filesUnder(join(ws, "dist"));
+        const r = await turn(
+          {
+            name: "CompileBundle",
+            input: { dir: "other", target: "channel", dryRun, allowExternalCli: true },
+          },
+          [compileBundle],
+          allowIn("CompileBundle"),
+          "auto",
+        );
+        expect(r.decision).toBe("allow");
+        const out = JSON.parse(r.result ?? "{}") as { status?: string; reason?: string };
+        expect(out.status).toBe("refused");
+        expect(out.reason).toContain(REFUSED);
+        expect(filesUnder(join(ws, "dist"))).toEqual(before);
+      });
+    }
+
+    // The install adds `node_modules` and the lockfile to the output directory,
+    // so one that leads to a directory holding roots is refused too.
+    for (const dryRun of [true, false]) {
+      test(`an output directory that leads to the working directory, compiled with dryRun ${dryRun}: refused, and nothing is added`, async () => {
+        seedCompiled();
+        writeFileSync(
+          join(ws, "up.tar"),
+          buildTar([
+            { name: "other/dist", kind: "symlink", linkTarget: ".." },
+            { name: "other/crewhaus.yaml", data: "name: other\ntarget: channel\n" },
+          ]),
+        );
+        const extracted = await turn(
+          {
+            name: "ArchiveExtract",
+            input: { archive: "up.tar", destination: ".", overwrite: true },
+          },
+          [archiveExtract],
+          allowIn("ArchiveExtract"),
+          "auto",
+        );
+        expect(extracted.decision).toBe("allow");
+        expect(lstatSync(join(ws, "other", "dist")).isSymbolicLink()).toBe(true);
+        const before = readdirSync(ws).sort();
+        const r = await turn(
+          {
+            name: "CompileBundle",
+            input: { dir: "other", target: "channel", dryRun, allowExternalCli: true },
+          },
+          [compileBundle],
+          allowIn("CompileBundle"),
+          "auto",
+        );
+        expect(r.decision).toBe("allow");
+        const out = JSON.parse(r.result ?? "{}") as { status?: string; reason?: string };
+        expect(out.status).toBe("refused");
+        expect(out.reason).toContain(REFUSED);
+        expect(readdirSync(ws).sort()).toEqual(before);
+      });
+    }
+  });
+
+  describe("a real process, started as each flow starts it, answers for itself", () => {
+    const STATE_ROOTS = join(ROOT, "packages", "runtime-core", "src", "state-roots.ts");
+    const REPORT = [
+      `import { runtimeStateRoots } from ${JSON.stringify(STATE_ROOTS)};`,
+      "console.log(JSON.stringify(runtimeStateRoots(undefined, undefined)));",
+      "",
+    ].join("\n");
+    /** The roots a process reports for itself, started as `bun <entry>` from `cwd`. */
+    const reported = (cwd: string, entry: string): string[] => {
+      const ran = Bun.spawnSync(["bun", entry], { cwd, stdout: "pipe", stderr: "pipe" });
+      expect(ran.stderr.toString()).toBe("");
+      expect(ran.exitCode).toBe(0);
+      return JSON.parse(ran.stdout.toString()) as string[];
+    };
+
+    test("a supervised daemon holds its spec and its manifest", () => {
+      seedCompiled();
+      put("dist/daemon.ts", REPORT);
+      const roots = reported(ws, join("dist", "daemon.ts"));
+      for (const name of [
+        "dist",
+        "node_modules",
+        "crewhaus.yaml",
+        "package.json",
+        "tsconfig.json",
+      ]) {
+        expect({ name, held: roots.includes(name) }).toEqual({ name, held: true });
+      }
+    }, 20_000); // slow by construction: a child process that loads the module
+
+    test("a compiled `target: cli` holds the trees, and leaves its project's files to the rules", () => {
+      seedCompiled("name: h\ntarget: cli\n");
+      put("dist/agent.ts", REPORT);
+      const roots = reported(ws, join("dist", "agent.ts"));
+      expect(roots).toContain("dist");
+      for (const name of ["crewhaus.yaml", "package.json", "tsconfig.json"]) {
+        expect({ name, held: roots.includes(name) }).toEqual({ name, held: false });
+      }
+    }, 20_000); // slow by construction: a child process that loads the module
+
+    test("a bundle started from inside itself holds its code and dependencies, and not its notes", () => {
+      seedCompiled();
+      put("dist/daemon.ts", REPORT);
+      put("dist/agent.ts", "export {};\n");
+      put("dist/GOAL.md", "# goal\n");
+      const roots = reported(join(ws, "dist"), "daemon.ts");
+      for (const name of [
+        "daemon.ts",
+        "agent.ts",
+        "package.json",
+        "node_modules",
+        "tsconfig.json",
+      ]) {
+        expect({ name, held: roots.includes(name) }).toEqual({ name, held: true });
+      }
+      expect(roots).not.toContain("GOAL.md");
+    }, 20_000); // slow by construction: a child process that loads the module
+
+    test("a bundle started from inside itself, across two starts: the spec names stay refused, and its own data stays its own", async () => {
+      base = tempDir("crewhaus-floor-two-starts-");
+      ws = join(base, "dist");
+      mkdirSync(ws, { recursive: true });
+      put("daemon.ts", REPORT);
+      put("agent.ts", "export {};\n");
+      put("package.json", MANIFEST);
+      process.chdir(ws);
+      const first = reported(ws, "daemon.ts");
+      for (const name of ["crewhaus.yaml", "crewhaus.yml", "agent.ts", "agent.js"]) {
+        expect({ name, held: first.includes(name) }).toEqual({ name, held: true });
+      }
+      expect(first).not.toContain("state.json");
+
+      // A turn of a process started the same way.
+      startedFrom("daemon.ts");
+      expect(floorAnswer(await writeTo("crewhaus.yaml", "name: h\ntarget: cli\n"))).toEqual(DENIED);
+      expect(existsSync(join(ws, "crewhaus.yaml"))).toBe(false);
+      for (const name of ["state.json", "report.json", "added.ts"]) {
+        expect({ name, ...floorAnswer(await writeTo(name)) }).toEqual({
+          name,
+          decision: "allow",
+          floor: false,
+        });
+      }
+
+      const second = reported(ws, "daemon.ts");
+      for (const name of ["agent.ts", "package.json", "crewhaus.yaml"]) {
+        expect({ name, held: second.includes(name) }).toEqual({ name, held: true });
+      }
+      expect(second).not.toContain("state.json");
+      expect(second).not.toContain("report.json");
+      // A start holds the code files present when it starts, as the docblock says.
+      expect(second).toContain("added.ts");
+    }, 30_000); // slow by construction: a model turn and two child processes that load the module
+
+    test("a compiled daemon below a working directory with no spec holds what lies above it", () => {
+      seedCompiled(null);
+      put("dist/daemon.ts", REPORT);
+      const roots = reported(ws, join("dist", "daemon.ts"));
+      for (const name of [
+        "dist",
+        "node_modules",
+        "package.json",
+        "tsconfig.json",
+        "jsconfig.json",
+        "crewhaus.yaml",
+        "crewhaus.yml",
+      ]) {
+        expect({ name, held: roots.includes(name) }).toEqual({ name, held: true });
+      }
+      expect(roots).not.toContain("build");
+    }, 20_000); // slow by construction: a child process that loads the module
+
+    test("a project under another harness's bundle holds the trees, and nothing else of these", () => {
+      seedCompiled();
+      const elsewhere = tempDir("crewhaus-floor-elsewhere-");
+      writeFileSync(join(elsewhere, "agent.ts"), REPORT);
+      const roots = reported(ws, join(elsewhere, "agent.ts"));
+      expect(roots).toContain("dist");
+      expect(roots).not.toContain("package.json");
+      expect(roots).not.toContain("crewhaus.yaml");
+    }, 20_000); // slow by construction: a child process that loads the module
+  });
+
+  describe("what a harness keeps doing in its own directory", () => {
+    const allowCompile = allowIn("CompileBundle");
+    const compileAt = (dir: string) =>
+      turn(
+        { name: "CompileBundle", input: { dir, target: "channel", dryRun: true } },
+        [compileBundle],
+        allowCompile,
+        "auto",
+      );
+
+    test("CompileBundle of the working directory reaches its execute", async () => {
+      seedCompiled();
+      const r = await compileAt(".");
+      expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+      const out = JSON.parse(r.result ?? "{}") as { dryRun?: boolean };
+      expect(out.dryRun).toBe(true);
+    });
+
+    test("and from a compiled daemon's own process", async () => {
+      seedCompiled();
+      startedFrom("dist/daemon.ts");
+      const r = await compileAt(".");
+      expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+      const out = JSON.parse(r.result ?? "{}") as { dryRun?: boolean };
+      expect(out.dryRun).toBe(true);
+    });
+  });
 });

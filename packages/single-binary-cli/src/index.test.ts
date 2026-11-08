@@ -109,6 +109,7 @@ describe("buildBinary() (T2 dry-run)", () => {
     expect(captured[0]).toBe("bun");
     expect(captured).toContain("build");
     expect(captured).toContain("--compile");
+    expect(captured).toContain("--no-compile-autoload-bunfig");
     expect(captured).toContain("--target");
     expect(captured).toContain("bun-linux-x64-baseline");
     expect(captured).toContain("--outfile");

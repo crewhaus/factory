@@ -1326,7 +1326,7 @@ export const gitApplyPatch: RegisteredTool = buildTool({
             checkedOnly,
             wouldApply: false,
             reason:
-              "GitApplyPatch: the patch names more files than could be checked against the run's own record (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory). Nothing was applied. Apply it in smaller patches.",
+              "GitApplyPatch: the patch names more files than could be checked against the run's own record (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records, environment files, compiled bundle and dependencies, Hangar's directory). Nothing was applied. Apply it in smaller patches.",
           });
         }
         named.push(...numstatPaths(listed.stdout));
