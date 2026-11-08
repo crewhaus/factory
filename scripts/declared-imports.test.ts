@@ -37,6 +37,7 @@ import { builtinModules } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { isPublishableManifest } from "./publishable.ts";
 import { isTestOnly } from "./test-only";
 
 const ROOT = join(import.meta.dir, "..");
@@ -69,8 +70,8 @@ function publishable(): Pkg[] {
       const file = join(dir, "package.json");
       if (!existsSync(file) || !existsSync(join(dir, "src"))) continue;
       const manifest = JSON.parse(readFileSync(file, "utf8")) as Manifest;
-      if (manifest.private === true || typeof manifest.name !== "string") continue;
-      out.push({ dir, manifest: manifest as Manifest & { name: string } });
+      if (!isPublishableManifest(manifest)) continue;
+      out.push({ dir, manifest });
     }
   }
   return out;

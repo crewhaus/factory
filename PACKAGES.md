@@ -71,6 +71,12 @@ The workspace versions in **lockstep**: every publishable package ships the same
 - No per-package version drift and no per-PR bump bookkeeping — the next cut's version is decided at release time and applied across the board.
 - The sibling `utilities/` workspace releases the same way with its own copy of the scripts.
 
+## Release candidates
+
+A tag like `v0.9.0-rc.1` publishes the npm packages under the `next` tag and the binaries as a GitHub pre-release. Homebrew, Scoop, apt and winget skip it, and container images get the candidate's version tag without moving `latest`. Try it with `npm install -g crewhaus@next`.
+
+A dry run (`gh workflow run release.yml -f version=0.9.0-rc.1 -f dry_run=true`) runs every gate and every publish check, publishes nothing, and leaves the GitHub release as a draft. A final tag like `v0.9.0` publishes only from a tree whose packages are all stamped with that version, so the bump lands on `main` before the tag.
+
 ## Developing from a clone (contributors)
 
 Bun resolves all `workspace:*` dependencies automatically — no `bun link` needed.
@@ -139,6 +145,7 @@ All thirteen publish in their own lockstep (currently 0.1.5), independent of the
 - The demos workspace at [crewhaus/demos](https://github.com/crewhaus/demos) and the smoke packages under `demos/smoke/*` — `@crewhaus-examples/*` smoke tests per catalog section. Internal CI artifacts; the example code is freely copyable under Apache-2.0.
 - The doc site at [crewhaus/docs](https://github.com/crewhaus/docs) — prose, not code.
 - The sibling apps and tooling in the development meta-repo — none are npm-shipped.
+- `hangar-e2e` and `service-fakes` — test-only workspace packages that are `private`, unscoped and never published (module briefs 326 and 327 in [crewhaus/docs](https://github.com/crewhaus/docs/tree/main/module-briefs)).
 
 ## Publishing checklist (per release cut)
 
@@ -149,7 +156,7 @@ Releases are **lockstep** — every publishable package ships the same version, 
 
    For a local publish, or for a package whose trusted publisher is not configured yet, fall back to a **granular** access token (Read and write) with **bypass two-factor authentication**, scoped to the whole **`@crewhaus` scope** *plus* the unscoped **`crewhaus`** package — a token scoped to a list of existing names cannot create a package that does not exist yet. Write tokens cap at 90 days. Classic *Automation* tokens are not an option: npm permanently revoked every one of them on 2025-12-09, and they cannot be recreated or recovered — that revocation, not an expiry, is why v0.4.1 and v0.4.2 failed to publish.
 
-   **A release that adds packages needs that token in CI**, as the `NPM_TOKEN` repository secret the `npm` job hands to npm when it is set: a trusted publisher is configured on a package that already exists on npm, so a brand-new name's first publish goes over the token, and its trusted publisher is configured afterwards. Check the secret is current before tagging such a release. If a new name fails, `publish-workspace.ts` holds back everything that depends on it — the `crewhaus` CLI included — rather than publish a package pinned to a version that does not exist.
+   **A release that adds packages needs that token in CI**, as the `NPM_TOKEN` repository secret the `npm` job hands to npm when it is set: a trusted publisher is configured on a package that already exists on npm, so a brand-new name's first publish goes over the token, and its trusted publisher is configured afterwards. Check the secret is current before tagging such a release. When a new name needs its first publish and no working token is set, the `npm` job stops before publishing anything and names the packages. If a new name fails, `publish-workspace.ts` holds back everything that depends on it — the `crewhaus` CLI included — rather than publish a package pinned to a version that does not exist.
 3. **Canary.** `bun scripts/publish-workspace.ts --filter @crewhaus/errors` — one leaf package proves auth before the full fan-out.
 4. **Publish.** `bun scripts/publish-workspace.ts` — topological order, skips versions already on the registry. Publishes with `npm publish` (adding `--provenance` when OIDC is available). The old "must stay on `bun publish`" rule is retired: it existed only because bun resolved `workspace:*` at pack time and npm shipped the literal range, and step 1's `--for-publish` now does that resolution from the stamped version. The script refuses to publish any manifest still carrying a `workspace:` range, or whose internal deps disagree with the version being cut.
 5. **Verify.** Every name resolves on the registry at the new version (brand-new package names can lag a few minutes before appearing); `npm view crewhaus@<next> dependencies` shows internal deps pinned at exactly `<next>`; and from a fresh directory `npm install -g crewhaus@<next>` (or `bun add -d crewhaus@<next>`) followed by `crewhaus compile <spec> -o out` round-trips without the source repo.

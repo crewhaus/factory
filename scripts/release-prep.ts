@@ -2,8 +2,10 @@
 /**
  * release-prep.ts — Prepares all publishable packages in a workspace for npm publish.
  *
- * Idempotent: updates package.json metadata for every package whose name starts with
- * "@crewhaus/" or "crewhaus-" (root workspace packages stay private as configured).
+ * Idempotent: updates package.json metadata for every package whose name publishes —
+ * the bare `crewhaus` CLI and every `@crewhaus/` name (`isPublishableName` in
+ * ./publishable.ts, the rule publish-workspace shares). Every other name, the root
+ * workspace and the private test packages included, is left as it is.
  *
  * Run:
  *   bun scripts/release-prep.ts --version 0.1.3            # stamp every package (lockstep)
@@ -23,8 +25,10 @@
  * bump commits lint-clean.
  *
  * Every publishable manifest is stamped with the workspace root's `engines.bun`
- * (or its own, when that asks for a newer Bun): the libraries run on Bun only,
- * and the manifest should say so. `--for-publish`
+ * (or its own, when that asks for a newer Bun): the libraries run on Bun, and the
+ * manifest should say so. A package that also declares `engines.node` in its
+ * committed manifest keeps it: that is the Node-loadable class, held to plain Node
+ * by scripts/node-packages.test.ts and scripts/node-load-smoke.ts. `--for-publish`
  * also copies the root LICENSE and NOTICE into every publishable package (npm
  * packs a `files` entry only when the file is there, and skips a missing one
  * silently) and writes a short README.md where a package has none.
@@ -41,6 +45,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { isPublishableName } from "./publishable.ts";
 
 type Json = Record<string, unknown>;
 
@@ -65,9 +70,11 @@ const CHECK = has("check");
 // --for-publish additionally rewrites entrypoints (main/types/exports/bin) and the
 // `files` allowlist from src/*.ts to the compiled dist/*.js + .d.ts, so the packed
 // tarball loads on Bun (>= the root's engines.bun) without TS type-stripping. It is
-// NOT plain-Node loadable: tsc keeps the extensionless relative specifiers that
-// `moduleResolution: Bundler` allows, and many packages call Bun.* APIs or import
-// text with `with { type: "text" }`. The stamped `engines.bun` says so.
+// NOT plain-Node loadable in general: tsc keeps the extensionless relative specifiers
+// that `moduleResolution: Bundler` allows, and many packages call Bun.* APIs or import
+// text with `with { type: "text" }`. The stamped `engines.bun` says so. The exception
+// is a package whose committed manifest declares `engines.node`: it compiles as
+// NodeNext, and CI loads its packed tarball under real `node`.
 // This is a PUBLISH-ONLY transform — the committed tree stays on src/ so the Bun dev
 // flow needs no build step. The release workflow runs `bun run build` before this and
 // publishes the dist output; a bare `--version` run (the in-repo lockstep version
@@ -282,14 +289,6 @@ function discoverWorkspacePackages(rootPkgPath: string): string[] {
   return results;
 }
 
-/**
- * Publishable: scoped @crewhaus/* and crewhaus-* packages, plus the bare
- * `crewhaus` CLI (apps/cli). The root workspace stays private.
- */
-function isPublishableName(name: unknown): name is string {
-  return typeof name === "string" && (name === "crewhaus" || /^@?crewhaus[-/]/.test(name));
-}
-
 /** Apply the release-prep transforms to a package.json object. Returns true if changed. */
 function applyRelease(pkg: Json, pkgDir: string, isRoot: boolean): boolean {
   let changed = false;
@@ -454,10 +453,14 @@ function generatedReadme(pkg: Json, relDir: string): string {
     );
   }
   // The range this package was stamped with (applyRelease ran first), which may be
-  // newer than the root's.
-  const bun = (pkg.engines as Json | undefined)?.bun;
+  // newer than the root's. `engines.node` is the committed one: applyRelease keeps it.
+  const engines = pkg.engines as Json | undefined;
+  const bunRange = typeof engines?.bun === "string" ? engines.bun : ROOT_BUN_ENGINE;
+  const node = engines?.node;
   out.push(
-    `Requires [Bun](https://bun.sh) \`${typeof bun === "string" ? bun : ROOT_BUN_ENGINE}\`; plain Node is not supported.`,
+    typeof node === "string" && node.trim() !== ""
+      ? `Runs on Node.js \`${node}\` and Bun \`${bunRange}\`.`
+      : `Requires [Bun](https://bun.sh) \`${bunRange}\`; plain Node is not supported.`,
     "",
   );
   out.push(`[Source](${HOMEPAGE_BASE}/tree/main/${relDir})`, "");
