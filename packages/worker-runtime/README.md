@@ -18,6 +18,12 @@ Tools + budget + limits + trace. Compaction and recovery are deliberately
 Node-only; on the edge a context overflow ends the run with a classified
 `context_overflow` frame rather than compacting.
 
+Every message the loop is handed, whatever its role, is screened at TrustOrigin
+`channel` before the first model call; a message the prompt-injection check
+refuses ends the run with an `input_blocked` failure and no model call. What a
+tool returns is classified at TrustOrigin `tool` before the next model call; a
+malicious output reaches the model as a redaction notice.
+
 ```ts
 import { runWorkerLoop } from "@crewhaus/worker-runtime";
 

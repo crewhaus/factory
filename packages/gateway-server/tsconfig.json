@@ -11,6 +11,7 @@
     { "path": "../errors" },
     { "path": "../federation-protocol" },
     { "path": "../gateway-protocol" },
+    { "path": "../run-context" },
     { "path": "../tenancy" }
   ],
   "include": ["src/**/*"]

@@ -18,6 +18,7 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/federation-protocol": "workspace:*",
     "@crewhaus/gateway-protocol": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
     "@crewhaus/tenancy": "workspace:*"
   },
   "license": "Apache-2.0",

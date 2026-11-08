@@ -1081,6 +1081,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/federation-protocol": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
       },
     },
@@ -1644,9 +1645,14 @@
       "name": "@crewhaus/queue-consumer",
       "version": "0.7.0",
       "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/idempotency-keys": "workspace:*",
         "@crewhaus/queue-protocol": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/egress-classifier": "workspace:*",
       },
     },
     "packages/queue-protocol": {
@@ -3760,6 +3766,7 @@
       "name": "@crewhaus/voice-runtime",
       "version": "0.7.0",
       "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
       },
     },
@@ -3800,6 +3807,7 @@
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",

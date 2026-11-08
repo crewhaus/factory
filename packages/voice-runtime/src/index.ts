@@ -17,7 +17,18 @@
  *   - `audio_chunk        { pcm }`  — agent's TTS audio (pcm16 24kHz)
  *   - `tool_use           { id, name, input }` — agent function calls
  *   - `interrupt          { reason }` — emitted on barge-in
+ *   - `input_blocked      { itemId?, rules }` — the prompt-injection check
+ *     refused the caller's input (a transcript of their speech, or text
+ *     passed to `sendText`); the call goes on
+ *   - `input_warned       { itemId?, rules }` — it kept the input, flagged
  *   - `disconnect         { code?, reason? }` — final
+ *
+ * The caller's input is screened at TrustOrigin `channel`. On the OpenAI
+ * Realtime adapter the session asks the provider to transcribe the caller,
+ * and each transcript is classified: a malicious one cancels the reply in
+ * progress and deletes the caller's item, so later replies do not build on
+ * it. Text passed to `sendText` is classified before it is sent, on both
+ * adapters. The two input events carry rule ids, never the text.
  *
  * The OpenAI adapter is HEADLESS — no microphone, no speakers. The
  * caller pumps PCM in via `sendAudio(pcm)`; the adapter emits audio +
@@ -27,6 +38,11 @@
  *   2. SIP gateway → daemon (telephony provides PCM).
  *   3. Node-only smoke (synthesize PCM in TS, pipe in, assert events).
  */
+import {
+  type BoundaryAction,
+  boundaryRuleIds,
+  classifyBoundary,
+} from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 
 export class VoiceRuntimeError extends CrewhausError {
@@ -48,7 +64,15 @@ export type RealtimeEvent =
   | { kind: "disconnect"; code?: number; reason?: string }
   | { kind: "error"; message: string; cause?: unknown }
   /** Raw provider frame, surfaced verbatim (Vapi adapter passthrough). */
-  | { kind: "raw"; provider: ProviderId; ts: string; payload: unknown };
+  | { kind: "raw"; provider: ProviderId; ts: string; payload: unknown }
+  /**
+   * The prompt-injection check refused the caller's input: a transcript of
+   * their speech (`itemId` is its conversation item, deleted) or text passed
+   * to `sendText` (not sent). The detector's rule ids, never the text.
+   */
+  | { kind: "input_blocked"; itemId?: string; rules: string[] }
+  /** The check kept the caller's input but flagged it. Rule ids, never the text. */
+  | { kind: "input_warned"; itemId?: string; rules: string[] };
 
 export type RealtimeEventHandler = (event: RealtimeEvent) => void;
 
@@ -82,12 +106,81 @@ export interface RealtimeAdapter {
    * timing is too slow for a one-shot smoke). Idempotent.
    */
   commitInput(): void;
-  /** Inject a text turn (no audio). Useful for tests + chat-only mixed mode. */
-  sendText(text: string): void;
+  /**
+   * Inject a text turn (no audio). Useful for tests + chat-only mixed mode.
+   * The text is classified at TrustOrigin `channel` before it is sent:
+   * malicious text is not sent (an `input_blocked` event; the call goes on),
+   * suspicious text is sent with an `input_warned` event. Throws at call time
+   * when not connected; otherwise the returned promise resolves once the
+   * text is sent or refused, in call order, and never rejects (a send that
+   * fails after the check is an `error` event).
+   */
+  sendText(text: string): void | Promise<void>;
   /** Cancel the in-flight response. Used by `barge-in-controller`. */
   interrupt(reason: string): void;
   on(handler: RealtimeEventHandler): () => void;
   disconnect(): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Caller input screening — shared by both adapters.
+// ---------------------------------------------------------------------------
+
+type Emit = (event: RealtimeEvent) => void;
+
+/**
+ * One adapter's input lane: each check, and what follows it (a send, a
+ * cancel), runs in the order it was queued, and a failure surfaces as an
+ * `error` event, never as a rejected promise.
+ */
+function createInputLane(emit: Emit): (task: () => Promise<void>) => Promise<void> {
+  let tail: Promise<void> = Promise.resolve();
+  return (task) => {
+    const next = tail.then(task).catch((err: unknown) => {
+      emit({ kind: "error", message: `input check: ${errorText(err)}` });
+    });
+    tail = next;
+    return next;
+  };
+}
+
+/** Classify caller input at TrustOrigin `channel`: the action and the rule ids. */
+async function checkCallerInput(
+  text: string,
+): Promise<{ readonly action: BoundaryAction; readonly rules: string[] }> {
+  const boundary = await classifyBoundary(text, { origin: "channel" });
+  return { action: boundary.action, rules: boundaryRuleIds(boundary.verdict) };
+}
+
+/**
+ * `sendText`'s body after the call-time connection check: classify, then
+ * `deliver` unless refused. A delivery that throws (the socket closed during
+ * the check) is an `error` event.
+ */
+function sendChecked(
+  lane: (task: () => Promise<void>) => Promise<void>,
+  emit: Emit,
+  text: string,
+  deliver: () => void,
+): Promise<void> {
+  return lane(async () => {
+    const verdict = await checkCallerInput(text);
+    if (verdict.action === "redact") {
+      emit({ kind: "input_blocked", rules: verdict.rules });
+      return;
+    }
+    try {
+      deliver();
+    } catch (err) {
+      emit({ kind: "error", message: `sendText: ${errorText(err)}` });
+      return;
+    }
+    if (verdict.action === "warn") emit({ kind: "input_warned", rules: verdict.rules });
+  });
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +203,8 @@ export interface RealtimeAdapter {
 //   - server events renamed: `response.audio.delta` →
 //     `response.output_audio.delta`, `response.audio_transcript.{delta,done}`
 //     → `response.output_audio_transcript.{delta,done}`
+//   - input transcription is `audio.input.transcription` (the beta
+//     `input_audio_transcription` field is never sent)
 //
 // The READ path still accepts the legacy event names as aliases — they cost
 // three case labels and keep the adapter usable against a gateway or proxy
@@ -125,6 +220,13 @@ const OPENAI_REALTIME_SAMPLE_RATE = 24_000;
  */
 const DEFAULT_OPENAI_REALTIME_MODEL = "gpt-realtime";
 const DEFAULT_OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime";
+/**
+ * The model a session asks to transcribe the caller's speech
+ * (`session.audio.input.transcription.model`), so each transcript can be
+ * classified before later replies build on it. The provider bills it as
+ * transcription.
+ */
+export const DEFAULT_INPUT_TRANSCRIPTION_MODEL = "gpt-transcribe";
 
 /** Test injection: a factory that returns a WebSocket-like (skips `new`). */
 export type WebSocketFactory = (
@@ -168,11 +270,50 @@ export function createOpenAIRealtimeAdapter(
     }
   }
 
-  function send(message: Record<string, unknown>): void {
+  function openSocket(): WebSocketLike {
     if (ws === undefined || ws.readyState !== 1 /* OPEN */) {
       throw new VoiceRuntimeError("adapter is not connected (or socket is not open)");
     }
-    ws.send(JSON.stringify(message));
+    return ws;
+  }
+
+  function send(message: Record<string, unknown>): void {
+    openSocket().send(JSON.stringify(message));
+  }
+
+  const inputLane = createInputLane(emit);
+
+  /**
+   * A transcript of the caller's speech (`undefined` when the provider could
+   * not make one), classified at `channel`. Malicious, or unreadable: the
+   * reply in progress is cancelled and the caller's item deleted, so later
+   * replies do not build on it, and `input_blocked` is emitted; the call goes
+   * on. Suspicious: `input_warned`. The transcript is never emitted.
+   */
+  function checkTranscript(itemId: string | undefined, transcript: string | undefined): void {
+    void inputLane(async () => {
+      const verdict =
+        transcript === undefined
+          ? { action: "redact" as const, rules: ["transcription-failed"] }
+          : await checkCallerInput(transcript);
+      const item = itemId !== undefined ? { itemId } : {};
+      if (verdict.action === "redact") {
+        // Each send tolerates a closed socket: the verdict is reported either way.
+        for (const message of [
+          { type: "response.cancel" },
+          ...(itemId !== undefined ? [{ type: "conversation.item.delete", item_id: itemId }] : []),
+        ]) {
+          try {
+            send(message);
+          } catch {
+            /* socket closed: nothing left to cancel or delete */
+          }
+        }
+        emit({ kind: "input_blocked", ...item, rules: verdict.rules });
+      } else if (verdict.action === "warn") {
+        emit({ kind: "input_warned", ...item, rules: verdict.rules });
+      }
+    });
   }
 
   function handleServerEvent(raw: unknown): void {
@@ -248,6 +389,19 @@ export function createOpenAIRealtimeAdapter(
       case "response.cancelled":
       case "response.cancel":
         emit({ kind: "interrupt", reason: "response cancelled" });
+        break;
+      // The caller's own speech, transcribed because the session asks for it
+      // (the transcript events above are the AGENT's). Each one is checked.
+      case "conversation.item.input_audio_transcription.completed": {
+        const transcript = ev["transcript"];
+        checkTranscript(
+          typeof ev["item_id"] === "string" ? ev["item_id"] : undefined,
+          typeof transcript === "string" ? transcript : undefined,
+        );
+        break;
+      }
+      case "conversation.item.input_audio_transcription.failed":
+        checkTranscript(typeof ev["item_id"] === "string" ? ev["item_id"] : undefined, undefined);
         break;
       case "error": {
         const errObj = ev["error"] as { message?: string } | undefined;
@@ -339,6 +493,8 @@ export function createOpenAIRealtimeAdapter(
       // because GA rejects a combined ["text","audio"] request; the audio
       // response still streams transcript deltas, which is where this
       // adapter's transcript_partial/transcript_final events come from.
+      // `audio.input.transcription` asks for the CALLER's transcript too, so
+      // each utterance can be classified (see checkTranscript).
       send({
         type: "session.update",
         session: {
@@ -352,6 +508,7 @@ export function createOpenAIRealtimeAdapter(
             input: {
               format: { type: "audio/pcm", rate: OPENAI_REALTIME_SAMPLE_RATE },
               turn_detection: connectOpts.vad === "none" ? null : { type: "server_vad" },
+              transcription: { model: DEFAULT_INPUT_TRANSCRIPTION_MODEL },
             },
             output: {
               // `rate` is REQUIRED on an audio/pcm output format — the server
@@ -392,15 +549,18 @@ export function createOpenAIRealtimeAdapter(
     },
 
     sendText(text) {
-      send({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text }],
-        },
+      openSocket(); // not connected: refused at call time
+      return sendChecked(inputLane, emit, text, () => {
+        send({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text }],
+          },
+        });
+        send({ type: "response.create" });
       });
-      send({ type: "response.create" });
     },
 
     interrupt(reason) {
@@ -478,12 +638,18 @@ export function createVapiRealtimeAdapter(
     }
   }
 
-  function send(message: Record<string, unknown>): void {
+  function openSocket(): WebSocketLike {
     if (ws === undefined || ws.readyState !== 1) {
       throw new VoiceRuntimeError("vapi adapter is not connected (or socket is not open)");
     }
-    ws.send(JSON.stringify(message));
+    return ws;
   }
+
+  function send(message: Record<string, unknown>): void {
+    openSocket().send(JSON.stringify(message));
+  }
+
+  const inputLane = createInputLane(emit);
 
   return {
     providerId: "vapi",
@@ -557,8 +723,11 @@ export function createVapiRealtimeAdapter(
     commitInput(): void {
       send({ type: "input_audio_buffer.commit" });
     },
-    sendText(text: string): void {
-      send({ type: "response.create", response: { modalities: ["text", "audio"], input: text } });
+    sendText(text: string): Promise<void> {
+      openSocket(); // not connected: refused at call time
+      return sendChecked(inputLane, emit, text, () => {
+        send({ type: "response.create", response: { modalities: ["text", "audio"], input: text } });
+      });
     },
     interrupt(_reason: string): void {
       try {

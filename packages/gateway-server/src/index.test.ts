@@ -726,6 +726,7 @@ describe("statusFor — exhaustive wire code → HTTP status map", () => {
     expect(statusFor(ErrorCode.BadRequest)).toBe(400);
     expect(statusFor(ErrorCode.BudgetExceeded)).toBe(429);
     expect(statusFor(ErrorCode.InternalError)).toBe(500);
+    expect(statusFor(ErrorCode.InputBlocked)).toBe(422);
     // Unknown / empty codes fall through to the 200 default.
     expect(statusFor("totally_unknown_code")).toBe(200);
     expect(statusFor("")).toBe(200);

@@ -12,9 +12,14 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/idempotency-keys": "workspace:*",
-    "@crewhaus/queue-protocol": "workspace:*"
+    "@crewhaus/queue-protocol": "workspace:*",
+    "@crewhaus/run-context": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/egress-classifier": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

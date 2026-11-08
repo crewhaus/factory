@@ -93,7 +93,8 @@ export type EgressResult = {
  * the sink in deliberately, but we still log + flag the audit trail) and
  * `"block"` on dynamic sinks (the agent reached the sink without explicit
  * spec authorisation; combining that with cross-origin data is too close
- * to the social-engineering exfil pattern).
+ * to the social-engineering exfil pattern), except `"api"`, which warns at
+ * both: a job is handed its input to act on, and each match is audited.
  *
  * Adding a new origin? Update both rows. The §41 `crewhaus doctor`
  * philosophy-alignment check catches drift.
@@ -121,6 +122,11 @@ const ORIGIN_DEFAULT_POLICY: SeverityMatrix = {
   // reply that reaches an unauthorised sink is the same lateral-move shape
   // as a sub-agent's finalMessage reaching one.
   consult: { "external-configured": "warn", "external-dynamic": "block" },
+  // Run input a caller handed over through an API, an SDK or a queue. A job
+  // is asked to act on it, such as fetching a URL it was given or searching
+  // with its caller's question, so a match warns at both scopes and the egress
+  // audit names `api` as its origin.
+  api: { "external-configured": "warn", "external-dynamic": "warn" },
 };
 
 /**

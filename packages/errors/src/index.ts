@@ -165,6 +165,12 @@ export type FailureClass =
    *  below the declared floor with `on_fail: halt`. A CrewHaus-configured
    *  evidence floor, not a provider failure (3x band). */
   | "provability"
+  /** Run input the prompt-injection check refused before any model call: a
+   *  library classified the text where it entered the run (an API request, a
+   *  queue payload, a Worker's chat messages) and the verdict was malicious,
+   *  or the text was too long for the check to read. It has no exit code of
+   *  its own yet: a report of it carries `EXIT_CODES.generic`. */
+  | "input_blocked"
   | "mcp_boot"
   | "context_overflow"
   | "spec"
