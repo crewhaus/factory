@@ -61,17 +61,16 @@ import {
   type ReadDecisionClaim,
   type ReadSupersedeClaim,
   type SupersedeClaim,
-  applyClaims,
   applyDecisionClaim,
   applySupersedeClaim,
   approvalIsExpired,
   approvalsFilePath,
   foldApprovalRecords,
+  foldWithClaims,
   isPendingApprovalShape,
   parseDecisionClaim,
   parseSupersedeClaim,
   readApprovalsFile,
-  readClaims,
 } from "./fold";
 import {
   APPROVALS_DIGEST_KEY_FILE,
@@ -383,12 +382,9 @@ function openTouch(rootDir: string, ledger: Ledger, lockedAppend: LockedAppend):
     );
   }
   const objects = read.state === "read" ? read.objects : [];
-  const folded = foldApprovalRecords(objects);
-  const claims = readClaims(
-    rootDir,
-    folded.records.map((r) => r.id),
-  );
-  const records = new Map(applyClaims(folded.records, claims).map((r) => [r.id, r] as const));
+  const folded = foldWithClaims(rootDir, objects);
+  const { claims } = folded;
+  const records = new Map(folded.records.map((r) => [r.id, r] as const));
   const facts = factsOf(objects);
   let keyed: Promise<CryptoKey> | undefined;
   const key = (): Promise<CryptoKey> => {
@@ -637,10 +633,11 @@ export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter
         if (expiredAt(record, nowMs)) return { outcome: "expired", record };
 
         const by = await storedActor(touch, request.actor, verdict);
+        // The display name goes on the decided line only, never in the claim: a
+        // claim outlives the TTL sweep, and free text must not (see DecisionClaim).
         const claim: DecisionClaim = {
           choice: request.choice,
           decidedAt: now().toISOString(),
-          ...(request.actor.display !== undefined ? { decidedBy: request.actor.display } : {}),
           ...(by !== undefined ? { decidedByPrincipal: by } : {}),
           ...(request.via !== undefined ? { decidedVia: request.via } : {}),
           ...(request.always === true && request.choice === "grant" ? { always: true } : {}),
@@ -655,7 +652,10 @@ export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter
           return { outcome: "already-decided", record: decided, winner: decided };
         }
         await seam.afterClaim?.();
-        const decided = applyDecisionClaim(record, claim);
+        const decided: PendingApproval = {
+          ...applyDecisionClaim(record, claim),
+          ...(request.actor.display !== undefined ? { decidedBy: request.actor.display } : {}),
+        };
         await touch.log(decided, {
           event: "decide",
           at: claim.decidedAt,

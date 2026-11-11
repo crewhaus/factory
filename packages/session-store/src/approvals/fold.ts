@@ -15,6 +15,11 @@
  *    line whose `decision` differs is ignored and counted;
  *  - a readable decision claim (`approvals.d/claims/decision/<appr>.json`) outranks
  *    the file, because the claim is what decided and a compaction cannot rewrite it.
+ *    It decides the fold too, not only the result: for an id with a claim, a line
+ *    whose `decision` differs from the claim's is ignored wherever it sits, so a
+ *    flipped line an 0.8.x compaction kept cannot shut out the lines that agree
+ *    with the claim (the spend of a grant among them). Read the claims first
+ *    ({@link foldWithClaims}), then fold.
  *
  * A claim that cannot be read is reported as a fault and the file's record is left
  * as it is: a read never repairs. Repairs happen under the lock, in `decide.ts`.
@@ -118,24 +123,69 @@ function addToDecided(current: PendingApproval, line: PendingApproval): PendingA
   return next;
 }
 
+/** The fields a decided line sets, and a spend adds. */
+const DECISION_FIELDS = [
+  "decision",
+  "decidedBy",
+  "decidedAt",
+  "decidedByPrincipal",
+  "decidedVia",
+  "always",
+  "consumedAt",
+  "consumedByRun",
+] as const;
+
+/**
+ * A line with every decision and spend field removed: what is left of a line that
+ * disagrees with its id's claim, when it is the only line that says the request exists.
+ */
+function undecided(line: PendingApproval): PendingApproval {
+  const kept: Record<string, unknown> = { ...line };
+  for (const field of DECISION_FIELDS) Reflect.deleteProperty(kept, field);
+  return kept as PendingApproval;
+}
+
+export type FoldOptions = {
+  /**
+   * Each id's decision as its claim records it. For an id named here, a line whose
+   * `decision` differs is ignored even before any line has decided, so the lines
+   * that agree with the claim are the ones that fold: a grant's spend among them.
+   */
+  readonly claimed?: ReadonlyMap<string, ApprovalDecision>;
+};
+
 /**
  * Fold rendezvous lines, already parsed, into one record per id: first decision
- * wins (see the module docblock). Pure: it reads no file and no claim.
+ * wins (see the module docblock). Pure: it reads no file and no claim. A caller
+ * that has the claims passes each id's choice as `claimed`.
  */
-export function foldApprovalRecords(objects: Iterable<unknown>): ApprovalFold {
+export function foldApprovalRecords(
+  objects: Iterable<unknown>,
+  opts: FoldOptions = {},
+): ApprovalFold {
   const byId = new Map<string, PendingApproval>();
   const ignoredById = new Map<string, number>();
   let ignored = 0;
+  const ignore = (id: string): void => {
+    ignored += 1;
+    ignoredById.set(id, (ignoredById.get(id) ?? 0) + 1);
+  };
   for (const value of objects) {
     if (!isPendingApprovalShape(value)) continue;
     const current = byId.get(value.id);
+    const claimed = opts.claimed?.get(value.id);
+    if (claimed !== undefined && value.decision !== undefined && value.decision !== claimed) {
+      // The claim decided otherwise. The line still says the request exists.
+      if (current === undefined) byId.set(value.id, undecided(value));
+      ignore(value.id);
+      continue;
+    }
     if (current === undefined || current.decision === undefined) {
       byId.set(value.id, value);
       continue;
     }
     if (value.decision !== current.decision) {
-      ignored += 1;
-      ignoredById.set(value.id, (ignoredById.get(value.id) ?? 0) + 1);
+      ignore(value.id);
       continue;
     }
     byId.set(value.id, addToDecided(current, value));
@@ -147,11 +197,17 @@ export function foldApprovalRecords(objects: Iterable<unknown>): ApprovalFold {
 // Claims
 // ---------------------------------------------------------------------------
 
-/** What a decision claim records: enough to rebuild the decided line. */
+/**
+ * What a decision claim records: enough to rebuild the decided line, and nothing a
+ * person typed. Claims are kept after the TTL sweep drops their record, so the
+ * free-text display name (`decidedBy`) is NOT stored here: it lives only in the
+ * rendezvous line, which the sweep drops. A repair rebuilds the decided line
+ * without it. The decider is kept as a stored actor (`decidedByPrincipal`: a `prn_`
+ * id or a keyed digest), never as text.
+ */
 export type DecisionClaim = {
   readonly choice: ApprovalDecision;
   readonly decidedAt: string;
-  readonly decidedBy?: string;
   readonly decidedByPrincipal?: string;
   readonly decidedVia?: ReceiptVia;
   readonly always?: true;
@@ -183,16 +239,16 @@ function isStoredPrincipal(value: unknown): boolean {
   return isId("prn", value) || (typeof value === "string" && STORED_LOCAL_ACTOR_RE.test(value));
 }
 
-/** A decision claim's record, or why it is not one. */
+/**
+ * A decision claim's record, or why it is not one. A field it does not know is
+ * ignored, and never carried into the record.
+ */
 export function parseDecisionClaim(
   record: Readonly<Record<string, unknown>>,
 ): DecisionClaim | string {
-  const { choice, decidedAt, decidedBy, decidedByPrincipal, decidedVia, always } = record;
+  const { choice, decidedAt, decidedByPrincipal, decidedVia, always } = record;
   if (choice !== "grant" && choice !== "deny") return "its choice is not grant or deny";
   if (typeof decidedAt !== "string") return "its decidedAt is not a string";
-  if (decidedBy !== undefined && typeof decidedBy !== "string") {
-    return "its decidedBy is not a string";
-  }
   if (decidedByPrincipal !== undefined && !isStoredPrincipal(decidedByPrincipal)) {
     return "its decidedByPrincipal is not a stored actor";
   }
@@ -203,7 +259,6 @@ export function parseDecisionClaim(
   return {
     choice,
     decidedAt,
-    ...(typeof decidedBy === "string" ? { decidedBy } : {}),
     ...(typeof decidedByPrincipal === "string" ? { decidedByPrincipal } : {}),
     ...(decidedVia !== undefined ? { decidedVia: decidedVia as ReceiptVia } : {}),
     ...(always === true && choice === "grant" ? { always: true as const } : {}),
@@ -225,8 +280,13 @@ export function parseSupersedeClaim(
   return { supersededBy, reason: reason as SupersedeReason, parkedAt };
 }
 
-/** The record with a decision claim applied: the claim's decision fields replace the file's. */
+/**
+ * The record with a decision claim applied: the claim's decision fields replace the
+ * file's. The display name (`decidedBy`, which a claim does not hold) is kept only
+ * from the decided line that claim wrote: the same choice at the same instant.
+ */
 export function applyDecisionClaim(record: PendingApproval, claim: DecisionClaim): PendingApproval {
+  const sameLine = record.decision === claim.choice && record.decidedAt === claim.decidedAt;
   const {
     decision: _decision,
     decidedBy: _decidedBy,
@@ -239,7 +299,7 @@ export function applyDecisionClaim(record: PendingApproval, claim: DecisionClaim
   return {
     ...rest,
     decision: claim.choice,
-    ...(claim.decidedBy !== undefined ? { decidedBy: claim.decidedBy } : {}),
+    ...(sameLine && record.decidedBy !== undefined ? { decidedBy: record.decidedBy } : {}),
     decidedAt: claim.decidedAt,
     ...(claim.decidedByPrincipal !== undefined
       ? { decidedByPrincipal: claim.decidedByPrincipal }
@@ -333,27 +393,49 @@ export function applyClaims(
   });
 }
 
-export type ClaimOverlay = {
-  readonly records: PendingApproval[];
+/** Each id's claimed choice, for {@link foldApprovalRecords}' `claimed`. */
+export function claimedChoices(claims: ClaimsRead): Map<string, ApprovalDecision> {
+  const claimed = new Map<string, ApprovalDecision>();
+  for (const [id, read] of claims.decisions) claimed.set(id, read.claim.choice);
+  return claimed;
+}
+
+const NO_CLAIMS: ClaimsRead = { decisions: new Map(), supersedes: new Map(), faults: [] };
+
+export type ClaimFold = ApprovalFold & {
   /** Claims that exist and could not be read: their records are left as the file says. */
   readonly faults: readonly ClaimFault[];
+  readonly claims: ClaimsRead;
 };
 
 /**
- * Apply the session root's decision and supersede claims to folded records. A
- * readable decision claim outranks the file; a supersede claim sets `supersededBy`
- * and `supersededReason`. Synchronous and read-only: it creates nothing, and a
- * claim it cannot read is a fault, never a repair.
+ * Fold rendezvous lines the way every reader and writer does: read the session
+ * root's claims for the ids the lines name, fold first-decision-wins with each
+ * claim's choice deciding (so a line that disagrees with a claim is ignored), then
+ * apply the claims. `select` limits the ids whose claims are read and whose records
+ * come back. Synchronous and read-only: it creates nothing, and a claim it cannot
+ * read is a fault, never a repair.
  */
-export function overlayDecisionClaims(
+export function foldWithClaims(
   rootDir: string,
-  records: readonly PendingApproval[],
-): ClaimOverlay {
-  const claims = readClaims(
-    rootDir,
-    records.map((r) => r.id),
-  );
-  return { records: applyClaims(records, claims), faults: claims.faults };
+  objects: readonly unknown[],
+  opts: { readonly select?: (line: PendingApproval) => boolean } = {},
+): ClaimFold {
+  const ids = new Set<string>();
+  for (const value of objects) {
+    if (isPendingApprovalShape(value) && (opts.select?.(value) ?? true)) ids.add(value.id);
+  }
+  const claims = ids.size === 0 ? NO_CLAIMS : readClaims(rootDir, ids);
+  const folded = foldApprovalRecords(objects, { claimed: claimedChoices(claims) });
+  const records =
+    opts.select === undefined ? folded.records : folded.records.filter((r) => ids.has(r.id));
+  return {
+    records: applyClaims(records, claims),
+    ignored: folded.ignored,
+    ignoredById: folded.ignoredById,
+    faults: claims.faults,
+    claims,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -437,13 +519,12 @@ export function foldReadOnly(rootDir: string): ReadOnlyFold {
       ...(read.state === "unreadable" ? { reason: read.reason } : {}),
     };
   }
-  const folded = foldApprovalRecords(read.objects);
-  const overlay = overlayDecisionClaims(rootDir, folded.records);
+  const folded = foldWithClaims(rootDir, read.objects);
   return {
     state: "read",
-    records: overlay.records,
+    records: folded.records,
     ignored: folded.ignored,
     ignoredById: folded.ignoredById,
-    faults: overlay.faults,
+    faults: folded.faults,
   };
 }

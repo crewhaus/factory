@@ -6,10 +6,10 @@
  * rewrite an operator's approvals ledger. So reads take the JSONL through
  * control-records' tail reader, under the same caps as every other view in
  * this package but from the file's NEWEST end, so a large file shows its
- * latest asks, and fold it the store's way (`foldApprovalRecords`): the first
- * decision on a request wins, and the decision claims beside the file
- * (`overlayDecisionClaims`) outrank it. A final line with no newline is a
- * write still landing: it waits for the next read.
+ * latest asks, and fold it the store's way (`foldWithClaims`): the first
+ * decision on a request wins, and the decision claims beside the file outrank
+ * it, so a line that disagrees with a claim never folds. A final line with no
+ * newline is a write still landing: it waits for the next read.
  *
  * WRITES GO THROUGH THE SANCTIONED STORE. Grant and deny call the store's
  * `decide`, which takes the session root's lock and publishes an exclusive
@@ -31,8 +31,7 @@ import {
   type ApprovalDecision,
   type PendingApproval,
   createPendingApprovalStore,
-  foldApprovalRecords,
-  overlayDecisionClaims,
+  foldWithClaims,
   ownerAuthorizer,
 } from "@crewhaus/session-store";
 import { MAX_JSONL_BYTES, MAX_JSONL_LINES } from "./constants";
@@ -113,9 +112,7 @@ export function foldApprovals(harnessDir: string): {
     followLeafSymlink: true,
   });
   if (read.state !== "read") return { approvals: [], truncated: false };
-  const folded = foldApprovalRecords(read.records);
-  const approvals =
-    folded.records.length === 0 ? [] : overlayDecisionClaims(root, folded.records).records;
+  const approvals = foldWithClaims(root, read.records).records;
   return { approvals, truncated: read.truncated };
 }
 

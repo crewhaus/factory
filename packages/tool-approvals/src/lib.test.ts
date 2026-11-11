@@ -204,6 +204,24 @@ describe("foldApprovals", () => {
     expect(foldApprovals(file).records.map(statusOf)).toEqual(["denied"]);
   });
 
+  test("a flipped line an 0.8.x compaction kept does not hide a spend of the claimed grant", async () => {
+    const sessions = path.join(tmp, ".crewhaus", "sessions");
+    const store = createPendingApprovalStore({ rootDir: sessions });
+    const waiting = approval({ id: approvalId(1), createdAt: new Date().toISOString() });
+    await store.persist(waiting as never);
+    const decided = await store.decide(
+      approvalId(1),
+      { choice: "grant", actor: {} },
+      { authorize: allowSingleOwner },
+    );
+    // The deny line a compaction kept, then the runtime's spend of the grant.
+    const file = writeApprovals(tmp, [
+      { ...waiting, decision: "deny", decidedAt: "2026-09-18T10:02:00Z" },
+      { ...decided.record, consumedAt: new Date().toISOString() },
+    ]);
+    expect(foldApprovals(file).records.map(statusOf)).toEqual(["consumed"]);
+  });
+
   test("a superseded record shows superseded, and its replacement waits", async () => {
     const sessions = path.join(tmp, ".crewhaus", "sessions");
     const store = createPendingApprovalStore({ rootDir: sessions });

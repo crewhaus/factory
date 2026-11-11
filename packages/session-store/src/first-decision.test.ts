@@ -44,13 +44,22 @@ const decideLines = (root: string, id: string) =>
   logLines(root).filter((l) => l["event"] === "decide" && l["decision"] === id);
 
 /** Publish a decision claim the way another writer would, with no lines after it. */
-function plantDecision(root: string, id: string, choice: "grant" | "deny", by = "someone"): void {
+function plantDecision(root: string, id: string, choice: "grant" | "deny"): void {
   const published = publishClaim(approvalsLedger(root), `decision/${id}`, {
     choice,
     decidedAt: "2026-11-11T10:00:00.000Z",
-    decidedBy: by,
   });
   expect(published.ok).toBe(true);
+}
+
+/** Every file under `approvals.d/claims/`, as text. */
+function claimTexts(root: string): string[] {
+  const dir = join(root, APPROVALS_DIRNAME, "claims");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { recursive: true, encoding: "utf8" })
+    .map((name) => join(dir, name))
+    .filter((path) => statSync(path).isFile())
+    .map((path) => readFileSync(path, "utf8"));
 }
 
 describe("the first decision wins", () => {
@@ -83,12 +92,13 @@ describe("the first decision wins", () => {
     await seam.reached;
     _setApprovalSeamsForTest(undefined);
     // B decides while A sits past its fold, as a writer that stole the lock would.
-    plantDecision(root, p.id, "deny", "B");
+    plantDecision(root, p.id, "deny");
     seam.release();
     const answer = await a;
     expect(answer.outcome).toBe("already-decided");
     expect(answer.winner?.decision).toBe("deny");
-    expect(answer.winner?.decidedBy).toBe("B");
+    // A claim holds no display name, so the completed line carries none.
+    expect(answer.winner?.decidedBy).toBeUndefined();
     const lines = decidedLines(root, p.id);
     expect(lines.map((l) => l["decision"])).toEqual(["deny"]);
     const logged = decideLines(root, p.id);
@@ -179,12 +189,43 @@ describe("the first decision wins", () => {
     expect(decideLines(root, p.id)).toHaveLength(1);
   });
 
+  test("a grant spent after an 0.8.x flip and compaction stays spent, through the sweep", async () => {
+    const root = tempRoot();
+    const store = createPendingApprovalStore({ rootDir: root });
+    const p = pending();
+    await store.persist(p);
+    await store.decide(p.id, { choice: "grant", actor: { display: "max" } }, ALLOW);
+    // An 0.8.x deny, then an 0.8.x compaction that kept only that line.
+    writeFileSync(
+      join(root, DEFAULT_APPROVALS_FILENAME),
+      `${JSON.stringify({ ...p, decision: "deny", decidedBy: "eve", decidedAt: new Date().toISOString() })}\n`,
+    );
+    const grant = await store.get(p.toolName, p.inputHash);
+    expect(grant?.decision).toBe("grant");
+    expect(grant?.consumedAt).toBeUndefined();
+    if (grant === null) throw new Error("unreachable");
+    // The runtime spends it.
+    await store.persist({ ...grant, consumedAt: new Date().toISOString() });
+    expect(await store.get(p.toolName, p.inputHash)).toBeNull();
+    const read = foldReadOnly(root).records[0];
+    expect(read?.decision).toBe("grant");
+    expect(read?.consumedAt).toBeDefined();
+    expect(logLines(root).filter((l) => l["event"] === "consume")).toHaveLength(1);
+    // The boot sweep rewrites the file from the fold: the spend survives it.
+    await evictExpiredApprovals({ rootDir: root });
+    const kept = rendezvousLines(root).filter((l) => l["id"] === p.id);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]?.["decision"]).toBe("grant");
+    expect(kept[0]?.["consumedAt"]).toBeDefined();
+    expect(await store.get(p.toolName, p.inputHash)).toBeNull();
+  });
+
   test("a crash between claim and append: reads show it decided, the next write repairs it once", async () => {
     const root = tempRoot();
     const store = createPendingApprovalStore({ rootDir: root });
     const p = pending();
     await store.persist(p);
-    plantDecision(root, p.id, "grant", "max");
+    plantDecision(root, p.id, "grant");
     // A read shows the decision, and writes nothing.
     expect(foldReadOnly(root).records[0]?.decision).toBe("grant");
     expect((await store.get(p.toolName, p.inputHash))?.decision).toBe("grant");
@@ -381,6 +422,34 @@ describe("defer", () => {
     await expect(at("2026-11-12")).rejects.toThrow(/not an ISO date and time/);
     await expect(at("2026-11-10T09:00:00Z")).rejects.toThrow(/not later than now/);
     await expect(at("2026-11-12T09:00:00Z", "busy")).rejects.toThrow(/awaiting-information/);
+  });
+});
+
+describe("what a claim keeps", () => {
+  test("no free text outlives the TTL: an evicted request's claim holds no display name", async () => {
+    const root = tempRoot();
+    const NAME = "Alice Smith";
+    const store = createPendingApprovalStore({ rootDir: root });
+    const p = pending();
+    await store.persist(p);
+    const decided = await store.decide(p.id, { choice: "grant", actor: { display: NAME } }, ALLOW);
+    expect(decided.outcome).toBe("decided");
+    // Before the TTL the name is shown, from the decided line.
+    expect(decided.record?.decidedBy).toBe(NAME);
+    expect(foldReadOnly(root).records[0]?.decidedBy).toBe(NAME);
+    const later = new Date(Date.now() + 40 * 86_400_000);
+    const swept = await evictExpiredApprovals({ rootDir: root, now: () => later });
+    expect(swept.evictedIds).toEqual([p.id]);
+    expect(rendezvousLines(root)).toHaveLength(0);
+    // The claim is kept, so the first decision still wins; it names no one in text.
+    const claims = claimTexts(root);
+    expect(claims.length).toBeGreaterThan(0);
+    expect(claims.some((text) => text.includes('"choice":"grant"'))).toBe(true);
+    for (const text of claims) {
+      expect(text).not.toContain(NAME);
+      expect(text).not.toContain('decidedBy"');
+    }
+    expect(logText(root)).not.toContain(NAME);
   });
 });
 

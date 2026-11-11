@@ -55,9 +55,8 @@ import {
 } from "./approvals/decide";
 import {
   approvalIsExpired,
-  foldApprovalRecords,
   foldReadOnly,
-  overlayDecisionClaims,
+  foldWithClaims,
   readApprovalsFile,
 } from "./approvals/fold";
 import { fencePath } from "./fence";
@@ -1029,13 +1028,14 @@ export function createPendingApprovalStore(
         throw new RuntimeError(`session-store: refusing to read the approvals log: ${read.reason}`);
       }
       // Claims are read only for the records this call could return.
-      const candidates = foldApprovalRecords(read.objects).records.filter(
-        (a) => a.toolName === toolName && a.inputHash === inputHash,
-      );
+      const match = (a: PendingApproval): boolean =>
+        a.toolName === toolName && a.inputHash === inputHash;
+      const candidates = foldWithClaims(rootDir, read.objects, { select: match }).records;
       const cutoff = cutoffMs();
       let best: PendingApproval | null = null;
       let bestAt = -1;
-      for (const approval of overlayDecisionClaims(rootDir, candidates).records) {
+      for (const approval of candidates) {
+        if (!match(approval)) continue;
         if (approval.consumedAt !== undefined) continue;
         if (approval.supersededBy !== undefined) continue;
         if (approvalIsExpired(approval, cutoff)) continue;
@@ -1107,11 +1107,12 @@ export {
 export {
   type ApprovalFold,
   type ClaimFault,
-  type ClaimOverlay,
+  type ClaimFold,
+  type FoldOptions,
   type ReadOnlyFold,
   foldApprovalRecords,
   foldReadOnly,
-  overlayDecisionClaims,
+  foldWithClaims,
 } from "./approvals/fold";
 export {
   ACTION_DIGEST_LABEL,

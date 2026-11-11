@@ -12,8 +12,8 @@
  * ---------------------------------------------------------------------------
  * `@crewhaus/session-store` owns `PendingApproval`, its file names and how it
  * folds: first decision wins, and a decision claim beside the file outranks it.
- * This package reads through `foldApprovalRecords` and `overlayDecisionClaims`,
- * so a status here is the status the CLI, Home and the runtime see. The record
+ * This package reads through `foldWithClaims` (claims read first, then the
+ * fold, so a line that disagrees with a claim never folds), so a status here is the status the CLI, Home and the runtime see. The record
  * is re-declared STRUCTURALLY: only the fields these tools project, all optional
  * except the seven the store's own shape check requires. A record carrying
  * fields we do not know about passes through untouched.
@@ -32,8 +32,7 @@ import {
   DEFAULT_APPROVALS_FILENAME,
   DEFAULT_ROOT_DIR,
   APPROVAL_ID_RE as STORE_APPROVAL_ID_RE,
-  foldApprovalRecords,
-  overlayDecisionClaims,
+  foldWithClaims,
 } from "@crewhaus/session-store";
 import type { OperativeArg } from "@crewhaus/tool-catalog";
 import { readOperativeField } from "@crewhaus/tool-executor";
@@ -150,9 +149,7 @@ export type FoldResult = {
 export function foldApprovals(path: string, maxLines?: number, maxBytes?: number): FoldResult {
   const read = readJsonlCapped(path, maxLines, maxBytes);
   const foreignLines = read.objects.filter((obj) => !isApprovalShape(obj)).length;
-  const folded = foldApprovalRecords(read.objects);
-  const records: readonly ApprovalRecord[] =
-    folded.records.length === 0 ? [] : overlayDecisionClaims(dirname(path), folded.records).records;
+  const records: readonly ApprovalRecord[] = foldWithClaims(dirname(path), read.objects).records;
   return { records, foreignLines, read };
 }
 
