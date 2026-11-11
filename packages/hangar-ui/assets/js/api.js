@@ -1,47 +1,49 @@
 /**
  * API client. Every request is built from the `routes.js` contract map
  * (the same map the hangar server's contract test drives), attaches the
- * bearer token, and enforces two read-path invariants:
+ * session, and enforces two read-path invariants:
  *
  *   - 404 → `null`, never an error ("absence is not an error" — the caller
  *     renders a "nothing yet" empty state);
- *   - 401 → the registered unauthorized handler fires (the app swaps in the
- *     token screen) and the request rejects with `ApiError(401)`.
+ *   - 401 → the registered unauthorized handler fires (the app signs in
+ *     again, silently with this browser's key when it can, else the sign-in
+ *     screen) and the request rejects with `ApiError(401)`.
  *
- * The token arrives via the `#t=<token>` URL fragment (fragments never
- * reach server logs) and lives in sessionStorage only — never in a cookie
- * (no cookies ⇒ no CSRF surface) and never in a query string.
+ * The bearer is a session (`cha_…`) that `sign-in.js` obtained sealed to this
+ * tab. It lives in sessionStorage only — never in a cookie (no cookies ⇒ no
+ * CSRF surface), never in a URL — and ends with the tab. Home's own key never
+ * reaches the browser.
  */
 
 import { ROUTES, buildPath, m3RouteKeys } from "./routes.js";
 import { createSseParser } from "./supervision.js";
 
-const TOKEN_KEY = "hangar.token";
+const SESSION_KEY = "hangar.session";
 
 let unauthorizedHandler = null;
 
-/** Register the single 401 handler (the app's token screen). */
+/** Register the single 401 handler (the app's sign-in path). */
 export function onUnauthorized(fn) {
   unauthorizedHandler = fn;
 }
 
-/** Current bearer token, or null. */
-export function getToken() {
+/** This tab's session secret, or null. */
+export function getSession() {
   try {
-    return sessionStorage.getItem(TOKEN_KEY);
+    return sessionStorage.getItem(SESSION_KEY);
   } catch {
     return null;
   }
 }
 
-/** Store (or clear, with null) the bearer token for this tab session. */
-export function setToken(token) {
+/** Store (or clear, with null) this tab's session secret. */
+export function setSession(secret) {
   try {
-    if (token === null || token === "") sessionStorage.removeItem(TOKEN_KEY);
-    else sessionStorage.setItem(TOKEN_KEY, token);
+    if (secret === null || secret === "") sessionStorage.removeItem(SESSION_KEY);
+    else sessionStorage.setItem(SESSION_KEY, secret);
   } catch {
     // sessionStorage unavailable — requests proceed unauthenticated and the
-    // server's 401 keeps routing the user to the token screen.
+    // server's 401 keeps routing the user to sign-in.
   }
 }
 
@@ -56,13 +58,13 @@ export class ApiError extends Error {
 
 function authHeaders(accept) {
   const headers = { accept };
-  const token = getToken();
-  if (token) headers.authorization = `Bearer ${token}`;
+  const session = getSession();
+  if (session) headers.authorization = `Bearer ${session}`;
   return headers;
 }
 
 /** One request, reported as `{ status, body }` — no throwing on a non-2xx.
- *  401 still fires the unauthorized handler (the token screen owns the view). */
+ *  401 still fires the unauthorized handler (sign-in owns the view). */
 async function rawRequest(method, path, body) {
   const headers = authHeaders("application/json");
   const init = { method, headers };
@@ -146,6 +148,8 @@ function startBody(opts) {
  * `state`/`output`/`exit`, and ALWAYS `done` last — so a closed run replays
  * and terminates with no live-vs-dead branch here. A dropped connection
  * emits a synthetic `{ event: "closed" }` so the view can tell the two apart.
+ * A stream whose session ended closes with `auth.expired` or `auth.revoked`
+ * first: that takes the same path as a 401.
  */
 export function streamRunEvents(id, runId, onFrame) {
   const controller = new AbortController();
@@ -187,6 +191,9 @@ export function streamRunEvents(id, runId, onFrame) {
       if (chunk.done) break;
       for (const frame of parser.push(decoder.decode(chunk.value, { stream: true }))) {
         emit(frame.event, frame.data);
+        if (frame.event === "auth.expired" || frame.event === "auth.revoked") {
+          if (unauthorizedHandler) unauthorizedHandler();
+        }
       }
     }
     emit("closed", null);
@@ -207,7 +214,7 @@ export function streamRunEvents(id, runId, onFrame) {
  * with the version that moved under you, a `501 not implemented (M3)` while
  * a handler is still a stub. Turning any of those into an `ApiError` throws
  * away the exact payload the screen exists to render. `401` still routes to
- * the token screen (that is a session fact, not a route answer).
+ * sign-in (that is a session fact, not a route answer).
  */
 async function callM3(route, params, body, query) {
   const path = `${buildPath(route.path, params ?? {})}${query ?? ""}`;
@@ -246,8 +253,49 @@ for (const key of m3RouteKeys()) {
  * generated wrappers above (hand-written names below win a collision, so a
  * route that later earns a friendlier signature can simply be written out).
  */
+/**
+ * One sign-in request: its refusal is an answer (`{ok, status, body}`), and a
+ * 401 here never fires the unauthorized handler — sign-in IS that handler.
+ * `bearer` names the credential explicitly, so a stale session in storage is
+ * never sent where it is not meant.
+ */
+async function authCall(route, body, bearer) {
+  const headers = { accept: "application/json" };
+  if (bearer) headers.authorization = `Bearer ${bearer}`;
+  const init = { method: route.method, headers };
+  if (body !== undefined) {
+    headers["content-type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  let res;
+  try {
+    res = await fetch(route.path, init);
+  } catch (err) {
+    return {
+      ok: false,
+      status: 0,
+      body: { message: err instanceof Error ? err.message : String(err) },
+    };
+  }
+  let parsed = null;
+  try {
+    const text = await res.text();
+    parsed = text === "" ? null : JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  return { ok: res.status >= 200 && res.status < 300, status: res.status, body: parsed ?? {} };
+}
+
 export const api = {
   ...m3Api,
+  // signing in (answers, never throws; see authCall)
+  authChallenge: () => authCall(ROUTES.authChallenge),
+  authSession: (body) => authCall(ROUTES.authSession, body),
+  authExchange: (body) => authCall(ROUTES.authExchange, body),
+  authRefresh: (body) => authCall(ROUTES.authRefresh, body, getSession()),
+  authSignOut: () => authCall(ROUTES.authSignOut, {}, getSession()),
+  bootTicket: (bearer) => authCall(ROUTES.bootTicket, {}, bearer),
   // fleet feed + registry CRUD
   harnesses: (hydrate = false) =>
     call(ROUTES.harnesses, {}, undefined, hydrate ? "?hydrate=1" : ""),

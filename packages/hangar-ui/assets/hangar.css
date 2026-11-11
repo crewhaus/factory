@@ -1285,20 +1285,42 @@ dl.kv dd {
   padding: 0;
 }
 
-/* ── token screen ──────────────────────────────────────────────────────── */
+/* ── sign-in screen ────────────────────────────────────────────────────── */
 
-.token-screen {
+.sign-in-screen {
   display: grid;
   place-items: center;
   padding: 40px 0;
 }
-.token-card {
+.sign-in-card {
   max-width: 480px;
+  width: 100%;
 }
-.token-form {
+.sign-in-twin {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.sign-in-form {
+  display: grid;
+  gap: 6px;
+}
+.sign-in-row {
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
+.sign-in-input {
+  flex: 1 1 12rem;
+  min-width: 0;
+  font-family: var(--mono);
+}
+.sign-in-message:empty {
+  display: none;
+}
+/* A typed confirmation (the inspector's save): monospace, like what it echoes. */
 .token-input {
   flex: 1;
   font-family: var(--mono);

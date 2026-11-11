@@ -1,8 +1,9 @@
 /**
- * Hangar console entry. Boot order: token bootstrap (read `#t=<token>`
- * from the URL fragment into sessionStorage and strip it via replaceState),
- * theme, shell render, router start, version footer. Booting is guarded on
- * `document` existing so the module can be imported by tests.
+ * Hangar console entry. Boot order: theme, sign-in (`sign-in.js`: a one-time
+ * `#x=` code from a boot link, this tab's session, this browser's own key, or
+ * the sign-in screen), then shell render, router start, version footer.
+ * Booting is guarded on `document` existing so the module can be imported by
+ * tests.
  *
  * M2 adds the fleet-wide nav (Runs, Approvals, Review, Activity) with live
  * counts, and gives the harness header its supervision pill, bundle
@@ -21,7 +22,7 @@
  * screen still answers, so no URL an operator saved goes dead.
  */
 
-import { ApiError, api, onUnauthorized, setToken } from "./api.js";
+import { ApiError, api, onUnauthorized } from "./api.js";
 import { clear, copyBtn, dot, el, skeleton, toast } from "./dom.js";
 import { bindingSheet, globalKey, initialKeyState, keyShape } from "./keys.js";
 import { notifications } from "./notify.js";
@@ -44,6 +45,7 @@ import {
   tabAvailability,
 } from "./router.js";
 import { shapeAccentVars, shapeLabel } from "./shapes.js";
+import * as signIn from "./sign-in.js";
 import { procRow } from "./supervision.js";
 import { openDialog } from "./ui/dialog.js";
 import { installLive } from "./ui/live.js";
@@ -74,10 +76,10 @@ import { renderSchedulers } from "./views/schedulers.js";
 import { renderSecurity } from "./views/security.js";
 import { renderSessions } from "./views/sessions.js";
 import { renderSettings } from "./views/settings.js";
+import { renderSignInScreen } from "./views/sign-in.js";
 import { renderSpecEdit } from "./views/spec-edit.js";
 import { renderSpec } from "./views/spec.js";
 import { renderThredz, renderThredzGlobal } from "./views/thredz.js";
-import { renderTokenScreen } from "./views/token.js";
 
 const TAB_LABELS = {
   overview: "Overview",
@@ -130,20 +132,6 @@ let keyState = initialKeyState();
 let omnibox = null;
 let sheet = null;
 let notificationsStarted = false;
-
-/** Move a `#t=<token>` fragment into sessionStorage and off the URL. */
-function bootstrapToken() {
-  const m = window.location.hash.match(/^#t=(.+)$/);
-  if (m === null) return;
-  let token = m[1];
-  try {
-    token = decodeURIComponent(token);
-  } catch {
-    // keep the raw fragment
-  }
-  setToken(token);
-  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/`);
-}
 
 /** Theme and Readability go on the root before the first paint, so nothing
  *  draws once in the wrong size or colours. The record lives in prefs.js,
@@ -435,7 +423,7 @@ async function dispatch(route) {
     }
   } catch (err) {
     if (seq !== dispatchSeq) return; // superseded by a newer navigation
-    if (err instanceof ApiError && err.status === 401) return; // token screen owns the view
+    if (err instanceof ApiError && err.status === 401) return; // sign-in owns the view
     renderError(viewRoot, err);
   }
 }
@@ -818,26 +806,51 @@ function drawSheet() {
   });
 }
 
-function boot() {
-  bootstrapToken();
+async function boot() {
   initTheme();
   installLive();
   installTooltips();
   const appRoot = document.getElementById("app");
-  renderShell(appRoot);
-  onUnauthorized(() => {
-    renderTokenScreen(viewRoot, () => {
-      loadVersion();
-      loadNavCounts();
-      // The polls that ran while the token was missing answered 401 and
-      // returned nothing; take a reading now rather than at the next tick.
-      notifications.refresh();
-      dispatch(parseRoute(window.location.hash));
+  // Signed back in after a 401: the polls that ran while the session was
+  // missing answered 401 and returned nothing, so take a reading now rather
+  // than at the next tick, and draw the screen the person was on.
+  const resume = () => {
+    loadVersion();
+    loadNavCounts();
+    notifications.refresh();
+    dispatch(parseRoute(window.location.hash));
+  };
+  // Several requests can answer 401 at once; one of them signs back in.
+  let reauth = null;
+  const start = () => {
+    renderShell(appRoot);
+    onUnauthorized(() => {
+      if (reauth !== null) return;
+      reauth = signIn
+        .recover()
+        .then((ok) => {
+          if (ok) resume();
+          else renderSignInScreen(viewRoot, { onSignedIn: resume });
+        })
+        .finally(() => {
+          reauth = null;
+        });
     });
-  });
-  startRouter((route) => {
-    dispatch(route);
-  });
+    startRouter((route) => {
+      dispatch(route);
+    });
+  };
+  const signedIn = await signIn.boot();
+  if (signedIn.navigating === true) return;
+  if (signedIn.signedIn) {
+    start();
+    return;
+  }
+  // Nothing on screen asks the server for anything until this tab is signed in.
+  clear(appRoot);
+  const main = el("main", { class: "view", id: "view", tabindex: "-1" });
+  appRoot.appendChild(main);
+  renderSignInScreen(main, { message: signedIn.message ?? "", onSignedIn: start });
 }
 
 if (typeof document !== "undefined") boot();

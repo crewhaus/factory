@@ -178,6 +178,28 @@ export const THREDZ_PANELS = [
   "Keys",
 ] as const;
 
+/** The sign-in screen has no route of its own: it is what a tab with nothing shows. */
+export const SIGN_IN_TEMPLATE = "#/sign-in";
+
+/**
+ * Bring a signed-in tab to the sign-in screen: drop its session, forget its key, and
+ * reload. Leaves the tab signed out, so it comes last in anything that uses it.
+ */
+export async function showSignInScreen(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    sessionStorage.removeItem("hangar.session");
+    await new Promise<void>((resolve) => {
+      const request = indexedDB.deleteDatabase("crewhaus-home");
+      request.onsuccess = () => resolve();
+      request.onerror = () => resolve();
+      request.onblocked = () => resolve();
+    });
+  });
+  await page.reload();
+  await waitFor(page, "#sign-in-title", "the sign-in screen");
+  await settle(page, "the sign-in screen");
+}
+
 export type ScreenState = {
   /** The gated template the state belongs to. */
   readonly template: string;
@@ -390,6 +412,13 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     });
   }
+  // Last: it leaves the tab signed out.
+  states.push({
+    template: SIGN_IN_TEMPLATE,
+    state: "first paint",
+    route: LIBRARY_ROUTE,
+    open: showSignInScreen,
+  });
   return states;
 }
 

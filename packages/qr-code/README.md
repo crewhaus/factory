@@ -10,7 +10,7 @@ with no data files, which also keeps it safe to embed in the `bun build --compil
 ```ts
 import { encodeQr, renderQrLines } from "@crewhaus/qr-code";
 
-const qr = encodeQr("http://192.168.1.42:4200/#t=…");
+const qr = encodeQr("http://192.168.1.42:4200");
 for (const line of renderQrLines(qr)) console.log(line);
 ```
 
@@ -20,8 +20,8 @@ ISO/IEC 18004 in **byte mode only**, versions 1–40, all four error-correction 
 automatic version selection, the spec's mask evaluation, and Reed–Solomon over GF(256).
 
 Byte mode is the whole encoder on purpose. Numeric and alphanumeric modes only pay for themselves
-alongside a segmentation optimiser, and the payloads this was built for — `http://host:port/#t=…`
-— contain lowercase letters, which the alphanumeric character set cannot hold. Byte mode over
+alongside a segmentation optimiser, and the payloads this was built for — `http://host:port`
+and its paths — contain lowercase letters, which the alphanumeric character set cannot hold. Byte mode over
 UTF-8 encodes every input correctly; the cost is at most one extra version for an all-digit
 payload.
 

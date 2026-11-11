@@ -6,7 +6,8 @@
  * controls that keep focus across their own updates, a refresh that keeps an
  * open editor, and the Readability choices. Two edits that must not slip past
  * a newer version close it: a conflict asks for the typed confirmation again,
- * and a restored wiki draft saves against the version it was typed on.
+ * and a restored wiki draft saves against the version it was typed on. The
+ * sign-in screen is toured too.
  */
 import { join } from "node:path";
 import { createWikiStore } from "@crewhaus/wiki-store";
@@ -25,6 +26,7 @@ import {
   mockRefusals,
   resetOverlays,
   setPrefs,
+  showSignInScreen,
   waitFor,
 } from "./a11y-states";
 import type { Journey, JourneyScope } from "./journey";
@@ -85,6 +87,29 @@ function grantCounter(page: Page): () => number {
     }
   });
   return () => grants;
+}
+
+/** The sign-in screen by keyboard alone: focus starts on its heading, every control is
+ *  reached with a visible ring and no trap, and a pasted key is refused from the keyboard. */
+async function signInScreen(session: Session): Promise<void> {
+  const { page } = session;
+  await showSignInScreen(page);
+  if (!(await activeMatches(page, "#sign-in-title"))) {
+    fail("the sign-in screen did not put focus on its heading");
+  }
+  const tour = await focusTour(page);
+  if (tour.reached < 3) fail(`Tab reached ${tour.reached} controls on the sign-in screen`);
+  if (tour.findings.length > 0) {
+    fail(
+      `the sign-in screen's focus tour found:\n  ${tour.findings.map((f) => `${f.rule}: ${f.detail}`).join("\n  ")}`,
+    );
+  }
+  await page.getByLabel("Sign-in link").focus();
+  await page.keyboard.type("ab".repeat(32));
+  await page.keyboard.press("Enter");
+  await until(page, "the field to refuse Home's own key", async () =>
+    (await page.locator(".sign-in-message").innerText()).includes("Home's own key"),
+  );
 }
 
 async function skipLink(session: Session): Promise<void> {
@@ -678,6 +703,8 @@ export const keyboardTour: Journey = {
         await inbox(session, id);
         await firstRunAndReadability(session, id);
         await conflictAsksAgain(session, id);
+        // Last: it leaves the tab signed out.
+        await signInScreen(session);
       }
       session.assertClean();
       await session.close();

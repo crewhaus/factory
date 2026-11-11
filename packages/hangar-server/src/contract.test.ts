@@ -42,6 +42,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
+import { bearer, codeFrom, sealedJs, signInJs } from "./__test__/browser";
 import { runCorpusEval } from "./__test__/eval-corpus";
 import { EVAL_JOB_ARGV } from "./eval-inputs";
 import { logLine, makeFixtureHarness } from "./fixture";
@@ -79,7 +80,29 @@ async function loadRoutes(): Promise<Record<string, RouteDef>> {
 // `|` ("string|null").
 // ---------------------------------------------------------------------------
 
+/** What `sign-in.js` reads of a sealed session answer. */
+const SESSION_ISSUED: ReadonlyArray<readonly [string, string]> = [
+  ["issued.alg", "string"],
+  ["issued.epk", "string"],
+  ["issued.iv", "string"],
+  ["issued.ct", "string"],
+  ["expiresAt", "string"],
+  ["principal", "string"],
+  ["device", "string"],
+];
+
 const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
+  // sign-in.js: a challenge to sign, three sealed answers, sign-out, and the legacy
+  // migration's boot link
+  authChallenge: [
+    ["nonce", "string"],
+    ["expiresAt", "string"],
+  ],
+  authExchange: SESSION_ISSUED,
+  authSession: SESSION_ISSUED,
+  authRefresh: SESSION_ISSUED,
+  authSignOut: [["signedOut", "boolean"]],
+  bootTicket: [["bootPath", "string"]],
   // app.js loadVersion
   version: [
     ["hangar", "string"],
@@ -518,6 +541,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["plugin", "string"],
     ["paneId", "string"],
     ["title", "string"],
+    ["src", "string"],
     ["doc", "string"],
     ["sandbox", "string"],
     ["csp", "string"],
@@ -1873,7 +1897,13 @@ describe("UI route contract", () => {
       const drive = async (
         key: string,
         params: Record<string, string> = {},
-        opts: { body?: unknown; query?: string; expectStatus?: number; readsKey?: string } = {},
+        opts: {
+          body?: unknown;
+          query?: string;
+          expectStatus?: number;
+          readsKey?: string;
+          headers?: Record<string, string>;
+        } = {},
       ): Promise<Record<string, unknown>> => {
         const route = ROUTES[key];
         if (route === undefined) throw new Error(`route "${key}" missing from routes.js`);
@@ -1881,6 +1911,7 @@ describe("UI route contract", () => {
         const { status, body } = await t.api(`${fill(route.path, params)}${opts.query ?? ""}`, {
           method: route.method,
           ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+          ...(opts.headers !== undefined ? { headers: opts.headers } : {}),
         });
         if (status !== (opts.expectStatus ?? 200)) {
           throw new Error(
@@ -1913,6 +1944,63 @@ describe("UI route contract", () => {
 
       // -- fleet feed: cold first paint, then hydrate ----------------------
       await drive("harnesses", {}, { query: "?hydrate=1", readsKey: "harnesses" });
+
+      // -- signing in: a boot link, a sealed session, a returning device, a refresh,
+      //    sign-out (effect: the signed-out session no longer works) --------------
+      const ui = { signIn: await signInJs(), sealed: await sealedJs() };
+      const ticket = await drive("bootTicket", {}, { body: {}, readsKey: "bootTicket" });
+      const deviceKey = await ui.signIn.makeDeviceKey();
+      const firstSeal = await ui.sealed.makeSeal();
+      const exchanged = await drive(
+        "authExchange",
+        {},
+        {
+          body: {
+            code: await codeFrom(t.fetchRaw, ticket["bootPath"] as string),
+            deviceJwk: deviceKey.deviceJwk,
+            seal: firstSeal.seal,
+          },
+          readsKey: "authExchange",
+        },
+      );
+      const device = exchanged["device"] as string;
+      const challenge = await drive("authChallenge", {}, { readsKey: "authChallenge" });
+      const secondSeal = await ui.sealed.makeSeal();
+      const signedIn = await drive(
+        "authSession",
+        {},
+        {
+          body: {
+            device,
+            nonce: challenge["nonce"],
+            signature: await ui.signIn.signChallenge(deviceKey.privateKey, {
+              device,
+              nonce: challenge["nonce"] as string,
+              seal: secondSeal.seal,
+            }),
+            seal: secondSeal.seal,
+          },
+          readsKey: "authSession",
+        },
+      );
+      const thirdSeal = await ui.sealed.makeSeal();
+      const refreshed = await drive(
+        "authRefresh",
+        {},
+        {
+          body: { seal: thirdSeal.seal },
+          headers: bearer(await secondSeal.open(signedIn["issued"], "auth.session")),
+          readsKey: "authRefresh",
+        },
+      );
+      const lastSession = await thirdSeal.open(refreshed["issued"], "auth.refresh");
+      expect((await t.fetchRaw("/api/version", { headers: bearer(lastSession) })).status).toBe(200);
+      await drive(
+        "authSignOut",
+        {},
+        { body: {}, headers: bearer(lastSession), readsKey: "authSignOut" },
+      );
+      expect((await t.fetchRaw("/api/version", { headers: bearer(lastSession) })).status).toBe(401);
 
       // -- per-harness reads -----------------------------------------------
       await drive("version", {}, { readsKey: "version" });
@@ -2258,9 +2346,17 @@ describe("UI route contract", () => {
         { plugin: "cost-lens", pane: "spend" },
         { readsKey: "pluginPane" },
       );
-      // The containment travels WITH the document, always.
+      // The containment travels WITH the document, always: the frame loads it from a
+      // single-use address that serves it with the plugin's policy and the sandbox.
       expect(pane["sandbox"]).toBe("allow-scripts");
       expect(String(pane["csp"])).toContain("connect-src 'none'");
+      const paneDoc = await t.fetchRaw(pane["src"] as string);
+      expect(paneDoc.status).toBe(200);
+      expect(await paneDoc.text()).toBe("<p>spend</p>");
+      expect(paneDoc.headers.get("content-security-policy")).toBe(
+        `${String(pane["csp"])}; sandbox allow-scripts`,
+      );
+      expect((await t.fetchRaw(pane["src"] as string)).status).toBe(404);
       const panes = await drive("panes", { id }, { readsKey: "panes" });
       expect((panes["panes"] as Array<{ id: string }>).map((p) => p.id)).toEqual(["spend"]);
       expect(panes["traceObservers"]).toEqual(["cost-lens"]);

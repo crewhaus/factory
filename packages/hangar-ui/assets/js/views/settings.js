@@ -1,8 +1,8 @@
 /**
  * HM-198's console half — Settings: Readability (this device's text size,
- * density, motion, contrast, shortcuts and theme), notification rules
- * (HM-183), read-only mode (HM-187), and the installed-plugin inventory
- * (HM-179).
+ * density, motion, contrast, shortcuts and theme), signing this browser out,
+ * notification rules (HM-183), read-only mode (HM-187), and the
+ * installed-plugin inventory (HM-179).
  *
  * Three deliberate choices show up here as UI:
  *
@@ -10,7 +10,7 @@
  *     because a product that decides what deserves to interrupt you is a
  *     product you stop trusting.
  *   - The read-only toggle is labelled with what it actually protects. It
- *     prevents accidents during a demo; the bearer token is the security
+ *     prevents accidents during a demo; signing in is the security
  *     boundary. Claiming more would be a lie a screen-share could disprove.
  *   - The plugin table lists the DEFERRED extension points beside the wired
  *     ones, with their reasons. A capability that is declared but not wired
@@ -35,6 +35,7 @@ import {
   writeTheme,
 } from "../prefs.js";
 import { hrefHarness } from "../router.js";
+import { signOut } from "../sign-in.js";
 import { fmtRelativeTime } from "../util.js";
 
 /** kind → the sentence the rule row shows. Mirrors the server's KIND_LABELS;
@@ -81,6 +82,7 @@ export async function renderSettings(root) {
   );
   const readability = readabilityCard();
   root.appendChild(readability);
+  root.appendChild(signOutCard());
   root.appendChild(readOnlyCard(settled(readOnlyRes)));
   root.appendChild(
     notificationCard(settled(notifRes), settled(groupsRes), () => renderSettings(root)),
@@ -203,6 +205,39 @@ function readabilityCard() {
 
 function settled(res) {
   return res.status === "fulfilled" ? res.value : null;
+}
+
+// ---------------------------------------------------------------------------
+// This browser
+// ---------------------------------------------------------------------------
+
+/**
+ * Sign out ends this tab's session at Home and keeps this browser's key, so
+ * the next visit signs in by itself. Forget this browser also deletes the
+ * key: the next visit needs a new link from `crewhaus hangar open`.
+ */
+function signOutCard() {
+  const leave = async (forget, button) => {
+    button.disabled = true;
+    await signOut({ forget });
+    window.location.reload();
+  };
+  const out = el("button", { class: "btn", type: "button", text: "Sign out" });
+  out.addEventListener("click", () => leave(false, out));
+  const forget = el("button", {
+    class: "btn btn-danger",
+    type: "button",
+    text: "Forget this browser",
+  });
+  forget.addEventListener("click", () => leave(true, forget));
+  return el("section", { class: "card" }, [
+    el("h3", { class: "card-title", text: "This browser" }),
+    el("p", {
+      class: "muted",
+      text: "Sign out ends this tab's session. Forget this browser also removes its key, so signing in again needs a new link from crewhaus hangar open.",
+    }),
+    el("div", { class: "editor-actions" }, [out, forget]),
+  ]);
 }
 
 // ---------------------------------------------------------------------------

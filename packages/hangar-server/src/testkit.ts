@@ -201,6 +201,9 @@ export type BootOptions = Omit<
   /** Run the preflight gate before spawns (default: off, so a fixture
    *  harness with no credentials is still startable in a test). */
   readonly preflight?: boolean;
+  /** Write files under the fresh workspace before Home boots — the owner's
+   *  `settings.json` blocks, which Home reads only at boot. */
+  readonly prepare?: (dirs: { readonly workspace: string; readonly hangarRoot: string }) => void;
 };
 
 /** Boot an isolated server on an ephemeral loopback port. */
@@ -219,8 +222,13 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
     preflight,
     controlClient,
     runJob,
+    prepare,
     ...rest
   } = opts;
+  if (prepare !== undefined) {
+    mkdirSync(hangarRoot, { recursive: true, mode: 0o700 });
+    prepare({ workspace, hangarRoot });
+  }
   const env = { CREWHAUS_WATCHME_ROOT: join(workspace, "watchme"), ...extraEnv };
   const now = opts.now ?? Date.now;
   const collectWarn = (m: string): void => {

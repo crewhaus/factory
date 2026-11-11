@@ -103,7 +103,7 @@ export const SERVICE_TOKEN_TTL_MS = Object.freeze({ default: 180 * DAY_MS, max: 
 
 const DISPLAY_NAME_MAX = 80;
 /** The keyed-digest purpose of a link subject. A pin: stored digests join forever. */
-const LINK_SUBJECT_LABEL = "access.link.subject";
+export const LINK_SUBJECT_LABEL = "access.link.subject";
 const HOME: AccessTarget = { scope: "home" };
 
 export type { Done, Refusal } from "./mutate";
@@ -207,7 +207,18 @@ function requireSnapshot(state: Planning): AccessSnapshot {
 }
 
 function linkSubjectRef(key: CryptoKey, subject: string): Promise<string> {
-  return keyedDigest(key, LINK_SUBJECT_LABEL, [subject]);
+  return keyedDigest(key, LINK_SUBJECT_LABEL, [normalizeLinkSubject(subject)]);
+}
+
+/**
+ * A link subject as it is keyed: a proxy subject's header name lower-cased, because HTTP
+ * header names ignore case and Home reads the header lower-cased.
+ */
+export function normalizeLinkSubject(subject: string): string {
+  if (!subject.startsWith("proxy:")) return subject;
+  const second = subject.indexOf(":", "proxy:".length);
+  if (second === -1) return subject;
+  return `proxy:${subject.slice("proxy:".length, second).toLowerCase()}${subject.slice(second)}`;
 }
 
 async function subjectKey(root: string, create: boolean): Promise<CryptoKey | Refusal> {
@@ -991,7 +1002,7 @@ async function linkSubject(
         at: state.at,
         by: state.by,
       };
-      subjects.links[row.id] = input.subject;
+      subjects.links[row.id] = normalizeLinkSubject(input.subject);
       const rows: Change<LinkResult>["rows"][number][] = [];
       if (member.created) rows.push({ kind: "principals", row: member.row });
       rows.push({ kind: "links", row });
