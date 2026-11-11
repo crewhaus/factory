@@ -14,15 +14,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **Changes that can affect a harness without opting in.** No spec has to turn
 these on: they reach every harness that uses what each one names.
 
+- **A run that measured nothing is no longer a baseline.** `EvalBaselinePin` and
+  `crewhaus eval`'s automatic pin refuse a run that measured nothing or in which
+  every case errored, as they already refused a budget-aborted run. The eval
+  still prints its result and keeps the baseline it had.
+
+## [0.8.1] - 2026-11-08
+
+Fixes and hardening for run input, the runtime-state floor, git tools,
+`crewhaus serve --mcp` and service setup.
+
+### Changed
+
+#### Before you upgrade
+
+**Changes that can affect a harness without opting in.** No spec has to turn
+these on: they reach every harness that uses what each one names.
+
 - **A daemon stops on an unset tool-config variable with exit 2.** After a
   recompile, a `channel`, `managed` or `crew` daemon whose `tool_config` or
   `chains` block reads an unset variable exits 2 with one line naming the
   variable, where it exited 1. Supervision still counts it as a crash, and its
   status reads "crashed (exit 2)" instead of "unclassified failure".
-- **A run that measured nothing is no longer a baseline.** `EvalBaselinePin` and
-  `crewhaus eval`'s automatic pin refuse a run that measured nothing or in which
-  every case errored, as they already refused a budget-aborted run. The eval
-  still prints its result and keeps the baseline it had.
 
 - **Run input is screened where it enters.** Text that starts or continues a
   run through the managed API (`runs.create`, `runs.continue`) and batch queue
