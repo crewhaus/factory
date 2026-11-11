@@ -19,6 +19,17 @@ these on: they reach every harness that uses what each one names.
   every case errored, as they already refused a budget-aborted run. The eval
   still prints its result and keeps the baseline it had.
 
+- **`crewhaus serve --mcp` classifies a tool call's message before its turn,
+  and takes `--host <address>`.** On stdio and `--sse`, a tool call's message
+  is classified at `api`, as managed run input is: a malicious one returns a
+  tool error naming `input_blocked` and its rules, with no model call, and a
+  suspicious one runs with a warning. Kept text carries its origin, so a call
+  to an external tool that carries a match goes out with a warning. With
+  `--sse`, `--host <address>` listens on another address; beyond this
+  computer it needs `CREWHAUS_MCP_TOKEN` of at least 32 characters, and the
+  bearer travels as sent, so keep such a listener on a private network or
+  behind TLS.
+
 ## [0.8.1] - 2026-11-08
 
 Fixes and hardening for run input, the runtime-state floor, git tools,

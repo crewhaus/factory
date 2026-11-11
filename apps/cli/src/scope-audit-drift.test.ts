@@ -413,8 +413,12 @@ describe("run-input boundary sites", () => {
     return found;
   };
 
-  test("the four sites hold against this tree", () => {
+  test("the five sites hold against this tree", () => {
     const expected: Record<string, string[]> = {
+      "serve-mcp-run-input": [
+        "serve-mcp-run-input:true:false",
+        "serve-mcp-run-input-lineage:true:false",
+      ],
       "gateway-server-run-input": [
         "gateway-server-run-input:true:false",
         "gateway-server-run-input-lineage:true:false",
@@ -453,6 +457,18 @@ describe("run-input boundary sites", () => {
     expect(findings[0]?.symbol).toBe("gateway-server-run-input");
     expect(findings[0]?.pass).toBe(false);
     expect(findings[0]?.reason).toContain("security regression");
+  });
+
+  test("the serve --mcp row fails without the classification, and its lineage row without the tag", () => {
+    const s = site("serve-mcp-run-input");
+    const source = readFileSync(join(repoRoot, s.path), "utf8");
+    expect(source).toContain('classifyBoundary(message, { origin: "api" })');
+    const unclassified = source
+      .replaceAll("classifyBoundary", "screenNothing")
+      .replaceAll("@crewhaus/boundary-classifier", "./nothing");
+    expect(auditBoundarySite(s, unclassified).map((f) => f.pass)).toEqual([false, true]);
+    const untagged = source.replaceAll("withInboundContent", "runOutsideAnyScope");
+    expect(auditBoundarySite(s, untagged).map((f) => f.pass)).toEqual([true, false]);
   });
 
   test("the lineage check accepts run-context's inbound scope in place of tagContent", () => {
