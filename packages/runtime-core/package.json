@@ -21,6 +21,8 @@
     "@crewhaus/compaction-autocompact": "workspace:*",
     "@crewhaus/compaction-curator": "workspace:*",
     "@crewhaus/compaction-snip": "workspace:*",
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/egress-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",

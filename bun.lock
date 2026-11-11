@@ -35,6 +35,8 @@
         "@crewhaus/compliance-controls": "workspace:*",
         "@crewhaus/computer-use-driver": "workspace:*",
         "@crewhaus/context-bundle": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
@@ -1112,6 +1114,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -1328,6 +1331,8 @@
       "name": "@crewhaus/harness-supervisor",
       "version": "0.8.0",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/harness-inventory": "workspace:*",
         "@crewhaus/preflight": "workspace:*",
@@ -1787,6 +1792,7 @@
       "name": "@crewhaus/run-context",
       "version": "0.8.0",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
       },
@@ -1804,6 +1810,8 @@
         "@crewhaus/compaction-autocompact": "workspace:*",
         "@crewhaus/compaction-curator": "workspace:*",
         "@crewhaus/compaction-snip": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/egress-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",

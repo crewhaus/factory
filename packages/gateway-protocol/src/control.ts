@@ -49,6 +49,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { openEventLog } from "@crewhaus/event-log";
+import { type RunScope, formatResumeScope, runWithScope } from "@crewhaus/run-context";
 
 /** Wire identifier for this control protocol. Bumping it is a breaking change. */
 export const CONTROL_PROTOCOL = "crewhaus.control.v1" as const;
@@ -479,6 +480,22 @@ function jsonResponse(body: unknown, status: number, headers?: Record<string, st
   });
 }
 
+/**
+ * The run scope a lane's tick runs in: resumable as `lane:<lane>`, started by
+ * the lane's kind (`heartbeat` or `schedule`, the base of a named lane such as
+ * `schedule:<name>`), marked `synthetic` when an operator woke it. A lane id no
+ * scope can name gets none, and the tick still runs.
+ */
+function laneScope(lane: string, synthetic: boolean): RunScope {
+  const kind = lane.split(":")[0] === "heartbeat" ? "heartbeat" : "schedule";
+  const trigger = { kind, lane, ...(synthetic ? { synthetic: true as const } : {}) } as const;
+  try {
+    return { resumeScope: formatResumeScope({ kind: "lane", id: lane }), trigger };
+  } catch {
+    return { trigger: { kind, ...(synthetic ? { synthetic: true as const } : {}) } };
+  }
+}
+
 export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
   const env = opts.env ?? process.env;
   const cwd = opts.cwd ?? process.cwd();
@@ -554,10 +571,15 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
           }
         }
         try {
-          await laneOpts.run({
-            sessionId,
-            ...(synthetic !== undefined ? { synthetic } : {}),
-          });
+          // The tick's runs are started by the lane and resume as the lane.
+          // An operator's wake marks the trigger synthetic; its reason and
+          // author stay in the marker and the audit record, never in a run row.
+          await runWithScope(laneScope(laneOpts.lane, synthetic !== undefined), () =>
+            laneOpts.run({
+              sessionId,
+              ...(synthetic !== undefined ? { synthetic } : {}),
+            }),
+          );
           lastOutcome = "ok";
         } catch (err) {
           lastOutcome = "error";

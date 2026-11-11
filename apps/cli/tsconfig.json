@@ -31,6 +31,8 @@
     { "path": "../../packages/preflight" },
     { "path": "../../packages/computer-use-driver" },
     { "path": "../../packages/context-bundle" },
+    { "path": "../../packages/control-contract" },
+    { "path": "../../packages/control-records" },
     { "path": "../../packages/data-retention-engine" },
     { "path": "../../packages/deployment-controller" },
     { "path": "../../packages/egress-classifier" },

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { dirname as pathDirname } from "node:path";
 import * as readline from "node:readline/promises";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -153,6 +152,7 @@ import {
   DATA_LINEAGE_CAP,
   type RunContext,
   createRunContext,
+  mintRunId,
   tagContent,
 } from "@crewhaus/run-context";
 import {
@@ -240,6 +240,7 @@ import {
   stripDirectiveFromMessage,
 } from "./pre-route";
 import { loadProjectMemory } from "./project-memory";
+import { hasRunRows, openRunRows, recordRunPark, withRunRows } from "./run-ledger";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 import {
@@ -2032,6 +2033,13 @@ export type RunChatLoopOptions = {
    * deny — widening a deliberately narrowed child.
    */
   settingsDir?: string | null;
+  /**
+   * Where this run's rows go: the harness root whose
+   * `.crewhaus/run/control/runs/` holds the run ledger (`./run-ledger`).
+   * Defaults to the harness root the settings load reads when one is given,
+   * else `process.cwd()`. `null` writes no rows, as `CREWHAUS_RUN_LEDGER=0` does.
+   */
+  runLedgerDir?: string | null;
   /**
    * Install a SIGINT handler that aborts the current turn on first press
    * and exits on the second. Defaults to true in REPL mode when stdin is
@@ -3844,6 +3852,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   ) {
     return credentialFloorScope.run(true, () => runChatLoop(opts));
   }
+  // Each invocation records how it ended for its run's rows (`./run-ledger`).
+  if (!hasRunRows(opts)) return withRunRows(opts, () => runChatLoop(opts));
   // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
   // any plugin-contributed tools so the tool-capable-model feature gate and the
   // per-turn advertisement below read the same list.
@@ -4809,14 +4819,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Loop contract 0.4 (Batch C, item 4) — when the caller supplies an
   // `agentId` and lets runChatLoop own the context, build the bus with that
   // identity so `envelope()` stamps every trace event with it. runId is minted
-  // here (matching run-context's `run_<8 hex>` shape) and threaded into BOTH
+  // here (by run-context's one minter, `mintRunId()`) and threaded into BOTH
   // the bus and the context so their ids stay coherent. When `opts.runContext`
   // is supplied the caller owns `agentId` on its bus, so this is skipped.
   const runContext: RunContext =
     opts.runContext ??
     (opts.agentId !== undefined
       ? (() => {
-          const runId = `run_${randomUUID().slice(0, 8)}`;
+          const runId = mintRunId();
           const eventBus = new TraceEventBus({ runId, sessionId, agentId: opts.agentId });
           return createRunContext({ runId, sessionId, eventBus });
         })()
@@ -5152,6 +5162,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     out.write("\n");
   };
 
+  openRunRows({
+    runContext,
+    opts,
+    harnessRoot: opts.settingsDir,
+    sessionId,
+    sessionRootDir,
+    persistSession,
+    bus,
+  });
   const eventLog: EventLog = persistSession
     ? await openEventLog(sessionId, { rootDir: sessionRootDir })
     : createMemoryEventLog();
@@ -7049,6 +7068,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             createdAt: new Date().toISOString(),
           };
           if (existing === null) await approvals.store.persist(pending);
+          recordRunPark(runContext, pending.id);
           if (approvals.notify !== undefined) {
             await approvals.notify(pending).catch((err) => {
               runContext.logger.warn("approvals.notify failed", {

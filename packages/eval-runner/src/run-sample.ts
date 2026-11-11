@@ -12,7 +12,7 @@ import {
 } from "@crewhaus/eval-grader";
 import { type Event as TranscriptEvent, openEventLog } from "@crewhaus/event-log";
 import type { ProofBundle } from "@crewhaus/provability";
-import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { type RunContext, createRunContext, runWithScope } from "@crewhaus/run-context";
 import { toolListEntryNames } from "@crewhaus/tool-catalog";
 import type {
   ModelResponseEvent,
@@ -109,7 +109,9 @@ export async function runSample(args: {
   const sampleDir = join(outDir, `${sampleArtifactDirName(sample.id)}${trialSuffix}`);
   mkdirSync(sampleDir, { recursive: true });
 
-  const runContext = args.runContext ?? createRunContext();
+  // A sample's run is started by the eval: its own context says so, and so
+  // does any context a loop inside the invoker mints for itself.
+  const runContext = args.runContext ?? createRunContext({ trigger: { kind: "eval" } });
   const events: TraceEvent[] = [];
   const unsubscribe = runContext.eventBus.subscribe((e) => {
     events.push(e);
@@ -124,12 +126,14 @@ export async function runSample(args: {
   let invokerProof: ProofBundle | undefined;
   let error: string | undefined;
   try {
-    const result = await invoker({
-      sample,
-      runContext,
-      sessionRootDir: sampleDir,
-      ...(args.seed !== undefined ? { seed: args.seed } : {}),
-    });
+    const result = await runWithScope({ trigger: { kind: "eval" } }, () =>
+      invoker({
+        sample,
+        runContext,
+        sessionRootDir: sampleDir,
+        ...(args.seed !== undefined ? { seed: args.seed } : {}),
+      }),
+    );
     agentOutput = result.agentOutput;
     transcript = result.transcript ? [...result.transcript] : [];
     invokerEvents = result.events;

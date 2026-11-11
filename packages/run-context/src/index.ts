@@ -7,13 +7,31 @@
  * Reference: claude-code/Tool.ts `ToolUseContext`,
  * openai-agents/run_context.py.
  */
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
+import { type Trigger, isId, mintRunId, parseResumeScope } from "@crewhaus/control-contract";
 import { type Logger, createLogger } from "@crewhaus/logging";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
-import { type InboundContent, takePendingInbound } from "./scope";
+import { registerRunController } from "./run-registry";
+import { type AmbientRun, type InboundContent, takeAmbientRun, takePendingInbound } from "./scope";
 import { trimToken } from "./token-trim";
 
-export { type InboundContent, withInboundContent } from "./scope";
+export {
+  type ResumeScope,
+  type Trigger,
+  type TriggerKind,
+  formatResumeScope,
+  mintRunId,
+  parseResumeScope,
+} from "@crewhaus/control-contract";
+export {
+  type CancelAbortReason,
+  RUN_REGISTRY_CAP,
+  cancelRun,
+  isCancelReason,
+  onRunIdle,
+  retainRun,
+} from "./run-registry";
+export { type InboundContent, type RunScope, runWithScope, withInboundContent } from "./scope";
 
 /**
  * Where content currently flowing through the runtime originated. Mirrors
@@ -96,6 +114,22 @@ export type RunContext = {
    * child run without rebuilding the whole context.
    */
   agentIdentity?: AgentIdentity;
+  /**
+   * The run that started this one: a sub-agent's or a side call's parent, set
+   * through {@link lineageOf}. Absent on a top-level run.
+   */
+  readonly parent?: string;
+  /**
+   * What this run may be resumed as, a string `parseResumeScope` accepts
+   * (`session:<id>`, `job:<id>`, `lane:<lane>`, `run:<root>`, `work:<wi>`).
+   */
+  readonly resumeScope?: string;
+  /** The parked run this one continues. */
+  readonly continues?: string;
+  /** The work item (`wi_…`) this run serves. */
+  readonly workItem?: string;
+  /** What started this run. */
+  readonly trigger?: Trigger;
 };
 
 /**
@@ -128,7 +162,8 @@ export function formatAgentIdentity(id: AgentIdentity | undefined): string {
 export type RunContextOptions = {
   /**
    * Override the auto-generated `runId`. Format is unconstrained; the
-   * default factory produces `run_<8 hex>`.
+   * default factory mints a canonical id with `mintRunId()` (`run_` and 26
+   * lowercase letters and digits).
    */
   runId?: string;
   /**
@@ -149,11 +184,24 @@ export type RunContextOptions = {
   eventBus?: TraceEventBus;
   /** Initial origin chain. Defaults to undefined (top-level/user context). */
   originStack?: ReadonlyArray<TrustOrigin>;
+  /**
+   * Lineage. Each field set here wins; an unset one comes from the ambient
+   * scope (`runWithScope`), and absent both it is absent. A `resumeScope` or
+   * `workItem` that does not fit its grammar is dropped with one warning
+   * naming the field. A child context takes these from {@link lineageOf}.
+   */
+  parent?: string;
+  resumeScope?: string;
+  continues?: string;
+  workItem?: string;
+  trigger?: Trigger;
 };
 
-function shortId(): string {
-  return randomUUID().slice(0, 8);
-}
+/** The lineage fields a context carries, as options take them. */
+export type RunLineage = Pick<
+  RunContextOptions,
+  "parent" | "resumeScope" | "continues" | "workItem" | "trigger"
+>;
 
 /**
  * Generate a fresh sessionId in the format `sess_<16 hex>`. The 16-hex
@@ -166,20 +214,26 @@ function generateSessionId(): string {
 }
 
 /**
- * Build a fresh RunContext with sensible defaults: random ids, a
- * never-aborted signal, a logger that has the run/session ids
- * pre-bound so every log line is tagged automatically, and a fresh
- * `TraceEventBus`.
+ * Build a fresh RunContext with sensible defaults: a canonical run id and a
+ * random session id, a never-aborted signal, a logger that has the
+ * run/session ids pre-bound so every log line is tagged automatically, and a
+ * fresh `TraceEventBus`.
+ *
+ * With no `abortSignal`, the controller it makes is kept in the run registry
+ * (`./run-registry`), so `cancelRun(ctx.runId)` can stop the run.
  *
  * Created inside a {@link withInboundContent} scope, the first context
  * adopts the run input a library classified and kept (see `./scope`): the
  * text is tagged into its lineage at its origin, and a warning is published
  * and logged for text kept with one. Outside a scope nothing is adopted.
+ * Inside a `runWithScope` scope, it takes the scope's lineage for any field
+ * its options leave unset.
  */
 export function createRunContext(opts: RunContextOptions = {}): RunContext {
-  const runId = opts.runId ?? `run_${shortId()}`;
+  const runId = opts.runId ?? mintRunId();
   const sessionId = opts.sessionId ?? generateSessionId();
-  const abortSignal = opts.abortSignal ?? new AbortController().signal;
+  const controller = opts.abortSignal === undefined ? new AbortController() : undefined;
+  const abortSignal = opts.abortSignal ?? (controller as AbortController).signal;
   const baseLogger = opts.logger ?? createLogger();
   const logger = baseLogger.child({ runId, sessionId });
   const eventBus = opts.eventBus ?? new TraceEventBus({ runId, sessionId, logger });
@@ -191,9 +245,50 @@ export function createRunContext(opts: RunContextOptions = {}): RunContext {
     logger,
     eventBus,
     ...(opts.originStack !== undefined ? { originStack: opts.originStack } : {}),
+    ...lineageFrom(opts, takeAmbientRun(), logger),
   };
+  if (controller !== undefined) registerRunController(runId, controller);
   adoptInbound(ctx, takePendingInbound());
   return ctx;
+}
+
+/**
+ * The lineage a context carries: each field from the options, else from the
+ * ambient scope. A `resumeScope` or `workItem` that does not fit its grammar
+ * is dropped, with one warning naming the field and never its value.
+ */
+function lineageFrom(opts: RunContextOptions, ambient: AmbientRun, logger: Logger): RunLineage {
+  const resumeScope = opts.resumeScope ?? ambient.resumeScope;
+  const workItem = opts.workItem ?? ambient.workItem;
+  const trigger = opts.trigger ?? ambient.trigger;
+  const continues = opts.continues ?? ambient.continues;
+  const fits = (field: string, ok: boolean): boolean => {
+    if (!ok) logger.warn("run lineage field dropped: it does not fit its grammar", { field });
+    return ok;
+  };
+  return {
+    ...(opts.parent !== undefined ? { parent: opts.parent } : {}),
+    ...(resumeScope !== undefined && fits("resumeScope", parseResumeScope(resumeScope) !== null)
+      ? { resumeScope }
+      : {}),
+    ...(continues !== undefined ? { continues } : {}),
+    ...(workItem !== undefined && fits("workItem", isId("wi", workItem)) ? { workItem } : {}),
+    ...(trigger !== undefined ? { trigger } : {}),
+  };
+}
+
+/**
+ * The options a child context takes from its parent: `parent` names the
+ * parent's run, and the parent's `resumeScope`, `trigger` and `workItem` carry
+ * over. `continues` never does: it belongs to the run that continued.
+ */
+export function lineageOf(ctx: RunContext): RunLineage {
+  return {
+    parent: ctx.runId,
+    ...(ctx.resumeScope !== undefined ? { resumeScope: ctx.resumeScope } : {}),
+    ...(ctx.trigger !== undefined ? { trigger: ctx.trigger } : {}),
+    ...(ctx.workItem !== undefined ? { workItem: ctx.workItem } : {}),
+  };
 }
 
 /**

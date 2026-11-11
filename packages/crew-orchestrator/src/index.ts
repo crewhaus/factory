@@ -39,7 +39,7 @@ import {
   emptyRuleSet,
 } from "@crewhaus/permission-engine";
 import type { NamedFailureClass } from "@crewhaus/recovery-engine";
-import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
+import { type RunContext, createRunContext, retainRun, tagContent } from "@crewhaus/run-context";
 import { type RunChatLoopOptions, runChatLoop } from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import type {
@@ -489,14 +489,23 @@ async function* driveCrew(
   const runContext: RunContext = createRunContext(
     args.opts.sessionId !== undefined ? { sessionId: args.opts.sessionId } : {},
   );
+  // Every role's loop runs on this one context: the run stays held until the
+  // drive loop ends, so it ends once, after its last role.
+  const releaseRun = retainRun(runContext);
 
   // Open a single event-log handle for the crew session. Every role's
   // runChatLoop opens its own handle against the same path; the
   // append-sync-per-line guarantee on POSIX keeps interleaving safe.
-  const eventLog: EventLog = await openEventLog(
-    runContext.sessionId,
-    args.opts.sessionRootDir !== undefined ? { rootDir: args.opts.sessionRootDir } : {},
-  );
+  let eventLog: EventLog;
+  try {
+    eventLog = await openEventLog(
+      runContext.sessionId,
+      args.opts.sessionRootDir !== undefined ? { rootDir: args.opts.sessionRootDir } : {},
+    );
+  } catch (err) {
+    releaseRun();
+    throw err;
+  }
 
   const queue: CrewEvent[] = [];
   type NextResolver = (ev: CrewEvent | "done" | "error") => void;
@@ -947,6 +956,7 @@ async function* driveCrew(
       driveError = err;
     } finally {
       await eventLog.close().catch(() => {});
+      releaseRun();
       // `resolveNext` is set by the consumer's Promise executor (a sibling closure);
       // CFA narrows it to the initial `null` inside this drive loop, so assert the
       // declared resolver-or-null shape back before draining it.

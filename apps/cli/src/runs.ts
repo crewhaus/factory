@@ -8,9 +8,21 @@
  * `run --resume` path already drives; `runs resume` is the dedicated verb for
  * re-driving a session (e.g. one a headless run PARKED on a pending approval)
  * after the approval was resolved out of band.
+ *
+ * A run id resumes too: the harness's run ledger (`.crewhaus/run/control/runs/`)
+ * says which session a run, or a root run's newest run, belongs to
+ * ({@link resolveRunsResumeTarget}).
  */
 import { existsSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { CANONICAL_RUN_ID_RE, type CursorPosition, type Trigger } from "@crewhaus/control-contract";
+import {
+  type Ledger,
+  controlPaths,
+  foldStates,
+  harnessLedger,
+  readPage,
+} from "@crewhaus/control-records";
 
 export class RunsError extends Error {
   override readonly name = "RunsError";
@@ -50,4 +62,126 @@ export function resolveRunsResumeSpecPath(
     );
   }
   return fallback;
+}
+
+/** True for a canonical run id (`run_` and 26 lowercase letters and digits). */
+export function isRunsRunId(value: string): boolean {
+  return CANONICAL_RUN_ID_RE.test(value);
+}
+
+/** The run ledger's directory, relative to the harness directory: where runtime-core writes. */
+export const RUNS_LEDGER_DIR = join(controlPaths(".").controlDir, "runs");
+
+/** The run ledger of the harness at `harnessDir`. */
+export function runsLedgerAt(harnessDir: string): Ledger {
+  return harnessLedger(harnessDir, { dir: RUNS_LEDGER_DIR }, { machine: "run" });
+}
+
+/** What a resume re-drives, and the run scope it runs in. */
+export type RunsResumeTarget = {
+  readonly sessionId: string;
+  /** The newest parked run of that session, which the resumed run continues. */
+  readonly continues?: string;
+};
+
+type RunningRow = { readonly id: string; readonly session?: string; readonly parent?: string };
+
+/**
+ * Every run's `running` row, newest first. Read whole, following every page:
+ * this read decides what is resumed, so a gap is refused, never skipped.
+ */
+function runningRows(ledger: Ledger, dir: string): RunningRow[] {
+  const rows: RunningRow[] = [];
+  const seen = new Set<string>();
+  let before: CursorPosition | undefined;
+  for (;;) {
+    const page = readPage(ledger, { limit: 1000, ...(before !== undefined ? { before } : {}) });
+    const gap = page.gaps[0];
+    if (gap !== undefined) {
+      throw new RunsError(
+        `the run records in ${dir} could not be read whole (segment ${gap.seg}, offset ${gap.off}: ${gap.reason}); nothing was resumed`,
+      );
+    }
+    for (const item of page.items) {
+      const row = item.record;
+      const id = row["id"];
+      if (row["state"] !== "running" || typeof id !== "string" || seen.has(id)) continue;
+      seen.add(id);
+      rows.push({
+        id,
+        ...(typeof row["session"] === "string" ? { session: row["session"] } : {}),
+        ...(typeof row["parent"] === "string" ? { parent: row["parent"] } : {}),
+      });
+    }
+    if (page.next === undefined) return rows;
+    before = page.next;
+  }
+}
+
+/** The newest run of `sessionId` whose current state is `waiting-for-approval`. */
+function newestParked(
+  ledger: Ledger,
+  rows: readonly RunningRow[],
+  sessionId: string,
+): string | undefined {
+  const fold = foldStates(ledger);
+  if (!fold.ok) return undefined;
+  return rows.find(
+    (row) =>
+      row.session === sessionId && fold.objects.get(row.id)?.state === "waiting-for-approval",
+  )?.id;
+}
+
+/**
+ * Resolve what `crewhaus runs resume <id>` re-drives, from the run ledger
+ * under `harnessDir`. A session id resumes that session. A run id resumes
+ * the session its `running` row names; a root run's id (a job its supervisor
+ * started) resumes the session of the newest run that names it as `parent`.
+ * Either way the resumed run continues the session's newest parked run, when
+ * it has one. The `session` and `parent` fields live only on the `running`
+ * row, so every retained row is read (a fold keeps each run's last row only),
+ * and the current states come from the fold.
+ *
+ * Throws `RunsError` naming the id when no run record here has it, and when
+ * the records cannot be read whole.
+ */
+export function resolveRunsResumeTarget(id: string, harnessDir: string): RunsResumeTarget {
+  const ledger = runsLedgerAt(harnessDir);
+  const dir = join(harnessDir, RUNS_LEDGER_DIR);
+  if (isRunsSessionId(id)) {
+    // The run records only label this resume: one that cannot be read leaves the label off.
+    let rows: RunningRow[];
+    try {
+      rows = runningRows(ledger, dir);
+    } catch {
+      return { sessionId: id };
+    }
+    const parked = newestParked(ledger, rows, id);
+    return { sessionId: id, ...(parked !== undefined ? { continues: parked } : {}) };
+  }
+  if (!isRunsRunId(id)) {
+    throw new RunsError(`invalid id "${id}": expected a session (sess_<16 hex>) or a run id`);
+  }
+  const rows = runningRows(ledger, dir);
+  const own = rows.find((row) => row.id === id && row.session !== undefined);
+  const child = rows.find((row) => row.parent === id && row.session !== undefined);
+  const sessionId = own?.session ?? child?.session;
+  if (sessionId === undefined) {
+    throw new RunsError(
+      `no run record in ${dir} has run ${id}. Run from the harness directory the run belongs to.`,
+    );
+  }
+  const parked = newestParked(ledger, rows, sessionId);
+  return { sessionId, ...(parked !== undefined ? { continues: parked } : {}) };
+}
+
+/** The run scope a resumed run runs in: started by a resume, continuing the parked run. */
+export function runsResumeScope(target: RunsResumeTarget): {
+  readonly trigger: Trigger;
+  readonly continues?: string;
+} {
+  return {
+    trigger: { kind: "resume" },
+    ...(target.continues !== undefined ? { continues: target.continues } : {}),
+  };
 }

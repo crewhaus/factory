@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
+import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import type {
   ModelResponseEvent,
   ToolCallEndEvent,
@@ -367,5 +368,33 @@ describe("combineGraderEntries", () => {
       latencyMs: 0,
     });
     expect(res.passed).toBe(true);
+  });
+});
+
+describe("runSample — the eval starts the sample's run", () => {
+  test("the sample's context, and a context a loop inside the invoker mints, name the eval as the trigger", async () => {
+    const outDir = newTempRoot();
+    let given: RunContext | undefined;
+    let minted: RunContext | undefined;
+    const invoker: AgentInvoker = async ({ runContext }) => {
+      given = runContext;
+      minted = createRunContext();
+      return { agentOutput: "ok", transcript: [] };
+    };
+    await runSample({ sample: SAMPLE, invoker, graders: EXACT, outDir, model: "claude-test" });
+    expect(given?.trigger).toEqual({ kind: "eval" });
+    expect(minted?.trigger).toEqual({ kind: "eval" });
+    // A caller's own context is used as given.
+    const own = createRunContext();
+    await runSample({
+      sample: SAMPLE,
+      invoker,
+      graders: EXACT,
+      outDir: newTempRoot(),
+      model: "claude-test",
+      runContext: own,
+    });
+    expect(given).toBe(own);
+    expect(minted?.trigger).toEqual({ kind: "eval" });
   });
 });

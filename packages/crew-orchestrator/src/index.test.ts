@@ -11,6 +11,7 @@ import type {
   SubAgentDefinition,
 } from "@crewhaus/agent-context-isolation";
 import { BUILTIN_DEFAULT_RULES, type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
+import { onRunIdle, retainRun } from "@crewhaus/run-context";
 import { createPendingApprovalStore } from "@crewhaus/runtime-core";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
@@ -1920,6 +1921,78 @@ describe("per-candidate profile enrichment reaches the role loop (0.6.0 PR 7b, �
       // §7.9 (PR 10) — a profiled candidate's arm id is its profile name.
       expect(scoreboard.records.map((r) => r.model)).toEqual(["fast"]);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("one run for the whole crew", () => {
+  test("the run is held through every role and goes idle once, after the drive ends", async () => {
+    const root = newTempRoot();
+    const saved = process.env["CREWHAUS_RUN_LEDGER"];
+    // Rows are not under test here; the hold is.
+    process.env["CREWHAUS_RUN_LEDGER"] = "0";
+    try {
+      let idle = 0;
+      let marks = 0;
+      const idleSeen: number[] = [];
+      // Each role's tool holds and releases the run, as a loop on the shared context does.
+      const mark = buildTool({
+        name: "mark",
+        description: "mark",
+        inputSchema: z.object({}).passthrough(),
+        readOnly: true,
+        execute: async (_input, ctx?: ToolExecuteContext) => {
+          const runContext = (ctx?.bridge as RuntimeBridge | undefined)?.runContext;
+          if (runContext === undefined) return "[no run context]";
+          if (marks === 0) onRunIdle(runContext.runId, () => idle++);
+          marks += 1;
+          const release = retainRun(runContext);
+          idleSeen.push(idle);
+          release();
+          return `marked:${marks}`;
+        },
+      });
+      const adapter = makeProgrammableAdapter(({ previousToolResults }) => {
+        if (previousToolResults.some((r) => r === "marked:1")) {
+          return [
+            {
+              type: "tool_use",
+              id: "tool_h",
+              name: "Handoff",
+              input: { target: "second", reason: "your turn" },
+            },
+          ];
+        }
+        if (previousToolResults.length > 0) return [{ type: "text", text: "done" }];
+        return [{ type: "tool_use", id: `tool_m${marks}`, name: "mark", input: {} }];
+      });
+      const crew = Crew()
+        .setName("held")
+        .addRole("first", { model: "stub", instructions: "First.", tools: [mark] })
+        .addRole("second", { model: "stub", instructions: "Second.", tools: [mark] })
+        .setEntry("first")
+        .compile();
+      // The custom tool isn't auto-allowed (only Handoff + SendMessage are).
+      const permissionRules: RuleSet = {
+        ...emptyRuleSet,
+        builtin: BUILTIN_DEFAULT_RULES,
+        flag: [{ type: "alwaysAllow", pattern: "mark", source: "flag" }],
+      };
+      const events = await collect(
+        crew.run("go", {
+          sessionRootDir: root,
+          _adapter: adapter,
+          permissionRules,
+          maxActivations: 4,
+        }),
+      );
+      expect(events.filter((e) => e.kind === "role_start").length).toBe(2);
+      expect(idleSeen).toEqual([0, 0]);
+      expect(idle).toBe(1);
+    } finally {
+      if (saved === undefined) Reflect.deleteProperty(process.env, "CREWHAUS_RUN_LEDGER");
+      else process.env["CREWHAUS_RUN_LEDGER"] = saved;
       rmSync(root, { recursive: true, force: true });
     }
   });

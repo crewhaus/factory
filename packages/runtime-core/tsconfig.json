@@ -11,6 +11,8 @@
     { "path": "../agent-context-isolation" },
     { "path": "../compaction-autocompact" },
     { "path": "../compaction-snip" },
+    { "path": "../control-contract" },
+    { "path": "../control-records" },
     { "path": "../egress-classifier" },
     { "path": "../errors" },
     { "path": "../event-log" },

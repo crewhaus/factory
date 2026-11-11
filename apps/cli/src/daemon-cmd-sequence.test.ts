@@ -188,6 +188,9 @@ const EXPECTED = {
     envKeys: [
       "CREWHAUS_CONTROL_PORT",
       "CREWHAUS_COST_TRACKING",
+      // Added on purpose since the capture: the supervisor hands every child
+      // its execution id, so the runs it records name the process.
+      "CREWHAUS_EXECUTION_ID",
       "CREWHAUS_NO_REGISTRY",
       "CREWHAUS_REGISTRY_ROOT",
       "CREWHAUS_TRACE",

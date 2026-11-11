@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CheckpointStore, createCheckpointStore } from "@crewhaus/checkpoint-store";
 import { EXIT_CODES, RunFailedError } from "@crewhaus/errors";
-import { createRunContext } from "@crewhaus/run-context";
+import { type RunContext, createRunContext, onRunIdle, retainRun } from "@crewhaus/run-context";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import {
   GraphBuildError,
@@ -549,5 +549,51 @@ describe("checkpoints (T1)", () => {
     const list = await store.list(runId);
     expect(list.length).toBe(3);
     expect(list.map((c) => c.nodeName)).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("one run for the whole graph", () => {
+  test("the run is held through every node and goes idle once, after the last", async () => {
+    const runContext = createRunContext();
+    let idle = 0;
+    const idleDuringNode: number[] = [];
+    // Each node runs a loop on the shared context, which holds the run while it runs.
+    const node = async (ctx: { runContext: RunContext }, s: number): Promise<number> => {
+      const release = retainRun(ctx.runContext);
+      idleDuringNode.push(idle);
+      release();
+      return s + 1;
+    };
+    const g = createGraph<number, number>()
+      .addNode("one", node)
+      .addNode("two", node)
+      .addEdge("one", "two")
+      .setEntry("one")
+      .compile();
+    // Set once the graph holds the run, before any node runs.
+    const stream = g.run(0, { runContext });
+    const events: string[] = [];
+    for await (const ev of stream) {
+      events.push(ev.kind);
+      if (ev.kind === "node_start" && events.length === 1) {
+        expect(onRunIdle(runContext.runId, () => idle++)).toBe(true);
+      }
+    }
+    expect(idleDuringNode).toEqual([0, 0]);
+    expect(idle).toBe(1);
+  });
+
+  test("a graph that throws still releases its hold", async () => {
+    const runContext = createRunContext();
+    let idle = 0;
+    const g = createGraph<number, number>()
+      .addNode("bad", async () => {
+        onRunIdle(runContext.runId, () => idle++);
+        throw new Error("node failed");
+      })
+      .setEntry("bad")
+      .compile();
+    await expect(collectTerminalState(g.run(0, { runContext }))).rejects.toThrow("node failed");
+    expect(idle).toBe(1);
   });
 });

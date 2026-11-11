@@ -70,8 +70,8 @@ describe("library minters", () => {
     expect(familyOf(() => mintRunId())).toEqual(new Set(["canonical"]));
   });
 
-  test("createRunContext mints a trace id today", () => {
-    expect(familyOf(() => createRunContext().runId, 100)).toEqual(new Set(["hex8"]));
+  test("createRunContext mints a canonical id", () => {
+    expect(familyOf(() => createRunContext().runId, 100)).toEqual(new Set(["canonical"]));
   });
 
   test("the supervisor's execution id and the research id are hex16", () => {
@@ -120,24 +120,25 @@ afterAll(() => {
 });
 
 describe("mints written inline", () => {
+  /** The runtime's and the child minters' own mints: each is the one minter now. */
   const TRACE_LINES = [
-    ["packages/runtime-core/src/index.ts", "const runId = `run_${randomUUID().slice(0, 8)}`;"],
-    [
-      "packages/agent-context-isolation/src/index.ts",
-      "const childRunId = `run_${randomUUID().slice(0, 8)}`;",
-    ],
-    [
-      "packages/model-service/src/side-calls.ts",
-      "const childRunId = `run_${randomUUID().slice(0, 8)}`;",
-    ],
+    ["packages/runtime-core/src/index.ts", "const runId = mintRunId();"],
+    ["packages/agent-context-isolation/src/index.ts", "const childRunId = mintRunId();"],
+    ["packages/model-service/src/side-calls.ts", "const childRunId = mintRunId();"],
   ] as const;
+  const OLD_TRACE_MINT = "`run_${randomUUID().slice(0, 8)}`";
 
-  for (const [path, line] of TRACE_LINES) {
-    test(`${path} mints a trace id`, () => {
+  test("every inline mint calls mintRunId(), and none keeps the 8-hex trace id", () => {
+    let filesRead = 0;
+    let oldMints = 0;
+    for (const [path, line] of TRACE_LINES) {
       expectLine(path, line);
-      expect(familyOf(expressionOf(line))).toEqual(new Set(["hex8"]));
-    });
-  }
+      filesRead += 1;
+      oldMints += read(path).split(OLD_TRACE_MINT).length - 1;
+    }
+    expect(filesRead).toBe(3);
+    expect(oldMints).toBe(0);
+  });
 
   test("the channel bridge's literal is never a routable id", () => {
     const source = read("packages/channel-adapter-base/src/approvals.ts");

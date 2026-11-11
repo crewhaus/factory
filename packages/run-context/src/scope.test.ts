@@ -4,8 +4,9 @@ import { describe, expect, test } from "bun:test";
  * tagged into the run's FIRST context, and only that one.
  */
 import type { AsyncLocalStorage } from "node:async_hooks";
+import { mintId, mintRunId } from "@crewhaus/control-contract";
 import { createLogger } from "@crewhaus/logging";
-import { type InboundContent, createRunContext, withInboundContent } from "./index";
+import { type InboundContent, createRunContext, runWithScope, withInboundContent } from "./index";
 import { takePendingInbound } from "./scope";
 
 const INPUT = "Summarise the attached quarterly report in three bullet points.";
@@ -151,5 +152,126 @@ describe("withInboundContent", () => {
       expect(takePendingInbound()).toEqual(entries);
       expect(takePendingInbound()).toEqual([]);
     });
+  });
+});
+
+describe("runWithScope", () => {
+  const WI = mintId("wi");
+
+  test("no scope: a context carries no lineage", () => {
+    const ctx = createRunContext();
+    for (const field of ["parent", "resumeScope", "continues", "workItem", "trigger"]) {
+      expect(field in ctx).toBe(false);
+    }
+  });
+
+  test("the scope fills every field the options leave unset, and the options win", async () => {
+    const scope = {
+      resumeScope: "job:job_00000001",
+      trigger: { kind: "queue" as const },
+      workItem: WI,
+    };
+    const [filled, overridden] = await runWithScope(scope, async () => {
+      await hop();
+      const a = createRunContext();
+      const b = createRunContext({
+        resumeScope: "lane:heartbeat",
+        trigger: { kind: "heartbeat", lane: "heartbeat" },
+      });
+      return [a, b] as const;
+    });
+    expect(filled.resumeScope).toBe("job:job_00000001");
+    expect(filled.trigger).toEqual({ kind: "queue" });
+    expect(filled.workItem).toBe(WI);
+    expect(overridden.resumeScope).toBe("lane:heartbeat");
+    expect(overridden.trigger).toEqual({ kind: "heartbeat", lane: "heartbeat" });
+    // A field the options leave unset still comes from the scope.
+    expect(overridden.workItem).toBe(WI);
+  });
+
+  test("a nested scope inherits the outer fields and overrides only the ones it names", async () => {
+    const ctx = await runWithScope({ resumeScope: "lane:schedule", workItem: WI }, () =>
+      runWithScope({ trigger: { kind: "schedule", lane: "schedule" } }, async () => {
+        await hop();
+        return createRunContext();
+      }),
+    );
+    expect(ctx.resumeScope).toBe("lane:schedule");
+    expect(ctx.workItem).toBe(WI);
+    expect(ctx.trigger).toEqual({ kind: "schedule", lane: "schedule" });
+    // Outside the scope again: nothing.
+    expect("resumeScope" in createRunContext()).toBe(false);
+  });
+
+  test("inside withInboundContent, the first context still adopts the run input", async () => {
+    const ctx = await withInboundContent([entry(INPUT)], () =>
+      runWithScope({ trigger: { kind: "queue" } }, async () => {
+        await hop();
+        return createRunContext();
+      }),
+    );
+    expect(ctx.dataLineage?.get(INPUT)).toBe("api");
+    expect(ctx.trigger).toEqual({ kind: "queue" });
+  });
+
+  test("around withInboundContent, the first context adopts the input and takes the scope", async () => {
+    const [first, second] = await runWithScope({ resumeScope: "job:j1" }, () =>
+      withInboundContent([entry(INPUT)], async () => {
+        await hop();
+        const a = createRunContext();
+        return [a, createRunContext()] as const;
+      }),
+    );
+    expect(first.dataLineage?.get(INPUT)).toBe("api");
+    expect(first.resumeScope).toBe("job:j1");
+    // The input went to the first context only; the scope reaches both.
+    expect(second.dataLineage).toBeUndefined();
+    expect(second.resumeScope).toBe("job:j1");
+  });
+
+  test("a nested runWithScope shares the outer inbound slot: the first context anywhere takes it", async () => {
+    const [inner, outer] = await withInboundContent([entry(INPUT)], async () => {
+      const a = await runWithScope({ trigger: { kind: "eval" } }, async () => {
+        await hop();
+        return createRunContext();
+      });
+      return [a, createRunContext()] as const;
+    });
+    expect(inner.dataLineage?.get(INPUT)).toBe("api");
+    expect(outer.dataLineage).toBeUndefined();
+  });
+
+  test("continues reaches the first context in the scope and not the second", async () => {
+    const PARKED = mintRunId();
+    const [first, second, nested] = await runWithScope(
+      { continues: PARKED, trigger: { kind: "resume" } },
+      async () => {
+        await hop();
+        const a = createRunContext();
+        const b = createRunContext();
+        // A nested scope that names no `continues` shares the outer slot, already taken.
+        const c = runWithScope({ resumeScope: "session:sess_0123456789abcdef" }, () =>
+          createRunContext(),
+        );
+        return [a, b, c] as const;
+      },
+    );
+    expect(first.continues).toBe(PARKED);
+    expect("continues" in second).toBe(false);
+    expect("continues" in nested).toBe(false);
+    // The rest of the scope reaches every context.
+    expect(second.trigger).toEqual({ kind: "resume" });
+    expect(nested.trigger).toEqual({ kind: "resume" });
+  });
+
+  test("a nested scope that names its own continues gives it to its own first context", async () => {
+    const OUTER = mintRunId();
+    const INNER = mintRunId();
+    const [inner, outer] = await runWithScope({ continues: OUTER }, async () => {
+      const a = runWithScope({ continues: INNER }, () => createRunContext());
+      return [a, createRunContext()] as const;
+    });
+    expect(inner.continues).toBe(INNER);
+    expect(outer.continues).toBe(OUTER);
   });
 });

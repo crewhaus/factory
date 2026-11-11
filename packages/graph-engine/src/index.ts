@@ -44,7 +44,7 @@ import {
   newGraphRunId,
 } from "@crewhaus/checkpoint-store";
 import { CrewhausError, EXIT_CODES, type FailureReport, RunFailedError } from "@crewhaus/errors";
-import type { RunContext } from "@crewhaus/run-context";
+import { type RunContext, retainRun } from "@crewhaus/run-context";
 import type { RunFailedEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 
 export type NodeName = string;
@@ -429,6 +429,11 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
     })();
   }
 
+  /**
+   * Run the graph on one context. Every node's loop runs on it, so the run is
+   * held until the graph ends (run-context's `retainRun`): it ends once, after
+   * its last node, however the stream ends.
+   */
   private async *execute(args: {
     graphRunId: GraphRunId;
     state: State;
@@ -437,12 +442,29 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
     runContext?: RunContext;
     resumedFromCheckpointId?: CheckpointId;
   }): AsyncIterable<NodeEvent<State>> {
+    const runContext = args.runContext ?? (await this.lazyRunContext());
+    const release = retainRun(runContext);
+    try {
+      yield* this.executeNodes({ ...args, runContext });
+    } finally {
+      release();
+    }
+  }
+
+  private async *executeNodes(args: {
+    graphRunId: GraphRunId;
+    state: State;
+    startNode: NodeName;
+    approvals: Readonly<Record<NodeName, string>>;
+    runContext: RunContext;
+    resumedFromCheckpointId?: CheckpointId;
+  }): AsyncIterable<NodeEvent<State>> {
     const { graphRunId, approvals } = args;
     let state = args.state;
     let cursor: NodeName | undefined = args.startNode;
     let parentCheckpointId = args.resumedFromCheckpointId;
     let turn = 0;
-    const runContext = args.runContext ?? (await this.lazyRunContext());
+    const runContext = args.runContext;
 
     while (cursor !== undefined) {
       const nodeName = cursor;
