@@ -23,6 +23,7 @@
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
         "@crewhaus/chunker": "workspace:*",
         "@crewhaus/claim-ledger": "workspace:*",

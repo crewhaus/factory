@@ -32,6 +32,7 @@
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/eval-optimizer-orchestrator": "workspace:*",
     "@crewhaus/prompt-optimizer": "workspace:*",
     "@crewhaus/prompt-optimizer-claude": "workspace:*",

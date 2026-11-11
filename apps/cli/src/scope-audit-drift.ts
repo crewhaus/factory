@@ -338,6 +338,10 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
   // A batch job's payload, classified at "api" before the job's handler and
   // tagged into its run the same way.
   { name: "queue-consumer", path: "packages/queue-consumer/src/index.ts", requireTag: true },
+  // What an MCP client sends to `crewhaus serve --mcp` (stdio or `--sse`),
+  // classified at "api" before the call's turn and tagged into the turn's
+  // first context through the same inbound scope.
+  { name: "serve-mcp-run-input", path: "apps/cli/src/serve-mcp.ts", requireTag: true },
   // Every message a Worker build's loop is handed, at "channel", before its
   // first model call. The edge keeps no lineage: refused, not tagged.
   { name: "worker-runtime-loop", path: "packages/worker-runtime/src/loop.ts" },

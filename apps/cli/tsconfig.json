@@ -19,6 +19,7 @@
     { "path": "../../packages/justification-judge-claude" },
     { "path": "../../packages/spec-patch" },
     { "path": "../../packages/audit-log" },
+    { "path": "../../packages/boundary-classifier" },
     { "path": "../../packages/canary-controller" },
     { "path": "../../packages/compiler" },
     { "path": "../../packages/feedback-distill" },

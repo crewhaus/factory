@@ -1522,7 +1522,9 @@ import {
   resolveMcpToolsMode,
   resolveMcpTransport,
   resolveServeBearer,
+  resolveServeBind,
   resolveServePort,
+  screenedInvoke,
   serveRequestRefusal,
 } from "./serve-mcp";
 // `crewhaus services setup` — the OPERATOR-tier provisioner for a harness's
@@ -5822,10 +5824,14 @@ async function runServeMcp(args: ParsedArgs): Promise<void> {
     transport === "sse"
       ? resolveServePort(strFlag(args, "port"), process.env["CREWHAUS_MCP_PORT"])
       : SERVE_MCP_DEFAULT_PORT;
-  // The `--sse` listener's bearer, before any wiring: a token that fails to be
-  // saved ends the start through `die()`, which skips the cleanup path.
+  // The `--sse` listener's address and bearer, before any wiring: a refused
+  // `--host` or a token that fails to be saved ends the start through
+  // `die()`, which skips the cleanup path. `--host` is a flag only, so the
+  // bind moves only when a person types it.
+  const bind =
+    transport === "sse" ? resolveServeBind(strFlag(args, "host"), process.env) : undefined;
   const bearer =
-    transport === "sse" ? resolveServeBearer({ cwd: process.cwd(), env: process.env }) : undefined;
+    bind !== undefined ? resolveServeBearer({ cwd: process.cwd(), env: process.env }) : undefined;
 
   // stdio → keep the agent's stdout off the JSON-RPC channel (see the docblock).
   let protocolStdout: Writable | undefined;
@@ -5874,14 +5880,18 @@ async function runServeMcp(args: ParsedArgs): Promise<void> {
       `[serve] MCP stdio server for "${cliIr.name}" ready (tools: ${toolsMode}) — add it to your MCP client's config\n`,
     );
   } else {
-    if (bearer === undefined) throw new ServeMcpError("an --sse start has no bearer token");
+    if (bind === undefined || bearer === undefined) {
+      throw new ServeMcpError("an --sse start has no listen address or bearer token");
+    }
     sseServer = Bun.serve({
       port,
-      hostname: "127.0.0.1",
-      fetch: (req) => serveRequestRefusal(req, bearer.token) ?? handle.fetch(req),
+      hostname: bind.hostname,
+      fetch: (req) => serveRequestRefusal(req, bind, bearer.token) ?? handle.fetch(req),
     });
+    const urlHost = bind.hostname.includes(":") ? `[${bind.hostname}]` : bind.hostname;
+    const reach = bind.loopback ? "this computer only" : "beyond this computer";
     process.stdout.write(
-      `[serve] MCP SSE server for "${cliIr.name}" on http://127.0.0.1:${port}, this computer only (tools: ${toolsMode}) — POST MCP requests to /\n`,
+      `[serve] MCP SSE server for "${cliIr.name}" on http://${urlHost}:${port}, ${reach} (tools: ${toolsMode}) — POST MCP requests to /\n`,
     );
     process.stdout.write(`[serve] bearer: ${bearer.source}\n`);
   }
@@ -6213,30 +6223,31 @@ async function buildServeRuntime(
     return run;
   };
 
-  const invoke: McpInvoke = (message, context) =>
-    serialize(() => {
-      if (context.subAgent !== undefined) {
-        const def = subAgents?.get(context.subAgent);
-        if (def === undefined) {
-          throw new ServeMcpError(`unknown sub-agent "${context.subAgent}"`);
-        }
-        return runChatLoop({
-          ...commonOptions,
-          model: def.model ?? model,
-          // An MCP-exposed sub-agent has no Task `profile` to pin: it runs on
-          // its declared plan, so the default profile's overlay heads its prompt.
-          instructions: foldSubAgentOverlay(def.instructions, def.overlay),
-          // `def.tools` is the sub-agent's resolved allowlist (always concrete
-          // from the IR; `?? []` only satisfies the optional runtime type).
-          tools: filterChildTools(tools, def.tools ?? []),
-          seedMessages: [{ role: "user" as const, content: message }],
-        });
+  // Each call's message is classified at `api` before its turn, and a kept
+  // one tags the turn's first RunContext (see `screenedInvoke`).
+  const invoke: McpInvoke = screenedInvoke(serialize, (message, context) => {
+    if (context.subAgent !== undefined) {
+      const def = subAgents?.get(context.subAgent);
+      if (def === undefined) {
+        throw new ServeMcpError(`unknown sub-agent "${context.subAgent}"`);
       }
       return runChatLoop({
-        ...primaryOptionsForRun(),
+        ...commonOptions,
+        model: def.model ?? model,
+        // An MCP-exposed sub-agent has no Task `profile` to pin: it runs on
+        // its declared plan, so the default profile's overlay heads its prompt.
+        instructions: foldSubAgentOverlay(def.instructions, def.overlay),
+        // `def.tools` is the sub-agent's resolved allowlist (always concrete
+        // from the IR; `?? []` only satisfies the optional runtime type).
+        tools: filterChildTools(tools, def.tools ?? []),
         seedMessages: [{ role: "user" as const, content: message }],
       });
+    }
+    return runChatLoop({
+      ...primaryOptionsForRun(),
+      seedMessages: [{ role: "user" as const, content: message }],
     });
+  });
 
   const cleanup = async (): Promise<void> => {
     // §7.8 — drained shadows settle (their verdicts are what the audition

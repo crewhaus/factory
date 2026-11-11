@@ -198,6 +198,10 @@ export const SERVE_SCHEMA: ParseArgsSchema = {
     { name: "sse", takesValue: false },
     // SSE listen port (default 8000, or CREWHAUS_MCP_PORT). Ignored for stdio.
     { name: "port", takesValue: true },
+    // SSE listen address (default 127.0.0.1). A flag only, with no spec key and
+    // no ambient variable, so the bind moves only when a person types it.
+    // Beyond this computer it needs CREWHAUS_MCP_TOKEN. Ignored for stdio.
+    { name: "host", takesValue: true },
     // Threaded into the projected agent's turn exactly as on `crewhaus run`.
     { name: "model", takesValue: true },
     { name: "permission-mode", takesValue: true },
