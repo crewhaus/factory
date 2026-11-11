@@ -45,11 +45,13 @@ by the other, and neither needs the other running.
 - **Reads never mutate** — session browsing is raw directory scans plus
   tolerant JSONL parsing, never `SessionStore.list()` (whose TTL eviction
   deletes expired transcripts as a side-effect). The approvals inbox folds
-  `approvals.jsonl` for the same reason: `PendingApprovalStore.list()`
-  COMPACTS the file, and a polled inbox must not rewrite an operator's
-  ledger. It reads through `@crewhaus/control-records`' tail reader, so a
-  large file shows its newest records. Regression tests browse both
-  repeatedly and assert every file survives byte-identical.
+  `approvals.jsonl` with `@crewhaus/session-store`'s own fold (the first
+  decision wins, and the decision claims beside the file outrank it), which
+  writes nothing. It reads through `@crewhaus/control-records`' tail reader,
+  so a large file shows its newest records. Regression tests browse both
+  repeatedly and assert every file survives byte-identical. Grant and deny
+  go through the store's `decide`: a request already decided from any
+  surface answers 409 naming its state.
 - **Credentials never render** — env handling reports KEY presence
   booleans only; the spec view masks credential values (spec-patch
   `isCredentialKey`/`maskCredentialTokens`); transcripts, preflight

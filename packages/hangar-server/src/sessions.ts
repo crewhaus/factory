@@ -21,8 +21,9 @@
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { resolveHarnessSessionRoot } from "@crewhaus/session-store";
 import { maskCredentialTokens } from "@crewhaus/spec-patch";
-import { MAX_RAW_LINES, SESSION_DIR_ENV, SESSION_ID_RE, SESSION_JSON_RE } from "./constants";
+import { MAX_RAW_LINES, SESSION_ID_RE, SESSION_JSON_RE } from "./constants";
 import { readHarnessEnvFiles } from "./env-file";
 import { readJsonlCapped } from "./jsonl";
 import { maskDeep } from "./mask";
@@ -40,18 +41,10 @@ export type SessionRootInfo = {
 };
 
 /** Resolve where a harness's sessions live, honoring the `.env` override
- *  when (and only when) it stays inside the harness dir. */
+ *  when (and only when) it stays inside the harness dir. One rule for every
+ *  reader: `@crewhaus/session-store`'s `resolveHarnessSessionRoot`. */
 export function resolveSessionRoot(harnessDir: string): SessionRootInfo {
-  const fallback = join(harnessDir, ".crewhaus", "sessions");
-  const override = readHarnessEnvFiles(harnessDir).vars[SESSION_DIR_ENV];
-  if (override === undefined || override.trim() === "") {
-    return { root: fallback, overrideActive: false, overrideIgnored: false };
-  }
-  const resolved = resolveContained(harnessDir, override.trim());
-  if (resolved === undefined) {
-    return { root: fallback, overrideActive: false, overrideIgnored: true };
-  }
-  return { root: resolved, overrideActive: true, overrideIgnored: false };
+  return resolveHarnessSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars);
 }
 
 export type SessionRow = {

@@ -61,8 +61,58 @@ export const DECISION_LOG_REASONS: Readonly<Record<EventsOf<ReasonTable>, readon
     }, {}),
   ) as unknown as Readonly<Record<EventsOf<ReasonTable>, readonly string[]>>;
 
+/**
+ * What a decision-log line records. `refuse` is reserved for the check made
+ * when a grant is spent, which records why it was not.
+ */
+export const DECISION_LOG_EVENTS = deepFreeze([
+  "park",
+  "decide",
+  "supersede",
+  "defer",
+  "consume",
+  "refuse",
+  "expire",
+  "evict",
+] as const);
+
+export type DecisionLogEvent = (typeof DECISION_LOG_EVENTS)[number];
+
+/**
+ * The closed key set of a decision-log line. The log holds ids, keyed digests,
+ * times and codes from closed lists: never tool input, free text or a user name.
+ * A key is added here on purpose, and its test changes with it.
+ */
+export const DECISION_LOG_KEYS = deepFreeze([
+  "v",
+  "at",
+  "event",
+  "decision",
+  "runId",
+  "sessionId",
+  "tool",
+  "inputDigest",
+  "placesDigest",
+  "bindingDigest",
+  "by",
+  "resolvedBy",
+  "agreementRevision",
+  "surface",
+  "outcome",
+  "reason",
+  "until",
+  "choice",
+  "answered",
+  "sensitivity",
+] as const);
+
+export type DecisionLogKey = (typeof DECISION_LOG_KEYS)[number];
+
 /** Why a decision was superseded: a code from a closed list, never free text. */
 export type SupersedeReason = ReasonsOf<ReasonTable, "supersede">;
+
+/** Why a decision was deferred: a code from a closed list, never free text. */
+export type DeferReason = ReasonsOf<ReasonTable, "defer">;
 
 export { OPERATOR_SUPERSEDE_REASONS };
 

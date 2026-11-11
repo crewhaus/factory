@@ -56,6 +56,7 @@ import {
   isArgScoped,
   rankSuggestions,
 } from "@crewhaus/harness-advice";
+import { APPROVALS_DIRNAME } from "@crewhaus/session-store";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { OperativeArg, RegisteredTool } from "@crewhaus/tool-catalog";
 import { TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
@@ -163,7 +164,14 @@ function parseInstantArg(label: string, text: string | undefined): Loaded<number
   return { ok: true, value: ms };
 }
 
-const statusEnum = z.enum(["pending", "granted", "granted-always", "denied", "consumed"]);
+const statusEnum = z.enum([
+  "pending",
+  "granted",
+  "granted-always",
+  "denied",
+  "consumed",
+  "superseded",
+]);
 
 /** How every instant input is written, said once so the three fields agree. */
 const INSTANT_FORMAT =
@@ -338,13 +346,17 @@ function noteStoreHealth(unknowns: Unknowns, store: StoreRead, probe: string): v
 // ---------------------------------------------------------------------------
 
 /**
- * The ledger an approvals reader opens inside a harness directory. A deny
- * naming it (or the sessions directory around it) fires on a call that
- * reads it. The `.env` files a missing ledger sends the reader to are left
+ * The ledger an approvals reader opens inside a harness directory, and the
+ * decision claims beside it that outrank it. A deny naming either (or the
+ * sessions directory around them) fires on a call that reads them. The `.env` files a missing ledger sends the reader to are left
  * out: it reads them only for whether they move the session root, and says
  * no more about them than that.
  */
-const LEDGER_OPENED = [{ path: `${SESSIONS_SUBDIR}/${APPROVALS_FILENAME}` }] as const;
+const LEDGER_OPENED = [
+  { path: `${SESSIONS_SUBDIR}/${APPROVALS_FILENAME}` },
+  // The decision claims beside it, which outrank the file.
+  { path: `${SESSIONS_SUBDIR}/${APPROVALS_DIRNAME}`, beneath: "all" },
+] as const;
 
 /** The harness's own permission rules, which PermissionsSuggest diffs against. */
 const SETTINGS_RELPATH = ".crewhaus/settings.json";
@@ -637,7 +649,14 @@ export const approvalsInbox: RegisteredTool = buildTool({
     const unreadableHarnesses: Array<{ harness: string; reason: string }> = [];
     const truncatedHarnesses: string[] = [];
     const undatedIds: string[] = [];
-    const totals = { pending: 0, granted: 0, "granted-always": 0, denied: 0, consumed: 0 };
+    const totals = {
+      pending: 0,
+      granted: 0,
+      "granted-always": 0,
+      denied: 0,
+      consumed: 0,
+      superseded: 0,
+    };
     let matched = 0;
     let readHarnesses = 0;
 
@@ -863,6 +882,7 @@ function rowAsRecord(row: InboxRow): ApprovalRecord & { readonly harness: string
         ? { decision: "deny" }
         : {}),
     ...(row.status === "consumed" ? { consumedAt: row.decidedAt ?? row.createdAt } : {}),
+    ...(row.supersededBy !== undefined ? { supersededBy: row.supersededBy } : {}),
     ...(row.always === true ? { always: true } : {}),
   };
 }

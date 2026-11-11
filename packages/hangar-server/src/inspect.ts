@@ -253,6 +253,12 @@ export const INSPECT_EXCLUSIONS: readonly InspectExclusion[] = [
       "a managed daemon's generated signing secret — a bare value, with no key for a masker to read",
     where: "the file itself, on the daemon's machine, or set CREWHAUS_GATEWAY_JWT_SECRET",
   },
+  {
+    path: ".crewhaus/sessions/approvals.d/keys/",
+    reason:
+      "the key the decision log's digests are made with — a bare value, and with it a digest of a tool input or a user name could be tested by guessing",
+    where: "nowhere: it never leaves the session root",
+  },
 ];
 
 /**
@@ -262,7 +268,11 @@ export const INSPECT_EXCLUSIONS: readonly InspectExclusion[] = [
  * `secrets` is refused, wherever it sits, and any name that starts `.env`.
  * Over-refusing a browser is recoverable; under-refusing it is not.
  *
- * CASE-FOLDED, ALL FIVE OF THEM. The default filesystem on darwin (APFS) and
+ * The decision log's key directory is refused wherever its session root
+ * sits (`approvals.d/keys` at any depth), because `CREWHAUS_SESSION_DIR` can
+ * move the session root anywhere inside the harness.
+ *
+ * CASE-FOLDED, ALL SIX OF THEM. The default filesystem on darwin (APFS) and
  * on Windows (NTFS) is case-INSENSITIVE, so the OS happily resolves
  * `.crewhaus/AUDIT` and `.crewhaus/Run/Logs` to the real directories — and
  * `resolveContained` answers with the caller's casing rather than the
@@ -273,10 +283,13 @@ export const INSPECT_EXCLUSIONS: readonly InspectExclusion[] = [
  */
 export function exclusionFor(segments: readonly string[]): InspectExclusion | null {
   const lower = segments.map((s) => s.toLowerCase());
-  for (const segment of lower) {
+  for (const [i, segment] of lower.entries()) {
     if (segment === "secrets") return INSPECT_EXCLUSIONS[0] as InspectExclusion;
     if (segment === ".env" || segment.startsWith(".env.")) {
       return INSPECT_EXCLUSIONS[2] as InspectExclusion;
+    }
+    if (segment === "approvals.d" && lower[i + 1] === "keys") {
+      return INSPECT_EXCLUSIONS[5] as InspectExclusion;
     }
   }
   if (lower[0] !== ".crewhaus") return null;

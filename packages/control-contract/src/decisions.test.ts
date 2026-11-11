@@ -3,6 +3,8 @@ import {
   type ApproverProjection,
   CORE_MODULE,
   DECISION_CLASSES,
+  DECISION_LOG_EVENTS,
+  DECISION_LOG_KEYS,
   DECISION_LOG_REASONS,
   type DecisionRecordView,
   OPERATOR_SUPERSEDE_REASONS,
@@ -681,7 +683,57 @@ describe("vocabulary", () => {
       "people-erased",
       "people-grant-revoked",
     ]);
-    expect([...CORE_MODULE.reasonCodes.evict]).toEqual(["erased"]);
+    expect([...CORE_MODULE.reasonCodes.evict]).toEqual(["erased", "ttl"]);
+    expect([...CORE_MODULE.reasonCodes.expire]).toEqual(["ttl"]);
+    expect([...CORE_MODULE.reasonCodes.defer]).toEqual([
+      "awaiting-information",
+      "awaiting-someone",
+      "scheduled",
+      "other",
+    ]);
+    expect(DECISION_LOG_REASONS.expire).toEqual(["ttl"]);
+    expect(DECISION_LOG_REASONS.defer).toContain("scheduled");
+  });
+
+  test("the decision log's events and its closed key set are pinned", () => {
+    expect([...DECISION_LOG_EVENTS]).toEqual([
+      "park",
+      "decide",
+      "supersede",
+      "defer",
+      "consume",
+      "refuse",
+      "expire",
+      "evict",
+    ]);
+    // A key added later changes this list on purpose: the log holds no content.
+    expect([...DECISION_LOG_KEYS]).toEqual([
+      "v",
+      "at",
+      "event",
+      "decision",
+      "runId",
+      "sessionId",
+      "tool",
+      "inputDigest",
+      "placesDigest",
+      "bindingDigest",
+      "by",
+      "resolvedBy",
+      "agreementRevision",
+      "surface",
+      "outcome",
+      "reason",
+      "until",
+      "choice",
+      "answered",
+      "sensitivity",
+    ]);
+    expect(Object.isFrozen(DECISION_LOG_KEYS)).toBe(true);
+    // Every reason list the core declares belongs to an event the log records.
+    for (const event of Object.keys(CORE_MODULE.reasonCodes)) {
+      expect(DECISION_LOG_EVENTS as readonly string[]).toContain(event);
+    }
   });
 
   test("an operator can give three of them; the rest only the system records", () => {

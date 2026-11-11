@@ -5,9 +5,22 @@
  * — which is exactly why the plane exposes `fetch` separately from `start`.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  allowSingleOwner,
+  createPendingApprovalStore,
+  generateApprovalId,
+} from "@crewhaus/session-store";
 import {
   CONTROL_PATH_PREFIX,
   CONTROL_PROTOCOL,
@@ -21,6 +34,7 @@ import {
   DRAIN_RETRY_AFTER_SECONDS,
   DRAIN_SWEEP_BUDGET_ENV,
   constantTimeEquals,
+  countPendingApprovals,
   createControlPlane,
   resolveControlToken,
   runDrainSweep,
@@ -845,5 +859,49 @@ describe("runDrainSweep — best-effort housekeeping under its own budget", () =
     );
     expect(await runDrainSweep(() => undefined, { env: {} })).toBe("done");
     expect(DEFAULT_DRAIN_SWEEP_MS).toBeGreaterThan(0);
+  });
+});
+
+describe("countPendingApprovals folds the way every reader does", () => {
+  const park = (inputHash: string) => ({
+    id: generateApprovalId(),
+    toolName: "Bash",
+    inputHash,
+    runId: "run_00000001",
+    sessionId: "sess_00000000000000aa",
+    surface: "daemon",
+    createdAt: new Date().toISOString(),
+  });
+  const write = (lines: readonly object[]): string => {
+    mkdirSync(sessions, { recursive: true });
+    const file = join(sessions, "approvals.jsonl");
+    writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+    return file;
+  };
+
+  test("a decided record an 0.8.x writer flipped back to waiting is not counted", () => {
+    const p = park("h1");
+    const granted = { ...p, decision: "grant", decidedBy: "max", decidedAt: p.createdAt };
+    const file = write([p, granted, p]);
+    expect(countPendingApprovals(file)).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe(
+      `${[p, granted, p].map((l) => JSON.stringify(l)).join("\n")}\n`,
+    );
+  });
+
+  test("a record its claim decided is not counted, though its file line still waits", async () => {
+    const decided = park("h2");
+    const waiting = park("h3");
+    const file = write([decided, waiting]);
+    const store = createPendingApprovalStore({ rootDir: sessions });
+    await store.decide(decided.id, { choice: "deny", actor: {} }, { authorize: allowSingleOwner });
+    // As a crash between the claim and its lines would leave the file.
+    writeFileSync(file, `${[decided, waiting].map((l) => JSON.stringify(l)).join("\n")}\n`);
+    expect(countPendingApprovals(file)).toBe(1);
+  });
+
+  test("no file counts nothing, and creates nothing", () => {
+    expect(countPendingApprovals(join(sessions, "approvals.jsonl"))).toBe(0);
+    expect(() => readdirSync(sessions)).toThrow();
   });
 });

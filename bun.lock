@@ -1110,8 +1110,10 @@
       "name": "@crewhaus/gateway-protocol",
       "version": "0.8.0",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -1975,9 +1977,13 @@
       "version": "0.8.0",
       "dependencies": {
         "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/spec-patch": "workspace:*",
       },
     },
     "packages/single-binary-cli": {
@@ -2433,6 +2439,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/harness-advice": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",

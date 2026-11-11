@@ -31,14 +31,14 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
+import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { basename, dirname, relative, resolve } from "node:path";
 import {
-  APPROVAL_ID_RE as APPROVAL_ID_REGEX,
   SESSION_ID_RE as ID_REGEX,
+  type ReceiptVia,
+  type SupersedeReason,
 } from "@crewhaus/control-contract";
 import { RuntimeError } from "@crewhaus/errors";
-import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
 import {
   type ContainedRead,
   type SafeFsFailure,
@@ -47,6 +47,20 @@ import {
   openForReadSync,
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
+import {
+  type ApprovalDecisions,
+  allowSingleOwner,
+  createApprovalWriter,
+  sweepApprovals,
+} from "./approvals/decide";
+import {
+  approvalIsExpired,
+  foldApprovalRecords,
+  foldReadOnly,
+  overlayDecisionClaims,
+  readApprovalsFile,
+} from "./approvals/fold";
+import { fencePath } from "./fence";
 
 export { APPROVAL_ID_RE, SESSION_ID_RE } from "@crewhaus/control-contract";
 
@@ -158,16 +172,6 @@ export interface SessionStore {
   list(): Promise<Session[]>;
   update(id: string, patch: SessionPatch): Promise<Session>;
   delete(id: string): Promise<void>;
-}
-
-// When a tenant context is active, fail closed on any resolved path that
-// escapes the tenant's sessionRoot (CWE-1230). Outside a tenant scope (the
-// common CLI case) this is a no-op so non-tenant behaviour is unchanged.
-function fencePath(absPath: string): string {
-  if (currentTenantContext() !== undefined) {
-    assertSamePath(absPath, requireTenant().sessionRoot);
-  }
-  return absPath;
 }
 
 /**
@@ -769,12 +773,17 @@ function normalizeAdditiveFields(session: Session): Session {
 // `permissions.ask_mode` is `"pause"`, runtime-core persists a
 // `PendingApproval` here, parks the run, and re-reads on the next execution to
 // re-resolve the call. The record lives in ONE append-only JSONL file beside
-// the session `.json`/`.jsonl` files (`<rootDir>/approvals.jsonl`), folded
-// last-wins per `id` on read. Keyed on `(toolName, inputHash)` — NOT on
-// session — so a grant persisted by one run is found by the next run that
-// re-issues the same call. TTL'd on the same mtime-independent clock as
-// sessions: a record whose `createdAt` is older than `ttlDays` is treated as
-// absent (and compacted away by `list()`).
+// the session `.json`/`.jsonl` files (`<rootDir>/approvals.jsonl`). Keyed on
+// `(toolName, inputHash)` — NOT on session — so a grant persisted by one run is
+// found by the next run that re-issues the same call. TTL'd on the same
+// mtime-independent clock as sessions: a record whose `createdAt` is older than
+// `ttlDays` is treated as absent, and dropped by the boot sweep.
+//
+// 0.9.0 (#507, #513) — the first decision wins, on every surface. Reads fold
+// first-decision-wins with the decision claims applied (`./approvals/fold`),
+// and never rewrite the file. Every write takes `approvals.d/lock`, a decision
+// is an exclusive claim, and a content-free decision log records each step
+// (`./approvals/decide`, `./approvals/log`).
 // ===========================================================================
 
 /** The out-of-band decision recorded on a parked approval. */
@@ -855,45 +864,68 @@ export type PendingApproval = {
    * plain one-shot grants and denies.
    */
   always?: boolean;
+  // ---- 0.9.0 (#507, #513) — additive, all OPTIONAL. `isPendingApprovalShape`
+  // checks only the seven required strings, so 0.8.x readers keep reading. ----
+  /**
+   * The decider as a stored actor: a `prn_` member id or `local:#<keyed digest>`
+   * of the local user, never a raw `local:` identity and never free text.
+   * `decidedBy` stays the display name, and carries no authority.
+   */
+  readonly decidedByPrincipal?: string;
+  /** The door the decision came through (`home`, `cli`, `slack`, …). */
+  readonly decidedVia?: ReceiptVia;
+  /** The fresh request that replaced this one (`crewhaus approvals supersede`). */
+  readonly supersededBy?: string;
+  /** Why it was replaced: a code from a closed list. */
+  readonly supersededReason?: SupersedeReason;
+  /** A pending request deferred until this instant (`crewhaus approvals defer`). */
+  readonly deferredUntil?: string;
 };
 
 /**
  * The persistence seam runtime-core's `approvals` option consumes. The
  * concrete `createPendingApprovalStore` implements this over a JSONL file;
- * tests may inject an in-memory twin. `persist` is an upsert (last-wins by
- * `id`), so a one-shot grant is consumed by re-persisting the record with
- * `consumedAt` set.
+ * tests may inject an in-memory twin. `persist` appends a line, and the fold
+ * governs it: until a record is decided its newest line wins; once it is
+ * decided a later line may only add `consumedAt` (so a one-shot grant is
+ * consumed by re-persisting the record with `consumedAt` set) or mark it
+ * superseded.
  */
 export interface PendingApprovalStore {
-  /** Append (upsert) a `PendingApproval`. */
+  /** Append a `PendingApproval`; the fold governs what it changes. */
   persist(approval: PendingApproval): Promise<void>;
   /**
    * The current record for `(toolName, inputHash)`: the newest non-consumed,
-   * non-expired match (pending or resolved), or `null`. The runtime branches
-   * on the returned `decision`.
+   * non-superseded, non-expired match (pending or resolved), or `null`. The
+   * runtime branches on the returned `decision`.
    */
   get(toolName: string, inputHash: string): Promise<PendingApproval | null>;
   /**
    * Record an out-of-band decision on the approval `id` (the CLI/Slack verb
-   * path). Returns the updated record, or `null` when no such id exists.
-   * `opts.always` marks a `grant` as a standing allow (#383) — recorded on
-   * the record verbatim; ignored for `deny`.
+   * path), first-wins. Returns the updated record ONLY when this call decided
+   * it; `null` when the id is unknown, already decided, spent, superseded or
+   * expired — the channel `ApprovalStore` contract, so a duplicate resolve (a
+   * button retry, two surfaces racing) is a no-op and the first decision
+   * stands. `opts.always` marks a `grant` as a standing allow (#383) —
+   * recorded on the record verbatim; ignored for `deny`. `opts.via` names the
+   * surface it came through.
    */
   resolve(
     id: string,
     decision: ApprovalDecision,
     by: string,
-    opts?: { readonly always?: boolean },
+    opts?: { readonly always?: boolean; readonly via?: ReceiptVia },
   ): Promise<PendingApproval | null>;
   /**
-   * Every live (non-expired) approval, newest-first. Compacts the backing
-   * file as a side-effect (drops expired + superseded lines), mirroring
-   * `SessionStore.list()`'s TTL eviction.
+   * Every live approval (not expired, not superseded), newest-touched first.
+   * A read: it never rewrites the backing file. Expired records are dropped
+   * by the locked boot sweep (`evictExpiredApprovals`), which logs each one
+   * first.
    */
   list(): Promise<PendingApproval[]>;
 }
 
-export const DEFAULT_APPROVALS_FILENAME = "approvals.jsonl";
+export { DEFAULT_APPROVALS_FILENAME } from "./approvals/log";
 
 /**
  * Stable canonical JSON — object keys sorted recursively — so a tool input
@@ -925,108 +957,6 @@ export type PendingApprovalStoreOptions = {
   readonly now?: () => Date;
 };
 
-function isPendingApprovalShape(value: unknown): value is PendingApproval {
-  if (typeof value !== "object" || value === null) return false;
-  const v = value as Record<string, unknown>;
-  return (
-    typeof v["id"] === "string" &&
-    typeof v["toolName"] === "string" &&
-    typeof v["inputHash"] === "string" &&
-    typeof v["runId"] === "string" &&
-    typeof v["sessionId"] === "string" &&
-    typeof v["surface"] === "string" &&
-    typeof v["createdAt"] === "string"
-  );
-}
-
-/**
- * A file-backed {@link PendingApprovalStore}: one append-only JSONL beside the
- * session files. Reads fold the log last-wins per `id`; `list()` additionally
- * compacts (atomic temp+rename) and evicts records older than `ttlDays`. The
- * path-traversal fence + tenant fence from the session store apply — the file
- * always resolves inside `rootDir`.
- */
-/** The approvals log path for a root, through the same fence sessions use. */
-function approvalsPath(rootDir: string): string {
-  return fencePath(resolve(rootDir, DEFAULT_APPROVALS_FILENAME));
-}
-
-/**
- * Fold the append-only approvals log into the latest record per id. A
- * malformed line never aborts the fold (best-effort, like session `list()`).
- */
-async function foldApprovals(rootDir: string): Promise<Map<string, PendingApproval>> {
-  let raw: string;
-  try {
-    raw = await readFile(approvalsPath(rootDir), "utf8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return new Map();
-    throw err;
-  }
-  const byId = new Map<string, PendingApproval>();
-  for (const line of raw.split("\n")) {
-    if (line.trim() === "") continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (isPendingApprovalShape(parsed)) byId.set(parsed.id, parsed);
-  }
-  return byId;
-}
-
-/**
- * Whether an approval has aged past the cutoff.
- *
- * An UNPARSEABLE `createdAt` counts as EXPIRED. `isPendingApprovalShape` only
- * requires a string, so a hand-edited or corrupted line would otherwise
- * survive every compaction forever — and these records embed the raw tool
- * input, which is by construction a call some policy deemed sensitive enough
- * to need a human. For a file holding that, failing open on a bad timestamp
- * is the wrong direction.
- */
-function approvalIsExpired(approval: PendingApproval, cutoffMs: number): boolean {
-  const created = Date.parse(approval.createdAt);
-  if (!Number.isFinite(created)) return true;
-  return created < cutoffMs;
-}
-
-/**
- * Compact the approvals log down to the live, latest-per-id records: expired
- * and superseded lines are dropped, atomically (tmp+rename). Shared by the
- * store's `list()` and the standalone {@link evictExpiredApprovals} — exactly
- * as `sweepExpired` is shared by `SessionStore.list()` and
- * {@link evictExpiredSessions}.
- */
-async function sweepExpiredApprovals(
-  rootDir: string,
-  cutoffMs: number,
-): Promise<{ evictedIds: string[]; live: PendingApproval[] }> {
-  const folded = await foldApprovals(rootDir);
-  // Nothing folded → nothing to compact, and crucially nothing to CREATE.
-  // Writing here would drop an empty `approvals.jsonl` into every session
-  // root at boot (the sweep runs unconditionally), polluting a directory
-  // whose `.jsonl` files everything else treats as event logs.
-  if (folded.size === 0) return { evictedIds: [], live: [] };
-  const live: PendingApproval[] = [];
-  const evictedIds: string[] = [];
-  for (const approval of folded.values()) {
-    if (approvalIsExpired(approval, cutoffMs)) evictedIds.push(approval.id);
-    else live.push(approval);
-  }
-  try {
-    await mkdir(rootDir, { recursive: true });
-    const body = live.map((a) => JSON.stringify(a)).join("\n");
-    writeContained(approvalsPath(rootDir), body.length > 0 ? `${body}\n` : "", "the approvals log");
-  } catch (err) {
-    // Best-effort compaction — a rewrite failure must not break listing.
-    console.error("session-store: approvals compaction failed", err);
-  }
-  return { evictedIds, live };
-}
-
 /**
  * Sweep expired pending approvals WITHOUT listing them — the approvals
  * counterpart to {@link evictExpiredSessions}, and for the same reason.
@@ -1054,61 +984,63 @@ export async function evictExpiredApprovals(
   const ttlDays = opts.ttlDays ?? DEFAULT_TTL_DAYS;
   const now = opts.now ?? (() => new Date());
   const cutoffMs = now().getTime() - ttlDays * MS_PER_DAY;
-  const { evictedIds } = await sweepExpiredApprovals(rootDir, cutoffMs);
+  // Under the lock: each dropped record is logged (`expire`, `evict`) before
+  // the file is rewritten with the folded survivors. A root with no approvals
+  // is left alone, and nothing is created there.
+  const { evictedIds } = await sweepApprovals(rootDir, cutoffMs, now);
   return { evictedIds };
 }
 
+/** The file-backed store: the runtime's seam plus the decision lifecycle. */
+export type FilePendingApprovalStore = PendingApprovalStore & ApprovalDecisions;
+
+/** Newest-touched first: a decision counts from when it was made. */
+function touchedAt(approval: PendingApproval): number {
+  const at = Date.parse(approval.decidedAt ?? approval.createdAt);
+  return Number.isFinite(at) ? at : 0;
+}
+
+/**
+ * A file-backed {@link PendingApprovalStore}: one append-only JSONL beside the
+ * session files, plus `approvals.d/` for the lock, the decision claims, the
+ * decision log and its key. Reads fold first-decision-wins with the claims
+ * applied and never write; every write takes the lock. The tenant fence from
+ * the session store applies — every path resolves inside `rootDir`.
+ */
 export function createPendingApprovalStore(
   opts: PendingApprovalStoreOptions = {},
-): PendingApprovalStore {
+): FilePendingApprovalStore {
   const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
   const ttlDays = opts.ttlDays ?? DEFAULT_TTL_DAYS;
   const now = opts.now ?? (() => new Date());
-  const filePath = (): string => approvalsPath(rootDir);
-
-  function validateId(id: string): void {
-    if (!APPROVAL_ID_REGEX.test(id)) {
-      throw new RuntimeError(`session-store: invalid approvalId "${id}" — expected appr_<16 hex>`);
-    }
-  }
-
-  // Fold + TTL live at module scope so this store and the standalone
-  // `evictExpiredApprovals` sweep share ONE implementation.
-  const foldAll = (): Promise<Map<string, PendingApproval>> => foldApprovals(rootDir);
-  const isExpired = approvalIsExpired;
-
-  async function append(approval: PendingApproval): Promise<void> {
-    await mkdir(rootDir, { recursive: true });
-    const absPath = filePath();
-    // In place, one write per record (atomic against other appenders), never
-    // through a link or into a FIFO at the name.
-    const appended = appendContained(
-      dirname(absPath),
-      basename(absPath),
-      `${JSON.stringify(approval)}\n`,
-      { mode: 0o600 },
-    );
-    if (!appended.ok) throw refusal("append to", "the approvals log", absPath, appended);
-  }
+  const cutoffMs = (): number => now().getTime() - ttlDays * MS_PER_DAY;
+  const writer = createApprovalWriter({ rootDir, ttlDays, now });
 
   return {
-    async persist(approval: PendingApproval): Promise<void> {
-      validateId(approval.id);
-      await append(approval);
-    },
+    persist: writer.persist,
+    decide: writer.decide,
+    supersede: writer.supersede,
+    defer: writer.defer,
 
     async get(toolName: string, inputHash: string): Promise<PendingApproval | null> {
-      const cutoffMs = now().getTime() - ttlDays * MS_PER_DAY;
-      const folded = await foldAll();
+      const read = readApprovalsFile(rootDir);
+      if (read.state === "absent") return null;
+      if (read.state === "unreadable") {
+        throw new RuntimeError(`session-store: refusing to read the approvals log: ${read.reason}`);
+      }
+      // Claims are read only for the records this call could return.
+      const candidates = foldApprovalRecords(read.objects).records.filter(
+        (a) => a.toolName === toolName && a.inputHash === inputHash,
+      );
+      const cutoff = cutoffMs();
       let best: PendingApproval | null = null;
       let bestAt = -1;
-      for (const approval of folded.values()) {
-        if (approval.toolName !== toolName || approval.inputHash !== inputHash) continue;
+      for (const approval of overlayDecisionClaims(rootDir, candidates).records) {
         if (approval.consumedAt !== undefined) continue;
-        if (isExpired(approval, cutoffMs)) continue;
+        if (approval.supersededBy !== undefined) continue;
+        if (approvalIsExpired(approval, cutoff)) continue;
         // Newest-touched wins: a fresh decision supersedes an older pending.
-        const touchedAt = Date.parse(approval.decidedAt ?? approval.createdAt);
-        const at = Number.isFinite(touchedAt) ? touchedAt : 0;
+        const at = touchedAt(approval);
         if (at >= bestAt) {
           bestAt = at;
           best = approval;
@@ -1121,42 +1053,84 @@ export function createPendingApprovalStore(
       id: string,
       decision: ApprovalDecision,
       by: string,
-      opts?: { readonly always?: boolean },
+      opts?: { readonly always?: boolean; readonly via?: ReceiptVia },
     ): Promise<PendingApproval | null> {
-      validateId(id);
-      const folded = await foldAll();
-      const current = folded.get(id);
-      if (current === undefined) return null;
-      const updated: PendingApproval = {
-        ...current,
-        decision,
-        decidedBy: by,
-        decidedAt: now().toISOString(),
-        // #383 — a standing allow only ever rides on a grant.
-        ...(decision === "grant" && opts?.always === true ? { always: true } : {}),
-      };
-      await append(updated);
-      return updated;
+      const answer = await writer.decide(
+        id,
+        {
+          choice: decision,
+          actor: { display: by },
+          ...(opts?.via !== undefined ? { via: opts.via } : {}),
+          // #383 — a standing allow only ever rides on a grant.
+          ...(opts?.always === true ? { always: true } : {}),
+        },
+        { authorize: allowSingleOwner },
+      );
+      return answer.outcome === "decided" ? answer.record : null;
     },
 
     async list(): Promise<PendingApproval[]> {
-      const cutoffMs = now().getTime() - ttlDays * MS_PER_DAY;
-      // Same sweep the standalone `evictExpiredApprovals` runs: drop expired
-      // and superseded records, rewrite atomically (tmp+rename). A concurrent
-      // append racing the rewrite is the only loss window, and approvals are
-      // low-rate.
-      const { live } = await sweepExpiredApprovals(rootDir, cutoffMs);
-      live.sort((a, b) => {
-        const at = Date.parse(a.decidedAt ?? a.createdAt);
-        const bt = Date.parse(b.decidedAt ?? b.createdAt);
-        return bt - at;
-      });
-      return live;
+      const folded = foldReadOnly(rootDir);
+      if (folded.state === "unreadable") {
+        throw new RuntimeError(
+          `session-store: refusing to read the approvals log: ${folded.reason ?? "unreadable"}`,
+        );
+      }
+      const cutoff = cutoffMs();
+      const live = folded.records.filter(
+        (a) => a.supersededBy === undefined && !approvalIsExpired(a, cutoff),
+      );
+      return live.sort((a, b) => touchedAt(b) - touchedAt(a));
     },
   };
 }
 
-/** Mint a fresh approval id in the `appr_<16 hex>` format the store validates. */
-export function generateApprovalId(): string {
-  return `appr_${randomBytes(8).toString("hex")}`;
-}
+export {
+  type ApprovalActor,
+  type ApprovalAuthorizer,
+  type ApprovalDecisions,
+  type ApprovalOp,
+  type AuthorizeAnswer,
+  type AuthorizeRequest,
+  type DecideAnswer,
+  type DecideRequest,
+  type DeferAnswer,
+  type DeferRequest,
+  DEFER_REASONS,
+  SUPERSEDE_REASONS,
+  type SupersedeAnswer,
+  type SupersedeRequest,
+  allowSingleOwner,
+  generateApprovalId,
+  parseDeferUntil,
+} from "./approvals/decide";
+export {
+  type ApprovalFold,
+  type ClaimFault,
+  type ClaimOverlay,
+  type ReadOnlyFold,
+  foldApprovalRecords,
+  foldReadOnly,
+  overlayDecisionClaims,
+} from "./approvals/fold";
+export {
+  ACTION_DIGEST_LABEL,
+  APPROVALS_CLAIMS_DIR,
+  APPROVALS_DIGEST_KEY_FILE,
+  APPROVALS_DIRNAME,
+  APPROVALS_LOCK_FILE,
+  DECISION_LOG_DIR,
+  type DecisionLogLine,
+  LOCAL_ACTOR_LABEL,
+  PLACES_DIGEST_LABEL,
+  approvalsDigestKey,
+  inputDigestOf,
+  placesDigestOf,
+  storedLocalActor,
+} from "./approvals/log";
+export {
+  type HarnessSessionRoot,
+  SESSION_DIR_ENV,
+  resolveHarnessSessionRoot,
+} from "./approvals/root";
+export { ownerAuthorizer } from "./approvals/authorize";

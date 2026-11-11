@@ -156,7 +156,10 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
         field: "dir",
         kind: "path",
         default: ".",
-        opens: [{ path: ".crewhaus/sessions/approvals.jsonl" }],
+        opens: [
+          { path: ".crewhaus/sessions/approvals.jsonl" },
+          { path: ".crewhaus/sessions/approvals.d", beneath: "all" },
+        ],
       },
     ],
     categories: ["approvals", "safety"],
@@ -174,7 +177,14 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "harnesses", kind: "path", opens: [{ path: ".crewhaus/sessions/approvals.jsonl" }] },
+      {
+        field: "harnesses",
+        kind: "path",
+        opens: [
+          { path: ".crewhaus/sessions/approvals.jsonl" },
+          { path: ".crewhaus/sessions/approvals.d", beneath: "all" },
+        ],
+      },
       { field: "root", kind: "path", default: ".", beneath: "all" },
     ],
     categories: ["approvals", "safety"],

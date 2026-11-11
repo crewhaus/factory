@@ -317,17 +317,21 @@ describe("the approvals file beside session logs", () => {
     }
   });
 
-  test("a session root that holds the working directory keeps that one file", () => {
+  test("a session root that holds the working directory keeps its approvals file and approvals.d", () => {
     const cwd = tempDir("crewhaus-state-roots-");
     const here = runtimeStateRoots(cwd, undefined, cwd, {});
     expect(here).toContain(join(cwd, APPROVALS));
     expect(here).toContain(APPROVALS);
+    expect(here).toContain(join(cwd, "approvals.d"));
+    expect(here).toContain("approvals.d");
     expect(here).not.toContain(cwd);
     // A relative setting resolves the same way.
     expect(runtimeStateRoots(".", undefined, cwd, {})).toContain(join(cwd, APPROVALS));
+    expect(runtimeStateRoots(".", undefined, cwd, {})).toContain(join(cwd, "approvals.d"));
 
     const above = runtimeStateRoots(dirname(cwd), undefined, cwd, {});
     expect(above).toContain(join(dirname(cwd), APPROVALS));
+    expect(above).toContain(join(dirname(cwd), "approvals.d"));
     expect(above).not.toContain(dirname(cwd));
     expect(above).not.toContain(APPROVALS);
   });

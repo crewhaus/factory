@@ -11,8 +11,16 @@
  * `crewhaus approvals grant|deny <id>`; the next run that re-issues the same
  * `(toolName, input)` call finds the recorded decision and proceeds
  * pre-resolved (a `grant` is one-shot — consumed on use).
+ *
+ * The first decision wins (#507): a second `grant` or `deny` is refused and
+ * names the first. A decision is changed before it is used with
+ * `crewhaus approvals supersede <id> --reason <code>`, which parks a fresh
+ * request in its place; a waiting request can be marked
+ * `crewhaus approvals defer <id> --until <time> --reason <code>`.
  */
-import type { PendingApproval } from "@crewhaus/session-store";
+import { hostname, userInfo } from "node:os";
+import { localActorOf } from "@crewhaus/access-control";
+import { DEFER_REASONS, type PendingApproval, SUPERSEDE_REASONS } from "@crewhaus/session-store";
 
 /**
  * The operator-facing lifecycle state of a parked approval, derived from the
@@ -21,17 +29,20 @@ import type { PendingApproval } from "@crewhaus/session-store";
  * decisions; `granted-always` is a standing allow (#383 — the terminal state
  * whether or not the parked call was since consumed, because the standing
  * behavior rides the `alwaysAllow` rule in `.crewhaus/settings.json`, not
- * this record); `pending` still awaits one.
+ * this record); `superseded` was replaced by a fresh request (checked first,
+ * as `effectiveDecisionState` does); `pending` still awaits one.
  */
 export type ApprovalDisplayStatus =
   | "pending"
   | "granted"
   | "granted-always"
   | "denied"
-  | "consumed";
+  | "consumed"
+  | "superseded";
 
 /** Derive the display status from the record's `decision` + `consumedAt`. */
 export function approvalStatus(a: PendingApproval): ApprovalDisplayStatus {
+  if (a.supersededBy !== undefined) return "superseded";
   if (a.decision === "grant" && a.always === true) return "granted-always";
   if (a.consumedAt !== undefined) return "consumed";
   if (a.decision === "grant") return "granted";
@@ -99,9 +110,14 @@ export function formatApprovalsTable(
 
 /**
  * Multi-line detail for one approval, including the verbatim tool input so an
- * approver can inspect exactly what a grant authorizes.
+ * approver can inspect exactly what a grant authorizes. `ignored` is how many
+ * later lines tried to change its decision and were ignored.
  */
-export function formatApprovalDetail(a: PendingApproval, now: number = Date.now()): string {
+export function formatApprovalDetail(
+  a: PendingApproval,
+  now: number = Date.now(),
+  opts: { readonly ignored?: number } = {},
+): string {
   const lines: string[] = [];
   const row = (label: string, value: string): void => {
     lines.push(`${pad(`${label}:`, 12)}${value}`);
@@ -119,6 +135,17 @@ export function formatApprovalDetail(a: PendingApproval, now: number = Date.now(
   if (a.decidedBy !== undefined) row("decidedBy", a.decidedBy);
   if (a.decidedAt !== undefined) row("decidedAt", a.decidedAt);
   if (a.consumedAt !== undefined) row("consumedAt", a.consumedAt);
+  if (a.supersededBy !== undefined) {
+    const why = a.supersededReason !== undefined ? ` (${a.supersededReason})` : "";
+    row("replacedBy", `${a.supersededBy}${why}`);
+  }
+  if (a.deferredUntil !== undefined) row("deferred", `until ${a.deferredUntil}`);
+  const ignored = opts.ignored ?? 0;
+  if (ignored > 0) {
+    lines.push(
+      `${ignored} later line${ignored === 1 ? "" : "s"} tried to change this decision and ${ignored === 1 ? "was" : "were"} ignored`,
+    );
+  }
   lines.push("input:");
   const inputText =
     a.input === undefined ? "  (not recorded)" : indentJson(JSON.stringify(a.input, null, 2));
@@ -161,4 +188,67 @@ function indentJson(json: string): string {
     .split("\n")
     .map((l) => `  ${l}`)
     .join("\n");
+}
+
+/** The codes `crewhaus approvals supersede --reason` takes. */
+export const SUPERSEDE_REASON_CODES: readonly string[] = SUPERSEDE_REASONS;
+/** The codes `crewhaus approvals defer --reason` takes. */
+export const DEFER_REASON_CODES: readonly string[] = DEFER_REASONS;
+
+/**
+ * What `approvals list` shows: every record the fold returns that the runtime
+ * would still see (within `ttlDays` of its park), replaced ones included so the
+ * history reads, newest-touched first.
+ */
+export function listedApprovals(
+  records: ReadonlyArray<PendingApproval>,
+  now: number,
+  ttlDays: number,
+): PendingApproval[] {
+  const cutoff = now - ttlDays * 86_400_000;
+  const touched = (a: PendingApproval): number => {
+    const at = Date.parse(a.decidedAt ?? a.createdAt);
+    return Number.isFinite(at) ? at : 0;
+  };
+  return records
+    .filter((a) => {
+      const created = Date.parse(a.createdAt);
+      return Number.isFinite(created) && created >= cutoff;
+    })
+    .sort((a, b) => touched(b) - touched(a));
+}
+
+/**
+ * Why a `grant` or `deny` was refused because the request is no longer waiting,
+ * and the one verb that changes a decision before it is used.
+ */
+export function alreadyDecidedMessage(id: string, winner: PendingApproval): string {
+  if (winner.supersededBy !== undefined) {
+    return `${id} was replaced by ${winner.supersededBy}; decide that one instead: crewhaus approvals grant|deny ${winner.supersededBy}`;
+  }
+  if (winner.consumedAt !== undefined) return `${id} was already granted and used`;
+  const was = winner.decision === "deny" ? "denied" : "granted";
+  return `${id} was already ${was}; to change it before it is used: crewhaus approvals supersede ${id} --reason <code>`;
+}
+
+/** An invalid `--reason`, with the codes the verb takes. */
+export function invalidReasonMessage(
+  verb: "supersede" | "defer",
+  given: string | undefined,
+): string {
+  const codes = verb === "supersede" ? SUPERSEDE_REASON_CODES : DEFER_REASON_CODES;
+  const got = given === undefined ? "missing --reason" : `"${given}" is not a reason`;
+  return `${got} — \`approvals ${verb}\` takes one of: ${codes.join(", ")}`;
+}
+
+/**
+ * The OS user running the CLI as `local:<user>@<host>`, which the store keeps
+ * only as a keyed digest; `undefined` when the identity cannot be read.
+ */
+export function localApprovalActor(): string | undefined {
+  try {
+    return localActorOf({ username: userInfo().username, hostname: hostname() });
+  } catch {
+    return undefined;
+  }
 }

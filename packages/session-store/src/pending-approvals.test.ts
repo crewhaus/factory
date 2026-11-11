@@ -124,39 +124,49 @@ describe("createPendingApprovalStore", () => {
     expect(got?.decision).toBe("grant");
   });
 
-  test("TTL: an expired record is invisible to get and list, and compacted away", async () => {
+  test("TTL: an expired record is invisible to get and list; only the sweep drops it", async () => {
     let clockMs = Date.parse("2026-01-01T00:00:00.000Z");
-    const store = createPendingApprovalStore({
-      rootDir: root,
-      ttlDays: 1,
-      now: () => new Date(clockMs),
-    });
+    const now = () => new Date(clockMs);
+    const store = createPendingApprovalStore({ rootDir: root, ttlDays: 1, now });
     const p = pending({ createdAt: new Date(clockMs).toISOString() });
     await store.persist(p);
     // Advance the clock two days — past the 1-day TTL.
     clockMs += 2 * 86_400_000;
+    const before = readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf8");
     expect(await store.get(p.toolName, p.inputHash)).toBeNull();
     expect(await store.list()).toEqual([]);
-    // list() compacts: the expired line is gone from the file.
-    const body = readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf8").trim();
-    expect(body).toBe("");
+    // list() is a read: the expired line is still on disk…
+    expect(readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf8")).toBe(before);
+    // …until the sweep drops it.
+    expect((await evictExpiredApprovals({ rootDir: root, ttlDays: 1, now })).evictedIds).toEqual([
+      p.id,
+    ]);
+    expect(readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf8").trim()).toBe("");
   });
 
-  test("list returns live approvals newest-first and compacts superseded lines", async () => {
-    const store = createPendingApprovalStore({ rootDir: root });
-    const a = pending({ inputHash: hashApprovalInput("t", { n: 1 }) });
-    const b = pending({ inputHash: hashApprovalInput("t", { n: 2 }) });
+  test("list returns live approvals newest-first and never rewrites the file", async () => {
+    let clockMs = Date.parse("2026-11-01T00:00:00.000Z");
+    const store = createPendingApprovalStore({ rootDir: root, now: () => new Date(clockMs) });
+    const a = pending({
+      inputHash: hashApprovalInput("t", { n: 1 }),
+      createdAt: new Date(clockMs).toISOString(),
+    });
+    clockMs += 1000;
+    const b = pending({
+      inputHash: hashApprovalInput("t", { n: 2 }),
+      createdAt: new Date(clockMs).toISOString(),
+    });
     await store.persist(a);
     await store.persist(b);
-    await store.resolve(a.id, "grant", "max"); // appends a superseding line for a
+    clockMs += 1000;
+    await store.resolve(a.id, "grant", "max"); // appends a decided line for a
+    const before = readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf8");
     const live = await store.list();
-    expect(live.length).toBe(2);
-    // After compaction the file has exactly one line per surviving id.
-    const lines = readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf8")
-      .trim()
-      .split("\n")
-      .filter((l) => l !== "");
-    expect(lines.length).toBe(2);
+    // Newest-touched first: a's decision is newer than b's park.
+    expect(live.map((r) => r.id)).toEqual([a.id, b.id]);
+    // Three lines (two parks, one decision), untouched by the read.
+    expect(readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf8")).toBe(before);
+    expect(before.trim().split("\n")).toHaveLength(3);
   });
 
   test("rejects a malformed approval id on persist and resolve", async () => {
@@ -235,14 +245,15 @@ describe("evictExpiredApprovals", () => {
     expect((await evictExpiredApprovals({ rootDir: root, ttlDays: 1 })).evictedIds).toEqual([p.id]);
   });
 
-  test("list() and the standalone sweep agree — they share one implementation", async () => {
+  test("list() hides what the sweep drops, and leaves the dropping to it", async () => {
     const store = createPendingApprovalStore({ rootDir: root });
     const old = pending({ createdAt: new Date(Date.now() - 40 * DAY).toISOString() });
     await store.persist(old);
     await store.persist(pending({ toolName: "b", inputHash: hashApprovalInput("b", {}) }));
-    // list() compacts as well, so the sweep afterwards finds nothing to do.
     const listed = await store.list();
     expect(listed.map((a) => a.id)).not.toContain(old.id);
+    // list() wrote nothing, so the sweep still has the old record to drop.
+    expect((await evictExpiredApprovals({ rootDir: root })).evictedIds).toEqual([old.id]);
     expect((await evictExpiredApprovals({ rootDir: root })).evictedIds).toEqual([]);
   });
 });
@@ -281,7 +292,7 @@ describe("#383 — standing (always) grants", () => {
     expect(lastLine).not.toContain("always");
   });
 
-  test("an always grant survives list() compaction", async () => {
+  test("an always grant survives the sweep's compaction", async () => {
     const store = createPendingApprovalStore({ rootDir: root });
     const p = pending();
     await store.persist(p);
@@ -290,6 +301,10 @@ describe("#383 — standing (always) grants", () => {
     expect(listed).toHaveLength(1);
     expect(listed[0]?.always).toBe(true);
     // And re-reads from the compacted file, not just the in-memory fold.
+    await evictExpiredApprovals({ rootDir: root });
+    expect(
+      readFileSync(join(root, DEFAULT_APPROVALS_FILENAME), "utf8").trim().split("\n"),
+    ).toHaveLength(1);
     const again = await store.list();
     expect(again[0]?.always).toBe(true);
   });

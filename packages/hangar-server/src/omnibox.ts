@@ -467,8 +467,8 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
     });
   }
 
-  // Pending approval ids — folded, never listed through the store (its
-  // list() COMPACTS the ledger, and indexing is a read).
+  // Pending approval ids — read raw, never listed through the store
+  // (indexing is a read, and wants every id, not the live ones).
   const approvals = resolveInside(dir, [".crewhaus", "approvals.jsonl"]);
   if (approvals !== undefined && existsSync(approvals)) {
     const { objects } = readJsonlCapped(approvals, MAX_JSONL_LINES);

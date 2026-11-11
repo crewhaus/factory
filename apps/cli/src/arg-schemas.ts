@@ -1022,8 +1022,9 @@ export const REVIEW_SCHEMA: ParseArgsSchema = {
   ],
 };
 
-// Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`
-// over the session-store approvals store (`.crewhaus/sessions/approvals.jsonl`).
+// Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`,
+// and 0.9.0's `supersede|defer`, over the session-store approvals store
+// (`.crewhaus/sessions/approvals.jsonl`).
 export const APPROVALS_SCHEMA: ParseArgsSchema = {
   flags: [
     // Harness root that owns `.crewhaus/` (mirrors `security digest --dir`).
@@ -1037,6 +1038,10 @@ export const APPROVALS_SCHEMA: ParseArgsSchema = {
     // `alwaysAllow` rule for the tool into `.crewhaus/settings.json`, so
     // future calls (any input) run pre-approved on this harness.
     { name: "always", takesValue: false },
+    // supersede and defer — a code from the verb's closed list.
+    { name: "reason", takesValue: true },
+    // defer only — an ISO date and time with Z or an offset, later than now.
+    { name: "until", takesValue: true },
     { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],

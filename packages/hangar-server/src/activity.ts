@@ -221,7 +221,7 @@ export function harnessActivity(
     if (at !== undefined) push("deploy", at, "deployment record updated", null);
   }
 
-  // approvals — folded (never listed: list() compacts)
+  // approvals — folded the store's way, which writes nothing
   for (const approval of foldApprovals(dir).approvals) {
     const decidedAt =
       approval.decidedAt !== undefined ? Date.parse(approval.decidedAt) : Number.NaN;
