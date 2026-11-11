@@ -67,7 +67,13 @@ import { runPreflight } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
 import { credentialFileRoots, runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
-import { OPTIMIZER_REFUSED_LEAVES } from "../packages/spec-patch/src/index";
+import {
+  OPTIMIZER_REFUSED_LEAVES,
+  STRUCTURAL_SEGMENTS,
+  applySpecEdits,
+  validatePatch,
+} from "../packages/spec-patch/src/index";
+import { parseSpec } from "../packages/spec/src/index";
 import { emitManaged } from "../packages/target-managed/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
 import {
@@ -118,6 +124,16 @@ const SHIPPED_REFUSED_LEAVES = [
   "model_pool.learning.seed",
   "provability.level",
   "provability.on_fail",
+] as const;
+/** The segments the optimizer reached only by exact entry in 0.8.x: a later one is a default-on change. */
+const SHIPPED_STRUCTURAL_SEGMENTS = [
+  "model_pool",
+  "judge",
+  "sub_agents",
+  "temperature",
+  "model_tiers",
+  "model_fallbacks",
+  "circuit_breaker",
 ] as const;
 
 /**
@@ -1365,6 +1381,57 @@ describe("the release notes name every change a harness without provability: see
       "";
     expect(bullet).toContain("measured nothing");
     expect(bullet).toContain("every case errored");
+  });
+
+  test("the optimizer: a whole-block value is admitted leaf by leaf, and every later structural segment is named", () => {
+    const added = STRUCTURAL_SEGMENTS.filter(
+      (seg) => !(SHIPPED_STRUCTURAL_SEGMENTS as readonly string[]).includes(seg),
+    );
+    expect(added.length > 0).toBe(true);
+    // A two-step workflow; a whole-steps value that changes step 0's model is
+    // refused at both optimizer entry points, and the same value with the
+    // model kept and the prompt changed passes both (a control that fails
+    // means the probe reached nothing).
+    const yaml = [
+      "name: w",
+      "target: workflow",
+      "model: base-model",
+      "steps:",
+      "  - name: one",
+      "    instructions: Do one.",
+      "    model: m1",
+      "  - name: two",
+      "    instructions: Do two.",
+      "",
+    ].join("\n");
+    const spec = parseSpec(yaml);
+    const value = (model: string, instructions: string) => [
+      { name: "one", instructions, model },
+      { name: "two", instructions: "Do two." },
+    ];
+    const probe = (steps: unknown): string => {
+      const messages: string[] = [];
+      try {
+        validatePatch(spec, { target: "workflow", path: ["steps"], op: "replace", value: steps });
+      } catch (err) {
+        messages.push((err as Error).message);
+      }
+      try {
+        applySpecEdits(yaml, [{ path: ["steps"], value: steps }], { restrictToOptimizable: true });
+      } catch (err) {
+        messages.push((err as Error).message);
+      }
+      return messages.join("\n");
+    };
+    expect(probe(value("m1", "Do one, carefully."))).toBe("");
+    const refused = probe(value("m2", "Do one."));
+    expect(refused.split("\n").filter((m) => m.includes('"steps.0.model"'))).toHaveLength(2);
+    // Named in a later list, each segment in backticks.
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("`model_pool.candidates`"),
+      ) ?? "";
+    expect(added.filter((seg) => !bullet.includes(`\`${seg}\``))).toEqual([]);
   });
 });
 

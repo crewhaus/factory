@@ -32,16 +32,26 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { type Spec, parseSpec } from "@crewhaus/spec";
-import { isCollection, isSeq, parse, parseDocument } from "yaml";
+import { isCollection, isSeq, parse, parseDocument, stringify } from "yaml";
 import { z } from "zod";
 import { DELTA_090_KEYS } from "./owner-keys";
 import { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
+import { admitBlockPatch, changedLeaves, withPatchApplied } from "./whole-block";
 
 // Re-exported so downstream renderers (the CLI changelog, future reporters)
 // can apply the SAME redaction to strings the differ never sees (rationales,
 // free-form provenance) without duplicating the pattern table a third time.
 export { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
 export { DELTA_090_KEYS, type OwnerKey } from "./owner-keys";
+export {
+  type AdmitBlockPatchOptions,
+  type BlockLeafRefusal,
+  type ChangedLeaf,
+  admitBlockPatch,
+  changedLeaves,
+  leafReachable,
+  withPatchApplied,
+} from "./whole-block";
 
 export class SpecPatchError extends CrewhausError {
   override readonly name = "SpecPatchError";
@@ -256,6 +266,38 @@ export function validatePatch(spec: Spec, patch: SpecPatch): void {
       }`,
     );
   }
+  // #514 — a value at a block is admitted leaf by leaf: every leaf it adds,
+  // removes or changes must be one the optimizer could patch on its own.
+  const [before, after, written] = specsAround(spec, patch);
+  const blocked = admitBlockPatch(spec.target, before, after, [], { written });
+  if (blocked !== undefined) {
+    throw new SpecPatchError(
+      `patch at ${formatPath(patch.path)} would change "${blocked.leaf}", which the optimizer may not change: ${blocked.reason}. ${PERSON_CAN}`,
+    );
+  }
+}
+
+/** What a refusal of a whole-block value tells its reader. */
+const PERSON_CAN =
+  "A person can make this change with crewhaus propose or by editing crewhaus.yaml.";
+
+/**
+ * The spec before and after `patch`, both re-parsed so schema defaults apply
+ * on each side alike: a value copied from the spec TEXT (a pool candidate
+ * without its defaulted `tags: []`) then reads as unchanged. The third member
+ * is the patched data as written. When the patched data does not parse, the
+ * raw patched data is compared instead, which can only refuse more.
+ */
+function specsAround(
+  spec: Spec,
+  patch: Pick<SpecPatch, "path" | "op" | "value">,
+): [before: unknown, after: unknown, written: unknown] {
+  const raw = withPatchApplied(spec, patch.path, patch.op, patch.value);
+  try {
+    return [parseSpec(stringify(spec)), parseSpec(stringify(raw)), raw];
+  } catch {
+    return [spec, raw, raw];
+  }
 }
 
 /** A refused leaf a block-level patch would change: its dotted path in the spec, and why it is refused. */
@@ -293,10 +335,12 @@ export function refusedLeafChange(
     for (let covered = pattern.length - 1; covered >= 1; covered--) {
       const head = pattern.slice(0, covered);
       const endsWithHead =
-        segs.length >= covered && head.every((p, i) => segs[segs.length - covered + i] === p);
+        segs.length >= covered &&
+        head.every((p, i) => segmentMatches(p, segs[segs.length - covered + i] as string));
       if (!endsWithHead) continue;
       const rest = pattern.slice(covered);
-      if (leafOf(head, proposed, rest) !== leafOf(head, current, rest)) {
+      // Compared by value: a row may name a block (`model_pool.candidates`).
+      if (changedLeaves(leafOf(head, current, rest), leafOf(head, proposed, rest), []).length > 0) {
         return { key: [...segs, ...rest].join("."), reason: refusedLeafReason(pattern) };
       }
     }
@@ -393,10 +437,14 @@ export type ApplySpecEditsOptions = {
   /**
    * The optimizer surface: every edit path must be admitted by the spec
    * target's `OPTIMIZABLE_PATHS` whitelist through {@link isOptimizable} —
-   * exact match (wildcards = one segment each), the structural
-   * `model_pool` / `judge` / `sub_agents` / `temperature` rule, then prefix;
-   * the same rule as `validatePatch`. Author surfaces leave this off and may
-   * edit any field — the atomic `parseSpec` re-validation is their safety floor.
+   * exact match (wildcards = one segment each), the structural rule (a path
+   * through a {@link STRUCTURAL_SEGMENTS} member is admitted by exact match
+   * only), then prefix; the same rule as `validatePatch`. Then the leaf rule
+   * (#514): after the whole batch applies, every leaf it added, removed or
+   * changed must be reachable on its own ({@link admitBlockPatch}), so a
+   * whole-step value cannot change a step's `model` or `tools`. Author
+   * surfaces leave this off and may edit any field — the atomic `parseSpec`
+   * re-validation is their safety floor.
    */
   readonly restrictToOptimizable?: boolean;
 };
@@ -502,6 +550,33 @@ export function applySpecEdits(
     spec = parseSpec(newYaml);
   } catch (err) {
     throw new SpecPatchError(`edited YAML failed spec validation: ${(err as Error).message}`, err);
+  }
+  if (opts.restrictToOptimizable === true) {
+    // #514 — the whole batch, leaf by leaf, judged together. Both sides are
+    // parsed so schema defaults apply alike, whatever form an edit's value
+    // took (a value copied from a parsed spec carries defaults the text omits).
+    const written: unknown = doc.toJS();
+    let before: unknown;
+    let after: unknown = spec;
+    try {
+      before = parseSpec(yamlText);
+    } catch {
+      before = parseDocument(yamlText).toJS();
+      after = written;
+    }
+    const blocked = admitBlockPatch(spec.target, before, after, [], { written });
+    if (blocked !== undefined) {
+      const by = edits.findIndex(
+        (edit) =>
+          edit.path.length <= blocked.path.length &&
+          edit.path.every((seg, i) => String(seg) === blocked.path[i]),
+      );
+      const who =
+        by >= 0 ? `edit #${by} (${formatEditPath(edits[by]?.path ?? [])})` : "the edits together";
+      throw new SpecPatchError(
+        `${who} would change "${blocked.leaf}", which the optimizer may not change: ${blocked.reason}. ${PERSON_CAN}`,
+      );
+    }
   }
   return { yaml: newYaml, spec, applied };
 }
@@ -815,6 +890,10 @@ export const OPTIMIZABLE_PATHS: Readonly<
     // sweet spot between false-positive denials and false-negative exfil
     // bypasses.
     Object.freeze(["security", "justification"]),
+    // The judge selection stays tunable through its own path once a wholesale
+    // value is admitted leaf by leaf (#514): the judge's `model` is a
+    // person's choice, a structural segment no entry passes through.
+    Object.freeze(["security", "justification", "judge"]),
     // §47 blockchain subsystem (slice 0). Whole-block replacement so the
     // optimizer can tune `chains[*].finality.count`, `chains[*].rpcPolicy`,
     // `transaction_policy.maxValueWei`, and `transaction_policy.simulationRequired`
@@ -907,13 +986,14 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["memory", "refreshEvery"]),
   ]),
   workflow: Object.freeze([
-    // Whole-step replacement — a whole-step VALUE may carry item 9's (G37)
-    // per-step model routing (a pool-bearing step round-trips, see the G37
-    // tests) because the path `["steps"]` crosses no structural segment.
-    // The sub-path route is narrower: the structural rule stops prefix reach
-    // at `model_pool` / `judge` / `temperature` / `model_tiers` /
-    // `model_fallbacks` / `circuit_breaker`, so `steps[i].model_tiers.fast`
-    // is refused and only the exact dials below are admitted under a step.
+    // Whole-step replacement, admitted leaf by leaf (#514): a whole-step
+    // value may change only the leaves reachable on their own. Per-step
+    // routing (item 9, G37) is set by a person; its tunable dials have the
+    // exact entries below (`poolDials`). The structural rule stops prefix
+    // reach at `model_pool` / `judge` / `temperature` / `model_tiers` /
+    // `model_fallbacks` / `circuit_breaker` / `model` / `tools` /
+    // `tool_config` / `permissions` / `hitl`, so `steps[i].model_tiers.fast`
+    // is refused and only the exact dials below are admitted under them.
     Object.freeze(["steps"]),
     // 0.6.0 §10.3 — the structural rule closed prefix reach into a step's
     // `model_pool` / `judge` / `temperature`; these exact wildcard entries
@@ -1017,12 +1097,12 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["retrieve", "defaultK"]),
   ]),
   crew: Object.freeze([
-    // Whole-role replacement — a whole-role VALUE may carry item 9's (G37)
-    // per-role model routing (the role name is a dynamic map key; see the
-    // G37 tests). The sub-path route is narrower, as at the workflow entry:
-    // `roles.<r>.model_tiers` / `model_fallbacks` / `circuit_breaker` /
-    // `model_pool.*` are refused by the structural rule; only the exact
-    // dials below are admitted under a role.
+    // Whole-role replacement, admitted leaf by leaf as at the workflow entry
+    // (#514): per-role routing (item 9, G37) is set by a person, and its
+    // tunable dials have exact entries (`poolDials`). `roles.<r>.model_tiers`
+    // / `model_fallbacks` / `circuit_breaker` / `model_pool.*` / `model` /
+    // `tools` are refused by the structural rule; only the exact dials below
+    // are admitted under a role.
     Object.freeze(["roles"]),
     // 0.6.0 §10.3 — per-role dials (`*` = one role name); see the workflow entry.
     ...poolDials(ROLE),
@@ -1168,15 +1248,35 @@ export const OPTIMIZABLE_PATHS: Readonly<
  *     whole-block prefix route (`["nodes"]` → `nodes.a.circuit_breaker`)
  *     without removing anything the table promises.
  *
+ *   - `model`, `tools`, `tool_config`, `permissions`, `hitl` (#514) — the
+ *     settings a person grants a step, node or role: its model (the roster a
+ *     person chose), what it may call, the allow-lists and credential names
+ *     its tools read, what runs without asking, and its human approval gate.
+ *     No exact entry passes through any of them, so the rule closes the
+ *     prefix route (`steps.0.model`, `steps.0.tool_config.http.allowed_origins`,
+ *     `nodes.a.hitl.prompt`) and removes nothing the table promises.
+ *     `instructions`, `max_tokens`, `thinking.budget_tokens`, `name` and the
+ *     exact per-step dials stay admitted.
+ *
  * One rule, no negative-list semantics: the exact entries
- * `["agent","model_pool",{policy,routing,learning}]` keep working, and a
- * whole-block `["steps"]` replacement (whose PATH carries none of these
- * segments) is unchanged. The wildcard segment ({@link WILDCARD_SEGMENT}) and
- * the exact entries the §10.3 table promises (`poolDials`, `judgeGateDials`,
- * `MODEL_PROFILE_DIALS`) ride on top of this rule — it is what makes that
- * table true for the positional shapes. Note the reconciliation the exact
- * match performs: `["agent","temperature"]` IS listed, so the structural
- * `temperature` segment blocks only the prefix route, never the entry.
+ * `["agent","model_pool",{policy,routing,learning}]` keep working. A
+ * whole-block value (`["steps"]`, `["nodes","a"]`, `["roles"]`, or any other
+ * entry admitted wholesale) is admitted leaf by leaf: every leaf it adds,
+ * removes or changes must be reachable on its own, through an entry with no
+ * structural segment between that entry and the leaf ({@link admitBlockPatch},
+ * {@link leafReachable}). So a whole-step value may change a step's
+ * `instructions`, but not its `model`, `tools` or pool roster. The wildcard
+ * segment ({@link WILDCARD_SEGMENT}) and the exact entries the §10.3 table
+ * promises (`poolDials`, `judgeGateDials`, `MODEL_PROFILE_DIALS`) ride on top
+ * of this rule — it is what makes that table true for the positional shapes.
+ * Note the reconciliation the exact match performs: `["agent","temperature"]`
+ * IS listed, so the structural `temperature` segment blocks only the prefix
+ * route, never the entry.
+ *
+ * Known and accepted, in the deny direction: the test is by segment name
+ * anywhere in the path, so a graph node or crew role literally named `model`,
+ * `tools`, `tool_config`, `permissions` or `hitl` loses prefix reach under it,
+ * as one named `judge` or `temperature` already does.
  */
 export const STRUCTURAL_SEGMENTS: ReadonlyArray<string> = Object.freeze([
   "model_pool",
@@ -1186,7 +1286,25 @@ export const STRUCTURAL_SEGMENTS: ReadonlyArray<string> = Object.freeze([
   "model_tiers",
   "model_fallbacks",
   "circuit_breaker",
+  "model",
+  "tools",
+  "tool_config",
+  "permissions",
+  "hitl",
 ]);
+
+/**
+ * Why a leaf under each structural segment added for #514 is refused, in the
+ * words a refusal shows. The older segments answer with their
+ * {@link HUMAN_OWNED_PATHS} row.
+ */
+export const STRUCTURAL_REASONS: Readonly<Record<string, string>> = Object.freeze({
+  model: "the model is part of the roster a person chose",
+  tools: "a tools list is a grant of what a step, node or role may call",
+  tool_config: "tool_config holds the allow-lists and credential names the tools read",
+  permissions: "permissions decide what runs without asking",
+  hitl: "a hitl block is a human approval gate",
+});
 
 /**
  * 0.6.0 §10.3 — the EXCLUDED half of the verdict table, stated in code rather
@@ -1572,10 +1690,16 @@ export function wildcardPlacementIssues(
           `${label} terminates in the human-owned key "${last}" under a wildcard — the §10.3 table excludes it`,
         );
       }
-      // `temperature` is the one structural segment that is a scalar LEAF (it
-      // is structural to block the prefix route, not because it is a block),
-      // so a wildcard entry may terminate in it; the block segments may not.
-      if (STRUCTURAL_SEGMENTS.includes(last) && last !== "temperature") {
+      // `temperature` and `model` are the structural segments that are scalar
+      // LEAVES (structural to block the prefix route, not because they are
+      // blocks). A wildcard entry may terminate in `temperature`; `model`, like
+      // `tools`, `tool_config` and `permissions`, is a forbidden leaf above and
+      // is reported once, there. The block segments may not end an entry.
+      if (
+        STRUCTURAL_SEGMENTS.includes(last) &&
+        last !== "temperature" &&
+        !WILDCARD_FORBIDDEN_LEAVES.includes(last)
+      ) {
         issues.push(
           `${label} terminates in the structural block "${last}" under a wildcard — a structural block is never whitelisted wholesale`,
         );
@@ -1645,6 +1769,14 @@ export function wildcardPlacementIssues(
  * `transaction_policy` is whitelisted WHOLESALE so the optimizer can tune the
  * value ceiling and simulation against an eval, and an eval cannot see a human
  * approval go away. A block patch that carries the spec's value passes.
+ *
+ * `model_pool.candidates` is the roster a person declared (#514): learning
+ * picks within it and never changes it, so no whole step, node or role value
+ * may change it either. A value that carries the roster as the spec has it
+ * passes.
+ *
+ * A row matches with wildcards (`"*"` = any one segment) through
+ * {@link refusedLeafIn}.
  */
 export const OPTIMIZER_REFUSED_LEAVES: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
   Object.freeze(["model_pool", "learning", "seed"]),
@@ -1652,6 +1784,7 @@ export const OPTIMIZER_REFUSED_LEAVES: ReadonlyArray<ReadonlyArray<string>> = Ob
   Object.freeze(["provability", "on_fail"]),
   ...DELTA_090_KEYS.filter((key) => key.refused && key.root !== true).map((key) => key.pattern),
   Object.freeze(["transaction_policy", "defaultWriteApproval"]),
+  Object.freeze(["model_pool", "candidates"]),
 ]);
 
 /**
@@ -1681,26 +1814,41 @@ const REFUSED_LEAF_REASONS: Readonly<Record<string, string>> = Object.freeze({
   ),
   "transaction_policy.defaultWriteApproval":
     "who approves a write is human-owned, because an eval cannot see a human approval go away",
+  "model_pool.candidates":
+    "the candidate roster is the set a person declared; learning picks within it, never changes it",
 });
 
-function refusedLeafReason(pattern: ReadonlyArray<string>): string {
+/** Why a refused row is refused, in the words a refusal shows. */
+export function refusedLeafReason(pattern: ReadonlyArray<string>): string {
   return (
     REFUSED_LEAF_REASONS[pattern.join(".")] ?? `${pattern.join(".")} is refused for every target`
   );
 }
 
+/** The refused rows {@link refusedLeafIn} matches against. */
+export type RefusedLeafRows = {
+  /** Matched as a contiguous run anywhere in the path. */
+  readonly leaves: ReadonlyArray<ReadonlyArray<string>>;
+  /** Matched from the document root only. */
+  readonly roots: ReadonlyArray<ReadonlyArray<string>>;
+};
+
 /**
  * The {@link OPTIMIZER_REFUSED_LEAVES} row `path` contains as a contiguous run,
- * or the {@link OPTIMIZER_REFUSED_ROOTS} row `path` starts with, if any.
+ * or the {@link OPTIMIZER_REFUSED_ROOTS} row `path` starts with, if any. A row
+ * segment `"*"` matches any one path segment, never zero. `rows` defaults to
+ * the two shipped tables (a test passes its own).
  */
-function refusedLeafIn(
+export function refusedLeafIn(
   path: ReadonlyArray<SpecEditPathSegment>,
+  rows: RefusedLeafRows = { leaves: OPTIMIZER_REFUSED_LEAVES, roots: OPTIMIZER_REFUSED_ROOTS },
 ): ReadonlyArray<string> | undefined {
-  const segs = path.map((s) => String(s));
+  const runAt = (pattern: ReadonlyArray<string>, start: number): boolean =>
+    start + pattern.length <= path.length &&
+    pattern.every((p, j) => segmentMatches(p, path[start + j] as SpecEditPathSegment));
   return (
-    OPTIMIZER_REFUSED_LEAVES.find((pattern) =>
-      segs.some((_s, i) => pattern.every((p, j) => segs[i + j] === p)),
-    ) ?? OPTIMIZER_REFUSED_ROOTS.find((pattern) => pattern.every((p, j) => segs[j] === p))
+    rows.leaves.find((pattern) => path.some((_s, i) => runAt(pattern, i))) ??
+    rows.roots.find((pattern) => runAt(pattern, 0))
   );
 }
 

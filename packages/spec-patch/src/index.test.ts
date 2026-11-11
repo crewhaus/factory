@@ -711,6 +711,8 @@ agent:
       ["provability", "on_fail"],
       // Who approves an on-chain write.
       ["transaction_policy", "defaultWriteApproval"],
+      // The candidate roster a person declared (#514).
+      ["model_pool", "candidates"],
     ]);
   });
 
@@ -772,7 +774,8 @@ agent:
         validatePatch(spec, { target: "cli", path, op: "replace", value: "x" }),
       ).not.toThrow(/not listed/);
     }
-    // The candidate ROSTER stays human-owned — like ["agent","model"] itself.
+    // The candidate ROSTER stays human-owned — like ["agent","model"] itself,
+    // and refused outright (#514): no entry could admit it.
     expect(() =>
       validatePatch(spec, {
         target: "cli",
@@ -780,7 +783,7 @@ agent:
         op: "replace",
         value: [],
       }),
-    ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+    ).toThrow(/an OPTIMIZER_REFUSED_LEAVES row — no OPTIMIZABLE_PATHS entry can admit it/);
     expect(() =>
       validatePatch(spec, {
         target: "cli",
