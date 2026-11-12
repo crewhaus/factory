@@ -697,6 +697,21 @@ describe("0.7.1 — a headless approval covers the place it was asked for", () =
   const parkedId = (err: RunFailedLike) =>
     /parked as approval (appr_[0-9a-f]{16})/.exec(err?.report?.detail ?? "")?.[1];
 
+  /**
+   * Leave one record on disk the way an older writer would have. The store
+   * keeps a decided record's first decided line, so an edit is a rewrite of
+   * that record's lines, not one more line appended.
+   */
+  function rewriteOnDisk(record: PendingApproval): void {
+    const file = join(root, "approvals", "approvals.jsonl");
+    const kept = readFileSync(file, "utf8")
+      .split("\n")
+      .filter(
+        (line) => line.trim() !== "" && (JSON.parse(line) as { id?: unknown }).id !== record.id,
+      );
+    writeFileSync(file, `${[...kept, JSON.stringify(record)].join("\n")}\n`);
+  }
+
   async function parkAndGrant(input: unknown = call): Promise<string> {
     const park = await turn(input);
     const id = parkedId(park);
@@ -828,7 +843,7 @@ describe("0.7.1 — a headless approval covers the place it was asked for", () =
       const record = (await store.list()).find((a) => a.id === id);
       if (record === undefined) throw new Error("no record");
       const { places: _dropped, ...legacy } = record;
-      await store.persist(legacy);
+      rewriteOnDisk(legacy);
       expect((await store.list()).find((a) => a.id === id)?.places).toBeUndefined();
       return id;
     }
@@ -856,7 +871,7 @@ describe("0.7.1 — a headless approval covers the place it was asked for", () =
   test("a record whose places are not the shape written covers nothing", async () => {
     const id = await parkAndGrant();
     const record = (await store.list()).find((a) => a.id === id);
-    await store.persist({ ...record, places: "public/x.md" } as unknown as PendingApproval);
+    rewriteOnDisk({ ...record, places: "public/x.md" } as unknown as PendingApproval);
     const again = await turn(call);
     expect(landed).toEqual([]);
     expect(again?.report?.class).toBe("approval_pending");

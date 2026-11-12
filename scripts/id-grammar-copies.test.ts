@@ -44,7 +44,6 @@ const KNOWN_COPIES: Readonly<Record<string, number>> = {
   "packages/target-browser-driver/src/index.ts": 1,
   "packages/target-channel-bot/src/index.ts": 1,
   "packages/target-managed/src/index.ts": 2,
-  "packages/tool-approvals/src/lib/approvals.ts": 1,
   "packages/tool-plan/src/index.ts": 1,
   "packages/tool-proof/src/lib/context.ts": 1,
   "packages/tool-proof/src/lib/evidence.ts": 1,

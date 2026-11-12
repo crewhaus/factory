@@ -121,6 +121,19 @@ describe("ApprovalStatus", () => {
     expect(unknown.find((u) => u.field === "total")?.reason).toContain("UNKNOWN");
   });
 
+  test("a ledger an 0.8.x writer flipped reports the first decision, as every reader does", async () => {
+    const id = approvalId(1);
+    writeApprovals(tmp, [
+      approval({ id }),
+      approval({ id, decision: "grant", decidedBy: "max", decidedAt: "2026-09-18T10:01:00Z" }),
+      approval({ id, decision: "deny", decidedBy: "eve", decidedAt: "2026-09-18T10:02:00Z" }),
+    ]);
+    const out = await callJson(approvalStatus, {});
+    expect(out["counts"]).toMatchObject({ granted: 1, denied: 0, pending: 0 });
+    const rows = out["approvals"] as Array<{ status: string; decidedBy: string }>;
+    expect(rows.map((r) => [r.status, r.decidedBy])).toEqual([["granted", "max"]]);
+  });
+
   test("filters run BEFORE the limit — the trap that returns zero rows when matches exist", async () => {
     // Two Bash parks, then five newer Read parks. A limit pushed into the read
     // would take the five Reads and then filter them all away.

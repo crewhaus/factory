@@ -44,6 +44,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -53,8 +54,10 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
+import { DECISION_LOG_KEYS } from "../packages/control-contract/src/index";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
+import { countPendingApprovals } from "../packages/gateway-protocol/src/control";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import type { IrManagedV0 } from "../packages/ir/src/index";
 import {
@@ -66,10 +69,17 @@ import {
 import { runPreflight } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
 import { credentialFileRoots, runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
+import {
+  allowSingleOwner,
+  createPendingApprovalStore,
+  foldReadOnly,
+  generateApprovalId,
+} from "../packages/session-store/src/index";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
 import { OPTIMIZER_REFUSED_LEAVES } from "../packages/spec-patch/src/index";
 import { emitManaged } from "../packages/target-managed/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
+import { foldApprovals as toolFoldApprovals } from "../packages/tool-approvals/src/lib/approvals";
 import {
   SHAPE_TOOL_PROFILES,
   type ToolShape,
@@ -1667,5 +1677,93 @@ describe("the release notes name run input screened where it enters", () => {
     };
     expect(probe.control).toBe(true);
     if (probe.changed) expect(runInput).toContain("`tool`");
+  });
+});
+
+/**
+ * Approval decisions: the first one wins on every surface, it is recorded once
+ * in a content-free log, and a read never rewrites the approvals file. Each probe
+ * drives the store on a temp session root: a second decision that is no longer
+ * refused, a log line with a key outside the closed set, a read that rewrites the
+ * file, or two readers that fold a flipped file differently fails here, and the
+ * list must name each change.
+ */
+describe("approval decisions", () => {
+  const park = () => ({
+    id: generateApprovalId(),
+    toolName: "Bash",
+    inputHash: "a".repeat(64),
+    input: { command: "ls" },
+    runId: "run_00000001",
+    sessionId: "sess_00000000000000aa",
+    surface: "daemon",
+    createdAt: new Date().toISOString(),
+  });
+  const sessionRoot = (): string => mkdtempSync(join(tmpdir(), "crewhaus-default-on-approvals-"));
+
+  test("the first decision wins, and the list says how to change one", async () => {
+    const root = sessionRoot();
+    try {
+      const store = createPendingApprovalStore({ rootDir: root });
+      const p = park();
+      await store.persist(p);
+      const allow = { authorize: allowSingleOwner };
+      expect((await store.decide(p.id, { choice: "deny", actor: {} }, allow)).outcome).toBe(
+        "decided",
+      );
+      const second = await store.decide(p.id, { choice: "grant", actor: {} }, allow);
+      expect(second.outcome).toBe("already-decided");
+      expect(await store.resolve(p.id, "grant", "someone")).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("`crewhaus approvals supersede`"),
+      ) ?? "";
+    expect(bullet).toContain("first decision");
+  });
+
+  test("decisions are logged without content, and reads never rewrite the approvals file", async () => {
+    const root = sessionRoot();
+    try {
+      const store = createPendingApprovalStore({ rootDir: root });
+      const p = park();
+      await store.persist(p);
+      await store.decide(p.id, { choice: "grant", actor: {} }, { authorize: allowSingleOwner });
+      // (a) every log line's keys are the closed set.
+      const logDir = join(root, "approvals.d", "decisions");
+      const lines = readdirSync(logDir)
+        .flatMap((name) => readFileSync(join(logDir, name), "utf8").split("\n"))
+        .filter((line) => line.trim() !== "")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines.map((l) => l["event"])).toEqual(["park", "decide"]);
+      const allowed: readonly string[] = DECISION_LOG_KEYS;
+      expect(lines.flatMap((l) => Object.keys(l)).filter((k) => !allowed.includes(k))).toEqual([]);
+      // (b) the readers leave the file as it was.
+      const file = join(root, "approvals.jsonl");
+      const before = readFileSync(file);
+      await store.list();
+      foldReadOnly(root);
+      countPendingApprovals(file);
+      expect(readFileSync(file).equals(before)).toBe(true);
+      // (c) a planted 0.8.x flip: every reader keeps the first decision.
+      const flipped = park();
+      const grant = { ...flipped, decision: "grant", decidedAt: flipped.createdAt };
+      writeFileSync(
+        file,
+        `${[flipped, grant, flipped].map((l) => JSON.stringify(l)).join("\n")}\n`,
+      );
+      expect(foldReadOnly(root).records.map((r) => r.decision)).toEqual(["grant"]);
+      expect(countPendingApprovals(file)).toBe(0);
+      expect(toolFoldApprovals(file).records.map((r) => r.decision)).toEqual(["grant"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    // (d) the list names the directory.
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes("`approvals.d/`")) ?? "";
+    expect(bullet).toContain("reads never rewrite");
+    expect(bullet).toContain("decision log");
   });
 });

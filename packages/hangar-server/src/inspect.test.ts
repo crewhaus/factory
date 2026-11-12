@@ -19,6 +19,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createPendingApprovalStore } from "@crewhaus/session-store";
 import { makeFixtureHarness } from "./fixture";
 import { exclusionFor, maskRawText, settingsDiff, validateSettings } from "./inspect";
 import { type TestServer, bootTestServer } from "./testkit";
@@ -110,6 +111,14 @@ describe("inspect — pure helpers", () => {
     // is recoverable, under-refusing it is not.
     expect(exclusionFor(["dist", "secrets", "x"])).not.toBeNull();
     expect(exclusionFor([".crewhaus", "skills", "faq"])).toBeNull();
+    // The decision log's key, wherever the session root sits; the log and the
+    // claims beside it hold no secret and stay browsable.
+    const key = [".crewhaus", "sessions", "approvals.d", "keys", "digest.key"];
+    expect(exclusionFor(key)?.path).toBe(".crewhaus/sessions/approvals.d/keys/");
+    expect(exclusionFor([".crewhaus", "sessions", "approvals.d", "keys"])).not.toBeNull();
+    expect(exclusionFor(["state", "approvals.d", "keys", "digest.key"])).not.toBeNull();
+    expect(exclusionFor([".crewhaus", "sessions", "approvals.d", "decisions"])).toBeNull();
+    expect(exclusionFor([".crewhaus", "sessions", "keys"])).toBeNull();
   });
 
   test("the exclusions are CASE-FOLDED — the default filesystem here is not case-sensitive", () => {
@@ -129,6 +138,7 @@ describe("inspect — pure helpers", () => {
       [".crewhaus", "SECRETS", "vault.json"],
       [".ENV"],
       [".Env.Local"],
+      [".crewhaus", "sessions", "Approvals.D", "KEYS", "digest.key"],
     ]) {
       expect(`${segments.join("/")}:${exclusionFor(segments) === null}`).toBe(
         `${segments.join("/")}:false`,
@@ -216,10 +226,11 @@ describe("inspect — the store index", () => {
 
       // The exclusions are DATA, so the console can say why they are absent.
       const excluded = body["excluded"] as Array<Record<string, unknown>>;
-      expect(excluded).toHaveLength(5);
+      expect(excluded).toHaveLength(6);
       expect(excluded.map((e) => e["path"])).toContain(".crewhaus/secrets/");
       expect(excluded.map((e) => e["path"])).toContain(".crewhaus/run/logs/");
       expect(excluded.map((e) => e["path"])).toContain(".crewhaus/run/gateway-jwt-secret");
+      expect(excluded.map((e) => e["path"])).toContain(".crewhaus/sessions/approvals.d/keys/");
 
       // …and the "we have no rich view for this yet" list names the rest of
       // the tree without pretending it is empty.
@@ -590,6 +601,40 @@ describe("inspect — the generic raw browser", () => {
       expect(listing.body["excludedHere"]).toEqual(
         expect.arrayContaining(["gateway-jwt-secret", "logs"]),
       );
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("the key beside the decision log is never served, in any case", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const store = createPendingApprovalStore({ rootDir: join(dir, ".crewhaus", "sessions") });
+      await store.persist({
+        id: "appr_00000000000000d1",
+        toolName: "Read",
+        inputHash: "h",
+        runId: "run_00000000000000d0",
+        sessionId: "sess_00000000000000aa",
+        surface: "daemon",
+        createdAt: new Date(NOW).toISOString(),
+      });
+      const keyFile = join(dir, ".crewhaus", "sessions", "approvals.d", "keys", "digest.key");
+      const value = readFileSync(keyFile, "utf8").trim();
+      expect(value).toMatch(/^[0-9a-f]{64}$/);
+      const id = await register(t, dir);
+      for (const path of [
+        ".crewhaus/sessions/approvals.d/keys/digest.key",
+        ".crewhaus/sessions/approvals.d/keys",
+        ".crewhaus/Sessions/APPROVALS.D/Keys/digest.key",
+      ]) {
+        const { status, body } = await t.api(
+          `/api/h/${id}/inspect/raw?path=${encodeURIComponent(path)}`,
+        );
+        expect(`${path}:${status}`).toBe(`${path}:403`);
+        expect(JSON.stringify(body)).not.toContain(value);
+      }
     } finally {
       await t.stop();
     }

@@ -29,8 +29,8 @@
  *   - READS NEVER MUTATE: session browsing is raw dir scans + tolerant
  *     JSONL parsing (never `SessionStore.list()`, whose TTL eviction
  *     deletes transcripts); memory views are fold-only. The approvals inbox
- *     folds `approvals.jsonl` for the same reason — `PendingApprovalStore
- *     .list()` COMPACTS, and a polled inbox must not rewrite a ledger.
+ *     folds `approvals.jsonl` with the store's own fold, which writes
+ *     nothing: a polled inbox must not rewrite a ledger.
  *   - CREDENTIALS NEVER RENDER: env routes return KEY presence booleans;
  *     spec/transcript routes pass the spec-patch maskers; captured daemon
  *     output is served only through the supervisor's scrubbed paths, never
@@ -88,6 +88,7 @@ import {
   approvalsInbox,
   isApprovalId,
   pendingApprovalCount,
+  refusedDecisionMessage,
   resolveApproval,
 } from "./approvals";
 import { type TokenSetup, createBootTickets, ensureToken, isAuthorized } from "./auth";
@@ -1426,6 +1427,11 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         });
         if (result.outcome === "not-found") throw new HttpError(404, "no such approval");
         if (result.outcome === "unreachable") throw new HttpError(409, result.reason);
+        if (result.outcome === "forbidden") throw new HttpError(403, result.reason);
+        if (result.outcome !== "resolved") {
+          // The first decision stands: say what state it left, never who made it.
+          throw new HttpError(409, refusedDecisionMessage(result.outcome, result.approval));
+        }
         return jsonMasked({ ok: true, approval: result.approval });
       }
 

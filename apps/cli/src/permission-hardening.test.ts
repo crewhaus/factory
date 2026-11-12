@@ -36,7 +36,11 @@ import {
 } from "@crewhaus/permission-engine";
 import { createRunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
-import { createPendingApprovalStore, hashApprovalInput } from "@crewhaus/session-store";
+import {
+  allowSingleOwner,
+  createPendingApprovalStore,
+  hashApprovalInput,
+} from "@crewhaus/session-store";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -1215,7 +1219,8 @@ describe("critic9 — a harness's own records a tool opens inside its directory"
     // the rules' to guard, where the run's own is the runtime-state floor's.
     mkdirSync(join(ws, "managed"));
     const input = { path: `${MARK}.md` };
-    await createPendingApprovalStore({ rootDir: sessions }).persist({
+    const approvals = createPendingApprovalStore({ rootDir: sessions });
+    await approvals.persist({
       id: "appr_0123456789abcdef",
       toolName: "Read",
       inputHash: hashApprovalInput("Read", input),
@@ -1225,6 +1230,12 @@ describe("critic9 — a harness's own records a tool opens inside its directory"
       surface: "single-turn",
       createdAt: new Date().toISOString(),
     });
+    // A decision claim beside the ledger, which the readers open too.
+    await approvals.decide(
+      "appr_0123456789abcdef",
+      { choice: "grant", actor: {} },
+      { authorize: allowSingleOwner },
+    );
   });
   const leaked = () => (lastResult ?? "").includes(MARK);
 
@@ -1236,8 +1247,22 @@ describe("critic9 — a harness's own records a tool opens inside its directory"
         {},
         [".crewhaus/sessions/sess_private.jsonl", ".crewhaus/settings.json"],
       ],
-      ["ApprovalStatus", {}, [".crewhaus/sessions/approvals.jsonl"]],
-      ["ApprovalsInbox", { harnesses: ["."] }, [".crewhaus/sessions/approvals.jsonl"]],
+      [
+        "ApprovalStatus",
+        {},
+        [
+          ".crewhaus/sessions/approvals.jsonl",
+          ".crewhaus/sessions/approvals.d/claims/decision/appr_0123456789abcdef.json",
+        ],
+      ],
+      [
+        "ApprovalsInbox",
+        { harnesses: ["."] },
+        [
+          ".crewhaus/sessions/approvals.jsonl",
+          ".crewhaus/sessions/approvals.d/claims/decision/appr_0123456789abcdef.json",
+        ],
+      ],
       ["EvalHistory", {}, [".crewhaus/evals/index.jsonl", ".crewhaus/evals/baselines.json"]],
       [
         "WatchmeReport",

@@ -419,8 +419,11 @@ describe("an optional operative field says what leaving it out means (C004)", ()
  * rule was denied.
  */
 const OPENS_ITS_RECORDS: Readonly<Record<string, ReadonlyArray<string>>> = {
-  "ApprovalsInbox.harnesses": [".crewhaus/sessions/approvals.jsonl"],
-  "ApprovalStatus.dir": [".crewhaus/sessions/approvals.jsonl"],
+  "ApprovalsInbox.harnesses": [
+    ".crewhaus/sessions/approvals.jsonl",
+    ".crewhaus/sessions/approvals.d/**",
+  ],
+  "ApprovalStatus.dir": [".crewhaus/sessions/approvals.jsonl", ".crewhaus/sessions/approvals.d/**"],
   "EvalHistory.evalsDir": ["index.jsonl", "baselines.json"],
   "HooksManage.dir": [".crewhaus/settings.json"],
   "PermissionsSuggest.dir": [".crewhaus/sessions/**", ".crewhaus/settings.json"],
