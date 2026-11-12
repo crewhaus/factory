@@ -2,24 +2,21 @@
  * The fleet approvals inbox — every harness's parked tool-approval requests
  * in one list, and the two writes that settle them.
  *
- * READS FOLD, THEY NEVER LIST. `PendingApprovalStore.list()` COMPACTS the
- * backing file as a side-effect (it drops expired and superseded lines),
- * exactly like `SessionStore.list()`'s TTL eviction. An inbox is polled;
- * polling must never rewrite an operator's approvals ledger. So reads fold
- * the JSONL directly — last-wins by `id`, the upsert rule `persist`
- * documents — through control-records' tail reader, under the same caps as
- * every other view in this package but from the file's NEWEST end, so a large
- * file shows its latest asks, and an ask decided near the end of the file
- * never reads as pending. A final line with no newline is a write still
- * landing: it waits for the next read.
+ * READS FOLD, THEY NEVER LIST. An inbox is polled; polling must never
+ * rewrite an operator's approvals ledger. So reads take the JSONL through
+ * control-records' tail reader, under the same caps as every other view in
+ * this package but from the file's NEWEST end, so a large file shows its
+ * latest asks, and fold it the store's way (`foldWithClaims`): the first
+ * decision on a request wins, and the decision claims beside the file outrank
+ * it, so a line that disagrees with a claim never folds. A final line with no
+ * newline is a write still landing: it waits for the next read.
  *
- * WRITES GO THROUGH THE SANCTIONED STORE. Grant and deny call
- * `createPendingApprovalStore(...).resolve(id, decision, by)`, which appends
- * an updated record. Hand-editing the file would work today and diverge the
- * moment the record shape moves; more importantly, the CLI
+ * WRITES GO THROUGH THE SANCTIONED STORE. Grant and deny call the store's
+ * `decide`, which takes the session root's lock and publishes an exclusive
+ * decision claim: the first decision on a request wins, from Home, the CLI or
+ * a channel, and a later one is answered with the winner. The CLI
  * (`crewhaus approvals`) and the runtime's re-resolve path read through the
- * store, and a manager that wrote a shape they do not recognize would park
- * the run forever.
+ * same store, so a manager can never write a shape they do not recognize.
  *
  * THE FILE LIVES WHERE THE SESSIONS DO. `approvals.jsonl` sits beside the
  * session files, so a harness that relocated its session root with
@@ -34,6 +31,8 @@ import {
   type ApprovalDecision,
   type PendingApproval,
   createPendingApprovalStore,
+  foldWithClaims,
+  ownerAuthorizer,
 } from "@crewhaus/session-store";
 import { MAX_JSONL_BYTES, MAX_JSONL_LINES } from "./constants";
 import { maskDeep } from "./mask";
@@ -60,7 +59,7 @@ export type ApprovalRow = {
   readonly inputHash: string;
   readonly surface: string;
   readonly createdAt: string;
-  readonly status: "pending" | "granted" | "granted-always" | "denied" | "consumed";
+  readonly status: "pending" | "granted" | "granted-always" | "denied" | "consumed" | "superseded";
   readonly decidedBy: string | null;
   readonly decidedAt: string | null;
   /** #383 — the grant was recorded as a standing allow (an `alwaysAllow`
@@ -84,21 +83,10 @@ export type ApprovalsView = {
   readonly truncatedHarnesses: readonly string[];
 };
 
-function isApprovalShape(value: unknown): value is PendingApproval {
-  if (typeof value !== "object" || value === null) return false;
-  const v = value as Record<string, unknown>;
-  return (
-    typeof v["id"] === "string" &&
-    typeof v["toolName"] === "string" &&
-    typeof v["inputHash"] === "string" &&
-    typeof v["runId"] === "string" &&
-    typeof v["sessionId"] === "string" &&
-    typeof v["surface"] === "string" &&
-    typeof v["createdAt"] === "string"
-  );
-}
-
 function statusOf(a: PendingApproval): ApprovalRow["status"] {
+  // A replaced request is settled whatever it said before; first, as
+  // `effectiveDecisionState` puts it.
+  if (a.supersededBy !== undefined) return "superseded";
   // #383 — a standing allow is the terminal state whether or not the parked
   // call was since consumed (mirrors the CLI's approvalStatus).
   if (a.decision === "grant" && a.always === true) return "granted-always";
@@ -108,24 +96,24 @@ function statusOf(a: PendingApproval): ApprovalRow["status"] {
   return "pending";
 }
 
-/** Fold one harness's approvals log. Never compacts, never evicts. The log is
- *  contained at its RESOLVED session root, which may itself be a link, as the
- *  sessions browser's is; a log that is a link out of that root lists nothing. */
+/** Fold one harness's approvals log the store's way: first decision wins, and
+ *  the decision claims beside it outrank it. Never compacts, never evicts,
+ *  never repairs. The log is contained at its RESOLVED session root, which may
+ *  itself be a link, as the sessions browser's is; a log that is a link out of
+ *  that root lists nothing. */
 export function foldApprovals(harnessDir: string): {
   readonly approvals: readonly PendingApproval[];
   readonly truncated: boolean;
 } {
-  const read = readTail(resolveSessionRoot(harnessDir).root, APPROVALS_FILENAME, {
+  const { root } = resolveSessionRoot(harnessDir);
+  const read = readTail(root, APPROVALS_FILENAME, {
     maxLines: MAX_JSONL_LINES,
     maxBytes: MAX_JSONL_BYTES,
     followLeafSymlink: true,
   });
   if (read.state !== "read") return { approvals: [], truncated: false };
-  const byId = new Map<string, PendingApproval>();
-  for (const obj of read.records) {
-    if (isApprovalShape(obj)) byId.set(obj.id, obj);
-  }
-  return { approvals: [...byId.values()], truncated: read.truncated };
+  const approvals = foldWithClaims(root, read.records).records;
+  return { approvals, truncated: read.truncated };
 }
 
 export type ApprovalHarness = {
@@ -180,11 +168,20 @@ export function approvalsInbox(
 export type ResolveApprovalResult =
   | { readonly outcome: "resolved"; readonly approval: PendingApproval }
   | { readonly outcome: "not-found" }
-  | { readonly outcome: "unreachable"; readonly reason: string };
+  | { readonly outcome: "unreachable"; readonly reason: string }
+  /** Another decision came first; `approval` is the record as it left it. */
+  | { readonly outcome: "already-decided"; readonly approval: PendingApproval }
+  /** The request is spent or replaced, so there is nothing left to decide. */
+  | { readonly outcome: "stale"; readonly approval: PendingApproval }
+  | { readonly outcome: "expired"; readonly approval: PendingApproval }
+  | { readonly outcome: "forbidden"; readonly reason: string };
 
 /**
- * Record a decision THROUGH the sanctioned store, so the CLI verbs and the
- * runtime's re-resolve path see exactly the record they expect.
+ * Record a decision THROUGH the sanctioned store's `decide`, so the CLI verbs
+ * and the runtime's re-resolve path see exactly the record they expect, and
+ * the first decision wins: a request already decided from any surface answers
+ * `already-decided`. The decision is recorded as coming through Home, and the
+ * harness's approver projection says who it is recorded as (`ownerAuthorizer`).
  *
  * `ttlDays` is passed as `Number.MAX_SAFE_INTEGER` deliberately: `resolve`
  * folds the file to find the record, and a manager settling an approval that
@@ -209,9 +206,46 @@ export async function resolveApproval(args: {
     ttlDays: Number.MAX_SAFE_INTEGER,
     ...(args.now !== undefined ? { now: args.now } : {}),
   });
-  const updated = await store.resolve(args.approvalId, args.decision, args.by);
-  if (updated === null) return { outcome: "not-found" };
-  return { outcome: "resolved", approval: updated };
+  const answer = await store.decide(
+    args.approvalId,
+    { choice: args.decision, actor: { display: args.by }, via: "home" },
+    { authorize: ownerAuthorizer(args.harnessDir) },
+  );
+  switch (answer.outcome) {
+    case "decided":
+      return answer.record === null
+        ? { outcome: "not-found" }
+        : { outcome: "resolved", approval: answer.record };
+    case "not-found":
+      return { outcome: "not-found" };
+    case "forbidden":
+      return {
+        outcome: "forbidden",
+        reason: answer.reason ?? "not allowed to decide this request",
+      };
+    case "already-decided":
+    case "stale":
+    case "expired":
+      return answer.record === null
+        ? { outcome: "not-found" }
+        : { outcome: answer.outcome, approval: answer.winner ?? answer.record };
+  }
+}
+
+/**
+ * What the route says when a decision is refused: fixed text naming the state,
+ * never who decided (`decidedBy` is free text a surface supplied).
+ */
+export function refusedDecisionMessage(
+  outcome: "already-decided" | "stale" | "expired",
+  approval: PendingApproval,
+): string {
+  if (outcome === "expired") return "This request has expired.";
+  if (approval.supersededBy !== undefined) return "This request was replaced by a newer one.";
+  if (approval.consumedAt !== undefined) return "This request was already used.";
+  if (approval.decision === "grant") return "This request was already granted.";
+  if (approval.decision === "deny") return "This request was already denied.";
+  return "This request was already settled.";
 }
 
 /** Count pending approvals for one harness — the cheap fleet-badge read. */
