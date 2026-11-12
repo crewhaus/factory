@@ -1691,6 +1691,88 @@ describe("the release notes name run input screened where it enters", () => {
 });
 
 /**
+ * Run identity and run records. A run's id has one form, and every run
+ * records its start, its park and its end. Both reach every harness without a
+ * spec opting in, so the list names both, and each check runs the change
+ * itself and requires its bullet unconditionally: reverting either fails.
+ */
+describe("the release notes name run ids and run records", () => {
+  const later = defaultOnBullets(changelog, LATER_HEADINGS);
+
+  test("a run's id is canonical, and the list says what it looks like", async () => {
+    const { CANONICAL_RUN_ID_RE } = await import("../packages/control-contract/src/index");
+    expect(createRunContext().runId).toMatch(CANONICAL_RUN_ID_RE);
+    const bullet = later.find((b) => b.includes("`run_`") && b.includes("26")) ?? "";
+    expect(bullet).toContain("26");
+    expect(bullet).toContain("`run_`");
+  });
+
+  test("a run writes its rows, where the list says, and the list names the switch", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { RUN_LEDGER_DIR, runLedgerAt } = await import("../packages/runtime-core/src/run-ledger");
+    const { RUN_LEDGER_DIR: SUPERVISOR_DIR } = await import(
+      "../packages/harness-supervisor/src/run-rows"
+    );
+    const { RUNS_LEDGER_DIR: RESUME_DIR } = await import("../apps/cli/src/runs");
+    const { readPage } = await import("../packages/control-records/src/index");
+    const harness = mkdtempSync(join(tmpdir(), "default-on-run-rows-"));
+    try {
+      const saved = process.env["CREWHAUS_RUN_LEDGER"];
+      Reflect.deleteProperty(process.env, "CREWHAUS_RUN_LEDGER");
+      try {
+        await runChatLoop({
+          model: "test-model",
+          instructions: "x",
+          singleTurn: true,
+          seedMessages: [{ role: "user", content: "hi" }],
+          permissionMode: "bypass",
+          installSigintHandler: false,
+          spinner: false,
+          stdout: () => {},
+          settingsDir: null,
+          sessionRootDir: join(harness, "sessions"),
+          runLedgerDir: harness,
+          _adapter: {
+            providerId: "anthropic",
+            features: {
+              caching: "explicit",
+              tool_use: true,
+              vision: true,
+              thinking: true,
+              web_search: false,
+            },
+            estimateTokens: () => 1,
+            async *stream() {
+              yield { kind: "message_start", usage: { input: 1, output: 0 } };
+              yield {
+                kind: "message_delta",
+                stopReason: "end_turn",
+                usage: { input: 0, output: 1 },
+              };
+              yield { kind: "message_stop" };
+            },
+          },
+        });
+      } finally {
+        if (saved !== undefined) process.env["CREWHAUS_RUN_LEDGER"] = saved;
+      }
+      const rows = readPage(runLedgerAt(harness), { limit: 10 }).items.map((i) => i.record);
+      expect(rows.length).toBeGreaterThanOrEqual(2);
+      // One place: the runtime writes, the supervisor closes and `runs resume` reads the same directory.
+      const listed = `${RUN_LEDGER_DIR.split(sep).join("/")}/`;
+      expect(listed).toBe(".crewhaus/run/control/runs/");
+      expect(SUPERVISOR_DIR).toBe(RUN_LEDGER_DIR);
+      expect(RESUME_DIR).toBe(RUN_LEDGER_DIR);
+      const bullet = later.find((b) => b.includes(`\`${listed}\``)) ?? "";
+      expect(bullet).toContain(`\`${listed}\``);
+      expect(bullet).toContain("`CREWHAUS_RUN_LEDGER=0`");
+    } finally {
+      rmSync(harness, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
  * Receipts and the mutating lease. Every daemon verb and every Home change now
  * writes a receipt first, a refused daemon start exits with the rejected-receipt
  * code where it exited 1, and the CLI's long verbs take the harness's mutating

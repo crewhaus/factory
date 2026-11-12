@@ -30,12 +30,12 @@
  * outputs are the harness's own model output judged blind — not a boundary —
  * and the shadow's text is discarded here, never returned.
  */
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import type { ProviderAdapter, ProviderId } from "@crewhaus/adapter-anthropic";
 import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import { judgePairwise, judgeSelect } from "@crewhaus/eval-judge";
 import type { IrModelPoolStrategy } from "@crewhaus/ir";
-import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { type RunContext, createRunContext, lineageOf, mintRunId } from "@crewhaus/run-context";
 import {
   type CommitteeMemberOutcome,
   type CommitteeSideCall,
@@ -146,7 +146,7 @@ export async function runNestedSingleTurn(
   args: NestedSingleTurnArgs,
 ): Promise<NestedSingleTurnResult> {
   const { parent, deps } = args;
-  const childRunId = `run_${randomUUID().slice(0, 8)}`;
+  const childRunId = mintRunId();
   const childSessionId = `sess_${randomBytes(8).toString("hex")}`;
   const childBus = new TraceEventBus({
     runId: childRunId,
@@ -170,6 +170,7 @@ export async function runNestedSingleTurn(
     ...(parent !== undefined ? { logger: parent.logger } : {}),
     eventBus: childBus,
     originStack: [...(parent?.originStack ?? []), "consult"],
+    ...(parent !== undefined ? lineageOf(parent) : {}),
   });
   const attribution = {
     role: args.role,

@@ -285,6 +285,9 @@ async function turn(
     instructions: "credential files",
     runContext,
     sessionRootDir: tempDir("crewhaus-credential-sessions-"),
+    // These checks compare the workspace before and after a call: the run's
+    // own records would land in it, so this loop writes none.
+    runLedgerDir: null,
     ...(target !== undefined ? { sessionTarget: target } : {}),
     singleTurn: true,
     seedMessages: [{ role: "user", content: "go" }],
@@ -839,6 +842,7 @@ describe("the loops a run starts", () => {
       instructions: "delegate",
       runContext: createRunContext(),
       sessionRootDir: tempDir("crewhaus-credential-sessions-"),
+      runLedgerDir: null,
       ...(target !== undefined ? { sessionTarget: target } : {}),
       singleTurn: true,
       seedMessages: [{ role: "user", content: "go" }],

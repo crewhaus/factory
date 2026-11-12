@@ -446,7 +446,7 @@ import {
 // per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
 // mines the same scoreboard into pool-policy suggestions.
 import { openScoreboard } from "@crewhaus/routing-store";
-import { createRunContext } from "@crewhaus/run-context";
+import { createRunContext, runWithScope } from "@crewhaus/run-context";
 import {
   type AgentIdentityFile,
   type RunChatLoopOptions,
@@ -1432,7 +1432,14 @@ import {
 } from "./run-observability";
 // Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume`
 // spec-resolution + session-id helpers (engine-free, unit-tested).
-import { RunsError, isRunsSessionId, resolveRunsResumeSpecPath } from "./runs";
+import {
+  RunsError,
+  isRunsRunId,
+  isRunsSessionId,
+  resolveRunsResumeSpecPath,
+  resolveRunsResumeTarget,
+  runsResumeScope,
+} from "./runs";
 // Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
 // assets generated from the spec (deterministic template / one-shot model
 // sample stubs + a single spec-goal llm_judge or floor grader), in a
@@ -4167,7 +4174,11 @@ function applyRunObservabilityEnv(args: ParsedArgs, ir: ReturnType<typeof lower>
 
 /**
  * Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume
- * <session> [--spec <path>] [--prompt <text>] [--model <m>] …`.
+ * <session|run> [--spec <path>] [--prompt <text>] [--model <m>] …`.
+ *
+ * A run id is resolved to its session through the harness's run ledger
+ * (`resolveRunsResumeTarget`); the resumed run is recorded as started by a
+ * resume, continuing the session's newest parked run.
  *
  * Re-drives a persisted cli session: resolves the spec backing it (`--spec`, or
  * `crewhaus.yaml` in the cwd), confirms the session exists AND belongs to that
@@ -4182,11 +4193,14 @@ function applyRunObservabilityEnv(args: ParsedArgs, ir: ReturnType<typeof lower>
 async function runRunsResume(args: ParsedArgs): Promise<void> {
   if (args.flags["help"] === true) {
     process.stdout.write(
-      "usage: crewhaus runs resume <session> [--spec <path>] [--prompt <text>] [--model <m>]\n" +
+      "usage: crewhaus runs resume <session|run> [--spec <path>] [--prompt <text>] [--model <m>]\n" +
         "                        [--ask-mode <pause|deny>] [--trace off|ring|pretty|json]\n" +
         "                        [--budget-usd <n>] [--streaming]\n" +
         "  Re-drives a persisted cli session (a sess_<16 hex> id) — replaying its\n" +
-        "  transcript and continuing the loop. The session store keeps only\n" +
+        "  transcript and continuing the loop. A run id resumes the session that\n" +
+        "  run belongs to, read from the run records under\n" +
+        "  .crewhaus/run/control/runs/ in the cwd; a job's run id resumes the session\n" +
+        "  of its newest run. The session store keeps only\n" +
         "  name/target/model, so the spec is resolved from --spec, else\n" +
         "  crewhaus.yaml in the cwd (sessions live under the dir you run from,\n" +
         "  or under CREWHAUS_SESSION_DIR when it is set).\n" +
@@ -4201,15 +4215,25 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
     );
     return;
   }
-  const sessionId = args.positional[0];
-  if (typeof sessionId !== "string") {
+  const id = args.positional[0];
+  if (typeof id !== "string") {
     die(
-      "missing <session> — a sess_<16 hex> id (list live sessions with `crewhaus sessions tail`)",
+      "missing <session|run> — a sess_<16 hex> id (list live sessions with `crewhaus sessions tail`) or a run id",
     );
   }
-  if (!isRunsSessionId(sessionId)) {
-    die(`invalid <session> "${sessionId}" — expected sess_<16 hex>`);
+  if (!isRunsSessionId(id) && !isRunsRunId(id)) {
+    die(
+      `invalid <session|run> "${id}" — expected sess_<16 hex> or a run id (run_ and 26 letters and digits)`,
+    );
   }
+  let target: ReturnType<typeof resolveRunsResumeTarget>;
+  try {
+    target = resolveRunsResumeTarget(id, process.cwd());
+  } catch (err) {
+    if (err instanceof RunsError) die(err.message);
+    throw err;
+  }
+  const sessionId = target.sessionId;
 
   // Resolve the spec backing the resume (--spec, else cwd/crewhaus.yaml).
   let specPath: string;
@@ -4263,7 +4287,8 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
     positional: [specPath],
     flags: { ...args.flags, resume: sessionId },
   };
-  await runRunCli(resumeArgs, ir, specPath);
+  // The resumed run is recorded as started by a resume, continuing the parked run.
+  await runWithScope(runsResumeScope(target), () => runRunCli(resumeArgs, ir, specPath));
 }
 
 /**

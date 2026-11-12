@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { createLogger } from "@crewhaus/logging";
+import { CANONICAL_RUN_ID_RE, mintId, mintRunId } from "@crewhaus/control-contract";
+import { type LogFields, type Logger, createLogger } from "@crewhaus/logging";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
 import {
   type AgentIdentity,
@@ -7,14 +8,17 @@ import {
   MAX_TOKEN_TAGS,
   createRunContext,
   formatAgentIdentity,
+  lineageOf,
   pushOrigin,
+  runWithScope,
   tagContent,
 } from "./index";
 
 describe("createRunContext defaults", () => {
   test("generates run/session ids with expected prefixes", () => {
     const ctx = createRunContext();
-    expect(ctx.runId).toMatch(/^run_[0-9a-f]{8}$/);
+    // The one canonical run id: `run_` and a 26-character ULID body.
+    expect(ctx.runId).toMatch(CANONICAL_RUN_ID_RE);
     // session-store path-traversal guard requires sess_<16 hex>; the
     // default factory matches that format so runtime-core can hand the
     // id straight to sessionStore.create({ id }).
@@ -448,5 +452,99 @@ describe("formatAgentIdentity", () => {
 
   test("omits undefined fields while keeping order for the rest", () => {
     expect(formatAgentIdentity({ skillId: "s1", roleId: "r1" })).toBe("skill=s1;role=r1");
+  });
+});
+
+/** A logger that counts its warnings, whatever child it is asked for. */
+function countingLogger(): { logger: Logger; warns: Array<{ msg: string; fields?: LogFields }> } {
+  const warns: Array<{ msg: string; fields?: LogFields }> = [];
+  const logger: Logger = {
+    debug: () => {},
+    info: () => {},
+    warn: (msg, fields) => {
+      warns.push({ msg, ...(fields !== undefined ? { fields } : {}) });
+    },
+    error: () => {},
+    child: () => logger,
+  };
+  return { logger, warns };
+}
+
+describe("run lineage", () => {
+  test("options set every lineage field, and an unset one is absent", () => {
+    const wi = mintId("wi");
+    const parent = mintRunId();
+    const ctx = createRunContext({
+      parent,
+      resumeScope: `run:${parent}`,
+      continues: parent,
+      workItem: wi,
+      trigger: { kind: "schedule", lane: "schedule" },
+    });
+    expect(ctx.parent).toBe(parent);
+    expect(ctx.resumeScope).toBe(`run:${parent}`);
+    expect(ctx.continues).toBe(parent);
+    expect(ctx.workItem).toBe(wi);
+    expect(ctx.trigger).toEqual({ kind: "schedule", lane: "schedule" });
+    const bare = createRunContext({ trigger: { kind: "cli" } });
+    expect(Object.keys(bare).filter((k) => k === "parent" || k === "workItem")).toEqual([]);
+  });
+
+  test("a resumeScope that does not fit its grammar is dropped, with one warning naming the field", () => {
+    const { logger, warns } = countingLogger();
+    const ctx = createRunContext({ logger, resumeScope: "job:has a space" });
+    expect("resumeScope" in ctx).toBe(false);
+    expect(warns).toHaveLength(1);
+    expect(warns[0]?.fields).toEqual({ field: "resumeScope" });
+    // The value is never echoed.
+    expect(JSON.stringify(warns)).not.toContain("has a space");
+  });
+
+  test("a workItem that does not fit its grammar is dropped, with one warning naming the field", () => {
+    const { logger, warns } = countingLogger();
+    const ctx = createRunContext({ logger, workItem: "work-42" });
+    expect("workItem" in ctx).toBe(false);
+    expect(warns).toHaveLength(1);
+    expect(warns[0]?.fields).toEqual({ field: "workItem" });
+    expect(JSON.stringify(warns)).not.toContain("work-42");
+  });
+
+  test("a misfit from the ambient scope is dropped the same way, and a fitting one warns nothing", () => {
+    const { logger, warns } = countingLogger();
+    const dropped = runWithScope({ resumeScope: "lane:nightly", workItem: "wi_nope" }, () =>
+      createRunContext({ logger }),
+    );
+    expect("resumeScope" in dropped).toBe(false);
+    expect("workItem" in dropped).toBe(false);
+    expect(warns.map((w) => w.fields?.["field"])).toEqual(["resumeScope", "workItem"]);
+    const kept = runWithScope({ resumeScope: "lane:schedule:nightly" }, () =>
+      createRunContext({ logger }),
+    );
+    expect(kept.resumeScope).toBe("lane:schedule:nightly");
+    expect(warns).toHaveLength(2);
+  });
+
+  test("lineageOf names the parent and carries resumeScope, trigger and workItem, never continues", () => {
+    const wi = mintId("wi");
+    const root = mintRunId();
+    const parent = createRunContext({
+      resumeScope: `work:${wi}`,
+      trigger: { kind: "queue" },
+      workItem: wi,
+      continues: root,
+      parent: root,
+    });
+    expect(lineageOf(parent)).toEqual({
+      parent: parent.runId,
+      resumeScope: `work:${wi}`,
+      trigger: { kind: "queue" },
+      workItem: wi,
+    });
+    const child = createRunContext(lineageOf(parent));
+    expect(child.parent).toBe(parent.runId);
+    expect("continues" in child).toBe(false);
+    // A parent with no lineage gives its child only `parent`.
+    const plain = createRunContext();
+    expect(lineageOf(plain)).toEqual({ parent: plain.runId });
   });
 });

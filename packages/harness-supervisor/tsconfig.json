@@ -5,6 +5,8 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../control-contract" },
+    { "path": "../control-records" },
     { "path": "../errors" },
     { "path": "../harness-inventory" },
     { "path": "../preflight" }

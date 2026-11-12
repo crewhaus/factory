@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/control-contract": "workspace:*",
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*"
   },

@@ -26,6 +26,8 @@
     "@crewhaus/trace-event-bus": "workspace:*"
   },
   "devDependencies": {
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/federation-discovery": "workspace:*",
     "@crewhaus/federation-protocol": "workspace:*",
     "@crewhaus/gateway-server": "workspace:*",

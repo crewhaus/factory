@@ -58,6 +58,18 @@ these on: they reach every harness that uses what each one names.
   directory, the runtime-state floor protects `approvals.d/` as it protects the
   approvals file.
 
+- **Run ids have one form.** A run's id is now `run_` and 26 lowercase letters
+  and digits (it was `run_` and 8 hex characters), in trace events, logs and
+  pending approvals. A sub-agent's run names the run that started it. A
+  one-shot job started under supervision names its job's run, and a workflow
+  job uses that id to resume its steps unless you set `CREWHAUS_RUN_ID`.
+
+- **Every run is recorded.** Each run appends a few lines to
+  `.crewhaus/run/control/runs/` in the harness directory when it starts, when it
+  waits for an approval and when it ends: ids, state, what started it and its
+  cost, never its messages. `CREWHAUS_RUN_LEDGER=0` turns this off and changes
+  nothing else.
+
 ## [0.8.1] - 2026-11-08
 
 Fixes and hardening for run input, the runtime-state floor, git tools,

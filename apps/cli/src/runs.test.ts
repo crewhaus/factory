@@ -1,6 +1,23 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { RunsError, isRunsSessionId, resolveRunsResumeSpecPath } from "./runs";
+import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
+import { mintRunId } from "@crewhaus/control-contract";
+import { append, readPage } from "@crewhaus/control-records";
+import { createRunContext, runWithScope } from "@crewhaus/run-context";
+import { createPendingApprovalStore, runChatLoop } from "@crewhaus/runtime-core";
+import { buildTool } from "@crewhaus/tool-builder";
+import { z } from "zod";
+import {
+  RUNS_LEDGER_DIR,
+  RunsError,
+  isRunsSessionId,
+  resolveRunsResumeSpecPath,
+  resolveRunsResumeTarget,
+  runsLedgerAt,
+  runsResumeScope,
+} from "./runs";
 
 describe("isRunsSessionId", () => {
   test("accepts sess_<16 hex>, rejects everything else", () => {
@@ -53,3 +70,209 @@ describe("resolveRunsResumeSpecPath", () => {
     }
   });
 });
+
+describe("resolveRunsResumeTarget", () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+  });
+  function harness(): string {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-runs-resume-"));
+    dirs.push(dir);
+    return dir;
+  }
+  const sessionId = (n: number) => `sess_${String(n).padStart(16, "0")}`;
+  function plant(dir: string, row: Record<string, unknown>): void {
+    const written = append(runsLedgerAt(dir), {
+      at: new Date().toISOString(),
+      trigger: { kind: "cli" },
+      ...row,
+    });
+    expect(written.ok).toBe(true);
+  }
+
+  test("a run id resolves to its session, whatever its last row says", () => {
+    const dir = harness();
+    const [finished, parked] = [mintRunId(), mintRunId()];
+    plant(dir, { id: finished, state: "running", session: sessionId(1) });
+    plant(dir, { id: finished, state: "succeeded" });
+    plant(dir, { id: parked, state: "running", session: sessionId(2) });
+    plant(dir, { id: parked, state: "waiting-for-approval", decision: "appr_0123456789abcdef" });
+    // The last rows carry no session: a resolver that read only the fold would find none.
+    expect(resolveRunsResumeTarget(finished, dir)).toEqual({ sessionId: sessionId(1) });
+    expect(resolveRunsResumeTarget(parked, dir)).toEqual({
+      sessionId: sessionId(2),
+      continues: parked,
+    });
+  });
+
+  test("a root's id resolves to the session of its newest run", () => {
+    const dir = harness();
+    const root = mintRunId();
+    const [older, newer] = [mintRunId(), mintRunId()];
+    plant(dir, { id: root, state: "queued", execution: "run_00000000000000aa" });
+    plant(dir, { id: root, state: "preparing", execution: "run_00000000000000aa" });
+    plant(dir, { id: root, state: "running", execution: "run_00000000000000aa" });
+    plant(dir, { id: older, state: "running", session: sessionId(3), parent: root });
+    plant(dir, { id: older, state: "succeeded" });
+    plant(dir, { id: newer, state: "running", session: sessionId(4), parent: root });
+    plant(dir, { id: newer, state: "waiting-for-approval", decision: "appr_0123456789abcdef" });
+    expect(resolveRunsResumeTarget(root, dir)).toEqual({
+      sessionId: sessionId(4),
+      continues: newer,
+    });
+  });
+
+  test("a session id resolves to itself, continuing its newest parked run", () => {
+    const dir = harness();
+    const [parkedOld, parkedNew] = [mintRunId(), mintRunId()];
+    plant(dir, { id: parkedOld, state: "running", session: sessionId(5) });
+    plant(dir, { id: parkedOld, state: "waiting-for-approval", decision: "appr_0123456789abcdef" });
+    plant(dir, { id: parkedNew, state: "running", session: sessionId(5) });
+    plant(dir, { id: parkedNew, state: "waiting-for-approval", decision: "appr_0123456789abcdee" });
+    expect(resolveRunsResumeTarget(sessionId(5), dir)).toEqual({
+      sessionId: sessionId(5),
+      continues: parkedNew,
+    });
+    // No run records at all: the session still resumes, with nothing to continue.
+    expect(resolveRunsResumeTarget(sessionId(6), harness())).toEqual({ sessionId: sessionId(6) });
+  });
+
+  test("an id no run record has is refused, naming it", () => {
+    const dir = harness();
+    const unknown = mintRunId();
+    expect(() => resolveRunsResumeTarget(unknown, dir)).toThrow(RunsError);
+    expect(() => resolveRunsResumeTarget(unknown, dir)).toThrow(unknown);
+    expect(() => resolveRunsResumeTarget("run_1234abcd", dir)).toThrow(RunsError);
+  });
+
+  test("run records that cannot be read whole are refused for a run id", () => {
+    const dir = harness();
+    const id = mintRunId();
+    plant(dir, { id, state: "running", session: sessionId(7) });
+    appendFileSync(join(dir, RUNS_LEDGER_DIR, "000001.jsonl"), "not json\n");
+    expect(() => resolveRunsResumeTarget(id, dir)).toThrow(/could not be read whole/);
+  });
+
+  test("the resumed loop's running row continues the parked run and was started by a resume", async () => {
+    const dir = harness();
+    const sessions = join(dir, "sessions");
+    const store = createPendingApprovalStore({ rootDir: join(dir, "approvals") });
+    const danger = buildTool({
+      name: "danger",
+      description: "must be approved",
+      inputSchema: z.object({ x: z.number() }).strict(),
+      readOnly: false,
+      destructive: false,
+      concurrencySafe: false,
+      execute: async () => "did it",
+    });
+    const first = createRunContext();
+    let parkedError: unknown;
+    try {
+      await runChatLoop({
+        ...LOOP,
+        runContext: first,
+        sessionRootDir: sessions,
+        runLedgerDir: dir,
+        permissionMode: "default",
+        tools: [danger],
+        approvals: { store },
+        _adapter: scriptedAdapter("tool"),
+      });
+    } catch (err) {
+      parkedError = err;
+    }
+    expect((parkedError as { report?: { class?: string } }).report?.class).toBe("approval_pending");
+
+    const target = resolveRunsResumeTarget(first.runId, dir);
+    expect(target).toEqual({ sessionId: first.sessionId, continues: first.runId });
+    // As the CLI does: the resumed loop mints its context inside the scope.
+    let resumed = first;
+    const answer = await runWithScope(runsResumeScope(target), () => {
+      resumed = createRunContext({ sessionId: first.sessionId });
+      return runChatLoop({
+        ...LOOP,
+        runContext: resumed,
+        sessionRootDir: sessions,
+        runLedgerDir: dir,
+        resume: { sessionId: first.sessionId },
+        _adapter: scriptedAdapter("text"),
+      });
+    });
+    expect(resumed.runId).not.toBe(first.runId);
+    expect(typeof answer).toBe("string");
+    const rows: Record<string, unknown>[] = [];
+    for (const item of readPage(runsLedgerAt(dir), { limit: 100 }).items) rows.unshift(item.record);
+    const running = rows.find((r) => r["id"] === resumed.runId && r["state"] === "running");
+    expect(running).toMatchObject({
+      continues: first.runId,
+      trigger: { kind: "resume" },
+      session: first.sessionId,
+    });
+    expect(rows.filter((r) => r["id"] === first.runId).map((r) => r["state"])).toEqual([
+      "running",
+      "waiting-for-approval",
+    ]);
+  });
+});
+
+const LOOP = {
+  model: "test-model",
+  instructions: "resume test",
+  singleTurn: true,
+  seedMessages: [{ role: "user" as const, content: "go" }],
+  installSigintHandler: false,
+  spinner: false,
+  stdout: () => {},
+  settingsDir: null,
+} as const;
+
+/** A model that calls `danger` once (`tool`) or answers in text (`text`). */
+function scriptedAdapter(reply: "tool" | "text"): ProviderAdapter {
+  return {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
+    },
+    estimateTokens: () => 0,
+    stream: () =>
+      (async function* () {
+        yield { kind: "message_start" } as const;
+        if (reply === "tool") {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "tool_use", id: "tu_1", name: "danger", input: {} },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: '{"x":1}' },
+          } as const;
+        } else {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "text", text: "" },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "resumed" },
+          } as const;
+        }
+        yield { kind: "content_block_stop", index: 0 } as const;
+        yield {
+          kind: "message_delta",
+          stopReason: reply === "tool" ? "tool_use" : "end_turn",
+          usage: { input: 1, output: 1 },
+        } as const;
+        yield { kind: "message_stop" } as const;
+      })(),
+  };
+}
