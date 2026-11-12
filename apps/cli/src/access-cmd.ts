@@ -14,7 +14,9 @@
  * they print the single-owner view. Every other verb first makes sure the access records
  * exist, with this OS user as the owner, and refuses another user of this computer.
  */
+import { readFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
+import { join } from "node:path";
 import {
   type AccessHandle,
   type AccessHarness,
@@ -22,9 +24,11 @@ import {
   INVITE_TTL_MS,
   type LocalIdentity,
   type MemberView,
+  PROXY_SECRET_HEADER,
   type ProjectionReport,
   type Refusal,
   SERVICE_TOKEN_TTL_MS,
+  SETTINGS_FILENAME,
   type TokenView,
   ensureAccessSetUp,
   listInvites,
@@ -33,6 +37,9 @@ import {
   loadAccessSnapshot,
   localActorOf,
   openAccess,
+  parseCidr,
+  readOwnerSettings,
+  writeOwnerBlock,
 } from "@crewhaus/access-control";
 import { type HangarRegistry, openHangarRegistry } from "@crewhaus/harness-registry";
 import { defaultIsPidAlive, readHangarLock, resolveHangarRoot } from "./hangar-cmd";
@@ -75,9 +82,16 @@ const ACCESS_USAGE_LINES: readonly string[] = [
   "       [--subject] [--expires <dur>]           a service token, shown once (180d at most)",
   "  crewhaus access sync                         rewrite each harness's list of who may approve;",
   "                                               run it after you change a harness's groups",
+  "  crewhaus access proxy                        how Home trusts a reverse proxy, if it does",
+  "  crewhaus access proxy --header <h> --peer <cidr>... --host <name>... [--socket]",
+  "                                               trust a proxy's identity header: from the listed",
+  "                                               peers with a secret it sends (shown once), or",
+  "                                               over Home's proxy socket with --socket",
+  "  crewhaus access proxy --off                  stop trusting it",
   "",
   "  Roles: viewer, operator, maintainer, owner. <h> is a harness id or directory, and",
-  "  <dur> is like 30m, 24h or 7d. These verbs work with Home stopped.",
+  "  <dur> is like 30m, 24h or 7d. These verbs work with Home stopped; a proxy change",
+  "  takes effect when Home next starts.",
 ];
 
 // ---------------------------------------------------------------------------
@@ -663,6 +677,147 @@ async function syncVerb(session: Session, argv: readonly string[]): Promise<Acce
   return finish(session, done, lines);
 }
 
+// ---------------------------------------------------------------------------
+// proxy
+// ---------------------------------------------------------------------------
+
+const HEADER_RE = /^[A-Za-z0-9-]{1,64}$/;
+const HOST_RE =
+  /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+
+/** The `access` block of the Hangar settings file as it is now, or `{}`. */
+function accessBlockOf(root: string): Record<string, unknown> {
+  try {
+    const raw = JSON.parse(readFileSync(join(root, SETTINGS_FILENAME), "utf8")) as unknown;
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
+    const access = (raw as Record<string, unknown>)["access"];
+    return typeof access === "object" && access !== null && !Array.isArray(access)
+      ? { ...(access as Record<string, unknown>) }
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Buffer.from(digest).toString("hex");
+}
+
+/**
+ * `crewhaus access proxy`: print, set or remove `access.trustedProxy` in the Hangar
+ * settings. Only this Home's owner may change it, and Home reads it when it starts.
+ */
+async function proxyVerb(session: Session, argv: readonly string[]): Promise<AccessCommandResult> {
+  const args = parseArgs("proxy", argv, {
+    header: "value",
+    peer: "values",
+    host: "values",
+    socket: "boolean",
+    off: "boolean",
+  });
+  noPositional("proxy", args);
+  const header = one(args, "header");
+  const peers = many(args, "peer");
+  const hosts = many(args, "host");
+  const writing =
+    header !== undefined || peers.length > 0 || hosts.length > 0 || args.booleans.has("socket");
+  if (!writing && !args.booleans.has("off")) {
+    const read = readOwnerSettings(session.root);
+    if (!read.ok) return { lines: [read.reason], exitCode: 1 };
+    const proxy = read.settings.trustedProxy;
+    if (proxy === undefined) {
+      return {
+        lines: ["Home trusts no reverse proxy: it signs every browser in itself."],
+        exitCode: 0,
+      };
+    }
+    return {
+      lines: [
+        `Home trusts the ${proxy.header} header from a reverse proxy:`,
+        `  peers  ${proxy.peers.length > 0 ? proxy.peers.join(", ") : "(none)"}`,
+        `  names  ${proxy.hosts.length > 0 ? proxy.hosts.join(", ") : "(none)"}`,
+        `  proof  ${proxy.socket === true ? `Home's proxy socket (${join(session.root, "proxy.sock")})` : `the ${PROXY_SECRET_HEADER} header it sends`}`,
+      ],
+      exitCode: 0,
+    };
+  }
+  if (writing && args.booleans.has("off")) {
+    throw new Error(
+      "access proxy: --off cannot be combined with --header, --peer, --host or --socket",
+    );
+  }
+  const acting = await actingPrincipal(session);
+  if ("ok" in acting) return refused(acting);
+  const before = accessBlockOf(session.root);
+  if (args.booleans.has("off")) {
+    const { trustedProxy: _gone, ...rest } = before;
+    writeOwnerBlock(session.root, "access", Object.keys(rest).length > 0 ? rest : undefined);
+    return {
+      lines: [
+        ...acting.lines,
+        "Home no longer trusts a reverse proxy. Restart Home for this to take effect.",
+      ],
+      exitCode: 0,
+    };
+  }
+  if (header === undefined || !HEADER_RE.test(header)) {
+    throw new Error("access proxy: --header names the header your proxy sets, like X-Auth-User");
+  }
+  const socket = args.booleans.has("socket");
+  if (socket && process.platform === "win32") {
+    throw new Error(
+      "access proxy: --socket needs a unix socket, which Home does not create on Windows",
+    );
+  }
+  if (!socket && peers.length === 0) {
+    throw new Error(
+      "access proxy: give the proxy's address with --peer <cidr> (127.0.0.1/32 for one on this computer)",
+    );
+  }
+  for (const peer of peers) {
+    if (parseCidr(peer) === undefined)
+      throw new Error(`access proxy: --peer "${peer}" is not a CIDR block`);
+  }
+  for (const host of hosts) {
+    if (!HOST_RE.test(host)) throw new Error(`access proxy: --host "${host}" is not a host name`);
+  }
+  const secret = socket
+    ? undefined
+    : Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+  const trustedProxy: Record<string, unknown> = {
+    header: header.toLowerCase(),
+    peers: [...peers],
+    hosts: hosts.map((host) => host.toLowerCase()),
+    ...(secret !== undefined ? { secretDigest: await sha256Hex(secret) } : {}),
+    ...(socket ? { socket: true } : {}),
+  };
+  writeOwnerBlock(session.root, "access", { ...before, trustedProxy });
+  const check = readOwnerSettings(session.root);
+  if (!check.ok) {
+    writeOwnerBlock(session.root, "access", Object.keys(before).length > 0 ? before : undefined);
+    return { lines: [`Nothing was changed: ${check.reason}`], exitCode: 1 };
+  }
+  const lines = [
+    ...acting.lines,
+    `Home will trust the ${header.toLowerCase()} header as the person signing in, and only from your proxy.`,
+  ];
+  if (secret !== undefined) {
+    lines.push(
+      "Configure the proxy to send this header on every request it passes to Home:",
+      `  ${PROXY_SECRET_HEADER}: ${secret}`,
+      "It is shown this once; Home keeps only a hash of it.",
+    );
+  } else {
+    lines.push(`Point the proxy at Home's proxy socket: ${join(session.root, "proxy.sock")}`);
+  }
+  lines.push(
+    "Each person still needs a link: `crewhaus access link proxy:<header>:<name> --member <name>`.",
+    "Restart Home for this to take effect.",
+  );
+  return { lines, exitCode: 0 };
+}
+
 /**
  * Run one `crewhaus access` verb. Bare `access`, `--help` and `-h` print usage.
  */
@@ -697,9 +852,11 @@ export async function runAccessCommand(
       return mintVerb(session, rest);
     case "sync":
       return syncVerb(session, rest);
+    case "proxy":
+      return proxyVerb(session, rest);
     default:
       throw new Error(
-        `access: unknown verb "${verb}" (expected: members, invite, grant, revoke, link, unlink, tokens, mint, sync)`,
+        `access: unknown verb "${verb}" (expected: members, invite, grant, revoke, link, unlink, tokens, mint, sync, proxy)`,
       );
   }
 }

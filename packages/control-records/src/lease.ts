@@ -149,12 +149,36 @@ function holderOf(lease: LeaseRecord): LeaseHolder {
   return { kind, head, pid, host, since: acquiredAt };
 }
 
+/**
+ * Whether a recorded process is provably gone: on this host, and either the probe says it
+ * is not alive, or a recorded start time is more than 2 seconds from the probe's (another
+ * process on a recycled pid). A foreign host, a probe that cannot answer, and a holder with
+ * no recorded start time whose pid answers alive are all alive.
+ *
+ * First consumers: the mutating lease, and command recovery judging a receipt's executor.
+ */
+export function holderProvablyDead(
+  holder: { readonly pid: number; readonly startedAtMs?: number; readonly host: string },
+  probe: LeaseProbe,
+  host: string,
+): boolean {
+  if (holder.host !== host) return false;
+  if (probe.isAlive(holder.pid) === false) return true;
+  if (holder.startedAtMs === undefined) return false;
+  const observed = probe.startTimeMs(holder.pid);
+  return observed !== undefined && Math.abs(observed - holder.startedAtMs) > START_TOLERANCE_MS;
+}
+
 function provablyDead(lease: LeaseRecord, probe: LeaseProbe, host: string): boolean {
-  if (lease.host !== host) return false;
-  if (probe.isAlive(lease.pid) === false) return true;
-  if (lease.startedAt === undefined) return false;
-  const observed = probe.startTimeMs(lease.pid);
-  return observed !== undefined && Math.abs(observed - lease.startedAt) > START_TOLERANCE_MS;
+  return holderProvablyDead(
+    {
+      pid: lease.pid,
+      ...(lease.startedAt !== undefined ? { startedAtMs: lease.startedAt } : {}),
+      host: lease.host,
+    },
+    probe,
+    host,
+  );
 }
 
 function removeLeaseFile(harnessDir: string, rel: string): boolean {

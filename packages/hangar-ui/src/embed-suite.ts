@@ -194,18 +194,17 @@ describe("js module hygiene", () => {
     }
   });
 
-  test("srcdoc appears in exactly one module, and only alongside a sandbox", () => {
-    // M4 (HM-179) introduces the ONE deliberate exception to the
-    // markup-string ban: a plugin pane's document is handed to an iframe via
-    // `srcdoc`. That is safe precisely because the string never joins THIS
-    // document — the frame gets an opaque origin (no `allow-same-origin`)
-    // and a CSP. Both halves are load-bearing, so the exception is pinned to
-    // one file and to the presence of the sandbox attribute beside it; a
-    // second module reaching for `srcdoc` fails here.
-    const users = jsEntries
-      .filter(([, entry]) => entry.body.includes("srcdoc"))
-      .map(([key]) => key);
-    expect(users).toEqual(["/assets/js/views/panes.js"]);
+  test("no module sets srcdoc, and the one frame carries a sandbox", () => {
+    // A plugin pane is the one place third-party markup is shown, and it is
+    // shown in a sandboxed frame (opaque origin, no `allow-same-origin`) that
+    // loads the pane from a single-use address serving the plugin's own
+    // policy. `srcdoc` would hand the frame this console's policy instead, so
+    // no module may set it.
+    const setsSrcdoc = /["']srcdoc["']|\.srcdoc\s*=/;
+    const users = jsEntries.filter(([, entry]) => setsSrcdoc.test(entry.body)).map(([key]) => key);
+    expect(users).toEqual([]);
+    // The check itself can fail.
+    expect(setsSrcdoc.test('frame.setAttribute("srcdoc", doc)')).toBe(true);
     const panes = hangarAssets["/assets/js/views/panes.js"]?.body ?? "";
     expect(panes).toContain("sandbox:");
     // …and it is the ONLY module allowed to build an iframe at all: the

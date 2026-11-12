@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import {
   allowSingleOwner,
   createPendingApprovalStore,
@@ -859,6 +860,51 @@ describe("runDrainSweep — best-effort housekeeping under its own budget", () =
     );
     expect(await runDrainSweep(() => undefined, { env: {} })).toBe("done");
     expect(DEFAULT_DRAIN_SWEEP_MS).toBeGreaterThan(0);
+  });
+});
+
+describe("a lane's run scope", () => {
+  test("a tick's run resumes as the lane and was started by it; a wake is synthetic and carries no reason or author", async () => {
+    const seen: RunContext[] = [];
+    const { plane } = harness();
+    const heartbeat = plane.lane({
+      lane: "heartbeat",
+      cadence: "every 1000ms",
+      everyMs: 1000,
+      run: async () => {
+        seen.push(createRunContext());
+      },
+    });
+    const schedule = plane.lane({
+      lane: "schedule",
+      cadence: 'cron "0 * * * *" UTC',
+      run: async () => {
+        seen.push(createRunContext());
+      },
+    });
+    await heartbeat.tick();
+    const res = await plane.fetch(
+      req(
+        `${CONTROL_PATH_PREFIX}/wake`,
+        wakeBody({ lane: "heartbeat", reason: "operator poke", by: "hangar" }),
+      ),
+    );
+    expect(res.status).toBe(202);
+    await heartbeat.settled();
+    await schedule.tick();
+
+    const [organic, woken, scheduled] = seen;
+    expect(organic?.resumeScope).toBe("lane:heartbeat");
+    expect(organic?.trigger).toEqual({ kind: "heartbeat", lane: "heartbeat" });
+    expect(woken?.resumeScope).toBe("lane:heartbeat");
+    expect(woken?.trigger).toEqual({ kind: "heartbeat", lane: "heartbeat", synthetic: true });
+    const lineage = JSON.stringify({ trigger: woken?.trigger, scope: woken?.resumeScope });
+    expect(lineage).not.toContain("operator poke");
+    expect(lineage).not.toContain("hangar");
+    expect(scheduled?.resumeScope).toBe("lane:schedule");
+    expect(scheduled?.trigger).toEqual({ kind: "schedule", lane: "schedule" });
+    // Outside a tick, no lane scope.
+    expect("resumeScope" in createRunContext()).toBe(false);
   });
 });
 

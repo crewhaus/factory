@@ -4,6 +4,10 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../logging" }, { "path": "../trace-event-bus" }],
+  "references": [
+    { "path": "../control-contract" },
+    { "path": "../logging" },
+    { "path": "../trace-event-bus" }
+  ],
   "include": ["src/**/*"]
 }

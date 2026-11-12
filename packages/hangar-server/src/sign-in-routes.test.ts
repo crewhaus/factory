@@ -1,0 +1,177 @@
+/**
+ * The sign-in routes end to end, with WebCrypto in Bun and the console's own modules:
+ * a boot link, an exchange, a session that reads the API, a returning device, a refresh
+ * and a sign-out. Every issuing answer is never cached and is unchanged by the masker.
+ */
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  bearer,
+  codeFrom,
+  exchange,
+  refresh,
+  returning,
+  sealedJs,
+  signInFromBootLink,
+  signInJs,
+} from "./__test__/browser";
+import { maskDeep } from "./mask";
+import { type TestServer, bootTestServer } from "./testkit";
+
+const servers: TestServer[] = [];
+afterEach(async () => {
+  while (servers.length > 0) await (servers.pop() as TestServer).stop();
+});
+
+function boot(): TestServer {
+  const t = bootTestServer({});
+  servers.push(t);
+  return t;
+}
+
+const json = (body: unknown): RequestInit => ({
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+describe("a browser signs in", () => {
+  test("boot link → code → exchange → the API answers the session", async () => {
+    const t = boot();
+    const browser = await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+    expect(browser.session).toMatch(/^cha_[A-Za-z0-9_-]{43}$/);
+    const res = await t.fetchRaw("/api/harnesses", { headers: bearer(browser.session) });
+    expect(res.status).toBe(200);
+  });
+
+  test("every issuing answer is never cached and is unchanged by the masker", async () => {
+    const t = boot();
+    const answers: Response[] = [];
+    const recording = async (path: string, init?: RequestInit): Promise<Response> => {
+      const res = await t.fetchRaw(path, init);
+      if (path.startsWith("/api/v1/auth/")) answers.push(res.clone());
+      return res;
+    };
+    const browser = await signInFromBootLink(recording, t.server.bootPath as string);
+    const back = await returning(recording, browser);
+    expect(back.status).toBe(200);
+    await refresh(recording, back.session as string);
+    const issuing = answers.filter((res) => res.url.includes("/challenge") === false);
+    expect(issuing.length).toBe(3);
+    for (const res of answers) {
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      const body = (await res.json()) as unknown;
+      expect(maskDeep(body)).toEqual(body);
+    }
+  });
+
+  test("a request that also carries X-Forwarded-For still signs in through the exchange", async () => {
+    const t = boot();
+    const forwarded = (path: string, init: RequestInit = {}): Promise<Response> =>
+      t.fetchRaw(path, {
+        ...init,
+        headers: { ...(init.headers as Record<string, string>), "x-forwarded-for": "203.0.113.9" },
+      });
+    const browser = await signInFromBootLink(forwarded, t.server.bootPath as string);
+    const res = await forwarded("/api/harnesses", { headers: bearer(browser.session) });
+    expect(res.status).toBe(200);
+  });
+
+  test("a code works once", async () => {
+    const t = boot();
+    const code = await codeFrom(t.fetchRaw, t.server.bootPath as string);
+    await exchange(t.fetchRaw, code);
+    await expect(exchange(t.fetchRaw, code)).rejects.toThrow(/401.*code_unknown/);
+  });
+});
+
+describe("refusals", () => {
+  test("a body that fails its schema is a 400 that never echoes the code", async () => {
+    const t = boot();
+    const code = await codeFrom(t.fetchRaw, t.server.bootPath as string);
+    const res = await t.fetchRaw(
+      "/api/v1/auth/exchange",
+      json({ code, deviceJwk: { kty: "RSA" } }),
+    );
+    expect(res.status).toBe(400);
+    const text = await res.text();
+    expect(text).not.toContain(code);
+    const body = JSON.parse(text) as {
+      error: { code: string; retryable: boolean; details: { reason: string } };
+    };
+    expect(body.error.code).toBe("invalid");
+    expect(body.error.details.reason).toBe("body_invalid");
+    expect(body.error.retryable).toBe(false);
+    // A refused body did not spend the code.
+    expect((await exchange(t.fetchRaw, code)).session).toMatch(/^cha_/);
+    expect(
+      (await t.fetchRaw("/api/v1/auth/exchange", { method: "POST", body: "{not json" })).status,
+    ).toBe(400);
+  });
+
+  test("refresh and sign-out need a session, and Home's own key is not one", async () => {
+    const t = boot();
+    const seal = await (await sealedJs()).makeSeal();
+    const bare = await t.fetchRaw("/api/v1/auth/refresh", json({ seal: seal.seal }));
+    expect(bare.status).toBe(401);
+    const asOwner = await t.fetchRaw("/api/v1/auth/sign-out", {
+      ...json({}),
+      headers: { "content-type": "application/json", ...bearer(t.token) },
+    });
+    expect(asOwner.status).toBe(403);
+    expect(
+      ((await asOwner.json()) as { error: { details: { reason: string } } }).error.details.reason,
+    ).toBe("session_required");
+  });
+
+  test("a wrong method is 405 and an unknown sign-in path 404, in the v1 envelope", async () => {
+    const t = boot();
+    const wrong = await t.fetchRaw("/api/v1/auth/challenge", { method: "POST" });
+    expect(wrong.status).toBe(405);
+    const missing = await t.fetchRaw("/api/v1/auth/accept-invite", json({}));
+    expect(missing.status).toBe(404);
+    expect(((await missing.json()) as { error: { code: string } }).error.code).toBe("not_found");
+  });
+
+  test("a signed-out session no longer works, and a session cannot mint boot links", async () => {
+    const t = boot();
+    const browser = await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+    const minted = await t.fetchRaw("/api/boot-ticket", {
+      method: "POST",
+      headers: bearer(browser.session),
+    });
+    expect(minted.status).toBe(403);
+    expect(((await minted.json()) as { reason: string }).reason).toBe("owner_only");
+    const out = await t.fetchRaw("/api/v1/auth/sign-out", {
+      ...json({}),
+      headers: { "content-type": "application/json", ...bearer(browser.session) },
+    });
+    expect(await out.json()).toEqual({ signedOut: true });
+    const after = await t.fetchRaw("/api/harnesses", { headers: bearer(browser.session) });
+    expect(after.status).toBe(401);
+    expect(((await after.json()) as { reason: string }).reason).toBe("session_unknown");
+  });
+
+  test("a device signature over another seal is refused", async () => {
+    const t = boot();
+    const browser = await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+    const challenge = (await (await t.fetchRaw("/api/v1/auth/challenge")).json()) as {
+      nonce: string;
+    };
+    const sealed = await sealedJs();
+    const mine = await sealed.makeSeal();
+    const relay = await sealed.makeSeal();
+    const signature = await (await signInJs()).signChallenge(browser.privateKey, {
+      device: browser.device,
+      nonce: challenge.nonce,
+      seal: mine.seal,
+    });
+    const res = await t.fetchRaw(
+      "/api/v1/auth/session",
+      json({ device: browser.device, nonce: challenge.nonce, signature, seal: relay.seal }),
+    );
+    expect(res.status).toBe(401);
+    expect(
+      ((await res.json()) as { error: { details: { reason: string } } }).error.details.reason,
+    ).toBe("signature_invalid");
+  });
+});

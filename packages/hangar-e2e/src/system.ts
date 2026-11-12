@@ -3,7 +3,9 @@
  * `CREWHAUS_E2E_BIN` names. The child's whole environment is spelled out here,
  * with `HOME` a sandbox, so nothing on the machine leaks in or gets written to.
  */
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { resolveHangarRoot } from "@crewhaus/harness-registry";
 import type { HomeAddress } from "./session";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..", "..");
@@ -44,18 +46,28 @@ export function childEnv(sandbox: string, modelUrl?: string): Record<string, str
 
 /** How long a child gets to print its URL. A wait, not an assertion on time. */
 const PRINT_BOUND_MS = 60_000;
-/** What `crewhaus hangar` prints: the address, and the token as a fragment. */
-const PRINTED_URL = /(http:\/\/127\.0\.0\.1:(\d+))\/#t=([^\s]+)/;
+/** What `crewhaus hangar` prints: the summary's `url` row, a bare address. No credential is
+ *  ever printed: a session reads Home's own key from the sandbox, where the CLI does. */
+const PRINTED_URL = /^│\s+url\s+(http:\/\/127\.0\.0\.1:(\d+))\s*$/m;
 
-/** Pull the address out of what the CLI printed. A session signs in from it. */
+/** Pull the address out of what the CLI printed. */
 export function parsePrintedUrl(
   output: string,
-): (HomeAddress & { readonly port: number }) | undefined {
+): { readonly url: string; readonly port: number } | undefined {
   const match = PRINTED_URL.exec(output);
   if (match === null) return undefined;
-  const [, url, port, token] = match;
-  if (url === undefined || port === undefined || token === undefined) return undefined;
-  return { url, port: Number(port), token, bootPath: `/#t=${token}` };
+  const [, url, port] = match;
+  if (url === undefined || port === undefined) return undefined;
+  return { url, port: Number(port) };
+}
+
+/** Home's own key, read from the sandbox's Hangar root the way the CLI reads it; "" when absent. */
+export function sandboxToken(env: Readonly<Record<string, string | undefined>>): string {
+  try {
+    return readFileSync(join(resolveHangarRoot(env), "token"), "utf8").trim();
+  } catch {
+    return "";
+  }
 }
 
 export type SpawnedHangar = {
@@ -100,7 +112,9 @@ export async function spawnHangar(
       if (done) return;
     }
   })();
-  const { port, ...home } = address;
+  const { port, url } = address;
+  // No boot link is printed either: the first session mints its own with Home's key.
+  const home: HomeAddress = { url, token: sandboxToken(env), bootPath: "" };
   return {
     pid: child.pid,
     port,

@@ -138,6 +138,8 @@ describe.skipIf(process.platform === "win32")("real spawns", () => {
       expect(prose).toContain("banner: starting up { not an event }");
       expect(prose).toContain("here is a brace { and a close } inline");
       expect(prose).not.toContain('"kind":"run_start"');
+      // The job's run records are closed before the harness is removed.
+      await supervisor.idle();
       supervisor.close();
     },
     TIMEOUT_MS,

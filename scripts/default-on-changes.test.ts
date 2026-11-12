@@ -24,8 +24,9 @@
  * `crewhaus serve --mcp --sse` listens on and the bearer it asks for, the check a
  * served tool call's message passes before its turn and what `--host` needs, the
  * file a managed daemon saves a generated signing secret to, and the preflight finding
- * for a harness directory that holds the home directory, with its start line. A
- * change reverted or scoped to the block stops being found, and a new root, tool,
+ * for a harness directory that holds the home directory, with its start line, the
+ * exit a refused daemon start gives now that it writes a receipt, and every CLI
+ * verb that takes a harness's mutating lease. A change reverted or scoped to the block stops being found, and a new root, tool,
  * header line, edge warning, verdict that moved, stopping shape or refused leaf
  * fails until the notes name it. Each scan also asserts it found something, so a
  * scan that silently matches nothing fails too.
@@ -52,13 +53,22 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { runDaemonCommand } from "../apps/cli/src/daemon-cmd";
+import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
 import { createContinuityStore } from "../packages/continuity-store/src/index";
-import { DECISION_LOG_KEYS } from "../packages/control-contract/src/index";
+import {
+  DECISION_LOG_KEYS,
+  EXIT_FOR_ERROR,
+  EXIT_FOR_REJECTED_RECEIPT,
+} from "../packages/control-contract/src/index";
+import { foldStates } from "../packages/control-records/src/index";
+import { commandsLedgerOf } from "../packages/control-service/src/index";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
 import { countPendingApprovals } from "../packages/gateway-protocol/src/control";
+import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import type { IrManagedV0 } from "../packages/ir/src/index";
 import { _setCompactSeamsForTest, createMemoryStore } from "../packages/memory-store/src/index";
@@ -1684,6 +1694,178 @@ describe("the release notes name run input screened where it enters", () => {
     };
     expect(probe.control).toBe(true);
     if (probe.changed) expect(runInput).toContain("`tool`");
+  });
+});
+
+/**
+ * Run identity and run records. A run's id has one form, and every run
+ * records its start, its park and its end. Both reach every harness without a
+ * spec opting in, so the list names both, and each check runs the change
+ * itself and requires its bullet unconditionally: reverting either fails.
+ */
+describe("the release notes name run ids and run records", () => {
+  const later = defaultOnBullets(changelog, LATER_HEADINGS);
+
+  test("a run's id is canonical, and the list says what it looks like", async () => {
+    const { CANONICAL_RUN_ID_RE } = await import("../packages/control-contract/src/index");
+    expect(createRunContext().runId).toMatch(CANONICAL_RUN_ID_RE);
+    const bullet = later.find((b) => b.includes("`run_`") && b.includes("26")) ?? "";
+    expect(bullet).toContain("26");
+    expect(bullet).toContain("`run_`");
+  });
+
+  test("a run writes its rows, where the list says, and the list names the switch", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { RUN_LEDGER_DIR, runLedgerAt } = await import("../packages/runtime-core/src/run-ledger");
+    const { RUN_LEDGER_DIR: SUPERVISOR_DIR } = await import(
+      "../packages/harness-supervisor/src/run-rows"
+    );
+    const { RUNS_LEDGER_DIR: RESUME_DIR } = await import("../apps/cli/src/runs");
+    const { readPage } = await import("../packages/control-records/src/index");
+    const harness = mkdtempSync(join(tmpdir(), "default-on-run-rows-"));
+    try {
+      const saved = process.env["CREWHAUS_RUN_LEDGER"];
+      Reflect.deleteProperty(process.env, "CREWHAUS_RUN_LEDGER");
+      try {
+        await runChatLoop({
+          model: "test-model",
+          instructions: "x",
+          singleTurn: true,
+          seedMessages: [{ role: "user", content: "hi" }],
+          permissionMode: "bypass",
+          installSigintHandler: false,
+          spinner: false,
+          stdout: () => {},
+          settingsDir: null,
+          sessionRootDir: join(harness, "sessions"),
+          runLedgerDir: harness,
+          _adapter: {
+            providerId: "anthropic",
+            features: {
+              caching: "explicit",
+              tool_use: true,
+              vision: true,
+              thinking: true,
+              web_search: false,
+            },
+            estimateTokens: () => 1,
+            async *stream() {
+              yield { kind: "message_start", usage: { input: 1, output: 0 } };
+              yield {
+                kind: "message_delta",
+                stopReason: "end_turn",
+                usage: { input: 0, output: 1 },
+              };
+              yield { kind: "message_stop" };
+            },
+          },
+        });
+      } finally {
+        if (saved !== undefined) process.env["CREWHAUS_RUN_LEDGER"] = saved;
+      }
+      const rows = readPage(runLedgerAt(harness), { limit: 10 }).items.map((i) => i.record);
+      expect(rows.length).toBeGreaterThanOrEqual(2);
+      // One place: the runtime writes, the supervisor closes and `runs resume` reads the same directory.
+      const listed = `${RUN_LEDGER_DIR.split(sep).join("/")}/`;
+      expect(listed).toBe(".crewhaus/run/control/runs/");
+      expect(SUPERVISOR_DIR).toBe(RUN_LEDGER_DIR);
+      expect(RESUME_DIR).toBe(RUN_LEDGER_DIR);
+      const bullet = later.find((b) => b.includes(`\`${listed}\``)) ?? "";
+      expect(bullet).toContain(`\`${listed}\``);
+      expect(bullet).toContain("`CREWHAUS_RUN_LEDGER=0`");
+    } finally {
+      rmSync(harness, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Receipts and the mutating lease. Every daemon verb and every Home change now
+ * writes a receipt first, a refused daemon start exits with the rejected-receipt
+ * code where it exited 1, and the CLI's long verbs take the harness's mutating
+ * lease. Each is found where it happens: a start refused against a running
+ * daemon, and every lease call site in the CLI with the verb it names. A verb
+ * that starts taking the lease fails until the list names it.
+ */
+describe("the release notes name the receipts and the lease every harness meets", () => {
+  const bullet = (): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+      b.includes("`.crewhaus/run/control/`"),
+    ) ?? "";
+
+  test("a refused daemon start writes a receipt and exits with the rejected-receipt code", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "default-on-receipts-")));
+    try {
+      const dir = join(root, "harness");
+      mkdirSync(join(dir, "dist"), { recursive: true });
+      writeFileSync(join(dir, "dist", "daemon.ts"), "// compiled bundle\n");
+      writeFileSync(
+        join(dir, "crewhaus.yaml"),
+        [
+          "name: receipts-fixture",
+          "target: channel",
+          "agent:",
+          "  model: anthropic/claude-sonnet-4",
+          "  instructions: |",
+          "    A fixture.",
+          "routing:",
+          "  sessionKey: channel",
+          "",
+        ].join("\n"),
+      );
+      const opts = {
+        env: { CREWHAUS_REGISTRY_ROOT: join(root, "registry"), CREWHAUS_NO_REGISTRY: "1" },
+        ops: createTestProcessOps(() => Date.now()),
+        cwd: dir,
+      };
+      // The control: a first start runs.
+      const first = await runDaemonCommand(["start", "--no-preflight"], opts);
+      expect(first.exitCode).toBe(0);
+      const again = await runDaemonCommand(["start", "--no-preflight"], opts);
+      expect(again.lines[0]).toContain("already running");
+      expect(again.exitCode).toBe(EXIT_FOR_REJECTED_RECEIPT);
+      expect(again.exitCode).not.toBe(1);
+      const fold = foldStates(commandsLedgerOf(dir));
+      expect(fold.ok && [...fold.objects.values()].map((o) => o.state)).toEqual([
+        "succeeded",
+        "rejected",
+      ]);
+      await runDaemonCommand(["stop"], opts);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const named = bullet();
+    for (const word of [
+      "`stop`",
+      "`restart`",
+      "`drain`",
+      `exit ${EXIT_FOR_REJECTED_RECEIPT}, where they exited 1`,
+      `exits ${EXIT_FOR_ERROR.unavailable}`,
+      "400",
+    ]) {
+      expect(named).toContain(word);
+    }
+  }, 20_000); // a daemon start and stop through the real supervisor
+
+  test("every CLI verb that takes the mutating lease is named, with the exit it refuses with", () => {
+    const cliSrc = join(ROOT, "apps", "cli", "src");
+    const verbs = new Set<string>();
+    let files = 0;
+    for (const name of readdirSync(cliSrc)) {
+      if (!name.endsWith(".ts") || name.endsWith(".test.ts") || name === "mutating-lease.ts") {
+        continue;
+      }
+      files += 1;
+      const source = readFileSync(join(cliSrc, name), "utf8");
+      for (const m of source.matchAll(/(?:hold|with)CliMutatingLease\([^;]*?,\s*"([^"]+)"/g)) {
+        verbs.add(m[1] as string);
+      }
+    }
+    expect(files).toBeGreaterThan(10);
+    expect(verbs.size).toBeGreaterThanOrEqual(5);
+    const named = bullet();
+    expect([...verbs].filter((verb) => !named.includes(`\`${verb}\``))).toEqual([]);
+    expect(named).toContain(`exit ${LEASE_BUSY_EXIT}`);
   });
 });
 

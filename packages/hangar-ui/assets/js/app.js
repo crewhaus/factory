@@ -1,8 +1,9 @@
 /**
- * Hangar console entry. Boot order: token bootstrap (read `#t=<token>`
- * from the URL fragment into sessionStorage and strip it via replaceState),
- * theme, shell render, router start, version footer. Booting is guarded on
- * `document` existing so the module can be imported by tests.
+ * Hangar console entry. Boot order: theme, sign-in (`sign-in.js`: a one-time
+ * `#x=` code from a boot link, this tab's session, this browser's own key, or
+ * the sign-in screen), then shell render, router start, version footer.
+ * Booting is guarded on `document` existing so the module can be imported by
+ * tests.
  *
  * M2 adds the fleet-wide nav (Runs, Approvals, Review, Activity) with live
  * counts, and gives the harness header its supervision pill, bundle
@@ -21,7 +22,7 @@
  * screen still answers, so no URL an operator saved goes dead.
  */
 
-import { ApiError, api, onUnauthorized, setToken } from "./api.js";
+import { ApiError, api, onUnauthorized } from "./api.js";
 import { clear, copyBtn, dot, el, skeleton, toast } from "./dom.js";
 import { bindingSheet, globalKey, initialKeyState, keyShape } from "./keys.js";
 import { notifications } from "./notify.js";
@@ -44,6 +45,7 @@ import {
   tabAvailability,
 } from "./router.js";
 import { shapeAccentVars, shapeLabel } from "./shapes.js";
+import * as signIn from "./sign-in.js";
 import { procRow } from "./supervision.js";
 import { openDialog } from "./ui/dialog.js";
 import { installLive } from "./ui/live.js";
@@ -74,10 +76,10 @@ import { renderSchedulers } from "./views/schedulers.js";
 import { renderSecurity } from "./views/security.js";
 import { renderSessions } from "./views/sessions.js";
 import { renderSettings } from "./views/settings.js";
+import { SESSION_ENDED, openSignInDialog, renderSignInScreen } from "./views/sign-in.js";
 import { renderSpecEdit } from "./views/spec-edit.js";
 import { renderSpec } from "./views/spec.js";
 import { renderThredz, renderThredzGlobal } from "./views/thredz.js";
-import { renderTokenScreen } from "./views/token.js";
 
 const TAB_LABELS = {
   overview: "Overview",
@@ -130,20 +132,12 @@ let keyState = initialKeyState();
 let omnibox = null;
 let sheet = null;
 let notificationsStarted = false;
-
-/** Move a `#t=<token>` fragment into sessionStorage and off the URL. */
-function bootstrapToken() {
-  const m = window.location.hash.match(/^#t=(.+)$/);
-  if (m === null) return;
-  let token = m[1];
-  try {
-    token = decodeURIComponent(token);
-  } catch {
-    // keep the raw fragment
-  }
-  setToken(token);
-  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/`);
-}
+/** The sign-in dialog is up over the shell: a 401 now has nothing more to do,
+ *  and the background loops stay stopped until it is done. */
+let signInShowing = false;
+/** The last navigation met a 401 the silent sign-in could not cure, so the
+ *  view holds a skeleton; the next sign-in draws it. */
+let viewStale = false;
 
 /** Theme and Readability go on the root before the first paint, so nothing
  *  draws once in the wrong size or colours. The record lives in prefs.js,
@@ -376,7 +370,7 @@ function startNotifications() {
   // costs the server, and take a fresh reading the moment it comes back.
   document.addEventListener("visibilitychange", () => {
     if (document.hidden === true) notifications.stop();
-    else notifications.start();
+    else if (!signInShowing) notifications.start();
   });
 }
 
@@ -404,6 +398,7 @@ async function dispatch(route) {
   // rather than sniffed from the DOM so the ownership rule stays a pure
   // input to the `keys.js` reducer.
   keyState = { ...keyState, inboxMounted: route.view === "approvals" || route.view === "review" };
+  viewStale = false;
   clear(viewRoot).appendChild(skeleton(6));
   try {
     if (route.view === "library") {
@@ -435,7 +430,10 @@ async function dispatch(route) {
     }
   } catch (err) {
     if (seq !== dispatchSeq) return; // superseded by a newer navigation
-    if (err instanceof ApiError && err.status === 401) return; // token screen owns the view
+    if (err instanceof ApiError && err.status === 401) {
+      viewStale = true; // sign-in is on screen; it draws this view when done
+      return;
+    }
     renderError(viewRoot, err);
   }
 }
@@ -818,26 +816,77 @@ function drawSheet() {
   });
 }
 
-function boot() {
-  bootstrapToken();
+async function boot() {
   initTheme();
   installLive();
   installTooltips();
   const appRoot = document.getElementById("app");
-  renderShell(appRoot);
-  onUnauthorized(() => {
-    renderTokenScreen(viewRoot, () => {
-      loadVersion();
-      loadNavCounts();
-      // The polls that ran while the token was missing answered 401 and
-      // returned nothing; take a reading now rather than at the next tick.
-      notifications.refresh();
-      dispatch(parseRoute(window.location.hash));
+  // Signed back in after a 401. The request that met it is sent again by
+  // api.js, so the view and anything typed into it stay as they are: only the
+  // shell's own readings are taken again (the polls that ran while the session
+  // was missing returned nothing). A view whose own load was refused, or a run
+  // stream that ended with its session, is drawn again; neither holds a draft.
+  const resume = () => {
+    if (document.hidden !== true) notifications.start();
+    loadNavCounts();
+    notifications.refresh();
+    if (viewStale) dispatch(parseRoute(window.location.hash));
+  };
+  // The silent sign-in failed: ask over the view, never instead of it, so a
+  // draft survives and focus goes back to it once the tab is signed in.
+  const askToSignIn = () => {
+    signInShowing = true;
+    notifications.stop();
+    openSignInDialog({
+      message: SESSION_ENDED,
+      onSignedIn: () => {
+        signInShowing = false;
+        resume();
+      },
+      onClose: () => {
+        // Dismissed without signing in: the next request that meets a 401 asks again.
+        signInShowing = false;
+      },
     });
-  });
-  startRouter((route) => {
-    dispatch(route);
-  });
+  };
+  // Several requests can answer 401 at once; they all wait on one attempt.
+  let reauth = null;
+  const start = () => {
+    renderShell(appRoot);
+    onUnauthorized((info) => {
+      if (signInShowing) return false;
+      if (reauth === null) {
+        reauth = signIn
+          .recover()
+          .then((ok) => {
+            if (ok) resume();
+            else askToSignIn();
+            return ok;
+          })
+          .finally(() => {
+            reauth = null;
+          });
+      }
+      return reauth.then((ok) => {
+        if (ok && info?.stream === true) dispatch(parseRoute(window.location.hash));
+        return ok;
+      });
+    });
+    startRouter((route) => {
+      dispatch(route);
+    });
+  };
+  const signedIn = await signIn.boot();
+  if (signedIn.navigating === true) return;
+  if (signedIn.signedIn) {
+    start();
+    return;
+  }
+  // Nothing on screen asks the server for anything until this tab is signed in.
+  clear(appRoot);
+  const main = el("main", { class: "view", id: "view", tabindex: "-1" });
+  appRoot.appendChild(main);
+  renderSignInScreen(main, { message: signedIn.message ?? "", onSignedIn: start });
 }
 
 if (typeof document !== "undefined") boot();

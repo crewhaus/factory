@@ -21,7 +21,7 @@
  * `sub_agent_end` events on the parent's existing `EventLog`; the child's
  * own transcript lives in a separate `<childSessionId>.jsonl` file.
  */
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
 import type { FailureReport } from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
@@ -36,7 +36,7 @@ import type {
 } from "@crewhaus/ir";
 import type { JustificationJudge, PermissionMode, RuleSet } from "@crewhaus/permission-engine";
 import type { NamedFailureClass } from "@crewhaus/recovery-engine";
-import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { type RunContext, createRunContext, lineageOf, mintRunId } from "@crewhaus/run-context";
 import type { PendingApproval, PendingApprovalStore } from "@crewhaus/session-store";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import { type Store, createStore } from "@crewhaus/state-store";
@@ -634,8 +634,9 @@ export type CreateIsolatedContextOptions = {
  * Build an `IsolatedContext` rooted under the parent's abort signal.
  *
  * Identity:
- *   - Fresh `runId` (8 hex) and fresh `sessionId` (sess_<16 hex>) via
- *     `createRunContext`.
+ *   - Fresh canonical `runId` (`mintRunId()`) and fresh `sessionId`
+ *     (sess_<16 hex>) via `createRunContext`; the child's context names the
+ *     parent's run as its `parent` (`lineageOf`).
  *   - The child's `EventLog` is opened against the same `sessionRootDir`
  *     as the parent so logs collocate, but writes to a different file.
  *   - The state container starts empty — no parent state bleeds in.
@@ -655,14 +656,14 @@ export async function createIsolatedContext(
   // soon as we mint the child's RunContext.
   const abortTree = createAbortTree(parent.runContext.abortSignal);
 
-  // Fresh identity. createRunContext mints randomBytes(8)→sess_<16hex> and
-  // a short runId; we let the parent's logger seed the child's logger so
+  // Fresh identity: a canonical run id from the one minter and a
+  // sess_<16hex> session id; we let the parent's logger seed the child's logger so
   // every log line carries the inherited app/session bindings. The child's
   // event bus inherits the parent's traceId and is rooted under the parent
   // bus's currently-open span, so OpenTelemetry stitches both runs into one
   // trace. The runId/sessionId on the child's events differ from the parent's
   // so subscribers can still distinguish per-run aggregates.
-  const childRunId = `run_${randomUUID().slice(0, 8)}`;
+  const childRunId = mintRunId();
   const childSessionId = `sess_${randomBytes(8).toString("hex")}`;
   const childBus = new TraceEventBus({
     runId: childRunId,
@@ -677,6 +678,7 @@ export async function createIsolatedContext(
     abortSignal: abortTree.signal,
     logger: parent.runContext.logger,
     eventBus: childBus,
+    ...lineageOf(parent.runContext),
   });
   // Track 10 / v0.3.0 §7.1 — stamp the child's identity at mint time so
   // child-attributed writes (plan_update / wiki_write / audit entries)

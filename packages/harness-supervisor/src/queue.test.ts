@@ -446,3 +446,42 @@ describe("recent() — terminal jobs stay visible", () => {
     expect(q2.recent(1)).toHaveLength(1);
   });
 });
+
+describe("a job carries the command it runs for", () => {
+  const CMD = "cmd_01m76e6f05hp514w9j4v3qymkt";
+  const BY = `local:#${"a".repeat(64)}`;
+
+  for (const [name, makeStore] of [
+    ["file", () => createFileJobStore(join(tempDir(), "jobs.jsonl"))],
+    ["memory", () => createMemoryJobStore()],
+  ] as const) {
+    test(`commandId and by are on the submitted record and round-trip the ${name} store`, async () => {
+      const store = makeStore();
+      const ctl = controllable();
+      const queue = createJobQueue({ store, run: ctl.run });
+      const job = queue.submit({
+        harnessDir: "/a",
+        kind: "eval",
+        argv: ["eval"],
+        commandId: CMD,
+        by: BY,
+      });
+      expect(job.commandId).toBe(CMD);
+      expect(job.by).toBe(BY);
+      ctl.finish(job.jobId);
+      await queue.idle();
+      const folded = store.read().find((j) => j.jobId === job.jobId);
+      expect(folded?.commandId).toBe(CMD);
+      expect(folded?.by).toBe(BY);
+      expect(folded?.state).toBe("done");
+    });
+  }
+
+  test("a job submitted without them carries neither field", () => {
+    const store = createMemoryJobStore();
+    const queue = createJobQueue({ store, run: controllable().run });
+    const job = queue.submit({ harnessDir: "/a", kind: "doctor", argv: ["doctor"] });
+    expect(Object.keys(job)).not.toContain("commandId");
+    expect(Object.keys(job)).not.toContain("by");
+  });
+});
