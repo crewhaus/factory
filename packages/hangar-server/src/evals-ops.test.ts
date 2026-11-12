@@ -1049,7 +1049,7 @@ describe("the flywheel's workflow listing", () => {
   });
 
   /**
-   * The drift guard, in the shape `cli-twins.test.ts` established: the CLI
+   * A drift guard: the CLI
    * source is READ, never imported (`apps/cli` depends on this package, not
    * the other way round). Each scaffolder constant must be DERIVED from
    * `SCAFFOLDED_WORKFLOWS` — re-hardcoding a filename in either file is how

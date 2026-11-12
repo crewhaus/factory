@@ -23,28 +23,34 @@ import { openDialog } from "../ui/dialog.js";
  * The CLI twin line: the exact command, monospaced, with a copy button.
  * `note` renders instead when there is no CLI verb yet — an honest absence
  * beats an invented command.
+ *
+ * `label` names the action the twin mirrors ("pass", "Grant") where a row
+ * shows several: it replaces "CLI twin" as the visible label, and the copy
+ * button says which command it copies, so twins that differ only late in a
+ * long line are told apart without scrolling, and by name.
  */
-export function cliTwin(command, note = null) {
+export function cliTwin(command, note = null, label = null) {
+  const named = typeof label === "string" && label !== "" ? label : null;
+  const tag = el("span", { class: "twin-label", text: named ?? "CLI twin" });
   if (typeof command !== "string" || command === "") {
     return note === null
       ? null
-      : el("div", { class: "twin twin-none" }, [
-          el("span", { class: "twin-label", text: "CLI twin" }),
-          el("span", { class: "muted", text: note }),
-        ]);
+      : el("div", { class: "twin twin-none" }, [tag, el("span", { class: "muted", text: note })]);
   }
+  const copy = copyBtn(command, "copy");
+  if (named !== null) copy.setAttribute("aria-label", `Copy the ${named} command`);
   // The command scrolls sideways rather than wrapping (a wrapped command is
   // hard to read back), so it is a Tab stop: a keyboard can reach its end.
   return el("div", { class: "twin" }, [
-    el("span", { class: "twin-label", text: "CLI twin" }),
+    tag,
     el("code", { class: "twin-cmd", tabindex: "0", text: command }),
-    copyBtn(command, "copy"),
+    copy,
   ]);
 }
 
 /** The twin for a named action (see `cliTwinFor`), or its honest absence. */
-export function actionTwin(action, args) {
-  return cliTwin(cliTwinFor(action, args), NO_TWIN_NOTES[action] ?? null);
+export function actionTwin(action, args, label = null) {
+  return cliTwin(cliTwinFor(action, args), NO_TWIN_NOTES[action] ?? null, label);
 }
 
 /**

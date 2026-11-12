@@ -256,8 +256,8 @@ function draw(root, rows, groups, opts = {}) {
   if (rows.length === 0) {
     main.appendChild(
       emptyState(
-        "No harnesses registered yet",
-        "crewhaus harness add <dir> (or Scan a root above)",
+        "No harnesses registered yet. Add one, or scan a folder above.",
+        "crewhaus harness add <dir>",
       ),
     );
   } else if (visible.length === 0) {

@@ -157,7 +157,8 @@ export const ADVISOR_JOB_ARGV: Readonly<Record<string, readonly string[]>> = {
   "models-explain": ["models", "explain", "crewhaus.yaml"],
 };
 
-const CLI_TWIN: Readonly<Record<string, string>> = {
+/** The command each advisor job kind runs, shown beside its action. */
+export const ADVISOR_CLI_TWINS: Readonly<Record<string, string>> = {
   doctor: "crewhaus doctor",
   compile: "crewhaus compile crewhaus.yaml -o dist",
   eval: EVAL_COMMAND,
@@ -173,7 +174,7 @@ const CLI_TWIN: Readonly<Record<string, string>> = {
 const jobAction = (jobKind: string, label: string): AdvisorAction => ({
   kind: "job",
   label,
-  cliTwin: CLI_TWIN[jobKind] ?? null,
+  cliTwin: ADVISOR_CLI_TWINS[jobKind] ?? null,
   jobKind,
 });
 
@@ -1536,13 +1537,13 @@ export const advisorIssueSubmit: M3Handler = (ctx) => {
       ready: kind !== "note",
       jobId,
       jobKind: kind === "note" ? null : kind,
-      cliTwin: kind === "note" ? null : (CLI_TWIN[kind] ?? null),
+      cliTwin: kind === "note" ? null : (ADVISOR_CLI_TWINS[kind] ?? null),
       note:
         kind === "note"
           ? "recorded only — no update was queued; pick a kind to turn it into one"
           : kind === "optimize"
             ? "queued the optimize loop — its patch lands as a reviewable spec update, never an automatic write"
-            : `queued ${CLI_TWIN[kind] ?? kind} — watch it in the job queue`,
+            : `queued ${ADVISOR_CLI_TWINS[kind] ?? kind} — watch it in the job queue`,
     },
   };
   appendAdvisorLine(ctx, "issues.jsonl", issue);

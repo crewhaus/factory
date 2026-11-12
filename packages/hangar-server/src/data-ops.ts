@@ -62,6 +62,7 @@ import { readJsonlCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
 import { isDryRun, jobArg, requireString } from "./m3";
 import { maskDeep, maskText } from "./mask";
+import { twinWord } from "./twin-word";
 
 const REGISTRY_SEGMENTS: readonly string[] = [".crewhaus", "datasets"];
 const QUARANTINE_SEGMENTS: readonly string[] = [".crewhaus", "datasets", "_quarantine"];
@@ -93,7 +94,9 @@ const specNameOf = (ctx: M3Context): string => ctx.entry?.specName ?? "spec";
  *  gate; a hand edit to either is overwritten by the next run. */
 function autoMaintained(ctx: M3Context, name: string): string | null {
   const spec = specNameOf(ctx);
-  if (name === `${spec}-ratings`) return "rebuilt by `crewhaus distill --register`";
+  if (name === `${spec}-ratings`) {
+    return `rebuilt by \`crewhaus distill --all-sessions --register ${twinWord(name, "<dataset>")}\``;
+  }
   if (name === `${spec}-regressions`) return "rebuilt by the eval gate's regression union";
   return null;
 }
@@ -223,7 +226,10 @@ export const datasets: M3Handler = async (ctx) => {
   }
   if (rows.length === 0) {
     return {
-      ...absent("no datasets registered on this harness", "crewhaus distill --register"),
+      ...absent(
+        "no datasets registered on this harness",
+        "crewhaus distill --all-sessions --register <dataset>",
+      ),
       datasets: rows,
       root: REGISTRY_SEGMENTS.join("/"),
     };
@@ -247,7 +253,10 @@ export const dataset: M3Handler = async (ctx) => {
   const { versions, records } = await loadVersions(ctx, name);
   if (versions.length === 0) {
     return {
-      ...absent(`no dataset "${name}" in this harness's registry`, "crewhaus distill --register"),
+      ...absent(
+        `no dataset "${name}" in this harness's registry`,
+        "crewhaus distill --all-sessions --register <dataset>",
+      ),
       name,
       versions: [],
       autoMaintained: autoMaintained(ctx, name),
@@ -305,7 +314,10 @@ export const datasetStatus: M3Handler = async (ctx) => {
   const names = await datasetNames(ctx);
   if (names.length === 0) {
     return {
-      ...absent("no datasets registered on this harness", "crewhaus distill --register"),
+      ...absent(
+        "no datasets registered on this harness",
+        "crewhaus distill --all-sessions --register <dataset>",
+      ),
       datasets: [],
     };
   }
@@ -476,7 +488,10 @@ export const datasetVerify: M3Handler = async (ctx) => {
     // registry simply holds no such dataset, and the panel renders that
     // beside the name the operator typed.
     return {
-      ...absent(`no dataset "${name}" in this harness's registry`, "crewhaus distill --register"),
+      ...absent(
+        `no dataset "${name}" in this harness's registry`,
+        "crewhaus distill --all-sessions --register <dataset>",
+      ),
       name,
       results: [],
       tampered: [],
@@ -720,7 +735,7 @@ export const datasetRefreshGoldens: M3Handler = (ctx) => {
       dry
         ? "preview queued — the verb proposes gold updates as a review diff and writes nothing"
         : "queued with --apply — it writes a NEW registry version, never in place",
-      "crewhaus dataset refresh-goldens",
+      ["crewhaus", ...argv.map((word) => twinWord(word, "<dataset>"))].join(" "),
     ),
     dryRun: dry,
     plan: {

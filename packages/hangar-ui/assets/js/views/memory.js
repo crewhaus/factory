@@ -212,7 +212,7 @@ function dreamCard(data, ctx, reload) {
   const specs = Array.isArray(data?.specs) ? data.specs : [];
   // Dream is a read-only timer row in control.v1 — there is nothing to poke,
   // so "Run now" goes through the job queue, exactly as the CLI would.
-  const runNow = jobButton("Run now", ctx.id, "dream-run", undefined, reload);
+  const runNow = jobButton("Run now", ctx.id, "dream-run", undefined, reload, ctx.dir);
   if (specs.length === 0) {
     return card("Dream", [
       emptyState("No dream state yet", "crewhaus dream run crewhaus.yaml"),

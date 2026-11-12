@@ -43,6 +43,7 @@ import {
 } from "@crewhaus/access-control";
 import { type HangarRegistry, openHangarRegistry } from "@crewhaus/harness-registry";
 import { defaultIsPidAlive, readHangarLock, resolveHangarRoot } from "./hangar-cmd";
+import type { CliFamily } from "./verbs";
 
 export type AccessCommandResult = {
   readonly lines: readonly string[];
@@ -93,6 +94,64 @@ const ACCESS_USAGE_LINES: readonly string[] = [
   "  <dur> is like 30m, 24h or 7d. These verbs work with Home stopped; a proxy change",
   "  takes effect when Home next starts.",
 ];
+
+/**
+ * The `access` family in the CLI's verb inventory (`verbs.ts`): each sub-verb
+ * and the flags its parser takes. A `values` flag may be repeated; a `value`
+ * flag is given once. Every `parseArgs` call below reads its flags from here,
+ * and the key order is the order the unknown-verb message lists them in.
+ */
+export const CLI_FAMILY = {
+  verb: "access",
+  since: "0.9.0",
+  sub: {
+    members: { flags: { json: "boolean" } },
+    invite: {
+      flags: {
+        role: "value",
+        home: "boolean",
+        group: "value",
+        harness: "value",
+        expires: "value",
+      },
+    },
+    grant: {
+      flags: {
+        member: "value",
+        role: "value",
+        home: "boolean",
+        group: "value",
+        harness: "value",
+        expires: "value",
+        create: "boolean",
+      },
+    },
+    revoke: { flags: { member: "value" } },
+    link: { flags: { member: "value", create: "boolean" } },
+    unlink: { flags: {} },
+    tokens: { flags: { json: "boolean" } },
+    mint: {
+      flags: {
+        service: "value",
+        permission: "values",
+        harness: "values",
+        content: "boolean",
+        subject: "boolean",
+        expires: "value",
+      },
+    },
+    sync: { flags: {} },
+    proxy: {
+      flags: {
+        header: "value",
+        peer: "values",
+        host: "values",
+        socket: "boolean",
+        off: "boolean",
+      },
+    },
+  },
+} as const satisfies CliFamily;
 
 // ---------------------------------------------------------------------------
 // Argument parsing (harness-cmd posture: throw plain Errors)
@@ -387,7 +446,7 @@ function memberLine(session: Session, member: MemberView, tokens: readonly Token
 }
 
 function membersVerb(session: Session, argv: readonly string[]): AccessCommandResult {
-  const args = parseArgs("members", argv, { json: "boolean" });
+  const args = parseArgs("members", argv, CLI_FAMILY.sub.members.flags);
   noPositional("members", args);
   const json = args.booleans.has("json");
   const read = loadAccessSnapshot(session.root);
@@ -425,7 +484,7 @@ function membersVerb(session: Session, argv: readonly string[]): AccessCommandRe
 }
 
 function tokensVerb(session: Session, argv: readonly string[]): AccessCommandResult {
-  const args = parseArgs("tokens", argv, { json: "boolean" });
+  const args = parseArgs("tokens", argv, CLI_FAMILY.sub.tokens.flags);
   noPositional("tokens", args);
   const json = args.booleans.has("json");
   const read = loadAccessSnapshot(session.root);
@@ -456,13 +515,7 @@ function tokensVerb(session: Session, argv: readonly string[]): AccessCommandRes
 // ---------------------------------------------------------------------------
 
 async function inviteVerb(session: Session, argv: readonly string[]): Promise<AccessCommandResult> {
-  const args = parseArgs("invite", argv, {
-    role: "value",
-    home: "boolean",
-    group: "value",
-    harness: "value",
-    expires: "value",
-  });
+  const args = parseArgs("invite", argv, CLI_FAMILY.sub.invite.flags);
   noPositional("invite", args);
   const role = roleOf("invite", requireValue("invite", args, "role"));
   const ttlMs = boundedDuration(one(args, "expires"), INVITE_TTL_MS.max, "an invite");
@@ -490,15 +543,7 @@ async function inviteVerb(session: Session, argv: readonly string[]): Promise<Ac
 }
 
 async function grantVerb(session: Session, argv: readonly string[]): Promise<AccessCommandResult> {
-  const args = parseArgs("grant", argv, {
-    member: "value",
-    role: "value",
-    home: "boolean",
-    group: "value",
-    harness: "value",
-    expires: "value",
-    create: "boolean",
-  });
+  const args = parseArgs("grant", argv, CLI_FAMILY.sub.grant.flags);
   noPositional("grant", args);
   const ref = requireValue("grant", args, "member");
   const role = roleOf("grant", requireValue("grant", args, "role"));
@@ -529,7 +574,7 @@ async function grantVerb(session: Session, argv: readonly string[]): Promise<Acc
 }
 
 async function revokeVerb(session: Session, argv: readonly string[]): Promise<AccessCommandResult> {
-  const args = parseArgs("revoke", argv, { member: "value" });
+  const args = parseArgs("revoke", argv, CLI_FAMILY.sub.revoke.flags);
   const member = one(args, "member");
   if (member !== undefined) {
     noPositional("revoke", args);
@@ -570,7 +615,7 @@ async function revokeVerb(session: Session, argv: readonly string[]): Promise<Ac
 }
 
 async function linkVerb(session: Session, argv: readonly string[]): Promise<AccessCommandResult> {
-  const args = parseArgs("link", argv, { member: "value", create: "boolean" });
+  const args = parseArgs("link", argv, CLI_FAMILY.sub.link.flags);
   noPositional("link", args, 1);
   const subject = args.positional[0];
   if (subject === undefined) {
@@ -595,7 +640,7 @@ async function linkVerb(session: Session, argv: readonly string[]): Promise<Acce
 }
 
 async function unlinkVerb(session: Session, argv: readonly string[]): Promise<AccessCommandResult> {
-  const args = parseArgs("unlink", argv, {});
+  const args = parseArgs("unlink", argv, CLI_FAMILY.sub.unlink.flags);
   noPositional("unlink", args, 1);
   const ref = args.positional[0];
   if (ref === undefined)
@@ -611,14 +656,7 @@ async function unlinkVerb(session: Session, argv: readonly string[]): Promise<Ac
 }
 
 async function mintVerb(session: Session, argv: readonly string[]): Promise<AccessCommandResult> {
-  const args = parseArgs("mint", argv, {
-    service: "value",
-    permission: "values",
-    harness: "values",
-    content: "boolean",
-    subject: "boolean",
-    expires: "value",
-  });
+  const args = parseArgs("mint", argv, CLI_FAMILY.sub.mint.flags);
   noPositional("mint", args);
   const service = requireValue("mint", args, "service");
   const permissions = many(args, "permission");
@@ -651,7 +689,7 @@ async function mintVerb(session: Session, argv: readonly string[]): Promise<Acce
 }
 
 async function syncVerb(session: Session, argv: readonly string[]): Promise<AccessCommandResult> {
-  const args = parseArgs("sync", argv, {});
+  const args = parseArgs("sync", argv, CLI_FAMILY.sub.sync.flags);
   noPositional("sync", args);
   const read = loadAccessSnapshot(session.root);
   if (read.state === "absent") {
@@ -709,13 +747,7 @@ async function sha256Hex(text: string): Promise<string> {
  * settings. Only this Home's owner may change it, and Home reads it when it starts.
  */
 async function proxyVerb(session: Session, argv: readonly string[]): Promise<AccessCommandResult> {
-  const args = parseArgs("proxy", argv, {
-    header: "value",
-    peer: "values",
-    host: "values",
-    socket: "boolean",
-    off: "boolean",
-  });
+  const args = parseArgs("proxy", argv, CLI_FAMILY.sub.proxy.flags);
   noPositional("proxy", args);
   const header = one(args, "header");
   const peers = many(args, "peer");
@@ -856,7 +888,7 @@ export async function runAccessCommand(
       return proxyVerb(session, rest);
     default:
       throw new Error(
-        `access: unknown verb "${verb}" (expected: members, invite, grant, revoke, link, unlink, tokens, mint, sync, proxy)`,
+        `access: unknown verb "${verb}" (expected: ${Object.keys(CLI_FAMILY.sub).join(", ")})`,
       );
   }
 }

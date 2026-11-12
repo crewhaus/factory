@@ -251,7 +251,10 @@ function renderShell(appRoot) {
   firstRunRoot = el("div", { class: "firstrun-slot", id: "first-run" });
   viewRoot = el("main", { class: "view", id: "view", tabindex: "-1" });
   footRoot = el("footer", { class: "app-foot", id: "foot" }, [
-    el("span", { class: "muted", text: "every action shows the CLI command it runs" }),
+    el("span", {
+      class: "muted",
+      text: "Actions show their command-line equivalent where one exists.",
+    }),
   ]);
   appRoot.appendChild(skipLink());
   appRoot.appendChild(header);

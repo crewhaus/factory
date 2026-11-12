@@ -71,6 +71,7 @@ import { resolveContained } from "./safety";
 import { readSpecYaml } from "./schedulers";
 import { classifyPath } from "./spec-edit";
 import { keyedScalar } from "./spec-lines";
+import { twinWord } from "./twin-word";
 
 const FEEDBACK_SEGMENTS: readonly string[] = [".crewhaus", "feedback"];
 const WATERMARK_SEGMENTS: readonly string[] = [...FEEDBACK_SEGMENTS, ".distill-state.json"];
@@ -179,6 +180,10 @@ function watermarkFor(ctx: M3Context, records: readonly FeedbackRecord[]): Water
 
 const specNameOf = (ctx: M3Context): string => ctx.entry?.specName ?? "spec";
 
+/** Where "Distill now" writes the dataset and its graders, harness-relative. */
+export const DISTILL_OUT = ".crewhaus/distilled/ratings.jsonl";
+export const DISTILL_GRADERS_OUT = ".crewhaus/distilled/graders.yaml";
+
 // ---------------------------------------------------------------------------
 // The ratings browser
 // ---------------------------------------------------------------------------
@@ -212,7 +217,10 @@ export const feedback: M3Handler = (ctx) => {
   const up = items.filter((i) => i.thumbs === "up" || (i.score ?? 0) > 0.5).length;
   if (items.length === 0) {
     return {
-      ...absent("no ratings recorded on this harness yet", "crewhaus rate"),
+      ...absent(
+        "no ratings recorded on this harness yet",
+        "crewhaus rate --session <session> --turn <turn> --thumbs up|down",
+      ),
       items,
       watermark,
       balance: { up: 0, down: 0, total: 0 },
@@ -226,7 +234,7 @@ export const feedback: M3Handler = (ctx) => {
       corpus.truncated
         ? "the rating corpus was read up to the transcript/line caps — counts are a floor"
         : null,
-      "crewhaus distill",
+      "crewhaus distill --all-sessions --register <dataset>",
     ),
     items,
     watermark,
@@ -246,24 +254,36 @@ export const feedback: M3Handler = (ctx) => {
  *
  * `--register` is a SEPARATE act from producing the dataset: it promotes the
  * result into the registry, where it can gate a release.
+ *
+ * It distills every session's ratings into {@link DISTILL_OUT} and
+ * {@link DISTILL_GRADERS_OUT}, under the harness directory the job runs in,
+ * and its command-line equivalent is that same argv.
  */
 export const distillRun: M3Handler = (ctx) => {
-  const argv = ["distill"];
+  const argv = [
+    "distill",
+    "--all-sessions",
+    "-o",
+    DISTILL_OUT,
+    "--graders-out",
+    DISTILL_GRADERS_OUT,
+  ];
   if (ctx.body["judge"] === true) argv.push("--judge");
   const register = ctx.body["register"] === true;
-  if (register) argv.push("--register");
+  const dataset = ratingsDatasetName(specNameOf(ctx));
+  if (register) argv.push("--register", dataset);
   return {
     ...found(
       register
-        ? `runs the verb AND promotes the result into the registry as ${ratingsDatasetName(specNameOf(ctx))}`
+        ? `runs the verb AND promotes the result into the registry as ${dataset}`
         : "runs the verb — the result is a dataset + graders on disk; promoting them into the registry is the separate --register act",
-      "crewhaus distill",
+      ["crewhaus", ...argv.map((word) => twinWord(word, "<dataset>"))].join(" "),
     ),
     job: ctx.submitJob("distill", argv),
     argv,
     registers: register,
     runtimeNote:
-      "this runs `crewhaus distill`; it does not enable the spec's autoDistill, which the shipped runtime honours only through the CLI",
+      "this runs distill once; it does not enable the spec's autoDistill, which the shipped runtime honours only through the CLI",
   };
 };
 
@@ -767,7 +787,7 @@ export const reactions: M3Handler = (ctx) => {
     };
   }
   return {
-    ...found(caveat, "crewhaus distill"),
+    ...found(caveat, "crewhaus distill --all-sessions --register <dataset>"),
     declared,
     sessionKeyMode: mode,
     collecting,
@@ -801,7 +821,10 @@ export const feedbackFleet: M3Handler = (ctx) => {
   const withRatings = rows.filter((r) => r.total > 0);
   if (withRatings.length === 0) {
     return {
-      ...absent("no harness in the fleet has recorded ratings yet", "crewhaus rate"),
+      ...absent(
+        "no harness in the fleet has recorded ratings yet",
+        "crewhaus rate --session <session> --turn <turn> --thumbs up|down",
+      ),
       harnesses: rows,
       scope: "feedback sinks only — transcripts are not opened on this screen",
     };
@@ -809,7 +832,7 @@ export const feedbackFleet: M3Handler = (ctx) => {
   return {
     ...found(
       "counts fold the .crewhaus/feedback sinks only; in-transcript ratings are counted on each harness's own Feedback tab",
-      "crewhaus distill",
+      "crewhaus distill --all-sessions --register <dataset>",
     ),
     harnesses: rows,
     distillReady: rows.filter((r) => r.unprocessed >= 5).map((r) => r.id),

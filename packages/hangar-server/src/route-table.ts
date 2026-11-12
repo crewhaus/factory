@@ -24,6 +24,7 @@ import {
   type Qualifier,
   type ReceiptMode,
 } from "@crewhaus/control-contract";
+import { ROUTE_TWIN_NOTES } from "./route-twin-notes";
 
 export type RouteRow = {
   /** The console's key; an off-map route's own name. */
@@ -98,6 +99,8 @@ function write(
   extras: WriteExtras = {},
 ): RouteRow {
   const core = extras.kind !== undefined ? COMMAND_KINDS[extras.kind] : undefined;
+  // A write with no core kind says what its command-line equivalent is, or that there is none.
+  const note = extras.note ?? ROUTE_TWIN_NOTES[key];
   return {
     key,
     ...(extras.aliases !== undefined ? { aliases: extras.aliases } : {}),
@@ -111,7 +114,7 @@ function write(
     ...(core === undefined ? { idempotent: method === "PUT" || method === "DELETE" } : {}),
     ...(extras.secretFields !== undefined ? { secretFields: extras.secretFields } : {}),
     cliTwin: core?.cliTwin ?? null,
-    ...(extras.note !== undefined ? { note: extras.note } : {}),
+    ...(note !== undefined ? { note } : {}),
   };
 }
 

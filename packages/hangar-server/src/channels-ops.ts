@@ -917,8 +917,8 @@ export const gateway: M3Handler = async (ctx) => {
     return {
       ...m3Base(
         false,
-        "this spec declares no gateway: block — the daemon serves no /status endpoint and no mini dashboard",
-        "crewhaus lint (after adding a gateway: block to the spec)",
+        "this spec declares no gateway: block — the daemon serves no /status endpoint and no mini dashboard; add one to the spec, then check it with lint",
+        "crewhaus lint",
       ),
       declared: false,
       addBlock: {

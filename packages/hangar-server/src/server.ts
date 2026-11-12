@@ -1011,7 +1011,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       /** The badge queue, newest first. */
       inApp,
       badge: inApp.length,
-      cliTwin: "crewhaus harness list --json  # the same signals, unfiltered",
+      /** No CLI verb shows the same thing yet; said as `null`, never a near-miss. */
+      cliTwin: null,
     };
   };
 
@@ -2391,7 +2392,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
             ? `no proof bundle persisted for ${runId}`
             : `no proof bundle persisted for ${runId} under a harness directory — a managed harness files its bundles under its tenants root (${roots.join(
                 ", ",
-              )}), outside the harness directory, which Hangar does not read: run \`crewhaus provability show --session ${runId} --tenants-root ${rootFlag}\` from the harness directory`,
+              )}), outside the harness directory, which Hangar does not read: run \`crewhaus provability show --session ${shellQuote(runId)} --tenants-root ${rootFlag}\` from the harness directory`,
         );
       }
       // One scrubber per harness (each reads that harness's `.env` chain),

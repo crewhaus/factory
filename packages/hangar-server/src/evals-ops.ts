@@ -78,6 +78,7 @@ import type { M3Context, M3Handler } from "./m3";
 import { jobArg, requireString } from "./m3";
 import { maskText } from "./mask";
 import { WORKFLOWS_DIR_SEGMENTS, isScaffoldedWorkflow } from "./scaffolded-workflows";
+import { twinWord } from "./twin-word";
 
 // ---------------------------------------------------------------------------
 // The read envelope + the tolerant filesystem probes this area shares
@@ -529,10 +530,20 @@ export const evalMatrix: M3Handler = (ctx) => {
     });
   }
   if (roots.length === 0) {
-    return { ...absent("no matrix runs recorded", "crewhaus eval --models"), cells, roots: [] };
+    return {
+      ...absent(
+        "no matrix runs recorded",
+        "crewhaus eval crewhaus.yaml --dataset <dataset> --graders <graders> --models <models>",
+      ),
+      cells,
+      roots: [],
+    };
   }
   return {
-    ...found(null, "crewhaus eval --models"),
+    ...found(
+      null,
+      "crewhaus eval crewhaus.yaml --dataset <dataset> --graders <graders> --models <models>",
+    ),
     cells,
     roots: rootViews,
     crashed: cells.filter((c) => c.crash !== null).length,
@@ -557,7 +568,10 @@ export const evalMatrixCell: M3Handler = (ctx) => {
     const summary = hasDir ? readJson(ctx, evalsSegments(root, cell, "results.json")) : undefined;
     const error = str(row?.["error"]);
     return {
-      ...found(null, "crewhaus eval --models"),
+      ...found(
+        null,
+        "crewhaus eval crewhaus.yaml --dataset <dataset> --graders <graders> --models <models>",
+      ),
       cell,
       root,
       model: str(row?.["model"]) ?? cell,
@@ -567,7 +581,10 @@ export const evalMatrixCell: M3Handler = (ctx) => {
     };
   }
   return {
-    ...absent(`no matrix cell "${cell}" under any recorded matrix run`, "crewhaus eval --models"),
+    ...absent(
+      `no matrix cell "${cell}" under any recorded matrix run`,
+      "crewhaus eval crewhaus.yaml --dataset <dataset> --graders <graders> --models <models>",
+    ),
     cell,
     root: null,
     model: null,
@@ -630,11 +647,11 @@ export const evalSuites: M3Handler = (ctx) => {
   suites.sort((a, b) => String(b["dir"]).localeCompare(String(a["dir"])));
   if (suites.length === 0) {
     return {
-      ...absent("no CI suite runs recorded", "crewhaus eval suite <suite.yaml> --tier fast"),
+      ...absent("no CI suite runs recorded", "crewhaus eval suite <suite> --tier fast"),
       suites,
     };
   }
-  return { ...found(null, "crewhaus eval suite <suite.yaml> --tier fast"), suites };
+  return { ...found(null, "crewhaus eval suite <suite> --tier fast"), suites };
 };
 
 const SUITE_TIERS = new Set(["fast", "nightly", "release"]);
@@ -1023,7 +1040,7 @@ export const redteam: M3Handler = async (ctx) => {
   return {
     ...found(
       "attack success rate is 1 − the refusal graders' pass rate; partial runs are excluded from the trend",
-      "crewhaus redteam report --runs",
+      "crewhaus redteam report --runs <runs>",
     ),
     dataset: versions.length > 0 ? { name: datasetName, versions } : null,
     runs,
@@ -1493,7 +1510,10 @@ export const experiments: M3Handler = (ctx) => {
   });
   if (out.length === 0) {
     return {
-      ...absent("no experiments recorded", "crewhaus experiment record --name <n> --version <v>"),
+      ...absent(
+        "no experiments recorded",
+        "crewhaus experiment record --name <name> --version <version> --outcome pass|fail",
+      ),
       experiments: out,
       boundary: EXPERIMENT_BOUNDARY,
     };
@@ -1506,7 +1526,9 @@ export const experiments: M3Handler = (ctx) => {
 };
 
 /**
- * `POST /api/h/:id/evals/experiments` — `experiment record|assign`.
+ * `POST /api/h/:id/evals/experiments` — `experiment record|assign`. A record
+ * takes `version` and `outcome`; an assignment takes `request`, the key of the
+ * request to map to a version.
  *
  * An INCOMPLETE record (no version, or no outcome) is not an error: the panel
  * composes one field at a time, and the honest answer is "here is what is
@@ -1520,22 +1542,37 @@ export const experimentRecord: M3Handler = (ctx) => {
   }
   const name = jobArg("name", requireString(ctx.body, "name"));
   const argv = ["experiment", action, "--name", name];
-  const version = ctx.body["version"] ?? ctx.body["variant"];
-  if (version !== undefined) argv.push("--version", jobArg("version", version));
+  // What the command line needs that the body did not give, as its placeholder.
+  const placeholders: string[] = [];
   const missing: string[] = [];
-  if (version === undefined) missing.push("version");
   if (action === "record") {
+    const version = ctx.body["version"] ?? ctx.body["variant"];
+    if (version !== undefined) argv.push("--version", jobArg("version", version));
+    else {
+      missing.push("version");
+      placeholders.push("--version", "<version>");
+    }
     const outcome = ctx.body["outcome"];
     if (outcome === "pass" || outcome === "fail") argv.push("--outcome", outcome);
-    else if (outcome === undefined) missing.push("outcome");
-    else throw new HttpError(400, '"outcome" must be "pass" or "fail"');
+    else if (outcome === undefined) {
+      missing.push("outcome");
+      placeholders.push("--outcome", "pass|fail");
+    } else throw new HttpError(400, '"outcome" must be "pass" or "fail"');
+  } else {
+    // `assign` maps a request to a version; it takes the request's key.
+    const request = ctx.body["request"];
+    if (request !== undefined) argv.push("--key", jobArg("request", request));
+    else {
+      missing.push("request");
+      placeholders.push("--key", "<request>");
+    }
   }
+  const twin = ["crewhaus", ...argv.map((word) => twinWord(word, "<name>")), ...placeholders].join(
+    " ",
+  );
   if (missing.length > 0) {
     return {
-      ...found(
-        `nothing submitted — a complete ${action} still needs: ${missing.join(", ")}`,
-        `crewhaus experiment ${action}`,
-      ),
+      ...found(`nothing submitted — a complete ${action} still needs: ${missing.join(", ")}`, twin),
       submitted: false,
       missing,
       argv: null,
@@ -1543,7 +1580,7 @@ export const experimentRecord: M3Handler = (ctx) => {
     };
   }
   return {
-    ...found(EXPERIMENT_BOUNDARY, `crewhaus experiment ${action}`),
+    ...found(EXPERIMENT_BOUNDARY, twin),
     submitted: true,
     missing,
     job: ctx.submitJob(`experiment ${action}`, argv),
@@ -1640,7 +1677,10 @@ export const annotateSample: M3Handler = (ctx) => {
   const transcriptInSessionsRoot =
     joinable && isFileAt(safeContain(ctx, [".crewhaus", "sessions", `${sessionId}.jsonl`]));
   return {
-    ...found("annotation recorded", "crewhaus rate --adjudicate"),
+    ...found(
+      "annotation recorded",
+      "crewhaus rate --session <session> --turn <turn> --thumbs up|down --adjudicate",
+    ),
     runId,
     sampleId,
     verdict,
@@ -1740,7 +1780,7 @@ export const annotations: M3Handler = (ctx) => {
           resolvable === rows.length
             ? null
             : `${rows.length - resolvable} of ${rows.length} annotation(s) cannot reach distill yet — see join.reason`,
-          "crewhaus distill",
+          "crewhaus distill --all-sessions --register <dataset>",
         );
   return {
     ...base,

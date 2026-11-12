@@ -108,6 +108,7 @@ import {
   pickLanAddress,
 } from "./lan-address";
 import { REMOTE_BIND_ENV, isLoopbackHost, remoteBindRefusal } from "./remote-bind";
+import type { CliFamily } from "./verbs";
 import { cliVersion } from "./version";
 
 /** What a verb returns: lines for stdout + the process exit code. `serve`
@@ -365,6 +366,38 @@ export function releaseHangarLock(hangarRoot: string, pid: number): void {
  *  runtime-state floor use too. */
 export { resolveHangarRoot };
 
+/**
+ * The `hangar` family in the CLI's verb inventory (`verbs.ts`): each sub-verb
+ * and the flags its parser takes. A bare `crewhaus hangar [--flags]` is
+ * `serve`. Every `parseVerbArgs` call below reads its flags from here, and the
+ * key order is the order the unknown-verb message lists them in.
+ */
+export const CLI_FAMILY = {
+  verb: "hangar",
+  since: "0.8.0",
+  bare: "serve",
+  sub: {
+    serve: {
+      flags: {
+        port: "value",
+        host: "value",
+        lan: "boolean",
+        "no-auth": "boolean",
+        "no-open": "boolean",
+        "no-qr": "boolean",
+        smoke: "boolean",
+        "read-only": "boolean",
+        "read-only-locked": "boolean",
+        "allow-host": "values",
+      },
+    },
+    status: { flags: { json: "boolean" } },
+    open: { flags: { print: "boolean" } },
+    qr: { flags: { ascii: "boolean", "no-color": "boolean" } },
+    "rotate-token": { flags: { "socket-only": "boolean", tcp: "boolean" } },
+  },
+} as const satisfies CliFamily;
+
 // ---------------------------------------------------------------------------
 // Tiny per-verb flag parsing (harness-cmd posture: throw plain Errors)
 // ---------------------------------------------------------------------------
@@ -542,18 +575,7 @@ type ServeFlags = {
 };
 
 function parseServeFlags(argv: readonly string[]): ServeFlags {
-  const args = parseVerbArgs("serve", argv, {
-    port: "value",
-    host: "value",
-    lan: "boolean",
-    "no-auth": "boolean",
-    "no-open": "boolean",
-    "no-qr": "boolean",
-    smoke: "boolean",
-    "read-only": "boolean",
-    "read-only-locked": "boolean",
-    "allow-host": "values",
-  });
+  const args = parseVerbArgs("serve", argv, CLI_FAMILY.sub.serve.flags);
   if (args.positional.length > 0) {
     throw new Error(`hangar serve: unexpected argument "${args.positional[0]}"`);
   }
@@ -1063,7 +1085,7 @@ async function hangarServe(
 // ---------------------------------------------------------------------------
 
 function hangarStatus(argv: readonly string[], opts: HangarCommandOptions): HangarCommandResult {
-  const args = parseVerbArgs("status", argv, { json: "boolean" });
+  const args = parseVerbArgs("status", argv, CLI_FAMILY.sub.status.flags);
   refuseDotenvRoots(opts);
   const env = opts.env ?? process.env;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
@@ -1135,7 +1157,7 @@ async function hangarOpen(
   argv: readonly string[],
   opts: HangarCommandOptions,
 ): Promise<HangarCommandResult> {
-  const args = parseVerbArgs("open", argv, { print: "boolean" });
+  const args = parseVerbArgs("open", argv, CLI_FAMILY.sub.open.flags);
   refuseDotenvRoots(opts);
   const env = opts.env ?? process.env;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
@@ -1201,7 +1223,7 @@ async function hangarOpen(
  * no phone can reach it.
  */
 function hangarQr(argv: readonly string[], opts: HangarCommandOptions): HangarCommandResult {
-  const args = parseVerbArgs("qr", argv, { ascii: "boolean", "no-color": "boolean" });
+  const args = parseVerbArgs("qr", argv, CLI_FAMILY.sub.qr.flags);
   refuseDotenvRoots(opts);
   const env = opts.env ?? process.env;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
@@ -1257,7 +1279,10 @@ export async function runHangarCommand(
   opts: HangarCommandOptions = {},
 ): Promise<HangarCommandResult> {
   const verb = argv[0] ?? "";
-  if (verb === "--help" || verb === "-h") return { lines: HANGAR_USAGE_LINES, exitCode: 0 };
+  // `hangar [<verb>] --help` answers before any Home directory is read.
+  if (argv.includes("--help") || argv.includes("-h")) {
+    return { lines: HANGAR_USAGE_LINES, exitCode: 0 };
+  }
   // Bare `crewhaus hangar [--flags]` is `hangar serve [--flags]`.
   if (verb === "" || verb.startsWith("--")) return await hangarServe(argv, opts);
   switch (verb) {
@@ -1270,10 +1295,11 @@ export async function runHangarCommand(
     case "qr":
       return hangarQr(argv.slice(1), opts);
     case "rotate-token": {
-      const args = parseVerbArgs("rotate-token", argv.slice(1), {
-        "socket-only": "boolean",
-        tcp: "boolean",
-      });
+      const args = parseVerbArgs(
+        "rotate-token",
+        argv.slice(1),
+        CLI_FAMILY.sub["rotate-token"].flags,
+      );
       if (args.positional.length > 0) {
         throw new Error(`hangar rotate-token: unexpected argument "${args.positional[0]}"`);
       }
@@ -1288,7 +1314,7 @@ export async function runHangarCommand(
     }
     default:
       throw new Error(
-        `unknown hangar verb "${verb}" (expected: serve | status | open | qr | rotate-token)`,
+        `unknown hangar verb "${verb}" (expected: ${Object.keys(CLI_FAMILY.sub).join(" | ")})`,
       );
   }
 }

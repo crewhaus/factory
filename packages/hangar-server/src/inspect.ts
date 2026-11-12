@@ -137,8 +137,8 @@ const STORE_DEFS: Readonly<Record<InspectStore, StoreDef>> = {
   "scope-audit": {
     kind: "dir",
     segments: [".crewhaus", "scope-audit"],
-    what: "lint's scope-audit baseline and its dated drift snapshots",
-    verb: "crewhaus lint --scope-audit --json --baseline",
+    what: "the scope-audit baseline and dated drift snapshots `crewhaus doctor --philosophy-alignment` writes",
+    verb: "crewhaus doctor --philosophy-alignment --json",
   },
   "prompt-cache": {
     kind: "dir",
@@ -156,7 +156,7 @@ const STORE_DEFS: Readonly<Record<InspectStore, StoreDef>> = {
     kind: "dir",
     segments: [".crewhaus", "skills"],
     what: "harness-local skills, one directory per skill (including the auto-discovered FAQ skill)",
-    verb: "crewhaus feedback faq --distill",
+    verb: "crewhaus faq distill",
   },
   commands: {
     kind: "dir",
@@ -168,7 +168,7 @@ const STORE_DEFS: Readonly<Record<InspectStore, StoreDef>> = {
     kind: "dir",
     segments: [".crewhaus", "preferences"],
     what: "learned per-rater preferences, injected into the agent's turn",
-    verb: "crewhaus distill --preferences",
+    verb: "crewhaus lessons update",
   },
   settings: {
     kind: "file",
@@ -186,13 +186,13 @@ const STORE_DEFS: Readonly<Record<InspectStore, StoreDef>> = {
     kind: "file",
     segments: [".crewhaus", "identity.json"],
     what: "the Ed25519 agent identity whose fingerprint stamps every trace envelope and audit record",
-    verb: "crewhaus run",
+    verb: "crewhaus run crewhaus.yaml",
   },
   meta: {
     kind: "file",
     segments: [".crewhaus", "meta.json"],
     what: "store schema versions and migration stamps",
-    verb: "crewhaus memory migrate",
+    verb: "crewhaus migrate memories",
   },
   environments: {
     kind: "file",
