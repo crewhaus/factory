@@ -78,7 +78,7 @@ describe("the memory file is never reached through a planted link", () => {
     const victim = join(outside, "rc");
     writeFileSync(victim, "ORIGINAL");
     symlinkSync(victim, join(root, "spec.jsonl.tmp"));
-    expect(await store.compact()).toEqual({ kept: 1, dropped: 2 });
+    expect(await store.compact()).toEqual({ kept: 1, dropped: 2, archived: 2 });
     expect(readFileSync(victim, "utf8")).toBe("ORIGINAL");
     expect(lstatSync(join(root, "spec.jsonl")).isFile()).toBe(true);
     expect((await store.list()).map((i) => i.entry.id)).toEqual([kept.id]);

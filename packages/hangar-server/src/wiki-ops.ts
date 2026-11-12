@@ -206,6 +206,8 @@ export type ArticleRead = {
   readonly createdAt: string | null;
   readonly updatedAt: string | null;
   readonly createdBy: { sessionId: string; agentIdentity: string | null } | null;
+  /** `"operator"` when a person wrote this version (the store's `author`), else null. */
+  readonly authorKind: "operator" | null;
   /** True when the file carries no parseable frontmatter — rendered as a
    *  document, and flagged, rather than hidden. */
   readonly malformed: boolean;
@@ -265,6 +267,7 @@ function readArticleFile(
               sessionId: parsed.createdBy.sessionId,
               agentIdentity: parsed.createdBy.agentIdentity ?? null,
             },
+      authorKind: parsed.author?.kind ?? null,
       malformed: false,
       truncated,
     };
@@ -284,6 +287,7 @@ function readArticleFile(
       createdAt: null,
       updatedAt: mtime,
       createdBy: null,
+      authorKind: null,
       malformed: true,
       truncated,
     };
@@ -485,6 +489,8 @@ export const wikiWrite: M3Handler = async (ctx) => {
       ...(sources !== undefined ? { sources } : {}),
       ...(confidence !== undefined ? { confidence } : {}),
       ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+      // A person's version: an agent's wiki_write reads it before writing over it.
+      author: { kind: "operator", via: "hangar" },
     });
     return {
       ok: true,
@@ -504,6 +510,15 @@ export const wikiWrite: M3Handler = async (ctx) => {
     return writeRefusal(err, slug, current);
   }
 };
+
+/**
+ * Who wrote a version: the store's `author` when a person's version carries
+ * one, else the older reading (an agent's session, or a person when none).
+ */
+function authorOf(snapshot: ArticleRead): "operator" | "agent" {
+  if (snapshot.authorKind !== null) return snapshot.authorKind;
+  return snapshot.createdBy === null ? "operator" : "agent";
+}
 
 /**
  * `GET /api/h/:id/memory/wiki/:slug/versions` — the version list.
@@ -539,7 +554,7 @@ export const wikiVersions: M3Handler = (ctx) => {
       version: Number(stem),
       title: snapshot.title,
       updatedAt: snapshot.updatedAt,
-      author: snapshot.createdBy === null ? "operator" : "agent",
+      author: authorOf(snapshot),
       sessionId: snapshot.createdBy?.sessionId ?? null,
       agentIdentity: snapshot.createdBy?.agentIdentity ?? null,
       bytes,
@@ -628,7 +643,7 @@ export const wikiVersion: M3Handler = (ctx) => {
     body: snapshot.body,
     tags: snapshot.tags,
     status: snapshot.status,
-    author: snapshot.createdBy === null ? "operator" : "agent",
+    author: authorOf(snapshot),
     sessionId: snapshot.createdBy?.sessionId ?? null,
     updatedAt: snapshot.updatedAt,
     currentVersion: current?.version ?? null,
@@ -696,8 +711,10 @@ export const wikiLinks: M3Handler = (ctx) => {
 /**
  * `POST /api/h/:id/memory/wiki/:slug/signals` — verified/confidence signals.
  *
- * Body: `{ verified?, confidence? }` through the store's `setSignals`, which
- * bumps no version and freezes no snapshot (the body is untouched).
+ * Body: `{ verified?, confidence?, expectedVersion? }` through the store's
+ * `setSignals`, which bumps no version and freezes no snapshot (the body is
+ * untouched). With a whole-number `expectedVersion` the change lands only on
+ * that version, and a moved article answers the `stale_article_version` state.
  * METADATA ONLY — a body carrying article content is REFUSED here, because
  * the one thing this route must never become is a second, unversioned
  * editor.
@@ -727,14 +744,29 @@ export const wikiSignals: M3Handler = async (ctx) => {
   ) {
     throw new HttpError(400, '"confidence" must be a number in [0, 1]');
   }
+  const rawExpected = ctx.body["expectedVersion"];
+  const expectedVersion =
+    typeof rawExpected === "number" && Number.isInteger(rawExpected) && rawExpected >= 0
+      ? rawExpected
+      : undefined;
   const specName = harnessSpecName(ctx);
   const target = wikiTarget(ctx, specName);
+  // Read first, so a refusal can show what is there now.
+  const current = readArticleFile(
+    containedPath(ctx, [...target.prefix, "articles", `${slug}.md`]),
+    slug,
+  );
   try {
-    await wikiStoreFor(ctx, target).setSignals(slug, {
-      ...(typeof rawVerified === "boolean" ? { verified: rawVerified } : {}),
-      ...(typeof rawConfidence === "number" ? { confidence: rawConfidence } : {}),
-    });
+    await wikiStoreFor(ctx, target).setSignals(
+      slug,
+      {
+        ...(typeof rawVerified === "boolean" ? { verified: rawVerified } : {}),
+        ...(typeof rawConfidence === "number" ? { confidence: rawConfidence } : {}),
+      },
+      expectedVersion !== undefined ? { expectedVersion } : {},
+    );
   } catch (err) {
+    if (err instanceof WikiVersionConflictError) return writeRefusal(err, slug, current);
     return {
       ok: false,
       code: "signals_refused",
@@ -759,16 +791,12 @@ export const wikiSignals: M3Handler = async (ctx) => {
 /**
  * `POST /api/h/:id/memory/wiki/:slug/archive` — archive (never delete).
  *
- * Body: `{ archived: boolean, confirm }`. Flips the article's status through
- * the store. Un-archiving is the same route with `archived: false`, which is
- * exactly why deletion is unnecessary.
- *
- * The store has no status-only mutation, so this is a content write with the
- * body kept byte-identical — it takes a version, which is the store's whole
- * supersede-never-delete model. A content write also RESETS `verified`, so
- * the prior signals are re-applied afterwards through `setSignals`:
- * archiving must not silently un-verify an article. An article too long to
- * read whole is refused, because that write would cut its body at the read cap.
+ * Body: `{ archived: boolean, confirm, expectedVersion? }`. Flips the
+ * article's status through the store's `setStatus`: metadata only, so the
+ * body bytes, the version and `verified` stay as they were, and an article of
+ * any length archives. Un-archiving is the same route with `archived: false`,
+ * which is exactly why deletion is unnecessary. With a whole-number
+ * `expectedVersion` it lands only on that version.
  */
 export const wikiArchive: M3Handler = async (ctx) => {
   const slug = validSlug(ctx);
@@ -777,14 +805,18 @@ export const wikiArchive: M3Handler = async (ctx) => {
   if (requireBoolean(ctx.body, "confirm") !== true) {
     throw new HttpError(409, 'archiving an article needs "confirm": true');
   }
+  const rawExpected = ctx.body["expectedVersion"];
+  const expectedVersion =
+    typeof rawExpected === "number" && Number.isInteger(rawExpected) && rawExpected >= 0
+      ? rawExpected
+      : undefined;
   const specName = harnessSpecName(ctx);
   const target = wikiTarget(ctx, specName);
   const articlePath = containedPath(ctx, [...target.prefix, "articles", `${slug}.md`]);
+  // A masked view, for the not-found answer and a refusal's `current` only:
+  // the archive itself writes no body.
   const current = readArticleFile(articlePath, slug);
-  // The round-trip reads RAW: the archive write re-writes the body, and a
-  // masked span written back would replace what it hid.
-  const raw = readArticleFile(articlePath, slug, { raw: true });
-  if (current === null || raw === null) {
+  if (current === null) {
     return {
       ok: false,
       code: "no_such_article",
@@ -792,30 +824,17 @@ export const wikiArchive: M3Handler = async (ctx) => {
       note: "no article with that slug — nothing to archive",
     };
   }
-  if (raw.truncated) {
-    throw new HttpError(409, "This article is too long to archive from here.");
-  }
-  const store = wikiStoreFor(ctx, target);
   try {
-    const result = await store.write({
+    await wikiStoreFor(ctx, target).setStatus(
       slug,
-      title: raw.title,
-      body: raw.body,
-      tags: [...raw.tags],
-      sources: [...raw.sources],
-      confidence: raw.confidence,
-      status: archived ? "archived" : "published",
-      expectedVersion: raw.version,
-    });
-    if (current.verified) {
-      // Restore the fact-checked flag the content write reset. Metadata only.
-      await store.setSignals(slug, { verified: true, confidence: current.confidence });
-    }
+      archived ? "archived" : "published",
+      expectedVersion !== undefined ? { expectedVersion } : {},
+    );
     return {
       ok: true,
       slug,
       archived,
-      version: result.version,
+      version: current.version,
       note: archived
         ? "archived — it leaves the live list, every version stays on disk, and un-archiving is this same call with archived: false"
         : "restored to published",
@@ -882,7 +901,9 @@ export const wikiReflect: M3Handler = (ctx) => {
             (rows.length === 0
               ? "No articles yet. The harness writes them as it works, or add one here."
               : null)),
-      null,
+      rows.length === 0 && authorityNote === null
+        ? "crewhaus wiki write <slug> --body-file <file> --expect 0"
+        : null,
       filteredOut
         ? "filtered"
         : rows.length > 0

@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEmbedder } from "@crewhaus/embedder";
 import { TenancyError, buildTenant, withTenant } from "@crewhaus/tenancy";
+import { parseArticle as parseArticle080 } from "./__fixtures__/v080-parse-article";
 import {
   STALE_ARTICLE_VERSION,
   UNKNOWN_TIMESTAMP,
@@ -714,5 +715,145 @@ describe("store construction guards", () => {
   test("specName is required and path-safe", () => {
     expect(() => createWikiStore({ specName: "" })).toThrow(WikiStoreError);
     expect(() => createWikiStore({ specName: "../evil", rootDir: tmp })).toThrow(WikiStoreError);
+  });
+});
+
+describe("operator authorship, status-only archive and guarded signals", () => {
+  const person = { kind: "operator", via: "cli" } as const;
+
+  test("setStatus keeps the body bytes and the version, and refuses a stale version", async () => {
+    const store = makeStore();
+    await store.write({ slug: "faq", title: "FAQ", body: "Answer one." });
+    await store.write({ slug: "faq", title: "FAQ", body: "Answer two.", expectedVersion: 1 });
+    await store.setSignals("faq", { verified: true });
+    const before = await store.get("faq");
+    await store.setStatus("faq", "archived", { expectedVersion: 2 });
+    const after = await store.get("faq");
+    expect(after?.status).toBe("archived");
+    expect(after?.version).toBe(2);
+    expect(after?.body).toBe(before?.body as string);
+    expect(after?.verified).toBe(true);
+    // No snapshot: versions/ holds only the superseded v1.
+    expect(existsSync(join(store.path(), "versions", "faq", "2.md"))).toBe(false);
+    const err = await store
+      .setStatus("faq", "published", { expectedVersion: 1 })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(WikiVersionConflictError);
+    expect((err as WikiVersionConflictError).currentVersion).toBe(2);
+    expect((await store.get("faq"))?.status).toBe("archived");
+    await expect(store.setStatus("nope", "archived")).rejects.toBeInstanceOf(WikiStoreError);
+  });
+
+  test("a write between a read and setStatus makes the held version stale", async () => {
+    const store = makeStore();
+    await store.write({ slug: "a", title: "A", body: "v1" });
+    const held = (await store.get("a"))?.version as number;
+    await store.write({ slug: "a", title: "A", body: "v2", expectedVersion: held });
+    await expect(
+      store.setStatus("a", "archived", { expectedVersion: held }),
+    ).rejects.toBeInstanceOf(WikiVersionConflictError);
+    expect((await store.get("a"))?.status).toBe("published");
+  });
+
+  test("author is never carried onto a later agent version", async () => {
+    const store = makeStore();
+    await store.write({ slug: "b", title: "B", body: "by a person", author: person });
+    expect((await store.get("b"))?.author).toEqual(person);
+    await store.write({
+      slug: "b",
+      title: "B",
+      body: "by an agent",
+      expectedVersion: 1,
+      createdBy: { sessionId: "sess_1" },
+    });
+    const agentVersion = await store.get("b");
+    expect(agentVersion?.author).toBeUndefined();
+    // The person's version is kept, author and all.
+    expect((await store.getVersion("b", 1))?.author).toEqual(person);
+  });
+
+  test("createdBy is not carried onto an operator version", async () => {
+    const store = makeStore();
+    await store.write({ slug: "c", title: "C", body: "agent", createdBy: { sessionId: "sess_9" } });
+    await store.write({
+      slug: "c",
+      title: "C",
+      body: "person",
+      expectedVersion: 1,
+      author: person,
+    });
+    const current = await store.get("c");
+    expect(current?.author).toEqual(person);
+    expect(current?.createdBy).toBeUndefined();
+  });
+
+  test("setSignals with a stale version refuses; without one it is unchanged", async () => {
+    const store = makeStore();
+    await store.write({ slug: "d", title: "D", body: "one" });
+    await store.write({ slug: "d", title: "D", body: "two", expectedVersion: 1 });
+    await expect(
+      store.setSignals("d", { verified: true }, { expectedVersion: 1 }),
+    ).rejects.toBeInstanceOf(WikiVersionConflictError);
+    expect((await store.get("d"))?.verified).toBe(false);
+    await store.setSignals("d", { verified: true }, { expectedVersion: 2 });
+    await store.setSignals("d", { confidence: 0.9 });
+    expect((await store.get("d"))?.verified).toBe(true);
+    expect((await store.get("d"))?.confidence).toBe(0.9);
+  });
+
+  test("getVersion round-trips a superseded version and answers null otherwise", async () => {
+    const store = makeStore();
+    await store.write({ slug: "e", title: "E1", body: "first body", tags: ["t"] });
+    await store.write({ slug: "e", title: "E2", body: "second body", expectedVersion: 1 });
+    const v1 = await store.getVersion("e", 1);
+    expect(v1?.title).toBe("E1");
+    expect(v1?.body).toBe("first body");
+    expect(v1?.tags).toEqual(["t"]);
+    expect(v1?.version).toBe(1);
+    // The current version is never in versions/.
+    expect(await store.getVersion("e", 2)).toBeNull();
+    expect(await store.getVersion("e", 9)).toBeNull();
+    await expect(store.getVersion("e", 0)).rejects.toBeInstanceOf(WikiStoreError);
+  });
+
+  test("parse is tolerant: an unknown or ill-typed author reads as absent", () => {
+    const base = serializeArticle({
+      slug: "x",
+      title: "X",
+      tags: [],
+      confidence: 0.5,
+      verified: false,
+      version: 1,
+      sources: [],
+      status: "published",
+      createdAt: "2026-07-01T00:00:00.000Z",
+      updatedAt: "2026-07-01T00:00:00.000Z",
+      body: "b",
+    });
+    for (const bad of [
+      "author: robot",
+      "author:\n  kind: agent",
+      "author:\n  kind: operator\n  via: email",
+    ]) {
+      const raw = base.replace("status: published", `${bad}\nstatus: published`);
+      expect(parseArticle(raw).author).toBeUndefined();
+    }
+    const good = base.replace(
+      "status: published",
+      "author:\n  kind: operator\n  via: hangar\n  cmd: cmd_1\nstatus: published",
+    );
+    expect(parseArticle(good).author).toEqual({ kind: "operator", via: "hangar", cmd: "cmd_1" });
+  });
+
+  test("a 0.8.0 reader reads an operator-written article whole, without author", async () => {
+    const store = makeStore();
+    await store.write({ slug: "f", title: "F", body: "person text", author: person, tags: ["k"] });
+    const raw = readFileSync(join(store.path(), "articles", "f.md"), "utf-8");
+    expect(raw).toContain("kind: operator");
+    const old = parseArticle080(raw);
+    const now = parseArticle(raw);
+    const { author, ...rest } = now;
+    expect(author).toEqual(person);
+    expect(old).toEqual(rest);
   });
 });

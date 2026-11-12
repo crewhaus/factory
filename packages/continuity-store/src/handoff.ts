@@ -40,7 +40,36 @@ export type HandoffInput = {
   readonly lastSessionId?: string;
   /** Default `"ladder"` — see {@link countsAsProven}. */
   readonly proofMode?: ContinuityProofMode;
+  /**
+   * Under `require` only: the records whose frozen proof its session log does
+   * not bear out (`recheckProofs`). Each is rendered open, like a record
+   * with no proof on record. Steps are keyed `<planId>#<index>`, goals by id.
+   * Ignored under the ladder and `off`.
+   */
+  readonly recheckFailed?: RecheckFailures;
 };
+
+/** The records whose frozen proof failed its recheck, as the handoff reads them. */
+export type RecheckFailures = {
+  /** `<planId>#<step index>` */
+  readonly steps: ReadonlySet<string>;
+  readonly goals: ReadonlySet<string>;
+};
+
+/** The key {@link RecheckFailures.steps} uses for a plan step. */
+export function stepRecheckKey(planId: string, index: number): string {
+  return `${planId}#${index}`;
+}
+
+/** What `recheckProofs` answers for one record. */
+export type ProofRecheck =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      /** The proof that failed; absent when the record carries none. */
+      readonly toolUseId?: string;
+      readonly why: "missing" | "changed" | "unreadable";
+    };
 
 const NONE = "_none_";
 
@@ -110,6 +139,30 @@ export function countsAsProven(
 }
 
 /**
+ * {@link countsAsProven} at a door that acts: under `require` a record also
+ * needs its frozen proofs to still match the session log they were read from
+ * (`recheckProofs`), so a proof written into `goals.yaml` or a plan file by
+ * hand completes nothing. Under the ladder and `off` it is unchanged, and
+ * `recheck` is not consulted.
+ */
+export function countsAsProvenChecked(
+  record: {
+    readonly status: string;
+    readonly unverified?: readonly UnverifiedRef[];
+    readonly proofs?: readonly FrozenProof[];
+  },
+  proofMode: ContinuityProofMode,
+  recheck: ProofRecheck,
+): boolean {
+  return proofMode === "require"
+    ? isProvenVerified(record) && recheck.ok
+    : record.status === "proven";
+}
+
+/** The `require` label for a proven record whose proof the session log does not match. */
+export const PROOF_CHANGED_LABEL = "marked proven with a proof the session log does not match";
+
+/**
  * {@link renderStatus} for a whole step or goal record: identical to it for
  * every record the ladder wrote, and {@link PROVEN_UNVERIFIED_LABEL} for one
  * proven by assertion — so "the log proves X ran" and "the model said X ran
@@ -137,8 +190,23 @@ function renderStepLine(step: PlanRecord["steps"][number]): string {
   return `${step.index}. ${renderLadderStatus(step)} ${step.text}${proofSuffix}`;
 }
 
-function planSummary(plan: PlanRecord, proofMode: ContinuityProofMode): string {
-  const proven = plan.steps.filter((s) => countsAsProven(s, proofMode)).length;
+/** Whether a step counts as done here: {@link countsAsProven}, less a failed recheck. */
+function stepDone(
+  plan: PlanRecord,
+  step: PlanRecord["steps"][number],
+  proofMode: ContinuityProofMode,
+  failed: RecheckFailures | undefined,
+): boolean {
+  if (!countsAsProven(step, proofMode)) return false;
+  return !(proofMode === "require" && failed?.steps.has(stepRecheckKey(plan.id, step.index)));
+}
+
+function planSummary(
+  plan: PlanRecord,
+  proofMode: ContinuityProofMode,
+  failed: RecheckFailures | undefined,
+): string {
+  const proven = plan.steps.filter((s) => stepDone(plan, s, proofMode, failed)).length;
   // Proven-by-assertion steps still count as proven under the ladder and
   // `off` (that is what `off` means), and not under `require`; either way
   // the summary says how many of them nobody checked. Absent on every
@@ -160,7 +228,11 @@ function renderRequirementLine(req: Requirement): string {
   return `- ${req.id} [${req.status}] ${JSON.stringify(req.text)} (user, ${req.source.sessionId}, turn ${req.source.turn})`;
 }
 
-function nextActions(plan: PlanRecord | null, proofMode: ContinuityProofMode): string[] {
+function nextActions(
+  plan: PlanRecord | null,
+  proofMode: ContinuityProofMode,
+  failed: RecheckFailures | undefined,
+): string[] {
   if (plan === null) return [];
   const actions: string[] = [];
   for (const step of plan.steps) {
@@ -168,12 +240,14 @@ function nextActions(plan: PlanRecord | null, proofMode: ContinuityProofMode): s
       actions.push(
         `Verify or redo: ${step.text} (${plan.id} step ${step.index} is claimed but unproven)`,
       );
-    } else if (step.status === "proven" && !countsAsProven(step, proofMode)) {
+    } else if (step.status === "proven" && !stepDone(plan, step, proofMode, failed)) {
       // `require` only (design/0.8.0 §6.3): PlanComplete still owes this
       // step a verified proof, so it is unfinished work beside the claims.
       const label = isProvenByAssertion(step)
         ? "proven (unverified)"
-        : "marked proven with no proof on record";
+        : countsAsProven(step, proofMode)
+          ? PROOF_CHANGED_LABEL
+          : "marked proven with no proof on record";
       actions.push(
         `Prove: ${step.text} (${plan.id} step ${step.index} is ${label}, not proven under continuity.proof: require)`,
       );
@@ -195,12 +269,13 @@ function nextActions(plan: PlanRecord | null, proofMode: ContinuityProofMode): s
 /** Pure renderer — no clock, no filesystem, no model. */
 export function renderHandoff(input: HandoffInput): string {
   const proofMode = input.proofMode ?? "ladder";
+  const failed = proofMode === "require" ? input.recheckFailed : undefined;
   const lines: string[] = [HANDOFF_MARKER, "# Handoff", "", "## Focus", ""];
   lines.push(input.focusBody.trim() !== "" ? input.focusBody.trim() : "_no focus set_");
 
   lines.push("", "## Active plan", "");
   if (input.activePlan !== null) {
-    lines.push(planSummary(input.activePlan, proofMode), "");
+    lines.push(planSummary(input.activePlan, proofMode, failed), "");
     for (const step of input.activePlan.steps) {
       lines.push(renderStepLine(step));
     }
@@ -210,15 +285,17 @@ export function renderHandoff(input: HandoffInput): string {
   }
 
   const others = input.plans.filter(
-    (p) => p.id !== input.activePlan?.id && p.steps.some((s) => !countsAsProven(s, proofMode)),
+    (p) => p.id !== input.activePlan?.id && p.steps.some((s) => !stepDone(p, s, proofMode, failed)),
   );
   if (others.length > 0) {
     lines.push("", "## Other open plans", "");
-    for (const plan of others) lines.push(`- ${planSummary(plan, proofMode)}`);
+    for (const plan of others) lines.push(`- ${planSummary(plan, proofMode, failed)}`);
   }
 
   lines.push("", "## Goals", "");
-  const openGoals = input.goals.filter((g) => !countsAsProven(g, proofMode));
+  const openGoals = input.goals.filter(
+    (g) => !countsAsProven(g, proofMode) || failed?.goals.has(g.id) === true,
+  );
   if (openGoals.length > 0) {
     for (const goal of openGoals) lines.push(renderGoalLine(goal));
   } else {
@@ -234,7 +311,7 @@ export function renderHandoff(input: HandoffInput): string {
   }
 
   lines.push("", "## Next actions", "");
-  const actions = nextActions(input.activePlan, proofMode);
+  const actions = nextActions(input.activePlan, proofMode, failed);
   if (actions.length > 0) {
     actions.forEach((action, i) => lines.push(`${i + 1}. ${action}`));
   } else {

@@ -54,12 +54,14 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
+import { createContinuityStore } from "../packages/continuity-store/src/index";
 import { DECISION_LOG_KEYS } from "../packages/control-contract/src/index";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
 import { countPendingApprovals } from "../packages/gateway-protocol/src/control";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import type { IrManagedV0 } from "../packages/ir/src/index";
+import { _setCompactSeamsForTest, createMemoryStore } from "../packages/memory-store/src/index";
 import {
   type RuleSet,
   type ToolCallContext,
@@ -68,7 +70,11 @@ import {
 } from "../packages/permission-engine/src/index";
 import { runPreflight } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
-import { credentialFileRoots, runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
+import {
+  credentialFileRoots,
+  runtimeStateRoots,
+  storeFileRoots,
+} from "../packages/runtime-core/src/state-roots";
 import {
   allowSingleOwner,
   createPendingApprovalStore,
@@ -89,6 +95,7 @@ import { planPin } from "../packages/tool-evalops/src/lib/pin";
 import { harnessRegister } from "../packages/tool-fleet/src/index";
 import { TOOL_REGISTRY } from "../packages/tool-registry-manifest/src/generated";
 import { factCrossCheck } from "../packages/tool-verify/src/index";
+import { createWikiTools } from "../packages/tool-wiki/src/index";
 
 const ROOT = dirname(import.meta.dir);
 /** 0.8.0's list, as released. It does not change. */
@@ -1765,5 +1772,147 @@ describe("approval decisions", () => {
       defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes("`approvals.d/`")) ?? "";
     expect(bullet).toContain("reads never rewrite");
     expect(bullet).toContain("decision log");
+  });
+});
+
+/**
+ * The knowledge stores' default-on changes. Each is found in the code that
+ * makes it: the continuity store's own files are whatever its `storeFiles()`
+ * names, compaction is driven against a temp store, and the wiki guard is the
+ * real `createWikiTools`.
+ */
+describe("the release notes name what the knowledge stores do by default", () => {
+  test("the floor: the continuity store's files are named, Write is denied there, StateImport's default is not", () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-continuity-")));
+    try {
+      const files = createContinuityStore({
+        specName: "s",
+        rootDir: join(cwd, ".crewhaus", "state"),
+      }).storeFiles();
+      // The names a person edits by hand; the lock, the Thredz goal map and the
+      // session directory ride along without a name of their own.
+      const named = files
+        .map((f) => basename(f))
+        .filter((n) => !n.startsWith(".") && n !== "sessions" && n !== "thredz-goals.json");
+      expect(named).toEqual(["focus.md", "goals.yaml", "plans", "handoff.md"]);
+      const floor = bullets.find((b) => b.includes("`.crewhaus/knowledge.json`")) ?? "";
+      expect(floor).toContain("`.crewhaus/state/<spec>/`");
+      for (const name of named) {
+        expect({ name, named: floor.includes(`\`${name}\``) }).toEqual({ name, named: true });
+      }
+      expect(floor).toContain("`StateImport`");
+      expect(floor).toContain("`Bash`");
+      expect(floor).toContain("`RunCommand`");
+
+      const protectedFiles = storeFileRoots(files, cwd);
+      const rules: RuleSet = {
+        ...emptyRuleSet,
+        flag: [{ type: "alwaysAllow", pattern: "*", source: "flag" }],
+      };
+      const write: ToolCallContext = {
+        toolName: "Write",
+        input: { path: ".crewhaus/state/s/focus.md", content: "x" },
+        operativeValues: [
+          {
+            kind: "path",
+            canonical: [".crewhaus/state/s/focus.md", join(cwd, ".crewhaus/state/s/focus.md")],
+          },
+        ],
+        readOnly: false,
+        destructive: true,
+      };
+      const stateImport: ToolCallContext = {
+        toolName: "StateImport",
+        input: { stateDir: ".crewhaus/state", mode: "merge" },
+        operativeValues: [
+          {
+            kind: "path",
+            canonical: [".crewhaus/state", join(cwd, ".crewhaus/state")],
+            beneath: [".crewhaus/state/", "./.crewhaus/state/", `${join(cwd, ".crewhaus/state")}/`],
+          },
+        ],
+        readOnly: false,
+        destructive: true,
+      };
+      expect(evaluateWithReason(write, "auto", rules, { protectedFiles }).decision).toBe("deny");
+      expect(evaluateWithReason(stateImport, "auto", rules, { protectedFiles }).decision).toBe(
+        "allow",
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("fact compaction archives what it drops, keeps the live set, and keeps a fact remembered meanwhile", async () => {
+    const rootDir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-compact-")));
+    try {
+      const store = createMemoryStore({ specName: "s", rootDir });
+      const keep = await store.remember("kept");
+      const gone = await store.remember("gone");
+      await store.forget(gone.id, { reason: "stale" });
+      const before = readFileSync(store.path(), "utf8")
+        .split("\n")
+        .filter((l) => l !== "");
+      const dropped = before.filter((l) => !l.includes(keep.id));
+      let late = "";
+      _setCompactSeamsForTest({
+        afterSnapshot: async () => {
+          late = (await store.remember("remembered meanwhile")).id;
+        },
+      });
+      try {
+        await store.compact();
+      } finally {
+        _setCompactSeamsForTest(undefined);
+      }
+      const history = (await store.history()).map((h) => JSON.stringify(h.line));
+      for (const line of dropped) {
+        const canonical = JSON.stringify(JSON.parse(line));
+        expect(history.filter((h) => h === canonical)).toHaveLength(1);
+      }
+      const live = (await store.list()).filter((i) => i.status === "live").map((i) => i.entry.id);
+      const file = readFileSync(store.path(), "utf8")
+        .split("\n")
+        .filter((l) => l !== "")
+        .map((l) => (JSON.parse(l) as { id: string }).id);
+      expect(file).toEqual(live);
+      expect(live).toEqual([keep.id, late]);
+      const bullet =
+        defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+          b.includes("`.crewhaus/memories/archive/"),
+        ) ?? "";
+      expect(bullet).toContain("`.crewhaus/memories/.<spec>.lock`");
+      expect(bullet).toContain("Upgrade every CrewHaus install");
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("wiki_write refuses an unread person-written version, and lands after wiki_get", async () => {
+    const rootDir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-wiki-")));
+    try {
+      const bundle = createWikiTools({ specName: "s", rootDir });
+      await bundle.store.write({
+        slug: "faq",
+        title: "FAQ",
+        body: "a person's text",
+        author: { kind: "operator", via: "cli" },
+      });
+      const rc = createRunContext();
+      const edit = { slug: "faq", title: "FAQ", body: "an agent's text" };
+      const refused = String(await bundle.write.execute(edit, { runContext: rc }));
+      expect(refused).toContain("was corrected by a person");
+      expect((await bundle.store.get("faq"))?.body).toBe("a person's text");
+      await bundle.get.execute({ slug: "faq" }, { runContext: rc });
+      expect(String(await bundle.write.execute(edit, { runContext: rc }))).toContain("at v2");
+      const bullet =
+        defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+          b.includes("keeps a person's edit"),
+        ) ?? "";
+      expect(bullet).toContain("`wiki_write`");
+      expect(bullet).toContain("`wiki_get`");
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
   });
 });

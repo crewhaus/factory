@@ -405,7 +405,7 @@ describe("crewhaus state restore", () => {
   test("unknown state action dies with the allowed set", async () => {
     const result = await runCli(["state", "frobnicate"], tmp);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain('state action must be "backup" or "restore"');
+    expect(result.stderr).toContain("state action must be one of backup, restore, clear, trash");
   }, 20_000);
 });
 

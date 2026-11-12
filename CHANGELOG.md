@@ -46,6 +46,78 @@ these on: they reach every harness that uses what each one names.
   directory, the runtime-state floor protects `approvals.d/` as it protects the
   approvals file.
 
+- **Fact compaction keeps what it removes, and fact writes take a lock.**
+  Compaction, from `crewhaus memory sweep --compact` and the dream pass, moves
+  superseded and expired facts and their tombstones to
+  `.crewhaus/memories/archive/<spec>/` and keeps them there, so a forget's reason
+  and a correction's old text stay in the history. Every fact write takes
+  `.crewhaus/memories/.<spec>.lock`, so a fact remembered while a compaction
+  runs is kept. The dream's duplicate pass records which fact replaced each
+  duplicate. Upgrade every CrewHaus install that touches a harness: an older CLI
+  or daemon still drops those lines when it compacts.
+
+- **`wiki_write` keeps a person's edit (local wiki).** An agent's `wiki_write`
+  writes over the version its session last read with `wiki_get` or
+  `wiki_recall`. It refuses, writing nothing, when the article changed since that
+  read, and when a person wrote the current version (with `crewhaus wiki write`
+  or in Hangar) and the session has not read it; the reply says to read the
+  article and re-apply the edit. An agent's own earlier version is written over
+  as before, and a Thredz-backed wiki is not affected.
+
+- **The runtime-state floor also covers the knowledge-sync marker, the
+  idempotency store and the continuity store's own files.** Beside
+  `.crewhaus/sessions`, `.crewhaus/tool-results` and `.crewhaus/proofs`, no
+  permission rule lets an agent's tool write: `.crewhaus/run` (the runfiles, logs
+  and control files a daemon keeps there); the settings file
+  `.crewhaus/settings.json`; what a harness's gates and janitors read,
+  `.crewhaus/approvals`, `.crewhaus/environments.json`, `.crewhaus/graders`,
+  `.crewhaus/judge-calibration.json`, `.crewhaus/evals`, `.crewhaus/datasets`,
+  `.crewhaus/retention.json`, `.crewhaus/audit`, `.crewhaus/graphs`,
+  `.crewhaus/advice` and the knowledge-sync marker `.crewhaus/knowledge.json`,
+  exactly that file; the durable-execution idempotency records,
+  `.crewhaus/idempotency` and the directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>`
+  names; the continuity store's own files under `.crewhaus/state/<spec>/`,
+  `focus.md`, `goals.yaml`, `plans` and `handoff.md`, and the same for each of
+  its sessions, which only the plan tools write (a tool that works on the whole
+  of `.crewhaus/state`, such as `StateImport` merging into it, keeps working, and
+  refuses an entry that lands on one of them); the working directory's `.env`,
+  `.env.local`, `.env.development`, `.env.development.local`, `.env.production`,
+  `.env.production.local`, `.env.test` and `.env.test.local`, and any file
+  `manager.envFiles` names; its `bunfig.toml` and `.npmrc`; the `approvals.jsonl`
+  beside session logs that `CREWHAUS_SESSION_DIR` puts at the working directory;
+  a managed run's whole tenants root; and Hangar's directory and registry:
+  `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always, and wherever the
+  run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT` puts them. The floor
+  also reads the directory a call keeps a tool's store in. In a working directory
+  that holds `crewhaus.yaml` or `crewhaus.yml`, it also covers `dist`, `build` and
+  `node_modules`; in a compiled non-interactive bundle running from that
+  directory, it also covers `crewhaus.yaml`, `crewhaus.yml`, `tsconfig.json`,
+  `jsconfig.json` and `package.json`; a bundle started from inside its own
+  directory covers its own code files and the other spellings of their names,
+  `package.json`, `bun.lock`, `bun.lockb`, `node_modules`, `tsconfig.json`,
+  `jsconfig.json`, `crewhaus.yaml` and `crewhaus.yml`; and a compiled
+  non-interactive bundle in a directory below covers that directory, the spec's
+  names at the working directory, and `node_modules`, `package.json`,
+  `tsconfig.json` and `jsconfig.json` from its parent up to the working directory.
+  `CompileBundle` refuses another directory whose output leads into one of these
+  or holds one.
+  Read from a tool that declares no paths, a relative `dist`, `build`,
+  `node_modules`, `package.json`, `tsconfig.json` or `jsconfig.json`, or a name
+  below one, is not taken for a path; an absolute one is. The compiled CLI is built
+  with `--no-compile-autoload-bunfig`, so it reads no `bunfig.toml` from the working
+  directory. Only `bypass` mode skips the floor, and the file tools that check
+  their own targets refuse even then, as `DatasetPut`, `SpecPin` and `DeployRollback` do for what lands in one
+  of these, and `EmitTraceEvent`, `ExperimentLedger`, `KvSet`, `KvDelete`,
+  `CounterIncrement`, `CheckpointSave`, `JournalAppend`, `BlackboardPost`,
+  `NoteWrite`, `IndexBuild` and `DedupeMark` for a record a link leads to one.
+  CrewHaus itself still writes these files, and a tool that keeps its own store
+  there, `EmitTraceEvent` in the run's own record, `DatasetPut` in
+  `.crewhaus/datasets` and `EvalBaselinePin` in `.crewhaus/evals`, still adds to
+  it. The floor refuses `HooksManage` on the harness it runs in, and
+  `EnvFileUpsert`, `SecretRotate` or `DoctorFix` on those environment files; they
+  work on other files and other harnesses as before. `Bash` and `RunCommand`
+  remain outside what the floor can see. Recompile a daemon to pick this up.
+
 ## [0.8.1] - 2026-11-08
 
 Fixes and hardening for run input, the runtime-state floor, git tools,

@@ -87,7 +87,9 @@ import {
   type ContinuityStore,
   EvidenceError,
   type EvidenceRef,
+  type FrozenProof,
   type Goal,
+  PROOF_CHANGED_LABEL,
   type PlanRecord,
   type Requirement,
   type UpdateGoalInput,
@@ -388,19 +390,36 @@ function orList(items: readonly string[]): string {
  * needs a verified proof. Null while the plan still has unstarted work (the
  * claim is then plainly not the end) or once every step is proven.
  */
-function incompletePlanNote(plan: PlanRecord): string | null {
+function incompletePlanNote(
+  plan: PlanRecord,
+  proofChanged: ReadonlySet<number> = new Set(),
+): string | null {
   if (plan.steps.some((s) => s.status === "open" || s.status === "in_progress")) return null;
+  // A verified step whose frozen proof failed its recheck is below proven too.
+  const changed = plan.steps.filter((s) => verifiedProven(s) && proofChanged.has(s.index));
   const below = plan.steps.filter((s) => !verifiedProven(s));
-  if (below.length === 0) return null;
+  if (below.length === 0 && changed.length === 0) return null;
   const present = new Set(below.map(belowProvenLabel));
   const labels = orList(
     ["claimed", "proven (unverified)", NO_PROOF_LABEL].filter((l) => present.has(l)),
   );
-  const which =
-    below.length === 1
-      ? `step ${below[0]?.index} is ${labels}, not proven — prove it`
-      : `steps ${below.map((s) => s.index).join(", ")} are ${labels}, not proven — prove each`;
+  const ordinary =
+    below.length === 0
+      ? []
+      : below.length === 1
+        ? [`step ${below[0]?.index} is ${labels}, not proven`]
+        : [`steps ${below.map((s) => s.index).join(", ")} are ${labels}, not proven`];
+  const parts = [
+    ...ordinary,
+    ...changed.map((s) => `step ${s.index}: its proof no longer matches the session log`),
+  ];
+  const which = `${parts.join("; ")} — ${below.length + changed.length === 1 ? "prove it" : "prove each"}`;
   return `${plan.id} is not complete: ${which} with PlanComplete({step, evidence: [{toolUseId}]}) first.`;
+}
+
+/** A frozen proof's identity, so a proof swapped under the same id is not mistaken for it. */
+function proofKey(p: FrozenProof): string {
+  return JSON.stringify([p.toolUseId, p.sessionId, p.toolName, p.inputHash, p.resultDigest]);
 }
 
 /**
@@ -432,15 +451,17 @@ function goalUpdateRefusal(
   goalId: string,
   input: { readonly current?: number; readonly target?: number },
   next: LadderRecord & Pick<Goal, "target" | "current" | "unit">,
+  proofChanged = false,
 ): string | null {
-  if (!atTarget(next) || verifiedProven(next)) return null;
+  if (!atTarget(next) || (verifiedProven(next) && !proofChanged)) return null;
   const fields = [
     ...(input.current !== undefined ? [`current: ${input.current}`] : []),
     ...(input.target !== undefined ? [`target: ${input.target}`] : []),
   ].join(", ");
+  const label = verifiedProven(next) ? PROOF_CHANGED_LABEL : belowProvenLabel(next);
   const why = isProvenByAssertion(next)
     ? `${goalId} is proven (unverified), which under continuity.proof: require is not proven — reaching its target${progressOf(next)} would mark it achieved. Prove it again in the same call, with verified evidence`
-    : `${goalId} is ${belowProvenLabel(next)}, not proven — reaching its target${progressOf(next)} would mark it achieved. Prove it in the same call`;
+    : `${goalId} is ${label}, not proven — reaching its target${progressOf(next)} would mark it achieved. Prove it in the same call`;
   return `${why}: GoalUpdate({goalId: "${goalId}", ${fields}, status: "proven", evidence: [{toolUseId}]}), citing the call that measured it.`;
 }
 
@@ -568,6 +589,21 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
     bridge?.runState?.set({ [PLAN_DIRTY_STATE_KEY]: true });
   }
 
+  /**
+   * Under `require`, the verified steps whose frozen proof does not match
+   * its session log, read through the store's `recheckProofs`. `skip` is a
+   * step this call just verified. Only `require` calls it, so the ladder and
+   * `off` read no log here.
+   */
+  async function stepsWithChangedProofs(plan: PlanRecord, skip?: number): Promise<Set<number>> {
+    const changed = new Set<number>();
+    for (const step of plan.steps) {
+      if (step.index === skip || !verifiedProven(step)) continue;
+      if (!(await store.recheckProofs(step)).ok) changed.add(step.index);
+    }
+    return changed;
+  }
+
   async function resolvePlanId(planId: string | undefined): Promise<string> {
     if (planId !== undefined) return planId;
     const active = await store.getActivePlan();
@@ -689,7 +725,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
           if (proofMode === "require" && input.status === "claimed") {
             // `claimed` stays settable under require — it is honest progress
             // — but the reply says plainly that it completes nothing.
-            const note = incompletePlanNote(plan);
+            const note = incompletePlanNote(plan, await stepsWithChangedProofs(plan));
             return `${planId} step ${input.step} → claimed (unverified — under continuity.proof: require it completes nothing; prove it with PlanComplete({step: ${input.step}, evidence: [{toolUseId}]}))${
               note !== null ? `\n${note}` : ""
             }`;
@@ -802,9 +838,14 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
           .map((r) => r.toolUseId)
           .join(", ")}`;
         // Under require, proving the last open step of a plan whose other
-        // steps are claimed (or proven only by assertion) does not finish
-        // it; say which steps still need a verified proof.
-        const note = proofMode === "require" ? incompletePlanNote(plan) : null;
+        // steps are claimed (or proven only by assertion, or carry a proof
+        // their session log does not match) does not finish it; say which
+        // steps still need a verified proof. The step just proven was read
+        // from its log in this call, so it is not read again.
+        const note =
+          proofMode === "require"
+            ? incompletePlanNote(plan, await stepsWithChangedProofs(plan, input.step))
+            : null;
         return note !== null ? `${reply}\n${note}` : reply;
       } catch (err) {
         if (err instanceof EvidenceError) {
@@ -875,10 +916,20 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
       // completes nothing new.
       const guarded =
         proofMode === "require" && (input.current !== undefined || input.target !== undefined);
-      const refuseUnproven = (next: Parameters<typeof goalUpdateRefusal>[2]): void => {
-        const why = goalUpdateRefusal(input.goalId, input, next);
+      const refuseUnproven = (
+        next: Parameters<typeof goalUpdateRefusal>[2],
+        proofChanged: boolean,
+      ): void => {
+        const why = goalUpdateRefusal(input.goalId, input, next, proofChanged);
         if (why !== null) throw new ProofRequiredError(why);
       };
+      // Under require, each frozen proof the goal already carries is read
+      // again from its session log before it can carry the goal to its
+      // target; proofs this call cites are verified by the store itself.
+      const rechecked = new Set<string>();
+      const verifiedNow = new Set(
+        input.status === "proven" ? (evidence ?? []).map((r) => r.toolUseId) : [],
+      );
       if (guarded) {
         // Early refusal on a snapshot, before any evidence is resolved; it
         // holds whatever store wrapper is in use. The authoritative check is
@@ -886,21 +937,36 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
         // lock, so two sessions cannot each pass on a stale read. An unknown
         // id falls through to the store's own "no goal" error.
         const existing = (await store.listGoals()).find((g) => g.id === input.goalId);
+        let snapshotChanged = false;
+        for (const proof of existing?.proofs ?? []) {
+          if ((await store.recheckProofs({ proofs: [proof] })).ok) rechecked.add(proofKey(proof));
+          else snapshotChanged = true;
+        }
         // A call that sets `proven` resolves its evidence (require is the
         // ladder there), so it lands verified — with a frozen proof,
         // replacing any assertion — or not at all; the snapshot has nothing
         // to refuse in it.
         if (existing !== undefined && input.status !== "proven") {
-          refuseUnproven({
-            status: input.status ?? existing.status,
-            unverified: existing.unverified,
-            proofs: existing.proofs,
-            target: input.target ?? existing.target,
-            current: input.current ?? existing.current,
-            unit: input.unit ?? existing.unit,
-          });
+          refuseUnproven(
+            {
+              status: input.status ?? existing.status,
+              unverified: existing.unverified,
+              proofs: existing.proofs,
+              target: input.target ?? existing.target,
+              current: input.current ?? existing.current,
+              unit: input.unit ?? existing.unit,
+            },
+            snapshotChanged,
+          );
         }
       }
+      // Inside the lock: a proof on the record that was neither read again
+      // above nor verified in this call (another writer's, landed since the
+      // snapshot) fails closed.
+      const proofChangedOn = (next: Goal): boolean =>
+        (next.proofs ?? []).some(
+          (p) => !rechecked.has(proofKey(p)) && !verifiedNow.has(p.toolUseId),
+        );
       const patch: UpdateGoalInput = {
         ...(input.title !== undefined ? { title: input.title } : {}),
         ...(input.status !== undefined ? { status: input.status } : {}),
@@ -916,7 +982,9 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
         proofMode === "off"
           ? await store.updateGoal(input.goalId, patch, { verification: "unverified" })
           : guarded
-            ? await store.updateGoal(input.goalId, patch, { guard: (next) => refuseUnproven(next) })
+            ? await store.updateGoal(input.goalId, patch, {
+                guard: (next) => refuseUnproven(next, proofChangedOn(next)),
+              })
             : await store.updateGoal(input.goalId, patch);
       // `action_proof` is keyed by plan step, so a goal proven by assertion
       // is marked on its own `goal_update` instead: the log must not show it
@@ -968,7 +1036,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
       markPlanDirty(ctx);
       return (
         `cleared: ${input.scope} (${result.moved.length} file(s)/dir(s)) → ${result.trashDir}\n` +
-        `undo: crewhaus memory restore ${result.ts}`
+        `undo: crewhaus state restore --trash ${result.ts}`
       );
     },
   });

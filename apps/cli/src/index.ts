@@ -338,6 +338,7 @@ import {
 // redactor is injected.
 import {
   KnowledgeSyncError,
+  PULL_NEEDS_SPEC_REASON,
   type PullPlan,
   type PushPlan,
   type Redactor,
@@ -349,12 +350,15 @@ import {
   formatPushReport,
   fragmentContentHash,
   harnessOptedIn,
+  harnessSpecName,
   memoryContentHash,
   planPull,
   planPush,
+  readHarnessFactStates,
   readHarnessGraders,
   readHarnessMemories,
   readHarnessPrompts,
+  readRetractions,
   readSharedFragments,
   readSharedMemories,
 } from "@crewhaus/harness-lifecycle/knowledge-sync";
@@ -16326,13 +16330,15 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   if (args.flags["help"] === true && action === undefined) {
     process.stdout.write(
       "usage: crewhaus lessons update [--sessions N|all] [--low-score F] [-o <LESSONS.md>]\n" +
+        '       crewhaus lessons retire <lesson> [--reason "<r>"] [-o <LESSONS.md>]\n' +
         "  Mine corrections + recurring failure→fix patterns into a deduped LESSONS.md\n" +
         "  (auto-loaded into the system prompt), plus per-user prefs under .crewhaus/preferences/.\n",
     );
     return;
   }
+  if (action === "retire") return runEditVerb("runLessonsRetire", args);
   if (action !== "update") {
-    die(`lessons: unknown action "${action ?? ""}" — supported: update`);
+    die(`lessons: unknown action "${action ?? ""}" — supported: update, retire`);
   }
   const lowScore = floatFlag(args, "low-score") ?? 0.5;
   if (lowScore < 0 || lowScore > 1) die(`invalid --low-score "${lowScore}" — must be in [0,1]`);
@@ -16342,10 +16348,10 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   const { turns, feedback } = gatherTurnsAndFeedback(sessionIds);
 
   // Failure signals reuse dataset-mine's negative-signal detection.
-  const failureSignals: Array<{ input: string; reason: string }> = [];
+  const failureSignals: Array<{ input: string; reason: string; sessionId: string }> = [];
   for (const id of sessionIds) {
     for (const c of mineSession(id, readSessionEvents(id))) {
-      failureSignals.push({ input: c.input, reason: c.reason });
+      failureSignals.push({ input: c.input, reason: c.reason, sessionId: id });
     }
   }
   if (feedback.length === 0 && failureSignals.length === 0) {
@@ -16357,13 +16363,27 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
   const redact = async (t: string): Promise<string> => (await redactor.redact(t)).text;
 
-  const freshLessons = await mineLessons(turns, feedback, failureSignals, { lowScore, redact });
+  // A lesson a person retired is never added again.
+  const { lessonId, readRetiredLessons, recordLessonProvenance } = await import(
+    "./knowledge-edit-cmd"
+  );
+  const retired = readRetiredLessons(process.cwd());
+  const freshLessons = (
+    await mineLessons(turns, feedback, failureSignals, { lowScore, redact })
+  ).filter((l) => !retired.has(lessonId(l)));
 
   // Merge into the existing LESSONS.md, preserving its human-authored preamble.
   const lessonsFile = strFlag(args, "out") ?? join(process.cwd(), "LESSONS.md");
   const existingRaw = existsSync(lessonsFile) ? readFileSync(lessonsFile, "utf-8") : "";
   const { preamble, lessons: existing } = parseLessonsMd(existingRaw);
   const merged = mergeLessons(existing, freshLessons);
+  // Which sessions each new lesson came from (ids only), beside the file.
+  const known = new Set(existing.map((l) => l.key));
+  recordLessonProvenance(
+    process.cwd(),
+    freshLessons.filter((l) => !known.has(l.key)),
+    () => new Date(),
+  );
   // TODO(#56 F7): `merged` grows unbounded across updates (dedupe never evicts)
   // — add a cap/prune (e.g. keep the newest/highest-signal N lessons) so the
   // auto-injected LESSONS.md can't bloat the system prompt over time.
@@ -16658,6 +16678,40 @@ async function runSessionsTail(args: ParsedArgs): Promise<void> {
  * (trash + undo) deliberately do NOT live here — they arrive with the
  * continuity store (design §2.6).
  */
+/**
+ * Run one `./knowledge-edit-cmd` verb (memory correct|mark, wiki write|archive|
+ * rollback, state clear|trash|restore --trash, lessons retire) in this process:
+ * a refusal dies with its message, a conflict exits 1. Outside a terminal a
+ * verb that would ask refuses unless `--yes` was given.
+ */
+async function runEditVerb(
+  verb: keyof Omit<typeof import("./knowledge-edit-cmd"), "KnowledgeEditError">,
+  args: ParsedArgs,
+): Promise<void> {
+  const mod = await import("./knowledge-edit-cmd");
+  const run = mod[verb] as (
+    a: ParsedArgs,
+    io: import("./knowledge-edit-cmd").KnowledgeEditIo,
+  ) => Promise<0 | 1>;
+  try {
+    const code = await run(args, {
+      cwd: process.cwd(),
+      stdout: (line) => process.stdout.write(`${line}\n`),
+      now: () => new Date(),
+      confirm: async (prompt) => {
+        if (process.stdin.isTTY !== true) {
+          die(`${args.positional[0] ?? verb}: refusing without --yes outside a terminal`);
+        }
+        return promptYesNo(prompt);
+      },
+    });
+    if (code !== 0) process.exit(code);
+  } catch (err) {
+    if (err instanceof mod.KnowledgeEditError || err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
 async function runMemory(args: ParsedArgs): Promise<void> {
   const action = args.positional[0];
   if (args.flags["help"] === true && action === undefined) {
@@ -16666,7 +16720,10 @@ async function runMemory(args: ParsedArgs): Promise<void> {
         "       crewhaus memory show <mem_id> [--spec <name>]\n" +
         "       crewhaus memory forget <mem_id> | --query <q> [--spec <name>] [--yes]\n" +
         "       crewhaus memory sweep [--compact] [--spec <name>] [--yes]\n" +
+        '       crewhaus memory correct <mem_id> (--text "<t>" | --text-file <f>) --reason "<r>" [--spec <name>] [--yes]\n' +
+        "       crewhaus memory mark <mem_id> (--personal | --not-personal) [--spec <name>]\n" +
         "  Inspect + explicitly forget the per-spec memory stores under .crewhaus/memories/.\n" +
+        "  correct replaces a wrong fact with the right one; the old fact stays in history.\n" +
         "  forget appends supersede tombstones (append-only; never a hard delete); a --query\n" +
         "  forgets EVERY matching memory. sweep tombstones TTL-expired entries; --compact\n" +
         "  additionally rewrites the file dropping dead lines (atomic tmp+rename).\n",
@@ -16757,7 +16814,7 @@ async function runMemory(args: ParsedArgs): Promise<void> {
         return;
       }
       const forgotten = await store.forget((id ?? query) as string, {
-        reason: "crewhaus memory forget",
+        reason: strFlag(args, "reason") ?? "crewhaus memory forget",
       });
       process.stdout.write(
         `[memory] forgot ${forgotten.length} memory(ies) (superseded tombstones in ${store.path()})\n`,
@@ -16793,8 +16850,14 @@ async function runMemory(args: ParsedArgs): Promise<void> {
       }
       return;
     }
+    case "correct":
+      return runEditVerb("runMemoryCorrect", args);
+    case "mark":
+      return runEditVerb("runMemoryMark", args);
     default:
-      die(`memory: unknown action "${action ?? ""}" — supported: list, show, forget, sweep`);
+      die(
+        `memory: unknown action "${action ?? ""}" — supported: list, show, forget, sweep, correct, mark`,
+      );
   }
 }
 
@@ -16845,6 +16908,9 @@ async function runWiki(args: ParsedArgs): Promise<void> {
         "       crewhaus wiki show <slug> [--spec <name>]\n" +
         "       crewhaus wiki search <q> [--spec <name>] [-k <n>]\n" +
         "       crewhaus wiki stats [--spec <name>]\n" +
+        "       crewhaus wiki write <slug> --body-file <f> --expect <v> [--title <t>] [--spec <name>]\n" +
+        "       crewhaus wiki archive <slug> --expect <v> [--undo] [--spec <name>]\n" +
+        "       crewhaus wiki rollback <slug> --to <n> --expect <current> [--spec <name>]\n" +
         "  Inspect the per-spec local wikis under .crewhaus/wiki/ (versioned articles;\n" +
         "  priors are kept under versions/<slug>/ — superseded, never deleted). list is\n" +
         "  stalest-first (the REFLECT order); search is BM25 keyword ranking.\n",
@@ -16928,8 +16994,16 @@ async function runWiki(args: ParsedArgs): Promise<void> {
       }
       return;
     }
+    case "write":
+      return runEditVerb("runWikiWrite", args);
+    case "archive":
+      return runEditVerb("runWikiArchive", args);
+    case "rollback":
+      return runEditVerb("runWikiRollback", args);
     default:
-      die(`wiki: unknown action "${action ?? ""}" — supported: list, show, search, stats`);
+      die(
+        `wiki: unknown action "${action ?? ""}" — supported: list, show, search, stats, write, archive, rollback`,
+      );
   }
 }
 
@@ -18065,23 +18139,27 @@ async function runKnowledge(args: ParsedArgs, action: string): Promise<void> {
   try {
     if (doPush) {
       for (const h of optedIn) {
-        const existingMemoryHashes = new Set(
-          readSharedMemories(sharedDir).map((m) => m.contentHash),
-        );
+        const sharedMemoriesNow = readSharedMemories(sharedDir);
+        const existingMemoryHashes = new Set(sharedMemoriesNow.map((m) => m.contentHash));
         const existingFragmentHashes = new Set([
           ...readSharedFragments(sharedDir, "grader").map((f) => f.contentHash),
           ...readSharedFragments(sharedDir, "prompt").map((f) => f.contentHash),
         ]);
         const graders = readHarnessGraders(h.dir);
+        // Live, non-personal facts only; corrected or expired ones are retracted.
+        const facts = await readHarnessFactStates(h.dir);
         const plan: PushPlan = await planPush({
           harness: basename(h.dir),
-          memories: readHarnessMemories(h.dir),
+          memories: facts.live,
           ...(graders !== undefined ? { graders } : {}),
           prompts: readHarnessPrompts(h.dir),
           existingMemoryHashes,
           existingFragmentHashes,
           redact,
           now,
+          deadFacts: facts.dead,
+          sharedMemories: sharedMemoriesNow,
+          existingRetractions: readRetractions(sharedDir),
         });
         if (!dryRun) applyPush(sharedDir, plan, now);
         for (const line of formatPushReport(basename(h.dir), plan, dryRun)) {
@@ -18095,7 +18173,10 @@ async function runKnowledge(args: ParsedArgs, action: string): Promise<void> {
         ...readSharedFragments(sharedDir, "grader"),
         ...readSharedFragments(sharedDir, "prompt"),
       ];
+      const retractions = readRetractions(sharedDir);
       for (const h of optedIn) {
+        // Facts land in the harness's own spec store, so a pull needs its name.
+        const specName = harnessSpecName(h.dir);
         const harnessMemoryHashes = new Set(
           readHarnessMemories(h.dir).map((m) => memoryContentHash(m.text, m.tags)),
         );
@@ -18111,7 +18192,12 @@ async function runKnowledge(args: ParsedArgs, action: string): Promise<void> {
           harnessMemoryHashes,
           harnessFragmentHashes,
         });
-        if (!dryRun) applyPull(h.dir, plan, now);
+        if (specName === undefined && plan.memories.length > 0) {
+          process.stdout.write(`${basename(h.dir)}: pull refused — ${PULL_NEEDS_SPEC_REASON}\n`);
+          process.exitCode = 1;
+          continue;
+        }
+        if (!dryRun) await applyPull(h.dir, plan, now, { specName, retractions });
         for (const line of formatPullReport(basename(h.dir), plan, dryRun)) {
           process.stdout.write(`${line}\n`);
         }
@@ -18331,18 +18417,23 @@ async function runRetire(args: ParsedArgs): Promise<void> {
         );
         const redact = await buildProductionKnowledgeRedactor();
         const graders = readHarnessGraders(harnessDir);
+        const facts = await readHarnessFactStates(harnessDir);
+        const sharedMemoriesNow = readSharedMemories(sharedDir);
         const plan2 = await planPush({
           harness: registryName,
-          memories: readHarnessMemories(harnessDir),
+          memories: facts.live,
           ...(graders !== undefined ? { graders } : {}),
           prompts: readHarnessPrompts(harnessDir),
-          existingMemoryHashes: new Set(readSharedMemories(sharedDir).map((m) => m.contentHash)),
+          existingMemoryHashes: new Set(sharedMemoriesNow.map((m) => m.contentHash)),
           existingFragmentHashes: new Set([
             ...readSharedFragments(sharedDir, "grader").map((f) => f.contentHash),
             ...readSharedFragments(sharedDir, "prompt").map((f) => f.contentHash),
           ]),
           redact,
           now: () => new Date(),
+          deadFacts: facts.dead,
+          sharedMemories: sharedMemoriesNow,
+          existingRetractions: readRetractions(sharedDir),
         });
         applyPush(sharedDir, plan2, () => new Date());
         // Also drop a copy of the push plan into the archive for the record.
@@ -24107,10 +24198,16 @@ switch (subcommand) {
   }
   case "state": {
     const action = rest[0] ?? "";
-    if (action !== "backup" && action !== "restore") {
-      die(`state action must be "backup" or "restore" (got "${action}")`);
+    const stateArgs = parseFor(rest, STATE_SCHEMA);
+    if (action === "clear") await runEditVerb("runStateClear", stateArgs);
+    else if (action === "trash") await runEditVerb("runStateTrash", stateArgs);
+    else if (action === "restore" && stateArgs.flags["trash"] !== undefined) {
+      await runEditVerb("runStateRestoreTrash", stateArgs);
+    } else if (action === "backup" || action === "restore") {
+      await runState(parseFor(rest.slice(1), STATE_SCHEMA), action);
+    } else {
+      die(`state action must be one of backup, restore, clear, trash (got "${action}")`);
     }
-    await runState(parseFor(rest.slice(1), STATE_SCHEMA), action);
     break;
   }
   case "services": {

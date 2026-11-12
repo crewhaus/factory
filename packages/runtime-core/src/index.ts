@@ -248,6 +248,7 @@ import {
   relocatingFieldLeftOut,
   runtimeRecordRoots,
   runtimeStateRoots,
+  storeFileRoots,
 } from "./state-roots";
 import {
   type ServingModel,
@@ -2293,6 +2294,13 @@ export type RunChatLoopOptions = {
      * store failure leaves the volatile `<guide>` block in place and warns.
      */
     readonly savePlan?: (planText: string) => Promise<void>;
+    /**
+     * The continuity store's own files (`ContinuityStore.storeFiles()`): the
+     * floor refuses any tool but the store's own a write to one
+     * (`EvaluateOptions.protectedFiles`), and the tools that write beneath a
+     * directory check them on the bridge. Forwarded to sub-agents.
+     */
+    readonly storeFiles?: readonly string[];
   };
   /**
    * Item #56 — absolute paths to per-user preference files injected at run
@@ -4165,6 +4173,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // tool call the agent makes may write there, whatever a rule says
   // (permission-engine's runtime-state floor, `./state-roots`).
   const protectedRoots = runtimeStateRoots(sessionRootDir, currentTenantContext()?.tenant);
+  // The continuity store's own files: only its tools write them. Files, not
+  // roots, so a tool working on the whole of `.crewhaus/state` keeps working.
+  const protectedFiles = storeFileRoots(opts.continuity?.storeFiles ?? []);
   const credentialRoots =
     credentialFloorScope.getStore() === true ? credentialFileRoots() : undefined;
   const recordRoots = runtimeRecordRoots(sessionRootDir, currentTenantContext()?.tenant);
@@ -5741,7 +5752,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
       : undefined;
   const bridgeContinuitySeam =
-    opts.continuity !== undefined ? { loadPlan: opts.continuity.loadPlan } : undefined;
+    opts.continuity !== undefined
+      ? {
+          loadPlan: opts.continuity.loadPlan,
+          ...(opts.continuity.storeFiles !== undefined
+            ? { storeFiles: opts.continuity.storeFiles }
+            : {}),
+        }
+      : undefined;
   //   - provability: READ-ONLY (0.8.0 §8). The floor and the skill text cross;
   //     the verifier, the retry policy and the bundle store stay parent-side,
   //     so only this loop's final text is ever gated.
@@ -6739,6 +6757,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       {
         sandboxAvailable: opts.sandboxAvailable === true,
         protectedRoots,
+        ...(protectedFiles.length > 0 ? { protectedFiles } : {}),
         ...(credentialRoots !== undefined ? { credentialRoots } : {}),
       },
     );
@@ -6953,6 +6972,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   {
                     sandboxAvailable: opts.sandboxAvailable === true,
                     protectedRoots,
+                    ...(protectedFiles.length > 0 ? { protectedFiles } : {}),
                     ...(credentialRoots !== undefined ? { credentialRoots } : {}),
                   },
                 )
@@ -7450,7 +7470,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       eventLog,
       // 0.8.0 — the runtime-state roots, for the tools that write beneath a
       // directory they name and must not reach one (see RuntimeBridge).
-      ...(protectedRoots.length > 0 ? { protectedRoots } : {}),
+      ...(protectedRoots.length + protectedFiles.length > 0
+        ? { protectedRoots: [...protectedRoots, ...protectedFiles] }
+        : {}),
       // The files a `channel` or `managed` run keeps from its tools, for the tools
       // RuntimeBridge names.
       ...(credentialRoots !== undefined ? { credentialRoots } : {}),

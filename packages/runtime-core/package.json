@@ -64,7 +64,8 @@
   "devDependencies": {
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
-    "@crewhaus/tool-plan": "workspace:*"
+    "@crewhaus/tool-plan": "workspace:*",
+    "@crewhaus/tool-state": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

@@ -39,9 +39,24 @@
  * "expired", target: <id>, at, …}`) that the reader folds over the
  * entries. `recall()`/`size()` see only live entries. `compact()` is
  * the growth-bounding primitive (closes TODO #53 F7): it rewrites the
- * file atomically (tmp + rename) dropping tombstoned/expired entries
- * and the tombstone lines themselves; parseable lines it does not
- * recognise (future line kinds) are preserved verbatim.
+ * file atomically (tmp + rename) without tombstoned/expired entries,
+ * the tombstone lines themselves and annotations of dead entries, and
+ * moves every line it removes to the archive (below); parseable lines it
+ * does not recognise (future line kinds) are preserved verbatim.
+ *
+ * ## Corrections, annotations and the archive (history is never rewritten)
+ *
+ * `supersede()` replaces a live fact with a corrected one: one append holds
+ * the successor (its `provenance.correctionOf` names the old id) and the
+ * old fact's tombstone (its `supersededBy` names the successor).
+ * `annotate()` appends a `{annotate: "category", target, value}` line that
+ * `list()` folds last-wins. `compact()` appends every line it drops to
+ * `<rootDir>/archive/<spec>/NNNNNN.jsonl` (rolling segments) before the live
+ * file is replaced, and `history()` reads them back, oldest first.
+ *
+ * Every write takes one lock, `<rootDir>/.<spec>.lock`, so a compaction
+ * never loses a fact remembered while it ran. The dot-name and the
+ * `archive/` directory are invisible to readers that list `*.jsonl`.
  *
  * ## Hybrid recall (design §3.4)
  *
@@ -58,10 +73,16 @@
  * write-path-governance rule: facts proven by tool runs outrank
  * pure-text claims of equal textual relevance.
  */
-import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, existsSync, mkdirSync, readSync, readdirSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { type Ledger, type LockedAppend, withLedgerLock } from "@crewhaus/control-records";
 import { CrewhausError } from "@crewhaus/errors";
-import { appendContained, openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
+import {
+  appendContained,
+  openForRead,
+  openForReadFd,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/memories";
 
@@ -75,12 +96,35 @@ export const MEMORY_FILE_MAX_BYTES = 512 * 1024 * 1024;
 /** Schema version stamped on every new write. Absent = v1 (read lazily). */
 export const MEMORY_SCHEMA_VERSION = 2;
 
+/** Who wrote a fact: a person, the agent, the extractor or a knowledge sync. */
+export type MemoryAuthor = {
+  readonly kind: "operator" | "agent" | "extractor" | "sync";
+  /** How it arrived, such as `"cli"`. */
+  readonly via?: string;
+  /** The command that wrote it, when one was recorded. */
+  readonly cmd?: string;
+};
+
+/** Where a pulled fact came from: the harness that shared it, and its content hash. */
+export type MemorySyncOrigin = {
+  readonly kind: "sync";
+  readonly harness: string;
+  /** The fact's id in the harness that shared it, when known. */
+  readonly fact?: string;
+  readonly contentHash: string;
+};
+
 /** Where a memory came from, and which tool runs prove it (toolUseIds). */
 export type MemoryProvenance = {
   readonly sessionId?: string;
   /** toolUseIds from the source session's event log — proof the fact is
    *  grounded in tool results, not just assistant narration. */
   readonly evidence?: readonly string[];
+  /** The id of the fact this one corrects (set by `supersede`). */
+  readonly correctionOf?: string;
+  readonly author?: MemoryAuthor;
+  /** Set on a fact a knowledge sync pulled in from another harness. */
+  readonly origin?: MemorySyncOrigin;
 };
 
 export type MemoryEntry = {
@@ -100,9 +144,14 @@ export type MemoryEntry = {
 /** Lifecycle status of an entry, materialized at read time. */
 export type MemoryEntryStatus = "live" | "superseded" | "expired";
 
+/** The one category an annotation can set today: the fact is about a person. */
+export type MemoryCategory = "person";
+
 export type MemoryListItem = {
   readonly entry: MemoryEntry;
   readonly status: MemoryEntryStatus;
+  /** Folded last-wins from `annotate()` lines; absent when none set one. */
+  readonly category?: MemoryCategory;
 };
 
 export type MemoryRecallResult = {
@@ -155,6 +204,59 @@ export type RememberOptions = {
 export type ForgetOptions = {
   /** Recorded on the tombstone line for later audit. */
   readonly reason?: string;
+  /** The id of the fact that replaces the forgotten one, as a structured link. */
+  readonly supersededBy?: string;
+  /** Who forgot it, recorded on the tombstone. */
+  readonly by?: string;
+  /** The command that forgot it, recorded on the tombstone. */
+  readonly cmd?: string;
+};
+
+export type SupersedeOptions = {
+  /** The successor's tags; default the old fact's tags. */
+  readonly tags?: readonly string[];
+  /** Why the fact was corrected, recorded on the tombstone. */
+  readonly reason: string;
+  /** Stamped into the successor's `provenance.author`. */
+  readonly author?: MemoryAuthor;
+  /** Further provenance for the successor (`correctionOf` and `author` are set here). */
+  readonly provenance?: MemoryProvenance;
+  /** Recorded on the tombstone. */
+  readonly by?: string;
+  /** Recorded on the tombstone. */
+  readonly cmd?: string;
+};
+
+export type SupersedeResult = {
+  /** The new, live fact. */
+  readonly successor: MemoryEntry;
+  /** The old fact, now superseded by `successor`. */
+  readonly superseded: MemoryEntry;
+};
+
+export type AnnotateOptions = {
+  /** `"person"` marks a fact as personal; `null` clears the mark. */
+  readonly category: MemoryCategory | null;
+};
+
+/** An append-only annotation line, folded last-wins over its target entry. */
+export type MemoryAnnotation = {
+  readonly annotate: "category";
+  readonly target: string;
+  readonly value: MemoryCategory | null;
+  readonly at: string;
+  readonly schemaVersion: number;
+};
+
+/** One line compaction moved out of the live file, as `history()` returns it. */
+export type MemoryArchivedLine = {
+  readonly v: 1;
+  readonly archivedAt: string;
+  readonly cause: "compaction";
+  /** The parsed line: an entry, a tombstone or an annotation. */
+  readonly line?: unknown;
+  /** An unparseable line's text, kept as it was. */
+  readonly raw?: string;
 };
 
 export type SweepResult = {
@@ -169,6 +271,8 @@ export type CompactResult = {
   readonly kept: number;
   /** Lines dropped (dead entries, tombstones, unparseable lines). */
   readonly dropped: number;
+  /** Lines appended to the archive: every dropped line. */
+  readonly archived: number;
 };
 
 export interface MemoryStore {
@@ -195,11 +299,28 @@ export interface MemoryStore {
   sweep(nowMs?: number): Promise<SweepResult>;
   /**
    * Growth-bounding rewrite (TODO #53 F7): drops tombstoned/expired
-   * entries and tombstone lines, preserving live entries (v1 lines
-   * untouched) and parseable-but-unknown lines verbatim. Atomic via
-   * tmp + rename.
+   * entries, tombstone lines and annotations of dead entries, preserving
+   * live entries (v1 lines untouched) and parseable-but-unknown lines
+   * verbatim. Every dropped line is appended to the archive first, and a
+   * line appended while it ran is kept. Atomic via tmp + rename.
    */
   compact(): Promise<CompactResult>;
+  /**
+   * Correct a live fact: append its successor and the old fact's tombstone in
+   * one write. Refuses a fact that is not live with {@link MemoryNotLiveError}
+   * and an unknown id with {@link MemoryNotFoundError}. A re-run after a torn
+   * write finds the successor it already appended and adds only the tombstone.
+   */
+  supersede(id: string, text: string, opts: SupersedeOptions): Promise<SupersedeResult>;
+  /** Mark (or unmark) a fact as personal. Refuses an unknown id with {@link MemoryNotFoundError}. */
+  annotate(id: string, opts: AnnotateOptions): Promise<void>;
+  /** Every line compaction archived, oldest first, a line archived twice read once. */
+  history(): Promise<readonly MemoryArchivedLine[]>;
+  /**
+   * Append each given entry whose id is not already in the file (live or dead),
+   * in one write. Returns the ids it added. The knowledge sync's pull uses it.
+   */
+  importSynced(entries: ReadonlyArray<MemoryEntry>): Promise<readonly string[]>;
   /** Every entry in file order with its materialized lifecycle status. */
   list(): Promise<readonly MemoryListItem[]>;
   /** Diagnostic: how many LIVE entries are stored. */
@@ -217,11 +338,55 @@ export interface MemoryStore {
 }
 
 export class MemoryStoreError extends CrewhausError {
-  override readonly name = "MemoryStoreError";
+  override readonly name: string = "MemoryStoreError";
   constructor(message: string, cause?: unknown) {
     super("config", message, cause);
   }
 }
+
+/** A correction or forget aimed at a fact that is already superseded or expired. */
+export class MemoryNotLiveError extends MemoryStoreError {
+  override readonly name = "MemoryNotLiveError";
+  readonly id: string;
+  readonly status: Exclude<MemoryEntryStatus, "live">;
+  readonly supersededBy: string | undefined;
+  constructor(id: string, status: Exclude<MemoryEntryStatus, "live">, supersededBy?: string) {
+    super(
+      `${id} is ${status}${supersededBy !== undefined ? ` (replaced by ${supersededBy})` : ""}, so it cannot be corrected; correct the live fact instead`,
+    );
+    this.id = id;
+    this.status = status;
+    this.supersededBy = supersededBy;
+  }
+}
+
+/** An id that no line in the store names. */
+export class MemoryNotFoundError extends MemoryStoreError {
+  override readonly name = "MemoryNotFoundError";
+  readonly id: string;
+  constructor(id: string) {
+    super(`no fact ${id} in this store`);
+    this.id = id;
+  }
+}
+
+/** Test seams for `compact()`: run code between its steps to force an interleaving. */
+export type CompactSeams = {
+  /** After the snapshot is read, before the lock is taken. */
+  readonly afterSnapshot?: () => void | Promise<void>;
+  /** Under the lock, after the archive append, before the last re-stat. */
+  readonly beforeFinalStat?: () => void | Promise<void>;
+};
+
+let compactSeams: CompactSeams = {};
+
+/** Test seam: force an interleaving in `compact()`. Pass `undefined` to restore. */
+export function _setCompactSeamsForTest(next: CompactSeams | undefined): void {
+  compactSeams = next ?? {};
+}
+
+/** The archive's segment names: six digits and `.jsonl`. */
+const ARCHIVE_SEGMENT_RE = /^\d{6}\.jsonl$/;
 
 const DEFAULT_K = 5;
 const ID_PREFIX = "mem_";
@@ -244,17 +409,24 @@ export type MemoryTombstone = {
   readonly schemaVersion: number;
   readonly supersededBy?: string;
   readonly reason?: string;
+  readonly by?: string;
+  readonly cmd?: string;
 };
 
 /**
  * Construct a memory store for a given spec. The store is lazy — the
  * underlying file is created on the first `remember()` call.
  */
+/** Whether `name` can name a memory store: `[a-zA-Z0-9_\-.]+`, so it is one file name. */
+export function isMemorySpecName(name: string): boolean {
+  return /^[a-zA-Z0-9_\-.]+$/.test(name);
+}
+
 export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
   if (!opts.specName) {
     throw new MemoryStoreError("specName is required");
   }
-  if (!/^[a-zA-Z0-9_\-.]+$/.test(opts.specName)) {
+  if (!isMemorySpecName(opts.specName)) {
     throw new MemoryStoreError(
       `invalid specName "${opts.specName}" — must match [a-zA-Z0-9_\\-.]+`,
     );
@@ -311,29 +483,79 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
     if (!appended.ok) throw refused("append to", appended.reason);
   }
 
+  const lockName = `.${opts.specName}.lock`;
+  const archiveDir = join("archive", opts.specName);
+  /** The fact lock and the archive, on control-records' one lock policy. */
+  const ledger: Ledger = {
+    root: resolve(rootDir),
+    lock: lockName,
+    records: { dir: archiveDir },
+    // Never written: the archive takes no claims.
+    claims: join(archiveDir, ".claims"),
+  };
+
+  /**
+   * Run `fn` holding `<rootDir>/.<spec>.lock`. A lock that cannot be taken
+   * (file-lock's error names the holder pid) and a refused lock directory
+   * both become a `MemoryStoreError` naming the file; an error `fn` throws
+   * passes through unchanged.
+   */
+  async function withStoreLock<T>(fn: (lockedAppend: LockedAppend) => Promise<T> | T): Promise<T> {
+    await ensureRootDir();
+    let inner: { readonly err: unknown } | undefined;
+    let answer: { readonly value: T } | { readonly ok: false; readonly reason: string };
+    try {
+      answer = await withLedgerLock(ledger, async (lockedAppend) => {
+        try {
+          return { value: await fn(lockedAppend) };
+        } catch (err) {
+          inner = { err };
+          throw err;
+        }
+      });
+    } catch (err) {
+      if (inner !== undefined) throw inner.err;
+      throw new MemoryStoreError(
+        `could not lock ${fileName} in ${rootDir} (${lockName}): ${(err as Error).message}`,
+        err,
+      );
+    }
+    if ("value" in answer) return answer.value;
+    throw new MemoryStoreError(
+      `could not lock ${fileName} in ${rootDir} (${lockName}): ${answer.reason}`,
+    );
+  }
+
   type Loaded = {
     readonly entries: MemoryEntry[];
     readonly tombstones: MemoryTombstone[];
+    readonly annotations: MemoryAnnotation[];
   };
 
-  async function loadAll(): Promise<Loaded> {
-    const entries: MemoryEntry[] = [];
-    const tombstones: MemoryTombstone[] = [];
-    for (const line of await readLines()) {
-      try {
-        const parsed = JSON.parse(line) as unknown;
-        if (isMemoryEntry(parsed)) entries.push(parsed);
-        else if (isMemoryTombstone(parsed)) tombstones.push(parsed);
-      } catch {
-        // Malformed line — skip. Append-only writes mean partial-write
-        // corruption is the most likely failure mode; one bad line
-        // shouldn't block recall on the others.
-      }
+  function parseInto(line: string, into: Loaded): void {
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (isMemoryEntry(parsed)) into.entries.push(parsed);
+      else if (isMemoryTombstone(parsed)) into.tombstones.push(parsed);
+      else if (isMemoryAnnotation(parsed)) into.annotations.push(parsed);
+    } catch {
+      // Malformed line — skip. Append-only writes mean partial-write
+      // corruption is the most likely failure mode; one bad line
+      // shouldn't block recall on the others.
     }
-    return { entries, tombstones };
   }
 
-  /** Fold tombstones + TTL over the raw entries into status-carrying items. */
+  function loadLines(lines: ReadonlyArray<string>): Loaded {
+    const loaded: Loaded = { entries: [], tombstones: [], annotations: [] };
+    for (const line of lines) parseInto(line, loaded);
+    return loaded;
+  }
+
+  async function loadAll(): Promise<Loaded> {
+    return loadLines(await readLines());
+  }
+
+  /** Fold tombstones, TTL and annotations over the raw entries into status-carrying items. */
   function materialize(loaded: Loaded, nowMs: number): MemoryListItem[] {
     const superseded = new Map<string, MemoryTombstone>();
     const expired = new Set<string>();
@@ -341,19 +563,25 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
       if (t.tombstone === "superseded") superseded.set(t.target, t);
       else expired.add(t.target);
     }
+    // Last annotation wins: file order is write order.
+    const category = new Map<string, MemoryCategory | null>();
+    for (const a of loaded.annotations) category.set(a.target, a.value);
     return loaded.entries.map((entry) => {
+      const cat = category.get(entry.id);
+      const extra = cat !== undefined && cat !== null ? { category: cat } : {};
       const sup = superseded.get(entry.id);
       if (sup !== undefined || entry.supersededBy !== undefined) {
         const supersededBy = entry.supersededBy ?? sup?.supersededBy;
         return {
           entry: supersededBy !== undefined ? { ...entry, supersededBy } : entry,
           status: "superseded" as const,
+          ...extra,
         };
       }
       if (expired.has(entry.id) || (entry.expiresAt !== undefined && nowMs >= entry.expiresAt)) {
-        return { entry, status: "expired" as const };
+        return { entry, status: "expired" as const, ...extra };
       }
-      return { entry, status: "live" as const };
+      return { entry, status: "live" as const, ...extra };
     });
   }
 
@@ -373,27 +601,132 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
     return `${ID_PREFIX}${hex}`;
   }
 
-  async function appendTombstones(
+  type TombstoneFields = Pick<MemoryTombstone, "reason" | "supersededBy" | "by" | "cmd">;
+
+  function tombstoneLine(
+    target: string,
+    kind: MemoryTombstone["tombstone"],
+    at: string,
+    fields: TombstoneFields,
+  ): string {
+    const t: MemoryTombstone = {
+      tombstone: kind,
+      target,
+      at,
+      schemaVersion: MEMORY_SCHEMA_VERSION,
+      ...(fields.supersededBy !== undefined ? { supersededBy: fields.supersededBy } : {}),
+      ...(fields.reason !== undefined ? { reason: fields.reason } : {}),
+      ...(fields.by !== undefined ? { by: fields.by } : {}),
+      ...(fields.cmd !== undefined ? { cmd: fields.cmd } : {}),
+    };
+    return JSON.stringify(t);
+  }
+
+  /** Append one tombstone per target in one write. The caller holds the lock. */
+  function appendTombstones(
     targets: ReadonlyArray<MemoryEntry>,
     kind: MemoryTombstone["tombstone"],
-    reason?: string,
-  ): Promise<void> {
+    fields: TombstoneFields = {},
+  ): void {
     if (targets.length === 0) return;
-    await ensureRootDir();
     const at = now().toISOString();
-    const lines = targets
-      .map((e) => {
-        const t: MemoryTombstone = {
-          tombstone: kind,
-          target: e.id,
-          at,
-          schemaVersion: MEMORY_SCHEMA_VERSION,
-          ...(reason !== undefined ? { reason } : {}),
-        };
-        return JSON.stringify(t);
-      })
-      .join("\n");
+    const lines = targets.map((e) => tombstoneLine(e.id, kind, at, fields)).join("\n");
     appendLines(`${lines}\n`);
+  }
+
+  /** A contained read of the live file from `position` to its end, with its identity. */
+  type Snapshot = {
+    readonly bytes: Buffer;
+    /** The file's size when read. */
+    readonly size: number;
+    readonly dev: number;
+    readonly ino: number;
+  };
+
+  /** Read the live file from `position`; `undefined` when it is not there. */
+  function readFrom(position: number): Snapshot | undefined {
+    const opened = openForReadFd(rootDir, fileName, { followLeafSymlink: false });
+    if (!opened.ok) {
+      if (opened.code === "not-found") return undefined;
+      throw refused("read", opened.reason);
+    }
+    try {
+      const size = opened.stats.size;
+      if (size > MEMORY_FILE_MAX_BYTES) {
+        throw new MemoryStoreError(
+          `${fileName} in ${rootDir} is larger than ${MEMORY_FILE_MAX_BYTES} bytes, so it was not read; archive or trim it (crewhaus memory sweep --compact rewrites it without forgotten entries)`,
+        );
+      }
+      const length = Math.max(0, size - position);
+      const bytes = Buffer.alloc(length);
+      let done = 0;
+      while (done < length) {
+        const got = readSync(opened.fd, bytes, done, length - done, position + done);
+        if (got === 0) break;
+        done += got;
+      }
+      return {
+        bytes: done === length ? bytes : bytes.subarray(0, done),
+        size: position + done,
+        dev: opened.stats.dev,
+        ino: opened.stats.ino,
+      };
+    } finally {
+      closeSync(opened.fd);
+    }
+  }
+
+  /** Split bytes into lines: whole lines, then any final unterminated fragment. */
+  function splitLines(bytes: Buffer): string[] {
+    return bytes
+      .toString("utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "");
+  }
+
+  /** The archive line for one dropped live-file line. */
+  function archiveRecord(line: string, archivedAt: string): Record<string, unknown> {
+    try {
+      return { v: 1, archivedAt, cause: "compaction", line: JSON.parse(line) as unknown };
+    } catch {
+      return { v: 1, archivedAt, cause: "compaction", raw: line };
+    }
+  }
+
+  /** Which lines of a snapshot compaction keeps and which it moves to the archive. */
+  function splitKeptDropped(
+    lines: ReadonlyArray<string>,
+    nowMs: number,
+  ): { kept: string[]; dropped: string[] } {
+    const items = materialize(loadLines(lines), nowMs);
+    const liveIds = new Set(items.filter((i) => i.status === "live").map((i) => i.entry.id));
+    const kept: string[] = [];
+    const dropped: string[] = [];
+    for (const line of lines) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        dropped.push(line); // unparseable partial-write junk, kept in the archive as text
+        continue;
+      }
+      if (isMemoryEntry(parsed)) {
+        (liveIds.has(parsed.id) ? kept : dropped).push(line);
+        continue;
+      }
+      if (isMemoryTombstone(parsed)) {
+        dropped.push(line); // its target is gone — the tombstone has no referent
+        continue;
+      }
+      if (isMemoryAnnotation(parsed)) {
+        (liveIds.has(parsed.target) ? kept : dropped).push(line);
+        continue;
+      }
+      // Parseable but unknown line kind (a future writer's) — preserve
+      // verbatim so compact never destroys forward-compatible data.
+      kept.push(line);
+    }
+    return { kept, dropped };
   }
 
   /**
@@ -531,12 +864,12 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
           : {}),
         ...(rememberOpts.provenance !== undefined ? { provenance: rememberOpts.provenance } : {}),
       };
-      await ensureRootDir();
       // #53 F7 (unbounded growth) is addressed by the explicit-forgetting
       // primitives: `sweep()` tombstones expired entries, `forget()`
       // supersedes stale ones, and `compact()` rewrites the file dropping
-      // dead lines (`crewhaus memory sweep --compact` runs both).
-      appendLines(`${JSON.stringify(entry)}\n`);
+      // dead lines (`crewhaus memory sweep --compact` runs both). The lock
+      // keeps this append out of a compaction's window.
+      await withStoreLock(() => appendLines(`${JSON.stringify(entry)}\n`));
       return entry;
     },
 
@@ -559,80 +892,256 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
       if (typeof idOrQuery !== "string" || idOrQuery.length === 0) {
         throw new MemoryStoreError("forget(): idOrQuery must be a non-empty string");
       }
-      const live = await loadLive();
-      let targets: MemoryEntry[];
-      if (ENTRY_ID_RE.test(idOrQuery)) {
-        // Id-shaped input NEVER falls back to text matching — forgetting
-        // a missing id must forget nothing.
-        targets = live.filter((e) => e.id === idOrQuery);
-      } else {
-        targets = bm25Rank(live, idOrQuery).map((r) => r.entry);
-      }
-      await appendTombstones(targets, "superseded", forgetOpts.reason);
-      return targets;
+      const fields: TombstoneFields = {
+        ...(forgetOpts.reason !== undefined ? { reason: forgetOpts.reason } : {}),
+        ...(forgetOpts.supersededBy !== undefined ? { supersededBy: forgetOpts.supersededBy } : {}),
+        ...(forgetOpts.by !== undefined ? { by: forgetOpts.by } : {}),
+        ...(forgetOpts.cmd !== undefined ? { cmd: forgetOpts.cmd } : {}),
+      };
+      return withStoreLock(async () => {
+        const live = await loadLive();
+        let targets: MemoryEntry[];
+        if (ENTRY_ID_RE.test(idOrQuery)) {
+          // Id-shaped input NEVER falls back to text matching — forgetting
+          // a missing id must forget nothing.
+          targets = live.filter((e) => e.id === idOrQuery);
+        } else {
+          targets = bm25Rank(live, idOrQuery).map((r) => r.entry);
+        }
+        appendTombstones(targets, "superseded", fields);
+        return targets;
+      });
     },
 
     async sweep(nowMs?: number): Promise<SweepResult> {
       const at = nowMs ?? now().getTime();
-      const loaded = await loadAll();
-      const items = materialize(loaded, at);
-      // Only past-expiry entries that carry NO tombstone yet get one, so
-      // re-running at the same time appends nothing (idempotent).
-      const tombstoned = new Set(loaded.tombstones.map((t) => t.target));
-      const fresh = items
-        .filter(
-          (i) =>
-            i.status === "expired" &&
-            i.entry.expiresAt !== undefined &&
-            at >= i.entry.expiresAt &&
-            !tombstoned.has(i.entry.id),
-        )
-        .map((i) => i.entry);
-      await appendTombstones(fresh, "expired");
-      const live = items.filter((i) => i.status === "live").length;
-      return { swept: fresh.length, live };
+      return withStoreLock(async () => {
+        const loaded = await loadAll();
+        const items = materialize(loaded, at);
+        // Only past-expiry entries that carry NO tombstone yet get one, so
+        // re-running at the same time appends nothing (idempotent).
+        const tombstoned = new Set(loaded.tombstones.map((t) => t.target));
+        const fresh = items
+          .filter(
+            (i) =>
+              i.status === "expired" &&
+              i.entry.expiresAt !== undefined &&
+              at >= i.entry.expiresAt &&
+              !tombstoned.has(i.entry.id),
+          )
+          .map((i) => i.entry);
+        appendTombstones(fresh, "expired");
+        const live = items.filter((i) => i.status === "live").length;
+        return { swept: fresh.length, live };
+      });
     },
 
     async compact(): Promise<CompactResult> {
-      const lines = await readLines();
-      if (lines.length === 0) return { kept: 0, dropped: 0 };
-      const loaded = await loadAll();
-      const items = materialize(loaded, now().getTime());
-      const liveIds = new Set(items.filter((i) => i.status === "live").map((i) => i.entry.id));
-      const kept: string[] = [];
-      let dropped = 0;
-      for (const line of lines) {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          dropped += 1; // unparseable partial-write junk
-          continue;
+      // 1. Outside the lock: the snapshot, up to its last whole line. A
+      //    fragment past it is re-read under the lock with the rest of the tail.
+      const snap = readFrom(0);
+      if (snap === undefined || snap.size === 0) return { kept: 0, dropped: 0, archived: 0 };
+      await compactSeams.afterSnapshot?.();
+      return withStoreLock(async (lockedAppend) => {
+        // 2. Under the lock: the same file, grown or not. A file another
+        //    compaction replaced since the snapshot is read again, whole.
+        const current = readFrom(0);
+        if (current === undefined) return { kept: 0, dropped: 0, archived: 0 };
+        const outside = snap as Snapshot;
+        const base = current.dev !== outside.dev || current.ino !== outside.ino ? current : outside;
+        const noted = base.bytes.lastIndexOf(0x0a) + 1;
+        const { kept, dropped } = splitKeptDropped(
+          splitLines(base.bytes.subarray(0, noted)),
+          now().getTime(),
+        );
+        let position = noted;
+        const tail: string[] = [];
+        const copyTail = (): void => {
+          const more = readFrom(position);
+          if (more === undefined || more.dev !== base.dev || more.ino !== base.ino) return;
+          tail.push(...splitLines(more.bytes));
+          position = more.size;
+        };
+        copyTail();
+        // 3. Every dropped line to the archive, before the live file loses it.
+        const archivedAt = now().toISOString();
+        for (const line of dropped) {
+          const appended = lockedAppend(archiveRecord(line, archivedAt));
+          if (!appended.ok) {
+            throw new MemoryStoreError(
+              `refusing to archive ${fileName} lines in ${rootDir}: ${appended.reason}; the live file was not changed`,
+            );
+          }
         }
-        if (isMemoryEntry(parsed)) {
-          if (liveIds.has(parsed.id)) kept.push(line);
-          else dropped += 1;
-          continue;
-        }
-        if (isMemoryTombstone(parsed)) {
-          dropped += 1; // its target is gone — the tombstone has no referent
-          continue;
-        }
-        // Parseable but unknown line kind (a future writer's) — preserve
-        // verbatim so compact never destroys forward-compatible data.
-        kept.push(line);
+        // 4. Once more: a writer that went round a stolen lock appended here.
+        await compactSeams.beforeFinalStat?.();
+        copyTail();
+        // 5. A random O_EXCL temp beside the file, renamed into place: the
+        //    replaced file keeps its permission bits.
+        const lines = [...kept, ...tail];
+        const written = writeFileSafe(
+          rootDir,
+          fileName,
+          lines.length > 0 ? `${lines.join("\n")}\n` : "",
+          { overwrite: true, mode: 0o600 },
+        );
+        if (!written.ok) throw refused("rewrite", written.reason);
+        embeddingCache.clear();
+        return { kept: lines.length, dropped: dropped.length, archived: dropped.length };
+      });
+    },
+
+    async supersede(
+      id: string,
+      text: string,
+      supersedeOpts: SupersedeOptions,
+    ): Promise<SupersedeResult> {
+      if (typeof text !== "string" || text.length === 0) {
+        throw new MemoryStoreError("supersede(): text must be a non-empty string");
       }
-      // A random O_EXCL temp beside the file, renamed into place: the
-      // replaced file keeps its permission bits.
-      const written = writeFileSafe(
-        rootDir,
-        fileName,
-        kept.length > 0 ? `${kept.join("\n")}\n` : "",
-        { overwrite: true, mode: 0o600 },
-      );
-      if (!written.ok) throw refused("rewrite", written.reason);
-      embeddingCache.clear();
-      return { kept: kept.length, dropped };
+      if (typeof supersedeOpts?.reason !== "string" || supersedeOpts.reason.trim() === "") {
+        throw new MemoryStoreError("supersede(): a reason is required");
+      }
+      if (!ENTRY_ID_RE.test(id)) {
+        throw new MemoryStoreError(
+          `supersede(): ${JSON.stringify(id)} is not a fact id (mem_<16 hex>)`,
+        );
+      }
+      return withStoreLock(async () => {
+        const items = materialize(await loadAll(), now().getTime());
+        const target = items.find((i) => i.entry.id === id);
+        if (target === undefined) throw new MemoryNotFoundError(id);
+        if (target.status !== "live") {
+          throw new MemoryNotLiveError(id, target.status, target.entry.supersededBy);
+        }
+        const at = now().toISOString();
+        const tombstoneFields = (successorId: string): TombstoneFields => ({
+          supersededBy: successorId,
+          reason: supersedeOpts.reason,
+          ...(supersedeOpts.by !== undefined ? { by: supersedeOpts.by } : {}),
+          ...(supersedeOpts.cmd !== undefined ? { cmd: supersedeOpts.cmd } : {}),
+        });
+        // Repair: a crash after the successor and before the tombstone left a
+        // live successor of this fact with this text. Finish that write.
+        const torn = items.find(
+          (i) =>
+            i.status === "live" && i.entry.provenance?.correctionOf === id && i.entry.text === text,
+        );
+        if (torn !== undefined) {
+          appendLines(`${tombstoneLine(id, "superseded", at, tombstoneFields(torn.entry.id))}\n`);
+          return {
+            successor: torn.entry,
+            superseded: { ...target.entry, supersededBy: torn.entry.id },
+          };
+        }
+        const provenance: MemoryProvenance = {
+          ...(supersedeOpts.provenance ?? {}),
+          correctionOf: id,
+          ...(supersedeOpts.author !== undefined ? { author: supersedeOpts.author } : {}),
+        };
+        const successor: MemoryEntry = {
+          id: mkId(),
+          text,
+          tags: [...(supersedeOpts.tags ?? target.entry.tags)],
+          createdAt: at,
+          schemaVersion: MEMORY_SCHEMA_VERSION,
+          provenance,
+        };
+        // One append: the successor and the tombstone land together.
+        appendLines(
+          `${JSON.stringify(successor)}\n${tombstoneLine(id, "superseded", at, tombstoneFields(successor.id))}\n`,
+        );
+        return { successor, superseded: { ...target.entry, supersededBy: successor.id } };
+      });
+    },
+
+    async annotate(id: string, annotateOpts: AnnotateOptions): Promise<void> {
+      const value = annotateOpts?.category;
+      if (value !== "person" && value !== null) {
+        throw new MemoryStoreError('annotate(): category must be "person" or null');
+      }
+      await withStoreLock(async () => {
+        const loaded = await loadAll();
+        if (!loaded.entries.some((e) => e.id === id)) throw new MemoryNotFoundError(id);
+        const line: MemoryAnnotation = {
+          annotate: "category",
+          target: id,
+          value,
+          at: now().toISOString(),
+          schemaVersion: MEMORY_SCHEMA_VERSION,
+        };
+        appendLines(`${JSON.stringify(line)}\n`);
+      });
+    },
+
+    async history(): Promise<readonly MemoryArchivedLine[]> {
+      let names: string[];
+      try {
+        names = readdirSync(join(rootDir, archiveDir), { withFileTypes: true })
+          .filter((e) => e.isFile() && ARCHIVE_SEGMENT_RE.test(e.name))
+          .map((e) => e.name)
+          .sort();
+      } catch {
+        return []; // no archive yet
+      }
+      const out: MemoryArchivedLine[] = [];
+      const seen = new Set<string>();
+      for (const name of names) {
+        const rel = join(archiveDir, name);
+        const read = await openForRead(rootDir, rel, {
+          maxBytes: MEMORY_FILE_MAX_BYTES,
+          followLeafSymlink: false,
+        });
+        if (!read.ok) {
+          if (read.code === "not-found") continue;
+          throw new MemoryStoreError(`refusing to read ${rel} in ${rootDir}: ${read.reason}`);
+        }
+        if (read.truncated) {
+          throw new MemoryStoreError(
+            `${rel} in ${rootDir} is larger than ${MEMORY_FILE_MAX_BYTES} bytes, so it was not read`,
+          );
+        }
+        for (const text of read.text.split("\n")) {
+          if (text.trim() === "") continue;
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(text);
+          } catch {
+            continue; // a torn archive line: the locked append seals it, skip it
+          }
+          if (!isArchivedLine(parsed)) continue;
+          // A crash between the archive append and the rename archives a
+          // line twice; it is one line of history.
+          const key =
+            parsed.line !== undefined ? `l:${canonicalJson(parsed.line)}` : `r:${parsed.raw}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(parsed);
+        }
+      }
+      return out;
+    },
+
+    async importSynced(entries: ReadonlyArray<MemoryEntry>): Promise<readonly string[]> {
+      for (const e of entries) {
+        if (!isMemoryEntry(e) || !ENTRY_ID_RE.test(e.id)) {
+          throw new MemoryStoreError(
+            `importSynced(): ${JSON.stringify((e as { id?: unknown })?.id)} is not a well-formed fact`,
+          );
+        }
+      }
+      if (entries.length === 0) return [];
+      return withStoreLock(async () => {
+        const known = new Set((await loadAll()).entries.map((e) => e.id));
+        const added: MemoryEntry[] = [];
+        for (const e of entries) {
+          if (known.has(e.id)) continue;
+          known.add(e.id);
+          added.push(e);
+        }
+        if (added.length > 0) appendLines(`${added.map((e) => JSON.stringify(e)).join("\n")}\n`);
+        return added.map((e) => e.id);
+      });
     },
 
     async list(): Promise<readonly MemoryListItem[]> {
@@ -1089,7 +1598,73 @@ function isProvenance(value: unknown): value is MemoryProvenance {
   ) {
     return false;
   }
+  if (v["correctionOf"] !== undefined && typeof v["correctionOf"] !== "string") return false;
+  if (v["author"] !== undefined && !isAuthor(v["author"])) return false;
+  if (v["origin"] !== undefined && !isSyncOrigin(v["origin"])) return false;
   return true;
+}
+
+const AUTHOR_KINDS: ReadonlyArray<MemoryAuthor["kind"]> = [
+  "operator",
+  "agent",
+  "extractor",
+  "sync",
+];
+
+function isAuthor(value: unknown): value is MemoryAuthor {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    AUTHOR_KINDS.includes(v["kind"] as MemoryAuthor["kind"]) &&
+    (v["via"] === undefined || typeof v["via"] === "string") &&
+    (v["cmd"] === undefined || typeof v["cmd"] === "string")
+  );
+}
+
+function isSyncOrigin(value: unknown): value is MemorySyncOrigin {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    v["kind"] === "sync" &&
+    typeof v["harness"] === "string" &&
+    typeof v["contentHash"] === "string" &&
+    (v["fact"] === undefined || typeof v["fact"] === "string")
+  );
+}
+
+/** An `annotate()` line. Neither an entry nor a tombstone, so a 0.8.0 reader skips it. */
+export function isMemoryAnnotation(value: unknown): value is MemoryAnnotation {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    v["annotate"] === "category" &&
+    typeof v["target"] === "string" &&
+    (v["value"] === "person" || v["value"] === null) &&
+    typeof v["at"] === "string"
+  );
+}
+
+function isArchivedLine(value: unknown): value is MemoryArchivedLine {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    v["v"] === 1 &&
+    typeof v["archivedAt"] === "string" &&
+    v["cause"] === "compaction" &&
+    (v["line"] !== undefined || typeof v["raw"] === "string")
+  );
+}
+
+/** JSON with object keys sorted, so two equal values spell the same. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const keys = Object.keys(value).sort();
+    return `{${keys
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson((value as Record<string, unknown>)[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 export function isMemoryTombstone(value: unknown): value is MemoryTombstone {
@@ -1100,6 +1675,11 @@ export function isMemoryTombstone(value: unknown): value is MemoryTombstone {
     typeof v["target"] === "string" &&
     typeof v["at"] === "string"
   );
+}
+
+/** The id pattern every fact carries: `mem_` and 16 lowercase hex digits. */
+export function isMemoryEntryId(value: string): boolean {
+  return ENTRY_ID_RE.test(value);
 }
 
 function tokenize(text: string): string[] {

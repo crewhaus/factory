@@ -40,7 +40,8 @@
  * session-store enforces (CWE-1230): with a tenant present, any resolved
  * path outside the tenant's root throws.
  */
-import { mkdir, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, readdir } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Tenant, assertSamePath, currentTenantContext } from "@crewhaus/tenancy";
@@ -50,15 +51,19 @@ import {
   type EvidenceRef,
   type FrozenProof,
   appendRetentionPins,
+  resolveEvidence,
   verifyEvidence,
 } from "./evidence";
 import {
   CONTINUITY_PROOF_MODES,
   type ContinuityProofMode,
   HANDOFF_MARKER,
+  type ProofRecheck,
+  type RecheckFailures,
   isProvenByAssertion,
   isProvenVerified,
   renderHandoff,
+  stepRecheckKey,
 } from "./handoff";
 import { type AcquireLockOptions, withLock } from "./lock";
 import {
@@ -119,10 +124,15 @@ export {
 export {
   type ContinuityProofMode,
   type HandoffInput,
+  type ProofRecheck,
+  type RecheckFailures,
   CONTINUITY_PROOF_MODES,
   HANDOFF_MARKER,
+  PROOF_CHANGED_LABEL,
   PROVEN_UNVERIFIED_LABEL,
   countsAsProven,
+  countsAsProvenChecked,
+  stepRecheckKey,
   isProvenByAssertion,
   isProvenVerified,
   renderHandoff,
@@ -206,11 +216,60 @@ const STEP_LINE_REGEX = /^(\d+)\. \[(open|in_progress|claimed|proven)\] (.+)$/;
 const STEPS_HEADING = "## Steps";
 
 export class ContinuityStoreError extends CrewhausError {
-  override readonly name = "ContinuityStoreError";
+  override readonly name: string = "ContinuityStoreError";
   constructor(message: string, cause?: unknown) {
     super("config", message, cause);
   }
 }
+
+/**
+ * `clear(scope, {expectFingerprint})` found the files changed since the dry
+ * run that produced the fingerprint. Nothing was moved; plan again.
+ */
+export class ContinuityClearConflictError extends ContinuityStoreError {
+  override readonly name = "ContinuityClearConflictError";
+  readonly expected: string;
+  readonly current: string;
+  constructor(expected: string, current: string) {
+    super(
+      `continuity-store: the working memory changed since the dry run (fingerprint ${expected.slice(0, 12)}…, now ${current.slice(0, 12)}…), so nothing was moved. Review the plan again, then clear with the new fingerprint.`,
+    );
+    this.expected = expected;
+    this.current = current;
+  }
+}
+
+/** One file a clear would move, as `planClear` lists it. */
+export type ClearPlanEntry = {
+  /** Relative to `.crewhaus`, slash-separated. */
+  readonly path: string;
+  readonly size: number;
+  readonly mtimeMs: number;
+};
+
+/** What `clear(scope)` would move right now, and a fingerprint of it. */
+export type ClearPlan = {
+  /** Every file, recursive under `plans/`, sorted by path. */
+  readonly entries: readonly ClearPlanEntry[];
+  /** sha256 hex over the canonical entries. */
+  readonly fingerprint: string;
+};
+
+export type ClearOptions = {
+  /**
+   * The fingerprint a `planClear` returned. Recomputed under the store lock;
+   * on a mismatch `clear` throws {@link ContinuityClearConflictError} and
+   * moves nothing.
+   */
+  readonly expectFingerprint?: string;
+};
+
+/** The scopes that hold state for this store's spec. */
+export type ContinuityScopes = {
+  readonly spec: true;
+  /** Session-scoped stores under `<spec>/sessions/`, sorted. */
+  readonly sessions: readonly string[];
+};
 
 /**
  * Text the store prints inside a line — a step, a plan or goal title, a goal
@@ -411,9 +470,32 @@ export interface ContinuityStore {
   writeHandoff(opts?: { lastSessionId?: string }): Promise<string>;
 
   // ---- clearing (§2.6 — trash, never hard-delete) ----
-  clear(scope: ClearScope): Promise<MoveToTrashResult>;
+  /** What `clear(scope)` would move now, with a fingerprint to pass back. */
+  planClear(scope: ClearScope): Promise<ClearPlan>;
+  /** Moves the scope's files to the trash. With `expectFingerprint`, only
+   *  when the files are still as `planClear` listed them. */
+  clear(scope: ClearScope, opts?: ClearOptions): Promise<MoveToTrashResult>;
   restore(ts: string): Promise<RestoreResult>;
   listTrash(): Promise<readonly TrashSnapshot[]>;
+
+  // ---- what the store owns ----
+  /** The spec scope and every session scope under it, read from `<spec>/sessions/`. */
+  listScopes(): Promise<ContinuityScopes>;
+  /**
+   * The absolute paths the store owns for its SPEC scope, whatever this
+   * instance's scope: `focus.md`, `goals.yaml`, `plans`, `handoff.md`,
+   * `sessions`, `thredz-goals.json` and `.lock` under `<root>/<spec>/`. The
+   * runtime keeps tools from writing them; the store's own tools still can.
+   */
+  storeFiles(): readonly string[];
+  /**
+   * Re-read each frozen proof on a step or goal from the session log it was
+   * frozen from. `ok` only when every proof still resolves, verified, with
+   * the same tool name, input hash and result digest. A log that cannot be
+   * read answers `unreadable`, never `ok`; a record with no proofs answers
+   * `missing`.
+   */
+  recheckProofs(record: { readonly proofs?: readonly FrozenProof[] }): Promise<ProofRecheck>;
 }
 
 // ---------------------------------------------------------------------------
@@ -771,10 +853,8 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
         : DEFAULT_ROOT_DIR),
   );
   const crewhausDir = resolve(rootDir, "..");
-  const storeDir =
-    scope.kind === "session"
-      ? join(rootDir, opts.specName, "sessions", scope.sessionId)
-      : join(rootDir, opts.specName);
+  const specDir = join(rootDir, opts.specName);
+  const storeDir = scope.kind === "session" ? join(specDir, "sessions", scope.sessionId) : specDir;
   const plansDir = join(storeDir, "plans");
   const focusPath = join(storeDir, "focus.md");
   const goalsPath = join(storeDir, "goals.yaml");
@@ -1118,12 +1198,74 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
     return merged;
   }
 
+  async function recheck(record: {
+    readonly proofs?: readonly FrozenProof[];
+  }): Promise<ProofRecheck> {
+    const proofs = record.proofs ?? [];
+    if (proofs.length === 0) return { ok: false, why: "missing" };
+    for (const proof of proofs) {
+      let unreadable = false;
+      const [resolution] = await resolveEvidence(
+        [{ toolUseId: proof.toolUseId, sessionId: proof.sessionId }],
+        {
+          sessionRootDir,
+          now,
+          onUnreadable: () => {
+            unreadable = true;
+          },
+        },
+      );
+      if (resolution === undefined || resolution.verdict === "missing") {
+        return {
+          ok: false,
+          toolUseId: proof.toolUseId,
+          why: unreadable ? "unreadable" : "missing",
+        };
+      }
+      const found = resolution.proof;
+      if (
+        resolution.verdict !== "verified" ||
+        found === undefined ||
+        found.toolName !== proof.toolName ||
+        found.inputHash !== proof.inputHash ||
+        found.resultDigest !== proof.resultDigest
+      ) {
+        return { ok: false, toolUseId: proof.toolUseId, why: "changed" };
+      }
+    }
+    return { ok: true };
+  }
+
+  /** Under `require`, every verified-proven record whose proof fails its recheck. */
+  async function recheckFailures(
+    plans: readonly PlanRecord[],
+    goals: readonly Goal[],
+  ): Promise<RecheckFailures> {
+    const steps = new Set<string>();
+    const failedGoals = new Set<string>();
+    for (const plan of plans) {
+      for (const step of plan.steps) {
+        if (isProvenVerified(step) && !(await recheck(step)).ok) {
+          steps.add(stepRecheckKey(plan.id, step.index));
+        }
+      }
+    }
+    for (const goal of goals) {
+      if (isProvenVerified(goal) && !(await recheck(goal)).ok) failedGoals.add(goal.id);
+    }
+    return { steps, goals: failedGoals };
+  }
+
   async function gatherHandoffInput(lastSessionId?: string) {
     const focus = (await readFocusState()) ?? emptyFocus;
     const plans = await readPlans();
     const activePlan =
       focus.activePlanId !== null ? (plans.find((p) => p.id === focus.activePlanId) ?? null) : null;
     const goals = await readGoals();
+    // Only `require` reads a session log here; the ladder and `off` render
+    // from the store's files alone, as before.
+    const recheckFailed =
+      opts.proofMode === "require" ? await recheckFailures(plans, goals) : undefined;
     return {
       focusBody: focus.body,
       activePlan,
@@ -1132,7 +1274,42 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
       requirements: focus.requirements,
       ...(lastSessionId !== undefined ? { lastSessionId } : {}),
       ...(opts.proofMode !== undefined ? { proofMode: opts.proofMode } : {}),
+      ...(recheckFailed !== undefined ? { recheckFailed } : {}),
     };
+  }
+
+  const clearTargets: Record<ClearScope, string[]> = {
+    focus: [focusPath],
+    plans: [plansDir],
+    goals: [goalsPath],
+    all: [focusPath, plansDir, goalsPath, handoffPath],
+  };
+
+  /** Every file under the scope's targets, with its size and mtime, sorted. */
+  async function planEntries(clearScope: ClearScope): Promise<ClearPlan> {
+    const entries: ClearPlanEntry[] = [];
+    const visit = async (abs: string): Promise<void> => {
+      fence(abs);
+      let st: Awaited<ReturnType<typeof lstat>>;
+      try {
+        st = await lstat(abs);
+      } catch {
+        return; // nothing there
+      }
+      if (st.isDirectory()) {
+        for (const name of await readdir(abs)) await visit(join(abs, name));
+        return;
+      }
+      entries.push({
+        path: relative(crewhausDir, abs).split("\\").join("/"),
+        size: st.size,
+        mtimeMs: st.mtimeMs,
+      });
+    };
+    for (const target of clearTargets[clearScope]) await visit(target);
+    entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    const canonical = JSON.stringify(entries.map((e) => [e.path, e.size, e.mtimeMs]));
+    return { entries, fingerprint: createHash("sha256").update(canonical).digest("hex") };
   }
 
   return {
@@ -1504,14 +1681,20 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
       return handoffPath;
     },
 
-    async clear(clearScope: ClearScope): Promise<MoveToTrashResult> {
-      const targets: Record<ClearScope, string[]> = {
-        focus: [focusPath],
-        plans: [plansDir],
-        goals: [goalsPath],
-        all: [focusPath, plansDir, goalsPath, handoffPath],
-      };
-      return locked(async () => moveToTrash(targets[clearScope], fence(crewhausDir), { now }));
+    async planClear(clearScope: ClearScope): Promise<ClearPlan> {
+      return planEntries(clearScope);
+    },
+
+    async clear(clearScope: ClearScope, clearOpts: ClearOptions = {}): Promise<MoveToTrashResult> {
+      return locked(async () => {
+        if (clearOpts.expectFingerprint !== undefined) {
+          const current = (await planEntries(clearScope)).fingerprint;
+          if (current !== clearOpts.expectFingerprint) {
+            throw new ContinuityClearConflictError(clearOpts.expectFingerprint, current);
+          }
+        }
+        return moveToTrash(clearTargets[clearScope], fence(crewhausDir), { now });
+      });
     },
 
     async restore(ts: string): Promise<RestoreResult> {
@@ -1520,6 +1703,39 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
 
     async listTrash(): Promise<readonly TrashSnapshot[]> {
       return listTrashDir(fence(crewhausDir));
+    },
+
+    async listScopes(): Promise<ContinuityScopes> {
+      const sessionsDir = fence(join(specDir, "sessions"));
+      let names: string[];
+      try {
+        names = (await readdir(sessionsDir, { withFileTypes: true }))
+          .filter((e) => e.isDirectory() && SESSION_ID_REGEX.test(e.name))
+          .map((e) => e.name)
+          .sort();
+      } catch {
+        names = [];
+      }
+      return { spec: true, sessions: names };
+    },
+
+    storeFiles(): readonly string[] {
+      return [
+        "focus.md",
+        "goals.yaml",
+        "plans",
+        "handoff.md",
+        "sessions",
+        // memory-service's Thredz goal mirror keeps its map beside goals.yaml.
+        "thredz-goals.json",
+        ".lock",
+      ].map((name) => join(specDir, name));
+    },
+
+    async recheckProofs(record: {
+      readonly proofs?: readonly FrozenProof[];
+    }): Promise<ProofRecheck> {
+      return recheck(record);
     },
   };
 }

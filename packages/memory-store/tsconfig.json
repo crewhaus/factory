@@ -4,6 +4,11 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../tool-safety" }, { "path": "../embedder" }],
+  "references": [
+    { "path": "../control-records" },
+    { "path": "../errors" },
+    { "path": "../tool-safety" },
+    { "path": "../embedder" }
+  ],
   "include": ["src/**/*"]
 }

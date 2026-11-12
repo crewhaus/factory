@@ -216,6 +216,7 @@ export async function runDreamPhase1(opts: DreamPhase1Options): Promise<DreamPha
           if (entry.id === keep.id) continue;
           await memoryStore.forget(entry.id, {
             reason: `dream: near-duplicate of ${keep.id}`,
+            supersededBy: keep.id,
           });
           kept.delete(entry.id);
           factsSuperseded += 1;

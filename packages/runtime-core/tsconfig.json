@@ -35,6 +35,7 @@
     { "path": "../tool-executor" },
     { "path": "../tool-orchestrator" },
     { "path": "../tool-plan" },
+    { "path": "../tool-state" },
     { "path": "../tool-loop-detection" },
     { "path": "../tool-result-store" },
     { "path": "../tool-safety" },

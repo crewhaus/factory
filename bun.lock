@@ -35,6 +35,7 @@
         "@crewhaus/compliance-controls": "workspace:*",
         "@crewhaus/computer-use-driver": "workspace:*",
         "@crewhaus/context-bundle": "workspace:*",
+        "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
@@ -1316,6 +1317,7 @@
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
+        "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
       },
     },
@@ -1449,6 +1451,7 @@
       "name": "@crewhaus/memory-store",
       "version": "0.8.0",
       "dependencies": {
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
       },
@@ -1850,6 +1853,7 @@
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-plan": "workspace:*",
+        "@crewhaus/tool-state": "workspace:*",
       },
     },
     "packages/sandbox": {

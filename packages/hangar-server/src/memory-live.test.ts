@@ -740,25 +740,27 @@ describe("the sweep preview", () => {
 });
 
 describe("archiving a long article", () => {
-  test("is refused, because the write would cut the body at the read cap", async () => {
+  test("archives it whole: status only, the body bytes and the version unchanged", async () => {
     const t = boot();
     const dir = makeFixtureHarness(join(t.harnessesRoot, "longart"), { specName: "longart" });
-    await wikiStore(dir, "longart").write({
-      slug: "tome",
-      title: "Tome",
-      body: "line of the tome\n".repeat(Math.ceil(MAX_TEXT_BYTES / 16)),
-    });
-    const path = join(dir, ".crewhaus", "wiki", "longart", "articles", "tome.md");
-    const before = readFileSync(path, "utf8");
+    // Past the 256 KiB read cap: about 300 KiB of body.
+    const body = "line of the tome\n".repeat(Math.ceil((300 * 1024) / 16));
+    expect(Buffer.byteLength(body)).toBeGreaterThan(MAX_TEXT_BYTES);
+    await wikiStore(dir, "longart").write({ slug: "tome", title: "Tome", body });
+    const before = await wikiStore(dir, "longart").get("tome");
     const id = await register(t, dir);
 
     const res = await t.api(`/api/h/${id}/memory/wiki/tome/archive`, {
       method: "POST",
       body: JSON.stringify({ archived: true, confirm: true }),
     });
-    expect(res.status).toBe(409);
-    expect(String(res.body["error"])).toContain("too long to archive");
-    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(res.status).toBe(200);
+    expect(res.body["ok"]).toBe(true);
+    expect(res.body["version"]).toBe(1);
+    const after = await wikiStore(dir, "longart").get("tome");
+    expect(after?.status).toBe("archived");
+    expect(after?.version).toBe(before?.version as number);
+    expect(after?.body).toBe(before?.body as string);
     expect(existsSync(join(dir, ".crewhaus", "wiki", "longart", "versions", "tome"))).toBe(false);
   });
 });
