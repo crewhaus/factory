@@ -11,7 +11,7 @@
  *
  * | Answer | Receipt |
  * |---|---|
- * | 2xx (207 is a partial failure: `failed`) | `succeeded`; a job route that queued a job stays `accepted` until the job settles |
+ * | 2xx (207 is a partial failure: `failed`) | `succeeded`; one that queued a job stays `accepted` until the job settles |
  * | 4xx, 501, 503, or an `HttpError` with one | `rejected`, with the status's error code |
  * | any other throw, or another 5xx | `unknown` (`failed` for a write that is safe to repeat) |
  *
@@ -121,14 +121,18 @@ function rowIsIdempotent(row: RouteRow): boolean {
   return declared?.idempotent ?? row.idempotent === true;
 }
 
-/** How a handler's answer settles its receipt; `undefined` leaves it for the job. */
+/**
+ * How a handler's answer settles its receipt; `undefined` leaves it for the job. A 2xx
+ * that queued a job is the job's to settle whatever the row declares, so a route that
+ * starts queuing work is never reported done before that work runs.
+ */
 export function settleForStatus(
   row: RouteRow,
   status: number,
   options: { readonly jobsQueued: number; readonly body?: unknown } = { jobsQueued: 0 },
 ): Settlement | undefined {
   if (status >= 200 && status < 300) {
-    if (row.dispatch === "job" && options.jobsQueued > 0) return undefined;
+    if (options.jobsQueued > 0) return undefined;
     const effects = (row.key === "groupProc" ? memberEffects(options.body) : undefined) ?? [
       { kind: "route", status: "done" as const, observed: `http ${status}` },
     ];
@@ -239,6 +243,14 @@ export function createReceipts(deps: ReceiptsDeps): WithReceipt {
       );
     }
 
+    // Everything that addresses the request is fingerprinted, so one key reused on another
+    // path (`/env/A`, then `/env/B`) or another query is refused, not replayed.
+    const params: Record<string, string> = {};
+    for (const [name, value] of Object.entries(matched.params)) {
+      if (name !== "id" || target === undefined) params[name] = value;
+    }
+    const query = [...new URL(req.url).searchParams.entries()];
+
     const scrub = deps.scrubFor(harnessDir);
     const answer = await deps.control.commands.submit<Handled>(
       {
@@ -247,6 +259,8 @@ export function createReceipts(deps: ReceiptsDeps): WithReceipt {
         ledger,
         via: "home",
         body,
+        params,
+        query,
         ...(row.secretFields !== undefined ? { secretFields: row.secretFields } : {}),
         ...(idempotency !== undefined ? { idempotency } : {}),
         ...(row.idempotent !== undefined ? { idempotent: row.idempotent } : {}),

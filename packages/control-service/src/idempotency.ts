@@ -49,20 +49,39 @@ export function withoutSecrets(
   return out;
 }
 
+/** What a request asks for, as its fingerprint reads it. */
+export type FingerprintInput = {
+  readonly kind: string;
+  readonly target: string;
+  /** Path parameters beyond the target, such as the variable a route unsets. */
+  readonly params?: Readonly<Record<string, string>>;
+  /** The query, as name and value pairs in any order. */
+  readonly query?: readonly (readonly [string, string])[];
+  readonly body?: Readonly<Record<string, unknown>>;
+  readonly secretFields?: readonly string[];
+};
+
 /**
- * A keyed digest of what the request asks for: its kind, its target and its body without
- * secret fields. Two requests under one key are the same request when these are equal.
+ * A keyed digest of what the request asks for: its kind, its target, its path parameters,
+ * its query and its body without secret fields. Two requests under one key are the same
+ * request only when all of these are equal, so a key reused on `/env/A` and then `/env/B`
+ * is refused rather than answered as the first.
  */
-export function fingerprintOf(
-  key: CryptoKey,
-  kind: string,
-  target: string,
-  body: Readonly<Record<string, unknown>>,
-  secretFields: readonly string[],
-): Promise<string> {
+export function fingerprintOf(key: CryptoKey, input: FingerprintInput): Promise<string> {
+  const query = [...(input.query ?? [])]
+    .map(([name, value]) => [name, value] as const)
+    .sort((a, b) => (a[0] === b[0] ? cmp(a[1], b[1]) : cmp(a[0], b[0])));
   return keyedDigest(key, FINGERPRINT_LABEL, [
-    kind,
-    target,
-    canonicalJson(withoutSecrets(body, secretFields)),
+    input.kind,
+    input.target,
+    canonicalJson({
+      params: input.params ?? {},
+      query,
+      body: withoutSecrets(input.body ?? {}, input.secretFields ?? []),
+    }),
   ]);
+}
+
+function cmp(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }

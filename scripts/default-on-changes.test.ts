@@ -24,8 +24,9 @@
  * `crewhaus serve --mcp --sse` listens on and the bearer it asks for, the check a
  * served tool call's message passes before its turn and what `--host` needs, the
  * file a managed daemon saves a generated signing secret to, and the preflight finding
- * for a harness directory that holds the home directory, with its start line. A
- * change reverted or scoped to the block stops being found, and a new root, tool,
+ * for a harness directory that holds the home directory, with its start line, the
+ * exit a refused daemon start gives now that it writes a receipt, and every CLI
+ * verb that takes a harness's mutating lease. A change reverted or scoped to the block stops being found, and a new root, tool,
  * header line, edge warning, verdict that moved, stopping shape or refused leaf
  * fails until the notes name it. Each scan also asserts it found something, so a
  * scan that silently matches nothing fails too.
@@ -44,6 +45,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -51,10 +53,16 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { runDaemonCommand } from "../apps/cli/src/daemon-cmd";
+import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
+import { EXIT_FOR_ERROR, EXIT_FOR_REJECTED_RECEIPT } from "../packages/control-contract/src/index";
+import { foldStates } from "../packages/control-records/src/index";
+import { commandsLedgerOf } from "../packages/control-service/src/index";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
+import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import type { IrManagedV0 } from "../packages/ir/src/index";
 import {
@@ -1667,5 +1675,95 @@ describe("the release notes name run input screened where it enters", () => {
     };
     expect(probe.control).toBe(true);
     if (probe.changed) expect(runInput).toContain("`tool`");
+  });
+});
+
+/**
+ * Receipts and the mutating lease. Every daemon verb and every Home change now
+ * writes a receipt first, a refused daemon start exits with the rejected-receipt
+ * code where it exited 1, and the CLI's long verbs take the harness's mutating
+ * lease. Each is found where it happens: a start refused against a running
+ * daemon, and every lease call site in the CLI with the verb it names. A verb
+ * that starts taking the lease fails until the list names it.
+ */
+describe("the release notes name the receipts and the lease every harness meets", () => {
+  const bullet = (): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+      b.includes("`.crewhaus/run/control/`"),
+    ) ?? "";
+
+  test("a refused daemon start writes a receipt and exits with the rejected-receipt code", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "default-on-receipts-")));
+    try {
+      const dir = join(root, "harness");
+      mkdirSync(join(dir, "dist"), { recursive: true });
+      writeFileSync(join(dir, "dist", "daemon.ts"), "// compiled bundle\n");
+      writeFileSync(
+        join(dir, "crewhaus.yaml"),
+        [
+          "name: receipts-fixture",
+          "target: channel",
+          "agent:",
+          "  model: anthropic/claude-sonnet-4",
+          "  instructions: |",
+          "    A fixture.",
+          "routing:",
+          "  sessionKey: channel",
+          "",
+        ].join("\n"),
+      );
+      const opts = {
+        env: { CREWHAUS_REGISTRY_ROOT: join(root, "registry"), CREWHAUS_NO_REGISTRY: "1" },
+        ops: createTestProcessOps(() => Date.now()),
+        cwd: dir,
+      };
+      // The control: a first start runs.
+      const first = await runDaemonCommand(["start", "--no-preflight"], opts);
+      expect(first.exitCode).toBe(0);
+      const again = await runDaemonCommand(["start", "--no-preflight"], opts);
+      expect(again.lines[0]).toContain("already running");
+      expect(again.exitCode).toBe(EXIT_FOR_REJECTED_RECEIPT);
+      expect(again.exitCode).not.toBe(1);
+      const fold = foldStates(commandsLedgerOf(dir));
+      expect(fold.ok && [...fold.objects.values()].map((o) => o.state)).toEqual([
+        "succeeded",
+        "rejected",
+      ]);
+      await runDaemonCommand(["stop"], opts);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const named = bullet();
+    for (const word of [
+      "`stop`",
+      "`restart`",
+      "`drain`",
+      `exit ${EXIT_FOR_REJECTED_RECEIPT}, where they exited 1`,
+      `exits ${EXIT_FOR_ERROR.unavailable}`,
+      "400",
+    ]) {
+      expect(named).toContain(word);
+    }
+  }, 20_000); // a daemon start and stop through the real supervisor
+
+  test("every CLI verb that takes the mutating lease is named, with the exit it refuses with", () => {
+    const cliSrc = join(ROOT, "apps", "cli", "src");
+    const verbs = new Set<string>();
+    let files = 0;
+    for (const name of readdirSync(cliSrc)) {
+      if (!name.endsWith(".ts") || name.endsWith(".test.ts") || name === "mutating-lease.ts") {
+        continue;
+      }
+      files += 1;
+      const source = readFileSync(join(cliSrc, name), "utf8");
+      for (const m of source.matchAll(/(?:hold|with)CliMutatingLease\([^;]*?,\s*"([^"]+)"/g)) {
+        verbs.add(m[1] as string);
+      }
+    }
+    expect(files).toBeGreaterThan(10);
+    expect(verbs.size).toBeGreaterThanOrEqual(5);
+    const named = bullet();
+    expect([...verbs].filter((verb) => !named.includes(`\`${verb}\``))).toEqual([]);
+    expect(named).toContain(`exit ${LEASE_BUSY_EXIT}`);
   });
 });

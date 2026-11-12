@@ -16,6 +16,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireMutatingLease } from "@crewhaus/control-records";
 import { type HangarHarnessEntry, openHangarRegistry } from "@crewhaus/harness-registry";
 import { createProcessOps } from "@crewhaus/harness-supervisor";
 import { makeFixtureHarness } from "./fixture";
@@ -25,7 +26,9 @@ import {
   createProcessLayer,
   defaultJobRunner,
   jobArgv,
+  leaseRefusal,
 } from "./process";
+import { DEV_JOB_KIND, MCP_JOB_KIND } from "./runtime-ops";
 import {
   type TestServer,
   bootTestServer,
@@ -1044,5 +1047,41 @@ describe("a mutating job holds the harness's mutating lease", () => {
     expect(answer.error).toContain("`crewhaus optimize` from the CLI");
     expect(answer.error).toContain(`pid ${holder.pid}`);
     expect(ops.children.length).toBe(spawned);
+  });
+
+  for (const kind of [MCP_JOB_KIND, DEV_JOB_KIND]) {
+    test(`a ${kind} job serves until stopped and takes no lease, so the CLI can take it meanwhile`, async () => {
+      const clock = createTestClock(NOW);
+      const ops = createTestProcessOps(() => clock.now());
+      const dir = makeFixtureHarness(join(mkdtempSync(join(tmpdir(), "hangar-lease-")), "h"), {
+        specName: "served",
+      });
+      const runner = defaultJobRunner(ops, () => "/bin/crewhaus");
+      const finished = runner({ ...jobFor(dir, "job_00000000000000c3"), kind }, ctx);
+      for (let i = 0; i < 50 && ops.children.length === 0; i++) await Bun.sleep(1);
+      const child = ops.last();
+      expect(child).toBeDefined();
+      expect(existsSync(leaseFile(dir))).toBe(false);
+      expect(child?.request.env["CREWHAUS_LEASE_REF"]).toBeUndefined();
+      const cli = await acquireMutatingLease(
+        dir,
+        { head: "cli", kind: "eval" },
+        { probe: ops, waitMs: 0, sleep: async () => undefined },
+      );
+      expect(cli.ok).toBe(true);
+      if (cli.ok) cli.release();
+      child?.exit(0);
+      expect(await finished).toEqual({ exitCode: 0 });
+    });
+  }
+
+  test("a holder from Home is named as its job, never as a command it is not", () => {
+    const since = "2026-08-02T23:00:00.000Z";
+    const words = leaseRefusal({ head: "server", kind: "spec-pin", pid: 7, host: "h", since });
+    expect(words).toContain("Home's spec-pin job (pid 7");
+    expect(words).not.toContain("crewhaus spec-pin");
+    expect(leaseRefusal({ head: "cli", kind: "eval", pid: 8, host: "h", since })).toContain(
+      "`crewhaus eval` from the CLI (pid 8",
+    );
   });
 });

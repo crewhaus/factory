@@ -82,6 +82,7 @@ import {
 } from "@crewhaus/harness-supervisor";
 import { knownControlPort, parseControlPort } from "./control-client";
 import { mergedSpawnEnv } from "./env-file";
+import { DEV_JOB_KIND, MCP_JOB_KIND } from "./runtime-ops";
 
 /**
  * The job vocabulary — which jobs the M2 action faces submit, and the closed
@@ -189,11 +190,30 @@ function liveTarget(harnessDir: string): string | undefined {
   }
 }
 
+/**
+ * What holds a harness's mutating lease, in words. A CLI holder's kind is the verb it
+ * runs (`crewhaus eval`); a Home holder's is a job's label, which is not always a
+ * command, so it is named as a job.
+ */
+export function leaseHolderWords(holder: LeaseHolder): string {
+  const what =
+    holder.head === "cli"
+      ? `\`crewhaus ${holder.kind}\` from the CLI`
+      : `${holder.head === "resident" ? "the Home service's" : "Home's"} ${holder.kind} job`;
+  return `${what} (pid ${holder.pid}, since ${holder.since})`;
+}
+
 /** Why a mutating job could not start: another process holds the harness. */
 export function leaseRefusal(holder: LeaseHolder): string {
-  const from = holder.head === "cli" ? "from the CLI" : "from Home";
-  return `another change is running on this harness: \`crewhaus ${holder.kind}\` ${from} (pid ${holder.pid}, since ${holder.since}); try again when it finishes`;
+  return `another change is running on this harness: ${leaseHolderWords(holder)}; try again when it finishes`;
 }
+
+/**
+ * Job kinds that serve until they are stopped: the MCP projection and the dev loop. They
+ * take no mutating lease, as a running daemon takes none: held for a server's whole life,
+ * it would refuse every terminal compile and eval on the harness until someone stopped it.
+ */
+export const LONG_LIVED_JOB_KINDS: ReadonlySet<string> = new Set([MCP_JOB_KIND, DEV_JOB_KIND]);
 
 /** The env name a job's child reads to run under the lease its parent holds. */
 export const LEASE_REF_ENV = "CREWHAUS_LEASE_REF";
@@ -225,8 +245,9 @@ export function defaultJobRunner(
     ensureRunDir(job.harnessDir);
     // A mutating job holds the harness's mutating lease, the one the CLI's long verbs
     // take, so a terminal `crewhaus eval` and this job never write the tree at once. The
-    // child is told the lease's ref and runs under it rather than waiting on itself.
-    if (job.mutating) {
+    // child is told the lease's ref and runs under it rather than waiting on itself. A
+    // server that runs until stopped takes none (LONG_LIVED_JOB_KINDS).
+    if (job.mutating && !LONG_LIVED_JOB_KINDS.has(job.kind)) {
       const held = await withMutatingLease(
         job.harnessDir,
         { head: "server", kind: job.kind },

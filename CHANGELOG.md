@@ -30,6 +30,18 @@ these on: they reach every harness that uses what each one names.
   bearer travels as sent, so keep such a listener on a private network or
   behind TLS.
 
+- **Daemon verbs and Home's changes leave a receipt, and long CLI verbs take
+  turns with Home.** `crewhaus daemon start`, `stop`, `restart` and `drain`,
+  and every change made in Home, first write a receipt under the harness's
+  `.crewhaus/run/control/` (ids and states, never arguments or secrets). A
+  verb whose receipt cannot be written does nothing and exits 52. `crewhaus
+  daemon start` and `restart` exit 55, where they exited 1, when the start is
+  refused: already running, or stopped by preflight. `compile`, `eval`,
+  `optimize`, `flywheel run` and `dream run` wait up to 10 seconds while a
+  Home job changes the same harness, then exit 53 naming it; a Home job that
+  meets one of them fails the same way. A Home write whose body is not a JSON
+  object is answered 400 before anything runs.
+
 ## [0.8.1] - 2026-11-08
 
 Fixes and hardening for run input, the runtime-state floor, git tools,

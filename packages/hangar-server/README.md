@@ -77,10 +77,13 @@ by the other, and neither needs the other running.
   go to its own `.crewhaus/run/control/commands/`, the same ledger
   `crewhaus daemon` writes; registry edits and Home's settings go to
   `<hangarRoot>/control/commands/`. A request refused before its handler
-  writes nothing. `Idempotency-Key` is honoured on every write. A mutating
-  job takes the harness's mutating lease, so a terminal `crewhaus eval` and
-  a queued one never write the tree at once, and command recovery runs at
-  boot, after adoption and the job restore.
+  writes nothing. `Idempotency-Key` is honoured on every write, bound to the
+  whole request: its path, query and body. A job that queues settles its
+  receipt when it ends, never when it is queued. A mutating job takes the
+  harness's mutating lease, so a terminal `crewhaus eval` and a queued one
+  never write the tree at once; the MCP projection and the dev loop, which
+  serve until stopped, take none, as a running daemon takes none. Command
+  recovery runs at boot, after adoption and the job restore.
 - **Torn-line tolerance + caps** — every JSONL reader skips unparseable
   lines and caps both lines (`MAX_JSONL_LINES`) and bytes
   (`MAX_JSONL_BYTES`) read; truncation is reported, never hidden.

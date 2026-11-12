@@ -256,6 +256,100 @@ describe("left alone", () => {
   });
 });
 
+describe("a daemon command a later one overtook", () => {
+  const LATER = "cmd_01m76e6f05hp514w9j4v3qymkz";
+  const SUPERSEDED = { code: "interrupted", message: "superseded by a later command" };
+
+  test("a stop a dead CLI left, then a start through Home: Home's recovery never stops the daemon", async () => {
+    const r = rig({ pid: 1000, mode: "server" });
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: CMD,
+      kind: "controls.stop",
+      acceptedAt: iso(NOW - 3_600_000),
+    });
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: LATER,
+      kind: "controls.start",
+      via: "home",
+      state: "succeeded",
+      acceptedAt: iso(NOW - 60_000),
+      executor: { pid: 1000, startedAt: iso(BOOTED + 1000), host: HOST, head: "server" },
+      retry: { retryable: true, safety: "reconcile-first" },
+    });
+    expect(await r.service.commands.recover("all")).toEqual({
+      redispatched: 0,
+      reconciled: 0,
+      unknown: 1,
+    });
+    expect(r.supervisor.calls).toEqual([]);
+    expect(lastRow(r.harness)?.["state"]).toBe("unknown");
+    expect(lastRow(r.harness)?.["outcome"]).toEqual(SUPERSEDED);
+    expect(stateOf(r.harness, LATER)).toBe("succeeded");
+  });
+
+  test("a start whose reconciler saw no daemon, then a stop: the start is never run again", async () => {
+    const r = rig({ pid: 1000, areas: [answering("not-done")] });
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: CMD,
+      kind: "controls.start",
+      acceptedAt: iso(NOW - 3_600_000),
+      retry: { retryable: true, safety: "reconcile-first" },
+    });
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: LATER,
+      kind: "controls.stop",
+      state: "succeeded",
+      acceptedAt: iso(NOW - 60_000),
+      executor: { pid: 1000, startedAt: iso(BOOTED + 1000), host: HOST, head: "cli" },
+    });
+    expect(await r.service.commands.recover({ harness: r.harness })).toEqual({
+      redispatched: 0,
+      reconciled: 0,
+      unknown: 1,
+    });
+    expect(r.supervisor.calls).toEqual([]);
+    expect(lastRow(r.harness)?.["outcome"]).toEqual(SUPERSEDED);
+  });
+
+  test("a drain is overtaken the same way, and the latest command still runs", async () => {
+    const r = rig({ pid: 1000 });
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: CMD,
+      kind: "controls.drain",
+      acceptedAt: iso(NOW - 3_600_000),
+    });
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: LATER,
+      kind: "controls.stop",
+      acceptedAt: iso(NOW - 60_000),
+    });
+    expect(await r.service.commands.recover({ harness: r.harness })).toEqual({
+      redispatched: 1,
+      reconciled: 0,
+      unknown: 1,
+    });
+    expect(r.supervisor.calls).not.toContain("drain");
+    expect(r.supervisor.calls.filter((call) => call === "stop")).toHaveLength(1);
+    expect(lastRow(r.harness)?.["outcome"]).toEqual(SUPERSEDED);
+    expect(stateOf(r.harness, LATER)).toBe("succeeded");
+  });
+
+  test("in Home's ledger, a command on another harness overtakes nothing", async () => {
+    const r = rig({ pid: 1000, mode: "server", harnessDirs: () => [] });
+    const ledger = workspaceCommandsLedger(r.hangarRoot);
+    plantReceipt(ledger, { id: CMD, acceptedAt: iso(NOW - 3_600_000) });
+    plantReceipt(ledger, {
+      id: LATER,
+      target: "home/harness/hrn_fedcba9876543210",
+      state: "succeeded",
+      acceptedAt: iso(NOW - 60_000),
+    });
+    // The first stop's harness is registered with a live directory, so it runs again.
+    expect(await r.service.commands.recover("all")).toMatchObject({ redispatched: 1 });
+    expect(r.supervisor.calls).toContain("stop");
+  });
+});
+
 describe("Home's recovery", () => {
   test("covers every registered harness and Home's ledger, and settles a job that never reached the queue", async () => {
     const other = tempDir("control-service-harness-");

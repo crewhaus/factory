@@ -43,10 +43,16 @@ export type CliLeaseAnswer<T> =
 /** Leases this process holds, by harness directory. */
 const held = new Map<string, HeldLease>();
 
+/**
+ * What holds the lease, in words. A CLI holder's kind is the verb it runs; a Home
+ * holder's is a job's label, which is not always a command, so it is named as a job.
+ */
 function whoHolds(holder: LeaseHolder): string {
-  const from =
-    holder.head === "cli" ? "the CLI" : holder.head === "resident" ? "the Home service" : "Home";
-  return `\`crewhaus ${holder.kind}\` from ${from} (pid ${holder.pid}, since ${holder.since})`;
+  const what =
+    holder.head === "cli"
+      ? `\`crewhaus ${holder.kind}\` from the CLI`
+      : `${holder.head === "resident" ? "the Home service's" : "Home's"} ${holder.kind} job`;
+  return `${what} (pid ${holder.pid}, since ${holder.since})`;
 }
 
 /** Why a verb did not start: another change holds the harness. */

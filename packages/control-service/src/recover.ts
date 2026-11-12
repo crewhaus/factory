@@ -6,6 +6,7 @@
  * | Found | Action |
  * |---|---|
  * | a job's receipt | the job queue moves it; Home alone settles one no job row names |
+ * | a daemon command a later daemon command on the same harness overtook | `unknown`: superseded, never run |
  * | a daemon start accepted before the machine booted | `unknown`: not started, the machine restarted |
  * | `accepted`, safe to repeat | run again |
  * | `accepted`, not safe to repeat | reconcile: done → `succeeded`, not done → run again |
@@ -15,11 +16,20 @@
  *
  * An inline effect never writes `running`, so an `accepted` receipt does not prove its
  * effect never started: that is why a kind that is not safe to repeat is reconciled first.
+ * A daemon command is run again only while it is the harness's latest: once an operator
+ * has started, stopped or drained the daemon since, re-running an older command would
+ * undo theirs.
  * Recovery writes; it runs at Home's boot and before the CLI's first change to a harness,
  * never on a read.
  */
 import type { CommandReceipt } from "@crewhaus/control-contract";
-import { type Ledger, foldStates, publishClaim, readClaim } from "@crewhaus/control-records";
+import {
+  type FoldedObject,
+  type Ledger,
+  foldStates,
+  publishClaim,
+  readClaim,
+} from "@crewhaus/control-records";
 import {
   type CommandsInternals,
   harnessDirOfTarget,
@@ -30,7 +40,7 @@ import {
 import type { ControlCore } from "./context";
 import { executorDead } from "./executor";
 import { commandsLedgerOf, workspaceCommandsLedger } from "./ledgers";
-import { NEEDS_DECISION, NOT_STARTED_REBOOT, type Outcome } from "./refusal";
+import { NEEDS_DECISION, NOT_STARTED_REBOOT, type Outcome, SUPERSEDED } from "./refusal";
 
 export type RecoverScope = { readonly harness: string } | "all";
 
@@ -50,6 +60,34 @@ const DAEMON_STARTS = new Set(["controls.start", "controls.restart"]);
 
 export function isJobReceipt(receipt: CommandReceipt): boolean {
   return receipt.effects.some((effect) => effect.kind === "job");
+}
+
+/**
+ * The daemon commands in one ledger that a later daemon command on the same harness
+ * overtook: every one but the latest per harness, by acceptance time, then by place in
+ * the ledger. In a harness's own ledger every daemon command is that harness's; in Home's
+ * they are told apart by target. A later command counts whatever state it reached: the
+ * operator asked for it after.
+ */
+export function supersededControls(
+  objects: Iterable<FoldedObject>,
+  ownHarness: boolean,
+): ReadonlySet<string> {
+  const latest = new Map<string, { readonly id: string; readonly at: number }>();
+  const all: string[] = [];
+  for (const object of objects) {
+    const kind = object.record["kind"];
+    if (typeof kind !== "string" || !kind.startsWith("controls.")) continue;
+    const subject = ownHarness ? "" : String(object.record["target"]);
+    const parsed = Date.parse(String(object.record["acceptedAt"]));
+    const at = Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+    all.push(object.id);
+    const seen = latest.get(subject);
+    // Fold order is ledger order, so a tie goes to the one written later.
+    if (seen === undefined || at >= seen.at) latest.set(subject, { id: object.id, at });
+  }
+  const keep = new Set([...latest.values()].map((entry) => entry.id));
+  return new Set(all.filter((id) => !keep.has(id)));
 }
 
 export function createRecover(
@@ -103,6 +141,7 @@ export function createRecover(
           core.warn(`control-service: recovery skipped a ledger: ${fold.reason}`);
         continue;
       }
+      const superseded = supersededControls(fold.objects.values(), dir !== undefined);
       for (const object of fold.objects.values()) {
         if (object.state !== "accepted" && object.state !== "running") continue;
         const receipt = receiptOf(object.record);
@@ -116,6 +155,13 @@ export function createRecover(
             await settle(ledger, receipt, "unknown", NEEDS_DECISION);
             counts.unknown += 1;
           }
+          continue;
+        }
+
+        if (superseded.has(receipt.id)) {
+          // Running it now would undo what the operator asked for since.
+          await settle(ledger, receipt, "unknown", SUPERSEDED);
+          counts.unknown += 1;
           continue;
         }
 

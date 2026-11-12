@@ -43,6 +43,10 @@ export type SubmitRequest = {
   readonly via: ReceiptVia;
   /** What the request asks for: fingerprinted, never stored. */
   readonly body?: Readonly<Record<string, unknown>>;
+  /** Path parameters beyond the target (a route's `:key`, `:name`): fingerprinted, never stored. */
+  readonly params?: Readonly<Record<string, string>>;
+  /** The request's query, as name and value pairs: fingerprinted, never stored. */
+  readonly query?: readonly (readonly [string, string])[];
   /** Body fields that hold a secret; the fingerprint leaves them out. */
   readonly secretFields?: readonly string[];
   /** The `Idempotency-Key` value, when the caller sent one. */
@@ -247,13 +251,14 @@ export function createCommands(core: ControlCore): CommandsInternals {
     const actor = await storedActorFor(core.hangarRoot, core.identity, key.hmac);
     let fingerprint: string;
     try {
-      fingerprint = await fingerprintOf(
-        key.hmac,
-        request.kind,
-        request.target ?? "",
-        request.body ?? {},
-        request.secretFields ?? [],
-      );
+      fingerprint = await fingerprintOf(key.hmac, {
+        kind: request.kind,
+        target: request.target ?? "",
+        ...(request.params !== undefined ? { params: request.params } : {}),
+        ...(request.query !== undefined ? { query: request.query } : {}),
+        ...(request.body !== undefined ? { body: request.body } : {}),
+        ...(request.secretFields !== undefined ? { secretFields: request.secretFields } : {}),
+      });
     } catch {
       return { ok: false, refusal: refuse("invalid", "the request body cannot be fingerprinted") };
     }

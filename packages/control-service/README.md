@@ -42,7 +42,8 @@ the same receipt to the same ledger.
 A receipt holds ids, refs, keyed digests and states: never an argument, an input or a secret. Its
 `actor` is the linked principal (`prn_…`) when Home's access records link the local user, and
 otherwise `local:#<keyed digest>` under the ledger root's own key. Its `fingerprint` is a keyed digest
-of the kind, the target and the body without the fields the route marks secret. Every row is the whole
+of the kind, the target, the path parameters, the query and the body without the fields the route
+marks secret. Every row is the whole
 receipt, folded by id through the `command` machine of `@crewhaus/control-contract`.
 
 `commands.submit(request, effect?)`:
@@ -71,12 +72,16 @@ the next touch. A claim whose receipt never landed is completed from the claim o
 | Found | Action |
 |---|---|
 | a job's receipt | the job queue moves it; Home settles one no job row names as `unknown` |
+| a daemon command a later daemon command on the same harness overtook | `unknown`: superseded by a later command, never run |
 | a daemon start accepted before the machine booted | `unknown`: not started, the machine restarted |
 | `accepted`, safe to repeat | run again |
 | `accepted`, not safe to repeat | reconcile: done → `succeeded`, not done → run again, else `unknown` |
 | `running`, safe to repeat | the first recoverer to claim `recover/<cmd>` runs it again |
 | `running`, not safe to repeat | reconcile: done → `succeeded`, not done → `failed`, else `unknown` |
 | a legacy kind, or no executor | `unknown`: interrupted, needs a decision |
+
+A daemon command runs again only while it is the harness's latest: once an operator has started,
+stopped or drained the daemon since, re-running an older command would undo theirs.
 
 It answers `{redispatched, reconciled, unknown}`. Recovery writes, so it never runs on a read.
 

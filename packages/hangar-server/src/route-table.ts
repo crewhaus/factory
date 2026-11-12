@@ -337,7 +337,16 @@ export const ROUTE_TABLE: readonly RouteRow[] = [
     "/api/h/:id/memory/watchme/synthesized/:stamp/apply",
     "h.spec.edit",
   ),
-  write("watchmePublish", "harness", "POST", "/api/h/:id/memory/watchme/publish", "h.memory.write"),
+  write(
+    "watchmePublish",
+    "harness",
+    "POST",
+    "/api/h/:id/memory/watchme/publish",
+    "h.memory.write",
+    {
+      dispatch: "job",
+    },
+  ),
 
   // ---- evals ----
   write("evalLaunch", "harness", "POST", "/api/h/:id/evals/run", "h.eval.run", { dispatch: "job" }),

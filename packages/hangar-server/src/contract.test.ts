@@ -1873,24 +1873,38 @@ describe("UI route contract", () => {
         const fold = foldStates(ledger);
         return fold.ok ? fold.objects.size : 0;
       };
+      const jobsSeen = (): number => {
+        const jobs = t.server.processes.jobs;
+        return new Set(
+          [...jobs.pending(), ...jobs.running(), ...jobs.recent(100_000)].map((j) => j.jobId),
+        ).size;
+      };
       const commandCounts = () => ({
         harness: objectsIn(commandsLedgerOf(dir)),
         home: objectsIn(workspaceCommandsLedger(t.hangarRoot)),
+        jobs: jobsSeen(),
       });
       let receipted = 0;
+      let queuing = 0;
       const expectReceipt = (
         key: string,
-        before: { harness: number; home: number },
+        before: { harness: number; home: number; jobs: number },
         body: Record<string, unknown>,
       ): void => {
         const row = ROUTE_BY_KEY.get(key);
         if (row === undefined) throw new Error(`route "${key}" has no route-table row`);
-        const after = commandCounts();
+        const { jobs, ...after } = commandCounts();
         const expected = {
           harness: before.harness + (row.receipt === "harness" ? 1 : 0),
           home: before.home + (row.receipt === "workspace" ? 1 : 0),
         };
         expect({ key, ...after }).toEqual({ key, ...expected });
+        // A receipted write that queued a job is a job row: the job, not the answer, settles
+        // it. (A read-only check such as `datasetLint` may queue one and has no receipt.)
+        if (row.receipt !== "none" && jobs > before.jobs) {
+          expect({ key, dispatch: row.dispatch }).toEqual({ key, dispatch: "job" });
+          queuing += 1;
+        }
         expect({ key, receipt: body["receipt"] !== undefined }).toEqual({
           key,
           receipt: row.receipt !== "none",
@@ -2335,6 +2349,8 @@ describe("UI route contract", () => {
       const total = commandCounts();
       expect(receipted).toBeGreaterThanOrEqual(100);
       expect(total.harness + total.home).toBe(receipted);
+      // The job check above saw jobs queued, so it can fail.
+      expect(queuing).toBeGreaterThanOrEqual(20);
     } finally {
       await t.stop();
       rmSync(pluginsDir, { recursive: true, force: true });

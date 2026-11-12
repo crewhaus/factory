@@ -86,7 +86,8 @@ describe("the CLI's mutating lease", () => {
     expect(answer.exitCode).toBe(53);
     expect(LEASE_BUSY_EXIT).toBe(53);
     const text = answer.lines.join("\n");
-    expect(text).toContain("`crewhaus eval` from Home");
+    expect(text).toContain("Home's eval job (pid 4242");
+    expect(text).not.toContain("`crewhaus eval`");
     expect(text).toContain("pid 4242");
     expect(text).toContain("since 2026-11-11T00:00:00.000Z");
   });

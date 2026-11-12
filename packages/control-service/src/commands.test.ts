@@ -372,6 +372,35 @@ describe("what a receipt holds", () => {
     expect(c.receipt.fingerprint).not.toBe(a.receipt.fingerprint);
   });
 
+  test("path parameters and the query are part of the fingerprint; the query's order is not", async () => {
+    const { service, harness } = rig();
+    const submit = async (
+      params: Record<string, string>,
+      query: (readonly [string, string])[] = [],
+    ): Promise<string> => {
+      const answer = await service.commands.submit(
+        { kind: "legacy.envUnset", target: HRN, ledger: { harness }, via: "home", params, query },
+        async () => ({ settle: { state: "succeeded" }, value: undefined }),
+      );
+      if (!answer.ok) throw new Error("refused");
+      return answer.receipt.fingerprint;
+    };
+    const a = await submit({ key: "ALPHA" });
+    expect(await submit({ key: "ALPHA" })).toBe(a);
+    expect(await submit({ key: "BETA" })).not.toBe(a);
+    const q = await submit({ key: "ALPHA" }, [
+      ["b", "2"],
+      ["a", "1"],
+    ]);
+    expect(q).not.toBe(a);
+    expect(
+      await submit({ key: "ALPHA" }, [
+        ["a", "1"],
+        ["b", "2"],
+      ]),
+    ).toBe(q);
+  });
+
   test("an unlinked local user is a keyed digest; a linked one is its principal", async () => {
     const unlinked = rig();
     const a = await unlinked.service.commands.submit(

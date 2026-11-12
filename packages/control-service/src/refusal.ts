@@ -62,6 +62,12 @@ export const NOT_STARTED_REBOOT: Outcome = Object.freeze({
   message: "not started: the machine restarted",
 });
 
+/** A daemon command another daemon command on the same harness overtook: never run again. */
+export const SUPERSEDED: Outcome = Object.freeze({
+  code: "interrupted",
+  message: "superseded by a later command",
+});
+
 /** A read-only job whose manager stopped while it ran. */
 export const JOB_INTERRUPTED: Outcome = Object.freeze({
   code: "interrupted",

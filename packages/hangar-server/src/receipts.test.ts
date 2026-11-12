@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { commandReceipt } from "@crewhaus/control-contract/schemas";
 import { type LedgerRecord, append, foldStates } from "@crewhaus/control-records";
 import { commandsLedgerOf, wireControl, workspaceCommandsLedger } from "@crewhaus/control-service";
+import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
 import { makeFixtureHarness } from "./fixture";
 import { json } from "./http";
 import type { ProcessLayer } from "./process";
@@ -124,6 +125,96 @@ describe("a refused request writes nothing", () => {
     expect(((await reused.json()) as { code: string }).code).toBe("idempotency_key_reused");
     expect(t.ops?.children).toHaveLength(1);
     expect(receiptsIn(dir)).toHaveLength(1);
+  });
+});
+
+describe("a key is bound to the whole request, path and query included", () => {
+  test("one key on two different paths: the second is refused 422 and its handler never runs", async () => {
+    const hangarRoot = mkdtempSync(join(tmpdir(), "receipts-params-"));
+    const harnessDir = mkdtempSync(join(tmpdir(), "receipts-params-h-"));
+    try {
+      const control = wireControl(
+        {
+          hangarRoot,
+          harnessDirOf: () => harnessDir,
+          supervisorFor: () => undefined,
+          drainRequest: () => async () => undefined,
+          identity: { username: "sam", hostname: "laptop" },
+          probe: { isAlive: () => true, startTimeMs: () => undefined },
+          onWarn: () => undefined,
+        },
+        { mode: "server" },
+      );
+      const id = "hrn_0123456789abcdef";
+      const withReceipt = createReceipts({
+        control,
+        harness: (asked) =>
+          asked === id
+            ? ({ id, dir: harnessDir, missingSince: null } as unknown as HangarHarnessEntry)
+            : undefined,
+        scrubFor: () => (text) => text,
+        onWarn: () => undefined,
+      });
+      const ran: string[] = [];
+      const send = (path: string, segments: string[], method = "DELETE") =>
+        withReceipt(
+          new Request(`http://127.0.0.1${path}`, {
+            method,
+            headers: { "Idempotency-Key": "k-1" },
+          }),
+          segments,
+          async () => {
+            ran.push(path);
+            return json({ ok: true });
+          },
+        );
+
+      const first = await send(`/api/h/${id}/env/OPENAI_KEY`, [
+        "api",
+        "h",
+        id,
+        "env",
+        "OPENAI_KEY",
+      ]);
+      expect(first.status).toBe(200);
+      // The same request again is a replay: answered, not run.
+      const again = await send(`/api/h/${id}/env/OPENAI_KEY`, [
+        "api",
+        "h",
+        id,
+        "env",
+        "OPENAI_KEY",
+      ]);
+      expect(again.headers.get("Idempotent-Replayed")).toBe("true");
+      const other = await send(`/api/h/${id}/env/SLACK_TOKEN`, [
+        "api",
+        "h",
+        id,
+        "env",
+        "SLACK_TOKEN",
+      ]);
+      expect(other.status).toBe(422);
+      expect(((await other.json()) as { code: string }).code).toBe("idempotency_key_reused");
+      expect(ran).toEqual([`/api/h/${id}/env/OPENAI_KEY`]);
+      expect(receiptsIn(harnessDir)).toHaveLength(1);
+
+      // A route with no harness id at all: the group's name and verb tell two requests apart.
+      const group = (name: string, query = "") =>
+        send(
+          `/api/registry/groups/${name}/proc/start${query}`,
+          ["api", "registry", "groups", name, "proc", "start"],
+          "POST",
+        );
+      expect((await group("alpha")).status).toBe(200);
+      expect(receiptsIn(hangarRoot, true)).toHaveLength(1);
+      expect((await group("beta")).status).toBe(422);
+      // And so does the query.
+      expect((await group("alpha", "?only=a")).status).toBe(422);
+      expect(ran).toHaveLength(2);
+    } finally {
+      rmSync(hangarRoot, { recursive: true, force: true });
+      rmSync(harnessDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -304,6 +395,12 @@ describe("how an answer settles a receipt", () => {
     expect(settleForStatus(row("evalLaunch"), 202, { jobsQueued: 1 })).toBeUndefined();
     expect(settleForStatus(row("evalLaunch"), 202, { jobsQueued: 0 })?.state).toBe("succeeded");
     expect(settleForStatus(row("evalLaunch"), 409, { jobsQueued: 1 })?.state).toBe("rejected");
+  });
+
+  test("an inline route that queued a job is left for the job too", () => {
+    expect(row("setPin").dispatch).toBe("inline");
+    expect(settleForStatus(row("setPin"), 200, { jobsQueued: 1 })).toBeUndefined();
+    expect(row("watchmePublish").dispatch).toBe("job");
   });
 
   test("a group walk's effects are its members", () => {
