@@ -490,7 +490,8 @@ async function* driveCrew(
     args.opts.sessionId !== undefined ? { sessionId: args.opts.sessionId } : {},
   );
   // Every role's loop runs on this one context: the run stays held until the
-  // drive loop ends, so it ends once, after its last role.
+  // drive loop ends, so it ends once, after its last role, and as the crew
+  // ended, said on the release.
   const releaseRun = retainRun(runContext);
 
   // Open a single event-log handle for the crew session. Every role's
@@ -503,7 +504,7 @@ async function* driveCrew(
       args.opts.sessionRootDir !== undefined ? { rootDir: args.opts.sessionRootDir } : {},
     );
   } catch (err) {
-    releaseRun();
+    releaseRun({ outcome: "failed", error: err });
     throw err;
   }
 
@@ -956,7 +957,14 @@ async function* driveCrew(
       driveError = err;
     } finally {
       await eventLog.close().catch(() => {});
-      releaseRun();
+      // The run ends as the crew did: a drive that threw (a role's stop, a
+      // router's throw, the activation limit) fails it, whatever its last
+      // role's loop returned.
+      releaseRun(
+        driveError !== undefined
+          ? { outcome: "failed", error: driveError }
+          : { outcome: "succeeded" },
+      );
       // `resolveNext` is set by the consumer's Promise executor (a sibling closure);
       // CFA narrows it to the initial `null` inside this drive loop, so assert the
       // declared resolver-or-null shape back before draining it.

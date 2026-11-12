@@ -7,6 +7,7 @@
  * schema, and the ledger's fold shows no anomaly unless a test says otherwise.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   existsSync,
@@ -30,7 +31,8 @@ import {
 } from "@crewhaus/control-contract";
 import { run as runSchema } from "@crewhaus/control-contract/schemas";
 import { append, foldStates, readPage } from "@crewhaus/control-records";
-import { RunFailedError } from "@crewhaus/errors";
+import { EXIT_CODES, RunFailedError } from "@crewhaus/errors";
+import { collectTerminalState, createGraph } from "@crewhaus/graph-engine";
 import type { LogFields, Logger } from "@crewhaus/logging";
 import { emptyRuleSet } from "@crewhaus/permission-engine";
 import { cancelRun, createRunContext, retainRun } from "@crewhaus/run-context";
@@ -774,4 +776,317 @@ describe("a ledger that cannot be written", () => {
     expect(failed).toHaveLength(1);
     expect(typeof failed[0]?.fields?.["code"]).toBe("string");
   });
+});
+
+describe("a park the loop did not write itself", () => {
+  test("a stop that escalates approval_pending with no park row is still a park: waiting-for-approval, then nothing", async () => {
+    const ledger = tempDir("ledger");
+    // A tool that rethrows a nested run's park, the way a sub-agent's is escalated.
+    const escalates = buildTool({
+      name: "escalates",
+      description: "a nested run parked",
+      inputSchema: z.object({}).passthrough(),
+      readOnly: true,
+      execute: async () => {
+        throw new RunFailedError({
+          class: "approval_pending",
+          title: "awaiting tool approval",
+          detail: "a nested run is parked",
+          remediation: "grant or deny it, then rerun",
+          exitCode: EXIT_CODES.approval_pending,
+        });
+      },
+    });
+    const ctx = createRunContext();
+    const { caught } = await loop({
+      ledger,
+      runContext: ctx,
+      tools: [escalates],
+      _adapter: toolAdapter("escalates", { input: 10, output: 5 }, ["tool", "text"]),
+    });
+    expect(caught).toBeInstanceOf(RunFailedError);
+    if (!(caught instanceof RunFailedError)) return;
+    expect(caught.report.class).toBe("approval_pending");
+    const rows = rowsOf(rowsAt(ledger), ctx.runId);
+    expect(rows.map((r) => r["state"])).toEqual(["running", "waiting-for-approval"]);
+    // A park carries no cost: a resume goes on spending.
+    expect("cost" in (rows[1] ?? {})).toBe(false);
+  });
+
+  test("a park recorded through a sub-run's context lands on the run it descends from", async () => {
+    const ledger = tempDir("ledger");
+    const store: PendingApprovalStore = createPendingApprovalStore({
+      rootDir: join(tempDir("approvals"), "approvals"),
+    });
+    const parent = createRunContext();
+    const danger = buildTool({
+      name: "danger",
+      description: "must be approved",
+      inputSchema: z.object({ x: z.number() }).strict(),
+      readOnly: false,
+      destructive: false,
+      concurrencySafe: false,
+      execute: async () => "did it",
+    });
+    // A tool that runs a nested loop on a child context, which parks; the
+    // tool rethrows the park, as the sub-agent spawner does.
+    const nested = buildTool({
+      name: "nested",
+      description: "runs a nested loop",
+      inputSchema: z.object({}).passthrough(),
+      readOnly: true,
+      execute: async () => {
+        const child = createRunContext({ parent: parent.runId });
+        const out = await loop({
+          ledger,
+          runContext: child,
+          permissionMode: "default",
+          tools: [danger],
+          approvals: { store },
+          _adapter: toolAdapter("danger", { input: 10, output: 5 }, ["tool", "text"]),
+        });
+        throw out.caught;
+      },
+    });
+    const { caught } = await loop({
+      ledger,
+      runContext: parent,
+      tools: [nested],
+      _adapter: toolAdapter("nested", { input: 10, output: 5 }, ["tool", "text"]),
+    });
+    expect(caught).toBeInstanceOf(RunFailedError);
+    const pending = await store.get("danger", hashApprovalInput("danger", { x: 1 }));
+    expect(pending?.id).toBeDefined();
+    const rows = rowsAt(ledger);
+    // Only the top-level run has rows: running, its park with the child's approval, nothing after.
+    expect(new Set(rows.map((r) => r["id"]))).toEqual(new Set([parent.runId]));
+    expect(rows.map((r) => r["state"])).toEqual(["running", "waiting-for-approval"]);
+    expect(rows[1]?.["decision"]).toBe(pending?.id);
+  });
+});
+
+describe("a holder's own end", () => {
+  /** One clean loop on `ctx` inside a hold the test releases with `ended`. */
+  async function heldLoop(
+    ledger: string,
+    ended: Parameters<ReturnType<typeof retainRun>>[0],
+    loopArgs: Partial<RunChatLoopOptions> = {},
+  ): Promise<Row[]> {
+    const ctx = createRunContext();
+    const release = retainRun(ctx);
+    await loop({ ledger, runContext: ctx, ...loopArgs });
+    release(ended);
+    return rowsOf(rowsAt(ledger), ctx.runId);
+  }
+
+  test("a holder that failed after a clean loop fails the run: unknown for a plain error, the class for a classified stop", async () => {
+    const ledger = tempDir("ledger");
+    const plain = await heldLoop(ledger, { outcome: "failed", error: new Error("node failed") });
+    expect(plain.map((r) => r["state"])).toEqual(["running", "failed"]);
+    expect(plain[1]?.["failureClass"]).toBe("unknown");
+    const budget = new RunFailedError({
+      class: "crewhaus_budget",
+      title: "budget",
+      detail: "spent",
+      remediation: "raise it",
+      exitCode: EXIT_CODES.crewhaus_budget,
+    });
+    const classified = await heldLoop(ledger, { outcome: "failed", error: budget });
+    expect(classified[1]).toMatchObject({
+      state: "failed",
+      failureClass: "crewhaus_budget",
+      cause: { kind: "budget", ref: "crewhaus_budget" },
+    });
+  });
+
+  test("a holder's pause is waiting-for-approval, never succeeded", async () => {
+    const ledger = tempDir("ledger");
+    const rows = await heldLoop(ledger, { outcome: "paused" });
+    expect(rows.map((r) => r["state"])).toEqual(["running", "waiting-for-approval"]);
+  });
+
+  test("a holder that says it succeeded wins over a loop it recovered from", async () => {
+    const ledger = tempDir("ledger");
+    const auth = Object.assign(new Error("401 invalid x-api-key"), {
+      providerId: "anthropic",
+      status: 401,
+      error: { type: "authentication_error", message: "invalid x-api-key" },
+    });
+    const rows = await heldLoop(
+      ledger,
+      { outcome: "succeeded" },
+      { _adapter: throwingAdapter(auth) },
+    );
+    expect(rows.map((r) => r["state"])).toEqual(["running", "succeeded"]);
+  });
+
+  test("a graph whose node throws after a loop on its context records failed, not the loop's success", async () => {
+    const ledger = tempDir("ledger");
+    const runContext = createRunContext();
+    const graph = createGraph<number, number>()
+      .addNode("talk", async (ctx, s) => {
+        const out = await loop({ ledger, runContext: ctx.runContext });
+        if (out.caught !== undefined) throw out.caught;
+        return s + 1;
+      })
+      .addNode("check", async () => {
+        throw new Error("validation failed");
+      })
+      .addEdge("talk", "check")
+      .setEntry("talk")
+      .compile();
+    await expect(collectTerminalState(graph.run(0, { runContext }))).rejects.toThrow(
+      "validation failed",
+    );
+    const rows = rowsOf(rowsAt(ledger), runContext.runId);
+    expect(rows.map((r) => r["state"])).toEqual(["running", "failed"]);
+    expect(rows[1]?.["failureClass"]).toBe("unknown");
+  });
+
+  test("a graph that pauses for a person after a loop records waiting-for-approval", async () => {
+    const ledger = tempDir("ledger");
+    const runContext = createRunContext();
+    const graph = createGraph<number, number>()
+      .addNode("talk", async (ctx, s) => {
+        await loop({ ledger, runContext: ctx.runContext });
+        return s + 1;
+      })
+      .addNode("ask", async (ctx, s) => {
+        await ctx.requestApproval("go ahead?");
+        return s;
+      })
+      .addEdge("talk", "ask")
+      .setEntry("talk")
+      .compile();
+    for await (const _ev of graph.run(0, { runContext })) {
+      // drain to the pause
+    }
+    expect(rowsOf(rowsAt(ledger), runContext.runId).map((r) => r["state"])).toEqual([
+      "running",
+      "waiting-for-approval",
+    ]);
+  });
+});
+
+describe("a sub-agent's spend", () => {
+  test("a priced parent with an unpriced sub-agent roll-up counts it as unpriced, not as $0", async () => {
+    const ledger = tempDir("ledger");
+    const ctx = createRunContext();
+    let published = false;
+    // The roll-up a sub-agent's spend reaches the parent's bus as, published mid-run.
+    const adapter = textAdapter("done", { input: 100, output: 10 }, () => {
+      if (published) return;
+      published = true;
+      ctx.eventBus.publish({
+        ...ctx.eventBus.envelope(),
+        kind: "cost_accrual",
+        role: "subagent",
+        summary: true,
+        provider: "anthropic",
+        modelId: "a-local-model",
+        inputTokens: 50,
+        outputTokens: 5,
+        cachedReadTokens: 0,
+        cacheCreationTokens: 0,
+        costUsdMicros: 0,
+        unpriced: true,
+      });
+    });
+    await loop({ ledger, runContext: ctx, model: "claude-sonnet-4-6", _adapter: adapter });
+    expect(published).toBe(true);
+    const cost = rowsOf(rowsAt(ledger), ctx.runId).at(-1)?.["cost"] as {
+      usdMicros: number | null;
+      unpriced: number;
+    };
+    // The parent's own call is priced, so there is a figure, and the roll-up is counted against it.
+    expect(cost.usdMicros ?? 0).toBeGreaterThan(0);
+    expect(cost.unpriced).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("a process that exits mid-run", () => {
+  test("a REPL ended with Ctrl-C twice exits 130 and its run is succeeded, not left running", async () => {
+    const ledger = tempDir("ledger");
+    const sessions = tempDir("sessions");
+    const script = join(tempDir("script"), "repl.ts");
+    // The child imports this package by path: a temp directory resolves no workspace names.
+    writeFileSync(
+      script,
+      `import { Readable } from "node:stream";
+import { runChatLoop } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};
+let ready = false;
+// An input that never sends a line: the REPL waits on it until the signals end it.
+const input = new Readable({
+  read() {
+    if (ready) return;
+    ready = true;
+    process.stdout.write("READY\\n");
+  },
+});
+const adapter = {
+  providerId: "anthropic",
+  features: { caching: "explicit", tool_use: true, vision: true, thinking: true, web_search: true },
+  estimateTokens: () => 0,
+  stream: () => (async function* () { yield { kind: "message_start" }; })(),
+};
+await runChatLoop({
+  model: "test-model",
+  instructions: "run rows exit test",
+  input,
+  installSigintHandler: true,
+  permissionMode: "bypass",
+  spinner: false,
+  stdout: (chunk) => process.stdout.write(chunk),
+  settingsDir: null,
+  sessionRootDir: ${JSON.stringify(sessions)},
+  runLedgerDir: ${JSON.stringify(ledger)},
+  _adapter: adapter,
+});
+`,
+    );
+    const env = { ...process.env };
+    for (const key of ENV_KEYS) Reflect.deleteProperty(env, key);
+    const child = spawn(process.execPath, [script], { env, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let errors = "";
+    let gone = false;
+    const waiters: Array<{ text: string; resolve: () => void; reject: (e: Error) => void }> = [];
+    child.stderr.on("data", (chunk: Buffer) => {
+      errors += chunk.toString("utf8");
+    });
+    child.stdout.on("data", (chunk: Buffer) => {
+      out += chunk.toString("utf8");
+      for (const w of waiters.splice(0)) {
+        if (out.includes(w.text)) w.resolve();
+        else waiters.push(w);
+      }
+    });
+    // Waiting on the child's own output, never on time: a child that ends first fails the wait.
+    const seen = (text: string): Promise<void> =>
+      new Promise((resolve, reject) => {
+        if (out.includes(text)) resolve();
+        else if (gone) reject(new Error(`the child ended before "${text}": ${errors}`));
+        else waiters.push({ text, resolve, reject });
+      });
+    const exited = new Promise<number | null>((resolve) =>
+      child.on("exit", (code) => {
+        gone = true;
+        for (const w of waiters.splice(0)) {
+          w.reject(new Error(`the child ended before "${w.text}": ${errors}`));
+        }
+        resolve(code);
+      }),
+    );
+    await seen("READY");
+    // The run is open: its running row is written, and nothing else yet.
+    expect(rowsAt(ledger).map((r) => r["state"])).toEqual(["running"]);
+    child.kill("SIGINT");
+    await seen("turn aborted");
+    child.kill("SIGINT");
+    expect(await exited).toBe(130);
+    const rows = rowsAt(ledger);
+    expect(rows.map((r) => r["state"])).toEqual(["running", "succeeded"]);
+    expect(rows[1]?.["id"]).toBe(rows[0]?.["id"]);
+    expect(rows[1]?.["cost"]).toBeDefined();
+  }, 30_000); // a child bun process loads the whole runtime: slow by construction on CI
 });

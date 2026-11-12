@@ -11,7 +11,7 @@ import type {
   SubAgentDefinition,
 } from "@crewhaus/agent-context-isolation";
 import { BUILTIN_DEFAULT_RULES, type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
-import { onRunIdle, retainRun } from "@crewhaus/run-context";
+import { type RunHoldOutcome, onRunIdle, retainRun } from "@crewhaus/run-context";
 import { createPendingApprovalStore } from "@crewhaus/runtime-core";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
@@ -1934,6 +1934,7 @@ describe("one run for the whole crew", () => {
     process.env["CREWHAUS_RUN_LEDGER"] = "0";
     try {
       let idle = 0;
+      let ended: RunHoldOutcome | undefined;
       let marks = 0;
       const idleSeen: number[] = [];
       // Each role's tool holds and releases the run, as a loop on the shared context does.
@@ -1945,7 +1946,12 @@ describe("one run for the whole crew", () => {
         execute: async (_input, ctx?: ToolExecuteContext) => {
           const runContext = (ctx?.bridge as RuntimeBridge | undefined)?.runContext;
           if (runContext === undefined) return "[no run context]";
-          if (marks === 0) onRunIdle(runContext.runId, () => idle++);
+          if (marks === 0) {
+            onRunIdle(runContext.runId, (outcome) => {
+              idle++;
+              ended = outcome;
+            });
+          }
           marks += 1;
           const release = retainRun(runContext);
           idleSeen.push(idle);
@@ -1990,6 +1996,79 @@ describe("one run for the whole crew", () => {
       expect(events.filter((e) => e.kind === "role_start").length).toBe(2);
       expect(idleSeen).toEqual([0, 0]);
       expect(idle).toBe(1);
+      // The crew says how it ended: done.
+      expect(ended).toEqual({ outcome: "succeeded" });
+    } finally {
+      if (saved === undefined) Reflect.deleteProperty(process.env, "CREWHAUS_RUN_LEDGER");
+      else process.env["CREWHAUS_RUN_LEDGER"] = saved;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the crew's own end is the run's end", () => {
+  test("a drive that fails (the activation limit) releases the run as failed, whatever its last role returned", async () => {
+    const root = newTempRoot();
+    const saved = process.env["CREWHAUS_RUN_LEDGER"];
+    process.env["CREWHAUS_RUN_LEDGER"] = "0";
+    try {
+      let ended: RunHoldOutcome | undefined;
+      let watched = false;
+      const watch = buildTool({
+        name: "watch",
+        description: "watch",
+        inputSchema: z.object({}).passthrough(),
+        readOnly: true,
+        execute: async (_input, ctx?: ToolExecuteContext) => {
+          const runContext = (ctx?.bridge as RuntimeBridge | undefined)?.runContext;
+          if (runContext === undefined) return "[no run context]";
+          if (!watched) {
+            watched = true;
+            onRunIdle(runContext.runId, (outcome) => {
+              ended = outcome;
+            });
+          }
+          return "watched";
+        },
+      });
+      // The first role's loop ends cleanly with a handoff; the limit then stops the drive.
+      const adapter = makeProgrammableAdapter(({ previousToolResults }) => {
+        if (previousToolResults.includes("watched")) {
+          return [
+            {
+              type: "tool_use",
+              id: "tool_h",
+              name: "Handoff",
+              input: { target: "second", reason: "your turn" },
+            },
+          ];
+        }
+        return [{ type: "tool_use", id: "tool_w", name: "watch", input: {} }];
+      });
+      const crew = Crew()
+        .setName("limited")
+        .addRole("first", { model: "stub", instructions: "First.", tools: [watch] })
+        .addRole("second", { model: "stub", instructions: "Second." })
+        .setEntry("first")
+        .compile();
+      const permissionRules: RuleSet = {
+        ...emptyRuleSet,
+        builtin: BUILTIN_DEFAULT_RULES,
+        flag: [{ type: "alwaysAllow", pattern: "watch", source: "flag" }],
+      };
+      await expect(
+        collect(
+          crew.run("go", {
+            sessionRootDir: root,
+            _adapter: adapter,
+            permissionRules,
+            maxActivations: 1,
+          }),
+        ),
+      ).rejects.toThrow(/maxActivations=1/);
+      expect(ended?.outcome).toBe("failed");
+      if (ended?.outcome !== "failed") return;
+      expect(String(ended.error)).toContain("maxActivations=1");
     } finally {
       if (saved === undefined) Reflect.deleteProperty(process.env, "CREWHAUS_RUN_LEDGER");
       else process.env["CREWHAUS_RUN_LEDGER"] = saved;

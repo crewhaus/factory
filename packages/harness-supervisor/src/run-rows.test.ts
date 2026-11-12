@@ -318,6 +318,20 @@ describe("the sweep", () => {
     expect(statesOf(rows, root).at(-1)).toBe("succeeded");
   });
 
+  test("exit 36 after a park inside a sub-agent: the loop's run stays parked and the root waits", async () => {
+    const h = setup("workflow");
+    const { root, execution } = await startJob(h);
+    const loopRun = mintRunId();
+    // The rows a top-level loop writes when a sub-agent beneath it parks: its
+    // park row names no execution, and may name no decision.
+    plant(h.dir, { id: loopRun, state: "running", execution, parent: root });
+    plant(h.dir, { id: loopRun, state: "waiting-for-approval" });
+    await exitWith(h, 36);
+    const rows = rowsAt(h.dir);
+    expect(statesOf(rows, loopRun)).toEqual(["running", "waiting-for-approval"]);
+    expect(statesOf(rows, root).at(-1)).toBe("waiting-for-approval");
+  });
+
   test("a daemon the last manager left, found dead at adoption, has its open runs interrupted", async () => {
     const h = setup("channel");
     const execution = "run_00000000000000aa";

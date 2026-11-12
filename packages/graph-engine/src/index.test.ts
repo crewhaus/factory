@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CheckpointStore, createCheckpointStore } from "@crewhaus/checkpoint-store";
 import { EXIT_CODES, RunFailedError } from "@crewhaus/errors";
-import { type RunContext, createRunContext, onRunIdle, retainRun } from "@crewhaus/run-context";
+import {
+  type RunContext,
+  type RunHoldOutcome,
+  createRunContext,
+  onRunIdle,
+  retainRun,
+} from "@crewhaus/run-context";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import {
   GraphBuildError,
@@ -556,6 +562,7 @@ describe("one run for the whole graph", () => {
   test("the run is held through every node and goes idle once, after the last", async () => {
     const runContext = createRunContext();
     let idle = 0;
+    let ended: RunHoldOutcome | undefined;
     const idleDuringNode: number[] = [];
     // Each node runs a loop on the shared context, which holds the run while it runs.
     const node = async (ctx: { runContext: RunContext }, s: number): Promise<number> => {
@@ -576,24 +583,105 @@ describe("one run for the whole graph", () => {
     for await (const ev of stream) {
       events.push(ev.kind);
       if (ev.kind === "node_start" && events.length === 1) {
-        expect(onRunIdle(runContext.runId, () => idle++)).toBe(true);
+        expect(
+          onRunIdle(runContext.runId, (outcome) => {
+            idle++;
+            ended = outcome;
+          }),
+        ).toBe(true);
       }
     }
     expect(idleDuringNode).toEqual([0, 0]);
     expect(idle).toBe(1);
+    // The graph says how it ended: done.
+    expect(ended).toEqual({ outcome: "succeeded" });
   });
 
-  test("a graph that throws still releases its hold", async () => {
+  test("a graph that throws after a node's loop releases its hold as failed, with the error", async () => {
     const runContext = createRunContext();
     let idle = 0;
+    let ended: RunHoldOutcome | undefined;
+    const thrown = new Error("node failed");
     const g = createGraph<number, number>()
-      .addNode("bad", async () => {
-        onRunIdle(runContext.runId, () => idle++);
-        throw new Error("node failed");
+      .addNode("ok", async (ctx, s) => {
+        // A loop on the shared context: it holds the run and ends cleanly.
+        const release = retainRun(ctx.runContext);
+        release();
+        return s + 1;
       })
-      .setEntry("bad")
+      .addNode("bad", async () => {
+        onRunIdle(runContext.runId, (outcome) => {
+          idle++;
+          ended = outcome;
+        });
+        throw thrown;
+      })
+      .addEdge("ok", "bad")
+      .setEntry("ok")
       .compile();
     await expect(collectTerminalState(g.run(0, { runContext }))).rejects.toThrow("node failed");
     expect(idle).toBe(1);
+    expect(ended).toEqual({ outcome: "failed", error: thrown });
+  });
+
+  test("a router that throws fails the run the same way", async () => {
+    const runContext = createRunContext();
+    let ended: RunHoldOutcome | undefined;
+    const g = createGraph<number, number>()
+      .addNode("one", async (_ctx, s) => {
+        onRunIdle(runContext.runId, (outcome) => {
+          ended = outcome;
+        });
+        return s + 1;
+      })
+      .addNode("two", async (_ctx, s) => s)
+      .addEdge("one", "two", () => {
+        throw new Error("router failed");
+      })
+      .setEntry("one")
+      .compile();
+    await expect(collectTerminalState(g.run(0, { runContext }))).rejects.toThrow("router failed");
+    expect(ended?.outcome).toBe("failed");
+  });
+
+  test("a graph that pauses for a person releases its hold as paused, never as done", async () => {
+    const runContext = createRunContext();
+    let ended: RunHoldOutcome | undefined;
+    const g = createGraph<number, number>()
+      .addNode("ask", async (ctx) => {
+        onRunIdle(runContext.runId, (outcome) => {
+          ended = outcome;
+        });
+        await ctx.requestApproval("go ahead?");
+        return 1;
+      })
+      .setEntry("ask")
+      .compile();
+    const { pausedAt } = await collectLastCheckpoint(g.run(0, { runContext }));
+    expect(pausedAt?.nodeName).toBe("ask");
+    expect(ended).toEqual({ outcome: "paused" });
+  });
+
+  test("a consumer that stops reading early says nothing of how the run ended", async () => {
+    const runContext = createRunContext();
+    let idle = 0;
+    let ended: RunHoldOutcome | undefined = { outcome: "succeeded" };
+    const g = createGraph<number, number>()
+      .addNode("one", async (_ctx, s) => {
+        onRunIdle(runContext.runId, (outcome) => {
+          idle++;
+          ended = outcome;
+        });
+        return s + 1;
+      })
+      .addNode("two", async (_ctx, s) => s + 1)
+      .addEdge("one", "two")
+      .setEntry("one")
+      .compile();
+    for await (const ev of g.run(0, { runContext })) {
+      if (ev.kind === "node_end") break;
+    }
+    expect(idle).toBe(1);
+    expect(ended).toBeUndefined();
   });
 });

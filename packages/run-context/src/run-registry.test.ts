@@ -6,6 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   RUN_REGISTRY_CAP,
+  type RunHoldOutcome,
   cancelRun,
   createRunContext,
   isCancelReason,
@@ -134,5 +135,40 @@ describe("holds", () => {
     expect(cancelRun(first.runId)).toBe(false);
     for (const release of releases) release();
     expect(idle).toBe(1);
+  });
+
+  test("the idle handler is handed how the holders ended the run: a failure stands, else the last said", () => {
+    const seen: Array<RunHoldOutcome | undefined> = [];
+    const hold = (outcomes: ReadonlyArray<RunHoldOutcome | undefined>): void => {
+      const ctx = createRunContext();
+      const releases = outcomes.map(() => retainRun(ctx));
+      onRunIdle(ctx.runId, (ended) => seen.push(ended));
+      outcomes.forEach((outcome, i) => releases[i]?.(outcome));
+    };
+    const error = new Error("graph failed");
+    hold([undefined]);
+    hold([{ outcome: "succeeded" }, undefined]);
+    hold([{ outcome: "failed", error }, { outcome: "succeeded" }]);
+    hold([{ outcome: "succeeded" }, { outcome: "paused" }]);
+    expect(seen).toEqual([
+      undefined,
+      { outcome: "succeeded" },
+      { outcome: "failed", error },
+      { outcome: "paused" },
+    ]);
+  });
+
+  test("a second release that says an outcome changes nothing: the release is a no-op", () => {
+    const ctx = createRunContext();
+    const releaseA = retainRun(ctx);
+    const releaseB = retainRun(ctx);
+    let ended: RunHoldOutcome | undefined;
+    onRunIdle(ctx.runId, (outcome) => {
+      ended = outcome;
+    });
+    releaseA({ outcome: "succeeded" });
+    releaseA({ outcome: "failed", error: new Error("late") });
+    releaseB();
+    expect(ended).toEqual({ outcome: "succeeded" });
   });
 });

@@ -64,6 +64,7 @@
     "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {
+    "@crewhaus/graph-engine": "workspace:*",
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-plan": "workspace:*"

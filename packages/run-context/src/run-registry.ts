@@ -11,7 +11,11 @@
  * A hold ({@link retainRun}) says the run has not ended: a loop holds its run
  * while it runs, and a library that drives several loops on one context holds
  * it for the whole run. When the last hold is released the run is idle: its
- * idle handler ({@link onRunIdle}) runs once and the entry is removed.
+ * idle handler ({@link onRunIdle}) runs once and the entry is removed. A
+ * holder that knows how the run ended says so on its release
+ * ({@link RunHoldOutcome}), and the idle handler is handed it: a library that
+ * drives several loops ends the run however it ended itself, not however its
+ * last loop did.
  *
  * One map, kept on `globalThis` under `Symbol.for("@crewhaus/run-context/runs")`
  * so two copies of this package in one process share it, capped at
@@ -26,10 +30,20 @@ export const RUN_REGISTRY_CAP = 1024;
 /** The branded reason {@link cancelRun} aborts with, read by {@link isCancelReason}. */
 export type CancelAbortReason = { readonly crewhausCancel: true };
 
+/**
+ * How a holder ended the run it held, said on its release: it finished, it
+ * paused for a person's decision, or it failed with `error`.
+ */
+export type RunHoldOutcome =
+  | { readonly outcome: "succeeded" }
+  | { readonly outcome: "paused" }
+  | { readonly outcome: "failed"; readonly error: unknown };
+
 type Entry = {
   controller?: AbortController;
   holds: number;
-  idle?: () => void;
+  idle?: (ended: RunHoldOutcome | undefined) => void;
+  ended?: RunHoldOutcome;
 };
 
 const REGISTRY_KEY = Symbol.for("@crewhaus/run-context/runs");
@@ -105,21 +119,26 @@ export function isCancelReason(signal: AbortSignal): boolean {
  * answering `false` for it). The returned release is idempotent: the call
  * that brings the holds to zero runs the run's idle handler once, then removes
  * the entry, controller included.
+ *
+ * A release may say how the holder ended the run. The idle handler is handed
+ * the outcome the releases said: a failure, once said, stands; otherwise the
+ * last one said wins. A release that says nothing changes nothing.
  */
-export function retainRun(ctx: { readonly runId: string }): () => void {
+export function retainRun(ctx: { readonly runId: string }): (ended?: RunHoldOutcome) => void {
   const runId = ctx.runId;
   const entry = entryFor(runId);
   entry.holds += 1;
   let released = false;
-  return () => {
+  return (ended?: RunHoldOutcome) => {
     if (released) return;
     released = true;
+    if (ended !== undefined && entry.ended?.outcome !== "failed") entry.ended = ended;
     entry.holds -= 1;
     if (entry.holds > 0) return;
     const idle = entry.idle;
     entry.idle = undefined;
     try {
-      idle?.();
+      idle?.(entry.ended);
     } catch {
       // An idle handler records what happened; its failure must not reach the run.
     } finally {
@@ -130,11 +149,12 @@ export function retainRun(ctx: { readonly runId: string }): () => void {
 }
 
 /**
- * Set what runs when the run goes idle (its last hold is released). The last
- * caller wins. Answers `false`, and sets nothing, when the registry has no
- * entry for the run: take a hold first.
+ * Set what runs when the run goes idle (its last hold is released), handed
+ * the outcome its holders said, if any. The last caller wins. Answers
+ * `false`, and sets nothing, when the registry has no entry for the run: take
+ * a hold first.
  */
-export function onRunIdle(runId: string, fn: () => void): boolean {
+export function onRunIdle(runId: string, fn: (ended: RunHoldOutcome | undefined) => void): boolean {
   const entry = registry().get(runId);
   if (entry === undefined) return false;
   entry.idle = fn;

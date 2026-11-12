@@ -26,6 +26,7 @@ export {
 export {
   type CancelAbortReason,
   RUN_REGISTRY_CAP,
+  type RunHoldOutcome,
   cancelRun,
   isCancelReason,
   onRunIdle,

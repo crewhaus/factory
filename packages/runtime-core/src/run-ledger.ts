@@ -19,14 +19,28 @@
  *    scope, what started the run, and the root run, work item, parked run
  *    and execution when known;
  *  - `waiting-for-approval {decision}` at a park (`recordRunPark`), after
- *    which this process writes nothing more for the run: the park is durable;
+ *    which this process writes nothing more for the run: the park is durable.
+ *    A park inside a sub-agent is the top-level run's park: the sub-agent's
+ *    context names its parent, and the park is recorded on the run it
+ *    descends from;
  *  - a terminal row once the run is idle (its last hold released, see
- *    run-context's `retainRun`), from the last loop's outcome: `cancelled`
- *    when the context's signal was aborted by `cancelRun`, whether the loop
- *    returned or threw; nothing more for an `approval_pending` stop; `failed
- *    {failureClass, cause?}` for another classified stop and `failed
- *    {failureClass: "unknown"}` for any other throw; `succeeded` otherwise.
- *    A terminal row carries `cost`, where an unpriced run is never $0.
+ *    run-context's `retainRun`): `cancelled` when the context's signal was
+ *    aborted by `cancelRun`, whether the loop returned or threw; otherwise
+ *    from how the run ended: the outcome a holder said on its release (a
+ *    graph or a crew that drives several loops ends the run as it ended
+ *    itself), else the last loop's. An `approval_pending` stop, or a holder's
+ *    pause, is `waiting-for-approval` when no park row was written yet, and
+ *    nothing more when one was; `failed {failureClass, cause?}` for another
+ *    classified stop and `failed {failureClass: "unknown"}` for any other
+ *    throw; `succeeded` otherwise. A terminal row carries `cost`, where an
+ *    unpriced run is never $0, and spend a sub-agent could not price is
+ *    counted as unpriced;
+ *  - a process that exits while a run is still open (`process.exit` skips
+ *    every `finally`, as a second Ctrl-C in the REPL does) ends it in the
+ *    exit handler, by the exit code: `0` or `130` (a person ending their
+ *    session) is `succeeded`, `36` is `waiting-for-approval`, another code
+ *    the exit-code table names is `failed` with its class, and any other is
+ *    `failed {failureClass: "unknown"}`.
  *
  * A verified root. A supervisor that starts a one-shot job writes its root
  * run's `queued` and `preparing` rows and hands the child `CREWHAUS_RUN_ID`
@@ -56,11 +70,17 @@ import {
   readPage,
 } from "@crewhaus/control-records";
 import { type CostTracker, createCostTracker } from "@crewhaus/cost-tracker";
-import { type FailureClass, RunFailedError } from "@crewhaus/errors";
+import { EXIT_CODES, type FailureClass, RunFailedError } from "@crewhaus/errors";
 import { DEFAULT_ROOT_DIR } from "@crewhaus/event-log";
-import { type RunContext, isCancelReason, onRunIdle, retainRun } from "@crewhaus/run-context";
+import {
+  type RunContext,
+  type RunHoldOutcome,
+  isCancelReason,
+  onRunIdle,
+  retainRun,
+} from "@crewhaus/run-context";
 import { currentTenantContext } from "@crewhaus/tenancy";
-import type { TraceEventBus } from "@crewhaus/trace-event-bus";
+import type { CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 
 type Logger = RunContext["logger"];
 
@@ -100,6 +120,9 @@ type OpenRun = {
   readonly bus: TraceEventBus;
   readonly trigger: Trigger;
   readonly tracker: CostTracker;
+  /** Nested roll-ups (a sub-agent's spend) seen on the bus, by whether they were priced. */
+  readonly rollups: { priced: number; unpriced: number };
+  readonly stopRollups: () => void;
   parked: boolean;
   last?: LoopOutcome;
 };
@@ -109,13 +132,22 @@ type RunRowsSlot = {
   readonly opts: object;
   run?: OpenRun;
   release?: () => void;
+  /** The run id this loop linked to the open run it descends from. */
+  linked?: string;
 };
 
 const slots = new AsyncLocalStorage<RunRowsSlot>();
 const openRuns = new Map<string, OpenRun>();
 const closedRuns = new Set<string>();
 const verifiedRoots = new Map<string, VerifiedRoot | null>();
+/**
+ * A running sub-run's id (a sub-agent's, a side call's) to the open run it
+ * descends from, so a park inside it lands on that run. A link lives while the
+ * sub-run's loop runs.
+ */
+const descendsFrom = new Map<string, string>();
 let appendWarned = false;
+let exitHandlerSet = false;
 
 /** Whether this `runChatLoop` invocation already runs under {@link withRunRows}. */
 export function hasRunRows(opts: object): boolean {
@@ -136,9 +168,18 @@ export async function withRunRows<T>(opts: object, fn: () => Promise<T>): Promis
     outcome = { threw: true, error: err };
     throw err;
   } finally {
+    if (slot.linked !== undefined) descendsFrom.delete(slot.linked);
     if (slot.run !== undefined) slot.run.last = outcome;
     slot.release?.();
   }
+}
+
+/** The open run `runId` is, or descends from. */
+function openRunOf(runId: string): OpenRun | undefined {
+  const run = openRuns.get(runId);
+  if (run !== undefined) return run;
+  const top = descendsFrom.get(runId);
+  return top === undefined ? undefined : openRuns.get(top);
 }
 
 /**
@@ -160,6 +201,15 @@ export function openRunRows(args: {
   const { runContext: ctx, opts } = args;
   const slot = slots.getStore();
   if (slot === undefined || slot.opts !== opts || slot.release !== undefined) return;
+  // A sub-run records no rows of its own, but a park inside it is its top
+  // run's park: link it to the open run it descends from while it runs.
+  if (ctx.parent !== undefined && slot.linked === undefined) {
+    const top = openRunOf(ctx.parent);
+    if (top !== undefined) {
+      descendsFrom.set(ctx.runId, top.runId);
+      slot.linked = ctx.runId;
+    }
+  }
   if (!args.persistSession || opts.runLedgerDir === null) return;
   if (process.env["CREWHAUS_RUN_LEDGER"] === "0") return;
   if (ctx.parent !== undefined || currentTenantContext() !== undefined) return;
@@ -193,6 +243,7 @@ export function openRunRows(args: {
       warnAppend(ctx.logger, written.code);
       return;
     }
+    const rollups = { priced: 0, unpriced: 0 };
     run = {
       runId: ctx.runId,
       ledger,
@@ -200,14 +251,35 @@ export function openRunRows(args: {
       bus: args.bus,
       trigger,
       tracker: createCostTracker(args.bus, { suppressEvents: true }),
+      rollups,
+      stopRollups: countRollups(args.bus, rollups),
       parked: false,
     };
     openRuns.set(ctx.runId, run);
+    setExitHandler();
   }
   const opened = run;
   slot.run = opened;
   slot.release = retainRun(ctx);
-  onRunIdle(ctx.runId, () => closeRun(opened));
+  onRunIdle(ctx.runId, (ended) => closeRun(opened, ended));
+}
+
+/**
+ * Count the nested roll-ups the bus carries (a sub-agent's spend, a side
+ * call's): the cost tracker folds their dollars, but a roll-up its publisher
+ * could not price adds no pricing miss there, so it is counted here.
+ */
+function countRollups(
+  bus: TraceEventBus,
+  rollups: { priced: number; unpriced: number },
+): () => void {
+  return bus.subscribe((event) => {
+    if (event.kind !== "cost_accrual") return;
+    const accrual = event as CostAccrualEvent;
+    if (accrual.summary !== true || accrual.role === undefined) return;
+    if (accrual.unpriced === true) rollups.unpriced += 1;
+    else rollups.priced += 1;
+  });
 }
 
 /**
@@ -215,7 +287,7 @@ export function openRunRows(args: {
  * then gets no terminal row from this process; a resume continues it.
  */
 export function recordRunPark(ctx: RunContext, decision: string): void {
-  const run = openRuns.get(ctx.runId);
+  const run = openRunOf(ctx.runId);
   if (run === undefined || run.parked) return;
   run.parked = true;
   const written = append(run.ledger, {
@@ -229,7 +301,12 @@ export function recordRunPark(ctx: RunContext, decision: string): void {
 }
 
 /** The run's idle handler: its terminal row, unless it parked. */
-function closeRun(run: OpenRun): void {
+function closeRun(run: OpenRun, ended: RunHoldOutcome | undefined): void {
+  endRun(run, () => terminalState(run, ended));
+}
+
+/** Forget an open run and write the row `ending` answers, if any. */
+function endRun(run: OpenRun, ending: () => Ending | undefined): void {
   openRuns.delete(run.runId);
   closedRuns.add(run.runId);
   if (closedRuns.size > CLOSED_RUNS_KEPT) {
@@ -238,37 +315,90 @@ function closeRun(run: OpenRun): void {
   }
   try {
     if (run.parked) return;
-    const ending = terminalState(run);
-    if (ending === undefined) return;
+    const row = ending();
+    if (row === undefined) return;
+    // A park row is written at the park, with no cost: a resume goes on spending.
     const written = append(run.ledger, {
       id: run.runId,
       at: new Date().toISOString(),
       trigger: run.trigger,
-      ...ending,
-      cost: runCost(run),
+      ...row,
+      ...(row.state === "waiting-for-approval" ? {} : { cost: runCost(run) }),
     });
     if (!written.ok) warnAppend(run.ctx.logger, written.code);
   } finally {
     run.tracker.unsubscribe();
+    run.stopRollups();
   }
 }
 
 type Ending =
-  | { readonly state: "cancelled" | "succeeded" }
+  | { readonly state: "cancelled" | "succeeded" | "waiting-for-approval" }
   | { readonly state: "failed"; readonly failureClass: string; readonly cause?: RunCause };
 
-/** How the run ended, from its signal and its last loop. `undefined`: a park stands. */
-function terminalState(run: OpenRun): Ending | undefined {
+/**
+ * How the run ended: its signal first, then the outcome a holder said on its
+ * release, then its last loop's. `undefined`: nothing to write.
+ */
+function terminalState(run: OpenRun, ended: RunHoldOutcome | undefined): Ending | undefined {
   // An aborted loop can return normally, so the cancel is read first.
   if (isCancelReason(run.ctx.abortSignal)) return { state: "cancelled" };
+  if (ended?.outcome === "succeeded") return { state: "succeeded" };
+  // A holder's pause (a graph's `hitl_pause`) waits on a person, like a park.
+  if (ended?.outcome === "paused") return { state: "waiting-for-approval" };
+  if (ended?.outcome === "failed") return endingOfThrow(ended.error);
   const last = run.last;
   if (last === undefined) return { state: "failed", failureClass: "unknown" };
   if (!last.threw) return { state: "succeeded" };
-  const failureClass = failureClassOf(last.error);
+  return endingOfThrow(last.error);
+}
+
+/**
+ * The row a thrown stop ends a run with. An `approval_pending` stop whose park
+ * row was not written (a park this process could not attribute) is still a
+ * park, never a success and never a failure.
+ */
+function endingOfThrow(error: unknown): Ending {
+  const failureClass = failureClassOf(error);
   if (failureClass === undefined) return { state: "failed", failureClass: "unknown" };
-  if (failureClass === "approval_pending") return undefined;
+  return endingOfClass(failureClass);
+}
+
+function endingOfClass(failureClass: FailureClass): Ending {
+  if (failureClass === "approval_pending") return { state: "waiting-for-approval" };
   const cause = causeOf(failureClass);
   return { state: "failed", failureClass, ...(cause !== undefined ? { cause } : {}) };
+}
+
+/** The failure class the exit-code table gives `code`, when it names one. */
+const CLASS_OF_EXIT_CODE: ReadonlyMap<number, FailureClass> = new Map(
+  Object.entries(EXIT_CODES)
+    .filter(([name]) => name !== "ok" && name !== "generic")
+    .map(([name, code]) => [code, name as FailureClass]),
+);
+
+/** How a run still open when the process exits ends, by the exit code. */
+function exitState(run: OpenRun, code: number): Ending {
+  if (isCancelReason(run.ctx.abortSignal)) return { state: "cancelled" };
+  // 130 is SIGINT: a person ending their session (the REPL's second Ctrl-C).
+  if (code === 0 || code === 130) return { state: "succeeded" };
+  const failureClass = CLASS_OF_EXIT_CODE.get(code);
+  return failureClass === undefined
+    ? { state: "failed", failureClass: "unknown" }
+    : endingOfClass(failureClass);
+}
+
+/**
+ * Once per process: on exit, end every run still open. `process.exit` runs no
+ * `finally`, so without this a run ended that way would read `running`
+ * forever. `append` is one synchronous write, so it lands before the exit.
+ */
+function setExitHandler(): void {
+  if (exitHandlerSet) return;
+  exitHandlerSet = true;
+  process.once("exit", (code) => {
+    for (const run of [...openRuns.values()]) endRun(run, () => exitState(run, code));
+  });
 }
 
 function failureClassOf(error: unknown): FailureClass | undefined {
@@ -295,8 +425,8 @@ function causeOf(failureClass: FailureClass): RunCause | undefined {
 
 /** The run's spend. A run whose every call was unpriced has no dollar figure: `null`, never 0. */
 function runCost(run: OpenRun): { readonly usdMicros: number | null; readonly unpriced: number } {
-  const unpriced = run.tracker.pricingMisses();
-  const priced = run.tracker.observed();
+  const unpriced = run.tracker.pricingMisses() + run.rollups.unpriced;
+  const priced = run.tracker.observed() + run.rollups.priced;
   const usdMicros =
     unpriced > 0 && priced === 0
       ? null
@@ -407,10 +537,15 @@ function triggerOf(value: unknown): Trigger | undefined {
   return (TRIGGER_KINDS as readonly unknown[]).includes(kind) ? (value as Trigger) : undefined;
 }
 
-/** Test seam: forget the roots, the ended runs and the one warning. */
+/** Test seam: forget the open runs, the roots, the ended runs and the one warning. */
 export function _resetRunLedgerForTest(): void {
+  for (const run of openRuns.values()) {
+    run.tracker.unsubscribe();
+    run.stopRollups();
+  }
   openRuns.clear();
   closedRuns.clear();
+  descendsFrom.clear();
   verifiedRoots.clear();
   appendWarned = false;
 }
