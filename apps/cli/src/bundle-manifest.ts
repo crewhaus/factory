@@ -13,10 +13,11 @@
  * CLI's own version. `compile --check` verified against exactly this
  * manifest already; now the compile itself ships it.
  */
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Bundle } from "@crewhaus/ir";
+import { specRevision } from "@crewhaus/ir/policy";
+import { probeBundleFile, writeBundleFile } from "./bundle-writer";
 import { cliVersion } from "./version";
 
 /** The `name` stamped into synthesized manifests — the "ours" marker that
@@ -50,19 +51,10 @@ export type BundleSpecStamp = {
 export const BUNDLE_STAMP_KEY = "crewhaus";
 
 /**
- * Digest of a spec's SOURCE TEXT, the thing an operator actually edits.
- *
- * Line endings are normalized (CRLF/CR → LF) and a single trailing newline is
- * ignored, so the same spec checked out on Windows — or re-saved by an editor
- * that adds a final newline — is not reported as a spec change. Nothing else
- * is normalized: whitespace and comments inside a spec CAN change behavior
- * (block scalars carry indentation into instructions), so treating them as
- * insignificant would under-report real drift.
+ * Digest of a spec's SOURCE TEXT, the thing an operator actually edits: the one revision
+ * function every check shares (`@crewhaus/ir/policy`'s `specRevision`).
  */
-export function hashSpecSource(specYaml: string): string {
-  const normalized = specYaml.replace(/\r\n?/g, "\n").replace(/\n$/, "");
-  return `sha256:${createHash("sha256").update(normalized, "utf8").digest("hex")}`;
-}
+export const hashSpecSource: (specYaml: string) => string = specRevision;
 
 /**
  * Collect the @crewhaus/* packages the emitted bundle imports (sorted,
@@ -153,10 +145,12 @@ export function ensureBundleManifest(
 ): ManifestResult {
   const path = join(outDir, "package.json");
   if (files.some((f) => f.path === "package.json")) return { path, action: "skipped" };
-  if (existsSync(path)) {
+  // A link (or any other non-regular file) at the name is never read: it is replaced.
+  const existing = probeBundleFile(outDir, "package.json");
+  if (existing.kind === "file") {
     let ours = false;
     try {
-      const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
+      const parsed: unknown = JSON.parse(existing.text);
       ours =
         typeof parsed === "object" &&
         parsed !== null &&
@@ -178,7 +172,11 @@ export function ensureBundleManifest(
           ...(version !== undefined ? { compiledWith: version } : {}),
         }
       : readBundleSpecStamp(outDir);
-  writeFileSync(path, buildBundlePackageJson(collectCrewhausDeps(files), version, stamp));
+  writeBundleFile(
+    outDir,
+    "package.json",
+    buildBundlePackageJson(collectCrewhausDeps(files), version, stamp),
+  );
   return { path, action: "wrote" };
 }
 

@@ -180,10 +180,13 @@ export type {
   PrepareRunnerOptions,
   PrepareStage,
   RunCommandInput,
+  CompileMode,
 } from "./prepare";
 export {
   bundleStaleness,
+  compileActiveRevision,
   compileIfStale,
+  SAVED_NOT_ACTIVE_NOTE,
   compileOutDir,
   createPrepareRunner,
   formatPrepareRefusal,
@@ -198,6 +201,10 @@ export {
 export {
   BRIEF_TARGETS,
   BUNDLE_DIR_CANDIDATES,
+  isLoaderEnvKey,
+  LOADER_ENV_KEYS,
+  LOADER_ENV_PREFIXES,
+  rootBundleCompiled,
   buildSpawnEnv,
   buildSpawnPlan,
   cliTwin,
@@ -238,6 +245,7 @@ export type {
   ExitClassification,
   ExitDisposition,
   RestartWindow,
+  RestartWindowStore,
 } from "./policy";
 export {
   BACKOFF_BASE_MS,
@@ -313,7 +321,34 @@ export type {
   SupervisorOptions,
   SupervisorSnapshot,
 } from "./supervisor";
-export { createHarnessSupervisor, DEFAULT_PUMP_INTERVAL_MS } from "./supervisor";
+export type { AdmitAnswer } from "./supervisor";
+export {
+  createHarnessSupervisor,
+  DEFAULT_PUMP_INTERVAL_MS,
+  DEPLOYMENT_ID_ENV,
+  SPEC_HASH_ENV,
+} from "./supervisor";
+
+export type { ActiveBuildCheck, ActiveDeployment } from "./active-build";
+export {
+  activeDeployment,
+  artifactOf,
+  BUILD_NOT_ACTIVE_MESSAGE,
+  launchedEntryOf,
+  NO_ACTIVE_BUILD_ACTIVATE_MESSAGE,
+  NO_ACTIVE_BUILD_MESSAGE,
+  resolvedEntryOf,
+  verifyActiveBuild,
+} from "./active-build";
+export type { BuildArtifact } from "./build-inputs";
+export {
+  bootInputsOf,
+  buildDigest,
+  bundleDirOf,
+  collectBuildFiles,
+  parseJsonc,
+  RESOLVER_FILES,
+} from "./build-inputs";
 
 // The manager-side helpers `@crewhaus/hangar-server` used to own, moved down
 // so that `crewhaus daemon` and the other heads reach them without depending

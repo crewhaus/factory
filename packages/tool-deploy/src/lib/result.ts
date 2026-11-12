@@ -98,7 +98,8 @@ export type FailCode =
   | "not-a-directory"
   | "bad-input"
   | "unreadable"
-  | "conflict";
+  | "conflict"
+  | "approval-required";
 
 export type Failure = { readonly ok: false; readonly reason: string; readonly code: FailCode };
 export type Loaded<T> = { readonly ok: true; readonly value: T } | Failure;

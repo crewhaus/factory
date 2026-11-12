@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AuditKind, FileAnchorStore, openAuditLog } from "@crewhaus/audit-log";
 import { DEFAULT_JUDGE_MODEL } from "@crewhaus/eval-judge";
+import { specRevision } from "@crewhaus/ir/policy";
 import { parseSpec } from "@crewhaus/spec";
 import { cliVersion } from "./version";
 
@@ -3154,13 +3155,17 @@ describe("crewhaus approval gate — all pin doors (item 59, F2)", () => {
     expect(await readGovernanceApprovals()).toHaveLength(0);
   }, 20_000);
 
-  test("spec pin to a protected env SUCCEEDS once an approval for the version is recorded", async () => {
+  test("spec pin to a protected env SUCCEEDS once an approval for the version's content is recorded", async () => {
     await seedProtectedHarness();
     const approvalsDir = join(tmp, ".crewhaus", "approvals");
     mkdirSync(approvalsDir, { recursive: true });
+    // The approval names the content of v2 as registered (b.yaml's text).
+    const specHash = specRevision(
+      "target: cli\nname: demo\nagent:\n  model: m\n  instructions: Two.\n",
+    );
     writeFileSync(
       join(approvalsDir, "demo__prod.json"),
-      JSON.stringify([{ approver: "alice", ts: "2026-07-02T00:00:00Z", version: "v2" }]),
+      JSON.stringify([{ approver: "alice", ts: "2026-07-02T00:00:00Z", version: "v2", specHash }]),
     );
     const pinned = await runCli(["spec", "pin", "demo", "prod", "v2"], { cwd: tmp });
     expect(pinned.exitCode).toBe(0);

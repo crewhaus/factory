@@ -144,6 +144,12 @@ export type DaemonRunfile = {
    * better than dropping names it does hold.
    */
   readonly scrubKeys?: readonly string[];
+  /** The deployment this run was started from (`dep_…`), when one is active. */
+  readonly deployment?: string;
+  /** The active deployment's spec revision. */
+  readonly specHash?: string;
+  /** The active deployment's build digest. */
+  readonly artifactDigest?: string;
 };
 
 /** How far apart two start-time readings may be and still count as the same

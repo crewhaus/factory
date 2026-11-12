@@ -7,6 +7,7 @@
   "references": [
     { "path": "../audit-log" },
     { "path": "../errors" },
+    { "path": "../ir" },
     { "path": "../spec-registry" }
   ],
   "include": ["src/**/*"]

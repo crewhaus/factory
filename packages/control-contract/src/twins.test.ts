@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import {
   COMMAND_KINDS,
   type CliTwin,
+  DEPLOYMENT_ID_RE,
   OPERATIONS,
   TWIN_PLACEHOLDERS,
+  isId,
   parseTwin,
   renderTwin,
 } from "./index.js";
@@ -14,9 +16,11 @@ const SHOW: CliTwin = { argv: ["approvals", "show", "{appr}", "--dir", "{dir}"] 
 const CHOICE: CliTwin = { argv: ["approvals", "{choice}", "{appr}", "--dir", "{dir}"] };
 const HARNESS: CliTwin = { argv: ["harness", "show", "{hrn}"] };
 
+const DEP = "dep_01m76e6f05hp514w9j4v3qymka";
+
 const SAMPLES = [
-  { hrn: HRN, appr: APPR, dir: "/srv/poly", choice: "grant" },
-  { hrn: HRN, appr: APPR, dir: "/srv/poly", choice: "deny" },
+  { hrn: HRN, appr: APPR, dir: "/srv/poly", choice: "grant", dep: DEP },
+  { hrn: HRN, appr: APPR, dir: "/srv/poly", choice: "deny", dep: DEP },
 ];
 
 const TWINS: readonly CliTwin[] = [
@@ -117,6 +121,20 @@ describe("parseTwin refuses", () => {
 });
 
 test("the placeholders, pinned, with empty flags", () => {
-  expect(Object.keys(TWIN_PLACEHOLDERS)).toEqual(["{hrn}", "{appr}", "{choice}", "{dir}"]);
+  expect(Object.keys(TWIN_PLACEHOLDERS)).toEqual(["{hrn}", "{appr}", "{choice}", "{dir}", "{dep}"]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
+});
+
+test("the {dep} placeholder is the deployment id grammar", () => {
+  expect(DEPLOYMENT_ID_RE.test(DEP)).toBe(isId("dep", DEP));
+  expect(DEPLOYMENT_ID_RE.test(DEP)).toBe(true);
+  for (const value of [
+    "dep_short",
+    `run_${DEP.slice(4)}`,
+    `${DEP}x`,
+    "dep_01M76E6F05HP514W9J4V3QYMKA",
+  ]) {
+    expect(DEPLOYMENT_ID_RE.test(value)).toBe(isId("dep", value));
+  }
+  expect(TWIN_PLACEHOLDERS["{dep}"]).toBe(DEPLOYMENT_ID_RE);
 });

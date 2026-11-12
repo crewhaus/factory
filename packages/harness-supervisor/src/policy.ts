@@ -171,22 +171,40 @@ export type RestartWindow = {
   reset(): void;
 };
 
+/** Where a restart window keeps its restarts between managers. */
+export type RestartWindowStore = {
+  /** The restarts recorded so far, or `undefined` when there are none to load. */
+  load(): readonly number[] | undefined;
+  save(restarts: readonly number[]): void;
+};
+
 /** A rolling restart counter. Injecting the clock is what makes the
- *  5-in-10-minutes rule testable without waiting ten minutes. */
+ *  5-in-10-minutes rule testable without waiting ten minutes. With a
+ *  `store`, the restarts survive the manager: a new supervisor on the same
+ *  harness counts the restarts the last one recorded. */
 export function createRestartWindow(
   clock: Clock,
   max: number = MAX_RESTARTS_PER_WINDOW,
   windowMs: number = RESTART_WINDOW_MS,
+  store?: RestartWindowStore,
 ): RestartWindow {
-  let stamps: number[] = [];
+  let stamps: number[] = [...(store?.load() ?? [])].filter((t) => Number.isFinite(t));
   const prune = (): void => {
     const cutoff = clock.now() - windowMs;
     stamps = stamps.filter((t) => t > cutoff);
+  };
+  const save = (): void => {
+    try {
+      store?.save(stamps);
+    } catch {
+      // Bookkeeping: the window in memory still holds.
+    }
   };
   return {
     record: () => {
       prune();
       stamps.push(clock.now());
+      save();
       return stamps.length;
     },
     count: () => {
@@ -204,6 +222,7 @@ export function createRestartWindow(
     },
     reset: () => {
       stamps = [];
+      save();
     },
   };
 }

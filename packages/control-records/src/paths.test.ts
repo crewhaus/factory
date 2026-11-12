@@ -22,6 +22,8 @@ describe("the layout", () => {
       mutatingLeaseFile: join(CONTROL, "leases", "mutating.json"),
       operatorFile: join(CONTROL, "operator.json"),
       approversFile: join(CONTROL, "approvers.json"),
+      deploymentsFile: join(CONTROL, "deployments.jsonl"),
+      harnessIdentityFile: join(CONTROL, "harness.json"),
     });
     expect(readdirSync(root)).toEqual([]);
   });

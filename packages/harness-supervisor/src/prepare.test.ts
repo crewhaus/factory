@@ -379,7 +379,7 @@ describe("createPrepareRunner", () => {
     const dir = harness();
     const ops = fakeOps();
     const runner = createPrepareRunner(deps(dir, ops));
-    expect(runner.configured).toEqual({ compile: false, hooks: [] });
+    expect(runner.configured).toEqual({ compile: false, compileMode: false, hooks: [] });
     expect(await runner.prepare()).toMatchObject({ ok: true, replan: false });
     expect(await runner.preSpawn()).toMatchObject({ ok: true });
     expect(ops.seen).toHaveLength(0);

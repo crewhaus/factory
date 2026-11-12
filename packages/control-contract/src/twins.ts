@@ -5,7 +5,7 @@
  * a command line back to its params, so one type serves both directions.
  */
 import type { CliTwin } from "./areas/types.js";
-import { APPROVAL_ID_RE, HARNESS_ID_RE } from "./ids.js";
+import { APPROVAL_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
 import { deepFreeze } from "./util.js";
 
 export type { CliTwin } from "./areas/types.js";
@@ -15,6 +15,7 @@ export const CLI_VERBS = deepFreeze({
   harness: ["list", "show"],
   daemon: ["start", "stop", "restart", "drain"],
   approvals: ["show", "grant", "deny"],
+  deploy: ["activate", "list"],
 } as const);
 
 /**
@@ -31,6 +32,7 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{choice}": /^(?:grant|deny)$/,
   // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
   "{dir}": /^[^\x00-\x1f\x7f-][^\x00-\x1f\x7f]*$/,
+  "{dep}": DEPLOYMENT_ID_RE,
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

@@ -4,7 +4,8 @@
  * process did not start before it signals one, as `crewhaus daemon stop` does. One
  * reconciler serves start and restart, the two kinds that are not safe to repeat blindly.
  *
- * The operator record, run creation and decisions get theirs with their writers.
+ * Activation's reconciler reads the deployment records. The operator record, run creation
+ * and decisions get theirs with their writers.
  */
 import type { CommandReceipt } from "@crewhaus/control-contract";
 import {
@@ -13,6 +14,7 @@ import {
   type StopResult,
   readRunfile,
 } from "@crewhaus/harness-supervisor";
+import { protectedEnvironmentGate, reconcileActivation } from "./deployments";
 import type {
   AreaRuntime,
   Executor,
@@ -20,7 +22,7 @@ import type {
   Reconciliation,
   Settlement,
 } from "./executor";
-import { outcomeOf } from "./refusal";
+import { NEEDS_DECISION, outcomeOf } from "./refusal";
 
 /** A start or restart's answer, as a settlement. */
 export function settleStart(result: StartResult): Settlement {
@@ -35,6 +37,7 @@ export function settleStart(result: StartResult): Settlement {
       return { state: "rejected", outcome: outcomeOf("conflict") };
     case "preflight-blocked":
     case "prepare-refused":
+    case "build-not-active":
       return { state: "rejected", outcome: outcomeOf("precondition_failed") };
     case "plan-failed":
       return {
@@ -109,6 +112,13 @@ export function reconcileDaemonStart(
   return runfile.pidStartTimeMs >= acceptedAt ? "done" : "unknown";
 }
 
+/**
+ * An activation run again by recovery. A person's activation names its environment and
+ * autostart, and a receipt keeps no argument, so recovery cannot repeat it as asked: once
+ * the reconciler finds the deployment still prepared, the command is left for a person.
+ */
+const activate: Executor = async () => ({ state: "unknown", outcome: NEEDS_DECISION });
+
 export const CORE_RUNTIME: AreaRuntime = {
   area: "core",
   executors: {
@@ -116,9 +126,12 @@ export const CORE_RUNTIME: AreaRuntime = {
     "controls.stop": stop,
     "controls.restart": restart,
     "controls.drain": drain,
+    "deployments.activate": activate,
   },
   reconcilers: {
     "controls.start": reconcileDaemonStart,
     "controls.restart": reconcileDaemonStart,
+    "deployments.activate": (receipt, ctx) => reconcileActivation(receipt, ctx),
   },
+  activationGates: [protectedEnvironmentGate],
 };

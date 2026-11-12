@@ -37,6 +37,7 @@ import {
   toolSitesOf,
 } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
+import { writeHarnessIdentity } from "@crewhaus/control-records";
 import {
   type CapabilityRequirement,
   DEFAULT_CAPABILITIES,
@@ -407,6 +408,7 @@ import {
   parseArgs,
 } from "@crewhaus/infra-utils";
 import { GENERATED_README_MARKER, type IrBudget, type IrV0, projectLoop } from "@crewhaus/ir";
+import { specRevision } from "@crewhaus/ir/policy";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
 // Item 1 (G30) — the MCP-server projection runtime. `crewhaus serve --mcp`
@@ -559,15 +561,14 @@ import { alertWebhookFromSettings, buildAlertSink } from "./alert-sink";
 // module so it is unit-testable (this entry file runs an argv switch on
 // import). The gate runs BEFORE the deployment-controller flips the pin.
 import {
-  type ApprovalDecisionInput,
   ApprovalGateError,
   type PrCheckReader,
   buildGovernancePayload,
-  decideApproval,
+  candidateSpecHash,
+  evaluateProtectedEnvGate,
   loadEnvironmentsConfig,
   policyForEnv,
   prReferencesVersion,
-  readApprovals,
   rollupConclusion,
 } from "./approval-gate";
 // Loop contract 0.4 (Batch C, G11) — the `crewhaus approvals` verbs' pure
@@ -597,6 +598,7 @@ import {
   COST_SUMMARY_SCHEMA,
   DATASETS_SCHEMA,
   DATASET_SCHEMA,
+  DEPLOY_ACTIVATE_SCHEMA,
   DEPLOY_SCHEMA,
   DEV_SCHEMA,
   DISTILL_SCHEMA,
@@ -691,6 +693,12 @@ import { checkBunVersion } from "./bun-floor";
 // documented standalone flow (`bun install` + `bun agent.ts` in the out-dir)
 // resolves the emitted `@crewhaus/*` imports.
 import { ensureBundleManifest } from "./bundle-manifest";
+import {
+  BundleWriteError,
+  assertOutDirNotLinked,
+  probeBundleFile,
+  writeBundleFile,
+} from "./bundle-writer";
 // Loop contract 0.4 (Batch F, item 6) — the cf-worker emit switch shared with
 // the compiler-worker's remote `POST /compile { emitAs: "cf-worker" }`, so
 // `crewhaus compile --emit-as cf-worker` emits the same Worker bundle locally.
@@ -750,6 +758,7 @@ import {
   isCloudDeployTargetShape,
   resolveCloudDeployAppName,
 } from "./cloud-deploy";
+import { harnessBundleOf, recordCompiledBundle } from "./compile-record";
 import { INFORMATIONAL_COMPILE_WARNING_CODES, wrapCodes } from "./compile-warnings";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
@@ -775,6 +784,7 @@ import {
   statusSummaryLines,
   statusTableRows,
 } from "./datasets-status";
+import { deployActivate, deployList } from "./deploy-activate-cmd";
 // Item 29 — `crewhaus deploy canary` eval-gated ramp orchestration, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import). The heavy I/O (per-version eval, registry pins,
@@ -1605,7 +1615,8 @@ import { type SessionTailCursor, advanceSessionTail, pickSessionToTail } from ".
 // modules (this entry file runs an argv switch on import) mirroring
 // doctor-checks.ts / alert-sink.ts.
 import { runSloProbe } from "./slo-doctor";
-import { buildSloSink, intakeGatePayload, lastKnownGoodFromAuditRecords } from "./slo-sink";
+import { makeSloRollback } from "./slo-rollback";
+import { buildSloSink, intakeGatePayload } from "./slo-sink";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -2272,30 +2283,38 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // above via `evalEntry`, so `--with-eval-harness` and a plain compile share
   // one pipeline. `--emit-as cf-worker` already refused the flag.)
 
-  mkdirSync(absOut, { recursive: true });
-  for (const file of bundle.files) {
-    const fullPath = join(absOut, file.path);
-    // Item 42 — never silently clobber a USER-AUTHORED README.md. A README
-    // we generated earlier carries GENERATED_README_MARKER and is refreshed
-    // like any other bundle file; one without the marker is kept, with a
-    // notice (pass --no-readme to silence).
-    if (file.path === "README.md" && existsSync(fullPath)) {
-      let existing: string;
-      try {
-        existing = readFileSync(fullPath, "utf-8");
-      } catch {
-        existing = "";
+  // A harness's own bundle directory that is a link is refused; every file below is written
+  // through the bundle writer, which never follows a link.
+  const ownBundle = !emitCfWorker && harnessBundleOf(absSpec, absOut) !== undefined;
+  const written: string[] = [];
+  try {
+    if (ownBundle) assertOutDirNotLinked(absOut);
+    mkdirSync(absOut, { recursive: true });
+    for (const file of bundle.files) {
+      const fullPath = join(absOut, file.path);
+      // Item 42 — never silently clobber a USER-AUTHORED README.md. A README
+      // we generated earlier carries GENERATED_README_MARKER and is refreshed
+      // like any other bundle file; one without the marker (or a link) is kept,
+      // with a notice (pass --no-readme to silence).
+      if (file.path === "README.md") {
+        const existing = probeBundleFile(absOut, file.path);
+        if (
+          existing.kind === "other" ||
+          (existing.kind === "file" && !existing.text.includes(GENERATED_README_MARKER))
+        ) {
+          process.stdout.write(
+            `kept ${fullPath} (not generated by crewhaus — pass --no-readme to skip README emission)\n`,
+          );
+          continue;
+        }
       }
-      if (!existing.includes(GENERATED_README_MARKER)) {
-        process.stdout.write(
-          `kept ${fullPath} (not generated by crewhaus — pass --no-readme to skip README emission)\n`,
-        );
-        continue;
-      }
+      writeBundleFile(absOut, file.path, file.content);
+      written.push(file.path);
+      process.stdout.write(`wrote ${fullPath}\n`);
     }
-    mkdirSync(dirname(fullPath), { recursive: true });
-    writeFileSync(fullPath, file.content);
-    process.stdout.write(`wrote ${fullPath}\n`);
+  } catch (err) {
+    if (err instanceof BundleWriteError) die(err.message);
+    throw err;
   }
   // Local bundles carry bare `@crewhaus/*` imports and nothing declaring
   // them — synthesize the pinned manifest so `bun install` in the out-dir
@@ -2306,6 +2325,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // exactly instead of guessing from mtimes.
   const manifest = ensureBundleManifest(bundle.files, absOut, { specYaml: yamlText });
   if (manifest.action === "wrote") {
+    written.push("package.json");
     process.stdout.write(`wrote ${manifest.path}\n`);
   } else if (manifest.action === "kept") {
     process.stdout.write(
@@ -2363,25 +2383,28 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         ...(strategy.entryImport !== undefined ? { entryImport: strategy.entryImport } : {}),
       },
     });
-    for (const file of evalBundle.files) {
-      const fullPath = join(evalOut, file.path);
-      if (file.path === "README.md" && existsSync(fullPath)) {
-        let existing: string;
-        try {
-          existing = readFileSync(fullPath, "utf-8");
-        } catch {
-          existing = "";
+    try {
+      for (const file of evalBundle.files) {
+        const fullPath = join(evalOut, file.path);
+        if (file.path === "README.md") {
+          const existing = probeBundleFile(evalOut, file.path);
+          if (
+            existing.kind === "other" ||
+            (existing.kind === "file" && !existing.text.includes(GENERATED_README_MARKER))
+          ) {
+            process.stdout.write(
+              `kept ${fullPath} (not generated by crewhaus — pass --no-readme to skip README emission)\n`,
+            );
+            continue;
+          }
         }
-        if (!existing.includes(GENERATED_README_MARKER)) {
-          process.stdout.write(
-            `kept ${fullPath} (not generated by crewhaus — pass --no-readme to skip README emission)\n`,
-          );
-          continue;
-        }
+        writeBundleFile(absOut, `${EVAL_BRIDGE_SUBDIR}/${file.path}`, file.content);
+        written.push(`${EVAL_BRIDGE_SUBDIR}/${file.path}`);
+        process.stdout.write(`wrote ${fullPath}\n`);
       }
-      mkdirSync(dirname(fullPath), { recursive: true });
-      writeFileSync(fullPath, file.content);
-      process.stdout.write(`wrote ${fullPath}\n`);
+    } catch (err) {
+      if (err instanceof BundleWriteError) die(err.message);
+      throw err;
     }
     // The eval bridge is its own local bundle in <out-dir>/eval/ — it needs
     // its own manifest for the same standalone-run reason as the primary.
@@ -2389,6 +2412,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     // stamp: recompiling the primary bundle is what refreshes both.
     const evalManifest = ensureBundleManifest(evalBundle.files, evalOut, { specYaml: yamlText });
     if (evalManifest.action === "wrote") {
+      written.push(`${EVAL_BRIDGE_SUBDIR}/package.json`);
       process.stdout.write(`wrote ${evalManifest.path}\n`);
     } else if (evalManifest.action === "kept") {
       process.stdout.write(
@@ -2396,6 +2420,21 @@ async function runCompile(args: ParsedArgs): Promise<void> {
       );
     }
     process.stdout.write(`${describeBridge(projected, strategy)}\n`);
+  }
+
+  // A prepared deployment for what this compile wrote into one of the harness's own bundle
+  // directories: after every write above, before the `--check` smoke.
+  if (ownBundle) {
+    const compiledWith = cliVersion();
+    const record = await recordCompiledBundle({
+      specPath: absSpec,
+      outDir: absOut,
+      yamlText,
+      written,
+      ...(compiledWith !== undefined ? { compiledWith } : {}),
+    });
+    if (record.recorded)
+      process.stdout.write(`prepared ${record.id} (crewhaus deploy activate ${record.id})\n`);
   }
 
   // Item 33 — `--check`: verify the just-emitted bundle. Wired at the very
@@ -2796,6 +2835,18 @@ function scaffoldProvabilitySection(level: InitProvabilityLevel): string {
   return `${tools}${tools !== "" ? "\n" : ""}${renderProvabilityBlock(level)}`;
 }
 
+/** Give a harness `crewhaus init` just created its own id (`harness.json`), unless it has one. */
+function writeNewHarnessIdentity(harnessDir: string): void {
+  const written = writeHarnessIdentity(
+    harnessDir,
+    { id: `hrn_${randomBytes(8).toString("hex")}` },
+    { ifAbsent: true },
+  );
+  if (!written.ok) {
+    process.stderr.write(`crewhaus: harness.json was not written: ${written.reason}\n`);
+  }
+}
+
 function runInit(args: ParsedArgs): void {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -2936,6 +2987,7 @@ ${provability !== undefined ? `\n${scaffoldProvabilitySection(provability)}` : "
     }
     writeFileSync(targetFile, yamlText);
     process.stdout.write(`wrote ${targetFile}\n`);
+    writeNewHarnessIdentity(targetDir);
     if (provabilityLevel !== undefined) writeProvabilityNotes(yamlText, provabilityLevel);
     if (hybrid) {
       process.stdout.write(
@@ -3636,6 +3688,7 @@ async function runInitInteractive(args: ParsedArgs): Promise<void> {
   mkdirSync(targetDir, { recursive: true });
   writeFileSync(targetFile, yaml);
   process.stdout.write(`wrote ${targetFile}\n`);
+  writeNewHarnessIdentity(targetDir);
   // 0.8.0 §11 — whichever path chose a proof floor, say what it still needs.
   const declared = provabilityLevelOf(
     (parseSpec(yaml) as { readonly provability?: SpecProvabilityBlock }).provability,
@@ -4863,60 +4916,13 @@ async function runRunCli(
         : {}),
       ...(wantsRollback
         ? {
-            rollback: async (event): Promise<void> => {
-              // Auto-rollback the "prod" env pin to the prior version via the
-              // deployment-controller. Requires a cwd spec-registry; degrades to
-              // an audited no-op (a warning) when none exists.
-              const specRootDir = join(cwd, ".crewhaus", "spec-registry");
-              if (!existsSync(specRootDir)) {
-                process.stderr.write(
-                  "[slo] rollback requested but no .crewhaus/spec-registry — skipping (alert/pause-intake still applied)\n",
-                );
-                return;
-              }
-              const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
-              const { createDeploymentController } = await import(
-                "@crewhaus/deployment-controller"
-              );
-              const registry = createFileBackedRegistry({ rootDir: specRootDir });
-              const current = await registry.aliasFor(ir.name, "prod");
-              // LAST-KNOWN-GOOD, not a lexicographic guess: the version that was
-              // pinned to prod immediately BEFORE `current`, read from the
-              // deployment-controller's `deployment_action` audit history. A
-              // lexicographic sort would pick e.g. v2 out of [v1,v2,v9,v10] as
-              // "the last non-current version" and roll production back to an
-              // arbitrary/ancient release. Never guess when flipping a prod pin.
-              const prior = lastKnownGoodFromAuditRecords(
-                readAuditRecords(),
-                ir.name,
-                "prod",
-                current,
-              );
-              if (prior === undefined) {
-                process.stderr.write(
-                  "[slo] rollback: no recorded last-known-good predecessor in deployment_action history — skipping (refusing to guess a prod pin; alert/pause-intake still applied)\n",
-                );
-                return;
-              }
-              // Guard: the predecessor must still exist in the registry (a
-              // deleted version can't be re-pinned; the controller would throw).
-              const versions = await registry.list(ir.name);
-              if (!versions.includes(prior)) {
-                process.stderr.write(
-                  `[slo] rollback: last-known-good ${prior} no longer in registry — skipping\n`,
-                );
-                return;
-              }
-              const controller = createDeploymentController({
-                registry,
-                auditLog: sloAudit,
-                actor: "slo-monitor",
-              });
-              await controller.rollback(ir.name, "prod", prior);
-              process.stderr.write(
-                `[slo] auto-rolled-back ${ir.name} prod → ${prior} (last-known-good; SLO breach: ${event.breach.detail})\n`,
-              );
-            },
+            rollback: makeSloRollback({
+              cwd,
+              name: ir.name,
+              audit: sloAudit,
+              readAuditRecords,
+              write: (line) => process.stderr.write(`${line}\n`),
+            }),
           }
         : {}),
     });
@@ -19100,6 +19106,7 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
         name,
         toEnv: env,
         toVersion: version,
+        specHash: () => candidateSpecHash(reg, name, version),
         verb: "pin",
         ...(tenantId !== undefined ? { tenantId } : {}),
         ...(actor !== undefined ? { actor } : {}),
@@ -19147,6 +19154,10 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
         "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
         "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n" +
         "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
+        "  crewhaus deploy activate [<dep>] [--harness <hrn|dir>] [--environment <e>]\n" +
+        "       [--no-autostart] [--json]                    make a prepared build the one this\n" +
+        "                                                    harness runs (newest prepared by default)\n" +
+        "  crewhaus deploy list [--harness <hrn|dir>] [--json]   this harness's deployments\n" +
         "\n" +
         "  --require-approval  refuse to flip a PROTECTED env's pin (declared in\n" +
         "                      .crewhaus/environments.json) until an approval quorum\n" +
@@ -19176,6 +19187,10 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
         "                             this splits live traffic — it does not.\n" +
         "    --experiment <name>      experiment/ledger name (default: the spec name)\n" +
         "    --experiment-dir <dir>   ledger root (default .crewhaus/experiments)\n" +
+        "    --require-approval --check-pr   a protected --env needs the approval quorum for\n" +
+        "                             the candidate's content before anything is registered;\n" +
+        "                             restoring the baseline the env held when the ramp began\n" +
+        "                             is not a new move and needs no quorum\n" +
         "\n" +
         "  `deploy canary` registers the candidate spec version, then drives the ramp\n" +
         "  steps: at each step it evals BOTH the baseline and candidate versions against\n" +
@@ -19300,6 +19315,7 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
         name,
         toEnv: env,
         toVersion: version,
+        specHash: () => candidateSpecHash(reg, name, version),
         verb: "rollback",
         ...(tenantId !== undefined ? { tenantId } : {}),
         ...(actor !== undefined ? { actor } : {}),
@@ -19415,6 +19431,25 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
     "@crewhaus/canary-controller"
   );
   const specReg = createSpecRegistry({ rootDir: specRootDir });
+  const audit = await openAuditLog({ rootDir: auditDir });
+
+  // A protected env takes the approval quorum for the candidate's content before
+  // anything is registered or ramped, so a refusal moves nothing.
+  try {
+    await enforceProtectedEnvGate({
+      args,
+      harnessRoot: process.cwd(),
+      name: specName,
+      toEnv: env,
+      toVersion: candidateVersion,
+      specHash: specRevision(candidateYaml),
+      verb: "canary",
+      auditLog: audit,
+    });
+  } catch (err) {
+    if (err instanceof ApprovalGateError) die(err.message);
+    throw err;
+  }
 
   // Register the candidate version (idempotent overwrite of the same bytes).
   await specReg.put(specName, candidateVersion, candidateYaml);
@@ -19538,7 +19573,6 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
     });
   };
 
-  const audit = await openAuditLog({ rootDir: auditDir });
   const deploymentController = createDeploymentController({
     registry: specReg,
     auditLog: audit,
@@ -19648,15 +19682,16 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
 
 /**
  * Item 59 (F2) — the single approval choke point for ANY pin flip into a
- * protected environment. `deploy promote`, `deploy rollback`, and `spec pin`
- * all route through this before the pin moves. Determines whether `toEnv` is
- * protected (config OR `--require-approval`), and if so requires the recorded
- * approvals + optional green-PR quorum for the exact `toVersion` being pinned.
- * The decision — satisfied OR refused — is audit-logged as `governance_approval`
- * (so even a blocked scheduled flip is evidenced); a refusal throws
- * ApprovalGateError. An unprotected env is a no-op.
+ * protected environment. `deploy promote`, `deploy rollback`, `deploy canary`
+ * and `spec pin` all route through this before the pin moves. The policy half
+ * (is `toEnv` protected, by config or `--require-approval`, and is the quorum
+ * met for the exact content being pinned) is
+ * `@crewhaus/deployment-controller/approval-gate`'s `evaluateProtectedEnvGate`;
+ * this wrapper records the decision — satisfied OR refused — as
+ * `governance_approval`, prints the `[approval]` line, and throws
+ * ApprovalGateError on a refusal. An unprotected env is a no-op.
  *
- * `verb` only shapes the human-facing messages ("promotion"/"rollback"/"pin").
+ * `verb` only shapes the human-facing messages.
  */
 async function enforceProtectedEnvGate(opts: {
   args: ParsedArgs;
@@ -19664,33 +19699,29 @@ async function enforceProtectedEnvGate(opts: {
   name: string;
   toEnv: string;
   toVersion: string;
-  verb: "promotion" | "rollback" | "pin";
+  /** `specRevision` of the content being pinned, or how to read it (asked only when protected). */
+  specHash: string | (() => Promise<string>);
+  verb: "promotion" | "rollback" | "pin" | "canary";
   tenantId?: string;
   actor?: string;
   auditLog: AuditLog;
 }): Promise<void> {
-  const requireFlag = opts.args.flags["require-approval"] === true;
-  const config = loadEnvironmentsConfig(opts.harnessRoot);
-  const policy = policyForEnv(config, opts.toEnv);
-  const protectedEnv = policy.requireApproval || requireFlag;
-  if (!protectedEnv) return; // unprotected — the pre-item-59 path
-
-  const approvals = readApprovals(opts.harnessRoot, opts.name, opts.toEnv);
-
-  let prCheck: Awaited<ReturnType<PrCheckReader>> | undefined;
-  if (opts.args.flags["check-pr"] === true) {
-    prCheck = readPrCheckViaGh({ specName: opts.name, env: opts.toEnv, version: opts.toVersion });
-  }
-
-  const decisionInput: ApprovalDecisionInput = {
+  const answer = await evaluateProtectedEnvGate({
+    harnessRoot: opts.harnessRoot,
     specName: opts.name,
     toEnv: opts.toEnv,
     toVersion: opts.toVersion,
-    policy,
-    approvals,
-    ...(prCheck !== undefined ? { prCheck } : {}),
-  };
-  const decision = decideApproval(decisionInput);
+    specHash: opts.specHash,
+    requireApproval: opts.args.flags["require-approval"] === true,
+    ...(opts.args.flags["check-pr"] === true
+      ? {
+          prCheck: () =>
+            readPrCheckViaGh({ specName: opts.name, env: opts.toEnv, version: opts.toVersion }),
+        }
+      : {}),
+  });
+  if (!answer.protected) return;
+  const { input: decisionInput, decision } = answer;
 
   // Record the gate evaluation (met OR refused) in the same audit chain the
   // flip lands in, so a blocked scheduled change is evidenced too.
@@ -19751,6 +19782,7 @@ async function enforceApprovalGate(opts: {
     name: opts.name,
     toEnv: opts.toEnv,
     toVersion,
+    specHash: () => candidateSpecHash(opts.registry, opts.name, toVersion),
     verb: "promotion",
     ...(opts.tenantId !== undefined ? { tenantId: opts.tenantId } : {}),
     ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
@@ -24326,9 +24358,23 @@ switch (subcommand) {
       }
       break;
     }
+    if (action === "activate" || action === "list") {
+      parseFor(rest.slice(1), DEPLOY_ACTIVATE_SCHEMA);
+      let result: { readonly lines: readonly string[]; readonly exitCode: number };
+      try {
+        result =
+          action === "activate" ? await deployActivate(rest.slice(1)) : deployList(rest.slice(1));
+      } catch (err) {
+        if (err instanceof Error) die(err.message);
+        throw err;
+      }
+      for (const line of result.lines) process.stdout.write(`${line}\n`);
+      if (result.exitCode !== 0) process.exit(result.exitCode);
+      break;
+    }
     if (action !== "promote" && action !== "rollback" && action !== "canary") {
       die(
-        `deploy action must be one of: fly, render, railway, heroku, promote, rollback, canary (got "${action}")`,
+        `deploy action must be one of: fly, render, railway, heroku, promote, rollback, canary, activate, list (got "${action}")`,
       );
     }
     try {

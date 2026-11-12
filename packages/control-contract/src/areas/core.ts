@@ -328,7 +328,7 @@ export const CORE_MODULE = {
       permission: "h.deploy",
       idempotent: false,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.deployActivate,
     },
     {
       id: "controls.pause",

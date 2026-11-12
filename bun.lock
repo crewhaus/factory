@@ -681,7 +681,10 @@
         "@crewhaus/access-control": "workspace:*",
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/deployment-controller": "workspace:*",
+        "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/harness-supervisor": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
       },
       "devDependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -797,6 +800,7 @@
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
       },
     },
@@ -1356,6 +1360,7 @@
         "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/harness-inventory": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
         "@crewhaus/preflight": "workspace:*",
       },
     },
@@ -2815,6 +2820,7 @@
       "dependencies": {
         "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
         "@crewhaus/spec-changelog": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",

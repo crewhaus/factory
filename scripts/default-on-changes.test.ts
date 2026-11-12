@@ -42,6 +42,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -53,6 +54,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { assertOutDirNotLinked, writeBundleFile } from "../apps/cli/src/bundle-writer";
 import { runDaemonCommand } from "../apps/cli/src/daemon-cmd";
 import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
@@ -64,8 +66,14 @@ import {
   EXIT_FOR_REJECTED_RECEIPT,
 } from "../packages/control-contract/src/index";
 import { foldStates } from "../packages/control-records/src/index";
+import {
+  ROOT_BUNDLE_UNRECORDED_MESSAGE,
+  admitExplicitStart,
+} from "../packages/control-service/src/deployments";
 import { commandsLedgerOf } from "../packages/control-service/src/index";
+import { decideApproval } from "../packages/deployment-controller/src/approval-gate";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
+import { EXIT_CODES } from "../packages/errors/src/index";
 import { parseGradersConfig } from "../packages/eval-grader/src/index";
 import { finishEvalRun } from "../packages/eval-ops/src/eval-history";
 import { lookupBaseline } from "../packages/eval-report/src/index";
@@ -80,8 +88,23 @@ import {
   FEDERATION_MAX_BODY_BYTES,
   createGatewayServer,
 } from "../packages/gateway-server/src/index";
+import { groupPlan } from "../packages/hangar-server/src/group-ops";
 import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
+import {
+  BUILD_NOT_ACTIVE_MESSAGE,
+  LOADER_ENV_KEYS,
+  buildSpawnEnv,
+  buildSpawnPlan,
+  createHarnessSupervisor,
+  resolveBundle,
+} from "../packages/harness-supervisor/src/index";
+import { writeSupervisionRecord } from "../packages/harness-supervisor/src/runfiles";
+import {
+  activateBuildForTest,
+  createFakeClock,
+  createFakeProcessOps,
+} from "../packages/harness-supervisor/src/testkit";
 import type { IrChannelV0, IrManagedV0 } from "../packages/ir/src/index";
 import { _setCompactSeamsForTest, createMemoryStore } from "../packages/memory-store/src/index";
 import {
@@ -2590,5 +2613,226 @@ describe("the release notes name what the knowledge stores do by default", () =>
     } finally {
       rmSync(rootDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("the release notes name what saved-is-not-deployed changes for every harness", () => {
+  const read = (rel: string): string => readFileSync(join(ROOT, rel), "utf8");
+  const count = (text: string, needle: string): number => text.split(needle).length - 1;
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("restarts run the active build: the automatic start and the autoCompile path check it", async () => {
+    const supervisor = read("packages/harness-supervisor/src/supervisor.ts");
+    expect(count(supervisor, "start({}, { automatic: true })")).toBe(1);
+    expect(count(supervisor, "internal.automatic === true || activeOnly")).toBe(1);
+    const automatic = supervisor.slice(
+      supervisor.indexOf("internal.automatic === true || activeOnly"),
+    );
+    expect(supervisor.indexOf("internal.automatic === true || activeOnly")).toBeGreaterThan(-1);
+    expect(
+      automatic.indexOf("verifyActiveBuild(options.harnessDir, options.target, launched)"),
+    ).toBeGreaterThan(-1);
+    expect(
+      automatic.indexOf("verifyActiveBuild(options.harnessDir, options.target, launched)"),
+    ).toBeLessThan(120);
+    const prepare = read("packages/harness-supervisor/src/prepare.ts");
+    expect(count(prepare, 'compileMode === "auto" ? await compileActiveRevision(deps)')).toBe(1);
+    expect(count(prepare, "verifyActiveBuild(deps.harnessDir, deps.target)")).toBe(1);
+
+    // A temp harness whose dist/ changed after activation stays down, with the reason.
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-active-")));
+    try {
+      mkdirSync(join(dir, "dist"), { recursive: true });
+      writeFileSync(join(dir, "crewhaus.yaml"), "name: demo\ntarget: channel\n");
+      writeFileSync(join(dir, "dist", "daemon.ts"), "// bundle\n");
+      activateBuildForTest(dir, "dist/daemon.ts");
+      const clock = createFakeClock();
+      const ops = createFakeProcessOps({ now: clock.now });
+      const supervised = createHarnessSupervisor({
+        harnessDir: dir,
+        target: "channel",
+        ops,
+        clock,
+        plan: () =>
+          buildSpawnPlan({
+            harnessDir: dir,
+            target: "channel",
+            processEnv: {},
+            ports: { port: 3000 },
+          }),
+      });
+      expect((await supervised.start()).ok).toBe(true);
+      writeFileSync(join(dir, "dist", "daemon.ts"), "// changed after activation\n");
+      ops.last()?.exit(EXIT_CODES.tool);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      clock.advance(30_000);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(ops.children).toHaveLength(1);
+      expect(supervised.snapshot().refusal?.message).toBe(BUILD_NOT_ACTIVE_MESSAGE);
+      supervised.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Restarts run the build you activated");
+    expect(bullet).toContain("`manager.autoCompile`");
+    expect(bullet).toContain("`crewhaus deploy activate`");
+  });
+
+  test("a protected environment's quorum guards every pin move and binds content", () => {
+    const index = read("apps/cli/src/index.ts");
+    for (const verb of ["pin", "rollback", "promotion", "canary"]) {
+      expect({ verb, sites: count(index, `verb: "${verb}",`) }).toEqual({ verb, sites: 1 });
+    }
+    expect(count(index, "await enforceProtectedEnvGate({")).toBe(4);
+    expect(count(index, "await enforceApprovalGate({")).toBe(1);
+    expect(count(read("apps/cli/src/slo-rollback.ts"), "evaluateProtectedEnvGate({")).toBe(1);
+    const tools = read("packages/tool-deploy/src/index.ts");
+    expect(count(tools, "evaluateProtectedEnvGate({")).toBe(1);
+    expect(count(tools, "await approvalGate(")).toBe(2);
+    // A record that names no content counts for nothing.
+    const decision = decideApproval({
+      specName: "s",
+      toEnv: "prod",
+      toVersion: "v1",
+      specHash: `sha256:${"a".repeat(64)}`,
+      policy: { requireApproval: true, minApprovals: 1 },
+      approvals: [{ approver: "alice", ts: "t", version: "v1" }],
+    });
+    expect(decision.satisfied).toBe(false);
+    const bullet = bulletFor("approval counts only for the spec it names");
+    for (const site of [
+      "`deploy promote`",
+      "`rollback`",
+      "`canary`",
+      "SLO rollback",
+      "`spec pin`",
+      "`SpecPin`",
+      "`DeployRollback`",
+      "`specHash`",
+    ]) {
+      expect(bullet).toContain(site);
+    }
+  });
+
+  test("loader settings come only from the manager's environment, PATH among them", () => {
+    const bullet = bulletFor("A supervised start takes loader and interpreter settings");
+    expect(bullet).toContain("`PATH`");
+    expect(bullet).toContain("`crewhaus harness show`");
+    expect(bullet).toContain("export it before starting the manager");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-loader-")));
+    try {
+      writeFileSync(
+        join(dir, ".env"),
+        "BUN_OPTIONS=--smol\nLD_PRELOAD=./x.so\nPATH=./bin\nNODE_ENV=production\n",
+      );
+      const spawn = buildSpawnEnv({ harnessRoot: dir, processEnv: {} });
+      expect(spawn.env["BUN_OPTIONS"]).toBeUndefined();
+      expect(spawn.env["LD_PRELOAD"]).toBeUndefined();
+      expect(spawn.env["PATH"]).toBeUndefined();
+      expect(spawn.env["NODE_ENV"]).toBe("production");
+      expect(spawn.dropped).toEqual(["BUN_OPTIONS", "LD_PRELOAD", "PATH"]);
+      expect(LOADER_ENV_KEYS).toContain("PATH");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a group start skips a harness registered after adoption began until it is adopted", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-adopt-")));
+    try {
+      const dir = join(root, "member");
+      mkdirSync(dir, { recursive: true });
+      const registry = openHangarRegistry({ root: join(root, "registry"), env: {} });
+      registry.upsert({ dir, specName: "member", target: "channel" });
+      registry.addGroup({ name: "crew" });
+      registry.setGroups(dir, ["crew"]);
+      const live = { live: () => true };
+      expect(groupPlan(registry, "crew", "start", live).members[0]?.skip).toContain(
+        "crewhaus harness adopt",
+      );
+      expect(groupPlan(registry, "crew", "stop", live).actionable).toBe(1);
+      registry.adopt(dir, `local:#${"0".repeat(64)}`);
+      expect(groupPlan(registry, "crew", "start", live).actionable).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    expect(bulletFor("A group start includes a harness registered after this release")).toContain(
+      "`crewhaus harness adopt`",
+    );
+  });
+
+  test("a root bundle runs once compile has recorded it, and a start never records one", async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-root-")));
+    try {
+      writeFileSync(join(dir, "crewhaus.yaml"), "name: demo\ntarget: cli\n");
+      writeFileSync(join(dir, "agent.ts"), "// compiled with -o .\n");
+      expect(resolveBundle(dir, "cli")).toBeUndefined();
+      writeFileSync(
+        join(dir, "package.json"),
+        JSON.stringify({ name: "crewhaus-compiled-bundle" }),
+      );
+      expect(resolveBundle(dir, "cli")?.entry).toBe("agent.ts");
+      const started = await admitExplicitStart(dir, "cli", {
+        head: "cli-direct",
+        actor: `local:#${"0".repeat(64)}`,
+      });
+      expect(started).toEqual({ ok: false, message: ROOT_BUNDLE_UNRECORDED_MESSAGE });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor(
+      "A bundle at a harness's root runs once `crewhaus compile` has recorded",
+    );
+    expect(bullet).toContain("`crewhaus compile <spec> -o .`");
+  });
+
+  test("compile's writer replaces a link at a leaf and refuses a linked directory", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-writer-")));
+    try {
+      const out = join(root, "dist");
+      mkdirSync(out, { recursive: true });
+      writeFileSync(join(root, "target.txt"), "kept\n");
+      symlinkSync(join(root, "target.txt"), join(out, "agent.ts"));
+      writeBundleFile(out, "agent.ts", "// bundle\n");
+      expect(lstatSync(join(out, "agent.ts")).isFile()).toBe(true);
+      expect(readFileSync(join(root, "target.txt"), "utf8")).toBe("kept\n");
+      mkdirSync(join(root, "elsewhere"), { recursive: true });
+      symlinkSync(join(root, "elsewhere"), join(out, "eval"));
+      expect(() => writeBundleFile(out, "eval/x.ts", "x")).toThrow("it is a link");
+      symlinkSync(out, join(root, "linked-dist"));
+      expect(() => assertOutDirNotLinked(join(root, "linked-dist"))).toThrow("it is a link");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const index = readFileSync(join(ROOT, "apps/cli/src/index.ts"), "utf8");
+    expect(count(index, "if (ownBundle) assertOutDirNotLinked(absOut);")).toBe(1);
+    expect(bulletFor("`crewhaus compile` writes each output file as a new regular file")).toContain(
+      "is a link",
+    );
+  });
+
+  test("the crash-loop count is read from the harness, so a new manager counts earlier restarts", () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-window-")));
+    try {
+      const clock = createFakeClock();
+      const now = clock.now();
+      writeSupervisionRecord(dir, [now - 4, now - 3, now - 2, now - 1]);
+      const supervised = createHarnessSupervisor({
+        harnessDir: dir,
+        target: "channel",
+        ops: createFakeProcessOps({ now: clock.now }),
+        clock,
+        plan: () =>
+          buildSpawnPlan({ harnessDir: dir, target: "channel", processEnv: {}, ports: {} }),
+      });
+      expect(supervised.snapshot().restartsInWindow).toBe(4);
+      supervised.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("The crash-loop count outlives the manager");
+    expect(bullet).toContain("`.crewhaus/run/supervision.json`");
+    expect(bullet).toContain("`crash-looping`");
   });
 });

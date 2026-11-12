@@ -18,6 +18,7 @@
     "@crewhaus/control-records": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/harness-inventory": "workspace:*",
+    "@crewhaus/ir": "workspace:*",
     "@crewhaus/preflight": "workspace:*"
   },
   "license": "Apache-2.0",

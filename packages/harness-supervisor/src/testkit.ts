@@ -7,9 +7,53 @@
  * process; the only I/O is appending to a log file a fake child "wrote",
  * which is what a real fd-redirected daemon does.
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { controlPaths } from "@crewhaus/control-records";
+import { buildDigest } from "./build-inputs";
 import type { ProcessOps, SpawnRequest, SpawnedProcess } from "./process-ops";
 import type { Clock } from "./types";
+
+/**
+ * Record the build on disk as the active deployment, the way an activation would leave
+ * it: a `prepared` row, then the same record `active`. For tests whose starts are
+ * automatic, which run only the active build.
+ */
+export function activateBuildForTest(
+  harnessDir: string,
+  entry: string,
+  options: { readonly id?: string; readonly specHash?: string; readonly at?: string } = {},
+): { readonly id: string; readonly digest: string } {
+  const taken = buildDigest(harnessDir, { entry });
+  if ("unreadable" in taken) throw new Error(taken.unreadable);
+  const id = options.id ?? "dep_01testtesttesttesttesttest";
+  const record = {
+    id,
+    harness: "hrn_0000000000000000",
+    artifact: {
+      digest: taken.digest,
+      specHash: options.specHash ?? `sha256:${"0".repeat(64)}`,
+      compiledWith: "0.0.0-test",
+      shape: "test",
+      entry,
+      bootInputs: [],
+    },
+    policyRevision: `sha256:${"0".repeat(64)}`,
+  };
+  const file = join(harnessDir, controlPaths(harnessDir).deploymentsFile);
+  mkdirSync(dirname(file), { recursive: true });
+  appendFileSync(
+    file,
+    `${JSON.stringify({ ...record, state: "prepared" })}\n${JSON.stringify({
+      ...record,
+      state: "active",
+      activatedAt: options.at ?? "2026-11-01T00:00:00.000Z",
+      autostart: true,
+      gates: "not-run",
+    })}\n`,
+  );
+  return { id, digest: taken.digest };
+}
 
 export type FakeClock = Clock & {
   /** Advance time and fire every timer due at or before the new now. */

@@ -17,9 +17,16 @@
 export { HARNESS_ID_RE, REGISTRY_FILENAME } from "./doc.js";
 export { hangarStateRoots, registryStateFiles, resolveHangarRoot } from "./hangar-root.js";
 export {
+  HARNESS_IDENTITY_REL,
+  type HarnessIdentityFile,
+  readHarnessIdentityFile,
+} from "./identity.js";
+export {
+  isAdopted,
   openHangarRegistry,
   registerHarnessHook,
   resolveRegistryRoot,
+  slugOf,
   sortGroupMembers,
   type HangarRegistry,
   type ListOptions,

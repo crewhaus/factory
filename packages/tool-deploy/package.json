@@ -14,6 +14,7 @@
   "dependencies": {
     "@crewhaus/deployment-controller": "workspace:*",
     "@crewhaus/errors": "workspace:*",
+    "@crewhaus/ir": "workspace:*",
     "@crewhaus/spec-changelog": "workspace:*",
     "@crewhaus/spec-registry": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",

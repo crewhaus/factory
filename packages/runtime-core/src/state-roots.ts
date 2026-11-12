@@ -85,6 +85,7 @@ const GATE_RECORDS: readonly string[] = [
   join(".crewhaus", "audit"),
   join(".crewhaus", "graphs"),
   join(".crewhaus", "advice"),
+  join(".crewhaus", "cloud"),
   // The knowledge-sync marker: exactly that file.
   join(".crewhaus", "knowledge.json"),
   // The proposals `crewhaus propose` and Home stage for a person to adopt.
