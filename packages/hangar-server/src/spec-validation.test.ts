@@ -434,6 +434,21 @@ describe("every spec write and its preview use the schema the harness is checked
   });
 });
 
+/** The variables Windows supplies to every child process, whatever environment the parent passes. */
+const WINDOWS_SYSTEM_ENV = [
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "LOGONSERVER",
+  "SYSTEMDRIVE",
+  "SYSTEMROOT",
+  "TEMP",
+  "TMP",
+  "USERDOMAIN",
+  "USERNAME",
+  "USERPROFILE",
+  "WINDIR",
+];
+
 describe("the child check", () => {
   const silent = (): ChildHandle => ({
     stdout: new ReadableStream<Uint8Array>({ start() {} }),
@@ -518,14 +533,16 @@ describe("the child check", () => {
     expect(existsSync(seen[0]?.cwd ?? "/h")).toBe(false);
   });
 
-  test("a real child sees PATH alone: the harness's .env and bunfig.toml never apply", async () => {
+  test("a real child is given PATH alone: the harness's .env and bunfig.toml never apply", async () => {
     const root = mkdtempSync(join(tmpdir(), "spec-check-env-"));
     try {
       const dir = join(root, "harness");
       const pkg = join(dir, "node_modules", "@crewhaus", "spec");
       mkdirSync(pkg, { recursive: true });
       const marker = join(root, "preloaded");
-      writeFileSync(join(dir, ".env"), `${["CREWHAUS", "HOME", "PLANTED"].join("_")}=planted\n`);
+      const planted = ["CREWHAUS", "HOME", "PLANTED"].join("_");
+      const sentinel = ["CREWHAUS", "HOME", "ONLY"].join("_");
+      writeFileSync(join(dir, ".env"), `${planted}=planted\n`);
       writeFileSync(
         join(dir, "preload.js"),
         `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "1");\n`,
@@ -559,11 +576,19 @@ describe("the child check", () => {
       const out = await validateInHarness(dir, "name: x\n", {
         op: "issues",
         entry,
-        homeEnv: { PATH: process.env["PATH"] ?? "" },
+        homeEnv: { PATH: process.env["PATH"] ?? "", [sentinel]: "home-only" },
       });
       expect(out.ok).toBe(true);
       const issues = out.ok ? out.issues : [];
-      expect(issues[0]?.message).toBe("PATH");
+      const seen = (issues[0]?.message ?? "").split(",");
+      expect(seen).toContain("PATH");
+      expect(seen).not.toContain(sentinel);
+      expect(seen).not.toContain(planted);
+      // Windows itself hands every child its system variables; nothing else may appear.
+      const allowed = new Set(
+        process.platform === "win32" ? ["PATH", ...WINDOWS_SYSTEM_ENV] : ["PATH"],
+      );
+      expect(seen.filter((k) => !allowed.has(k.toUpperCase()))).toEqual([]);
       expect(issues[1]?.message).not.toBe(dir);
       expect(existsSync(marker)).toBe(false);
     } finally {
