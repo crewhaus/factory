@@ -93,6 +93,13 @@ Run `crewhaus` with no arguments for the full usage text, or any subcommand with
 | `compliance evidence` | Collect SOC 2 / ISO 27001 / HIPAA evidence |
 | `version` | Print the CLI version (also `--version`, `-v`) |
 
+The full list of commands, with their sub-commands and flags, is
+[`verbs.json`](verbs.json), generated from the CLI's own verb inventory
+(`src/verbs.ts`) by `bun scripts/generate-verbs-json.ts`. A new command is a
+`src/<command>-cmd.ts` module that exports `CLI_FAMILY`, plus one dispatch line;
+a new sub-command or flag on an older command edits its row in `src/verbs.ts` or
+its schema in `src/arg-schemas.ts`.
+
 ## Docs
 
 - [Documentation](https://crewhaus.ai/docs) — start with the [quickstart](https://crewhaus.ai/docs/quickstart) and the [CLI target guide](https://crewhaus.ai/docs/targets/cli)

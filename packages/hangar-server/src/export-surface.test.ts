@@ -33,6 +33,7 @@ import * as processModule from "./process";
 import * as runsModule from "./runs";
 import * as safetyModule from "./safety";
 import * as scaffolded from "./scaffolded-workflows";
+import * as twinSources from "./twin-sources";
 
 /** `Object.keys(await import("./index")).sort()`, captured before the move. */
 const INDEX_VALUES: readonly string[] = [
@@ -305,6 +306,18 @@ describe("the export surface", () => {
     const live = Object.keys(scaffolded).sort();
     expect(live).toHaveLength(5);
     expect(live).toEqual([...SCAFFOLDED_VALUES]);
+  });
+
+  test("./twin-sources exports exactly the seven sources the twin check reads", () => {
+    expect(Object.keys(twinSources).sort()).toEqual([
+      "ADVISOR_CLI_TWINS",
+      "MAX_FACT_FILE_BYTES",
+      "ROUTE_TABLE",
+      "ROUTE_TWIN_NOTES",
+      "devArgv",
+      "mcpArgv",
+      "runtimeOpTwin",
+    ]);
   });
 });
 

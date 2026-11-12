@@ -87,6 +87,7 @@ import { runDetail, runLogFile } from "@crewhaus/harness-supervisor/run-detail";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { hashSpecSource, readBundleSpecStamp } from "./bundle-manifest";
 import { envChainLines } from "./env-chain-view";
+import type { CliFamily } from "./verbs";
 import { cliVersion } from "./version";
 
 /** What a verb returns: lines for stdout + the process exit code. */
@@ -153,6 +154,47 @@ const DAEMON_USAGE_LINES: readonly string[] = [
   "  with no Hangar console running — and a daemon started either way is adopted",
   "  by the other. All state is harness-local, under .crewhaus/run/.",
 ];
+
+/** `start` and `restart` take the same flags (they share one parse). */
+const START_FLAGS = {
+  force: "boolean",
+  ack: "value",
+  "no-preflight": "boolean",
+  compile: "boolean",
+  "no-compile": "boolean",
+  group: "value",
+  parallel: "boolean",
+} as const;
+
+/**
+ * The `daemon` family in the CLI's verb inventory (`verbs.ts`): each sub-verb
+ * and the flags its parser takes. Every `parseVerbArgs` call below reads its
+ * flags from here, and the key order is the order the unknown-verb message
+ * lists them in ({@link DAEMON_VERBS}).
+ */
+export const CLI_FAMILY = {
+  verb: "daemon",
+  since: "0.8.0",
+  sub: {
+    start: { flags: START_FLAGS },
+    submit: {
+      flags: {
+        "brief-file": "value",
+        "no-preflight": "boolean",
+        force: "boolean",
+        ack: "value",
+        compile: "boolean",
+        "no-compile": "boolean",
+      },
+    },
+    stop: { flags: { grace: "value", group: "value", parallel: "boolean" } },
+    restart: { flags: START_FLAGS },
+    status: { flags: { json: "boolean" } },
+    logs: { flags: { tail: "value", follow: "boolean", run: "value" } },
+    wake: { flags: { lane: "value", reason: "value" } },
+    drain: { flags: {} },
+  },
+} as const satisfies CliFamily;
 
 // ---------------------------------------------------------------------------
 // Tiny per-verb flag parsing (hangar-cmd posture: throw plain Errors)
@@ -542,15 +584,7 @@ async function daemonStart(
   restart: boolean,
 ): Promise<DaemonCommandResult> {
   const verb = restart ? "restart" : "start";
-  const args = parseVerbArgs(verb, argv, {
-    force: "boolean",
-    ack: "value",
-    "no-preflight": "boolean",
-    compile: "boolean",
-    "no-compile": "boolean",
-    group: "value",
-    parallel: "boolean",
-  });
+  const args = parseVerbArgs(verb, argv, CLI_FAMILY.sub[verb].flags);
   if (args.flags.get("compile") === true && args.flags.get("no-compile") === true) {
     throw new Error(`daemon ${verb}: --compile and --no-compile are mutually exclusive`);
   }
@@ -871,14 +905,7 @@ async function daemonSubmit(
   argv: readonly string[],
   opts: DaemonCommandOptions,
 ): Promise<DaemonCommandResult> {
-  const args = parseVerbArgs("submit", argv, {
-    "brief-file": "value",
-    "no-preflight": "boolean",
-    force: "boolean",
-    ack: "value",
-    compile: "boolean",
-    "no-compile": "boolean",
-  });
+  const args = parseVerbArgs("submit", argv, CLI_FAMILY.sub.submit.flags);
   const harness = resolveHarness(args.positional[0], opts);
   if (!readsBriefOnStdin(harness.target)) {
     // Only the brief-taking shapes have an input document. Saying which verb
@@ -980,11 +1007,7 @@ async function daemonStop(
   argv: readonly string[],
   opts: DaemonCommandOptions,
 ): Promise<DaemonCommandResult> {
-  const args = parseVerbArgs("stop", argv, {
-    grace: "value",
-    group: "value",
-    parallel: "boolean",
-  });
+  const args = parseVerbArgs("stop", argv, CLI_FAMILY.sub.stop.flags);
   const groupFlag = args.flags.get("group");
   if (typeof groupFlag === "string") {
     if (args.positional[0] !== undefined) {
@@ -1067,7 +1090,7 @@ async function daemonDrain(
   argv: readonly string[],
   opts: DaemonCommandOptions,
 ): Promise<DaemonCommandResult> {
-  const args = parseVerbArgs("drain", argv, {});
+  const args = parseVerbArgs("drain", argv, CLI_FAMILY.sub.drain.flags);
   const harness = resolveHarness(args.positional[0], opts);
   return await receipted(harness, "controls.drain", opts, () => drainOnce(harness, opts));
 }
@@ -1136,7 +1159,7 @@ async function daemonWake(
   argv: readonly string[],
   opts: DaemonCommandOptions,
 ): Promise<DaemonCommandResult> {
-  const args = parseVerbArgs("wake", argv, { lane: "value", reason: "value" });
+  const args = parseVerbArgs("wake", argv, CLI_FAMILY.sub.wake.flags);
   const harness = resolveHarness(args.positional[0], opts);
   const laneFlag = args.flags.get("lane");
   if (typeof laneFlag !== "string" || !isControlLane(laneFlag)) {
@@ -1201,7 +1224,7 @@ async function daemonStatus(
   argv: readonly string[],
   opts: DaemonCommandOptions,
 ): Promise<DaemonCommandResult> {
-  const args = parseVerbArgs("status", argv, { json: "boolean" });
+  const args = parseVerbArgs("status", argv, CLI_FAMILY.sub.status.flags);
   const harness = resolveHarness(args.positional[0], opts);
   const ops = opts.ops ?? createProcessOps();
   const runfile = readRunfile(harness.dir);
@@ -1601,7 +1624,7 @@ async function daemonLogs(
   argv: readonly string[],
   opts: DaemonCommandOptions,
 ): Promise<DaemonCommandResult> {
-  const args = parseVerbArgs("logs", argv, { tail: "value", follow: "boolean", run: "value" });
+  const args = parseVerbArgs("logs", argv, CLI_FAMILY.sub.logs.flags);
   const harness = resolveHarness(args.positional[0], opts);
   const tailFlag = args.flags.get("tail");
   const tail = typeof tailFlag === "string" ? Number(tailFlag) : DEFAULT_LOG_TAIL;
@@ -1678,16 +1701,8 @@ function latestRun(harnessDir: string): string | undefined {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-export const DAEMON_VERBS = [
-  "start",
-  "submit",
-  "stop",
-  "restart",
-  "status",
-  "logs",
-  "wake",
-  "drain",
-] as const;
+/** Every daemon verb, in the order the unknown-verb message lists them. */
+export const DAEMON_VERBS: readonly string[] = Object.keys(CLI_FAMILY.sub);
 
 /**
  * HM-188 — lead the output with the win32 supervision notice.
@@ -1708,10 +1723,17 @@ export async function runDaemonCommand(
   opts: DaemonCommandOptions = {},
 ): Promise<DaemonCommandResult> {
   const verb = argv[0] ?? "";
-  if (verb === "" || verb === "--help" || verb === "-h") {
+  const rest = argv.slice(1);
+  // `daemon <verb> --help` answers before any harness is resolved or read.
+  if (
+    verb === "" ||
+    verb === "--help" ||
+    verb === "-h" ||
+    rest.includes("--help") ||
+    rest.includes("-h")
+  ) {
     return { lines: DAEMON_USAGE_LINES, exitCode: 0 };
   }
-  const rest = argv.slice(1);
   switch (verb) {
     case "start":
       return await daemonStart(rest, opts, false);

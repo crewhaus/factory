@@ -149,7 +149,7 @@ function costCard(payload) {
   if (costs === null || (costs.calls === 0 && days.every((d) => d.usdMicros === 0))) {
     return card(
       "Spend (7d)",
-      emptyState("No cost data yet", "crewhaus run (cost tracking is on by default)"),
+      emptyState("No cost data yet. Cost tracking is on by default.", "crewhaus run crewhaus.yaml"),
     );
   }
   // A day with no figure is unknown, never $0.

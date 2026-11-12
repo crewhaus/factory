@@ -108,8 +108,8 @@ describe("matchActions", () => {
     expect(actions[0]?.params).toEqual({ id: "hrn_1" });
     // The EXACT string, not a prefix: `toContain("crewhaus daemon start")`
     // is satisfied by `crewhaus daemon start --dir /h/poly`, which every
-    // daemon verb rejects. `cli-twins.test.ts` checks the whole surface
-    // against the CLI's dispatch; this pins the one row.
+    // daemon verb rejects. `apps/cli/src/cli-twins.test.ts` checks the whole
+    // surface against the CLI's verb inventory; this pins the one row.
     // …and the path is quoted UNCONDITIONALLY, the convention `shellQuote`
     // exists for: a directory name is attacker-influenceable on a shared
     // mount, and a conditional quote leaves every expansion live.

@@ -204,7 +204,7 @@ function demoCard(view, twins, reload) {
       }),
     ]),
   );
-  card.appendChild(twin(twins.demo ?? "cp -R <demos>/starters/<starter> <dir>"));
+  card.appendChild(twin(twins.demo ?? "cp -R <starter-dir> <dir> && crewhaus harness add <dir>"));
   return card;
 }
 

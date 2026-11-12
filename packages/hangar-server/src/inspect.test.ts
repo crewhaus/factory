@@ -324,7 +324,7 @@ describe("inspect — one store", () => {
       const { status, body } = await t.api(`/api/h/${id}/inspect/scope-audit`);
       expect(status).toBe(200);
       expect(body["present"]).toBe(false);
-      expect(String(body["verb"])).toContain("crewhaus lint");
+      expect(String(body["verb"])).toBe("crewhaus doctor --philosophy-alignment --json");
     } finally {
       await t.stop();
     }

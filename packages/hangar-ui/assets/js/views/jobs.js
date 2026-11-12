@@ -10,8 +10,8 @@
 
 import { api } from "../api.js";
 import { clear, dot, el, emptyState, skeleton, toast } from "../dom.js";
-import { JOB_COMMANDS, jobQueueModel, jobRow } from "../supervision.js";
-import { cliTwin, runAction } from "./control.js";
+import { jobQueueModel, jobRow } from "../supervision.js";
+import { actionTwin, runAction } from "./control.js";
 
 /** Submit one job and report it — the shared path for every action face. */
 export async function submitJob(btn, id, kind, options, onOk) {
@@ -27,11 +27,11 @@ export async function submitJob(btn, id, kind, options, onOk) {
   );
 }
 
-/** A button that enqueues a job and shows the command it will run. */
-export function jobButton(label, id, kind, options, onOk) {
+/** A button that enqueues a job and shows the command it will run, in `dir`. */
+export function jobButton(label, id, kind, options, onOk, dir) {
   const btn = el("button", { class: "btn", type: "button", text: label });
   btn.addEventListener("click", () => submitJob(btn, id, kind, options, onOk));
-  return el("div", { class: "job-action" }, [btn, cliTwin(JOB_COMMANDS[kind] ?? null)]);
+  return el("div", { class: "job-action" }, [btn, actionTwin("job", { dir, kind })]);
 }
 
 function jobsTable(rows) {
@@ -85,7 +85,9 @@ export async function renderJobs(root) {
   const model = jobQueueModel(payload);
   clear(root);
   if (model.total === 0) {
-    root.appendChild(emptyState("No jobs queued", "crewhaus doctor (or Run now on any harness)"));
+    root.appendChild(
+      emptyState("No jobs queued. Use Run now on any harness, or run a check.", "crewhaus doctor"),
+    );
     return;
   }
   const section = (title, jobs, note) => {

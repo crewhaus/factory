@@ -172,8 +172,8 @@ function approvalCard(row, { perform }) {
       gatedBtn("Deny", gate, () => perform("deny"), "btn btn-danger"),
     ]),
     el("div", { class: "inbox-twins" }, [
-      actionTwin("grant", { id: row.id }),
-      actionTwin("deny", { id: row.id }),
+      actionTwin("grant", { id: row.id, dir: row.dir }),
+      actionTwin("deny", { id: row.id, dir: row.dir }),
     ]),
   ];
 }

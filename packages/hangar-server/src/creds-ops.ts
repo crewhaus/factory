@@ -701,7 +701,7 @@ export const credentialsMatrix: M3Handler = (ctx) => {
         : unreadable > 0
           ? `${unreadable} harness${unreadable === 1 ? "" : "es"} could not be read — those rows say why, and the rest of the fleet is unaffected`
           : null,
-      "crewhaus hangar add <dir>",
+      "crewhaus harness add <dir>",
     ),
     harnesses,
     unreadable,

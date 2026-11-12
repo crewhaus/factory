@@ -562,8 +562,8 @@ export const modelRoutes: M3Handler = (ctx) => {
   if (path === undefined || !existsSync(path)) {
     return {
       ...absent(
-        `no session log for "${sessionId}" — the timeline is read from .crewhaus/sessions/<id>.jsonl`,
-        "crewhaus sessions list",
+        `no session log for "${sessionId}" — the timeline is read from .crewhaus/sessions/<id>.jsonl, which a run writes`,
+        "crewhaus run",
       ),
       sessionId,
       entries: [],

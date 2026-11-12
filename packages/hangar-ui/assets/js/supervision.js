@@ -165,7 +165,7 @@ export const REMEDIES = {
     hint: "add a spec to this directory, then compile it",
   },
   "install-cli": {
-    label: "crewhaus CLI not found",
+    label: "CLI not found",
     jobKind: null,
     hint: "install the CLI so the manager can spawn through it",
   },
@@ -1126,6 +1126,8 @@ export function approvalRow(row, nowMs) {
   return {
     id: typeof r.id === "string" ? r.id : "",
     harnessId: typeof r.harnessId === "string" ? r.harnessId : "",
+    // The harness directory, so the row's command-line equivalent runs there.
+    dir: typeof r.harnessDir === "string" ? r.harnessDir : "",
     specName: typeof r.specName === "string" ? r.specName : "",
     toolName: typeof r.toolName === "string" ? r.toolName : "tool",
     // Verbatim (the server already masked it) — an approver cannot judge a
@@ -1158,6 +1160,8 @@ export function reviewRow(row, nowMs) {
   return {
     id: typeof r.id === "string" ? r.id : "",
     harnessId: typeof r.harnessId === "string" ? r.harnessId : "",
+    // The harness directory, so the row's command-line equivalents run there.
+    dir: typeof r.harnessDir === "string" ? r.harnessDir : "",
     specName: typeof r.specName === "string" ? r.specName : "",
     kind: typeof r.kind === "string" ? r.kind : "item",
     status,
@@ -1352,9 +1356,21 @@ export function deploymentRow(record, nowMs) {
 // CLI twins
 // ---------------------------------------------------------------------------
 
-function quoteArg(value) {
-  const s = String(value);
-  return s.includes(" ") ? JSON.stringify(s) : s;
+/**
+ * One quoting rule for every command-line equivalent: the value is wrapped in
+ * single quotes, and a `'` inside it is closed, escaped and reopened (`'\''`).
+ * Inside single quotes a POSIX shell expands nothing, so a pasted line runs
+ * exactly the command shown, whatever a directory or an id is called. The same
+ * function as `shellQuote` in `@crewhaus/harness-supervisor`, which the server's
+ * equivalents use.
+ */
+export function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+/** A value, single-quoted; its placeholder, unquoted, when it is missing. */
+function quotedOr(value, placeholder) {
+  return value === undefined || value === null || value === "" ? placeholder : shellQuote(value);
 }
 
 /** The `crewhaus` argv each job kind runs — mirrors the server's `jobArgv`. */
@@ -1365,11 +1381,31 @@ export const JOB_COMMANDS = {
   "dream-run": "crewhaus dream run crewhaus.yaml",
 };
 
+/** Every action {@link cliTwinFor} has a command for. */
+export const TWIN_ACTIONS = [
+  "start",
+  "stop",
+  "restart",
+  "drain",
+  "wake",
+  "logs",
+  "grant",
+  "deny",
+  "review",
+  "adjudicate",
+  "baseline",
+  "job",
+];
+
 /**
  * The exact command an action's CLI twin runs. Every button in the console
  * shows one: it is the single best trust affordance in the design, because
  * an operator can verify what a click will do before clicking it — and the
  * two heads (CLI and console) drive the same state tree.
+ *
+ * Every value it carries is single-quoted ({@link shellQuote}); fixed words
+ * are not, and a value it was not given renders as its `<placeholder>`. With
+ * a `dir`, the command starts `cd '<dir>' &&`, so it runs in that harness.
  *
  * Returns null where no CLI verb exists yet; the caller renders the honest
  * note from {@link NO_TWIN_NOTES} instead of inventing a command.
@@ -1377,43 +1413,76 @@ export const JOB_COMMANDS = {
 export function cliTwinFor(action, args = {}) {
   const a = args && typeof args === "object" ? args : {};
   const dir = typeof a.dir === "string" && a.dir !== "" ? a.dir : null;
-  const at = (command) => (dir !== null ? `cd ${quoteArg(dir)} && ${command}` : command);
+  const prefix = dir !== null ? ["cd", shellQuote(dir), "&&"] : [];
+  const at = (words) => [...prefix, "crewhaus", ...words].join(" ");
   switch (action) {
     case "start": {
-      const ack = Array.isArray(a.acknowledge) ? a.acknowledge.filter((x) => x !== "") : [];
-      return at(
-        `crewhaus daemon start${a.force === true ? " --force" : ""}${
-          ack.length > 0 ? ` --ack ${ack.join(",")}` : ""
-        }`,
-      );
+      const ack = Array.isArray(a.acknowledge)
+        ? a.acknowledge.filter((x) => typeof x === "string" && x !== "")
+        : [];
+      return at([
+        "daemon",
+        "start",
+        ...(a.force === true ? ["--force"] : []),
+        ...(ack.length > 0 ? ["--ack", shellQuote(ack.join(","))] : []),
+      ]);
     }
     case "stop":
-      return at("crewhaus daemon stop");
+      return at(["daemon", "stop"]);
     case "restart":
-      return at("crewhaus daemon restart");
+      return at(["daemon", "restart"]);
     case "drain":
-      return at("crewhaus daemon drain");
+      return at(["daemon", "drain"]);
     case "wake":
-      return at(`crewhaus daemon wake --lane ${quoteArg(a.lane ?? "heartbeat")}`);
+      return at(["daemon", "wake", "--lane", quotedOr(a.lane, "<lane>")]);
     case "logs":
-      return at(
-        `crewhaus daemon logs${a.runId !== undefined ? ` --run ${quoteArg(a.runId)}` : ""} --follow`,
-      );
+      return at([
+        "daemon",
+        "logs",
+        ...(a.runId !== undefined && a.runId !== null ? ["--run", shellQuote(a.runId)] : []),
+        "--follow",
+      ]);
     case "grant":
-      return at(`crewhaus approvals grant ${quoteArg(a.id ?? "<id>")}`);
+      return at(["approvals", "grant", quotedOr(a.id, "<id>")]);
     case "deny":
-      return at(`crewhaus approvals deny ${quoteArg(a.id ?? "<id>")}`);
+      return at(["approvals", "deny", quotedOr(a.id, "<id>")]);
     case "review":
-      return at(`crewhaus review resolve ${quoteArg(a.id ?? "<id>")}`);
-    case "adjudicate":
-      return at(
-        `crewhaus rate --session ${quoteArg(a.sessionId ?? "<sess>")} --turn ${a.turn ?? 0} --thumbs ${quoteArg(a.verdict ?? "up")} --adjudicate`,
-      );
+      // A pass or fail verdict on the item: the CLI's resolve records the
+      // same resolution Home's does.
+      return at([
+        "review",
+        "resolve",
+        quotedOr(a.id, "<id>"),
+        "--note",
+        quotedOr(a.verdict, "pass|fail"),
+      ]);
+    case "adjudicate": {
+      // A thumbs verdict on the rated turn, then the item closed with the
+      // resolution Home records: the two steps `crewhaus review next` takes.
+      const verdict = a.verdict === "up" || a.verdict === "down" ? a.verdict : null;
+      return at([
+        "rate",
+        "--session",
+        quotedOr(a.sessionId, "<session>"),
+        "--turn",
+        quotedOr(a.turn, "<turn>"),
+        "--thumbs",
+        verdict !== null ? shellQuote(verdict) : "up|down",
+        "--adjudicate",
+        "&&",
+        "crewhaus",
+        "review",
+        "resolve",
+        quotedOr(a.id, "<id>"),
+        "--note",
+        verdict !== null ? shellQuote(`adjudicated: thumbs ${verdict}`) : "<note>",
+      ]);
+    }
     case "baseline":
-      return at(`crewhaus eval-report baseline set ${quoteArg(a.runId ?? "<run>")}`);
+      return at(["eval-report", "baseline", "set", quotedOr(a.runId, "<run>")]);
     case "job":
-      return typeof a.kind === "string" && JOB_COMMANDS[a.kind] !== undefined
-        ? at(JOB_COMMANDS[a.kind])
+      return typeof a.kind === "string" && Object.hasOwn(JOB_COMMANDS, a.kind)
+        ? [...prefix, JOB_COMMANDS[a.kind]].join(" ")
         : null;
     default:
       return null;

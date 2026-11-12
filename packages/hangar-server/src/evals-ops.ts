@@ -529,10 +529,20 @@ export const evalMatrix: M3Handler = (ctx) => {
     });
   }
   if (roots.length === 0) {
-    return { ...absent("no matrix runs recorded", "crewhaus eval --models"), cells, roots: [] };
+    return {
+      ...absent(
+        "no matrix runs recorded",
+        "crewhaus eval crewhaus.yaml --dataset <dataset> --graders <graders> --models <models>",
+      ),
+      cells,
+      roots: [],
+    };
   }
   return {
-    ...found(null, "crewhaus eval --models"),
+    ...found(
+      null,
+      "crewhaus eval crewhaus.yaml --dataset <dataset> --graders <graders> --models <models>",
+    ),
     cells,
     roots: rootViews,
     crashed: cells.filter((c) => c.crash !== null).length,
@@ -557,7 +567,10 @@ export const evalMatrixCell: M3Handler = (ctx) => {
     const summary = hasDir ? readJson(ctx, evalsSegments(root, cell, "results.json")) : undefined;
     const error = str(row?.["error"]);
     return {
-      ...found(null, "crewhaus eval --models"),
+      ...found(
+        null,
+        "crewhaus eval crewhaus.yaml --dataset <dataset> --graders <graders> --models <models>",
+      ),
       cell,
       root,
       model: str(row?.["model"]) ?? cell,
@@ -567,7 +580,10 @@ export const evalMatrixCell: M3Handler = (ctx) => {
     };
   }
   return {
-    ...absent(`no matrix cell "${cell}" under any recorded matrix run`, "crewhaus eval --models"),
+    ...absent(
+      `no matrix cell "${cell}" under any recorded matrix run`,
+      "crewhaus eval crewhaus.yaml --dataset <dataset> --graders <graders> --models <models>",
+    ),
     cell,
     root: null,
     model: null,
@@ -630,11 +646,11 @@ export const evalSuites: M3Handler = (ctx) => {
   suites.sort((a, b) => String(b["dir"]).localeCompare(String(a["dir"])));
   if (suites.length === 0) {
     return {
-      ...absent("no CI suite runs recorded", "crewhaus eval suite <suite.yaml> --tier fast"),
+      ...absent("no CI suite runs recorded", "crewhaus eval suite <suite> --tier fast"),
       suites,
     };
   }
-  return { ...found(null, "crewhaus eval suite <suite.yaml> --tier fast"), suites };
+  return { ...found(null, "crewhaus eval suite <suite> --tier fast"), suites };
 };
 
 const SUITE_TIERS = new Set(["fast", "nightly", "release"]);
@@ -1023,7 +1039,7 @@ export const redteam: M3Handler = async (ctx) => {
   return {
     ...found(
       "attack success rate is 1 − the refusal graders' pass rate; partial runs are excluded from the trend",
-      "crewhaus redteam report --runs",
+      "crewhaus redteam report --runs <runs>",
     ),
     dataset: versions.length > 0 ? { name: datasetName, versions } : null,
     runs,

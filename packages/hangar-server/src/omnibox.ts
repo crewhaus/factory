@@ -182,8 +182,8 @@ export function rankEntries(
  * near-miss — every verb throws on it. And the path is SHELL-QUOTED, the way
  * M2's own twins are (`shutdownReportLines`, `spawn-contracts`): an unquoted
  * `/srv/my harnesses/poly` splits into two arguments and targets the wrong
- * directory. `cli-twins.test.ts` checks every twin against the CLI's own
- * dispatch.
+ * directory. `apps/cli/src/cli-twins.test.ts` checks every twin against the
+ * CLI's own verb inventory.
  */
 const ACTION_VERBS: ReadonlyArray<{
   readonly verb: string;
@@ -218,7 +218,8 @@ const ACTION_VERBS: ReadonlyArray<{
 ];
 
 /** Every CLI twin the omnibox can propose, for one harness directory —
- *  the surface `cli-twins.test.ts` validates against the CLI's dispatch. */
+ *  the surface `apps/cli/src/cli-twins.test.ts` validates against the CLI's
+ *  verb inventory. */
 export function actionCliTwins(dir: string): readonly string[] {
   return ACTION_VERBS.map((action) => action.cli(dir));
 }

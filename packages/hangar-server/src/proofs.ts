@@ -259,9 +259,23 @@ export function proofCliTwin(
   tenantsRoot?: string,
   pass?: number,
 ): string {
-  const tenants = tenantsRoot !== undefined ? ` --tenants-root ${shellQuote(tenantsRoot)}` : "";
-  const which = pass !== undefined ? ` --pass ${pass}` : "";
-  return `cd ${shellQuote(harnessDir)} && crewhaus provability show --session ${sessionId} --turn ${turn}${which}${tenants} --json`;
+  // Every string value is single-quoted, the session id included, so the line
+  // runs exactly this command when pasted; the turn and pass are integers.
+  return [
+    "cd",
+    shellQuote(harnessDir),
+    "&&",
+    "crewhaus",
+    "provability",
+    "show",
+    "--session",
+    shellQuote(sessionId),
+    "--turn",
+    String(turn),
+    ...(pass !== undefined ? ["--pass", String(pass)] : []),
+    ...(tenantsRoot !== undefined ? ["--tenants-root", shellQuote(tenantsRoot)] : []),
+    "--json",
+  ].join(" ");
 }
 
 /**

@@ -298,7 +298,7 @@ function supervisionOf(live: readonly JobRecord[]): {
 
 /** The command an operator could paste. Every value is quoted
  *  unconditionally — a harness directory is an attacker-influenceable name. */
-function twin(harnessDir: string, argv: readonly string[]): string {
+export function runtimeOpTwin(harnessDir: string, argv: readonly string[]): string {
   return ["cd", shellQuote(harnessDir), "&&", "crewhaus", ...argv.map(shellQuote)].join(" ");
 }
 
@@ -507,7 +507,7 @@ export const mcpServers: M3Handler = async (ctx) => {
     cliTwin:
       specFile === null
         ? null
-        : twin(dir, mcpArgv(specFile, transport ?? "stdio", port ?? MCP_DEFAULT_PORT)),
+        : runtimeOpTwin(dir, mcpArgv(specFile, transport ?? "stdio", port ?? MCP_DEFAULT_PORT)),
   };
 };
 
@@ -570,7 +570,7 @@ export const mcpServerStart: M3Handler = (ctx) => {
     transport,
     port,
     argv,
-    cliTwin: twin(dir, argv),
+    cliTwin: runtimeOpTwin(dir, argv),
     ledgerError,
     // The port is NOT claimed in the port ledger: this layer allocates
     // nothing, so a collision surfaces as the CLI failing to bind rather than
@@ -732,7 +732,7 @@ export const dev: M3Handler = (ctx) => {
     runs: [...live, ...past].map(runtimeRun),
     ledger: ledgerRows(dir, "job"),
     supervision: supervisionOf(live),
-    cliTwin: specFile === null ? null : twin(dir, devArgv(specFile, false)),
+    cliTwin: specFile === null ? null : runtimeOpTwin(dir, devArgv(specFile, false)),
   };
 };
 
@@ -777,7 +777,7 @@ export const devStart: M3Handler = (ctx) => {
     argv,
     cwd: dir,
     stateRoots: stateRoots(ctx),
-    cliTwin: twin(dir, argv),
+    cliTwin: runtimeOpTwin(dir, argv),
     ledgerError,
     supervision: supervisionOf([job]),
     watch: runId === null ? null : watchPath(ctx.entry?.id ?? "", runId),
