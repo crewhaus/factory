@@ -83,6 +83,17 @@ these on: they reach every harness that uses what each one names.
   cost, never its messages. `CREWHAUS_RUN_LEDGER=0` turns this off and changes
   nothing else.
 
+- **A channel daemon's webhook handler reads at most a fixed number of bytes.**
+  A request whose body is larger is answered with 413 before its signature is
+  checked; the limit is 1 MiB, and `CHANNEL_WEBHOOK_MAX_BYTES` changes it.
+  Recompile a daemon to pick this up.
+
+- **A managed daemon's federation route reads at most a fixed number of bytes.**
+  With federation on, a `POST /federation` request whose body is larger is
+  answered with 413 before the peer is authorized; the limit is 1 MiB, and
+  `createGatewayServer`'s `federation.maxBodyBytes` changes it. Recompile a
+  daemon to pick this up.
+
 - **Fact compaction keeps what it removes, and fact writes take a lock.**
   Compaction, from `crewhaus memory sweep --compact` and the dream pass, moves
   superseded and expired facts and their tombstones to

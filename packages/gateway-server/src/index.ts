@@ -54,6 +54,10 @@ import {
   encodeSseEvent,
   encodeSuccess,
 } from "@crewhaus/gateway-protocol";
+import {
+  DEFAULT_WEBHOOK_MAX_BYTES,
+  readRequestBodyCapped,
+} from "@crewhaus/gateway-protocol/body-limit";
 import { withInboundContent } from "@crewhaus/run-context";
 import { type Tenant, buildTenant, validateTenantId, withTenant } from "@crewhaus/tenancy";
 
@@ -285,6 +289,13 @@ export type GatewayFederationConfig = {
   };
   readonly dispatch: FederationInboundDispatch;
   readonly authorize?: FederationAuthorize;
+  /**
+   * Most bytes of a `POST /federation` body the server reads, as a
+   * non-negative integer. Default {@link FEDERATION_MAX_BODY_BYTES} (1 MiB);
+   * raise it for peers that send larger payloads. A body past it is answered
+   * 413 before `authorize` runs.
+   */
+  readonly maxBodyBytes?: number;
 };
 
 export type CreateGatewayServerOptions = {
@@ -391,6 +402,14 @@ export type CreateGatewayServerOptions = {
  * to avoid.
  */
 export const DEFAULT_CLOSE_GRACE_MS = 10_000;
+
+/**
+ * Most bytes of a `POST /federation` body the server reads when
+ * `federation.maxBodyBytes` is not set (1 MiB). A peer's envelope carries its
+ * own authentication, so the body is read before the peer is known; past this
+ * it is answered 413 and the read stops.
+ */
+export const FEDERATION_MAX_BODY_BYTES = DEFAULT_WEBHOOK_MAX_BYTES;
 
 /**
  * Stop a `Bun.serve` handle gracefully, but under a bound.
@@ -513,6 +532,12 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
   // `/federation` to (kept in lock-step with `@crewhaus/federation-router`) plus
   // the cert-pin fingerprint the A2A card omits.
   const fed = opts.federation;
+  const fedMaxBodyBytes = fed?.maxBodyBytes ?? FEDERATION_MAX_BODY_BYTES;
+  if (!Number.isSafeInteger(fedMaxBodyBytes) || fedMaxBodyBytes < 0) {
+    throw new RangeError(
+      `federation.maxBodyBytes must be a non-negative integer, got ${String(fedMaxBodyBytes)}`,
+    );
+  }
   const fedBase = fed !== undefined ? fed.identity.endpoint.replace(/\/+$/, "") : "";
   const fedAgentCard: A2AAgentCard | undefined =
     fed !== undefined
@@ -615,6 +640,22 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
     const log = await openAuditLog({ rootDir: tenant.auditRoot });
     auditLogByTenant.set(tenant.id, log);
     return log;
+  }
+
+  /**
+   * The 401 for a request whose bearer is missing or does not verify, as
+   * handleEnvelope would answer it, or `undefined` for one that verifies.
+   */
+  function bearerRefusal(bearer: string | undefined): Response | undefined {
+    if (typeof bearer !== "string" || bearer === "") {
+      return errorResponse(encodeError("?", ErrorCode.Unauthorized, "missing bearer token"));
+    }
+    try {
+      verifyJwt(bearer, opts.jwtSecret, now);
+      return undefined;
+    } catch (err) {
+      return errorResponse(errorEnvelopeFor(err, "?"));
+    }
   }
 
   async function handleEnvelope(envelope: unknown, bearer: string | undefined): Promise<unknown> {
@@ -815,9 +856,22 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
               : Response.json({ error: "federation is not enabled" }, { status: 404 });
           }
           if (req.method === "POST" && pathname === "/federation") {
+            // A peer authenticates inside the envelope, so the body is read
+            // before anything else is known about it: only when federation is
+            // on, and never more of it than federation.maxBodyBytes.
+            if (fed === undefined) {
+              return Response.json({ error: "federation is not enabled" }, { status: 404 });
+            }
+            const fread = await readRequestBodyCapped(req, fedMaxBodyBytes);
+            if (!fread.ok) {
+              return Response.json(
+                { error: await fread.response.text() },
+                { status: fread.response.status },
+              );
+            }
             let fbody: unknown;
             try {
-              fbody = await req.json();
+              fbody = JSON.parse(fread.text);
             } catch {
               return Response.json({ error: "request body must be JSON" }, { status: 400 });
             }
@@ -832,6 +886,11 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
           }
           const auth = req.headers.get("authorization") ?? "";
           const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
+          // The bearer is checked before the body is read, so a caller without
+          // a valid token is answered 401 at no cost of reading what it sent.
+          // handleEnvelope/handleSubscribe check it again, with the tenant.
+          const unauthorized = bearerRefusal(bearer);
+          if (unauthorized !== undefined) return unauthorized;
           let body: unknown;
           try {
             body = await req.json();

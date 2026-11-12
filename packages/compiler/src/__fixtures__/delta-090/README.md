@@ -25,3 +25,10 @@ path; the imports gain `lstatSync`, `mkdirSync`, `rmSync`, `writeFileSync` and `
 lines about where `CREWHAUS_TENANTS_ROOT` belongs are emitted only for a spec that declares a tool that
 may work on files, or `provability:`, and the managed spec here declares neither. No other digest
 moves.
+
+**Webhook body limit delta — `channel`'s `gateway.ts` and `daemon.ts` only.** The gateway reads a
+webhook body through `readRequestBodyCapped` (`@crewhaus/gateway-protocol/body-limit`) on its events
+and actions routes, so a body over the limit is answered 413 before `verify()`, and its config gains an
+optional `maxBodyBytes`. The daemon resolves the limit once from `CHANNEL_WEBHOOK_MAX_BYTES` (1 MiB when
+unset) and passes it to the gateway and to the public port's `Bun.serve` as `maxRequestBodySize`. No
+other digest moves.

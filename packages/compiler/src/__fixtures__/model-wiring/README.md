@@ -88,3 +88,14 @@ log names the path; the imports gain `lstatSync`, `mkdirSync`, `rmSync`,
 a spec that declares a tool that may work on files, or `provability:`, and the
 spec pinned here declares neither, so they move no byte of this pin. Nothing
 else in the bundle moves.
+
+
+**Webhook body limit delta — `channel-pool.gateway.ts` and `channel-pool.daemon.ts` only.**
+The channel gateway reads a webhook body through `readRequestBodyCapped` from
+`@crewhaus/gateway-protocol/body-limit` on its events and actions routes,
+instead of `req.text()`: a body over the limit is answered 413 before
+`verify()`, and the gateway config gains an optional `maxBodyBytes`. The daemon
+resolves the limit once (`CHANNEL_WEBHOOK_MAX_BYTES`, 1 MiB when unset), prints
+a boot warning for a value it cannot use, and passes the same number to
+`createGateway` and to the public port's `Bun.serve` as `maxRequestBodySize`.
+Nothing else in the bundle moves.

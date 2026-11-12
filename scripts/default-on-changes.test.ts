@@ -67,10 +67,18 @@ import { foldStates } from "../packages/control-records/src/index";
 import { commandsLedgerOf } from "../packages/control-service/src/index";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
+import {
+  FEDERATION_VERSION,
+  encodeFederationEnvelope,
+} from "../packages/federation-protocol/src/index";
 import { countPendingApprovals } from "../packages/gateway-protocol/src/control";
+import {
+  FEDERATION_MAX_BODY_BYTES,
+  createGatewayServer,
+} from "../packages/gateway-server/src/index";
 import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
-import type { IrManagedV0 } from "../packages/ir/src/index";
+import type { IrChannelV0, IrManagedV0 } from "../packages/ir/src/index";
 import { _setCompactSeamsForTest, createMemoryStore } from "../packages/memory-store/src/index";
 import {
   type RuleSet,
@@ -99,6 +107,7 @@ import {
   validatePatch,
 } from "../packages/spec-patch/src/index";
 import { parseSpec } from "../packages/spec/src/index";
+import { emitChannelBot } from "../packages/target-channel-bot/src/index";
 import { emitManaged } from "../packages/target-managed/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
 import { foldApprovals as toolFoldApprovals } from "../packages/tool-approvals/src/lib/approvals";
@@ -2022,6 +2031,161 @@ describe("approval decisions", () => {
     expect(bullet).toContain("reads never rewrite");
     expect(bullet).toContain("decision log");
   });
+});
+
+describe("the release notes name the channel webhook body limit", () => {
+  test("the emitted gateway answers 413 over the limit before verify, and the bullet names the variable", async () => {
+    const ir: IrChannelV0 = {
+      version: 0,
+      name: "default-on-webhook",
+      target: "channel",
+      agent: { model: "claude-sonnet-4-6", instructions: "be helpful" },
+      tools: [],
+      toolConfigs: {},
+      channels: {
+        slack: {
+          botToken: { kind: "env", name: "SLACK_BOT_TOKEN" },
+          signingSecret: { kind: "env", name: "SLACK_SIGNING_SECRET" },
+        },
+      },
+      routing: { sessionKey: "thread" },
+      mcp_servers: {},
+      permissions: { rules: [] },
+      subAgents: [],
+      compaction: {},
+    };
+    const files = new Map(emitChannelBot(ir).files.map((f) => [f.path, f.content]));
+    // Beside the package's sources, so the generated imports resolve.
+    const dir = mkdtempSync(
+      join(ROOT, "packages", "target-channel-bot", "src", ".default-on-webhook-"),
+    );
+    try {
+      writeFileSync(join(dir, "gateway.ts"), files.get("gateway.ts") ?? "");
+      const { createGateway } = (await import(join(dir, "gateway.ts"))) as {
+        createGateway(config: {
+          adapters: ReadonlyMap<string, unknown>;
+          sessionRouter: unknown;
+          maxBodyBytes?: number;
+        }): { handle(req: Request): Promise<Response> };
+      };
+      let verified = 0;
+      const adapter = {
+        id: "slack",
+        verify: (req: { body: string }) => {
+          verified++;
+          return req.body === "{}";
+        },
+        parseInbound: () => ({ kind: "skip" }),
+      };
+      const gateway = createGateway({
+        adapters: new Map([["slack", adapter]]),
+        sessionRouter: { handle: async () => {} },
+        maxBodyBytes: 1024,
+      });
+      const post = (body: BodyInit, headers: Record<string, string> = {}) =>
+        gateway.handle(
+          new Request("http://127.0.0.1/slack/events", {
+            method: "POST",
+            headers,
+            body,
+            duplex: "half",
+          } as RequestInit),
+        );
+      // The control: a normal-sized signed body still verifies.
+      expect((await post("{}")).status).toBe(200);
+      expect(verified).toBe(1);
+      // A declared length over the limit, and a streamed body that passes it.
+      expect((await post("x".repeat(2048), { "content-length": "2048" })).status).toBe(413);
+      let chunks = 0;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (chunks++ === 8) controller.close();
+          else controller.enqueue(new Uint8Array(512));
+        },
+      });
+      expect((await post(stream)).status).toBe(413);
+      expect(verified).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    // The daemon resolves one limit for the gateway and for the public port.
+    const daemon = files.get("daemon.ts") ?? "";
+    const required = [
+      "const __webhookBodyLimit = resolveWebhookBodyLimit(process.env);",
+      "maxBodyBytes: __webhookBodyLimit.maxBytes,",
+      "maxRequestBodySize: __webhookBodyLimit.maxBytes,",
+    ];
+    expect(required.filter((text) => !daemon.includes(text))).toEqual([]);
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("`CHANNEL_WEBHOOK_MAX_BYTES`"),
+      ) ?? "";
+    expect(bullet).toContain("413 before its signature is checked");
+    expect(bullet).toContain("1 MiB");
+  });
+});
+
+describe("the release notes name the federation body limit", () => {
+  test("a managed daemon's POST /federation answers 413 over the limit before authorize, and the bullet names the option", async () => {
+    const envelope = (payload: string) =>
+      encodeFederationEnvelope({
+        version: FEDERATION_VERSION,
+        traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        federation: {
+          from: { deployment: "peer-a", role: "client" },
+          to: { deployment: "dep", role: "server" },
+          mtls: { client_cert_subject: "CN=peer-a" },
+        },
+        kind: "question",
+        payload,
+      });
+    const tenantsRoot = mkdtempSync(join(tmpdir(), "default-on-federation-"));
+    const counts = { authorized: 0, dispatched: 0 };
+    const server = createGatewayServer({
+      jwtSecret: ["default", "on", "federation"].join("-"),
+      tenantsRoot,
+      handler: async () => ({ ok: true }),
+      federation: {
+        identity: {
+          name: "dep",
+          description: "a peer",
+          endpoint: "https://dep.example",
+          publicKeyFingerprint: "a".repeat(64),
+        },
+        authorize: () => {
+          counts.authorized++;
+          return { ok: true };
+        },
+        dispatch: async () => {
+          counts.dispatched++;
+          return { reply: "done" };
+        },
+      },
+    });
+    const { port, close } = await server.listen(0, "127.0.0.1");
+    try {
+      const post = (body: string) =>
+        fetch(`http://127.0.0.1:${port}/federation`, { method: "POST", body });
+      // The control: a valid envelope under the limit is authorized and dispatched.
+      const ok = await post(envelope("hello"));
+      expect(ok.status).toBe(200);
+      expect(counts).toEqual({ authorized: 1, dispatched: 1 });
+      // An envelope over the limit is answered 413, with no authorize or dispatch.
+      const over = await post(envelope("p".repeat(FEDERATION_MAX_BODY_BYTES)));
+      expect(over.status).toBe(413);
+      expect(counts).toEqual({ authorized: 1, dispatched: 1 });
+    } finally {
+      await close();
+      rmSync(tenantsRoot, { recursive: true, force: true });
+    }
+    expect(FEDERATION_MAX_BODY_BYTES).toBe(1024 * 1024);
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("`federation.maxBodyBytes`"),
+      ) ?? "";
+    expect(bullet).toContain("413 before the peer is authorized");
+    expect(bullet).toContain("1 MiB");
+  }, 20_000); // sends 1 MiB through a real socket; slow on a loaded CI runner
 });
 
 /**
