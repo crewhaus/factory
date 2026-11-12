@@ -83,17 +83,6 @@ these on: they reach every harness that uses what each one names.
   cost, never its messages. `CREWHAUS_RUN_LEDGER=0` turns this off and changes
   nothing else.
 
-- **A channel daemon's webhook handler reads at most a fixed number of bytes.**
-  A request whose body is larger is answered with 413 before its signature is
-  checked; the limit is 1 MiB, and `CHANNEL_WEBHOOK_MAX_BYTES` changes it.
-  Recompile a daemon to pick this up.
-
-- **A managed daemon's federation route reads at most a fixed number of bytes.**
-  With federation on, a `POST /federation` request whose body is larger is
-  answered with 413 before the peer is authorized; the limit is 1 MiB, and
-  `createGatewayServer`'s `federation.maxBodyBytes` changes it. Recompile a
-  daemon to pick this up.
-
 - **Fact compaction keeps what it removes, and fact writes take a lock.**
   Compaction, from `crewhaus memory sweep --compact` and the dream pass, moves
   superseded and expired facts and their tombstones to
@@ -184,6 +173,31 @@ these on: they reach every harness that uses what each one names.
   own words, and a parked run says to continue with `crewhaus runs resume`.
   Requests parked before the upgrade count for their conversation only, so a
   batch job or a scheduled lane parked before it asks once more.
+
+## [0.8.2] - 2026-11-12
+
+A channel daemon's webhook routes and a managed daemon's federation route read
+at most a fixed number of bytes.
+
+### Changed
+
+#### Before you upgrade
+
+**Changes that can affect a harness without opting in.** No spec has to turn
+these on: they reach every harness that uses what each one names.
+
+- **A channel daemon's webhook handler reads at most a fixed number of bytes.**
+  A request whose body is larger is answered with 413 before its signature is
+  checked; the limit is 1 MiB, and `CHANNEL_WEBHOOK_MAX_BYTES` changes it.
+  Recompile a daemon to pick this up.
+
+- **A managed daemon checks a JSON-RPC bearer before it reads the body, and
+  reads at most a fixed number of bytes of a federation request.** A JSON-RPC
+  request without a valid bearer is answered with 401, whatever its body. With
+  federation on, a `POST /federation` request whose body is larger is answered
+  with 413 before the peer is authorized; the limit is 1 MiB, and code that
+  calls `createGatewayServer` itself can set `federation.maxBodyBytes`.
+  Recompile a daemon to pick this up.
 
 ## [0.8.1] - 2026-11-08
 
