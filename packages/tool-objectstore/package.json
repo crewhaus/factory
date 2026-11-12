@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-objectstore",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic object-store URL signing: SigV4 presigned GET and PUT, computed offline",
   "main": "src/index.ts",

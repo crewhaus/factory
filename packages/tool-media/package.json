@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-media",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic media tools: image inspection and transformation, barcode encoding and decoding, chart and diagram rendering, and audio and video probing",
   "main": "src/index.ts",

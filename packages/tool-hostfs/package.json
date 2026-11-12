@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-hostfs",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic host filesystem operations beyond read and write: watching a path, recoverable deletion, and the OS file index",
   "main": "src/index.ts",

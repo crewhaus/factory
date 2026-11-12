@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-safety",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "Zero-dependency guards tool packages share instead of hand-rolling: caller-supplied regexes run under a real deadline in a terminable worker, bounded readers for streams, child processes, HTTP bodies and files, filesystem operations that contain the leaf, not just the directory, and credential environment variables only an operator can allow",
   "main": "src/index.ts",

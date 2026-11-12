@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-proc",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic process tools: background processes, log tailing, port and file waits, and retry with backoff",
   "main": "src/index.ts",

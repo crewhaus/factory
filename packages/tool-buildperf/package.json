@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-buildperf",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic build-performance gates: bundle size, benchmark comparison and flaky-test detection against a baseline",
   "main": "src/index.ts",

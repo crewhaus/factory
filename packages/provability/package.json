@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/provability",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "The provability ladder (cited, grounded, checked, proven): evidence index, verifiers, proof bundles and proof-artifact storage",
   "main": "src/index.ts",

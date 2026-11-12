@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-git",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic git tools: status, diff, log, blame, branches, commits, stashes and worktrees over a real repository",
   "main": "src/index.ts",

@@ -5,7 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.2] - 2026-11-12
+
+A channel daemon's webhook routes and a managed daemon's federation route read
+at most a fixed number of bytes.
 
 ### Changed
 
@@ -19,11 +22,13 @@ these on: they reach every harness that uses what each one names.
   checked; the limit is 1 MiB, and `CHANNEL_WEBHOOK_MAX_BYTES` changes it.
   Recompile a daemon to pick this up.
 
-- **A managed daemon's federation route reads at most a fixed number of bytes.**
-  With federation on, a `POST /federation` request whose body is larger is
-  answered with 413 before the peer is authorized; the limit is 1 MiB, and
-  `createGatewayServer`'s `federation.maxBodyBytes` changes it. Recompile a
-  daemon to pick this up.
+- **A managed daemon checks a JSON-RPC bearer before it reads the body, and
+  reads at most a fixed number of bytes of a federation request.** A JSON-RPC
+  request without a valid bearer is answered with 401, whatever its body. With
+  federation on, a `POST /federation` request whose body is larger is answered
+  with 413 before the peer is authorized; the limit is 1 MiB, and code that
+  calls `createGatewayServer` itself can set `federation.maxBodyBytes`.
+  Recompile a daemon to pick this up.
 
 ## [0.8.1] - 2026-11-08
 

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-einvoice",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic fixed-format financial files: e-invoice XML and bank payment batches, byte-exact",
   "main": "src/index.ts",

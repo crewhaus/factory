@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-capability",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "ToolRegistry: what builtin tools exist, and which of them this harness is actually running",
   "main": "src/index.ts",

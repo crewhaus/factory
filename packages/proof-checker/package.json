@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/proof-checker",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "Pluggable proof checkers behind the proven rung: a dependency-free certificate checker plus SMT (Z3) and Lean 4 sandbox adapters",
   "main": "src/index.ts",
