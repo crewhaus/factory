@@ -57,6 +57,9 @@ const CLI_SRC = join(import.meta.dir, "..", "..", "..", "apps", "cli", "src");
  *   · memory, wiki, knowledge, dream, migrate, watchme — the dispatch in
  *     `apps/cli/src/index.ts`, with one flag schema per noun
  *     (`arg-schemas.ts`, `DREAM_CLI_SCHEMA` in `dream-cli.ts`).
+ *   · state — `STATE_SCHEMA` in `apps/cli/src/arg-schemas.ts`, one flag list
+ *     across backup, restore, clear and trash, and the `state` dispatch in
+ *     `apps/cli/src/index.ts`.
  *   · approvals — `APPROVALS_SCHEMA` in `apps/cli/src/arg-schemas.ts`, one flag
  *     list across its verbs, and the action list in `apps/cli/src/index.ts`.
  *
@@ -65,8 +68,44 @@ const CLI_SRC = join(import.meta.dir, "..", "..", "..", "apps", "cli", "src");
  * non-zero exit with an "unknown flag" message. A noun with one schema accepts
  * the same flags on every verb.
  */
-const MEMORY_FLAGS = ["spec", "query", "yes", "compact", "help"];
-const WIKI_FLAGS = ["spec", "tags", "status", "k", "help"];
+const MEMORY_FLAGS = [
+  "spec",
+  "query",
+  "yes",
+  "compact",
+  "help",
+  "reason",
+  "text",
+  "text-file",
+  "personal",
+  "not-personal",
+];
+const WIKI_FLAGS = [
+  "spec",
+  "tags",
+  "status",
+  "k",
+  "help",
+  "body-file",
+  "expect",
+  "title",
+  "undo",
+  "to",
+];
+const STATE_FLAGS = [
+  "out",
+  "exclude",
+  "into",
+  "merge",
+  "force",
+  "help",
+  "scope",
+  "session",
+  "spec",
+  "yes",
+  "expect",
+  "trash",
+];
 const KNOWLEDGE_FLAGS = ["root", "shared", "pull", "push", "dry-run", "no-redact", "help"];
 const DREAM_FLAGS = ["force", "help"];
 const MIGRATE_MEMORIES_FLAGS = ["dry-run", "help"];
@@ -118,8 +157,19 @@ const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly str
     show: MEMORY_FLAGS,
     forget: MEMORY_FLAGS,
     sweep: MEMORY_FLAGS,
+    correct: MEMORY_FLAGS,
+    mark: MEMORY_FLAGS,
   },
-  wiki: { list: WIKI_FLAGS, show: WIKI_FLAGS, search: WIKI_FLAGS, stats: WIKI_FLAGS },
+  wiki: {
+    list: WIKI_FLAGS,
+    show: WIKI_FLAGS,
+    search: WIKI_FLAGS,
+    stats: WIKI_FLAGS,
+    write: WIKI_FLAGS,
+    archive: WIKI_FLAGS,
+    rollback: WIKI_FLAGS,
+  },
+  state: { backup: STATE_FLAGS, restore: STATE_FLAGS, clear: STATE_FLAGS, trash: STATE_FLAGS },
   knowledge: { sync: KNOWLEDGE_FLAGS },
   dream: { run: DREAM_FLAGS, status: DREAM_FLAGS, init: DREAM_FLAGS },
   migrate: { memories: MIGRATE_MEMORIES_FLAGS },
@@ -233,6 +283,8 @@ describe("the dispatch table matches the CLI", () => {
     expect(memory?.[1]?.split(", ")).toEqual([...verbsOf("memory")]);
     const wiki = index.match(/wiki: unknown action [^\n]*supported: ([a-z, ]+)`/);
     expect(wiki?.[1]?.split(", ")).toEqual([...verbsOf("wiki")]);
+    const state = index.match(/state action must be one of ([a-z, ]+) \(got/);
+    expect(state?.[1]?.split(", ")).toEqual([...verbsOf("state")]);
     expect(index).toContain('knowledge action must be "sync"');
     expect(verbsOf("knowledge")).toEqual(["sync"]);
     expect(index).toContain(
@@ -252,6 +304,7 @@ describe("the dispatch table matches the CLI", () => {
     const dream = readFileSync(join(CLI_SRC, "dream-cli.ts"), "utf8");
     expect(schemaFlags(schemas, "MEMORY_SCHEMA")).toEqual(MEMORY_FLAGS);
     expect(schemaFlags(schemas, "WIKI_SCHEMA")).toEqual(WIKI_FLAGS);
+    expect(schemaFlags(schemas, "STATE_SCHEMA")).toEqual(STATE_FLAGS);
     expect(schemaFlags(schemas, "KNOWLEDGE_SCHEMA")).toEqual(KNOWLEDGE_FLAGS);
     expect(schemaFlags(schemas, "MIGRATE_MEMORIES_SCHEMA")).toEqual(MIGRATE_MEMORIES_FLAGS);
     expect(schemaFlags(schemas, "WATCHME_SCHEMA")).toEqual(WATCHME_FLAGS);
@@ -261,7 +314,10 @@ describe("the dispatch table matches the CLI", () => {
   test("the checker rejects the memory commands that never existed", () => {
     expect(rejectionReason("crewhaus memory remember")).toContain('unknown memory verb "remember"');
     expect(rejectionReason("crewhaus remember")).toContain("no dispatch table");
-    expect(rejectionReason("crewhaus wiki write")).toContain('unknown wiki verb "write"');
+    expect(rejectionReason("crewhaus wiki delete")).toContain('unknown wiki verb "delete"');
+    // `wiki write` exists now, with its own flags.
+    expect(rejectionReason("crewhaus wiki write <slug> --body-file <file> --expect 0")).toBeNull();
+    expect(rejectionReason("crewhaus state trash")).toBeNull();
     expect(rejectionReason("crewhaus run (then /reflect)")).toContain("no dispatch table");
     expect(rejectionReason("crewhaus memory list --nope")).toContain('unknown flag "--nope"');
     // …and accepts the forms the screens show.
@@ -413,9 +469,16 @@ describe("every twin this server proposes would run if pasted", () => {
           seen.push(`${route.key}: ${verb}`);
         }
       }
-      // Pinned, so this guard cannot go quiet: fifteen reads swept twice.
+      // Pinned, so this guard cannot go quiet: fifteen reads swept twice. The
+      // trash list (on both harnesses) and the empty wiki now name their verbs.
       expect(reads.length).toBe(15);
-      expect(seen.length).toBe(15);
+      expect(seen.length).toBe(18);
+      expect(seen.filter((v) => v.endsWith(": crewhaus state trash"))).toHaveLength(2);
+      expect(
+        seen.filter((v) =>
+          v.endsWith(": crewhaus wiki write <slug> --body-file <file> --expect 0"),
+        ),
+      ).toHaveLength(1);
     } finally {
       await t.stop();
     }

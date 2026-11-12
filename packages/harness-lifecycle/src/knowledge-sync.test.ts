@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createMemoryStore } from "@crewhaus/memory-store";
 import {
   IDENTITY_REDACTOR,
   KNOWLEDGE_MARKER_RELPATH,
@@ -13,12 +14,16 @@ import {
   formatPushReport,
   fragmentContentHash,
   harnessOptedIn,
+  harnessSpecName,
   looksLikeSecret,
   maskKnowledgeSecrets,
   memoryContentHash,
   planPull,
   planPush,
+  readHarnessFactStates,
+  readHarnessFacts,
   readHarnessMemories,
+  readRetractions,
   readSharedFragments,
   readSharedMemories,
   splitProvenanceHeader,
@@ -164,6 +169,7 @@ describe("push → pull round-trip", () => {
     const cliDir = join(root, "cli");
     mkdirSync(botDir, { recursive: true });
     mkdirSync(cliDir, { recursive: true });
+    writeFileSync(join(cliDir, "crewhaus.yaml"), "name: concierge\nshape: cli\n");
     seedMemory(botDir, [{ text: "prod lesson", tags: ["ops"] }]);
 
     // push from bot
@@ -187,15 +193,18 @@ describe("push → pull round-trip", () => {
       harnessFragmentHashes: new Set(),
     });
     expect(pullPlan.memories).toHaveLength(1);
-    applyPull(cliDir, pullPlan, NOW);
+    await applyPull(cliDir, pullPlan, NOW, { specName: harnessSpecName(cliDir) });
 
-    const sharedFile = join(cliDir, ".crewhaus", "memories", "shared.jsonl");
-    expect(existsSync(sharedFile)).toBe(true);
-    const pulled = JSON.parse(readFileSync(sharedFile, "utf-8").trim());
+    // It lands in the harness's own spec store, not a side file.
+    expect(existsSync(join(cliDir, ".crewhaus", "memories", "shared.jsonl"))).toBe(false);
+    const specFile = join(cliDir, ".crewhaus", "memories", "concierge.jsonl");
+    const pulled = JSON.parse(readFileSync(specFile, "utf-8").trim());
     expect(pulled.text).toBe("prod lesson");
     expect(pulled.tags).toContain("shared:bot");
-    // a valid MemoryEntry shape for the memory-store to load
-    expect(pulled.id).toMatch(/^mem_shared_/);
+    // A valid fact id the store's own rule accepts, derived from the content hash.
+    const hash = memoryContentHash("prod lesson", ["ops"]);
+    expect(pulled.id).toBe(`mem_${hash.slice(0, 16)}`);
+    expect(pulled.provenance.origin).toEqual({ kind: "sync", harness: "bot", contentHash: hash });
   });
 
   test("a second push of the same memory is a no-op (dedupe)", async () => {
@@ -450,5 +459,264 @@ describe("shared-store validation on pull (F6)", () => {
     expect(frags).toHaveLength(1);
     expect(frags[0]?.contentHash).toBe(realHash);
     expect(frags[0]?.contents).toContain("a shared lesson");
+  });
+});
+
+describe("knowledge sync integrity", () => {
+  const NOW = () => new Date("2026-07-02T00:00:00.000Z");
+
+  async function push(harnessDir: string, shared: string, harness: string) {
+    const states = await readHarnessFactStates(harnessDir);
+    const plan = await planPush({
+      harness,
+      memories: states.live,
+      prompts: [],
+      existingMemoryHashes: new Set(readSharedMemories(shared).map((m) => m.contentHash)),
+      existingFragmentHashes: new Set(),
+      redact: IDENTITY_REDACTOR,
+      now: NOW,
+      deadFacts: states.dead,
+      sharedMemories: readSharedMemories(shared),
+      existingRetractions: readRetractions(shared),
+    });
+    applyPush(shared, plan, NOW);
+    return plan;
+  }
+
+  async function pull(harnessDir: string, shared: string) {
+    const plan = planPull({
+      sharedMemories: readSharedMemories(shared),
+      sharedFragments: [],
+      harnessMemoryHashes: new Set(),
+      harnessFragmentHashes: new Set(),
+    });
+    return applyPull(harnessDir, plan, NOW, {
+      specName: harnessSpecName(harnessDir),
+      retractions: readRetractions(shared),
+    });
+  }
+
+  function harness(name: string, spec?: string): string {
+    const dir = join(root, name);
+    mkdirSync(dir, { recursive: true });
+    if (spec !== undefined) writeFileSync(join(dir, "crewhaus.yaml"), `name: ${spec}\n`);
+    return dir;
+  }
+
+  test("superseded, expired and personal facts are not pushed; live ones carry their origin", async () => {
+    const bot = harness("bot", "bot");
+    const now = { t: Date.parse("2026-07-01T00:00:00.000Z") };
+    const store = createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+      now: () => new Date(now.t),
+    });
+    const kept = await store.remember("deploys run at 9am", ["ops"]);
+    const wrong = await store.remember("the office is on floor 3");
+    await store.supersede(wrong.id, "the office is on floor 4", { reason: "moved" });
+    await store.remember("a token that lapses", [], { ttlMs: 10 });
+    const personal = await store.remember("Dana prefers tea");
+    await store.annotate(personal.id, { category: "person" });
+    now.t += 1000;
+    const facts = await readHarnessFacts(bot);
+    expect(facts.map((f) => f.text).sort()).toEqual([
+      "deploys run at 9am",
+      "the office is on floor 4",
+    ]);
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    const lines = readSharedMemories(shared);
+    expect(lines.map((m) => m.text).sort()).toEqual([
+      "deploys run at 9am",
+      "the office is on floor 4",
+    ]);
+    expect(lines.find((m) => m.text === "deploys run at 9am")?.origin).toEqual({
+      harness: "bot",
+      fact: kept.id,
+    });
+  });
+
+  test("a pulled fact gets mem_<16 hex> in <spec>.jsonl, and recall finds it; a second pull adds nothing", async () => {
+    const bot = harness("bot", "bot");
+    const cli = harness("cli", "concierge");
+    await createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+    }).remember("the release train leaves on Thursdays", ["ops"]);
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    const first = await pull(cli, shared);
+    expect(first.added).toHaveLength(1);
+    expect(first.added[0]).toMatch(/^mem_[0-9a-f]{16}$/);
+    const store = createMemoryStore({
+      specName: "concierge",
+      rootDir: join(cli, ".crewhaus", "memories"),
+    });
+    expect((await store.recall("release train", 5)).map((r) => r.entry.id)).toEqual([
+      first.added[0] as string,
+    ]);
+    const second = await pull(cli, shared);
+    expect(second.added).toEqual([]);
+    expect(await store.size()).toBe(1);
+  });
+
+  test("a retraction tombstones the pulled copy, and only the sharer's copy", async () => {
+    const bot = harness("bot", "bot");
+    const cli = harness("cli", "concierge");
+    const botStore = createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+    });
+    const wrong = await botStore.remember("the office is on floor 3");
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    await pull(cli, shared);
+    const cliStore = createMemoryStore({
+      specName: "concierge",
+      rootDir: join(cli, ".crewhaus", "memories"),
+    });
+    expect(await cliStore.size()).toBe(1);
+
+    await botStore.supersede(wrong.id, "the office is on floor 4", { reason: "moved" });
+    const plan = await push(bot, shared, "bot");
+    expect(plan.retractions.map((r) => r.reason)).toEqual(["superseded"]);
+    // A re-run retracts nothing twice.
+    expect((await push(bot, shared, "bot")).retractions).toEqual([]);
+    expect(readRetractions(shared)).toHaveLength(1);
+
+    const outcome = await pull(cli, shared);
+    expect(outcome.retracted).toHaveLength(1);
+    const items = await cliStore.list();
+    expect(items.filter((i) => i.status === "live").map((i) => i.entry.text)).toEqual([
+      "the office is on floor 4",
+    ]);
+    expect(readFileSync(cliStore.path(), "utf-8")).toContain("retracted by bot");
+  });
+
+  test("a fact corrected and then compacted away is still retracted, once", async () => {
+    const bot = harness("bot", "bot");
+    const botStore = createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+    });
+    const wrong = await botStore.remember("the office is on floor 3");
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    await botStore.supersede(wrong.id, "the office is on floor 4", { reason: "moved" });
+    expect((await botStore.compact()).archived).toBe(2);
+    expect(readFileSync(botStore.path(), "utf-8")).not.toContain("floor 3");
+    const plan = await push(bot, shared, "bot");
+    expect(plan.retractions.map((r) => [r.contentHash, r.reason])).toEqual([
+      [memoryContentHash("the office is on floor 3", []), "superseded"],
+    ]);
+    expect((await push(bot, shared, "bot")).retractions).toEqual([]);
+  });
+
+  test("a pulled fact a person forgot stays forgotten after a compaction", async () => {
+    const bot = harness("bot", "bot");
+    const cli = harness("cli", "concierge");
+    await createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+    }).remember("the office is on floor 3");
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    const [id] = (await pull(cli, shared)).added;
+    const cliStore = createMemoryStore({
+      specName: "concierge",
+      rootDir: join(cli, ".crewhaus", "memories"),
+    });
+    await cliStore.forget(id as string, { reason: "wrong" });
+    await cliStore.compact();
+    expect((await pull(cli, shared)).added).toEqual([]);
+    expect(await cliStore.size()).toBe(0);
+  });
+
+  test("a pulled fact a person corrected stays corrected after a compaction", async () => {
+    const bot = harness("bot", "bot");
+    const cli = harness("cli", "concierge");
+    await createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+    }).remember("the office is on floor 3");
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    const [id] = (await pull(cli, shared)).added;
+    const cliStore = createMemoryStore({
+      specName: "concierge",
+      rootDir: join(cli, ".crewhaus", "memories"),
+    });
+    await cliStore.supersede(id as string, "the office is on floor 4", { reason: "moved" });
+    await cliStore.compact();
+    expect((await pull(cli, shared)).added).toEqual([]);
+    const live = (await cliStore.list()).filter((i) => i.status === "live");
+    expect(live.map((i) => i.entry.text)).toEqual(["the office is on floor 4"]);
+  });
+
+  test("a retraction from another harness leaves the pulled copy alone; a malformed line is skipped", async () => {
+    const bot = harness("bot", "bot");
+    const cli = harness("cli", "concierge");
+    await createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+    }).remember("a shared fact");
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    await pull(cli, shared);
+    const hash = readSharedMemories(shared)[0]?.contentHash as string;
+    writeFileSync(
+      join(shared, "retractions.jsonl"),
+      `${JSON.stringify({ contentHash: hash, harness: "intruder", at: "t", reason: "superseded" })}\n{not json\n${JSON.stringify({ contentHash: "zz", harness: "bot", at: "t", reason: "superseded" })}\n`,
+    );
+    expect(readRetractions(shared)).toHaveLength(1);
+    expect((await pull(cli, shared)).retracted).toEqual([]);
+    expect(
+      await createMemoryStore({
+        specName: "concierge",
+        rootDir: join(cli, ".crewhaus", "memories"),
+      }).size(),
+    ).toBe(1);
+  });
+
+  test("the pull refuses without a spec name, writing nothing", async () => {
+    const bot = harness("bot", "bot");
+    const cli = harness("cli");
+    await createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+    }).remember("x");
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    expect(harnessSpecName(cli)).toBeUndefined();
+    await expect(pull(cli, shared)).rejects.toThrow(
+      "Pull needs this harness's crewhaus.yaml to know which memory store to fill.",
+    );
+    expect(existsSync(join(cli, ".crewhaus"))).toBe(false);
+  });
+
+  test("harnessSpecName reads the top-level name tolerantly", () => {
+    const dir = harness("h");
+    const cases: Array<[string, string | undefined]> = [
+      ["name: support-bot\n", "support-bot"],
+      ['name: "quoted"\n', "quoted"],
+      ["name: spaced # comment\n", "spaced"],
+      ["shape: cli\n  name: nested\n", undefined],
+      ["name: ../evil\n", undefined],
+      ["name:\n", undefined],
+    ];
+    for (const [text, want] of cases) {
+      writeFileSync(join(dir, "crewhaus.yaml"), text);
+      expect(harnessSpecName(dir)).toBe(want);
+    }
+  });
+
+  test("validateSharedMemory carries a well-typed origin and drops an ill-typed one", () => {
+    const base = { text: "t", tags: [], provenance: { harness: "a", pushedAt: "x" } };
+    const rec = { ...base, contentHash: memoryContentHash("t", []) };
+    const good = validateSharedMemory({ ...rec, origin: { harness: "a", fact: "mem_1" } });
+    expect(good.ok && good.memory.origin).toEqual({ harness: "a", fact: "mem_1" });
+    const bad = validateSharedMemory({ ...rec, origin: { harness: 7 } });
+    expect(bad.ok).toBe(true);
+    expect(bad.ok && bad.memory.origin).toBeUndefined();
   });
 });

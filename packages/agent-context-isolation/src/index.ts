@@ -259,6 +259,12 @@ export type SubAgentMemorySeam = {
  */
 export type SubAgentContinuitySeam = {
   readonly loadPlan: () => Promise<string | null>;
+  /**
+   * The continuity store's own files, which the child's floor keeps from
+   * every tool but the store's own, as the parent's does. Data only, so the
+   * seam stays read-only.
+   */
+  readonly storeFiles?: readonly string[];
 };
 
 /**

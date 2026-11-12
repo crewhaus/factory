@@ -17,6 +17,7 @@
   "dependencies": {
     "@crewhaus/audit-log": "workspace:*",
     "@crewhaus/data-retention-engine": "workspace:*",
+    "@crewhaus/memory-store": "workspace:*",
     "@crewhaus/session-store": "workspace:*"
   },
   "license": "Apache-2.0",

@@ -1164,12 +1164,15 @@ export const continuity: M3Handler = async (ctx) => {
  * the files it holds (paths relative to `.crewhaus`) and whether restoring
  * it would collide with a file that came back since.
  */
+/** The CLI twin of the trash list. */
+const TRASH_VERB = "crewhaus state trash";
+
 export const continuityTrash: M3Handler = async (ctx) => {
   const dir = harnessDirOf(ctx);
   const crewhaus = containedPath(ctx, [".crewhaus"]);
   if (crewhaus === undefined || !existsSync(join(crewhaus, "trash"))) {
     return {
-      ...readBase(false, "Nothing has been cleared yet.", null),
+      ...readBase(false, "Nothing has been cleared yet.", TRASH_VERB),
       snapshots: [],
       purgeAfterDays: 7,
     };
@@ -1178,7 +1181,11 @@ export const continuityTrash: M3Handler = async (ctx) => {
   try {
     listed = await listTrash(crewhaus);
   } catch (err) {
-    return { ...readBase(false, describeFailure(err), null), snapshots: [], purgeAfterDays: 7 };
+    return {
+      ...readBase(false, describeFailure(err), TRASH_VERB),
+      snapshots: [],
+      purgeAfterDays: 7,
+    };
   }
   const nowMs = ctx.now();
   const snapshots = listed
@@ -1204,7 +1211,7 @@ export const continuityTrash: M3Handler = async (ctx) => {
     ...readBase(
       snapshots.length > 0,
       snapshots.length === 0 ? "the trash directory exists but holds no snapshots" : null,
-      null,
+      TRASH_VERB,
     ),
     snapshots,
     purgeAfterDays: 7,

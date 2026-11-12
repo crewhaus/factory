@@ -446,3 +446,33 @@ describe("handoff (store surface)", () => {
     );
   });
 });
+
+describe("a read that overlaps another session's write", () => {
+  test("every listGoals() while another task updates the goal returns it", async () => {
+    // A write renames a new goals.yaml over the old one, so an unlocked read
+    // can open a different file from the one it checked (code `changed`).
+    // The read is repeated; bounded by the writes, not by a clock.
+    const writer = makeStore();
+    const reader = makeStore();
+    await writer.writeGoal({ title: "coverage", target: 1000, current: 0 });
+    const failures: string[] = [];
+    let reads = 0;
+    let done = false;
+    const writes = (async () => {
+      for (let i = 1; i <= 150; i++) await writer.updateGoal("goal-0001", { current: i });
+      done = true;
+    })();
+    while (!done) {
+      try {
+        const goals = await reader.listGoals();
+        if (goals[0]?.id !== "goal-0001") failures.push("goal missing");
+      } catch (err) {
+        failures.push(String(err));
+      }
+      reads++;
+    }
+    await writes;
+    expect(reads).toBeGreaterThan(0);
+    expect(failures).toEqual([]);
+  }, 20_000); // 150 locked writes; slow on a loaded CI runner.
+});

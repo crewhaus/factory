@@ -189,21 +189,23 @@ describe("trust tiers", () => {
   });
 
   test("a security surface on a step, a node or a role is human-owned", () => {
-    for (const [target, path] of [
-      ["workflow", ["steps", "0", "tools"]],
-      ["workflow", ["steps", "0", "tool_config"]],
-      ["workflow", ["steps", "0", "model"]],
-      ["workflow", ["steps", "0", "model_pool", "policy"]],
-      ["workflow", ["steps", "0", "model_pool", "learning"]],
-      ["workflow", ["steps", "0", "permissions", "allow"]],
-      ["workflow", ["steps", "0", "mcp_servers", "docs"]],
-      ["graph", ["nodes", "a", "tools"]],
-      ["graph", ["nodes", "b", "hitl"]],
-      ["crew", ["roles", "lead", "tools"]],
+    for (const [target, path, tunable] of [
+      ["workflow", ["steps", "0", "tools"], false],
+      ["workflow", ["steps", "0", "tool_config"], false],
+      ["workflow", ["steps", "0", "model"], false],
+      ["workflow", ["steps", "0", "model_pool", "policy"], true],
+      ["workflow", ["steps", "0", "model_pool", "learning"], true],
+      ["workflow", ["steps", "0", "permissions", "allow"], false],
+      ["workflow", ["steps", "0", "mcp_servers", "docs"], true],
+      ["graph", ["nodes", "a", "tools"], false],
+      ["graph", ["nodes", "b", "hitl"], false],
+      ["crew", ["roles", "lead", "tools"], false],
     ] as const) {
-      // Inside the optimizer's table, so only the security surface can answer.
+      // Where the optimizer's table admits the path, only the security surface
+      // can answer; a grant, a model or a gate the table no longer reaches by
+      // prefix (#514) is human-owned on both counts.
       expect(`${target}:${path.join(".")}:${isAutoTunable(target, [...path])}`).toBe(
-        `${target}:${path.join(".")}:true`,
+        `${target}:${path.join(".")}:${tunable}`,
       );
       const row = classifyPath(target, [...path]);
       expect(`${target}:${path.join(".")}:${row.tier}:${row.securitySurface}`).toBe(

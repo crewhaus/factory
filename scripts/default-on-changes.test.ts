@@ -57,6 +57,7 @@ import { runDaemonCommand } from "../apps/cli/src/daemon-cmd";
 import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
+import { createContinuityStore } from "../packages/continuity-store/src/index";
 import {
   DECISION_LOG_KEYS,
   EXIT_FOR_ERROR,
@@ -78,6 +79,7 @@ import {
 import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import type { IrChannelV0, IrManagedV0 } from "../packages/ir/src/index";
+import { _setCompactSeamsForTest, createMemoryStore } from "../packages/memory-store/src/index";
 import {
   type RuleSet,
   type ToolCallContext,
@@ -86,7 +88,11 @@ import {
 } from "../packages/permission-engine/src/index";
 import { runPreflight } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
-import { credentialFileRoots, runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
+import {
+  credentialFileRoots,
+  runtimeStateRoots,
+  storeFileRoots,
+} from "../packages/runtime-core/src/state-roots";
 import {
   allowSingleOwner,
   createPendingApprovalStore,
@@ -94,7 +100,13 @@ import {
   generateApprovalId,
 } from "../packages/session-store/src/index";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
-import { OPTIMIZER_REFUSED_LEAVES } from "../packages/spec-patch/src/index";
+import {
+  OPTIMIZER_REFUSED_LEAVES,
+  STRUCTURAL_SEGMENTS,
+  applySpecEdits,
+  validatePatch,
+} from "../packages/spec-patch/src/index";
+import { parseSpec } from "../packages/spec/src/index";
 import { emitChannelBot } from "../packages/target-channel-bot/src/index";
 import { emitManaged } from "../packages/target-managed/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
@@ -108,6 +120,7 @@ import { planPin } from "../packages/tool-evalops/src/lib/pin";
 import { harnessRegister } from "../packages/tool-fleet/src/index";
 import { TOOL_REGISTRY } from "../packages/tool-registry-manifest/src/generated";
 import { factCrossCheck } from "../packages/tool-verify/src/index";
+import { createWikiTools } from "../packages/tool-wiki/src/index";
 
 const ROOT = dirname(import.meta.dir);
 /** 0.8.0's list, as released. It does not change. */
@@ -147,6 +160,16 @@ const SHIPPED_REFUSED_LEAVES = [
   "model_pool.learning.seed",
   "provability.level",
   "provability.on_fail",
+] as const;
+/** The segments the optimizer reached only by exact entry in 0.8.x: a later one is a default-on change. */
+const SHIPPED_STRUCTURAL_SEGMENTS = [
+  "model_pool",
+  "judge",
+  "sub_agents",
+  "temperature",
+  "model_tiers",
+  "model_fallbacks",
+  "circuit_breaker",
 ] as const;
 
 /**
@@ -1395,6 +1418,57 @@ describe("the release notes name every change a harness without provability: see
     expect(bullet).toContain("measured nothing");
     expect(bullet).toContain("every case errored");
   });
+
+  test("the optimizer: a whole-block value is admitted leaf by leaf, and every later structural segment is named", () => {
+    const added = STRUCTURAL_SEGMENTS.filter(
+      (seg) => !(SHIPPED_STRUCTURAL_SEGMENTS as readonly string[]).includes(seg),
+    );
+    expect(added.length > 0).toBe(true);
+    // A two-step workflow; a whole-steps value that changes step 0's model is
+    // refused at both optimizer entry points, and the same value with the
+    // model kept and the prompt changed passes both (a control that fails
+    // means the probe reached nothing).
+    const yaml = [
+      "name: w",
+      "target: workflow",
+      "model: base-model",
+      "steps:",
+      "  - name: one",
+      "    instructions: Do one.",
+      "    model: m1",
+      "  - name: two",
+      "    instructions: Do two.",
+      "",
+    ].join("\n");
+    const spec = parseSpec(yaml);
+    const value = (model: string, instructions: string) => [
+      { name: "one", instructions, model },
+      { name: "two", instructions: "Do two." },
+    ];
+    const probe = (steps: unknown): string => {
+      const messages: string[] = [];
+      try {
+        validatePatch(spec, { target: "workflow", path: ["steps"], op: "replace", value: steps });
+      } catch (err) {
+        messages.push((err as Error).message);
+      }
+      try {
+        applySpecEdits(yaml, [{ path: ["steps"], value: steps }], { restrictToOptimizable: true });
+      } catch (err) {
+        messages.push((err as Error).message);
+      }
+      return messages.join("\n");
+    };
+    expect(probe(value("m1", "Do one, carefully."))).toBe("");
+    const refused = probe(value("m2", "Do one."));
+    expect(refused.split("\n").filter((m) => m.includes('"steps.0.model"'))).toHaveLength(2);
+    // Named in a later list, each segment in backticks.
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("`model_pool.candidates`"),
+      ) ?? "";
+    expect(added.filter((seg) => !bullet.includes(`\`${seg}\``))).toEqual([]);
+  });
 });
 
 /**
@@ -2112,4 +2186,165 @@ describe("the release notes name the federation body limit", () => {
     expect(bullet).toContain("413 before the peer is authorized");
     expect(bullet).toContain("1 MiB");
   }, 20_000); // sends 1 MiB through a real socket; slow on a loaded CI runner
+});
+
+/**
+ * The knowledge stores' default-on changes. Each is found in the code that
+ * makes it: the continuity store's own files are whatever its `storeFiles()`
+ * names, compaction is driven against a temp store, and the wiki guard is the
+ * real `createWikiTools`.
+ */
+describe("the release notes name what the knowledge stores do by default", () => {
+  test("the floor: the continuity store's files are named, Write is denied there, StateImport's default is not", () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-continuity-")));
+    try {
+      const files = createContinuityStore({
+        specName: "s",
+        rootDir: join(cwd, ".crewhaus", "state"),
+      }).storeFiles();
+      // The names a person edits by hand; the lock, the Thredz goal map and the
+      // session directory ride along without a name of their own.
+      const named = files
+        .map((f) => basename(f))
+        .filter((n) => !n.startsWith(".") && n !== "sessions" && n !== "thredz-goals.json");
+      expect(named).toEqual(["focus.md", "goals.yaml", "plans", "handoff.md"]);
+      const floor = bullets.find((b) => b.includes("`.crewhaus/knowledge.json`")) ?? "";
+      expect(floor).toContain("`.crewhaus/state/<spec>/`");
+      for (const name of named) {
+        expect({ name, named: floor.includes(`\`${name}\``) }).toEqual({ name, named: true });
+      }
+      expect(floor).toContain("`StateImport`");
+      expect(floor).toContain("`Bash`");
+      expect(floor).toContain("`RunCommand`");
+
+      const protectedFiles = storeFileRoots(files, cwd);
+      const rules: RuleSet = {
+        ...emptyRuleSet,
+        flag: [{ type: "alwaysAllow", pattern: "*", source: "flag" }],
+      };
+      const write: ToolCallContext = {
+        toolName: "Write",
+        input: { path: ".crewhaus/state/s/focus.md", content: "x" },
+        operativeValues: [
+          {
+            kind: "path",
+            canonical: [".crewhaus/state/s/focus.md", join(cwd, ".crewhaus/state/s/focus.md")],
+          },
+        ],
+        readOnly: false,
+        destructive: true,
+      };
+      const stateImport: ToolCallContext = {
+        toolName: "StateImport",
+        input: { stateDir: ".crewhaus/state", mode: "merge" },
+        operativeValues: [
+          {
+            kind: "path",
+            canonical: [".crewhaus/state", join(cwd, ".crewhaus/state")],
+            beneath: [".crewhaus/state/", "./.crewhaus/state/", `${join(cwd, ".crewhaus/state")}/`],
+          },
+        ],
+        readOnly: false,
+        destructive: true,
+        checksOwnTargets: true,
+      };
+      // A tool that acts beneath the store's directory and does not check its
+      // own targets (GitWorktreeAdd's `path`) is denied.
+      const worktreeAdd: ToolCallContext = {
+        toolName: "GitWorktreeAdd",
+        input: { path: ".crewhaus/state/s" },
+        operativeValues: [
+          {
+            kind: "path",
+            canonical: [".crewhaus/state/s", join(cwd, ".crewhaus/state/s")],
+            beneath: [".crewhaus/state/s/", `${join(cwd, ".crewhaus/state/s")}/`],
+          },
+        ],
+        readOnly: false,
+        destructive: true,
+      };
+      expect(evaluateWithReason(write, "auto", rules, { protectedFiles }).decision).toBe("deny");
+      expect(evaluateWithReason(worktreeAdd, "auto", rules, { protectedFiles }).decision).toBe(
+        "deny",
+      );
+      expect(evaluateWithReason(stateImport, "auto", rules, { protectedFiles }).decision).toBe(
+        "allow",
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("fact compaction archives what it drops, keeps the live set, and keeps a fact remembered meanwhile", async () => {
+    const rootDir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-compact-")));
+    try {
+      const store = createMemoryStore({ specName: "s", rootDir });
+      const keep = await store.remember("kept");
+      const gone = await store.remember("gone");
+      await store.forget(gone.id, { reason: "stale" });
+      const before = readFileSync(store.path(), "utf8")
+        .split("\n")
+        .filter((l) => l !== "");
+      const dropped = before.filter((l) => !l.includes(keep.id));
+      let late = "";
+      _setCompactSeamsForTest({
+        afterSnapshot: async () => {
+          late = (await store.remember("remembered meanwhile")).id;
+        },
+      });
+      try {
+        await store.compact();
+      } finally {
+        _setCompactSeamsForTest(undefined);
+      }
+      const history = (await store.history()).map((h) => JSON.stringify(h.line));
+      for (const line of dropped) {
+        const canonical = JSON.stringify(JSON.parse(line));
+        expect(history.filter((h) => h === canonical)).toHaveLength(1);
+      }
+      const live = (await store.list()).filter((i) => i.status === "live").map((i) => i.entry.id);
+      const file = readFileSync(store.path(), "utf8")
+        .split("\n")
+        .filter((l) => l !== "")
+        .map((l) => (JSON.parse(l) as { id: string }).id);
+      expect(file).toEqual(live);
+      expect(live).toEqual([keep.id, late]);
+      const bullet =
+        defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+          b.includes("`.crewhaus/memories/archive/"),
+        ) ?? "";
+      expect(bullet).toContain("`.crewhaus/memories/.<spec>.lock`");
+      expect(bullet).toContain("Upgrade every CrewHaus install");
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("wiki_write refuses an unread person-written version, and lands after wiki_get", async () => {
+    const rootDir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-wiki-")));
+    try {
+      const bundle = createWikiTools({ specName: "s", rootDir });
+      await bundle.store.write({
+        slug: "faq",
+        title: "FAQ",
+        body: "a person's text",
+        author: { kind: "operator", via: "cli" },
+      });
+      const rc = createRunContext();
+      const edit = { slug: "faq", title: "FAQ", body: "an agent's text" };
+      const refused = String(await bundle.write.execute(edit, { runContext: rc }));
+      expect(refused).toContain("was corrected by a person");
+      expect((await bundle.store.get("faq"))?.body).toBe("a person's text");
+      await bundle.get.execute({ slug: "faq" }, { runContext: rc });
+      expect(String(await bundle.write.execute(edit, { runContext: rc }))).toContain("at v2");
+      const bullet =
+        defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+          b.includes("keeps a person's edit"),
+        ) ?? "";
+      expect(bullet).toContain("`wiki_write`");
+      expect(bullet).toContain("`wiki_get`");
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
 });

@@ -12,6 +12,9 @@
       "path": "../data-retention-engine"
     },
     {
+      "path": "../memory-store"
+    },
+    {
       "path": "../session-store"
     }
   ],

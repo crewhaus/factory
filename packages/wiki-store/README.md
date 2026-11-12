@@ -34,7 +34,8 @@ const hits = await wiki.recall("csv delimiter", 6);   // hybrid + one-hop
 `stats` — plus one extension: `semanticSearch?` exists when an `embedder`
 was supplied (the thredz-parity `wiki_semantic_search` tool needs a pure
 cosine ranking with a `minScore` floor, which the fused recall score cannot
-express).
+express). For a person's edits: `setStatus` (archive or publish, metadata
+only) and `getVersion` (a superseded version from `versions/`).
 
 ## Optimistic concurrency — the Thredz PATCH contract
 
@@ -70,7 +71,15 @@ lands atomically (tmp+rename).
   cosine similarity when an embedder is present.
 - `setSignals` (verified/confidence) is metadata-only: **no version bump,
   no snapshot**. A content `write()` RESETS `verified` to false — a new
-  version is a new, not-yet-fact-checked claim.
+  version is a new, not-yet-fact-checked claim. With `{ expectedVersion }`
+  it lands only on that version.
+- `setStatus` is metadata-only too: the body bytes, the version and
+  `verified` stay, so an article of any length archives; a version mismatch
+  throws `WikiVersionConflictError`.
+- A version a person wrote carries `author: { kind: "operator", via }`. The
+  next version never inherits it, and a version written with it does not
+  carry an agent's `createdBy` forward. `@crewhaus/tool-wiki` refuses an
+  agent's overwrite of a person's version the session never read.
 - `index.json` is a derived cache: reads fall back to a scan of
   `articles/` when it is missing or corrupt, and every mutation rewrites
   it from that authoritative scan (crash-safe by construction).

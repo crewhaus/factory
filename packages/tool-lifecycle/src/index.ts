@@ -53,6 +53,7 @@ import {
   AUDIT_CHAIN_EXCLUSION_REASON,
   InvalidRetentionDateError,
   KNOWLEDGE_MARKER_RELPATH,
+  PULL_NEEDS_SPEC_REASON,
   RETENTION_CONFIG_RELPATH,
   RETIREMENT_LOG_FILENAME,
   RetentionConfigError,
@@ -65,13 +66,16 @@ import {
   formatPlan,
   fragmentContentHash,
   harnessOptedIn,
+  harnessSpecName,
   openHarnessRecordStore,
   parseRetentionDate,
   planPull,
   planPush,
+  readHarnessFactStates,
   readHarnessGraders,
   readHarnessMemories,
   readHarnessPrompts,
+  readRetractions,
   runRetentionExport,
   runRetentionPurge,
   runRetentionSweep,
@@ -87,9 +91,9 @@ import {
 import { z } from "zod";
 import {
   NO_PII_PASS_REASON,
-  PULLED_MEMORIES_RELPATH,
   SHARED_MANIFEST_RELPATH,
   SHARED_MEMORIES_RELPATH,
+  SHARED_RETRACTIONS_RELPATH,
   auditHarnessMemoryFiles,
   auditSharedFragments,
   auditSharedMemories,
@@ -97,6 +101,7 @@ import {
   landedSharedGraderHashes,
   makeRedactor,
   pulledFragmentRelPath,
+  pulledMemoriesRelPath,
   sharedFragmentRelPath,
 } from "./lib/knowledge";
 import {
@@ -1276,21 +1281,38 @@ export const knowledgeSync: RegisteredTool = buildTool({
       if (input.allowWithoutPiiRedaction !== true) {
         return refusal(tool, "refused", NO_PII_PASS_REASON, common);
       }
+      // A push shares live, non-personal facts only, read through the
+      // harness's memory stores; corrected or expired ones are retracted.
+      let facts: Awaited<ReturnType<typeof readHarnessFactStates>>;
+      try {
+        facts = await readHarnessFactStates(harnessDir.value.real);
+      } catch (err) {
+        return refusal(
+          tool,
+          "unreadable",
+          `the harness's facts could not be read: ${(err as Error).message}`,
+          common,
+        );
+      }
       const plan = await planPush({
         harness: label,
-        memories: harnessMemories,
+        memories: facts.live,
         graders: harnessGraders,
         prompts: harnessPrompts,
         existingMemoryHashes: new Set(sharedMemories.value.memories.map((m) => m.contentHash)),
         existingFragmentHashes: new Set(sharedFragments.map((f) => f.contentHash)),
         redact: makeRedactor(),
         now: () => new Date(),
+        deadFacts: facts.dead,
+        sharedMemories: sharedMemories.value.memories,
+        existingRetractions: readRetractions(shared.value.real),
       });
       const total = plan.memories.length + plan.fragments.length;
       const planReport = {
         memories: plan.memories.length,
         fragments: plan.fragments.length,
         duplicates: plan.skippedDuplicates,
+        ...(plan.retractions.length > 0 ? { retractions: plan.retractions.length } : {}),
         // COUNT ONLY. The library's own report prints a 60-character preview
         // of each dropped memory; those are the artifacts that still looked
         // like a credential, so echoing them here would publish the secret
@@ -1310,6 +1332,7 @@ export const knowledgeSync: RegisteredTool = buildTool({
       // the preview too, so the refusal shows before the run that would write.
       const pushWrites = [
         ...(plan.memories.length > 0 ? [SHARED_MEMORIES_RELPATH] : []),
+        ...(plan.retractions.length > 0 ? [SHARED_RETRACTIONS_RELPATH] : []),
         SHARED_MANIFEST_RELPATH,
         ...plan.fragments.map(sharedFragmentRelPath),
       ];
@@ -1382,7 +1405,10 @@ export const knowledgeSync: RegisteredTool = buildTool({
       });
     }
 
-    // pull
+    // pull — memories land in the harness's own spec store, so a pull that
+    // brings any needs the spec's name; without one it retracts nothing.
+    const specName = harnessSpecName(harnessDir.value.real);
+    const retractions = specName === undefined ? [] : readRetractions(shared.value.real);
     const localMemoryHashes = harnessMemoryHashes(harnessMemories);
     // A grader fragment a previous pull landed is written to
     // `graders.shared-<hash>.yaml`, which `readHarnessGraders` deliberately
@@ -1410,11 +1436,16 @@ export const knowledgeSync: RegisteredTool = buildTool({
       fragments: plan.fragments.length,
       duplicates: plan.skippedDuplicates,
     };
+    if (specName === undefined && plan.memories.length > 0) {
+      return refusal(tool, "refused", PULL_NEEDS_SPEC_REASON, { ...common, plan: planReport });
+    }
     // Contain what the pull WRITES, for the same reason the push does: the
     // harness directory being inside the workspace says nothing about
     // `.crewhaus/prompts` being a symlink pointing out of it.
     const pullWrites = [
-      ...(plan.memories.length > 0 ? [PULLED_MEMORIES_RELPATH] : []),
+      ...(specName !== undefined && (plan.memories.length > 0 || retractions.length > 0)
+        ? [pulledMemoriesRelPath(specName)]
+        : []),
       ...plan.fragments.map(pulledFragmentRelPath),
     ];
     const pullEscapes = containWritePaths(tool, harnessDir.value, pullWrites, protectedRoots);
@@ -1440,7 +1471,7 @@ export const knowledgeSync: RegisteredTool = buildTool({
       });
     }
     try {
-      applyPull(harnessDir.value.real, plan, () => new Date());
+      await applyPull(harnessDir.value.real, plan, () => new Date(), { specName, retractions });
     } catch (err) {
       return json({
         ...common,

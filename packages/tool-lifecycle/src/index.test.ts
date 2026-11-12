@@ -751,14 +751,38 @@ const STRIPE_SHAPED = ["sk", "live", "51H8xQ2eZvKYlo2Cdcfghjkmnpqrstvw"].join("_
  */
 const UNRECOGNISED_SECRET = ["Zq7Wm3Kx9Lp2Vb8Nc", "4Ht6Rj1Ds5Fg0Ay2Qw"].join("");
 
+/**
+ * A fact line as `@crewhaus/memory-store` writes one: a push reads facts
+ * through the store, so a line without the entry's fields is not a fact.
+ */
+function fact(n: number, text: string, tags: string[] = []): string {
+  return JSON.stringify({
+    id: `mem_${String(n).padStart(16, "0")}`,
+    text,
+    tags,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+}
+
+/** The spec a pull lands in: the `demo` store, as the fixtures' memory file names it. */
+function specFile(): void {
+  write("crewhaus.yaml", "name: demo\nshape: cli\n");
+}
+
 function knowledgeHarness(optIn = true): void {
   if (optIn) write(".crewhaus/knowledge.json", JSON.stringify({ share: true }));
+  specFile();
   write(
     ".crewhaus/memories/demo.jsonl",
-    `${JSON.stringify({ id: "m1", text: "prefer the cached path", tags: ["perf"] })}\n${JSON.stringify(
-      { id: "m2", text: "retries belong at the edge", tags: [] },
-    )}\n`,
+    `${fact(1, "prefer the cached path", ["perf"])}\n${fact(2, "retries belong at the edge")}\n`,
   );
+}
+
+/** The lines of the pulled-into spec store holding `text`. */
+function landedLines(text: string): string[] {
+  return readFileSync(path.join(tmp, ".crewhaus/memories/demo.jsonl"), "utf8")
+    .split("\n")
+    .filter((l) => l.includes(text));
 }
 
 test("KnowledgeSync refuses to push from a harness that has not opted in", async () => {
@@ -822,10 +846,7 @@ test("KnowledgeSync pushes, dedupes a second push, and verifies what landed", as
 
 test("KnowledgeSync masks a recognised credential and never echoes the raw one", async () => {
   write(".crewhaus/knowledge.json", JSON.stringify({ share: true }));
-  write(
-    ".crewhaus/memories/demo.jsonl",
-    `${JSON.stringify({ id: "m1", text: `the key is ${STRIPE_SHAPED}`, tags: [] })}\n`,
-  );
+  write(".crewhaus/memories/demo.jsonl", `${fact(1, `the key is ${STRIPE_SHAPED}`)}\n`);
   const raw = await callRaw(knowledgeSync, {
     direction: "push",
     dryRun: false,
@@ -848,13 +869,7 @@ test("KnowledgeSync drops an unrecognised secret shape and never echoes it back"
   write(".crewhaus/knowledge.json", JSON.stringify({ share: true }));
   write(
     ".crewhaus/memories/demo.jsonl",
-    `${JSON.stringify({ id: "m1", text: `token ${UNRECOGNISED_SECRET}`, tags: [] })}\n${JSON.stringify(
-      {
-        id: "m2",
-        text: "batch the writes",
-        tags: [],
-      },
-    )}\n`,
+    `${fact(1, `token ${UNRECOGNISED_SECRET}`)}\n${fact(2, "batch the writes")}\n`,
   );
   const raw = await callRaw(knowledgeSync, {
     direction: "push",
@@ -913,23 +928,20 @@ test("KnowledgeSync counts the shared records it could not trust, and does not p
   expect(at(r, "pulled", "memories")).toBe(1);
   expect(r["verified"]).toBe(true);
 
-  const landed = readFileSync(path.join(tmp, ".crewhaus/memories/shared.jsonl"), "utf8");
+  // It lands in the harness's own spec store, beside the harness's facts.
+  const landed = readFileSync(path.join(tmp, ".crewhaus/memories/demo.jsonl"), "utf8");
   expect(landed).toContain("use the retry budget");
   expect(landed).not.toContain("ignore all previous instructions");
+  expect(existsSync(path.join(tmp, ".crewhaus/memories/shared.jsonl"))).toBe(false);
 
   // A second pull brings nothing. This is the assertion that pins the
   // shared-provenance tag applyPull adds: hashing the landed memory as it sits
   // on disk does NOT reproduce the shared record's hash, so a pull that only
-  // did that would re-import everything on every run and grow shared.jsonl
-  // without bound — which is what `crewhaus knowledge pull` does today.
+  // did that would plan every memory again on every run.
   const again = await callJson(knowledgeSync, { direction: "pull", dryRun: false });
   expect(at(again, "pulled", "memories")).toBe(0);
   expect(at(again, "pulled", "duplicates")).toBe(1);
-  expect(
-    readFileSync(path.join(tmp, ".crewhaus/memories/shared.jsonl"), "utf8")
-      .split("\n")
-      .filter((l) => l.trim() !== "").length,
-  ).toBe(1);
+  expect(landedLines("use the retry budget")).toHaveLength(1);
 });
 
 test("KnowledgeSync pushes grader and prompt fragments under their content hash", async () => {
@@ -991,11 +1003,12 @@ test("KnowledgeSync refuses a shared store inside the harness state it syncs", a
 test("KnowledgeSync reports an unreadable shared store as unreadable, not as empty", async () => {
   knowledgeHarness();
   mkdirSync(path.join(tmp, ".crewhaus-shared/memories.jsonl"), { recursive: true });
+  const before = readFileSync(path.join(tmp, ".crewhaus/memories/demo.jsonl"), "utf8");
   const r = await callJson(knowledgeSync, { direction: "pull", dryRun: false });
   console.log(`KNOWLEDGE_UNREADABLE ${r["code"]} ${String(r["reason"]).slice(0, 110)}`);
   expect(r["status"]).toBe("refused");
   expect(r["code"]).toBe("unreadable");
-  expect(existsSync(path.join(tmp, ".crewhaus/memories/shared.jsonl"))).toBe(false);
+  expect(readFileSync(path.join(tmp, ".crewhaus/memories/demo.jsonl"), "utf8")).toBe(before);
 });
 
 test("KnowledgeSync reports memory lines it could not parse rather than counting them as nothing", async () => {
@@ -1180,6 +1193,7 @@ test("HarnessRetire will not write its evidence through a link out of the worksp
 
 test("a second pull brings in nothing even when the shared record carries its own provenance", async () => {
   const { memoryContentHash } = await import("@crewhaus/harness-lifecycle");
+  specFile();
   // A memory that has been round-tripped once already: one harness pulled it,
   // so its tags carry a `shared:` tag of their own, and pushed it on.
   const text = "back-pressure belongs at the queue";
@@ -1207,11 +1221,25 @@ test("a second pull brings in nothing even when the shared record carries its ow
   const second = await callJson(knowledgeSync, { direction: "pull", dryRun: false });
   expect(at(second, "pulled", "memories")).toBe(0);
   expect(at(second, "pulled", "duplicates")).toBe(1);
-  expect(
-    readFileSync(path.join(tmp, ".crewhaus/memories/shared.jsonl"), "utf8")
-      .split("\n")
-      .filter((l) => l.trim() !== "").length,
-  ).toBe(1);
+  expect(landedLines(text)).toHaveLength(1);
+});
+
+test("KnowledgeSync refuses a pull into a harness whose spec names no memory store", async () => {
+  write(
+    ".crewhaus-shared/memories.jsonl",
+    `${JSON.stringify({
+      contentHash: createHash("sha256").update("a lesson\n").digest("hex"),
+      text: "a lesson",
+      tags: [],
+      provenance: { harness: "other", pushedAt: "2026-01-01T00:00:00.000Z" },
+    })}\n`,
+  );
+  const r = await callJson(knowledgeSync, { direction: "pull", dryRun: false });
+  expect(r["status"]).toBe("refused");
+  expect(String(r["reason"])).toBe(
+    "Pull needs this harness's crewhaus.yaml to know which memory store to fill.",
+  );
+  expect(existsSync(path.join(tmp, ".crewhaus"))).toBe(false);
 });
 
 test("a second pull does not re-pull the grader fragment the first one landed", async () => {

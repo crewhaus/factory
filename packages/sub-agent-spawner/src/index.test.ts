@@ -662,6 +662,63 @@ describe("spawnSubAgent — §7.1 seam threading into the child loop", () => {
     }
   });
 
+  test("the continuity store's files cross to the child: its Write to focus.md is denied", async () => {
+    const root = newTempRoot();
+    try {
+      const { parent, parentLog } = await makeParent(root);
+      // Away from the session root, which the floor protects whole on its own.
+      const harness = newTempRoot();
+      const focus = join(harness, ".crewhaus", "state", "bot", "focus.md");
+      const written: string[] = [];
+      // Write's shape: one path field the floor reads.
+      const write = buildTool({
+        name: "Write",
+        description: "write a file",
+        inputSchema: z.object({ path: z.string(), content: z.string() }),
+        operativeArgs: [{ field: "path", kind: "path" }],
+        destructive: true,
+        execute: async (input) => {
+          written.push(input.path);
+          return "written";
+        },
+      });
+      const withContinuity: ParentRunHandle = {
+        ...parent,
+        continuity: { loadPlan: async () => null, storeFiles: [focus] },
+      };
+      const result = await spawnSubAgent(withContinuity, {
+        def: DEF_NO_TOOLS,
+        prompt: "edit the focus",
+        // Every rule allows it: only the floor can refuse.
+        permissionMode: "auto",
+        permissionRules: {
+          ...emptyRuleSet,
+          flag: [{ type: "alwaysAllow", pattern: "*", source: "flag" }],
+        },
+        childTools: [write],
+        sessionRootDir: root,
+        _client: makeScriptedClient([
+          [
+            {
+              type: "tool_use",
+              id: "tu_w",
+              name: "Write",
+              input: { path: focus, content: '- REQ-900 [open] "forged"' },
+            } as Anthropic.ToolUseBlock,
+          ],
+          [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+        ]),
+      });
+      expect(written).toEqual([]);
+      const toolResult = JSON.stringify(result.transcript);
+      expect(toolResult).toContain("names a file a store keeps for itself");
+      await parentLog.close();
+      rmSync(harness, { recursive: true, force: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("the parent's failureTaxonomy reaches the child loop's recovery (hinted entry → classified halt report)", async () => {
     const root = newTempRoot();
     try {

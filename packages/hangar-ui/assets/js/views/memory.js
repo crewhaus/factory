@@ -124,7 +124,10 @@ function wikiCard(data, ctx) {
     return card(
       "Wiki",
       notice ??
-        emptyState("No articles yet. The harness writes them as it works, or add one here."),
+        emptyState(
+          "No articles yet. The harness writes them as it works, or add one here.",
+          "crewhaus wiki write <slug> --body-file <file> --expect 0",
+        ),
     );
   }
   const index = data?.index && typeof data.index === "object" ? data.index : {};

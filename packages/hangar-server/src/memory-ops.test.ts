@@ -16,7 +16,7 @@
  * No test here spawns a process.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
 import { makeFixtureHarness } from "./fixture";
@@ -988,6 +988,55 @@ describe("wiki editor", () => {
     ).toContain("steps");
   });
 
+  test("signals with a stale expectedVersion are refused with the current article", async () => {
+    const t = boot();
+    const dir = fabricHarness(t);
+    writeArticle(dir, "fabric", "how-to-deploy", {
+      title: "How to deploy",
+      body: "# Deploy\nsteps\n",
+      version: 3,
+    });
+    const id = await register(t, dir);
+    const stale = await t.api(`/api/h/${id}/memory/wiki/how-to-deploy/signals`, {
+      method: "POST",
+      body: JSON.stringify({ verified: true, expectedVersion: 2 }),
+    });
+    expect(stale.status).toBe(200);
+    expect(stale.body["ok"]).toBe(false);
+    expect(stale.body["code"]).toBe("stale_article_version");
+    expect(stale.body["currentVersion"]).toBe(3);
+    expect((stale.body["current"] as Record<string, unknown>)["version"]).toBe(3);
+    const file = join(dir, ".crewhaus", "wiki", "fabric", "articles", "how-to-deploy.md");
+    expect(readFileSync(file, "utf8")).not.toContain("verified: true");
+    const held = await t.api(`/api/h/${id}/memory/wiki/how-to-deploy/signals`, {
+      method: "POST",
+      body: JSON.stringify({ verified: true, expectedVersion: 3 }),
+    });
+    expect(held.body["ok"]).toBe(true);
+    expect(readFileSync(file, "utf8")).toContain("verified: true");
+  });
+
+  test("a write from Hangar is a person's version, and the versions list says so", async () => {
+    const t = boot();
+    const dir = fabricHarness(t, "fabric", { learning: false });
+    const id = await register(t, dir);
+    const put = (body: string, expectedVersion: number) =>
+      t.api(`/api/h/${id}/memory/wiki/notes`, {
+        method: "PUT",
+        body: JSON.stringify({ body, title: "Notes", expectedVersion }),
+      });
+    expect((await put("# Notes\nfirst\n", 0)).body["ok"]).toBe(true);
+    expect((await put("# Notes\nsecond\n", 1)).body["ok"]).toBe(true);
+    const file = join(dir, ".crewhaus", "wiki", "fabric", "articles", "notes.md");
+    expect(readFileSync(file, "utf8")).toContain("kind: operator");
+    expect(readFileSync(file, "utf8")).toContain("via: hangar");
+    const versions = await t.api(`/api/h/${id}/memory/wiki/notes/versions`);
+    expect((versions.body["versions"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      version: 1,
+      author: "operator",
+    });
+  });
+
   test("archive is reversible, keeps every version, and preserves `verified`", async () => {
     const t = boot();
     const dir = fabricHarness(t);
@@ -1012,14 +1061,13 @@ describe("wiki editor", () => {
     expect(archived.body["ok"]).toBe(true);
     const file = join(dir, ".crewhaus", "wiki", "fabric", "articles", "how-to-deploy.md");
     expect(readFileSync(file, "utf8")).toContain("status: archived");
-    // A content write resets `verified`; archiving must not un-verify.
+    // Status only: `verified`, the body and the version stay, and no version is frozen.
     expect(readFileSync(file, "utf8")).toContain("verified: true");
-    expect(
-      readFileSync(
-        join(dir, ".crewhaus", "wiki", "fabric", "versions", "how-to-deploy", "1.md"),
-        "utf8",
-      ),
-    ).toContain("steps");
+    expect(readFileSync(file, "utf8")).toContain("steps");
+    expect(archived.body["version"]).toBe(1);
+    expect(existsSync(join(dir, ".crewhaus", "wiki", "fabric", "versions", "how-to-deploy"))).toBe(
+      false,
+    );
 
     const back = await t.api(`/api/h/${id}/memory/wiki/how-to-deploy/archive`, {
       method: "POST",

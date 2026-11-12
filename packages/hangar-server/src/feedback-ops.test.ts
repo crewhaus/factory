@@ -418,22 +418,6 @@ describe("the advisory feed", () => {
 
   test.each([
     [
-      "a step's tool list",
-      [
-        "name: routed",
-        "target: workflow",
-        "model: anthropic/claude-sonnet-4",
-        "steps:",
-        "  - name: draft",
-        "    instructions: Draft it.",
-        "",
-      ],
-      "workflow",
-      ["steps", "0", "tools"],
-      "replace",
-      ["Read"],
-    ],
-    [
       "a game's contract address",
       [
         "name: routed",

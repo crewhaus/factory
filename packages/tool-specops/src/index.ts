@@ -56,16 +56,20 @@ import {
 import { type Spec, parseSpec, parseSpecIssues } from "@crewhaus/spec";
 import { UPGRADE_NOTES_TABLE, collectUpgradeNotes } from "@crewhaus/spec-changelog/upgrade";
 import {
+  type ChangedLeaf,
   OPTIMIZABLE_PATHS,
   OPTIMIZER_REFUSED_LEAVES,
+  RESERVED_PATH_SEGMENTS,
   type SpecPatch,
   WILDCARD_SEGMENT,
+  admitBlockPatch,
   applySpecPatch,
   diffSpecYaml,
   humanOwnedReason,
   isOptimizable,
   specHasPath,
   validatePatch,
+  withPatchApplied,
 } from "@crewhaus/spec-patch";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -243,7 +247,7 @@ const MODEL_TURN_REFUSED: ReadonlyArray<{
  * above name the cli-shaped `agent.instructions`; a workflow step, a graph
  * node and a crew role carry the same things one level down — its prompt,
  * its tool grant, its model — and `OPTIMIZABLE_PATHS` admits the whole
- * `steps` / `nodes` / `roles` block by prefix. So a path through one of these
+ * `steps` / `nodes` / `roles` block wholesale. So a path through one of these
  * keys is refused at any depth, and a patch at an ANCESTOR (a whole step,
  * `steps` itself) may not change what sits under one (`ownedLeafChange`).
  */
@@ -265,21 +269,6 @@ const HUMAN_OWNED_KEYS: ReadonlyMap<string, string> = new Map([
   ["contracts", "contract bindings are the on-chain spend surface"],
 ]);
 
-/**
- * Blocks compared, not refused, under an ancestor patch: each has tunable
- * dials with exact `OPTIMIZABLE_PATHS` entries of their own (a pool's
- * `policy`, a judge gate's `threshold`), which stay patchable at those
- * paths, while a whole-step or whole-node value may not change the block —
- * the pool's candidate roster, the judge's identity, or the gate itself.
- */
-const OWNED_WHEN_REPLACED: ReadonlyMap<string, string> = new Map([
-  [
-    "model_pool",
-    "a model pool carries the candidate roster; patch its tunable dials at their own paths",
-  ],
-  ["judge", "a judge gate decides what passes; patch its tunable dials at their own paths"],
-]);
-
 /** Leaves rooted at the document's top that are human-owned (onchain-game). */
 const ROOTED_OWNED: ReadonlyArray<{ readonly path: readonly string[]; readonly reason: string }> = [
   { path: ["game", "contract"], reason: "the game contract is the on-chain spend surface" },
@@ -294,11 +283,24 @@ function startsWith(path: ReadonlyArray<string>, prefix: ReadonlyArray<string>):
   return prefix.length <= path.length && prefix.every((seg, i) => path[i] === seg);
 }
 
+/** True when an allow-list entry of `target` (wildcards honoured) is a prefix of `path`. */
+function underAllowedEntry(target: Spec["target"], path: ReadonlyArray<string>): boolean {
+  return (OPTIMIZABLE_PATHS[target] ?? []).some(
+    (entry) =>
+      entry.length <= path.length &&
+      entry.every((seg, i) => seg === WILDCARD_SEGMENT || seg === path[i]),
+  );
+}
+
 /**
  * Why a model turn may not patch `path`, or undefined when this layer admits
- * it. Given a `target`, the per-key rules apply only to a path the allow-list
- * admits: one it does not admit (a top-level `permissions`, `agent.model`)
- * keeps the allow-list's own, more specific refusal.
+ * it. Given a `target`, the per-key rules apply only to a path under a block
+ * the allow-list names (a whole `steps`, `nodes`, `roles` or `game` entry, or
+ * any other entry that is a prefix of it): such a path is refused here with
+ * the key's own reason, even where the allow-list's structural rule refuses
+ * it too (`steps.0.model`, `nodes.a.hitl`). A path under no entry at all (a
+ * top-level `permissions`, `agent.model`) keeps the allow-list's own, more
+ * specific refusal.
  */
 export function modelTurnRefusal(
   path: ReadonlyArray<string>,
@@ -310,7 +312,7 @@ export function modelTurnRefusal(
     for (let i = 0; i < n && same; i++) same = row.prefix[i] === path[i];
     if (same) return row.reason;
   }
-  if (target !== undefined && !isOptimizable(target, path)) return undefined;
+  if (target !== undefined && !underAllowedEntry(target, path)) return undefined;
   for (const segment of path) {
     const owned = HUMAN_OWNED_KEYS.get(segment);
     if (owned !== undefined) return owned;
@@ -319,148 +321,51 @@ export function modelTurnRefusal(
   return undefined;
 }
 
-/** JSON with object keys sorted, so two equal values compare equal. */
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined)
-      .sort(([a], [b]) => compareStrings(a, b));
-    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
-  }
-  return JSON.stringify(value) ?? "null";
-}
-
-/** True when `entry` (with `*` matching one segment) begins with `path`. */
-function entryExtends(entry: ReadonlyArray<string>, path: ReadonlyArray<string>): boolean {
-  return (
-    entry.length > path.length &&
-    path.every((seg, i) => entry[i] === seg || entry[i] === WILDCARD_SEGMENT)
-  );
-}
-
-/** A deep copy of `value` with the sub-path `tail` (`*` = every child) removed. */
-function withoutTail(value: unknown, tail: ReadonlyArray<string>): unknown {
-  if (value === null || typeof value !== "object") return value;
-  const [head, ...rest] = tail;
-  if (head === undefined) return value;
-  const copy: Record<string, unknown> | unknown[] = Array.isArray(value)
-    ? [...value]
-    : { ...(value as Record<string, unknown>) };
-  const keys =
-    head === WILDCARD_SEGMENT ? Object.keys(copy) : Object.hasOwn(copy, head) ? [head] : [];
-  for (const key of keys) {
-    const bag = copy as Record<string, unknown>;
-    if (rest.length === 0) {
-      if (Array.isArray(copy)) bag[key] = null;
-      else delete bag[key];
-    } else {
-      bag[key] = withoutTail(bag[key], rest);
-    }
-  }
-  return copy;
-}
-
 /**
- * The part of an `OWNED_WHEN_REPLACED` block at `path` that is human-owned:
- * the block minus every sub-path the target's allow-list names exactly (a
- * pool's `policy`, a judge's `threshold`). Those dials may move, through
- * their own path or inside a whole-block value; nothing else in it may.
+ * The model-turn layer of the whole-block rule: a changed leaf under a
+ * human-owned key (at any depth), a rooted owned row, or a path a model turn
+ * may never patch. The shared rule (`admitBlockPatch`) has already refused
+ * every leaf the optimizer itself may not change.
  */
-function ownedPart(value: unknown, path: ReadonlyArray<string>, target: Spec["target"]): unknown {
-  let out = value;
-  for (const entry of OPTIMIZABLE_PATHS[target] ?? []) {
-    if (entryExtends(entry, path)) out = withoutTail(out, entry.slice(path.length));
-  }
-  return out;
-}
-
-/** Why the leaf at `path` is human-owned, when it is. */
-function ownedLeafReason(path: ReadonlyArray<string>, isKey: boolean): string | undefined {
-  const last = path[path.length - 1];
-  if (isKey && last !== undefined) {
-    const owned = HUMAN_OWNED_KEYS.get(last) ?? OWNED_WHEN_REPLACED.get(last);
+function modelTurnLeafRule(leaf: ChangedLeaf): string | undefined {
+  for (const segment of leaf.path) {
+    const owned = HUMAN_OWNED_KEYS.get(segment);
     if (owned !== undefined) return owned;
   }
-  for (const row of ROOTED_OWNED) {
-    if (row.path.length === path.length && startsWith(path, row.path)) return row.reason;
-  }
-  for (const row of MODEL_TURN_REFUSED) {
-    if (row.prefix.length === path.length && startsWith(path, row.prefix)) return row.reason;
-  }
+  for (const row of ROOTED_OWNED) if (startsWith(leaf.path, row.path)) return row.reason;
+  for (const row of MODEL_TURN_REFUSED) if (startsWith(leaf.path, row.prefix)) return row.reason;
   return undefined;
 }
 
 /**
- * Every human-owned leaf at or under `path` in `value`, as dotted path →
- * canonical JSON. A leaf's whole subtree is its value; nothing under it is
- * walked. `isKey` says whether `path`'s last segment is a mapping key (an
- * array index is never an owned key).
+ * The name a refusal gives a refused leaf: its shortest prefix below the
+ * patched path `at` that ends in a human-owned key, `model_pool` or `judge`,
+ * or equals a rooted owned row or a refused prefix — the setting a person
+ * recognises (`steps.2.judge`, not `steps.2.judge.criteria`). Else the leaf
+ * itself.
  */
-function ownedLeaves(
-  value: unknown,
-  path: ReadonlyArray<string>,
-  isKey: boolean,
-  target: Spec["target"],
-  out: Map<string, { value: string; reason: string }>,
-): void {
-  if (value === undefined) return;
-  const reason = path.length > 0 ? ownedLeafReason(path, isKey) : undefined;
-  if (reason !== undefined) {
-    out.set(path.join("."), { value: canonicalJson(ownedPart(value, path, target)), reason });
-    return;
-  }
-  if (Array.isArray(value)) {
-    value.forEach((item, i) => ownedLeaves(item, [...path, String(i)], false, target, out));
-  } else if (value !== null && typeof value === "object") {
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      ownedLeaves(v, [...path, k], true, target, out);
+function ownedName(leaf: ReadonlyArray<string>, at: ReadonlyArray<string>): string {
+  for (let len = at.length + 1; len <= leaf.length; len++) {
+    const head = leaf.slice(0, len);
+    const last = head[len - 1] as string;
+    if (HUMAN_OWNED_KEYS.has(last) || last === "model_pool" || last === "judge") {
+      return head.join(".");
     }
+    const same = (row: ReadonlyArray<string>): boolean =>
+      row.length === len && startsWith(head, row);
+    if (ROOTED_OWNED.some((row) => same(row.path))) return head.join(".");
+    if (MODEL_TURN_REFUSED.some((row) => same(row.prefix))) return head.join(".");
   }
-}
-
-/** The value at `path` in a parsed document, or undefined. */
-function valueAt(doc: unknown, path: ReadonlyArray<string>): { value: unknown; isKey: boolean } {
-  let at: unknown = doc;
-  let isKey = true;
-  for (const segment of path) {
-    if (Array.isArray(at)) {
-      const i = Number(segment);
-      at = Number.isInteger(i) && String(i) === segment ? at[i] : undefined;
-      isKey = false;
-    } else if (at !== null && typeof at === "object") {
-      at = Object.hasOwn(at as object, segment)
-        ? (at as Record<string, unknown>)[segment]
-        : undefined;
-      isKey = true;
-    } else {
-      return { value: undefined, isKey: true };
-    }
-  }
-  return { value: at, isKey };
-}
-
-/** The first human-owned leaf that differs between two leaf maps. */
-function firstDifference(
-  before: ReadonlyMap<string, { value: string; reason: string }>,
-  after: ReadonlyMap<string, { value: string; reason: string }>,
-): { leaf: string; reason: string } | undefined {
-  const keys = [...new Set([...before.keys(), ...after.keys()])].sort(compareStrings);
-  for (const leaf of keys) {
-    const a = before.get(leaf);
-    const b = after.get(leaf);
-    if (a?.value !== b?.value) return { leaf, reason: (a ?? b)?.reason ?? "" };
-  }
-  return undefined;
+  return leaf.join(".");
 }
 
 /**
  * The human-owned leaf a patch at `path` would add, remove or change, if
- * any: the owned leaves under `path` in the document are compared with the
- * owned leaves in the patch's value (none, for a remove). A whole-step,
- * whole-node or whole-`steps` value that carries every prompt, grant, model
- * and gate unchanged passes; one that rewrites, drops, adds or reorders any
- * of them does not.
+ * any: the document before and after the patch, compared leaf by leaf under
+ * `path` by spec-patch's `admitBlockPatch` with this tool's model-turn rule on
+ * top. A whole-step, whole-node or whole-`steps` value that carries every
+ * prompt, grant, model and gate unchanged passes; one that rewrites, drops,
+ * adds or reorders any of them does not.
  */
 export function ownedLeafChange(
   document: unknown,
@@ -468,13 +373,12 @@ export function ownedLeafChange(
   path: ReadonlyArray<string>,
   op: SpecPatch["op"],
   value: unknown,
-): { leaf: string; reason: string } | undefined {
-  const current = valueAt(document, path);
-  const before = new Map<string, { value: string; reason: string }>();
-  ownedLeaves(current.value, path, current.isKey, target, before);
-  const after = new Map<string, { value: string; reason: string }>();
-  if (op !== "remove") ownedLeaves(value, path, current.isKey, target, after);
-  return firstDifference(before, after);
+): OwnedLeaf | undefined {
+  const after = withPatchApplied(document, path, op, value);
+  const refusal = admitBlockPatch(target, document, after, path, { leafRule: modelTurnLeafRule });
+  return refusal === undefined
+    ? undefined
+    : { leaf: ownedName(refusal.path, path), reason: refusal.reason, rule: refusal.rule };
 }
 
 /** The human-owned leaf two whole documents differ on, if any. */
@@ -482,13 +386,20 @@ export function ownedLeafDrift(
   before: unknown,
   after: unknown,
   target: Spec["target"],
-): { leaf: string; reason: string } | undefined {
-  const a = new Map<string, { value: string; reason: string }>();
-  const b = new Map<string, { value: string; reason: string }>();
-  ownedLeaves(before, [], true, target, a);
-  ownedLeaves(after, [], true, target, b);
-  return firstDifference(a, b);
+): OwnedLeaf | undefined {
+  const refusal = admitBlockPatch(target, before, after, [], { leafRule: modelTurnLeafRule });
+  return refusal === undefined
+    ? undefined
+    : { leaf: ownedName(refusal.path, []), reason: refusal.reason, rule: refusal.rule };
 }
+
+/** What a model-turn patch would move: the setting it names, why, and which rule refused it. */
+export type OwnedLeaf = {
+  readonly leaf: string;
+  readonly reason: string;
+  /** `refused-leaf`: a row no allow-list entry can admit; else human-owned. */
+  readonly rule?: "refused-leaf" | "not-tunable" | "caller";
+};
 
 /** The document as plain data, or undefined when it does not parse. */
 function plainDocument(yamlText: string): unknown {
@@ -547,7 +458,14 @@ function refusedLeafRemovedBy(
 
 const patchInputSchema = z.object({
   path: z
-    .array(z.string().min(1))
+    .array(
+      z
+        .string()
+        .min(1)
+        .refine((seg) => !RESERVED_PATH_SEGMENTS.includes(seg), {
+          message: `a path segment may not be ${RESERVED_PATH_SEGMENTS.join(", ")}`,
+        }),
+    )
     .min(1)
     .max(12)
     .describe('the field to change, as a key chain: ["agent","max_tokens"]'),
@@ -667,7 +585,7 @@ export const specPatchApply: RegisteredTool = buildTool({
         refused.push({
           index: item.index,
           path: dotted,
-          reason: `${item.op === "remove" ? "removing" : "this value at"} ${dotted} would change ${moved.leaf}, which is human-owned: a model turn cannot write it. Carry ${moved.leaf} over exactly as the spec has it (patch the tunable fields beside it), or edit crewhaus.yaml by hand.`,
+          reason: `${item.op === "remove" ? "removing" : "this value at"} ${dotted} would change ${moved.leaf}, which is ${moved.rule === "refused-leaf" ? "not optimizable" : "human-owned"}: a model turn cannot write it (${moved.reason}). Carry ${moved.leaf} over exactly as the spec has it (patch the tunable fields beside it), or edit crewhaus.yaml by hand.`,
           humanOwned: moved.reason,
           admissibleNearby: admissibleNear(spec.target, item.path),
         });
@@ -754,7 +672,7 @@ export const specPatchApply: RegisteredTool = buildTool({
         refused: [
           {
             path: drift.leaf,
-            reason: `the batch as a whole would change ${drift.leaf}, which is human-owned: a model turn cannot write it.`,
+            reason: `the batch as a whole would change ${drift.leaf}, which is ${drift.rule === "refused-leaf" ? "not optimizable" : "human-owned"}: a model turn cannot write it (${drift.reason}).`,
             humanOwned: drift.reason,
           },
         ],

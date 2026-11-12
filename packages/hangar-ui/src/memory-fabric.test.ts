@@ -391,7 +391,9 @@ describe("the memory screens name only commands that run", () => {
   test("no command that never existed, and no dream verb without its spec", () => {
     for (const fake of [
       "crewhaus remember",
-      "crewhaus wiki write",
+      // `wiki write` exists, with its flags; a bare one never ran.
+      'crewhaus wiki write"',
+      "crewhaus wiki write <slug>\n",
       "crewhaus /focus",
       "crewhaus run (then",
       "crewhaus run (the agent",
@@ -400,6 +402,10 @@ describe("the memory screens name only commands that run", () => {
     ]) {
       expect(`${fake}: ${source.includes(fake)}`).toBe(`${fake}: false`);
     }
+  });
+
+  test("the empty wiki names the real write command, flags and all", () => {
+    expect(source).toContain('"crewhaus wiki write <slug> --body-file <file> --expect 0"');
   });
 
   test("the scan read the real views", () => {
