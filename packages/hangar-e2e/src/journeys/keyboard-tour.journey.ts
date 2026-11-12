@@ -1,23 +1,25 @@
 /**
  * The console by keyboard alone: the skip link, a focus ring and no trap on
- * every gated screen, dialogs that hold focus and give it back, the command
- * menu as a combobox whose armed action the keyboard can confirm, inbox
- * verdicts that take two keys and only while the list has focus, tooltips,
- * controls that keep focus across their own updates, a refresh that keeps an
- * open editor, and the Readability choices. Two edits that must not slip past
- * a newer version close it: a conflict asks for the typed confirmation again,
- * and a restored wiki draft saves against the version it was typed on. The
- * sign-in screen is toured too, and the dialog a session that ends mid-use
- * opens keeps what is typed into it and its focus while polls go on.
+ * every toured screen, the header's Help and Settings lists and the narrow
+ * Menu (Escape gives focus back), a harness's section nav and sub-view list,
+ * dialogs that hold focus and give it back, the command menu as a combobox
+ * whose armed action the keyboard can confirm, inbox verdicts that take two
+ * keys and only while the list has focus, tooltips, controls that keep focus
+ * across their own updates, a refresh that keeps an open editor, and the
+ * Readability choices. Two edits that must not slip past a newer version
+ * close it: a conflict asks for the typed confirmation again, and a restored
+ * wiki draft saves against the version it was typed on. The sign-in screen is
+ * toured too, and the dialog a session that ends mid-use opens keeps what is
+ * typed into it and its focus while polls go on.
  */
 import { join } from "node:path";
 import { createWikiStore } from "@crewhaus/wiki-store";
 import type { JSHandle, Page } from "playwright";
 import type { A11yFinding } from "../a11y/finding";
-import { GATED_TEMPLATES } from "../a11y/gate";
+import { TOURED_TEMPLATES } from "../a11y/gate";
 import { dialogContainmentFinding, escapeFinding, focusTour } from "../a11y/keyboard";
-import { LIBRARY_ROUTE, globalRoute, harnessRoute } from "../console-routes";
-import type { Session } from "../session";
+import { HARNESSES_ROUTE, HOME_ROUTE, type RouteHarness, routeFor } from "../console-routes";
+import type { HomeAddress, Session } from "../session";
 import { settle } from "../settle";
 import {
   a11yFleet,
@@ -36,12 +38,10 @@ const fail = (what: string): never => {
   throw new Error(what);
 };
 
-/** The route a gated template stands for, for one harness. */
-function routeOf(template: string, harnessId: string): string {
-  return template.startsWith("#/h/:id/")
-    ? harnessRoute(harnessId, template.slice("#/h/:id/".length))
-    : template;
-}
+/** The addresses this tour uses, by what they are. */
+const APPROVALS = "#/home/needs-you?type=approvals";
+const REVIEW = "#/home/needs-you?type=review";
+const CHANGES = "#/home/changes";
 
 async function activeIs(page: Page, handle: JSHandle): Promise<boolean> {
   return await page.evaluate((node) => node === document.activeElement, handle);
@@ -119,9 +119,9 @@ async function signInScreen(session: Session): Promise<void> {
 async function sessionEndsMidUse(session: Session): Promise<void> {
   const { page } = session;
   await page.clock.install();
-  await session.visit(LIBRARY_ROUTE);
+  await session.visit(HARNESSES_ROUTE);
   await page.reload();
-  await settle(page, "the Library under a fake clock");
+  await settle(page, "the harness list under a fake clock");
   // The session ends and the browser's key is gone, so signing in silently cannot work.
   await page.evaluate(async () => {
     sessionStorage.removeItem("hangar.session");
@@ -161,7 +161,7 @@ async function sessionEndsMidUse(session: Session): Promise<void> {
 
 async function skipLink(session: Session): Promise<void> {
   const { page } = session;
-  await freshVisit(session, LIBRARY_ROUTE);
+  await freshVisit(session, HOME_ROUTE);
   await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur?.());
   await page.keyboard.press("Tab");
   if (!(await activeMatches(page, "a.skip-link")))
@@ -173,10 +173,14 @@ async function skipLink(session: Session): Promise<void> {
   if (after !== before) fail(`the skip link changed the address from ${before} to ${after}`);
 }
 
-async function tourEveryScreen(session: Session, harnessId: string, theme: string): Promise<void> {
+async function tourEveryScreen(
+  session: Session,
+  harness: RouteHarness,
+  theme: string,
+): Promise<void> {
   const findings: string[] = [];
-  for (const template of GATED_TEMPLATES) {
-    await freshVisit(session, routeOf(template, harnessId));
+  for (const template of TOURED_TEMPLATES) {
+    await freshVisit(session, routeFor(template, harness));
     const tour = await focusTour(session.page);
     if (tour.reached === 0) findings.push(`${template} ${theme}: Tab reached nothing`);
     for (const finding of tour.findings) {
@@ -186,17 +190,116 @@ async function tourEveryScreen(session: Session, harnessId: string, theme: strin
   if (findings.length > 0) fail(`the focus tour found:\n  ${findings.join("\n  ")}`);
 }
 
-async function overlays(session: Session, harnessId: string): Promise<void> {
+/** The aria-expanded a disclosure's button says now. */
+async function expanded(page: Page, button: string): Promise<string | null> {
+  return await page.locator(button).getAttribute("aria-expanded");
+}
+
+/**
+ * The shell by keyboard alone. Each of the header's lists opens from its
+ * button and says so; Escape closes it and gives focus back to the button;
+ * Tab out of it closes it. A harness's section nav and sub-view list are
+ * reached by Tab with the current ones marked, and Enter on a sub-view lands
+ * on its page with focus on the page's heading.
+ */
+async function shellByKeyboard(session: Session, harness: RouteHarness): Promise<void> {
   const { page } = session;
-  const spec = harnessRoute(harnessId, "spec");
-  const overview = harnessRoute(harnessId, "overview");
+  await freshVisit(session, HOME_ROUTE);
+  for (const id of ["help-menu", "settings-menu"]) {
+    const button = `button[aria-controls="${id}"]`;
+    const list = page.locator(`#${id}`);
+    await page.locator(button).focus();
+    if ((await expanded(page, button)) !== "false") fail(`${id} starts open`);
+    await page.keyboard.press("Enter");
+    await until(page, `Enter to open ${id}`, async () => (await expanded(page, button)) === "true");
+    if (!(await list.isVisible())) fail(`${id} says it is open and shows nothing`);
+    await page.keyboard.press("Tab");
+    if (!(await activeWithin(page, `#${id}`))) fail(`Tab from its button did not enter ${id}`);
+    await page.keyboard.press("Escape");
+    await until(
+      page,
+      `Escape to close ${id}`,
+      async () => (await expanded(page, button)) === "false",
+    );
+    if (await list.isVisible()) fail(`${id} says it is closed and still shows`);
+    if (!(await activeMatches(page, button))) fail(`Escape in ${id} did not give focus back`);
+    // Tab past its last item closes it, without a key of its own.
+    await page.keyboard.press("Enter");
+    await until(page, `${id} to open again`, async () => (await expanded(page, button)) === "true");
+    const items = await page.locator(`#${id} .menu-link`).count();
+    for (let i = 0; i <= items; i += 1) await page.keyboard.press("Tab");
+    await until(
+      page,
+      `Tab out of ${id} to close it`,
+      async () => (await expanded(page, button)) === "false",
+    );
+  }
+
+  await freshVisit(session, routeFor("#/h/:id/setup/spec", harness));
+  const section = page.locator('nav[aria-label="Harness sections"] a[aria-current="page"]');
+  if ((await section.textContent()) !== "Setup") fail("the section nav does not mark Setup");
+  const sub = page.locator('nav[aria-label="Setup views"] a[aria-current="page"]');
+  if ((await sub.textContent()) !== "Spec") fail("the sub-view list does not mark Spec");
+  await page.locator('nav[aria-label="Harness sections"] a').first().focus();
+  let reached = false;
+  for (let i = 0; i < 12 && !reached; i += 1) {
+    await page.keyboard.press("Tab");
+    reached = await activeWithin(page, 'nav[aria-label="Setup views"]');
+  }
+  if (!reached) fail("Tab from the section nav never reached the sub-view list");
+  const before = await page.evaluate(() => globalThis.location.hash);
+  await page.keyboard.press("Enter");
+  await until(
+    page,
+    "Enter on a sub-view to open it",
+    async () => (await page.evaluate(() => globalThis.location.hash)) !== before,
+  );
+  await settle(page, "a sub-view");
+  if (!(await activeMatches(page, "h1#page-title"))) fail("the page's heading did not take focus");
+}
+
+/** The narrow Menu by keyboard: it opens, holds every destination, and Escape gives focus back. */
+async function narrowMenu(scope: JourneyScope, home: HomeAddress): Promise<void> {
+  const session = await scope.session(home, {
+    label: "keyboard-tour-narrow",
+    viewport: { width: 320, height: 640 },
+  });
+  const { page } = session;
+  await freshVisit(session, HOME_ROUTE);
+  if (await page.locator("nav.app-nav").isVisible()) fail("the wide nav shows at 320");
+  const menu = "button.menu-toggle";
+  await page.locator(menu).focus();
+  await page.keyboard.press("Enter");
+  await until(page, "Enter to open the Menu", async () => (await expanded(page, menu)) === "true");
+  for (const label of ["Home", "Harnesses", "People", "Connections", "Readability"]) {
+    if (!(await page.locator("#narrow-menu a", { hasText: label }).first().isVisible())) {
+      fail(`the open Menu shows no ${label}`);
+    }
+  }
+  await page.keyboard.press("Tab");
+  if (!(await activeWithin(page, "#narrow-menu"))) fail("Tab from Menu did not enter it");
+  await page.keyboard.press("Escape");
+  await until(
+    page,
+    "Escape to close the Menu",
+    async () => (await expanded(page, menu)) === "false",
+  );
+  if (!(await activeMatches(page, menu))) fail("Escape in the Menu did not give focus back");
+  session.assertClean();
+  await session.close();
+}
+
+async function overlays(session: Session, harness: RouteHarness): Promise<void> {
+  const { page } = session;
+  const spec = routeFor("#/h/:id/setup/spec", harness);
+  const overview = routeFor("#/h/:id", harness);
   const cases: Array<{ route: string; trigger: string; overlay: string; key?: string }> = [
     { route: overview, trigger: 'button:text-is("Start")', overlay: "dialog[open]" },
     { route: spec, trigger: 'button:text-is("Pin to…")', overlay: "dialog[open]" },
     { route: spec, trigger: 'button:text-is("View")', overlay: "dialog[open]" },
     { route: spec, trigger: 'button:text-is("Save")', overlay: "dialog[open]" },
-    { route: LIBRARY_ROUTE, trigger: "button.omni-open", overlay: "dialog.omni-panel[open]" },
-    { route: LIBRARY_ROUTE, trigger: "button.omni-open", overlay: "dialog.sheet[open]", key: "?" },
+    { route: HOME_ROUTE, trigger: "button.omni-open", overlay: "dialog.omni-panel[open]" },
+    { route: HOME_ROUTE, trigger: "button.omni-open", overlay: "dialog.sheet[open]", key: "?" },
   ];
   const findings: A11yFinding[] = [];
   for (const c of cases) {
@@ -228,7 +331,7 @@ async function overlays(session: Session, harnessId: string): Promise<void> {
 
 async function commandMenu(session: Session, starts: () => number): Promise<void> {
   const { page } = session;
-  await freshVisit(session, LIBRARY_ROUTE);
+  await freshVisit(session, HOME_ROUTE);
   const opener = await page.locator("button.omni-open").elementHandle();
   if (opener === null) fail("no command menu button");
   await (opener as JSHandle<HTMLElement>).evaluate((node) => node.focus());
@@ -263,7 +366,7 @@ async function commandMenu(session: Session, starts: () => number): Promise<void
   await settle(page, "a result");
 
   // An action takes a second step, and Escape takes it back.
-  await freshVisit(session, LIBRARY_ROUTE);
+  await freshVisit(session, HOME_ROUTE);
   await page.locator("button.omni-open").focus();
   await page.keyboard.press("Enter");
   await waitFor(page, "dialog.omni-panel[open]", "the command menu");
@@ -329,11 +432,11 @@ async function commandMenu(session: Session, starts: () => number): Promise<void
   if (starts() !== 1) fail(`Run it sent ${starts()} starts, not 1`);
 }
 
-async function inbox(session: Session, harnessId: string): Promise<void> {
+async function inbox(session: Session, harness: RouteHarness): Promise<void> {
   const { page } = session;
   const grants = grantCounter(page);
   const row = '.inbox-card[tabindex="0"]';
-  await freshVisit(session, globalRoute("approvals"));
+  await freshVisit(session, APPROVALS);
   await page.locator(row).focus();
   await page.keyboard.press("g");
   await waitFor(page, ".inbox-armed", "the armed prompt");
@@ -410,7 +513,7 @@ async function inbox(session: Session, harnessId: string): Promise<void> {
   if (grants() !== 2) fail(`the inbox sent ${grants()} grants, not 2`);
 
   // Over a typed confirmation, `?` and `/` open nothing.
-  await freshVisit(session, harnessRoute(harnessId, "spec"));
+  await freshVisit(session, routeFor("#/h/:id/setup/spec", harness));
   await page.getByRole("button", { name: "Pin to…" }).first().click();
   await waitFor(page, "dialog[open] input[placeholder]", "the typed confirm");
   await page.locator('dialog[open] button:text-is("Cancel")').focus();
@@ -431,10 +534,10 @@ async function inbox(session: Session, harnessId: string): Promise<void> {
 
 async function tooltip(session: Session): Promise<void> {
   const { page } = session;
-  await freshVisit(session, LIBRARY_ROUTE);
+  await freshVisit(session, HARNESSES_ROUTE);
   const trigger = page.locator("#view button[data-tip]").first();
   const handle = await trigger.elementHandle();
-  if (handle === null) fail("no control on the Library carries a tooltip");
+  if (handle === null) fail("no control on the harness list carries a tooltip");
   await trigger.focus();
   await waitFor(page, ".tip", "the tooltip on focus");
   await page.keyboard.press("Escape");
@@ -468,21 +571,21 @@ async function keepsFocus(
     fail(`${what}: focus left the control after its update`);
 }
 
-async function panelsAndToggles(session: Session, harnessId: string): Promise<void> {
+async function panelsAndToggles(session: Session, harness: RouteHarness): Promise<void> {
   const { page } = session;
-  await freshVisit(session, harnessRoute(harnessId, "memory"));
+  await freshVisit(session, routeFor("#/h/:id/knowledge/memory", harness));
   await keepsFocus(
     page,
     'nav[aria-label="memory fabric panels"] button:text-is("Wiki")',
     "a memory panel",
   );
-  await freshVisit(session, harnessRoute(harnessId, "thredz"));
+  await freshVisit(session, routeFor("#/h/:id/knowledge/thredz", harness));
   await keepsFocus(
     page,
     'nav[aria-label="thredz panels"] button:text-is("Records")',
     "a Thredz panel",
   );
-  await freshVisit(session, globalRoute("activity"));
+  await freshVisit(session, CHANGES);
   await keepsFocus(page, '[aria-label="activity kinds"] button', "an activity kind toggle");
   await keepsFocus(
     page,
@@ -490,9 +593,9 @@ async function panelsAndToggles(session: Session, harnessId: string): Promise<vo
     "the window toggle",
   );
   // The inboxes repaint their list on a toggle; the toggle itself is kept.
-  await freshVisit(session, globalRoute("approvals"));
+  await freshVisit(session, APPROVALS);
   await keepsFocus(page, 'button.toggle:has-text("Show settled")', "the Show settled toggle");
-  await freshVisit(session, globalRoute("review"));
+  await freshVisit(session, REVIEW);
   await keepsFocus(page, 'button.toggle:has-text("Show resolved")', "the Show resolved toggle");
 }
 
@@ -506,12 +609,16 @@ async function keyedRefresh(session: Session): Promise<void> {
     await held;
     await route.continue();
   });
-  await session.visit(globalRoute("settings"));
+  await session.visit("#/settings");
   // Not through `visit`, which waits for every request: one is being held.
   await page.evaluate((hash) => {
     globalThis.location.hash = hash;
-  }, LIBRARY_ROUTE);
-  await waitFor(page, 'button[aria-label^="edit registry fields"]', "the Library's first paint");
+  }, HARNESSES_ROUTE);
+  await waitFor(
+    page,
+    'button[aria-label^="edit registry fields"]',
+    "the harness list's first paint",
+  );
   await page.locator('button[aria-label^="edit registry fields"]').first().click();
   const notes = page.locator('.editor-tr textarea[aria-label="notes"]');
   await waitFor(page, '.editor-tr textarea[aria-label="notes"]', "the row editor");
@@ -519,10 +626,10 @@ async function keyedRefresh(session: Session): Promise<void> {
   await page.keyboard.type("kept across the refresh");
   const handle = await notes.elementHandle();
   release();
-  await settle(page, "the Library refresh");
+  await settle(page, "the harness list refresh");
   await page.unroute(/\/api\/harnesses\?hydrate=1/);
   if ((await page.locator(".rollup").textContent())?.includes("refreshing") === true) {
-    fail("the Library never finished its refresh");
+    fail("the harness list never finished its refresh");
   }
   if ((await notes.count()) !== 1) fail("the refresh closed the open row editor");
   if ((await notes.inputValue()) !== "kept across the refresh")
@@ -531,7 +638,7 @@ async function keyedRefresh(session: Session): Promise<void> {
     fail("the refresh moved focus out of the editor");
 }
 
-async function firstRunAndReadability(session: Session, harnessId: string): Promise<void> {
+async function firstRunAndReadability(session: Session, harness: RouteHarness): Promise<void> {
   const { page } = session;
   await clearPrefs(page);
   await waitFor(page, ".firstrun", "the first-run card");
@@ -547,10 +654,10 @@ async function firstRunAndReadability(session: Session, harnessId: string): Prom
   await page.getByRole("button", { name: "Adjust" }).click();
   await until(
     page,
-    "Adjust to land on Settings",
-    async () => (await page.evaluate(() => globalThis.location.hash)) === globalRoute("settings"),
+    "Adjust to land on Readability",
+    async () => (await page.evaluate(() => globalThis.location.hash)) === "#/settings/readability",
   );
-  await settle(page, "Settings");
+  await settle(page, "#/settings/readability");
   await until(page, "focus in the Readability card", async () =>
     activeWithin(page, "#readability"),
   );
@@ -572,7 +679,7 @@ async function firstRunAndReadability(session: Session, harnessId: string): Prom
   await setPrefs(page, { firstRunDone: true });
 
   // A draft survives a reload of the tab.
-  await freshVisit(session, harnessRoute(harnessId, "advisor"));
+  await freshVisit(session, routeFor("#/h/:id/overview/needs-you", harness));
   const title = page.locator('input[aria-label="issue title"]');
   await title.fill("the agent loops on a refusal");
   await title.dispatchEvent("input");
@@ -591,7 +698,8 @@ const specEditPath = (id: string): string => `/api/h/${encodeURIComponent(id)}/s
  * top" opens the typed dialog again over the new diff, and nothing is sent
  * until the name is typed again.
  */
-async function conflictAsksAgain(session: Session, harnessId: string): Promise<void> {
+async function conflictAsksAgain(session: Session, harness: RouteHarness): Promise<void> {
+  const harnessId = harness.id;
   const { page } = session;
   let edits = 0;
   await page.route(`**${specEditPath(harnessId)}`, (route) => {
@@ -608,7 +716,7 @@ async function conflictAsksAgain(session: Session, harnessId: string): Promise<v
       : route.fulfill({ status: 200, contentType: "application/json", body: '{"ok":true}' });
   });
   try {
-    await freshVisit(session, harnessRoute(harnessId, "spec"));
+    await freshVisit(session, routeFor("#/h/:id/setup/spec", harness));
     const row = page.locator("tr", { has: page.locator("td.mono", { hasText: /^agent\.model$/ }) });
     await row.getByRole("button", { name: "Review & apply" }).click();
     const typed = "dialog[open] input[placeholder]";
@@ -656,7 +764,7 @@ async function wikiDraftAgainstNewer(scope: JourneyScope): Promise<void> {
   });
   const area = page.locator('textarea[aria-label="article body"]');
   const openEditor = async (): Promise<void> => {
-    await freshVisit(session, harnessRoute(h.id, "memory"));
+    await freshVisit(session, routeFor("#/h/:id/knowledge/memory", h));
     await page
       .locator('nav[aria-label="memory fabric panels"] button', { hasText: "Wiki" })
       .click();
@@ -716,7 +824,7 @@ export const keyboardTour: Journey = {
   id: "keyboard-tour",
   shard: "axe",
   proves:
-    "Every gated screen works by keyboard alone: a skip link first, a visible unobscured focus and no trap, dialogs that hold focus and give it back on Escape, a command menu that arms actions rather than running them and confirms them by keyboard, inbox verdicts that take two keys and only in the list, tooltips, controls that keep focus across their updates, a refresh that keeps an open editor, the first-run card, Readability and drafts; a conflict asks for a typed confirmation again, and a restored wiki draft never writes over a newer version.",
+    "Every toured screen works by keyboard alone: a skip link first, a visible unobscured focus and no trap, the header's lists and the narrow Menu that close on Escape and give focus back, the section nav and sub-view list, dialogs that hold focus and give it back on Escape, a command menu that arms actions rather than running them and confirms them by keyboard, inbox verdicts that take two keys and only in the list, tooltips, controls that keep focus across their updates, a refresh that keeps an open editor, the first-run card, Readability and drafts; a conflict asks for a typed confirmation again, and a restored wiki draft never writes over a newer version.",
   run: async (scope) => {
     const world = await a11yFleet(scope, "keyboard-tour");
     const id = world.harness.id;
@@ -744,17 +852,18 @@ export const keyboardTour: Journey = {
         }
       });
       await skipLink(session);
-      await tourEveryScreen(session, id, theme);
+      await tourEveryScreen(session, world.harness, theme);
       if (theme === "dark") {
-        await overlays(session, id);
+        await shellByKeyboard(session, world.harness);
+        await overlays(session, world.harness);
         const before = starts;
         await commandMenu(session, () => starts - before);
         await tooltip(session);
-        await panelsAndToggles(session, id);
+        await panelsAndToggles(session, world.harness);
         await keyedRefresh(session);
-        await inbox(session, id);
-        await firstRunAndReadability(session, id);
-        await conflictAsksAgain(session, id);
+        await inbox(session, world.harness);
+        await firstRunAndReadability(session, world.harness);
+        await conflictAsksAgain(session, world.harness);
         // Last: these leave the tab signed out.
         await sessionEndsMidUse(session);
         await signInScreen(session);
@@ -762,6 +871,7 @@ export const keyboardTour: Journey = {
       session.assertClean();
       await session.close();
     }
+    await narrowMenu(scope, world.home);
     await wikiDraftAgainstNewer(scope);
   },
 };

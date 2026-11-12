@@ -1,18 +1,19 @@
 /**
- * The floor under every gated screen that axe does not measure: reflow at
- * 320 CSS px, text spacing, the accessibility tree of the shell and of each
- * overlay, reduced motion from the system and from Readability, and
- * announcements that are polite for information and assertive only for an
- * error.
+ * The floor under the toured screens that axe does not measure: reflow at
+ * 320 CSS px (the shell with its Menu open too), text spacing, the
+ * accessibility tree of the shell — the header, a harness's section nav and
+ * its sub-view list — and of each overlay, reduced motion from the system
+ * and from Readability, and announcements that are polite for information
+ * and assertive only for an error.
  */
 import type { Page } from "playwright";
 import { ariaSnapshot } from "../a11y/aria";
 import type { A11yFinding } from "../a11y/finding";
-import { GATED_TEMPLATES } from "../a11y/gate";
+import { TOURED_TEMPLATES } from "../a11y/gate";
 import { reducedMotionFindings } from "../a11y/reduced-motion";
 import { reflowFinding } from "../a11y/reflow";
 import { textSpacingFindings } from "../a11y/text-spacing";
-import { LIBRARY_ROUTE, globalRoute, harnessRoute } from "../console-routes";
+import { HOME_ROUTE, type RouteHarness, routeFor } from "../console-routes";
 import type { Session } from "../session";
 import { settle } from "../settle";
 import {
@@ -25,11 +26,8 @@ import {
 } from "./a11y-states";
 import type { Journey } from "./journey";
 
-function routeOf(template: string, harnessId: string): string {
-  return template.startsWith("#/h/:id/")
-    ? harnessRoute(harnessId, template.slice("#/h/:id/".length))
-    : template;
-}
+/** The approvals inbox, where the announcements are heard. */
+const APPROVALS = "#/home/needs-you?type=approvals";
 
 const note = (out: string[], where: string, findings: readonly (A11yFinding | undefined)[]) => {
   for (const finding of findings) {
@@ -52,14 +50,52 @@ async function snapshotHolds(
   }
 }
 
-async function overlaySnapshots(session: Session, harnessId: string, out: string[]): Promise<void> {
+async function overlaySnapshots(
+  session: Session,
+  harness: RouteHarness,
+  out: string[],
+): Promise<void> {
   const { page } = session;
-  await freshVisit(session, LIBRARY_ROUTE);
+  await freshVisit(session, HOME_ROUTE);
   await snapshotHolds(page, out, "the shell", "body", [
     'link "Skip to content"',
-    'navigation "fleet screens"',
+    'navigation "Main"',
     "main",
     'button "Search',
+  ]);
+  await snapshotHolds(page, out, "the header", "header", [
+    'link "Home',
+    'link "Harnesses"',
+    'link "People"',
+    'link "Connections"',
+    'button "Help',
+    'button "Settings',
+  ]);
+  await snapshotHolds(page, out, "the page heading", "main", ['heading "Home" [level=1]']);
+  await page.locator('button[aria-controls="settings-menu"]').click();
+  await waitFor(page, "#settings-menu .menu-link", "the Settings list");
+  await snapshotHolds(page, out, "the Settings list", "#settings-menu", [
+    'link "Readability"',
+    'link "Your account"',
+    'button "Theme',
+  ]);
+  await resetOverlays(page);
+
+  await freshVisit(session, routeFor("#/h/:id/setup/spec", harness));
+  await snapshotHolds(page, out, "the section nav", 'nav[aria-label="Harness sections"]', [
+    'navigation "Harness sections"',
+    'link "Overview"',
+    'link "Work"',
+    'link "Quality"',
+    'link "Knowledge"',
+    'link "Setup"',
+  ]);
+  await snapshotHolds(page, out, "the sub-view list", 'nav[aria-label="Setup views"]', [
+    'navigation "Setup views"',
+    'heading "What it does"',
+    'link "Spec"',
+    'heading "What it uses"',
+    'link "Files"',
   ]);
 
   await pressOnPage(page, "/");
@@ -83,7 +119,7 @@ async function overlaySnapshots(session: Session, harnessId: string, out: string
   ]);
   await resetOverlays(page);
 
-  await freshVisit(session, harnessRoute(harnessId, "overview"));
+  await freshVisit(session, routeFor("#/h/:id", harness));
   await page.getByRole("button", { name: "Start", exact: true }).click();
   await waitFor(page, "dialog[open] .refusal-list", "the refusal dialog");
   await snapshotHolds(page, out, "the refusal dialog", "dialog[open]", [
@@ -93,7 +129,7 @@ async function overlaySnapshots(session: Session, harnessId: string, out: string
   ]);
   await resetOverlays(page);
 
-  await freshVisit(session, harnessRoute(harnessId, "spec"));
+  await freshVisit(session, routeFor("#/h/:id/setup/spec", harness));
   await page.getByRole("button", { name: "Pin to…" }).first().click();
   await waitFor(page, "dialog[open] input[placeholder]", "the typed confirm");
   await snapshotHolds(page, out, "the typed confirm", "dialog[open]", [
@@ -155,8 +191,8 @@ async function reducedMotion(session: Session, out: string[]): Promise<void> {
   const animations = () => page.evaluate(() => document.getAnimations().length);
 
   // The system's setting.
-  await freshVisit(session, LIBRARY_ROUTE);
-  await withHeldRequest(session, approvals, globalRoute("approvals"), async () => {
+  await freshVisit(session, HOME_ROUTE);
+  await withHeldRequest(session, approvals, APPROVALS, async () => {
     await page.emulateMedia({ reducedMotion: "no-preference" });
     if ((await animations()) === 0) {
       out.push("reduced motion: the skeleton does not animate at all, so no check below can fail");
@@ -171,8 +207,8 @@ async function reducedMotion(session: Session, out: string[]): Promise<void> {
   );
   await page.reload();
   await settle(page, "a reload");
-  await freshVisit(session, LIBRARY_ROUTE);
-  await withHeldRequest(session, approvals, globalRoute("approvals"), async () => {
+  await freshVisit(session, HOME_ROUTE);
+  await withHeldRequest(session, approvals, APPROVALS, async () => {
     if ((await page.evaluate(() => document.documentElement.dataset["motion"])) !== "reduce") {
       out.push("reduced motion (Readability): the choice did not reach the root element");
     }
@@ -197,7 +233,7 @@ async function announcements(session: Session, out: string[]): Promise<void> {
     }
     return false;
   };
-  await freshVisit(session, globalRoute("approvals"));
+  await freshVisit(session, APPROVALS);
   await page.locator('.inbox-card[tabindex="0"] .inbox-actions button:text-is("Grant")').click();
   await waitFor(page, ".toast-info", "an information toast");
   if ((await page.locator(".toast[role=alert], .toast [role=alert]").count()) > 0) {
@@ -214,7 +250,7 @@ async function announcements(session: Session, out: string[]): Promise<void> {
   await page.route(DENY, (route) =>
     route.fulfill({ status: 400, contentType: "text/plain", body: "refused for this test" }),
   );
-  await freshVisit(session, globalRoute("approvals"));
+  await freshVisit(session, APPROVALS);
   await page.locator('.inbox-card[tabindex="0"] .inbox-actions button:text-is("Deny")').click();
   await waitFor(page, ".toast-error", "an error toast");
   if (!(await waitText("assertive", "Deny failed")))
@@ -234,7 +270,7 @@ export const a11yFloor: Journey = {
   id: "a11y-floor",
   shard: "axe",
   proves:
-    "Every gated screen reflows at 320 px and loses nothing under the text-spacing overrides; the shell, the command menu and each overlay name every control and carry their roles; nothing animates under reduced motion from the system or from Readability; and information is announced politely, an error assertively.",
+    "Every toured screen, and the shell's open Menu, reflows at 320 px and loses nothing under the text-spacing overrides; the header, a harness's section nav and sub-view list, the command menu and each overlay name every control and carry their roles; nothing animates under reduced motion from the system or from Readability; and information is announced politely, an error assertively.",
   run: async (scope) => {
     const world = await a11yFleet(scope, "a11y-floor");
     const id = world.harness.id;
@@ -253,10 +289,15 @@ export const a11yFloor: Journey = {
       label: "a11y-floor-reflow",
       viewport: { width: 320, height: 800 },
     });
-    for (const template of GATED_TEMPLATES) {
-      await freshVisit(narrow, routeOf(template, id));
+    for (const template of TOURED_TEMPLATES) {
+      await freshVisit(narrow, routeFor(template, world.harness));
       note(out, `${template} at 320`, [await reflowFinding(narrow.page)]);
     }
+    // The shell's Menu, open, reflows too.
+    await freshVisit(narrow, HOME_ROUTE);
+    await narrow.page.locator("button.menu-toggle").click();
+    await waitFor(narrow.page, "#narrow-menu .menu-link", "the Menu at 320");
+    note(out, "the open Menu at 320", [await reflowFinding(narrow.page)]);
     narrow.assertClean();
     await narrow.close();
 
@@ -268,15 +309,15 @@ export const a11yFloor: Journey = {
     await mockRefusals(session.page, id);
     // Spacing is written onto every node: a reload before each screen starts
     // it from the page as served, where a visit would keep the spaced shell.
-    for (const template of GATED_TEMPLATES) {
-      await freshVisit(session, routeOf(template, id));
+    for (const template of TOURED_TEMPLATES) {
+      await freshVisit(session, routeFor(template, world.harness));
       await session.page.reload();
       await settle(session.page, template);
       note(out, `${template} text spacing`, await textSpacingFindings(session.page));
     }
     await session.page.reload();
     await settle(session.page, "a reload");
-    await overlaySnapshots(session, id, out);
+    await overlaySnapshots(session, world.harness, out);
     await reducedMotion(session, out);
     await announcements(session, out);
     session.assertClean();
