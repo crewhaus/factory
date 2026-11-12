@@ -463,3 +463,94 @@ describe("the verbs", () => {
     expect(existsSync(approversOf(harnessDir))).toBe(true);
   });
 });
+
+describe("access proxy", () => {
+  const settingsOf = (): Record<string, unknown> =>
+    JSON.parse(readFileSync(join(hangarRoot, "settings.json"), "utf8")) as Record<string, unknown>;
+
+  test("with nothing set, says Home trusts no proxy", async () => {
+    const out = await run(["proxy"]);
+    expect(out.exitCode).toBe(0);
+    expect(out.lines.join("\n")).toContain("trusts no reverse proxy");
+  });
+
+  test("writes the block, prints the secret once, and stores only its digest", async () => {
+    mkdirSync(hangarRoot, { recursive: true });
+    writeFileSync(
+      join(hangarRoot, "settings.json"),
+      JSON.stringify({ readOnly: true, access: { allowedHosts: ["nas.local"] } }),
+    );
+    const out = await run([
+      "proxy",
+      "--header",
+      "X-Auth-User",
+      "--peer",
+      "127.0.0.1/32",
+      "--host",
+      "home.example.test",
+    ]);
+    expect(out.exitCode).toBe(0);
+    const text = out.lines.join("\n");
+    const match = /CrewHaus-Proxy-Secret: ([A-Za-z0-9_-]{43})/i.exec(text);
+    expect(match).not.toBeNull();
+    const secret = match?.[1] as string;
+    expect(text.split(secret).length).toBe(2); // printed once
+    expect(text).toContain("Restart Home");
+    const settings = settingsOf();
+    const access = settings["access"] as {
+      trustedProxy: Record<string, unknown>;
+      allowedHosts: string[];
+    };
+    expect(access.allowedHosts).toEqual(["nas.local"]);
+    expect(settings["readOnly"]).toBe(true);
+    expect(access.trustedProxy).toEqual({
+      header: "x-auth-user",
+      peers: ["127.0.0.1/32"],
+      hosts: ["home.example.test"],
+      secretDigest: Buffer.from(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret)),
+      ).toString("hex"),
+    });
+    expect(readFileSync(join(hangarRoot, "settings.json"), "utf8")).not.toContain(secret);
+    // Reading it back names no digest and no secret.
+    const shown = (await run(["proxy"])).lines.join("\n");
+    expect(shown).toContain("x-auth-user");
+    expect(shown).not.toContain(access.trustedProxy["secretDigest"] as string);
+    expect(shown).not.toContain(secret);
+  });
+
+  test("--socket stores no secret and points the proxy at Home's proxy socket", async () => {
+    if (process.platform === "win32") return;
+    const out = await run(["proxy", "--header", "x-auth-user", "--socket"]);
+    expect(out.exitCode).toBe(0);
+    expect(out.lines.join("\n")).toContain(join(hangarRoot, "proxy.sock"));
+    const proxy = (settingsOf()["access"] as { trustedProxy: Record<string, unknown> })
+      .trustedProxy;
+    expect(proxy["socket"]).toBe(true);
+    expect(proxy["secretDigest"]).toBeUndefined();
+  });
+
+  test("--off removes the block and keeps the rest", async () => {
+    await run(["proxy", "--header", "x-auth-user", "--peer", "10.0.0.0/8"]);
+    const out = await run(["proxy", "--off"]);
+    expect(out.exitCode).toBe(0);
+    expect("access" in settingsOf()).toBe(false);
+  });
+
+  test("refuses bad input before writing anything, and another user of this computer", async () => {
+    await expect(
+      run(["proxy", "--header", "x-auth-user", "--peer", "10.0.0.0/33"]),
+    ).rejects.toThrow(/not a CIDR block/);
+    await expect(run(["proxy", "--header", "x-auth-user"])).rejects.toThrow(/--peer/);
+    await expect(run(["proxy", "--off", "--header", "x"])).rejects.toThrow(/cannot be combined/);
+    expect(existsSync(join(hangarRoot, "settings.json"))).toBe(false);
+    await run(["members"]);
+    expect(
+      (await run(["grant", "--member", "Ana", "--create", "--role", "viewer", "--home"])).exitCode,
+    ).toBe(0);
+    const eve = await run(["proxy", "--header", "x-auth-user", "--peer", "10.0.0.0/8"], OTHER);
+    expect(eve.exitCode).toBe(1);
+    expect(eve.lines.join(" ")).toContain("belongs to another user");
+    expect(existsSync(join(hangarRoot, "settings.json"))).toBe(false);
+  });
+});

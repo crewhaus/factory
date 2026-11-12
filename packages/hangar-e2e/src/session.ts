@@ -124,12 +124,13 @@ export function consoleErrorReason(
 const spentBootPaths = new WeakSet<object>();
 
 /**
- * The path that signs a new session in. `bootPath` is one single-use ticket
- * minted at boot, so the first session on a Home spends it and any later one
- * trades the token for its own.
+ * The path that signs a new session in: a single-use boot link, which redirects to a
+ * one-time code the console trades for a session of its own. `bootPath` is one link
+ * minted at boot (empty when there is none), so the first session on a Home spends it
+ * and any later one mints its own with Home's key, from loopback, as the CLI does.
  */
-async function signInPath(home: HomeAddress): Promise<string> {
-  if (!spentBootPaths.has(home)) {
+export async function signInPath(home: HomeAddress): Promise<string> {
+  if (!spentBootPaths.has(home) && home.bootPath !== "") {
     spentBootPaths.add(home);
     return home.bootPath;
   }

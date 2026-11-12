@@ -22,9 +22,12 @@
  * tests and CI hermetic), which matches the server's own
  * `~/.crewhaus/hangar` default under the default registry root.
  *
- * The auth token is handed to the browser as a URL FRAGMENT (`/#t=<token>`),
- * NEVER a query string — fragments never leave the browser, so the token
- * cannot land in server logs or referrer headers.
+ * Home's own key (`<hangarRoot>/token`) stays on this computer: no printed
+ * line, QR code or argument list carries it. A browser on this computer signs
+ * in through a single-use boot link (`/boot/<nonce>`), which redirects to a
+ * one-time code the browser trades, with a key of its own, for a session.
+ * The CLI mints that link with Home's own key over `<hangarRoot>/home.sock`
+ * (TCP loopback where there is no socket).
  *
  * Factored out of the entry file `index.ts` (which runs a top-level argv
  * switch and so cannot be imported by a test without executing the CLI).
@@ -49,14 +52,17 @@
  * 403 remedy tells operators to restart into.
  *
  * `--lan` is the phone door: it binds the address `lan-address.ts` picks for
- * this machine and prints a QR code (`@crewhaus/qr-code`, imported
- * STATICALLY for the same compiled-binary reason as the UI assets) that
- * encodes the same `/#t=<token>` url the summary already prints. It is its
- * own opt-in rather than a second `--host`: typing it is exactly the
- * deliberate, visible act HM-201 asks for, so the environment variable is
- * not demanded on top. Nothing else is relaxed — auth stays mandatory, and
- * the QR carries the bearer token, which is why the boot summary says so out
- * loud and the docs pair it with `--read-only` for a screen share.
+ * this machine (and loopback beside it, so this computer's own browser still
+ * signs in) and prints a QR code (`@crewhaus/qr-code`, imported STATICALLY
+ * for the same compiled-binary reason as the UI assets) that encodes the bare
+ * LAN address. It is its own opt-in rather than a second `--host`: typing it
+ * is exactly the deliberate, visible act HM-201 asks for, so the environment
+ * variable is not demanded on top. Nothing else is relaxed — auth stays
+ * mandatory, and the code carries no credential: the phone opens Home and is
+ * asked to sign in.
+ *
+ * Every verb that resolves Home's directory first refuses one taken from a
+ * `.env` file in the working directory (`hangar-env.ts`).
  *
  * Bad arguments throw plain `Error`s; the entry file routes them through
  * `die()` like `harness` does.
@@ -72,6 +78,7 @@ import {
 } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
+import { HOME_SOCKET, type LocalIdentity, loadAccessSnapshot } from "@crewhaus/access-control";
 import {
   DEFAULT_HANGAR_PORT,
   type HangarServer,
@@ -91,6 +98,8 @@ import {
   shutdownReportLines,
 } from "@crewhaus/harness-supervisor";
 import { encodeQr, renderQrLines, renderedWidth } from "@crewhaus/qr-code";
+import { dotenvRootRefusal } from "./hangar-env";
+import { rotateTokenVerb } from "./hangar-rotate";
 import { assetSmokeCheck, problemSummary } from "./hangar-smoke";
 import {
   type InterfaceMap,
@@ -151,39 +160,58 @@ export type HangarCommandOptions = {
   /** Whether to wrap the QR code in the SGR pair that pins its contrast.
    *  Defaults to "stdout is a TTY and NO_COLOR is unset". */
   readonly color?: boolean;
+  /** The working directory whose `.env*` files must not choose Home's
+   *  directories; defaults to `process.cwd()`. */
+  readonly cwd?: string;
+  /** Reads a dotenv file for that check; injected by tests. */
+  readonly readFile?: (path: string) => string | undefined;
+  /** The OS user acting (`rotate-token`); `os.userInfo()` and `os.hostname()` by default. */
+  readonly identity?: LocalIdentity;
 };
 
 const HANGAR_USAGE_LINES: readonly string[] = [
   "usage:",
   "  crewhaus hangar [serve]                      boot the Hangar manager console (the local",
   "       [--port <n>] [--host <h>] [--lan]       web UI over the machine-wide harness",
-  "       [--no-auth] [--no-open] [--no-qr]       registry) and open it in the browser",
+  "       [--allow-host <name>]...                registry) and open it in the browser",
+  "       [--no-auth] [--no-open] [--no-qr]",
   "       [--smoke] [--read-only]",
   "       [--read-only-locked]",
-  "  crewhaus hangar status [--json]              lock/port/registry/token report — works",
-  "                                               without a running server",
-  "  crewhaus hangar open                         print + open the running console's URL",
+  "  crewhaus hangar status [--json]              lock/port/registry report — works without",
+  "                                               a running server",
+  "  crewhaus hangar open [--print]               sign a browser on this computer in",
   "  crewhaus hangar qr [--ascii] [--no-color]    reprint the running console's QR code",
+  "  crewhaus hangar rotate-token [--socket-only | --tcp]",
+  "                                               replace Home's own key",
   "",
-  "  The console binds 127.0.0.1:4200 by default and hands its bearer token",
-  "  to the browser as a URL #fragment (never a query string). --host binds",
-  "  another interface: it REQUIRES auth and, because the console is machine",
-  `  control over plain HTTP, also ${REMOTE_BIND_ENV}=1.`,
+  "  The console binds 127.0.0.1:4200 by default. A browser on this computer",
+  "  signs in through a one-time link that `crewhaus hangar` and",
+  "  `crewhaus hangar open` open for you; `open --print` shows the link instead,",
+  "  to paste into the sign-in screen (it works once, for 2 minutes). Home's own",
+  "  key stays in its directory: it works only from this computer.",
+  "  --host binds another interface: it REQUIRES auth and, because the console",
+  `  is machine control over plain HTTP, also ${REMOTE_BIND_ENV}=1.`,
   "  --no-auth is loopback-dev only.",
-  "  --lan binds this machine's LAN address instead, and prints a QR code to",
+  "  --lan binds this machine's LAN address as well, and prints a QR code to",
   "  scan with a phone on the same network. It is its own opt-in — typing it",
-  `  is the deliberate act ${REMOTE_BIND_ENV} asks for — but it is the same`,
-  "  exposure: machine control over plain HTTP, with a bearer token as the",
-  "  only boundary. The QR carries that token, so treat the code like the",
-  "  credential it is, and pair it with --read-only for a screen share.",
-  "  --no-qr boots the LAN console without printing one.",
+  `  is the deliberate act ${REMOTE_BIND_ENV} asks for. The code carries no`,
+  "  credential: the phone opens Home, over plain HTTP. --no-qr skips it.",
+  "  --allow-host <name> adds a name Home answers to (a name in your hosts",
+  "  file, say); any other name gets 421. Repeat it for more than one.",
   "  --read-only boots the console with every mutating route refused (403) —",
   "  the screen-share posture; it can still be lifted from the UI. Add",
   "  --read-only-locked when the person driving is not the person who owns",
   "  the machine: the mode then cannot be turned off over the wire, only by",
   "  restarting the manager without the flag.",
-  "  --smoke boots on an ephemeral port, self-checks the embedded UI + API",
-  "  auth, and exits — the release workflow's compiled-binary smoke entry.",
+  "  --smoke boots on an ephemeral port, self-checks the embedded UI, the",
+  "  sign-in rules and the Host check, and exits — the release workflow's",
+  "  compiled-binary smoke entry.",
+  "  rotate-token replaces Home's own key and signs every browser out;",
+  "  --socket-only takes the key off TCP for good (only the CLI, over",
+  "  <hangarRoot>/home.sock, uses it), and --tcp puts it back. It works with",
+  "  Home running.",
+  "  Home's directories (CREWHAUS_HANGAR_ROOT, CREWHAUS_REGISTRY_ROOT) are read",
+  "  from your shell only, never from a .env file.",
   "  One instance per hangar root: <hangarRoot>/hangar.lock (stale locks",
   "  from dead pids are replaced automatically).",
 ];
@@ -341,16 +369,19 @@ export { resolveHangarRoot };
 // Tiny per-verb flag parsing (harness-cmd posture: throw plain Errors)
 // ---------------------------------------------------------------------------
 
-type VerbFlagSpec = Readonly<Record<string, "value" | "boolean">>;
+type VerbFlagSpec = Readonly<Record<string, "value" | "values" | "boolean">>;
 
 type VerbArgs = {
   readonly positional: readonly string[];
   readonly flags: ReadonlyMap<string, string | true>;
+  /** Every value of a repeatable flag, in order. */
+  readonly lists: ReadonlyMap<string, readonly string[]>;
 };
 
 function parseVerbArgs(verb: string, argv: readonly string[], spec: VerbFlagSpec): VerbArgs {
   const positional: string[] = [];
   const flags = new Map<string, string | true>();
+  const lists = new Map<string, string[]>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === undefined) continue;
@@ -363,10 +394,11 @@ function parseVerbArgs(verb: string, argv: readonly string[], spec: VerbFlagSpec
           `hangar ${verb}: unknown flag "${a}"${known.length > 0 ? ` (expected: ${known.join(", ")})` : ""}`,
         );
       }
-      if (kind === "value") {
+      if (kind === "value" || kind === "values") {
         const v = argv[i + 1];
         if (v === undefined) throw new Error(`hangar ${verb}: ${a} requires a value`);
         flags.set(name, v);
+        if (kind === "values") lists.set(name, [...(lists.get(name) ?? []), v]);
         i++;
       } else {
         flags.set(name, true);
@@ -375,7 +407,7 @@ function parseVerbArgs(verb: string, argv: readonly string[], spec: VerbFlagSpec
       positional.push(a);
     }
   }
-  return { positional, flags };
+  return { positional, flags, lists };
 }
 
 // ---------------------------------------------------------------------------
@@ -412,20 +444,76 @@ function jsonLines(value: unknown): string[] {
   return JSON.stringify(value, null, 2).split("\n");
 }
 
-/** The URL to PRINT: token as a #fragment (never a query string — fragments
- *  never leave the browser, so the token cannot leak into logs/referrers).
- *  Printing to the operator's own terminal is fine; see {@link handoffUrl}
- *  for what may be passed to another process. */
-function fragmentUrl(baseUrl: string, token: string | undefined): string {
-  return token !== undefined && token !== "" ? `${baseUrl}/#t=${token}` : baseUrl;
-}
-
-/** The URL to HAND TO THE BROWSER. A child process's argv is readable by
- *  every other process on the machine, so the token must not appear in it:
- *  the server's single-use `/boot/<nonce>` path redirects to the fragment
- *  form instead, and a nonce scraped from a process list is already spent. */
+/** The URL to HAND TO THE BROWSER: the server's single-use `/boot/<nonce>`
+ *  path, which redirects once to a one-time sign-in code. A child process's
+ *  argv is readable by every other process on the machine, and a nonce
+ *  scraped from a process list is already spent. */
 function handoffUrl(baseUrl: string, bootPath: string | undefined): string {
   return bootPath !== undefined && bootPath !== "" ? `${baseUrl}${bootPath}` : baseUrl;
+}
+
+/** The address a browser on THIS computer opens: loopback, at the same port,
+ *  whatever else Home is bound to (a plain-HTTP LAN address is no place to
+ *  sign in from: WebCrypto exists only on an encrypted or local page). */
+export function loopbackBase(url: string, port: number): string {
+  const host = hostFromUrl(url);
+  return host !== undefined && isLoopbackHost(host) ? url : `http://127.0.0.1:${port}`;
+}
+
+/** Stop before anything else when Home's directory came from a dotenv file. */
+function refuseDotenvRoots(opts: HangarCommandOptions): void {
+  const refusal = dotenvRootRefusal({
+    cwd: opts.cwd ?? process.cwd(),
+    ...(opts.readFile !== undefined ? { readFile: opts.readFile } : {}),
+  });
+  if (refusal !== undefined) throw new Error(refusal);
+}
+
+const BOOT_TICKET_TIMEOUT_MS = 5_000;
+
+/** What the running console answered a boot-link request. */
+type BootPathAnswer =
+  | { readonly kind: "minted"; readonly bootPath: string }
+  /** Home refused the key in `<hangarRoot>/token`: the file is not the key it recorded. */
+  | { readonly kind: "key-refused" }
+  | { readonly kind: "unavailable" };
+
+/**
+ * Mint a single-use boot link on the running console with Home's own key,
+ * over `<hangarRoot>/home.sock` when it is there (TCP loopback otherwise).
+ */
+async function mintBootPath(hangarRoot: string, lock: HangarLock): Promise<BootPathAnswer> {
+  const unavailable = { kind: "unavailable" } as const;
+  let token: string;
+  try {
+    token = readFileSync(join(hangarRoot, TOKEN_FILENAME), "utf8").trim();
+  } catch {
+    return unavailable;
+  }
+  if (token === "") return unavailable;
+  const sock = join(hangarRoot, HOME_SOCKET);
+  const init = {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: "{}",
+    signal: AbortSignal.timeout(BOOT_TICKET_TIMEOUT_MS),
+  };
+  try {
+    const res = existsSync(sock)
+      ? await fetch("http://localhost/api/boot-ticket", { ...init, unix: sock } as RequestInit)
+      : await fetch(`${loopbackBase(lock.url, lock.port)}/api/boot-ticket`, init);
+    if (res.status === 401) {
+      const body = (await res.json().catch(() => ({}))) as { reason?: unknown };
+      return body.reason === "credential_unknown" ? { kind: "key-refused" } : unavailable;
+    }
+    if (!res.ok) return unavailable;
+    const body = (await res.json()) as { bootPath?: unknown };
+    return typeof body.bootPath === "string" && /^\/boot\/[0-9a-f]{64}$/.test(body.bootPath)
+      ? { kind: "minted", bootPath: body.bootPath }
+      : unavailable;
+  } catch {
+    return unavailable;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +537,8 @@ type ServeFlags = {
   readonly lan: boolean;
   /** Suppress the QR code a LAN bind would otherwise print. */
   readonly noQr: boolean;
+  /** More names Home answers to (`--allow-host`, repeatable). */
+  readonly allowHosts: readonly string[];
 };
 
 function parseServeFlags(argv: readonly string[]): ServeFlags {
@@ -462,9 +552,16 @@ function parseServeFlags(argv: readonly string[]): ServeFlags {
     smoke: "boolean",
     "read-only": "boolean",
     "read-only-locked": "boolean",
+    "allow-host": "values",
   });
   if (args.positional.length > 0) {
     throw new Error(`hangar serve: unexpected argument "${args.positional[0]}"`);
+  }
+  const allowHosts = [...(args.lists.get("allow-host") ?? [])];
+  for (const name of allowHosts) {
+    if (!/^[A-Za-z0-9.-]{1,253}$/.test(name) || name.startsWith(".") || name.endsWith(".")) {
+      throw new Error(`hangar serve: --allow-host takes a host name (got "${name}")`);
+    }
   }
   const portFlag = args.flags.get("port");
   let port: number | undefined;
@@ -489,6 +586,7 @@ function parseServeFlags(argv: readonly string[]): ServeFlags {
     smoke: args.flags.get("smoke") === true,
     readOnly: readOnlyLocked || args.flags.get("read-only") === true,
     readOnlyLocked,
+    allowHosts,
   };
   if (flags.lan && flags.host !== undefined) {
     throw new Error(
@@ -538,7 +636,22 @@ async function runSmokeChecks(server: HangarServer, write: (line: string) => voi
       ...(headers !== undefined ? { headers } : {}),
       signal: AbortSignal.timeout(SMOKE_FETCH_TIMEOUT_MS),
     });
-  const checks: ReadonlyArray<{ readonly name: string; readonly run: () => Promise<void> }> = [
+  /** As the CLI authenticates: over Home's own socket when there is one. */
+  const asCli = (path: string, headers: Record<string, string>): Promise<Response> =>
+    server.socketPath !== undefined
+      ? fetch(`http://localhost${path}`, {
+          headers,
+          unix: server.socketPath,
+          signal: AbortSignal.timeout(SMOKE_FETCH_TIMEOUT_MS),
+        } as RequestInit)
+      : get(path, headers);
+  const access = loadAccessSnapshot(server.hangarRoot);
+  const socketOnly =
+    access.state === "present" &&
+    access.snapshot.tokens.some(
+      (row) => row.kind === "bootstrap" && row.state === "active" && row.socketOnly === true,
+    );
+  const checks: Array<{ readonly name: string; readonly run: () => Promise<void> }> = [
     {
       name: "GET /healthz answers ok",
       run: async () => {
@@ -567,21 +680,49 @@ async function runSmokeChecks(server: HangarServer, write: (line: string) => voi
       },
     },
     {
-      name: "GET /api/harnesses with the bearer token answers 200 JSON",
+      name: "GET /api/harnesses with Home's own key answers 200 JSON",
       run: async () => {
-        const res = await get("/api/harnesses", { authorization: `Bearer ${token}` });
+        const res = await asCli("/api/harnesses", { authorization: `Bearer ${token}` });
         if (res.status !== 200) throw new Error(`status ${res.status}`);
         await res.json();
       },
     },
     {
-      name: "GET /api/harnesses without a token is refused (401)",
+      name: "GET /api/harnesses without a credential is refused (401)",
       run: async () => {
         const res = await get("/api/harnesses");
         if (res.status !== 401) throw new Error(`status ${res.status} (expected 401)`);
       },
     },
+    {
+      name: "a request with a foreign Host is refused (421)",
+      run: async () => {
+        const res = await get("/api/harnesses", {
+          host: "rebind.example.test",
+          authorization: `Bearer ${token}`,
+        });
+        if (res.status !== 421) throw new Error(`status ${res.status} (expected 421)`);
+        // The plain-text refusal, never an /api answer.
+        const type = res.headers.get("content-type") ?? "";
+        const text = await res.text();
+        if (!type.startsWith("text/plain") || text.includes("harnesses")) {
+          throw new Error("the refusal carried a body from /api");
+        }
+      },
+    },
   ];
+  if (socketOnly) {
+    checks.push({
+      name: "Home's own key is refused over TCP and accepted on its socket",
+      run: async () => {
+        const tcp = await get("/api/harnesses", { authorization: `Bearer ${token}` });
+        if (tcp.status !== 401) throw new Error(`TCP answered ${tcp.status} (expected 401)`);
+        if (server.socketPath === undefined) throw new Error("Home has no socket");
+        const sock = await asCli("/api/harnesses", { authorization: `Bearer ${token}` });
+        if (sock.status !== 200) throw new Error(`the socket answered ${sock.status}`);
+      },
+    });
+  }
   for (const check of checks) {
     try {
       await check.run();
@@ -675,18 +816,18 @@ export function qrBlockLines(url: string, options: QrBlockOptions = {}): string[
   return [...(caption !== undefined ? [caption, ""] : []), ...renderQrLines(qr, renderOptions)];
 }
 
-/** The boxed boot summary (plain box-drawing, no color codes). */
+/** The boxed boot summary (plain box-drawing, no color codes). It carries
+ *  no credential: Home's own key is named by where it lives, never shown. */
 function summaryLines(
   server: HangarServer,
-  openUrl: string,
   harnessCount: number | undefined,
   lan: LanAddress | undefined,
 ): string[] {
-  const rows: Array<[string, string]> = [["url", openUrl]];
+  const rows: Array<[string, string]> = [["url", server.loopbackUrl ?? server.url]];
   if (lan !== undefined) {
     rows.push([
       "network",
-      `${lan.interfaceName} — every device on this network can reach this console over plain HTTP`,
+      `${server.url} on ${lan.interfaceName} — every device on this network can reach this console over plain HTTP`,
     ]);
   } else if (!server.noAuth) {
     // The one line that tells an operator the feature exists, on the boot
@@ -699,10 +840,8 @@ function summaryLines(
   if (server.noAuth) {
     rows.push(["auth", "DISABLED (--no-auth) — every local process can read this fleet's state"]);
   } else {
-    rows.push([
-      "token",
-      `${server.tokenPath ?? "(supplied via options)"} — sent as a URL #fragment`,
-    ]);
+    rows.push(["sign in", "a browser on this computer: crewhaus hangar open"]);
+    rows.push(["key", `${server.tokenPath ?? "(none)"}, stays on this computer`]);
   }
   rows.push([
     "registry",
@@ -761,6 +900,7 @@ async function hangarServe(
   opts: HangarCommandOptions,
 ): Promise<HangarCommandResult> {
   const flags = parseServeFlags(argv);
+  refuseDotenvRoots(opts);
   const env = opts.env ?? process.env;
   // HM-201 — the remote-bind opt-in. `parseServeFlags` is pure argv, and
   // this gate reads the environment, so it lives here rather than in the
@@ -812,6 +952,7 @@ async function hangarServe(
     ...(flags.noAuth ? { noAuth: true } : {}),
     ...(flags.readOnly ? { readOnly: true } : {}),
     ...(flags.readOnlyLocked ? { readOnlyLocked: true } : {}),
+    ...(flags.allowHosts.length > 0 ? { allowHosts: flags.allowHosts } : {}),
     assets: hangarAssets,
     env,
     now,
@@ -858,23 +999,25 @@ async function hangarServe(
     return { lines: [], exitCode };
   }
 
-  const openUrl = fragmentUrl(server.url, server.token);
-  for (const line of summaryLines(server, openUrl, registry?.list().length, lan)) write(line);
+  for (const line of summaryLines(server, registry?.list().length, lan)) write(line);
   // The QR goes last so it sits next to the shell prompt, which is the
-  // easiest place on the screen to point a phone at.
+  // easiest place on the screen to point a phone at. It encodes the bare LAN
+  // address: no credential, so a photo of the screen gives nobody a way in.
   if (lan !== undefined && !flags.noQr) {
     write("");
-    for (const line of qrBlockLines(openUrl, {
+    for (const line of qrBlockLines(server.url, {
       color: wantsColor(opts, env),
       columns: terminalColumns(opts),
-      caption: "scan to open Hangar on your phone — the code carries the access token:",
+      caption: "scan to open Home on your phone:",
     })) {
       write(line);
     }
     write("");
   }
   if (!flags.noOpen) {
-    (opts.openBrowser ?? openInBrowser)(handoffUrl(server.url, server.bootPath));
+    (opts.openBrowser ?? openInBrowser)(
+      handoffUrl(server.loopbackUrl ?? server.url, server.bootPath),
+    );
   }
 
   // Block until SIGINT/SIGTERM, then stop cleanly and release the lock.
@@ -921,6 +1064,7 @@ async function hangarServe(
 
 function hangarStatus(argv: readonly string[], opts: HangarCommandOptions): HangarCommandResult {
   const args = parseVerbArgs("status", argv, { json: "boolean" });
+  refuseDotenvRoots(opts);
   const env = opts.env ?? process.env;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
   const hangarRoot = resolveHangarRoot(env);
@@ -975,7 +1119,11 @@ function hangarStatus(argv: readonly string[], opts: HangarCommandOptions): Hang
       ? `registry: ${registry.path} (${harnessCount} harness(es))`
       : "registry: unreadable",
   );
-  lines.push(tokenPresent ? `token: ${tokenPath}` : `token: none minted yet (${tokenPath})`);
+  lines.push(
+    tokenPresent
+      ? `key: ${tokenPath} (Home's own key; it stays on this computer)`
+      : `key: none minted yet (${tokenPath})`,
+  );
   return { lines, exitCode: 0 };
 }
 
@@ -987,7 +1135,8 @@ async function hangarOpen(
   argv: readonly string[],
   opts: HangarCommandOptions,
 ): Promise<HangarCommandResult> {
-  parseVerbArgs("open", argv, {});
+  const args = parseVerbArgs("open", argv, { print: "boolean" });
+  refuseDotenvRoots(opts);
   const env = opts.env ?? process.env;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
   const hangarRoot = resolveHangarRoot(env);
@@ -998,38 +1147,44 @@ async function hangarOpen(
       exitCode: 1,
     };
   }
-  // Re-read the token file so the fragment survives console restarts that
-  // reminted it. A missing token file (a --no-auth boot) opens the bare url.
-  let token: string | undefined;
-  try {
-    token = readFileSync(join(hangarRoot, TOKEN_FILENAME), "utf8").trim();
-  } catch {
-    token = undefined;
+  // A browser on this computer opens loopback, whatever else Home is bound to.
+  const base = loopbackBase(lock.url, lock.port);
+  // Trade Home's own key (which this OS user can read from disk) for a
+  // single-use link, so the browser's command line carries nothing secret.
+  const answer = await mintBootPath(hangarRoot, lock);
+  if (answer.kind === "key-refused") {
+    return {
+      lines: [
+        `Home refused the key in ${join(hangarRoot, TOKEN_FILENAME)}: it is not the one Home recorded. Run \`crewhaus hangar rotate-token\` to make a new one, then \`crewhaus hangar open\` again.`,
+      ],
+      exitCode: 1,
+    };
   }
-  // Trade the token (which we can read from disk) for a single-use handoff
-  // path, so the browser command line carries no secret. If the running
-  // console is older or unreachable, fall back to opening the bare url and
-  // let the UI's token screen take over — never put the token in argv.
-  let handoff = lock.url;
-  if (token !== undefined && token !== "") {
-    try {
-      const res = await fetch(`${lock.url}/api/boot-ticket`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(5_000),
-      });
-      if (res.ok) {
-        const body = (await res.json()) as { bootPath?: unknown };
-        if (typeof body.bootPath === "string") handoff = handoffUrl(lock.url, body.bootPath);
-      }
-    } catch {
-      // Unreachable or auth-disabled console — bare url below.
+  if (answer.kind === "unavailable") {
+    if (args.flags.get("print") === true) {
+      return {
+        lines: [
+          `Home at ${base} did not give a sign-in link. Is it running from this release? Restart it with \`crewhaus hangar\`.`,
+        ],
+        exitCode: 1,
+      };
     }
+    (opts.openBrowser ?? openInBrowser)(base);
+    return {
+      lines: [`opened ${base} — Home did not give a sign-in link, so sign in there`],
+      exitCode: 0,
+    };
   }
-  (opts.openBrowser ?? openInBrowser)(handoff);
-  // Printed for manual copy: the operator's own terminal, not another
-  // process's argv.
-  return { lines: [fragmentUrl(lock.url, token)], exitCode: 0 };
+  const link = handoffUrl(base, answer.bootPath);
+  if (args.flags.get("print") === true) {
+    // The operator's own terminal: a link that works once, for 2 minutes.
+    return {
+      lines: [link, "it works once, for 2 minutes: paste it into Home's sign-in screen"],
+      exitCode: 0,
+    };
+  }
+  (opts.openBrowser ?? openInBrowser)(link);
+  return { lines: ["opened Home in your browser"], exitCode: 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1202,7 @@ async function hangarOpen(
  */
 function hangarQr(argv: readonly string[], opts: HangarCommandOptions): HangarCommandResult {
   const args = parseVerbArgs("qr", argv, { ascii: "boolean", "no-color": "boolean" });
+  refuseDotenvRoots(opts);
   const env = opts.env ?? process.env;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
   const hangarRoot = resolveHangarRoot(env);
@@ -1070,19 +1226,13 @@ function hangarQr(argv: readonly string[], opts: HangarCommandOptions): HangarCo
     };
   }
 
-  let token: string | undefined;
-  try {
-    token = readFileSync(join(hangarRoot, TOKEN_FILENAME), "utf8").trim();
-  } catch {
-    token = undefined;
-  }
-  const url = fragmentUrl(lock.url, token);
+  // The bare address: the code carries no credential.
   return {
-    lines: qrBlockLines(url, {
+    lines: qrBlockLines(lock.url, {
       color: args.flags.get("no-color") === true ? false : wantsColor(opts, env),
       columns: terminalColumns(opts),
       ...(args.flags.get("ascii") === true ? { ascii: true } : {}),
-      caption: "scan to open Hangar on your phone — the code carries the access token:",
+      caption: "scan to open Home on your phone:",
     }),
     exitCode: 0,
   };
@@ -1119,7 +1269,26 @@ export async function runHangarCommand(
       return await hangarOpen(argv.slice(1), opts);
     case "qr":
       return hangarQr(argv.slice(1), opts);
+    case "rotate-token": {
+      const args = parseVerbArgs("rotate-token", argv.slice(1), {
+        "socket-only": "boolean",
+        tcp: "boolean",
+      });
+      if (args.positional.length > 0) {
+        throw new Error(`hangar rotate-token: unexpected argument "${args.positional[0]}"`);
+      }
+      refuseDotenvRoots(opts);
+      return rotateTokenVerb({
+        hangarRoot: resolveHangarRoot(opts.env ?? process.env),
+        socketOnly: args.flags.get("socket-only") === true,
+        tcp: args.flags.get("tcp") === true,
+        ...(opts.identity !== undefined ? { identity: opts.identity } : {}),
+        ...(opts.now !== undefined ? { now: opts.now } : {}),
+      });
+    }
     default:
-      throw new Error(`unknown hangar verb "${verb}" (expected: serve | status | open | qr)`);
+      throw new Error(
+        `unknown hangar verb "${verb}" (expected: serve | status | open | qr | rotate-token)`,
+      );
   }
 }

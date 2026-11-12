@@ -148,6 +148,14 @@ const DRIVERS: Record<
   string,
   { call: () => Promise<unknown>; params?: Record<string, string>; query?: string }
 > = {
+  authChallenge: { call: () => api.authChallenge() },
+  authSession: {
+    call: () => api.authSession({ device: "dev_x", nonce: "n", signature: "s", seal: {} }),
+  },
+  authExchange: { call: () => api.authExchange({ code: "c", deviceJwk: {}, seal: {} }) },
+  authRefresh: { call: () => api.authRefresh({ seal: {} }) },
+  authSignOut: { call: () => api.authSignOut() },
+  bootTicket: { call: () => api.bootTicket("legacy") },
   version: { call: () => api.version() },
   harnesses: { call: () => api.harnesses() },
   addHarness: { call: () => api.addHarness("/h") },

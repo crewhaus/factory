@@ -35,6 +35,8 @@ export type BootHomeOptions = {
 
 export type Home = HomeAddress & {
   readonly port: number;
+  /** Where this Home looks for installed plugins (empty until a journey installs one). */
+  readonly pluginsDir: string;
   readonly fleet: Fleet;
   readonly notifications: RecordedNotifications;
   readonly server: HangarServer;
@@ -68,12 +70,13 @@ export function bootHome(fleet: Fleet, opts: BootHomeOptions = {}): Home {
           ...(opts.runJob !== undefined ? { runJob: opts.runJob } : {}),
         });
 
+  const pluginsDir = join(scratch, "plugins");
   const server = startHangarServer({
     port: 0,
     root,
     registryRoot: fleet.registryRoot,
     assets: hangarAssets,
-    pluginsDir: join(scratch, "plugins"),
+    pluginsDir,
     cwd,
     env,
     now,
@@ -96,6 +99,7 @@ export function bootHome(fleet: Fleet, opts: BootHomeOptions = {}): Home {
   return {
     url: server.url,
     port: server.port,
+    pluginsDir,
     bootPath,
     token,
     fleet,

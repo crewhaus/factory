@@ -15,6 +15,7 @@ import {
   normalizeWebhookUrl,
   openSettingsStore,
 } from "./settings";
+import { bootTestServer } from "./testkit";
 
 const root = (): string => mkdtempSync(join(tmpdir(), "hangar-settings-"));
 
@@ -100,5 +101,70 @@ describe("normalizeWebhookUrl", () => {
     expect(normalizeWebhookUrl("https://u:p@hooks.example.test/x").error).toContain("credentials");
     expect(normalizeWebhookUrl("not a url").error).toContain("valid URL");
     expect(normalizeWebhookUrl(42).error).toContain("string");
+  });
+});
+
+describe("the owner's blocks: access and links", () => {
+  const OWNER = {
+    access: {
+      allowedHosts: ["home.example.test"],
+      trustedProxy: {
+        header: "X-Auth-User",
+        peers: ["127.0.0.1/32"],
+        hosts: ["proxy.example.test"],
+        secretDigest: "a".repeat(64),
+      },
+    },
+    links: { baseUrl: "https://home.example.test" },
+  };
+
+  test("survive a notifications update and a read-only toggle, as the file has them now", () => {
+    const dir = root();
+    try {
+      const store = openSettingsStore(dir);
+      store.update({ readOnly: false });
+      // The owner edits the file by hand while Home runs.
+      const path = join(dir, SETTINGS_FILENAME);
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), ...OWNER }));
+      store.update({ notifications: { mutedGroups: ["prod"] } });
+      store.update({ readOnly: true });
+      const after = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      expect(after["access"]).toEqual(OWNER.access);
+      expect(after["links"]).toEqual(OWNER.links);
+      expect(after["readOnly"]).toBe(true);
+      expect((after["notifications"] as { mutedGroups: string[] }).mutedGroups).toEqual(["prod"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an invalid access block refuses Home's boot, naming the file and the field", () => {
+    expect(() =>
+      bootTestServer({
+        prepare: ({ hangarRoot }) =>
+          writeFileSync(
+            join(hangarRoot, SETTINGS_FILENAME),
+            JSON.stringify({ access: { allowedHosts: [7] } }),
+          ),
+      }),
+    ).toThrow(/settings\.json: access\.allowedHosts\[0\] is not a host name/);
+  });
+
+  test("an invalid links.baseUrl is warned about and ignored at boot", async () => {
+    const t = bootTestServer({
+      prepare: ({ hangarRoot }) =>
+        writeFileSync(
+          join(hangarRoot, SETTINGS_FILENAME),
+          JSON.stringify({ links: { baseUrl: "http://home.example.test" } }),
+        ),
+    });
+    try {
+      expect(t.warnings.some((w) => w.includes("links.baseUrl"))).toBe(true);
+      // Ignored: its host is not one Home answers to.
+      const res = await t.fetchRaw("/healthz-not", { headers: { host: "home.example.test" } });
+      expect(res.status).toBe(421);
+    } finally {
+      await t.stop();
+    }
   });
 });
