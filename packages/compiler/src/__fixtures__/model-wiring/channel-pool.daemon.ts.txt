@@ -11,6 +11,7 @@ import { createSessionRouter } from "./session-router.js";
 import { createGateway } from "./gateway.js";
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createDedupStore } from "@crewhaus/durable-state";
+import { resolveWebhookBodyLimit } from "@crewhaus/gateway-protocol/body-limit";
 import { createJanitor } from "@crewhaus/runtime-core";
 import { openAuditLog } from "@crewhaus/audit-log";
 import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
@@ -111,12 +112,20 @@ async function main(): Promise<void> {
   // CREWHAUS_DEDUP_STORE=sqlite:<path> so seen webhook ids survive restarts
   // and are shared by every daemon process on this host.
   const __dedupStore = createDedupStore(process.env["CREWHAUS_DEDUP_STORE"] ?? "memory");
+  // The webhook body limit: CHANNEL_WEBHOOK_MAX_BYTES, 1 MiB when unset. The
+  // gateway reads at most this much of a body before verifying it, and the
+  // public port refuses a declared length over it before the gateway runs.
+  const __webhookBodyLimit = resolveWebhookBodyLimit(process.env);
+  if (__webhookBodyLimit.warning !== undefined) {
+    process.stderr.write(`[daemon] ${__webhookBodyLimit.warning}\n`);
+  }
   const gateway = createGateway({
     adapters: new Map([["slack", slackAdapter]]),
     sessionRouter,
     approvals: __approvals,
     auditSink: __securityAudit,
     dedupStore: __dedupStore,
+    maxBodyBytes: __webhookBodyLimit.maxBytes,
   });
 
   // Boot-time self-heal janitor (ops item 36): evicts expired sessions on a
@@ -166,6 +175,7 @@ async function main(): Promise<void> {
   // control.v1 drain has been requested. Control itself is NEVER on this port.
   const server = Bun.serve({
     port,
+    maxRequestBodySize: __webhookBodyLimit.maxBytes,
     fetch: (__req) => __control.publicGate(__req) ?? ((req: Request) => gateway.handle(req))(__req),
   });
   process.stdout.write(`[daemon] listening on http://localhost:${server.port}\n`);

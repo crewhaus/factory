@@ -54,6 +54,10 @@ import {
   encodeSseEvent,
   encodeSuccess,
 } from "@crewhaus/gateway-protocol";
+import {
+  DEFAULT_WEBHOOK_MAX_BYTES,
+  readRequestBodyCapped,
+} from "@crewhaus/gateway-protocol/body-limit";
 import { withInboundContent } from "@crewhaus/run-context";
 import { type Tenant, buildTenant, validateTenantId, withTenant } from "@crewhaus/tenancy";
 
@@ -393,6 +397,13 @@ export type CreateGatewayServerOptions = {
 export const DEFAULT_CLOSE_GRACE_MS = 10_000;
 
 /**
+ * Most bytes of a `POST /federation` body the server reads (1 MiB). A peer's
+ * envelope carries its own authentication, so the body is read before the
+ * peer is known; past this it is answered 413 and the read stops.
+ */
+export const FEDERATION_MAX_BODY_BYTES = DEFAULT_WEBHOOK_MAX_BYTES;
+
+/**
  * Stop a `Bun.serve` handle gracefully, but under a bound.
  *
  * GRACEFUL, because `stop()`'s promise resolves only once in-flight requests
@@ -617,6 +628,22 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
     return log;
   }
 
+  /**
+   * The 401 for a request whose bearer is missing or does not verify, as
+   * handleEnvelope would answer it, or `undefined` for one that verifies.
+   */
+  function bearerRefusal(bearer: string | undefined): Response | undefined {
+    if (typeof bearer !== "string" || bearer === "") {
+      return errorResponse(encodeError("?", ErrorCode.Unauthorized, "missing bearer token"));
+    }
+    try {
+      verifyJwt(bearer, opts.jwtSecret, now);
+      return undefined;
+    } catch (err) {
+      return errorResponse(errorEnvelopeFor(err, "?"));
+    }
+  }
+
   async function handleEnvelope(envelope: unknown, bearer: string | undefined): Promise<unknown> {
     let id = "?";
     try {
@@ -815,9 +842,22 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
               : Response.json({ error: "federation is not enabled" }, { status: 404 });
           }
           if (req.method === "POST" && pathname === "/federation") {
+            // A peer authenticates inside the envelope, so the body is read
+            // before anything else is known about it: only when federation is
+            // on, and never more of it than FEDERATION_MAX_BODY_BYTES.
+            if (fed === undefined) {
+              return Response.json({ error: "federation is not enabled" }, { status: 404 });
+            }
+            const fread = await readRequestBodyCapped(req, FEDERATION_MAX_BODY_BYTES);
+            if (!fread.ok) {
+              return Response.json(
+                { error: await fread.response.text() },
+                { status: fread.response.status },
+              );
+            }
             let fbody: unknown;
             try {
-              fbody = await req.json();
+              fbody = JSON.parse(fread.text);
             } catch {
               return Response.json({ error: "request body must be JSON" }, { status: 400 });
             }
@@ -832,6 +872,11 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
           }
           const auth = req.headers.get("authorization") ?? "";
           const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
+          // The bearer is checked before the body is read, so a caller without
+          // a valid token is answered 401 at no cost of reading what it sent.
+          // handleEnvelope/handleSubscribe check it again, with the tenant.
+          const unauthorized = bearerRefusal(bearer);
+          if (unauthorized !== undefined) return unauthorized;
           let body: unknown;
           try {
             body = await req.json();

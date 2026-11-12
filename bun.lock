@@ -2249,6 +2249,10 @@
         "@crewhaus/model-service": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
       },
+      "devDependencies": {
+        "@crewhaus/durable-state": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+      },
       "peerDependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/channel-adapter-base": "workspace:*",

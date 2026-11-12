@@ -70,6 +70,11 @@ these on: they reach every harness that uses what each one names.
   cost, never its messages. `CREWHAUS_RUN_LEDGER=0` turns this off and changes
   nothing else.
 
+- **A channel daemon's webhook handler reads at most a fixed number of bytes.**
+  A request whose body is larger is answered with 413 before its signature is
+  checked; the limit is 1 MiB, and `CHANNEL_WEBHOOK_MAX_BYTES` changes it.
+  Recompile a daemon to pick this up.
+
 ## [0.8.1] - 2026-11-08
 
 Fixes and hardening for run input, the runtime-state floor, git tools,
