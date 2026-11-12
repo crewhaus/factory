@@ -94,6 +94,17 @@ export type PendingApproval = {
   readonly places?: ReadonlyArray<ApprovalPlace>;
   /** 0.7.1 — set when this asks again for a call approved where it landed before. */
   readonly supersedes?: SupersededApproval;
+  /**
+   * 0.9.0 — the lowest class that may decide it (`operator`, `maintainer`,
+   * `owner`), when the runtime recorded one. Absent counts as `operator`.
+   */
+  readonly requiredClass?: "operator" | "maintainer" | "owner";
+  /**
+   * 0.9.0 — whether a grant also covers only one version of what the call acts
+   * on (the tool reports one): `false` when the tool reports none. Absent on a
+   * request parked before grants were bound.
+   */
+  readonly resourceVersionBound?: boolean;
 };
 
 /** Filter for {@link ApprovalStore.list}. */
@@ -530,6 +541,13 @@ export type RuntimeApprovalRecord = {
   readonly places?: ReadonlyArray<ApprovalPlace>;
   /** 0.7.1 — the approval this one asks again in place of. */
   readonly supersedes?: SupersededApproval;
+  /** 0.9.0 — the lowest class that may decide it; read defensively, it comes from a file. */
+  readonly requiredClass?: string;
+  /**
+   * 0.9.0 — what a grant on it is good for. Read defensively, and only for
+   * `resourceRevisionBound`: the rest is the runtime's to check.
+   */
+  readonly binding?: { readonly resourceRevisionBound?: unknown };
 };
 
 export type RuntimeApprovalStoreLike = {
@@ -578,9 +596,27 @@ function supersededOf(value: unknown): SupersededApproval | undefined {
   };
 }
 
+const REQUIRED_CLASSES: ReadonlyArray<string> = ["operator", "maintainer", "owner"];
+
+/** A recorded class, if it is one. */
+function requiredClassOf(value: unknown): PendingApproval["requiredClass"] {
+  return typeof value === "string" && REQUIRED_CLASSES.includes(value)
+    ? (value as PendingApproval["requiredClass"])
+    : undefined;
+}
+
+/** The binding's resource flag, if the record carries a readable one. */
+function resourceVersionBoundOf(binding: unknown): boolean | undefined {
+  if (typeof binding !== "object" || binding === null) return undefined;
+  const bound = (binding as { readonly resourceRevisionBound?: unknown }).resourceRevisionBound;
+  return typeof bound === "boolean" ? bound : undefined;
+}
+
 function toChannelApproval(r: RuntimeApprovalRecord): PendingApproval {
   const places = placesOf(r.places);
   const supersedes = supersededOf(r.supersedes);
+  const requiredClass = requiredClassOf(r.requiredClass);
+  const resourceVersionBound = resourceVersionBoundOf(r.binding);
   return {
     id: r.id,
     toolName: r.toolName,
@@ -597,6 +633,8 @@ function toChannelApproval(r: RuntimeApprovalRecord): PendingApproval {
     ...(r.always === true ? { always: true } : {}),
     ...(places !== undefined ? { places } : {}),
     ...(supersedes !== undefined ? { supersedes } : {}),
+    ...(requiredClass !== undefined ? { requiredClass } : {}),
+    ...(resourceVersionBound !== undefined ? { resourceVersionBound } : {}),
   };
 }
 

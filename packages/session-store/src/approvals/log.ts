@@ -8,6 +8,7 @@
  *   approvals.d/lock                         orders every write to both files
  *   approvals.d/claims/decision/appr_….json  the first decision, created exclusively
  *   approvals.d/claims/supersede/appr_….json the one supersede of a record
+ *   approvals.d/claims/consume/appr_….json   the one spend of a grant
  *   approvals.d/decisions/NNNNNN.jsonl       the decision log, segmented by size
  *   approvals.d/keys/digest.key              the key its digests are made with (0600)
  *
@@ -36,7 +37,7 @@ import {
   readDigestKey,
   readPage,
 } from "@crewhaus/control-records";
-import type { ApprovalDecision, PendingApproval } from "../index";
+import type { ApprovalDecision, ApprovalToPersist, PendingApproval } from "../index";
 
 /** The rendezvous file, beside the session files. */
 export const DEFAULT_APPROVALS_FILENAME = "approvals.jsonl";
@@ -59,6 +60,8 @@ export const APPROVALS_DIGEST_KEY_FILE = join(APPROVALS_DIRNAME, "keys", "digest
 export const ACTION_DIGEST_LABEL = "decision.action";
 /** The label of a parked call's places digest. */
 export const PLACES_DIGEST_LABEL = "decision.places";
+/** The label of a binding's digest, over the sealed binding's canonical JSON. */
+export const BINDING_DIGEST_LABEL = "decision.binding";
 /** The label of an unlinked local actor's stored form, `local:#<digest>`. */
 export const LOCAL_ACTOR_LABEL = "local-actor";
 
@@ -82,6 +85,28 @@ export function placesDigestOf(key: CryptoKey, places: unknown): Promise<string>
   return keyedDigest(key, PLACES_DIGEST_LABEL, [
     canonicalJson(Array.isArray(places) ? places : []),
   ]);
+}
+
+/** The keyed digest of a sealed binding: its canonical JSON. */
+export function bindingDigestOf(key: CryptoKey, binding: unknown): Promise<string> {
+  return keyedDigest(key, BINDING_DIGEST_LABEL, [canonicalJson(binding)]);
+}
+
+/**
+ * The record with its binding sealed: the binding's `placesDigest` made from the
+ * record's own `places`, then the record's `bindingDigest` over the binding. A
+ * record without a binding comes back as it is. Every writer that parks a bound
+ * record seals it here, so a binding is sealed the same way however it is parked;
+ * a `placesDigest` a caller supplied is replaced, never trusted.
+ */
+export async function sealBinding(
+  key: CryptoKey,
+  record: ApprovalToPersist,
+): Promise<PendingApproval> {
+  const { binding, bindingDigest: _unsealed, ...rest } = record;
+  if (binding === undefined) return rest as PendingApproval;
+  const sealed = { ...binding, placesDigest: await placesDigestOf(key, record.places) };
+  return { ...rest, binding: sealed, bindingDigest: await bindingDigestOf(key, sealed) };
 }
 
 /** `local:<user>@<host>` as an append-only record may hold it: `local:#<keyed digest>`. */
@@ -110,6 +135,8 @@ export type DecisionLogLine = {
   readonly tool: string;
   readonly inputDigest: string;
   readonly placesDigest: string;
+  /** The record's keyed binding digest, on every line for a bound record. */
+  readonly bindingDigest?: string;
   /** The stored actor: a `prn_` id or `local:#<digest>`. */
   readonly by?: string;
   /** Where it came from: the record's surface, or the door a decision came through. */
@@ -159,6 +186,10 @@ export async function decisionLogLine(
     tool: record.toolName,
     inputDigest: await inputDigestOf(key, record.inputHash),
     placesDigest: await placesDigestOf(key, record.places),
+    // A keyed digest only: a binding names runs and sessions, which stay in the record.
+    ...(typeof record.bindingDigest === "string" && /^[0-9a-f]{64}$/.test(record.bindingDigest)
+      ? { bindingDigest: record.bindingDigest }
+      : {}),
     ...(fields.by !== undefined ? { by: fields.by } : {}),
     surface: fields.surface,
     ...(fields.outcome !== undefined ? { outcome: fields.outcome } : {}),

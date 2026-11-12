@@ -808,14 +808,15 @@ describe("0.7.1 — a headless approval covers the place it was asked for", () =
     // runs nothing wherever the call lands, so it is honoured as 0.7.0 did
     // rather than asked again.
     const first = parkedId(await turn(call));
-    await store.resolve(first as string, "deny", "operator");
+    await store.resolve(first as string, "deny", "Dana from ops");
     retarget("../secrets");
     expect(await turn(call)).toBeUndefined();
     expect(landed).toEqual([]);
-    // The model is told why: the operator's refusal.
-    expect(JSON.stringify(requests[1]?.messages ?? [])).toContain(
-      "`Write` approval was denied by operator",
-    );
+    // The model is told why: a reviewer of the request's class refused it. A
+    // write is destructive, so it needed a maintainer; who decided stays off it.
+    const told = JSON.stringify(requests[1]?.messages ?? []);
+    expect(told).toContain(`\`Write\` approval ${first} was denied by a maintainer.`);
+    expect(told).not.toContain("Dana from ops");
     expect((await store.list()).map((a) => a.id)).toEqual([first]);
   });
 

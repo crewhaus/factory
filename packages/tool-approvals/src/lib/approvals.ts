@@ -71,10 +71,15 @@ export type ApprovalRecord = {
   /** The decider as a stored actor (`prn_…` or `local:#<digest>`). */
   readonly decidedByPrincipal?: string;
   readonly decidedVia?: string;
-  /** The fresh request that replaced this one. */
+  /**
+   * The fresh request that replaced this one, or, when `supersededReason` is
+   * `run-cancelled`, the run whose cancel withdrew it.
+   */
   readonly supersededBy?: string;
   readonly supersededReason?: string;
   readonly deferredUntil?: string;
+  /** The lowest class that may decide it; absent counts as `operator`. */
+  readonly requiredClass?: string;
 };
 
 export type ApprovalStatusName =
@@ -330,10 +335,20 @@ export type ApprovalRow = {
   readonly status: ApprovalStatusName;
   readonly surface: string;
   readonly createdAt: string;
-  readonly decidedBy: string | null;
+  /**
+   * The surface the decision came through (`home`, `cli`, `slack`, …), `null`
+   * before one is made or when the surface did not say. Who decided is never
+   * shown: a row reaches a model, and no text a deciding surface recorded does.
+   */
+  readonly decidedVia: string | null;
   readonly decidedAt: string | null;
+  /** The lowest class that may decide it: `operator`, `maintainer` or `owner`. */
+  readonly requiredClass: string;
   readonly always?: true;
-  /** The fresh request that replaced this one, when it was superseded. */
+  /**
+   * The fresh request that replaced this one, when it was superseded; the
+   * cancelled run's id when its run's cancel withdrew it (`run-cancelled`).
+   */
   readonly supersededBy?: string;
   /** A pending request deferred until this instant. */
   readonly deferredUntil?: string;
@@ -407,6 +422,15 @@ export function operativeOf(
   return { field: null, value: null };
 }
 
+const DECISION_CLASSES: readonly string[] = ["operator", "maintainer", "owner"];
+
+/** A record's class as a row shows it: absent is `operator`; one that is not a class needs the owner. */
+function requiredClassOf(record: ApprovalRecord): string {
+  const required: unknown = record.requiredClass;
+  if (required === undefined) return "operator";
+  return typeof required === "string" && DECISION_CLASSES.includes(required) ? required : "owner";
+}
+
 /** Project one record into a row. `nowMs` omitted ⇒ no age field at all, rather
  *  than an age measured against a clock the caller never named. */
 export function toRow(record: ApprovalRecord, nowMs?: number): ApprovalRow {
@@ -429,8 +453,9 @@ export function toRow(record: ApprovalRecord, nowMs?: number): ApprovalRow {
     status: statusOf(record),
     surface: record.surface,
     createdAt: record.createdAt,
-    decidedBy: record.decidedBy ?? null,
+    decidedVia: typeof record.decidedVia === "string" ? record.decidedVia : null,
     decidedAt: record.decidedAt ?? null,
+    requiredClass: requiredClassOf(record),
     ...(record.always === true ? { always: true as const } : {}),
     ...(typeof record.supersededBy === "string" ? { supersededBy: record.supersededBy } : {}),
     ...(typeof record.deferredUntil === "string" ? { deferredUntil: record.deferredUntil } : {}),

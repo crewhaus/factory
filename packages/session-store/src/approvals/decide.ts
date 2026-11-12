@@ -20,12 +20,22 @@
  *
  * `persist` and the TTL sweep take the same lock, so a compaction can no longer drop
  * a line appended while it ran.
+ *
+ * SPENDING A GRANT. `consume` makes the checks a grant must pass just before the call
+ * it covers runs (control-contract's `verifyDecision`: the scope, the revisions, where
+ * the call lands, and whether its decider may still decide at its class), under the
+ * lock, then creates `approvals.d/claims/consume/<appr>.json` exclusively: one caller
+ * spends it, across processes and after a lock steal. A refusal leaves the grant
+ * unspent and logs why; one that retires the grant (its revisions moved, or its
+ * decider lost the right) supersedes it and parks the request asked in its place.
  */
 import { randomBytes } from "node:crypto";
 import { closeSync, mkdirSync, readSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import {
   APPROVAL_ID_RE,
+  CANONICAL_RUN_ID_RE,
+  DECISION_CLASSES,
   DECISION_LOG_REASONS,
   type DecisionClass,
   type DecisionState,
@@ -34,8 +44,10 @@ import {
   RECEIPT_VIA,
   type ReceiptVia,
   type SupersedeReason,
+  type VerifyReason,
   effectiveDecisionState,
   isId,
+  verifyDecision,
 } from "@crewhaus/control-contract";
 import {
   type ClaimContent,
@@ -54,13 +66,24 @@ import {
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
 import { fencePath } from "../fence";
-import type { ApprovalDecision, PendingApproval } from "../index";
+import type {
+  ApprovalDecision,
+  ApprovalPlace,
+  ApprovalToPersist,
+  ConsumeAnswer,
+  ConsumeRequest,
+  PendingApproval,
+  SupersedeRunRequest,
+} from "../index";
 import {
   type ClaimsRead,
+  type ConsumeClaim,
   type DecisionClaim,
+  type ReadConsumeClaim,
   type ReadDecisionClaim,
   type ReadSupersedeClaim,
   type SupersedeClaim,
+  applyConsumeClaim,
   applyDecisionClaim,
   applySupersedeClaim,
   approvalIsExpired,
@@ -68,9 +91,11 @@ import {
   foldApprovalRecords,
   foldWithClaims,
   isPendingApprovalShape,
+  parseConsumeClaim,
   parseDecisionClaim,
   parseSupersedeClaim,
   readApprovalsFile,
+  wasWithdrawn,
 } from "./fold";
 import {
   APPROVALS_DIGEST_KEY_FILE,
@@ -79,6 +104,8 @@ import {
   approvalsLedger,
   decisionLogLine,
   logHasLine,
+  placesDigestOf,
+  sealBinding,
   storedLocalActor,
 } from "./log";
 
@@ -204,6 +231,19 @@ export interface ApprovalDecisions {
     request: DeferRequest,
     options: { readonly authorize: ApprovalAuthorizer },
   ): Promise<DeferAnswer>;
+  /**
+   * Spend a grant, once: the checks just before its call runs, under the lock,
+   * then an exclusive consume claim. See the module docblock.
+   */
+  consume(id: string, request: ConsumeRequest): Promise<ConsumeAnswer>;
+  /**
+   * Withdraw the requests the named runs wait on, because they were cancelled:
+   * superseded `run-cancelled`, with nothing asked in their place.
+   */
+  supersedeRun(
+    runIds: readonly string[],
+    request: SupersedeRunRequest,
+  ): Promise<{ readonly superseded: string[] }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +255,7 @@ type Hook = () => void | Promise<void>;
 type ApprovalSeams = {
   /** After a locked operation has folded and repaired, before it checks. */
   readonly afterFold?: Hook;
-  /** After a claim is published, before the log line. */
+  /** After a claim is published, before the log line. May throw (a crash). */
   readonly afterClaim?: Hook;
   /** In the TTL sweep, after every log line and before the rewrite. May throw. */
   readonly beforeRewrite?: Hook;
@@ -269,6 +309,18 @@ function validateActor(actor: ApprovalActor): void {
   if (actor.display !== undefined && typeof actor.display !== "string") {
     throw new RuntimeError("session-store: an actor's display name must be text");
   }
+}
+
+/**
+ * The class a decision on `record` needs. Only an absent class defaults to
+ * `operator`; one that is present and not a class needs the owner.
+ */
+function classOf(record: PendingApproval): DecisionClass {
+  const required: unknown = record.requiredClass;
+  if (required === undefined) return "operator";
+  return (DECISION_CLASSES as readonly unknown[]).includes(required)
+    ? (required as DecisionClass)
+    : "owner";
 }
 
 /** Decided, spent or superseded: nothing a later decision may change. */
@@ -359,6 +411,7 @@ type Touch = {
 const decidedFact = (id: string, choice: string): string => `decided\0${id}\0${choice}`;
 const supersededFact = (id: string, by: string): string => `superseded\0${id}\0${by}`;
 const parkedFact = (id: string): string => `parked\0${id}`;
+const consumedFact = (id: string): string => `consumed\0${id}`;
 
 function factsOf(objects: readonly unknown[]): Set<string> {
   const facts = new Set<string>();
@@ -369,6 +422,7 @@ function factsOf(objects: readonly unknown[]): Set<string> {
     if (typeof value.supersededBy === "string") {
       facts.add(supersededFact(value.id, value.supersededBy));
     }
+    if (typeof value.consumedAt === "string") facts.add(consumedFact(value.id));
   }
   return facts;
 }
@@ -425,6 +479,7 @@ function openTouch(rootDir: string, ledger: Ledger, lockedAppend: LockedAppend):
       if (record.supersededBy !== undefined) {
         facts.add(supersededFact(record.id, record.supersededBy));
       }
+      if (record.consumedAt !== undefined) facts.add(consumedFact(record.id));
     },
   };
 }
@@ -446,23 +501,68 @@ async function locked<T>(rootDir: string, fn: (touch: Touch) => Promise<T>): Pro
   return answer.value;
 }
 
-/** The fresh request a supersede parks in place of `record`. */
-function freshRequest(record: PendingApproval, id: string, at: string): PendingApproval {
+/** What a spend that retired a grant knows now, so the request asked in its place is bound to it. */
+type Rebind = {
+  readonly runId: string;
+  readonly deploymentId?: string;
+  readonly specHash?: string;
+  readonly resourceRevision?: string;
+  readonly places: ReadonlyArray<ApprovalPlace>;
+};
+
+/** The binding of a request asked in place of one whose grant was refused at the spend. */
+function reboundBinding(record: PendingApproval, rebind: Rebind): ApprovalToPersist["binding"] {
+  const old: unknown = record.binding;
+  if (typeof old !== "object" || old === null) return undefined;
+  const { resumeScope, sessionId, workItem } = old as Partial<Record<string, unknown>>;
+  if (typeof resumeScope !== "string" || typeof sessionId !== "string") return undefined;
+  const bound = typeof rebind.resourceRevision === "string" && rebind.resourceRevision !== "";
+  return {
+    runId: rebind.runId,
+    resumeScope,
+    sessionId,
+    ...(typeof workItem === "string" ? { workItem } : {}),
+    ...(rebind.deploymentId !== undefined ? { deploymentId: rebind.deploymentId } : {}),
+    ...(rebind.specHash !== undefined ? { specHash: rebind.specHash } : {}),
+    ...(bound ? { resourceRevision: rebind.resourceRevision } : {}),
+    resourceRevisionBound: bound,
+  };
+}
+
+/**
+ * The fresh request a supersede parks in place of `record`. It keeps the record's
+ * class and its binding, so a request asked again is never easier to grant, nor
+ * bound to less, than the one it replaces. With `rebind` (a grant refused at the
+ * spend) it is bound to what the spend found instead: the spending run, the
+ * revisions it runs under and where the call lands now, since a copy of the old
+ * revisions would be refused again on every grant of the replacement. The caller
+ * seals the binding.
+ */
+function freshRequest(
+  record: PendingApproval,
+  id: string,
+  at: string,
+  rebind?: Rebind,
+): ApprovalToPersist {
+  const places = rebind !== undefined ? rebind.places : record.places;
+  const binding = rebind !== undefined ? reboundBinding(record, rebind) : record.binding;
   return {
     id,
     toolName: record.toolName,
     inputHash: record.inputHash,
     ...(record.input !== undefined ? { input: record.input } : {}),
-    ...(record.places !== undefined ? { places: record.places } : {}),
+    ...(places !== undefined ? { places } : {}),
     supersedes: {
       id: record.id,
       ...(record.decision !== undefined ? { decision: record.decision } : {}),
       ...(record.places !== undefined ? { places: record.places } : {}),
     },
-    runId: record.runId,
+    runId: rebind !== undefined ? rebind.runId : record.runId,
     sessionId: record.sessionId,
     surface: record.surface,
     createdAt: at,
+    ...(record.requiredClass !== undefined ? { requiredClass: record.requiredClass } : {}),
+    ...(binding !== undefined ? { binding } : {}),
   };
 }
 
@@ -515,8 +615,11 @@ async function repairSupersede(touch: Touch, id: string, read: ReadSupersedeClai
     }
     touch.rendezvous(superseded);
   }
+  // A request withdrawn because its run was cancelled is replaced by nothing:
+  // `supersededBy` names the run, not a request to park.
+  if (wasWithdrawn(superseded)) return;
   if (!touch.facts.has(parkedFact(supersededBy))) {
-    const fresh = freshRequest(superseded, supersededBy, parkedAt);
+    const fresh = await sealed(touch, freshRequest(superseded, supersededBy, parkedAt));
     const logged = logHasLine(
       touch.ledger,
       read.content.seg,
@@ -530,6 +633,29 @@ async function repairSupersede(touch: Touch, id: string, read: ReadSupersedeClai
   }
 }
 
+/** Complete a spend whose consume claim exists and whose lines the file or the log lacks. */
+async function repairConsume(touch: Touch, id: string, read: ReadConsumeClaim): Promise<void> {
+  const current = touch.records.get(id);
+  if (current === undefined || current.decision !== "grant") return;
+  const consumed = applyConsumeClaim(current, read.claim);
+  touch.records.set(id, consumed);
+  if (touch.facts.has(consumedFact(id))) return;
+  const logged = logHasLine(
+    touch.ledger,
+    read.content.seg,
+    (line) => line["event"] === "consume" && line["decision"] === id,
+  );
+  if (!logged) {
+    await touch.log(consumed, {
+      event: "consume",
+      at: read.claim.consumedAt,
+      surface: consumed.surface,
+      outcome: "repaired",
+    });
+  }
+  touch.rendezvous(consumed);
+}
+
 /** Every repair the claims call for. Runs first in every locked operation. */
 async function repairAll(touch: Touch): Promise<void> {
   for (const id of [...touch.order]) {
@@ -537,6 +663,8 @@ async function repairAll(touch: Touch): Promise<void> {
     if (decision !== undefined) await repairDecision(touch, id, decision);
     const supersede = touch.claims.supersedes.get(id);
     if (supersede !== undefined) await repairSupersede(touch, id, supersede);
+    const consume = touch.claims.consumes.get(id);
+    if (consume !== undefined) await repairConsume(touch, id, consume);
   }
 }
 
@@ -576,9 +704,38 @@ async function storedActor(
 // ---------------------------------------------------------------------------
 
 export type ApprovalWriter = ApprovalDecisions & {
-  /** Append a record under the lock: a park line for a new id, a consume line for a spend. */
-  persist(approval: PendingApproval): Promise<void>;
+  /**
+   * Append a record under the lock: a park line for a new id, a consume line for a
+   * spend, a newer line for a pending request. A record that carries a binding is
+   * sealed first (`sealBinding`). An undecided line for a request already decided
+   * or withdrawn writes nothing.
+   */
+  persist(approval: ApprovalToPersist): Promise<void>;
 };
+
+function validateConsume(request: ConsumeRequest): void {
+  if (typeof request !== "object" || request === null) {
+    throw new RuntimeError("session-store: a spend needs a request");
+  }
+  if (typeof request.runId !== "string" || request.runId === "") {
+    throw new RuntimeError("session-store: a spend names the run spending it");
+  }
+  if (typeof request.resumeScope !== "string" || request.resumeScope === "") {
+    throw new RuntimeError("session-store: a spend names the scope it is made in");
+  }
+  if (!Array.isArray(request.places)) {
+    throw new RuntimeError("session-store: a spend says where its call lands");
+  }
+  if (typeof request.approvers !== "object" || request.approvers === null) {
+    throw new RuntimeError("session-store: a spend says who may decide in this harness");
+  }
+}
+
+/** The record as the file holds it: a binding sealed, or no binding at all. */
+async function sealed(touch: Touch, approval: ApprovalToPersist): Promise<PendingApproval> {
+  if (approval.binding === undefined) return approval as PendingApproval;
+  return sealBinding(await touch.key(), approval);
+}
 
 export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter {
   const { rootDir, ttlDays, now } = ctx;
@@ -595,17 +752,26 @@ export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter
         await repairAll(touch);
         await seam.afterFold?.();
         const existing = touch.records.get(approval.id);
+        // An undecided line adds nothing to a request already decided or withdrawn.
+        if (
+          existing !== undefined &&
+          approval.decision === undefined &&
+          (existing.decision !== undefined || existing.supersededBy !== undefined)
+        ) {
+          return;
+        }
         const at = now().toISOString();
+        const record = await sealed(touch, approval);
         if (existing === undefined) {
-          await touch.log(approval, { event: "park", at, surface: approval.surface });
+          await touch.log(record, { event: "park", at, surface: record.surface });
         } else if (
-          approval.consumedAt !== undefined &&
+          record.consumedAt !== undefined &&
           existing.decision === "grant" &&
           existing.consumedAt === undefined
         ) {
           await touch.log(existing, { event: "consume", at, surface: existing.surface });
         }
-        touch.rendezvous(approval);
+        touch.rendezvous(record);
       });
     },
 
@@ -622,7 +788,7 @@ export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter
         await seam.afterFold?.();
         const record = touch.records.get(id);
         if (record === undefined) return { outcome: "not-found", record: null };
-        const verdict = await authorize({ op: "decide", record, requiredClass: "operator" });
+        const verdict = await authorize({ op: "decide", record, requiredClass: classOf(record) });
         if (!verdict.ok) return { outcome: "forbidden", record, reason: verdict.reason };
         const nowMs = now().getTime();
         const state = effectiveDecisionState(record, null, nowMs).state;
@@ -722,7 +888,7 @@ export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter
         });
         touch.rendezvous(superseded);
         touch.records.set(id, superseded);
-        const fresh = freshRequest(superseded, claim.supersededBy, parkedAt);
+        const fresh = await sealed(touch, freshRequest(superseded, claim.supersededBy, parkedAt));
         await touch.log(fresh, { event: "park", at: parkedAt, surface: fresh.surface });
         touch.rendezvous(fresh);
         touch.records.set(fresh.id, fresh);
@@ -777,7 +943,182 @@ export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter
         return { outcome: "deferred", record: deferred };
       });
     },
+
+    async consume(id, request) {
+      validateId(id);
+      validateConsume(request);
+      const seam = seams;
+      return locked(rootDir, async (touch): Promise<ConsumeAnswer> => {
+        await repairAll(touch);
+        await seam.afterFold?.();
+        const record = touch.records.get(id);
+        if (record === undefined) return { outcome: "not-found", record: null };
+        const nowMs = now().getTime();
+        const at = now().toISOString();
+        const surface = request.surface ?? record.surface;
+        const refused = async (
+          reason: VerifyReason,
+          fresh?: PendingApproval,
+        ): Promise<ConsumeAnswer> => {
+          await touch.log(record, { event: "refuse", at, surface, reason });
+          return {
+            outcome: "refused",
+            reason,
+            record: touch.records.get(id) ?? record,
+            ...(fresh !== undefined ? { fresh } : {}),
+          };
+        };
+        // Past the TTL, a grant is about to be swept: never spent.
+        if (approvalIsExpired(record, cutoffMs())) return refused("expired");
+        const key = await touch.key();
+        const verdict = verifyDecision({
+          decision: record,
+          consumer: {
+            runId: request.runId,
+            resumeScope: request.resumeScope,
+            ...(request.continues !== undefined ? { continues: request.continues } : {}),
+            ...(request.deploymentId !== undefined ? { deploymentId: request.deploymentId } : {}),
+            ...(request.specHash !== undefined ? { specHash: request.specHash } : {}),
+            ...(request.resourceRevision !== undefined
+              ? { resourceRevision: request.resourceRevision }
+              : {}),
+            placesDigest: await placesDigestOf(key, request.places),
+          },
+          approvers: request.approvers,
+          now: nowMs,
+        });
+        if (!verdict.ok) {
+          const reason = verdict.supersedeReason;
+          // A refusal that can change back (a scope, a place, a list that cannot be
+          // read) leaves the grant as it is. One that cannot retires it, unless no
+          // run waits on an answer, so nothing new reaches the inbox.
+          if (reason === undefined || request.reask === false) return refused(verdict.reason);
+          const claim: SupersedeClaim = {
+            supersededBy: generateApprovalId(),
+            reason,
+            parkedAt: at,
+          };
+          const published = publishClaim(touch.ledger, `supersede/${id}`, claim);
+          if (!published.ok) {
+            if (published.code !== "exists") throw refusal("claim", `supersede ${id}`, published);
+            // Another writer retired it first: complete its lines, and hand back its request.
+            const winner = winnerClaim(touch, `supersede/${id}`, parseSupersedeClaim);
+            await repairSupersede(touch, id, winner);
+            const asked =
+              winner.claim.reason === "run-cancelled"
+                ? undefined
+                : touch.records.get(winner.claim.supersededBy);
+            return refused(verdict.reason, asked);
+          }
+          await seam.afterClaim?.();
+          const superseded = applySupersedeClaim(record, claim);
+          await touch.log(record, { event: "refuse", at, surface, reason: verdict.reason });
+          await touch.log(superseded, { event: "supersede", at, surface, reason });
+          touch.rendezvous(superseded);
+          touch.records.set(id, superseded);
+          const fresh = await sealed(
+            touch,
+            freshRequest(superseded, claim.supersededBy, at, {
+              runId: request.runId,
+              ...(request.deploymentId !== undefined ? { deploymentId: request.deploymentId } : {}),
+              ...(request.specHash !== undefined ? { specHash: request.specHash } : {}),
+              ...(request.resourceRevision !== undefined
+                ? { resourceRevision: request.resourceRevision }
+                : {}),
+              places: request.places,
+            }),
+          );
+          await touch.log(fresh, { event: "park", at, surface: fresh.surface });
+          touch.rendezvous(fresh);
+          touch.records.set(fresh.id, fresh);
+          return { outcome: "refused", reason: verdict.reason, record: superseded, fresh };
+        }
+        const claim: ConsumeClaim = { consumedAt: at, consumedByRun: request.runId };
+        const published = publishClaim(touch.ledger, `consume/${id}`, claim);
+        if (!published.ok) {
+          if (published.code !== "exists") throw refusal("claim", `consume ${id}`, published);
+          // A writer that stole the lock spent it first: complete its lines, then say so.
+          const winner = winnerClaim(touch, `consume/${id}`, parseConsumeClaim);
+          await repairConsume(touch, id, winner);
+          return refused("consumed");
+        }
+        await seam.afterClaim?.();
+        const consumed = applyConsumeClaim(record, claim);
+        await touch.log(consumed, { event: "consume", at, surface });
+        touch.rendezvous(consumed);
+        touch.records.set(id, consumed);
+        return { outcome: "consumed", record: consumed };
+      });
+    },
+
+    async supersedeRun(runIds, request) {
+      if (request?.reason !== "run-cancelled") {
+        throw new RuntimeError(
+          "session-store: a run's requests are withdrawn only when it is cancelled",
+        );
+      }
+      validateVia(request.via);
+      const named = (Array.isArray(runIds) ? runIds : []).filter(
+        (id): id is string => typeof id === "string" && id !== "",
+      );
+      // A withdrawn request names the run whose cancel withdrew it, by its canonical id.
+      const by = named.find((id) => CANONICAL_RUN_ID_RE.test(id));
+      if (by === undefined) return { superseded: [] };
+      // A root with no approvals has nothing to withdraw, and nothing is created there.
+      if (readApprovalsFile(rootDir).state === "absent") return { superseded: [] };
+      const runs = new Set(named);
+      const seam = seams;
+      return locked(rootDir, async (touch) => {
+        await repairAll(touch);
+        await seam.afterFold?.();
+        const nowMs = now().getTime();
+        const at = now().toISOString();
+        const superseded: string[] = [];
+        for (const id of [...touch.order]) {
+          const record = touch.records.get(id);
+          if (record === undefined || !runs.has(boundRunOf(record))) continue;
+          // Pending, or granted and unspent: what a cancelled run was waiting on.
+          if (record.supersededBy !== undefined || record.consumedAt !== undefined) continue;
+          if (record.decision !== undefined && record.decision !== "grant") continue;
+          if (expiredAt(record, nowMs)) continue;
+          const claim: SupersedeClaim = {
+            supersededBy: by,
+            reason: "run-cancelled",
+            parkedAt: at,
+          };
+          const published = publishClaim(touch.ledger, `supersede/${id}`, claim);
+          if (!published.ok) {
+            if (published.code !== "exists") throw refusal("claim", `supersede ${id}`, published);
+            const winner = winnerClaim(touch, `supersede/${id}`, parseSupersedeClaim);
+            await repairSupersede(touch, id, winner);
+            continue;
+          }
+          await seam.afterClaim?.();
+          const withdrawn = applySupersedeClaim(record, claim);
+          await touch.log(withdrawn, {
+            event: "supersede",
+            at,
+            surface: request.via ?? "system",
+            reason: "run-cancelled",
+          });
+          touch.rendezvous(withdrawn);
+          touch.records.set(id, withdrawn);
+          superseded.push(id);
+        }
+        return { superseded };
+      });
+    },
   };
+}
+
+/** The run a request is bound to: its binding's, or, unbound, the run that parked it. */
+function boundRunOf(record: PendingApproval): string {
+  const binding: unknown = record.binding;
+  if (typeof binding === "object" && binding !== null) {
+    const runId = (binding as { readonly runId?: unknown }).runId;
+    if (typeof runId === "string") return runId;
+  }
+  return record.runId;
 }
 
 // ---------------------------------------------------------------------------

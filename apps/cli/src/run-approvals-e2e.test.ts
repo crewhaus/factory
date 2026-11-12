@@ -379,7 +379,7 @@ describe("crewhaus run — permissions.ask_mode threading (G11)", () => {
     expect(existsSync(join(root, ".crewhaus", "sessions", "approvals.jsonl"))).toBe(false);
 
     // …and the verbs resolve the same root, or the remediation the runtime
-    // prints ("grant … then rerun") points at an empty file.
+    // prints ("grant …, then resume the run") points at an empty file.
     const listed = await runCli(["approvals", "list", "--json"], root, {
       CREWHAUS_SESSION_DIR: sessionDir,
     });
@@ -395,9 +395,15 @@ describe("the documented park → grant → resume round trip", () => {
     mkdirSync(root, { recursive: true });
     seedSpec(root, "ask_mode: pause");
 
-    // 1. park
+    // 1. park: the remediation names the resume verb for this conversation
     const parked = await runCli(["run", "crewhaus.yaml", "--prompt", "read it"], root);
     expect(parked.exitCode).toBe(APPROVAL_PENDING_EXIT);
+    const sessionId =
+      readdirSync(join(root, ".crewhaus", "sessions"))
+        .find((f) => f.startsWith("sess_") && f.endsWith(".json"))
+        ?.replace(/\.json$/, "") ?? "";
+    expect(sessionId).toMatch(/^sess_[0-9a-f]{16}$/);
+    expect(`${parked.stdout}${parked.stderr}`).toContain(`crewhaus runs resume ${sessionId}`);
 
     // 2. the operator sees it
     const listed = await runCli(["approvals", "list", "--json"], root);
@@ -409,9 +415,10 @@ describe("the documented park → grant → resume round trip", () => {
     const granted = await runCli(["approvals", "grant", id, "--by", "tester"], root);
     expect(granted.exitCode).toBe(0);
 
-    // 4. rerun: the grant is found by (toolName, inputHash) and consumed, the
-    //    call runs pre-approved, and the turn completes normally.
-    const resumed = await runCli(["run", "crewhaus.yaml", "--prompt", "read it"], root);
+    // 4. resume the conversation: the grant is found by (toolName, inputHash) in
+    //    the scope it was asked in and spent, the call runs pre-approved, and the
+    //    turn completes normally.
+    const resumed = await runCli(["runs", "resume", sessionId, "--prompt", "read it"], root);
     expect(resumed.exitCode).toBe(0);
     expect(toolResults(root)).toContain("mango");
 

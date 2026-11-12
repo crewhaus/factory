@@ -28,6 +28,25 @@ export const OPERATOR_SUPERSEDE_REASONS = deepFreeze([
   "other",
 ] as const);
 
+/**
+ * Why a grant was not spent: the checks made just before it is used, each a
+ * code from this closed list. They are the `refuse` reasons of the decision log.
+ */
+export const VERIFY_REASONS = deepFreeze([
+  "not-a-grant",
+  "consumed",
+  "superseded",
+  "expired",
+  "scope-mismatch",
+  "run-mismatch",
+  "revision-changed",
+  "resource-changed",
+  "places-changed",
+  "decider-not-authorized",
+  "approvers-unreadable",
+  "decider-unverified",
+] as const);
+
 const ULID = "ulid";
 const HEX16 = "hex16";
 
@@ -539,6 +558,7 @@ export const CORE_MODULE = {
       "people-erased",
       "people-grant-revoked",
     ],
+    refuse: [...VERIFY_REASONS],
     evict: ["erased", "ttl"],
     expire: ["ttl"],
     defer: ["awaiting-information", "awaiting-someone", "scheduled", "other"],

@@ -378,7 +378,8 @@ export const decision = z
     kind: z.enum(["tool", "input"]).optional(),
     decidedByPrincipal: storedActor.optional(),
     decidedVia: z.string().optional(),
-    supersededBy: decisionId.optional(),
+    // A fresh request's id, or the run whose cancel withdrew this one (`run-cancelled`).
+    supersededBy: z.union([decisionId, canonicalRunId]).optional(),
     supersededReason: oneOf(
       asTuple(DECISION_LOG_REASONS.supersede as readonly SupersedeReason[]),
     ).optional(),
@@ -429,7 +430,11 @@ export const approverProjection = z
     harness: harnessId,
     owner: principalId,
     governedSince: timestamp,
-    members: z.array(z.object({ principal: principalId, decide: decisionClass }).passthrough()),
+    members: z.array(
+      z
+        .object({ principal: principalId, decide: decisionClass, until: timestamp.optional() })
+        .passthrough(),
+    ),
     links: z.array(z.object({ external: externalSubject, principal: principalId }).passthrough()),
   })
   .passthrough();

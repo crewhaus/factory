@@ -425,6 +425,39 @@ describe("createRuntimeBackedApprovalStore", () => {
     expect(sent).toEqual([`${approvalFallbackText(again.id)}\n${text}`]);
   });
 
+  test("0.9.0 — the bridge carries the class a request needs and whether a grant binds a resource version", async () => {
+    const bound = record({
+      id: "appr_00000000000000c1",
+      requiredClass: "maintainer",
+      binding: { resourceRevisionBound: true },
+    });
+    const unbound = record({
+      id: "appr_00000000000000c2",
+      requiredClass: "owner",
+      binding: { resourceRevisionBound: false },
+    });
+    // Read defensively: what is not a class, or not a flag, is left off.
+    const torn = record({
+      id: "appr_00000000000000c3",
+      requiredClass: "chief",
+      binding: { resourceRevisionBound: "yes" },
+    });
+    const legacy = record({ id: "appr_00000000000000c4" });
+    const bridged = createRuntimeBackedApprovalStore(
+      fakeRuntimeStore([bound, unbound, torn, legacy]).store,
+    );
+    const cards = await Promise.all([bound, unbound, torn, legacy].map((r) => bridged.get(r.id)));
+    expect(cards.map((c) => [c?.requiredClass, c?.resourceVersionBound])).toEqual([
+      ["maintainer", true],
+      ["owner", false],
+      [undefined, undefined],
+      [undefined, undefined],
+    ]);
+    // A record without them maps as before: no keys at all.
+    expect(cards[3]).not.toHaveProperty("requiredClass");
+    expect(cards[3]).not.toHaveProperty("resourceVersionBound");
+  });
+
   test("0.7.1 — places a record does not hold in the shape written are left off the card", async () => {
     const malformed = [
       record({ id: "appr_00000000000000a1", places: "public/x.md" as never }),

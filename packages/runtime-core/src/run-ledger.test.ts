@@ -672,14 +672,6 @@ describe("a verified root", () => {
       },
     ],
     [
-      "an id that is not canonical",
-      (ledger) => {
-        const execution = executionId();
-        plantRoot(ledger, "run_0123abcd", execution);
-        return { id: "run_0123abcd", execution };
-      },
-    ],
-    [
       "a root pushed out of the newest 256 lines",
       (ledger) => {
         const id = mintRunId();
@@ -724,6 +716,32 @@ describe("a verified root", () => {
       const refusals = warns.filter((w) => w.msg.includes("CREWHAUS_RUN_ID"));
       expect(refusals).toHaveLength(1);
       expect(JSON.stringify(refusals)).not.toContain(id);
+    });
+  }
+
+  // A value not shaped like a run id is another tool's own key: a workflow sets
+  // CREWHAUS_RUN_ID to a stable value to resume its steps. It is not a root, and
+  // it is not worth a warning.
+  for (const [name, value, planted] of [
+    ["an id that is not canonical, even with a queued row", "run_0123abcd", true],
+    ["a workflow's stable resume key", "nightly-import", false],
+  ] as const) {
+    test(`ignored without a warning: ${name}`, async () => {
+      const ledger = tempDir("ledger");
+      const execution = executionId();
+      if (planted) plantRoot(ledger, value, execution);
+      process.env["CREWHAUS_RUN_ID"] = value;
+      process.env["CREWHAUS_EXECUTION_ID"] = execution;
+      const { logger, warns } = recordingLogger();
+      for (const ctx of [createRunContext({ logger }), createRunContext({ logger })]) {
+        const { caught } = await loop({ ledger, runContext: ctx });
+        expect(caught).toBeUndefined();
+        const running = rowsOf(rowsAt(ledger), ctx.runId)[0];
+        expect("parent" in (running ?? {})).toBe(false);
+        expect(running?.["resumeScope"]).toBe(`session:${ctx.sessionId}`);
+      }
+      expect(warns.filter((w) => w.msg.includes("CREWHAUS_RUN_ID"))).toEqual([]);
+      expect(rowsOf(rowsAt(ledger), value).filter((r) => r["state"] === "running")).toEqual([]);
     });
   }
 });

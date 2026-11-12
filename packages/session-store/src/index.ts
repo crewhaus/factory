@@ -34,9 +34,13 @@ import { closeSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { basename, dirname, relative, resolve } from "node:path";
 import {
+  type DecisionBinding,
+  type DecisionClass,
   SESSION_ID_RE as ID_REGEX,
   type ReceiptVia,
   type SupersedeReason,
+  type VerifyApprovers,
+  type VerifyReason,
 } from "@crewhaus/control-contract";
 import { RuntimeError } from "@crewhaus/errors";
 import {
@@ -58,6 +62,7 @@ import {
   foldReadOnly,
   foldWithClaims,
   readApprovalsFile,
+  recordInScope,
 } from "./approvals/fold";
 import { fencePath } from "./fence";
 
@@ -873,12 +878,89 @@ export type PendingApproval = {
   readonly decidedByPrincipal?: string;
   /** The door the decision came through (`home`, `cli`, `slack`, …). */
   readonly decidedVia?: ReceiptVia;
-  /** The fresh request that replaced this one (`crewhaus approvals supersede`). */
+  /**
+   * What replaced this request: the fresh request parked in its place
+   * (`crewhaus approvals supersede`, or a grant whose revisions moved), or, when
+   * `supersededReason` is `run-cancelled`, the run whose cancel withdrew it. A
+   * withdrawn request has no replacement.
+   */
   readonly supersededBy?: string;
   /** Why it was replaced: a code from a closed list. */
   readonly supersededReason?: SupersedeReason;
   /** A pending request deferred until this instant (`crewhaus approvals defer`). */
   readonly deferredUntil?: string;
+  /**
+   * The lowest class that may decide it, set when it is parked. Absent counts as
+   * `operator`. Classes bite once a harness has members; until then the owner
+   * decides everything.
+   */
+  readonly requiredClass?: DecisionClass;
+  /**
+   * What a grant on it is good for: the scope it was asked in (`resumeScope`), the
+   * run that parked, the deployment and spec it was asked under when known, a
+   * version of the resource when the tool reports one, and a keyed digest of where
+   * the call lands. Absent on a record parked before 0.9.0, which counts as bound
+   * to its session.
+   */
+  readonly binding?: DecisionBinding;
+  /** A keyed digest of the binding, which every later decision-log line for it carries. */
+  readonly bindingDigest?: string;
+  /** The run that spent the grant. */
+  readonly consumedByRun?: string;
+};
+
+/**
+ * A binding as a park hands it to `persist`: the store fills in the keyed parts
+ * (`placesDigest`, and the record's `bindingDigest`), since only it holds the key.
+ */
+export type UnsealedBinding = Omit<DecisionBinding, "placesDigest"> & {
+  readonly placesDigest?: string;
+};
+
+/** What `persist` takes: a record whose binding the store seals when it parks it. */
+export type ApprovalToPersist = Omit<PendingApproval, "binding"> & {
+  readonly binding?: UnsealedBinding;
+};
+
+/** Where a spend happens, and what it is checked against (see `consume`). */
+export type ConsumeRequest = {
+  /** The run spending it: the top run, as the run ledger names it. */
+  readonly runId: string;
+  /** The scope the spending run is in. */
+  readonly resumeScope: string;
+  /** The parked run this one continues, when it is a continuation. */
+  readonly continues?: string;
+  readonly deploymentId?: string;
+  readonly specHash?: string;
+  /** The version of the resource the tool reports now; absent when it reports none. */
+  readonly resourceRevision?: string;
+  /** Where the call lands now. */
+  readonly places: ReadonlyArray<ApprovalPlace>;
+  /** Who may decide in this harness now: the caller reads the harness's projection. */
+  readonly approvers: VerifyApprovers;
+  /** Where the spend comes from, for the decision log; the record's surface when absent. */
+  readonly surface?: string;
+  /**
+   * `false` when no run waits on the answer (a call a rule already allows): a
+   * refusal is logged and nothing is superseded, so no request reaches the inbox.
+   */
+  readonly reask?: false;
+};
+
+export type ConsumeAnswer =
+  | { readonly outcome: "consumed"; readonly record: PendingApproval }
+  | {
+      readonly outcome: "refused";
+      readonly reason: VerifyReason;
+      readonly record: PendingApproval;
+      /** The request parked in its place, when the refusal retired the grant. */
+      readonly fresh?: PendingApproval;
+    }
+  | { readonly outcome: "not-found"; readonly record: null };
+
+export type SupersedeRunRequest = {
+  readonly reason: "run-cancelled";
+  readonly via?: ReceiptVia;
 };
 
 /**
@@ -891,14 +973,24 @@ export type PendingApproval = {
  * superseded.
  */
 export interface PendingApprovalStore {
-  /** Append a `PendingApproval`; the fold governs what it changes. */
-  persist(approval: PendingApproval): Promise<void>;
+  /**
+   * Append a `PendingApproval`; the fold governs what it changes. A record's
+   * binding is sealed here (its places digest and `bindingDigest`). An undecided
+   * line for a request already decided or withdrawn writes nothing.
+   */
+  persist(approval: ApprovalToPersist): Promise<void>;
   /**
    * The current record for `(toolName, inputHash)`: the newest non-consumed,
    * non-superseded, non-expired match (pending or resolved), or `null`. The
-   * runtime branches on the returned `decision`.
+   * runtime branches on the returned `decision`. With `resumeScope`, only a
+   * record bound to that scope matches (`recordInScope`): a record parked before
+   * grants were bound counts as bound to its session.
    */
-  get(toolName: string, inputHash: string): Promise<PendingApproval | null>;
+  get(
+    toolName: string,
+    inputHash: string,
+    opts?: { readonly resumeScope?: string },
+  ): Promise<PendingApproval | null>;
   /**
    * Record an out-of-band decision on the approval `id` (the CLI/Slack verb
    * path), first-wins. Returns the updated record ONLY when this call decided
@@ -922,6 +1014,24 @@ export interface PendingApprovalStore {
    * first.
    */
   list(): Promise<PendingApproval[]>;
+  /**
+   * Spend a grant: the checks a grant must pass just before the call it covers
+   * runs, made under the lock, then an exclusive claim, so exactly one caller
+   * spends it, across processes. A refusal leaves it unspent; one that retires it
+   * also parks the request asked in its place. Optional: a store without it
+   * spends a grant once per process only.
+   */
+  consume?(id: string, request: ConsumeRequest): Promise<ConsumeAnswer>;
+  /**
+   * Withdraw what the runs named were waiting on, when they are cancelled: every
+   * request bound to one of them that is pending, or granted and unspent, is
+   * superseded `run-cancelled`, naming the first canonical run id. Nothing is
+   * asked in its place. Optional, like `consume`.
+   */
+  supersedeRun?(
+    runIds: readonly string[],
+    request: SupersedeRunRequest,
+  ): Promise<{ readonly superseded: string[] }>;
 }
 
 export { DEFAULT_APPROVALS_FILENAME } from "./approvals/log";
@@ -1020,8 +1130,14 @@ export function createPendingApprovalStore(
     decide: writer.decide,
     supersede: writer.supersede,
     defer: writer.defer,
+    consume: writer.consume,
+    supersedeRun: writer.supersedeRun,
 
-    async get(toolName: string, inputHash: string): Promise<PendingApproval | null> {
+    async get(
+      toolName: string,
+      inputHash: string,
+      getOpts?: { readonly resumeScope?: string },
+    ): Promise<PendingApproval | null> {
       const read = readApprovalsFile(rootDir);
       if (read.state === "absent") return null;
       if (read.state === "unreadable") {
@@ -1039,6 +1155,8 @@ export function createPendingApprovalStore(
         if (approval.consumedAt !== undefined) continue;
         if (approval.supersededBy !== undefined) continue;
         if (approvalIsExpired(approval, cutoff)) continue;
+        const scope = getOpts?.resumeScope;
+        if (scope !== undefined && !recordInScope(approval, scope)) continue;
         // Newest-touched wins: a fresh decision supersedes an older pending.
         const at = touchedAt(approval);
         if (at >= bestAt) {
@@ -1113,10 +1231,12 @@ export {
   foldApprovalRecords,
   foldReadOnly,
   foldWithClaims,
+  recordInScope,
 } from "./approvals/fold";
 export {
   ACTION_DIGEST_LABEL,
   APPROVALS_CLAIMS_DIR,
+  BINDING_DIGEST_LABEL,
   APPROVALS_DIGEST_KEY_FILE,
   APPROVALS_DIRNAME,
   APPROVALS_LOCK_FILE,
@@ -1125,8 +1245,10 @@ export {
   LOCAL_ACTOR_LABEL,
   PLACES_DIGEST_LABEL,
   approvalsDigestKey,
+  bindingDigestOf,
   inputDigestOf,
   placesDigestOf,
+  sealBinding,
   storedLocalActor,
 } from "./approvals/log";
 export {

@@ -284,6 +284,35 @@ describe("actors", () => {
     }
   });
 
+  test("a projected member may carry an end time, and a withdrawn request names its cancelled run", () => {
+    const projection = {
+      v: 1,
+      epoch: 1,
+      generatedAt: "2026-01-01T00:00:00Z",
+      harness: HRN,
+      owner: mintId("prn"),
+      governedSince: "2026-01-01T00:00:00Z",
+      links: [],
+    };
+    const member = { principal: mintId("prn"), decide: "operator" };
+    for (const [until, ok] of [
+      [undefined, true],
+      ["2026-02-01T00:00:00Z", true],
+      ["whenever", false],
+      [7, false],
+    ] as const) {
+      const members = [{ ...member, ...(until === undefined ? {} : { until }) }];
+      expect(approverProjection.safeParse({ ...projection, members }).success).toBe(ok);
+    }
+    const base = EXAMPLES["decision"] as object;
+    expect(decision.safeParse({ ...base, supersededBy: "appr_0123456789abcdef" }).success).toBe(
+      true,
+    );
+    expect(decision.safeParse({ ...base, supersededBy: mintRunId() }).success).toBe(true);
+    expect(decision.safeParse({ ...base, supersededBy: "run_0123abcd" }).success).toBe(false);
+    expect(decision.safeParse({ ...base, supersededBy: "somebody" }).success).toBe(false);
+  });
+
   test("schemas refuse a raw local link", () => {
     const projection = {
       v: 1,

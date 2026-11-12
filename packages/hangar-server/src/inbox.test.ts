@@ -15,6 +15,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { mintRunId } from "@crewhaus/control-contract";
 import { extractFeedbackRecords } from "@crewhaus/feedback-distill";
 import { createPendingApprovalStore, foldReadOnly } from "@crewhaus/session-store";
 import { pendingApprovalCount } from "./approvals";
@@ -214,6 +215,34 @@ describe("approvals inbox", () => {
       const seen = await store.get("SendMessage", "hash-1");
       expect(seen?.decision).toBe("deny");
       expect(seen?.decidedVia).toBe("home");
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("a request its run's cancel withdrew is refused with 409, saying it was withdrawn", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inboxHarness(t, "inbox-withdrawn");
+      const id = await register(t, dir);
+      const store = createPendingApprovalStore({
+        rootDir: join(dir, ".crewhaus", "sessions"),
+        now: () => new Date(NOW),
+      });
+      const cancelled = mintRunId();
+      const withdrawn = await store.supersedeRun([cancelled, "run_00000000000000b0"], {
+        reason: "run-cancelled",
+      });
+      expect(withdrawn.superseded).toEqual(["appr_00000000000000b1"]);
+      const granted = await t.api(`/api/h/${id}/approvals/appr_00000000000000b1/grant`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      expect(granted.status).toBe(409);
+      expect(String(granted.body["error"])).toBe(
+        "This request was withdrawn: its run was cancelled.",
+      );
+      expect(JSON.stringify(granted.body)).not.toContain("replaced");
     } finally {
       await t.stop();
     }

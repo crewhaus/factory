@@ -81,6 +81,14 @@ const BAD_BODIES: Readonly<Record<string, unknown>> = {
     members: [{ principal: "prn_bad", decide: "operator" }],
   },
   "an unknown decide class": { ...PROJECTION, members: [{ principal: MEMBER, decide: "viewer" }] },
+  "a member until that is a number": {
+    ...PROJECTION,
+    members: [{ principal: MEMBER, decide: "operator", until: 1_800_000_000_000 }],
+  },
+  "a member until that is null": {
+    ...PROJECTION,
+    members: [{ principal: MEMBER, decide: "operator", until: null }],
+  },
   "a link that is not an object": { ...PROJECTION, links: [null] },
   "a malformed link principal": {
     ...PROJECTION,
@@ -157,6 +165,24 @@ describe("readApproverProjection", () => {
     expect((read.projection as unknown as Record<string, unknown>)["homeUrl"]).toBe(
       "https://example.test/home",
     );
+  });
+
+  test("a member's until is read: before it the member decides, after it the member does not", () => {
+    const withUntil = (until: string) =>
+      reader()(
+        harnessWith({ ...PROJECTION, members: [{ principal: MEMBER, decide: "operator", until }] }),
+      );
+    const ahead = withUntil("2026-11-08T00:00:00.000Z");
+    expect(ahead.state).toBe("present");
+    expect(verify(ahead)).toEqual({ ok: true });
+    const passed = withUntil("2026-11-06T00:00:00.000Z");
+    expect(passed.state).toBe("present");
+    expect(verify(passed)).toMatchObject({ ok: false, reason: "decider-not-authorized" });
+    // A time that cannot be read counts as passed.
+    expect(verify(withUntil("soon"))).toMatchObject({
+      ok: false,
+      reason: "decider-not-authorized",
+    });
   });
 
   test("every decision class is accepted", () => {

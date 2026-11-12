@@ -2,7 +2,10 @@
  * The approver projection: the harness's own copy of who may decide what, for daemons
  * and the runtime, which must never depend on Hangar being up. Absent means single-owner
  * mode, present means enforced, unreadable fails closed; the consequences are the
- * consumers'. Local actors are never projected.
+ * consumers'. Local actors are never projected. A member's `until`, when present,
+ * is the instant its authority ends: `memberMayDecide` (control-contract) counts it
+ * only before then, so a member whose credential has ended stops counting at that
+ * instant, however long ago the file was written.
  */
 import {
   type ApproverProjection,
@@ -43,6 +46,10 @@ function projectionFault(body: Record<string, unknown>): string | undefined {
     if (member === undefined) return "a member is not an object";
     if (!isId("prn", member["principal"])) return "a member's principal is not a principal id";
     if (!classes.includes(member["decide"])) return "a member's decide is not a decision class";
+    // An end time is enforced by every reader, so one that is not text fails closed here.
+    if (member["until"] !== undefined && typeof member["until"] !== "string") {
+      return "a member's until is not a string";
+    }
   }
   for (const raw of links) {
     const link = asObject(raw);

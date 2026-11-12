@@ -855,6 +855,27 @@ export interface RegisteredTool {
   /** See ToolDefinition.serviceDefaults. Optional; `buildTool` passes it
    *  through for a tool that declares a `service`, and refuses it otherwise. */
   serviceDefaults?: (input: unknown, toolConfig: unknown) => ServiceDefaults | undefined;
+  /**
+   * A version of the resource the call acts on (a pull request's head commit, a
+   * recipient set's digest); a grant covers the call only while it is unchanged.
+   * The runtime asks it when a call is parked for approval and again just before
+   * the approved call runs; a different answer asks again. Optional: a tool that
+   * declares none is approved for its input and places alone, and its approvals
+   * say the resource version is not bound.
+   *
+   * It runs on the model's input before any person has approved the call and
+   * before the egress check has seen it, so it must be a read with no side
+   * effects, and it may reach only what the tool's declared `scope` and
+   * `ioCapability` already cover: never a host, path or command taken from the
+   * input. It must stop when `signal` aborts. The runtime gives up after a few
+   * seconds, or when the run is cancelled. An answer of 1-256 characters of
+   * `[0-9A-Za-z:._/-]` is a version; any other answer, a throw or giving up
+   * reports none.
+   */
+  revisionOf?: (
+    input: unknown,
+    opts: { readonly signal: AbortSignal },
+  ) => string | undefined | Promise<string | undefined>;
 }
 
 export class ToolCatalogError extends CrewhausError {

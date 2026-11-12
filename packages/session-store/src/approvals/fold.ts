@@ -15,6 +15,8 @@
  *    line whose `decision` differs is ignored and counted;
  *  - a readable decision claim (`approvals.d/claims/decision/<appr>.json`) outranks
  *    the file, because the claim is what decided and a compaction cannot rewrite it.
+ *    A consume claim (`claims/consume/<appr>.json`) likewise says a grant was spent,
+ *    and by which run, whether or not its line reached the file.
  *    It decides the fold too, not only the result: for an id with a claim, a line
  *    whose `decision` differs from the claim's is ignored wherever it sits, so a
  *    flipped line an 0.8.x compaction kept cannot shut out the lines that agree
@@ -28,6 +30,7 @@ import { closeSync, readFileSync, readdirSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import {
   APPROVAL_ID_RE,
+  CANONICAL_RUN_ID_RE,
   DECISION_LOG_REASONS,
   RECEIPT_VIA,
   type ReceiptVia,
@@ -213,12 +216,21 @@ export type DecisionClaim = {
   readonly always?: true;
 };
 
-/** What a supersede claim records: the fresh request and why. */
+/**
+ * What a supersede claim records: the fresh request and why. For `run-cancelled`,
+ * `supersededBy` names the cancelled run instead, and no fresh request exists.
+ */
 export type SupersedeClaim = {
   readonly supersededBy: string;
   readonly reason: SupersedeReason;
   /** When the fresh request was parked, so a repair parks it with the same time. */
   readonly parkedAt: string;
+};
+
+/** What a consume claim records: when the grant was spent, and by which run. */
+export type ConsumeClaim = {
+  readonly consumedAt: string;
+  readonly consumedByRun: string;
 };
 
 export type ClaimFault = { readonly id: string; readonly reason: string };
@@ -228,10 +240,12 @@ export type ReadSupersedeClaim = {
   readonly content: ClaimContent;
   readonly claim: SupersedeClaim;
 };
+export type ReadConsumeClaim = { readonly content: ClaimContent; readonly claim: ConsumeClaim };
 
 export type ClaimsRead = {
   readonly decisions: ReadonlyMap<string, ReadDecisionClaim>;
   readonly supersedes: ReadonlyMap<string, ReadSupersedeClaim>;
+  readonly consumes: ReadonlyMap<string, ReadConsumeClaim>;
   readonly faults: readonly ClaimFault[];
 };
 
@@ -265,19 +279,50 @@ export function parseDecisionClaim(
   };
 }
 
-/** A supersede claim's record, or why it is not one. */
+/**
+ * A supersede claim's record, or why it is not one. `supersededBy` is a fresh
+ * request's `appr_` id, except for `run-cancelled`, where it is the cancelled
+ * run's canonical id: a withdrawn request is replaced by nothing.
+ */
 export function parseSupersedeClaim(
   record: Readonly<Record<string, unknown>>,
 ): SupersedeClaim | string {
   const { supersededBy, reason, parkedAt } = record;
-  if (typeof supersededBy !== "string" || !APPROVAL_ID_RE.test(supersededBy)) {
-    return "its supersededBy is not an approval id";
-  }
   if (!(DECISION_LOG_REASONS.supersede as readonly unknown[]).includes(reason)) {
     return "its reason is not a supersede reason";
   }
+  if (reason === "run-cancelled") {
+    if (typeof supersededBy !== "string" || !CANONICAL_RUN_ID_RE.test(supersededBy)) {
+      return "its supersededBy is not a run id";
+    }
+  } else if (typeof supersededBy !== "string" || !APPROVAL_ID_RE.test(supersededBy)) {
+    return "its supersededBy is not an approval id";
+  }
   if (typeof parkedAt !== "string") return "its parkedAt is not a string";
   return { supersededBy, reason: reason as SupersedeReason, parkedAt };
+}
+
+/** Whether a record's supersede withdrew it (its run was cancelled), rather than replaced it. */
+export function wasWithdrawn(record: Pick<PendingApproval, "supersededReason">): boolean {
+  return record.supersededReason === "run-cancelled";
+}
+
+/** A consume claim's record, or why it is not one. */
+export function parseConsumeClaim(
+  record: Readonly<Record<string, unknown>>,
+): ConsumeClaim | string {
+  const { consumedAt, consumedByRun } = record;
+  if (typeof consumedAt !== "string" || Number.isNaN(Date.parse(consumedAt))) {
+    return "its consumedAt is not a time";
+  }
+  if (
+    typeof consumedByRun !== "string" ||
+    consumedByRun.length === 0 ||
+    consumedByRun.length > 256
+  ) {
+    return "its consumedByRun is not a run id";
+  }
+  return { consumedAt, consumedByRun };
 }
 
 /**
@@ -318,6 +363,32 @@ export function applySupersedeClaim(
 }
 
 /**
+ * The record with a consume claim applied: spent, and by which run. Only a grant
+ * can be spent, so any other record comes back as it is.
+ */
+export function applyConsumeClaim(record: PendingApproval, claim: ConsumeClaim): PendingApproval {
+  if (record.decision !== "grant") return record;
+  return { ...record, consumedAt: claim.consumedAt, consumedByRun: claim.consumedByRun };
+}
+
+/**
+ * Whether a record answers a call made in `resumeScope`: its binding names that
+ * scope, or, for a record parked before grants were bound, the scope is its own
+ * session. One rule for every lookup (the store's `get`, the runtime's replay and
+ * place searches), so a grant or a deny is found only where it was asked.
+ */
+export function recordInScope(
+  record: Pick<PendingApproval, "binding" | "sessionId">,
+  resumeScope: string,
+): boolean {
+  const binding: unknown = record.binding;
+  if (binding === undefined) return resumeScope === `session:${record.sessionId}`;
+  if (typeof binding !== "object" || binding === null) return false;
+  const bound = (binding as { readonly resumeScope?: unknown }).resumeScope;
+  return typeof bound === "string" && bound !== "" && bound === resumeScope;
+}
+
+/**
  * The claim names of one kind on disk, or `undefined` when the directory exists and
  * cannot be listed (every claim is then read one by one, and refused one by one).
  */
@@ -338,7 +409,7 @@ function claimIds(root: string, kind: string): ReadonlySet<string> | undefined {
 }
 
 /**
- * The decision and supersede claims for `ids`, read with control-records'
+ * The decision, supersede and consume claims for `ids`, read with control-records'
  * `readClaim` on the session root's ledger. Synchronous; creates nothing. Each
  * claims directory is listed once, and a claim is read only for an id in `ids`.
  */
@@ -346,8 +417,10 @@ export function readClaims(rootDir: string, ids: Iterable<string>): ClaimsRead {
   const ledger = approvalsLedger(rootDir);
   const decisionIds = claimIds(ledger.root, "decision");
   const supersedeIds = claimIds(ledger.root, "supersede");
+  const consumeIds = claimIds(ledger.root, "consume");
   const decisions = new Map<string, ReadDecisionClaim>();
   const supersedes = new Map<string, ReadSupersedeClaim>();
+  const consumes = new Map<string, ReadConsumeClaim>();
   const faults: ClaimFault[] = [];
   const read = <T>(
     kind: string,
@@ -374,8 +447,10 @@ export function readClaims(rootDir: string, ids: Iterable<string>): ClaimsRead {
     if (decision !== undefined) decisions.set(id, decision);
     const supersede = read("supersede", id, supersedeIds, parseSupersedeClaim);
     if (supersede !== undefined) supersedes.set(id, supersede);
+    const consume = read("consume", id, consumeIds, parseConsumeClaim);
+    if (consume !== undefined) consumes.set(id, consume);
   }
-  return { decisions, supersedes, faults };
+  return { decisions, supersedes, consumes, faults };
 }
 
 /** `records` with every readable claim applied. */
@@ -389,6 +464,8 @@ export function applyClaims(
     if (decision !== undefined) next = applyDecisionClaim(next, decision.claim);
     const supersede = claims.supersedes.get(record.id);
     if (supersede !== undefined) next = applySupersedeClaim(next, supersede.claim);
+    const consume = claims.consumes.get(record.id);
+    if (consume !== undefined) next = applyConsumeClaim(next, consume.claim);
     return next;
   });
 }
@@ -400,7 +477,12 @@ export function claimedChoices(claims: ClaimsRead): Map<string, ApprovalDecision
   return claimed;
 }
 
-const NO_CLAIMS: ClaimsRead = { decisions: new Map(), supersedes: new Map(), faults: [] };
+const NO_CLAIMS: ClaimsRead = {
+  decisions: new Map(),
+  supersedes: new Map(),
+  consumes: new Map(),
+  faults: [],
+};
 
 export type ClaimFold = ApprovalFold & {
   /** Claims that exist and could not be read: their records are left as the file says. */

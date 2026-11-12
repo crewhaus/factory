@@ -112,17 +112,54 @@ export function decideClassOf(
   const target = targetOf(harness);
   if (row.kind === "service") {
     // A service decides only operator-class questions, and only with the explicit permission.
-    const holds = snapshot.tokens.some(
-      (credential) =>
-        credential.principal === principal &&
-        credential.kind === "service" &&
-        isLiveCredential(snapshot, credential, now) &&
-        credentialHolds(credential, "h.decision.resolve", target),
-    );
-    return holds ? "operator" : null;
+    return decidingCredentials(snapshot, principal, harness, now).length > 0 ? "operator" : null;
   }
   const role = standingRole(snapshot, principal, target, now);
   return role === null || role === "viewer" ? null : role;
+}
+
+/** A service principal's live credentials that may resolve decisions on the harness. */
+function decidingCredentials(
+  snapshot: AccessSnapshot,
+  principal: string,
+  harness: AccessHarness,
+  now: number,
+): AccessSnapshot["tokens"] {
+  const target = targetOf(harness);
+  return snapshot.tokens.filter(
+    (credential) =>
+      credential.principal === principal &&
+      credential.kind === "service" &&
+      isLiveCredential(snapshot, credential, now) &&
+      credentialHolds(credential, "h.decision.resolve", target),
+  );
+}
+
+/**
+ * When a member's authority to decide on the harness ends on its own, as an ISO
+ * instant, or `undefined` when it does not. Only a service's does: it decides
+ * through credentials that expire, so its member row carries the latest end time
+ * among the live ones that may resolve decisions there, and every reader stops
+ * counting it at that instant, however long ago the file was written. A member's
+ * grants are copied in only when they have no end time (see `standingRole`), and
+ * the owner never ends.
+ */
+export function decideUntilOf(
+  snapshot: AccessSnapshot,
+  principal: string,
+  harness: AccessHarness,
+  now: number,
+): string | undefined {
+  const row = principalOf(snapshot, principal);
+  if (row === undefined || row.kind !== "service" || principal === snapshot.owner) return undefined;
+  let latest: number | undefined;
+  for (const credential of decidingCredentials(snapshot, principal, harness, now)) {
+    // A credential with no end time decides until it is revoked: nothing ends on its own.
+    if (credential.expiresAt === undefined) return undefined;
+    const ends = Date.parse(credential.expiresAt);
+    if (Number.isFinite(ends) && (latest === undefined || ends > latest)) latest = ends;
+  }
+  return latest === undefined ? undefined : new Date(latest).toISOString();
 }
 
 function liveSlackLinks(snapshot: AccessSnapshot): { principal: string; external: string }[] {
@@ -160,11 +197,13 @@ export function projectionContent(
   now: number,
 ): Content {
   const owner = snapshot.owner as string;
-  const members: { principal: string; decide: DecisionClass }[] = [];
+  const members: { principal: string; decide: DecisionClass; until?: string }[] = [];
   for (const principal of snapshot.principals) {
     if (principal.id === owner) continue;
     const decide = decideClassOf(snapshot, principal.id, harness, now);
-    if (decide !== null) members.push({ principal: principal.id, decide });
+    if (decide === null) continue;
+    const until = decideUntilOf(snapshot, principal.id, harness, now);
+    members.push({ principal: principal.id, decide, ...(until !== undefined ? { until } : {}) });
   }
   members.sort((a, b) => byText(a.principal, b.principal));
   const deciders = new Set([owner, ...members.map((member) => member.principal)]);
@@ -180,7 +219,11 @@ function normalize(content: Content): string {
     owner: content.owner,
     governedSince: content.governedSince,
     members: content.members
-      .map((member) => ({ principal: member.principal, decide: member.decide }))
+      .map((member) => ({
+        principal: member.principal,
+        decide: member.decide,
+        ...(member.until !== undefined ? { until: member.until } : {}),
+      }))
       .sort((a, b) => byText(a.principal, b.principal)),
     links: content.links
       .map((link) => ({ external: link.external, principal: link.principal }))

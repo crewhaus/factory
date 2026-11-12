@@ -88,6 +88,7 @@ import {
 } from "../packages/permission-engine/src/index";
 import { runPreflight } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
+import { requiredClassFor } from "../packages/runtime-core/src/decision-binding";
 import {
   credentialFileRoots,
   runtimeStateRoots,
@@ -1100,7 +1101,7 @@ describe("the release notes name every change a harness without provability: see
 
     // A grant is spent after the egress check and the rate gate, whose
     // refusal lets it go unspent.
-    const spend = runtime.indexOf("await heldGrant?.spend();");
+    const spend = runtime.indexOf("const spent = await held.spend(");
     expect(spend).toBeGreaterThan(-1);
     const screen = runtime.lastIndexOf("classifyEgress(payload, runContext", spend);
     expect(screen).toBeGreaterThan(-1);
@@ -1125,7 +1126,7 @@ describe("the release notes name every change a harness without provability: see
     expect(allowedBranch).toContain('if (decision !== "allow" || approvals === undefined) return;');
     expect(allowedBranch).toContain("landsWhereApproved(grant, gateView)");
     expect(allowedBranch).toContain("!grantsInFlight.has(grant.id)");
-    expect(allowedBranch).toContain("heldGrant = holdGrant(grant, approvals.store);");
+    expect(allowedBranch).toContain('heldGrant = holdGrant(grant, approvals.store, "rule");');
     // It reads the store only for a call the egress check would refuse, once
     // the verdict is in and before a block can become a warn.
     expect(runtime.split("holdRuleAllowedGrant").length - 1).toBe(2);
@@ -2030,6 +2031,56 @@ describe("approval decisions", () => {
       defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes("`approvals.d/`")) ?? "";
     expect(bullet).toContain("reads never rewrite");
     expect(bullet).toContain("decision log");
+  });
+
+  test("a grant covers the scope it was asked in, a destructive tool needs a maintainer, and the list says so", async () => {
+    const root = sessionRoot();
+    try {
+      const store = createPendingApprovalStore({ rootDir: root });
+      const p = park();
+      // A park carries its binding; the store seals the keyed part as it writes it.
+      await store.persist({
+        ...p,
+        binding: {
+          runId: p.runId,
+          resumeScope: "session:A",
+          sessionId: p.sessionId,
+          resourceRevisionBound: false,
+        },
+      });
+      const decided = await store.decide(
+        p.id,
+        { choice: "grant", actor: {} },
+        { authorize: allowSingleOwner },
+      );
+      expect(decided.outcome).toBe("decided");
+      // (a) another scope finds nothing, and a spend there is refused and kept.
+      expect(await store.get(p.toolName, p.inputHash, { resumeScope: "job:x" })).toBeNull();
+      const spent = await store.consume(p.id, {
+        runId: "run_00000002",
+        resumeScope: "job:x",
+        places: [],
+        approvers: { state: "absent" },
+      });
+      expect(spent.outcome).toBe("refused");
+      expect(spent.outcome === "refused" && spent.reason).toBe("scope-mismatch");
+      expect((await store.get(p.toolName, p.inputHash, { resumeScope: "session:A" }))?.id).toBe(
+        p.id,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    // (b) the class a parked call needs comes from the tool's own facts.
+    expect(requiredClassFor({ destructive: true, requireJustification: false })).toBe("maintainer");
+    expect(requiredClassFor({ destructive: false, requireJustification: false })).toBe("operator");
+    // (c) the list names it.
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("`crewhaus runs resume`"),
+      ) ?? "";
+    expect(bullet).toContain("used once");
+    expect(bullet).toContain("maintainer");
+    expect(bullet).toContain("chat channel's buttons names no one");
   });
 });
 

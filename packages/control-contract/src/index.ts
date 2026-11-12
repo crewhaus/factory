@@ -84,6 +84,7 @@ export {
   type VerifyVerdict,
   classAllows,
   effectiveDecisionState,
+  memberMayDecide,
   verifyDecision,
 } from "./decisions.js";
 export {
