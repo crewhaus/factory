@@ -34,8 +34,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseSpec } from "@crewhaus/spec";
 import { OPTIMIZABLE_PATHS } from "@crewhaus/spec-patch";
+import { parse } from "yaml";
 import * as fx from "./fixtures";
-import { doctorFix, modelTurnRefusal, specAdvise, specPatchApply, specUpgrade } from "./index";
+import {
+  doctorFix,
+  modelTurnRefusal,
+  ownedLeafChange,
+  specAdvise,
+  specPatchApply,
+  specUpgrade,
+} from "./index";
 
 /** CI is a loaded two-core box; these do real file I/O. */
 const BUDGET_MS = 30_000;
@@ -1359,5 +1367,46 @@ describe("DoctorFix", () => {
       advise: true,
       upgrade: true,
     });
+  });
+});
+
+describe("SpecPatchApply: a prototype name is never a path segment", () => {
+  const protoKeys = (): string[] => Object.getOwnPropertyNames(Object.prototype).sort();
+
+  it("refuses nodes.__proto__.x for replace and remove, and no prototype changes", async () => {
+    const [objectBefore, arrayBefore] = [
+      protoKeys(),
+      Object.getOwnPropertyNames(Array.prototype).sort(),
+    ];
+    for (const patch of [
+      { path: ["nodes", "__proto__", "pwned"], op: "replace", value: "yes" },
+      { path: ["nodes", "__proto__", "hasOwnProperty"], op: "remove" },
+      { path: ["steps", "__proto__", "pwned"], value: "yes" },
+      { path: ["nodes", "constructor", "prototype", "pwned"], value: "yes" },
+    ]) {
+      const out = await run(specPatchApply, { spec: fx.GRAPH_SPEC_YAML, patches: [patch] });
+      expect(out["ok"]).not.toBe(true);
+      expect(JSON.stringify(out)).toContain("a path segment may not be __proto__");
+    }
+    expect(({} as Record<string, unknown>)["pwned"]).toBeUndefined();
+    expect(([] as unknown as Record<string, unknown>)["pwned"]).toBeUndefined();
+    expect(typeof Object.prototype.hasOwnProperty).toBe("function");
+    expect(protoKeys()).toEqual(objectBefore);
+    expect(Object.getOwnPropertyNames(Array.prototype).sort()).toEqual(arrayBefore);
+  });
+
+  it("ownedLeafChange refuses it too, and reads no prototype", () => {
+    const before = protoKeys();
+    const doc = parse(fx.GRAPH_SPEC_YAML) as unknown;
+    for (const [path, op] of [
+      [["nodes", "__proto__", "hasOwnProperty"], "remove"],
+      [["nodes", "__proto__", "pwned"], "replace"],
+    ] as const) {
+      const moved = ownedLeafChange(doc, "graph", path, op, "yes");
+      expect(moved?.reason).toContain("a path segment may not be __proto__");
+    }
+    expect(typeof Object.prototype.hasOwnProperty).toBe("function");
+    expect(({} as Record<string, unknown>)["pwned"]).toBeUndefined();
+    expect(protoKeys()).toEqual(before);
   });
 });

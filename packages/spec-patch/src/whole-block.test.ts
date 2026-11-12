@@ -18,6 +18,7 @@ import {
   refusedLeafIn,
   validatePatch,
   wildcardPlacementIssues,
+  withPatchApplied,
 } from "./index";
 
 const WORKFLOW = `name: w
@@ -566,5 +567,163 @@ describe("admitBlockPatch and leafReachable", () => {
 
   test("the wildcard placement guard still passes on the shipped table", () => {
     expect(wildcardPlacementIssues()).toEqual([]);
+  });
+});
+
+describe("an index segment is read the way the writer reads it", () => {
+  // The YAML writer reads a segment over a sequence with `Number(key)`, so
+  // each of these addresses an element when the patch is written; the gate
+  // must judge the element it addresses, not an unrelated property.
+  const forms = (i: number): string[] => [`0${i}`, `${i}.0`, ` ${i}`, `${i}e0`, `+${i}`];
+
+  test("a non-canonical index that changes a step's model is refused by validatePatch", () => {
+    for (const [i, model] of [
+      [0, "claude-opus-4-8"],
+      [1, "evil-model"],
+    ] as const) {
+      const value = edited(steps()[i] as Step, (s) => {
+        s["model"] = model;
+      });
+      for (const seg of forms(i)) {
+        let message = "";
+        try {
+          validatePatch(parseSpec(WORKFLOW), {
+            target: "workflow",
+            path: ["steps", seg],
+            op: "replace",
+            value,
+          });
+        } catch (err) {
+          message = (err as Error).message;
+        }
+        expect(message).toContain(`would change "steps.${i}.model"`);
+      }
+    }
+  });
+
+  test("withPatchApplied writes the element a non-canonical index addresses, at any depth", () => {
+    for (const seg of forms(1)) {
+      const deep = withPatchApplied(plain(WORKFLOW), ["steps", seg, "model"], "replace", "x") as {
+        steps: Step[];
+      };
+      expect(deep.steps[1]?.["model"]).toBe("x");
+      expect(Object.keys(deep.steps)).toEqual(["0", "1"]);
+      const gone = withPatchApplied(plain(WORKFLOW), ["steps", seg], "remove", undefined) as {
+        steps: Step[];
+      };
+      expect(gone.steps.map((s) => s["name"])).toEqual(["fetch"]);
+    }
+    // A key the writer refuses on a sequence leaves the document as it is.
+    const kept = withPatchApplied(plain(WORKFLOW), ["steps", "first", "model"], "replace", "x");
+    expect(kept).toEqual(plain(WORKFLOW));
+  });
+
+  test("applySpecEdits names the edit that wrote it, whatever form its index took", () => {
+    const value = edited(steps()[0] as Step, (s) => {
+      s["model"] = "claude-opus-4-8";
+    });
+    let message = "";
+    try {
+      applySpecEdits(WORKFLOW, [{ path: ["steps", "00"], value }], { restrictToOptimizable: true });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain('edit #0 (steps.00) would change "steps.0.model"');
+  });
+
+  test("a non-canonical index that only changes instructions is still admitted", () => {
+    const value = edited(steps()[1] as Step, (s) => {
+      s["instructions"] = "Summarise it briefly.";
+    });
+    expect(() =>
+      validatePatch(parseSpec(WORKFLOW), {
+        target: "workflow",
+        path: ["steps", "01"],
+        op: "replace",
+        value,
+      }),
+    ).not.toThrow();
+  });
+
+  test("changedLeaves names a leaf under a non-canonical index by its plain index", () => {
+    const before = plain(WORKFLOW);
+    const after = edited(before, (d) => {
+      ((d["steps"] as Step[])[1] as Step)["model"] = "x";
+    });
+    expect(changedLeaves(before, after, ["steps", "01"]).map((l) => l.path.join("."))).toEqual([
+      "steps.1.model",
+    ]);
+  });
+});
+
+describe("a prototype name is never a path segment", () => {
+  const protoKeys = (): string[] => Object.getOwnPropertyNames(Object.prototype).sort();
+  const arrayKeys = (): string[] => Object.getOwnPropertyNames(Array.prototype).sort();
+
+  test("validatePatch refuses __proto__, constructor and prototype, and no prototype changes", () => {
+    const [objectBefore, arrayBefore] = [protoKeys(), arrayKeys()];
+    const cases: Array<[string, Spec["target"], string[]]> = [
+      [GRAPH, "graph", ["nodes", "__proto__", "pwned"]],
+      [WORKFLOW, "workflow", ["steps", "__proto__", "pwned"]],
+      [GRAPH, "graph", ["nodes", "constructor", "prototype", "pwned"]],
+    ];
+    for (const [yaml, target, path] of cases) {
+      for (const op of ["replace", "add", "remove"] as const) {
+        let message = "";
+        try {
+          validatePatch(parseSpec(yaml), { target, path, op, value: "yes" });
+        } catch (err) {
+          expect(err).toBeInstanceOf(SpecPatchError);
+          message = (err as Error).message;
+        }
+        expect(message).toContain("a path segment may not be __proto__");
+      }
+    }
+    expect(({} as Record<string, unknown>)["pwned"]).toBeUndefined();
+    expect(([] as unknown as Record<string, unknown>)["pwned"]).toBeUndefined();
+    expect(protoKeys()).toEqual(objectBefore);
+    expect(arrayKeys()).toEqual(arrayBefore);
+  });
+
+  test("applySpecEdits refuses one too, restricted or not", () => {
+    for (const opts of [{}, { restrictToOptimizable: true }]) {
+      expect(() =>
+        applySpecEdits(GRAPH, [{ path: ["nodes", "__proto__", "pwned"], value: "yes" }], opts),
+      ).toThrow(/a path segment may not be __proto__/);
+    }
+    expect(({} as Record<string, unknown>)["pwned"]).toBeUndefined();
+  });
+
+  test("admitBlockPatch refuses a reserved segment in the path or in a changed leaf", () => {
+    const doc = plain(GRAPH);
+    const refusal = admitBlockPatch("graph", doc, doc, ["nodes", "__proto__", "hasOwnProperty"]);
+    expect(refusal?.reason).toContain("a path segment may not be __proto__");
+    const after = edited(doc, (d) => {
+      Object.defineProperty(d["nodes"], "constructor", {
+        value: { instructions: "x" },
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    });
+    expect(admitBlockPatch("graph", doc, after, ["nodes"])?.leaf).toBe(
+      "nodes.constructor.instructions",
+    );
+  });
+
+  test("withPatchApplied writes and deletes own properties only", () => {
+    const before = protoKeys();
+    const doc = plain(GRAPH);
+    const set = withPatchApplied(doc, ["nodes", "__proto__", "pwned"], "replace", "yes") as {
+      nodes: Record<string, unknown>;
+    };
+    expect(({} as Record<string, unknown>)["pwned"]).toBeUndefined();
+    expect(Object.hasOwn(set.nodes, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(set.nodes)).toBe(Object.prototype);
+    withPatchApplied(doc, ["nodes", "__proto__", "hasOwnProperty"], "remove", undefined);
+    withPatchApplied(doc, ["nodes", "constructor", "prototype", "x"], "replace", 1);
+    expect(typeof Object.prototype.hasOwnProperty).toBe("function");
+    expect((Object as unknown as Record<string, unknown>)["x"]).toBeUndefined();
+    expect(protoKeys()).toEqual(before);
   });
 });

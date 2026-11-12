@@ -16,6 +16,7 @@
  */
 import type { Spec } from "@crewhaus/spec";
 import {
+  RESERVED_PATH_SEGMENTS,
   STRUCTURAL_REASONS,
   STRUCTURAL_SEGMENTS,
   type SpecEditPathSegment,
@@ -60,21 +61,68 @@ function isMapping(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** The value at `path`, reading a sequence by index. `undefined` when absent. */
+/**
+ * The index a segment addresses on a sequence, read exactly as the YAML
+ * writer reads it (`Number(key)`, a non-negative integer), so `"00"`, `"1.0"`
+ * and `" 1"` address the element here that they address when the patch is
+ * written. `undefined` when the writer refuses the segment on a sequence.
+ */
+export function sequenceIndex(seg: SpecEditPathSegment): number | undefined {
+  const i = typeof seg === "number" ? seg : seg === "" ? Number.NaN : Number(seg);
+  return Number.isInteger(i) && i >= 0 ? Math.abs(i) : undefined;
+}
+
+/** A mapping's own value at `key`, never one it inherits (`__proto__`, `constructor`). */
+function ownValue(holder: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(holder, key) ? holder[key] : undefined;
+}
+
+/** Set an own property, never a prototype: `__proto__` is a plain key here. */
+function setOwn(holder: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(holder, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/** The value at `path`, reading a sequence as the writer does. `undefined` when absent. */
 function valueAt(doc: unknown, path: ReadonlyArray<SpecEditPathSegment>): unknown {
   let cur = doc;
   for (const seg of path) {
-    const key = String(seg);
     if (Array.isArray(cur)) {
-      const i = Number(key);
-      cur = Number.isInteger(i) && i >= 0 && String(i) === key ? cur[i] : undefined;
+      const i = sequenceIndex(seg);
+      cur = i === undefined ? undefined : cur[i];
     } else if (isMapping(cur)) {
-      cur = Object.hasOwn(cur, key) ? cur[key] : undefined;
+      cur = ownValue(cur, String(seg));
     } else {
       return undefined;
     }
   }
   return cur;
+}
+
+/**
+ * `at` with each segment that addresses a sequence (in either document)
+ * written as its plain index, so a leaf under `["steps","00"]` is named
+ * `steps.0.…`, like the element it is.
+ */
+export function canonicalPath(
+  before: unknown,
+  after: unknown,
+  at: ReadonlyArray<SpecEditPathSegment>,
+): string[] {
+  const out: string[] = [];
+  let x = before;
+  let y = after;
+  for (const seg of at) {
+    const i = Array.isArray(x) || Array.isArray(y) ? sequenceIndex(seg) : undefined;
+    out.push(i === undefined ? String(seg) : String(i));
+    x = valueAt(x, [seg]);
+    y = valueAt(y, [seg]);
+  }
+  return out;
 }
 
 /**
@@ -131,7 +179,7 @@ export function changedLeaves(
   after: unknown,
   at: ReadonlyArray<SpecEditPathSegment>,
 ): ReadonlyArray<ChangedLeaf> {
-  const base = at.map((seg) => String(seg));
+  const base = canonicalPath(before, after, at);
   const a = new Map<string, { path: string[]; value: unknown }>();
   const b = new Map<string, { path: string[]; value: unknown }>();
   collectLeaves(valueAt(before, at), base, a);
@@ -183,6 +231,9 @@ export function leafReachable(
   return false;
 }
 
+/** Why a path through a prototype name is refused. */
+const RESERVED_REASON = "a path segment may not be __proto__, constructor or prototype";
+
 /** Why a leaf no admitted entry reaches is refused. */
 function notTunableReason(target: Spec["target"], leaf: ReadonlyArray<string>): string {
   const structural = leaf.find((seg) => STRUCTURAL_SEGMENTS.includes(seg));
@@ -199,7 +250,8 @@ function notTunableReason(target: Spec["target"], leaf: ReadonlyArray<string>): 
  * `undefined` when every one may. For each leaf, in {@link changedLeaves}
  * order: a refused row (`refused-leaf`, the row's reason), then
  * {@link leafReachable} (`not-tunable`), then the caller's `leafRule`
- * (`caller`).
+ * (`caller`). A path or leaf through a `RESERVED_PATH_SEGMENTS` name is
+ * refused first (`not-tunable`), whatever it changes.
  */
 export function admitBlockPatch(
   target: Spec["target"],
@@ -208,7 +260,23 @@ export function admitBlockPatch(
   at: ReadonlyArray<SpecEditPathSegment>,
   opts: AdmitBlockPatchOptions = {},
 ): BlockLeafRefusal | undefined {
+  // A prototype name is never a spec key: refused wherever it appears, before
+  // anything is read through it.
+  const reserved = (path: ReadonlyArray<SpecEditPathSegment>): boolean =>
+    path.some((seg) => RESERVED_PATH_SEGMENTS.includes(String(seg)));
+  if (reserved(at)) {
+    const path = at.map((seg) => String(seg));
+    return { leaf: path.join("."), path, reason: RESERVED_REASON, rule: "not-tunable" };
+  }
   for (const leaf of changedLeaves(before, after, at)) {
+    if (reserved(leaf.path)) {
+      return {
+        leaf: leaf.path.join("."),
+        path: leaf.path,
+        reason: RESERVED_REASON,
+        rule: "not-tunable",
+      };
+    }
     if (
       opts.written !== undefined &&
       leaf.before === undefined &&
@@ -233,7 +301,10 @@ export function admitBlockPatch(
 /**
  * A copy of `doc` with `value` set at `path` (intermediate mappings created),
  * or with `path` deleted for a `remove`. Plain data in, plain data out; the
- * input is not touched.
+ * input is not touched. A segment over a sequence is read as the YAML writer
+ * reads it ({@link sequenceIndex}); one the writer refuses there leaves the
+ * document as it is, since the write fails too. Every read and write is of an
+ * own property, so no segment reaches a prototype.
  */
 export function withPatchApplied(
   doc: unknown,
@@ -244,32 +315,43 @@ export function withPatchApplied(
   const root: unknown = structuredClone(doc ?? {});
   let cur: unknown = root;
   for (let i = 0; i < path.length - 1; i++) {
-    const key = String(path[i]);
-    const holder = cur as Record<string, unknown>;
-    let next = Array.isArray(cur) || isMapping(cur) ? holder[key] : undefined;
-    if (next === undefined) {
-      if (op === "remove") return root;
-      next = {};
-      holder[key] = next;
-    } else if (next === null || typeof next !== "object") {
-      // A scalar on the way (a `provability: grounded` shorthand): the CST
-      // refuses this write, so the document stays as it is.
+    const seg = path[i] as SpecEditPathSegment;
+    let next: unknown;
+    if (Array.isArray(cur)) {
+      const at = sequenceIndex(seg);
+      if (at === undefined) return root;
+      next = cur[at];
+      if (next === undefined) {
+        if (op === "remove") return root;
+        next = {};
+        cur[at] = next;
+      }
+    } else if (isMapping(cur)) {
+      const key = String(seg);
+      next = ownValue(cur, key);
+      if (next === undefined) {
+        if (op === "remove") return root;
+        next = {};
+        setOwn(cur, key, next);
+      }
+    } else {
       return root;
     }
+    // A scalar on the way (a `provability: grounded` shorthand): the CST
+    // refuses this write, so the document stays as it is.
+    if (next === null || typeof next !== "object") return root;
     cur = next;
   }
-  const last = String(path[path.length - 1]);
-  if (op === "remove") {
-    if (Array.isArray(cur)) {
-      const i = Number(last);
-      if (Number.isInteger(i) && i >= 0 && i < cur.length) cur.splice(i, 1);
-    } else if (isMapping(cur)) {
-      delete cur[last];
-    }
-    return root;
-  }
-  if (Array.isArray(cur) || isMapping(cur)) {
-    (cur as Record<string, unknown>)[last] = structuredClone(value);
+  const last = path[path.length - 1] as SpecEditPathSegment;
+  if (Array.isArray(cur)) {
+    const at = sequenceIndex(last);
+    if (at === undefined) return root;
+    if (op !== "remove") cur[at] = structuredClone(value);
+    else if (at < cur.length) cur.splice(at, 1);
+  } else if (isMapping(cur)) {
+    const key = String(last);
+    if (op !== "remove") setOwn(cur, key, structuredClone(value));
+    else if (Object.hasOwn(cur, key)) delete cur[key];
   }
   return root;
 }

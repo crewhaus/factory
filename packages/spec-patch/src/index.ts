@@ -36,7 +36,13 @@ import { isCollection, isSeq, parse, parseDocument, stringify } from "yaml";
 import { z } from "zod";
 import { DELTA_090_KEYS } from "./owner-keys";
 import { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
-import { admitBlockPatch, changedLeaves, withPatchApplied } from "./whole-block";
+import {
+  admitBlockPatch,
+  canonicalPath,
+  changedLeaves,
+  sequenceIndex,
+  withPatchApplied,
+} from "./whole-block";
 
 // Re-exported so downstream renderers (the CLI changelog, future reporters)
 // can apply the SAME redaction to strings the differ never sees (rationales,
@@ -82,9 +88,27 @@ export type SpecPatch = {
   readonly rationale?: string;
 };
 
+/**
+ * Path segments no patch or edit may name: in plain data they address an
+ * object's prototype, not a spec key, so every entry point refuses them.
+ */
+export const RESERVED_PATH_SEGMENTS: ReadonlyArray<string> = Object.freeze([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
+/** A path segment that names a key: non-empty and not a {@link RESERVED_PATH_SEGMENTS} member. */
+const pathKeySchema = z
+  .string()
+  .min(1)
+  .refine((seg) => !RESERVED_PATH_SEGMENTS.includes(seg), {
+    message: `a path segment may not be ${RESERVED_PATH_SEGMENTS.join(", ")}`,
+  });
+
 const specPatchSchema = z.object({
   target: z.string().min(1),
-  path: z.array(z.string().min(1)).min(1),
+  path: z.array(pathKeySchema).min(1),
   op: z.enum(["replace", "add", "remove"]),
   value: z.unknown().optional(),
   rationale: z.string().optional(),
@@ -428,7 +452,7 @@ export type SpecEdit = {
 };
 
 const specEditSchema = z.object({
-  path: z.array(z.union([z.string().min(1), z.number().int().nonnegative()])).min(1),
+  path: z.array(z.union([pathKeySchema, z.number().int().nonnegative()])).min(1),
   value: z.unknown().optional(),
   rationale: z.string().optional(),
 });
@@ -566,11 +590,13 @@ export function applySpecEdits(
     }
     const blocked = admitBlockPatch(spec.target, before, after, [], { written });
     if (blocked !== undefined) {
-      const by = edits.findIndex(
-        (edit) =>
-          edit.path.length <= blocked.path.length &&
-          edit.path.every((seg, i) => String(seg) === blocked.path[i]),
-      );
+      // An edit's index segment is compared as the writer read it (`"00"` is `0`).
+      const by = edits.findIndex((edit) => {
+        const segs = canonicalPath(before, written, edit.path);
+        return (
+          segs.length <= blocked.path.length && segs.every((seg, i) => seg === blocked.path[i])
+        );
+      });
       const who =
         by >= 0 ? `edit #${by} (${formatEditPath(edits[by]?.path ?? [])})` : "the edits together";
       throw new SpecPatchError(
@@ -598,8 +624,8 @@ function guardSequenceIndices(
   for (let i = 0; i < path.length; i++) {
     const seg = path[i] as SpecEditPathSegment;
     const parent = i === 0 ? doc.contents : doc.getIn(path.slice(0, i), true);
-    const asIndex =
-      typeof seg === "number" ? seg : /^\d+$/.test(seg) ? Number.parseInt(seg, 10) : undefined;
+    // Read as the CST reads it: `"01"`, `"1.0"` and `" 1"` are index 1 there.
+    const asIndex = sequenceIndex(seg);
     if (isSeq(parent)) {
       if (asIndex !== undefined && asIndex > parent.items.length) {
         throw new SpecPatchError(

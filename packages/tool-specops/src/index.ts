@@ -59,6 +59,7 @@ import {
   type ChangedLeaf,
   OPTIMIZABLE_PATHS,
   OPTIMIZER_REFUSED_LEAVES,
+  RESERVED_PATH_SEGMENTS,
   type SpecPatch,
   WILDCARD_SEGMENT,
   admitBlockPatch,
@@ -457,7 +458,14 @@ function refusedLeafRemovedBy(
 
 const patchInputSchema = z.object({
   path: z
-    .array(z.string().min(1))
+    .array(
+      z
+        .string()
+        .min(1)
+        .refine((seg) => !RESERVED_PATH_SEGMENTS.includes(seg), {
+          message: `a path segment may not be ${RESERVED_PATH_SEGMENTS.join(", ")}`,
+        }),
+    )
     .min(1)
     .max(12)
     .describe('the field to change, as a key chain: ["agent","max_tokens"]'),
