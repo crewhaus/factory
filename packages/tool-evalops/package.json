@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-evalops",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic eval-result operations: recompute, trend, pin a baseline and sanity-check a grader without running an eval",
   "main": "src/index.ts",

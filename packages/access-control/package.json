@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/access-control",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Who may operate a harness: members and services, roles granted on the whole Home, a group or one harness, hashed credentials, invites, identity links, the pure authorize() check and the approver projection each governed harness reads. Files and WebCrypto only: no process, no socket, no third-party dependency.",
   "main": "src/index.ts",

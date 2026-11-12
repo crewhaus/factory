@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-math",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic math tools: expression evaluation, statistics, decimal money arithmetic, unit conversion, geospatial distance and financial formulas",
   "main": "src/index.ts",

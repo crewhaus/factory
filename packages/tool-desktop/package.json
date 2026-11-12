@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-desktop",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic access to the operator's desktop: clipboard, notifications, opening a document, printing, windows, presence and sleep — failing closed on a headless host",
   "main": "src/index.ts",
