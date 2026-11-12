@@ -175,3 +175,38 @@ describe("refusals", () => {
     ).toBe("signature_invalid");
   });
 });
+
+describe("a sign-in body is held to its limit as it is read", () => {
+  test("a declared length over the limit is refused as an invalid body", async () => {
+    const t = boot();
+    const res = await t.fetchRaw("/api/v1/auth/exchange", json({ pad: "x".repeat(9 * 1024) }));
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { details: { reason: string } } };
+    expect(body.error.details.reason).toBe("body_invalid");
+  });
+
+  test("a streamed body that passes the limit is answered without waiting for its end", async () => {
+    const t = boot();
+    // 16 KiB, then a stream that never ends. A read of the whole body would
+    // wait for an end that never comes, and the fetch would time out; the
+    // counted read answers at the chunk that passes 8 KiB.
+    let sent = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= 16) return new Promise<void>(() => {});
+        sent++;
+        controller.enqueue(new Uint8Array(1024).fill(0x20));
+        return undefined;
+      },
+    });
+    const res = await t.fetchRaw("/api/v1/auth/exchange", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: stream,
+      duplex: "half",
+    } as RequestInit);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { details: { reason: string } } };
+    expect(body.error.details.reason).toBe("body_invalid");
+  });
+});

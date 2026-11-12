@@ -19,6 +19,7 @@ import {
   authSessionRequest,
   emptyRequest,
 } from "@crewhaus/control-contract/schemas";
+import { readRequestBodyCapped } from "@crewhaus/gateway-protocol/body-limit";
 import { type HomeAccess, checkAccess, refusalOf, refusalResponse } from "./access";
 import { json } from "./http";
 import { maskDeep } from "./mask";
@@ -66,13 +67,11 @@ async function bodyOf(
   req: Request,
   schema: Schema,
 ): Promise<{ value: unknown } | { refused: true }> {
-  let text: string;
-  try {
-    text = await req.text();
-  } catch {
-    return { refused: true };
-  }
-  if (Buffer.byteLength(text) > MAX_BODY_BYTES) return { refused: true };
+  // Counted as it is read: a body past the limit is refused at the chunk that
+  // passes it, and one that declares a larger length is refused unread.
+  const read = await readRequestBodyCapped(req, MAX_BODY_BYTES);
+  if (!read.ok) return { refused: true };
+  const text = read.text;
   let parsed: unknown;
   try {
     parsed = text === "" ? undefined : JSON.parse(text);

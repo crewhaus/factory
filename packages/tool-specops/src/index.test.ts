@@ -34,8 +34,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseSpec } from "@crewhaus/spec";
 import { OPTIMIZABLE_PATHS } from "@crewhaus/spec-patch";
+import { parse } from "yaml";
 import * as fx from "./fixtures";
-import { doctorFix, modelTurnRefusal, specAdvise, specPatchApply, specUpgrade } from "./index";
+import {
+  doctorFix,
+  modelTurnRefusal,
+  ownedLeafChange,
+  specAdvise,
+  specPatchApply,
+  specUpgrade,
+} from "./index";
 
 /** CI is a loaded two-core box; these do real file I/O. */
 const BUDGET_MS = 30_000;
@@ -351,8 +359,8 @@ describe("SpecPatchApply refuses what a model turn may not write (C126)", () => 
       }
     }
     // agent.instructions on 11 targets, transaction_policy on 9, chains on 8,
-    // security.justification on 1: a row the table stopped matching fails here.
-    expect(refusedEntries).toBe(29);
+    // security.justification on 2: a row the table stopped matching fails here.
+    expect(refusedEntries).toBe(30);
     expect(admittedEntries).toBeGreaterThan(100);
   });
 
@@ -672,6 +680,29 @@ describe("SpecPatchApply refuses a prompt, grant, model or gate on every shape (
       });
     });
   }
+
+  it("a whole steps block that changes a step pool's learning seed is refused by this tool", async () => {
+    // The shared whole-block rule (#514) reads the refused seed row inside the
+    // value; the tool's own refusal form proves the tool runs it.
+    const value = [
+      {
+        name: "answer",
+        instructions: "Answer the question.",
+        model_pool: { policy: "learned", learning: { seed: "s2" }, candidates: roster },
+      },
+    ];
+    const out = await run(specPatchApply, { spec: P, patches: [{ path: ["steps"], value }] });
+    const refused = out["refused"] as Array<Record<string, unknown>> | undefined;
+    expect({ ok: out["ok"], applied: out["applied"], path: refused?.[0]?.["path"] }).toEqual({
+      ok: false,
+      applied: 0,
+      path: "steps",
+    });
+    const reason = String(refused?.[0]?.["reason"]);
+    expect(reason).toContain("would change steps.0.model_pool,");
+    expect(reason).toContain("a model turn cannot write it");
+    expect(String(refused?.[0]?.["humanOwned"])).toContain("PINS model_pool.learning.seed");
+  });
 
   it("a patch to an anchored field that a prompt aliases is caught on the batch as a whole", async () => {
     // Each patch is judged against the file, and `name` is not human-owned;
@@ -1336,5 +1367,46 @@ describe("DoctorFix", () => {
       advise: true,
       upgrade: true,
     });
+  });
+});
+
+describe("SpecPatchApply: a prototype name is never a path segment", () => {
+  const protoKeys = (): string[] => Object.getOwnPropertyNames(Object.prototype).sort();
+
+  it("refuses nodes.__proto__.x for replace and remove, and no prototype changes", async () => {
+    const [objectBefore, arrayBefore] = [
+      protoKeys(),
+      Object.getOwnPropertyNames(Array.prototype).sort(),
+    ];
+    for (const patch of [
+      { path: ["nodes", "__proto__", "pwned"], op: "replace", value: "yes" },
+      { path: ["nodes", "__proto__", "hasOwnProperty"], op: "remove" },
+      { path: ["steps", "__proto__", "pwned"], value: "yes" },
+      { path: ["nodes", "constructor", "prototype", "pwned"], value: "yes" },
+    ]) {
+      const out = await run(specPatchApply, { spec: fx.GRAPH_SPEC_YAML, patches: [patch] });
+      expect(out["ok"]).not.toBe(true);
+      expect(JSON.stringify(out)).toContain("a path segment may not be __proto__");
+    }
+    expect(({} as Record<string, unknown>)["pwned"]).toBeUndefined();
+    expect(([] as unknown as Record<string, unknown>)["pwned"]).toBeUndefined();
+    expect(typeof Object.prototype.hasOwnProperty).toBe("function");
+    expect(protoKeys()).toEqual(objectBefore);
+    expect(Object.getOwnPropertyNames(Array.prototype).sort()).toEqual(arrayBefore);
+  });
+
+  it("ownedLeafChange refuses it too, and reads no prototype", () => {
+    const before = protoKeys();
+    const doc = parse(fx.GRAPH_SPEC_YAML) as unknown;
+    for (const [path, op] of [
+      [["nodes", "__proto__", "hasOwnProperty"], "remove"],
+      [["nodes", "__proto__", "pwned"], "replace"],
+    ] as const) {
+      const moved = ownedLeafChange(doc, "graph", path, op, "yes");
+      expect(moved?.reason).toContain("a path segment may not be __proto__");
+    }
+    expect(typeof Object.prototype.hasOwnProperty).toBe("function");
+    expect(({} as Record<string, unknown>)["pwned"]).toBeUndefined();
+    expect(protoKeys()).toEqual(before);
   });
 });
