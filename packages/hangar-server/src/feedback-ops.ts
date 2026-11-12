@@ -77,6 +77,7 @@ import {
   readSpecFile,
   requireEditable,
   requireExpectedRev,
+  requireSpecEditAuthority,
   requireWholeSpec,
 } from "./spec-edit";
 import { keyedScalar } from "./spec-lines";
@@ -667,6 +668,9 @@ export const adviceApply: M3Handler = async (ctx) => {
     ...(proposal.op === "remove" ? {} : { value: proposal.value }),
     ...(proposal.rationale !== "" ? { rationale: proposal.rationale } : {}),
   };
+  // A change to a security surface, or one that raises spending, is the security edit
+  // permission's, before the feed says anything else about it.
+  requireSpecEditAuthority(ctx, before, [edit]);
 
   // Checked with the schema this harness is built against, before any edit
   // is applied: a read-only spec is refused (409 `read-only`), and the

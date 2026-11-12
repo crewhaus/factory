@@ -54,8 +54,10 @@ export type ApprovalRow = {
   readonly harnessDir: string;
   readonly specName: string;
   readonly toolName: string;
-  /** Verbatim tool input, credential-masked. */
+  /** Verbatim tool input, credential-masked; `null` when the reader may not read content. */
   readonly input: unknown;
+  /** Set when the input exists but this reader may not read this harness's content. */
+  readonly inputWithheld?: true;
   readonly inputHash: string;
   readonly surface: string;
   readonly createdAt: string;
@@ -125,13 +127,18 @@ export type ApprovalHarness = {
 /** Fold every registered harness's approvals into one inbox, newest first. */
 export function approvalsInbox(
   harnesses: readonly ApprovalHarness[],
-  opts: { readonly includeSettled?: boolean } = {},
+  opts: {
+    readonly includeSettled?: boolean;
+    /** Whether the reader may read this harness's content; the tool input is withheld otherwise. */
+    readonly showsContent?: (harnessId: string) => boolean;
+  } = {},
 ): ApprovalsView {
   const rows: ApprovalRow[] = [];
   const truncatedHarnesses: string[] = [];
   for (const harness of harnesses) {
     const { approvals, truncated } = foldApprovals(harness.dir);
     if (truncated) truncatedHarnesses.push(harness.id);
+    const content = opts.showsContent?.(harness.id) ?? true;
     for (const a of approvals) {
       const status = statusOf(a);
       if (opts.includeSettled !== true && status !== "pending") continue;
@@ -142,8 +149,10 @@ export function approvalsInbox(
         specName: harness.specName,
         toolName: a.toolName,
         // Verbatim, then masked: the approver sees the real call, never a
-        // credential that happened to be an argument to it.
-        input: maskDeep(a.input ?? null),
+        // credential that happened to be an argument to it. A reader who may not read
+        // this harness's content sees that it is withheld, not what it says.
+        input: content ? maskDeep(a.input ?? null) : null,
+        ...(content ? {} : { inputWithheld: true }),
         inputHash: a.inputHash,
         surface: a.surface,
         createdAt: a.createdAt,

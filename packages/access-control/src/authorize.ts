@@ -40,6 +40,9 @@ export type AuthorizeVerdict =
   | { readonly allow: true; readonly grant: string }
   | { readonly allow: false; readonly needs: string; readonly role: Role | null };
 
+/** The one object a request is about, as a domain names it: `{kind: "person", id: "psn_…"}`. */
+export type ObjectRef = { readonly kind: string; readonly id: string };
+
 export type DomainRequest = {
   readonly actor: AccessActor;
   readonly principal: PrincipalRow;
@@ -47,14 +50,24 @@ export type DomainRequest = {
   readonly target: AccessTarget;
   readonly snapshot: AccessSnapshot;
   readonly now: number;
+  /** The object the request is about, exactly as the caller named it; absent when none was. */
+  readonly ref?: ObjectRef;
 };
 
-/** A domain's own authorizer. It must answer; a throw refuses. */
+/**
+ * A domain's own authorizer. It must answer; a throw refuses.
+ *
+ * A checker that decides per object refuses a request that carries no `ref`: the key is
+ * left out entirely when the caller named no object, so "no object" can never read as
+ * "any object".
+ */
 export type DomainChecker = (request: DomainRequest) => AuthorizeVerdict;
 
 export type AuthorizeOptions = {
   readonly now: number;
   readonly domains?: ReadonlyMap<string, DomainChecker>;
+  /** The object the request is about, handed to a domain's checker unchanged. */
+  readonly ref?: ObjectRef;
 };
 
 /**
@@ -212,7 +225,12 @@ function roleAt(
   return target.scope === "harness" ? effectiveRole(snapshot, principal, target, now) : null;
 }
 
-/** `<name>` of a permission `<name>.…` whose prefix is not a core one, else `undefined`. */
+/**
+ * `<name>` of a permission `<name>.…` whose prefix is not a core one, else `undefined`.
+ *
+ * First consumers: `authorize()`, and Home's route-table check that every domain row names
+ * the object it is about.
+ */
 export function domainOf(permission: string): string | undefined {
   const dot = permission.indexOf(".");
   if (dot < 1) return undefined;
@@ -250,7 +268,15 @@ export function authorize(
     const checker = options.domains?.get(domain);
     if (checker === undefined) return refuse(permission, memberRole);
     try {
-      const verdict = checker({ actor, principal, permission, target, snapshot, now: options.now });
+      const verdict = checker({
+        actor,
+        principal,
+        permission,
+        target,
+        snapshot,
+        now: options.now,
+        ...(options.ref !== undefined ? { ref: options.ref } : {}),
+      });
       return verdict?.allow === true && typeof verdict.grant === "string"
         ? { allow: true, grant: verdict.grant }
         : refuse(permission, memberRole);

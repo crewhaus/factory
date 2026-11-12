@@ -450,7 +450,7 @@ const CORE_ROWS = [
     "public",
     "workspace",
     "authAcceptInviteRequest",
-    "sessionIssued",
+    "inviteAccepted",
   ],
   [
     "auth.refresh",
@@ -806,7 +806,7 @@ describe("rows, pinned", () => {
       "auth.acceptInvite",
     ]);
     expect(coreRow("auth.exchange").secretFields).toEqual(["code"]);
-    expect(coreRow("auth.acceptInvite").secretFields).toEqual(["code"]);
+    expect(coreRow("auth.acceptInvite").secretFields).toEqual(["code", "sessionSecret"]);
   });
 
   test("no core row declares modelBound yet", () => {

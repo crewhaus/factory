@@ -4,16 +4,28 @@
  *   GET  /api/v1/auth/challenge   public          a single-use nonce for a device to sign
  *   POST /api/v1/auth/session     public          a signed challenge → a sealed session
  *   POST /api/v1/auth/exchange    public          a boot link's code + a new device key → a sealed session
+ *   POST /api/v1/auth/accept-invite public        an invite code + a name + a new device key → a member and a sealed session
  *   POST /api/v1/auth/refresh     a session       a new sealed secret for the same session
  *   POST /api/v1/auth/sign-out    a session       end it
+ *
+ * On a page served over plain HTTP there is no WebCrypto to make keys with, so joining
+ * from an invite sends a secret the page made instead, and Home keeps only its digest: a
+ * tab-only session, accepted only over TCP on the address the LAN door bound, with no
+ * forwarding or proxy header, and only on a Home started with that door.
  *
  * Bodies are checked with control-contract's schemas, and a refusal never echoes what was
  * sent (the exchange `code` above all). Every answer passes the dispatch masker and is
  * never cached. A session secret leaves only sealed to the key the request carried, so a
  * proxy that logs bodies logs ciphertext. Nothing here logs a request body.
  */
-import type { Peer } from "@crewhaus/access-control";
 import {
+  PROXY_SECRET_HEADER,
+  type Peer,
+  hasForwardingHeaders,
+  hostNameOf,
+} from "@crewhaus/access-control";
+import {
+  authAcceptInviteRequest,
   authExchangeRequest,
   authRefreshRequest,
   authSessionRequest,
@@ -33,6 +45,7 @@ export const SIGN_IN_ROUTES = [
   { method: "GET", path: "/api/v1/auth/challenge", permission: "public" },
   { method: "POST", path: "/api/v1/auth/session", permission: "public" },
   { method: "POST", path: "/api/v1/auth/exchange", permission: "public" },
+  { method: "POST", path: "/api/v1/auth/accept-invite", permission: "public" },
   { method: "POST", path: "/api/v1/auth/refresh", permission: "authenticated" },
   { method: "POST", path: "/api/v1/auth/sign-out", permission: "authenticated" },
 ] as const;
@@ -132,6 +145,58 @@ export async function serveSignIn(
     const answer = await signIn.exchange(body.value as Parameters<typeof signIn.exchange>[0]);
     if (!answer.ok)
       return refuse(pathname, answer.status, answer.code, answer.reason, answer.message);
+    return issuedAnswer(answer);
+  }
+
+  if (pathname === "/api/v1/auth/accept-invite") {
+    const body = await bodyOf(req, authAcceptInviteRequest);
+    if ("refused" in body) return badBody();
+    const input = body.value as Record<string, unknown>;
+    if (typeof input["sessionSecret"] === "string") {
+      // A tab-only session: only through the LAN door, as the page sees it, unrelayed.
+      const lanHost = home.config.lanHost;
+      const bare = (host: string): string =>
+        host.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+      if (
+        lanHost === undefined ||
+        peer.listener !== "tcp" ||
+        hostNameOf(req.headers.get("host")) !== bare(lanHost) ||
+        hasForwardingHeaders(req, home.config.trustedProxy?.header) ||
+        req.headers.has(PROXY_SECRET_HEADER)
+      ) {
+        return refuse(
+          pathname,
+          403,
+          "forbidden",
+          "tab_only",
+          "This page is not encrypted, so it can join only through the address `crewhaus hangar --lan` shows. Open Home on its own computer or over HTTPS.",
+        );
+      }
+      const answer = await signIn.acceptInvite({
+        code: String(input["code"]),
+        displayName: String(input["displayName"]),
+        sessionSecret: input["sessionSecret"],
+        bindHost: lanHost,
+      });
+      if (!answer.ok) {
+        return refuse(pathname, answer.status, answer.code, answer.reason, answer.message);
+      }
+      return json(
+        maskDeep({
+          ok: true,
+          tabOnly: true,
+          expiresAt: answer.expiresAt,
+          principal: answer.principal,
+        }),
+      );
+    }
+    const answer = await signIn.acceptInvite(
+      body.value as Parameters<typeof signIn.acceptInvite>[0],
+    );
+    if (!answer.ok) {
+      return refuse(pathname, answer.status, answer.code, answer.reason, answer.message);
+    }
+    if ("tabOnly" in answer) return badBody();
     return issuedAnswer(answer);
   }
 

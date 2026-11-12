@@ -158,12 +158,18 @@ export type AuthExchangeRequest = {
   readonly seal: Seal;
 };
 
-export type AuthAcceptInviteRequest = {
-  readonly code: string;
-  readonly displayName: string;
-  readonly deviceJwk: DeviceJwk;
-  readonly seal: Seal;
-};
+export type AuthAcceptInviteRequest =
+  | {
+      readonly code: string;
+      readonly displayName: string;
+      readonly deviceJwk: DeviceJwk;
+      readonly seal: Seal;
+    }
+  | {
+      readonly code: string;
+      readonly displayName: string;
+      readonly sessionSecret: string;
+    };
 
 export type AuthRefreshRequest = {
   readonly seal: Seal;
@@ -416,6 +422,14 @@ export type SessionIssued = {
   readonly principal?: string;
   readonly receipt?: CommandReceipt;
 };
+
+export type InviteAccepted =
+  | SessionIssued
+  | {
+      readonly tabOnly: true;
+      readonly expiresAt: string;
+      readonly principal?: string;
+    };
 
 export type SignedOut = {
   readonly signedOut: true;

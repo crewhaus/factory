@@ -116,8 +116,12 @@ function nameKey(name: string): string {
   return name.normalize("NFC").trim().toLowerCase();
 }
 
-/** A display name a person typed, or the refusal that says what is wrong with it. */
-function checkDisplayName(raw: string): string | Refusal {
+/**
+ * A display name a person typed, or the refusal that says what is wrong with it.
+ *
+ * First consumers: every verb that names a member, and accepting an invite.
+ */
+export function checkDisplayName(raw: string): string | Refusal {
   const name = raw.normalize("NFC").trim();
   if (name === "") return refusal("invalid", "A name cannot be empty.");
   if (name.length > DISPLAY_NAME_MAX) {
@@ -592,7 +596,7 @@ function redeemRefusal(code: RedeemRefusalCode, detail?: string): RedeemAnswer {
  * `ok: true` may act on it. It creates no member and issues nothing; accepting an invite
  * (a member, a grant, a device, a session) is the caller's.
  *
- * First consumer: the invite-acceptance route, later in this release; nothing calls it yet.
+ * First consumer: the sign-in handle's `acceptInvite`.
  */
 export async function redeemInvite(
   hangarRoot: string,
@@ -1264,6 +1268,30 @@ function contextFor(
 
 const DOMAIN_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
 
+/**
+ * Add a domain's checker to a domain table, by the one set of rules every table keeps: a
+ * name of lower-case letters, digits and hyphens, never a core permission prefix, never a
+ * second registration, and a function for a checker. A broken rule throws.
+ *
+ * First consumers: {@link openAccess}'s `registerDomain`, and Home's own domain table.
+ */
+export function registerDomainIn(
+  domains: Map<string, DomainChecker>,
+  name: string,
+  checker: DomainChecker,
+): void {
+  if (!DOMAIN_NAME_RE.test(name))
+    throw new TypeError(`access-control: "${name}" is not a domain name`);
+  if (CORE_PERMISSION_PREFIXES.has(name)) {
+    throw new TypeError(`access-control: "${name}" is a core permission prefix, not a domain`);
+  }
+  if (domains.has(name))
+    throw new TypeError(`access-control: the domain "${name}" is already registered`);
+  if (typeof checker !== "function")
+    throw new TypeError("access-control: a domain needs a checker");
+  domains.set(name, checker);
+}
+
 export type AccessHandle = {
   readonly root: string;
   /** Hand every permission `<name>.…` to its own checker. A core prefix or a second registration throws. */
@@ -1300,16 +1328,7 @@ export function openAccess(hangarRoot: string, options: OpenAccessOptions = {}):
   return {
     root: hangarRoot,
     registerDomain(name, checker) {
-      if (!DOMAIN_NAME_RE.test(name))
-        throw new TypeError(`access-control: "${name}" is not a domain name`);
-      if (CORE_PERMISSION_PREFIXES.has(name)) {
-        throw new TypeError(`access-control: "${name}" is a core permission prefix, not a domain`);
-      }
-      if (domains.has(name))
-        throw new TypeError(`access-control: the domain "${name}" is already registered`);
-      if (typeof checker !== "function")
-        throw new TypeError("access-control: a domain needs a checker");
-      domains.set(name, checker);
+      registerDomainIn(domains, name, checker);
     },
     authorize: (snapshot, actor, permission, target) =>
       authorize(snapshot, actor, permission, target, { now: ctx.now(), domains }),

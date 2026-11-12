@@ -101,7 +101,7 @@ export type OmniResults = {
   readonly actions: readonly OmniAction[];
   /** Harnesses whose entries were built for this query (the lazy cost). */
   readonly indexed: number;
-  /** Total entries currently held. */
+  /** Entries currently held for the harnesses searched. */
   readonly size: number;
 };
 
@@ -516,12 +516,15 @@ export function createOmniIndex(
   const build = deps.build ?? buildHarnessEntries;
   const token = deps.token ?? harnessIndexToken;
   const cache = new Map<string, { token: string; entries: readonly OmniEntry[] }>();
+  /** The entries indexed for these harnesses only: a search counts what its caller may see. */
+  const sizeOf = (harnesses: readonly IndexHarness[]): number =>
+    harnesses.reduce((n, harness) => n + (cache.get(harness.id)?.entries.length ?? 0), 0);
 
   return {
     search: (query, harnesses, limit = OMNI_LIMIT) => {
       const q = typeof query === "string" ? query.trim() : "";
       if (q === "") {
-        return { query: "", entries: [], actions: [], indexed: 0, size: cacheSize(cache) };
+        return { query: "", entries: [], actions: [], indexed: 0, size: sizeOf(harnesses) };
       }
       let indexed = 0;
       const all: OmniEntry[] = [];
@@ -542,7 +545,7 @@ export function createOmniIndex(
         entries: rankEntries(all, q, limit),
         actions: matchActions(q, harnesses),
         indexed,
-        size: cacheSize(cache),
+        size: sizeOf(harnesses),
       };
     },
     size: () => cacheSize(cache),

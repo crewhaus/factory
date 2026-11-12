@@ -9,6 +9,8 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
+import { acceptInvite, signInFromBootLink } from "./__test__/browser";
 import {
   ADVISOR_JOB_ARGV,
   ARM_SAMPLE_FLOOR,
@@ -931,4 +933,43 @@ describe("the advisor's real wiring, over the routes", () => {
       await t.stop();
     }
   });
+});
+
+describe("acting on an item needs the permission of what it queues", () => {
+  test("an operator may decide an item but not queue an optimize run", async () => {
+    const t = bootTestServer();
+    try {
+      const id = await registered(t);
+      await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+      const read = loadAccessSnapshot(t.hangarRoot);
+      if (read.state !== "present") throw new Error("no access records");
+      const invite = await openAccess(t.hangarRoot).createInvite(
+        { principal: read.snapshot.owner as string },
+        { role: "operator", scope: `harness:${id}` },
+      );
+      if (!invite.ok) throw new Error(invite.reason);
+      const operator = await acceptInvite(t.fetchRaw, invite.result.code, "Otto");
+      const acted = await t.fetchRaw(`/api/h/${id}/advisor/eval-below-baseline/act`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${operator.session}`,
+        },
+        body: "{}",
+      });
+      expect(acted.status).toBe(403);
+      const body = (await acted.json()) as Record<string, unknown>;
+      expect([body["code"], body["needs"]]).toEqual(["forbidden", "h.quality.edit"]);
+      const jobs = (await t.api("/api/jobs")).body;
+      expect([...(jobs["running"] as unknown[]), ...(jobs["pending"] as unknown[])]).toEqual([]);
+      // The owner acts, and the run is queued.
+      const owned = await t.api(`/api/h/${id}/advisor/eval-below-baseline/act`, {
+        method: "POST",
+        body: "{}",
+      });
+      expect(owned.status).toBe(200);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
 });

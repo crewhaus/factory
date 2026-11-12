@@ -736,6 +736,18 @@ export const sessionIssued = z
   })
   .passthrough();
 
+/** Joining from an invite answers a sealed session, or, for a tab-only session, no secret at all. */
+export const inviteAccepted = z.union([
+  sessionIssued,
+  z
+    .object({
+      tabOnly: z.literal(true),
+      expiresAt: timestamp,
+      principal: principalId.optional(),
+    })
+    .passthrough(),
+]);
+
 export const signedOut = z.object({ signedOut: z.literal(true) }).passthrough();
 
 export const authChallenge = z.object({ nonce: z.string(), expiresAt: timestamp }).passthrough();
@@ -746,9 +758,21 @@ export const authSessionRequest = z
 
 export const authExchangeRequest = z.object({ code: z.string().min(1), deviceJwk, seal }).strict();
 
-export const authAcceptInviteRequest = z
-  .object({ code: z.string().min(1), displayName: z.string().min(1), deviceJwk, seal })
-  .strict();
+/**
+ * Joining from an invite: a device key and a seal where the page can make them, or, on a
+ * page served over plain HTTP, a 32-byte secret the page made itself (43 base64url
+ * characters), of which Home keeps only a digest.
+ */
+export const authAcceptInviteRequest = z.union([
+  z.object({ code: z.string().min(1), displayName: z.string().min(1), deviceJwk, seal }).strict(),
+  z
+    .object({
+      code: z.string().min(1),
+      displayName: z.string().min(1),
+      sessionSecret: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    })
+    .strict(),
+]);
 
 export const authRefreshRequest = z.object({ seal }).strict();
 
@@ -907,6 +931,7 @@ export const CORE_SCHEMAS = {
   harnessOverview,
   invite,
   inviteCreateRequest,
+  inviteAccepted,
   inviteIssued,
   inviteList,
   issued,

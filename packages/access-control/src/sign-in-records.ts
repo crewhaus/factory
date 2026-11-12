@@ -41,8 +41,15 @@ export type SessionRow = {
   readonly at: string;
   readonly by: string;
   readonly principal: string;
-  /** The device it was issued to, `dev_…`. */
-  readonly device: string;
+  /** The device it was issued to, `dev_…`. Absent only on a tab-only session. */
+  readonly device?: string;
+  /**
+   * A session a page on plain HTTP made for itself when it joined from an invite: no device
+   * key, no refresh, and good only over TCP on {@link SessionRow.bindHost}.
+   */
+  readonly tabOnly?: true;
+  /** The address the LAN door was bound to when a tab-only session was made. */
+  readonly bindHost?: string;
   /** Lowercase hex SHA-256 of the session's secret. */
   readonly sha256: string;
   /** The absolute deadline. The sliding one is kept in memory. */
@@ -52,6 +59,8 @@ export type SessionRow = {
 };
 
 const HEX64_RE = /^[0-9a-f]{64}$/;
+/** An address the LAN door binds: an IPv4 or IPv6 literal, or a host name. */
+const BIND_HOST_RE = /^[A-Za-z0-9.:-]{1,253}$/;
 const COORDINATE_RE = /^[A-Za-z0-9_-]{43}$/;
 const END_REASONS: readonly string[] = ["signed-out", "refreshed", "rotated", "device-revoked"];
 
@@ -93,7 +102,13 @@ function isSessionRow(row: Record<string, unknown>): row is Record<string, unkno
     isTime(row["at"]) &&
     isStoredActor(row["by"]) &&
     isId("prn", row["principal"]) &&
-    isId("dev", row["device"]) &&
+    (row["tabOnly"] === true
+      ? row["device"] === undefined &&
+        typeof row["bindHost"] === "string" &&
+        BIND_HOST_RE.test(row["bindHost"])
+      : isId("dev", row["device"]) &&
+        row["tabOnly"] === undefined &&
+        row["bindHost"] === undefined) &&
     typeof row["sha256"] === "string" &&
     HEX64_RE.test(row["sha256"]) &&
     isTime(row["expiresAt"]) &&
@@ -156,7 +171,9 @@ export function foldSignIn(root: string): SignInFold {
   };
   for (const device of devices.values()) bump(device.id, Date.parse(device.at));
   for (const session of sessions.values()) {
-    bump(session.device, Date.parse(session.expiresAt) - SESSION_MAX_MS);
+    if (session.device !== undefined) {
+      bump(session.device, Date.parse(session.expiresAt) - SESSION_MAX_MS);
+    }
   }
   return { ok: true, devices, sessions, lastIssued };
 }

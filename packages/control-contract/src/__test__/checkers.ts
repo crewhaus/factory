@@ -245,15 +245,23 @@ export function walkActorFields(schemas: Readonly<Record<string, z.ZodTypeAny>>)
   return { holes, names: [...names].sort(), exempt: [...exempt].sort(), checked };
 }
 
+/** A request's fields: an object's, or every field any option of a union of objects has. */
 function objectFields(schema: z.ZodTypeAny | undefined): readonly string[] {
   if (schema === undefined) return [];
   const inner = unwrap(schema);
+  if (inner instanceof z.ZodUnion) {
+    return [...new Set((inner.options as z.ZodTypeAny[]).flatMap((o) => objectFields(o)))];
+  }
   return inner instanceof z.ZodObject ? Object.keys(inner.shape) : [];
 }
 
+/** A strict object, or a union whose every option is one. */
 function isStrict(schema: z.ZodTypeAny | undefined): boolean {
   if (schema === undefined) return false;
   const inner = unwrap(schema);
+  if (inner instanceof z.ZodUnion) {
+    return (inner.options as z.ZodTypeAny[]).every((option) => isStrict(option));
+  }
   return inner instanceof z.ZodObject && inner._def.unknownKeys === "strict";
 }
 

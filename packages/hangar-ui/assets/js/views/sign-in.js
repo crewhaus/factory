@@ -20,8 +20,10 @@
 
 import { append, clear, copyBtn, el } from "../dom.js";
 import {
+  CONNECTION_NOT_ENCRYPTED,
   NOT_ENCRYPTED,
   OWN_KEY,
+  acceptInvite,
   canSignIn,
   exchangeCode,
   followBootLink,
@@ -154,6 +156,84 @@ function signInContents({ onSignedIn, message }) {
     form.parentNode?.insertBefore(el("div", { class: "editor-actions" }, [again]), form);
   });
   return { nodes, hasReason };
+}
+
+/**
+ * The join screen an invite link opens: one field, the person's name (nothing to
+ * remember, no puzzle: WCAG 2.2 SC 3.3.8), and one button. On a page that is not
+ * encrypted it says so, and this tab keeps its own sign-in.
+ */
+export function renderJoinScreen(root, { code, onSignedIn }) {
+  clear(root);
+  const heading = el("h1", { id: "join-title", tabindex: "-1", text: "Join Home" });
+  const status = el("p", { class: "sign-in-message" });
+  const say = (kind, words) => {
+    clear(status);
+    if (words === "") {
+      announce("");
+      return;
+    }
+    status.dataset.kind = kind;
+    status.appendChild(el("strong", { text: prefixOf(kind) }));
+    append(status, words);
+    announce(`${prefixOf(kind)}${words}`);
+  };
+  const input = el("input", {
+    id: "join-name",
+    class: "input sign-in-input",
+    type: "text",
+    autocomplete: "name",
+    required: "required",
+    maxlength: "80",
+    "aria-describedby": "join-help",
+  });
+  const submit = el("button", { class: "btn btn-primary", type: "submit", text: "Join Home" });
+  const form = el("form", { class: "sign-in-form" }, [
+    el("label", { for: "join-name", text: "Your name" }),
+    el("div", { class: "sign-in-row" }, [input, submit]),
+  ]);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (input.value.trim() === "") {
+      say("error", "Type your name.");
+      input.focus();
+      return;
+    }
+    submit.disabled = true;
+    say("info", "joining…");
+    const answer = await acceptInvite(code, input.value);
+    submit.disabled = false;
+    if (answer.ok) {
+      say("", "");
+      onSignedIn?.();
+      return;
+    }
+    say("error", answer.message);
+    input.focus();
+  });
+  const nodes = [
+    heading,
+    el("p", {
+      id: "join-help",
+      text: "You were invited to this Home. Others here will see this name.",
+    }),
+  ];
+  if (!canSignIn()) {
+    nodes.push(
+      el("p", { class: "sign-in-reason" }, [
+        el("strong", { text: CONNECTION_NOT_ENCRYPTED }),
+        " This tab keeps its own sign-in, which ends when you close it.",
+      ]),
+    );
+  }
+  nodes.push(form, status);
+  const card = el(
+    "section",
+    { class: "card sign-in-card", "aria-labelledby": "join-title" },
+    nodes,
+  );
+  root.appendChild(el("div", { class: "sign-in-screen" }, [card]));
+  input.focus();
 }
 
 /**

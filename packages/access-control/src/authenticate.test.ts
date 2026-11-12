@@ -1,7 +1,7 @@
 /**
  * `authenticate`: Home's own key only from this computer, the proxy identity only from a
- * proven proxy, a bearer and an identity that must agree, and nobody but the owner until
- * route authorization lands. Every refusal is asserted by its reason, not its status.
+ * proven proxy, a bearer and an identity that must agree, and every live identity answered
+ * for the choke point to authorize. Every refusal is asserted by its reason, not its status.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -325,8 +325,8 @@ describe("trusted-proxy identity", () => {
   });
 });
 
-describe("owner only, until route authorization lands", () => {
-  test("a proxy identity linked to a second member is refused, by reason", async () => {
+describe("every live identity is answered; what it may do is the choke point's", () => {
+  test("a proxy identity linked to a second member authenticates as that member", async () => {
     const h = await home();
     const access = openAccess(h.root);
     const done = await access.link(
@@ -340,10 +340,10 @@ describe("owner only, until route authorization lands", () => {
       { address: "10.9.9.9", listener: "tcp" },
       await proxyConfig(),
     );
-    expect(reasonOf(answer)).toBe("403 authorization_unavailable owner_only");
+    expect(answer).toEqual({ kind: "principal", principal: done.result.principal, via: "proxy" });
   });
 
-  test("a live service token is refused, by reason", async () => {
+  test("a live service token authenticates as its service, naming the credential it used", async () => {
     const h = await home();
     const access = openAccess(h.root);
     const minted = await access.mintServiceToken(
@@ -351,12 +351,45 @@ describe("owner only, until route authorization lands", () => {
       { service: "ci", permissions: [], harnesses: [] },
     );
     if (!minted.ok) throw new Error(minted.reason);
-    expect(reasonOf(await auth(h, request(bearer(minted.result.secret)), LAN))).toBe(
-      "403 authorization_unavailable owner_only",
-    );
+    expect(await auth(h, request(bearer(minted.result.secret)), LAN)).toEqual({
+      kind: "principal",
+      principal: minted.result.principal,
+      via: "service",
+      credential: minted.result.token.id,
+    });
     expect(reasonOf(await auth(h, request(bearer(`chs_${"A".repeat(43)}`)), LAN))).toBe(
       "401 unauthenticated credential_unknown",
     );
+  });
+
+  test("a personal-token shape is unknown, and is never compared as Home's own key", async () => {
+    const h = await home(false);
+    const personal = `chp_${"A".repeat(43)}`;
+    // Even as the key Home read at boot, from a direct loopback peer, it is not one.
+    const answer = await authenticate(
+      request(bearer(personal)),
+      LOOPBACK,
+      {},
+      {
+        signIn: h.signIn,
+        bootToken: personal,
+      },
+    );
+    expect(reasonOf(answer)).toBe("401 unauthenticated credential_unknown");
+    const invite = `chi_${"B".repeat(43)}`;
+    expect(
+      reasonOf(
+        await authenticate(
+          request(bearer(invite)),
+          SOCKET,
+          {},
+          {
+            signIn: h.signIn,
+            bootToken: invite,
+          },
+        ),
+      ),
+    ).toBe("401 unauthenticated credential_unknown");
   });
 
   test("an unknown session is unauthenticated", async () => {

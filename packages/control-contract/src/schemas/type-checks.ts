@@ -94,6 +94,7 @@ export type SchemaTypeChecks = [
   Expect<Same<z.infer<typeof S.harnessList>, T.HarnessList>>,
   Expect<Same<z.infer<typeof S.harnessOverview>, T.HarnessOverview>>,
   Expect<Same<z.infer<typeof S.invite>, T.Invite>>,
+  Expect<Same<z.infer<typeof S.inviteAccepted>, T.InviteAccepted>>,
   Expect<Same<z.infer<typeof S.inviteCreateRequest>, T.InviteCreateRequest>>,
   Expect<Same<z.infer<typeof S.inviteIssued>, T.InviteIssued>>,
   Expect<Same<z.infer<typeof S.inviteList>, T.InviteList>>,

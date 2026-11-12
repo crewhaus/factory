@@ -76,7 +76,12 @@ import { renderSchedulers } from "./views/schedulers.js";
 import { renderSecurity } from "./views/security.js";
 import { renderSessions } from "./views/sessions.js";
 import { renderSettings } from "./views/settings.js";
-import { SESSION_ENDED, openSignInDialog, renderSignInScreen } from "./views/sign-in.js";
+import {
+  SESSION_ENDED,
+  openSignInDialog,
+  renderJoinScreen,
+  renderSignInScreen,
+} from "./views/sign-in.js";
 import { renderSpecEdit } from "./views/spec-edit.js";
 import { renderSpec } from "./views/spec.js";
 import { renderThredz, renderThredzGlobal } from "./views/thredz.js";
@@ -889,6 +894,10 @@ async function boot() {
   clear(appRoot);
   const main = el("main", { class: "view", id: "view", tabindex: "-1" });
   appRoot.appendChild(main);
+  if (typeof signedIn.invite === "string") {
+    renderJoinScreen(main, { code: signedIn.invite, onSignedIn: start });
+    return;
+  }
   renderSignInScreen(main, { message: signedIn.message ?? "", onSignedIn: start });
 }
 

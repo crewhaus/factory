@@ -10,7 +10,8 @@
  * | `direct` | the CLI | recovery of the one harness a verb acts on, before its first change |
  */
 import { hostname, uptime } from "node:os";
-import type { LocalIdentity } from "@crewhaus/access-control";
+import { type LocalIdentity, loadAccessSnapshot } from "@crewhaus/access-control";
+import { COMMAND_KINDS, type CommandReceipt, isId } from "@crewhaus/control-contract";
 import type { LeaseProbe } from "@crewhaus/control-records";
 import type { HarnessSupervisor } from "@crewhaus/harness-supervisor";
 import { AREA_RUNTIMES, compositionProblems } from "./areas";
@@ -45,6 +46,16 @@ export type ControlDeps = {
   readonly host?: string;
   readonly head?: "server" | "cli";
   readonly onWarn?: (message: string) => void;
+  /**
+   * Whether `actor` (a `prn_…`) still holds `permission` on what `target` (a ref) names:
+   * `true`, `false`, or `undefined` when it could not be determined. Home passes one over
+   * `authorize()` and a fresh access snapshot; without one, every command runs as accepted.
+   */
+  readonly authorizeActor?: (
+    actor: string,
+    permission: string,
+    target: string,
+  ) => boolean | undefined;
 };
 
 export type ControlService = {
@@ -82,6 +93,39 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
   }
 
   const now = deps.now ?? (() => Date.now());
+  const warn = deps.onWarn ?? ((message: string) => console.warn(message));
+  let warnedUndetermined = false;
+  /**
+   * A queued or recovered command's actor, checked again before it runs. A system actor, an
+   * unlinked local user and the Home's owner pass; a member whose authority is gone does not.
+   * An answer that could not be determined runs the command, with one warning.
+   */
+  const actorRefused = (receipt: CommandReceipt): boolean => {
+    const authorizeActor = deps.authorizeActor;
+    if (authorizeActor === undefined || !isId("prn", receipt.actor)) return false;
+    const permission = (COMMAND_KINDS as Readonly<Record<string, { permission: string }>>)[
+      receipt.kind
+    ]?.permission;
+    if (permission === undefined || permission === "public") return false;
+    const read = loadAccessSnapshot(deps.hangarRoot);
+    if (read.state === "present" && read.snapshot.owner === receipt.actor) return false;
+    let answer: boolean | undefined;
+    try {
+      answer = authorizeActor(receipt.actor, permission, receipt.target);
+    } catch {
+      answer = undefined;
+    }
+    if (answer === undefined) {
+      if (!warnedUndetermined) {
+        warnedUndetermined = true;
+        warn(
+          "control-service: whether a queued command's actor may still run it could not be determined; it runs as accepted",
+        );
+      }
+      return false;
+    }
+    return answer === false;
+  };
   const pid = deps.pid ?? process.pid;
   const host = deps.host ?? hostname();
   const head = deps.head ?? (options.mode === "server" ? "server" : "cli");
@@ -102,7 +146,8 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
     supervisorFor: deps.supervisorFor,
     releaseSupervisor: deps.releaseSupervisor ?? (() => undefined),
     drainRequest: deps.drainRequest,
-    warn: deps.onWarn ?? ((message) => console.warn(message)),
+    warn,
+    actorRefused,
     selfExecutor: () => {
       if (self !== undefined) return self;
       // Asked once: a start time does not change, and on some systems the probe is slow.
