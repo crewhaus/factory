@@ -3,10 +3,7 @@
  * that has to read the body before it can decide anything about the request.
  *
  * A webhook is the case this is for: the platform signs the raw body, so the
- * body has to be read before the signature can be checked. `await req.text()`
- * buffers whatever the caller sends, and the only bound is the server's own
- * (Bun's `maxRequestBodySize`, 128 MB by default), which looks at a declared
- * `Content-Length` and lets a chunked body through whole. Here the limit is
+ * body has to be read before the signature can be checked. The limit is
  * applied twice:
  *
  * 1. A declared `Content-Length` over the limit is answered 413 before a byte

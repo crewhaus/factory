@@ -75,6 +75,12 @@ these on: they reach every harness that uses what each one names.
   checked; the limit is 1 MiB, and `CHANNEL_WEBHOOK_MAX_BYTES` changes it.
   Recompile a daemon to pick this up.
 
+- **A managed daemon's federation route reads at most a fixed number of bytes.**
+  With federation on, a `POST /federation` request whose body is larger is
+  answered with 413 before the peer is authorized; the limit is 1 MiB, and
+  `createGatewayServer`'s `federation.maxBodyBytes` changes it. Recompile a
+  daemon to pick this up.
+
 ## [0.8.1] - 2026-11-08
 
 Fixes and hardening for run input, the runtime-state floor, git tools,

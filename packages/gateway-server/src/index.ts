@@ -289,6 +289,13 @@ export type GatewayFederationConfig = {
   };
   readonly dispatch: FederationInboundDispatch;
   readonly authorize?: FederationAuthorize;
+  /**
+   * Most bytes of a `POST /federation` body the server reads, as a
+   * non-negative integer. Default {@link FEDERATION_MAX_BODY_BYTES} (1 MiB);
+   * raise it for peers that send larger payloads. A body past it is answered
+   * 413 before `authorize` runs.
+   */
+  readonly maxBodyBytes?: number;
 };
 
 export type CreateGatewayServerOptions = {
@@ -397,9 +404,10 @@ export type CreateGatewayServerOptions = {
 export const DEFAULT_CLOSE_GRACE_MS = 10_000;
 
 /**
- * Most bytes of a `POST /federation` body the server reads (1 MiB). A peer's
- * envelope carries its own authentication, so the body is read before the
- * peer is known; past this it is answered 413 and the read stops.
+ * Most bytes of a `POST /federation` body the server reads when
+ * `federation.maxBodyBytes` is not set (1 MiB). A peer's envelope carries its
+ * own authentication, so the body is read before the peer is known; past this
+ * it is answered 413 and the read stops.
  */
 export const FEDERATION_MAX_BODY_BYTES = DEFAULT_WEBHOOK_MAX_BYTES;
 
@@ -524,6 +532,12 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
   // `/federation` to (kept in lock-step with `@crewhaus/federation-router`) plus
   // the cert-pin fingerprint the A2A card omits.
   const fed = opts.federation;
+  const fedMaxBodyBytes = fed?.maxBodyBytes ?? FEDERATION_MAX_BODY_BYTES;
+  if (!Number.isSafeInteger(fedMaxBodyBytes) || fedMaxBodyBytes < 0) {
+    throw new RangeError(
+      `federation.maxBodyBytes must be a non-negative integer, got ${String(fedMaxBodyBytes)}`,
+    );
+  }
   const fedBase = fed !== undefined ? fed.identity.endpoint.replace(/\/+$/, "") : "";
   const fedAgentCard: A2AAgentCard | undefined =
     fed !== undefined
@@ -844,11 +858,11 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
           if (req.method === "POST" && pathname === "/federation") {
             // A peer authenticates inside the envelope, so the body is read
             // before anything else is known about it: only when federation is
-            // on, and never more of it than FEDERATION_MAX_BODY_BYTES.
+            // on, and never more of it than federation.maxBodyBytes.
             if (fed === undefined) {
               return Response.json({ error: "federation is not enabled" }, { status: 404 });
             }
-            const fread = await readRequestBodyCapped(req, FEDERATION_MAX_BODY_BYTES);
+            const fread = await readRequestBodyCapped(req, fedMaxBodyBytes);
             if (!fread.ok) {
               return Response.json(
                 { error: await fread.response.text() },

@@ -1,18 +1,24 @@
 /**
  * What the gateway reads of a request body before it knows who sent it.
  *
- * The JSON-RPC plane checks the bearer before it reads a byte of the body; the
- * federation route reads a body only when federation is on, and then at most
- * FEDERATION_MAX_BODY_BYTES of it. Each test sends a body the old order would
- * have parsed first (malformed JSON, which used to come back 400), so it fails
- * if the read moves back ahead of the check.
+ * The JSON-RPC plane checks the bearer before it reads a byte of the body: a
+ * malformed body without a valid bearer is answered 401, and with one it is
+ * answered 400. The federation route reads a body only when federation is on,
+ * and then at most `federation.maxBodyBytes` of it (FEDERATION_MAX_BODY_BYTES
+ * by default): past that it is answered 413 before the peer is authorized.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { FEDERATION_VERSION, encodeFederationEnvelope } from "@crewhaus/federation-protocol";
 import { buildTenant } from "@crewhaus/tenancy";
-import { FEDERATION_MAX_BODY_BYTES, createGatewayServer, signJwt } from "./index";
+import {
+  FEDERATION_MAX_BODY_BYTES,
+  type GatewayFederationConfig,
+  createGatewayServer,
+  signJwt,
+} from "./index";
 
 const SECRET = ["body", "order", "fixture"].join("-");
 let tmp = "";
@@ -65,7 +71,7 @@ async function withServer(
 }
 
 describe("the JSON-RPC plane checks the bearer before it reads the body", () => {
-  test("no bearer: 401, where a malformed body used to be parsed first and answered 400", async () => {
+  test("no bearer: a malformed body is answered 401, not parsed", async () => {
     await withServer({}, async (base, handled) => {
       const res = await fetch(base, { method: "POST", body: "{not json" });
       expect(res.status).toBe(401);
@@ -154,4 +160,98 @@ describe("POST /federation reads a body only when federation is on, and only so 
       },
     );
   }, 20_000); // streams 4 MiB through a real socket; slow on a loaded CI runner
+});
+
+function envelope(payload: string): string {
+  return encodeFederationEnvelope({
+    version: FEDERATION_VERSION,
+    traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+    federation: {
+      from: { deployment: "peer-a", role: "client" },
+      to: { deployment: "dep", role: "server" },
+      mtls: { client_cert_subject: "CN=peer-a" },
+    },
+    kind: "question",
+    payload,
+  });
+}
+
+function federationWith(
+  counts: { authorized: number; dispatched: number },
+  maxBodyBytes?: number,
+): GatewayFederationConfig {
+  return {
+    identity: {
+      name: "dep",
+      description: "a peer",
+      endpoint: "https://dep.example",
+      publicKeyFingerprint: "a".repeat(64),
+    },
+    // Denies, so a large envelope that is read stops at a cheap 403.
+    authorize: () => {
+      counts.authorized++;
+      return { ok: false, reason: "not allowlisted" };
+    },
+    dispatch: async () => {
+      counts.dispatched++;
+      return { reply: "never" };
+    },
+    ...(maxBodyBytes !== undefined ? { maxBodyBytes } : {}),
+  };
+}
+
+describe("federation.maxBodyBytes sets how much of a POST /federation body is read", () => {
+  // 1.5 MiB of payload: over the default limit, under a raised one.
+  const large = envelope("p".repeat(1536 * 1024));
+
+  test("unset: a 1.5 MiB envelope is 413 and the peer is not authorized", async () => {
+    const counts = { authorized: 0, dispatched: 0 };
+    await withServer({ federation: federationWith(counts) }, async (base) => {
+      const res = await fetch(`${base}/federation`, { method: "POST", body: large });
+      expect(res.status).toBe(413);
+      expect(await res.json()).toEqual({
+        error: `payload too large: the limit is ${FEDERATION_MAX_BODY_BYTES} bytes`,
+      });
+      expect(counts).toEqual({ authorized: 0, dispatched: 0 });
+    });
+  }, 20_000); // sends 1.5 MiB through a real socket; slow on a loaded CI runner
+
+  test("raised to 2 MiB: the same envelope is read and reaches authorize", async () => {
+    const counts = { authorized: 0, dispatched: 0 };
+    await withServer({ federation: federationWith(counts, 2 * 1024 * 1024) }, async (base) => {
+      const res = await fetch(`${base}/federation`, { method: "POST", body: large });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: "federation denied: not allowlisted" });
+      expect(counts).toEqual({ authorized: 1, dispatched: 0 });
+    });
+  }, 20_000); // sends 1.5 MiB through a real socket; slow on a loaded CI runner
+
+  test("lowered to 1 KiB: a 2 KiB envelope is 413, a small one still reaches authorize", async () => {
+    const counts = { authorized: 0, dispatched: 0 };
+    await withServer({ federation: federationWith(counts, 1024) }, async (base) => {
+      const over = await fetch(`${base}/federation`, {
+        method: "POST",
+        body: envelope("p".repeat(2048)),
+      });
+      expect(over.status).toBe(413);
+      expect(await over.json()).toEqual({ error: "payload too large: the limit is 1024 bytes" });
+      expect(counts.authorized).toBe(0);
+      const small = await fetch(`${base}/federation`, { method: "POST", body: envelope("hi") });
+      expect(small.status).toBe(403);
+      expect(counts.authorized).toBe(1);
+    });
+  });
+
+  test("a limit that is not a non-negative integer is refused when the server is created", () => {
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() =>
+        createGatewayServer({
+          jwtSecret: SECRET,
+          tenantsRoot: tmp,
+          handler: async () => ({ ok: true }),
+          federation: federationWith({ authorized: 0, dispatched: 0 }, bad),
+        }),
+      ).toThrow("federation.maxBodyBytes must be a non-negative integer");
+    }
+  });
 });
