@@ -681,15 +681,21 @@ describe("OPTIMIZABLE_PATHS × applySpecEdits (optimizer-surface round-trip)", (
 });
 
 /**
- * Batch G, Item 9 (G37) — per-role / per-step model routing is optimizer-
- * reachable via the WHOLE-BLOCK entries (`["roles"]` on crew, `["steps"]` on
- * workflow) rather than standalone paths: the role name / step index is
- * positional, so no static narrower path exists, and whole-block replacement
- * already spans model/instructions. These tests pin that reachability so a
- * future refactor that narrows the entries can't silently orphan the routing.
+ * Batch G, Item 9 (G37) — per-role / per-step model routing is set by a
+ * person. A whole-block value (`["roles"]` on crew, `["steps"]` on workflow)
+ * is admitted leaf by leaf (#514), so one that ADDS a pool roster is refused,
+ * naming the roster; the pool's tunable dials have exact entries of their own
+ * (`poolDials`). A value that keeps the pool the spec already has and changes
+ * only `instructions` passes.
  */
-describe("Item 9 (G37) — role/step model_pool rides the whole-block optimizable entry", () => {
-  test("crew: replacing [roles] with a model_pool-bearing role round-trips under restrictToOptimizable", () => {
+describe("Item 9 (G37) — role/step model_pool is set by a person, never through a whole-block value", () => {
+  const ROSTER = [
+    { model: "claude-haiku-4-5", tags: ["cheap"] },
+    { model: "claude-opus-4-8", tags: ["strong"] },
+  ];
+  const restricted = { restrictToOptimizable: true } as const;
+
+  test("crew: a [roles] value that adds a role's pool is refused, naming the roster", () => {
     const yaml = [
       "name: cr",
       "target: crew",
@@ -700,26 +706,22 @@ describe("Item 9 (G37) — role/step model_pool rides the whole-block optimizabl
       "    instructions: lead it",
     ].join("\n");
     const nextRoles = {
-      lead: {
-        instructions: "lead it",
-        model_pool: {
-          candidates: [
-            { model: "claude-haiku-4-5", tags: ["cheap"] },
-            { model: "claude-opus-4-8", tags: ["strong"] },
-          ],
-          policy: "learned",
-        },
-      },
+      lead: { instructions: "lead it", model_pool: { candidates: ROSTER, policy: "learned" } },
     };
-    const result = applySpecEdits(yaml, [{ path: ["roles"], value: nextRoles }], {
-      restrictToOptimizable: true,
-    });
-    expect(result.applied).toBe(1);
-    if (result.spec.target !== "crew") throw new Error("unexpected target");
-    expect(result.spec.roles.lead?.model_pool?.policy).toBe("learned");
+    expect(() => applySpecEdits(yaml, [{ path: ["roles"], value: nextRoles }], restricted)).toThrow(
+      /edit #0 \(roles\) would change "roles\.lead\.model_pool\.candidates\.0\.model"/,
+    );
+    expect(() =>
+      validatePatch(parseSpec(yaml), {
+        target: "crew",
+        path: ["roles"],
+        op: "replace",
+        value: nextRoles,
+      }),
+    ).toThrow(/would change "roles\.lead\.model_pool\.candidates/);
   });
 
-  test("workflow: replacing [steps] with a model_pool-bearing step round-trips under restrictToOptimizable", () => {
+  test("workflow: a [steps] value that adds a step's pool is refused, naming the roster", () => {
     const yaml = [
       "name: w",
       "target: workflow",
@@ -732,23 +734,49 @@ describe("Item 9 (G37) — role/step model_pool rides the whole-block optimizabl
       {
         name: "route",
         instructions: "pick a path",
-        model_pool: {
-          candidates: [
-            { model: "claude-haiku-4-5", tags: ["cheap"] },
-            { model: "claude-opus-4-8", tags: ["strong"] },
-          ],
-          policy: "heuristic",
-        },
+        model_pool: { candidates: ROSTER, policy: "heuristic" },
       },
     ];
-    const result = applySpecEdits(yaml, [{ path: ["steps"], value: nextSteps }], {
-      restrictToOptimizable: true,
-    });
+    expect(() => applySpecEdits(yaml, [{ path: ["steps"], value: nextSteps }], restricted)).toThrow(
+      /edit #0 \(steps\) would change "steps\.0\.model_pool\.candidates\.0\.model".*a person/,
+    );
+  });
+
+  test("a value that keeps the pool the spec has and changes instructions passes", () => {
+    const yaml = [
+      "name: w",
+      "target: workflow",
+      "model: base-model",
+      "steps:",
+      "  - name: route",
+      "    instructions: pick a path",
+      "    model_pool:",
+      "      policy: heuristic",
+      "      candidates:",
+      "        - { model: claude-haiku-4-5, tags: [cheap] }",
+      "        - { model: claude-opus-4-8, tags: [strong] }",
+    ].join("\n");
+    const nextSteps = [
+      {
+        name: "route",
+        instructions: "pick a path, then say why",
+        model_pool: { candidates: ROSTER, policy: "heuristic" },
+      },
+    ];
+    const result = applySpecEdits(yaml, [{ path: ["steps"], value: nextSteps }], restricted);
     expect(result.applied).toBe(1);
     if (result.spec.target !== "workflow") throw new Error("unexpected target");
     const step = result.spec.steps[0];
     if (step === undefined || "kind" in step) throw new Error("expected a regular step");
-    expect(step.model_pool?.policy).toBe("heuristic");
+    expect(step.instructions).toBe("pick a path, then say why");
+    expect(() =>
+      validatePatch(parseSpec(yaml), {
+        target: "workflow",
+        path: ["steps"],
+        op: "replace",
+        value: nextSteps,
+      }),
+    ).not.toThrow();
   });
 });
 
@@ -910,8 +938,8 @@ describe("§10.3 structural rule — model_pool / judge / sub_agents / temperatu
       { restrictToOptimizable: true },
     );
     expect(wf.applied).toBe(1);
-    // Whole-block replacement carries no structural SEGMENT in its path, so it
-    // is unchanged (the G37 tests above pin that a pool-bearing block rides it).
+    // A whole-block value is admitted leaf by leaf (#514); the G37 tests above
+    // pin that one which adds a pool roster is refused.
     const cr = applySpecEdits(
       CREW,
       [{ path: ["roles", "lead", "instructions"], value: "lead harder" }],
@@ -971,7 +999,38 @@ describe("§10.3 structural rule — model_pool / judge / sub_agents / temperatu
       "model_tiers",
       "model_fallbacks",
       "circuit_breaker",
+      "model",
+      "tools",
+      "tool_config",
+      "permissions",
+      "hitl",
     ]);
+    // #514's five: a step's model, tools and tool_config, a graph node's
+    // hitl, and permissions on a crew role's sub-agent (steps, nodes and
+    // roles have none of their own).
+    const granted = parseSpec(
+      `${WORKFLOW.replace(
+        "    instructions: write it",
+        "    instructions: write it\n    model: m3\n    tools: [bash]\n    tool_config: { bash: { timeout_ms: 1000 } }",
+      )}`,
+    );
+    if (granted.target !== "workflow") throw new Error("unexpected target");
+    const grantedStep = granted.steps[0];
+    if (grantedStep === undefined || "kind" in grantedStep)
+      throw new Error("expected a regular step");
+    expect(grantedStep.model).toBe("m3");
+    expect(grantedStep.tools).toEqual(["bash"]);
+    expect(grantedStep.tool_config).toBeDefined();
+    const gated = parseSpec(
+      `${GRAPH.replace("    instructions: x", "    instructions: x\n    hitl: { prompt: ok? }")}`,
+    );
+    if (gated.target !== "graph") throw new Error("unexpected target");
+    expect(gated.nodes.a?.hitl).toBeDefined();
+    const permitted = parseSpec(
+      `${CREW.replace("helper: { description: helps, instructions: help }", "helper: { description: helps, instructions: help, permissions: scoped }")}`,
+    );
+    if (permitted.target !== "crew") throw new Error("unexpected target");
+    expect(permitted.roles.lead?.sub_agents?.helper?.permissions).toBeDefined();
     expect(
       parseSpec(
         `${WORKFLOW.replace("    instructions: write it", "    instructions: write it\n    temperature: 0")}`,
@@ -1058,10 +1117,16 @@ describe("§10.3 — the roster patches hard-fail validatePatch on every host", 
       ["evaluation", "grader", "judges"],
       ["observability", "slo", "escalation_rate"],
     ]) {
+      // The roster is a refused row (#514): refused before the allow-list.
+      const roster = path.join(".").startsWith("agent.model_pool.candidates");
       expect(
         () => validatePatch(spec, { target: "cli", path, op: "replace", value: "x" }),
         `[${path.join(", ")}] must hard-fail`,
-      ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+      ).toThrow(
+        roster
+          ? /an OPTIMIZER_REFUSED_LEAVES row — no OPTIMIZABLE_PATHS entry can admit it/
+          : /not listed in OPTIMIZABLE_PATHS/,
+      );
       // …and every one of them is CLASSIFIED as excluded, with a reason.
       expect(humanOwnedReason(path), `[${path.join(", ")}] has no exclusion row`).toBeDefined();
     }

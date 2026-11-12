@@ -66,6 +66,7 @@ describe("the lists derive from the table", () => {
       ["provability", "level"],
       ["provability", "on_fail"],
       ["transaction_policy", "defaultWriteApproval"],
+      ["model_pool", "candidates"],
     ]);
   });
 
@@ -162,12 +163,6 @@ describe("the table's own rules", () => {
 
     test(`${name}: a one-segment pattern is root-anchored`, () => {
       if (key.pattern.length === 1) expect(key.root).toBe(true);
-    });
-
-    test(`${name}: a refused row has no wildcard yet`, () => {
-      // The refused-leaf matcher compares with ===, so a "*" would match
-      // nothing. The PR that teaches refusedLeafIn wildcards deletes this.
-      if (key.refused) expect(key.pattern).not.toContain("*");
     });
 
     test(`${name}: it states a reason and a release, and does not end in a wildcard`, () => {

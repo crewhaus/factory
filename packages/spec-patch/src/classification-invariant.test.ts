@@ -24,10 +24,12 @@ import { Spec } from "@crewhaus/spec";
 import type { ZodTypeAny } from "zod";
 import {
   DELTA_090_KEYS,
-  STRUCTURAL_SEGMENTS,
+  OPTIMIZER_REFUSED_LEAVES,
   WILDCARD_SEGMENT,
+  admitBlockPatch,
   humanOwnedReason,
   isOptimizable,
+  leafReachable,
 } from "./index";
 
 type Path = ReadonlyArray<string>;
@@ -165,20 +167,12 @@ function concrete(path: Path): string[] {
  * A LEAF is optimizer-reachable when the optimizer can write it: either the
  * leaf path itself is admitted, or a whitelisted ANCESTOR block can be
  * replaced wholesale and the tail from that ancestor to the leaf crosses no
- * structural segment. The second clause is how `["agent","model_pool","routing"]`
- * (exact, whitelisted wholesale) reaches `routing.strongTag`, and why
- * `["steps"]` does NOT reach `steps[i].model_pool.candidates[j].model` — the
- * structural rule stops whole-block reach at the `model_pool` boundary, which
- * is exactly the leak §10.3 closes.
+ * structural segment. The rule is spec-patch's own `leafReachable` (#514), the
+ * one the whole-block gate runs, so the invariant and the gate are one
+ * definition; here it takes the schema path with its wildcards made concrete.
  */
 function reachable(target: Spec["target"], path: Path): boolean {
-  const real = concrete(path);
-  for (let len = real.length; len >= 1; len--) {
-    const tail = real.slice(len);
-    if (tail.some((seg) => STRUCTURAL_SEGMENTS.includes(seg))) break;
-    if (isOptimizable(target, real.slice(0, len))) return true;
-  }
-  return false;
+  return leafReachable(target, concrete(path));
 }
 
 function targetOf(shape: ZodTypeAny): Spec["target"] {
@@ -365,5 +359,60 @@ describe("the owner-keys table — every leaf under a row is human-owned", () =>
     expect(
       leavesUnder(shapes[0] as ZodTypeAny, intent as (typeof DELTA_090_KEYS)[number]).length,
     ).toBe(4);
+  });
+});
+
+/**
+ * #514 — a refused row is refused inside a whole-block value too. For every
+ * OPTIMIZER_REFUSED_LEAVES row and every shape, each schema leaf under the row
+ * that has an admitted ancestor is refused by `admitBlockPatch` at that
+ * ancestor when a value there changes it.
+ */
+describe("through a whole-block entry — a refused leaf stays refused inside a block value", () => {
+  const shapes = Spec.options as ReadonlyArray<ZodTypeAny>;
+
+  const underRow = (path: Path, row: ReadonlyArray<string>): boolean =>
+    path.some((_, i) => matchesAt(path, row, i));
+
+  /** A document holding `value` at `path`. */
+  const docWith = (path: Path, value: unknown): unknown => {
+    const root: Record<string, unknown> = {};
+    let cur = root;
+    for (const seg of path.slice(0, -1)) {
+      const next: Record<string, unknown> = {};
+      cur[seg] = next;
+      cur = next;
+    }
+    cur[path[path.length - 1] as string] = value;
+    return root;
+  };
+
+  test("every refused leaf under an admitted ancestor is refused at that ancestor", () => {
+    let cases = 0;
+    const admitted: string[] = [];
+    for (const shape of shapes) {
+      const target = targetOf(shape);
+      const all = new Set<string>();
+      leaves(shape, [], all);
+      for (const key of all) {
+        const path = key.split(" ");
+        if (!OPTIMIZER_REFUSED_LEAVES.some((row) => underRow(path, row))) continue;
+        const real = concrete(path);
+        // The longest admitted proper ancestor, if any.
+        let at: string[] | undefined;
+        for (let len = real.length - 1; len >= 1 && at === undefined; len--) {
+          if (isOptimizable(target, real.slice(0, len))) at = real.slice(0, len);
+        }
+        if (at === undefined) continue;
+        cases += 1;
+        const refusal = admitBlockPatch(target, docWith(real, "a"), docWith(real, "b"), at);
+        if (refusal?.rule !== "refused-leaf" || refusal.leaf !== real.join(".")) {
+          admitted.push(`${target}: ${real.join(".")} at ${at.join(".")}`);
+        }
+      }
+    }
+    expect(admitted).toEqual([]);
+    // model_pool.candidates and model_pool.learning.seed under steps, nodes and roles.
+    expect(cases).toBeGreaterThan(0);
   });
 });

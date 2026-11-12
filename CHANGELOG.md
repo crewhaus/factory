@@ -30,6 +30,19 @@ these on: they reach every harness that uses what each one names.
   bearer travels as sent, so keep such a listener on a private network or
   behind TLS.
 
+- **The optimizer changes a whole step, node or role only through settings it
+  may tune.** `crewhaus optimize`, `crewhaus advise --apply` and Hangar's
+  automatic apply accept a change to a whole `steps` list, `nodes` map or
+  `roles` map, or to one entry, only when every setting it adds, removes or
+  changes is tunable on its own. A step's, node's or role's `model`, `tools`,
+  `tool_config`, `permissions` and `hitl` now need a person, as does a pool's
+  `model_pool.candidates`, and a setting the optimizer may never change is
+  refused inside such a value too. A change that keeps those settings as the
+  spec has them still applies. On a `cli` harness the intent gate's
+  `security.justification.model` needs a person too; its `judge` stays
+  tunable. The refusal names the setting; a person can make it with
+  `crewhaus propose` or by editing `crewhaus.yaml`.
+
 - **Daemon verbs and Home's changes leave a receipt, and long CLI verbs take
   turns with Home.** `crewhaus daemon start`, `stop`, `restart` and `drain`,
   and every change made in Home, first write a receipt under the harness's
