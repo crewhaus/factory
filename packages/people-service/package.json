@@ -1,0 +1,46 @@
+{
+  "name": "@crewhaus/people-service",
+  "version": "0.8.0",
+  "type": "module",
+  "description": "People profile management for Home and `crewhaus people`: the rules a profile obeys, receipted changes, review, export and erasure, and who may do what with a profile (module brief 329). Never in a compiled harness.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/people": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/control-records": "workspace:*",
+    "@crewhaus/control-service": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/people-service"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/people-service#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

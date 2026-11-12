@@ -241,3 +241,84 @@ describe("through wireEvaluation", () => {
     expect(gates.evaluation?.graderType).toBe("regex");
   });
 });
+
+describe("a grader that could not grade the turn", () => {
+  /** A judge whose provider call fails. */
+  const failingJudge = (error: Error) =>
+    scriptedJudge(() => {
+      throw error;
+    }).adapter;
+
+  test("llm_judge: one eval_unmeasured on the turn's bus, and the same error rejects", async () => {
+    const error = new TypeError("judge provider unavailable");
+    const { bus, events } = recordingBus();
+    const gate = buildRunEvaluation(
+      {
+        grader: { type: "llm_judge", criteria: "is it correct?" },
+        threshold: 0.7,
+        onFail: "retry",
+        maxRetries: 2,
+      },
+      "claude-haiku-4-5",
+      { judgeAdapter: failingJudge(error) },
+    );
+    const thrown = await gate.evaluate({ ...turn("x", bus), stage: "draft" }).catch((e) => e);
+    expect(thrown).toBe(error);
+    const unmeasured = events.filter((e) => e.kind === "eval_unmeasured");
+    expect(unmeasured).toHaveLength(1);
+    expect(unmeasured[0]).toMatchObject({
+      kind: "eval_unmeasured",
+      gate: "evaluation",
+      graderType: "llm_judge",
+      maxRetries: 2,
+      judgeModel: "claude-haiku-4-5",
+      stage: "draft",
+      reason: "grader_error",
+      errorName: "TypeError",
+    });
+    expect(events.some((e) => e.kind === "eval_graded")).toBe(false);
+  });
+
+  test("contains and regex: a throwing evaluate publishes one eval_unmeasured and rejects with the same error", async () => {
+    // A final text whose conversion to a string throws stands in for a grader
+    // that fails inside its own evaluate.
+    const error = new RangeError("cannot read the final text");
+    const poisoned = {
+      [Symbol.toPrimitive]: () => {
+        throw error;
+      },
+      includes: () => {
+        throw error;
+      },
+    } as unknown as string;
+    for (const ev of [
+      { grader: { type: "contains", value: "DONE" }, onFail: "halt", maxRetries: 1 },
+      { grader: { type: "regex", value: "\\d+" }, onFail: "halt", maxRetries: 1 },
+    ] as IrEvaluation[]) {
+      const { bus, events } = recordingBus();
+      const gate = buildRunEvaluation(ev, "m");
+      const thrown = await gate.evaluate(turn(poisoned, bus)).catch((e) => e);
+      expect(thrown).toBe(error);
+      const unmeasured = events.filter((e) => e.kind === "eval_unmeasured");
+      expect(unmeasured).toHaveLength(1);
+      expect(unmeasured[0]).toMatchObject({
+        graderType: ev.grader.type,
+        maxRetries: 1,
+        reason: "grader_error",
+        errorName: "RangeError",
+      });
+      expect("judgeModel" in (unmeasured[0] as object)).toBe(false);
+    }
+  });
+
+  test("a grade that succeeds publishes no eval_unmeasured", async () => {
+    const { bus, events } = recordingBus();
+    const gate = buildRunEvaluation(
+      { grader: { type: "contains", value: "DONE" }, onFail: "halt", maxRetries: 1 },
+      "m",
+    );
+    expect((await gate.evaluate(turn("DONE", bus))).score).toBe(1);
+    expect((await gate.evaluate(turn("no", bus))).score).toBe(0);
+    expect(events.filter((e) => e.kind === "eval_unmeasured")).toEqual([]);
+  });
+});

@@ -49,6 +49,8 @@
     "@crewhaus/control-contract": "workspace:*",
     "@crewhaus/control-records": "workspace:*",
     "@crewhaus/control-service": "workspace:*",
+    "@crewhaus/people": "workspace:*",
+    "@crewhaus/people-service": "workspace:*",
     "@crewhaus/computer-use-driver": "workspace:*",
     "@crewhaus/context-bundle": "workspace:*",
     "@crewhaus/continuity-store": "workspace:*",

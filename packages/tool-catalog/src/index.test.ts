@@ -11,12 +11,14 @@ import {
   ToolCatalogError,
   defaultCatalog,
   hasModelChosenDestination,
+  hasSelfCheckedOpening,
   legacyMcpToolName,
   mcpToolName,
   schemaDeclaresJustification,
   stripJustificationField,
   toolListEntryNames,
   withJustificationField,
+  withoutSelfCheckedOpenings,
 } from "./index";
 
 function makeTool(name: string): RegisteredTool {
@@ -336,5 +338,32 @@ describe("hasModelChosenDestination", () => {
         operativeArgs: [api, { kind: "recipient", service: "baseUrl" }],
       }),
     ).toBe(true);
+  });
+});
+
+describe("withoutSelfCheckedOpenings", () => {
+  test("drops the openings the tool checks itself and keeps the rest", () => {
+    const arg = {
+      field: "dir",
+      kind: "path" as const,
+      opens: [{ path: "store.jsonl" }, { path: "marker.json", selfChecked: true as const }],
+    };
+    expect(hasSelfCheckedOpening(arg)).toBe(true);
+    expect(withoutSelfCheckedOpenings(arg)).toEqual({
+      field: "dir",
+      kind: "path",
+      opens: [{ path: "store.jsonl" }],
+    });
+    // The declaration itself is not changed.
+    expect(arg.opens).toHaveLength(2);
+  });
+
+  test("a declaration without one is returned as it is", () => {
+    const arg = { field: "dir", kind: "path" as const, opens: [{ path: "store.jsonl" }] };
+    expect(hasSelfCheckedOpening(arg)).toBe(false);
+    expect(withoutSelfCheckedOpenings(arg)).toBe(arg);
+    const bare = { field: "path", kind: "path" as const };
+    expect(hasSelfCheckedOpening(bare)).toBe(false);
+    expect(withoutSelfCheckedOpenings(bare)).toBe(bare);
   });
 });

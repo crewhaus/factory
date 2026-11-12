@@ -198,6 +198,10 @@ function formatBody(ev: TraceEvent): string {
       }${ev.judgeCostUsdMicros !== undefined ? ` judgeMicros=${ev.judgeCostUsdMicros}` : ""}${
         ev.escalatedTo !== undefined ? ` escalatedTo=${ev.escalatedTo}` : ""
       }`;
+    case "eval_unmeasured":
+      return `gate=${ev.gate} grader=${ev.graderType} reason=${ev.reason} error=${ev.errorName}${
+        ev.judgeModel !== undefined ? ` judge=${ev.judgeModel}` : ""
+      }${ev.stage !== undefined ? ` stage=${ev.stage}` : ""}`;
     case "judge_verdict":
       return `at=${ev.stepOrNode} verdict=${ev.verdict} score=${ev.score.toFixed(2)}${
         ev.judgeModel !== undefined ? ` judge=${ev.judgeModel}` : ""

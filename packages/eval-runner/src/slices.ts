@@ -12,6 +12,8 @@
  * nothing is omitted; a run that slices nothing omits `slices` entirely,
  * keeping metadata-less results.json byte-identical to pre-B13 output.
  */
+import type { GradeResult, GradeStatus } from "@crewhaus/eval-grader";
+import { isUnmeasured } from "@crewhaus/grader-provability";
 import type { SampleResult, SliceStats } from "./types";
 
 /** The default `--slice` keys, applied when present in sample metadata. */
@@ -30,6 +32,46 @@ export const DEFAULT_SLICE_KEYS: ReadonlyArray<string> = [
  */
 export function sampleAbstained(s: SampleResult): boolean {
   return s.error === undefined && s.grades.overall.abstained === true;
+}
+
+/**
+ * A sample whose overall grade is not measured: an enforced grader could not
+ * measure it and none recorded a failure. Errored samples are never this
+ * (the invoker crash wins), as with {@link sampleAbstained}.
+ */
+export function sampleNotMeasured(s: SampleResult): boolean {
+  return s.error === undefined && s.grades.overall.status === "not_measured";
+}
+
+/** A sample every enforced grader skipped as outside what it measures. */
+export function sampleSkipped(s: SampleResult): boolean {
+  return s.error === undefined && s.grades.overall.status === "skipped";
+}
+
+/** A sample every enforced grader only observed: a verdict recorded, not enforced. */
+export function sampleObserving(s: SampleResult): boolean {
+  return s.error === undefined && s.grades.overall.status === "observing";
+}
+
+/**
+ * A sample with no verdict about the spec: not measured, skipped or observing.
+ * Every pass-rate denominator that leaves out abstained samples leaves these
+ * out too.
+ */
+export function sampleWithoutVerdict(s: SampleResult): boolean {
+  return sampleNotMeasured(s) || sampleSkipped(s) || sampleObserving(s);
+}
+
+/**
+ * The {@link GradeStatus} of one grade: its `status`, or `not_measured` for a
+ * provability grade whose rationale carries one of the pinned prefixes that
+ * replace a measurement. That second reading is how a record written before
+ * `status` existed is read, and it is the only reader of such records.
+ */
+export function gradeStatusOf(
+  g: Pick<GradeResult, "status" | "rationale">,
+): GradeStatus | undefined {
+  return g.status ?? (isUnmeasured(g) ? "not_measured" : undefined);
 }
 
 /**
@@ -64,21 +106,20 @@ export function sampleIsCanary(s: SampleResult): boolean {
 
 /**
  * Per-slice pass rate + mean score, mirroring the run-level semantics:
- * `passRate` excludes abstained and canary samples from the denominator
- * (errored ones still count as failures), and `meanScore` averages the
- * graded, non-errored, non-canary samples only. `sampleCount` is the
- * slice's full membership.
+ * `passRate` excludes abstained, canary, not-measured, skipped and observing
+ * samples from the denominator (errored ones still count as failures), and
+ * `meanScore` averages the graded, non-errored samples only. `sampleCount`
+ * is the slice's full membership.
  */
 function sliceStats(group: ReadonlyArray<SampleResult>): SliceStats {
-  const excluded = group.filter((s) => sampleAbstained(s) || sampleIsCanary(s));
+  const unverdicted = (s: SampleResult): boolean =>
+    sampleAbstained(s) || sampleIsCanary(s) || sampleWithoutVerdict(s);
+  const excluded = group.filter(unverdicted);
   const graded = group.length - excluded.length;
   const passed = group.filter(
-    (s) =>
-      s.error === undefined && !sampleAbstained(s) && !sampleIsCanary(s) && s.grades.overall.passed,
+    (s) => s.error === undefined && !unverdicted(s) && s.grades.overall.passed,
   ).length;
-  const scored = group.filter(
-    (s) => s.error === undefined && !sampleAbstained(s) && !sampleIsCanary(s),
-  );
+  const scored = group.filter((s) => s.error === undefined && !unverdicted(s));
   return {
     sampleCount: group.length,
     passRate: graded === 0 ? 0 : passed / graded,

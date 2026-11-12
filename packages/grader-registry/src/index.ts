@@ -77,10 +77,12 @@ export class GraderRegistry {
 /**
  * Discover plugin graders under `<pluginRoot>/<plugin>/index.{ts,js}` and
  * register them with the supplied registry. Returns the names registered.
+ * `onModule` hears each registered name with the entry file it came from.
  */
 export async function discoverPluginGraders(
   registry: GraderRegistry,
   pluginRoot: string,
+  onModule?: (name: string, modulePath: string) => void,
 ): Promise<ReadonlyArray<string>> {
   if (!existsSync(pluginRoot)) return [];
   const registered: string[] = [];
@@ -118,6 +120,7 @@ export async function discoverPluginGraders(
       }
       registry.upsert(it.name, it.grader);
       registered.push(it.name);
+      onModule?.(it.name, modulePath);
     }
   }
   return registered;

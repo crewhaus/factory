@@ -13,15 +13,22 @@
  * A row written before `errorCount`/`measuredCount` existed cannot be told
  * from a clean one, so an old row is refused only for `partial` or for having
  * no samples.
+ *
+ * A pin that replaces one measured with a different instrument records the
+ * re-anchor (`rebaselined`): the caller's reason when it gives one, otherwise
+ * `manual`, with the run the replaced pin named and the command that pinned.
  */
 import {
   type BaselineEntry,
   DEFAULT_EVALS_DIR,
+  type RebaselineReason,
   type RunIndexEntry,
   baselineKeyFor,
   lineageOfEntry,
+  pinnedUnder,
   setBaseline,
 } from "./history";
+import { instrumentChanges } from "./instrument";
 
 /** Why a run says nothing about the spec it ran. */
 export type MeasurementProblem = "partial" | "all_errored" | "nothing_measured";
@@ -34,7 +41,16 @@ export type PinRefusal = {
 export type PinOptions = {
   /** The lineage the caller means to pin. A run from another one is refused. */
   readonly lineageKey?: string;
+  /** The re-anchor this pin records, when the caller re-anchors on purpose. */
+  readonly rebaselined?: BaselineEntry["rebaselined"];
+  /**
+   * What is pinning (`crewhaus eval`, `EvalBaselinePin`, …), recorded on a
+   * `manual` re-anchor mark.
+   */
+  readonly cmd?: string;
 };
+
+export type { RebaselineReason };
 
 export type PinOutcome =
   | { readonly ok: true; readonly pin: BaselineEntry }
@@ -112,9 +128,29 @@ export function pinFromIndexEntry(
       ...(entry.routing !== undefined ? { routing: entry.routing } : {}),
       ...(entry.policyVersion !== undefined ? { policyVersion: entry.policyVersion } : {}),
       ...(entry.armsDigest !== undefined ? { armsDigest: entry.armsDigest } : {}),
+      ...(entry.calibrationDigest !== undefined
+        ? { calibrationDigest: entry.calibrationDigest }
+        : {}),
+      ...(entry.pluginsDigest !== undefined ? { pluginsDigest: entry.pluginsDigest } : {}),
+      ...(opts.rebaselined !== undefined ? { rebaselined: opts.rebaselined } : {}),
       ts,
     },
   };
+}
+
+/**
+ * The re-anchor mark for pinning `entry` over `replaced`: `manual`, naming the
+ * replaced run, when the two were measured with different instruments
+ * ({@link instrumentChanges}, unverified fields left out), else `undefined`.
+ */
+export function manualRebaseline(
+  replaced: BaselineEntry | undefined,
+  entry: RunIndexEntry,
+  cmd: string,
+): BaselineEntry["rebaselined"] {
+  if (replaced === undefined || replaced.runId === entry.runId) return undefined;
+  const changed = instrumentChanges(replaced, entry).filter((c) => c.unverified !== true);
+  return changed.length > 0 ? { from: replaced.runId, reason: "manual", cmd } : undefined;
 }
 
 /**
@@ -127,7 +163,22 @@ export function pinRun(
   evalsDir: string = DEFAULT_EVALS_DIR,
   opts: PinOptions = {},
 ): PinOutcome {
-  const outcome = pinFromIndexEntry(entry, ts, opts);
+  const refusal = pinRefusal(entry, opts);
+  if (refusal !== undefined) return { ok: false, refusal };
+  let pinOpts = opts;
+  if (opts.rebaselined === undefined) {
+    // The pin this one replaces, read as the write below reads the file. A
+    // file it refuses is the writer's to refuse, so it marks nothing here.
+    let replaced: BaselineEntry | undefined;
+    try {
+      replaced = pinnedUnder(baselineKeyFor(lineageOfEntry(entry)), evalsDir);
+    } catch {
+      replaced = undefined;
+    }
+    const mark = manualRebaseline(replaced, entry, opts.cmd ?? "unknown");
+    if (mark !== undefined) pinOpts = { ...opts, rebaselined: mark };
+  }
+  const outcome = pinFromIndexEntry(entry, ts, pinOpts);
   if (outcome.ok) setBaseline(outcome.pin, evalsDir);
   return outcome;
 }

@@ -332,3 +332,56 @@ describe("evaluateSentinel", () => {
     expect(r.reason).toContain("graders config changed");
   });
 });
+
+describe("the rest of the measuring instrument", () => {
+  const calibration = (minScore: number) => ({
+    judgeCalibration: {
+      path: ".crewhaus/judge-calibration.json",
+      applied: [{ grader: "j", specKey: "s", minScore, passingScore: 1 + minScore * 4 }],
+    },
+  });
+  const probe = (
+    base: Partial<EvalRunSummary["config"]>,
+    current: Partial<EvalRunSummary["config"]>,
+  ) =>
+    evaluateSentinel({
+      baseline: loaded(HASH_A, [sample("a", true, 1)], base),
+      current: loaded(HASH_A, [sample("a", true, 1)], current),
+      baselineDatasetHash: DS_HASH,
+      currentDatasetHash: DS_HASH,
+    });
+
+  test("a judge calibration change is not comparable, naming it", () => {
+    const result = probe(calibration(0.5), calibration(0.75));
+    expect(result).toMatchObject({ verdict: "not-comparable", alert: true });
+    expect(result.reason).toContain("judge calibration changed");
+    expect(result.reason).toContain("calibrationDigest");
+    // Calibrated on one side only: also a change between two run summaries.
+    expect(probe({}, calibration(0.5)).verdict).toBe("not-comparable");
+  });
+
+  test("a plugin grader code change is not comparable, naming it", () => {
+    const result = probe(
+      { pluginsDigest: "p1", cliVersion: "0.9.0" },
+      { pluginsDigest: "p2", cliVersion: "0.9.0" },
+    );
+    expect(result).toMatchObject({ verdict: "not-comparable", alert: true });
+    expect(result.reason).toContain("plugin grader code changed");
+    expect(result.reason).toContain("pluginsDigest: p1 → p2");
+  });
+
+  test("a graders hash on one side only stays not comparable", () => {
+    const result = probe({ gradersHash: "g" }, {});
+    expect(result.verdict).toBe("not-comparable");
+    expect(result.reason).toContain("graders config changed");
+  });
+
+  test("the same calibration and plugins keep a clean probe clean", () => {
+    expect(
+      probe(
+        { ...calibration(0.5), pluginsDigest: "p", cliVersion: "0.9.0" },
+        { ...calibration(0.5), pluginsDigest: "p", cliVersion: "0.9.0" },
+      ).verdict,
+    ).toBe("clean");
+  });
+});

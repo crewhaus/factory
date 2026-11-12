@@ -427,7 +427,15 @@ const OPENS_ITS_RECORDS: Readonly<Record<string, ReadonlyArray<string>>> = {
   "EvalHistory.evalsDir": ["index.jsonl", "baselines.json"],
   "HooksManage.dir": [".crewhaus/settings.json"],
   "PermissionsSuggest.dir": [".crewhaus/sessions/**", ".crewhaus/settings.json"],
-  "RouteControl.dir": [".crewhaus/routing/**"],
+  // The routing store's files. The freeze marker and its `.tmp` are
+  // `selfChecked`: freeze and unfreeze hold them against the floor's roots.
+  "RouteControl.dir": [
+    ".crewhaus/routing/arms.jsonl",
+    ".crewhaus/routing/arms.jsonl.tmp",
+    ".crewhaus/routing/priors.json",
+    ".crewhaus/routing/freeze.json",
+    ".crewhaus/routing/freeze.json.tmp",
+  ],
   "WatchmeReport.dir": [".crewhaus/watchme/**", ".crewhaus/routing/arms.jsonl"],
 };
 

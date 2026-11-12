@@ -42,7 +42,12 @@ export type RegistryOperativeArg = {
   /** With `beneath`: the boolean field without which the tool acts on the path alone. */
   readonly beneathWhen?: string;
   /** For a `path`: the fixed places inside the directory the tool opens, which a deny or ask reads. */
-  readonly opens?: ReadonlyArray<{ readonly path: string; readonly beneath?: string }>;
+  readonly opens?: ReadonlyArray<{
+    readonly path: string;
+    readonly beneath?: string;
+    /** The tool checks this file against the runtime-state floor itself: the floor leaves it out; a deny or ask reads it. */
+    readonly selfChecked?: true;
+  }>;
   /** For a `path` declared `within` a field: its default is read from the workspace root. */
   readonly defaultAtRoot?: true;
   /** For a `path`: the value is a pattern that stands for every path it lists. */
@@ -165,6 +170,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
           opens: arg.opens.map((o) => ({
             path: o.path,
             ...(o.beneath !== undefined ? { beneath: o.beneath } : {}),
+            ...(o.selfChecked === true ? { selfChecked: true as const } : {}),
           })),
         }
       : {}),

@@ -6,14 +6,21 @@
  *
  * Policy (AUTOMATION-OPPORTUNITIES.md item 3):
  * - Every run is appended to `.crewhaus/evals/index.jsonl`.
- * - First run for a (spec, dataset) key pins the baseline.
- * - A keyset mismatch from `diffReports` (sample ids changed) means the
- *   dataset itself changed — start a new baseline lineage instead of
- *   failing the run.
- * - A gradersHash/judgeModel mismatch vs the pinned baseline means the
- *   *measurement instrument* changed — the two runs' scores are not
- *   comparable, so warn loudly and start a new baseline lineage the same
- *   way. Baselines pinned before the fields existed gate exactly as before.
+ * - First run for a (spec, dataset) key pins the baseline. A regression-union
+ *   run (`<primary>+regressions@vN`) with no baseline of its own gates
+ *   against the most recent pin of its primary (or of a lower union) on the
+ *   cases both share, and pins its own lineage on a pass.
+ * - A run is gated only when it is comparable with its baseline
+ *   (`comparability` in `@crewhaus/eval-report`): it is not partial, it
+ *   measured something, the baseline run can be read, the measuring
+ *   instrument is the same (graders config, judge, judge calibration, plugin
+ *   graders, arm snapshot and policy), no baseline case is missing, and a
+ *   changed dataset left the shared cases unchanged. A run that is not
+ *   comparable says why and which cases, fails under `--gate`, and pins
+ *   nothing. Cases added since the baseline are listed and the gate compares
+ *   the shared ones; a shared case the baseline measured that this run did
+ *   not measure fails the gate. `--rebaseline --reason <code>` re-anchors the
+ *   lineage on this run instead, and the pin records it.
  * - The regression gate is strict by default: ANY pass-rate drop fails, and
  *   any sample-level pass→fail flip fails even when a recovery elsewhere
  *   cancels it out in the aggregates.
@@ -49,37 +56,54 @@
  * - NEW-HUNT-3 — a budget-aborted PARTIAL run is still appended to the
  *   index (marked `partial: true` so readers can tell its deflated
  *   passRate from a real one), but it is NEVER pinned or promoted as a
- *   baseline on ANY path (first run, new lineage, gate-pass promotion):
+ *   baseline on ANY path (first run, gate-pass promotion, re-anchor):
  *   its aborted samples are synthetic errors (passed: false, score 0),
  *   not measurements, and a baseline seeded from them would make real
- *   regressions read as recoveries forever after. Against an existing
- *   baseline the gate verdict fails outright — an incomplete measurement
- *   cannot honestly pass a pre-declared gate.
+ *   regressions read as recoveries forever after. Its gate verdict fails
+ *   outright, on a first run too — an incomplete measurement cannot
+ *   honestly pass a pre-declared gate.
  * - A run in which every case errored, or that produced no verdict at all,
- *   is recorded and never pinned on any path either, for the same reason.
+ *   is recorded, never pinned on any path, and fails the gate, for the same
+ *   reason.
  */
 import { resolve } from "node:path";
 import {
+  type BaselineEntry,
   type BaselineLineage,
+  type CaseDigests,
+  type ComparabilityRule,
   HistoryWriteError,
   type LoadedRun,
+  type RebaselineReason,
   type RecordEvalRunOptions,
   type ReportDiff,
   ReportError,
   type RunIndexEntry,
   baselineKeyFor,
+  comparability,
   diffReports,
+  formatInstrumentChange,
+  instrumentChanges,
   isLegacyLineage,
   lineageOfEntry,
   loadRun,
+  lostMeasurement,
   pinRefusal,
   pinRun,
+  readBaselines,
+  readCaseDigests,
   readRunIndexLatest,
   recordEvalRun,
   resolveBaseline,
   runIndexEntryFromSummary,
+  unmeasurableRun,
 } from "@crewhaus/eval-report";
-import type { EvalRoutingMode, EvalRunSummary } from "@crewhaus/eval-runner";
+import {
+  type EvalRoutingMode,
+  type EvalRunSummary,
+  aggregate,
+  sampleWithoutVerdict,
+} from "@crewhaus/eval-runner";
 import { type GateThresholds, type GateVerdict, gate } from "@crewhaus/regression-runner";
 
 export type FinishEvalOptions = {
@@ -142,12 +166,27 @@ export type FinishEvalOptions = {
   readonly write?: (line: string) => void;
   /** Warning sink; defaults to stderr. */
   readonly warn?: (line: string) => void;
+  /**
+   * `--rebaseline --reason <code>`: skip the comparison and re-anchor the
+   * lineage on this run, recording why and with which command. A run that
+   * cannot be pinned is refused.
+   */
+  readonly rebaseline?: { readonly reason: RebaselineReason; readonly cmd: string };
+  /**
+   * This run's case digests. Absent, they are read from `<outDir>/cases.json`;
+   * a test passes them in.
+   */
+  readonly cases?: CaseDigests;
 };
 
 export type FinishEvalResult = {
   /** True only when `gateRequested` and the regression gate failed. */
   readonly gateFailed: boolean;
   readonly gateReason?: string;
+  /** Why the run could not be gated against its baseline, when it could not. */
+  readonly notComparable?: ComparabilityRule;
+  /** This run re-anchored its lineage (`--rebaseline`). */
+  readonly rebaselined?: true;
   /**
    * 0.6.0 §6.1 — this run PINNED a per-arm lineage that had no baseline of
    * its own (it is the lineage's second run, beside an older legacy pin). The
@@ -180,6 +219,21 @@ export function abstainedSampleIds(prev: EvalRunSummary, next: EvalRunSummary): 
   const ids = new Set<string>();
   for (const s of [...prev.samples, ...next.samples]) {
     if (s.error === undefined && s.grades.overall.abstained === true) ids.add(s.sampleId);
+  }
+  return ids;
+}
+
+/**
+ * Sample ids with no verdict in EITHER run: not measured, skipped or only
+ * observed. Like an abstained sample, such a sample's pass/fail is a
+ * placeholder, so the flip comparison leaves it out. A sample the baseline
+ * measured and this run did not fails {@link gateRuns} on its own rule
+ * (`lostMeasurement`), not as a flip.
+ */
+export function unverdictedSampleIds(prev: EvalRunSummary, next: EvalRunSummary): Set<string> {
+  const ids = new Set<string>();
+  for (const s of [...prev.samples, ...next.samples]) {
+    if (sampleWithoutVerdict(s)) ids.add(s.sampleId);
   }
   return ids;
 }
@@ -226,9 +280,13 @@ export function routedInstrumentMismatch(
  *
  * A3 — samples abstained in either run are excluded from the per-sample
  * flip comparison (their verdict is UNKNOWN, not a fail — see
- * {@link abstainedSampleIds}). The pass-RATE criterion still compares the
- * runs' recorded aggregates, whose denominators already exclude each run's
- * own abstained samples.
+ * {@link abstainedSampleIds}), and so are samples not measured, skipped or
+ * only observed in either run ({@link unverdictedSampleIds}). The pass-RATE
+ * criterion still compares the runs' recorded aggregates, whose denominators
+ * already exclude each run's own such samples. A sample the baseline measured
+ * that `next` did not measure fails the gate (`cases the baseline measured
+ * were not measured: <ids>`), for every caller: a pass means every case the
+ * baseline measured was measured again.
  */
 export function gateRuns(
   prev: EvalRunSummary,
@@ -259,25 +317,31 @@ export function gateRuns(
       },
     };
   }
-  const abstained = abstainedSampleIds(prev, next);
+  const stripped = new Set([
+    ...abstainedSampleIds(prev, next),
+    ...unverdictedSampleIds(prev, next),
+  ]);
   const stripAbstained = (run: EvalRunSummary): EvalRunSummary =>
-    abstained.size === 0
+    stripped.size === 0
       ? run
-      : { ...run, samples: run.samples.filter((s) => !abstained.has(s.sampleId)) };
+      : { ...run, samples: run.samples.filter((s) => !stripped.has(s.sampleId)) };
   const verdict = gate(stripAbstained(prev), stripAbstained(next), {
     regressionThreshold: 0,
     latencyThreshold: Number.POSITIVE_INFINITY,
     ...thresholds,
   });
-  if (verdict.verdict === "pass" && verdict.report.regressions.length > 0) {
+  const reasons: string[] = [];
+  if (verdict.verdict === "fail") reasons.push(verdict.reason ?? "regression gate failed");
+  else if (verdict.report.regressions.length > 0) {
     const ids = verdict.report.regressions.map((r) => r.sampleId).join(", ");
-    return {
-      verdict: "fail",
-      reason: `sample regressions despite a flat pass rate: [${ids}]`,
-      report: verdict.report,
-    };
+    reasons.push(`sample regressions despite a flat pass rate: [${ids}]`);
   }
-  return verdict;
+  const lost = lostMeasurement(prev, next);
+  if (lost.length > 0) {
+    reasons.push(`cases the baseline measured were not measured: ${lost.join(", ")}`);
+  }
+  if (reasons.length === 0) return verdict;
+  return { verdict: "fail", reason: reasons.join("; "), report: verdict.report };
 }
 
 /**
@@ -299,22 +363,16 @@ export function costGateReason(
 }
 
 /**
- * Record a completed eval run in the history index, then resolve/diff/gate
- * against the pinned baseline for its (spec, dataset) key. Returns whether
- * the caller should exit non-zero (gate requested + failed).
+ * Record a completed eval run in the history index, then resolve the pinned
+ * baseline for its lineage, check the two are comparable, and diff/gate on
+ * the cases they share. Returns whether the caller should exit non-zero
+ * (gate requested + failed) and, when the run could not be compared, why.
  */
 export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEvalResult> {
   const write = opts.write ?? ((line: string) => process.stdout.write(`${line}\n`));
   const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
   const { summary, specName, specSource } = opts;
   const datasetName = summary.config.datasetName;
-  // Measurement-instrument identity, straight off the summary the runner
-  // recorded (the eval path computes gradersHash once for the sentinel and
-  // threads it into the run; judgeModel is present only when a run pinned
-  // one). Recorded on the index entry + baseline pin so a later run can
-  // detect that the instrument — not the agent — changed.
-  const gradersHash = summary.config.gradersHash;
-  const judgeModel = summary.config.judgeModel;
   const absOut = resolve(opts.outDir);
 
   // Build + append the index entry through eval-report's shared recorder —
@@ -358,14 +416,25 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     entry = runIndexEntryFromSummary(summary, recordOpts);
   }
 
+  /** Warn, at the moment a pin happens, that the run replayed its tools. */
+  const warnReplayedPin = (): void => {
+    // NEW-HUNT-4 — a cassette-replayed run IS pinnable (it is a real,
+    // reproducible measurement of the agent's reasoning), but pinning it
+    // silently would gate every future LIVE run against frozen tool results.
+    if (summary.config.toolRecording?.mode === "replay") {
+      warn(
+        `[eval] warning: pinning a REPLAYED run (--replay-tools ${summary.config.toolRecording.dir}) as the baseline for ${specName}/${datasetName} — every tool result came from the cassette, so later LIVE runs will be gated against frozen tool output.`,
+      );
+    }
+  };
+
   const pinCurrentRun = (label: string): void => {
     // NEW-HUNT-3 — a budget-aborted run records its unexecuted samples as
     // synthetic errors, and a run in which every case errored or none produced
     // a verdict has measured nothing: pinning either would seed every later
     // gate with garbage (real regressions would read as recoveries against the
     // deflated pin). Asked HERE, before anything is printed about promoting, so
-    // every pin path — first run, new lineage, gate-pass promotion — refuses
-    // the same way.
+    // every pin path refuses the same way.
     const refusal = pinRefusal(entry);
     if (refusal !== undefined) {
       write(
@@ -379,19 +448,11 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
       write(`[eval] baseline not set (${label}; --no-promote)`);
       return;
     }
-    // NEW-HUNT-4 — a cassette-replayed run IS pinnable (it is a real,
-    // reproducible measurement of the agent's reasoning), but pinning it
-    // silently would gate every future LIVE run against frozen tool results.
-    // Warn at the moment the pin happens, where it is actionable.
-    if (summary.config.toolRecording?.mode === "replay") {
-      warn(
-        `[eval] warning: pinning a REPLAYED run (--replay-tools ${summary.config.toolRecording.dir}) as the baseline for ${specName}/${datasetName} — every tool result came from the cassette, so later LIVE runs will be gated against frozen tool output.`,
-      );
-    }
+    warnReplayedPin();
     // `entry` is this run's index row, so the pin and the row can never
     // disagree about which arm they are.
     try {
-      if (!pinRun(entry, entry.ts, opts.evalsDir).ok) return;
+      if (!pinRun(entry, entry.ts, opts.evalsDir, { cmd: "crewhaus eval" }).ok) return;
     } catch (err) {
       if (!(err instanceof HistoryWriteError)) throw err;
       historyRefused(`baseline not set (${label})`, err);
@@ -414,8 +475,28 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     ? `${specName}/${datasetName}`
     : `${specName}/${datasetName}#${entry.armId ?? "routed"}`;
   const lookup = resolveBaseline(lineage, opts.evalsDir);
-  const baseline = lookup.entry;
-  if (baseline === undefined) {
+  const own = lookup.entry;
+
+  // A partial run, or one that measured nothing, is held to no baseline and
+  // can be none: under --gate it fails, on a first run too.
+  const unmeasurable = unmeasurableRun(summary);
+  if (unmeasurable !== undefined) {
+    if (opts.rebaseline !== undefined) {
+      write(`[eval] --rebaseline: ${pinRefusal(entry)?.reason ?? unmeasurable.reason}`);
+    }
+    if (own !== undefined || opts.gateRequested || opts.rebaseline !== undefined) {
+      if (own === undefined && opts.rebaseline === undefined) {
+        pinCurrentRun(`first run for ${lineageLabel}`);
+      }
+      write(`[eval] gate: FAIL — ${unmeasurable.reason}`);
+      if (own !== undefined) write(`[eval] baseline kept: ${own.runId}`);
+      return opts.gateRequested
+        ? { gateFailed: true, gateReason: unmeasurable.reason, notComparable: unmeasurable.rule }
+        : { gateFailed: false };
+    }
+  }
+
+  if (own === undefined && lookup.legacyPresent) {
     // The one V2-specific rule (§6.1): a per-arm lineage that does not exist
     // yet, alongside a legacy baseline that does, is NOT a "first run". Pinning
     // the FIRST such run would let the very run that creates the lineage
@@ -431,23 +512,47 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     // Without this the condition never changes (nothing else writes a V2 key),
     // so `--gate` under `--record` would be a permanent no-op on every harness
     // that ever ran a plain eval, and the "re-run" guidance would be false.
-    if (lookup.legacyPresent) {
-      const priorRuns = readRunIndexLatest(opts.evalsDir).filter(
-        (e) => e.runId !== summary.runId && baselineKeyFor(lineageOfEntry(e)) === lookup.key,
+    if (opts.rebaseline !== undefined) {
+      write(
+        `[eval] --rebaseline: ${lineageLabel} has no baseline of its own yet, so there is nothing to re-anchor — this run follows the per-arm lineage rule below.`,
       );
-      if (priorRuns.length === 0) {
-        write(
-          `[eval] new per-arm lineage ${lineageLabel} — recorded, not gated and not promotable (the legacy ${specName}/${datasetName} baseline measures a different instrument). Re-run to establish this arm's own baseline.`,
-        );
-        return { gateFailed: false };
-      }
-      pinCurrentRun(
-        `establishing ${lineageLabel} — run ${priorRuns.length + 1} of this lineage, not gated (the legacy ${specName}/${datasetName} baseline measures a different instrument)`,
-      );
-      return { gateFailed: false, lineageSeeded: true };
     }
-    pinCurrentRun(`first run for ${lineageLabel}`);
+    const priorRuns = readRunIndexLatest(opts.evalsDir).filter(
+      (e) => e.runId !== summary.runId && baselineKeyFor(lineageOfEntry(e)) === lookup.key,
+    );
+    if (priorRuns.length === 0) {
+      write(
+        `[eval] new per-arm lineage ${lineageLabel} — recorded, not gated and not promotable (the legacy ${specName}/${datasetName} baseline measures a different instrument). Re-run to establish this arm's own baseline.`,
+      );
+      return { gateFailed: false };
+    }
+    pinCurrentRun(
+      `establishing ${lineageLabel} — run ${priorRuns.length + 1} of this lineage, not gated (the legacy ${specName}/${datasetName} baseline measures a different instrument)`,
+    );
+    return { gateFailed: false, lineageSeeded: true };
+  }
+
+  // A regression-union run with no baseline of its own is gated against its
+  // primary's (or a lower union's) most recent pin, on the cases both share.
+  const predecessor = own === undefined ? unionPredecessor(lineage, opts.evalsDir) : undefined;
+  const baseline = own ?? predecessor;
+  const firstRunLabel =
+    predecessor !== undefined
+      ? `first run for ${lineageLabel}, gated against ${predecessor.runId} (${specName}/${predecessor.datasetName})`
+      : `first run for ${lineageLabel}`;
+
+  if (opts.rebaseline !== undefined) {
+    return rebaselineOnto(baseline, opts.rebaseline);
+  }
+
+  if (baseline === undefined) {
+    pinCurrentRun(firstRunLabel);
     return { gateFailed: false };
+  }
+  if (predecessor !== undefined) {
+    write(
+      `[eval] no baseline for ${lineageLabel} yet — gating against ${predecessor.runId}, pinned for ${specName}/${predecessor.datasetName}, on the cases both runs share`,
+    );
   }
 
   // NEW-HUNT-6 — self-comparison guard. `--resume` is the first feature that
@@ -498,84 +603,74 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     );
   }
 
-  // Instrument guard: the gate compares SCORES, and scores are comparable
-  // only when both runs graded with the same measurement instrument — the
-  // same graders config (gradersHash) bound to the same judge (judgeModel).
-  // When the pinned baseline recorded either and this run's differs, gating
-  // would blame the agent for a rubric/judge change, so warn loudly and
-  // start a new baseline lineage exactly like the dataset-changed path.
-  // A side missing the field (old history, or no pinned judge) never trips
-  // the guard — hash-less entries gate exactly as before.
-  const gradersChanged =
-    gradersHash !== undefined &&
-    baseline.gradersHash !== undefined &&
-    baseline.gradersHash !== gradersHash;
-  const judgeChanged =
-    judgeModel !== undefined &&
-    baseline.judgeModel !== undefined &&
-    baseline.judgeModel !== judgeModel;
-  // 0.6.0 §6.1 — the ROUTED half of the same guard: the arm snapshot the
-  // learned policy read, and the pool policy that read it. Both belong HERE
-  // and not in the key: a policy flip must re-baseline the lineage, never
-  // orphan it under a key nothing will ever pin again.
-  const armsChanged =
-    entry.armsDigest !== undefined &&
-    baseline.armsDigest !== undefined &&
-    baseline.armsDigest !== entry.armsDigest;
-  const policyChanged =
-    entry.policyVersion !== undefined &&
-    baseline.policyVersion !== undefined &&
-    baseline.policyVersion !== entry.policyVersion;
-  if (gradersChanged || judgeChanged || armsChanged || policyChanged) {
-    warn(
-      `[eval] warning: the measurement instrument changed since baseline ${baseline.runId} was pinned:`,
-    );
-    if (gradersChanged) {
-      warn(`[eval]   gradersHash: ${baseline.gradersHash} → ${gradersHash}`);
-    }
-    if (judgeChanged) {
-      warn(`[eval]   judgeModel: ${baseline.judgeModel} → ${judgeModel}`);
-    }
-    if (armsChanged) {
-      warn(`[eval]   armsDigest: ${baseline.armsDigest} → ${entry.armsDigest}`);
-      warn(
-        "[eval]   the two runs routed off DIFFERENT arm snapshots — two arm snapshots are two different instruments.",
-      );
-    }
-    if (policyChanged) {
-      warn(`[eval]   policyVersion: ${baseline.policyVersion} → ${entry.policyVersion}`);
-    }
-    warn(
-      "[eval]   scores graded by different graders configs or judge models, or routed off different arm snapshots or policies, are not comparable — not gating this run against that baseline.",
-    );
-    write("[eval] instrument changed — starting new baseline lineage");
-    pinCurrentRun("new lineage");
-    return { gateFailed: false };
-  }
-
-  let prevLoaded: LoadedRun;
+  // Comparability: the same instrument, the same cases, a readable baseline.
+  // Scores from runs that are not comparable say nothing about the agent, so
+  // the run is not gated and nothing is pinned.
+  let prevLoaded: LoadedRun | undefined;
   try {
     prevLoaded = await loadRun(baseline.outDir);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    write(
-      `[eval] baseline run ${baseline.runId} unreadable (${msg}) — starting new baseline lineage`,
-    );
-    pinCurrentRun("new lineage");
-    return { gateFailed: false };
+  } catch {
+    prevLoaded = undefined;
   }
   const nextLoaded = await loadRun(absOut);
+  const runCases = opts.cases ?? readCaseDigests(absOut);
+  const baseCases = readCaseDigests(baseline.outDir);
+  const comparable = comparability(
+    {
+      pin: baseline,
+      ...(prevLoaded !== undefined ? { summary: prevLoaded.summary } : {}),
+      ...(baseCases !== undefined ? { cases: baseCases } : {}),
+    },
+    { entry, summary: nextLoaded.summary, ...(runCases !== undefined ? { cases: runCases } : {}) },
+  );
+  if (!comparable.comparable || prevLoaded === undefined) {
+    const rule: ComparabilityRule = comparable.comparable ? "baseline_unreadable" : comparable.rule;
+    const reason = comparable.comparable
+      ? `the baseline run ${baseline.runId} could not be read`
+      : comparable.reason;
+    write(`[eval] not comparable with baseline ${baseline.runId}: ${reason}`);
+    if (!comparable.comparable) {
+      for (const change of comparable.changes ?? []) {
+        write(`[eval]   ${formatInstrumentChange(change)}`);
+      }
+      if (comparable.ids !== undefined) write(`[eval]   cases: ${comparable.ids.join(", ")}`);
+    }
+    const gateReason = `not comparable with baseline ${baseline.runId}: ${reason}`;
+    if (predecessor !== undefined && !opts.gateRequested) {
+      // A union run that cannot be compared with its predecessor starts its
+      // own lineage, as a first run does.
+      pinCurrentRun(`first run for ${lineageLabel}`);
+      return { gateFailed: false, notComparable: rule };
+    }
+    write(`[eval] baseline kept: ${baseline.runId}`);
+    return opts.gateRequested
+      ? { gateFailed: true, gateReason, notComparable: rule }
+      : { gateFailed: false, notComparable: rule };
+  }
+
+  // The gate compares the cases both runs hold. Cases added since the baseline
+  // have no baseline yet; they are listed and promote with the run.
+  if (comparable.added.length > 0) {
+    write(`[eval] new cases, no baseline yet: ${comparable.added.join(", ")}`);
+  }
+  const nextForGate =
+    comparable.added.length === 0 ? nextLoaded : restrictTo(nextLoaded, comparable.shared);
 
   let diff: ReportDiff;
   try {
-    diff = diffReports(prevLoaded, nextLoaded).diff;
+    diff = diffReports(prevLoaded, nextForGate).diff;
   } catch (err) {
-    if (err instanceof ReportError) {
-      write("[eval] dataset changed — starting new baseline lineage");
-      pinCurrentRun("new lineage");
-      return { gateFailed: false };
-    }
-    throw err;
+    if (!(err instanceof ReportError)) throw err;
+    const reason = `the two runs' cases could not be matched (${err.message})`;
+    write(`[eval] not comparable with baseline ${baseline.runId}: ${reason}`);
+    write(`[eval] baseline kept: ${baseline.runId}`);
+    return opts.gateRequested
+      ? {
+          gateFailed: true,
+          gateReason: `not comparable with baseline ${baseline.runId}: ${reason}`,
+          notComparable: "cases_changed",
+        }
+      : { gateFailed: false, notComparable: "cases_changed" };
   }
 
   write(
@@ -597,11 +692,19 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   // A3 — say when the flip comparison is running on fewer samples than the
   // diff above showed: abstained-in-either-run samples await a human
   // verdict, so the gate must not count their placeholder fails as flips.
-  const abstained = abstainedSampleIds(prevLoaded.summary, nextLoaded.summary);
+  const abstained = abstainedSampleIds(prevLoaded.summary, nextForGate.summary);
   if (abstained.size > 0) {
     write(
       `[eval] gate: excluding ${abstained.size} abstained sample(s) from the flip comparison: ` +
         `[${[...abstained].join(", ")}]`,
+    );
+  }
+  const unverdicted = [...unverdictedSampleIds(prevLoaded.summary, nextForGate.summary)].filter(
+    (id) => !abstained.has(id),
+  );
+  if (unverdicted.length > 0) {
+    write(
+      `[eval] gate: excluding ${unverdicted.length} sample(s) without a verdict (not measured, skipped or observing) from the flip comparison: [${unverdicted.join(", ")}]`,
     );
   }
 
@@ -611,7 +714,7 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   // part of the run summaries regression-runner compares). A declared cost
   // ceiling that cannot be checked (pricing miss → costUsd absent) warns
   // loudly rather than failing on a number nobody computed.
-  const verdict = gateRuns(prevLoaded.summary, nextLoaded.summary, {
+  const verdict = gateRuns(prevLoaded.summary, nextForGate.summary, {
     ...(opts.maxP95LatencyMs !== undefined ? { latencyThreshold: opts.maxP95LatencyMs } : {}),
   });
   if (opts.maxCostUsd !== undefined && opts.costUsd === undefined) {
@@ -621,16 +724,6 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   }
   const costReason = costGateReason(opts.costUsd, opts.maxCostUsd);
   const failReasons: string[] = [];
-  // NEW-HUNT-3 — an incomplete measurement cannot honestly pass a
-  // pre-declared gate: the budget-aborted samples never ran, so "no
-  // regression" is unknowable. Without this a partial run whose aborted
-  // samples were ALREADY failing in the baseline flips nothing (fail→fail)
-  // and reads gate-PASS — a false green (and, pre-guard, a promotion).
-  if (summary.partial !== undefined) {
-    failReasons.push(
-      `run is partial (budget exhausted after ${summary.partial.completedSamples}/${summary.partial.totalSamples} samples) — an incomplete run cannot pass the gate`,
-    );
-  }
   if (verdict.verdict === "fail") failReasons.push(verdict.reason ?? "regression gate failed");
   if (costReason !== undefined) failReasons.push(costReason);
   if (failReasons.length > 0) {
@@ -641,10 +734,133 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   }
 
   write("[eval] gate: PASS");
-  if (opts.promote) {
+  if (predecessor !== undefined) {
+    pinCurrentRun(firstRunLabel);
+  } else if (opts.promote) {
     pinCurrentRun("promoted");
   } else {
     write(`[eval] baseline kept: ${baseline.runId} (--no-promote)`);
   }
   return { gateFailed: false };
+
+  /**
+   * `--rebaseline`: re-anchor the lineage on this run. Prints what changed
+   * against the replaced baseline when it can be read, then pins with the
+   * mark. The run is already known to be measurable.
+   */
+  async function rebaselineOnto(
+    replaced: BaselineEntry | undefined,
+    rebaseline: { readonly reason: RebaselineReason; readonly cmd: string },
+  ): Promise<FinishEvalResult> {
+    if (replaced !== undefined) {
+      write(`[eval] --rebaseline: re-anchoring ${lineageLabel} (was ${replaced.runId})`);
+      let prev: EvalRunSummary | undefined;
+      try {
+        prev = (await loadRun(replaced.outDir)).summary;
+      } catch {
+        prev = undefined;
+      }
+      if (prev === undefined) {
+        write(`[eval]   the baseline run ${replaced.runId} could not be read`);
+      } else {
+        for (const change of instrumentChanges(prev, summary)) {
+          if (change.unverified !== true) write(`[eval]   ${formatInstrumentChange(change)}`);
+        }
+        const before = new Set(prev.samples.map((x) => x.sampleId));
+        const now = new Set(summary.samples.map((x) => x.sampleId));
+        const removed = [...before].filter((id) => !now.has(id));
+        const added = [...now].filter((id) => !before.has(id));
+        const baseCases = readCaseDigests(replaced.outDir);
+        const runCases = opts.cases ?? readCaseDigests(absOut);
+        const changed =
+          baseCases !== undefined && runCases !== undefined
+            ? [...now].filter(
+                (id) =>
+                  before.has(id) &&
+                  baseCases.digests[id] !== undefined &&
+                  runCases.digests[id] !== undefined &&
+                  baseCases.digests[id] !== runCases.digests[id],
+              )
+            : [];
+        if (removed.length > 0) write(`[eval]   cases removed: ${removed.join(", ")}`);
+        if (changed.length > 0) write(`[eval]   cases changed: ${changed.join(", ")}`);
+        if (added.length > 0) write(`[eval]   cases added: ${added.join(", ")}`);
+      }
+    }
+    warnReplayedPin();
+    let outcome: ReturnType<typeof pinRun>;
+    try {
+      outcome = pinRun(entry, entry.ts, opts.evalsDir, {
+        rebaselined: {
+          ...(replaced !== undefined ? { from: replaced.runId } : {}),
+          reason: rebaseline.reason,
+          cmd: rebaseline.cmd,
+        },
+      });
+    } catch (err) {
+      if (!(err instanceof HistoryWriteError)) throw err;
+      historyRefused("baseline not re-anchored", err);
+      return { gateFailed: false };
+    }
+    if (!outcome.ok) {
+      write(`[eval] --rebaseline: ${outcome.refusal.reason}`);
+      return opts.gateRequested
+        ? { gateFailed: true, gateReason: `--rebaseline: ${outcome.refusal.reason}` }
+        : { gateFailed: false };
+    }
+    write(`[eval] baseline re-anchored: ${summary.runId} (${rebaseline.reason})`);
+    return { gateFailed: false, rebaselined: true };
+  }
+}
+
+/** The regression-union suffix a run's datasetName carries. */
+const UNION_SUFFIX = /^(.*)\+regressions@v(\d+)$/;
+
+/**
+ * For a regression-union lineage (`<primary>+regressions@vN`) with no pin of
+ * its own: the most recently pinned baseline of the same spec and arm whose
+ * dataset is the primary or a lower union (`+regressions@vM`, M < N).
+ * `undefined` for any other lineage, and when none is pinned.
+ */
+export function unionPredecessor(
+  lineage: BaselineLineage,
+  evalsDir?: string,
+): BaselineEntry | undefined {
+  const m = UNION_SUFFIX.exec(lineage.datasetName);
+  if (m === null) return undefined;
+  const primary = m[1] as string;
+  const version = Number(m[2]);
+  let pins: BaselineEntry[];
+  try {
+    pins = Object.values(readBaselines(evalsDir));
+  } catch {
+    return undefined;
+  }
+  const sameArm = (pin: BaselineEntry): boolean =>
+    baselineKeyFor(lineageOfEntry({ ...pin, datasetName: lineage.datasetName })) ===
+    baselineKeyFor(lineage);
+  const lower = (datasetName: string): boolean => {
+    if (datasetName === primary) return true;
+    const own = UNION_SUFFIX.exec(datasetName);
+    return own !== null && own[1] === primary && Number(own[2]) < version;
+  };
+  const tsOf = (pin: BaselineEntry): number => {
+    const t = Date.parse(pin.ts);
+    return Number.isNaN(t) ? Number.NEGATIVE_INFINITY : t;
+  };
+  let best: BaselineEntry | undefined;
+  for (const pin of pins) {
+    if (typeof pin !== "object" || pin === null) continue;
+    if (pin.specName !== lineage.specName || typeof pin.datasetName !== "string") continue;
+    if (!lower(pin.datasetName) || !sameArm(pin)) continue;
+    if (best === undefined || tsOf(pin) >= tsOf(best)) best = pin;
+  }
+  return best;
+}
+
+/** A loaded run cut to `ids`, its aggregates recomputed over them. */
+function restrictTo(run: LoadedRun, ids: ReadonlyArray<string>): LoadedRun {
+  const keep = new Set(ids);
+  const samples = run.summary.samples.filter((s) => keep.has(s.sampleId));
+  return { ...run, summary: { ...run.summary, samples, aggregates: aggregate(samples) } };
 }

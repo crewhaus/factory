@@ -413,6 +413,47 @@ export type EvalAggregates = {
   /** B18 — the canary samples' ids. Present iff {@link canary} is. */
   readonly canarySampleIds?: ReadonlyArray<string>;
   /**
+   * Samples whose overall grade is `not_measured`: an enforced grader could
+   * not measure the case and none recorded a failure. Out of the `passRate`
+   * denominator and `meanScore`, like the abstained bucket. Present (with
+   * {@link notMeasuredSampleIds}) only when at least one sample was not
+   * measured.
+   */
+  readonly notMeasured?: number;
+  /** The not-measured samples' ids. Present iff {@link notMeasured} is. */
+  readonly notMeasuredSampleIds?: ReadonlyArray<string>;
+  /**
+   * Samples every enforced grader skipped as outside what it measures. Out of
+   * the `passRate` denominator and `meanScore`. Present (with
+   * {@link skippedSampleIds}) only when at least one sample was skipped.
+   */
+  readonly skipped?: number;
+  /** The skipped samples' ids. Present iff {@link skipped} is. */
+  readonly skippedSampleIds?: ReadonlyArray<string>;
+  /**
+   * Per grader, the entries it only observed: how many it graded and which
+   * would have failed had it been enforced. Counted from every observing
+   * entry, whatever the sample's overall state. A sample whose every enforced
+   * grader observed is out of the `passRate` denominator. Present only when a
+   * grader observed.
+   */
+  readonly observing?: Readonly<
+    Record<
+      string,
+      {
+        readonly graded: number;
+        readonly wouldFail: number;
+        readonly wouldFailSampleIds: ReadonlyArray<string>;
+      }
+    >
+  >;
+  /**
+   * Samples with a verdict about the spec: not errored, abstained, a canary,
+   * not measured, skipped or observing. Present only beside
+   * {@link notMeasured}, {@link skipped} or {@link observing}.
+   */
+  readonly measured?: number;
+  /**
    * A12 — per-criterion mean judge scores, keyed grader name → criterion →
    * mean of the raw 1–5 criterion scores over the samples that grader
    * scored (abstained verdicts carry no breakdown and are excluded).
@@ -745,6 +786,13 @@ export type EvalRunSummary = {
       readonly path: string;
       readonly applied: ReadonlyArray<JudgeCalibrationApplication>;
     };
+    /**
+     * sha256 over the sorted lines `<name>\t<sha256 of the entry file>` for
+     * the `.crewhaus/graders` plugins this run's graders resolved. It covers
+     * each plugin's entry file only, not modules that file imports. Absent
+     * when no grader resolved to a plugin.
+     */
+    readonly pluginsDigest?: string;
     /** NEW-HUNT-4 — the tool record/replay mode in force, when either
      *  `--record-tools` or `--replay-tools` was given (absent otherwise —
      *  see {@link EvalToolRecordingConfig}). */
@@ -772,6 +820,12 @@ export type EvalRunSummary = {
 export type GraderLookup = {
   lookup(name: string): Grader;
   list?(): ReadonlyArray<string>;
+  /**
+   * The `.crewhaus/graders` plugins this registry loaded, name → entry file.
+   * `runEval` digests the ones its graders resolve into
+   * `config.pluginsDigest`. Optional: a registry without it records none.
+   */
+  pluginSources?(): ReadonlyMap<string, string>;
   /**
    * NEW-HUNT-7 — resolve a name WITH the graders.yaml entry's `opts`
    * record. The default registry implements it (per-pack strict

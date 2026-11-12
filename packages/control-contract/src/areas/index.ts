@@ -26,7 +26,7 @@ import type { AreaModule } from "./types.js";
 
 // import { KNOWLEDGE_MODULE } from "./knowledge.js";
 
-// import { PEOPLE_MODULE } from "./people.js";
+import { PEOPLE_MODULE } from "./people.js";
 
 // import { QUALITY_MODULE } from "./quality.js";
 
@@ -53,7 +53,7 @@ export const AREA_MODULES = [
 
   // KNOWLEDGE_MODULE,
 
-  // PEOPLE_MODULE,
+  PEOPLE_MODULE,
 
   // QUALITY_MODULE,
 

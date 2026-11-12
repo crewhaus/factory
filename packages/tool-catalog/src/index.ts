@@ -435,7 +435,12 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * names, so `alwaysDeny ApprovalStatus(.crewhaus/sessions/**)` fires on the
  * ordinary call; an allow reads the directory alone. A tool that opens
  * named files in a directory, rather than walking it, declares them this
- * way: without it, a deny naming one of them never fires.
+ * way: without it, a deny naming one of them never fires. One declared
+ * `selfChecked` is a file the tool itself holds against the runtime-state
+ * floor's roots on every call that writes it (RouteControl's freeze marker):
+ * the floor leaves it out of what the call writes, so a call that only
+ * reads it, or writes the store's other files, is not refused for it, and
+ * every deny or ask still reads it.
  *
  * `glob: true`, for a `path`, says the value is a pattern the tool lists
  * the paths of (the Glob tool's `pattern`, whose wildcards never list a
@@ -556,7 +561,30 @@ export type OperativeArg = {
 export type OperativeOpening = {
   readonly path: string;
   readonly beneath?: "all" | "visible";
+  /** The tool checks this place against the runtime-state floor itself: the floor leaves it out. */
+  readonly selfChecked?: true;
 };
+
+/**
+ * `arg` as the runtime-state floor reads it: without the openings the tool
+ * checks against the floor's roots itself (`selfChecked`), which every deny
+ * or ask still reads. The same object when it declares none. Taken
+ * structurally, so the builtin manifest's declarations read the same way.
+ */
+export function withoutSelfCheckedOpenings<
+  A extends { readonly opens?: ReadonlyArray<{ readonly selfChecked?: true }> },
+>(arg: A): A {
+  const { opens } = arg;
+  if (opens === undefined || !opens.some((o) => o.selfChecked === true)) return arg;
+  return { ...arg, opens: opens.filter((o) => o.selfChecked !== true) };
+}
+
+/** True when `arg` declares an opening the tool checks against the floor itself. */
+export function hasSelfCheckedOpening(arg: {
+  readonly opens?: ReadonlyArray<{ readonly selfChecked?: true }>;
+}): boolean {
+  return (arg.opens ?? []).some((o) => o.selfChecked === true);
+}
 
 /**
  * A `url` declared as its own `service`: the API a call goes to, itself

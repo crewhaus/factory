@@ -16,6 +16,19 @@ export const CLI_VERBS = deepFreeze({
   daemon: ["start", "stop", "restart", "drain"],
   approvals: ["show", "grant", "deny"],
   deploy: ["activate", "list"],
+  people: [
+    "init",
+    "keys",
+    "list",
+    "add",
+    "show",
+    "note",
+    "edit",
+    "review",
+    "export",
+    "activity",
+    "erase",
+  ],
 } as const);
 
 /**
@@ -24,7 +37,9 @@ export const CLI_VERBS = deepFreeze({
  * `{hrn}` is a harness id, never a slug. `{dir}` is a directory D whose
  * `D/.crewhaus/sessions` holds the decision, so a moved session root shows no twin.
  * It is non-empty, has no control character and no leading `-`, so it can never
- * read as a flag.
+ * read as a flag. `{psn}` and `{pcl}` are a profile's and a note's ids, `{kind}` a
+ * profile kind, `{area}` a note's area and `{verdict}` a review that needs no
+ * further argument.
  */
 export const TWIN_PLACEHOLDERS = deepFreeze({
   "{hrn}": HARNESS_ID_RE,
@@ -33,6 +48,11 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
   "{dir}": /^[^\x00-\x1f\x7f-][^\x00-\x1f\x7f]*$/,
   "{dep}": DEPLOYMENT_ID_RE,
+  "{psn}": /^psn_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{pcl}": /^pcl_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{kind}": /^(?:personal|audience|synthetic)$/,
+  "{area}": /^[a-z][a-z0-9-]{0,39}$/,
+  "{verdict}": /^(?:keep|reject|reopen)$/,
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

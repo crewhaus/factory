@@ -28,11 +28,54 @@
  *
  * `threshold`, `onFail` and `maxRetries` are the IR's resolved values, and the
  * cascade's lower-time `escalateTo` is threaded only under `on_fail: escalate`.
+ *
+ * A grader that throws publishes one `eval_unmeasured` event on the turn's
+ * bus and rethrows the same error, so a reader of the bus can tell an
+ * ungraded turn from a graded one; the runtime's handling of the throw is
+ * its own.
  */
 import { type JudgePanelKnobs, gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";
 import type { IrEvaluation } from "@crewhaus/ir";
 import { judgeInstrumentId } from "@crewhaus/model-service";
 import type { RunEvaluation } from "@crewhaus/runtime-core";
+import type { EvalUnmeasuredEvent } from "@crewhaus/trace-event-bus";
+
+/**
+ * `evaluate`, publishing one `eval_unmeasured` event on the turn's bus when it
+ * throws, then rethrowing the same error.
+ */
+function reportUnmeasured(
+  meta: {
+    readonly graderType: EvalUnmeasuredEvent["graderType"];
+    readonly maxRetries?: number;
+    readonly judgeModel?: string;
+  },
+  evaluate: RunEvaluation["evaluate"],
+): RunEvaluation["evaluate"] {
+  return async (turn) => {
+    try {
+      return await evaluate(turn);
+    } catch (err) {
+      try {
+        const event: EvalUnmeasuredEvent = {
+          ...turn.bus.envelope(),
+          kind: "eval_unmeasured",
+          gate: "evaluation",
+          graderType: meta.graderType,
+          ...(meta.maxRetries !== undefined ? { maxRetries: meta.maxRetries } : {}),
+          ...(meta.judgeModel !== undefined ? { judgeModel: meta.judgeModel } : {}),
+          ...(turn.stage !== undefined ? { stage: turn.stage } : {}),
+          reason: "grader_error",
+          errorName: err instanceof Error ? err.name : "Error",
+        };
+        turn.bus.publish(event);
+      } catch {
+        // The grader's own error is the one the caller handles.
+      }
+      throw err;
+    }
+  };
+}
 
 /** The `llm_judge` rubric every in-loop judge grades against: one criterion, the spec's text. */
 function inLoopRubric(criteria: string) {
@@ -73,41 +116,45 @@ export function buildRunEvaluation(
     const model = grader.model ?? primaryModel;
     const rubric = inLoopRubric(grader.criteria);
     const panel = { ...grader, model };
+    const judgeModel = judgeInstrumentId(panel, primaryModel);
     return {
       graderType: "llm_judge",
-      judgeModel: judgeInstrumentId(panel, primaryModel),
+      judgeModel,
       // The lowered default is 0.7; the floor guards hand-built IR.
       threshold: ev.threshold ?? 0.7,
       onFail: ev.onFail,
       maxRetries: ev.maxRetries,
       ...escalate,
-      evaluate: async ({ finalText, messages, isSynthetic, bus }) => {
-        const verdict = await gradeWithJudgePanel({
-          rubric,
-          sample: { id: "in-loop-evaluation", input: "" },
-          run: inLoopRunResult({ finalText, messages, isSynthetic }),
-          model,
-          ...(grader.judges !== undefined ? { judges: grader.judges } : {}),
-          ...(grader.repeats !== undefined ? { repeats: grader.repeats } : {}),
-          ...(grader.temperature !== undefined ? { temperature: grader.temperature } : {}),
-          ...(grader.target !== undefined ? { target: grader.target } : {}),
-          ...(grader.params !== undefined ? { params: grader.params } : {}),
-          ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
-          // Judge spend rides the run bus (role "judge") — every panelist and
-          // every repeat publishes its own model_request / model_response.
-          bus,
-        });
-        return {
-          score: verdict.score,
-          rationale: verdict.rationale,
-          judge: {
-            model: verdict.judgeModel,
-            ...(verdict.costUsdMicros !== undefined
-              ? { costUsdMicros: verdict.costUsdMicros }
-              : {}),
-          },
-        };
-      },
+      evaluate: reportUnmeasured(
+        { graderType: "llm_judge", maxRetries: ev.maxRetries, judgeModel },
+        async ({ finalText, messages, isSynthetic, bus }) => {
+          const verdict = await gradeWithJudgePanel({
+            rubric,
+            sample: { id: "in-loop-evaluation", input: "" },
+            run: inLoopRunResult({ finalText, messages, isSynthetic }),
+            model,
+            ...(grader.judges !== undefined ? { judges: grader.judges } : {}),
+            ...(grader.repeats !== undefined ? { repeats: grader.repeats } : {}),
+            ...(grader.temperature !== undefined ? { temperature: grader.temperature } : {}),
+            ...(grader.target !== undefined ? { target: grader.target } : {}),
+            ...(grader.params !== undefined ? { params: grader.params } : {}),
+            ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
+            // Judge spend rides the run bus (role "judge") — every panelist and
+            // every repeat publishes its own model_request / model_response.
+            bus,
+          });
+          return {
+            score: verdict.score,
+            rationale: verdict.rationale,
+            judge: {
+              model: verdict.judgeModel,
+              ...(verdict.costUsdMicros !== undefined
+                ? { costUsdMicros: verdict.costUsdMicros }
+                : {}),
+            },
+          };
+        },
+      ),
     };
   }
   const value = grader.value;
@@ -118,10 +165,13 @@ export function buildRunEvaluation(
       onFail: ev.onFail,
       maxRetries: ev.maxRetries,
       ...escalate,
-      evaluate: async ({ finalText }) =>
-        finalText.includes(value)
-          ? { score: 1, rationale: `output contains "${value}"` }
-          : { score: 0, rationale: `output missing "${value}"` },
+      evaluate: reportUnmeasured(
+        { graderType: "contains", maxRetries: ev.maxRetries },
+        async ({ finalText }) =>
+          finalText.includes(value)
+            ? { score: 1, rationale: `output contains "${value}"` }
+            : { score: 0, rationale: `output missing "${value}"` },
+      ),
     };
   }
   // The pattern was validated compilable at parse time.
@@ -132,11 +182,14 @@ export function buildRunEvaluation(
     onFail: ev.onFail,
     maxRetries: ev.maxRetries,
     ...escalate,
-    evaluate: async ({ finalText }) => {
-      regex.lastIndex = 0;
-      return regex.test(finalText)
-        ? { score: 1, rationale: `output matches /${value}/` }
-        : { score: 0, rationale: `output does not match /${value}/` };
-    },
+    evaluate: reportUnmeasured(
+      { graderType: "regex", maxRetries: ev.maxRetries },
+      async ({ finalText }) => {
+        regex.lastIndex = 0;
+        return regex.test(finalText)
+          ? { score: 1, rationale: `output matches /${value}/` }
+          : { score: 0, rationale: `output does not match /${value}/` };
+      },
+    ),
   };
 }

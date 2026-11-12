@@ -88,6 +88,8 @@
         "@crewhaus/model-router": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
         "@crewhaus/module-marketplace-client": "workspace:*",
+        "@crewhaus/people": "workspace:*",
+        "@crewhaus/people-service": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/pii-redactor": "workspace:*",
         "@crewhaus/plugin-loader": "workspace:*",
@@ -1573,6 +1575,32 @@
       "version": "0.8.0",
       "dependencies": {
         "@crewhaus/trace-event-bus": "workspace:*",
+      },
+    },
+    "packages/people": {
+      "name": "@crewhaus/people",
+      "version": "0.8.0",
+      "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/spec-patch": "workspace:*",
+      },
+    },
+    "packages/people-service": {
+      "name": "@crewhaus/people-service",
+      "version": "0.8.0",
+      "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/people": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/control-service": "workspace:*",
       },
     },
     "packages/permission-engine": {
@@ -4257,6 +4285,10 @@
     "@crewhaus/module-marketplace-client": ["@crewhaus/module-marketplace-client@workspace:packages/module-marketplace-client"],
 
     "@crewhaus/otel-exporter": ["@crewhaus/otel-exporter@workspace:packages/otel-exporter"],
+
+    "@crewhaus/people": ["@crewhaus/people@workspace:packages/people"],
+
+    "@crewhaus/people-service": ["@crewhaus/people-service@workspace:packages/people-service"],
 
     "@crewhaus/permission-engine": ["@crewhaus/permission-engine@workspace:packages/permission-engine"],
 

@@ -16,6 +16,7 @@
  */
 import { type RunIndexEntry, baselineKeyFor, lineageOfEntry } from "./history";
 import { escapeHtml, shell } from "./render";
+import { type Walk, breakBoundaries, segmentSeries } from "./segments";
 
 /** One run on a trend line. */
 export type TrendPoint = {
@@ -171,14 +172,76 @@ export function trendTable(series: ReadonlyArray<TrendSeries>): {
 }
 
 /**
+ * Each series cut where its dataset or measuring instrument changed
+ * (`segmentSeries`), in the order of `series`.
+ */
+export function segmentTrends(
+  series: ReadonlyArray<TrendSeries>,
+  entries: ReadonlyArray<RunIndexEntry>,
+): Walk[] {
+  return series.map((s) => segmentSeries(s, entries));
+}
+
+/** One line per cut: `<label>: instrument changed at <runId> (<field>: a → b) — deltas are per segment`. */
+export function formatTrendBoundaryLines(
+  series: ReadonlyArray<TrendSeries>,
+  segmented: ReadonlyArray<Walk | undefined>,
+): string[] {
+  return series.flatMap((s, i) =>
+    breakBoundaries(segmented[i]?.boundaries ?? []).map(
+      (b) =>
+        `${s.specName}/${trendSeriesLabel(s)}: instrument changed at ${b.toRunId} (${b.changed
+          .map((c) => `${c.field}: ${c.from} → ${c.to}`)
+          .join("; ")}) — deltas are per segment`,
+    ),
+  );
+}
+
+/**
+ * The series as `trends.json` writes them: a series cut by an instrument
+ * change also carries its `segments` and the `boundaries` that cut it. A
+ * series with no cut is written as it is.
+ */
+export function trendsJson(
+  series: ReadonlyArray<TrendSeries>,
+  segmented: ReadonlyArray<Walk | undefined> = [],
+): unknown[] {
+  return series.map((s, i) => {
+    const walk = segmented[i];
+    const cuts = breakBoundaries(walk?.boundaries ?? []);
+    return walk === undefined || cuts.length === 0
+      ? s
+      : { ...s, segments: walk.segments, boundaries: cuts };
+  });
+}
+
+/**
  * The plain-language movement line per series: where the suite started,
  * where it is now, and the delta in percentage POINTS (not percent — a
  * 40%→50% move is +10pp, and calling it "+25%" is how trend charts lie).
- * A single-run series says so instead of inventing a trend.
+ * A single-run series says so instead of inventing a trend. A series cut by
+ * an instrument change reports its last segment's move instead, over the
+ * runs that measured something, since a delta across the cut compares two
+ * instruments.
  */
-export function formatTrendSummaryLines(series: ReadonlyArray<TrendSeries>): string[] {
-  return series.map((s) => {
+export function formatTrendSummaryLines(
+  series: ReadonlyArray<TrendSeries>,
+  segmented: ReadonlyArray<Walk | undefined> = [],
+): string[] {
+  return series.map((s, i) => {
     const head = `trends ${s.specName}/${trendSeriesLabel(s)}:`;
+    const walk = segmented[i];
+    if (walk !== undefined && breakBoundaries(walk.boundaries).length > 0) {
+      const last = walk.segments[walk.segments.length - 1];
+      const trend = last?.trend ?? null;
+      const tail =
+        trend !== null
+          ? `last segment ${trend.fromTs} → ${trend.toTs} · ` +
+            `pass_rate ${pct(trend.passRateStart)} → ${pct(trend.passRateEnd)} (${signed(trend.passRateDeltaPp)}pp) · ` +
+            `mean_score ${trend.meanScoreStart.toFixed(3)} → ${trend.meanScoreEnd.toFixed(3)} (${signed(trend.meanScoreDelta, 3)})`
+          : `last segment: ${last?.trendUnavailable ?? "no trend"}`;
+      return `${head} ${s.points.length} runs in ${walk.segments.length} segments (the instrument changed) · ${tail}`;
+    }
     const first = s.points[0];
     const last = s.points[s.points.length - 1];
     if (first === undefined || last === undefined) return `${head} no runs`;
@@ -238,6 +301,8 @@ function svgChart(opts: {
   readonly series: ReadonlyArray<ChartSeries>;
   readonly max: number;
   readonly yFormat: (v: number) => string;
+  /** Point indices that start a new segment: the line is not drawn into them. */
+  readonly breaks?: ReadonlySet<number>;
 }): string {
   const n = opts.xLabels.length;
   const innerW = CHART_W - PAD_L - PAD_R;
@@ -272,6 +337,7 @@ function svgChart(opts: {
       let d = "";
       let open = false;
       s.values.forEach((v, i) => {
+        if (opts.breaks?.has(i) === true) open = false;
         if (v === undefined) {
           open = false;
           return;
@@ -347,7 +413,10 @@ const COST_COLOR = "#b26a00";
  * honestly), an optional cost chart when any run in the series was priced,
  * and the run table underneath. Self-contained — no external assets.
  */
-export function renderTrends(series: ReadonlyArray<TrendSeries>): string {
+export function renderTrends(
+  series: ReadonlyArray<TrendSeries>,
+  segmented: ReadonlyArray<Walk | undefined> = [],
+): string {
   if (series.length === 0) {
     return shell(
       "crewhaus eval trends",
@@ -355,11 +424,16 @@ export function renderTrends(series: ReadonlyArray<TrendSeries>): string {
     );
   }
   const sections = series
-    .map((s) => {
+    .map((s, i) => {
       const xLabels = s.points.map((p) => p.ts.slice(0, 16).replace("T", " "));
+      // Where the instrument changed, the line stops and starts again.
+      const cuts = breakBoundaries(segmented[i]?.boundaries ?? []);
+      const cutAt = new Set(cuts.map((b) => s.points.findIndex((p) => p.runId === b.toRunId)));
+      const breaks = cuts.length > 0 ? { breaks: cutAt } : {};
       const quality = svgChart({
         xLabels,
         max: 1,
+        ...breaks,
         yFormat: (v) => `${(v * 100).toFixed(0)}%`,
         series: [
           { label: "pass rate", color: PASS_COLOR, values: s.points.map((p) => p.passRate) },
@@ -373,6 +447,7 @@ export function renderTrends(series: ReadonlyArray<TrendSeries>): string {
           ? `<h3>cost per run</h3>${svgChart({
               xLabels,
               max: maxCost,
+              ...breaks,
               yFormat: (v) => `$${v.toFixed(4)}`,
               series: [{ label: "est. cost (agent)", color: COST_COLOR, values: costs }],
             })}`
@@ -383,10 +458,13 @@ export function renderTrends(series: ReadonlyArray<TrendSeries>): string {
           .map((h) => `<th>${escapeHtml(h)}</th>`)
           .join("")}</tr></thead><tbody>` +
         `${rows.map((r) => `<tr>${r.map((c) => `<td>${escapeHtml(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
-      const summary = formatTrendSummaryLines([s])[0] ?? "";
+      const summary = formatTrendSummaryLines([s], [segmented[i]])[0] ?? "";
+      const cutNotes = formatTrendBoundaryLines([s], [segmented[i]])
+        .map((line) => `<p class="meta">${escapeHtml(line)}</p>`)
+        .join("");
       return (
         `<section class="trend"><h2>${escapeHtml(`${s.specName} / ${trendSeriesLabel(s)}`)}</h2>` +
-        `<p class="meta">${escapeHtml(summary)}</p>${quality}${costChart}${table}</section>`
+        `<p class="meta">${escapeHtml(summary)}</p>${cutNotes}${quality}${costChart}${table}</section>`
       );
     })
     .join("\n");

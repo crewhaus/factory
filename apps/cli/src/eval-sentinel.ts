@@ -30,7 +30,14 @@
  * the fresh run + baseline load are performed by the caller and passed in as
  * `LoadedRun`s, so the drift logic is unit-testable with seeded run dirs.
  */
-import { type LoadedRun, type ReportDiff, ReportError, diffReports } from "@crewhaus/eval-report";
+import {
+  type LoadedRun,
+  type ReportDiff,
+  ReportError,
+  diffReports,
+  formatInstrumentChange,
+  instrumentChanges,
+} from "@crewhaus/eval-report";
 
 export type SentinelVerdict = "clean" | "drift" | "not-comparable";
 
@@ -50,9 +57,10 @@ export type SentinelResult = {
  * caller hashes the dataset file/registry record and passes both in.
  *
  * Verdicts:
- *   - `not-comparable` (alert): specHash, dataset-hash, judgeModel, or
- *     gradersHash differs — the spec, the sentinel data, or what "pass" means
- *     changed, so a diff cannot be attributed to the provider. Loud, not
+ *   - `not-comparable` (alert): specHash, dataset-hash, judgeModel,
+ *     gradersHash, the judge calibration or the plugin graders' code differs —
+ *     the spec, the sentinel data, or what "pass" means changed, so a diff
+ *     cannot be attributed to the provider. Loud, not
  *     silent: a mis-pointed sentinel must not read green. Likewise when
  *     EITHER run is budget-aborted (`summary.partial`, NEW-HUNT-3): its
  *     unexecuted samples were recorded as synthetic errors by the harness
@@ -108,6 +116,23 @@ export function evaluateSentinel(opts: {
       verdict: "not-comparable",
       alert: true,
       reason: `graders config changed since the baseline (gradersHash ${short(baseGradersHash)} → ${short(curGradersHash)}) — a sentinel probe requires byte-identical graders; re-pin the baseline against the current graders.yaml`,
+    };
+  }
+  // The rest of the instrument: the judge calibration and the plugin graders'
+  // code also change what "pass" means without touching the provider.
+  const otherInstrument = instrumentChanges(opts.baseline.summary, opts.current.summary).find(
+    (c) =>
+      c.unverified !== true && (c.field === "calibrationDigest" || c.field === "pluginsDigest"),
+  );
+  if (otherInstrument !== undefined) {
+    const what =
+      otherInstrument.field === "calibrationDigest"
+        ? "judge calibration changed since the baseline"
+        : "plugin grader code changed since the baseline";
+    return {
+      verdict: "not-comparable",
+      alert: true,
+      reason: `${what} (${formatInstrumentChange(otherInstrument)}) — a sentinel probe requires an unchanged measuring instrument; re-pin the baseline against the current ${otherInstrument.field === "calibrationDigest" ? "calibration" : "plugin graders"}`,
     };
   }
 

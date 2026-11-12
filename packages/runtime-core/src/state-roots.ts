@@ -22,7 +22,9 @@
  *   `crewhaus hangar` keeps its token and settings) and registry file.
  * - The records a harness's gates and janitors keep: the deploy approvals and
  *   environments, the graders, the judge calibration, the evals, datasets,
- *   retention pins, audit trail, graph checkpoints and advice.
+ *   retention pins, audit trail, graph checkpoints, advice, the knowledge-sync
+ *   marker, the staged proposals, the routing freeze marker, the scope-audit
+ *   baseline and the security corpus.
  * - The operator's configuration in the working directory: the environment
  *   files Bun loads there, any file `manager.envFiles` declares, and the
  *   `bunfig.toml` and `.npmrc` there.
@@ -86,6 +88,15 @@ const GATE_RECORDS: readonly string[] = [
   join(".crewhaus", "cloud"),
   // The knowledge-sync marker: exactly that file.
   join(".crewhaus", "knowledge.json"),
+  // The proposals `crewhaus propose` and Home stage for a person to adopt.
+  join(".crewhaus", "proposals"),
+  // The routing freeze marker `crewhaus route freeze` pins: exactly that file.
+  join(".crewhaus", "routing", "freeze.json"),
+  // The scope-audit baseline `doctor --philosophy-alignment --accept-baseline`
+  // writes: exactly that file.
+  join(".crewhaus", "scope-audit", "baseline.json"),
+  // The rule corpus `crewhaus security corpus` writes: exactly that file.
+  join(".crewhaus", "security-corpus", "corpus.json"),
 ];
 
 /** Where the durable-execution idempotency store keeps its records by default. */
@@ -478,7 +489,10 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   records a harness's gates and janitors keep; the environment files Bun
  *   loads from there; and its `bunfig.toml` and `.npmrc`. These hold at every
  *   working directory, with or without a spec. Exact files stay exact: a
- *   neighbour such as `.env.example` or `.crewhaus/graders.yaml` is not one.
+ *   neighbour such as `.env.example` or `.crewhaus/graders.yaml` is not one,
+ *   and neither is the routing store's scoreboard beside the freeze marker,
+ *   a dated scope audit beside its baseline, or a candidate file beside the
+ *   security corpus.
  * - The approvals file beside session logs a session directory puts at the
  *   working directory or above it. The record's group leaves such a root to
  *   the rules; this one file stays protected. A default run adds nothing.

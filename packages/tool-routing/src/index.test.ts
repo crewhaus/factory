@@ -1602,14 +1602,18 @@ for (const [state, settings] of [
 
   test(`RouteControl refuses a routing file that leads to a settings file ${state}`, async () => {
     seedSettings();
-    for (const leaf of ["freeze.json", "freeze.json.tmp", "arms.jsonl", "arms.jsonl.tmp"]) {
+    // Each action is refused for a link at a file it writes: freeze at the
+    // marker, compact at the scoreboard.
+    for (const [leaf, input] of [
+      ["freeze.json", { action: "freeze", policyVersion: "p" }],
+      ["freeze.json.tmp", { action: "freeze", policyVersion: "p" }],
+      ["arms.jsonl", { action: "compact" }],
+      ["arms.jsonl.tmp", { action: "compact" }],
+      ["priors.json", { action: "compact" }],
+    ] as const) {
       linkTo(`fleet/other/.crewhaus/routing/${leaf}`, SETTINGS_REL);
       for (const dryRun of [true, false]) {
-        await refusedOnFloor(
-          routeControl,
-          { action: "freeze", dir: "fleet/other", policyVersion: "p", dryRun },
-          SETTINGS_REL,
-        );
+        await refusedOnFloor(routeControl, { ...input, dir: "fleet/other", dryRun }, SETTINGS_REL);
       }
       rmSync(path.join(tmp, "fleet/other/.crewhaus/routing", leaf));
     }
@@ -1630,4 +1634,48 @@ test("what only reads through those names, and a write elsewhere, go on with tho
   const status = await run(routeControl, { action: "status", dir: "fleet/other" });
   expect(String(status["reason"])).not.toContain("where the runtime keeps its own record");
   expect(readFileSync(path.join(tmp, SETTINGS_REL), "utf8")).toBe(SETTINGS_BYTES);
+});
+
+// ---------------------------------------------------------------------------
+// the freeze marker as a floor root
+// ---------------------------------------------------------------------------
+
+test("freeze and unfreeze are refused while the freeze marker is a floor root; status, promote and compact run", async () => {
+  seedArms();
+  const markerCtx = { bridge: { protectedRoots: [".crewhaus/routing/freeze.json"] } };
+  const run = async (input: unknown): Promise<Json> =>
+    JSON.parse(String(await routeControl.execute(input as never, markerCtx as never))) as Json;
+  const marker = path.join(tmp, ".crewhaus", "routing", "freeze.json");
+
+  // No marker yet: freeze writes nothing and names the CLI verbs.
+  for (const input of [
+    { action: "freeze", policyVersion: "pv-1", dryRun: false },
+    { action: "freeze", policyVersion: "pv-1" },
+    { action: "unfreeze", dryRun: false },
+  ]) {
+    const out = await run(input);
+    expect({ input, status: out["status"] }).toEqual({ input, status: "refused" });
+    expect(String(out["reason"])).toContain("where the runtime keeps its own record");
+    expect(String(out["reason"])).toContain("`crewhaus route freeze <policyVersion>`");
+    expect(String(out["reason"])).toContain("`crewhaus route freeze --clear`");
+    expect(existsSync(marker)).toBe(false);
+  }
+
+  // The store's other files are not the marker: these run.
+  const before = readFileSync(path.join(tmp, ARMS), "utf8");
+  expect((await run({ action: "status" }))["status"]).not.toBe("refused");
+  expect((await run({ action: "promote" }))["status"]).toBe("preview");
+  expect((await run({ action: "compact" }))["status"]).toBe("preview");
+  expect(readFileSync(path.join(tmp, ARMS), "utf8")).toBe(before);
+
+  // A marker that exists keeps its bytes.
+  writeFileSync(marker, '{"policyVersion":"pv-0","frozenAt":"2026-01-01T00:00:00.000Z"}\n');
+  const bytes = readFileSync(marker, "utf8");
+  for (const input of [
+    { action: "unfreeze", dryRun: false },
+    { action: "freeze", policyVersion: "pv-2", dryRun: false },
+  ]) {
+    expect((await run(input))["status"]).toBe("refused");
+    expect(readFileSync(marker, "utf8")).toBe(bytes);
+  }
 });

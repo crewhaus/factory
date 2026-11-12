@@ -290,10 +290,15 @@ export async function runSample(args: {
   // ran). Note this deliberately also overrides an `any`-combine pass: with
   // an abstaining judge on the panel the combined verdict is still built on
   // an unknown, and a human confirming costs less than a wrong pass.
+  //
+  // A result state from the combine (not measured, skipped, observing) wins
+  // over abstention; the rule above runs over the entries without a status.
+  const unstated = perGrader.filter((g) => g.status === undefined);
   const sampleAbstained =
     error === undefined &&
-    perGrader.some((g) => g.abstained === true) &&
-    perGrader.every((g) => g.abstained === true || g.passed);
+    combined.status === undefined &&
+    unstated.some((g) => g.abstained === true) &&
+    unstated.every((g) => g.abstained === true || g.passed);
   // A2 — a high-entropy judge-panel vote (`needsReview` on a perGrader
   // entry) flags the SAMPLE for human review without touching its verdict:
   // the pass/fail is real (unlike abstention) and stays in the pass-rate
@@ -301,7 +306,10 @@ export async function runSample(args: {
   // needs-review bucket beside the abstained needs-human one. An abstained
   // outcome wins over the flag (the sample already routes to needs-human).
   const sampleNeedsReview =
-    error === undefined && !sampleAbstained && perGrader.some((g) => g.needsReview === true);
+    error === undefined &&
+    !sampleAbstained &&
+    combined.status === undefined &&
+    perGrader.some((g) => g.needsReview === true);
   const overall: GradeResult = sampleAbstained
     ? { ...combined, passed: false, score: 0, abstained: true }
     : sampleNeedsReview
@@ -315,7 +323,8 @@ export async function runSample(args: {
   // `"error"` verdict (the run never produced a gradeable output); an A3
   // abstained sample is a `"skip"` (needs-human, not a graded fail — keeping
   // bus consumers consistent with the aggregates, which drop abstained
-  // samples from the pass-rate denominator); otherwise the combined
+  // samples from the pass-rate denominator), and so is a sample that was not
+  // measured, skipped or only observed; otherwise the combined
   // `overall.passed` maps to `pass`/`fail`. Additive: it does NOT touch the
   // already-persisted events.jsonl / metrics / aggregates — it is a bus emit
   // on the (optionally shared) run context.
@@ -324,7 +333,13 @@ export async function runSample(args: {
     kind: "test_verdict",
     testId: sample.id,
     verdict:
-      error !== undefined ? "error" : sampleAbstained ? "skip" : overall.passed ? "pass" : "fail",
+      error !== undefined
+        ? "error"
+        : sampleAbstained || overall.status !== undefined
+          ? "skip"
+          : overall.passed
+            ? "pass"
+            : "fail",
     reason: overall.rationale,
     durationMs: latencyMs,
   };
@@ -441,6 +456,127 @@ function computeMetrics(
 }
 
 /**
+ * The sample's overall grade. With no entry carrying a
+ * {@link GradeResult.status} (or with an invoker error, which fails the sample
+ * ahead of everything), exactly {@link combineVerdicts}. Otherwise the combine
+ * is three-valued:
+ *
+ * - `report` entries, and entries that are `skipped` or `observing`, are
+ *   recorded in `perGrader` and set aside;
+ * - `all` and the requirements: any measured fail fails; else any
+ *   `not_measured` entry makes the sample not measured; else it passes;
+ * - `any`: any measured pass passes; else any `not_measured` entry makes the
+ *   sample not measured; else it fails;
+ * - `weighted`: any `not_measured` weighted entry makes the sample not
+ *   measured; else the weighted score over the measured entries decides;
+ * - when every enforced entry is set aside, the sample is `observing` if any
+ *   of them observed, and `skipped` (`out_of_scope`) otherwise.
+ *
+ * A sample without a verdict carries `passed: false` and `score: 0` as
+ * placeholders, and the not-measured reason of its first not-measured entry.
+ * The rationale lists every entry as {@link combineVerdicts} does.
+ */
+function combineOverall(
+  perGrader: ReadonlyArray<{ name: string } & GradeResult>,
+  graders: ReadonlyArray<GraderEntry>,
+  policy: GraderCombinePolicy | undefined,
+  error: string | undefined,
+): GradeResult {
+  const verdicts = combineVerdicts(perGrader, graders, policy, error);
+  if (error !== undefined || perGrader.every((g) => g.status === undefined)) return verdicts;
+
+  type Entry = { readonly result: { name: string } & GradeResult; readonly weight: number };
+  const own: Entry[] = [];
+  const required: Entry[] = [];
+  perGrader.forEach((result, i) => {
+    const role = graders[i]?.role;
+    const entry = { result, weight: graders[i]?.weight ?? 1 };
+    if (role === undefined) own.push(entry);
+    else if (role === "requirement") required.push(entry);
+  });
+  const enforced = [...own, ...required];
+  if (enforced.length === 0) return verdicts;
+  const setAside = (e: Entry): boolean =>
+    e.result.status === "skipped" || e.result.status === "observing";
+  const ownVoting = own.filter((e) => !setAside(e));
+  const requiredVoting = required.filter((e) => !setAside(e));
+  const placeholder = { passed: false, score: 0, rationale: verdicts.rationale } as const;
+  if (ownVoting.length === 0 && requiredVoting.length === 0) {
+    return enforced.some((e) => e.result.status === "observing")
+      ? { ...placeholder, status: "observing" }
+      : { ...placeholder, status: "skipped", statusReason: "out_of_scope" };
+  }
+
+  type Outcome = "pass" | "fail" | "not_measured";
+  const notMeasured = (e: Entry): boolean => e.result.status === "not_measured";
+  const and = (entries: ReadonlyArray<Entry>): Outcome =>
+    entries.some((e) => !notMeasured(e) && !e.result.passed)
+      ? "fail"
+      : entries.some(notMeasured)
+        ? "not_measured"
+        : "pass";
+  const mean = (xs: ReadonlyArray<number>): number =>
+    xs.length === 0 ? 0 : xs.reduce((a, b) => a + b, 0) / xs.length;
+
+  let ownOutcome: Outcome | undefined;
+  let ownScore = 0;
+  if (ownVoting.length > 0) {
+    const measured = ownVoting.filter((e) => !notMeasured(e));
+    switch (policy?.mode ?? "all") {
+      case "any":
+        ownOutcome = measured.some((e) => e.result.passed)
+          ? "pass"
+          : ownVoting.some(notMeasured)
+            ? "not_measured"
+            : "fail";
+        ownScore = measured.length === 0 ? 0 : Math.max(...measured.map((e) => e.result.score));
+        break;
+      case "weighted": {
+        const totalWeight = ownVoting.reduce((sum, e) => sum + e.weight, 0);
+        ownScore =
+          totalWeight === 0
+            ? 0
+            : ownVoting.reduce((sum, e) => sum + e.result.score * e.weight, 0) / totalWeight;
+        ownOutcome = ownVoting.some(notMeasured)
+          ? "not_measured"
+          : ownScore >= (policy?.passingThreshold ?? 0.5)
+            ? "pass"
+            : "fail";
+        break;
+      }
+      default:
+        ownOutcome = and(ownVoting);
+        ownScore = mean(measured.map((e) => e.result.score));
+    }
+  }
+  const requiredOutcome = requiredVoting.length > 0 ? and(requiredVoting) : undefined;
+  const outcomes = [ownOutcome, requiredOutcome].filter((o): o is Outcome => o !== undefined);
+  const outcome: Outcome = outcomes.includes("fail")
+    ? "fail"
+    : outcomes.includes("not_measured")
+      ? "not_measured"
+      : "pass";
+  if (outcome === "not_measured") {
+    const first = [...ownVoting, ...requiredVoting]
+      .map((e) => e.result)
+      .find((g) => g.status === "not_measured");
+    return {
+      ...placeholder,
+      status: "not_measured",
+      ...(first?.statusReason !== undefined ? { statusReason: first.statusReason } : {}),
+    };
+  }
+  const measuredRequired = requiredVoting.filter((e) => !notMeasured(e));
+  const score =
+    ownVoting.length > 0
+      ? ownScore
+      : measuredRequired.length === 0
+        ? 0
+        : measuredRequired.filter((e) => e.result.passed).length / measuredRequired.length;
+  return { passed: outcome === "pass", score, rationale: verdicts.rationale };
+}
+
+/**
  * 0.8.0 §9.1 — the sample's overall grade when some entries carry a
  * {@link GraderEntry.role}: the `combine:` policy over the role-less entries
  * (the user's own graders), AND-ed with every `"requirement"` entry's pass;
@@ -449,7 +585,7 @@ function computeMetrics(
  * number, never a mean over scores of different scales and directions).
  * No role anywhere ⇒ exactly {@link combinePolicy}, byte for byte.
  */
-function combineOverall(
+function combineVerdicts(
   perGrader: ReadonlyArray<{ name: string } & GradeResult>,
   graders: ReadonlyArray<GraderEntry>,
   policy: GraderCombinePolicy | undefined,

@@ -107,10 +107,13 @@ export {
   type TrendPoint,
   type TrendSeries,
   buildTrends,
+  formatTrendBoundaryLines,
   formatTrendSummaryLines,
   renderTrends,
+  segmentTrends,
   trendSeriesLabel,
   trendTable,
+  trendsJson,
 } from "./trends";
 // C32 — flat per-sample × per-grader export across runs (csv / jsonl).
 export {
@@ -135,9 +138,11 @@ export {
   DEFAULT_EVALS_DIR,
   INDEX_FILENAME,
   ROUTED_LINEAGE_SEGMENT,
+  type RebaselineReason,
   type RecordEvalRunOptions,
   type RunIndexEntry,
   appendRunIndex,
+  calibrationDigestOf,
   HistoryWriteError,
   baselineKey,
   baselineKeyFor,
@@ -151,6 +156,7 @@ export {
   lookupBaseline,
   parseBaselines,
   parseRunIndex,
+  pinnedUnder,
   readBaselines,
   readRunIndex,
   readRunIndexLatest,
@@ -168,6 +174,7 @@ export {
   type PinOptions,
   type PinOutcome,
   type PinRefusal,
+  manualRebaseline,
   measurementProblem,
   pinFromIndexEntry,
   pinRefusal,
@@ -182,3 +189,48 @@ export {
   runStatsOf,
   sampleRowsOf,
 } from "./run-rows";
+// What a run measured, and how it stands against the present.
+export {
+  type RunState,
+  type Staleness,
+  runState,
+  sampleMeasured,
+  staleness,
+} from "./run-state";
+// The measuring instrument and the one rule for when it changed.
+export {
+  INSTRUMENT_FIELDS,
+  type Instrument,
+  type InstrumentChange,
+  type InstrumentField,
+  type InstrumentSource,
+  formatInstrumentChange,
+  instrumentChanges,
+  instrumentOf,
+} from "./instrument";
+// Whether a run can be gated against its baseline, and on which cases.
+export {
+  type CaseDigests,
+  type Comparability,
+  type ComparabilityRule,
+  comparability,
+  lostMeasurement,
+  measuredInBaseline,
+  readCaseDigests,
+  unmeasurableRun,
+} from "./comparability";
+// Trends cut where the dataset or the instrument changed.
+export {
+  type Boundary,
+  type FieldChange,
+  type FieldUnverified,
+  SEGMENT_FIELDS,
+  type Segment,
+  type SegmentField,
+  type SegmentPoint,
+  type SegmentTrend,
+  type Walk,
+  breakBoundaries,
+  segmentRuns,
+  segmentSeries,
+} from "./segments";
