@@ -6284,6 +6284,219 @@
       ]
     },
     {
+      "verb": "people",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "sub": {
+        "init": {
+          "flags": [
+            {
+              "name": "custody",
+              "takesValue": true
+            },
+            {
+              "name": "backup-days",
+              "takesValue": true
+            }
+          ]
+        },
+        "keys": {
+          "flags": [
+            {
+              "name": "rotate",
+              "takesValue": false
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "list": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "add": {
+          "flags": [
+            {
+              "name": "kind",
+              "takesValue": true
+            },
+            {
+              "name": "describes",
+              "takesValue": true
+            },
+            {
+              "name": "basis",
+              "takesValue": true
+            },
+            {
+              "name": "variation",
+              "takesValue": true
+            },
+            {
+              "name": "size",
+              "takesValue": true
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "set": {
+          "flags": [
+            {
+              "name": "off-limits",
+              "takesValue": true,
+              "repeatable": true
+            },
+            {
+              "name": "allow",
+              "takesValue": true,
+              "repeatable": true
+            },
+            {
+              "name": "viewer",
+              "takesValue": true,
+              "repeatable": true
+            },
+            {
+              "name": "remove-viewer",
+              "takesValue": true,
+              "repeatable": true
+            },
+            {
+              "name": "rename",
+              "takesValue": false
+            }
+          ]
+        },
+        "note": {
+          "flags": [
+            {
+              "name": "area",
+              "takesValue": true
+            },
+            {
+              "name": "type",
+              "takesValue": true
+            },
+            {
+              "name": "purpose",
+              "takesValue": true,
+              "repeatable": true
+            },
+            {
+              "name": "sensitivity",
+              "takesValue": true
+            },
+            {
+              "name": "confidence",
+              "takesValue": true
+            },
+            {
+              "name": "review-by",
+              "takesValue": true
+            }
+          ]
+        },
+        "edit": {
+          "flags": [
+            {
+              "name": "expect",
+              "takesValue": true
+            }
+          ]
+        },
+        "review": {
+          "flags": [
+            {
+              "name": "as",
+              "takesValue": true
+            },
+            {
+              "name": "purpose",
+              "takesValue": true,
+              "repeatable": true
+            },
+            {
+              "name": "into",
+              "takesValue": true
+            }
+          ]
+        },
+        "export": {
+          "flags": [
+            {
+              "name": "out",
+              "takesValue": true
+            },
+            {
+              "name": "area",
+              "takesValue": true,
+              "repeatable": true
+            },
+            {
+              "name": "purpose",
+              "takesValue": true,
+              "repeatable": true
+            },
+            {
+              "name": "include-sensitive",
+              "takesValue": false
+            },
+            {
+              "name": "no-rejected",
+              "takesValue": false
+            },
+            {
+              "name": "summary",
+              "takesValue": false
+            },
+            {
+              "name": "dry-run",
+              "takesValue": false
+            },
+            {
+              "name": "force",
+              "takesValue": false
+            }
+          ]
+        },
+        "activity": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "limit",
+              "takesValue": true
+            }
+          ]
+        },
+        "erase": {
+          "flags": [
+            {
+              "name": "dry-run",
+              "takesValue": false
+            }
+          ]
+        }
+      },
+      "flags": null
+    },
+    {
       "verb": "permissions",
       "kind": "legacy",
       "since": "0.8.0",

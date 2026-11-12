@@ -249,6 +249,11 @@ const accessNeedsFlags = (sub: string, flags: readonly string[]): Requirement =>
   ],
 });
 
+const peopleNeedsOne = (sub: string, what: string): Requirement => ({
+  positionals: { min: 1, max: 1 },
+  pins: [{ file: "people-cmd.ts", text: `exactlyOne("${sub}", args, "${what}")` }],
+});
+
 /**
  * The commands that parse but refuse to start without more, keyed by
  * `verb` or `verb sub`. A command shown in Home that misses one of these
@@ -365,6 +370,26 @@ export const REQUIRED: Readonly<Record<string, Requirement>> = {
       { file: "access-cmd.ts", text: '"access unlink: name a link id' },
     ],
   },
+  "people add": {
+    positionals: { max: 0 },
+    flags: ["kind"],
+    pins: [{ file: "people-cmd.ts", text: 'requireValue("add", args, "kind")' }],
+  },
+  "people show": peopleNeedsOne("show", "<psn_…>"),
+  "people set": peopleNeedsOne("set", "<psn_…>"),
+  "people note": {
+    positionals: { min: 1, max: 1 },
+    flags: ["area"],
+    pins: [
+      { file: "people-cmd.ts", text: 'exactlyOne("note", args, "<psn_…>")' },
+      { file: "people-cmd.ts", text: 'requireValue("note", args, "area")' },
+    ],
+  },
+  "people edit": peopleNeedsOne("edit", "<pcl_…>"),
+  "people review": peopleNeedsOne("review", "a profile (psn_…) or a note (pcl_…)"),
+  "people export": peopleNeedsOne("export", "<psn_…>"),
+  "people activity": peopleNeedsOne("activity", "<psn_…>"),
+  "people erase": peopleNeedsOne("erase", "<psn_…>"),
 };
 
 /** Why `given` falls short of what `key` needs, or null. */

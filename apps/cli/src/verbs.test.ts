@@ -122,7 +122,7 @@ describe("the inventory is the dispatch", () => {
       if (families.includes(verb)) continue;
       expect(`${file}: ${!labels.includes(verb) || legacy.includes(verb)}`).toBe(`${file}: true`);
     }
-    expect(families.sort()).toEqual(["access", "daemon", "hangar", "harness"]);
+    expect(families.sort()).toEqual(["access", "daemon", "hangar", "harness", "people"]);
     expect(LEGACY_VERBS.length, "a new verb is a `<verb>-cmd.ts` module exporting CLI_FAMILY").toBe(
       LEGACY_COUNT,
     );
@@ -242,8 +242,8 @@ describe("every flag list answers --help", () => {
         }
       }
     }
-    expect(asked).toBe(2 * (12 + 5 + 8 + 10));
-  }, 20_000); // four modules' imports and seventy calls; slow on a loaded runner
+    expect(asked).toBe(2 * (12 + 5 + 8 + 10 + 12));
+  }, 30_000); // five modules' imports and ninety-four calls; slow on a loaded runner
 });
 
 describe("family parsers take their flags from CLI_FAMILY", () => {

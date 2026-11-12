@@ -57,9 +57,16 @@ export type AuthorizeOptions = {
   readonly domains?: ReadonlyMap<string, DomainChecker>;
 };
 
-/** The prefixes of the core vocabulary (`home`, `h`, `self`): never a domain's. */
+/**
+ * The prefixes of the core vocabulary (`home`, `h`, `self`): never a domain's. A prefix is
+ * core when some role can hold one of its permissions. A prefix whose every permission has
+ * floor `none` (`people`) is a domain's, even when its permissions are declared, so a
+ * permission that no role holds is decided only by its domain's checker.
+ */
 export const CORE_PERMISSION_PREFIXES: ReadonlySet<string> = new Set(
-  PERMISSIONS.map((permission) => permission.split(".")[0] as string),
+  PERMISSIONS.filter((permission) => PERMISSION_DECLS[permission].floor !== "none").map(
+    (permission) => permission.split(".")[0] as string,
+  ),
 );
 
 const rank = (role: Role): number => ROLES.indexOf(role);
@@ -186,6 +193,25 @@ function authorizeService(
     : refuse(permission, null);
 }
 
+/**
+ * The role a refusal reports: for a declared permission, the role at its declared scope, as
+ * `authorizeMember` reports it (a home permission's role is the home grant's, and a harness
+ * permission has none on the home target); for any other, the role on the target.
+ */
+function roleAt(
+  snapshot: AccessSnapshot,
+  principal: string,
+  permission: string,
+  target: AccessTarget,
+  now: number,
+): Role | null {
+  if (!isPermission(permission)) return effectiveRole(snapshot, principal, target, now);
+  if (PERMISSION_DECLS[permission].scope === "home") {
+    return effectiveRole(snapshot, principal, { scope: "home" }, now);
+  }
+  return target.scope === "harness" ? effectiveRole(snapshot, principal, target, now) : null;
+}
+
 /** `<name>` of a permission `<name>.…` whose prefix is not a core one, else `undefined`. */
 export function domainOf(permission: string): string | undefined {
   const dot = permission.indexOf(".");
@@ -216,7 +242,9 @@ export function authorize(
   // System actors and unknown or removed principals hold nothing.
   if (principal === undefined || principal.state !== "active") return refuse(permission, null);
   const memberRole =
-    principal.kind === "member" ? effectiveRole(snapshot, principal.id, target, options.now) : null;
+    principal.kind === "member"
+      ? roleAt(snapshot, principal.id, permission, target, options.now)
+      : null;
   const domain = domainOf(permission);
   if (domain !== undefined) {
     const checker = options.domains?.get(domain);

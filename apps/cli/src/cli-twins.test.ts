@@ -33,7 +33,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
-import { CLI_VERBS, COMMAND_KINDS, OPERATIONS, renderTwin } from "@crewhaus/control-contract";
+import {
+  CLI_VERBS,
+  COMMAND_KINDS,
+  OPERATIONS,
+  mintId,
+  renderTwin,
+} from "@crewhaus/control-contract";
 import {
   M3_ROUTES,
   actionCliTwins,
@@ -199,8 +205,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(26);
-    expect(pins).toBe(37);
+    expect(Object.keys(REQUIRED).length).toBe(35);
+    expect(pins).toBe(47);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -301,16 +307,27 @@ describe("the server's twins, by import", () => {
     let pairs = 0;
     for (const [noun, verbs] of Object.entries(CLI_VERBS)) {
       for (const verb of verbs) {
-        // The vocabulary a twin may start with; a verb that takes an argument gets one.
-        const args = " <arg>".repeat(REQUIRED[`${noun} ${verb}`]?.positionals?.min ?? 0);
+        // The vocabulary a twin may start with; a verb that takes an argument gets one,
+        // and a flag it cannot start without gets that flag.
+        const need = REQUIRED[`${noun} ${verb}`];
+        const args = [
+          " <arg>".repeat(need?.positionals?.min ?? 0),
+          ...(need?.flags ?? []).map((flag) => ` --${flag} <arg>`),
+        ].join("");
         expectRunnable(`CLI_VERBS ${noun}`, `crewhaus ${noun} ${verb}${args}`);
         pairs++;
       }
     }
-    expect(pairs).toBeGreaterThanOrEqual(9);
+    expect(pairs).toBeGreaterThanOrEqual(20);
   });
 
   test("operations, command kinds and the route table's core twins, both choices", () => {
+    const PEOPLE = {
+      psn: mintId("psn"),
+      pcl: mintId("pcl"),
+      kind: "audience",
+      area: "communication",
+    };
     const SAMPLES = [
       {
         hrn: "hrn_0123456789abcdef",
@@ -318,6 +335,8 @@ describe("the server's twins, by import", () => {
         dir: "/srv/poly",
         choice: "grant",
         dep: "dep_01m76e6f05hp514w9j4v3qymka",
+        ...PEOPLE,
+        verdict: "keep",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -325,6 +344,8 @@ describe("the server's twins, by import", () => {
         dir: "/srv/poly",
         choice: "deny",
         dep: "dep_01m76e6f05hp514w9j4v3qymka",
+        ...PEOPLE,
+        verdict: "reopen",
       },
     ];
     const twins = [
@@ -344,8 +365,8 @@ describe("the server's twins, by import", () => {
         checked++;
       }
     }
-    // Ten operation twins, six command kinds and eight route rows, each rendered twice.
-    expect(checked).toBeGreaterThanOrEqual(48);
+    // Twenty-three operation twins, thirteen command kinds and eight route rows, each rendered twice.
+    expect(checked).toBeGreaterThanOrEqual(88);
   });
 });
 

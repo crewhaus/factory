@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../control-contract" },
+    { "path": "../people" },
+    { "path": "../spec-patch" },
+    { "path": "../tool-safety" }
+  ],
+  "include": ["src/**/*"]
+}

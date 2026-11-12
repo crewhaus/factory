@@ -304,6 +304,8 @@
     { "path": "./packages/control-contract" },
     { "path": "./packages/control-records" },
     { "path": "./packages/control-service" },
+    { "path": "./packages/people" },
+    { "path": "./packages/people-service" },
     { "path": "./apps/cli" }
   ]
 }

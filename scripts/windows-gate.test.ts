@@ -20,6 +20,8 @@ const WINDOWS_CONTROL_PLANE = [
   "hangar-server",
   "control-records",
   "control-service",
+  "people",
+  "people-service",
 ] as const;
 
 type Workflow = { jobs: Record<string, { steps?: { run?: string }[] }> };

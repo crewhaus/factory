@@ -881,7 +881,21 @@ describe("rows, pinned", () => {
 describe("path params", () => {
   test("the set is closed, and every param a row names is in it", () => {
     expect(Object.keys(PATH_PARAMS).sort()).toEqual(
-      ["cmd", "crd", "dep", "dev", "grt", "h", "inv", "lnk", "ref", "rule", "run"].sort(),
+      [
+        "cmd",
+        "crd",
+        "dep",
+        "dev",
+        "grt",
+        "h",
+        "inv",
+        "lnk",
+        "ref",
+        "rule",
+        "run",
+        "psn",
+        "pcl",
+      ].sort(),
     );
     expect(isPathParam("nope", ["x"])).toBe(false);
     expect(isPathParam("constructor", ["x"])).toBe(false);
