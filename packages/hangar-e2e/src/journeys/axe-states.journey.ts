@@ -28,6 +28,7 @@ export const axeStates: Journey = {
     const rows: Record<string, Record<string, number>> = {};
     const samples: Record<string, Readonly<Record<string, readonly string[]>>> = {};
     const notRun: string[] = [];
+    const strays: string[] = [];
     let version = "";
     for (const theme of GATE_THEMES) {
       for (const width of GATE_WIDTHS) {
@@ -40,6 +41,13 @@ export const axeStates: Journey = {
         await mockRefusals(session.page, world.harness.id);
         for (const state of states) {
           await enterState(session, state);
+          // A value that was never there, drawn as a word, is a broken state too.
+          const stray = /^(null|undefined|\[object Object\])$/m.exec(
+            await session.page.locator("body").innerText(),
+          );
+          if (stray !== null) {
+            strays.push(`${state.template}>${state.state} ${theme} ${width}: "${stray[0]}"`);
+          }
           const result = await runAxe(session.page);
           version = result.version;
           const template = `${state.template}>${state.state}`;
@@ -61,6 +69,8 @@ export const axeStates: Journey = {
       );
     }
     if (notRun.length > 0) throw new Error(`axe did not run on: ${notRun.join(", ")}`);
+    if (strays.length > 0)
+      throw new Error(`a state shows a missing value:\n  ${strays.join("\n  ")}`);
     const verdict = gateVerdict(
       report,
       states.map((state) => `${state.template}>${state.state}`),

@@ -68,7 +68,7 @@ export const crawl: Journey = {
   id: "crawl",
   shard: "smoke",
   proves:
-    "Following the console's own links from Home reaches every route template, each section's page within three links; no link is an old address; every fleet page and every harness screen for every shape renders with no not-found page, no error card and no session failure; and reading them changes no byte of any harness directory.",
+    "Following the console's own links from Home reaches every route template, each section's page within three links; no link is an old address; every fleet page and every harness screen for every shape renders with no not-found page, no error card, no missing value drawn as a word and no session failure; and reading them changes no byte of any harness directory.",
   run: async (scope) => {
     const grammar = await loadConsoleGrammar();
     const fleet = await scope.fleet({ seed: "crawl" });
@@ -90,6 +90,9 @@ export const crawl: Journey = {
       await session.visit(route);
       const body = await session.page.locator("body").innerText();
       if (body.includes(NOT_FOUND_TEXT)) notRendered.push(`${route}: ${NOT_FOUND_TEXT}`);
+      // A value that was never there, drawn as a word.
+      const stray = /^(null|undefined|\[object Object\])$/m.exec(body);
+      if (stray !== null) notRendered.push(`${route}: the page shows "${stray[0]}"`);
       const errorCards = await session.page.locator(ERROR_CARD_SELECTOR).count();
       if (errorCards > 0) {
         const text = await session.page.locator(ERROR_CARD_SELECTOR).first().innerText();

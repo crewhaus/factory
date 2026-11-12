@@ -151,14 +151,17 @@ export function openOmnibox(opts = {}) {
         input.focus();
       },
     });
+    // A child that is not there is left out: `replaceChildren` would draw null as text.
     confirmRow.replaceChildren(
-      el("strong", { text: `${row.title}?` }),
-      row.cliTwin !== "" ? el("code", { class: "omni-twin mono", text: row.cliTwin }) : null,
-      runnable
-        ? null
-        : el("span", { class: "muted", text: `this build cannot run “${row.route}” from here` }),
-      run,
-      cancel,
+      ...[
+        el("strong", { text: `${row.title}?` }),
+        row.cliTwin !== "" ? el("code", { class: "omni-twin mono", text: row.cliTwin }) : null,
+        runnable
+          ? null
+          : el("span", { class: "muted", text: `this build cannot run “${row.route}” from here` }),
+        run,
+        cancel,
+      ].filter((node) => node !== null),
     );
     confirmRow.hidden = false;
     confirmRow.focus();
