@@ -245,6 +245,23 @@ these on: they reach every harness that uses what each one names.
   running harness counts the restarts before it toward `crash-looping`; a
   person's start still resets the count.
 
+- **Spec writers refuse a change made meanwhile and keep a draft.** `crewhaus
+  optimize --write-back`, `flywheel`, `upgrade --write`, `lint --fix`,
+  `model-scan --write` and `model right-size --write` check that
+  `crewhaus.yaml` is still the version they started from; if it changed, they
+  write nothing, save their result as a draft under `.crewhaus/run/spec/drafts/`
+  and exit 53.
+
+- **`crewhaus run` says at start which security settings changed since the
+  last start.** It keeps a record in `.crewhaus/run/spec/` and prints one line
+  naming the settings (never their values); the run continues. `crewhaus dev`
+  is for development and reloads every change.
+
+- **A supervised or Home start uses a harness's own
+  `node_modules/.bin/crewhaus` only when it resolves inside the harness
+  directory**, otherwise the `crewhaus` on `PATH`. Home's jobs for a harness
+  not adopted on this machine use the `crewhaus` on `PATH`.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read

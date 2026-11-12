@@ -24,8 +24,8 @@ export type FixAction = {
   readonly summary: string;
   /** Multi-line diff preview (created/edited content). */
   readonly diff: string;
-  /** Perform the mutation. Throws on failure; the CLI reports it. */
-  apply(): void;
+  /** Perform the mutation. Throws (or rejects) on failure; the CLI reports it. */
+  apply(): void | Promise<void>;
 };
 
 /** Injected filesystem seam — every fixer reads/writes through this so the
@@ -33,7 +33,8 @@ export type FixAction = {
 export type FixFs = {
   exists(path: string): boolean;
   read(path: string): string;
-  write(path: string, content: string): void;
+  /** May be async: the CLI writes the spec through its revision-checked commit. */
+  write(path: string, content: string): void | Promise<void>;
   mkdirp(path: string): void;
 };
 
@@ -141,7 +142,7 @@ export function planScopeFix(opts: {
         value: "external",
         rationale: "doctor --fix: mark outward tool external (scope audit)",
       });
-      opts.fs.write(opts.specPath, result);
+      return opts.fs.write(opts.specPath, result);
     },
   };
 }

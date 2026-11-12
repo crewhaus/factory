@@ -24,6 +24,7 @@ import {
   runStagedOptimize,
   writeBackStagedResult,
 } from "./optimize-stages";
+import { specRev } from "./spec-commit";
 
 const WORKFLOW_YAML = `name: mini-flow
 target: workflow
@@ -383,9 +384,10 @@ describe("writeBackStagedResult (the staged write-back)", () => {
   test("with a write-back the source gains ONE stamp and both accepted stages' text", async () => {
     const dir = newTmp();
     const { start, staged } = await driveTwoStages(dir);
-    const r = writeBackStagedResult({
+    const r = await writeBackStagedResult({
       result: staged,
       targetSpecPath: start,
+      expectedRev: specRev(WORKFLOW_YAML),
       runId: "opt_test",
       mutator: "rule-based",
       iterations: 7,
@@ -415,9 +417,10 @@ describe("writeBackStagedResult (the staged write-back)", () => {
     const dir = newTmp();
     const { start, staged } = await driveTwoStages(dir, "draft");
     expect(staged.acceptedCount).toBe(1);
-    writeBackStagedResult({
+    await writeBackStagedResult({
       result: staged,
       targetSpecPath: start,
+      expectedRev: specRev(WORKFLOW_YAML),
       runId: "opt_test",
       mutator: "claude",
       iterations: 3,
@@ -442,17 +445,73 @@ describe("writeBackStagedResult (the staged write-back)", () => {
       workingDir: join(dir, "stages"),
       runStage: async () => outcome({ applied: false, improvement: 0 }),
     });
-    expect(() =>
+    await expect(
       writeBackStagedResult({
         result: staged,
         targetSpecPath: start,
+        expectedRev: specRev(WORKFLOW_YAML),
         runId: "opt_test",
         mutator: "rule-based",
         iterations: 1,
       }),
-    ).toThrow(BridgedCandidateError);
+    ).rejects.toThrow(BridgedCandidateError);
     // …and the tracked spec is still byte-identical.
     expect(readFileSync(start, "utf-8")).toBe(WORKFLOW_YAML);
+  });
+});
+
+describe("writeBackStagedResult: a spec changed during the run", () => {
+  test("is left as it is, the result is kept as a draft, and the write exits 53", async () => {
+    const dir = newTmp();
+    const start = join(dir, "crewhaus.yaml");
+    writeFileSync(start, WORKFLOW_YAML);
+    const staged = await runStagedOptimize({
+      stages: [
+        {
+          name: "draft",
+          kind: "step",
+          path: ["steps", "0", "instructions"],
+          instructions: "draft",
+        },
+      ],
+      startingYamlPath: start,
+      workingDir: join(dir, "stages"),
+      runStage: async ({ specPath }) => ({
+        applied: true,
+        scoreBefore: 0.4,
+        scoreAfter: 0.8,
+        improvement: 0.4,
+        patchedYaml: readFileSync(specPath, "utf-8").replace("Draft a one-line answer.", "NEW"),
+        spentUsdMicros: 0,
+        budgetExhausted: false,
+      }),
+    });
+    const edited = `${WORKFLOW_YAML}# edited by hand during the run\n`;
+    writeFileSync(start, edited);
+    const lines: string[] = [];
+    let code: number | undefined;
+    await expect(
+      writeBackStagedResult({
+        result: staged,
+        targetSpecPath: start,
+        expectedRev: specRev(WORKFLOW_YAML),
+        runId: "opt_test",
+        mutator: "rule-based",
+        iterations: 1,
+        commitDeps: {
+          stderr: (t) => lines.push(t),
+          exit: (c) => {
+            code = c;
+            throw new Error("exited");
+          },
+        },
+      }),
+    ).rejects.toThrow("exited");
+    expect(code).toBe(53);
+    expect(readFileSync(start, "utf-8")).toBe(edited);
+    const draft = /draft: (\S+\.json)\./.exec(lines.join(""))?.[1] ?? "";
+    expect(existsSync(draft)).toBe(true);
+    expect(readFileSync(draft, "utf-8")).toContain("NEW");
   });
 });
 

@@ -22,12 +22,16 @@ export const CONFLICT_ACTIONS = Object.freeze([
 ]);
 
 /**
- * `(current, draft)` → `{ message, rev, diff, draft, actions }`. `current` is
- * the 412's `body.current`; `draft` is the edit that was refused (falling
- * back to `current.draft`). The diff stays a string, whatever is in it.
+ * `(current, draft, opts)` → `{ message, rev, diff, draft, actions }`.
+ * `current` is the 412's `body.current`; `draft` is the edit that was refused
+ * (falling back to `current.draft`). The diff stays a string, whatever is in
+ * it. An action that cannot do what it says is not offered: no "Download my
+ * draft" without draft text to save, and no "Re-apply" when `opts.canReapply`
+ * is false.
  */
-export function conflictModel(current, draft) {
+export function conflictModel(current, draft, opts = {}) {
   const c = current && typeof current === "object" ? current : {};
+  const o = opts && typeof opts === "object" ? opts : {};
   const rev = typeof c.rev === "string" || typeof c.rev === "number" ? String(c.rev) : null;
   const draftText = typeof draft === "string" ? draft : typeof c.draft === "string" ? c.draft : "";
   return {
@@ -35,7 +39,10 @@ export function conflictModel(current, draft) {
     rev,
     diff: typeof c.diff === "string" ? c.diff : "",
     draft: draftText,
-    actions: CONFLICT_ACTIONS.map((a) => ({ ...a })),
+    actions: CONFLICT_ACTIONS.filter(
+      (a) =>
+        (a.id !== "download" || draftText !== "") && (a.id !== "reapply" || o.canReapply !== false),
+    ).map((a) => ({ ...a })),
   };
 }
 
@@ -48,11 +55,11 @@ function download(text, name) {
 }
 
 /**
- * `{ current: { rev, diff, draft }, onReapply(rev), onUseDisk() }` → the view.
+ * `{ current: { rev, diff, draft }, onReapply(rev), onUseDisk(), canReapply }` → the view.
  */
 export function conflictView(opts) {
   const o = opts && typeof opts === "object" ? opts : {};
-  const model = conflictModel(o.current, o.current?.draft);
+  const model = conflictModel(o.current, o.current?.draft, { canReapply: o.canReapply });
   const buttons = model.actions.map((action) => {
     const btn = el("button", {
       class: action.id === "reapply" ? "btn btn-primary" : "btn",

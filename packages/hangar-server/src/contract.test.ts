@@ -45,6 +45,7 @@ import { createContinuityStore } from "@crewhaus/continuity-store";
 import { type Ledger, casAppend, deploymentsLedger, foldStates } from "@crewhaus/control-records";
 import { commandsLedgerOf, workspaceCommandsLedger } from "@crewhaus/control-service";
 import { buildDigest, resolveBundle } from "@crewhaus/harness-supervisor";
+import { specRev } from "@crewhaus/spec-patch/commit";
 import { bearer, codeFrom, sealedJs, signInJs } from "./__test__/browser";
 import { runCorpusEval } from "./__test__/eval-corpus";
 import { EVAL_JOB_ARGV } from "./eval-inputs";
@@ -644,6 +645,9 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["warnings", "array"],
     ["warningsVerb", "string"],
     ["hash", "string"],
+    // The revision every write sends back, and whether this spec takes writes here.
+    ["rev", "string"],
+    ["readOnly", "object|null"],
   ),
   // Every declared path, badged. The reason travels with the badge so the
   // editor never shows a lock without saying who holds the key.
@@ -658,6 +662,8 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["autoTunableCount", "number"],
     ["humanOwnedCount", "number"],
     ["confirmName", "string"],
+    ["rev", "string"],
+    ["readOnly", "object|null"],
   ),
   specVersions: m3Read(
     ["specName", "string"],
@@ -680,6 +686,15 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["version", "string"],
     ["against", "string"],
     ["entries", "array"],
+    ["diff", "string"],
+  ),
+  // A draft kept when a write found the spec changed on disk: what it holds,
+  // and what it would change on top of the spec as it is now.
+  specDraft: m3Read(
+    ["draftId", "string"],
+    ["baseRev", "string|null"],
+    ["currentRev", "string"],
+    ["yaml", "string|null"],
     ["diff", "string"],
   ),
   wizardTemplates: m3Read(
@@ -821,6 +836,8 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["observedFeedback", "object"],
     ["judgments", "object"],
     ["asOf", "string|null"],
+    // The spec's revision: the toggle sends it back.
+    ["rev", "string|null"],
   ),
   watchmeReports: memoryRead(["reports", "array"]),
   watchmeReport: memoryRead(
@@ -830,7 +847,12 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["files", "array"],
   ),
   watchmeIntents: memoryRead(["intents", "array"]),
-  watchmeSynthesized: memoryRead(["proposals", "array"], ["advisory", "boolean"]),
+  watchmeSynthesized: memoryRead(
+    ["proposals", "array"],
+    ["advisory", "boolean"],
+    // The spec's revision: an apply sends it back.
+    ["rev", "string|null"],
+  ),
 
   // ---- M3 · evals + data + feedback (owner: the Evals+Data implementer) -
   // Every field below is present WHATEVER the harness holds — the normal
@@ -1377,6 +1399,7 @@ const M3_PARAMS: Record<string, string> = {
   optRunId: "opt_19a3f0c2b11",
   sampleId: "s1",
   version: "1.0.0",
+  draft: "20260803T000000Z-0000aaaa",
   name: "smoke",
   spec: "contract-harness",
   slug: "how-to-deploy",
@@ -1402,9 +1425,18 @@ const M3_PARAMS: Record<string, string> = {
  * handler is real — so a body key an implementer decides to require lands
  * here rather than being discovered in the browser.
  */
+/** Spec writes the contract harness's read-only spec refuses (409 `read-only`). */
+const READ_ONLY_SPEC_WRITES = new Set([
+  "specPatch",
+  "specPropose",
+  "mcpConnectorWrite",
+  "watchmeToggle",
+]);
+
 const M3_BODIES: Record<string, unknown> = {
-  specEdit: { edits: [], confirmName: "contract-harness" },
-  specPatch: { edit: { path: "agent.instructions", value: "be concise" } },
+  // `expectedRev` is filled with the contract harness's revision before the drive.
+  specEdit: { edits: [], confirmName: "contract-harness", expectedRev: "" },
+  specPatch: { edit: { path: "agent.instructions", value: "be concise" }, expectedRev: "" },
   specDiff: { edits: [] },
   specPin: { env: "prod", version: "1.0.0", confirmName: "contract-harness" },
   specRollback: { env: "prod", version: "1.0.0", confirmName: "contract-harness" },
@@ -1902,6 +1934,23 @@ describe("UI route contract", () => {
       const dir = contractHarness(t);
       await seedContinuity(dir);
       await seedEvals(dir);
+      // A spec write sends the revision it loaded, and a kept draft is readable.
+      const loadedRev = specRev(readFileSync(join(dir, "crewhaus.yaml"), "utf8"));
+      M3_BODIES["specEdit"] = { ...(M3_BODIES["specEdit"] as object), expectedRev: loadedRev };
+      M3_BODIES["specPatch"] = { ...(M3_BODIES["specPatch"] as object), expectedRev: loadedRev };
+      const drafts = join(dir, ".crewhaus", "run", "spec", "drafts");
+      mkdirSync(drafts, { recursive: true });
+      writeFileSync(
+        join(drafts, "20260803T000000Z-0000aaaa.json"),
+        JSON.stringify({
+          v: 1,
+          at: "2026-08-03T00:00:00.000Z",
+          baseRev: loadedRev,
+          writer: "home.spec",
+          actor: { kind: "person" },
+          edits: [{ path: ["agent", "instructions"], value: "be concise" }],
+        }),
+      );
       // Every write the route table receipts adds exactly one command to its own ledger
       // and answers with it; a read, and a write the table exempts, adds none.
       const objectsIn = (ledger: Ledger): number => {
@@ -2335,6 +2384,13 @@ describe("UI route contract", () => {
           ...(writes ? { body: JSON.stringify(M3_BODIES[key]) } : {}),
         });
         expectReceipt(key, before, body);
+        // The contract harness carries settings from other shapes, which the
+        // cli schema does not know: its spec is read-only here, and every spec
+        // write refuses with the reason, before any preview, rather than landing.
+        if (READ_ONLY_SPEC_WRITES.has(key)) {
+          expect(`${key}:${status}:${String(body["code"])}`).toBe(`${key}:409:read-only`);
+          continue;
+        }
         if (status === 501) {
           expect(`${key}:${String(body["error"] ?? "")}`).toContain("not implemented (M3)");
           continue;

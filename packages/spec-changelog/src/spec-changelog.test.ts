@@ -306,3 +306,28 @@ describe("changelog rendering + append", () => {
     expect(readFileSync(path, "utf-8")).toContain("## v1 — 2026-07-01");
   });
 });
+
+describe("autoRegisterSpecVersion — a version stored meanwhile", () => {
+  test("a version file another writer planted is never replaced; the next number is used", async () => {
+    const { registry, rootDir } = makeRegistry();
+    await autoRegisterSpecVersion({
+      registry,
+      registryRootDir: rootDir,
+      specName: "hello",
+      yaml: YAML_V1,
+      now: NOW,
+    });
+    // Another writer created v2 on disk and has not listed it yet.
+    writeFileSync(join(rootDir, "hello", "v2.yaml"), "name: planted\n");
+    const result = await autoRegisterSpecVersion({
+      registry,
+      registryRootDir: rootDir,
+      specName: "hello",
+      yaml: YAML_V2,
+      now: NOW,
+    });
+    expect(result).toEqual({ status: "registered", name: "hello", version: "v3" });
+    expect(readFileSync(join(rootDir, "hello", "v2.yaml"), "utf-8")).toBe("name: planted\n");
+    expect(await registry.get("hello", "v3")).toBe(YAML_V2);
+  });
+});

@@ -16,7 +16,8 @@
  *       <name>.json       ← per-tenant pin overlay
  *
  * Operations:
- *   put(name, version, yaml)         write a new version
+ *   put(name, version, yaml)         write a version (replacing one of that name)
+ *   putNew(name, version, yaml)      write a version that must not exist yet
  *   get(name, version)               read a specific version
  *   list(name)                       all versions for a spec
  *   pin(name, env, version)          attach an environment alias
@@ -27,12 +28,38 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
+import { withFileLock } from "@crewhaus/infra-utils";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 
 export class SpecRegistryError extends CrewhausError {
   override readonly name = "SpecRegistryError";
-  constructor(message: string, cause?: unknown) {
+  /**
+   * Why the registry refused, when a caller can act on it. `exists`:
+   * {@link RegistryAdapter.putNew} found the version already stored. (`code`
+   * is the error family every `CrewhausError` carries.)
+   */
+  readonly failure: "exists" | undefined;
+  constructor(message: string, cause?: unknown, failure?: "exists") {
     super("config", message, cause);
+    this.failure = failure;
   }
+}
+
+/**
+ * Version order: `v<digits>` versions first, by their number (`v2` before
+ * `v10`), then every other version name lexicographically.
+ */
+export function compareVersions(a: string, b: string): number {
+  const na = /^v(\d+)$/.exec(a);
+  const nb = /^v(\d+)$/.exec(b);
+  if (na !== null && nb !== null) {
+    const x = BigInt(na[1] as string);
+    const y = BigInt(nb[1] as string);
+    return x < y ? -1 : x > y ? 1 : 0;
+  }
+  if (na !== null) return -1;
+  if (nb !== null) return 1;
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 export type Manifest = {
@@ -42,6 +69,8 @@ export type Manifest = {
 
 export interface RegistryAdapter {
   put(name: string, version: string, yaml: string): Promise<void>;
+  /** Write a version that must not exist yet; an existing one is refused (`SpecRegistryError`, failure `exists`) and left as it is. */
+  putNew(name: string, version: string, yaml: string): Promise<void>;
   get(name: string, version: string): Promise<string>;
   list(name: string): Promise<ReadonlyArray<string>>;
   listSpecs(): Promise<ReadonlyArray<string>>;
@@ -77,6 +106,8 @@ function ensureSafeTenant(t: string): void {
 export type FileBackedRegistryOptions = {
   /** Default: `.crewhaus/specs`. */
   readonly rootDir: string;
+  /** Test seam: runs after a manifest is read inside a read-modify-write. */
+  readonly hooks?: { readonly afterManifestRead?: () => void };
 };
 
 export function createFileBackedRegistry(opts: FileBackedRegistryOptions): RegistryAdapter {
@@ -111,15 +142,52 @@ export function createFileBackedRegistry(opts: FileBackedRegistryOptions): Regis
     mkdirSync(specDir(name), { recursive: true });
     writeFileSync(p, JSON.stringify(m, null, 2), { mode: 0o600 });
   }
+  /** Read, change and save one spec's manifest under its lock, so concurrent writers never lose each other's change. */
+  async function updateManifest<T>(name: string, change: (m: Manifest) => T): Promise<T> {
+    mkdirSync(specDir(name), { recursive: true });
+    return await withFileLock(
+      join(specDir(name), "manifest.lock"),
+      async () => {
+        const m = loadManifest(name);
+        opts.hooks?.afterManifestRead?.();
+        const out = change(m);
+        saveManifest(name, m);
+        return out;
+      },
+      { label: "spec-registry", waitMs: 10_000 },
+    );
+  }
 
   return {
     async put(name, version, yaml): Promise<void> {
       mkdirSync(specDir(name), { recursive: true });
       const p = specVersionPath(name, version);
       writeFileSync(p, yaml, { mode: 0o600 });
-      const m = loadManifest(name);
-      if (!m.versions.includes(version)) m.versions.push(version);
-      saveManifest(name, m);
+      await updateManifest(name, (m) => {
+        if (!m.versions.includes(version)) m.versions.push(version);
+      });
+    },
+    async putNew(name, version, yaml): Promise<void> {
+      mkdirSync(specDir(name), { recursive: true });
+      ensureSafeVersion(version);
+      const written = writeFileSafe(specDir(name), `${version}.yaml`, yaml, {
+        overwrite: false,
+        mode: 0o600,
+      });
+      if (!written.ok) {
+        throw written.code === "exists"
+          ? new SpecRegistryError(
+              `spec "${name}" version "${version}" already exists; it was not replaced`,
+              undefined,
+              "exists",
+            )
+          : new SpecRegistryError(
+              `spec "${name}" version "${version}" could not be written: ${written.reason}`,
+            );
+      }
+      await updateManifest(name, (m) => {
+        if (!m.versions.includes(version)) m.versions.push(version);
+      });
     },
     async get(name, version): Promise<string> {
       const p = specVersionPath(name, version);
@@ -130,7 +198,7 @@ export function createFileBackedRegistry(opts: FileBackedRegistryOptions): Regis
     },
     async list(name): Promise<ReadonlyArray<string>> {
       const m = loadManifest(name);
-      return [...m.versions].sort();
+      return [...m.versions].sort(compareVersions);
     },
     async listSpecs(): Promise<ReadonlyArray<string>> {
       if (!existsSync(rootDir)) return [];
@@ -141,24 +209,24 @@ export function createFileBackedRegistry(opts: FileBackedRegistryOptions): Regis
     async delete(name, version): Promise<void> {
       const p = specVersionPath(name, version);
       if (existsSync(p)) rmSync(p);
-      const m = loadManifest(name);
-      m.versions = m.versions.filter((v) => v !== version);
-      // Remove any pin pointing at the deleted version.
-      for (const [env, v] of Object.entries(m.pins)) {
-        if (v === version) delete m.pins[env];
-      }
-      saveManifest(name, m);
+      await updateManifest(name, (m) => {
+        m.versions = m.versions.filter((v) => v !== version);
+        // Remove any pin pointing at the deleted version.
+        for (const [env, v] of Object.entries(m.pins)) {
+          if (v === version) delete m.pins[env];
+        }
+      });
     },
     async pin(name, environment, version): Promise<void> {
       ensureSafeEnv(environment);
-      const m = loadManifest(name);
-      if (!m.versions.includes(version)) {
-        throw new SpecRegistryError(
-          `cannot pin "${name}" "${environment}" → "${version}": version not in registry`,
-        );
-      }
-      m.pins[environment] = version;
-      saveManifest(name, m);
+      await updateManifest(name, (m) => {
+        if (!m.versions.includes(version)) {
+          throw new SpecRegistryError(
+            `cannot pin "${name}" "${environment}" → "${version}": version not in registry`,
+          );
+        }
+        m.pins[environment] = version;
+      });
     },
     async aliasFor(name, environment): Promise<string | undefined> {
       ensureSafeEnv(environment);

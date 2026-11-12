@@ -8,7 +8,7 @@ import type {
   ProviderMutation,
 } from "@crewhaus/prompt-optimizer";
 import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
-import { optimizeSpec } from "./index";
+import { OptimizeSpecError, optimizeSpec } from "./index";
 
 const CLI_YAML = `# A simple CLI agent
 target: cli
@@ -128,6 +128,41 @@ describe("optimizeSpec — end-to-end fitness loop", () => {
     expect(source).toContain("# crewhaus optimize: runId");
     expect(source).toContain("# A simple CLI agent"); // original leading comment preserved
     expect(source).toContain("# The system prompt:"); // structural comment preserved
+  });
+
+  test("writeBack: a spec edited during the run is left as edited, and the result is kept as a draft", async () => {
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, CLI_YAML);
+    const edited = CLI_YAML.replace("You are a helpful assistant.", "Edited by hand.");
+    let calls = 0;
+    // The edit lands between the run's read and its write, from inside the
+    // fitness function the run calls.
+    const fitness = async (prompt: string) => {
+      calls += 1;
+      if (calls === 2) writeFileSync(specPath, edited);
+      return prompt.length / 100;
+    };
+    let caught: unknown;
+    try {
+      await optimizeSpec({
+        specPath,
+        fitness,
+        trainSet: [{ id: "t1", input: "x", expected_output: "y" }],
+        devSet: [{ id: "d1", input: "x", expected_output: "y" }],
+        iterations: 3,
+        seed: 42,
+        outDir: join(tmpRoot, "out"),
+        writeBack: true,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(OptimizeSpecError);
+    expect((caught as OptimizeSpecError).failure).toBe("conflict");
+    const draft = (caught as OptimizeSpecError).draftPath ?? "";
+    expect(existsSync(draft)).toBe(true);
+    expect(readFileSync(draft, "utf8")).toContain("# crewhaus optimize: runId");
+    expect(readFileSync(specPath, "utf8")).toBe(edited);
   });
 
   // D36 (Wave 5) — a multi-prompt target is still refused WITHOUT a stage

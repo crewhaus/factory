@@ -46,6 +46,7 @@ import { confirmAction } from "../ui/dialog.js";
 import { bindDraft, draftKey } from "../ui/draft.js";
 import { panelNav } from "../ui/panels.js";
 import { fmtCount, fmtPct, fmtRelativeTime, fmtUsd, usdFromMicros } from "../util.js";
+import { openConflict } from "./spec-edit.js";
 
 const PANELS = [
   ["facts", "Facts"],
@@ -257,9 +258,11 @@ async function load(host, call) {
 /**
  * Run one write with a busy button. A non-2xx (or an `ok:false` envelope)
  * never fails silently: it becomes a toast carrying the server's own note,
- * which is the sentence that explains what to do next.
+ * which is the sentence that explains what to do next. A 412 that carries the
+ * server's current state opens the spec editor's conflict view instead
+ * (`conflict` says how to re-apply), so a spec that moved is never just a toast.
  */
-async function run(btn, label, call, onDone) {
+async function run(btn, label, call, onDone, conflict = null) {
   const original = btn.textContent;
   btn.disabled = true;
   btn.textContent = `${label}…`;
@@ -272,6 +275,10 @@ async function run(btn, label, call, onDone) {
   btn.textContent = original;
   btn.disabled = false;
   const body = res.body && typeof res.body === "object" ? res.body : {};
+  if (res.status === 412 && body.current && typeof body.current === "object") {
+    openConflict(body.current, `${label} done`, { opener: btn, ...(conflict ?? {}) });
+    return res;
+  }
   if (!res.ok) {
     toast(`${label} failed: ${String(body.error ?? body.message ?? res.status)}`);
   } else if (body.ok === false) {
@@ -1818,6 +1825,20 @@ async function watchmePanel(host, ctx, reload) {
   host.appendChild(publishCard(ctx));
 }
 
+/**
+ * Re-read the watch-me panel, then put focus on its first heading: the
+ * control that made the write is gone with the old render, so focus never
+ * falls to the page.
+ */
+async function rerenderWatchme(host, ctx, reload) {
+  await watchmePanel(host, ctx, reload);
+  const heading = host.querySelector("h3, h4");
+  if (heading instanceof HTMLElement) {
+    if (!heading.hasAttribute("tabindex")) heading.setAttribute("tabindex", "-1");
+    heading.focus();
+  }
+}
+
 function toggleControl(ctx, analytics, host, reload) {
   const watching = analytics.watching === true;
   const btn = el("button", {
@@ -1838,13 +1859,15 @@ function toggleControl(ctx, analytics, host, reload) {
           {
             watching: !watching,
             confirm: true,
+            // The revision this panel read: the write is checked against it.
+            expectedRev: String(analytics.rev ?? ""),
             ...(nameField.input.value.trim() !== ""
               ? { confirmName: nameField.input.value.trim() }
               : {}),
           },
         ),
       (res) => {
-        if (res.ok && res.body?.applied === true) void watchmePanel(host, ctx, reload);
+        if (res.ok && res.body?.applied === true) void rerenderWatchme(host, ctx, reload);
         else if (res.ok && res.body?.code === "needs_typed_confirm") {
           toast(
             String(res.body.note ?? "type the spec name to apply this human-owned edit"),
@@ -1852,6 +1875,10 @@ function toggleControl(ctx, analytics, host, reload) {
           );
         }
       },
+      // A typed confirmation is never re-sent, and this panel has no way to
+      // re-apply on top: the conflict offers the version on disk and the
+      // kept draft, and the panel re-reads with focus on its heading.
+      { id: ctx.id, reload: () => void rerenderWatchme(host, ctx, reload) },
     );
   });
   return wrap;
@@ -1911,11 +1938,11 @@ function synthesizedCard(synthesized, ctx, host, reload) {
       class: "muted",
       text: String(synthesized.note ?? "advisory only — reading a proposal is not applying it"),
     }),
-    ...proposals.map((p) => proposalBlock(p, ctx, host, reload)),
+    ...proposals.map((p) => proposalBlock(p, ctx, host, reload, String(synthesized.rev ?? ""))),
   ]);
 }
 
-function proposalBlock(proposal, ctx, host, reload) {
+function proposalBlock(proposal, ctx, host, reload, rev) {
   const edits = Array.isArray(proposal.edits) ? proposal.edits : [];
   const picked = new Set();
   const nameField = field("type the spec name for human-owned edits", { placeholder: "spec name" });
@@ -1930,14 +1957,17 @@ function proposalBlock(proposal, ctx, host, reload) {
           {
             edits: [...picked],
             confirm: true,
+            // The revision the listing read: the write is checked against it.
+            expectedRev: rev,
             ...(nameField.input.value.trim() !== ""
               ? { confirmName: nameField.input.value.trim() }
               : {}),
           },
         ),
       (res) => {
-        if (res.ok && res.body?.applied === true) void watchmePanel(host, ctx, reload);
+        if (res.ok && res.body?.applied === true) void rerenderWatchme(host, ctx, reload);
       },
+      { id: ctx.id, reload: () => void rerenderWatchme(host, ctx, reload) },
     );
   });
 

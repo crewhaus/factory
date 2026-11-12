@@ -35,7 +35,7 @@
  * READS NEVER MUTATE: the ratings browser folds raw JSONL under the shared
  * caps and never calls a store `list()` that would evict or compact.
  */
-import { readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
   type FeedbackRecord,
@@ -47,6 +47,7 @@ import {
   readDistillState,
 } from "@crewhaus/feedback-distill";
 import { applySpecEdits, diffSpecYaml } from "@crewhaus/spec-patch";
+import { parseYamlOnly, specRev } from "@crewhaus/spec-patch/commit";
 import { MAX_JSONL_LINES, SESSION_JSONL_RE } from "./constants";
 import {
   absent,
@@ -69,7 +70,15 @@ import { jobArg } from "./m3";
 import { maskDeep, maskSpecYaml, maskText } from "./mask";
 import { resolveContained } from "./safety";
 import { readSpecYaml } from "./schedulers";
-import { classifyPath } from "./spec-edit";
+import {
+  classifyPath,
+  commitHomeEdits,
+  previewHomeEdits,
+  readSpecFile,
+  requireEditable,
+  requireExpectedRev,
+  requireWholeSpec,
+} from "./spec-edit";
 import { keyedScalar } from "./spec-lines";
 import { twinWord } from "./twin-word";
 
@@ -624,8 +633,12 @@ export const adviceRun: M3Handler = (ctx) => {
  * true })`, the path check the optimizer runs under. A refused path
  * answers with the credential-redacted diff and `crewhaus propose` named in
  * the refusal — not silently dropped, and not quietly written.
+ *
+ * The preview answers the spec's `rev`; `confirm: true` must send it back
+ * as `expectedRev`, and the write is the guarded commit every spec write
+ * takes (412 when the spec moved; the file's mode kept; a version recorded).
  */
-export const adviceApply: M3Handler = (ctx) => {
+export const adviceApply: M3Handler = async (ctx) => {
   const adviceId = ctx.params["adviceId"] as string;
   const proposal = readProposals(ctx).find((p) => p.adviceId === adviceId);
   if (proposal === undefined) {
@@ -640,7 +653,6 @@ export const adviceApply: M3Handler = (ctx) => {
       applied: false,
     };
   }
-  const specPath = ctx.contain(["crewhaus.yaml"]);
   const before = readSpecYaml(ctx.harnessDir ?? "");
   if (before === "") {
     return {
@@ -656,12 +668,20 @@ export const adviceApply: M3Handler = (ctx) => {
     ...(proposal.rationale !== "" ? { rationale: proposal.rationale } : {}),
   };
 
+  // Checked with the schema this harness is built against, before any edit
+  // is applied: a read-only spec is refused (409 `read-only`), and the
+  // preview parses the way the guarded commit will.
+  const check = await requireEditable(ctx, before);
+  const parse = check.source === "harness" ? { parse: parseYamlOnly } : {};
+
   // The human-owned refusal is a FIRST-CLASS state: show what the edit would
   // have done, then name the route that CAN carry it.
   const humanOwnedRefusal = (reason: string): HttpError => {
     let diff: unknown = [];
     try {
-      diff = diffSpecYaml(before, applySpecEdits(before, [edit]).yaml).map((d) => ({ ...d }));
+      diff = diffSpecYaml(before, applySpecEdits(before, [edit], parse).yaml).map((d) => ({
+        ...d,
+      }));
     } catch {
       diff = [];
     }
@@ -681,12 +701,21 @@ export const adviceApply: M3Handler = (ctx) => {
 
   if (proposal.tier !== "auto-tunable") throw humanOwnedRefusal(proposal.tierReason);
 
-  let applied: ReturnType<typeof applySpecEdits>;
-  try {
-    applied = applySpecEdits(before, [edit], { restrictToOptimizable: true });
-  } catch (err) {
-    throw humanOwnedRefusal(err instanceof Error ? err.message : String(err));
+  const preview = await previewHomeEdits(ctx, before, [edit], check, { restrict: true });
+  if (preview.stage === "schema") {
+    return {
+      ...found("the harness's schema refuses this change — nothing was written", "crewhaus advise"),
+      ok: false,
+      code: "edit_rejected",
+      reason: preview.error,
+      adviceId,
+      applied: false,
+    };
   }
+  if (!preview.ok || preview.yaml === null) {
+    throw humanOwnedRefusal(preview.error ?? "the change does not apply");
+  }
+  const applied = { yaml: preview.yaml };
 
   if (ctx.body["confirm"] !== true) {
     return {
@@ -696,30 +725,33 @@ export const adviceApply: M3Handler = (ctx) => {
       tier: proposal.tier,
       diff: diffSpecYaml(before, applied.yaml).map((d) => ({ ...d })),
       preview: maskSpecYaml(applied.yaml),
-      confirmWith: 'send "confirm": true to write it',
+      /** Send it back as `expectedRev` with `confirm: true`. */
+      rev: specRev(before),
+      confirmWith: 'send "confirm": true and "expectedRev": "<rev>" to write it',
     };
   }
-  // Atomic: write beside the spec and rename, so a reader never sees half a
-  // document. Written through the patch library's output — never a template.
-  //
-  // SEAM: this writes the working spec only. Recording a spec-registry
-  // VERSION (and its CHANGELOG entry) belongs to the spec write path, which
-  // owns that store; until this route can share that commit helper, an
-  // advice-applied edit shows up in the file but not in version history, and
-  // the response says so rather than implying otherwise.
-  const tmp = `${specPath}.${process.pid}.tmp`;
-  writeFileSync(tmp, applied.yaml, { mode: 0o600 });
-  renameSync(tmp, specPath);
+  const file = readSpecFile(ctx);
+  requireWholeSpec(file);
+  const committed = await commitHomeEdits(ctx, file, [edit], {
+    writer: "home.advice",
+    expectedRev: requireExpectedRev(ctx),
+    restrict: true,
+  });
+  if ("refused" in committed) return { ...committed.refused, adviceId, applied: false };
   return {
     ...found(
-      "applied to crewhaus.yaml — this writes the working spec; register a version from the Spec tab to record it in version history",
+      committed.registered !== undefined
+        ? `applied to crewhaus.yaml and recorded as version ${committed.registered}`
+        : "applied to crewhaus.yaml",
       "crewhaus advise",
     ),
     adviceId,
-    applied: true,
+    applied: committed.wrote,
     tier: proposal.tier,
-    edits: applied.applied,
-    diff: diffSpecYaml(before, applied.yaml).map((d) => ({ ...d })),
+    edits: committed.applied ?? 0,
+    diff: committed.entries.map((d) => ({ ...d })),
+    rev: committed.rev,
+    registered: committed.registered ?? null,
   };
 };
 

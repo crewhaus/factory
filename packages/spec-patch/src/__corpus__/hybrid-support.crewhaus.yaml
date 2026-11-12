@@ -1,0 +1,98 @@
+# hybrid-support — a cheap worker, a strong checker, and one harness.
+#
+# The problem this starter exists to solve: a support agent declares one
+# strong model because a handful of hard questions need it, so every
+# "where is my order" turn is billed at the strong model's rate.
+#
+# The 0.6.0 answer is three blocks:
+#
+#   models:        every per-model setting declared ONCE, named
+#   model_pool:    the lanes the router picks between, per turn
+#   evaluation:    a checker that grades the draft, and escalates it
+#
+# Read it top to bottom and the whole route is on one screen: who drafts,
+# what the drafter may touch, who grades, and what happens when the grade
+# comes back short.
+#
+# Usage (from inside this directory):
+#   cp .env.example .env      # ANTHROPIC_API_KEY
+#   bunx crewhaus models explain      # the route, before you spend anything
+#   bunx crewhaus run crewhaus.yaml
+#
+# Walkthrough: ../../walkthroughs/75-hybrid-models.md
+
+name: hybrid-support
+target: cli
+
+# The roster. A profile is a NAME for everything that can differ per
+# model, so no slot below repeats a model id, a token budget, or a
+# thinking effort. Any model slot in the spec may reference one as
+# `$<name>` — quote it on a shell command line, or the shell eats it.
+models:
+  fast:
+    model: claude-haiku-4-5
+    tags: [cheap]
+    max_tokens: 2048
+    temperature: 0.2
+    instructions: |
+      You are the fast lane. Answer from the order notes you can read, in
+      two sentences. If the notes do not settle it, say so plainly instead
+      of guessing — a short honest miss is cheap to fix.
+  strong:
+    model: claude-opus-5
+    tags: [strong]
+    thinking: { effort: high }
+  checker:
+    model: claude-sonnet-5
+
+agent:
+  # The declared primary is the cheap profile: the lane most turns take.
+  model: $fast
+  instructions: |
+    You answer customer questions about their orders. The order notes are
+    in notes/. Name the order status, and cite the note you read it from.
+    Refund eligibility is decided by bin/refund-window.sh, never by you.
+
+  # The two lanes. A candidate may carry every profile field inline, and
+  # that is where per-model narrowing lives: `tools` is subset-only (never
+  # additive), `permissions` may only deny and ask, and `cost` makes the
+  # lane ineligible once it has spent its share — it never ends the run.
+  model_pool:
+    policy: heuristic
+    candidates:
+      - model: $fast
+        tools: [read, grep]
+        permissions: { deny: ["Bash(**)"] }
+        cost: { max_usd: 0.50 }
+      - model: $strong
+    # Draft on the cheap lane; hand a failed draft to the strong one.
+    # `clean_prompt` re-runs the turn from the pre-draft transcript, so the
+    # strong model is never anchored on the answer that just failed.
+    strategy:
+      cascade: { draft: cheap, escalate_to: strong, clean_prompt: true }
+      max_escalations: 1
+
+tools: [read, grep, bash]
+
+# The escalation trigger. The checker grades the finished turn; below the
+# threshold `on_fail: escalate` re-runs it on `strategy.cascade.escalate_to`
+# instead of re-prompting the model that just missed.
+evaluation:
+  grader:
+    type: llm_judge
+    model: $checker
+    criteria: |
+      The reply names the order's status and cites the note file it came
+      from. A refund verdict must come from bin/refund-window.sh, not from
+      the model's own judgement.
+  threshold: 0.7
+  on_fail: escalate
+
+permissions:
+  mode: default
+  rules:
+    - { type: alwaysDeny,  pattern: Bash(rm -rf**) }
+    - { type: alwaysDeny,  pattern: Bash(sudo**) }
+    - { type: alwaysAllow, pattern: Read }
+    - { type: alwaysAllow, pattern: Grep }
+    - { type: alwaysAllow, pattern: Bash(./bin/refund-window.sh**) }

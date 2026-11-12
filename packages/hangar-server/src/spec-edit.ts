@@ -41,49 +41,67 @@
  * such envelope names the code, the reason, and the verb that fixes it.
  *
  * ---------------------------------------------------------------------------
- * THE SCHEMA IS LOADED PER HARNESS
+ * THE SCHEMA IS CHECKED PER HARNESS, OUTSIDE THIS PROCESS
  * ---------------------------------------------------------------------------
- * A machine's harnesses span crewhaus versions; that is the normal case.
- * `loadSpecModule` resolves `@crewhaus/spec` from the HARNESS's own
- * `node_modules` (and only when that copy realpath-contains inside the
- * harness), falling back to the manager's bundled copy with a badge that
- * says so. Pinning one schema across a mixed fleet is the defect this
- * avoids — it makes a harness one version ahead look broken. Resolution
- * never installs anything: opening a tab must not dirty a git-clean dir.
+ * A machine's harnesses span crewhaus versions; that is the normal case. A
+ * harness adopted on this machine whose `@crewhaus/spec` realpath-contains
+ * inside it is checked with that copy, in a child process
+ * (`spec-validator-child.ts`): a harness's code never runs inside Home. Any
+ * other harness, or a check that cannot answer, is checked with this
+ * manager's own schema, with a note that says so. A spec carrying keys the
+ * schema in use does not know is READ-ONLY here: every read says so, and
+ * every write answers 409 `read-only` naming the keys. Resolution never
+ * installs anything: opening a tab must not dirty a git-clean dir.
+ *
+ * ---------------------------------------------------------------------------
+ * EVERY WRITE IS ONE GUARDED COMMIT
+ * ---------------------------------------------------------------------------
+ * Every spec write here goes through `@crewhaus/spec-patch/commit`, and must
+ * carry the revision the editor loaded (`expectedRev`; 428 without one). A
+ * spec changed on disk since that read is answered 412 with the current
+ * revision, the diff the refused edits would make on top of it, and the id of
+ * the draft kept for them (`specDraft` serves it). Every commit records a
+ * version in the harness's registry.
  */
-import { createHash } from "node:crypto";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
-import { parseSpec, parseSpecIssues, specJsonSchema } from "@crewhaus/spec";
+import { type Spec, parseSpec, parseSpecIssues, specJsonSchema } from "@crewhaus/spec";
+import { autoRegisterSpecVersion } from "@crewhaus/spec-changelog/spec-changelog";
 import {
-  DELTA_090_KEYS,
   OPTIMIZABLE_PATHS,
   REDACTED_VALUE,
   type SpecDiffEntry,
   type SpecEdit,
-  WILDCARD_SEGMENT,
   applySpecEdits,
   diffSpecYaml,
+  escalationFor,
   isCredentialKey,
   isOptimizable,
   specHasPath,
+  surfaceFor,
+  surfaceMatchesFrom,
 } from "@crewhaus/spec-patch";
+import {
+  type CommitFailure,
+  type CommitSuccess,
+  DRAFT_ID_RE,
+  type WriterId,
+  commitSpec,
+  parseYamlOnly,
+  readSpecDraft,
+  specRev,
+} from "@crewhaus/spec-patch/commit";
+import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
 import { type M3Context, type M3Handler, jobArg, requireTypedConfirm } from "./m3";
-import { maskSpecYaml, maskText } from "./mask";
+import { maskDeep, maskSpecYaml, maskText } from "./mask";
 import { resolveContained } from "./safety";
+import { type ChildTimer, type SpawnChild, validateInHarness } from "./spec-validator-child";
+
+export { SECURITY_SURFACES } from "@crewhaus/spec-patch";
 import { keyLineParts, namedValues } from "./spec-lines";
 
 /** The spec file every harness is anchored on. */
@@ -143,13 +161,11 @@ export type SpecFileRead = {
   readonly truncated: boolean;
   readonly specName: string;
   readonly target: string;
+  /** The spec's revision (`specRevision`), or `absent`: the token every write sends back as `expectedRev`. */
+  readonly rev: string;
+  /** The same value as `rev`, under the name earlier clients read. */
   readonly hash: string;
 };
-
-/** sha256 of the exact bytes — the editor's rebase token. */
-function hashOf(text: string): string {
-  return `sha256:${createHash("sha256").update(text).digest("hex")}`;
-}
 
 /** Read the harness's spec through the dispatcher's containment closure.
  *  Absence is not an error: `present: false` with empty text. */
@@ -165,7 +181,8 @@ export function readSpecFile(ctx: M3Context): SpecFileRead {
     truncated: read.truncated,
     specName: header.name ?? ctx.entry?.specName ?? "spec",
     target: header.target ?? "unknown",
-    hash: hashOf(read.text),
+    rev: present ? specRev(read.text) : "absent",
+    hash: present ? specRev(read.text) : "absent",
   };
 }
 
@@ -174,15 +191,9 @@ export function readSpecFile(ctx: M3Context): SpecFileRead {
  *
  * `readSpecFile` reads through `readTextCapped`, so a spec past the cap
  * comes back as a PREFIX of itself. A prefix is a VIEW: rendering one is
- * honest, writing one back is not. `writeSpecFile` renames over the
- * original, so everything past the cap would be deleted — silently, because
- * the surviving head of an over-cap spec usually still parses (the cut lands
- * inside a long block scalar), and because the answer's own diff and `hash`
- * are computed from the damaged text, which re-anchors the editor's rebase
- * token to the damage. Refuse instead, with the verb that can do the job.
- *
- * The same refusal `watchme-ops`' `liveSpec` and the settings writer in
- * `inspect.ts` already make; this is the write path that had missed it.
+ * honest, building a write from one is not. Refuse instead, with the verb
+ * that can do the job. The same refusal `watchme-ops`' `liveSpec` and the
+ * settings writer in `inspect.ts` make.
  */
 export function requireWholeSpec(file: SpecFileRead): void {
   if (!file.truncated) return;
@@ -192,40 +203,8 @@ export function requireWholeSpec(file: SpecFileRead): void {
   );
 }
 
-/** The mode a spec gets when this manager CREATES the file. It is never
- *  applied to one that already exists — see {@link writeSpecFile}. */
-const NEW_SPEC_MODE = 0o644;
-
-/**
- * Write the spec back atomically (temp file in the SAME directory, then
- * rename) so a crashed write can never truncate a harness's spec.
- *
- * The rename replaces the INODE, which means the temp file's mode BECOMES
- * the spec's mode. Writing a hardcoded one would silently chmod a file the
- * operator owns — a deliberately narrowed `crewhaus.yaml` would come back
- * world-readable after any edit made from the console. So the existing mode
- * is carried across the rename, and the default applies only when there is
- * no file to carry one from. Exported because a spec file must be replaced
- * the same way wherever it is replaced.
- */
-export function writeSpecFile(path: string, text: string): void {
-  let mode = NEW_SPEC_MODE;
-  try {
-    mode = statSync(path).mode & 0o7777;
-  } catch {
-    // Nothing there to preserve — the default is the only answer there is.
-  }
-  const tmp = `${path}.hangar-tmp`;
-  writeFileSync(tmp, text, { mode });
-  // `writeFileSync`'s mode is masked by the process umask at CREATE time, so
-  // it is a request rather than a guarantee; the chmod is what makes the
-  // preserved mode exact.
-  chmodSync(tmp, mode);
-  renameSync(tmp, path);
-}
-
 // ---------------------------------------------------------------------------
-// per-harness spec module (the mixed-version fleet)
+// the schema a spec is checked with (the mixed-version fleet)
 // ---------------------------------------------------------------------------
 
 export type SpecIssueRow = {
@@ -234,31 +213,46 @@ export type SpecIssueRow = {
   readonly code?: string;
 };
 
-export type SpecModule = {
-  readonly parseSpec: (yamlText: string) => unknown;
-  readonly parseSpecIssues: (yamlText: string) => ReadonlyArray<SpecIssueRow>;
-  readonly specJsonSchema: () => Record<string, unknown>;
-  /** Which copy answered: the harness's own, or the manager's bundled one. */
+/** Which schema checked a spec, and what it found. */
+export type SchemaCheck = {
+  /** The harness's own `@crewhaus/spec` (in a child process), or this manager's. */
   readonly source: "harness" | "manager";
-  /** The resolved copy's version, when its package.json could be read. */
+  /** The answering copy's version, when its package.json could be read. */
   readonly version: string | null;
-  /** Set when the harness copy was tried and could not be used. */
+  /** Why the harness's own schema did not answer, when it did not. */
   readonly note: string | null;
+  /** Diagnostics, messages masked. */
+  readonly issues: ReadonlyArray<SpecIssueRow>;
+  /** `op: "schema"` only: the JSON schema. */
+  readonly schema?: Record<string, unknown>;
+  /** `op: "schema"` only: the spec parsed with defaults, or undefined when it does not parse. */
+  readonly parsed?: unknown;
+  /** `op: "schema"` only: why it does not parse. */
+  readonly parseError?: string;
 };
 
-const MANAGER_MODULE: SpecModule = {
-  parseSpec,
-  parseSpecIssues,
-  specJsonSchema,
-  source: "manager",
-  version: null,
-  note: null,
+/** The note a harness not adopted on this machine gets. */
+export const NOT_ADOPTED_NOTE =
+  "Checked with this CrewHaus's schema. Adopt the harness to check it with its own.";
+
+/** Test seam for the child check: its spawn, timer and interpreter. */
+export type SchemaCheckDeps = {
+  readonly spawn?: SpawnChild;
+  readonly timer?: ChildTimer;
+  readonly interpreter?: string | undefined;
 };
 
-/** Memoized per harness dir: resolving + importing on every keystroke would
- *  make the editor feel like a compiler. A reinstall inside a running
- *  manager keeps the version the badge already showed until restart. */
-const specModuleCache = new Map<string, SpecModule>();
+let schemaCheckDeps: SchemaCheckDeps = {};
+
+/** Replace the child check's seams (tests). */
+export function setSchemaCheckDeps(deps: SchemaCheckDeps): void {
+  schemaCheckDeps = deps;
+  schemaChecks.clear();
+}
+
+/** Answers by harness, copy, operation and spec revision: one child per distinct question. */
+const schemaChecks = new Map<string, SchemaCheck>();
+const MAX_SCHEMA_CHECKS = 64;
 
 function harnessPackageVersion(harnessDir: string): string | null {
   const pkg = resolveContained(
@@ -274,69 +268,368 @@ function harnessPackageVersion(harnessDir: string): string | null {
   }
 }
 
-/**
- * Resolve the schema this harness is actually built against.
- *
- * Two guards, both mandatory. The resolved entry point must realpath-contain
- * inside the harness (a hoisted copy elsewhere on the machine is somebody
- * else's code, not this harness's), and every failure degrades to the
- * manager's own copy with a note rather than throwing — a spec tab that 500s
- * because a harness has no `node_modules` would be worse than a badge.
- */
-export async function loadSpecModule(harnessDir: string): Promise<SpecModule> {
-  const cached = specModuleCache.get(harnessDir);
-  if (cached !== undefined) return cached;
-  let resolved: SpecModule = MANAGER_MODULE;
-  try {
-    const entry = Bun.resolveSync("@crewhaus/spec", harnessDir);
-    if (resolveContained(harnessDir, entry) === undefined) {
-      resolved = {
-        ...MANAGER_MODULE,
-        note: "this harness resolves @crewhaus/spec outside its own directory — validated with the manager's copy instead",
-      };
-    } else {
-      const mod = (await import(entry)) as Partial<SpecModule>;
-      if (
-        typeof mod.parseSpec === "function" &&
-        typeof mod.parseSpecIssues === "function" &&
-        typeof mod.specJsonSchema === "function"
-      ) {
-        resolved = {
-          parseSpec: mod.parseSpec,
-          parseSpecIssues: mod.parseSpecIssues,
-          specJsonSchema: mod.specJsonSchema,
-          source: "harness",
-          version: harnessPackageVersion(harnessDir),
-          note: null,
-        };
-      } else {
-        resolved = {
-          ...MANAGER_MODULE,
-          note: "this harness's @crewhaus/spec exports no schema surface this manager understands — validated with the manager's copy",
-        };
-      }
+function rowsOf(
+  issues: ReadonlyArray<{
+    path: ReadonlyArray<string | number>;
+    message: string;
+    code?: string | null;
+  }>,
+): SpecIssueRow[] {
+  return issues.map((issue) => ({
+    path: issue.path.map((p) => String(p)),
+    message: maskText(issue.message),
+    ...(typeof issue.code === "string" ? { code: issue.code } : {}),
+  }));
+}
+
+/** This manager's own schema. */
+function managerCheck(yamlText: string, op: "issues" | "schema", note: string | null): SchemaCheck {
+  let issues: SpecIssueRow[];
+  if (yamlText === "") {
+    issues = [];
+  } else {
+    try {
+      issues = rowsOf(parseSpecIssues(yamlText));
+    } catch (err) {
+      issues = [{ path: [], message: maskText(errText(err)), code: "parser_failed" }];
     }
-  } catch {
-    resolved = {
-      ...MANAGER_MODULE,
-      note: "this harness has no installed @crewhaus/spec — validated with the manager's copy",
-    };
   }
-  specModuleCache.set(harnessDir, resolved);
-  return resolved;
+  if (op === "issues") return { source: "manager", version: null, note, issues };
+  let parsed: unknown;
+  let parseError: string | undefined;
+  try {
+    parsed = parseSpec(yamlText);
+  } catch (err) {
+    parseError = errText(err);
+  }
+  return {
+    source: "manager",
+    version: null,
+    note,
+    issues,
+    schema: specJsonSchema() as Record<string, unknown>,
+    ...(parsed !== undefined ? { parsed } : {}),
+    ...(parseError !== undefined ? { parseError } : {}),
+  };
+}
+
+/**
+ * Check `yamlText` with the schema this harness is built against.
+ *
+ * A harness adopted on this machine whose `@crewhaus/spec` resolves inside
+ * it is checked with that copy, in a child process; anything else, or a
+ * child that cannot answer, with this manager's schema and a note naming
+ * why. Never throws.
+ */
+export async function checkSpec(
+  ctx: Pick<M3Context, "harnessDir" | "adopted">,
+  yamlText: string,
+  op: "issues" | "schema",
+): Promise<SchemaCheck> {
+  const dir = ctx.harnessDir;
+  if (dir === null || ctx.adopted !== true) return managerCheck(yamlText, op, NOT_ADOPTED_NOTE);
+  let resolved: string;
+  try {
+    resolved = Bun.resolveSync("@crewhaus/spec", dir);
+  } catch {
+    return managerCheck(
+      yamlText,
+      op,
+      "this harness has no installed @crewhaus/spec — checked with this CrewHaus's schema",
+    );
+  }
+  const entry = resolveContained(dir, resolved);
+  if (entry === undefined) {
+    return managerCheck(
+      yamlText,
+      op,
+      "this harness resolves @crewhaus/spec outside its own directory — checked with this CrewHaus's schema",
+    );
+  }
+  const version = harnessPackageVersion(dir);
+  const key = [dir, entry, version ?? "", op, specRev(yamlText)].join("\u0000");
+  const cached = schemaChecks.get(key);
+  if (cached !== undefined) return cached;
+  const answer = await validateInHarness(dir, yamlText, { op, entry, ...schemaCheckDeps });
+  if (!answer.ok) {
+    return managerCheck(yamlText, op, `${answer.note} — checked with this CrewHaus's schema`);
+  }
+  const check: SchemaCheck = {
+    source: "harness",
+    version,
+    note: null,
+    issues: rowsOf(answer.issues),
+    ...(answer.schema !== undefined ? { schema: answer.schema } : {}),
+    ...(answer.parsed !== undefined && answer.parsed !== null ? { parsed: answer.parsed } : {}),
+    ...(op === "schema" && (answer.parsed === undefined || answer.parsed === null)
+      ? { parseError: "the spec does not validate against the harness's schema" }
+      : {}),
+  };
+  if (schemaChecks.size >= MAX_SCHEMA_CHECKS) {
+    const oldest = schemaChecks.keys().next().value;
+    if (oldest !== undefined) schemaChecks.delete(oldest);
+  }
+  schemaChecks.set(key, check);
+  return check;
 }
 
 /** Diagnostics, as the plain rows the editor anchors to a field. */
-function issuesOf(mod: SpecModule, yamlText: string): Array<Record<string, unknown>> {
-  if (yamlText === "") return [];
+function issueRows(check: SchemaCheck): Array<Record<string, unknown>> {
+  return check.issues.map((issue) => ({
+    path: issue.path.map((p) => String(p)),
+    message: issue.message,
+    code: issue.code ?? null,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// read-only: a spec with settings this schema does not know
+// ---------------------------------------------------------------------------
+
+export type ReadOnlyState = {
+  readonly reason: string;
+  readonly paths: ReadonlyArray<string>;
+  readonly verb: string;
+};
+
+/**
+ * The settings a schema reports it does not know. Such an issue's `path` is
+ * the PARENT object, and the key names are only in the message
+ * (`Unrecognized key(s) in object: 'a', 'b'`), so each path is the parent
+ * plus each quoted key, falling back to the parent alone.
+ */
+export function unknownKeyPaths(issues: ReadonlyArray<SpecIssueRow>): string[] {
+  const out: string[] = [];
+  for (const issue of issues) {
+    if (issue.code !== "unrecognized_keys") continue;
+    const parent = issue.path.map(String).join(".");
+    const keys = [...issue.message.matchAll(/'([^']+)'/g)].map((m) => m[1] as string);
+    if (keys.length === 0) out.push(parent === "" ? "(root)" : parent);
+    for (const key of keys) out.push(parent === "" ? key : `${parent}.${key}`);
+  }
+  return [...new Set(out)];
+}
+
+/** The read-only state a check implies, or null when the spec may be edited here. */
+export function readOnlyOf(check: SchemaCheck, harnessDir: string | null): ReadOnlyState | null {
+  const paths = unknownKeyPaths(check.issues);
+  if (paths.length === 0) return null;
+  const verb = `cd ${harnessDir ?? "<harness dir>"} && bunx crewhaus`;
+  return {
+    reason: `This harness uses settings this version of CrewHaus doesn't know (${paths.join(", ")}). It's read-only here. Edit it with the CrewHaus that built it (\`${verb} …\`), or upgrade CrewHaus.`,
+    paths,
+    verb,
+  };
+}
+
+export function readOnlyRefusal(state: ReadOnlyState): HttpError {
+  return new HttpError(409, state.reason, {
+    code: "read-only",
+    readOnly: state,
+    verb: state.verb,
+  });
+}
+
+/**
+ * Check the spec a write would start from and refuse a read-only one (409
+ * `read-only`), before any edit is applied to it. Answers the check, so the
+ * caller previews with the same schema ({@link previewHomeEdits}).
+ */
+export async function requireEditable(
+  ctx: Pick<M3Context, "harnessDir" | "adopted">,
+  yamlText: string,
+): Promise<SchemaCheck> {
+  const check = await checkSpec(ctx, yamlText, "issues");
+  const state = readOnlyOf(check, ctx.harnessDir);
+  if (state !== null) throw readOnlyRefusal(state);
+  return check;
+}
+
+// ---------------------------------------------------------------------------
+// the guarded commit every spec write here goes through
+// ---------------------------------------------------------------------------
+
+/**
+ * The revision a write was computed from: `expectedRev` (or `expectedHash`)
+ * from the body, or `?expectedRev=` on a route with no body. A write without
+ * one is answered 428.
+ */
+export function requireExpectedRev(ctx: M3Context): string {
+  const raw = ctx.body["expectedRev"] ?? ctx.body["expectedHash"] ?? ctx.query.get("expectedRev");
+  if (typeof raw !== "string" || raw === "") {
+    throw new HttpError(428, "send the revision you loaded as expectedRev", { verb: null });
+  }
+  return raw;
+}
+
+function nameOf(yamlText: string): string | undefined {
   try {
-    return mod.parseSpecIssues(yamlText).map((issue) => ({
-      path: issue.path.map((p) => String(p)),
-      message: maskText(issue.message),
-      code: issue.code ?? null,
-    }));
-  } catch (err) {
-    return [{ path: [], message: maskText(errText(err)), code: "parser_failed" }];
+    const parsed = parseYamlOnly(yamlText) as unknown;
+    const name = isPlainObject(parsed) ? parsed["name"] : undefined;
+    return typeof name === "string" ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Record a version of `yamlText` in this harness's registry (`.crewhaus/specs`). */
+async function registerHomeVersion(
+  ctx: M3Context,
+  specName: string,
+  yamlText: string,
+): Promise<{ version: string }> {
+  const rootDir = ctx.contain([STATE_DIR, SPECS_SUBDIR]);
+  mkdirSync(rootDir, { recursive: true });
+  const result = await autoRegisterSpecVersion({
+    registry: createFileBackedRegistry({ rootDir }),
+    registryRootDir: rootDir,
+    specName: nameOf(yamlText) ?? specName,
+    yaml: yamlText,
+  });
+  return { version: result.version };
+}
+
+export type HomeCommitOptions = {
+  readonly writer: WriterId;
+  readonly expectedRev: string;
+  /** Run under the optimizer's path restriction. */
+  readonly restrict: boolean;
+  /** The typed name, when the operator typed one. */
+  readonly confirmName?: string | undefined;
+};
+
+/** A commit refused for a reason about the WORLD (the 200 typed envelope). */
+export type HomeCommitRefusal = { readonly refused: Record<string, unknown> };
+
+/**
+ * Commit a batch of edits to this harness's spec through the guarded commit.
+ *
+ * A conflict is answered 412 (`current: {rev, diff, draftId}`), a read-only
+ * spec 409 `read-only`, a rename or budget raise without the typed name 409
+ * carrying `needs`, an over-cap spec 409. A batch the schema rejects comes
+ * back as `{ refused }`, the typed envelope the editor renders beside the field.
+ */
+export async function commitHomeEdits(
+  ctx: M3Context,
+  file: SpecFileRead,
+  edits: readonly SpecEdit[],
+  opts: HomeCommitOptions,
+): Promise<CommitSuccess | HomeCommitRefusal> {
+  const check = await checkSpec(ctx, file.text, "issues");
+  const committed = await commitSpec(
+    { specPath: file.path },
+    { kind: "edits", edits, ...(opts.restrict ? { restrictToOptimizable: true } : {}) },
+    {
+      expectedRev: opts.expectedRev,
+      writer: opts.writer,
+      actor: { kind: "person", by: ctx.operator },
+      confirm: { ...(opts.confirmName !== undefined ? { name: opts.confirmName } : {}) },
+      // The harness's own schema decides; this manager's must not refuse a key it does not know.
+      ...(check.source === "harness" ? { parse: parseYamlOnly } : {}),
+      validate: async (yamlText, { before }) => {
+        if (before !== undefined) {
+          const state = readOnlyOf(await checkSpec(ctx, before, "issues"), ctx.harnessDir);
+          if (state !== null) {
+            return { ok: false, code: "read-only", reason: state.reason, paths: state.paths };
+          }
+        }
+        if (check.source === "harness") {
+          const after = await checkSpec(ctx, yamlText, "issues");
+          if (after.issues.length > 0) {
+            return {
+              ok: false,
+              reason: after.issues.map((i) => i.message).join("; "),
+              issues: after.issues,
+            };
+          }
+        }
+        return { ok: true };
+      },
+      register: async (yamlText) => await registerHomeVersion(ctx, file.specName, yamlText),
+    },
+  );
+  if (committed.ok) return committed;
+  return await homeCommitFailure(ctx, file, edits, committed, check, opts.restrict);
+}
+
+/** Map a refused commit onto Home's answers. Throws for the request-level ones. */
+async function homeCommitFailure(
+  ctx: M3Context,
+  file: SpecFileRead,
+  edits: readonly SpecEdit[],
+  failure: CommitFailure,
+  check: SchemaCheck,
+  restrict: boolean,
+): Promise<HomeCommitRefusal> {
+  switch (failure.code) {
+    case "conflict": {
+      const now = readSpecFile(ctx);
+      const preview = await previewHomeEdits(
+        ctx,
+        now.text,
+        edits,
+        await checkSpec(ctx, now.text, "issues"),
+        { restrict },
+      );
+      throw new HttpError(
+        412,
+        "the spec changed on disk since this editor loaded it — your edit is kept as a draft",
+        {
+          current: {
+            rev: failure.current?.rev ?? now.rev,
+            diff: preview.ok ? preview.diff : (preview.error ?? ""),
+            draftId: failure.draft?.id ?? null,
+          },
+        },
+      );
+    }
+    case "read-only":
+      throw readOnlyRefusal(
+        readOnlyOf(check, ctx.harnessDir) ?? {
+          reason: failure.reason,
+          paths: failure.paths ?? [],
+          verb: `cd ${ctx.harnessDir ?? "<harness dir>"} && bunx crewhaus`,
+        },
+      );
+    case "needs-confirmation":
+      throw new HttpError(
+        409,
+        `${failure.reason} Send "confirmName": "${file.specName}" to apply it.`,
+        {
+          needs: failure.needs ?? "typed-name",
+          warning: failure.reason,
+          paths: failure.paths ?? [],
+          confirmName: file.specName,
+        },
+      );
+    case "too-large":
+      throw new HttpError(409, `${failure.reason}. Edit it with the CLI.`);
+    case "invalid":
+      return {
+        refused: refusal("edit_rejected", maskText(failure.reason), {
+          specName: file.specName,
+          target: file.target,
+          issues: issueRows(check),
+          rev: file.rev,
+          hash: file.hash,
+          verb: "crewhaus compile crewhaus.yaml -o dist",
+        }),
+      };
+    case "unwritable":
+      return { refused: refusal("not_writable", maskText(failure.reason), { rev: file.rev }) };
+  }
+}
+
+/** The confirmations a batch would need: a rename, a budget raise. Empty when it needs none. */
+export function escalationsFor(
+  before: string,
+  edits: readonly SpecEdit[],
+): ReturnType<typeof escalationFor> {
+  try {
+    const after = applySpecEdits(before, edits, { parse: parseYamlOnly }).yaml;
+    return escalationFor(parseYamlOnly(before), parseYamlOnly(after));
+  } catch {
+    return [];
   }
 }
 
@@ -355,260 +648,9 @@ export type SpecTrustRow = {
   readonly reason: string;
 };
 
-/**
- * The human-owned SECURITY surfaces: fields whose blast radius is a
- * permission, a spend, a credential path or a trust boundary rather than an
- * answer's quality. Editing one is legitimate — it just never happens by
- * accident, so these are the paths that demand the redacted diff plus a
- * typed confirmation (or `crewhaus propose`).
- *
- * Everything outside both this table and `OPTIMIZABLE_PATHS` is still
- * human-owned; it simply needs the confirmation without the interstitial.
- */
-export const SECURITY_SURFACES: ReadonlyArray<{
-  /** Segments matched from the ROOT of the path (`anywhere` widens this). */
-  readonly prefix: readonly string[];
-  readonly reason: string;
-  /**
-   * 0.6.0 — match the segments as a contiguous run ANYWHERE in the path
-   * (with `"*"` = any one segment), so one row covers a block that hangs
-   * off several hosts: `model_pool.rules` on `agent`, `steps[i]`, `nodes.x`,
-   * `roles.r` and every `sub_agents.<n>` alike.
-   */
-  readonly anywhere?: true;
-  /** Match this path only, not the fields under it: a block whose own dials stay tunable. */
-  readonly exact?: true;
-}> = [
-  {
-    prefix: ["permissions"],
-    reason:
-      "permissions decide what the agent may do — a widened rule is a security change, not a quality one",
-  },
-  {
-    prefix: ["agent", "model"],
-    reason:
-      "the model roster is never auto-patched: a swap moves cost, latency and behaviour at once",
-  },
-  {
-    prefix: ["agent", "model_pool"],
-    reason: "the candidate pool decides which models may serve traffic",
-  },
-  {
-    prefix: ["agent", "model_fallbacks"],
-    reason: "the failover chain decides which provider answers when the first one is down",
-  },
-  {
-    prefix: ["agent", "model_tiers"],
-    reason: "tier routing decides which model a turn is spent on",
-  },
-  {
-    prefix: ["watchme"],
-    reason:
-      "watch-me is a consent + data-plane posture; the observer is never tuned by the loop it observes",
-  },
-  { prefix: ["plugins"], reason: "plugins load third-party code into the agent at boot" },
-  {
-    prefix: ["expose"],
-    reason: "expose publishes this bundle as an MCP server other clients can call",
-  },
-  {
-    prefix: ["learning", "sources"],
-    reason: "learning sources decide what text is ingested into the agent's knowledge",
-  },
-  { prefix: ["thredz"], reason: "thredz crosses the harness boundary to a hosted wiki" },
-  {
-    prefix: ["sandbox"],
-    reason: "the sandbox is the isolation boundary code execution runs inside",
-  },
-  {
-    prefix: ["tool_config"],
-    anywhere: true,
-    reason: "tool config decides what the agent's tools may reach",
-  },
-  {
-    prefix: ["transaction_policy"],
-    reason: "the transaction policy gates on-chain writes and approvals",
-  },
-  {
-    prefix: ["idempotencyWindowMs"],
-    reason:
-      "the idempotency window decides how long an event or job already acted on is not acted on again",
-  },
-  {
-    prefix: ["mcp_servers"],
-    reason:
-      "an MCP server is third-party code plus its credentials — write it through the connectors tab",
-  },
-  { prefix: ["hooks"], reason: "hooks run commands on the machine at lifecycle points" },
-  { prefix: ["security"], reason: "the security block is the harness's own defence configuration" },
-  { prefix: ["wallets"], reason: "wallets hold funds" },
-  { prefix: ["chains"], reason: "chain bindings decide which network is written to" },
-  { prefix: ["contracts"], reason: "contract bindings decide which addresses are called" },
-  // ---- 0.6.0 (design §8.3, §10.3) — the hybrid-model surfaces. The
-  // optimizer may tune a handful of DIALS inside these blocks (a profile's
-  // `max_tokens`, `rules[*].enabled`, `strategy.shadow.sample_rate`, …), but a
-  // console write to any of them takes the typed confirmation: the same block
-  // carries the roster, the rule targets, the judge identity and the floor.
-  {
-    prefix: ["models"],
-    reason:
-      "a model profile declares identity, tools, permissions and spend for every slot that references it — the roster is never edited by accident",
-  },
-  {
-    prefix: ["model_pool", "rules"],
-    anywhere: true,
-    reason: "routing rules decide which turns leave the cheap lane and which arm serves them",
-  },
-  {
-    prefix: ["model_pool", "strategy"],
-    anywhere: true,
-    reason:
-      "the hybrid strategy names the draft, escalation, guide, shadow and committee arms and registers the Escalate / Consult tools",
-  },
-  {
-    prefix: ["model_pool", "reward"],
-    anywhere: true,
-    reason:
-      "the reward block bounds what the learned policy may exploit (quality source, priors, the floor) — never tuned by the loop it bounds",
-  },
-  {
-    prefix: ["sub_agents", WILDCARD_SEGMENT, "allowed_profiles"],
-    anywhere: true,
-    reason:
-      "the profile allowlist is what a model-filled Task profile argument is validated against — a roster decision for the child",
-  },
-  // A step, a node and a role each carry their own copy of these, and one row
-  // covers all three. Last, so a narrower row's reason answers first.
-  {
-    prefix: ["tools"],
-    anywhere: true,
-    reason: "the tool list decides what this agent can do",
-  },
-  // This group keeps its own `tool_config` row, so a step's, node's or role's
-  // tool config is human-owned whatever the root row above matches.
-  {
-    prefix: ["tool_config"],
-    anywhere: true,
-    reason: "tool config decides what the agent's tools may reach",
-  },
-  {
-    prefix: ["permissions"],
-    anywhere: true,
-    reason:
-      "permissions decide what the agent may do — a widened rule is a security change, not a quality one",
-  },
-  {
-    prefix: ["mcp_servers"],
-    anywhere: true,
-    reason:
-      "an MCP server is third-party code plus its credentials — write it through the connectors tab",
-  },
-  {
-    prefix: ["hitl"],
-    anywhere: true,
-    reason: "a human gate decides where a person signs off on the work",
-  },
-  {
-    prefix: ["model"],
-    anywhere: true,
-    reason:
-      "the model roster is never auto-patched: a swap moves cost, latency and behaviour at once",
-  },
-  {
-    prefix: ["model_pool"],
-    anywhere: true,
-    reason: "the candidate pool decides which models may serve traffic",
-  },
-  // A whole step, node or role, and the list or map that holds them: one value
-  // there can carry every row above at once. A field inside one
-  // (`steps[0].instructions`) is classified on its own.
-  {
-    prefix: ["steps"],
-    exact: true,
-    reason:
-      "the step list holds each step's tools, permissions, models and human gates; a step's own fields stay tunable one at a time",
-  },
-  {
-    prefix: ["steps", WILDCARD_SEGMENT],
-    exact: true,
-    reason:
-      "a step holds its own tools, permissions, models and human gates; its fields stay tunable one at a time",
-  },
-  {
-    prefix: ["nodes"],
-    exact: true,
-    reason:
-      "the node map holds each node's tools, permissions, models and human gates; a node's own fields stay tunable one at a time",
-  },
-  {
-    prefix: ["nodes", WILDCARD_SEGMENT],
-    exact: true,
-    reason:
-      "a node holds its own tools, permissions, models and human gate; its fields stay tunable one at a time",
-  },
-  {
-    prefix: ["roles"],
-    exact: true,
-    reason:
-      "the role map holds each role's tools, permissions and models; a role's own fields stay tunable one at a time",
-  },
-  {
-    prefix: ["roles", WILDCARD_SEGMENT],
-    exact: true,
-    reason:
-      "a role holds its own tools, permissions and models; its fields stay tunable one at a time",
-  },
-  // On-chain bindings. A policy that allows a contract by id reads the address
-  // from these, so they sit beside `contracts` and `chains`.
-  {
-    prefix: ["game", "contract"],
-    reason: "the game contract binding decides which address is called",
-  },
-  {
-    prefix: ["game", "actionsContract"],
-    reason: "the actions contract decides which address a move is sent to",
-  },
-  {
-    prefix: ["game"],
-    exact: true,
-    reason:
-      "the game block holds the contract bindings; its objective and timing stay tunable one field at a time",
-  },
-  {
-    prefix: ["triggers"],
-    reason: "triggers decide which addresses and events wake the agent",
-  },
-  // Every security row of the owner-keys table, derived, never a hand copy.
-  ...DELTA_090_KEYS.filter((key) => key.security).map((key) => ({
-    prefix: key.pattern,
-    reason: key.reason,
-    ...(key.root === true ? {} : { anywhere: true as const }),
-  })),
-];
-
-/** `prefix` matches the path from segment `start` (`"*"` = any one segment). */
-function matchesFrom(prefix: readonly string[], path: readonly string[], start: number): boolean {
-  if (path.length < start + prefix.length) return false;
-  return prefix.every((seg, i) => seg === WILDCARD_SEGMENT || path[start + i] === seg);
-}
-
+/** `prefix` matches `path` from its root (`"*"` in `prefix` = any one segment). */
 function isPrefix(prefix: readonly string[], path: readonly string[]): boolean {
-  return matchesFrom(prefix, path, 0);
-}
-
-/** A security-surface row matches a path root-anchored, or anywhere or exactly when the row says so. */
-function surfaceMatches(
-  surface: (typeof SECURITY_SURFACES)[number],
-  path: readonly string[],
-): boolean {
-  if (surface.exact === true) {
-    return path.length === surface.prefix.length && isPrefix(surface.prefix, path);
-  }
-  if (surface.anywhere !== true) return isPrefix(surface.prefix, path);
-  for (let start = 0; start + surface.prefix.length <= path.length; start++) {
-    if (matchesFrom(surface.prefix, path, start)) return true;
-  }
-  return false;
+  return surfaceMatchesFrom(prefix, path, 0);
 }
 
 function optimizableFor(target: string): ReadonlyArray<readonly string[]> {
@@ -644,7 +686,7 @@ export function isAutoTunable(target: string, path: readonly string[]): boolean 
  */
 export function classifyPath(target: string, segments: readonly string[]): SpecTrustRow {
   const path = segments.join(".");
-  const surface = SECURITY_SURFACES.find((s) => surfaceMatches(s, segments));
+  const surface = surfaceFor(segments);
   if (surface !== undefined) {
     return {
       path,
@@ -873,18 +915,68 @@ function splitByTier(target: string, edits: readonly SpecEdit[]): Split {
 /** Diff a batch WITHOUT writing it. Never throws: a preview that cannot be
  *  produced is itself the thing the interstitial has to say. Shared with the
  *  builders, whose connector writes are spec edits like any other. */
+export type SpecPreview = {
+  readonly ok: boolean;
+  readonly entries: ReadonlyArray<SpecDiffEntry>;
+  readonly diff: string;
+  readonly error: string | null;
+  /** The edited text, UNMASKED (a write source, never an answer); null when the batch does not apply. */
+  readonly yaml: string | null;
+  /** Why it failed: the batch does not apply, or the harness's own schema refuses the result. */
+  readonly stage?: "apply" | "schema";
+};
+
 export function previewSpecEdits(
   before: string,
   edits: readonly SpecEdit[],
-): { ok: boolean; entries: ReadonlyArray<SpecDiffEntry>; diff: string; error: string | null } {
-  if (edits.length === 0) return { ok: true, entries: [], diff: "", error: null };
+  opts: { readonly parse?: (yamlText: string) => Spec; readonly restrict?: boolean } = {},
+): SpecPreview {
+  if (edits.length === 0) return { ok: true, entries: [], diff: "", error: null, yaml: before };
   try {
-    const after = applySpecEdits(before, edits);
+    const after = applySpecEdits(before, edits, {
+      ...(opts.parse !== undefined ? { parse: opts.parse } : {}),
+      ...(opts.restrict === true ? { restrictToOptimizable: true } : {}),
+    });
     const entries = diffEntries(before, after.yaml);
-    return { ok: true, entries, diff: renderDiff(entries), error: null };
+    return { ok: true, entries, diff: renderDiff(entries), error: null, yaml: after.yaml };
   } catch (err) {
-    return { ok: false, entries: [], diff: "", error: maskText(errText(err)) };
+    return {
+      ok: false,
+      entries: [],
+      diff: "",
+      error: maskText(errText(err)),
+      yaml: null,
+      stage: "apply",
+    };
   }
+}
+
+/**
+ * Preview a batch on this harness's spec with the schema that decides for it,
+ * as {@link commitHomeEdits} commits it: where the harness's own schema
+ * answered `check`, the batch is parsed as YAML only and the result is checked
+ * by that schema in its child; otherwise this manager's schema decides.
+ */
+export async function previewHomeEdits(
+  ctx: Pick<M3Context, "harnessDir" | "adopted">,
+  before: string,
+  edits: readonly SpecEdit[],
+  check: SchemaCheck,
+  opts: { readonly restrict?: boolean } = {},
+): Promise<SpecPreview> {
+  if (check.source !== "harness") return previewSpecEdits(before, edits, opts);
+  const preview = previewSpecEdits(before, edits, { ...opts, parse: parseYamlOnly });
+  if (!preview.ok || preview.yaml === null || edits.length === 0) return preview;
+  const after = await checkSpec(ctx, preview.yaml, "issues");
+  if (after.issues.length === 0) return preview;
+  return {
+    ok: false,
+    entries: [],
+    diff: "",
+    error: after.issues.map((i) => i.message).join("; "),
+    yaml: null,
+    stage: "schema",
+  };
 }
 
 /**
@@ -893,104 +985,114 @@ export function previewSpecEdits(
  *   - all-auto-tunable → applied under `restrictToOptimizable`, the same
  *     restriction the optimizer runs under;
  *   - any human-owned path with no typed confirmation → 409 carrying the
- *     redacted preview the interstitial renders, and the name of the route
- *     that turns the same batch into a review PR;
+ *     redacted preview the interstitial renders, the name of the route that
+ *     turns the same batch into a review PR, and — for a rename or a budget
+ *     raise — what it needs and why;
  *   - human-owned WITH the confirmation → applied unrestricted, because the
  *     operator has now said the sentence the machine may not say for them.
+ *
+ * Every write is one guarded commit ({@link commitHomeEdits}) against the
+ * revision the editor loaded, and records a version.
  */
 async function applyBatch(
   ctx: M3Context,
   edits: readonly SpecEdit[],
   gated = true,
+  writer: WriterId = "home.spec",
 ): Promise<Record<string, unknown>> {
   const file = readSpecFile(ctx);
-  const mod = await loadSpecModule(ctx.harnessDir as string);
   if (!file.present) {
     return refusal("no_spec", `this harness has no ${SPEC_FILE} to edit`, {
       verb: "crewhaus init",
     });
   }
-  // Before ANY of the rest: the read this batch would be applied to, and
-  // written back from, has to be the whole document.
+  // Before ANY of the rest: the read this batch would be applied to has to
+  // be the whole document.
   requireWholeSpec(file);
-  const expected = ctx.body["expectedHash"];
-  if (typeof expected === "string" && expected !== "" && expected !== file.hash) {
-    throw new HttpError(
-      409,
-      "the spec changed on disk since this editor loaded it — re-read it and re-apply",
-    );
-  }
+  const check = await checkSpec(ctx, file.text, "issues");
+  const readOnly = readOnlyOf(check, ctx.harnessDir);
   const { auto, human } = splitByTier(file.target, edits);
-  const confirmed = ctx.body["confirmName"] !== undefined;
-  if (gated && human.length > 0 && !confirmed) {
-    // The interstitial's data: what would change, and why it is gated.
-    const preview = previewSpecEdits(file.text, edits);
-    throw new HttpError(
-      409,
-      `${human.length} of these ${edits.length} edits touch human-owned paths (${human
-        .map((row) => row.path)
-        .join(
-          ", ",
-        )}) — send "confirmName": "${file.specName}" to apply them here, or POST the same batch to /spec/propose for review. Preview: ${
-        preview.diff === "" ? "no structural change" : preview.diff
-      }`,
-    );
-  }
-  if (gated && human.length > 0) requireTypedConfirm(ctx.body, file.specName);
 
   if (edits.length === 0) {
     // A zero-edit batch is the no-op the editor uses to re-read and rebase.
-    // `applySpecEdits` would re-validate the file and throw on a spec that
-    // does not parse, which is not an answer to "apply nothing".
+    // It writes nothing, so it needs no revision.
     return {
       ok: true,
       applied: 0,
+      rev: file.rev,
       hash: file.hash,
       specName: file.specName,
       target: file.target,
       tiers: { autoTunable: auto, humanOwned: human },
       entries: [],
       diff: "",
-      issues: issuesOf(mod, file.text),
-      schemaSource: mod.source,
+      issues: issueRows(check),
+      schemaSource: check.source,
+      readOnly,
       note: "nothing to apply — the spec is unchanged",
     };
   }
-
-  let applied: { yaml: string; applied: number };
-  try {
-    applied = applySpecEdits(
-      file.text,
-      edits,
-      human.length === 0 ? { restrictToOptimizable: true } : {},
+  if (readOnly !== null) throw readOnlyRefusal(readOnly);
+  const expectedRev = requireExpectedRev(ctx);
+  const confirmed = ctx.body["confirmName"] !== undefined;
+  if (gated && human.length > 0 && !confirmed) {
+    // The interstitial's data: what would change, and why it is gated.
+    const preview = await previewHomeEdits(ctx, file.text, edits, check);
+    const escalations = escalationsFor(file.text, edits);
+    const warning = escalations.map((e) => e.reason).join(" ");
+    throw new HttpError(
+      409,
+      `${human.length} of these ${edits.length} edits touch human-owned paths (${human
+        .map((row) => row.path)
+        .join(
+          ", ",
+        )}) — send "confirmName": "${file.specName}" to apply them here, or POST the same batch to /spec/propose for review.${
+        warning === "" ? "" : ` ${warning}`
+      } Preview: ${preview.diff === "" ? "no structural change" : preview.diff}`,
+      escalations.length > 0
+        ? {
+            needs:
+              escalations.find((e) => e.needs === "h.spec.edit.security")?.needs ?? "typed-name",
+            warning,
+            paths: escalations.flatMap((e) => e.paths),
+            confirmName: file.specName,
+          }
+        : undefined,
     );
-  } catch (err) {
-    // The batch produced text the schema rejects — often because the spec was
-    // already invalid. A fact about the file, rendered beside the field.
-    return refusal("edit_rejected", maskText(errText(err)), {
-      specName: file.specName,
-      target: file.target,
-      tiers: { autoTunable: auto, humanOwned: human },
-      issues: issuesOf(mod, file.text),
-      hash: file.hash,
-      verb: "crewhaus compile crewhaus.yaml -o dist",
-    });
   }
-  const entries = diffEntries(file.text, applied.yaml);
-  writeSpecFile(file.path, applied.yaml);
+  if (gated && human.length > 0) requireTypedConfirm(ctx.body, file.specName);
+
+  const committed = await commitHomeEdits(ctx, file, edits, {
+    writer,
+    expectedRev,
+    restrict: human.length === 0,
+    confirmName: typeof ctx.body["confirmName"] === "string" ? ctx.body["confirmName"] : undefined,
+  });
+  if ("refused" in committed) {
+    return { ...committed.refused, tiers: { autoTunable: auto, humanOwned: human } };
+  }
+  const after = await checkSpec(ctx, committed.yaml, "issues");
   return {
     ok: true,
-    applied: applied.applied,
-    hash: hashOf(applied.yaml),
+    applied: committed.applied ?? 0,
+    wrote: committed.wrote,
+    rev: committed.rev,
+    hash: committed.rev,
+    registered: committed.registered ?? null,
+    formatting: committed.formatting,
     specName: file.specName,
     target: file.target,
     tiers: { autoTunable: auto, humanOwned: human },
-    entries,
-    diff: renderDiff(entries),
-    issues: issuesOf(mod, applied.yaml),
-    yaml: maskSpecYaml(applied.yaml),
-    schemaSource: mod.source,
-    note: "the new version is registered on the next `crewhaus compile` — the manager never writes the version registry behind the compiler's back",
+    entries: committed.entries,
+    diff: renderDiff(committed.entries),
+    issues: issueRows(after),
+    yaml: maskSpecYaml(committed.yaml),
+    schemaSource: check.source,
+    note:
+      committed.note ??
+      (committed.wrote
+        ? `written and recorded as version ${committed.registered ?? "(none)"}`
+        : "the spec already says this — nothing was written"),
   };
 }
 
@@ -1005,8 +1107,9 @@ async function applyBatch(
 export async function commitSpecEdits(
   ctx: M3Context,
   edits: readonly SpecEdit[],
+  writer: WriterId = "home.builder",
 ): Promise<Record<string, unknown>> {
-  return await applyBatch(ctx, edits, false);
+  return await applyBatch(ctx, edits, false, writer);
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,8 +1225,9 @@ const VERSIONS_VERB = "crewhaus spec put <name> <version> crewhaus.yaml";
 /**
  * `PUT /api/h/:id/spec` — apply a BATCH of spec edits.
  *
- * Body: `{ edits: SpecEdit[], expectedHash?, confirmName? }`. Answers the
- * re-validated diagnostics and the new content hash so the editor rebases.
+ * Body: `{ edits: SpecEdit[], expectedRev, confirmName? }` (`expectedHash`
+ * is the same field's earlier name). Answers the re-validated diagnostics,
+ * the new revision and the recorded version, so the editor rebases.
  */
 export const specEdit: M3Handler = async (ctx) => await applyBatch(ctx, parseEdits(ctx.body));
 
@@ -1149,15 +1253,21 @@ export const specPatch: M3Handler = async (ctx) => {
 export const specDiff: M3Handler = async (ctx) => {
   const edits = parseEdits(ctx.body);
   const file = readSpecFile(ctx);
-  const mod = await loadSpecModule(ctx.harnessDir as string);
+  const check = await checkSpec(ctx, file.text, "issues");
+  const readOnly = readOnlyOf(check, ctx.harnessDir);
   const { auto, human } = splitByTier(file.target, edits);
-  const preview = previewSpecEdits(file.text, edits);
+  const preview = await previewHomeEdits(ctx, file.text, edits, check);
+  const escalations = escalationsFor(file.text, edits);
   return {
     ok: preview.ok,
     ...(preview.ok ? {} : { code: "edit_rejected", reason: preview.error }),
     specName: file.specName,
     target: file.target,
+    rev: file.rev,
     hash: file.hash,
+    readOnly,
+    /** A rename or a budget raise: what it needs, and the sentence the confirmation shows. */
+    escalations: escalations.map((e) => ({ needs: e.needs, warning: e.reason, paths: e.paths })),
     /** A preview of a spec read past the cap is a preview of its HEAD; the
      *  write path refuses that batch, so the flag says why in advance. */
     truncated: file.truncated,
@@ -1165,10 +1275,10 @@ export const specDiff: M3Handler = async (ctx) => {
     diff: preview.diff,
     tiers: { autoTunable: auto, humanOwned: human },
     /** True when this batch may be applied straight from the editor. */
-    autoApplicable: human.length === 0 && !file.truncated,
+    autoApplicable: human.length === 0 && !file.truncated && readOnly === null,
     confirmName: human.length > 0 ? file.specName : null,
     proposeRoute: human.length > 0 ? "specPropose" : null,
-    issues: issuesOf(mod, file.text),
+    issues: issueRows(check),
   };
 };
 
@@ -1218,15 +1328,15 @@ export function narrowSchema(
  */
 export const specSchema: M3Handler = async (ctx) => {
   const file = readSpecFile(ctx);
-  const mod = await loadSpecModule(ctx.harnessDir as string);
+  const check = await checkSpec(ctx, file.text, "schema");
   if (!file.present) {
     return {
       ...base(false, `no ${SPEC_FILE} in this harness`, "crewhaus init"),
       specName: file.specName,
       target: null,
       schema: null,
-      schemaSource: mod.source,
-      schemaVersion: mod.version,
+      schemaSource: check.source,
+      schemaVersion: check.version,
       effective: [],
       effectiveNote: null,
       declaredCount: 0,
@@ -1234,14 +1344,16 @@ export const specSchema: M3Handler = async (ctx) => {
       issues: [],
       warnings: [],
       warningsVerb: "crewhaus compile crewhaus.yaml -o dist",
+      rev: file.rev,
       hash: file.hash,
+      readOnly: null,
       truncated: false,
     };
   }
   let schema: Record<string, unknown> | null = null;
-  let schemaNote: string | null = mod.note;
+  let schemaNote: string | null = check.note;
   try {
-    const narrowed = narrowSchema(mod.specJsonSchema(), file.target);
+    const narrowed = narrowSchema(check.schema ?? {}, file.target);
     schema = narrowed.schema;
     if (!narrowed.narrowed) {
       schemaNote =
@@ -1254,11 +1366,11 @@ export const specSchema: M3Handler = async (ctx) => {
 
   let effective: EffectiveRow[] = [];
   let effectiveNote: string | null = null;
-  try {
-    effective = effectiveConfig(mod.parseSpec(file.text), file.text);
-  } catch (err) {
+  if (check.parsed !== undefined) {
+    effective = effectiveConfig(check.parsed, file.text);
+  } else {
     effectiveNote = `defaults cannot be materialized until the spec validates: ${maskText(
-      errText(err),
+      check.parseError ?? "the spec does not validate",
     )}`;
   }
   const declaredCount = effective.filter((row) => row.source === "declared").length;
@@ -1267,19 +1379,23 @@ export const specSchema: M3Handler = async (ctx) => {
     specName: file.specName,
     target: file.target,
     schema,
-    schemaSource: mod.source,
-    schemaVersion: mod.version,
+    schemaSource: check.source,
+    schemaVersion: check.version,
     effective,
     effectiveNote,
     declaredCount,
     defaultedCount: effective.length - declaredCount,
-    issues: issuesOf(mod, file.text),
+    issues: issueRows(check),
     /** Compile warnings (accepted-but-unwired keys) come from the compiler,
      *  which this server does not run: naming the verb is the honest answer
      *  until the manager can read a compile report. */
     warnings: [],
     warningsVerb: "crewhaus compile crewhaus.yaml -o dist",
+    /** The revision every write sends back as `expectedRev`. */
+    rev: file.rev,
     hash: file.hash,
+    /** Set when the spec carries settings the schema in use does not know: no write is taken. */
+    readOnly: readOnlyOf(check, ctx.harnessDir),
     /** This VIEW may show the head of an over-cap spec; the write path
      *  refuses it. The flag is what stops the two reading as the same file. */
     truncated: file.truncated,
@@ -1294,7 +1410,7 @@ export const specSchema: M3Handler = async (ctx) => {
  * fields from this; the server enforces the same table on write, so the two
  * can never disagree.
  */
-export const specTrust: M3Handler = (ctx) => {
+export const specTrust: M3Handler = async (ctx) => {
   const file = readSpecFile(ctx);
   if (!file.present) {
     return {
@@ -1306,9 +1422,12 @@ export const specTrust: M3Handler = (ctx) => {
       humanOwnedCount: 0,
       securitySurfaceCount: 0,
       confirmName: file.specName,
+      rev: file.rev,
+      readOnly: null,
       truncated: false,
     };
   }
+  const readOnly = readOnlyOf(await checkSpec(ctx, file.text, "issues"), ctx.harnessDir);
   const paths = declaredPaths(file.text).map((segments) => classifyPath(file.target, segments));
   const auto = paths.filter((row) => row.tier === "auto-tunable").length;
   return {
@@ -1324,6 +1443,8 @@ export const specTrust: M3Handler = (ctx) => {
     humanOwnedCount: paths.length - auto,
     securitySurfaceCount: paths.filter((row) => row.securitySurface).length,
     confirmName: file.specName,
+    rev: file.rev,
+    readOnly,
     /** True ⇒ these are the paths of the spec's HEAD only, and no edit from
      *  this table will be applied. */
     truncated: file.truncated,
@@ -1644,7 +1765,6 @@ const PROPOSAL_PATH_RE = /^\.crewhaus\/proposals\/hangar-[0-9]{1,20}\/proposed\.
 export const specPropose: M3Handler = async (ctx) => {
   const edits = parseEdits(ctx.body);
   const file = readSpecFile(ctx);
-  const mod = await loadSpecModule(ctx.harnessDir as string);
   if (!file.present) {
     return refusal("no_spec", `this harness has no ${SPEC_FILE} to propose against`, {
       verb: "crewhaus init",
@@ -1654,10 +1774,11 @@ export const specPropose: M3Handler = async (ctx) => {
   // — so a capped read would put a mutilated spec into the review bundle and
   // ask a human to approve it. Same refusal as a direct write.
   requireWholeSpec(file);
-  const preview = previewSpecEdits(file.text, edits);
-  if (!preview.ok) {
+  const check = await requireEditable(ctx, file.text);
+  const preview = await previewHomeEdits(ctx, file.text, edits, check);
+  if (!preview.ok || preview.yaml === null) {
     return refusal("edit_rejected", preview.error ?? "the batch does not apply", {
-      issues: issuesOf(mod, file.text),
+      issues: issueRows(check),
       verb: "crewhaus compile crewhaus.yaml -o dist",
     });
   }
@@ -1668,7 +1789,7 @@ export const specPropose: M3Handler = async (ctx) => {
     });
   }
   const { auto, human } = splitByTier(file.target, edits);
-  const proposed = applySpecEdits(file.text, edits).yaml;
+  const proposed = preview.yaml;
   const stamp = String(ctx.now());
   const rel = `${STATE_DIR}/${PROPOSAL_SUBDIR}/hangar-${stamp}/${PROPOSAL_FILE}`;
   if (!PROPOSAL_PATH_RE.test(rel)) {
@@ -1702,5 +1823,73 @@ export const specPropose: M3Handler = async (ctx) => {
     note: dryRun
       ? 'dry run: the review bundle is assembled and printed, and no branch or PR is opened. Send "dryRun": false to open one.'
       : "the proposal opens a review PR and never auto-merges — the human gate is the PR itself",
+  };
+};
+
+/**
+ * One kept edit as a view: its path, and its value redacted when any segment
+ * of the path names a credential (an edit's own keys are only `path` and
+ * `value`, so a key-name masker never sees the setting it writes).
+ */
+function maskDraftEdit(raw: unknown): unknown {
+  if (!isPlainObject(raw)) return maskDeep(raw);
+  const path = Array.isArray(raw["path"]) ? (raw["path"] as unknown[]) : [];
+  const underCredential = path.some((seg) => typeof seg === "string" && isCredentialKey(seg));
+  const out: Record<string, unknown> = { path: path.map((seg) => maskDeep(seg)) };
+  if ("value" in raw) out["value"] = underCredential ? REDACTED_VALUE : maskDeep(raw["value"]);
+  if (typeof raw["rationale"] === "string") out["rationale"] = maskText(raw["rationale"]);
+  return out;
+}
+
+/**
+ * `GET /api/h/:id/spec/drafts/:draft` — a draft kept when a write found the
+ * spec changed on disk.
+ *
+ * Answers the draft (masked: a text draft as spec YAML, an edit draft as a
+ * tree) and the diff it would make on top of the spec as it is now. An id
+ * that is not a draft id, or names no draft, is a 404.
+ */
+export const specDraft: M3Handler = async (ctx) => {
+  const id = ctx.params["draft"] ?? "";
+  if (!DRAFT_ID_RE.test(id)) throw new HttpError(404, "no such draft");
+  try {
+    // Per file, through the dispatcher's closure: a draft is read only from inside the harness.
+    ctx.contain([STATE_DIR, "run", "spec", "drafts", `${id}.json`]);
+  } catch {
+    throw new HttpError(404, "no such draft");
+  }
+  const file = readSpecFile(ctx);
+  const draft = readSpecDraft(file.path, id);
+  if (draft === undefined) throw new HttpError(404, "no such draft");
+  let diff = "";
+  let yaml: string | null = null;
+  let edits: unknown = null;
+  if (typeof draft.text === "string") {
+    yaml = maskSpecYaml(draft.text);
+    try {
+      diff = renderDiff(diffEntries(file.text, draft.text));
+    } catch (err) {
+      diff = maskText(errText(err));
+    }
+  } else if (Array.isArray(draft.edits)) {
+    edits = draft.edits.map(maskDraftEdit);
+    const preview = await previewHomeEdits(
+      ctx,
+      file.text,
+      draft.edits,
+      await checkSpec(ctx, file.text, "issues"),
+    );
+    diff = preview.ok ? preview.diff : (preview.error ?? "");
+  }
+  return {
+    ...base(true, null, null),
+    draftId: id,
+    at: typeof draft.at === "string" ? draft.at : null,
+    writer: typeof draft.writer === "string" ? draft.writer : null,
+    baseRev: typeof draft.baseRev === "string" ? draft.baseRev : null,
+    currentRev: file.rev,
+    yaml,
+    edits,
+    diff,
   };
 };

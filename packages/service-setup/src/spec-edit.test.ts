@@ -32,9 +32,9 @@ function writeSpec(yaml: string, file = "crewhaus.yaml"): string {
 }
 
 /** Capture a thrown `ServiceSetupError`, asserting that one was thrown. */
-function caught(fn: () => unknown): ServiceSetupError {
+async function caught(fn: () => unknown): Promise<ServiceSetupError> {
   try {
-    fn();
+    await fn();
   } catch (err) {
     expect(err).toBeInstanceOf(ServiceSetupError);
     return err as ServiceSetupError;
@@ -78,9 +78,9 @@ gateway:
 `;
 
 describe("setThredzSpace", () => {
-  test("changes only the thredz.space line, leaving comments and order intact", () => {
+  test("changes only the thredz.space line, leaving comments and order intact", async () => {
     const specPath = writeSpec(COMMENTED_SPEC);
-    const result = setThredzSpace(specPath, "crew-secretary");
+    const result = await setThredzSpace(specPath, "crew-secretary");
 
     expect(result).toEqual({
       file: "crewhaus.yaml",
@@ -109,7 +109,7 @@ describe("setThredzSpace", () => {
     expect(after.split("\n").length).toBe(COMMENTED_SPEC.split("\n").length);
   });
 
-  test("adds space inside the thredz map when the key is absent", () => {
+  test("adds space inside the thredz map when the key is absent", async () => {
     const source = `name: secretary
 
 thredz:
@@ -121,7 +121,7 @@ gateway:
   port: 4601
 `;
     const specPath = writeSpec(source);
-    expect(setThredzSpace(specPath, "crew-secretary").outcome).toBe("set");
+    expect((await setThredzSpace(specPath, "crew-secretary")).outcome).toBe("set");
 
     const after = readFileSync(specPath, "utf8");
     const lines = after.split("\n");
@@ -148,12 +148,12 @@ gateway:
     );
   });
 
-  test("is unchanged, and leaves the bytes alone, when the value already matches", () => {
+  test("is unchanged, and leaves the bytes alone, when the value already matches", async () => {
     const specPath = writeSpec(COMMENTED_SPEC);
     const before = readFileSync(specPath);
     const mtimeBefore = statSync(specPath).mtimeMs;
 
-    const result = setThredzSpace(specPath, "old-space");
+    const result = await setThredzSpace(specPath, "old-space");
     expect(result).toEqual({
       file: "crewhaus.yaml",
       path: "thredz.space",
@@ -165,42 +165,42 @@ gateway:
     expect(statSync(specPath).mtimeMs).toBe(mtimeBefore);
   });
 
-  test("re-running after a set is a no-op", () => {
+  test("re-running after a set is a no-op", async () => {
     const specPath = writeSpec(COMMENTED_SPEC);
-    expect(setThredzSpace(specPath, "crew-secretary").outcome).toBe("set");
+    expect((await setThredzSpace(specPath, "crew-secretary")).outcome).toBe("set");
     const afterFirst = readFileSync(specPath);
-    expect(setThredzSpace(specPath, "crew-secretary").outcome).toBe("unchanged");
+    expect((await setThredzSpace(specPath, "crew-secretary")).outcome).toBe("unchanged");
     expect(readFileSync(specPath).equals(afterFirst)).toBe(true);
   });
 
-  test("reports the spec's own basename, not the full path", () => {
+  test("reports the spec's own basename, not the full path", async () => {
     const specPath = writeSpec(COMMENTED_SPEC, "secretary.crewhaus.yaml");
-    expect(setThredzSpace(specPath, "x").file).toBe("secretary.crewhaus.yaml");
+    expect((await setThredzSpace(specPath, "x")).file).toBe("secretary.crewhaus.yaml");
   });
 });
 
 describe("setThredzSpace refusals", () => {
-  test("no thredz: block at all", () => {
+  test("no thredz: block at all", async () => {
     const specPath = writeSpec("name: n\ntarget: channel\n");
-    const err = caught(() => setThredzSpace(specPath, "s"));
+    const err = await caught(() => setThredzSpace(specPath, "s"));
     expect(err.service).toBe("harness");
     expect(err.message).toBe("crewhaus.yaml has no thredz: block to scope");
     expect(err.options.fix).toContain("add a thredz: block");
     expect(err.failureClass).toBe("config");
   });
 
-  test("an empty `thredz:` key is treated as no block", () => {
-    const err = caught(() => setThredzSpace(writeSpec("name: n\nthredz:\n"), "s"));
+  test("an empty `thredz:` key is treated as no block", async () => {
+    const err = await caught(() => setThredzSpace(writeSpec("name: n\nthredz:\n"), "s"));
     expect(err.message).toContain("has no thredz: block");
   });
 
-  test("`thredz: false` is no block either", () => {
-    const err = caught(() => setThredzSpace(writeSpec("name: n\nthredz: false\n"), "s"));
+  test("`thredz: false` is no block either", async () => {
+    const err = await caught(() => setThredzSpace(writeSpec("name: n\nthredz: false\n"), "s"));
     expect(err.message).toContain("has no thredz: block");
   });
 
-  test("the boolean shorthand says so and shows the expansion", () => {
-    const err = caught(() => setThredzSpace(writeSpec("name: n\nthredz: true\n"), "s"));
+  test("the boolean shorthand says so and shows the expansion", async () => {
+    const err = await caught(() => setThredzSpace(writeSpec("name: n\nthredz: true\n"), "s"));
     expect(err.service).toBe("harness");
     expect(err.message).toBe(
       "crewhaus.yaml uses the thredz shorthand (`thredz: true`), which has nowhere to put a space",
@@ -208,35 +208,35 @@ describe("setThredzSpace refusals", () => {
     expect(err.options.fix).toContain("api_key: $YOUR_KEY_VAR");
   });
 
-  test("the string shorthand names the form but NEVER the value", () => {
+  test("the string shorthand names the form but NEVER the value", async () => {
     // In the string shorthand the scalar IS the Thredz api_key, and the spec
     // schema accepts a literal there — so echoing it would print a live
     // credential to stdout. Name the form instead.
-    const err = caught(() => setThredzSpace(writeSpec("name: n\nthredz: $MY_KEY\n"), "s"));
+    const err = await caught(() => setThredzSpace(writeSpec("name: n\nthredz: $MY_KEY\n"), "s"));
     expect(err.message).toBe(
       "crewhaus.yaml uses the thredz shorthand (`thredz: <value>`), which has nowhere to put a space",
     );
     expect(err.message).not.toContain("MY_KEY");
-    const literal = caught(() =>
+    const literal = await caught(() =>
       setThredzSpace(writeSpec("name: n\nthredz: thredz_liveSECRET0123\n"), "s"),
     );
     expect(literal.message).not.toContain("thredz_liveSECRET0123");
     expect(err.options.fix).toContain("expand it to the object form");
   });
 
-  test("a non-mapping thredz block is its own distinct message", () => {
+  test("a non-mapping thredz block is its own distinct message", async () => {
     for (const yaml of ["thredz:\n  - api_key: $K\n", "thredz: [1, 2]\n", "thredz: 42\n"]) {
-      const err = caught(() => setThredzSpace(writeSpec(yaml), "s"));
+      const err = await caught(() => setThredzSpace(writeSpec(yaml), "s"));
       expect(err.service).toBe("harness");
       expect(err.message).toBe("crewhaus.yaml's thredz: block is not a mapping");
       expect(err.options.fix).toContain("mapping with an api_key key");
     }
   });
 
-  test("a literal api_key refuses — setup will not sit beside a plaintext credential", () => {
+  test("a literal api_key refuses — setup will not sit beside a plaintext credential", async () => {
     const source = "name: n\nthredz:\n  api_key: thr_live_abc123\n";
     const specPath = writeSpec(source);
-    const err = caught(() => setThredzSpace(specPath, "crew"));
+    const err = await caught(() => setThredzSpace(specPath, "crew"));
     expect(err.service).toBe("harness");
     expect(err.message).toBe(
       "crewhaus.yaml inlines a literal thredz.api_key — setup will not add configuration beside a plaintext credential",
@@ -248,7 +248,7 @@ describe("setThredzSpace refusals", () => {
     expect(err.message).not.toContain("thr_live_abc123");
   });
 
-  test("every refusal leaves the file byte-identical", () => {
+  test("every refusal leaves the file byte-identical", async () => {
     for (const yaml of [
       "name: n\n",
       "name: n\nthredz: true\n",
@@ -257,35 +257,35 @@ describe("setThredzSpace refusals", () => {
       "thredz:\n  api_key: plaintext\n",
     ]) {
       const specPath = writeSpec(yaml);
-      caught(() => setThredzSpace(specPath, "s"));
+      await caught(() => setThredzSpace(specPath, "s"));
       expect(readFileSync(specPath, "utf8")).toBe(yaml);
     }
   });
 });
 
 describe("previewThredzSpace", () => {
-  test("renders (unset) → slug when there is no space key", () => {
+  test("renders (unset) → slug when there is no space key", async () => {
     const specPath = writeSpec("thredz:\n  api_key: $K\n");
     expect(previewThredzSpace(specPath, "crew-secretary")).toBe(
       'thredz.space: (unset) → "crew-secretary"',
     );
   });
 
-  test("renders old → new when the space changes", () => {
+  test("renders old → new when the space changes", async () => {
     const specPath = writeSpec(COMMENTED_SPEC);
     expect(previewThredzSpace(specPath, "crew-secretary")).toBe(
       'thredz.space: old-space → "crew-secretary"',
     );
   });
 
-  test("says so when the file already reads the slug", () => {
+  test("says so when the file already reads the slug", async () => {
     const specPath = writeSpec(COMMENTED_SPEC);
     expect(previewThredzSpace(specPath, "old-space")).toBe(
       'thredz.space already reads "old-space"',
     );
   });
 
-  test("reports the refusals the apply would raise, instead of implying success", () => {
+  test("reports the refusals the apply would raise, instead of implying success", async () => {
     // A dry run is read specifically to decide whether to proceed, so it must
     // not render `(unset) → "s"` for a spec setThredzSpace will throw on.
     // Both paths share one verdict, so they cannot drift.
@@ -298,7 +298,7 @@ describe("previewThredzSpace", () => {
     );
   });
 
-  test("every preview refusal corresponds to a real setThredzSpace throw", () => {
+  test("every preview refusal corresponds to a real setThredzSpace throw", async () => {
     for (const body of [
       "name: n\n",
       "thredz: true\n",
@@ -307,11 +307,11 @@ describe("previewThredzSpace", () => {
     ]) {
       const specPath = writeSpec(body);
       expect(previewThredzSpace(specPath, "s")).toContain("cannot set thredz.space");
-      expect(() => setThredzSpace(specPath, "s")).toThrow();
+      await expect(setThredzSpace(specPath, "s")).rejects.toThrow();
     }
   });
 
-  test("never writes the file", () => {
+  test("never writes the file", async () => {
     const specPath = writeSpec(COMMENTED_SPEC);
     const before = readFileSync(specPath);
     const mtimeBefore = statSync(specPath).mtimeMs;

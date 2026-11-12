@@ -15,6 +15,7 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/preflight": "workspace:*",
     "@crewhaus/spec": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*",
     "yaml": "^2.6.0"
   },
   "license": "Apache-2.0",

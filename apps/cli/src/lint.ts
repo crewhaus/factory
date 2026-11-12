@@ -26,6 +26,7 @@ import {
   parseSpecIssues,
   specJsonSchema,
 } from "@crewhaus/spec";
+import { type Splice, applySplices, scalarSplice } from "@crewhaus/spec-patch/minimal-diff";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
@@ -874,7 +875,7 @@ export function suggestSafeName(name: string): string | undefined {
 // -------------------------------------------------------------------------
 
 /** One replacement of a scalar's source text. */
-type ScalarEdit = { readonly start: number; readonly end: number; readonly text: string };
+type ScalarEdit = Splice;
 
 /** What `lint --fix` would change, and what it would only suggest. */
 export type LintFixResult = {
@@ -1158,31 +1159,6 @@ function toolListFixes(
   return out;
 }
 
-/** A replacement for a scalar's source that keeps how it was quoted. */
-function scalarEdit(src: string, node: Scalar, value: string): ScalarEdit | undefined {
-  const range = node.range;
-  if (range === undefined || range === null) return undefined;
-  if (node.type === "BLOCK_LITERAL" || node.type === "BLOCK_FOLDED") return undefined;
-  const [start, end] = range;
-  const written = src.slice(start, end);
-  const quote = written.startsWith('"') ? '"' : written.startsWith("'") ? "'" : "";
-  const text =
-    quote !== ""
-      ? `${quote}${value}${quote}`
-      : /^[A-Za-z0-9_$][\w.$-]*$/.test(value)
-        ? value
-        : JSON.stringify(value);
-  return { start, end, text };
-}
-
-function applyEdits(src: string, edits: ReadonlyArray<ScalarEdit>): string {
-  let out = src;
-  for (const e of [...edits].sort((a, b) => b.start - a.start)) {
-    out = `${out.slice(0, e.start)}${e.text}${out.slice(e.end)}`;
-  }
-  return out;
-}
-
 /**
  * A `lint` finding for each typo in a list that NARROWS a site's tools (a
  * sub-agent's, a model profile's, a pool candidate's). compile passes such a
@@ -1293,7 +1269,7 @@ export function applyLintFixes(
         `tool "${fix.token}" — did you mean ${options}? (not auto-fixed — ${fix.list} is also read through an alias at ${fix.aliasedAt.join(", ")}, which the edit would change too)`,
       );
     } else if (fix.to !== undefined) {
-      const edit = scalarEdit(yamlText, fix.node, fix.to);
+      const edit = scalarSplice(yamlText, fix.node, fix.to);
       if (edit === undefined) continue;
       edits.push(edit);
       applied.push(`tool "${fix.token}" → "${fix.to}" (nearest match)`);
@@ -1312,13 +1288,13 @@ export function applyLintFixes(
     if (!isScalar(node) || typeof node.value !== "string" || fixedNames.has(node)) continue;
     const safe = suggestSafeName(node.value);
     if (safe === undefined) continue;
-    const edit = scalarEdit(yamlText, node, safe);
+    const edit = scalarSplice(yamlText, node, safe);
     if (edit === undefined) continue;
     fixedNames.add(node);
     edits.push(edit);
     applied.push(`name "${node.value}" → "${safe}" (unsafe characters)`);
   }
-  let text = applyEdits(yamlText, edits);
+  let text = applySplices(yamlText, edits);
 
   // A malformed credential reference, one per round, where compile names it.
   const seen = new Set<string>();
@@ -1349,9 +1325,9 @@ export function applyLintFixes(
     if (fixed === undefined) break;
     const current = parseDocument(text);
     const node = credentialScalar(current, label, raw);
-    const edit = node !== undefined ? scalarEdit(text, node, fixed) : undefined;
+    const edit = node !== undefined ? scalarSplice(text, node, fixed) : undefined;
     if (edit === undefined) break;
-    text = applyEdits(text, [edit]);
+    text = applySplices(text, [edit]);
     applied.push(`secret "${raw}" → "${fixed}" ($UPPER_SNAKE_CASE)`);
   }
   return { text, applied, suggested };

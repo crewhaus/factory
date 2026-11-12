@@ -262,6 +262,7 @@ const M3_PARAM_VALUES: Record<string, string> = {
   sampleId: "s1",
   sess: SESS,
   version: "1.2.0",
+  draft: "20260803T000000Z-0000aaaa",
   name: "smoke",
   spec: "contract-harness",
   slug: "how-to-deploy",

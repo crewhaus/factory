@@ -26,6 +26,7 @@
     { "path": "../harness-supervisor" },
     { "path": "../preflight" },
     { "path": "../spec" },
+    { "path": "../spec-changelog" },
     { "path": "../spec-patch" }
   ],
   "include": ["src/**/*"]

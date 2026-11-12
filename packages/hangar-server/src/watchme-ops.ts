@@ -45,10 +45,11 @@
  * through the capped, torn-line-tolerant reader every other JSONL in this
  * package uses.
  */
-import { existsSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parseSpec } from "@crewhaus/spec";
-import { type SpecEdit, applySpecEdits, diffSpecYaml } from "@crewhaus/spec-patch";
+import { type SpecEdit, diffSpecYaml } from "@crewhaus/spec-patch";
+import { specRev } from "@crewhaus/spec-patch/commit";
 import type {
   WatchmeAggregate,
   WatchmeJudgment,
@@ -74,7 +75,15 @@ import {
   specScalar,
 } from "./memory-ops";
 import { readSpecYaml } from "./schedulers";
-import { classifyPath } from "./spec-edit";
+import {
+  classifyPath,
+  commitHomeEdits,
+  previewHomeEdits,
+  readSpecFile,
+  requireEditable,
+  requireExpectedRev,
+  requireWholeSpec,
+} from "./spec-edit";
 
 const START_VERB = "crewhaus watchme start";
 const REPORT_VERB = "crewhaus watchme report";
@@ -288,6 +297,8 @@ export const watchmeAnalytics: M3Handler = (ctx) => {
       START_VERB,
     ),
     watching: state?.["watching"] === true,
+    /** The spec's revision: the toggle sends it back as `expectedRev`. */
+    rev: specRevOf(ctx),
     state: maskDeep(state),
     sessions,
     observations: observations.length,
@@ -561,11 +572,10 @@ function liveSpec(ctx: M3Context): { path: string; text: string } {
   return { path, text };
 }
 
-/** Write the spec back atomically: temp file in the SAME dir, then rename. */
-function writeSpec(path: string, text: string): void {
-  const tmp = `${path}.hangar-watchme-tmp`;
-  writeFileSync(tmp, text, { mode: 0o644 });
-  renameSync(tmp, path);
+/** The live spec's revision, or null when there is no spec to read. */
+function specRevOf(ctx: M3Context): string | null {
+  const text = readSpecYaml(harnessDirOf(ctx));
+  return text === "" ? null : specRev(text);
 }
 
 type EditOutcome = {
@@ -584,13 +594,14 @@ type EditOutcome = {
  * `SECURITY_SURFACES`) need the typed confirmation.
  * Without one this returns the credential-redacted diff and writes nothing:
  * a proposal, which is the fallback the write covenant names. Rendering a
- * proposal is never applying it.
+ * proposal is never applying it. A write sends the revision it previewed
+ * (`expectedRev`) and is the guarded commit every spec write takes.
  */
-function applyOrPropose(
+async function applyOrPropose(
   ctx: M3Context,
   edits: readonly SpecEdit[],
   opts: { confirmed: boolean; restrict: boolean },
-): EditOutcome {
+): Promise<EditOutcome & { rev?: string; registered?: string | null }> {
   let spec: { path: string; text: string };
   try {
     spec = liveSpec(ctx);
@@ -604,31 +615,34 @@ function applyOrPropose(
       note: describeFailure(err),
     };
   }
-  let next: string;
-  try {
-    next = applySpecEdits(
-      spec.text,
-      edits,
-      opts.restrict ? { restrictToOptimizable: true } : {},
-    ).yaml;
-  } catch (err) {
+  // Checked with the schema this harness is built against before any edit is
+  // applied: a read-only spec is refused (409 `read-only`), and the preview
+  // parses the way the guarded commit will.
+  const check = await requireEditable(ctx, spec.text);
+  const preview = await previewHomeEdits(ctx, spec.text, edits, check, {
+    restrict: opts.restrict,
+  });
+  if (!preview.ok || preview.yaml === null) {
     return {
       ok: false,
       applied: false,
       code: "spec_edit_refused",
       diff: [],
-      note: describeFailure(err),
+      note: preview.error ?? "the edit does not apply",
     };
   }
+  const next = preview.yaml;
   // `diffSpecYaml` redacts credential-carrying values itself — this is the
   // interstitial's data source, and it must never quote a secret.
   const diff = diffSpecYaml(spec.text, next);
+  const rev = specRev(spec.text);
   if (!opts.confirmed) {
     return {
       ok: true,
       applied: false,
       code: "needs_typed_confirm",
       diff,
+      rev,
       note: "this path is human-owned — nothing was written; re-send with confirmName set to the spec name, or route it through crewhaus propose",
     };
   }
@@ -638,11 +652,39 @@ function applyOrPropose(
       applied: false,
       code: "no_change",
       diff,
+      rev,
       note: "the spec already says this",
     };
   }
-  writeSpec(spec.path, next);
-  return { ok: true, applied: true, diff, note: "spec written; recompile to make the change live" };
+  const file = readSpecFile(ctx);
+  requireWholeSpec(file);
+  const confirmName = ctx.body["confirmName"];
+  const committed = await commitHomeEdits(ctx, file, edits, {
+    writer: "home.watchme",
+    expectedRev: requireExpectedRev(ctx),
+    restrict: opts.restrict,
+    confirmName: typeof confirmName === "string" ? confirmName : undefined,
+  });
+  if ("refused" in committed) {
+    return {
+      ok: false,
+      applied: false,
+      code: String(committed.refused["code"] ?? "spec_edit_refused"),
+      diff: [],
+      note: String(committed.refused["reason"] ?? "the edit was refused"),
+    };
+  }
+  return {
+    ok: true,
+    applied: committed.wrote,
+    diff: [...committed.entries],
+    rev: committed.rev,
+    registered: committed.registered ?? null,
+    note:
+      committed.registered !== undefined
+        ? `spec written and recorded as version ${committed.registered}; recompile to make the change live`
+        : "spec written; recompile to make the change live",
+  };
 }
 
 /**
@@ -653,14 +695,14 @@ function applyOrPropose(
  * not a write to `watchme/state.json`. Without the typed `confirmName` the
  * route answers with the diff it WOULD write and changes nothing.
  */
-export const watchmeToggle: M3Handler = (ctx) => {
+export const watchmeToggle: M3Handler = async (ctx) => {
   const watching = requireBoolean(ctx.body, "watching");
   if (requireBoolean(ctx.body, "confirm") !== true) {
     throw new HttpError(409, 'toggling watchme needs "confirm": true');
   }
   const specName = harnessSpecName(ctx);
   const confirmed = ctx.body["confirmName"] === specName;
-  const outcome = applyOrPropose(
+  const outcome = await applyOrPropose(
     ctx,
     [
       {
@@ -785,6 +827,7 @@ export const watchmeSynthesized: M3Handler = (ctx) => {
           "crewhaus watchme synthesize",
         ),
         proposals,
+        rev: specRevOf(ctx),
         advisory: true,
       }
     : {
@@ -794,6 +837,8 @@ export const watchmeSynthesized: M3Handler = (ctx) => {
           "crewhaus watchme synthesize",
         ),
         proposals,
+        /** The live spec's revision: an apply sends it back as `expectedRev`. */
+        rev: specRevOf(ctx),
         advisory: true,
       };
 };
@@ -807,7 +852,7 @@ export const watchmeSynthesized: M3Handler = (ctx) => {
  * same restriction and the same propose fallback a hand edit gets: a
  * proposal never earns a privileged channel.
  */
-export const watchmeApply: M3Handler = (ctx) => {
+export const watchmeApply: M3Handler = async (ctx) => {
   const stamp = ctx.params["stamp"] ?? "";
   if (requireBoolean(ctx.body, "confirm") !== true) {
     throw new HttpError(409, 'applying synthesized edits needs "confirm": true');
@@ -892,7 +937,7 @@ export const watchmeApply: M3Handler = (ctx) => {
   // confirm already checked above and runs under the optimizer's path check;
   // anything human-owned needs the typed confirmation, or it comes back as a
   // proposal.
-  const outcome = applyOrPropose(ctx, edits, {
+  const outcome = await applyOrPropose(ctx, edits, {
     confirmed: allAutoTunable || ctx.body["confirmName"] === specName,
     restrict: allAutoTunable,
   });

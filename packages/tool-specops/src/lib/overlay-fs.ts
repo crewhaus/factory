@@ -21,11 +21,17 @@
  * Containment holds inside the seam too: every path a fixer reads or writes
  * goes through `resolveSafe`, not just the ones the caller typed, because a
  * planner composes paths of its own.
+ *
+ * The spec itself is committed through `@crewhaus/spec-patch/commit`, against
+ * the revision of the text the overlay read from disk (or "absent" when the
+ * fixer found no file): a spec changed between the plan and the commit is left
+ * as it is, and the fixed document is kept as a draft.
  */
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { FixFs } from "@crewhaus/harness-advice/doctor-fix";
+import { commitSpec, parseYamlOnly, specRev } from "@crewhaus/spec-patch/commit";
 import { MAX_SPEC_BYTES, readContained, renderPath, resolveInput } from "./sources";
 
 /** A read or write the overlay refused, raised out of a fixer's `apply()`. */
@@ -43,6 +49,12 @@ export type CapturedWrite =
 export type OverlayFs = FixFs & {
   /** Everything `apply()` wrote, in the order it wrote it. */
   captured(): ReadonlyArray<CapturedWrite>;
+  /**
+   * The revision of the text the overlay first read from disk at `p`, or
+   * "absent" when it found no file there (or never looked): the revision a
+   * commit of `p` is guarded by.
+   */
+  baseRev(p: string): string;
 };
 
 /**
@@ -55,6 +67,8 @@ export function createOverlayFs(toolName: string, maxReadBytes = MAX_SPEC_BYTES)
   const writes: CapturedWrite[] = [];
   const fileWrites = new Map<string, string>();
   const dirWrites = new Set<string>();
+  /** What each path held on disk when the overlay first looked at it. */
+  const diskRevs = new Map<string, string>();
 
   /** The key an overlay entry is stored under: the contained, normalised path. */
   const keyOf = (p: string): string => {
@@ -79,7 +93,9 @@ export function createOverlayFs(toolName: string, maxReadBytes = MAX_SPEC_BYTES)
       for (const dir of dirWrites) {
         if (key.startsWith(`${dir}/`)) return true;
       }
-      return existsSync(path.resolve(process.cwd(), key));
+      const onDisk = existsSync(path.resolve(process.cwd(), key));
+      if (!onDisk && !diskRevs.has(key)) diskRevs.set(key, "absent");
+      return onDisk;
     },
     read(p: string): string {
       const key = keyOf(p);
@@ -89,6 +105,7 @@ export function createOverlayFs(toolName: string, maxReadBytes = MAX_SPEC_BYTES)
       if (pending !== undefined) return pending;
       const read = readContained(toolName, key, maxReadBytes);
       if (!read.ok) throw new FixFsError(read.message);
+      if (!diskRevs.has(key)) diskRevs.set(key, specRev(read.value));
       return read.value;
     },
     write(p: string, content: string): void {
@@ -108,6 +125,9 @@ export function createOverlayFs(toolName: string, maxReadBytes = MAX_SPEC_BYTES)
       writes.forEach((w, i) => lastIndex.set(`${w.kind}:${w.path}`, i));
       return writes.filter((w, i) => lastIndex.get(`${w.kind}:${w.path}`) === i);
     },
+    baseRev(p: string): string {
+      return diskRevs.get(keyOf(p)) ?? "absent";
+    },
   };
 }
 
@@ -120,6 +140,19 @@ export type CommitResult = {
    * as a rollback that did not happen.
    */
   readonly error?: string;
+  /** Set when the spec changed after the fixers read it: nothing of it was written. */
+  readonly conflict?: {
+    /** The kept draft of the fixed spec, workspace-relative, when one was kept. */
+    readonly draft?: string;
+  };
+};
+
+/** The spec among the captured writes, and the revision its commit is guarded by. */
+export type SpecCommitTarget = {
+  /** The spec's contained, workspace-relative path (the key captured writes carry). */
+  readonly path: string;
+  /** The revision of the text the fixers read, or "absent" for a spec they created. */
+  readonly baseRev: string;
 };
 
 /**
@@ -131,7 +164,11 @@ export type CommitResult = {
  * denied, a full disk, a race - is reported with the exact prefix that did
  * land, because the caller's next move depends on which half happened.
  */
-export function commitWrites(toolName: string, writes: ReadonlyArray<CapturedWrite>): CommitResult {
+export async function commitWrites(
+  toolName: string,
+  writes: ReadonlyArray<CapturedWrite>,
+  spec?: SpecCommitTarget,
+): Promise<CommitResult> {
   const willExist = new Set<string>();
   for (const w of writes) {
     if (w.kind === "dir") willExist.add(w.path);
@@ -144,9 +181,13 @@ export function commitWrites(toolName: string, writes: ReadonlyArray<CapturedWri
   // make free. `mkdir -p` is idempotent and order-independent, so hoisting the
   // directories is the fix, not a second pre-check that would have to agree
   // with this one.
+  // The spec goes right after the directories: a spec that changed meanwhile
+  // stops the batch before any other file lands.
+  const isSpec = (w: CapturedWrite): boolean => w.kind === "file" && w.path === spec?.path;
   const ordered = [
     ...writes.filter((w) => w.kind === "dir"),
-    ...writes.filter((w) => w.kind !== "dir"),
+    ...writes.filter(isSpec),
+    ...writes.filter((w) => w.kind !== "dir" && !isSpec(w)),
   ];
   for (const w of writes) {
     if (w.kind !== "file") continue;
@@ -181,6 +222,38 @@ export function commitWrites(toolName: string, writes: ReadonlyArray<CapturedWri
       };
     }
     const abs = safe.value.real;
+    if (w.kind === "file" && spec !== undefined && isSpec(w)) {
+      // Already checked by the caller with the schema; the commit adds the
+      // revision check, never a second validation.
+      const result = await commitSpec(
+        { specPath: abs },
+        { kind: "text", text: w.content },
+        {
+          expectedRev: spec.baseRev,
+          writer: "tool.DoctorFix",
+          actor: { kind: "agent" },
+          parse: parseYamlOnly,
+        },
+      );
+      if (!result.ok) {
+        const draft =
+          result.draft !== undefined
+            ? path.relative(process.cwd(), result.draft.path).split(path.sep).join("/")
+            : undefined;
+        return {
+          committed,
+          error:
+            result.code === "conflict"
+              ? `"${w.path}" changed after the fixes read it, so it was not written; ${committed.length} earlier change(s) DID land`
+              : `"${w.path}" was not written (${result.reason}); ${committed.length} earlier change(s) DID land`,
+          ...(result.code === "conflict" ? { conflict: draft !== undefined ? { draft } : {} } : {}),
+        };
+      }
+      if (result.wrote) {
+        committed.push({ path: w.path, bytes: Buffer.byteLength(w.content, "utf8") });
+      }
+      continue;
+    }
     try {
       if (w.kind === "dir") {
         mkdirSync(abs, { recursive: true });

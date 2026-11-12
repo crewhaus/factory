@@ -32,4 +32,18 @@ describe("conflictModel", () => {
     expect(m.diff).toBe("");
     expect(m.draft).toBe("");
   });
+
+  test("an action that could not do what it says is not offered", () => {
+    // No draft text: "Download my draft" would save an empty file.
+    expect(conflictModel({ rev: "r2" }, "").actions.map((a: { id: string }) => a.id)).toEqual([
+      "reapply",
+      "use-disk",
+    ]);
+    // A caller that cannot re-apply: the button would do what "Use the version on disk" does.
+    expect(
+      conflictModel({ rev: "r2" }, "kept", { canReapply: false }).actions.map(
+        (a: { id: string }) => a.id,
+      ),
+    ).toEqual(["use-disk", "download"]);
+  });
 });

@@ -158,6 +158,7 @@ describe("locating the harness", () => {
     expect(
       resolveCrewhausBin("/h", {
         exists: (p) => p === join("/h", "node_modules", ".bin", "crewhaus"),
+        realpath: (p) => p,
         which: (c) => {
           calls.push(c);
           return "/usr/local/bin/crewhaus";
@@ -168,6 +169,50 @@ describe("locating the harness", () => {
     expect(
       resolveCrewhausBin("/h", { exists: () => false, which: () => undefined }),
     ).toBeUndefined();
+  });
+
+  const local = join("/h", "node_modules", ".bin", "crewhaus");
+  const onPath = "/usr/local/bin/crewhaus";
+
+  test("a harness CLI that links outside the harness is passed over for PATH's", () => {
+    expect(
+      resolveCrewhausBin("/h", {
+        exists: (p) => p === local,
+        realpath: (p) => (p === local ? "/elsewhere/crewhaus/cli.js" : p),
+        which: () => onPath,
+      }),
+    ).toBe(onPath);
+  });
+
+  test("a harness CLI that links inside the harness is used", () => {
+    expect(
+      resolveCrewhausBin("/h", {
+        exists: (p) => p === local,
+        realpath: (p) => (p === local ? "/h/node_modules/crewhaus/dist/cli.js" : p),
+        which: () => onPath,
+      }),
+    ).toBe(local);
+  });
+
+  test("allowHarnessLocal: false takes PATH's even when the harness has its own", () => {
+    expect(
+      resolveCrewhausBin("/h", {
+        exists: (p) => p === local,
+        realpath: (p) => p,
+        which: () => onPath,
+        allowHarnessLocal: false,
+      }),
+    ).toBe(onPath);
+  });
+
+  test("a sibling directory that only shares the harness's name prefix is outside it", () => {
+    expect(
+      resolveCrewhausBin("/h", {
+        exists: (p) => p === local,
+        realpath: (p) => (p === local ? "/h-other/node_modules/crewhaus/cli.js" : p),
+        which: () => onPath,
+      }),
+    ).toBe(onPath);
   });
 });
 

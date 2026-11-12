@@ -81,10 +81,6 @@ const EXEMPT: Readonly<Record<string, Exemption>> = {
     sites: 1,
     reason: `.crewhaus/retention.json pins, named by the server's pid. ${WORKSPACE_FOLLOW_UP}`,
   },
-  "packages/hangar-server/src/feedback-ops.ts": {
-    sites: 1,
-    reason: `a spec edit from the Hangar console, named by the server's pid. ${WORKSPACE_FOLLOW_UP}`,
-  },
   "packages/hangar-server/src/rollups.ts": { sites: 1, reason: `the rollup cache; ${HOME}` },
   "packages/harness-registry/src/registry.ts": {
     sites: 1,
@@ -324,7 +320,7 @@ test("no write goes through a temp name derived from its target, unless listed w
   expect([...found.values()].reduce((a, b) => a + b, 0)).toBe(
     Object.values(EXEMPT).reduce((a, e) => a + e.sites, 0),
   );
-  expect([...found.values()].reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(19);
+  expect([...found.values()].reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(18);
 });
 
 test("no append goes through a link at its file, unless listed with its reason", () => {

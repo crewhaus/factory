@@ -31,8 +31,8 @@
  *
  * Catalog layer: F-eval. Brief: 279.
  */
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { Sample } from "@crewhaus/eval-dataset";
 import {
@@ -53,7 +53,7 @@ import {
   formatWriteBackHeader,
   validatePatch,
 } from "@crewhaus/spec-patch";
-import { writeFileSafe } from "@crewhaus/tool-safety/fs";
+import { commitSpec, parseYamlOnly, specRev } from "@crewhaus/spec-patch/commit";
 import type { CostAccrualEvent, ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 import {
   BudgetMeter,
@@ -65,8 +65,21 @@ import { formatStageNames, listOptimizableStages } from "./stages";
 
 export class OptimizeSpecError extends CrewhausError {
   override readonly name = "OptimizeSpecError";
-  constructor(message: string, cause?: unknown) {
+  /**
+   * `conflict`: the spec changed after the run read it, so the write-back was
+   * kept as a draft. (`code` is the error family every `CrewhausError` carries.)
+   */
+  readonly failure: "conflict" | undefined;
+  /** On a conflict: the kept draft. */
+  readonly draftPath: string | undefined;
+  constructor(
+    message: string,
+    cause?: unknown,
+    detail: { readonly failure?: "conflict"; readonly draftPath?: string } = {},
+  ) {
     super("compiler", message, cause);
+    this.failure = detail.failure;
+    this.draftPath = detail.draftPath;
   }
 }
 
@@ -98,6 +111,8 @@ export type OptimizeSpecOptions = {
    * leave the source untouched.
    */
   readonly writeBack?: boolean;
+  /** Test seam: passed to the spec commit's `hooks` on write-back. */
+  readonly commitHooks?: { readonly afterRead?: () => Promise<void> | void };
   /** Optional run id (default: `opt_<hex>`). */
   readonly runId?: string;
   /** RNG seed forwarded to the default rule-based mutator. */
@@ -500,25 +515,37 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
       iterations: opts.iterations ?? 10,
     });
     const stamped = `${header}${applyResult.yaml}`;
-    // 0.7.1 — the spec the operator named is replaced atomically: a random
-    // O_EXCL|O_NOFOLLOW temp beside it, renamed into place, keeping the file's
-    // permission bits. Before, a fixed `<spec>.optimize.tmp` was written
-    // through any link planted there (and then truncated), and the spec was
-    // rewritten in place. A spec path that is itself a link is written where
-    // the operator's link leads, as before: that link is the operator's.
-    let target: string;
-    try {
-      target = realpathSync(specAbs);
-    } catch (err) {
-      throw new OptimizeSpecError(`cannot resolve spec at ${specAbs} for write-back`, err);
-    }
-    const written = writeFileSafe(dirname(target), basename(target), stamped, {
-      overwrite: true,
-    });
-    if (!written.ok) {
-      throw new OptimizeSpecError(
-        `refusing to write the optimised spec back to ${specAbs}: ${written.reason} (code ${written.code})`,
-      );
+    // Through the spec commit helper: checked against the revision this run
+    // read, written atomically beside the file with its mode kept, and where
+    // the spec path is a link, written where the operator's link leads.
+    const committed = await commitSpec(
+      { specPath: specAbs },
+      { kind: "text", text: stamped },
+      {
+        expectedRev: specRev(yamlText),
+        writer: "optimizer",
+        actor: { kind: "process" },
+        parse: parseYamlOnly,
+        ...(opts.commitHooks !== undefined ? { hooks: opts.commitHooks } : {}),
+      },
+    );
+    if (!committed.ok) {
+      throw committed.code === "conflict"
+        ? new OptimizeSpecError(
+            `${specAbs} changed after this run read it, so the optimised spec was not written${
+              committed.draft !== undefined
+                ? `; it is kept as a draft at ${committed.draft.path}`
+                : ""
+            }`,
+            undefined,
+            {
+              failure: "conflict",
+              ...(committed.draft !== undefined ? { draftPath: committed.draft.path } : {}),
+            },
+          )
+        : new OptimizeSpecError(
+            `refusing to write the optimised spec back to ${specAbs}: ${committed.reason} (code ${committed.code})`,
+          );
     }
     writtenTo = specAbs;
   }

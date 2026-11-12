@@ -34,6 +34,7 @@ import { CrewhausError } from "@crewhaus/errors";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { isCollection, isSeq, parse, parseDocument, stringify } from "yaml";
 import { z } from "zod";
+import { renderMinimal } from "./minimal-diff";
 import { DELTA_090_KEYS } from "./owner-keys";
 import { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
 import {
@@ -49,6 +50,7 @@ import {
 // free-form provenance) without duplicating the pattern table a third time.
 export { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
 export { DELTA_090_KEYS, type OwnerKey } from "./owner-keys";
+export * from "./surfaces";
 export {
   type AdmitBlockPatchOptions,
   type BlockLeafRefusal,
@@ -119,6 +121,8 @@ export type ApplySpecPatchResult = {
   readonly yaml: string;
   /** The re-parsed Spec after the patch. */
   readonly spec: Spec;
+  /** `kept`: only the patched range changed; `restyled`: the whole document was re-rendered. */
+  readonly formatting: "kept" | "restyled";
 };
 
 /**
@@ -211,14 +215,17 @@ export function applySpecPatch(yamlText: string, patch: SpecPatch): ApplySpecPat
     }
   }
 
-  const newYaml = doc.toString();
+  const { yaml: newYaml, formatting } = renderMinimal(yamlText, doc, [path]) ?? {
+    yaml: doc.toString(),
+    formatting: "restyled" as const,
+  };
   let spec: Spec;
   try {
     spec = parseSpec(newYaml);
   } catch (err) {
     throw new SpecPatchError(`patched YAML failed spec validation: ${(err as Error).message}`, err);
   }
-  return { yaml: newYaml, spec };
+  return { yaml: newYaml, spec, formatting };
 }
 
 /** The first proper prefix of `path` whose value is a scalar (not a collection), if any. */
@@ -471,6 +478,12 @@ export type ApplySpecEditsOptions = {
    * re-validation is their safety floor.
    */
   readonly restrictToOptimizable?: boolean;
+  /**
+   * The parser the batch is validated with, in place of `parseSpec`: a
+   * harness's own schema, or a YAML-only parse for a writer that validates no
+   * schema.
+   */
+  readonly parse?: (yamlText: string) => Spec;
 };
 
 export type ApplySpecEditsResult = {
@@ -480,6 +493,8 @@ export type ApplySpecEditsResult = {
   readonly spec: Spec;
   /** Edits that changed the document — idempotent deletes of absent paths don't count. */
   readonly applied: number;
+  /** `kept`: only the edited ranges changed; `restyled`: the whole document was re-rendered. */
+  readonly formatting: "kept" | "restyled";
 };
 
 /**
@@ -504,14 +519,15 @@ export function applySpecEdits(
       throw new SpecPatchError(`edit #${i} shape is invalid: ${parsed.error.message}`);
     }
   });
+  const parse = opts.parse ?? parseSpec;
   if (edits.length === 0) {
     let spec: Spec;
     try {
-      spec = parseSpec(yamlText);
+      spec = parse(yamlText);
     } catch (err) {
       throw new SpecPatchError(`input YAML failed spec validation: ${(err as Error).message}`, err);
     }
-    return { yaml: yamlText, spec, applied: 0 };
+    return { yaml: yamlText, spec, applied: 0, formatting: "kept" };
   }
 
   let doc: ReturnType<typeof parseDocument>;
@@ -568,10 +584,14 @@ export function applySpecEdits(
     applied += 1;
   });
 
-  const newYaml = doc.toString();
+  const { yaml: newYaml, formatting } = renderMinimal(
+    yamlText,
+    doc,
+    edits.map((edit) => edit.path),
+  ) ?? { yaml: doc.toString(), formatting: "restyled" as const };
   let spec: Spec;
   try {
-    spec = parseSpec(newYaml);
+    spec = parse(newYaml);
   } catch (err) {
     throw new SpecPatchError(`edited YAML failed spec validation: ${(err as Error).message}`, err);
   }
@@ -583,7 +603,7 @@ export function applySpecEdits(
     let before: unknown;
     let after: unknown = spec;
     try {
-      before = parseSpec(yamlText);
+      before = parse(yamlText);
     } catch {
       before = parseDocument(yamlText).toJS();
       after = written;
@@ -604,7 +624,7 @@ export function applySpecEdits(
       );
     }
   }
-  return { yaml: newYaml, spec, applied };
+  return { yaml: newYaml, spec, applied, formatting };
 }
 
 /**

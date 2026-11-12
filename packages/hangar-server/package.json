@@ -38,6 +38,7 @@
     "@crewhaus/routing-store": "workspace:*",
     "@crewhaus/session-store": "workspace:*",
     "@crewhaus/spec": "workspace:*",
+    "@crewhaus/spec-changelog": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",
     "@crewhaus/spec-registry": "workspace:*",
     "@crewhaus/watchme-store": "workspace:*",

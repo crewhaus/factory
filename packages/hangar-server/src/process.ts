@@ -44,8 +44,13 @@ import { join } from "node:path";
 import { type LeaseHolder, type LeaseOptions, withMutatingLease } from "@crewhaus/control-records";
 import { admitExplicitStart } from "@crewhaus/control-service";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
-import type { HangarHarnessEntry, HangarRegistry } from "@crewhaus/harness-registry";
 import {
+  type HangarHarnessEntry,
+  type HangarRegistry,
+  isAdopted,
+} from "@crewhaus/harness-registry";
+import {
+  type BinResolverDeps,
   type Clock,
   type DaemonRunfile,
   type HarnessSupervisor,
@@ -315,6 +320,21 @@ async function runJobChild(
   };
 }
 
+/**
+ * The `crewhaus` a Home job runs for the harness at `dir`: the harness's own
+ * (contained) copy when the harness is adopted on this machine, otherwise the
+ * `crewhaus` on PATH. A directory with no registry row counts as not adopted.
+ */
+export function jobCrewhausBin(
+  registry: Pick<HangarRegistry, "list" | "adoptionSince">,
+  dir: string,
+  deps: Omit<BinResolverDeps, "allowHarnessLocal"> = {},
+): string | undefined {
+  const entry = registry.list().find((row) => row.dir === dir);
+  const adopted = entry !== undefined && isAdopted(entry, registry.adoptionSince());
+  return resolveCrewhausBin(dir, { ...deps, allowHarnessLocal: adopted });
+}
+
 export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
   const clock = options.clock ?? systemClock;
   const ops = options.ops ?? createProcessOps();
@@ -324,7 +344,7 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
   const store = options.jobStore ?? createFileJobStore(`${options.hangarRoot}/jobs.jsonl`);
   const jobs = createJobQueue({
     store: options.wrapJobStore !== undefined ? options.wrapJobStore(store) : store,
-    run: options.runJob ?? defaultJobRunner(ops, (dir) => resolveCrewhausBin(dir)),
+    run: options.runJob ?? defaultJobRunner(ops, (dir) => jobCrewhausBin(options.registry, dir)),
     now: options.now,
     ...(options.jobConcurrency !== undefined ? { concurrency: options.jobConcurrency } : {}),
   });

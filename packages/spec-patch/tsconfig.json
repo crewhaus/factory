@@ -4,6 +4,12 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../spec" }],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../infra-utils" },
+    { "path": "../ir" },
+    { "path": "../spec" },
+    { "path": "../tool-safety" }
+  ],
   "include": ["src/**/*"]
 }

@@ -1,6 +1,7 @@
 import { lowerWithWarnings } from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Spec, parseSpec } from "@crewhaus/spec";
+import { applySplices, scalarSplice } from "@crewhaus/spec-patch/minimal-diff";
 import { isMap, isScalar, parseAllDocuments, parseDocument } from "yaml";
 import { auditProvability } from "./lint";
 
@@ -620,13 +621,15 @@ export function setProvability(
     // The scalar to rewrite: the shorthand itself, or the object form's
     // `level` (which the schema requires).
     const rung = isMap(node) ? node.get("level", true) : node;
-    const range = isScalar(rung) ? rung.range : undefined;
-    if (range === undefined || range === null) {
+    const splice = isScalar(rung)
+      ? scalarSplice(yaml, rung, level, { quoting: "plain-word" })
+      : undefined;
+    if (splice === undefined) {
       throw new InitProvabilityError(
         "the interview's provability: block is not in a form --provability can set — edit its level by hand",
       );
     }
-    out = `${yaml.slice(0, range[0])}${level}${yaml.slice(range[1])}`;
+    out = applySplices(yaml, [splice]);
   }
   return { yaml: out, spec: parseSpec(out) };
 }

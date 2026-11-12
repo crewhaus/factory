@@ -43,12 +43,19 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { applySpecEdits, isCredentialKey, maskCredentialTokens } from "@crewhaus/spec-patch";
+import { createSpecFile } from "@crewhaus/spec-patch/commit";
 import { MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
 import { type M3Context, type M3Handler, requireTypedConfirm } from "./m3";
 import { maskSpecYaml, maskText } from "./mask";
-import { commitSpecEdits, previewSpecEdits, readSpecFile, requireWholeSpec } from "./spec-edit";
+import {
+  commitSpecEdits,
+  previewHomeEdits,
+  readSpecFile,
+  requireEditable,
+  requireWholeSpec,
+} from "./spec-edit";
 import { keyValueParts } from "./spec-lines";
 
 const SPEC_FILE = "crewhaus.yaml";
@@ -329,13 +336,23 @@ export const wizardCreate: M3Handler = (ctx) => {
   if (dirExists && !statSync(dir).isDirectory()) {
     throw new HttpError(400, '"dir" exists and is not a directory');
   }
+  // Create-only: a spec that appeared since the check above is never replaced.
+  let created: ReturnType<typeof createSpecFile>;
   try {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(specPath, yaml, { mode: 0o644 });
+    created = createSpecFile(specPath, yaml);
   } catch (err) {
     return refusal("not_writable", maskText(err instanceof Error ? err.message : String(err)), {
       dir,
     });
+  }
+  if (!created.ok) {
+    return created.code === "exists"
+      ? refusal("spec_exists", `${specPath} already exists — the wizard never overwrites one`, {
+          dir,
+          verb: "crewhaus init",
+        })
+      : refusal("not_writable", maskText(created.reason), { dir });
   }
   return {
     ok: true,
@@ -506,8 +523,7 @@ export const graderWrite: M3Handler = (ctx) => {
   mkdirSync(dir, { recursive: true });
   // In PLACE, not tmp+rename: `mode` applies only when the file is created,
   // so an existing graders.yaml keeps the permissions its author gave it.
-  // (A rename would replace the inode and impose this mode — which is the
-  // trap `writeSpecFile` has to work around.)
+  // (A rename would replace the inode and impose this mode.)
   writeFileSync(path, yaml.endsWith("\n") ? yaml : `${yaml}\n`, { mode: 0o644 });
   // Re-read: the answer is what is on disk, not what was sent.
   const onDisk = readTextCapped(path, MAX_TEXT_BYTES).text;
@@ -987,7 +1003,9 @@ export const mcpConnectorWrite: M3Handler = async (ctx) => {
   requireWholeSpec(file);
   const { name, value } = connectorValue(ctx);
   const edits = [{ path: [MCP_KEY, name], value }];
-  const preview = previewSpecEdits(file.text, edits);
+  // Checked with the schema this harness is built against; a read-only spec is refused here.
+  const check = await requireEditable(ctx, file.text);
+  const preview = await previewHomeEdits(ctx, file.text, edits, check);
   const dryRun = ctx.body["dryRun"] !== false;
   if (!preview.ok) {
     return refusal("edit_rejected", preview.error ?? "the connector does not apply", {
@@ -1004,7 +1022,9 @@ export const mcpConnectorWrite: M3Handler = async (ctx) => {
       entries: preview.entries,
       diff: preview.diff,
       confirmName: file.specName,
-      note: '`mcp_servers` is human-owned: review the diff, then send {"dryRun": false, "confirmName": "<spec name>"}.',
+      /** Send it back as `expectedRev` with the confirmation. */
+      rev: file.rev,
+      note: '`mcp_servers` is human-owned: review the diff, then send {"dryRun": false, "confirmName": "<spec name>", "expectedRev": "<rev>"}.',
     };
   }
   requireTypedConfirm(ctx.body, file.specName);
@@ -1037,7 +1057,8 @@ export const mcpConnectorRemove: M3Handler = async (ctx) => {
   // {}` is valid but reads as a leftover, and the next author has to guess
   // whether it means "none" or "not finished".
   const edits = declared.length === 1 ? [{ path: [MCP_KEY] }] : [{ path: [MCP_KEY, name] }];
-  const preview = previewSpecEdits(file.text, edits);
+  const check = await requireEditable(ctx, file.text);
+  const preview = await previewHomeEdits(ctx, file.text, edits, check);
   const confirmName = ctx.query.get("confirmName");
   if (confirmName !== file.specName) {
     return {
@@ -1047,7 +1068,9 @@ export const mcpConnectorRemove: M3Handler = async (ctx) => {
       entries: preview.entries,
       diff: preview.diff,
       confirmName: file.specName,
-      note: `removing an MCP server is a human-owned spec edit — repeat this call with ?confirmName=${file.specName}`,
+      /** Send it back as `?expectedRev=` with the confirmation. */
+      rev: file.rev,
+      note: `removing an MCP server is a human-owned spec edit — repeat this call with ?confirmName=${file.specName}&expectedRev=${file.rev}`,
     };
   }
   const committed = await commitSpecEdits(ctx, edits);

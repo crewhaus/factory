@@ -35,7 +35,7 @@
  * result rather than counted as empty.
  */
 
-import { basename } from "node:path";
+import { basename, relative } from "node:path";
 import {
   type AdviceFinding,
   type SessionEvents,
@@ -71,6 +71,7 @@ import {
   validatePatch,
   withPatchApplied,
 } from "@crewhaus/spec-patch";
+import { commitSpec, specRev } from "@crewhaus/spec-patch/commit";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { parse as parseYaml } from "yaml";
@@ -86,8 +87,8 @@ import {
   renderPath,
   resolveInput,
   specSourceFields,
-  writeContained,
 } from "./lib/sources";
+import { toPosix, workspaceRoot } from "./paths";
 
 /** A batch past this is not a review a human is going to do. */
 const MAX_PATCHES = 64;
@@ -735,8 +736,11 @@ export const specPatchApply: RegisteredTool = buildTool({
       });
     }
 
-    const written = writeContained(toolName, input.path, current);
-    if (!written.ok) {
+    // Contained exactly as every read here is, then committed through the
+    // spec commit helper against the revision of the text this call read: a
+    // spec changed meanwhile is left as it is and the result kept as a draft.
+    const safe = resolveInput(toolName, input.path);
+    if (!safe.ok) {
       return json({
         ok: false,
         target: spec.target,
@@ -744,8 +748,37 @@ export const specPatchApply: RegisteredTool = buildTool({
         patches: applied,
         diff,
         wrote: false,
-        error: written.message,
+        error: safe.message,
         note: "the patched document is valid; only the write failed. Re-run with dryRun to recover the text",
+      });
+    }
+    const committed = await commitSpec(
+      { specPath: safe.value.real },
+      { kind: "text", text: current },
+      { expectedRev: specRev(original), writer: "tool.SpecPatchApply", actor: { kind: "agent" } },
+    );
+    if (!committed.ok) {
+      const draft =
+        committed.draft !== undefined
+          ? toPosix(relative(workspaceRoot(), committed.draft.path))
+          : undefined;
+      return json({
+        ok: false,
+        target: spec.target,
+        applied: applied.length,
+        patches: applied,
+        diff,
+        wrote: false,
+        code: committed.code,
+        error:
+          committed.code === "conflict"
+            ? `"${renderPath(input.path)}" changed after this call read it, so nothing was written`
+            : `"${renderPath(input.path)}" was not written: ${committed.reason}`,
+        ...(draft !== undefined ? { draft } : {}),
+        note:
+          committed.code === "conflict"
+            ? "the patched document is kept as a draft; re-read the spec and apply the patches again"
+            : "the patched document is valid; only the write failed. Re-run with dryRun to recover the text",
       });
     }
     return json({
@@ -755,7 +788,7 @@ export const specPatchApply: RegisteredTool = buildTool({
       patches: applied,
       changed: !unchanged,
       diff,
-      wrote: { path: renderPath(input.path), bytes: written.value },
+      wrote: { path: renderPath(input.path), bytes: Buffer.byteLength(current, "utf8") },
     });
   },
 });
@@ -1404,7 +1437,11 @@ export const doctorFix: RegisteredTool = buildTool({
         note: "nothing to fix",
       });
     }
-    const commit = commitWrites(toolName, captured);
+    const commit = await commitWrites(
+      toolName,
+      captured,
+      specKey.ok ? { path: specRel, baseRev: fs.baseRev(specRel) } : undefined,
+    );
     const fullyCommitted = commit.error === undefined;
     return json({
       ok: fullyCommitted,
@@ -1412,6 +1449,12 @@ export const doctorFix: RegisteredTool = buildTool({
       wrote: commit.committed.length > 0,
       committed: commit.committed,
       ...(commit.error !== undefined ? { error: commit.error } : {}),
+      ...(commit.conflict !== undefined
+        ? {
+            code: "conflict",
+            ...(commit.conflict.draft !== undefined ? { draft: commit.conflict.draft } : {}),
+          }
+        : {}),
       ...plan,
       // A failed commit renders the PLAN, not an applied report: the committed
       // list above is the record of what actually landed.

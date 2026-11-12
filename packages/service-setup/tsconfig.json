@@ -4,6 +4,11 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../preflight" }, { "path": "../spec" }],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../preflight" },
+    { "path": "../spec" },
+    { "path": "../spec-patch" }
+  ],
   "include": ["src/**/*"]
 }
