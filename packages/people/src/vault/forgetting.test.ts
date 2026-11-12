@@ -46,6 +46,47 @@ async function opens(vault: Vault, psn: string): Promise<string> {
   return (await vault.readPerson<{ label: string }>(psn)).data.label + (claims[0]?.value ?? "");
 }
 
+/** Whether a copied `key.json` opens under the keychain's live space key. */
+async function opensUnderLiveKey(
+  vault: Vault,
+  secrets: ReturnType<typeof fakeSecrets>,
+  copiedKeyFile: string,
+  space: string,
+  psn: string,
+): Promise<boolean> {
+  const status = (await vault.status()) as Extract<VaultStatus, { state: "ready" }>;
+  const live = [...secrets.items.entries()].find(([name]) =>
+    name.endsWith(`/v${status.kekVersion}`),
+  )?.[1];
+  expect(live).toBeDefined();
+  const copied = JSON.parse(readFileSync(copiedKeyFile, "utf8")) as {
+    iv: string;
+    ct: string;
+    kekVersion: number;
+  };
+  const opened = await open(
+    await aesKey(bytesOf(live as string) as Uint8Array),
+    copied,
+    personKeyAad(space, psn, copied.kekVersion),
+  );
+  return opened !== undefined;
+}
+
+function stopOnce(stop: string): { arm: () => void; onStep: (step: string) => void } {
+  let armed = false;
+  return {
+    arm: () => {
+      armed = true;
+    },
+    onStep: (step) => {
+      if (armed && step === stop) {
+        armed = false;
+        throw new Error(`stopped after ${step}`);
+      }
+    },
+  };
+}
+
 function mark(): ErasureMark {
   return {
     per: mintId("per"),
@@ -238,4 +279,118 @@ describe("erasure, interrupted after each step", () => {
       expect(await opens(after, dana)).toBe("DanaDana likes tea");
     });
   }
+});
+
+describe("an erasure ends under a key made after the person's key was deleted", () => {
+  const keyFileIn = (dir: string, space: string, psn: string) =>
+    join(dir, "spaces", space, "persons", psn, "key.json");
+  const kekVersionOf = async (vault: Vault) =>
+    ((await vault.status()) as Extract<VaultStatus, { state: "ready" }>).kekVersion;
+
+  test("a rotation that stopped with the old key still kept is finished, then a new key is made", async () => {
+    const stop = stopOnce("version-set");
+    const {
+      base,
+      root,
+      secrets,
+      vault,
+      space,
+      open: reopen,
+    } = await vaultWith("keychain", stop.onStep);
+    const sam = await person(vault, "Sam");
+    const dana = await person(vault, "Dana");
+    stop.arm();
+    await expect(vault.rotateSpaceKey()).rejects.toThrow("stopped after version-set");
+    const cold = reopen();
+    expect(await kekVersionOf(cold)).toBe(2);
+    cpSync(root, join(base, "copy"), { recursive: true });
+    const copy = keyFileIn(join(base, "copy"), space, sam);
+    // The copy is wrapped under the version in use: the probe can say yes.
+    expect(await opensUnderLiveKey(cold, secrets, copy, space, sam)).toBe(true);
+    const plan = { ...mark(), kekTarget: (await kekVersionOf(cold)) + 1 };
+    const outcome = await cold.write(async (w) => {
+      w.markErasing(sam, plan);
+      return w.eraseMarked(sam);
+    });
+    expect(outcome.rotation).toMatchObject({ rotated: true, kekVersion: 3 });
+    expect(await kekVersionOf(reopen())).toBe(plan.kekTarget);
+    expect(await opensUnderLiveKey(reopen(), secrets, copy, space, sam)).toBe(false);
+    expect([...secrets.items.keys()].map((k) => k.slice(-3))).toEqual(["/v3"]);
+    expect(await opens(reopen(), dana)).toBe("DanaDana likes tea");
+  });
+
+  test("a rotation run while an erasure is marked deletes that person's key instead of re-wrapping it", async () => {
+    const stop = stopOnce("marked");
+    const {
+      base,
+      root,
+      secrets,
+      vault,
+      space,
+      open: reopen,
+    } = await vaultWith("keychain", stop.onStep);
+    const sam = await person(vault, "Sam");
+    const dana = await person(vault, "Dana");
+    stop.arm();
+    await expect(
+      vault.write(async (w) => {
+        w.markErasing(sam, mark());
+        return w.eraseMarked(sam);
+      }),
+    ).rejects.toThrow("stopped after marked");
+    cpSync(root, join(base, "before"), { recursive: true });
+    const cold = reopen();
+    const target = cold.row(sam)?.erasure?.kekTarget;
+    expect(target).toBe(2);
+    expect((await cold.rotateSpaceKey()).rotated).toBe(true);
+    // A backup taken now holds no key for the person being erased.
+    expect(existsSync(keyFileIn(root, space, sam))).toBe(false);
+    expect(cold.row(sam)?.state).toBe("erasing");
+    await cold.write((w) => w.eraseMarked(sam));
+    const after = reopen();
+    expect(after.row(sam)).toBeUndefined();
+    expect(await kekVersionOf(after)).toBe(target as number);
+    expect(
+      await opensUnderLiveKey(
+        after,
+        secrets,
+        keyFileIn(join(base, "before"), space, sam),
+        space,
+        sam,
+      ),
+    ).toBe(false);
+    expect(await opens(after, dana)).toBe("DanaDana likes tea");
+  });
+
+  test("a person already re-wrapped by a stopped rotation is erased under the version after it", async () => {
+    const stop = stopOnce("person-key-rewrapped");
+    const {
+      base,
+      root,
+      secrets,
+      vault,
+      space,
+      open: reopen,
+    } = await vaultWith("keychain", stop.onStep);
+    const sam = await person(vault, "Sam");
+    const dana = await person(vault, "Dana");
+    stop.arm();
+    await expect(vault.rotateSpaceKey()).rejects.toThrow("stopped after person-key-rewrapped");
+    cpSync(root, join(base, "copy"), { recursive: true });
+    const copy = keyFileIn(join(base, "copy"), space, sam);
+    const copied = JSON.parse(readFileSync(copy, "utf8")) as { kekVersion: number };
+    expect(copied.kekVersion).toBe(2);
+    const cold = reopen();
+    expect(await kekVersionOf(cold)).toBe(1);
+    await cold.write(async (w) => {
+      w.markErasing(sam, mark());
+      expect(cold.row(sam)?.erasure?.kekTarget).toBe(3);
+      return w.eraseMarked(sam);
+    });
+    const after = reopen();
+    expect(await kekVersionOf(after)).toBe(3);
+    expect(await opensUnderLiveKey(after, secrets, copy, space, sam)).toBe(false);
+    expect([...secrets.items.keys()].map((k) => k.slice(-3))).toEqual(["/v3"]);
+    expect(await opens(after, dana)).toBe("DanaDana likes tea");
+  });
 });

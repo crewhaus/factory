@@ -54,7 +54,10 @@ node-only. A key it cannot reach answers `locked` with the reason, never "no pro
 
 Erasing a profile deletes its key first, then its records, then rotates the space key and re-wraps
 every remaining person's key, so a copy of the old files made before the erasure no longer opens.
-Each step is idempotent: a run that stopped part way is finished by running it again.
+The erasure ends only once a space key made after the person's key was deleted is the one in use,
+however an earlier rotation stopped, and a rotation run while an erasure is pending deletes that
+person's key instead of re-wrapping it. Each step is idempotent: a run that stopped part way is
+finished by running it again.
 
 Notes are compare-and-set: `appendClaimRevision(psn, note, {expectRev})` answers
 `{conflict: "stale_claim_revision", current}` when someone else changed the note first.

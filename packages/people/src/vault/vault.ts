@@ -81,7 +81,11 @@ export type ErasureMark = {
   readonly per: string;
   readonly by: string;
   readonly at: string;
-  /** The space key version the erasure rotates to; equal to the current one when it cannot. */
+  /**
+   * The space key version the erasure rotates to; equal to the current one when it cannot.
+   * The erasure ends only once a key made after the person's key was deleted is the one
+   * in use: `markErasing` raises this past any version that person's key is wrapped under.
+   */
   readonly kekTarget: number;
   readonly inventoryDigest: string;
   readonly removed: ErasureCounts;
@@ -246,7 +250,10 @@ export type VaultWriter = {
   setBackupDays(days: number | undefined): void;
   rotateSpaceKey(options?: { readonly newKeyHex?: string }): Promise<RotationResult>;
   shredPerson(person: string): void;
-  /** Mark a profile `erasing` with what the erasure will record. Idempotent. */
+  /**
+   * Mark a profile `erasing` with what the erasure will record. Idempotent. From here the
+   * erasure is committed: a rotation deletes this profile's key instead of re-wrapping it.
+   */
   markErasing(person: string, mark: ErasureMark): void;
   /** Run a marked erasure's steps, each idempotent, and drop the row last. */
   eraseMarked(person: string): Promise<{ readonly rotation: RotationResult | "skipped" }>;
@@ -649,7 +656,12 @@ export function openVault(options: OpenVaultOptions): Vault | RootRefusal {
     return custodianOf(meta).destroy(older);
   };
 
-  const rotateLocked = async (newKeyHex?: string): Promise<RotationResult> => {
+  /**
+   * Rotate the space key one version. `advance` is set by an erasure: a rotation that only
+   * has an older key left to destroy goes on to make a new one, so the erased person's key
+   * was never wrapped under the key in use when it returns.
+   */
+  const rotateLocked = async (newKeyHex?: string, advance = false): Promise<RotationResult> => {
     const meta = requireMeta();
     const keeper = custodianOf(meta);
     const current = meta.kekVersion;
@@ -691,7 +703,7 @@ export function openVault(options: OpenVaultOptions): Vault | RootRefusal {
           throw new VaultError("locked", "A rotation stopped part way and its new key is gone.");
         }
         const cleaned = await finishRotation(meta);
-        if (cleaned === "destroyed") {
+        if (cleaned === "destroyed" && !advance) {
           return { rotated: true, kekVersion: current, resumed: true, oldKey: "destroyed" };
         }
         next = randomKey();
@@ -703,7 +715,14 @@ export function openVault(options: OpenVaultOptions): Vault | RootRefusal {
     for (const row of rows) {
       const file = readKeyFile(meta, row.person);
       // An erasure that already deleted this key has nothing to re-wrap.
-      if (file === undefined || file.kekVersion === target) continue;
+      if (file === undefined) continue;
+      if (row.state === "erasing") {
+        // A marked erasure is committed: its key is deleted, never wrapped under the new key.
+        removeFile(root, `${personDir(meta, row.person)}/key.json`);
+        personKeyCache.delete(row.person);
+        continue;
+      }
+      if (file.kekVersion === target) continue;
       const raw = await unwrapRaw(meta, row.person, file);
       await wrap(meta, row.person, raw, target, next);
       personKeyCache.delete(row.person);
@@ -882,9 +901,18 @@ export function openVault(options: OpenVaultOptions): Vault | RootRefusal {
       if (!canTransition("person", row.state, "erasing")) {
         throw new VaultError("invalid", "This profile cannot be erased from its state.");
       }
+      // A rotation that stopped part way may already have wrapped this person's key under
+      // the next version: the erasure then rotates past it.
+      const wrappedAt = readKeyFile(meta, person)?.kekVersion ?? 0;
+      const kekTarget =
+        meta.custody === "environment"
+          ? mark.kekTarget
+          : Math.max(mark.kekTarget, meta.kekVersion + 1, wrappedAt + 1);
       writeRows(
         meta,
-        rows.map((r) => (r.person === person ? { ...r, state: "erasing", erasure: mark } : r)),
+        rows.map((r) =>
+          r.person === person ? { ...r, state: "erasing", erasure: { ...mark, kekTarget } } : r,
+        ),
       );
       step("marked");
     },
@@ -903,12 +931,12 @@ export function openVault(options: OpenVaultOptions): Vault | RootRefusal {
       removeTree(root, dir);
       step("records-deleted");
       let rotation: RotationResult | "skipped" = "skipped";
-      const latest = requireMeta();
-      if (latest.kekVersion < mark.kekTarget) {
-        rotation = await rotateLocked();
-      } else {
-        await finishRotation(latest);
+      // Each pass moves the version up by one, or reports it cannot (environment custody).
+      while (requireMeta().kekVersion < mark.kekTarget) {
+        rotation = await rotateLocked(undefined, true);
+        if (!rotation.rotated) break;
       }
+      if (rotation === "skipped") await finishRotation(requireMeta());
       step("space-key-rotated");
       const recorded = readJsonl("erasures.jsonl").some(
         (value) => isRecord(value) && value["per"] === mark.per,

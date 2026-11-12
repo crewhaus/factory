@@ -8,7 +8,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { mintId } from "@crewhaus/control-contract";
 import { ERASURE_NONCE_TTL_MS } from "@crewhaus/people/vault";
-import { createPeopleAdmin } from "./admin";
+import { type Refused, SAVED_KEY_ROTATION, createPeopleAdmin } from "./admin";
 import { fixture, ok, removeTempDirs, scan, snapshot } from "./test-helpers";
 
 afterAll(removeTempDirs);
@@ -282,9 +282,15 @@ describe("the vault", () => {
 
   test("environment custody will not rotate without a new key from its caller", async () => {
     const { admin, receiptsNow } = await fixture({ custody: "environment" });
-    expect(await admin.rotateKeys()).toEqual(
+    const refusal = await admin.rotateKeys();
+    expect(refusal).toEqual(
       expect.objectContaining({ ok: false, reason: "space-key-not-rotated" }),
     );
+    // The way it names saves the new key before anything is re-wrapped under it.
+    const message = (refusal as Refused).message;
+    expect(message).toContain(SAVED_KEY_ROTATION);
+    expect(SAVED_KEY_ROTATION).toContain("> new.key");
+    expect(message).not.toMatch(/\|\s*crewhaus people keys --rotate/);
     expect(receiptsNow()).toHaveLength(1);
     expect(ok(await admin.rotateKeys("cd".repeat(32))).oldKey).toBe("kept");
   });

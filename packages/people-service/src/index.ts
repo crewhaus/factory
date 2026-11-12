@@ -19,6 +19,7 @@ export {
   type ReceiptsPort,
   type Refused,
   type ReviewInput,
+  SAVED_KEY_ROTATION,
   type StoredClaim,
   createPeopleAdmin,
   currentNotes,

@@ -13,6 +13,8 @@
  * receipt is written to Home's workspace ledger before the vault changes. A note's words
  * and a profile's name are typed or piped in, never put on the command line.
  */
+import { spawnSync } from "node:child_process";
+import { fstatSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import {
@@ -40,6 +42,7 @@ import {
   type PeopleAdmin,
   type ReceiptsPort,
   type Refused,
+  SAVED_KEY_ROTATION,
   type StoredClaim,
   createPeopleAdmin,
 } from "@crewhaus/people-service";
@@ -69,6 +72,17 @@ export type PeopleCommandOptions = {
   readonly stdin?: () => Promise<string | undefined>;
   /** Whether a person is typing: prompts are shown only then. Defaults to stdin's own answer. */
   readonly isTTY?: boolean;
+  /**
+   * Whether stdin is a file redirected in (`< new.key`), not a pipe. A new key kept in an
+   * environment variable is read only from a saved file or typed twice. Defaults to stdin's
+   * own answer; `undefined` when it cannot be told.
+   */
+  readonly stdinIsFile?: boolean;
+  /**
+   * Stops what is typed from showing, and returns what turns it back on; `undefined` when
+   * this terminal cannot. Defaults to `stty -echo` on POSIX.
+   */
+  readonly hideInput?: () => (() => void) | undefined;
   /** Where prompts, the plan before an erasure and notices go. Defaults to stderr. */
   readonly prompt?: (text: string) => void;
   /** The OS credential store; `Bun.secrets` by default. */
@@ -279,6 +293,8 @@ type Session = {
   readonly identity: LocalIdentity;
   readonly localActor: string;
   readonly isTTY: boolean;
+  readonly stdinIsFile: boolean | undefined;
+  readonly hideInput: () => (() => void) | undefined;
   readonly prompt: (text: string) => void;
   readonly line: () => Promise<string | undefined>;
   readonly vault: () => Vault | { readonly ok: false; readonly reason: string };
@@ -301,6 +317,37 @@ function stdinReader(): { read: () => Promise<string | undefined>; close: () => 
   };
 }
 
+/** Whether a descriptor is a regular file; `undefined` when it cannot be told. */
+export function isRegularFileFd(fd: number): boolean | undefined {
+  try {
+    return fstatSync(fd).isFile();
+  } catch {
+    return undefined;
+  }
+}
+
+/** `stty -echo` on the controlling terminal, undone by the returned function or on Ctrl-C. */
+function hideTypedInput(): (() => void) | undefined {
+  if (process.platform === "win32") return undefined;
+  const stty = (setting: string): boolean => {
+    try {
+      return spawnSync("stty", [setting], { stdio: ["inherit", "ignore", "ignore"] }).status === 0;
+    } catch {
+      return false;
+    }
+  };
+  if (!stty("-echo")) return undefined;
+  const onInterrupt = (): void => {
+    stty("echo");
+    process.exit(130);
+  };
+  process.once("SIGINT", onInterrupt);
+  return () => {
+    process.removeListener("SIGINT", onInterrupt);
+    stty("echo");
+  };
+}
+
 function sessionFor(opts: PeopleCommandOptions, line: () => Promise<string | undefined>): Session {
   const env = opts.env ?? process.env;
   const now = opts.now ?? (() => Date.now());
@@ -314,6 +361,8 @@ function sessionFor(opts: PeopleCommandOptions, line: () => Promise<string | und
     identity,
     localActor: localActorOf(identity),
     isTTY: opts.isTTY ?? process.stdin.isTTY === true,
+    stdinIsFile: "stdinIsFile" in opts ? opts.stdinIsFile : isRegularFileFd(0),
+    hideInput: opts.hideInput ?? hideTypedInput,
     prompt: opts.prompt ?? ((text) => void process.stderr.write(text)),
     line,
     vault: () => {
@@ -611,7 +660,9 @@ async function keysVerb(session: Session, argv: readonly string[]): Promise<Peop
         status.backupDays !== undefined
           ? `Backups keep files for ${status.backupDays} days.`
           : "How long your backups keep files isn't set: crewhaus people init --backup-days <n>",
-        "Replace the key: crewhaus people keys --rotate",
+        status.custody === "environment"
+          ? `Replace the key: ${SAVED_KEY_ROTATION}`
+          : "Replace the key: crewhaus people keys --rotate",
       ],
       exitCode: 0,
     };
@@ -624,15 +675,9 @@ async function keysVerb(session: Session, argv: readonly string[]): Promise<Peop
   const status = await opened.vault.status();
   let newKey: string | undefined;
   if (status.state === "ready" && status.custody === "environment") {
-    newKey = (await ask(session, "New key (64 hex characters): "))?.trim();
-    if (newKey === undefined || newKey === "") {
-      return {
-        lines: [
-          "Nothing was rotated: under environment custody the new key comes from you. Pipe it in, for example: openssl rand -hex 32 | crewhaus people keys --rotate",
-        ],
-        exitCode: 1,
-      };
-    }
+    const given = await keptNewKey(session);
+    if ("refused" in given) return { lines: given.refused, exitCode: 1 };
+    newKey = given.key;
   }
   const answer = await opened.admin.rotateKeys(newKey);
   if (!answer.ok) return answerLines(answer);
@@ -642,9 +687,62 @@ async function keysVerb(session: Session, argv: readonly string[]): Promise<Peop
       : `Replaced the profile key (now version ${answer.value.kekVersion}).`,
   ];
   if (answer.value.oldKey === "kept") {
-    lines.push(`Put the new key in ${SPACE_KEY_ENV} before your next \`crewhaus people\` command.`);
+    lines.push(
+      `Set ${SPACE_KEY_ENV} to the new key before your next \`crewhaus people\` command. The old key no longer opens your profiles.`,
+    );
   }
   return { lines, exitCode: 0 };
+}
+
+/** How to replace a key kept in an environment variable without losing it. */
+const SAVE_KEY_FIRST: readonly string[] = [
+  "Save the new key to a file first, then read it in from that file:",
+  `  ${SAVED_KEY_ROTATION}`,
+  `Then set ${SPACE_KEY_ENV} to the key in new.key.`,
+];
+
+/**
+ * The new key under environment custody, only from where the person keeps it: a file
+ * redirected in, or typed twice with nothing shown. A key piped straight from a generator
+ * would be stored nowhere once the rotation re-wraps every profile under it.
+ */
+async function keptNewKey(
+  session: Session,
+): Promise<{ readonly key: string } | { readonly refused: readonly string[] }> {
+  const nothing = "Nothing was rotated: under environment custody the new key comes from you.";
+  if (session.isTTY) {
+    const restore = session.hideInput();
+    if (restore === undefined) {
+      return { refused: [`${nothing} This terminal can't hide a typed key.`, ...SAVE_KEY_FIRST] };
+    }
+    let first: string | undefined;
+    let second: string | undefined;
+    try {
+      first = (await ask(session, "New key (64 hex characters, not shown): "))?.trim();
+      session.prompt("\n");
+      if (first !== undefined && first !== "") {
+        second = (await ask(session, "The same key again: "))?.trim();
+        session.prompt("\n");
+      }
+    } finally {
+      restore();
+    }
+    if (first === undefined || first === "") return { refused: [nothing, ...SAVE_KEY_FIRST] };
+    if (second !== first) {
+      return { refused: ["Nothing was rotated: the two keys you typed don't match."] };
+    }
+    return { key: first };
+  }
+  if (session.stdinIsFile !== true) {
+    return {
+      refused: [`${nothing} It is read from a file you saved, never a pipe.`, ...SAVE_KEY_FIRST],
+    };
+  }
+  const key = (await session.line())?.trim();
+  if (key === undefined || key === "") {
+    return { refused: [`${nothing} The file was empty.`, ...SAVE_KEY_FIRST] };
+  }
+  return { key };
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,7 +1190,7 @@ function residueLine(residue: ErasureResidue): string {
     case "backups-unknown":
       return "  backups made before today. We don't know how long your backups keep files: crewhaus people init --backup-days <n>";
     case "space-key-not-rotated":
-      return `  the profile key in ${SPACE_KEY_ENV}, until you replace it: crewhaus people keys --rotate`;
+      return `  the profile key in ${SPACE_KEY_ENV}, until you replace it: ${SAVED_KEY_ROTATION}`;
   }
 }
 

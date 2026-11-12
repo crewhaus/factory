@@ -4,19 +4,24 @@
  * reaches the real `~/.crewhaus` or the real credential store.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SAVED_KEY_ROTATION } from "@crewhaus/people-service";
 import type { SecretsPort } from "@crewhaus/people/vault";
-import { type PeopleCommandResult, runPeopleCommand } from "./people-cmd";
+import { type PeopleCommandResult, isRegularFileFd, runPeopleCommand } from "./people-cmd";
 
 let base: string;
 let hangarRoot: string;
@@ -63,10 +68,17 @@ afterEach(() => {
   rmSync(base, { recursive: true, force: true });
 });
 
+type Stdin = {
+  readonly isTTY?: boolean;
+  readonly stdinIsFile?: boolean;
+  readonly hideInput?: () => (() => void) | undefined;
+};
+
 function run(
   argv: readonly string[],
   input: readonly string[] = [],
   identity = ME,
+  stdin: Stdin = {},
 ): Promise<PeopleCommandResult> {
   const lines = [...input];
   return runPeopleCommand(argv, {
@@ -74,7 +86,9 @@ function run(
     now: () => clock,
     identity,
     secrets,
-    isTTY: false,
+    isTTY: stdin.isTTY ?? false,
+    stdinIsFile: stdin.stdinIsFile ?? false,
+    ...(stdin.hideInput !== undefined ? { hideInput: stdin.hideInput } : {}),
     stdin: async () => lines.shift(),
     prompt: (text) => prompts.push(text),
     openRegistry: () => ({ list: () => [] }) as never,
@@ -174,23 +188,92 @@ describe("init and keys", () => {
     expect(existsSync(hangarRoot)).toBe(false);
   });
 
-  test("environment custody says it is weaker, and rotating reads the new key from stdin", async () => {
+  test("environment custody says it is weaker, and a key piped in is refused with nothing changed", async () => {
     env["CREWHAUS_PEOPLE_SPACE_KEY"] = "ab".repeat(32);
     const init = await run(["init", "--custody", "environment"]);
     expect(init.lines[0]).toBe(
       "Profiles are set up. Their key is kept in CREWHAUS_PEOPLE_SPACE_KEY.",
     );
     expect(init.lines[1]).toContain("the credential store is safer");
-    const none = await run(["keys", "--rotate"]);
+    await addMe();
+    const none = await run(["keys", "--rotate"], [], ME, { stdinIsFile: true });
     expect(none.exitCode).toBe(1);
-    const rotated = await run(["keys", "--rotate"], ["cd".repeat(32)]);
+    const piped = await run(["keys", "--rotate"], ["cd".repeat(32)]);
+    expect(piped.exitCode).toBe(1);
+    expect(piped.lines[0]).toContain("never a pipe");
+    expect(piped.lines).toContain(`  ${SAVED_KEY_ROTATION}`);
+    // Refused before anything was re-wrapped: the key the person holds still opens.
+    expect((await run(["list"])).lines[0]).toContain("Sam");
+    expect((await run(["keys"])).lines[0]).toContain("(version 1)");
+  });
+
+  test("rotated the way it says, the profiles open with the key saved in new.key", async () => {
+    env["CREWHAUS_PEOPLE_SPACE_KEY"] = "ab".repeat(32);
+    await run(["init", "--custody", "environment"]);
+    await addMe();
+    // openssl rand -hex 32 > new.key && crewhaus people keys --rotate < new.key
+    const saved = join(base, "new.key");
+    writeFileSync(saved, `${randomBytes(32).toString("hex")}\n`);
+    const fromFile = readFileSync(saved, "utf8").split("\n");
+    const rotated = await run(["keys", "--rotate"], fromFile, ME, { stdinIsFile: true });
+    expect(rotated.exitCode).toBe(0);
     expect(rotated.lines).toEqual([
       "Replaced the profile key (now version 2).",
-      "Put the new key in CREWHAUS_PEOPLE_SPACE_KEY before your next `crewhaus people` command.",
+      "Set CREWHAUS_PEOPLE_SPACE_KEY to the new key before your next `crewhaus people` command. The old key no longer opens your profiles.",
     ]);
     expect((await run(["list"])).exitCode).toBe(1);
+    // Then set CREWHAUS_PEOPLE_SPACE_KEY to the key in new.key.
+    env["CREWHAUS_PEOPLE_SPACE_KEY"] = readFileSync(saved, "utf8").trim();
+    const listed = await run(["list"]);
+    expect(listed.exitCode).toBe(0);
+    expect(listed.lines[0]).toContain("Sam");
+  });
+
+  test("typed at a terminal, the new key is hidden and asked for twice", async () => {
+    env["CREWHAUS_PEOPLE_SPACE_KEY"] = "ab".repeat(32);
+    await run(["init", "--custody", "environment"]);
+    const echo: string[] = [];
+    const hideInput = () => {
+      echo.push("off");
+      return () => void echo.push("on");
+    };
+    const tty = { isTTY: true, hideInput };
+    const mismatch = await run(["keys", "--rotate"], ["cd".repeat(32), "ce".repeat(32)], ME, tty);
+    expect(mismatch.exitCode).toBe(1);
+    expect(mismatch.lines).toEqual(["Nothing was rotated: the two keys you typed don't match."]);
+    expect(echo).toEqual(["off", "on"]);
+    expect(prompts.some((p) => p.includes("not shown"))).toBe(true);
+    expect((await run(["keys"])).lines[0]).toContain("(version 1)");
+    const cannotHide = await run(["keys", "--rotate"], ["cd".repeat(32)], ME, {
+      isTTY: true,
+      hideInput: () => undefined,
+    });
+    expect(cannotHide.exitCode).toBe(1);
+    expect(cannotHide.lines[0]).toContain("can't hide a typed key");
+    const typed = await run(["keys", "--rotate"], ["cd".repeat(32), "cd".repeat(32)], ME, tty);
+    expect(typed.exitCode).toBe(0);
+    expect(echo).toEqual(["off", "on", "off", "on"]);
     env["CREWHAUS_PEOPLE_SPACE_KEY"] = "cd".repeat(32);
     expect((await run(["list"])).lines[0]).toBe("No profiles yet.");
+  });
+
+  test("no guidance pipes a generated key straight into --rotate", async () => {
+    env["CREWHAUS_PEOPLE_SPACE_KEY"] = "ab".repeat(32);
+    await run(["init", "--custody", "environment"]);
+    const psn = await addMe();
+    const shown = [
+      ...(await run(["keys"])).lines,
+      ...(await run(["keys", "--rotate"], ["cd".repeat(32)])).lines,
+      ...(await run(["keys", "--rotate"], [], ME, { stdinIsFile: true })).lines,
+      ...(await run(["erase", psn, "--dry-run"])).lines,
+    ];
+    const mentions = shown.filter((line) => line.includes("keys --rotate"));
+    expect(mentions).toHaveLength(4);
+    for (const line of mentions) {
+      expect(line).toContain("> new.key");
+      expect(line).toContain("--rotate < new.key");
+      expect(line).not.toMatch(/\|\s*crewhaus people keys --rotate/);
+    }
   });
 
   test("--backup-days dates the backups an erasure cannot reach", async () => {
@@ -368,4 +451,27 @@ test("the vault is refused inside a git work tree, naming the fix", async () => 
   expect(out.exitCode).toBe(1);
   expect(out.lines[0]).toContain("Set CREWHAUS_HANGAR_ROOT to a directory outside it.");
   expect(existsSync(hangarRoot)).toBe(false);
+});
+
+describe("where stdin comes from", () => {
+  test("a file redirected in is a regular file; a device is not", () => {
+    const file = join(base, "new.key");
+    writeFileSync(file, "x\n");
+    const fd = openSync(file, "r");
+    try {
+      expect(isRegularFileFd(fd)).toBe(true);
+    } finally {
+      closeSync(fd);
+    }
+    const dev = openSync(process.platform === "win32" ? "NUL" : "/dev/null", "r");
+    try {
+      expect(isRegularFileFd(dev)).toBe(false);
+    } finally {
+      closeSync(dev);
+    }
+  });
+
+  test("a descriptor that cannot be read says so, not no", () => {
+    expect(isRegularFileFd(987_654)).toBeUndefined();
+  });
 });

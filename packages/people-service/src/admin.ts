@@ -58,6 +58,7 @@ import {
 import {
   ERASURE_NONCE_TTL_MS,
   type IndexRow,
+  SPACE_KEY_ENV,
   type Vault,
   VaultError,
   type VaultStatus,
@@ -130,6 +131,13 @@ export type Done<T> = { readonly ok: true; readonly value: T; readonly receipt?:
 export type Answer<T> = Done<T> | Refused;
 
 /** "Not allowed" and "no such profile" are this one answer. */
+/**
+ * How to replace a key kept in an environment variable without losing it: the new key is
+ * saved to a file before the rotation re-wraps anything under it, and read in from there.
+ */
+export const SAVED_KEY_ROTATION =
+  "openssl rand -hex 32 > new.key && crewhaus people keys --rotate < new.key";
+
 export const NOT_FOUND: Refused = Object.freeze({
   ok: false,
   code: "not_found",
@@ -540,7 +548,7 @@ export function createPeopleAdmin(options: PeopleAdminOptions) {
         return refused(
           "precondition_failed",
           "space-key-not-rotated",
-          "Under environment custody the new key comes from you: pipe 64 hex characters into `crewhaus people keys --rotate`.",
+          `Under environment custody the new key comes from you. Save it to a file first, then read it in: \`${SAVED_KEY_ROTATION}\`. Then set ${SPACE_KEY_ENV} to the key in new.key.`,
         );
       }
       return command({ kind: "people.vault.rotate", body: {} }, async () => {
