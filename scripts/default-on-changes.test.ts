@@ -24,8 +24,9 @@
  * `crewhaus serve --mcp --sse` listens on and the bearer it asks for, the check a
  * served tool call's message passes before its turn and what `--host` needs, the
  * file a managed daemon saves a generated signing secret to, and the preflight finding
- * for a harness directory that holds the home directory, with its start line. A
- * change reverted or scoped to the block stops being found, and a new root, tool,
+ * for a harness directory that holds the home directory, with its start line, the
+ * exit a refused daemon start gives now that it writes a receipt, and every CLI
+ * verb that takes a harness's mutating lease. A change reverted or scoped to the block stops being found, and a new root, tool,
  * header line, edge warning, verdict that moved, stopping shape or refused leaf
  * fails until the notes name it. Each scan also asserts it found something, so a
  * scan that silently matches nothing fails too.
@@ -44,6 +45,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -51,10 +53,21 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { runDaemonCommand } from "../apps/cli/src/daemon-cmd";
+import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
+import {
+  DECISION_LOG_KEYS,
+  EXIT_FOR_ERROR,
+  EXIT_FOR_REJECTED_RECEIPT,
+} from "../packages/control-contract/src/index";
+import { foldStates } from "../packages/control-records/src/index";
+import { commandsLedgerOf } from "../packages/control-service/src/index";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
+import { countPendingApprovals } from "../packages/gateway-protocol/src/control";
+import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import type { IrManagedV0 } from "../packages/ir/src/index";
 import {
@@ -66,10 +79,17 @@ import {
 import { runPreflight } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
 import { credentialFileRoots, runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
+import {
+  allowSingleOwner,
+  createPendingApprovalStore,
+  foldReadOnly,
+  generateApprovalId,
+} from "../packages/session-store/src/index";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
 import { OPTIMIZER_REFUSED_LEAVES } from "../packages/spec-patch/src/index";
 import { emitManaged } from "../packages/target-managed/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
+import { foldApprovals as toolFoldApprovals } from "../packages/tool-approvals/src/lib/approvals";
 import {
   SHAPE_TOOL_PROFILES,
   type ToolShape,
@@ -1749,5 +1769,183 @@ describe("the release notes name run ids and run records", () => {
     } finally {
       rmSync(harness, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * Receipts and the mutating lease. Every daemon verb and every Home change now
+ * writes a receipt first, a refused daemon start exits with the rejected-receipt
+ * code where it exited 1, and the CLI's long verbs take the harness's mutating
+ * lease. Each is found where it happens: a start refused against a running
+ * daemon, and every lease call site in the CLI with the verb it names. A verb
+ * that starts taking the lease fails until the list names it.
+ */
+describe("the release notes name the receipts and the lease every harness meets", () => {
+  const bullet = (): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+      b.includes("`.crewhaus/run/control/`"),
+    ) ?? "";
+
+  test("a refused daemon start writes a receipt and exits with the rejected-receipt code", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "default-on-receipts-")));
+    try {
+      const dir = join(root, "harness");
+      mkdirSync(join(dir, "dist"), { recursive: true });
+      writeFileSync(join(dir, "dist", "daemon.ts"), "// compiled bundle\n");
+      writeFileSync(
+        join(dir, "crewhaus.yaml"),
+        [
+          "name: receipts-fixture",
+          "target: channel",
+          "agent:",
+          "  model: anthropic/claude-sonnet-4",
+          "  instructions: |",
+          "    A fixture.",
+          "routing:",
+          "  sessionKey: channel",
+          "",
+        ].join("\n"),
+      );
+      const opts = {
+        env: { CREWHAUS_REGISTRY_ROOT: join(root, "registry"), CREWHAUS_NO_REGISTRY: "1" },
+        ops: createTestProcessOps(() => Date.now()),
+        cwd: dir,
+      };
+      // The control: a first start runs.
+      const first = await runDaemonCommand(["start", "--no-preflight"], opts);
+      expect(first.exitCode).toBe(0);
+      const again = await runDaemonCommand(["start", "--no-preflight"], opts);
+      expect(again.lines[0]).toContain("already running");
+      expect(again.exitCode).toBe(EXIT_FOR_REJECTED_RECEIPT);
+      expect(again.exitCode).not.toBe(1);
+      const fold = foldStates(commandsLedgerOf(dir));
+      expect(fold.ok && [...fold.objects.values()].map((o) => o.state)).toEqual([
+        "succeeded",
+        "rejected",
+      ]);
+      await runDaemonCommand(["stop"], opts);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const named = bullet();
+    for (const word of [
+      "`stop`",
+      "`restart`",
+      "`drain`",
+      `exit ${EXIT_FOR_REJECTED_RECEIPT}, where they exited 1`,
+      `exits ${EXIT_FOR_ERROR.unavailable}`,
+      "400",
+    ]) {
+      expect(named).toContain(word);
+    }
+  }, 20_000); // a daemon start and stop through the real supervisor
+
+  test("every CLI verb that takes the mutating lease is named, with the exit it refuses with", () => {
+    const cliSrc = join(ROOT, "apps", "cli", "src");
+    const verbs = new Set<string>();
+    let files = 0;
+    for (const name of readdirSync(cliSrc)) {
+      if (!name.endsWith(".ts") || name.endsWith(".test.ts") || name === "mutating-lease.ts") {
+        continue;
+      }
+      files += 1;
+      const source = readFileSync(join(cliSrc, name), "utf8");
+      for (const m of source.matchAll(/(?:hold|with)CliMutatingLease\([^;]*?,\s*"([^"]+)"/g)) {
+        verbs.add(m[1] as string);
+      }
+    }
+    expect(files).toBeGreaterThan(10);
+    expect(verbs.size).toBeGreaterThanOrEqual(5);
+    const named = bullet();
+    expect([...verbs].filter((verb) => !named.includes(`\`${verb}\``))).toEqual([]);
+    expect(named).toContain(`exit ${LEASE_BUSY_EXIT}`);
+  });
+});
+
+/**
+ * Approval decisions: the first one wins on every surface, it is recorded once
+ * in a content-free log, and a read never rewrites the approvals file. Each probe
+ * drives the store on a temp session root: a second decision that is no longer
+ * refused, a log line with a key outside the closed set, a read that rewrites the
+ * file, or two readers that fold a flipped file differently fails here, and the
+ * list must name each change.
+ */
+describe("approval decisions", () => {
+  const park = () => ({
+    id: generateApprovalId(),
+    toolName: "Bash",
+    inputHash: "a".repeat(64),
+    input: { command: "ls" },
+    runId: "run_00000001",
+    sessionId: "sess_00000000000000aa",
+    surface: "daemon",
+    createdAt: new Date().toISOString(),
+  });
+  const sessionRoot = (): string => mkdtempSync(join(tmpdir(), "crewhaus-default-on-approvals-"));
+
+  test("the first decision wins, and the list says how to change one", async () => {
+    const root = sessionRoot();
+    try {
+      const store = createPendingApprovalStore({ rootDir: root });
+      const p = park();
+      await store.persist(p);
+      const allow = { authorize: allowSingleOwner };
+      expect((await store.decide(p.id, { choice: "deny", actor: {} }, allow)).outcome).toBe(
+        "decided",
+      );
+      const second = await store.decide(p.id, { choice: "grant", actor: {} }, allow);
+      expect(second.outcome).toBe("already-decided");
+      expect(await store.resolve(p.id, "grant", "someone")).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("`crewhaus approvals supersede`"),
+      ) ?? "";
+    expect(bullet).toContain("first decision");
+  });
+
+  test("decisions are logged without content, and reads never rewrite the approvals file", async () => {
+    const root = sessionRoot();
+    try {
+      const store = createPendingApprovalStore({ rootDir: root });
+      const p = park();
+      await store.persist(p);
+      await store.decide(p.id, { choice: "grant", actor: {} }, { authorize: allowSingleOwner });
+      // (a) every log line's keys are the closed set.
+      const logDir = join(root, "approvals.d", "decisions");
+      const lines = readdirSync(logDir)
+        .flatMap((name) => readFileSync(join(logDir, name), "utf8").split("\n"))
+        .filter((line) => line.trim() !== "")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines.map((l) => l["event"])).toEqual(["park", "decide"]);
+      const allowed: readonly string[] = DECISION_LOG_KEYS;
+      expect(lines.flatMap((l) => Object.keys(l)).filter((k) => !allowed.includes(k))).toEqual([]);
+      // (b) the readers leave the file as it was.
+      const file = join(root, "approvals.jsonl");
+      const before = readFileSync(file);
+      await store.list();
+      foldReadOnly(root);
+      countPendingApprovals(file);
+      expect(readFileSync(file).equals(before)).toBe(true);
+      // (c) a planted 0.8.x flip: every reader keeps the first decision.
+      const flipped = park();
+      const grant = { ...flipped, decision: "grant", decidedAt: flipped.createdAt };
+      writeFileSync(
+        file,
+        `${[flipped, grant, flipped].map((l) => JSON.stringify(l)).join("\n")}\n`,
+      );
+      expect(foldReadOnly(root).records.map((r) => r.decision)).toEqual(["grant"]);
+      expect(countPendingApprovals(file)).toBe(0);
+      expect(toolFoldApprovals(file).records.map((r) => r.decision)).toEqual(["grant"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    // (d) the list names the directory.
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes("`approvals.d/`")) ?? "";
+    expect(bullet).toContain("reads never rewrite");
+    expect(bullet).toContain("decision log");
   });
 });

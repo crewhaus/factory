@@ -31,6 +31,19 @@ const id = mintRunId();
 classifyRunId(id); // { family: "canonical", refKinds: ["run"] }
 ```
 
+## Receipts and exits
+
+`COMMAND_KINDS` is the closed list of command kinds the composed areas declare. A legacy Hangar route
+with no core kind of its own writes its receipt as `legacy.<route key>` (`LEGACY_COMMAND_KIND_RE`), and
+`isCommandKind` accepts either form; the receipt schema checks `kind` with it. No executor is ever
+registered for a legacy kind, so recovery never runs one again.
+
+`EXIT_FOR_ERROR` gives every error code the CLI exit it ends with: the control band 50-56
+(`unauthenticated` 50, `forbidden` 51, `unavailable` 52, `conflict` 53, `unsupported` 54,
+`invalid` 55, `not_found` 56, each with its neighbours), `disabled` 38, `paused` 39 and `internal` 1.
+`EXIT_FOR_REJECTED_RECEIPT` is 55. The control service holds these numbers to `@crewhaus/errors`'
+`EXIT_CODES` in a test, because this entry imports nothing.
+
 ## What it does not do
 
 It never reads or writes anything. Record formats, locks, claims and tail readers belong to the

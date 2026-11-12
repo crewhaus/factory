@@ -18,6 +18,9 @@
       "path": "../harness-advice"
     },
     {
+      "path": "../session-store"
+    },
+    {
       "path": "../tool-permission-matcher"
     },
     {

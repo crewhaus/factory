@@ -17,6 +17,7 @@ export {
   type AppendClaimAnswer,
   type CasAnswer,
   type ClaimContent,
+  type ExpireAnswer,
   type FoldAnomaly,
   type FoldAnswer,
   type FoldGap,
@@ -31,6 +32,7 @@ export {
   publishClaim,
   readClaim,
   withLedgerLock,
+  expireClaim,
 } from "./ledger";
 export { type DropAnswer, dropSegmentsBefore } from "./retention";
 export {
@@ -52,7 +54,14 @@ export {
   resume,
   snapshotAt,
 } from "./cursor";
-export { type DigestKeyRead, ensureDigestKey, keyedDigest, readDigestKey } from "./digest";
+export {
+  type DigestKeyRead,
+  ensureDigestKey,
+  keyedDigest,
+  readDigestKey,
+  LOCAL_ACTOR_LABEL,
+  storedLocalActor,
+} from "./digest";
 export {
   type OperatorDeployment,
   type OperatorIntake,
@@ -78,5 +87,6 @@ export {
   acquireMutatingLease,
   readMutatingLease,
   withMutatingLease,
+  holderProvablyDead,
 } from "./lease";
 export { type RunnableMode, type RunnableVerdict, assertRunnable } from "./runnable";

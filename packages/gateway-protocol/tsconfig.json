@@ -5,10 +5,12 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../control-contract" },
     { "path": "../errors" },
     { "path": "../event-log" },
     { "path": "../provability" },
-    { "path": "../run-context" }
+    { "path": "../run-context" },
+    { "path": "../session-store" }
   ],
   "include": ["src/**/*"]
 }

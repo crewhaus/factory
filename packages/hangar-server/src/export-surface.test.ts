@@ -18,11 +18,13 @@
  */
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import * as accessControlHome from "@crewhaus/access-control";
 import { CONTROL_RUN_DIR, CONTROL_TOKEN_FILENAME } from "@crewhaus/gateway-protocol/control";
 import * as controlClientHome from "@crewhaus/gateway-protocol/control-client";
 import * as supervisorHome from "@crewhaus/harness-supervisor";
 import * as jobKindsHome from "@crewhaus/harness-supervisor/job-kinds";
 import * as runDetailHome from "@crewhaus/harness-supervisor/run-detail";
+import * as authModule from "./auth";
 import * as controlClientModule from "./control-client";
 import * as credsOpsModule from "./creds-ops";
 import * as envFileModule from "./env-file";
@@ -255,6 +257,28 @@ const INDEX_VALUES: readonly string[] = [
   "wikiView",
 ];
 
+/**
+ * Values added since, each on purpose: signing in (the choke point's adapter, the Host
+ * allowlist, the page policy, the sockets and the sign-in routes) and the owner's
+ * settings blocks.
+ */
+const SIGN_IN_VALUES: readonly string[] = [
+  "HOME_CSP",
+  "HOME_SOCKET",
+  "MISDIRECTED_TEXT",
+  "PROXY_SOCKET",
+  "SIGN_IN_ROUTES",
+  "allowedHosts",
+  "checkAccess",
+  "hostAllowed",
+  "hostNameOf",
+  "isLoopbackHostname",
+  "isV1Path",
+  "misdirected",
+  "refusalResponse",
+  "serveSignIn",
+];
+
 /** `Object.keys(await import("./scaffolded-workflows")).sort()`, captured
  *  before the move. The CLI imports this subpath for its workflow names. */
 const SCAFFOLDED_VALUES: readonly string[] = [
@@ -266,13 +290,14 @@ const SCAFFOLDED_VALUES: readonly string[] = [
 ];
 
 describe("the export surface", () => {
-  test("the root entry exports exactly the values it exported before the move", () => {
+  test("the root entry exports exactly the values it exported before the move, and the ones added since", () => {
     // The count first, so a failure says how far off the surface is before
     // the diff says where.
     expect(INDEX_VALUES).toHaveLength(219);
+    expect(SIGN_IN_VALUES).toHaveLength(14);
     const live = Object.keys(entry).sort();
-    expect(live).toHaveLength(219);
-    expect(live).toEqual([...INDEX_VALUES]);
+    expect(live).toHaveLength(219 + 14);
+    expect(live).toEqual([...INDEX_VALUES, ...SIGN_IN_VALUES].sort());
   });
 
   test("./scaffolded-workflows exports exactly its five values", () => {
@@ -311,6 +336,13 @@ const MOVED: ReadonlyArray<readonly [name: string, home: Namespace]> = [
   ["isJobKind", jobKindsHome],
   ["JOB_KINDS", jobKindsHome],
   ["JobArgumentError", jobKindsHome],
+  // Home's own key moved to the package that decides who signs in.
+  ["ensureToken", accessControlHome],
+  ["tokenEquals", accessControlHome],
+  ["TOKEN_FILENAME", accessControlHome],
+  ["SETTINGS_FILENAME", accessControlHome],
+  ["HOME_SOCKET", accessControlHome],
+  ["PROXY_SOCKET", accessControlHome],
 ];
 
 /** The same, module by module: the re-export modules keep every value they
@@ -321,6 +353,8 @@ const MODULE_MOVES: ReadonlyArray<
   ["control-client", controlClientModule, "DEFAULT_CONTROL_TIMEOUT_MS", controlClientHome],
   ["runs", runsModule, "MAX_LEDGER_ROWS", runDetailHome],
   ["creds-ops", credsOpsModule, "ENV_KEY_RE", supervisorHome],
+  ["auth", authModule, "createBootTickets", accessControlHome],
+  ["auth", authModule, "BOOT_TICKET_TTL_MS", accessControlHome],
 ];
 
 /** Pure re-export modules: exactly the values each defined before the move. */
@@ -345,8 +379,8 @@ const REEXPORT_MODULES: ReadonlyArray<
 ];
 
 describe("moved names are re-exported, not copied", () => {
-  test("each of the 21 is the same binding as at its new home", () => {
-    expect(MOVED).toHaveLength(21);
+  test("each of the 27 is the same binding as at its new home", () => {
+    expect(MOVED).toHaveLength(27);
     for (const [name, home] of MOVED) {
       // The name must exist at the home: two undefineds would compare equal.
       expect(`${name}:${home[name] !== undefined}`).toBe(`${name}:true`);

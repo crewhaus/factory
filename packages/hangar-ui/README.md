@@ -45,13 +45,22 @@ server's static-asset option; a server route for `path` responds with
 
 ## The app
 
-- **Auth bootstrap** — reads `#t=<token>` from the URL fragment into
-  sessionStorage (and strips it via `history.replaceState`), then sends
-  `Authorization: Bearer` on every request. Fragments never reach server
-  logs; no cookies means no CSRF surface. Any 401 swaps in a token-paste
-  screen that points at the token file (`~/.crewhaus/hangar/token` by
-  default). The live run feed is hand-rolled over `fetch` for the same
-  reason `EventSource` cannot be used: it carries no bearer header.
+- **Sign-in** (`sign-in.js`, `sealed.js`, `views/sign-in.js`) — before the
+  router starts: a one-time `#x=` code from a boot link is taken off the
+  address first, then traded, with a new non-extractable ECDSA P-256 key
+  (kept in IndexedDB, `crewhaus-home`), for a session Home seals to this
+  tab (ECDH P-256, HKDF-SHA256, AES-256-GCM); else this tab's session; else
+  the browser's key signs a challenge; else a tab an earlier release left
+  holding Home's own key trades it once, from loopback, and deletes it;
+  else the sign-in screen, which asks for a link from
+  `crewhaus hangar open` and refuses Home's own key unsent. The session
+  lives in sessionStorage and goes as `Authorization: Bearer` on every
+  request; no cookies means no CSRF surface. A 401, or a run stream that
+  closes with `auth.expired` or `auth.revoked`, signs in again with the
+  browser's key once, silently, then shows the screen. Settings has Sign
+  out and Forget this browser. The live run feed is hand-rolled over
+  `fetch` for the same reason `EventSource` cannot be used: it carries no
+  bearer header. Every page is served under a strict Content-Security-Policy.
 - **Hash router, deep-linkable** — `#/` (Library), the fleet screens
   `#/{runs, approvals, review, activity, credentials, feedback, thredz}`,
   `#/h/<id>` (Overview), and `#/h/<id>/{spec, runs[/<runId>], schedulers,

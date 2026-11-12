@@ -7,8 +7,10 @@ outside identities (a Slack user, a GitHub account, a proxy login), the pure `au
 the approver projection each governed harness reads.
 
 The design is in [module brief 323](https://github.com/crewhaus/docs/blob/main/module-briefs/323-access-control.md).
-This package is its first stage: the records, `authorize()`, `registerDomain()`, the projection writer
-and the bootstrap migration, with `crewhaus access` in direct mode as the first caller.
+Stage 1 is the records, `authorize()`, `registerDomain()`, the projection writer and the bootstrap
+migration, with `crewhaus access` in direct mode as the first caller. Stage 2 is the owner signing in:
+Home's own key and the boot tickets (moved here from hangar-server), browsers' device keys and sealed
+sessions, the owner's settings blocks, and `authenticate()`, which Home calls on every request.
 
 It is files and WebCrypto: it imports `@crewhaus/control-contract`, `@crewhaus/control-records`,
 `@crewhaus/tool-safety/fs` and Node built-ins, spawns no process, opens no socket and reads no file of
@@ -32,6 +34,9 @@ Every path is under the Hangar root (`~/.crewhaus/hangar` by default). Directori
 | `subjects.json` | `{v: 1, principals: {prn_: {displayName, contact?}}, links: {lnk_: "<subject>"}}` |
 | `keys/subject.key` | the key `subjectRef` is a keyed digest under |
 | `lock`, `claims/` | the one access lock, and the claims that settle how an invite ends |
+| `devices.jsonl` | `{id: dev_, principal, deviceJwk, state: active\|revoked, revokedAt?}`: each browser's PUBLIC signing key |
+| `sessions.jsonl` | `{id: crd_, principal, device, sha256, expiresAt, state: active\|ended, endedAt?, reason?}`: the digest of each session's secret |
+| `security.jsonl` | `{v: 1, at, event: "identity_header_ignored", listener, peerRef}`: a proxy identity header that did not count, at most once per peer per hour; `peerRef` is a keyed digest, never the address |
 
 Every ledger row is `{id, state, at, by, …}`, one file per kind, folded by `id`. `by` is always a
 stored actor, never a raw `local:` id. No row holds a secret, a display name, a contact or a readable
@@ -53,6 +58,46 @@ its digest is recorded as the owner's `bootstrap` credential.
 Both `redact.ts` copies (in `@crewhaus/ir` and `@crewhaus/spec-patch`) mask the `ch*_` shapes, so a
 CrewHaus secret is masked wherever it appears.
 
+`devices.jsonl` and `sessions.jsonl` are not authority: `loadAccessSnapshot` never folds them, and
+signing in, coming back and refreshing never move the access revision. Signing out and rotating Home's
+own key do. Their fold is tolerant: a torn line is skipped, never a reason to sign everyone out.
+
+## Signing in
+
+- **Home's own key** (`<hangarRoot>/token`, the bootstrap) is the owner only on
+  `<hangarRoot>/home.sock`, or over TCP from a loopback peer (`127.0.0.0/8`, `::1` in every spelling,
+  `::ffff:127.x.y.z`) whose request carries none of `Forwarded`, `X-Forwarded-*`, `X-Real-IP` or the
+  proxy's identity header, while the key is not socket-only and no proxy is trusted. With access set up
+  it is the live `bootstrap` credential with that digest, so `rotateBootstrap` takes effect on a running
+  Home at its next request. No setting accepts it from anywhere else.
+- **Boot tickets** (`/boot/<nonce>`, 2 minutes) are minted with Home's own key and spent for an
+  **exchange code** (60 seconds); a **challenge** (60 seconds) is what a returning device signs. Both are
+  single use, deleted before their expiry is checked, and at most 256 of each live at once.
+- **A device key** is a non-extractable ECDSA P-256 key the browser makes; Home keeps its public JWK.
+  It signs `canonicalJson({v: 1, op: "auth.session", device, nonce, seal})`, so a relay cannot swap in
+  its own seal. It is unusable 30 days after it last signed in.
+- **A session** (`cha_…`) lasts an hour from its last use and 12 hours at most. The sliding deadline is
+  kept in memory (from the session's row after a restart), so checking a session writes nothing. A
+  refresh issues a new secret with the same deadline.
+- **Sealed issuance.** A request that gets a secret sends `seal`, a one-off ECDH P-256 public key. Home
+  answers `{alg: "ECDH-ES+A256GCM", epk, iv, ct}`: ECDH with its own one-off key (`epk`, the raw
+  uncompressed point), HKDF-SHA256 (empty salt, info `crewhaus.hangar.v1/issued`), AES-256-GCM with the
+  operation id as additional data, every value lowercase hex. The browser half is
+  `hangar-ui/assets/js/sealed.js`; a test seals here and opens there.
+- **`authenticate(request, peer, config, state)`** takes the proxy identity (only from a listed peer
+  with the proxy's secret, or on `proxy.sock`), then the bearer (`cha_` a session, `chs_` a service
+  token, anything else Home's own key under the rules above), refuses a bearer and an identity that
+  name different principals (`identity_mismatch`), and answers 403 `not_invited` for an identity nobody
+  linked. Until route authorization lands, `admitUntilAuthorization` admits only the home owner: any
+  other principal is refused with `authorization_unavailable` (`owner_only`).
+- **Rotation.** `rotateBootstrap` writes a new key at 0600, revokes the old digest, records the new one
+  (socket-only when asked, and it stays so until `tcp`), ends every session and revokes every device
+  key, and moves the revision once. Another user of the computer is refused.
+- **The owner's settings.** `readOwnerSettings` reads `access` (`trustedProxy {header, peers, hosts,
+  secretDigest?, socket?}`, `allowedHosts`) and `links` (`baseUrl`: https, or http on loopback) from
+  `<hangarRoot>/settings.json`; an `access` block that is not right is refused naming the file and
+  the field. `writeOwnerBlock` changes one block and keeps the rest.
+
 ## Exports
 
 | Export | Does | First consumer |
@@ -68,6 +113,13 @@ CrewHaus secret is masked wherever it appears.
 | `localPrincipalOf(snapshot, localActor)` | The principal an OS user is linked to | `crewhaus access sync` |
 | `mintIssuedSecret(kind)` | A new secret of a kind | invites and service tokens |
 | `INVITE_TTL_MS`, `SERVICE_TOKEN_TTL_MS` | The lifetimes: an invite 24 hours by default and 7 days at most; a service token 180 days | `--expires` |
+| `ensureToken`, `tokenEquals`, `TOKEN_FILENAME`, `createBootTickets`, `BOOT_TICKET_TTL_MS` | Home's own key and the boot tickets, moved from hangar-server (which re-exports them for one release) | Home's boot |
+| `openSignIn(hangarRoot, {now?, localActor})` | The sign-in handle: boot tickets, exchange codes, challenges, `exchange`, `signInWithDevice`, `refresh`, `signOut`, `verifyBearer`, `onEnd`, `checkSessions` | Home's sign-in routes |
+| `authenticate`, `admitUntilAuthorization` | One request to at most one principal; the owner-only rule until route authorization | Home's choke point |
+| `rotateBootstrap(hangarRoot, {localActor, socketOnly?, tcp?, now?})` | Replace Home's own key | `crewhaus hangar rotate-token` |
+| `readOwnerSettings`, `writeOwnerBlock`, `SETTINGS_FILENAME`, `OWNER_BLOCKS` | The owner's settings blocks | Home's boot, `crewhaus access proxy` |
+| `isLoopbackAddress`, `parseCidr`, `cidrContains` | Addresses as bytes | `authenticate` |
+| `HOME_SOCKET`, `PROXY_SOCKET`, `PROXY_SECRET_HEADER`, `SIGN_IN_LIMITS`, `BOOTSTRAP_PRINCIPAL` | Names and lifetimes | Home, the CLI |
 
 ## Rules
 
@@ -107,6 +159,6 @@ CrewHaus secret is masked wherever it appears.
 
 ## `crewhaus access`
 
-`members`, `tokens`, `invite`, `grant`, `revoke`, `link`, `unlink`, `mint` and `sync`, in
+`members`, `tokens`, `invite`, `grant`, `revoke`, `link`, `unlink`, `mint`, `sync` and `proxy`, in
 `apps/cli/src/access-cmd.ts`, which only parses and prints. Every verb works with Home stopped; the OS
 user who owns the Home acts as its owner, and another user of the same computer is refused.

@@ -13,9 +13,13 @@
   },
   "dependencies": {
     "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/tool-safety": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/spec-patch": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

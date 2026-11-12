@@ -54,6 +54,8 @@ export type CredentialRow = RowBase & {
   readonly harnesses?: readonly string[];
   readonly contentRead?: true;
   readonly subjectAssert?: true;
+  /** A bootstrap only `<hangarRoot>/home.sock` accepts (`crewhaus hangar rotate-token --socket-only`). */
+  readonly socketOnly?: true;
   readonly expiresAt?: string;
   readonly state: "active" | "revoked";
   readonly revokedAt?: string;
@@ -146,6 +148,7 @@ const CHECKS: { readonly [K in keyof RowOf]: (row: Record<string, unknown>) => b
     optional(row["harnesses"], (v) => Array.isArray(v) && v.every((h) => isId("hrn", h))) &&
     optional(row["contentRead"], (v) => v === true) &&
     optional(row["subjectAssert"], (v) => v === true) &&
+    optional(row["socketOnly"], (v) => v === true && row["kind"] === "bootstrap") &&
     optional(row["expiresAt"], isTime) &&
     (row["state"] === "active" || row["state"] === "revoked") &&
     ended(row, "revoked", "revokedAt"),

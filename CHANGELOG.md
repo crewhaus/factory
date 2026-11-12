@@ -30,6 +30,34 @@ these on: they reach every harness that uses what each one names.
   bearer travels as sent, so keep such a listener on a private network or
   behind TLS.
 
+- **Daemon verbs and Home's changes leave a receipt, and long CLI verbs take
+  turns with Home.** `crewhaus daemon start`, `stop`, `restart` and `drain`,
+  and every change made in Home, first write a receipt under the harness's
+  `.crewhaus/run/control/` (ids and states, never arguments or secrets). A
+  verb whose receipt cannot be written does nothing and exits 52. `crewhaus
+  daemon start` and `restart` exit 55, where they exited 1, when the start is
+  refused: already running, or stopped by preflight. `compile`, `eval`,
+  `optimize`, `flywheel run` and `dream run` wait up to 10 seconds while a
+  Home job changes the same harness, then exit 53 naming it; a Home job that
+  meets one of them fails the same way. A Home write whose body is not a JSON
+  object is answered 400 before anything runs.
+
+- **The first decision on an approval wins.** A second grant or deny on the same
+  request, from Home, the CLI or a channel, is refused and names the first
+  decision. To change a decision before it is used, run
+  `crewhaus approvals supersede` with the request's id and a `--reason` code: it
+  parks a fresh request in its place.
+
+- **Approval decisions are recorded once, and reads never rewrite the approvals
+  file.** Each session root gains `approvals.d/`: a lock every write takes, a
+  claim file that records the first decision, and a decision log of ids, keyed
+  digests, times and reason codes, never tool input or names. `crewhaus
+  approvals list|show`, the runtime and a channel daemon no longer compact
+  `approvals.jsonl` when they read it, and the TTL sweep at start writes a log
+  line before it drops a request. When the session root holds the working
+  directory, the runtime-state floor protects `approvals.d/` as it protects the
+  approvals file.
+
 - **Run ids have one form.** A run's id is now `run_` and 26 lowercase letters
   and digits (it was `run_` and 8 hex characters), in trace events, logs and
   pending approvals. A sub-agent's run names the run that started it. A

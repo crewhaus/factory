@@ -7,6 +7,7 @@ import {
   append,
   appendClaim,
   casAppend,
+  expireClaim,
   foldStates,
   publishClaim,
   readClaim,
@@ -639,5 +640,106 @@ describe("torn-line sealing", () => {
     const fold = foldStates(ledger);
     if (!fold.ok) throw new Error(fold.reason);
     expect(fold.objects.get("b")?.state).toBe("s");
+  });
+});
+
+describe("expiring a claim", () => {
+  const T0 = Date.parse("2026-11-01T00:00:00.000Z");
+  const claimFile = (root: string, rel: string): string =>
+    join(root, ".crewhaus", "run", "control", "claims", rel);
+
+  test("an older claim is removed, and its name can be claimed again", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root);
+    _setLedgerSeamsForTest({ now: () => T0 });
+    await appendClaim(ledger, { claim: "idem/one", record: { id: "a" } });
+    expect(existsSync(claimFile(root, "idem/one.json"))).toBe(true);
+    expect(await expireClaim(ledger, "idem/one", T0 + 1)).toEqual({ ok: true, removed: true });
+    expect(existsSync(claimFile(root, "idem/one.json"))).toBe(false);
+    expect(readClaim(ledger, "idem/one")).toMatchObject({ ok: false, code: "not-found" });
+  });
+
+  test("a claim exactly as old as the bound, or younger, stays", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root);
+    _setLedgerSeamsForTest({ now: () => T0 });
+    await appendClaim(ledger, { claim: "idem/one", record: { id: "a" } });
+    expect(await expireClaim(ledger, "idem/one", T0)).toEqual({ ok: true, removed: false });
+    expect(await expireClaim(ledger, "idem/one", T0 - 1)).toEqual({ ok: true, removed: false });
+    expect(existsSync(claimFile(root, "idem/one.json"))).toBe(true);
+  });
+
+  test("a missing claim is nothing to remove", async () => {
+    const ledger = runsLedger(tempDir());
+    expect(await expireClaim(ledger, "idem/none", T0)).toEqual({ ok: true, removed: false });
+  });
+
+  test("a generation claim is refused and kept, however old", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root, "deployment");
+    _setLedgerSeamsForTest({ now: () => T0 });
+    await casAppend(ledger, "d", null, { state: "prepared" });
+    const answer = await expireClaim(ledger, "gen/d/1", T0 + 365 * 86_400_000);
+    expect(answer).toMatchObject({ ok: false, code: "invalid-path" });
+    expect(existsSync(claimFile(root, "gen/d/1.json"))).toBe(true);
+  });
+});
+
+describe("a claim is one fact per claim and id", () => {
+  const T0 = Date.parse("2026-11-01T00:00:00.000Z");
+
+  test("a name claimed again with a new id folds as a second object", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root, "command");
+    _setLedgerSeamsForTest({ now: () => T0 });
+    await appendClaim(ledger, { claim: "idem/one", record: { id: "a", state: "accepted" } });
+    await expireClaim(ledger, "idem/one", T0 + 1);
+    const again = await appendClaim(ledger, {
+      claim: "idem/one",
+      record: { id: "b", state: "accepted" },
+    });
+    expect(again).toMatchObject({ ok: true, won: true });
+    const fold = foldStates(ledger);
+    if (!fold.ok) throw new Error(fold.reason);
+    expect([...fold.objects.keys()].sort()).toEqual(["a", "b"]);
+    expect(fold.records).toBe(2);
+  });
+
+  test("a crash between the claim again and its append is repaired on the next touch", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root, "command");
+    _setLedgerSeamsForTest({ now: () => T0 });
+    await appendClaim(ledger, { claim: "idem/one", record: { id: "a", state: "accepted" } });
+    await expireClaim(ledger, "idem/one", T0 + 1);
+    _setLedgerSeamsForTest({
+      now: () => T0,
+      afterClaim: () => {
+        throw new Error("crash");
+      },
+    });
+    await expect(
+      appendClaim(ledger, { claim: "idem/one", record: { id: "b", state: "accepted" } }),
+    ).rejects.toThrow("crash");
+    _setLedgerSeamsForTest(undefined);
+    const touch = await appendClaim(ledger, {
+      claim: "idem/one",
+      record: { id: "c", state: "accepted" },
+    });
+    if (!touch.ok || touch.won) throw new Error("the touch must lose");
+    expect(touch.repaired).toBe(true);
+    expect(touch.winner.record["id"]).toBe("b");
+    const fold = foldStates(ledger);
+    if (!fold.ok) throw new Error(fold.reason);
+    expect([...fold.objects.keys()].sort()).toEqual(["a", "b"]);
+  });
+
+  test("a row with no id is still one fact per claim", () => {
+    const root = tempDir();
+    const ledger = runsLedger(root);
+    append(ledger, { claim: "idem/x", note: 1 });
+    append(ledger, { claim: "idem/x", note: 2 });
+    const fold = foldStates(ledger);
+    if (!fold.ok) throw new Error(fold.reason);
+    expect(fold.records).toBe(1);
   });
 });

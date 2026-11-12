@@ -5,9 +5,10 @@
  * through the module's `env` option, so nothing here can touch the real
  * `~/.crewhaus`. Lock semantics are unit-tested with fake pid-liveness
  * probes; the `status --json` running case boots a real in-process
- * `startHangarServer` on an ephemeral port; the ONE subprocess in this file
- * is the `hangar serve --smoke` end-to-end (the release workflow's smoke
- * entry), spawned with an explicit generous timeout per the CI rule.
+ * `startHangarServer` on an ephemeral port. The subprocesses are the
+ * `hangar serve --smoke` end-to-end (the release workflow's smoke entry) and
+ * the dotenv rows, which need Bun's own `.env` loader; each is spawned with an
+ * explicit generous timeout per the CI rule.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -178,25 +179,32 @@ async function driveServe(
     readonly networkInterfaces?: () => InterfaceMap;
     readonly columns?: number;
     readonly color?: boolean;
+    readonly openBrowser?: (url: string) => void;
   },
 ): Promise<HangarServerOptions[]> {
   const seen: HangarServerOptions[] = [];
   const baseline = process.listenerCount("SIGTERM");
-  const run = runHangarCommand(["serve", "--no-open", ...argv], {
-    env: opts.env,
-    ...(opts.platform !== undefined ? { platform: opts.platform } : {}),
-    pid: 4242,
-    isPidAlive: () => false,
-    write: opts.write ?? ((): void => {}),
-    ...(opts.networkInterfaces !== undefined ? { networkInterfaces: opts.networkInterfaces } : {}),
-    ...(opts.columns !== undefined ? { columns: opts.columns } : {}),
-    ...(opts.color !== undefined ? { color: opts.color } : {}),
-    startServer: (options) => {
-      seen.push(options);
-      return fakeServer({ handles: new Map(), runningJobs: [] }, [], options.hostname);
+  const run = runHangarCommand(
+    ["serve", ...(opts.openBrowser !== undefined ? [] : ["--no-open"]), ...argv],
+    {
+      env: opts.env,
+      ...(opts.platform !== undefined ? { platform: opts.platform } : {}),
+      pid: 4242,
+      isPidAlive: () => false,
+      write: opts.write ?? ((): void => {}),
+      ...(opts.networkInterfaces !== undefined
+        ? { networkInterfaces: opts.networkInterfaces }
+        : {}),
+      ...(opts.columns !== undefined ? { columns: opts.columns } : {}),
+      ...(opts.color !== undefined ? { color: opts.color } : {}),
+      ...(opts.openBrowser !== undefined ? { openBrowser: opts.openBrowser } : {}),
+      startServer: (options) => {
+        seen.push(options);
+        return fakeServer({ handles: new Map(), runningJobs: [] }, [], options.hostname);
+      },
+      exit: () => {},
     },
-    exit: () => {},
-  });
+  );
   await awaitSignalWait(baseline);
   process.emit("SIGTERM");
   await run;
@@ -307,25 +315,35 @@ describe("hangar serve --lan", () => {
     expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(false);
   });
 
-  test("prints a QR code that encodes the token-bearing url, and says so", async () => {
+  test("prints a QR code that encodes the bare LAN address, and no credential", async () => {
     const ws = newWorkspace();
     const out = sink();
+    const opened: string[] = [];
     await driveServe(["--lan"], {
       env: ws.env,
       networkInterfaces: () => LAN_INTERFACES,
       write: out.write,
       color: false,
       columns: 200,
+      openBrowser: (url) => opened.push(url),
     });
     const printed = out.lines.join("\n");
-    // The url the fake server composed, with the token as a #fragment.
-    const url = "http://192.168.7.31:4321/#t=fake-token";
-    expect(printed).toContain("scan to open Hangar on your phone");
+    // The bare address the fake server composed: no token, no fragment.
+    const url = "http://192.168.7.31:4321";
+    expect(printed).toContain("scan to open Home on your phone");
     // …and the code really is that url, not merely some code-shaped output.
     const want = renderQrLines(encodeQr(url, { ecLevel: "M" }), { color: false });
     for (const line of want) expect(out.lines).toContain(line);
+    const withToken = renderQrLines(encodeQr(`${url}/#t=fake-token`, { ecLevel: "M" }), {
+      color: false,
+    });
+    expect(withToken.every((line) => out.lines.includes(line))).toBe(false);
     // The summary names the interface and the exposure.
-    expect(printed).toContain("en0 — every device on this network can reach this console");
+    expect(printed).toContain("on en0 — every device on this network can reach this console");
+    // No printed line and no opener argument carries Home's own key.
+    expect(printed).not.toContain("fake-token");
+    expect(printed).not.toContain("#t=");
+    expect(opened.join(" ")).not.toContain("fake-token");
   });
 
   test("--no-qr boots the LAN console without printing one", async () => {
@@ -377,7 +395,7 @@ describe("hangar serve --lan", () => {
 // ---------------------------------------------------------------------------
 
 describe("hangar qr", () => {
-  test("reprints the running console's code from the lock and the token file", () => {
+  test("reprints the running console's code from the lock: the bare address, no key", () => {
     const ws = newWorkspace();
     mkdirSync(ws.hangarRoot, { recursive: true });
     writeFileSync(join(ws.hangarRoot, "token"), "lan-token\n");
@@ -395,11 +413,11 @@ describe("hangar qr", () => {
     });
     return got.then((result) => {
       expect(result.exitCode).toBe(0);
-      const want = renderQrLines(
-        encodeQr("http://192.168.7.31:4200/#t=lan-token", { ecLevel: "M" }),
-        { color: false },
-      );
+      const want = renderQrLines(encodeQr("http://192.168.7.31:4200", { ecLevel: "M" }), {
+        color: false,
+      });
       for (const line of want) expect(result.lines).toContain(line);
+      expect(result.lines.join("\n")).not.toContain("lan-token");
     });
   });
 
@@ -544,10 +562,27 @@ describe("hangar serve argument validation", () => {
     ).rejects.toThrow(/already running at http:\/\/127\.0\.0\.1:4200 \(pid 4242\).*hangar open/);
   });
 
-  test("--help prints usage with the fragment-token contract", async () => {
+  test("--help prints usage: a one-time link signs a browser in; Home's own key stays here", async () => {
     const out = await runHangarCommand(["--help"]);
     expect(out.exitCode).toBe(0);
-    expect(out.lines.join("\n")).toContain("URL #fragment (never a query string)");
+    const text = out.lines.join("\n");
+    expect(text).toContain("signs in through a one-time link");
+    expect(text).toContain("crewhaus hangar rotate-token [--socket-only | --tcp]");
+    expect(text).toContain("--allow-host <name>");
+    expect(text).not.toContain("#fragment");
+  });
+
+  test("--allow-host reaches the server, repeatable", async () => {
+    const ws = newWorkspace();
+    const seen = await driveServe(["--allow-host", "home.lan", "--allow-host", "nas.local"], {
+      env: ws.env,
+    });
+    expect(seen[0]?.allowHosts).toEqual(["home.lan", "nas.local"]);
+    const none = await driveServe([], { env: ws.env });
+    expect(none[0]?.allowHosts).toBeUndefined();
+    await expect(
+      runHangarCommand(["serve", "--allow-host", "bad name"], { env: ws.env }),
+    ).rejects.toThrow(/--allow-host takes a host name/);
   });
 });
 
@@ -623,13 +658,11 @@ describe("hangar status / open", () => {
     expect(opened).toEqual([]);
   });
 
-  test("open prints the #fragment url but never hands the token to the opener", async () => {
+  test("open with no answer from the console opens the bare address, never the key", async () => {
     const ws = newWorkspace();
     mkdirSync(ws.hangarRoot, { recursive: true });
     writeFileSync(join(ws.hangarRoot, "token"), "tok-abc123\n");
-    // Nothing is listening on this port, so the boot-ticket mint fails and
-    // the opener falls back to the bare url — the token still must not
-    // appear in what another process would see.
+    // Nothing is listening on this port, so no link can be minted.
     writeHangarLock(ws.hangarRoot, { ...LOCK, pid: process.pid, url: "http://127.0.0.1:4321" });
     const opened: string[] = [];
     const out = await runHangarCommand(["open"], {
@@ -637,21 +670,19 @@ describe("hangar status / open", () => {
       openBrowser: (url) => opened.push(url),
     });
     expect(out.exitCode).toBe(0);
-    // Printed to the operator's own terminal: the full fragment url.
-    expect(out.lines).toEqual(["http://127.0.0.1:4321/#t=tok-abc123"]);
-    expect(out.lines[0]).not.toContain("?"); // fragment, never a query string
-    // Handed to another process: never the token.
     expect(opened).toEqual(["http://127.0.0.1:4321"]);
-    expect(opened[0]).not.toContain("tok-abc123");
+    expect(out.lines.join(" ")).not.toContain("tok-abc123");
+    expect(out.lines.join(" ")).toContain("sign in there");
   });
 
-  test("open trades the token for a single-use boot path against a live console", async () => {
+  test("open signs a browser in through a single-use link minted over home.sock", async () => {
     const ws = newWorkspace();
     const server = startHangarServer({
       port: 0,
       root: ws.hangarRoot,
-      registryRoot: ws.registryRoot,
+      registryRoot: ws.env["CREWHAUS_REGISTRY_ROOT"] as string,
       env: ws.env,
+      onWarn: () => {},
     });
     try {
       writeHangarLock(ws.hangarRoot, {
@@ -666,14 +697,119 @@ describe("hangar status / open", () => {
         openBrowser: (url) => opened.push(url),
       });
       expect(out.exitCode).toBe(0);
+      expect(out.lines).toEqual(["opened Home in your browser"]);
       const handed = opened[0] as string;
-      expect(handed).toMatch(/\/boot\/[0-9a-f]{64}$/);
+      expect(handed).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/boot\/[0-9a-f]{64}$/);
       expect(handed).not.toContain(server.token as string);
-      // It is a real, single-use ticket: it redirects once to the fragment.
+      // It is a real, single-use link: it redirects once to a one-time code.
       const first = await fetch(handed, { redirect: "manual" });
       expect(first.status).toBe(302);
-      expect(first.headers.get("location")).toBe(`/#t=${server.token}`);
+      expect(first.headers.get("location")).toMatch(/^\/#x=[A-Za-z0-9_-]{43}$/);
       expect((await fetch(handed, { redirect: "manual" })).status).toBe(404);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("open --print prints a one-time /boot/ link instead of opening it", async () => {
+    const ws = newWorkspace();
+    const server = startHangarServer({
+      port: 0,
+      root: ws.hangarRoot,
+      registryRoot: ws.env["CREWHAUS_REGISTRY_ROOT"] as string,
+      env: ws.env,
+      onWarn: () => {},
+    });
+    try {
+      writeHangarLock(ws.hangarRoot, {
+        ...LOCK,
+        pid: process.pid,
+        port: server.port,
+        url: server.url,
+      });
+      const opened: string[] = [];
+      const out = await runHangarCommand(["open", "--print"], {
+        env: ws.env,
+        openBrowser: (url) => opened.push(url),
+      });
+      expect(out.exitCode).toBe(0);
+      expect(opened).toEqual([]);
+      expect(out.lines[0]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/boot\/[0-9a-f]{64}$/);
+      expect(out.lines.join("\n")).not.toContain(server.token as string);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("open names rotate-token when Home refuses the key in the file", async () => {
+    const ws = newWorkspace();
+    const server = startHangarServer({
+      port: 0,
+      root: ws.hangarRoot,
+      registryRoot: ws.env["CREWHAUS_REGISTRY_ROOT"] as string,
+      env: ws.env,
+      onWarn: () => {},
+    });
+    try {
+      writeHangarLock(ws.hangarRoot, {
+        ...LOCK,
+        pid: process.pid,
+        port: server.port,
+        url: server.url,
+      });
+      // Recorded by a rotation, then the file replaced behind Home's back.
+      const rotated = await runHangarCommand(["rotate-token"], {
+        env: ws.env,
+        identity: { username: "tester", hostname: "test-host" },
+      });
+      expect(rotated.exitCode).toBe(0);
+      writeFileSync(join(ws.hangarRoot, "token"), `${"cd".repeat(32)}\n`, { mode: 0o600 });
+      for (const argv of [["open"], ["open", "--print"]]) {
+        const opened: string[] = [];
+        const out = await runHangarCommand(argv, {
+          env: ws.env,
+          openBrowser: (url) => opened.push(url),
+        });
+        expect(out.exitCode).toBe(1);
+        expect(opened).toEqual([]);
+        expect(out.lines.join("\n")).toContain("is not the one Home recorded");
+        expect(out.lines.join("\n")).toContain("crewhaus hangar rotate-token");
+        expect(out.lines.join("\n")).not.toContain("cd".repeat(32));
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("rotate-token against a running Home: the old key is refused at once, the new one works", async () => {
+    const ws = newWorkspace();
+    const server = startHangarServer({
+      port: 0,
+      root: ws.hangarRoot,
+      registryRoot: ws.env["CREWHAUS_REGISTRY_ROOT"] as string,
+      env: ws.env,
+      onWarn: () => {},
+    });
+    try {
+      const old = server.token as string;
+      const ask = (token: string) =>
+        fetch(`${server.url}/api/version`, { headers: { authorization: `Bearer ${token}` } });
+      expect((await ask(old)).status).toBe(200);
+      const out = await runHangarCommand(["rotate-token"], {
+        env: ws.env,
+        identity: { username: "tester", hostname: "test-host" },
+      });
+      expect(out.exitCode).toBe(0);
+      const fresh = readFileSync(join(ws.hangarRoot, "token"), "utf8").trim();
+      expect(fresh).not.toBe(old);
+      // The key is never printed.
+      expect(out.lines.join("\n")).not.toContain(fresh);
+      expect(out.lines.join("\n")).toContain("the old one no longer works");
+      expect((await ask(old)).status).toBe(401);
+      expect((await ask(fresh)).status).toBe(200);
+      await expect(
+        runHangarCommand(["rotate-token", "--socket-only", "--tcp"], { env: ws.env }),
+      ).rejects.toThrow(/not both/);
     } finally {
       await server.stop();
     }
@@ -681,7 +817,129 @@ describe("hangar status / open", () => {
 });
 
 // ---------------------------------------------------------------------------
-// serve --smoke end-to-end (the ONE subprocess in this file)
+// Home's directories come from the shell, not a .env file
+// ---------------------------------------------------------------------------
+
+describe("Home's directories and dotenv files", () => {
+  const files = (map: Record<string, string>) => (path: string) => {
+    const name = path.split(/[\\/]/).pop() as string;
+    return map[name];
+  };
+
+  test.each([
+    ["CREWHAUS_HANGAR_ROOT", ".env"],
+    ["CREWHAUS_REGISTRY_ROOT", ".env"],
+    ["CREWHAUS_HANGAR_ROOT", ".env.development.local"],
+    ["CREWHAUS_REGISTRY_ROOT", ".env.test.local"],
+  ])("%s with the value ./%s holds is refused, naming both", async (name, file) => {
+    const ws = newWorkspace();
+    const value = ws.env[name] as string;
+    for (const verb of [["serve"], ["status"], ["open"], ["qr"], ["rotate-token"]]) {
+      await expect(
+        runHangarCommand(verb, {
+          env: ws.env,
+          cwd: ws.root,
+          readFile: files({ [file]: `# local\n${name}=${value}\n` }),
+          isPidAlive: () => false,
+          startServer: () => {
+            throw new Error(SERVER_FACTORY_REACHED);
+          },
+        }),
+      ).rejects.toThrow(
+        `crewhaus hangar: ${name} is set in ./${file}. Home's directory decides who can sign in, so it is read only from your shell: remove it from ./${file} and run \`export ${name}=<path>\` instead.`,
+      );
+    }
+  });
+
+  test("a line in the file is refused even when a different value is exported", async () => {
+    // Bun never overrides an export, so such a line is dead or the one that chose the
+    // directory; it cannot tell which, and neither can Home.
+    const ws = newWorkspace();
+    await expect(
+      runHangarCommand(["status"], {
+        env: ws.env,
+        cwd: ws.root,
+        readFile: files({ ".env": "CREWHAUS_HANGAR_ROOT=/somewhere/else\n" }),
+      }),
+    ).rejects.toThrow(/CREWHAUS_HANGAR_ROOT is set in \.\/\.env\./);
+  });
+
+  test("files without either variable, and no files, are accepted", async () => {
+    const ws = newWorkspace();
+    const other = await runHangarCommand(["status"], {
+      env: ws.env,
+      cwd: ws.root,
+      readFile: files({
+        ".env": "# CREWHAUS_HANGAR_ROOT=/commented\nCREWHAUS_HANGAR_ROOTS=/other\nPORT=1\n",
+      }),
+    });
+    expect(other.exitCode).toBe(0);
+    const none = await runHangarCommand(["status"], {
+      env: ws.env,
+      cwd: ws.root,
+      readFile: () => undefined,
+    });
+    expect(none.exitCode).toBe(0);
+  });
+
+  // Each spelling goes through Bun's own loader in a child started in a directory that
+  // holds only that `.env`, with neither variable in its environment: the child proves the
+  // line reached `process.env` and that the refusal still names it.
+  test.each([
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT=/tmp/plain\n"],
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT=$HOME/planted-root\n"],
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT=${HOME}/planted-root\n"],
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT='$HOME/planted-root'\n"],
+    ["CREWHAUS_REGISTRY_ROOT", "R=/tmp/r\nCREWHAUS_REGISTRY_ROOT=$R\n"],
+    ["CREWHAUS_HANGAR_ROOT", 'CREWHAUS_HANGAR_ROOT="/tmp/e" # note\n'],
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT='/tmp/sq'  # comment\n"],
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT=`/tmp/bt`\n"],
+    ["CREWHAUS_HANGAR_ROOT", "  export CREWHAUS_HANGAR_ROOT = /tmp/spaced\r\n"],
+  ])(
+    "%s from Bun's own loading of %j is refused",
+    async (name, text) => {
+      const dir = mkdtempSync(join(tmpdir(), "hangar-dotenv-"));
+      writeFileSync(join(dir, ".env"), text);
+      const script = [
+        `import { dotenvRootRefusal } from ${JSON.stringify(join(import.meta.dir, "hangar-env.ts"))};`,
+        "const refusal = dotenvRootRefusal({ cwd: process.cwd() });",
+        `console.log(JSON.stringify({ value: process.env[${JSON.stringify(name)}] ?? null, refusal: refusal ?? null }));`,
+      ].join("\n");
+      const env: Record<string, string> = { PATH: process.env["PATH"] ?? "", HOME: dir };
+      const proc = Bun.spawn([process.execPath, "-e", script], {
+        cwd: dir,
+        env,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      rmSync(dir, { recursive: true, force: true });
+      if (exitCode !== 0) throw new Error(`child exited ${exitCode}: ${stderr}`);
+      const got = JSON.parse(stdout.trim()) as { value: string | null; refusal: string | null };
+      // Bun loaded the line, so the variable is set in the child.
+      expect(got.value).not.toBeNull();
+      expect(got.refusal).toContain(`${name} is set in ./.env.`);
+    },
+    // A child process per row; CI runners start one far slower than a laptop.
+    20_000,
+  );
+
+  test("reads the real files in the working directory", async () => {
+    const ws = newWorkspace();
+    writeFileSync(join(ws.root, ".env.local"), `CREWHAUS_HANGAR_ROOT=${ws.hangarRoot}\n`);
+    await expect(runHangarCommand(["status"], { env: ws.env, cwd: ws.root })).rejects.toThrow(
+      /CREWHAUS_HANGAR_ROOT is set in \.\/\.env\.local/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// serve --smoke end-to-end (a subprocess)
 // ---------------------------------------------------------------------------
 
 describe("hangar serve --smoke", () => {
@@ -712,13 +970,53 @@ describe("hangar serve --smoke", () => {
     expect(stdout).toContain("✓ GET /healthz answers ok");
     expect(stdout).toContain("✓ GET / serves the embedded UI shell");
     expect(stdout).toContain("✓ every embedded console file serves with its content type");
-    expect(stdout).toContain("✓ GET /api/harnesses with the bearer token answers 200 JSON");
-    expect(stdout).toContain("✓ GET /api/harnesses without a token is refused (401)");
+    expect(stdout).toContain("✓ GET /api/harnesses with Home's own key answers 200 JSON");
+    expect(stdout).toContain("✓ GET /api/harnesses without a credential is refused (401)");
+    expect(stdout).toContain("✓ a request with a foreign Host is refused (421)");
     expect(stdout).toContain("smoke: all checks passed");
     // The boot minted a real token file and the clean exit released the lock.
     expect(readFileSync(join(ws.hangarRoot, "token"), "utf8").trim().length).toBeGreaterThan(0);
     expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(false);
   }, 120_000);
+});
+
+describe("hangar serve --smoke, in process", () => {
+  test("fails on the Host check when the allowlist lets a foreign name through", async () => {
+    const ws = newWorkspace();
+    const out = sink();
+    const got = await runHangarCommand(["serve", "--smoke"], {
+      env: ws.env,
+      cwd: ws.root,
+      write: out.write,
+      isPidAlive: () => false,
+      // An allowlist that answers the name the smoke sends is no allowlist.
+      startServer: (options) =>
+        startHangarServer({ ...options, allowHosts: ["rebind.example.test"], onWarn: () => {} }),
+    });
+    expect(got.exitCode).toBe(1);
+    expect(out.lines.join("\n")).toContain("✗ a request with a foreign Host is refused (421)");
+  });
+
+  test("checks that a socket-only key is refused over TCP and taken on the socket", async () => {
+    const ws = newWorkspace();
+    const rotated = await runHangarCommand(["rotate-token", "--socket-only"], {
+      env: ws.env,
+      identity: { username: "tester", hostname: "test-host" },
+    });
+    expect(rotated.exitCode).toBe(0);
+    const out = sink();
+    const got = await runHangarCommand(["serve", "--smoke"], {
+      env: ws.env,
+      cwd: ws.root,
+      write: out.write,
+      isPidAlive: () => false,
+      startServer: (options) => startHangarServer({ ...options, onWarn: () => {} }),
+    });
+    expect(out.lines.join("\n")).toContain(
+      "✓ Home's own key is refused over TCP and accepted on its socket",
+    );
+    expect(got.exitCode).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------

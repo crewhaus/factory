@@ -164,6 +164,13 @@ describe("EXIT_CODES", () => {
       approval_pending: 36,
       provability: 37,
       tool: 40,
+      not_signed_in: 50,
+      forbidden: 51,
+      unavailable: 52,
+      conflict: 53,
+      unsupported: 54,
+      refused: 55,
+      not_found: 56,
     });
   });
 });

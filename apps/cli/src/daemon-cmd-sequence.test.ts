@@ -14,7 +14,8 @@
  * method, the route, the header names, whether the bearer is the token the
  * daemon minted, and the body. For the spawn: argv, the env NAMES and the
  * control port. Normalized only for what differs per run — the temp dir,
- * pids, run ids and times.
+ * pids, run ids, command ids and times. The receipt lines (`Done (cmd_…)`) are
+ * the one deliberate addition since the capture.
  *
  * Nothing is spawned: `ProcessOps` and `fetch` are fakes, as in
  * `daemon-cmd.test.ts` (whose helpers are copied here, not shared, so that
@@ -172,6 +173,7 @@ function normalizer(root: string): (text: string) => string {
     for (const r of roots) out = out.split(r).join("<tmp>");
     return out
       .replace(/\brun_[0-9a-f]{16}\b/g, "<run>")
+      .replace(/\bcmd_[0-9a-z]{26}\b/g, "cmd_X")
       .replace(/\bpid \d+/g, "pid <pid>")
       .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z/g, "<time>");
   };
@@ -206,6 +208,7 @@ const EXPECTED = {
         "sequence-fixture: started <run> (pid <pid>)",
         "  class daemon · state running",
         "  logs: crewhaus daemon logs <tmp>/harness --run <run>",
+        "Done (cmd_X)",
       ],
     },
     {
@@ -252,7 +255,7 @@ const EXPECTED = {
     {
       argv: ["drain"],
       exitCode: 0,
-      lines: ["sequence-fixture: drained"],
+      lines: ["sequence-fixture: drained", "Done (cmd_X)"],
     },
   ],
   controlCalls: [

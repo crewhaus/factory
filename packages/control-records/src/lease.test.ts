@@ -7,6 +7,7 @@ import {
   type LeaseRecord,
   _setLeaseSeamsForTest,
   acquireMutatingLease,
+  holderProvablyDead,
   readMutatingLease,
   withMutatingLease,
 } from "./lease";
@@ -385,5 +386,44 @@ describe("readMutatingLease", () => {
       plant(leaseFile(root), jsonLine({ ...holder(), ...change }));
       expect(readMutatingLease(root).state).toBe("unreadable");
     }
+  });
+});
+
+describe("holderProvablyDead", () => {
+  const here = hostname();
+  const probe = (alive: boolean | undefined, start: number | undefined): LeaseProbe => ({
+    isAlive: () => alive,
+    startTimeMs: () => start,
+  });
+
+  test("a gone pid on this host is dead; an unanswered probe is not", () => {
+    expect(holderProvablyDead({ pid: 7, host: here }, probe(false, undefined), here)).toBe(true);
+    expect(holderProvablyDead({ pid: 7, host: here }, probe(undefined, undefined), here)).toBe(
+      false,
+    );
+    expect(holderProvablyDead({ pid: 7, host: here }, probe(true, undefined), here)).toBe(false);
+  });
+
+  test("a recycled pid: a start time more than 2 seconds off is dead, within 2 seconds is not", () => {
+    const holder = { pid: 7, startedAtMs: NOW, host: here };
+    expect(holderProvablyDead(holder, probe(true, NOW + 2001), here)).toBe(true);
+    expect(holderProvablyDead(holder, probe(true, NOW - 3000), here)).toBe(true);
+    expect(holderProvablyDead(holder, probe(true, NOW + 2000), here)).toBe(false);
+    expect(holderProvablyDead(holder, probe(true, undefined), here)).toBe(false);
+  });
+
+  test("another host is never judged", () => {
+    expect(holderProvablyDead({ pid: 7, host: "elsewhere" }, probe(false, undefined), here)).toBe(
+      false,
+    );
+  });
+
+  test("the lease breaks a holder through it: a recycled pid loses the lease", async () => {
+    const root = harnessHeldBy(holder({ startedAt: NOW }));
+    const taken = await acquireMutatingLease(root, WHO, {
+      waitMs: 0,
+      probe: { isAlive: () => true, startTimeMs: () => NOW + 5000 },
+    });
+    expect(taken.ok).toBe(true);
   });
 });

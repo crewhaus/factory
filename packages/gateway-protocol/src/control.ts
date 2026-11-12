@@ -46,10 +46,12 @@
  */
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { effectiveDecisionState } from "@crewhaus/control-contract";
 import { openEventLog } from "@crewhaus/event-log";
 import { type RunScope, formatResumeScope, runWithScope } from "@crewhaus/run-context";
+import { foldReadOnly } from "@crewhaus/session-store";
 
 /** Wire identifier for this control protocol. Bumping it is a breaking change. */
 export const CONTROL_PROTOCOL = "crewhaus.control.v1" as const;
@@ -436,41 +438,21 @@ export async function recordSyntheticWake(args: {
 export const APPROVALS_FILENAME = "approvals.jsonl" as const;
 
 /**
- * Count parked approvals WITHOUT calling `PendingApprovalStore.list()`.
+ * Count parked approvals still awaiting a human, the way every other reader
+ * counts them: `@crewhaus/session-store`'s `foldReadOnly` (first decision wins,
+ * decision claims applied), then `effectiveDecisionState` says `pending`.
  *
- * `list()` compacts the backing file as a side-effect (it drops expired and
- * superseded lines), exactly like `SessionStore.list()`'s TTL eviction. A
- * status endpoint is a read: polling it must never rewrite an operator's
- * approvals ledger. So this folds the JSONL itself — last-wins by `id`, the
- * same upsert rule `persist` documents — and counts the records still awaiting
- * a human. A missing file, a torn tail line, or an unreadable record counts as
- * nothing rather than failing the whole status call.
+ * A status endpoint is a read: polling it never rewrites an operator's
+ * approvals, and `foldReadOnly` writes nothing. `filePath` names the approvals
+ * file; its directory is the session root the claims sit beside. A missing or
+ * unreadable file counts as nothing rather than failing the whole status call.
  */
 export function countPendingApprovals(filePath: string): number {
-  let raw: string;
-  try {
-    raw = readFileSync(filePath, "utf-8");
-  } catch {
-    return 0;
-  }
-  const latest = new Map<string, { decision?: unknown; consumedAt?: unknown }>();
-  for (const line of raw.split("\n")) {
-    if (line === "") continue;
-    let parsed: { id?: unknown; decision?: unknown; consumedAt?: unknown };
-    try {
-      parsed = JSON.parse(line) as typeof parsed;
-    } catch {
-      continue; // torn tail line — a reader never aborts on one
-    }
-    if (typeof parsed.id !== "string") continue;
-    latest.set(parsed.id, parsed);
-  }
-  let pending = 0;
-  for (const record of latest.values()) {
-    if (record.consumedAt !== undefined) continue;
-    if (record.decision === undefined || record.decision === "pending") pending += 1;
-  }
-  return pending;
+  const folded = foldReadOnly(dirname(filePath));
+  const now = Date.now();
+  return folded.records.filter(
+    (record) => effectiveDecisionState(record, null, now).state === "pending",
+  ).length;
 }
 
 function jsonResponse(body: unknown, status: number, headers?: Record<string, string>): Response {

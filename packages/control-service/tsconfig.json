@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../access-control" },
+    { "path": "../control-contract" },
+    { "path": "../control-records" },
+    { "path": "../harness-supervisor" }
+  ],
+  "include": ["src/**/*"]
+}

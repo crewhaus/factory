@@ -18,6 +18,21 @@ export const COMMAND_KINDS: Readonly<Record<CommandKindId, CommandKindDecl>> = d
   ) as Record<CommandKindId, CommandKindDecl>,
 );
 
+/**
+ * A receipt kind for a legacy Hangar route that has no core kind of its own:
+ * `legacy.<route key>`. The route table is the closed list of them; no executor
+ * is ever registered for one, so recovery never runs one again.
+ */
+export const LEGACY_COMMAND_KIND_RE = /^legacy\.[a-z][A-Za-z0-9]{0,63}$/;
+
+/** Whether `kind` may name a receipt: a composed command kind, or a legacy route's. */
+export function isCommandKind(kind: unknown): kind is string {
+  return (
+    typeof kind === "string" &&
+    (Object.hasOwn(COMMAND_KINDS, kind) || LEGACY_COMMAND_KIND_RE.test(kind))
+  );
+}
+
 export type ReceiptExecutor = {
   readonly pid: number;
   readonly startedAt: string;

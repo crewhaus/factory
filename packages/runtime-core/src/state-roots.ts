@@ -55,7 +55,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DEFAULT_ROOT_DIR } from "@crewhaus/event-log";
 import { hangarStateRoots, registryStateFiles } from "@crewhaus/harness-registry";
-import { DEFAULT_APPROVALS_FILENAME } from "@crewhaus/session-store";
+import { APPROVALS_DIRNAME, DEFAULT_APPROVALS_FILENAME } from "@crewhaus/session-store";
 import type { Tenant } from "@crewhaus/tenancy";
 import { DEFAULT_ROOT_DIR as TOOL_RESULTS_ROOT_DIR } from "@crewhaus/tool-result-store";
 import { protectedRootHolding, rootsBesideStore } from "@crewhaus/tool-safety/fs";
@@ -514,9 +514,13 @@ export function runtimeStateRoots(
       ),
       holdingCwd: "protect",
     },
-    // The approvals file of a session root the record's group left out above.
+    // The approvals file of a session root the record's group left out above,
+    // and the claims, lock, decision log and key beside it: a planted claim
+    // would outrank the file.
     {
-      roots: within(cwd, sessions) ? [join(sessions, DEFAULT_APPROVALS_FILENAME)] : [],
+      roots: within(cwd, sessions)
+        ? [join(sessions, DEFAULT_APPROVALS_FILENAME), join(sessions, APPROVALS_DIRNAME)]
+        : [],
       holdingCwd: "protect",
     },
     // A declared `.` or `..` must not wall off the working directory.

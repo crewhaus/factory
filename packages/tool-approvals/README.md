@@ -34,14 +34,15 @@ are deliberately excluded from the optimizer's writable paths, because an agent
 must never be able to widen its own permissions. A tool that could apply a
 permission rule would be that agent.
 
-The reads are side-effect-free in a stronger sense than "they only read". The
-sanctioned `PendingApprovalStore.list()` **compacts its backing file** as a
-side effect — it drops expired and superseded lines and rewrites the log. An
-inbox is polled; polling must never rewrite an operator's approvals ledger, and
-compaction would also destroy the settled-decision history that half of
-`ApprovalsInbox`'s job is to show. So every read here folds the JSONL directly,
-last-wins by `id`, exactly the upsert rule `persist` documents. `index.test.ts`
-proves it by hashing every file in the workspace before and after a call.
+The reads are side-effect-free in a stronger sense than "they only read". An
+inbox is polled; polling must never rewrite an operator's approvals ledger. So
+every read here folds the JSONL with `@crewhaus/session-store`'s own fold: the
+first decision on a request wins, and the decision claims beside the file
+(`.crewhaus/sessions/approvals.d/claims/`) outrank it, so a status here is the
+status the CLI, Home and the runtime see. The fold writes nothing and repairs
+nothing. `index.test.ts` proves it by hashing every file in the workspace before
+and after a call. A request replaced with `crewhaus approvals supersede` reads
+`superseded`.
 
 The same discipline applies to time: a pending record long past its TTL is still
 reported as **pending**. Expiry is the runtime's decision, made when it re-reads

@@ -31,7 +31,7 @@ import { healthScoreCard, rankHealthRows } from "../assets/js/views/health.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { shouldOnboard } from "../assets/js/views/onboarding.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { paneSandbox, paneSrcdoc } from "../assets/js/views/panes.js";
+import { paneSandbox, paneSrc } from "../assets/js/views/panes.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { splitList } from "../assets/js/views/settings.js";
 
@@ -507,19 +507,23 @@ describe("plugin panes — HM-179 containment", () => {
     expect(paneSandbox(null)).toBe("allow-scripts");
   });
 
-  test("the srcdoc carries the CSP, and a quote in it cannot break the attribute", () => {
-    const doc = paneSrcdoc({ csp: "default-src 'none'; connect-src 'none'", doc: "<p>hi</p>" });
-    expect(doc).toContain('http-equiv="Content-Security-Policy"');
-    expect(doc).toContain("content=\"default-src 'none'; connect-src 'none'\"");
-    expect(doc).toContain("<p>hi</p>");
-
-    const injected = paneSrcdoc({ csp: 'x" onload="alert(1)', doc: "" });
-    expect(injected).not.toContain('onload="alert(1)"');
-    expect(injected).toContain("&quot;");
-  });
-
-  test("an absent policy still yields a locked-down document", () => {
-    expect(paneSrcdoc(null)).toContain("content=\"default-src 'none'\"");
+  test("a frame loads only a single-use pane address on this server", () => {
+    const nonce = "ab".repeat(32);
+    expect(paneSrc({ src: `/pane/${nonce}` })).toBe(`/pane/${nonce}`);
+    // Anything a payload could point elsewhere is refused, and the card says the
+    // document is missing instead.
+    for (const src of [
+      `https://evil.example.test/pane/${nonce}`,
+      `//evil.example.test/pane/${nonce}`,
+      `/pane/${nonce}/../x`,
+      "/pane/short",
+      "javascript:alert(1)",
+      "",
+      undefined,
+    ]) {
+      expect(paneSrc({ src })).toBeNull();
+    }
+    expect(paneSrc(null)).toBeNull();
   });
 });
 

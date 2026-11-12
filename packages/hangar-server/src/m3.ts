@@ -70,8 +70,8 @@
  *                 second command — to a spawn.
  *
  * READS NEVER MUTATE. Never `SessionStore.list()` (its TTL eviction deletes
- * transcripts) and never `PendingApprovalStore.list()` (it COMPACTS the
- * ledger): browse raw, fold tombstones, skip torn lines, cap what you read.
+ * transcripts) and never `PendingApprovalStore.list()` (a view of the live
+ * records): browse raw, fold tombstones, skip torn lines, cap what you read.
  * `index.json` caches are rebuildable hints, never the source of truth.
  *
  * CONTAINMENT IS PER FILE. `ctx.contain([...])` realpath-checks every single

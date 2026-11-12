@@ -38,6 +38,14 @@ describe("approvalStatus", () => {
       approvalStatus(approval({ decision: "grant", consumedAt: "2026-07-17T01:00:00.000Z" })),
     ).toBe("consumed");
   });
+
+  test("a replaced request is superseded, whatever it said before", () => {
+    expect(
+      approvalStatus(
+        approval({ decision: "grant", always: true, supersededBy: "appr_00000000000000f1" }),
+      ),
+    ).toBe("superseded");
+  });
 });
 
 describe("formatApprovalAge", () => {
@@ -82,6 +90,23 @@ describe("formatApprovalDetail", () => {
     expect(out).toContain("max");
     expect(out).toContain("input:");
     expect(out).toContain("ls -la");
+  });
+
+  test("shows what replaced it, a deferral, and the lines that tried to change it", () => {
+    const out = formatApprovalDetail(
+      approval({
+        decision: "deny",
+        supersededBy: "appr_00000000000000f1",
+        supersededReason: "decided-in-error",
+        deferredUntil: "2026-07-18T09:00:00.000Z",
+      }),
+      Date.parse("2026-07-17T00:10:00.000Z"),
+      { ignored: 2 },
+    );
+    expect(out).toContain("replacedBy: appr_00000000000000f1 (decided-in-error)");
+    expect(out).toContain("deferred:   until 2026-07-18T09:00:00.000Z");
+    expect(out).toContain("2 later lines tried to change this decision and were ignored");
+    expect(formatApprovalDetail(approval())).not.toContain("ignored");
   });
 
   test("notes a missing input", () => {
@@ -220,6 +245,99 @@ describe("crewhaus approvals (CLI)", () => {
     expect(parsed.decidedBy).toBe("max");
   }, 20_000);
 
+  test("the first decision wins: a deny after a grant is refused and names the way to change it", async () => {
+    await seedApproval(ID);
+    expect((await runCli(["approvals", "grant", ID, "--by", "max"])).exitCode).toBe(0);
+    const denied = await runCli(["approvals", "deny", ID, "--by", "eve"]);
+    expect(denied.exitCode).toBe(1);
+    expect(denied.stderr).toContain(`${ID} was already granted`);
+    expect(denied.stderr).toContain(`crewhaus approvals supersede ${ID} --reason <code>`);
+    const shown = await runCli(["approvals", "show", ID, "--json"]);
+    const parsed = JSON.parse(shown.stdout) as PendingApproval;
+    expect(parsed.decision).toBe("grant");
+    expect(parsed.decidedBy).toBe("max");
+    expect(parsed.decidedVia).toBe("cli");
+  }, 20_000);
+
+  test("supersede replaces a decision with a fresh request, which is then decided", async () => {
+    await seedApproval(ID);
+    await runCli(["approvals", "deny", ID]);
+    const bad = await runCli(["approvals", "supersede", ID, "--reason", "because"]);
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stderr).toContain("decided-in-error, policy-changed, other");
+    const replaced = await runCli([
+      "approvals",
+      "supersede",
+      ID,
+      "--reason",
+      "decided-in-error",
+      "--json",
+    ]);
+    expect(replaced.exitCode).toBe(0);
+    const { record, fresh } = JSON.parse(replaced.stdout) as {
+      record: PendingApproval;
+      fresh: PendingApproval;
+    };
+    expect(record.supersededBy).toBe(fresh.id);
+    expect(fresh.supersedes).toEqual({ id: ID, decision: "deny" });
+    const listed = await runCli(["approvals", "list"]);
+    expect(listed.stdout).toContain("superseded");
+    expect((await runCli(["approvals", "grant", fresh.id])).exitCode).toBe(0);
+    const again = await runCli(["approvals", "supersede", ID, "--reason", "other"]);
+    expect(again.exitCode).toBe(1);
+    expect(again.stderr).toContain("cannot be replaced");
+  }, 20_000);
+
+  test("defer marks a waiting request, and refuses a time without an offset", async () => {
+    await seedApproval(ID);
+    const offsetless = await runCli([
+      "approvals",
+      "defer",
+      ID,
+      "--until",
+      "2099-01-01T09:00:00",
+      "--reason",
+      "scheduled",
+    ]);
+    expect(offsetless.exitCode).toBe(1);
+    expect(offsetless.stderr).toContain("no UTC offset");
+    const badReason = await runCli([
+      "approvals",
+      "defer",
+      ID,
+      "--until",
+      "2099-01-01T09:00:00Z",
+      "--reason",
+      "busy",
+    ]);
+    expect(badReason.exitCode).toBe(1);
+    expect(badReason.stderr).toContain("awaiting-information");
+    const deferred = await runCli([
+      "approvals",
+      "defer",
+      ID,
+      "--until",
+      "2099-01-01T09:00:00Z",
+      "--reason",
+      "scheduled",
+    ]);
+    expect(deferred.exitCode).toBe(0);
+    expect(deferred.stdout).toContain("deferred");
+    const shown = await runCli(["approvals", "show", ID]);
+    expect(shown.stdout).toContain("until 2099-01-01T09:00:00.000Z");
+    expect(shown.stdout).toContain("pending");
+  }, 20_000);
+
+  test("list and show leave the approvals file byte-identical", async () => {
+    await seedApproval(ID);
+    await runCli(["approvals", "grant", ID]);
+    const file = join(cwd, ".crewhaus", "sessions", "approvals.jsonl");
+    const before = readFileSync(file);
+    await runCli(["approvals", "list"]);
+    await runCli(["approvals", "show", ID]);
+    expect(readFileSync(file).equals(before)).toBe(true);
+  }, 20_000);
+
   test("deny records a deny decision", async () => {
     await seedApproval(ID);
     const denied = await runCli(["approvals", "deny", ID]);
@@ -254,7 +372,7 @@ describe("crewhaus approvals (CLI)", () => {
     for (const args of [["approvals"], ["approvals", "--help"]]) {
       const { exitCode, stdout } = await runCli(args);
       expect(exitCode).toBe(0);
-      expect(stdout).toContain("usage: crewhaus approvals list|show|grant|deny");
+      expect(stdout).toContain("usage: crewhaus approvals list|show|grant|deny|supersede|defer");
     }
   }, 20_000);
 
