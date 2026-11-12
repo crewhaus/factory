@@ -4,8 +4,10 @@
  * loads no view, so it is safe in the shell's static import graph and under
  * bun.
  *
- * Shape gating lives on the rows. A gated row carries `gate: {shapes, why}`;
- * the sub-view list draws an off-matrix row as text with its reason, and the
+ * Shape gating lives on the rows. A gated row carries `gate: {shapes, why,
+ * plain}`: `plain` is the sentence the screen shows, `why` the technical
+ * reason kept for technical details. The sub-view list draws an off-matrix
+ * row as text with its sentence, and the
  * deep link still resolves, because the honest empty state that screen
  * renders is a real answer and a shared address must not go dead.
  */
@@ -63,17 +65,24 @@ export const SHAPE_GATED_TABS = Object.freeze(
 
 /**
  * Which of a section's listed sub-views this target can use, in list order:
- * `{ id, on, reason }`. An off-matrix row carries the sentence the list shows
- * instead of a link. An unknown or missing target is gated at nothing.
+ * `{ id, on, reason, summary }`. An off-matrix row carries `summary`, the
+ * plain sentence the list shows instead of a link, and `reason`, the
+ * technical why (schema blocks and the target) kept for technical details.
+ * An unknown or missing target is gated at nothing.
  */
 export function subViewAvailability(section, target) {
   const shape = typeof target === "string" ? target : "";
   const known = SHAPE_TARGETS.includes(shape);
   return listedViews(section).map((row) => {
     if (row.gate === undefined || !known || row.gate.shapes.includes(shape)) {
-      return { id: row.id, on: true, reason: null };
+      return { id: row.id, on: true, reason: null, summary: null };
     }
-    return { id: row.id, on: false, reason: `${row.gate.why} — this harness's target is ${shape}` };
+    return {
+      id: row.id,
+      on: false,
+      reason: `${row.gate.why} — this harness's target is ${shape}`,
+      summary: row.gate.plain,
+    };
   });
 }
 

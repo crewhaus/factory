@@ -427,20 +427,27 @@ export function sectionLabel(route) {
 }
 
 /**
+ * The link for a server `screen` id on harness `id`: the approvals inbox is
+ * a fleet screen, every other screen is on the harness. The advisor and
+ * health views link through this, and `screenLabel` names what it builds.
+ */
+export function screenHref(id, screen) {
+  const s = String(screen ?? "");
+  return s === "approvals" ? hrefGlobal(s) : hrefHarness(id, s);
+}
+
+/**
  * Where a server `screen` id is fixed, in the console's words: "Setup › Spec"
- * for `spec`, "Home › Needs you" for `approvals`. One lookup through the same
- * table the links use, so the label and the link can never disagree.
+ * for `spec`, "Home › Needs you" for `approvals`. It names the route
+ * `screenHref` builds, so the label and the link can never disagree.
  */
 export function screenLabel(screen) {
   const id = String(screen ?? "");
-  if (LEGACY_GLOBAL_VIEWS.includes(id) && id !== "settings") {
-    const route = parseRoute(hrefGlobal(id));
-    const area = fleetArea(route.view);
-    if (area !== null && route.sub !== null) return `${area.title} › ${fleetHeading(route)}`;
-  }
-  const route = parseRoute(hrefHarness("_", id));
-  if (route.view !== "harness") return id;
-  return sectionLabel(route);
+  const route = parseRoute(screenHref("_", id));
+  if (route.view === "harness") return sectionLabel(route);
+  const area = fleetArea(route.view);
+  if (area === null) return id;
+  return route.sub === null ? area.title : `${area.title} › ${fleetHeading(route)}`;
 }
 
 /**

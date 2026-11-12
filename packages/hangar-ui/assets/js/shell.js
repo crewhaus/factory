@@ -56,8 +56,10 @@ let firstRunRoot = null;
 let navCounts = {};
 let notificationsStarted = false;
 let lastRoute = null;
-/** The header's parts that change per navigation or per count. */
-const header = { nav: null, settings: null, menuNav: null, closers: [] };
+/** The header's parts that change per navigation or per count. `links`
+ *  holds each destination's link node, built once per shell, so a redraw
+ *  updates them in place and a focused link keeps its focus. */
+const header = { nav: null, settings: null, menuNav: null, closers: [], links: [] };
 
 /** The main region, for app.js. */
 export function viewRootNode() {
@@ -169,9 +171,26 @@ function disclosure(opts) {
     const next = event.relatedTarget;
     if (!(next instanceof Node) || !wrap.contains(next)) setOpen(false);
   });
+  // A button inside (Theme, Keyboard shortcuts) acts on the page and stays
+  // put, so the panel closes and focus goes back to the disclosure's own
+  // button BEFORE the item's handler runs (capture phase): a dialog the item
+  // opens then records a visible opener to return to, and focus never drops
+  // to the body with the hidden panel.
+  list.addEventListener(
+    "click",
+    (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest("button") === null) return;
+      setOpen(false);
+      button.focus();
+    },
+    true,
+  );
+  // A link navigates: the new page's heading takes focus.
   list.addEventListener("click", (event) => {
     const target = event.target;
-    if (target instanceof Element && target.closest("a, button") !== null) setOpen(false);
+    if (target instanceof Element && target.closest("a") !== null) setOpen(false);
   });
   header.closers.push(() => setOpen(false));
   return { node: wrap, button, list, setOpen };
@@ -246,7 +265,9 @@ export function renderShell(appRoot, nextHooks = {}) {
   Object.assign(hooks, nextHooks);
   clear(appRoot);
   header.closers = [];
+  header.links = [];
   header.nav = el("ul", { class: "app-nav-list" });
+  buildNavList(header.nav);
   const mainNav = el("nav", { class: "app-nav", "aria-label": "Main" }, [header.nav]);
   // A visible affordance for ⌘K: a keyboard-only feature is a feature only
   // the person who built it knows about.
@@ -274,6 +295,7 @@ export function renderShell(appRoot, nextHooks = {}) {
   settings.list.appendChild(listOf(settingsItems()));
   header.settings = settings.button;
   header.menuNav = el("ul", { class: "menu-list" });
+  buildNavList(header.menuNav);
   const menu = disclosure({
     id: "narrow-menu",
     button: [el("span", { text: "Menu" })],
@@ -361,33 +383,42 @@ async function loadReadOnlyBanner() {
   );
 }
 
-/** The header's destinations and the Settings badge, with the current page marked. */
-export function drawNav(route) {
-  if (route !== null) lastRoute = route;
-  for (const close of header.closers) close();
-  const current = lastRoute?.view ?? null;
-  const link = (dest) => {
-    const here = current === dest.id;
-    return el(
-      "a",
-      {
-        class: `navlink${here ? " active" : ""}`,
-        href: dest.path,
-        "aria-current": here ? "page" : null,
-      },
-      [
-        el("span", { text: dest.label }),
-        ...(dest.badge === "needs-you" ? badge(needsYouCount(), "need you") : []),
-      ],
-    );
-  };
-  if (header.nav !== null) {
-    clear(header.nav);
-    for (const dest of DESTINATIONS) header.nav.appendChild(el("li", null, link(dest)));
+/** One list of destination links, built once; `drawNav` updates them in place. */
+function buildNavList(list) {
+  clear(list);
+  for (const dest of DESTINATIONS) {
+    const node = el("a", { class: "navlink", href: dest.path }, [
+      el("span", { text: dest.label }),
+      el("span", { class: "nav-badge-slot" }),
+    ]);
+    list.appendChild(el("li", null, node));
+    header.links.push({ dest, node });
   }
-  if (header.menuNav !== null) {
-    clear(header.menuNav);
-    for (const dest of DESTINATIONS) header.menuNav.appendChild(el("li", null, link(dest)));
+}
+
+/**
+ * The header's destinations and the Settings badge, with the current page
+ * marked. A navigation (`route` given) closes any open disclosure; a counts
+ * update (`route` null) only swaps the badges, so an open Help, Settings or
+ * Menu stays open and the focus inside it stays where it is.
+ */
+export function drawNav(route) {
+  if (route !== null) {
+    lastRoute = route;
+    for (const close of header.closers) close();
+  }
+  const current = lastRoute?.view ?? null;
+  for (const { dest, node } of header.links) {
+    const here = current === dest.id;
+    node.classList.toggle("active", here);
+    if (here) node.setAttribute("aria-current", "page");
+    else node.removeAttribute("aria-current");
+    const slot = node.querySelector(".nav-badge-slot");
+    if (slot !== null) {
+      slot.replaceChildren(
+        ...(dest.badge === "needs-you" ? badge(needsYouCount(), "need you") : []),
+      );
+    }
   }
   if (header.settings !== null) {
     header.settings.classList.toggle("active", current === "settings");
@@ -660,8 +691,9 @@ async function renderHarnessPage(container, route, signal) {
   if (current !== undefined && !current.on) {
     content.appendChild(
       el("div", { class: "rollup" }, [
-        dot("off", "off this shape's panel matrix"),
-        el("span", { class: "muted", text: current.reason }),
+        dot("off", "not available"),
+        el("span", { class: "muted", text: current.summary }),
+        technicalDetails(current.reason, subViewOf(section, current.id)?.label ?? current.id),
       ]),
     );
   }
@@ -705,14 +737,29 @@ function sectionNav(route) {
   ]);
 }
 
-/** One sub-view in a list: a link, or, off this shape's matrix, its name and why. */
+/**
+ * The technical reason a sub-view is off for this harness (the schema
+ * blocks and the target), folded away: the screen leads with the plain
+ * sentence, and whoever wants the why opens this.
+ */
+function technicalDetails(reason, label) {
+  return el("details", { class: "fold gate-details" }, [
+    el("summary", { class: "fold-summary" }, [
+      el("span", { class: "muted", text: "Technical details" }),
+      el("span", { class: "sr-only", text: `: ${label}` }),
+    ]),
+    el("p", { class: "fold-body muted", text: reason }),
+  ]);
+}
+
+/** One sub-view in a list: a link, or, when this harness cannot have it, its name and why. */
 function subViewItem(route, section, row, availability) {
   const state = availability.find((a) => a.id === row.id);
   const here = route.sub === row.id;
   if (state !== undefined && !state.on) {
     return el("li", { class: "subview-off" }, [
       el("span", { class: `subview-name${here ? " active" : ""}`, text: row.label }),
-      el("span", { class: "subview-why", text: `Not part of this shape: ${state.reason}` }),
+      el("span", { class: "subview-why", text: state.summary }),
     ]);
   }
   return el("li", null, [
@@ -790,9 +837,8 @@ function drawSectionIndex(body, route, section, availability) {
           ? el("a", { href: hrefHarness(route.id, section.id, row.id), text: row.label })
           : el("span", { class: "subview-name", text: row.label }),
         el("p", { class: "muted section-index-describe", text: row.describe }),
-        on
-          ? null
-          : el("p", { class: "subview-why", text: `Not part of this shape: ${state.reason}` }),
+        on ? null : el("p", { class: "subview-why", text: state.summary }),
+        on ? null : technicalDetails(state.reason, row.label),
       ]);
     });
     return [

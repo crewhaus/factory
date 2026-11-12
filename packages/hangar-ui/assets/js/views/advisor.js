@@ -31,7 +31,7 @@ import {
   toast,
   withTip,
 } from "../dom.js";
-import { hrefGlobal, hrefHarness, screenLabel } from "../router.js";
+import { hrefHarness, screenHref, screenLabel } from "../router.js";
 import { chart, chartModel } from "../ui/chart.js";
 import { bindDraft, draftKey } from "../ui/draft.js";
 import { fmtPct } from "../util.js";
@@ -63,7 +63,7 @@ export function itemActionModel(item, id) {
   const screen = String(item.screen ?? "overview");
   // Fleet screens (the approvals inbox) are global; everything else is a
   // screen on this harness, named the way the console names it.
-  const href = screen === "approvals" ? hrefGlobal("approvals") : hrefHarness(id, screen);
+  const href = screenHref(id, screen);
   const where = screenLabel(screen);
   const generic = action.label === undefined || String(action.label) === `Open ${screen}`;
   return {

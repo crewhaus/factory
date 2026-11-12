@@ -10,9 +10,13 @@ import { ADVISOR_SCREENS } from "./advisor";
 import { HEALTH_SCREENS } from "./health";
 
 type Route = { readonly view: string; readonly section?: string; readonly sub?: string | null };
+type Row = { readonly id: string; readonly label: string };
+type Sections = { sectionById(id: string | undefined): (Row & { views: Row[] }) | null };
 type Router = {
   hrefHarness(id: string, tab?: string, ...rest: string[]): string;
   hrefGlobal(view: string): string;
+  screenHref(id: string, screen: string): string;
+  screenLabel(screen: string): string;
   parseRoute(hash: string): Route;
   redirectFor(hash: string): string | null;
 };
@@ -24,6 +28,9 @@ async function loadRouter(): Promise<Router> {
 }
 
 const router = await loadRouter();
+const sections = (await import(
+  new URL("../../hangar-ui/assets/js/sections/index.js", import.meta.url).href
+)) as Sections;
 const ID = "hrn_0123456789abcdef";
 
 /** The link the console builds for a server screen id, as its views build it
@@ -49,6 +56,28 @@ describe("every screen the server names", () => {
       expect(`${screen} → ${href}: ${route.view}`).not.toBe(`${screen} → ${href}: notfound`);
       expect(`${screen} → ${router.redirectFor(href)}`).toBe(`${screen} → null`);
     }
+  });
+
+  test("the views build their link with the router's one rule", () => {
+    for (const screen of screens) expect(router.screenHref(ID, screen)).toBe(linkFor(screen));
+  });
+
+  test("is named by the section and sub-view its link opens", () => {
+    for (const screen of screens) {
+      const route = router.parseRoute(linkFor(screen));
+      if (route.view !== "harness") continue;
+      const section = sections.sectionById(route.section);
+      expect(section).not.toBeNull();
+      const sub = route.sub === null ? null : section?.views.find((row) => row.id === route.sub);
+      const expected =
+        sub === null || sub === undefined ? section?.label : `${section?.label} › ${sub.label}`;
+      expect(`${screen}: ${router.screenLabel(screen)}`).toBe(`${screen}: ${expected}`);
+    }
+    // The two ids that are also old fleet names are named where they link.
+    expect(router.screenLabel("runs")).toBe("Work › Runs");
+    expect(router.screenLabel("feedback")).toBe("Quality › Feedback");
+    expect(router.screenLabel("spec")).toBe("Setup › Spec");
+    expect(router.screenLabel("approvals")).toBe("Home › Needs you");
   });
 
   test("a harness screen lands in a harness section; the approvals inbox on Needs you", () => {

@@ -12,7 +12,7 @@ export const WORK = Object.freeze({
   // biome-ignore format: one row per line, so an area appends its row without touching the shell
   views: Object.freeze([
     { id: "runs", label: "Runs", describe: "Every run it has made, and a live view of one.", load: () => import("../views/runs.js"), render: (m, root, ctx) => m.renderRuns(root, ctx), capture: ["runId"], deep: true },
-    { id: "schedule", label: "Schedule", describe: "Work it starts on its own, and when that runs next.", load: () => import("../views/schedulers.js"), render: (m, root, ctx) => m.renderSchedulers(root, ctx), gate: { shapes: ["cli", "channel", "managed", "crew", "research", "batch", "voice"], why: "no lane can arm here — this target's schema admits no heartbeat:, schedule: or memory.dream: block, and its bundle runs no janitor" } },
+    { id: "schedule", label: "Schedule", describe: "Work it starts on its own, and when that runs next.", load: () => import("../views/schedulers.js"), render: (m, root, ctx) => m.renderSchedulers(root, ctx), gate: { shapes: ["cli", "channel", "managed", "crew", "research", "batch", "voice"], why: "no lane can arm here — this target's schema admits no heartbeat:, schedule: or memory.dream: block, and its bundle runs no janitor", plain: "This kind of harness cannot start work on a schedule." } },
     { id: "sessions", label: "Sessions", describe: "Conversations it has had, each with its full transcript.", load: () => import("../views/sessions.js"), render: (m, root, ctx) => m.renderSessions(root, ctx), capture: ["sessionId"], deep: true },
   ]),
 });

@@ -3,7 +3,8 @@
  * both widths, with no allow-list and no baseline. Any violation on any row
  * fails the build, and so does a missing row, a screen without the content it
  * must show (`GATE_EXPECTS`), a route that did not settle, a row where axe
- * did not run, or a session failure. The report (`axe-report.json`) and the
+ * did not run, a route that scrolls sideways at 320 CSS px (axe has no reflow
+ * rule, so the narrow pass measures it on every route), or a session failure. The report (`axe-report.json`) and the
  * step summary are written before any of that throws, so the artifact exists
  * on a failure too.
  */
@@ -19,6 +20,7 @@ import {
   gateVerdict,
   gatedTemplates,
 } from "../a11y/gate";
+import { REFLOW_WIDTH, reflowFinding } from "../a11y/reflow";
 import { routeFor } from "../console-routes";
 import type { Journey } from "./journey";
 
@@ -26,7 +28,7 @@ export const axeGate: Journey = {
   id: "axe-gate",
   shard: "axe",
   proves:
-    "Every route the console serves — each fleet page and each harness section and sub-view — has no axe violation in either theme at either width, and shows the content it exists for; there is no allow-list and no baseline.",
+    "Every route the console serves — each fleet page and each harness section and sub-view — has no axe violation in either theme at either width, reflows at 320 px without scrolling sideways, and shows the content it exists for; there is no allow-list and no baseline.",
   run: async (scope) => {
     const templates = await gatedTemplates();
     const fleet = await scope.fleet({ seed: "axe", shapes: ["cli"], rich: true });
@@ -44,6 +46,7 @@ export const axeGate: Journey = {
     const samples: Record<string, Readonly<Record<string, readonly string[]>>> = {};
     const notRun: string[] = [];
     const emptyScreens: string[] = [];
+    const unreflowed: string[] = [];
     let version = "";
     for (const theme of GATE_THEMES) {
       for (const width of GATE_WIDTHS) {
@@ -72,6 +75,10 @@ export const axeGate: Journey = {
           if (result.passes === 0) notRun.push(`${template} ${theme} ${width}`);
           rows[rowKey(template, theme, width)] = { ...result.violations };
           samples[rowKey(template, theme, width)] = result.samples;
+          if (width === REFLOW_WIDTH) {
+            const reflow = await reflowFinding(session.page);
+            if (reflow !== undefined) unreflowed.push(`${template} ${theme}: ${reflow.detail}`);
+          }
         }
         session.assertClean();
         await session.close();
@@ -104,6 +111,11 @@ export const axeGate: Journey = {
     if (notRun.length > 0) throw new Error(`axe did not run on: ${notRun.join(", ")}`);
     if (Object.keys(rows).length !== expectedRows) {
       throw new Error(`the sweep has ${Object.keys(rows).length} rows, not ${expectedRows}`);
+    }
+    if (unreflowed.length > 0) {
+      throw new Error(
+        `a route scrolls sideways at ${REFLOW_WIDTH} px (WCAG 1.4.10 reflow):\n  ${unreflowed.join("\n  ")}`,
+      );
     }
     if (emptyScreens.length > 0) {
       throw new Error(

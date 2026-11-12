@@ -51,14 +51,16 @@ Any axe violation on any route, in any theme at any width, fails the build. Ther
 no baseline: no parameter can exempt a rule, a node or a screen. Each route also names, in
 `GATE_EXPECTS` (`src/a11y/gate.ts`), what must be on it before axe runs, so a seed that stops
 producing its content fails by name rather than passing over an empty screen. The sweep fails on its
-own machinery too: a missing row, a route that did not settle, or axe not running. It writes
+own machinery too: a missing row, a route that did not settle, or axe not running. axe has no
+reflow rule, so the 320 px pass also measures every route and fails on one that scrolls sideways. It writes
 `axe-report.json` and a step summary before it throws.
 
 Three more journeys hold the screens beyond their first paint. `axe-states` sweeps their other
 states — every dialog, the command menu, the header's lists, a section's sub-view list, the tooltip,
 an armed inbox row, a filtered digest, every memory and Thredz panel, and each Readability choice —
 with the same verdict, into its own artifact (`axe-states-report.json`). `keyboard-tour` drives the
-toured screens (`TOURED_TEMPLATES`) and the shell by keyboard alone, and `a11y-floor` checks reflow at
+toured screens (`TOURED_TEMPLATES`) and the shell by keyboard alone (including a badge update while
+a header list is open, and the buttons inside the lists), and `a11y-floor` checks reflow at
 320 px, text spacing, the accessibility tree of the shell and reduced motion.
 
 **How a new route joins the gate:** it already has. A screen is a row in the router's tables

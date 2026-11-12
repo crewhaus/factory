@@ -15,7 +15,7 @@ import * as sectionsModule from "../assets/js/sections/index.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { SHAPE_ACCENTS } from "../assets/js/shapes.js";
 
-type Gate = { shapes: string[]; why: string };
+type Gate = { shapes: string[]; why: string; plain?: string };
 type Row = {
   id: string;
   label: string;
@@ -27,7 +27,7 @@ type Row = {
   group?: string;
 };
 type Section = { id: string; label: string; views: Row[]; index: unknown };
-type Availability = { id: string; on: boolean; reason: string | null };
+type Availability = { id: string; on: boolean; reason: string | null; summary: string | null };
 
 const { SECTIONS, SHAPE_GATED_TABS, subViewAvailability, subViewGroups } = sectionsModule as {
   SECTIONS: Section[];
@@ -159,7 +159,9 @@ describe("the matrix table itself", () => {
   test("the exported gate table IS the rows' gates: one table, no second copy to drift", () => {
     const fromRows = Object.fromEntries(
       SECTIONS.flatMap((s) =>
-        s.views.filter((r) => r.gate !== undefined).map((r) => [r.id, r.gate]),
+        s.views
+          .filter((r) => r.gate !== undefined)
+          .map((r) => [r.id, { shapes: r.gate?.shapes, why: r.gate?.why }]),
       ),
     );
     expect(SHAPE_GATED_TABS).toEqual(fromRows);
@@ -263,6 +265,33 @@ describe("the gate fails open, and never silently", () => {
     }
     // A live row never carries one — the reason field IS the disabled state.
     for (const row of rows("channel")) expect(row.reason).toBe(null);
+  });
+
+  test("every gate has a plain sentence for the screen, free of schema keys and shapes", () => {
+    let gates = 0;
+    for (const section of SECTIONS) {
+      for (const row of section.views.filter((r) => r.gate !== undefined)) {
+        const plain = String(row.gate?.plain ?? "");
+        expect(`${row.id}:${plain.length > 10 && plain.endsWith(".")}`).toBe(`${row.id}:true`);
+        // No YAML key (`channels:`), and no "target" or "schema".
+        expect(`${row.id}:${/[a-z]:(\s|$)/.test(plain)}`).toBe(`${row.id}:false`);
+        expect(`${row.id}:${/\btarget\b|\bschema\b/i.test(plain)}`).toBe(`${row.id}:false`);
+        gates += 1;
+      }
+    }
+    expect(gates).toBe(5);
+  });
+
+  test("a disabled sub-view shows its row's plain sentence; a live one shows none", () => {
+    for (const target of SHAPE_TARGETS) {
+      for (const row of rows(target)) {
+        const expected = row.on
+          ? null
+          : (SECTIONS.flatMap((s) => s.views).find((r) => r.id === row.id)?.gate?.plain ??
+            "missing");
+        expect(`${target}/${row.id}:${row.summary}`).toBe(`${target}/${row.id}:${expected}`);
+      }
+    }
   });
 
   test("a deep link to an off-matrix sub-view still resolves", () => {

@@ -300,6 +300,9 @@ The header holds four destinations — **Home**, **Harnesses**, **People**
 and **Connections** — then Search (⌘K), **Help ▾** and **Settings ▾**; below
 720 px it is the brand, Search and a **Menu** that lists all of them. Help
 and Settings are disclosures (Escape closes and gives focus back), not menus.
+A badge update leaves an open one open, with focus where it was; a button
+inside one (Theme, Keyboard shortcuts) closes it and puts focus back on its
+button, which is also where the shortcuts sheet returns focus.
 Every page has exactly one `<h1>`, drawn by the shell: a fleet page's title,
 or the harness's name. After each navigation the heading takes focus, the
 document title names the page (`<page> — Hangar`, or `<sub-view> — <harness>
@@ -332,8 +335,15 @@ replaces the address without a navigation, and a deep link opens that panel.
 | Knowledge | Memory, Thredz; a wiki article at `knowledge/wiki/<slug>` |
 | Setup | What it does: Spec · What it uses: Tools, Models, Channels, Credentials, Plugins · Limits: Security, Budget · Where it runs: Deployment · Advanced: Files |
 
-A sub-view a harness's shape cannot use is listed as text with its reason
-(`gate` on its row), and its deep link still resolves.
+A sub-view a harness's shape cannot use is listed as text with a plain
+sentence ("Only channel harnesses have channels.", `gate.plain` on its row);
+the technical reason (`gate.why` and the harness's target) sits in a folded
+"Technical details" on the section's page and on the sub-view itself, and
+its deep link still resolves.
+
+The advisor's and the health score's "Fix in …" links are built by
+`screenHref(id, screen)` and named by `screenLabel(screen)`, which names the
+route that link opens ("Work › Runs", "Home › Needs you").
 
 **Every older address redirects**, through one table (`LEGACY_ROUTES` in
 `router.js`): the router replaces the address in place, so a redirect adds

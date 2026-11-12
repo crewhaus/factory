@@ -196,6 +196,100 @@ async function expanded(page: Page, button: string): Promise<string | null> {
 }
 
 /**
+ * Make the header take a counts update now, through the console's own path:
+ * the tab goes hidden and comes back, which restarts the notification poll,
+ * and the poll's snapshot redraws the header's badges. Resolves once that
+ * poll has answered and the page has had a frame to redraw.
+ */
+async function forceCountsUpdate(page: Page): Promise<void> {
+  const answered = page.waitForResponse(
+    (response) => new URL(response.url()).pathname === "/api/notifications",
+  );
+  await page.evaluate(() => {
+    const flip = (hidden: boolean) => {
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    flip(true);
+    flip(false);
+    Reflect.deleteProperty(document, "hidden");
+  });
+  await answered;
+  await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0))),
+  );
+}
+
+/** Open a header list from its button, by keyboard. */
+async function openList(page: Page, button: string, panel: string): Promise<void> {
+  await page.locator(button).focus();
+  if ((await expanded(page, button)) !== "true") await page.keyboard.press("Enter");
+  await until(page, `${panel} to open`, async () => (await expanded(page, button)) === "true");
+}
+
+/** An open list keeps its state, and the focus inside it, across a counts update. */
+async function keepsAcrossCounts(page: Page, button: string, panel: string): Promise<void> {
+  await openList(page, button, panel);
+  const first = page.locator(`${panel} a`).first();
+  await first.focus();
+  const held = await first.elementHandle();
+  if (held === null) return fail(`${panel} has no link to focus`);
+  await forceCountsUpdate(page);
+  if ((await expanded(page, button)) !== "true") fail(`a counts update closed ${panel}`);
+  if (!(await activeIs(page, held))) fail(`a counts update moved focus out of ${panel}`);
+  await page.keyboard.press("Escape");
+  await until(page, `${panel} to close`, async () => (await expanded(page, button)) === "false");
+}
+
+/** Theme inside a list closes it and leaves focus on the list's button, never the body. */
+async function themeKeepsFocus(page: Page, button: string, panel: string): Promise<void> {
+  const theme = page.locator(`${panel} button.menu-link`, { hasText: "Theme" });
+  const themeNow = () => page.evaluate(() => document.documentElement.dataset["theme"]);
+  const before = await themeNow();
+  for (const round of ["switch", "switch back"]) {
+    await openList(page, button, panel);
+    await theme.focus();
+    await page.keyboard.press("Enter");
+    await until(
+      page,
+      `Theme (${round}) in ${panel} to close it`,
+      async () => (await expanded(page, button)) === "false",
+    );
+    if (!(await activeMatches(page, button))) fail(`Theme (${round}) in ${panel} dropped focus`);
+    if (round === "switch" && (await themeNow()) === before) {
+      fail(`Theme in ${panel} did not change the theme`);
+    }
+  }
+}
+
+/** Keyboard shortcuts inside a list: its sheet closes back onto the list's button. */
+async function sheetReturnsFocus(page: Page, button: string, panel: string): Promise<void> {
+  await openList(page, button, panel);
+  await page.locator(`${panel} button.menu-link`, { hasText: "Keyboard shortcuts" }).focus();
+  await page.keyboard.press("Enter");
+  await waitFor(page, "dialog.sheet[open]", `Keyboard shortcuts in ${panel}`);
+  await page.keyboard.press("Escape");
+  await until(
+    page,
+    "the shortcuts sheet to close",
+    async () => (await page.locator("dialog.sheet[open]").count()) === 0,
+  );
+  if (!(await activeMatches(page, button))) {
+    fail(`closing the shortcuts sheet opened from ${panel} did not give focus back to its button`);
+  }
+}
+
+/** The wide header's Settings and Help, past their open and close. */
+async function settingsAndHelpItems(page: Page): Promise<void> {
+  const settings = 'button[aria-controls="settings-menu"]';
+  const help = 'button[aria-controls="help-menu"]';
+  await keepsAcrossCounts(page, settings, "#settings-menu");
+  await themeKeepsFocus(page, settings, "#settings-menu");
+  await keepsAcrossCounts(page, help, "#help-menu");
+  await sheetReturnsFocus(page, help, "#help-menu");
+}
+
+/**
  * The shell by keyboard alone. Each of the header's lists opens from its
  * button and says so; Escape closes it and gives focus back to the button;
  * Tab out of it closes it. A harness's section nav and sub-view list are
@@ -234,6 +328,9 @@ async function shellByKeyboard(session: Session, harness: RouteHarness): Promise
       async () => (await expanded(page, button)) === "false",
     );
   }
+  // Settings holds Theme; Help holds Keyboard shortcuts.
+  await freshVisit(session, HOME_ROUTE);
+  await settingsAndHelpItems(page);
 
   await freshVisit(session, routeFor("#/h/:id/setup/spec", harness));
   const section = page.locator('nav[aria-label="Harness sections"] a[aria-current="page"]');
@@ -285,6 +382,9 @@ async function narrowMenu(scope: JourneyScope, home: HomeAddress): Promise<void>
     async () => (await expanded(page, menu)) === "false",
   );
   if (!(await activeMatches(page, menu))) fail("Escape in the Menu did not give focus back");
+  await keepsAcrossCounts(page, menu, "#narrow-menu");
+  await themeKeepsFocus(page, menu, "#narrow-menu");
+  await sheetReturnsFocus(page, menu, "#narrow-menu");
   session.assertClean();
   await session.close();
 }

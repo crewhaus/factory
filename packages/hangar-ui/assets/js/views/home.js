@@ -102,6 +102,27 @@ function nothing(message) {
   ]);
 }
 
+/**
+ * A Retry that draws the panel again in place; if the whole panel then
+ * fails, it says so and offers Retry again.
+ */
+function retryInto(root, ctx, render, subject) {
+  return () => {
+    clear(root).appendChild(skeleton(3));
+    render(root, ctx).catch((err) => {
+      if (ctx.signal?.aborted) return;
+      clear(root).appendChild(
+        emptyFor({
+          cause: "connection-failed",
+          subject,
+          detail: err instanceof Error ? err.message : String(err),
+          onAction: retryInto(root, ctx, render, subject),
+        }),
+      );
+    });
+  };
+}
+
 const itemList = (items) => el("ul", { class: "home-list" }, items);
 
 /** The newest `n` of a list, by an ISO time field. Pure. */
@@ -113,23 +134,59 @@ export function newestFirst(items, field, n = PANEL_ITEMS) {
 }
 
 /**
- * What needs you, from the two inbox reads. Pure:
- * `{ approvals: [...top], review: [...top], pending, open }`.
+ * What needs you, from the two inbox reads. Pure. A read that failed is
+ * passed as `null` and is not zero: its count is `null` and its name is in
+ * `failed`, so nothing downstream can print "0 waiting" or "nothing needs
+ * you" for a list nobody could read.
+ * `{ approvals: [...top], review: [...top], pending, open, failed }`.
  */
 export function needsYouModel(approvalsPayload, reviewPayload) {
-  const a = approvalsPayload && typeof approvalsPayload === "object" ? approvalsPayload : {};
-  const r = reviewPayload && typeof reviewPayload === "object" ? reviewPayload : {};
-  const approvals = (Array.isArray(a.approvals) ? a.approvals : []).filter(
+  const read = (payload) => payload !== null && typeof payload === "object";
+  const a = read(approvalsPayload) ? approvalsPayload : null;
+  const r = read(reviewPayload) ? reviewPayload : null;
+  const approvals = (Array.isArray(a?.approvals) ? a.approvals : []).filter(
     (row) => row?.status === "pending",
   );
-  const review = (Array.isArray(r.items) ? r.items : []).filter((row) => row?.status === "open");
+  const review = (Array.isArray(r?.items) ? r.items : []).filter((row) => row?.status === "open");
+  const failed = [];
+  if (a === null) failed.push("approvals");
+  if (r === null) failed.push("review");
   return {
     approvals: newestFirst(approvals, "createdAt"),
     review: newestFirst(review, "ts"),
-    pending: typeof a.pending === "number" ? a.pending : approvals.length,
-    open: typeof r.open === "number" ? r.open : review.length,
+    pending: a === null ? null : typeof a.pending === "number" ? a.pending : approvals.length,
+    open: r === null ? null : typeof r.open === "number" ? r.open : review.length,
+    failed,
   };
 }
+
+/** True only when both inboxes answered and neither holds anything. Pure. */
+export function nothingNeedsYou(model) {
+  return (
+    model.failed.length === 0 &&
+    model.approvals.length === 0 &&
+    model.review.length === 0 &&
+    model.pending === 0 &&
+    model.open === 0
+  );
+}
+
+/** The summary line, from the inboxes that answered only. Pure; null when neither did. */
+export function needsYouSummary(model) {
+  const parts = [];
+  if (model.pending !== null) {
+    parts.push(`${model.pending} approval${model.pending === 1 ? "" : "s"} waiting`);
+  }
+  if (model.open !== null) {
+    parts.push(`${model.open} review item${model.open === 1 ? "" : "s"} open`);
+  }
+  return parts.length === 0 ? null : parts.join(" · ");
+}
+
+const INBOX_SUBJECTS = Object.freeze({
+  approvals: "the approvals list",
+  review: "the review list",
+});
 
 /** Home's "Needs you": pending approvals and open review items, newest first. */
 export async function renderNeedsYouPanel(root, ctx = {}) {
@@ -141,7 +198,7 @@ export async function renderNeedsYouPanel(root, ctx = {}) {
     review.status === "fulfilled" ? review.value : null,
   );
   clear(root);
-  if (model.approvals.length === 0 && model.review.length === 0) {
+  if (nothingNeedsYou(model)) {
     root.appendChild(nothing("Nothing needs you right now."));
     return;
   }
@@ -167,18 +224,15 @@ export async function renderNeedsYouPanel(root, ctx = {}) {
       ]),
     ),
   ];
-  root.appendChild(
-    el("p", {
-      class: "muted home-summary",
-      text: `${model.pending} approval${model.pending === 1 ? "" : "s"} waiting · ${model.open} review item${model.open === 1 ? "" : "s"} open`,
-    }),
-  );
-  root.appendChild(itemList(items));
-  if (approvals.status === "rejected" || review.status === "rejected") {
+  const summary = needsYouSummary(model);
+  if (summary !== null) root.appendChild(el("p", { class: "muted home-summary", text: summary }));
+  if (items.length > 0) root.appendChild(itemList(items));
+  for (const source of model.failed) {
     root.appendChild(
-      el("p", {
-        class: "muted",
-        text: `Can't reach the ${approvals.status === "rejected" ? "approvals" : "review"} list right now.`,
+      emptyFor({
+        cause: "connection-failed",
+        subject: INBOX_SUBJECTS[source],
+        onAction: retryInto(root, ctx, renderNeedsYouPanel, INBOX_SUBJECTS[source]),
       }),
     );
   }
@@ -197,6 +251,19 @@ export function workingRows(harnesses, procs, nowMs) {
   return out;
 }
 
+/**
+ * The Working-now picture from the per-harness process reads. Pure. A read
+ * that failed is counted in `unchecked`, never judged "not running".
+ */
+export function workingModel(harnesses, settled, nowMs) {
+  const list = Array.isArray(settled) ? settled : [];
+  const procs = list.map((s) => (s?.status === "fulfilled" ? s.value : null));
+  return {
+    working: workingRows(harnesses, procs, nowMs),
+    unchecked: list.filter((s) => s?.status !== "fulfilled").length,
+  };
+}
+
 /** Home's "Working now": every harness whose process is running. */
 export async function renderWorkingPanel(root, ctx = {}) {
   const harnesses = Array.isArray(ctx.harnesses) ? ctx.harnesses : [];
@@ -205,11 +272,19 @@ export async function renderWorkingPanel(root, ctx = {}) {
   if (harnesses.length > 0 && settled.every((s) => s.status === "rejected")) {
     throw settled[0].reason;
   }
-  const procs = settled.map((s) => (s.status === "fulfilled" ? s.value : null));
-  const working = workingRows(harnesses, procs, Date.now());
+  const { working, unchecked } = workingModel(harnesses, settled, Date.now());
   clear(root);
+  if (unchecked > 0) {
+    root.appendChild(
+      emptyFor({
+        cause: "connection-failed",
+        subject: `${unchecked} harness${unchecked === 1 ? "" : "es"}`,
+        onAction: retryInto(root, ctx, renderWorkingPanel, "the harnesses"),
+      }),
+    );
+  }
   if (working.length === 0) {
-    root.appendChild(nothing("Nothing is running."));
+    root.appendChild(nothing(unchecked > 0 ? "Nothing else is running." : "Nothing is running."));
     return;
   }
   root.appendChild(

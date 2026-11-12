@@ -845,6 +845,10 @@ input[type="radio"] {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The path gives way, never the button beside it. */
+.h-dir .btn-copy {
+  flex: none;
+}
 
 .safety-strip {
   margin-top: 6px;
@@ -2646,5 +2650,16 @@ figure.chart svg {
   .crumb-line {
     flex-wrap: wrap;
     min-width: 0;
+  }
+  /* A row of controls wraps, and so does a long button label. */
+  .section-content .control-row,
+  .section-content .control-action {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .section-content .control-row .btn {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }
