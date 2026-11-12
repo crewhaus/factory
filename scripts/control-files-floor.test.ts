@@ -164,11 +164,15 @@ const GATE_DIRS = [
   ".crewhaus/audit",
   ".crewhaus/graphs",
   ".crewhaus/advice",
+  // The durable-execution idempotency records.
+  ".crewhaus/idempotency",
 ];
 const GATE_FILES = [
   ".crewhaus/environments.json",
   ".crewhaus/judge-calibration.json",
   ".crewhaus/retention.json",
+  // The knowledge-sync marker.
+  ".crewhaus/knowledge.json",
 ];
 const ENV_FILES = [
   ".env",

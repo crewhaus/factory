@@ -2211,3 +2211,137 @@ describe("credential files (credentialRoots)", () => {
 function pick(details: { readonly decision: string }): { readonly decision: string } {
   return { decision: details.decision };
 }
+
+describe("a store's own files (protectedFiles)", () => {
+  const FOCUS = "/srv/ws/.crewhaus/state/s/focus.md";
+  const FILES = [FOCUS, ".crewhaus/state/s/focus.md", "/srv/ws/.crewhaus/state/s/plans"];
+  const rules: RuleSet = {
+    ...emptyRuleSet,
+    flag: [rule("alwaysAllow", "Write", "flag"), rule("alwaysAllow", "StateImport", "flag")],
+  };
+  const write = (rel: string): ToolCallContext => ({
+    toolName: "Write",
+    input: { path: rel, content: "x" },
+    operativeValues: [{ kind: "path", canonical: [rel, `/srv/ws/${rel}`] }],
+    readOnly: false,
+    destructive: true,
+  });
+  // StateImport with its default `stateDir: .crewhaus/state` (`beneath: "all"`).
+  const stateImport: ToolCallContext = {
+    toolName: "StateImport",
+    input: { stateDir: ".crewhaus/state", mode: "merge" },
+    operativeValues: [
+      {
+        kind: "path",
+        canonical: [".crewhaus/state", "/srv/ws/.crewhaus/state"],
+        beneath: [".crewhaus/state/", "./.crewhaus/state/", "/srv/ws/.crewhaus/state/"],
+      },
+    ],
+    readOnly: false,
+    destructive: true,
+    // StateImport checks every entry against the roots on its bridge.
+    checksOwnTargets: true,
+  };
+  // A tool that acts beneath the directory it names and does not check its
+  // own targets: GitWorktreeAdd's `path`, TrashPath's `paths`.
+  const beneathStore = (toolName: string, input: unknown): ToolCallContext => ({
+    toolName,
+    input,
+    operativeValues: [
+      {
+        kind: "path",
+        canonical: [".crewhaus/state/s", "/srv/ws/.crewhaus/state/s"],
+        beneath: [".crewhaus/state/s/", "/srv/ws/.crewhaus/state/s/"],
+      },
+    ],
+    readOnly: false,
+    destructive: true,
+  });
+  const anyRules: RuleSet = {
+    ...emptyRuleSet,
+    flag: [rule("alwaysAllow", "*", "flag")],
+  };
+
+  test("a Write to one, or inside one, is denied whatever a rule allows", () => {
+    for (const path of [".crewhaus/state/s/focus.md", ".crewhaus/state/s/plans/plan-0001-x.md"]) {
+      for (const mode of ["default", "auto"] as const) {
+        const r = evaluateWithReason(write(path), mode, rules, { protectedFiles: FILES });
+        expect({ path, mode, decision: r.decision }).toEqual({ path, mode, decision: "deny" });
+        expect(r.reason).toContain("names a file a store keeps for itself");
+      }
+    }
+    // A neighbour is the rules' to decide.
+    expect(
+      evaluateWithReason(write(".crewhaus/state/s/kv/x.json"), "auto", rules, {
+        protectedFiles: FILES,
+      }).decision,
+    ).toBe("allow");
+  });
+
+  test("StateImport with the default stateDir is not denied for them", () => {
+    expect(evaluateWithReason(stateImport, "auto", rules, { protectedFiles: FILES }).decision).toBe(
+      "allow",
+    );
+  });
+
+  test("the same paths as protectedRoots do deny it: the two readings differ", () => {
+    const r = evaluateWithReason(stateImport, "auto", rules, { protectedRoots: FILES });
+    expect(r.decision).toBe("deny");
+    expect(r.reason).toContain("acts on everything beneath `.crewhaus/state`");
+  });
+
+  test("a tool that acts beneath the store's directory and checks nothing itself is denied", () => {
+    for (const call of [
+      beneathStore("GitWorktreeAdd", { path: ".crewhaus/state/s", ref: "main" }),
+      beneathStore("TrashPath", { paths: [".crewhaus/state/s"] }),
+    ]) {
+      for (const mode of ["default", "auto"] as const) {
+        const r = evaluateWithReason(call, mode, anyRules, { protectedFiles: FILES });
+        expect({ tool: call.toolName, mode, decision: r.decision }).toEqual({
+          tool: call.toolName,
+          mode,
+          decision: "deny",
+        });
+        expect(r.reason).toContain(
+          "acts on everything beneath `.crewhaus/state/s`, which holds a file a store keeps for itself",
+        );
+      }
+    }
+  });
+
+  test("StateImport without the flag is read the way a root is", () => {
+    const { checksOwnTargets: _checks, ...plain } = stateImport;
+    const r = evaluateWithReason(plain, "auto", rules, { protectedFiles: FILES });
+    expect(r.decision).toBe("deny");
+    expect(r.reason).toContain("acts on everything beneath `.crewhaus/state`");
+  });
+
+  test("the flag lifts only the beneath reading: a self-checking tool naming one is denied", () => {
+    const named: ToolCallContext = {
+      ...stateImport,
+      input: { stateDir: ".crewhaus/state/s/plans", mode: "merge" },
+      operativeValues: [
+        {
+          kind: "path",
+          canonical: [".crewhaus/state/s/plans", "/srv/ws/.crewhaus/state/s/plans"],
+          beneath: [".crewhaus/state/s/plans/"],
+        },
+      ],
+    };
+    expect(evaluateWithReason(named, "auto", rules, { protectedFiles: FILES }).decision).toBe(
+      "deny",
+    );
+  });
+
+  test("a read-only call, and bypass, are not refused", () => {
+    const read: ToolCallContext = { ...write(".crewhaus/state/s/focus.md"), readOnly: true };
+    expect(evaluateWithReason(read, "auto", rules, { protectedFiles: FILES }).decision).toBe(
+      "allow",
+    );
+    expect(
+      evaluateWithReason(write(".crewhaus/state/s/focus.md"), "bypass", rules, {
+        protectedFiles: FILES,
+      }).decision,
+    ).toBe("allow");
+  });
+});

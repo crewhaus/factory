@@ -231,10 +231,12 @@ those previews are the secret. This tool reports `droppedForSecrets` as a count
 only. A test asserts the raw result string does not contain the fixture secret.
 
 **A pulled memory is recognised on the next pull.** `applyPull` lands a memory
-with an extra `shared:<harness>` tag, and the content hash covers text *and*
-tags — so hashing what is on disk does not reproduce the shared record's hash.
-`crewhaus knowledge pull` compares exactly that way, which means every pull
-re-imports everything it pulled before and `shared.jsonl` grows on each run.
+in the harness's own spec store (`.crewhaus/memories/<spec>.jsonl`, the spec its
+`crewhaus.yaml` names) under an id derived from its content hash, so the store
+never takes it twice. It lands with an extra `shared:<harness>` tag, and the
+content hash covers text *and* tags — so hashing what is on disk does not
+reproduce the shared record's hash, and `crewhaus knowledge pull`, which compares
+exactly that way, plans every memory it pulled before again.
 `KnowledgeSync` hashes a landed memory both ways (still with the library's
 `memoryContentHash`), so a second pull brings in nothing. The undo is exactly
 `applyPull`'s do: **one** trailing `shared:` tag comes back off, because one

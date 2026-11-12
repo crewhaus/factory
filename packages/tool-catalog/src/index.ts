@@ -707,6 +707,17 @@ export interface ToolDefinition<TInput = unknown> {
    */
   requiresModelFeatures?: ModelFeatureRequirement;
   /**
+   * The tool checks every place it writes beneath a directory it names
+   * against the roots the runtime hands it on the bridge
+   * (`RuntimeBridge.protectedRoots`), so the runtime-state floor reads a
+   * store's own files (`EvaluateOptions.protectedFiles`) for its call only
+   * the `inside` way: a call that acts beneath the directory holding them is
+   * left to the tool's own check (StateImport over the whole of
+   * `.crewhaus/state`). Set it only on a tool that does check. Omitted ⇒ the
+   * floor reads those files as it reads a root.
+   */
+  checksOwnTargets?: boolean;
+  /**
    * Authoritative JSON Schema for the tool's input. When set, runtime-core
    * forwards this verbatim to the model instead of running
    * `zodToJsonSchema(inputSchema)`. Used by tools whose canonical schema is
@@ -830,6 +841,8 @@ export interface RegisteredTool {
    * the tool is advertised to every candidate.
    */
   requiresModelFeatures?: ModelFeatureRequirement;
+  /** See ToolDefinition.checksOwnTargets. Present only as `true`, passed through by `buildTool`. */
+  checksOwnTargets?: true;
   /** See ToolDefinition.jsonSchema. Optional; runtime-core falls back to
    *  zodToJsonSchema(inputSchema) when absent. */
   jsonSchema?: unknown;

@@ -1846,6 +1846,9 @@ export const stateExport: RegisteredTool = stateTool({
 export const stateImport: RegisteredTool = stateTool({
   name: "StateImport",
   operativeArgs: [{ field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, beneath: "all" }],
+  // Every entry is checked against the bridge's roots before it is written
+  // (below), so the floor leaves a store's own files beneath `stateDir` to it.
+  checksOwnTargets: true,
   description:
     "Restore a state directory from a StateExport document, merging into what is there or replacing it. Use it to seed a fresh workspace or roll state back; `dryRun` reports exactly what would be written first, every entry path is checked for escapes before anything is created, and 'replace' refuses any directory holding anything this package did not put there, so it can never be pointed at a source tree.",
   inputSchema: z.object({

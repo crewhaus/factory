@@ -72,6 +72,20 @@
  * `## Sources` heading — what was prompt-only discipline in the expert
  * demo becomes a hard gate. Default false.
  *
+ * ## A person's correction survives the agent (the read ledger)
+ *
+ * `wiki_write` writes over the version the session last READ, not the one
+ * on disk right before the write: a bounded read ledger
+ * ({@link createWikiReadLedger}) remembers, per session, the version of each
+ * article whose body `wiki_get` or `wiki_recall` returned. An overwrite of an
+ * article that changed since that read is refused with the two versions,
+ * and an overwrite of a version a person wrote (the store's `author`) that
+ * the session never read is refused too, so an edit made from the CLI or
+ * Hangar is never lost to an agent working from an older copy. Search,
+ * list, related, semantic search, a redacted article and a `concise` read
+ * that cut the body are not reads. `log_knowledge_gap` re-reads and appends
+ * within one call, so it keeps any correction and is not guarded.
+ *
  * ## `log_knowledge_gap` (decoupled)
  *
  * Takes an injected `logGap` callback — the plan-store wiring happens in
@@ -160,7 +174,71 @@ export type CreateWikiToolsOptions = {
   /** Event-log append seam — see `AppendWikiEvent`. */
   readonly appendEvent?: AppendWikiEvent;
   readonly now?: () => Date;
+  /**
+   * Which article versions each session has read (see
+   * {@link createWikiReadLedger}). Default: a fresh ledger per bundle. A
+   * channel daemon passes one shared ledger so its conversations share the
+   * bound.
+   */
+  readonly readLedger?: WikiReadLedger;
 };
+
+/** Per session, the version of each article whose body the session was shown. */
+export type WikiReadLedger = {
+  /** Record that `session` received the body of `slug` at `version`. */
+  noteRead(session: string, slug: string, version: number): void;
+  /** The version `session` last read of `slug`, or `undefined` when it never did. */
+  lastRead(session: string, slug: string): number | undefined;
+};
+
+export type WikiReadLedgerOptions = {
+  /** Sessions kept; the least recently used is dropped past it. Default 256. */
+  readonly maxSessions?: number;
+  /** Articles kept per session; the least recently used is dropped past it. Default 1024. */
+  readonly maxSlugs?: number;
+};
+
+/**
+ * A bounded read ledger: least-recently-used sessions, and least-recently-used
+ * articles within a session, are dropped at the bounds. A dropped entry reads
+ * as never read, which is the cautious answer (the guard asks for a fresh
+ * read of a person's version, and otherwise writes over the version on disk).
+ */
+export function createWikiReadLedger(opts: WikiReadLedgerOptions = {}): WikiReadLedger {
+  const maxSessions = Math.max(1, opts.maxSessions ?? 256);
+  const maxSlugs = Math.max(1, opts.maxSlugs ?? 1024);
+  const sessions = new Map<string, Map<string, number>>();
+  const touch = (session: string): Map<string, number> | undefined => {
+    const slugs = sessions.get(session);
+    if (slugs !== undefined) {
+      sessions.delete(session);
+      sessions.set(session, slugs);
+    }
+    return slugs;
+  };
+  return {
+    noteRead(session, slug, version) {
+      let slugs = touch(session);
+      if (slugs === undefined) {
+        slugs = new Map();
+        sessions.set(session, slugs);
+        if (sessions.size > maxSessions) {
+          const oldest = sessions.keys().next().value;
+          if (oldest !== undefined) sessions.delete(oldest);
+        }
+      }
+      slugs.delete(slug);
+      slugs.set(slug, version);
+      if (slugs.size > maxSlugs) {
+        const oldest = slugs.keys().next().value;
+        if (oldest !== undefined) slugs.delete(oldest);
+      }
+    },
+    lastRead(session, slug) {
+      return touch(session)?.get(slug);
+    },
+  };
+}
 
 export type WikiToolBundle = {
   readonly recall: RegisteredTool;
@@ -598,6 +676,10 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       now,
     });
   const requireSources = opts.requireSources === true;
+  const readLedger = opts.readLedger ?? createWikiReadLedger();
+  /** The ledger's session key: the run's session, or one key for a run with none. */
+  const sessionKey = (ctx: ToolExecuteContext | undefined): string =>
+    resolveRunContext(ctx)?.sessionId ?? "-";
   // The ranking tools send the query and article text to the embedder. A
   // store that does not say where its embedder is, but can rank
   // semantically, is taken to reach one.
@@ -643,6 +725,8 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
           "",
           ...(c.safe ? [c.text] : [`--- ${named(hit.ref)} — [article redacted]`, c.notice]),
         );
+        // The body reached the model: this session has read this version.
+        if (c.safe) readLedger.noteRead(sessionKey(ctx), hit.ref.slug, hit.ref.version);
       }
       return lines.join("\n");
     },
@@ -728,10 +812,13 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         const name = redactedName(article);
         return `slug: ${name.slug} · ${name.version} — [article redacted]\n\n${c.notice}`;
       }
-      const body =
-        input.concise === true && article.body.length > CONCISE_CHARS
-          ? `${article.body.slice(0, CONCISE_CHARS).trimEnd()}\n… (concise — call wiki_get without concise for the full body)`
-          : article.body;
+      const cut = input.concise === true && article.body.length > CONCISE_CHARS;
+      const body = cut
+        ? `${article.body.slice(0, CONCISE_CHARS).trimEnd()}\n… (concise — call wiki_get without concise for the full body)`
+        : article.body;
+      // Only a whole body counts as a read: an edit made from a cut one
+      // could drop what the model never saw.
+      if (!cut) readLedger.noteRead(sessionKey(ctx), article.slug, article.version);
       return `${header.join("\n")}\n\n${body}`;
     },
   });
@@ -758,6 +845,24 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       }
       const existing = await store.get(input.slug).catch(() => null);
       const createdBy = createdByFrom(ctx);
+      const session = sessionKey(ctx);
+      const lastRead = existing !== null ? readLedger.lastRead(session, input.slug) : undefined;
+      if (existing !== null) {
+        // The article's title is stored text: it is printed only when it
+        // classifies clean at `memory`, and the slug stands in otherwise.
+        const label = async (): Promise<string> => {
+          const title = existing.title.replace(/\s+/g, " ").trim();
+          return (await classifyMemory(title, resolveRunContext(ctx))).safe
+            ? title
+            : redactedName(existing).slug;
+        };
+        if (lastRead !== undefined && lastRead < existing.version) {
+          return `wiki_write refused: "${await label()}" changed since you read it (v${lastRead} → v${existing.version}). Read it again with wiki_get, then re-apply your edit. Nothing was written.`;
+        }
+        if (lastRead === undefined && existing.author?.kind === "operator") {
+          return `wiki_write refused: "${await label()}" was corrected by a person. Read it with wiki_get first, then re-apply your edit. Nothing was written.`;
+        }
+      }
       try {
         const result = await store.write({
           slug: input.slug,
@@ -767,9 +872,12 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
           ...(input.confidenceScore !== undefined ? { confidence: input.confidenceScore } : {}),
           ...(input.status !== undefined ? { status: input.status } : {}),
           sources: extractSources(input.body),
-          ...(existing !== null ? { expectedVersion: existing.version } : {}),
+          // The version this session read, so a change made since is a conflict.
+          ...(existing !== null ? { expectedVersion: lastRead ?? existing.version } : {}),
           ...(createdBy !== undefined ? { createdBy } : {}),
         });
+        // The session wrote this version, so it knows what it holds.
+        readLedger.noteRead(session, result.slug, result.version);
         await emit({
           slug: result.slug,
           version: result.version,

@@ -68,6 +68,8 @@ export function makeRedactor(): Redactor {
  */
 export const SHARED_MEMORIES_RELPATH = "memories.jsonl";
 export const SHARED_MANIFEST_RELPATH = "manifest.jsonl";
+/** Where a push appends retractions (the package's `SHARED_RETRACTIONS_FILE`). */
+export const SHARED_RETRACTIONS_RELPATH = "retractions.jsonl";
 const SHARED_FRAGMENT_DIR = { grader: "graders", prompt: "prompts" } as const;
 const SHARED_FRAGMENT_EXT = { grader: ".yaml", prompt: ".md" } as const;
 
@@ -191,8 +193,9 @@ export function auditSharedFragments(
  * from the shared store lands with one more tag than the record it came from,
  * so hashing what is on disk does NOT reproduce the shared record's hash. The
  * CLI computes the harness's hashes without accounting for it
- * (`apps/cli/src/index.ts`, the `knowledge pull` branch), which is why a
- * second pull re-imports everything and `shared.jsonl` grows on every run.
+ * (`apps/cli/src/index.ts`, the `knowledge pull` branch), so it plans every
+ * pulled memory again; the spec store adds none of them twice (each lands
+ * under an id derived from its content hash), but the plan still counts them.
  *
  * `harnessMemoryHashes` below closes that by hashing a landed memory BOTH
  * ways. The hashing rule itself is still the package's `memoryContentHash`;
@@ -240,7 +243,9 @@ export function harnessMemoryHashes(
  * real pull, so a rename upstream fails a test here rather than silently
  * turning the checks into no-ops.
  */
-export const PULLED_MEMORIES_RELPATH = ".crewhaus/memories/shared.jsonl";
+export function pulledMemoriesRelPath(specName: string): string {
+  return `.crewhaus/memories/${specName}.jsonl`;
+}
 const PULLED_PROMPT_RELDIR = ".crewhaus/prompts";
 export const PULLED_GRADER_PREFIX = "graders.shared-";
 export const PULLED_GRADER_SUFFIX = ".yaml";

@@ -27,6 +27,7 @@ import {
   GAPS_TAG,
   THREDZ_WIKI_TOOL_NAMES,
   type WikiEvent,
+  createWikiReadLedger,
   createWikiTools,
   extractSources,
   hasSourcesHeading,
@@ -1052,5 +1053,144 @@ describe("wiki_write event seam", () => {
       },
     ]);
     await log.close();
+  });
+});
+
+describe("wiki_write keeps a person's correction (the read ledger)", () => {
+  const person = { kind: "operator", via: "cli" } as const;
+  const edit = { slug: "faq", title: "FAQ", body: "the agent's edit" };
+
+  async function seedAt(bundle: ReturnType<typeof makeBundle>, version: number, last?: object) {
+    for (let v = 1; v <= version; v++) {
+      await bundle.store.write({
+        slug: "faq",
+        title: "FAQ",
+        body: `body v${v}`,
+        ...(v > 1 ? { expectedVersion: v - 1 } : {}),
+        ...(v === version && last !== undefined ? last : {}),
+      });
+    }
+  }
+
+  test("read v3, current v5: refused, naming both versions, and nothing is written", async () => {
+    const bundle = makeBundle();
+    await seedAt(bundle, 3);
+    const rc = createRunContext();
+    await bundle.get.execute({ slug: "faq" }, { runContext: rc });
+    await bundle.store.write({ slug: "faq", title: "FAQ", body: "v4", expectedVersion: 3 });
+    await bundle.store.write({ slug: "faq", title: "FAQ", body: "v5", expectedVersion: 4 });
+    const out = await bundle.write.execute(edit, { runContext: rc });
+    expect(out).toBe(
+      'wiki_write refused: "FAQ" changed since you read it (v3 → v5). Read it again with wiki_get, then re-apply your edit. Nothing was written.',
+    );
+    expect((await bundle.store.get("faq"))?.version).toBe(5);
+  });
+
+  test("never read, a person wrote the current version: refused", async () => {
+    const bundle = makeBundle();
+    await seedAt(bundle, 2, { author: person });
+    const out = await bundle.write.execute(edit, { runContext: createRunContext() });
+    expect(out).toBe(
+      'wiki_write refused: "FAQ" was corrected by a person. Read it with wiki_get first, then re-apply your edit. Nothing was written.',
+    );
+    expect((await bundle.store.get("faq"))?.body).toBe("body v2");
+  });
+
+  test("after wiki_get, the write lands", async () => {
+    const bundle = makeBundle();
+    await seedAt(bundle, 2, { author: person });
+    const rc = createRunContext();
+    await bundle.get.execute({ slug: "faq" }, { runContext: rc });
+    const out = await bundle.write.execute(edit, { runContext: rc });
+    expect(out).toContain("updated (superseded v2");
+    expect((await bundle.store.get("faq"))?.body).toBe("the agent's edit");
+    // The session wrote v3, so its own next edit lands too.
+    expect(
+      await bundle.write.execute({ ...edit, body: "a second edit" }, { runContext: rc }),
+    ).toContain("at v4");
+  });
+
+  test("an agent-only history the session never read lands, as before", async () => {
+    const bundle = makeBundle();
+    await seedAt(bundle, 2, { createdBy: { sessionId: "sess_other" } });
+    expect(await bundle.write.execute(edit, { runContext: createRunContext() })).toContain("at v3");
+  });
+
+  test("a create lands", async () => {
+    const bundle = makeBundle();
+    expect(await bundle.write.execute(edit, { runContext: createRunContext() })).toContain(
+      'created "faq" at v1',
+    );
+  });
+
+  test("wiki_recall counts as a read", async () => {
+    const bundle = makeBundle();
+    await seedAt(bundle, 1, { author: person });
+    const rc = createRunContext();
+    await bundle.recall.execute({ query: "body" }, { runContext: rc });
+    expect(await bundle.write.execute(edit, { runContext: rc })).toContain("at v2");
+  });
+
+  test("wiki_search is not a read, and neither is a redacted or a cut wiki_get", async () => {
+    const bundle = makeBundle();
+    await seedAt(bundle, 1, { author: person });
+    const rc = createRunContext();
+    await bundle.search.execute({ query: "body" }, { runContext: rc });
+    expect(await bundle.write.execute(edit, { runContext: rc })).toContain("corrected by a person");
+
+    const long = "x ".repeat(800);
+    await bundle.store.write({ slug: "long", title: "Long", body: long, author: person });
+    await bundle.get.execute({ slug: "long", concise: true }, { runContext: rc });
+    expect(
+      await bundle.write.execute(
+        { slug: "long", title: "Long", body: "short" },
+        { runContext: rc },
+      ),
+    ).toContain("corrected by a person");
+
+    await bundle.store.write({ slug: "evil", title: "Evil", body: MALICIOUS_BODY, author: person });
+    const got = await bundle.get.execute({ slug: "evil" }, { runContext: rc });
+    expect(got).toContain("[article redacted]");
+    expect(
+      await bundle.write.execute(
+        { slug: "evil", title: "Evil", body: "clean" },
+        { runContext: rc },
+      ),
+    ).toContain("corrected by a person");
+  });
+
+  test("reads are per session", async () => {
+    const bundle = makeBundle();
+    await seedAt(bundle, 1, { author: person });
+    await bundle.get.execute({ slug: "faq" }, { runContext: createRunContext() });
+    expect(await bundle.write.execute(edit, { runContext: createRunContext() })).toContain(
+      "corrected by a person",
+    );
+  });
+});
+
+describe("createWikiReadLedger bounds", () => {
+  test("drops the least recently used session past maxSessions", () => {
+    const ledger = createWikiReadLedger({ maxSessions: 2 });
+    ledger.noteRead("s1", "a", 1);
+    ledger.noteRead("s2", "a", 1);
+    expect(ledger.lastRead("s1", "a")).toBe(1); // s1 is now the most recent
+    ledger.noteRead("s3", "a", 1);
+    expect(ledger.lastRead("s2", "a")).toBeUndefined();
+    expect(ledger.lastRead("s1", "a")).toBe(1);
+    expect(ledger.lastRead("s3", "a")).toBe(1);
+  });
+
+  test("drops the least recently used article past maxSlugs, per session", () => {
+    const ledger = createWikiReadLedger({ maxSlugs: 2 });
+    ledger.noteRead("s", "a", 1);
+    ledger.noteRead("s", "b", 1);
+    ledger.noteRead("s", "a", 2); // a refreshed
+    ledger.noteRead("s", "c", 1);
+    expect(ledger.lastRead("s", "b")).toBeUndefined();
+    expect(ledger.lastRead("s", "a")).toBe(2);
+    expect(ledger.lastRead("s", "c")).toBe(1);
+    ledger.noteRead("t", "z", 1);
+    expect(ledger.lastRead("s", "a")).toBe(2);
   });
 });

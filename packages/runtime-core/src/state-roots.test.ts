@@ -21,6 +21,7 @@ import {
   relocatingFieldLeftOut,
   runtimeRecordRoots,
   runtimeStateRoots,
+  storeFileRoots,
 } from "./state-roots";
 
 const TMP: string[] = [];
@@ -49,7 +50,10 @@ const GATE_RECORDS = [
   "audit",
   "graphs",
   "advice",
+  "knowledge.json",
 ].map((name) => join(".crewhaus", name));
+/** The idempotency store's default directory, always a root. */
+const IDEMPOTENCY = [join(".crewhaus", "idempotency")];
 const ENV_FILES = [
   ".env",
   ".env.local",
@@ -479,7 +483,10 @@ describe("Hangar's directory", () => {
   test("with no variables, the default is the only root beside the record and the control files", () => {
     const cwd = tempDir("crewhaus-state-roots-");
     const roots = runtimeStateRoots(undefined, undefined, cwd, {});
-    const workspace = [...RECORD, ...CONTROL].flatMap((rel) => [join(cwd, rel), rel]);
+    const workspace = [...RECORD, ...CONTROL, ...IDEMPOTENCY].flatMap((rel) => [
+      join(cwd, rel),
+      rel,
+    ]);
     expect(roots.filter((root) => !workspace.includes(root))).toEqual(DEFAULT_SPELLINGS);
   });
 
@@ -1230,5 +1237,50 @@ describe("the credential file roots", () => {
     const before = runtimeStateRoots(undefined, undefined, cwd, {});
     credentialFileRoots(cwd);
     expect(runtimeStateRoots(undefined, undefined, cwd, {})).toEqual(before);
+  });
+});
+
+describe("the knowledge-sync marker and the idempotency store", () => {
+  test("names .crewhaus/knowledge.json exactly and .crewhaus/idempotency as a directory", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    const knowledge = join(".crewhaus", "knowledge.json");
+    expect(roots).toContain(knowledge);
+    expect(roots).toContain(join(cwd, knowledge));
+    expect(protectedRootHolding(`${knowledge}.bak`, roots, cwd)).toBeUndefined();
+    const held = protectedRootHolding(join(".crewhaus", "idempotency", "s", "k.json"), roots, cwd);
+    expect([join(".crewhaus", "idempotency"), join(cwd, ".crewhaus", "idempotency")]).toContain(
+      held as string,
+    );
+  });
+
+  test("file:<dir> adds the directory it names; file, file: and file:. add nothing", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const base = runtimeStateRoots(undefined, undefined, cwd, {});
+    const custom = runtimeStateRoots(undefined, undefined, cwd, {
+      CREWHAUS_IDEMPOTENCY_STORE: "file:custom/idem",
+    });
+    expect(custom.filter((r) => !base.includes(r)).sort()).toEqual(
+      [join("custom", "idem"), join(cwd, "custom", "idem")].sort(),
+    );
+    // The default stays a root whatever the variable says.
+    expect(custom).toContain(join(cwd, ".crewhaus", "idempotency"));
+    for (const value of ["file", "file:", "file:.", "memory"]) {
+      expect({
+        value,
+        roots: runtimeStateRoots(undefined, undefined, cwd, { CREWHAUS_IDEMPOTENCY_STORE: value }),
+      }).toEqual({ value, roots: base });
+    }
+  });
+});
+
+describe("storeFileRoots", () => {
+  test("spells each store file absolute and workspace-relative", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const focus = join(cwd, ".crewhaus", "state", "s", "focus.md");
+    expect(storeFileRoots([focus], cwd).sort()).toEqual(
+      [focus, join(".crewhaus", "state", "s", "focus.md")].sort(),
+    );
+    expect(storeFileRoots([], cwd)).toEqual([]);
   });
 });

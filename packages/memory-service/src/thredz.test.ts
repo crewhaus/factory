@@ -758,3 +758,108 @@ describe("goal mirror × continuity.proof: require completes only a verified goa
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Under require a goal's frozen proofs are read again from their logs before
+// the mirror completes the remote goal.
+// ---------------------------------------------------------------------------
+
+describe("goal mirror × require rechecks frozen proofs", () => {
+  const SESS = "sess_0123456789abcdef";
+
+  function wire(proof: "require" | "ladder") {
+    const { client, calls } = fakeClient({
+      goal_write: () => ({ content: '{"_id":"tz-goal-1"}', isError: false }),
+      goal_update: () => ({ content: '{"_id":"tz-goal-1"}', isError: false }),
+    });
+    const { deps: d } = deps({ thredz: { client, serverName: "thredz" }, sessionScope: SESS });
+    const wired = wireContinuity(
+      { specName: "mirror-recheck", continuity: { proof }, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    const tool = (name: string): RegisteredTool => {
+      const found = wired.tools.find((t) => t.name === name);
+      if (found === undefined) throw new Error(`${name} not registered`);
+      return found;
+    };
+    const updates = () => calls.filter((c) => c.name === "goal_update").map((c) => c.args);
+    return { wired, tool, updates };
+  }
+
+  /** Rewrite goals.yaml with goal-0001 proven by a frozen proof no log holds (JSON is YAML). */
+  function handProve(storeDir: string): void {
+    writeFileSync(
+      join(storeDir, "goals.yaml"),
+      JSON.stringify({
+        version: 1,
+        goals: [
+          {
+            id: "goal-0001",
+            title: "ship",
+            status: "proven",
+            target: 10,
+            current: 2,
+            proofs: [
+              {
+                toolUseId: "tu_made_up",
+                sessionId: SESS,
+                toolName: "Bash",
+                inputHash: "sha256:00",
+                resultDigest: "10 shipped",
+                verifiedAt: "2026-07-13T00:00:00.000Z",
+              },
+            ],
+            createdAt: "2026-07-13T00:00:00.000Z",
+            updatedAt: "2026-07-13T00:00:00.000Z",
+          },
+        ],
+      }),
+    );
+  }
+
+  test("a hand-proved goal never sends currentValue = targetValue", async () => {
+    const req = wire("require");
+    await req.tool("GoalWrite").execute({ title: "ship", target: 10 });
+    handProve(req.wired.store.dir());
+    await req.tool("GoalUpdate").execute({ goalId: "goal-0001", title: "ship it" });
+    expect(req.updates()).toEqual([{ id: "tz-goal-1", title: "ship it" }]);
+  });
+
+  test("the ladder completes the same goal, reading no log", async () => {
+    const lad = wire("ladder");
+    await lad.tool("GoalWrite").execute({ title: "ship", target: 10 });
+    handProve(lad.wired.store.dir());
+    await lad.tool("GoalUpdate").execute({ goalId: "goal-0001", title: "ship it" });
+    expect(lad.updates()).toEqual([
+      { id: "tz-goal-1", title: "ship it", targetValue: 10, currentValue: 10 },
+    ]);
+  });
+
+  test("the wrapped store carries the new store methods through its spread", () => {
+    const req = wire("require");
+    const store = req.wired.store;
+    expect(typeof store.planClear).toBe("function");
+    expect(typeof store.listScopes).toBe("function");
+    expect(typeof store.storeFiles).toBe("function");
+    expect(typeof store.recheckProofs).toBe("function");
+    expect(store.storeFiles()).toContain(join(store.dir(), "goals.yaml"));
+  });
+
+  test("wireContinuity's seam carries the store's files", () => {
+    const req = wire("require");
+    const files = req.wired.continuity.storeFiles ?? [];
+    const spec = join(tmp, ".crewhaus", "state", "mirror-recheck");
+    expect(files).toEqual(
+      [
+        "focus.md",
+        "goals.yaml",
+        "plans",
+        "handoff.md",
+        "sessions",
+        "thredz-goals.json",
+        ".lock",
+      ].map((n) => join(spec, n)),
+    );
+  });
+});

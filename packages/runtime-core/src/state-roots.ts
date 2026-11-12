@@ -83,7 +83,30 @@ const GATE_RECORDS: readonly string[] = [
   join(".crewhaus", "audit"),
   join(".crewhaus", "graphs"),
   join(".crewhaus", "advice"),
+  // The knowledge-sync marker: exactly that file.
+  join(".crewhaus", "knowledge.json"),
 ];
+
+/** Where the durable-execution idempotency store keeps its records by default. */
+const IDEMPOTENCY_DIR = join(".crewhaus", "idempotency");
+
+/**
+ * The idempotency store's roots: the default directory, and the directory
+ * `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>` names (`@crewhaus/durable-execution`
+ * reads the same variable; `file` and `file:` mean the default), resolved
+ * against `cwd`. A variable can add a root and never move one.
+ */
+function idempotencyRoots(
+  cwd: string,
+  env: Readonly<Record<string, string | undefined>>,
+): string[] {
+  const roots = [resolve(cwd, IDEMPOTENCY_DIR)];
+  const raw = env["CREWHAUS_IDEMPOTENCY_STORE"];
+  if (raw?.startsWith("file:") === true && raw.length > "file:".length) {
+    roots.push(resolve(cwd, raw.slice("file:".length)));
+  }
+  return roots;
+}
 
 /** Every file Bun loads into a process started here, whichever NODE_ENV. */
 const ENV_FILES: readonly string[] = [
@@ -467,9 +490,12 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   `resolveHangarRoot` the CLI and the fleet tools use), and the
  *   `harnesses.json` of `<registryRoot>` and of `~/.crewhaus`
  *   (`registryStateFiles`), so a variable can add a protected root and never
- *   move one. `env` is read for those two variables alone; the default
- *   follows the home directory (`homedir()`), as the Hangar server's own
- *   fallback does.
+ *   move one. The default follows the home directory (`homedir()`), as the
+ *   Hangar server's own fallback does.
+ * - The idempotency store's records: `.crewhaus/idempotency`, and the
+ *   directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>` names. One that holds
+ *   the working directory (`file:.`) is left to the rules. `env` is read for
+ *   these three variables alone.
  * - What the harness's next start runs, by what the working directory is to
  *   this process ({@link Standing}): `dist`, `build` and `node_modules`; the
  *   compiled inputs; and the bundle the process started from. `entry` is the
@@ -529,6 +555,9 @@ export function runtimeStateRoots(
     // its registry file. One that holds the working directory stays protected:
     // the floor refuses a run inside Hangar's directory that writes there.
     { roots: [...hangarStateRoots(env), ...registryStateFiles(env)], holdingCwd: "protect" },
+    // The idempotency store's records. A `file:<dir>` that holds the working
+    // directory is left to the rules rather than walling it off.
+    { roots: idempotencyRoots(cwd, env), holdingCwd: "skip" },
     // What the harness's next start runs. Each lies inside the working
     // directory, so none holds it.
     { roots: standing.holdsSpec ? atCwd(INSTALLED_TREES) : [], holdingCwd: "protect" },
@@ -543,6 +572,21 @@ export function runtimeStateRoots(
     }
   }
   return [...roots];
+}
+
+/**
+ * A store's own files as floor entries, each spelled as {@link runtimeStateRoots}
+ * spells a root. They are protected FILES (`EvaluateOptions.protectedFiles`):
+ * a call that names one, a path inside one, or acts beneath a directory
+ * holding one is refused, except that a tool that checks its own targets on
+ * the bridge (`checksOwnTargets`) is refused only for a path that names one,
+ * so StateImport keeps working on the whole of `.crewhaus/state`. The
+ * continuity store's files are the first.
+ */
+export function storeFileRoots(paths: readonly string[], cwd: string = process.cwd()): string[] {
+  const out = new Set<string>();
+  for (const path of paths) addSpellings(out, resolve(cwd, path), cwd);
+  return [...out];
 }
 
 /**

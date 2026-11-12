@@ -151,6 +151,27 @@ const EXPECTED_FIRST_RUN = {
   trashPurged: 1,
 };
 
+describe("runDreamPhase1 — the duplicate pass keeps history", () => {
+  test("the duplicate's tombstone names the kept fact, and the archive holds the duplicate", async () => {
+    const stores = await seedFixture();
+    await runDreamPhase1({ specName: "bot", crewhausDir: tmp, ...stores, now: fixedNow });
+    const live = (await stores.memoryStore.list()).filter((i) => i.status === "live");
+    const keeper = live.find((i) => i.entry.text === "the deploy runs at 9am!");
+    expect(keeper).toBeDefined();
+    const archived = (await stores.memoryStore.history()).map(
+      (h) => h.line as Record<string, unknown>,
+    );
+    const duplicate = archived.find((l) => l["text"] === "The deploy runs at 9am");
+    expect(duplicate).toBeDefined();
+    const tombstone = archived.find(
+      (l) => l["tombstone"] === "superseded" && l["target"] === duplicate?.["id"],
+    );
+    expect(tombstone?.["supersededBy"]).toBe(keeper?.entry.id);
+    expect(tombstone?.["reason"]).toBe(`dream: near-duplicate of ${keeper?.entry.id}`);
+    // The fixture and a full phase-1 run are slow by construction on a loaded runner.
+  }, 20_000);
+});
+
 describe("runDreamPhase1 — determinism", () => {
   test("first run produces the exact expected counts", async () => {
     const stores = await seedFixture();

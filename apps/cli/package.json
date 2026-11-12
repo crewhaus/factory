@@ -51,6 +51,7 @@
     "@crewhaus/control-service": "workspace:*",
     "@crewhaus/computer-use-driver": "workspace:*",
     "@crewhaus/context-bundle": "workspace:*",
+    "@crewhaus/continuity-store": "workspace:*",
     "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/data-retention-engine": "workspace:*",
     "@crewhaus/dataset-registry": "workspace:*",
