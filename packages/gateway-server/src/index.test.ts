@@ -1207,12 +1207,15 @@ describe("listen — real Bun.serve HTTP surface (loopback)", () => {
     });
   });
 
-  test("a non-JSON body returns 400 before auth is even consulted", async () => {
+  test("an authenticated non-JSON body returns 400", async () => {
+    // The bearer is checked before the body is read (body-before-auth.test.ts
+    // holds the case without one), so this needs a token that verifies.
     const { server } = makeServer();
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
     await withHttp(server, async (base) => {
       const res = await fetch(base, {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer whatever" },
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
         body: "}{ not json",
       });
       expect(res.status).toBe(400);

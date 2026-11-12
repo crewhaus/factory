@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+#### Before you upgrade
+
+**Changes that can affect a harness without opting in.** No spec has to turn
+these on: they reach every harness that uses what each one names.
+
+- **A channel daemon's webhook handler reads at most a fixed number of bytes.**
+  A request whose body is larger is answered with 413 before its signature is
+  checked; the limit is 1 MiB, and `CHANNEL_WEBHOOK_MAX_BYTES` changes it.
+  Recompile a daemon to pick this up.
+
+- **A managed daemon's federation route reads at most a fixed number of bytes.**
+  With federation on, a `POST /federation` request whose body is larger is
+  answered with 413 before the peer is authorized; the limit is 1 MiB, and
+  `createGatewayServer`'s `federation.maxBodyBytes` changes it. Recompile a
+  daemon to pick this up.
+
 ## [0.8.1] - 2026-11-08
 
 Fixes and hardening for run input, the runtime-state floor, git tools,
