@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-registry-manifest",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Generated data-only manifest of every builtin tool — key, name, description, flags, categories and keywords — so a compiled bundle can describe a tool it was not given",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-docs",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic document tools: PDF text extraction, DOCX/XLSX/PPTX reading and writing, email and calendar parsing, and document conversion",
   "main": "src/index.ts",

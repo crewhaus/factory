@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/sandbox-image-z3",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Z3 SMT solver sandbox image: registry registration for the proven rung's smt checker",
   "main": "src/index.ts",

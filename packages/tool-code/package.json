@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-code",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic code intelligence tools: AST queries, formatters, linters, test runners, builds, dependency graphs and diagnostics",
   "main": "src/index.ts",

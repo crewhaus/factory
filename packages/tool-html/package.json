@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-html",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic HTML tools: CSS selection, table and link extraction, forms, structured data and readable text, over markup rather than a live browser",
   "main": "src/index.ts",
