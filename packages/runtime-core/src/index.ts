@@ -180,9 +180,11 @@ import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool, ToolExecuteModel } from "@crewhaus/tool-catalog";
 import {
   hasModelChosenDestination,
+  hasSelfCheckedOpening,
   legacyMcpToolName,
   stripJustificationField,
   withJustificationField,
+  withoutSelfCheckedOpenings,
 } from "@crewhaus/tool-catalog";
 import { LOOP_TOOL_NAMES, resolveToolConfigEnv } from "@crewhaus/tool-categories";
 import { executeTool, operativeValuesFor, preparePermissionSubject } from "@crewhaus/tool-executor";
@@ -4260,6 +4262,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    *    writes none of it. MovePath's `source` is not one: a move takes it
    *    away.
    *
+   *  - one opening declared `selfChecked` (RouteControl's freeze marker): the
+   *    tool holds that file against the floor's roots itself, on every call
+   *    that writes it, so a call that only reads it or writes the store's
+   *    other files is not refused for it. A deny or ask still reads it.
+   *
    * Every other operative value counts — a secret reference's file included
    * (SecretRotate's `ref` names the file it writes). `undefined` ⇒ the
    * call's operative values as they are (a tool with neither kind of field).
@@ -4286,8 +4293,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       arg.source === true ||
       arg.reads === true ||
       (arg.readsWhen !== undefined && named(arg.readsWhen));
-    if (args === undefined || !args.some(skipped)) return undefined;
-    const written = args.filter((arg) => !skipped(arg));
+    if (args === undefined || !args.some((arg) => skipped(arg) || hasSelfCheckedOpening(arg))) {
+      return undefined;
+    }
+    const written = args.filter((arg) => !skipped(arg)).map(withoutSelfCheckedOpenings);
     if (written.length === 0) return [];
     return (
       operativeValuesFor({ ...tool, operativeArgs: written }, parsedInput, {

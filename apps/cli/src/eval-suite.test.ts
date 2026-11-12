@@ -18,6 +18,7 @@ import {
   aggregateSuite,
   buildEntryEvalArgs,
   entryAggregatesFromResults,
+  entryObserving,
   evaluateEntryThresholds,
   parseSuiteManifest,
   parseTierFlag,
@@ -545,5 +546,86 @@ describe("suite.json is the machine-readable verdict", () => {
     expect(reloaded.passed).toBe(true);
     expect(reloaded.tier).toBe("nightly");
     expect(reloaded.entries[0].aggregates.passRate).toBe(1);
+  });
+});
+
+describe("entries that measured nothing, and entries that only observed", () => {
+  const base = {
+    suiteName: "s",
+    tier: "fast" as const,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    endedAt: "2026-01-01T00:05:00.000Z",
+    outDir: "/out",
+  };
+  const observedSample = { grades: { overall: { passed: false, status: "observing" } } };
+
+  test("a run that measured nothing fails its entry, saying so", () => {
+    const nothing = entryAggregatesFromResults({
+      aggregates: { passRate: 0, meanScore: 0, notMeasured: 2, measured: 0 },
+      samples: [{}, {}],
+    });
+    expect(nothing).toMatchObject({ measured: 0, notMeasured: 2 });
+    expect(evaluateEntryThresholds(nothing as EntryAggregates, undefined)).toEqual([
+      "nothing was measured — no case produced a verdict about the spec",
+    ]);
+    // Every case errored, on a run that recorded no `measured`.
+    const errored = entryAggregatesFromResults({
+      aggregates: { passRate: 0, meanScore: 0, errorCount: 2 },
+      samples: [{}, {}],
+    });
+    expect(errored?.measured).toBe(0);
+    // A clean run reads as it always did.
+    expect(
+      entryAggregatesFromResults({
+        aggregates: { passRate: 1, meanScore: 1, errorCount: 0 },
+        samples: [{}],
+      }),
+    ).toEqual({ passRate: 1, meanScore: 1, sampleCount: 1 });
+  });
+
+  test("an entry whose every sample only observed reads OBSERVING", () => {
+    const observing = entryAggregatesFromResults({
+      aggregates: { passRate: 0, meanScore: 0, measured: 0, observing: { watch: {} } },
+      samples: [observedSample, observedSample],
+    });
+    expect(entryObserving(observing)).toBe(true);
+    // One sample that did not only observe: not an observing entry.
+    const mixed = entryAggregatesFromResults({
+      aggregates: { passRate: 0, meanScore: 0, measured: 0, observing: { watch: {} } },
+      samples: [observedSample, { grades: { overall: { passed: false, status: "not_measured" } } }],
+    });
+    expect(entryObserving(mixed)).toBe(false);
+  });
+
+  test("an OBSERVING entry does not fail the tier and never prints PASS; a tier of them prints OBSERVING", () => {
+    const observing: SuiteEntryOutcome = {
+      name: "watching",
+      dataset: "d",
+      graders: "g",
+      outDir: "/out/watching",
+      passed: true,
+      failures: [],
+      aggregates: { passRate: 0, meanScore: 0, sampleCount: 2, measured: 0, observing: true },
+      errored: false,
+      state: "observing",
+    };
+    const passing: SuiteEntryOutcome = {
+      ...observing,
+      name: "smoke",
+      aggregates: { passRate: 1, meanScore: 1, sampleCount: 2 },
+    };
+    const { state: _none, ...passingEntry } = passing;
+    const onlyObserving = aggregateSuite({ ...base, entries: [observing] });
+    expect(onlyObserving.passed).toBe(true);
+    const text = renderSuiteSummary(onlyObserving);
+    expect(text).toContain("tier=fast: OBSERVING (0/1 entries passed, 1 observing)");
+    expect(text).toContain("  OBSERVING  watching");
+    expect(text).not.toContain("PASS");
+    const mixed = renderSuiteSummary(
+      aggregateSuite({ ...base, entries: [passingEntry, observing] }),
+    );
+    expect(mixed).toContain("tier=fast: PASS (1/2 entries passed, 1 observing)");
+    expect(mixed).toContain("  OBSERVING  watching");
+    expect(mixed).toContain("  PASS  smoke");
   });
 });

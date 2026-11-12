@@ -175,3 +175,59 @@ describe("pinRun", () => {
     expect(() => pinRun(entry(), "t", evalsDir)).toThrow(/not a JSON object/);
   });
 });
+
+describe("a pin over a different instrument records the re-anchor", () => {
+  test("a manual pin over another instrument is marked manual, naming the run it replaced", () => {
+    const evalsDir = newTempRoot();
+    expect(pinRun(entry({ runId: "run_a", gradersHash: "g1" }), "t1", evalsDir).ok).toBe(true);
+    const replaced = pinRun(entry({ runId: "run_b", gradersHash: "g2" }), "t2", evalsDir, {
+      cmd: "crewhaus eval-report baseline set",
+    });
+    expect(replaced.ok && replaced.pin.rebaselined).toEqual({
+      from: "run_a",
+      reason: "manual",
+      cmd: "crewhaus eval-report baseline set",
+    });
+    expect(readBaselines(evalsDir)["shop::smoke"]?.rebaselined?.from).toBe("run_a");
+  });
+
+  test("over the same instrument, or where a field is unverifiable, there is no mark", () => {
+    const evalsDir = newTempRoot();
+    pinRun(entry({ runId: "run_a", gradersHash: "g1" }), "t1", evalsDir);
+    const same = pinRun(entry({ runId: "run_b", gradersHash: "g1" }), "t2", evalsDir, { cmd: "x" });
+    expect(same.ok && same.pin.rebaselined).toBeUndefined();
+    // A calibration digest on one side of two rows cannot be told from an old row.
+    const oneSided = pinRun(
+      entry({ runId: "run_c", gradersHash: "g1", calibrationDigest: "c" }),
+      "t3",
+      evalsDir,
+      { cmd: "x" },
+    );
+    expect(oneSided.ok && oneSided.pin.rebaselined).toBeUndefined();
+  });
+
+  test("a caller's own re-anchor is recorded as given", () => {
+    const evalsDir = newTempRoot();
+    const pinned = pinRun(entry(), "t", evalsDir, {
+      rebaselined: { reason: "reset", cmd: "crewhaus eval --rebaseline" },
+    });
+    expect(pinned.ok && pinned.pin.rebaselined).toEqual({
+      reason: "reset",
+      cmd: "crewhaus eval --rebaseline",
+    });
+  });
+
+  test("the pin carries the run's calibration and plugin digests", () => {
+    const outcome = pinFromIndexEntry(
+      entry({ calibrationDigest: "c", pluginsDigest: "p", armsDigest: "a" }),
+      "t",
+    );
+    if (!outcome.ok) throw new Error("expected a pin");
+    expect(Object.keys(outcome.pin).slice(-4)).toEqual([
+      "armsDigest",
+      "calibrationDigest",
+      "pluginsDigest",
+      "ts",
+    ]);
+  });
+});

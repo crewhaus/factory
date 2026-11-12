@@ -351,6 +351,8 @@ export class DefaultGraderRegistry extends GraderRegistry {
   private readonly pluginNames = new Set<string>();
   /** Pack names that accept construction opts, with their strict schemas. */
   private readonly packFactories = new Map<string, PackOptsFactory>();
+  /** Each plugin-registered name → the entry file it was loaded from. */
+  private readonly pluginModules = new Map<string, string>();
   /** C35 — the judge-token sink this registry's judge-backed graders report
    *  to, shared by reference with every lazily-built classifier. */
   readonly judgeUsage: JudgeUsageHolder = {};
@@ -375,6 +377,16 @@ export class DefaultGraderRegistry extends GraderRegistry {
   /** @internal — construction wiring for `defaultGraderRegistry`. */
   markPluginNames(names: Iterable<string>): void {
     for (const n of names) this.pluginNames.add(n);
+  }
+
+  /** @internal — construction wiring for `defaultGraderRegistry`. */
+  markPluginModule(name: string, modulePath: string): void {
+    this.pluginModules.set(name, modulePath);
+  }
+
+  /** The `.crewhaus/graders` plugins this registry loaded, name → entry file. */
+  pluginSources(): ReadonlyMap<string, string> {
+    return new Map(this.pluginModules);
   }
 
   /**
@@ -561,7 +573,11 @@ export async function defaultGraderRegistry(
   );
 
   const pluginRoot = opts.pluginRoot ?? join(opts.cwd ?? process.cwd(), ".crewhaus", "graders");
-  registry.markPluginNames(await discoverPluginGraders(registry, pluginRoot));
+  registry.markPluginNames(
+    await discoverPluginGraders(registry, pluginRoot, (name, modulePath) =>
+      registry.markPluginModule(name, modulePath),
+    ),
+  );
 
   return registry;
 }

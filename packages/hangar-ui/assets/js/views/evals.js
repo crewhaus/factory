@@ -173,7 +173,7 @@ export const SAMPLE_FILTERS = [
   {
     id: "other",
     label: "no verdict",
-    verdicts: ["abstained", "canary", "unknown"],
+    verdicts: ["abstained", "not_measured", "skipped", "observing", "canary", "unknown"],
     none: "Every case in this run has a verdict.",
   },
 ];
@@ -465,6 +465,9 @@ export const VERDICT_FACES = {
   fail: { state: "bad", word: "fail" },
   error: { state: "bad", word: "error" },
   abstained: { state: "warn", word: "needs a person" },
+  not_measured: { state: "unknown", word: "not measured" },
+  skipped: { state: "off", word: "skipped" },
+  observing: { state: "off", word: "observing" },
   canary: { state: "off", word: "canary" },
   unknown: { state: "unknown", word: "no result" },
 };

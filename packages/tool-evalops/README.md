@@ -18,19 +18,22 @@ needs a model turn, a provider key or a network.
 `@crewhaus/eval-report`'s `buildTrends` groups runs by baseline lineage —
 (spec, dataset) and, since 0.6.0, the arm. That grouping is right and this
 package reuses it. It is not an identity, though: the dataset bytes, the
-graders config, the judge model and the arm snapshot are recorded **on the
-run** and can change from one run of a lineage to the next. `crewhaus eval`
-knows this and refuses to gate across such a change. Nothing carried that
-knowledge into the fold that draws the line.
+graders config, the judge model, the judge calibration, the plugin graders
+and the arm snapshot are recorded **on the run** and can change from one run
+of a lineage to the next.
 
 So `EvalHistory` segments each lineage and gives every segment its own
-first-to-last delta, in percentage **points**.
+first-to-last delta, in percentage **points**. The segmentation is
+`@crewhaus/eval-report`'s `segmentSeries`, the same one `eval-report trends`
+and Home draw with.
 
 | field | both present and different | present on one side only |
 |---|---|---|
 | `datasetHash` | cut | unverified (a current CLI always writes it, including when absent from both) |
 | `gradersHash` | cut | unverified (same) |
 | `judgeModel` | cut | unverified — but absent on **both** means "neither run pinned a judge", which is a fact, not a gap |
+| `calibrationDigest` | cut | unverified (a row cannot tell an old run from an uncalibrated one) |
+| `pluginsDigest` | cut | unverified (same) |
 | `armsDigest` | cut | unverified on a routed lineage; absent on an unrouted one is a statement |
 | `policyVersion` | cut | as `armsDigest` |
 | `specHash` | note only | note only |

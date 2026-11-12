@@ -3261,6 +3261,14 @@
           "takesValue": true
         },
         {
+          "name": "rebaseline",
+          "takesValue": false
+        },
+        {
+          "name": "reason",
+          "takesValue": true
+        },
+        {
           "name": "help",
           "short": "h",
           "takesValue": false

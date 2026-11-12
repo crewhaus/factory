@@ -155,6 +155,29 @@ test("rows a current CLI wrote read as verified; rows that predate the columns d
   expect(ancient.segments[0]?.unverifiedJoins[0]?.missingOn).toBe("both");
 });
 
+test("a judge calibration change and a plugin grader change each cut the line", () => {
+  for (const field of ["calibrationDigest", "pluginsDigest"] as const) {
+    const { segments, boundaries } = segment([
+      row({ runId: "r1", ts: "2026-01-01T00:00:00Z", [field]: "one" }),
+      row({ runId: "r2", ts: "2026-01-02T00:00:00Z", [field]: "two" }),
+    ]);
+    expect({ field, segments: segments.length }).toEqual({ field, segments: 2 });
+    expect(boundaries[0]?.changed[0]).toMatchObject({ field, from: "one", to: "two" });
+  }
+});
+
+test("a calibration or plugin digest on one side only is unverified, never a cut", () => {
+  for (const field of ["calibrationDigest", "pluginsDigest"] as const) {
+    const { segments, boundaries } = segment([
+      row({ runId: "r1", ts: "2026-01-01T00:00:00Z" }),
+      row({ runId: "r2", ts: "2026-01-02T00:00:00Z", [field]: "one" }),
+    ]);
+    expect({ field, segments: segments.length }).toEqual({ field, segments: 1 });
+    expect(boundaries[0]).toMatchObject({ kind: "unverified" });
+    expect(boundaries[0]?.unverified[0]).toMatchObject({ field, missingOn: "earlier" });
+  }
+});
+
 test("a routed lineage cuts on an arm-snapshot change", () => {
   const routed = (runId: string, ts: string, armsDigest: string): Row =>
     row({ runId, ts, armId: "fast", routing: "candidate:fast", armsDigest, policyVersion: "p1" });

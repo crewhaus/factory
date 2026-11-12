@@ -52,6 +52,10 @@ const GATE_RECORDS = [
   "advice",
   "cloud",
   "knowledge.json",
+  "proposals",
+  join("routing", "freeze.json"),
+  join("scope-audit", "baseline.json"),
+  join("security-corpus", "corpus.json"),
 ].map((name) => join(".crewhaus", name));
 /** The idempotency store's default directory, always a root. */
 const IDEMPOTENCY = [join(".crewhaus", "idempotency")];
@@ -1285,6 +1289,35 @@ describe("the knowledge-sync marker and the idempotency store", () => {
         value,
         roots: runtimeStateRoots(undefined, undefined, cwd, { CREWHAUS_IDEMPOTENCY_STORE: value }),
       }).toEqual({ value, roots: base });
+    }
+  });
+});
+
+describe("the proposals, the routing freeze marker, the scope-audit baseline and the security corpus", () => {
+  test("names the proposals directory, and each of the three files exactly", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    const held = (rel: string): string | undefined => protectedRootHolding(rel, roots, cwd);
+    expect(held(join(".crewhaus", "proposals", "p-1.json"))).toBeDefined();
+    for (const rel of [
+      join(".crewhaus", "routing", "freeze.json"),
+      join(".crewhaus", "scope-audit", "baseline.json"),
+      join(".crewhaus", "security-corpus", "corpus.json"),
+    ]) {
+      expect({ rel, root: roots.includes(rel) && roots.includes(join(cwd, rel)) }).toEqual({
+        rel,
+        root: true,
+      });
+    }
+    // Their neighbours are other files.
+    for (const rel of [
+      join(".crewhaus", "routing", "arms.jsonl"),
+      join(".crewhaus", "routing", "freeze.json.bak"),
+      join(".crewhaus", "scope-audit", "2026-01-01.json"),
+      join(".crewhaus", "security-corpus", "candidate-rules.json"),
+      join(".crewhaus", "proposals.md"),
+    ]) {
+      expect({ rel, held: held(rel) }).toEqual({ rel, held: undefined });
     }
   });
 });

@@ -2,7 +2,15 @@ import { detectCalibrationAggregates } from "./calibration-abstention";
 import { detectParaphraseConsistency } from "./paraphrase-consistency";
 import { mergeServedModels } from "./routing";
 import { detectSemanticFallback } from "./semantic-fallback";
-import { sampleAbstained, sampleIsCanary, sampleNeedsReview } from "./slices";
+import {
+  sampleAbstained,
+  sampleIsCanary,
+  sampleNeedsReview,
+  sampleNotMeasured,
+  sampleObserving,
+  sampleSkipped,
+  sampleWithoutVerdict,
+} from "./slices";
 import { meanCI95, wilsonCI95 } from "./stats";
 import type { EvalAggregates, SafetyViolationCounts, SampleResult } from "./types";
 
@@ -98,6 +106,17 @@ const ZERO_SAFETY: SafetyViolationCounts = {
  * (detected via the pack's stable rationale prefix, canonical grades only —
  * consistent with every other aggregate).
  *
+ * Result-state honesty: a sample that was not measured, skipped or only
+ * observed (`grades.overall.status`) has no verdict about the spec, so like an
+ * abstained one it leaves the `passRate` denominator, `meanScore` and both
+ * CIs, and is listed in `notMeasured`/`skipped` with its id. `observing`
+ * counts, per grader, every observing entry and how many would have failed,
+ * whatever the sample's overall state. `measured` is the samples with a
+ * verdict (not errored, abstained, canary, not measured, skipped or
+ * observing), present only beside one of those three blocks. Canary wins over
+ * all three, as it does over abstained. A run with none of them is
+ * byte-identical.
+ *
  * Cross-sample post-run seam (evals Wave 2, cluster C): `aggregate()` is
  * THE additive hook for measurements that only exist ACROSS samples — it
  * runs once over every canonical SampleResult after the run (`runEval` and
@@ -128,10 +147,26 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
   // turns/latency/token measurements are real. `scored` (non-errored,
   // graded) feeds the verdict-derived figures: passRate, meanScore, and
   // both CIs.
+  // Result states: no verdict about the spec, so out of the denominator.
+  const notMeasuredIds = samples
+    .filter((s) => sampleNotMeasured(s) && !sampleIsCanary(s))
+    .map((s) => s.sampleId);
+  const skippedIds = samples
+    .filter((s) => sampleSkipped(s) && !sampleIsCanary(s))
+    .map((s) => s.sampleId);
+  const observingSamples = samples.filter((s) => sampleObserving(s) && !sampleIsCanary(s));
   const ok = samples.filter((s) => s.error === undefined);
-  const scored = ok.filter((s) => !sampleAbstained(s) && !sampleIsCanary(s));
+  const scored = ok.filter(
+    (s) => !sampleAbstained(s) && !sampleIsCanary(s) && !sampleWithoutVerdict(s),
+  );
   const total = samples.length;
-  const gradedTotal = total - abstainedIds.length - canaryIds.length;
+  const gradedTotal =
+    total -
+    abstainedIds.length -
+    canaryIds.length -
+    notMeasuredIds.length -
+    skippedIds.length -
+    observingSamples.length;
   const passed = scored.filter((s) => s.grades.overall.passed).length;
   const scoredScores = scored.map((s) => s.grades.overall.score);
   const meanScore =
@@ -202,6 +237,42 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
       { input: 0, output: 0 },
     );
   }
+
+  // Observing graders: what each would have decided, from every observing
+  // entry whatever the sample's overall state.
+  const observingByGrader = new Map<string, { graded: number; wouldFailSampleIds: string[] }>();
+  for (const s of samples) {
+    if (sampleIsCanary(s)) continue;
+    for (const g of s.grades.perGrader) {
+      if (g.status !== "observing") continue;
+      const acc = observingByGrader.get(g.name) ?? { graded: 0, wouldFailSampleIds: [] };
+      acc.graded += 1;
+      if (!g.passed) acc.wouldFailSampleIds.push(s.sampleId);
+      observingByGrader.set(g.name, acc);
+    }
+  }
+  const observing: Record<
+    string,
+    { graded: number; wouldFail: number; wouldFailSampleIds: string[] }
+  > = {};
+  for (const name of [...observingByGrader.keys()].sort()) {
+    const acc = observingByGrader.get(name) as { graded: number; wouldFailSampleIds: string[] };
+    observing[name] = {
+      graded: acc.graded,
+      wouldFail: acc.wouldFailSampleIds.length,
+      wouldFailSampleIds: acc.wouldFailSampleIds,
+    };
+  }
+  const hasStates =
+    notMeasuredIds.length > 0 || skippedIds.length > 0 || Object.keys(observing).length > 0;
+  const measured = samples.filter(
+    (s) =>
+      s.error === undefined &&
+      s.graderError === undefined &&
+      !sampleAbstained(s) &&
+      !sampleIsCanary(s) &&
+      !sampleWithoutVerdict(s),
+  ).length;
 
   // A12 — per-criterion means per grader, over the grades that carried a
   // `detail` breakdown (judge-backed graders on non-abstained verdicts).
@@ -282,6 +353,12 @@ export function aggregate(samples: ReadonlyArray<SampleResult>): EvalAggregates 
       ? { needsReview: needsReviewIds.length, needsReviewSampleIds: needsReviewIds }
       : {}),
     ...(canaryIds.length > 0 ? { canary: canaryIds.length, canarySampleIds: canaryIds } : {}),
+    ...(notMeasuredIds.length > 0
+      ? { notMeasured: notMeasuredIds.length, notMeasuredSampleIds: notMeasuredIds }
+      : {}),
+    ...(skippedIds.length > 0 ? { skipped: skippedIds.length, skippedSampleIds: skippedIds } : {}),
+    ...(Object.keys(observing).length > 0 ? { observing } : {}),
+    ...(hasStates ? { measured } : {}),
     ...(flakySampleIds.length > 0
       ? { flaky: flakySampleIds.length, flakySampleIds: flakySampleIds }
       : {}),

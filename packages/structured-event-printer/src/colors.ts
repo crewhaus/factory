@@ -70,6 +70,7 @@ const PALETTE: Record<TraceEventKind, string> = {
   // Loop contract 0.4 (Batch B, G62) — in-loop evaluation verdicts sit
   // beside test_verdict in the green verdict family.
   eval_graded: "\x1b[32m", // green
+  eval_unmeasured: "\x1b[33m", // yellow — a turn stood ungraded
   judge_verdict: "\x1b[32m", // green
   provability_graded: "\x1b[32m", // green
   proof_checked: "\x1b[32m", // green

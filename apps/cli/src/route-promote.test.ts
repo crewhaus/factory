@@ -192,6 +192,48 @@ describe("resolveRoutePromotionGate — every way a promotion is refused", () =>
     expect(g.reason).toContain("FAILED its baseline gate");
   });
 
+  test("a candidate that stops measuring a case the baseline measured is refused, naming it", async () => {
+    const graded = (sampleId: string, notMeasured: boolean) => {
+      const grade = {
+        score: 0,
+        passed: false,
+        rationale: "no proof bundle",
+        ...(notMeasured ? { status: "not_measured", statusReason: "no_proof_bundle" } : {}),
+      };
+      return notMeasured
+        ? { sampleId, latencyMs: 10, grades: { overall: grade, perGrader: [grade] } }
+        : {
+            sampleId,
+            latencyMs: 10,
+            grades: {
+              overall: { score: 1, passed: true, rationale: "ok" },
+              perGrader: [{ name: "exact", score: 1, passed: true, rationale: "ok" }],
+            },
+          };
+    };
+    const twoCases = (runId: string, s2NotMeasured: boolean) => {
+      const base = summary(runId, true) as unknown as Record<string, unknown>;
+      return {
+        ...base,
+        // The runner's pass rate leaves a case without a verdict out: 1/1 either way.
+        samples: [graded("s1", false), graded("s2", s2NotMeasured)],
+      } as unknown as EvalRunSummary;
+    };
+    const g = await gateWith({
+      ...PASSING,
+      runs: { "/runs/new": twoCases("run_new", true), "/runs/base": twoCases("run_base", false) },
+    });
+    expect(g.passed).toBe(false);
+    expect(g.reason).toContain("FAILED its baseline gate");
+    expect(g.reason).toContain("cases the baseline measured were not measured: s2");
+    // Control: the same two runs, both measuring s2, authorize.
+    const ok = await gateWith({
+      ...PASSING,
+      runs: { "/runs/new": twoCases("run_new", false), "/runs/base": twoCases("run_base", false) },
+    });
+    expect(ok.passed).toBe(true);
+  });
+
   test("two runs off DIFFERENT arm snapshots are two instruments — refused by the digest guard", async () => {
     const g = await gateWith({
       ...PASSING,

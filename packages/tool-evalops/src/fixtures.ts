@@ -41,6 +41,9 @@ export type Row = {
   routing?: string;
   policyVersion?: string;
   armsDigest?: string;
+  calibrationDigest?: string;
+  pluginsDigest?: string;
+  measuredCount?: number;
   ts: string;
   outDir: string;
 };

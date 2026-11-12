@@ -49,7 +49,7 @@ import type {
   RegressionGate,
 } from "@crewhaus/canary-controller";
 import type { EvalRunSummary } from "@crewhaus/eval-runner";
-import { sampleAbstained, sampleIsCanary } from "@crewhaus/eval-runner";
+import { sampleAbstained, sampleIsCanary, sampleWithoutVerdict } from "@crewhaus/eval-runner";
 import { type GateThresholds, gate } from "@crewhaus/regression-runner";
 
 /** Parse a `--traffic 5,25,50,100` list into validated, ordered steps. */
@@ -138,7 +138,8 @@ export function makeCanaryEvalGate(opts: {
  * not a verdict — so projecting it as a `failure` would bias this version's
  * success rate below the pass rate of the very run it was built from, which
  * is precisely the "count a guess" behaviour A3 exists to forbid. A canary
- * tripwire is never a measurement of the spec at all.
+ * tripwire is never a measurement of the spec at all, and a sample that was
+ * not measured, skipped or only observed has no verdict to project either.
  */
 export function experimentOutcomesFromEvalRun(args: {
   readonly experiment: string;
@@ -148,7 +149,7 @@ export function experimentOutcomesFromEvalRun(args: {
   readonly ts: string;
 }): ExperimentOutcomeRecord[] {
   return args.summary.samples
-    .filter((s) => !sampleAbstained(s) && !sampleIsCanary(s))
+    .filter((s) => !sampleAbstained(s) && !sampleIsCanary(s) && !sampleWithoutVerdict(s))
     .map((s) => ({
       ts: args.ts,
       experiment: args.experiment,
@@ -397,7 +398,7 @@ export function routingProfileOf(
   let decisions = 0;
   let floorBlocked = 0;
   for (const sample of summary.samples) {
-    if (sampleAbstained(sample) || sampleIsCanary(sample)) continue;
+    if (sampleAbstained(sample) || sampleIsCanary(sample) || sampleWithoutVerdict(sample)) continue;
     graded += 1;
     turns += sample.turns;
     const served = sample.servedModels ?? [];
