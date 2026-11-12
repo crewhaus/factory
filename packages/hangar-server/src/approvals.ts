@@ -83,7 +83,9 @@ export type ApprovalsView = {
   readonly truncatedHarnesses: readonly string[];
 };
 
-function statusOf(a: PendingApproval): ApprovalRow["status"] {
+/** One request's state, the inbox's own rule: only `"pending"` waits on a person.
+ *  Exported for the command menu, which indexes what is pending by it. */
+export function statusOf(a: PendingApproval): ApprovalRow["status"] {
   // A replaced request is settled whatever it said before; first, as
   // `effectiveDecisionState` puts it.
   if (a.supersededBy !== undefined) return "superseded";

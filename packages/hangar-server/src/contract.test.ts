@@ -513,6 +513,8 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["entries[].subtitle", "string"],
     ["entries[].href", "string"],
     ["entries[].harnessId", "string|null"],
+    ["entries[].source", "string"],
+    ["entries[].indexedAt", "string"],
   ],
   // views/settings.js notificationCard + app.js nav badge
   notifications: [
