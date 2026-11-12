@@ -2023,6 +2023,10 @@ dialog.sheet {
 .note {
   font-size: 0.75rem;
 }
+/* A long route path wraps on a narrow screen rather than widening the page. */
+.exempt-list {
+  overflow-wrap: anywhere;
+}
 .rules-table td,
 .rules-table th {
   vertical-align: middle;
