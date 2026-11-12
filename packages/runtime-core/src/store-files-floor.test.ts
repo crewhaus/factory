@@ -1,9 +1,10 @@
 /**
  * The continuity store's own files on the floor (`continuity.storeFiles` →
  * `EvaluateOptions.protectedFiles`): under `alwaysAllow *`, a `Write` to
- * `.crewhaus/state/<spec>/focus.md` is refused, while the plan tools that own
- * the store write it, and `StateImport` over the whole of `.crewhaus/state`
- * keeps working for the store's neighbours. An entry that lands on one of the
+ * `.crewhaus/state/<spec>/focus.md` is refused, and so is a tool that fills
+ * the store's directory without checking its own targets, while the plan
+ * tools that own the store write it, and `StateImport` over the whole of
+ * `.crewhaus/state` keeps working for the store's neighbours. An entry that lands on one of the
  * store's files is refused by StateImport's own per-entry check.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -113,6 +114,18 @@ describe("the continuity store's files on the floor", () => {
         return "written";
       },
     });
+    // GitWorktreeAdd's shape: a directory it fills, with no check of its own.
+    const worktreeAdd = buildTool({
+      name: "GitWorktreeAdd",
+      description: "check a branch out into a directory",
+      inputSchema: z.object({ path: z.string() }),
+      operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
+      destructive: true,
+      execute: async (input) => {
+        written.push(input.path);
+        return "added";
+      },
+    });
     const runContext = createRunContext();
     const decisions: Array<{ toolName: string; decision: string }> = [];
     const results: Record<string, string> = {};
@@ -141,6 +154,12 @@ describe("the continuity store's files on the floor", () => {
           name: "Write",
           input: { path: ".crewhaus/state/bot/focus.md", content: "- REQ-900 [open] forged" },
         },
+        {
+          type: "tool_use",
+          id: "toolu_wt",
+          name: "GitWorktreeAdd",
+          input: { path: ".crewhaus/state/bot" },
+        },
         { type: "tool_use", id: "toolu_f", name: "FocusWrite", input: { focus: "ship the fix" } },
         {
           type: "tool_use",
@@ -165,7 +184,7 @@ describe("the continuity store's files on the floor", () => {
         sessionRootDir: SESSION_ROOT,
         singleTurn: true,
         seedMessages: [{ role: "user", content: "go" }],
-        tools: [write, ...plan.all, stateImport],
+        tools: [write, worktreeAdd, ...plan.all, stateImport],
         permissionMode: "auto",
         permissionRules: {
           ...emptyRuleSet,
@@ -190,6 +209,11 @@ describe("the continuity store's files on the floor", () => {
       expect(decisions.find((d) => d.toolName === "Write")?.decision).toBe("deny");
       expect(written).toEqual([]);
       expect(results["toolu_w"]).toContain("names a file a store keeps for itself");
+      // A tool that fills the store's directory and checks nothing itself is refused.
+      expect(decisions.find((d) => d.toolName === "GitWorktreeAdd")?.decision).toBe("deny");
+      expect(results["toolu_wt"]).toContain(
+        "acts on everything beneath `.crewhaus/state/bot`, which holds a file a store keeps for itself",
+      );
       // The plan tools own the store: none is refused (FocusWrite and PlanUpdate
       // are bookkeeping tools a rule allows without a decision event).
       for (const id of ["toolu_f", "toolu_p", "toolu_c"]) {

@@ -923,9 +923,12 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
         const why = goalUpdateRefusal(input.goalId, input, next, proofChanged);
         if (why !== null) throw new ProofRequiredError(why);
       };
-      // Under require, each frozen proof the goal already carries is read
-      // again from its session log before it can carry the goal to its
-      // target; proofs this call cites are verified by the store itself.
+      // Under require, the frozen proofs the goal already carries are read
+      // again from their session logs before they can carry the goal to its
+      // target; proofs this call cites are verified by the store itself. One
+      // proof that holds is enough (as the store's `recheckProofs` reads it),
+      // so a goal proven again in this call reaches its target even when an
+      // older proof on it no longer matches.
       const rechecked = new Set<string>();
       const verifiedNow = new Set(
         input.status === "proven" ? (evidence ?? []).map((r) => r.toolUseId) : [],
@@ -937,11 +940,10 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
         // lock, so two sessions cannot each pass on a stale read. An unknown
         // id falls through to the store's own "no goal" error.
         const existing = (await store.listGoals()).find((g) => g.id === input.goalId);
-        let snapshotChanged = false;
         for (const proof of existing?.proofs ?? []) {
           if ((await store.recheckProofs({ proofs: [proof] })).ok) rechecked.add(proofKey(proof));
-          else snapshotChanged = true;
         }
+        const snapshotChanged = (existing?.proofs ?? []).length > 0 && rechecked.size === 0;
         // A call that sets `proven` resolves its evidence (require is the
         // ladder there), so it lands verified — with a frozen proof,
         // replacing any assertion — or not at all; the snapshot has nothing
@@ -960,12 +962,15 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
           );
         }
       }
-      // Inside the lock: a proof on the record that was neither read again
-      // above nor verified in this call (another writer's, landed since the
-      // snapshot) fails closed.
+      // Inside the lock: the record holds only when one of its proofs was
+      // read again above or verified in this call. A proof neither read nor
+      // verified here (another writer's, landed since the snapshot) counts
+      // for nothing, so a record carrying only such proofs fails closed. The
+      // store replaces a proof cited again under the same toolUseId with the
+      // one it just verified, so a cited id names a verified proof.
       const proofChangedOn = (next: Goal): boolean =>
-        (next.proofs ?? []).some(
-          (p) => !rechecked.has(proofKey(p)) && !verifiedNow.has(p.toolUseId),
+        !(next.proofs ?? []).some(
+          (p) => rechecked.has(proofKey(p)) || verifiedNow.has(p.toolUseId),
         );
       const patch: UpdateGoalInput = {
         ...(input.title !== undefined ? { title: input.title } : {}),

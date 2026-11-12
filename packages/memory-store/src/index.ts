@@ -55,8 +55,12 @@
  * file is replaced, and `history()` reads them back, oldest first.
  *
  * Every write takes one lock, `<rootDir>/.<spec>.lock`, so a compaction
- * never loses a fact remembered while it ran. The dot-name and the
- * `archive/` directory are invisible to readers that list `*.jsonl`.
+ * never loses a fact remembered while it ran. A compaction holds it only to
+ * re-read the file, copy what was appended since its snapshot and rename the
+ * replacement: it archives the dropped lines before, under the archive's own
+ * `archive/<spec>/.lock`, so a fact write never waits on the archive. The
+ * dot-names and the `archive/` directory are invisible to readers that list
+ * `*.jsonl`.
  *
  * ## Hybrid recall (design §3.4)
  *
@@ -317,8 +321,9 @@ export interface MemoryStore {
   /** Every line compaction archived, oldest first, a line archived twice read once. */
   history(): Promise<readonly MemoryArchivedLine[]>;
   /**
-   * Append each given entry whose id is not already in the file (live or dead),
-   * in one write. Returns the ids it added. The knowledge sync's pull uses it.
+   * Append each given entry whose id is not already in the store (live, dead,
+   * or archived by a compaction, as an entry or a tombstone's target), in one
+   * write. Returns the ids it added. The knowledge sync's pull uses it.
    */
   importSynced(entries: ReadonlyArray<MemoryEntry>): Promise<readonly string[]>;
   /** Every entry in file order with its materialized lifecycle status. */
@@ -372,9 +377,11 @@ export class MemoryNotFoundError extends MemoryStoreError {
 
 /** Test seams for `compact()`: run code between its steps to force an interleaving. */
 export type CompactSeams = {
-  /** After the snapshot is read, before the lock is taken. */
+  /** After the snapshot is read, before anything is archived or locked. */
   readonly afterSnapshot?: () => void | Promise<void>;
-  /** Under the lock, after the archive append, before the last re-stat. */
+  /** After each archived line, holding the archive lock and NOT the fact lock. */
+  readonly afterArchiveLine?: () => void | Promise<void>;
+  /** Under the fact lock, after the first tail copy, before the last re-stat. */
   readonly beforeFinalStat?: () => void | Promise<void>;
 };
 
@@ -495,6 +502,59 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
   };
 
   /**
+   * The archive's own lock, `archive/<spec>/.lock`: a compaction appends the
+   * lines it drops under it, never under the fact lock, so a fact write
+   * never waits on the archive. Two compactions' appends still never
+   * interleave, and the locked append seals a torn final line.
+   */
+  const archiveLedger: Ledger = {
+    root: resolve(rootDir),
+    lock: join(archiveDir, ".lock"),
+    records: { dir: archiveDir },
+    claims: join(archiveDir, ".claims"),
+  };
+
+  /** Lines archived between yields to the event loop, so a long archive does not stall it. */
+  const ARCHIVE_YIELD_EVERY = 256;
+
+  /**
+   * Append `lines` to the archive under the archive lock (see
+   * {@link archiveLedger}). A refusal throws, and the caller then leaves the
+   * live file as it was.
+   */
+  async function archiveLines(lines: ReadonlyArray<string>, archivedAt: string): Promise<void> {
+    let answer: { readonly done: true } | { readonly ok: false; readonly reason: string };
+    try {
+      answer = await withLedgerLock(archiveLedger, async (lockedAppend) => {
+        for (let i = 0; i < lines.length; i++) {
+          if (i > 0 && i % ARCHIVE_YIELD_EVERY === 0) {
+            await new Promise<void>((done) => setImmediate(done));
+          }
+          const appended = lockedAppend(archiveRecord(lines[i] as string, archivedAt));
+          if (!appended.ok) {
+            throw new MemoryStoreError(
+              `refusing to archive ${fileName} lines in ${rootDir}: ${appended.reason}; the live file was not changed`,
+            );
+          }
+          await compactSeams.afterArchiveLine?.();
+        }
+        return { done: true as const };
+      });
+    } catch (err) {
+      if (err instanceof MemoryStoreError) throw err;
+      throw new MemoryStoreError(
+        `could not lock the archive of ${fileName} in ${rootDir} (${archiveLedger.lock}): ${(err as Error).message}; the live file was not changed`,
+        err,
+      );
+    }
+    if (!("done" in answer)) {
+      throw new MemoryStoreError(
+        `could not lock the archive of ${fileName} in ${rootDir} (${archiveLedger.lock}): ${answer.reason}; the live file was not changed`,
+      );
+    }
+  }
+
+  /**
    * Run `fn` holding `<rootDir>/.<spec>.lock`. A lock that cannot be taken
    * (file-lock's error names the holder pid) and a refused lock directory
    * both become a `MemoryStoreError` naming the file; an error `fn` throws
@@ -553,6 +613,55 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
 
   async function loadAll(): Promise<Loaded> {
     return loadLines(await readLines());
+  }
+
+  /** The archive, oldest segment first, a doubled line once (see `history()`). */
+  async function readHistory(): Promise<readonly MemoryArchivedLine[]> {
+    let names: string[];
+    try {
+      names = readdirSync(join(rootDir, archiveDir), { withFileTypes: true })
+        .filter((e) => e.isFile() && ARCHIVE_SEGMENT_RE.test(e.name))
+        .map((e) => e.name)
+        .sort();
+    } catch {
+      return []; // no archive yet
+    }
+    const out: MemoryArchivedLine[] = [];
+    const seen = new Set<string>();
+    for (const name of names) {
+      const rel = join(archiveDir, name);
+      const read = await openForRead(rootDir, rel, {
+        maxBytes: MEMORY_FILE_MAX_BYTES,
+        followLeafSymlink: false,
+      });
+      if (!read.ok) {
+        if (read.code === "not-found") continue;
+        throw new MemoryStoreError(`refusing to read ${rel} in ${rootDir}: ${read.reason}`);
+      }
+      if (read.truncated) {
+        throw new MemoryStoreError(
+          `${rel} in ${rootDir} is larger than ${MEMORY_FILE_MAX_BYTES} bytes, so it was not read`,
+        );
+      }
+      for (const text of read.text.split("\n")) {
+        if (text.trim() === "") continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          continue; // a torn archive line: the locked append seals it, skip it
+        }
+        if (!isArchivedLine(parsed)) continue;
+        // A crash between the archive append and the rename archives a
+        // line twice; it is one line of history.
+        const key =
+          parsed.line !== undefined ? `l:${canonicalJson(parsed.line)}` : `r:${parsed.raw}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(parsed);
+      }
+    }
+    return out;
   }
 
   /** Fold tombstones, TTL and annotations over the raw entries into status-carrying items. */
@@ -937,23 +1046,46 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
     },
 
     async compact(): Promise<CompactResult> {
-      // 1. Outside the lock: the snapshot, up to its last whole line. A
-      //    fragment past it is re-read under the lock with the rest of the tail.
+      // 1. Outside the lock: the snapshot, up to its last whole line, split
+      //    into what stays and what goes. A fragment past it is re-read under
+      //    the lock with the rest of the tail.
       const snap = readFrom(0);
       if (snap === undefined || snap.size === 0) return { kept: 0, dropped: 0, archived: 0 };
       await compactSeams.afterSnapshot?.();
-      return withStoreLock(async (lockedAppend) => {
-        // 2. Under the lock: the same file, grown or not. A file another
-        //    compaction replaced since the snapshot is read again, whole.
+      const snapEnd = snap.bytes.lastIndexOf(0x0a) + 1;
+      const snapLines = splitLines(snap.bytes.subarray(0, snapEnd));
+      const planned = { lines: snapLines, ...splitKeptDropped(snapLines, now().getTime()) };
+      // 2. Still outside the fact lock: every line about to be dropped goes to
+      //    the archive first. Those lines are dead and stay dead (a tombstone
+      //    is final), so nothing a writer appends meanwhile can revive one; a
+      //    crash before the rename archives a line twice, and `history()`
+      //    reads it once.
+      if (planned.dropped.length > 0) {
+        await archiveLines(planned.dropped, now().toISOString());
+      }
+      const archived = new Set(planned.dropped);
+      // 3. Under the lock, only the re-read, the tail copy and the rename.
+      return withStoreLock(async () => {
+        // The same file, grown or not. A file another compaction replaced
+        // since the snapshot is read again, whole.
         const current = readFrom(0);
-        if (current === undefined) return { kept: 0, dropped: 0, archived: 0 };
-        const outside = snap as Snapshot;
-        const base = current.dev !== outside.dev || current.ino !== outside.ino ? current : outside;
-        const noted = base.bytes.lastIndexOf(0x0a) + 1;
-        const { kept, dropped } = splitKeptDropped(
-          splitLines(base.bytes.subarray(0, noted)),
-          now().getTime(),
-        );
+        if (current === undefined) return { kept: 0, dropped: 0, archived: archived.size };
+        const replaced = current.dev !== snap.dev || current.ino !== snap.ino;
+        const base = replaced ? current : snap;
+        const noted = replaced ? base.bytes.lastIndexOf(0x0a) + 1 : snapEnd;
+        // A line drops only when it is in the archive already; one that died
+        // since the snapshot (or that a replaced file holds) stays for the
+        // next compaction.
+        const baseLines = replaced ? splitLines(base.bytes.subarray(0, noted)) : planned.lines;
+        const dying = replaced
+          ? new Set(splitKeptDropped(baseLines, now().getTime()).dropped)
+          : archived;
+        const kept: string[] = [];
+        let dropped = 0;
+        for (const line of baseLines) {
+          if (dying.has(line) && archived.has(line)) dropped += 1;
+          else kept.push(line);
+        }
         let position = noted;
         const tail: string[] = [];
         const copyTail = (): void => {
@@ -963,21 +1095,11 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
           position = more.size;
         };
         copyTail();
-        // 3. Every dropped line to the archive, before the live file loses it.
-        const archivedAt = now().toISOString();
-        for (const line of dropped) {
-          const appended = lockedAppend(archiveRecord(line, archivedAt));
-          if (!appended.ok) {
-            throw new MemoryStoreError(
-              `refusing to archive ${fileName} lines in ${rootDir}: ${appended.reason}; the live file was not changed`,
-            );
-          }
-        }
-        // 4. Once more: a writer that went round a stolen lock appended here.
+        // Once more: a writer that went round a stolen lock appended here.
         await compactSeams.beforeFinalStat?.();
         copyTail();
-        // 5. A random O_EXCL temp beside the file, renamed into place: the
-        //    replaced file keeps its permission bits.
+        // A random O_EXCL temp beside the file, renamed into place: the
+        // replaced file keeps its permission bits.
         const lines = [...kept, ...tail];
         const written = writeFileSafe(
           rootDir,
@@ -987,7 +1109,7 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
         );
         if (!written.ok) throw refused("rewrite", written.reason);
         embeddingCache.clear();
-        return { kept: lines.length, dropped: dropped.length, archived: dropped.length };
+        return { kept: lines.length, dropped, archived: planned.dropped.length };
       });
     },
 
@@ -1075,51 +1197,7 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
     },
 
     async history(): Promise<readonly MemoryArchivedLine[]> {
-      let names: string[];
-      try {
-        names = readdirSync(join(rootDir, archiveDir), { withFileTypes: true })
-          .filter((e) => e.isFile() && ARCHIVE_SEGMENT_RE.test(e.name))
-          .map((e) => e.name)
-          .sort();
-      } catch {
-        return []; // no archive yet
-      }
-      const out: MemoryArchivedLine[] = [];
-      const seen = new Set<string>();
-      for (const name of names) {
-        const rel = join(archiveDir, name);
-        const read = await openForRead(rootDir, rel, {
-          maxBytes: MEMORY_FILE_MAX_BYTES,
-          followLeafSymlink: false,
-        });
-        if (!read.ok) {
-          if (read.code === "not-found") continue;
-          throw new MemoryStoreError(`refusing to read ${rel} in ${rootDir}: ${read.reason}`);
-        }
-        if (read.truncated) {
-          throw new MemoryStoreError(
-            `${rel} in ${rootDir} is larger than ${MEMORY_FILE_MAX_BYTES} bytes, so it was not read`,
-          );
-        }
-        for (const text of read.text.split("\n")) {
-          if (text.trim() === "") continue;
-          let parsed: unknown;
-          try {
-            parsed = JSON.parse(text);
-          } catch {
-            continue; // a torn archive line: the locked append seals it, skip it
-          }
-          if (!isArchivedLine(parsed)) continue;
-          // A crash between the archive append and the rename archives a
-          // line twice; it is one line of history.
-          const key =
-            parsed.line !== undefined ? `l:${canonicalJson(parsed.line)}` : `r:${parsed.raw}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          out.push(parsed);
-        }
-      }
-      return out;
+      return readHistory();
     },
 
     async importSynced(entries: ReadonlyArray<MemoryEntry>): Promise<readonly string[]> {
@@ -1133,6 +1211,12 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
       if (entries.length === 0) return [];
       return withStoreLock(async () => {
         const known = new Set((await loadAll()).entries.map((e) => e.id));
+        // A fact a compaction archived is known too: it was forgotten or
+        // corrected here, and a pull must not bring it back to life.
+        for (const archived of await readHistory()) {
+          if (isMemoryEntry(archived.line)) known.add(archived.line.id);
+          else if (isMemoryTombstone(archived.line)) known.add(archived.line.target);
+        }
         const added: MemoryEntry[] = [];
         for (const e of entries) {
           if (known.has(e.id)) continue;

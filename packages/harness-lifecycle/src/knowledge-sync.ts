@@ -61,7 +61,13 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type MemoryEntry, createMemoryStore, isMemorySpecName } from "@crewhaus/memory-store";
+import {
+  type MemoryEntry,
+  createMemoryStore,
+  isMemoryEntry,
+  isMemorySpecName,
+  isMemoryTombstone,
+} from "@crewhaus/memory-store";
 import { type SecretMatch, hasHighEntropyToken, jwtMatches, pemBlockMatches } from "./secret-scan";
 
 /** Thrown for operational failures. The CLI routes the message through
@@ -353,7 +359,8 @@ const LEGACY_SHARED_FILE = "shared.jsonl";
  * forgotten or expired fact is not) and a fact marked personal is not read
  * either. Each fact carries its `spec` and `id`. The legacy `shared.jsonl` is
  * read raw, as before. `dead` lists the facts that are not live, for
- * the push's retractions.
+ * the push's retractions, including the ones a compaction moved to the
+ * store's archive.
  */
 export async function readHarnessFactStates(
   harnessDir: string,
@@ -370,7 +377,10 @@ export async function readHarnessFactStates(
     }
     const spec = f.slice(0, -".jsonl".length);
     if (!isMemorySpecName(spec)) continue;
-    for (const item of await createMemoryStore({ specName: spec, rootDir: dir }).list()) {
+    const store = createMemoryStore({ specName: spec, rootDir: dir });
+    const inFile = new Set<string>();
+    for (const item of await store.list()) {
+      inFile.add(item.entry.id);
       if (item.status !== "live") {
         dead.push({ spec, id: item.entry.id, status: item.status });
         continue;
@@ -378,8 +388,39 @@ export async function readHarnessFactStates(
       if (item.category === "person") continue;
       live.push({ text: item.entry.text, tags: item.entry.tags, spec, id: item.entry.id });
     }
+    dead.push(...archivedDeadFacts(spec, await store.history(), inFile));
   }
   return { live, dead };
+}
+
+/**
+ * The facts a compaction moved to the archive, each dead with the kind its
+ * archived tombstone gives it: `superseded` when a tombstone or the entry
+ * names it so, `expired` otherwise (a TTL or an expiry tombstone). A fact
+ * still in the live file is read from there instead.
+ */
+function archivedDeadFacts(
+  spec: string,
+  archived: ReadonlyArray<{ readonly line?: unknown }>,
+  inFile: ReadonlySet<string>,
+): DeadFact[] {
+  const superseded = new Set<string>();
+  const entries: MemoryEntry[] = [];
+  for (const { line } of archived) {
+    if (isMemoryEntry(line)) entries.push(line);
+    else if (isMemoryTombstone(line) && line.tombstone === "superseded")
+      superseded.add(line.target);
+  }
+  const out: DeadFact[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (inFile.has(entry.id) || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    const status =
+      superseded.has(entry.id) || entry.supersededBy !== undefined ? "superseded" : "expired";
+    out.push({ spec, id: entry.id, status });
+  }
+  return out;
 }
 
 /** {@link readHarnessFactStates}' live facts: what a push shares. */

@@ -2296,9 +2296,10 @@ export type RunChatLoopOptions = {
     readonly savePlan?: (planText: string) => Promise<void>;
     /**
      * The continuity store's own files (`ContinuityStore.storeFiles()`): the
-     * floor refuses any tool but the store's own a write to one
-     * (`EvaluateOptions.protectedFiles`), and the tools that write beneath a
-     * directory check them on the bridge. Forwarded to sub-agents.
+     * floor refuses any tool but the store's own a write to one, or beneath a
+     * directory holding one (`EvaluateOptions.protectedFiles`); a tool that
+     * checks its own targets on the bridge (`checksOwnTargets`, StateImport)
+     * is read the `inside` way only. Forwarded to sub-agents.
      */
     readonly storeFiles?: readonly string[];
   };
@@ -4174,7 +4175,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // (permission-engine's runtime-state floor, `./state-roots`).
   const protectedRoots = runtimeStateRoots(sessionRootDir, currentTenantContext()?.tenant);
   // The continuity store's own files: only its tools write them. Files, not
-  // roots, so a tool working on the whole of `.crewhaus/state` keeps working.
+  // roots, so a tool that checks its own targets (StateImport) keeps working
+  // on the whole of `.crewhaus/state`.
   const protectedFiles = storeFileRoots(opts.continuity?.storeFiles ?? []);
   const credentialRoots =
     credentialFloorScope.getStore() === true ? credentialFileRoots() : undefined;
@@ -6751,6 +6753,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         readOnly: tool.readOnly,
         destructive: tool.destructive,
         requiresSandbox: tool.requiresSandbox,
+        ...(tool.checksOwnTargets === true ? { checksOwnTargets: true } : {}),
       },
       permissionMode,
       servingPlan.permissionRules,
@@ -6966,6 +6969,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                     readOnly: tool.readOnly,
                     destructive: tool.destructive,
                     requiresSandbox: tool.requiresSandbox,
+                    ...(tool.checksOwnTargets === true ? { checksOwnTargets: true } : {}),
                   },
                   permissionMode,
                   servingPlan.permissionRules,

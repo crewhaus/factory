@@ -78,9 +78,10 @@ these on: they reach every harness that uses what each one names.
   `.crewhaus/idempotency` and the directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>`
   names; the continuity store's own files under `.crewhaus/state/<spec>/`,
   `focus.md`, `goals.yaml`, `plans` and `handoff.md`, and the same for each of
-  its sessions, which only the plan tools write (a tool that works on the whole
-  of `.crewhaus/state`, such as `StateImport` merging into it, keeps working, and
-  refuses an entry that lands on one of them); the working directory's `.env`,
+  its sessions, which only the plan tools write, and no tool acting beneath a
+  directory that holds them does either (`StateImport` merging into the whole of
+  `.crewhaus/state` keeps working, and refuses an entry that lands on one of
+  them); the working directory's `.env`,
   `.env.local`, `.env.development`, `.env.development.local`, `.env.production`,
   `.env.production.local`, `.env.test` and `.env.test.local`, and any file
   `manager.envFiles` names; its `bunfig.toml` and `.npmrc`; the `approvals.jsonl`

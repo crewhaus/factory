@@ -593,6 +593,66 @@ describe("knowledge sync integrity", () => {
     expect(readFileSync(cliStore.path(), "utf-8")).toContain("retracted by bot");
   });
 
+  test("a fact corrected and then compacted away is still retracted, once", async () => {
+    const bot = harness("bot", "bot");
+    const botStore = createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+    });
+    const wrong = await botStore.remember("the office is on floor 3");
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    await botStore.supersede(wrong.id, "the office is on floor 4", { reason: "moved" });
+    expect((await botStore.compact()).archived).toBe(2);
+    expect(readFileSync(botStore.path(), "utf-8")).not.toContain("floor 3");
+    const plan = await push(bot, shared, "bot");
+    expect(plan.retractions.map((r) => [r.contentHash, r.reason])).toEqual([
+      [memoryContentHash("the office is on floor 3", []), "superseded"],
+    ]);
+    expect((await push(bot, shared, "bot")).retractions).toEqual([]);
+  });
+
+  test("a pulled fact a person forgot stays forgotten after a compaction", async () => {
+    const bot = harness("bot", "bot");
+    const cli = harness("cli", "concierge");
+    await createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+    }).remember("the office is on floor 3");
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    const [id] = (await pull(cli, shared)).added;
+    const cliStore = createMemoryStore({
+      specName: "concierge",
+      rootDir: join(cli, ".crewhaus", "memories"),
+    });
+    await cliStore.forget(id as string, { reason: "wrong" });
+    await cliStore.compact();
+    expect((await pull(cli, shared)).added).toEqual([]);
+    expect(await cliStore.size()).toBe(0);
+  });
+
+  test("a pulled fact a person corrected stays corrected after a compaction", async () => {
+    const bot = harness("bot", "bot");
+    const cli = harness("cli", "concierge");
+    await createMemoryStore({
+      specName: "bot",
+      rootDir: join(bot, ".crewhaus", "memories"),
+    }).remember("the office is on floor 3");
+    const shared = join(root, ".crewhaus-shared");
+    await push(bot, shared, "bot");
+    const [id] = (await pull(cli, shared)).added;
+    const cliStore = createMemoryStore({
+      specName: "concierge",
+      rootDir: join(cli, ".crewhaus", "memories"),
+    });
+    await cliStore.supersede(id as string, "the office is on floor 4", { reason: "moved" });
+    await cliStore.compact();
+    expect((await pull(cli, shared)).added).toEqual([]);
+    const live = (await cliStore.list()).filter((i) => i.status === "live");
+    expect(live.map((i) => i.entry.text)).toEqual(["the office is on floor 4"]);
+  });
+
   test("a retraction from another harness leaves the pulled copy alone; a malformed line is skipped", async () => {
     const bot = harness("bot", "bot");
     const cli = harness("cli", "concierge");

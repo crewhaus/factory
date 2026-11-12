@@ -54,6 +54,64 @@ describe("compaction under concurrency", () => {
     expect((await store.list()).map((i) => i.entry.id)).toEqual([late as string]);
   });
 
+  test("archiving holds no fact lock: a remember and a forget made while lines are archived land", async () => {
+    const store = createMemoryStore({ specName: "busy", rootDir: tmp });
+    const dead: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const e = await store.remember(`stale fact ${i}`);
+      await store.forget(e.id);
+      dead.push(e.id);
+    }
+    const doomed = await store.remember("forgotten while archiving");
+    const during: string[] = [];
+    let archivedLines = 0;
+    _setCompactSeamsForTest({
+      afterArchiveLine: async () => {
+        archivedLines += 1;
+        // A fact write from here would wait on the fact lock (and fail when
+        // it cannot be taken) if the archive were written under it.
+        if (archivedLines === 1) {
+          during.push((await store.remember("remembered while archiving")).id);
+          await store.forget(doomed.id, { reason: "wrong" });
+        }
+      },
+    });
+    const result = await store.compact();
+    expect(archivedLines).toBe(6);
+    expect(result).toEqual({ kept: 3, dropped: 6, archived: 6 });
+    const live = await store.list();
+    expect(live.filter((i) => i.status === "live").map((i) => i.entry.id)).toEqual(during);
+    // The fact forgotten mid-archive is still in the file, dead, for the next compaction.
+    expect(live.find((i) => i.entry.id === doomed.id)?.status).toBe("superseded");
+    expect(liveLines(store.path()).some((l) => l.includes("stale fact"))).toBe(false);
+    expect((await store.compact()).archived).toBe(2);
+    expect((await store.history()).length).toBe(8);
+  });
+
+  test("a fact that dies after the snapshot stays in the file until a compaction archives it", async () => {
+    const t = { ms: Date.parse("2026-11-01T00:00:00.000Z") };
+    const store = createMemoryStore({ specName: "ttl", rootDir: tmp, now: () => new Date(t.ms) });
+    const dead = await store.remember("already dead");
+    await store.forget(dead.id);
+    const lapsing = await store.remember("lapses mid-compaction", [], { ttlMs: 10 });
+    _setCompactSeamsForTest({
+      afterArchiveLine: () => {
+        t.ms += 1000;
+      },
+    });
+    await store.compact();
+    expect(liveLines(store.path()).some((l) => l.includes(lapsing.id))).toBe(true);
+    expect((await store.history()).some((h) => JSON.stringify(h.line).includes(lapsing.id))).toBe(
+      false,
+    );
+    _setCompactSeamsForTest(undefined);
+    await store.compact();
+    expect(liveLines(store.path())).toEqual([]);
+    expect((await store.history()).some((h) => JSON.stringify(h.line).includes(lapsing.id))).toBe(
+      true,
+    );
+  });
+
   test("a raw append that went round the lock, made before the last stat, survives", async () => {
     const store = createMemoryStore({ specName: "bypass", rootDir: tmp });
     const keep = await store.remember("kept fact");

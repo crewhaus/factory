@@ -1,6 +1,6 @@
 /**
  * Under `continuity.proof: require`, a step or goal counts as proven only while
- * its frozen proof still matches the session log it was read from. A proof
+ * one of its frozen proofs still matches the session log it was read from. A proof
  * written into a plan file or `goals.yaml` by hand completes nothing at the
  * tools that act on it: PlanComplete's note and GoalUpdate's at-target check.
  */
@@ -107,6 +107,44 @@ describe("PlanComplete under require", () => {
     expect(reply).toBe("plan-0001 step 2 proven — evidence: tu_two");
   });
 
+  test("proving step 1 again after its proof failed lets step 2 complete the plan, with no note", async () => {
+    const tools = makeTools("require");
+    await tools.planUpdate.execute({ action: "create", title: "ship", steps: ["one", "two"] });
+    logToolPair("tu_one");
+    await tools.planComplete.execute({ step: 1, evidence: [{ toolUseId: "tu_one" }] });
+    const path = planFile();
+    writeFileSync(path, readFileSync(path, "utf8").replaceAll("tu_one", "tu_forged"));
+    logToolPair("tu_again");
+    await tools.planComplete.execute({ step: 1, evidence: [{ toolUseId: "tu_again" }] });
+    logToolPair("tu_two");
+    expect(await tools.planComplete.execute({ step: 2, evidence: [{ toolUseId: "tu_two" }] })).toBe(
+      "plan-0001 step 2 proven — evidence: tu_two",
+    );
+  });
+
+  test("citing the same call again replaces a proof that was changed under its id", async () => {
+    const tools = makeTools("require");
+    await tools.planUpdate.execute({ action: "create", title: "ship", steps: ["one", "two"] });
+    logToolPair("tu_one");
+    await tools.planComplete.execute({ step: 1, evidence: [{ toolUseId: "tu_one" }] });
+    const path = planFile();
+    const genuine = readFileSync(path, "utf8");
+    const hashLine = /inputHash: .*/.exec(genuine)?.[0];
+    expect(hashLine).toBeDefined();
+    writeFileSync(path, genuine.replace(/inputHash: .*/, 'inputHash: "sha256:00"'));
+    logToolPair("tu_two");
+    expect(
+      await tools.planComplete.execute({ step: 2, evidence: [{ toolUseId: "tu_two" }] }),
+    ).toContain("step 1: its proof no longer matches the session log");
+    await tools.planComplete.execute({ step: 1, evidence: [{ toolUseId: "tu_one" }] });
+    const repaired = readFileSync(path, "utf8");
+    expect(repaired).toContain(hashLine as string);
+    expect(repaired).not.toContain("sha256:00");
+    expect(await tools.planComplete.execute({ step: 2, evidence: [{ toolUseId: "tu_two" }] })).toBe(
+      "plan-0001 step 2 proven — evidence: tu_two",
+    );
+  });
+
   test("the ladder reads no log: the same forged file gives the ladder's reply", async () => {
     const tools = makeTools("ladder");
     await tools.planUpdate.execute({ action: "create", title: "ship", steps: ["one", "two"] });
@@ -180,6 +218,53 @@ describe("GoalUpdate under require", () => {
     });
     const reply = await tools.goalUpdate.execute({ goalId: "goal-0001", current: 10 });
     expect(reply).toContain("goal-0001 updated");
+    expect(reply).toContain("(10/10)");
+  });
+
+  test("proving a hand-proved goal in the same call reaches its target", async () => {
+    handProvedGoal();
+    const tools = makeTools("require");
+    logToolPair("tu_measure");
+    const reply = await tools.goalUpdate.execute({
+      goalId: "goal-0001",
+      current: 10,
+      status: "proven",
+      evidence: [{ toolUseId: "tu_measure" }],
+    });
+    expect(reply).toContain("goal-0001 updated");
+    expect(reply).toContain("(10/10)");
+    // Once proven again, a later progress move holds too.
+    expect(
+      await tools.goalUpdate.execute({
+        goalId: "goal-0001",
+        title: "Close all tickets",
+        current: 10,
+      }),
+    ).toContain("(10/10)");
+  });
+
+  test("a goal whose session log was pruned is refused, then reaches its target once proven again", async () => {
+    const tools = makeTools("require");
+    await tools.goalWrite.execute({ title: "Close tickets", target: 10, current: 4 });
+    logToolPair("tu_measure");
+    await tools.goalUpdate.execute({
+      goalId: "goal-0001",
+      current: 5,
+      status: "proven",
+      evidence: [{ toolUseId: "tu_measure" }],
+    });
+    rmSync(join(tmp, ".crewhaus", "sessions"), { recursive: true, force: true });
+    const err = await tools.goalUpdate
+      .execute({ goalId: "goal-0001", current: 10 })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ProofRequiredError);
+    logToolPair("tu_recount");
+    const reply = await tools.goalUpdate.execute({
+      goalId: "goal-0001",
+      current: 10,
+      status: "proven",
+      evidence: [{ toolUseId: "tu_recount" }],
+    });
     expect(reply).toContain("(10/10)");
   });
 

@@ -577,10 +577,11 @@ export function runtimeStateRoots(
 /**
  * A store's own files as floor entries, each spelled as {@link runtimeStateRoots}
  * spells a root. They are protected FILES (`EvaluateOptions.protectedFiles`):
- * a call that names one, or a path inside one, is refused, but a call that
- * acts beneath a directory holding one is not, so a tool that works on the
- * whole of `.crewhaus/state` keeps working. The continuity store's files are
- * the first.
+ * a call that names one, a path inside one, or acts beneath a directory
+ * holding one is refused, except that a tool that checks its own targets on
+ * the bridge (`checksOwnTargets`) is refused only for a path that names one,
+ * so StateImport keeps working on the whole of `.crewhaus/state`. The
+ * continuity store's files are the first.
  */
 export function storeFileRoots(paths: readonly string[], cwd: string = process.cwd()): string[] {
   const out = new Set<string>();

@@ -1,7 +1,8 @@
 /**
  * The guarded clear, the store's own file list, and the proof recheck the
  * doors that act use under `continuity.proof: require`: a frozen proof counts
- * only while the session log it was read from still says the same thing.
+ * only while the session log it was read from still says the same thing, and
+ * one such proof proves its record.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -190,6 +191,30 @@ describe("recheckProofs", () => {
       toolUseId: "tu_torn",
       why: "unreadable",
     });
+  });
+
+  test("one proof the log bears out proves the record; a forged one beside it adds nothing", async () => {
+    const store = makeStore();
+    const proof = await provenStep(store, "tu_kept");
+    const forged: FrozenProof = { ...proof, toolUseId: "tu_made_up" };
+    expect(await store.recheckProofs({ proofs: [forged, proof] })).toEqual({ ok: true });
+    // None matches: the first failure is the answer.
+    expect(
+      await store.recheckProofs({ proofs: [forged, { ...proof, inputHash: "sha256:ff" }] }),
+    ).toEqual({ ok: false, toolUseId: "tu_made_up", why: "missing" });
+  });
+
+  test("proving a step again under the same id replaces the proof that no longer matches", async () => {
+    const store = makeStore();
+    const proof = await provenStep(store, "tu_same");
+    const path = join(store.dir(), "plans", "plan-0001-p.md");
+    writeFileSync(path, readFileSync(path, "utf8").replace(proof.inputHash, "sha256:00"));
+    const tampered = (await store.getPlan("plan-0001"))?.steps[0]?.proofs ?? [];
+    expect((await store.recheckProofs({ proofs: tampered })).ok).toBe(false);
+    const plan = await store.proveStep("plan-0001", 1, [{ toolUseId: "tu_same", sessionId: SESS }]);
+    const proofs = plan.steps[0]?.proofs ?? [];
+    expect(proofs.map((p) => [p.toolUseId, p.inputHash])).toEqual([["tu_same", proof.inputHash]]);
+    expect(await store.recheckProofs({ proofs })).toEqual({ ok: true });
   });
 
   test("a record with no proofs is missing", async () => {

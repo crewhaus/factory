@@ -1833,8 +1833,27 @@ describe("the release notes name what the knowledge stores do by default", () =>
         ],
         readOnly: false,
         destructive: true,
+        checksOwnTargets: true,
+      };
+      // A tool that acts beneath the store's directory and does not check its
+      // own targets (GitWorktreeAdd's `path`) is denied.
+      const worktreeAdd: ToolCallContext = {
+        toolName: "GitWorktreeAdd",
+        input: { path: ".crewhaus/state/s" },
+        operativeValues: [
+          {
+            kind: "path",
+            canonical: [".crewhaus/state/s", join(cwd, ".crewhaus/state/s")],
+            beneath: [".crewhaus/state/s/", `${join(cwd, ".crewhaus/state/s")}/`],
+          },
+        ],
+        readOnly: false,
+        destructive: true,
       };
       expect(evaluateWithReason(write, "auto", rules, { protectedFiles }).decision).toBe("deny");
+      expect(evaluateWithReason(worktreeAdd, "auto", rules, { protectedFiles }).decision).toBe(
+        "deny",
+      );
       expect(evaluateWithReason(stateImport, "auto", rules, { protectedFiles }).decision).toBe(
         "allow",
       );

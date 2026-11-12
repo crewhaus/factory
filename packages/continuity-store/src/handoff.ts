@@ -41,8 +41,8 @@ export type HandoffInput = {
   /** Default `"ladder"` — see {@link countsAsProven}. */
   readonly proofMode?: ContinuityProofMode;
   /**
-   * Under `require` only: the records whose frozen proof its session log does
-   * not bear out (`recheckProofs`). Each is rendered open, like a record
+   * Under `require` only: the records none of whose frozen proofs its session
+   * log bears out (`recheckProofs`). Each is rendered open, like a record
    * with no proof on record. Steps are keyed `<planId>#<index>`, goals by id.
    * Ignored under the ladder and `off`.
    */
@@ -140,9 +140,9 @@ export function countsAsProven(
 
 /**
  * {@link countsAsProven} at a door that acts: under `require` a record also
- * needs its frozen proofs to still match the session log they were read from
- * (`recheckProofs`), so a proof written into `goals.yaml` or a plan file by
- * hand completes nothing. Under the ladder and `off` it is unchanged, and
+ * needs one of its frozen proofs to still match the session log it was read
+ * from (`recheckProofs`), so a proof written into `goals.yaml` or a plan file
+ * by hand completes nothing. Under the ladder and `off` it is unchanged, and
  * `recheck` is not consulted.
  */
 export function countsAsProvenChecked(

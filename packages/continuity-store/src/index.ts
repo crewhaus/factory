@@ -489,11 +489,12 @@ export interface ContinuityStore {
    */
   storeFiles(): readonly string[];
   /**
-   * Re-read each frozen proof on a step or goal from the session log it was
-   * frozen from. `ok` only when every proof still resolves, verified, with
-   * the same tool name, input hash and result digest. A log that cannot be
-   * read answers `unreadable`, never `ok`; a record with no proofs answers
-   * `missing`.
+   * Re-read the frozen proofs on a step or goal from the session logs they
+   * were frozen from. `ok` when at least one proof still resolves, verified,
+   * with the same tool name, input hash and result digest: a genuine proof
+   * proves the record, and one that does not match adds nothing. Otherwise
+   * the first failure is answered. A log that cannot be read answers
+   * `unreadable`, never `ok`; a record with no proofs answers `missing`.
    */
   recheckProofs(record: { readonly proofs?: readonly FrozenProof[] }): Promise<ProofRecheck>;
 }
@@ -1116,12 +1117,21 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
     });
   }
 
+  /**
+   * The proofs a record carries after a verified transition: the ones it
+   * already had, each replaced by the proof just frozen under the same
+   * toolUseId (it was read from the log a moment ago, so it is the
+   * authority), then the new ones. A record whose earlier proof under that id
+   * no longer matches its log is then proven again by citing the same call.
+   */
   function mergeProofs(
     existing: readonly FrozenProof[],
     incoming: readonly FrozenProof[],
   ): readonly FrozenProof[] {
+    const fresh = new Map(incoming.map((p) => [p.toolUseId, p] as const));
+    const kept = existing.map((p) => fresh.get(p.toolUseId) ?? p);
     const seen = new Set(existing.map((p) => p.toolUseId));
-    return [...existing, ...incoming.filter((p) => !seen.has(p.toolUseId))];
+    return [...kept, ...incoming.filter((p) => !seen.has(p.toolUseId))];
   }
 
   /**
@@ -1203,35 +1213,47 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
   }): Promise<ProofRecheck> {
     const proofs = record.proofs ?? [];
     if (proofs.length === 0) return { ok: false, why: "missing" };
+    // One proof the log still bears out proves the record: a proof that does
+    // not match (written by hand, or read from a log since pruned) adds
+    // nothing, and must not keep a record that was proven again from ever
+    // counting. The first failure is reported when none matches.
+    let firstFailure: ProofRecheck | undefined;
     for (const proof of proofs) {
-      let unreadable = false;
-      const [resolution] = await resolveEvidence(
-        [{ toolUseId: proof.toolUseId, sessionId: proof.sessionId }],
-        {
-          sessionRootDir,
-          now,
-          onUnreadable: () => {
-            unreadable = true;
-          },
+      const result = await recheckOne(proof);
+      if (result.ok) return result;
+      firstFailure ??= result;
+    }
+    return firstFailure ?? { ok: false, why: "missing" };
+  }
+
+  async function recheckOne(proof: FrozenProof): Promise<ProofRecheck> {
+    let unreadable = false;
+    const [resolution] = await resolveEvidence(
+      [{ toolUseId: proof.toolUseId, sessionId: proof.sessionId }],
+      {
+        sessionRootDir,
+        now,
+        onUnreadable: () => {
+          unreadable = true;
         },
-      );
-      if (resolution === undefined || resolution.verdict === "missing") {
-        return {
-          ok: false,
-          toolUseId: proof.toolUseId,
-          why: unreadable ? "unreadable" : "missing",
-        };
-      }
-      const found = resolution.proof;
-      if (
-        resolution.verdict !== "verified" ||
-        found === undefined ||
-        found.toolName !== proof.toolName ||
-        found.inputHash !== proof.inputHash ||
-        found.resultDigest !== proof.resultDigest
-      ) {
-        return { ok: false, toolUseId: proof.toolUseId, why: "changed" };
-      }
+      },
+    );
+    if (resolution === undefined || resolution.verdict === "missing") {
+      return {
+        ok: false,
+        toolUseId: proof.toolUseId,
+        why: unreadable ? "unreadable" : "missing",
+      };
+    }
+    const found = resolution.proof;
+    if (
+      resolution.verdict !== "verified" ||
+      found === undefined ||
+      found.toolName !== proof.toolName ||
+      found.inputHash !== proof.inputHash ||
+      found.resultDigest !== proof.resultDigest
+    ) {
+      return { ok: false, toolUseId: proof.toolUseId, why: "changed" };
     }
     return { ok: true };
   }
