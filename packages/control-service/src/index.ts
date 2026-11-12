@@ -5,7 +5,7 @@
  * never imports `@crewhaus/hangar-server`.
  */
 export { currentLocalIdentity, storedActorFor } from "./actor";
-export { AREA_RUNTIMES, compositionProblems } from "./areas";
+export { AREA_RUNTIMES, activationGates, compositionProblems } from "./areas";
 export {
   type Commands,
   type InlineEffect,
@@ -16,6 +16,8 @@ export {
 export type { ControlMode } from "./context";
 export { CORE_RUNTIME, reconcileDaemonStart, settleStart, settleStop } from "./core-runtime";
 export {
+  type ActivationGate,
+  type ActivationGateContext,
   type AreaRuntime,
   type Executor,
   type ExecutorContext,
@@ -27,6 +29,21 @@ export {
   executorDead,
   withOwnStartTime,
 } from "./executor";
+export {
+  type ActivationAnswer,
+  type ActivationRequest,
+  type AdmitOptions,
+  GATES_NOT_RUN,
+  PROTECTED_ENVIRONMENT_GATE,
+  type StartHead,
+  activateDeployment,
+  admitExplicitStart,
+  deploymentIdOf,
+  ensureHarnessIdentity,
+  isServiceActor,
+  protectedEnvironmentGate,
+  reconcileActivation,
+} from "./deployments";
 export { FINGERPRINT_LABEL, IDEMPOTENCY_TTL_MS, idempotencyClaim } from "./idempotency";
 export type { JobAdapter } from "./jobs";
 export {

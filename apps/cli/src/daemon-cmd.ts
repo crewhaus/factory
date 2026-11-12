@@ -32,12 +32,16 @@
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { EXIT_FOR_ERROR, EXIT_FOR_REJECTED_RECEIPT } from "@crewhaus/control-contract";
+import { ensureDigestKey, readHarnessIdentity } from "@crewhaus/control-records";
 import {
   type ControlService,
   type Settlement,
+  type StartHead,
+  admitExplicitStart,
   currentLocalIdentity,
   settleStart,
   settleStop,
+  storedActorFor,
   wireControl,
   withOwnStartTime,
 } from "@crewhaus/control-service";
@@ -51,6 +55,7 @@ import {
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import {
   type HangarRegistry,
+  isAdopted,
   openHangarRegistry,
   resolveHangarRoot,
 } from "@crewhaus/harness-registry";
@@ -268,6 +273,7 @@ export function supervisorFor(
   gate: { readonly enabled: boolean; readonly force?: boolean; readonly acknowledge?: string[] },
   prep: { readonly compile?: boolean } = {},
   run: { readonly briefFile?: string } = {},
+  head: StartHead = "cli-direct",
 ): HarnessSupervisor {
   const env = opts.env ?? process.env;
   const ops = opts.ops ?? createProcessOps();
@@ -275,6 +281,29 @@ export function supervisorFor(
     harnessDir: harness.dir,
     target: harness.target,
     ops,
+    // A person's start from this head: `daemon start|restart <dir>` and `daemon submit` may
+    // record and activate the build on disk; a group member runs only an active build.
+    admit: async ({ harnessDir, target, entry, ledgerAbsent }) => {
+      const key = await ensureDigestKey(harnessDir);
+      if (key.state !== "present") {
+        return {
+          ok: false,
+          message: "the harness's digest key cannot be read; nothing was started",
+        };
+      }
+      const actor = await storedActorFor(resolveHangarRoot(env), currentLocalIdentity(), key.hmac);
+      const registryId = openRegistrySafe(opts)
+        ?.list()
+        .find((entry) => entry.dir === harnessDir)?.id;
+      return admitExplicitStart(harnessDir, target, {
+        head,
+        entry,
+        ledgerAbsent,
+        actor,
+        ...(registryId !== undefined ? { registryId } : {}),
+        ...(opts.clock !== undefined ? { now: opts.clock.now } : {}),
+      });
+    },
     clock: opts.clock ?? systemClock,
     managerVersion: cliVersion() ?? "0.0.0",
     plan: () =>
@@ -471,12 +500,17 @@ function directControl(opts: DaemonCommandOptions): ControlService {
 /** Harnesses this process has recovered: once per process per harness. */
 const recoveredHarnesses = new Set<string>();
 
-/** The harness as a ref, when it is registered; otherwise the receipt names itself. */
+/**
+ * The harness as a ref: its registry row's id when it is registered, else the id its own
+ * `harness.json` carries; otherwise the receipt names itself. Only reads.
+ */
 function targetFor(harness: ResolvedHarness, opts: DaemonCommandOptions): string | undefined {
   const entry = openRegistrySafe(opts)
     ?.list()
     .find((e) => e.dir === harness.dir);
-  return entry === undefined ? undefined : `home/harness/${entry.id}`;
+  if (entry !== undefined) return `home/harness/${entry.id}`;
+  const identity = readHarnessIdentity(harness.dir);
+  return identity.state === "present" ? `home/harness/${identity.identity.id}` : undefined;
 }
 
 type Settled = { readonly result: DaemonCommandResult; readonly settle: Settlement };
@@ -540,6 +574,7 @@ async function daemonStart(
   argv: readonly string[],
   opts: DaemonCommandOptions,
   restart: boolean,
+  head: StartHead = "cli-direct",
 ): Promise<DaemonCommandResult> {
   const verb = restart ? "restart" : "start";
   const args = parseVerbArgs(verb, argv, {
@@ -562,10 +597,11 @@ async function daemonStart(
     // The group's own BOOT order for start/restart. Members walk it as
     // written; a restart is a start of each member, not a stop-then-start of
     // the whole group, so the order that matters is the boot order.
-    const members = resolveGroup(groupFlag, opts);
+    const members = resolveGroup(groupFlag, opts, verb);
     const rest = passthroughFlags(args);
+    // Each member is admitted as a group start: it runs only an active build.
     return await walkGroup(members, verb, args.flags.get("parallel") === true, (member) =>
-      daemonStart([member.harness.dir, ...rest], opts, restart),
+      daemonStart([member.harness.dir, ...rest], opts, restart, "group"),
     );
   }
   const harness = resolveHarness(args.positional[0], opts);
@@ -597,6 +633,8 @@ async function daemonStart(
           : args.flags.get("no-compile") === true
             ? { compile: false }
             : {},
+        {},
+        head,
       );
       try {
         // A restart from the terminal is by construction a restart of a daemon
@@ -662,6 +700,14 @@ async function daemonStart(
                 exitCode: EXIT_FOR_REJECTED_RECEIPT,
               },
             };
+          case "build-not-active":
+            return {
+              settle,
+              result: {
+                lines: [`${harness.specName}: ${result.message}`],
+                exitCode: EXIT_FOR_REJECTED_RECEIPT,
+              },
+            };
           case "plan-failed":
             return {
               settle,
@@ -704,7 +750,11 @@ type GroupMember = {
  * `--group` walk would leave an operator believing the group is up when a
  * third of it was never considered.
  */
-function resolveGroup(name: string, opts: DaemonCommandOptions): readonly GroupMember[] {
+function resolveGroup(
+  name: string,
+  opts: DaemonCommandOptions,
+  verb: "start" | "restart" | "stop",
+): readonly GroupMember[] {
   const registry = openRegistrySafe(opts);
   if (registry === undefined) {
     throw new Error(
@@ -721,7 +771,16 @@ function resolveGroup(name: string, opts: DaemonCommandOptions): readonly GroupM
       `daemon --group: group "${name}" has no members${known !== "" ? ` (known groups: ${known})` : ""} — add some with \`crewhaus harness group ${name} --add <dir> --member-order <n>\``,
     );
   }
+  const adoptionSince = registry.adoptionSince();
   return entries.map((entry): GroupMember => {
+    // A group start runs only the harnesses adopted on this machine; a stop reaches all.
+    if (verb !== "stop" && !isAdopted(entry, adoptionSince)) {
+      return {
+        harness: { dir: entry.dir, target: entry.target, specName: entry.specName },
+        entryId: entry.id,
+        skip: `not adopted on this machine — crewhaus harness adopt ${entry.id}`,
+      };
+    }
     // A vanished directory is reported, never silently walked past: it is
     // the difference between "the fleet is up" and "the fleet is up except
     // the one whose checkout someone moved".
@@ -964,6 +1023,8 @@ async function daemonSubmit(
           lines: [`${harness.specName}:`, ...formatPrepareRefusal(result.refusal)],
           exitCode: 1,
         };
+      case "build-not-active":
+        return { lines: [`${harness.specName}: ${result.message}`], exitCode: 1 };
       case "plan-failed":
         return { lines: [`${harness.specName}: ${result.error.message}`], exitCode: 1 };
     }
@@ -994,7 +1055,7 @@ async function daemonStop(
     // dependents-first: stopping the secretary while the six specs that
     // mount its A2A door are still live is how a clean shutdown turns into
     // six connection errors.
-    const members = [...resolveGroup(groupFlag, opts)].reverse();
+    const members = [...resolveGroup(groupFlag, opts, "stop")].reverse();
     const rest = passthroughFlags(args);
     return await walkGroup(members, "stop", args.flags.get("parallel") === true, (member) =>
       daemonStop([member.harness.dir, ...rest], opts),

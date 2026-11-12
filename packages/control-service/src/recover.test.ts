@@ -40,7 +40,11 @@ function answering(answer: Reconciliation): AreaRuntime {
   const reconcile = (): Reconciliation => answer;
   return {
     ...CORE_RUNTIME,
-    reconcilers: { "controls.start": reconcile, "controls.restart": reconcile },
+    reconcilers: {
+      ...CORE_RUNTIME.reconcilers,
+      "controls.start": reconcile,
+      "controls.restart": reconcile,
+    },
   };
 }
 

@@ -67,9 +67,14 @@ import {
   openSignIn,
   readOwnerSettings,
 } from "@crewhaus/access-control";
+import { DEPLOYMENT_ID_RE } from "@crewhaus/control-contract";
 import {
+  AREA_RUNTIMES,
   type RecoverCounts,
+  activateDeployment,
+  activationGates,
   currentLocalIdentity,
+  isServiceActor,
   wireControl,
   withOwnStartTime,
 } from "@crewhaus/control-service";
@@ -219,7 +224,7 @@ import {
   jobArgv,
 } from "./process";
 import { isProofRunId, proofTenants, proofView } from "./proofs";
-import { commandFields, createReceipts } from "./receipts";
+import { commandFields, createReceipts, currentCommand } from "./receipts";
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
 import {
@@ -1194,6 +1199,60 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     };
   };
 
+  /**
+   * Activate a prepared build: the activation gates, then the records. A failed gate
+   * answers 409 with the deployment as it stands.
+   */
+  const activateRoute = async (
+    entry: HangarHarnessEntry,
+    dep: string,
+    body: Record<string, unknown>,
+  ): Promise<{ readonly body: unknown; readonly status: number }> => {
+    if (!DEPLOYMENT_ID_RE.test(dep)) throw new HttpError(400, "not a deployment id");
+    const environment = body["environment"];
+    if (environment !== undefined && typeof environment !== "string") {
+      throw new HttpError(400, '"environment" must be a string');
+    }
+    const command = currentCommand();
+    const actor = command?.by ?? "sys:executor";
+    const answer = await activateDeployment({
+      harnessDir: liveDirOr404(entry),
+      dep,
+      actor,
+      actorIsService: isServiceActor(hangarRoot, actor),
+      cmd: command?.commandId ?? dep,
+      gates: activationGates(AREA_RUNTIMES),
+      ...(typeof environment === "string" && environment !== "" ? { environment } : {}),
+      ...(body["autostart"] === false ? { autostart: false } : {}),
+      registryId: entry.id,
+      now: opts.now ?? (() => Date.now()),
+    });
+    if (answer.ok) {
+      return {
+        status: 200,
+        body: { ok: true, deployment: answer.record, superseded: answer.superseded },
+      };
+    }
+    const status =
+      answer.code === "not_found"
+        ? 404
+        : answer.code === "forbidden"
+          ? 403
+          : answer.code === "unavailable"
+            ? 503
+            : 409;
+    return {
+      status,
+      body: {
+        ok: false,
+        code: answer.code,
+        message: answer.message,
+        current: answer.current ?? null,
+        verb: answer.verb ?? null,
+      },
+    };
+  };
+
   /** One member's refusal, as one line — the same vocabulary the per-harness
    *  routes use, flattened so a sweep's summary reads as a list. */
   function groupRefusalMessage(result: StartResult & { readonly ok: false }): string {
@@ -1204,6 +1263,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         return `preflight refused: ${result.gate.refused.map((i) => i.message).join("; ")}`;
       case "prepare-refused":
         return result.refusal.message;
+      case "build-not-active":
+        return result.message;
       case "plan-failed":
         return result.error.message;
     }
@@ -1268,6 +1329,18 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         // 409, not 400: the request was well-formed and the refusal is a
         // fact about the harness that `force`/`acknowledge` may clear.
         return json(gateRefusalBody(result.gate), 409);
+      case "build-not-active":
+        // 409: the build on disk is not the active deployment's. Activating it, or
+        // restoring the active build, clears it.
+        return json(
+          {
+            ok: false,
+            reason: "build-not-active",
+            message: result.message,
+            verb: "crewhaus deploy activate",
+          },
+          409,
+        );
       case "plan-failed":
         return json(
           {
@@ -1521,6 +1594,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
     // ---- M2 writes: process control, control.v1, inboxes, action faces ----
     if (method === "POST") {
+      if (head === "deployments" && tail.length === 2 && tail[1] === "activate") {
+        const answer = await activateRoute(entry, tail[0] as string, await readBody(req));
+        return jsonMasked(answer.body, answer.status);
+      }
       if (head === "proc" && tail.length === 1) {
         const verb = tail[0];
         const handle = await processFor(entry);

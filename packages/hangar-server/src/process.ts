@@ -42,6 +42,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type LeaseHolder, type LeaseOptions, withMutatingLease } from "@crewhaus/control-records";
+import { admitExplicitStart } from "@crewhaus/control-service";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import type { HangarHarnessEntry, HangarRegistry } from "@crewhaus/harness-registry";
 import {
@@ -82,6 +83,7 @@ import {
 } from "@crewhaus/harness-supervisor";
 import { knownControlPort, parseControlPort } from "./control-client";
 import { mergedSpawnEnv } from "./env-file";
+import { currentCommand } from "./receipts";
 import { DEV_JOB_KIND, MCP_JOB_KIND } from "./runtime-ops";
 
 /**
@@ -359,6 +361,20 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       ports,
       managerVersion: options.managerVersion,
       plan,
+      // Home's Start, Restart and group start run only the active build (a harness with no
+      // deployment record yet is recorded at its first start).
+      admit: async ({ harnessDir: dir, target: shape, entry: launched, ledgerAbsent }) => {
+        const command = currentCommand();
+        return admitExplicitStart(dir, shape, {
+          head: "home",
+          entry: launched,
+          ledgerAbsent,
+          actor: command?.by ?? "sys:executor",
+          registryId: entry.id,
+          ...(command !== undefined ? { cmd: command.commandId } : {}),
+          now: options.now,
+        });
+      },
       // The SAME prep the terminal head runs, built per start because
       // `.crewhaus/settings.json` is edited between starts like the spec is.
       // Without this the console's Restart button rebuilt the spawn plan and

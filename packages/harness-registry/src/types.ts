@@ -78,6 +78,15 @@ export type HangarHarnessEntry = {
   /** ISO 8601 stamped when the dir vanishes; cleared when it is back.
    *  Vanished entries are NEVER silently pruned from the file. */
   readonly missingSince: string | null;
+  /** A short name, unique in this Home, from the spec name. */
+  readonly slug?: string;
+  /** Set when this directory's `harness.json` names another row's id: `fork-of hrn_…`. */
+  readonly identity?: string;
+  /** Adopted on this machine: when, and by whom (a stored actor ref). */
+  readonly home?: { readonly adoptedAt: string; readonly by: string };
+  /** When the row was moved to another directory: it counts as adopted only once adopted
+   *  there (`home`). */
+  readonly relocatedAt?: string;
   /** Unknown fields from newer writers, preserved on rewrite. */
   readonly [extra: string]: unknown;
 };
@@ -107,6 +116,9 @@ export type GroupDef = {
 /** The whole `harnesses.json` document. */
 export type HangarRegistryDoc = {
   readonly v: 2;
+  /** When the first write from a registry that knows adoption landed. A row registered
+   *  before it counts as adopted for a group start. */
+  readonly adoptionSince?: string;
   readonly harnesses: readonly HangarHarnessEntry[];
   readonly scanRoots: readonly ScanRoot[];
   readonly groups: readonly GroupDef[];

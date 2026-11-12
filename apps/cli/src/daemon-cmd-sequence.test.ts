@@ -192,9 +192,13 @@ const EXPECTED = {
       "CREWHAUS_COST_TRACKING",
       // Added on purpose since the capture: the supervisor hands every child
       // its execution id, so the runs it records name the process.
+      // Added on purpose: the deployment a run was started from, stamped from the active
+      // record (a harness with no record is recorded and activated at its first start).
+      "CREWHAUS_DEPLOYMENT_ID",
       "CREWHAUS_EXECUTION_ID",
       "CREWHAUS_NO_REGISTRY",
       "CREWHAUS_REGISTRY_ROOT",
+      "CREWHAUS_SPEC_HASH",
       "CREWHAUS_TRACE",
       "SEQ_API_KEY",
     ],

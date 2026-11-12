@@ -821,6 +821,8 @@ describe("rows, pinned", () => {
     expect(twins).toEqual([
       ["harnesses.list", "harness list"],
       ["harnesses.get", "harness show {hrn}"],
+      ["deployments.list", "deploy list --harness {hrn}"],
+      ["deployments.activate", "deploy activate {dep} --harness {hrn}"],
       ["controls.drain", "daemon drain {hrn}"],
       ["controls.stop", "daemon stop {hrn}"],
       ["controls.start", "daemon start {hrn}"],

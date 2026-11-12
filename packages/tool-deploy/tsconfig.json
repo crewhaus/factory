@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../tool-safety" },
+    { "path": "../ir" },
     {
       "path": "../errors"
     },

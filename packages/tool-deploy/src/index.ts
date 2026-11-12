@@ -82,6 +82,11 @@
 import { readdirSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { createDeploymentController } from "@crewhaus/deployment-controller";
+import {
+  candidateSpecHash,
+  evaluateProtectedEnvGate,
+} from "@crewhaus/deployment-controller/approval-gate";
+import { specRevision } from "@crewhaus/ir/policy";
 import { autoRegisterSpecVersion, nextVersion } from "@crewhaus/spec-changelog";
 import { type RegistryAdapter, createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -125,6 +130,77 @@ import {
   sample,
 } from "./lib/result";
 import { workspaceRoot } from "./paths";
+
+/** What the protected-environment gate decided for a pin move, as a tool reports it. */
+type ApprovalGateReport =
+  | { readonly protected: false }
+  | {
+      readonly protected: true;
+      readonly satisfied: boolean;
+      readonly required: number;
+      readonly counted: number;
+      readonly reason: string;
+    };
+
+/** The verb a person runs when a tool's pin move needs an approval quorum. */
+const APPROVAL_VERB = "crewhaus deploy promote --require-approval";
+
+/**
+ * The protected-environment gate every pin move passes, for a tool: the workspace's
+ * `.crewhaus/environments.json` and recorded approvals in `.crewhaus/approvals`, bound to
+ * the content being pinned. A tool consults no PR check, so only recorded approvals count.
+ */
+async function approvalGate(
+  name: string,
+  env: string,
+  toVersion: string,
+  specHash: string | (() => Promise<string>),
+): Promise<Loaded<ApprovalGateReport>> {
+  try {
+    const answer = await evaluateProtectedEnvGate({
+      harnessRoot: workspaceRoot(),
+      specName: name,
+      toEnv: env,
+      toVersion,
+      specHash,
+    });
+    if (!answer.protected) return { ok: true, value: { protected: false } };
+    return {
+      ok: true,
+      value: {
+        protected: true,
+        satisfied: answer.decision.satisfied,
+        required: answer.decision.required,
+        counted: answer.decision.countedApprovers.length + (answer.decision.prWitness ? 1 : 0),
+        reason: render(answer.decision.reason),
+      },
+    };
+  } catch (err) {
+    return fail(
+      "unreadable",
+      `the protected-environment policy for "${render(env)}" could not be read: ${render(
+        err instanceof Error ? err.message : String(err),
+      )}. Nothing was changed.`,
+    );
+  }
+}
+
+/** The refusal for a protected environment whose quorum is not met. */
+function approvalRequired(
+  tool: string,
+  env: string,
+  gate: ApprovalGateReport,
+  extra: Record<string, unknown>,
+): string {
+  return refusal(
+    tool,
+    "approval-required",
+    `"${render(env)}" is a protected environment, and its approval quorum for this content is not met: ${
+      gate.protected ? gate.reason : ""
+    }. A tool records no approval and reads no PR check; a person records the approvals and runs \`${APPROVAL_VERB}\`. Nothing was changed.`,
+    { ...extra, approvalGate: gate, nothingWasChanged: true },
+  );
+}
 
 /**
  * A file's text as 0.7.0's `readFileSync(path, "utf8")` gave it: a leading
@@ -420,7 +496,7 @@ export const specPin: RegisteredTool = buildTool({
     { field: "env", kind: "id", within: "name", overlay: "tenant" },
   ],
   description:
-    'Register a spec file\'s current content as a version in the local spec registry and pin that version to an environment (or a tenant\'s overlay of one). Use it to deploy a spec change. Registration is content-hashed: unchanged content is a no-op that reports the version already holding it, and each new version appends an entry to the spec\'s CHANGELOG.md. It REFUSES to move an existing pin unless repin:true, because the registry keeps no pin history; a tenant\'s first overlay replaces nothing and is written. It refuses a spec name the registry would store under another spelling, map to its shared "spec" fallback, or hide (a leading "_", "_tenants" included), a registryDir inside such a directory of another registry, a manifest that cannot be read or is a symlink (never treated as "no versions"), and any path the registry would open that resolves outside the workspace. NO AUDIT RECORD IS WRITTEN, and the result says so next to the pin that changed. dryRun changes nothing and previews the same pin decision.',
+    'Register a spec file\'s current content as a version in the local spec registry and pin it to an environment (or a tenant\'s overlay of one). Use it to deploy a spec change. Registration is content-hashed: unchanged content reports the version already holding it; each new version appends to the spec\'s CHANGELOG.md. It REFUSES to move an existing pin unless repin:true, because the registry keeps no pin history; a tenant\'s first overlay replaces nothing and is written. It refuses a spec name the registry would store under another spelling, map to its shared "spec" fallback, or hide (a leading "_", "_tenants" included), a registryDir inside such a directory of another registry, a manifest that cannot be read or is a symlink, and any path the registry would open that resolves outside the workspace. A protected environment needs approvals naming this content\'s specHash (approval-required). NO AUDIT RECORD IS WRITTEN, and the result says so. dryRun changes nothing and previews the pin decision and the gate.',
   inputSchema: z.object({
     name: z
       .string()
@@ -628,6 +704,26 @@ export const specPin: RegisteredTool = buildTool({
       }
     }
 
+    // Every pin move into a protected environment takes its approval quorum, bound to the
+    // content of the spec file this call read.
+    const gate = await approvalGate(
+      name.registryName,
+      env,
+      predictedVersion ?? candidate,
+      specRevision(yaml),
+    );
+    if (!gate.ok) {
+      return refusal(tool, gate.code, gate.reason, { ...common, env: render(env), ...pinContext });
+    }
+    if (!dryRun && gate.value.protected && !gate.value.satisfied) {
+      return approvalRequired(tool, env, gate.value, {
+        ...common,
+        env: render(env),
+        ...pinContext,
+        registration: renderStrings(prediction),
+      });
+    }
+
     if (dryRun) {
       const decision =
         predictedVersion === undefined
@@ -644,6 +740,7 @@ export const specPin: RegisteredTool = buildTool({
         ...pinContext,
         registration: renderStrings(prediction),
         pinDecision: renderStrings(decision as Record<string, unknown>),
+        approvalGate: gate.value,
         nothingWasChanged: true,
         auditRecord: AUDIT_LOG_UNAVAILABLE,
       });
@@ -921,7 +1018,7 @@ export const deployRollback: RegisteredTool = buildTool({
     { field: "env", kind: "id", within: "name", overlay: "tenant" },
   ],
   description:
-    'Repoint an environment (or a tenant\'s overlay of one) at an earlier registered version of a spec, through @crewhaus/deployment-controller\'s rollback. Use it to undo a bad deploy. DESTRUCTIVE: the registry has no unpin and keeps no pin history, so the binding this replaces survives nowhere afterwards. dryRun defaults to TRUE and runs the same selection the real call runs. It REFUSES a relative version word such as "previous" (there is no history to resolve it against; use DeployInspect to pick a version by name), a spec name the registry would store under another spelling (naming the stored one) or its listing hides (a leading "_"), a version this registry has never seen, a listed version whose file cannot be fetched (the environment would resolve to nothing while reading as a successful deploy), a manifest that cannot be read, and any path the registry would open that resolves outside the workspace. NO AUDIT RECORD IS WRITTEN, and the result says so next to the pin that changed.',
+    'Repoint an environment (or a tenant\'s overlay of one) at an earlier registered version of a spec, through @crewhaus/deployment-controller\'s rollback. Use it to undo a bad deploy. DESTRUCTIVE: the registry has no unpin and keeps no pin history, so the binding this replaces survives nowhere afterwards. dryRun defaults to TRUE and runs the same selection the real call runs. It REFUSES a relative version word such as "previous" (there is no history to resolve it against; use DeployInspect to pick a version by name), a spec name the registry would store under another spelling (naming the stored one) or its listing hides (a leading "_"), a version this registry has never seen, a listed version whose file cannot be fetched, a manifest that cannot be read, and any path the registry would open that resolves outside the workspace. A protected environment needs approvals naming the target\'s specHash (approval-required); dryRun reports the gate. NO AUDIT RECORD IS WRITTEN, and the result says so.',
   inputSchema: z.object({
     name: z.string().min(1).describe("the spec's name as the registry stores it"),
     env: z.string().min(1).describe("the environment whose pin should be repointed"),
@@ -1046,12 +1143,24 @@ export const deployRollback: RegisteredTool = buildTool({
       });
     }
 
+    // Every pin move into a protected environment takes its approval quorum, bound to the
+    // content of the version it repoints at.
+    const toVersion = plan.value.toVersion;
+    const gate = await approvalGate(name.registryName, input.env, toVersion, () =>
+      candidateSpecHash(registry, name.registryName, toVersion),
+    );
+    if (!gate.ok) return refusal(tool, gate.code, gate.reason, { ...common, plan: planReport });
+    if (!dryRun && gate.value.protected && !gate.value.satisfied) {
+      return approvalRequired(tool, input.env, gate.value, { ...common, plan: planReport });
+    }
+
     if (dryRun) {
       return json({
         ...common,
         status: "preview",
         dryRun: true,
         plan: planReport,
+        approvalGate: gate.value,
         nothingWasChanged: true,
         auditRecord: AUDIT_LOG_UNAVAILABLE,
       });

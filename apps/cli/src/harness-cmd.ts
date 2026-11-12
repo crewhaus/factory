@@ -22,8 +22,19 @@
  * + an exit code instead of writing to stdout. Bad arguments throw plain
  * `Error`s; the entry file routes them through `die()` like `route` does.
  */
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import {
+  ensureDigestKey,
+  readHarnessIdentity,
+  writeHarnessIdentity,
+} from "@crewhaus/control-records";
+import {
+  currentLocalIdentity,
+  ensureHarnessIdentity,
+  storedActorFor,
+} from "@crewhaus/control-service";
 import {
   baselineKeyFor,
   lineageOfEntry,
@@ -47,6 +58,7 @@ import {
   type HangarHarnessEntry,
   type HangarRegistry,
   openHangarRegistry,
+  resolveHangarRoot,
 } from "@crewhaus/harness-registry";
 import { buildSpawnEnv, harnessHookDisclosures, loadEnvChain } from "@crewhaus/harness-supervisor";
 import { preflightHarness } from "@crewhaus/preflight";
@@ -94,6 +106,11 @@ const HARNESS_USAGE_LINES: readonly string[] = [
   "  crewhaus harness preflight <dir|id> [--json]      typed will-it-boot checks (credentials,",
   "                                                    channel env, MCP refs, ports, bundle",
   "                                                    freshness); exits 1 on blocking findings",
+  "  crewhaus harness adopt <dir|hrn_id> [--slug <s>]  adopt a harness on this machine: a group",
+  "                                                    start includes it; writes its harness.json",
+  "                                                    when it has none",
+  "  crewhaus harness fork <dir>                       give a copied harness its own id (a fresh",
+  "                                                    harness.json) and register it",
   "",
   "  The registry is one JSON file, <registry-root>/harnesses.json",
   "  (CREWHAUS_REGISTRY_ROOT, default ~/.crewhaus). CREWHAUS_NO_REGISTRY=1",
@@ -406,6 +423,10 @@ async function harnessShow(
   // each last went — a hook that exists is a fact about the harness, not
   // something you should have to open settings.json to discover.
   const hooks = alive ? harnessHookDisclosures(entry.dir) : [];
+  // Loader settings the env files name, which a supervised start leaves out: names only.
+  const droppedEnv = alive
+    ? buildSpawnEnv({ harnessRoot: entry.dir, processEnv: process.env }).dropped
+    : [];
   if (boolFlag(args, "json")) {
     return {
       lines: jsonLines({
@@ -413,6 +434,7 @@ async function harnessShow(
         inventory: inventory ?? null,
         health: health ?? null,
         envFiles,
+        droppedEnv,
         hooks,
       }),
       exitCode: 0,
@@ -422,6 +444,11 @@ async function harnessShow(
   if (inventory !== undefined) lines.push(...inventoryRowLines(inventory));
   if (health !== undefined) lines.push(...healthLines(health));
   lines.push(...envChainLines(envFiles, "    "));
+  if (droppedEnv.length > 0) {
+    lines.push(
+      `    left out of a supervised start (taken only from the manager's own environment): ${droppedEnv.join(", ")}`,
+    );
+  }
   for (const hook of hooks) {
     const last =
       hook.lastRunAt === undefined
@@ -464,6 +491,81 @@ function harnessAdd(reg: HangarRegistry, argv: readonly string[]): HarnessComman
   );
   lines.push(...disabledNote(reg));
   return { lines, exitCode: 0 };
+}
+
+/** Register a directory that is not registered yet, the way `harness add` does. */
+function registerDir(reg: HangarRegistry, dir: string, originDetail: string): HangarHarnessEntry {
+  const header = lenientHeader(dir);
+  return reg.upsert({
+    dir,
+    ...(header?.name !== undefined ? { specName: header.name } : {}),
+    ...(header?.target !== undefined ? { target: header.target } : {}),
+    origin: "manual",
+    originDetail,
+  });
+}
+
+async function harnessAdopt(
+  reg: HangarRegistry,
+  argv: readonly string[],
+  opts: HarnessCommandOptions,
+): Promise<HarnessCommandResult> {
+  const args = parseVerbArgs("adopt", argv, { slug: "value" });
+  const key = requirePositional("adopt", args, 0, "<dir|hrn_id>");
+  let entry = reg.get(key);
+  if (entry === undefined) {
+    const dir = resolve(key);
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) {
+      throw new Error(`no registered harness or directory matches "${key}"`);
+    }
+    entry = registerDir(reg, dir, "harness adopt");
+  }
+  const identity = ensureHarnessIdentity(entry.dir, entry.id);
+  if (!identity.ok) throw new Error(`harness adopt: harness.json: ${identity.reason}`);
+  // A harness.json that names an id no row holds re-keys the row on registration.
+  if (identity.id !== entry.id) entry = registerDir(reg, entry.dir, "harness adopt");
+  const key0 = await ensureDigestKey(entry.dir);
+  if (key0.state !== "present") {
+    throw new Error("harness adopt: the harness's digest key cannot be read; nothing was adopted");
+  }
+  const env = opts.env ?? process.env;
+  const by = await storedActorFor(resolveHangarRoot(env), currentLocalIdentity(), key0.hmac);
+  const slugFlag = args.flags.get("slug");
+  const adopted = reg.adopt(entry.id, by, typeof slugFlag === "string" ? { slug: slugFlag } : {});
+  if (adopted === undefined) {
+    throw new Error(`no registered harness matches "${key}" — see \`crewhaus harness list\``);
+  }
+  return {
+    lines: [
+      `adopted ${adopted.specName} (${adopted.id}) on this machine${
+        adopted.slug !== undefined ? ` as ${adopted.slug}` : ""
+      } — a group start includes it`,
+      ...disabledNote(reg),
+    ],
+    exitCode: 0,
+  };
+}
+
+function harnessFork(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
+  const args = parseVerbArgs("fork", argv, {});
+  const dir = resolve(requirePositional("fork", args, 0, "<dir>"));
+  if (!existsSync(dir) || !statSync(dir).isDirectory()) {
+    throw new Error(`harness fork: no directory at ${dir}`);
+  }
+  const before = readHarnessIdentity(dir);
+  const id = `hrn_${randomBytes(8).toString("hex")}`;
+  const written = writeHarnessIdentity(dir, { id, createdAt: new Date().toISOString() });
+  if (!written.ok) throw new Error(`harness fork: harness.json: ${written.reason}`);
+  const entry = registerDir(reg, dir, "harness fork");
+  return {
+    lines: [
+      `forked ${entry.specName}: its own id is ${entry.id}${
+        before.state === "present" ? ` (was ${before.identity.id})` : ""
+      }`,
+      ...disabledNote(reg),
+    ],
+    exitCode: 0,
+  };
 }
 
 function harnessRemove(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
@@ -765,8 +867,15 @@ async function harnessPreflight(
     hooks: harnessHookDisclosures(dir),
   });
   const exitCode: 0 | 1 = report.ok ? 0 : 1;
-  if (boolFlag(args, "json")) return { lines: jsonLines(report), exitCode };
+  if (boolFlag(args, "json")) {
+    return { lines: jsonLines({ ...report, droppedEnv: spawnEnv.dropped }), exitCode };
+  }
   const lines: string[] = [`preflight ${label} (${dir}):`, ""];
+  if (spawnEnv.dropped.length > 0) {
+    lines.push(
+      `ⓘ left out of a supervised start (taken only from the manager's own environment): ${spawnEnv.dropped.join(", ")}`,
+    );
+  }
   for (const item of report.items) {
     const mark = item.level === "blocking" ? "✗" : item.level === "warn" ? "⚠" : "✓";
     lines.push(`${mark} ${item.message}`);
@@ -821,9 +930,13 @@ export async function runHarnessCommand(
       return harnessScan(reg, rest, opts);
     case "preflight":
       return await harnessPreflight(reg, rest, opts);
+    case "adopt":
+      return await harnessAdopt(reg, rest, opts);
+    case "fork":
+      return harnessFork(reg, rest);
     default:
       throw new Error(
-        `unknown harness verb "${verb}" (expected: list | show | add | remove | relocate | group | tag | pin | scan | preflight)`,
+        `unknown harness verb "${verb}" (expected: list | show | add | remove | relocate | group | tag | pin | scan | preflight | adopt | fork)`,
       );
   }
 }

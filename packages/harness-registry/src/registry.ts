@@ -30,12 +30,17 @@
  * own API — this package never touches the watchme file format directly.
  */
 import {
+  closeSync,
   existsSync,
+  constants as fsConstants,
+  lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -51,6 +56,7 @@ import {
   sleepSync,
   sortDoc,
 } from "./doc.js";
+import { readHarnessIdentityFile } from "./identity.js";
 import type {
   GroupDef,
   HangarHarnessEntry,
@@ -77,7 +83,44 @@ export type OpenHangarRegistryOptions = {
   /** Internal test seam: invoked after every document read inside the
    *  read-merge-write loop (used to exercise the concurrent-writer retry). */
   readonly hooks?: { readonly afterRead?: () => void };
+  /** Home's root, for the id map a re-keyed row is recorded in. Default:
+   *  `CREWHAUS_HANGAR_ROOT`, else `<registry root>/hangar`. */
+  readonly hangarRoot?: string;
 };
+
+/**
+ * Whether a row counts as adopted on this machine for a group start: it carries `home`; or,
+ * never moved to another directory (`relocatedAt`), it was registered strictly before
+ * `adoptionSince`, or `adoptionSince` is absent (no write from a registry that knows
+ * adoption has happened, so every row predates it).
+ */
+export function isAdopted(entry: HangarHarnessEntry, adoptionSince: string | undefined): boolean {
+  if (entry.home !== undefined) return true;
+  if (typeof entry.relocatedAt === "string") return false;
+  if (adoptionSince === undefined) return true;
+  const registered = Date.parse(entry.registeredAt);
+  const since = Date.parse(adoptionSince);
+  if (!Number.isFinite(registered) || !Number.isFinite(since)) return false;
+  return registered < since;
+}
+
+/** A spec name as a slug: lower-kebab, letters and digits. */
+export function slugOf(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug === "" ? "harness" : slug;
+}
+
+/** A slug no other row holds: `name`, then `name-2`, `name-3`… */
+function uniqueSlug(base: string, taken: ReadonlySet<string>): string {
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n += 1) {
+    const candidate = `${base}-${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
 
 /** Fields accepted by {@link HangarRegistry.upsert}. Only `dir` is
  *  required; callers supply `specName`/`target` (no spec parsing here). */
@@ -222,6 +265,15 @@ export type HangarRegistry = {
    *  throws, respects `CREWHAUS_NO_REGISTRY`, registers with origin
    *  `run-hook`. */
   registerHook(fields: RegisterHookFields): RegisterHookResult;
+  /** Adopt a harness on this machine: record `home` on its row (and a `slug`, when
+   *  given). `by` is a stored actor ref. `undefined` when no row matches. */
+  adopt(
+    dirOrId: string,
+    by: string,
+    opts?: { readonly slug?: string },
+  ): HangarHarnessEntry | undefined;
+  /** When the first write from a registry that knows adoption landed; `undefined` before. */
+  adoptionSince(): string | undefined;
   /** One-time merge of the legacy watchme registry (idempotent — safe to
    *  call every boot; already-registered dirs are left untouched). Imported
    *  entries get origin `import` / originDetail `watchme`. */
@@ -343,13 +395,19 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
    *  — mirroring the disabled path — instead of failing a semantic read. */
   const mutate = <T>(
     fn: Mutation<T>,
-    mutateOpts: { readonly degradeOnWriteError?: boolean } = {},
+    mutateOpts: { readonly degradeOnWriteError?: boolean; readonly stampIso?: string } = {},
   ): { result: T; wrote: boolean } => {
     if (disabled) {
       const out = fn(read());
       return { result: out.result, wrote: false };
     }
-    const tryWrite = (doc: HangarRegistryDoc): boolean => {
+    const tryWrite = (written: HangarRegistryDoc): boolean => {
+      // The first write from a registry that knows adoption stamps when that began, with
+      // the write's own timestamp, so a row this write registers is not "before" it.
+      const doc =
+        written.adoptionSince === undefined
+          ? { ...written, adoptionSince: mutateOpts.stampIso ?? nowIso() }
+          : written;
       try {
         writeDoc(doc);
         return true;
@@ -478,56 +536,160 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
   const upsert = (fields: UpsertFields): HangarHarnessEntry => {
     const dir = resolve(fields.dir);
     const stampIso = nowIso();
-    const { result, wrote } = mutate<HangarHarnessEntry>((state) => {
-      const existing = state.doc.harnesses.find((e) => e.dir === dir);
-      let entry: HangarHarnessEntry;
-      if (existing !== undefined) {
-        entry = {
-          ...existing,
-          specName: fields.specName ?? existing.specName,
-          target: fields.target ?? existing.target,
-          kind: fields.kind ?? existing.kind,
-          watchme:
-            fields.watchme !== undefined
-              ? { ...existing.watchme, share: fields.watchme.share }
-              : existing.watchme,
-          remotes: fields.remotes !== undefined ? [...fields.remotes] : existing.remotes,
-          lastSeen: stampIso,
-          missingSince: null,
+    // The harness's own id, when it carries one: read once, never written here.
+    const own = readHarnessIdentityFile(dir);
+    let rekeyed: { readonly from: string; readonly to: string } | undefined;
+    const { result, wrote } = mutate<HangarHarnessEntry>(
+      (state) => {
+        rekeyed = undefined;
+        const existing = state.doc.harnesses.find((e) => e.dir === dir);
+        const holder =
+          own === undefined ? undefined : state.doc.harnesses.find((e) => e.id === own.id);
+        let entry: HangarHarnessEntry;
+        if (existing !== undefined) {
+          // A row whose harness names an id no row holds takes that id.
+          const id =
+            own !== undefined && own.id !== existing.id && holder === undefined
+              ? own.id
+              : existing.id;
+          if (id !== existing.id) rekeyed = { from: existing.id, to: id };
+          entry = {
+            ...existing,
+            id,
+            specName: fields.specName ?? existing.specName,
+            target: fields.target ?? existing.target,
+            kind: fields.kind ?? existing.kind,
+            watchme:
+              fields.watchme !== undefined
+                ? { ...existing.watchme, share: fields.watchme.share }
+                : existing.watchme,
+            remotes: fields.remotes !== undefined ? [...fields.remotes] : existing.remotes,
+            lastSeen: stampIso,
+            missingSince: null,
+          };
+        } else {
+          const taken = new Set(state.doc.harnesses.map((e) => e.id));
+          // A new row takes its harness's own id when no row holds it; a copy of a
+          // registered harness mints its own and records where it came from.
+          const forkOf = own !== undefined && holder !== undefined ? own.id : undefined;
+          const id = own !== undefined && holder === undefined ? own.id : mint(dir, taken);
+          const specName = fields.specName ?? basename(dir);
+          const slugs = new Set(
+            state.doc.harnesses
+              .map((e) => e.slug)
+              .filter((slug): slug is string => typeof slug === "string"),
+          );
+          entry = {
+            id,
+            ...(forkOf !== undefined ? { identity: `fork-of ${forkOf}` } : {}),
+            slug: uniqueSlug(slugOf(specName), slugs),
+            dir,
+            specName,
+            target: fields.target ?? "unknown",
+            origin: fields.origin ?? "manual",
+            originDetail: fields.originDetail ?? "",
+            registeredAt: stampIso,
+            lastSeen: stampIso,
+            groups: [...(fields.groups ?? [])],
+            tags: [...(fields.tags ?? [])],
+            pinned: fields.pinned ?? false,
+            hidden: false,
+            notes: fields.notes ?? "",
+            kind: fields.kind ?? "local",
+            watchme: { share: fields.watchme?.share ?? false },
+            remotes: fields.remotes !== undefined ? [...fields.remotes] : [],
+            missingSince: null,
+          };
+        }
+        return {
+          doc: {
+            ...state.doc,
+            harnesses: [...state.doc.harnesses.filter((e) => e.dir !== dir), entry],
+          },
+          result: entry,
+          write: true,
         };
-      } else {
-        const taken = new Set(state.doc.harnesses.map((e) => e.id));
-        entry = {
-          id: mint(dir, taken),
-          dir,
-          specName: fields.specName ?? basename(dir),
-          target: fields.target ?? "unknown",
-          origin: fields.origin ?? "manual",
-          originDetail: fields.originDetail ?? "",
-          registeredAt: stampIso,
-          lastSeen: stampIso,
-          groups: [...(fields.groups ?? [])],
-          tags: [...(fields.tags ?? [])],
-          pinned: fields.pinned ?? false,
-          hidden: false,
-          notes: fields.notes ?? "",
-          kind: fields.kind ?? "local",
-          watchme: { share: fields.watchme?.share ?? false },
-          remotes: fields.remotes !== undefined ? [...fields.remotes] : [],
-          missingSince: null,
-        };
-      }
-      return {
-        doc: {
-          ...state.doc,
-          harnesses: [...state.doc.harnesses.filter((e) => e.dir !== dir), entry],
-        },
-        result: entry,
-        write: true,
-      };
-    });
+      },
+      { stampIso },
+    );
+    if (wrote && rekeyed !== undefined) {
+      recordIdMap({ at: stampIso, from: rekeyed.from, to: rekeyed.to, dir });
+    }
     if (wrote) watchmeRefresh(result);
     return result;
+  };
+
+  /** Append one re-key to `<hangarRoot>/control/id-map.jsonl`. Best-effort. */
+  const recordIdMap = (row: {
+    readonly at: string;
+    readonly from: string;
+    readonly to: string;
+    readonly dir: string;
+  }): void => {
+    const explicit = env["CREWHAUS_HANGAR_ROOT"];
+    const hangarRoot =
+      opts.hangarRoot ??
+      (explicit !== undefined && explicit !== "" ? resolve(explicit) : join(root, "hangar"));
+    const controlDir = join(hangarRoot, "control");
+    try {
+      mkdirSync(controlDir, { recursive: true, mode: 0o700 });
+      if (lstatSync(controlDir).isSymbolicLink()) throw new Error(`${controlDir} is a link`);
+      // Appended through a descriptor that refuses a link at the file itself.
+      const fd = openSync(
+        join(controlDir, "id-map.jsonl"),
+        fsConstants.O_WRONLY |
+          fsConstants.O_APPEND |
+          fsConstants.O_CREAT |
+          (fsConstants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      try {
+        writeSync(fd, `${JSON.stringify(row)}\n`);
+      } finally {
+        closeSync(fd);
+      }
+    } catch (err) {
+      onWarn(
+        `harness-registry: could not record the re-key of ${row.from}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  };
+
+  const adopt = (
+    dirOrId: string,
+    by: string,
+    adoptOpts: { readonly slug?: string } = {},
+  ): HangarHarnessEntry | undefined => {
+    const stampIso = nowIso();
+    const { result } = mutate<HangarHarnessEntry | undefined>(
+      (state) => {
+        const entry = findEntry(state.doc, dirOrId);
+        if (entry === undefined) return { doc: state.doc, result: undefined, write: false };
+        const slugs = new Set(
+          state.doc.harnesses
+            .filter((e) => e.id !== entry.id)
+            .map((e) => e.slug)
+            .filter((slug): slug is string => typeof slug === "string"),
+        );
+        const slug =
+          adoptOpts.slug !== undefined ? uniqueSlug(slugOf(adoptOpts.slug), slugs) : entry.slug;
+        const next: HangarHarnessEntry = {
+          ...entry,
+          ...(slug !== undefined ? { slug } : {}),
+          home: { adoptedAt: stampIso, by },
+        };
+        return { doc: replaceEntry(state.doc, next), result: next, write: true };
+      },
+      { stampIso },
+    );
+    return result;
+  };
+
+  const adoptionSince = (): string | undefined => {
+    const value = read().doc.adoptionSince;
+    return typeof value === "string" ? value : undefined;
   };
 
   const remove = (dirOrId: string): boolean => {
@@ -559,7 +721,12 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
         );
       }
       oldDir = entry.dir;
-      const next = { ...entry, dir, missingSince: null, lastSeen: stampIso };
+      // Adoption does not travel: a row moved to a new directory is adopted again there.
+      const { home: _home, ...rest } = entry;
+      const next: HangarHarnessEntry =
+        dir === entry.dir
+          ? { ...entry, missingSince: null, lastSeen: stampIso }
+          : { ...rest, dir, missingSince: null, lastSeen: stampIso, relocatedAt: stampIso };
       return { doc: replaceEntry(state.doc, next), result: next, write: true };
     });
     if (wrote && result !== undefined && oldDir !== undefined && oldDir !== result.dir) {
@@ -870,6 +1037,8 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
     removeScanRoot,
     registerHook,
     seedFromWatchme,
+    adopt,
+    adoptionSince,
   };
 }
 

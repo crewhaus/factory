@@ -8,7 +8,8 @@
  */
 import { AREA_MODULES, COMMAND_KINDS } from "@crewhaus/control-contract";
 import { CORE_RUNTIME } from "./core-runtime";
-import type { AreaRuntime } from "./executor";
+import { PROTECTED_ENVIRONMENT_GATE } from "./deployments";
+import type { ActivationGate, AreaRuntime } from "./executor";
 
 // import { ATTENTION_RUNTIME } from "./areas/attention";
 
@@ -102,5 +103,30 @@ export function compositionProblems(areas: readonly AreaRuntime[]): readonly str
       );
     }
   }
+  const gates = new Map<string, string>();
+  for (const runtime of areas) {
+    for (const gate of runtime.activationGates ?? []) {
+      const first = gates.get(gate.name);
+      if (first !== undefined) {
+        problems.push(
+          `activation gate "${gate.name}" registered twice (areas "${first}" and "${runtime.area}")`,
+        );
+      } else {
+        gates.set(gate.name, runtime.area);
+      }
+    }
+  }
+  const order = activationGates(areas);
+  if (
+    order.some((gate) => gate.name === PROTECTED_ENVIRONMENT_GATE) &&
+    order[0]?.name !== PROTECTED_ENVIRONMENT_GATE
+  ) {
+    problems.push(`the core's "${PROTECTED_ENVIRONMENT_GATE}" activation gate is not first`);
+  }
   return problems;
+}
+
+/** Every area's activation gates, flattened in composition order. */
+export function activationGates(areas: readonly AreaRuntime[]): readonly ActivationGate[] {
+  return areas.flatMap((runtime) => runtime.activationGates ?? []);
 }

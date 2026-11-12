@@ -32,6 +32,7 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { readDeployments } from "@crewhaus/control-records";
 import { readManagerSettings } from "./manager-settings";
 import type { EnvOverride, RunClass, RunKind } from "./types";
 
@@ -171,9 +172,36 @@ export function resolveBundle(harnessRoot: string, target: string): BundleLocati
   for (const candidate of BUNDLE_DIR_CANDIDATES) {
     const bundleDir = candidate === "." ? harnessRoot : join(harnessRoot, candidate);
     const entryPath = join(bundleDir, entry);
-    if (existsSync(entryPath)) return { bundleDir, entry, entryPath };
+    if (!existsSync(entryPath)) continue;
+    // A root entry is a bundle only when crewhaus compiled it there: a deployment record
+    // names a root entry, or compile's stamped manifest sits at the root.
+    if (candidate === "." && !rootBundleCompiled(harnessRoot)) continue;
+    return { bundleDir, entry, entryPath };
   }
   return undefined;
+}
+
+/** The `name` `crewhaus compile` stamps into a manifest it wrote. */
+const COMPILED_MANIFEST_NAME = "crewhaus-compiled-bundle";
+
+/** Whether `crewhaus compile` put a bundle at the harness root. */
+export function rootBundleCompiled(harnessRoot: string): boolean {
+  try {
+    const manifest = JSON.parse(readFileSync(join(harnessRoot, "package.json"), "utf8")) as {
+      name?: unknown;
+    };
+    if (manifest.name === COMPILED_MANIFEST_NAME) return true;
+  } catch {
+    // No manifest, or not ours: the records decide.
+  }
+  const read = readDeployments(harnessRoot);
+  if (read.state !== "present") return false;
+  return read.records.some((record) => {
+    const artifact = record["artifact"];
+    if (typeof artifact !== "object" || artifact === null) return false;
+    const entry = (artifact as { entry?: unknown }).entry;
+    return typeof entry === "string" && entry !== "" && !entry.includes("/");
+  });
 }
 
 export type BinResolverDeps = {
@@ -391,7 +419,61 @@ export type SpawnEnv = {
   /** The full chain including declared-but-absent shared files. */
   readonly envFileRefs: readonly EnvFileRef[];
   readonly overrides: readonly EnvOverride[];
+  /** Loader settings the env files named and the spawn left out: names only. */
+  readonly dropped: readonly string[];
 };
+
+/**
+ * Loader and interpreter settings a supervised start takes only from the environment the
+ * manager was started with, never from a harness's env files. Matched by exact name here
+ * and by family in `LOADER_ENV_PREFIXES`; names are compared as written.
+ */
+export const LOADER_ENV_KEYS = [
+  "BUN_OPTIONS",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "BASH_ENV",
+  "ENV",
+  "CHVM_DIR",
+  "SHELLOPTS",
+  "BASHOPTS",
+  "PS4",
+  "IFS",
+  "PATH",
+  "GCONV_PATH",
+  "PERL5OPT",
+  "PERL5LIB",
+  "PERLLIB",
+  "RUBYOPT",
+  "RUBYLIB",
+  "PYTHONPATH",
+  "PYTHONHOME",
+  "PYTHONSTARTUP",
+  "JAVA_TOOL_OPTIONS",
+  "_JAVA_OPTIONS",
+  "JDK_JAVA_OPTIONS",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_EXEC_PATH",
+  "GIT_ASKPASS",
+  "GIT_PROXY_COMMAND",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_TEMPLATE_DIR",
+] as const;
+
+/** Families matched by prefix. Never a bare `NODE_` or `BUN_`: `NODE_ENV` is an app setting. */
+export const LOADER_ENV_PREFIXES = ["GIT_CONFIG_", "LD_", "DYLD_", "BASH_FUNC_"] as const;
+
+const LOADER_ENV_KEY_SET: ReadonlySet<string> = new Set(LOADER_ENV_KEYS);
+
+/** Whether a name is a loader setting a spawn takes only from the manager's environment. */
+export function isLoaderEnvKey(name: string): boolean {
+  return (
+    LOADER_ENV_KEY_SET.has(name) || LOADER_ENV_PREFIXES.some((prefix) => name.startsWith(prefix))
+  );
+}
 
 /**
  * Build the exact environment a spawn receives: harness `.env` chain UNDER
@@ -402,9 +484,22 @@ export type SpawnEnv = {
 export function buildSpawnEnv(input: SpawnEnvInput): SpawnEnv {
   const chain = input.envChain ?? loadEnvChain(input.harnessRoot);
   const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(chain.vars)) env[k] = v;
+  const dropped = new Set<string>();
+  for (const [k, v] of Object.entries(chain.vars)) {
+    if (isLoaderEnvKey(k)) {
+      dropped.add(k);
+      continue;
+    }
+    env[k] = v;
+  }
   for (const [k, v] of Object.entries(input.processEnv)) {
-    if (typeof v === "string") env[k] = v;
+    if (typeof v !== "string") continue;
+    // A loader setting whose value is the env files' own came from them (loaded into the
+    // manager's environment at its start), not from whoever started the manager.
+    // `PATH` is the one exception: the child always runs with the manager's `PATH`.
+    if (isLoaderEnvKey(k) && chain.vars[k] === v && k !== "PATH") continue;
+    if (isLoaderEnvKey(k)) dropped.delete(k);
+    env[k] = v;
   }
   env["CREWHAUS_TRACE"] = "json";
   env["CREWHAUS_COST_TRACKING"] = "1";
@@ -422,7 +517,13 @@ export function buildSpawnEnv(input: SpawnEnvInput): SpawnEnv {
           : "env-file";
     overrides.push({ name, value, source });
   }
-  return { env, envFiles: chain.files, envFileRefs: chain.refs, overrides };
+  return {
+    env,
+    envFiles: chain.files,
+    envFileRefs: chain.refs,
+    overrides,
+    dropped: [...dropped].sort(),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +630,8 @@ export type SpawnPlan = {
   readonly supervised: boolean;
   readonly entry: string;
   readonly bundleDir: string;
+  /** The spec a launch from source runs (`interpreter`, `cli-verb`). */
+  readonly specPath?: string;
   readonly ports: {
     readonly port?: number;
     readonly gatewayPort?: number;
@@ -621,6 +724,7 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
       canResume: false,
       entry: "serve --mcp",
       bundleDir: harnessRoot,
+      specPath,
     };
   }
 
@@ -639,6 +743,7 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
       canResume: true,
       entry: specPath,
       bundleDir: harnessRoot,
+      specPath,
     };
   }
 

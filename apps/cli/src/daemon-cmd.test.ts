@@ -22,7 +22,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { append, foldStates } from "@crewhaus/control-records";
 import { commandsLedgerOf } from "@crewhaus/control-service";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
@@ -186,7 +186,7 @@ type GroupFixture = {
  * Deliberately REGISTERED in the opposite order, so a walk that happens to
  * follow registry insertion order fails the test.
  */
-function groupFixture(options: { withCli?: boolean } = {}): GroupFixture {
+function groupFixture(options: { withCli?: boolean; adopt?: boolean } = {}): GroupFixture {
   const root = mkdtempSync(join(tmpdir(), "daemon-group-"));
   const registryRoot = join(root, "registry");
   const ops = fakeOps(() => Date.now());
@@ -210,6 +210,8 @@ function groupFixture(options: { withCli?: boolean } = {}): GroupFixture {
     dirs.set(name, dir);
     const reg = openHangarRegistry({ root: registryRoot, env: {} });
     reg.upsert({ dir, specName: name, target, origin: "manual", originDetail: "test" });
+    // A group start runs the members adopted on this machine.
+    if (options.adopt !== false) reg.adopt(dir, `local:#${"0".repeat(64)}`);
     reg.addGroup({ name: "crew" });
     reg.setGroups(dir, ["crew"]);
     if (order !== undefined) reg.setGroupOrder(dir, "crew", order);
@@ -518,6 +520,47 @@ describe("crewhaus daemon", () => {
       const stopped = await runDaemonCommand(["stop", "--group", "crew"], g.opts);
       expect(stopped.exitCode).toBe(0);
       expect(g.signalledNames()).toEqual(["chief", "archivist", "secretary"]);
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  test("a group start skips a member not adopted here, and starts it once adopted", async () => {
+    const g = groupFixture({ adopt: false });
+    try {
+      const out = await runDaemonCommand(["start", "--group", "crew", "--no-preflight"], g.opts);
+      expect(out.lines.join("\n")).toContain(
+        "not adopted on this machine — crewhaus harness adopt",
+      );
+      expect(g.spawnedNames()).toEqual([]);
+      const reg = openHangarRegistry({
+        root: join(dirname(g.dirOf("chief")), "registry"),
+        env: {},
+      });
+      reg.adopt(g.dirOf("chief"), `local:#${"0".repeat(64)}`);
+      await runDaemonCommand(["start", "--group", "crew", "--no-preflight"], g.opts);
+      expect(g.spawnedNames()).toEqual(["chief"]);
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  test("a group member whose build is not the active one is refused; a single start records it", async () => {
+    const g = groupFixture();
+    try {
+      // The first start records and activates what is there.
+      await runDaemonCommand(["start", "--no-preflight"], { ...g.opts, cwd: g.dirOf("chief") });
+      await runDaemonCommand(["stop"], { ...g.opts, cwd: g.dirOf("chief") });
+      writeFileSync(join(g.dirOf("chief"), "dist", "daemon.ts"), "// recompiled\n");
+      const group = await runDaemonCommand(["start", "--group", "crew", "--no-preflight"], g.opts);
+      expect(group.lines.join("\n")).toContain("isn't the active deployment");
+      const before = g.spawnedNames().filter((n) => n === "chief").length;
+      const single = await runDaemonCommand(["start", "--no-preflight"], {
+        ...g.opts,
+        cwd: g.dirOf("chief"),
+      });
+      expect(single.exitCode).toBe(0);
+      expect(g.spawnedNames().filter((n) => n === "chief").length).toBe(before + 1);
     } finally {
       g.cleanup();
     }
@@ -1194,6 +1237,23 @@ describe("crewhaus daemon writes a receipt for every change", () => {
       expect((rejected[0]?.["outcome"] as { code: string }).code).toBe("conflict");
       expect(again.lines.at(-1)).toBe(`Not done (${rejected[0]?.["id"]})`);
       expect(receiptsOf(f.dir).filter((r) => r["state"] === "succeeded")).toHaveLength(1);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("an unregistered harness with a harness.json is named by its id in the receipt", async () => {
+    const f = fixture();
+    try {
+      const id = "hrn_00000000000000c1";
+      mkdirSync(join(f.dir, ".crewhaus", "run", "control"), { recursive: true });
+      writeFileSync(
+        join(f.dir, ".crewhaus", "run", "control", "harness.json"),
+        JSON.stringify({ v: 1, id, createdAt: "2026-11-12T00:00:00.000Z" }),
+      );
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const start = receiptsOf(f.dir).find((r) => r["kind"] === "controls.start");
+      expect(start?.["target"]).toBe(`home/harness/${id}`);
     } finally {
       f.cleanup();
     }

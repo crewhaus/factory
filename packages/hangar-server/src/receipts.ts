@@ -65,6 +65,12 @@ export function commandFields(): { readonly commandId?: string; readonly by?: st
   return { commandId: context.commandId, by: context.by };
 }
 
+/** The command the current request runs for, read only (it queues nothing). */
+export function currentCommand(): { readonly commandId: string; readonly by: string } | undefined {
+  const context = commandContext.getStore();
+  return context === undefined ? undefined : { commandId: context.commandId, by: context.by };
+}
+
 const M3_KEYS: ReadonlySet<string> = new Set(M3_ROUTES.map((route) => route.key));
 
 /** The error code an answer's status means. */

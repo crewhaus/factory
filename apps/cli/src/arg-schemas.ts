@@ -1843,3 +1843,15 @@ export const FEDERATION_SCHEMA: ParseArgsSchema = {
     { name: "help", short: "h" },
   ],
 };
+
+// `crewhaus deploy activate [<dep>]` / `crewhaus deploy list`: a harness's deployment
+// records. The handlers in deploy-activate-cmd.ts read the same flags.
+export const DEPLOY_ACTIVATE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "harness", takesValue: true },
+    { name: "environment", takesValue: true },
+    { name: "no-autostart", takesValue: false },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};

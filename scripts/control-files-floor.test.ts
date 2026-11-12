@@ -164,6 +164,8 @@ const GATE_DIRS = [
   ".crewhaus/audit",
   ".crewhaus/graphs",
   ".crewhaus/advice",
+  // `crewhaus cloud`'s working directory.
+  ".crewhaus/cloud",
   // The durable-execution idempotency records.
   ".crewhaus/idempotency",
 ];

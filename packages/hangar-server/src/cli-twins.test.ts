@@ -128,6 +128,7 @@ const WATCHME_FLAGS = [
   "help",
 ];
 const APPROVALS_FLAGS = ["dir", "by", "once", "always", "reason", "until", "json", "help"];
+const DEPLOY_ACTIVATE_FLAGS = ["harness", "environment", "no-autostart", "json", "help"];
 
 const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
   harness: {
@@ -141,6 +142,12 @@ const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly str
     pin: ["off"],
     scan: ["root"],
     preflight: ["json"],
+    adopt: ["slug"],
+    fork: [],
+  },
+  deploy: {
+    activate: DEPLOY_ACTIVATE_FLAGS,
+    list: DEPLOY_ACTIVATE_FLAGS,
   },
   daemon: {
     start: ["force", "ack", "no-preflight", "compile", "no-compile"],
@@ -325,6 +332,18 @@ describe("the dispatch table matches the CLI", () => {
     expect(rejectionReason("crewhaus dream init crewhaus.yaml")).toBeNull();
   });
 
+  test("the deploy activate and list flags are the ones the CLI declares", () => {
+    const schemas = readFileSync(join(CLI_SRC, "arg-schemas.ts"), "utf8");
+    expect(schemaFlags(schemas, "DEPLOY_ACTIVATE_SCHEMA")).toEqual(DEPLOY_ACTIVATE_FLAGS);
+    const index = readFileSync(join(CLI_SRC, "index.ts"), "utf8");
+    expect(index).toContain('if (action === "activate" || action === "list") {');
+    expect(
+      rejectionReason(
+        "crewhaus deploy activate dep_01m76e6f05hp514w9j4v3qymka --harness hrn_0123456789abcdef",
+      ),
+    ).toBeNull();
+  });
+
   test("the approvals verbs and flags are the ones the CLI declares", () => {
     const schemas = readFileSync(join(CLI_SRC, "arg-schemas.ts"), "utf8");
     expect(schemaFlags(schemas, "APPROVALS_SCHEMA")).toEqual(APPROVALS_FLAGS);
@@ -492,12 +511,14 @@ describe("every twin the contract declares would run if pasted", () => {
       appr: "appr_0123456789abcdef",
       dir: "/srv/poly",
       choice: "grant",
+      dep: "dep_01m76e6f05hp514w9j4v3qymka",
     },
     {
       hrn: "hrn_0123456789abcdef",
       appr: "appr_0123456789abcdef",
       dir: "/srv/poly",
       choice: "deny",
+      dep: "dep_01m76e6f05hp514w9j4v3qymka",
     },
   ];
 
@@ -519,8 +540,8 @@ describe("every twin the contract declares would run if pasted", () => {
         checked++;
       }
     }
-    // Eight operation twins, five command kinds and seven route rows, each rendered twice.
-    expect(checked).toBeGreaterThanOrEqual(40);
+    // Ten operation twins, six command kinds and eight route rows, each rendered twice.
+    expect(checked).toBeGreaterThanOrEqual(48);
   });
 
   test("the checker refuses a verb the CLI does not have", () => {

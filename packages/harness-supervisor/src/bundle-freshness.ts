@@ -18,9 +18,9 @@
  * resets them, clock skew inverts them) — and the verdict says so, because a
  * caller gating a daemon spawn needs to know which of the two answers it got.
  */
-import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { specRevision } from "@crewhaus/ir/policy";
 
 /** The `name` the compile stamps into manifests it owns. */
 export const BUNDLE_MANIFEST_NAME = "crewhaus-compiled-bundle";
@@ -29,16 +29,10 @@ export const BUNDLE_MANIFEST_NAME = "crewhaus-compiled-bundle";
 export const BUNDLE_STAMP_KEY = "crewhaus";
 
 /**
- * Digest of a spec's SOURCE TEXT. Line endings are normalized (CRLF/CR → LF)
- * and a single trailing newline is ignored, so the same spec checked out on
- * Windows is not reported as changed. Nothing else is normalized: whitespace
- * inside a spec CAN change behavior (block scalars carry indentation into
- * `instructions`), so ignoring it would under-report real drift.
+ * Digest of a spec's SOURCE TEXT: the one revision function every check shares
+ * (`@crewhaus/ir/policy`'s `specRevision`).
  */
-export function hashSpecSource(specYaml: string): string {
-  const normalized = specYaml.replace(/\r\n?/g, "\n").replace(/\n$/, "");
-  return `sha256:${createHash("sha256").update(normalized, "utf8").digest("hex")}`;
-}
+export const hashSpecSource: (specYaml: string) => string = specRevision;
 
 export type BundleFreshness = {
   /** `fresh`/`stale` are EXACT (hash-compared); `approximate-*` come from

@@ -44,7 +44,7 @@ export function runsLedger(root: string, machine?: MachineName): Ledger {
 export function deploymentsLedger(root: string, machine?: MachineName): Ledger {
   return harnessLedger(
     root,
-    { file: join(controlPaths(root).controlDir, "deployments.jsonl") },
+    { file: controlPaths(root).deploymentsFile },
     machine !== undefined ? { machine } : {},
   );
 }

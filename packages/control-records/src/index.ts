@@ -90,3 +90,13 @@ export {
   holderProvablyDead,
 } from "./lease";
 export { type RunnableMode, type RunnableVerdict, assertRunnable } from "./runnable";
+export {
+  type DeploymentsRead,
+  type HarnessIdentity,
+  type HarnessIdentityRead,
+  type IdentityWrite,
+  deploymentsLedger,
+  readDeployments,
+  readHarnessIdentity,
+  writeHarnessIdentity,
+} from "./deployments";

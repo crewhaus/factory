@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { AREA_RUNTIMES, compositionProblems } from "./areas";
+import { AREA_RUNTIMES, activationGates, compositionProblems } from "./areas";
 import { CORE_RUNTIME } from "./core-runtime";
-import type { AreaRuntime, Executor } from "./executor";
+import type { ActivationGate, AreaRuntime, Executor } from "./executor";
 import { IDENTITY, fakeProbe, removeTempDirs, tempDir } from "./test-helpers";
 import { wireControl } from "./wire";
 
@@ -26,7 +26,7 @@ function wireWith(areas: readonly AreaRuntime[]) {
 }
 
 describe("the composition", () => {
-  test("the shipped composition passes, and the core registers daemon control only", () => {
+  test("the shipped composition passes, and the core registers daemon control and activation", () => {
     expect(compositionProblems(AREA_RUNTIMES)).toEqual([]);
     expect(AREA_RUNTIMES.map((runtime) => runtime.area)).toEqual(["core"]);
     expect(Object.keys(CORE_RUNTIME.executors ?? {}).sort()).toEqual([
@@ -34,12 +34,35 @@ describe("the composition", () => {
       "controls.restart",
       "controls.start",
       "controls.stop",
+      "deployments.activate",
     ]);
     expect(Object.keys(CORE_RUNTIME.reconcilers ?? {}).sort()).toEqual([
       "controls.restart",
       "controls.start",
+      "deployments.activate",
+    ]);
+    expect(activationGates(AREA_RUNTIMES).map((gate) => gate.name)).toEqual([
+      "protected-environment",
     ]);
     expect(wireWith(AREA_RUNTIMES)).not.toThrow();
+  });
+
+  test("an activation gate registered twice is refused, naming it", () => {
+    const gate: ActivationGate = { name: "quality", check: async () => ({ ok: true }) };
+    expect(
+      compositionProblems([
+        CORE_RUNTIME,
+        { area: "core", activationGates: [gate] },
+        { area: "core", activationGates: [gate] },
+      ]),
+    ).toEqual(['activation gate "quality" registered twice (areas "core" and "core")']);
+  });
+
+  test("the core's protected-environment gate must run first", () => {
+    const early: ActivationGate = { name: "quality", check: async () => ({ ok: true }) };
+    expect(compositionProblems([{ area: "core", activationGates: [early] }, CORE_RUNTIME])).toEqual(
+      ['the core\'s "protected-environment" activation gate is not first'],
+    );
   });
 
   test("a kind registered twice is refused, naming it", () => {

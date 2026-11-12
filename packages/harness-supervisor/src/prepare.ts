@@ -44,6 +44,8 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { specRevision } from "@crewhaus/ir/policy";
+import { activeDeployment, verifyActiveBuild } from "./active-build";
 import { type BundleFreshness, bundleFreshness } from "./bundle-freshness";
 import {
   type ManagerHook,
@@ -85,6 +87,9 @@ export type PrepareOutcome =
       readonly replan: boolean;
       /** What happened, for the operator ("recompiled", "postCompile ok"). */
       readonly notes: readonly string[];
+      /** `manager.autoCompile` governed this build against an active deployment, so the
+       *  start runs only the active deployment's build. */
+      readonly activeOnly?: boolean;
     }
   | { readonly ok: false; readonly refusal: PrepareRefusal };
 
@@ -380,6 +385,45 @@ export async function compileIfStale(deps: PrepareDeps): Promise<PrepareOutcome>
   if (!STALE_STATES.has(freshness.state)) {
     return { ok: true, replan: false, notes: [`bundle: ${freshness.label}`] };
   }
+  return compileBundle(deps, freshness.label);
+}
+
+/** Shown when `manager.autoCompile` leaves a saved revision that is not the active one. */
+export const SAVED_NOT_ACTIVE_NOTE =
+  "the saved revision isn't active — activate it to run it (crewhaus deploy activate)";
+
+/**
+ * `manager.autoCompile`'s compile: it rebuilds only the active revision. With an active
+ * deployment, a saved spec whose revision is not the active one compiles nothing (the
+ * start goes on to the build check with the active build); the active revision whose
+ * build is missing or does not match recompiles, and the build check then decides. With
+ * no deployment record it compiles a stale bundle, and the start's admission decides.
+ */
+export async function compileActiveRevision(deps: PrepareDeps): Promise<PrepareOutcome> {
+  const active = activeDeployment(deps.harnessDir);
+  if (active === undefined) return compileIfStale(deps);
+  const specPath = findSpecPath(deps.harnessDir);
+  if (specPath !== undefined && active.specHash !== undefined) {
+    let saved: string | undefined;
+    try {
+      saved = specRevision(readFileSync(specPath, "utf8"));
+    } catch {
+      saved = undefined;
+    }
+    if (saved !== undefined && saved !== active.specHash) {
+      return { ok: true, replan: false, notes: [SAVED_NOT_ACTIVE_NOTE], activeOnly: true };
+    }
+  }
+  const check = verifyActiveBuild(deps.harnessDir, deps.target);
+  if (check.ok) {
+    return { ok: true, replan: false, notes: ["bundle: the active build"], activeOnly: true };
+  }
+  const compiled = await compileBundle(deps, check.message);
+  return compiled.ok ? { ...compiled, activeOnly: true } : compiled;
+}
+
+/** Compile the bundle and install its dependencies. */
+async function compileBundle(deps: PrepareDeps, was: string): Promise<PrepareOutcome> {
   if (deps.crewhausBin === undefined) {
     return {
       ok: false,
@@ -412,13 +456,13 @@ export async function compileIfStale(deps: PrepareDeps): Promise<PrepareOutcome>
       ok: false,
       refusal: {
         stage: "compile",
-        message: `crewhaus compile failed — the bundle is still the stale one (${freshness.label})`,
+        message: `crewhaus compile failed — the bundle is still the stale one (${was})`,
         ...(compile.exitCode !== null ? { exitCode: compile.exitCode } : {}),
         output: compile.output,
       },
     };
   }
-  const notes = [`recompiled ${outDir}/ (was: ${freshness.label})`];
+  const notes = [`recompiled ${outDir}/ (was: ${was})`];
 
   // A local bundle carries bare `@crewhaus/*` imports and a synthesized
   // manifest that declares them; without the install the entry dies on its
@@ -463,6 +507,9 @@ export type PrepareRunnerOptions = PrepareDeps & {
   readonly compile?: boolean;
 };
 
+/** Who asked for a compile: a person (`--compile`), `manager.autoCompile`, or nobody. */
+export type CompileMode = "explicit" | "auto" | false;
+
 export type PrepareRunner = {
   /** compile-if-stale, then the postCompile hook. Runs after the start slot
    *  is claimed and BEFORE preflight, so preflight sees the fresh bundle. */
@@ -472,7 +519,11 @@ export type PrepareRunner = {
   preSpawn(): Promise<PrepareOutcome>;
   /** Whether either step would do anything, so a caller can skip the wiring
    *  (and a UI can say "no prep configured") without running it. */
-  readonly configured: { readonly compile: boolean; readonly hooks: readonly ManagerHookName[] };
+  readonly configured: {
+    readonly compile: boolean;
+    readonly compileMode: CompileMode;
+    readonly hooks: readonly ManagerHookName[];
+  };
 };
 
 /**
@@ -484,12 +535,21 @@ export type PrepareRunner = {
 export function createPrepareRunner(options: PrepareRunnerOptions): PrepareRunner {
   const settings = options.settings ?? readManagerSettings(options.harnessDir);
   const deps: PrepareDeps = { ...options, settings };
-  const wantsCompile = options.compile ?? settings.autoCompile;
+  const compileMode: CompileMode =
+    options.compile === true
+      ? "explicit"
+      : options.compile === false
+        ? false
+        : settings.autoCompile
+          ? "auto"
+          : false;
+  const wantsCompile = compileMode !== false;
   const hooks = settings.hooks;
 
   return {
     configured: {
       compile: wantsCompile,
+      compileMode,
       hooks: [
         ...(hooks.postCompile !== undefined ? (["postCompile"] as const) : []),
         ...(hooks.preSpawn !== undefined ? (["preSpawn"] as const) : []),
@@ -498,11 +558,14 @@ export function createPrepareRunner(options: PrepareRunnerOptions): PrepareRunne
     prepare: async () => {
       const notes: string[] = [];
       let replan = false;
-      if (wantsCompile) {
-        const compiled = await compileIfStale(deps);
+      let activeOnly = false;
+      if (compileMode !== false) {
+        const compiled =
+          compileMode === "auto" ? await compileActiveRevision(deps) : await compileIfStale(deps);
         if (!compiled.ok) return compiled;
         notes.push(...compiled.notes);
         replan = compiled.replan;
+        activeOnly = compiled.activeOnly === true;
       }
       // The postCompile hook fires on every prepared start, not only the
       // ones that recompiled: its job is to make the bundle on disk correct,
@@ -511,7 +574,7 @@ export function createPrepareRunner(options: PrepareRunnerOptions): PrepareRunne
       const hooked = await runManagerHook("postCompile", hooks.postCompile, deps, hooks.timeoutMs);
       if (!hooked.ok) return hooked;
       notes.push(...hooked.notes);
-      return { ok: true, replan, notes };
+      return { ok: true, replan, notes, ...(activeOnly ? { activeOnly: true } : {}) };
     },
     preSpawn: () => runManagerHook("preSpawn", hooks.preSpawn, deps, hooks.timeoutMs),
   };
