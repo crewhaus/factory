@@ -16,9 +16,29 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { CONTENT_TYPES, contentTypeFor, hangarAssets } from "./index";
+import { CONTENT_TYPES, EMBED_MODULES, contentTypeFor, hangarAssets } from "./index";
 
 const ASSETS_DIR = join(import.meta.dir, "..", "assets");
+
+/** `import … from "x"` and `export … from "x"`: what a module needs before it runs. */
+const STATIC_IMPORT_RE = /import\s+[^"']*?["']([^"']+)["']/g;
+/** `import("x")` with a literal path: what a module loads when it is asked to. */
+const LITERAL_IMPORT_RE = /\bimport\(\s*["']([^"']+)["']\s*\)/g;
+/** Any `import(` at all: each must be one of the literal ones above. */
+const ANY_DYNAMIC_IMPORT_RE = /\bimport\s*\(/g;
+
+/** A module's imports: the static ones, the literal dynamic ones, and how many
+ *  dynamic ones are NOT a literal path (a computed import the walk cannot follow). */
+function importsOf(body: string): {
+  readonly statics: readonly string[];
+  readonly lazy: readonly string[];
+  readonly computed: number;
+} {
+  const statics = [...body.matchAll(STATIC_IMPORT_RE)].map((m) => m[1] ?? "");
+  const lazy = [...body.matchAll(LITERAL_IMPORT_RE)].map((m) => m[1] ?? "");
+  const all = [...body.matchAll(ANY_DYNAMIC_IMPORT_RE)].length;
+  return { statics, lazy, computed: all - lazy.length };
+}
 
 /** Walk assets/ and return every file's path relative to it (posix slashes). */
 function walkAssets(dir = ASSETS_DIR, prefix = ""): string[] {
@@ -121,6 +141,54 @@ describe("embed map completeness", () => {
   });
 });
 
+describe("the embed modules", () => {
+  const modules = Object.entries(EMBED_MODULES);
+
+  test("one per area, and no two claim the same path (a duplicate would hide an asset)", () => {
+    expect(modules.map(([area]) => area).sort()).toEqual([
+      "attention",
+      "creation",
+      "delegation",
+      "home",
+      "inspection",
+      "integrations",
+      "knowledge",
+      "people",
+      "quality",
+      "runtime",
+    ]);
+    const sum = modules.reduce((n, [, map]) => n + Object.keys(map).length, 0);
+    expect(Object.keys(hangarAssets).length).toBe(sum);
+    const owner = new Map<string, string>();
+    for (const [area, map] of modules) {
+      for (const key of Object.keys(map)) {
+        expect(`${key}:${owner.get(key) ?? area}`).toBe(`${key}:${area}`);
+        owner.set(key, area);
+      }
+    }
+  });
+
+  test("index.ts spreads every embed module, and builds the map from nothing else", () => {
+    const source = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
+    const files = readdirSync(join(import.meta.dir, "embed"))
+      .filter((name) => name.endsWith(".ts") && name !== "asset.ts")
+      .map((name) => name.slice(0, -3))
+      .sort();
+    expect(files).toEqual(modules.map(([area]) => area).sort());
+    for (const area of files) {
+      expect(`${area}:${source.includes(`...${area}Assets,`)}`).toBe(`${area}:true`);
+    }
+    expect(source.match(/^import .* with \{ type: "text" \};$/gm) ?? []).toEqual([]);
+  });
+
+  test("no embed module imports index.ts back", () => {
+    for (const name of readdirSync(join(import.meta.dir, "embed"))) {
+      const source = readFileSync(join(import.meta.dir, "embed", name), "utf8");
+      expect(`${name}:${/from\s+["']\.\.\/index["']/.test(source)}`).toBe(`${name}:false`);
+    }
+  });
+});
+
 describe("contentTypeFor", () => {
   test("known extensions", () => {
     expect(contentTypeFor("/assets/js/app.js")).toBe("text/javascript; charset=utf-8");
@@ -186,6 +254,7 @@ describe("js module hygiene", () => {
       "insertAdjacent" + "HTML",
       "document." + "write",
       "createContextual" + "Fragment",
+      "DOM" + "Parser",
     ];
     for (const [key, entry] of jsEntries) {
       for (const needle of banned) {
@@ -249,16 +318,33 @@ describe("js module hygiene", () => {
   });
 
   test("every relative import resolves to another embedded asset (import-graph closure)", () => {
-    const importRe = /import\s+[^"']*?["']([^"']+)["']/g;
+    let lazy = 0;
     for (const [key, entry] of jsEntries) {
       const dir = key.slice(0, key.lastIndexOf("/"));
-      for (const match of entry.body.matchAll(importRe)) {
-        const spec = match[1] ?? "";
-        expect(spec.startsWith("./") || spec.startsWith("../")).toBe(true);
+      const found = importsOf(entry.body);
+      lazy += found.lazy.length;
+      for (const spec of [...found.statics, ...found.lazy]) {
+        expect(`${key}: ${spec}:${spec.startsWith("./") || spec.startsWith("../")}`).toBe(
+          `${key}: ${spec}:true`,
+        );
         const resolved = resolvePosix(dir, spec);
-        expect(hangarAssets[resolved]).toBeDefined();
+        expect(`${key}: ${spec}:${hangarAssets[resolved] !== undefined}`).toBe(
+          `${key}: ${spec}:true`,
+        );
       }
     }
+    // The tables load their screens lazily, so the walk has lazy edges to follow.
+    expect(lazy).toBeGreaterThanOrEqual(30);
+  });
+
+  test("every dynamic import names a literal path, so the walk can follow it", () => {
+    for (const [key, entry] of jsEntries) {
+      expect(`${key}:${importsOf(entry.body).computed}`).toBe(`${key}:0`);
+    }
+    // The check itself can fail: a planted computed import is counted, a literal one is not.
+    const planted = 'const name = "x"; await import(`./views/${name}.js`); import("./views/a.js");';
+    expect(importsOf(planted)).toEqual({ statics: [], lazy: ["./views/a.js"], computed: 1 });
+    expect(importsOf("const m = import (path);").computed).toBe(1);
   });
 
   test("no orphaned module is shipped (every js asset is reachable from the shell entry)", () => {
@@ -269,23 +355,41 @@ describe("js module hygiene", () => {
     // zero-build tree has nothing to catch it: the transpiler, the
     // completeness check and the import-graph closure above all pass on code
     // nobody imports. Reachability is the check that does not.
-    const entry = "/assets/js/app.js";
-    const importRe = /import\s+[^"']*?["']([^"']+)["']/g;
-    const seen = new Set<string>([entry]);
-    const queue = [entry];
-    while (queue.length > 0) {
-      const key = queue.pop() as string;
-      const body = hangarAssets[key]?.body ?? "";
-      const dir = key.slice(0, key.lastIndexOf("/"));
-      for (const match of body.matchAll(importRe)) {
-        const resolved = resolvePosix(dir, match[1] ?? "");
-        if (seen.has(resolved)) continue;
-        seen.add(resolved);
-        queue.push(resolved);
-      }
-    }
+    const seen = closureOf("/assets/js/app.js", { lazy: true });
     const orphans = jsEntries.map(([key]) => key).filter((key) => !seen.has(key));
     expect(orphans).toEqual([]);
+  });
+
+  test("the shell loads no screen up front: of the views, only the sign-in screen is static", () => {
+    // Every other screen loads when it is first opened, through its table row.
+    const eager = [...closureOf("/assets/js/app.js", { lazy: false })]
+      .filter((key) => key.startsWith("/assets/js/views/"))
+      .sort();
+    expect(eager).toEqual(["/assets/js/views/sign-in.js"]);
+    // Home pulls in none of the heavy screens either, so a cold visit stays light.
+    const home = [...closureOf("/assets/js/views/home.js", { lazy: false })];
+    expect(home.length).toBeGreaterThan(3);
+    for (const heavy of ["evals", "spec-edit", "memory-fabric", "thredz", "runs"]) {
+      expect(home).not.toContain(`/assets/js/views/${heavy}.js`);
+    }
+    // …and the lazy walk does reach the screens, so the check above can fail.
+    const all = [...closureOf("/assets/js/app.js", { lazy: true })].filter((key) =>
+      key.startsWith("/assets/js/views/"),
+    );
+    expect(all.length).toBeGreaterThanOrEqual(30);
+  });
+
+  test("no module outside views/ imports a screen statically", () => {
+    for (const [key, entry] of jsEntries) {
+      if (key.startsWith("/assets/js/views/")) continue;
+      const dir = key.slice(0, key.lastIndexOf("/"));
+      const views = importsOf(entry.body)
+        .statics.map((spec) => resolvePosix(dir, spec))
+        .filter((resolved) => resolved.startsWith("/assets/js/views/"));
+      // app.js holds the sign-in screen, which has to be ready before the router starts.
+      const allowed = key === "/assets/js/app.js" ? ["/assets/js/views/sign-in.js"] : [];
+      expect(`${key}:${JSON.stringify(views)}`).toBe(`${key}:${JSON.stringify(allowed)}`);
+    }
   });
 
   /** The modules whose body contains `needle`, sorted. */
@@ -335,6 +439,25 @@ describe("js module hygiene", () => {
     }
   });
 });
+
+/** Every module reachable from `entry`; `lazy` follows literal dynamic imports too. */
+function closureOf(entry: string, opts: { readonly lazy: boolean }): Set<string> {
+  const seen = new Set<string>([entry]);
+  const queue = [entry];
+  while (queue.length > 0) {
+    const key = queue.pop() as string;
+    const body = hangarAssets[key]?.body ?? "";
+    const dir = key.slice(0, key.lastIndexOf("/"));
+    const found = importsOf(body);
+    for (const spec of opts.lazy ? [...found.statics, ...found.lazy] : found.statics) {
+      const resolved = resolvePosix(dir, spec);
+      if (seen.has(resolved)) continue;
+      seen.add(resolved);
+      queue.push(resolved);
+    }
+  }
+  return seen;
+}
 
 function resolvePosix(fromDir: string, spec: string): string {
   const parts = fromDir.split("/").filter((p) => p !== "");

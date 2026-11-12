@@ -18,7 +18,8 @@ credentials + channels + security, Thredz, and the raw inspectors.
 
 There is no build step, no framework, and no npm dependency. The `assets/`
 tree IS the app: plain ES modules loaded by the browser exactly as checked
-in. `src/index.ts` imports every asset `with { type: "text" }` — static
+in. The modules under `src/embed/` import every asset `with { type: "text" }`
+— one module per area, which `src/index.ts` spreads into one map — static
 imports only, because `bun build --compile` embeds only what the import
 graph references statically; a runtime `readFileSync` of a
 package-relative path resolves inside the compiled binary's virtual
@@ -61,15 +62,11 @@ server's static-asset option; a server route for `path` responds with
   out and Forget this browser. The live run feed is hand-rolled over
   `fetch` for the same reason `EventSource` cannot be used: it carries no
   bearer header. Every page is served under a strict Content-Security-Policy.
-- **Hash router, deep-linkable** — `#/` (Library), the fleet screens
-  `#/{runs, approvals, review, activity, credentials, feedback, thredz}`,
-  `#/h/<id>` (Overview), and `#/h/<id>/{spec, runs[/<runId>], schedulers,
-  sessions[/<sess>], evals[/<runId>[/<sampleId>]], memory[/wiki/<slug>],
-  data, feedback, costs, creds, channels, security, thredz, deploy, inspect,
-  dev}`. The eight M3 tabs capture their trailing segments GENERICALLY
-  (`M3_TABS` → a `rest` array), so a sub-screen inside one of them never
-  needs a new `parseRoute` case.
-- **Library** — dense sortable table (name + dir tail, shape badge, model,
+- **Hash router, deep-linkable** — four destinations and five harness
+  sections; see [Navigation](#navigation-destinations-sections-and-redirects)
+  for the grammar, the redirect from every older address, and the tables a
+  new screen is added to.
+- **Harnesses** (the list, `#/harnesses`) — dense sortable table (name + dir tail, shape badge, model,
   supervision state + parked-approval count, eval health dot + text,
   sessions, spend 7d, capability badges, group chips); a sub-rail of stored
   groups plus client-computed smart groups (Failing evals, Unbudgeted, Has
@@ -88,7 +85,7 @@ server's static-asset option; a server route for `path` responds with
 
 ### M2 — the driving surfaces
 
-- **Runs & daemons** (`#/runs`) — every registered harness's supervision
+- **Runs & daemons** (`#/home/working`) — every registered harness's supervision
   state in one board: state pill, pid, uptime, adopted badge, restarts in
   the window with the next-restart countdown, last exit + failure class,
   control availability. Row actions Start / Stop / Restart / Drain, each
@@ -96,23 +93,23 @@ server's static-asset option; a server route for `path` responds with
   it: the global job queue (running / pending / interrupted) and a failure
   board grouping the fleet by how it died ("3 harnesses exited 31 —
   provider funding").
-- **Run console** (`#/h/<id>/runs/<runId>`) — the live SSE feed rendered in
+- **Run console** (`#/h/<id>/work/runs/<runId>`) — the live SSE feed rendered in
   the M1 transcript vocabulary, with interleaved (scrubbed) prose, a
   stats/cost HUD folded from the frames, and the terminal exit banner with
   its failure class and remediation. The `replay`-first / `done`-last
   grammar means a finished run and a live one take the same code path.
-- **Schedulers** (`#/h/<id>/schedulers`) — the four-lane timeline with
+- **Schedule** (`#/h/<id>/work/schedule`) — the four-lane timeline with
   cadence + its source, last outcome, and next due — or an honest "cadence
   only" naming why the phase is unknown. Wake respects `pokeable`; a
   `tick_in_flight` refusal retries, a `draining` one does not.
-- **Approvals** (`#/approvals`) and **Review** (`#/review`) — cross-harness
+- **Approvals** (`#/home/needs-you?type=approvals`) and **Review** (`?type=review`) — cross-harness
   triage with the verbatim (masked) tool input, keyboard-first (j/k to
   move, one key per verdict, `.` row menu, `?` bindings). Review offers
   thumbs only where they can land on a session turn.
-- **Activity** (`#/activity`) — what changed since yesterday, grouped by
+- **What changed** (`#/home/changes`) — what changed since yesterday, grouped by
   kind with per-group filters, every row deep-linking into the screen that
   owns it.
-- **Deployments** (`#/h/<id>/deploy`) — the records with class (local /
+- **Deployment** (`#/h/<id>/setup/deployment`) — the records with class (local /
   PaaS / cf-worker) and health, and an honest empty state naming the file
   that will hold them.
 - **Action faces on the M1 screens** — session retention pin, eval baseline
@@ -126,32 +123,33 @@ Eleven new view modules (`views/{spec-edit, memory-fabric, evals-lab, data,
 feedback, creds, channels, security, thredz, inspect, runtime}.js`) draw
 eight new harness tabs and three new fleet screens:
 
-- **Spec** (`#/h/<id>/spec`) gains the write side — the trust-tier table
+- **Spec** (`#/h/<id>/setup/spec`) gains the write side — the trust-tier table
   (auto-tunable rows edit inline; human-owned rows demand the typed spec-name
   confirm or route to `crewhaus propose`), the diff interstitial, version
   history with pin/rollback, and the builders (templates, graders, dataset,
   MCP connectors).
-- **Memory** (`#/h/<id>/memory`) gains the fabric's write side — facts with
+- **Memory** (`#/h/<id>/knowledge/memory[/<panel>]`) gains the fabric's write side — facts with
   forget/sweep (tombstones, never a delete), continuity trash + restore, the
   wiki editor with `expectedVersion` and its stale retry, watch-me analytics,
   reports, intents and the synthesize review. A plan step or goal proven by
   assertion under `continuity.proof: off` shows as an amber
   `proven (unverified)`, with the refs it cited in its tooltip, never as a
   green proven.
-- **Datasets** (`#/h/<id>/data`), **Feedback** (`#/h/<id>/feedback`) and the
+- **Datasets** (`#/h/<id>/quality/datasets`), **Feedback** (`…/quality/feedback`) and the
   eval lab inside **Evals** cover the quality loops: registry + hygiene +
   growth, the fewshot/faq/lessons/advice feeds, and the matrix / trends /
   judge / graders / coverage / sentinel screens.
-- **Credentials**, **Channels** and **Security** (`#/h/<id>/{creds,channels,
+- **Credentials**, **Channels** and **Security** (`#/h/<id>/setup/{credentials,channels,
   security}`) show env-key PRESENCE (never a value), the channel doctor and
   provisioning, and the egress / PII / compliance / on-chain / retention
   panels.
-- **Thredz** (`#/h/<id>/thredz`) is proxied server-side — the workspace key
+- **Thredz** (`#/h/<id>/knowledge/thredz[/<panel>]`) is proxied server-side — the workspace key
   never reaches the browser.
-- **Inspect** (`#/h/<id>/inspect`) is the raw store browser, and **Dev & MCP**
-  (`#/h/<id>/dev`) drives the dev server and the MCP servers.
-- Fleet-wide: **Credentials** (`#/credentials`, the provider × harness
-  matrix), **Feedback** (`#/feedback`) and **Thredz** (`#/thredz`).
+- **Files** (`#/h/<id>/setup/files[/<store>[/<entry>]]`) is the raw store browser, and **Tools**
+  (`#/h/<id>/setup/tools`) drives the dev server and the MCP servers.
+- Fleet-wide: **Credentials** (`#/connections/credentials`, the provider ×
+  harness matrix), **Feedback** (`#/harnesses/feedback`) and **Thredz**
+  (`#/connections/thredz`).
 
 Two conventions make that surface cheap to extend:
 
@@ -292,9 +290,115 @@ instead of pretending success. Two refusals are deliberately NOT errors:
 envelope with `expected: true` disables its control with the server's own
 sentence.
 
-The Library paints twice by design: instantly from the cache-only feed
+The harness list paints twice by design: instantly from the cache-only feed
 (figures labeled with their `cachedAt` as-of time), then again from a
 background `?hydrate=1` refetch with freshly computed rollups.
+
+## Navigation: destinations, sections and redirects
+
+The header holds four destinations — **Home**, **Harnesses**, **People**
+and **Connections** — then Search (⌘K), **Help ▾** and **Settings ▾**; below
+720 px it is the brand, Search and a **Menu** that lists all of them. Help
+and Settings are disclosures (Escape closes and gives focus back), not menus.
+Every page has exactly one `<h1>`, drawn by the shell: a fleet page's title,
+or the harness's name. After each navigation the heading takes focus, the
+document title names the page (`<page> — Hangar`, or `<sub-view> — <harness>
+— Hangar`), the page's name is announced politely, and `main#view` carries
+`data-ready="<template>"`.
+
+| Address | Screen |
+|---|---|
+| `#/` | Home: what needs you, what is working now, what changed (onboarding on a first visit) |
+| `#/home/needs-you[?type=approvals\|review\|advice]` | the approvals inbox, the review queue and the fleet advice, stacked or one at a time |
+| `#/home/working`, `#/home/changes` | the supervision board; the activity digest |
+| `#/harnesses[/health\|/feedback]` | the harness list; the fleet health board; the feedback rollup |
+| `#/people` | People (not in Home yet: says so, and names `crewhaus people list`) |
+| `#/connections[/credentials\|/thredz]` | the connection kinds with a fleet view |
+| `#/settings[/readability\|/notifications\|/home\|/account]` | Settings |
+| `#/h/<id>` | a harness's Overview |
+| `#/h/<id>/<section>[/<sub>[/…]]` | `overview`, `work`, `quality`, `knowledge`, `setup` |
+
+Any address takes `?key=value` pairs; a key nothing reads is kept and
+ignored. Sub-panels are part of the address (`knowledge/memory/<panel>`,
+`knowledge/thredz/<panel>`, `setup/files/<store>[/<entry>]`,
+`setup/models/routes/<session>`): a view changes it with `ctx.setSub`, which
+replaces the address without a navigation, and a deep link opens that panel.
+
+| Section | Sub-views |
+|---|---|
+| Overview | the overview and health score; Needs you |
+| Work | Runs (and one run), Schedule, Sessions (and one transcript) |
+| Quality | Results (and the eval lab), Datasets, Feedback |
+| Knowledge | Memory, Thredz; a wiki article at `knowledge/wiki/<slug>` |
+| Setup | What it does: Spec · What it uses: Tools, Models, Channels, Credentials, Plugins · Limits: Security, Budget · Where it runs: Deployment · Advanced: Files |
+
+A sub-view a harness's shape cannot use is listed as text with its reason
+(`gate` on its row), and its deep link still resolves.
+
+**Every older address redirects**, through one table (`LEGACY_ROUTES` in
+`router.js`): the router replaces the address in place, so a redirect adds
+no history entry, and `hrefHarness` / `hrefGlobal` build their old addresses
+and answer the new ones, so a server `screen` id lands where it always
+meant to.
+
+| Old | New |
+|---|---|
+| `#/runs` | `#/home/working` |
+| `#/approvals`, `#/review`, `#/advisor` | `#/home/needs-you?type=approvals`, `…?type=review`, `…?type=advice` |
+| `#/activity` | `#/home/changes` |
+| `#/health`, `#/feedback` | `#/harnesses/health`, `#/harnesses/feedback` |
+| `#/credentials`, `#/thredz` | `#/connections/credentials`, `#/connections/thredz` |
+| `#/settings` | itself (the index) |
+| `#/h/<id>/overview` | `#/h/<id>` |
+| `#/h/<id>/advisor[/…]` | `#/h/<id>/overview/needs-you[/…]` |
+| `#/h/<id>/spec` | `#/h/<id>/setup/spec` |
+| `#/h/<id>/runs[/<run>]` | `#/h/<id>/work/runs[/<run>]` |
+| `#/h/<id>/schedulers` | `#/h/<id>/work/schedule` |
+| `#/h/<id>/sessions[/<sess>]` | `#/h/<id>/work/sessions[/<sess>]` |
+| `#/h/<id>/evals[/<run>[/<sample>]]` | `#/h/<id>/quality/results[/<run>[/<sample>]]` |
+| `#/h/<id>/memory/wiki/<slug>` | `#/h/<id>/knowledge/wiki/<slug>` |
+| `#/h/<id>/memory` | `#/h/<id>/knowledge/memory` |
+| `#/h/<id>/data[/…]`, `feedback[/…]` | `#/h/<id>/quality/datasets[/…]`, `quality/feedback[/…]` |
+| `#/h/<id>/costs`, `models[/…]` | `#/h/<id>/setup/budget`, `setup/models[/…]` |
+| `#/h/<id>/creds[/…]`, `channels[/…]`, `security[/…]` | `#/h/<id>/setup/credentials[/…]`, `setup/channels[/…]`, `setup/security[/…]` |
+| `#/h/<id>/thredz[/…]` | `#/h/<id>/knowledge/thredz[/…]` |
+| `#/h/<id>/deploy`, `inspect[/…]`, `dev[/…]`, `panes` | `#/h/<id>/setup/deployment`, `setup/files[/…]`, `setup/tools[/…]`, `setup/plugins` |
+
+### Adding a screen
+
+A screen is a row in a table, never an edit to the router or the shell:
+
+| Table | Module | Row |
+|---|---|---|
+| a harness section's sub-views | `sections/{overview,work,quality,knowledge,setup}.js` | `{ id, label, group?, describe, load, render, rest?, capture?, gate? }` |
+| the destinations | `destinations.js` `DESTINATIONS` | `{ id, label, path, badge? }` |
+| Home's panels | `HOME_PANELS` | `{ id, title, panel: { load, render }, load, render }` |
+| the Harnesses views | `HARNESS_VIEWS` | `{ id, title, describe, load, render }` |
+| the connection kinds | `CONNECTION_KINDS` | `{ id, title, describe, load, render }` |
+| the Settings pages | `SETTINGS_PAGES` | `{ id, title, describe, load, render }` |
+| the command menu's verbs | hangar-server `menu/actions/` | one provider file, one line in `index.ts` |
+
+`load` names the view module by a literal path (`() => import("../views/x.js")`)
+and `render(mod, root, ctx)` draws it; the context carries `ctx.signal`
+(aborted when the person navigates away) and `ctx.setSub`. The router derives
+its grammar and `ROUTE_TEMPLATES` from these tables, so a new row is crawled
+and held to the accessibility gate the day it lands.
+
+**Screens load when first opened.** `app.js` statically imports only the
+shell, the router, the navigator, the tables, the components and the
+sign-in screen; every other view arrives through its row's `load`. A
+navigation mounts a fresh container and aborts the previous one, so a slow
+screen the person has left can never draw over, focus or announce on the
+one they moved to. Static assets carry an `ETag` and revalidate, so a new
+release's module is fetched the first time it is asked for.
+
+**Embed modules.** A new asset file is registered in its area's module under
+`src/embed/` (`home.ts`, or `attention.ts`, `creation.ts`, `delegation.ts`,
+`inspection.ts`, `integrations.ts`, `knowledge.ts`, `people.ts`,
+`quality.ts`, `runtime.ts`); `src/index.ts` spreads them all and is not
+edited. The embed suite fails on a file that is not registered, on two
+modules claiming one path, on a dynamic import that is not a literal path,
+and on a module nothing reaches.
 
 ## M4 — the polish layer
 
@@ -354,9 +458,8 @@ payload asks for it.
 
 ## M5 — the Advisor
 
-`views/advisor.js` draws one more harness tab (`#/h/<id>/advisor`, right
-after Overview — the strip order is the triage order) and one more fleet
-screen (`#/advisor`):
+`views/advisor.js` draws one more harness screen (Overview › Needs you,
+`#/h/<id>/overview/needs-you`) and one more fleet screen (`#/home/needs-you?type=advice`):
 
 - **The feed** — every alert, suggestion and optimization signal the manager
   can derive about the harness, in one severity-ranked list. Every item
@@ -382,15 +485,15 @@ screen (`#/advisor`):
   run: the kind selector (tooltipped per kind) picks what gets queued, with
   `optimize` — the eval→patch loop whose artifact is a reviewable spec
   patch — as the default.
-- **The fleet board** (`#/advisor`) — every harness's rollup, worst first,
+- **The fleet board** (`#/home/needs-you?type=advice`) — every harness's rollup, worst first,
   each row deep-linking its Advisor tab.
 
-The Library also becomes curatable (M5): harness rows carry a `hidden` flag
+The harness list also becomes curatable (M5): harness rows carry a `hidden` flag
 (the row editor's Visibility checkbox), hidden rows fold out of every view
 except an explicit **Hidden** rail bucket, and a **Find harnesses…** panel
 lists the unregistered harnesses under the scan roots (via
 `GET /api/registry/discover`) with per-candidate Add buttons — discovery
-without registration, so the Library only shows what you add. The blanket
+without registration, so the harness list only shows what you add. The blanket
 Scan (which registers everything) stays as the labeled bulk fallback.
 
 ## Testing

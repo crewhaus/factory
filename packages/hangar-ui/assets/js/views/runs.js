@@ -19,8 +19,18 @@
  */
 
 import { api, streamRunEvents } from "../api.js";
-import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
-import { hrefHarness } from "../router.js";
+import {
+  clear,
+  collapsible,
+  dot,
+  el,
+  emptyState,
+  jsonPre,
+  scrollRegion,
+  skeleton,
+  toast,
+} from "../dom.js";
+import { hrefGlobal, hrefHarness } from "../router.js";
 import { shapeAccentVars, shapeLabel } from "../shapes.js";
 import {
   failureBoard,
@@ -52,7 +62,7 @@ const BOARD_COLUMNS = [
   "Actions",
 ];
 
-export async function renderRunsBoard(root) {
+export async function renderRunsBoard(root, ctx = {}) {
   clear(root).appendChild(skeleton(6));
   const feed = await api.harnesses();
   const rows = normalizeRows(feed).filter((r) => r.missingSince === null);
@@ -73,10 +83,10 @@ export async function renderRunsBoard(root) {
   // operator had to remember.
   const groupsCard = el("section", { class: "card" });
   root.appendChild(groupsCard);
-  void renderGroupStrip(groupsCard, () => renderRunsBoard(root));
+  void renderGroupStrip(groupsCard, () => renderRunsBoard(root, ctx));
 
   const tbody = el("tbody");
-  const table = el("div", { class: "table-scroll" }, [
+  const table = scrollRegion("Harness processes", [
     el("table", { class: "fleet" }, [
       el(
         "thead",
@@ -104,7 +114,7 @@ export async function renderRunsBoard(root) {
   root.appendChild(el("div", { class: "ov-grid" }, [failures, jobsCard]));
   renderJobs(jobsBody);
 
-  const reload = () => renderRunsBoard(root);
+  const reload = () => renderRunsBoard(root, ctx);
   const nowMs = Date.now();
   const placeholders = new Map();
   for (const row of rows) {
@@ -116,7 +126,7 @@ export async function renderRunsBoard(root) {
   // Hydrate each row with its process detail. One request per harness, all
   // in flight together; a failing one leaves its cold row standing.
   const details = await Promise.allSettled(rows.map((r) => api.proc(r.id)));
-  if (!root.isConnected) return;
+  if (ctx.signal?.aborted === true) return;
   const exits = [];
   rows.forEach((row, i) => {
     const settled = details[i];
@@ -300,7 +310,7 @@ function boardRow(feedRow, proc, nowMs, reload) {
       feedRow.pendingApprovals > 0
         ? el("a", {
             class: "chip chip-warn",
-            href: "#/approvals",
+            href: hrefGlobal("approvals"),
             text: `${feedRow.pendingApprovals} approval${feedRow.pendingApprovals === 1 ? "" : "s"} waiting`,
           })
         : null,
@@ -418,7 +428,7 @@ export async function renderRuns(root, ctx) {
     );
   }
   root.appendChild(
-    el("div", { class: "table-scroll" }, [
+    scrollRegion("Run history", [
       el("table", { class: "fleet" }, [
         el(
           "thead",
@@ -499,11 +509,11 @@ async function renderRunConsole(root, ctx, runId) {
     }
   };
 
-  // The stream is bound to this node: the first frame that arrives after the
-  // router replaced the view aborts the reader instead of leaving it holding
-  // a connection.
+  // The stream is bound to this navigation: leaving the screen aborts the
+  // reader instead of leaving it holding a connection, and a frame that
+  // arrives after that is dropped.
   const stream = streamRunEvents(ctx.id, runId, (frame) => {
-    if (!feed.isConnected) {
+    if (ctx.signal?.aborted === true) {
       stream.close();
       return;
     }
@@ -523,6 +533,7 @@ async function renderRunConsole(root, ctx, runId) {
     for (const item of sseFrameToFeed(frame.event, frame.data)) push(item);
     drawHud();
   });
+  ctx.signal?.addEventListener("abort", () => stream.close(), { once: true });
 }
 
 function exitBannerNode(banner) {

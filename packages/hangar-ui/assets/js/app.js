@@ -1,63 +1,42 @@
 /**
  * Hangar console entry. Boot order: theme, sign-in (`sign-in.js`: a one-time
  * `#x=` code from a boot link, this tab's session, this browser's own key, or
- * the sign-in screen), then shell render, router start, version footer.
+ * the sign-in screen), then the shell, the router, the version footer.
  * Booting is guarded on `document` existing so the module can be imported by
  * tests.
  *
- * M2 adds the fleet-wide nav (Runs, Approvals, Review, Activity) with live
- * counts, and gives the harness header its supervision pill, bundle
- * freshness badge, control availability and — when the spawn plan cannot be
- * built — the remedy as a BUTTON rather than an error.
- *
- * M3 adds the detail tabs (Datasets, Feedback, Credentials, Channels,
- * Security, Thredz, Inspect, Dev & MCP), stacks an M3 half beneath the
- * existing Spec, Evals and Memory panels, and puts the fleet credential
- * matrix, feedback rollup and Thredz explorer in the rail.
- *
- * The tab strip is where the shape × panel matrix is applied: the target
- * shape decides which tabs are live and which render disabled with the
- * reason (`tabAvailability` in router.js owns the table). Gating stops at
- * the strip — a deep link to an off-matrix tab still resolves and the
- * screen still answers, so no URL an operator saved goes dead.
+ * This module holds boot, the one document key listener, the overlays (the
+ * command menu and the bindings sheet) and the navigator that draws each
+ * route. The shell (`shell.js`) draws the chrome and every page's frame; the
+ * screens themselves load when first opened, through the tables in
+ * `destinations.js` and `sections/*.js`. Nothing here imports a screen other
+ * than the sign-in screen, which has to be ready before anything else is.
  */
 
-import { ApiError, api, onUnauthorized } from "./api.js";
-import { clear, el, skeleton } from "./dom.js";
+import { ApiError, onUnauthorized } from "./api.js";
+import { clear, el } from "./dom.js";
 import { bindingSheet, globalKey, initialKeyState, keyShape } from "./keys.js";
+import { createNavigator } from "./navigation.js";
 import { notifications } from "./notify.js";
 import { openOmnibox } from "./omnibox.js";
 import { applyPrefs, applyTheme, readPrefs, readTheme } from "./prefs.js";
 import { parseRoute, startRouter } from "./router.js";
 import {
-  configureShell,
-  currentNavCounts,
+  afterRoute,
   drawNav,
   loadNavCounts,
+  markReady,
+  mountRoute,
   renderError,
-  renderHarnessPage,
-  renderNotFound,
+  renderRoute,
   renderShell,
-  viewRootNode,
 } from "./shell.js";
 import * as signIn from "./sign-in.js";
 import { openDialog } from "./ui/dialog.js";
 import { installLive } from "./ui/live.js";
 import { dismissTooltip, installTooltips } from "./ui/tooltip.js";
-import { renderActivity } from "./views/activity.js";
-import { renderAdvisorBoard } from "./views/advisor.js";
-import { renderApprovals } from "./views/approvals.js";
-import { renderCredentialsMatrix } from "./views/creds.js";
-import { renderFeedbackBoard } from "./views/feedback.js";
-import { renderHealthBoard } from "./views/health.js";
-import { renderLibrary } from "./views/library.js";
-import { renderReview } from "./views/review.js";
-import { renderRunsBoard } from "./views/runs.js";
-import { renderSettings } from "./views/settings.js";
 import { SESSION_ENDED, openSignInDialog, renderSignInScreen } from "./views/sign-in.js";
-import { renderThredzGlobal } from "./views/thredz.js";
 
-let dispatchSeq = 0;
 // M4 (HM-190): overlay ownership. `inboxMounted` is set per navigation so
 // `?` goes to the inbox's own sheet on the two screens that bind it, and to
 // the app's sheet everywhere else.
@@ -79,52 +58,44 @@ function initTheme() {
   applyPrefs(document.documentElement, readPrefs());
 }
 
-async function dispatch(route) {
-  const seq = ++dispatchSeq;
-  const viewRoot = viewRootNode();
-  drawNav(route, currentNavCounts());
-  // The two screens that bind `?` for their own inbox sheet. Tracked here
-  // rather than sniffed from the DOM so the ownership rule stays a pure
-  // input to the `keys.js` reducer.
-  keyState = { ...keyState, inboxMounted: route.view === "approvals" || route.view === "review" };
+/** Whether a route puts an inbox list on the page (the `?` key is then the list's). */
+function hasInbox(route) {
+  if (route.view !== "home" || route.sub !== "needs-you") return false;
+  const type = route.query?.type;
+  return type === undefined || type === "approvals" || type === "review";
+}
+
+const navigator = createNavigator({
+  mount: (route) => mountRoute(route),
+  render: (route, container, opts) => renderRoute(route, container, opts),
+  after: (route, container, result) =>
+    afterRoute(route, container, result, { focus: navigatedBefore }),
+  isStale: (err) => err instanceof ApiError && err.status === 401,
+  onStale: () => {
+    viewStale = true; // sign-in is on screen; it draws this view when done
+  },
+  onError: (err, container, route) => {
+    renderError(container, err);
+    markReady(route);
+  },
+});
+
+/** Whether a navigation has already finished drawing: the first load keeps
+ *  focus where the browser puts it, so the skip link is the first Tab stop;
+ *  every later navigation moves focus to the new page's heading. */
+let navigatedBefore = false;
+
+function dispatch(route) {
+  drawNav(route);
+  // The screens that bind `?` for their own inbox sheet. Tracked here rather
+  // than sniffed from the DOM so the ownership rule stays a pure input to the
+  // `keys.js` reducer.
+  keyState = { ...keyState, inboxMounted: hasInbox(route) };
   viewStale = false;
-  clear(viewRoot).appendChild(skeleton(6));
-  try {
-    if (route.view === "library") {
-      await renderLibrary(viewRoot);
-    } else if (route.view === "harness") {
-      await renderHarnessPage(viewRoot, route);
-    } else if (route.view === "runs") {
-      await renderRunsBoard(viewRoot);
-    } else if (route.view === "approvals") {
-      await renderApprovals(viewRoot);
-    } else if (route.view === "review") {
-      await renderReview(viewRoot);
-    } else if (route.view === "activity") {
-      await renderActivity(viewRoot);
-    } else if (route.view === "credentials") {
-      await renderCredentialsMatrix(viewRoot);
-    } else if (route.view === "feedback") {
-      await renderFeedbackBoard(viewRoot);
-    } else if (route.view === "thredz") {
-      await renderThredzGlobal(viewRoot);
-    } else if (route.view === "health") {
-      await renderHealthBoard(viewRoot);
-    } else if (route.view === "advisor") {
-      await renderAdvisorBoard(viewRoot);
-    } else if (route.view === "settings") {
-      await renderSettings(viewRoot);
-    } else {
-      renderNotFound(viewRoot, route);
-    }
-  } catch (err) {
-    if (seq !== dispatchSeq) return; // superseded by a newer navigation
-    if (err instanceof ApiError && err.status === 401) {
-      viewStale = true; // sign-in is on screen; it draws this view when done
-      return;
-    }
-    renderError(viewRoot, err);
-  }
+  return navigator.navigate(route).then((outcome) => {
+    if (outcome === "done") navigatedBefore = true;
+    return outcome;
+  });
 }
 
 /**
@@ -175,6 +146,13 @@ function closeOverlay() {
   const open = omnibox;
   omnibox = null;
   open.close();
+}
+
+/** Help's "Keyboard shortcuts": the same sheet `?` opens. */
+function openSheet() {
+  closeOverlay();
+  keyState = { ...keyState, sheetOpen: true, omniboxOpen: false };
+  drawSheet();
 }
 
 /** The `?` bindings overlay. Rendered from `bindingSheet()` so the list and
@@ -271,13 +249,13 @@ async function boot() {
   // Several requests can answer 401 at once; they all wait on one attempt.
   let reauth = null;
   const start = () => {
-    configureShell({
+    renderShell(appRoot, {
       openOverlay: () => openOverlay(),
+      openSheet: () => openSheet(),
       installKeyboard: () => installKeyboard(),
       redispatch: () => dispatch(parseRoute(window.location.hash)),
       isSigningIn: () => signInShowing,
     });
-    renderShell(appRoot);
     onUnauthorized((info) => {
       if (signInShowing) return false;
       if (reauth === null) {

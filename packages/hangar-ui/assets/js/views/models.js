@@ -25,7 +25,7 @@
  */
 
 import { api } from "../api.js";
-import { clear, collapsible, el, emptyState, jsonPre, skeleton } from "../dom.js";
+import { clear, collapsible, el, emptyState, jsonPre, scrollRegion, skeleton } from "../dom.js";
 import { fmtCount, fmtUsd, usdFromMicros } from "../util.js";
 
 /** A spend row's share of the total, in [0, 1]. Pure. */
@@ -153,8 +153,8 @@ function shareBar(share) {
   ]);
 }
 
-function table(headers, rows) {
-  return el("div", { class: "table-scroll" }, [
+function table(label, headers, rows) {
+  return scrollRegion(label, [
     el("table", { class: "fleet" }, [
       el(
         "thead",
@@ -214,7 +214,8 @@ export async function renderModels(root, ctx) {
             text: "declare models: to give a profile its own settings, tools and permissions once, then reference it as $name at any model slot.",
           })
         : table(
-            ["Profile", "Model", "Settings"],
+            "Model profiles",
+            ["Model profile", "Model", "Settings"],
             registry.map((row) =>
               el("tr", null, [
                 el("td", { class: "mono", text: String(row?.name ?? "?") }),
@@ -250,7 +251,8 @@ export async function renderModels(root, ctx) {
           `Routing pool · ${hostPath}`,
           `policy ${p.policy ?? "static"}${p.scope ? ` · scope ${p.scope}` : ""}`,
           table(
-            ["Candidate", "Profile", "Tags", "Enabled"],
+            `Candidates in ${hostPath}`,
+            ["Candidate", "Model profile", "Tags", "Enabled"],
             (Array.isArray(p.candidates) ? p.candidates : []).map((c) =>
               el("tr", null, [
                 el("td", { class: "mono", text: String(c?.model ?? "—") }),
@@ -273,6 +275,7 @@ export async function renderModels(root, ctx) {
   if (roles.length > 0) {
     spendBody.push(
       table(
+        "Spend by role",
         ["Role", "Calls", "Cost", "Share"],
         roles.map((r) =>
           el("tr", null, [
@@ -288,7 +291,8 @@ export async function renderModels(root, ctx) {
   if (profiles.length > 0) {
     spendBody.push(
       table(
-        ["Profile", "Calls", "Cost", "Share"],
+        "Spend by model profile",
+        ["Model profile", "Calls", "Cost", "Share"],
         profiles.map((p) =>
           el("tr", null, [
             el("td", { class: "mono", text: p.profile }),
@@ -313,7 +317,11 @@ export async function renderModels(root, ctx) {
     );
   }
   root.appendChild(
-    card("Spend by role and profile", fmtUsd(usdFromMicros(body.spend?.totalUsdMicros)), spendBody),
+    card(
+      "Spend by role and model profile",
+      fmtUsd(usdFromMicros(body.spend?.totalUsdMicros)),
+      spendBody,
+    ),
   );
 
   // ---- 3. the leaderboard -------------------------------------------------
@@ -327,6 +335,7 @@ export async function renderModels(root, ctx) {
             text: "a pooled run folds one observation per turn into its band's arm; nothing has been observed yet.",
           })
         : table(
+            "Leaderboard",
             ["Band", "Model", "n", "Reward", "Quality", "Latency", "Cost/call"],
             leaderboard.map((row) =>
               el("tr", { class: row?.best === true ? "row-best" : null }, [
@@ -381,6 +390,7 @@ export async function renderModels(root, ctx) {
                   text: `${s.id} (${s.routingLines})`,
                 });
                 btn.addEventListener("click", () => {
+                  ctx.setSub?.(["routes", String(s.id)]);
                   void loadTimeline(timelineRoot, ctx.id, String(s.id));
                 });
                 return btn;
@@ -390,7 +400,10 @@ export async function renderModels(root, ctx) {
           ],
     ),
   );
-  const first = sessions[0];
+  // `setup/models/routes/<session>` opens that session's timeline; an
+  // unknown one opens the first, as the screen always has.
+  const wanted = ctx.route?.rest?.[0] === "routes" ? ctx.route.rest[1] : undefined;
+  const first = sessions.find((s) => String(s.id) === wanted) ?? sessions[0];
   if (first !== undefined) await loadTimeline(timelineRoot, ctx.id, String(first.id));
 
   if (body.freeze) {
@@ -418,6 +431,7 @@ async function loadTimeline(host, id, sessionId) {
   }
   host.appendChild(
     table(
+      "Route timeline",
       ["Turn", "Kind", "Detail"],
       entries.map((entry) => {
         const line = timelineLine(entry);

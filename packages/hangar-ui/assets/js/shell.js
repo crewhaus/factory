@@ -1,110 +1,68 @@
 /**
- * The console's shell: the header and its nav, the banner and first-run
- * slots, the main region, the footer, and the harness page's header and tab
- * strip. Moved out of app.js unchanged; app.js keeps boot, the one document
- * key listener, the overlays and the sheet, and hands the shell the few
- * things it calls back into through `configureShell`.
+ * The console's shell: the header (four destinations, Search, Help and
+ * Settings, and a Menu on narrow screens), the banner and first-run slots,
+ * the main region, the footer, and the frame every page is drawn in — a
+ * fleet page's heading, a harness page's header, its section nav and its
+ * sub-view list. app.js keeps boot, the one document key listener, the
+ * overlays and the sheet, and hands the shell what it calls back into
+ * through `renderShell`'s hooks.
+ *
+ * Every page has exactly one `<h1>`, drawn here, never by a view: a fleet
+ * page's from its destination, page or Settings row; a harness page's is the
+ * harness name; not found's is "Nothing at this address". Re-hosted views
+ * keep their own `<h2>`/`<h3>`.
+ *
+ * What a page holds comes from the tables (`destinations.js`,
+ * `sections/*.js`), so a new screen is a row there, not an edit here. Views
+ * load when first opened: each row's `load` names its module by a literal path.
  */
 
 import { api } from "./api.js";
-import { clear, copyBtn, dot, el, toast } from "./dom.js";
+import { DESTINATIONS, SETTINGS_PAGES, fleetArea, fleetPage } from "./destinations.js";
+import { clear, copyBtn, dot, el, skeleton, toast } from "./dom.js";
 import { notifications } from "./notify.js";
 import { applyTheme, readPrefs, requestFocus, writePrefs, writeTheme } from "./prefs.js";
-import { hrefGlobal, hrefHarness, hrefLibrary, parseRoute, tabAvailability } from "./router.js";
+import {
+  hrefFleet,
+  hrefHarness,
+  hrefHome,
+  pageTitle,
+  routeTemplate,
+  sectionLabel,
+  subViewAvailability,
+} from "./router.js";
+import { SECTIONS, sectionById, subViewGroups, subViewOf } from "./sections/index.js";
 import { shapeAccentVars, shapeLabel } from "./shapes.js";
 import { procRow } from "./supervision.js";
-import { renderAdvisor } from "./views/advisor.js";
-import { renderChannels } from "./views/channels.js";
-import { renderCosts } from "./views/costs.js";
-import { renderCreds } from "./views/creds.js";
-import { renderData } from "./views/data.js";
-import { renderDeploy } from "./views/deploy.js";
-import { renderEvalsLab } from "./views/evals-lab.js";
-import { renderEvals } from "./views/evals.js";
-import { renderFeedback } from "./views/feedback.js";
-import { renderHealthCard } from "./views/health.js";
-import { renderInspect } from "./views/inspect.js";
-import { renderMemoryFabric } from "./views/memory-fabric.js";
-import { renderMemory } from "./views/memory.js";
-import { renderModels } from "./views/models.js";
-import { renderOverview } from "./views/overview.js";
-import { renderPanes } from "./views/panes.js";
-import { renderRuns } from "./views/runs.js";
-import { renderRuntime } from "./views/runtime.js";
-import { renderSchedulers } from "./views/schedulers.js";
-import { renderSecurity } from "./views/security.js";
-import { renderSessions } from "./views/sessions.js";
-import { renderSpecEdit } from "./views/spec-edit.js";
-import { renderSpec } from "./views/spec.js";
-import { renderThredz } from "./views/thredz.js";
+import { announce } from "./ui/live.js";
 
-/** What the shell calls back into app.js for: the overlay, the key
- *  listener, a fresh dispatch, and whether a sign-in is on screen. */
+/** Where the releases and the docs live, linked from Help. */
+const RELEASES_URL = "https://github.com/crewhaus/factory/releases";
+const DOCS_URL = "https://github.com/crewhaus/docs";
+
+/** What the shell calls back into app.js for. */
 const hooks = {
   openOverlay: () => {},
+  openSheet: () => {},
   installKeyboard: () => {},
   redispatch: () => {},
   isSigningIn: () => false,
 };
 
-export function configureShell(next) {
-  Object.assign(hooks, next);
-}
-
-/** The main region, for app.js's dispatch. */
-export function viewRootNode() {
-  return viewRoot;
-}
-
-/** The counts the nav shows now. */
-export function currentNavCounts() {
-  return navCounts;
-}
-
-const TAB_LABELS = {
-  overview: "Overview",
-  advisor: "Advisor",
-  spec: "Spec",
-  runs: "Runs",
-  schedulers: "Schedulers",
-  sessions: "Sessions",
-  evals: "Evals",
-  memory: "Memory",
-  data: "Datasets",
-  feedback: "Feedback",
-  costs: "Costs",
-  models: "Models",
-  creds: "Credentials",
-  channels: "Channels",
-  security: "Security",
-  thredz: "Thredz",
-  deploy: "Deployments",
-  inspect: "Inspect",
-  dev: "Dev & MCP",
-  panes: "Plugin panes",
-};
-
-/** The fleet-wide screens in the header rail, with their count sources. */
-const NAV = [
-  { view: "runs", label: "Runs & daemons" },
-  { view: "approvals", label: "Approvals" },
-  { view: "review", label: "Review" },
-  { view: "activity", label: "Activity" },
-  { view: "health", label: "Health" },
-  { view: "advisor", label: "Advisor" },
-  { view: "credentials", label: "Credentials" },
-  { view: "feedback", label: "Feedback" },
-  { view: "thredz", label: "Thredz" },
-  { view: "settings", label: "Settings" },
-];
-
 let viewRoot = null;
 let footRoot = null;
-let navRoot = null;
 let bannerRoot = null;
 let firstRunRoot = null;
 let navCounts = {};
 let notificationsStarted = false;
+let lastRoute = null;
+/** The header's parts that change per navigation or per count. */
+const header = { nav: null, settings: null, menuNav: null, closers: [] };
+
+/** The main region, for app.js. */
+export function viewRootNode() {
+  return viewRoot;
+}
 
 function toggleTheme() {
   const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
@@ -147,12 +105,13 @@ function mountFirstRun(slot) {
     onClick: () => {
       answer();
       const first = document.querySelector("#readability input:checked");
-      if (parseRoute(window.location.hash).view === "settings" && first instanceof HTMLElement) {
+      const here = lastRoute?.view === "settings" && lastRoute?.sub === "readability";
+      if (here && first instanceof HTMLElement) {
         first.focus();
       } else {
-        // Settings takes the request once it has drawn the card.
+        // The Readability page takes the request once it has drawn the card.
         requestFocus("readability");
-        window.location.hash = hrefGlobal("settings");
+        window.location.hash = hrefFleet("settings", "readability");
       }
     },
   });
@@ -174,16 +133,121 @@ function mountFirstRun(slot) {
   );
 }
 
-export function renderShell(appRoot) {
-  clear(appRoot);
-  const themeBtn = el("button", {
-    class: "btn btn-ghost",
-    type: "button",
-    text: "Theme",
-    title: "Toggle light/dark",
-    onClick: toggleTheme,
+/**
+ * A disclosure: a button and the list it shows. Not a menu: the list holds
+ * ordinary links and buttons, reached with Tab. Escape closes it and gives
+ * focus back to the button; Tab out of it closes it; choosing an item closes
+ * it. All of that is handled on the widget's own element.
+ */
+function disclosure(opts) {
+  const list = el("div", { class: `disclosure-panel ${opts.panelClass ?? ""}`, id: opts.id });
+  list.hidden = true;
+  const button = el(
+    "button",
+    {
+      class: `btn btn-ghost disclosure-btn ${opts.buttonClass ?? ""}`,
+      type: "button",
+      "aria-expanded": "false",
+      "aria-controls": opts.id,
+    },
+    opts.button,
+  );
+  const wrap = el("div", { class: `disclosure ${opts.wrapClass ?? ""}` }, [button, list]);
+  const setOpen = (open) => {
+    button.setAttribute("aria-expanded", String(open));
+    list.hidden = !open;
+  };
+  button.addEventListener("click", () => setOpen(list.hidden));
+  wrap.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || list.hidden) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setOpen(false);
+    button.focus();
   });
-  navRoot = el("nav", { class: "app-nav", "aria-label": "fleet screens" });
+  wrap.addEventListener("focusout", (event) => {
+    const next = event.relatedTarget;
+    if (!(next instanceof Node) || !wrap.contains(next)) setOpen(false);
+  });
+  list.addEventListener("click", (event) => {
+    const target = event.target;
+    if (target instanceof Element && target.closest("a, button") !== null) setOpen(false);
+  });
+  header.closers.push(() => setOpen(false));
+  return { node: wrap, button, list, setOpen };
+}
+
+/** A count as a visible number and the words a screen reader says with it. */
+function badge(count, words) {
+  if (typeof count !== "number" || count <= 0) return [];
+  return [
+    el("span", { class: "nav-badge", "aria-hidden": "true", text: String(count) }),
+    el("span", { class: "sr-only", text: `, ${count} ${words}` }),
+  ];
+}
+
+/** Pending approvals and open review items: the number Home's link wears. */
+function needsYouCount() {
+  const approvals = typeof navCounts.approvals === "number" ? navCounts.approvals : 0;
+  const review = typeof navCounts.review === "number" ? navCounts.review : 0;
+  return approvals + review;
+}
+
+function settingsItems() {
+  return [
+    el("a", { class: "menu-link", href: hrefFleet("settings"), text: "All settings" }),
+    ...SETTINGS_PAGES.map((page) =>
+      el("a", { class: "menu-link", href: hrefFleet("settings", page.id), text: page.title }),
+    ),
+    el("button", {
+      class: "menu-link",
+      type: "button",
+      text: "Theme: light or dark",
+      onClick: toggleTheme,
+    }),
+  ];
+}
+
+function helpItems() {
+  return [
+    el("button", {
+      class: "menu-link",
+      type: "button",
+      text: "Keyboard shortcuts",
+      onClick: () => hooks.openSheet(),
+    }),
+    el("a", {
+      class: "menu-link",
+      href: RELEASES_URL,
+      rel: "noopener noreferrer",
+      text: "What changed in this version",
+    }),
+    el("a", {
+      class: "menu-link",
+      href: DOCS_URL,
+      rel: "noopener noreferrer",
+      text: "Documentation",
+    }),
+  ];
+}
+
+const listOf = (items) =>
+  el(
+    "ul",
+    { class: "menu-list" },
+    items.map((item) => el("li", null, item)),
+  );
+
+/**
+ * The shell. `nextHooks`: `{ openOverlay, openSheet, installKeyboard,
+ * redispatch, isSigningIn }`.
+ */
+export function renderShell(appRoot, nextHooks = {}) {
+  Object.assign(hooks, nextHooks);
+  clear(appRoot);
+  header.closers = [];
+  header.nav = el("ul", { class: "app-nav-list" });
+  const mainNav = el("nav", { class: "app-nav", "aria-label": "Main" }, [header.nav]);
   // A visible affordance for ⌘K: a keyboard-only feature is a feature only
   // the person who built it knows about.
   const searchBtn = el("button", {
@@ -194,16 +258,50 @@ export function renderShell(appRoot) {
   });
   searchBtn.appendChild(el("span", { text: "Search" }));
   searchBtn.appendChild(el("kbd", { class: "mono", text: "⌘K" }));
-  const header = el("header", { class: "app-header" }, [
-    el("a", { class: "brand", href: hrefLibrary() }, [
+  const help = disclosure({
+    id: "help-menu",
+    button: [el("span", { text: "Help" }), el("span", { "aria-hidden": "true", text: " ▾" })],
+    wrapClass: "wide-only",
+    panelClass: "menu-panel",
+  });
+  help.list.appendChild(listOf(helpItems()));
+  const settings = disclosure({
+    id: "settings-menu",
+    button: [],
+    wrapClass: "wide-only",
+    panelClass: "menu-panel",
+  });
+  settings.list.appendChild(listOf(settingsItems()));
+  header.settings = settings.button;
+  header.menuNav = el("ul", { class: "menu-list" });
+  const menu = disclosure({
+    id: "narrow-menu",
+    button: [el("span", { text: "Menu" })],
+    wrapClass: "narrow-only",
+    buttonClass: "menu-toggle",
+    panelClass: "menu-panel narrow-menu",
+  });
+  menu.list.append(
+    el("nav", { "aria-label": "Menu" }, [
+      header.menuNav,
+      el("h2", { class: "menu-heading", text: "Settings" }),
+      listOf(settingsItems()),
+      el("h2", { class: "menu-heading", text: "Help" }),
+      listOf(helpItems()),
+    ]),
+  );
+  const head = el("header", { class: "app-header" }, [
+    el("a", { class: "brand", href: hrefHome() }, [
       el("span", { class: "logo", "aria-hidden": "true", text: "H" }),
       el("span", { class: "brand-name", text: "Hangar" }),
-      el("span", { class: "brand-sub", text: "CrewHaus harness manager" }),
+      el("span", { class: "brand-sub", text: "CrewHaus" }),
     ]),
-    navRoot,
+    mainNav,
     el("span", { class: "spacer" }),
     searchBtn,
-    themeBtn,
+    help.node,
+    settings.node,
+    menu.node,
   ]);
   bannerRoot = el("div", { class: "banner-slot", id: "banners" });
   // Its own slot: the read-only banner clears `bannerRoot` when it loads.
@@ -216,13 +314,13 @@ export function renderShell(appRoot) {
     }),
   ]);
   appRoot.appendChild(skipLink());
-  appRoot.appendChild(header);
+  appRoot.appendChild(head);
   appRoot.appendChild(bannerRoot);
   appRoot.appendChild(firstRunRoot);
   appRoot.appendChild(viewRoot);
   appRoot.appendChild(footRoot);
   mountFirstRun(firstRunRoot);
-  drawNav(parseRoute(window.location.hash));
+  drawNav(null);
   loadVersion();
   loadNavCounts();
   startNotifications();
@@ -251,7 +349,11 @@ async function loadReadOnlyBanner() {
       el("span", {
         text: "every mutating request is refused by the server — this manager is in demo/screen-share mode.",
       }),
-      el("a", { class: "banner-link", href: hrefGlobal("settings"), text: "Settings →" }),
+      el("a", {
+        class: "banner-link",
+        href: hrefFleet("settings", "home"),
+        text: "Home settings →",
+      }),
       state.locked === true
         ? el("span", { class: "chip chip-warn", text: "locked at startup" })
         : null,
@@ -259,38 +361,51 @@ async function loadReadOnlyBanner() {
   );
 }
 
-/** The nav, with the active screen marked. Counts arrive separately. */
-export function drawNav(route, counts = {}) {
-  if (navRoot === null) return;
-  clear(navRoot);
-  navRoot.appendChild(
-    el("a", {
-      class: `navlink${route.view === "library" ? " active" : ""}`,
-      href: hrefLibrary(),
-      text: "Library",
-    }),
-  );
-  for (const item of NAV) {
-    const count = counts[item.view];
-    const link = el("a", {
-      class: `navlink${route.view === item.view ? " active" : ""}`,
-      href: hrefGlobal(item.view),
-    });
-    link.appendChild(el("span", { text: item.label }));
-    if (typeof count === "number" && count > 0) {
-      link.appendChild(el("span", { class: "nav-badge", text: String(count) }));
-    }
-    navRoot.appendChild(link);
+/** The header's destinations and the Settings badge, with the current page marked. */
+export function drawNav(route) {
+  if (route !== null) lastRoute = route;
+  for (const close of header.closers) close();
+  const current = lastRoute?.view ?? null;
+  const link = (dest) => {
+    const here = current === dest.id;
+    return el(
+      "a",
+      {
+        class: `navlink${here ? " active" : ""}`,
+        href: dest.path,
+        "aria-current": here ? "page" : null,
+      },
+      [
+        el("span", { text: dest.label }),
+        ...(dest.badge === "needs-you" ? badge(needsYouCount(), "need you") : []),
+      ],
+    );
+  };
+  if (header.nav !== null) {
+    clear(header.nav);
+    for (const dest of DESTINATIONS) header.nav.appendChild(el("li", null, link(dest)));
+  }
+  if (header.menuNav !== null) {
+    clear(header.menuNav);
+    for (const dest of DESTINATIONS) header.menuNav.appendChild(el("li", null, link(dest)));
+  }
+  if (header.settings !== null) {
+    header.settings.classList.toggle("active", current === "settings");
+    header.settings.replaceChildren(
+      el("span", { text: "Settings" }),
+      ...badge(Number(navCounts.settings ?? 0), "new notifications"),
+      el("span", { "aria-hidden": "true", text: " ▾" }),
+    );
   }
 }
 
-/** Merge counts into the nav and redraw. The three numbers arrive from two
+/** Merge counts into the header and redraw. The numbers arrive from two
  *  sources — the inbox reads here, the notification badge from the shared
  *  poll — so they are merged rather than replaced, and neither can wipe the
  *  other's number on the way past. */
 function setNavCounts(patch) {
   navCounts = { ...navCounts, ...patch };
-  drawNav(parseRoute(window.location.hash), navCounts);
+  drawNav(null);
 }
 
 /** Pending approvals and open review items — the two inbox numbers. The
@@ -353,26 +468,174 @@ async function loadVersion() {
   footRoot.appendChild(node);
 }
 
-export async function renderHarnessPage(root, route) {
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+
+/** The page's one heading. It takes focus after each navigation. */
+const pageHeading = (text) =>
+  el("h1", { class: "page-title", id: "page-title", tabindex: "-1", text });
+
+/** A fleet area's own list of its pages (Harnesses, Connections, Settings). */
+function areaNav(area, route) {
+  if (area.indexLabel === undefined || area.pages.length === 0) return null;
+  const item = (label, href, here) =>
+    el("li", null, [
+      el("a", {
+        class: `tab${here ? " active" : ""}`,
+        href,
+        "aria-current": here ? "page" : null,
+        text: label,
+      }),
+    ]);
+  return el("nav", { class: "page-nav", "aria-label": `${area.title} pages` }, [
+    el("ul", { class: "tabs page-nav-list" }, [
+      item(area.indexLabel, hrefFleet(area.id), route.sub === null),
+      ...area.pages.map((page) =>
+        item(page.title, hrefFleet(area.id, page.id), route.sub === page.id),
+      ),
+    ]),
+  ]);
+}
+
+/**
+ * A fresh container for one navigation, attached at once. A fleet page gets
+ * its heading straight away; a harness page waits for the harness's name.
+ */
+export function mountRoute(route) {
+  if (viewRoot === null) return null;
+  viewRoot.removeAttribute("data-ready");
+  const page = el("div", { class: "page" });
+  const area = fleetArea(route.view);
+  if (area !== null) {
+    const row = route.sub === null ? null : fleetPage(area, route.sub);
+    page.append(
+      pageHeading(row === null ? area.title : row.title),
+      areaNav(area, route),
+      el("div", { class: "page-body" }, [skeleton(6)]),
+    );
+  } else {
+    page.appendChild(skeleton(6));
+  }
+  clear(viewRoot).appendChild(page);
+  return page;
+}
+
+/** Draw a route into its container. Resolves to the names its title needs. */
+export async function renderRoute(route, container, { signal }) {
+  if (route.view === "harness") return renderHarnessPage(container, route, signal);
+  const area = fleetArea(route.view);
+  if (area === null) {
+    renderNotFound(container, route);
+    return {};
+  }
+  const row = route.sub === null ? area.index : fleetPage(area, route.sub);
+  const body = container.querySelector(".page-body") ?? container;
+  const ctx = { route, signal, setSub: () => {} };
+  const mod = await row.load();
+  if (signal.aborted) return {};
+  await row.render(mod, body, ctx);
+  return {};
+}
+
+/** Mark the screen arrived: the ready mark the browser journeys wait for. */
+export function markReady(route) {
+  if (viewRoot !== null) viewRoot.dataset.ready = routeTemplate(route) ?? "notfound";
+}
+
+/**
+ * After the current navigation has drawn: its heading takes focus (unless
+ * the screen already put focus inside itself on purpose, or this is the
+ * page's first load, where the skip link stays the first stop), the document
+ * title names the page, the page's name is said politely, and the ready mark
+ * is set.
+ */
+export function afterRoute(route, container, result = {}, opts = {}) {
+  const heading = container.querySelector("h1");
+  const active = document.activeElement;
+  const kept = active instanceof Node && active !== document.body && container.contains(active);
+  if (heading instanceof HTMLElement && !kept && opts.focus !== false) heading.focus();
+  const title = pageTitle(route, { harness: result?.harness });
+  document.title = title;
+  announce(title.replace(/ — Hangar$/, ""));
+  markReady(route);
+}
+
+function renderNotFound(container, route) {
+  clear(container).appendChild(
+    el("div", { class: "card notfound" }, [
+      pageHeading("Nothing at this address"),
+      el("p", { class: "muted mono", text: String(route.hash ?? "") }),
+      el("div", { class: "notfound-actions" }, [
+        el("a", { class: "btn btn-primary", href: hrefHome(), text: "Go to Home" }),
+        el("button", {
+          class: "btn",
+          type: "button",
+          text: "Search",
+          onClick: () => hooks.openOverlay(),
+        }),
+      ]),
+    ]),
+  );
+}
+
+/** A screen whose request failed: the card says so, and Retry draws it again. */
+export function renderError(container, err) {
+  const message = err instanceof Error ? err.message : String(err);
+  const slot = container.querySelector(".tab-body") ?? container.querySelector(".page-body");
+  const host = slot ?? container;
+  clear(host);
+  if (container.querySelector("h1") === null)
+    host.appendChild(pageHeading("This page could not load"));
+  host.appendChild(
+    el("div", { class: "card error-card" }, [
+      el("h2", null, [dot("bad", "request failed")]),
+      el("p", { class: "muted", text: message }),
+      el("button", {
+        class: "btn",
+        type: "button",
+        text: "Retry",
+        onClick: () => hooks.redispatch(),
+      }),
+    ]),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The harness page
+// ---------------------------------------------------------------------------
+
+/** Replace the address with a sub-panel's, without a navigation. */
+function setSubFor(route, signal) {
+  return (segments) => {
+    if (signal.aborted || route.view !== "harness" || route.sub === null) return;
+    const parts = Array.isArray(segments) ? segments.filter((s) => s !== "" && s != null) : [];
+    const href = hrefHarness(route.id, route.section, route.sub, ...parts);
+    window.history.replaceState(window.history.state, "", href);
+  };
+}
+
+async function renderHarnessPage(container, route, signal) {
   // The process picture rides along with the detail so the header can show
-  // supervision without a second paint; a failure leaves the M1 header.
+  // supervision without a second paint; a failure leaves the plain header.
   const [detailRes, procRes] = await Promise.allSettled([
     api.harness(route.id),
     api.proc(route.id),
   ]);
+  if (signal.aborted) return {};
   if (detailRes.status === "rejected") throw detailRes.reason;
   const detail = detailRes.value;
   const proc = procRes.status === "fulfilled" ? procRes.value : null;
-  clear(root);
+  clear(container);
   if (detail === null) {
-    root.appendChild(
+    container.appendChild(
       el("div", { class: "card" }, [
-        el("h2", { text: "Not registered" }),
+        pageHeading("Not registered"),
         el("p", { class: "muted", text: "No harness with that id is in the registry." }),
-        el("a", { href: hrefLibrary(), text: "← back to Library" }),
+        el("a", { href: hrefFleet("harnesses"), text: "Go to Harnesses" }),
       ]),
     );
-    return;
+    return {};
   }
   const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
   const ctx = {
@@ -381,101 +644,174 @@ export async function renderHarnessPage(root, route) {
     route,
     proc,
     dir: typeof entry.dir === "string" ? entry.dir : "",
-    reload: () => renderHarnessPage(root, route),
+    signal,
+    reload: () => hooks.redispatch(),
+    setSub: setSubFor(route, signal),
   };
-  root.appendChild(harnessHeader(detail, route, ctx));
-  // The shape × panel matrix, applied where the strip is drawn: a tab this
-  // target's schema cannot declare renders as a disabled label carrying the
-  // reason, not as a link into a screen whose only content is "not
-  // applicable". The deep link still resolves, so a shared URL still opens.
-  const availability = tabAvailability(targetOf(detail));
-  root.appendChild(
-    el(
-      "nav",
-      { class: "tabs", "aria-label": "harness tabs" },
-      availability.map((row) => tabNode(route, row)),
-    ),
+  const name = harnessName(detail, route);
+  container.appendChild(harnessHeader(detail, route, ctx));
+  container.appendChild(sectionNav(route));
+  const section = sectionById(route.section);
+  const availability = subViewAvailability(section, targetOf(detail));
+  const content = el("div", { class: "section-content" });
+  container.appendChild(
+    el("div", { class: "section-layout" }, [subViewNav(route, section, availability), content]),
   );
-  const current = availability.find((row) => row.tab === route.tab);
+  const current = availability.find((row) => row.id === route.sub);
   if (current !== undefined && !current.on) {
-    root.appendChild(
+    content.appendChild(
       el("div", { class: "rollup" }, [
         dot("off", "off this shape's panel matrix"),
         el("span", { class: "muted", text: current.reason }),
       ]),
     );
   }
-  const tabRoot = el("div", { class: "tab-body" });
-  root.appendChild(tabRoot);
-  // The three tabs that gained an M3 half render the M1/M2 surface first and
-  // the new one beneath it — one screen, not two competing ones.
-  if (route.tab === "spec") {
-    await renderSpec(tabRoot, ctx);
-    await renderSpecEdit(section(tabRoot), ctx);
-  } else if (route.tab === "advisor") await renderAdvisor(tabRoot, ctx);
-  else if (route.tab === "runs") await renderRuns(tabRoot, ctx);
-  else if (route.tab === "schedulers") await renderSchedulers(tabRoot, ctx);
-  else if (route.tab === "sessions") await renderSessions(tabRoot, ctx);
-  else if (route.tab === "evals") {
-    await renderEvals(tabRoot, ctx);
-    await renderEvalsLab(section(tabRoot), ctx);
-  } else if (route.tab === "memory") {
-    await renderMemory(tabRoot, ctx);
-    await renderMemoryFabric(section(tabRoot), ctx);
-  } else if (route.tab === "data") await renderData(tabRoot, ctx);
-  else if (route.tab === "feedback") await renderFeedback(tabRoot, ctx);
-  else if (route.tab === "costs") await renderCosts(tabRoot, ctx);
-  else if (route.tab === "models") await renderModels(tabRoot, ctx);
-  else if (route.tab === "creds") await renderCreds(tabRoot, ctx);
-  else if (route.tab === "channels") await renderChannels(tabRoot, ctx);
-  else if (route.tab === "security") await renderSecurity(tabRoot, ctx);
-  else if (route.tab === "thredz") await renderThredz(tabRoot, ctx);
-  else if (route.tab === "deploy") await renderDeploy(tabRoot, ctx);
-  else if (route.tab === "inspect") await renderInspect(tabRoot, ctx);
-  else if (route.tab === "dev") await renderRuntime(tabRoot, ctx);
-  else if (route.tab === "panes") await renderPanes(tabRoot, ctx);
-  else {
-    await renderOverview(tabRoot, ctx);
-    // The explained score (HM-11) loads on its own: it runs a preflight, and
-    // the Overview's first paint must not wait for one.
-    await renderHealthCard(section(tabRoot), ctx);
+  const body = el("div", { class: "tab-body" });
+  content.appendChild(body);
+  if (route.sub === null && section.index === null) {
+    drawSectionIndex(body, route, section, availability);
+    return { harness: name };
   }
+  const row = route.sub === null ? section.index : subViewOf(section, route.sub);
+  const mod = await row.load();
+  if (signal.aborted) return { harness: name };
+  await row.render(mod, body, ctx);
+  return { harness: name };
+}
+
+function harnessName(detail, route) {
+  const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
+  const inv = detail.inventory && typeof detail.inventory === "object" ? detail.inventory : {};
+  return String(inv.specName ?? entry.specName ?? route.id);
+}
+
+/** The five sections, as links, with the current one marked. */
+function sectionNav(route) {
+  return el("nav", { class: "section-nav", "aria-label": "Harness sections" }, [
+    el(
+      "ul",
+      { class: "tabs section-nav-list" },
+      SECTIONS.map((section) => {
+        const here = route.section === section.id;
+        return el("li", null, [
+          el("a", {
+            class: `tab${here ? " active" : ""}`,
+            href: hrefHarness(route.id, section.id),
+            "aria-current": here ? "page" : null,
+            text: section.label,
+          }),
+        ]);
+      }),
+    ),
+  ]);
+}
+
+/** One sub-view in a list: a link, or, off this shape's matrix, its name and why. */
+function subViewItem(route, section, row, availability) {
+  const state = availability.find((a) => a.id === row.id);
+  const here = route.sub === row.id;
+  if (state !== undefined && !state.on) {
+    return el("li", { class: "subview-off" }, [
+      el("span", { class: `subview-name${here ? " active" : ""}`, text: row.label }),
+      el("span", { class: "subview-why", text: `Not part of this shape: ${state.reason}` }),
+    ]);
+  }
+  return el("li", null, [
+    el("a", {
+      class: `subview-link${here ? " active" : ""}`,
+      href: hrefHarness(route.id, section.id, row.id),
+      "aria-current": here ? "page" : null,
+      text: row.label,
+    }),
+  ]);
 }
 
 /**
- * One tab in the strip. An on-matrix tab is a link; an off-matrix one is a
- * disabled label whose accessible name carries the reason as TEXT — the
- * dimming is never the whole message.
+ * The section's sub-views: a rail beside the content on a wide screen, a
+ * disclosure above it on a narrow one. Setup's groups are headed lists.
  */
-function tabNode(route, row) {
-  const label = TAB_LABELS[row.tab] ?? row.tab;
-  const active = route.tab === row.tab;
-  if (row.on) {
-    return el("a", {
-      class: `tab${active ? " active" : ""}`,
-      "aria-current": active ? "page" : null,
-      href: hrefHarness(route.id, row.tab),
-      text: label,
-    });
+function subViewNav(route, section, availability) {
+  const label = `${section.label} views`;
+  const list = el("div", { class: "subview-list", id: "subview-list" });
+  const summaryHere = route.sub === null;
+  list.appendChild(
+    el("ul", { class: "subview-group-list" }, [
+      el("li", null, [
+        el("a", {
+          class: `subview-link${summaryHere ? " active" : ""}`,
+          href: hrefHarness(route.id, section.id),
+          "aria-current": summaryHere ? "page" : null,
+          text: section.id === "overview" ? "Overview" : "Summary",
+        }),
+      ]),
+    ]),
+  );
+  for (const group of subViewGroups(section)) {
+    if (group.group !== null)
+      list.appendChild(el("h2", { class: "subview-group", text: group.group }));
+    list.appendChild(
+      el(
+        "ul",
+        { class: "subview-group-list" },
+        group.rows.map((row) => subViewItem(route, section, row, availability)),
+      ),
+    );
   }
-  return el("span", {
-    class: `tab tab-off muted${active ? " active" : ""}`,
-    // The console ships one stylesheet and this state is the only new one on
-    // the strip, so it dims inline rather than growing the CSS a rule that
-    // one span uses. The reason still travels as text, in both the tooltip
-    // and the accessible name — the dimming is a hint, never the message.
-    style: { opacity: "0.45", cursor: "not-allowed" },
-    "aria-disabled": "true",
-    "aria-current": active ? "page" : null,
-    "aria-label": `${label} — not part of this shape: ${row.reason}`,
-    title: row.reason,
+  const toggle = el("button", {
+    class: "btn btn-ghost subview-toggle",
+    type: "button",
+    "aria-expanded": "false",
+    "aria-controls": "subview-list",
     text: label,
   });
+  const nav = el("nav", { class: "subview-nav", "aria-label": label }, [toggle, list]);
+  const setOpen = (open) => {
+    toggle.setAttribute("aria-expanded", String(open));
+    nav.classList.toggle("open", open);
+  };
+  toggle.addEventListener("click", () => setOpen(!nav.classList.contains("open")));
+  nav.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !nav.classList.contains("open")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setOpen(false);
+    toggle.focus();
+  });
+  return nav;
+}
+
+/** A section's own page: its sub-views, each with what it is for. */
+function drawSectionIndex(body, route, section, availability) {
+  const lists = subViewGroups(section).map((group) => {
+    const items = group.rows.map((row) => {
+      const state = availability.find((a) => a.id === row.id);
+      const on = state === undefined || state.on;
+      return el("li", { class: `section-index-item${on ? "" : " off"}` }, [
+        on
+          ? el("a", { href: hrefHarness(route.id, section.id, row.id), text: row.label })
+          : el("span", { class: "subview-name", text: row.label }),
+        el("p", { class: "muted section-index-describe", text: row.describe }),
+        on
+          ? null
+          : el("p", { class: "subview-why", text: `Not part of this shape: ${state.reason}` }),
+      ]);
+    });
+    return [
+      group.group === null ? null : el("h2", { class: "section-index-group", text: group.group }),
+      el("ul", { class: "section-index" }, items),
+    ];
+  });
+  clear(body).appendChild(
+    el("section", { class: "card section-summary", "aria-label": sectionLabel(route) }, [
+      el("p", { class: "muted", text: section.describe }),
+      ...lists.flat(),
+    ]),
+  );
 }
 
 /** The target shape string, read from the same places the header reads it
  *  (the inventory's parsed header first, the registry row as the fallback).
- *  One reader, so the strip and the badge can never disagree. */
+ *  One reader, so the list and the badge can never disagree. */
 function targetOf(detail) {
   const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
   const inv = detail.inventory && typeof detail.inventory === "object" ? detail.inventory : {};
@@ -484,25 +820,16 @@ function targetOf(detail) {
   return typeof explicit === "string" ? explicit : "";
 }
 
-/** Append a fresh sub-container so a second render into the same tab does
- *  not clear the first (every view clears the root it is handed). */
-function section(root) {
-  const node = el("div", { class: "tab-section" });
-  root.appendChild(node);
-  return node;
-}
-
 /**
  * Detail header. The detail payload nests all identity fields under
  * `entry` (the registry row) with richer names on `inventory`; the header
  * reads those, never invented top-level fields. Capability chips come from
  * the server's `badges` (the lenient spec scan) — the M1 posture line — and
- * M2 adds the supervision strip beneath it.
+ * M2 adds the supervision strip beneath it. The name is the page's heading.
  */
 function harnessHeader(detail, route, ctx) {
   const entry = detail.entry && typeof detail.entry === "object" ? detail.entry : {};
-  const inv = detail.inventory && typeof detail.inventory === "object" ? detail.inventory : {};
-  const name = String(inv.specName ?? entry.specName ?? route.id);
+  const name = harnessName(detail, route);
   const target = targetOf(detail);
   const dir = String(entry.dir ?? "");
   const missing = detail.missing === true || typeof entry.missingSince === "string";
@@ -512,7 +839,7 @@ function harnessHeader(detail, route, ctx) {
     [
       el("div", { class: "h-title" }, [
         el("span", { class: "shape-badge", text: shapeLabel(target) }),
-        el("h2", { text: name }),
+        pageHeading(name),
         missing ? dot("bad", "directory missing") : null,
       ]),
       dir !== ""
@@ -594,31 +921,5 @@ function badgeStrip(badges) {
     "div",
     { class: "safety-strip", "aria-label": "capabilities" },
     active.map((k) => el("span", { class: "chip", text: k })),
-  );
-}
-
-export function renderNotFound(root, route) {
-  clear(root).appendChild(
-    el("div", { class: "card" }, [
-      el("h2", { text: "Nothing at this address" }),
-      el("p", { class: "muted mono", text: String(route.hash ?? "") }),
-      el("a", { href: hrefLibrary(), text: "← back to Library" }),
-    ]),
-  );
-}
-
-export function renderError(root, err) {
-  const message = err instanceof Error ? err.message : String(err);
-  clear(root).appendChild(
-    el("div", { class: "card error-card" }, [
-      el("h2", null, [dot("bad", "request failed")]),
-      el("p", { class: "muted", text: message }),
-      el("button", {
-        class: "btn",
-        type: "button",
-        text: "Retry",
-        onClick: () => hooks.redispatch(),
-      }),
-    ]),
   );
 }

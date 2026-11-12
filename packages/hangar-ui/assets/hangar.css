@@ -729,6 +729,8 @@ table.fleet {
   max-width: 260px;
 }
 .pin {
+  min-width: 24px;
+  min-height: 24px;
   font: inherit;
   background: none;
   border: none;
@@ -826,6 +828,7 @@ input[type="radio"] {
   align-items: center;
   gap: 10px;
 }
+.h-title h1,
 .h-title h2 {
   margin: 0;
   font-size: 1.1875rem;
@@ -1683,7 +1686,7 @@ dialog.modal::backdrop {
 
 .lanes {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
   gap: 10px;
 }
 .lane-card {
@@ -1698,8 +1701,10 @@ dialog.modal::backdrop {
 .lane-card .dot-label {
   white-space: normal;
 }
+/* An unarmed lane says so in words beside its dot; a dashed edge repeats it
+   without dimming the words below the contrast they need. */
 .lane-off {
-  opacity: 0.72;
+  border-style: dashed;
 }
 .lane-phase {
   margin-bottom: 8px;
@@ -2392,4 +2397,249 @@ figure.chart svg {
 :root[data-density="compact"] .ov-grid,
 :root[data-density="compact"] .lanes {
   gap: 6px;
+}
+
+/* ==========================================================================
+   The shell: four destinations, Help and Settings, the narrow Menu, each
+   page's heading, a harness's sections and their sub-view lists, Home's
+   panels. Below 720px the header is the brand, Search and Menu, and the
+   sub-view list folds behind its own button.
+   ========================================================================== */
+
+.app-header {
+  position: relative;
+}
+.app-nav-list,
+.menu-list,
+.page-nav-list,
+.section-nav-list,
+.subview-group-list,
+.section-index,
+.home-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.app-nav-list {
+  display: flex;
+  gap: 2px;
+}
+
+/* The header's lists open in the page's flow, as a row under the header,
+   never over a control: the wrapper steps aside (display: contents) so the
+   open list is a full-width row of the header. */
+.app-header .disclosure {
+  display: contents;
+}
+.disclosure-btn.active {
+  color: var(--ink);
+  background: var(--panel-3);
+}
+.disclosure-panel {
+  order: 99;
+  flex-basis: 100%;
+  padding: 6px;
+  background: var(--panel);
+  border: 1px solid var(--boundary);
+  border-radius: var(--radius-sm);
+}
+.menu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.menu-link {
+  display: block;
+  width: 100%;
+  min-height: 24px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.menu-link:hover {
+  background: var(--panel-3);
+  text-decoration: none;
+}
+@media (min-width: 720px) {
+  .app-header .menu-panel .menu-list {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+}
+.menu-heading {
+  margin: 10px 10px 2px;
+  color: var(--ink-2);
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+.app-header .narrow-only {
+  display: none;
+}
+
+.page-title {
+  margin: 4px 0 12px;
+  font-size: 1.25rem;
+}
+.page-nav-list {
+  flex-wrap: wrap;
+}
+.page-nav-list .tab,
+.section-nav-list .tab {
+  display: inline-block;
+}
+.notfound-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* A harness: the five sections, and a section's sub-views beside it. */
+.section-layout {
+  display: grid;
+  grid-template-columns: 12rem minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.section-content {
+  min-width: 0;
+}
+.subview-toggle {
+  display: none;
+}
+.subview-group {
+  margin: 12px 10px 4px;
+  color: var(--ink-2);
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+.subview-link {
+  display: block;
+  min-height: 24px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--ink-2);
+}
+.subview-link:hover {
+  color: var(--ink);
+  text-decoration: none;
+}
+.subview-link.active {
+  color: var(--ink);
+  background: var(--panel-3);
+  border-color: var(--rule-2);
+}
+.subview-off {
+  padding: 4px 10px;
+}
+.subview-name {
+  color: var(--ink-2);
+}
+.subview-why {
+  display: block;
+  color: var(--ink-2);
+  font-size: 0.75rem;
+}
+
+/* A section's own page: its sub-views and what each is for. */
+.section-index {
+  display: grid;
+  gap: 10px;
+}
+.section-index-item > a {
+  font-weight: 600;
+}
+.section-index-describe {
+  margin: 2px 0 0;
+}
+.section-index-group {
+  margin: 16px 0 6px;
+  font-size: 0.875rem;
+}
+
+/* Home: three panels, each on its own. */
+.home-panels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  gap: 12px;
+}
+.home-panel {
+  margin: 0;
+}
+.home-panel-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.home-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.home-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+.home-summary {
+  margin: 0 0 8px;
+}
+.needs-you-section + .needs-you-section {
+  margin-top: 20px;
+}
+.needs-you-heading {
+  margin: 12px 0 4px;
+  font-size: 1rem;
+}
+
+@media (max-width: 719px) {
+  .app-nav,
+  .app-header .wide-only,
+  .brand-sub {
+    display: none;
+  }
+  .app-header .narrow-only {
+    display: contents;
+  }
+  .section-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+  /* All five sections stay in view: they wrap rather than scroll away. */
+  .section-nav-list {
+    flex-wrap: wrap;
+  }
+  .subview-toggle {
+    display: inline-flex;
+  }
+  .subview-nav:not(.open) .subview-list {
+    display: none;
+  }
+  /* Reflow: on a narrow screen a state, a chip or a row of checks wraps
+     rather than widening the page. */
+  .section-content .dot-pair,
+  .page-body .dot-pair,
+  .section-content .asof,
+  .page-body .asof {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .section-content .chip,
+  .page-body .chip {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+  .section-content .check,
+  .crumb-line {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
 }
