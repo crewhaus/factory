@@ -36,6 +36,7 @@ import routerJs from "../assets/js/router.js" with { type: "text" };
 import routesJs from "../assets/js/routes.js" with { type: "text" };
 import sealedJs from "../assets/js/sealed.js" with { type: "text" };
 import shapesJs from "../assets/js/shapes.js" with { type: "text" };
+import shellJs from "../assets/js/shell.js" with { type: "text" };
 import signInJs from "../assets/js/sign-in.js" with { type: "text" };
 import supervisionJs from "../assets/js/supervision.js" with { type: "text" };
 import chartUiJs from "../assets/js/ui/chart.js" with { type: "text" };
@@ -137,6 +138,7 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/routes.js": asset(routesJs, "routes.js"),
   "/assets/js/sealed.js": asset(sealedJs, "sealed.js"),
   "/assets/js/shapes.js": asset(shapesJs, "shapes.js"),
+  "/assets/js/shell.js": asset(shellJs, "shell.js"),
   "/assets/js/sign-in.js": asset(signInJs, "sign-in.js"),
   "/assets/js/supervision.js": asset(supervisionJs, "supervision.js"),
   "/assets/js/ui/chart.js": asset(chartUiJs, "chart.js"),

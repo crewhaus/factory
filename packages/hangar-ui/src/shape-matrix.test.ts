@@ -162,8 +162,8 @@ describe("the gate fails open, and never silently", () => {
 });
 
 describe("the app draws the strip through the matrix", () => {
-  test("app.js filters the tab strip and renders the off-matrix rows disabled", async () => {
-    const source = await Bun.file(new URL("../assets/js/app.js", import.meta.url)).text();
+  test("the shell filters the tab strip and renders the off-matrix rows disabled", async () => {
+    const source = await Bun.file(new URL("../assets/js/shell.js", import.meta.url)).text();
     // The regression this file exists for: the strip was `HARNESS_TABS.map`,
     // ungated, while router.js claimed gating happened here.
     expect(source.includes("HARNESS_TABS.map(")).toBe(false);
