@@ -36,6 +36,8 @@ export const PATH_PARAMS = deepFreeze({
   run: (segments: readonly string[]): boolean =>
     segments.length === 1 && CANONICAL_RUN_ID_RE.test(segments[0] ?? ""),
   ref: refParam,
+  psn: prefixed("psn"),
+  pcl: prefixed("pcl"),
 });
 
 export type PathParam = keyof typeof PATH_PARAMS;

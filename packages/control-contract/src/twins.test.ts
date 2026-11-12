@@ -6,6 +6,7 @@ import {
   OPERATIONS,
   TWIN_PLACEHOLDERS,
   isId,
+  mintId,
   parseTwin,
   renderTwin,
 } from "./index.js";
@@ -17,10 +18,19 @@ const CHOICE: CliTwin = { argv: ["approvals", "{choice}", "{appr}", "--dir", "{d
 const HARNESS: CliTwin = { argv: ["harness", "show", "{hrn}"] };
 
 const DEP = "dep_01m76e6f05hp514w9j4v3qymka";
+const PEOPLE = { psn: mintId("psn"), pcl: mintId("pcl"), kind: "personal", area: "communication" };
 
 const SAMPLES = [
-  { hrn: HRN, appr: APPR, dir: "/srv/poly", choice: "grant", dep: DEP },
-  { hrn: HRN, appr: APPR, dir: "/srv/poly", choice: "deny", dep: DEP },
+  { hrn: HRN, appr: APPR, dir: "/srv/poly", choice: "grant", dep: DEP, ...PEOPLE, verdict: "keep" },
+  {
+    hrn: HRN,
+    appr: APPR,
+    dir: "/srv/poly",
+    choice: "deny",
+    dep: DEP,
+    ...PEOPLE,
+    verdict: "reject",
+  },
 ];
 
 const TWINS: readonly CliTwin[] = [
@@ -121,7 +131,18 @@ describe("parseTwin refuses", () => {
 });
 
 test("the placeholders, pinned, with empty flags", () => {
-  expect(Object.keys(TWIN_PLACEHOLDERS)).toEqual(["{hrn}", "{appr}", "{choice}", "{dir}", "{dep}"]);
+  expect(Object.keys(TWIN_PLACEHOLDERS)).toEqual([
+    "{hrn}",
+    "{appr}",
+    "{choice}",
+    "{dir}",
+    "{dep}",
+    "{psn}",
+    "{pcl}",
+    "{kind}",
+    "{area}",
+    "{verdict}",
+  ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
 });
 

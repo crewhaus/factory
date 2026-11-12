@@ -22,7 +22,7 @@ import { CORE_SCHEMAS } from "./core.js";
 
 // import { KNOWLEDGE_SCHEMAS } from "./knowledge.js";
 
-// import { PEOPLE_SCHEMAS } from "./people.js";
+import { PEOPLE_SCHEMAS } from "./people.js";
 
 // import { QUALITY_SCHEMAS } from "./quality.js";
 
@@ -49,7 +49,7 @@ export const AREA_SCHEMAS: readonly Readonly<Record<string, z.ZodTypeAny>>[] = [
 
   // KNOWLEDGE_SCHEMAS,
 
-  // PEOPLE_SCHEMAS,
+  PEOPLE_SCHEMAS,
 
   // QUALITY_SCHEMAS,
 
