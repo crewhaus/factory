@@ -974,8 +974,9 @@ export type SupersedeRunRequest = {
  */
 export interface PendingApprovalStore {
   /**
-   * Append a `PendingApproval`; the fold governs what it changes. A new record's
-   * binding is sealed here (its places digest and `bindingDigest`).
+   * Append a `PendingApproval`; the fold governs what it changes. A record's
+   * binding is sealed here (its places digest and `bindingDigest`). An undecided
+   * line for a request already decided or withdrawn writes nothing.
    */
   persist(approval: ApprovalToPersist): Promise<void>;
   /**

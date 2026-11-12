@@ -215,6 +215,8 @@ import {
   bindingFor,
   consumeHeld,
   deniedByPhrase,
+  reboundToParkingRun,
+  refusedPhrase,
   requiredClassFor,
   withdrawOnCancel,
 } from "./decision-binding";
@@ -7203,7 +7205,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   binding: await bindingFor({ runContext, sessionId, tool, operativeInput }),
                 };
           if (park !== null) await approvals.store.persist(park);
-          const pending: PendingApproval = reuse ?? (park as PendingApproval);
+          // A request re-used under a supervised job's root scope follows the run
+          // that waits on it now, the run `crewhaus runs resume` continues.
+          const rebound = reuse !== null ? reboundToParkingRun(reuse, runContext) : null;
+          if (rebound !== null) await approvals.store.persist(rebound);
+          const pending: PendingApproval =
+            (rebound as PendingApproval | null) ?? reuse ?? (park as PendingApproval);
           recordRunPark(runContext, pending.id);
           if (approvals.notify !== undefined) {
             await approvals.notify(pending).catch((err) => {
@@ -7233,7 +7240,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             movedFrom === undefined
               ? ""
               : refused !== undefined
-                ? `; approval ${movedFrom.id} was granted but could not be used here (${refused}), so it is asked again`
+                ? `; approval ${movedFrom.id} was granted but could not be used here (${refusedPhrase(refused)}), so it is asked again`
                 : `; approval ${movedFrom.id} was ${
                     movedFrom.decision === "grant" ? "granted" : "requested"
                   } for ${describePlaces(movedFrom.places)}, and the call now lands at ${describePlaces(

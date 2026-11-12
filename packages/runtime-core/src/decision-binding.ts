@@ -26,12 +26,14 @@ import {
   type VerifyApprovers,
   type VerifyReason,
   isId,
+  parseResumeScope,
   verifyDecision,
 } from "@crewhaus/control-contract";
 import { readApproverProjection } from "@crewhaus/control-records";
 import type { RunContext } from "@crewhaus/run-context";
 import type {
   ApprovalPlace,
+  ApprovalToPersist,
   PendingApproval,
   PendingApprovalStore,
   UnsealedBinding,
@@ -60,6 +62,19 @@ export function deniedByPhrase(requiredClass: unknown): string {
   return "an operator";
 }
 
+/**
+ * Why a grant could not be used, as the run's stop says it: the reason code, and
+ * for a grant that names no person, where such a grant comes from. In a harness
+ * with members a grant counts only when it names one; a chat channel's buttons
+ * record no person, so their grant is asked again until it is made where one is.
+ */
+export function refusedPhrase(reason: string): string {
+  if (reason === "decider-unverified") {
+    return `${reason}: the grant names no member of this harness, and one made with a chat channel's buttons names none`;
+  }
+  return reason;
+}
+
 /** The revisions this harness runs under, when its environment names them. */
 export type RunRevisions = { readonly deploymentId?: string; readonly specHash?: string };
 
@@ -79,21 +94,54 @@ export function runRevisions(env: NodeJS.ProcessEnv = process.env): RunRevisions
   };
 }
 
+/** How long a tool's `revisionOf` may take before it counts as reporting no version. */
+export const REVISION_TIMEOUT_MS = 5_000;
+
+/** A resource version a binding can hold: bounded, and plain enough to compare and log. */
+const RESOURCE_REVISION_RE = /^[0-9A-Za-z:._/-]{1,256}$/;
+
 /**
- * The version of the resource the call acts on, when the tool reports one: a
- * non-empty string from its `revisionOf`. A hook that throws or answers anything
- * else reports nothing, and the binding then says the resource is not bound.
+ * The version of the resource the call acts on, when the tool reports one: 1-256
+ * characters of `[0-9A-Za-z:._/-]` from its `revisionOf`. The hook runs before the
+ * call is approved, so it is bounded: it gets a signal that aborts when the run is
+ * cancelled or after `timeoutMs`, and an answer that does not come by then, a
+ * throw, or anything else reports nothing. The binding then says the resource is
+ * not bound, and a grant is checked by its places alone.
  */
 export async function resourceRevisionOf(
   tool: Pick<RegisteredTool, "revisionOf">,
   operativeInput: unknown,
+  opts: { readonly signal?: AbortSignal; readonly timeoutMs?: number } = {},
 ): Promise<string | undefined> {
-  if (typeof tool.revisionOf !== "function") return undefined;
+  const revisionOf = tool.revisionOf;
+  if (typeof revisionOf !== "function") return undefined;
+  const parent = opts.signal;
+  if (parent?.aborted === true) return undefined;
+  const controller = new AbortController();
+  const stop = (): void => controller.abort();
+  parent?.addEventListener("abort", stop, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const gaveUp = new Promise<undefined>((resolve) => {
+    controller.signal.addEventListener("abort", () => resolve(undefined), { once: true });
+    timer = setTimeout(stop, opts.timeoutMs ?? REVISION_TIMEOUT_MS);
+  });
+  const answer = Promise.resolve().then(() =>
+    revisionOf(operativeInput, { signal: controller.signal }),
+  );
+  // An answer that comes after the runtime gave up is dropped, a late throw too.
+  answer.catch(() => {});
   try {
-    const revision: unknown = await tool.revisionOf(operativeInput);
-    return typeof revision === "string" && revision !== "" ? revision : undefined;
+    const revision: unknown = await Promise.race([answer, gaveUp]);
+    return typeof revision === "string" && RESOURCE_REVISION_RE.test(revision)
+      ? revision
+      : undefined;
   } catch {
     return undefined;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    parent?.removeEventListener("abort", stop);
+    // The hook has answered or been given up on: anything it still runs stops.
+    controller.abort();
   }
 }
 
@@ -105,7 +153,9 @@ export async function bindingFor(args: {
   readonly operativeInput: unknown;
 }): Promise<UnsealedBinding> {
   const { runContext, sessionId } = args;
-  const resourceRevision = await resourceRevisionOf(args.tool, args.operativeInput);
+  const resourceRevision = await resourceRevisionOf(args.tool, args.operativeInput, {
+    signal: runContext.abortSignal,
+  });
   return {
     runId: parkingRunIdOf(runContext),
     resumeScope: resumeScopeOf(runContext, sessionId),
@@ -115,6 +165,30 @@ export async function bindingFor(args: {
     ...(resourceRevision !== undefined ? { resourceRevision } : {}),
     resourceRevisionBound: resourceRevision !== undefined,
   };
+}
+
+/**
+ * A pending request re-used by a park under a supervised job's root scope
+ * (`run:<root>`), bound to the run that parks now. Under that scope a grant is
+ * spent only by the run it is bound to or a run that continues it, and
+ * `crewhaus runs resume` continues the newest parked run; so the request follows
+ * the run that waits on it. `null` when nothing moves: a request already decided,
+ * withdrawn or spent, one bound to another scope kind, or one already bound here.
+ */
+export function reboundToParkingRun(
+  reuse: PendingApproval,
+  runContext: RunContext,
+): ApprovalToPersist | null {
+  if (reuse.decision !== undefined || reuse.supersededBy !== undefined) return null;
+  if (reuse.consumedAt !== undefined) return null;
+  const binding = reuse.binding;
+  if (typeof binding !== "object" || binding === null) return null;
+  if (parseResumeScope(binding.resumeScope)?.kind !== "run") return null;
+  const runId = parkingRunIdOf(runContext);
+  if (binding.runId === runId) return null;
+  // The store seals the binding again (its places digest and `bindingDigest`).
+  const { bindingDigest: _sealedFor, ...rest } = reuse;
+  return { ...rest, binding: { ...binding, runId } };
 }
 
 /** How a held grant's spend ended. */
@@ -172,7 +246,9 @@ export async function consumeHeld(args: {
   const continues = continuesOf(runContext);
   const resumeScope = resumeScopeOf(runContext, args.sessionId);
   const revisions = runRevisions();
-  const resourceRevision = await resourceRevisionOf(args.tool, args.operativeInput);
+  const resourceRevision = await resourceRevisionOf(args.tool, args.operativeInput, {
+    signal: runContext.abortSignal,
+  });
   const approvers = approversAt(args.harnessRoot);
   const spent = {
     runId,

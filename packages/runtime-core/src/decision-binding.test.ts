@@ -15,7 +15,7 @@ import { dirname, join } from "node:path";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ProviderAdapter, ProviderRequest } from "@crewhaus/adapter-anthropic";
 import { type ApproverProjection, mintId, mintRunId } from "@crewhaus/control-contract";
-import { append, controlPaths } from "@crewhaus/control-records";
+import { append, controlPaths, foldStates } from "@crewhaus/control-records";
 import { RunFailedError } from "@crewhaus/errors";
 import { type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
 import {
@@ -37,7 +37,7 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
-import { requiredClassFor } from "./decision-binding";
+import { requiredClassFor, resourceRevisionOf } from "./decision-binding";
 import { runChatLoop } from "./index";
 import { _resetRunLedgerForTest, runLedgerAt } from "./run-ledger";
 
@@ -427,6 +427,46 @@ describe("a grant that cannot be used asks again", () => {
     expect(resumed.events.filter((e) => e.kind === "approval_requested")).toHaveLength(1);
   });
 
+  test("in a harness with members, a grant that names no person (a chat channel's buttons) is asked again each time; one a member makes runs", async () => {
+    const ran: unknown[] = [];
+    const tools = [askedTool(ran)];
+    const member = mintId("prn");
+    plantApprovers(harness, [{ principal: member, decide: "operator" }]);
+    const parked = await loop({ tools });
+    const sessionId = parked.ctx.sessionId;
+    let asked = parkedIdOf(parked);
+    const ids = [asked];
+    for (let round = 0; round < 2; round++) {
+      // The way a channel's approve button records a grant: no principal.
+      await store.resolve(asked, "grant", "someone in the channel");
+      const resumed = await loop({ tools, sessionId });
+      expect(ran).toEqual([]);
+      const detail = (resumed.caught as RunFailedError).report.detail;
+      expect(detail).toContain(`approval ${asked} was granted but could not be used here`);
+      expect(detail).toContain("decider-unverified");
+      expect(detail).toContain("chat channel");
+      // Left as it was: unspent and not withdrawn. A new request is asked.
+      expect(recordOf(asked)?.consumedAt).toBeUndefined();
+      expect(recordOf(asked)?.supersededBy).toBeUndefined();
+      const next = parkedIdOf(resumed);
+      expect(ids).not.toContain(next);
+      ids.push(next);
+      asked = next;
+    }
+    expect(foldReadOnly(approvalsRoot).records).toHaveLength(3);
+    // A member's grant on the newest request is the one that runs.
+    const decided = await store.decide(
+      asked,
+      { choice: "grant", actor: { principal: member } },
+      { authorize: allowSingleOwner },
+    );
+    expect(decided.outcome).toBe("decided");
+    const done = await loop({ tools, sessionId });
+    expect(done.caught).toBeUndefined();
+    expect(ran).toEqual([{ x: 1 }]);
+    expect(recordOf(asked)?.consumedAt).toBeDefined();
+  });
+
   test("a spec that changed between the park and the spend: asked again, the old request superseded", async () => {
     const ran: unknown[] = [];
     const tools = [askedTool(ran)];
@@ -476,6 +516,47 @@ describe("a grant that cannot be used asks again", () => {
     const unbound = recordOf(parkedIdOf(await loop({ tools: [throwing] })));
     expect(unbound?.binding?.resourceRevisionBound).toBe(false);
     expect(unbound?.binding?.resourceRevision).toBeUndefined();
+  });
+});
+
+describe("a tool's resource version is bounded", () => {
+  test("a hook that never answers is given up on, its signal aborts, and the park binds no version", async () => {
+    const signals: AbortSignal[] = [];
+    const hanging = {
+      revisionOf: (_input: unknown, opts: { readonly signal: AbortSignal }) => {
+        signals.push(opts.signal);
+        return new Promise<string>(() => {});
+      },
+    };
+    expect(await resourceRevisionOf(hanging, { x: 1 }, { timeoutMs: 10 })).toBeUndefined();
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(true);
+
+    // A cancelled run gives up on it too, and a run already cancelled never asks.
+    const run = new AbortController();
+    const pending = resourceRevisionOf(hanging, { x: 1 }, { signal: run.signal });
+    run.abort();
+    expect(await pending).toBeUndefined();
+    expect(signals[1]?.aborted).toBe(true);
+    expect(await resourceRevisionOf(hanging, { x: 1 }, { signal: run.signal })).toBeUndefined();
+    expect(signals).toHaveLength(2);
+  });
+
+  test("only 1-256 characters of [0-9A-Za-z:._/-] are a version", async () => {
+    const answering = (answer: unknown) => ({ revisionOf: () => answer as string });
+    const longest = "a".repeat(256);
+    expect(await resourceRevisionOf(answering(longest), {})).toBe(longest);
+    expect(await resourceRevisionOf(answering("sha256:ab.c/d_e-F"), {})).toBe("sha256:ab.c/d_e-F");
+    for (const odd of ["", "a".repeat(257), "head 1", "head\n1", "ünïcode", "a;b", 7, null]) {
+      expect(await resourceRevisionOf(answering(odd), {})).toBeUndefined();
+    }
+
+    // Through a park: an answer that is not a version binds none.
+    const ran: unknown[] = [];
+    const odd = { ...askedTool(ran), revisionOf: () => `head\n${"x".repeat(300)}` };
+    const record = recordOf(parkedIdOf(await loop({ tools: [odd] })));
+    expect(record?.binding?.resourceRevisionBound).toBe(false);
+    expect(record?.binding?.resourceRevision).toBeUndefined();
   });
 });
 
@@ -704,6 +785,52 @@ describe("a supervised job's root scope", () => {
     const record = recordOf(parkedIdOf(parked));
     expect(record?.binding?.resumeScope).toBe(`run:${root}`);
     expect(record?.binding?.runId).toBe(parked.ctx.runId);
+  });
+
+  test("resumed before the grant, the re-park follows the new run, and the next resume spends the grant once", async () => {
+    const ran: unknown[] = [];
+    const tools = [askedTool(ran)];
+    const scope = `run:${mintRunId()}`;
+    /** What `crewhaus runs resume` continues: the newest of `runs` the run ledger marks waiting. */
+    const resumeTarget = (newestFirst: readonly string[]): string => {
+      const fold = foldStates(runLedgerAt(harness));
+      if (!fold.ok) throw new Error("the run ledger could not be read");
+      const waiting = newestFirst.find(
+        (id) => fold.objects.get(id)?.state === "waiting-for-approval",
+      );
+      if (waiting === undefined) throw new Error("no parked run");
+      return waiting;
+    };
+
+    const first = await runWithScope({ resumeScope: scope }, () => loop({ tools }));
+    const id = parkedIdOf(first);
+    const sessionId = first.ctx.sessionId;
+    expect(recordOf(id)?.binding?.runId).toBe(first.ctx.runId);
+
+    // Resumed before anyone decides: the same request, now waited on by the new run.
+    const early = await runWithScope(
+      { resumeScope: scope, continues: resumeTarget([first.ctx.runId]) },
+      () => loop({ tools, sessionId }),
+    );
+    expect(parkedIdOf(early)).toBe(id);
+    expect(recordOf(id)?.binding?.runId).toBe(early.ctx.runId);
+    expect(foldReadOnly(approvalsRoot).records.map((r) => r.id)).toEqual([id]);
+
+    const decided = await store.decide(
+      id,
+      { choice: "grant", actor: {} },
+      { authorize: allowSingleOwner },
+    );
+    expect(decided.outcome).toBe("decided");
+    const continues = resumeTarget([early.ctx.runId, first.ctx.runId]);
+    expect(continues).toBe(early.ctx.runId);
+    const last = await runWithScope({ resumeScope: scope, continues }, () =>
+      loop({ tools, sessionId }),
+    );
+    expect(last.caught).toBeUndefined();
+    expect(ran).toEqual([{ x: 1 }]);
+    expect(recordOf(id)?.consumedByRun).toBe(last.ctx.runId);
+    expect(foldReadOnly(approvalsRoot).records.map((r) => r.id)).toEqual([id]);
   });
 
   test("a run in the job's scope that does not continue the parking run asks again", async () => {

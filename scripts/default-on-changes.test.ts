@@ -2004,6 +2004,7 @@ describe("approval decisions", () => {
       ) ?? "";
     expect(bullet).toContain("used once");
     expect(bullet).toContain("maintainer");
+    expect(bullet).toContain("chat channel's buttons names no one");
   });
 });
 

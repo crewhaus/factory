@@ -152,7 +152,10 @@ these on: they reach every harness that uses what each one names.
   so it is spent once even across processes, and only while the person who
   granted it can still approve at that level. Destructive tools, and tools that
   ask for a justification, need a maintainer or the owner once a harness has
-  members. Cancelling a run withdraws the requests it was waiting on. A denied
+  members. In a harness with members, a grant counts only when it names the
+  owner or a member: one made with a chat channel's buttons names no one, so the
+  call is asked again until it is granted with `crewhaus approvals grant` or in
+  Hangar. Cancelling a run withdraws the requests it was waiting on. A denied
   call's message to the model names the role that denied it, never a person's
   own words, and a parked run says to continue with `crewhaus runs resume`.
   Requests parked before the upgrade count for their conversation only, so a

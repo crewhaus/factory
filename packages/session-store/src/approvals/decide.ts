@@ -706,7 +706,9 @@ async function storedActor(
 export type ApprovalWriter = ApprovalDecisions & {
   /**
    * Append a record under the lock: a park line for a new id, a consume line for a
-   * spend. A record that carries a binding is sealed first (`sealBinding`).
+   * spend, a newer line for a pending request. A record that carries a binding is
+   * sealed first (`sealBinding`). An undecided line for a request already decided
+   * or withdrawn writes nothing.
    */
   persist(approval: ApprovalToPersist): Promise<void>;
 };
@@ -750,6 +752,14 @@ export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter
         await repairAll(touch);
         await seam.afterFold?.();
         const existing = touch.records.get(approval.id);
+        // An undecided line adds nothing to a request already decided or withdrawn.
+        if (
+          existing !== undefined &&
+          approval.decision === undefined &&
+          (existing.decision !== undefined || existing.supersededBy !== undefined)
+        ) {
+          return;
+        }
         const at = now().toISOString();
         const record = await sealed(touch, approval);
         if (existing === undefined) {

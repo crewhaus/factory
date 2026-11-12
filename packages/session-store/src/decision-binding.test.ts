@@ -169,6 +169,50 @@ describe("a park seals its binding", () => {
   });
 });
 
+describe("a pending request bound again", () => {
+  test("a newer line re-seals the binding and the fold reads it; once decided or withdrawn, an undecided line writes nothing", async () => {
+    const root = tempRoot();
+    const store = createPendingApprovalStore({ rootDir: root });
+    const p = boundPark();
+    await store.persist(p);
+    const first = rendezvousLines(root).find((l) => l["id"] === p.id) as PendingApproval;
+    const nextRun = mintRunId();
+    const { bindingDigest: _sealed, ...rest } = first;
+    await store.persist({
+      ...rest,
+      binding: { ...(first.binding as NonNullable<PendingApproval["binding"]>), runId: nextRun },
+    });
+    const key = await approvalsDigestKey(root);
+    if (key.state !== "present") throw new Error(key.state);
+    const folded = foldReadOnly(root).records.find((r) => r.id === p.id);
+    expect(folded?.binding?.runId).toBe(nextRun);
+    expect(folded?.bindingDigest).toBe(await bindingDigestOf(key.hmac, folded?.binding));
+    expect(folded?.bindingDigest).not.toBe(first.bindingDigest);
+    // A park line is written once per id.
+    expect(linesOf(root, p.id, "park")).toHaveLength(1);
+
+    await store.decide(p.id, { choice: "grant", actor: {} }, ALLOW);
+    const before = rendezvousLines(root).length;
+    await store.persist({
+      ...rest,
+      binding: { ...(folded?.binding as never), runId: PARKING_RUN },
+    });
+    expect(rendezvousLines(root)).toHaveLength(before);
+    expect(foldReadOnly(root).ignored).toBe(0);
+    expect(foldReadOnly(root).records.find((r) => r.id === p.id)?.binding?.runId).toBe(nextRun);
+
+    const withdrawn = boundPark();
+    await store.persist(withdrawn);
+    await store.supersedeRun([PARKING_RUN], { reason: "run-cancelled", via: "system" });
+    const count = rendezvousLines(root).length;
+    await store.persist(withdrawn);
+    expect(rendezvousLines(root)).toHaveLength(count);
+    expect(foldReadOnly(root).records.find((r) => r.id === withdrawn.id)?.supersededReason).toBe(
+      "run-cancelled",
+    );
+  });
+});
+
 describe("a lookup finds a record only in its own scope", () => {
   test("a grant parked in session:A is found there, not in session:B or job:x; an unbound record only in its session", async () => {
     const root = tempRoot();
