@@ -31,6 +31,16 @@
  */
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { EXIT_FOR_ERROR, EXIT_FOR_REJECTED_RECEIPT } from "@crewhaus/control-contract";
+import {
+  type ControlService,
+  type Settlement,
+  currentLocalIdentity,
+  settleStart,
+  settleStop,
+  wireControl,
+  withOwnStartTime,
+} from "@crewhaus/control-service";
 import {
   type ControlLane,
   type ControlResult,
@@ -39,7 +49,11 @@ import {
   knownControlPort,
 } from "@crewhaus/gateway-protocol/control-client";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
-import { type HangarRegistry, openHangarRegistry } from "@crewhaus/harness-registry";
+import {
+  type HangarRegistry,
+  openHangarRegistry,
+  resolveHangarRoot,
+} from "@crewhaus/harness-registry";
 import {
   type Clock,
   type HarnessSupervisor,
@@ -78,7 +92,7 @@ import { cliVersion } from "./version";
 /** What a verb returns: lines for stdout + the process exit code. */
 export type DaemonCommandResult = {
   readonly lines: readonly string[];
-  readonly exitCode: 0 | 1;
+  readonly exitCode: number;
 };
 
 export type DaemonCommandOptions = {
@@ -424,6 +438,101 @@ function controlLines(
 }
 
 // ---------------------------------------------------------------------------
+// Direct mode: every change is a command, its receipt written first
+// ---------------------------------------------------------------------------
+
+/**
+ * The control service this terminal head acts through. It writes the same command
+ * receipts Home writes, into the harness's own ledger, so each head sees what the other
+ * did. A re-run it starts after a crash goes through this file's own supervisor, with
+ * preflight on and nothing forced.
+ */
+function directControl(opts: DaemonCommandOptions): ControlService {
+  const env = opts.env ?? process.env;
+  return wireControl(
+    {
+      hangarRoot: resolveHangarRoot(env),
+      harnessDirOf: (hrn) => openRegistrySafe(opts)?.get(hrn)?.dir,
+      supervisorFor: (dir) => supervisorFor(resolveHarness(dir, opts), opts, { enabled: true }),
+      releaseSupervisor: (_dir, supervisor) => supervisor.close(),
+      drainRequest: (dir) => async () => {
+        const control = createControlClient(opts.fetch !== undefined ? { fetch: opts.fetch } : {});
+        const outcome = await control.drain(controlTargetFor(resolveHarness(dir, opts)));
+        if (!outcome.ok) throw new Error(outcome.reason);
+      },
+      identity: currentLocalIdentity(),
+      now: (opts.clock ?? systemClock).now,
+      probe: withOwnStartTime(opts.ops ?? createProcessOps()),
+    },
+    { mode: "direct" },
+  );
+}
+
+/** Harnesses this process has recovered: once per process per harness. */
+const recoveredHarnesses = new Set<string>();
+
+/** The harness as a ref, when it is registered; otherwise the receipt names itself. */
+function targetFor(harness: ResolvedHarness, opts: DaemonCommandOptions): string | undefined {
+  const entry = openRegistrySafe(opts)
+    ?.list()
+    .find((e) => e.dir === harness.dir);
+  return entry === undefined ? undefined : `home/harness/${entry.id}`;
+}
+
+type Settled = { readonly result: DaemonCommandResult; readonly settle: Settlement };
+
+/**
+ * Run a verb as a command: recover this harness's unfinished commands (once per
+ * process), write the `accepted` receipt, run the verb, and settle the receipt from what
+ * it did. The verb's own lines stand, followed by the receipt's id. A refusal before
+ * acceptance exits through the control band (50-56); a `rejected` receipt exits 55.
+ */
+async function receipted(
+  harness: ResolvedHarness,
+  kind: "controls.start" | "controls.restart" | "controls.stop" | "controls.drain",
+  opts: DaemonCommandOptions,
+  verb: () => Promise<Settled>,
+): Promise<DaemonCommandResult> {
+  const control = directControl(opts);
+  if (!recoveredHarnesses.has(harness.dir)) {
+    recoveredHarnesses.add(harness.dir);
+    try {
+      await control.commands.recover({ harness: harness.dir });
+    } catch {
+      // Recovery is the writer's courtesy to the last crash, never a gate on this verb.
+    }
+  }
+  const target = targetFor(harness, opts);
+  const answer = await control.commands.submit(
+    {
+      kind,
+      ...(target !== undefined ? { target } : {}),
+      ledger: { harness: harness.dir },
+      via: "cli",
+    },
+    async () => {
+      const done = await verb();
+      return { settle: done.settle, value: done.result };
+    },
+  );
+  if (!answer.ok) {
+    return {
+      lines: [`${harness.specName}: not done — ${answer.refusal.message}`],
+      exitCode: EXIT_FOR_ERROR[answer.refusal.code],
+    };
+  }
+  const result = answer.replayed ? undefined : answer.value;
+  const lines = result?.lines ?? [];
+  const { id, state } = answer.receipt;
+  if (state === "succeeded") return { lines: [...lines, `Done (${id})`], exitCode: 0 };
+  if (state === "rejected") {
+    return { lines: [...lines, `Not done (${id})`], exitCode: EXIT_FOR_REJECTED_RECEIPT };
+  }
+  const exitCode = result === undefined || result.exitCode === 0 ? 1 : result.exitCode;
+  return { lines: [...lines, `Not done (${id})`], exitCode };
+}
+
+// ---------------------------------------------------------------------------
 // start / restart
 // ---------------------------------------------------------------------------
 
@@ -468,79 +577,102 @@ async function daemonStart(
           .map((s) => s.trim())
           .filter((s) => s !== "")
       : undefined;
-  const supervisor = supervisorFor(
+  return await receipted(
     harness,
+    restart ? "controls.restart" : "controls.start",
     opts,
-    {
-      enabled: args.flags.get("no-preflight") !== true,
-      force: args.flags.get("force") === true,
-      ...(acknowledge !== undefined ? { acknowledge } : {}),
+    async () => {
+      const supervisor = supervisorFor(
+        harness,
+        opts,
+        {
+          enabled: args.flags.get("no-preflight") !== true,
+          force: args.flags.get("force") === true,
+          ...(acknowledge !== undefined ? { acknowledge } : {}),
+        },
+        // Neither flag ⇒ the harness's own `manager.autoCompile` decides, so the
+        // console's Restart button and this verb agree without a flag.
+        args.flags.get("compile") === true
+          ? { compile: true }
+          : args.flags.get("no-compile") === true
+            ? { compile: false }
+            : {},
+      );
+      try {
+        // A restart from the terminal is by construction a restart of a daemon
+        // THIS process did not spawn, so it has to adopt off the runfile first:
+        // a supervisor with no pid stops nothing, leaves the runfile in place,
+        // and then refuses its own start with "already running".
+        if (restart) await supervisor.adopt();
+        const result = restart ? await supervisor.restart() : await supervisor.start();
+        const settle = settleStart(result);
+        if (result.ok) {
+          const plan = supervisor.snapshot();
+          return {
+            settle,
+            result: {
+              lines: [
+                `${harness.specName}: ${restart ? "restarted" : "started"} ${result.runId}${
+                  result.pid !== undefined ? ` (pid ${result.pid})` : ""
+                }`,
+                // An operator who asked for a recompile is told it happened —
+                // "nothing recompiled and nobody said so" is the failure this
+                // whole path exists to end.
+                ...(result.prepared ?? []).map((note) => `  ${note}`),
+                `  class ${runClassFor(harness.target)} · state ${plan.state}`,
+                `  logs: crewhaus daemon logs ${harness.dir} --run ${result.runId}`,
+              ],
+              exitCode: 0,
+            },
+          };
+        }
+        switch (result.reason) {
+          case "already-running":
+            return {
+              settle,
+              result: {
+                lines: [
+                  `${harness.specName}: already running${
+                    result.runfile !== undefined
+                      ? ` (pid ${result.runfile.pid}, run ${result.runfile.runId})`
+                      : ""
+                  } — the runfile is the lock`,
+                ],
+                exitCode: EXIT_FOR_REJECTED_RECEIPT,
+              },
+            };
+          case "preflight-blocked":
+            return {
+              settle,
+              result: {
+                lines: [
+                  ...formatGateRefusal(result.gate),
+                  "",
+                  "  re-run with --force to wave through the forceable items,",
+                  "  or --ack <id,id> to wave specific ones through by id.",
+                ],
+                exitCode: EXIT_FOR_REJECTED_RECEIPT,
+              },
+            };
+          case "prepare-refused":
+            return {
+              settle,
+              result: {
+                lines: [`${harness.specName}:`, ...formatPrepareRefusal(result.refusal)],
+                exitCode: EXIT_FOR_REJECTED_RECEIPT,
+              },
+            };
+          case "plan-failed":
+            return {
+              settle,
+              result: { lines: [`${harness.specName}: ${result.error.message}`], exitCode: 1 },
+            };
+        }
+      } finally {
+        supervisor.close();
+      }
     },
-    // Neither flag ⇒ the harness's own `manager.autoCompile` decides, so the
-    // console's Restart button and this verb agree without a flag.
-    args.flags.get("compile") === true
-      ? { compile: true }
-      : args.flags.get("no-compile") === true
-        ? { compile: false }
-        : {},
   );
-  try {
-    // A restart from the terminal is by construction a restart of a daemon
-    // THIS process did not spawn, so it has to adopt off the runfile first:
-    // a supervisor with no pid stops nothing, leaves the runfile in place,
-    // and then refuses its own start with "already running".
-    if (restart) await supervisor.adopt();
-    const result = restart ? await supervisor.restart() : await supervisor.start();
-    if (result.ok) {
-      const plan = supervisor.snapshot();
-      return {
-        lines: [
-          `${harness.specName}: ${restart ? "restarted" : "started"} ${result.runId}${
-            result.pid !== undefined ? ` (pid ${result.pid})` : ""
-          }`,
-          // An operator who asked for a recompile is told it happened —
-          // "nothing recompiled and nobody said so" is the failure this
-          // whole path exists to end.
-          ...(result.prepared ?? []).map((note) => `  ${note}`),
-          `  class ${runClassFor(harness.target)} · state ${plan.state}`,
-          `  logs: crewhaus daemon logs ${harness.dir} --run ${result.runId}`,
-        ],
-        exitCode: 0,
-      };
-    }
-    switch (result.reason) {
-      case "already-running":
-        return {
-          lines: [
-            `${harness.specName}: already running${
-              result.runfile !== undefined
-                ? ` (pid ${result.runfile.pid}, run ${result.runfile.runId})`
-                : ""
-            } — the runfile is the lock`,
-          ],
-          exitCode: 1,
-        };
-      case "preflight-blocked":
-        return {
-          lines: [
-            ...formatGateRefusal(result.gate),
-            "",
-            "  re-run with --force to wave through the forceable items,",
-            "  or --ack <id,id> to wave specific ones through by id.",
-          ],
-          exitCode: 1,
-        };
-      case "prepare-refused":
-        return {
-          lines: [`${harness.specName}:`, ...formatPrepareRefusal(result.refusal)],
-          exitCode: 1,
-        };
-      case "plan-failed":
-        return { lines: [`${harness.specName}: ${result.error.message}`], exitCode: 1 };
-    }
-  } finally {
-    supervisor.close();
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -646,7 +778,7 @@ function passthroughFlags(args: VerbArgs): string[] {
 type MemberOutcome = {
   readonly member: GroupMember;
   readonly lines: readonly string[];
-  readonly exitCode: 0 | 1;
+  readonly exitCode: number;
   readonly skipped: boolean;
 };
 
@@ -869,48 +1001,66 @@ async function daemonStop(
     );
   }
   const harness = resolveHarness(args.positional[0], opts);
-  const supervisor = supervisorFor(harness, opts, { enabled: false });
-  try {
-    // Adopt first: a daemon this process did not spawn is exactly the case
-    // `stop` exists for, and without adoption there is no pid to signal.
-    const adopted = await supervisor.adopt();
-    if (adopted === "none") {
-      return { lines: [`${harness.specName}: not running (no runfile)`], exitCode: 0 };
-    }
-    if (adopted === "lost") {
-      return {
-        lines: [`${harness.specName}: the recorded daemon is gone — the stale runfile was cleared`],
-        exitCode: 0,
-      };
-    }
-    const graceFlag = args.flags.get("grace");
-    const graceMs = typeof graceFlag === "string" ? Number(graceFlag) : undefined;
-    if (graceMs !== undefined && (!Number.isFinite(graceMs) || graceMs < 0)) {
-      throw new Error("daemon stop: --grace must be a non-negative number of ms");
-    }
-    const result = await supervisor.stop(graceMs !== undefined ? { graceMs } : {});
-    if (!result.stopped) {
-      // A live daemon holds the runfile that this supervisor never adopted,
-      // so nothing was signalled. Reporting "stopped" here would walk an
-      // operator away from a channel bot that is still answering.
-      return {
-        lines: [
-          `${harness.specName}: NOT stopped — a live daemon${
-            result.runfile !== undefined ? ` (pid ${result.runfile.pid})` : ""
-          } holds the runfile but was not adopted; nothing was signalled`,
-        ],
-        exitCode: 1,
-      };
-    }
-    return {
-      lines: [
-        `${harness.specName}: stopped${result.forced ? " (SIGKILL — it ignored SIGTERM)" : ""}`,
-      ],
-      exitCode: 0,
-    };
-  } finally {
-    supervisor.close();
+  // Checked before the command is written: a refused argument writes nothing.
+  const graceFlag = args.flags.get("grace");
+  const graceMs = typeof graceFlag === "string" ? Number(graceFlag) : undefined;
+  if (graceMs !== undefined && (!Number.isFinite(graceMs) || graceMs < 0)) {
+    throw new Error("daemon stop: --grace must be a non-negative number of ms");
   }
+  return await receipted(harness, "controls.stop", opts, async () => {
+    const supervisor = supervisorFor(harness, opts, { enabled: false });
+    try {
+      // Adopt first: a daemon this process did not spawn is exactly the case
+      // `stop` exists for, and without adoption there is no pid to signal.
+      const adopted = await supervisor.adopt();
+      const nothingToStop = settleStop({ stopped: false, forced: false });
+      if (adopted === "none") {
+        return {
+          settle: nothingToStop,
+          result: { lines: [`${harness.specName}: not running (no runfile)`], exitCode: 0 },
+        };
+      }
+      if (adopted === "lost") {
+        return {
+          settle: nothingToStop,
+          result: {
+            lines: [
+              `${harness.specName}: the recorded daemon is gone — the stale runfile was cleared`,
+            ],
+            exitCode: 0,
+          },
+        };
+      }
+      const result = await supervisor.stop(graceMs !== undefined ? { graceMs } : {});
+      if (!result.stopped) {
+        // A live daemon holds the runfile that this supervisor never adopted,
+        // so nothing was signalled. Reporting "stopped" here would walk an
+        // operator away from a channel bot that is still answering.
+        return {
+          settle: settleStop(result),
+          result: {
+            lines: [
+              `${harness.specName}: NOT stopped — a live daemon${
+                result.runfile !== undefined ? ` (pid ${result.runfile.pid})` : ""
+              } holds the runfile but was not adopted; nothing was signalled`,
+            ],
+            exitCode: 1,
+          },
+        };
+      }
+      return {
+        settle: settleStop(result),
+        result: {
+          lines: [
+            `${harness.specName}: stopped${result.forced ? " (SIGKILL — it ignored SIGTERM)" : ""}`,
+          ],
+          exitCode: 0,
+        },
+      };
+    } finally {
+      supervisor.close();
+    }
+  });
 }
 
 async function daemonDrain(
@@ -919,12 +1069,19 @@ async function daemonDrain(
 ): Promise<DaemonCommandResult> {
   const args = parseVerbArgs("drain", argv, {});
   const harness = resolveHarness(args.positional[0], opts);
+  return await receipted(harness, "controls.drain", opts, () => drainOnce(harness, opts));
+}
+
+async function drainOnce(harness: ResolvedHarness, opts: DaemonCommandOptions): Promise<Settled> {
   const control = createControlClient(opts.fetch !== undefined ? { fetch: opts.fetch } : {});
   const supervisor = supervisorFor(harness, opts, { enabled: false });
   try {
     const adopted = await supervisor.adopt();
     if (adopted !== "adopted") {
-      return { lines: [`${harness.specName}: not running`], exitCode: 0 };
+      return {
+        settle: settleStop({ stopped: false, forced: false }),
+        result: { lines: [`${harness.specName}: not running`], exitCode: 0 },
+      };
     }
     // Adopting attaches the pump; draining it once is what turns the
     // daemon's stdout announcement into a control port we can dial. Without
@@ -938,12 +1095,15 @@ async function daemonDrain(
     });
     if (!result.stopped) {
       return {
-        lines: [
-          `${harness.specName}: NOT drained — a live daemon${
-            result.runfile !== undefined ? ` (pid ${result.runfile.pid})` : ""
-          } holds the runfile but was not adopted; nothing was signalled`,
-        ],
-        exitCode: 1,
+        settle: settleStop(result),
+        result: {
+          lines: [
+            `${harness.specName}: NOT drained — a live daemon${
+              result.runfile !== undefined ? ` (pid ${result.runfile.pid})` : ""
+            } holds the runfile but was not adopted; nothing was signalled`,
+          ],
+          exitCode: 1,
+        },
       };
     }
     const viaSignal = outcome === undefined || !outcome.ok;
@@ -962,7 +1122,7 @@ async function daemonDrain(
         }`,
       );
     }
-    return { lines, exitCode: 0 };
+    return { settle: settleStop(result), result: { lines, exitCode: 0 } };
   } finally {
     supervisor.close();
   }

@@ -3,7 +3,13 @@ import { createHmac } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { isStoredActor } from "@crewhaus/control-contract";
-import { ensureDigestKey, keyedDigest, readDigestKey } from "./digest";
+import {
+  LOCAL_ACTOR_LABEL,
+  ensureDigestKey,
+  keyedDigest,
+  readDigestKey,
+  storedLocalActor,
+} from "./digest";
 import { controlFile, plant, removeTempDirs, tempDir } from "./test-helpers";
 
 afterAll(removeTempDirs);
@@ -200,5 +206,32 @@ describe("a key file named by the caller", () => {
     const ensured = await ensureDigestKey(root, { file: "../outside.key" });
     expect(ensured.state).toBe("unreadable");
     expect(existsSync(join(root, "..", "outside.key"))).toBe(false);
+  });
+});
+
+describe("storedLocalActor", () => {
+  test("the label is pinned, and so is the digest under a fixed key", async () => {
+    expect(LOCAL_ACTOR_LABEL).toBe("local-actor");
+    const raw = new Uint8Array(32).fill(1);
+    const key = await crypto.subtle.importKey(
+      "raw",
+      raw,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    expect(await storedLocalActor(key, "local:sam@laptop")).toBe(
+      "local:#b13afd6724b52ab82fabaee2108b1eb64397fdc5fcdd2601d6c082cd1464af98",
+    );
+  });
+
+  test("it is the keyed digest under the label, a stored actor, and never the raw actor", async () => {
+    const key = await keyOf(harnessWithKey());
+    const stored = await storedLocalActor(key, "local:max@laptop");
+    expect(stored).toBe(`local:#${await keyedDigest(key, "local-actor", ["local:max@laptop"])}`);
+    expect(isStoredActor(stored)).toBe(true);
+    expect(stored).not.toContain("max");
+    const other = await keyOf(harnessWithKey("ff".repeat(32)));
+    expect(await storedLocalActor(other, "local:max@laptop")).not.toBe(stored);
   });
 });

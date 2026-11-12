@@ -98,6 +98,16 @@ function treeOf(root: string): Record<string, string> {
   return out;
 }
 
+/**
+ * The tree without the harness's command records: a refused write is still a command,
+ * and its `rejected` receipt is the one thing it leaves.
+ */
+function outsideControl(tree: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(tree).filter(([path]) => path !== "run/" && !path.startsWith("run/control/")),
+  );
+}
+
 /** A fact line in the store's own shape. */
 function fact(n: number, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -799,6 +809,7 @@ describe("a Thredz-backed wiki is edited in Thredz", () => {
         const res = await write(t, id, "kept");
         expect(res.status).toBe(409);
         expect(res.body["error"]).toBe(THREDZ_REFUSAL);
+        expect((res.body["receipt"] as { state: string }).state).toBe("rejected");
       }
       // Ahead of body validation: this is not a 400.
       const noBody = await t.api(`/api/h/${id}/memory/wiki/kept`, {
@@ -807,7 +818,7 @@ describe("a Thredz-backed wiki is edited in Thredz", () => {
       });
       expect(noBody.status).toBe(409);
       expect(noBody.body["error"]).toBe(THREDZ_REFUSAL);
-      expect(treeOf(crewhaus)).toEqual(before);
+      expect(outsideControl(treeOf(crewhaus))).toEqual(before);
     });
   }
 
@@ -885,8 +896,9 @@ describe("a Thredz-backed wiki is edited in Thredz", () => {
       const res = await write(t, id, "kept");
       expect(res.status).toBe(409);
       expect(res.body["error"]).toBe(UNKNOWN_REFUSAL);
+      expect((res.body["receipt"] as { state: string }).state).toBe("rejected");
     }
-    expect(treeOf(crewhaus)).toEqual(before);
+    expect(outsideControl(treeOf(crewhaus))).toEqual(before);
   });
 
   test("the answer table", () => {

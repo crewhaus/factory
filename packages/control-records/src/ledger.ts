@@ -7,14 +7,16 @@
  * repaired on the next touch.
  *
  * That repair can race a slow but live winner, which is what a stolen lock creates,
- * so a claim's record can land twice. Every fold counts one record per `claim` value,
- * the first line, and only the caller answered `won: true` may perform the effect.
+ * so a claim's record can land twice. Every fold counts one record per claim and id,
+ * the first line, and only the caller answered `won: true` may perform the effect. A
+ * repair copies its record whole, so its duplicate shares both; a name an expired claim
+ * gave up and a new record claimed again, with a new id, is a new object.
  *
  * A refused publish or append answers tool-safety's `SafeFsFailure`. A lock that cannot
  * be taken rejects with `withFileLock`'s own error, its message intact; anything but a
  * regular file at the lock's name is refused before the lock is created, in the same words.
  */
-import { closeSync } from "node:fs";
+import { closeSync, unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { MACHINES, canTransition } from "@crewhaus/control-contract";
 import type { AcquireFileLockOptions } from "@crewhaus/infra-utils";
@@ -22,6 +24,7 @@ import {
   type SafeFsFailure,
   appendContained,
   ensureDirContained,
+  resolveContained,
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
 import {
@@ -256,8 +259,22 @@ export function readClaim(ledger: Ledger, claim: string): PublishAnswer {
   };
 }
 
-/** Whether a line carrying this claim exists from segment `from` onward. */
-function claimHasLine(ledger: Ledger, claim: string, from: number): boolean | SafeFsFailure {
+/**
+ * Which fact a line records: its claim and its id. A row without a string `id` is keyed by
+ * its claim alone.
+ */
+function factOf(claim: string, id: unknown): string {
+  return typeof id === "string" ? JSON.stringify([claim, id]) : JSON.stringify([claim]);
+}
+
+/** Whether a line carrying this claim and id exists from segment `from` onward. */
+function claimHasLine(
+  ledger: Ledger,
+  claim: string,
+  id: unknown,
+  from: number,
+): boolean | SafeFsFailure {
+  const fact = factOf(claim, id);
   const retained = retainedSegments(ledger);
   if (!retained.ok) return retained;
   for (const seg of retained.segs) {
@@ -272,7 +289,10 @@ function claimHasLine(ledger: Ledger, claim: string, from: number): boolean | Sa
     try {
       scanForward(opened.fd, 0, opened.stats.size, Number.POSITIVE_INFINITY, (line) => {
         const value = classifyLine(line);
-        found = value.kind === "record" && value.record["claim"] === claim;
+        found =
+          value.kind === "record" &&
+          value.record["claim"] === claim &&
+          factOf(claim, value.record["id"]) === fact;
         return found ? "stop-after" : "go";
       });
     } catch (err) {
@@ -298,7 +318,7 @@ function repairClaim(
   const mark = readWatermark(ledger);
   if (!mark.ok) return mark;
   if (winner.seg < mark.seg) return { repaired: false };
-  const has = claimHasLine(ledger, winner.claim, winner.seg);
+  const has = claimHasLine(ledger, winner.claim, winner.record["id"], winner.seg);
   if (typeof has !== "boolean") return has;
   if (has) return { repaired: false };
   const written = lockedAppend({ ...winner.record, claim: winner.claim, repaired: true });
@@ -349,6 +369,47 @@ export async function appendClaim(
   });
 }
 
+export type ExpireAnswer = { readonly ok: true; readonly removed: boolean } | SafeFsFailure;
+
+/**
+ * Remove a claim whose `at` is older than `notBefore` (epoch ms), so its name can be claimed
+ * again. Under the ledger lock the claim is read again and removed only while it is still
+ * that old; a younger claim, a missing one and one whose `at` cannot be read are left
+ * alone. A generation claim is never removed and is refused. The removal is contained: a
+ * link planted at the claim's name is removed, never followed.
+ *
+ * First consumer: idempotency keys, honoured for seven days.
+ */
+export async function expireClaim(
+  ledger: Ledger,
+  claim: string,
+  notBefore: number,
+): Promise<ExpireAnswer> {
+  const rel = claimRel(ledger, claim);
+  if (typeof rel !== "string") return rel;
+  if (claim.split("/")[0] === GENERATION_KIND) {
+    return refusal(
+      "invalid-path",
+      rel,
+      `${JSON.stringify(claim)} is a generation claim: never removed`,
+    );
+  }
+  return withLedgerLock<ExpireAnswer>(ledger, () => {
+    const read = readClaim(ledger, claim);
+    if (!read.ok) return read.code === "not-found" ? { ok: true, removed: false } : read;
+    const at = Date.parse(read.content.at);
+    if (!Number.isFinite(at) || at >= notBefore) return { ok: true, removed: false };
+    const resolved = resolveContained(ledger.root, rel, { followLeaf: false });
+    if (!resolved.ok) return resolved;
+    try {
+      unlinkSync(resolved.real);
+    } catch (err) {
+      return ioFailure(rel, err, "remove");
+    }
+    return { ok: true, removed: true };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Folds
 // ---------------------------------------------------------------------------
@@ -383,7 +444,7 @@ export type FoldAnswer =
       readonly objects: ReadonlyMap<string, FoldedObject>;
       /** The highest generation seen per id, on any row, applied or not. */
       readonly generations: ReadonlyMap<string, number>;
-      /** Facts counted: lines that parsed, one per `claim` value. */
+      /** Facts counted: lines that parsed, one per claim and id. */
       readonly records: number;
       readonly anomalies: readonly FoldAnomaly[];
       readonly gaps: readonly FoldGap[];
@@ -400,9 +461,11 @@ function rowIsLegal(ledger: Ledger, from: string | undefined, to: unknown): bool
 }
 
 /**
- * Every retained segment, read whole, folded by `id` through the ledger's machine. It
- * is uncapped because a fold decides writes: a capped read is only a view, and a list
- * uses `readPage`. A segment that cannot be read is refused rather than folded around.
+ * Every retained segment, read whole, folded by `id` through the ledger's machine, one
+ * record per claim and id (the first line; a row without a string `id` by its claim
+ * alone). It is uncapped because a fold decides writes: a capped read is only a view, and
+ * a list uses `readPage`. A segment that cannot be read is refused rather than folded
+ * around.
  *
  * First consumers: the run ledger and the receipts.
  */
@@ -432,8 +495,9 @@ export function foldStates(ledger: Ledger): FoldAnswer {
         const row = value.record;
         const claim = row["claim"];
         if (typeof claim === "string") {
-          if (claims.has(claim)) return "go";
-          claims.add(claim);
+          const fact = factOf(claim, row["id"]);
+          if (claims.has(fact)) return "go";
+          claims.add(fact);
         }
         records += 1;
         const id = row["id"];

@@ -18,6 +18,7 @@
     "@crewhaus/continuity-store": "workspace:*",
     "@crewhaus/control-contract": "workspace:*",
     "@crewhaus/control-records": "workspace:*",
+    "@crewhaus/control-service": "workspace:*",
     "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/data-retention-engine": "workspace:*",
     "@crewhaus/dataset-registry": "workspace:*",

@@ -41,6 +41,7 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { type LeaseHolder, type LeaseOptions, withMutatingLease } from "@crewhaus/control-records";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import type { HangarHarnessEntry, HangarRegistry } from "@crewhaus/harness-registry";
 import {
@@ -112,6 +113,9 @@ export type ProcessLayerOptions = {
   readonly clock?: Clock;
   readonly ports?: PortLedger;
   readonly jobStore?: JobStore;
+  /** Wraps the job store (the given one or the default file), so command receipts move
+   *  with their jobs. */
+  readonly wrapJobStore?: (store: JobStore) => JobStore;
   /** Job executor. Defaults to spawning the `crewhaus` CLI through `ops`. */
   readonly runJob?: JobRunner;
   readonly jobConcurrency?: number;
@@ -185,6 +189,15 @@ function liveTarget(harnessDir: string): string | undefined {
   }
 }
 
+/** Why a mutating job could not start: another process holds the harness. */
+export function leaseRefusal(holder: LeaseHolder): string {
+  const from = holder.head === "cli" ? "from the CLI" : "from Home";
+  return `another change is running on this harness: \`crewhaus ${holder.kind}\` ${from} (pid ${holder.pid}, since ${holder.since}); try again when it finishes`;
+}
+
+/** The env name a job's child reads to run under the lease its parent holds. */
+export const LEASE_REF_ENV = "CREWHAUS_LEASE_REF";
+
 /** Default job runner: spawn `crewhaus <argv>` in the harness root through
  *  the same `ProcessOps` seam the supervisor uses, capturing into the run
  *  dir. Never a shell — argv is passed as a vector.
@@ -202,6 +215,7 @@ function liveTarget(harnessDir: string): string | undefined {
 export function defaultJobRunner(
   ops: ProcessOps,
   harnessBin: (dir: string) => string | undefined,
+  lease: Omit<LeaseOptions, "probe"> = {},
 ): JobRunner {
   return async (job: JobRecord, ctx: JobRunContext) => {
     const bin = harnessBin(job.harnessDir);
@@ -209,46 +223,72 @@ export function defaultJobRunner(
       return { error: "no resolvable `crewhaus` CLI (harness node_modules/.bin, then PATH)" };
     }
     ensureRunDir(job.harnessDir);
-    const logFile = runLogPath(job.harnessDir, job.jobId.replace(/^job_/, "run_"));
-    const child = ops.spawn({
-      argv: [bin, ...job.argv],
-      cwd: job.harnessDir,
-      env: mergedSpawnEnv(process.env, job.harnessDir).env as Record<string, string>,
-      stdio: { mode: "file", path: logFile },
-      detached: true,
-    });
-    // HAND THE CHILD TO THE QUEUE. Without this the queue knows a job is
-    // "running" but holds nothing it can signal: `cancel()` answers false and
-    // manager shutdown marks the ledger row while the process keeps going —
-    // the orphan M4 exists to stop, reintroduced through the console path.
-    ctx.register(processOpsChild(ops, child.pid));
-    const { code } = await child.exited;
-    if (code !== 0 || job.kind !== "compile") return { exitCode: code ?? 1 };
+    // A mutating job holds the harness's mutating lease, the one the CLI's long verbs
+    // take, so a terminal `crewhaus eval` and this job never write the tree at once. The
+    // child is told the lease's ref and runs under it rather than waiting on itself.
+    if (job.mutating) {
+      const held = await withMutatingLease(
+        job.harnessDir,
+        { head: "server", kind: job.kind },
+        (held) => runJobChild(ops, bin, job, ctx, held.leaseRef),
+        { ...lease, probe: ops },
+      );
+      if (held.ok) return held.value;
+      return { error: "holder" in held ? leaseRefusal(held.holder) : held.reason };
+    }
+    return runJobChild(ops, bin, job, ctx, undefined);
+  };
+}
 
-    // A manager-initiated compile replaces the bundle, which SILENTLY
-    // discarded whatever the operator's post-compile step had patched into
-    // it — the reason fleets had a "never use console compile jobs" rule.
-    // Running the harness's own `postCompile` hook here closes that: the
-    // console's compile and `daemon start --compile` leave the same bundle.
-    const outcome = await runManagerHook(
-      "postCompile",
-      readManagerSettings(job.harnessDir).hooks.postCompile,
-      {
-        harnessDir: job.harnessDir,
-        target: liveTarget(job.harnessDir) ?? "cli",
-        ops,
-        env: mergedSpawnEnv(process.env, job.harnessDir).env as Record<string, string>,
-        crewhausBin: bin,
-      },
-      readManagerSettings(job.harnessDir).hooks.timeoutMs,
-    );
-    if (outcome.ok) return { exitCode: 0 };
-    // The compile itself succeeded; the job did not. Reporting 0 here would
-    // leave a bundle nobody patched behind a green job row.
-    return {
-      exitCode: outcome.refusal.exitCode ?? 1,
-      error: [outcome.refusal.message, ...outcome.refusal.output].join("\n"),
-    };
+async function runJobChild(
+  ops: ProcessOps,
+  bin: string,
+  job: JobRecord,
+  ctx: JobRunContext,
+  leaseRef: string | undefined,
+): Promise<{ exitCode?: number; error?: string }> {
+  const logFile = runLogPath(job.harnessDir, job.jobId.replace(/^job_/, "run_"));
+  const child = ops.spawn({
+    argv: [bin, ...job.argv],
+    cwd: job.harnessDir,
+    env: {
+      ...(mergedSpawnEnv(process.env, job.harnessDir).env as Record<string, string>),
+      ...(leaseRef !== undefined ? { [LEASE_REF_ENV]: leaseRef } : {}),
+    },
+    stdio: { mode: "file", path: logFile },
+    detached: true,
+  });
+  // HAND THE CHILD TO THE QUEUE. Without this the queue knows a job is
+  // "running" but holds nothing it can signal: `cancel()` answers false and
+  // manager shutdown marks the ledger row while the process keeps going —
+  // the orphan M4 exists to stop, reintroduced through the console path.
+  ctx.register(processOpsChild(ops, child.pid));
+  const { code } = await child.exited;
+  if (code !== 0 || job.kind !== "compile") return { exitCode: code ?? 1 };
+
+  // A manager-initiated compile replaces the bundle, which SILENTLY
+  // discarded whatever the operator's post-compile step had patched into
+  // it — the reason fleets had a "never use console compile jobs" rule.
+  // Running the harness's own `postCompile` hook here closes that: the
+  // console's compile and `daemon start --compile` leave the same bundle.
+  const outcome = await runManagerHook(
+    "postCompile",
+    readManagerSettings(job.harnessDir).hooks.postCompile,
+    {
+      harnessDir: job.harnessDir,
+      target: liveTarget(job.harnessDir) ?? "cli",
+      ops,
+      env: mergedSpawnEnv(process.env, job.harnessDir).env as Record<string, string>,
+      crewhausBin: bin,
+    },
+    readManagerSettings(job.harnessDir).hooks.timeoutMs,
+  );
+  if (outcome.ok) return { exitCode: 0 };
+  // The compile itself succeeded; the job did not. Reporting 0 here would
+  // leave a bundle nobody patched behind a green job row.
+  return {
+    exitCode: outcome.refusal.exitCode ?? 1,
+    error: [outcome.refusal.message, ...outcome.refusal.output].join("\n"),
   };
 }
 
@@ -258,8 +298,9 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
   const ports = options.ports ?? createPortLedger({ now: options.now });
   const handles = new Map<string, HarnessProcess>();
 
+  const store = options.jobStore ?? createFileJobStore(`${options.hangarRoot}/jobs.jsonl`);
   const jobs = createJobQueue({
-    store: options.jobStore ?? createFileJobStore(`${options.hangarRoot}/jobs.jsonl`),
+    store: options.wrapJobStore !== undefined ? options.wrapJobStore(store) : store,
     run: options.runJob ?? defaultJobRunner(ops, (dir) => resolveCrewhausBin(dir)),
     now: options.now,
     ...(options.jobConcurrency !== undefined ? { concurrency: options.jobConcurrency } : {}),

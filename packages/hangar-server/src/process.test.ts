@@ -14,7 +14,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { type HangarHarnessEntry, openHangarRegistry } from "@crewhaus/harness-registry";
 import { createProcessOps } from "@crewhaus/harness-supervisor";
@@ -634,8 +634,12 @@ describe("process control", () => {
         status: 0,
         body: {},
       }));
-      await t.api(`/api/h/${id}/proc`); // let the route reach supervisor.drain()
-      expect((await t.api(`/api/h/${id}/proc`)).body["state"]).toBe("draining");
+      // Let the route reach supervisor.drain(): its receipt is written first.
+      let state: unknown;
+      for (let i = 0; i < 100 && state !== "draining"; i++) {
+        state = (await t.api(`/api/h/${id}/proc`)).body["state"];
+      }
+      expect(state).toBe("draining");
 
       const feed = await openRunFeed(t, id, runId);
       await feed.until((s) => s.includes("event: replay"));
@@ -966,4 +970,79 @@ describe("ProcessLayer.held", () => {
       await t.stop();
     }
   }, 20_000);
+});
+
+describe("a mutating job holds the harness's mutating lease", () => {
+  const leaseFile = (dir: string): string =>
+    join(dir, ".crewhaus", "run", "control", "leases", "mutating.json");
+  const jobFor = (dir: string, jobId: string) =>
+    ({
+      jobId,
+      harnessDir: dir,
+      kind: "eval",
+      argv: ["eval"],
+      mutating: true,
+      state: "running",
+      enqueuedAt: new Date(NOW).toISOString(),
+    }) as Parameters<ReturnType<typeof defaultJobRunner>>[0];
+  const ctx = {
+    register: () => undefined,
+    isCancelled: () => false,
+  } as unknown as Parameters<ReturnType<typeof defaultJobRunner>>[1];
+
+  test("the child runs under the lease and is told its ref; the lease is released after", async () => {
+    const clock = createTestClock(NOW);
+    const ops = createTestProcessOps(() => clock.now());
+    const dir = makeFixtureHarness(join(mkdtempSync(join(tmpdir(), "hangar-lease-")), "h"), {
+      specName: "leased",
+    });
+    const runner = defaultJobRunner(ops, () => "/bin/crewhaus");
+    const finished = runner(jobFor(dir, "job_00000000000000c1"), ctx);
+    for (let i = 0; i < 50 && ops.children.length === 0; i++) await Bun.sleep(1);
+    const child = ops.last();
+    const lease = JSON.parse(readFileSync(leaseFile(dir), "utf8")) as Record<string, unknown>;
+    expect(lease["head"]).toBe("server");
+    expect(lease["kind"]).toBe("eval");
+    expect(child?.request.env["CREWHAUS_LEASE_REF"]).toBe(lease["leaseRef"] as string);
+    child?.exit(0);
+    expect(await finished).toEqual({ exitCode: 0 });
+    expect(existsSync(leaseFile(dir))).toBe(false);
+  });
+
+  test("a harness the CLI holds: the job fails naming the holder, and nothing is spawned", async () => {
+    const clock = createTestClock(NOW);
+    const ops = createTestProcessOps(() => clock.now());
+    const dir = makeFixtureHarness(join(mkdtempSync(join(tmpdir(), "hangar-lease-")), "h"), {
+      specName: "busy",
+    });
+    // A live holder: a process the fake OS knows.
+    const holder = ops.spawn({
+      argv: ["crewhaus", "optimize"],
+      cwd: dir,
+      env: {},
+      stdio: { mode: "inherit" },
+    } as never);
+    mkdirSync(join(dir, ".crewhaus", "run", "control", "leases"), { recursive: true });
+    writeFileSync(
+      leaseFile(dir),
+      `${JSON.stringify({
+        v: 1,
+        pid: holder.pid,
+        host: hostname(),
+        head: "cli",
+        kind: "optimize",
+        acquiredAt: "2026-08-02T23:00:00.000Z",
+        leaseRef: "cli-ref",
+      })}\n`,
+    );
+    const spawned = ops.children.length;
+    const runner = defaultJobRunner(ops, () => "/bin/crewhaus", {
+      waitMs: 0,
+      sleep: async () => undefined,
+    });
+    const answer = await runner(jobFor(dir, "job_00000000000000c2"), ctx);
+    expect(answer.error).toContain("`crewhaus optimize` from the CLI");
+    expect(answer.error).toContain(`pid ${holder.pid}`);
+    expect(ops.children.length).toBe(spawned);
+  });
 });

@@ -71,6 +71,12 @@ export type JobRecord = {
   /** True when the cancel escalated past the grace period to SIGKILL —
    *  the same flag the run ledger records for a forced daemon stop. */
   readonly forced?: boolean;
+  /** The command receipt (`cmd_…`) this job carries out, when a command
+   *  submitted it. Only the first, `pending` row holds it. */
+  readonly commandId?: string;
+  /** Who queued it, as a stored actor (`prn_…` or `local:#<digest>`), never a
+   *  raw local user name. */
+  readonly by?: string;
 };
 
 export type JobStore = {
@@ -212,6 +218,10 @@ export type SubmitInput = {
   readonly argv: readonly string[];
   /** Defaults to `!isReadOnlyJob(kind)`. */
   readonly mutating?: boolean;
+  /** The command receipt this job carries out. */
+  readonly commandId?: string;
+  /** Who queued it, as a stored actor. */
+  readonly by?: string;
 };
 
 export type JobQueue = {
@@ -456,6 +466,8 @@ export function createJobQueue(options: JobQueueOptions): JobQueue {
         mutating,
         state: "pending",
         enqueuedAt: new Date(now()).toISOString(),
+        ...(input.commandId !== undefined ? { commandId: input.commandId } : {}),
+        ...(input.by !== undefined ? { by: input.by } : {}),
       };
       options.store.append(record);
       queued.push(record);

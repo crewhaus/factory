@@ -1263,6 +1263,7 @@ import {
   modelsAuditExitCode,
   parseModelsArgs,
 } from "./models-cli";
+import { holdCliMutatingLease } from "./mutating-lease";
 // Item 66 — `crewhaus onchain tune|sentinel`: mine wallet-engine receipt +
 // simulation history to propose a tuned transaction_policy and flag anomalous
 // spend. Side-effect-free (this entry file reads history + writes patch/report).
@@ -2065,6 +2066,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     await runCompileWatch({ specPath, strict, readme });
     return;
   }
+  await holdCliMutatingLease(dirname(resolve(specPath)), "compile");
 
   const absSpec = resolve(specPath);
   logger.debug("compile.start", { spec: absSpec, out: outDir, emitIr, strict, allowUnmarkedSinks });
@@ -7353,6 +7355,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   const retryErrors = args.flags["no-retry"] !== true;
   const outDirArg = args.flags["out"];
   const absSpec = resolve(specPath);
+  await holdCliMutatingLease(dirname(absSpec), "optimize");
   const runId = `opt_${Date.now().toString(16)}`;
   const outDir =
     typeof outDirArg === "string"
@@ -8571,6 +8574,7 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       `spec not found at ${absSpec} — run from the harness directory (standalone-harness convention) or pass <spec.yaml>`,
     );
   }
+  await holdCliMutatingLease(dirname(absSpec), "flywheel run");
   const dryRun = args.flags["dry-run"] === true;
 
   // Invariant: never run over uncommitted spec changes (see gitSpecStatus).
@@ -9615,6 +9619,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   }
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
+  await holdCliMutatingLease(dirname(resolve(specPath)), "eval");
   const datasetPath = args.flags["dataset"];
   const gradersPath = args.flags["graders"];
   const outDirArg = args.flags["out"];

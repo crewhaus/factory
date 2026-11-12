@@ -35,6 +35,9 @@
         "@crewhaus/compliance-controls": "workspace:*",
         "@crewhaus/computer-use-driver": "workspace:*",
         "@crewhaus/context-bundle": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/control-service": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
@@ -670,6 +673,20 @@
         "@crewhaus/spec-patch": "workspace:*",
       },
     },
+    "packages/control-service": {
+      "name": "@crewhaus/control-service",
+      "version": "0.8.0",
+      "dependencies": {
+        "@crewhaus/access-control": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/harness-supervisor": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+      },
+    },
     "packages/cost-tracker": {
       "name": "@crewhaus/cost-tracker",
       "version": "0.8.0",
@@ -1244,6 +1261,7 @@
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/control-service": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
@@ -4054,6 +4072,8 @@
     "@crewhaus/control-contract": ["@crewhaus/control-contract@workspace:packages/control-contract"],
 
     "@crewhaus/control-records": ["@crewhaus/control-records@workspace:packages/control-records"],
+
+    "@crewhaus/control-service": ["@crewhaus/control-service@workspace:packages/control-service"],
 
     "@crewhaus/cost-tracker": ["@crewhaus/cost-tracker@workspace:packages/cost-tracker"],
 

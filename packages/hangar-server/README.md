@@ -67,6 +67,20 @@ by the other, and neither needs the other running.
 - **A request body never becomes a command line** — job argv is built from
   a closed vocabulary (`jobArgv(kind, options)`) with every interpolated
   value shape-checked; there is no free-form argv parameter.
+- **Every change is persisted before it is acknowledged** — the route table
+  (`src/route-table.ts`) is data: one row per method and path, with its
+  permission, whether it writes a command receipt and where, and its CLI
+  twin, held to the console's `routes.js` by `route-table.test.ts`. The
+  receipts middleware (`src/receipts.ts`) writes the `accepted` receipt
+  through `@crewhaus/control-service` before the handler runs, settles it
+  from the answer, and adds `receipt` to the answer. A harness's commands
+  go to its own `.crewhaus/run/control/commands/`, the same ledger
+  `crewhaus daemon` writes; registry edits and Home's settings go to
+  `<hangarRoot>/control/commands/`. A request refused before its handler
+  writes nothing. `Idempotency-Key` is honoured on every write. A mutating
+  job takes the harness's mutating lease, so a terminal `crewhaus eval` and
+  a queued one never write the tree at once, and command recovery runs at
+  boot, after adoption and the job restore.
 - **Torn-line tolerance + caps** — every JSONL reader skips unparseable
   lines and caps both lines (`MAX_JSONL_LINES`) and bytes
   (`MAX_JSONL_BYTES`) read; truncation is reported, never hidden.

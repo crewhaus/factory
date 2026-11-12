@@ -48,6 +48,12 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
+import {
+  type RecoverCounts,
+  currentLocalIdentity,
+  wireControl,
+  withOwnStartTime,
+} from "@crewhaus/control-service";
 import { readRunIndex } from "@crewhaus/eval-report";
 import {
   type BuildInventoryDeps,
@@ -69,6 +75,7 @@ import {
   type StartResult,
   type StopResult,
   cliTwin,
+  createProcessOps,
   isUnforceable,
   readRunfile,
   resolveBundle,
@@ -174,6 +181,7 @@ import {
   jobArgv,
 } from "./process";
 import { isProofRunId, proofTenants, proofView } from "./proofs";
+import { commandFields, createReceipts } from "./receipts";
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
 import {
@@ -301,7 +309,11 @@ export type HangarServer = {
     readonly adopted: number;
     readonly lost: number;
     readonly jobs: number;
+    /** What command recovery did, after adoption and the job restore. */
+    readonly commands: RecoverCounts;
   }>;
+  /** The control service this server writes command receipts through. */
+  readonly controlService: ReturnType<typeof wireControl>;
   stop(): Promise<void>;
 };
 
@@ -340,6 +352,37 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   const hostname = opts.hostname ?? "127.0.0.1";
   const operator = opts.operator ?? "hangar";
 
+  // Every command is persisted before it is acknowledged. The supervisor and the drain
+  // call are lent lazily, so the job store below can be wrapped without a cycle.
+  const controlService = wireControl(
+    {
+      hangarRoot,
+      harnessDirOf: (hrn) => {
+        const entry = registry.get(hrn);
+        return entry !== undefined && entry.missingSince === null && existsSync(entry.dir)
+          ? entry.dir
+          : undefined;
+      },
+      harnessDirs: () => liveHarnesses().map((h) => h.dir),
+      supervisorFor: (dir) => {
+        const entry = registry.list().find((e) => e.dir === dir);
+        return entry === undefined ? undefined : processes.get(entry).supervisor;
+      },
+      drainRequest: (dir) => async () => {
+        const outcome = await control.drain({
+          harnessDir: dir,
+          controlPort: processes.peek(dir)?.controlPort(),
+        });
+        if (!outcome.ok) throw new Error(outcome.reason);
+      },
+      identity: currentLocalIdentity(),
+      now,
+      probe: withOwnStartTime(createProcessOps()),
+      onWarn,
+    },
+    { mode: "server" },
+  );
+
   const processes: ProcessLayer =
     opts.processLayer ??
     createProcessLayer({
@@ -349,6 +392,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       onWarn,
       hangarRoot,
       managerVersion: version,
+      wrapJobStore: controlService.jobs.wrapStore,
     });
   const control: ControlClient = opts.controlClient ?? createControlClient();
 
@@ -1220,6 +1264,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           ...(entry !== null ? { harnessId: entry.id } : {}),
           kind,
           argv,
+          ...commandFields(),
         }),
       warn: onWarn,
     };
@@ -1481,7 +1526,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           if (err instanceof JobArgumentError) throw new HttpError(400, err.message);
           throw err;
         }
-        const record = processes.jobs.submit({ harnessDir: dir, harnessId: entry.id, kind, argv });
+        const record = processes.jobs.submit({
+          harnessDir: dir,
+          harnessId: entry.id,
+          kind,
+          argv,
+          ...commandFields(),
+        });
         return jsonMasked({ ok: true, job: record }, 202);
       }
 
@@ -2293,6 +2344,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     return errResponse(404, "not found");
   };
 
+  const withReceipt = createReceipts({
+    control: controlService,
+    harness: (id) => registry.get(id),
+    scrubFor: (dir) => (dir === undefined ? fleetScrub() : harnessScrub(dir)),
+    onWarn,
+  });
+
   const handle = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
     const pathname = url.pathname;
@@ -2341,7 +2399,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         return errResponse(400, "malformed path encoding");
       }
       try {
-        return await api(req, url, segs.slice(1));
+        return await withReceipt(req, segs, () => api(req, url, segs.slice(1)));
       } catch (err) {
         if (err instanceof HttpError) return errResponse(err.status, err.message);
         onWarn(
@@ -2375,12 +2433,25 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   // manager died is closed as `interrupted` against an accurate picture.
   // Bun.serve binds synchronously, so the socket is live either way; a
   // caller that needs the picture awaits `ready`.
-  const ready = processes.boot().catch((err) => {
-    onWarn(
-      `hangar-server: process boot failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return { adopted: 0, lost: 0, jobs: 0 };
-  });
+  const ready = processes
+    .boot()
+    .catch((err) => {
+      onWarn(
+        `hangar-server: process boot failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { adopted: 0, lost: 0, jobs: 0 };
+    })
+    // Command recovery last: after adoption and the job restore, so it judges an accurate
+    // process picture and the receipts the restore already moved.
+    .then(async (booted) => ({
+      ...booted,
+      commands: await controlService.commands.recover("all").catch((err) => {
+        onWarn(
+          `hangar-server: command recovery failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return { redispatched: 0, reconciled: 0, unknown: 0 };
+      }),
+    }));
 
   return {
     url: `http://${hostname}:${boundPort}`,
@@ -2394,6 +2465,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     noAuth,
     idleTimeoutSeconds: SSE_IDLE_TIMEOUT_SECONDS,
     processes,
+    controlService,
     readOnly: readOnlyNow,
     ready,
     stop: async () => {

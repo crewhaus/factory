@@ -11,6 +11,7 @@
     { "path": "../continuity-store" },
     { "path": "../control-contract" },
     { "path": "../control-records" },
+    { "path": "../control-service" },
     { "path": "../watchme-store" },
     { "path": "../dataset-registry" },
     { "path": "../audit-log" },

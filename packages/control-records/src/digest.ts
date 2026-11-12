@@ -106,3 +106,21 @@ export async function keyedDigest(
   const body = new TextEncoder().encode(JSON.stringify([label, ...parts]));
   return hexOf(new Uint8Array(await crypto.subtle.sign("HMAC", key, body)));
 }
+
+/**
+ * The label of an unlinked local actor's digest. Stored digests join forever: a pin.
+ *
+ * First consumers: the command receipts, through `storedLocalActor`, and the decision log.
+ */
+export const LOCAL_ACTOR_LABEL = "local-actor";
+
+/**
+ * What an append-only record holds for an unlinked local actor (`local:<user>@<host>`):
+ * `local:#<keyedDigest(key, LOCAL_ACTOR_LABEL, [actor])>`, under the key of the root the
+ * record lives in. One definition, so the decision log and the receipts join.
+ *
+ * First consumer: the command receipts.
+ */
+export async function storedLocalActor(key: CryptoKey, localActor: string): Promise<string> {
+  return `local:#${await keyedDigest(key, LOCAL_ACTOR_LABEL, [localActor])}`;
+}
