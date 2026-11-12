@@ -186,6 +186,7 @@ describe("deployment-controller — T3 promote/rollback", () => {
       }),
       // Unused by this path — present to satisfy the interface.
       put: async () => {},
+      putNew: async () => {},
       get: async () => "",
       list: async () => [],
       listSpecs: async () => [],

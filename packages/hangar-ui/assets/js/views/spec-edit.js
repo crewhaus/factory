@@ -100,6 +100,68 @@ function tierBadge(row) {
 }
 
 /**
+ * The read-only state a spec read answered (`readOnly`), as this screen
+ * shows it. Pure. A spec carrying settings the schema in use does not know
+ * takes no write here: the notice says why in words, and every write control
+ * is held (`aria-disabled`, described by the notice) without leaving the
+ * focus order.
+ */
+export function readOnlyModel(readOnly) {
+  if (!readOnly || typeof readOnly !== "object") {
+    return { held: false, notice: "", paths: [], verb: null };
+  }
+  return {
+    held: true,
+    notice:
+      typeof readOnly.reason === "string" && readOnly.reason !== ""
+        ? readOnly.reason
+        : "This spec is read-only here.",
+    paths: Array.isArray(readOnly.paths) ? readOnly.paths.map(String) : [],
+    verb: typeof readOnly.verb === "string" ? readOnly.verb : null,
+  };
+}
+
+const READ_ONLY_NOTE_ID = "spec-read-only-note";
+
+/** Hold a write control while the spec is read-only: still focusable, announced as unavailable, with the reason. */
+function holdWhenReadOnly(control, live) {
+  if (live?.readOnly?.held === true) {
+    control.setAttribute("aria-disabled", "true");
+    control.setAttribute("aria-describedby", READ_ONLY_NOTE_ID);
+  }
+  return control;
+}
+
+/** True while a control is held (read-only spec, or a write in flight). */
+const isHeld = (control) => control.getAttribute("aria-disabled") === "true";
+
+/** The notice a read-only spec renders above the editor. */
+function readOnlyCard(model) {
+  return el("div", { class: "card", id: READ_ONLY_NOTE_ID }, [
+    el("h3", { class: "card-title" }, [
+      el("span", { text: "Read-only here" }),
+      dot("warn", "read-only"),
+    ]),
+    el("p", { text: model.notice }),
+    model.verb === null
+      ? null
+      : el("p", { class: "muted" }, [
+          el("span", { text: "Edit it with " }),
+          el("code", { text: model.verb }),
+        ]),
+  ]);
+}
+
+/** The sentence a rename or a budget raise adds to a confirmation's lead, or "". */
+function escalationLead(body) {
+  const rows = Array.isArray(body?.escalations) ? body.escalations : [];
+  return rows
+    .map((row) => (typeof row?.warning === "string" ? row.warning : ""))
+    .filter((text) => text !== "")
+    .join(" ");
+}
+
+/**
  * Report the outcome of a write.
  *
  * Four distinct answers live behind one call, and collapsing them would
@@ -120,7 +182,7 @@ function tierBadge(row) {
  * again: a confirmation typed against one version of the spec never applies
  * an edit on top of another.
  */
-function reportWrite(res, okMessage, conflict = null) {
+export function reportWrite(res, okMessage, conflict = null) {
   if (res === null || res === undefined) {
     toast("No answer from the manager");
     return false;
@@ -143,13 +205,51 @@ function reportWrite(res, okMessage, conflict = null) {
   return true;
 }
 
-/** The conflict view, in a dialog. Nothing is written until a choice is made.
- *  Focus goes back to the control that made the write (`conflict.opener`). */
-function openConflict(current, okMessage, conflict) {
+const nonEmpty = (v) => (typeof v === "string" && v !== "" ? v : null);
+
+/**
+ * The text "Download my draft" saves: the caller's own copy of the refused
+ * edit, else the draft the server kept (`current.draftId`, read through
+ * `specDraft` for harness `conflict.id`, masked), else nothing — and then
+ * the view offers no download. `fetchDraft` is the read (a test seam).
+ */
+export async function draftTextFor(
+  current,
+  conflict,
+  fetchDraft = (params) => api.specDraft(params),
+) {
+  const cur = current && typeof current === "object" ? current : {};
   const c = conflict && typeof conflict === "object" ? conflict : {};
+  const own = nonEmpty(c.draft) ?? nonEmpty(cur.draft);
+  if (own !== null) return own;
+  const draftId = nonEmpty(cur.draftId);
+  const id = nonEmpty(c.id);
+  if (draftId === null || id === null) return "";
+  try {
+    const res = await fetchDraft({ id, draft: draftId });
+    const body = res?.ok && res.body && typeof res.body === "object" ? res.body : null;
+    if (body === null) return "";
+    const yaml = nonEmpty(body.yaml);
+    if (yaml !== null) return yaml;
+    return Array.isArray(body.edits) && body.edits.length > 0
+      ? JSON.stringify(body.edits, null, 2)
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+/** The conflict view, in a dialog. Nothing is written until a choice is made.
+ *  Focus goes back to the control that made the write (`conflict.opener`).
+ *  "Re-apply" is offered only when the caller can re-apply
+ *  (`conflict.reconfirm` or `conflict.retry`). */
+export async function openConflict(current, okMessage, conflict) {
+  const c = conflict && typeof conflict === "object" ? conflict : {};
+  const draft = await draftTextFor(current, c);
   let dialog = null;
   const view = conflictView({
-    current: { ...current, draft: typeof c.draft === "string" ? c.draft : current.draft },
+    current: { ...current, draft },
+    canReapply: typeof c.reconfirm === "function" || typeof c.retry === "function",
     onReapply: async (rev) => {
       dialog?.close();
       if (typeof c.reconfirm === "function") {
@@ -375,14 +475,18 @@ function renderValue(value) {
  *   a block or a list → the JSON pane, which takes the same diff → tier →
  *     confirm road with the whole value as one edit.
  */
-function trustCard(ctx, trust, valueByPath, reload) {
+function trustCard(ctx, trust, valueByPath, reload, live) {
   const rows = Array.isArray(trust.paths) ? trust.paths : [];
   // Rows are what the spec DECLARES; the pane is how anything else is
   // reached, so it belongs on the empty screen too — a spec with no rows is
   // exactly the one an operator needs to add a block to.
-  const addBlock = el("button", { class: "btn", type: "button", text: "Edit any path…" });
+  const addBlock = holdWhenReadOnly(
+    el("button", { class: "btn", type: "button", text: "Edit any path…" }),
+    live,
+  );
   addBlock.addEventListener("click", () => {
-    valueDialog(ctx, { path: "", value: undefined, pathEditable: true, reload });
+    if (isHeld(addBlock)) return;
+    valueDialog(ctx, { path: "", value: undefined, pathEditable: true, reload, live });
   });
   const addForm = (lead) =>
     el("div", { class: "add-form" }, [el("p", { class: "muted grow", text: lead }), addBlock]);
@@ -409,9 +513,9 @@ function trustCard(ctx, trust, valueByPath, reload) {
       el("td", { class: "cell-actions" }, [
         editable
           ? row.tier === "auto-tunable"
-            ? autoTunableEditor(ctx, path, current, reload)
-            : humanOwnedActions(ctx, path, current, confirmName, reload)
-          : jsonPaneButton(ctx, path, current, reload),
+            ? autoTunableEditor(ctx, path, current, reload, live)
+            : humanOwnedActions(ctx, path, current, confirmName, reload, live)
+          : jsonPaneButton(ctx, path, current, reload, live),
       ]),
     ]);
   });
@@ -437,21 +541,25 @@ function trustCard(ctx, trust, valueByPath, reload) {
 const isContainer = (value) => typeof value === "object" && value !== null;
 
 /** Inline input + Save for a path the optimizer is allowed to write. */
-function autoTunableEditor(ctx, path, current, reload) {
+function autoTunableEditor(ctx, path, current, reload, live) {
   const input = el("input", {
     class: "input",
     type: "text",
     value: typeof current === "string" ? current : JSON.stringify(current),
     "aria-label": `value for ${path}`,
   });
-  const save = el("button", { class: "btn btn-primary", type: "button", text: "Save" });
+  const save = holdWhenReadOnly(
+    el("button", { class: "btn btn-primary", type: "button", text: "Save" }),
+    live,
+  );
   save.addEventListener("click", async () => {
     // Held with aria-disabled, not `disabled`: a disabled button drops focus
     // to the page, and the answer may open a dialog that must return it here.
-    if (save.getAttribute("aria-disabled") === "true") return;
+    if (isHeld(save)) return;
     save.setAttribute("aria-disabled", "true");
     const edit = { path, value: coerce(input.value, current) };
-    const res = await api.specPatch({ id: ctx.id }, { edit });
+    // The revision this screen loaded: a spec changed since answers 412.
+    const res = await api.specPatch({ id: ctx.id }, { edit, expectedRev: live?.rev ?? "" });
     save.removeAttribute("aria-disabled");
     const conflict = {
       opener: save,
@@ -530,10 +638,14 @@ export function editsFor(path, text) {
 
 /** The row control for a path the inline editor cannot type: a container, or
  *  a declared path with no effective value to seed an input from. */
-function jsonPaneButton(ctx, path, current, reload) {
-  const open = el("button", { class: "btn btn-ghost", type: "button", text: "Edit as JSON…" });
+function jsonPaneButton(ctx, path, current, reload, live) {
+  const open = holdWhenReadOnly(
+    el("button", { class: "btn btn-ghost", type: "button", text: "Edit as JSON…" }),
+    live,
+  );
   open.addEventListener("click", () => {
-    valueDialog(ctx, { path, value: current, pathEditable: false, reload });
+    if (isHeld(open)) return;
+    valueDialog(ctx, { path, value: current, pathEditable: false, reload, live });
   });
   return open;
 }
@@ -546,7 +658,7 @@ function jsonPaneButton(ctx, path, current, reload) {
  * Both roads end at the same `specEdit` PUT, so the server remains the gate
  * and this screen stays the explanation.
  */
-function valueDialog(ctx, { path, value, pathEditable, reload }) {
+function valueDialog(ctx, { path, value, pathEditable, reload, live }) {
   let dialog = null;
   const pathInput = el("input", {
     class: "input grow",
@@ -595,8 +707,13 @@ function valueDialog(ctx, { path, value, pathEditable, reload }) {
       );
     }
     out.appendChild(pre(String(body.diff ?? "")));
+    // The revision the preview read: the write is checked against it.
+    const previewRev = String(body.rev ?? live?.rev ?? "");
     const apply = async (extra) => {
-      const wrote = await api.specEdit({ id: ctx.id }, { edits: batch.edits, ...extra });
+      const wrote = await api.specEdit(
+        { id: ctx.id },
+        { edits: batch.edits, ...extra, expectedRev: previewRev },
+      );
       const typed = typeof extra.confirmName === "string";
       const conflict = {
         draft: JSON.stringify(batch.edits, null, 2),
@@ -636,6 +753,8 @@ function valueDialog(ctx, { path, value, pathEditable, reload }) {
       return;
     }
     const confirmName = String(body.confirmName ?? "");
+    const warning = escalationLead(body);
+    if (warning !== "") out.appendChild(el("p", { class: "gated-why", text: warning }));
     const typed = el("input", {
       class: "input",
       type: "text",
@@ -711,18 +830,25 @@ function valueDialog(ctx, { path, value, pathEditable, reload }) {
 
 /** "Review & apply" (diff → typed confirm) and "Propose" for a human-owned
  *  path. Neither writes anything before the operator has seen the diff. */
-function humanOwnedActions(ctx, path, current, confirmName, reload) {
+function humanOwnedActions(ctx, path, current, confirmName, reload, live) {
   const input = el("input", {
     class: "input",
     type: "text",
     value: typeof current === "string" ? current : JSON.stringify(current),
     "aria-label": `new value for ${path}`,
   });
-  const review = el("button", { class: "btn", type: "button", text: "Review & apply" });
-  const propose = el("button", { class: "btn btn-ghost", type: "button", text: "Propose" });
+  const review = holdWhenReadOnly(
+    el("button", { class: "btn", type: "button", text: "Review & apply" }),
+    live,
+  );
+  const propose = holdWhenReadOnly(
+    el("button", { class: "btn btn-ghost", type: "button", text: "Propose" }),
+    live,
+  );
   const editFor = () => ({ path, value: coerce(input.value, current) });
 
   review.addEventListener("click", async () => {
+    if (isHeld(review)) return;
     const edits = [editFor()];
     const preview = await api.specDiff({ id: ctx.id }, { edits });
     if (!preview.ok) {
@@ -734,14 +860,19 @@ function humanOwnedActions(ctx, path, current, confirmName, reload) {
       toast(`${body.code ?? "refused"}: ${body.reason ?? "this edit does not apply"}`);
       return;
     }
+    const warning = escalationLead(body);
+    const previewRev = String(body.rev ?? live?.rev ?? "");
     confirmModal({
       title: `Change ${path}`,
-      lead: "This is a human-owned field. Read the diff — values are credential-redacted server-side — then type the spec name to apply it here, or close this and open a review instead.",
+      lead: `${warning === "" ? "" : `${warning} `}This is a human-owned field. Read the diff — values are credential-redacted server-side — then type the spec name to apply it here, or close this and open a review instead.`,
       detail: [pre(String(body.diff ?? ""))],
       confirmName,
       action: "Apply to the live spec",
       onConfirm: async () => {
-        const res = await api.specEdit({ id: ctx.id }, { edits, confirmName });
+        const res = await api.specEdit(
+          { id: ctx.id },
+          { edits, confirmName, expectedRev: previewRev },
+        );
         const conflict = {
           draft: JSON.stringify(edits, null, 2),
           reload,
@@ -755,6 +886,7 @@ function humanOwnedActions(ctx, path, current, confirmName, reload) {
   });
 
   propose.addEventListener("click", async () => {
+    if (isHeld(propose)) return;
     const res = await api.specPropose(
       { id: ctx.id },
       { edits: [editFor()], title: `hangar: ${path}` },
@@ -932,7 +1064,7 @@ function pinDialog(ctx, version, confirmName, reload) {
 // MCP connectors
 // ---------------------------------------------------------------------------
 
-function connectorsCard(ctx, body, catalog, reload) {
+function connectorsCard(ctx, body, catalog, reload, live) {
   const servers = Array.isArray(body.servers) ? body.servers : [];
   const findings = Array.isArray(body.findings) ? body.findings : [];
   const confirmName = String(body.confirmName ?? "");
@@ -965,12 +1097,12 @@ function connectorsCard(ctx, body, catalog, reload) {
     inner.push(
       table(
         ["Server", "Transport", "Command / URL", "Env refs", ""],
-        servers.map((server) => connectorRow(ctx, server, confirmName, reload)),
+        servers.map((server) => connectorRow(ctx, server, confirmName, reload, live)),
         "MCP connectors",
       ),
     );
   }
-  inner.push(connectorForm(ctx, catalog, confirmName, reload));
+  inner.push(connectorForm(ctx, catalog, confirmName, reload, live));
   return card(
     "MCP connectors",
     findings.some((f) => f.level === "bad")
@@ -980,11 +1112,15 @@ function connectorsCard(ctx, body, catalog, reload) {
   );
 }
 
-function connectorRow(ctx, server, confirmName, reload) {
+function connectorRow(ctx, server, confirmName, reload, live) {
   const name = String(server.name ?? "");
   const refs = Array.isArray(server.envRefs) ? server.envRefs : [];
-  const remove = el("button", { class: "btn btn-ghost", type: "button", text: "Remove…" });
+  const remove = holdWhenReadOnly(
+    el("button", { class: "btn btn-ghost", type: "button", text: "Remove…" }),
+    live,
+  );
   remove.addEventListener("click", async () => {
+    if (isHeld(remove)) return;
     // The plan first — the server answers what WOULD change, then the same
     // call with the confirmation applies it.
     const plan = await api.mcpConnectorRemove({ id: ctx.id, name });
@@ -1006,9 +1142,22 @@ function connectorRow(ctx, server, confirmName, reload) {
         const res = await api.mcpConnectorRemove(
           { id: ctx.id, name },
           undefined,
-          `?confirmName=${encodeURIComponent(confirmName)}`,
+          `?confirmName=${encodeURIComponent(confirmName)}&expectedRev=${encodeURIComponent(
+            String(plan.body?.rev ?? live?.rev ?? ""),
+          )}`,
         );
-        if (reportWrite(res, `Removed ${name}`)) reload();
+        // A typed write is never re-sent as it was: "re-apply" asks again
+        // over the plan for the spec as it is now.
+        const conflict = {
+          id: ctx.id,
+          opener: remove,
+          reload,
+          done: reload,
+          reconfirm: () => remove.click(),
+        };
+        if (reportWrite(res, `Removed ${name}`, conflict)) {
+          reload();
+        }
       },
     });
   });
@@ -1037,7 +1186,7 @@ function connectorRow(ctx, server, confirmName, reload) {
 /** Add a connector: pick a catalog skeleton or type one, preview the diff,
  *  then confirm. Values for secrets are never accepted here — the form takes
  *  a command and its arguments, and the server refuses the rest. */
-function connectorForm(ctx, catalog, confirmName, reload) {
+function connectorForm(ctx, catalog, confirmName, reload, live) {
   const connectors = Array.isArray(catalog?.connectors) ? catalog.connectors : [];
   const name = el("input", { class: "input", type: "text", "aria-label": "server name" });
   const command = el("input", {
@@ -1063,8 +1212,12 @@ function connectorForm(ctx, catalog, confirmName, reload) {
     command.value = typeof entry.command === "string" ? entry.command : "";
     args.value = Array.isArray(entry.args) ? entry.args.join(" ") : "";
   });
-  const add = el("button", { class: "btn btn-primary", type: "button", text: "Preview…" });
+  const add = holdWhenReadOnly(
+    el("button", { class: "btn btn-primary", type: "button", text: "Preview…" }),
+    live,
+  );
   add.addEventListener("click", async () => {
+    if (isHeld(add)) return;
     const payload = {
       name: name.value.trim(),
       command: command.value.trim(),
@@ -1088,9 +1241,23 @@ function connectorForm(ctx, catalog, confirmName, reload) {
       onConfirm: async () => {
         const res = await api.mcpConnectorWrite(
           { id: ctx.id },
-          { ...payload, dryRun: false, confirmName },
+          {
+            ...payload,
+            dryRun: false,
+            confirmName,
+            expectedRev: String(plan.body?.rev ?? live?.rev ?? ""),
+          },
         );
-        if (reportWrite(res, `Added ${payload.name}`)) reload();
+        const conflict = {
+          id: ctx.id,
+          opener: add,
+          reload,
+          done: reload,
+          reconfirm: () => add.click(),
+        };
+        if (reportWrite(res, `Added ${payload.name}`, conflict)) {
+          reload();
+        }
       },
     });
   });
@@ -1343,6 +1510,13 @@ export async function renderSpecEdit(root, ctx) {
   const confirmName = String(
     trust.body?.confirmName ?? connectors.body?.confirmName ?? versions.body?.confirmName ?? "",
   );
+  // The revision this screen loaded (every write sends it back), and whether
+  // this spec takes writes here at all.
+  const live = {
+    rev: String(schema.body?.rev ?? trust.body?.rev ?? ""),
+    readOnly: readOnlyModel(schema.body?.readOnly ?? trust.body?.readOnly),
+  };
+  if (live.readOnly.held) root.appendChild(readOnlyCard(live.readOnly));
 
   root.appendChild(
     isStub(schema)
@@ -1355,7 +1529,7 @@ export async function renderSpecEdit(root, ctx) {
     isStub(trust)
       ? stubCard("Fields & trust tiers", trust)
       : trust.ok
-        ? trustCard(ctx, trust.body ?? {}, valueByPath, reload)
+        ? trustCard(ctx, trust.body ?? {}, valueByPath, reload, live)
         : errorCard("Fields & trust tiers", trust),
   );
   root.appendChild(
@@ -1369,7 +1543,7 @@ export async function renderSpecEdit(root, ctx) {
     isStub(connectors)
       ? stubCard("MCP connectors", connectors)
       : connectors.ok
-        ? connectorsCard(ctx, connectors.body ?? {}, catalog.ok ? catalog.body : null, reload)
+        ? connectorsCard(ctx, connectors.body ?? {}, catalog.ok ? catalog.body : null, reload, live)
         : errorCard("MCP connectors", connectors),
   );
   root.appendChild(

@@ -325,3 +325,60 @@ describe("applyMigrationEdits — the CST applier", () => {
     expect(() => migrateSpecYaml("name: a\n", e, 1)).toThrow(/edits\(\) and up\(\) disagree/);
   });
 });
+
+describe("migration-runner — plan first, then create each new version", () => {
+  const spec = (name: string, marker: string) =>
+    `name: ${name}\ntarget: cli\nversion: 0\nagent:\n  model: x\n  instructions: ${marker}\n`;
+
+  test("over v1..v10 the next version is v11, and v10 keeps its bytes", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    for (let i = 1; i <= 10; i++) await reg.put("a", `v${i}`, spec("a", `m${i}`));
+    const before = await reg.get("a", "v10");
+    const result = await migrateAll({
+      registry: reg,
+      engine: createDefaultEngine(),
+      fromVersion: 0,
+      toVersion: 1,
+    });
+    expect(result.plan).toEqual([
+      expect.objectContaining({
+        name: "a",
+        latestVersion: "v10",
+        newVersion: "v11",
+        written: true,
+      }),
+    ]);
+    expect(await reg.get("a", "v10")).toBe(before);
+    expect(await reg.get("a", "v11")).toContain("instructions: m10");
+  });
+
+  test("one spec that fails among three writes nothing anywhere", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    for (const name of ["a", "b", "c"]) await reg.put(name, "v1", spec(name, "ok"));
+    await expect(
+      migrateAll({
+        registry: reg,
+        engine: createDefaultEngine(),
+        fromVersion: 0,
+        toVersion: 1,
+        validate: (_spec, name) => {
+          if (name === "b") throw new Error("b is not valid");
+        },
+      }),
+    ).rejects.toThrow("nothing was written");
+    for (const name of ["a", "b", "c"]) expect(await reg.list(name)).toEqual(["v1"]);
+  });
+
+  test("a dry run marks nothing written", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    await reg.put("a", "v1", spec("a", "ok"));
+    const result = await migrateAll({
+      registry: reg,
+      engine: createDefaultEngine(),
+      fromVersion: 0,
+      toVersion: 1,
+      dryRun: true,
+    });
+    expect(result.plan[0]?.written).toBeUndefined();
+  });
+});

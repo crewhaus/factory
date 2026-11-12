@@ -281,6 +281,7 @@ export const ROUTE_TABLE: readonly RouteRow[] = [
   write("specPropose", "harness", "POST", "/api/h/:id/spec/propose", "h.spec.edit", {
     dispatch: "job",
   }),
+  read("specDraft", "/api/h/:id/spec/drafts/:draft", "h.read.content"),
   read("wizardTemplates", "/api/builders/templates", "h.read"),
   write("wizardCreate", "workspace", "POST", "/api/builders/spec", "home.registry.manage"),
   read("mcpCatalog", "/api/builders/mcp-catalog", "h.read"),

@@ -231,6 +231,7 @@ export const ROUTES = {
     body: "SpecPropose",
     group: "spec",
   },
+  specDraft: { method: "GET", path: "/api/h/:id/spec/drafts/:draft", group: "spec" },
   wizardTemplates: { method: "GET", path: "/api/builders/templates", group: "spec" },
   wizardCreate: { method: "POST", path: "/api/builders/spec", body: "WizardSpec", group: "spec" },
   mcpCatalog: { method: "GET", path: "/api/builders/mcp-catalog", group: "spec" },

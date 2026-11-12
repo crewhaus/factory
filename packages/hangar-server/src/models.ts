@@ -198,7 +198,7 @@ const AGENT_POOL_PATH = "agent.model_pool";
  * the batch pipeline too. Reading only `agent.model_pool` makes the console
  * tell a crew or workflow operator "nothing is being routed" while a per-role
  * pool routes every turn — so this walks for the key the same `anywhere`
- * way `SECURITY_SURFACES` in spec-edit.ts already treats `model_pool.rules`.
+ * way `SECURITY_SURFACES` (spec-patch's surfaces table) treats `model_pool.rules`.
  * A pool's own subtree is not re-walked: what is under it is candidates and
  * rules, never another pool.
  */

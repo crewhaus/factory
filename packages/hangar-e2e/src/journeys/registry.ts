@@ -12,6 +12,7 @@ import { pluginPane } from "./plugin-pane.journey";
 import { runThenConsole } from "./run-then-console.journey";
 import { sessionSelfTest } from "./session-self-test.journey";
 import { signIn } from "./sign-in.journey";
+import { specConflict } from "./spec-conflict.journey";
 import { thredzProxy } from "./thredz-proxy.journey";
 import { untrustedMarkup } from "./untrusted-markup.journey";
 
@@ -28,6 +29,7 @@ export const JOURNEYS: readonly Journey[] = [
   axeBaseline,
   axeStates,
   keyboardTour,
+  specConflict,
   cliBoot,
   runThenConsole,
 ];

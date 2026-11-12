@@ -58,6 +58,7 @@ import { assertOutDirNotLinked, writeBundleFile } from "../apps/cli/src/bundle-w
 import { runDaemonCommand } from "../apps/cli/src/daemon-cmd";
 import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
+import { discloseSurfaceChange } from "../apps/cli/src/surface-disclosure";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
 import { createContinuityStore } from "../packages/continuity-store/src/index";
 import {
@@ -96,6 +97,7 @@ import {
   resolveBundle,
 } from "../packages/harness-supervisor/src/index";
 import { writeSupervisionRecord } from "../packages/harness-supervisor/src/runfiles";
+import { resolveCrewhausBin } from "../packages/harness-supervisor/src/spawn-contracts";
 import {
   activateBuildForTest,
   createFakeClock,
@@ -124,6 +126,7 @@ import {
   generateApprovalId,
 } from "../packages/session-store/src/index";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
+import { commitSpec, readSpecDraft, specRev } from "../packages/spec-patch/src/commit";
 import {
   OPTIMIZER_REFUSED_LEAVES,
   STRUCTURAL_SEGMENTS,
@@ -2641,5 +2644,138 @@ describe("the release notes name what saved-is-not-deployed changes for every ha
     const bullet = bulletFor("The crash-loop count outlives the manager");
     expect(bullet).toContain("`.crewhaus/run/supervision.json`");
     expect(bullet).toContain("`crash-looping`");
+  });
+});
+
+describe("the release notes name what guarded spec writes change for every harness", () => {
+  const read = (rel: string): string => readFileSync(join(ROOT, rel), "utf8");
+  const count = (text: string, needle: string): number => text.split(needle).length - 1;
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+  /** One top-level function of `source`, up to the next top-level declaration. */
+  const functionBody = (source: string, signature: string): string => {
+    const start = source.indexOf(signature);
+    expect({ signature, found: start > -1 }).toEqual({ signature, found: true });
+    const rest = source.slice(start + signature.length);
+    const next = rest.search(/\n(?:export )?(?:async )?function /);
+    return next === -1 ? rest : rest.slice(0, next);
+  };
+
+  test("each CLI spec writer commits against the revision it read, and a stale one writes nothing", async () => {
+    const index = read("apps/cli/src/index.ts");
+    for (const signature of [
+      "async function runLintCommand(",
+      "async function runOptimizeFromAdvice(",
+      "async function runFlywheelRun(",
+      "async function runModelScan(",
+      "async function runModelRightSize(",
+      "async function runUpgrade(",
+    ]) {
+      const body = functionBody(index, signature);
+      expect({ signature, commits: count(body, "await commitCliSpec(") }).toEqual({
+        signature,
+        commits: 1,
+      });
+      expect({ signature, rev: count(body, "expectedRev: specRev(") }).toEqual({
+        signature,
+        rev: 1,
+      });
+      expect({
+        signature,
+        raw: /writeFileSync\((?:absSpec|opts\.absSpec|specPath)\b/.test(body),
+      }).toEqual({ signature, raw: false });
+    }
+    const staged = functionBody(
+      read("apps/cli/src/optimize-stages.ts"),
+      "export async function writeBackStagedResult<",
+    );
+    expect(count(staged, "await commitCliSpec(")).toBe(1);
+    expect(count(staged, "expectedRev: opts.expectedRev")).toBe(1);
+    expect(count(index, "expectedRev: stagedSourceRev,")).toBe(1);
+    const optimizer = read("packages/eval-optimizer-orchestrator/src/index.ts");
+    expect(count(optimizer, "expectedRev: specRev(yamlText),")).toBe(1);
+
+    // A commit against a revision the file no longer has writes nothing and keeps a draft.
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-commit-")));
+    try {
+      const spec = join(dir, "crewhaus.yaml");
+      writeFileSync(spec, "name: demo\ntarget: cli\n");
+      const result = await commitSpec(
+        { specPath: spec },
+        { kind: "text", text: "name: other\ntarget: cli\n" },
+        {
+          expectedRev: specRev("name: demo-before\ntarget: cli\n"),
+          writer: "cli.flywheel",
+          actor: { kind: "process" },
+        },
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe("conflict");
+        expect(readSpecDraft(spec, result.draft?.id ?? "")?.text).toBe(
+          "name: other\ntarget: cli\n",
+        );
+      }
+      expect(readFileSync(spec, "utf8")).toBe("name: demo\ntarget: cli\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Spec writers refuse a change made meanwhile and keep a draft");
+    for (const verb of [
+      "`flywheel`",
+      "`upgrade --write`",
+      "`lint --fix`",
+      "`model-scan --write`",
+    ]) {
+      expect(bullet).toContain(verb);
+    }
+    expect(bullet).toContain("`.crewhaus/run/spec/drafts/`");
+    expect(bullet).toContain("exit 53");
+  });
+
+  test("crewhaus run names a changed security setting at start, before it dispatches", () => {
+    const run = functionBody(read("apps/cli/src/index.ts"), "async function runRun(");
+    const disclose = run.indexOf("discloseSurfaceChange(absSpec, yamlText);");
+    expect(disclose).toBeGreaterThan(-1);
+    expect(run.indexOf("return runRunCli(")).toBeGreaterThan(disclose);
+    expect(run.indexOf("return runRunBrowser(")).toBeGreaterThan(disclose);
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-disclose-")));
+    try {
+      const spec = join(dir, "crewhaus.yaml");
+      const before = "name: demo\ntarget: cli\npermissions:\n  allow: [Read]\n";
+      const lines: string[] = [];
+      const stderr = (line: string) => lines.push(line);
+      expect(discloseSurfaceChange(spec, before, { stderr }).kind).toBe("recorded");
+      const after = before.replace("allow: [Read]", "allow: [Read, Bash]");
+      expect(discloseSurfaceChange(spec, after, { stderr }).kind).toBe("changed");
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("changed since the last start: permissions.");
+      expect(lines[0]).not.toContain("Bash");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("`crewhaus run` says at start which security settings changed");
+    expect(bullet).toContain("`.crewhaus/run/spec/`");
+    expect(bullet).toContain("`crewhaus dev`");
+  });
+
+  test("a harness's own crewhaus runs only when it resolves inside the harness", () => {
+    const local = join("/h", "node_modules", ".bin", "crewhaus");
+    const resolved = resolveCrewhausBin("/h", {
+      exists: (p) => p === local,
+      realpath: (p) => (p === local ? "/elsewhere/crewhaus.js" : p),
+      which: () => "/usr/local/bin/crewhaus",
+    });
+    expect(resolved).toBe("/usr/local/bin/crewhaus");
+    expect(
+      resolveCrewhausBin("/h", {
+        exists: (p) => p === local,
+        realpath: (p) => (p === local ? "/h/node_modules/crewhaus/cli.js" : p),
+        which: () => "/usr/local/bin/crewhaus",
+      }),
+    ).toBe(local);
+    const bullet = bulletFor("only when it resolves inside the harness");
+    expect(bullet).toContain("`node_modules/.bin/crewhaus`");
+    expect(bullet).toContain("`crewhaus` on `PATH`");
   });
 });

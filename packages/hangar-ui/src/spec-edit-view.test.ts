@@ -9,7 +9,15 @@
  */
 import { describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { editPath, editsFor, parseJsonValue } from "../assets/js/views/spec-edit.js";
+import { conflictModel } from "../assets/js/ui/conflict.js";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import {
+  draftTextFor,
+  editPath,
+  editsFor,
+  parseJsonValue,
+  readOnlyModel,
+} from "../assets/js/views/spec-edit.js";
 
 describe("editPath", () => {
   test("a list index is a NUMBER — that is what reaches a list item at all", () => {
@@ -139,5 +147,160 @@ describe("the view module's own hygiene", () => {
     // The typed writes ask again, over a fresh diff.
     expect(source.match(/conflict\.reconfirm = \(rev\) =>/g)?.length).toBe(2);
     expect(source.includes("async function reconfirmEdit(")).toBe(true);
+  });
+});
+
+const viewSource = async (name: string): Promise<string> =>
+  await Bun.file(new URL(`../assets/js/views/${name}`, import.meta.url)).text();
+
+/** Every argument list of `api.<fn>(` calls in `source`, balanced over brackets. */
+function callsOf(source: string, fn: string): string[] {
+  const out: string[] = [];
+  let at = source.indexOf(`api.${fn}(`);
+  while (at !== -1) {
+    let depth = 0;
+    let end = at + `api.${fn}`.length;
+    for (; end < source.length; end++) {
+      const ch = source[end];
+      if (ch === "(" || ch === "{" || ch === "[") depth++;
+      else if (ch === ")" || ch === "}" || ch === "]") {
+        depth--;
+        if (depth === 0) break;
+      }
+    }
+    out.push(source.slice(at, end + 1));
+    at = source.indexOf(`api.${fn}(`, end);
+  }
+  return out;
+}
+
+describe("every spec write sends the revision it loaded", () => {
+  test("the editor's writes, the connectors', advice's and watch-me's", async () => {
+    const spec = await viewSource("spec-edit.js");
+    const writes = [
+      ...callsOf(spec, "specPatch"),
+      ...callsOf(spec, "specEdit"),
+      ...callsOf(spec, "mcpConnectorWrite").filter((c) => c.includes("dryRun: false")),
+      ...callsOf(spec, "mcpConnectorRemove").filter((c) => c.includes("confirmName")),
+    ];
+    expect(writes.length).toBe(8);
+    for (const call of writes) expect(call).toContain("expectedRev");
+
+    const feedback = await viewSource("feedback.js");
+    const fabric = await viewSource("memory-fabric.js");
+    expect(feedback).toContain('{ confirm: true, expectedRev: String(data.rev ?? "") }');
+    for (const call of [...callsOf(fabric, "watchmeToggle"), ...callsOf(fabric, "watchmeApply")]) {
+      expect(call).toContain("expectedRev");
+    }
+  });
+
+  test("advice and watch-me open the editor's conflict view on a 412", async () => {
+    for (const name of ["feedback.js", "memory-fabric.js"]) {
+      const source = await viewSource(name);
+      expect(source).toContain('import { openConflict } from "./spec-edit.js";');
+      expect(source).toContain("status === 412");
+      expect(source).toContain("openConflict(");
+    }
+  });
+});
+
+describe("a conflict's draft is what the write tried, never an empty file", () => {
+  const actionsFor = (draft: string, canReapply = true): string[] =>
+    conflictModel({ rev: "r2" }, draft, { canReapply }).actions.map((a: { id: string }) => a.id);
+
+  test("the caller's own copy of the edit is what downloads", async () => {
+    const asked: unknown[] = [];
+    const text = await draftTextFor({ draftId: "d" }, { id: "h", draft: '{"path":"x"}' }, (p) => {
+      asked.push(p);
+      return Promise.resolve({ ok: true, body: {} });
+    });
+    expect(text).toBe('{"path":"x"}');
+    expect(asked).toEqual([]);
+  });
+
+  test("a watch-me or connector 412 downloads the draft the server kept, masked", async () => {
+    const asked: unknown[] = [];
+    const edits = [{ path: ["watchme", "enabled"], value: true }];
+    const text = await draftTextFor(
+      { rev: "r2", diff: "~ watchme.enabled", draftId: "20261112T120000Z-0000aaaa" },
+      { id: "hrn_1" },
+      (p) => {
+        asked.push(p);
+        return Promise.resolve({ ok: true, body: { yaml: null, edits } });
+      },
+    );
+    expect(asked).toEqual([{ id: "hrn_1", draft: "20261112T120000Z-0000aaaa" }]);
+    expect(JSON.parse(text)).toEqual(edits);
+    expect(actionsFor(text)).toContain("download");
+  });
+
+  test("no draft to be had offers no download", async () => {
+    for (const fetchDraft of [
+      () => Promise.resolve({ ok: false, status: 404, body: {} }),
+      () => Promise.reject(new Error("offline")),
+      () => Promise.resolve({ ok: true, body: { yaml: "", edits: [] } }),
+    ]) {
+      const text = await draftTextFor({ draftId: "d" }, { id: "h" }, fetchDraft);
+      expect(text).toBe("");
+      expect(actionsFor(text)).not.toContain("download");
+    }
+    expect(await draftTextFor({}, {}, () => Promise.reject(new Error("never asked")))).toBe("");
+  });
+
+  test("every 412 whose caller keeps no draft of its own names the harness to read it from", async () => {
+    const spec = await viewSource("spec-edit.js");
+    // The two connector conflicts (add and remove).
+    expect(spec.match(/const conflict = \{\n\s+id: ctx\.id,/g)?.length).toBe(2);
+    const feedback = await viewSource("feedback.js");
+    expect(feedback).not.toContain("JSON.stringify({ adviceId");
+    expect(feedback).toContain("id: ctx.id,");
+    const fabric = await viewSource("memory-fabric.js");
+    expect(fabric.match(/\{ id: ctx\.id, reload: \(\) => void rerenderWatchme\(/g)?.length).toBe(2);
+  });
+
+  test("watch-me offers no re-apply it cannot do, and keeps focus on the panel after a re-read", async () => {
+    const fabric = await viewSource("memory-fabric.js");
+    expect(fabric.includes("reconfirm:")).toBe(false);
+    expect(fabric.includes("retry:")).toBe(false);
+    expect(actionsFor("kept", false)).toEqual(["use-disk", "download"]);
+    expect(fabric).toContain("async function rerenderWatchme(");
+    expect(fabric).toContain("heading.focus()");
+  });
+});
+
+describe("a read-only spec", () => {
+  test("the model says why in words and holds the writes", () => {
+    const m = readOnlyModel({
+      reason: "This harness uses settings this version of CrewHaus doesn't know (future_block).",
+      paths: ["future_block"],
+      verb: "cd /h && bunx crewhaus",
+    });
+    expect(m.held).toBe(true);
+    expect(m.notice).toContain("future_block");
+    expect(m.paths).toEqual(["future_block"]);
+    expect(m.verb).toBe("cd /h && bunx crewhaus");
+    expect(readOnlyModel(null)).toEqual({ held: false, notice: "", paths: [], verb: null });
+  });
+
+  test("every write control is held with aria-disabled and described by the notice, and stays in the tab order", async () => {
+    const source = await viewSource("spec-edit.js");
+    const held = source.match(/holdWhenReadOnly\(/g)?.length ?? 0;
+    // Save, Edit any path, Edit as JSON, Review & apply, Propose, Remove, Preview, plus the definition.
+    expect(held).toBe(8);
+    expect(source).toContain('control.setAttribute("aria-disabled", "true")');
+    expect(source).toContain('control.setAttribute("aria-describedby", READ_ONLY_NOTE_ID)');
+    // Held, never removed from the focus order with `disabled`.
+    expect(source.includes("control.disabled = true")).toBe(false);
+    expect(source).toContain(
+      "if (live.readOnly.held) root.appendChild(readOnlyCard(live.readOnly));",
+    );
+  });
+
+  test("a rename's warning is in the typed confirmation's lead", async () => {
+    const source = await viewSource("spec-edit.js");
+    expect(source).toContain("const warning = escalationLead(body);");
+    expect(source).toContain(
+      'lead: `${warning === "" ? "" : `${warning} `}This is a human-owned field.',
+    );
   });
 });

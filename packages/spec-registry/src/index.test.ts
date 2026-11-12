@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SpecRegistryError, createFileBackedRegistry } from "./index";
+import { SpecRegistryError, compareVersions, createFileBackedRegistry } from "./index";
 
 let tmpRoot = "";
 
@@ -123,5 +123,60 @@ describe("spec-registry — T8 cross-tenant isolation", () => {
     expect(reg.pinForTenant("../bad", "hello", "prod", "v1")).rejects.toBeInstanceOf(
       SpecRegistryError,
     );
+  });
+});
+
+describe("spec-registry — version order and safe writes", () => {
+  test("list orders vN versions by number, then every other name after them", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    for (let i = 10; i >= 1; i--) await reg.put("s", `v${i}`, `name: s${i}\n`);
+    await reg.put("s", "release-a", "name: a\n");
+    expect(await reg.list("s")).toEqual([
+      "v1",
+      "v2",
+      "v3",
+      "v4",
+      "v5",
+      "v6",
+      "v7",
+      "v8",
+      "v9",
+      "v10",
+      "release-a",
+    ]);
+    expect(compareVersions("v2", "v10")).toBeLessThan(0);
+    expect(compareVersions("v10", "beta")).toBeLessThan(0);
+    expect(compareVersions("alpha", "beta")).toBeLessThan(0);
+  });
+
+  test("putNew refuses a version that exists and leaves its bytes", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    await reg.putNew("s", "v1", "name: first\n");
+    let caught: unknown;
+    try {
+      await reg.putNew("s", "v1", "name: second\n");
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SpecRegistryError);
+    expect((caught as SpecRegistryError).failure).toBe("exists");
+    expect(await reg.get("s", "v1")).toBe("name: first\n");
+    expect(await reg.list("s")).toEqual(["v1"]);
+  });
+
+  test("two puts of different versions both stay in the manifest", async () => {
+    let second: Promise<void> | undefined;
+    const reg = createFileBackedRegistry({
+      rootDir: tmpRoot,
+      hooks: {
+        afterManifestRead: () => {
+          // The second put starts while the first holds the manifest it read.
+          if (second === undefined) second = reg.put("s", "v2", "name: two\n");
+        },
+      },
+    });
+    await reg.put("s", "v1", "name: one\n");
+    await second;
+    expect(await reg.list("s")).toEqual(["v1", "v2"]);
   });
 });

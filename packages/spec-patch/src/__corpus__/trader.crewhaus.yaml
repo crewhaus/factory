@@ -1,0 +1,161 @@
+# trader-advisor — a self-improving trading RESEARCH advisor that ships a
+# seed exam and ZERO track record, and earns the record — plus a second,
+# journal-derived dataset — from its own paper trades.
+#
+# Three pieces do the work:
+#   thredz:    — the hosted wiki + goals = the advisor's brain and its
+#                human-visible dashboard (playbooks, research, metrics)
+#   learning:  — the shipped study/reflect/exam discipline pointed at
+#                trading (curriculum.md + a costs-and-constraints exam)
+#   broker (mcp_servers) — a local zero-dep paper brokerage that fills at
+#                real delayed prices, charges every real fee, enforces
+#                cash-account constraints, and keeps score. The market
+#                grades the advisor; the advisor can't grade itself.
+#
+# NOT financial advice; the harness cannot execute real trades — there is
+# no tool for it. It paper-trades to learn, and (once its own confidence
+# gate passes) suggests trades the OPERATOR may choose to make.
+#
+# Walkthrough: ../../walkthroughs/73-trading-advisor.md
+#
+# Usage (from inside this directory):
+#   cp .env.example .env      # ANTHROPIC_API_KEY + THREDZ_API_KEY (+ search)
+#   bunx crewhaus run crewhaus.yaml
+# Then try: "study", /study, /exam, "scan the watchlist", "paper buy ...".
+
+name: trader-advisor
+target: cli
+
+# Hosted brain: wiki articles (playbooks, journal reviews, the dashboard
+# article) + goals (the metric-tick primitive Thredz dashboards chart).
+#
+# `space:` (0.5.0, Pro/Scale) scopes every wiki call to one memory boundary;
+# create the space before first run — see .env.example. daemon.yaml carries the
+# SAME key and the SAME space on purpose: these two specs are one advisor with
+# two faces, so the playbooks the daemon studies into are the playbooks you
+# exercise here, and its `dashboard` and `watchlist` articles are the ones you
+# read. The shared key is load-bearing, not laziness — an `individual` space is
+# readable only by the key that owns it, and ONE individual space per key is a
+# hard Thredz limit. (For the opposite pattern — a key per agent, each with its
+# own private space — see ../expert.) Inside a space the space's TYPE decides
+# visibility, so the `visibility:` knob no longer applies.
+thredz: { api_key: $THREDZ_API_KEY, space: trader-advisor, goals: true }
+
+learning:
+  domain: systematic retail trading of mainstream US markets (equities/ETFs and crypto) under realistic costs and constraints
+  curriculum: curriculum.md
+  sources:
+    ["sec.gov", "finra.org", "cmegroup.com", "*.edu", "ssrn.com", "alphaarchitect.com", "quantocracy.com", "morningstar.com"]
+  exam: { dataset: eval/dataset.jsonl, graders: eval/graders.yaml }
+
+agent:
+  model: claude-sonnet-5
+  max_tokens: 16384
+  model_fallbacks: [claude-haiku-4-5-20251001] # long study passes survive a provider hiccup
+  instructions: |
+    You are a trading research advisor. You NEVER execute real trades and
+    you never present yourself as a licensed advisor — you research, you
+    paper-trade through the broker tools, and you learn.
+
+    Discipline over conviction:
+    - Costs first. Every idea is judged on NET expectancy — after spread,
+      slippage, SEC/TAF or taker fees. If the edge is smaller than the
+      cost stack, it is not an edge. The exam in eval/ tests you on this.
+    - Process over outcome. A good trade is a thesis with an edge, a
+      defined invalidation (stop), sized under the risk rail — whatever
+      one outcome says. Judge decisions by process; let the journal judge
+      results in aggregate.
+    - The broker is the referee. Its rejections (settled cash, market
+      hours, risk rail, drawdown halt) are real-world constraints — when
+      it rejects you, record what you learned, never argue around it.
+    - Playbooks live in the wiki. Every strategy you research or invent
+      becomes a wiki article (cited, confidence-scored) with entry/exit/
+      sizing rules and its journal stats. Trade only written playbooks.
+    - When the operator reports a real fill ("filled 100 @ 187.42"), call
+      broker__record_live_fill, then compare against the mirrored paper
+      trade to measure sim-vs-real drift.
+  sub_agents:
+    researcher:
+      description: |
+        Read-only market researcher. Give it ONE narrow question and the
+        source allowlist. It returns 2-4 verbatim, cited snippets — no
+        synthesis, no opinions. Hard cap: 180 words.
+      instructions: |
+        You research ONE narrow question against high-quality sources.
+        Prefer primary sources (SEC/FINRA/exchange fee schedules, filings,
+        peer-reviewed and SSRN papers) over blogs; treat trader forums as
+        leads to verify, not sources. Return 2-4 SHORT verbatim snippets,
+        each with its source, and one line on time-tested vs frontier.
+        Do NOT synthesise. Under 180 words.
+      tools: [webSearch, webFetch, read]
+      model: claude-haiku-4-5-20251001
+      permissions:
+        allow: [WebSearch, WebFetch, Read]
+        deny: []
+
+tools: [read, write, edit, glob, grep, webSearch, webFetch, todoWrite]
+
+# The paper brokerage: a zero-dependency stdio MCP server in this repo.
+# Its tools arrive prefixed (broker__quote, broker__paper_buy, ...).
+mcp_servers:
+  broker:
+    transport: stdio
+    command: bun
+    args: ["mcp/paper-broker.ts"]
+
+# Ratings on the advisor's answers feed the flywheel: once 5 unprocessed
+# ones accumulate (CREWHAUS_AUTODISTILL_THRESHOLD tunes it) a `crewhaus run`
+# teardown registers them as a versioned `trader-advisor-ratings` dataset.
+feedback:
+  modality: stars
+  scale: { min: 1, max: 5 }
+  autoDistill: true
+
+permissions:
+  mode: default
+  rules:
+    # Research + recall: friction-free.
+    - { type: alwaysAllow, pattern: Read }
+    - { type: alwaysAllow, pattern: Glob }
+    - { type: alwaysAllow, pattern: Grep }
+    - { type: alwaysAllow, pattern: WebSearch }
+    - { type: alwaysAllow, pattern: WebFetch }
+    - { type: alwaysAllow, pattern: TodoWrite }
+    # The wiki is the job (writes stay justification-gated + audited).
+    - { type: alwaysAllow, pattern: wiki_recall }
+    - { type: alwaysAllow, pattern: wiki_semantic_search }
+    - { type: alwaysAllow, pattern: wiki_search }
+    - { type: alwaysAllow, pattern: wiki_get }
+    - { type: alwaysAllow, pattern: wiki_list }
+    - { type: alwaysAllow, pattern: wiki_related }
+    - { type: alwaysAllow, pattern: wiki_stats }
+    - { type: alwaysAllow, pattern: wiki_space_list } # read-only: which spaces this key can reach
+    - { type: alwaysAllow, pattern: wiki_write }
+    - { type: alwaysAllow, pattern: wiki_set_signals }
+    # No wiki_space_create rule on purpose: it spends plan quota and is
+    # justification-gated, so creating a space stays your call, not the agent's.
+    - { type: alwaysAllow, pattern: log_knowledge_gap }
+    - { type: alwaysAllow, pattern: task_list }
+    - { type: alwaysAllow, pattern: run_exam }
+    # Metric ticks for the Thredz dashboard cards.
+    - { type: alwaysAllow, pattern: goal_list }
+    - { type: alwaysAllow, pattern: goal_get }
+    - { type: alwaysAllow, pattern: goal_write }
+    - { type: alwaysAllow, pattern: goal_update }
+    # Paper trading is free to act — the broker enforces the rails in
+    # code, and no tool that touches real money exists in this harness.
+    - { type: alwaysAllow, pattern: broker__quote }
+    - { type: alwaysAllow, pattern: broker__account }
+    - { type: alwaysAllow, pattern: broker__paper_buy }
+    - { type: alwaysAllow, pattern: broker__paper_sell }
+    - { type: alwaysAllow, pattern: broker__mark_to_market }
+    - { type: alwaysAllow, pattern: broker__journal_read }
+    - { type: alwaysAllow, pattern: broker__performance }
+    - { type: alwaysAllow, pattern: broker__export_dataset }
+    - { type: alwaysAllow, pattern: broker__record_live_fill }
+    - { type: alwaysAllow, pattern: broker__live_book }
+    # Curriculum + exam curation: Markdown/JSONL only.
+    - { type: alwaysAllow, pattern: Edit(curriculum.md) }
+    - { type: alwaysAllow, pattern: Edit(eval/**) }
+    - { type: alwaysAllow, pattern: Write(eval/**) }
+    - { type: alwaysAllow, pattern: Edit(sources/**) }

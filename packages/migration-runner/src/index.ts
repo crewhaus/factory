@@ -26,7 +26,7 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import type { MigrationEdit, MigrationEngine, SpecObject } from "@crewhaus/migration-engine";
-import type { RegistryAdapter } from "@crewhaus/spec-registry";
+import { type RegistryAdapter, compareVersions } from "@crewhaus/spec-registry";
 import { isSeq, parseDocument, parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 export class MigrationRunnerError extends CrewhausError {
@@ -49,6 +49,8 @@ export type MigrationPlanItem = {
    * re-serialised object-level. Present for `action: "migrate"` only.
    */
   readonly commentsPreserved?: boolean;
+  /** True once a `migrate` item's new version is stored; absent on a dry run or a refused run. */
+  readonly written?: boolean;
 };
 
 export type MigrateAllOptions = {
@@ -233,9 +235,12 @@ export async function migrateAll(opts: MigrateAllOptions): Promise<MigrateAllRes
   const downward = opts.fromVersion > opts.toVersion;
   const specs = await opts.registry.listSpecs();
   const plan: MigrationPlanItem[] = [];
+  // The migrated text of each `migrate` item, by plan index: nothing is
+  // written until every spec has been planned.
+  const pending = new Map<number, string>();
 
   for (const name of specs) {
-    const versions = [...(await opts.registry.list(name))].sort();
+    const versions = [...(await opts.registry.list(name))].sort(compareVersions);
     if (versions.length === 0) continue;
     const latest = versions[versions.length - 1];
     if (!latest) continue;
@@ -287,6 +292,7 @@ export async function migrateAll(opts: MigrateAllOptions): Promise<MigrateAllRes
       }
     }
     const newVersion = newVersionName(latest, opts.toVersion);
+    pending.set(plan.length, migrated.yaml);
     plan.push({
       name,
       latestVersion: latest,
@@ -295,17 +301,23 @@ export async function migrateAll(opts: MigrateAllOptions): Promise<MigrateAllRes
       diff: { fromVersion: currentVersion, toVersion: opts.toVersion },
       commentsPreserved: migrated.commentsPreserved,
     });
-    if (!opts.dryRun) {
-      await opts.registry.put(name, newVersion, migrated.yaml);
-    }
   }
 
-  // Refuse to apply if any spec failed validation in non-dry-run mode.
+  // A run with any spec that failed writes nothing at all.
   const failed = plan.filter((p) => p.action === "validate-fail").length;
   if (failed > 0 && !opts.dryRun) {
     throw new MigrationRunnerError(
-      `${failed} spec(s) failed migration; run with dryRun: true to inspect`,
+      `${failed} spec(s) failed migration; nothing was written. Run with dryRun: true to inspect`,
     );
+  }
+  if (!opts.dryRun) {
+    // Each new version is created, never replaced: an existing version of
+    // that name refuses the write and keeps its bytes.
+    for (const [index, yaml] of pending) {
+      const item = plan[index] as MigrationPlanItem;
+      await opts.registry.putNew(item.name, item.newVersion as string, yaml);
+      plan[index] = { ...item, written: true };
+    }
   }
 
   return {

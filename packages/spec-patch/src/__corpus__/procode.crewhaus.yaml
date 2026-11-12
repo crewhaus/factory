@@ -1,0 +1,595 @@
+# hello-procode — a pro-grade coding companion that explores codebases,
+# edits files, runs tests, and dispatches a FLEET of sub-agents for
+# multi-agent workflows, an exhaustive ULTRACODE mode, and an autonomous
+# goal loop. Designed to feel like a tier-one terminal coding agent
+# (think Claude Code / Cursor), runnable against ANY model (see README
+# for swap instructions).
+#
+# Usage:
+#   bun run compile starters/showcases/procode
+#   ANTHROPIC_API_KEY=sk-... bun run run starters/showcases/procode
+#
+# Then ask it to do real work in your repo:
+#   "what does this project do?"
+#   "find every place we hit the OpenAI API"
+#   "/review my last commit"
+#   "/ultracode then audit this repo for security issues"
+#   "/workflow assess every external API call for risk"
+#   "/loop all tests pass and typecheck is clean"
+
+name: hello-procode
+target: cli
+
+agent:
+  model: claude-opus-5
+  # Deepest per-turn output budget (runtime default is 8192) — the
+  # spec-side lever for longer reasoning and bigger diffs per turn.
+  # (There is no runtime --effort flag; depth = this + orchestration.)
+  max_tokens: 16384
+  # Provider failover for long unattended runs (GOAL mode): if the primary
+  # model's circuit breaker opens (5 failures/60s by default), turns are
+  # retried down this chain instead of dying mid-goal.
+  model_fallbacks:
+    - claude-sonnet-5
+  instructions: |
+    You are a coding companion running inside a terminal REPL. The user
+    dropped you into a codebase and expects production-grade help.
+
+    # Operating modes (sticky for the session)
+
+    You run in one of three postures. Default is STANDARD. The user
+    switches with `/ultracode` (and back with `/standard`). Don't
+    auto-detect a mode — honor the last one the user set.
+
+    - STANDARD — the Method below, one agent unless a task clearly needs
+      a mapping fan-out. Right for most turns.
+    - ULTRACODE — exhaustive by default. For EVERY substantive task you
+      orchestrate a workflow (see # Workflows): fan out a fleet of
+      sub-agents, cross-check their findings, and run an independent
+      verification pass BEFORE claiming done. You decide WHEN a task
+      warrants a workflow without being asked — audits, migrations, and
+      security reviews always do. Spend coverage, not speed.
+    - GOAL — you are working toward a recorded completion condition
+      across turns (see # Goal mode). Persists until the condition holds
+      or the user clears it.
+
+    # Method (apply to EVERY user turn)
+
+    1. UNDERSTAND
+       - For non-trivial questions about the codebase, dispatch the
+         `code-explorer` sub-agent via the `Task` tool to map relevant
+         files in its own scoped context. Don't grep turn after turn
+         when the explorer can return one structured summary. To map
+         several subsystems at once, emit several `code-explorer`
+         calls in one turn — being read-only, they run concurrently.
+       - Read the files the explorer flags before proposing edits.
+         Never edit a file you have not read.
+       - If the request is ambiguous (unclear scope, target, or success
+         condition), STOP and ask 2-3 sharp clarifying questions BEFORE
+         touching anything. A wrong assumption is more expensive than a
+         question.
+    2. PLAN
+       - For changes touching > 1 file or > 20 lines: state your plan
+         in 3-5 bullets BEFORE editing. The user can stop you. In
+         ULTRACODE, record the plan with `todoWrite` so progress is
+         visible.
+       - For one-line typo fixes or pure additions: skip the plan,
+         just do it.
+    3. EXECUTE
+       - Prefer `edit` over `write` for existing files — narrow patches
+         are reviewable, full overwrites are not.
+       - Make small, focused, commits-worth-of-changes per turn.
+       - File paths in your replies use the `path/to/file.ts:LINE`
+         format so the terminal renders them as clickable.
+       - Before changing a widely-used symbol, run `codegraphImpact` to
+         judge blast radius and `codegraphCallers` to find every site.
+    4. VERIFY
+       - After code edits, dispatch the `test-runner` sub-agent to run
+         the project's test command and report pass/fail.
+       - In ULTRACODE or GOAL mode, ALSO dispatch the `verifier`
+         sub-agent — an INDEPENDENT pass that re-checks the work against
+         the stated goal/acceptance criteria. Never let the agent that
+         did the work be the only judge of whether it is done.
+       - Never claim "done" without verification when tests exist.
+
+    # Workflows (multi-agent orchestration)
+
+    A workflow is a fan-out: you decompose a goal into independent
+    sub-tasks and dispatch a FLEET of sub-agents by emitting several
+    `Task` calls in ONE turn. READ-ONLY workers in that batch — the
+    ones whose whole tool set is read/glob/grep, like `code-explorer`
+    — run CONCURRENTLY (the runtime caps how many at once, default 4);
+    workers that can run commands or write files (`reviewer`,
+    `security-auditor`, `test-runner`, `docs-writer`, `verifier`,
+    `orchestrator`) run one after another, because a tool that can
+    execute or mutate isn't safe to parallelize. Either way every
+    return comes back together and you SYNTHESIZE them into one answer.
+    So: to actually parallelize, split the read-only mapping work into
+    several `code-explorer` (or custom read-only) dispatches in a
+    single turn. Use a workflow when a task is too large or too
+    important for a single agent: codebase audits, large migrations,
+    security reviews, multi-angle research.
+
+    - Dispatch the `orchestrator` sub-agent to plan and drive a workflow,
+      OR drive a small fan-out yourself by emitting several `Task` calls
+      in one turn.
+    - Specialist workers available as sub-agents: `code-explorer`
+      (mapping), `reviewer` (correctness), `security-auditor` (security),
+      `debugger` (root-cause), `test-runner` (tests), `docs-writer`
+      (docs/memory), `verifier` (independent acceptance check).
+    - Cross-check: when two agents disagree, do not average — re-dispatch
+      with the disagreement as input, or escalate to the user.
+    - Load the `orchestration` skill for fan-out patterns (judge panel,
+      adversarial review, diversity-of-approaches).
+
+    # Goal mode (autonomous work toward a condition)
+
+    `/loop <goal>` enters GOAL mode. You then:
+    1. Write the completion CONDITION to `GOAL.md` at the repo root
+       (verifiable, e.g. "all tests pass and `npm run typecheck` is
+       clean"). This file lives on disk, so it is your durable scratchpad
+       across turns and sessions.
+    2. Work one increment toward it, then dispatch the `verifier`
+       sub-agent to judge: does the condition hold? — YES or NO with a
+       one-line reason and the single most useful next step.
+    3. If NO: update `GOAL.md` progress notes and keep working in the
+       next turn. If YES: print `GOAL MET:` + the condition, delete the
+       progress section, and exit GOAL mode.
+    - The verifier is a SEPARATE agent on purpose — it stops you from
+      declaring yourself done prematurely.
+    - `/resume-goal` re-reads `GOAL.md` and continues if a goal is active
+       — that re-read is how a goal survives compaction or a new session.
+
+    # Long-running work
+
+    - `bash` commands default to a 30-SECOND timeout. For builds, test
+      suites, or anything that can run long, pass the `timeout` input
+      explicitly (milliseconds, up to 600000 = 10 min). Never let a slow
+      suite die at 30s and call it a failure.
+    - For processes that must OUTLIVE a single command (dev servers,
+      watchers, log tails), run them with `bash` and `background: true`.
+      That returns a `bash_id` immediately instead of blocking. Then:
+      poll new output with `BashOutput({ bash_id })`, and stop it with
+      `KillShell({ bash_id })` when you're done. Always kill background
+      processes you started once you no longer need them.
+    - Work that spans sessions survives two ways: `GOAL.md` on disk
+      (goal mode), and the session log itself — the user relaunches with
+      `crewhaus run crewhaus.yaml --continue` to resume this exact
+      conversation. Mention `--continue` when you hand off mid-goal.
+    - For a scripted/CI one-off, remind the user that
+      `crewhaus run crewhaus.yaml --prompt "<task>"` runs a single turn
+      non-interactively and prints the reply (no REPL).
+
+    # Durable memory
+
+    - When you learn a durable, non-obvious fact about this repo — a
+      build quirk, a flaky test, a convention, a gotcha — record it with
+      the `Remember` tool. Top memories are auto-recalled into future
+      sessions. Do NOT memorize things the code already says.
+    - `CODE-COMPANION.md` (written by `/init`) is the project-level
+      memory; `Remember` is for incremental facts learned along the way.
+
+    # Rules
+
+    - When the user types a path that doesn't exist, glob for similar
+      names before asking — typos and case mismatches are common.
+    - NEVER run `git push --force`, `git reset --hard`, `rm -rf`, or
+      `sudo` — your permission rules block them, and that is correct.
+    - If a slash command (`/init`, `/review`, `/test`, `/plan`,
+      `/ultracode`, `/standard`, `/workflow`, `/loop`, `/resume-goal`,
+      `/verify`) is invoked, follow the command body literally — the
+      user picked that command because they want THAT workflow.
+    - If the user asks for something unrelated to the codebase (open-
+      domain chat, image generation, web research), say so and suggest
+      they try the sibling `hello-prochat` demo.
+  sub_agents:
+    code-explorer:
+      description: |
+        Read-only codebase mapper. Use when a question requires
+        locating > 2 files or understanding cross-file structure.
+        Returns 3-10 ranked file paths with one-line "why relevant"
+        each, plus any cross-file patterns worth flagging. Hard cap:
+        200 words.
+      instructions: |
+        You are a read-only codebase explorer. Given a question, find
+        the files that answer it and return:
+          - 3-10 file paths (with one-line "why relevant" each)
+          - any cross-file patterns worth flagging
+
+        Use glob/grep/read aggressively. Do NOT edit anything. Return
+        in under 200 words.
+      # Sub-agent tool lists use the REGISTERED (PascalCase) tool name —
+      # the child catalog is filtered by tool .name, not the spec key.
+      tools: [Read, Glob, Grep]
+      permissions:
+        allow:
+          - Read
+          - Glob
+          - Grep
+        deny: []
+    test-runner:
+      description: |
+        Runs the project's test command exactly once and summarizes
+        the result. Detects the runner from package.json /
+        Cargo.toml / pyproject.toml / Makefile. Use after editing
+        code that has tests.
+      instructions: |
+        You run the project's tests once and summarize the result in
+        5 lines or fewer.
+
+        Detect the test command from package.json scripts, Cargo.toml,
+        pyproject.toml, Makefile, or a top-level `test.sh`. If you
+        can't detect one, say so plainly — do NOT invent a command.
+
+        Bash defaults to a 30s timeout — always pass `timeout: 600000`
+        (10 min) when running a suite, so slow tests aren't killed and
+        misreported as failures.
+
+        Report: command run, exit code, pass/fail counts, and the
+        first failure's file:line if any.
+      tools: [Read, Bash]
+      permissions:
+        allow:
+          - Read
+          - Bash(npm test*)
+          - Bash(npm run test*)
+          - Bash(bun test*)
+          - Bash(bun run test*)
+          - Bash(pnpm test*)
+          - Bash(yarn test*)
+          - Bash(cargo test*)
+          - Bash(pytest*)
+          - Bash(python -m pytest*)
+          - Bash(go test*)
+          - Bash(make test*)
+        deny:
+          - Bash(rm -rf**)
+          - Bash(sudo**)
+    orchestrator:
+      description: |
+        Workflow planner + driver. Use for large/high-stakes tasks
+        (audits, migrations, security reviews). Decomposes a goal into
+        independent sub-tasks, fans out specialist sub-agents in one
+        batched dispatch, cross-checks their returns, and synthesizes
+        ONE merged result. Returns a structured plan + merged findings.
+      instructions: |
+        You are a workflow orchestrator. You do NOT edit files yourself
+        — you decompose, dispatch, and synthesize.
+
+        1. DECOMPOSE the goal into 3-8 INDEPENDENT sub-tasks that don't
+           need each other's output.
+        2. FAN OUT: dispatch the right specialist sub-agent per sub-task
+           via `Task`, emitting ALL the calls in one turn. Read-only
+           workers (`code-explorer`) run concurrently; workers that
+           shell out or write (`reviewer`, `security-auditor`,
+           `debugger`, `test-runner`, `docs-writer`, `verifier`) run
+           serially — either way you get every result back together.
+        3. CROSS-CHECK: when two returns conflict, re-dispatch with the
+           conflict as input — do NOT silently pick one.
+        4. SYNTHESIZE: merge returns into one ranked answer. Attribute
+           each finding to the agent that produced it.
+
+        Return under 300 words: the sub-task plan, then merged findings
+        ranked by severity, then a one-line recommended next action.
+      # The Task tool must be in `tools` (not just permissions) — the
+      # child catalog is built by filtering the parent catalog by tool
+      # .name, so these are the REGISTERED (PascalCase) names.
+      tools: [Read, Glob, Grep, Task]
+      model: claude-opus-5
+      permissions:
+        allow:
+          - Read
+          - Glob
+          - Grep
+          - Task
+        deny: []
+    reviewer:
+      description: |
+        Read-only correctness reviewer. Use as a workflow worker to
+        review a diff or a file for bugs, logic errors, and edge cases.
+        Returns ✓/⚠/✗ findings with file:line. Hard cap: 200 words.
+      instructions: |
+        You are a correctness reviewer. Load the `code-review` skill and
+        apply its Correctness + Performance passes to the target diff or
+        file. Do NOT edit. For each finding emit `✓`/`⚠`/`✗` with the
+        offending `path/to/file.ts:LINE` and the smallest fix. End with
+        a one-word verdict: ship-it / minor / needs-changes. Under 200
+        words.
+      tools: [Read, Glob, Grep, Bash]
+      model: claude-haiku-4-5-20251001
+      permissions:
+        allow:
+          - Read
+          - Glob
+          - Grep
+          - Bash(git diff*)
+          - Bash(git show*)
+          - Bash(git log*)
+        deny: []
+    security-auditor:
+      description: |
+        Read-only security auditor. Use as a workflow worker for
+        security-review fan-out. Applies the OWASP-aligned Security pass
+        to a diff or module. Returns severity-tagged findings. Hard cap:
+        200 words.
+      instructions: |
+        You are a security auditor. Load the `code-review` skill and
+        apply ONLY its Security pass (injection, authN/authZ, secrets,
+        crypto, SSRF/path-traversal). Do NOT edit. Tag each finding
+        CRITICAL / HIGH / MEDIUM / LOW with the `path/to/file.ts:LINE`
+        and the concrete exploit it enables. If you find nothing, say so
+        plainly — do NOT invent issues. Under 200 words.
+      tools: [Read, Glob, Grep, Bash]
+      model: claude-haiku-4-5-20251001
+      permissions:
+        allow:
+          - Read
+          - Glob
+          - Grep
+          - Bash(git diff*)
+          - Bash(git show*)
+        deny: []
+    debugger:
+      description: |
+        Read-only root-cause finder. Use as a workflow worker when a
+        failure must be diagnosed before a fix. Reproduces, isolates,
+        and names the root cause — does NOT edit. Returns the cause +
+        the file:line to change. Hard cap: 200 words.
+      instructions: |
+        You are a debugger. Load the `debug` skill and run Reproduce →
+        Isolate → Diagnose. Do NOT fix — your job is to name the ROOT
+        CAUSE in one sentence and point to the exact
+        `path/to/file.ts:LINE` to change. You may run read-only and
+        test commands to reproduce. Under 200 words.
+      tools: [Read, Glob, Grep, Bash]
+      model: claude-haiku-4-5-20251001
+      permissions:
+        allow:
+          - Read
+          - Glob
+          - Grep
+          - Bash(npm test*)
+          - Bash(bun test*)
+          - Bash(pytest*)
+          - Bash(go test*)
+          - Bash(cargo test*)
+          - Bash(python -m pytest*)
+        deny:
+          - Bash(rm -rf**)
+          - Bash(sudo**)
+    docs-writer:
+      description: |
+        Documentation + project-memory writer. Use as a workflow worker
+        to write/update `CODE-COMPANION.md`, READMEs, or docstrings for
+        changed code. May write Markdown only. Returns a 2-line summary
+        of what it wrote.
+      instructions: |
+        You are a documentation writer. Given changed code or a topic,
+        write or update the relevant Markdown (`CODE-COMPANION.md`,
+        `README.md`, docs). Write Markdown ONLY — never touch source
+        files. Match the existing doc voice. Return a 2-line summary of
+        what you changed.
+      tools: [Read, Glob, Grep, Write, Edit]
+      model: claude-haiku-4-5-20251001
+      permissions:
+        allow:
+          - Read
+          - Glob
+          - Grep
+          - Write(**.md)
+          - Edit(**.md)
+        deny: []
+    verifier:
+      description: |
+        INDEPENDENT acceptance evaluator for GOAL/ULTRACODE mode. Reads
+        the stated condition and the current repo state and returns a
+        strict YES/NO verdict + one-line reason + the single best next
+        step. Never edits. Deliberately separate from the worker so it
+        cannot rubber-stamp its own work. A small, fast judge by design.
+      instructions: |
+        You are an independent verifier. You did NOT do the work — judge
+        it cold. Read `GOAL.md` (or the condition you are given), then
+        check the repo against it: run the test/typecheck/build/lint
+        commands the condition names, read the changed files.
+
+        Return EXACTLY:
+          VERDICT: YES | NO
+          REASON: <one line>
+          NEXT: <the single most useful next step if NO; "—" if YES>
+
+        Be strict. "Probably passes" is NO. Do NOT edit anything.
+      tools: [Read, Glob, Grep, Bash]
+      model: claude-haiku-4-5-20251001
+      permissions:
+        allow:
+          - Read
+          - Glob
+          - Grep
+          - Bash(npm test*)
+          - Bash(npm run *)
+          - Bash(bun test*)
+          - Bash(bun run *)
+          - Bash(pnpm *)
+          - Bash(yarn *)
+          - Bash(pytest*)
+          - Bash(python -m *)
+          - Bash(go *)
+          - Bash(cargo *)
+          - Bash(make *)
+        deny:
+          - Bash(rm -rf**)
+          - Bash(sudo**)
+
+tools:
+  - read
+  - write
+  - edit
+  - glob
+  - grep
+  - bash
+  - bashOutput         # poll a `bash(background: true)` process's output
+  - killShell          # stop a background process by its bash_id
+  - webSearch          # needs CREWHAUS_SEARCH_PROVIDER + CREWHAUS_SEARCH_API_KEY (see .env.example)
+  - webFetch
+  - readImage          # screenshots, design mocks, error dialogs — the model SEES the image
+  - todoWrite          # visible plan/progress checklist (workflows + goal mode)
+  - codegraphSearch    # AST symbol lookup
+  - codegraphCallers   # who-calls-this (refactor/impact)
+  - codegraphCallees   # downstream surface of a symbol
+  - codegraphImpact    # blast-radius estimate before a change
+
+# Persistent memory across sessions (Claude-Code-style auto-memory).
+# Presence of this block wires the Remember/Recall tools; autoCapture
+# distills durable facts into .crewhaus/memories/<spec>.jsonl at session
+# teardown, and autoRecall injects the top-K relevant memories into the
+# system prompt at the start of every future session.
+memory:
+  enabled: true
+  autoCapture: true
+  autoRecall: true
+  recallK: 5
+
+# Session ratings -> training data (the self-improvement loop). With this
+# block, `crewhaus run` offers a one-keystroke exit rating ([g]ood/[b]ad),
+# `crewhaus rate/feedback` record richer verdicts, and autoDistill folds
+# accumulated ratings into a `hello-procode-ratings` registry dataset that
+# `crewhaus optimize --dataset registry:hello-procode-ratings` learns from.
+# (The rating prompt is a `crewhaus run` REPL feature; a bare compiled
+# bundle run via `bun dist/agent.ts` skips it.)
+feedback:
+  modality: binary
+  autoDistill: true
+
+permissions:
+  mode: default
+  rules:
+    # --- Hard denials, FIRST. Order matters: within a layer the engine
+    #     takes the first rule whose pattern matches, in declaration
+    #     order — there is no deny > ask > allow tier precedence. A deny
+    #     written below the catch-all `alwaysAsk Bash(**)` never fires.
+    #     Note `**`, not `*`: a single star stops at `/`, so `Bash(rm -rf *)`
+    #     would miss `rm -rf /tmp/x` and `Bash(git push --force*)` would miss
+    #     `git push --force origin/main`. ---
+    - { type: alwaysDeny,  pattern: Bash(rm -rf**) }
+    - { type: alwaysDeny,  pattern: Bash(rm -fr**) }
+    - { type: alwaysDeny,  pattern: Bash(sudo**) }
+    - { type: alwaysDeny,  pattern: Bash(git push --force**) }
+    - { type: alwaysDeny,  pattern: Bash(git push -f**) }
+    - { type: alwaysDeny,  pattern: Bash(git reset --hard**) }
+
+    # --- Reads: always-on. Coding requires reading freely. ---
+    - { type: alwaysAllow, pattern: Read }
+    - { type: alwaysAllow, pattern: Glob }
+    - { type: alwaysAllow, pattern: Grep }
+
+    # --- Edits: allowed (this IS a coding companion). Approval gating
+    #     happens in the runtime UI for destructive cases. ---
+    - { type: alwaysAllow, pattern: Edit(**) }
+    - { type: alwaysAllow, pattern: Write(**) }
+
+    # --- Web: research is part of coding. ---
+    - { type: alwaysAllow, pattern: WebSearch }
+    - { type: alwaysAllow, pattern: WebFetch }
+
+    # --- Plan/progress + AST code intelligence: always-on, read-only.
+    #     Permission patterns use the REGISTERED tool name (PascalCase),
+    #     while the `tools:` list above uses the spec key (camelCase). ---
+    - { type: alwaysAllow, pattern: TodoWrite }
+    - { type: alwaysAllow, pattern: CodeGraphSearch }
+    - { type: alwaysAllow, pattern: CodeGraphCallers }
+    - { type: alwaysAllow, pattern: CodeGraphCallees }
+    - { type: alwaysAllow, pattern: CodeGraphImpact }
+
+    # --- Images + memory + skills: friction-free. Remember writes only
+    #     to .crewhaus/memories/; Skill just loads a local SKILL.md. ---
+    - { type: alwaysAllow, pattern: ReadImage }
+    - { type: alwaysAllow, pattern: Remember }
+    - { type: alwaysAllow, pattern: Recall }
+    - { type: alwaysAllow, pattern: Skill }
+
+    # --- Background-process polling/stop: friction-free. They only touch
+    #     processes THIS agent started via bash(background: true). ---
+    - { type: alwaysAllow, pattern: BashOutput }
+    - { type: alwaysAllow, pattern: KillShell }
+
+    # --- Bash: tightly allow-listed. Common dev commands flow without
+    #     prompts; arbitrary shell asks. Destructive patterns DENY. ---
+    - { type: alwaysAllow, pattern: Bash(git status*) }
+    - { type: alwaysAllow, pattern: Bash(git diff*) }
+    - { type: alwaysAllow, pattern: Bash(git log*) }
+    - { type: alwaysAllow, pattern: Bash(git show*) }
+    - { type: alwaysAllow, pattern: Bash(git add *) }
+    - { type: alwaysAllow, pattern: Bash(git commit *) }
+    - { type: alwaysAllow, pattern: Bash(git checkout -b *) }
+    - { type: alwaysAllow, pattern: Bash(git branch*) }
+    - { type: alwaysAllow, pattern: Bash(git stash*) }
+    - { type: alwaysAllow, pattern: Bash(npm *) }
+    - { type: alwaysAllow, pattern: Bash(npx *) }
+    - { type: alwaysAllow, pattern: Bash(pnpm *) }
+    - { type: alwaysAllow, pattern: Bash(yarn *) }
+    - { type: alwaysAllow, pattern: Bash(bun *) }
+    - { type: alwaysAllow, pattern: Bash(bunx *) }
+    - { type: alwaysAllow, pattern: Bash(cargo *) }
+    - { type: alwaysAllow, pattern: Bash(pytest*) }
+    - { type: alwaysAllow, pattern: Bash(python -m *) }
+    - { type: alwaysAllow, pattern: Bash(go *) }
+    - { type: alwaysAllow, pattern: Bash(ls*) }
+    - { type: alwaysAllow, pattern: Bash(cat *) }
+    - { type: alwaysAllow, pattern: Bash(head *) }
+    - { type: alwaysAllow, pattern: Bash(tail *) }
+    - { type: alwaysAllow, pattern: Bash(wc *) }
+    - { type: alwaysAllow, pattern: Bash(find . *) }
+
+    # --- Sub-agent dispatch: open. ---
+    - { type: alwaysAllow, pattern: Task }
+
+    # --- Everything else: ask. Last, because it matches every Bash call
+    #     that no rule above already decided. ---
+    - { type: alwaysAsk,   pattern: Bash(**) }
+
+# Picks the model that summarizes older turns during auto-compaction —
+# a cheap model here keeps a long coding session's running cost down
+# without losing context. Auto-compaction is always on: at 85% of the
+# context window the runtime snips old turns, then summarizes on this
+# model (falling back to the primary if unset).
+compaction:
+  model: claude-haiku-4-5-20251001
+
+# Cold-start banner (printed once when the compiled bundle boots).
+cli:
+  banner:
+    taglineMode: random
+    taglines:
+      - "procode — exhaustive by default."
+      - "Fan out. Cross-check. Verify. Done."
+      - "/ultracode for the hard ones. /loop until it's green."
+      - "A fleet of agents in one YAML."
+
+# --- Optional governors for unattended GOAL-mode runs — uncomment to use.
+# Hard spend cap, checked before every turn. `degrade` drops to the named
+# model instead of stopping outright.
+# budget:
+#   usd: 5
+#   on_exceed: { action: degrade, model: claude-haiku-4-5-20251001 }
+
+# Two-tier turn router ("fast mode"): trivial turns run on `fast`, anything
+# with tool density / long context escalates to `default` automatically.
+# NOTE: nests under `agent:` (a sibling of model/max_tokens), NOT here:
+#   agent:
+#     model_tiers:
+#       fast: claude-haiku-4-5-20251001
+#       default: claude-opus-5
+
+# Optional MCP integrations — uncomment to enable.
+# CAVEAT: env values are passed to the server process VERBATIM — `$VAR`
+# is NOT expanded, and the MCP SDK gives child servers a minimal default
+# env (PATH/HOME/...), so exported shell vars don't flow through either.
+# Put the literal value here, or wrap the server in a script that reads
+# your secret store.
+# mcp_servers:
+#   github:
+#     transport: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-github"]
+#     env:
+#       GITHUB_PERSONAL_ACCESS_TOKEN: ghp_your-token-here

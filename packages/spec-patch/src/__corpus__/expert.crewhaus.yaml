@@ -1,0 +1,112 @@
+# hello-expert — a self-teaching DOMAIN EXPERT on the v0.3.0 learning fabric.
+#
+# Two knobs do all the work:
+#   thredz:    — the hosted wiki that is the expert's long-term memory
+#                (bare-name wiki_* tools, synthesized MCP server, one API key
+#                and one wiki space per agent)
+#   learning:  — the shipped `learning-loop` skill (ANSWER / STUDY / REFLECT /
+#                EXAM), the /study /reflect /exam commands, Sources-required
+#                wiki writes, and the first-class in-process exam
+#
+# Everything that used to be a ~150-line mechanism prompt here now ships with
+# CrewHaus itself. What remains below is the DOMAIN: one sentence of identity,
+# the curriculum + sources + exam files, and a research sub-agent.
+#
+# Usage (from inside this directory — see README):
+#   cp .env.example .env      # THREDZ_API_KEY + ANTHROPIC_API_KEY
+#   bunx crewhaus run crewhaus.yaml
+# Then try a question, /study, /reflect, /exam.
+
+name: hello-expert
+target: cli
+
+# `thredz: true` is shorthand for `{ api_key: $THREDZ_API_KEY }`. It is spelled
+# out here for the knob that matters in 0.5.0 — `space:`, the Thredz WIKI SPACE
+# every wiki_* call is scoped to. Spaces need a Pro or Scale plan; on Free or
+# Starter drop `space:` and the key uses the account's unspaced wiki.
+#
+# `coffee-expert` is created as an INDIVIDUAL space, readable only by the key
+# that owns it — this agent's memory, nobody else's. Thredz allows exactly ONE
+# individual space per API KEY, which is why the always-on daemon carries a
+# SECOND key with its own space instead of sharing this one (daemon.yaml).
+#
+# No `visibility:` here on purpose: inside a space the space's own TYPE decides
+# who can read, and `visibility:` stops applying.
+thredz:
+  api_key: $THREDZ_API_KEY
+  space: coffee-expert
+
+learning:
+  domain: specialty coffee brewing & extraction science
+  curriculum: curriculum.md
+  sources: ["sca.coffee", "*.edu", "baristahustle.com"]
+  exam: { dataset: eval/dataset.jsonl, graders: eval/graders.yaml }
+
+agent:
+  model: claude-sonnet-5
+  max_tokens: 16384
+  model_fallbacks: [claude-haiku-4-5-20251001] # long study passes survive a provider hiccup
+  instructions: |
+    You are the resident specialty-coffee expert. Precision over fluency:
+    grind size, brew ratios, extraction yields, TDS, and water chemistry are
+    load-bearing numbers in this field — get them right, with units, or say
+    you are unsure. Prefer SCA standards and peer-reviewed extraction
+    science; treat blogs and forums as leads to verify, not sources. Local
+    field notes live in sources/.
+  sub_agents:
+    researcher:
+      description: |
+        Read-only source researcher. Give it ONE narrow sub-question and the
+        source allowlist. It returns 2-4 verbatim, cited snippets — no
+        synthesis, no opinions. Hard cap: 180 words.
+      instructions: |
+        You research ONE narrow question against high-quality sources.
+        Prefer primary literature, standards bodies, and canonical texts
+        over blogs and forums. Return 2-4 SHORT verbatim snippets, each with
+        its source URL/title, and one line on whether the claim is
+        time-tested or frontier/provisional. Do NOT synthesise or edit
+        anything. Under 180 words.
+      tools: [webSearch, webFetch, read]
+      model: claude-haiku-4-5-20251001
+      permissions:
+        allow: [WebSearch, WebFetch, Read]
+        deny: []
+
+tools: [read, write, edit, glob, grep, webSearch, webFetch, todoWrite]
+
+# User ratings on answers feed the self-improvement flywheel (README).
+feedback:
+  modality: stars
+  scale: { min: 1, max: 5 }
+  autoDistill: true
+
+permissions:
+  mode: default
+  rules:
+    # Research + recall: friction-free (this is a learning agent). Wiki
+    # writes are the job — allowed, but justification-gated + audited by the
+    # runtime (wiki_write / wiki_set_signals are destructive by default).
+    - { type: alwaysAllow, pattern: Read }
+    - { type: alwaysAllow, pattern: Glob }
+    - { type: alwaysAllow, pattern: Grep }
+    - { type: alwaysAllow, pattern: WebSearch }
+    - { type: alwaysAllow, pattern: WebFetch }
+    - { type: alwaysAllow, pattern: TodoWrite }
+    - { type: alwaysAllow, pattern: wiki_recall }
+    - { type: alwaysAllow, pattern: wiki_semantic_search }
+    - { type: alwaysAllow, pattern: wiki_search }
+    - { type: alwaysAllow, pattern: wiki_get }
+    - { type: alwaysAllow, pattern: wiki_list }
+    - { type: alwaysAllow, pattern: wiki_related }
+    - { type: alwaysAllow, pattern: wiki_stats }
+    - { type: alwaysAllow, pattern: wiki_space_list } # "which spaces can this key see?"
+    - { type: alwaysAllow, pattern: wiki_write }
+    - { type: alwaysAllow, pattern: wiki_set_signals }
+    - { type: alwaysAllow, pattern: log_knowledge_gap }
+    - { type: alwaysAllow, pattern: task_list } # open gaps at study time
+    - { type: alwaysAllow, pattern: run_exam } # the first-class /exam (no Bash)
+    # Curriculum + exam curation: Markdown/JSONL only.
+    - { type: alwaysAllow, pattern: Edit(curriculum.md) }
+    - { type: alwaysAllow, pattern: Edit(eval/**) }
+    - { type: alwaysAllow, pattern: Write(eval/**) }
+    - { type: alwaysAllow, pattern: Edit(sources/**) }

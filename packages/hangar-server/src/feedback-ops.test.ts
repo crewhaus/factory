@@ -15,7 +15,7 @@
  *     even where the optimizer may tune it.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { isOptimizable } from "@crewhaus/spec-patch";
 import { sessionKeyOf, tierFor } from "./feedback-ops";
@@ -357,15 +357,65 @@ describe("the advisory feed", () => {
     expect((preview.body["diff"] as unknown[]).length).toBeGreaterThan(0);
     expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).not.toContain("never repeat yourself");
 
-    const applied = await t.api(`/api/h/${id}/feedback/advice/adv_instructions/apply`, {
+    // The write sends back the revision it previewed; without it, nothing is written.
+    const noRev = await t.api(`/api/h/${id}/feedback/advice/adv_instructions/apply`, {
       method: "POST",
       body: JSON.stringify({ confirm: true }),
     });
+    expect(noRev.status).toBe(428);
+    expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).not.toContain("never repeat yourself");
+
+    const applied = await t.api(`/api/h/${id}/feedback/advice/adv_instructions/apply`, {
+      method: "POST",
+      body: JSON.stringify({ confirm: true, expectedRev: preview.body["rev"] }),
+    });
     expect(applied.body["applied"]).toBe(true);
+    expect(applied.body["registered"]).toBe("v1");
     const after = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
     expect(after).toContain("never repeat yourself");
     // Comment/key order preserved: this went through the CST, not a template.
     expect(after).toContain("name: loop");
+  });
+
+  for (const mode of [0o600, 0o644]) {
+    test(`applying keeps a ${mode.toString(8)} spec's mode`, async () => {
+      if (process.platform === "win32") return;
+      const t = boot();
+      const dir = loopHarness(t);
+      const specPath = join(dir, "crewhaus.yaml");
+      chmodSync(specPath, mode);
+      const id = await register(t, dir);
+      const preview = await t.api(`/api/h/${id}/feedback/advice/adv_instructions/apply`, {
+        method: "POST",
+        body: "{}",
+      });
+      const applied = await t.api(`/api/h/${id}/feedback/advice/adv_instructions/apply`, {
+        method: "POST",
+        body: JSON.stringify({ confirm: true, expectedRev: preview.body["rev"] }),
+      });
+      expect(applied.body["applied"]).toBe(true);
+      expect(statSync(specPath).mode & 0o777).toBe(mode);
+    });
+  }
+
+  test("applying against a spec that moved since the preview is answered 412 and writes nothing", async () => {
+    const t = boot();
+    const dir = loopHarness(t);
+    const specPath = join(dir, "crewhaus.yaml");
+    const id = await register(t, dir);
+    const preview = await t.api(`/api/h/${id}/feedback/advice/adv_instructions/apply`, {
+      method: "POST",
+      body: "{}",
+    });
+    const edited = `${readFileSync(specPath, "utf8")}# edited meanwhile\n`;
+    writeFileSync(specPath, edited);
+    const applied = await t.api(`/api/h/${id}/feedback/advice/adv_instructions/apply`, {
+      method: "POST",
+      body: JSON.stringify({ confirm: true, expectedRev: preview.body["rev"] }),
+    });
+    expect(applied.status).toBe(412);
+    expect((applied.body["current"] as { draftId: string }).draftId).toMatch(/Z-[0-9a-f]{8}$/);
+    expect(readFileSync(specPath, "utf8")).toBe(edited);
   });
 
   test("a human-owned path is refused with the diff and the propose route named", async () => {

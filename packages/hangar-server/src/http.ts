@@ -12,9 +12,16 @@
 /** A refusal with a status. Thrown by handlers, caught by the dispatcher. */
 export class HttpError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /**
+   * Fields answered beside `error` (a 412's `current`, a 409's `needs`). The
+   * dispatcher masks them like any answer; no field may be named so that the
+   * credential masker redacts it.
+   */
+  readonly body: Readonly<Record<string, unknown>> | undefined;
+  constructor(status: number, message: string, body?: Readonly<Record<string, unknown>>) {
     super(message);
     this.status = status;
+    this.body = body;
   }
 }
 

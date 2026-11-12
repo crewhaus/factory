@@ -91,6 +91,7 @@ import {
   HARNESS_ID_RE,
   type HangarHarnessEntry,
   type HangarRegistry,
+  isAdopted,
   openHangarRegistry,
 } from "@crewhaus/harness-registry";
 import {
@@ -1452,6 +1453,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     const context: M3Context = {
       entry,
       harnessDir,
+      // Adopted on THIS machine (a row from before adoption began counts):
+      // only then is the harness's own code trusted to check its spec.
+      adopted: entry !== null && isAdopted(entry, registry.adoptionSince()),
       params,
       query: url.searchParams,
       body,
@@ -1485,7 +1489,23 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         }),
       warn: onWarn,
     };
-    const result = await route.handler(context);
+    let result: unknown;
+    try {
+      result = await route.handler(context);
+    } catch (err) {
+      // A refusal that carries fields beside its message (a 412's `current`,
+      // a 409's `needs`) is masked and scrubbed like any answer.
+      if (err instanceof HttpError && err.body !== undefined) {
+        return json(
+          maskDeep(
+            { error: err.message, ...err.body },
+            dir === null ? fleetScrub() : harnessScrub(dir),
+          ),
+          err.status,
+        );
+      }
+      throw err;
+    }
     if (result instanceof Response) return result;
     // Masked AND SCRUBBED unconditionally, in one place, so a handler written
     // next month inherits both layers without knowing they exist. Defense in
@@ -2686,7 +2706,11 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       try {
         return await withReceipt(req, segs, () => api(req, url, segs.slice(1)));
       } catch (err) {
-        if (err instanceof HttpError) return errResponse(err.status, err.message);
+        if (err instanceof HttpError) {
+          return err.body === undefined
+            ? errResponse(err.status, err.message)
+            : json(maskDeep({ error: err.message, ...err.body }, fleetScrub()), err.status);
+        }
         onWarn(
           `hangar-server: unhandled route error: ${err instanceof Error ? err.message : String(err)}`,
         );

@@ -16,9 +16,18 @@
  * No test here spawns a process.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
+import { specRev } from "@crewhaus/spec-patch/commit";
 import { makeFixtureHarness } from "./fixture";
 import { type TestServer, bootTestServer } from "./testkit";
 
@@ -1219,15 +1228,52 @@ describe("watchme toggle", () => {
     expect((proposed.body["diff"] as unknown[]).length).toBeGreaterThan(0);
     expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(specBefore);
 
-    const applied = await t.api(`/api/h/${id}/memory/watchme/toggle`, {
+    // The proposal answers the revision the write must send back.
+    const noRev = await t.api(`/api/h/${id}/memory/watchme/toggle`, {
       method: "POST",
       body: JSON.stringify({ watching: false, confirm: true, confirmName: "fabric" }),
     });
+    expect(noRev.status).toBe(428);
+    expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(specBefore);
+    const applied = await t.api(`/api/h/${id}/memory/watchme/toggle`, {
+      method: "POST",
+      body: JSON.stringify({
+        watching: false,
+        confirm: true,
+        confirmName: "fabric",
+        expectedRev: proposed.body["rev"],
+      }),
+    });
     expect(applied.body["applied"]).toBe(true);
+    expect(applied.body["registered"]).toBe("v1");
     expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toContain("watchme:");
     // The runtime's own state file is owned by `crewhaus watchme start/stop`.
     expect(readFileSync(join(dir, ".crewhaus", "watchme", "state.json"), "utf8")).toBe(stateBefore);
   });
+});
+
+describe("watchme writes keep the spec's mode", () => {
+  for (const mode of [0o600, 0o644]) {
+    test(`a ${mode.toString(8)} spec stays ${mode.toString(8)} after a toggle`, async () => {
+      if (process.platform === "win32") return;
+      const t = boot();
+      const dir = fabricHarness(t);
+      const specPath = join(dir, "crewhaus.yaml");
+      chmodSync(specPath, mode);
+      const id = await register(t, dir);
+      const applied = await t.api(`/api/h/${id}/memory/watchme/toggle`, {
+        method: "POST",
+        body: JSON.stringify({
+          watching: false,
+          confirm: true,
+          confirmName: "fabric",
+          expectedRev: specRev(readFileSync(specPath, "utf8")),
+        }),
+      });
+      expect(applied.body["applied"]).toBe(true);
+      expect(statSync(specPath).mode & 0o777).toBe(mode);
+    });
+  }
 });
 
 describe("watchme synthesize", () => {
@@ -1284,10 +1330,15 @@ describe("watchme synthesize", () => {
     expect(proposedOnly.body["code"]).toBe("needs_typed_confirm");
     expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(specBefore);
 
-    // An auto-tunable path needs only the confirm already given.
+    // An auto-tunable path needs only the confirm already given, and the
+    // revision the listing answered.
     const applied = await t.api(`/api/h/${id}/memory/watchme/synthesized/20260803T000000Z/apply`, {
       method: "POST",
-      body: JSON.stringify({ edits: ["agent.instructions"], confirm: true }),
+      body: JSON.stringify({
+        edits: ["agent.instructions"],
+        confirm: true,
+        expectedRev: listed.body["rev"],
+      }),
     });
     expect(applied.body["applied"]).toBe(true);
     expect(applied.body["tier"]).toBe("auto-tunable");
@@ -1384,7 +1435,12 @@ describe("watchme synthesize", () => {
     // The typed confirmation is what carries it.
     const confirmed = await t.api(route, {
       method: "POST",
-      body: JSON.stringify({ edits: ["transaction_policy"], confirm: true, confirmName: "fabric" }),
+      body: JSON.stringify({
+        edits: ["transaction_policy"],
+        confirm: true,
+        confirmName: "fabric",
+        expectedRev: specRev(specBefore),
+      }),
     });
     expect(confirmed.body["applied"]).toBe(true);
     expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toContain("simulationRequired: false");
@@ -1428,7 +1484,12 @@ describe("watchme synthesize", () => {
 
     const confirmed = await t.api(route, {
       method: "POST",
-      body: JSON.stringify({ edits: ["steps[1]"], confirm: true, confirmName: "fabric" }),
+      body: JSON.stringify({
+        edits: ["steps[1]"],
+        confirm: true,
+        confirmName: "fabric",
+        expectedRev: listed.body["rev"],
+      }),
     });
     expect(confirmed.body["applied"]).toBe(true);
     expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toContain("Bash");

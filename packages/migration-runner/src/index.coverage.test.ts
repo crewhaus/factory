@@ -30,7 +30,7 @@ function memRegistry(initial: Record<string, Record<string, string>> = {}): Regi
   for (const [name, versions] of Object.entries(initial)) {
     data.set(name, new Map(Object.entries(versions)));
   }
-  // `migrateAll` only ever touches listSpecs/list/get/put; the remaining
+  // `migrateAll` only ever touches listSpecs/list/get/putNew; the remaining
   // RegistryAdapter members are intentionally absent (never called here).
   return {
     data,
@@ -47,6 +47,12 @@ function memRegistry(initial: Record<string, Record<string, string>> = {}): Regi
     },
     async put(name: string, version: string, yaml: string) {
       const m = data.get(name) ?? new Map<string, string>();
+      m.set(version, yaml);
+      data.set(name, m);
+    },
+    async putNew(name: string, version: string, yaml: string) {
+      const m = data.get(name) ?? new Map<string, string>();
+      if (m.has(version)) throw new Error(`${name}@${version} exists`);
       m.set(version, yaml);
       data.set(name, m);
     },

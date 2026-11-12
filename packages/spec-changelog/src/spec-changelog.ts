@@ -252,11 +252,14 @@ export type AutoRegisterResult = {
   readonly version: string;
 };
 
+/** How many version numbers a registration tries before it gives up. */
+const REGISTER_ATTEMPTS = 5;
+
 /**
  * Content-hash gated auto-put: when some stored version already carries this
- * exact content, report `unchanged` (with that version); otherwise `put` the
- * next `vN` and append the distilled changelog entry. The previous-latest
- * version (manifest order) is the diff baseline.
+ * exact content, report `unchanged` (with that version); otherwise create the
+ * next `vN` (never replacing a stored one) and append the distilled changelog
+ * entry. The previous-latest version (manifest order) is the diff baseline.
  */
 export async function autoRegisterSpecVersion(
   opts: AutoRegisterOptions,
@@ -290,8 +293,22 @@ export async function autoRegisterSpecVersion(
     }
   }
 
-  const version = nextVersion(manifest.versions);
-  await opts.registry.put(name, version, opts.yaml);
+  // Each registration creates a version and never replaces one: a version
+  // another writer stored meanwhile is skipped, and the next number is tried.
+  const taken: string[] = [];
+  let version = nextVersion(manifest.versions);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await opts.registry.putNew(name, version, opts.yaml);
+      break;
+    } catch (err) {
+      if ((err as { failure?: unknown }).failure !== "exists" || attempt >= REGISTER_ATTEMPTS) {
+        throw err;
+      }
+      taken.push(version);
+      version = nextVersion([...(await opts.registry.manifest(name)).versions, ...taken]);
+    }
+  }
   appendChangelogEntry({
     registryRootDir: opts.registryRootDir,
     name,

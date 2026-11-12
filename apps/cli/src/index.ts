@@ -1612,6 +1612,7 @@ import { type SessionTailCursor, advanceSessionTail, pickSessionToTail } from ".
 import { runSloProbe } from "./slo-doctor";
 import { makeSloRollback } from "./slo-rollback";
 import { buildSloSink, intakeGatePayload } from "./slo-sink";
+import { commitCliSpec, createSpecFile, exitOnOptimizeConflict, specRev } from "./spec-commit";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -1625,6 +1626,7 @@ import {
   parseExcludeGlobs,
   restoreStateArchive,
 } from "./state-backup";
+import { discloseSurfaceChange } from "./surface-disclosure";
 // v0.3.0 Goal 3 — `doctor --probe`'s thredz check (wiki_stats round-trip
 // through the spec's synthesized/user-declared thredz MCP server).
 import { probeThredz, thredzProbeTarget, thredzProbeToCheck } from "./thredz-probe";
@@ -2521,7 +2523,12 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
   if (args.flags["fix"] === true) {
     const { text: fixedYaml, applied, suggested, skipped } = applyLintFixes(yamlText, resolveTool);
     if (applied.length > 0) {
-      writeFileSync(absSpec, fixedYaml);
+      await commitCliSpec(
+        "lint --fix",
+        absSpec,
+        { kind: "text", text: fixedYaml },
+        { expectedRev: specRev(yamlText), writer: "cli.lint" },
+      );
       for (const line of applied) process.stdout.write(`fixed: ${line}\n`);
       yamlText = fixedYaml;
     }
@@ -2980,7 +2987,8 @@ agent:
     agent's actual behavior, persona, and constraints.
 ${provability !== undefined ? `\n${scaffoldProvabilitySection(provability)}` : ""}`;
     }
-    writeFileSync(targetFile, yamlText);
+    const created = createSpecFile(targetFile, yamlText);
+    if (!created.ok) die(created.reason);
     process.stdout.write(`wrote ${targetFile}\n`);
     writeNewHarnessIdentity(targetDir);
     if (provabilityLevel !== undefined) writeProvabilityNotes(yamlText, provabilityLevel);
@@ -3681,7 +3689,8 @@ async function runInitInteractive(args: ParsedArgs): Promise<void> {
   }
 
   mkdirSync(targetDir, { recursive: true });
-  writeFileSync(targetFile, yaml);
+  const created = createSpecFile(targetFile, yaml);
+  if (!created.ok) die(created.reason);
   process.stdout.write(`wrote ${targetFile}\n`);
   writeNewHarnessIdentity(targetDir);
   // 0.8.0 §11 — whichever path chose a proof floor, say what it still needs.
@@ -4170,6 +4179,9 @@ async function runRun(args: ParsedArgs): Promise<void> {
     if (warning.code !== "tool-config-unused") continue;
     process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
   }
+
+  // Which security settings changed since the last start, named once.
+  discloseSurfaceChange(absSpec, yamlText);
 
   if (ir.target === "cli") return runRunCli(args, ir, specPath);
   if (ir.target === "browser") return runRunBrowser(args, ir);
@@ -5565,7 +5577,9 @@ async function runDev(args: ParsedArgs): Promise<void> {
         "  stops. --once launches one run to completion and exits with its code\n" +
         "  (a credential-free boot check for CI). --debounce sets the change-\n" +
         "  coalescing window in ms (default 150). --plugins <a,b,c> overrides the\n" +
-        '  spec\'s plugins: list compiled into the child (--plugins "" activates none).\n',
+        '  spec\'s plugins: list compiled into the child (--plugins "" activates none).\n' +
+        "  dev reloads every spec change, security settings included, and is for\n" +
+        "  development: run a harness with `crewhaus run` or a compiled build.\n",
     );
     return;
   }
@@ -6782,10 +6796,27 @@ async function runDoctorFix(opts: {
   readonly specPath: string;
   readonly specModel: string | undefined;
 }): Promise<void> {
+  // The spec is written through the revision-checked commit, against the
+  // revision of the text the same fixer read (a scaffold: no spec at all).
+  const specAbs = resolve(opts.specPath);
+  const specReadRev = new Map<string, string>();
   const fixFs: FixFs = {
     exists: (p) => existsSync(p),
-    read: (p) => readFileSync(p, "utf-8"),
-    write: (p, content) => {
+    read: (p) => {
+      const text = readFileSync(p, "utf-8");
+      if (resolve(p) === specAbs) specReadRev.set(specAbs, specRev(text));
+      return text;
+    },
+    write: async (p, content) => {
+      if (resolve(p) === specAbs) {
+        await commitCliSpec(
+          "doctor --fix",
+          specAbs,
+          { kind: "text", text: content },
+          { expectedRev: specReadRev.get(specAbs) ?? "absent", writer: "cli.doctor" },
+        );
+        return;
+      }
       mkdirSync(dirname(p), { recursive: true });
       writeFileSync(p, content);
     },
@@ -6856,7 +6887,7 @@ async function runDoctorFix(opts: {
   }
 
   if (opts.apply) {
-    for (const a of actions) a.apply();
+    for (const a of actions) await a.apply();
   }
   process.stdout.write(`\n${formatFixPlan(actions, opts.apply)}`);
 }
@@ -8045,6 +8076,8 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     // the LAST accepted stage's patch and pass it explicitly, exactly as the
     // single-stage branch does.
     let lastAcceptedPatchJson: string | undefined;
+    // The revision the write-back is checked against: the spec as this run read it.
+    const stagedSourceRev = specRev(readFileSync(optimizeSpecPath, "utf-8"));
     const staged = await runStagedOptimize({
       stages: selectedStages,
       startingYamlPath: optimizeSpecPath,
@@ -8125,9 +8158,10 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       // ONE write-back for the composed result: the accepted stages' patches
       // are already folded into staged.finalYamlPath. The composition + stamp
       // live in ./optimize-stages.ts so this destructive write is unit-tested.
-      writeBackStagedResult({
+      await writeBackStagedResult({
         result: staged,
         targetSpecPath: absSpec,
+        expectedRev: stagedSourceRev,
         runId,
         mutator: mutator ?? "rule-based",
         iterations,
@@ -8148,23 +8182,25 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       );
     }
   } else {
-    const result = await optimizeSpec({
-      specPath: optimizeSpecPath,
-      fitness: makeFitness(undefined),
-      trainSet,
-      devSet,
-      iterations,
-      seed,
-      improvementThreshold,
-      outDir,
-      // Item #54 — the few-shot path is patch-only so the injected examples never
-      // land in the tracked spec (they'd double-inject on the next run).
-      writeBack: writeBack && !fewShotDisablesWriteBack,
-      runId,
-      traceBus,
-      ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
-      ...(budgetUsd !== undefined ? { budgetUsd } : {}),
-    });
+    const result = await exitOnOptimizeConflict("optimize --write-back", () =>
+      optimizeSpec({
+        specPath: optimizeSpecPath,
+        fitness: makeFitness(undefined),
+        trainSet,
+        devSet,
+        iterations,
+        seed,
+        improvementThreshold,
+        outDir,
+        // Item #54 — the few-shot path is patch-only so the injected examples never
+        // land in the tracked spec (they'd double-inject on the next run).
+        writeBack: writeBack && !fewShotDisablesWriteBack,
+        runId,
+        traceBus,
+        ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
+        ...(budgetUsd !== undefined ? { budgetUsd } : {}),
+      }),
+    );
 
     process.stdout.write(
       `[optimize] score: ${result.scoreBefore.toFixed(3)} → ${result.scoreAfter.toFixed(3)} ` +
@@ -8401,7 +8437,12 @@ async function runOptimizeFromAdvice(opts: {
 
   // --write-back: the flywheel applyAccepted conventions — stamped source
   // write, auto-register + changelog, best-effort regression pinning.
-  writeFileSync(opts.absSpec, stamped);
+  await commitCliSpec(
+    "optimize --from-advice --write-back",
+    opts.absSpec,
+    { kind: "text", text: stamped },
+    { expectedRev: specRev(sourceYaml), writer: "cli.optimize" },
+  );
   process.stdout.write(`[optimize] wrote patched YAML to ${opts.absSpec}\n`);
   if (!opts.noRegister) {
     await autoRegisterSpec(stamped, { patchJsonPath: join(adviceDir, "patch.json") });
@@ -9055,7 +9096,12 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       scoreAfter: outcome.scoreAfter,
       iterations: outcome.iterations,
     })}${outcome.patchedYaml}`;
-    writeFileSync(absSpec, stamped);
+    await commitCliSpec(
+      "flywheel run",
+      absSpec,
+      { kind: "text", text: stamped },
+      { expectedRev: specRev(sourceYaml), writer: "cli.flywheel" },
+    );
     process.stdout.write(`[flywheel] wrote patched YAML to ${absSpec}\n`);
     await autoRegisterSpec(stamped, { patchJsonPath: join(outcome.outDir, "patch.json") });
     try {
@@ -11167,7 +11213,12 @@ async function runModelScan(args: ParsedArgs): Promise<void> {
         ["agent", "model"],
         scan.best.candidateModel,
       );
-      writeFileSync(specPath, updated);
+      await commitCliSpec(
+        "model-scan --write",
+        specPath,
+        { kind: "text", text: updated },
+        { expectedRev: specRev(yamlText), writer: "cli.model-scan" },
+      );
       process.stdout.write(
         `[model-scan] --write: applied agent.model = ${scan.best.candidateModel} to ${specPath} (comment-preserving CST edit; review the diff before committing)\n`,
       );
@@ -11800,7 +11851,12 @@ async function runModelRightSize(args: ParsedArgs): Promise<void> {
         report.best.slotPath,
         report.best.modelString,
       );
-      writeFileSync(specPath, updated);
+      await commitCliSpec(
+        "model right-size --write",
+        specPath,
+        { kind: "text", text: updated },
+        { expectedRev: specRev(yamlText), writer: "cli.right-size" },
+      );
       process.stdout.write(
         `[right-size] --write: applied ${report.best.slot} = ${report.best.modelString} to ${specPath} (comment-preserving CST edit; review the diff)\n`,
       );
@@ -20470,7 +20526,12 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
   }
 
   if (write && finalYaml !== undefined && finalYaml !== yamlText) {
-    writeFileSync(absSpec, finalYaml);
+    await commitCliSpec(
+      "upgrade --write",
+      absSpec,
+      { kind: "text", text: finalYaml },
+      { expectedRev: specRev(yamlText), writer: "cli.upgrade" },
+    );
     // Register + changelog the rewritten spec exactly as `compile` does, so
     // `spec log` shows the upgrade as a version rather than a silent edit.
     await autoRegisterSpec(finalYaml);

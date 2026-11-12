@@ -30,7 +30,7 @@
  *   - only the interpreter launch can resume a session; the compiled bundle
  *     cannot, and the Run controls must say so rather than pretend.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { readDeployments } from "@crewhaus/control-records";
 import { readManagerSettings } from "./manager-settings";
@@ -209,12 +209,29 @@ export type BinResolverDeps = {
   readonly exists?: (path: string) => boolean;
   /** PATH lookup; injected in tests. Returns an absolute path or undefined. */
   readonly which?: (cmd: string) => string | undefined;
+  /** Real-path resolution; injected in tests. Throws for a path that does not resolve. */
+  readonly realpath?: (path: string) => string;
+  /**
+   * Whether the harness's own `node_modules/.bin/crewhaus` may be used. Default
+   * true. Home passes false for its jobs on a harness not adopted on this
+   * machine, so they run Home's own `crewhaus`.
+   */
+  readonly allowHarnessLocal?: boolean;
 };
+
+/** `inner` resolves inside `root` (both real paths), by the `relative()` rule. */
+function realInside(root: string, inner: string): boolean {
+  const rel = relative(root, inner);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
 
 /**
  * Resolve a runnable `crewhaus` CLI: the harness's OWN
  * `node_modules/.bin/crewhaus` first (version-matched to the harness's
  * dependencies — the mixed-version fleet is the normal case), then PATH.
+ * The harness's own copy is used only when its real path is inside the
+ * harness's real directory; one that resolves anywhere else is passed over
+ * for the `crewhaus` on PATH.
  * undefined ⇒ no interpreter launch is available, so the compiled bundle is
  * the only path and resume is impossible.
  */
@@ -223,8 +240,17 @@ export function resolveCrewhausBin(
   deps: BinResolverDeps = {},
 ): string | undefined {
   const exists = deps.exists ?? existsSync;
-  const local = join(harnessRoot, "node_modules", ".bin", "crewhaus");
-  if (exists(local)) return local;
+  const realpath = deps.realpath ?? realpathSync;
+  if (deps.allowHarnessLocal !== false) {
+    const local = join(harnessRoot, "node_modules", ".bin", "crewhaus");
+    if (exists(local)) {
+      try {
+        if (realInside(realpath(harnessRoot), realpath(local))) return local;
+      } catch {
+        // A local bin that does not resolve is not one to run.
+      }
+    }
+  }
   const which = deps.which ?? defaultWhich;
   return which("crewhaus");
 }

@@ -22,6 +22,7 @@
 import { api } from "../api.js";
 import { clear, collapsible, dot, el, emptyState, mdBlocks, skeleton, toast } from "../dom.js";
 import { fmtCount, fmtPct, fmtRelativeTime } from "../util.js";
+import { openConflict } from "./spec-edit.js";
 
 /** The per-harness Feedback tab. */
 export async function renderFeedback(root, ctx) {
@@ -155,8 +156,17 @@ function refusalText(res) {
   return raw || `HTTP ${String(res.status)}`;
 }
 
-async function fire(fn, params, body, okMessage, reload) {
+/**
+ * One write, reported. A 412 that carries the server's current state opens
+ * the same conflict view the spec editor uses (`conflict` adds the opener and
+ * how to re-apply), so a refused spec write is never just a toast.
+ */
+async function fire(fn, params, body, okMessage, reload, conflict = null) {
   const res = await call(fn, params, body);
+  if (res.status === 412 && res.body?.current && typeof res.body.current === "object") {
+    openConflict(res.body.current, okMessage, { reload, done: reload, ...(conflict ?? {}) });
+    return res;
+  }
   if (!res.ok) {
     toast(refusalText(res), "error");
     return res;
@@ -477,12 +487,20 @@ function proposalRow(ctx, proposal, reload) {
     });
     apply.addEventListener("click", async () => {
       apply.disabled = true;
+      const params = { id: ctx.id, adviceId: String(proposal.adviceId) };
+      // The revision the preview read: the write is checked against it.
       await fire(
         api.adviceApply,
-        { id: ctx.id, adviceId: String(proposal.adviceId) },
-        { confirm: true },
+        params,
+        { confirm: true, expectedRev: String(data.rev ?? "") },
         "Applied to crewhaus.yaml",
         reload,
+        {
+          // The draft the server kept is what "Download my draft" saves.
+          id: ctx.id,
+          opener: previewBtn,
+          retry: (rev) => call(api.adviceApply, params, { confirm: true, expectedRev: rev }),
+        },
       );
       apply.disabled = false;
     });

@@ -394,7 +394,7 @@ export async function applyThredz(ctx: SetupContext): Promise<ThredzOutcome> {
   // space created in the operator's account that the harness can never be
   // pointed at, and on an individual key that is not recoverable: a key owns
   // at most one individual space, ever. Check first, create second.
-  assertSpecCanHoldSpace(target.specPath);
+  await assertSpecCanHoldSpace(target.specPath);
 
   await verifyKey(auth, deps);
   io.info("Thredz key verified");
@@ -422,7 +422,7 @@ export async function applyThredz(ctx: SetupContext): Promise<ThredzOutcome> {
     },
   ];
 
-  const edit = setThredzSpace(target.specPath, space.slug);
+  const edit = await setThredzSpace(target.specPath, space.slug);
   changes.push({
     service: "thredz",
     summary: `${edit.file}: thredz.space = "${space.slug}"`,
@@ -440,12 +440,12 @@ export async function applyThredz(ctx: SetupContext): Promise<ThredzOutcome> {
  * real slug is not known until the space exists — and the refusals are all
  * about the SHAPE of the `thredz:` block, never about the value.
  */
-function assertSpecCanHoldSpace(specPath: string): void {
+async function assertSpecCanHoldSpace(specPath: string): Promise<void> {
   const preview = previewThredzSpace(specPath, SPACE_PROBE_SLUG);
   if (preview.startsWith("cannot set thredz.space")) {
     // Re-raise through the real writer so the message and its `fix:` are the
     // ones the operator would otherwise have seen, with nothing invented here.
-    setThredzSpace(specPath, SPACE_PROBE_SLUG);
+    await setThredzSpace(specPath, SPACE_PROBE_SLUG);
   }
 }
 

@@ -7,20 +7,23 @@
  * the way `thredz.api_key` does. Everything else setup learns is a secret and
  * goes to `.env`.
  *
- * `@crewhaus/spec-patch` is the repo's YAML write-back tool and is
- * deliberately NOT used here: its `OPTIMIZABLE_PATHS` excludes the
- * `["thredz"]` prefix precisely so that `optimize --write-back` and the
- * Hangar spec editor can never rewrite anything under it. Reaching past that
- * guard from a library would weaken it for every other caller. Instead this
- * module edits the `yaml` Document directly — the same CST-preserving
- * mechanism spec-patch uses — and touches one documented key.
+ * `@crewhaus/spec-patch`'s edit API is deliberately NOT used here: its
+ * `OPTIMIZABLE_PATHS` excludes the `["thredz"]` prefix precisely so that
+ * `optimize --write-back` and the Hangar spec editor can never rewrite
+ * anything under it. Reaching past that guard from a library would weaken it
+ * for every other caller. Instead this module edits the `yaml` Document
+ * directly — the same CST-preserving mechanism spec-patch uses — and touches
+ * one documented key. The file itself is written through spec-patch's commit
+ * helper, like every other spec write: checked against the revision of the
+ * text this module read, with YAML syntax as the only validation.
  *
  * A spec author who inlined a literal `thredz.api_key` gets no help from this
  * module: setup refuses to add a space beside a plaintext credential, matching
  * Hangar's refusal to proxy such a spec at all.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { basename } from "node:path";
+import { commitSpec, parseYamlOnly, specRev } from "@crewhaus/spec-patch/commit";
 import { type Document, type YAMLMap, isMap, parseDocument } from "yaml";
 import { ServiceSetupError } from "./types";
 
@@ -43,8 +46,9 @@ export type SpecEditResult = {
  * ask for) or when the block is one of the shorthand forms, since collapsing
  * `thredz: $KEY` into a map would silently restructure the author's spec.
  */
-export function setThredzSpace(specPath: string, slug: string): SpecEditResult {
-  const doc = parseDocument(readFileSync(specPath, "utf8"));
+export async function setThredzSpace(specPath: string, slug: string): Promise<SpecEditResult> {
+  const text = readFileSync(specPath, "utf8");
+  const doc = parseDocument(text);
   const file = basename(specPath);
   const verdict = inspectThredzSpace(doc, file, slug);
 
@@ -56,7 +60,30 @@ export function setThredzSpace(specPath: string, slug: string): SpecEditResult {
   }
 
   verdict.block.set("space", slug);
-  writeFileSync(specPath, String(doc), "utf8");
+  const committed = await commitSpec(
+    { specPath },
+    { kind: "text", text: String(doc) },
+    {
+      expectedRev: specRev(text),
+      writer: "service-setup",
+      actor: { kind: "person" },
+      parse: parseYamlOnly,
+    },
+  );
+  if (!committed.ok) {
+    throw new ServiceSetupError(
+      "harness",
+      committed.code === "conflict"
+        ? `${file} changed while setup was editing it, so thredz.space was not written`
+        : `${file} was not written: ${committed.reason}`,
+      {
+        fix:
+          committed.draft !== undefined
+            ? `re-run setup; the edit is kept as a draft at ${committed.draft.path}`
+            : "re-run setup",
+      },
+    );
+  }
   return { file, path: "thredz.space", outcome: "set", value: slug };
 }
 

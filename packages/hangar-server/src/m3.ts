@@ -123,6 +123,9 @@ export type M3Context = {
   /** The harness's live directory, or null on a fleet-wide route. Present
    *  implies it exists (a vanished dir 404s before the handler runs). */
   readonly harnessDir: string | null;
+  /** True when the harness is adopted on this machine (`isAdopted` over its
+   *  registry row). Only an adopted harness's own code checks its spec. */
+  readonly adopted: boolean;
   /** Validated `:param` values from the path. */
   readonly params: M3Params;
   /** The request's query string. Never carries anything credential-shaped. */

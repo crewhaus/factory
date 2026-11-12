@@ -20,9 +20,18 @@
  * literal is built from string parts at runtime.
  */
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { DELTA_090_KEYS } from "@crewhaus/spec-patch";
+import { specRev } from "@crewhaus/spec-patch/commit";
 import {
   lintMcpEnv,
   looksLikeCredential,
@@ -537,6 +546,8 @@ function specHarness(t: TestServer, name: string, yaml = VALID_SPEC): string {
 }
 
 const post = (body: unknown): RequestInit => ({ method: "POST", body: JSON.stringify(body) });
+/** The revision of the spec on disk: what a client that just read it sends as `expectedRev`. */
+const revOf = (dir: string): string => specRev(readFileSync(join(dir, "crewhaus.yaml"), "utf8"));
 const put = (body: unknown): RequestInit => ({ method: "PUT", body: JSON.stringify(body) });
 
 describe("the structured editor", () => {
@@ -549,10 +560,12 @@ describe("the structured editor", () => {
       expect(status).toBe(200);
       expect(body["present"]).toBe(true);
       expect(body["target"]).toBe("cli");
-      // No node_modules in the fixture ⇒ the manager's copy answers, and the
+      // Not adopted on this machine ⇒ the manager's copy answers, and the
       // badge says so rather than pretending the harness's schema was used.
       expect(body["schemaSource"]).toBe("manager");
-      expect(String(body["note"])).toContain("@crewhaus/spec");
+      expect(String(body["note"])).toContain("Adopt the harness");
+      expect(body["rev"]).toBe(revOf(dir));
+      expect(body["hash"]).toBe(body["rev"]);
       const effective = body["effective"] as Array<{ path: string; source: string }>;
       expect(effective.find((r) => r.path === "agent.model")?.source).toBe("declared");
       expect(body["declaredCount"]).toBeGreaterThan(0);
@@ -609,7 +622,10 @@ describe("the structured editor", () => {
       const id = await register(t, dir);
       const { status, body } = await t.api(
         `/api/h/${id}/spec/patch`,
-        post({ edit: { path: "agent.instructions", value: "Be extremely brief." } }),
+        post({
+          edit: { path: "agent.instructions", value: "Be extremely brief." },
+          expectedRev: revOf(dir),
+        }),
       );
       expect(status).toBe(200);
       expect(body["ok"]).toBe(true);
@@ -631,7 +647,7 @@ describe("the structured editor", () => {
       const before = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
       const { status, body } = await t.api(
         `/api/h/${id}/spec`,
-        put({ edits: [{ path: "permissions.mode", value: "bypass" }] }),
+        put({ edits: [{ path: "permissions.mode", value: "bypass" }], expectedRev: revOf(dir) }),
       );
       expect(status).toBe(409);
       expect(String(body["error"])).toContain("permissions.mode");
@@ -650,7 +666,10 @@ describe("the structured editor", () => {
       const before = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
       const { status, body } = await t.api(
         `/api/h/${id}/spec`,
-        put({ edits: [{ path: "intent.purpose", value: "Keep it fast." }] }),
+        put({
+          edits: [{ path: "intent.purpose", value: "Keep it fast." }],
+          expectedRev: revOf(dir),
+        }),
       );
       expect(status).toBe(409);
       expect(String(body["error"])).toContain("intent.purpose");
@@ -670,6 +689,7 @@ describe("the structured editor", () => {
         put({
           edits: [{ path: "intent.purpose", value: "Keep it fast." }],
           confirmName: "spec-edit-fixture",
+          expectedRev: revOf(dir),
         }),
       );
       expect(status).toBe(200);
@@ -690,6 +710,7 @@ describe("the structured editor", () => {
         put({
           edits: [{ path: "permissions.mode", value: "auto" }],
           confirmName: "spec-edit-fixture",
+          expectedRev: revOf(dir),
         }),
       );
       expect(status).toBe(200);
@@ -707,7 +728,11 @@ describe("the structured editor", () => {
       const id = await register(t, dir);
       const { status } = await t.api(
         `/api/h/${id}/spec`,
-        put({ edits: [{ path: "permissions.mode", value: "auto" }], confirmName: "not-the-name" }),
+        put({
+          edits: [{ path: "permissions.mode", value: "auto" }],
+          confirmName: "not-the-name",
+          expectedRev: revOf(dir),
+        }),
       );
       expect(status).toBe(409);
       expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toContain("mode: default");
@@ -716,17 +741,132 @@ describe("the structured editor", () => {
     }
   });
 
-  test("a stale expectedHash refuses instead of overwriting a spec that moved", async () => {
+  test("a write without the revision it loaded is answered 428", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "no-rev");
+      const id = await register(t, dir);
+      const before = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
+      const { status, body } = await t.api(
+        `/api/h/${id}/spec`,
+        put({ edits: [{ path: "agent.instructions", value: "x" }] }),
+      );
+      expect(status).toBe(428);
+      expect(String(body["error"])).toContain("expectedRev");
+      expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a stale revision is answered 412 with the current revision, the diff and a readable draft", async () => {
     const t = boot();
     try {
       const dir = specHarness(t, "stale");
       const id = await register(t, dir);
+      const edits = [{ path: "agent.instructions", value: "Mine." }];
       const { status, body } = await t.api(
         `/api/h/${id}/spec`,
-        put({ edits: [], expectedHash: "sha256:0000" }),
+        put({ edits, expectedRev: specRev("name: something-else\n") }),
       );
-      expect(status).toBe(409);
-      expect(String(body["error"])).toContain("changed on disk");
+      expect(status).toBe(412);
+      const current = body["current"] as { rev: string; diff: string; draftId: string };
+      expect(current.rev).toBe(revOf(dir));
+      expect(current.diff).toContain("agent.instructions");
+      expect(current.draftId).toMatch(/^\d{8}T\d{6}Z-[0-9a-f]{8}$/);
+      expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(VALID_SPEC);
+      const draft = await t.api(`/api/h/${id}/spec/drafts/${current.draftId}`);
+      expect(draft.status).toBe(200);
+      expect(draft.body["edits"]).toEqual([{ path: ["agent", "instructions"], value: "Mine." }]);
+      expect(String(draft.body["diff"])).toContain("agent.instructions");
+      expect(draft.body["currentRev"]).toBe(revOf(dir));
+      for (const bad of ["..%2Fx", "20261112T120000Z-0000aaaa", "x".repeat(40)]) {
+        expect((await t.api(`/api/h/${id}/spec/drafts/${bad}`)).status).toBe(404);
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a kept draft never serves a value written under a credential setting", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "draft-mask");
+      const id = await register(t, dir);
+      // Not credential-shaped on its own: only the setting it is written under says it is one.
+      const planted = ["hunter", "2plain", "value"].join("");
+      const { status, body } = await t.api(
+        `/api/h/${id}/spec`,
+        put({
+          edits: [{ path: ["mcp_servers", "files", "env", "API_KEY"], value: planted }],
+          confirmName: "spec-edit-fixture",
+          expectedRev: specRev("name: something-else\n"),
+        }),
+      );
+      expect(status).toBe(412);
+      expect(JSON.stringify(body)).not.toContain(planted);
+      const draftId = (body["current"] as { draftId: string }).draftId;
+      const draft = await t.api(`/api/h/${id}/spec/drafts/${draftId}`);
+      expect(draft.status).toBe(200);
+      expect(draft.body["edits"]).toEqual([
+        { path: ["mcp_servers", "files", "env", "API_KEY"], value: "[redacted]" },
+      ]);
+      expect(JSON.stringify(draft.body)).not.toContain(planted);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a draft is read only from inside the harness: a linked drafts directory answers 404", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "draft-link");
+      const id = await register(t, dir);
+      const outside = join(t.workspace, "outside-drafts");
+      mkdirSync(outside, { recursive: true });
+      const draftId = "20261112T120000Z-0000aaaa";
+      writeFileSync(
+        join(outside, `${draftId}.json`),
+        JSON.stringify({ v: 1, at: "2026-11-12T12:00:00.000Z", text: "name: planted\n" }),
+      );
+      const state = join(dir, ".crewhaus", "run", "spec");
+      mkdirSync(state, { recursive: true });
+      symlinkSync(outside, join(state, "drafts"));
+      const draft = await t.api(`/api/h/${id}/spec/drafts/${draftId}`);
+      expect(draft.status).toBe(404);
+      expect(JSON.stringify(draft.body)).not.toContain("planted");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a change on disk between the read and the save is refused; the new revision then saves and records a version", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "interleave");
+      const specPath = join(dir, "crewhaus.yaml");
+      const id = await register(t, dir);
+      const loaded = await t.api(`/api/h/${id}/spec/schema`);
+      const loadedRev = String(loaded.body["rev"]);
+      // Someone edits the file on disk after the editor loaded it.
+      const edited = VALID_SPEC.replace("max_tokens: 4096", "max_tokens: 4000");
+      writeFileSync(specPath, edited);
+      const edit = { path: "agent.instructions", value: "Be brief." };
+      const stale = await t.api(`/api/h/${id}/spec/patch`, post({ edit, expectedRev: loadedRev }));
+      expect(stale.status).toBe(412);
+      expect(readFileSync(specPath, "utf8")).toBe(edited);
+      const fresh = (stale.body["current"] as { rev: string }).rev;
+      const saved = await t.api(`/api/h/${id}/spec/patch`, post({ edit, expectedRev: fresh }));
+      expect(saved.status).toBe(200);
+      expect(saved.body["wrote"]).toBe(true);
+      expect(saved.body["registered"]).toBe("v1");
+      expect(readFileSync(specPath, "utf8")).toContain("max_tokens: 4000");
+      const again = await t.api(
+        `/api/h/${id}/spec/patch`,
+        post({ edit, expectedRev: String(saved.body["rev"]) }),
+      );
+      expect(again.status).toBe(200);
+      expect(again.body["wrote"]).toBe(false);
     } finally {
       await t.stop();
     }
@@ -768,7 +908,10 @@ describe("the structured editor", () => {
       const id = await register(t, dir);
       const { status } = await t.api(
         `/api/h/${id}/spec/patch`,
-        post({ edit: { path: "agent.instructions", value: "Be extremely brief." } }),
+        post({
+          edit: { path: "agent.instructions", value: "Be extremely brief." },
+          expectedRev: revOf(dir),
+        }),
       );
       expect(status).toBe(200);
       // The write is tmp+rename, and rename replaces the INODE: a hardcoded
@@ -788,7 +931,7 @@ describe("the structured editor", () => {
       const before = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
       const { status, body } = await t.api(
         `/api/h/${id}/spec/patch`,
-        post({ edit: { path: "agent.max_tokens", value: -5 } }),
+        post({ edit: { path: "agent.max_tokens", value: -5 }, expectedRev: revOf(dir) }),
       );
       expect(status).toBe(200);
       expect(body["ok"]).toBe(false);
@@ -963,7 +1106,10 @@ describe("the security surfaces the optimizer may also tune", () => {
         { path: "chains.0.rpcUrls", value: ["https://rpc.invalid/v1"] },
         { path: "security.justification.judge", value: "claude" },
       ]) {
-        const { status, body } = await t.api(`/api/h/${id}/spec/patch`, post({ edit }));
+        const { status, body } = await t.api(
+          `/api/h/${id}/spec/patch`,
+          post({ edit, expectedRev: revOf(dir) }),
+        );
         expect(`${edit.path}:${status}`).toBe(`${edit.path}:409`);
         expect(`${edit.path}:${String(body["error"])}`).toContain(edit.path);
       }
@@ -976,6 +1122,7 @@ describe("the security surfaces the optimizer may also tune", () => {
         post({
           edit: { path: "transaction_policy.simulationRequired", value: false },
           confirmName: "spec-edit-fixture",
+          expectedRev: revOf(dir),
         }),
       );
       expect(confirmed.status).toBe(200);
@@ -1364,6 +1511,7 @@ describe("builders", () => {
       expect(String(preview.body["diff"])).toContain("mcp_servers");
       expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).not.toContain("mcp_servers");
 
+      expect(preview.body["rev"]).toBe(revOf(dir));
       const applied = await t.api(
         `/api/h/${id}/builders/mcp`,
         post({
@@ -1372,6 +1520,7 @@ describe("builders", () => {
           args: ["-y", "some-server"],
           dryRun: false,
           confirmName: "spec-edit-fixture",
+          expectedRev: preview.body["rev"],
         }),
       );
       expect(applied.body["ok"]).toBe(true);
@@ -1381,9 +1530,14 @@ describe("builders", () => {
       const plan = await t.api(`/api/h/${id}/builders/mcp/files`, { method: "DELETE" });
       expect(plan.body["dryRun"]).toBe(true);
       expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toContain("mcp_servers:");
-      const removed = await t.api(`/api/h/${id}/builders/mcp/files?confirmName=spec-edit-fixture`, {
+      const noRev = await t.api(`/api/h/${id}/builders/mcp/files?confirmName=spec-edit-fixture`, {
         method: "DELETE",
       });
+      expect(noRev.status).toBe(428);
+      const removed = await t.api(
+        `/api/h/${id}/builders/mcp/files?confirmName=spec-edit-fixture&expectedRev=${encodeURIComponent(String(plan.body["rev"]))}`,
+        { method: "DELETE" },
+      );
       expect(removed.body["ok"]).toBe(true);
       expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).not.toContain("mcp_servers:");
     } finally {
@@ -1610,7 +1764,10 @@ describe("a whole step on the editor", () => {
         { path: "steps.0", value: step },
         { path: "steps", value: [step] },
       ]) {
-        const { status, body } = await t.api(`/api/h/${id}/spec/patch`, post({ edit }));
+        const { status, body } = await t.api(
+          `/api/h/${id}/spec/patch`,
+          post({ edit, expectedRev: revOf(dir) }),
+        );
         expect(`${edit.path}:${status}`).toBe(`${edit.path}:409`);
         expect(`${edit.path}:${String(body["error"])}`).toContain(edit.path);
       }
@@ -1618,7 +1775,10 @@ describe("a whole step on the editor", () => {
 
       const field = await t.api(
         `/api/h/${id}/spec/patch`,
-        post({ edit: { path: "steps.0.instructions", value: "Draft it carefully." } }),
+        post({
+          edit: { path: "steps.0.instructions", value: "Draft it carefully." },
+          expectedRev: revOf(dir),
+        }),
       );
       expect(field.status).toBe(200);
       expect(readFileSync(specPath, "utf8")).toContain("Draft it carefully.");
@@ -1626,7 +1786,11 @@ describe("a whole step on the editor", () => {
       // The typed confirmation carries the whole step.
       const confirmed = await t.api(
         `/api/h/${id}/spec/patch`,
-        post({ edit: { path: "steps.0", value: step }, confirmName: "spec-edit-fixture" }),
+        post({
+          edit: { path: "steps.0", value: step },
+          confirmName: "spec-edit-fixture",
+          expectedRev: revOf(dir),
+        }),
       );
       expect(confirmed.status).toBe(200);
       expect(readFileSync(specPath, "utf8")).toContain("Bash");

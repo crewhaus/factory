@@ -40,6 +40,7 @@ import { compile, lower, parseSpec } from "@crewhaus/compiler";
 import type { IrNode } from "@crewhaus/ir";
 import { formatWriteBackHeader } from "@crewhaus/spec-patch";
 import { EvalBridgeError, projectEvalIr, selectInvoker } from "./eval-bridge";
+import { type CliCommitDeps, commitCliSpec } from "./spec-commit";
 
 export class BridgedCandidateError extends Error {
   override readonly name = "BridgedCandidateError";
@@ -373,6 +374,10 @@ export type StagedWriteBackOptions<S extends OptimizableStageLike = OptimizableS
   readonly result: Pick<StagedOptimizeResult<S>, "perStage" | "acceptedCount" | "finalYamlPath">;
   /** The tracked spec being overwritten (absolute). */
   readonly targetSpecPath: string;
+  /** The revision of the spec this run started from; a spec changed since is never overwritten. */
+  readonly expectedRev: string;
+  /** Test seam: how a refused write reports and exits. */
+  readonly commitDeps?: CliCommitDeps;
   readonly runId: string;
   /** Mutator name as the operator selected it (`rule-based` when unset). */
   readonly mutator: string;
@@ -404,10 +409,14 @@ export type StagedWriteBackResult = {
  * Callers must not invoke this when `acceptedCount === 0`: with nothing
  * accepted `finalYamlPath` is the untouched starting spec, and stamping it
  * would rewrite a tracked file to say an optimization landed when none did.
+ *
+ * The write goes through the spec commit helper, checked against
+ * `expectedRev`: a spec changed after the run read it is left as it is, the
+ * result is kept as a draft and the command exits 53.
  */
-export function writeBackStagedResult<S extends OptimizableStageLike>(
+export async function writeBackStagedResult<S extends OptimizableStageLike>(
   opts: StagedWriteBackOptions<S>,
-): StagedWriteBackResult {
+): Promise<StagedWriteBackResult> {
   const accepted = opts.result.perStage.filter((p) => p.outcome.applied);
   if (accepted.length === 0) {
     throw new BridgedCandidateError(
@@ -427,6 +436,12 @@ export function writeBackStagedResult<S extends OptimizableStageLike>(
     ...(opts.timestamp !== undefined ? { timestamp: opts.timestamp } : {}),
   });
   const written = `${header}${composed}`;
-  writeFileSync(resolve(opts.targetSpecPath), written);
+  await commitCliSpec(
+    "optimize --write-back",
+    resolve(opts.targetSpecPath),
+    { kind: "text", text: written },
+    { expectedRev: opts.expectedRev, writer: "cli.optimize" },
+    opts.commitDeps,
+  );
   return { written, header, acceptedStages };
 }

@@ -80,22 +80,22 @@ describe("the overlay filesystem", () => {
     expect(() => fs.read("big.yaml")).toThrow(/4096 bytes, over the 1024 limit/);
   });
 
-  it("commits captured writes in order, creating a captured directory first", () => {
+  it("commits captured writes in order, creating a captured directory first", async () => {
     const fs = createOverlayFs("T");
     fs.mkdirp("state");
     fs.write("state/notes.txt", "hello");
-    const result = commitWrites("T", fs.captured());
+    const result = await commitWrites("T", fs.captured());
     console.log(`COMMIT ${JSON.stringify(result)}`);
     expect(result.error).toBeUndefined();
     expect(readFileSync(join(workspace, "state", "notes.txt"), "utf8")).toBe("hello");
     expect(result.committed.map((c) => c.path)).toEqual(["state", "state/notes.txt"]);
   });
 
-  it("refuses the whole commit when a destination directory is missing, writing nothing", () => {
+  it("refuses the whole commit when a destination directory is missing, writing nothing", async () => {
     const fs = createOverlayFs("T");
     fs.write("first.txt", "a");
     fs.write("missing/second.txt", "b");
-    const result = commitWrites("T", fs.captured());
+    const result = await commitWrites("T", fs.captured());
     console.log(`COMMIT_REFUSED ${JSON.stringify(result)}`);
     // The reason, and the fact that the FIRST write did not land either.
     expect(result.committed).toEqual([]);
@@ -103,10 +103,10 @@ describe("the overlay filesystem", () => {
     expect(() => readFileSync(join(workspace, "first.txt"), "utf8")).toThrow();
   });
 
-  it("reports bytes in UTF-8, not UTF-16 code units", () => {
+  it("reports bytes in UTF-8, not UTF-16 code units", async () => {
     const fs = createOverlayFs("T");
     fs.write("a.txt", "héllo");
-    const result = commitWrites("T", fs.captured());
+    const result = await commitWrites("T", fs.captured());
     expect(result.committed[0]?.bytes).toBe(6);
   });
 });

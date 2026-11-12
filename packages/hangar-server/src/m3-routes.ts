@@ -174,6 +174,7 @@ import {
 } from "./security-ops";
 import {
   specDiff,
+  specDraft,
   specEdit,
   specPatch,
   specPin,
@@ -335,6 +336,7 @@ export const M3_ROUTES: readonly M3Route[] = [
   route("specPin", "POST", "/api/h/:id/spec/pin", "spec", specPin),
   route("specRollback", "POST", "/api/h/:id/spec/rollback", "spec", specRollback),
   route("specPropose", "POST", "/api/h/:id/spec/propose", "spec", specPropose),
+  route("specDraft", "GET", "/api/h/:id/spec/drafts/:draft", "spec", specDraft),
   route("wizardTemplates", "GET", "/api/builders/templates", "spec", wizardTemplates),
   route("wizardCreate", "POST", "/api/builders/spec", "spec", wizardCreate),
   route("mcpCatalog", "GET", "/api/builders/mcp-catalog", "spec", mcpCatalog),
