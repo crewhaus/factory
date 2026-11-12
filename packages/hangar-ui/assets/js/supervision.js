@@ -1368,9 +1368,26 @@ export function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
-/** A value, single-quoted; its placeholder, unquoted, when it is missing. */
+/**
+ * A C0 or C1 control character, or DEL. A value holding one is never put into
+ * a command-line equivalent: the line would not read as it runs.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
+const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f-\u009f]/;
+
+/** True when `value` can be shown in a command-line equivalent at all. */
+export function twinSafe(value) {
+  return !CONTROL_CHAR_RE.test(String(value));
+}
+
+/**
+ * A value, single-quoted; its placeholder, unquoted, when it is missing or
+ * holds a control character.
+ */
 function quotedOr(value, placeholder) {
-  return value === undefined || value === null || value === "" ? placeholder : shellQuote(value);
+  return value === undefined || value === null || value === "" || !twinSafe(value)
+    ? placeholder
+    : shellQuote(value);
 }
 
 /** The `crewhaus` argv each job kind runs — mirrors the server's `jobArgv`. */
@@ -1404,8 +1421,9 @@ export const TWIN_ACTIONS = [
  * two heads (CLI and console) drive the same state tree.
  *
  * Every value it carries is single-quoted ({@link shellQuote}); fixed words
- * are not, and a value it was not given renders as its `<placeholder>`. With
- * a `dir`, the command starts `cd '<dir>' &&`, so it runs in that harness.
+ * are not, and a value it was not given, or one holding a control character,
+ * renders as its `<placeholder>`. With a `dir`, the command starts
+ * `cd '<dir>' &&`, so it runs in that harness.
  *
  * Returns null where no CLI verb exists yet; the caller renders the honest
  * note from {@link NO_TWIN_NOTES} instead of inventing a command.
@@ -1413,7 +1431,7 @@ export const TWIN_ACTIONS = [
 export function cliTwinFor(action, args = {}) {
   const a = args && typeof args === "object" ? args : {};
   const dir = typeof a.dir === "string" && a.dir !== "" ? a.dir : null;
-  const prefix = dir !== null ? ["cd", shellQuote(dir), "&&"] : [];
+  const prefix = dir !== null ? ["cd", quotedOr(dir, "<dir>"), "&&"] : [];
   const at = (words) => [...prefix, "crewhaus", ...words].join(" ");
   switch (action) {
     case "start": {
@@ -1424,7 +1442,7 @@ export function cliTwinFor(action, args = {}) {
         "daemon",
         "start",
         ...(a.force === true ? ["--force"] : []),
-        ...(ack.length > 0 ? ["--ack", shellQuote(ack.join(","))] : []),
+        ...(ack.length > 0 ? ["--ack", quotedOr(ack.join(","), "<ids>")] : []),
       ]);
     }
     case "stop":
@@ -1439,7 +1457,9 @@ export function cliTwinFor(action, args = {}) {
       return at([
         "daemon",
         "logs",
-        ...(a.runId !== undefined && a.runId !== null ? ["--run", shellQuote(a.runId)] : []),
+        ...(a.runId !== undefined && a.runId !== null && a.runId !== ""
+          ? ["--run", quotedOr(a.runId, "<run>")]
+          : []),
         "--follow",
       ]);
     case "grant":

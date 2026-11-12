@@ -171,14 +171,18 @@ function reviewCard(row, { perform }) {
       { class: "inbox-twins" },
       row.verdicts.map((verdict) =>
         verdict === "up" || verdict === "down"
-          ? actionTwin("adjudicate", {
-              dir: row.dir,
-              id: row.id,
-              sessionId: row.sessionId,
-              turn: row.turn,
+          ? actionTwin(
+              "adjudicate",
+              {
+                dir: row.dir,
+                id: row.id,
+                sessionId: row.sessionId,
+                turn: row.turn,
+                verdict,
+              },
               verdict,
-            })
-          : actionTwin("review", { dir: row.dir, id: row.id, verdict }),
+            )
+          : actionTwin("review", { dir: row.dir, id: row.id, verdict }, verdict),
       ),
     ),
     Object.keys(row.sourceRef).length > 0

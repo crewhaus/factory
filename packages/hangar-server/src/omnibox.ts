@@ -32,12 +32,12 @@
  */
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { shellQuote } from "@crewhaus/harness-supervisor";
 import { MAX_JSONL_LINES, SAFE_SEGMENT_RE, SESSION_JSON_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
 import { resolveInside } from "./safety";
 import { resolveSessionRoot } from "./sessions";
 import { liveWikiSegments } from "./store-layout";
+import { twinWord } from "./twin-word";
 
 /** What an omnibox row IS — the kind drives its icon and its deep link. */
 export const OMNI_KINDS = [
@@ -182,8 +182,9 @@ export function rankEntries(
  * near-miss — every verb throws on it. And the path is SHELL-QUOTED, the way
  * M2's own twins are (`shutdownReportLines`, `spawn-contracts`): an unquoted
  * `/srv/my harnesses/poly` splits into two arguments and targets the wrong
- * directory. `apps/cli/src/cli-twins.test.ts` checks every twin against the
- * CLI's own verb inventory.
+ * directory. A directory holding a control character shows as `<dir>`.
+ * `apps/cli/src/cli-twins.test.ts` checks every twin against the CLI's own
+ * verb inventory.
  */
 const ACTION_VERBS: ReadonlyArray<{
   readonly verb: string;
@@ -194,25 +195,25 @@ const ACTION_VERBS: ReadonlyArray<{
   {
     verb: "start",
     route: "procStart",
-    cli: (dir) => `crewhaus daemon start ${shellQuote(dir)}`,
+    cli: (dir) => `crewhaus daemon start ${twinWord(dir, "<dir>")}`,
     label: (name) => `Start ${name}`,
   },
   {
     verb: "stop",
     route: "procStop",
-    cli: (dir) => `crewhaus daemon stop ${shellQuote(dir)}`,
+    cli: (dir) => `crewhaus daemon stop ${twinWord(dir, "<dir>")}`,
     label: (name) => `Stop ${name}`,
   },
   {
     verb: "restart",
     route: "procRestart",
-    cli: (dir) => `crewhaus daemon restart ${shellQuote(dir)}`,
+    cli: (dir) => `crewhaus daemon restart ${twinWord(dir, "<dir>")}`,
     label: (name) => `Restart ${name}`,
   },
   {
     verb: "drain",
     route: "procDrain",
-    cli: (dir) => `crewhaus daemon drain ${shellQuote(dir)}`,
+    cli: (dir) => `crewhaus daemon drain ${twinWord(dir, "<dir>")}`,
     label: (name) => `Drain ${name}`,
   },
 ];

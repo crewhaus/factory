@@ -186,7 +186,7 @@ const STORE_DEFS: Readonly<Record<InspectStore, StoreDef>> = {
     kind: "file",
     segments: [".crewhaus", "identity.json"],
     what: "the Ed25519 agent identity whose fingerprint stamps every trace envelope and audit record",
-    verb: "crewhaus run",
+    verb: "crewhaus run crewhaus.yaml",
   },
   meta: {
     kind: "file",

@@ -266,7 +266,12 @@ describe("the ratings browser", () => {
     const t = boot();
     const id = await register(t, loopHarness(t));
     const plain = await t.api(`/api/h/${id}/feedback/distill`, { method: "POST", body: "{}" });
-    expect(plain.body["argv"]).toEqual(["distill"]);
+    const out = ["-o", ".crewhaus/distilled/ratings.jsonl"];
+    const graders = ["--graders-out", ".crewhaus/distilled/graders.yaml"];
+    expect(plain.body["argv"]).toEqual(["distill", "--all-sessions", ...out, ...graders]);
+    expect(plain.body["verb"]).toBe(
+      "crewhaus 'distill' '--all-sessions' '-o' '.crewhaus/distilled/ratings.jsonl' '--graders-out' '.crewhaus/distilled/graders.yaml'",
+    );
     expect(plain.body["registers"]).toBe(false);
     expect(String(plain.body["runtimeNote"])).toContain("autoDistill");
 
@@ -274,7 +279,15 @@ describe("the ratings browser", () => {
       method: "POST",
       body: JSON.stringify({ judge: true, register: true }),
     });
-    expect(promoted.body["argv"]).toEqual(["distill", "--judge", "--register"]);
+    expect(promoted.body["argv"]).toEqual([
+      "distill",
+      "--all-sessions",
+      ...out,
+      ...graders,
+      "--judge",
+      "--register",
+      "loop-ratings",
+    ]);
     expect(String(promoted.body["note"])).toContain("loop-ratings");
   });
 });

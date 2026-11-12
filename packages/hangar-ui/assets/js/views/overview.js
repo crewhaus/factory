@@ -178,7 +178,10 @@ function preflightCard(payload) {
   const report = payload?.report && typeof payload.report === "object" ? payload.report : payload;
   const items = Array.isArray(report?.items) ? report.items : [];
   if (items.length === 0) {
-    return card("Preflight", emptyState("No preflight report yet", "crewhaus harness preflight"));
+    return card(
+      "Preflight",
+      emptyState("No preflight report yet", "crewhaus harness preflight <dir>"),
+    );
   }
   const warns = items.filter((i) => i.level === "warn").length;
   const blocking = items.filter((i) => i.level === "blocking").length;

@@ -563,7 +563,7 @@ export const modelRoutes: M3Handler = (ctx) => {
     return {
       ...absent(
         `no session log for "${sessionId}" — the timeline is read from .crewhaus/sessions/<id>.jsonl, which a run writes`,
-        "crewhaus run",
+        "crewhaus run crewhaus.yaml",
       ),
       sessionId,
       entries: [],

@@ -61,11 +61,11 @@
 import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import { SESSION_ID_RE } from "@crewhaus/control-contract";
-import { shellQuote } from "@crewhaus/harness-supervisor";
 import { SAFE_SEGMENT_RE } from "./constants";
 import { readHarnessEnvFiles } from "./env-file";
 import { readTextCapped } from "./jsonl";
 import { isSafePathSegment, resolveContained, resolveInside } from "./safety";
+import { twinWord } from "./twin-word";
 
 /** A research run's id (citation-tracker's `newRunId`): its report bundle's key. */
 const RESEARCH_RUN_RE = /^run_[0-9a-f]{16}$/;
@@ -263,17 +263,17 @@ export function proofCliTwin(
   // runs exactly this command when pasted; the turn and pass are integers.
   return [
     "cd",
-    shellQuote(harnessDir),
+    twinWord(harnessDir, "<dir>"),
     "&&",
     "crewhaus",
     "provability",
     "show",
     "--session",
-    shellQuote(sessionId),
+    twinWord(sessionId, "<session>"),
     "--turn",
     String(turn),
     ...(pass !== undefined ? ["--pass", String(pass)] : []),
-    ...(tenantsRoot !== undefined ? ["--tenants-root", shellQuote(tenantsRoot)] : []),
+    ...(tenantsRoot !== undefined ? ["--tenants-root", twinWord(tenantsRoot, "<dir>")] : []),
     "--json",
   ].join(" ");
 }

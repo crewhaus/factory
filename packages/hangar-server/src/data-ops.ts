@@ -45,7 +45,6 @@ import {
   verifySplitHashes,
 } from "@crewhaus/dataset-registry";
 import { readRunIndexLatest } from "@crewhaus/eval-report";
-import { shellQuote } from "@crewhaus/harness-supervisor";
 import { MAX_JSONL_LINES } from "./constants";
 import {
   absent,
@@ -63,6 +62,7 @@ import { readJsonlCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
 import { isDryRun, jobArg, requireString } from "./m3";
 import { maskDeep, maskText } from "./mask";
+import { twinWord } from "./twin-word";
 
 const REGISTRY_SEGMENTS: readonly string[] = [".crewhaus", "datasets"];
 const QUARANTINE_SEGMENTS: readonly string[] = [".crewhaus", "datasets", "_quarantine"];
@@ -95,7 +95,7 @@ const specNameOf = (ctx: M3Context): string => ctx.entry?.specName ?? "spec";
 function autoMaintained(ctx: M3Context, name: string): string | null {
   const spec = specNameOf(ctx);
   if (name === `${spec}-ratings`) {
-    return `rebuilt by \`crewhaus distill --all-sessions --register ${shellQuote(name)}\``;
+    return `rebuilt by \`crewhaus distill --all-sessions --register ${twinWord(name, "<dataset>")}\``;
   }
   if (name === `${spec}-regressions`) return "rebuilt by the eval gate's regression union";
   return null;
@@ -735,7 +735,7 @@ export const datasetRefreshGoldens: M3Handler = (ctx) => {
       dry
         ? "preview queued — the verb proposes gold updates as a review diff and writes nothing"
         : "queued with --apply — it writes a NEW registry version, never in place",
-      "crewhaus dataset refresh-goldens",
+      ["crewhaus", ...argv.map((word) => twinWord(word, "<dataset>"))].join(" "),
     ),
     dryRun: dry,
     plan: {

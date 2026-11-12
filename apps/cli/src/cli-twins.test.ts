@@ -21,7 +21,15 @@
  * quiet fails rather than passing on nothing.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
@@ -59,7 +67,13 @@ import { shellQuote as supervisorQuote } from "@crewhaus/harness-supervisor";
 import { JOB_KINDS, jobArgv } from "@crewhaus/harness-supervisor/job-kinds";
 import { createWikiStore } from "@crewhaus/wiki-store";
 import { VALUE, commandsIn, commandsUnder } from "./__test__/literals";
-import { checkLine, realInventory, shellWords } from "./__test__/twin-check";
+import {
+  REQUIRED,
+  checkLine,
+  checkRequirement,
+  realInventory,
+  shellWords,
+} from "./__test__/twin-check";
 import { type TwinHome, bootTwinHome } from "./__test__/twin-home";
 import type { Inventory } from "./verbs";
 
@@ -107,6 +121,21 @@ describe("the checker", () => {
       ["crewhaus version --json", "declares no flags"],
       ["crewhaus pricing", "needs a sub-verb"],
       ["crewhaus rate --session s --turn 1 up|down", "offers a choice"],
+      // Parsed, but refused before it does anything.
+      ["crewhaus run", "crewhaus run needs an argument"],
+      ["crewhaus rate", "crewhaus rate needs --session"],
+      ["crewhaus rate --session <session> --adjudicate", "needs one of --thumbs, --stars, --score"],
+      ["crewhaus distill", "needs one of --out, --register"],
+      ["crewhaus distill --register <dataset>", "needs one of --session, --all-sessions"],
+      ["crewhaus experiment record --name <n> --version <v>", "needs --outcome"],
+      ["crewhaus experiment assign --name <n>", "needs --key"],
+      ["crewhaus harness add", "crewhaus harness add needs an argument"],
+      ["crewhaus harness relocate <id>", "needs 2 arguments"],
+      ["crewhaus hangar serve extra", "takes no arguments"],
+      ["crewhaus hangar extra", "unknown hangar verb"],
+      ["crewhaus access members extra", "takes no arguments"],
+      ["crewhaus access grant --member <m>", "needs --role"],
+      ["crewhaus access unlink", "needs an argument"],
     ];
     for (const [line, reason] of refused) {
       expect(`${line} ⇒ ${checkLine(inv, line) ?? "runs"}`).toContain(reason);
@@ -132,9 +161,58 @@ describe("the checker", () => {
       "cp -R <starter-dir> <dir> && crewhaus harness add <dir>",
       "crewhaus dream crewhaus.yaml",
       "crewhaus security corpus check",
+      "crewhaus run crewhaus.yaml",
+      "crewhaus distill --all-sessions --register <dataset>",
+      "crewhaus distill --session <session> -o <file>",
+      "crewhaus experiment record --name <name> --version <version> --outcome pass|fail",
+      "crewhaus harness relocate <id> <dir>",
+      "crewhaus access link <account> --member <member>",
     ]) {
       expectRunnable("accepted", line);
     }
+  });
+
+  test("each requirement it holds a command to is the CLI's own refusal", () => {
+    const sources = new Map<string, string>();
+    const read = (file: string): string => {
+      let text = sources.get(file);
+      if (text === undefined) {
+        text = readFileSync(join(import.meta.dir, file), "utf8");
+        sources.set(file, text);
+      }
+      return text;
+    };
+    let pins = 0;
+    for (const [key, need] of Object.entries(REQUIRED)) {
+      expect(`${key}: ${need.pins.length > 0}`).toBe(`${key}: true`);
+      for (const pin of need.pins) {
+        let text = read(pin.file);
+        if (pin.within !== undefined) {
+          const start = text.indexOf(pin.within);
+          expect(`${key}: ${pin.within} ${start > -1}`).toBe(`${key}: ${pin.within} true`);
+          const end = text.indexOf("\n}\n", start);
+          text = text.slice(start, end === -1 ? undefined : end);
+        }
+        expect(`${key}: ${pin.file} holds ${pin.text}: ${text.includes(pin.text)}`).toBe(
+          `${key}: ${pin.file} holds ${pin.text}: true`,
+        );
+        pins++;
+      }
+    }
+    expect(Object.keys(REQUIRED).length).toBe(26);
+    expect(pins).toBe(37);
+  });
+
+  test("a requirement it is given is applied, and a key it is not given is not", () => {
+    const table = {
+      "x y": { positionals: { min: 1, max: 2 }, flags: ["a"], oneOf: [["b", "c"]], pins: [] },
+    };
+    expect(checkRequirement("x y", 0, new Set(["a", "b"]), table)).toContain("needs an argument");
+    expect(checkRequirement("x y", 3, new Set(["a", "b"]), table)).toContain("at most 2");
+    expect(checkRequirement("x y", 1, new Set(["b"]), table)).toContain("needs --a");
+    expect(checkRequirement("x y", 1, new Set(["a"]), table)).toContain("one of --b, --c");
+    expect(checkRequirement("x y", 1, new Set(["a", "c"]), table)).toBeNull();
+    expect(checkRequirement("x z", 0, new Set(), table)).toBeNull();
   });
 });
 
@@ -223,7 +301,9 @@ describe("the server's twins, by import", () => {
     let pairs = 0;
     for (const [noun, verbs] of Object.entries(CLI_VERBS)) {
       for (const verb of verbs) {
-        expectRunnable(`CLI_VERBS ${noun}`, `crewhaus ${noun} ${verb}`);
+        // The vocabulary a twin may start with; a verb that takes an argument gets one.
+        const args = " <arg>".repeat(REQUIRED[`${noun} ${verb}`]?.positionals?.min ?? 0);
+        expectRunnable(`CLI_VERBS ${noun}`, `crewhaus ${noun} ${verb}${args}`);
         pairs++;
       }
     }
@@ -273,6 +353,7 @@ type Supervision = {
   readonly NO_TWIN_NOTES: Readonly<Record<string, string>>;
   cliTwinFor(action: string, args?: Record<string, unknown>): string | null;
   shellQuote(value: string): string;
+  twinSafe(value: string): boolean;
 };
 
 /** The console's twin module, a browser ES module loaded by URL. */
@@ -371,6 +452,48 @@ describe("one quoting rule", () => {
       expect(sup.shellQuote(value)).toBe(supervisorQuote(value));
       expect(shellWords(sup.shellQuote(value))).toEqual([[value]]);
     }
+  });
+
+  test("a value with a control character is never put into a command-line equivalent", async () => {
+    const sup = await loadSupervision();
+    const CONTROL = ["\u0003", "\u0015", "\u001b[201~", "\u007f", "\u009b", "\n"];
+    let twins = 0;
+    for (const mark of CONTROL) {
+      const tainted = (value: string): string => `${value}${mark}x`;
+      const args: Record<string, unknown> = {
+        ...FULL_ARGS,
+        dir: tainted("/srv/poly"),
+        acknowledge: [tainted("channel.slack")],
+        lane: tainted("heart"),
+        runId: tainted("run_1"),
+        id: tainted("appr_1"),
+        sessionId: tainted("sess_1"),
+      };
+      const lines = [
+        ...sup.TWIN_ACTIONS.map((action) => sup.cliTwinFor(action, args) ?? ""),
+        ...actionCliTwins(tainted("/srv/poly")),
+        proofCliTwin(tainted("/srv/poly"), tainted("sess_1"), 1, tainted(".crewhaus/tenants")),
+        runtimeOpTwin(tainted("/srv/poly"), devArgv("crewhaus.yaml", false)),
+        runtimeOpTwin("/srv/poly", ["dev", tainted("crewhaus.yaml")]),
+      ];
+      for (const line of lines) {
+        const shown = JSON.stringify(line);
+        expect(`${shown} holds it: ${line.includes(mark)}`).toBe(`${shown} holds it: false`);
+        expect(`${shown}: ${sup.twinSafe(line)}`).toBe(`${shown}: true`);
+        expectRunnable(`tainted ${JSON.stringify(mark)}`, line);
+        twins++;
+      }
+      // What stands in its place is the placeholder, never a quoted fragment.
+      expect(sup.cliTwinFor("stop", { dir: tainted("/srv/poly") })).toBe(
+        "cd <dir> && crewhaus daemon stop",
+      );
+      expect(sup.twinSafe(tainted("a"))).toBe(false);
+    }
+    expect(twins).toBe(CONTROL.length * (sup.TWIN_ACTIONS.length + 4 + 1 + 2));
+    // A plain value is still quoted exactly as before.
+    expect(sup.cliTwinFor("stop", { dir: "/srv/my poly" })).toBe(
+      "cd '/srv/my poly' && crewhaus daemon stop",
+    );
   });
 
   test.skipIf(process.platform === "win32")("a real shell prints each value back unchanged", () => {
@@ -546,6 +669,38 @@ describe("what a running Home serves", () => {
     ).toHaveLength(1);
   }, 20_000); // thirty reads against a live server
 
+  test("the writes that answer with their command answer with one that runs", async () => {
+    const post = async (path: string, body: Record<string, unknown>): Promise<string> => {
+      const res = await home.api(`/api/h/${filledId}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(`${path} ${res.status}`).toBe(`${path} 200`);
+      return String((res.body as Record<string, unknown>)["verb"]);
+    };
+    const served = [
+      await post("/evals/experiments", { action: "record", name: "exp1" }),
+      await post("/evals/experiments", { action: "record", name: "exp1", version: "a" }),
+      await post("/evals/experiments", {
+        action: "record",
+        name: "exp1",
+        version: "a",
+        outcome: "pass",
+      }),
+      await post("/evals/experiments", { action: "assign", name: "exp1" }),
+      await post("/evals/experiments", { action: "assign", name: "exp1", request: "req-1" }),
+      await post("/feedback/distill", {}),
+      await post("/feedback/distill", { judge: true, register: true }),
+      await post("/data/refresh-goldens", { name: "filled-ratings" }),
+    ];
+    for (const verb of served) expectRunnable("write", verb);
+    expect(served[2]).toBe(
+      "crewhaus 'experiment' 'record' '--name' 'exp1' '--version' 'a' '--outcome' 'pass'",
+    );
+    expect(served[4]).toBe("crewhaus 'experiment' 'assign' '--name' 'exp1' '--key' 'req-1'");
+  }, 20_000); // eight writes against a live server
+
   test("the search answers with runnable actions", async () => {
     const search = await home.api("/api/search?q=start%20bare");
     const actions = (search.body as { actions: Array<{ id: string; cliTwin: string }> }).actions;
@@ -589,11 +744,6 @@ const BUILT: ReadonlyArray<{
       [sentinelArgv({}, OFFERS).argv.join(" ")],
       [optimizeArgv({ mutator: "rule-based" }, OFFERS).argv.join(" ")],
     ],
-  },
-  {
-    file: "evals-ops.ts",
-    command: `crewhaus experiment ${VALUE}`,
-    values: [["record"], ["assign"]],
   },
   { file: "evals-ops.ts", command: `crewhaus flywheel ${VALUE}`, values: [["init"], ["run"]] },
   {
@@ -707,6 +857,53 @@ describe("every write has an equivalent or a note", () => {
     expect(Object.keys(ROUTE_TWIN_NOTES).length).toBe(101);
     for (const [key, note] of Object.entries(ROUTE_TWIN_NOTES)) {
       expect(ROUTE_TABLE.find((row) => row.key === key)?.note).toBe(note);
+    }
+  });
+
+  /**
+   * The writes whose handler previews by default (`isDryRun`) and asks for a
+   * typed confirmation before the real run, and how the command-line form
+   * the note names first is held to a preview too: it carries `--dry-run`,
+   * or it lacks the flag that makes the command write.
+   */
+  const PREVIEW_FIRST: Readonly<
+    Record<string, { readonly has: string } | { readonly lacks: string }>
+  > = {
+    retentionSweep: { has: "--dry-run" },
+    retentionPurge: { has: "--dry-run" },
+    memoryMigrate: { has: "--dry-run" },
+    knowledgeSync: { has: "--dry-run" },
+    watchmePublish: { has: "--dry-run" },
+    datasetRefreshGoldens: { lacks: "--apply" },
+    piiTune: { lacks: "--write" },
+    // The CLI has no dry run here; the note says so.
+    memorySweep: { lacks: "--dry-run" },
+    // The command proposes and writes nothing to the spec.
+    onchainTune: { lacks: "--out" },
+  };
+
+  test("a write Home previews first names the command's preview first, and the difference", () => {
+    const server = join(REPO, "packages", "hangar-server", "src");
+    // Every handler that previews by default, so a new one is listed here.
+    let calls = 0;
+    for (const file of readdirSync(server)) {
+      if (!file.endsWith(".ts") || file.endsWith(".test.ts")) continue;
+      calls += readFileSync(join(server, file), "utf8").split("isDryRun(ctx.body)").length - 1;
+    }
+    // Nine call sites: the read-only lint, and eight handlers behind nine
+    // routes (retention's sweep and purge share one).
+    expect(calls).toBe(9);
+    expect(Object.keys(PREVIEW_FIRST).length).toBe(9);
+    for (const [key, rule] of Object.entries(PREVIEW_FIRST)) {
+      const note = ROUTE_TWIN_NOTES[key] ?? "";
+      const first = commandsIn(note)[0] ?? "";
+      expect(`${key}: ${first !== ""}`).toBe(`${key}: true`);
+      if ("has" in rule) {
+        expect(`${key}: ${first}`).toContain(rule.has);
+        expect(note).toContain(`without \`${rule.has}\``);
+      } else {
+        expect(`${key}: ${first}`).not.toContain(rule.lacks);
+      }
     }
   });
 

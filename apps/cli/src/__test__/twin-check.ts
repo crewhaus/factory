@@ -9,7 +9,10 @@
  * an unbalanced quote is a reason, not a command. Then {@link checkCommand}
  * holds each `crewhaus …` command to the verb inventory (`verbs.ts`): a legacy
  * verb's tokens go through the real `parseArgs` with its real schema, and a
- * family's through the flags its module declares.
+ * family's through the flags its module declares. Parsing is not running, so
+ * {@link REQUIRED} then holds the commands that refuse to start without a
+ * positional or a flag to what they need, each pinned to the CLI's own
+ * refusal so the table cannot drift from it.
  *
  * The notation a command may use, and nothing more:
  *
@@ -205,6 +208,194 @@ function subList(keys: readonly string[]): string {
   return keys.filter((k) => k !== "").join(" | ");
 }
 
+/**
+ * Where the CLI's own refusal for a {@link Requirement} is written: `text`
+ * appears in `file` (under `apps/cli/src`), inside the function that opens
+ * with `within` when that is given.
+ */
+export type RequirementPin = {
+  readonly file: string;
+  readonly within?: string;
+  readonly text: string;
+};
+
+/**
+ * What one verb (or `verb sub`) needs before it does anything: how many
+ * positionals it takes, the flags it cannot run without, and groups of
+ * which at least one must be given. Flag names are the long names, as the
+ * parser reports them (`-o` is `out`).
+ */
+export type Requirement = {
+  readonly positionals?: { readonly min?: number; readonly max?: number };
+  readonly flags?: readonly string[];
+  readonly oneOf?: ReadonlyArray<readonly string[]>;
+  readonly pins: readonly RequirementPin[];
+};
+
+const harnessNeedsOne = (sub: string, what: string): Requirement => ({
+  positionals: { min: 1 },
+  pins: [{ file: "harness-cmd.ts", text: `requirePositional("${sub}", args, 0, "${what}")` }],
+});
+const accessTakesNone = (sub: string): Requirement => ({
+  positionals: { max: 0 },
+  pins: [{ file: "access-cmd.ts", text: `noPositional("${sub}", args);` }],
+});
+const accessNeedsFlags = (sub: string, flags: readonly string[]): Requirement => ({
+  positionals: { max: 0 },
+  flags,
+  pins: [
+    { file: "access-cmd.ts", text: `noPositional("${sub}", args);` },
+    ...flags.map((f) => ({ file: "access-cmd.ts", text: `requireValue("${sub}", args, "${f}")` })),
+  ],
+});
+
+/**
+ * The commands that parse but refuse to start without more, keyed by
+ * `verb` or `verb sub`. A command shown in Home that misses one of these
+ * dies when pasted, so the checker refuses it.
+ */
+export const REQUIRED: Readonly<Record<string, Requirement>> = {
+  run: {
+    positionals: { min: 1 },
+    pins: [
+      { file: "index.ts", within: "async function runRun(", text: 'die("missing <spec.yaml>")' },
+    ],
+  },
+  rate: {
+    flags: ["session"],
+    oneOf: [["thumbs", "stars", "score"]],
+    pins: [
+      {
+        file: "index.ts",
+        within: "async function captureFeedback(",
+        text: 'die("missing --session <id>")',
+      },
+      {
+        file: "index.ts",
+        within: "async function runRate(",
+        text: 'die("give one of --thumbs up|down, --stars 1-5, or --score 0-1")',
+      },
+    ],
+  },
+  distill: {
+    oneOf: [
+      ["out", "register"],
+      ["session", "all-sessions"],
+    ],
+    pins: [
+      {
+        file: "index.ts",
+        within: "async function runDistill(",
+        text: 'die("missing -o <dataset.jsonl> (or --register <name> to promote into the registry)")',
+      },
+      {
+        file: "index.ts",
+        within: "async function runDistill(",
+        text: 'die("missing --session <id> (or --all-sessions)")',
+      },
+    ],
+  },
+  "experiment record": {
+    flags: ["name", "version", "outcome"],
+    pins: [
+      { file: "experiment.ts", text: "return fail(`--name is required" },
+      { file: "experiment.ts", text: 'fail("missing --version <v>")' },
+      { file: "experiment.ts", text: 'fail(`--outcome must be "pass" or "fail"' },
+    ],
+  },
+  "experiment assign": {
+    flags: ["name", "key"],
+    pins: [
+      { file: "experiment.ts", text: "return fail(`--name is required" },
+      { file: "experiment.ts", text: 'fail("missing --key <request-key>")' },
+    ],
+  },
+  "dataset refresh-goldens": {
+    flags: ["dataset"],
+    pins: [
+      {
+        file: "index.ts",
+        within: "async function runRefreshGoldens(",
+        text: 'die("missing --dataset <file|registry:ref>")',
+      },
+    ],
+  },
+  "harness show": harnessNeedsOne("show", "<dir|hrn_id>"),
+  "harness add": harnessNeedsOne("add", "<dir>"),
+  "harness remove": harnessNeedsOne("remove", "<dir|hrn_id>"),
+  "harness group": harnessNeedsOne("group", "<name>"),
+  "harness tag": harnessNeedsOne("tag", "<dir|hrn_id>"),
+  "harness pin": harnessNeedsOne("pin", "<dir|hrn_id>"),
+  "harness preflight": harnessNeedsOne("preflight", "<dir|hrn_id>"),
+  "harness relocate": {
+    positionals: { min: 2 },
+    pins: [{ file: "harness-cmd.ts", text: 'requirePositional("relocate", args, 1, "<newDir>")' }],
+  },
+  "hangar serve": {
+    positionals: { max: 0 },
+    pins: [{ file: "hangar-cmd.ts", text: "`hangar serve: unexpected argument" }],
+  },
+  "hangar rotate-token": {
+    positionals: { max: 0 },
+    pins: [{ file: "hangar-cmd.ts", text: "`hangar rotate-token: unexpected argument" }],
+  },
+  "access members": accessTakesNone("members"),
+  "access tokens": accessTakesNone("tokens"),
+  "access sync": accessTakesNone("sync"),
+  "access proxy": accessTakesNone("proxy"),
+  "access invite": accessNeedsFlags("invite", ["role"]),
+  "access grant": accessNeedsFlags("grant", ["member", "role"]),
+  "access mint": accessNeedsFlags("mint", ["service"]),
+  "access revoke": {
+    positionals: { max: 1 },
+    pins: [{ file: "access-cmd.ts", text: 'noPositional("revoke", args, 1);' }],
+  },
+  "access link": {
+    positionals: { min: 1, max: 1 },
+    flags: ["member"],
+    pins: [
+      { file: "access-cmd.ts", text: 'noPositional("link", args, 1);' },
+      { file: "access-cmd.ts", text: 'requireValue("link", args, "member")' },
+    ],
+  },
+  "access unlink": {
+    positionals: { min: 1, max: 1 },
+    pins: [
+      { file: "access-cmd.ts", text: 'noPositional("unlink", args, 1);' },
+      { file: "access-cmd.ts", text: '"access unlink: name a link id' },
+    ],
+  },
+};
+
+/** Why `given` falls short of what `key` needs, or null. */
+export function checkRequirement(
+  key: string,
+  positionals: number,
+  given: ReadonlySet<string>,
+  table: Readonly<Record<string, Requirement>> = REQUIRED,
+): string | null {
+  const need = table[key];
+  if (need === undefined) return null;
+  const label = `crewhaus ${key}`;
+  const min = need.positionals?.min;
+  const max = need.positionals?.max;
+  if (min !== undefined && positionals < min) {
+    return `${label} needs ${min === 1 ? "an argument" : `${min} arguments`} (given ${positionals})`;
+  }
+  if (max !== undefined && positionals > max) {
+    return `${label} takes ${max === 0 ? "no arguments" : `at most ${max}`} (given ${positionals})`;
+  }
+  for (const flag of need.flags ?? []) {
+    if (!given.has(flag)) return `${label} needs --${flag}`;
+  }
+  for (const group of need.oneOf ?? []) {
+    if (!group.some((flag) => given.has(flag))) {
+      return `${label} needs one of ${group.map((f) => `--${f}`).join(", ")}`;
+    }
+  }
+  return null;
+}
+
 /** Tokens after a legacy verb (or its sub-verb), through the real parser. */
 function checkSchemaTokens(
   label: string,
@@ -219,7 +410,7 @@ function checkSchemaTokens(
         return `crewhaus ${label} declares no flags, so "${t.text}" is not accepted`;
       }
     }
-    return null;
+    return checkRequirement(label, tokens.length, new Set());
   }
   const schema = schemaNamed(schemaName);
   if (schema === undefined) return `crewhaus ${label}: schema ${schemaName} does not exist`;
@@ -244,8 +435,9 @@ function checkSchemaTokens(
       return `crewhaus ${label}: "${t.text}" offers a choice outside a sub-verb or flag value`;
     }
   }
+  let parsed: ReturnType<typeof parseArgs>;
   try {
-    parseArgs(
+    parsed = parseArgs(
       tokens.map((t) => t.text),
       schema,
     );
@@ -253,7 +445,7 @@ function checkSchemaTokens(
     if (err instanceof ArgParseError) return `crewhaus ${label}: ${err.message}`;
     throw err;
   }
-  return null;
+  return checkRequirement(label, parsed.positional.length, new Set(Object.keys(parsed.flags)));
 }
 
 function checkLegacy(entry: LegacyVerb, tokens: readonly Word[]): string | null {
@@ -292,10 +484,12 @@ function checkFamilySub(family: CliFamily, name: string, tokens: readonly Word[]
   const label = `crewhaus ${family.verb} ${name}`;
   const expected = Object.keys(flags).map((f) => `--${f}`);
   const given = new Set<string>();
+  let positionals = 0;
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i] as Word;
     if (!t.text.startsWith("--")) {
       if (t.alternation) return `${label}: "${t.text}" offers a choice where none is taken`;
+      positionals += 1;
       continue;
     }
     if (t.text.includes("=")) {
@@ -306,7 +500,10 @@ function checkFamilySub(family: CliFamily, name: string, tokens: readonly Word[]
       return `${label}: unknown flag "${t.text}" (expected: ${expected.length > 0 ? expected.join(", ") : "none"})`;
     }
     const kind = flags[flag];
-    if (kind === "boolean") continue;
+    if (kind === "boolean") {
+      given.add(flag);
+      continue;
+    }
     const value = tokens[i + 1];
     if (value === undefined || value.text.startsWith("--")) {
       return `${label}: ${t.text} needs a value`;
@@ -315,7 +512,7 @@ function checkFamilySub(family: CliFamily, name: string, tokens: readonly Word[]
     given.add(flag);
     i += 1;
   }
-  return null;
+  return checkRequirement(`${family.verb} ${name}`, positionals, given);
 }
 
 function checkFamily(family: CliFamily, tokens: readonly Word[]): string | null {
