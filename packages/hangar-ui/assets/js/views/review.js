@@ -164,16 +164,27 @@ function reviewCard(row, { perform }) {
       : null,
     el("div", { class: "muted reason", text: row.verdictNote }),
     el("div", { class: "inbox-actions" }, row.verdicts.map(verdictBtn)),
-    el("div", { class: "inbox-twins" }, [
-      row.adjudicable
-        ? actionTwin("adjudicate", {
-            sessionId: row.sessionId,
-            turn: row.turn ?? 0,
-            verdict: "up",
-          })
-        : null,
-      actionTwin("review", { id: row.id }),
-    ]),
+    // One equivalent per verdict button: thumbs adjudicate the rated turn,
+    // pass and fail record the verdict on the item.
+    el(
+      "div",
+      { class: "inbox-twins" },
+      row.verdicts.map((verdict) =>
+        verdict === "up" || verdict === "down"
+          ? actionTwin(
+              "adjudicate",
+              {
+                dir: row.dir,
+                id: row.id,
+                sessionId: row.sessionId,
+                turn: row.turn,
+                verdict,
+              },
+              verdict,
+            )
+          : actionTwin("review", { dir: row.dir, id: row.id, verdict }, verdict),
+      ),
+    ),
     Object.keys(row.sourceRef).length > 0
       ? el("details", { class: "fold" }, [
           el("summary", { class: "fold-summary" }, [

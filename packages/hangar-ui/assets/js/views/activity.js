@@ -131,8 +131,8 @@ function paint(view) {
     view.body.replaceChildren(
       emptyFor({
         cause: "no-data",
-        detail: "Nothing has changed in this window.",
-        verb: "crewhaus run (or start a daemon)",
+        detail: "Nothing has changed in this window. Run the harness, or start its daemon.",
+        verb: "crewhaus run crewhaus.yaml",
       }),
     );
     return;

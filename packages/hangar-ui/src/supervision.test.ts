@@ -960,6 +960,13 @@ describe("inbox rows", () => {
     expect(itemOnly.verdicts).toEqual(["pass", "fail"]);
     expect(itemOnly.verdictNote).toContain("no session turn");
   });
+
+  test("approval and review rows carry the harness directory their equivalents run in", () => {
+    expect(sup.approvalRow({ id: "appr_1", harnessDir: "/srv/ops" }, NOW).dir).toBe("/srv/ops");
+    expect(sup.reviewRow({ id: "rev_1", harnessDir: "/srv/ops" }, NOW).dir).toBe("/srv/ops");
+    expect(sup.approvalRow({ id: "appr_1" }, NOW).dir).toBe("");
+    expect(sup.reviewRow({ id: "rev_1", harnessDir: 7 }, NOW).dir).toBe("");
+  });
 });
 
 describe("activity digest", () => {
@@ -1093,42 +1100,86 @@ describe("jobs + deployments", () => {
 });
 
 describe("CLI twins", () => {
-  test("every process verb has the daemon command an operator can paste", () => {
+  test("every process verb has the daemon command an operator can paste, in its harness", () => {
     const dir = "/harnesses/ops";
-    expect(sup.cliTwinFor("start", { dir })).toBe("cd /harnesses/ops && crewhaus daemon start");
-    expect(sup.cliTwinFor("stop", { dir })).toBe("cd /harnesses/ops && crewhaus daemon stop");
-    expect(sup.cliTwinFor("restart", { dir })).toBe("cd /harnesses/ops && crewhaus daemon restart");
-    expect(sup.cliTwinFor("drain", { dir })).toBe("cd /harnesses/ops && crewhaus daemon drain");
+    expect(sup.cliTwinFor("start", { dir })).toBe("cd '/harnesses/ops' && crewhaus daemon start");
+    expect(sup.cliTwinFor("stop", { dir })).toBe("cd '/harnesses/ops' && crewhaus daemon stop");
+    expect(sup.cliTwinFor("restart", { dir })).toBe(
+      "cd '/harnesses/ops' && crewhaus daemon restart",
+    );
+    expect(sup.cliTwinFor("drain", { dir })).toBe("cd '/harnesses/ops' && crewhaus daemon drain");
     expect(sup.cliTwinFor("wake", { dir, lane: "heartbeat" })).toBe(
-      "cd /harnesses/ops && crewhaus daemon wake --lane heartbeat",
+      "cd '/harnesses/ops' && crewhaus daemon wake --lane 'heartbeat'",
     );
   });
 
-  test("a forced start names --force and the acknowledged ids", () => {
+  test("a forced start names --force and the acknowledged ids as one quoted value", () => {
     expect(sup.cliTwinFor("start", { dir: "/h", force: true, acknowledge: ["a", "b"] })).toBe(
-      "cd /h && crewhaus daemon start --force --ack a,b",
+      "cd '/h' && crewhaus daemon start --force --ack 'a,b'",
     );
   });
 
-  test("paths with spaces are quoted exactly as the supervisor's twin does", () => {
+  test("every value is single-quoted, the way the supervisor's own twin is", () => {
     expect(sup.cliTwinFor("stop", { dir: "/my harnesses/ops" })).toBe(
-      'cd "/my harnesses/ops" && crewhaus daemon stop',
+      "cd '/my harnesses/ops' && crewhaus daemon stop",
+    );
+    expect(sup.cliTwinFor("grant", { id: "it's" })).toBe("crewhaus approvals grant 'it'\\''s'");
+    expect(sup.shellQuote("a b")).toBe("'a b'");
+    expect(sup.shellQuote("")).toBe("''");
+  });
+
+  test("a value the twin was not given renders as its placeholder, unquoted", () => {
+    expect(sup.cliTwinFor("grant", {})).toBe("crewhaus approvals grant <id>");
+    expect(sup.cliTwinFor("wake", {})).toBe("crewhaus daemon wake --lane <lane>");
+    expect(sup.cliTwinFor("review", {})).toBe("crewhaus review resolve <id> --note pass|fail");
+    expect(sup.cliTwinFor("adjudicate", {})).toBe(
+      "crewhaus rate --session <session> --turn <turn> --thumbs up|down --adjudicate && crewhaus review resolve <id> --note <note>",
+    );
+    expect(sup.cliTwinFor("baseline", {})).toBe("crewhaus eval-report baseline set <run>");
+  });
+
+  test("approval and review twins start in the harness directory", () => {
+    const dir = "/srv/my harnesses/ops";
+    expect(sup.cliTwinFor("grant", { dir, id: "appr_1" })).toBe(
+      "cd '/srv/my harnesses/ops' && crewhaus approvals grant 'appr_1'",
+    );
+    expect(sup.cliTwinFor("deny", { dir, id: "appr_1" })).toBe(
+      "cd '/srv/my harnesses/ops' && crewhaus approvals deny 'appr_1'",
+    );
+    expect(sup.cliTwinFor("review", { dir, id: "rev_1", verdict: "pass" })).toBe(
+      "cd '/srv/my harnesses/ops' && crewhaus review resolve 'rev_1' --note 'pass'",
     );
   });
 
-  test("inbox and eval verbs match the CLI's real subcommands", () => {
-    expect(sup.cliTwinFor("grant", { id: "appr_1" })).toBe("crewhaus approvals grant appr_1");
-    expect(sup.cliTwinFor("deny", { id: "appr_1" })).toBe("crewhaus approvals deny appr_1");
-    expect(sup.cliTwinFor("review", { id: "rev_1" })).toBe("crewhaus review resolve rev_1");
-    expect(sup.cliTwinFor("adjudicate", { sessionId: "sess_1", turn: 3, verdict: "up" })).toBe(
-      "crewhaus rate --session sess_1 --turn 3 --thumbs up --adjudicate",
+  test("one review twin per verdict: pass and fail resolve, up and down adjudicate then resolve", () => {
+    expect(sup.cliTwinFor("review", { id: "rev_1", verdict: "fail" })).toBe(
+      "crewhaus review resolve 'rev_1' --note 'fail'",
     );
+    for (const verdict of ["up", "down"]) {
+      expect(
+        sup.cliTwinFor("adjudicate", {
+          dir: "/h",
+          id: "rev_1",
+          sessionId: "sess_1",
+          turn: 3,
+          verdict,
+        }),
+      ).toBe(
+        `cd '/h' && crewhaus rate --session 'sess_1' --turn '3' --thumbs '${verdict}' --adjudicate && crewhaus review resolve 'rev_1' --note 'adjudicated: thumbs ${verdict}'`,
+      );
+    }
+    expect(sup.cliTwinFor("adjudicate", { sessionId: "sess_1", turn: 0, verdict: "up" })).toContain(
+      "--turn '0'",
+    );
+  });
+
+  test("the eval verb matches the CLI's real subcommand", () => {
     expect(sup.cliTwinFor("baseline", { runId: "run_1" })).toBe(
-      "crewhaus eval-report baseline set run_1",
+      "crewhaus eval-report baseline set 'run_1'",
     );
   });
 
-  test("job twins mirror the server's own jobArgv vocabulary", () => {
+  test("job twins mirror the server's own jobArgv vocabulary, in the harness directory", () => {
     expect(sup.JOB_COMMANDS).toEqual({
       doctor: "crewhaus doctor",
       compile: "crewhaus compile crewhaus.yaml -o dist",
@@ -1136,9 +1187,20 @@ describe("CLI twins", () => {
       "dream-run": "crewhaus dream run crewhaus.yaml",
     });
     expect(sup.cliTwinFor("job", { dir: "/h", kind: "eval" })).toBe(
-      "cd /h && crewhaus eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
+      "cd '/h' && crewhaus eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
     );
     expect(sup.cliTwinFor("job", { kind: "nope" })).toBeNull();
+    // A kind is looked up as the vocabulary's own key, never an inherited one.
+    expect(sup.cliTwinFor("job", { kind: "constructor" })).toBeNull();
+  });
+
+  test("the action list names exactly the actions with a command", () => {
+    for (const action of sup.TWIN_ACTIONS) {
+      expect(`${action}: ${typeof sup.cliTwinFor(action, { kind: "doctor" })}`).toBe(
+        `${action}: string`,
+      );
+    }
+    expect(sup.TWIN_ACTIONS).toHaveLength(12);
   });
 
   test("an action with no CLI verb says so instead of inventing one", () => {

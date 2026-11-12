@@ -679,7 +679,7 @@ export const watchmeToggle: M3Handler = (ctx) => {
     specName,
     confirmName: specName,
     stateFile:
-      ".crewhaus/watchme/state.json (owned by `crewhaus watchme start/stop` — not written here)",
+      ".crewhaus/watchme/state.json (owned by `crewhaus watchme start|stop` — not written here)",
   };
 };
 

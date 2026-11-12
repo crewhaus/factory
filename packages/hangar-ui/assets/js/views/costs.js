@@ -20,7 +20,7 @@ export async function renderCosts(root, ctx) {
   const days = Array.isArray(costs?.days) ? costs.days : [];
   if (costs === null || (models.length === 0 && costs.calls === 0)) {
     root.appendChild(
-      emptyState("No cost data yet", "crewhaus run (cost tracking is on by default)"),
+      emptyState("No cost data yet. Cost tracking is on by default.", "crewhaus run crewhaus.yaml"),
     );
     return;
   }

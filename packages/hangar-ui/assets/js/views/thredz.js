@@ -1847,7 +1847,7 @@ export async function renderThredzGlobal(root) {
         text: `${payload.wired ?? 0} of ${harnesses.length} declare a \`thredz:\` block.`,
       }),
       harnesses.length === 0
-        ? emptyState("No harnesses registered yet", "crewhaus hangar add")
+        ? emptyState("No harnesses registered yet", "crewhaus harness add <dir>")
         : table(
             ["Harness", "Backend", "Key variable", "New writes"],
             harnesses.map((h) =>

@@ -7,9 +7,10 @@
  * And its CLI twin. Every bundle row names "the exact command that does the
  * same thing in a terminal" — `crewhaus provability show --session <id>
  * --turn <n> --json` — and a twin that fails when pasted teaches an operator
- * the console's commands are decorative (cli-twins.test.ts says why). The CLI
- * is not imported (apps/cli depends on this package, not the other way
- * round); its SOURCE is read, the way cli-twins.test.ts's drift guard reads it.
+ * the console's commands are decorative (apps/cli/src/cli-twins.test.ts says
+ * why). The CLI is not imported (apps/cli depends on this package, not the
+ * other way round); its SOURCE is read here, and apps/cli/src/cli-twins.test.ts
+ * checks every twin against the CLI's own verb inventory.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -409,7 +410,7 @@ describe("GET /api/runs/:id/proof — spec directories and the managed shape", (
     );
     // The twin names the root it reads, and the answer sends no one back inside.
     expect(String(none.body["error"])).toContain(
-      `crewhaus provability show --session ${SESS} --tenants-root '${outside}'`,
+      `crewhaus provability show --session '${SESS}' --tenants-root '${outside}'`,
     );
     expect(String(none.body["error"])).not.toContain("set CREWHAUS_TENANTS_ROOT");
     expect(String(none.body["error"])).not.toContain("inside it");
@@ -584,15 +585,15 @@ describe("the proof route's CLI twin runs", () => {
   test("every flag the twin passes is one `crewhaus provability` declares", () => {
     const twin = proofCliTwin("/srv/my harnesses/poly", SESS, 7);
     expect(twin).toBe(
-      `cd '/srv/my harnesses/poly' && crewhaus provability show --session ${SESS} --turn 7 --json`,
+      `cd '/srv/my harnesses/poly' && crewhaus provability show --session '${SESS}' --turn 7 --json`,
     );
     const tenantTwin = proofCliTwin("/srv/poly", SESS, 7, ".crewhaus/tenants");
     expect(tenantTwin).toBe(
-      `cd '/srv/poly' && crewhaus provability show --session ${SESS} --turn 7 --tenants-root '.crewhaus/tenants' --json`,
+      `cd '/srv/poly' && crewhaus provability show --session '${SESS}' --turn 7 --tenants-root '.crewhaus/tenants' --json`,
     );
     const passTwin = proofCliTwin("/srv/poly", SESS, 7, ".crewhaus/tenants", 2);
     expect(passTwin).toBe(
-      `cd '/srv/poly' && crewhaus provability show --session ${SESS} --turn 7 --pass 2 --tenants-root '.crewhaus/tenants' --json`,
+      `cd '/srv/poly' && crewhaus provability show --session '${SESS}' --turn 7 --pass 2 --tenants-root '.crewhaus/tenants' --json`,
     );
     const declared = declaredProvabilityFlags();
     for (const one of [twin, tenantTwin, passTwin]) {

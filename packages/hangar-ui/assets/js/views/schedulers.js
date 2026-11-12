@@ -109,7 +109,7 @@ function laneCard(lane, headerReason, ctx, dir, reload) {
   } else if (lane.lane === "dream") {
     // Dream is a read-only timer row in control.v1 — the honest "run now" is
     // the job queue, not a poke.
-    actions.appendChild(jobButton("Run now", ctx.id, "dream-run", undefined, reload));
+    actions.appendChild(jobButton("Run now", ctx.id, "dream-run", undefined, reload, ctx.dir));
     if (lane.pokeReason !== null) {
       actions.appendChild(el("div", { class: "muted gated-why", text: lane.pokeReason }));
     }

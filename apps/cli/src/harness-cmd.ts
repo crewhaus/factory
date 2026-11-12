@@ -64,6 +64,7 @@ import { buildSpawnEnv, harnessHookDisclosures, loadEnvChain } from "@crewhaus/h
 import { preflightHarness } from "@crewhaus/preflight";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { envChainLines } from "./env-chain-view";
+import type { CliFamily } from "./verbs";
 
 /** What a verb returns: lines for stdout + the process exit code. */
 export type HarnessCommandResult = {
@@ -128,6 +129,40 @@ const HARNESS_USAGE_LINES: readonly string[] = [
   "  walks a --root and needs no registration. Both are supported; neither",
   "  replaces the other.",
 ];
+
+/**
+ * The `harness` family in the CLI's verb inventory (`verbs.ts`): each sub-verb
+ * and the flags its parser takes. Every `parseVerbArgs` call below reads its
+ * flags from here, and the key order is the order the unknown-verb message
+ * lists them in.
+ */
+export const CLI_FAMILY = {
+  verb: "harness",
+  since: "0.8.0",
+  sub: {
+    list: { flags: { group: "value", json: "boolean" } },
+    show: { flags: { json: "boolean" } },
+    add: { flags: {} },
+    remove: { flags: {} },
+    relocate: { flags: {} },
+    group: {
+      flags: {
+        add: "value",
+        remove: "value",
+        color: "value",
+        order: "value",
+        "member-order": "value",
+        list: "boolean",
+      },
+    },
+    tag: { flags: { add: "value", remove: "value" } },
+    pin: { flags: { off: "boolean" } },
+    scan: { flags: { root: "value" } },
+    preflight: { flags: { json: "boolean" } },
+    adopt: { flags: { slug: "value" } },
+    fork: { flags: {} },
+  },
+} as const satisfies CliFamily;
 
 // ---------------------------------------------------------------------------
 // Tiny per-verb flag parsing (route.ts posture: throw plain Errors)
@@ -369,7 +404,7 @@ function healthLines(h: HarnessHealth): string[] {
 // ---------------------------------------------------------------------------
 
 function harnessList(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
-  const args = parseVerbArgs("list", argv, { group: "value", json: "boolean" });
+  const args = parseVerbArgs("list", argv, CLI_FAMILY.sub.list.flags);
   const group = strFlag(args, "group");
   let entries = reg.list();
   if (group !== undefined) entries = entries.filter((e) => e.groups.includes(group));
@@ -402,7 +437,7 @@ async function harnessShow(
   reg: HangarRegistry,
   argv: readonly string[],
 ): Promise<HarnessCommandResult> {
-  const args = parseVerbArgs("show", argv, { json: "boolean" });
+  const args = parseVerbArgs("show", argv, CLI_FAMILY.sub.show.flags);
   const key = requirePositional("show", args, 0, "<dir|hrn_id>");
   const entry = requireEntry(reg, key);
   const alive = entry.missingSince === null && existsSync(entry.dir);
@@ -464,7 +499,7 @@ async function harnessShow(
 }
 
 function harnessAdd(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
-  const args = parseVerbArgs("add", argv, {});
+  const args = parseVerbArgs("add", argv, CLI_FAMILY.sub.add.flags);
   const dir = resolve(requirePositional("add", args, 0, "<dir>"));
   if (!existsSync(dir) || !statSync(dir).isDirectory()) {
     throw new Error(`harness add: no directory at ${dir}`);
@@ -510,7 +545,7 @@ async function harnessAdopt(
   argv: readonly string[],
   opts: HarnessCommandOptions,
 ): Promise<HarnessCommandResult> {
-  const args = parseVerbArgs("adopt", argv, { slug: "value" });
+  const args = parseVerbArgs("adopt", argv, CLI_FAMILY.sub.adopt.flags);
   const key = requirePositional("adopt", args, 0, "<dir|hrn_id>");
   let entry = reg.get(key);
   if (entry === undefined) {
@@ -547,7 +582,7 @@ async function harnessAdopt(
 }
 
 function harnessFork(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
-  const args = parseVerbArgs("fork", argv, {});
+  const args = parseVerbArgs("fork", argv, CLI_FAMILY.sub.fork.flags);
   const dir = resolve(requirePositional("fork", args, 0, "<dir>"));
   if (!existsSync(dir) || !statSync(dir).isDirectory()) {
     throw new Error(`harness fork: no directory at ${dir}`);
@@ -569,7 +604,7 @@ function harnessFork(reg: HangarRegistry, argv: readonly string[]): HarnessComma
 }
 
 function harnessRemove(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
-  const args = parseVerbArgs("remove", argv, {});
+  const args = parseVerbArgs("remove", argv, CLI_FAMILY.sub.remove.flags);
   const key = requirePositional("remove", args, 0, "<dir|hrn_id>");
   const entry = requireEntry(reg, key);
   reg.remove(entry.id);
@@ -583,7 +618,7 @@ function harnessRemove(reg: HangarRegistry, argv: readonly string[]): HarnessCom
 }
 
 function harnessRelocate(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
-  const args = parseVerbArgs("relocate", argv, {});
+  const args = parseVerbArgs("relocate", argv, CLI_FAMILY.sub.relocate.flags);
   const key = requirePositional("relocate", args, 0, "<hrn_id>");
   const newDir = resolve(requirePositional("relocate", args, 1, "<newDir>"));
   const entry = requireEntry(reg, key);
@@ -606,14 +641,7 @@ function harnessRelocate(reg: HangarRegistry, argv: readonly string[]): HarnessC
 }
 
 function harnessGroup(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
-  const args = parseVerbArgs("group", argv, {
-    add: "value",
-    remove: "value",
-    color: "value",
-    order: "value",
-    "member-order": "value",
-    list: "boolean",
-  });
+  const args = parseVerbArgs("group", argv, CLI_FAMILY.sub.group.flags);
   const name = requirePositional("group", args, 0, "<name>");
   const addKey = strFlag(args, "add");
   const removeKey = strFlag(args, "remove");
@@ -716,7 +744,7 @@ function harnessGroup(reg: HangarRegistry, argv: readonly string[]): HarnessComm
 }
 
 function harnessTag(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
-  const args = parseVerbArgs("tag", argv, { add: "value", remove: "value" });
+  const args = parseVerbArgs("tag", argv, CLI_FAMILY.sub.tag.flags);
   const key = requirePositional("tag", args, 0, "<dir|hrn_id>");
   const addTag = strFlag(args, "add");
   const removeTag = strFlag(args, "remove");
@@ -748,7 +776,7 @@ function harnessTag(reg: HangarRegistry, argv: readonly string[]): HarnessComman
 }
 
 function harnessPin(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
-  const args = parseVerbArgs("pin", argv, { off: "boolean" });
+  const args = parseVerbArgs("pin", argv, CLI_FAMILY.sub.pin.flags);
   const key = requirePositional("pin", args, 0, "<dir|hrn_id>");
   const off = boolFlag(args, "off");
   const entry = requireEntry(reg, key);
@@ -771,7 +799,7 @@ function harnessScan(
   argv: readonly string[],
   opts: HarnessCommandOptions,
 ): HarnessCommandResult {
-  const args = parseVerbArgs("scan", argv, { root: "value" });
+  const args = parseVerbArgs("scan", argv, CLI_FAMILY.sub.scan.flags);
   const rootFlag = strFlag(args, "root");
   let roots: string[];
   if (rootFlag !== undefined) {
@@ -835,7 +863,7 @@ async function harnessPreflight(
   argv: readonly string[],
   opts: HarnessCommandOptions,
 ): Promise<HarnessCommandResult> {
-  const args = parseVerbArgs("preflight", argv, { json: "boolean" });
+  const args = parseVerbArgs("preflight", argv, CLI_FAMILY.sub.preflight.flags);
   const key = requirePositional("preflight", args, 0, "<dir|hrn_id>");
   const entry = reg.get(key);
   let dir: string;
@@ -904,11 +932,19 @@ export async function runHarnessCommand(
   opts: HarnessCommandOptions = {},
 ): Promise<HarnessCommandResult> {
   const verb = argv[0] ?? "";
-  if (verb === "" || verb === "--help" || verb === "-h") {
+  const rest = argv.slice(1);
+  // `harness <verb> --help` answers before the registry is opened, so asking
+  // how a verb works never touches a file.
+  if (
+    verb === "" ||
+    verb === "--help" ||
+    verb === "-h" ||
+    rest.includes("--help") ||
+    rest.includes("-h")
+  ) {
     return { lines: HARNESS_USAGE_LINES, exitCode: 0 };
   }
   const reg = openRegistry(opts);
-  const rest = argv.slice(1);
   switch (verb) {
     case "list":
       return harnessList(reg, rest);
@@ -936,7 +972,7 @@ export async function runHarnessCommand(
       return harnessFork(reg, rest);
     default:
       throw new Error(
-        `unknown harness verb "${verb}" (expected: list | show | add | remove | relocate | group | tag | pin | scan | preflight | adopt | fork)`,
+        `unknown harness verb "${verb}" (expected: ${Object.keys(CLI_FAMILY.sub).join(" | ")})`,
       );
   }
 }

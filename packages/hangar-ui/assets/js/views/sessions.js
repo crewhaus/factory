@@ -34,7 +34,7 @@ export async function renderSessions(root, ctx) {
   clear(root);
   const list = Array.isArray(data) ? data : Array.isArray(data?.sessions) ? data.sessions : [];
   if (list.length === 0) {
-    root.appendChild(emptyState("No sessions yet", "crewhaus run"));
+    root.appendChild(emptyState("No sessions yet", "crewhaus run crewhaus.yaml"));
     return;
   }
   const nowMs = Date.now();
