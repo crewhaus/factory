@@ -39,7 +39,7 @@
  *   - INVALID METADATA — a malformed `metadata.provability`, naming the field.
  *   - FLOOR ABOVE THE BUNDLE — see above.
  */
-import type { GradeResult, Grader, RunResult, Sample } from "@crewhaus/eval-grader";
+import type { GradeResult, Grader, RunResult, Sample, StatusReason } from "@crewhaus/eval-grader";
 import {
   type ProofBinding,
   type ProofBundle,
@@ -110,8 +110,13 @@ type Standing =
     }
   | { readonly result: GradeResult };
 
-const fail = (rationale: string): { result: GradeResult } => ({
-  result: { passed: false, score: 0, rationale },
+/**
+ * The result that replaces a measurement: `passed: false` and `score: 0` are
+ * placeholders, `status: "not_measured"` says so, and `statusReason` names
+ * why. The rationale keeps its pinned prefix ({@link UNMEASURED_PREFIXES}).
+ */
+const notMeasured = (rationale: string, statusReason: StatusReason): { result: GradeResult } => ({
+  result: { passed: false, score: 0, rationale, status: "not_measured", statusReason },
 });
 
 /**
@@ -122,22 +127,25 @@ const fail = (rationale: string): { result: GradeResult } => ({
 function standing(sample: Sample, run: RunResult, floorDependent: boolean): Standing {
   const meta = sampleProvabilityOf(sample);
   // `meta.error` names the field: "metadata.provability… must be …".
-  if (!meta.ok) return fail(`invalid ${meta.error}`);
+  if (!meta.ok) return notMeasured(`invalid ${meta.error}`, "invalid_metadata");
   const bundle = run.artifacts?.proof;
   if (bundle === undefined) {
-    return fail(
+    return notMeasured(
       `${NO_PROOF_BUNDLE} — this sample carries no provability verdict: the run was not gated (declare provability: on the spec, or run \`crewhaus eval --provability <level>\`), or the sample ended before the gate graded an answer`,
+      "no_proof_bundle",
     );
   }
   if (bundle.verdict === "unverified") {
-    return fail(
+    return notMeasured(
       `${UNVERIFIED_BUNDLE} (${bundle.error ?? "the verifier failed"}) — it stood unverified, so nothing was graded`,
+      "unverified",
     );
   }
   const floor = meta.value.level ?? bundle.level;
   if (floorDependent && levelRank(floor) > levelRank(bundle.level)) {
-    return fail(
+    return notMeasured(
       `${FLOOR_ABOVE_BUNDLE}: the sample's ${floor} floor is above the ${bundle.level} floor the gate graded at, and rungs above a gate's floor are recorded without the checks only those floors run — gate the sample at ${floor} (the eval runner does, per sample) for a grade`,
+      "floor_above_bundle",
     );
   }
   return { bundle, floor, meta: meta.value };

@@ -42,7 +42,15 @@ async function realSummary(ids: readonly string[], repeats?: number): Promise<Ev
     grader: async (sample) =>
       sample.id.startsWith("unsure")
         ? { passed: false, score: 0, rationale: "not enough to go on", abstained: true }
-        : { passed: true, score: 1, rationale: "fine" },
+        : sample.id.startsWith("unmeasured")
+          ? {
+              passed: false,
+              score: 0,
+              rationale: "could not measure this case",
+              status: "not_measured" as const,
+              statusReason: "no_proof_bundle" as const,
+            }
+          : { passed: true, score: 1, rationale: "fine" },
   };
   return runEval({
     ir,
@@ -80,6 +88,19 @@ const row = (overrides: Partial<RunIndexEntry> = {}): RunIndexEntry => ({
   ts: "2026-11-01T00:00:00.000Z",
   outDir: "/gone",
   ...overrides,
+});
+
+describe("a case that was not measured", () => {
+  test("reads as not_measured, not fail, and is not counted as measured", async () => {
+    const summary = await realSummary(["yes-1", "unmeasured-1"]);
+    const rows = sampleRowsOf(summary, []);
+    expect(rows.map((r) => [r.sampleId, r.verdict])).toEqual([
+      ["yes-1", "pass"],
+      ["unmeasured-1", "not_measured"],
+    ]);
+    expect(rows.find((r) => r.verdict === "not_measured")?.score).toBeNull();
+    expect(runStatsOf(summary).measuredCount).toBe(1);
+  });
 });
 
 describe("a real summary", () => {

@@ -825,6 +825,33 @@ describe("formatBody — every kind + optional-field branches", () => {
     );
   });
 
+  test("eval_unmeasured renders the gate, grader, reason and error, with the judge and stage when set", () => {
+    const ev = {
+      ...envelope,
+      kind: "eval_unmeasured",
+      gate: "evaluation",
+      graderType: "llm_judge",
+      reason: "grader_error",
+      errorName: "TypeError",
+      judgeModel: "claude-haiku-4-5",
+      stage: "draft",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("eval_unmeasured")}gate=evaluation grader=llm_judge reason=grader_error error=TypeError judge=claude-haiku-4-5 stage=draft`,
+    );
+    const bare = {
+      ...envelope,
+      kind: "eval_unmeasured",
+      gate: "evaluation",
+      graderType: "regex",
+      reason: "grader_error",
+      errorName: "Error",
+    } satisfies TraceEvent;
+    expect(formatLine(bare)).toBe(
+      `${prefix("eval_unmeasured")}gate=evaluation grader=regex reason=grader_error error=Error`,
+    );
+  });
+
   test("judge_verdict WITH rationale includes it", () => {
     const ev = {
       ...envelope,

@@ -58,7 +58,7 @@ import { assertOutDirNotLinked, writeBundleFile } from "../apps/cli/src/bundle-w
 import { runDaemonCommand } from "../apps/cli/src/daemon-cmd";
 import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
-import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
+import { cfWorkerUnwiredBlockWarnings, lower } from "../packages/compiler/src/index";
 import { createContinuityStore } from "../packages/continuity-store/src/index";
 import {
   DECISION_LOG_KEYS,
@@ -74,7 +74,11 @@ import { commandsLedgerOf } from "../packages/control-service/src/index";
 import { decideApproval } from "../packages/deployment-controller/src/approval-gate";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { EXIT_CODES } from "../packages/errors/src/index";
+import { parseGradersConfig } from "../packages/eval-grader/src/index";
+import { finishEvalRun } from "../packages/eval-ops/src/eval-history";
 import { lookupBaseline } from "../packages/eval-report/src/index";
+import { type EvalRunSummary, runEval } from "../packages/eval-runner/src/index";
+import { buildRunEvaluation } from "../packages/evaluation-service/src/evaluation";
 import {
   FEDERATION_VERSION,
   encodeFederationEnvelope,
@@ -143,8 +147,10 @@ import {
 import { planPin } from "../packages/tool-evalops/src/lib/pin";
 import { harnessRegister } from "../packages/tool-fleet/src/index";
 import { TOOL_REGISTRY } from "../packages/tool-registry-manifest/src/generated";
+import { routeControl } from "../packages/tool-routing/src/index";
 import { factCrossCheck } from "../packages/tool-verify/src/index";
 import { createWikiTools } from "../packages/tool-wiki/src/index";
+import { type TraceEvent, TraceEventBus } from "../packages/trace-event-bus/src/index";
 
 const ROOT = dirname(import.meta.dir);
 /** 0.8.0's list, as released. It does not change. */
@@ -1492,6 +1498,193 @@ describe("the release notes name every change a harness without provability: see
         b.includes("`model_pool.candidates`"),
       ) ?? "";
     expect(added.filter((seg) => !bullet.includes(`\`${seg}\``))).toEqual([]);
+  });
+
+  test("eval --gate: a run measured with another graders config is not comparable, and the baseline is kept", async () => {
+    const root = mkdtempSync(join(tmpdir(), "crewhaus-default-on-gate-"));
+    try {
+      const evalsDir = join(root, ".crewhaus", "evals");
+      const run = (runId: string, gradersHash: string): EvalRunSummary => {
+        const outDir = join(root, runId);
+        const summary = {
+          runId,
+          startedAt: "2026-11-01T00:00:00.000Z",
+          endedAt: "2026-11-01T00:00:01.000Z",
+          samples: [
+            {
+              sampleId: "a",
+              sessionId: "sess_0000000000000000",
+              startedAt: "2026-11-01T00:00:00.000Z",
+              endedAt: "2026-11-01T00:00:01.000Z",
+              latencyMs: 1,
+              turns: 1,
+              tokens: { input: 1, output: 1 },
+              model: "m",
+              agentOutput: "x",
+              grades: {
+                overall: { passed: true, score: 1, rationale: "ok" },
+                perGrader: [{ name: "g", passed: true, score: 1, rationale: "ok" }],
+              },
+            },
+          ],
+          aggregates: {
+            passRate: 1,
+            meanScore: 1,
+            p50Turns: 1,
+            p95Turns: 1,
+            p50LatencyMs: 1,
+            p95LatencyMs: 1,
+            totalTokens: { input: 1, output: 1 },
+            errorCount: 0,
+          },
+          config: {
+            specHash: "s",
+            datasetName: "smoke",
+            datasetHash: "d",
+            gradersHash,
+            graderNames: ["g"],
+            model: "m",
+            concurrency: 1,
+          },
+          outDir,
+        } satisfies EvalRunSummary;
+        mkdirSync(outDir, { recursive: true });
+        writeFileSync(join(outDir, "results.json"), JSON.stringify(summary));
+        return summary;
+      };
+      const finish = (summary: EvalRunSummary) =>
+        finishEvalRun({
+          summary,
+          specName: "shop",
+          datasetHash: "d",
+          outDir: summary.outDir,
+          gateRequested: true,
+          promote: true,
+          evalsDir,
+          write: () => {},
+          warn: () => {},
+        });
+      await finish(run("run_a", "g1"));
+      const before = readFileSync(join(evalsDir, "baselines.json"), "utf8");
+      const result = await finish(run("run_b", "g2"));
+      expect(result).toMatchObject({ gateFailed: true, notComparable: "instrument" });
+      expect(readFileSync(join(evalsDir, "baselines.json"), "utf8")).toBe(before);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes("`--rebaseline")) ?? "";
+    expect(bullet).toContain("not comparable");
+    expect(bullet).toContain("`crewhaus eval --gate`");
+  });
+
+  test("a provability requirement that could not measure a case leaves the case out of the pass rate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "crewhaus-default-on-unmeasured-"));
+    try {
+      const ir = lower(
+        parseSpec("name: shop\ntarget: cli\nagent:\n  model: m\n  instructions: Answer.\n"),
+      );
+      if (ir.target !== "cli") throw new Error("expected a cli spec");
+      const { compiled } = parseGradersConfig(
+        "graders:\n  - name: coverage\n    type: registry\n    grader: provability.claimCoverage\n",
+      );
+      async function* samples() {
+        yield { id: "a", input: "q" };
+      }
+      // No proof bundle: the run was not gated, so the requirement cannot
+      // measure the case.
+      const summary = await runEval({
+        ir,
+        dataset: { name: "smoke", samples: samples() },
+        compiledGraders: compiled,
+        opts: {
+          outDir: root,
+          cwd: root,
+          invoker: async () => ({ agentOutput: "an answer", transcript: [], events: [] }),
+        },
+      });
+      expect(summary.aggregates.notMeasured).toBe(1);
+      expect(summary.aggregates.notMeasuredSampleIds).toEqual(["a"]);
+      expect(summary.aggregates.measured).toBe(0);
+      expect(summary.aggregates.passRateCI95).toBeUndefined();
+      expect(summary.samples[0]?.grades.overall).toMatchObject({
+        status: "not_measured",
+        statusReason: "no_proof_bundle",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes("`notMeasured`")) ?? "";
+    expect(bullet).toContain("pass rate leaves it out");
+  });
+
+  test("an in-loop judge that fails leaves one eval_unmeasured on the run's bus", async () => {
+    const events: TraceEvent[] = [];
+    const bus = new TraceEventBus({ runId: "run_00000001", sessionId: "sess_00000000000000aa" });
+    bus.subscribe((event) => {
+      events.push(event);
+    });
+    const failing = new Error("judge provider unavailable");
+    const gate = buildRunEvaluation(
+      { grader: { type: "llm_judge", criteria: "correct?" }, onFail: "retry", maxRetries: 1 },
+      "m",
+      {
+        judgeAdapter: {
+          providerId: "anthropic",
+          features: {
+            caching: "explicit",
+            tool_use: true,
+            vision: false,
+            thinking: false,
+            web_search: false,
+          },
+          estimateTokens: () => 0,
+          stream: () => {
+            throw failing;
+          },
+        } as never,
+      },
+    );
+    const thrown = await gate
+      .evaluate({ finalText: "x", messages: [], usage: { input: 0, output: 0 }, bus })
+      .catch((err) => err);
+    expect(thrown).toBe(failing);
+    expect(events.filter((e) => e.kind === "eval_unmeasured")).toHaveLength(1);
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes("`eval_unmeasured`")) ??
+      "";
+    expect(bullet).toContain("`evaluation:`");
+  });
+
+  test("the floor names RouteControl and the CLI verb that keeps the freeze marker, and RouteControl refuses freeze on it", async () => {
+    const floor =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("`.crewhaus/routing/freeze.json`"),
+      ) ?? "";
+    expect(floor).toContain("`RouteControl`");
+    expect(floor).toContain("`crewhaus route freeze`");
+    const ws = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-route-")));
+    const cwd = process.cwd();
+    try {
+      process.chdir(ws);
+      const roots = runtimeStateRoots(undefined, undefined, ws);
+      expect(roots).toContain(join(ws, ".crewhaus", "routing", "freeze.json"));
+      const out = JSON.parse(
+        String(
+          await routeControl.execute(
+            { action: "freeze", policyVersion: "pv", dryRun: false } as never,
+            { bridge: { protectedRoots: roots } } as never,
+          ),
+        ),
+      ) as { status?: string; reason?: string };
+      expect(out.status).toBe("refused");
+      expect(out.reason).toContain("`crewhaus route freeze --clear`");
+      expect(readdirSync(ws).includes(".crewhaus")).toBe(false);
+    } finally {
+      process.chdir(cwd);
+      rmSync(ws, { recursive: true, force: true });
+    }
   });
 });
 

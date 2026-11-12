@@ -509,7 +509,8 @@ export const EVAL_USAGE =
   "[--record-tools <dir> | --replay-tools <dir> [--replay-miss error|live]] " +
   "[--resume <runDir>] " +
   "[--provability <level>] " +
-  "[--models <m1,m2,...>]\n" +
+  "[--models <m1,m2,...>] " +
+  "[--rebaseline --reason <code>]\n" +
   "  Before any model spend, an OFFLINE preflight lint-lite refuses runs with\n" +
   "  duplicate sample ids (artifact dirs collide, flip detection corrupts) or\n" +
   "  gold-needing graders (exact_match/expected_contains) over a dataset where NO\n" +
@@ -532,6 +533,20 @@ export const EVAL_USAGE =
   "  pair pins the baseline; later runs auto-promote when the regression gate\n" +
   "  passes. --no-promote keeps the existing pin; --gate exits non-zero when the\n" +
   "  gate fails (any pass-rate drop or sample-level pass→fail flip).\n" +
+  "  A run is gated only when it is comparable with its baseline. It is not\n" +
+  "  comparable, and --gate fails with the reason and the case ids, when it stopped\n" +
+  "  at its budget, measured nothing, its baseline run cannot be read, the measuring\n" +
+  "  instrument changed (graders config, judge, judge calibration, plugin grader\n" +
+  "  code, routing snapshot or policy), cases of the baseline are missing, or the\n" +
+  "  dataset changed and a shared case changed or a run recorded no cases.json.\n" +
+  "  Without --gate the same lines are warnings, and the baseline stays as it was\n" +
+  "  either way. Cases added since the baseline are listed and the gate compares\n" +
+  "  the cases both runs share; a case the baseline measured that this run did not\n" +
+  "  measure fails the gate. --rebaseline --reason <code> re-anchors the baseline on\n" +
+  "  this run instead (codes: instrument-changed, cases-changed,\n" +
+  "  baseline-unreadable, reset), and the pin records the reason and the run it\n" +
+  "  replaced. It refuses a run that cannot be a baseline, and is refused with\n" +
+  "  --no-promote, --models, --sentinel, --resume, --provability and --voice.\n" +
   "  --max-p95-latency-ms N / --max-cost-usd F declare ops thresholds for the same\n" +
   "  baseline gate: the verdict FAILS (and exits non-zero under --gate) when p95\n" +
   "  per-sample latency rose more than N ms vs the pinned baseline, or when this\n" +
@@ -606,9 +621,11 @@ export const EVAL_USAGE =
   "  When the registry contains <specName>-regressions (pinned by `crewhaus optimize`),\n" +
   "  its samples are unioned into the dataset by default (dedupe by id, primary wins).\n" +
   "  When the union actually ADDS samples, datasetName/datasetHash reflect it\n" +
-  "  (`+regressions@vX` suffix + folded hash), so the first adding union starts a new\n" +
-  "  baseline lineage by design; a union that adds nothing keeps the primary identity\n" +
-  "  (and lineage) untouched. --no-regressions skips the union.\n" +
+  "  (`+regressions@vX` suffix + folded hash), so it keys its own baseline lineage.\n" +
+  "  Until that lineage has a pin, the run gates against the primary's (or a lower\n" +
+  "  union's) most recent pin on the cases both share, names it, and pins its own\n" +
+  "  lineage on a pass. A union that adds nothing keeps the primary identity (and\n" +
+  "  lineage) untouched. --no-regressions skips the union.\n" +
   "  Samples whose run ERRORS (provider timeout, 429, a grader/judge throw — infra\n" +
   "  noise, not a graded failure) are retried once by default; the retried outcome\n" +
   "  replaces the errored one and is tagged retried:true in results.json (the summary\n" +
@@ -644,7 +661,11 @@ export const EVAL_USAGE =
   "  the sample's outcome is `abstained` — excluded from the pass-rate denominator,\n" +
   "  counted + id-listed as needs_human in results.json/stdout/report for\n" +
   "  `crewhaus rate` follow-up, and excluded from the baseline gate's per-sample\n" +
-  "  flip comparison. Judge criterion scores are persisted per grade (detail) and\n" +
+  "  flip comparison. A provability grader that cannot measure a case (no proof\n" +
+  "  bundle, an answer the verifier could not verify, invalid metadata, a case\n" +
+  "  floor above the bundle's) records it as not measured: it leaves the pass-rate\n" +
+  "  denominator the same way and is listed under notMeasured in results.json.\n" +
+  "  Judge criterion scores are persisted per grade (detail) and\n" +
   "  aggregated per criterion (criterionMeans + a `judge criteria` line).\n" +
   "  llm_judge graders judge the final output by default; `target: transcript`\n" +
   "  feeds the judge the run's bounded, sentinel-wrapped trajectory digest instead.\n" +
@@ -729,9 +750,9 @@ export const EVAL_USAGE =
   "  policy and two runs of the same seed make identical route decisions.\n" +
   "  --warm-arms seeds that snapshot from the harness's live arms.jsonl instead of\n" +
   "  starting cold; the file is re-read at the end and a mid-run change is\n" +
-  "  reported. The snapshot's digest is the run's INSTRUMENT identity: two runs\n" +
-  "  with different digests start a new baseline lineage instead of gating across\n" +
-  "  the difference. Routed runs key their own baseline lineage\n" +
+  "  reported. The snapshot's digest is part of the run's INSTRUMENT identity: two\n" +
+  "  runs with different digests are not comparable, and --rebaseline re-anchors\n" +
+  "  the lineage. Routed runs key their own baseline lineage\n" +
   "  (spec::dataset::<arm|routed>) beside the legacy spec::dataset one, so a cheap\n" +
   "  candidate can never pin over the primary's baseline. On a routed run the\n" +
   "  graders.yaml `per_model:` map binds each SERVED ARM to its own judge, passing\n" +

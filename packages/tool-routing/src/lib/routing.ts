@@ -51,8 +51,10 @@ import { type MeanView, type RateView, meanWithInterval, rate } from "./stats";
 export const STATE_RELDIR = ".crewhaus";
 
 /**
- * Every path under the state directory that opening or writing the routing
- * store can touch, relative to it.
+ * The paths under the state directory that an action writes, relative to it,
+ * by action: `promote` and `compact` write the scoreboard and the priors
+ * ({@link ROUTING_STORE_RELPATHS}), `freeze` and `unfreeze` the freeze marker
+ * ({@link ROUTING_FREEZE_RELPATHS}).
  *
  * The `.tmp` names are not incidental. `Scoreboard.compact()` and
  * `promoteLanes()` both write `<file>.tmp` and then `renameSync` it ON TOP of
@@ -61,13 +63,18 @@ export const STATE_RELDIR = ".crewhaus";
  * workspace before the rename ever runs — which is the InvoiceRender shape:
  * the directory was contained and the leaf that became the filename was not.
  */
-export const ROUTING_TOUCHED_RELPATHS: ReadonlyArray<string> = [
+export const ROUTING_STORE_RELPATHS: ReadonlyArray<string> = [
   "routing",
   "routing/arms.jsonl",
   "routing/arms.jsonl.tmp",
+  "routing/priors.json",
+];
+
+/** What `freeze` and `unfreeze` write: the freeze marker and its `.tmp`. */
+export const ROUTING_FREEZE_RELPATHS: ReadonlyArray<string> = [
+  "routing",
   "routing/freeze.json",
   "routing/freeze.json.tmp",
-  "routing/priors.json",
 ];
 
 /** The subset touched by a read-only inspection. */

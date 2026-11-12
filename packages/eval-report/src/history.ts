@@ -34,8 +34,10 @@ import {
   type EvalRoutingMode,
   type EvalRunSummary,
   type SampleResult,
-  sampleAbstained,
+  canonicalJson,
   sampleIsCanary,
+  sampleNotMeasured,
+  sampleSkipped,
 } from "@crewhaus/eval-runner";
 import {
   type SafeFsFailure,
@@ -47,6 +49,7 @@ import {
 } from "@crewhaus/tool-safety/fs";
 import { ReportError } from "./errors";
 import { jsonSyntaxProblem } from "./json-problem";
+import { sampleMeasured } from "./run-state";
 
 /** Default location of the run index + baselines, relative to the cwd. */
 export const DEFAULT_EVALS_DIR = join(".crewhaus", "evals");
@@ -158,6 +161,29 @@ export type RunIndexEntry = {
    */
   readonly measuredCount?: number;
   /**
+   * Samples whose overall grade was not measured (`aggregates.notMeasured`).
+   * Present only when above 0, so a run with none writes the row it always
+   * did.
+   */
+  readonly notMeasuredCount?: number;
+  /** Samples every enforced grader skipped. Present only when above 0. */
+  readonly skippedCount?: number;
+  /** Samples with at least one observing grade. Present only when above 0. */
+  readonly observingCount?: number;
+  /**
+   * sha256 of the judge calibration the run applied
+   * ({@link calibrationDigestOf}). Part of the measuring instrument. Present
+   * only when the run applied one; a row written before the field existed
+   * has none either way, so its absence on a row is not evidence.
+   */
+  readonly calibrationDigest?: string;
+  /**
+   * The digest of the `.crewhaus/graders` plugins the run's graders resolved
+   * (`config.pluginsDigest`). Part of the measuring instrument. Present only
+   * when a grader resolved a plugin.
+   */
+  readonly pluginsDigest?: string;
+  /**
    * NEW-HUNT-3 — true when the run was cut short by its run-level budget
    * cap (`EvalRunSummary.partial`): samples still queued at abort were
    * recorded as synthetic errors, so this entry's passRate/meanScore read
@@ -256,9 +282,49 @@ export type BaselineEntry = {
   readonly routing?: EvalRoutingMode;
   readonly policyVersion?: string;
   readonly armsDigest?: string;
+  /** The pinned run's judge calibration digest (see {@link RunIndexEntry.calibrationDigest}). */
+  readonly calibrationDigest?: string;
+  /** The pinned run's plugin digest (see {@link RunIndexEntry.pluginsDigest}). */
+  readonly pluginsDigest?: string;
+  /**
+   * Set when this pin re-anchored the lineage on a run measured differently
+   * from the pin it replaced: `crewhaus eval --rebaseline --reason <code>`, or
+   * a manual pin over a different instrument (`reason: "manual"`). `from` is
+   * the run the replaced pin named; `cmd` is what pinned it. Absent on a pin
+   * that followed the gate.
+   */
+  readonly rebaselined?: {
+    readonly from?: string;
+    readonly reason: RebaselineReason;
+    readonly cmd: string;
+  };
   /** ISO-8601 timestamp of when the pin was written. */
   readonly ts: string;
 };
+
+/**
+ * Why a pin re-anchored its lineage. `crewhaus eval --rebaseline --reason`
+ * takes the first four; `manual` marks a pin made by hand over a different
+ * instrument.
+ */
+export type RebaselineReason =
+  | "instrument-changed"
+  | "cases-changed"
+  | "baseline-unreadable"
+  | "reset"
+  | "manual";
+
+/**
+ * sha256 hex of the judge calibration a run applied
+ * (`config.judgeCalibration.applied`, canonical JSON), or `undefined` when it
+ * applied none. Read from the summary, so a run recorded by any version that
+ * applied a calibration has one.
+ */
+export function calibrationDigestOf(summary: EvalRunSummary): string | undefined {
+  const applied = summary.config?.judgeCalibration?.applied;
+  if (applied === undefined || applied.length === 0) return undefined;
+  return createHash("sha256").update(canonicalJson(applied)).digest("hex");
+}
 
 /** Shape of `baselines.json`: `<specName>::<datasetName>` → pinned run. */
 export type BaselinesFile = Record<string, BaselineEntry>;
@@ -548,9 +614,17 @@ export function runIndexEntryFromSummary(
   const errored = (s: SampleResult): boolean =>
     s.error !== undefined || s.graderError !== undefined;
   const errorCount = summary.samples.filter(errored).length;
-  const measuredCount = summary.samples.filter(
-    (s) => !errored(s) && !sampleAbstained(s) && !sampleIsCanary(s),
+  const measuredCount = summary.samples.filter(sampleMeasured).length;
+  // Result states, counted off the samples (canaries excluded, as the
+  // aggregates do) so every launcher's row says the same.
+  const counted = summary.samples.filter((s) => !sampleIsCanary(s));
+  const notMeasuredCount = counted.filter(sampleNotMeasured).length;
+  const skippedCount = counted.filter(sampleSkipped).length;
+  const observingCount = counted.filter((s) =>
+    s.grades.perGrader.some((g) => g.status === "observing"),
   ).length;
+  const calibrationDigest = calibrationDigestOf(summary);
+  const pluginsDigest = summary.config.pluginsDigest;
   return {
     runId: summary.runId,
     specName: opts.specName,
@@ -592,6 +666,13 @@ export function runIndexEntryFromSummary(
     ...routingColumnsFromSummary(summary),
     ...(opts.armId !== undefined ? { armId: opts.armId } : {}),
     ...(opts.routing !== undefined ? { routing: opts.routing } : {}),
+    // Result states and the rest of the measuring instrument, each only when
+    // it says something, so a clean run's row does not move by a byte.
+    ...(notMeasuredCount > 0 ? { notMeasuredCount } : {}),
+    ...(skippedCount > 0 ? { skippedCount } : {}),
+    ...(observingCount > 0 ? { observingCount } : {}),
+    ...(calibrationDigest !== undefined ? { calibrationDigest } : {}),
+    ...(pluginsDigest !== undefined ? { pluginsDigest } : {}),
     ts: summary.endedAt,
     outDir: opts.outDir,
   };
@@ -774,6 +855,20 @@ function baselinesForUpdate(evalsDir: string): BaselinesFile {
     );
   }
   return json as BaselinesFile;
+}
+
+/**
+ * The pin stored under `key`, read the way a pin write reads the file: a link
+ * or special file at `baselines.json` is refused, never followed (a
+ * {@link HistoryWriteError}), and a file that is not a map of pins is a
+ * ReportError. `undefined` when nothing is pinned there.
+ */
+export function pinnedUnder(
+  key: string,
+  evalsDir: string = DEFAULT_EVALS_DIR,
+): BaselineEntry | undefined {
+  const baselines = baselinesForUpdate(evalsDir);
+  return Object.hasOwn(baselines, key) ? baselines[key] : undefined;
 }
 
 /**

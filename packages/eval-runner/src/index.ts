@@ -167,6 +167,7 @@ import { createSkillTool } from "@crewhaus/skills-registry";
 import { currentTenantContext } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { aggregate } from "./aggregate";
+import { pluginsDigestOf, writeCaseDigests } from "./cases";
 import { warnProvabilityOutsidePolicy, warnUnconsumedCombinePolicy } from "./combine-warnings";
 import {
   defaultGraderRegistry,
@@ -209,9 +210,14 @@ import { Semaphore } from "./semaphore";
 import {
   DEFAULT_SLICE_KEYS,
   computeSlices,
+  gradeStatusOf,
   sampleAbstained,
   sampleIsCanary,
   sampleNeedsReview,
+  sampleNotMeasured,
+  sampleObserving,
+  sampleSkipped,
+  sampleWithoutVerdict,
 } from "./slices";
 import { DEFAULT_SCORE_EPSILON, meanCI95, tCritical975, wilsonCI95 } from "./stats";
 import {
@@ -305,6 +311,14 @@ export { wireRunOnce };
 // A2 — sampleNeedsReview is its needs-review sibling (verdict still counts).
 // B18 — sampleIsCanary marks contamination tripwires (excluded like abstained).
 export { DEFAULT_SLICE_KEYS, computeSlices, sampleAbstained, sampleIsCanary, sampleNeedsReview };
+// Result states: a sample not measured, skipped or only observed has no
+// verdict about the spec, and every denominator that leaves out abstained
+// samples leaves these out too (`sampleWithoutVerdict`). `gradeStatusOf`
+// reads one grade, including a record written before `status` existed.
+export { gradeStatusOf, sampleNotMeasured, sampleObserving, sampleSkipped, sampleWithoutVerdict };
+export type { GradeStatus, StatusReason } from "@crewhaus/eval-grader";
+// The run directory's case digests (`cases.json`) and the plugin digest.
+export { CASES_FILENAME, CASES_VERSION, caseDigestOf, pluginsDigestOf } from "./cases";
 // A4/A5 — the shared "you declared config nothing will consume" warning.
 // Every surface that PARSES the graders.yaml grammar must call it (runEval,
 // createExamRunner, and the CLI's `eval --voice --graders` path), so a
@@ -837,6 +851,18 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   ];
   const graders: GraderEntry[] = buildGraders(undefined);
 
+  // The `.crewhaus/graders` plugins this run's graders resolved, digested so a
+  // change to a plugin's code reads as a change of instrument.
+  const pluginSources = graderRegistry?.pluginSources?.();
+  const resolvedPlugins = new Map<string, string>();
+  for (const g of compiledGraders) {
+    const name = g.registrySpec?.grader;
+    const modulePath = name !== undefined ? pluginSources?.get(name) : undefined;
+    if (name !== undefined && modulePath !== undefined) resolvedPlugins.set(name, modulePath);
+  }
+  const pluginsDigest = pluginsDigestOf([...resolvedPlugins.entries()]);
+  const pluginsConfig = pluginsDigest !== undefined ? { pluginsDigest } : {};
+
   // A4/A5 — the graders config's top-level `combine:` policy rides on the
   // compiled entries (identical on each; absent = the pre-policy `all`).
   // Warn LOUDLY at run start when `weight`/`passing_threshold` are declared
@@ -1197,6 +1223,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         ...(budgetUsd !== undefined ? { budgetUsd } : {}),
         ...judgeSamplingConfig,
         ...judgeCalibrationConfig,
+        ...pluginsConfig,
         // NEW-HUNT-4 — how tool execution was treated (absent = live tools).
         ...toolRecordingConfig,
         // 0.6.0 §6.1 — how the run was ROUTED (absent = static), so the resume
@@ -1223,6 +1250,10 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   if (samples.length === 0) {
     throw new RunnerError(`dataset "${dataset.name}" yielded zero samples`);
   }
+  // Each case's digest, next to run.json, so a later run whose dataset differs
+  // can tell which shared cases are unchanged. A resume rewrites it: the
+  // identity guard above has already proved the dataset did not move.
+  await writeCaseDigests(outDir, samples);
 
   // NEW-HUNT-6 — resolve which samples this attempt does NOT have to pay for
   // again: every sample whose per-sample artifacts already carry a full grade
@@ -1633,6 +1664,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       ...(budgetUsd !== undefined ? { budgetUsd } : {}),
       ...judgeSamplingConfig,
       ...judgeCalibrationConfig,
+      ...pluginsConfig,
       // NEW-HUNT-4 — mirrors run.json: a replayed run is gated and pinned
       // like any other, and this is where it says its tools came from a
       // cassette (and which one), plus how often the replay had to reuse an

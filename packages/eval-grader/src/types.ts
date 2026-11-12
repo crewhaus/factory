@@ -3,11 +3,46 @@ import type { Event as TranscriptEvent } from "@crewhaus/event-log";
 import type { ProofBundle } from "@crewhaus/provability";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 
+/**
+ * A grade that is not a pass/fail verdict about the spec:
+ *
+ * - `not_measured` — the grader could not measure this case (no proof bundle,
+ *   an answer the verifier could not verify, …). `passed: false` and
+ *   `score: 0` are placeholders; the pass rate leaves the case out.
+ * - `skipped` — the case is outside what the grader measures.
+ * - `observing` — the grader records a verdict without enforcing it.
+ */
+export type GradeStatus = "not_measured" | "skipped" | "observing";
+
+/**
+ * Why a grade carries a {@link GradeStatus}. The provability graders produce
+ * `no_proof_bundle`, `unverified`, `invalid_metadata` and
+ * `floor_above_bundle`. `out_of_scope` is the runner's reason for a case every
+ * enforced grader skipped. `no_judge_credentials` and `not_regradable` are
+ * reserved for the judge and regrade producers that land with graders scoped
+ * by criteria; nothing produces them yet.
+ */
+export type StatusReason =
+  | "no_proof_bundle"
+  | "unverified"
+  | "invalid_metadata"
+  | "floor_above_bundle"
+  | "out_of_scope"
+  | "no_judge_credentials"
+  | "not_regradable";
+
 export type GradeResult = {
   readonly passed: boolean;
   /** 0..1 normalized score; map an LLM-judge 1–5 score via (n-1)/4. */
   readonly score: number;
   readonly rationale: string;
+  /**
+   * Set when this grade is not a pass/fail verdict ({@link GradeStatus}).
+   * Absent means a verdict, read from `passed`.
+   */
+  readonly status?: GradeStatus;
+  /** Why the grade carries its {@link status}. Present only with it. */
+  readonly statusReason?: StatusReason;
   /**
    * A3 — the judge declined to score because the evidence was insufficient.
    * Only judge-backed graders ever set this; when `true`, `passed: false` /

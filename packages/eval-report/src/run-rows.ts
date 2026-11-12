@@ -14,8 +14,12 @@ import {
   sampleArtifactDirName,
   sampleIsCanary,
   sampleNeedsReview,
+  sampleNotMeasured,
+  sampleObserving,
+  sampleSkipped,
 } from "@crewhaus/eval-runner";
 import type { RunIndexEntry } from "./history";
+import { sampleMeasured } from "./run-state";
 
 export type RunStats = {
   readonly passRate: number | null;
@@ -29,7 +33,16 @@ export type RunStats = {
   readonly flakyCount: number;
 };
 
-export type SampleVerdict = "pass" | "fail" | "error" | "abstained" | "canary" | "unknown";
+export type SampleVerdict =
+  | "pass"
+  | "fail"
+  | "error"
+  | "abstained"
+  | "not_measured"
+  | "skipped"
+  | "observing"
+  | "canary"
+  | "unknown";
 
 export type SampleRow = {
   readonly sampleId: string;
@@ -69,6 +82,9 @@ function verdictOf(s: SampleResult): SampleVerdict {
   if (isErrored(s)) return "error";
   if (sampleIsCanary(s)) return "canary";
   if (sampleAbstained(s)) return "abstained";
+  if (sampleNotMeasured(s)) return "not_measured";
+  if (sampleSkipped(s)) return "skipped";
+  if (sampleObserving(s)) return "observing";
   return s.grades.overall.passed === true ? "pass" : "fail";
 }
 
@@ -91,10 +107,7 @@ export function runStatsOf(summary: unknown, row?: RunIndexEntry): RunStats {
     meanScore: asNumber(aggregates?.["meanScore"]) ?? asNumber(row?.meanScore) ?? null,
     sampleCount: samples?.length ?? asNumber(row?.sampleCount) ?? null,
     errorCount: samples?.filter(isErrored).length ?? asNumber(row?.errorCount) ?? null,
-    measuredCount:
-      samples?.filter((s) => !isErrored(s) && !sampleAbstained(s) && !sampleIsCanary(s)).length ??
-      asNumber(row?.measuredCount) ??
-      null,
+    measuredCount: samples?.filter(sampleMeasured).length ?? asNumber(row?.measuredCount) ?? null,
     costUsd: asNumber(row?.costUsd) ?? null,
     // `partial` in results.json is an object saying why, not a boolean.
     partial: record?.["partial"] !== undefined || row?.partial === true,

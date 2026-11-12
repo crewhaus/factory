@@ -274,47 +274,61 @@ describe("finishEvalRun — index + baseline lifecycle", () => {
     expect(ctx.lines.join("\n")).toContain("gate: FAIL");
   });
 
-  test("sampleId keyset mismatch starts a new baseline lineage (no gate failure)", async () => {
+  test("a baseline case missing from the run is not comparable: --gate fails, naming it, and the pin is kept", async () => {
     const ctx = newCtx();
     const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [
       makeSample("a", true, 1),
       makeSample("b", true, 1),
     ]);
     await finish(ctx, prev);
-    // Dataset changed: sample "b" replaced by "c", and it fails — a naive
-    // diff/gate would either throw or flag a regression.
+    // Sample "b" replaced by "c", and it fails.
     const next = makeRun(ctx, "run_bbbb2222bbbb2222", [
       makeSample("a", true, 1),
       makeSample("c", false, 0),
     ]);
+    const before = readFileSync(join(ctx.evalsDir, "baselines.json"), "utf8");
     const result = await finish(ctx, next, { gateRequested: true, datasetHash: "e".repeat(64) });
-    expect(result.gateFailed).toBe(false);
-    expect(ctx.lines.join("\n")).toContain("dataset changed — starting new baseline lineage");
-    const pin = getBaseline("concierge", "smoke", ctx.evalsDir);
-    expect(pin?.runId).toBe("run_bbbb2222bbbb2222");
-    expect(pin?.datasetHash).toBe("e".repeat(64));
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "cases_removed" });
+    expect(result.gateReason).toContain("not comparable with baseline run_aaaa1111aaaa1111");
+    const out = ctx.lines.join("\n");
+    expect(out).toContain("[eval]   cases: b");
+    expect(out).toContain("--rebaseline --reason cases-changed");
+    expect(out).toContain("[eval] baseline kept: run_aaaa1111aaaa1111");
+    expect(readFileSync(join(ctx.evalsDir, "baselines.json"), "utf8")).toBe(before);
   });
 
-  test("keyset mismatch with --no-promote leaves the old pin untouched", async () => {
+  test("a baseline case missing from the run pins nothing with --no-promote either", async () => {
     const ctx = newCtx();
     const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
     await finish(ctx, prev);
     const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("z", true, 1)]);
     const result = await finish(ctx, next, { promote: false });
-    expect(result.gateFailed).toBe(false);
+    expect(result).toEqual({ gateFailed: false, notComparable: "cases_removed" });
     expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
   });
 
-  test("unreadable baseline dir starts a new lineage instead of crashing", async () => {
+  test("an unreadable baseline run is not comparable: --gate fails and the pin is kept", async () => {
     const ctx = newCtx();
     const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
     await finish(ctx, prev);
     rmSync(prev.outDir, { recursive: true, force: true });
     const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
     const result = await finish(ctx, next, { gateRequested: true });
-    expect(result.gateFailed).toBe(false);
-    expect(ctx.lines.join("\n")).toContain("starting new baseline lineage");
-    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_bbbb2222bbbb2222");
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "baseline_unreadable" });
+    expect(ctx.lines.join("\n")).toContain("--rebaseline --reason baseline-unreadable");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+  });
+
+  test("without --gate the same not-comparable lines print and the run exits clean", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, prev);
+    rmSync(prev.outDir, { recursive: true, force: true });
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    const result = await finish(ctx, next, { gateRequested: false });
+    expect(result).toEqual({ gateFailed: false, notComparable: "baseline_unreadable" });
+    expect(ctx.lines.join("\n")).toContain("not comparable with baseline run_aaaa1111aaaa1111");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
   });
 });
 
@@ -437,29 +451,28 @@ describe("finishEvalRun — measurement-instrument guard (NEW-HUNT-1)", () => {
     expect(pin?.judgeModel).toBe("judge-model-a");
   });
 
-  test("a gradersHash change vs the pinned baseline warns and starts a new lineage", async () => {
+  test("a gradersHash change vs the pinned baseline is not comparable: --gate fails and the pin is kept", async () => {
     const ctx = newCtx();
     const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
       gradersHash: "g-hash-1",
     });
     await finish(ctx, prev);
-    // Same dataset/keyset, but the rubric changed AND the sample now fails —
-    // a naive gate would blame the agent for the stricter rubric.
+    // Same dataset and cases, but the rubric changed and the sample now fails.
     const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", false, 0)], {
       gradersHash: "g-hash-2",
     });
+    const before = readFileSync(join(ctx.evalsDir, "baselines.json"), "utf8");
     const result = await finish(ctx, next, { gateRequested: true });
-    expect(result.gateFailed).toBe(false);
-    const warned = ctx.warnings.join("\n");
-    expect(warned).toContain("measurement instrument changed");
-    expect(warned).toContain("g-hash-1 → g-hash-2");
-    expect(ctx.lines.join("\n")).toContain("instrument changed — starting new baseline lineage");
-    const pin = getBaseline("concierge", "smoke", ctx.evalsDir);
-    expect(pin?.runId).toBe("run_bbbb2222bbbb2222");
-    expect(pin?.gradersHash).toBe("g-hash-2");
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "instrument" });
+    const out = ctx.lines.join("\n");
+    expect(out).toContain("not comparable with baseline run_aaaa1111aaaa1111");
+    expect(out).toContain("[eval]   gradersHash: g-hash-1 → g-hash-2");
+    expect(out).toContain("--rebaseline --reason instrument-changed");
+    expect(out).not.toContain("regression: a");
+    expect(readFileSync(join(ctx.evalsDir, "baselines.json"), "utf8")).toBe(before);
   });
 
-  test("a judgeModel change vs the pinned baseline warns and starts a new lineage", async () => {
+  test("a judgeModel change vs the pinned baseline is not comparable", async () => {
     const ctx = newCtx();
     const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
       gradersHash: "g-hash-1",
@@ -471,13 +484,27 @@ describe("finishEvalRun — measurement-instrument guard (NEW-HUNT-1)", () => {
       judgeModel: "judge-model-b",
     });
     const result = await finish(ctx, next, { gateRequested: true });
-    expect(result.gateFailed).toBe(false);
-    const warned = ctx.warnings.join("\n");
-    expect(warned).toContain("judge-model-a → judge-model-b");
-    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.judgeModel).toBe("judge-model-b");
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "instrument" });
+    expect(ctx.lines.join("\n")).toContain("judgeModel: judge-model-a → judge-model-b");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.judgeModel).toBe("judge-model-a");
   });
 
-  test("instrument mismatch with --no-promote warns but keeps the old pin", async () => {
+  test("a judge pinned on one side only is an instrument change", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
+      gradersHash: "g-hash-1",
+      judgeModel: "judge-model-a",
+    });
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], {
+      gradersHash: "g-hash-1",
+    });
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "instrument" });
+    expect(ctx.lines.join("\n")).toContain("judgeModel: judge-model-a → (none)");
+  });
+
+  test("an instrument change with --no-promote prints the same lines and keeps the old pin", async () => {
     const ctx = newCtx();
     const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
       gradersHash: "g-hash-1",
@@ -487,41 +514,35 @@ describe("finishEvalRun — measurement-instrument guard (NEW-HUNT-1)", () => {
       gradersHash: "g-hash-2",
     });
     const result = await finish(ctx, next, { promote: false });
-    expect(result.gateFailed).toBe(false);
-    expect(ctx.warnings.join("\n")).toContain("measurement instrument changed");
-    expect(ctx.lines.join("\n")).toContain("--no-promote");
+    expect(result).toEqual({ gateFailed: false, notComparable: "instrument" });
+    expect(ctx.lines.join("\n")).toContain("gradersHash: g-hash-1 → g-hash-2");
     expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
   });
 
-  test("a hash-less legacy baseline gates exactly as before (no warning)", async () => {
+  test("a baseline without a gradersHash gates normally against a run that has one", async () => {
     const ctx = newCtx();
-    // Baseline pinned by an old CLI — no instrument fields recorded.
+    // A baseline recorded without the graders hash.
     const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
     await finish(ctx, prev);
     const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", false, 0)], {
       gradersHash: "g-hash-2",
-      judgeModel: "judge-model-b",
     });
     const result = await finish(ctx, next, { gateRequested: true });
     expect(result.gateFailed).toBe(true);
-    expect(ctx.warnings.join("\n")).not.toContain("measurement instrument");
+    expect(result.notComparable).toBeUndefined();
     expect(ctx.lines.join("\n")).toContain("vs baseline run_aaaa1111aaaa1111");
     expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
   });
 
-  test("a run without hashes never trips the guard against a hash-carrying pin", async () => {
-    // The symmetric back-compat direction: a summary recorded without the
-    // fields must gate normally even against a pin that carries them.
+  test("a run without a gradersHash gates normally against a pin that has one", async () => {
     const ctx = newCtx();
     const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
       gradersHash: "g-hash-1",
-      judgeModel: "judge-model-a",
     });
     await finish(ctx, prev);
     const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
     const result = await finish(ctx, next);
     expect(result.gateFailed).toBe(false);
-    expect(ctx.warnings.join("\n")).not.toContain("measurement instrument");
     expect(ctx.lines.join("\n")).toContain("gate: PASS");
   });
 
@@ -944,7 +965,7 @@ describe("finishEvalRun — a run that measured nothing never becomes a baseline
     error: "invoker crashed",
   });
 
-  test("a first run in which every case errored pins nothing and says so", async () => {
+  test("a first run in which every case errored pins nothing, says so, and fails --gate", async () => {
     const ctx = newCtx();
     const summary = makeSummary(
       "run_aaaa1111aaaa1111",
@@ -953,7 +974,11 @@ describe("finishEvalRun — a run that measured nothing never becomes a baseline
     );
     persistRun(summary);
     const result = await finish(ctx, summary, { gateRequested: true });
-    expect(result.gateFailed).toBe(false);
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "nothing_measured" });
+    expect(result.gateReason).toContain("nothing was measured");
+    expect(ctx.lines).toContain(
+      "[eval] gate: FAIL — nothing was measured — none of the 2 case(s) produced a verdict about the spec",
+    );
     expect(getBaseline("concierge", "smoke", ctx.evalsDir)).toBeUndefined();
     expect(ctx.lines).toContain(
       "[eval] run measured nothing — baseline not pinned (first run for concierge/smoke)",
@@ -1016,7 +1041,7 @@ describe("finishEvalRun — partial (budget-exhausted) runs never become baselin
     return summary;
   }
 
-  test("a partial FIRST run is indexed (marked partial) but pins NO baseline", async () => {
+  test("a partial FIRST run is indexed (marked partial), pins NO baseline and fails --gate", async () => {
     const ctx = newCtx();
     // Sample "b" never ran — the runner recorded it as an errored fail.
     const run = makePartialRun(
@@ -1026,7 +1051,7 @@ describe("finishEvalRun — partial (budget-exhausted) runs never become baselin
       1,
     );
     const result = await finish(ctx, run, { gateRequested: true });
-    expect(result.gateFailed).toBe(false); // no baseline to gate against
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "partial" });
     const index = readRunIndex(ctx.evalsDir);
     expect(index).toHaveLength(1);
     expect(index[0]?.partial).toBe(true);
@@ -1083,13 +1108,12 @@ describe("finishEvalRun — partial (budget-exhausted) runs never become baselin
     expect(ctx.lines.join("\n")).toContain("gate: FAIL");
   });
 
-  test("a partial run does not pin the new-lineage paths either (instrument change)", async () => {
+  test("a partial run with a changed instrument is held to the partial rule first, and pins nothing", async () => {
     const ctx = newCtx();
     const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
       gradersHash: "g1".repeat(32),
     });
     await finish(ctx, prev);
-    // Instrument changed → new lineage would normally pin this run.
     const next = makePartialRun(
       ctx,
       "run_bbbb2222bbbb2222",
@@ -1101,9 +1125,9 @@ describe("finishEvalRun — partial (budget-exhausted) runs never become baselin
     expect(result.gateFailed).toBe(false);
     // Old pin survives untouched; the partial run pinned nothing.
     expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
-    expect(ctx.lines.join("\n")).toContain(
-      "partial run (budget exhausted) — baseline not pinned (new lineage)",
-    );
+    const out = ctx.lines.join("\n");
+    expect(out).toContain("gate: FAIL — run is partial (budget exhausted after 1/2 samples)");
+    expect(out).toContain("baseline kept: run_aaaa1111aaaa1111");
   });
 });
 
@@ -1287,7 +1311,7 @@ describe("finishEvalRun — per-arm lineages (§6.1)", () => {
     expect(pin?.armsDigest).toBe("aaaa");
   });
 
-  test("a CHANGED arm snapshot starts a new lineage instead of gating across it", async () => {
+  test("a CHANGED arm snapshot is not comparable: nothing is gated across it and nothing re-pins", async () => {
     const ctx = newCtx();
     const first = makeRun(
       ctx,
@@ -1303,17 +1327,18 @@ describe("finishEvalRun — per-arm lineages (§6.1)", () => {
       routedConfig("as-declared", { armsDigest: "bbbb" }),
     );
     const result = await finish(ctx, second, { gateRequested: true });
-    // A pass-rate collapse that would normally FAIL the gate is not gated —
-    // the two runs measured with different instruments.
-    expect(result.gateFailed).toBe(false);
-    expect(ctx.warnings.join("\n")).toContain("armsDigest: aaaa → bbbb");
-    expect(ctx.lines.join("\n")).toContain("instrument changed — starting new baseline lineage");
+    // The two runs measured with different instruments: the verdict is "not
+    // comparable", never a regression.
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "instrument" });
+    const out = ctx.lines.join("\n");
+    expect(out).toContain("armsDigest: aaaa → bbbb");
+    expect(out).not.toContain("regression: a");
     expect(
       resolveBaseline(
         { specName: "concierge", datasetName: "smoke", routing: "as-declared" },
         ctx.evalsDir,
       ).entry?.runId,
-    ).toBe("run_arm22222arm22222");
+    ).toBe("run_arm11111arm11111");
   });
 
   test("an unchanged snapshot still gates the routed lineage normally", async () => {
@@ -1372,5 +1397,449 @@ describe("routedInstrumentMismatch / gateRuns digest guard", () => {
     );
     expect(verdict.verdict).toBe("fail");
     expect(verdict.reason).toContain("not comparable");
+  });
+});
+
+describe("gateRuns — a sample without a verdict", () => {
+  const out = "/unused";
+  /** A not-measured sample whose placeholder verdict is `passed`. */
+  const placeholder = (id: string, passed: boolean): SampleResult => {
+    const s = notMeasuredSample(id);
+    return {
+      ...s,
+      grades: {
+        overall: { ...s.grades.overall, passed },
+        perGrader: s.grades.perGrader.map((g) => ({ ...g, passed })),
+      },
+    };
+  };
+  /** The runner's pass rate: over the samples with a verdict only. */
+  const measuredRate = (summary: EvalRunSummary): EvalRunSummary => {
+    const measured = summary.samples.filter((x) => x.grades.overall.status === undefined);
+    const passed = measured.filter((x) => x.grades.overall.passed).length;
+    return {
+      ...summary,
+      aggregates: {
+        ...summary.aggregates,
+        passRate: measured.length === 0 ? 0 : passed / measured.length,
+      },
+    };
+  };
+
+  test("one not measured in both runs is left out of the flip comparison", () => {
+    const prev = measuredRate(
+      makeSummary("run_aaaa1111aaaa1111", [makeSample("a", true, 1), placeholder("b", true)], out),
+    );
+    const next = measuredRate(
+      makeSummary("run_bbbb2222bbbb2222", [makeSample("a", true, 1), placeholder("b", false)], out),
+    );
+    const verdict = gateRuns(prev, next);
+    expect(verdict.report.regressions).toEqual([]);
+    expect(verdict).toMatchObject({ verdict: "pass" });
+  });
+
+  test("one the baseline measured and this run did not fails the gate, naming each case", () => {
+    const prev = measuredRate(
+      makeSummary(
+        "run_aaaa1111aaaa1111",
+        [makeSample("a", true, 1), makeSample("b", true, 1), makeSample("c", true, 1)],
+        out,
+      ),
+    );
+    const next = measuredRate(
+      makeSummary(
+        "run_bbbb2222bbbb2222",
+        [makeSample("a", true, 1), notMeasuredSample("b"), notMeasuredSample("c")],
+        out,
+      ),
+    );
+    expect(next.aggregates.passRate).toBe(1);
+    const verdict = gateRuns(prev, next);
+    expect(verdict.verdict).toBe("fail");
+    expect(verdict.reason).toBe("cases the baseline measured were not measured: b, c");
+    // Not counted as flips: the reason names them once.
+    expect(verdict.report.regressions).toEqual([]);
+  });
+
+  test("a failing gate and a lost measurement are both named", () => {
+    const prev = measuredRate(
+      makeSummary(
+        "run_aaaa1111aaaa1111",
+        [makeSample("a", true, 1), makeSample("b", true, 1), makeSample("c", false, 0)],
+        out,
+      ),
+    );
+    const next = measuredRate(
+      makeSummary(
+        "run_bbbb2222bbbb2222",
+        [makeSample("a", false, 0), notMeasuredSample("b"), makeSample("c", true, 1)],
+        out,
+      ),
+    );
+    const verdict = gateRuns(prev, next);
+    expect(verdict.verdict).toBe("fail");
+    expect(verdict.reason).toMatch(
+      /^pass-rate dropped from 0\.67 to 0\.50 .*; cases the baseline measured were not measured: b$/,
+    );
+    expect(verdict.report.regressions.map((r) => r.sampleId)).toEqual(["a"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Comparability, growth, lost measurement and re-anchoring
+// ---------------------------------------------------------------------------
+
+/** A sample whose enforced grader could not measure it. */
+function notMeasuredSample(id: string): SampleResult {
+  const rationale = "no proof bundle (is provability: declared?) — nothing was graded";
+  return {
+    ...makeSample(id, false, 0),
+    grades: {
+      overall: {
+        passed: false,
+        score: 0,
+        rationale,
+        status: "not_measured",
+        statusReason: "no_proof_bundle",
+      },
+      perGrader: [
+        {
+          name: "provability.claimCoverage",
+          passed: false,
+          score: 0,
+          rationale,
+          status: "not_measured",
+          statusReason: "no_proof_bundle",
+        },
+      ],
+    },
+  };
+}
+
+/** Write `cases.json` into a run's directory: each id's digest. */
+function writeCases(run: EvalRunSummary, digests: Record<string, string>): void {
+  writeFileSync(join(run.outDir, "cases.json"), JSON.stringify({ version: 1, digests }));
+}
+
+describe("finishEvalRun — comparability against the pinned baseline", () => {
+  test("with the same dataset and cases the gate runs as it always did, and the pin is the shared builder's", async () => {
+    const ctx = newCtx();
+    await finish(ctx, makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]));
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result).toEqual({ gateFailed: false });
+    expect(ctx.lines.join("\n")).not.toContain("new cases");
+    const row = readRunIndex(ctx.evalsDir).at(-1) as RunIndexEntry;
+    const expected = pinFromIndexEntry(row, row.ts);
+    if (!expected.ok) throw new Error("expected a pin");
+    const written = JSON.parse(readFileSync(join(ctx.evalsDir, "baselines.json"), "utf8"));
+    expect(JSON.stringify(written["concierge::smoke"])).toBe(JSON.stringify(expected.pin));
+  });
+
+  test("a changed dataset whose run recorded no cases.json is not comparable", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    writeCases(prev, { a: "d1" });
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    const result = await finish(ctx, next, { gateRequested: true, datasetHash: "e".repeat(64) });
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "cases_changed" });
+    expect(ctx.lines.join("\n")).toContain("this run recorded no cases.json");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+  });
+
+  test("a changed dataset whose shared case changed is not comparable, naming the case", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [
+      makeSample("a", true, 1),
+      makeSample("b", true, 1),
+    ]);
+    writeCases(prev, { a: "d1", b: "d2" });
+    await finish(ctx, prev);
+    const third = makeRun(ctx, "run_cccc3333cccc3333", [
+      makeSample("a", true, 1),
+      makeSample("b", true, 1),
+    ]);
+    // The run's digests, passed in as its run directory would carry them.
+    const changed = await finishEvalRun({
+      summary: third,
+      specName: "concierge",
+      datasetHash: "e".repeat(64),
+      outDir: third.outDir,
+      gateRequested: true,
+      promote: true,
+      evalsDir: ctx.evalsDir,
+      write: ctx.write,
+      warn: ctx.warn,
+      cases: { version: 1, digests: { a: "d1", b: "d2-edited" } },
+    });
+    expect(changed).toMatchObject({ gateFailed: true, notComparable: "cases_changed" });
+    expect(ctx.lines).toContain("[eval]   cases: b");
+  });
+
+  test("cases added since the baseline are listed, and the gate compares the shared ones", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    writeCases(prev, { a: "d1" });
+    await finish(ctx, prev);
+    // A new case that fails does not fail the gate: it has no baseline yet.
+    const grown = makeRun(ctx, "run_bbbb2222bbbb2222", [
+      makeSample("a", true, 1),
+      makeSample("new", false, 0),
+    ]);
+    writeCases(grown, { a: "d1", new: "d9" });
+    const passed = await finish(ctx, grown, { gateRequested: true, datasetHash: "e".repeat(64) });
+    expect(passed).toEqual({ gateFailed: false });
+    const out = ctx.lines.join("\n");
+    expect(out).toContain("[eval] new cases, no baseline yet: new");
+    expect(out).toContain("gate: PASS");
+    // The full run is what promotes.
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_bbbb2222bbbb2222");
+
+    // A shared case that regresses still fails.
+    const ctx2 = newCtx();
+    const base2 = makeRun(ctx2, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    writeCases(base2, { a: "d1" });
+    await finish(ctx2, base2);
+    const regressed = makeRun(ctx2, "run_bbbb2222bbbb2222", [
+      makeSample("a", false, 0),
+      makeSample("new", true, 1),
+    ]);
+    writeCases(regressed, { a: "d1", new: "d9" });
+    const failed = await finish(ctx2, regressed, {
+      gateRequested: true,
+      datasetHash: "e".repeat(64),
+    });
+    expect(failed.gateFailed).toBe(true);
+    expect(ctx2.lines.join("\n")).toContain("regression: a");
+    expect(getBaseline("concierge", "smoke", ctx2.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+  });
+
+  test("a case the baseline measured and this run did not measure fails the gate, naming it", async () => {
+    const ctx = newCtx();
+    await finish(
+      ctx,
+      makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1), makeSample("b", true, 1)]),
+    );
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [
+      makeSample("a", true, 1),
+      notMeasuredSample("b"),
+    ]);
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result.gateFailed).toBe(true);
+    expect(result.gateReason).toContain("cases the baseline measured were not measured: b");
+    expect(ctx.lines.join("\n")).toContain("without a verdict");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+  });
+
+  test("a baseline whose provability grade only carried the not-measured prefix lost nothing", async () => {
+    const ctx = newCtx();
+    // A record written before `status` existed: the rationale prefix alone.
+    const legacy = (id: string): SampleResult => {
+      const rationale = "no proof bundle (is provability: declared?) — nothing was graded";
+      return {
+        ...makeSample(id, false, 0),
+        grades: {
+          overall: {
+            passed: false,
+            score: 0,
+            rationale: `[provability.claimCoverage: ✗] ${rationale}`,
+          },
+          perGrader: [{ name: "provability.claimCoverage", passed: false, score: 0, rationale }],
+        },
+      };
+    };
+    await finish(
+      ctx,
+      makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1), legacy("b")]),
+    );
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [
+      makeSample("a", true, 1),
+      notMeasuredSample("b"),
+    ]);
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result).toEqual({ gateFailed: false });
+    expect(ctx.lines.join("\n")).not.toContain("were not measured");
+  });
+
+  test("a calibration change between the two runs is not comparable", async () => {
+    const ctx = newCtx();
+    const applied = (minScore: number) => ({
+      judgeCalibration: {
+        path: ".crewhaus/judge-calibration.json",
+        applied: [
+          { grader: "judge", specKey: "concierge", minScore, passingScore: 1 + minScore * 4 },
+        ],
+      },
+    });
+    await finish(
+      ctx,
+      makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], applied(0.5)),
+    );
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], applied(0.75));
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "instrument" });
+    expect(ctx.lines.join("\n")).toContain("calibrationDigest:");
+  });
+
+  test("an old baseline that applied a calibration, with the same calibration now, is comparable", async () => {
+    const ctx = newCtx();
+    const calibration = {
+      judgeCalibration: {
+        path: ".crewhaus/judge-calibration.json",
+        applied: [{ grader: "judge", specKey: "concierge", minScore: 0.5, passingScore: 3 }],
+      },
+    };
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], calibration);
+    await finish(ctx, prev);
+    // The pin as an earlier version wrote it: no calibrationDigest column.
+    const pins = readBaselines(ctx.evalsDir);
+    const { calibrationDigest: _dropped, ...oldPin } = pins["concierge::smoke"] as RunIndexEntry;
+    writeFileSync(
+      join(ctx.evalsDir, "baselines.json"),
+      `${JSON.stringify({ "concierge::smoke": oldPin }, null, 2)}\n`,
+    );
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], calibration);
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result).toEqual({ gateFailed: false });
+    expect(ctx.lines.join("\n")).toContain("gate: PASS");
+  });
+
+  test("a plugin grader's changed code is not comparable", async () => {
+    const ctx = newCtx();
+    await finish(
+      ctx,
+      makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], { pluginsDigest: "p1" }),
+    );
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], {
+      pluginsDigest: "p2",
+    });
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "instrument" });
+    expect(ctx.lines.join("\n")).toContain("pluginsDigest: p1 → p2");
+  });
+
+  test("a run that measured nothing fails --gate against a baseline and keeps it", async () => {
+    const ctx = newCtx();
+    await finish(ctx, makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]));
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [notMeasuredSample("a")]);
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result).toMatchObject({ gateFailed: true, notComparable: "nothing_measured" });
+    expect(ctx.lines).toContain("[eval] baseline kept: run_aaaa1111aaaa1111");
+  });
+});
+
+describe("finishEvalRun — --rebaseline re-anchors the lineage", () => {
+  test("pins the run with the mark, naming the run it replaced and what changed", async () => {
+    const ctx = newCtx();
+    await finish(
+      ctx,
+      makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], { gradersHash: "g1" }),
+    );
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", false, 0)], {
+      gradersHash: "g2",
+    });
+    const result = await finishEvalRun({
+      summary: next,
+      specName: "concierge",
+      datasetHash: "d".repeat(64),
+      outDir: next.outDir,
+      gateRequested: true,
+      promote: true,
+      evalsDir: ctx.evalsDir,
+      write: ctx.write,
+      warn: ctx.warn,
+      rebaseline: { reason: "instrument-changed", cmd: "crewhaus eval --rebaseline" },
+    });
+    expect(result).toEqual({ gateFailed: false, rebaselined: true });
+    const pin = getBaseline("concierge", "smoke", ctx.evalsDir);
+    expect(pin?.runId).toBe("run_bbbb2222bbbb2222");
+    expect(pin?.rebaselined).toEqual({
+      from: "run_aaaa1111aaaa1111",
+      reason: "instrument-changed",
+      cmd: "crewhaus eval --rebaseline",
+    });
+    const out = ctx.lines.join("\n");
+    expect(out).toContain("[eval]   gradersHash: g1 → g2");
+    expect(out).toContain("[eval] baseline re-anchored: run_bbbb2222bbbb2222 (instrument-changed)");
+  });
+
+  test("refuses a run that cannot be pinned, and fails --gate", async () => {
+    const ctx = newCtx();
+    await finish(ctx, makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]));
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [notMeasuredSample("a")]);
+    const result = await finishEvalRun({
+      summary: next,
+      specName: "concierge",
+      datasetHash: "d".repeat(64),
+      outDir: next.outDir,
+      gateRequested: true,
+      promote: true,
+      evalsDir: ctx.evalsDir,
+      write: ctx.write,
+      warn: ctx.warn,
+      rebaseline: { reason: "reset", cmd: "crewhaus eval --rebaseline" },
+    });
+    expect(result.gateFailed).toBe(true);
+    expect(result.rebaselined).toBeUndefined();
+    expect(ctx.lines.join("\n")).toContain(
+      "[eval] --rebaseline: run run_bbbb2222bbbb2222 measured nothing",
+    );
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+  });
+});
+
+describe("finishEvalRun — a regression-union run gates against its primary's baseline", () => {
+  test("gates on the shared cases, names the predecessor, and pins its own lineage on a pass", async () => {
+    const ctx = newCtx();
+    const primary = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    writeCases(primary, { a: "d1" });
+    await finish(ctx, primary);
+    const union = makeRun(
+      ctx,
+      "run_bbbb2222bbbb2222",
+      [makeSample("a", true, 1), makeSample("r1", false, 0)],
+      { datasetName: "smoke+regressions@v1" },
+    );
+    writeCases(union, { a: "d1", r1: "d7" });
+    const result = await finish(ctx, union, { gateRequested: true, datasetHash: "u".repeat(64) });
+    expect(result).toEqual({ gateFailed: false });
+    const out = ctx.lines.join("\n");
+    expect(out).toContain("gating against run_aaaa1111aaaa1111, pinned for concierge/smoke");
+    expect(out).toContain(
+      "baseline set: run_bbbb2222bbbb2222 (first run for concierge/smoke+regressions@v1, gated against run_aaaa1111aaaa1111 (concierge/smoke))",
+    );
+    expect(getBaseline("concierge", "smoke+regressions@v1", ctx.evalsDir)?.runId).toBe(
+      "run_bbbb2222bbbb2222",
+    );
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+  });
+
+  test("a shared regression against the primary fails the union run's gate and pins nothing", async () => {
+    const ctx = newCtx();
+    const primary = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    writeCases(primary, { a: "d1" });
+    await finish(ctx, primary);
+    const union = makeRun(
+      ctx,
+      "run_bbbb2222bbbb2222",
+      [makeSample("a", false, 0), makeSample("r1", true, 1)],
+      { datasetName: "smoke+regressions@v1" },
+    );
+    writeCases(union, { a: "d1", r1: "d7" });
+    const result = await finish(ctx, union, { gateRequested: true, datasetHash: "u".repeat(64) });
+    expect(result.gateFailed).toBe(true);
+    expect(getBaseline("concierge", "smoke+regressions@v1", ctx.evalsDir)).toBeUndefined();
+  });
+
+  test("with no predecessor pinned a union run is a first run", async () => {
+    const ctx = newCtx();
+    const union = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], {
+      datasetName: "smoke+regressions@v2",
+    });
+    await finish(ctx, union, { gateRequested: true });
+    expect(ctx.lines.join("\n")).toContain(
+      "baseline set: run_bbbb2222bbbb2222 (first run for concierge/smoke+regressions@v2)",
+    );
   });
 });
