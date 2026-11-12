@@ -42,6 +42,22 @@ these on: they reach every harness that uses what each one names.
   meets one of them fails the same way. A Home write whose body is not a JSON
   object is answered 400 before anything runs.
 
+- **The first decision on an approval wins.** A second grant or deny on the same
+  request, from Home, the CLI or a channel, is refused and names the first
+  decision. To change a decision before it is used, run
+  `crewhaus approvals supersede` with the request's id and a `--reason` code: it
+  parks a fresh request in its place.
+
+- **Approval decisions are recorded once, and reads never rewrite the approvals
+  file.** Each session root gains `approvals.d/`: a lock every write takes, a
+  claim file that records the first decision, and a decision log of ids, keyed
+  digests, times and reason codes, never tool input or names. `crewhaus
+  approvals list|show`, the runtime and a channel daemon no longer compact
+  `approvals.jsonl` when they read it, and the TTL sweep at start writes a log
+  line before it drops a request. When the session root holds the working
+  directory, the runtime-state floor protects `approvals.d/` as it protects the
+  approvals file.
+
 ## [0.8.1] - 2026-11-08
 
 Fixes and hardening for run input, the runtime-state floor, git tools,

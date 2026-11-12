@@ -539,7 +539,9 @@ export const CORE_MODULE = {
       "people-erased",
       "people-grant-revoked",
     ],
-    evict: ["erased"],
+    evict: ["erased", "ttl"],
+    expire: ["ttl"],
+    defer: ["awaiting-information", "awaiting-someone", "scheduled", "other"],
   },
   capabilityKeys: [
     "controls.pauseIntake",

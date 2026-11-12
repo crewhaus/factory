@@ -13,10 +13,11 @@
  *     queue row — otherwise the next `crewhaus distill` re-opens it.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { extractFeedbackRecords } from "@crewhaus/feedback-distill";
-import { createPendingApprovalStore } from "@crewhaus/session-store";
+import { createPendingApprovalStore, foldReadOnly } from "@crewhaus/session-store";
+import { pendingApprovalCount } from "./approvals";
 import { makeFixtureHarness } from "./fixture";
 import { logLine } from "./fixture";
 import { type TestServer, bootTestServer } from "./testkit";
@@ -183,6 +184,94 @@ describe("approvals inbox", () => {
       const row = rows.find((r) => r.id === "appr_00000000000000c1");
       expect(row?.status).toBe("granted-always");
       expect(row?.always).toBe(true);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("a second decision is refused with 409, naming the first and not who made it", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inboxHarness(t, "inbox-twice");
+      const id = await register(t, dir);
+      const url = `/api/h/${id}/approvals/appr_00000000000000b1`;
+      const denied = await t.api(`${url}/deny`, {
+        method: "POST",
+        body: JSON.stringify({ by: "first@example.invalid" }),
+      });
+      expect(denied.status).toBe(200);
+      const granted = await t.api(`${url}/grant`, {
+        method: "POST",
+        body: JSON.stringify({ by: "second@example.invalid" }),
+      });
+      expect(granted.status).toBe(409);
+      expect(String(granted.body["error"])).toBe("This request was already denied.");
+      expect(JSON.stringify(granted.body)).not.toContain("first@example.invalid");
+      const store = createPendingApprovalStore({
+        rootDir: join(dir, ".crewhaus", "sessions"),
+        now: () => new Date(NOW),
+      });
+      const seen = await store.get("SendMessage", "hash-1");
+      expect(seen?.decision).toBe("deny");
+      expect(seen?.decidedVia).toBe("home");
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("an approver list that cannot be read refuses the decision with 403", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inboxHarness(t, "inbox-governed");
+      const control = join(dir, ".crewhaus", "run", "control");
+      mkdirSync(control, { recursive: true });
+      writeFileSync(join(control, "approvers.json"), "{ torn");
+      const id = await register(t, dir);
+      const res = await t.api(`/api/h/${id}/approvals/appr_00000000000000b1/grant`, {
+        method: "POST",
+        body: "{}",
+      });
+      expect(res.status).toBe(403);
+      expect(String(res.body["error"])).toContain("crewhaus access sync");
+      expect(foldReadOnly(join(dir, ".crewhaus", "sessions")).records[0]?.decision).toBeUndefined();
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("the inbox and the pending count agree with the store's fold on a flipped file", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = makeFixtureHarness(join(t.harnessesRoot, "inbox-flipped"), {
+        specName: "inbox-flipped",
+        sessions: [],
+        approvals: [],
+        reviewQueue: [],
+      });
+      const park = {
+        id: "appr_00000000000000e1",
+        toolName: "Bash",
+        inputHash: "hash-e",
+        input: { command: "ls" },
+        runId: "run_00000000000000e0",
+        sessionId: "sess_00000000000000aa",
+        surface: "daemon",
+        createdAt: iso(NOW - DAY),
+      };
+      const grant = { ...park, decision: "grant", decidedBy: "max", decidedAt: iso(NOW - DAY + 1) };
+      // An 0.8.x writer flipped the grant back to waiting, last.
+      writeFileSync(
+        join(dir, ".crewhaus", "sessions", "approvals.jsonl"),
+        `${[park, grant, park].map((l) => JSON.stringify(l)).join("\n")}\n`,
+      );
+      await register(t, dir);
+      const folded = foldReadOnly(join(dir, ".crewhaus", "sessions")).records;
+      expect(folded.map((r) => r.decision)).toEqual(["grant"]);
+      const inbox = await t.api("/api/approvals?all=1");
+      const rows = inbox.body["approvals"] as Array<{ id: string; status: string }>;
+      expect(rows.find((r) => r.id === park.id)?.status).toBe("granted");
+      expect(inbox.body["pending"]).toBe(0);
+      expect(pendingApprovalCount(dir)).toBe(0);
     } finally {
       await t.stop();
     }

@@ -43,7 +43,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan reads the sources", () => {
-    expect(SOURCES.length).toBe(12);
+    expect(SOURCES.length).toBe(19);
     expect(imports.some((i) => i.path === "@crewhaus/control-records")).toBe(true);
   });
 
@@ -94,6 +94,28 @@ describe("what the package exports", () => {
         "mintIssuedSecret",
         "openAccess",
         "redeemInvite",
+        // Stage 2: signing in.
+        "BOOTSTRAP_PRINCIPAL",
+        "BOOT_TICKET_TTL_MS",
+        "HOME_SOCKET",
+        "OWNER_BLOCKS",
+        "PROXY_SECRET_HEADER",
+        "PROXY_SOCKET",
+        "SETTINGS_FILENAME",
+        "SIGN_IN_LIMITS",
+        "TOKEN_FILENAME",
+        "admitUntilAuthorization",
+        "authenticate",
+        "cidrContains",
+        "createBootTickets",
+        "ensureToken",
+        "isLoopbackAddress",
+        "openSignIn",
+        "parseCidr",
+        "readOwnerSettings",
+        "rotateBootstrap",
+        "tokenEquals",
+        "writeOwnerBlock",
       ].sort(),
     );
   });

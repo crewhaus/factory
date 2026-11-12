@@ -8,6 +8,7 @@ import { cliBoot } from "./cli-boot.journey";
 import { crawl } from "./crawl.journey";
 import type { Journey } from "./journey";
 import { keyboardTour } from "./keyboard-tour.journey";
+import { pluginPane } from "./plugin-pane.journey";
 import { runThenConsole } from "./run-then-console.journey";
 import { sessionSelfTest } from "./session-self-test.journey";
 import { signIn } from "./sign-in.journey";
@@ -17,6 +18,7 @@ import { untrustedMarkup } from "./untrusted-markup.journey";
 export const JOURNEYS: readonly Journey[] = [
   sessionSelfTest,
   signIn,
+  pluginPane,
   crawl,
   untrustedMarkup,
   thredzProxy,

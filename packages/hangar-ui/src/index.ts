@@ -34,7 +34,9 @@ import omniboxJs from "../assets/js/omnibox.js" with { type: "text" };
 import prefsJs from "../assets/js/prefs.js" with { type: "text" };
 import routerJs from "../assets/js/router.js" with { type: "text" };
 import routesJs from "../assets/js/routes.js" with { type: "text" };
+import sealedJs from "../assets/js/sealed.js" with { type: "text" };
 import shapesJs from "../assets/js/shapes.js" with { type: "text" };
+import signInJs from "../assets/js/sign-in.js" with { type: "text" };
 import supervisionJs from "../assets/js/supervision.js" with { type: "text" };
 import chartUiJs from "../assets/js/ui/chart.js" with { type: "text" };
 import conflictUiJs from "../assets/js/ui/conflict.js" with { type: "text" };
@@ -80,10 +82,10 @@ import schedulersViewJs from "../assets/js/views/schedulers.js" with { type: "te
 import securityViewJs from "../assets/js/views/security.js" with { type: "text" };
 import sessionsViewJs from "../assets/js/views/sessions.js" with { type: "text" };
 import settingsViewJs from "../assets/js/views/settings.js" with { type: "text" };
+import signInViewJs from "../assets/js/views/sign-in.js" with { type: "text" };
 import specEditViewJs from "../assets/js/views/spec-edit.js" with { type: "text" };
 import specViewJs from "../assets/js/views/spec.js" with { type: "text" };
 import thredzViewJs from "../assets/js/views/thredz.js" with { type: "text" };
-import tokenViewJs from "../assets/js/views/token.js" with { type: "text" };
 
 /** One embeddable asset: the file's text plus its HTTP content type. */
 export type HangarAsset = {
@@ -133,7 +135,9 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/prefs.js": asset(prefsJs, "prefs.js"),
   "/assets/js/router.js": asset(routerJs, "router.js"),
   "/assets/js/routes.js": asset(routesJs, "routes.js"),
+  "/assets/js/sealed.js": asset(sealedJs, "sealed.js"),
   "/assets/js/shapes.js": asset(shapesJs, "shapes.js"),
+  "/assets/js/sign-in.js": asset(signInJs, "sign-in.js"),
   "/assets/js/supervision.js": asset(supervisionJs, "supervision.js"),
   "/assets/js/ui/chart.js": asset(chartUiJs, "chart.js"),
   "/assets/js/ui/conflict.js": asset(conflictUiJs, "conflict.js"),
@@ -177,10 +181,10 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/views/runtime.js": asset(runtimeViewJs, "runtime.js"),
   "/assets/js/views/schedulers.js": asset(schedulersViewJs, "schedulers.js"),
   "/assets/js/views/security.js": asset(securityViewJs, "security.js"),
+  "/assets/js/views/sign-in.js": asset(signInViewJs, "sign-in.js"),
   "/assets/js/views/sessions.js": asset(sessionsViewJs, "sessions.js"),
   "/assets/js/views/settings.js": asset(settingsViewJs, "settings.js"),
   "/assets/js/views/spec-edit.js": asset(specEditViewJs, "spec-edit.js"),
   "/assets/js/views/spec.js": asset(specViewJs, "spec.js"),
   "/assets/js/views/thredz.js": asset(thredzViewJs, "thredz.js"),
-  "/assets/js/views/token.js": asset(tokenViewJs, "token.js"),
 };

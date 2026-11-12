@@ -5,32 +5,30 @@
  * It goes into an `<iframe>` whose `sandbox` grants `allow-scripts` and
  * NOTHING else: without `allow-same-origin` the frame has an opaque origin,
  * so its script cannot reach this page's DOM, its sessionStorage (where the
- * bearer token lives) or its history. The Content-Security-Policy the server
- * computed from the plugin's own `net` allow-list rides along inside the
- * document as a `<meta http-equiv>` line — fail-closed, so a plugin with no
- * declared network permission gets `connect-src 'none'`.
+ * session lives) or its history.
  *
- * The frame is built with `srcdoc`, which is the ONE place in this console
- * where a markup string reaches the DOM — and it is the one place where that
- * is the safe option rather than the dangerous one: the string never becomes
- * part of this document, only of a sandboxed one. Everything else on this
- * screen is built with createElement like the rest of the app.
+ * The frame loads the pane from a single-use address the pane read hands out
+ * (`src`, `/pane/<nonce>`), which serves the document with the Content-
+ * Security-Policy the server computed from the plugin's own `net` allow-list
+ * — fail-closed, so a plugin with no declared network permission gets
+ * `connect-src 'none'` — and the same sandbox, both as response headers. A
+ * `srcdoc` frame would inherit this console's own policy instead, under
+ * which a pane's own script never runs. No markup string reaches the DOM on
+ * this screen; everything is built with createElement like the rest of the app.
  */
 
 import { api } from "../api.js";
 import { clear, dot, el, emptyState, skeleton } from "../dom.js";
 
+const PANE_SRC_RE = /^\/pane\/[0-9a-f]{64}$/;
+
 /**
- * Assemble the sandboxed document: the plugin's own markup with the policy
- * prepended. Pure, so the containment can be unit-tested — the assertions
- * that matter are that the CSP is present and that the sandbox list never
- * grows `allow-same-origin`.
+ * The address a pane frame loads: only a single-use pane address on this
+ * server, never anything a payload could point elsewhere. `null` otherwise.
  */
-export function paneSrcdoc(doc) {
-  const csp = String(doc?.csp ?? "default-src 'none'");
-  const body = String(doc?.doc ?? "");
-  const meta = `<meta http-equiv="Content-Security-Policy" content="${csp.replace(/"/g, "&quot;")}">`;
-  return `<!doctype html><html><head><meta charset="utf-8">${meta}</head><body>${body}</body></html>`;
+export function paneSrc(doc) {
+  const src = typeof doc?.src === "string" ? doc.src : "";
+  return PANE_SRC_RE.test(src) ? src : null;
 }
 
 /** The sandbox token list for a pane frame. Never `allow-same-origin`. */
@@ -104,7 +102,8 @@ async function paneCard(pane) {
     );
     return card;
   }
-  if (doc === null) {
+  const src = paneSrc(doc);
+  if (doc === null || src === null) {
     card.appendChild(emptyState("This pane's document is missing", "crewhaus plugins list"));
     return card;
   }
@@ -113,11 +112,8 @@ async function paneCard(pane) {
     title: String(pane?.title ?? "plugin pane"),
     sandbox: paneSandbox(doc),
     referrerpolicy: "no-referrer",
-    loading: "lazy",
+    src,
   });
-  // `srcdoc` — see the module docblock: the string becomes the SANDBOXED
-  // document, never part of this one.
-  frame.setAttribute("srcdoc", paneSrcdoc(doc));
   card.appendChild(frame);
   card.appendChild(
     el("div", { class: "muted small" }, [

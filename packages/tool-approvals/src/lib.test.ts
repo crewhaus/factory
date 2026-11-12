@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { allowSingleOwner, createPendingApprovalStore } from "@crewhaus/session-store";
 import { approval, approvalId, makeHarness, writeApprovals, writeSession } from "./fixtures";
 import {
   countByStatus,
@@ -155,7 +156,7 @@ describe("readTailCapped / readJsonlCapped", () => {
 // ---------------------------------------------------------------------------
 
 describe("foldApprovals", () => {
-  test("last record wins by id — a grant appended after a park replaces it", () => {
+  test("until a decision, the newest record wins by id — a grant appended after a park replaces it", () => {
     const id = approvalId(1);
     const file = writeApprovals(tmp, [
       approval({ id, createdAt: "2026-09-18T10:00:00.000Z" }),
@@ -175,6 +176,71 @@ describe("foldApprovals", () => {
     const folded = foldApprovals(file);
     expect(folded.records).toHaveLength(1);
     expect(folded.foreignLines).toBe(1);
+  });
+
+  test("the first decision wins: a later line that flips it is ignored", () => {
+    const id = approvalId(1);
+    const file = writeApprovals(tmp, [
+      approval({ id }),
+      approval({ id, decision: "grant", decidedBy: "max", decidedAt: "2026-09-18T10:01:00Z" }),
+      approval({ id, decision: "deny", decidedBy: "eve", decidedAt: "2026-09-18T10:02:00Z" }),
+    ]);
+    const folded = foldApprovals(file);
+    expect(folded.records.map((r) => [statusOf(r), r.decidedBy])).toEqual([["granted", "max"]]);
+  });
+
+  test("a record its decision claim decided is not pending, though its line still waits", async () => {
+    const sessions = path.join(tmp, ".crewhaus", "sessions");
+    const store = createPendingApprovalStore({ rootDir: sessions });
+    const waiting = approval({ id: approvalId(1), createdAt: new Date().toISOString() });
+    await store.persist(waiting as never);
+    await store.decide(
+      approvalId(1),
+      { choice: "deny", actor: {} },
+      { authorize: allowSingleOwner },
+    );
+    // As a crash between the claim and its lines would leave the file.
+    const file = writeApprovals(tmp, [waiting]);
+    expect(foldApprovals(file).records.map(statusOf)).toEqual(["denied"]);
+  });
+
+  test("a flipped line an 0.8.x compaction kept does not hide a spend of the claimed grant", async () => {
+    const sessions = path.join(tmp, ".crewhaus", "sessions");
+    const store = createPendingApprovalStore({ rootDir: sessions });
+    const waiting = approval({ id: approvalId(1), createdAt: new Date().toISOString() });
+    await store.persist(waiting as never);
+    const decided = await store.decide(
+      approvalId(1),
+      { choice: "grant", actor: {} },
+      { authorize: allowSingleOwner },
+    );
+    // The deny line a compaction kept, then the runtime's spend of the grant.
+    const file = writeApprovals(tmp, [
+      { ...waiting, decision: "deny", decidedAt: "2026-09-18T10:02:00Z" },
+      { ...decided.record, consumedAt: new Date().toISOString() },
+    ]);
+    expect(foldApprovals(file).records.map(statusOf)).toEqual(["consumed"]);
+  });
+
+  test("a superseded record shows superseded, and its replacement waits", async () => {
+    const sessions = path.join(tmp, ".crewhaus", "sessions");
+    const store = createPendingApprovalStore({ rootDir: sessions });
+    await store.persist(
+      approval({ id: approvalId(1), createdAt: new Date().toISOString() }) as never,
+    );
+    await store.decide(
+      approvalId(1),
+      { choice: "deny", actor: {} },
+      { authorize: allowSingleOwner },
+    );
+    const replaced = await store.supersede(
+      approvalId(1),
+      { actor: {}, reason: "decided-in-error" },
+      { authorize: allowSingleOwner },
+    );
+    const folded = foldApprovals(path.join(sessions, "approvals.jsonl"));
+    expect(folded.records.map(statusOf)).toEqual(["superseded", "pending"]);
+    expect(folded.records[0]?.supersededBy).toBe(replaced.fresh?.id);
   });
 
   test("an unreadable ledger folds to no records AND says the read failed", () => {
@@ -201,6 +267,13 @@ describe("statusOf", () => {
       "granted-always",
     ],
   ];
+  test("superseded comes first, before granted-always", () => {
+    const record = {
+      ...approval({ decision: "grant", always: true }),
+      supersededBy: approvalId(9),
+    };
+    expect(statusOf(record as never)).toBe("superseded");
+  });
   for (const [label, fixture, expected] of cases) {
     test(`${label} -> ${expected}`, () => {
       expect(statusOf(approval(fixture) as never)).toBe(expected);
@@ -221,6 +294,7 @@ test("countByStatus reports every status, so 0 is never confusable with absent",
     "granted",
     "granted-always",
     "pending",
+    "superseded",
   ]);
   expect(counts.pending).toBe(1);
   expect(counts.denied).toBe(0);

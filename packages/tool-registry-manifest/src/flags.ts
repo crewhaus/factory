@@ -102,7 +102,10 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
         field: "dir",
         kind: "path",
         default: ".",
-        opens: [{ path: ".crewhaus/sessions/approvals.jsonl" }],
+        opens: [
+          { path: ".crewhaus/sessions/approvals.jsonl" },
+          { path: ".crewhaus/sessions/approvals.d", beneath: "all" },
+        ],
       },
     ],
   },
@@ -115,7 +118,14 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "harnesses", kind: "path", opens: [{ path: ".crewhaus/sessions/approvals.jsonl" }] },
+      {
+        field: "harnesses",
+        kind: "path",
+        opens: [
+          { path: ".crewhaus/sessions/approvals.jsonl" },
+          { path: ".crewhaus/sessions/approvals.d", beneath: "all" },
+        ],
+      },
       { field: "root", kind: "path", default: ".", beneath: "all" },
     ],
   },

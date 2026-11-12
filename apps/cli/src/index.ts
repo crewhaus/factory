@@ -455,11 +455,15 @@ import {
 } from "@crewhaus/runtime-core";
 import { resolveSandboxBackend, sandboxAvailableFromEnv } from "@crewhaus/sandbox";
 import {
+  DEFAULT_TTL_DAYS,
   type PendingApproval,
   type PendingApprovalStore,
   createPendingApprovalStore,
   createSessionStore,
   evictExpiredSessions,
+  foldReadOnly,
+  ownerAuthorizer,
+  parseDeferUntil,
 } from "@crewhaus/session-store";
 import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
@@ -561,7 +565,16 @@ import {
 } from "./approval-gate";
 // Loop contract 0.4 (Batch C, G11) — the `crewhaus approvals` verbs' pure
 // rendering layer (the file-backed store wiring lives in the handler below).
-import { formatApprovalDetail, formatApprovalsTable } from "./approvals-cli";
+import {
+  DEFER_REASON_CODES,
+  SUPERSEDE_REASON_CODES,
+  alreadyDecidedMessage,
+  formatApprovalDetail,
+  formatApprovalsTable,
+  invalidReasonMessage,
+  listedApprovals,
+  localApprovalActor,
+} from "./approvals-cli";
 import {
   ADVISE_SCHEMA,
   APPROVALS_SCHEMA,
@@ -15460,31 +15473,43 @@ async function runFeedbackCmd(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`.
- * Reads/writes the file-backed `PendingApprovalStore` under the harness's
- * `.crewhaus/sessions/` (the same store the runtime parks against and re-reads
- * to resume a paused run). `--dir` overrides the harness root; `--json` prints
- * the raw store records; grant/deny record an out-of-band decision keyed on the
- * approval id.
+ * Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`,
+ * and since 0.9.0 `supersede|defer`. Reads/writes the file-backed
+ * `PendingApprovalStore` under the harness's `.crewhaus/sessions/` (the same
+ * store the runtime parks against and re-reads to resume a paused run).
+ * `--dir` overrides the harness root; `--json` prints the raw store records.
+ * Reads go through `foldReadOnly` and never rewrite the file; grant/deny are
+ * first-wins (`decide`), so a second decision is refused and names the first.
  */
 async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"] || action === "") {
     process.stdout.write(
-      "usage: crewhaus approvals list|show|grant|deny <id> [--dir <root>] [--by <who>] [--json]\n" +
-        "  list                 all parked approvals under .crewhaus/sessions/, newest first\n" +
-        "  show <id>            full detail for one approval (incl. the verbatim tool input)\n" +
-        "  grant <id> [--once]  record a GRANT — the next run re-issuing the same tool call\n" +
-        "                       proceeds pre-approved. --once (default) is one-shot: the\n" +
-        "                       runtime consumes the grant on use, so a later identical call\n" +
-        "                       re-asks. --by <who> records the deciding identity (> CREWHAUS_USER > cli).\n" +
-        "  grant <id> --always  record a STANDING allow: grants this call AND writes an\n" +
-        "                       `alwaysAllow` rule for the tool to .crewhaus/settings.json, so\n" +
-        "                       every future call of the tool runs pre-approved on this harness\n" +
-        "                       (any input — unlike a one-shot grant, which is keyed to the\n" +
-        "                       exact input). Undo by removing the rule from settings.json.\n" +
-        "  deny <id>            record a DENY — the parked call is refused with a note on resume.\n" +
-        "  These resolve the parks a headless run creates when a tool permission asks and\n" +
-        "  `permissions.ask_mode: pause` (the default) is set.\n",
+      `${[
+        "usage: crewhaus approvals list|show|grant|deny|supersede|defer <id> [--dir <root>] [--by <who>] [--json]",
+        "  list                 all parked approvals under .crewhaus/sessions/, newest first",
+        "  show <id>            full detail for one approval (incl. the verbatim tool input)",
+        "  grant <id> [--once]  record a GRANT — the next run re-issuing the same tool call",
+        "                       proceeds pre-approved. --once (default) is one-shot: the",
+        "                       runtime consumes the grant on use, so a later identical call",
+        "                       re-asks. --by <who> records the deciding identity (> CREWHAUS_USER > cli).",
+        "  grant <id> --always  record a STANDING allow: grants this call AND writes an",
+        "                       `alwaysAllow` rule for the tool to .crewhaus/settings.json, so",
+        "                       every future call of the tool runs pre-approved on this harness",
+        "                       (any input — unlike a one-shot grant, which is keyed to the",
+        "                       exact input). Undo by removing the rule from settings.json.",
+        "  deny <id>            record a DENY — the parked call is refused with a note on resume.",
+        "  The first decision on a request wins: a second grant or deny is refused.",
+        "  supersede <id> --reason <code>",
+        "                       replace a decision before it is used: a fresh request is",
+        "                       parked in its place, to grant or deny.",
+        `                       --reason is one of: ${SUPERSEDE_REASON_CODES.join(", ")}`,
+        "  defer <id> --until <time> --reason <code>",
+        "                       mark a waiting request as deferred until a time with Z or",
+        "                       an offset (for example 2026-12-01T09:00:00Z).",
+        `                       --reason is one of: ${DEFER_REASON_CODES.join(", ")}`,
+        "  These resolve the parks a headless run creates when a tool permission asks and",
+        "  `permissions.ask_mode: pause` (the default) is set.",
+      ].join("\n")}\n`,
     );
     return;
   }
@@ -15498,35 +15523,113 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
     typeof dirFlag === "string"
       ? join(resolve(dirFlag), SESSIONS_SUBDIR)
       : (resolveSessionRootDir(undefined) ?? join(process.cwd(), SESSIONS_SUBDIR));
+  // The harness that owns `.crewhaus/` — its settings file and its approver list.
+  const harnessDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
   const store = createPendingApprovalStore({ rootDir });
   const json = args.flags["json"] === true;
 
-  if (action === "list") {
-    const list = await store.list();
-    if (json) {
-      process.stdout.write(`${JSON.stringify(list, null, 2)}\n`);
+  if (action === "list" || action === "show") {
+    const folded = foldReadOnly(rootDir);
+    if (folded.state === "unreadable") {
+      die(`cannot read the approvals under ${rootDir}: ${folded.reason ?? "unreadable"}`);
+    }
+    if (action === "list") {
+      const list = listedApprovals(folded.records, Date.now(), DEFAULT_TTL_DAYS);
+      if (json) {
+        process.stdout.write(`${JSON.stringify(list, null, 2)}\n`);
+        return;
+      }
+      process.stdout.write(formatApprovalsTable(list));
       return;
     }
-    process.stdout.write(formatApprovalsTable(list));
-    return;
-  }
-
-  const id = args.positional[0];
-  if (typeof id !== "string" || id === "") die("missing <id> — see `crewhaus approvals`");
-
-  if (action === "show") {
-    const found = (await store.list()).find((a: PendingApproval) => a.id === id);
+    const id = args.positional[0];
+    if (typeof id !== "string" || id === "") die("missing <id> — see `crewhaus approvals`");
+    const found = folded.records.find((a: PendingApproval) => a.id === id);
     if (found === undefined) die(`no approval "${id}" under ${rootDir}`);
     if (json) {
       process.stdout.write(`${JSON.stringify(found, null, 2)}\n`);
       return;
     }
-    process.stdout.write(formatApprovalDetail(found));
+    process.stdout.write(
+      formatApprovalDetail(found, Date.now(), { ignored: folded.ignoredById.get(id) ?? 0 }),
+    );
     return;
   }
 
-  // grant | deny — record an out-of-band decision.
+  const id = args.positional[0];
+  if (typeof id !== "string" || id === "") die("missing <id> — see `crewhaus approvals`");
   const by = strFlag(args, "by") ?? process.env["CREWHAUS_USER"] ?? "cli";
+  const local = localApprovalActor();
+  const actor = { ...(local !== undefined ? { local } : {}), display: by };
+  const authorize = ownerAuthorizer(harnessDir);
+  const storeCall = async <T>(call: () => Promise<T>): Promise<T> => {
+    try {
+      return await call();
+    } catch (err) {
+      // The store throws on a malformed id (not appr_<16 hex>) or a refused file.
+      die(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  if (action === "supersede") {
+    const reason = strFlag(args, "reason");
+    if (reason === undefined || !SUPERSEDE_REASON_CODES.includes(reason)) {
+      die(invalidReasonMessage("supersede", reason));
+    }
+    const answer = await storeCall(() =>
+      store.supersede(id, { actor, via: "cli", reason }, { authorize }),
+    );
+    if (answer.outcome === "not-found") die(`no approval "${id}" under ${rootDir}`);
+    if (answer.outcome === "forbidden") die(answer.reason ?? "not allowed to replace this request");
+    if (answer.outcome === "already-decided") {
+      die(`${id} was already replaced by ${answer.winner?.supersededBy ?? "another request"}`);
+    }
+    if (answer.outcome === "stale" || answer.fresh === undefined) {
+      die(`${id} cannot be replaced: ${answer.reason ?? "it is no longer open"}`);
+    }
+    if (json) {
+      process.stdout.write(
+        `${JSON.stringify({ record: answer.record, fresh: answer.fresh }, null, 2)}\n`,
+      );
+      return;
+    }
+    process.stdout.write(
+      `superseded ${id} — ${answer.fresh.toolName}; ${answer.fresh.id} now waits for a decision: crewhaus approvals grant|deny ${answer.fresh.id}\n`,
+    );
+    return;
+  }
+
+  if (action === "defer") {
+    const until = strFlag(args, "until");
+    if (until === undefined) die("missing --until <time> (for example 2026-12-01T09:00:00Z)");
+    const when = parseDeferUntil(until, Date.now());
+    if (typeof when === "string") die(when);
+    const reason = strFlag(args, "reason");
+    if (reason === undefined || !DEFER_REASON_CODES.includes(reason)) {
+      die(invalidReasonMessage("defer", reason));
+    }
+    const answer = await storeCall(() =>
+      store.defer(id, { until, reason, actor, via: "cli" }, { authorize }),
+    );
+    if (answer.outcome === "not-found") die(`no approval "${id}" under ${rootDir}`);
+    if (answer.outcome === "forbidden") die(answer.reason ?? "not allowed to defer this request");
+    if (answer.outcome === "expired") die(`${id} has expired`);
+    if (answer.outcome === "already-decided") {
+      die(
+        `${id} is no longer waiting: ${alreadyDecidedMessage(id, answer.winner ?? answer.record ?? ({} as PendingApproval))}`,
+      );
+    }
+    if (json) {
+      process.stdout.write(`${JSON.stringify(answer.record, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(
+      `deferred ${id} until ${answer.record?.deferredUntil ?? until} (${reason})\n`,
+    );
+    return;
+  }
+
+  // grant | deny — record an out-of-band decision, first-wins.
   const decision: "grant" | "deny" = action === "grant" ? "grant" : "deny";
   // #383 — a standing allow: grant + persist an alwaysAllow rule for the tool.
   const always = args.flags["always"] === true;
@@ -15540,19 +15643,25 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
       `--always writes .crewhaus/settings.json under the HARNESS root, but the approvals store was located via CREWHAUS_SESSION_DIR/tenant scope (${resolveSessionRootDir(undefined)}), so the harness owning settings.json cannot be inferred from the current directory. Re-run with --dir <harness root>.`,
     );
   }
-  let updated: PendingApproval | null;
-  try {
-    updated = await store.resolve(id, decision, by, always ? { always: true } : undefined);
-  } catch (err) {
-    // resolve() throws on a malformed id (not appr_<16 hex>).
-    die(err instanceof Error ? err.message : String(err));
+  const answer = await storeCall(() =>
+    store.decide(
+      id,
+      { choice: decision, actor, via: "cli", ...(always ? { always: true } : {}) },
+      { authorize },
+    ),
+  );
+  if (answer.outcome === "not-found") die(`no approval "${id}" under ${rootDir}`);
+  if (answer.outcome === "forbidden") die(answer.reason ?? "not allowed to decide this request");
+  if (answer.outcome === "expired") die(`${id} has expired`);
+  if (answer.outcome !== "decided" || answer.record === null) {
+    die(alreadyDecidedMessage(id, answer.winner ?? answer.record ?? ({} as PendingApproval)));
   }
-  if (updated === null) die(`no approval "${id}" under ${rootDir}`);
+  const updated = answer.record;
   let ruleNote = "";
   if (always) {
     // The settings file lives at the HARNESS root (the dir owning .crewhaus/),
-    // not under the sessions subdir the store uses.
-    const harnessDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+    // not under the sessions subdir the store uses. Written only once the
+    // grant is the decision that stands.
     try {
       const written = appendSettingsRule(harnessDir, {
         type: "alwaysAllow",
@@ -15565,7 +15674,7 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
       die(
         `granted ${id}, but writing the standing alwaysAllow rule failed: ${
           err instanceof Error ? err.message : String(err)
-        }\nThe grant itself is recorded (one-shot). Fix .crewhaus/settings.json and re-run \`crewhaus approvals grant ${id} --always\`, or add the rule by hand.`,
+        }\nThe grant itself is recorded (one-shot). Fix .crewhaus/settings.json and add the rule { type: alwaysAllow, pattern: ${updated.toolName} } to it by hand.`,
       );
     }
   }
@@ -23779,14 +23888,17 @@ switch (subcommand) {
     await runFeedbackCmd(parseFor(rest, FEEDBACK_SCHEMA));
     break;
   case "approvals": {
-    // Loop contract 0.4 (Batch C, G11) — list | show | grant | deny <id>.
+    // Loop contract 0.4 (Batch C, G11) — list | show | grant | deny <id>;
+    // 0.9.0 — supersede | defer <id>.
     // A leading -h/--help (help flag in the action slot) routes to the
     // handler's own help, not the invalid-action error.
     const first = rest[0] ?? "";
     const isHelp = first === "--help" || first === "-h";
     const action = isHelp ? "" : first;
-    if (!isHelp && !["", "list", "show", "grant", "deny"].includes(action)) {
-      die(`approvals action must be one of: list, show, grant, deny (got "${action}")`);
+    if (!isHelp && !["", "list", "show", "grant", "deny", "supersede", "defer"].includes(action)) {
+      die(
+        `approvals action must be one of: list, show, grant, deny, supersede, defer (got "${action}")`,
+      );
     }
     try {
       await runApprovals(parseFor(isHelp ? rest : rest.slice(1), APPROVALS_SCHEMA), action);

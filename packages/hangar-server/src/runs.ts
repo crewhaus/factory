@@ -216,9 +216,22 @@ export function runArtifactsExist(harnessDir: string, runId: string): boolean {
 // ---------------------------------------------------------------------------
 
 /** The SSE event names this server emits. Named here (and in the route map)
- *  so the UI and the server cannot drift on them. */
-export const SSE_EVENTS = ["state", "output", "exit", "replay", "done"] as const;
+ *  so the UI and the server cannot drift on them. `auth.expired` and
+ *  `auth.revoked` come just before `done` when the session that opened the
+ *  stream ends: the console takes them as it takes a 401. */
+export const SSE_EVENTS = [
+  "state",
+  "output",
+  "exit",
+  "replay",
+  "done",
+  "auth.expired",
+  "auth.revoked",
+] as const;
 export type SseEventName = (typeof SSE_EVENTS)[number];
+
+/** An abort reason that names the event a stream closes with. */
+const CLOSING_EVENTS: ReadonlySet<string> = new Set(["auth.expired", "auth.revoked"]);
 
 export const SSE_HEADERS: Record<string, string> = {
   "content-type": "text/event-stream; charset=utf-8",
@@ -282,6 +295,8 @@ export type RunStreamOptions = {
   readonly maxFrames?: number;
   /** Keep-alive cadence; see {@link SSE_HEARTBEAT_MS}. Tests shorten it. */
   readonly heartbeatMs?: number;
+  /** Closes the stream. An abort whose `reason` is `"auth.expired"` or
+   *  `"auth.revoked"` writes that event, with `{}`, before `done`. */
   readonly signal?: AbortSignal;
 };
 
@@ -331,6 +346,9 @@ export function runEventStream(options: RunStreamOptions): Response {
         unsubscribe?.();
         if (heartbeat !== undefined) clearInterval(heartbeat);
         try {
+          if (CLOSING_EVENTS.has(reason)) {
+            controller.enqueue(encoder.encode(frame(reason as SseEventName, {})));
+          }
           controller.enqueue(encoder.encode(frame("done", { runId: options.runId, reason })));
           controller.close();
         } catch {
@@ -395,7 +413,12 @@ export function runEventStream(options: RunStreamOptions): Response {
         }
       });
 
-      options.signal?.addEventListener("abort", () => finish("aborted"), { once: true });
+      const onAbort = (): void => {
+        const why = options.signal?.reason;
+        finish(typeof why === "string" && CLOSING_EVENTS.has(why) ? why : "aborted");
+      };
+      if (options.signal?.aborted === true) onAbort();
+      else options.signal?.addEventListener("abort", onAbort, { once: true });
     },
   });
   return new Response(stream, { headers: SSE_HEADERS });

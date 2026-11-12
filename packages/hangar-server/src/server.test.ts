@@ -677,7 +677,7 @@ describe("cost routes", () => {
 });
 
 describe("boot tickets (browser handoff without argv exposure)", () => {
-  test("a ticket redirects once to the fragment form, then is spent", async () => {
+  test("a ticket redirects once to a one-time sign-in code, never the token, then is spent", async () => {
     const t = boot({ now: () => NOW });
     const bootPath = t.server.bootPath as string;
     expect(bootPath).toMatch(/^\/boot\/[0-9a-f]{64}$/);
@@ -686,8 +686,13 @@ describe("boot tickets (browser handoff without argv exposure)", () => {
 
     const first = await t.fetchRaw(bootPath, { redirect: "manual" });
     expect(first.status).toBe(302);
-    expect(first.headers.get("location")).toBe(`/#t=${encodeURIComponent(t.token)}`);
+    const location = first.headers.get("location") ?? "";
+    expect(location).toMatch(/^\/#x=[A-Za-z0-9_-]{43}$/);
+    // Home's own key never reaches a browser, in any form.
+    expect(location).not.toContain(t.token);
+    expect(location).not.toContain("#t=");
     expect(first.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(first.headers.get("cache-control")).toBe("no-store");
 
     // Single use: a replayed ticket (from a shell history or a process list)
     // is already dead.
@@ -708,5 +713,24 @@ describe("boot tickets (browser handoff without argv exposure)", () => {
     const minted = body["bootPath"] as string;
     clock = NOW + 120_001; // past BOOT_TICKET_TTL_MS
     expect((await t.fetchRaw(minted, { redirect: "manual" })).status).toBe(404);
+  });
+
+  test("the server takes no token of the caller's: Home's own key is always its file", async () => {
+    // The `token` option is gone: it left no file for the access records to record as
+    // the owner's key. A caller that still passes one gets a minted file, and its value
+    // is refused.
+    const t = boot({ token: "tok-from-the-caller" } as Parameters<typeof bootTestServer>[0]);
+    expect(t.token).not.toBe("tok-from-the-caller");
+    expect(readFileSync(join(t.hangarRoot, "token"), "utf8").trim()).toBe(t.token);
+    const res = await t.fetchRaw("/api/version", {
+      headers: { authorization: "Bearer tok-from-the-caller" },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("a --no-auth Home has no boot links", async () => {
+    const t = boot({ noAuth: true });
+    expect(t.server.bootPath).toBeUndefined();
+    expect((await t.fetchRaw(`/boot/${"0".repeat(64)}`, { redirect: "manual" })).status).toBe(404);
   });
 });

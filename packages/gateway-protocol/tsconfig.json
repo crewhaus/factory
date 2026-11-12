@@ -4,6 +4,12 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../event-log" }, { "path": "../provability" }],
+  "references": [
+    { "path": "../control-contract" },
+    { "path": "../errors" },
+    { "path": "../event-log" },
+    { "path": "../provability" },
+    { "path": "../session-store" }
+  ],
   "include": ["src/**/*"]
 }

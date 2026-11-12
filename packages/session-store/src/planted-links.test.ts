@@ -27,6 +27,7 @@ import { join } from "node:path";
 import {
   createPendingApprovalStore,
   createSessionStore,
+  evictExpiredApprovals,
   generateApprovalId,
   summarizeSessionIntoIndex,
 } from "./index";
@@ -126,6 +127,8 @@ describe("the approvals log (0.7.1)", () => {
     symlinkSync(victim, join(sessions, "approvals.jsonl.tmp"));
     const live = await store.list();
     expect(live.length).toBe(1);
+    // The sweep is what compacts now: it writes through no link either.
+    await evictExpiredApprovals({ rootDir: sessions });
     expect(readFileSync(victim, "utf8")).toBe(VICTIM_TEXT);
     expect(lstatSync(join(sessions, "approvals.jsonl")).isSymbolicLink()).toBe(false);
   });

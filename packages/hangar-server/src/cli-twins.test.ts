@@ -88,7 +88,7 @@ const WATCHME_FLAGS = [
   "forget",
   "help",
 ];
-const APPROVALS_FLAGS = ["dir", "by", "once", "always", "json", "help"];
+const APPROVALS_FLAGS = ["dir", "by", "once", "always", "reason", "until", "json", "help"];
 
 const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
   harness: {
@@ -137,6 +137,8 @@ const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly str
     show: APPROVALS_FLAGS,
     grant: APPROVALS_FLAGS,
     deny: APPROVALS_FLAGS,
+    supersede: APPROVALS_FLAGS,
+    defer: APPROVALS_FLAGS,
   },
 };
 
@@ -273,7 +275,7 @@ describe("the dispatch table matches the CLI", () => {
 
     const entry = readFileSync(join(CLI_SRC, "index.ts"), "utf8");
     const actions = entry.match(
-      /!isHelp && !\["", ([^\]]+)\]\.includes\(action\)[^\n]*\n\s*die\(`approvals/,
+      /!isHelp && !\["", ([^\]]+)\]\.includes\(action\)[^\n]*\n\s*die\(\s*`approvals/,
     );
     expect(actions?.[1]).toBeDefined();
     const verbs = [...(actions?.[1] ?? "").matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
@@ -459,8 +461,8 @@ describe("every twin the contract declares would run if pasted", () => {
   });
 
   test("the checker refuses a verb the CLI does not have", () => {
-    expect(rejectionReason("crewhaus approvals supersede appr_x")).toContain(
-      'unknown approvals verb "supersede"',
+    expect(rejectionReason("crewhaus approvals revoke appr_x")).toContain(
+      'unknown approvals verb "revoke"',
     );
   });
 });

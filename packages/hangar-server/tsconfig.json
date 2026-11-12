@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../access-control" },
     { "path": "../spec-registry" },
     { "path": "../memory-store" },
     { "path": "../wiki-store" },

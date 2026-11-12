@@ -117,7 +117,6 @@ function write(
 
 /** Routes under `/api` the server answers that the console's map does not name. */
 export const OFF_MAP_KEYS: readonly string[] = [
-  "bootTicket",
   "setGroupsAll",
   "removeGroup",
   "scanRoots",
@@ -145,6 +144,20 @@ export const OFF_MAP_OUTSIDE_API: readonly {
 export const ROUTE_TABLE: readonly RouteRow[] = [
   // ---- routes the server branches by hand (no group in routes.js) ----
   read("version", "/api/version", "home.read"),
+  // Signing in is answered before authentication and before the receipts middleware:
+  // it issues or ends a browser session, and changes no harness and no setting.
+  read("authChallenge", "/api/v1/auth/challenge", "public"),
+  readOnly("authSession", "POST", "/api/v1/auth/session", "public", "signs a browser in"),
+  readOnly("authExchange", "POST", "/api/v1/auth/exchange", "public", "signs a browser in"),
+  readOnly("authRefresh", "POST", "/api/v1/auth/refresh", "public", "renews a browser session"),
+  readOnly("authSignOut", "POST", "/api/v1/auth/sign-out", "public", "ends a browser session"),
+  readOnly(
+    "bootTicket",
+    "POST",
+    "/api/boot-ticket",
+    "home.settings.manage",
+    "mints a single-use browser handoff; changes no harness and no setting",
+  ),
   read("harnesses", "/api/harnesses", "home.read", ["filtered"]),
   write("addHarness", "workspace", "POST", "/api/harnesses", "home.registry.manage"),
   write("scan", "workspace", "POST", "/api/scan", "home.registry.manage"),
@@ -707,13 +720,6 @@ export const ROUTE_TABLE: readonly RouteRow[] = [
   write("devStop", "harness", "POST", "/api/h/:id/dev/stop", "h.control"),
 
   // ---- off the console's map ----
-  readOnly(
-    "bootTicket",
-    "POST",
-    "/api/boot-ticket",
-    "home.settings.manage",
-    "mints a single-use browser handoff; changes no harness and no setting",
-  ),
   write("setGroupsAll", "workspace", "PUT", "/api/registry/groups", "home.registry.manage"),
   write("removeGroup", "workspace", "DELETE", "/api/registry/groups", "home.registry.manage"),
   read("scanRoots", "/api/registry/scan-roots", "home.read"),
