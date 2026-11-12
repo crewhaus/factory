@@ -1022,8 +1022,9 @@ export const REVIEW_SCHEMA: ParseArgsSchema = {
   ],
 };
 
-// Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`
-// over the session-store approvals store (`.crewhaus/sessions/approvals.jsonl`).
+// Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`,
+// and 0.9.0's `supersede|defer`, over the session-store approvals store
+// (`.crewhaus/sessions/approvals.jsonl`).
 export const APPROVALS_SCHEMA: ParseArgsSchema = {
   flags: [
     // Harness root that owns `.crewhaus/` (mirrors `security digest --dir`).
@@ -1037,6 +1038,10 @@ export const APPROVALS_SCHEMA: ParseArgsSchema = {
     // `alwaysAllow` rule for the tool into `.crewhaus/settings.json`, so
     // future calls (any input) run pre-approved on this harness.
     { name: "always", takesValue: false },
+    // supersede and defer — a code from the verb's closed list.
+    { name: "reason", takesValue: true },
+    // defer only — an ISO date and time with Z or an offset, later than now.
+    { name: "until", takesValue: true },
     { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],
@@ -1120,6 +1125,8 @@ export const LESSONS_SCHEMA: ParseArgsSchema = {
     // Override the LESSONS.md path (default `<cwd>/LESSONS.md`).
     { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
+    // retire — why the lesson is retired, kept in .crewhaus/lessons/retired.jsonl.
+    { name: "reason", takesValue: true },
   ],
 };
 
@@ -1167,6 +1174,14 @@ export const MEMORY_SCHEMA: ParseArgsSchema = {
     // lines (atomic tmp+rename; the growth-bounding compaction).
     { name: "compact", takesValue: false },
     { name: "help", short: "h" },
+    // forget / correct — why, recorded on the tombstone.
+    { name: "reason", takesValue: true },
+    // correct — the new text, inline or from a file (exactly one).
+    { name: "text", takesValue: true },
+    { name: "text-file", takesValue: true },
+    // mark — the fact is about a person, or is not.
+    { name: "personal", takesValue: false },
+    { name: "not-personal", takesValue: false },
   ],
 };
 
@@ -1193,6 +1208,16 @@ export const WIKI_SCHEMA: ParseArgsSchema = {
     // search — max results to print. Default 10.
     { name: "k", short: "k", takesValue: true },
     { name: "help", short: "h" },
+    // write — the article body, read from a file.
+    { name: "body-file", takesValue: true },
+    // write / archive / rollback — the version you read (0 creates).
+    { name: "expect", takesValue: true },
+    // write — the article title (default: the current one).
+    { name: "title", takesValue: true },
+    // archive — publish it again instead.
+    { name: "undo", takesValue: false },
+    // rollback — the version whose text comes back.
+    { name: "to", takesValue: true },
   ],
 };
 
@@ -1300,6 +1325,16 @@ export const STATE_SCHEMA: ParseArgsSchema = {
     { name: "merge", takesValue: true },
     { name: "force", takesValue: false },
     { name: "help", short: "h" },
+    // clear — which working memory, of which session and spec.
+    { name: "scope", takesValue: true },
+    { name: "session", takesValue: true },
+    { name: "spec", takesValue: true },
+    // clear — move the files; without it, list them and the command that moves them.
+    { name: "yes", takesValue: false },
+    // clear — the fingerprint the listing printed.
+    { name: "expect", takesValue: true },
+    // restore — a trash snapshot instead of a backup.
+    { name: "trash", takesValue: true },
   ],
 };
 

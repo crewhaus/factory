@@ -29,6 +29,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { OWNER_BLOCKS, SETTINGS_FILENAME } from "@crewhaus/access-control";
 import {
   DEFAULT_QUIET_HOURS,
   DEFAULT_RULES,
@@ -38,7 +39,7 @@ import {
   normalizeRules,
 } from "./notifications";
 
-export const SETTINGS_FILENAME = "settings.json";
+export { SETTINGS_FILENAME };
 const SETTINGS_VERSION = 1;
 
 export type NotificationSettings = {
@@ -180,7 +181,13 @@ export function openSettingsStore(
     cached = next;
     try {
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+      // The owner's blocks are not this store's to change: they are read from the file
+      // as it is NOW and written back untouched, whatever this process read at boot.
+      writeFileSync(
+        path,
+        `${JSON.stringify({ ...next, ...ownerBlocksOf(path) }, null, 2)}\n`,
+        "utf8",
+      );
     } catch (err) {
       onWarn(
         `hangar-server: could not persist settings to ${path}: ${err instanceof Error ? err.message : String(err)}`,
@@ -282,4 +289,23 @@ export function readOnlyRefusal(
       ? "this manager was started with --read-only-locked; restart it without that flag"
       : 'turn it off in Settings (or PUT /api/read-only {"enabled":false})',
   };
+}
+
+// ---------------------------------------------------------------------------
+// The owner's blocks: `access` and `links`
+// ---------------------------------------------------------------------------
+
+/** `access` and `links` exactly as the file holds them now; `{}` when it holds neither.
+ *  They are the owner's (`@crewhaus/access-control` reads and writes them), so a write
+ *  from this store carries them through untouched. */
+function ownerBlocksOf(path: string): Record<string, unknown> {
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (!isRecord(raw)) return {};
+    const out: Record<string, unknown> = {};
+    for (const key of OWNER_BLOCKS) if (key in raw) out[key] = raw[key];
+    return out;
+  } catch {
+    return {};
+  }
 }

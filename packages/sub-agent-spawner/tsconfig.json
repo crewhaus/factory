@@ -8,6 +8,8 @@
     { "path": "../adapter-anthropic" },
     { "path": "../agent-context-isolation" },
     { "path": "../boundary-classifier" },
+    { "path": "../control-contract" },
+    { "path": "../control-records" },
     { "path": "../cost-tracker" },
     { "path": "../errors" },
     { "path": "../event-log" },

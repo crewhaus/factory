@@ -338,6 +338,7 @@ import {
 // redactor is injected.
 import {
   KnowledgeSyncError,
+  PULL_NEEDS_SPEC_REASON,
   type PullPlan,
   type PushPlan,
   type Redactor,
@@ -349,12 +350,15 @@ import {
   formatPushReport,
   fragmentContentHash,
   harnessOptedIn,
+  harnessSpecName,
   memoryContentHash,
   planPull,
   planPush,
+  readHarnessFactStates,
   readHarnessGraders,
   readHarnessMemories,
   readHarnessPrompts,
+  readRetractions,
   readSharedFragments,
   readSharedMemories,
 } from "@crewhaus/harness-lifecycle/knowledge-sync";
@@ -446,7 +450,7 @@ import {
 // per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
 // mines the same scoreboard into pool-policy suggestions.
 import { openScoreboard } from "@crewhaus/routing-store";
-import { createRunContext } from "@crewhaus/run-context";
+import { createRunContext, runWithScope } from "@crewhaus/run-context";
 import {
   type AgentIdentityFile,
   type RunChatLoopOptions,
@@ -455,11 +459,15 @@ import {
 } from "@crewhaus/runtime-core";
 import { resolveSandboxBackend, sandboxAvailableFromEnv } from "@crewhaus/sandbox";
 import {
+  DEFAULT_TTL_DAYS,
   type PendingApproval,
   type PendingApprovalStore,
   createPendingApprovalStore,
   createSessionStore,
   evictExpiredSessions,
+  foldReadOnly,
+  ownerAuthorizer,
+  parseDeferUntil,
 } from "@crewhaus/session-store";
 import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
@@ -561,7 +569,16 @@ import {
 } from "./approval-gate";
 // Loop contract 0.4 (Batch C, G11) — the `crewhaus approvals` verbs' pure
 // rendering layer (the file-backed store wiring lives in the handler below).
-import { formatApprovalDetail, formatApprovalsTable } from "./approvals-cli";
+import {
+  DEFER_REASON_CODES,
+  SUPERSEDE_REASON_CODES,
+  alreadyDecidedMessage,
+  formatApprovalDetail,
+  formatApprovalsTable,
+  invalidReasonMessage,
+  listedApprovals,
+  localApprovalActor,
+} from "./approvals-cli";
 import {
   ADVISE_SCHEMA,
   APPROVALS_SCHEMA,
@@ -1263,6 +1280,7 @@ import {
   modelsAuditExitCode,
   parseModelsArgs,
 } from "./models-cli";
+import { holdCliMutatingLease } from "./mutating-lease";
 // Item 66 — `crewhaus onchain tune|sentinel`: mine wallet-engine receipt +
 // simulation history to propose a tuned transaction_policy and flag anomalous
 // spend. Side-effect-free (this entry file reads history + writes patch/report).
@@ -1418,7 +1436,14 @@ import {
 } from "./run-observability";
 // Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume`
 // spec-resolution + session-id helpers (engine-free, unit-tested).
-import { RunsError, isRunsSessionId, resolveRunsResumeSpecPath } from "./runs";
+import {
+  RunsError,
+  isRunsRunId,
+  isRunsSessionId,
+  resolveRunsResumeSpecPath,
+  resolveRunsResumeTarget,
+  runsResumeScope,
+} from "./runs";
 // Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
 // assets generated from the spec (deterministic template / one-shot model
 // sample stubs + a single spec-goal llm_judge or floor grader), in a
@@ -2065,6 +2090,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     await runCompileWatch({ specPath, strict, readme });
     return;
   }
+  await holdCliMutatingLease(dirname(resolve(specPath)), "compile");
 
   const absSpec = resolve(specPath);
   logger.debug("compile.start", { spec: absSpec, out: outDir, emitIr, strict, allowUnmarkedSinks });
@@ -4152,7 +4178,11 @@ function applyRunObservabilityEnv(args: ParsedArgs, ir: ReturnType<typeof lower>
 
 /**
  * Loop contract 0.4 (Batch F, item 7, CLI half) — `crewhaus runs resume
- * <session> [--spec <path>] [--prompt <text>] [--model <m>] …`.
+ * <session|run> [--spec <path>] [--prompt <text>] [--model <m>] …`.
+ *
+ * A run id is resolved to its session through the harness's run ledger
+ * (`resolveRunsResumeTarget`); the resumed run is recorded as started by a
+ * resume, continuing the session's newest parked run.
  *
  * Re-drives a persisted cli session: resolves the spec backing it (`--spec`, or
  * `crewhaus.yaml` in the cwd), confirms the session exists AND belongs to that
@@ -4167,11 +4197,14 @@ function applyRunObservabilityEnv(args: ParsedArgs, ir: ReturnType<typeof lower>
 async function runRunsResume(args: ParsedArgs): Promise<void> {
   if (args.flags["help"] === true) {
     process.stdout.write(
-      "usage: crewhaus runs resume <session> [--spec <path>] [--prompt <text>] [--model <m>]\n" +
+      "usage: crewhaus runs resume <session|run> [--spec <path>] [--prompt <text>] [--model <m>]\n" +
         "                        [--ask-mode <pause|deny>] [--trace off|ring|pretty|json]\n" +
         "                        [--budget-usd <n>] [--streaming]\n" +
         "  Re-drives a persisted cli session (a sess_<16 hex> id) — replaying its\n" +
-        "  transcript and continuing the loop. The session store keeps only\n" +
+        "  transcript and continuing the loop. A run id resumes the session that\n" +
+        "  run belongs to, read from the run records under\n" +
+        "  .crewhaus/run/control/runs/ in the cwd; a job's run id resumes the session\n" +
+        "  of its newest run. The session store keeps only\n" +
         "  name/target/model, so the spec is resolved from --spec, else\n" +
         "  crewhaus.yaml in the cwd (sessions live under the dir you run from,\n" +
         "  or under CREWHAUS_SESSION_DIR when it is set).\n" +
@@ -4186,15 +4219,25 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
     );
     return;
   }
-  const sessionId = args.positional[0];
-  if (typeof sessionId !== "string") {
+  const id = args.positional[0];
+  if (typeof id !== "string") {
     die(
-      "missing <session> — a sess_<16 hex> id (list live sessions with `crewhaus sessions tail`)",
+      "missing <session|run> — a sess_<16 hex> id (list live sessions with `crewhaus sessions tail`) or a run id",
     );
   }
-  if (!isRunsSessionId(sessionId)) {
-    die(`invalid <session> "${sessionId}" — expected sess_<16 hex>`);
+  if (!isRunsSessionId(id) && !isRunsRunId(id)) {
+    die(
+      `invalid <session|run> "${id}" — expected sess_<16 hex> or a run id (run_ and 26 letters and digits)`,
+    );
   }
+  let target: ReturnType<typeof resolveRunsResumeTarget>;
+  try {
+    target = resolveRunsResumeTarget(id, process.cwd());
+  } catch (err) {
+    if (err instanceof RunsError) die(err.message);
+    throw err;
+  }
+  const sessionId = target.sessionId;
 
   // Resolve the spec backing the resume (--spec, else cwd/crewhaus.yaml).
   let specPath: string;
@@ -4248,7 +4291,8 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
     positional: [specPath],
     flags: { ...args.flags, resume: sessionId },
   };
-  await runRunCli(resumeArgs, ir, specPath);
+  // The resumed run is recorded as started by a resume, continuing the parked run.
+  await runWithScope(runsResumeScope(target), () => runRunCli(resumeArgs, ir, specPath));
 }
 
 /**
@@ -7353,6 +7397,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   const retryErrors = args.flags["no-retry"] !== true;
   const outDirArg = args.flags["out"];
   const absSpec = resolve(specPath);
+  await holdCliMutatingLease(dirname(absSpec), "optimize");
   const runId = `opt_${Date.now().toString(16)}`;
   const outDir =
     typeof outDirArg === "string"
@@ -8571,6 +8616,7 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       `spec not found at ${absSpec} — run from the harness directory (standalone-harness convention) or pass <spec.yaml>`,
     );
   }
+  await holdCliMutatingLease(dirname(absSpec), "flywheel run");
   const dryRun = args.flags["dry-run"] === true;
 
   // Invariant: never run over uncommitted spec changes (see gitSpecStatus).
@@ -9615,6 +9661,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   }
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
+  await holdCliMutatingLease(dirname(resolve(specPath)), "eval");
   const datasetPath = args.flags["dataset"];
   const gradersPath = args.flags["graders"];
   const outDirArg = args.flags["out"];
@@ -15455,31 +15502,43 @@ async function runFeedbackCmd(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`.
- * Reads/writes the file-backed `PendingApprovalStore` under the harness's
- * `.crewhaus/sessions/` (the same store the runtime parks against and re-reads
- * to resume a paused run). `--dir` overrides the harness root; `--json` prints
- * the raw store records; grant/deny record an out-of-band decision keyed on the
- * approval id.
+ * Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`,
+ * and since 0.9.0 `supersede|defer`. Reads/writes the file-backed
+ * `PendingApprovalStore` under the harness's `.crewhaus/sessions/` (the same
+ * store the runtime parks against and re-reads to resume a paused run).
+ * `--dir` overrides the harness root; `--json` prints the raw store records.
+ * Reads go through `foldReadOnly` and never rewrite the file; grant/deny are
+ * first-wins (`decide`), so a second decision is refused and names the first.
  */
 async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"] || action === "") {
     process.stdout.write(
-      "usage: crewhaus approvals list|show|grant|deny <id> [--dir <root>] [--by <who>] [--json]\n" +
-        "  list                 all parked approvals under .crewhaus/sessions/, newest first\n" +
-        "  show <id>            full detail for one approval (incl. the verbatim tool input)\n" +
-        "  grant <id> [--once]  record a GRANT — the next run re-issuing the same tool call\n" +
-        "                       proceeds pre-approved. --once (default) is one-shot: the\n" +
-        "                       runtime consumes the grant on use, so a later identical call\n" +
-        "                       re-asks. --by <who> records the deciding identity (> CREWHAUS_USER > cli).\n" +
-        "  grant <id> --always  record a STANDING allow: grants this call AND writes an\n" +
-        "                       `alwaysAllow` rule for the tool to .crewhaus/settings.json, so\n" +
-        "                       every future call of the tool runs pre-approved on this harness\n" +
-        "                       (any input — unlike a one-shot grant, which is keyed to the\n" +
-        "                       exact input). Undo by removing the rule from settings.json.\n" +
-        "  deny <id>            record a DENY — the parked call is refused with a note on resume.\n" +
-        "  These resolve the parks a headless run creates when a tool permission asks and\n" +
-        "  `permissions.ask_mode: pause` (the default) is set.\n",
+      `${[
+        "usage: crewhaus approvals list|show|grant|deny|supersede|defer <id> [--dir <root>] [--by <who>] [--json]",
+        "  list                 all parked approvals under .crewhaus/sessions/, newest first",
+        "  show <id>            full detail for one approval (incl. the verbatim tool input)",
+        "  grant <id> [--once]  record a GRANT — the next run re-issuing the same tool call",
+        "                       proceeds pre-approved. --once (default) is one-shot: the",
+        "                       runtime consumes the grant on use, so a later identical call",
+        "                       re-asks. --by <who> records the deciding identity (> CREWHAUS_USER > cli).",
+        "  grant <id> --always  record a STANDING allow: grants this call AND writes an",
+        "                       `alwaysAllow` rule for the tool to .crewhaus/settings.json, so",
+        "                       every future call of the tool runs pre-approved on this harness",
+        "                       (any input — unlike a one-shot grant, which is keyed to the",
+        "                       exact input). Undo by removing the rule from settings.json.",
+        "  deny <id>            record a DENY — the parked call is refused with a note on resume.",
+        "  The first decision on a request wins: a second grant or deny is refused.",
+        "  supersede <id> --reason <code>",
+        "                       replace a decision before it is used: a fresh request is",
+        "                       parked in its place, to grant or deny.",
+        `                       --reason is one of: ${SUPERSEDE_REASON_CODES.join(", ")}`,
+        "  defer <id> --until <time> --reason <code>",
+        "                       mark a waiting request as deferred until a time with Z or",
+        "                       an offset (for example 2026-12-01T09:00:00Z).",
+        `                       --reason is one of: ${DEFER_REASON_CODES.join(", ")}`,
+        "  These resolve the parks a headless run creates when a tool permission asks and",
+        "  `permissions.ask_mode: pause` (the default) is set.",
+      ].join("\n")}\n`,
     );
     return;
   }
@@ -15493,35 +15552,113 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
     typeof dirFlag === "string"
       ? join(resolve(dirFlag), SESSIONS_SUBDIR)
       : (resolveSessionRootDir(undefined) ?? join(process.cwd(), SESSIONS_SUBDIR));
+  // The harness that owns `.crewhaus/` — its settings file and its approver list.
+  const harnessDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
   const store = createPendingApprovalStore({ rootDir });
   const json = args.flags["json"] === true;
 
-  if (action === "list") {
-    const list = await store.list();
-    if (json) {
-      process.stdout.write(`${JSON.stringify(list, null, 2)}\n`);
+  if (action === "list" || action === "show") {
+    const folded = foldReadOnly(rootDir);
+    if (folded.state === "unreadable") {
+      die(`cannot read the approvals under ${rootDir}: ${folded.reason ?? "unreadable"}`);
+    }
+    if (action === "list") {
+      const list = listedApprovals(folded.records, Date.now(), DEFAULT_TTL_DAYS);
+      if (json) {
+        process.stdout.write(`${JSON.stringify(list, null, 2)}\n`);
+        return;
+      }
+      process.stdout.write(formatApprovalsTable(list));
       return;
     }
-    process.stdout.write(formatApprovalsTable(list));
-    return;
-  }
-
-  const id = args.positional[0];
-  if (typeof id !== "string" || id === "") die("missing <id> — see `crewhaus approvals`");
-
-  if (action === "show") {
-    const found = (await store.list()).find((a: PendingApproval) => a.id === id);
+    const id = args.positional[0];
+    if (typeof id !== "string" || id === "") die("missing <id> — see `crewhaus approvals`");
+    const found = folded.records.find((a: PendingApproval) => a.id === id);
     if (found === undefined) die(`no approval "${id}" under ${rootDir}`);
     if (json) {
       process.stdout.write(`${JSON.stringify(found, null, 2)}\n`);
       return;
     }
-    process.stdout.write(formatApprovalDetail(found));
+    process.stdout.write(
+      formatApprovalDetail(found, Date.now(), { ignored: folded.ignoredById.get(id) ?? 0 }),
+    );
     return;
   }
 
-  // grant | deny — record an out-of-band decision.
+  const id = args.positional[0];
+  if (typeof id !== "string" || id === "") die("missing <id> — see `crewhaus approvals`");
   const by = strFlag(args, "by") ?? process.env["CREWHAUS_USER"] ?? "cli";
+  const local = localApprovalActor();
+  const actor = { ...(local !== undefined ? { local } : {}), display: by };
+  const authorize = ownerAuthorizer(harnessDir);
+  const storeCall = async <T>(call: () => Promise<T>): Promise<T> => {
+    try {
+      return await call();
+    } catch (err) {
+      // The store throws on a malformed id (not appr_<16 hex>) or a refused file.
+      die(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  if (action === "supersede") {
+    const reason = strFlag(args, "reason");
+    if (reason === undefined || !SUPERSEDE_REASON_CODES.includes(reason)) {
+      die(invalidReasonMessage("supersede", reason));
+    }
+    const answer = await storeCall(() =>
+      store.supersede(id, { actor, via: "cli", reason }, { authorize }),
+    );
+    if (answer.outcome === "not-found") die(`no approval "${id}" under ${rootDir}`);
+    if (answer.outcome === "forbidden") die(answer.reason ?? "not allowed to replace this request");
+    if (answer.outcome === "already-decided") {
+      die(`${id} was already replaced by ${answer.winner?.supersededBy ?? "another request"}`);
+    }
+    if (answer.outcome === "stale" || answer.fresh === undefined) {
+      die(`${id} cannot be replaced: ${answer.reason ?? "it is no longer open"}`);
+    }
+    if (json) {
+      process.stdout.write(
+        `${JSON.stringify({ record: answer.record, fresh: answer.fresh }, null, 2)}\n`,
+      );
+      return;
+    }
+    process.stdout.write(
+      `superseded ${id} — ${answer.fresh.toolName}; ${answer.fresh.id} now waits for a decision: crewhaus approvals grant|deny ${answer.fresh.id}\n`,
+    );
+    return;
+  }
+
+  if (action === "defer") {
+    const until = strFlag(args, "until");
+    if (until === undefined) die("missing --until <time> (for example 2026-12-01T09:00:00Z)");
+    const when = parseDeferUntil(until, Date.now());
+    if (typeof when === "string") die(when);
+    const reason = strFlag(args, "reason");
+    if (reason === undefined || !DEFER_REASON_CODES.includes(reason)) {
+      die(invalidReasonMessage("defer", reason));
+    }
+    const answer = await storeCall(() =>
+      store.defer(id, { until, reason, actor, via: "cli" }, { authorize }),
+    );
+    if (answer.outcome === "not-found") die(`no approval "${id}" under ${rootDir}`);
+    if (answer.outcome === "forbidden") die(answer.reason ?? "not allowed to defer this request");
+    if (answer.outcome === "expired") die(`${id} has expired`);
+    if (answer.outcome === "already-decided") {
+      die(
+        `${id} is no longer waiting: ${alreadyDecidedMessage(id, answer.winner ?? answer.record ?? ({} as PendingApproval))}`,
+      );
+    }
+    if (json) {
+      process.stdout.write(`${JSON.stringify(answer.record, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(
+      `deferred ${id} until ${answer.record?.deferredUntil ?? until} (${reason})\n`,
+    );
+    return;
+  }
+
+  // grant | deny — record an out-of-band decision, first-wins.
   const decision: "grant" | "deny" = action === "grant" ? "grant" : "deny";
   // #383 — a standing allow: grant + persist an alwaysAllow rule for the tool.
   const always = args.flags["always"] === true;
@@ -15535,19 +15672,25 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
       `--always writes .crewhaus/settings.json under the HARNESS root, but the approvals store was located via CREWHAUS_SESSION_DIR/tenant scope (${resolveSessionRootDir(undefined)}), so the harness owning settings.json cannot be inferred from the current directory. Re-run with --dir <harness root>.`,
     );
   }
-  let updated: PendingApproval | null;
-  try {
-    updated = await store.resolve(id, decision, by, always ? { always: true } : undefined);
-  } catch (err) {
-    // resolve() throws on a malformed id (not appr_<16 hex>).
-    die(err instanceof Error ? err.message : String(err));
+  const answer = await storeCall(() =>
+    store.decide(
+      id,
+      { choice: decision, actor, via: "cli", ...(always ? { always: true } : {}) },
+      { authorize },
+    ),
+  );
+  if (answer.outcome === "not-found") die(`no approval "${id}" under ${rootDir}`);
+  if (answer.outcome === "forbidden") die(answer.reason ?? "not allowed to decide this request");
+  if (answer.outcome === "expired") die(`${id} has expired`);
+  if (answer.outcome !== "decided" || answer.record === null) {
+    die(alreadyDecidedMessage(id, answer.winner ?? answer.record ?? ({} as PendingApproval)));
   }
-  if (updated === null) die(`no approval "${id}" under ${rootDir}`);
+  const updated = answer.record;
   let ruleNote = "";
   if (always) {
     // The settings file lives at the HARNESS root (the dir owning .crewhaus/),
-    // not under the sessions subdir the store uses.
-    const harnessDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+    // not under the sessions subdir the store uses. Written only once the
+    // grant is the decision that stands.
     try {
       const written = appendSettingsRule(harnessDir, {
         type: "alwaysAllow",
@@ -15560,7 +15703,7 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
       die(
         `granted ${id}, but writing the standing alwaysAllow rule failed: ${
           err instanceof Error ? err.message : String(err)
-        }\nThe grant itself is recorded (one-shot). Fix .crewhaus/settings.json and re-run \`crewhaus approvals grant ${id} --always\`, or add the rule by hand.`,
+        }\nThe grant itself is recorded (one-shot). Fix .crewhaus/settings.json and add the rule { type: alwaysAllow, pattern: ${updated.toolName} } to it by hand.`,
       );
     }
   }
@@ -16217,13 +16360,15 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   if (args.flags["help"] === true && action === undefined) {
     process.stdout.write(
       "usage: crewhaus lessons update [--sessions N|all] [--low-score F] [-o <LESSONS.md>]\n" +
+        '       crewhaus lessons retire <lesson> [--reason "<r>"] [-o <LESSONS.md>]\n' +
         "  Mine corrections + recurring failure→fix patterns into a deduped LESSONS.md\n" +
         "  (auto-loaded into the system prompt), plus per-user prefs under .crewhaus/preferences/.\n",
     );
     return;
   }
+  if (action === "retire") return runEditVerb("runLessonsRetire", args);
   if (action !== "update") {
-    die(`lessons: unknown action "${action ?? ""}" — supported: update`);
+    die(`lessons: unknown action "${action ?? ""}" — supported: update, retire`);
   }
   const lowScore = floatFlag(args, "low-score") ?? 0.5;
   if (lowScore < 0 || lowScore > 1) die(`invalid --low-score "${lowScore}" — must be in [0,1]`);
@@ -16233,10 +16378,10 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   const { turns, feedback } = gatherTurnsAndFeedback(sessionIds);
 
   // Failure signals reuse dataset-mine's negative-signal detection.
-  const failureSignals: Array<{ input: string; reason: string }> = [];
+  const failureSignals: Array<{ input: string; reason: string; sessionId: string }> = [];
   for (const id of sessionIds) {
     for (const c of mineSession(id, readSessionEvents(id))) {
-      failureSignals.push({ input: c.input, reason: c.reason });
+      failureSignals.push({ input: c.input, reason: c.reason, sessionId: id });
     }
   }
   if (feedback.length === 0 && failureSignals.length === 0) {
@@ -16248,13 +16393,27 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
   const redact = async (t: string): Promise<string> => (await redactor.redact(t)).text;
 
-  const freshLessons = await mineLessons(turns, feedback, failureSignals, { lowScore, redact });
+  // A lesson a person retired is never added again.
+  const { lessonId, readRetiredLessons, recordLessonProvenance } = await import(
+    "./knowledge-edit-cmd"
+  );
+  const retired = readRetiredLessons(process.cwd());
+  const freshLessons = (
+    await mineLessons(turns, feedback, failureSignals, { lowScore, redact })
+  ).filter((l) => !retired.has(lessonId(l)));
 
   // Merge into the existing LESSONS.md, preserving its human-authored preamble.
   const lessonsFile = strFlag(args, "out") ?? join(process.cwd(), "LESSONS.md");
   const existingRaw = existsSync(lessonsFile) ? readFileSync(lessonsFile, "utf-8") : "";
   const { preamble, lessons: existing } = parseLessonsMd(existingRaw);
   const merged = mergeLessons(existing, freshLessons);
+  // Which sessions each new lesson came from (ids only), beside the file.
+  const known = new Set(existing.map((l) => l.key));
+  recordLessonProvenance(
+    process.cwd(),
+    freshLessons.filter((l) => !known.has(l.key)),
+    () => new Date(),
+  );
   // TODO(#56 F7): `merged` grows unbounded across updates (dedupe never evicts)
   // — add a cap/prune (e.g. keep the newest/highest-signal N lessons) so the
   // auto-injected LESSONS.md can't bloat the system prompt over time.
@@ -16549,6 +16708,40 @@ async function runSessionsTail(args: ParsedArgs): Promise<void> {
  * (trash + undo) deliberately do NOT live here — they arrive with the
  * continuity store (design §2.6).
  */
+/**
+ * Run one `./knowledge-edit-cmd` verb (memory correct|mark, wiki write|archive|
+ * rollback, state clear|trash|restore --trash, lessons retire) in this process:
+ * a refusal dies with its message, a conflict exits 1. Outside a terminal a
+ * verb that would ask refuses unless `--yes` was given.
+ */
+async function runEditVerb(
+  verb: keyof Omit<typeof import("./knowledge-edit-cmd"), "KnowledgeEditError">,
+  args: ParsedArgs,
+): Promise<void> {
+  const mod = await import("./knowledge-edit-cmd");
+  const run = mod[verb] as (
+    a: ParsedArgs,
+    io: import("./knowledge-edit-cmd").KnowledgeEditIo,
+  ) => Promise<0 | 1>;
+  try {
+    const code = await run(args, {
+      cwd: process.cwd(),
+      stdout: (line) => process.stdout.write(`${line}\n`),
+      now: () => new Date(),
+      confirm: async (prompt) => {
+        if (process.stdin.isTTY !== true) {
+          die(`${args.positional[0] ?? verb}: refusing without --yes outside a terminal`);
+        }
+        return promptYesNo(prompt);
+      },
+    });
+    if (code !== 0) process.exit(code);
+  } catch (err) {
+    if (err instanceof mod.KnowledgeEditError || err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
 async function runMemory(args: ParsedArgs): Promise<void> {
   const action = args.positional[0];
   if (args.flags["help"] === true && action === undefined) {
@@ -16557,7 +16750,10 @@ async function runMemory(args: ParsedArgs): Promise<void> {
         "       crewhaus memory show <mem_id> [--spec <name>]\n" +
         "       crewhaus memory forget <mem_id> | --query <q> [--spec <name>] [--yes]\n" +
         "       crewhaus memory sweep [--compact] [--spec <name>] [--yes]\n" +
+        '       crewhaus memory correct <mem_id> (--text "<t>" | --text-file <f>) --reason "<r>" [--spec <name>] [--yes]\n' +
+        "       crewhaus memory mark <mem_id> (--personal | --not-personal) [--spec <name>]\n" +
         "  Inspect + explicitly forget the per-spec memory stores under .crewhaus/memories/.\n" +
+        "  correct replaces a wrong fact with the right one; the old fact stays in history.\n" +
         "  forget appends supersede tombstones (append-only; never a hard delete); a --query\n" +
         "  forgets EVERY matching memory. sweep tombstones TTL-expired entries; --compact\n" +
         "  additionally rewrites the file dropping dead lines (atomic tmp+rename).\n",
@@ -16648,7 +16844,7 @@ async function runMemory(args: ParsedArgs): Promise<void> {
         return;
       }
       const forgotten = await store.forget((id ?? query) as string, {
-        reason: "crewhaus memory forget",
+        reason: strFlag(args, "reason") ?? "crewhaus memory forget",
       });
       process.stdout.write(
         `[memory] forgot ${forgotten.length} memory(ies) (superseded tombstones in ${store.path()})\n`,
@@ -16684,8 +16880,14 @@ async function runMemory(args: ParsedArgs): Promise<void> {
       }
       return;
     }
+    case "correct":
+      return runEditVerb("runMemoryCorrect", args);
+    case "mark":
+      return runEditVerb("runMemoryMark", args);
     default:
-      die(`memory: unknown action "${action ?? ""}" — supported: list, show, forget, sweep`);
+      die(
+        `memory: unknown action "${action ?? ""}" — supported: list, show, forget, sweep, correct, mark`,
+      );
   }
 }
 
@@ -16736,6 +16938,9 @@ async function runWiki(args: ParsedArgs): Promise<void> {
         "       crewhaus wiki show <slug> [--spec <name>]\n" +
         "       crewhaus wiki search <q> [--spec <name>] [-k <n>]\n" +
         "       crewhaus wiki stats [--spec <name>]\n" +
+        "       crewhaus wiki write <slug> --body-file <f> --expect <v> [--title <t>] [--spec <name>]\n" +
+        "       crewhaus wiki archive <slug> --expect <v> [--undo] [--spec <name>]\n" +
+        "       crewhaus wiki rollback <slug> --to <n> --expect <current> [--spec <name>]\n" +
         "  Inspect the per-spec local wikis under .crewhaus/wiki/ (versioned articles;\n" +
         "  priors are kept under versions/<slug>/ — superseded, never deleted). list is\n" +
         "  stalest-first (the REFLECT order); search is BM25 keyword ranking.\n",
@@ -16819,8 +17024,16 @@ async function runWiki(args: ParsedArgs): Promise<void> {
       }
       return;
     }
+    case "write":
+      return runEditVerb("runWikiWrite", args);
+    case "archive":
+      return runEditVerb("runWikiArchive", args);
+    case "rollback":
+      return runEditVerb("runWikiRollback", args);
     default:
-      die(`wiki: unknown action "${action ?? ""}" — supported: list, show, search, stats`);
+      die(
+        `wiki: unknown action "${action ?? ""}" — supported: list, show, search, stats, write, archive, rollback`,
+      );
   }
 }
 
@@ -17956,23 +18169,27 @@ async function runKnowledge(args: ParsedArgs, action: string): Promise<void> {
   try {
     if (doPush) {
       for (const h of optedIn) {
-        const existingMemoryHashes = new Set(
-          readSharedMemories(sharedDir).map((m) => m.contentHash),
-        );
+        const sharedMemoriesNow = readSharedMemories(sharedDir);
+        const existingMemoryHashes = new Set(sharedMemoriesNow.map((m) => m.contentHash));
         const existingFragmentHashes = new Set([
           ...readSharedFragments(sharedDir, "grader").map((f) => f.contentHash),
           ...readSharedFragments(sharedDir, "prompt").map((f) => f.contentHash),
         ]);
         const graders = readHarnessGraders(h.dir);
+        // Live, non-personal facts only; corrected or expired ones are retracted.
+        const facts = await readHarnessFactStates(h.dir);
         const plan: PushPlan = await planPush({
           harness: basename(h.dir),
-          memories: readHarnessMemories(h.dir),
+          memories: facts.live,
           ...(graders !== undefined ? { graders } : {}),
           prompts: readHarnessPrompts(h.dir),
           existingMemoryHashes,
           existingFragmentHashes,
           redact,
           now,
+          deadFacts: facts.dead,
+          sharedMemories: sharedMemoriesNow,
+          existingRetractions: readRetractions(sharedDir),
         });
         if (!dryRun) applyPush(sharedDir, plan, now);
         for (const line of formatPushReport(basename(h.dir), plan, dryRun)) {
@@ -17986,7 +18203,10 @@ async function runKnowledge(args: ParsedArgs, action: string): Promise<void> {
         ...readSharedFragments(sharedDir, "grader"),
         ...readSharedFragments(sharedDir, "prompt"),
       ];
+      const retractions = readRetractions(sharedDir);
       for (const h of optedIn) {
+        // Facts land in the harness's own spec store, so a pull needs its name.
+        const specName = harnessSpecName(h.dir);
         const harnessMemoryHashes = new Set(
           readHarnessMemories(h.dir).map((m) => memoryContentHash(m.text, m.tags)),
         );
@@ -18002,7 +18222,12 @@ async function runKnowledge(args: ParsedArgs, action: string): Promise<void> {
           harnessMemoryHashes,
           harnessFragmentHashes,
         });
-        if (!dryRun) applyPull(h.dir, plan, now);
+        if (specName === undefined && plan.memories.length > 0) {
+          process.stdout.write(`${basename(h.dir)}: pull refused — ${PULL_NEEDS_SPEC_REASON}\n`);
+          process.exitCode = 1;
+          continue;
+        }
+        if (!dryRun) await applyPull(h.dir, plan, now, { specName, retractions });
         for (const line of formatPullReport(basename(h.dir), plan, dryRun)) {
           process.stdout.write(`${line}\n`);
         }
@@ -18222,18 +18447,23 @@ async function runRetire(args: ParsedArgs): Promise<void> {
         );
         const redact = await buildProductionKnowledgeRedactor();
         const graders = readHarnessGraders(harnessDir);
+        const facts = await readHarnessFactStates(harnessDir);
+        const sharedMemoriesNow = readSharedMemories(sharedDir);
         const plan2 = await planPush({
           harness: registryName,
-          memories: readHarnessMemories(harnessDir),
+          memories: facts.live,
           ...(graders !== undefined ? { graders } : {}),
           prompts: readHarnessPrompts(harnessDir),
-          existingMemoryHashes: new Set(readSharedMemories(sharedDir).map((m) => m.contentHash)),
+          existingMemoryHashes: new Set(sharedMemoriesNow.map((m) => m.contentHash)),
           existingFragmentHashes: new Set([
             ...readSharedFragments(sharedDir, "grader").map((f) => f.contentHash),
             ...readSharedFragments(sharedDir, "prompt").map((f) => f.contentHash),
           ]),
           redact,
           now: () => new Date(),
+          deadFacts: facts.dead,
+          sharedMemories: sharedMemoriesNow,
+          existingRetractions: readRetractions(sharedDir),
         });
         applyPush(sharedDir, plan2, () => new Date());
         // Also drop a copy of the push plan into the archive for the record.
@@ -23774,14 +24004,17 @@ switch (subcommand) {
     await runFeedbackCmd(parseFor(rest, FEEDBACK_SCHEMA));
     break;
   case "approvals": {
-    // Loop contract 0.4 (Batch C, G11) — list | show | grant | deny <id>.
+    // Loop contract 0.4 (Batch C, G11) — list | show | grant | deny <id>;
+    // 0.9.0 — supersede | defer <id>.
     // A leading -h/--help (help flag in the action slot) routes to the
     // handler's own help, not the invalid-action error.
     const first = rest[0] ?? "";
     const isHelp = first === "--help" || first === "-h";
     const action = isHelp ? "" : first;
-    if (!isHelp && !["", "list", "show", "grant", "deny"].includes(action)) {
-      die(`approvals action must be one of: list, show, grant, deny (got "${action}")`);
+    if (!isHelp && !["", "list", "show", "grant", "deny", "supersede", "defer"].includes(action)) {
+      die(
+        `approvals action must be one of: list, show, grant, deny, supersede, defer (got "${action}")`,
+      );
     }
     try {
       await runApprovals(parseFor(isHelp ? rest : rest.slice(1), APPROVALS_SCHEMA), action);
@@ -23995,10 +24228,16 @@ switch (subcommand) {
   }
   case "state": {
     const action = rest[0] ?? "";
-    if (action !== "backup" && action !== "restore") {
-      die(`state action must be "backup" or "restore" (got "${action}")`);
+    const stateArgs = parseFor(rest, STATE_SCHEMA);
+    if (action === "clear") await runEditVerb("runStateClear", stateArgs);
+    else if (action === "trash") await runEditVerb("runStateTrash", stateArgs);
+    else if (action === "restore" && stateArgs.flags["trash"] !== undefined) {
+      await runEditVerb("runStateRestoreTrash", stateArgs);
+    } else if (action === "backup" || action === "restore") {
+      await runState(parseFor(rest.slice(1), STATE_SCHEMA), action);
+    } else {
+      die(`state action must be one of backup, restore, clear, trash (got "${action}")`);
     }
-    await runState(parseFor(rest.slice(1), STATE_SCHEMA), action);
     break;
   }
   case "services": {

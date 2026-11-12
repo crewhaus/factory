@@ -5,12 +5,14 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../access-control" },
     { "path": "../spec-registry" },
     { "path": "../memory-store" },
     { "path": "../wiki-store" },
     { "path": "../continuity-store" },
     { "path": "../control-contract" },
     { "path": "../control-records" },
+    { "path": "../control-service" },
     { "path": "../watchme-store" },
     { "path": "../dataset-registry" },
     { "path": "../audit-log" },

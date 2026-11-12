@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { dirname as pathDirname } from "node:path";
 import * as readline from "node:readline/promises";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -153,6 +152,7 @@ import {
   DATA_LINEAGE_CAP,
   type RunContext,
   createRunContext,
+  mintRunId,
   tagContent,
 } from "@crewhaus/run-context";
 import {
@@ -240,6 +240,7 @@ import {
   stripDirectiveFromMessage,
 } from "./pre-route";
 import { loadProjectMemory } from "./project-memory";
+import { hasRunRows, openRunRows, recordRunPark, withRunRows } from "./run-ledger";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 import {
@@ -248,6 +249,7 @@ import {
   relocatingFieldLeftOut,
   runtimeRecordRoots,
   runtimeStateRoots,
+  storeFileRoots,
 } from "./state-roots";
 import {
   type ServingModel,
@@ -2033,6 +2035,13 @@ export type RunChatLoopOptions = {
    */
   settingsDir?: string | null;
   /**
+   * Where this run's rows go: the harness root whose
+   * `.crewhaus/run/control/runs/` holds the run ledger (`./run-ledger`).
+   * Defaults to the harness root the settings load reads when one is given,
+   * else `process.cwd()`. `null` writes no rows, as `CREWHAUS_RUN_LEDGER=0` does.
+   */
+  runLedgerDir?: string | null;
+  /**
    * Install a SIGINT handler that aborts the current turn on first press
    * and exits on the second. Defaults to true in REPL mode when stdin is
    * a TTY; defaults to false otherwise (singleTurn, piped input, tests).
@@ -2293,6 +2302,14 @@ export type RunChatLoopOptions = {
      * store failure leaves the volatile `<guide>` block in place and warns.
      */
     readonly savePlan?: (planText: string) => Promise<void>;
+    /**
+     * The continuity store's own files (`ContinuityStore.storeFiles()`): the
+     * floor refuses any tool but the store's own a write to one, or beneath a
+     * directory holding one (`EvaluateOptions.protectedFiles`); a tool that
+     * checks its own targets on the bridge (`checksOwnTargets`, StateImport)
+     * is read the `inside` way only. Forwarded to sub-agents.
+     */
+    readonly storeFiles?: readonly string[];
   };
   /**
    * Item #56 — absolute paths to per-user preference files injected at run
@@ -3844,6 +3861,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   ) {
     return credentialFloorScope.run(true, () => runChatLoop(opts));
   }
+  // Each invocation records how it ended for its run's rows (`./run-ledger`).
+  if (!hasRunRows(opts)) return withRunRows(opts, () => runChatLoop(opts));
   // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
   // any plugin-contributed tools so the tool-capable-model feature gate and the
   // per-turn advertisement below read the same list.
@@ -4165,6 +4184,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // tool call the agent makes may write there, whatever a rule says
   // (permission-engine's runtime-state floor, `./state-roots`).
   const protectedRoots = runtimeStateRoots(sessionRootDir, currentTenantContext()?.tenant);
+  // The continuity store's own files: only its tools write them. Files, not
+  // roots, so a tool that checks its own targets (StateImport) keeps working
+  // on the whole of `.crewhaus/state`.
+  const protectedFiles = storeFileRoots(opts.continuity?.storeFiles ?? []);
   const credentialRoots =
     credentialFloorScope.getStore() === true ? credentialFileRoots() : undefined;
   const recordRoots = runtimeRecordRoots(sessionRootDir, currentTenantContext()?.tenant);
@@ -4809,14 +4832,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Loop contract 0.4 (Batch C, item 4) — when the caller supplies an
   // `agentId` and lets runChatLoop own the context, build the bus with that
   // identity so `envelope()` stamps every trace event with it. runId is minted
-  // here (matching run-context's `run_<8 hex>` shape) and threaded into BOTH
+  // here (by run-context's one minter, `mintRunId()`) and threaded into BOTH
   // the bus and the context so their ids stay coherent. When `opts.runContext`
   // is supplied the caller owns `agentId` on its bus, so this is skipped.
   const runContext: RunContext =
     opts.runContext ??
     (opts.agentId !== undefined
       ? (() => {
-          const runId = `run_${randomUUID().slice(0, 8)}`;
+          const runId = mintRunId();
           const eventBus = new TraceEventBus({ runId, sessionId, agentId: opts.agentId });
           return createRunContext({ runId, sessionId, eventBus });
         })()
@@ -5152,6 +5175,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     out.write("\n");
   };
 
+  openRunRows({
+    runContext,
+    opts,
+    harnessRoot: opts.settingsDir,
+    sessionId,
+    sessionRootDir,
+    persistSession,
+    bus,
+  });
   const eventLog: EventLog = persistSession
     ? await openEventLog(sessionId, { rootDir: sessionRootDir })
     : createMemoryEventLog();
@@ -5741,7 +5773,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
       : undefined;
   const bridgeContinuitySeam =
-    opts.continuity !== undefined ? { loadPlan: opts.continuity.loadPlan } : undefined;
+    opts.continuity !== undefined
+      ? {
+          loadPlan: opts.continuity.loadPlan,
+          ...(opts.continuity.storeFiles !== undefined
+            ? { storeFiles: opts.continuity.storeFiles }
+            : {}),
+        }
+      : undefined;
   //   - provability: READ-ONLY (0.8.0 §8). The floor and the skill text cross;
   //     the verifier, the retry policy and the bundle store stay parent-side,
   //     so only this loop's final text is ever gated.
@@ -6733,12 +6772,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         readOnly: tool.readOnly,
         destructive: tool.destructive,
         requiresSandbox: tool.requiresSandbox,
+        ...(tool.checksOwnTargets === true ? { checksOwnTargets: true } : {}),
       },
       permissionMode,
       servingPlan.permissionRules,
       {
         sandboxAvailable: opts.sandboxAvailable === true,
         protectedRoots,
+        ...(protectedFiles.length > 0 ? { protectedFiles } : {}),
         ...(credentialRoots !== undefined ? { credentialRoots } : {}),
       },
     );
@@ -6947,12 +6988,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                     readOnly: tool.readOnly,
                     destructive: tool.destructive,
                     requiresSandbox: tool.requiresSandbox,
+                    ...(tool.checksOwnTargets === true ? { checksOwnTargets: true } : {}),
                   },
                   permissionMode,
                   servingPlan.permissionRules,
                   {
                     sandboxAvailable: opts.sandboxAvailable === true,
                     protectedRoots,
+                    ...(protectedFiles.length > 0 ? { protectedFiles } : {}),
                     ...(credentialRoots !== undefined ? { credentialRoots } : {}),
                   },
                 )
@@ -7049,6 +7092,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             createdAt: new Date().toISOString(),
           };
           if (existing === null) await approvals.store.persist(pending);
+          recordRunPark(runContext, pending.id);
           if (approvals.notify !== undefined) {
             await approvals.notify(pending).catch((err) => {
               runContext.logger.warn("approvals.notify failed", {
@@ -7450,7 +7494,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       eventLog,
       // 0.8.0 — the runtime-state roots, for the tools that write beneath a
       // directory they name and must not reach one (see RuntimeBridge).
-      ...(protectedRoots.length > 0 ? { protectedRoots } : {}),
+      ...(protectedRoots.length + protectedFiles.length > 0
+        ? { protectedRoots: [...protectedRoots, ...protectedFiles] }
+        : {}),
       // The files a `channel` or `managed` run keeps from its tools, for the tools
       // RuntimeBridge names.
       ...(credentialRoots !== undefined ? { credentialRoots } : {}),

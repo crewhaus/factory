@@ -42,10 +42,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
+import { type Ledger, foldStates } from "@crewhaus/control-records";
+import { commandsLedgerOf, workspaceCommandsLedger } from "@crewhaus/control-service";
+import { bearer, codeFrom, sealedJs, signInJs } from "./__test__/browser";
 import { runCorpusEval } from "./__test__/eval-corpus";
 import { EVAL_JOB_ARGV } from "./eval-inputs";
 import { logLine, makeFixtureHarness } from "./fixture";
 import { M3_ROUTES } from "./m3-routes";
+import { ROUTE_BY_KEY } from "./route-table";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
@@ -79,7 +83,29 @@ async function loadRoutes(): Promise<Record<string, RouteDef>> {
 // `|` ("string|null").
 // ---------------------------------------------------------------------------
 
+/** What `sign-in.js` reads of a sealed session answer. */
+const SESSION_ISSUED: ReadonlyArray<readonly [string, string]> = [
+  ["issued.alg", "string"],
+  ["issued.epk", "string"],
+  ["issued.iv", "string"],
+  ["issued.ct", "string"],
+  ["expiresAt", "string"],
+  ["principal", "string"],
+  ["device", "string"],
+];
+
 const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
+  // sign-in.js: a challenge to sign, three sealed answers, sign-out, and the legacy
+  // migration's boot link
+  authChallenge: [
+    ["nonce", "string"],
+    ["expiresAt", "string"],
+  ],
+  authExchange: SESSION_ISSUED,
+  authSession: SESSION_ISSUED,
+  authRefresh: SESSION_ISSUED,
+  authSignOut: [["signedOut", "boolean"]],
+  bootTicket: [["bootPath", "string"]],
   // app.js loadVersion
   version: [
     ["hangar", "string"],
@@ -518,6 +544,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["plugin", "string"],
     ["paneId", "string"],
     ["title", "string"],
+    ["src", "string"],
     ["doc", "string"],
     ["sandbox", "string"],
     ["csp", "string"],
@@ -1864,6 +1891,50 @@ describe("UI route contract", () => {
       const dir = contractHarness(t);
       await seedContinuity(dir);
       await seedEvals(dir);
+      // Every write the route table receipts adds exactly one command to its own ledger
+      // and answers with it; a read, and a write the table exempts, adds none.
+      const objectsIn = (ledger: Ledger): number => {
+        const fold = foldStates(ledger);
+        return fold.ok ? fold.objects.size : 0;
+      };
+      const jobsSeen = (): number => {
+        const jobs = t.server.processes.jobs;
+        return new Set(
+          [...jobs.pending(), ...jobs.running(), ...jobs.recent(100_000)].map((j) => j.jobId),
+        ).size;
+      };
+      const commandCounts = () => ({
+        harness: objectsIn(commandsLedgerOf(dir)),
+        home: objectsIn(workspaceCommandsLedger(t.hangarRoot)),
+        jobs: jobsSeen(),
+      });
+      let receipted = 0;
+      let queuing = 0;
+      const expectReceipt = (
+        key: string,
+        before: { harness: number; home: number; jobs: number },
+        body: Record<string, unknown>,
+      ): void => {
+        const row = ROUTE_BY_KEY.get(key);
+        if (row === undefined) throw new Error(`route "${key}" has no route-table row`);
+        const { jobs, ...after } = commandCounts();
+        const expected = {
+          harness: before.harness + (row.receipt === "harness" ? 1 : 0),
+          home: before.home + (row.receipt === "workspace" ? 1 : 0),
+        };
+        expect({ key, ...after }).toEqual({ key, ...expected });
+        // A receipted write that queued a job is a job row: the job, not the answer, settles
+        // it. (A read-only check such as `datasetLint` may queue one and has no receipt.)
+        if (row.receipt !== "none" && jobs > before.jobs) {
+          expect({ key, dispatch: row.dispatch }).toEqual({ key, dispatch: "job" });
+          queuing += 1;
+        }
+        expect({ key, receipt: body["receipt"] !== undefined }).toEqual({
+          key,
+          receipt: row.receipt !== "none",
+        });
+        if (row.receipt !== "none") receipted += 1;
+      };
       const fill = (template: string, params: Record<string, string>): string =>
         template.replace(/:([A-Za-z][A-Za-z0-9]*)/g, (_m, name: string) => {
           const v = params[name];
@@ -1873,15 +1944,24 @@ describe("UI route contract", () => {
       const drive = async (
         key: string,
         params: Record<string, string> = {},
-        opts: { body?: unknown; query?: string; expectStatus?: number; readsKey?: string } = {},
+        opts: {
+          body?: unknown;
+          query?: string;
+          expectStatus?: number;
+          readsKey?: string;
+          headers?: Record<string, string>;
+        } = {},
       ): Promise<Record<string, unknown>> => {
         const route = ROUTES[key];
         if (route === undefined) throw new Error(`route "${key}" missing from routes.js`);
         driven.add(key);
+        const before = commandCounts();
         const { status, body } = await t.api(`${fill(route.path, params)}${opts.query ?? ""}`, {
           method: route.method,
           ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+          ...(opts.headers !== undefined ? { headers: opts.headers } : {}),
         });
+        expectReceipt(key, before, body);
         if (status !== (opts.expectStatus ?? 200)) {
           throw new Error(
             `${key} ${route.method} ${route.path}: expected ${opts.expectStatus ?? 200}, got ${status} ${JSON.stringify(body)}`,
@@ -1913,6 +1993,63 @@ describe("UI route contract", () => {
 
       // -- fleet feed: cold first paint, then hydrate ----------------------
       await drive("harnesses", {}, { query: "?hydrate=1", readsKey: "harnesses" });
+
+      // -- signing in: a boot link, a sealed session, a returning device, a refresh,
+      //    sign-out (effect: the signed-out session no longer works) --------------
+      const ui = { signIn: await signInJs(), sealed: await sealedJs() };
+      const ticket = await drive("bootTicket", {}, { body: {}, readsKey: "bootTicket" });
+      const deviceKey = await ui.signIn.makeDeviceKey();
+      const firstSeal = await ui.sealed.makeSeal();
+      const exchanged = await drive(
+        "authExchange",
+        {},
+        {
+          body: {
+            code: await codeFrom(t.fetchRaw, ticket["bootPath"] as string),
+            deviceJwk: deviceKey.deviceJwk,
+            seal: firstSeal.seal,
+          },
+          readsKey: "authExchange",
+        },
+      );
+      const device = exchanged["device"] as string;
+      const challenge = await drive("authChallenge", {}, { readsKey: "authChallenge" });
+      const secondSeal = await ui.sealed.makeSeal();
+      const signedIn = await drive(
+        "authSession",
+        {},
+        {
+          body: {
+            device,
+            nonce: challenge["nonce"],
+            signature: await ui.signIn.signChallenge(deviceKey.privateKey, {
+              device,
+              nonce: challenge["nonce"] as string,
+              seal: secondSeal.seal,
+            }),
+            seal: secondSeal.seal,
+          },
+          readsKey: "authSession",
+        },
+      );
+      const thirdSeal = await ui.sealed.makeSeal();
+      const refreshed = await drive(
+        "authRefresh",
+        {},
+        {
+          body: { seal: thirdSeal.seal },
+          headers: bearer(await secondSeal.open(signedIn["issued"], "auth.session")),
+          readsKey: "authRefresh",
+        },
+      );
+      const lastSession = await thirdSeal.open(refreshed["issued"], "auth.refresh");
+      expect((await t.fetchRaw("/api/version", { headers: bearer(lastSession) })).status).toBe(200);
+      await drive(
+        "authSignOut",
+        {},
+        { body: {}, headers: bearer(lastSession), readsKey: "authSignOut" },
+      );
+      expect((await t.fetchRaw("/api/version", { headers: bearer(lastSession) })).status).toBe(401);
 
       // -- per-harness reads -----------------------------------------------
       await drive("version", {}, { readsKey: "version" });
@@ -2109,10 +2246,12 @@ describe("UI route contract", () => {
           throw new Error(`no M3_BODIES entry for write route "${key}" (${route.path})`);
         }
         driven.add(key);
+        const before = commandCounts();
         const { status, body } = await t.api(fill(route.path, params), {
           method: route.method,
           ...(writes ? { body: JSON.stringify(M3_BODIES[key]) } : {}),
         });
+        expectReceipt(key, before, body);
         if (status === 501) {
           expect(`${key}:${String(body["error"] ?? "")}`).toContain("not implemented (M3)");
           continue;
@@ -2258,9 +2397,17 @@ describe("UI route contract", () => {
         { plugin: "cost-lens", pane: "spend" },
         { readsKey: "pluginPane" },
       );
-      // The containment travels WITH the document, always.
+      // The containment travels WITH the document, always: the frame loads it from a
+      // single-use address that serves it with the plugin's policy and the sandbox.
       expect(pane["sandbox"]).toBe("allow-scripts");
       expect(String(pane["csp"])).toContain("connect-src 'none'");
+      const paneDoc = await t.fetchRaw(pane["src"] as string);
+      expect(paneDoc.status).toBe(200);
+      expect(await paneDoc.text()).toBe("<p>spend</p>");
+      expect(paneDoc.headers.get("content-security-policy")).toBe(
+        `${String(pane["csp"])}; sandbox allow-scripts`,
+      );
+      expect((await t.fetchRaw(pane["src"] as string)).status).toBe(404);
       const panes = await drive("panes", { id }, { readsKey: "panes" });
       expect((panes["panes"] as Array<{ id: string }>).map((p) => p.id)).toEqual(["spend"]);
       expect(panes["traceObservers"]).toEqual(["cost-lens"]);
@@ -2294,6 +2441,12 @@ describe("UI route contract", () => {
 
       // -- completeness: the map holds nothing this test did not drive -----
       expect([...driven].sort()).toEqual(Object.keys(ROUTES).sort());
+      // …and every command those drives wrote is one a receipted write accounted for.
+      const total = commandCounts();
+      expect(receipted).toBeGreaterThanOrEqual(100);
+      expect(total.harness + total.home).toBe(receipted);
+      // The job check above saw jobs queued, so it can fail.
+      expect(queuing).toBeGreaterThanOrEqual(20);
     } finally {
       await t.stop();
       rmSync(pluginsDir, { recursive: true, force: true });

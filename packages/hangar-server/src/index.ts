@@ -12,8 +12,11 @@
  * re-implementing it.
  *
  * Safety model (enforced, tested):
- *   - bearer-token auth on every `/api` route (constant-time compare;
- *     `/healthz` and the static shell excepted; no cookies ⇒ no CSRF);
+ *   - a Host allowlist before everything but `/healthz` (421 otherwise), then
+ *     one `authenticate()` on every `/api` route: a sealed browser session,
+ *     or Home's own key from this computer only (`/healthz`, the static
+ *     shell and the sign-in routes excepted; no cookies ⇒ no CSRF); a strict
+ *     Content-Security-Policy on every page;
  *   - path safety: id-shape validation + realpath containment inside the
  *     registered harness dir on every filesystem read;
  *   - reads never mutate: session browsing is raw dir scans + tolerant
@@ -51,6 +54,24 @@ export {
   WORKFLOWS_DIR_SEGMENTS,
 } from "./scaffolded-workflows";
 export { ensureToken, isAuthorized, TOKEN_FILENAME, tokenEquals, type TokenSetup } from "./auth";
+export {
+  checkAccess,
+  isV1Path,
+  refusalResponse,
+  type AccessCheck,
+  type HomeAccess,
+} from "./access";
+export { HOME_CSP } from "./csp";
+export {
+  allowedHosts,
+  hostAllowed,
+  hostNameOf,
+  MISDIRECTED_TEXT,
+  misdirected,
+  type AllowlistInput,
+} from "./host-allowlist";
+export { HOME_SOCKET, isLoopbackHostname, PROXY_SOCKET } from "./listeners";
+export { serveSignIn, SIGN_IN_ROUTES } from "./sign-in-routes";
 export { mergedSpawnEnv, parseEnvText, readHarnessEnvFiles } from "./env-file";
 export { readJsonlCapped, readTextCapped, type JsonlRead } from "./jsonl";
 export { maskDeep, maskSpecYaml } from "./mask";

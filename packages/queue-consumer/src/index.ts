@@ -58,7 +58,13 @@ import { boundaryRuleIds, classifyBoundary, valueText } from "@crewhaus/boundary
 import { CrewhausError, type FailureClass } from "@crewhaus/errors";
 import { type IdempotencyStore, idempotencyKey, withIdempotency } from "@crewhaus/idempotency-keys";
 import type { Job, NackReason, QueueAdapter } from "@crewhaus/queue-protocol";
-import { type InboundContent, withInboundContent } from "@crewhaus/run-context";
+import {
+  type InboundContent,
+  type RunScope,
+  formatResumeScope,
+  runWithScope,
+  withInboundContent,
+} from "@crewhaus/run-context";
 
 export class QueueConsumerError extends CrewhausError {
   // `: string` (not the literal) so a subclass can name itself.
@@ -218,6 +224,26 @@ const DEFAULT_EMPTY_QUEUE_POLL_MS = 100;
 const DEFAULT_DEFER_VISIBILITY_MS = 60_000;
 
 /**
+ * The run scope a job's handler runs in: started by the queue, resumable as
+ * the job. A job id that does not fit the `job:` grammar (printable ASCII
+ * without spaces, at most 256 characters) gets no resume scope and one stderr
+ * line naming it; the job still runs.
+ */
+function jobScope(jobId: string): RunScope {
+  try {
+    return {
+      resumeScope: formatResumeScope({ kind: "job", id: jobId }),
+      trigger: { kind: "queue" },
+    };
+  } catch {
+    process.stderr.write(
+      `[queue-consumer] job ${JSON.stringify(jobId)} has an id no resume scope can name; its run records no resume scope\n`,
+    );
+    return { trigger: { kind: "queue" } };
+  }
+}
+
+/**
  * Loop contract 0.4 (G11) — did the handler PARK on a pending approval rather
  * than fail?
  *
@@ -322,10 +348,12 @@ export function startConsumer<TInput, TResult>(
       if (screened instanceof InputBlockedError) {
         outcome = { kind: "fail", reason: "permanent", error: screened };
       } else {
-        const r = await withInboundContent([screened], async () =>
-          wrappedHandler
-            ? wrappedHandler({ input: job.input, job }, key)
-            : { value: await opts.handler(job.input, { key, job }), fromCache: false },
+        const r = await runWithScope(jobScope(job.id), () =>
+          withInboundContent([screened], async () =>
+            wrappedHandler
+              ? wrappedHandler({ input: job.input, job }, key)
+              : { value: await opts.handler(job.input, { key, job }), fromCache: false },
+          ),
         );
         outcome = { kind: "ok", value: r.value, fromCache: r.fromCache };
       }

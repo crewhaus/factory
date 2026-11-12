@@ -37,12 +37,19 @@
  *     `forced: true` recorded in the ledger — and a stop that holds no pid
  *     while a LIVE runfile exists says so (`reason: "not-adopted"`) instead
  *     of reporting a success it did not perform.
+ *   - **Runs are recorded.** Every child is handed its execution id
+ *     (`CREWHAUS_EXECUTION_ID`); a one-shot job also gets a root run, queued
+ *     in the harness's run ledger before the spawn and handed over as
+ *     `CREWHAUS_RUN_ID`, and its exit closes that root and interrupts the
+ *     runs the process left open (`./run-rows`). `CREWHAUS_RUN_LEDGER=0`
+ *     turns this off.
  *
  * Every side-effecting dependency is injected — process ops, clock, plan
  * builder, gate, scrubber, id minter — so the whole machine is exercised in
  * unit tests without spawning a harness.
  */
 import { appendFileSync } from "node:fs";
+import { mintRunId as mintCanonicalRunId } from "@crewhaus/control-contract";
 import { adoptRunning, verifyRunfile } from "./adoption";
 import type { GateDecision, GateOptions } from "./gate";
 import {
@@ -59,6 +66,7 @@ import {
 import { type PortLedger, runfilePortClaims } from "./ports";
 import type { PrepareRefusal, PrepareRunner } from "./prepare";
 import { type ProcessOps, type SpawnedProcess, argvFingerprint } from "./process-ops";
+import { type RootEnding, closeExecution, openRootRun, runLedgerOff } from "./run-rows";
 import {
   acquireStartLock,
   appendRunLedger,
@@ -157,6 +165,8 @@ export type StartResult =
       readonly ok: true;
       readonly runId: string;
       readonly pid: number | undefined;
+      /** A one-shot job's root run: the canonical id its child was handed as `CREWHAUS_RUN_ID`. */
+      readonly root?: string;
       /** What the prepare seams did on the way in ("recompiled dist/",
        *  "preSpawn hook ok") — nothing to act on, but an operator who asked
        *  for a recompile deserves to be told it happened. */
@@ -239,6 +249,9 @@ export type SupervisorOptions = {
   /** The MANAGER process id recorded in the start lock. Defaults to
    *  `process.pid`; injected in tests so two "managers" can race. */
   readonly ownerPid?: number;
+  /** Where a run record that could not be written is reported, one line
+   *  each. Defaults to stderr. Never changes the supervision state. */
+  readonly warn?: (line: string) => void;
 };
 
 export type HarnessSupervisor = {
@@ -281,7 +294,8 @@ export type HarnessSupervisor = {
   /** Drain the log once, now (tests; also the manual Refresh action). */
   pumpNow(): void;
   subscribe(listener: (event: SupervisorEvent) => void): () => void;
-  /** Resolves when no restart is scheduled and no start is in flight. */
+  /** Resolves when no restart is scheduled, no start is in flight and no
+   *  run record is still being written. */
   idle(): Promise<void>;
   /** Release timers and listeners without touching the child. */
   close(): void;
@@ -336,6 +350,14 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
   const listeners = new Set<(event: SupervisorEvent) => void>();
   const idleWaiters: Array<() => void> = [];
   const ownerPid = options.ownerPid ?? process.pid;
+  const warn =
+    options.warn ?? ((line: string) => void process.stderr.write(`[harness-supervisor] ${line}\n`));
+  /** The current one-shot job's root run, closed by its exit. */
+  let currentRoot: string | undefined;
+  /** The current plan turned run records off. */
+  let rowsOff = false;
+  /** Run-record writes in flight: `idle()` waits for them. */
+  const rowWork = new Set<Promise<void>>();
 
   /** A port of 0 means "kernel, pick one" — not-known-yet, never reachable. */
   const knownPort = (port: number | undefined): number | undefined =>
@@ -403,7 +425,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
   };
 
   const settleIfIdle = (): void => {
-    if (!starting && restartTimer === undefined) {
+    if (!starting && restartTimer === undefined && rowWork.size === 0) {
       for (const w of idleWaiters.splice(0)) w();
     }
   };
@@ -667,8 +689,10 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       adopted && code === null && signal === null && !wasOperatorStop && recovered === undefined
         ? { ...base, title: "exited while unobserved — exit code unknown (adopted run)" }
         : base;
+    const endedRunId = runId;
     finishRun(classification, forcedStopInFlight);
     forcedStopInFlight = false;
+    closeRows(endedRunId, rootEnding(classification, wasOperatorStop));
 
     switch (classification.disposition) {
       case "terminal":
@@ -699,6 +723,67 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         break;
     }
     settleIfIdle();
+  };
+
+  /** Keep a run-record write in flight visible to `idle()`; report one that fails. */
+  const trackRows = (
+    work: Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }>,
+  ): void => {
+    const tracked: Promise<void> = work
+      .then(
+        (answer) => {
+          if (!answer.ok) warn(`run records not closed: ${answer.reason}`);
+        },
+        (err: unknown) => warn(`run records not closed: ${toError(err).message}`),
+      )
+      .finally(() => {
+        rowWork.delete(tracked);
+        settleIfIdle();
+      });
+    rowWork.add(tracked);
+  };
+
+  /**
+   * The environment a child is spawned with: the plan's, plus its execution
+   * id, plus, for a one-shot job, a root run queued in the run ledger before
+   * the spawn. An operator's own `CREWHAUS_RUN_ID` is passed through
+   * untouched and gets no root; `CREWHAUS_RUN_LEDGER=0` adds nothing.
+   */
+  const stampRunIds = (plan: SpawnPlan, execution: string): Record<string, string> => {
+    currentRoot = undefined;
+    rowsOff = runLedgerOff(plan.env);
+    if (rowsOff) return plan.env;
+    const env = { ...plan.env, CREWHAUS_EXECUTION_ID: execution };
+    if (plan.kind !== "job" || plan.env["CREWHAUS_RUN_ID"] !== undefined) return env;
+    const root = mintCanonicalRunId();
+    const opened = openRootRun(
+      options.harnessDir,
+      root,
+      execution,
+      new Date(clock.now()).toISOString(),
+    );
+    if (!opened.ok) {
+      warn(`run records: this job runs without a root run (${opened.reason})`);
+      return env;
+    }
+    currentRoot = root;
+    return { ...env, CREWHAUS_RUN_ID: root };
+  };
+
+  /** Close what an execution left in the run ledger, and its root, if it has one. */
+  const closeRows = (execution: string | undefined, ending: RootEnding): void => {
+    const root = currentRoot;
+    currentRoot = undefined;
+    if (execution === undefined) return;
+    const off = adopted ? runLedgerOff(loadEnvChain(options.harnessDir).vars) : rowsOff;
+    if (off) return;
+    trackRows(
+      closeExecution(options.harnessDir, {
+        execution,
+        ...(root !== undefined ? { root: { id: root, ending } } : {}),
+        now: clock.now,
+      }),
+    );
   };
 
   const startPump = (id: string, spawnEnv: Record<string, string>): void => {
@@ -784,6 +869,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         failureClass: "interrupted",
       });
     }
+    closeRows(id, { state: "failed", failureClass: "spawn" });
     runId = undefined;
     startedAt = undefined;
     controlPort = undefined;
@@ -936,10 +1022,11 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         // and so an fd-redirected child appends rather than creates.
         appendFileSync(logFile, "", { mode: 0o600 });
 
+        const env = stampRunIds(plan, id);
         child = options.ops.spawn({
           argv: plan.argv,
           cwd: plan.cwd,
-          env: plan.env,
+          env,
           stdio: plan.stdio === "file" ? { mode: "file", path: logFile } : { mode: "pipe" },
           // A crew brief: the kernel feeds it, so a detached run keeps its
           // input after this manager exits.
@@ -1018,6 +1105,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
           ok: true,
           runId: id,
           pid,
+          ...(currentRoot !== undefined ? { root: currentRoot } : {}),
           ...(prepared.length > 0 ? { prepared } : {}),
         };
       } catch (err) {
@@ -1169,6 +1257,13 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       return "none";
     }
     if (result.status === "lost") {
+      // The daemon died while no manager watched: what it left open is
+      // interrupted, as an exit this supervisor saw would have done.
+      if (!runLedgerOff(loadEnvChain(options.harnessDir).vars)) {
+        trackRows(
+          closeExecution(options.harnessDir, { execution: result.runfile.runId, now: clock.now }),
+        );
+      }
       forensics = { tail: result.tail };
       lastExit = {
         disposition: "crash",
@@ -1285,6 +1380,19 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       settleIfIdle();
     },
   };
+}
+
+/** How a root run ends, from its process's exit. */
+function rootEnding(classification: ExitClassification, operatorStop: boolean): RootEnding {
+  if (operatorStop) return { state: "cancelled" };
+  switch (classification.disposition) {
+    case "parked":
+      return { state: "waiting-for-approval" };
+    case "clean":
+      return { state: "succeeded" };
+    default:
+      return { state: "failed", failureClass: classification.failureClass ?? "crash" };
+  }
 }
 
 /** Copy a piped stream into the run log. Attached runs must end up with the

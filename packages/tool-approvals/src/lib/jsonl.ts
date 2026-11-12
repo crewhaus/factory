@@ -2,12 +2,10 @@
  * Capped, torn-line-tolerant JSONL reading — the only way this package touches
  * an append-only log.
  *
- * NEVER A STORE `list()`. `@crewhaus/session-store`'s `PendingApprovalStore.list()`
- * COMPACTS its backing file as a side effect: it drops expired and superseded
- * lines and rewrites the file. An inbox is polled, and polling must never
- * rewrite an operator's approvals ledger — nor drop the settled records whose
- * history is half of what these tools exist to show. So reads fold the JSONL
- * directly, last-wins by `id`, the upsert rule `persist` documents.
+ * NEVER A STORE `list()`. A store's `list()` is a view of the live records:
+ * it leaves out the settled history that half of what these tools exist to
+ * show. So reads take the JSONL here, and fold it with the store's own
+ * first-decision-wins fold (see `./approvals`), which writes nothing.
  *
  * THE TAIL, NOT THE HEAD. `@crewhaus/hangar-server`'s reader takes the first
  * `maxBytes` of the file. For an append-only log that keeps the OLDEST records

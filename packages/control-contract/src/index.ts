@@ -30,9 +30,11 @@ export {
   COMMAND_KINDS,
   type CommandKindId,
   type CommandReceipt,
+  LEGACY_COMMAND_KIND_RE,
   type ReceiptEffect,
   type ReceiptExecutor,
   type ReceiptRetry,
+  isCommandKind,
 } from "./commands.js";
 export {
   CURSOR_MAX_LENGTH,
@@ -53,11 +55,16 @@ export {
 export {
   type ApproverProjection,
   DECISION_CLASSES,
+  DECISION_LOG_EVENTS,
+  DECISION_LOG_KEYS,
   DECISION_LOG_REASONS,
   type DecisionBinding,
   type DecisionClass,
   type DecisionEscalation,
+  type DecisionLogEvent,
+  type DecisionLogKey,
   type DecisionOverlays,
+  type DeferReason,
   type DecisionPlace,
   type DecisionRecordView,
   type DecisionSensitivity,
@@ -86,6 +93,7 @@ export {
   type ErrorEnvelope,
   isErrorCode,
 } from "./errors.js";
+export { EXIT_FOR_ERROR, EXIT_FOR_REJECTED_RECEIPT } from "./exits.js";
 export {
   EVENT_TAXONOMY,
   EVENT_TAXONOMY_VERSION,

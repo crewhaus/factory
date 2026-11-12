@@ -7,21 +7,33 @@
  * the BM25-only regression guard.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEmbedder } from "@crewhaus/embedder";
+import * as v080 from "./__fixtures__/v080-guards";
 import {
   DEFAULT_AUTO_CAPTURE_THRESHOLD,
   DEFAULT_AUTO_RECALL_K,
   MAX_CAPTURE_EVENTS_PER_CHILD,
   MEMORY_SCHEMA_VERSION,
+  MemoryNotFoundError,
+  MemoryNotLiveError,
   MemoryStoreError,
   type SessionEvent,
   captureChildFacts,
   captureFacts,
   createMemoryStore,
   deriveMemoryDecision,
+  isMemoryEntry,
   summarizeDurableFacts,
   summarizeDurableFactsWithEvidence,
   turnsFromEvents,
@@ -423,13 +435,21 @@ describe("compact() — atomic growth-bounding rewrite", () => {
     nowMs += 200;
     await store.sweep();
     const result = await store.compact();
-    // Dropped: forgotten entry + its tombstone + expired entry + its tombstone.
-    expect(result).toEqual({ kept: 1, dropped: 4 });
+    // Dropped: forgotten entry + its tombstone + expired entry + its tombstone,
+    // and every one of them is kept in the archive.
+    expect(result).toEqual({ kept: 1, dropped: 4, archived: 4 });
     const raw = readFileSync(store.path(), "utf-8");
     expect(raw).toContain("keep me around");
     expect(raw).not.toContain("forget me");
     expect(raw).not.toContain("tombstone");
     expect(existsSync(`${store.path()}.tmp`)).toBe(false);
+    const history = await store.history();
+    expect(history).toHaveLength(4);
+    expect(history.every((h) => h.cause === "compaction")).toBe(true);
+    const archivedText = JSON.stringify(history);
+    expect(archivedText).toContain("forget me");
+    expect(archivedText).toContain("expiring soon");
+    expect(archivedText).not.toContain("keep me around");
     // Recall unaffected before/after compact.
     const results = await store.recall("keep", 5);
     expect(results.map((r) => r.entry.id)).toEqual([keep.id]);
@@ -444,16 +464,19 @@ describe("compact() — atomic growth-bounding rewrite", () => {
     const before = readFileSync(store.path(), "utf-8");
     const v1Line = before.split("\n").find((l) => l.includes("v1 line survives"));
     const result = await store.compact();
-    expect(result).toEqual({ kept: 2, dropped: 1 });
+    expect(result).toEqual({ kept: 2, dropped: 1, archived: 1 });
     const after = readFileSync(store.path(), "utf-8");
     expect(after.split("\n")).toContain(v1Line);
     expect(after.split("\n")).toContain(unknownLine);
     expect(after).not.toContain("{broken json");
+    // The unparseable line is kept in the archive as text.
+    expect((await store.history()).map((h) => h.raw)).toEqual(["{broken json"]);
   });
 
   test("compacting an empty/missing file is a no-op", async () => {
     const store = createMemoryStore({ specName: "compact-empty", rootDir: tmp });
-    expect(await store.compact()).toEqual({ kept: 0, dropped: 0 });
+    expect(await store.compact()).toEqual({ kept: 0, dropped: 0, archived: 0 });
+    expect(await store.history()).toEqual([]);
   });
 });
 
@@ -785,5 +808,241 @@ describe("captureChildFacts (§7.1)", () => {
     ]);
     expect(written).toHaveLength(0);
     expect(await store.size()).toBe(0);
+  });
+});
+
+describe("supersede() — a correction keeps the old fact as history", () => {
+  test("links both ways in one append, and recall finds only the successor", async () => {
+    const store = createMemoryStore({ specName: "fix", rootDir: tmp });
+    const old = await store.remember("the office is on floor 3", ["office"]);
+    const { successor, superseded } = await store.supersede(old.id, "the office is on floor 4", {
+      reason: "moved in May",
+      author: { kind: "operator", via: "cli" },
+    });
+    expect(successor.provenance?.correctionOf).toBe(old.id);
+    expect(successor.provenance?.author).toEqual({ kind: "operator", via: "cli" });
+    expect(successor.tags).toEqual(["office"]);
+    expect(superseded.supersededBy).toBe(successor.id);
+    const items = await store.list();
+    const oldItem = items.find((i) => i.entry.id === old.id);
+    expect(oldItem?.status).toBe("superseded");
+    expect(oldItem?.entry.supersededBy).toBe(successor.id);
+    expect(items.find((i) => i.entry.id === successor.id)?.status).toBe("live");
+    const lines = readFileSync(store.path(), "utf-8").trim().split("\n");
+    const tomb = JSON.parse(lines[lines.length - 1] as string);
+    expect(tomb).toMatchObject({
+      tombstone: "superseded",
+      target: old.id,
+      supersededBy: successor.id,
+      reason: "moved in May",
+    });
+    expect((await store.recall("office floor", 5)).map((r) => r.entry.id)).toEqual([successor.id]);
+  });
+
+  test("refuses a superseded fact with MemoryNotLiveError naming its successor", async () => {
+    const store = createMemoryStore({ specName: "fix2", rootDir: tmp });
+    const old = await store.remember("a wrong fact");
+    const { successor } = await store.supersede(old.id, "a right fact", { reason: "typo" });
+    const before = readFileSync(store.path(), "utf-8");
+    const err = await store
+      .supersede(old.id, "another fact", { reason: "again" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MemoryNotLiveError);
+    expect((err as MemoryNotLiveError).status).toBe("superseded");
+    expect((err as MemoryNotLiveError).supersededBy).toBe(successor.id);
+    expect(readFileSync(store.path(), "utf-8")).toBe(before);
+  });
+
+  test("refuses an unknown id with MemoryNotFoundError, and a missing reason", async () => {
+    const store = createMemoryStore({ specName: "fix3", rootDir: tmp });
+    const e = await store.remember("x");
+    await expect(
+      store.supersede("mem_0000000000000000", "y", { reason: "r" }),
+    ).rejects.toBeInstanceOf(MemoryNotFoundError);
+    await expect(store.supersede(e.id, "y", { reason: " " })).rejects.toThrow(/reason/);
+  });
+
+  test("a torn write (successor without tombstone) repairs to exactly one successor", async () => {
+    const store = createMemoryStore({ specName: "torn", rootDir: tmp });
+    const old = await store.remember("the price is 10");
+    // What a crash after the successor line and before the tombstone leaves.
+    const torn = {
+      id: "mem_00000000000000aa",
+      text: "the price is 12",
+      tags: [],
+      createdAt: new Date().toISOString(),
+      schemaVersion: 2,
+      provenance: { correctionOf: old.id },
+    };
+    appendFileSync(store.path(), `${JSON.stringify(torn)}\n`);
+    const { successor } = await store.supersede(old.id, "the price is 12", { reason: "re-run" });
+    expect(successor.id).toBe(torn.id);
+    const items = await store.list();
+    expect(items.filter((i) => i.entry.provenance?.correctionOf === old.id)).toHaveLength(1);
+    expect(items.find((i) => i.entry.id === old.id)?.status).toBe("superseded");
+    expect(items.filter((i) => i.status === "live").map((i) => i.entry.id)).toEqual([torn.id]);
+  });
+});
+
+describe("forget() — the structured link", () => {
+  test("supersededBy, by and cmd land on the tombstone", async () => {
+    const store = createMemoryStore({ specName: "fl", rootDir: tmp });
+    const keep = await store.remember("keep");
+    const dup = await store.remember("keep too");
+    await store.forget(dup.id, { reason: "dup", supersededBy: keep.id, by: "prn_x", cmd: "cmd_1" });
+    const items = await store.list();
+    expect(items.find((i) => i.entry.id === dup.id)?.entry.supersededBy).toBe(keep.id);
+    const raw = readFileSync(store.path(), "utf-8");
+    expect(raw).toContain('"by":"prn_x"');
+    expect(raw).toContain('"cmd":"cmd_1"');
+  });
+});
+
+describe("annotate() — a person mark, folded last-wins", () => {
+  test("folds last-wins and clears with null", async () => {
+    const store = createMemoryStore({ specName: "ann", rootDir: tmp });
+    const e = await store.remember("Dana's birthday is in June");
+    await store.annotate(e.id, { category: "person" });
+    expect((await store.list())[0]?.category).toBe("person");
+    await store.annotate(e.id, { category: null });
+    expect((await store.list())[0]?.category).toBeUndefined();
+    await store.annotate(e.id, { category: "person" });
+    expect((await store.list())[0]?.category).toBe("person");
+    // Recall and size are unaffected by annotation lines.
+    expect(await store.size()).toBe(1);
+  });
+
+  test("refuses an unknown id", async () => {
+    const store = createMemoryStore({ specName: "ann2", rootDir: tmp });
+    await store.remember("x");
+    await expect(
+      store.annotate("mem_0000000000000000", { category: "person" }),
+    ).rejects.toBeInstanceOf(MemoryNotFoundError);
+  });
+
+  test("an annotation of a dead fact is archived; of a live one it is kept", async () => {
+    const store = createMemoryStore({ specName: "ann3", rootDir: tmp });
+    const live = await store.remember("live fact");
+    const dead = await store.remember("dead fact");
+    await store.annotate(live.id, { category: "person" });
+    await store.annotate(dead.id, { category: "person" });
+    await store.forget(dead.id);
+    await store.compact();
+    const raw = readFileSync(store.path(), "utf-8");
+    expect(raw).toContain(`"target":"${live.id}"`);
+    expect(raw).not.toContain(`"target":"${dead.id}"`);
+    const archived = (await store.history()).map((h) => h.line as Record<string, unknown>);
+    expect(archived.some((l) => l["annotate"] === "category" && l["target"] === dead.id)).toBe(
+      true,
+    );
+    expect((await store.list())[0]?.category).toBe("person");
+  });
+});
+
+describe("importSynced()", () => {
+  test("appends only ids not already in the file, live or dead", async () => {
+    const store = createMemoryStore({ specName: "imp", rootDir: tmp });
+    const mine = await store.remember("mine");
+    await store.forget(mine.id);
+    const fact = (id: string, text: string) => ({
+      id,
+      text,
+      tags: ["shared:a"],
+      createdAt: "2026-11-01T00:00:00.000Z",
+      schemaVersion: 2,
+      provenance: { origin: { kind: "sync" as const, harness: "a", contentHash: "ab" } },
+    });
+    const added = await store.importSynced([
+      fact(mine.id, "would collide with a dead fact"),
+      fact("mem_00000000000000b1", "pulled one"),
+      fact("mem_00000000000000b1", "pulled one again"),
+    ]);
+    expect(added).toEqual(["mem_00000000000000b1"]);
+    expect(await store.importSynced([fact("mem_00000000000000b1", "pulled one")])).toEqual([]);
+    expect((await store.recall("pulled", 5)).map((r) => r.entry.id)).toEqual([
+      "mem_00000000000000b1",
+    ]);
+  });
+});
+
+describe("mixed versions — a 0.8.0 reader on this release's lines", () => {
+  test("a successor is an entry, a linked tombstone a tombstone, an annotation neither", async () => {
+    const store = createMemoryStore({ specName: "mixed", rootDir: tmp });
+    const old = await store.remember("first");
+    await store.supersede(old.id, "second", {
+      reason: "r",
+      author: { kind: "operator", via: "cli" },
+      by: "prn_a",
+      cmd: "cmd_a",
+    });
+    const succ = (await store.list()).find((i) => i.status === "live")?.entry;
+    await store.annotate(succ?.id as string, { category: "person" });
+    await store.importSynced([
+      {
+        id: "mem_00000000000000c1",
+        text: "synced",
+        tags: [],
+        createdAt: "2026-11-01T00:00:00.000Z",
+        provenance: { origin: { kind: "sync", harness: "h", fact: "mem_1", contentHash: "cd" } },
+      },
+    ]);
+    const lines = readFileSync(store.path(), "utf-8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const kinds = lines.map((l) =>
+      v080.isMemoryEntry(l) ? "entry" : v080.isMemoryTombstone(l) ? "tombstone" : "neither",
+    );
+    expect(kinds).toEqual(["entry", "entry", "tombstone", "neither", "entry"]);
+    const tomb = lines[2] as Record<string, unknown>;
+    expect([tomb["supersededBy"], tomb["by"], tomb["cmd"]]).toEqual([
+      (succ as { id: string }).id,
+      "prn_a",
+      "cmd_a",
+    ]);
+  });
+
+  test("an ill-typed new provenance field makes the line malformed, as 0.8.0 does for its own", () => {
+    expect(isMemoryEntry({ id: "m", text: "t", tags: [], createdAt: "x" })).toBe(true);
+    for (const provenance of [
+      { correctionOf: 7 },
+      { author: { kind: "robot" } },
+      { author: { kind: "operator", via: 1 } },
+      { origin: { kind: "sync", harness: "h" } },
+    ]) {
+      expect(isMemoryEntry({ id: "m", text: "t", tags: [], createdAt: "x", provenance })).toBe(
+        false,
+      );
+    }
+  });
+});
+
+describe("the fact lock", () => {
+  test("a held lock refuses a write with an error naming the file and the holder", async () => {
+    const store = createMemoryStore({ specName: "held", rootDir: tmp });
+    await store.remember("first");
+    // A live holder (this process) with a fresh mtime: the write waits, then fails.
+    writeFileSync(
+      join(tmp, ".held.lock"),
+      JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }),
+    );
+    try {
+      const err = await store.remember("second").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(MemoryStoreError);
+      expect((err as Error).message).toContain("held.jsonl");
+      expect((err as Error).message).toContain(`pid ${process.pid}`);
+    } finally {
+      rmSync(join(tmp, ".held.lock"), { force: true });
+    }
+    expect(await store.size()).toBe(1);
+    // The lock policy waits two seconds before it gives up.
+  }, 20_000);
+
+  test("the lock and the archive are invisible to a *.jsonl listing", async () => {
+    const store = createMemoryStore({ specName: "vis", rootDir: tmp });
+    const a = await store.remember("a");
+    await store.forget(a.id);
+    await store.compact();
+    expect(readdirSync(tmp).filter((n) => n.endsWith(".jsonl"))).toEqual(["vis.jsonl"]);
   });
 });

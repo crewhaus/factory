@@ -20,15 +20,25 @@
  * before the runtime attaches its own subscribers, so the log line is what an
  * operator of a process without such a stream sees.
  *
+ * The same store carries the run's lineage: {@link runWithScope} names what
+ * started the work (`trigger`), what it may be resumed as (`resumeScope`), the
+ * work item it serves and the parked run it continues. Every context created
+ * inside takes these for any field its own options leave unset; `continues`
+ * goes to the first context only, like the run input.
+ *
  * One store, kept on `globalThis` under
  * `Symbol.for("@crewhaus/run-context/ambient")`, so two copies of this package
- * in one process (a bundle that duplicated it) share it. Contract for every
- * helper that opens a nested scope on this store: copy the current store, and
- * copy its `inbound` object BY REFERENCE (never a clone of `consumed`), so a
- * context created in the nested scope consumes the same entries the outer one
- * would. Only {@link withInboundContent} replaces `inbound`.
+ * in one process (a bundle that duplicated it) share it. Two helpers open a
+ * nested scope on it, {@link withInboundContent} and {@link runWithScope}, and
+ * both follow one contract: copy the current store, and copy its shared slots
+ * (`inbound`, and `run.continues`) BY REFERENCE (never a clone of their
+ * `consumed`/`taken` flag), so a context created in the nested scope consumes
+ * the same entries the outer one would. Only {@link withInboundContent}
+ * replaces `inbound`; only a {@link runWithScope} that names `continues`
+ * replaces that slot. Either helper nests inside the other.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { Trigger } from "@crewhaus/control-contract";
 import type { TrustOrigin } from "./index";
 
 /** Run input a library classified and kept, waiting for the run's first context. */
@@ -44,7 +54,32 @@ export type InboundContent = {
 /** Shared and mutable: every scope nested inside holds the same object. */
 type InboundSlot = { readonly entries: readonly InboundContent[]; consumed: boolean };
 
-type AmbientStore = { readonly inbound?: InboundSlot };
+/**
+ * What a library knows about the run it hands work to. Every field is
+ * optional; a field a context's own options set wins over the scope's.
+ */
+export type RunScope = {
+  /** What the run may be resumed as: `session:`, `job:`, `lane:`, `run:` or `work:` and an id. */
+  readonly resumeScope?: string;
+  /** What started the run. */
+  readonly trigger?: Trigger;
+  /** The parked run this one continues. Taken by the first context in the scope only. */
+  readonly continues?: string;
+  /** The work item (`wi_…`) the run serves. */
+  readonly workItem?: string;
+};
+
+/** Shared and mutable, like {@link InboundSlot}: the first context takes it. */
+type ContinuesSlot = { readonly id: string; taken: boolean };
+
+type RunFields = {
+  readonly resumeScope?: string;
+  readonly trigger?: Trigger;
+  readonly workItem?: string;
+  readonly continues?: ContinuesSlot;
+};
+
+type AmbientStore = { readonly inbound?: InboundSlot; readonly run?: RunFields };
 
 const AMBIENT_KEY = Symbol.for("@crewhaus/run-context/ambient");
 
@@ -78,4 +113,52 @@ export function takePendingInbound(): readonly InboundContent[] {
   if (slot === undefined || slot.consumed) return [];
   slot.consumed = true;
   return slot.entries;
+}
+
+/**
+ * Run `fn` in a scope that names the run's lineage. The scope keeps the
+ * current store's other fields, merges the outer scope's run fields under
+ * `scope`'s, and keeps the outer `continues` slot by reference unless `scope`
+ * names its own. Every context created inside, at any depth of awaits, takes
+ * these fields for any its own options leave unset.
+ */
+export function runWithScope<T>(scope: RunScope, fn: () => T): T {
+  const store = ambient();
+  const current = store.getStore();
+  const outer = current?.run;
+  const run: RunFields = {
+    ...outer,
+    ...(scope.resumeScope !== undefined ? { resumeScope: scope.resumeScope } : {}),
+    ...(scope.trigger !== undefined ? { trigger: scope.trigger } : {}),
+    ...(scope.workItem !== undefined ? { workItem: scope.workItem } : {}),
+    ...(scope.continues !== undefined ? { continues: { id: scope.continues, taken: false } } : {}),
+  };
+  return store.run({ ...current, run }, fn);
+}
+
+/** The lineage a new context takes from the current scope. */
+export type AmbientRun = {
+  readonly resumeScope?: string;
+  readonly trigger?: Trigger;
+  readonly workItem?: string;
+  readonly continues?: string;
+};
+
+/**
+ * The current scope's run fields, taking its `continues` (the first caller
+ * gets it, later ones do not); `{}` with no scope. `createRunContext` calls
+ * this once.
+ */
+export function takeAmbientRun(): AmbientRun {
+  const run = ambient().getStore()?.run;
+  if (run === undefined) return {};
+  const slot = run.continues;
+  const continues = slot !== undefined && !slot.taken ? slot.id : undefined;
+  if (slot !== undefined) slot.taken = true;
+  return {
+    ...(run.resumeScope !== undefined ? { resumeScope: run.resumeScope } : {}),
+    ...(run.trigger !== undefined ? { trigger: run.trigger } : {}),
+    ...(run.workItem !== undefined ? { workItem: run.workItem } : {}),
+    ...(continues !== undefined ? { continues } : {}),
+  };
 }

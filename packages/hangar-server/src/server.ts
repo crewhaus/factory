@@ -16,12 +16,20 @@
  *   - baselines ⇒ `@crewhaus/eval-report`'s `setBaseline`.
  *
  * Safety model enforced here:
- *   - AUTH: every `/api` route requires `Authorization: Bearer <token>`
- *     (constant-time compare). `/healthz` and the static UI shell (which
- *     carries no harness data and must load before the browser has stored
- *     the fragment token) are the only unauthenticated surfaces. No cookies
- *     anywhere ⇒ no CSRF surface. `noAuth` disables the check with a logged
- *     warning, for trusted localhost dev only.
+ *   - HOST: before anything but `/healthz`, a `Host` this Home does not know
+ *     answers 421 (`host-allowlist.ts`), so a page that rebinds its own name
+ *     to loopback is turned away before it can spend a boot link.
+ *   - AUTH: every `/api` route passes `authenticate()` from
+ *     `@crewhaus/access-control` at one place (`access.ts`). A browser holds
+ *     a session sealed to it, signed in through a single-use boot link or its
+ *     own device key (`sign-in-routes.ts`); Home's own key (the bootstrap,
+ *     `<hangarRoot>/token`) is the owner only on `<hangarRoot>/home.sock` or
+ *     from a direct loopback peer with no forwarding headers, and never
+ *     reaches a browser. `/healthz`, the static UI shell and the sign-in
+ *     routes are the only unauthenticated surfaces. No cookies anywhere ⇒ no
+ *     CSRF surface. Every page carries a strict Content-Security-Policy
+ *     (`csp.ts`). `noAuth` disables the check with a logged warning, for
+ *     trusted localhost dev only.
  *   - PATH SAFETY: `:id` params must match their format regexes before any
  *     filesystem work, and every harness-relative read realpath-contains
  *     inside that harness's registered dir (the registry is the allowlist).
@@ -29,8 +37,8 @@
  *   - READS NEVER MUTATE: session browsing is raw dir scans + tolerant
  *     JSONL parsing (never `SessionStore.list()`, whose TTL eviction
  *     deletes transcripts); memory views are fold-only. The approvals inbox
- *     folds `approvals.jsonl` for the same reason — `PendingApprovalStore
- *     .list()` COMPACTS, and a polled inbox must not rewrite a ledger.
+ *     folds `approvals.jsonl` with the store's own fold, which writes
+ *     nothing: a polled inbox must not rewrite a ledger.
  *   - CREDENTIALS NEVER RENDER: env routes return KEY presence booleans;
  *     spec/transcript routes pass the spec-patch maskers; captured daemon
  *     output is served only through the supervisor's scrubbed paths, never
@@ -46,8 +54,25 @@
  * docblocks carry the write covenant each must honour.
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname as osHostname, userInfo } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
+import {
+  type Authenticated,
+  type Peer,
+  type SignInHandle,
+  type TokenSetup,
+  ensureToken,
+  loadAccessSnapshot,
+  localActorOf,
+  openSignIn,
+  readOwnerSettings,
+} from "@crewhaus/access-control";
+import {
+  type RecoverCounts,
+  currentLocalIdentity,
+  wireControl,
+  withOwnStartTime,
+} from "@crewhaus/control-service";
 import { readRunIndex } from "@crewhaus/eval-report";
 import {
   type BuildInventoryDeps,
@@ -69,6 +94,7 @@ import {
   type StartResult,
   type StopResult,
   cliTwin,
+  createProcessOps,
   isUnforceable,
   readRunfile,
   resolveBundle,
@@ -76,6 +102,13 @@ import {
   shellQuote,
 } from "@crewhaus/harness-supervisor";
 import { runPreflight } from "@crewhaus/preflight";
+import {
+  type HomeAccess,
+  bootstrapKeyMismatch,
+  checkAccess,
+  refusalOf,
+  refusalResponse,
+} from "./access";
 import { currentBaselines, pinBaseline, pinSession, readPins } from "./actions";
 import {
   type ActivityHarness,
@@ -88,9 +121,9 @@ import {
   approvalsInbox,
   isApprovalId,
   pendingApprovalCount,
+  refusedDecisionMessage,
   resolveApproval,
 } from "./approvals";
-import { type TokenSetup, createBootTickets, ensureToken, isAuthorized } from "./auth";
 import { bundleFreshness } from "./bundle-freshness";
 import {
   DEFAULT_HANGAR_PORT,
@@ -107,6 +140,7 @@ import {
   isControlLane,
 } from "./control-client";
 import { foldHarnessCosts } from "./costs";
+import { SHELL_HEADERS } from "./csp";
 import { deploymentsView } from "./deployments";
 import { mergedSpawnEnv } from "./env-file";
 import { evalJobOptions, launchOffers } from "./eval-inputs";
@@ -128,7 +162,18 @@ import {
   declaredBudgetUsd,
   dreamOverdue,
 } from "./health";
+import { allowedHosts, hostAllowed, misdirected } from "./host-allowlist";
 import { HttpError, errResponse, json } from "./http";
+import {
+  HOME_SOCKET,
+  PROXY_SOCKET,
+  bindSocket,
+  isLoopbackHostname,
+  isWildcardHostname,
+  socketPath as socketPathOf,
+  socketsSupported,
+  unlinkSocket,
+} from "./listeners";
 import { type M3Context, type M3Harness, requireBoolean, requireString } from "./m3";
 import { type M3Match, matchM3 } from "./m3-routes";
 import { type TextScrubber, maskDeep } from "./mask";
@@ -174,6 +219,7 @@ import {
   jobArgv,
 } from "./process";
 import { isProofRunId, proofTenants, proofView } from "./proofs";
+import { commandFields, createReceipts } from "./receipts";
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
 import {
@@ -200,6 +246,7 @@ import {
   openSettingsStore,
   readOnlyRefusal,
 } from "./settings";
+import { SIGN_IN_ROUTES, isSignInPath, serveSignIn } from "./sign-in-routes";
 import { BADGE_KEYS, capabilityBadges, specView } from "./spec-view";
 
 export type StaticAsset = {
@@ -217,8 +264,8 @@ export type HangarServerOptions = {
   /** Registry root passed to `openHangarRegistry` (the DIRECTORY holding
    *  `harnesses.json`); default `CREWHAUS_REGISTRY_ROOT` or `~/.crewhaus`. */
   readonly registryRoot?: string;
-  /** Explicit bearer token; otherwise loaded/minted at `<root>/token`. */
-  readonly token?: string;
+  /** More names this Home answers to (`--allow-host`), beside the ones it always does. */
+  readonly allowHosts?: readonly string[];
   /** Disable auth entirely (logged warning; trusted localhost dev only). */
   readonly noAuth?: boolean;
   /** Prebuilt UI assets served at `/` and exact asset paths. Absent → a
@@ -268,16 +315,22 @@ export type HangarServerOptions = {
 
 export type HangarServer = {
   readonly url: string;
+  /** `http://127.0.0.1:<port>` when Home is bound beyond loopback and also answers there:
+   *  the address a browser on this computer signs in from. */
+  readonly loopbackUrl?: string;
+  /** `<hangarRoot>/home.sock`, when Home listens on it (never on Windows). */
+  readonly socketPath?: string;
   readonly port: number;
   readonly hostname: string;
   readonly hangarRoot: string;
   readonly registryPath: string;
-  /** Undefined when `noAuth` is set. */
+  /** Home's own key, as read at boot; undefined when `noAuth` is set. It
+   *  stays in this process and its file: no route ever sends it. */
   readonly token?: string;
-  /** Where the minted token lives; undefined when supplied via options. */
+  /** Where Home's own key lives (`<hangarRoot>/token`). */
   readonly tokenPath?: string;
-  /** A single-use `/boot/<nonce>` path that redirects to the fragment form.
-   *  The launcher opens THIS, so the token never enters a command line.
+  /** A single-use `/boot/<nonce>` path that redirects to a one-time sign-in
+   *  code. The launcher opens THIS, so nothing secret enters a command line.
    *  Undefined when `noAuth` is set (there is nothing to hand over). */
   readonly bootPath?: string;
   readonly noAuth: boolean;
@@ -291,6 +344,10 @@ export type HangarServer = {
   readonly processes: ProcessLayer;
   /** True while read-only mode refuses mutating requests (HM-187). */
   readOnly(): boolean;
+  /** Run the session check now: every live run stream whose session has
+   *  expired or ended closes with `auth.expired` or `auth.revoked`. Home runs
+   *  it every 30 seconds on its own. */
+  checkSessions(): void;
   /**
    * Resolves once the boot sequence has run: port ledger open → `adopt()`
    * per registered harness → `jobQueue.restore()`. `Bun.serve` binds
@@ -301,7 +358,11 @@ export type HangarServer = {
     readonly adopted: number;
     readonly lost: number;
     readonly jobs: number;
+    /** What command recovery did, after adoption and the job restore. */
+    readonly commands: RecoverCounts;
   }>;
+  /** The control service this server writes command receipts through. */
+  readonly controlService: ReturnType<typeof wireControl>;
   stop(): Promise<void>;
 };
 
@@ -311,6 +372,32 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
 const asStringArray = (v: unknown): string[] | undefined =>
   Array.isArray(v) && v.every((s) => typeof s === "string") ? (v as string[]) : undefined;
 
+/** A plugin pane's single-use address lives this long, and at most this many at once. */
+const PANE_LINK_TTL_MS = 60_000;
+const PANE_LINK_CAP = 256;
+/** How often live run streams check that their session still holds. */
+const SESSION_CHECK_MS = 30_000;
+
+/** The OS user running Home, for the access records' local actor. */
+function osIdentity(env: Readonly<Record<string, string | undefined>>): {
+  username: string;
+  hostname: string;
+} {
+  let username = "";
+  try {
+    username = userInfo().username;
+  } catch {
+    username = env["USER"] ?? env["USERNAME"] ?? "";
+  }
+  let host = "";
+  try {
+    host = osHostname();
+  } catch {
+    host = "";
+  }
+  return { username, hostname: host };
+}
+
 /** Start the manager server. Synchronous — `Bun.serve` binds immediately. */
 export function startHangarServer(opts: HangarServerOptions = {}): HangarServer {
   const env = opts.env ?? process.env;
@@ -319,15 +406,61 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   const hangarRoot =
     opts.root !== undefined ? resolve(opts.root) : join(homedir(), ".crewhaus", "hangar");
   const noAuth = opts.noAuth === true;
+  const hostname = opts.hostname ?? "127.0.0.1";
+
+  // ---- signing in: the owner's settings, the sign-in handle, the Host allowlist ----
+  // The owner's `access` and `links` blocks are read once, here; a block that is not
+  // right refuses boot, because guessing at who Home may trust is worse than not starting.
+  const ownerRead = readOwnerSettings(hangarRoot);
+  if (!ownerRead.ok) throw new Error(`hangar-server: ${ownerRead.reason}`);
+  for (const warning of ownerRead.warnings) onWarn(`hangar-server: ${warning}`);
+  const ownerSettings = ownerRead.settings;
+  const trustedProxy = ownerSettings.trustedProxy;
+  if (trustedProxy !== undefined) {
+    if (!isLoopbackHostname(hostname)) {
+      throw new Error(
+        `hangar-server: a trusted proxy is set in ${join(hangarRoot, "settings.json")}, so Home listens on this computer only — drop --lan and --host, or remove the proxy with \`crewhaus access proxy --off\``,
+      );
+    }
+    if (trustedProxy.socket === true && !socketsSupported()) {
+      throw new Error(
+        "hangar-server: access.trustedProxy.socket needs a unix socket, which Home does not create on Windows — use a proxy secret instead (`crewhaus access proxy` without --socket)",
+      );
+    }
+  }
+  if (!noAuth && !socketsSupported()) {
+    const access = loadAccessSnapshot(hangarRoot);
+    const socketOnly =
+      access.state === "present" &&
+      access.snapshot.tokens.some(
+        (row) => row.kind === "bootstrap" && row.state === "active" && row.socketOnly === true,
+      );
+    if (socketOnly) {
+      throw new Error(
+        "hangar-server: Home's own key is socket-only, and Home does not create its socket on Windows — run `crewhaus hangar rotate-token --tcp`",
+      );
+    }
+  }
   let tokenSetup: TokenSetup | undefined;
   if (noAuth) {
     onWarn(
       "hangar-server: AUTH DISABLED (noAuth) — every local process can read this fleet's state",
     );
   } else {
-    tokenSetup = ensureToken(hangarRoot, opts.token);
+    tokenSetup = ensureToken(hangarRoot);
+    const mismatch = bootstrapKeyMismatch(hangarRoot, tokenSetup.token);
+    if (mismatch !== undefined) throw new Error(mismatch);
   }
-  const bootTickets = createBootTickets();
+  const signIn: SignInHandle = openSignIn(hangarRoot, {
+    now,
+    localActor: localActorOf(osIdentity(env)),
+  });
+  const homeAccess: HomeAccess = {
+    signIn,
+    config: trustedProxy !== undefined ? { trustedProxy } : {},
+    bootToken: tokenSetup?.token,
+    now,
+  };
 
   const registry: HangarRegistry = openHangarRegistry({
     ...(opts.registryRoot !== undefined ? { root: opts.registryRoot } : {}),
@@ -337,8 +470,61 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   });
   const cache = openRollupCache(hangarRoot);
   const version = opts.version ?? HANGAR_SERVER_VERSION;
-  const hostname = opts.hostname ?? "127.0.0.1";
   const operator = opts.operator ?? "hangar";
+
+  // Every command is persisted before it is acknowledged. The supervisor and the drain
+  // call are lent lazily, so the job store below can be wrapped without a cycle.
+  const controlService = wireControl(
+    {
+      hangarRoot,
+      harnessDirOf: (hrn) => {
+        const entry = registry.get(hrn);
+        return entry !== undefined && entry.missingSince === null && existsSync(entry.dir)
+          ? entry.dir
+          : undefined;
+      },
+      harnessDirs: () => liveHarnesses().map((h) => h.dir),
+      supervisorFor: (dir) => {
+        const entry = registry.list().find((e) => e.dir === dir);
+        return entry === undefined ? undefined : processes.get(entry).supervisor;
+      },
+      drainRequest: (dir) => async () => {
+        const outcome = await control.drain({
+          harnessDir: dir,
+          controlPort: processes.peek(dir)?.controlPort(),
+        });
+        if (!outcome.ok) throw new Error(outcome.reason);
+      },
+      identity: currentLocalIdentity(),
+      now,
+      probe: withOwnStartTime(createProcessOps()),
+      onWarn,
+    },
+    { mode: "server" },
+  );
+
+  /** Who each `/api` request authenticated as, for the routes that care which credential. */
+  const callers = new WeakMap<Request, Authenticated>();
+  /** Single-use pane documents (`/pane/<nonce>`), minted inside the authenticated pane read. */
+  const paneDocs = new Map<
+    string,
+    { readonly doc: string; readonly csp: string; readonly expiry: number }
+  >();
+  /**
+   * The abort signal for a live run stream: the client going away, or, for a stream
+   * opened with a session, that session ending. The reason names the closing event.
+   */
+  const streamSignal = (req: Request): AbortSignal | undefined => {
+    const who = callers.get(req);
+    const sessionRef = who?.kind === "principal" ? who.sessionRef : undefined;
+    if (sessionRef === undefined) return req.signal;
+    const ended = new AbortController();
+    const stop = signIn.onEnd(sessionRef, (end) =>
+      ended.abort(end === "expired" ? "auth.expired" : "auth.revoked"),
+    );
+    req.signal?.addEventListener("abort", stop, { once: true });
+    return req.signal === undefined ? ended.signal : AbortSignal.any([req.signal, ended.signal]);
+  };
 
   const processes: ProcessLayer =
     opts.processLayer ??
@@ -349,6 +535,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       onWarn,
       hangarRoot,
       managerVersion: version,
+      wrapJobStore: controlService.jobs.wrapStore,
     });
   const control: ControlClient = opts.controlClient ?? createControlClient();
 
@@ -1220,6 +1407,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           ...(entry !== null ? { harnessId: entry.id } : {}),
           kind,
           argv,
+          ...commandFields(),
         }),
       warn: onWarn,
     };
@@ -1426,6 +1614,11 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         });
         if (result.outcome === "not-found") throw new HttpError(404, "no such approval");
         if (result.outcome === "unreachable") throw new HttpError(409, result.reason);
+        if (result.outcome === "forbidden") throw new HttpError(403, result.reason);
+        if (result.outcome !== "resolved") {
+          // The first decision stands: say what state it left, never who made it.
+          throw new HttpError(409, refusedDecisionMessage(result.outcome, result.approval));
+        }
         return jsonMasked({ ok: true, approval: result.approval });
       }
 
@@ -1481,7 +1674,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           if (err instanceof JobArgumentError) throw new HttpError(400, err.message);
           throw err;
         }
-        const record = processes.jobs.submit({ harnessDir: dir, harnessId: entry.id, kind, argv });
+        const record = processes.jobs.submit({
+          harnessDir: dir,
+          harnessId: entry.id,
+          kind,
+          argv,
+          ...commandFields(),
+        });
         return jsonMasked({ ok: true, job: record }, 202);
       }
 
@@ -1568,7 +1767,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         scrub: harnessScrub(dir),
         ...(live ? { subscribe: handle.supervisor.subscribe } : {}),
         ...(opts.sseHeartbeatMs !== undefined ? { heartbeatMs: opts.sseHeartbeatMs } : {}),
-        ...(req.signal !== undefined ? { signal: req.signal } : {}),
+        signal: streamSignal(req),
       });
     }
     if (head === "control" && tail.length === 1 && tail[0] === "status") {
@@ -1721,12 +1920,25 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       return json({ hangar: version, protocolV: PROTOCOL_V });
     }
 
-    // Mint a fresh single-use browser handoff. Bearer-authed: `crewhaus
-    // hangar open` reads the token file (it already has filesystem access to
-    // it) and trades it for a path safe to put on a command line.
+    // Mint a fresh single-use browser handoff. `crewhaus hangar open` reads
+    // Home's own key from disk (it already has filesystem access to it) and
+    // trades it, over `home.sock`, for a path safe to put on a command line.
     if (head === "boot-ticket" && rest.length === 0 && method === "POST") {
       if (tokenSetup === undefined) throw new HttpError(409, "auth is disabled; open / directly");
-      return json({ bootPath: bootTickets.mint(now()) });
+      // Home's own key only: a browser session, even the owner's, cannot mint sign-in
+      // links for other browsers.
+      const caller = callers.get(req);
+      if (caller?.kind !== "principal" || caller.via !== "bootstrap") {
+        return json(
+          {
+            error: "Only Home's own key, on this computer, can make a sign-in link.",
+            code: "authorization_unavailable",
+            reason: "owner_only",
+          },
+          403,
+        );
+      }
+      return json({ bootPath: signIn.mintBootTicket() });
     }
 
     if (head === "harnesses" && rest.length === 0) {
@@ -2063,7 +2275,19 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       // NOT masked: the pane document is the plugin's own markup, and
       // maskDeep would rewrite its text. It is contained by the sandbox and
       // the CSP that travel with it, which is the containment that matters.
-      return json(doc);
+      // The frame loads it from a single-use address that serves it with that
+      // CSP and sandbox as headers: a `srcdoc` frame would inherit the
+      // console's own policy, which runs no inline script.
+      const at = now();
+      for (const [key, entry] of paneDocs) if (entry.expiry <= at) paneDocs.delete(key);
+      while (paneDocs.size >= PANE_LINK_CAP) {
+        const oldest = paneDocs.keys().next();
+        if (oldest.done === true) break;
+        paneDocs.delete(oldest.value);
+      }
+      const nonce = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex");
+      paneDocs.set(nonce, { doc: doc.doc, csp: doc.csp, expiry: at + PANE_LINK_TTL_MS });
+      return json({ ...doc, src: `/pane/${nonce}` });
     }
 
     // ---- M2 fleet inboxes ---------------------------------------------
@@ -2216,6 +2440,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   const builtinIndex = (): Response => {
     const routes = [
       "GET  /healthz",
+      "GET  /boot/:nonce   (a single-use sign-in link)",
+      ...SIGN_IN_ROUTES.map((r) => `${r.method.padEnd(4)} ${r.path}`),
+      "POST /api/boot-ticket   (Home's own key only)",
       "GET  /api/version",
       "GET  /api/harnesses[?hydrate=1]   POST /api/harnesses {dir}",
       "GET|POST|PUT|DELETE /api/registry/groups",
@@ -2264,13 +2491,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET|POST /api/h/:id/{mcp-servers,dev}/…",
     ];
     const items = routes.map((r) => `<li><code>${r}</code></li>`).join("\n");
-    const html = `<!doctype html><meta charset="utf-8"><title>Hangar</title><h1>Hangar manager API</h1><p>No UI assets embedded in this build. Every <code>/api</code> route requires <code>Authorization: Bearer &lt;token&gt;</code>.</p><ul>${items}</ul>`;
+    const html = `<!doctype html><meta charset="utf-8"><title>Hangar</title><h1>Hangar manager API</h1><p>No UI assets embedded in this build. Every <code>/api</code> route requires <code>Authorization: Bearer &lt;session&gt;</code>.</p><ul>${items}</ul>`;
     return new Response(html, {
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store",
-        "x-content-type-options": "nosniff",
-      },
+      headers: { ...SHELL_HEADERS, "content-type": "text/html; charset=utf-8" },
     });
   };
 
@@ -2281,11 +2504,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const asset = assets[pathname] ?? (pathname === "/" ? assets["/index.html"] : undefined);
       if (asset !== undefined) {
         return new Response(asset.body, {
-          headers: {
-            "content-type": asset.contentType,
-            "cache-control": "no-store",
-            "x-content-type-options": "nosniff",
-          },
+          headers: { ...SHELL_HEADERS, "content-type": asset.contentType },
         });
       }
     }
@@ -2293,36 +2512,82 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     return errResponse(404, "not found");
   };
 
-  const handle = async (req: Request): Promise<Response> => {
+  const withReceipt = createReceipts({
+    control: controlService,
+    harness: (id) => registry.get(id),
+    scrubFor: (dir) => (dir === undefined ? fleetScrub() : harnessScrub(dir)),
+    onWarn,
+  });
+
+  const hosts = allowedHosts({
+    bound: [hostname],
+    ...(trustedProxy !== undefined ? { trustedProxyHosts: trustedProxy.hosts } : {}),
+    allowedHosts: ownerSettings.allowedHosts,
+    ...(ownerSettings.baseUrl !== undefined
+      ? { baseUrlHost: new URL(ownerSettings.baseUrl).hostname }
+      : {}),
+    ...(opts.allowHosts !== undefined ? { allowHosts: opts.allowHosts } : {}),
+  });
+
+  const handle = async (incoming: Request, peer: Peer): Promise<Response> => {
+    let req = incoming;
     const url = new URL(req.url);
     const pathname = url.pathname;
     if (pathname === "/healthz") return json({ ok: true });
 
+    // Before everything else, a boot link and a static file included: a name this Home
+    // does not answer to is a page that rebound its own name to this address.
+    if (!hostAllowed(req.headers.get("host"), hosts)) return misdirected();
+
     // Unauthenticated by necessity — the caller is a fresh browser that has
-    // no token yet. Security rests on the nonce being unguessable and
-    // single-use, not on the request being authorized.
+    // nothing yet. Security rests on the nonce being unguessable and
+    // single-use, not on the request being authorized. It answers a one-time
+    // code, which the browser trades with its own new key for a session.
     if (pathname.startsWith("/boot/")) {
       if (req.method !== "GET") return errResponse(405, "method not allowed");
       if (tokenSetup === undefined) return errResponse(404, "not found");
-      const nonce = pathname.slice("/boot/".length);
-      if (bootTickets.consume(nonce, now()) === undefined) {
-        return errResponse(404, "boot ticket already used or expired");
-      }
+      const code = signIn.mintExchangeCode(pathname.slice("/boot/".length));
+      if (code === undefined) return errResponse(404, "boot ticket already used or expired");
       return new Response(null, {
         status: 302,
         headers: {
-          location: `/#t=${encodeURIComponent(tokenSetup.token)}`,
+          location: `/#x=${code}`,
           "cache-control": "no-store",
           "referrer-policy": "no-referrer",
         },
       });
     }
 
+    // A plugin pane's document, once, with the plugin's own policy and sandbox.
+    if (pathname.startsWith("/pane/")) {
+      if (req.method !== "GET") return errResponse(405, "method not allowed");
+      const nonce = pathname.slice("/pane/".length);
+      const entry = paneDocs.get(nonce);
+      paneDocs.delete(nonce);
+      if (entry === undefined || entry.expiry <= now()) return errResponse(404, "not found");
+      return new Response(entry.doc, {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy": `${entry.csp}; sandbox allow-scripts`,
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "referrer-policy": "no-referrer",
+        },
+      });
+    }
+
+    if (isSignInPath(pathname)) {
+      if (noAuth) return errResponse(404, "not found");
+      return await serveSignIn(homeAccess, req, peer, pathname);
+    }
+
     if (pathname === "/api" || pathname.startsWith("/api/")) {
       if (!noAuth) {
-        if (tokenSetup === undefined || !isAuthorized(req, tokenSetup.token)) {
-          return errResponse(401, "missing or invalid bearer token");
-        }
+        const checked = await checkAccess(homeAccess, req, peer);
+        const refused = refusalOf(checked.answer);
+        if (refused !== undefined) return refusalResponse(pathname, refused);
+        req = checked.request;
+        callers.set(req, checked.answer);
       }
       // HM-187 — read-only mode, enforced HERE, ahead of every handler.
       // Placed after auth and before dispatch so it covers the M1/M2 chain
@@ -2341,7 +2606,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         return errResponse(400, "malformed path encoding");
       }
       try {
-        return await api(req, url, segs.slice(1));
+        return await withReceipt(req, segs, () => api(req, url, segs.slice(1)));
       } catch (err) {
         if (err instanceof HttpError) return errResponse(err.status, err.message);
         onWarn(
@@ -2354,6 +2619,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     return serveStatic(req, pathname);
   };
 
+  const tcpPeer = (
+    req: Request,
+    srv: { requestIP(r: Request): { address: string } | null },
+  ): Peer => ({
+    address: srv.requestIP(req)?.address ?? null,
+    listener: "tcp",
+  });
   const server = Bun.serve({
     port: opts.port ?? DEFAULT_HANGAR_PORT,
     hostname,
@@ -2365,22 +2637,95 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     // The keep-alive comment frame (SSE_HEARTBEAT_MS) is the other half:
     // this raises the ceiling, the ping keeps the socket under it.
     idleTimeout: SSE_IDLE_TIMEOUT_SECONDS,
-    fetch: handle,
+    fetch: (req, srv) => handle(req, tcpPeer(req, srv)),
   });
 
   const boundPort = server.port ?? 0;
+
+  // A LAN or named-host bind also answers on loopback at the same port, so a browser
+  // on this computer has a secure context to sign in from. A wildcard bind already does.
+  type Stoppable = { stop(closeActive?: boolean): unknown };
+  const extra: Stoppable[] = [];
+  let loopbackUrl: string | undefined;
+  if (!isLoopbackHostname(hostname)) {
+    loopbackUrl = `http://127.0.0.1:${boundPort}`;
+    if (!isWildcardHostname(hostname)) {
+      try {
+        extra.push(
+          Bun.serve({
+            port: boundPort,
+            hostname: "127.0.0.1",
+            development: false,
+            idleTimeout: SSE_IDLE_TIMEOUT_SECONDS,
+            fetch: (req, srv) => handle(req, tcpPeer(req, srv)),
+          }),
+        );
+      } catch (err) {
+        loopbackUrl = undefined;
+        onWarn(
+          `hangar-server: could not also listen on 127.0.0.1:${boundPort} (${err instanceof Error ? err.message : String(err)}) — signing in from this computer is unavailable on this run`,
+        );
+      }
+    }
+  }
+  // Home's own socket, and the proxy's when the owner chose one. Each passes the same
+  // `handle`, told which socket it came in on.
+  const sockets: string[] = [];
+  const serveSocket = (name: string, listener: Peer["listener"]): string | undefined => {
+    if (!socketsSupported()) return undefined;
+    const path = socketPathOf(hangarRoot, name);
+    const bound = bindSocket(
+      path,
+      (unix) =>
+        // A unix-socket server takes no idle timeout of its own; Bun keeps the
+        // socket open while the stream writes, and the heartbeat keeps it writing.
+        Bun.serve({
+          unix,
+          development: false,
+          fetch: (req) => handle(req, { address: null, listener }),
+        }),
+      onWarn,
+    );
+    if (bound === undefined) return undefined;
+    extra.push(bound);
+    sockets.push(path);
+    return path;
+  };
+  const homeSocket = noAuth ? undefined : serveSocket(HOME_SOCKET, "home.sock");
+  if (trustedProxy?.socket === true && serveSocket(PROXY_SOCKET, "proxy.sock") === undefined) {
+    onWarn(
+      "hangar-server: the trusted proxy's socket could not be created — the proxy cannot reach Home",
+    );
+  }
+  // Live run streams opened with a session close when it ends.
+  let stopped = false;
+  const sessionTimer = setInterval(() => signIn.checkSessions(), SESSION_CHECK_MS);
+  (sessionTimer as { unref?: () => void }).unref?.();
   // Boot the process picture: the port ledger is already open (the layer
   // owns it), every registered harness with a runfile is adopted, and only
   // THEN the job queue restores — so work that was running when the previous
   // manager died is closed as `interrupted` against an accurate picture.
   // Bun.serve binds synchronously, so the socket is live either way; a
   // caller that needs the picture awaits `ready`.
-  const ready = processes.boot().catch((err) => {
-    onWarn(
-      `hangar-server: process boot failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return { adopted: 0, lost: 0, jobs: 0 };
-  });
+  const ready = processes
+    .boot()
+    .catch((err) => {
+      onWarn(
+        `hangar-server: process boot failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { adopted: 0, lost: 0, jobs: 0 };
+    })
+    // Command recovery last: after adoption and the job restore, so it judges an accurate
+    // process picture and the receipts the restore already moved.
+    .then(async (booted) => ({
+      ...booted,
+      commands: await controlService.commands.recover("all").catch((err) => {
+        onWarn(
+          `hangar-server: command recovery failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return { redispatched: 0, reconciled: 0, unknown: 0 };
+      }),
+    }));
 
   return {
     url: `http://${hostname}:${boundPort}`,
@@ -2390,17 +2735,26 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     registryPath: registry.path,
     ...(tokenSetup !== undefined ? { token: tokenSetup.token } : {}),
     ...(tokenSetup?.tokenPath !== undefined ? { tokenPath: tokenSetup.tokenPath } : {}),
-    ...(tokenSetup !== undefined ? { bootPath: bootTickets.mint(now()) } : {}),
+    ...(tokenSetup !== undefined ? { bootPath: signIn.mintBootTicket() } : {}),
+    ...(loopbackUrl !== undefined ? { loopbackUrl } : {}),
+    ...(homeSocket !== undefined ? { socketPath: homeSocket } : {}),
     noAuth,
     idleTimeoutSeconds: SSE_IDLE_TIMEOUT_SECONDS,
     processes,
+    controlService,
     readOnly: readOnlyNow,
+    checkSessions: () => signIn.checkSessions(),
     ready,
     stop: async () => {
+      if (stopped) return;
+      stopped = true;
       // Release timers and subscriptions; the CHILDREN are deliberately left
       // alone. A detached daemon outliving its manager is the whole point of
       // the runfile — the next boot adopts it.
       processes.close();
+      clearInterval(sessionTimer);
+      for (const listener of extra) await listener.stop(true);
+      for (const path of sockets) unlinkSocket(path);
       await server.stop(true);
     },
   };

@@ -15,7 +15,12 @@ import { dirname, join } from "node:path";
 
 const ROOT = dirname(import.meta.dir);
 
-const WINDOWS_CONTROL_PLANE = ["harness-supervisor", "hangar-server", "control-records"] as const;
+const WINDOWS_CONTROL_PLANE = [
+  "harness-supervisor",
+  "hangar-server",
+  "control-records",
+  "control-service",
+] as const;
 
 type Workflow = { jobs: Record<string, { steps?: { run?: string }[] }> };
 

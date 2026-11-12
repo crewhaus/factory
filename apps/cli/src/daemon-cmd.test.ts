@@ -21,8 +21,10 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { append, foldStates } from "@crewhaus/control-records";
+import { commandsLedgerOf } from "@crewhaus/control-service";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import type { Clock, ProcessOps, SpawnRequest, SpawnedProcess } from "@crewhaus/harness-supervisor";
 import { hashSpecSource } from "@crewhaus/harness-supervisor";
@@ -313,7 +315,7 @@ describe("crewhaus daemon", () => {
       expect(typeof runfile.argvFingerprint).toBe("string");
 
       const again = await runDaemonCommand(["start", "--no-preflight"], f.opts);
-      expect(again.exitCode).toBe(1);
+      expect(again.exitCode).toBe(55);
       expect(again.lines[0]).toContain("already running");
       expect(f.ops.children.length).toBe(1);
     } finally {
@@ -356,14 +358,14 @@ describe("crewhaus daemon", () => {
     ]);
     try {
       const refused = await runDaemonCommand(["start"], f.opts);
-      expect(refused.exitCode).toBe(1);
+      expect(refused.exitCode).toBe(55);
       const text = refused.lines.join("\n");
       expect(text).toContain("preflight refused the spawn");
       expect(text).toContain("cannot be overridden");
       expect(f.ops.children.length).toBe(0);
 
       const forced = await runDaemonCommand(["start", "--force"], f.opts);
-      expect(forced.exitCode).toBe(1);
+      expect(forced.exitCode).toBe(55);
       expect(forced.lines.join("\n")).toContain("cannot be overridden");
       // The refusal REPLACED the spawn — it did not precede one.
       expect(f.ops.children.length).toBe(0);
@@ -377,14 +379,14 @@ describe("crewhaus daemon", () => {
     try {
       const opts = { ...f.opts, env: { ...f.opts.env, HOME: f.dir } };
       const refused = await runDaemonCommand(["start"], opts);
-      expect(refused.exitCode).toBe(1);
+      expect(refused.exitCode).toBe(55);
       expect(refused.lines.join("\n")).toContain("holds the home directory");
       expect(f.ops.children.length).toBe(0);
 
       // The fixture's spec has a blocking finding of its own, so the id clears
       // this line and the refusal stands on the other one.
       const acked = await runDaemonCommand(["start", "--ack", "workspace.holds-home"], opts);
-      expect(acked.exitCode).toBe(1);
+      expect(acked.exitCode).toBe(55);
       expect(acked.lines.join("\n")).toContain("preflight refused the spawn");
       expect(acked.lines.join("\n")).not.toContain("holds the home directory");
       expect(f.ops.children.length).toBe(0);
@@ -395,7 +397,7 @@ describe("crewhaus daemon", () => {
 
       f.ops.last()?.exit(0);
       const next = await runDaemonCommand(["start"], opts);
-      expect(next.exitCode).toBe(1);
+      expect(next.exitCode).toBe(55);
       expect(next.lines.join("\n")).toContain("holds the home directory");
       expect(f.ops.children.length).toBe(1);
     } finally {
@@ -679,7 +681,7 @@ describe("crewhaus daemon", () => {
           },
         },
       });
-      expect(out.exitCode).toBe(1);
+      expect(out.exitCode).toBe(55);
       const text = out.lines.join("\n");
       expect(text).toContain("preSpawn refused the start");
       expect(text).toContain("ENOENT");
@@ -1122,6 +1124,123 @@ describe("crewhaus daemon status — registry pin freshness", () => {
       ).toBeUndefined();
     } finally {
       f.cleanup();
+    }
+  });
+});
+
+// --- every change is a command ------------------------------------------------
+
+/** The receipts in a harness's command ledger, as their latest rows. */
+function receiptsOf(dir: string): Record<string, unknown>[] {
+  const fold = foldStates(commandsLedgerOf(dir));
+  if (!fold.ok) return [];
+  return [...fold.objects.values()].map((o) => o.record as Record<string, unknown>);
+}
+
+/** A stop accepted by a process that died before it ran: no process holds pid 999. */
+function plantOrphanStop(dir: string, id: string): void {
+  const answer = append(commandsLedgerOf(dir), {
+    id,
+    v: 1,
+    kind: "controls.stop",
+    target: `home/cmd/${id}`,
+    actor: `local:#${"a".repeat(64)}`,
+    via: "cli",
+    fingerprint: "f".repeat(64),
+    state: "accepted",
+    acceptedAt: new Date(Date.now() - 1000).toISOString(),
+    executor: {
+      pid: 999,
+      startedAt: new Date(Date.now() - 2000).toISOString(),
+      host: hostname(),
+      head: "cli",
+    },
+    effects: [],
+    retry: { retryable: true, safety: "idempotent" },
+  });
+  if (!answer.ok) throw new Error(answer.reason);
+}
+
+describe("crewhaus daemon writes a receipt for every change", () => {
+  test("stop writes one cli receipt in the harness's own ledger, and says Done", async () => {
+    const f = fixture();
+    try {
+      const out = await runDaemonCommand(["stop"], f.opts);
+      expect(out.exitCode).toBe(0);
+      expect(out.lines[0]).toBe("daemon-fixture: not running (no runfile)");
+      const receipts = receiptsOf(f.dir);
+      expect(receipts).toHaveLength(1);
+      const receipt = receipts[0] as Record<string, unknown>;
+      expect(receipt["kind"]).toBe("controls.stop");
+      expect(receipt["via"]).toBe("cli");
+      expect(receipt["state"]).toBe("succeeded");
+      expect(receipt["actor"]).toMatch(/^local:#[0-9a-f]{64}$/);
+      expect(out.lines.at(-1)).toBe(`Done (${receipt["id"]})`);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a refused start exits 55, with a rejected receipt and its id", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      const again = await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      expect(again.exitCode).toBe(55);
+      expect(again.lines[0]).toContain("already running");
+      const rejected = receiptsOf(f.dir).filter((r) => r["state"] === "rejected");
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0]?.["kind"]).toBe("controls.start");
+      expect((rejected[0]?.["outcome"] as { code: string }).code).toBe("conflict");
+      expect(again.lines.at(-1)).toBe(`Not done (${rejected[0]?.["id"]})`);
+      expect(receiptsOf(f.dir).filter((r) => r["state"] === "succeeded")).toHaveLength(1);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a bad argument is refused before anything is written", async () => {
+    const f = fixture();
+    try {
+      await expect(runDaemonCommand(["stop", "--grace", "-1"], f.opts)).rejects.toThrow(
+        /--grace must be a non-negative number/,
+      );
+      expect(existsSync(join(f.dir, ".crewhaus", "run", "control"))).toBe(false);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("recovery runs once per harness per process, and never touches another harness", async () => {
+    const f = fixture();
+    const other = fixture();
+    try {
+      plantOrphanStop(f.dir, "cmd_01m76e6f05hp514w9j4v3qymka");
+      plantOrphanStop(other.dir, "cmd_01m76e6f05hp514w9j4v3qymkb");
+      const otherLedger = join(
+        other.dir,
+        ".crewhaus",
+        "run",
+        "control",
+        "commands",
+        "000001.jsonl",
+      );
+      const otherBefore = readFileSync(otherLedger);
+
+      await runDaemonCommand(["stop"], f.opts);
+      const first = receiptsOf(f.dir).find((r) => r["id"] === "cmd_01m76e6f05hp514w9j4v3qymka");
+      expect(first?.["state"]).toBe("succeeded");
+
+      // A second orphan, after this process already recovered the harness: left for the
+      // next process.
+      plantOrphanStop(f.dir, "cmd_01m76e6f05hp514w9j4v3qymkc");
+      await runDaemonCommand(["stop"], f.opts);
+      const second = receiptsOf(f.dir).find((r) => r["id"] === "cmd_01m76e6f05hp514w9j4v3qymkc");
+      expect(second?.["state"]).toBe("accepted");
+      expect(readFileSync(otherLedger)).toEqual(otherBefore);
+    } finally {
+      f.cleanup();
+      other.cleanup();
     }
   });
 });

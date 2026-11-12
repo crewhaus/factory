@@ -30,7 +30,8 @@
 import {
   type ContinuityProofMode,
   type ContinuityStore,
-  countsAsProven,
+  type ProofRecheck,
+  countsAsProvenChecked,
 } from "@crewhaus/continuity-store";
 import type { McpHost } from "@crewhaus/mcp-host";
 import { createPiiRedactor } from "@crewhaus/pii-redactor";
@@ -454,9 +455,10 @@ export type ThredzGoalMirrorOptions = {
   readonly log?: (line: string) => void;
   /**
    * `continuity.proof` — which local goals count as achieved, and so have
-   * their remote goal completed (`countsAsProven`). Default `"ladder"`:
+   * their remote goal completed (`countsAsProvenChecked`). Default `"ladder"`:
    * every `proven` goal. Under `"require"` only a goal proven with verified
-   * evidence completes its mirror (design/0.8.0 §6.3).
+   * evidence whose frozen proofs still match their session logs completes its
+   * mirror (design/0.8.0 §6.3).
    */
   readonly proofMode?: ContinuityProofMode;
 };
@@ -613,12 +615,19 @@ export function withThredzGoalMirror(
       if (patch.title !== undefined) body["title"] = (await redactor.redact(goal.title)).text;
       if (patch.target !== undefined) body["targetValue"] = goal.target;
       if (patch.current !== undefined) body["currentValue"] = goal.current;
-      if (countsAsProven(goal, opts.proofMode)) {
+      // Under `require` the goal's frozen proofs are read again from their
+      // session logs first, so a proof written into goals.yaml by hand
+      // completes nothing remotely. The ladder and `off` read no log here.
+      const proofMode = opts.proofMode ?? "ladder";
+      const recheck: ProofRecheck =
+        proofMode === "require" ? await store.recheckProofs(goal) : { ok: true };
+      if (countsAsProvenChecked(goal, proofMode, recheck)) {
         // Thredz goals complete when currentValue reaches targetValue — a
         // proven local goal completes its mirror deterministically. Under
         // `continuity.proof: require` "proven" means verified (design/0.8.0
-        // §6.3): a goal proven by assertion under an earlier `off` run, or
-        // marked proven with no proof on record, is below proven there, and
+        // §6.3): a goal proven by assertion under an earlier `off` run,
+        // marked proven with no proof on record, or carrying a proof its
+        // session log does not match, is below proven there, and
         // tool-plan refuses to complete it. Forcing completion here would be
         // a second completion path that any allowed update — progress below
         // the target, a title edit — walks through, so such a goal mirrors

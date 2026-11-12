@@ -269,7 +269,7 @@ describe("the system half", () => {
 
     test("spawnHangar", async () => {
       const { dir, marker } = standIn(
-        "echo 'http://127.0.0.1:43210/#t=abc123'\ntrap 'exit 0' TERM\nwhile :; do sleep 0.05; done",
+        "echo '│  url       http://127.0.0.1:43210'\ntrap 'exit 0' TERM\nwhile :; do sleep 0.05; done",
       );
       const hangar = await spawnHangar(childEnv(dir), dir);
       try {
@@ -290,15 +290,13 @@ describe("the system half", () => {
     expect(env["CREWHAUS_REGISTRY_ROOT"]).toBe(sandboxEnv("/sandbox")["CREWHAUS_REGISTRY_ROOT"]);
   });
 
-  test("the printed URL becomes an address a session can sign in from", () => {
-    const printed = "Hangar is up\n  http://127.0.0.1:43210/#t=abc123\nmore\n";
-    expect(parsePrintedUrl(printed)).toEqual({
-      url: "http://127.0.0.1:43210",
-      port: 43210,
-      token: "abc123",
-      bootPath: "/#t=abc123",
-    });
+  test("the printed summary's url row becomes the address a session signs in at", () => {
+    const printed =
+      "┌─ Hangar — the CrewHaus harness manager\n│  url       http://127.0.0.1:43210\n│  sign in   a browser on this computer: crewhaus hangar open\n└─\n";
+    expect(parsePrintedUrl(printed)).toEqual({ url: "http://127.0.0.1:43210", port: 43210 });
     expect(parsePrintedUrl("still starting")).toBeUndefined();
-    expect(parsePrintedUrl("http://0.0.0.0:43210/#t=abc123")).toBeUndefined();
+    expect(parsePrintedUrl("│  url       http://0.0.0.0:43210")).toBeUndefined();
+    // The old form carried a credential in the address; nothing prints it any more.
+    expect(parsePrintedUrl("  http://127.0.0.1:43210/#t=abc123")).toBeUndefined();
   });
 });

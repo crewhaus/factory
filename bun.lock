@@ -35,6 +35,10 @@
         "@crewhaus/compliance-controls": "workspace:*",
         "@crewhaus/computer-use-driver": "workspace:*",
         "@crewhaus/context-bundle": "workspace:*",
+        "@crewhaus/continuity-store": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/control-service": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
@@ -670,6 +674,20 @@
         "@crewhaus/spec-patch": "workspace:*",
       },
     },
+    "packages/control-service": {
+      "name": "@crewhaus/control-service",
+      "version": "0.8.0",
+      "dependencies": {
+        "@crewhaus/access-control": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/harness-supervisor": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+      },
+    },
     "packages/cost-tracker": {
       "name": "@crewhaus/cost-tracker",
       "version": "0.8.0",
@@ -1110,8 +1128,11 @@
       "name": "@crewhaus/gateway-protocol",
       "version": "0.8.0",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -1240,10 +1261,12 @@
       "name": "@crewhaus/hangar-server",
       "version": "0.8.0",
       "dependencies": {
+        "@crewhaus/access-control": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/control-service": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
@@ -1314,6 +1337,7 @@
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
+        "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
       },
     },
@@ -1328,6 +1352,8 @@
       "name": "@crewhaus/harness-supervisor",
       "version": "0.8.0",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/harness-inventory": "workspace:*",
         "@crewhaus/preflight": "workspace:*",
@@ -1447,6 +1473,7 @@
       "name": "@crewhaus/memory-store",
       "version": "0.8.0",
       "dependencies": {
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
       },
@@ -1787,6 +1814,7 @@
       "name": "@crewhaus/run-context",
       "version": "0.8.0",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
       },
@@ -1804,6 +1832,8 @@
         "@crewhaus/compaction-autocompact": "workspace:*",
         "@crewhaus/compaction-curator": "workspace:*",
         "@crewhaus/compaction-snip": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/egress-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -1845,9 +1875,11 @@
         "zod-to-json-schema": "^3.23.5",
       },
       "devDependencies": {
+        "@crewhaus/graph-engine": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-plan": "workspace:*",
+        "@crewhaus/tool-state": "workspace:*",
       },
     },
     "packages/sandbox": {
@@ -1975,9 +2007,13 @@
       "version": "0.8.0",
       "dependencies": {
         "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/spec-patch": "workspace:*",
       },
     },
     "packages/single-binary-cli": {
@@ -2121,6 +2157,8 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
       "devDependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/federation-discovery": "workspace:*",
         "@crewhaus/federation-protocol": "workspace:*",
         "@crewhaus/gateway-server": "workspace:*",
@@ -2433,6 +2471,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/harness-advice": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
@@ -4054,6 +4093,8 @@
     "@crewhaus/control-contract": ["@crewhaus/control-contract@workspace:packages/control-contract"],
 
     "@crewhaus/control-records": ["@crewhaus/control-records@workspace:packages/control-records"],
+
+    "@crewhaus/control-service": ["@crewhaus/control-service@workspace:packages/control-service"],
 
     "@crewhaus/cost-tracker": ["@crewhaus/cost-tracker@workspace:packages/cost-tracker"],
 

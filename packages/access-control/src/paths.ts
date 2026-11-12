@@ -19,6 +19,16 @@ export const LEDGER_KINDS = [
 
 export type LedgerKind = (typeof LEDGER_KINDS)[number];
 
+/**
+ * The sign-in records: browsers' device keys and their sessions. Kept out of
+ * `LEDGER_KINDS` on purpose, so the authority snapshot (`loadAccessSnapshot`) never folds
+ * them and appending one never moves the access revision: a sign-in changes nobody's
+ * authority.
+ */
+export const SIGN_IN_KINDS = ["devices", "sessions"] as const;
+
+export type SignInKind = (typeof SIGN_IN_KINDS)[number];
+
 export type AccessPaths = {
   readonly dir: string;
   readonly lock: string;
@@ -29,6 +39,10 @@ export type AccessPaths = {
   /** The bootstrap token Home mints, beside `access/`, never inside it. */
   readonly token: string;
   readonly ledgers: Readonly<Record<LedgerKind, string>>;
+  /** `devices.jsonl` and `sessions.jsonl`. */
+  readonly signIn: Readonly<Record<SignInKind, string>>;
+  /** Content-free lines about proxy identity headers Home ignored. */
+  readonly security: string;
 };
 
 /** The fixed names, relative to the Hangar root. Pure: touches no file. */
@@ -45,6 +59,11 @@ export function accessPaths(): AccessPaths {
     subjectKey: join(ACCESS_DIR, "keys", "subject.key"),
     token: "token",
     ledgers,
+    signIn: {
+      devices: join(ACCESS_DIR, "devices.jsonl"),
+      sessions: join(ACCESS_DIR, "sessions.jsonl"),
+    },
+    security: join(ACCESS_DIR, "security.jsonl"),
   };
 }
 
@@ -54,6 +73,17 @@ export function accessLedger(hangarRoot: string, kind: LedgerKind): Ledger {
   return {
     root: hangarRoot,
     records: { file: paths.ledgers[kind] },
+    lock: paths.lock,
+    claims: paths.claims,
+  };
+}
+
+/** A sign-in ledger, on the same access lock and claims directory as the others. */
+export function signInLedger(hangarRoot: string, kind: SignInKind): Ledger {
+  const paths = accessPaths();
+  return {
+    root: hangarRoot,
+    records: { file: paths.signIn[kind] },
     lock: paths.lock,
     claims: paths.claims,
   };

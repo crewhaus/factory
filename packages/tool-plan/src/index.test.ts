@@ -300,7 +300,7 @@ describe("MemoryClear", () => {
     const out = (await bundle.memoryClear.execute({ scope: "plans" })) as string;
     expect(out).toContain("cleared: plans");
     expect(out).toContain(join(tmp, ".crewhaus", "trash"));
-    expect(out).toMatch(/undo: crewhaus memory restore \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}/);
+    expect(out).toMatch(/undo: crewhaus state restore --trash \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}/);
     expect(existsSync(join(bundle.store.dir(), "plans"))).toBe(false);
   });
 

@@ -39,6 +39,7 @@ import { makeFixtureHarness } from "./fixture";
 import { M3_ROUTES } from "./m3-routes";
 import { actionCliTwins, matchActions } from "./omnibox";
 import { demoAvailability, onboardingView } from "./onboarding";
+import { ROUTE_TABLE } from "./route-table";
 import { bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
@@ -56,6 +57,9 @@ const CLI_SRC = join(import.meta.dir, "..", "..", "..", "apps", "cli", "src");
  *   · memory, wiki, knowledge, dream, migrate, watchme — the dispatch in
  *     `apps/cli/src/index.ts`, with one flag schema per noun
  *     (`arg-schemas.ts`, `DREAM_CLI_SCHEMA` in `dream-cli.ts`).
+ *   · state — `STATE_SCHEMA` in `apps/cli/src/arg-schemas.ts`, one flag list
+ *     across backup, restore, clear and trash, and the `state` dispatch in
+ *     `apps/cli/src/index.ts`.
  *   · approvals — `APPROVALS_SCHEMA` in `apps/cli/src/arg-schemas.ts`, one flag
  *     list across its verbs, and the action list in `apps/cli/src/index.ts`.
  *
@@ -64,8 +68,44 @@ const CLI_SRC = join(import.meta.dir, "..", "..", "..", "apps", "cli", "src");
  * non-zero exit with an "unknown flag" message. A noun with one schema accepts
  * the same flags on every verb.
  */
-const MEMORY_FLAGS = ["spec", "query", "yes", "compact", "help"];
-const WIKI_FLAGS = ["spec", "tags", "status", "k", "help"];
+const MEMORY_FLAGS = [
+  "spec",
+  "query",
+  "yes",
+  "compact",
+  "help",
+  "reason",
+  "text",
+  "text-file",
+  "personal",
+  "not-personal",
+];
+const WIKI_FLAGS = [
+  "spec",
+  "tags",
+  "status",
+  "k",
+  "help",
+  "body-file",
+  "expect",
+  "title",
+  "undo",
+  "to",
+];
+const STATE_FLAGS = [
+  "out",
+  "exclude",
+  "into",
+  "merge",
+  "force",
+  "help",
+  "scope",
+  "session",
+  "spec",
+  "yes",
+  "expect",
+  "trash",
+];
 const KNOWLEDGE_FLAGS = ["root", "shared", "pull", "push", "dry-run", "no-redact", "help"];
 const DREAM_FLAGS = ["force", "help"];
 const MIGRATE_MEMORIES_FLAGS = ["dry-run", "help"];
@@ -87,7 +127,7 @@ const WATCHME_FLAGS = [
   "forget",
   "help",
 ];
-const APPROVALS_FLAGS = ["dir", "by", "once", "always", "json", "help"];
+const APPROVALS_FLAGS = ["dir", "by", "once", "always", "reason", "until", "json", "help"];
 
 const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
   harness: {
@@ -117,8 +157,19 @@ const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly str
     show: MEMORY_FLAGS,
     forget: MEMORY_FLAGS,
     sweep: MEMORY_FLAGS,
+    correct: MEMORY_FLAGS,
+    mark: MEMORY_FLAGS,
   },
-  wiki: { list: WIKI_FLAGS, show: WIKI_FLAGS, search: WIKI_FLAGS, stats: WIKI_FLAGS },
+  wiki: {
+    list: WIKI_FLAGS,
+    show: WIKI_FLAGS,
+    search: WIKI_FLAGS,
+    stats: WIKI_FLAGS,
+    write: WIKI_FLAGS,
+    archive: WIKI_FLAGS,
+    rollback: WIKI_FLAGS,
+  },
+  state: { backup: STATE_FLAGS, restore: STATE_FLAGS, clear: STATE_FLAGS, trash: STATE_FLAGS },
   knowledge: { sync: KNOWLEDGE_FLAGS },
   dream: { run: DREAM_FLAGS, status: DREAM_FLAGS, init: DREAM_FLAGS },
   migrate: { memories: MIGRATE_MEMORIES_FLAGS },
@@ -136,6 +187,8 @@ const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly str
     show: APPROVALS_FLAGS,
     grant: APPROVALS_FLAGS,
     deny: APPROVALS_FLAGS,
+    supersede: APPROVALS_FLAGS,
+    defer: APPROVALS_FLAGS,
   },
 };
 
@@ -230,6 +283,8 @@ describe("the dispatch table matches the CLI", () => {
     expect(memory?.[1]?.split(", ")).toEqual([...verbsOf("memory")]);
     const wiki = index.match(/wiki: unknown action [^\n]*supported: ([a-z, ]+)`/);
     expect(wiki?.[1]?.split(", ")).toEqual([...verbsOf("wiki")]);
+    const state = index.match(/state action must be one of ([a-z, ]+) \(got/);
+    expect(state?.[1]?.split(", ")).toEqual([...verbsOf("state")]);
     expect(index).toContain('knowledge action must be "sync"');
     expect(verbsOf("knowledge")).toEqual(["sync"]);
     expect(index).toContain(
@@ -249,6 +304,7 @@ describe("the dispatch table matches the CLI", () => {
     const dream = readFileSync(join(CLI_SRC, "dream-cli.ts"), "utf8");
     expect(schemaFlags(schemas, "MEMORY_SCHEMA")).toEqual(MEMORY_FLAGS);
     expect(schemaFlags(schemas, "WIKI_SCHEMA")).toEqual(WIKI_FLAGS);
+    expect(schemaFlags(schemas, "STATE_SCHEMA")).toEqual(STATE_FLAGS);
     expect(schemaFlags(schemas, "KNOWLEDGE_SCHEMA")).toEqual(KNOWLEDGE_FLAGS);
     expect(schemaFlags(schemas, "MIGRATE_MEMORIES_SCHEMA")).toEqual(MIGRATE_MEMORIES_FLAGS);
     expect(schemaFlags(schemas, "WATCHME_SCHEMA")).toEqual(WATCHME_FLAGS);
@@ -258,7 +314,10 @@ describe("the dispatch table matches the CLI", () => {
   test("the checker rejects the memory commands that never existed", () => {
     expect(rejectionReason("crewhaus memory remember")).toContain('unknown memory verb "remember"');
     expect(rejectionReason("crewhaus remember")).toContain("no dispatch table");
-    expect(rejectionReason("crewhaus wiki write")).toContain('unknown wiki verb "write"');
+    expect(rejectionReason("crewhaus wiki delete")).toContain('unknown wiki verb "delete"');
+    // `wiki write` exists now, with its own flags.
+    expect(rejectionReason("crewhaus wiki write <slug> --body-file <file> --expect 0")).toBeNull();
+    expect(rejectionReason("crewhaus state trash")).toBeNull();
     expect(rejectionReason("crewhaus run (then /reflect)")).toContain("no dispatch table");
     expect(rejectionReason("crewhaus memory list --nope")).toContain('unknown flag "--nope"');
     // …and accepts the forms the screens show.
@@ -272,7 +331,7 @@ describe("the dispatch table matches the CLI", () => {
 
     const entry = readFileSync(join(CLI_SRC, "index.ts"), "utf8");
     const actions = entry.match(
-      /!isHelp && !\["", ([^\]]+)\]\.includes\(action\)[^\n]*\n\s*die\(`approvals/,
+      /!isHelp && !\["", ([^\]]+)\]\.includes\(action\)[^\n]*\n\s*die\(\s*`approvals/,
     );
     expect(actions?.[1]).toBeDefined();
     const verbs = [...(actions?.[1] ?? "").matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
@@ -410,9 +469,16 @@ describe("every twin this server proposes would run if pasted", () => {
           seen.push(`${route.key}: ${verb}`);
         }
       }
-      // Pinned, so this guard cannot go quiet: fifteen reads swept twice.
+      // Pinned, so this guard cannot go quiet: fifteen reads swept twice. The
+      // trash list (on both harnesses) and the empty wiki now name their verbs.
       expect(reads.length).toBe(15);
-      expect(seen.length).toBe(15);
+      expect(seen.length).toBe(18);
+      expect(seen.filter((v) => v.endsWith(": crewhaus state trash"))).toHaveLength(2);
+      expect(
+        seen.filter((v) =>
+          v.endsWith(": crewhaus wiki write <slug> --body-file <file> --expect 0"),
+        ),
+      ).toHaveLength(1);
     } finally {
       await t.stop();
     }
@@ -439,6 +505,9 @@ describe("every twin the contract declares would run if pasted", () => {
     const twins = [
       ...OPERATIONS.map((op) => [op.id, op.cliTwin] as const),
       ...Object.values(COMMAND_KINDS).map((kind) => [kind.id, kind.cliTwin] as const),
+      ...ROUTE_TABLE.flatMap((row) =>
+        row.cliTwin !== null ? [[row.key, row.cliTwin] as const] : [],
+      ),
     ];
     let checked = 0;
     for (const [id, twin] of twins) {
@@ -450,13 +519,13 @@ describe("every twin the contract declares would run if pasted", () => {
         checked++;
       }
     }
-    // Eight operation twins and five command kinds, each rendered twice.
-    expect(checked).toBeGreaterThanOrEqual(26);
+    // Eight operation twins, five command kinds and seven route rows, each rendered twice.
+    expect(checked).toBeGreaterThanOrEqual(40);
   });
 
   test("the checker refuses a verb the CLI does not have", () => {
-    expect(rejectionReason("crewhaus approvals supersede appr_x")).toContain(
-      'unknown approvals verb "supersede"',
+    expect(rejectionReason("crewhaus approvals revoke appr_x")).toContain(
+      'unknown approvals verb "revoke"',
     );
   });
 });

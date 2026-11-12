@@ -513,7 +513,16 @@ export async function spawnSubAgent(
       ...(parent.skills !== undefined && parent.skills.length > 0 ? { skills: parent.skills } : {}),
       ...(parent.failureTaxonomy !== undefined ? { failureTaxonomy: parent.failureTaxonomy } : {}),
       ...(parent.continuity !== undefined
-        ? { continuity: { loadPlan: parent.continuity.loadPlan, ledger: false } }
+        ? {
+            continuity: {
+              loadPlan: parent.continuity.loadPlan,
+              ledger: false,
+              // The store's files stay out of the child's tools too.
+              ...(parent.continuity.storeFiles !== undefined
+                ? { storeFiles: parent.continuity.storeFiles }
+                : {}),
+            },
+          }
         : {}),
       //   - approvals: Loop contract 0.4 (G11) parking. The child inherits the
       //     parent's ask_mode and the SAME store. Nothing is narrowed here,

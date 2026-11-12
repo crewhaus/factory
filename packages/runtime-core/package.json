@@ -21,6 +21,8 @@
     "@crewhaus/compaction-autocompact": "workspace:*",
     "@crewhaus/compaction-curator": "workspace:*",
     "@crewhaus/compaction-snip": "workspace:*",
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/egress-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
@@ -62,9 +64,11 @@
     "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {
+    "@crewhaus/graph-engine": "workspace:*",
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
-    "@crewhaus/tool-plan": "workspace:*"
+    "@crewhaus/tool-plan": "workspace:*",
+    "@crewhaus/tool-state": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

@@ -46,6 +46,7 @@ import { parseSpec } from "@crewhaus/spec";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { DREAM_WORKFLOW_RELPATH, buildDreamWorkflowYaml } from "./ci-scaffold";
 import { scaffoldWorkflowFile } from "./flywheel";
+import { holdCliMutatingLease } from "./mutating-lease";
 
 export class DreamCliError extends CrewhausError {
   override readonly name = "DreamCliError";
@@ -315,7 +316,8 @@ export function renderDreamRunReport(report: DreamRunReport): string[] {
 
 async function runVerb(args: ParsedArgs): Promise<void> {
   const cwd = process.cwd();
-  const { ir, fragment } = loadDreamSpec(args.positional[0]);
+  const { ir, fragment, absSpec } = loadDreamSpec(args.positional[0]);
+  await holdCliMutatingLease(dirname(absSpec), "dream run");
   const model = ir.agent?.model;
   const modelPhase =
     model !== undefined

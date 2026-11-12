@@ -117,6 +117,13 @@ export type ToolCallContext = {
    * is configured (`sandboxAvailable: true`).
    */
   readonly requiresSandbox?: boolean;
+  /**
+   * The tool checks every place it writes beneath a directory it names
+   * against the roots on its bridge (`ToolDefinition.checksOwnTargets`). Only
+   * {@link EvaluateOptions.protectedFiles} reads it: for such a call a store
+   * file is read the `inside` way alone. Absent ⇒ the `above` way too.
+   */
+  readonly checksOwnTargets?: boolean;
 };
 
 export type Decision = "allow" | "deny" | "ask";
@@ -189,6 +196,20 @@ export type EvaluateOptions = {
    * deny would have no rule to lift it. Any other such string goes to the rules.
    */
   readonly protectedRoots?: ReadonlyArray<string>;
+  /**
+   * A store's own files, kept from every tool but the store's own (the
+   * continuity store's `focus.md`, `goals.yaml`, `plans`, ... under
+   * `.crewhaus/state/<spec>/`). A call that is not read-only and names one,
+   * or a path inside one, is denied before any rule is read, as a
+   * {@link protectedRoots} root is, and so is one that acts beneath a
+   * directory holding one. The one difference: for a tool that checks its own
+   * targets against the roots on its bridge (`ToolCallContext
+   * .checksOwnTargets`), a file is read the `inside` way only, so StateImport
+   * over the whole of `.crewhaus/state` is left to the tool's own per-entry
+   * check, which refuses an entry landing on one. Only `bypass` skips it.
+   * Absent ⇒ no check.
+   */
+  readonly protectedFiles?: ReadonlyArray<string>;
   /**
    * The files a run keeps from its agent's tools. A call that names one, or a
    * file `isCredentialFileName` matches, is denied whatever a rule says,
@@ -497,6 +518,32 @@ function protectedRootHit(
 }
 
 /**
+ * The store file a call names or acts beneath (see
+ * `EvaluateOptions.protectedFiles`), or `undefined`. Read as
+ * {@link protectedRootHit} reads a root, except for a tool that checks its own
+ * targets (`ToolCallContext.checksOwnTargets`): for it, the `inside` way only,
+ * so a directory it acts beneath is never compared and StateImport keeps
+ * importing into the directory holding a store.
+ */
+function protectedFileHit(
+  call: ToolCallContext,
+  opts: EvaluateOptions,
+): { readonly root: string; readonly above?: string } | undefined {
+  if (call.readOnly || opts.protectedFiles === undefined || opts.protectedFiles.length === 0) {
+    return undefined;
+  }
+  const hit = rootHit(
+    call.floorValues ?? call.operativeValues,
+    call.input,
+    opts.protectedFiles,
+    undefined,
+    call.checksOwnTargets === true,
+  );
+  // The git-directory name check is the roots' to answer.
+  return hit === undefined || hit.root === GIT_DIRECTORY ? undefined : hit;
+}
+
+/**
  * What a call names among the files a run keeps from its tools (see
  * `EvaluateOptions.credentialRoots`), read-only or not, or `undefined`. It reads
  * all of the call's operative values, a field the call only reads from included,
@@ -555,6 +602,7 @@ function rootHit(
   input: unknown,
   roots: ReadonlyArray<string>,
   names?: (name: string) => boolean,
+  insideOnly = false,
 ): { readonly root: string; readonly above?: string } | undefined {
   const candidates: Array<{
     readonly path: string;
@@ -632,7 +680,7 @@ function rootHit(
     for (const { key, fold } of keys) {
       if (liesUnder(key, fold ? folded : plain)) return { root };
     }
-    if (!insideWorkspace(plain)) continue;
+    if (insideOnly || !insideWorkspace(plain)) continue;
     for (const { key, fold, opensHidden } of walked) {
       const rootKey = fold ? folded : plain;
       if (!rootKey.startsWith(`${key}/`)) continue;
@@ -689,6 +737,18 @@ export function evaluateWithReason(
         floorHit.above !== undefined
           ? `\`${call.toolName}\` is not read-only and acts on everything beneath \`${floorHit.above}\`, where ${RECORD} — no rule can allow that`
           : `\`${call.toolName}\` is not read-only and names a path where ${RECORD} — no rule can allow that`,
+    };
+  }
+  // A store's own files (`EvaluateOptions.protectedFiles`): only its own tools
+  // write them, so a path one names is refused whatever a rule says.
+  const fileHit = protectedFileHit(call, opts);
+  if (fileHit !== undefined) {
+    return {
+      decision: "deny",
+      reason:
+        fileHit.above !== undefined
+          ? `\`${call.toolName}\` is not read-only and acts on everything beneath \`${fileHit.above}\`, which holds a file a store keeps for itself (the continuity store's focus, goals, plans and handoff), which only that store's own tools write — no rule can allow that`
+          : `\`${call.toolName}\` is not read-only and names a file a store keeps for itself (the continuity store's focus, goals, plans and handoff), which only that store's own tools write — no rule can allow that`,
     };
   }
   // A run that answers people other than its operator keeps these files from

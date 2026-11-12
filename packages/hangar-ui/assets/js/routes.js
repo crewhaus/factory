@@ -40,6 +40,18 @@ export const ROUTES = {
   // cross-cutting
   version: { method: "GET", path: "/api/version" },
 
+  // Signing in. A browser holds a session, never Home's own key: the boot link
+  // trades a one-time code for a session sealed to this tab (`authExchange`), and
+  // a returning browser signs a challenge with its device key (`authChallenge`,
+  // then `authSession`). `bootTicket` is the one route Home's own key calls from
+  // a tab: it migrates a tab an earlier release left holding that key, once.
+  authChallenge: { method: "GET", path: "/api/v1/auth/challenge" },
+  authSession: { method: "POST", path: "/api/v1/auth/session", body: "AuthSession" }, // {device, nonce, signature, seal}
+  authExchange: { method: "POST", path: "/api/v1/auth/exchange", body: "AuthExchange" }, // {code, deviceJwk, seal}
+  authRefresh: { method: "POST", path: "/api/v1/auth/refresh", body: "AuthRefresh" }, // {seal}
+  authSignOut: { method: "POST", path: "/api/v1/auth/sign-out", body: "Empty" }, // {}
+  bootTicket: { method: "POST", path: "/api/boot-ticket", body: "Empty" }, // {} → {bootPath}
+
   // fleet feed + registry CRUD (the ONLY writes in M1 — manager state)
   harnesses: { method: "GET", path: "/api/harnesses" },
   addHarness: { method: "POST", path: "/api/harnesses", body: "AddHarness" }, // {dir}

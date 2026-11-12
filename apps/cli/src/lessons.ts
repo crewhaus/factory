@@ -24,6 +24,12 @@
 import { mergeFeedback, normalizeRating } from "./feedback";
 import type { FeedbackRecord, SessionTurn } from "./feedback";
 
+/** Where a mined lesson came from: session ids, and the feedback turns for a correction. */
+export type LessonSources = {
+  readonly sessions: readonly string[];
+  readonly turns?: ReadonlyArray<{ readonly sessionId: string; readonly turnNumber: number }>;
+};
+
 /** One durable lesson. `key` is the normalized-text dedupe handle. */
 export type Lesson = {
   /** Normalized dedupe key (lowercased, whitespace-collapsed). */
@@ -31,6 +37,12 @@ export type Lesson = {
   /** The human-readable lesson line rendered into LESSONS.md. */
   readonly text: string;
   readonly kind: "correction" | "failure-fix";
+  /**
+   * Set by {@link mineLessons}: the feedback session and turn pairs, or the
+   * failure sessions, the lesson was mined from. Never rendered into
+   * LESSONS.md; `crewhaus lessons update` records it beside the file.
+   */
+  readonly sources?: LessonSources;
 };
 
 export type LessonsOptions = {
@@ -60,7 +72,7 @@ function clip(s: string, n: number): string {
 export async function mineLessons(
   turns: ReadonlyArray<SessionTurn>,
   feedback: ReadonlyArray<FeedbackRecord>,
-  failureSignals: ReadonlyArray<{ input: string; reason: string }>,
+  failureSignals: ReadonlyArray<{ input: string; reason: string; sessionId?: string }>,
   opts: LessonsOptions = {},
 ): Promise<Lesson[]> {
   const lowScore = opts.lowScore ?? 0.5;
@@ -69,11 +81,33 @@ export async function mineLessons(
   for (const t of turns) turnByKey.set(`${t.sessionId}#${t.turnNumber}`, t);
 
   const byKey = new Map<string, Lesson>();
-  const add = (text: string, kind: Lesson["kind"]): void => {
+  const sourcesByKey = new Map<
+    string,
+    { sessions: Set<string>; turns: Map<string, { sessionId: string; turnNumber: number }> }
+  >();
+  const add = (
+    text: string,
+    kind: Lesson["kind"],
+    from: { sessionId?: string; turnNumber?: number },
+  ): void => {
     const clean = clip(text, 300);
     if (clean === "") return;
     const key = normalizeKey(clean);
     if (!byKey.has(key)) byKey.set(key, { key, text: clean, kind });
+    let sources = sourcesByKey.get(key);
+    if (sources === undefined) {
+      sources = { sessions: new Set(), turns: new Map() };
+      sourcesByKey.set(key, sources);
+    }
+    if (from.sessionId !== undefined) {
+      sources.sessions.add(from.sessionId);
+      if (from.turnNumber !== undefined) {
+        sources.turns.set(`${from.sessionId}#${from.turnNumber}`, {
+          sessionId: from.sessionId,
+          turnNumber: from.turnNumber,
+        });
+      }
+    }
   };
 
   // Correction lessons from feedback (merged so one per turn). #56 F3 — the
@@ -85,7 +119,7 @@ export async function mineLessons(
     const score = normalizeRating(fb);
     if (fb.correction !== undefined && fb.correction.trim() !== "") {
       const q = question ? `For "${await redact(clip(question, 80))}": ` : "";
-      add(`${q}prefer this answer — ${await redact(fb.correction)}`, "correction");
+      add(`${q}prefer this answer — ${await redact(fb.correction)}`, "correction", fb);
     } else if (
       fb.comment !== undefined &&
       fb.comment.trim() !== "" &&
@@ -93,7 +127,7 @@ export async function mineLessons(
       score <= lowScore
     ) {
       const q = question ? `For "${await redact(clip(question, 80))}": ` : "";
-      add(`${q}avoid — ${await redact(fb.comment)}`, "correction");
+      add(`${q}avoid — ${await redact(fb.comment)}`, "correction", fb);
     }
   }
 
@@ -104,12 +138,27 @@ export async function mineLessons(
   for (const sig of failureSignals) {
     const redactedInput = sig.input.trim() !== "" ? await redact(clip(sig.input, 80)) : "";
     const q = redactedInput !== "" ? ` on "${redactedInput}"` : "";
-    add(`Watch out${q}: ${await redact(sig.reason)}.`, "failure-fix");
+    add(
+      `Watch out${q}: ${await redact(sig.reason)}.`,
+      "failure-fix",
+      sig.sessionId !== undefined ? { sessionId: sig.sessionId } : {},
+    );
   }
 
   // Stable order: corrections first (higher-signal), then failure-fixes; each
   // group alphabetized by key so re-runs produce byte-identical output.
-  return [...byKey.values()].sort(
+  const withSources = [...byKey.values()].map((lesson): Lesson => {
+    const s = sourcesByKey.get(lesson.key);
+    if (s === undefined || s.sessions.size === 0) return lesson;
+    return {
+      ...lesson,
+      sources: {
+        sessions: [...s.sessions].sort(),
+        ...(s.turns.size > 0 ? { turns: [...s.turns.values()] } : {}),
+      },
+    };
+  });
+  return withSources.sort(
     (a, b) =>
       (a.kind === b.kind ? 0 : a.kind === "correction" ? -1 : 1) || a.key.localeCompare(b.key),
   );

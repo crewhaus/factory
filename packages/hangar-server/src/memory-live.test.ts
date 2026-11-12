@@ -98,6 +98,16 @@ function treeOf(root: string): Record<string, string> {
   return out;
 }
 
+/**
+ * The tree without the harness's command records: a refused write is still a command,
+ * and its `rejected` receipt is the one thing it leaves.
+ */
+function outsideControl(tree: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(tree).filter(([path]) => path !== "run/" && !path.startsWith("run/control/")),
+  );
+}
+
 /** A fact line in the store's own shape. */
 function fact(n: number, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -740,25 +750,27 @@ describe("the sweep preview", () => {
 });
 
 describe("archiving a long article", () => {
-  test("is refused, because the write would cut the body at the read cap", async () => {
+  test("archives it whole: status only, the body bytes and the version unchanged", async () => {
     const t = boot();
     const dir = makeFixtureHarness(join(t.harnessesRoot, "longart"), { specName: "longart" });
-    await wikiStore(dir, "longart").write({
-      slug: "tome",
-      title: "Tome",
-      body: "line of the tome\n".repeat(Math.ceil(MAX_TEXT_BYTES / 16)),
-    });
-    const path = join(dir, ".crewhaus", "wiki", "longart", "articles", "tome.md");
-    const before = readFileSync(path, "utf8");
+    // Past the 256 KiB read cap: about 300 KiB of body.
+    const body = "line of the tome\n".repeat(Math.ceil((300 * 1024) / 16));
+    expect(Buffer.byteLength(body)).toBeGreaterThan(MAX_TEXT_BYTES);
+    await wikiStore(dir, "longart").write({ slug: "tome", title: "Tome", body });
+    const before = await wikiStore(dir, "longart").get("tome");
     const id = await register(t, dir);
 
     const res = await t.api(`/api/h/${id}/memory/wiki/tome/archive`, {
       method: "POST",
       body: JSON.stringify({ archived: true, confirm: true }),
     });
-    expect(res.status).toBe(409);
-    expect(String(res.body["error"])).toContain("too long to archive");
-    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(res.status).toBe(200);
+    expect(res.body["ok"]).toBe(true);
+    expect(res.body["version"]).toBe(1);
+    const after = await wikiStore(dir, "longart").get("tome");
+    expect(after?.status).toBe("archived");
+    expect(after?.version).toBe(before?.version as number);
+    expect(after?.body).toBe(before?.body as string);
     expect(existsSync(join(dir, ".crewhaus", "wiki", "longart", "versions", "tome"))).toBe(false);
   });
 });
@@ -799,6 +811,7 @@ describe("a Thredz-backed wiki is edited in Thredz", () => {
         const res = await write(t, id, "kept");
         expect(res.status).toBe(409);
         expect(res.body["error"]).toBe(THREDZ_REFUSAL);
+        expect((res.body["receipt"] as { state: string }).state).toBe("rejected");
       }
       // Ahead of body validation: this is not a 400.
       const noBody = await t.api(`/api/h/${id}/memory/wiki/kept`, {
@@ -807,7 +820,7 @@ describe("a Thredz-backed wiki is edited in Thredz", () => {
       });
       expect(noBody.status).toBe(409);
       expect(noBody.body["error"]).toBe(THREDZ_REFUSAL);
-      expect(treeOf(crewhaus)).toEqual(before);
+      expect(outsideControl(treeOf(crewhaus))).toEqual(before);
     });
   }
 
@@ -885,8 +898,9 @@ describe("a Thredz-backed wiki is edited in Thredz", () => {
       const res = await write(t, id, "kept");
       expect(res.status).toBe(409);
       expect(res.body["error"]).toBe(UNKNOWN_REFUSAL);
+      expect((res.body["receipt"] as { state: string }).state).toBe("rejected");
     }
-    expect(treeOf(crewhaus)).toEqual(before);
+    expect(outsideControl(treeOf(crewhaus))).toEqual(before);
   });
 
   test("the answer table", () => {

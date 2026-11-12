@@ -29,13 +29,46 @@ by the other, and neither needs the other running.
 
 ## Safety model (enforced + regression-tested)
 
-- **Auth** — every `/api` route requires `Authorization: Bearer <token>`
-  (constant-time compare over sha256 digests). The token comes from
-  `opts.token` or is minted at boot to `<hangarRoot>/token` (0600;
-  hangar root defaults to `~/.crewhaus/hangar`). `/healthz` and the
-  static UI shell are the only unauthenticated surfaces. No cookies
-  anywhere, so there is no CSRF surface. `noAuth` disables the check with
-  a logged warning (trusted localhost dev only).
+- **Host allowlist** — before anything but `/healthz`, a request whose
+  `Host` is not one Home answers to gets `421` with a plain-text body, the
+  same on every path: `localhost`, `127.0.0.1`, `[::1]`, the address a
+  listener bound (for a wildcard bind, this computer's addresses at boot),
+  a trusted proxy's names, the owner's `access.allowedHosts`, the host of
+  `links.baseUrl` and `allowHosts` (`--allow-host`). A page that rebinds
+  its own name to loopback is turned away before it can spend a boot link.
+- **Sign-in** — every `/api` route passes `authenticate()` from
+  `@crewhaus/access-control` at one place (`access.ts`). A browser holds a
+  session (`cha_…`, an hour from its last use and twelve hours at most)
+  that Home issued sealed to it: a boot link (`/boot/<nonce>`, single use)
+  redirects to a one-time code (`/#x=`) the browser trades, with a
+  non-extractable key of its own, at `POST /api/v1/auth/exchange`, and a
+  returning browser signs a challenge (`GET /api/v1/auth/challenge`,
+  `POST /api/v1/auth/session`). Home's own key, minted at first boot to
+  `<hangarRoot>/token` (0600; hangar root defaults to `~/.crewhaus/hangar`),
+  is the owner only on `<hangarRoot>/home.sock` (0600) or from a direct
+  loopback peer that sent no forwarding header, and no route ever sends it.
+  `POST /api/boot-ticket` takes only Home's own key. Until route
+  authorization lands, every principal but the home owner is refused with
+  `authorization_unavailable`. `/healthz`, the static UI shell, `/boot/`,
+  `/pane/` and the sign-in routes are the only unauthenticated surfaces. No
+  cookies anywhere, so there is no CSRF surface. `noAuth` disables the
+  check with a logged warning (trusted localhost dev only).
+- **Trusted proxy** — the owner's `access.trustedProxy` in
+  `<hangarRoot>/settings.json` (`crewhaus access proxy`) lets a reverse
+  proxy name the person signing in with a header, which counts only from a
+  listed peer that also sends `CrewHaus-Proxy-Secret`, or on
+  `<hangarRoot>/proxy.sock`. Boot refuses it unless Home listens on
+  loopback only. The header from anywhere else is stripped and noted,
+  content-free, in `access/security.jsonl`. Home reads the owner's
+  `access` and `links` blocks at boot and never writes them.
+- **Page policy** — every page and asset carries `HOME_CSP` (scripts,
+  styles, fetches and frames from Home only; nothing inline), with
+  `Cross-Origin-Opener-Policy: same-origin` and `Referrer-Policy:
+  no-referrer`. A plugin pane loads from a single-use `/pane/<nonce>`
+  address served with the plugin's own policy and `sandbox allow-scripts`.
+- **Live streams end with the session** — a run stream opened with a
+  session closes with `event: auth.expired` or `event: auth.revoked`
+  before `done` when that session expires or signs out.
 - **Path safety** — `:id` params are validated against their format
   regexes (`hrn_…`, `sess_…`, `run_…`, safe-segment) before any
   filesystem work, and every harness-relative read must realpath-contain
@@ -45,11 +78,13 @@ by the other, and neither needs the other running.
 - **Reads never mutate** — session browsing is raw directory scans plus
   tolerant JSONL parsing, never `SessionStore.list()` (whose TTL eviction
   deletes expired transcripts as a side-effect). The approvals inbox folds
-  `approvals.jsonl` for the same reason: `PendingApprovalStore.list()`
-  COMPACTS the file, and a polled inbox must not rewrite an operator's
-  ledger. It reads through `@crewhaus/control-records`' tail reader, so a
-  large file shows its newest records. Regression tests browse both
-  repeatedly and assert every file survives byte-identical.
+  `approvals.jsonl` with `@crewhaus/session-store`'s own fold (the first
+  decision wins, and the decision claims beside the file outrank it), which
+  writes nothing. It reads through `@crewhaus/control-records`' tail reader,
+  so a large file shows its newest records. Regression tests browse both
+  repeatedly and assert every file survives byte-identical. Grant and deny
+  go through the store's `decide`: a request already decided from any
+  surface answers 409 naming its state.
 - **Credentials never render** — env handling reports KEY presence
   booleans only; the spec view masks credential values (spec-patch
   `isCredentialKey`/`maskCredentialTokens`); transcripts, preflight
@@ -67,6 +102,23 @@ by the other, and neither needs the other running.
 - **A request body never becomes a command line** — job argv is built from
   a closed vocabulary (`jobArgv(kind, options)`) with every interpolated
   value shape-checked; there is no free-form argv parameter.
+- **Every change is persisted before it is acknowledged** — the route table
+  (`src/route-table.ts`) is data: one row per method and path, with its
+  permission, whether it writes a command receipt and where, and its CLI
+  twin, held to the console's `routes.js` by `route-table.test.ts`. The
+  receipts middleware (`src/receipts.ts`) writes the `accepted` receipt
+  through `@crewhaus/control-service` before the handler runs, settles it
+  from the answer, and adds `receipt` to the answer. A harness's commands
+  go to its own `.crewhaus/run/control/commands/`, the same ledger
+  `crewhaus daemon` writes; registry edits and Home's settings go to
+  `<hangarRoot>/control/commands/`. A request refused before its handler
+  writes nothing. `Idempotency-Key` is honoured on every write, bound to the
+  whole request: its path, query and body. A job that queues settles its
+  receipt when it ends, never when it is queued. A mutating job takes the
+  harness's mutating lease, so a terminal `crewhaus eval` and a queued one
+  never write the tree at once; the MCP projection and the dev loop, which
+  serve until stopped, take none, as a running daemon takes none. Command
+  recovery runs at boot, after adoption and the job restore.
 - **Torn-line tolerance + caps** — every JSONL reader skips unparseable
   lines and caps both lines (`MAX_JSONL_LINES`) and bytes
   (`MAX_JSONL_BYTES`) read; truncation is reported, never hidden.
@@ -331,7 +383,7 @@ route executes nothing.
 **Read-only mode is enforced here, not in the UI.** Every non-GET `/api`
 request is refused unless it is on the short exact-match exempt list
 (`READ_ONLY_EXEMPT`), so a route added next month is covered by construction.
-It prevents accidents during a demo — the bearer token, not this toggle, is
+It prevents accidents during a demo — signing in, not this toggle, is
 the security boundary — and `readOnlyLocked` refuses even the un-toggle for
 the case where the person driving is not the person who owns the machine. A
 `--read-only` BOOT flag is a posture for one process and is deliberately not
@@ -428,7 +480,10 @@ with no bundle gets) rather than answered with a silent "none".
 import { startHangarServer } from "@crewhaus/hangar-server";
 
 const server = startHangarServer({ port: 4200 });
-console.log(`${server.url}/#t=${server.token}`); // token travels as a URL fragment
+// A single-use link that signs a browser on this computer in. It carries no
+// credential: it redirects once to a one-time code the browser trades for a
+// session of its own.
+console.log(`${server.url}${server.bootPath}`);
 await server.stop();
 ```
 
@@ -438,8 +493,8 @@ The helpers `crewhaus daemon` shares with this server now live in
 `.env` writer, the scrubbers, path containment); this package re-exports them
 for one release.
 
-Options cover the bind host/port, hangar root, registry root, explicit
-token / `noAuth`, prebuilt static `assets` (the CLI injects the embedded
+Options cover the bind host/port, hangar root, registry root, `noAuth`,
+`allowHosts`, prebuilt static `assets` (the CLI injects the embedded
 UI; absent assets get a minimal built-in index page), an injectable
 `env`/`now`/`onWarn` for tests, the reported `version`, and — for M2 — an
 injectable `processLayer` and `controlClient`.

@@ -164,11 +164,15 @@ const GATE_DIRS = [
   ".crewhaus/audit",
   ".crewhaus/graphs",
   ".crewhaus/advice",
+  // The durable-execution idempotency records.
+  ".crewhaus/idempotency",
 ];
 const GATE_FILES = [
   ".crewhaus/environments.json",
   ".crewhaus/judge-calibration.json",
   ".crewhaus/retention.json",
+  // The knowledge-sync marker.
+  ".crewhaus/knowledge.json",
 ];
 const ENV_FILES = [
   ".env",
@@ -993,6 +997,9 @@ async function turn(
     instructions: "control files floor",
     runContext,
     ...(sessionRootDir !== null ? { sessionRootDir } : {}),
+    // These checks compare the workspace before and after a call: the run's
+    // own records would land in it, so this loop writes none.
+    runLedgerDir: null,
     ...extra,
     singleTurn: true,
     seedMessages: [{ role: "user", content: "go" }],

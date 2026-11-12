@@ -826,6 +826,9 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     ...(def.requiresModelFeatures !== undefined
       ? { requiresModelFeatures: def.requiresModelFeatures }
       : {}),
+    // A tool that checks its own targets against the bridge's roots: the
+    // floor then reads a store's own files for it the `inside` way only.
+    ...(def.checksOwnTargets === true ? { checksOwnTargets: true as const } : {}),
     // Per-call concurrency classifier (Task): passed through verbatim, like
     // jsonSchema/ioCapability. Omitted on the definition ⇒ omitted here, so
     // the orchestrator falls back to the static concurrency flags.

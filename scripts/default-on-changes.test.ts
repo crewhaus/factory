@@ -24,8 +24,9 @@
  * `crewhaus serve --mcp --sse` listens on and the bearer it asks for, the check a
  * served tool call's message passes before its turn and what `--host` needs, the
  * file a managed daemon saves a generated signing secret to, and the preflight finding
- * for a harness directory that holds the home directory, with its start line. A
- * change reverted or scoped to the block stops being found, and a new root, tool,
+ * for a harness directory that holds the home directory, with its start line, the
+ * exit a refused daemon start gives now that it writes a receipt, and every CLI
+ * verb that takes a harness's mutating lease. A change reverted or scoped to the block stops being found, and a new root, tool,
  * header line, edge warning, verdict that moved, stopping shape or refused leaf
  * fails until the notes name it. Each scan also asserts it found something, so a
  * scan that silently matches nothing fails too.
@@ -44,6 +45,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -51,12 +53,25 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { runDaemonCommand } from "../apps/cli/src/daemon-cmd";
+import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
+import { createContinuityStore } from "../packages/continuity-store/src/index";
+import {
+  DECISION_LOG_KEYS,
+  EXIT_FOR_ERROR,
+  EXIT_FOR_REJECTED_RECEIPT,
+} from "../packages/control-contract/src/index";
+import { foldStates } from "../packages/control-records/src/index";
+import { commandsLedgerOf } from "../packages/control-service/src/index";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
+import { countPendingApprovals } from "../packages/gateway-protocol/src/control";
+import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import type { IrManagedV0 } from "../packages/ir/src/index";
+import { _setCompactSeamsForTest, createMemoryStore } from "../packages/memory-store/src/index";
 import {
   type RuleSet,
   type ToolCallContext,
@@ -65,7 +80,17 @@ import {
 } from "../packages/permission-engine/src/index";
 import { runPreflight } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
-import { credentialFileRoots, runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
+import {
+  credentialFileRoots,
+  runtimeStateRoots,
+  storeFileRoots,
+} from "../packages/runtime-core/src/state-roots";
+import {
+  allowSingleOwner,
+  createPendingApprovalStore,
+  foldReadOnly,
+  generateApprovalId,
+} from "../packages/session-store/src/index";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
 import {
   OPTIMIZER_REFUSED_LEAVES,
@@ -76,6 +101,7 @@ import {
 import { parseSpec } from "../packages/spec/src/index";
 import { emitManaged } from "../packages/target-managed/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
+import { foldApprovals as toolFoldApprovals } from "../packages/tool-approvals/src/lib/approvals";
 import {
   SHAPE_TOOL_PROFILES,
   type ToolShape,
@@ -85,6 +111,7 @@ import { planPin } from "../packages/tool-evalops/src/lib/pin";
 import { harnessRegister } from "../packages/tool-fleet/src/index";
 import { TOOL_REGISTRY } from "../packages/tool-registry-manifest/src/generated";
 import { factCrossCheck } from "../packages/tool-verify/src/index";
+import { createWikiTools } from "../packages/tool-wiki/src/index";
 
 const ROOT = dirname(import.meta.dir);
 /** 0.8.0's list, as released. It does not change. */
@@ -1734,5 +1761,426 @@ describe("the release notes name run input screened where it enters", () => {
     };
     expect(probe.control).toBe(true);
     if (probe.changed) expect(runInput).toContain("`tool`");
+  });
+});
+
+/**
+ * Run identity and run records. A run's id has one form, and every run
+ * records its start, its park and its end. Both reach every harness without a
+ * spec opting in, so the list names both, and each check runs the change
+ * itself and requires its bullet unconditionally: reverting either fails.
+ */
+describe("the release notes name run ids and run records", () => {
+  const later = defaultOnBullets(changelog, LATER_HEADINGS);
+
+  test("a run's id is canonical, and the list says what it looks like", async () => {
+    const { CANONICAL_RUN_ID_RE } = await import("../packages/control-contract/src/index");
+    expect(createRunContext().runId).toMatch(CANONICAL_RUN_ID_RE);
+    const bullet = later.find((b) => b.includes("`run_`") && b.includes("26")) ?? "";
+    expect(bullet).toContain("26");
+    expect(bullet).toContain("`run_`");
+  });
+
+  test("a run writes its rows, where the list says, and the list names the switch", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { RUN_LEDGER_DIR, runLedgerAt } = await import("../packages/runtime-core/src/run-ledger");
+    const { RUN_LEDGER_DIR: SUPERVISOR_DIR } = await import(
+      "../packages/harness-supervisor/src/run-rows"
+    );
+    const { RUNS_LEDGER_DIR: RESUME_DIR } = await import("../apps/cli/src/runs");
+    const { readPage } = await import("../packages/control-records/src/index");
+    const harness = mkdtempSync(join(tmpdir(), "default-on-run-rows-"));
+    try {
+      const saved = process.env["CREWHAUS_RUN_LEDGER"];
+      Reflect.deleteProperty(process.env, "CREWHAUS_RUN_LEDGER");
+      try {
+        await runChatLoop({
+          model: "test-model",
+          instructions: "x",
+          singleTurn: true,
+          seedMessages: [{ role: "user", content: "hi" }],
+          permissionMode: "bypass",
+          installSigintHandler: false,
+          spinner: false,
+          stdout: () => {},
+          settingsDir: null,
+          sessionRootDir: join(harness, "sessions"),
+          runLedgerDir: harness,
+          _adapter: {
+            providerId: "anthropic",
+            features: {
+              caching: "explicit",
+              tool_use: true,
+              vision: true,
+              thinking: true,
+              web_search: false,
+            },
+            estimateTokens: () => 1,
+            async *stream() {
+              yield { kind: "message_start", usage: { input: 1, output: 0 } };
+              yield {
+                kind: "message_delta",
+                stopReason: "end_turn",
+                usage: { input: 0, output: 1 },
+              };
+              yield { kind: "message_stop" };
+            },
+          },
+        });
+      } finally {
+        if (saved !== undefined) process.env["CREWHAUS_RUN_LEDGER"] = saved;
+      }
+      const rows = readPage(runLedgerAt(harness), { limit: 10 }).items.map((i) => i.record);
+      expect(rows.length).toBeGreaterThanOrEqual(2);
+      // One place: the runtime writes, the supervisor closes and `runs resume` reads the same directory.
+      const listed = `${RUN_LEDGER_DIR.split(sep).join("/")}/`;
+      expect(listed).toBe(".crewhaus/run/control/runs/");
+      expect(SUPERVISOR_DIR).toBe(RUN_LEDGER_DIR);
+      expect(RESUME_DIR).toBe(RUN_LEDGER_DIR);
+      const bullet = later.find((b) => b.includes(`\`${listed}\``)) ?? "";
+      expect(bullet).toContain(`\`${listed}\``);
+      expect(bullet).toContain("`CREWHAUS_RUN_LEDGER=0`");
+    } finally {
+      rmSync(harness, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Receipts and the mutating lease. Every daemon verb and every Home change now
+ * writes a receipt first, a refused daemon start exits with the rejected-receipt
+ * code where it exited 1, and the CLI's long verbs take the harness's mutating
+ * lease. Each is found where it happens: a start refused against a running
+ * daemon, and every lease call site in the CLI with the verb it names. A verb
+ * that starts taking the lease fails until the list names it.
+ */
+describe("the release notes name the receipts and the lease every harness meets", () => {
+  const bullet = (): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+      b.includes("`.crewhaus/run/control/`"),
+    ) ?? "";
+
+  test("a refused daemon start writes a receipt and exits with the rejected-receipt code", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "default-on-receipts-")));
+    try {
+      const dir = join(root, "harness");
+      mkdirSync(join(dir, "dist"), { recursive: true });
+      writeFileSync(join(dir, "dist", "daemon.ts"), "// compiled bundle\n");
+      writeFileSync(
+        join(dir, "crewhaus.yaml"),
+        [
+          "name: receipts-fixture",
+          "target: channel",
+          "agent:",
+          "  model: anthropic/claude-sonnet-4",
+          "  instructions: |",
+          "    A fixture.",
+          "routing:",
+          "  sessionKey: channel",
+          "",
+        ].join("\n"),
+      );
+      const opts = {
+        env: { CREWHAUS_REGISTRY_ROOT: join(root, "registry"), CREWHAUS_NO_REGISTRY: "1" },
+        ops: createTestProcessOps(() => Date.now()),
+        cwd: dir,
+      };
+      // The control: a first start runs.
+      const first = await runDaemonCommand(["start", "--no-preflight"], opts);
+      expect(first.exitCode).toBe(0);
+      const again = await runDaemonCommand(["start", "--no-preflight"], opts);
+      expect(again.lines[0]).toContain("already running");
+      expect(again.exitCode).toBe(EXIT_FOR_REJECTED_RECEIPT);
+      expect(again.exitCode).not.toBe(1);
+      const fold = foldStates(commandsLedgerOf(dir));
+      expect(fold.ok && [...fold.objects.values()].map((o) => o.state)).toEqual([
+        "succeeded",
+        "rejected",
+      ]);
+      await runDaemonCommand(["stop"], opts);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const named = bullet();
+    for (const word of [
+      "`stop`",
+      "`restart`",
+      "`drain`",
+      `exit ${EXIT_FOR_REJECTED_RECEIPT}, where they exited 1`,
+      `exits ${EXIT_FOR_ERROR.unavailable}`,
+      "400",
+    ]) {
+      expect(named).toContain(word);
+    }
+  }, 20_000); // a daemon start and stop through the real supervisor
+
+  test("every CLI verb that takes the mutating lease is named, with the exit it refuses with", () => {
+    const cliSrc = join(ROOT, "apps", "cli", "src");
+    const verbs = new Set<string>();
+    let files = 0;
+    for (const name of readdirSync(cliSrc)) {
+      if (!name.endsWith(".ts") || name.endsWith(".test.ts") || name === "mutating-lease.ts") {
+        continue;
+      }
+      files += 1;
+      const source = readFileSync(join(cliSrc, name), "utf8");
+      for (const m of source.matchAll(/(?:hold|with)CliMutatingLease\([^;]*?,\s*"([^"]+)"/g)) {
+        verbs.add(m[1] as string);
+      }
+    }
+    expect(files).toBeGreaterThan(10);
+    expect(verbs.size).toBeGreaterThanOrEqual(5);
+    const named = bullet();
+    expect([...verbs].filter((verb) => !named.includes(`\`${verb}\``))).toEqual([]);
+    expect(named).toContain(`exit ${LEASE_BUSY_EXIT}`);
+  });
+});
+
+/**
+ * Approval decisions: the first one wins on every surface, it is recorded once
+ * in a content-free log, and a read never rewrites the approvals file. Each probe
+ * drives the store on a temp session root: a second decision that is no longer
+ * refused, a log line with a key outside the closed set, a read that rewrites the
+ * file, or two readers that fold a flipped file differently fails here, and the
+ * list must name each change.
+ */
+describe("approval decisions", () => {
+  const park = () => ({
+    id: generateApprovalId(),
+    toolName: "Bash",
+    inputHash: "a".repeat(64),
+    input: { command: "ls" },
+    runId: "run_00000001",
+    sessionId: "sess_00000000000000aa",
+    surface: "daemon",
+    createdAt: new Date().toISOString(),
+  });
+  const sessionRoot = (): string => mkdtempSync(join(tmpdir(), "crewhaus-default-on-approvals-"));
+
+  test("the first decision wins, and the list says how to change one", async () => {
+    const root = sessionRoot();
+    try {
+      const store = createPendingApprovalStore({ rootDir: root });
+      const p = park();
+      await store.persist(p);
+      const allow = { authorize: allowSingleOwner };
+      expect((await store.decide(p.id, { choice: "deny", actor: {} }, allow)).outcome).toBe(
+        "decided",
+      );
+      const second = await store.decide(p.id, { choice: "grant", actor: {} }, allow);
+      expect(second.outcome).toBe("already-decided");
+      expect(await store.resolve(p.id, "grant", "someone")).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("`crewhaus approvals supersede`"),
+      ) ?? "";
+    expect(bullet).toContain("first decision");
+  });
+
+  test("decisions are logged without content, and reads never rewrite the approvals file", async () => {
+    const root = sessionRoot();
+    try {
+      const store = createPendingApprovalStore({ rootDir: root });
+      const p = park();
+      await store.persist(p);
+      await store.decide(p.id, { choice: "grant", actor: {} }, { authorize: allowSingleOwner });
+      // (a) every log line's keys are the closed set.
+      const logDir = join(root, "approvals.d", "decisions");
+      const lines = readdirSync(logDir)
+        .flatMap((name) => readFileSync(join(logDir, name), "utf8").split("\n"))
+        .filter((line) => line.trim() !== "")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines.map((l) => l["event"])).toEqual(["park", "decide"]);
+      const allowed: readonly string[] = DECISION_LOG_KEYS;
+      expect(lines.flatMap((l) => Object.keys(l)).filter((k) => !allowed.includes(k))).toEqual([]);
+      // (b) the readers leave the file as it was.
+      const file = join(root, "approvals.jsonl");
+      const before = readFileSync(file);
+      await store.list();
+      foldReadOnly(root);
+      countPendingApprovals(file);
+      expect(readFileSync(file).equals(before)).toBe(true);
+      // (c) a planted 0.8.x flip: every reader keeps the first decision.
+      const flipped = park();
+      const grant = { ...flipped, decision: "grant", decidedAt: flipped.createdAt };
+      writeFileSync(
+        file,
+        `${[flipped, grant, flipped].map((l) => JSON.stringify(l)).join("\n")}\n`,
+      );
+      expect(foldReadOnly(root).records.map((r) => r.decision)).toEqual(["grant"]);
+      expect(countPendingApprovals(file)).toBe(0);
+      expect(toolFoldApprovals(file).records.map((r) => r.decision)).toEqual(["grant"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    // (d) the list names the directory.
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes("`approvals.d/`")) ?? "";
+    expect(bullet).toContain("reads never rewrite");
+    expect(bullet).toContain("decision log");
+  });
+});
+
+/**
+ * The knowledge stores' default-on changes. Each is found in the code that
+ * makes it: the continuity store's own files are whatever its `storeFiles()`
+ * names, compaction is driven against a temp store, and the wiki guard is the
+ * real `createWikiTools`.
+ */
+describe("the release notes name what the knowledge stores do by default", () => {
+  test("the floor: the continuity store's files are named, Write is denied there, StateImport's default is not", () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-continuity-")));
+    try {
+      const files = createContinuityStore({
+        specName: "s",
+        rootDir: join(cwd, ".crewhaus", "state"),
+      }).storeFiles();
+      // The names a person edits by hand; the lock, the Thredz goal map and the
+      // session directory ride along without a name of their own.
+      const named = files
+        .map((f) => basename(f))
+        .filter((n) => !n.startsWith(".") && n !== "sessions" && n !== "thredz-goals.json");
+      expect(named).toEqual(["focus.md", "goals.yaml", "plans", "handoff.md"]);
+      const floor = bullets.find((b) => b.includes("`.crewhaus/knowledge.json`")) ?? "";
+      expect(floor).toContain("`.crewhaus/state/<spec>/`");
+      for (const name of named) {
+        expect({ name, named: floor.includes(`\`${name}\``) }).toEqual({ name, named: true });
+      }
+      expect(floor).toContain("`StateImport`");
+      expect(floor).toContain("`Bash`");
+      expect(floor).toContain("`RunCommand`");
+
+      const protectedFiles = storeFileRoots(files, cwd);
+      const rules: RuleSet = {
+        ...emptyRuleSet,
+        flag: [{ type: "alwaysAllow", pattern: "*", source: "flag" }],
+      };
+      const write: ToolCallContext = {
+        toolName: "Write",
+        input: { path: ".crewhaus/state/s/focus.md", content: "x" },
+        operativeValues: [
+          {
+            kind: "path",
+            canonical: [".crewhaus/state/s/focus.md", join(cwd, ".crewhaus/state/s/focus.md")],
+          },
+        ],
+        readOnly: false,
+        destructive: true,
+      };
+      const stateImport: ToolCallContext = {
+        toolName: "StateImport",
+        input: { stateDir: ".crewhaus/state", mode: "merge" },
+        operativeValues: [
+          {
+            kind: "path",
+            canonical: [".crewhaus/state", join(cwd, ".crewhaus/state")],
+            beneath: [".crewhaus/state/", "./.crewhaus/state/", `${join(cwd, ".crewhaus/state")}/`],
+          },
+        ],
+        readOnly: false,
+        destructive: true,
+        checksOwnTargets: true,
+      };
+      // A tool that acts beneath the store's directory and does not check its
+      // own targets (GitWorktreeAdd's `path`) is denied.
+      const worktreeAdd: ToolCallContext = {
+        toolName: "GitWorktreeAdd",
+        input: { path: ".crewhaus/state/s" },
+        operativeValues: [
+          {
+            kind: "path",
+            canonical: [".crewhaus/state/s", join(cwd, ".crewhaus/state/s")],
+            beneath: [".crewhaus/state/s/", `${join(cwd, ".crewhaus/state/s")}/`],
+          },
+        ],
+        readOnly: false,
+        destructive: true,
+      };
+      expect(evaluateWithReason(write, "auto", rules, { protectedFiles }).decision).toBe("deny");
+      expect(evaluateWithReason(worktreeAdd, "auto", rules, { protectedFiles }).decision).toBe(
+        "deny",
+      );
+      expect(evaluateWithReason(stateImport, "auto", rules, { protectedFiles }).decision).toBe(
+        "allow",
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("fact compaction archives what it drops, keeps the live set, and keeps a fact remembered meanwhile", async () => {
+    const rootDir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-compact-")));
+    try {
+      const store = createMemoryStore({ specName: "s", rootDir });
+      const keep = await store.remember("kept");
+      const gone = await store.remember("gone");
+      await store.forget(gone.id, { reason: "stale" });
+      const before = readFileSync(store.path(), "utf8")
+        .split("\n")
+        .filter((l) => l !== "");
+      const dropped = before.filter((l) => !l.includes(keep.id));
+      let late = "";
+      _setCompactSeamsForTest({
+        afterSnapshot: async () => {
+          late = (await store.remember("remembered meanwhile")).id;
+        },
+      });
+      try {
+        await store.compact();
+      } finally {
+        _setCompactSeamsForTest(undefined);
+      }
+      const history = (await store.history()).map((h) => JSON.stringify(h.line));
+      for (const line of dropped) {
+        const canonical = JSON.stringify(JSON.parse(line));
+        expect(history.filter((h) => h === canonical)).toHaveLength(1);
+      }
+      const live = (await store.list()).filter((i) => i.status === "live").map((i) => i.entry.id);
+      const file = readFileSync(store.path(), "utf8")
+        .split("\n")
+        .filter((l) => l !== "")
+        .map((l) => (JSON.parse(l) as { id: string }).id);
+      expect(file).toEqual(live);
+      expect(live).toEqual([keep.id, late]);
+      const bullet =
+        defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+          b.includes("`.crewhaus/memories/archive/"),
+        ) ?? "";
+      expect(bullet).toContain("`.crewhaus/memories/.<spec>.lock`");
+      expect(bullet).toContain("Upgrade every CrewHaus install");
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("wiki_write refuses an unread person-written version, and lands after wiki_get", async () => {
+    const rootDir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-wiki-")));
+    try {
+      const bundle = createWikiTools({ specName: "s", rootDir });
+      await bundle.store.write({
+        slug: "faq",
+        title: "FAQ",
+        body: "a person's text",
+        author: { kind: "operator", via: "cli" },
+      });
+      const rc = createRunContext();
+      const edit = { slug: "faq", title: "FAQ", body: "an agent's text" };
+      const refused = String(await bundle.write.execute(edit, { runContext: rc }));
+      expect(refused).toContain("was corrected by a person");
+      expect((await bundle.store.get("faq"))?.body).toBe("a person's text");
+      await bundle.get.execute({ slug: "faq" }, { runContext: rc });
+      expect(String(await bundle.write.execute(edit, { runContext: rc }))).toContain("at v2");
+      const bullet =
+        defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+          b.includes("keeps a person's edit"),
+        ) ?? "";
+      expect(bullet).toContain("`wiki_write`");
+      expect(bullet).toContain("`wiki_get`");
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
   });
 });

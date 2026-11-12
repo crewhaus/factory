@@ -227,6 +227,17 @@ export type WikiCreatedBy = {
   readonly agentIdentity?: string;
 };
 
+/**
+ * A person wrote this VERSION of the article, through the CLI or Hangar. An
+ * agent's version carries none. `@crewhaus/tool-wiki` refuses an agent's
+ * overwrite of a person's version the agent never read.
+ */
+export type WikiAuthor = {
+  readonly kind: "operator";
+  readonly via?: "cli" | "hangar";
+  readonly cmd?: string;
+};
+
 /** The YAML frontmatter of an article file (design §3.1). */
 export type WikiFrontmatter = {
   readonly slug: string;
@@ -243,6 +254,8 @@ export type WikiFrontmatter = {
   /** The version number this one superseded (absent on version 1). */
   readonly supersedes?: number;
   readonly createdBy?: WikiCreatedBy;
+  /** Set when a person wrote this version; never inherited by the next one. */
+  readonly author?: WikiAuthor;
   readonly status: WikiArticleStatus;
   /** ISO-8601, or {@link UNKNOWN_TIMESTAMP} when the file holds none. */
   readonly createdAt: string;
@@ -294,6 +307,21 @@ export type WikiWrite = {
    */
   readonly expectedVersion?: number;
   readonly createdBy?: WikiCreatedBy;
+  /**
+   * A person wrote this version. Never inherited: a version written without
+   * it carries none. With it, a prior `createdBy` is not carried forward.
+   */
+  readonly author?: WikiAuthor;
+};
+
+export type WikiStatusOptions = {
+  /** Refuse with `WikiVersionConflictError` unless the article is at this version. */
+  readonly expectedVersion?: number;
+};
+
+export type WikiSignalsOptions = {
+  /** Refuse with `WikiVersionConflictError` unless the article is at this version. */
+  readonly expectedVersion?: number;
 };
 
 export type WikiListOptions = {
@@ -367,8 +395,20 @@ export interface WikiStore {
   list(opts?: WikiListOptions): Promise<readonly WikiRef[]>;
   /** Tag overlap + link adjacency (+ embedding similarity when available). */
   related(slug: string): Promise<readonly WikiRelatedRef[]>;
-  /** Metadata-only quality signals — no version bump, no snapshot. */
-  setSignals(slug: string, signals: WikiSignals): Promise<void>;
+  /** Metadata-only quality signals — no version bump, no snapshot. Guarded
+   *  when `opts.expectedVersion` is passed. */
+  setSignals(slug: string, signals: WikiSignals, opts?: WikiSignalsOptions): Promise<void>;
+  /**
+   * Metadata-only status change (archive, publish): no version bump, no
+   * snapshot, `verified` kept, the body untouched. A version mismatch raises
+   * `WikiVersionConflictError`; a missing slug `WikiStoreError`.
+   */
+  setStatus(slug: string, status: WikiArticleStatus, opts?: WikiStatusOptions): Promise<void>;
+  /**
+   * A superseded version from `versions/<slug>/<n>.md`, or `null` when there
+   * is none. The current version is never there: read it with `get`.
+   */
+  getVersion(slug: string, version: number): Promise<WikiArticle | null>;
   stats(): Promise<WikiStats>;
   /**
    * Cosine-similarity-only ranking (a `minScore` floor, default 0.05) —
@@ -450,6 +490,15 @@ export function serializeArticle(article: WikiArticle): string {
           },
         }
       : {}),
+    ...(frontmatter.author !== undefined
+      ? {
+          author: {
+            kind: frontmatter.author.kind,
+            ...(frontmatter.author.via !== undefined ? { via: frontmatter.author.via } : {}),
+            ...(frontmatter.author.cmd !== undefined ? { cmd: frontmatter.author.cmd } : {}),
+          },
+        }
+      : {}),
     status: frontmatter.status,
     createdAt: frontmatter.createdAt,
     updatedAt: frontmatter.updatedAt,
@@ -508,6 +557,7 @@ export function parseArticle(raw: string): WikiArticle {
       };
     }
   }
+  const author = parseAuthor(v["author"]);
   return {
     slug: v["slug"],
     title: v["title"],
@@ -518,10 +568,25 @@ export function parseArticle(raw: string): WikiArticle {
     sources: strArr(v["sources"]),
     ...(typeof v["supersedes"] === "number" ? { supersedes: v["supersedes"] } : {}),
     ...(createdBy !== undefined ? { createdBy } : {}),
+    ...(author !== undefined ? { author } : {}),
     status,
     createdAt: isoTimestampOr(v["createdAt"]),
     updatedAt: isoTimestampOr(v["updatedAt"]),
     body,
+  };
+}
+
+/** A frontmatter `author`, or `undefined` when it is absent, unknown or ill-typed. */
+function parseAuthor(raw: unknown): WikiAuthor | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const a = raw as Record<string, unknown>;
+  if (a["kind"] !== "operator") return undefined;
+  if (a["via"] !== undefined && a["via"] !== "cli" && a["via"] !== "hangar") return undefined;
+  if (a["cmd"] !== undefined && typeof a["cmd"] !== "string") return undefined;
+  return {
+    kind: "operator",
+    ...(a["via"] === "cli" || a["via"] === "hangar" ? { via: a["via"] } : {}),
+    ...(typeof a["cmd"] === "string" ? { cmd: a["cmd"] } : {}),
   };
 }
 
@@ -1071,6 +1136,7 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
             version: 1,
             sources: [...(input.sources ?? [])],
             ...(input.createdBy !== undefined ? { createdBy: input.createdBy } : {}),
+            ...(input.author !== undefined ? { author: input.author } : {}),
             status: input.status ?? "published",
             createdAt: at,
             updatedAt: at,
@@ -1096,11 +1162,14 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
             version: existing.version + 1,
             sources: input.sources !== undefined ? [...input.sources] : existing.sources,
             supersedes: existing.version,
+            // A person's version is never labelled with an agent's session,
+            // and an author is never inherited by the next version.
             ...(input.createdBy !== undefined
               ? { createdBy: input.createdBy }
-              : existing.createdBy !== undefined
+              : existing.createdBy !== undefined && input.author === undefined
                 ? { createdBy: existing.createdBy }
                 : {}),
+            ...(input.author !== undefined ? { author: input.author } : {}),
             status: input.status ?? existing.status,
             createdAt: existing.createdAt,
             updatedAt: at,
@@ -1187,7 +1256,11 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
       return out;
     },
 
-    async setSignals(slug: string, signals: WikiSignals): Promise<void> {
+    async setSignals(
+      slug: string,
+      signals: WikiSignals,
+      signalOpts: WikiSignalsOptions = {},
+    ): Promise<void> {
       validateSlug(slug);
       if (signals.verified === undefined && signals.confidence === undefined) {
         throw new WikiStoreError("setSignals(): pass at least one of verified / confidence");
@@ -1203,6 +1276,12 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
         if (existing === null) {
           throw new WikiStoreError(`setSignals(): no article "${slug}"`);
         }
+        if (
+          signalOpts.expectedVersion !== undefined &&
+          signalOpts.expectedVersion !== existing.version
+        ) {
+          throw new WikiVersionConflictError(slug, signalOpts.expectedVersion, existing.version);
+        }
         // Metadata-only: no version bump, no snapshot (the body is untouched).
         const next: WikiArticle = {
           ...existing,
@@ -1213,6 +1292,48 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
         await atomicWrite(articlePath(slug), serializeArticle(next));
         await persistIndex(await rebuildIndex());
       });
+    },
+
+    async setStatus(
+      slug: string,
+      status: WikiArticleStatus,
+      statusOpts: WikiStatusOptions = {},
+    ): Promise<void> {
+      validateSlug(slug);
+      if (!ARTICLE_STATUSES.includes(status)) {
+        throw new WikiStoreError(
+          `setStatus(): status must be one of ${ARTICLE_STATUSES.join(", ")}`,
+        );
+      }
+      return locked(async () => {
+        const existing = await readArticle(slug);
+        if (existing === null) {
+          throw new WikiStoreError(`setStatus(): no article "${slug}"`);
+        }
+        if (
+          statusOpts.expectedVersion !== undefined &&
+          statusOpts.expectedVersion !== existing.version
+        ) {
+          throw new WikiVersionConflictError(slug, statusOpts.expectedVersion, existing.version);
+        }
+        // Metadata-only, like setSignals: same version, no snapshot, the body
+        // and `verified` kept.
+        const next: WikiArticle = { ...existing, status, updatedAt: now().toISOString() };
+        await atomicWrite(articlePath(slug), serializeArticle(next));
+        await persistIndex(await rebuildIndex());
+      });
+    },
+
+    async getVersion(slug: string, version: number): Promise<WikiArticle | null> {
+      validateSlug(slug);
+      if (!Number.isInteger(version) || version < 1) {
+        throw new WikiStoreError("getVersion(): version must be a whole number of at least 1");
+      }
+      const raw = await readStoreFile(
+        fence(join(versionsDir, slug, `${version}.md`)),
+        ARTICLE_MAX_BYTES,
+      );
+      return raw === null ? null : parseArticle(raw);
     },
 
     async stats(): Promise<WikiStats> {

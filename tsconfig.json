@@ -303,6 +303,7 @@
     { "path": "./packages/access-control" },
     { "path": "./packages/control-contract" },
     { "path": "./packages/control-records" },
+    { "path": "./packages/control-service" },
     { "path": "./apps/cli" }
   ]
 }

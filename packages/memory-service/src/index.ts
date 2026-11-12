@@ -129,7 +129,12 @@ import type { Tenant } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { createMemoryTools } from "@crewhaus/tool-memory";
 import { type ContinuityEvent, createPlanTools } from "@crewhaus/tool-plan";
-import { type KnowledgeGap, type WikiEvent, createWikiTools } from "@crewhaus/tool-wiki";
+import {
+  type KnowledgeGap,
+  type WikiEvent,
+  createWikiReadLedger,
+  createWikiTools,
+} from "@crewhaus/tool-wiki";
 import { type WikiStore, createWikiStore } from "@crewhaus/wiki-store";
 import {
   type ExamRunner,
@@ -616,6 +621,12 @@ export type ContinuitySeam = {
   /** 0.6.0 §7.4 — a guide-produced plan (`strategy.guide`, `every:
    *  first_turn`) written into the plan store; see {@link guidePlanToStore}. */
   readonly savePlan?: (planText: string) => Promise<void>;
+  /**
+   * The continuity store's own files (`ContinuityStore.storeFiles()`): the
+   * runtime keeps every tool but the store's own from writing them. Absent
+   * under a tenant, whose root already holds the store.
+   */
+  readonly storeFiles?: readonly string[];
 };
 
 /**
@@ -984,6 +995,9 @@ export function wireContinuity(
     loadPlan: () => renderPlanTail(store, plan, cont.proof),
     onPlanDirty: () => renderPlanTail(store, plan, cont.proof),
     ledger: cont.ledger !== false,
+    // The store's files under `.crewhaus/state/<spec>/`, kept from every tool
+    // but the plan tools. Under a tenant the tenants root holds them already.
+    ...(deps.tenant === undefined ? { storeFiles: store.storeFiles() } : {}),
     // 0.6.0 §7.4 — plan-execute: a first-turn guide's plan lands in the store
     // (only when plans are on; `plan: false` keeps the store plan-free).
     ...(plan
@@ -1138,6 +1152,10 @@ export function wireWiki(
   const bundle = createWikiTools({
     specName: fragment.specName,
     store,
+    // One bounded read ledger per wired wiki, so a channel daemon's
+    // conversations share it. Auto-recall below notes no reads: its seam
+    // carries no session, and an excerpt is not the body.
+    readLedger: createWikiReadLedger(),
     ...(embedder !== undefined ? { embedder } : {}),
     ...(wiki.requireSources === true ? { requireSources: true } : {}),
     ...(extras.logGap !== undefined ? { logGap: extras.logGap } : {}),

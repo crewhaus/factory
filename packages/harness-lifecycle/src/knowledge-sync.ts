@@ -46,10 +46,28 @@
  * OPT-IN — a harness participates only when it carries a
  * `.crewhaus/knowledge.json` marker (`{ "share": true }`). A harness that
  * hasn't opted in is skipped by a fleet-wide sync.
+ *
+ * INTEGRITY — a push reads each spec's facts through `@crewhaus/memory-store`
+ * ({@link readHarnessFacts}): only live facts that are not marked personal
+ * leave the harness, each shared line names the fact it came from
+ * (`origin`), and a fact this harness shared that is later corrected or
+ * expires appends a retraction (`retractions.jsonl`). A pull lands in the
+ * harness's own spec store (`.crewhaus/memories/<spec>.jsonl`, the spec named
+ * by its `crewhaus.yaml`), under that store's lock, with a deterministic id
+ * (`mem_<first 16 hex of the content hash>`), so a pull is idempotent and the
+ * facts are recalled like the harness's own. A retraction tombstones the
+ * pulled copy from the harness that retracted it, and only that copy.
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  type MemoryEntry,
+  createMemoryStore,
+  isMemoryEntry,
+  isMemorySpecName,
+  isMemoryTombstone,
+} from "@crewhaus/memory-store";
 import { type SecretMatch, hasHighEntropyToken, jwtMatches, pemBlockMatches } from "./secret-scan";
 
 /** Thrown for operational failures. The CLI routes the message through
@@ -92,12 +110,38 @@ export type Provenance = {
   readonly pushedAt: string;
 };
 
+/** Which harness fact a shared memory came from, so a later correction can retract it. */
+export type SharedOrigin = {
+  readonly harness: string;
+  /** The fact's id in that harness's spec store. */
+  readonly fact?: string;
+};
+
 export type SharedMemory = {
   readonly contentHash: string;
   readonly text: string;
   readonly tags: ReadonlyArray<string>;
   readonly provenance: Provenance;
+  readonly origin?: SharedOrigin;
 };
+
+/** A harness withdrawing a memory it shared: its fact was corrected or expired. */
+export type Retraction = {
+  readonly contentHash: string;
+  readonly harness: string;
+  readonly at: string;
+  readonly reason: "superseded" | "expired";
+};
+
+/** A fact in a harness that is not live: the push retracts its shared copy. */
+export type DeadFact = {
+  readonly spec: string;
+  readonly id: string;
+  readonly status: "superseded" | "expired";
+};
+
+/** Where retractions live in the shared store. */
+export const SHARED_RETRACTIONS_FILE = "retractions.jsonl";
 
 export type SharedFragment = {
   readonly contentHash: string;
@@ -302,26 +346,144 @@ export function harnessOptedIn(harnessDir: string): boolean {
 
 type RawMemory = { text: string; tags: ReadonlyArray<string> };
 
-/** Read every memory-store entry across a harness's `.crewhaus/memories/*.jsonl`. */
+/** A fact a push reads: a live fact of one spec store (with its `spec` and `id`), or a
+ *  line of the legacy `shared.jsonl` (with neither). */
+export type HarnessFact = RawMemory & { readonly spec?: string; readonly id?: string };
+
+/** The legacy landing file of a 0.8.x pull, read raw as before. */
+const LEGACY_SHARED_FILE = "shared.jsonl";
+
+/**
+ * What a push reads: every spec store under `.crewhaus/memories/` folded
+ * through `@crewhaus/memory-store`, so only LIVE facts are read (a corrected,
+ * forgotten or expired fact is not) and a fact marked personal is not read
+ * either. Each fact carries its `spec` and `id`. The legacy `shared.jsonl` is
+ * read raw, as before. `dead` lists the facts that are not live, for
+ * the push's retractions, including the ones a compaction moved to the
+ * store's archive.
+ */
+export async function readHarnessFactStates(
+  harnessDir: string,
+): Promise<{ readonly live: HarnessFact[]; readonly dead: DeadFact[] }> {
+  const dir = join(harnessDir, MEMORIES_RELPATH);
+  if (!existsSync(dir)) return { live: [], dead: [] };
+  const live: HarnessFact[] = [];
+  const dead: DeadFact[] = [];
+  for (const f of readdirSync(dir).sort()) {
+    if (!f.endsWith(".jsonl")) continue;
+    if (f === LEGACY_SHARED_FILE) {
+      live.push(...readRawMemoryFile(join(dir, f)));
+      continue;
+    }
+    const spec = f.slice(0, -".jsonl".length);
+    if (!isMemorySpecName(spec)) continue;
+    const store = createMemoryStore({ specName: spec, rootDir: dir });
+    const inFile = new Set<string>();
+    for (const item of await store.list()) {
+      inFile.add(item.entry.id);
+      if (item.status !== "live") {
+        dead.push({ spec, id: item.entry.id, status: item.status });
+        continue;
+      }
+      if (item.category === "person") continue;
+      live.push({ text: item.entry.text, tags: item.entry.tags, spec, id: item.entry.id });
+    }
+    dead.push(...archivedDeadFacts(spec, await store.history(), inFile));
+  }
+  return { live, dead };
+}
+
+/**
+ * The facts a compaction moved to the archive, each dead with the kind its
+ * archived tombstone gives it: `superseded` when a tombstone or the entry
+ * names it so, `expired` otherwise (a TTL or an expiry tombstone). A fact
+ * still in the live file is read from there instead.
+ */
+function archivedDeadFacts(
+  spec: string,
+  archived: ReadonlyArray<{ readonly line?: unknown }>,
+  inFile: ReadonlySet<string>,
+): DeadFact[] {
+  const superseded = new Set<string>();
+  const entries: MemoryEntry[] = [];
+  for (const { line } of archived) {
+    if (isMemoryEntry(line)) entries.push(line);
+    else if (isMemoryTombstone(line) && line.tombstone === "superseded")
+      superseded.add(line.target);
+  }
+  const out: DeadFact[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (inFile.has(entry.id) || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    const status =
+      superseded.has(entry.id) || entry.supersededBy !== undefined ? "superseded" : "expired";
+    out.push({ spec, id: entry.id, status });
+  }
+  return out;
+}
+
+/** {@link readHarnessFactStates}' live facts: what a push shares. */
+export async function readHarnessFacts(harnessDir: string): Promise<HarnessFact[]> {
+  return (await readHarnessFactStates(harnessDir)).live;
+}
+
+function readRawMemoryFile(path: string): RawMemory[] {
+  const out: RawMemory[] = [];
+  for (const line of readFileSync(path, "utf-8").split("\n")) {
+    if (line.trim() === "") continue;
+    try {
+      const rec = JSON.parse(line) as { text?: unknown; tags?: unknown };
+      if (typeof rec.text !== "string") continue;
+      const tags = Array.isArray(rec.tags)
+        ? rec.tags.filter((t): t is string => typeof t === "string")
+        : [];
+      out.push({ text: rec.text, tags });
+    } catch {
+      // tolerated
+    }
+  }
+  return out;
+}
+
+/**
+ * The spec this harness's memory lives under: the top-level `name:` of its
+ * `crewhaus.yaml` (or `crewhaus.yml`), when it is a valid store name. Tolerant:
+ * a missing, unreadable or unnamed spec answers `undefined`, and a pull then
+ * refuses rather than guess which store to fill.
+ */
+export function harnessSpecName(harnessDir: string): string | undefined {
+  for (const file of ["crewhaus.yaml", "crewhaus.yml"]) {
+    let text: string;
+    try {
+      text = readFileSync(join(harnessDir, file), "utf-8");
+    } catch {
+      continue;
+    }
+    const m = /^name:[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s#]+))[ \t]*(?:#.*)?$/m.exec(text);
+    const name = m === null ? undefined : (m[1] ?? m[2] ?? m[3]);
+    return name !== undefined && name !== "" && isMemorySpecName(name) ? name : undefined;
+  }
+  return undefined;
+}
+
+/** The refusal for a pull into a harness whose spec names no memory store. */
+export const PULL_NEEDS_SPEC_REASON =
+  "Pull needs this harness's crewhaus.yaml to know which memory store to fill.";
+
+/**
+ * Read every memory-store line across a harness's `.crewhaus/memories/*.jsonl`
+ * RAW: every line with a `text`, live or not, tombstones folded over nothing.
+ * Callers that hash what is on disk for dedupe use it; a push reads
+ * {@link readHarnessFacts} instead.
+ */
 export function readHarnessMemories(harnessDir: string): RawMemory[] {
   const dir = join(harnessDir, MEMORIES_RELPATH);
   if (!existsSync(dir)) return [];
   const out: RawMemory[] = [];
   for (const f of readdirSync(dir)) {
     if (!f.endsWith(".jsonl")) continue;
-    for (const line of readFileSync(join(dir, f), "utf-8").split("\n")) {
-      if (line.trim() === "") continue;
-      try {
-        const rec = JSON.parse(line) as { text?: unknown; tags?: unknown };
-        if (typeof rec.text !== "string") continue;
-        const tags = Array.isArray(rec.tags)
-          ? rec.tags.filter((t): t is string => typeof t === "string")
-          : [];
-        out.push({ text: rec.text, tags });
-      } catch {
-        // tolerated
-      }
-    }
+    out.push(...readRawMemoryFile(join(dir, f)));
   }
   return out;
 }
@@ -384,6 +546,22 @@ export function validateSharedMemory(
   if (!Array.isArray(r["tags"]) || !r["tags"].every((t) => typeof t === "string")) {
     return { ok: false, reason: "tags is not a string[]" };
   }
+  // An ill-typed origin is dropped, never half-read; the memory itself stays.
+  const rawOrigin = r["origin"];
+  const origin: SharedOrigin | undefined =
+    rawOrigin !== null &&
+    typeof rawOrigin === "object" &&
+    !Array.isArray(rawOrigin) &&
+    typeof (rawOrigin as Record<string, unknown>)["harness"] === "string" &&
+    ((rawOrigin as Record<string, unknown>)["fact"] === undefined ||
+      typeof (rawOrigin as Record<string, unknown>)["fact"] === "string")
+      ? {
+          harness: (rawOrigin as Record<string, string>)["harness"] as string,
+          ...(typeof (rawOrigin as Record<string, unknown>)["fact"] === "string"
+            ? { fact: (rawOrigin as Record<string, string>)["fact"] as string }
+            : {}),
+        }
+      : undefined;
   const tags = r["tags"] as string[];
   // Re-hash text+tags and reject a record whose stored hash lies — this is what
   // defeats dedupe-poisoning (a forged hash colliding with a trusted entry).
@@ -401,8 +579,66 @@ export function validateSharedMemory(
       : { harness: "unknown", pushedAt: "unknown" };
   return {
     ok: true,
-    memory: { contentHash: r["contentHash"], text: r["text"], tags, provenance },
+    memory: {
+      contentHash: r["contentHash"],
+      text: r["text"],
+      tags,
+      provenance,
+      ...(origin !== undefined ? { origin } : {}),
+    },
   };
+}
+
+const CONTENT_HASH_RE = /^[0-9a-f]{64}$/;
+
+/** One parsed retraction line, or why it is skipped. The shared store is untrusted. */
+export function validateRetraction(
+  rec: unknown,
+): { ok: true; retraction: Retraction } | { ok: false; reason: string } {
+  if (rec === null || typeof rec !== "object" || Array.isArray(rec)) {
+    return { ok: false, reason: "not an object" };
+  }
+  const r = rec as Record<string, unknown>;
+  if (typeof r["contentHash"] !== "string" || !CONTENT_HASH_RE.test(r["contentHash"])) {
+    return { ok: false, reason: "contentHash is not a sha256 hex" };
+  }
+  if (typeof r["harness"] !== "string" || r["harness"] === "") {
+    return { ok: false, reason: "harness not a string" };
+  }
+  if (typeof r["at"] !== "string") return { ok: false, reason: "at not a string" };
+  if (r["reason"] !== "superseded" && r["reason"] !== "expired") {
+    return { ok: false, reason: "reason is not superseded | expired" };
+  }
+  return {
+    ok: true,
+    retraction: {
+      contentHash: r["contentHash"],
+      harness: r["harness"],
+      at: r["at"],
+      reason: r["reason"],
+    },
+  };
+}
+
+/** Read the shared retractions. Missing → []. A malformed line is skipped with a warning. */
+export function readRetractions(sharedDir: string): Retraction[] {
+  const path = join(sharedDir, SHARED_RETRACTIONS_FILE);
+  if (!existsSync(path)) return [];
+  const out: Retraction[] = [];
+  for (const line of readFileSync(path, "utf-8").split("\n")) {
+    if (line.trim() === "") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      warnSkippedShared("retraction (not JSON)");
+      continue;
+    }
+    const v = validateRetraction(parsed);
+    if (v.ok) out.push(v.retraction);
+    else warnSkippedShared(`retraction (${v.reason})`);
+  }
+  return out;
 }
 
 /** Read the shared memories.jsonl. Missing → []. Each record is validated as a
@@ -512,6 +748,8 @@ export type PushPlan = {
   readonly droppedSecrets: ReadonlyArray<string>;
   /** Artifacts already present in the shared store (deduped away). */
   readonly skippedDuplicates: number;
+  /** Memories this harness shared whose fact has since been corrected or expired. */
+  readonly retractions: ReadonlyArray<Retraction>;
 };
 
 /**
@@ -523,13 +761,20 @@ export type PushPlan = {
  */
 export async function planPush(opts: {
   readonly harness: string;
-  readonly memories: ReadonlyArray<RawMemory>;
+  /** {@link readHarnessFacts}: a fact with an `id` is shared with its `origin`. */
+  readonly memories: ReadonlyArray<HarnessFact>;
   readonly graders?: { filename: string; contents: string } | undefined;
   readonly prompts: ReadonlyArray<{ filename: string; contents: string }>;
   readonly existingMemoryHashes: ReadonlySet<string>;
   readonly existingFragmentHashes: ReadonlySet<string>;
   readonly redact: Redactor;
   readonly now: () => Date;
+  /** The harness's facts that are not live ({@link readHarnessFactStates}). */
+  readonly deadFacts?: ReadonlyArray<DeadFact>;
+  /** The shared store's memories, to find the ones this harness shared. */
+  readonly sharedMemories?: ReadonlyArray<SharedMemory>;
+  /** Retractions already in the shared store, so a re-run appends none twice. */
+  readonly existingRetractions?: ReadonlyArray<Retraction>;
 }): Promise<PushPlan> {
   const provenance: Provenance = { harness: opts.harness, pushedAt: opts.now().toISOString() };
   const memories: SharedMemory[] = [];
@@ -549,7 +794,36 @@ export async function planPush(opts: {
       continue;
     }
     seenThisPush.add(hash);
-    memories.push({ contentHash: hash, text: outcome.text, tags: m.tags, provenance });
+    memories.push({
+      contentHash: hash,
+      text: outcome.text,
+      tags: m.tags,
+      provenance,
+      ...(m.id !== undefined ? { origin: { harness: opts.harness, fact: m.id } } : {}),
+    });
+  }
+
+  // A fact this harness shared (matched by the shared line's origin) that is
+  // now corrected or expired is retracted, once.
+  const deadById = new Map((opts.deadFacts ?? []).map((d) => [d.id, d]));
+  const alreadyRetracted = new Set(
+    (opts.existingRetractions ?? [])
+      .filter((r) => r.harness === opts.harness)
+      .map((r) => r.contentHash),
+  );
+  const retractions: Retraction[] = [];
+  for (const shared of opts.sharedMemories ?? []) {
+    const fact = shared.origin?.fact;
+    if (shared.origin?.harness !== opts.harness || fact === undefined) continue;
+    const dead = deadById.get(fact);
+    if (dead === undefined || alreadyRetracted.has(shared.contentHash)) continue;
+    alreadyRetracted.add(shared.contentHash);
+    retractions.push({
+      contentHash: shared.contentHash,
+      harness: opts.harness,
+      at: provenance.pushedAt,
+      reason: dead.status,
+    });
   }
 
   const fragments: SharedFragment[] = [];
@@ -576,12 +850,20 @@ export async function planPush(opts: {
   }
   for (const p of opts.prompts) await pushFragment("prompt", p.filename, p.contents);
 
-  return { memories, fragments, droppedSecrets, skippedDuplicates };
+  return { memories, fragments, droppedSecrets, skippedDuplicates, retractions };
 }
 
 /** Write a push plan into the shared store (append memories, write fragment
  *  files, append the manifest log). Not called in --dry-run. */
 export function applyPush(sharedDir: string, plan: PushPlan, now: () => Date): void {
+  const retractions = plan.retractions ?? [];
+  if (retractions.length > 0) {
+    mkdirSync(sharedDir, { recursive: true });
+    appendLine(
+      join(sharedDir, SHARED_RETRACTIONS_FILE),
+      retractions.map((r) => JSON.stringify(r)).join("\n"),
+    );
+  }
   if (plan.memories.length === 0 && plan.fragments.length === 0) return;
   mkdirSync(sharedDir, { recursive: true });
   if (plan.memories.length > 0) {
@@ -646,27 +928,85 @@ export function planPull(opts: {
   return { memories, fragments, skippedDuplicates };
 }
 
-/** Write a pull plan into a harness: append memories to a shared-memories
- *  JSONL the memory-store already reads, and drop fragment files into
- *  `.crewhaus/prompts` / a `graders.shared.yaml`. Not called in --dry-run. */
-export function applyPull(harnessDir: string, plan: PullPlan, now: () => Date): void {
-  if (plan.memories.length > 0) {
+/** The id a pulled memory lands under: deterministic, so a pull is idempotent. */
+export function pulledMemoryId(contentHash: string): string {
+  return `mem_${contentHash.slice(0, 16)}`;
+}
+
+export type PullOutcome = {
+  /** Ids of the facts this pull added to the spec store. */
+  readonly added: ReadonlyArray<string>;
+  /** Ids of pulled facts a retraction tombstoned. */
+  readonly retracted: ReadonlyArray<string>;
+};
+
+/**
+ * Write a pull plan into a harness: each memory lands in the harness's own
+ * spec store (`.crewhaus/memories/<specName>.jsonl`) under that store's lock,
+ * with a deterministic id and `provenance.origin`, so `recall()` finds it and
+ * a second pull adds nothing; a memory its sharer retracted is not added.
+ * Each retraction tombstones the pulled copy from the harness that retracted
+ * it. Fragment files land in `.crewhaus/prompts` / `graders.shared-*.yaml`.
+ * The legacy `shared.jsonl` of an older pull is left as it is. Not called in
+ * --dry-run. A pull with memories to land is refused, writing nothing, without
+ * a valid `specName`; a fragment-only pull needs none (and retracts nothing,
+ * having no store to look in).
+ */
+export async function applyPull(
+  harnessDir: string,
+  plan: PullPlan,
+  now: () => Date,
+  opts: { readonly specName: string | undefined; readonly retractions?: ReadonlyArray<Retraction> },
+): Promise<PullOutcome> {
+  const specName =
+    opts.specName !== undefined && isMemorySpecName(opts.specName) ? opts.specName : undefined;
+  if (specName === undefined && plan.memories.length > 0) {
+    throw new KnowledgeSyncError(PULL_NEEDS_SPEC_REASON);
+  }
+  const retractions = specName === undefined ? [] : (opts.retractions ?? []);
+  const retractedBy = new Set(retractions.map((r) => `${r.harness}\n${r.contentHash}`));
+  let added: readonly string[] = [];
+  const retracted: string[] = [];
+  const memories = plan.memories.filter(
+    (m) => !retractedBy.has(`${m.provenance.harness}\n${m.contentHash}`),
+  );
+  if (specName !== undefined && (memories.length > 0 || retractions.length > 0)) {
     const dir = join(harnessDir, MEMORIES_RELPATH);
     mkdirSync(dir, { recursive: true });
-    // Land in a dedicated shared file the memory-store loads alongside the
-    // harness's own memories. Each entry is a valid MemoryEntry (id + text +
-    // tags + createdAt), so recall() ranks them like local memories.
-    const path = join(dir, "shared.jsonl");
-    const stamp = now().toISOString();
-    const lines = plan.memories.map((m) =>
-      JSON.stringify({
-        id: `mem_shared_${m.contentHash.slice(0, 16)}`,
+    const store = createMemoryStore({ specName, rootDir: dir, now });
+    if (memories.length > 0) {
+      const stamp = now().toISOString();
+      const entries: MemoryEntry[] = memories.map((m) => ({
+        id: pulledMemoryId(m.contentHash),
         text: m.text,
+        // The provenance tag tool-lifecycle's hashing undoes: one, at the end.
         tags: [...m.tags, `shared:${m.provenance.harness}`],
         createdAt: stamp,
-      }),
-    );
-    appendLine(path, lines.join("\n"));
+        schemaVersion: 2,
+        provenance: {
+          origin: {
+            kind: "sync",
+            harness: m.provenance.harness,
+            ...(m.origin?.fact !== undefined ? { fact: m.origin.fact } : {}),
+            contentHash: m.contentHash,
+          },
+        },
+      }));
+      added = await store.importSynced(entries);
+    }
+    if (retractions.length > 0) {
+      const items = await store.list();
+      for (const r of retractions) {
+        const id = pulledMemoryId(r.contentHash);
+        const copy = items.find((i) => i.entry.id === id && i.status === "live");
+        const origin = copy?.entry.provenance?.origin;
+        // Only the harness that shared it can retract the pulled copy.
+        if (copy === undefined || origin?.harness !== r.harness) continue;
+        if (origin.contentHash !== r.contentHash) continue;
+        const forgotten = await store.forget(id, { reason: `retracted by ${r.harness}` });
+        retracted.push(...forgotten.map((e) => e.id));
+      }
+    }
   }
   for (const frag of plan.fragments) {
     if (frag.kind === "prompt") {
@@ -686,6 +1026,7 @@ export function applyPull(harnessDir: string, plan: PullPlan, now: () => Date): 
       );
     }
   }
+  return { added, retracted };
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +1047,12 @@ export function formatPushReport(
   }
   if (plan.skippedDuplicates > 0) {
     lines.push(`  • ${plan.skippedDuplicates} already in the shared store (deduped)`);
+  }
+  const retractions = plan.retractions ?? [];
+  if (retractions.length > 0) {
+    lines.push(
+      `  • ${dryRun ? "would retract" : "retracted"} ${retractions.length} shared memory(ies) whose fact was corrected or expired`,
+    );
   }
   return lines;
 }

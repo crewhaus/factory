@@ -8,16 +8,15 @@
  * are the reads that let them notice without a model turn.
  *
  * ---------------------------------------------------------------------------
- * THE RECORD SHAPE IS SOMEONE ELSE'S
+ * THE RECORD SHAPE AND THE FOLD ARE THE STORE'S
  * ---------------------------------------------------------------------------
- * `@crewhaus/session-store` owns `PendingApproval`, and `@crewhaus/hangar-server`
- * owns the fleet fold over it. Neither is a dependency of this package (see the
- * README — the fold is ~40 lines and the alternative was pulling a server and a
- * store into a tool package), so the shape is re-declared here STRUCTURALLY:
- * only the fields these tools actually project, all of them optional except the
- * seven the store's own `isPendingApprovalShape` requires. A record carrying
- * fields we do not know about passes through untouched, so a store that grows a
- * field does not make this reader reject its records.
+ * `@crewhaus/session-store` owns `PendingApproval`, its file names and how it
+ * folds: first decision wins, and a decision claim beside the file outranks it.
+ * This package reads through `foldWithClaims` (claims read first, then the
+ * fold, so a line that disagrees with a claim never folds), so a status here is the status the CLI, Home and the runtime see. The record
+ * is re-declared STRUCTURALLY: only the fields these tools project, all optional
+ * except the seven the store's own shape check requires. A record carrying
+ * fields we do not know about passes through untouched.
  *
  * ---------------------------------------------------------------------------
  * STRICTLY READ-ONLY, INCLUDING ABOUT TIME
@@ -28,6 +27,13 @@
  * answering a question it has no authority over, and an operator who skipped it
  * on that advice would leave a run blocked that a grant would have resumed.
  */
+import { dirname } from "node:path";
+import {
+  DEFAULT_APPROVALS_FILENAME,
+  DEFAULT_ROOT_DIR,
+  APPROVAL_ID_RE as STORE_APPROVAL_ID_RE,
+  foldWithClaims,
+} from "@crewhaus/session-store";
 import type { OperativeArg } from "@crewhaus/tool-catalog";
 import { readOperativeField } from "@crewhaus/tool-executor";
 import { OPERATIVE_ARG_FIELDS } from "@crewhaus/tool-permission-matcher";
@@ -35,12 +41,12 @@ import { TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
 import { type JsonlRead, readJsonlCapped } from "./jsonl";
 import { compareStrings } from "./unknown";
 
-/** The approvals log's filename, beside the session files. */
-export const APPROVALS_FILENAME = "approvals.jsonl";
-/** Where a harness keeps its session state, by convention. */
-export const SESSIONS_SUBDIR = ".crewhaus/sessions";
+/** The approvals log's filename, beside the session files (the store's own). */
+export const APPROVALS_FILENAME = DEFAULT_APPROVALS_FILENAME;
+/** Where a harness keeps its session state, by convention (the store's default). */
+export const SESSIONS_SUBDIR = DEFAULT_ROOT_DIR;
 /** The id grammar `PendingApprovalStore.resolve` enforces. */
-export const APPROVAL_ID_RE = /^appr_[0-9a-f]{16}$/;
+export const APPROVAL_ID_RE = STORE_APPROVAL_ID_RE;
 
 export function isApprovalId(id: string): boolean {
   return APPROVAL_ID_RE.test(id);
@@ -62,9 +68,22 @@ export type ApprovalRecord = {
   readonly decidedAt?: string;
   readonly consumedAt?: string;
   readonly always?: boolean;
+  /** The decider as a stored actor (`prn_…` or `local:#<digest>`). */
+  readonly decidedByPrincipal?: string;
+  readonly decidedVia?: string;
+  /** The fresh request that replaced this one. */
+  readonly supersededBy?: string;
+  readonly supersededReason?: string;
+  readonly deferredUntil?: string;
 };
 
-export type ApprovalStatusName = "pending" | "granted" | "granted-always" | "denied" | "consumed";
+export type ApprovalStatusName =
+  | "pending"
+  | "granted"
+  | "granted-always"
+  | "denied"
+  | "consumed"
+  | "superseded";
 
 /** Every status, in the order an operator cares about them. */
 export const APPROVAL_STATUSES: readonly ApprovalStatusName[] = Object.freeze([
@@ -73,6 +92,7 @@ export const APPROVAL_STATUSES: readonly ApprovalStatusName[] = Object.freeze([
   "granted-always",
   "denied",
   "consumed",
+  "superseded",
 ]);
 
 /** Mirrors `@crewhaus/session-store`'s own `isPendingApprovalShape`: seven
@@ -94,12 +114,15 @@ export function isApprovalShape(value: unknown): value is ApprovalRecord {
 /**
  * The status rule, as the CLI and the hangar both derive it.
  *
- * `granted-always` wins over `consumed` because a standing allow is terminal
- * whether or not the parked call was since spent — the `alwaysAllow` rule it
- * wrote into `settings.json` carries the behaviour from then on, and an
- * operator auditing "what did we hand out permanently" must see it.
+ * `superseded` comes first, as it does in `effectiveDecisionState`: a replaced
+ * request is settled whatever it said before. `granted-always` wins over
+ * `consumed` because a standing allow is terminal whether or not the parked
+ * call was since spent — the `alwaysAllow` rule it wrote into `settings.json`
+ * carries the behaviour from then on, and an operator auditing "what did we
+ * hand out permanently" must see it.
  */
 export function statusOf(a: ApprovalRecord): ApprovalStatusName {
+  if (a.supersededBy !== undefined) return "superseded";
   if (a.decision === "grant" && a.always === true) return "granted-always";
   if (a.consumedAt !== undefined) return "consumed";
   if (a.decision === "grant") return "granted";
@@ -115,22 +138,19 @@ export type FoldResult = {
 };
 
 /**
- * Fold one approvals log: last record wins by `id`, which is the upsert rule
- * `PendingApprovalStore.persist` documents (a grant is recorded by appending
- * the record again with `decision` set). Never compacts, never evicts.
+ * Fold one approvals log the store's way: first decision wins, and a decision
+ * or supersede claim beside the file (`approvals.d/claims/`) outranks it. Never
+ * compacts, never evicts, never repairs: a claim that cannot be read leaves the
+ * file's record as it is.
  *
- * Output order is FILE order of each id's LAST record — deterministic for a
+ * Output order is FILE order of each id's FIRST record — deterministic for a
  * given file, and re-sorted by every caller before it is shown.
  */
 export function foldApprovals(path: string, maxLines?: number, maxBytes?: number): FoldResult {
   const read = readJsonlCapped(path, maxLines, maxBytes);
-  const byId = new Map<string, ApprovalRecord>();
-  let foreignLines = 0;
-  for (const obj of read.objects) {
-    if (isApprovalShape(obj)) byId.set(obj.id, obj);
-    else foreignLines += 1;
-  }
-  return { records: [...byId.values()], foreignLines, read };
+  const foreignLines = read.objects.filter((obj) => !isApprovalShape(obj)).length;
+  const records: readonly ApprovalRecord[] = foldWithClaims(dirname(path), read.objects).records;
+  return { records, foreignLines, read };
 }
 
 /**
@@ -313,6 +333,10 @@ export type ApprovalRow = {
   readonly decidedBy: string | null;
   readonly decidedAt: string | null;
   readonly always?: true;
+  /** The fresh request that replaced this one, when it was superseded. */
+  readonly supersededBy?: string;
+  /** A pending request deferred until this instant. */
+  readonly deferredUntil?: string;
   readonly runId: string;
   readonly sessionId: string;
   readonly inputHash: string;
@@ -408,6 +432,8 @@ export function toRow(record: ApprovalRecord, nowMs?: number): ApprovalRow {
     decidedBy: record.decidedBy ?? null,
     decidedAt: record.decidedAt ?? null,
     ...(record.always === true ? { always: true as const } : {}),
+    ...(typeof record.supersededBy === "string" ? { supersededBy: record.supersededBy } : {}),
+    ...(typeof record.deferredUntil === "string" ? { deferredUntil: record.deferredUntil } : {}),
     runId: record.runId,
     sessionId: record.sessionId,
     inputHash: record.inputHash,
@@ -434,6 +460,7 @@ export function countByStatus(
     "granted-always": 0,
     denied: 0,
     consumed: 0,
+    superseded: 0,
   } satisfies Record<ApprovalStatusName, number>;
   for (const r of records) counts[statusOf(r)] += 1;
   return counts;

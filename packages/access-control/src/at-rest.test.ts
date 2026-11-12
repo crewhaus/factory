@@ -11,9 +11,11 @@ import { grant, invite, link, member, tokenRow } from "@crewhaus/control-contrac
 import { isCredentialKey } from "@crewhaus/spec-patch";
 import { redeemInvite } from "./access";
 import { accessPaths } from "./paths";
+import { openSignIn } from "./sign-in";
 import {
   BOOTSTRAP_TOKEN,
   type Fixture,
+  LOCAL,
   filesUnder,
   homeFixture,
   ok,
@@ -53,8 +55,68 @@ async function usedHome(): Promise<Used> {
     }),
   );
   ok(await home.access.link(home.actor, { subject: "github:99", member: "Ana" }));
-  return { home, secrets: [first.code, second.code, token.secret] };
+  return { home, secrets: [first.code, second.code, token.secret, ...(await signedIn(home))] };
 }
+
+/** A UI module Home serves, loaded by URL. */
+async function uiModule<T>(name: string): Promise<T> {
+  return (await import(new URL(`../../hangar-ui/assets/js/${name}`, import.meta.url).href)) as T;
+}
+
+type Jwk = { kty: "EC"; crv: "P-256"; x: string; y: string };
+
+/**
+ * Browsers sign in, come back, refresh and sign out, and a proxy header from a stray peer
+ * is noted. Answers every secret, code and address that went by.
+ */
+async function signedIn(home: Fixture): Promise<string[]> {
+  const sealed = await uiModule<{
+    makeSeal(): Promise<{ seal: Jwk; open(issued: unknown, op: string): Promise<string> }>;
+  }>("sealed.js");
+  const ui = await uiModule<{
+    makeDeviceKey(): Promise<{ privateKey: CryptoKey; deviceJwk: Jwk }>;
+    signChallenge(
+      key: CryptoKey,
+      input: { device: string; nonce: string; seal: Jwk },
+    ): Promise<string>;
+  }>("sign-in.js");
+  const signIn = openSignIn(home.root, { now: home.clock.now, localActor: LOCAL });
+  const code = signIn.mintExchangeCode(signIn.mintBootTicket().slice("/boot/".length)) as string;
+  const key = await ui.makeDeviceKey();
+  const first = await sealed.makeSeal();
+  const exchanged = await signIn.exchange({ code, deviceJwk: key.deviceJwk, seal: first.seal });
+  if (!exchanged.ok) throw new Error(exchanged.reason);
+  const one = await first.open(exchanged.issued, "auth.exchange");
+  const { nonce } = signIn.challenge();
+  const second = await sealed.makeSeal();
+  const signature = await ui.signChallenge(key.privateKey, {
+    device: exchanged.device,
+    nonce,
+    seal: second.seal,
+  });
+  const returned = await signIn.signInWithDevice({
+    device: exchanged.device,
+    nonce,
+    signature,
+    seal: second.seal,
+  });
+  if (!returned.ok) throw new Error(returned.reason);
+  const two = await second.open(returned.issued, "auth.session");
+  const check = await signIn.verifyBearer(two);
+  if (!check.ok) throw new Error(check.reason);
+  const third = await sealed.makeSeal();
+  const refreshed = await signIn.refresh(check.sessionRef, third.seal);
+  if (!refreshed.ok) throw new Error(refreshed.reason);
+  const three = await third.open(refreshed.issued, "auth.refresh");
+  const last = await signIn.verifyBearer(three);
+  if (!last.ok) throw new Error(last.reason);
+  await signIn.signOut(last.sessionRef);
+  await signIn.noteIgnoredIdentity("tcp", PEER_ADDRESS);
+  return [code, nonce, one, two, three, PEER_ADDRESS];
+}
+
+/** A documentation address (RFC 5737): it must never reach a record. */
+const PEER_ADDRESS = "203.0.113.77";
 
 /** Every file under the Hangar root and every projection, as `path: text`. */
 function everyFile({ home }: Used): Record<string, string> {
@@ -85,6 +147,9 @@ describe("no plaintext secret at rest", () => {
     const used = await usedHome();
     const files = everyFile(used);
     expect(Object.keys(files).length).toBeGreaterThan(10);
+    for (const rel of ["devices.jsonl", "sessions.jsonl", "security.jsonl"]) {
+      expect(Object.keys(files)).toContain(`access/${rel}`);
+    }
     expect(leaks(files, used.secrets)).toEqual([]);
     expect(
       Object.entries(files)

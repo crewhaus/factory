@@ -5,9 +5,23 @@
  * — which is exactly why the plane exposes `fetch` separately from `start`.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import {
+  allowSingleOwner,
+  createPendingApprovalStore,
+  generateApprovalId,
+} from "@crewhaus/session-store";
 import {
   CONTROL_PATH_PREFIX,
   CONTROL_PROTOCOL,
@@ -21,6 +35,7 @@ import {
   DRAIN_RETRY_AFTER_SECONDS,
   DRAIN_SWEEP_BUDGET_ENV,
   constantTimeEquals,
+  countPendingApprovals,
   createControlPlane,
   resolveControlToken,
   runDrainSweep,
@@ -845,5 +860,94 @@ describe("runDrainSweep — best-effort housekeeping under its own budget", () =
     );
     expect(await runDrainSweep(() => undefined, { env: {} })).toBe("done");
     expect(DEFAULT_DRAIN_SWEEP_MS).toBeGreaterThan(0);
+  });
+});
+
+describe("a lane's run scope", () => {
+  test("a tick's run resumes as the lane and was started by it; a wake is synthetic and carries no reason or author", async () => {
+    const seen: RunContext[] = [];
+    const { plane } = harness();
+    const heartbeat = plane.lane({
+      lane: "heartbeat",
+      cadence: "every 1000ms",
+      everyMs: 1000,
+      run: async () => {
+        seen.push(createRunContext());
+      },
+    });
+    const schedule = plane.lane({
+      lane: "schedule",
+      cadence: 'cron "0 * * * *" UTC',
+      run: async () => {
+        seen.push(createRunContext());
+      },
+    });
+    await heartbeat.tick();
+    const res = await plane.fetch(
+      req(
+        `${CONTROL_PATH_PREFIX}/wake`,
+        wakeBody({ lane: "heartbeat", reason: "operator poke", by: "hangar" }),
+      ),
+    );
+    expect(res.status).toBe(202);
+    await heartbeat.settled();
+    await schedule.tick();
+
+    const [organic, woken, scheduled] = seen;
+    expect(organic?.resumeScope).toBe("lane:heartbeat");
+    expect(organic?.trigger).toEqual({ kind: "heartbeat", lane: "heartbeat" });
+    expect(woken?.resumeScope).toBe("lane:heartbeat");
+    expect(woken?.trigger).toEqual({ kind: "heartbeat", lane: "heartbeat", synthetic: true });
+    const lineage = JSON.stringify({ trigger: woken?.trigger, scope: woken?.resumeScope });
+    expect(lineage).not.toContain("operator poke");
+    expect(lineage).not.toContain("hangar");
+    expect(scheduled?.resumeScope).toBe("lane:schedule");
+    expect(scheduled?.trigger).toEqual({ kind: "schedule", lane: "schedule" });
+    // Outside a tick, no lane scope.
+    expect("resumeScope" in createRunContext()).toBe(false);
+  });
+});
+
+describe("countPendingApprovals folds the way every reader does", () => {
+  const park = (inputHash: string) => ({
+    id: generateApprovalId(),
+    toolName: "Bash",
+    inputHash,
+    runId: "run_00000001",
+    sessionId: "sess_00000000000000aa",
+    surface: "daemon",
+    createdAt: new Date().toISOString(),
+  });
+  const write = (lines: readonly object[]): string => {
+    mkdirSync(sessions, { recursive: true });
+    const file = join(sessions, "approvals.jsonl");
+    writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+    return file;
+  };
+
+  test("a decided record an 0.8.x writer flipped back to waiting is not counted", () => {
+    const p = park("h1");
+    const granted = { ...p, decision: "grant", decidedBy: "max", decidedAt: p.createdAt };
+    const file = write([p, granted, p]);
+    expect(countPendingApprovals(file)).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe(
+      `${[p, granted, p].map((l) => JSON.stringify(l)).join("\n")}\n`,
+    );
+  });
+
+  test("a record its claim decided is not counted, though its file line still waits", async () => {
+    const decided = park("h2");
+    const waiting = park("h3");
+    const file = write([decided, waiting]);
+    const store = createPendingApprovalStore({ rootDir: sessions });
+    await store.decide(decided.id, { choice: "deny", actor: {} }, { authorize: allowSingleOwner });
+    // As a crash between the claim and its lines would leave the file.
+    writeFileSync(file, `${[decided, waiting].map((l) => JSON.stringify(l)).join("\n")}\n`);
+    expect(countPendingApprovals(file)).toBe(1);
+  });
+
+  test("no file counts nothing, and creates nothing", () => {
+    expect(countPendingApprovals(join(sessions, "approvals.jsonl"))).toBe(0);
+    expect(() => readdirSync(sessions)).toThrow();
   });
 });

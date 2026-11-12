@@ -69,6 +69,9 @@ export async function a11yFleet(scope: JourneyScope, seed: string): Promise<A11y
     expectedStatuses: [
       { pathname: startPath(harness.id), status: 409 },
       { pathname: specPatchPath(harness.id), status: 412 },
+      // The sign-in screen first asks whether Home answers this tab with no
+      // credential at all (a trusted proxy, or --no-auth); this one does not.
+      { pathname: "/api/version", status: 401 },
     ],
   };
 }
@@ -177,6 +180,28 @@ export const THREDZ_PANELS = [
   "Graph",
   "Keys",
 ] as const;
+
+/** The sign-in screen has no route of its own: it is what a tab with nothing shows. */
+export const SIGN_IN_TEMPLATE = "#/sign-in";
+
+/**
+ * Bring a signed-in tab to the sign-in screen: drop its session, forget its key, and
+ * reload. Leaves the tab signed out, so it comes last in anything that uses it.
+ */
+export async function showSignInScreen(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    sessionStorage.removeItem("hangar.session");
+    await new Promise<void>((resolve) => {
+      const request = indexedDB.deleteDatabase("crewhaus-home");
+      request.onsuccess = () => resolve();
+      request.onerror = () => resolve();
+      request.onblocked = () => resolve();
+    });
+  });
+  await page.reload();
+  await waitFor(page, "#sign-in-title", "the sign-in screen");
+  await settle(page, "the sign-in screen");
+}
 
 export type ScreenState = {
   /** The gated template the state belongs to. */
@@ -390,6 +415,24 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     });
   }
+  // Last: they leave the tab signed out.
+  states.push({
+    template: SIGN_IN_TEMPLATE,
+    state: "first paint",
+    route: LIBRARY_ROUTE,
+    open: showSignInScreen,
+  });
+  states.push({
+    template: SIGN_IN_TEMPLATE,
+    state: "a link refused",
+    route: LIBRARY_ROUTE,
+    open: async (page) => {
+      await showSignInScreen(page);
+      await page.getByLabel("Sign-in link").fill("not a link");
+      await page.getByLabel("Sign-in link").press("Enter");
+      await waitFor(page, ".sign-in-message strong", "the refusal on the sign-in screen");
+    },
+  });
   return states;
 }
 

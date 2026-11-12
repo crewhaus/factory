@@ -74,3 +74,91 @@ describe("the sunset gate's flags are the flags `model right-size` accepts", () 
     ).not.toThrow();
   });
 });
+
+/**
+ * The knowledge-editing verbs' printed and documented commands parse: a
+ * correction, a mark, a person's wiki version, an archive, a rollback, the
+ * guarded clear with its fingerprint, a trash restore and a lesson retirement.
+ */
+describe("the knowledge-editing verbs' flags parse", () => {
+  test("memory correct, mark and forget --reason", () => {
+    const correct = parseArgs(
+      ["correct", "mem_0123456789abcdef", "--text", "floor 4", "--reason", "moved", "--yes"],
+      SCHEMAS.MEMORY_SCHEMA,
+    );
+    expect([correct.flags["text"], correct.flags["reason"], correct.flags["yes"]]).toEqual([
+      "floor 4",
+      "moved",
+      true,
+    ]);
+    expect(
+      parseArgs(
+        ["correct", "mem_x", "--text-file", "fix.txt", "--reason", "r"],
+        SCHEMAS.MEMORY_SCHEMA,
+      ).flags["text-file"],
+    ).toBe("fix.txt");
+    expect(
+      parseArgs(["mark", "mem_x", "--personal"], SCHEMAS.MEMORY_SCHEMA).flags["personal"],
+    ).toBe(true);
+    expect(
+      parseArgs(["mark", "mem_x", "--not-personal"], SCHEMAS.MEMORY_SCHEMA).flags["not-personal"],
+    ).toBe(true);
+    expect(
+      parseArgs(["forget", "mem_x", "--reason", "stale"], SCHEMAS.MEMORY_SCHEMA).flags["reason"],
+    ).toBe("stale");
+  });
+
+  test("wiki write, archive and rollback", () => {
+    const write = parseArgs(
+      ["write", "faq", "--body-file", "faq.md", "--expect", "0", "--title", "FAQ"],
+      SCHEMAS.WIKI_SCHEMA,
+    );
+    expect([write.flags["body-file"], write.flags["expect"], write.flags["title"]]).toEqual([
+      "faq.md",
+      "0",
+      "FAQ",
+    ]);
+    expect(
+      parseArgs(["archive", "faq", "--expect", "3", "--undo"], SCHEMAS.WIKI_SCHEMA).flags["undo"],
+    ).toBe(true);
+    expect(
+      parseArgs(["rollback", "faq", "--to", "2", "--expect", "3"], SCHEMAS.WIKI_SCHEMA).flags["to"],
+    ).toBe("2");
+  });
+
+  test("state clear, trash and restore --trash", () => {
+    const clear = parseArgs(
+      [
+        "clear",
+        "--scope",
+        "plans",
+        "--session",
+        "sess_0123456789abcdef",
+        "--spec",
+        "bot",
+        "--yes",
+        "--expect",
+        "ab12",
+      ],
+      SCHEMAS.STATE_SCHEMA,
+    );
+    expect([
+      clear.flags["scope"],
+      clear.flags["session"],
+      clear.flags["spec"],
+      clear.flags["yes"],
+      clear.flags["expect"],
+    ]).toEqual(["plans", "sess_0123456789abcdef", "bot", true, "ab12"]);
+    expect(
+      parseArgs(["restore", "--trash", "2026-11-01T00-00-00"], SCHEMAS.STATE_SCHEMA).flags["trash"],
+    ).toBe("2026-11-01T00-00-00");
+  });
+
+  test("lessons retire --reason", () => {
+    expect(
+      parseArgs(["retire", "l0123456789abcdef", "--reason", "wrong"], SCHEMAS.LESSONS_SCHEMA).flags[
+        "reason"
+      ],
+    ).toBe("wrong");
+  });
+});
