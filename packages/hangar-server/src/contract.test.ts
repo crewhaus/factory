@@ -42,11 +42,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
+import { type Ledger, foldStates } from "@crewhaus/control-records";
+import { commandsLedgerOf, workspaceCommandsLedger } from "@crewhaus/control-service";
 import { bearer, codeFrom, sealedJs, signInJs } from "./__test__/browser";
 import { runCorpusEval } from "./__test__/eval-corpus";
 import { EVAL_JOB_ARGV } from "./eval-inputs";
 import { logLine, makeFixtureHarness } from "./fixture";
 import { M3_ROUTES } from "./m3-routes";
+import { ROUTE_BY_KEY } from "./route-table";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
@@ -1888,6 +1891,50 @@ describe("UI route contract", () => {
       const dir = contractHarness(t);
       await seedContinuity(dir);
       await seedEvals(dir);
+      // Every write the route table receipts adds exactly one command to its own ledger
+      // and answers with it; a read, and a write the table exempts, adds none.
+      const objectsIn = (ledger: Ledger): number => {
+        const fold = foldStates(ledger);
+        return fold.ok ? fold.objects.size : 0;
+      };
+      const jobsSeen = (): number => {
+        const jobs = t.server.processes.jobs;
+        return new Set(
+          [...jobs.pending(), ...jobs.running(), ...jobs.recent(100_000)].map((j) => j.jobId),
+        ).size;
+      };
+      const commandCounts = () => ({
+        harness: objectsIn(commandsLedgerOf(dir)),
+        home: objectsIn(workspaceCommandsLedger(t.hangarRoot)),
+        jobs: jobsSeen(),
+      });
+      let receipted = 0;
+      let queuing = 0;
+      const expectReceipt = (
+        key: string,
+        before: { harness: number; home: number; jobs: number },
+        body: Record<string, unknown>,
+      ): void => {
+        const row = ROUTE_BY_KEY.get(key);
+        if (row === undefined) throw new Error(`route "${key}" has no route-table row`);
+        const { jobs, ...after } = commandCounts();
+        const expected = {
+          harness: before.harness + (row.receipt === "harness" ? 1 : 0),
+          home: before.home + (row.receipt === "workspace" ? 1 : 0),
+        };
+        expect({ key, ...after }).toEqual({ key, ...expected });
+        // A receipted write that queued a job is a job row: the job, not the answer, settles
+        // it. (A read-only check such as `datasetLint` may queue one and has no receipt.)
+        if (row.receipt !== "none" && jobs > before.jobs) {
+          expect({ key, dispatch: row.dispatch }).toEqual({ key, dispatch: "job" });
+          queuing += 1;
+        }
+        expect({ key, receipt: body["receipt"] !== undefined }).toEqual({
+          key,
+          receipt: row.receipt !== "none",
+        });
+        if (row.receipt !== "none") receipted += 1;
+      };
       const fill = (template: string, params: Record<string, string>): string =>
         template.replace(/:([A-Za-z][A-Za-z0-9]*)/g, (_m, name: string) => {
           const v = params[name];
@@ -1908,11 +1955,13 @@ describe("UI route contract", () => {
         const route = ROUTES[key];
         if (route === undefined) throw new Error(`route "${key}" missing from routes.js`);
         driven.add(key);
+        const before = commandCounts();
         const { status, body } = await t.api(`${fill(route.path, params)}${opts.query ?? ""}`, {
           method: route.method,
           ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
           ...(opts.headers !== undefined ? { headers: opts.headers } : {}),
         });
+        expectReceipt(key, before, body);
         if (status !== (opts.expectStatus ?? 200)) {
           throw new Error(
             `${key} ${route.method} ${route.path}: expected ${opts.expectStatus ?? 200}, got ${status} ${JSON.stringify(body)}`,
@@ -2197,10 +2246,12 @@ describe("UI route contract", () => {
           throw new Error(`no M3_BODIES entry for write route "${key}" (${route.path})`);
         }
         driven.add(key);
+        const before = commandCounts();
         const { status, body } = await t.api(fill(route.path, params), {
           method: route.method,
           ...(writes ? { body: JSON.stringify(M3_BODIES[key]) } : {}),
         });
+        expectReceipt(key, before, body);
         if (status === 501) {
           expect(`${key}:${String(body["error"] ?? "")}`).toContain("not implemented (M3)");
           continue;
@@ -2390,6 +2441,12 @@ describe("UI route contract", () => {
 
       // -- completeness: the map holds nothing this test did not drive -----
       expect([...driven].sort()).toEqual(Object.keys(ROUTES).sort());
+      // …and every command those drives wrote is one a receipted write accounted for.
+      const total = commandCounts();
+      expect(receipted).toBeGreaterThanOrEqual(100);
+      expect(total.harness + total.home).toBe(receipted);
+      // The job check above saw jobs queued, so it can fail.
+      expect(queuing).toBeGreaterThanOrEqual(20);
     } finally {
       await t.stop();
       rmSync(pluginsDir, { recursive: true, force: true });

@@ -45,8 +45,11 @@ A claim file, published whole and exclusively, **decides** an exactly-once fact.
 appends: the shared lock policy steals any lock older than 30 seconds, so a writer paused across a
 laptop sleep can wake to find another inside. A crash between claim and append is repaired on the
 next touch, and that repair can race a slow but live winner, so a claim's record can land twice.
-**Every fold counts one record per `claim` value, the first line, and only the caller answered
-`won: true` may perform the effect.**
+**Every fold counts one record per claim and id, the first line, and only the caller answered
+`won: true` may perform the effect.** A repair copies its record whole, so its duplicate shares both
+and counts once; a row with no string `id` is keyed by its claim alone. A name that an expired claim
+gave up and a new record claimed again, with a new id, is a new object, and a crash between that claim
+and its append is repaired like any other (first consumer: idempotency keys).
 
 | Export | Contract | First consumer |
 |---|---|---|
@@ -56,6 +59,7 @@ next touch, and that repair can race a slow but live winner, so a claim's record
 | `appendClaim(ledger, {claim, record})` | Publish, then append stamped with `claim`. Answers `{won: true}` or `{won: false, winner}`. A claim whose `seg` is below the watermark is never repaired. | decisions, idempotency, receipts |
 | `casAppend(ledger, id, expectState, next)` | Fold, check, publish `gen/<id>/<g+1>`, append `{...next, id, gen}`. Answers `{applied: true}` or `{applied: false, current, illegal?}`. Generation claims are never removed. | activation, `dec_` decisions, attention overlays |
 | `foldStates(ledger)` | Every retained segment, uncapped, through the machine. An illegal row is kept, returned as an anomaly `{id, from, to, at}` and never applied. | the run ledger and the receipts |
+| `expireClaim(ledger, claim, notBefore)` | Under the lock, re-reads the claim and removes it only while its `at` is older than `notBefore` (epoch ms). A younger, missing or unreadable-time claim stays; a generation claim is refused and never removed. The removal never follows a link. | idempotency keys, honoured for seven days |
 | `dropSegmentsBefore(ledger, seg)` | Under the lock: the watermark first, then the files. It only rises, and the newest segment is never dropped. | the scheduler's retention |
 
 Generation claims are keyed by `id` alone, so ledgers that share a claims directory must not reuse an
@@ -117,6 +121,7 @@ for the fixed text.
 | `readDigestKey(harnessDir, {file?})` | `{state: "absent"}`, `{state: "present", hmac}` or `{state: "unreadable", reason}`. Creates nothing. `file` names another key file under the same root. | the decision log; access-control's subject key |
 | `ensureDigestKey(harnessDir, {file?})` | For writers. Publishes exclusively; a racing creator reads the winner's key. An unreadable key is refused, never replaced. | the decision log; access-control's subject key |
 | `keyedDigest(key, label, parts)` | HMAC-SHA256, lowercase hex, over the UTF-8 of `JSON.stringify([label, ...parts])`. | the decision log |
+| `storedLocalActor(key, localActor)`, `LOCAL_ACTOR_LABEL` | `local:#<keyedDigest(key, "local-actor", [actor])>`: what a record holds for an unlinked local OS user, under the key of the root the record lives in. One definition, so records join. | the command receipts; the decision log |
 
 Stored digests join forever, so this format is a pin. The label keeps two purposes from joining.
 
@@ -127,6 +132,7 @@ Stored digests join forever, so this format is a pin. The label keeps two purpos
 | `acquireMutatingLease(harnessDir, {head, kind}, {waitMs, probe, now, sleep})` | Publishes exclusively. A contender polls until `waitMs`, then answers `{ok: false, holder}` naming kind, head, pid, host and since. | Home's job runner and the CLI's long mutating verbs |
 | `withMutatingLease(harnessDir, who, fn, options)` | Runs `fn` holding the lease, and releases it when `fn` returns or throws. | Home's job runner and the CLI's long mutating verbs |
 | `readMutatingLease(harnessDir)` | A pure read. | Home's job runner and the CLI's long mutating verbs |
+| `holderProvablyDead({pid, startedAtMs?, host}, probe, host)` | The lease's own liveness rule, for any recorded process. | the lease; command recovery, judging a receipt's executor |
 
 Only a provably dead holder loses the lease: the same host, and `isAlive(pid) === false`, or a recorded
 start time more than 2 seconds from the probe's. A probe that cannot answer means held, a foreign host

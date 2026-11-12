@@ -237,6 +237,22 @@ export const EXIT_CODES = {
   provability: 37,
   /** Tool or MCP failure (including MCP boot). */
   tool: 40,
+  /** 0.9.0 control band (50-56): a refusal from the control plane, before or
+   *  instead of the work. Not signed in, or the credential was refused. */
+  not_signed_in: 50,
+  /** The caller lacks the permission, or authorization could not be decided. */
+  forbidden: 51,
+  /** Nothing was done and a retry later may work: unavailable or rate limited. */
+  unavailable: 52,
+  /** The object is not in the state the command needs: a conflict, an
+   *  already-decided decision, a failed precondition, or a reused idempotency key. */
+  conflict: 53,
+  /** The harness or the protocol cannot do this. */
+  unsupported: 54,
+  /** The command was refused: invalid input, blocked input, or a rejected receipt. */
+  refused: 55,
+  /** The object the command names does not exist. */
+  not_found: 56,
 } as const;
 
 /**

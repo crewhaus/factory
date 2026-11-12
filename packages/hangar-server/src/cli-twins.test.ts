@@ -39,6 +39,7 @@ import { makeFixtureHarness } from "./fixture";
 import { M3_ROUTES } from "./m3-routes";
 import { actionCliTwins, matchActions } from "./omnibox";
 import { demoAvailability, onboardingView } from "./onboarding";
+import { ROUTE_TABLE } from "./route-table";
 import { bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
@@ -441,6 +442,9 @@ describe("every twin the contract declares would run if pasted", () => {
     const twins = [
       ...OPERATIONS.map((op) => [op.id, op.cliTwin] as const),
       ...Object.values(COMMAND_KINDS).map((kind) => [kind.id, kind.cliTwin] as const),
+      ...ROUTE_TABLE.flatMap((row) =>
+        row.cliTwin !== null ? [[row.key, row.cliTwin] as const] : [],
+      ),
     ];
     let checked = 0;
     for (const [id, twin] of twins) {
@@ -452,8 +456,8 @@ describe("every twin the contract declares would run if pasted", () => {
         checked++;
       }
     }
-    // Eight operation twins and five command kinds, each rendered twice.
-    expect(checked).toBeGreaterThanOrEqual(26);
+    // Eight operation twins, five command kinds and seven route rows, each rendered twice.
+    expect(checked).toBeGreaterThanOrEqual(40);
   });
 
   test("the checker refuses a verb the CLI does not have", () => {

@@ -20,6 +20,7 @@ import { openHangarRegistry } from "@crewhaus/harness-registry";
 import type {
   Clock,
   JobRunner,
+  JobStore,
   ProcessOps,
   SpawnRequest,
   SpawnedProcess,
@@ -239,6 +240,10 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
   let ops: FakeProcessOps | undefined;
   let clock: FakeClock | undefined;
   let processLayer = suppliedLayer;
+  // The server wraps only a store it builds itself, so the layer built here wraps its own
+  // late: once the server exists, its job adapter moves receipts as it does in production.
+  let jobStore: JobStore | undefined;
+  let wrappedStore: JobStore | undefined;
   if (processLayer === undefined) {
     const testClock = createTestClock(now());
     clock = testClock;
@@ -259,6 +264,13 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
       // observable effect a submit assertion needs. Override for real work.
       runJob: runJob ?? (() => new Promise<{ exitCode?: number }>(() => {})),
       ...(preflight === true ? {} : { noPreflight: true }),
+      wrapJobStore: (store) => {
+        jobStore = store;
+        return {
+          append: (record) => (wrappedStore ?? store).append(record),
+          read: () => store.read(),
+        };
+      },
     });
     if (wrapProcessLayer !== undefined) processLayer = wrapProcessLayer(processLayer);
   }
@@ -289,6 +301,7 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
     ...(controlClient !== undefined ? { controlClient } : {}),
     onWarn: collectWarn,
   });
+  if (jobStore !== undefined) wrappedStore = server.controlService.jobs.wrapStore(jobStore);
   const token = server.token ?? "";
 
   const fetchRaw = (path: string, init: RequestInit = {}): Promise<Response> =>
