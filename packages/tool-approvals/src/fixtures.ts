@@ -31,6 +31,8 @@ export type ApprovalFixture = {
   readonly decidedAt?: string;
   readonly consumedAt?: string;
   readonly always?: boolean;
+  readonly decidedVia?: string;
+  readonly requiredClass?: string;
 };
 
 /** One `PendingApproval` record, defaults filled in. */
@@ -50,7 +52,26 @@ export function approval(fixture: ApprovalFixture = {}): Record<string, unknown>
     ...(fixture.decidedAt !== undefined ? { decidedAt: fixture.decidedAt } : {}),
     ...(fixture.consumedAt !== undefined ? { consumedAt: fixture.consumedAt } : {}),
     ...(fixture.always !== undefined ? { always: fixture.always } : {}),
+    ...(fixture.decidedVia !== undefined ? { decidedVia: fixture.decidedVia } : {}),
+    ...(fixture.requiredClass !== undefined ? { requiredClass: fixture.requiredClass } : {}),
   };
+}
+
+/**
+ * A consume claim under `<harnessDir>/.crewhaus/sessions/approvals.d/claims/`, in
+ * the shape the store publishes one, with no rendezvous line after it: the spend a
+ * crash left half-written, which every reader must still count.
+ */
+export function writeConsumeClaim(harnessDir: string, id: string, consumedAt: string): void {
+  const dir = path.join(harnessDir, ".crewhaus", "sessions", "approvals.d", "claims", "consume");
+  mkdirSync(dir, { recursive: true });
+  const claim = `consume/${id}`;
+  const record = { consumedAt, consumedByRun: "run_01m7703cs8jjkenyccysbb1s7v" };
+  writeFileSync(
+    path.join(dir, `${id}.json`),
+    `${JSON.stringify({ v: 1, claim, at: consumedAt, seg: 1, record })}\n`,
+    { mode: 0o600 },
+  );
 }
 
 /** Write an approvals ledger under `<harnessDir>/.crewhaus/sessions/`. */

@@ -8,7 +8,7 @@
  * finished and not progressing, and the only way anyone finds out is if
  * somebody looks. These three tools are that looking, without a model turn:
  *
- *   ApprovalStatus     one harness — what is parked, what was decided, by whom
+ *   ApprovalStatus     one harness — what is parked, what was decided, through which surface
  *   ApprovalsInbox     the fleet — every harness under a root, in one page
  *   PermissionsSuggest the history — the rules that would stop the re-asking
  *
@@ -872,7 +872,7 @@ function rowAsRecord(row: InboxRow): ApprovalRecord & { readonly harness: string
     sessionId: row.sessionId,
     surface: row.surface,
     createdAt: row.createdAt,
-    ...(row.decidedBy !== null ? { decidedBy: row.decidedBy } : {}),
+    ...(row.decidedVia !== null ? { decidedVia: row.decidedVia } : {}),
     ...(row.decidedAt !== null ? { decidedAt: row.decidedAt } : {}),
     // The projection lost `decision`/`consumedAt`, but `status` is the thing the
     // comparator reads — so it is reconstituted from the status, not guessed.

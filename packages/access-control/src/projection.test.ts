@@ -110,12 +110,69 @@ describe("where a projection is written", () => {
       }),
     );
     const members = readProjection(h)["members"] as { principal: string; decide: string }[];
+    // A service decides through a credential that expires, so its row says when.
+    expect(typeof ci.token.expiresAt).toBe("string");
     expect(members).toEqual(
       [
         { principal: mo.principal, decide: "maintainer" },
-        { principal: ci.principal, decide: "operator" },
+        { principal: ci.principal, decide: "operator", until: ci.token.expiresAt as string },
       ].sort((a, b) => (a.principal < b.principal ? -1 : 1)),
     );
+  });
+
+  test("a service member's until is its latest live deciding credential's expiry, and moving it rewrites the file", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    const scope = `harness:${h.id}`;
+    const mo = ok(
+      await home.access.grant(home.actor, { member: "Mo", create: true, role: "operator", scope }),
+    );
+    const first = ok(
+      await home.access.mintServiceToken(home.actor, {
+        service: "ci",
+        permissions: ["h.decision.resolve"],
+        harnesses: [h.id],
+        ttlMs: HOUR,
+      }),
+    );
+    const memberOf = (principal: string) =>
+      (readProjection(h)["members"] as { principal: string; until?: string }[]).find(
+        (m) => m.principal === principal,
+      );
+    expect(memberOf(first.principal)?.until).toBe(first.token.expiresAt as string);
+    // A grant member's authority does not end on its own: no until.
+    expect(memberOf(mo.principal)).toEqual({ principal: mo.principal, decide: "operator" });
+    expect(readProjection(h)["owner"]).toBe(home.owner);
+
+    // A second credential that lasts longer moves the end time, and the file is rewritten.
+    const writes = countWrites();
+    const second = ok(
+      await home.access.mintServiceToken(home.actor, {
+        service: "ci",
+        permissions: ["h.decision.resolve"],
+        harnesses: [h.id],
+        ttlMs: 3 * HOUR,
+      }),
+    );
+    expect(second.principal).toBe(first.principal);
+    expect(writes).toEqual([h.id]);
+    expect(memberOf(first.principal)?.until).toBe(second.token.expiresAt as string);
+    expect(Date.parse(second.token.expiresAt as string)).toBeGreaterThan(
+      Date.parse(first.token.expiresAt as string),
+    );
+
+    // A credential that cannot decide here does not count toward the end time.
+    ok(
+      await home.access.mintServiceToken(home.actor, {
+        service: "ci",
+        permissions: ["h.control"],
+        harnesses: [h.id],
+        ttlMs: 5 * HOUR,
+      }),
+    );
+    expect(memberOf(first.principal)?.until).toBe(second.token.expiresAt as string);
+    expect(approverProjection.safeParse(readProjection(h)).success).toBe(true);
   });
 
   test("a service without the decision permission is not projected", async () => {

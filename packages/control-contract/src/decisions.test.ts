@@ -9,13 +9,16 @@ import {
   type DecisionRecordView,
   OPERATOR_SUPERSEDE_REASONS,
   SYSTEM_SUPERSEDE_REASONS,
+  type SupersedeReason,
   VERIFY_REASONS,
   type VerifyConsumer,
   type VerifyDecisionInput,
   type VerifyReason,
   classAllows,
   effectiveDecisionState,
+  memberMayDecide,
   mintId,
+  mintRunId,
   verifyDecision,
 } from "./index.js";
 
@@ -206,14 +209,29 @@ function withRecord(
   return verify({ decision: { ...GRANT, ...record }, ...change });
 }
 
-function refused(reason: VerifyReason, detail?: string) {
+function refused(reason: VerifyReason, detail?: string, supersedeReason?: SupersedeReason) {
+  const why = supersedeReason ?? (reason === "revision-changed" ? "revision-changed" : undefined);
   return {
     ok: false,
     reason,
-    supersede: reason === "revision-changed",
+    supersede: why !== undefined,
+    ...(why === undefined ? {} : { supersedeReason: why }),
     ...(detail === undefined ? {} : { detail }),
   };
 }
+
+/** A principal decider who no longer holds the class: refused, and the grant is retired. */
+const revoked = () => refused("decider-not-authorized", undefined, "decider-revoked");
+
+/** A supervised job's root scope, the one scope that also checks the run. */
+const ROOT_SCOPE = `run:${mintRunId()}`;
+const RUN_BOUND: DecisionRecordView = {
+  ...GRANT,
+  binding: {
+    ...(GRANT.binding as NonNullable<DecisionRecordView["binding"]>),
+    resumeScope: ROOT_SCOPE,
+  },
+};
 
 const PRESENT = { approvers: { state: "present", projection: PROJECTION } } as const;
 
@@ -260,16 +278,42 @@ describe("verifyDecision, one reason at a time", () => {
       refused("scope-mismatch"),
     );
   });
-  test("run-mismatch, and a continuation of the parking run passes", () => {
-    expect(verify({ consumer: { ...CONSUMER, runId: "run_ffffffff" } })).toEqual(
+  test("run-mismatch under a supervised job's root scope, and a continuation of the parking run passes", () => {
+    const rooted = { decision: RUN_BOUND } as const;
+    const consumer = { ...CONSUMER, resumeScope: ROOT_SCOPE };
+    expect(verify({ ...rooted, consumer: { ...consumer, runId: "run_ffffffff" } })).toEqual(
       refused("run-mismatch"),
     );
     expect(
-      verify({ consumer: { ...CONSUMER, runId: "run_ffffffff", continues: "run_0000" } }),
+      verify({
+        ...rooted,
+        consumer: { ...consumer, runId: "run_ffffffff", continues: "run_0000" },
+      }),
     ).toEqual(refused("run-mismatch"));
     expect(
-      verify({ consumer: { ...CONSUMER, runId: "run_ffffffff", continues: "run_abcd1234" } }),
+      verify({
+        ...rooted,
+        consumer: { ...consumer, runId: "run_ffffffff", continues: "run_abcd1234" },
+      }),
     ).toEqual({ ok: true });
+    expect(verify({ ...rooted, consumer })).toEqual({ ok: true });
+    // A binding with no run under a root scope cannot be checked.
+    const noRun = { ...RUN_BOUND, binding: { ...RUN_BOUND.binding, runId: "" } } as never;
+    expect(verify({ decision: noRun, consumer })).toEqual(refused("run-mismatch"));
+  });
+  test("under a session, a job, a lane or a work item the scope is the binding: a new run passes", () => {
+    for (const scope of [SCOPE, "job:nightly-1", "lane:heartbeat", `work:${mintId("wi")}`]) {
+      const decision = {
+        ...GRANT,
+        binding: { ...(GRANT.binding as object), resumeScope: scope },
+      } as DecisionRecordView;
+      const consumer = { ...CONSUMER, resumeScope: scope, runId: "run_ffffffff" };
+      expect(verify({ decision, consumer })).toEqual({ ok: true });
+      // The scope still binds: another scope is refused.
+      expect(verify({ decision, consumer: { ...consumer, resumeScope: "job:other" } })).toEqual(
+        refused("scope-mismatch"),
+      );
+    }
   });
   test("revision-changed, and it alone says supersede", () => {
     const deployment = verify({ consumer: { ...CONSUMER, deploymentId: "dep_b" } });
@@ -301,13 +345,32 @@ describe("verifyDecision, one reason at a time", () => {
     const { placesDigest: _a, ...noPlaces } = CONSUMER;
     expect(verify({ consumer: noPlaces })).toEqual(refused("places-changed"));
   });
-  test("every other reason leaves supersede false", () => {
-    for (const reason of VERIFY_REASONS) {
-      expect(refused(reason).supersede).toBe(reason === "revision-changed");
-    }
-    expect(verify({ consumer: { ...CONSUMER, placesDigest: "x" } })).toMatchObject({
-      supersede: false,
+  test("only a moved revision and a principal decider's lost authority say supersede", () => {
+    expect(verify({ consumer: { ...CONSUMER, specHash: "spec-b" } })).toMatchObject({
+      supersede: true,
+      supersedeReason: "revision-changed",
     });
+    const stranger = { decidedByPrincipal: mintId("prn") };
+    expect(withRecord(stranger, PRESENT)).toEqual(revoked());
+    // Every other refusal keeps the grant as it is.
+    const kept: readonly (readonly [VerifyReason, ReturnType<typeof verify>])[] = [
+      ["places-changed", verify({ consumer: { ...CONSUMER, placesDigest: "x" } })],
+      ["resource-changed", verify({ consumer: { ...CONSUMER, resourceRevision: "rev-b" } })],
+      ["scope-mismatch", verify({ consumer: { ...CONSUMER, resumeScope: "job:x" } })],
+      ["consumed", withRecord({ consumedAt: BEFORE })],
+      ["expired", withRecord({ expiredAt: BEFORE })],
+      ["approvers-unreadable", verify({ approvers: { state: "unreadable" } })],
+      [
+        "decider-unverified",
+        withRecord({ decidedByPrincipal: undefined, decidedAt: AFTER }, PRESENT),
+      ],
+      ["decider-not-authorized", withRecord({ decidedByPrincipal: "sys:scheduler" })],
+      ["decider-not-authorized", withRecord({ resolvedBy: "policy" }, PRESENT)],
+    ];
+    for (const [reason, verdict] of kept) {
+      expect(verdict).toEqual(refused(reason));
+      expect(verdict).not.toHaveProperty("supersedeReason");
+    }
   });
 });
 
@@ -347,15 +410,48 @@ describe("the decider", () => {
   test("a member passes at their class floor and no higher", () => {
     expect(withRecord({ requiredClass: "operator" }, PRESENT)).toEqual({ ok: true });
     expect(withRecord({ requiredClass: "maintainer" }, PRESENT)).toEqual({ ok: true });
-    expect(withRecord({ requiredClass: "owner" }, PRESENT)).toEqual(
-      refused("decider-not-authorized"),
-    );
+    expect(withRecord({ requiredClass: "owner" }, PRESENT)).toEqual(revoked());
+  });
+
+  test("a member whose until has passed, or cannot be read, no longer counts", () => {
+    const at = (until: unknown) =>
+      ({
+        state: "present",
+        projection: {
+          ...PROJECTION,
+          members: [{ principal: PRINCIPAL, decide: "maintainer", until }],
+        } as ApproverProjection,
+      }) as const;
+    expect(verify({ approvers: at(AFTER) })).toEqual({ ok: true });
+    expect(verify({ approvers: at(BEFORE) })).toEqual(revoked());
+    expect(verify({ approvers: at("2026-11-07T12:00:00.000Z") })).toEqual(revoked());
+    expect(verify({ approvers: at("next week") })).toEqual(revoked());
+    expect(verify({ approvers: at(7) })).toEqual(revoked());
+    // The owner carries no end time.
+    expect(withRecord({ decidedByPrincipal: OWNER }, { approvers: at(BEFORE) })).toEqual({
+      ok: true,
+    });
+  });
+
+  test("memberMayDecide is the one rule: the owner, or a member whose class and time allow it", () => {
+    const projection: ApproverProjection = {
+      ...PROJECTION,
+      members: [
+        { principal: PRINCIPAL, decide: "operator", until: AFTER },
+        { principal: OWNER, decide: "operator" },
+      ],
+    };
+    expect(memberMayDecide(projection, PRINCIPAL, "operator", NOW)).toBe(true);
+    expect(memberMayDecide(projection, PRINCIPAL, "maintainer", NOW)).toBe(false);
+    expect(memberMayDecide(projection, PRINCIPAL, "operator", Date.parse(LATER))).toBe(false);
+    expect(memberMayDecide(projection, PRINCIPAL, "operator", Number.NaN)).toBe(false);
+    expect(memberMayDecide(projection, OWNER, "owner", Date.parse(LATER))).toBe(true);
+    expect(memberMayDecide(projection, mintId("prn"), "operator", NOW)).toBe(false);
+    expect(memberMayDecide(null as never, OWNER, "operator", NOW)).toBe(false);
   });
 
   test("a null class refuses all but the owner; only an absent one defaults", () => {
-    expect(withRecord({ requiredClass: null as never }, PRESENT)).toEqual(
-      refused("decider-not-authorized"),
-    );
+    expect(withRecord({ requiredClass: null as never }, PRESENT)).toEqual(revoked());
     expect(
       withRecord({ decidedByPrincipal: OWNER, requiredClass: null as never }, PRESENT),
     ).toEqual({ ok: true });
@@ -369,20 +465,14 @@ describe("the decider", () => {
     } as ApproverProjection;
     const approvers = { state: "present", projection } as const;
     expect(verify({ approvers })).toEqual({ ok: true });
-    expect(withRecord({ requiredClass: "nope" as never }, { approvers })).toEqual(
-      refused("decider-not-authorized"),
-    );
+    expect(withRecord({ requiredClass: "nope" as never }, { approvers })).toEqual(revoked());
   });
 
   test("a removed member is refused", () => {
     const projection = { ...PROJECTION, members: [] };
-    expect(verify({ approvers: { state: "present", projection } })).toEqual(
-      refused("decider-not-authorized"),
-    );
+    expect(verify({ approvers: { state: "present", projection } })).toEqual(revoked());
     const broken = { ...PROJECTION, members: "nope" as never };
-    expect(verify({ approvers: { state: "present", projection: broken } })).toEqual(
-      refused("decider-not-authorized"),
-    );
+    expect(verify({ approvers: { state: "present", projection: broken } })).toEqual(revoked());
   });
 
   describe("no principal, or an unlinked local actor, counts like free text", () => {
@@ -441,7 +531,7 @@ describe("the decider", () => {
 describe("order and legacy records", () => {
   test("the first failure wins, walking the list one fix at a time", () => {
     const worst: DecisionRecordView = {
-      ...GRANT,
+      ...RUN_BOUND,
       decision: undefined,
       consumedAt: BEFORE,
       supersededBy: "appr_ffffffffffffffff",
@@ -465,7 +555,7 @@ describe("order and legacy records", () => {
       ["superseded", { consumedAt: undefined }, {}],
       ["expired", { supersededBy: undefined }, {}],
       ["scope-mismatch", { expiresAt: undefined }, {}],
-      ["run-mismatch", {}, { resumeScope: SCOPE }],
+      ["run-mismatch", {}, { resumeScope: ROOT_SCOPE }],
       ["revision-changed", {}, { runId: "run_abcd1234" }],
       ["resource-changed", {}, { deploymentId: "dep_a" }],
       ["places-changed", {}, { resourceRevision: "rev-a" }],
@@ -575,30 +665,38 @@ describe("a binding that cannot be checked refuses", () => {
     });
   });
 
-  describe("run-mismatch", () => {
+  describe("run-mismatch, under a supervised job's root scope", () => {
+    const rooted = (
+      fields: Record<string, unknown>,
+      consumer: Partial<Record<keyof VerifyConsumer, unknown>> = {},
+    ) =>
+      withBinding({ resumeScope: ROOT_SCOPE, ...fields }, { resumeScope: ROOT_SCOPE, ...consumer });
+    test("the rooted baseline passes", () => {
+      expect(rooted({})).toEqual({ ok: true });
+    });
     test("no run on the binding, a different run consuming, nothing continued", () => {
-      expect(withBinding({ runId: undefined }, { runId: "run_other" })).toEqual(
-        refused("run-mismatch"),
-      );
+      expect(rooted({ runId: undefined }, { runId: "run_other" })).toEqual(refused("run-mismatch"));
     });
     test("no run on either side", () => {
-      expect(withBinding({ runId: undefined }, { runId: undefined })).toEqual(
-        refused("run-mismatch"),
-      );
+      expect(rooted({ runId: undefined }, { runId: undefined })).toEqual(refused("run-mismatch"));
     });
     test("equal values that are not runs", () => {
-      expect(withBinding({ runId: 7 }, { runId: 7 })).toEqual(refused("run-mismatch"));
-      expect(withBinding({ runId: "" }, { runId: "" })).toEqual(refused("run-mismatch"));
+      expect(rooted({ runId: 7 }, { runId: 7 })).toEqual(refused("run-mismatch"));
+      expect(rooted({ runId: "" }, { runId: "" })).toEqual(refused("run-mismatch"));
     });
     test("a consumer with no run of its own cannot pass by what it continues", () => {
-      expect(withBinding({}, { runId: undefined, continues: "run_abcd1234" })).toEqual(
+      expect(rooted({}, { runId: undefined, continues: "run_abcd1234" })).toEqual(
         refused("run-mismatch"),
       );
     });
     test("a non-string continues matches nothing", () => {
-      expect(withBinding({ runId: 7 }, { runId: "run_other", continues: 7 })).toEqual(
+      expect(rooted({ runId: 7 }, { runId: "run_other", continues: 7 })).toEqual(
         refused("run-mismatch"),
       );
+    });
+    test("under a session scope the same runs are not checked", () => {
+      expect(withBinding({ runId: undefined }, { runId: "run_other" })).toEqual({ ok: true });
+      expect(withBinding({ runId: 7 }, { runId: 7 })).toEqual({ ok: true });
     });
   });
 
@@ -693,6 +791,9 @@ describe("vocabulary", () => {
     ]);
     expect(DECISION_LOG_REASONS.expire).toEqual(["ttl"]);
     expect(DECISION_LOG_REASONS.defer).toContain("scheduled");
+    // A refusal at the spend logs why, from the same closed list the check answers with.
+    expect([...CORE_MODULE.reasonCodes.refuse]).toEqual([...VERIFY_REASONS]);
+    expect(DECISION_LOG_REASONS.refuse).toEqual([...VERIFY_REASONS]);
   });
 
   test("the decision log's events and its closed key set are pinned", () => {

@@ -578,6 +578,7 @@ import {
   invalidReasonMessage,
   listedApprovals,
   localApprovalActor,
+  withdrawnMessage,
 } from "./approvals-cli";
 import {
   ADVISE_SCHEMA,
@@ -15610,6 +15611,9 @@ async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
     );
     if (answer.outcome === "not-found") die(`no approval "${id}" under ${rootDir}`);
     if (answer.outcome === "forbidden") die(answer.reason ?? "not allowed to replace this request");
+    const withdrawn =
+      answer.record !== null ? withdrawnMessage(id, answer.winner ?? answer.record) : undefined;
+    if (withdrawn !== undefined) die(withdrawn);
     if (answer.outcome === "already-decided") {
       die(`${id} was already replaced by ${answer.winner?.supersededBy ?? "another request"}`);
     }

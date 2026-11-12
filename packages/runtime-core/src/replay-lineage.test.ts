@@ -693,10 +693,10 @@ describe("a call a person approved on a parked approval goes out as approved", (
     let spends = 0;
     const slowSpend: typeof store = {
       ...store,
-      persist: async (approval) => {
-        if (approval.id === pending.id && approval.consumedAt !== undefined) spends += 1;
+      consume: async (id, request) => {
+        if (id === pending.id) spends += 1;
         await Bun.sleep(25);
-        await store.persist(approval);
+        return store.consume(id, request);
       },
     };
     await approvedRun(

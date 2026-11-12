@@ -157,6 +157,7 @@ import {
 } from "@crewhaus/run-context";
 import {
   type ApprovalPlace,
+  type ApprovalToPersist,
   type PendingApproval,
   type PendingApprovalStore,
   type SessionStore,
@@ -166,6 +167,7 @@ import {
   generateApprovalId,
   hashApprovalInput,
   mergeSessionModels,
+  recordInScope,
   resolveSessionPin,
 } from "@crewhaus/session-store";
 import { type SkillRef, formatSkillsForPrompt } from "@crewhaus/skills-registry";
@@ -208,6 +210,14 @@ import {
   createCliMarkdownRenderer,
   isCliMarkdownEnabled,
 } from "./cli-markdown";
+import {
+  type SpendOutcome,
+  bindingFor,
+  consumeHeld,
+  deniedByPhrase,
+  requiredClassFor,
+  withdrawOnCancel,
+} from "./decision-binding";
 import { createMemoryEventLog, createMemorySessionStore } from "./ephemeral";
 import { type ExitRatingFeedback, FEEDBACK_EVENT_KIND, runExitRating } from "./exit-rating";
 import { type JsonSchemaLike, flattenUnionToObject } from "./flatten-union";
@@ -240,7 +250,15 @@ import {
   stripDirectiveFromMessage,
 } from "./pre-route";
 import { loadProjectMemory } from "./project-memory";
-import { hasRunRows, openRunRows, recordRunPark, withRunRows } from "./run-ledger";
+import {
+  hasRunRows,
+  ledgerRoot,
+  onCancelledRun,
+  openRunRows,
+  recordRunPark,
+  resumeScopeOf,
+  withRunRows,
+} from "./run-ledger";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 import {
@@ -763,6 +781,8 @@ export {
   generateApprovalId,
   hashApprovalInput,
 } from "@crewhaus/session-store";
+// 0.9.0 (#507, #513) — the class a parked call needs, from the tool's own facts.
+export { requiredClassFor } from "./decision-binding";
 
 /**
  * How long after an operator's DECISION a grant may still satisfy a call the
@@ -782,6 +802,10 @@ export const REPLAYABLE_GRANT_MAX_AGE_MS = 15 * 60 * 1000;
  * allow:
  *
  *   - `sessionId` — a grant never leaks into another conversation.
+ *   - `resumeScope` (0.9.0, when given) — the grant was asked in this scope
+ *     (`recordInScope`): a batch job's re-delivery or a lane's next tick may
+ *     replay it, a call in any other scope may not. A record parked before
+ *     grants were bound still needs its own session.
  *   - `toolName` — a grant for one tool never authorizes another.
  *   - `decision === "grant"` and no `consumedAt` — one-shot means one shot.
  *   - `runId !== <this run>` — the grant must come from a PRIOR run, i.e.
@@ -808,6 +832,8 @@ export async function findReplayableGrant(
     readonly toolName: string;
     readonly sessionId: string;
     readonly runId: string;
+    /** The scope the call is made in; given, only a grant bound to it is replayed. */
+    readonly resumeScope?: string;
     /** Epoch ms; the freshness window is measured from the DECISION. */
     readonly now?: number;
     /** Override the window (tests). */
@@ -829,7 +855,10 @@ export async function findReplayableGrant(
   const legacyToolName = legacyMcpToolName(where.toolName);
   const matches = all.filter((a) => {
     if (a.toolName !== where.toolName && a.toolName !== legacyToolName) return false;
-    if (a.sessionId !== where.sessionId) return false;
+    if (where.resumeScope === undefined || a.binding === undefined) {
+      if (a.sessionId !== where.sessionId) return false;
+    }
+    if (where.resumeScope !== undefined && !recordInScope(a, where.resumeScope)) return false;
     if (a.decision !== "grant") return false;
     if (a.consumedAt !== undefined) return false;
     if (a.runId === where.runId) return false;
@@ -920,13 +949,15 @@ export function landsWhereApproved(
  * one was made for another place, an older one may still be this place's —
  * a grant the operator made before a link moved away and back, or a park
  * already waiting. `list` is optional on an injected store; without it (or
- * when it fails) there is nothing more to find, and the call parks.
+ * when it fails) there is nothing more to find, and the call parks. Only a
+ * record asked in `resumeScope` counts (`recordInScope`).
  */
 async function findApprovalForPlace(
   store: Pick<PendingApprovalStore, "persist" | "get" | "resolve"> &
     Partial<Pick<PendingApprovalStore, "list">>,
   keys: ReadonlyArray<readonly [toolName: string, inputHash: string]>,
   call: CallPlaces,
+  resumeScope: string,
 ): Promise<PendingApproval | null> {
   if (typeof store.list !== "function") return null;
   let all: readonly PendingApproval[];
@@ -944,10 +975,16 @@ async function findApprovalForPlace(
     (a) =>
       keys.some(([toolName, inputHash]) => a.toolName === toolName && a.inputHash === inputHash) &&
       a.consumedAt === undefined &&
+      recordInScope(a, resumeScope) &&
       landsWhereApproved(a, call),
   );
   return [...matches].sort((a, b) => touched(b) - touched(a))[0] ?? null;
 }
+
+/** What the model is told when the egress check blocks a call. */
+const EGRESS_DENIED_RESULT =
+  "[egress denied] outbound payload contains content tagged from a non-user origin under a strict-policy sink. " +
+  "Inspect the prior tool/sub-agent results that fed this call's input; the egress classifier's `dataLineage` records which boundary site introduced the flagged substring.";
 
 /** What a park asked in place of `record` keeps of it, for the card. */
 function supersededBy(record: PendingApproval): SupersededApproval {
@@ -3069,7 +3106,12 @@ export type RunChatLoopOptions = {
       // #400 — OPTIONAL: supplied, a resumed run can replay the input an
       // operator approved when the model regenerates the call differently.
       // Omitted, that path is simply never taken (pre-#400 behaviour).
-      Partial<Pick<PendingApprovalStore, "list">>;
+      Partial<Pick<PendingApprovalStore, "list">> &
+      // 0.9.0 — OPTIONAL: `consume` spends a grant by an exclusive claim, after
+      // the checks a grant must pass where its call runs; without it a grant is
+      // checked here and spent once per process only. `supersedeRun` withdraws
+      // what a cancelled run waits on.
+      Partial<Pick<PendingApprovalStore, "consume" | "supersedeRun">>;
     readonly notify?: (approval: PendingApproval) => Promise<void>;
     readonly surface?: string;
   };
@@ -5184,6 +5226,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     persistSession,
     bus,
   });
+  if (opts.approvals !== undefined) {
+    onCancelledRun(runContext, withdrawOnCancel(runContext, opts.approvals.store));
+  }
   const eventLog: EventLog = persistSession
     ? await openEventLog(sessionId, { rootDir: sessionRootDir })
     : createMemoryEventLog();
@@ -6598,6 +6643,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // single choke point every result passes through) can tell the model,
     // whichever return path fires.
     let replayedFrom: PendingApproval | undefined;
+    // Where the APPROVED input lands, when a replay runs it: a spend checks this.
+    let replayView: ReturnType<typeof placeRecordingCanonicalizer> | undefined;
     const finish = async (
       resultIn: Anthropic.ToolResultBlockParam,
     ): Promise<Anthropic.ToolResultBlockParam> => {
@@ -6798,19 +6845,55 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // The store grant this call runs under, spent once it has passed every
     // check below that can refuse it; `release` lets it go unspent.
     let heldGrant:
-      | { approvalId: string; spend: () => Promise<void>; release: () => void }
+      | {
+          approvalId: string;
+          /** `rule`: a call a rule allows, held so the egress check lets it out as approved. */
+          kind: "ask" | "rule";
+          spend: (places: ReadonlyArray<ApprovalPlace>) => Promise<SpendOutcome>;
+          release: () => void;
+        }
+      | undefined;
+    // Whether the egress check let this call out only because of the held grant.
+    let egressReliedOnGrant = false;
+    // 0.9.0 — set where the ask path parks a call, so a grant the spend below
+    // refuses parks it the same way.
+    let parkCall:
+      | ((asked: {
+          readonly movedFrom: PendingApproval | undefined;
+          readonly reuse: PendingApproval | null;
+          readonly places: ReadonlyArray<ApprovalPlace>;
+          readonly refused?: string;
+        }) => Promise<never>)
       | undefined;
     // Held synchronously, so a parallel identical call cannot run under it too.
     const holdGrant = (
       grant: PendingApproval,
-      store: Pick<PendingApprovalStore, "persist">,
+      store: Pick<PendingApprovalStore, "persist"> & Partial<Pick<PendingApprovalStore, "consume">>,
+      kind: "ask" | "rule",
     ): NonNullable<typeof heldGrant> => {
       grantsInFlight.add(grant.id);
       return {
         approvalId: grant.id,
-        spend: async () => {
-          await store.persist({ ...grant, consumedAt: new Date().toISOString() });
-          grantsInFlight.delete(grant.id);
+        kind,
+        // 0.9.0 — spent by the store's exclusive claim, after the checks a grant
+        // must pass where the call runs now (`consumeHeld`).
+        spend: async (places) => {
+          try {
+            return await consumeHeld({
+              store,
+              grant,
+              runContext,
+              sessionId,
+              tool,
+              operativeInput,
+              places,
+              harnessRoot: ledgerRoot(opts, opts.settingsDir),
+              reask: kind === "ask",
+              surface: approvalSurface,
+            });
+          } finally {
+            grantsInFlight.delete(grant.id);
+          }
         },
         // A refused call can be retried, and the same refusal answers it
         // without a new card for the operator.
@@ -6836,7 +6919,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // forever. The persisted record still carries the full `tu.input`
         // below so the approving operator SEES the justification.
         const inputHash = hashApprovalInput(tu.name, operativeInput);
-        let existing = await approvals.store.get(tu.name, inputHash);
+        // 0.9.0 — a record answers only the scope it was asked in: this
+        // conversation, batch job, lane, supervised job or work item.
+        const approvalScope = resumeScopeOf(runContext, sessionId);
+        const inScope = (record: PendingApproval | null): PendingApproval | null =>
+          record !== null && recordInScope(record, approvalScope) ? record : null;
+        let existing = inScope(
+          await approvals.store.get(tu.name, inputHash, { resumeScope: approvalScope }),
+        );
         // 0.7.1 — an approval parked before MCP tools were renamed is keyed on
         // the old `<server>__<tool>` spelling, and the operator may already
         // have granted it. Honour it (or re-use it while still pending)
@@ -6847,9 +6937,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           approvalKeys.push([legacyToolName, hashApprovalInput(legacyToolName, operativeInput)]);
         }
         if (existing === null && legacyToolName !== undefined) {
-          existing = await approvals.store.get(
-            legacyToolName,
-            hashApprovalInput(legacyToolName, operativeInput),
+          existing = inScope(
+            await approvals.store.get(
+              legacyToolName,
+              hashApprovalInput(legacyToolName, operativeInput),
+              { resumeScope: approvalScope },
+            ),
           );
         }
         // 0.7.1 — A GRANT COVERS THE PLACE IT WAS MADE FOR. The record is
@@ -6868,7 +6961,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           !landsWhereApproved(existing, gateView)
         ) {
           movedFrom = existing;
-          existing = await findApprovalForPlace(approvals.store, approvalKeys, gateView);
+          existing = await findApprovalForPlace(
+            approvals.store,
+            approvalKeys,
+            gateView,
+            approvalScope,
+          );
         }
         if (existing?.decision === "grant" && grantsInFlight.has(existing.id)) existing = null;
         // #400 — THE RESUMED CALL IS NOT THE PARKED CALL.
@@ -6899,14 +6997,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             toolName: tu.name,
             sessionId,
             runId: bus.runId,
+            resumeScope: approvalScope,
             now: Date.now(),
           });
-          // CLAIM IT SYNCHRONOUSLY. The lookup reads and the consuming
-          // `persist` writes, and up to `maxConcurrentTools` ask-gated calls
-          // run through this gate at once — so without a claim two parallel
-          // calls both find the same unconsumed grant and both execute. The
-          // set is per-run and in-process, which is where that race is;
-          // across processes the store's `consumedAt` remains the authority.
+          // CLAIM IT SYNCHRONOUSLY. The lookup reads and the spend writes, and
+          // up to `maxConcurrentTools` ask-gated calls run through this gate at
+          // once, so the set holds a grant for the call that found it. It is
+          // per-run and in-process, the fast path; across processes the store's
+          // exclusive consume claim is the authority.
           //
           // 0.7.1 — and bound like the exact match: the APPROVED input must
           // still land where it did when the operator approved it. Read here,
@@ -6916,7 +7014,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             !replayedApprovalIds.has(replay.id) &&
             !grantsInFlight.has(replay.id)
           ) {
-            const replayView = placeRecordingCanonicalizer();
+            replayView = placeRecordingCanonicalizer();
             const subjectOfReplay = preparePermissionSubject(
               tool,
               operativeToolInput(tu.name, replay.input),
@@ -7033,7 +7131,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // they have to approve the same action twice. The egress check
             // records a match on this call and lets it go out as approved.
             // Held synchronously, as the replay claim above is held.
-            heldGrant = holdGrant(existing, approvals.store);
+            heldGrant = holdGrant(existing, approvals.store, "ask");
           }
           if (replayedFrom !== undefined && approved) {
             bus.publish({
@@ -7065,33 +7163,47 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           }
         } else if (existing?.decision === "deny") {
           approved = false;
-          denialMessage = `tool denied: \`${tu.name}\` approval was denied${
-            existing.decidedBy !== undefined ? ` by ${existing.decidedBy}` : ""
-          }.`;
-        } else {
-          // No decision yet. Reuse an existing pending record for this key
-          // (idempotent re-park across resumed runs) or persist a fresh one,
-          // fire the out-of-band notification, publish `approval_requested`,
-          // and PARK: throw the classified `approval_pending` report. The
-          // NeedTools catch (non-streaming) publishes `run_failed` + rethrows;
-          // the streaming path reaches the same halt through recovery's
-          // classified-report passthrough. On the next execution the store
-          // carries a grant/deny and the call re-resolves pre-decided.
-          const pending: PendingApproval = existing ?? {
-            id: generateApprovalId(),
-            toolName: tu.name,
-            inputHash,
-            input: tu.input,
-            // 0.7.1 — what this park covers: where the call lands now, and
-            // the approval it asks in place of, so a card can say both.
-            places: gateView.places(),
-            ...(movedFrom !== undefined ? { supersedes: supersededBy(movedFrom) } : {}),
-            runId: bus.runId,
-            sessionId,
-            surface: approvalSurface,
-            createdAt: new Date().toISOString(),
-          };
-          if (existing === null) await approvals.store.persist(pending);
+          // 0.9.0 — fixed text naming a role: no text a deciding surface recorded
+          // reaches the model.
+          denialMessage = `tool denied: \`${tu.name}\` approval ${existing.id} was denied by ${deniedByPhrase(
+            existing.requiredClass,
+          )}.`;
+        }
+        // No decision yet. Reuse an existing pending record for this key
+        // (idempotent re-park across resumed runs) or persist a fresh one,
+        // fire the out-of-band notification, publish `approval_requested`,
+        // and PARK: throw the classified `approval_pending` report. The
+        // NeedTools catch (non-streaming) publishes `run_failed` + rethrows;
+        // the streaming path reaches the same halt through recovery's
+        // classified-report passthrough. On the next execution the store
+        // carries a grant/deny and the call re-resolves pre-decided.
+        // 0.9.0 — a closure: a grant the spend refuses (after every gate below)
+        // parks the call here too, re-using the request the store asked in its
+        // place (`reuse`), so no second request is made.
+        parkCall = async ({ movedFrom, reuse, places, refused }) => {
+          // A fresh park records who may decide it and what a grant on it is
+          // good for; the store seals the binding's keyed part as it writes it.
+          const park: ApprovalToPersist | null =
+            reuse !== null
+              ? null
+              : {
+                  id: generateApprovalId(),
+                  toolName: tu.name,
+                  inputHash: hashApprovalInput(tu.name, operativeInput),
+                  input: tu.input,
+                  // 0.7.1 — what this park covers: where the call lands now, and
+                  // the approval it asks in place of, so a card can say both.
+                  places,
+                  ...(movedFrom !== undefined ? { supersedes: supersededBy(movedFrom) } : {}),
+                  runId: bus.runId,
+                  sessionId,
+                  surface: approvalSurface,
+                  createdAt: new Date().toISOString(),
+                  requiredClass: requiredClassFor(tool),
+                  binding: await bindingFor({ runContext, sessionId, tool, operativeInput }),
+                };
+          if (park !== null) await approvals.store.persist(park);
+          const pending: PendingApproval = reuse ?? (park as PendingApproval);
           recordRunPark(runContext, pending.id);
           if (approvals.notify !== undefined) {
             await approvals.notify(pending).catch((err) => {
@@ -7116,21 +7228,27 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           });
           // Asked again because the call moved: say where it was approved
           // and where it lands now, so the operator decides on the new place.
+          // Asked again because its grant could not be used: say which, and why.
           const moved =
             movedFrom === undefined
               ? ""
-              : `; approval ${movedFrom.id} was ${
-                  movedFrom.decision === "grant" ? "granted" : "requested"
-                } for ${describePlaces(movedFrom.places)}, and the call now lands at ${describePlaces(
-                  gateView.places(),
-                )}, so it is asked again`;
+              : refused !== undefined
+                ? `; approval ${movedFrom.id} was granted but could not be used here (${refused}), so it is asked again`
+                : `; approval ${movedFrom.id} was ${
+                    movedFrom.decision === "grant" ? "granted" : "requested"
+                  } for ${describePlaces(movedFrom.places)}, and the call now lands at ${describePlaces(
+                    places,
+                  )}, so it is asked again`;
           throw new RunFailedError({
             class: "approval_pending",
             title: "awaiting tool approval",
             detail: `\`${tu.name}\` requires approval on a non-interactive surface (${approvalSurface})${moved}; the run is parked as approval ${pending.id}`,
-            remediation: `grant or deny approval ${pending.id} out of band (e.g. \`crewhaus approvals grant ${pending.id}\`; add \`--always\` to allow \`${tu.name}\` from now on), then rerun`,
+            remediation: `grant or deny approval ${pending.id} out of band (e.g. \`crewhaus approvals grant ${pending.id}\`; add \`--always\` to allow \`${tu.name}\` from now on), then resume the run: \`crewhaus runs resume ${sessionId}\``,
             exitCode: EXIT_CODES.approval_pending,
           });
+        };
+        if (existing?.decision !== "grant" && existing?.decision !== "deny") {
+          await parkCall({ movedFrom, reuse: existing, places: gateView.places() });
         }
       } else {
         // Pre-0.4 collapse-to-deny: no interactive surface, and either
@@ -7172,13 +7290,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const holdRuleAllowedGrant = async (): Promise<void> => {
       if (decision !== "allow" || approvals === undefined) return;
       let grant: PendingApproval | null = null;
+      const approvalScope = resumeScopeOf(runContext, sessionId);
       try {
-        grant = await approvals.store.get(tu.name, hashApprovalInput(tu.name, operativeInput));
+        grant = await approvals.store.get(tu.name, hashApprovalInput(tu.name, operativeInput), {
+          resumeScope: approvalScope,
+        });
         const legacyToolName = legacyMcpToolName(tu.name);
         if (grant === null && legacyToolName !== undefined) {
           grant = await approvals.store.get(
             legacyToolName,
             hashApprovalInput(legacyToolName, operativeInput),
+            { resumeScope: approvalScope },
           );
         }
       } catch (err) {
@@ -7194,9 +7316,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         grant.decision === "grant" &&
         grant.consumedAt === undefined &&
         !grantsInFlight.has(grant.id) &&
+        recordInScope(grant, approvalScope) &&
         landsWhereApproved(grant, gateView)
       ) {
-        heldGrant = holdGrant(grant, approvals.store);
+        heldGrant = holdGrant(grant, approvals.store, "rule");
       }
     };
     if (!approved) {
@@ -7334,6 +7457,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         classified.verdict === "block" && heldGrant !== undefined
           ? heldGrant.approvalId
           : undefined;
+      egressReliedOnGrant = approvedOver !== undefined;
       const egress: typeof classified =
         approvedOver !== undefined ? { ...classified, verdict: "warn" } : classified;
       const approvedReason =
@@ -7409,9 +7533,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         return finish({
           type: "tool_result",
           tool_use_id: tu.id,
-          content:
-            "[egress denied] outbound payload contains content tagged from a non-user origin under a strict-policy sink. " +
-            "Inspect the prior tool/sub-agent results that fed this call's input; the egress classifier's `dataLineage` records which boundary site introduced the flagged substring.",
+          content: EGRESS_DENIED_RESULT,
           is_error: true,
         });
       }
@@ -7458,7 +7580,69 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
     // The call has passed every gate that can refuse it, so the grant it runs
     // under is spent here; a call a gate above refused left it unspent.
-    await heldGrant?.spend();
+    // 0.9.0 — the spend is the last check: where the call lands now (the
+    // approved input's places on a replay), the scope and revisions it runs
+    // under, and whether the person who granted it may still decide at its
+    // class. A refusal leaves the grant unspent and the call does not run.
+    const held = heldGrant;
+    if (held !== undefined) {
+      const spendView =
+        replayedFrom !== undefined && replayView !== undefined ? replayView : gateView;
+      const spent = await held.spend(spendView.places());
+      if (spent.outcome === "refused") {
+        runContext.logger.info("tool approval not used", {
+          approvalId: held.approvalId,
+          reason: spent.reason,
+        });
+        if (held.kind === "rule") {
+          // A rule allows the call; the grant only let it out past an egress
+          // `block`. Without the grant, the egress check's verdict stands.
+          if (egressReliedOnGrant) {
+            bus.publish({
+              ...bus.envelope(),
+              kind: "permission_decision",
+              toolName: tu.name,
+              decision: "deny",
+              mode: permissionMode,
+              outcome: "egress-blocked",
+              reason: `approval ${held.approvalId} not used (${spent.reason}): the egress check's block stands`,
+              ...callAttribution,
+            });
+            return finish({
+              type: "tool_result",
+              tool_use_id: tu.id,
+              content: EGRESS_DENIED_RESULT,
+              is_error: true,
+            });
+          }
+        } else {
+          bus.publish({
+            ...bus.envelope(),
+            kind: "permission_decision",
+            toolName: tu.name,
+            decision: "ask",
+            mode: permissionMode,
+            reason: `approval ${held.approvalId} not used (${spent.reason}): asked again`,
+            ...callAttribution,
+          });
+          replayedFrom = undefined;
+          if (parkCall === undefined) {
+            return finish({
+              type: "tool_result",
+              tool_use_id: tu.id,
+              content: `tool denied: approval ${held.approvalId} could not be used (${spent.reason})`,
+              is_error: true,
+            });
+          }
+          await parkCall({
+            movedFrom: spent.record,
+            reuse: spent.fresh ?? null,
+            places: spendView.places(),
+            refused: spent.reason,
+          });
+        }
+      }
+    }
 
     const toolAbort = turnAbort.child();
     // Build the bridge for this call. Built on EVERY run (#160 follow-up):

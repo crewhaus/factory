@@ -19,7 +19,7 @@ tools:
 
 | Tool | What it does |
 |---|---|
-| `ApprovalStatus` | One harness's approval ledger — what is parked now, what was decided, when and by whom |
+| `ApprovalStatus` | One harness's approval ledger — what is parked now, what was decided, when and through which surface |
 | `ApprovalsInbox` | The fleet in one page: every harness under a root, with the tool and argument that parked each run |
 | `PermissionsSuggest` | The rules that would stop the re-asking, each verified to match only the call it came from |
 

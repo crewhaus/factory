@@ -143,6 +143,21 @@ these on: they reach every harness that uses what each one names.
   work on other files and other harnesses as before. `Bash` and `RunCommand`
   remain outside what the floor can see. Recompile a daemon to pick this up.
 
+- **An approval covers the work it was asked in, and is used once.** A grant
+  counts for the call it was asked about, in the conversation, batch job,
+  scheduled lane or supervised job that asked, and only while the harness runs
+  the deployment and spec it was granted under (and, for a tool that reports
+  one, the same version of what it acts on); anywhere else the call is asked
+  again. Using a grant is an exclusive claim checked just before the tool runs,
+  so it is spent once even across processes, and only while the person who
+  granted it can still approve at that level. Destructive tools, and tools that
+  ask for a justification, need a maintainer or the owner once a harness has
+  members. Cancelling a run withdraws the requests it was waiting on. A denied
+  call's message to the model names the role that denied it, never a person's
+  own words, and a parked run says to continue with `crewhaus runs resume`.
+  Requests parked before the upgrade count for their conversation only, so a
+  batch job or a scheduled lane parked before it asks once more.
+
 ## [0.8.1] - 2026-11-08
 
 Fixes and hardening for run input, the runtime-state floor, git tools,

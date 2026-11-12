@@ -3,7 +3,7 @@ import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
-import { mintRunId } from "@crewhaus/control-contract";
+import { mintId, mintRunId } from "@crewhaus/control-contract";
 import { append, readPage } from "@crewhaus/control-records";
 import { createRunContext, runWithScope } from "@crewhaus/run-context";
 import { createPendingApprovalStore, runChatLoop } from "@crewhaus/runtime-core";
@@ -138,6 +138,54 @@ describe("resolveRunsResumeTarget", () => {
     expect(resolveRunsResumeTarget(sessionId(6), harness())).toEqual({ sessionId: sessionId(6) });
   });
 
+  test("a parked supervised run's scope comes back, by session id and by run id, and goes into the resume", () => {
+    const dir = harness();
+    const root = mintRunId();
+    const parked = mintRunId();
+    const scope = `run:${root}`;
+    plant(dir, { id: root, state: "queued", execution: "run_00000000000000ab" });
+    plant(dir, {
+      id: parked,
+      state: "running",
+      session: sessionId(8),
+      parent: root,
+      resumeScope: scope,
+    });
+    plant(dir, { id: parked, state: "waiting-for-approval", decision: "appr_0123456789abcdef" });
+    const want = { sessionId: sessionId(8), continues: parked, resumeScope: scope };
+    expect(resolveRunsResumeTarget(sessionId(8), dir)).toEqual(want);
+    expect(resolveRunsResumeTarget(parked, dir)).toEqual(want);
+    expect(resolveRunsResumeTarget(root, dir)).toEqual(want);
+    expect(runsResumeScope(want)).toEqual({
+      trigger: { kind: "resume" },
+      continues: parked,
+      resumeScope: scope,
+    });
+  });
+
+  test("a run parked under a work item resumes in it; a parked run with no recorded scope resumes with none", () => {
+    const dir = harness();
+    const workItem = mintId("wi");
+    const [worked, bare] = [mintRunId(), mintRunId()];
+    plant(dir, {
+      id: worked,
+      state: "running",
+      session: sessionId(9),
+      resumeScope: `work:${workItem}`,
+    });
+    plant(dir, { id: worked, state: "waiting-for-approval", decision: "appr_0123456789abcdef" });
+    expect(resolveRunsResumeTarget(sessionId(9), dir)).toEqual({
+      sessionId: sessionId(9),
+      continues: worked,
+      resumeScope: `work:${workItem}`,
+    });
+    plant(dir, { id: bare, state: "running", session: sessionId(10) });
+    plant(dir, { id: bare, state: "waiting-for-approval", decision: "appr_0123456789abcdee" });
+    const target = resolveRunsResumeTarget(bare, dir);
+    expect(target).toEqual({ sessionId: sessionId(10), continues: bare });
+    expect(runsResumeScope(target)).toEqual({ trigger: { kind: "resume" }, continues: bare });
+  });
+
   test("an id no run record has is refused, naming it", () => {
     const dir = harness();
     const unknown = mintRunId();
@@ -186,7 +234,11 @@ describe("resolveRunsResumeTarget", () => {
     expect((parkedError as { report?: { class?: string } }).report?.class).toBe("approval_pending");
 
     const target = resolveRunsResumeTarget(first.runId, dir);
-    expect(target).toEqual({ sessionId: first.sessionId, continues: first.runId });
+    expect(target).toEqual({
+      sessionId: first.sessionId,
+      continues: first.runId,
+      resumeScope: `session:${first.sessionId}`,
+    });
     // As the CLI does: the resumed loop mints its context inside the scope.
     let resumed = first;
     const answer = await runWithScope(runsResumeScope(target), () => {

@@ -47,8 +47,17 @@
  * and `CREWHAUS_EXECUTION_ID`. The value is honoured only when the ledger's
  * newest row for that id, in its newest 256 lines, is `queued` or `preparing`
  * for this execution; then the root's `running` row is written once and every
- * top-level loop names the root as its `parent`. Any other value is ignored
- * with one warning, and the loops' rows use their own ids.
+ * top-level loop names the root as its `parent`. A canonical run id that is not
+ * such a root is ignored with one warning, and the loops' rows use their own
+ * ids. A value that is not shaped like a run id (a workflow's own durable-resume
+ * key, which `target-workflow` documents setting here) is ignored silently.
+ *
+ * What a grant binds to. A park records the run the ledger marks waiting
+ * (`parkingRunIdOf`: the top run, so a park inside a sub-agent binds to the run a
+ * resume continues) and the scope that run was opened in (`resumeScopeOf`), and a
+ * spend reads both again, with `continuesOf`. They answer the same with the ledger
+ * off, from the context alone, which binds a supervised job to its session:
+ * stricter, never weaker.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { statSync } from "node:fs";
@@ -123,6 +132,8 @@ type OpenRun = {
   /** Nested roll-ups (a sub-agent's spend) seen on the bus, by whether they were priced. */
   readonly rollups: { priced: number; unpriced: number };
   readonly stopRollups: () => void;
+  /** The scope its `running` row recorded: what a grant parked in it is bound to. */
+  readonly resumeScope?: string;
   parked: boolean;
   last?: LoopOutcome;
 };
@@ -134,6 +145,8 @@ type RunRowsSlot = {
   release?: () => void;
   /** The run id this loop linked to the open run it descends from. */
   linked?: string;
+  /** Called once, before the release, when the loop's run was cancelled. */
+  onCancel?: { readonly ctx: RunContext; readonly fn: () => Promise<void> };
 };
 
 const slots = new AsyncLocalStorage<RunRowsSlot>();
@@ -168,10 +181,55 @@ export async function withRunRows<T>(opts: object, fn: () => Promise<T>): Promis
     outcome = { threw: true, error: err };
     throw err;
   } finally {
+    // Before the release, which can end the run and forget it: what the hook
+    // reads (`parkingRunIdOf`) must still find the top run.
+    const cancelled = slot.onCancel;
+    if (cancelled !== undefined && isCancelReason(cancelled.ctx.abortSignal)) {
+      try {
+        await cancelled.fn();
+      } catch {
+        // The hook reports its own failure; a cancel never fails the loop.
+      }
+    }
     if (slot.linked !== undefined) descendsFrom.delete(slot.linked);
     if (slot.run !== undefined) slot.run.last = outcome;
     slot.release?.();
   }
+}
+
+/**
+ * Run `fn` once when this loop ends with its run cancelled (`cancelRun`), whether
+ * or not the ledger records: what the run was waiting on is withdrawn there. Only
+ * the current `runChatLoop` invocation's slot holds it; outside one it does nothing.
+ */
+export function onCancelledRun(ctx: RunContext, fn: () => Promise<void>): void {
+  const slot = slots.getStore();
+  if (slot === undefined) return;
+  slot.onCancel = { ctx, fn };
+}
+
+/**
+ * The run a park inside `ctx` is recorded on: the open top run it is or descends
+ * from, else its own. A resume continues this id.
+ */
+export function parkingRunIdOf(ctx: RunContext): string {
+  return openRunOf(ctx.runId)?.runId ?? ctx.runId;
+}
+
+/**
+ * The parked run `ctx`'s top run continues. A child context never inherits
+ * `continues`, so a call inside a sub-agent of a resumed run reads it from the top.
+ */
+export function continuesOf(ctx: RunContext): string | undefined {
+  return openRunOf(ctx.runId)?.ctx.continues ?? ctx.continues;
+}
+
+/**
+ * The scope a grant parked in `ctx` is bound to: the open run's recorded scope,
+ * else the context's own, else the session's.
+ */
+export function resumeScopeOf(ctx: RunContext, sessionId: string): string {
+  return openRunOf(ctx.runId)?.resumeScope ?? ctx.resumeScope ?? `session:${sessionId}`;
 }
 
 /** The open run `runId` is, or descends from. */
@@ -253,6 +311,7 @@ export function openRunRows(args: {
       tracker: createCostTracker(args.bus, { suppressEvents: true }),
       rollups,
       stopRollups: countRollups(args.bus, rollups),
+      ...(resumeScope !== undefined ? { resumeScope } : {}),
       parked: false,
     };
     openRuns.set(ctx.runId, run);
@@ -434,7 +493,15 @@ function runCost(run: OpenRun): { readonly usdMicros: number | null; readonly un
   return { usdMicros, unpriced };
 }
 
-function ledgerRoot(opts: RunRowsLoopOptions, harnessRoot: string | null | undefined): string {
+/**
+ * The harness root a loop's control records live under: `runLedgerDir` when it is
+ * a string, else the root the settings load reads, else the working directory.
+ * The run ledger and the approver projection a spend reads are both found here.
+ */
+export function ledgerRoot(
+  opts: RunRowsLoopOptions,
+  harnessRoot: string | null | undefined,
+): string {
   if (typeof opts.runLedgerDir === "string") return opts.runLedgerDir;
   if (typeof harnessRoot === "string") return harnessRoot;
   return process.cwd();
@@ -489,6 +556,12 @@ function verifiedRoot(ledger: Ledger, logger: Logger): VerifiedRoot | undefined 
   const key = `${ledger.root}\u0000${named}\u0000${execution}`;
   const known = verifiedRoots.get(key);
   if (known !== undefined) return known ?? undefined;
+  // Not shaped like a run id: another tool's own key (a workflow's durable-resume
+  // key), never a root a supervisor queued. Ignored without a word.
+  if (!CANONICAL_RUN_ID_RE.test(named)) {
+    verifiedRoots.set(key, null);
+    return undefined;
+  }
   const root = acceptRoot(ledger, named, execution);
   verifiedRoots.set(key, root ?? null);
   if (root === undefined) {

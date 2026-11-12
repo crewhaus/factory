@@ -15,7 +15,12 @@
  */
 import { existsSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { CANONICAL_RUN_ID_RE, type CursorPosition, type Trigger } from "@crewhaus/control-contract";
+import {
+  CANONICAL_RUN_ID_RE,
+  type CursorPosition,
+  type Trigger,
+  parseResumeScope,
+} from "@crewhaus/control-contract";
 import {
   type Ledger,
   controlPaths,
@@ -82,9 +87,20 @@ export type RunsResumeTarget = {
   readonly sessionId: string;
   /** The newest parked run of that session, which the resumed run continues. */
   readonly continues?: string;
+  /**
+   * The scope that parked run was recorded in, when it has one: the resumed run
+   * re-enters it, so a grant asked there (a supervised job's root, a work item,
+   * a batch job or a lane) covers the resumed call.
+   */
+  readonly resumeScope?: string;
 };
 
-type RunningRow = { readonly id: string; readonly session?: string; readonly parent?: string };
+type RunningRow = {
+  readonly id: string;
+  readonly session?: string;
+  readonly parent?: string;
+  readonly resumeScope?: string;
+};
 
 /**
  * Every run's `running` row, newest first. Read whole, following every page:
@@ -111,6 +127,9 @@ function runningRows(ledger: Ledger, dir: string): RunningRow[] {
         id,
         ...(typeof row["session"] === "string" ? { session: row["session"] } : {}),
         ...(typeof row["parent"] === "string" ? { parent: row["parent"] } : {}),
+        ...(typeof row["resumeScope"] === "string" && parseResumeScope(row["resumeScope"]) !== null
+          ? { resumeScope: row["resumeScope"] }
+          : {}),
       });
     }
     if (page.next === undefined) return rows;
@@ -123,13 +142,22 @@ function newestParked(
   ledger: Ledger,
   rows: readonly RunningRow[],
   sessionId: string,
-): string | undefined {
+): RunningRow | undefined {
   const fold = foldStates(ledger);
   if (!fold.ok) return undefined;
   return rows.find(
     (row) =>
       row.session === sessionId && fold.objects.get(row.id)?.state === "waiting-for-approval",
-  )?.id;
+  );
+}
+
+/** What a resume of `sessionId` continues, and the scope it re-enters. */
+function resumeOf(sessionId: string, parked: RunningRow | undefined): RunsResumeTarget {
+  return {
+    sessionId,
+    ...(parked !== undefined ? { continues: parked.id } : {}),
+    ...(parked?.resumeScope !== undefined ? { resumeScope: parked.resumeScope } : {}),
+  };
 }
 
 /**
@@ -156,8 +184,7 @@ export function resolveRunsResumeTarget(id: string, harnessDir: string): RunsRes
     } catch {
       return { sessionId: id };
     }
-    const parked = newestParked(ledger, rows, id);
-    return { sessionId: id, ...(parked !== undefined ? { continues: parked } : {}) };
+    return resumeOf(id, newestParked(ledger, rows, id));
   }
   if (!isRunsRunId(id)) {
     throw new RunsError(`invalid id "${id}": expected a session (sess_<16 hex>) or a run id`);
@@ -171,17 +198,21 @@ export function resolveRunsResumeTarget(id: string, harnessDir: string): RunsRes
       `no run record in ${dir} has run ${id}. Run from the harness directory the run belongs to.`,
     );
   }
-  const parked = newestParked(ledger, rows, sessionId);
-  return { sessionId, ...(parked !== undefined ? { continues: parked } : {}) };
+  return resumeOf(sessionId, newestParked(ledger, rows, sessionId));
 }
 
-/** The run scope a resumed run runs in: started by a resume, continuing the parked run. */
+/**
+ * The run scope a resumed run runs in: started by a resume, continuing the parked
+ * run, in the scope that run was recorded in.
+ */
 export function runsResumeScope(target: RunsResumeTarget): {
   readonly trigger: Trigger;
   readonly continues?: string;
+  readonly resumeScope?: string;
 } {
   return {
     trigger: { kind: "resume" },
     ...(target.continues !== undefined ? { continues: target.continues } : {}),
+    ...(target.resumeScope !== undefined ? { resumeScope: target.resumeScope } : {}),
   };
 }

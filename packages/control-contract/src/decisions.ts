@@ -7,11 +7,11 @@
  * Bad input never throws. It answers the safe way: a time that cannot be read
  * counts as passed, and a check that cannot be made refuses.
  */
-import { OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
+import { OPERATOR_SUPERSEDE_REASONS, VERIFY_REASONS } from "./areas/core.js";
 import { MODULES, type ModuleField } from "./areas/index.js";
 import type { Role } from "./areas/types.js";
 import type { DecisionState } from "./machines.js";
-import { parseActor } from "./refs.js";
+import { parseActor, parseResumeScope } from "./refs.js";
 import { deepFreeze } from "./util.js";
 
 // ---------------------------------------------------------------------------
@@ -211,7 +211,11 @@ export type DecisionOverlays = {
   };
 };
 
-/** The harness-local copy of who may decide. Local actors are never projected. */
+/**
+ * The harness-local copy of who may decide. Local actors are never projected. A
+ * member with `until` counts only before that instant: the file is rewritten when
+ * access changes, so the time travels with it and a reader needs nothing else.
+ */
 export type ApproverProjection = {
   readonly v: 1;
   readonly epoch: number;
@@ -222,6 +226,8 @@ export type ApproverProjection = {
   readonly members: readonly {
     readonly principal: string;
     readonly decide: DecisionClass;
+    /** When this member's authority ends (ISO). Absent: it does not end on its own. */
+    readonly until?: string;
   }[];
   readonly links: readonly {
     readonly external: string;
@@ -308,20 +314,7 @@ export function effectiveDecisionState(
 // verifyDecision
 // ---------------------------------------------------------------------------
 
-export const VERIFY_REASONS = deepFreeze([
-  "not-a-grant",
-  "consumed",
-  "superseded",
-  "expired",
-  "scope-mismatch",
-  "run-mismatch",
-  "revision-changed",
-  "resource-changed",
-  "places-changed",
-  "decider-not-authorized",
-  "approvers-unreadable",
-  "decider-unverified",
-] as const);
+export { VERIFY_REASONS };
 
 export type VerifyReason = (typeof VERIFY_REASONS)[number];
 
@@ -355,16 +348,42 @@ export type VerifyVerdict =
       readonly reason: VerifyReason;
       /** Whether the caller records the grant as superseded before asking again. */
       readonly supersede: boolean;
+      /** The reason the supersede records, when `supersede` is true. */
+      readonly supersedeReason?: SupersedeReason;
       readonly detail?: string;
     };
 
 const OK: VerifyVerdict = Object.freeze({ ok: true });
 
-function refuse(reason: VerifyReason, detail?: string): VerifyVerdict {
+/**
+ * Whether a refusal also retires the grant, and why. A grant whose revisions moved
+ * can never be spent again, and neither can one whose decider has lost the right to
+ * decide it: both are superseded, so the request asked in its place is the one a
+ * person decides. Every other refusal leaves the grant as it is, since what it
+ * found (a scope, a place, a list that cannot be read) can change back.
+ */
+function supersedeReasonOf(
+  record: DecisionRecordView,
+  reason: VerifyReason,
+): SupersedeReason | undefined {
+  if (reason === "revision-changed") return "revision-changed";
+  if (
+    reason === "decider-not-authorized" &&
+    record.resolvedBy !== "policy" &&
+    parseActor(record.decidedByPrincipal)?.form === "principal"
+  ) {
+    return "decider-revoked";
+  }
+  return undefined;
+}
+
+function refuse(record: DecisionRecordView, reason: VerifyReason, detail?: string): VerifyVerdict {
+  const supersedeReason = supersedeReasonOf(record, reason);
   return {
     ok: false,
     reason,
-    supersede: reason === "revision-changed",
+    supersede: supersedeReason !== undefined,
+    ...(supersedeReason === undefined ? {} : { supersedeReason }),
     ...(detail === undefined ? {} : { detail }),
   };
 }
@@ -385,41 +404,61 @@ function knownSupersedeReason(reason: unknown): string | undefined {
     : undefined;
 }
 
-/** A principal's current authority, read from a present projection. */
-function principalMayDecide(
-  principal: string,
+/** Whether a member's `until` has passed. Absent never passes; one that cannot be read has. */
+function untilPassed(until: unknown, now: number): boolean {
+  if (until === undefined) return false;
+  const ends = parseTime(until);
+  return ends === undefined || !Number.isFinite(now) || now >= ends;
+}
+
+/**
+ * Whether `principal` may decide at `requiredClass` now, by a present projection:
+ * the owner always may; a member may while its class allows it and its `until`,
+ * if it has one, has not passed. A member whose `until` cannot be read does not count.
+ */
+export function memberMayDecide(
   projection: ApproverProjection,
-  required: unknown,
+  principal: string,
+  requiredClass: unknown,
+  now: number,
 ): boolean {
+  if (typeof projection !== "object" || projection === null) return false;
   if (projection.owner === principal) return true;
-  const members: readonly { principal: string; decide: string }[] = Array.isArray(
+  const members: readonly { principal: string; decide: string; until?: unknown }[] = Array.isArray(
     projection.members,
   )
     ? projection.members
     : [];
   return members.some(
-    (member) => member?.principal === principal && classAllows(member?.decide, required),
+    (member) =>
+      member?.principal === principal &&
+      classAllows(member?.decide, requiredClass) &&
+      !untilPassed(member?.until, now),
   );
 }
 
-function verifyDecider(record: DecisionRecordView, approvers: VerifyApprovers): VerifyVerdict {
+function verifyDecider(
+  record: DecisionRecordView,
+  approvers: VerifyApprovers,
+  now: number,
+): VerifyVerdict {
   const decider = parseActor(record.decidedByPrincipal);
   // Service principals and system actors never decide on their own authority,
   // and a grant is never what a fallback applies.
   if (decider?.form === "system" || record.resolvedBy === "policy") {
-    return refuse("decider-not-authorized");
+    return refuse(record, "decider-not-authorized");
   }
   if (approvers?.state === "absent") return OK;
-  if (approvers?.state !== "present") return refuse("approvers-unreadable");
+  if (approvers?.state !== "present") return refuse(record, "approvers-unreadable");
   if (typeof approvers.projection !== "object" || approvers.projection === null) {
-    return refuse("approvers-unreadable");
+    return refuse(record, "approvers-unreadable");
   }
   if (decider?.form === "principal") {
     // Only an absent class defaults. One that is present and unreadable refuses all but the owner.
     const required = record.requiredClass === undefined ? "operator" : record.requiredClass;
-    return principalMayDecide(decider.id, approvers.projection, required)
+    return memberMayDecide(approvers.projection, decider.id, required, now)
       ? OK
-      : refuse("decider-not-authorized");
+      : refuse(record, "decider-not-authorized");
   }
   // No principal, or an unlinked local actor: free text carries no authority, so
   // it passes only when decided before this harness was governed.
@@ -429,7 +468,7 @@ function verifyDecider(record: DecisionRecordView, approvers: VerifyApprovers): 
   if (legacy && decidedAt !== undefined && governedSince !== undefined) {
     if (decidedAt < governedSince) return OK;
   }
-  return refuse("decider-unverified");
+  return refuse(record, "decider-unverified");
 }
 
 /**
@@ -437,53 +476,65 @@ function verifyDecider(record: DecisionRecordView, approvers: VerifyApprovers): 
  * It reads no ledger, so turning run tracking off cannot weaken it. Current policy
  * and the pre-tool hook stay the runtime's own check. Any refusal leaves the grant
  * unspent, and the answer is always to ask again.
+ *
+ * The scope is the binding. A scope that a re-delivery, a lane tick or a
+ * conversation's next message re-enters is the binding on its own: each of those
+ * is a new run, and the grant was given for the work, not for one run of it. A
+ * supervised job's root scope (`run:<root>`) also needs the parking run or the
+ * run that continues it, so only a resume of that job spends its grant.
  */
 export function verifyDecision(input: VerifyDecisionInput): VerifyVerdict {
   const { decision: record, overlays, consumer, approvers, now } = input;
 
-  if (typeof record !== "object" || record === null) return refuse("not-a-grant");
-  if (record.decision !== "grant") return refuse("not-a-grant");
-  if (record.consumedAt !== undefined) return refuse("consumed");
-  if (record.supersededBy !== undefined) {
-    return refuse("superseded", knownSupersedeReason(record.supersededReason));
+  if (typeof record !== "object" || record === null) {
+    return { ok: false, reason: "not-a-grant", supersede: false };
   }
-  if (effectiveDecisionState(record, overlays, now).state === "expired") return refuse("expired");
+  if (record.decision !== "grant") return refuse(record, "not-a-grant");
+  if (record.consumedAt !== undefined) return refuse(record, "consumed");
+  if (record.supersededBy !== undefined) {
+    return refuse(record, "superseded", knownSupersedeReason(record.supersededReason));
+  }
+  if (effectiveDecisionState(record, overlays, now).state === "expired") {
+    return refuse(record, "expired");
+  }
 
-  if (typeof consumer !== "object" || consumer === null) return refuse("scope-mismatch");
-  if (!isText(consumer.resumeScope)) return refuse("scope-mismatch");
+  if (typeof consumer !== "object" || consumer === null) return refuse(record, "scope-mismatch");
+  if (!isText(consumer.resumeScope)) return refuse(record, "scope-mismatch");
   const binding = record.binding;
   if (binding === undefined) {
     // Parked before grants were bound: bound to its session, with no run check.
     if (!isText(record.sessionId) || consumer.resumeScope !== `session:${record.sessionId}`) {
-      return refuse("scope-mismatch");
+      return refuse(record, "scope-mismatch");
     }
   } else {
-    if (typeof binding !== "object" || binding === null) return refuse("scope-mismatch");
+    if (typeof binding !== "object" || binding === null) return refuse(record, "scope-mismatch");
     if (!isText(binding.resumeScope) || !isText(binding.sessionId)) {
-      return refuse("scope-mismatch");
+      return refuse(record, "scope-mismatch");
     }
-    if (consumer.resumeScope !== binding.resumeScope) return refuse("scope-mismatch");
-    if (!isText(binding.runId) || !isText(consumer.runId)) return refuse("run-mismatch");
-    if (consumer.runId !== binding.runId && consumer.continues !== binding.runId) {
-      return refuse("run-mismatch");
+    if (consumer.resumeScope !== binding.resumeScope) return refuse(record, "scope-mismatch");
+    if (parseResumeScope(binding.resumeScope)?.kind === "run") {
+      if (!isText(binding.runId) || !isText(consumer.runId)) return refuse(record, "run-mismatch");
+      if (consumer.runId !== binding.runId && consumer.continues !== binding.runId) {
+        return refuse(record, "run-mismatch");
+      }
     }
     if (
       differs(binding.deploymentId, consumer.deploymentId) ||
       differs(binding.specHash, consumer.specHash)
     ) {
-      return refuse("revision-changed");
+      return refuse(record, "revision-changed");
     }
     // Only an explicit `false` unbinds the resource: a flag that is missing or torn still checks.
     if (
       binding.resourceRevisionBound !== false &&
       (!isText(binding.resourceRevision) || binding.resourceRevision !== consumer.resourceRevision)
     ) {
-      return refuse("resource-changed");
+      return refuse(record, "resource-changed");
     }
     if (!isText(binding.placesDigest) || binding.placesDigest !== consumer.placesDigest) {
-      return refuse("places-changed");
+      return refuse(record, "places-changed");
     }
   }
 
-  return verifyDecider(record, approvers);
+  return verifyDecider(record, approvers, now);
 }

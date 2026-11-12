@@ -214,6 +214,17 @@ async function runSingleTurn(
   };
 }
 
+/**
+ * The session a parked approval was asked in. A grant is spent only in the scope
+ * it was asked in (a conversation here), so a resume re-enters that session, as
+ * `crewhaus runs resume <session>` and a channel's next message do.
+ */
+async function parkedSession(approvalId: string): Promise<string> {
+  const parked = (await store.list()).find((a) => a.id === approvalId);
+  if (parked === undefined) throw new Error(`no parked approval ${approvalId}`);
+  return parked.sessionId;
+}
+
 // ---------------------------------------------------------------------------
 // G11 — headless parking / resume.
 // ---------------------------------------------------------------------------
@@ -270,12 +281,14 @@ describe("G11 — pending-approval parking (headless ask, ask_mode: pause)", () 
     // Out-of-band grant (the CLI/Slack verb path).
     await store.resolve(requested.approvalId, "grant", "tester");
 
-    // Phase 2 — a fresh run re-issues the same call and finds the grant.
+    // Phase 2 — a fresh run in the same conversation re-issues the same call
+    // and finds the grant.
     const executed: unknown[] = [];
     const second = await runSingleTurn({
       _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 7 })], [text("done")]]).adapter,
       tools: [dangerTool((i) => executed.push(i))],
       approvals: { store },
+      _sessionId: await parkedSession(requested.approvalId),
     });
     expect(second.caught).toBeUndefined();
     expect(second.result).toBe("done");
@@ -291,24 +304,23 @@ describe("G11 — pending-approval parking (headless ask, ask_mode: pause)", () 
   });
 
   test("a spent grant re-parks an identical later call (one-shot)", async () => {
-    const park = async () =>
+    const park = async (_sessionId?: string) =>
       runSingleTurn({
         _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 3 })], [text("done")]]).adapter,
         tools: [dangerTool()],
         approvals: { store },
+        ...(_sessionId !== undefined ? { _sessionId } : {}),
       });
     const first = await park();
     const req = first.events.find((e) => e.kind === "approval_requested");
     if (req?.kind !== "approval_requested") throw new Error("expected a park");
     await store.resolve(req.approvalId, "grant", "tester");
+    const sessionId = await parkedSession(req.approvalId);
     // Consume the grant.
-    await runSingleTurn({
-      _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 3 })], [text("done")]]).adapter,
-      tools: [dangerTool()],
-      approvals: { store },
-    });
-    // A THIRD identical call must re-park (grant spent).
-    const third = await park();
+    const second = await park(sessionId);
+    expect(second.caught).toBeUndefined();
+    // A THIRD identical call in the same conversation must re-park (grant spent).
+    const third = await park(sessionId);
     expect(third.caught).toBeInstanceOf(RunFailedError);
     expect(third.events.some((e) => e.kind === "approval_requested")).toBe(true);
   });
@@ -371,6 +383,7 @@ describe("G11 — pending-approval parking (headless ask, ask_mode: pause)", () 
       tools: [gatedDanger((i) => executed.push(i))],
       approvals: { store },
       justificationJudge: judge,
+      _sessionId: await parkedSession(req.approvalId),
     });
     expect(second.caught).toBeUndefined();
     expect(second.result).toBe("done");
@@ -396,6 +409,7 @@ describe("G11 — pending-approval parking (headless ask, ask_mode: pause)", () 
       _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 9 })], [text("done")]]).adapter,
       tools: [dangerTool((i) => executed.push(i))],
       approvals: { store },
+      _sessionId: await parkedSession(req.approvalId),
     });
     expect(second.caught).toBeUndefined();
     expect(second.result).toBe("done");
@@ -714,6 +728,7 @@ describe("#383 — standing grants and .crewhaus/settings.json rules", () => {
       _adapter: scriptedAdapter([[use("tu_1", "danger", { x: 4 })], [text("done")]]).adapter,
       tools: [dangerTool((i) => executed.push(i))],
       approvals: { store },
+      _sessionId: await parkedSession(req.approvalId),
     });
     expect(second.caught).toBeUndefined();
     expect(executed).toEqual([{ x: 4 }]);

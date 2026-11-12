@@ -135,7 +135,10 @@ export function formatApprovalDetail(
   if (a.decidedBy !== undefined) row("decidedBy", a.decidedBy);
   if (a.decidedAt !== undefined) row("decidedAt", a.decidedAt);
   if (a.consumedAt !== undefined) row("consumedAt", a.consumedAt);
-  if (a.supersededBy !== undefined) {
+  if (a.supersededBy !== undefined && a.supersededReason === "run-cancelled") {
+    // Withdrawn, not replaced: nothing waits in its place.
+    row("withdrawn", `run ${a.supersededBy} was cancelled`);
+  } else if (a.supersededBy !== undefined) {
     const why = a.supersededReason !== undefined ? ` (${a.supersededReason})` : "";
     row("replacedBy", `${a.supersededBy}${why}`);
   }
@@ -223,12 +226,26 @@ export function listedApprovals(
  * and the one verb that changes a decision before it is used.
  */
 export function alreadyDecidedMessage(id: string, winner: PendingApproval): string {
+  const withdrawn = withdrawnMessage(id, winner);
+  if (withdrawn !== undefined) return withdrawn;
   if (winner.supersededBy !== undefined) {
     return `${id} was replaced by ${winner.supersededBy}; decide that one instead: crewhaus approvals grant|deny ${winner.supersededBy}`;
   }
   if (winner.consumedAt !== undefined) return `${id} was already granted and used`;
   const was = winner.decision === "deny" ? "denied" : "granted";
   return `${id} was already ${was}; to change it before it is used: crewhaus approvals supersede ${id} --reason <code>`;
+}
+
+/**
+ * Why a request withdrawn because its run was cancelled cannot be decided or
+ * replaced, or `undefined` for any other record. It names no verb: nothing waits
+ * in its place, and its `supersededBy` is a run, not a request.
+ */
+export function withdrawnMessage(id: string, record: PendingApproval): string | undefined {
+  if (record.supersededBy === undefined || record.supersededReason !== "run-cancelled") {
+    return undefined;
+  }
+  return `${id} was withdrawn when its run was cancelled; there is nothing to decide`;
 }
 
 /** An invalid `--reason`, with the codes the verb takes. */

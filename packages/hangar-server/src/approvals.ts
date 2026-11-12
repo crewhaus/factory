@@ -241,6 +241,9 @@ export function refusedDecisionMessage(
   approval: PendingApproval,
 ): string {
   if (outcome === "expired") return "This request has expired.";
+  if (approval.supersededBy !== undefined && approval.supersededReason === "run-cancelled") {
+    return "This request was withdrawn: its run was cancelled.";
+  }
   if (approval.supersededBy !== undefined) return "This request was replaced by a newer one.";
   if (approval.consumedAt !== undefined) return "This request was already used.";
   if (approval.decision === "grant") return "This request was already granted.";

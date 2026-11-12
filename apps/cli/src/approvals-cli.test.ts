@@ -9,10 +9,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PendingApproval } from "@crewhaus/session-store";
 import {
+  alreadyDecidedMessage,
   approvalStatus,
   formatApprovalAge,
   formatApprovalDetail,
   formatApprovalsTable,
+  withdrawnMessage,
 } from "./approvals-cli";
 
 function approval(overrides: Partial<PendingApproval> = {}): PendingApproval {
@@ -107,6 +109,29 @@ describe("formatApprovalDetail", () => {
     expect(out).toContain("deferred:   until 2026-07-18T09:00:00.000Z");
     expect(out).toContain("2 later lines tried to change this decision and were ignored");
     expect(formatApprovalDetail(approval())).not.toContain("ignored");
+  });
+
+  test("a request withdrawn because its run was cancelled says so, and names no request to decide", () => {
+    const run = "run_01m7703cs8jjkenyccysbb1s7v";
+    const withdrawn = approval({
+      decision: "grant",
+      supersededBy: run,
+      supersededReason: "run-cancelled",
+    });
+    const out = formatApprovalDetail(withdrawn);
+    expect(out).toContain(`withdrawn:  run ${run} was cancelled`);
+    expect(out).not.toContain("replacedBy");
+    const message = alreadyDecidedMessage(withdrawn.id, withdrawn);
+    expect(message).toContain("withdrawn when its run was cancelled");
+    expect(message).not.toContain("crewhaus approvals");
+    expect(message).not.toContain(run);
+    expect(withdrawnMessage(withdrawn.id, withdrawn)).toBe(message);
+    // A replaced request still names the one to decide instead.
+    const replaced = approval({ supersededBy: "appr_00000000000000f1", supersededReason: "other" });
+    expect(withdrawnMessage(replaced.id, replaced)).toBeUndefined();
+    expect(alreadyDecidedMessage(replaced.id, replaced)).toContain(
+      "crewhaus approvals grant|deny appr_00000000000000f1",
+    );
   });
 
   test("notes a missing input", () => {
@@ -286,6 +311,27 @@ describe("crewhaus approvals (CLI)", () => {
     const again = await runCli(["approvals", "supersede", ID, "--reason", "other"]);
     expect(again.exitCode).toBe(1);
     expect(again.stderr).toContain("cannot be replaced");
+  }, 20_000);
+
+  test("a request withdrawn by its run's cancel: grant and supersede refuse it, and name no verb", async () => {
+    await seedApproval(ID);
+    const { createPendingApprovalStore } = await import("@crewhaus/session-store");
+    const { mintRunId } = await import("@crewhaus/control-contract");
+    const store = createPendingApprovalStore({ rootDir: join(cwd, ".crewhaus", "sessions") });
+    const run = mintRunId();
+    expect(
+      (await store.supersedeRun([run, "run_1"], { reason: "run-cancelled" })).superseded,
+    ).toEqual([ID]);
+    const shown = await runCli(["approvals", "show", ID]);
+    expect(shown.stdout).toContain(`withdrawn:  run ${run} was cancelled`);
+    const granted = await runCli(["approvals", "grant", ID]);
+    expect(granted.exitCode).toBe(1);
+    expect(granted.stderr).toContain("withdrawn when its run was cancelled");
+    expect(granted.stderr).not.toContain("approvals grant|deny");
+    const replaced = await runCli(["approvals", "supersede", ID, "--reason", "other"]);
+    expect(replaced.exitCode).toBe(1);
+    expect(replaced.stderr).toContain("withdrawn when its run was cancelled");
+    expect(replaced.stderr).not.toContain(run);
   }, 20_000);
 
   test("defer marks a waiting request, and refuses a time without an offset", async () => {
