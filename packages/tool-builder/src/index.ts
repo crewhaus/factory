@@ -334,7 +334,7 @@ function checkOpenings(
     if (opening === null || typeof opening !== "object") {
       fail(`${where} must be an object like { path: ".crewhaus/settings.json" }`);
     }
-    const { path, beneath } = opening;
+    const { path, beneath, selfChecked } = opening;
     if (typeof path !== "string" || path === "") fail(`${where}.path must name a file or store`);
     if (
       /^([\\/]|[A-Za-z]:)/.test(path) ||
@@ -347,7 +347,21 @@ function checkOpenings(
     if (beneath !== undefined && beneath !== "all" && beneath !== "visible") {
       fail(`${where}.beneath is "all", "visible" or left out`);
     }
-    out.push(Object.freeze({ path, ...(beneath !== undefined ? { beneath } : {}) }));
+    if (selfChecked !== undefined) {
+      if (selfChecked !== true) fail(`${where}.selfChecked is either true or left out`);
+      if (beneath !== undefined) {
+        fail(
+          `${where}.selfChecked: only a file the tool checks against the floor itself, not a store it walks`,
+        );
+      }
+    }
+    out.push(
+      Object.freeze({
+        path,
+        ...(beneath !== undefined ? { beneath } : {}),
+        ...(selfChecked === true ? { selfChecked } : {}),
+      }),
+    );
   }
   return Object.freeze(out);
 }

@@ -42,7 +42,7 @@
  * improvement.
  */
 import type { Grader } from "@crewhaus/eval-grader";
-import { sampleAbstained } from "./slices";
+import { sampleAbstained, sampleWithoutVerdict } from "./slices";
 import type { SampleResult } from "./types";
 
 /** The registry name this pack registers under. */
@@ -115,9 +115,10 @@ export function detectParaphraseConsistency(
   for (const s of samples) {
     const group = s.metadata?.[PARAPHRASE_GROUP_METADATA_KEY];
     if (typeof group !== "string") continue;
-    // Usable verdicts only: an errored sample is infra noise and an
-    // abstained one is an unknown — neither is a verdict to agree with.
-    if (s.error !== undefined || sampleAbstained(s)) continue;
+    // Usable verdicts only: an errored sample is infra noise, and an
+    // abstained, not-measured, skipped or observing one has no verdict to
+    // agree with.
+    if (s.error !== undefined || sampleAbstained(s) || sampleWithoutVerdict(s)) continue;
     const verdicts = groups.get(group);
     if (verdicts !== undefined) verdicts.push(s.grades.overall.passed);
     else groups.set(group, [s.grades.overall.passed]);

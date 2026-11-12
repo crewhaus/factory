@@ -20,7 +20,7 @@ tools:
 
 | Tool | What it does |
 |---|---|
-| `RouteControl` | Read the reward scoreboard and its lanes; freeze or unfreeze the learned policy; promote observe-only lane evidence into the live arms; compact the store |
+| `RouteControl` | Read the reward scoreboard and its lanes; freeze or unfreeze the learned policy (refused while the freeze marker is on the runtime-state floor, where `crewhaus route freeze` sets and clears it); promote observe-only lane evidence into the live arms; compact the store |
 | `ExperimentLedger` | Assign a request key to a spec-version variant, record outcomes, and fold the ledger into per-version tallies with a winner or an explicit undecided |
 | `FlywheelStatus` | Report the self-improvement loop's scaffolding, its run artifacts, and which dataset rung it would resolve |
 | `WatchmeReport` | Read the observational-learning ledger, its per-window outcomes, and how much of its quality has reached routing |

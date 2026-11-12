@@ -95,7 +95,11 @@ import {
 } from "../packages/runtime-core/src/state-roots";
 import { createPendingApprovalStore } from "../packages/session-store/src/index";
 import { buildTenant, withTenant } from "../packages/tenancy/src/index";
-import type { RegisteredTool } from "../packages/tool-catalog/src/index";
+import {
+  type RegisteredTool,
+  hasSelfCheckedOpening,
+  withoutSelfCheckedOpenings,
+} from "../packages/tool-catalog/src/index";
 import { datasetPut } from "../packages/tool-dataset/src/index";
 import { deployRollback, specPin } from "../packages/tool-deploy/src/index";
 import { clipboardWrite, desktopNotify } from "../packages/tool-desktop/src/index";
@@ -166,6 +170,8 @@ const GATE_DIRS = [
   ".crewhaus/advice",
   // The durable-execution idempotency records.
   ".crewhaus/idempotency",
+  // The proposals staged for a person to adopt.
+  ".crewhaus/proposals",
 ];
 const GATE_FILES = [
   ".crewhaus/environments.json",
@@ -173,6 +179,17 @@ const GATE_FILES = [
   ".crewhaus/retention.json",
   // The knowledge-sync marker.
   ".crewhaus/knowledge.json",
+  // The routing freeze marker, the scope-audit baseline and the security corpus.
+  ".crewhaus/routing/freeze.json",
+  ".crewhaus/scope-audit/baseline.json",
+  ".crewhaus/security-corpus/corpus.json",
+];
+/** The four gate records a run's floor names beside the others above. */
+const ADDED_GATE_RECORDS = [
+  ".crewhaus/proposals",
+  ".crewhaus/routing/freeze.json",
+  ".crewhaus/scope-audit/baseline.json",
+  ".crewhaus/security-corpus/corpus.json",
 ];
 const ENV_FILES = [
   ".env",
@@ -205,6 +222,10 @@ const NEIGHBOURS = [
   "sub/.env",
   "sub/bunfig.toml",
   "config/other.env",
+  ".crewhaus/routing/arms.jsonl",
+  ".crewhaus/scope-audit/2026-01-01.json",
+  ".crewhaus/security-corpus/candidate-rules.json",
+  ".crewhaus/proposals.md",
 ];
 /** Each writer whose field keeps its store in a gate record, and that record. */
 const OWN_STORES: Readonly<Record<string, readonly string[]>> = {
@@ -336,7 +357,10 @@ describe("the write matrix: every writer's path fields, in the spellings a call 
     `${JSON.stringify({ manager: { envFiles: [DECLARED_ENV] } })}\n`,
   );
   const NEW_FILES = [...GATE_FILES, ...ENV_FILES, ...START_CONFIG, DECLARED_ENV];
-  for (const rel of NEW_FILES) writeFileSync(join(ws, rel), "kept\n");
+  for (const rel of NEW_FILES) {
+    mkdirSync(dirname(join(ws, rel)), { recursive: true });
+    writeFileSync(join(ws, rel), "kept\n");
+  }
   symlinkSync(join(".crewhaus", "run"), join(ws, "to-run"));
   symlinkSync(join(".crewhaus", "settings.json"), join(ws, "to-settings"));
   symlinkSync("home", join(ws, "to-home"));
@@ -437,8 +461,11 @@ describe("the write matrix: every writer's path fields, in the spellings a call 
       a.source === true ||
       a.reads === true ||
       (a.readsWhen !== undefined && named(a.readsWhen));
-    const written = declared.filter((a) => !skipped(a));
-    const floorValues = declared.some(skipped) ? (valuesOf(written, input) ?? []) : undefined;
+    // As the runtime reads it: an opening the tool checks itself is left out.
+    const written = declared.filter((a) => !skipped(a)).map(withoutSelfCheckedOpenings);
+    const floorValues = declared.some((a) => skipped(a) || hasSelfCheckedOpening(a))
+      ? (valuesOf(written, input) ?? [])
+      : undefined;
     const operativeValues = valuesOf(declared, input);
     return {
       toolName: entry.name,
@@ -583,6 +610,53 @@ describe("the write matrix: every writer's path fields, in the spellings a call 
         decision: evaluateWithReason(call, mode, builtin, { protectedRoots: ROOTS }).decision,
       }).toEqual({ toolName, input, decision: "allow" });
     }
+  });
+
+  test("the default call of every writer decides the same with and without the four added gate records", () => {
+    // The roots without the four, in every spelling the run gives them.
+    const added = ADDED_GATE_RECORDS.map((rel) => rel.split("/").join(sep));
+    const isAdded = (root: string): boolean =>
+      added.some((rel) => root === rel || root.endsWith(`${sep}${rel}`));
+    const without = ROOTS.filter((root) => !isAdded(root));
+    expect(ROOTS.length - without.length).toBeGreaterThanOrEqual(ADDED_GATE_RECORDS.length);
+    const writers = Object.values(TOOL_REGISTRY).filter((entry) => !entry.readOnly);
+    expect(writers.length).toBeGreaterThanOrEqual(95);
+    const differs: string[] = [];
+    for (const entry of writers) {
+      const declared = entry.operativeArgs ?? [];
+      const input: Record<string, unknown> = {};
+      const skipped = (a: Arg): boolean =>
+        (a.relocates === true && relocatingFieldLeftOut(a, input, RECORD_ROOTS, ROOTS, ws)) ||
+        a.source === true ||
+        a.reads === true;
+      const written = declared.filter((a) => !skipped(a)).map(withoutSelfCheckedOpenings);
+      const floorValues = declared.some((a) => skipped(a) || hasSelfCheckedOpening(a))
+        ? (valuesOf(written, input) ?? [])
+        : undefined;
+      const operativeValues = valuesOf(declared, input);
+      const call: ToolCallContext = {
+        toolName: entry.name,
+        input,
+        ...(operativeValues !== undefined ? { operativeValues } : {}),
+        ...(floorValues !== undefined ? { floorValues } : {}),
+        readOnly: false,
+        destructive: entry.destructive,
+        requiresSandbox: entry.requiresSandbox,
+      };
+      const rules = allowIn(entry.name);
+      const withAdded = evaluateWithReason(call, "auto", rules, { protectedRoots: ROOTS });
+      const withoutAdded = evaluateWithReason(call, "auto", rules, { protectedRoots: without });
+      if (withAdded.decision !== withoutAdded.decision) {
+        differs.push(`${entry.name}: ${withoutAdded.decision} → ${withAdded.decision}`);
+      }
+      if (entry.name === "RouteControl") {
+        expect({ tool: entry.name, decision: withAdded.decision }).toEqual({
+          tool: entry.name,
+          decision: "allow",
+        });
+      }
+    }
+    expect(differs).toEqual([]);
   });
 
   test("CrewHaus's own settings writer still writes the file the floor keeps tools out of", () => {
@@ -2016,6 +2090,53 @@ describe("the records a harness's gates read, its environment files and its star
         expect(readdirSync(join(ws, ".crewhaus", "run"))).toEqual([]);
       });
     });
+  });
+
+  describe("RouteControl beside the freeze marker", () => {
+    const route = (input: Record<string, unknown>, mode: PermissionMode) =>
+      turn(
+        {
+          name: "RouteControl",
+          input: { ...input, justification: "steer this harness's learned model routing" },
+        },
+        [routeControl],
+        allowIn("RouteControl"),
+        mode,
+        tempDir("crewhaus-floor-sessions-"),
+        { justificationJudge: allowAny },
+      );
+    const MARKER = join(".crewhaus", "routing", "freeze.json");
+
+    test("status runs at the default directory under a tool-wide allow", async () => {
+      expect(roots()).toContain(join(ws, MARKER));
+      const r = await route({ action: "status" }, "auto");
+      expect(floorAnswer(r)).toEqual({ decision: "allow", floor: false });
+      expect(r.result ?? "").not.toContain(REFUSED);
+      expect(r.result ?? "").toContain('"status":"ok"');
+    });
+
+    test("promote and compact are not refused for the marker the call declares", async () => {
+      for (const action of ["promote", "compact"]) {
+        const r = await route({ action }, "auto");
+        expect({ action, ...floorAnswer(r) }).toEqual({ action, decision: "allow", floor: false });
+        expect(r.result ?? "").not.toContain(REFUSED);
+      }
+    }, 20_000); // slow by construction: two model turns
+
+    test("freeze is refused in bypass, naming the CLI verbs, and the marker keeps its bytes", async () => {
+      put(MARKER, '{"policyVersion":"pv-0","frozenAt":"2026-01-01T00:00:00.000Z"}\n');
+      const before = readFileSync(join(ws, MARKER), "utf8");
+      for (const input of [
+        { action: "freeze", policyVersion: "pv-1", dryRun: false },
+        { action: "unfreeze", dryRun: false },
+      ]) {
+        const r = await route(input, "bypass");
+        expect(r.decision).toBe("allow");
+        expect(r.result).toContain(REFUSED);
+        expect(r.result).toContain("crewhaus route freeze --clear");
+        expect(readFileSync(join(ws, MARKER), "utf8")).toBe(before);
+      }
+    }, 20_000); // slow by construction: two model turns
   });
 
   describe("CrewHaus's own writers still write what the run's roots hold", () => {

@@ -33,6 +33,7 @@ import {
   baselineKey,
   baselineKeyFor,
   clearBaseline,
+  manualRebaseline,
   pinFromIndexEntry,
   pinRun,
 } from "@crewhaus/eval-report";
@@ -50,6 +51,9 @@ import {
 import { RESULTS_FILENAME } from "./run";
 
 export type PinAction = "show" | "set" | "clear";
+
+/** What a pin this tool writes records as having pinned it. */
+const PIN_CMD = "EvalBaselinePin";
 
 export type PinPlan = {
   readonly action: PinAction;
@@ -80,6 +84,8 @@ function instrumentMoves(previous: BaselineEntry, next: BaselineEntry): string[]
     ["judgeModel", previous.judgeModel, next.judgeModel],
     ["armsDigest", previous.armsDigest, next.armsDigest],
     ["policyVersion", previous.policyVersion, next.policyVersion],
+    ["calibrationDigest", previous.calibrationDigest, next.calibrationDigest],
+    ["pluginsDigest", previous.pluginsDigest, next.pluginsDigest],
   ];
   for (const [field, a, b] of pairs) {
     if (a !== undefined && b !== undefined && a !== b) moves.push(`${field} ${a} -> ${b}`);
@@ -197,7 +203,13 @@ export function planPin(input: PlanInput): Loaded<PinPlan> {
   // spec/dataset/arm strings only select which lineage is being operated on.
   // The pin carries the run's OWN timestamp, not the clock: a result that moves
   // because it was computed twice is not a result.
-  const pinned = pinFromIndexEntry(row, row.ts, { lineageKey: key });
+  // A pin over a different instrument records the re-anchor, as the write
+  // below does.
+  const mark = manualRebaseline(previous, row, PIN_CMD);
+  const pinned = pinFromIndexEntry(row, row.ts, {
+    lineageKey: key,
+    ...(mark !== undefined ? { rebaselined: mark } : {}),
+  });
   if (!pinned.ok) return fail("bad-input", pinned.refusal.reason);
   const verified = verifyRunDir(row);
   if (!verified.ok) return verified;
@@ -306,7 +318,7 @@ export function commitPin(
   }
   try {
     if (plan.action === "set" && plan.next !== undefined && row !== undefined) {
-      const pinned = pinRun(row, row.ts, dir.real, { lineageKey: plan.key });
+      const pinned = pinRun(row, row.ts, dir.real, { lineageKey: plan.key, cmd: PIN_CMD });
       if (!pinned.ok) return fail("bad-input", pinned.refusal.reason);
     } else if (plan.action === "clear" && plan.previous !== undefined) {
       clearBaseline(plan.key, dir.real);

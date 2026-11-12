@@ -1272,7 +1272,11 @@ describe("critic9 — a harness's own records a tool opens inside its directory"
       [
         "RouteControl",
         { action: "status", justification: "permission hardening: read the routing store" },
-        [".crewhaus/routing/arms.jsonl", ".crewhaus/routing/freeze.json"],
+        [
+          ".crewhaus/routing/arms.jsonl",
+          ".crewhaus/routing/freeze.json",
+          ".crewhaus/routing/priors.json",
+        ],
       ],
       ["HooksManage", { action: "list", dir: "managed" }, ["managed/.crewhaus/settings.json"]],
     ];
@@ -1345,6 +1349,40 @@ describe("critic9 — a harness's own records a tool opens inside its directory"
     expect(
       await gate("ApprovalStatus", { dir: "src" }, rules(["alwaysAllow", "ApprovalStatus(src)"])),
     ).toBe("allow");
+  }, 60_000);
+
+  test("a deny or ask on another harness's freeze marker fires on the RouteControl call that writes it", async () => {
+    mkdirSync(join(ws, "fleet", "other"), { recursive: true });
+    const marker = "fleet/other/.crewhaus/routing/freeze.json";
+    const freeze = {
+      action: "freeze",
+      dir: "fleet/other",
+      policyVersion: "v1",
+      justification: "permission hardening: pin another harness's routing",
+    };
+    for (const mode of ["default", "auto"] as const) {
+      const denied = rules(
+        ["alwaysDeny", `RouteControl(${marker})`],
+        ["alwaysAllow", "RouteControl"],
+      );
+      expect({ mode, got: await gate("RouteControl", freeze, denied, mode) }).toEqual({
+        mode,
+        got: "deny",
+      });
+      // Refused before the tool ran: no preview came back.
+      expect(lastResult ?? "").not.toContain('"status"');
+    }
+    const asked = rules(["alwaysAsk", `RouteControl(${marker})`], ["alwaysAllow", "RouteControl"]);
+    expect(await gate("RouteControl", freeze, asked)).toBe("ask");
+    // Control: the same call under a deny about another place runs.
+    const elsewhere = rules(
+      ["alwaysDeny", "RouteControl(fleet/third/.crewhaus/routing/freeze.json)"],
+      ["alwaysAllow", "RouteControl"],
+    );
+    expect(await gate("RouteControl", freeze, elsewhere, "default", { judgeAllows: true })).toBe(
+      "allow",
+    );
+    expect(lastResult ?? "").toContain('"status":"preview"');
   }, 60_000);
 });
 

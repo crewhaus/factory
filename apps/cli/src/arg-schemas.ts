@@ -784,6 +784,11 @@ export const EVAL_SCHEMA: ParseArgsSchema = {
     { name: "max-ttft-ms", takesValue: true },
     { name: "max-turn-latency-ms", takesValue: true },
     { name: "max-barge-in-yield-ms", takesValue: true },
+    // Re-anchor the (spec, dataset) baseline on this run instead of gating it
+    // (`--rebaseline --reason instrument-changed|cases-changed|
+    // baseline-unreadable|reset`); the pin records why.
+    { name: "rebaseline", takesValue: false },
+    { name: "reason", takesValue: true },
     { name: "help", short: "h" },
   ],
 };

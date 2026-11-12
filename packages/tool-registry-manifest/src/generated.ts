@@ -6824,7 +6824,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "routeControl",
     name: "RouteControl",
     description:
-      "Inspect and steer a harness's learned model routing: the per-(routeKey, arm) reward scoreboard, the `route freeze` kill switch, and the promotion of observe-only `q:` / `shadow:` lane evidence into the live arms. Every rate it reports carries a Wilson interval and every mean carries its n, because an arm with three observations is not a better arm than one with three hundred. It REFUSES to promote or compact when the freeze marker exists (the pin is the kill switch) AND when the marker exists but cannot be parsed — a corrupt kill switch is not an absent one, and `promoteLanes`'s own freeze check reads it as absent. A real promotion additionally needs acceptUngated:true, because this tool does not resolve the eval gate `crewhaus route promote` requires. Resetting the scoreboard is deliberately not offered; use `crewhaus route reset`. dryRun defaults to true and changes nothing; the promotion preview is promoteLanes' own dryRun, running the same fold.",
+      "Inspect and steer a harness's learned model routing: the per-(routeKey, arm) reward scoreboard, the `route freeze` kill switch, and the promotion of observe-only `q:` / `shadow:` lane evidence into the live arms. Every rate it reports carries a Wilson interval and every mean its n: three observations do not make a better arm than three hundred. It REFUSES to promote or compact when the freeze marker exists (the pin is the kill switch) AND when the marker exists but cannot be parsed — a corrupt kill switch is not an absent one. A real promotion also needs acceptUngated:true, because this tool does not resolve the eval gate `crewhaus route promote` requires. Resetting the scoreboard is not offered; use `crewhaus route reset`. Freeze and unfreeze are refused while the freeze marker is on the runtime-state floor; use `crewhaus route freeze <policyVersion>` or `--clear`. dryRun defaults to true and changes nothing; the promotion preview runs the same fold.",
     readOnly: false,
     destructive: true,
     scope: "internal",
@@ -6835,7 +6835,13 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
         field: "dir",
         kind: "path",
         default: ".",
-        opens: [{ path: ".crewhaus/routing", beneath: "all" }],
+        opens: [
+          { path: ".crewhaus/routing/arms.jsonl" },
+          { path: ".crewhaus/routing/arms.jsonl.tmp" },
+          { path: ".crewhaus/routing/priors.json" },
+          { path: ".crewhaus/routing/freeze.json", selfChecked: true },
+          { path: ".crewhaus/routing/freeze.json.tmp", selfChecked: true },
+        ],
       },
     ],
     categories: ["routing", "operations"],

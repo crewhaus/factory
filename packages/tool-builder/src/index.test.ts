@@ -450,6 +450,42 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
     });
   });
 
+  test("an opening declared selfChecked is kept as declared, on a file only", () => {
+    const schema = z.object({ dir: z.string().optional() });
+    const build = (opening: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Steer",
+        description: "d",
+        inputSchema: schema,
+        execute: exec,
+        operativeArgs: [
+          {
+            field: "dir",
+            kind: "path",
+            default: ".",
+            opens: [{ path: ".crewhaus/store.json" }, opening],
+          } as OperativeArg,
+        ],
+      });
+    expect(build({ path: ".crewhaus/marker.json", selfChecked: true })().operativeArgs).toEqual([
+      {
+        field: "dir",
+        kind: "path",
+        default: ".",
+        opens: [
+          { path: ".crewhaus/store.json" },
+          { path: ".crewhaus/marker.json", selfChecked: true },
+        ],
+      },
+    ]);
+    expect(build({ path: ".crewhaus/marker.json", selfChecked: false })).toThrow(
+      /opens\[1\]\.selfChecked is either true or left out/,
+    );
+    expect(build({ path: ".crewhaus/store", beneath: "all", selfChecked: true })).toThrow(
+      /opens\[1\]\.selfChecked: only a file the tool checks against the floor itself/,
+    );
+  });
+
   test("hiddenWhen names a boolean that opens a walk that skips hidden names", () => {
     const schema = z.object({
       path: z.string().optional(),

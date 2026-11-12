@@ -100,6 +100,11 @@ function makeSummary(
 }
 
 /** Persist a fabricated run so `loadRun(outDir)` succeeds. */
+/** Write a run directory's `cases.json`: each case id's digest. */
+function writeCaseDigests(outDir: string, digests: Record<string, string>): void {
+  writeFileSync(join(outDir, "cases.json"), JSON.stringify({ version: 1, digests }));
+}
+
 function persistRun(summary: EvalRunSummary): void {
   mkdirSync(summary.outDir, { recursive: true });
   writeFileSync(join(summary.outDir, "results.json"), JSON.stringify(summary, null, 2));
@@ -593,10 +598,10 @@ describe("applyRegressionUnion — eval-side default union", () => {
   });
 });
 
-// -------- item-3 interaction: union restarts the baseline lineage --------
+// -------- item-3 interaction: a union run gates against its primary --------
 
 describe("regression union × run-history baselines (item 3 interaction)", () => {
-  test("a unioned run keys into a NEW baseline lineage; the pre-union baseline survives", async () => {
+  test("a unioned run gates against the primary's pin on the shared cases, then keys its own lineage", async () => {
     const root = newTempRoot();
     const registry = newRegistry(root);
     const evalsDir = join(root, ".crewhaus", "evals");
@@ -610,6 +615,7 @@ describe("regression union × run-history baselines (item 3 interaction)", () =>
       join(root, "runA"),
     );
     persistRun(runA);
+    writeCaseDigests(runA.outDir, { p1: "d-p1", p2: "d-p2" });
     await finishEvalRun({
       summary: runA,
       specName: "concierge",
@@ -639,10 +645,11 @@ describe("regression union × run-history baselines (item 3 interaction)", () =>
     });
     expect(union?.datasetName).toBe("smoke+regressions@v1");
 
-    // Run 2 — the union changed the sample keyset AND the lineage key:
+    // Run 2 — the union added a case AND changed the lineage key:
     // datasetName/datasetHash reflect the union, so the run-history index
-    // keys honestly and the run starts a fresh baseline lineage instead of
-    // diffing (and keyset-erroring) against the pre-union baseline.
+    // keys honestly. With no pin of its own, the run gates against the
+    // primary's pin on the cases both runs share (their digests are equal),
+    // and the added case has no baseline yet.
     const runB = makeSummary(
       "run_bbbb2222bbbb2222",
       [
@@ -654,6 +661,7 @@ describe("regression union × run-history baselines (item 3 interaction)", () =>
       union?.datasetName as string,
     );
     persistRun(runB);
+    writeCaseDigests(runB.outDir, { p1: "d-p1", p2: "d-p2", r1: "d-r1" });
     lines.length = 0;
     const finish = await finishEvalRun({
       summary: runB,
@@ -667,8 +675,10 @@ describe("regression union × run-history baselines (item 3 interaction)", () =>
     });
 
     expect(finish.gateFailed).toBe(false);
+    expect(lines).toContain("[eval] new cases, no baseline yet: r1");
+    expect(lines).toContain("[eval] gate: PASS");
     expect(lines).toContain(
-      "[eval] baseline set: run_bbbb2222bbbb2222 (first run for concierge/smoke+regressions@v1)",
+      "[eval] baseline set: run_bbbb2222bbbb2222 (first run for concierge/smoke+regressions@v1, gated against run_aaaa1111aaaa1111 (concierge/smoke))",
     );
     // New lineage pinned under the union key; the pre-union pin survives.
     expect(getBaseline("concierge", "smoke+regressions@v1", evalsDir)?.runId).toBe(
@@ -684,10 +694,11 @@ describe("regression union × run-history baselines (item 3 interaction)", () =>
     });
   });
 
-  test("counterfactual: a keyset change under an UNCHANGED datasetName restarts the lineage in place", async () => {
-    // This is the "dataset changed — starting new baseline lineage" path the
-    // union would trip if datasetName were NOT suffixed — kept honest here so
-    // a regression in either half of the interaction fails a test.
+  test("counterfactual: a dataset change under an UNCHANGED datasetName with no case digests is not comparable", async () => {
+    // What the union would meet if datasetName were NOT suffixed: the same
+    // lineage, a different dataset, and nothing that shows the shared cases
+    // are unchanged. Kept here so a change in either half of the interaction
+    // fails a test.
     const root = newTempRoot();
     const evalsDir = join(root, ".crewhaus", "evals");
     const lines: string[] = [];
@@ -717,7 +728,7 @@ describe("regression union × run-history baselines (item 3 interaction)", () =>
     );
     persistRun(runB);
     lines.length = 0;
-    await finishEvalRun({
+    const result = await finishEvalRun({
       summary: runB,
       specName: "concierge",
       datasetHash: "b".repeat(64),
@@ -728,8 +739,10 @@ describe("regression union × run-history baselines (item 3 interaction)", () =>
       write,
     });
 
-    expect(lines).toContain("[eval] dataset changed — starting new baseline lineage");
-    expect(getBaseline("concierge", "smoke", evalsDir)?.runId).toBe("run_bbbb2222bbbb2222");
+    expect(result.notComparable).toBe("cases_changed");
+    expect(lines.join("\n")).toContain("not comparable with baseline run_aaaa1111aaaa1111");
+    expect(lines).toContain("[eval] baseline kept: run_aaaa1111aaaa1111");
+    expect(getBaseline("concierge", "smoke", evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
   });
 });
 

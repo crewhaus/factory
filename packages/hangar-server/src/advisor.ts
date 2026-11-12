@@ -37,6 +37,14 @@
  * sources rather than from snapshots a read would have to persist).
  */
 import { appendFileSync, mkdirSync } from "node:fs";
+import {
+  baselineKeyFor,
+  breakBoundaries,
+  buildTrends,
+  lineageOfEntry,
+  segmentSeries,
+  trendSeriesLabel,
+} from "@crewhaus/eval-report";
 import { countOpenIncidents } from "@crewhaus/harness-inventory";
 import { runPreflight } from "@crewhaus/preflight";
 import { pendingApprovalCount } from "./approvals";
@@ -1123,18 +1131,47 @@ export const advisorReopen: M3Handler = (ctx) => {
  * DURABLE sources only (the eval index, the session cost fold, the decisions
  * ledger). No snapshot is persisted by a read; a GET that wrote history
  * would violate the reads-never-mutate covenant for a convenience.
+ *
+ * The eval trend is one lineage's: the lineage of the latest run that
+ * measured something, over the runs that measured something in its last
+ * segment (since the dataset or the measuring instrument last changed). A
+ * delta across lineages or across an instrument change compares different
+ * measurements.
  */
 export const advisorTrend: M3Handler = (ctx) => {
   const dir = requireDir(ctx);
   const evals = evalsView(dir);
-  const evalSeries = [...evals.runs]
-    .sort((a, b) => String(a.ts).localeCompare(String(b.ts)))
+  const runs = [...evals.runs].sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+  const measuredRun = (r: { readonly partial?: boolean; readonly measuredCount?: number }) =>
+    r.partial !== true && r.measuredCount !== 0;
+  const latest = [...runs].reverse().find(measuredRun);
+  const lineageKey = latest !== undefined ? baselineKeyFor(lineageOfEntry(latest)) : undefined;
+  const byRun = new Map(runs.map((r) => [r.runId, r]));
+  const keyOfSeries = (s: { readonly points: ReadonlyArray<{ readonly runId: string }> }) => {
+    const first = byRun.get(s.points[0]?.runId ?? "");
+    return first !== undefined ? baselineKeyFor(lineageOfEntry(first)) : undefined;
+  };
+  const series =
+    lineageKey !== undefined
+      ? buildTrends(runs).find((s) => keyOfSeries(s) === lineageKey)
+      : undefined;
+  const walk = series !== undefined ? segmentSeries(series, runs) : undefined;
+  const boundaries = breakBoundaries(walk?.boundaries ?? []);
+  const lastSegment = walk?.segments[walk.segments.length - 1];
+  const evalSeries = (lastSegment?.points ?? [])
+    .map((p) => byRun.get(p.runId))
+    .filter((r): r is (typeof runs)[number] => r !== undefined && measuredRun(r))
     .map((r) => ({
       runId: r.runId,
       ts: r.ts,
       passRate: r.passRate,
       datasetName: r.datasetName,
     }));
+  const lineage =
+    series !== undefined && lineageKey !== undefined
+      ? // `id`, not `key`: the dispatch masker redacts a field by its name.
+        { id: lineageKey, label: `${series.specName}/${trendSeriesLabel(series)}` }
+      : null;
   const costs = foldHarnessCosts(dir, ctx.now());
   const records = readDecisions(ctx);
   const twoWeeksAgo = ctx.now() - 14 * 86_400_000;
@@ -1154,22 +1191,31 @@ export const advisorTrend: M3Handler = (ctx) => {
     first !== undefined && last !== undefined && evalSeries.length > 1
       ? (num(last.passRate) ?? 0) - (num(first.passRate) ?? 0)
       : null;
+  const since = boundaries.length > 0 ? "since the checks last changed" : undefined;
   const summary =
     evalSeries.length === 0
-      ? "no eval history yet — improvement is unmeasured until a first run lands"
+      ? runs.length === 0
+        ? "no eval history yet — improvement is unmeasured until a first run lands"
+        : "no recorded eval run measured anything yet — improvement is unmeasured until one does"
       : delta === null
-        ? "one eval run recorded — a second run makes this a trend"
+        ? since !== undefined
+          ? `one eval run ${since} — a second run makes this a trend`
+          : "one eval run recorded — a second run makes this a trend"
         : delta > 0.001
-          ? `pass rate is up ${(delta * 100).toFixed(1)} points since the first recorded run`
+          ? `pass rate is up ${(delta * 100).toFixed(1)} points ${since ?? "since the first recorded run"}`
           : delta < -0.001
-            ? `pass rate is down ${(Math.abs(delta) * 100).toFixed(1)} points since the first recorded run`
-            : "pass rate is flat across the recorded runs";
+            ? `pass rate is down ${(Math.abs(delta) * 100).toFixed(1)} points ${since ?? "since the first recorded run"}`
+            : since !== undefined
+              ? `pass rate is flat ${since}`
+              : "pass rate is flat across the recorded runs";
   return {
     ...found(
       "folded from the eval index, the session cost ledger and the advisor's own decisions — nothing here is a stored snapshot",
       launchOffers(dir, ctx.entry?.target).eval.verb,
     ),
     evalSeries,
+    lineage,
+    boundaries,
     spendDays: costs.days,
     decisions,
     summary,

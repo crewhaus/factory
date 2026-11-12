@@ -1187,6 +1187,31 @@ export type JudgeVerdictEvent = TraceEventEnvelope & {
   reason?: "judge_share_exhausted";
 };
 
+/**
+ * Published by the in-loop `evaluation:` machinery when its grader could not
+ * grade a completed turn: the grader threw (a judge provider error, a timeout).
+ * The turn stands ungraded — the runtime fails open on a grader error — and
+ * this event says so, so a reader of the bus can tell an ungraded turn from a
+ * graded one. One event per failed grading pass; no `eval_graded` follows it.
+ */
+export type EvalUnmeasuredEvent = TraceEventEnvelope & {
+  kind: "eval_unmeasured";
+  /** Which gate could not grade: the in-loop `evaluation:` block. */
+  gate: "evaluation";
+  /** Which `evaluation.grader.type` was grading. */
+  graderType: "llm_judge" | "contains" | "regex";
+  /** The block's resolved `max_retries` cap, when known. */
+  maxRetries?: number;
+  /** The judge instrument the grader was bound to (`llm_judge` only). */
+  judgeModel?: string;
+  /** The cascade stage of the attempt being graded, when in a cascade. */
+  stage?: string;
+  /** Why the turn was not graded. */
+  reason: "grader_error";
+  /** The thrown error's `name` (`Error` for a non-Error throw). */
+  errorName: string;
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -1229,6 +1254,7 @@ export type TraceEvent =
   | SanitizerReportEvent
   | AlertRaisedEvent
   | EvalGradedEvent
+  | EvalUnmeasuredEvent
   | JudgeVerdictEvent
   | ProvabilityGradedEvent
   | ProofCheckedEvent;

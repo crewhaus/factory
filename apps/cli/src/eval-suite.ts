@@ -319,6 +319,15 @@ export type EntryAggregates = {
   readonly sampleCount: number;
   /** NEW-HUNT-3 — a budget-aborted run: its aggregates are not a measurement. */
   readonly partial?: boolean;
+  /**
+   * Samples with a verdict about the spec (`aggregates.measured`), when the
+   * run recorded it, or 0 when every sample errored.
+   */
+  readonly measured?: number;
+  /** Samples not measured (`aggregates.notMeasured`), when any. */
+  readonly notMeasured?: number;
+  /** Every sample was only observed: nothing was enforced. */
+  readonly observing?: true;
 };
 
 /**
@@ -334,7 +343,14 @@ export type EntryAggregates = {
 export function entryAggregatesFromResults(raw: unknown): EntryAggregates | undefined {
   if (raw === null || typeof raw !== "object") return undefined;
   const results = raw as {
-    aggregates?: { passRate?: unknown; meanScore?: unknown };
+    aggregates?: {
+      passRate?: unknown;
+      meanScore?: unknown;
+      errorCount?: unknown;
+      measured?: unknown;
+      notMeasured?: unknown;
+      observing?: unknown;
+    };
     samples?: unknown;
     partial?: unknown;
   };
@@ -343,11 +359,32 @@ export function entryAggregatesFromResults(raw: unknown): EntryAggregates | unde
   if (typeof passRate !== "number" || typeof meanScore !== "number") return undefined;
   const partial = results.partial;
   const isPartial = typeof partial === "object" && partial !== null;
+  const samples = Array.isArray(results.samples) ? (results.samples as unknown[]) : [];
+  const sampleCount = samples.length;
+  const errorCount = results.aggregates?.errorCount;
+  const recorded = results.aggregates?.measured;
+  const measured =
+    typeof recorded === "number"
+      ? recorded
+      : typeof errorCount === "number" && sampleCount > 0 && errorCount === sampleCount
+        ? 0
+        : undefined;
+  const notMeasured = results.aggregates?.notMeasured;
+  const statusOf = (s: unknown): unknown =>
+    (s as { grades?: { overall?: { status?: unknown } } } | null)?.grades?.overall?.status;
+  const allObserving =
+    measured === 0 &&
+    typeof results.aggregates?.observing === "object" &&
+    sampleCount > 0 &&
+    samples.every((s) => statusOf(s) === "observing");
   return {
     passRate,
     meanScore,
-    sampleCount: Array.isArray(results.samples) ? results.samples.length : 0,
+    sampleCount,
     ...(isPartial ? { partial: true } : {}),
+    ...(measured !== undefined ? { measured } : {}),
+    ...(typeof notMeasured === "number" ? { notMeasured } : {}),
+    ...(allObserving ? { observing: true as const } : {}),
   };
 }
 
@@ -363,11 +400,18 @@ export type SuiteEntryOutcome = {
   readonly aggregates?: EntryAggregates;
   /** True when the entry did not produce results at all (crash/config). */
   readonly errored: boolean;
+  /**
+   * `observing` when every sample of the entry was only observed: nothing was
+   * enforced, so the entry neither passes nor fails the tier and reads
+   * OBSERVING. Absent otherwise.
+   */
+  readonly state?: "observing";
 };
 
 /** Absolute-threshold evaluation for one entry. A PARTIAL run always fails:
  *  its pass rate is deflated by synthetic errors, so "it cleared the floor"
- *  would be a number nobody can stand behind. */
+ *  would be a number nobody can stand behind. A run that measured nothing
+ *  fails too: its pass rate is about no case. */
 export function evaluateEntryThresholds(
   aggregates: EntryAggregates,
   thresholds: SuiteThresholds | undefined,
@@ -375,6 +419,9 @@ export function evaluateEntryThresholds(
   const failures: string[] = [];
   if (aggregates.partial === true) {
     failures.push("run is PARTIAL (budget exhausted) — an incomplete measurement cannot pass");
+  }
+  if (aggregates.measured === 0) {
+    failures.push("nothing was measured — no case produced a verdict about the spec");
   }
   if (thresholds?.min_pass_rate !== undefined && aggregates.passRate < thresholds.min_pass_rate) {
     failures.push(
@@ -402,8 +449,14 @@ export type SuiteResult = {
   readonly entries: ReadonlyArray<SuiteEntryOutcome>;
 };
 
+/** Whether an entry only observed: every sample observing, nothing measured. */
+export function entryObserving(aggregates: EntryAggregates | undefined): boolean {
+  return aggregates?.observing === true;
+}
+
 /** A tier passes only when EVERY entry passed — the suite verdict is an AND,
- *  because a tier exists to be one required check. */
+ *  because a tier exists to be one required check. An OBSERVING entry enforces
+ *  nothing, so it does not fail the tier. */
 export function aggregateSuite(opts: {
   readonly suiteName: string;
   readonly tier: SuiteTier;
@@ -426,16 +479,26 @@ export function aggregateSuite(opts: {
 /** The suite summary block (stdout + the text half of `suite.json`). */
 export function renderSuiteSummary(result: SuiteResult): string {
   const lines: string[] = [];
+  const observing = result.entries.filter((e) => e.state === "observing").length;
+  const verdict =
+    result.passed && observing > 0 && observing === result.entries.length
+      ? "OBSERVING"
+      : result.passed
+        ? "PASS"
+        : "FAIL";
   lines.push(
-    `[suite] ${result.suiteName} tier=${result.tier}: ${result.passed ? "PASS" : "FAIL"} ` +
-      `(${result.entries.filter((e) => e.passed).length}/${result.entries.length} entries passed)`,
+    `[suite] ${result.suiteName} tier=${result.tier}: ${verdict} ` +
+      `(${result.entries.filter((e) => e.passed && e.state !== "observing").length}/${result.entries.length} entries passed${
+        observing > 0 ? `, ${observing} observing` : ""
+      })`,
   );
   for (const entry of result.entries) {
     const agg =
       entry.aggregates !== undefined
         ? `pass_rate ${(entry.aggregates.passRate * 100).toFixed(1)}%  mean ${entry.aggregates.meanScore.toFixed(3)}  n=${entry.aggregates.sampleCount}`
         : "no results";
-    lines.push(`  ${entry.passed ? "PASS" : "FAIL"}  ${entry.name.padEnd(16)} ${agg}`);
+    const word = entry.state === "observing" ? "OBSERVING" : entry.passed ? "PASS" : "FAIL";
+    lines.push(`  ${word}  ${entry.name.padEnd(16)} ${agg}`);
     for (const failure of entry.failures) lines.push(`        ${failure}`);
   }
   lines.push(`[suite] summary: ${result.outDir}/suite.json`);

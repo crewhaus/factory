@@ -101,8 +101,8 @@ these on: they reach every harness that uses what each one names.
   article and re-apply the edit. An agent's own earlier version is written over
   as before, and a Thredz-backed wiki is not affected.
 
-- **The runtime-state floor also covers the knowledge-sync marker, the
-  idempotency store and the continuity store's own files.** Beside
+- **The runtime-state floor also covers the staged proposals, the routing
+  freeze marker, the scope-audit baseline and the security corpus.** Beside
   `.crewhaus/sessions`, `.crewhaus/tool-results` and `.crewhaus/proofs`, no
   permission rule lets an agent's tool write: `.crewhaus/run` (the runfiles, logs
   and control files a daemon keeps there); the settings file
@@ -110,8 +110,13 @@ these on: they reach every harness that uses what each one names.
   `.crewhaus/approvals`, `.crewhaus/environments.json`, `.crewhaus/graders`,
   `.crewhaus/judge-calibration.json`, `.crewhaus/evals`, `.crewhaus/datasets`,
   `.crewhaus/retention.json`, `.crewhaus/audit`, `.crewhaus/graphs`,
-  `.crewhaus/advice` and the knowledge-sync marker `.crewhaus/knowledge.json`,
-  exactly that file; the durable-execution idempotency records,
+  `.crewhaus/advice`, the knowledge-sync marker `.crewhaus/knowledge.json`,
+  exactly that file, the proposals staged for a person to adopt,
+  `.crewhaus/proposals`, the routing freeze marker
+  `.crewhaus/routing/freeze.json`, the scope-audit baseline
+  `.crewhaus/scope-audit/baseline.json` and the security corpus
+  `.crewhaus/security-corpus/corpus.json`, exactly each of those files; the
+  durable-execution idempotency records,
   `.crewhaus/idempotency` and the directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>`
   names; the continuity store's own files under `.crewhaus/state/<spec>/`,
   `focus.md`, `goals.yaml`, `plans` and `handoff.md`, and the same for each of
@@ -153,8 +158,10 @@ these on: they reach every harness that uses what each one names.
   `.crewhaus/datasets` and `EvalBaselinePin` in `.crewhaus/evals`, still adds to
   it. The floor refuses `HooksManage` on the harness it runs in, and
   `EnvFileUpsert`, `SecretRotate` or `DoctorFix` on those environment files; they
-  work on other files and other harnesses as before. `Bash` and `RunCommand`
-  remain outside what the floor can see. Recompile a daemon to pick this up.
+  work on other files and other harnesses as before. `RouteControl` reads and
+  steers the routing store as before and leaves the freeze marker to
+  `crewhaus route freeze`. `Bash` and `RunCommand` remain outside what the
+  floor can see. Recompile a daemon to pick this up.
 
 - **An approval covers the work it was asked in, and is used once.** A grant
   counts for the call it was asked about, in the conversation, batch job,
@@ -173,6 +180,28 @@ these on: they reach every harness that uses what each one names.
   own words, and a parked run says to continue with `crewhaus runs resume`.
   Requests parked before the upgrade count for their conversation only, so a
   batch job or a scheduled lane parked before it asks once more.
+
+- **`crewhaus eval --gate` fails when a run is not comparable with its
+  baseline.** A changed measuring instrument (the graders config, the judge,
+  the judge calibration, plugin grader code, the routing snapshot or policy),
+  cases removed or changed since the baseline, a baseline run that cannot be
+  read, cases the baseline measured that this run did not, a run that measured
+  nothing and a run stopped at its budget each fail with the reason and the
+  case ids, and the baseline stays as it was. Without `--gate` the same lines
+  are warnings. A run that is not comparable never re-pins on its own:
+  `--rebaseline --reason <code>` re-anchors the baseline, and the pin records
+  it. Cases added since the baseline are listed, and the gate compares the
+  cases both runs share.
+
+- **Provability graders record a case they could not measure as not
+  measured.** With no proof bundle, an answer the verifier could not verify,
+  invalid provability metadata on the case, or a case floor above the
+  bundle's, the result carries that reason, the case is listed under
+  `notMeasured` in `results.json`, and the pass rate leaves it out, as it
+  leaves out an abstained case. A case with a measured failure still fails.
+
+- **A failing in-loop `evaluation:` judge leaves an `eval_unmeasured` trace
+  event.** The turn still stands, ungraded, as it did.
 
 ## [0.8.2] - 2026-11-12
 

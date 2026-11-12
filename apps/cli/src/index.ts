@@ -236,6 +236,7 @@ import {
   formatPairwiseLines,
   formatSignificanceLine,
   formatSliceDeltaLines,
+  formatTrendBoundaryLines,
   formatTrendSummaryLines,
   formatUsd,
   hashDatasetFile,
@@ -248,7 +249,9 @@ import {
   renderTrends,
   rowsToCsv,
   rowsToJsonl,
+  segmentTrends,
   trendTable,
+  trendsJson,
 } from "@crewhaus/eval-report";
 import {
   type EvalRoutingMode,
@@ -896,6 +899,7 @@ import { EvalPlanError, planSampleSize, renderEvalPlan } from "./eval-plan";
 // 0.8.0 §9.1 — the block `eval --provability <level>` measures when the spec
 // parks its provability: block at level: off (lowered to none otherwise).
 import { parkedProvabilityBlock } from "./eval-provability";
+import { parseRebaseline } from "./eval-rebaseline";
 // Item 30 — model-drift sentinel comparison logic, in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
 // import). The fresh run + baseline load happen in index.ts; this decides drift.
@@ -914,6 +918,7 @@ import {
   aggregateSuite,
   buildEntryEvalArgs,
   entryAggregatesFromResults,
+  entryObserving,
   evaluateEntryThresholds,
   parseSuiteManifest,
   parseTierFlag,
@@ -9650,6 +9655,14 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
         );
       }
     }
+    // A voice replay pins no baseline, so there is nothing to re-anchor.
+    for (const flag of ["rebaseline", "reason"] as const) {
+      if (args.flags[flag] !== undefined) {
+        die(
+          `--voice does not support --${flag}: --voice replays recorded call sessions and pins no baseline, so there is nothing to re-anchor`,
+        );
+      }
+    }
     // 0.8.0 §9.1 — likewise: a replayed call session ran no provability gate,
     // so there is no floor to impose and no bundle to grade.
     if (args.flags["provability"] !== undefined) {
@@ -9670,6 +9683,10 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
   const gateRequested = args.flags["gate"] === true;
   const promote = args.flags["no-promote"] !== true;
+  // `--rebaseline --reason <code>`: re-anchor the lineage on this run.
+  const rebaselineParsed = parseRebaseline(args.flags);
+  if (!rebaselineParsed.ok) die(rebaselineParsed.error);
+  const rebaseline = rebaselineParsed.rebaseline;
 
   // Item 30 — model-drift sentinel. --baseline points at the frozen run dir to
   // diff against; incompatible with lineage/matrix flags (a sentinel is a
@@ -10451,6 +10468,9 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     ...(judgeCostUsd !== undefined ? { judgeCostUsd } : {}),
     ...(maxP95LatencyMs !== undefined ? { maxP95LatencyMs } : {}),
     ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
+    // `--rebaseline`: re-anchor instead of gating (the case digests come from
+    // the run directory).
+    ...(rebaseline !== undefined ? { rebaseline } : {}),
   });
   if (finish.gateFailed) {
     const reason = `eval --gate: ${finish.gateReason ?? "regression gate failed"}`;
@@ -10628,6 +10648,9 @@ async function runEvalSuiteCommand(args: ParsedArgs): Promise<void> {
       process.stderr.write(`[suite] entry "${entry.name}" crashed — continuing\n`);
     }
     const aggregates = readEntryAggregates(entryOut, staleAt);
+    // Every sample only observed: nothing was enforced, so the entry reads
+    // OBSERVING and neither passes nor fails the tier.
+    const observing = !errored && entryObserving(aggregates);
     if (aggregates === undefined) {
       errored = true;
       failures.push(
@@ -10635,7 +10658,7 @@ async function runEvalSuiteCommand(args: ParsedArgs): Promise<void> {
           ? "no fresh results.json — the entry produced no measurement (the file in this directory is from an earlier run)"
           : "no results.json — the entry produced no measurement",
       );
-    } else {
+    } else if (!observing) {
       failures.push(...evaluateEntryThresholds(aggregates, entry.thresholds));
     }
     outcomes.push({
@@ -10643,10 +10666,11 @@ async function runEvalSuiteCommand(args: ParsedArgs): Promise<void> {
       dataset: entry.dataset,
       graders: entry.graders,
       outDir: entryOut,
-      passed: failures.length === 0,
-      failures,
+      passed: observing || failures.length === 0,
+      failures: observing ? [] : failures,
       ...(aggregates !== undefined ? { aggregates } : {}),
       errored,
+      ...(observing ? { state: "observing" as const } : {}),
     });
   }
 
@@ -12144,17 +12168,25 @@ function runEvalReportTrends(args: ParsedArgs): void {
   }
   const pinnedRunIds = new Set(Object.values(readBaselines()).map((b) => b.runId));
   const series = buildTrends(entries, { pinnedRunIds });
+  // Each series cut where its dataset or measuring instrument changed.
+  const segmented = segmentTrends(series, entries);
   const { header, rows } = trendTable(series);
   writeTable(header, rows);
-  for (const line of formatTrendSummaryLines(series)) {
+  for (const line of formatTrendSummaryLines(series, segmented)) {
+    process.stdout.write(`[eval-report] ${line}\n`);
+  }
+  for (const line of formatTrendBoundaryLines(series, segmented)) {
     process.stdout.write(`[eval-report] ${line}\n`);
   }
   const outArg = args.flags["out"];
   if (typeof outArg === "string") {
     const absOut = resolve(outArg);
     mkdirSync(absOut, { recursive: true });
-    writeFileSync(join(absOut, "index.html"), renderTrends(series));
-    writeFileSync(join(absOut, "trends.json"), `${JSON.stringify(series, null, 2)}\n`);
+    writeFileSync(join(absOut, "index.html"), renderTrends(series, segmented));
+    writeFileSync(
+      join(absOut, "trends.json"),
+      `${JSON.stringify(trendsJson(series, segmented), null, 2)}\n`,
+    );
     process.stdout.write(`[eval-report] trends: ${join(absOut, "index.html")}\n`);
   }
 }
@@ -12291,8 +12323,15 @@ function runEvalReportBaseline(args: ParsedArgs): void {
       // Carries the spec source, the instrument identity and the lineage columns
       // forward: `setBaseline` keys on the lineage, so a pin that dropped them
       // would clobber the primary's baseline with a cheap candidate's run.
-      const pinned = pinRun(entry, new Date().toISOString());
+      const pinned = pinRun(entry, new Date().toISOString(), undefined, {
+        cmd: "crewhaus eval-report baseline set",
+      });
       if (!pinned.ok) die(`eval-report baseline set: ${pinned.refusal.reason}`);
+      if (pinned.pin.rebaselined !== undefined) {
+        process.stdout.write(
+          `[eval-report] the pin it replaces (${pinned.pin.rebaselined.from ?? "none"}) was measured with a different instrument — this pin records a manual re-anchor\n`,
+        );
+      }
       const armLabel =
         entry.armId ?? (entry.routing !== undefined && entry.routing !== "static" ? "routed" : "");
       process.stdout.write(

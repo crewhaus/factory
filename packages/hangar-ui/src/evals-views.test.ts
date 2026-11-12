@@ -158,6 +158,21 @@ describe("every verdict has a word", () => {
     expect(views.gradeVerdict(undefined, false)).toBe("unknown");
   });
 
+  test("a case without a verdict reads by its state, and only under no verdict", () => {
+    expect(views.verdictFace("not_measured").word).toBe("not measured");
+    expect(views.verdictFace("skipped").word).toBe("skipped");
+    expect(views.verdictFace("observing").word).toBe("observing");
+    const rows = ["pass", "fail", "not_measured", "skipped", "observing"].map((v) => row(v));
+    expect(views.filterRows(rows, "fail").map((r: { verdict: string }) => r.verdict)).toEqual([
+      "fail",
+    ]);
+    expect(views.filterRows(rows, "other").map((r: { verdict: string }) => r.verdict)).toEqual([
+      "not_measured",
+      "skipped",
+      "observing",
+    ]);
+  });
+
   test("a grader's record reads by what it records", () => {
     expect(views.gradeVerdict(true, false)).toBe("pass");
     expect(views.gradeVerdict(false, false)).toBe("fail");

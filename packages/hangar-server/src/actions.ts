@@ -164,7 +164,7 @@ export function pinBaseline(args: {
   }
   let pinned: ReturnType<typeof pinRun>;
   try {
-    pinned = pinRun(run, args.nowIso, evalsDir);
+    pinned = pinRun(run, args.nowIso, evalsDir, { cmd: "hangar" });
   } catch (err) {
     // eval-report refuses a pin file that is a link, a FIFO or not a JSON
     // object, by name and reason: that is the operator's answer (a 409), not

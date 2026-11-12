@@ -112,8 +112,9 @@ import {
   PROMOTE_GATE_UNAVAILABLE,
   QUALITY_LANE_PREFIX,
   RESET_UNAVAILABLE,
+  ROUTING_FREEZE_RELPATHS,
   ROUTING_READ_RELPATHS,
-  ROUTING_TOUCHED_RELPATHS,
+  ROUTING_STORE_RELPATHS,
   SHADOW_LANE_PREFIX,
   STATE_RELDIR,
   armViews,
@@ -260,23 +261,34 @@ const ROUTE_ACTIONS = ["status", "freeze", "unfreeze", "promote", "compact"] as 
 
 export const routeControl: RegisteredTool = buildTool({
   name: "RouteControl",
-  // The routing store under the harness: the scoreboard, the freeze marker
-  // and the priors, read and (promote, compact) rewritten.
+  // The routing store's files under the harness, each read by a deny or ask
+  // on any call: the scoreboard (and the `.tmp` it is renamed from), the
+  // priors and the freeze marker. The marker is `selfChecked`: freeze and
+  // unfreeze hold it against the floor's roots themselves, so the floor
+  // leaves it out and status, promote and compact are not refused for it.
   operativeArgs: [
     {
       field: "dir",
       kind: "path",
       default: ".",
-      opens: [{ path: `${STATE_RELDIR}/routing`, beneath: "all" }],
+      // Under STATE_RELDIR, spelled out: the manifest names files.
+      opens: [
+        { path: ".crewhaus/routing/arms.jsonl" },
+        { path: ".crewhaus/routing/arms.jsonl.tmp" },
+        { path: ".crewhaus/routing/priors.json" },
+        { path: ".crewhaus/routing/freeze.json", selfChecked: true },
+        { path: ".crewhaus/routing/freeze.json.tmp", selfChecked: true },
+      ],
     },
   ],
   description:
-    "Inspect and steer a harness's learned model routing: the per-(routeKey, arm) reward scoreboard, the `route freeze` kill switch, and the promotion of observe-only `q:` / `shadow:` lane evidence into the live arms. Every rate it reports carries a Wilson interval and every mean carries its n, because an arm with three observations is not a better arm than one with three hundred. It REFUSES to promote or compact when the freeze marker exists (the pin is the kill switch) AND when the marker exists but cannot be parsed — a corrupt kill switch is not an absent one, and `promoteLanes`'s own freeze check reads it as absent. A real promotion additionally needs acceptUngated:true, because this tool does not resolve the eval gate `crewhaus route promote` requires. Resetting the scoreboard is deliberately not offered; use `crewhaus route reset`. dryRun defaults to true and changes nothing; the promotion preview is promoteLanes' own dryRun, running the same fold.",
+    "Inspect and steer a harness's learned model routing: the per-(routeKey, arm) reward scoreboard, the `route freeze` kill switch, and the promotion of observe-only `q:` / `shadow:` lane evidence into the live arms. Every rate it reports carries a Wilson interval and every mean its n: three observations do not make a better arm than three hundred. It REFUSES to promote or compact when the freeze marker exists (the pin is the kill switch) AND when the marker exists but cannot be parsed — a corrupt kill switch is not an absent one. A real promotion also needs acceptUngated:true, because this tool does not resolve the eval gate `crewhaus route promote` requires. Resetting the scoreboard is not offered; use `crewhaus route reset`. Freeze and unfreeze are refused while the freeze marker is on the runtime-state floor; use `crewhaus route freeze <policyVersion>` or `--clear`. dryRun defaults to true and changes nothing; the promotion preview runs the same fold.",
+
   inputSchema: z.object({
     action: z
       .enum(ROUTE_ACTIONS)
       .describe(
-        "status (read the arms, the freeze marker, the lanes and the priors), freeze (pin a policyVersion), unfreeze (lift the pin), promote (fold lane evidence into the live arms), compact (rewrite the store to one aggregate line per arm)",
+        "status (read the arms, the freeze marker, the lanes and the priors), freeze (pin a policyVersion; refused while the freeze marker is on the runtime-state floor, use `crewhaus route freeze <policyVersion>`), unfreeze (lift the pin; refused the same way, use `crewhaus route freeze --clear`), promote (fold lane evidence into the live arms), compact (rewrite the store to one aggregate line per arm)",
       ),
     dir: dirField,
     policyVersion: z
@@ -313,13 +325,31 @@ export const routeControl: RegisteredTool = buildTool({
     const dryRun = input.dryRun ?? true;
     const limit = input.limit ?? DEFAULT_LIMIT;
     const readOnlyAction = input.action === "status";
+    const freezeAction = input.action === "freeze" || input.action === "unfreeze";
+    const roots = readOnlyAction ? [] : protectedRootsOf(ctx);
     const rooted = rootState(
       tool,
       input.dir ?? ".",
-      readOnlyAction ? ROUTING_READ_RELPATHS : ROUTING_TOUCHED_RELPATHS,
-      readOnlyAction ? [] : protectedRootsOf(ctx),
+      readOnlyAction
+        ? ROUTING_READ_RELPATHS
+        : freezeAction
+          ? ROUTING_FREEZE_RELPATHS
+          : ROUTING_STORE_RELPATHS,
+      roots,
     );
-    if (!rooted.ok) return refusal(tool, rooted.code, rooted.reason);
+    if (!rooted.ok) {
+      // The freeze marker on the floor is the operator's: name the verbs that
+      // pin and lift it.
+      const onFloor =
+        freezeAction && rooted.code === "refused" && rooted.reason.includes("no tool may change");
+      return refusal(
+        tool,
+        rooted.code,
+        onFloor
+          ? `${rooted.reason} Pin or lift the policy with \`crewhaus route freeze <policyVersion>\` or \`crewhaus route freeze --clear\`.`
+          : rooted.reason,
+      );
+    }
     const { stateRoot, stateRel } = rooted.value;
     const armsPath = path.join(stateRoot, "routing", "arms.jsonl");
 

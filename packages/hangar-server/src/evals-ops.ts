@@ -53,9 +53,11 @@ import { SESSION_ID_RE as SESSION_ID_SHAPE } from "@crewhaus/control-contract";
 import { createFileBackedRegistry } from "@crewhaus/dataset-registry";
 import {
   type RunIndexEntry,
+  breakBoundaries,
   buildTrends,
   readBaselines,
   readRunIndexLatest,
+  segmentSeries,
 } from "@crewhaus/eval-report";
 import { buildFeedbackRecord } from "@crewhaus/feedback-distill";
 import { MAX_JSONL_LINES, MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
@@ -679,11 +681,14 @@ export const evalSuiteRun: M3Handler = (ctx) => {
 /**
  * `GET /api/h/:id/evals/trends` — per-(spec, dataset) trends.
  *
- * Two separations that stop this panel from lying:
- *   1. PARTIAL runs are carried on the series (so the operator sees they
- *      happened) but excluded from the regression signal — a budget-aborted
- *      run's deflated pass rate is not a score drop.
- *   2. AGENT spend and JUDGE spend are reported apart. The judge frequently
+ * Three separations that stop this panel from lying:
+ *   1. PARTIAL runs, and runs that measured nothing, are carried on the series
+ *      (so the operator sees they happened) but excluded from the regression
+ *      signal — their pass rate is not a score drop.
+ *   2. A series is cut where its dataset or measuring instrument changed
+ *      (`segments`, with the `boundaries` that cut it), and its delta is the
+ *      last segment's: a delta across the cut compares two instruments.
+ *   3. AGENT spend and JUDGE spend are reported apart. The judge frequently
  *      costs more than the thing it is judging, and one blended number hides
  *      exactly the line item an operator would cut.
  */
@@ -709,8 +714,10 @@ export const evalTrends: M3Handler = (ctx) => {
     // The trend line is drawn over MEASURED runs only. A partial run stays in
     // `points` (it is a fact) but never sets the delta.
     const measured = points.filter((p) => p.partial !== true);
-    const first = measured[0];
-    const last = measured[measured.length - 1];
+    // Cut where the instrument changed; the delta is the last segment's, over
+    // the runs in it that measured something.
+    const { segments, boundaries } = segmentSeries(s, entries);
+    const lastTrend = segments[segments.length - 1]?.trend ?? null;
     return {
       specName: s.specName,
       datasetName: s.datasetName,
@@ -718,10 +725,9 @@ export const evalTrends: M3Handler = (ctx) => {
       measuredCount: measured.length,
       partialCount: points.length - measured.length,
       replayedCount: points.filter((p) => p.replayed).length,
-      deltaPp:
-        first !== undefined && last !== undefined && measured.length >= 2
-          ? (last.passRate - first.passRate) * 100
-          : null,
+      deltaPp: lastTrend !== null ? lastTrend.passRateDeltaPp : null,
+      segments,
+      boundaries: breakBoundaries(boundaries),
     };
   });
   const sum = (pick: (e: RunIndexEntry) => number | undefined): number =>

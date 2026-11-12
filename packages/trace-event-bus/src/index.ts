@@ -22,6 +22,7 @@ export type {
   EffectiveParams,
   ErrorRecoveredEvent,
   EvalGradedEvent,
+  EvalUnmeasuredEvent,
   ProvabilityGradedEvent,
   ProofCheckedEvent,
   HandoffEvent,

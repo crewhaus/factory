@@ -837,6 +837,9 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
   evalSuites: m3Read(["suites", "array"]),
   evalTrends: m3Read(
     ["series", "array"],
+    // Each series is cut where its instrument changed (one segment when
+    // nothing did), so a view never draws a delta across two instruments.
+    ["series[].segments", "array"],
     // agent vs judge spend stay SEPARATE: one blended number hides which of
     // the two an operator would actually cut.
     ["spend.agentUsd", "number"],
@@ -1248,6 +1251,8 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["decisions.dismissed", "number"],
     ["summary", "string"],
     ["baselines", "object"],
+    // Where the instrument changed in the lineage the trend folds.
+    ["boundaries", "array"],
   ),
   advisorReports: m3Read(["reports", "array"], ["kinds", "array"]),
   // Driven with a reportId that does not exist, so the absent envelope is
