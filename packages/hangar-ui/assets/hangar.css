@@ -2431,6 +2431,11 @@ figure.chart svg {
 .app-header .disclosure {
   display: contents;
 }
+.disclosure-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
 .disclosure-btn.active {
   color: var(--ink);
   background: var(--panel-3);

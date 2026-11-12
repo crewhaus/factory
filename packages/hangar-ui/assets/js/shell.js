@@ -509,11 +509,10 @@ export function mountRoute(route) {
   const area = fleetArea(route.view);
   if (area !== null) {
     const row = route.sub === null ? null : fleetPage(area, route.sub);
-    page.append(
-      pageHeading(row === null ? area.title : row.title),
-      areaNav(area, route),
-      el("div", { class: "page-body" }, [skeleton(6)]),
-    );
+    const nav = areaNav(area, route);
+    page.append(pageHeading(row === null ? area.title : row.title));
+    if (nav !== null) page.append(nav);
+    page.append(el("div", { class: "page-body" }, [skeleton(6)]));
   } else {
     page.appendChild(skeleton(6));
   }
