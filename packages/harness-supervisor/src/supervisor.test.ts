@@ -27,6 +27,7 @@ import type { HarnessSupervisor, SupervisorEvent } from "./supervisor";
 import {
   type FakeClock,
   type FakeProcessOps,
+  activateBuildForTest,
   createFakeClock,
   createFakeProcessOps,
 } from "./testkit";
@@ -80,10 +81,16 @@ type SetupOptions = {
   newRunId?: () => string;
   /** The prepare seams (compile-if-stale + operator hooks). */
   prepare?: () => PrepareRunner;
+  /** Record the bundle as the active deployment (default true): automatic starts run
+   *  only the active build. */
+  active?: boolean;
 };
 
 function setup(target: string, options: SetupOptions = {}): Harness {
   const dir = tempHarness(target, options.env ?? "");
+  if (options.active !== false) {
+    activateBuildForTest(dir, `dist/${target === "channel" ? "daemon.ts" : "agent.ts"}`);
+  }
   const clock = createFakeClock();
   const ops = createFakeProcessOps({ now: clock.now });
   const planPorts =

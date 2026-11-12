@@ -1,6 +1,7 @@
-import { HARNESS_COMMAND, READ } from "./shared.js";
+import { HARNESS_COMMAND, READ, TWINS } from "./shared.js";
 
-const NO_DEPLOYMENT_VERB = "`crewhaus deploy` moves spec-registry pins, not deployment records.";
+const ONE_DEPLOYMENT_VERB =
+  "`crewhaus deploy list` shows every deployment; the CLI has no verb for one.";
 
 export const DEPLOYMENT_OPERATIONS = [
   {
@@ -11,8 +12,7 @@ export const DEPLOYMENT_OPERATIONS = [
     permission: "h.read",
     request: "listQuery",
     response: "deploymentList",
-    cliTwin: null,
-    noTwinReason: NO_DEPLOYMENT_VERB,
+    cliTwin: TWINS.deployList,
     qualifiers: [],
   },
   {
@@ -24,7 +24,7 @@ export const DEPLOYMENT_OPERATIONS = [
     request: "noBody",
     response: "deployment",
     cliTwin: null,
-    noTwinReason: NO_DEPLOYMENT_VERB,
+    noTwinReason: ONE_DEPLOYMENT_VERB,
     qualifiers: [],
   },
   {
@@ -34,8 +34,7 @@ export const DEPLOYMENT_OPERATIONS = [
     path: "/api/v1/harnesses/{h}/deployments",
     permission: "h.deploy",
     request: "deploymentActivateRequest",
-    cliTwin: null,
-    noTwinReason: NO_DEPLOYMENT_VERB,
+    cliTwin: TWINS.deployActivate,
     qualifiers: ["human-only"],
   },
 ] as const;

@@ -204,7 +204,56 @@ export function readRunfile(harnessDir: string): DaemonRunfile | undefined {
           ),
         }
       : {}),
+    // The deployment the run was started from; absent on a runfile written before one
+    // was recorded, and read as absent.
+    ...(str("deployment") !== undefined ? { deployment: str("deployment") as string } : {}),
+    ...(str("specHash") !== undefined ? { specHash: str("specHash") as string } : {}),
+    ...(str("artifactDigest") !== undefined
+      ? { artifactDigest: str("artifactDigest") as string }
+      : {}),
   };
+}
+
+/** `<harness>/.crewhaus/run/supervision.json`: the restart window, kept between managers. */
+export const SUPERVISION_FILE_NAME = "supervision.json";
+
+export type SupervisionRecord = { readonly v: 1; readonly restarts: readonly number[] };
+
+export type SupervisionRead =
+  | { readonly state: "absent" }
+  | { readonly state: "present"; readonly record: SupervisionRecord }
+  | { readonly state: "unreadable" };
+
+/** The persisted restart window. Tolerant: anything but a well-formed record is unreadable. */
+export function readSupervisionRecord(harnessDir: string): SupervisionRead {
+  let text: string;
+  try {
+    text = readFileSync(join(runDir(harnessDir), SUPERVISION_FILE_NAME), "utf8");
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT"
+      ? { state: "absent" }
+      : { state: "unreadable" };
+  }
+  try {
+    const parsed = JSON.parse(text) as { v?: unknown; restarts?: unknown };
+    if (parsed.v !== 1 || !Array.isArray(parsed.restarts)) return { state: "unreadable" };
+    const restarts = parsed.restarts.filter(
+      (t): t is number => typeof t === "number" && Number.isFinite(t),
+    );
+    return { state: "present", record: { v: 1, restarts } };
+  } catch {
+    return { state: "unreadable" };
+  }
+}
+
+/** Write the restart window atomically (tmp + rename, 0600). */
+export function writeSupervisionRecord(harnessDir: string, restarts: readonly number[]): void {
+  ensureRunDir(harnessDir);
+  atomicWrite(
+    join(runDir(harnessDir), SUPERVISION_FILE_NAME),
+    `${JSON.stringify({ v: 1, restarts: [...restarts] })}\n`,
+    0o600,
+  );
 }
 
 /** Remove `daemon.json` (a clean stop). Missing file is success. */

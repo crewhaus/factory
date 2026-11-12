@@ -43,12 +43,34 @@ export type Reconciler = (
   ctx: ReconcileContext,
 ) => Reconciliation | Promise<Reconciliation>;
 
+/** What an activation gate is shown: the deployment as it would be activated. */
+export type ActivationGateContext = {
+  readonly harnessDir: string;
+  /** The prepared record, with the environment the activation names. */
+  readonly deployment: Readonly<Record<string, unknown>>;
+  /** The stored actor ref that activates. */
+  readonly actor: string;
+  readonly now: number;
+};
+
+/** A check every activation passes, in composition order. */
+export type ActivationGate = {
+  readonly name: string;
+  check(
+    ctx: ActivationGateContext,
+  ): Promise<
+    { readonly ok: true } | { readonly ok: false; readonly reason: string; readonly verb?: string }
+  >;
+};
+
 /** An area's running code for the command kinds it owns. Later slots join this type. */
 export type AreaRuntime = {
   /** The area's name, as its module in control-contract declares it. */
   readonly area: string;
   readonly executors?: Readonly<Record<string, Executor>>;
   readonly reconcilers?: Readonly<Record<string, Reconciler>>;
+  /** Checks every activation passes; the core's protected-environment gate runs first. */
+  readonly activationGates?: readonly ActivationGate[];
 };
 
 /** An executor stamp, with `probed: false` when the probe could not say when it started. */

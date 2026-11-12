@@ -52,7 +52,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan really reads the sources", () => {
-    expect(SOURCES.length).toBe(17);
+    expect(SOURCES.length).toBe(18);
     expect(imports.length).toBeGreaterThan(40);
     expect(imports.some((i) => i.path === "node:fs")).toBe(true);
     expect(imports.some((i) => i.path === "@crewhaus/tool-safety/fs")).toBe(true);
@@ -121,6 +121,7 @@ describe("what the package exports", () => {
         "controlPaths",
         "createApproverReader",
         "createOperatorReader",
+        "deploymentsLedger",
         "dropSegmentsBefore",
         "ensureDigestKey",
         "expireClaim",
@@ -134,7 +135,9 @@ describe("what the package exports", () => {
         "publishClaim",
         "readApproverProjection",
         "readClaim",
+        "readDeployments",
         "readDigestKey",
+        "readHarnessIdentity",
         "readMutatingLease",
         "readOperatorRecord",
         "readPage",
@@ -144,6 +147,7 @@ describe("what the package exports", () => {
         "storedLocalActor",
         "withLedgerLock",
         "withMutatingLease",
+        "writeHarnessIdentity",
       ].sort(),
     );
   });

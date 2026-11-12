@@ -27,7 +27,11 @@
  *      dropping them from the walk unannounced would let an operator
  *      believe a group is up when part of it was never considered.
  */
-import type { HangarHarnessEntry, HangarRegistry } from "@crewhaus/harness-registry";
+import {
+  type HangarHarnessEntry,
+  type HangarRegistry,
+  isAdopted,
+} from "@crewhaus/harness-registry";
 import { readsBriefOnStdin, runClassFor } from "@crewhaus/harness-supervisor";
 
 /** The lifecycle verbs a group accepts. `drain` is deliberately absent: it
@@ -63,8 +67,17 @@ export type GroupPlan = {
   readonly skipped: number;
 };
 
-/** Why this member cannot be started/stopped as a daemon, or null. */
-function skipReason(entry: HangarHarnessEntry, live: (dir: string) => boolean): string | null {
+/** Why this member cannot be started/stopped as a daemon, or null. A start or restart runs
+ *  only the members adopted on this machine; a stop reaches them all. */
+export function skipReason(
+  entry: HangarHarnessEntry,
+  live: (dir: string) => boolean,
+  verb: GroupVerb,
+  adoptionSince: string | undefined,
+): string | null {
+  if (verb !== "stop" && !isAdopted(entry, adoptionSince)) {
+    return `not adopted on this machine — crewhaus harness adopt ${entry.id}`;
+  }
   if (entry.missingSince !== null || !live(entry.dir)) {
     return `directory is missing (since ${entry.missingSince ?? "now"}) — relocate or remove it`;
   }
@@ -90,6 +103,7 @@ export function groupPlan(
 ): GroupPlan {
   const ordered = registry.groupMembers(group);
   const walk = verb === "stop" ? [...ordered].reverse() : ordered;
+  const adoptionSince = registry.adoptionSince();
   const members = walk.map((entry, index): GroupPlanMember => {
     const declared = entry.groupOrder?.[group];
     return {
@@ -100,7 +114,7 @@ export function groupPlan(
       runClass: runClassFor(entry.target),
       position: index + 1,
       declaredOrder: declared ?? null,
-      skip: skipReason(entry, deps.live),
+      skip: skipReason(entry, deps.live, verb, adoptionSince),
     };
   });
   return {

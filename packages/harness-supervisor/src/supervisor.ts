@@ -48,8 +48,18 @@
  * builder, gate, scrubber, id minter — so the whole machine is exercised in
  * unit tests without spawning a harness.
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { mintRunId as mintCanonicalRunId } from "@crewhaus/control-contract";
+import { readDeployments } from "@crewhaus/control-records";
+import { specRevision } from "@crewhaus/ir/policy";
+import {
+  type ActiveDeployment,
+  BUILD_NOT_ACTIVE_MESSAGE,
+  activeDeployment,
+  artifactOf,
+  launchedEntryOf,
+  verifyActiveBuild,
+} from "./active-build";
 import { adoptRunning, verifyRunfile } from "./adoption";
 import type { GateDecision, GateOptions } from "./gate";
 import {
@@ -79,6 +89,7 @@ import {
   readRunLedger,
   readRunfile,
   readStartLock,
+  readSupervisionRecord,
   recentRuns,
   releaseStartLock,
   runCursorPath,
@@ -87,6 +98,7 @@ import {
   runfileExists,
   startLockIsStale,
   writeRunfile,
+  writeSupervisionRecord,
 } from "./runfiles";
 import { type Scrubber, createEnvScrubber, scrubbableEnvKeys } from "./scrub";
 import type { SupervisedChild } from "./shutdown";
@@ -144,6 +156,15 @@ export type SupervisorSnapshot = {
    *  announced on stdout (the plan asks for a kernel-assigned 0) or read
    *  from the runfile at adoption. */
   readonly controlPort?: number;
+  /** Why the last start did not run the build, until a start succeeds. */
+  readonly refusal?: {
+    readonly reason: "build-not-active";
+    readonly message: string;
+    readonly at: string;
+  };
+  /** Set when the restart window kept between managers could not be read, so it
+   *  started empty. */
+  readonly windowNote?: string;
 };
 
 export type SupervisorEvent =
@@ -181,6 +202,13 @@ export type StartResult =
       readonly ok: false;
       readonly reason: "prepare-refused";
       readonly refusal: PrepareRefusal;
+    }
+  | {
+      /** The build on disk is not the one a start may run: an automatic start runs only
+       *  the active deployment's build, and a person's start is admitted by its head. */
+      readonly ok: false;
+      readonly reason: "build-not-active";
+      readonly message: string;
     }
   | {
       readonly ok: false;
@@ -252,7 +280,27 @@ export type SupervisorOptions = {
   /** Where a run record that could not be written is reported, one line
    *  each. Defaults to stderr. Never changes the supervision state. */
   readonly warn?: (line: string) => void;
+  /**
+   * Admits a person's start: decides whether the build on disk may run, recording and
+   * activating it when the head allows. Called after the `preSpawn` hook and before the
+   * run id is minted, so nothing that writes the bundle runs between the check and the
+   * spawn. An automatic start never asks it: it runs only the active deployment's build.
+   */
+  readonly admit?: (request: {
+    readonly harnessDir: string;
+    readonly target: string;
+    /** The entry this launch runs, posix, relative to the harness. */
+    readonly entry: string;
+    /** True when the harness had no deployment record when this start began, before
+     *  any compile it ran: a harness from before deployments, recorded at this start. */
+    readonly ledgerAbsent: boolean;
+  }) => Promise<AdmitAnswer>;
 };
+
+/** A head's answer to a person's start. */
+export type AdmitAnswer =
+  | { readonly ok: true; readonly deployment?: ActiveDeployment }
+  | { readonly ok: false; readonly message: string };
 
 export type HarnessSupervisor = {
   snapshot(): SupervisorSnapshot;
@@ -303,9 +351,31 @@ export type HarnessSupervisor = {
 
 export const DEFAULT_PUMP_INTERVAL_MS = 250;
 
+/** The deployment a run was started from, stamped from the active record. */
+export const DEPLOYMENT_ID_ENV = "CREWHAUS_DEPLOYMENT_ID";
+/** The active deployment's spec revision, stamped beside it. */
+export const SPEC_HASH_ENV = "CREWHAUS_SPEC_HASH";
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
+
+/**
+ * The active deployment, when the spec a launch runs from source is that deployment's
+ * revision; otherwise none, so the spawn carries no deployment it was not checked against.
+ */
+function deploymentOfSpec(
+  harnessDir: string,
+  specPath: string | undefined,
+): ActiveDeployment | undefined {
+  const active = activeDeployment(harnessDir);
+  if (active?.specHash === undefined || specPath === undefined) return undefined;
+  try {
+    return specRevision(readFileSync(specPath, "utf8")) === active.specHash ? active : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupervisor {
   const clock = options.clock ?? systemClock;
@@ -313,11 +383,25 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
   const mintRunId = options.newRunId ?? (() => newRunId());
   const pumpInterval = options.pumpIntervalMs ?? DEFAULT_PUMP_INTERVAL_MS;
   const graceMs = options.stopGraceMs ?? STOP_GRACE_MS;
+  // The restart window is kept in `.crewhaus/run/supervision.json`, so a new manager
+  // counts the restarts the last one recorded.
+  let windowNote: string | undefined;
   const window = createRestartWindow(
     clock,
     options.maxRestarts ?? MAX_RESTARTS_PER_WINDOW,
     options.restartWindowMs ?? RESTART_WINDOW_MS,
+    {
+      load: () => {
+        const read = readSupervisionRecord(options.harnessDir);
+        if (read.state === "unreadable") {
+          windowNote = "the kept restart count could not be read, so it started at zero";
+        }
+        return read.state === "present" ? read.record.restarts : undefined;
+      },
+      save: (restarts) => writeSupervisionRecord(options.harnessDir, restarts),
+    },
   );
+  let refusal: SupervisorSnapshot["refusal"];
 
   let state: SupervisionState = "stopped";
   let runId: string | undefined;
@@ -380,6 +464,8 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     ...(adopted ? { adopted: true } : {}),
     ...(currentPorts !== undefined ? { ports: currentPorts } : {}),
     ...(controlPort !== undefined ? { controlPort } : {}),
+    ...(refusal !== undefined ? { refusal } : {}),
+    ...(windowNote !== undefined ? { windowNote } : {}),
   });
 
   /**
@@ -749,11 +835,24 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
    * the spawn. An operator's own `CREWHAUS_RUN_ID` is passed through
    * untouched and gets no root; `CREWHAUS_RUN_LEDGER=0` adds nothing.
    */
-  const stampRunIds = (plan: SpawnPlan, execution: string): Record<string, string> => {
+  const stampRunIds = (
+    plan: SpawnPlan,
+    execution: string,
+    deployment: ActiveDeployment | undefined,
+  ): Record<string, string> => {
     currentRoot = undefined;
+    // The deployment stamps come from the active record alone, run ledger on or off: a
+    // `.env` line or the manager's own environment never supplies them.
+    const stamped: Record<string, string> = { ...plan.env };
+    Reflect.deleteProperty(stamped, DEPLOYMENT_ID_ENV);
+    Reflect.deleteProperty(stamped, SPEC_HASH_ENV);
+    if (deployment !== undefined) {
+      stamped[DEPLOYMENT_ID_ENV] = deployment.id;
+      if (deployment.specHash !== undefined) stamped[SPEC_HASH_ENV] = deployment.specHash;
+    }
     rowsOff = runLedgerOff(plan.env);
-    if (rowsOff) return plan.env;
-    const env = { ...plan.env, CREWHAUS_EXECUTION_ID: execution };
+    if (rowsOff) return stamped;
+    const env = { ...stamped, CREWHAUS_EXECUTION_ID: execution };
     if (plan.kind !== "job" || plan.env["CREWHAUS_RUN_ID"] !== undefined) return env;
     const root = mintCanonicalRunId();
     const opened = openRootRun(
@@ -883,6 +982,17 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     return { ok: false, reason: "plan-failed", stage: "spawn", error };
   };
 
+  /** A start that may not run the build on disk: stopped, with the reason kept. */
+  const refuseBuild = (message: string): StartResult => {
+    refusal = {
+      reason: "build-not-active",
+      message,
+      at: new Date(clock.now()).toISOString(),
+    };
+    setState("stopped");
+    return { ok: false, reason: "build-not-active", message };
+  };
+
   const start = async (
     gateOptions: GateOptions = {},
     internal: { readonly automatic?: boolean } = {},
@@ -953,6 +1063,9 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       currentPorts = plan.ports;
 
       const prepared: string[] = [];
+      let activeOnly = false;
+      // Read before any compile this start runs, which records what it built.
+      const ledgerAbsent = readDeployments(options.harnessDir).state === "absent";
       const runner = options.prepare?.();
       if (runner !== undefined) {
         // Inside the start slot, so two managers cannot recompile the same
@@ -964,6 +1077,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
           return { ok: false, reason: "prepare-refused", refusal: outcome.refusal };
         }
         prepared.push(...outcome.notes);
+        if (outcome.activeOnly === true) activeOnly = true;
         if (outcome.replan) {
           // The bundle moved. Re-resolve it, or the spawn launches the entry
           // that was resolved BEFORE the compile — the silent staleness the
@@ -1000,6 +1114,45 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         prepared.push(...outcome.notes);
       }
 
+      // The build check, after every step that may write the bundle and before the run
+      // id is minted, for a launch that runs a compiled bundle. An automatic start, and a
+      // start whose compile `manager.autoCompile` governed, run only the active
+      // deployment's build; a person's start is admitted by its head.
+      // The deployment stamped on the spawn is one this launch was checked against.
+      let deployment: ActiveDeployment | undefined;
+      if (plan.launchMode !== "compiled") {
+        deployment = deploymentOfSpec(options.harnessDir, plan.specPath);
+      } else {
+        const launched = launchedEntryOf(options.harnessDir, plan.bundleDir, plan.entry);
+        if (internal.automatic === true || activeOnly) {
+          const check = verifyActiveBuild(options.harnessDir, options.target, launched);
+          if (!check.ok) return refuseBuild(check.message);
+          deployment = check.deployment;
+        } else if (options.admit !== undefined) {
+          const admitted = await options.admit({
+            harnessDir: options.harnessDir,
+            target: options.target,
+            entry: launched,
+            ledgerAbsent,
+          });
+          if (!admitted.ok) return refuseBuild(admitted.message);
+          if (admitted.deployment !== undefined) {
+            // The admitted build must be the one this launch runs.
+            if (artifactOf(admitted.deployment.record)?.entry !== launched) {
+              return refuseBuild(BUILD_NOT_ACTIVE_MESSAGE);
+            }
+            deployment = admitted.deployment;
+          } else {
+            const check = verifyActiveBuild(options.harnessDir, options.target, launched);
+            deployment = check.ok ? check.deployment : undefined;
+          }
+        } else {
+          const check = verifyActiveBuild(options.harnessDir, options.target, launched);
+          deployment = check.ok ? check.deployment : undefined;
+        }
+      }
+      refusal = undefined;
+
       // Mint BEFORE announcing `starting`: the entry guard treats that state
       // as "already-running", so a state we enter must always be a state we
       // can leave.
@@ -1022,7 +1175,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         // and so an fd-redirected child appends rather than creates.
         appendFileSync(logFile, "", { mode: 0o600 });
 
-        const env = stampRunIds(plan, id);
+        const env = stampRunIds(plan, id, deployment);
         child = options.ops.spawn({
           argv: plan.argv,
           cwd: plan.cwd,
@@ -1071,6 +1224,13 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
             // `.env` chain and writing process-env secrets to disk in
             // cleartext.
             scrubKeys: scrubbableEnvKeys(plan.env),
+            ...(deployment !== undefined
+              ? {
+                  deployment: deployment.id,
+                  ...(deployment.specHash !== undefined ? { specHash: deployment.specHash } : {}),
+                  artifactDigest: deployment.digest,
+                }
+              : {}),
           });
         }
         if (options.ports !== undefined) {

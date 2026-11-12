@@ -139,15 +139,15 @@ export type AuditKind =
   //   { action: "sweep"|"export"|"purge", dryRun: false, deletedSessionIds,
   //     kept/deferred counts, policy inputs (maxAgeDays, pins, windows), ... }
   | "retention_enforcement"
-  // Item 59 — approval-gated promotion. `crewhaus deploy promote
-  // --require-approval` appends one record when an approval gate is
-  // EVALUATED for a protected environment: the recorded approvals/tokens or
-  // green PR check that satisfied the quorum (or the refusal), stamped
-  // alongside the promotion it authorized so the approval and the pin flip
+  // Item 59 — approval-gated pin moves. Every pin move into a protected
+  // environment (`crewhaus deploy promote|rollback|canary`, `spec pin`, an SLO
+  // rollback) appends one record when the gate is EVALUATED: the recorded
+  // approvals or green PR check that satisfied the quorum (or the refusal),
+  // stamped alongside the move it authorized so the approval and the pin flip
   // sit in the same tamper-evident chain. Payload shape (opaque JSON; see
-  // apps/cli/src/approval-gate.ts):
-  //   { name, toEnv, required, approvals: [{approver, ts, ...}], satisfied,
-  //     prCheck?, ... }
+  // @crewhaus/deployment-controller/approval-gate's `buildGovernancePayload`):
+  //   { name, toEnv, toVersion, specHash, required, satisfied,
+  //     countedApprovers, prWitness, prNumber?, actor?, ts }
   | "governance_approval"
   // Item 59 — PR-based optimize/advise proposals. `crewhaus propose` appends
   // one record when a spec-change proposal is packaged into a review artifact

@@ -50,6 +50,7 @@ const GATE_RECORDS = [
   "audit",
   "graphs",
   "advice",
+  "cloud",
   "knowledge.json",
 ].map((name) => join(".crewhaus", name));
 /** The idempotency store's default directory, always a root. */
@@ -179,6 +180,20 @@ describe("the files that control the run", () => {
     writeFileSync(shared, "{}");
     symlinkSync(shared, join(cwd2, ".crewhaus", "settings.json"));
     expect(runtimeStateRoots(undefined, undefined, cwd2, {})).toContain(shared);
+  });
+});
+
+describe("the cloud working directory", () => {
+  test("a file under .crewhaus/cloud is under a root; .crewhaus/cloudy is not", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    const under = (path: string): boolean =>
+      roots.some((root) => {
+        const rel = relative(root, path);
+        return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+      });
+    expect(under(join(cwd, ".crewhaus", "cloud", "x", "main.tf"))).toBe(true);
+    expect(under(join(cwd, ".crewhaus", "cloudy"))).toBe(false);
   });
 });
 

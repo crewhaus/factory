@@ -38,12 +38,13 @@
  * to one truth.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
-import { type Ledger, foldStates } from "@crewhaus/control-records";
+import { type Ledger, casAppend, deploymentsLedger, foldStates } from "@crewhaus/control-records";
 import { commandsLedgerOf, workspaceCommandsLedger } from "@crewhaus/control-service";
+import { buildDigest, resolveBundle } from "@crewhaus/harness-supervisor";
 import { bearer, codeFrom, sealedJs, signInJs } from "./__test__/browser";
 import { runCorpusEval } from "./__test__/eval-corpus";
 import { EVAL_JOB_ARGV } from "./eval-inputs";
@@ -426,14 +427,19 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["recent[].jobId", "string"],
     ["recent[].state", "string"],
   ],
-  // views/deploy.js — F-6, read-only + honest empty state
+  // views/deploy.js — the kept records and the unverified legacy rows
   deployments: [
     ["present", "boolean"],
     ["deployments", "array"],
+    ["deployments[].verified", "boolean"],
+    ["deployments[].source", "string"],
     ["error", "string|null"],
     ["path", "string"],
     ["note", "string|null"],
+    ["verb", "string"],
   ],
+  // views/deploy.js — "Activate this build"
+  deploymentActivate: [["ok", "boolean"]],
   // views/costs.js + overview.js costCard
   costs: [
     ["id", "string"],
@@ -2134,7 +2140,79 @@ describe("UI route contract", () => {
       const runBody = await drive("run", { id, runId: SEEDED_RUN }, { readsKey: "run" });
       expect(runBody["live"]).toBe(false);
       await drive("schedulers", { id }, { readsKey: "schedulers" });
-      await drive("deployments", { id }, { readsKey: "deployments" });
+      const legacy = await drive("deployments", { id }, { readsKey: "deployments" });
+      expect((legacy["deployments"] as Array<{ verified: boolean }>)[0]?.verified).toBe(false);
+
+      // -- activation: a prepared build becomes active through one receipted command ------
+      const bundle = resolveBundle(dir, "channel") ?? resolveBundle(dir, "cli");
+      if (bundle === undefined) throw new Error("the contract harness has no bundle");
+      const entry = relative(dir, bundle.entryPath).split("\\").join("/");
+      const plantPrepared = async (dep: string, specHash = `sha256:${"c".repeat(64)}`) => {
+        const taken = buildDigest(dir, { entry });
+        if ("unreadable" in taken) throw new Error(taken.unreadable);
+        await casAppend(deploymentsLedger(dir), dep, null, {
+          id: dep,
+          state: "prepared",
+          artifact: { digest: taken.digest, specHash, entry },
+        });
+      };
+      const DEP_ONE = "dep_01m76e6f05hp514w9j4v3qymka";
+      const DEP_TWO = "dep_01m76e6f05hp514w9j4v3qymkb";
+      await plantPrepared(DEP_ONE);
+      const activated = await drive(
+        "deploymentActivate",
+        { id, dep: DEP_ONE },
+        { body: {}, readsKey: "deploymentActivate" },
+      );
+      expect(activated["ok"]).toBe(true);
+      const afterActivate = await drive("deployments", { id }, { readsKey: "deployments" });
+      const kept = afterActivate["deployments"] as Array<{
+        verified: boolean;
+        record: { id: string; state: string };
+      }>;
+      expect(kept[0]).toMatchObject({ verified: true, record: { id: DEP_ONE, state: "active" } });
+      // A protected environment without a quorum: 409 with the deployment as it stands.
+      writeFileSync(
+        join(dir, ".crewhaus", "environments.json"),
+        JSON.stringify({ environments: { prod: { requireApproval: true } } }),
+      );
+      await plantPrepared(DEP_TWO);
+      const refused = await drive(
+        "deploymentActivate",
+        { id, dep: DEP_TWO },
+        { body: { environment: "prod" }, expectStatus: 409 },
+      );
+      expect((refused["current"] as { state: string }).state).toBe("prepared");
+      // With a quorum for its content it moves into prod; an activation that names no
+      // environment then takes prod's quorum too, and prod's build stays.
+      const specName = /^name:[ \t]*["']?([^"'\s#]+)/m.exec(
+        readFileSync(join(dir, "crewhaus.yaml"), "utf8"),
+      )?.[1];
+      mkdirSync(join(dir, ".crewhaus", "approvals"), { recursive: true });
+      writeFileSync(
+        join(dir, ".crewhaus", "approvals", `${specName}__prod.json`),
+        JSON.stringify([{ approver: "a", ts: "t", specHash: `sha256:${"c".repeat(64)}` }]),
+      );
+      const intoProd = await drive(
+        "deploymentActivate",
+        { id, dep: DEP_TWO },
+        { body: { environment: "prod" }, readsKey: "deploymentActivate" },
+      );
+      expect(intoProd["ok"]).toBe(true);
+      const DEP_THREE = "dep_01m76e6f05hp514w9j4v3qymkc";
+      await plantPrepared(DEP_THREE, `sha256:${"e".repeat(64)}`);
+      const unnamed = await drive(
+        "deploymentActivate",
+        { id, dep: DEP_THREE },
+        { body: {}, expectStatus: 409 },
+      );
+      expect((unnamed["current"] as { state: string }).state).toBe("prepared");
+      const afterUnnamed = (await drive("deployments", { id }, { readsKey: "deployments" }))[
+        "deployments"
+      ] as Array<{ verified: boolean; record: { id: string; state: string } }>;
+      expect(afterUnnamed.find((d) => d.record.id === DEP_TWO)?.record.state).toBe("active");
+      rmSync(join(dir, ".crewhaus", "approvals"), { recursive: true, force: true });
+      rmSync(join(dir, ".crewhaus", "environments.json"));
       await drive("approvals", {}, { query: "?all=1", readsKey: "approvals" });
       await drive("review", {}, { readsKey: "review" });
       await drive("activity", {}, { query: "?since=30d", readsKey: "activity" });

@@ -317,12 +317,14 @@ describe("the server's twins, by import", () => {
         appr: "appr_0123456789abcdef",
         dir: "/srv/poly",
         choice: "grant",
+        dep: "dep_01m76e6f05hp514w9j4v3qymka",
       },
       {
         hrn: "hrn_0123456789abcdef",
         appr: "appr_0123456789abcdef",
         dir: "/srv/poly",
         choice: "deny",
+        dep: "dep_01m76e6f05hp514w9j4v3qymka",
       },
     ];
     const twins = [
@@ -342,8 +344,8 @@ describe("the server's twins, by import", () => {
         checked++;
       }
     }
-    // Eight operation twins, five command kinds and seven route rows, each rendered twice.
-    expect(checked).toBeGreaterThanOrEqual(40);
+    // Ten operation twins, six command kinds and eight route rows, each rendered twice.
+    expect(checked).toBeGreaterThanOrEqual(48);
   });
 });
 

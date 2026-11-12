@@ -224,6 +224,10 @@ const DRIVERS: Record<
   jobs: { call: () => api.jobs() },
   submitJob: { call: () => api.submitJob(ID, "doctor"), params: { id: ID } },
   deployments: { call: () => api.deployments(ID), params: { id: ID } },
+  deploymentActivate: {
+    call: () => api.deploymentActivate(ID, "dep_01m76e6f05hp514w9j4v3qymka"),
+    params: { id: ID, dep: "dep_01m76e6f05hp514w9j4v3qymka" },
+  },
   pinSession: { call: () => api.pinSession(ID, SESS, true), params: { id: ID, sess: SESS } },
   pinBaseline: { call: () => api.pinBaseline(ID, RUN), params: { id: ID } },
   // ---- M4 --------------------------------------------------------------

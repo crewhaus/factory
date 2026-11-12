@@ -110,8 +110,8 @@ these on: they reach every harness that uses what each one names.
   `.crewhaus/approvals`, `.crewhaus/environments.json`, `.crewhaus/graders`,
   `.crewhaus/judge-calibration.json`, `.crewhaus/evals`, `.crewhaus/datasets`,
   `.crewhaus/retention.json`, `.crewhaus/audit`, `.crewhaus/graphs`,
-  `.crewhaus/advice` and the knowledge-sync marker `.crewhaus/knowledge.json`,
-  exactly that file; the durable-execution idempotency records,
+  `.crewhaus/advice`, `.crewhaus/cloud` and the knowledge-sync marker
+  `.crewhaus/knowledge.json`, exactly that file; the durable-execution idempotency records,
   `.crewhaus/idempotency` and the directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>`
   names; the continuity store's own files under `.crewhaus/state/<spec>/`,
   `focus.md`, `goals.yaml`, `plans` and `handoff.md`, and the same for each of
@@ -173,6 +173,47 @@ these on: they reach every harness that uses what each one names.
   own words, and a parked run says to continue with `crewhaus runs resume`.
   Requests parked before the upgrade count for their conversation only, so a
   batch job or a scheduled lane parked before it asks once more.
+
+- **Restarts run the build you activated.** A crash restart, or a start whose
+  compile `manager.autoCompile` decides, starts a harness only when its built
+  files match the active deployment, and otherwise leaves it stopped with the
+  reason; `autoCompile` rebuilds only the active revision. Home's Start runs the
+  active build; after a compile, run `crewhaus deploy activate`, or start it
+  with `crewhaus daemon start`, which records it. A harness with no deployment
+  record is recorded at its next start.
+
+- **A protected environment's approval counts only for the spec it names.**
+  Every change to a protected environment's pin — `deploy promote`, `rollback`,
+  `canary`, an SLO rollback, `spec pin`, and the `SpecPin` and `DeployRollback`
+  tools — needs the same approval quorum, and a recorded approval counts only
+  when its `specHash` matches the version's content. The refusal prints the
+  value to record.
+
+- **A supervised start takes loader and interpreter settings, `PATH` among
+  them, only from the environment it was started with,** never from a harness's
+  env files; `crewhaus harness show` lists any it left out. If a harness set
+  `PATH` in an env file, export it before starting the manager.
+
+- **A group start includes a harness registered after this release once it is
+  adopted** (`crewhaus harness adopt`); harnesses registered before keep
+  starting.
+
+- **A bundle at a harness's root runs once `crewhaus compile` has recorded
+  it.** A root `agent.ts` or `daemon.ts` is a bundle when a deployment record
+  names it or compile's stamped manifest sits beside it, and a start records
+  one only from compile's record. A harness compiled into its own directory
+  starts after it is compiled there again with this release (`crewhaus compile
+  <spec> -o .`).
+
+- **`crewhaus compile` writes each output file as a new regular file.** A link
+  at a name it writes is replaced by a file, and it stops, naming the path,
+  when a directory between the output directory and a file it writes is a
+  link, or when the harness's own bundle directory is one.
+
+- **The crash-loop count outlives the manager.** A harness's recent restarts
+  are kept in `.crewhaus/run/supervision.json`, so a manager that takes over a
+  running harness counts the restarts before it toward `crash-looping`; a
+  person's start still resets the count.
 
 ## [0.8.2] - 2026-11-12
 

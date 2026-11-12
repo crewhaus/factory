@@ -28,6 +28,8 @@ export const EXECUTION_RUN_ID_RE = /^run_[0-9a-f]{16}$/;
 export const GRAPH_RUN_ID_RE = /^grun_[0-9a-f]{16}$/;
 /** A run id from `mintRunId()`. */
 export const CANONICAL_RUN_ID_RE = /^run_[0-9a-hjkmnp-tv-z]{26}$/;
+/** A deployment id, `dep_<ulid>`: the grammar `isId("dep", …)` accepts. */
+export const DEPLOYMENT_ID_RE = /^dep_[0-9a-hjkmnp-tv-z]{26}$/;
 
 /**
  * Issued secrets, as grammars only. Nothing here mints, stores or masks one:

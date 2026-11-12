@@ -38,6 +38,10 @@ export type ControlPaths = {
   readonly mutatingLeaseFile: string;
   readonly operatorFile: string;
   readonly approversFile: string;
+  /** The deployment records: compile's `prepared` rows and activation's moves. */
+  readonly deploymentsFile: string;
+  /** The harness's portable identity, `{v, id, slug?, createdAt}`. */
+  readonly harnessIdentityFile: string;
 };
 
 /**
@@ -57,6 +61,8 @@ export function controlPaths(harnessDir: string): ControlPaths {
     mutatingLeaseFile: join(controlDir, "leases", "mutating.json"),
     operatorFile: join(controlDir, "operator.json"),
     approversFile: join(controlDir, "approvers.json"),
+    deploymentsFile: join(controlDir, "deployments.jsonl"),
+    harnessIdentityFile: join(controlDir, "harness.json"),
   };
 }
 

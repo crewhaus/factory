@@ -9,6 +9,7 @@
     { "path": "../control-records" },
     { "path": "../errors" },
     { "path": "../harness-inventory" },
+    { "path": "../ir" },
     { "path": "../preflight" }
   ],
   "include": ["src/**/*"]

@@ -242,8 +242,8 @@ describe("every flag list answers --help", () => {
         }
       }
     }
-    expect(asked).toBe(2 * (10 + 5 + 8 + 10));
-  }, 20_000); // four modules' imports and sixty-six calls; slow on a loaded runner
+    expect(asked).toBe(2 * (12 + 5 + 8 + 10));
+  }, 20_000); // four modules' imports and seventy calls; slow on a loaded runner
 });
 
 describe("family parsers take their flags from CLI_FAMILY", () => {

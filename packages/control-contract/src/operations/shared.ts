@@ -25,6 +25,8 @@ export const TWINS = {
   daemonRestart: { argv: ["daemon", "restart", "{hrn}"] },
   approvalsShow: { argv: ["approvals", "show", "{appr}", "--dir", "{dir}"] },
   approvalsChoice: { argv: ["approvals", "{choice}", "{appr}", "--dir", "{dir}"] },
+  deployActivate: { argv: ["deploy", "activate", "{dep}", "--harness", "{hrn}"] },
+  deployList: { argv: ["deploy", "list", "--harness", "{hrn}"] },
 } as const;
 
 export const NO_VERB = "The CLI has no command for this.";

@@ -153,6 +153,11 @@ export const ROUTES = {
   jobs: { method: "GET", path: "/api/jobs" },
   submitJob: { method: "POST", path: "/api/h/:id/jobs", body: "JobSubmit" }, // {kind, dataset?, graders?}
   deployments: { method: "GET", path: "/api/h/:id/deployments" },
+  deploymentActivate: {
+    method: "POST",
+    path: "/api/h/:id/deployments/:dep/activate",
+    body: "DeploymentActivate",
+  }, // {environment?, autostart?}
   pinSession: { method: "POST", path: "/api/h/:id/sessions/:sess/pin", body: "PinSession" }, // {pinned}
   pinBaseline: { method: "POST", path: "/api/h/:id/evals/baseline", body: "PinBaseline" }, // {runId}
 

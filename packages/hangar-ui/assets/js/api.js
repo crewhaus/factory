@@ -412,6 +412,9 @@ export const api = {
       { kind, ...(options && typeof options === "object" ? options : {}) },
     ),
   deployments: (id) => call(ROUTES.deployments, { id }),
+  // Typed: a gate that refuses answers 409 with the reason, which the view shows.
+  deploymentActivate: (id, dep, body) =>
+    callTyped(ROUTES.deploymentActivate, { id, dep }, body && typeof body === "object" ? body : {}),
   pinSession: (id, sess, pinned) => call(ROUTES.pinSession, { id, sess }, { pinned }),
   pinBaseline: (id, runId) => call(ROUTES.pinBaseline, { id }, { runId }),
 

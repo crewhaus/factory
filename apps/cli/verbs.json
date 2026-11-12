@@ -2414,6 +2414,56 @@
               "takesValue": false
             }
           ]
+        },
+        "activate": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "environment",
+              "takesValue": true
+            },
+            {
+              "name": "no-autostart",
+              "takesValue": false
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "list": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "environment",
+              "takesValue": true
+            },
+            {
+              "name": "no-autostart",
+              "takesValue": false
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
         }
       },
       "flags": [
@@ -4770,6 +4820,17 @@
               "takesValue": false
             }
           ]
+        },
+        "adopt": {
+          "flags": [
+            {
+              "name": "slug",
+              "takesValue": true
+            }
+          ]
+        },
+        "fork": {
+          "flags": []
         }
       },
       "flags": null

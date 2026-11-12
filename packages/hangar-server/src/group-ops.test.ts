@@ -37,8 +37,12 @@ function entry(
 }
 
 /** A registry whose only real behaviour is group membership + ordering. */
-function fakeRegistry(entries: readonly HangarHarnessEntry[]): HangarRegistry {
+function fakeRegistry(
+  entries: readonly HangarHarnessEntry[],
+  adoptionSince?: string,
+): HangarRegistry {
   return {
+    adoptionSince: () => adoptionSince,
     groupMembers: (group: string) => sortGroupMembers(group, entries),
     listGroups: () => [{ name: "crew", order: 1, color: "" }],
     get: (idOrDir: string) => entries.find((e) => e.id === idOrDir || e.dir === idOrDir),
@@ -52,6 +56,40 @@ describe("the verb vocabulary", () => {
     expect([...GROUP_VERBS]).toEqual(["start", "stop", "restart"]);
     expect(isGroupVerb("drain")).toBe(false);
     expect(isGroupVerb("start")).toBe(true);
+  });
+});
+
+describe("adoption", () => {
+  const since = "2026-11-12T00:00:00.000Z";
+  const after = { ...entry("late", "channel", 1), registeredAt: "2026-11-13T00:00:00.000Z" };
+
+  test("a start skips a row registered after adoption began and not adopted; a stop reaches it", () => {
+    const start = groupPlan(fakeRegistry([after], since), "crew", "start", live);
+    expect(start.members[0]?.skip).toBe(
+      `not adopted on this machine — crewhaus harness adopt ${after.id}`,
+    );
+    expect(groupPlan(fakeRegistry([after], since), "crew", "stop", live).members[0]?.skip).toBe(
+      null,
+    );
+  });
+
+  test("once adopted it starts; a row registered before adoption began starts too", () => {
+    const adopted = { ...after, home: { adoptedAt: since, by: `local:#${"0".repeat(64)}` } };
+    expect(groupPlan(fakeRegistry([adopted], since), "crew", "start", live).actionable).toBe(1);
+    expect(
+      groupPlan(fakeRegistry([entry("early", "channel", 1)], since), "crew", "start", live)
+        .actionable,
+    ).toBe(1);
+  });
+
+  test("a row registered before adoption began and moved since is skipped until adopted", () => {
+    const moved = { ...entry("early", "channel", 1), relocatedAt: since };
+    const start = groupPlan(fakeRegistry([moved], since), "crew", "start", live);
+    expect(start.members[0]?.skip).toBe(
+      `not adopted on this machine — crewhaus harness adopt ${moved.id}`,
+    );
+    const adopted = { ...moved, home: { adoptedAt: since, by: `local:#${"0".repeat(64)}` } };
+    expect(groupPlan(fakeRegistry([adopted], since), "crew", "start", live).actionable).toBe(1);
   });
 });
 

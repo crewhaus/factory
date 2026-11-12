@@ -219,6 +219,8 @@ export const LEGACY_VERBS: readonly LegacyVerb[] = deepFreeze<LegacyVerb[]>([
       promote: null,
       rollback: null,
       canary: null,
+      activate: "DEPLOY_ACTIVATE_SCHEMA",
+      list: "DEPLOY_ACTIVATE_SCHEMA",
     },
     subCheckedBy: "handler",
   },
