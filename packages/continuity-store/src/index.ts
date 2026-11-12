@@ -163,6 +163,9 @@ export const REQUIREMENTS_LEDGER_MAX_BYTES = 16_384;
  */
 export const STATE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 
+/** How many times a store read that overlapped a write (code `changed`) is tried. */
+const STATE_READ_ATTEMPTS = 5;
+
 /**
  * The shape a toolUseId must have to be recorded UNVERIFIED (design/0.8.0
  * §6.3). On the verified path an id is recorded only after it resolved in a
@@ -923,13 +926,22 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
    * `focus.md -> ~/.ssh/...` is not read), or `null` when nothing is there. A
    * link that stays inside the store is followed; a FIFO is refused, not
    * waited on.
+   *
+   * `changed` (the name was checked, then the file opened was not the one
+   * checked) is what every write produces, since a write renames a new file
+   * over the old one, so a read that overlaps another session's write (an
+   * unlocked snapshot such as `listGoals()`) is repeated, up to
+   * {@link STATE_READ_ATTEMPTS} times; only a name that keeps changing is
+   * refused.
    */
   async function readText(path: string): Promise<string | null> {
     fence(path);
     const rel = storeRel(path);
-    const read = await openForRead(storeDir, rel, {
-      maxBytes: STATE_FILE_MAX_BYTES,
-    });
+    let read = await openForRead(storeDir, rel, { maxBytes: STATE_FILE_MAX_BYTES });
+    for (let attempt = 1; attempt < STATE_READ_ATTEMPTS; attempt++) {
+      if (read.ok || read.code !== "changed") break;
+      read = await openForRead(storeDir, rel, { maxBytes: STATE_FILE_MAX_BYTES });
+    }
     if (!read.ok) {
       if (read.code === "not-found") return null;
       throw new ContinuityStoreError(
