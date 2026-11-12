@@ -4,6 +4,8 @@
  * loaded by path), so a sealed answer here opens exactly as it would in a browser.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import { ApiError, api, onUnauthorized } from "../assets/js/api.js";
 import {
   NOT_ENCRYPTED,
   OWN_KEY,
@@ -232,6 +234,94 @@ describe("a tab an earlier release left holding Home's own key", () => {
     expect(calls.filter((c) => c.path === "/api/boot-ticket").length).toBe(1);
     expect(storage.has("hangar.token")).toBe(false);
     expect(navigatedTo).toEqual([]);
+  });
+});
+
+describe("an old #t= link, which carried Home's own key in the address", () => {
+  test("is off the address before the first request, traded once, and never stored", async () => {
+    const key = "ab".repeat(32);
+    location["hash"] = `#t=${key}`;
+    respond = (call) =>
+      call.path === "/api/boot-ticket" ? ok({ bootPath: BOOT_PATH }) : refusal(404, "x");
+    const answer = await boot();
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) expect(call.hashAtSend).not.toContain(key);
+    expect(location["hash"]).toBe("#/");
+    const traded = calls.filter((c) => c.path === "/api/boot-ticket");
+    expect(traded.length).toBe(1);
+    expect(traded[0]?.auth).toBe(`Bearer ${key}`);
+    expect(answer).toEqual({ signedIn: false, navigating: true });
+    expect(navigatedTo).toEqual([BOOT_PATH]);
+    for (const value of storage.values()) expect(value).not.toContain(key);
+  });
+
+  test("a tab that already has a session drops the key without sending it", async () => {
+    const key = "cd".repeat(32);
+    storage.set("hangar.session", SESSION);
+    location["hash"] = `#t=${key}`;
+    expect((await boot()).signedIn).toBe(true);
+    expect(location["hash"]).toBe("#/");
+    expect(calls).toEqual([]);
+    for (const value of storage.values()) expect(value).not.toContain(key);
+  });
+});
+
+describe("a Home that answers without a credential", () => {
+  test("behind a trusted proxy that vouched for this person, the tab is signed in", async () => {
+    respond = (call) =>
+      call.path === "/api/version" && call.auth === null
+        ? ok({ hangar: "0.9.0", protocolV: 1 })
+        : call.path === "/api/v1/auth/challenge"
+          ? ok({ nonce: "n", expiresAt: "2026-11-11T00:01:00.000Z" })
+          : refusal(401, "no_credential");
+    expect(await boot()).toEqual({ signedIn: true });
+    const probe = calls.find((c) => c.path === "/api/version");
+    expect(probe?.auth).toBeNull();
+  });
+
+  test("one that refuses it shows the sign-in screen", async () => {
+    respond = (call) =>
+      call.path === "/api/v1/auth/challenge"
+        ? ok({ nonce: "n", expiresAt: "2026-11-11T00:01:00.000Z" })
+        : refusal(401, "no_credential");
+    expect((await boot()).signedIn).toBe(false);
+    expect(calls.some((c) => c.path === "/api/version")).toBe(true);
+  });
+});
+
+describe("a request that meets an ended session", () => {
+  afterEach(() => onUnauthorized(null));
+
+  test("is sent once more when the tab signs in again, so the action is not lost", async () => {
+    let asked = 0;
+    onUnauthorized(() => {
+      asked += 1;
+      storage.set("hangar.session", SESSION);
+      return Promise.resolve(true);
+    });
+    let seen = 0;
+    respond = () => {
+      seen += 1;
+      return seen === 1 ? refusal(401, "session_expired") : ok({ hangar: "0.9.0" });
+    };
+    expect(await api.version()).toEqual({ hangar: "0.9.0" });
+    expect(asked).toBe(1);
+    expect(calls.length).toBe(2);
+    expect(calls[1]?.auth).toBe(`Bearer ${SESSION}`);
+  });
+
+  test("is refused when signing in again did not work, and is never sent a third time", async () => {
+    let asked = 0;
+    onUnauthorized(() => {
+      asked += 1;
+      return asked === 1;
+    });
+    respond = () => refusal(401, "session_expired");
+    const error = await api.version().catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as { status: number }).status).toBe(401);
+    expect(calls.length).toBe(2);
+    expect(asked).toBe(2);
   });
 });
 

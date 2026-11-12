@@ -12,13 +12,17 @@
  * `{error: <message>}` elsewhere, with `code` and `reason` beside it so the console and
  * older tests that read `error` keep working.
  */
+import { createHash } from "node:crypto";
+import { join } from "node:path";
 import {
   type AuthenticateConfig,
   type Authenticated,
   PROXY_SECRET_HEADER,
   type Peer,
   type SignInHandle,
+  TOKEN_FILENAME,
   authenticate,
+  loadAccessSnapshot,
 } from "@crewhaus/access-control";
 import { json } from "./http";
 
@@ -125,4 +129,25 @@ export function refusalOf(answer: Authenticated): RefusalBody | undefined {
     };
   }
   return undefined;
+}
+
+/**
+ * Why Home must not boot with the key in `<hangarRoot>/token`, or `undefined`.
+ *
+ * Once the access records hold Home's own key (the first sign-in or rotation records it),
+ * that record is the key, not the file. When the file no longer matches it (deleted and
+ * minted again at this boot, replaced, or restored from an old copy), the file's key
+ * would be refused on every request and `crewhaus hangar open` could not mint a link, so
+ * Home stops at boot and names the one verb that makes file and record agree again.
+ *
+ * First consumer: `startHangarServer`.
+ */
+export function bootstrapKeyMismatch(hangarRoot: string, token: string): string | undefined {
+  const read = loadAccessSnapshot(hangarRoot);
+  if (read.state !== "present") return undefined;
+  const recorded = read.snapshot.tokens.filter((row) => row.kind === "bootstrap");
+  if (recorded.length === 0) return undefined;
+  const digest = createHash("sha256").update(token, "utf8").digest("hex");
+  if (recorded.some((row) => row.state === "active" && row.sha256 === digest)) return undefined;
+  return `hangar-server: ${join(hangarRoot, TOKEN_FILENAME)} is not the key Home recorded (it was deleted, replaced or restored from an old copy), so it would be refused — run \`crewhaus hangar rotate-token\` to make a new one, then start Home again`;
 }

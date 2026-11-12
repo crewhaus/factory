@@ -76,7 +76,7 @@ import { renderSchedulers } from "./views/schedulers.js";
 import { renderSecurity } from "./views/security.js";
 import { renderSessions } from "./views/sessions.js";
 import { renderSettings } from "./views/settings.js";
-import { renderSignInScreen } from "./views/sign-in.js";
+import { SESSION_ENDED, openSignInDialog, renderSignInScreen } from "./views/sign-in.js";
 import { renderSpecEdit } from "./views/spec-edit.js";
 import { renderSpec } from "./views/spec.js";
 import { renderThredz, renderThredzGlobal } from "./views/thredz.js";
@@ -132,6 +132,12 @@ let keyState = initialKeyState();
 let omnibox = null;
 let sheet = null;
 let notificationsStarted = false;
+/** The sign-in dialog is up over the shell: a 401 now has nothing more to do,
+ *  and the background loops stay stopped until it is done. */
+let signInShowing = false;
+/** The last navigation met a 401 the silent sign-in could not cure, so the
+ *  view holds a skeleton; the next sign-in draws it. */
+let viewStale = false;
 
 /** Theme and Readability go on the root before the first paint, so nothing
  *  draws once in the wrong size or colours. The record lives in prefs.js,
@@ -364,7 +370,7 @@ function startNotifications() {
   // costs the server, and take a fresh reading the moment it comes back.
   document.addEventListener("visibilitychange", () => {
     if (document.hidden === true) notifications.stop();
-    else notifications.start();
+    else if (!signInShowing) notifications.start();
   });
 }
 
@@ -392,6 +398,7 @@ async function dispatch(route) {
   // rather than sniffed from the DOM so the ownership rule stays a pure
   // input to the `keys.js` reducer.
   keyState = { ...keyState, inboxMounted: route.view === "approvals" || route.view === "review" };
+  viewStale = false;
   clear(viewRoot).appendChild(skeleton(6));
   try {
     if (route.view === "library") {
@@ -423,7 +430,10 @@ async function dispatch(route) {
     }
   } catch (err) {
     if (seq !== dispatchSeq) return; // superseded by a newer navigation
-    if (err instanceof ApiError && err.status === 401) return; // sign-in owns the view
+    if (err instanceof ApiError && err.status === 401) {
+      viewStale = true; // sign-in is on screen; it draws this view when done
+      return;
+    }
     renderError(viewRoot, err);
   }
 }
@@ -811,30 +821,56 @@ async function boot() {
   installLive();
   installTooltips();
   const appRoot = document.getElementById("app");
-  // Signed back in after a 401: the polls that ran while the session was
-  // missing answered 401 and returned nothing, so take a reading now rather
-  // than at the next tick, and draw the screen the person was on.
+  // Signed back in after a 401. The request that met it is sent again by
+  // api.js, so the view and anything typed into it stay as they are: only the
+  // shell's own readings are taken again (the polls that ran while the session
+  // was missing returned nothing). A view whose own load was refused, or a run
+  // stream that ended with its session, is drawn again; neither holds a draft.
   const resume = () => {
-    loadVersion();
+    if (document.hidden !== true) notifications.start();
     loadNavCounts();
     notifications.refresh();
-    dispatch(parseRoute(window.location.hash));
+    if (viewStale) dispatch(parseRoute(window.location.hash));
   };
-  // Several requests can answer 401 at once; one of them signs back in.
+  // The silent sign-in failed: ask over the view, never instead of it, so a
+  // draft survives and focus goes back to it once the tab is signed in.
+  const askToSignIn = () => {
+    signInShowing = true;
+    notifications.stop();
+    openSignInDialog({
+      message: SESSION_ENDED,
+      onSignedIn: () => {
+        signInShowing = false;
+        resume();
+      },
+      onClose: () => {
+        // Dismissed without signing in: the next request that meets a 401 asks again.
+        signInShowing = false;
+      },
+    });
+  };
+  // Several requests can answer 401 at once; they all wait on one attempt.
   let reauth = null;
   const start = () => {
     renderShell(appRoot);
-    onUnauthorized(() => {
-      if (reauth !== null) return;
-      reauth = signIn
-        .recover()
-        .then((ok) => {
-          if (ok) resume();
-          else renderSignInScreen(viewRoot, { onSignedIn: resume });
-        })
-        .finally(() => {
-          reauth = null;
-        });
+    onUnauthorized((info) => {
+      if (signInShowing) return false;
+      if (reauth === null) {
+        reauth = signIn
+          .recover()
+          .then((ok) => {
+            if (ok) resume();
+            else askToSignIn();
+            return ok;
+          })
+          .finally(() => {
+            reauth = null;
+          });
+      }
+      return reauth.then((ok) => {
+        if (ok && info?.stream === true) dispatch(parseRoute(window.location.hash));
+        return ok;
+      });
     });
     startRouter((route) => {
       dispatch(route);

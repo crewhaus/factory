@@ -7,7 +7,11 @@
  *     renders a "nothing yet" empty state);
  *   - 401 → the registered unauthorized handler fires (the app signs in
  *     again, silently with this browser's key when it can, else the sign-in
- *     screen) and the request rejects with `ApiError(401)`.
+ *     screen). When it answers that the tab is signed in again, the request
+ *     is sent once more with the new session, so the action that met the
+ *     expired session is not lost; otherwise it rejects with `ApiError(401)`.
+ *     Replaying is safe: Home refuses an unauthenticated request before any
+ *     route sees it.
  *
  * The bearer is a session (`cha_…`) that `sign-in.js` obtained sealed to this
  * tab. It lives in sessionStorage only — never in a cookie (no cookies ⇒ no
@@ -22,9 +26,23 @@ const SESSION_KEY = "hangar.session";
 
 let unauthorizedHandler = null;
 
-/** Register the single 401 handler (the app's sign-in path). */
+/**
+ * Register the single 401 handler (the app's sign-in path). It is called with
+ * `{ stream: true }` when a run stream ended with its session, and answers
+ * (or resolves to) `true` when the tab is signed in again.
+ */
 export function onUnauthorized(fn) {
   unauthorizedHandler = fn;
+}
+
+/** Ask the handler to sign the tab in again; whether it did. */
+async function signedInAgain(info) {
+  if (!unauthorizedHandler) return false;
+  try {
+    return (await unauthorizedHandler(info)) === true;
+  } catch {
+    return false;
+  }
 }
 
 /** This tab's session secret, or null. */
@@ -64,8 +82,9 @@ function authHeaders(accept) {
 }
 
 /** One request, reported as `{ status, body }` — no throwing on a non-2xx.
- *  401 still fires the unauthorized handler (sign-in owns the view). */
-async function rawRequest(method, path, body) {
+ *  401 still fires the unauthorized handler, and the request is sent once
+ *  more when that signed the tab in again. */
+async function rawRequest(method, path, body, replayed = false) {
   const headers = authHeaders("application/json");
   const init = { method, headers };
   if (body !== undefined) {
@@ -79,7 +98,7 @@ async function rawRequest(method, path, body) {
     throw new ApiError(0, `network error: ${err instanceof Error ? err.message : String(err)}`);
   }
   if (res.status === 401) {
-    if (unauthorizedHandler) unauthorizedHandler();
+    if ((await signedInAgain()) && !replayed) return rawRequest(method, path, body, true);
     throw new ApiError(401, "unauthorized");
   }
   if (res.status === 404 || res.status === 204) return { status: res.status, body: null };
@@ -171,7 +190,7 @@ export function streamRunEvents(id, runId, onFrame) {
       return;
     }
     if (res.status === 401) {
-      if (unauthorizedHandler) unauthorizedHandler();
+      if (!controller.signal.aborted) void signedInAgain({ stream: true });
       return;
     }
     if (!res.ok || res.body === null || res.body === undefined) {
@@ -191,8 +210,12 @@ export function streamRunEvents(id, runId, onFrame) {
       if (chunk.done) break;
       for (const frame of parser.push(decoder.decode(chunk.value, { stream: true }))) {
         emit(frame.event, frame.data);
-        if (frame.event === "auth.expired" || frame.event === "auth.revoked") {
-          if (unauthorizedHandler) unauthorizedHandler();
+        // A closed view's stream aborts in `emit`; only a live one asks.
+        if (
+          (frame.event === "auth.expired" || frame.event === "auth.revoked") &&
+          !controller.signal.aborted
+        ) {
+          void signedInAgain({ stream: true });
         }
       }
     }
@@ -296,6 +319,9 @@ export const api = {
   authRefresh: (body) => authCall(ROUTES.authRefresh, body, getSession()),
   authSignOut: () => authCall(ROUTES.authSignOut, {}, getSession()),
   bootTicket: (bearer) => authCall(ROUTES.bootTicket, {}, bearer),
+  // `GET /api/version` with no credential: answered only by a Home that needs none
+  // here (--no-auth, or a trusted proxy that vouched for this person)
+  probe: () => authCall(ROUTES.version),
   // fleet feed + registry CRUD
   harnesses: (hydrate = false) =>
     call(ROUTES.harnesses, {}, undefined, hydrate ? "?hydrate=1" : ""),

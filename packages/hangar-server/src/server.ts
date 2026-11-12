@@ -95,7 +95,13 @@ import {
   shellQuote,
 } from "@crewhaus/harness-supervisor";
 import { runPreflight } from "@crewhaus/preflight";
-import { type HomeAccess, checkAccess, refusalOf, refusalResponse } from "./access";
+import {
+  type HomeAccess,
+  bootstrapKeyMismatch,
+  checkAccess,
+  refusalOf,
+  refusalResponse,
+} from "./access";
 import { currentBaselines, pinBaseline, pinSession, readPins } from "./actions";
 import {
   type ActivityHarness,
@@ -429,6 +435,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     );
   } else {
     tokenSetup = ensureToken(hangarRoot);
+    const mismatch = bootstrapKeyMismatch(hangarRoot, tokenSetup.token);
+    if (mismatch !== undefined) throw new Error(mismatch);
   }
   const signIn: SignInHandle = openSignIn(hangarRoot, {
     now,

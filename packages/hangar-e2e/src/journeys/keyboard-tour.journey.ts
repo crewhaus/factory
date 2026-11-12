@@ -7,7 +7,8 @@
  * open editor, and the Readability choices. Two edits that must not slip past
  * a newer version close it: a conflict asks for the typed confirmation again,
  * and a restored wiki draft saves against the version it was typed on. The
- * sign-in screen is toured too.
+ * sign-in screen is toured too, and the dialog a session that ends mid-use
+ * opens keeps what is typed into it and its focus while polls go on.
  */
 import { join } from "node:path";
 import { createWikiStore } from "@crewhaus/wiki-store";
@@ -109,6 +110,52 @@ async function signInScreen(session: Session): Promise<void> {
   await page.keyboard.press("Enter");
   await until(page, "the field to refuse Home's own key", async () =>
     (await page.locator(".sign-in-message").innerText()).includes("Home's own key"),
+  );
+}
+
+/** A session that ends while the shell is open: the sign-in dialog comes up over the
+ *  view, and the notification poll that keeps running underneath never redraws it, so
+ *  what is typed into it and where focus is stay put. */
+async function sessionEndsMidUse(session: Session): Promise<void> {
+  const { page } = session;
+  await page.clock.install();
+  await session.visit(LIBRARY_ROUTE);
+  await page.reload();
+  await settle(page, "the Library under a fake clock");
+  // The session ends and the browser's key is gone, so signing in silently cannot work.
+  await page.evaluate(async () => {
+    sessionStorage.removeItem("hangar.session");
+    await new Promise<void>((resolve) => {
+      const request = indexedDB.deleteDatabase("crewhaus-home");
+      request.onsuccess = () => resolve();
+      request.onerror = () => resolve();
+      request.onblocked = () => resolve();
+    });
+  });
+  await page.clock.fastForward(31_000); // one notification poll, which meets a 401
+  await waitFor(page, "dialog[open] #sign-in-link", "the sign-in dialog after the session ended");
+  if (!(await activeWithin(page, "dialog[open]"))) fail("the sign-in dialog did not take focus");
+  if ((await page.locator("#view .sign-in-card").count()) !== 0) {
+    fail("the sign-in screen replaced the view instead of opening over it");
+  }
+  await page.getByLabel("Sign-in link").focus();
+  await page.keyboard.type("half-typed");
+  await page.clock.fastForward(61_000); // two more polls' worth
+  await page.waitForTimeout(150);
+  if ((await page.getByLabel("Sign-in link").inputValue()) !== "half-typed") {
+    fail("what was typed into the sign-in link was lost while the dialog was up");
+  }
+  if (!(await activeMatches(page, "#sign-in-link"))) {
+    fail("focus left the sign-in link while the dialog was up");
+  }
+  if ((await page.locator("dialog[open]").count()) !== 1) {
+    fail("a second sign-in dialog opened while the first was up");
+  }
+  await page.keyboard.press("Escape");
+  await until(
+    page,
+    "Escape to close the sign-in dialog",
+    async () => (await page.locator("dialog[open]").count()) === 0,
   );
 }
 
@@ -680,7 +727,12 @@ export const keyboardTour: Journey = {
         theme,
         viewport: { width: 1280, height: 800 },
         // The typed-confirm conflict is mocked here too.
-        expectedStatuses: [...world.expectedStatuses, { pathname: specEditPath(id), status: 412 }],
+        expectedStatuses: [
+          ...world.expectedStatuses,
+          { pathname: specEditPath(id), status: 412 },
+          // The poll that meets the session ended mid-use.
+          { pathname: "/api/notifications", status: 401 },
+        ],
       });
       await mockRefusals(session.page, id);
       session.page.on("request", (request) => {
@@ -703,7 +755,8 @@ export const keyboardTour: Journey = {
         await inbox(session, id);
         await firstRunAndReadability(session, id);
         await conflictAsksAgain(session, id);
-        // Last: it leaves the tab signed out.
+        // Last: these leave the tab signed out.
+        await sessionEndsMidUse(session);
         await signInScreen(session);
       }
       session.assertClean();

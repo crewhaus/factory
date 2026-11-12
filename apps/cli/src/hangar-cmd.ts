@@ -464,7 +464,6 @@ export function loopbackBase(url: string, port: number): string {
 function refuseDotenvRoots(opts: HangarCommandOptions): void {
   const refusal = dotenvRootRefusal({
     cwd: opts.cwd ?? process.cwd(),
-    env: opts.env ?? process.env,
     ...(opts.readFile !== undefined ? { readFile: opts.readFile } : {}),
   });
   if (refusal !== undefined) throw new Error(refusal);
@@ -472,19 +471,26 @@ function refuseDotenvRoots(opts: HangarCommandOptions): void {
 
 const BOOT_TICKET_TIMEOUT_MS = 5_000;
 
+/** What the running console answered a boot-link request. */
+type BootPathAnswer =
+  | { readonly kind: "minted"; readonly bootPath: string }
+  /** Home refused the key in `<hangarRoot>/token`: the file is not the key it recorded. */
+  | { readonly kind: "key-refused" }
+  | { readonly kind: "unavailable" };
+
 /**
  * Mint a single-use boot link on the running console with Home's own key,
  * over `<hangarRoot>/home.sock` when it is there (TCP loopback otherwise).
- * `undefined` when the console cannot be reached or refuses.
  */
-async function mintBootPath(hangarRoot: string, lock: HangarLock): Promise<string | undefined> {
+async function mintBootPath(hangarRoot: string, lock: HangarLock): Promise<BootPathAnswer> {
+  const unavailable = { kind: "unavailable" } as const;
   let token: string;
   try {
     token = readFileSync(join(hangarRoot, TOKEN_FILENAME), "utf8").trim();
   } catch {
-    return undefined;
+    return unavailable;
   }
-  if (token === "") return undefined;
+  if (token === "") return unavailable;
   const sock = join(hangarRoot, HOME_SOCKET);
   const init = {
     method: "POST",
@@ -496,13 +502,17 @@ async function mintBootPath(hangarRoot: string, lock: HangarLock): Promise<strin
     const res = existsSync(sock)
       ? await fetch("http://localhost/api/boot-ticket", { ...init, unix: sock } as RequestInit)
       : await fetch(`${loopbackBase(lock.url, lock.port)}/api/boot-ticket`, init);
-    if (!res.ok) return undefined;
+    if (res.status === 401) {
+      const body = (await res.json().catch(() => ({}))) as { reason?: unknown };
+      return body.reason === "credential_unknown" ? { kind: "key-refused" } : unavailable;
+    }
+    if (!res.ok) return unavailable;
     const body = (await res.json()) as { bootPath?: unknown };
     return typeof body.bootPath === "string" && /^\/boot\/[0-9a-f]{64}$/.test(body.bootPath)
-      ? body.bootPath
-      : undefined;
+      ? { kind: "minted", bootPath: body.bootPath }
+      : unavailable;
   } catch {
-    return undefined;
+    return unavailable;
   }
 }
 
@@ -1141,8 +1151,16 @@ async function hangarOpen(
   const base = loopbackBase(lock.url, lock.port);
   // Trade Home's own key (which this OS user can read from disk) for a
   // single-use link, so the browser's command line carries nothing secret.
-  const bootPath = await mintBootPath(hangarRoot, lock);
-  if (bootPath === undefined) {
+  const answer = await mintBootPath(hangarRoot, lock);
+  if (answer.kind === "key-refused") {
+    return {
+      lines: [
+        `Home refused the key in ${join(hangarRoot, TOKEN_FILENAME)}: it is not the one Home recorded. Run \`crewhaus hangar rotate-token\` to make a new one, then \`crewhaus hangar open\` again.`,
+      ],
+      exitCode: 1,
+    };
+  }
+  if (answer.kind === "unavailable") {
     if (args.flags.get("print") === true) {
       return {
         lines: [
@@ -1157,7 +1175,7 @@ async function hangarOpen(
       exitCode: 0,
     };
   }
-  const link = handoffUrl(base, bootPath);
+  const link = handoffUrl(base, answer.bootPath);
   if (args.flags.get("print") === true) {
     // The operator's own terminal: a link that works once, for 2 minutes.
     return {

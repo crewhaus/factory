@@ -10,17 +10,22 @@
  *     sessionStorage (`hangar.session`) and gone with the tab. It lasts an hour from its
  *     last use and twelve hours at most.
  *
- * `boot()` runs before the router, in this order:
+ * `boot()` runs before the router. Before anything else it takes an old `#t=<key>` link
+ * (Home's own key in the address, which earlier releases printed) off the address and
+ * keeps the key only in memory, for step (d). Then, in this order:
  *
  *   a. `#x=<code>` in the address: the one-time code a boot link (`crewhaus hangar open`)
  *      redirects to. It is removed from the address FIRST, then traded, with a new device
  *      key, for a session;
  *   b. else a session already in this tab;
  *   c. else a device key: ask for a challenge, sign it, get a session;
- *   d. else a tab an earlier release left holding Home's own key (`hangar.token`): traded
- *      once for a boot link (which works only on Home's own computer) and deleted,
- *      whatever the answer;
- *   e. else the sign-in screen.
+ *   d. else Home's own key from an earlier release (that `#t=` link, or a tab still
+ *      holding it as `hangar.token`): traded once for a boot link (which works only on
+ *      Home's own computer) and dropped, whatever the answer; never stored;
+ *   e. else a request with no credential at all: a Home started with --no-auth, or one
+ *      behind a trusted proxy that vouched for this person, answers it, and the tab is
+ *      signed in as far as Home is concerned;
+ *   f. else the sign-in screen.
  *
  * After a 401, (c) runs once, silently, before the screen. A device key is deleted only
  * when Home says it is unknown, withdrawn or unused for 30 days, never on a network error.
@@ -313,7 +318,7 @@ export async function hasDevice() {
  * boot link, and delete it whatever the answer. Answers `"navigated"` when the browser
  * is on its way to the link.
  */
-export async function migrateLegacyToken() {
+export async function migrateLegacyToken(fromAddress = null) {
   const store = storage();
   let legacy = null;
   try {
@@ -321,6 +326,7 @@ export async function migrateLegacyToken() {
   } catch {
     legacy = null;
   }
+  if (legacy === null || legacy === "") legacy = fromAddress;
   if (legacy === null || legacy === "") return "none";
   let answer;
   try {
@@ -365,8 +371,24 @@ export function followBootLink(path) {
   globalThis.location.assign(path);
 }
 
+/**
+ * Take an old `#t=<key>` link off the address before anything else runs, and hand the key
+ * back (held in memory only), or null.
+ */
+function takeLegacyAddressKey() {
+  const legacy = /^#t=(.+)$/.exec(globalThis.location.hash);
+  if (legacy === null) return null;
+  replaceAddress("#/");
+  try {
+    return decodeURIComponent(legacy[1]);
+  } catch {
+    return legacy[1];
+  }
+}
+
 /** Sign in from the address and storage, before the router starts. */
 export async function boot() {
+  const addressKey = takeLegacyAddressKey();
   const loc = globalThis.location;
   let message = "";
   const fragment = /^#x=([A-Za-z0-9_-]+)$/.exec(loc.hash);
@@ -386,17 +408,20 @@ export async function boot() {
       message = device.message;
     }
   }
-  if ((await migrateLegacyToken()) === "navigated") return { signedIn: false, navigating: true };
-  // A Home started with --no-auth answers without a session: nothing to sign in to.
-  if (await authIsOff()) return { signedIn: true };
+  if ((await migrateLegacyToken(addressKey)) === "navigated") {
+    return { signedIn: false, navigating: true };
+  }
+  // A Home started with --no-auth, or a trusted proxy that vouched for this person,
+  // answers a request that carries no credential: nothing to sign in to.
+  if (await answersWithoutCredential()) return { signedIn: true };
   if (!canSignIn()) message = NOT_ENCRYPTED;
   return { signedIn: false, message };
 }
 
-/** A Home with sign-in off has no sign-in routes at all. */
-async function authIsOff() {
-  const probe = await api.authChallenge();
-  return probe.status === 404;
+/** Whether Home answers this tab with no credential at all. */
+async function answersWithoutCredential() {
+  const probe = await api.probe();
+  return probe.ok;
 }
 
 let lastSilent = Number.NEGATIVE_INFINITY;

@@ -1317,8 +1317,9 @@ dl.kv dd {
   min-width: 0;
   font-family: var(--mono);
 }
-.sign-in-message:empty {
-  display: none;
+/* Always in the layout, so words appearing in it never move the form. */
+.sign-in-message {
+  min-height: 1.5em;
 }
 /* A typed confirmation (the inspector's save): monospace, like what it echoes. */
 .token-input {

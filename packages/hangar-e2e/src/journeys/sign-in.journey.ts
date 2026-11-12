@@ -101,7 +101,7 @@ export const signIn: Journey = {
     fresh.page.on("request", (request) => sentBefore.push(new URL(request.url()).pathname));
     await input.fill(home.token);
     await input.press("Enter");
-    await fresh.page.getByText("That is Home's own key").waitFor();
+    await fresh.page.locator(".sign-in-message", { hasText: "That is Home's own key" }).waitFor();
     if (sentBefore.length !== 0)
       throw new Error(`pasting Home's key sent ${sentBefore.join(", ")}`);
     if ((await input.inputValue()) !== "") throw new Error("Home's key stayed in the field");

@@ -5,9 +5,10 @@
  * through the module's `env` option, so nothing here can touch the real
  * `~/.crewhaus`. Lock semantics are unit-tested with fake pid-liveness
  * probes; the `status --json` running case boots a real in-process
- * `startHangarServer` on an ephemeral port; the ONE subprocess in this file
- * is the `hangar serve --smoke` end-to-end (the release workflow's smoke
- * entry), spawned with an explicit generous timeout per the CI rule.
+ * `startHangarServer` on an ephemeral port. The subprocesses are the
+ * `hangar serve --smoke` end-to-end (the release workflow's smoke entry) and
+ * the dotenv rows, which need Bun's own `.env` loader; each is spawned with an
+ * explicit generous timeout per the CI rule.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -740,6 +741,46 @@ describe("hangar status / open", () => {
     }
   });
 
+  test("open names rotate-token when Home refuses the key in the file", async () => {
+    const ws = newWorkspace();
+    const server = startHangarServer({
+      port: 0,
+      root: ws.hangarRoot,
+      registryRoot: ws.env["CREWHAUS_REGISTRY_ROOT"] as string,
+      env: ws.env,
+      onWarn: () => {},
+    });
+    try {
+      writeHangarLock(ws.hangarRoot, {
+        ...LOCK,
+        pid: process.pid,
+        port: server.port,
+        url: server.url,
+      });
+      // Recorded by a rotation, then the file replaced behind Home's back.
+      const rotated = await runHangarCommand(["rotate-token"], {
+        env: ws.env,
+        identity: { username: "tester", hostname: "test-host" },
+      });
+      expect(rotated.exitCode).toBe(0);
+      writeFileSync(join(ws.hangarRoot, "token"), `${"cd".repeat(32)}\n`, { mode: 0o600 });
+      for (const argv of [["open"], ["open", "--print"]]) {
+        const opened: string[] = [];
+        const out = await runHangarCommand(argv, {
+          env: ws.env,
+          openBrowser: (url) => opened.push(url),
+        });
+        expect(out.exitCode).toBe(1);
+        expect(opened).toEqual([]);
+        expect(out.lines.join("\n")).toContain("is not the one Home recorded");
+        expect(out.lines.join("\n")).toContain("crewhaus hangar rotate-token");
+        expect(out.lines.join("\n")).not.toContain("cd".repeat(32));
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+
   test("rotate-token against a running Home: the old key is refused at once, the new one works", async () => {
     const ws = newWorkspace();
     const server = startHangarServer({
@@ -810,14 +851,29 @@ describe("Home's directories and dotenv files", () => {
     }
   });
 
-  test("a different exported value wins and is accepted; no file is accepted", async () => {
+  test("a line in the file is refused even when a different value is exported", async () => {
+    // Bun never overrides an export, so such a line is dead or the one that chose the
+    // directory; it cannot tell which, and neither can Home.
     const ws = newWorkspace();
-    const differing = await runHangarCommand(["status"], {
+    await expect(
+      runHangarCommand(["status"], {
+        env: ws.env,
+        cwd: ws.root,
+        readFile: files({ ".env": "CREWHAUS_HANGAR_ROOT=/somewhere/else\n" }),
+      }),
+    ).rejects.toThrow(/CREWHAUS_HANGAR_ROOT is set in \.\/\.env\./);
+  });
+
+  test("files without either variable, and no files, are accepted", async () => {
+    const ws = newWorkspace();
+    const other = await runHangarCommand(["status"], {
       env: ws.env,
       cwd: ws.root,
-      readFile: files({ ".env": "CREWHAUS_HANGAR_ROOT=/somewhere/else\n" }),
+      readFile: files({
+        ".env": "# CREWHAUS_HANGAR_ROOT=/commented\nCREWHAUS_HANGAR_ROOTS=/other\nPORT=1\n",
+      }),
     });
-    expect(differing.exitCode).toBe(0);
+    expect(other.exitCode).toBe(0);
     const none = await runHangarCommand(["status"], {
       env: ws.env,
       cwd: ws.root,
@@ -825,6 +881,53 @@ describe("Home's directories and dotenv files", () => {
     });
     expect(none.exitCode).toBe(0);
   });
+
+  // Each spelling goes through Bun's own loader in a child started in a directory that
+  // holds only that `.env`, with neither variable in its environment: the child proves the
+  // line reached `process.env` and that the refusal still names it.
+  test.each([
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT=/tmp/plain\n"],
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT=$HOME/planted-root\n"],
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT=${HOME}/planted-root\n"],
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT='$HOME/planted-root'\n"],
+    ["CREWHAUS_REGISTRY_ROOT", "R=/tmp/r\nCREWHAUS_REGISTRY_ROOT=$R\n"],
+    ["CREWHAUS_HANGAR_ROOT", 'CREWHAUS_HANGAR_ROOT="/tmp/e" # note\n'],
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT='/tmp/sq'  # comment\n"],
+    ["CREWHAUS_HANGAR_ROOT", "CREWHAUS_HANGAR_ROOT=`/tmp/bt`\n"],
+    ["CREWHAUS_HANGAR_ROOT", "  export CREWHAUS_HANGAR_ROOT = /tmp/spaced\r\n"],
+  ])(
+    "%s from Bun's own loading of %j is refused",
+    async (name, text) => {
+      const dir = mkdtempSync(join(tmpdir(), "hangar-dotenv-"));
+      writeFileSync(join(dir, ".env"), text);
+      const script = [
+        `import { dotenvRootRefusal } from ${JSON.stringify(join(import.meta.dir, "hangar-env.ts"))};`,
+        "const refusal = dotenvRootRefusal({ cwd: process.cwd() });",
+        `console.log(JSON.stringify({ value: process.env[${JSON.stringify(name)}] ?? null, refusal: refusal ?? null }));`,
+      ].join("\n");
+      const env: Record<string, string> = { PATH: process.env["PATH"] ?? "", HOME: dir };
+      const proc = Bun.spawn([process.execPath, "-e", script], {
+        cwd: dir,
+        env,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      rmSync(dir, { recursive: true, force: true });
+      if (exitCode !== 0) throw new Error(`child exited ${exitCode}: ${stderr}`);
+      const got = JSON.parse(stdout.trim()) as { value: string | null; refusal: string | null };
+      // Bun loaded the line, so the variable is set in the child.
+      expect(got.value).not.toBeNull();
+      expect(got.refusal).toContain(`${name} is set in ./.env.`);
+    },
+    // A child process per row; CI runners start one far slower than a laptop.
+    20_000,
+  );
 
   test("reads the real files in the working directory", async () => {
     const ws = newWorkspace();
@@ -836,7 +939,7 @@ describe("Home's directories and dotenv files", () => {
 });
 
 // ---------------------------------------------------------------------------
-// serve --smoke end-to-end (the ONE subprocess in this file)
+// serve --smoke end-to-end (a subprocess)
 // ---------------------------------------------------------------------------
 
 describe("hangar serve --smoke", () => {

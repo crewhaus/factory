@@ -69,6 +69,9 @@ export async function a11yFleet(scope: JourneyScope, seed: string): Promise<A11y
     expectedStatuses: [
       { pathname: startPath(harness.id), status: 409 },
       { pathname: specPatchPath(harness.id), status: 412 },
+      // The sign-in screen first asks whether Home answers this tab with no
+      // credential at all (a trusted proxy, or --no-auth); this one does not.
+      { pathname: "/api/version", status: 401 },
     ],
   };
 }
@@ -412,12 +415,23 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     });
   }
-  // Last: it leaves the tab signed out.
+  // Last: they leave the tab signed out.
   states.push({
     template: SIGN_IN_TEMPLATE,
     state: "first paint",
     route: LIBRARY_ROUTE,
     open: showSignInScreen,
+  });
+  states.push({
+    template: SIGN_IN_TEMPLATE,
+    state: "a link refused",
+    route: LIBRARY_ROUTE,
+    open: async (page) => {
+      await showSignInScreen(page);
+      await page.getByLabel("Sign-in link").fill("not a link");
+      await page.getByLabel("Sign-in link").press("Enter");
+      await waitFor(page, ".sign-in-message strong", "the refusal on the sign-in screen");
+    },
   });
   return states;
 }
