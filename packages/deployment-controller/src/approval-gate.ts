@@ -256,11 +256,9 @@ export function rollupConclusion(
 }
 
 /**
- * F3(b) — does this PR reference `version` as a bounded token in its head ref,
- * title, or body? `propose` names the branch `propose/<slug>-<version>-<hash>-
- * <stamp>`, so the version is a bounded segment of the head ref; a bare
- * substring match would let `v1` witness `v10`, so require non-alphanumeric
- * (or string-edge) bounds. Binds the PR witness to the EXACT promoted version.
+ * Whether `version` appears as a bounded token in this PR's head ref, title or
+ * body: a bare substring match would let `v1` match `v10`, so the token needs
+ * non-alphanumeric (or string-edge) bounds.
  */
 export function prReferencesVersion(
   pr: { readonly headRefName?: string; readonly title?: string; readonly body?: string },

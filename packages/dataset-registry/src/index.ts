@@ -35,6 +35,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   writeFileSync,
   writeSync,
@@ -502,20 +503,28 @@ export function recordHeldOutUse(opts: RecordHeldOutUseOptions): HeldOutUse {
   return use;
 }
 
-/** The most use lines {@link readHeldOutUses} reads. */
+/** The most use lines {@link readHeldOutUses} parses: the newest ones. */
 export const HELD_OUT_USES_READ_CAP = 10_000;
+
+/**
+ * The bytes {@link readHeldOutUses} allows per line when it sizes its read
+ * window: it reads at most `HELD_OUT_USES_READ_CAP × HELD_OUT_USE_LINE_MAX_BYTES`
+ * bytes, from the end of the ledger.
+ */
+export const HELD_OUT_USE_LINE_MAX_BYTES = 1024;
 
 export type HeldOutUsesReport = {
   /** True when the version has a use ledger. */
   readonly present: boolean;
-  /** Well-formed use lines, in file order (oldest first). */
+  /** Well-formed use lines among the newest ones read, in file order (oldest first). */
   readonly uses: ReadonlyArray<HeldOutUse>;
   /** `releases[]` entries on the record that no test-split use line names
    *  by `runId`: each counts once as a release use of the test split. */
   readonly legacyReleases: ReadonlyArray<ReleaseEntry>;
   /** Lines that were not a well-formed use (a torn last line, a hand edit). */
   readonly skipped: number;
-  /** True when the ledger holds more than {@link HELD_OUT_USES_READ_CAP} lines. */
+  /** True when the ledger holds more than was read: more than
+   *  {@link HELD_OUT_USES_READ_CAP} lines, or more bytes than the read window. */
   readonly truncated: boolean;
   /** Why the ledger could not be read, when it could not. */
   readonly note?: string;
@@ -547,11 +556,38 @@ function parseHeldOutUse(line: string): HeldOutUse | undefined {
 }
 
 /**
+ * The last `HELD_OUT_USES_READ_CAP × HELD_OUT_USE_LINE_MAX_BYTES` bytes of an
+ * open ledger, as text. When the window starts after byte 0 (`cut`), the line
+ * the window's start falls in is dropped whole.
+ */
+function readLedgerTail(fd: number): { readonly text: string; readonly cut: boolean } {
+  const window = HELD_OUT_USES_READ_CAP * HELD_OUT_USE_LINE_MAX_BYTES;
+  const size = fstatSync(fd).size;
+  const start = Math.max(0, size - window);
+  const buf = Buffer.alloc(size - start);
+  let filled = 0;
+  while (filled < buf.length) {
+    const n = readSync(fd, buf, filled, buf.length - filled, start + filled);
+    if (n === 0) break;
+    filled += n;
+  }
+  let bytes = buf.subarray(0, filled);
+  const cut = start > 0;
+  if (cut) {
+    const newline = bytes.indexOf(0x0a);
+    bytes = newline === -1 ? bytes.subarray(bytes.length) : bytes.subarray(newline + 1);
+  }
+  return { text: bytes.toString("utf8"), cut };
+}
+
+/**
  * Read a version's use ledger. A read: no lock and no write, a torn or
- * foreign line is counted in `skipped` (never thrown), at most
- * {@link HELD_OUT_USES_READ_CAP} lines are read and more is reported as
- * `truncated`, and a ledger that is a link or not a regular file is reported
- * in `note`, never followed. The record's legacy `releases[]` entries are
+ * foreign line is counted in `skipped` (never thrown), and the newest lines
+ * are the ones read: at most {@link HELD_OUT_USES_READ_CAP} lines from the
+ * last `HELD_OUT_USES_READ_CAP × HELD_OUT_USE_LINE_MAX_BYTES` bytes, with
+ * anything older reported as `truncated` (a line cut by the window's start is
+ * dropped, not counted in `skipped`). A ledger that is a link or not a
+ * regular file is reported in `note`, never followed. The record's legacy `releases[]` entries are
  * returned when no test-split use line names their run.
  */
 export function readHeldOutUses(rootDir: string, name: string, version: string): HeldOutUsesReport {
@@ -570,6 +606,7 @@ export function readHeldOutUses(rootDir: string, name: string, version: string):
     // An absent or torn record carries no legacy releases.
   }
   let text = "";
+  let windowCut = false;
   let present = false;
   let note: string | undefined;
   let st: ReturnType<typeof lstatSync> | undefined;
@@ -588,7 +625,9 @@ export function readHeldOutUses(rootDir: string, name: string, version: string):
       try {
         const fd = openSync(path, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
         try {
-          text = readFileSync(fd, "utf8");
+          const tail = readLedgerTail(fd);
+          text = tail.text;
+          windowCut = tail.cut;
         } finally {
           closeSync(fd);
         }
@@ -599,10 +638,10 @@ export function readHeldOutUses(rootDir: string, name: string, version: string):
   }
   const lines = text.split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-  const truncated = lines.length > HELD_OUT_USES_READ_CAP;
+  const truncated = windowCut || lines.length > HELD_OUT_USES_READ_CAP;
   const uses: HeldOutUse[] = [];
   let skipped = 0;
-  for (const line of lines.slice(0, HELD_OUT_USES_READ_CAP)) {
+  for (const line of lines.slice(Math.max(0, lines.length - HELD_OUT_USES_READ_CAP))) {
     if (line.trim() === "") continue;
     const use = parseHeldOutUse(line);
     if (use === undefined) skipped++;
