@@ -24,6 +24,7 @@ describe("the layout", () => {
       approversFile: join(CONTROL, "approvers.json"),
       deploymentsFile: join(CONTROL, "deployments.jsonl"),
       harnessIdentityFile: join(CONTROL, "harness.json"),
+      heartbeatFile: join(".crewhaus", "run", "control-heartbeat.json"),
     });
     expect(readdirSync(root)).toEqual([]);
   });

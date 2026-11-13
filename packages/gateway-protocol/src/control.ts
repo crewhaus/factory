@@ -19,19 +19,41 @@
  *     which is then reported on stdout). Unset ⇒ no control socket at all,
  *     so upgrading a bundle never opens a listener nobody asked for.
  *     Exposing it on a PaaS is an explicit opt-in: set the bind + token as
- *     provider secrets at deploy time.
+ *     provider secrets at deploy time. A bind beyond this computer (any
+ *     `CREWHAUS_CONTROL_BIND` that {@link isLoopbackBind} does not accept)
+ *     opens only with a token set in `CREWHAUS_CONTROL_TOKEN`; a token minted
+ *     into a file serves a loopback socket only.
  *   - Bearer auth against `CREWHAUS_CONTROL_TOKEN`, or a token minted at boot
  *     into `<cwd>/.crewhaus/run/control-token` (0600) so a local manager can
  *     read it off disk. Compared in constant time; never logged, never
  *     echoed, never written to an audit payload.
- *   - `GET  /control/v1/healthz` → `{ok, name, target}`
- *   - `GET  /control/v1/status`  → counters + per-lane timers + channels +
- *                                  pending approvals
- *   - `POST /control/v1/wake`    → one synthetic tick down the IDENTICAL code
- *                                  path as the timer fire
- *   - `POST /control/v1/drain`   → stop intake, finish in-flight work, exit 0
- *   - Every call appends a `gateway_request` record to the harness's
- *     hash-chained audit log when one is wired.
+ *   - The routes are {@link CONTROL_ROUTES}:
+ *     - `GET  /control/v1/healthz` → `{ok, name, target}`
+ *     - `GET  /control/v1/status`  → counters, per-lane timers, channels,
+ *                                    pending approvals, the operator record,
+ *                                    the controls this daemon supports and
+ *                                    its active runs
+ *     - `POST /control/v1/wake`    → one synthetic tick down the IDENTICAL
+ *                                    code path as the timer fire
+ *     - `POST /control/v1/drain`   → stop intake, finish in-flight work, exit 0
+ *     - `POST /control/v1/runs/{runId}/cancel` → signal that run's abort
+ *     - `POST /control/v1/operator/reload` → re-read the operator record now
+ *     - `POST /control/v1/runs/claim` → wake the registered queued-runs follower
+ *   - A control route restricts or asks for a re-read; lifting a restriction is
+ *     a record write by an authorized command. No route sets or lifts a pause
+ *     or a disable.
+ *   - A refused call (401, an unknown route) and every POST append one
+ *     `gateway_request` record to the harness's hash-chained audit log when
+ *     one is wired; a successful `healthz` or `status` read appends nothing.
+ *
+ * THE OPERATOR RECORD. The plane honours `.crewhaus/run/control/operator.json`
+ * (`@crewhaus/control-records`): a daemon booting while it is disabled, or
+ * while it cannot be read, exits 38 from the constructor; while intake is
+ * closed, a lane's tick runs nothing and a wake answers 409 with the verdict's
+ * code. `start()` names the harness as this process's intake root, which the
+ * runtime's loop admission reads, and writes a heartbeat to
+ * `.crewhaus/run/control-heartbeat.json` every {@link HEARTBEAT_INTERVAL_MS},
+ * with or without a control port.
  *
  * Separately — and INDEPENDENT of whether the control port is bound — a bare,
  * unauthenticated `GET /healthz` is served on the daemon's PUBLIC port when it
@@ -48,9 +70,31 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { effectiveDecisionState } from "@crewhaus/control-contract";
+import {
+  CANONICAL_RUN_ID_RE,
+  type CapabilityName,
+  effectiveDecisionState,
+} from "@crewhaus/control-contract";
+import {
+  type IntakeVerdict,
+  type OperatorRead,
+  assertRunnable,
+  intakeVerdict,
+  readOperatorRecord,
+  refreshOperatorRecord,
+  registerIntakeRoot,
+  unregisterIntakeRoot,
+  writeHeartbeat,
+} from "@crewhaus/control-records";
+import { EXIT_CODES } from "@crewhaus/errors";
 import { openEventLog } from "@crewhaus/event-log";
-import { type RunScope, formatResumeScope, runWithScope } from "@crewhaus/run-context";
+import {
+  type RunScope,
+  activeRunCount,
+  cancelRun,
+  formatResumeScope,
+  runWithScope,
+} from "@crewhaus/run-context";
 import { foldReadOnly } from "@crewhaus/session-store";
 
 /** Wire identifier for this control protocol. Bumping it is a breaking change. */
@@ -88,6 +132,46 @@ export const DEFAULT_DRAIN_SWEEP_MS = 5_000;
 /** `Retry-After` (seconds) on the 503 a draining daemon answers intake with. */
 export const DRAIN_RETRY_AFTER_SECONDS = 15;
 
+/** How often `start()` rewrites `.crewhaus/run/control-heartbeat.json`, in ms. */
+export const HEARTBEAT_INTERVAL_MS = 15_000;
+
+/**
+ * Every control route, as `{method, route}` with the full path. `fetch`
+ * dispatches from this list, so a route is served exactly when it is listed.
+ */
+export const CONTROL_ROUTES = Object.freeze([
+  Object.freeze({ method: "GET", route: `${CONTROL_PATH_PREFIX}/healthz` }),
+  Object.freeze({ method: "GET", route: `${CONTROL_PATH_PREFIX}/status` }),
+  Object.freeze({ method: "POST", route: `${CONTROL_PATH_PREFIX}/wake` }),
+  Object.freeze({ method: "POST", route: `${CONTROL_PATH_PREFIX}/drain` }),
+  Object.freeze({ method: "POST", route: `${CONTROL_PATH_PREFIX}/runs/{runId}/cancel` }),
+  Object.freeze({ method: "POST", route: `${CONTROL_PATH_PREFIX}/operator/reload` }),
+  Object.freeze({ method: "POST", route: `${CONTROL_PATH_PREFIX}/runs/claim` }),
+] as const);
+
+export type ControlRoute = (typeof CONTROL_ROUTES)[number];
+
+/** The code a closed intake answers with: the operator verdict's. */
+export type IntakeClosedCode = Extract<IntakeVerdict, { readonly state: "closed" }>["code"];
+
+/**
+ * Whether `host` is a loopback address: `localhost`, any `127.0.0.0/8`
+ * address, or `::1`, bracketed or not, and the IPv4-mapped `::ffff:127.x.x.x`.
+ * Anything else, `0.0.0.0` and `::` included, is beyond this computer.
+ */
+export function isLoopbackBind(host: string): boolean {
+  let h = host.trim().toLowerCase();
+  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+  if (h === "localhost" || h === "::1") return true;
+  const v4 = h.startsWith("::ffff:") ? h.slice("::ffff:".length) : h;
+  const octets = v4.split(".");
+  return (
+    octets.length === 4 &&
+    octets[0] === "127" &&
+    octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
+  );
+}
+
 /** The two lanes an operator can poke. Both are in-process timers. */
 export type ControlLane = "heartbeat" | "schedule";
 
@@ -108,6 +192,8 @@ export type ControlTimerReport = {
   readonly lastFiredAt?: string;
   readonly lastOutcome?: ControlOutcome;
   readonly nextDueAt?: string;
+  /** Set when the last organic fire ran nothing because intake was closed. */
+  readonly skipped?: IntakeClosedCode;
 };
 
 /** What a lane's tick body receives. `synthetic` is set only for operator pokes. */
@@ -176,6 +262,8 @@ export interface ControlLaneHandle {
   wake(args: { readonly reason: string; readonly by: string }): Promise<{
     readonly accepted: boolean;
     readonly sessionId?: string;
+    /** Set when intake is closed: the tick did not start, and this is why. */
+    readonly refused?: IntakeClosedCode;
   }>;
   /** Resolves once no tick is in flight (used by drain). */
   settled(): Promise<void>;
@@ -216,6 +304,17 @@ export type ControlPlaneOptions = {
    * so the 202 is on the wire before the process starts tearing down.
    */
   readonly drainSettleMs?: number;
+  /**
+   * The operator-record reader, for tests. Defaults to `readOperatorRecord`,
+   * which `POST /control/v1/operator/reload` refreshes; an injected reader
+   * that carries a `refresh` is refreshed too.
+   */
+  readonly operatorRead?: (harnessDir: string) => OperatorRead;
+  /** The heartbeat's timer, for tests. Defaults to the global interval timer. */
+  readonly timers?: {
+    readonly setInterval: (fn: () => void, ms: number) => unknown;
+    readonly clearInterval: (handle: unknown) => void;
+  };
 };
 
 export interface ControlPlane {
@@ -244,6 +343,13 @@ export interface ControlPlane {
   publicGate(req: Request): Response | undefined;
   /** Where the bearer came from. Never returns the token itself. */
   tokenSource(): { readonly source: "env" | "file"; readonly path?: string } | undefined;
+  /**
+   * Register what `POST /control/v1/runs/claim` wakes: the follower that
+   * claims queued runs. The last registration wins. While none is registered
+   * the route answers 404 `claim_unsupported`, and `/status` lists no
+   * `runs.create`.
+   */
+  onClaim(handler: () => void | Promise<void>): void;
 }
 
 /**
@@ -486,6 +592,20 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
   const stderr = opts.stderr ?? ((line: string) => process.stderr.write(line));
   const exit = opts.exit ?? ((code: number) => process.exit(code));
   const drainSettleMs = opts.drainSettleMs ?? 50;
+  const readOperator = opts.operatorRead ?? readOperatorRecord;
+
+  // A daemon whose operator disabled it, or whose operator record cannot be
+  // read, does not start: it exits 38 here, before it binds anything.
+  const boot = assertRunnable(cwd, { mode: "start", read: readOperator });
+  const bootRefused = !boot.ok;
+  if (!boot.ok) {
+    stderr(
+      boot.reason === "unreadable"
+        ? "[control] operator record unreadable, not starting\n"
+        : "[control] disabled by its operator, not starting\n",
+    );
+    exit(EXIT_CODES.disabled);
+  }
 
   const startedAt = new Date(now()).toISOString();
   const counters: ControlCounters = {
@@ -501,6 +621,14 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
   let draining = false;
   let server: { stop(closeActiveConnections?: boolean): unknown; port?: number } | undefined;
   let resolved: ResolvedControlToken | undefined;
+  let claimHandler: (() => void | Promise<void>) | undefined;
+  let heartbeatHandle: unknown;
+  const heartbeatFailures = new Set<string>();
+  const timers = opts.timers ?? {
+    setInterval: (fn: () => void, ms: number): unknown => setInterval(fn, ms),
+    clearInterval: (handle: unknown): void =>
+      clearInterval(handle as ReturnType<typeof setInterval>),
+  };
 
   function laneCounterKey(lane: ControlLane): keyof ControlCounters {
     return lane === "heartbeat" ? "heartbeatTicks" : "scheduleWakes";
@@ -514,6 +642,7 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
     let lastStartMs: number | undefined;
     let lastFiredAt: string | undefined;
     let lastOutcome: ControlOutcome | undefined;
+    let lastSkipped: IntakeClosedCode | undefined;
 
     /**
      * Claim the lane and run one tick. The claim (`busy = true`) is made
@@ -526,8 +655,18 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
       accepted: boolean;
       sessionId: string;
       done: Promise<void>;
+      refused?: IntakeClosedCode;
     } {
+      const closed = intakeClosed();
+      if (closed !== undefined) {
+        if (synthetic === undefined) {
+          lastSkipped = closed;
+          lastStartMs = now();
+        }
+        return { accepted: false, sessionId: "", done: Promise.resolve(), refused: closed };
+      }
       if (busy) return { accepted: false, sessionId: "", done: inFlight };
+      if (synthetic === undefined) lastSkipped = undefined;
       busy = true;
       const sessionId = mintSessionId();
       lastStartMs = now();
@@ -594,6 +733,7 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
         return {
           accepted: started.accepted,
           ...(started.accepted && ownsSession ? { sessionId: started.sessionId } : {}),
+          ...(started.refused !== undefined ? { refused: started.refused } : {}),
         };
       },
       async settled(): Promise<void> {
@@ -612,10 +752,97 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
           ...(lastFiredAt !== undefined ? { lastFiredAt } : {}),
           ...(lastOutcome !== undefined ? { lastOutcome } : {}),
           ...(projected !== undefined ? { nextDueAt: projected } : {}),
+          ...(lastSkipped !== undefined ? { skipped: lastSkipped } : {}),
         };
       },
     };
     return handle;
+  }
+
+  /** The code new work is refused with while the operator record closes intake. */
+  function intakeClosed(): IntakeClosedCode | undefined {
+    const verdict = intakeVerdict(cwd, { read: readOperator });
+    return verdict.state === "closed" ? verdict.code : undefined;
+  }
+
+  /** What `/status`, the heartbeat and a reload answer about the operator record. */
+  function operatorState(): {
+    readonly rev: number | null;
+    readonly paused: boolean;
+    readonly disabled: boolean;
+    readonly unreadable: boolean;
+  } {
+    const read = readOperator(cwd);
+    if (read.state === "unreadable") {
+      // An unreadable record counts as paused, and stops a start.
+      return { rev: null, paused: true, disabled: false, unreadable: true };
+    }
+    if (read.state === "absent") {
+      return { rev: null, paused: false, disabled: false, unreadable: false };
+    }
+    return {
+      rev: read.record.rev,
+      paused: read.record.intake?.paused === true,
+      disabled: read.record.deployment?.disabled === true,
+      unreadable: false,
+    };
+  }
+
+  /** Whether this process records run rows (`CREWHAUS_RUN_LEDGER=0` turns them off). */
+  function runLedgerOn(): boolean {
+    return env["CREWHAUS_RUN_LEDGER"] !== "0";
+  }
+
+  /**
+   * Runs this process is running, or `null` where it cannot count them: a
+   * managed tenant's run and a run with run rows off take no hold.
+   */
+  function activeRuns(): number | null {
+    return opts.target === "managed" || !runLedgerOn() ? null : activeRunCount();
+  }
+
+  /** The controls `/status` says this daemon supports. */
+  function capabilities(): CapabilityName[] {
+    return [
+      ...(opts.target === "voice" ? [] : (["controls.pauseIntake"] as const)),
+      "controls.cancelRun",
+      "controls.drain",
+      "controls.disable",
+      ...(runLedgerOn() ? (["runs.ledger"] as const) : []),
+      ...(claimHandler !== undefined ? (["runs.create"] as const) : []),
+    ];
+  }
+
+  /** Write one heartbeat; a failure is one stderr line per reason, never a throw. */
+  function beat(): void {
+    const operator = operatorState();
+    const written = writeHeartbeat(cwd, {
+      v: 1,
+      pid: opts.pid ?? process.pid,
+      at: new Date(now()).toISOString(),
+      operatorRev: operator.rev,
+      paused: operator.paused,
+      disabled: operator.disabled,
+      activeRuns: activeRuns(),
+      runLedger: runLedgerOn(),
+    });
+    if (!written.ok && !heartbeatFailures.has(written.reason)) {
+      heartbeatFailures.add(written.reason);
+      stderr(`[control] heartbeat not written: ${sanitizeControlText(written.reason)}\n`);
+    }
+  }
+
+  function startHeartbeat(): void {
+    if (heartbeatHandle !== undefined) return;
+    beat();
+    heartbeatHandle = timers.setInterval(beat, HEARTBEAT_INTERVAL_MS);
+    (heartbeatHandle as { unref?: () => void } | null)?.unref?.();
+  }
+
+  function stopHeartbeat(): void {
+    if (heartbeatHandle === undefined) return;
+    timers.clearInterval(heartbeatHandle);
+    heartbeatHandle = undefined;
   }
 
   function token(): string {
@@ -664,6 +891,9 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
       timers,
       channels: opts.channels !== undefined ? [...opts.channels()] : [],
       pendingApprovals,
+      operator: operatorState(),
+      capabilities: capabilities(),
+      activeRuns: activeRuns(),
     };
   }
 
@@ -684,6 +914,7 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
         } catch (err) {
           stderr(`[control] drain error: ${(err as Error).message}\n`);
         } finally {
+          stopHeartbeat();
           stdout("[control] drained — exiting 0\n");
           exit(0);
         }
@@ -745,6 +976,22 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
     const reason = cleanReason !== "" ? cleanReason : "operator wake";
     const by = cleanBy !== "" ? cleanBy : CONTROL_PROTOCOL;
     const outcome = await handle.wake({ reason, by });
+    if (outcome.refused !== undefined) {
+      // Intake is closed by the operator record: no new tick starts until it opens.
+      return {
+        lane,
+        reason,
+        by,
+        res: jsonResponse(
+          {
+            error: `this daemon is ${outcome.refused} by its operator — no new ticks start`,
+            code: outcome.refused,
+            lane,
+          },
+          409,
+        ),
+      };
+    }
     if (!outcome.accepted) {
       // Ticks never overlap themselves — armSchedule's re-arm-after-resolve
       // rule applies to operator pokes too.
@@ -777,12 +1024,174 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
     };
   }
 
+  /** One audited record for a control call, never carrying a credential. */
+  function audited(
+    req: Request,
+    path: string,
+    status: number,
+    extra: Record<string, unknown> = {},
+  ): Promise<void> {
+    return audit({
+      protocol: CONTROL_PROTOCOL,
+      route: path,
+      method: req.method,
+      authorized: true,
+      status,
+      ...extra,
+    });
+  }
+
+  /**
+   * `POST /control/v1/runs/{runId}/cancel`: signal the abort of a run this
+   * process is running (run-context `cancelRun`). A 202 means this process
+   * signalled the run's abort; a run whose controller this process still
+   * keeps after the run ended, as a managed run's can be, answers 202 too. A
+   * run this process is not running, a parked one included, answers 404
+   * `run_not_active`. Served while draining, paused or disabled. The body is
+   * not read.
+   */
+  async function handleCancel(req: Request, path: string, runId: string): Promise<Response> {
+    if (!CANONICAL_RUN_ID_RE.test(runId)) {
+      await audited(req, path, 400);
+      return jsonResponse(
+        { error: "cancel needs a crewhaus run id: run_ and 26 characters", code: "bad_request" },
+        400,
+      );
+    }
+    if (cancelRun(runId)) {
+      await audited(req, path, 202, { runId });
+      return jsonResponse({ runId, cancelled: true }, 202);
+    }
+    await audited(req, path, 404, { runId });
+    return jsonResponse(
+      { error: `this daemon is not running run ${runId}`, code: "run_not_active", runId },
+      404,
+    );
+  }
+
+  /**
+   * `POST /control/v1/operator/reload`: read the operator record now, through
+   * the default reader and through an injected reader that can refresh, and
+   * answer what is enforced from here on. The body is not read.
+   */
+  async function handleReload(req: Request, path: string): Promise<Response> {
+    refreshOperatorRecord(cwd);
+    const injected = opts.operatorRead as { readonly refresh?: unknown } | undefined;
+    if (typeof injected?.refresh === "function") {
+      (injected.refresh as (harnessDir: string) => OperatorRead)(cwd);
+    }
+    const operator = operatorState();
+    await audited(req, path, 200, { rev: operator.rev });
+    return jsonResponse({ operator }, 200);
+  }
+
+  /**
+   * `POST /control/v1/runs/claim`: wake the registered queued-runs follower
+   * without waiting for it. 404 `claim_unsupported` while none is registered;
+   * 409 while draining or while intake is closed, and the follower is not
+   * woken. The body is not read.
+   */
+  async function handleClaim(req: Request, path: string): Promise<Response> {
+    const follower = claimHandler;
+    if (follower === undefined) {
+      await audited(req, path, 404);
+      return jsonResponse(
+        { error: "this daemon runs no queued runs", code: "claim_unsupported" },
+        404,
+      );
+    }
+    if (draining) {
+      await audited(req, path, 409, { code: "draining" });
+      return jsonResponse(
+        { error: "daemon is draining — no new work accepted", code: "draining" },
+        409,
+      );
+    }
+    const closed = intakeClosed();
+    if (closed !== undefined) {
+      await audited(req, path, 409, { code: closed });
+      return jsonResponse(
+        { error: `this daemon is ${closed} by its operator — no new work starts`, code: closed },
+        409,
+      );
+    }
+    void (async () => {
+      try {
+        await follower();
+      } catch (err) {
+        stderr(`[control] claim failed: ${sanitizeControlText((err as Error).message)}\n`);
+      }
+    })();
+    await audited(req, path, 202);
+    return jsonResponse({ claimed: "requested" }, 202);
+  }
+
+  type RouteHandler = (
+    req: Request,
+    path: string,
+    params: Readonly<Record<string, string>>,
+  ) => Promise<Response>;
+
+  /** One handler per listed route: a route missing here does not compile. */
+  const ROUTE_HANDLERS: Readonly<Record<ControlRoute["route"], RouteHandler>> = {
+    "/control/v1/healthz": async () =>
+      // A successful read is not audited: a liveness probe would fill the log.
+      jsonResponse({ ok: true, name: opts.name, target: opts.target }, 200),
+    "/control/v1/status": async () => jsonResponse(await statusBody(), 200),
+    "/control/v1/wake": async (req, path) => {
+      const outcome = await handleWake(req);
+      await audited(req, path, outcome.res.status, {
+        ...(outcome.lane !== undefined ? { lane: outcome.lane } : {}),
+        ...(outcome.sessionId !== undefined ? { sessionId: outcome.sessionId } : {}),
+        // The poke's provenance rides the hash-chained audit log — the record
+        // that IS covered by the harness's retention policy — so a lane with
+        // no session of its own is still evidenced.
+        ...(outcome.reason !== undefined ? { reason: outcome.reason } : {}),
+        ...(outcome.by !== undefined ? { by: outcome.by } : {}),
+      });
+      return outcome.res;
+    },
+    "/control/v1/drain": async (req, path) => {
+      const already = draining;
+      if (!already) beginDrain();
+      await audited(req, path, 202, { alreadyDraining: already });
+      return jsonResponse({ draining: true, alreadyDraining: already }, 202);
+    },
+    "/control/v1/runs/{runId}/cancel": (req, path, params) =>
+      handleCancel(req, path, params["runId"] ?? ""),
+    "/control/v1/operator/reload": (req, path) => handleReload(req, path),
+    "/control/v1/runs/claim": (req, path) => handleClaim(req, path),
+  };
+
+  /** The listed route `method` and `path` name, with its `{param}` segments. */
+  function matchRoute(
+    method: string,
+    path: string,
+  ): { readonly route: ControlRoute; readonly params: Record<string, string> } | undefined {
+    const parts = path.split("/");
+    for (const route of CONTROL_ROUTES) {
+      if (route.method !== method) continue;
+      const pattern = route.route.split("/");
+      if (pattern.length !== parts.length) continue;
+      const params: Record<string, string> = {};
+      const matches = pattern.every((segment, i) => {
+        const part = parts[i] ?? "";
+        if (segment.startsWith("{") && segment.endsWith("}")) {
+          params[segment.slice(1, -1)] = part;
+          return part !== "";
+        }
+        return segment === part;
+      });
+      if (matches) return { route, params };
+    }
+    return undefined;
+  }
+
   async function fetchControl(req: Request): Promise<Response> {
     const path = new URL(req.url).pathname;
     if (!path.startsWith(CONTROL_PATH_PREFIX)) {
       return jsonResponse({ error: "not found", code: "not_found" }, 404);
     }
-    const route = path.slice(CONTROL_PATH_PREFIX.length);
     if (!authorized(req)) {
       // The rejected attempt is evidenced too — an unauthenticated poke at the
       // control plane is exactly what an operator wants to see later. The
@@ -799,69 +1208,12 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
       });
     }
 
-    if (req.method === "GET" && route === "/healthz") {
-      await audit({
-        protocol: CONTROL_PROTOCOL,
-        route: path,
-        method: "GET",
-        authorized: true,
-        status: 200,
-      });
-      return jsonResponse({ ok: true, name: opts.name, target: opts.target }, 200);
+    const matched = matchRoute(req.method, path);
+    if (matched !== undefined) {
+      return ROUTE_HANDLERS[matched.route.route](req, path, matched.params);
     }
 
-    if (req.method === "GET" && route === "/status") {
-      const body = await statusBody();
-      await audit({
-        protocol: CONTROL_PROTOCOL,
-        route: path,
-        method: "GET",
-        authorized: true,
-        status: 200,
-      });
-      return jsonResponse(body, 200);
-    }
-
-    if (req.method === "POST" && route === "/wake") {
-      const outcome = await handleWake(req);
-      await audit({
-        protocol: CONTROL_PROTOCOL,
-        route: path,
-        method: "POST",
-        authorized: true,
-        status: outcome.res.status,
-        ...(outcome.lane !== undefined ? { lane: outcome.lane } : {}),
-        ...(outcome.sessionId !== undefined ? { sessionId: outcome.sessionId } : {}),
-        // The poke's provenance rides the hash-chained audit log — the record
-        // that IS covered by the harness's retention policy — so a lane with
-        // no session of its own is still evidenced.
-        ...(outcome.reason !== undefined ? { reason: outcome.reason } : {}),
-        ...(outcome.by !== undefined ? { by: outcome.by } : {}),
-      });
-      return outcome.res;
-    }
-
-    if (req.method === "POST" && route === "/drain") {
-      const already = draining;
-      if (!already) beginDrain();
-      await audit({
-        protocol: CONTROL_PROTOCOL,
-        route: path,
-        method: "POST",
-        authorized: true,
-        status: 202,
-        alreadyDraining: already,
-      });
-      return jsonResponse({ draining: true, alreadyDraining: already }, 202);
-    }
-
-    await audit({
-      protocol: CONTROL_PROTOCOL,
-      route: path,
-      method: req.method,
-      authorized: true,
-      status: 404,
-    });
+    await audited(req, path, 404);
     return jsonResponse({ error: `no such control route: ${path}`, code: "not_found" }, 404);
   }
 
@@ -882,6 +1234,11 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
     fetch: fetchControl,
 
     async start(): Promise<{ port: number; url: string } | undefined> {
+      if (bootRefused) return undefined;
+      // Whether or not a control port is configured: this process serves this
+      // harness's control plane, and says it is alive.
+      registerIntakeRoot(cwd);
+      startHeartbeat();
       const raw = env[CONTROL_PORT_ENV];
       if (raw === undefined || raw === "") return undefined;
       const port = Number(raw);
@@ -892,6 +1249,16 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
         return undefined;
       }
       const bind = env[CONTROL_BIND_ENV] ?? DEFAULT_CONTROL_BIND;
+      const envToken = env[CONTROL_TOKEN_ENV];
+      if (!isLoopbackBind(bind) && (envToken === undefined || envToken === "")) {
+        // Checked before the token is resolved, so no token file is minted for
+        // a socket that will not open.
+        stderr(
+          `[control] ${CONTROL_BIND_ENV}="${sanitizeControlText(bind)}" is beyond this computer` +
+            ` and ${CONTROL_TOKEN_ENV} is not set — control.v1 not served\n`,
+        );
+        return undefined;
+      }
       // Resolving the token here is what MINTS `.crewhaus/run/control-token`
       // — a daemon with no control port never writes one. Reuse an already
       // resolved token rather than minting a second: a fresh mint would
@@ -913,6 +1280,8 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
     },
 
     async stop(): Promise<void> {
+      stopHeartbeat();
+      unregisterIntakeRoot(cwd);
       if (server === undefined) return;
       server.stop(true);
       server = undefined;
@@ -939,6 +1308,10 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
       return resolved.path !== undefined
         ? { source: resolved.source, path: resolved.path }
         : { source: resolved.source };
+    },
+
+    onClaim(handler): void {
+      claimHandler = handler;
     },
   };
 }

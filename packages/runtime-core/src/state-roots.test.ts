@@ -56,6 +56,7 @@ const GATE_RECORDS = [
   join("routing", "freeze.json"),
   join("scope-audit", "baseline.json"),
   join("security-corpus", "corpus.json"),
+  join("slo", "intake.json"),
 ].map((name) => join(".crewhaus", name));
 /** The idempotency store's default directory, always a root. */
 const IDEMPOTENCY = [join(".crewhaus", "idempotency")];
@@ -211,6 +212,9 @@ describe("what a harness's gates read, its environment files and its start confi
       join(".crewhaus", "retention.json.bak"),
       join(".crewhaus", "graders.yaml"),
       join(".crewhaus", "advice.md"),
+      join(".crewhaus", "slo", "intake.json.bak"),
+      join(".crewhaus", "slo", "other.json"),
+      join(".crewhaus", "slo"),
       ".env.example",
       ".env.sample",
       ".envrc",

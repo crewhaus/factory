@@ -163,6 +163,8 @@ describe("EXIT_CODES", () => {
       evaluation: 35,
       approval_pending: 36,
       provability: 37,
+      disabled: 38,
+      paused: 39,
       tool: 40,
       not_signed_in: 50,
       forbidden: 51,

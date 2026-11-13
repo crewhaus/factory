@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../boundary-classifier" },
+    { "path": "../control-records" },
     { "path": "../egress-classifier" },
     { "path": "../errors" },
     { "path": "../idempotency-keys" },

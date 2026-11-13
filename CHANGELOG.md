@@ -102,7 +102,8 @@ these on: they reach every harness that uses what each one names.
   as before, and a Thredz-backed wiki is not affected.
 
 - **The runtime-state floor also covers the staged proposals, the routing
-  freeze marker, the scope-audit baseline and the security corpus.** Beside
+  freeze marker, the scope-audit baseline, the security corpus and the SLO
+  intake gate.** Beside
   `.crewhaus/sessions`, `.crewhaus/tool-results` and `.crewhaus/proofs`, no
   permission rule lets an agent's tool write: `.crewhaus/run` (the runfiles, logs
   and control files a daemon keeps there); the settings file
@@ -115,8 +116,9 @@ these on: they reach every harness that uses what each one names.
   exactly that file, the proposals staged for a person to adopt,
   `.crewhaus/proposals`, the routing freeze marker
   `.crewhaus/routing/freeze.json`, the scope-audit baseline
-  `.crewhaus/scope-audit/baseline.json` and the security corpus
-  `.crewhaus/security-corpus/corpus.json`, exactly each of those files; the
+  `.crewhaus/scope-audit/baseline.json`, the security corpus
+  `.crewhaus/security-corpus/corpus.json` and the SLO intake gate
+  `.crewhaus/slo/intake.json`, exactly each of those files; the
   durable-execution idempotency records,
   `.crewhaus/idempotency` and the directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>`
   names; the continuity store's own files under `.crewhaus/state/<spec>/`,
@@ -261,6 +263,33 @@ these on: they reach every harness that uses what each one names.
   `node_modules/.bin/crewhaus` only when it resolves inside the harness
   directory**, otherwise the `crewhaus` on `PATH`. Home's jobs for a harness
   not adopted on this machine use the `crewhaus` on `PATH`.
+
+- **A daemon's control port can stop a run and re-read its operator settings,
+  and every daemon records when it was last alive.** `crewhaus.control.v1`
+  adds `POST /control/v1/runs/<run>/cancel`, `POST /control/v1/operator/reload`
+  and `POST /control/v1/runs/claim`, and `/status` shows the pause and disable
+  state, the controls the daemon supports and its active runs. Each daemon
+  writes `.crewhaus/run/control-heartbeat.json` every 15 seconds, with or
+  without a control port. A successful `/healthz` or `/status` call is not
+  written to the audit log; a refused call and every other call are. A control
+  port bound beyond this computer with `CREWHAUS_CONTROL_BIND` opens only with a
+  token set in `CREWHAUS_CONTROL_TOKEN`. Recompile a daemon to pick this up.
+
+- **Daemons honour pause and disable.** A daemon reads
+  `.crewhaus/run/control/operator.json` before new work starts. While it is
+  paused, scheduled lanes skip their ticks; a chat channel answers a new
+  message with "Paused by its operator; this message was not processed." (or
+  nothing, for a quiet pause) and keeps answering Slack's URL check and button
+  clicks; the managed API answers `runs.create` and `runs.continue` with
+  `paused` (HTTP 503 with `Retry-After`); a batch worker takes no jobs; a crew
+  or graph does not start its first step. Work already running finishes, and a
+  one-time grant lets its conversation run once more to pick up the approved
+  call. While it is disabled the same places refuse with `disabled`, and a
+  daemon started while disabled exits 38. A record that cannot be read counts
+  as paused and stops a start. SLO recovery lifts neither. A voice daemon
+  honours disable when it starts. The supervisor does not restart a daemon that
+  exits 34 (time limit), 35 (evaluation), 37 (provability) or 38 (disabled),
+  and the exit-code table gains 38 and 39. Recompile a daemon to pick this up.
 
 ## [0.8.2] - 2026-11-12
 

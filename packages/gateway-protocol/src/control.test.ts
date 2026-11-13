@@ -4,8 +4,9 @@
  * here runs against `plane.fetch(Request)` — no socket, no daemon, no timers
  * — which is exactly why the plane exposes `fetch` separately from `start`.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -16,7 +17,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { CAPABILITY_NAMES, mintRunId } from "@crewhaus/control-contract";
+import { type OperatorRead, createOperatorReader, intakeRoot } from "@crewhaus/control-records";
+import {
+  type RunContext,
+  activeRunCount,
+  createRunContext,
+  isCancelReason,
+  retainRun,
+} from "@crewhaus/run-context";
 import {
   allowSingleOwner,
   createPendingApprovalStore,
@@ -25,6 +34,7 @@ import {
 import {
   CONTROL_PATH_PREFIX,
   CONTROL_PROTOCOL,
+  CONTROL_ROUTES,
   CONTROL_RUN_DIR,
   CONTROL_TEXT_MAX,
   CONTROL_TOKEN_FILENAME,
@@ -34,9 +44,11 @@ import {
   DEFAULT_DRAIN_SWEEP_MS,
   DRAIN_RETRY_AFTER_SECONDS,
   DRAIN_SWEEP_BUDGET_ENV,
+  HEARTBEAT_INTERVAL_MS,
   constantTimeEquals,
   countPendingApprovals,
   createControlPlane,
+  isLoopbackBind,
   resolveControlToken,
   runDrainSweep,
   sanitizeControlText,
@@ -47,11 +59,19 @@ let sessions: string;
 // Built from parts so no realistic-shaped credential literal lands in the repo.
 const TOKEN = ["ctl", "0".repeat(8), "abcd"].join("-");
 
+/**
+ * Every plane a test builds. `start()` names this process's intake root and arms the
+ * heartbeat timer, and `bun test` runs every file of the package in one process, so
+ * each plane is stopped after its test.
+ */
+const planes: ControlPlane[] = [];
+
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), "crewhaus-control-"));
   sessions = join(tmp, "sessions");
 });
-afterEach(() => {
+afterEach(async () => {
+  for (const plane of planes.splice(0)) await plane.stop();
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -85,6 +105,7 @@ function harness(over: Partial<ControlPlaneOptions> = {}): Harness {
     drainSettleMs: 1,
     ...over,
   });
+  planes.push(plane);
   return { plane, audits, exits, out };
 }
 
@@ -537,10 +558,11 @@ describe("public gate", () => {
 });
 
 describe("start", () => {
-  test("binds nothing (and mints no token file) when CREWHAUS_CONTROL_PORT is unset", async () => {
+  test("binds nothing (and mints no token file) when CREWHAUS_CONTROL_PORT is unset, and still beats", async () => {
     const { plane } = harness({ env: {} });
     expect(await plane.start()).toBeUndefined();
-    expect(readdirSync(tmp)).not.toContain(".crewhaus");
+    expect(existsSync(join(tmp, CONTROL_RUN_DIR, CONTROL_TOKEN_FILENAME))).toBe(false);
+    expect(existsSync(join(tmp, CONTROL_RUN_DIR, "control-heartbeat.json"))).toBe(true);
     expect(plane.tokenSource()).toBeUndefined();
   });
 
@@ -949,5 +971,602 @@ describe("countPendingApprovals folds the way every reader does", () => {
   test("no file counts nothing, and creates nothing", () => {
     expect(countPendingApprovals(join(sessions, "approvals.jsonl"))).toBe(0);
     expect(() => readdirSync(sessions)).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The operator record: boot, lanes, the three runtime routes, status, the
+// heartbeat, the bind and the audit trail.
+// ---------------------------------------------------------------------------
+
+const OPERATOR_FILE = join(CONTROL_RUN_DIR, "control", "operator.json");
+
+/** Write an operator record as a plain JSON fixture. */
+function writeOperator(dir: string, body: Record<string, unknown>): void {
+  mkdirSync(join(dir, CONTROL_RUN_DIR, "control"), { recursive: true });
+  writeFileSync(
+    join(dir, OPERATOR_FILE),
+    `${JSON.stringify({ v: 1, rev: 1, desired: "running", intake: null, deployment: null, ...body })}\n`,
+  );
+}
+
+const present = (rev: number, block: Record<string, unknown> = {}): OperatorRead => ({
+  state: "present",
+  record: { v: 1, rev, intake: null, deployment: null, desired: "running", ...block },
+});
+const OPEN: OperatorRead = { state: "absent" };
+const PAUSED = present(2, { intake: { paused: true } });
+const DISABLED = present(3, { deployment: { disabled: true } });
+
+/** An injected reader whose answer a test flips. */
+function flippable(initial: OperatorRead): {
+  readonly read: (dir: string) => OperatorRead;
+  set(next: OperatorRead): void;
+} {
+  let current = initial;
+  return {
+    read: () => current,
+    set(next) {
+      current = next;
+    },
+  };
+}
+
+/** A lane whose body counts its runs. */
+function countingLane(plane: ControlPlane, lane: "heartbeat" | "schedule" = "heartbeat") {
+  const ran = { count: 0 };
+  const handle = plane.lane({
+    lane,
+    cadence: "every 1000ms",
+    everyMs: 1000,
+    run: async () => {
+      ran.count += 1;
+    },
+  });
+  return { handle, ran };
+}
+
+const post = (path: string): Request => req(`${CONTROL_PATH_PREFIX}${path}`, { method: "POST" });
+
+describe("a daemon booting while its operator disabled it", () => {
+  test("exits 38 once from the constructor, and its start() binds and registers nothing", async () => {
+    writeOperator(tmp, { deployment: { disabled: true } });
+    const errs: string[] = [];
+    const { plane, exits } = harness({
+      env: { CREWHAUS_CONTROL_PORT: "0", CREWHAUS_CONTROL_TOKEN: TOKEN },
+      stderr: (line) => {
+        errs.push(line);
+      },
+    });
+    expect(exits).toEqual([38]);
+    expect(errs.join("")).toContain("disabled by its operator, not starting");
+    expect(await plane.start()).toBeUndefined();
+    expect(intakeRoot()).toBeUndefined();
+    expect(existsSync(join(tmp, CONTROL_RUN_DIR, "control-heartbeat.json"))).toBe(false);
+  });
+
+  test("an operator record that cannot be read stops the boot the same way", () => {
+    mkdirSync(join(tmp, CONTROL_RUN_DIR, "control"), { recursive: true });
+    writeFileSync(join(tmp, OPERATOR_FILE), "{");
+    const errs: string[] = [];
+    const { exits } = harness({
+      stderr: (line) => {
+        errs.push(line);
+      },
+    });
+    expect(exits).toEqual([38]);
+    expect(errs.join("")).toContain("operator record unreadable, not starting");
+  });
+
+  test("a paused daemon boots", async () => {
+    writeOperator(tmp, { intake: { paused: true } });
+    const { plane, exits } = harness({ env: {} });
+    expect(exits).toEqual([]);
+    await plane.start();
+    expect(intakeRoot()).toBe(tmp);
+  });
+});
+
+describe("lanes run nothing while intake is closed", () => {
+  test("paused: a tick runs the body 0 times and counts nothing; a wake answers 409 paused", async () => {
+    const operator = flippable(PAUSED);
+    const { plane } = harness({ operatorRead: operator.read });
+    const { handle, ran } = countingLane(plane);
+    await handle.tick();
+    expect(ran.count).toBe(0);
+    expect(plane.counters.heartbeatTicks).toBe(0);
+    expect(handle.report().skipped).toBe("paused");
+    expect(handle.report().lastFiredAt).toBeUndefined();
+    const res = await plane.fetch(
+      req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane: "heartbeat" })),
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: "paused", lane: "heartbeat" });
+    expect(ran.count).toBe(0);
+    expect(readdirSync(tmp)).not.toContain("sessions");
+
+    operator.set(OPEN);
+    await handle.tick();
+    expect(ran.count).toBe(1);
+    expect(plane.counters.heartbeatTicks).toBe(1);
+    expect(handle.report().skipped).toBeUndefined();
+  });
+
+  test("disabled: a wake answers 409 disabled and the body never runs", async () => {
+    const operator = flippable(OPEN);
+    const { plane } = harness({ operatorRead: operator.read });
+    const { handle, ran } = countingLane(plane, "schedule");
+    operator.set(DISABLED);
+    const res = await plane.fetch(
+      req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane: "schedule" })),
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: "disabled", lane: "schedule" });
+    await handle.tick();
+    expect(ran.count).toBe(0);
+    expect(handle.report().skipped).toBe("disabled");
+  });
+
+  test("a wake while draining is still refused as draining", async () => {
+    const { plane } = harness({ operatorRead: () => PAUSED });
+    countingLane(plane);
+    await plane.fetch(post("/drain"));
+    const res = await plane.fetch(
+      req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane: "heartbeat" })),
+    );
+    expect(((await res.json()) as { code: string }).code).toBe("draining");
+  });
+});
+
+describe("the public gate keeps answering while paused or disabled", () => {
+  test("Slack's events and actions fall through while paused and while disabled, and shed once draining", async () => {
+    const operator = flippable(PAUSED);
+    const { plane } = harness({ operatorRead: operator.read });
+    for (const state of [PAUSED, DISABLED]) {
+      operator.set(state);
+      for (const path of ["/slack/events", "/slack/actions"]) {
+        const gate = plane.publicGate(
+          new Request(`http://example.test${path}`, { method: "POST" }),
+        );
+        expect({ path, gate }).toEqual({ path, gate: undefined });
+      }
+    }
+    await plane.fetch(post("/drain"));
+    const shed = plane.publicGate(
+      new Request("http://example.test/slack/events", { method: "POST" }),
+    );
+    expect(shed?.status).toBe(503);
+  });
+});
+
+describe("POST /control/v1/runs/{runId}/cancel", () => {
+  test("a run this process is running is signalled: 202, its signal aborted with the cancel reason", async () => {
+    writeOperator(tmp, { intake: { paused: true } });
+    const before = readFileSync(join(tmp, OPERATOR_FILE));
+    const { plane } = harness();
+    const ctx = createRunContext();
+    const res = await plane.fetch(post(`/runs/${ctx.runId}/cancel`));
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ runId: ctx.runId, cancelled: true });
+    expect(ctx.abortSignal.aborted).toBe(true);
+    expect(isCancelReason(ctx.abortSignal)).toBe(true);
+    expect(readFileSync(join(tmp, OPERATOR_FILE)).equals(before)).toBe(true);
+  });
+
+  test("a run id this process is not running answers 404 run_not_active", async () => {
+    const { plane } = harness();
+    const runId = mintRunId();
+    const res = await plane.fetch(post(`/runs/${runId}/cancel`));
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { code: string; error: string };
+    expect(body.code).toBe("run_not_active");
+    expect(body.error).toContain("not running");
+  });
+
+  test("an id that is not a crewhaus run id answers 400 and cancels nothing", async () => {
+    const { plane } = harness();
+    for (const id of ["run_123", "sess_0000000000000000", `run_${"U".repeat(26)}`]) {
+      const res = await plane.fetch(post(`/runs/${id}/cancel`));
+      expect({ id, status: res.status }).toEqual({ id, status: 400 });
+      expect(((await res.json()) as { code: string }).code).toBe("bad_request");
+    }
+  });
+
+  test("is served while draining, paused or disabled", async () => {
+    const { plane } = harness({ operatorRead: () => DISABLED });
+    await plane.fetch(post("/drain"));
+    const ctx = createRunContext();
+    expect((await plane.fetch(post(`/runs/${ctx.runId}/cancel`))).status).toBe(202);
+  });
+});
+
+describe("POST /control/v1/operator/reload", () => {
+  test("the default reader: a tick runs from the cached record until a reload, and not after", async () => {
+    const frozen = spyOn(Date, "now").mockReturnValue(9_000_000);
+    try {
+      writeOperator(tmp, { rev: 1 });
+      const { plane } = harness();
+      const status = (await (await plane.fetch(req(`${CONTROL_PATH_PREFIX}/status`))).json()) as {
+        operator: { rev: number };
+      };
+      expect(status.operator.rev).toBe(1);
+      const { handle, ran } = countingLane(plane);
+
+      writeOperator(tmp, { rev: 2, intake: { paused: true } });
+      await handle.tick();
+      expect(ran.count).toBe(1);
+
+      const res = await plane.fetch(post("/operator/reload"));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        operator: { rev: 2, paused: true, disabled: false, unreadable: false },
+      });
+      await handle.tick();
+      expect(ran.count).toBe(1);
+    } finally {
+      frozen.mockRestore();
+    }
+  });
+
+  test("an injected reader that can refresh is refreshed too", async () => {
+    writeOperator(tmp, { rev: 1 });
+    const operatorRead = createOperatorReader({ now: () => 0 });
+    const { plane } = harness({ operatorRead });
+    const { handle, ran } = countingLane(plane);
+    writeOperator(tmp, { rev: 2, deployment: { disabled: true } });
+    await handle.tick();
+    expect(ran.count).toBe(1);
+    const res = await plane.fetch(post("/operator/reload"));
+    expect(await res.json()).toEqual({
+      operator: { rev: 2, paused: false, disabled: true, unreadable: false },
+    });
+    await handle.tick();
+    expect(ran.count).toBe(1);
+  });
+
+  test("an absent record answers rev null, open", async () => {
+    const { plane } = harness();
+    const res = await plane.fetch(post("/operator/reload"));
+    expect(await res.json()).toEqual({
+      operator: { rev: null, paused: false, disabled: false, unreadable: false },
+    });
+  });
+
+  test("an unreadable record answers paused and unreadable, and leaves the file as it is", async () => {
+    const { plane } = harness();
+    mkdirSync(join(tmp, CONTROL_RUN_DIR, "control"), { recursive: true });
+    writeFileSync(join(tmp, OPERATOR_FILE), "{");
+    const res = await plane.fetch(post("/operator/reload"));
+    expect(await res.json()).toEqual({
+      operator: { rev: null, paused: true, disabled: false, unreadable: true },
+    });
+    expect(readFileSync(join(tmp, OPERATOR_FILE), "utf8")).toBe("{");
+  });
+});
+
+describe("POST /control/v1/runs/claim", () => {
+  test("no follower registered answers 404 claim_unsupported", async () => {
+    const { plane } = harness();
+    const res = await plane.fetch(post("/runs/claim"));
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { code: string }).code).toBe("claim_unsupported");
+  });
+
+  test("a registered follower is woken exactly once, without waiting for it", async () => {
+    const { plane } = harness();
+    let calls = 0;
+    plane.onClaim(
+      () =>
+        new Promise<void>(() => {
+          calls += 1;
+        }),
+    );
+    const res = await plane.fetch(post("/runs/claim"));
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ claimed: "requested" });
+    expect(calls).toBe(1);
+  });
+
+  test("while paused it answers 409 paused and does not wake the follower", async () => {
+    const { plane } = harness({ operatorRead: () => PAUSED });
+    let calls = 0;
+    plane.onClaim(() => {
+      calls += 1;
+    });
+    const res = await plane.fetch(post("/runs/claim"));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { code: string }).code).toBe("paused");
+    expect(calls).toBe(0);
+  });
+
+  test("a follower that fails is reported on stderr, not thrown", async () => {
+    let reportedLine: (line: string) => void = () => undefined;
+    const reported = new Promise<string>((resolve) => {
+      reportedLine = resolve;
+    });
+    const { plane } = harness({
+      stderr: (line) => {
+        if (line.includes("claim failed")) reportedLine(line);
+      },
+    });
+    plane.onClaim(async () => {
+      throw new Error("follower broke");
+    });
+    expect((await plane.fetch(post("/runs/claim"))).status).toBe(202);
+    expect(await reported).toContain("claim failed: follower broke");
+  });
+});
+
+describe("status reports the operator record, the controls and the active runs", () => {
+  type Status = {
+    operator: { rev: number | null; paused: boolean; disabled: boolean; unreadable: boolean };
+    capabilities: string[];
+    activeRuns: number | null;
+  };
+  const statusOf = async (plane: ControlPlane): Promise<Status> =>
+    (await (await plane.fetch(req(`${CONTROL_PATH_PREFIX}/status`))).json()) as Status;
+
+  test("operator, and a held run counted while it is held", async () => {
+    const { plane } = harness({ operatorRead: () => PAUSED });
+    const base = activeRunCount();
+    const release = retainRun(createRunContext());
+    try {
+      const held = await statusOf(plane);
+      expect(held.operator).toEqual({ rev: 2, paused: true, disabled: false, unreadable: false });
+      expect(held.activeRuns).toBe(base + 1);
+    } finally {
+      release();
+    }
+    expect((await statusOf(plane)).activeRuns).toBe(base);
+  });
+
+  test("activeRuns is null where this process cannot count its runs", async () => {
+    expect((await statusOf(harness({ target: "managed" }).plane)).activeRuns).toBeNull();
+    const off = harness({ env: { CREWHAUS_CONTROL_TOKEN: TOKEN, CREWHAUS_RUN_LEDGER: "0" } });
+    expect((await statusOf(off.plane)).activeRuns).toBeNull();
+    expect(typeof (await statusOf(harness().plane)).activeRuns).toBe("number");
+  });
+
+  test("capabilities are control-contract names: pause for every shape but voice, runs.create only with a follower", async () => {
+    const channel = harness();
+    const listed = (await statusOf(channel.plane)).capabilities;
+    expect(listed.every((name) => (CAPABILITY_NAMES as readonly string[]).includes(name))).toBe(
+      true,
+    );
+    expect(listed).toEqual([
+      "controls.pauseIntake",
+      "controls.cancelRun",
+      "controls.drain",
+      "controls.disable",
+      "runs.ledger",
+    ]);
+    channel.plane.onClaim(() => undefined);
+    expect((await statusOf(channel.plane)).capabilities).toContain("runs.create");
+
+    const voice = (await statusOf(harness({ target: "voice" }).plane)).capabilities;
+    expect(voice).not.toContain("controls.pauseIntake");
+    expect(voice).toContain("controls.cancelRun");
+    const off = harness({ env: { CREWHAUS_CONTROL_TOKEN: TOKEN, CREWHAUS_RUN_LEDGER: "0" } });
+    expect((await statusOf(off.plane)).capabilities).not.toContain("runs.ledger");
+  });
+});
+
+describe("the audit trail: refusals and every POST, never a successful read", () => {
+  test("healthz and status append nothing; a 401 and each POST append exactly one", async () => {
+    const { plane, audits } = harness();
+    const lane = countingLane(plane);
+    plane.onClaim(() => undefined);
+
+    expect((await plane.fetch(req(`${CONTROL_PATH_PREFIX}/healthz`))).status).toBe(200);
+    expect((await plane.fetch(req(`${CONTROL_PATH_PREFIX}/status`))).status).toBe(200);
+    expect(audits).toHaveLength(0);
+
+    await plane.fetch(req(`${CONTROL_PATH_PREFIX}/status`, { bearer: null }));
+    expect(audits).toHaveLength(1);
+
+    await plane.fetch(req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane: "heartbeat" })));
+    await lane.handle.settled();
+    expect(audits).toHaveLength(2);
+
+    const runId = mintRunId();
+    await plane.fetch(post(`/runs/${runId}/cancel`));
+    expect(audits).toHaveLength(3);
+    expect(audits[2]?.payload).toMatchObject({ runId, status: 404, method: "POST" });
+
+    await plane.fetch(post("/operator/reload"));
+    expect(audits).toHaveLength(4);
+    expect(audits[3]?.payload).toMatchObject({ rev: null, status: 200 });
+
+    await plane.fetch(post("/runs/claim"));
+    expect(audits).toHaveLength(5);
+    expect(audits[4]?.payload).toMatchObject({ status: 202 });
+
+    await plane.fetch(post("/drain"));
+    expect(audits).toHaveLength(6);
+
+    expect((await plane.fetch(req(`${CONTROL_PATH_PREFIX}/nope`))).status).toBe(404);
+    expect(audits).toHaveLength(7);
+    expect(JSON.stringify(audits)).not.toContain(TOKEN);
+  });
+});
+
+describe("CONTROL_ROUTES is what the router serves", () => {
+  test("lists the seven routes, and every one answers something other than no-such-route", async () => {
+    expect(CONTROL_ROUTES.map((r) => `${r.method} ${r.route}`)).toEqual([
+      `GET ${CONTROL_PATH_PREFIX}/healthz`,
+      `GET ${CONTROL_PATH_PREFIX}/status`,
+      `POST ${CONTROL_PATH_PREFIX}/wake`,
+      `POST ${CONTROL_PATH_PREFIX}/drain`,
+      `POST ${CONTROL_PATH_PREFIX}/runs/{runId}/cancel`,
+      `POST ${CONTROL_PATH_PREFIX}/operator/reload`,
+      `POST ${CONTROL_PATH_PREFIX}/runs/claim`,
+    ]);
+    expect(Object.isFrozen(CONTROL_ROUTES)).toBe(true);
+    const { plane } = harness();
+    for (const { method, route } of CONTROL_ROUTES) {
+      const path = route.replace("{runId}", mintRunId());
+      const res = await plane.fetch(
+        req(path, { method, ...(method === "POST" ? { body: "{}" } : {}) }),
+      );
+      const body = (await res.json()) as { code?: string };
+      expect({ route, code: body.code }).not.toEqual({ route, code: "not_found" });
+    }
+  });
+
+  test("a listed path under another method is no route", async () => {
+    const { plane } = harness();
+    const res = await plane.fetch(req(`${CONTROL_PATH_PREFIX}/operator/reload`));
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { code: string }).code).toBe("not_found");
+  });
+});
+
+describe("the heartbeat", () => {
+  test("start() with no port writes every field at once, rewrites it on the interval, and stop() clears it", async () => {
+    let t = Date.parse("2026-11-12T00:00:00.000Z");
+    const armed: Array<{ fn: () => void; ms: number; handle: object }> = [];
+    const cleared: unknown[] = [];
+    const { plane } = harness({
+      env: {},
+      now: () => t,
+      pid: 4321,
+      operatorRead: () => PAUSED,
+      timers: {
+        setInterval: (fn, ms) => {
+          const handle = { id: armed.length };
+          armed.push({ fn, ms, handle });
+          return handle;
+        },
+        clearInterval: (handle) => {
+          cleared.push(handle);
+        },
+      },
+    });
+    expect(await plane.start()).toBeUndefined();
+    expect(intakeRoot()).toBe(tmp);
+    const file = join(tmp, CONTROL_RUN_DIR, "control-heartbeat.json");
+    const first = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    expect(first).toEqual({
+      v: 1,
+      pid: 4321,
+      at: "2026-11-12T00:00:00.000Z",
+      operatorRev: 2,
+      paused: true,
+      disabled: false,
+      activeRuns: activeRunCount(),
+      runLedger: true,
+    });
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(armed).toHaveLength(1);
+    expect(armed[0]?.ms).toBe(HEARTBEAT_INTERVAL_MS);
+
+    t += HEARTBEAT_INTERVAL_MS;
+    armed[0]?.fn();
+    expect((JSON.parse(readFileSync(file, "utf8")) as { at: string }).at).toBe(
+      "2026-11-12T00:00:15.000Z",
+    );
+
+    await plane.stop();
+    expect(cleared).toEqual([armed[0]?.handle]);
+    expect(intakeRoot()).toBeUndefined();
+  });
+
+  test("a heartbeat that cannot be written is one stderr line per reason, never a throw", async () => {
+    const errs: string[] = [];
+    const armed: Array<() => void> = [];
+    // A file where `.crewhaus` goes: the heartbeat's directory cannot be made.
+    writeFileSync(join(tmp, ".crewhaus"), "x");
+    const { plane } = harness({
+      operatorRead: () => OPEN,
+      stderr: (line) => {
+        errs.push(line);
+      },
+      timers: {
+        setInterval: (fn) => {
+          armed.push(fn);
+          return 1;
+        },
+        clearInterval: () => undefined,
+      },
+    });
+    expect(await plane.start()).toBeUndefined();
+    armed[0]?.();
+    armed[0]?.();
+    expect(errs.filter((line) => line.includes("heartbeat not written"))).toHaveLength(1);
+  });
+
+  test("a drain clears the heartbeat before it exits", async () => {
+    const cleared: unknown[] = [];
+    let exited: () => void = () => undefined;
+    const exitedOnce = new Promise<void>((resolve) => {
+      exited = resolve;
+    });
+    const { plane } = harness({
+      exit: () => exited(),
+      timers: { setInterval: () => "beat", clearInterval: (h) => cleared.push(h) },
+    });
+    await plane.start();
+    await plane.fetch(post("/drain"));
+    await exitedOnce;
+    expect(cleared).toEqual(["beat"]);
+  });
+});
+
+describe("a bind beyond this computer needs a token from the environment", () => {
+  test("isLoopbackBind accepts loopback only", () => {
+    for (const host of [
+      "localhost",
+      "LOCALHOST",
+      "127.0.0.1",
+      "127.1.2.3",
+      "127.255.255.255",
+      "::1",
+      "[::1]",
+      "::ffff:127.0.0.1",
+      "[::ffff:127.0.0.2]",
+    ]) {
+      expect({ host, loopback: isLoopbackBind(host) }).toEqual({ host, loopback: true });
+    }
+    for (const host of [
+      "0.0.0.0",
+      "::",
+      "[::]",
+      "",
+      "10.0.0.1",
+      "192.168.1.10",
+      "128.0.0.1",
+      "127.0.0.256",
+      "127.0.0",
+      "127.0.0.1.5",
+      "localhost.example.com",
+      "::ffff:10.0.0.1",
+      "example.com",
+    ]) {
+      expect({ host, loopback: isLoopbackBind(host) }).toEqual({ host, loopback: false });
+    }
+  });
+
+  test("0.0.0.0 with no CREWHAUS_CONTROL_TOKEN serves nothing, mints no token and says why", async () => {
+    const errs: string[] = [];
+    const { plane } = harness({
+      env: { CREWHAUS_CONTROL_PORT: "0", CREWHAUS_CONTROL_BIND: "0.0.0.0" },
+      stderr: (line) => {
+        errs.push(line);
+      },
+    });
+    expect(await plane.start()).toBeUndefined();
+    expect(existsSync(join(tmp, CONTROL_RUN_DIR, CONTROL_TOKEN_FILENAME))).toBe(false);
+    expect(plane.tokenSource()).toBeUndefined();
+    const said = errs.join("");
+    expect(said).toContain("CREWHAUS_CONTROL_BIND");
+    expect(said).toContain("CREWHAUS_CONTROL_TOKEN");
+  });
+
+  test("an empty CREWHAUS_CONTROL_TOKEN is no token", async () => {
+    const { plane } = harness({
+      env: { CREWHAUS_CONTROL_PORT: "0", CREWHAUS_CONTROL_BIND: "::", CREWHAUS_CONTROL_TOKEN: "" },
+    });
+    expect(await plane.start()).toBeUndefined();
+    expect(existsSync(join(tmp, CONTROL_RUN_DIR, CONTROL_TOKEN_FILENAME))).toBe(false);
   });
 });

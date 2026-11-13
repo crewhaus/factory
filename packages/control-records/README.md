@@ -31,6 +31,9 @@ are the run ledger and the receipts. Directories are created only on a write pat
 | `operator.json` | whether intake is paused and the deployment disabled |
 | `approvers.json` | the harness's copy of who may decide what |
 
+`controlPaths(harnessDir).heartbeatFile` is `.crewhaus/run/control-heartbeat.json`, beside the control
+token and outside `control/`: when a daemon last said it was alive.
+
 Every primitive takes a containment root plus record paths relative to it, so the same code serves a
 harness directory, a session root and the Hangar root.
 
@@ -98,14 +101,20 @@ file anywhere up its path inside the root. The reason names the file and the fau
 
 | Export | Contract | First consumer |
 |---|---|---|
-| `readOperatorRecord(harnessDir)`, `createOperatorReader({now})` | `operator.json`: `{v, rev, intake, deployment, desired}`, cap 64 KiB. | the supervisor's start gate |
+| `readOperatorRecord(harnessDir)`, `createOperatorReader({now})` | `operator.json`: `{v, rev, intake, deployment, desired}`, cap 64 KiB. A reader is a function with a `refresh(harnessDir)` that reads the file now and keeps that answer. | the supervisor's start gate |
+| `refreshOperatorRecord(harnessDir)` | Reads `operator.json` now through the default reader and keeps that answer, so every door reading through it, `intakeVerdict` included, answers from it at once, whatever the clock says. | the control plane's `POST /control/v1/operator/reload` |
 | `operatorVerdict(read)` | `{intake, start, unreadable}`. Disabled wins over paused. Unreadable is paused and refused. | the supervisor's start gate |
 | `readApproverProjection(harnessDir)`, `createApproverReader({now})` | `approvers.json`, cap 1 MiB. Absent is single-owner mode, present is enforced, unreadable fails closed. An answer goes straight to `verifyDecision`. Unknown keys stay on it. | the runtime's consume check |
-| `intakeVerdict(harnessDir, {read?})` | `{state: "open"}` or `{state: "closed", reasons, notice, code, retryAfter?}`. Read `state`, `code`, `notice` and `retryAfter`; never switch exhaustively on `reasons[].kind`. A record both paused and disabled lists both reasons, so lifting one never lifts the other. The SLO gate's file is not a reason. | the doors that admit work, and `assertRunnable` |
+| `intakeVerdict(harnessDir, {read?})` | `{state: "open"}` or `{state: "closed", reasons, notice, code, exitName, retryAfter?}`. Read `state`, `code`, `exitName`, `notice` and `retryAfter`; never switch exhaustively on `reasons[].kind`. A door puts `code` on the wire and `exitName` (the `EXIT_CODES` name) on an exit. A record both paused and disabled lists both reasons, so lifting one never lifts the other. The SLO gate's file is not a reason. | the doors that admit work, and `assertRunnable` |
 | `assertRunnable(harnessDir, {mode, ignorePause?, read?})` | One answer per CLI entry point. It never exits or throws for an operator state; `exitName` names the exit code. | the CLI's entry points |
 
 `notice` in the operator record is a string to show, `null` for a pause recorded as quiet, or absent
 for the fixed text.
+
+| Export | Contract | First consumer |
+|---|---|---|
+| `registerIntakeRoot(harnessDir)`, `intakeRoot()`, `unregisterIntakeRoot(harnessDir)` | The directory of the control plane this process serves, resolved, in one slot on `globalThis` under `Symbol.for("@crewhaus/control-records/intake-root")` so two copies in a bundle share it. Absent in every CLI process. Unregistering another directory leaves the slot as it is. | the control plane's `start()` and `stop()`; the runtime's admission at loop start |
+| `writeHeartbeat(harnessDir, beat)` | `.crewhaus/run/control-heartbeat.json`: `{v: 1, pid, at, operatorRev, paused, disabled, activeRuns, runLedger}`, written whole, atomically, at `0600`, its directory at `0700` and contained. Only those fields are written. The caller supplies every value. Answers `{ok: true}` or `{ok: false, reason}` and never throws. | the control plane's heartbeat; its first reader is Home's "last verified" |
 
 | Record | `interactive` | `run` | `start` |
 |---|---|---|---|

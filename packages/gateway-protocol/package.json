@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/run-context": "workspace:*",

@@ -29,6 +29,7 @@
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/harness-registry": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/logging": "workspace:*",
     "@crewhaus/metrics-collector": "workspace:*",
     "@crewhaus/model-plan": "workspace:*",
     "@crewhaus/model-router": "workspace:*",
@@ -65,7 +66,6 @@
   },
   "devDependencies": {
     "@crewhaus/graph-engine": "workspace:*",
-    "@crewhaus/logging": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-plan": "workspace:*",
     "@crewhaus/tool-state": "workspace:*"

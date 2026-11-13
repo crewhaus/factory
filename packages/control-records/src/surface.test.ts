@@ -52,7 +52,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan really reads the sources", () => {
-    expect(SOURCES.length).toBe(18);
+    expect(SOURCES.length).toBe(20);
     expect(imports.length).toBeGreaterThan(40);
     expect(imports.some((i) => i.path === "node:fs")).toBe(true);
     expect(imports.some((i) => i.path === "@crewhaus/tool-safety/fs")).toBe(true);
@@ -128,6 +128,7 @@ describe("what the package exports", () => {
         "foldStates",
         "harnessLedger",
         "holderProvablyDead",
+        "intakeRoot",
         "intakeVerdict",
         "LOCAL_ACTOR_LABEL",
         "keyedDigest",
@@ -142,12 +143,16 @@ describe("what the package exports", () => {
         "readOperatorRecord",
         "readPage",
         "readTail",
+        "refreshOperatorRecord",
+        "registerIntakeRoot",
         "resume",
         "snapshotAt",
         "storedLocalActor",
+        "unregisterIntakeRoot",
         "withLedgerLock",
         "withMutatingLease",
         "writeHarnessIdentity",
+        "writeHeartbeat",
       ].sort(),
     );
   });
@@ -255,6 +260,26 @@ describe("no field name is one the masker would redact", () => {
       plant(controlFile(root, "operator.json"), "torn");
       fieldNames(api.intakeVerdict(root, { read: api.createOperatorReader() }), names);
 
+      const beat = {
+        v: 1,
+        pid: 1,
+        at: "2026-11-12T00:00:00.000Z",
+        operatorRev: 1,
+        paused: false,
+        disabled: false,
+        activeRuns: 0,
+        runLedger: true,
+      } as const;
+      fieldNames(api.writeHeartbeat(root, beat), names);
+      fieldNames(
+        JSON.parse(readFileSync(join(root, api.controlPaths(root).heartbeatFile), "utf8")),
+        names,
+      );
+      plant(join(root, "a-file"), "not a directory");
+      const refused = api.writeHeartbeat(join(root, "a-file"), beat);
+      expect(refused.ok).toBe(false);
+      fieldNames(refused, names);
+
       // Each expected name is really in the walk, so the assertion below can fail.
       for (const name of [
         "digestKeyFile",
@@ -268,6 +293,11 @@ describe("no field name is one the masker would redact", () => {
         "tail",
         "lock",
         "claims",
+        "heartbeatFile",
+        "operatorRev",
+        "activeRuns",
+        "runLedger",
+        "exitName",
       ]) {
         expect(names.has(name)).toBe(true);
       }

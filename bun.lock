@@ -735,6 +735,7 @@
       "devDependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "zod": "^3.23.8",
       },
@@ -1134,6 +1135,7 @@
       "version": "0.8.2",
       "dependencies": {
         "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
@@ -1150,6 +1152,7 @@
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/durable-state": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/federation-protocol": "workspace:*",
@@ -1776,6 +1779,7 @@
       "version": "0.8.2",
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/idempotency-keys": "workspace:*",
         "@crewhaus/queue-protocol": "workspace:*",
@@ -1873,6 +1877,7 @@
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/logging": "workspace:*",
         "@crewhaus/metrics-collector": "workspace:*",
         "@crewhaus/model-plan": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
@@ -1909,7 +1914,6 @@
       },
       "devDependencies": {
         "@crewhaus/graph-engine": "workspace:*",
-        "@crewhaus/logging": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-plan": "workspace:*",
         "@crewhaus/tool-state": "workspace:*",

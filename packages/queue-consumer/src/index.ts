@@ -30,6 +30,9 @@
  *   - handler throws `approval_pending` (loop contract 0.4, G11) → DEFER:
  *     neither ack nor nack, push the visibility lease out by
  *     `deferVisibilityMs`, and do not count the attempt.
+ *   - handler throws a `RunFailedError` of class `paused` or `disabled` (the
+ *     runtime refused the job's loop because the harness's operator closed
+ *     intake) → DEFER the same way: the job waits for intake to open.
  *
  * Why parking is not a retry: a parked job is waiting on a human running
  * `crewhaus approvals grant`, which takes as long as it takes. Counted as a
@@ -38,6 +41,11 @@
  * so the approval seam could never actually complete on this shape. The
  * grant is keyed on `(toolName, inputHash)`, so any later re-delivery finds
  * it; the only thing that had to change was not throwing the job away first.
+ *
+ * The operator record: while `.crewhaus/run/control/operator.json` in
+ * `harnessDir` closes intake (`intakeVerdict` in `@crewhaus/control-records`),
+ * the loop pulls nothing. In-flight handlers, their visibility renewals and
+ * `drain()` carry on.
  *
  * Drain semantics: `drain()` stops new pulls but lets in-flight handlers
  * complete + ack. `stop()` is `drain()` plus a wait — used by the
@@ -55,6 +63,7 @@
  * "api" and reports a suspicious one there.
  */
 import { boundaryRuleIds, classifyBoundary, valueText } from "@crewhaus/boundary-classifier";
+import { type IntakeVerdict, intakeVerdict } from "@crewhaus/control-records";
 import { CrewhausError, type FailureClass } from "@crewhaus/errors";
 import { type IdempotencyStore, idempotencyKey, withIdempotency } from "@crewhaus/idempotency-keys";
 import type { Job, NackReason, QueueAdapter } from "@crewhaus/queue-protocol";
@@ -195,6 +204,13 @@ export type ConsumerOptions<TInput, TResult> = {
   /** Wait between empty-queue pulls. Defaults to 100ms. */
   readonly emptyQueuePollMs?: number;
   readonly observer?: ConsumerObserver<TInput, TResult>;
+  /**
+   * The harness whose operator record admits new jobs. Defaults to
+   * `process.cwd()`. While the record closes intake, nothing is pulled.
+   */
+  readonly harnessDir?: string;
+  /** Test seam — the intake verdict. Defaults to `intakeVerdict(harnessDir)`. */
+  readonly intake?: () => IntakeVerdict;
   /** Test seam — `setTimeout`/`clearTimeout` overrides for deterministic visibility renewal tests. */
   readonly _setTimeout?: typeof setTimeout;
   readonly _clearTimeout?: typeof clearTimeout;
@@ -257,6 +273,20 @@ function isApprovalPending(err: unknown): boolean {
   return typeof report === "object" && report !== null && report.class === "approval_pending";
 }
 
+/**
+ * Did the runtime refuse the job's loop because the operator closed intake?
+ * Structural for the same reason as {@link isApprovalPending}. Such a job is
+ * deferred like a park: it waits for intake to open and spends no attempt.
+ */
+function isIntakeRefusal(err: unknown): boolean {
+  const report = (err as { report?: { class?: unknown } } | null | undefined)?.report;
+  return (
+    typeof report === "object" &&
+    report !== null &&
+    (report.class === "paused" || report.class === "disabled")
+  );
+}
+
 export function startConsumer<TInput, TResult>(
   opts: ConsumerOptions<TInput, TResult>,
 ): RunningConsumer {
@@ -268,6 +298,8 @@ export function startConsumer<TInput, TResult>(
   const deferVisibilityMs = opts.deferVisibilityMs ?? DEFAULT_DEFER_VISIBILITY_MS;
   const ts = opts._setTimeout ?? setTimeout;
   const tc = opts._clearTimeout ?? clearTimeout;
+  const harnessDir = opts.harnessDir ?? process.cwd();
+  const intake = opts.intake ?? ((): IntakeVerdict => intakeVerdict(harnessDir));
 
   const wrappedHandler = opts.idempotencyStore
     ? withIdempotency<{ input: TInput; job: Job<TInput> }, TResult>(
@@ -297,6 +329,12 @@ export function startConsumer<TInput, TResult>(
         await Promise.race(inFlight);
       }
       if (stopping) break;
+
+      // The operator closed intake: take no job until it opens again.
+      if (intake().state === "closed") {
+        await sleep(emptyPollMs);
+        continue;
+      }
 
       const want = Math.max(1, Math.min(pullBatch, opts.concurrency - inFlight.size));
       let pulled: ReadonlyArray<Job<TInput>>;
@@ -358,13 +396,14 @@ export function startConsumer<TInput, TResult>(
         outcome = { kind: "ok", value: r.value, fromCache: r.fromCache };
       }
     } catch (err) {
-      if (isApprovalPending(err)) {
+      if (isApprovalPending(err) || isIntakeRefusal(err)) {
         // A park is NOT a failure — it is a run waiting on a human, and the
         // only thing that can resolve it is someone running `crewhaus
         // approvals grant`. Counting it against `maxRetries` meant a job
         // almost always dead-lettered before that happened: with the default
         // 3 retries and a visibility timeout in the tens of seconds, the
-        // budget was spent in under a minute.
+        // budget was spent in under a minute. A job refused because the
+        // operator closed intake waits the same way, for intake to open.
         const defers = (deferCounts.get(job.id) ?? 0) + 1;
         deferCounts.set(job.id, defers);
         outcome = { kind: "deferred", error: err, defers };

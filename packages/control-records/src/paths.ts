@@ -42,6 +42,11 @@ export type ControlPaths = {
   readonly deploymentsFile: string;
   /** The harness's portable identity, `{v, id, slug?, createdAt}`. */
   readonly harnessIdentityFile: string;
+  /**
+   * When a daemon last said it was alive: beside the control token in the run
+   * directory, outside `control/`.
+   */
+  readonly heartbeatFile: string;
 };
 
 /**
@@ -51,7 +56,8 @@ export type ControlPaths = {
  * First consumers: the run ledger and the receipts.
  */
 export function controlPaths(harnessDir: string): ControlPaths {
-  const controlDir = join(".crewhaus", "run", "control");
+  const runDir = join(".crewhaus", "run");
+  const controlDir = join(runDir, "control");
   return {
     root: harnessDir,
     controlDir,
@@ -63,6 +69,7 @@ export function controlPaths(harnessDir: string): ControlPaths {
     approversFile: join(controlDir, "approvers.json"),
     deploymentsFile: join(controlDir, "deployments.jsonl"),
     harnessIdentityFile: join(controlDir, "harness.json"),
+    heartbeatFile: join(runDir, "control-heartbeat.json"),
   };
 }
 

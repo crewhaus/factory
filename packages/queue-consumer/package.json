@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@crewhaus/boundary-classifier": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/idempotency-keys": "workspace:*",
     "@crewhaus/queue-protocol": "workspace:*",
