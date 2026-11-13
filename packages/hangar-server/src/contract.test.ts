@@ -490,7 +490,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
   onboarding: [
     ["firstBoot", "boolean"],
     ["harnessCount", "number"],
-    ["scanRootCount", "number"],
+    ["scanRootCount", "number|null"],
     ["suggestions", "array"],
     ["suggestions[].dir", "string"],
     ["suggestions[].exists", "boolean"],
@@ -502,6 +502,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["demo.remedy", "string|null"],
     ["completedAt", "string|null"],
     ["cliTwins", "object"],
+    ["note", "string|null"],
   ],
   // omnibox.js omniRows
   search: [

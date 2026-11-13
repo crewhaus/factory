@@ -27,6 +27,7 @@
  */
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
+import { permissionMessage } from "./access";
 import { SAFE_SEGMENT_RE } from "./constants";
 import { resolveContained, resolveInside } from "./safety";
 
@@ -313,7 +314,8 @@ export type OnboardingView = {
   /** True when there is nothing to look at yet: no harnesses AND no roots. */
   readonly firstBoot: boolean;
   readonly harnessCount: number;
-  readonly scanRootCount: number;
+  /** How many scan roots Home has; `null` (unknown) for a caller who may not manage them. */
+  readonly scanRootCount: number | null;
   readonly suggestions: readonly ScanRootSuggestion[];
   readonly demo: DemoAvailability;
   /** ISO-8601 when onboarding was completed/dismissed, or null. */
@@ -325,7 +327,7 @@ export type OnboardingView = {
 /** Assemble the first-boot view. Pure given its inputs. */
 export function onboardingView(args: {
   readonly harnessCount: number;
-  readonly scanRootCount: number;
+  readonly scanRootCount: number | null;
   readonly suggestions: readonly ScanRootSuggestion[];
   readonly demo: DemoAvailability;
   readonly completedAt: string | null;
@@ -363,4 +365,79 @@ export function dirExists(dir: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** The permission that sees and changes where Home looks for harnesses. */
+export const REGISTRY_MANAGE = "home.registry.manage";
+
+/** What a caller who may not manage the registry hears in place of its paths. */
+export const REGISTRY_PATHS_NOTE = `Folders on this computer are shown only to people who manage this Home's harnesses. ${permissionMessage(REGISTRY_MANAGE, "home")}`;
+
+/** What the onboarding read needs; each thunk runs only for a caller who may manage. */
+export type OnboardingInputs = {
+  readonly harnessCount: number;
+  readonly completedAt: string | null;
+  readonly scanRootCount: () => number;
+  readonly suggestions: () => readonly ScanRootSuggestion[];
+  readonly demo: () => DemoAvailability;
+};
+
+export type GatedOnboarding = OnboardingView & {
+  /** Why folder suggestions, scan roots and the demo source are not shown; null when they are. */
+  readonly note: string | null;
+  /** The permission that shows them, when they are not shown. */
+  readonly needs?: typeof REGISTRY_MANAGE;
+};
+
+/**
+ * The onboarding read for one caller. Folder suggestions, the scan-root count and the
+ * demo checkout name places on this computer, so they go only to a caller who may manage
+ * the registry; anyone else gets empty values, `firstBoot: false`, and a note that says
+ * who to ask. Nothing about those places is computed for them.
+ *
+ * First consumer: `GET /api/onboarding` in `server.ts`.
+ */
+export function gateOnboarding(input: OnboardingInputs, mayManage: boolean): GatedOnboarding {
+  if (mayManage) {
+    return {
+      ...onboardingView({
+        harnessCount: input.harnessCount,
+        scanRootCount: input.scanRootCount(),
+        suggestions: input.suggestions(),
+        demo: input.demo(),
+        completedAt: input.completedAt,
+      }),
+      note: null,
+    };
+  }
+  const view = onboardingView({
+    harnessCount: input.harnessCount,
+    scanRootCount: null,
+    suggestions: [],
+    demo: {
+      available: false,
+      source: null,
+      starters: [],
+      reason: "only people who manage this Home's harnesses can add a demo",
+      remedy: permissionMessage(REGISTRY_MANAGE, "home"),
+    },
+    completedAt: input.completedAt,
+  });
+  return { ...view, firstBoot: false, note: REGISTRY_PATHS_NOTE, needs: REGISTRY_MANAGE };
+}
+
+/**
+ * The scan-root read for one caller: the roots only for a caller who may manage the
+ * registry, and for anyone else none, with a note that says who to ask.
+ *
+ * First consumer: `GET /api/registry/scan-roots` in `server.ts`.
+ */
+export function gateScanRoots<T>(
+  roots: () => readonly T[],
+  mayManage: boolean,
+):
+  | { readonly scanRoots: readonly T[]; readonly note: null }
+  | { readonly scanRoots: readonly T[]; readonly note: string; readonly needs: string } {
+  if (mayManage) return { scanRoots: roots(), note: null };
+  return { scanRoots: [], note: REGISTRY_PATHS_NOTE, needs: REGISTRY_MANAGE };
 }

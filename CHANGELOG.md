@@ -504,6 +504,37 @@ these on: they reach every harness that uses what each one names.
   `propose/<id>` after it, and stops before any git step when the record
   cannot be written.
 
+- **The raw inspector shows a harness's identity file as its fingerprint and
+  key presence only**, by any path or link that leads to it. Home's raw file
+  browser, a store entry and a skill's `SKILL.md` answer
+  `.crewhaus/identity.json`, at any depth and in any letter case, as its
+  fingerprint and whether each key is present, as the identity store does.
+
+- **The raw inspector refuses a nested harness's run, audit and key files, and
+  paths inside another registered harness.** The inspector's exclusions under
+  `.crewhaus/` apply at every `.crewhaus` in a path, so
+  `apps/sub/.crewhaus/run/control-token` is refused like the harness's own. A
+  path whose real place is inside another harness registered with Home is
+  refused and left out of listings; that harness's own inspector reads it.
+
+- **Only someone who can manage Home's registry sees scan-root paths, folder
+  suggestions and the demo source in onboarding.** For anyone else,
+  `GET /api/onboarding` and `GET /api/registry/scan-roots` answer no
+  suggestions, no scan roots, an unknown scan-root count (`null`), no demo
+  source, and a note saying who to ask.
+
+- **Starting Home from code with sign-in off fails when a trusted proxy is set,
+  anyone other than the owner has access, or it would listen beyond this
+  computer**, as `crewhaus hangar --no-auth` does: `startHangarServer` with
+  `noAuth` throws before it binds anything unless it listens on a loopback
+  address only.
+
+- **Home's settings editor reads and replaces only a harness's own
+  `.crewhaus/settings.json`.** `PUT /api/h/:id/inspect/settings` refuses a
+  settings file that is a link or whose real place is elsewhere (409, edit it
+  in the harness's own directory), and one that an inspector exclusion or
+  another registered harness holds (403), before it shows or writes anything.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read
