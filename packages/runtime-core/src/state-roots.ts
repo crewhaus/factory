@@ -532,9 +532,9 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   module, or what that script runs in turn). Exact files: a neighbour such as
  *   `prep.sh.bak` is not one, and a path that is a directory names nothing.
  * - The spec record of a spec in another directory: `<spec dir>/.crewhaus/run/spec`
- *   when `more.specDir` (else {@link runSpecDirScope}'s value) is set and its real
- *   path is not the working directory's. In the spec's own directory the record
- *   is already under `.crewhaus/run`.
+ *   when `more.specDir` (a run's `specDir` option, else {@link runSpecDirScope}'s
+ *   value) is set and its real path is not the working directory's. In the
+ *   spec's own directory the record is already under `.crewhaus/run`.
  * - Project memory and skills, on a run in {@link credentialFloorScope} (a
  *   `channel` or `managed` run, and the loops it starts) whose spec at the working
  *   directory has a target {@link MEMORY_FLOOR_TARGETS} names, or whose target
