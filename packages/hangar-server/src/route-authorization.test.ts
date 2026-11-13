@@ -19,7 +19,7 @@
  * table of sentinel rows checks that computation independently.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type AccessSnapshot,
@@ -680,7 +680,114 @@ describe("a harness the caller may not see, and one that is not there", () => {
     });
     expect(asOwner.status).toBe(404);
   });
+
+  // The proof route names no harness in its path: the choke point decides it on the harness
+  // `?harness=` names, or on the one holding the run's bundle, and the handler reads that
+  // same harness with no check of its own. A change that makes them read different values
+  // fails here.
+  test("the proof route, for a run with a bundle: decided and answered on one harness", async () => {
+    const { t, a, b, aDir, creds } = world;
+    // A run of A's with a bundle, under its own id so no matrix row reads it.
+    const sess = "sess_00000000000c13b1";
+    const marker = "Alpha's refund window is 14 days.";
+    const at = join(aDir, ".crewhaus", "proofs", "alpha", sess);
+    mkdirSync(at, { recursive: true });
+    writeFileSync(join(at, "turn-1.json"), `${JSON.stringify(proofBundle(marker), null, 2)}\n`);
+    const ghost = "hrn_fffffffffffffffe";
+    const get = async (who: string, query: string) => {
+      const res = await t.fetchRaw(`/api/runs/${sess}/proof${query}`, {
+        headers: (creds[who] as Cred).headers,
+      });
+      const text = await res.text();
+      return { status: res.status, text, body: JSON.parse(text) as Record<string, unknown> };
+    };
+
+    // memberB may not read A. Scoped to A, unscoped, and scoped to an id Home does not
+    // have, it hears the refusal one of its own `:id` routes gives on A.
+    const onA = await get("memberB", `?harness=${a}`);
+    const unscoped = await get("memberB", "");
+    const onGhost = await get("memberB", `?harness=${ghost}`);
+    const onARow = await t.fetchRaw(`/api/h/${a}/sessions/${sess}`, {
+      headers: (creds["memberB"] as Cred).headers,
+    });
+    expect([onA.status, unscoped.status, onGhost.status, onARow.status]).toEqual([
+      403, 403, 403, 403,
+    ]);
+    const refusal = (await onARow.json()) as Record<string, unknown>;
+    expect(refusal["needs"]).toBe("h.read.content");
+    for (const answer of [onA, unscoped, onGhost]) expect(answer.body).toEqual(refusal);
+    // The owner, who sees every harness, hears that the id is not there.
+    expect((await get("owner", `?harness=${ghost}`)).status).toBe(404);
+
+    // A member who reads A's content gets A's bundle, scoped and unscoped.
+    for (const query of [`?harness=${a}`, ""]) {
+      const answer = await get("viewerA", query);
+      expect(answer.status).toBe(200);
+      const rows = answer.body["bundles"] as Array<Record<string, unknown>>;
+      expect(rows.map((r) => r["harnessId"])).toEqual([a]);
+      expect(answer.text).toContain(marker);
+    }
+
+    // memberB scoped to its own harness is answered from B alone, which holds no bundle.
+    const onB = await get("memberB", `?harness=${b}`);
+    expect(onB.status).toBe(404);
+    for (const leak of [marker, a, aDir]) expect(onB.text).not.toContain(leak);
+    // Naming both, in either order, is decided and answered on the same one of them.
+    for (const query of [`?harness=${b}&harness=${a}`, `?harness=${a}&harness=${b}`]) {
+      const both = await get("memberB", query);
+      expect([403, 404]).toContain(both.status);
+      for (const leak of [marker, aDir]) expect(both.text).not.toContain(leak);
+    }
+
+    // A token that reads A but not its content is refused, and so is a run's scoped link.
+    const service = await get("service", `?harness=${a}`);
+    expect([service.status, service.body["reason"]]).toEqual([403, "permission"]);
+    const scoped = await get("scoped", `?harness=${a}`);
+    expect([scoped.status, scoped.body["reason"]]).toEqual([403, "scoped"]);
+  });
 });
+
+/** A persisted proof bundle as the gate writes it (provability's `ProofBundle`). */
+function proofBundle(claim: string): Record<string, unknown> {
+  const hash = `sha256:${"ab".repeat(32)}`;
+  return {
+    version: 1,
+    level: "grounded",
+    verdict: "pass",
+    score: 1,
+    threshold: 1,
+    achieved: "grounded",
+    claims: [
+      {
+        index: 0,
+        text: claim,
+        line: 1,
+        status: "met",
+        best: "grounded",
+        bindings: [
+          {
+            ref: "[1]",
+            kind: "source",
+            rung: "grounded",
+            ok: true,
+            origin: "https://acme.example/policy",
+            sha256: hash,
+            excerpt: "Customers may request a refund within 14 days.",
+          },
+        ],
+      },
+    ],
+    claimCount: 1,
+    met: 1,
+    unmet: 0,
+    assumptions: 0,
+    sources: 1,
+    judgeWaived: 0,
+    retryIndex: 0,
+    createdAt: "2026-10-21T12:00:00.000Z",
+    bundleHash: hash,
+  };
+}
 
 describe("fleet folds count and quote only what the caller may read", () => {
   const FILTERED = ROUTE_TABLE.filter(
