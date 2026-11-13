@@ -535,13 +535,17 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   when `more.specDir` (else {@link runSpecDirScope}'s value) is set and its real
  *   path is not the working directory's. In the spec's own directory the record
  *   is already under `.crewhaus/run`.
- * - Project memory and skills, on a run in {@link credentialFloorScope} whose spec
- *   at the working directory has a target {@link MEMORY_FLOOR_TARGETS} names, or
- *   none can be read: the memory files the runtime loads at the working directory
- *   (`CANONICAL_MEMORY_FILES`, exactly those names) and the skill directories
- *   discovery reads, `<cwd>/.crewhaus/skills` and `~/.crewhaus/skills`, whole. The
- *   same names under another directory are not roots, and plugin skill
- *   directories are not either.
+ * - Project memory and skills, on a run in {@link credentialFloorScope} (a
+ *   `channel` or `managed` run, and the loops it starts) whose spec at the working
+ *   directory has a target {@link MEMORY_FLOOR_TARGETS} names, or whose target
+ *   cannot be read: the memory files the runtime loads at the working directory
+ *   (`AGENTS.md`, `CLAUDE.md`, `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`,
+ *   exactly those files there) and the skill directories discovery reads,
+ *   `<cwd>/.crewhaus/skills` and `~/.crewhaus/skills`, whole
+ *   ({@link memoryFloorRoots}). The floor denies that run's agent tool calls that
+ *   write them, and an operator edits them. The same names under another
+ *   directory (a clone, a worktree, `docs/AGENTS.md`) are not roots, and plugin
+ *   skill directories are not either.
  *
  * The floor reads calls that write. A read of the run's record, a spilled
  * output's parts included, goes on as before.
@@ -611,7 +615,7 @@ export function runtimeStateRoots(
     { roots: hookTargetFiles(cwd, more.hookCommands ?? []), holdingCwd: "skip" },
     // The spec record of a spec kept in another directory.
     { roots: specRecordRoots(specDir, cwd), holdingCwd: "skip" },
-    // Project memory and skills on a run that answers people other than its operator.
+    // Project memory and skills on a channel or managed run, which an operator edits.
     { roots: memoryFloorRoots(cwd), holdingCwd: "skip" },
   ];
   const roots = new Set<string>();
@@ -747,16 +751,22 @@ export function credentialFileRoots(cwd: string = process.cwd()): string[] {
 export const credentialFloorScope = new AsyncLocalStorage<true>();
 
 /**
- * The targets whose runs keep their project memory and skills from their
- * agent's tools: the people a run answers can edit neither, and an operator
- * can. Read with {@link credentialFloorScope}.
+ * The targets whose runs hold their project memory and skills on the floor: on a
+ * run in {@link credentialFloorScope} (a `channel` or `managed` run, and the loops
+ * it starts) whose spec at the working directory has one of these targets, or
+ * whose target cannot be read, the floor denies the agent's tool calls that write
+ * them (`Bash` and `RunCommand` aside), and an operator edits them.
  */
-export const MEMORY_FLOOR_TARGETS = ["managed"] as const;
+export const MEMORY_FLOOR_TARGETS = ["channel", "managed"] as const;
 
 /**
  * The memory files and skill directories of a run in {@link credentialFloorScope}
  * whose spec at `cwd` has a {@link MEMORY_FLOOR_TARGETS} target, or whose target
- * cannot be read; `[]` otherwise.
+ * cannot be read; `[]` otherwise. The memory files are the ones the runtime loads
+ * at the working directory (`CANONICAL_MEMORY_FILES`), exactly those; the skill
+ * directories are the two discovery reads, `<cwd>/.crewhaus/skills` and
+ * `~/.crewhaus/skills`, whole. The same names under another directory (a clone, a
+ * worktree, `docs/AGENTS.md`) are not roots.
  */
 function memoryFloorRoots(cwd: string): string[] {
   if (credentialFloorScope.getStore() !== true) return [];

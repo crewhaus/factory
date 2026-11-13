@@ -211,6 +211,15 @@ export const streamQuery = z.object({ after: cursorString.optional() }).strict()
 // Runs and receipts
 // ---------------------------------------------------------------------------
 
+export const triggerSource = z
+  .object({
+    platform: z.string(),
+    conversationRef: z.string(),
+    messageRef: z.string(),
+    senderRef: z.string().optional(),
+  })
+  .passthrough();
+
 export const trigger = z
   .object({
     kind: oneOf(TRIGGER_KINDS),
@@ -218,6 +227,7 @@ export const trigger = z
     via: oneOf(RECEIPT_VIA).optional(),
     workItem: workItemId.optional(),
     synthetic: z.literal(true).optional(),
+    source: triggerSource.optional(),
   })
   .passthrough();
 
@@ -459,6 +469,7 @@ export const approverProjection = z
         .passthrough(),
     ),
     links: z.array(z.object({ external: externalSubject, principal: principalId }).passthrough()),
+    homeUrl: z.string().optional(),
   })
   .passthrough();
 
@@ -997,4 +1008,5 @@ export const CORE_SCHEMAS = {
   tokenMintRequest,
   tokenRow,
   trigger,
+  triggerSource,
 } as const;

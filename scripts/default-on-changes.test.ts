@@ -61,17 +61,25 @@ import { directControl, runDaemonCommand } from "../apps/cli/src/daemon-cmd";
 import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
 import { discloseSurfaceChange } from "../apps/cli/src/surface-disclosure";
+import {
+  acceptInbound,
+  createApprovalActions,
+  createRuntimeBackedApprovalStore,
+} from "../packages/channel-adapter-base/src/index";
 import { cfWorkerUnwiredBlockWarnings, compile, lower } from "../packages/compiler/src/index";
 import { createContinuityStore } from "../packages/continuity-store/src/index";
 import {
   DECISION_LOG_KEYS,
   EXIT_FOR_ERROR,
   EXIT_FOR_REJECTED_RECEIPT,
+  mintId,
+  mintRunId,
 } from "../packages/control-contract/src/index";
 import {
   casAppend,
   foldStates,
   intakeRoot,
+  runsLedger,
   standingRulesLedger,
   unregisterIntakeRoot,
 } from "../packages/control-records/src/index";
@@ -2369,7 +2377,9 @@ describe("approval decisions", () => {
       ) ?? "";
     expect(bullet).toContain("used once");
     expect(bullet).toContain("maintainer");
-    expect(bullet).toContain("chat channel's buttons names no one");
+    expect(bullet).toContain(
+      "a chat channel's buttons count once the person who clicks is linked to a member",
+    );
   });
 });
 
@@ -4266,7 +4276,7 @@ describe("the release notes name what recorded managed runs and API input change
     }
     const floor = bulletFor("The runtime-state floor also covers the staged proposals");
     expect(floor).toContain(
-      "on a `managed` harness, the project memory files the runtime loads at the working directory, `AGENTS.md`, `CLAUDE.md`, `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`, exactly those files, and the skill directories `.crewhaus/skills` and `~/.crewhaus/skills`",
+      "on a `channel` or `managed` run, and in the loops it starts, whose spec at the working directory has that target or cannot be read, the project memory files the runtime loads there, `AGENTS.md`, `CLAUDE.md`, `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`, exactly those files, and the skill directories `.crewhaus/skills` and `~/.crewhaus/skills`, which an operator edits",
     );
   });
 });
@@ -4621,5 +4631,220 @@ describe("run records, structured recall, context_assembled, ledger labels, comp
     const bullet = bulletFor("A compaction summary carries its origin into the run.");
     expect(bullet).toContain("`compaction`");
     expect(bullet).toContain("egress check");
+  });
+});
+
+describe("the release notes name what a channel daemon does with clicks and messages", () => {
+  const count = (text: string, needle: string): number => text.split(needle).length - 1;
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+  const CHANNEL_IR: IrChannelV0 = {
+    version: 0,
+    name: "default-on-channel",
+    target: "channel",
+    agent: { model: "claude-sonnet-4-6", instructions: "be helpful" },
+    tools: [],
+    toolConfigs: {},
+    channels: {
+      slack: {
+        botToken: { kind: "env", name: "SLACK_BOT_TOKEN" },
+        signingSecret: { kind: "env", name: "SLACK_SIGNING_SECRET" },
+      },
+    },
+    routing: { sessionKey: "thread" },
+    mcp_servers: {},
+    permissions: { rules: [] },
+    subAgents: [],
+    compaction: {},
+  };
+  const gateway = (): string =>
+    emitChannelBot(CHANNEL_IR).files.find((f) => f.path === "gateway.ts")?.content ?? "";
+
+  /** A temp harness with a parked approval in its own session root, and a Slack-shaped click. */
+  async function parkedClick() {
+    const harness = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-clicks-")));
+    const rootDir = join(harness, ".crewhaus", "sessions");
+    const runtime = createPendingApprovalStore({ rootDir });
+    const input = { path: "a.md" };
+    const id = generateApprovalId();
+    await runtime.persist({
+      id,
+      toolName: "Write",
+      inputHash: hashApprovalInput("Write", input),
+      input,
+      runId: mintRunId(),
+      sessionId: "sess_00000000000000aa",
+      surface: "channel",
+      createdAt: new Date().toISOString(),
+    });
+    const interaction = {
+      kind: "approval_action" as const,
+      approvalId: id,
+      decision: "grant" as const,
+      userId: "U0",
+      teamId: "T0",
+    };
+    return { harness, rootDir, runtime, id, interaction };
+  }
+
+  test("a click counts only from a linked member: the gateway delegates, and an unlinked one decides nothing", async () => {
+    const g = gateway();
+    expect(count(g, "createApprovalActions(")).toBe(1);
+    expect(count(g, "approvalActions.handle(interaction, actionAdapter)")).toBe(1);
+    expect(g).not.toContain("appendSettingsRule");
+    const { harness, rootDir, runtime, id, interaction } = await parkedClick();
+    try {
+      const answers: string[] = [];
+      const adapter = {
+        id: "slack",
+        parseInteraction: () => undefined,
+        answerInteraction: async (args: { text: string }) => void answers.push(args.text),
+      };
+      const actions = createApprovalActions({
+        approvals: createRuntimeBackedApprovalStore(runtime),
+        adapters: new Map([["slack", adapter]]),
+        sessionRouter: { resumeApproval: async () => undefined },
+        harnessDir: harness,
+        watch: { onChange: () => undefined, close: () => undefined },
+      });
+      expect((await actions.handle(interaction, adapter)).status).toBe(200);
+      for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+      expect(answers).toHaveLength(1);
+      expect(answers[0]).toContain("crewhaus access link slack:T0:U0");
+      expect(existsSync(join(rootDir, "approvals.d", "claims"))).toBe(false);
+      expect((await runtime.list()).find((a) => a.id === id)?.decision).toBeUndefined();
+    } finally {
+      rmSync(harness, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("A Slack click decides an approval only for a linked member");
+    expect(bullet).toContain("`crewhaus access link slack:<team>:<user> --member <name>`");
+    expect(bullet).toContain("for 30 days");
+    expect(bullet).toContain("Approve appears only when the whole request fits the card");
+  });
+
+  test("a message is on record before the answer: the events route hands off, and the rows fold", async () => {
+    const g = gateway();
+    const events = g.slice(g.indexOf("const match = url.pathname.match(/^\\/([^/]+)\\/events$/);"));
+    expect(g.indexOf("const match = url.pathname.match(/^\\/([^/]+)\\/events$/);")).toBeGreaterThan(
+      -1,
+    );
+    expect(count(events, "return handleInboundEvent(parsed.event, adapter, {")).toBe(1);
+    // The skip and the reaction answer on their own; the event's answer is the library's.
+    expect(count(events, 'new Response("ok"')).toBe(2);
+    expect(count(events, "queueMicrotask(")).toBe(0);
+    const harness = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-inbound-")));
+    try {
+      const accepted = await acceptInbound(
+        {
+          idempotencyKey: "Ev1",
+          workspaceId: "T0",
+          channelId: "C0",
+          userId: "U0",
+          ts: "1700000000.000100",
+        },
+        { id: "slack" },
+        { harnessDir: harness },
+      );
+      const ledger = runsLedger(harness);
+      const fold = foldStates(ledger);
+      if (!fold.ok) throw new Error(fold.reason);
+      expect(fold.anomalies).toEqual([]);
+      const row = fold.objects.get(accepted.runId);
+      expect(row?.state).toBe("preparing");
+      expect(Object.keys(row?.record ?? {}).sort()).toEqual([
+        "at",
+        "holder",
+        "id",
+        "state",
+        "trigger",
+      ]);
+    } finally {
+      rmSync(harness, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("A channel message is on record before it is acknowledged");
+    expect(bullet).toContain("`.crewhaus/run/control/runs/`");
+    expect(bullet).toContain("`CREWHAUS_RUN_LEDGER=0`");
+  });
+
+  test("a click is answered once the decision is recorded, whatever the card update does", async () => {
+    const { harness, rootDir, runtime, id, interaction } = await parkedClick();
+    try {
+      const owner = mintId("prn");
+      mkdirSync(join(harness, ".crewhaus", "run", "control"), { recursive: true });
+      writeFileSync(
+        join(harness, ".crewhaus", "run", "control", "approvers.json"),
+        JSON.stringify({
+          v: 1,
+          epoch: 1,
+          generatedAt: new Date().toISOString(),
+          harness: "hrn_00000000000000c1",
+          owner,
+          governedSince: new Date().toISOString(),
+          members: [],
+          links: [{ external: "slack:T0:U0", principal: owner }],
+        }),
+      );
+      const adapter = {
+        id: "slack",
+        parseInteraction: () => undefined,
+        ackApproval: () => new Promise<void>(() => undefined),
+      };
+      const actions = createApprovalActions({
+        approvals: createRuntimeBackedApprovalStore(runtime),
+        adapters: new Map([["slack", adapter]]),
+        sessionRouter: { resumeApproval: async () => undefined },
+        harnessDir: harness,
+        watch: { onChange: () => undefined, close: () => undefined },
+      });
+      const res = await actions.handle(interaction, adapter);
+      expect(res.status).toBe(200);
+      expect(readdirSync(join(rootDir, "approvals.d", "claims")).length).toBeGreaterThan(0);
+      expect((await runtime.list()).find((a) => a.id === id)?.decidedByPrincipal).toBe(owner);
+    } finally {
+      rmSync(harness, { recursive: true, force: true });
+    }
+    expect(bulletFor("Slack approval clicks are answered once the decision is recorded")).toContain(
+      "happen after the answer",
+    );
+  });
+
+  test("on a channel harness the floor holds the project memory files and the skill directories", () => {
+    expect(MEMORY_FLOOR_TARGETS).toContain("channel");
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-memory-")));
+    try {
+      writeFileSync(join(cwd, "crewhaus.yaml"), "name: x\ntarget: channel\n");
+      const roots = credentialFloorScope.run(true, () =>
+        runtimeStateRoots(undefined, undefined, cwd, {}, undefined),
+      );
+      for (const name of [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CODE-COMPANION.md",
+        "AGENT.md",
+        "LESSONS.md",
+      ]) {
+        expect(roots).toContain(join(cwd, name));
+      }
+      expect(roots).toContain(join(cwd, ".crewhaus", "skills"));
+      expect(roots).toContain(join(homedir(), ".crewhaus", "skills"));
+      expect(roots).not.toContain(join(cwd, "docs", "AGENTS.md"));
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+    const floor = bulletFor("The runtime-state floor also covers the staged proposals").replace(
+      /\s+/g,
+      " ",
+    );
+    expect(floor).toContain(
+      "on a `channel` or `managed` run, and in the loops it starts, whose spec at the working directory has that target or cannot be read, the project memory files the runtime loads there, `AGENTS.md`, `CLAUDE.md`, `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`, exactly those files, and the skill directories `.crewhaus/skills` and `~/.crewhaus/skills`, which an operator edits",
+    );
+    // One floor bullet in this release's list, not two.
+    const unreleased = changelog.slice(0, changelog.indexOf("\n## [0.8.2]"));
+    expect(unreleased.length).toBeGreaterThan(0);
+    expect(
+      defaultOnBullets(unreleased, LATER_HEADINGS).filter((b) =>
+        b.includes("runtime-state floor also covers"),
+      ),
+    ).toHaveLength(1);
   });
 });

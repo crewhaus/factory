@@ -75,8 +75,8 @@ import {
   type Ledger,
   append,
   controlPaths,
-  harnessLedger,
   readPage,
+  runsLedger,
   subjectRefOf,
 } from "@crewhaus/control-records";
 import { type CostTracker, createCostTracker } from "@crewhaus/cost-tracker";
@@ -98,9 +98,9 @@ type Logger = RunContext["logger"];
 /** The run ledger's directory, relative to the harness root. */
 export const RUN_LEDGER_DIR = join(controlPaths(".").controlDir, "runs");
 
-/** The run ledger of the harness at `root`. */
+/** The run ledger of the harness at `root`: control-records' `runsLedger`. */
 export function runLedgerAt(root: string): Ledger {
-  return harnessLedger(root, { dir: RUN_LEDGER_DIR }, { machine: "run" });
+  return runsLedger(root);
 }
 
 /** How many newest lines the root check reads. A capped read can only refuse. */
