@@ -1028,20 +1028,21 @@ export const REVIEW_SCHEMA: ParseArgsSchema = {
 };
 
 // Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`,
-// and 0.9.0's `supersede|defer`, over the session-store approvals store
-// (`.crewhaus/sessions/approvals.jsonl`).
+// and 0.9.0's `supersede|defer|rules|revoke`, over the session-store approvals
+// store (`.crewhaus/sessions/approvals.jsonl`) and the harness's standing rules.
 export const APPROVALS_SCHEMA: ParseArgsSchema = {
   flags: [
     // Harness root that owns `.crewhaus/` (mirrors `security digest --dir`).
     { name: "dir", takesValue: true },
-    // The deciding identity recorded on grant/deny (flag > CREWHAUS_USER > "cli").
+    // A label shown with the decision (flag > CREWHAUS_USER > "cli"); it grants
+    // no authority: a decision counts as the member the OS user is linked to.
     { name: "by", takesValue: true },
     // grant only — the grant applies to the next matching tool call only
     // (default; the runtime consumes a grant on use). Explicit for scripting.
     { name: "once", takesValue: false },
-    // grant only (#383) — a STANDING allow: grants this call AND persists an
-    // `alwaysAllow` rule for the tool into `.crewhaus/settings.json`, so
-    // future calls (any input) run pre-approved on this harness.
+    // grant only — also make a standing rule: an allow naming exactly what the
+    // call acted on, for 30 days, in `.crewhaus/settings.json` and its record.
+    // The owner's alone; a member's grants once and asks the owner.
     { name: "always", takesValue: false },
     // supersede and defer — a code from the verb's closed list.
     { name: "reason", takesValue: true },
@@ -1049,6 +1050,12 @@ export const APPROVALS_SCHEMA: ParseArgsSchema = {
     { name: "until", takesValue: true },
     { name: "json", takesValue: false },
     { name: "help", short: "h" },
+    // grant --always only — how many days the standing rule lasts, 1-365.
+    { name: "days", takesValue: true },
+    // grant --always only — a wider glob for the same tool, the owner's, confirmed at a terminal.
+    { name: "pattern", takesValue: true },
+    // revoke only — remove a whole-tool allow no standing-rule record keeps.
+    { name: "legacy", takesValue: true },
   ],
 };
 

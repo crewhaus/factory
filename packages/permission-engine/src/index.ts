@@ -47,12 +47,21 @@
  */
 import { lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  type LedgerRead,
+  type StandingRuleRow,
+  createStandingRuleReader,
+  ruleIsLive,
+} from "@crewhaus/control-records";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   type CompiledPattern,
+  OPERATIVE_ARG_FIELDS,
   type OperativeValue,
+  type OperativeValueKind,
   type RulePolarity,
   compilePattern,
+  escapeGlobLiteral,
   matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
 import {
@@ -71,6 +80,13 @@ export type PermissionRule = {
   readonly type: RuleType;
   readonly pattern: string;
   readonly source: RuleSource;
+  /**
+   * Whether the rule still stands, asked each time it could match. Only a settings
+   * allow kept by a standing-rule record carries it ({@link loadSettingsRules}): a rule
+   * that answers `false` (revoked, or past its end) matches nothing. Absent: the rule
+   * stands as written.
+   */
+  readonly live?: () => boolean;
 };
 
 export type RuleSet = {
@@ -349,7 +365,8 @@ function compile(rule: PermissionRule): CompiledPattern {
 /**
  * The first rule, in source-priority order, that matches `call` among the
  * rules `consider` admits. Each rule is matched with its own polarity: an
- * allow needs every operative value to match, a deny or ask any one.
+ * allow needs every operative value to match, a deny or ask any one. A rule
+ * whose `live` answers `false` is passed over.
  *
  * A malformed rule pattern fails CLOSED for safety rules: an uncompilable
  * `alwaysDeny`/`alwaysAsk` still gates (it counts as a match), so an
@@ -365,6 +382,8 @@ function firstMatchingRule(
   for (const sourceKey of SOURCE_PRIORITY) {
     for (const rule of rules[sourceKey]) {
       if (!consider(rule.type)) continue;
+      // A standing rule its record ended (revoked, or past its end) matches nothing.
+      if (rule.live?.() === false) continue;
       try {
         const compiled = compile(rule);
         const matched = matchesPattern(compiled, call.toolName, call.input, {
@@ -1223,12 +1242,113 @@ function readSettingsRoot(path: string): Record<string, unknown> | undefined {
  * `mode: bypass` is rejected here exactly as it is for yaml. Malformed JSON
  * or an invalid permissions config THROWS {@link PermissionConfigError} —
  * fail closed, matching the CLI's behavior when it reads the same file.
+ *
+ * STANDING RULES. An `alwaysAllow` whose pattern the harness's standing-rule
+ * record (`.crewhaus/run/control/standing-rules.jsonl`, control-records)
+ * names is kept by that record:
+ *
+ *  - when no row for the pattern is `active` and before its end, the entry
+ *    is not loaded;
+ *  - otherwise it is loaded with `live`, which asks the record again (at
+ *    most once a second per harness, by `opts.now`), so a rule revoked or
+ *    past its end stops matching within a second, in a run already going;
+ *  - an entry the record does not name loads as written, with no `live`:
+ *    the rule is exactly `{ type, pattern, source }`.
+ *
+ * A record that cannot be read revives nothing and hides nothing: a loaded
+ * rule keeps the last answer its record gave, and a load with no good read
+ * loads every entry as written.
  */
-export function loadSettingsRules(dir: string): ReadonlyArray<PermissionRule> {
+export function loadSettingsRules(
+  dir: string,
+  opts: { readonly now?: () => number } = {},
+): ReadonlyArray<PermissionRule> {
   const root = readSettingsRoot(settingsFilePath(dir));
   if (root === undefined) return [];
   const parsed = parsePermissionsConfig(root["permissions"], "settings");
-  return tagRules(parsed.rules, "settings");
+  const tagged = tagRules(parsed.rules, "settings");
+  if (!tagged.some((rule) => rule.type === "alwaysAllow")) return tagged;
+  const now = opts.now ?? (() => Date.now());
+  const reader = createStandingRuleReader({ now });
+  const first = reader(dir);
+  if (first.state !== "present") return tagged;
+  const out: PermissionRule[] = [];
+  for (const rule of tagged) {
+    if (rule.type !== "alwaysAllow" || !first.rows.some((row) => row.pattern === rule.pattern)) {
+      out.push(rule);
+      continue;
+    }
+    if (!livePattern(first, rule.pattern, now())) continue;
+    let last = true;
+    const live = (): boolean => {
+      const read = reader(dir);
+      if (read.state === "present") last = livePattern(read, rule.pattern, now());
+      return last;
+    };
+    out.push({ ...rule, live });
+  }
+  return out;
+}
+
+/** Whether any row for `pattern` is active and before its end. */
+function livePattern(
+  read: Extract<LedgerRead<StandingRuleRow>, { state: "present" }>,
+  pattern: string,
+  nowMs: number,
+): boolean {
+  return read.rows.some((row) => row.pattern === pattern && ruleIsLive(row, nowMs));
+}
+
+/**
+ * Write a whole settings root to `<dir>/.crewhaus/settings.json`, the one way
+ * this package writes it, through a random O_EXCL|O_NOFOLLOW temp beside the
+ * file, so the write never opens a link planted under a fixed temp name. A
+ * settings.json that links elsewhere in the
+ * workspace is written where it leads; one that leads out of it is refused.
+ *
+ * `.crewhaus` itself may be a link an operator made to keep a harness's
+ * state elsewhere; rules are read through it, so they are written through it
+ * too: it is then the root, as it is for the session and routing stores.
+ *
+ * Throws {@link PermissionConfigError} when the write is refused.
+ */
+export function writeSettingsFile(dir: string, root: Readonly<Record<string, unknown>>): string {
+  const path = settingsFilePath(dir);
+  mkdirSync(dir, { recursive: true });
+  const crewhausDir = join(dir, ".crewhaus");
+  const linkedStateDir = isSymlink(crewhausDir);
+  const written = writeFileSafe(
+    linkedStateDir ? crewhausDir : dir,
+    linkedStateDir ? "settings.json" : SETTINGS_RELATIVE_PATH,
+    `${JSON.stringify(root, null, 2)}\n`,
+    {
+      overwrite: true,
+      createParents: true,
+      leafSymlink: "follow-contained",
+    },
+  );
+  if (!written.ok) {
+    throw new PermissionConfigError(`cannot write settings file ${path}: ${written.reason}`);
+  }
+  return path;
+}
+
+/** The settings root with `permissions.rules` replaced, every other key kept. */
+function withRules(
+  root: Readonly<Record<string, unknown>>,
+  rules: ReadonlyArray<{ readonly type: RuleType; readonly pattern: string }>,
+): Record<string, unknown> {
+  const permissionsRoot =
+    typeof root["permissions"] === "object" && root["permissions"] !== null
+      ? (root["permissions"] as Record<string, unknown>)
+      : {};
+  return {
+    ...root,
+    permissions: {
+      ...permissionsRoot,
+      rules: rules.map((r) => ({ type: r.type, pattern: r.pattern })),
+    },
+  };
 }
 
 /**
@@ -1237,9 +1357,9 @@ export function loadSettingsRules(dir: string): ReadonlyArray<PermissionRule> {
  * preserving every unrelated key on write-back. Deduped on
  * `(type, pattern)` — re-appending an existing rule is a no-op. The write is
  * atomic (tmp + rename) so a concurrently-booting run never reads a torn
- * file. This is the persistence half of a standing allow: the approval
- * surfaces call it with `{ type: "alwaysAllow", pattern: <toolName> }` when
- * an operator grants an approval with `--always`.
+ * file ({@link writeSettingsFile}). This is the persistence half of a
+ * standing allow: the decision service calls it with the narrow pattern of
+ * the approved call when an owner grants with `--always`.
  *
  * Throws {@link PermissionConfigError} when the existing file is malformed —
  * never overwrite a file we could not parse.
@@ -1255,43 +1375,149 @@ export function appendSettingsRule(
   if (existing.rules.some((r) => r.type === rule.type && r.pattern === rule.pattern)) {
     return { added: false, path };
   }
-  const permissionsRoot =
-    typeof root["permissions"] === "object" && root["permissions"] !== null
-      ? (root["permissions"] as Record<string, unknown>)
-      : {};
-  const next = {
-    ...root,
-    permissions: {
-      ...permissionsRoot,
-      rules: [
-        ...existing.rules.map((r) => ({ type: r.type, pattern: r.pattern })),
-        { type: rule.type, pattern: rule.pattern },
-      ],
-    },
-  };
-  // 0.7.1 — a random O_EXCL|O_NOFOLLOW temp beside the file, never the fixed
-  // `settings.json.tmp`, which was opened through any link a model had
-  // planted there. A settings.json that links elsewhere in the workspace is
-  // written where it leads; one that leads out of it is refused.
-  //
-  // `.crewhaus` itself may be a link an operator made to keep a harness's
-  // state elsewhere; rules are read through it, so they are written through
-  // it too: it is then the root, as it is for the session and routing stores.
-  mkdirSync(dir, { recursive: true });
-  const crewhausDir = join(dir, ".crewhaus");
-  const linkedStateDir = isSymlink(crewhausDir);
-  const written = writeFileSafe(
-    linkedStateDir ? crewhausDir : dir,
-    linkedStateDir ? "settings.json" : SETTINGS_RELATIVE_PATH,
-    `${JSON.stringify(next, null, 2)}\n`,
-    {
-      overwrite: true,
-      createParents: true,
-      leafSymlink: "follow-contained",
-    },
-  );
-  if (!written.ok) {
-    throw new PermissionConfigError(`cannot write settings file ${path}: ${written.reason}`);
-  }
+  writeSettingsFile(dir, withRules(root, [...existing.rules, rule]));
   return { added: true, path };
+}
+
+/**
+ * Remove one permission rule, exactly `(type, pattern)`, from
+ * `<dir>/.crewhaus/settings.json`, keeping every other rule in its order and
+ * every unrelated key. A file or a rule that is not there removes nothing and
+ * writes nothing. The write is the one {@link appendSettingsRule} makes, with
+ * the same link handling.
+ *
+ * Throws {@link PermissionConfigError} when the existing file is malformed —
+ * never rewrite a file we could not parse.
+ */
+export function removeSettingsRule(
+  dir: string,
+  rule: { readonly type: RuleType; readonly pattern: string },
+): { readonly removed: boolean; readonly path: string } {
+  const path = settingsFilePath(dir);
+  const root = readSettingsRoot(path);
+  if (root === undefined) return { removed: false, path };
+  const existing = parsePermissionsConfig(root["permissions"], "settings");
+  const kept = existing.rules.filter((r) => !(r.type === rule.type && r.pattern === rule.pattern));
+  if (kept.length === existing.rules.length) return { removed: false, path };
+  writeSettingsFile(dir, withRules(root, kept));
+  return { removed: true, path };
+}
+
+// ---------------------------------------------------------------------------
+// The narrow pattern of one call
+// ---------------------------------------------------------------------------
+
+/**
+ * Why one call cannot be written as a narrow rule (`Tool(value)`):
+ *
+ * - `undeclared` — the tool does not say which argument decides where it
+ *   acts, and the matcher's name table does not know it;
+ * - `no-scoping-argument` — it says no argument does (`operativeArgs: []`);
+ * - `not-parsed` — the input does not parse with the tool's schema;
+ * - `no-value` — the call carried none of the tool's operative arguments, or
+ *   left out the API it acts on;
+ * - `several-places` — the call acted on more than one place, which one rule
+ *   value cannot cover;
+ * - `not-representable` — the value cannot be written as a rule value (a path
+ *   outside the workspace, a parenthesis), or the rule written for it would
+ *   not match the call it came from;
+ * - `every-value` — the call acted on every value at once (a listing by
+ *   prefix or pattern), which only a wildcard rule covers.
+ *
+ * The first two that need the tool itself (`no-scoping-argument`,
+ * `not-parsed`) are each caller's to answer before it asks.
+ */
+export type NarrowRefusal =
+  | "undeclared"
+  | "no-scoping-argument"
+  | "not-parsed"
+  | "no-value"
+  | "several-places"
+  | "not-representable"
+  | "every-value";
+
+export type NarrowPattern =
+  | {
+      readonly pattern: string;
+      /** The one value the pattern names, unescaped. */
+      readonly value: string;
+      readonly valueKind?: OperativeValueKind;
+    }
+  | { readonly refused: NarrowRefusal };
+
+/**
+ * The narrowest allow that grants exactly the call it came from:
+ * `Tool(<the call's one operative value, glob-escaped>)`, or why there is none.
+ *
+ * `values` are the call's operative values, as the runtime reads them for its
+ * permission check (the tool's declared `operativeArgs`, canonicalised).
+ * `undefined` means the tool declares none: the matcher's name table is used,
+ * reading `input` as recorded. A value only a deny or ask reads
+ * (`restrictOnly`) is left out; exactly one value must remain. The pattern is
+ * checked against the call it came from, the way the engine reads that call:
+ * one that would not grant it is refused (`not-representable`), never
+ * proposed.
+ */
+export function narrowPatternFor(
+  toolName: string,
+  input: unknown,
+  values: ReadonlyArray<OperativeValue> | undefined,
+): NarrowPattern {
+  if (values === undefined) {
+    const fields = OPERATIVE_ARG_FIELDS[toolName];
+    if (fields === undefined) return { refused: "undeclared" };
+    if (input === null || typeof input !== "object") return { refused: "no-value" };
+    const record = input as Record<string, unknown>;
+    for (const field of fields) {
+      const value = record[field];
+      if (typeof value === "string" && value.length > 0) {
+        return grantsItsCall(toolName, value, undefined, (pattern) =>
+          matchesPattern(pattern, toolName, input),
+        );
+      }
+    }
+    return { refused: "no-value" };
+  }
+  // A relocating field's default is read by a deny or ask only; an allow is
+  // about the record the call named.
+  const allowOnly = values.filter((v) => v.restrictOnly !== true);
+  if (allowOnly.length === 0) return { refused: "no-value" };
+  if (allowOnly.length > 1) return { refused: "several-places" };
+  const only = allowOnly[0] as OperativeValue;
+  const value = only.canonical[0];
+  if (only.outsideWorkspace === true || value === undefined) {
+    return { refused: "not-representable" };
+  }
+  // `KvList {namespace: "scratch", prefix: "a"}` lists every key starting
+  // with `a`: its canonical `scratch/a*` is not a literal, and the escaped
+  // rule `KvList(scratch/a\*)` would never fire for the call it came from.
+  // A Glob pattern likewise stands for every path it lists.
+  if (only.standsForAny !== undefined || only.globPattern === true) {
+    return { refused: "every-value" };
+  }
+  return grantsItsCall(toolName, value, only.kind, (pattern) =>
+    matchesPattern(pattern, toolName, input, { operativeValues: allowOnly }),
+  );
+}
+
+/**
+ * The pattern for `value`, when the rule it writes grants the call it came
+ * from. A parenthesis is refused: the pattern is split at its first `(`, and
+ * a reader of a rule with nested parentheses cannot tell where the argument
+ * ends.
+ */
+function grantsItsCall(
+  toolName: string,
+  value: string,
+  valueKind: OperativeValueKind | undefined,
+  grants: (pattern: CompiledPattern) => boolean,
+): NarrowPattern {
+  if (value.includes("(") || value.includes(")")) return { refused: "not-representable" };
+  const pattern = `${toolName}(${escapeGlobLiteral(value)})`;
+  try {
+    if (!grants(compilePattern(pattern))) return { refused: "not-representable" };
+  } catch {
+    return { refused: "not-representable" };
+  }
+  return { pattern, value, ...(valueKind !== undefined ? { valueKind } : {}) };
 }

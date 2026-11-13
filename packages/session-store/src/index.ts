@@ -1231,6 +1231,8 @@ export {
   foldApprovalRecords,
   foldReadOnly,
   foldWithClaims,
+  parseDecisionClaim,
+  parseSupersedeClaim,
   recordInScope,
 } from "./approvals/fold";
 export {
@@ -1245,6 +1247,7 @@ export {
   LOCAL_ACTOR_LABEL,
   PLACES_DIGEST_LABEL,
   approvalsDigestKey,
+  approvalsLedger,
   bindingDigestOf,
   inputDigestOf,
   placesDigestOf,
@@ -1256,4 +1259,9 @@ export {
   SESSION_DIR_ENV,
   resolveHarnessSessionRoot,
 } from "./approvals/root";
-export { ownerAuthorizer } from "./approvals/authorize";
+export {
+  type ApprovalPrincipal,
+  NO_PRINCIPAL_REASON,
+  needsClassReason,
+  principalAuthorizer,
+} from "./approvals/authorize";

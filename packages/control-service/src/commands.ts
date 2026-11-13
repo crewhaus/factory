@@ -186,16 +186,22 @@ export function createCommands(core: ControlCore): CommandsInternals {
       running = next;
     }
     const executor = core.executors.get(receipt.kind);
-    const supervisor = harnessDir !== undefined ? core.supervisorFor(harnessDir) : undefined;
+    const supervised = !core.unsupervised.has(receipt.kind);
+    const supervisor =
+      harnessDir !== undefined && supervised ? core.supervisorFor(harnessDir) : undefined;
     let settle: Settlement;
-    if (executor === undefined || harnessDir === undefined || supervisor === undefined) {
+    if (
+      executor === undefined ||
+      harnessDir === undefined ||
+      (supervised && supervisor === undefined)
+    ) {
       settle = { state: "failed", outcome: outcomeOf("unavailable") };
     } else {
       try {
         settle = await executor({
           receipt: running,
           harnessDir,
-          supervisor,
+          ...(supervisor !== undefined ? { supervisor } : {}),
           drainRequest: core.drainRequest(harnessDir),
           now: core.now,
         });
@@ -205,7 +211,7 @@ export function createCommands(core: ControlCore): CommandsInternals {
           outcome: outcomeOf("internal"),
         };
       } finally {
-        core.releaseSupervisor(harnessDir, supervisor);
+        if (supervisor !== undefined) core.releaseSupervisor(harnessDir, supervisor);
       }
     }
     // `running → rejected` and `running → cancelled` are not moves the machine allows: a

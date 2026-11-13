@@ -1,10 +1,27 @@
 /** Fixtures for this package's tests. Not compiled, not published. */
-import { type Dirent, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import {
+  type Dirent,
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CommandReceipt } from "@crewhaus/control-contract";
+import { ensureAccessSetUp, localActorOf } from "@crewhaus/access-control";
+import { type CommandReceipt, mintId } from "@crewhaus/control-contract";
 import { type LeaseProbe, type Ledger, append } from "@crewhaus/control-records";
 import type { HarnessSupervisor, StartResult, StopResult } from "@crewhaus/harness-supervisor";
+import {
+  type PendingApproval,
+  createPendingApprovalStore,
+  generateApprovalId,
+  hashApprovalInput,
+} from "@crewhaus/session-store";
 import type { AreaRuntime } from "./executor";
 import { type ControlService, wireControl } from "./wire";
 
@@ -222,4 +239,117 @@ export function deferred(): { readonly promise: Promise<void>; readonly open: ()
     open = resolve;
   });
   return { promise, open };
+}
+
+// ---------------------------------------------------------------------------
+// Access, projections and parked approvals
+// ---------------------------------------------------------------------------
+
+/** Set Home's access records up with `identity` as the owner's linked local user. */
+export async function setUpOwner(
+  hangarRoot: string,
+  identity: { readonly username: string; readonly hostname: string } = IDENTITY,
+): Promise<string> {
+  const done = await ensureAccessSetUp(hangarRoot, { localActor: localActorOf(identity) });
+  if (!done.ok) throw new Error(done.reason);
+  return done.result.owner;
+}
+
+/**
+ * Plant a member whose active `local` link is `identity`, as access records hold one:
+ * the principal row, the link row and its readable subject. `crewhaus access link`
+ * links no local user, so a test that needs one plants it.
+ */
+export function linkLocalMember(
+  hangarRoot: string,
+  identity: { readonly username: string; readonly hostname: string },
+  by: string,
+): string {
+  const principal = mintId("prn");
+  const link = mintId("lnk");
+  const at = new Date(NOW).toISOString();
+  const dir = join(hangarRoot, "access");
+  mkdirSync(dir, { recursive: true });
+  appendFileSync(
+    join(dir, "principals.jsonl"),
+    `${JSON.stringify({ id: principal, kind: "member", state: "active", at, by })}\n`,
+  );
+  appendFileSync(
+    join(dir, "links.jsonl"),
+    `${JSON.stringify({
+      id: link,
+      principal,
+      provider: "local",
+      subjectRef: "c".repeat(64),
+      verifiedVia: "owner",
+      state: "active",
+      at,
+      by,
+    })}\n`,
+  );
+  const subjectsFile = join(dir, "subjects.json");
+  const subjects = JSON.parse(readFileSync(subjectsFile, "utf8")) as {
+    links: Record<string, string>;
+  };
+  subjects.links[link] = localActorOf(identity);
+  writeFileSync(subjectsFile, `${JSON.stringify(subjects, null, 2)}\n`);
+  return principal;
+}
+
+/** Write a harness's approver projection: its owner and members by class. */
+export function plantProjection(
+  harness: string,
+  owner: string,
+  members: ReadonlyArray<{ readonly principal: string; readonly decide: string }> = [],
+): void {
+  const control = join(harness, ".crewhaus", "run", "control");
+  mkdirSync(control, { recursive: true });
+  writeFileSync(
+    join(control, "approvers.json"),
+    `${JSON.stringify({
+      v: 1,
+      epoch: 1,
+      generatedAt: new Date(NOW).toISOString(),
+      harness: "hrn_00000000000000c1",
+      owner,
+      governedSince: new Date(NOW - 86_400_000).toISOString(),
+      members,
+      links: [],
+    })}\n`,
+  );
+}
+
+/** Park a tool approval in the harness's default session root. */
+export async function park(
+  harness: string,
+  toolName: string,
+  input: unknown,
+  overrides: Partial<PendingApproval> = {},
+): Promise<PendingApproval> {
+  const record: PendingApproval = {
+    id: generateApprovalId(),
+    toolName,
+    inputHash: hashApprovalInput(toolName, input),
+    input,
+    runId: "run_abcd1234",
+    sessionId: "sess_00000000000000aa",
+    surface: "single-turn",
+    createdAt: new Date(NOW).toISOString(),
+    ...overrides,
+  };
+  const store = createPendingApprovalStore({
+    rootDir: join(harness, ".crewhaus", "sessions"),
+    now: () => new Date(NOW),
+  });
+  await store.persist(record);
+  return record;
+}
+
+/** The harness's settings file, parsed; `undefined` when absent. */
+export function settingsOf(harness: string): unknown {
+  try {
+    return JSON.parse(readFileSync(join(harness, ".crewhaus", "settings.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
 }

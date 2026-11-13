@@ -16,6 +16,8 @@ export type ControlCore = {
   readonly hostBootedAt: () => number;
   readonly executors: ReadonlyMap<string, Executor>;
   readonly reconcilers: ReadonlyMap<string, Reconciler>;
+  /** Kinds dispatched without a supervisor: their executors act on records alone. */
+  readonly unsupervised: ReadonlySet<string>;
   readonly harnessDirOf: (hrn: string) => string | undefined;
   readonly harnessDirs: () => readonly string[];
   readonly supervisorFor: (harnessDir: string) => HarnessSupervisor | undefined;

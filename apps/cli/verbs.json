@@ -235,6 +235,18 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "pattern",
+              "takesValue": true
+            },
+            {
+              "name": "legacy",
+              "takesValue": true
             }
           ]
         },
@@ -272,6 +284,18 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "pattern",
+              "takesValue": true
+            },
+            {
+              "name": "legacy",
+              "takesValue": true
             }
           ]
         },
@@ -309,6 +333,18 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "pattern",
+              "takesValue": true
+            },
+            {
+              "name": "legacy",
+              "takesValue": true
             }
           ]
         },
@@ -346,6 +382,18 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "pattern",
+              "takesValue": true
+            },
+            {
+              "name": "legacy",
+              "takesValue": true
             }
           ]
         },
@@ -383,6 +431,18 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "pattern",
+              "takesValue": true
+            },
+            {
+              "name": "legacy",
+              "takesValue": true
             }
           ]
         },
@@ -420,6 +480,18 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "pattern",
+              "takesValue": true
+            },
+            {
+              "name": "legacy",
+              "takesValue": true
             }
           ]
         },
@@ -457,6 +529,116 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "pattern",
+              "takesValue": true
+            },
+            {
+              "name": "legacy",
+              "takesValue": true
+            }
+          ]
+        },
+        "rules": {
+          "flags": [
+            {
+              "name": "dir",
+              "takesValue": true
+            },
+            {
+              "name": "by",
+              "takesValue": true
+            },
+            {
+              "name": "once",
+              "takesValue": false
+            },
+            {
+              "name": "always",
+              "takesValue": false
+            },
+            {
+              "name": "reason",
+              "takesValue": true
+            },
+            {
+              "name": "until",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "pattern",
+              "takesValue": true
+            },
+            {
+              "name": "legacy",
+              "takesValue": true
+            }
+          ]
+        },
+        "revoke": {
+          "flags": [
+            {
+              "name": "dir",
+              "takesValue": true
+            },
+            {
+              "name": "by",
+              "takesValue": true
+            },
+            {
+              "name": "once",
+              "takesValue": false
+            },
+            {
+              "name": "always",
+              "takesValue": false
+            },
+            {
+              "name": "reason",
+              "takesValue": true
+            },
+            {
+              "name": "until",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "pattern",
+              "takesValue": true
+            },
+            {
+              "name": "legacy",
+              "takesValue": true
             }
           ]
         }
@@ -494,6 +676,18 @@
           "name": "help",
           "short": "h",
           "takesValue": false
+        },
+        {
+          "name": "days",
+          "takesValue": true
+        },
+        {
+          "name": "pattern",
+          "takesValue": true
+        },
+        {
+          "name": "legacy",
+          "takesValue": true
         }
       ]
     },

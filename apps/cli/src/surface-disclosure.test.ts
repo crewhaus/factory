@@ -10,9 +10,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { dirname, join } from "node:path";
+import { runtimeStateRoots } from "@crewhaus/runtime-core";
 import { protectedRootHolding } from "@crewhaus/tool-safety/fs";
-import { discloseSurfaceChange, surfaceRecordDir } from "./surface-disclosure";
+import { discloseSurfaceChange, surfaceRecordDir, withRunSpecDir } from "./surface-disclosure";
 
 const SPEC = `name: disclosed
 target: cli
@@ -98,15 +99,95 @@ describe("crewhaus run's start-up disclosure of security settings", () => {
     expect(start(spec, SPEC)).toEqual({ lines: [], kind: "unchanged" });
   });
 
-  test("started in the spec's directory, the record is inside the run directory the floor protects", () => {
+  const RECORD_FILES = ["surfaces.json", "commits.jsonl", join("drafts", "x"), "lock"];
+
+  test("started in the spec's directory, the record is on the floor the run consults", () => {
     const spec = harness();
     const cwd = realpathSync(join(spec, ".."));
     start(spec, SPEC);
     const record = join(surfaceRecordDir(spec), "surfaces.json");
     expect(existsSync(record)).toBe(true);
-    // `.crewhaus/run` under the run's working directory is a floor root.
-    expect(relative(cwd, record).startsWith(join(".crewhaus", "run") + sep)).toBe(true);
-    expect(protectedRootHolding(record, [join(cwd, ".crewhaus", "run")], cwd)).toBeDefined();
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {}, undefined, {
+      specDir: dirname(spec),
+    });
+    for (const name of RECORD_FILES) {
+      expect(protectedRootHolding(join(surfaceRecordDir(spec), name), roots, cwd)).toBeDefined();
+    }
+  });
+
+  test("a spec kept elsewhere has its record on the floor too, through the run's scope", () => {
+    const spec = harness();
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "surface-disclosure-cwd-")));
+    dirs.push(cwd);
+    const explicit = runtimeStateRoots(undefined, undefined, cwd, {}, undefined, {
+      specDir: dirname(spec),
+    });
+    const scoped = withRunSpecDir(spec, () =>
+      runtimeStateRoots(undefined, undefined, cwd, {}, undefined),
+    );
+    const outside = runtimeStateRoots(undefined, undefined, cwd, {}, undefined);
+    for (const name of RECORD_FILES) {
+      const file = join(surfaceRecordDir(spec), name);
+      expect(protectedRootHolding(file, explicit, cwd)).toBeDefined();
+      expect(protectedRootHolding(file, scoped, cwd)).toBeDefined();
+      expect(protectedRootHolding(file, outside, cwd)).toBeUndefined();
+    }
+  });
+
+  test("a record missing after the spec was committed to is said, and written again", () => {
+    const spec = harness();
+    mkdirSync(surfaceRecordDir(spec), { recursive: true });
+    writeFileSync(join(surfaceRecordDir(spec), "commits.jsonl"), '{"v":1}\n');
+    const out = start(spec, SPEC);
+    expect(out.kind).toBe("warned");
+    expect(out.lines).toHaveLength(1);
+    expect(out.lines[0]).toContain("crewhaus.yaml");
+    expect(out.lines[0]).toContain("can't be shown");
+    expect(existsSync(join(surfaceRecordDir(spec), "surfaces.json"))).toBe(true);
+    expect(start(spec, SPEC)).toEqual({ lines: [], kind: "unchanged" });
+  });
+
+  test("a missing record whose rewrite fails says both", () => {
+    const spec = harness();
+    mkdirSync(surfaceRecordDir(spec), { recursive: true });
+    writeFileSync(join(surfaceRecordDir(spec), "commits.jsonl"), '{"v":1}\n');
+    const lines: string[] = [];
+    const out = discloseSurfaceChange(spec, SPEC, {
+      stderr: (line) => lines.push(line),
+      write: () => {
+        throw new Error("disk full");
+      },
+    });
+    expect(out.kind).toBe("warned");
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain("can't be shown");
+    expect(lines[1]).toContain("disk full");
+  });
+
+  test("an unreadable record whose rewrite fails says both", () => {
+    const spec = harness();
+    mkdirSync(surfaceRecordDir(spec), { recursive: true });
+    writeFileSync(join(surfaceRecordDir(spec), "surfaces.json"), "{ torn");
+    const lines: string[] = [];
+    const out = discloseSurfaceChange(spec, SPEC, {
+      stderr: (line) => lines.push(line),
+      write: () => {
+        throw new Error("disk full");
+      },
+    });
+    expect(out.kind).toBe("warned");
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain("can't be shown");
+    expect(lines[0]).toContain("Review the security settings in crewhaus.yaml");
+    expect(lines[1]).toContain("disk full");
+  });
+
+  test("no record and no commit log is a quiet first start", () => {
+    const spec = harness();
+    mkdirSync(surfaceRecordDir(spec), { recursive: true });
+    // A log with no complete line is no commit.
+    writeFileSync(join(surfaceRecordDir(spec), "commits.jsonl"), '{"v":1');
+    expect(start(spec, SPEC)).toEqual({ lines: [], kind: "recorded" });
   });
 });
 

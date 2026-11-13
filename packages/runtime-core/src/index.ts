@@ -273,6 +273,7 @@ import {
   runtimeStateRoots,
   storeFileRoots,
 } from "./state-roots";
+export { runSpecDirScope, runtimeStateRoots } from "./state-roots";
 import {
   type ServingModel,
   type ToolLimitVerdict,
@@ -4229,7 +4230,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // tool results and the proof bundles this run's gates read as evidence: no
   // tool call the agent makes may write there, whatever a rule says
   // (permission-engine's runtime-state floor, `./state-roots`).
-  const protectedRoots = runtimeStateRoots(sessionRootDir, currentTenantContext()?.tenant);
+  const protectedRoots = runtimeStateRoots(
+    sessionRootDir,
+    currentTenantContext()?.tenant,
+    undefined,
+    undefined,
+    undefined,
+    { hookCommands: opts.hooks?.map((hook) => hook.command) ?? [] },
+  );
   // The continuity store's own files: only its tools write them. Files, not
   // roots, so a tool that checks its own targets (StateImport) keeps working
   // on the whole of `.crewhaus/state`.

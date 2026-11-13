@@ -16,7 +16,11 @@
  *   3. for each pair of allows, one from each set, the pattern that matches
  *      exactly the calls BOTH match — when this grammar can write it;
  *
- * then the mode's own fallback, which both sets share. A call that matches no
+ * then the mode's own fallback, which both sets share. An allow made from a
+ * pair in which either side carries `live` (a standing rule that is revoked
+ * or past its end stops matching) answers `live` from its pairs: it matches
+ * while some pair behind it still does, and a pair already stopped when the
+ * meet is built grants nothing. A call that matches no
  * deny or ask gets `allow` only when both sets allow it; any other call falls
  * through to the fallback, as it would in the set that did not allow it.
  *
@@ -97,6 +101,11 @@ export function intersectPatterns(a: string, b: string): string | undefined {
   return arg === null ? tool : `${tool}(${arg})`;
 }
 
+/** Whether neither allow of a pair has stopped matching. */
+function pairLive(a: PermissionRule, b: PermissionRule): boolean {
+  return a.live?.() !== false && b.live?.() !== false;
+}
+
 export type RuleSetMeet = {
   readonly rules: RuleSet;
   /** Allow patterns of `b` that no allow of `a` shares any writable overlap with. */
@@ -110,23 +119,32 @@ export function meetRuleSets(a: RuleSet, b: RuleSet): RuleSetMeet {
     all.filter((r) => r.type === type).map((r) => ({ ...r, source: "settings" as const }));
   const allowsA = flatten(a).filter((r) => r.type === "alwaysAllow");
   const allowsB = flatten(b).filter((r) => r.type === "alwaysAllow");
-  const granted = new Set<string>();
+  // Each granted pattern keeps the pairs of allows behind it, so a standing
+  // rule's liveness (`PermissionRule.live`) holds in the meet too.
+  const granted = new Map<string, [PermissionRule, PermissionRule][]>();
   const ungranted: string[] = [];
   for (const rb of allowsB) {
     let any = false;
     for (const ra of allowsA) {
       const both = intersectPatterns(ra.pattern, rb.pattern);
       if (both === undefined) continue;
-      granted.add(both);
       any = true;
+      if (!pairLive(ra, rb)) continue;
+      const pairs = granted.get(both);
+      if (pairs === undefined) granted.set(both, [[ra, rb]]);
+      else pairs.push([ra, rb]);
     }
     if (!any && !ungranted.includes(rb.pattern)) ungranted.push(rb.pattern);
   }
-  const allows: PermissionRule[] = [...granted].map((pattern) => ({
-    type: "alwaysAllow",
-    pattern,
-    source: "settings",
-  }));
+  const allows: PermissionRule[] = [...granted].map(([pattern, pairs]) => {
+    const rule: PermissionRule = { type: "alwaysAllow", pattern, source: "settings" };
+    // A pair of allows with no `live` on either side grants for good, and a
+    // rule that no live-checked pair grants stays exactly `{type, pattern, source}`.
+    if (pairs.every(([ra, rb]) => ra.live !== undefined || rb.live !== undefined)) {
+      return { ...rule, live: () => pairs.some(([ra, rb]) => pairLive(ra, rb)) };
+    }
+    return rule;
+  });
   return {
     rules: {
       flag: [],

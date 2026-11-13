@@ -26,7 +26,7 @@ function wireWith(areas: readonly AreaRuntime[]) {
 }
 
 describe("the composition", () => {
-  test("the shipped composition passes, and the core registers daemon control and activation", () => {
+  test("the shipped composition passes, and the core registers daemon control, activation and decisions", () => {
     expect(compositionProblems(AREA_RUNTIMES)).toEqual([]);
     expect(AREA_RUNTIMES.map((runtime) => runtime.area)).toEqual(["core"]);
     expect(Object.keys(CORE_RUNTIME.executors ?? {}).sort()).toEqual([
@@ -34,12 +34,25 @@ describe("the composition", () => {
       "controls.restart",
       "controls.start",
       "controls.stop",
+      "decisions.resolve",
+      "decisions.supersede",
       "deployments.activate",
+      "rules.create",
+      "rules.revoke",
     ]);
     expect(Object.keys(CORE_RUNTIME.reconcilers ?? {}).sort()).toEqual([
       "controls.restart",
       "controls.start",
+      "decisions.supersede",
       "deployments.activate",
+      "rules.create",
+    ]);
+    // The decision kinds act on records alone: dispatched with no supervisor.
+    expect([...(CORE_RUNTIME.unsupervised ?? [])].sort()).toEqual([
+      "decisions.resolve",
+      "decisions.supersede",
+      "rules.create",
+      "rules.revoke",
     ]);
     expect(activationGates(AREA_RUNTIMES).map((gate) => gate.name)).toEqual([
       "protected-environment",

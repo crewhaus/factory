@@ -9,7 +9,7 @@
  * `alwaysAllow RunCommand` ("run any command"), with no warning in the output.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
@@ -221,4 +221,68 @@ describe("crewhaus permissions suggest — an allow that would override the spec
     const json = JSON.parse((await suggest(true)).stdout) as { overrideCheck: unknown };
     expect(json.overrideCheck).toMatchObject({ spec: null, unread: expect.any(String) });
   }, 30_000);
+});
+
+describe("crewhaus permissions suggest --apply on a harness with an approver list", () => {
+  test("a linked maintainer is refused before anything is asked, and the file stays", async () => {
+    const { ensureAccessSetUp, localActorOf } = await import("@crewhaus/access-control");
+    const { currentLocalIdentity } = await import("@crewhaus/control-service");
+    const { mintId } = await import("@crewhaus/control-contract");
+    const hangarRoot = join(cwd, "home");
+    const setup = await ensureAccessSetUp(hangarRoot, {
+      localActor: localActorOf({ username: "someone-else", hostname: "elsewhere" }),
+    });
+    if (!setup.ok) throw new Error(setup.reason);
+    const owner = setup.result.owner;
+    // This OS user, planted as a linked member: `crewhaus access link` links no local user.
+    const member = mintId("prn");
+    const link = mintId("lnk");
+    const at = new Date().toISOString();
+    const access = join(hangarRoot, "access");
+    writeFileSync(
+      join(access, "principals.jsonl"),
+      `${readFileSync(join(access, "principals.jsonl"), "utf8")}${JSON.stringify({ id: member, kind: "member", state: "active", at, by: owner })}\n`,
+    );
+    writeFileSync(
+      join(access, "links.jsonl"),
+      `${readFileSync(join(access, "links.jsonl"), "utf8")}${JSON.stringify({ id: link, principal: member, provider: "local", subjectRef: "e".repeat(64), verifiedVia: "owner", state: "active", at, by: owner })}\n`,
+    );
+    const subjects = JSON.parse(readFileSync(join(access, "subjects.json"), "utf8")) as {
+      links: Record<string, string>;
+    };
+    subjects.links[link] = localActorOf(currentLocalIdentity());
+    writeFileSync(join(access, "subjects.json"), JSON.stringify(subjects));
+    mkdirSync(join(cwd, ".crewhaus", "run", "control"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".crewhaus", "run", "control", "approvers.json"),
+      JSON.stringify({
+        v: 1,
+        epoch: 1,
+        generatedAt: at,
+        harness: "hrn_00000000000000e1",
+        owner,
+        governedSince: at,
+        members: [{ principal: member, decide: "maintainer" }],
+        links: [],
+      }),
+    );
+    const settings = join(cwd, ".crewhaus", "settings.json");
+    writeFileSync(settings, '{"hooks":[]}\n');
+    seed([{ name: "Write", input: { path: "out/report.md", content: "x" } }]);
+    const proc = Bun.spawn([process.execPath, CLI_PATH, "permissions", "suggest", "--apply"], {
+      cwd,
+      env: {
+        PATH: process.env["PATH"] ?? "",
+        CREWHAUS_HANGAR_ROOT: hangarRoot,
+        CREWHAUS_REGISTRY_ROOT: join(cwd, "registry"),
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    expect(exitCode).toBe(51);
+    expect(stderr).toContain("Needs the owner.");
+    expect(readFileSync(settings, "utf8")).toBe('{"hooks":[]}\n');
+  }, 60_000);
 });

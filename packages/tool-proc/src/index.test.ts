@@ -904,6 +904,18 @@ describe("RunCommand", () => {
     }
   });
 
+  test("a child is marked as started by the tool, and the call cannot clear the mark", async () => {
+    const plain = await call(runCommand, { argv: ["env"] });
+    expect(plain.stdout).toContain("CREWHAUS_AGENT_TOOL=RunCommand");
+    const cleared = await call(runCommand, {
+      argv: ["env"],
+      envSet: { CREWHAUS_AGENT_TOOL: "" },
+    });
+    expect(cleared.stdout).toContain("CREWHAUS_AGENT_TOOL=RunCommand");
+    const forwarded = await call(runCommand, { argv: ["env"], env: ["CREWHAUS_AGENT_TOOL"] });
+    expect(forwarded.stdout).toContain("CREWHAUS_AGENT_TOOL=RunCommand");
+  });
+
   test("envSet supplies a literal value", async () => {
     const out = await call(runCommand, { argv: ["env"], envSet: { GREETING: "hi" } });
     expect(out.stdout).toContain("GREETING=hi");

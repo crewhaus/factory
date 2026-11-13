@@ -350,6 +350,16 @@ export const decisionOverlays = z
   .object({ assigned: z.object({ to: storedActor, at: timestamp }).strict().optional() })
   .strict();
 
+/** A standing-rule proposal's terms; `ruleKind` says which terms follow. */
+export const standingRuleTerms = z
+  .object({
+    ruleKind: z.literal("allow"),
+    tool: z.string(),
+    pattern: z.string(),
+    expiresAt: timestamp,
+  })
+  .passthrough();
+
 export const decision = z
   .object({
     id: decisionId,
@@ -375,7 +385,7 @@ export const decision = z
     consumedAt: timestamp.optional(),
     consumedByRun: z.string().optional(),
     always: z.boolean().optional(),
-    kind: z.enum(["tool", "input"]).optional(),
+    kind: z.enum(["tool", "input", "standing-rule-proposal"]).optional(),
     decidedByPrincipal: storedActor.optional(),
     decidedVia: z.string().optional(),
     // A fresh request's id, or the run whose cancel withdrew this one (`run-cancelled`).
@@ -402,6 +412,9 @@ export const decision = z
     harness: harnessId.optional(),
     choices: z.array(z.string()).optional(),
     evidenceRefs: z.array(z.string()).optional(),
+    terms: standingRuleTerms.optional(),
+    proposedBy: storedActor.optional(),
+    derivedFrom: decisionId.optional(),
   })
   .passthrough();
 
@@ -442,14 +455,20 @@ export const approverProjection = z
 export const standingRule = z
   .object({
     id: ruleId,
+    kind: z.literal("allow"),
     tool: z.string(),
     pattern: z.string(),
     derivedFrom: decisionId.optional(),
+    proposal: decisionId.optional(),
     createdBy: storedActor,
-    reason: z.string(),
+    reason: z.enum(["approval", "proposal"]),
     policyRevision: z.string().optional(),
+    createdAt: timestamp,
     expiresAt: timestamp,
+    state: z.enum(["active", "revoked", "expired"]),
     revokedAt: timestamp.optional(),
+    revokedBy: storedActor.optional(),
+    expiredAt: timestamp.optional(),
   })
   .passthrough();
 

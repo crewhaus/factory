@@ -67,11 +67,14 @@ const LINK = {
 const DEVICE = { id: mintId("dev"), principal: mintId("prn"), createdAt: AT } as const;
 const RULE = {
   id: mintId("rule"),
+  kind: "allow",
   tool: "Bash",
   pattern: "Bash(ls)",
   createdBy: mintId("prn"),
-  reason: "other",
+  reason: "approval",
+  createdAt: AT,
   expiresAt: AT,
+  state: "active",
 } as const;
 const OPERATION = {
   id: "me.get",

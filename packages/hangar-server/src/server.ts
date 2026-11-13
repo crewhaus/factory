@@ -1701,18 +1701,29 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         const verb = tail[1];
         if (!isApprovalId(apprId)) throw new HttpError(400, "invalid approval id");
         if (verb !== "grant" && verb !== "deny") throw new HttpError(404, "not found");
-        const body = await readBody(req);
-        const by = typeof body["by"] === "string" && body["by"] !== "" ? body["by"] : operator;
+        // The decision counts as the signed-in member, decided by their class; the
+        // operator label is shown with it and is no authority.
+        const caller = callers.get(req);
+        const actor: Parameters<typeof resolveApproval>[0]["actor"] =
+          caller?.kind === "principal"
+            ? {
+                kind: "principal",
+                principal: caller.principal,
+                ...(caller.via === "service" ? { service: true as const } : {}),
+                display: operator,
+              }
+            : { kind: "anonymous", display: operator };
         const result = await resolveApproval({
+          decisions: controlService.decisions,
           harnessDir: liveDirOr404(entry),
           approvalId: apprId,
           decision: verb === "grant" ? "grant" : "deny",
-          by,
-          now: () => new Date(now()),
+          actor,
         });
         if (result.outcome === "not-found") throw new HttpError(404, "no such approval");
         if (result.outcome === "unreachable") throw new HttpError(409, result.reason);
         if (result.outcome === "forbidden") throw new HttpError(403, result.reason);
+        if (result.outcome === "invalid") throw new HttpError(400, result.reason);
         if (result.outcome !== "resolved") {
           // The first decision stands: say what state it left, never who made it.
           throw new HttpError(409, refusedDecisionMessage(result.outcome, result.approval));

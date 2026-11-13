@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
+import { casAppend, standingRulesLedger } from "@crewhaus/control-records";
 import {
   BUILTIN_DEFAULT_RULES,
   type PermissionMode,
@@ -7,6 +11,7 @@ import {
   type ToolCallContext,
   emptyRuleSet,
   evaluate,
+  loadSettingsRules,
 } from "@crewhaus/permission-engine";
 import { resolveChildPermissions, resolveChildPermissionsNarrowOnly } from "./index.js";
 
@@ -395,5 +400,91 @@ describe("resolveChildPermissionsNarrowOnly — a definition the operator did no
     const { ungrantedAllows, ...narrow } = resolveChildPermissionsNarrowOnly(parent, scoped);
     expect(narrow).toEqual(resolveChildPermissions(parent, scoped));
     expect(ungrantedAllows).toEqual([]);
+  });
+});
+
+describe("resolveChildPermissionsNarrowOnly — a standing rule's liveness", () => {
+  const T0 = Date.parse("2026-11-12T00:00:00.000Z");
+  const pattern = "Write(notes/a.md)";
+  const write: ToolCallContext = {
+    toolName: "Write",
+    input: { path: "notes/a.md" },
+    operativeValues: [{ kind: "path", canonical: ["notes/a.md"] }],
+    readOnly: false,
+    destructive: true,
+  };
+  const definition: SubAgentDefinition = {
+    ...DEF_BASE,
+    tools: ["Write"],
+    permissions: { allow: ["Write(**)"], deny: [] },
+  };
+
+  async function harness(): Promise<{
+    dir: string;
+    revoke: () => Promise<void>;
+    [Symbol.dispose]: () => void;
+  }> {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "narrow-live-")));
+    mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(dir, ".crewhaus", "settings.json"),
+      JSON.stringify({ permissions: { rules: [{ type: "alwaysAllow", pattern }] } }),
+    );
+    const id = "rule_01m76e6f05hp514w9j4v3qymka";
+    const row = {
+      kind: "allow",
+      tool: "Write",
+      pattern,
+      createdBy: "prn_01m76e6f05hp514w9j4v3qymkb",
+      reason: "approval",
+      createdAt: new Date(T0).toISOString(),
+      expiresAt: new Date(T0 + 30 * 86_400_000).toISOString(),
+      state: "active",
+    };
+    await casAppend(standingRulesLedger(dir), id, null, row);
+    return {
+      dir,
+      revoke: async () => {
+        await casAppend(standingRulesLedger(dir), id, "active", {
+          ...row,
+          state: "revoked",
+          revokedAt: new Date(T0 + 2000).toISOString(),
+          revokedBy: row.createdBy,
+        });
+      },
+      [Symbol.dispose]: () => rmSync(dir, { recursive: true, force: true }),
+    };
+  }
+
+  test("a child built before the revoke stops allowing with its parent", async () => {
+    using h = await harness();
+    let now = T0 + 1000;
+    const parent = {
+      mode: "default" as PermissionMode,
+      rules: { ...emptyRuleSet, settings: loadSettingsRules(h.dir, { now: () => now }) },
+    };
+    const child = resolveChildPermissionsNarrowOnly(parent, definition);
+    expect(evaluate(write, child.mode, child.rules)).toBe("allow");
+    await h.revoke();
+    now += 1001;
+    expect(evaluate(write, parent.mode, parent.rules)).toBe("ask");
+    expect(evaluate(write, child.mode, child.rules)).not.toBe("allow");
+    // A child built after the revoke grants nothing for it.
+    const later = resolveChildPermissionsNarrowOnly(parent, definition);
+    expect(evaluate(write, later.mode, later.rules)).not.toBe("allow");
+  });
+
+  test("a rule no record names stays exactly as written in the child", () => {
+    const parent = {
+      mode: "default" as PermissionMode,
+      rules: {
+        ...emptyRuleSet,
+        settings: [{ type: "alwaysAllow" as const, pattern, source: "settings" as const }],
+      },
+    };
+    const child = resolveChildPermissionsNarrowOnly(parent, definition);
+    expect(child.rules.settings.filter((rule) => rule.type === "alwaysAllow")).toEqual([
+      { type: "alwaysAllow", pattern, source: "settings" },
+    ]);
   });
 });
