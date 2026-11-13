@@ -48,7 +48,11 @@ import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
 const SKILL_FILE = "SKILL.md";
-const SKILLS_RELATIVE = ".crewhaus/skills";
+/**
+ * The skill directory discovery reads under the working directory and under
+ * the home directory. Exported so the runtime-state floor names the same one.
+ */
+export const SKILLS_RELATIVE = ".crewhaus/skills";
 
 /**
  * The largest SKILL.md read, whole, at discovery and when its body is

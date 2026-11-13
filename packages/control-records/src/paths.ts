@@ -51,6 +51,15 @@ export type ControlPaths = {
   readonly standingRulesFile: string;
   /** The `dec_` decisions that are not tool approvals, in size segments. */
   readonly decisionsDir: string;
+  /** The run ledger, in size segments. */
+  readonly runsDir: string;
+  /**
+   * A queued run's input and subject, one `0600` file per run, kept until the
+   * process that runs it has read it, or the run is cancelled.
+   */
+  readonly inputsDir: string;
+  /** The key a run's subject is digested under (`subjectRefOf`), beside the digest key. */
+  readonly subjectKeyFile: string;
 };
 
 /**
@@ -76,6 +85,9 @@ export function controlPaths(harnessDir: string): ControlPaths {
     heartbeatFile: join(runDir, "control-heartbeat.json"),
     standingRulesFile: join(controlDir, "standing-rules.jsonl"),
     decisionsDir: join(controlDir, "decisions"),
+    runsDir: join(controlDir, "runs"),
+    inputsDir: join(controlDir, "inputs"),
+    subjectKeyFile: join(controlDir, "keys", "subject.key"),
   };
 }
 
@@ -98,4 +110,13 @@ export function harnessLedger(
     claims: paths.claimsDir,
     ...(options.machine !== undefined ? { machine: options.machine } : {}),
   };
+}
+
+/**
+ * The run ledger of the harness at `root`, on the `run` machine.
+ *
+ * First consumers: the managed daemon's run rows and its queued-run follower.
+ */
+export function runsLedger(root: string): Ledger {
+  return harnessLedger(root, { dir: controlPaths(root).runsDir }, { machine: "run" });
 }

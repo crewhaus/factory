@@ -833,6 +833,7 @@ describe("Home's run credentials and decision records are never served", () => {
     [".crewhaus/run/mcp-token", "MCP door"],
     [".crewhaus/run/control/keys/digest.key", "digests are made with"],
     [".crewhaus/run/control/inputs/dec_1.json", "inputs decisions were asked about"],
+    [".crewhaus/run/control/inputs/run_1.json", "a queued run's input"],
     [".crewhaus/run/control/approvers.json", "who may approve"],
     [".crewhaus/run/control/link-requests.jsonl", "link an outside identity"],
     [".crewhaus/run/gateway-jwt-secret", "generated signing secret"],

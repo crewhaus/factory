@@ -32,3 +32,10 @@ and actions routes, so a body over the limit is answered 413 before `verify()`, 
 optional `maxBodyBytes`. The daemon resolves the limit once from `CHANNEL_WEBHOOK_MAX_BYTES` (1 MiB when
 unset) and passes it to the gateway and to the public port's `Bun.serve` as `maxRequestBodySize`. No
 other digest moves.
+
+**Managed runs delta — `managed`'s `daemon.ts` only.** The `crewhaus.v1` handler, the run-event
+registry and the signing-secret bootstrap delegate to `@crewhaus/gateway-server/managed-runs`
+(`createManagedRuns`, `resolveGatewaySecret`); the emitted code keeps only the turn itself, and the
+daemon starts and stops the queued-run follower with the gateway. Imports follow. The tenants-root
+check is emitted only for a spec that declares a tool that works on files, which the managed spec here
+does not. No other digest moves.

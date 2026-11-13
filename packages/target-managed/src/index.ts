@@ -44,6 +44,8 @@ import { TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
  *   - per-tenant routing via `@crewhaus/tenancy`,
  *   - per-tenant audit log via `@crewhaus/audit-log`,
  *   - the runChatLoop dispatcher inside `runs.create` / `runs.continue`,
+ *     through `@crewhaus/gateway-server/managed-runs`, which records each
+ *     run before its turn starts,
  *   - a pluggable `@crewhaus/durable-state` BudgetStore
  *     (`CREWHAUS_BUDGET_STORE=sqlite:<path>` for restart-safe accounting)
  *     shared with the boot-time self-heal janitor (ops item 36), which
@@ -140,9 +142,9 @@ function resolveManagedTools(
  * True when the spec declares a builtin that may work on files named relative
  * to the harness directory: its manifest row names a path or a command, or does
  * not say. An absent `operativeArgs` is "not declared", and `[]` is how a tool
- * declares that no argument decides where it acts. The boot warning about where
- * the tenants root belongs is emitted for these specs, and a spec with none
- * compiles without a byte of it.
+ * declares that no argument decides where it acts. The boot check that refuses a
+ * tenants root inside the harness directory is emitted for these specs, and a
+ * spec with none compiles without a byte of it.
  */
 function declaresPathTool(ir: IrManagedV0): boolean {
   return (ir.tools ?? []).some((key) => {
@@ -1116,8 +1118,8 @@ const federation: GatewayFederationConfig | undefined =
  * seen is the standing verdict. The reply carries no footer (the gate is
  * wired with `footerTarget: "none"`, see `renderEvaluation`): the envelope's
  * `proof` is the bundle's one carrier. A duplicate resume (the idempotency
- * path) returns the cached reply WITH the bundle it was graded with, never a
- * bare reply.
+ * path in `@crewhaus/gateway-server/managed-runs`) returns the cached reply
+ * WITH the bundle it was graded with, never a bare reply.
  *
  * A `halt` verdict throws the classified `provability` failure (exit 37)
  * before any result exists, so the gateway answers with an error and no
@@ -1128,70 +1130,52 @@ const federation: GatewayFederationConfig | undefined =
  * run's `provability_graded` trace event, which `runs.subscribe` streams like
  * every other bus event (its `bundlePath` relative to the tenant's root).
  *
- * Without `provability:` every piece is the pre-0.8.0 text, byte for byte.
+ * The rest of a run — its id, its rows, its context, the resume cache — is
+ * `createManagedRuns`'s: this renders only the `executeTurn` it is handed.
  */
 function renderProofResult(
   ir: IrManagedV0,
   tenantField: string,
 ): {
   readonly importLine: string;
-  readonly storeDecl: string;
-  readonly servedType: string;
-  readonly servedVar: string;
   readonly executeTurn: string;
-  readonly unwrap: string;
-  readonly resultField: string;
 } {
-  const extraOptions = `          extraOptions: {
-            runContext,
-            justificationAuditSink: log,
-            egressAuditSink: log,
-            ...(isResume ? { resume: { sessionId } } : {}),
-          },`;
+  const extraOptions = `      extraOptions: {
+        runContext,
+        justificationAuditSink: log,
+        egressAuditSink: log,
+        ...(isResume ? { resume: { sessionId } } : {}),
+      },`;
   if (ir.provability === undefined) {
     return {
       importLine: "",
-      storeDecl: "const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<string>();",
-      servedType: "string",
-      servedVar: "reply",
-      executeTurn: `      const executeTurn = async (): Promise<string> =>
-        await runOneTurn({
-          tenantId: tenant.id,
-          sessionId,
-          input: p.input${tenantField},
+      executeTurn: `  executeTurn: async ({ tenant, sessionId, input, isResume, runContext, log }) => ({
+    reply: await runOneTurn({
+      tenantId: tenant.id,
+      sessionId,
+      input${tenantField},
 ${extraOptions}
-        });
-      let reply: string;`,
-      unwrap: "",
-      resultField: "",
+    }),
+  }),`,
     };
   }
   return {
     importLine: 'import type { ProofBundle } from "@crewhaus/evaluation-service";\n',
-    storeDecl: `// 0.8.0 §5.4 — a served turn is its reply and, under provability:, the proof
-// bundle its gate graded; the resume cache keeps both.
-type ServedTurn = { readonly reply: string; readonly proof?: ProofBundle };
-const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<ServedTurn>();`,
-    servedType: "ServedTurn",
-    servedVar: "served",
-    executeTurn: `      // 0.8.0 §5.4 — this run's observer: the gate grades every pass of the
-      // turn and the last bundle it hands over is the standing verdict.
-      const executeTurn = async (): Promise<ServedTurn> => {
-        const graded: { proof?: ProofBundle } = {};
-        const turnReply = await runOneTurn({
-          tenantId: tenant.id,
-          sessionId,
-          input: p.input${tenantField},
-          onProofBundle: (bundle) => {
-            graded.proof = bundle;
-          },
+    executeTurn: `  // This run's observer: the gate grades every pass of the turn, and the
+  // last bundle it hands over is the standing verdict.
+  executeTurn: async ({ tenant, sessionId, input, isResume, runContext, log }) => {
+    const graded: { proof?: ProofBundle } = {};
+    const reply = await runOneTurn({
+      tenantId: tenant.id,
+      sessionId,
+      input${tenantField},
+      onProofBundle: (bundle) => {
+        graded.proof = bundle;
+      },
 ${extraOptions}
-        });
-        return graded.proof !== undefined ? { reply: turnReply, proof: graded.proof } : { reply: turnReply };
-      };
-      let served: ServedTurn;`,
-    unwrap: "\n      const reply = served.reply;",
-    resultField: ", ...(served.proof !== undefined ? { proof: served.proof } : {})",
+    });
+    return graded.proof !== undefined ? { reply, proof: graded.proof } : { reply };
+  },`,
   };
 }
 
@@ -1240,10 +1224,10 @@ const DREAM_STEP = createDreamJanitorStep(${memoryFabric(ir).fragmentJson}, {
   // teardown and its ratings would otherwise accumulate forever.
   const feedbackOn = ir.feedback !== undefined && ir.feedback.enabled !== false;
   const distillOn = feedbackOn && ir.feedback?.autoDistill === true;
-  // `randomBytes` and `mkdirSync` are already in the unconditional preamble
-  // below, so this adds only what the handler needs on top of them.
+  // `randomBytes` is already in the unconditional preamble below, and the fs
+  // names the handler needs join the one `node:fs` import there.
   const feedbackImport = feedbackOn
-    ? 'import { appendFileSync, existsSync } from "node:fs";\nimport { buildFeedbackRecord } from "@crewhaus/feedback-distill";\n'
+    ? 'import { buildFeedbackRecord } from "@crewhaus/feedback-distill";\n'
     : "";
   // GatewayServerError rides the existing gateway-server import so the emitted
   // module never names one specifier twice.
@@ -1295,9 +1279,10 @@ const DISTILL_STEP = createDistillJanitorStep({
         ...(dreamOn ? ["...(DREAM_STEP !== null ? [DREAM_STEP] : [])"] : []),
         "...(DISTILL_STEP !== null ? [DISTILL_STEP] : [])",
       ].join(", ")}],`;
-  const feedbackHandlerBlock = feedbackOn
+  const feedbackMethods = feedbackOn
     ? `
-    if (method === "feedback.submit") {
+  otherMethods: {
+    "feedback.submit": async ({ params, tenant }) => {
       // NEW-inloop-coverage — the gateway's rating-capture route. The record
       // is written to the SAME .crewhaus/feedback sink \`crewhaus distill\` /
       // \`optimize --ratings\` / \`judge calibrate\` already read, per tenant
@@ -1376,8 +1361,8 @@ const DISTILL_STEP = createDistillJanitorStep({
         },
       });
       return { recorded: true, id: record.id };
-    }
-`
+    },
+  },`
     : "";
 
   // crewhaus.control.v1 — emitted into every daemon-shape bundle from the
@@ -1402,7 +1387,8 @@ const DISTILL_STEP = createDistillJanitorStep({
   // the exit, eating the supervisor's deadline while a turn is still running.
   const controlDrain = renderControlDrain({
     body: `console.error("[managed] draining — intake stopped");
-janitor.stop();${ir.schedule ? "\nif (__scheduleTimer !== undefined) clearInterval(__scheduleTimer);" : ""}
+janitor.stop();
+managedRuns.stop();${ir.schedule ? "\nif (__scheduleTimer !== undefined) clearInterval(__scheduleTimer);" : ""}
 await handle.close();
 await runDrainSweep(() => janitor.runOnce(), {
   onOutcome: (__o) => {
@@ -1425,36 +1411,29 @@ if (process.env.CREWHAUS_TENANTS_ROOT === undefined) {
     \`[managed] provability: proof bundles go to \${TENANTS_ROOT}/<tenant>/proofs/ — outside .crewhaus/, so crewhaus state backup does not carry them, and an OS tmp cleaner may delete them. Set CREWHAUS_TENANTS_ROOT to an absolute path outside the harness directory to keep them, such as /home/you/.crewhaus/tenants/<harness>.\`,
   );
 }`;
-  // Where the tenants root belongs, said at boot to a spec that declares a tool
-  // working on harness files. A root named through a symlink, or one that does
-  // not exist yet, is compared by where it lands on disk.
+  // A spec that declares a tool working on harness files starts only with its
+  // tenants root outside the harness directory (exit 21, the config exit, so a
+  // supervisor never restarts it); a spec with none emits no byte of it.
   const pathToolDeclared = declaresPathTool(ir);
   const tenantsRootPlacement = pathToolDeclared
     ? `
-function onDisk(path: string): string {
-  const at = resolve(path);
-  try {
-    return realpathSync(at);
-  } catch {}
-  const up = dirname(at);
-  return up === at ? at : join(onDisk(up), basename(at));
-}
-const tenantsRootFromCwd = relative(onDisk(process.cwd()), onDisk(TENANTS_ROOT));
-if (
-  tenantsRootFromCwd === "" ||
-  (!tenantsRootFromCwd.startsWith("..") && !isAbsolute(tenantsRootFromCwd))
-) {
-  console.error(
-    "[managed] keep CREWHAUS_TENANTS_ROOT outside the harness directory, so tenant data stays apart from the harness's own files.",
-  );
+const __rootRefusal = checkTenantsRoot({ cwd: process.cwd(), tenantsRoot: TENANTS_ROOT });
+if (__rootRefusal !== undefined) {
+  console.error(__rootRefusal);
+  process.exit(21);
 }`
     : "";
-  const fsImports = pathToolDeclared
-    ? "lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync"
-    : "lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync";
-  const pathImports = pathToolDeclared
-    ? "basename, dirname, isAbsolute, join, relative, resolve"
-    : "dirname";
+  const managedRunsImport = `import { ${
+    pathToolDeclared ? "checkTenantsRoot, " : ""
+  }createManagedRuns, resolveGatewaySecret } from "@crewhaus/gateway-server/managed-runs";`;
+  const fsImports = feedbackOn
+    ? "appendFileSync, existsSync, mkdirSync, readFileSync"
+    : "readFileSync";
+  // The schedule wake renders a failed tick's report; nothing else here does.
+  const errorsImport =
+    ir.schedule !== undefined
+      ? 'import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";\n'
+      : "";
 
   const tenantList = ir.tenants
     .map(
@@ -1469,23 +1448,16 @@ if (
 // Source spec: ${escapeJsonString(ir.name)} (target: managed, ir version: ${ir.version})
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createBudgetStore } from "@crewhaus/durable-state";
-import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";
-${gatewayServerImport}
-import {
-  createInMemoryIdempotencyStore,
-  idempotencyKey,
-  withIdempotency,
-} from "@crewhaus/idempotency-keys";
+${errorsImport}${gatewayServerImport}
+${managedRunsImport}
 import { openAuditLog } from "@crewhaus/audit-log";
-${renderControlImports({ drainSweep: true, logSafe: ir.schedule !== undefined })}import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
-import { createRunContext, type RunContext } from "@crewhaus/run-context";
+${renderControlImports({ drainSweep: true, logSafe: ir.schedule !== undefined })}import { createRunContext } from "@crewhaus/run-context";
 ${dreamImport}${distillImport}${feedbackImport}import { createJanitor } from "@crewhaus/runtime-core";
 import { buildTenant, withTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
 ${proofResult.importLine}
 import { randomBytes } from "node:crypto";
 import { ${fsImports} } from "node:fs";
-import { ${pathImports} } from "node:path";
 ${renderObservabilityEnv(ir)}const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";${tenantsRootWarning}${tenantsRootPlacement}
 const PORT = Number(process.env.PORT ?? 3000);
 // Bind every interface unless told otherwise. gateway.listen defaults to
@@ -1494,42 +1466,9 @@ const PORT = Number(process.env.PORT ?? 3000);
 // A loopback bind refuses every probe from outside the container while the
 // in-container healthcheck still passes. Set HOST=127.0.0.1 to narrow it.
 const HOST = process.env.HOST ?? "0.0.0.0";
-const ENV_JWT_SECRET = process.env.CREWHAUS_GATEWAY_JWT_SECRET;
-if (ENV_JWT_SECRET !== undefined && ENV_JWT_SECRET.length < 16) {
-  console.error(
-    "[managed] CREWHAUS_GATEWAY_JWT_SECRET is set but too short (min 16 chars). Refusing to start.",
-  );
-  process.exit(1);
-}
-const JWT_SECRET: string = ENV_JWT_SECRET ?? randomBytes(24).toString("hex");
-if (ENV_JWT_SECRET === undefined) {
-  // Generated for this boot and saved for the operator, who mints a token
-  // from it. Production sets CREWHAUS_GATEWAY_JWT_SECRET.
-  const secretFile = \`\${process.cwd()}/.crewhaus/run/gateway-jwt-secret\`;
-  try {
-    mkdirSync(dirname(secretFile), { recursive: true, mode: 0o700 });
-    rmSync(secretFile, { force: true });
-    const ignoreFile = \`\${dirname(secretFile)}/.gitignore\`;
-    try {
-      writeFileSync(ignoreFile, "*\\n", { flag: "wx" });
-    } catch {}
-    // An operator's own file stays. Anything else at that name is not a
-    // .gitignore git reads, so it gives way to one.
-    if (!lstatSync(ignoreFile).isFile()) {
-      rmSync(ignoreFile, { force: true, recursive: true });
-      writeFileSync(ignoreFile, "*\\n", { flag: "wx" });
-    }
-    writeFileSync(secretFile, \`\${JWT_SECRET}\\n\`, { mode: 0o600, flag: "wx" });
-  } catch (err) {
-    console.error(
-      \`[managed] set CREWHAUS_GATEWAY_JWT_SECRET (at least 16 chars): no secret is set, and one could not be saved to \${secretFile}: \${(err as Error).message}\`,
-    );
-    process.exit(1);
-  }
-  console.error(
-    "[managed] no CREWHAUS_GATEWAY_JWT_SECRET in env, so this run generated one and saved it to .crewhaus/run/gateway-jwt-secret. Set the variable to keep tokens valid across restarts.",
-  );
-}
+// CREWHAUS_GATEWAY_JWT_SECRET, or one generated for this boot and saved to
+// .crewhaus/run/gateway-jwt-secret (0600) for the operator to mint a token from.
+const JWT_SECRET = resolveGatewaySecret({ cwd: process.cwd(), env: process.env });
 
 // control.v1 — the harness-level (NOT per-tenant) hash-chained audit log every
 // control call appends a \`gateway_request\` record to. Per-tenant logs stay the
@@ -1639,34 +1578,23 @@ function readIntakeGate(): { paused: boolean; reason?: string } {
   }
   return __intakeCache;
 }
-
-// Contract item 3 — the per-run trace-bus registry that backs runs.subscribe.
-// Every run's TraceEventBus is registered under its runId, TENANT-FENCED:
-// resolveRunEvents only streams to the tenant that started the run (a
-// cross-tenant — or unknown — runId resolves to undefined → 404, so a run's
-// existence never leaks across tenants). Bounded so completed runs' ring
-// buffers don't accumulate unboundedly; the oldest entry is evicted past the
-// cap.
-const RUN_BUS_CAP = 256;
-const RUN_BUSES = new Map<string, { tenantId: string; bus: RunContext["eventBus"] }>();
-function registerRunBus(runId: string, tenantId: string, bus: RunContext["eventBus"]): void {
-  RUN_BUSES.set(runId, { tenantId, bus });
-  while (RUN_BUSES.size > RUN_BUS_CAP) {
-    const oldest = RUN_BUSES.keys().next().value;
-    if (oldest === undefined) break;
-    RUN_BUSES.delete(oldest);
-  }
-}
-
-// Loop contract 0.4 (Batch F, ITEM 7) — the resume path's idempotency store.
-// runs.continue with a prior sessionId reseats that session's history and is
-// wrapped in withIdempotency keyed on (tenant, session, input), so a duplicate
-// resume (client retry / a visibility-lease double-pull) returns the cached
-// reply instead of re-executing the turn. TTL bounds the dedupe window
-// (CREWHAUS_RESUME_IDEM_TTL_MS, default 5 min).
-${proofResult.storeDecl}
-const RESUME_IDEM_TTL_MS = Number(process.env.CREWHAUS_RESUME_IDEM_TTL_MS ?? 300_000);
 ${federationSurface.block}
+// The crewhaus.v1 runs (@crewhaus/gateway-server/managed-runs): each run is
+// recorded under .crewhaus/run/control/runs/ before its turn starts, can be
+// cancelled and followed by its tenant, and a queued one is claimed and run
+// here. The turn itself is the one piece compiled from the spec.
+const managedRuns = createManagedRuns({
+  harnessDir: process.cwd(),
+  tenantsRoot: TENANTS_ROOT,
+  tenantOverrides,
+  budgetStore: BUDGET_STORE,
+  intakeGate: readIntakeGate,
+  control: __control,
+  getAuditLog: (tenant) => gateway.getAuditLog(tenant),
+  recordUsage: (tenantId, delta) => gateway.recordUsage(tenantId, delta),
+${proofResult.executeTurn}${feedbackMethods}
+});
+
 const gateway = createGatewayServer({
   jwtSecret: JWT_SECRET,
   tenantsRoot: TENANTS_ROOT,
@@ -1677,115 +1605,25 @@ const gateway = createGatewayServer({
   // plus the 503 + Retry-After intake shed once a drain has been requested.
   // Control routes themselves are NEVER served on this public port.
   publicGate: (__req) => __control.publicGate(__req),${federationSurface.field}
-  // Contract item 3 — resolve a run's live trace stream for runs.subscribe from
-  // the per-run bus registry, fenced to the owning tenant. Returning undefined
-  // (unknown OR cross-tenant runId) makes the gateway answer 404.
-  resolveRunEvents: ({ runId, tenant }) => {
-    const entry = RUN_BUSES.get(runId);
-    if (entry === undefined || entry.tenantId !== tenant.id) return undefined;
-    const bus = entry.bus;
-    return {
-      // Atomic snapshot + live-subscribe: the ring-buffer replay and the live
-      // listener attach with no yield between (both synchronous), so no event
-      // is dropped or duplicated across the replay→live boundary.
-      open: (listener: (event: unknown) => void) => {
-        const replay = bus.recent();
-        const close = bus.subscribe(listener);
-        return { replay, close };
-      },
-    };
-  },
-  handler: async ({ method, params, tenant }) => {
-    if (method === "runs.create" || method === "runs.continue") {
-      const p = params as { input: string; sessionId?: string };
-      // The default session id MUST satisfy session-store's id contract
-      // (/^sess_[0-9a-f]{16}$/ — see packages/session-store generateId), or the
-      // very first store write of a runs.create that omitted sessionId throws
-      // and the caller sees internal_error. Mint it exactly the way the store
-      // itself does: 8 random bytes, hex-encoded.
-      const sessionId = p.sessionId ?? \`sess_\${randomBytes(8).toString("hex")}\`;
-      const runId = \`run_\${Math.random().toString(36).slice(2, 10)}\`;
-      const log = await gateway.getAuditLog(tenant);
-      const policy = evaluatePolicy(
-        { toolName: "runChatLoop", sideEffect: "external", input: p.input, tenantId: tenant.id },
-      );
-      await auditPolicyDecision(log, { toolName: "runChatLoop", input: p.input, tenantId: tenant.id }, policy);
-      if (policy.decision === "deny") {
-        throw new Error(\`policy denied: \${policy.reason ?? "no reason"}\`);
-      }
-      // Contract item 3 — mint the run's trace bus up front and register it
-      // (tenant-fenced) so runs.subscribe can replay + live-stream THIS run;
-      // the SAME context is threaded into runOneTurn so every trace event the
-      // run publishes lands on the registered bus, and the response runId is
-      // the bus's runId (the id a client subsequently subscribes with).
-      // G48 — the per-tenant hash-chained audit log is wired as BOTH the
-      // justification and egress durable sinks, so intent-gate and egress
-      // verdicts are tamper-evidenced per tenant inside the managed daemon.
-      const runContext = createRunContext({ runId, sessionId });
-      registerRunBus(runId, tenant.id, runContext.eventBus);
-      // Loop contract 0.4 (Batch F, ITEM 7) — runs.continue with a prior
-      // sessionId is the RESUME path: reseat that session's history (\`resume\`)
-      // and dedupe a duplicate resume via withIdempotency. runs.create (and a
-      // continue with no sessionId) always runs a fresh turn.
-      const isResume = method === "runs.continue" && p.sessionId !== undefined;
-${proofResult.executeTurn}
-      try {
-        if (isResume) {
-          const guarded = withIdempotency<undefined, ${proofResult.servedType}>(() => executeTurn(), {
-            store: RESUME_IDEM_STORE,
-            ttlMs: RESUME_IDEM_TTL_MS,
-          });
-          const key = idempotencyKey(\`\${tenant.id}:\${sessionId}:\${p.input}\`, 0);
-          ${proofResult.servedVar} = (await guarded(undefined, key)).value;
-        } else {
-          ${proofResult.servedVar} = await executeTurn();
-        }
-      } catch (err) {
-        // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
-        // renders its structured report on the daemon's stderr, then
-        // rethrows so the gateway maps it to an error response. The daemon
-        // itself keeps serving — one tenant's dead provider account must
-        // not take the process down.
-        if (isRunFailedError(err)) {
-          process.stderr.write(\`\${formatRunFailure(err.report, { prefix: "[managed]" })}\\n\`);
-        }
-        throw err;
-      }${proofResult.unwrap}
-      __control.counters.turns++;
-      const inputTokens = Math.ceil(p.input.length / 4);
-      const outputTokens = Math.ceil(reply.length / 4);
-      await gateway.recordUsage(tenant.id, { input: inputTokens, output: outputTokens });
-      await log.append({
-        kind: "model_call",
-        payload: { tenantId: tenant.id, sessionId, inputTokens, outputTokens },
-      });
-      return { runId, sessionId, tenantId: tenant.id, reply${proofResult.resultField} };
-    }
-    if (method === "runs.cancel") {
-      return { ok: true };
-    }
-${feedbackHandlerBlock}    if (method === "audit.tail") {
-      const log = await gateway.getAuditLog(tenant);
-      const rows: unknown[] = [];
-      for await (const r of log.read()) rows.push(r);
-      return { rows };
-    }
-    return { ok: true, method };
-  },
+  resolveRunEvents: managedRuns.resolveRunEvents,
+  handler: managedRuns.handler,
 });
 
 const handle = await gateway.listen(PORT, HOST);
 console.error(\`[managed] gateway listening on \${HOST}:\${handle.port}\`);
+void managedRuns.start();
 ${scheduleWake.helpers}${scheduleWake.block}${controlDrain}${controlStart}
 process.on("SIGTERM", async () => {
   console.error("[managed] SIGTERM — closing gateway");
-  janitor.stop();${scheduleWake.shutdown}
+  janitor.stop();
+  managedRuns.stop();${scheduleWake.shutdown}
   await handle.close();
   process.exit(0);
 });
 process.on("SIGINT", async () => {
   console.error("[managed] SIGINT — closing gateway");
-  janitor.stop();${scheduleWake.shutdown}
+  janitor.stop();
+  managedRuns.stop();${scheduleWake.shutdown}
   await handle.close();
   process.exit(0);
 });

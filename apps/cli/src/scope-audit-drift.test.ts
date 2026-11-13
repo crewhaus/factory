@@ -413,8 +413,16 @@ describe("run-input boundary sites", () => {
     return found;
   };
 
-  test("the five sites hold against this tree", () => {
+  test("the seven sites hold against this tree", () => {
     const expected: Record<string, string[]> = {
+      "gateway-server-managed-runs": [
+        "gateway-server-managed-runs:true:false",
+        "gateway-server-managed-runs-lineage:true:false",
+      ],
+      "runtime-core-input-origin": [
+        "runtime-core-input-origin:true:false",
+        "runtime-core-input-origin-lineage:true:false",
+      ],
       "serve-mcp-run-input": [
         "serve-mcp-run-input:true:false",
         "serve-mcp-run-input-lineage:true:false",
@@ -431,6 +439,22 @@ describe("run-input boundary sites", () => {
       const s = site(name);
       const findings = auditBoundarySite(s, readFileSync(join(repoRoot, s.path), "utf8"));
       expect(findings.map((f) => `${f.symbol}:${f.pass}:${f.warn ?? false}`)).toEqual(symbols);
+    }
+  });
+
+  test("the queued-run and seed rows fail without the classification, and their lineage rows without the tag", () => {
+    for (const name of ["gateway-server-managed-runs", "runtime-core-input-origin"]) {
+      const s = site(name);
+      const source = readFileSync(join(repoRoot, s.path), "utf8");
+      expect(source).toContain('origin: "api"');
+      const unclassified = source
+        .replaceAll("classifyBoundary", "screenNothing")
+        .replaceAll("@crewhaus/boundary-classifier", "./nothing");
+      expect(auditBoundarySite(s, unclassified).map((f) => f.pass)).toEqual([false, true]);
+      const untagged = source
+        .replaceAll("withInboundContent", "runOutsideAnyScope")
+        .replaceAll("tagContent", "tagNothing");
+      expect(auditBoundarySite(s, untagged).map((f) => f.pass)).toEqual([true, false]);
     }
   });
 

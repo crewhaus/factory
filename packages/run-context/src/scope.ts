@@ -24,7 +24,9 @@
  * started the work (`trigger`), what it may be resumed as (`resumeScope`), the
  * work item it serves and the parked run it continues. Every context created
  * inside takes these for any field its own options leave unset; `continues`
- * goes to the first context only, like the run input.
+ * goes to the first context only, like the run input. It can also name who the
+ * run serves (`subject`), which no context carries: {@link currentSubject}
+ * reads it, for the run row's keyed digest.
  *
  * One store, kept on `globalThis` under
  * `Symbol.for("@crewhaus/run-context/ambient")`, so two copies of this package
@@ -67,6 +69,13 @@ export type RunScope = {
   readonly continues?: string;
   /** The work item (`wi_…`) the run serves. */
   readonly workItem?: string;
+  /**
+   * Who the run serves, as a verified source named them (a managed daemon's
+   * `app:<tenant>:<sub>`, from the token's verified `sub`). Read with
+   * {@link currentSubject}; it never goes on a context, its lineage or a trace
+   * envelope, and a run row holds only a keyed digest of it.
+   */
+  readonly subject?: string;
 };
 
 /** Shared and mutable, like {@link InboundSlot}: the first context takes it. */
@@ -77,6 +86,7 @@ type RunFields = {
   readonly trigger?: Trigger;
   readonly workItem?: string;
   readonly continues?: ContinuesSlot;
+  readonly subject?: string;
 };
 
 type AmbientStore = { readonly inbound?: InboundSlot; readonly run?: RunFields };
@@ -132,8 +142,17 @@ export function runWithScope<T>(scope: RunScope, fn: () => T): T {
     ...(scope.trigger !== undefined ? { trigger: scope.trigger } : {}),
     ...(scope.workItem !== undefined ? { workItem: scope.workItem } : {}),
     ...(scope.continues !== undefined ? { continues: { id: scope.continues, taken: false } } : {}),
+    ...(scope.subject !== undefined ? { subject: scope.subject } : {}),
   };
   return store.run({ ...current, run }, fn);
+}
+
+/**
+ * The subject the current scope names (`RunScope.subject`), or `undefined` with
+ * none. Reading takes nothing: every caller in the scope sees the same subject.
+ */
+export function currentSubject(): string | undefined {
+  return ambient().getStore()?.run?.subject;
 }
 
 /** The lineage a new context takes from the current scope. */

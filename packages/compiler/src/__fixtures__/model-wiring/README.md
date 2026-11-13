@@ -99,3 +99,12 @@ resolves the limit once (`CHANNEL_WEBHOOK_MAX_BYTES`, 1 MiB when unset), prints
 a boot warning for a value it cannot use, and passes the same number to
 `createGateway` and to the public port's `Bun.serve` as `maxRequestBodySize`.
 Nothing else in the bundle moves.
+
+**Managed runs delta — `managed-fallbacks.daemon.ts` only.** The `crewhaus.v1`
+handler, the run-event registry and the signing-secret bootstrap delegate to
+`@crewhaus/gateway-server/managed-runs` (`createManagedRuns`,
+`resolveGatewaySecret`); the emitted code keeps only the turn itself, and the
+daemon starts and stops the queued-run follower with the gateway. Imports
+follow. The tenants-root check is emitted only for a spec that declares a tool
+that works on files, which the spec pinned here does not. Nothing else in the
+bundle moves.

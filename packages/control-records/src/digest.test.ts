@@ -5,11 +5,14 @@ import { join } from "node:path";
 import { isStoredActor } from "@crewhaus/control-contract";
 import {
   LOCAL_ACTOR_LABEL,
+  RUN_SUBJECT_LABEL,
   ensureDigestKey,
   keyedDigest,
   readDigestKey,
   storedLocalActor,
+  subjectRefOf,
 } from "./digest";
+import { controlPaths } from "./paths";
 import { controlFile, plant, removeTempDirs, tempDir } from "./test-helpers";
 
 afterAll(removeTempDirs);
@@ -233,5 +236,43 @@ describe("storedLocalActor", () => {
     expect(stored).not.toContain("max");
     const other = await keyOf(harnessWithKey("ff".repeat(32)));
     expect(await storedLocalActor(other, "local:max@laptop")).not.toBe(stored);
+  });
+});
+
+describe("subjectRefOf", () => {
+  const SUBJECT = "app:tenant-a:user-7";
+
+  test("the label is pinned, and so is the digest under a fixed subject key", async () => {
+    expect(RUN_SUBJECT_LABEL).toBe("run-subject");
+    const root = tempDir();
+    plant(join(root, controlPaths(root).subjectKeyFile), `${FIXED_KEY}\n`);
+    const expected = createHmac("sha256", Buffer.from(FIXED_KEY, "hex"))
+      .update(JSON.stringify(["run-subject", SUBJECT]))
+      .digest("hex");
+    expect(await subjectRefOf(root, SUBJECT)).toBe(expected);
+  });
+
+  test("64 hex, stable under one key, made under its own key file and never the digest key", async () => {
+    const root = tempDir();
+    const ref = await subjectRefOf(root, SUBJECT);
+    expect(ref).toMatch(/^[0-9a-f]{64}$/);
+    expect(ref).not.toContain("user-7");
+    expect(await subjectRefOf(root, SUBJECT)).toBe(ref);
+    const keyFile = join(root, controlPaths(root).subjectKeyFile);
+    expect(statSync(keyFile).mode & 0o777).toBe(0o600);
+    expect(existsSync(join(root, controlPaths(root).digestKeyFile))).toBe(false);
+    expect(await subjectRefOf(root, "app:tenant-a:user-8")).not.toBe(ref);
+  });
+
+  test("another harness's subject key gives another digest", async () => {
+    const one = await subjectRefOf(tempDir(), SUBJECT);
+    const two = await subjectRefOf(tempDir(), SUBJECT);
+    expect(one).not.toBe(two);
+  });
+
+  test("a subject key that cannot be read rejects, naming the file", async () => {
+    const root = tempDir();
+    plant(join(root, controlPaths(root).subjectKeyFile), "short\n");
+    await expect(subjectRefOf(root, SUBJECT)).rejects.toThrow("subject.key");
   });
 });

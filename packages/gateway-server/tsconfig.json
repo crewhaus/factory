@@ -7,11 +7,14 @@
   "references": [
     { "path": "../audit-log" },
     { "path": "../boundary-classifier" },
+    { "path": "../control-contract" },
     { "path": "../control-records" },
     { "path": "../durable-state" },
     { "path": "../errors" },
     { "path": "../federation-protocol" },
     { "path": "../gateway-protocol" },
+    { "path": "../idempotency-keys" },
+    { "path": "../policy-engine" },
     { "path": "../run-context" },
     { "path": "../tenancy" }
   ],

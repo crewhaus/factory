@@ -3,7 +3,7 @@ import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { acquireMutatingLease } from "./lease";
 import { append, publishClaim } from "./ledger";
-import { controlPaths, harnessLedger } from "./paths";
+import { controlPaths, harnessLedger, runsLedger } from "./paths";
 import { removeTempDirs, snapshotTree, tempDir } from "./test-helpers";
 
 afterAll(removeTempDirs);
@@ -27,6 +27,9 @@ describe("the layout", () => {
       heartbeatFile: join(".crewhaus", "run", "control-heartbeat.json"),
       standingRulesFile: join(CONTROL, "standing-rules.jsonl"),
       decisionsDir: join(CONTROL, "decisions"),
+      runsDir: join(CONTROL, "runs"),
+      inputsDir: join(CONTROL, "inputs"),
+      subjectKeyFile: join(CONTROL, "keys", "subject.key"),
     });
     expect(readdirSync(root)).toEqual([]);
   });
@@ -46,6 +49,16 @@ describe("the layout", () => {
       records: { file },
       lock: join(CONTROL, "lock"),
       claims: join(CONTROL, "claims"),
+    });
+  });
+
+  test("runsLedger is the run ledger, on the run machine", () => {
+    expect(runsLedger("/h")).toEqual({
+      root: "/h",
+      records: { dir: join(CONTROL, "runs") },
+      lock: join(CONTROL, "lock"),
+      claims: join(CONTROL, "claims"),
+      machine: "run",
     });
   });
 

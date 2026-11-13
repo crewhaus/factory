@@ -228,6 +228,7 @@ import { type ExitRatingFeedback, FEEDBACK_EVENT_KIND, runExitRating } from "./e
 import { type JsonSchemaLike, flattenUnionToObject } from "./flatten-union";
 import { createFooterLineGuard, neutralizeFooterLines } from "./forged-footer";
 import { attachIncidentCollector } from "./incident-collector";
+import { contextForSeed, refuseBlockedSeed, seedVerdict } from "./input-origin";
 import { type AdvertisedToolSummary, LIST_TOOLS_NAME, buildListToolsTool } from "./list-tools";
 import { createSpanUnionTracker, modelLatencyMs } from "./model-latency";
 import {
@@ -262,6 +263,7 @@ import {
   openRunRows,
   recordRunPark,
   resumeScopeOf,
+  runSubjectRef,
   withRunRows,
 } from "./run-ledger";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
@@ -2084,6 +2086,12 @@ export type RunChatLoopOptions = {
    * else `process.cwd()`. `null` writes no rows, as `CREWHAUS_RUN_LEDGER=0` does.
    */
   runLedgerDir?: string | null;
+  /**
+   * Who this run serves, as a verified source named them. The `running` row
+   * records only a keyed digest of it (`subjectRef`, `./run-ledger`); unset,
+   * the ambient scope's subject (run-context's `currentSubject`) is used.
+   */
+  subject?: string;
   /**
    * Install a SIGINT handler that aborts the current turn on first press
    * and exits on the second. Defaults to true in REPL mode when stdin is
@@ -3916,6 +3924,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     if (!admitted.admit) return admitted.reply;
     return withRunRows(opts, () => runChatLoop(opts));
   }
+  // A one-shot job's seed is checked at "api" under CREWHAUS_INPUT_ORIGIN (`./input-origin`).
+  const seed = await seedVerdict(opts);
   // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
   // any plugin-contributed tools so the tool-capable-model feature gate and the
   // per-turn advertisement below read the same list.
@@ -4902,15 +4912,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // here (by run-context's one minter, `mintRunId()`) and threaded into BOTH
   // the bus and the context so their ids stay coherent. When `opts.runContext`
   // is supplied the caller owns `agentId` on its bus, so this is skipped.
-  const runContext: RunContext =
-    opts.runContext ??
-    (opts.agentId !== undefined
+  const runContext: RunContext = contextForSeed(seed, opts.runContext, () =>
+    opts.agentId !== undefined
       ? (() => {
           const runId = mintRunId();
           const eventBus = new TraceEventBus({ runId, sessionId, agentId: opts.agentId });
           return createRunContext({ runId, sessionId, eventBus });
         })()
-      : createRunContext({ sessionId }));
+      : createRunContext({ sessionId }),
+  );
   if (resumedMessages !== undefined) tagReplayedToolResults(runContext, resumedMessages);
 
   // G01 — surface the max-tokens lift once, at boot (see `effectiveMaxTokens`).
@@ -5242,6 +5252,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     out.write("\n");
   };
 
+  const subjectRef = await runSubjectRef({
+    runContext,
+    opts,
+    harnessRoot: opts.settingsDir,
+    persistSession,
+  });
   openRunRows({
     runContext,
     opts,
@@ -5250,7 +5266,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     sessionRootDir,
     persistSession,
     bus,
+    ...(subjectRef !== undefined ? { subjectRef } : {}),
   });
+  refuseBlockedSeed(seed);
   if (opts.approvals !== undefined) {
     onCancelledRun(runContext, withdrawOnCancel(runContext, opts.approvals.store));
   }

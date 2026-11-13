@@ -250,6 +250,15 @@ describe("the exit closes the root", () => {
     expect(rows[2]?.["failureClass"]).toBe("crewhaus_budget");
   });
 
+  test("exit 41 fails the root with input_blocked, and the job is not restarted", async () => {
+    const h = setup("workflow");
+    const { root } = await startJob(h);
+    await exitWith(h, 41);
+    const rows = rowsAt(h.dir).filter((r) => r["id"] === root);
+    expect(rows.map((r) => r["state"])).toEqual(["queued", "preparing", "failed"]);
+    expect(rows[2]?.["failureClass"]).toBe("input_blocked");
+  });
+
   test("an operator stop cancels the root", async () => {
     const h = setup("workflow");
     const { root } = await startJob(h);

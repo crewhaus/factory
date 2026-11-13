@@ -166,6 +166,7 @@ describe("EXIT_CODES", () => {
       disabled: 38,
       paused: 39,
       tool: 40,
+      input_blocked: 41,
       not_signed_in: 50,
       forbidden: 51,
       unavailable: 52,

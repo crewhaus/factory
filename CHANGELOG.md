@@ -143,7 +143,11 @@ these on: they reach every harness that uses what each one names.
   that script runs in turn); for `crewhaus run` or `crewhaus runs resume` of
   a spec in another directory, that directory's `.crewhaus/run/spec`; the `approvals.jsonl`
   beside session logs that `CREWHAUS_SESSION_DIR` puts at the working directory;
-  a managed run's whole tenants root; and Hangar's directory and registry:
+  a managed run's whole tenants root; on a `managed` harness, the project memory
+  files the runtime loads at the working directory, `AGENTS.md`, `CLAUDE.md`,
+  `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`, exactly those files, and the
+  skill directories `.crewhaus/skills` and `~/.crewhaus/skills`, which an operator
+  edits; and Hangar's directory and registry:
   `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always, and wherever the
   run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT` puts them. The floor
   also reads the directory a call keeps a tool's store in. In a working directory
@@ -363,6 +367,38 @@ these on: they reach every harness that uses what each one names.
   stops matching within a second, in a run already going too. A rule
   `.crewhaus/settings.json` holds with no record keeps working and `crewhaus
   approvals rules` lists it to narrow or remove. The file keeps its 0.8 shape.
+- **A managed daemon records each run before its turn starts.** `runs.create` and
+  `runs.continue` write content-free rows to `.crewhaus/run/control/runs/` with a
+  canonical run id (`run_` and 26 characters) and the tenant: `running` before
+  the turn, then how it ended; a run cut off when its daemon stops is marked
+  `interrupted` at the next start, and never run again. An input the
+  prompt-injection check refuses is recorded as `failed` with `input_blocked`,
+  and its caller gets `input_blocked`. When a token names a `sub`, the run's
+  last row keeps only a keyed digest of it (`subjectRef`). `runs.cancel` stops a
+  run of the caller's tenant; `sessions.list` and `sessions.fork` answer
+  `unsupported` (HTTP 501); `audit.tail` honours `sinceTs`. The daemon also runs
+  the runs queued for it, so control.v1's `/status` lists `runs.create` and
+  `POST /control/v1/runs/claim` wakes it. `CREWHAUS_RUN_LEDGER=0` turns the rows
+  off with the other run rows. Recompile a daemon to pick this up.
+- **A one-shot job the control API starts has its input checked at `api`.**
+  Under `CREWHAUS_INPUT_ORIGIN=api`, the first top-level loop checks its seed
+  messages before its first model call; a refused seed ends the job with exit 41
+  (`input_blocked`), which a supervisor records as `failed` with `input_blocked`
+  and does not restart, and a kept one is tagged at `api`. The variable takes the
+  one value `api`; unset, nothing changes.
+- **A managed daemon whose spec declares a tool that works on files starts only
+  with `CREWHAUS_TENANTS_ROOT` outside the harness directory.** Otherwise it
+  exits 21 and names the variable, so tenant data stays apart from the harness's
+  own files. Set it to an absolute path such as `~/.crewhaus/tenants/<harness>`.
+  Recompile a daemon to pick this up.
+- **On a `channel` or `managed` harness, a tool call that names the run records
+  or the inputs waiting for a run or a decision is refused.** As with the
+  credential files, an agent's tool call that names `.crewhaus/run/control/runs`
+  or `.crewhaus/run/control/inputs`, or a file inside either, is denied whatever
+  a rule says, reads included, so a run that answers one person never sees
+  another's runs or inputs. A run a managed daemon takes from its queue keeps
+  its input there only until the daemon reads it, or the run is cancelled.
+  Only `bypass` mode skips this. Recompile a daemon to pick this up.
 
 ## [0.8.2] - 2026-11-12
 

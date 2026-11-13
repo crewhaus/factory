@@ -325,15 +325,33 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
   // Run input at TrustOrigin "api": managed `runs.create` / `runs.continue`
   // input is classified in the envelope path before the run's handler, and
   // kept text tags the run's first context through run-context's inbound
-  // scope. The file also classifies federation payloads, so the row reads
-  // only the window before the success return, which holds the run-input
-  // check and the scope and stops short of the federation call.
+  // scope. A managed run's handler is handed the verdict and records the run
+  // before a refused input fails it. The file also classifies federation
+  // payloads, so the row reads only the window before the success return,
+  // which holds the run-input check and the scope and stops short of the
+  // federation call.
   {
     name: "gateway-server-run-input",
     path: "packages/gateway-server/src/index.ts",
     requireTag: true,
     anchor: "return encodeSuccess(id, result);",
     window: 3000,
+  },
+  // A queued managed run's input, which never passes through a request:
+  // classified at "api" where the follower claims it, and tagged into the
+  // run's first context the same way.
+  {
+    name: "gateway-server-managed-runs",
+    path: "packages/gateway-server/src/managed-runs.ts",
+    requireTag: true,
+  },
+  // A one-shot job's seed under CREWHAUS_INPUT_ORIGIN=api, classified at "api"
+  // before the first top-level loop's first model call and tagged into its
+  // context.
+  {
+    name: "runtime-core-input-origin",
+    path: "packages/runtime-core/src/input-origin.ts",
+    requireTag: true,
   },
   // A batch job's payload, classified at "api" before the job's handler and
   // tagged into its run the same way.

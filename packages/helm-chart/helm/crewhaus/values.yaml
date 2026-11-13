@@ -67,6 +67,13 @@ secrets:
   #     - name: OPENAI_API_KEY
   #       secretName: crewhaus-creds
   #       key: OPENAI_API_KEY
+  #
+  # A `managed` target reads its token signing secret from
+  # CREWHAUS_GATEWAY_JWT_SECRET (at least 16 characters). Set it here from a
+  # Secret, so tokens stay valid across restarts and pods:
+  #     - name: CREWHAUS_GATEWAY_JWT_SECRET
+  #       secretName: crewhaus-creds
+  #       key: CREWHAUS_GATEWAY_JWT_SECRET
   provider: []
 
 # Plain (non-secret) env vars appended to the container, e.g. provider
@@ -96,12 +103,6 @@ ingress:
         - path: /
           pathType: Prefix
   tls: []
-
-# §20 gateway-server JWT issuance.
-gateway:
-  tls:
-    cert: ""
-    key: ""
 
 resources:
   requests:

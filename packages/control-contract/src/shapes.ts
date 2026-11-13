@@ -218,6 +218,8 @@ export type Run = {
   readonly cause?: RunCause;
   /** Who created a queued run. */
   readonly by?: string;
+  /** The managed tenant the run serves: rows of one tenant are read apart from another's. */
+  readonly tenant?: string;
 };
 
 export type RunCreated = {

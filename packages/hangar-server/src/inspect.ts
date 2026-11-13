@@ -291,7 +291,8 @@ export const INSPECT_EXCLUSIONS: readonly InspectExclusion[] = [
   },
   {
     path: ".crewhaus/run/control/inputs/",
-    reason: "the inputs decisions were asked about, kept whole for the decision they wait on",
+    reason:
+      "the inputs decisions were asked about, kept whole for the decision they wait on, and a queued run's input, kept whole until the process that runs it reads it",
     where: "Approvals → each request, shown to whoever may decide it",
   },
   {

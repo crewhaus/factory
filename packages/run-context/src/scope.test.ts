@@ -6,7 +6,15 @@ import { describe, expect, test } from "bun:test";
 import type { AsyncLocalStorage } from "node:async_hooks";
 import { mintId, mintRunId } from "@crewhaus/control-contract";
 import { createLogger } from "@crewhaus/logging";
-import { type InboundContent, createRunContext, runWithScope, withInboundContent } from "./index";
+import {
+  type InboundContent,
+  adoptInbound,
+  createRunContext,
+  currentSubject,
+  lineageOf,
+  runWithScope,
+  withInboundContent,
+} from "./index";
 import { takePendingInbound } from "./scope";
 
 const INPUT = "Summarise the attached quarterly report in three bullet points.";
@@ -273,5 +281,83 @@ describe("runWithScope", () => {
     });
     expect(inner.continues).toBe(INNER);
     expect(outer.continues).toBe(OUTER);
+  });
+});
+
+describe("the subject a scope names", () => {
+  const SUBJECT = "app:tenant-a:user-7";
+
+  test("no scope: no subject", () => {
+    expect(currentSubject()).toBeUndefined();
+  });
+
+  test("every caller in the scope reads it, at any depth of awaits, and reading takes nothing", async () => {
+    const seen = await runWithScope({ subject: SUBJECT }, async () => {
+      const first = currentSubject();
+      await hop();
+      return [first, currentSubject()];
+    });
+    expect(seen).toEqual([SUBJECT, SUBJECT]);
+    expect(currentSubject()).toBeUndefined();
+  });
+
+  test("a nested scope keeps the outer subject unless it names its own", () => {
+    const [kept, replaced] = runWithScope({ subject: SUBJECT }, () => [
+      runWithScope({ resumeScope: "session:sess_0123456789abcdef" }, () => currentSubject()),
+      runWithScope({ subject: "app:tenant-a:user-8" }, () => currentSubject()),
+    ]);
+    expect(kept).toBe(SUBJECT);
+    expect(replaced).toBe("app:tenant-a:user-8");
+  });
+
+  test("no context, lineage or trace envelope carries it", () => {
+    const ctx = runWithScope({ subject: SUBJECT, trigger: { kind: "api" } }, () =>
+      createRunContext(),
+    );
+    expect(ctx.trigger).toEqual({ kind: "api" });
+    expect(
+      JSON.stringify(Object.entries(ctx).filter(([k]) => k !== "logger" && k !== "eventBus")),
+    ).not.toContain("user-7");
+    expect(JSON.stringify(lineageOf(ctx))).not.toContain("user-7");
+    expect(JSON.stringify(ctx.eventBus.envelope())).not.toContain("user-7");
+  });
+});
+
+describe("the origin chain of a context that adopts run input", () => {
+  test("starts with the adopted origins, distinct and in order, after the one its options give", () => {
+    const plain = withInboundContent([entry(INPUT), entry(OTHER)], () => createRunContext());
+    expect(plain.originStack).toEqual(["api"]);
+    const given = withInboundContent([entry(INPUT)], () =>
+      createRunContext({ originStack: ["user"] }),
+    );
+    expect(given.originStack).toEqual(["user", "api"]);
+    const mixed = withInboundContent(
+      [
+        entry(INPUT, { origin: "channel" }),
+        entry(OTHER),
+        entry("third input text here", { origin: "channel" }),
+      ],
+      () => createRunContext(),
+    );
+    expect(mixed.originStack).toEqual(["channel", "api"]);
+  });
+
+  test("a context that adopts nothing keeps the chain its options give, or none", () => {
+    expect("originStack" in createRunContext()).toBe(false);
+    expect(createRunContext({ originStack: ["subagent"] }).originStack).toEqual(["subagent"]);
+    const second = withInboundContent([entry(INPUT)], () => {
+      createRunContext();
+      return createRunContext();
+    });
+    expect("originStack" in second).toBe(false);
+  });
+
+  test("adoptInbound tags a context it is handed and leaves its chain as it was", () => {
+    const ctx = createRunContext({ originStack: ["user"] });
+    adoptInbound(ctx, [entry(INPUT, { warning: { rules: ["r1"], score: 0.5 } })]);
+    expect(ctx.dataLineage?.get(INPUT)).toBe("api");
+    expect(ctx.originStack).toEqual(["user"]);
+    const warned = ctx.eventBus.recent().filter((e) => e.kind === "permission_decision");
+    expect(warned).toHaveLength(1);
   });
 });

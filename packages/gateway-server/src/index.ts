@@ -26,7 +26,11 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { type AppendInput, type AuditLog, openAuditLog } from "@crewhaus/audit-log";
-import { boundaryRuleIds, classifyBoundary } from "@crewhaus/boundary-classifier";
+import {
+  type BoundaryAction,
+  boundaryRuleIds,
+  classifyBoundary,
+} from "@crewhaus/boundary-classifier";
 import { type IntakeVerdict, intakeVerdict } from "@crewhaus/control-records";
 import { type BudgetStore, InMemoryBudgetStore } from "@crewhaus/durable-state";
 import { CrewhausError } from "@crewhaus/errors";
@@ -61,6 +65,9 @@ import {
 } from "@crewhaus/gateway-protocol/body-limit";
 import { withInboundContent } from "@crewhaus/run-context";
 import { type Tenant, buildTenant, validateTenantId, withTenant } from "@crewhaus/tenancy";
+import { GatewayCodedError, isManagedRunHandler } from "./coded";
+
+export { GatewayCodedError, MANAGED_RUN_HANDLER, isManagedRunHandler } from "./coded";
 
 export class GatewayServerError extends CrewhausError {
   override readonly name = "GatewayServerError";
@@ -190,10 +197,30 @@ export function verifyJwt(token: string, secret: string, now: () => number = Dat
 // Server contract.
 // ---------------------------------------------------------------------------
 
+/**
+ * The run input's verdict, as the prompt-injection check gave it at TrustOrigin
+ * "api": the action, the rule ids and the score, never the text.
+ */
+export type RunInputVerdict = {
+  readonly action: BoundaryAction;
+  readonly rules: readonly string[];
+  readonly score: number;
+};
+
 export type RunHandler = (args: {
   readonly method: MethodT;
   readonly params: unknown;
   readonly tenant: Tenant;
+  /** The verified token's `sub` claim, when it names one. */
+  readonly sub?: string;
+  /**
+   * The run input's verdict, handed only to a handler `createManagedRuns`
+   * made (`MANAGED_RUN_HANDLER`): it records a refused input as a failed run,
+   * then answers `input_blocked`; called with none, that handler classifies
+   * the input itself. Every other handler is never called with a refused
+   * input.
+   */
+  readonly inputVerdict?: RunInputVerdict;
 }) => Promise<unknown>;
 
 /**
@@ -457,6 +484,24 @@ function intakeRefusalOf(
     code: report.class,
     notice: typeof report.detail === "string" ? report.detail : null,
   };
+}
+
+/** The wire codes a {@link GatewayCodedError} may answer with. */
+const CODED_ERRORS: ReadonlySet<string> = new Set([ErrorCode.InputBlocked, ErrorCode.Unsupported]);
+
+/**
+ * A handler's coded refusal: a `GatewayCodedError` whose code is one
+ * {@link CODED_ERRORS} names. Checked by shape as well as `instanceof`, because
+ * a bundle can carry two copies of this package.
+ */
+function codedRefusalOf(
+  err: unknown,
+): { readonly code: string; readonly message: string; readonly data: unknown } | undefined {
+  if (!(err instanceof Error)) return undefined;
+  if (!(err instanceof GatewayCodedError) && err.name !== "GatewayCodedError") return undefined;
+  const code = (err as { wireCode?: unknown }).wireCode;
+  if (typeof code !== "string" || !CODED_ERRORS.has(code)) return undefined;
+  return { code, message: err.message, data: (err as { data?: unknown }).data };
 }
 
 /** `error.data.retryAfter` of an error envelope, when it is a positive integer. */
@@ -775,10 +820,12 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
         // once decoded) is classified at TrustOrigin "api" after
         // authentication, the intake gate and the reservation, and before the
         // run's handler: authenticated is not classified (AGENTS.md, Pillar
-        // 3). A malicious verdict refuses the call with `input_blocked`, so no
-        // handler and no model call run (the `finally` still releases the
-        // reservation); kept text runs inside run-context's inbound scope,
-        // which tags it into the run's first context at "api".
+        // 3). A malicious verdict refuses the call with `input_blocked` and no
+        // model call runs: a managed-runs handler is handed the verdict and
+        // records the refused run first, and no other handler is called (the
+        // `finally` still releases the reservation); kept text runs inside
+        // run-context's inbound scope, which tags it into the run's first
+        // context at "api".
         const input =
           decoded.method === "runs.create" || decoded.method === "runs.continue"
             ? (decoded.params as { readonly input: string }).input
@@ -805,7 +852,10 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
             : {}),
         };
         await log.append({ kind: "gateway_request", payload: requestPayload });
-        if (boundary?.action === "redact") {
+        // A managed-runs handler records a refused input as a failed run and
+        // answers `input_blocked` itself; any other handler is not called.
+        const managed = isManagedRunHandler(opts.handler);
+        if (boundary?.action === "redact" && !managed) {
           return encodeError(
             id,
             ErrorCode.InputBlocked,
@@ -813,10 +863,20 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
             { origin: "api", rules, score: boundary.verdict.score },
           );
         }
+        const verdict =
+          managed && boundary !== undefined
+            ? { inputVerdict: { action: boundary.action, rules, score: boundary.verdict.score } }
+            : {};
         const handle = () =>
-          opts.handler({ method: decoded.method, params: decoded.params, tenant });
+          opts.handler({
+            method: decoded.method,
+            params: decoded.params,
+            tenant,
+            ...(claims.sub !== undefined ? { sub: claims.sub } : {}),
+            ...verdict,
+          });
         const result = await withTenant(tenant, () =>
-          input === undefined || boundary === undefined
+          input === undefined || boundary === undefined || boundary.action === "redact"
             ? handle()
             : withInboundContent(
                 [
@@ -1047,6 +1107,8 @@ export function statusFor(code: string): number {
     case ErrorCode.Paused:
     case ErrorCode.Disabled:
       return 503;
+    case ErrorCode.Unsupported:
+      return 501;
     default:
       return 200;
   }
@@ -1064,15 +1126,20 @@ export function statusFor(code: string): number {
  *   - a `RunFailedError` whose report class is `paused` or `disabled` (a loop
  *     the runtime refused at its start) → that code, as `handleEnvelope`
  *     answers it
+ *   - a `GatewayCodedError` with `input_blocked` or `unsupported` (a
+ *     managed-runs handler that recorded a refused input, or a method this
+ *     daemon does not serve) → that code, its message and its data
  *   - anything else → `internal_error`
  *
- * `input_blocked` is not one of these mappings: `handleEnvelope` answers it
- * itself, when the prompt-injection check refuses a run's input, and nothing
- * throws it.
+ * For any other handler `handleEnvelope` answers `input_blocked` itself,
+ * before the handler is called, when the prompt-injection check refuses a
+ * run's input.
  */
 function errorEnvelopeFor(err: unknown, id: string): ResponseEnvelopeT {
   const refused = intakeRefusalOf(err);
   if (refused !== undefined) return intakeClosedError(id, refused);
+  const coded = codedRefusalOf(err);
+  if (coded !== undefined) return encodeError(id, coded.code, coded.message, coded.data);
   if (err instanceof GatewayProtocolError) {
     return encodeError(id, ErrorCode.BadRequest, err.message);
   }
