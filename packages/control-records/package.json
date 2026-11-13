@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/control-records",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "The file layer under the shared control core: claims, segments without renames, tail readers, vector cursors, keyed digests, the operator and approver readers, the intake verdict and the mutating lease. Light and node-only: it spawns no process.",
   "main": "src/index.ts",

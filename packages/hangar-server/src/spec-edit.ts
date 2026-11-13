@@ -44,8 +44,9 @@
  * THE SCHEMA IS CHECKED PER HARNESS, OUTSIDE THIS PROCESS
  * ---------------------------------------------------------------------------
  * A machine's harnesses span crewhaus versions; that is the normal case. A
- * harness adopted on this machine whose `@crewhaus/spec` realpath-contains
- * inside it is checked with that copy, in a child process
+ * harness adopted with `crewhaus harness adopt` on this machine whose
+ * `@crewhaus/spec` realpath-contains inside it is checked with that copy, in a
+ * child process
  * (`spec-validator-child.ts`): a harness's code never runs inside Home. Any
  * other harness, or a check that cannot answer, is checked with this
  * manager's own schema, with a note that says so. A spec carrying keys the
@@ -65,6 +66,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import { type Spec, parseSpec, parseSpecIssues, specJsonSchema } from "@crewhaus/spec";
 import { autoRegisterSpecVersion } from "@crewhaus/spec-changelog/spec-changelog";
@@ -98,7 +100,13 @@ import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
-import { type M3Context, type M3Handler, jobArg, requireTypedConfirm } from "./m3";
+import {
+  type M3Context,
+  type M3Handler,
+  jobArg,
+  requirePermission,
+  requireTypedConfirm,
+} from "./m3";
 import { maskDeep, maskSpecYaml, maskText } from "./mask";
 import { resolveContained } from "./safety";
 import { type ChildTimer, type SpawnChild, validateInHarness } from "./spec-validator-child";
@@ -233,9 +241,13 @@ export type SchemaCheck = {
   readonly parseError?: string;
 };
 
-/** The note a harness not adopted on this machine gets. */
-export const NOT_ADOPTED_NOTE =
-  "Checked with this CrewHaus's schema. Adopt the harness to check it with its own.";
+/** The note a harness not adopted with `crewhaus harness adopt` on this machine gets; with
+ *  no registry row there is no id to name. */
+export function notAdoptedNote(id: string | undefined): string {
+  return id === undefined
+    ? "Checked with this CrewHaus's schema. To check it with its own, run crewhaus harness adopt <dir>."
+    : `Checked with this CrewHaus's schema. To check it with its own, run crewhaus harness adopt ${id}.`;
+}
 
 /** Test seam for the child check: its spawn, timer and interpreter. */
 export type SchemaCheckDeps = {
@@ -318,18 +330,20 @@ function managerCheck(yamlText: string, op: "issues" | "schema", note: string | 
 /**
  * Check `yamlText` with the schema this harness is built against.
  *
- * A harness adopted on this machine whose `@crewhaus/spec` resolves inside
- * it is checked with that copy, in a child process; anything else, or a
- * child that cannot answer, with this manager's schema and a note naming
- * why. Never throws.
+ * A harness adopted with `crewhaus harness adopt` on this machine whose
+ * `@crewhaus/spec` resolves inside it is checked with that copy, in a child
+ * process; anything else, or a child that cannot answer, with this manager's
+ * schema and a note naming why. Never throws.
  */
 export async function checkSpec(
-  ctx: Pick<M3Context, "harnessDir" | "adopted">,
+  ctx: Pick<M3Context, "harnessDir" | "adopted" | "entry">,
   yamlText: string,
   op: "issues" | "schema",
 ): Promise<SchemaCheck> {
   const dir = ctx.harnessDir;
-  if (dir === null || ctx.adopted !== true) return managerCheck(yamlText, op, NOT_ADOPTED_NOTE);
+  if (dir === null || ctx.adopted !== true) {
+    return managerCheck(yamlText, op, notAdoptedNote(ctx.entry?.id));
+  }
   let resolved: string;
   try {
     resolved = Bun.resolveSync("@crewhaus/spec", dir);
@@ -438,7 +452,7 @@ export function readOnlyRefusal(state: ReadOnlyState): HttpError {
  * caller previews with the same schema ({@link previewHomeEdits}).
  */
 export async function requireEditable(
-  ctx: Pick<M3Context, "harnessDir" | "adopted">,
+  ctx: Pick<M3Context, "harnessDir" | "adopted" | "entry">,
   yamlText: string,
 ): Promise<SchemaCheck> {
   const check = await checkSpec(ctx, yamlText, "issues");
@@ -503,13 +517,133 @@ export type HomeCommitOptions = {
 /** A commit refused for a reason about the WORLD (the 200 typed envelope). */
 export type HomeCommitRefusal = { readonly refused: Record<string, unknown> };
 
+/** The permission a spec change on a security surface, or one that can raise spending, needs. */
+export const SPEC_SECURITY_PERMISSION = "h.spec.edit.security";
+
+/** Said when a spec change needs the security edit permission the caller does not hold. */
+const SECURITY_EDIT_REFUSAL =
+  "Only an owner of this harness can change this part of the spec: it touches what the agent may do or what it may spend.";
+
+/**
+ * The spec paths in a batch that need the security edit permission: every edit on a
+ * security surface, and every path a raise of spending touches. Empty when none does.
+ */
+export function securityPathsOf(
+  target: string,
+  before: string,
+  edits: readonly SpecEdit[],
+): string[] {
+  const paths = new Set<string>();
+  for (const edit of edits) {
+    const row = classifyPath(target, segmentsOf(edit));
+    if (row.securitySurface) paths.add(row.path);
+  }
+  for (const escalation of escalationsFor(before, edits)) {
+    if (escalation.needs === SPEC_SECURITY_PERMISSION) {
+      for (const path of escalation.paths) paths.add(path);
+    }
+  }
+  // By what the batch changes, not by where each edit points: one edit on a parent block
+  // can carry a security surface inside its value.
+  let after: string | undefined;
+  try {
+    after = applySpecEdits(before, edits, { parse: parseYamlOnly }).yaml;
+  } catch {
+    after = undefined;
+  }
+  if (after !== undefined) {
+    for (const path of securityChangesOf(before, after)) paths.add(path);
+  }
+  return [...paths];
+}
+
+const isContainer = (value: unknown): value is Record<string, unknown> | unknown[] =>
+  typeof value === "object" && value !== null;
+
+/** A container's entries, a list's indexes as their own segments. */
+function entriesOf(value: Record<string, unknown> | unknown[]): Array<[string, unknown]> {
+  return Array.isArray(value)
+    ? value.map((item, index): [string, unknown] => [String(index), item])
+    : Object.entries(value);
+}
+
+/**
+ * Every place two parsed specs differ that a security surface covers, as dotted paths.
+ * Where a value is added, removed or replaced by one of another shape, every path inside
+ * it counts, and the place itself (a whole step, node or role is a surface of its own).
+ *
+ * First consumers: {@link securityPathsOf}, and the in-lock check in
+ * {@link commitHomeEdits}.
+ */
+export function securityChangesBetween(before: unknown, after: unknown): string[] {
+  const found = new Set<string>();
+  const mark = (path: readonly string[]): void => {
+    if (path.length > 0 && surfaceFor(path) !== undefined) found.add(path.join("."));
+  };
+  const markAll = (value: unknown, path: readonly string[]): void => {
+    mark(path);
+    if (isContainer(value)) {
+      for (const [key, inner] of entriesOf(value)) markAll(inner, [...path, key]);
+    }
+  };
+  const walk = (a: unknown, b: unknown, path: readonly string[]): void => {
+    if (isDeepStrictEqual(a, b)) return;
+    if (isContainer(a) && isContainer(b) && Array.isArray(a) === Array.isArray(b)) {
+      const keys = new Set([...entriesOf(a).map(([k]) => k), ...entriesOf(b).map(([k]) => k)]);
+      const at = (value: Record<string, unknown> | unknown[], key: string): unknown =>
+        Array.isArray(value) ? value[Number(key)] : value[key];
+      for (const key of keys) walk(at(a, key), at(b, key), [...path, key]);
+      return;
+    }
+    markAll(a, path);
+    markAll(b, path);
+  };
+  walk(before, after, []);
+  return [...found];
+}
+
+/** {@link securityChangesBetween} over two spec texts; empty when either does not parse. */
+function securityChangesOf(before: string, after: string): string[] {
+  try {
+    return securityChangesBetween(parseYamlOnly(before), parseYamlOnly(after));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Refuse a spec change the caller may not make: one that touches a security surface or
+ * raises spending needs the security edit permission, whatever name was typed. A 403
+ * naming what is missing, before any preview asks for a typed name.
+ *
+ * First consumers: every spec write this manager makes (the editor, a patch, advice,
+ * synthesized edits, the builders' connector writes).
+ */
+export function requireSpecEditAuthority(
+  ctx: Pick<M3Context, "authorize">,
+  before: string,
+  edits: readonly SpecEdit[],
+): void {
+  let target = "unknown";
+  try {
+    target = readSpecHeader(before).target ?? "unknown";
+  } catch {
+    // An unreadable header still has its security surfaces, which no target changes.
+  }
+  const paths = securityPathsOf(target, before, edits);
+  if (paths.length === 0) return;
+  requirePermission(ctx, SPEC_SECURITY_PERMISSION, { paths, message: SECURITY_EDIT_REFUSAL });
+}
+
 /**
  * Commit a batch of edits to this harness's spec through the guarded commit.
  *
  * A conflict is answered 412 (`current: {rev, diff, draftId}`), a read-only
  * spec 409 `read-only`, a rename or budget raise without the typed name 409
- * carrying `needs`, an over-cap spec 409. A batch the schema rejects comes
- * back as `{ refused }`, the typed envelope the editor renders beside the field.
+ * carrying `needs`, an over-cap spec 409. A change that raises spending, by a
+ * caller without the security edit permission, is 403, decided inside the lock on
+ * the text actually being written. A batch the schema rejects comes back as
+ * `{ refused }`, the typed envelope the editor renders beside the field.
  */
 export async function commitHomeEdits(
   ctx: M3Context,
@@ -518,13 +652,14 @@ export async function commitHomeEdits(
   opts: HomeCommitOptions,
 ): Promise<CommitSuccess | HomeCommitRefusal> {
   const check = await checkSpec(ctx, file.text, "issues");
+  let securityRefusal: { readonly role: unknown; readonly paths: readonly string[] } | undefined;
   const committed = await commitSpec(
     { specPath: file.path },
     { kind: "edits", edits, ...(opts.restrict ? { restrictToOptimizable: true } : {}) },
     {
       expectedRev: opts.expectedRev,
       writer: opts.writer,
-      actor: { kind: "person", by: ctx.operator },
+      actor: { kind: "person", by: ctx.principal },
       confirm: { ...(opts.confirmName !== undefined ? { name: opts.confirmName } : {}) },
       // The harness's own schema decides; this manager's must not refuse a key it does not know.
       ...(check.source === "harness" ? { parse: parseYamlOnly } : {}),
@@ -533,6 +668,28 @@ export async function commitHomeEdits(
           const state = readOnlyOf(await checkSpec(ctx, before, "issues"), ctx.harnessDir);
           if (state !== null) {
             return { ok: false, code: "read-only", reason: state.reason, paths: state.paths };
+          }
+          // On the text this commit writes, inside the lock: a change on a security surface
+          // or a raise of spending needs the security edit permission, whatever the
+          // caller's preview said.
+          const needing = [
+            ...new Set([
+              ...securityChangesOf(before, yamlText),
+              ...escalationBetween(before, yamlText)
+                .filter((e) => e.needs === SPEC_SECURITY_PERMISSION)
+                .flatMap((e) => e.paths),
+            ]),
+          ];
+          if (needing.length > 0) {
+            const verdict = ctx.authorize(SPEC_SECURITY_PERMISSION);
+            if (!verdict.allow) {
+              securityRefusal = { role: verdict.role, paths: needing };
+              return {
+                ok: false,
+                reason: SECURITY_EDIT_REFUSAL,
+                paths: securityRefusal.paths,
+              };
+            }
           }
         }
         if (check.source === "harness") {
@@ -551,7 +708,25 @@ export async function commitHomeEdits(
     },
   );
   if (committed.ok) return committed;
+  if (securityRefusal !== undefined) {
+    throw new HttpError(403, SECURITY_EDIT_REFUSAL, {
+      code: "forbidden",
+      reason: "permission",
+      needs: SPEC_SECURITY_PERMISSION,
+      role: securityRefusal.role,
+      paths: [...securityRefusal.paths],
+    });
+  }
   return await homeCommitFailure(ctx, file, edits, committed, check, opts.restrict);
+}
+
+/** The confirmations the change from `before` to `after` would need, by its text. */
+function escalationBetween(before: string, after: string): ReturnType<typeof escalationFor> {
+  try {
+    return escalationFor(parseYamlOnly(before), parseYamlOnly(after));
+  } catch {
+    return [];
+  }
 }
 
 /** Map a refused commit onto Home's answers. Throws for the request-level ones. */
@@ -594,6 +769,18 @@ async function homeCommitFailure(
         },
       );
     case "needs-confirmation":
+      if (failure.needs === SPEC_SECURITY_PERMISSION) {
+        const verdict = ctx.authorize(SPEC_SECURITY_PERMISSION);
+        if (!verdict.allow) {
+          throw new HttpError(403, SECURITY_EDIT_REFUSAL, {
+            code: "forbidden",
+            reason: "permission",
+            needs: SPEC_SECURITY_PERMISSION,
+            role: verdict.role,
+            paths: failure.paths ?? [],
+          });
+        }
+      }
       throw new HttpError(
         409,
         `${failure.reason} Send "confirmName": "${file.specName}" to apply it.`,
@@ -990,7 +1177,7 @@ export function previewSpecEdits(
  * by that schema in its child; otherwise this manager's schema decides.
  */
 export async function previewHomeEdits(
-  ctx: Pick<M3Context, "harnessDir" | "adopted">,
+  ctx: Pick<M3Context, "harnessDir" | "adopted" | "entry">,
   before: string,
   edits: readonly SpecEdit[],
   check: SchemaCheck,
@@ -1066,6 +1253,9 @@ async function applyBatch(
   }
   if (readOnly !== null) throw readOnlyRefusal(readOnly);
   const expectedRev = requireExpectedRev(ctx);
+  // Before the interstitial, and whether or not a name was typed: a change to a security
+  // surface, or one that raises spending, is the security edit permission's.
+  requireSpecEditAuthority(ctx, file.text, edits);
   const confirmed = ctx.body["confirmName"] !== undefined;
   if (gated && human.length > 0 && !confirmed) {
     // The interstitial's data: what would change, and why it is gated.
@@ -1827,6 +2017,8 @@ export const specPropose: M3Handler = async (ctx) => {
   if (!PROPOSAL_PATH_RE.test(rel)) {
     throw new HttpError(500, "refusing to stage a proposal outside the proposals directory");
   }
+  // Its job is checked before the proposal is staged, so a refused job leaves nothing.
+  ctx.checkJob();
   const dir = ctx.contain([STATE_DIR, PROPOSAL_SUBDIR, `hangar-${stamp}`]);
   mkdirSync(dir, { recursive: true });
   const target = ctx.contain([STATE_DIR, PROPOSAL_SUBDIR, `hangar-${stamp}`, PROPOSAL_FILE]);

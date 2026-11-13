@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/gateway-server",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Bun.serve daemon speaking gateway-protocol — JWT auth + per-tenant routing + budget enforcement",
   "main": "src/index.ts",
@@ -15,6 +15,7 @@
     "@crewhaus/durable-state": "workspace:*",
     "@crewhaus/audit-log": "workspace:*",
     "@crewhaus/boundary-classifier": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/federation-protocol": "workspace:*",
     "@crewhaus/gateway-protocol": "workspace:*",

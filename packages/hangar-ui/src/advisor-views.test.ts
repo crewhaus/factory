@@ -44,13 +44,24 @@ describe("itemActionModel", () => {
     });
   });
 
-  test("a link action deep-links the harness tab that owns the fix", () => {
+  // Changed deliberately: the screen that owns a fix is a sub-view of a
+  // section now, and the link is named the way the console names it.
+  test("a link action deep-links the screen that owns the fix, by its name", () => {
     const model = itemActionModel(
       { screen: "creds", action: { kind: "link", label: "Open creds", cliTwin: null } },
       ID,
     );
     expect(model.kind).toBe("link");
-    expect(model.href).toBe(`#/h/${ID}/creds`);
+    expect(model.href).toBe(`#/h/${ID}/setup/credentials`);
+    expect(model.label).toBe("Open Setup › Credentials");
+    expect(model.where).toBe("Setup › Credentials");
+    // A label the server wrote itself is kept.
+    const own = itemActionModel(
+      { screen: "spec", action: { kind: "link", label: "Open the spec", cliTwin: null } },
+      ID,
+    );
+    expect(own.label).toBe("Open the spec");
+    expect(own.href).toBe(`#/h/${ID}/setup/spec`);
   });
 
   test("the approvals screen is a FLEET link, not a harness tab", () => {
@@ -58,7 +69,7 @@ describe("itemActionModel", () => {
       { screen: "approvals", action: { kind: "link", label: "Open approvals", cliTwin: null } },
       ID,
     );
-    expect(model.href).toBe("#/approvals");
+    expect(model.href).toBe("#/home/needs-you?type=approvals");
   });
 
   test("no action still says so instead of rendering nothing", () => {

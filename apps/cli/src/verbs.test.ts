@@ -477,7 +477,7 @@ describe("legacy sub-verbs match the dispatch", () => {
       subKeys("watchme"),
     );
     const approvals = INDEX.match(
-      /!isHelp && !\["", ([^\]]+)\]\.includes\(action\)[^\n]*\n\s*die\(\s*`approvals/,
+      /!isHelp &&\s+!\["", ([^\]]+)\]\.includes\(\s*action,?\s*\)\s*\)\s*\{\s*die\(\s*`approvals/,
     );
     expect(approvals?.[1]).toBeDefined();
     expect([...(approvals?.[1] ?? "").matchAll(/"([a-z-]+)"/g)].map((m) => m[1])).toEqual(

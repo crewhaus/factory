@@ -35,6 +35,7 @@ export type RunState = CoreMachines["run"]["states"][number];
 export type CommandState = CoreMachines["command"]["states"][number];
 export type DecisionState = CoreMachines["decision"]["states"][number];
 export type DeploymentState = CoreMachines["deployment"]["states"][number];
+export type RuleState = CoreMachines["rule"]["states"][number];
 
 /** Derived from the operator record, the supervisor and the heartbeat; never stored. */
 export const HARNESS_DISPLAY_STATES = deepFreeze([

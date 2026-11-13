@@ -1010,16 +1010,19 @@ describe("activity digest", () => {
     expect(wiki.count).toBe(1);
   });
 
+  // Changed deliberately: the links are built in the sections' grammar now.
   test("every kind deep-links into the screen that owns it", () => {
-    expect(sup.activityHref(items[0])).toBe("#/h/hrn_1/runs/run_1");
-    expect(sup.activityHref(items[1])).toBe("#/h/hrn_1/sessions/sess_1");
-    expect(sup.activityHref(items[2])).toBe("#/h/hrn_1/memory/wiki/x");
+    expect(sup.activityHref(items[0])).toBe("#/h/hrn_1/work/runs/run_1");
+    expect(sup.activityHref(items[1])).toBe("#/h/hrn_1/work/sessions/sess_1");
+    expect(sup.activityHref(items[2])).toBe("#/h/hrn_1/knowledge/wiki/x");
     expect(sup.activityHref({ kind: "eval", harnessId: "h", ref: "run_9" })).toBe(
-      "#/h/h/evals/run_9",
+      "#/h/h/quality/results/run_9",
     );
-    expect(sup.activityHref({ kind: "spec", harnessId: "h" })).toBe("#/h/h/spec");
-    expect(sup.activityHref({ kind: "deploy", harnessId: "h" })).toBe("#/h/h/deploy");
-    expect(sup.activityHref({ kind: "approval", harnessId: "h" })).toBe("#/approvals");
+    expect(sup.activityHref({ kind: "spec", harnessId: "h" })).toBe("#/h/h/setup/spec");
+    expect(sup.activityHref({ kind: "deploy", harnessId: "h" })).toBe("#/h/h/setup/deployment");
+    expect(sup.activityHref({ kind: "approval", harnessId: "h" })).toBe(
+      "#/home/needs-you?type=approvals",
+    );
     expect(sup.activityHref({ kind: "run" })).toBeNull();
   });
 });

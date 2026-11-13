@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/people-service",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "People profile management for Home and `crewhaus people`: the rules a profile obeys, receipted changes, review, export and erasure, and who may do what with a profile (module brief 329). Never in a compiled harness.",
   "main": "src/index.ts",

@@ -18,10 +18,12 @@ import { openHangarRegistry } from "@crewhaus/harness-registry";
 import {
   BUNDLE_DIR_CANDIDATES,
   bootInputsOf,
-  buildDigest,
+  buildLinkMessage,
+  collectBuildFiles,
   entryFileFor,
+  linkEntriesOf,
 } from "@crewhaus/harness-supervisor";
-import { intentDigest, policyRevision, specRevision } from "@crewhaus/ir/policy";
+import { bundleDigest, intentDigest, policyRevision, specRevision } from "@crewhaus/ir/policy";
 import { parseSpec } from "@crewhaus/spec";
 
 function physical(path: string): string {
@@ -83,7 +85,8 @@ export type CompileRecordAnswer =
 
 /**
  * Append the `prepared` row for what compile just wrote. A failure to record is reported,
- * never thrown: the bundle on disk is still the compile's answer.
+ * never thrown: the bundle on disk is still the compile's answer. A build whose files hold a
+ * link is not recorded, and the reason names the link.
  *
  * First consumer: `crewhaus compile` (`runCompile`).
  */
@@ -115,8 +118,12 @@ export async function recordCompiledBundle(
     ...(files !== undefined ? { files } : {}),
     bootInputs,
   };
-  const taken = buildDigest(harnessDir, artifactFiles);
-  if ("unreadable" in taken) return { recorded: false, reason: taken.unreadable };
+  const collected = collectBuildFiles(harnessDir, artifactFiles);
+  if (!Array.isArray(collected)) return { recorded: false, reason: collected.unreadable };
+  // A build runs from regular files only, so a build every start would refuse is not recorded.
+  const [link] = linkEntriesOf(collected);
+  if (link !== undefined) return { recorded: false, reason: buildLinkMessage(link) };
+  const taken = { digest: bundleDigest(collected) };
 
   const registryId = (input.registryIdOf ?? defaultRegistryIdOf)(harnessDir);
   const identity = readHarnessIdentity(harnessDir);

@@ -407,6 +407,30 @@ describe("crewhaus daemon", () => {
     }
   });
 
+  test("a restart that would be refused leaves the daemon running and says so", async () => {
+    const f = fixture();
+    try {
+      const opts = { ...f.opts, env: { ...f.opts.env, HOME: f.dir } };
+      expect((await runDaemonCommand(["start", "--force"], opts)).exitCode).toBe(0);
+      const child = f.ops.last();
+      const refused = await runDaemonCommand(["restart"], opts);
+      expect(refused.exitCode).toBe(55);
+      expect(refused.lines[0]).toStartWith(
+        "daemon-fixture: not restarted, it keeps running — preflight refused: ",
+      );
+      expect(refused.lines.join("\n")).toContain("holds the home directory");
+      expect(child?.signals).toEqual([]);
+      expect(f.ops.children.length).toBe(1);
+      // With the start's own flags it goes ahead.
+      const restarted = await runDaemonCommand(["restart", "--force"], opts);
+      expect(restarted.exitCode).toBe(0);
+      expect(child?.signals).toEqual(["SIGTERM"]);
+      expect(f.ops.children.length).toBe(2);
+    } finally {
+      f.cleanup();
+    }
+  });
+
   test("stop adopts a daemon this process did not spawn, then signals it", async () => {
     const f = fixture();
     try {

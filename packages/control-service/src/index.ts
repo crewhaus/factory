@@ -5,6 +5,57 @@
  * never imports `@crewhaus/hangar-server`.
  */
 export { currentLocalIdentity, storedActorFor } from "./actor";
+export {
+  DECISION_EXECUTORS,
+  DECISION_RECONCILERS,
+  type Observed,
+  observeResolve,
+  observeRuleCreate,
+  observeRuleRevoke,
+  observeSupersede,
+} from "./decision-runtime";
+export {
+  type DecisionActor,
+  type Decisions,
+  type DecisionsDeps,
+  type DeferRequest,
+  type HarnessFound,
+  type ResolveAnswer,
+  type ResolveHooks,
+  type ResolveRequest,
+  type SupersedeRequest,
+  createDecisions,
+  harnessForSessionRoot,
+  principalOfActor,
+  settingsWriteClass,
+} from "./decisions";
+export {
+  DEFAULT_RULE_DAYS,
+  type LegacyAllow,
+  type LegacyRevokeAnswer,
+  type LegacyRevokeOutcome,
+  type ListedProposal,
+  type ListedRule,
+  MAX_RULE_DAYS,
+  type RevokeAnswer,
+  type RuleListing,
+  type RuleRevokeAnswer,
+  type RuleWrite,
+  type RuleWriteAnswer,
+  type Rules,
+  type StandingPattern,
+  callValues,
+  carriesCredential,
+  createRules,
+  createStandingRule,
+  legacyBroadAllows,
+  revokeLegacyAllow,
+  revokeStandingRule,
+  ruleDaysProblem,
+  ruleEnd,
+  standingPatternFor,
+  widenedPatternProblem,
+} from "./rules";
 export { AREA_RUNTIMES, activationGates, compositionProblems } from "./areas";
 export {
   type Commands,

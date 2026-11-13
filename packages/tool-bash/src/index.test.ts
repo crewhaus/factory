@@ -26,6 +26,18 @@ describe("Bash tool metadata", () => {
 });
 
 describe("Bash tool execution", () => {
+  test("a command it runs is marked as started by the Bash tool, and sees the current environment", async () => {
+    process.env["CREWHAUS_TEST_SET_AFTER_START"] = "now";
+    try {
+      const out = await bash.execute({
+        command: 'echo "tool=$CREWHAUS_AGENT_TOOL added=$CREWHAUS_TEST_SET_AFTER_START"',
+      });
+      expect(out).toContain("tool=Bash added=now");
+    } finally {
+      Reflect.deleteProperty(process.env, "CREWHAUS_TEST_SET_AFTER_START");
+    }
+  });
+
   test("captures stdout and exit code 0 on success", async () => {
     const out = await bash.execute({ command: "echo hello" });
     expect(out).toContain("hello");
@@ -142,6 +154,16 @@ async function pollUntil(
 describe("background Bash + BashOutput + KillShell", () => {
   afterEach(() => {
     __resetBackgroundProcsForTest();
+  });
+
+  test("a background command is marked as started by the Bash tool", async () => {
+    const started = await bash.execute({
+      command: 'echo "tool=$CREWHAUS_AGENT_TOOL"',
+      background: true,
+    });
+    const id = /bash_[0-9a-f]+/.exec(started)?.[0] as string;
+    const seen = await pollUntil(id, (text) => text.includes("tool="));
+    expect(seen).toContain("tool=Bash");
   });
 
   test("metadata: BashOutput internal/serial, KillShell destructive", () => {

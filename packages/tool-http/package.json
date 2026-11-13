@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-http",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic HTTP and network tools: pagination, GraphQL, webhooks, SSE, DNS, TLS inspection and link checking over allow-listed origins",
   "main": "src/index.ts",

@@ -62,25 +62,43 @@ export function readWholeRecord(root: string, rel: string, maxBytes: number): Wh
     : { state: "body", body };
 }
 
+/**
+ * A cached reader: a call answers from the cache while the entry is fresh, and
+ * `refresh` reads the file now and keeps that answer for the next second.
+ */
+export type CachedReader<T> = ((harnessDir: string) => T) & {
+  readonly refresh: (harnessDir: string) => T;
+};
+
 /** The reader the injected clock drives. Expired entries are dropped on insert. */
 export function cachedPerPath<T>(
   readNow: (harnessDir: string) => T,
   now: () => number,
-): (harnessDir: string) => T {
+): CachedReader<T> {
   const cache = new Map<string, { readonly at: number; readonly answer: T }>();
   const fresh = (at: number, t: number): boolean => t >= at && t - at < CACHE_MS;
-  return (harnessDir) => {
+  const keep = (key: string, t: number, answer: T): void => {
+    for (const [path, entry] of cache) {
+      if (!fresh(entry.at, t)) cache.delete(path);
+    }
+    cache.set(key, { at: t, answer });
+  };
+  const read = (harnessDir: string): T => {
     const key = resolve(harnessDir);
     const t = now();
     const hit = cache.get(key);
     if (hit !== undefined && fresh(hit.at, t)) return hit.answer;
     const answer = readNow(harnessDir);
-    for (const [path, entry] of cache) {
-      if (!fresh(entry.at, t)) cache.delete(path);
-    }
-    cache.set(key, { at: t, answer });
+    keep(key, t, answer);
     return answer;
   };
+  const refresh = (harnessDir: string): T => {
+    const t = now();
+    const answer = readNow(harnessDir);
+    keep(resolve(harnessDir), t, answer);
+    return answer;
+  };
+  return Object.assign(read, { refresh });
 }
 
 export function isText(value: unknown): boolean {

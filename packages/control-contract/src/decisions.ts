@@ -161,6 +161,18 @@ export type DecisionEscalation = {
 export type DecisionSensitivity = "internal" | "restricted" | "people";
 
 /**
+ * What a standing-rule proposal asks the owner to allow: a narrow allow for one
+ * tool, until a time. `ruleKind` says which terms follow, so another kind of rule
+ * adds its own.
+ */
+export type StandingRuleTerms = {
+  readonly ruleKind: "allow";
+  readonly tool: string;
+  readonly pattern: string;
+  readonly expiresAt: string;
+};
+
+/**
  * A decision record. A tool approval carries every name its parked record has; a
  * decision that is not a tool approval (`dec_`) has no tool call, so those names
  * are optional here.
@@ -183,7 +195,7 @@ export type DecisionRecordView = {
   readonly consumedAt?: string;
   readonly consumedByRun?: string;
   readonly always?: boolean;
-  readonly kind?: "tool" | "input";
+  readonly kind?: "tool" | "input" | "standing-rule-proposal";
   /** The decider as a stored actor: `prn_`, `local:#<digest>` or `sys:`. */
   readonly decidedByPrincipal?: string;
   readonly decidedVia?: string;
@@ -201,6 +213,12 @@ export type DecisionRecordView = {
   readonly binding?: DecisionBinding;
   readonly bindingDigest?: string;
   readonly askDigest?: string;
+  /** A standing-rule proposal's terms. */
+  readonly terms?: StandingRuleTerms;
+  /** Who asked, as a stored actor: a member whose own `--always` became a request to the owner. */
+  readonly proposedBy?: string;
+  /** The tool approval a proposal was made from. */
+  readonly derivedFrom?: string;
 };
 
 /** What the workspace layers over a decision. A tool approval's deferral is on the record. */

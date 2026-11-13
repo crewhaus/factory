@@ -61,6 +61,7 @@ import { APPROVALS_DIRNAME, DEFAULT_APPROVALS_FILENAME } from "@crewhaus/session
 import type { Tenant } from "@crewhaus/tenancy";
 import { DEFAULT_ROOT_DIR as TOOL_RESULTS_ROOT_DIR } from "@crewhaus/tool-result-store";
 import { protectedRootHolding, rootsBesideStore } from "@crewhaus/tool-safety/fs";
+import { hookTargetFiles } from "./hook-targets";
 
 /**
  * The files that control a run, relative to its working directory: the run
@@ -97,6 +98,9 @@ const GATE_RECORDS: readonly string[] = [
   join(".crewhaus", "scope-audit", "baseline.json"),
   // The rule corpus `crewhaus security corpus` writes: exactly that file.
   join(".crewhaus", "security-corpus", "corpus.json"),
+  // The SLO intake gate the monitor flips: exactly that file. The operator record is a
+  // separate file under `.crewhaus/run`.
+  join(".crewhaus", "slo", "intake.json"),
 ];
 
 /** Where the durable-execution idempotency store keeps its records by default. */
@@ -516,6 +520,18 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   compiled inputs; and the bundle the process started from. `entry` is the
  *   process's entry file, `Bun.main` unless a test names another, and the
  *   answer is kept for the life of the process.
+ * - The files the run's hooks name directly ({@link hookTargetFiles}): the
+ *   argv of `manager.hooks.postCompile` and `.preSpawn` and each `hooks[].command`
+ *   in `<cwd>/.crewhaus/settings.json`, and `more.hookCommands`, the commands of
+ *   the hooks the run loaded, read as that module's docblock says (a command
+ *   word written as a path, and the script a shell or an interpreter it starts
+ *   is given; not a word built when the hook runs, a package script or a
+ *   module, or what that script runs in turn). Exact files: a neighbour such as
+ *   `prep.sh.bak` is not one, and a path that is a directory names nothing.
+ * - The spec record of a spec in another directory: `<spec dir>/.crewhaus/run/spec`
+ *   when `more.specDir` (else {@link runSpecDirScope}'s value) is set and its real
+ *   path is not the working directory's. In the spec's own directory the record
+ *   is already under `.crewhaus/run`.
  *
  * The floor reads calls that write. A read of the run's record, a spilled
  * output's parts included, goes on as before.
@@ -526,8 +542,10 @@ export function runtimeStateRoots(
   cwd: string = process.cwd(),
   env: Readonly<Record<string, string | undefined>> = process.env,
   entry: string | undefined = (globalThis as { Bun?: { main?: string } }).Bun?.main,
+  more: { readonly hookCommands?: readonly string[]; readonly specDir?: string } = {},
 ): string[] {
   const sessions = resolve(cwd, sessionRootDir ?? DEFAULT_ROOT_DIR);
+  const specDir = more.specDir ?? runSpecDirScope.getStore();
   const standing = standingOf(cwd, entry);
   const atCwd = (names: readonly string[]): string[] => names.map((name) => resolve(cwd, name));
   /**
@@ -578,6 +596,11 @@ export function runtimeStateRoots(
     { roots: standing.holdsSpec ? atCwd(INSTALLED_TREES) : [], holdingCwd: "protect" },
     { roots: standing.compiledDaemon ? atCwd(COMPILED_INPUTS) : [], holdingCwd: "protect" },
     { roots: atCwd(standing.ownBundle), holdingCwd: "protect" },
+    // The files the run's hooks name directly. A hook that names the working
+    // directory names nothing (a directory), and one that holds it is left to the rules.
+    { roots: hookTargetFiles(cwd, more.hookCommands ?? []), holdingCwd: "skip" },
+    // The spec record of a spec kept in another directory.
+    { roots: specRecordRoots(specDir, cwd), holdingCwd: "skip" },
   ];
   const roots = new Set<string>();
   for (const group of groups) {
@@ -706,3 +729,18 @@ export function credentialFileRoots(cwd: string = process.cwd()): string[] {
 
 /** Set for the whole of a run that answers people other than its operator, nested loops included. */
 export const credentialFloorScope = new AsyncLocalStorage<true>();
+
+/**
+ * The directory of the spec a run was started from, for the whole of that run, nested
+ * loops included: `crewhaus run` and `crewhaus runs resume` enter it, so the spec's own
+ * record is on the floor when the spec lives outside the working directory.
+ */
+export const runSpecDirScope = new AsyncLocalStorage<string>();
+
+/** `<real spec dir>/.crewhaus/run/spec`, unless the spec's directory is the working directory. */
+function specRecordRoots(specDir: string | undefined, cwd: string): string[] {
+  if (specDir === undefined || specDir === "") return [];
+  const real = followed(resolve(cwd, specDir)) ?? resolve(cwd, specDir);
+  const realCwd = followed(resolve(cwd)) ?? resolve(cwd);
+  return real === realCwd ? [] : [join(real, ".crewhaus", "run", "spec")];
+}

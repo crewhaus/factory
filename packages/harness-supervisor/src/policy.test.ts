@@ -63,8 +63,42 @@ describe("classifyExit", () => {
     });
   }
 
-  test("the terminal set is exactly 20/21/30/31/33", () => {
-    expect([...TERMINAL_EXIT_CODES].sort((a, b) => a - b)).toEqual([20, 21, 30, 31, 33]);
+  test("the terminal set is exactly 20/21/30/31/33/34/35/37/38", () => {
+    expect([...TERMINAL_EXIT_CODES].sort((a, b) => a - b)).toEqual([
+      20, 21, 30, 31, 33, 34, 35, 37, 38,
+    ]);
+  });
+
+  for (const [code, failureClass, title] of [
+    [EXIT_CODES.timeout, "timeout", "stopped by its configured time limit"],
+    [
+      EXIT_CODES.evaluation,
+      "evaluation",
+      "stopped because its answer failed the configured evaluation",
+    ],
+    [
+      EXIT_CODES.provability,
+      "provability",
+      "stopped because its answer lacked the evidence its spec requires",
+    ],
+    [EXIT_CODES.disabled, "disabled", "disabled by its operator"],
+  ] as const) {
+    test(`exit ${code} (${failureClass}) stops a long-running harness for good, with its title`, () => {
+      const c = classifyExit({ exitCode: code, operatorStop: false, longRunning: true });
+      expect(c).toMatchObject({
+        disposition: "terminal",
+        restartable: false,
+        failureClass,
+        title,
+        exitCode: code,
+      });
+    });
+  }
+
+  test("exit 39 (paused) is not a daemon exit, so it is classified as a crash", () => {
+    const c = classifyExit({ exitCode: EXIT_CODES.paused, operatorStop: false, longRunning: true });
+    expect(c.disposition).toBe("crash");
+    expect(c.restartable).toBe(true);
   });
 
   test("billing (31) carries the billing failure class for the remediation card", () => {

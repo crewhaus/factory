@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-onchain",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic onchain tools: ABI encoding and decoding, EIP-55 address checksums, EIP-712 and EIP-191 hashing, unit conversion and fixed-point DeFi maths",
   "main": "src/index.ts",

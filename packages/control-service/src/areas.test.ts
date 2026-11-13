@@ -26,7 +26,7 @@ function wireWith(areas: readonly AreaRuntime[]) {
 }
 
 describe("the composition", () => {
-  test("the shipped composition passes, and the core registers daemon control and activation", () => {
+  test("the shipped composition passes, and the core registers daemon control, activation and decisions", () => {
     expect(compositionProblems(AREA_RUNTIMES)).toEqual([]);
     expect(AREA_RUNTIMES.map((runtime) => runtime.area)).toEqual(["core"]);
     expect(Object.keys(CORE_RUNTIME.executors ?? {}).sort()).toEqual([
@@ -34,12 +34,25 @@ describe("the composition", () => {
       "controls.restart",
       "controls.start",
       "controls.stop",
+      "decisions.resolve",
+      "decisions.supersede",
       "deployments.activate",
+      "rules.create",
+      "rules.revoke",
     ]);
     expect(Object.keys(CORE_RUNTIME.reconcilers ?? {}).sort()).toEqual([
       "controls.restart",
       "controls.start",
+      "decisions.supersede",
       "deployments.activate",
+      "rules.create",
+    ]);
+    // The decision kinds act on records alone: dispatched with no supervisor.
+    expect([...(CORE_RUNTIME.unsupervised ?? [])].sort()).toEqual([
+      "decisions.resolve",
+      "decisions.supersede",
+      "rules.create",
+      "rules.revoke",
     ]);
     expect(activationGates(AREA_RUNTIMES).map((gate) => gate.name)).toEqual([
       "protected-environment",
@@ -63,6 +76,25 @@ describe("the composition", () => {
     expect(compositionProblems([{ area: "core", activationGates: [early] }, CORE_RUNTIME])).toEqual(
       ['the core\'s "protected-environment" activation gate is not first'],
     );
+  });
+
+  test("a composition without the core's protected-environment gate is refused, naming it", () => {
+    const missing = 'the core\'s "protected-environment" activation gate is missing';
+    const quality: ActivationGate = { name: "quality", check: async () => ({ ok: true }) };
+    const { activationGates: _gates, ...coreWithoutGate } = CORE_RUNTIME;
+    expect(compositionProblems([coreWithoutGate])).toEqual([missing]);
+    expect(compositionProblems([{ ...coreWithoutGate, activationGates: [quality] }])).toEqual([
+      missing,
+    ]);
+    // A gate of that name from another area is not the core's.
+    const lookalike: ActivationGate = {
+      name: "protected-environment",
+      check: async () => ({ ok: true }),
+    };
+    expect(
+      compositionProblems([coreWithoutGate, { area: "quality", activationGates: [lookalike] }]),
+    ).toContain(missing);
+    expect(wireWith([coreWithoutGate])).toThrow(missing);
   });
 
   test("a kind registered twice is refused, naming it", () => {
@@ -90,14 +122,23 @@ describe("the composition", () => {
       '"controls.start" is not safe to repeat and has an executor but no reconciler',
     );
     // A kind that is safe to repeat needs none.
-    expect(wireWith([{ area: "core", executors: { "controls.stop": noop } }])).not.toThrow();
+    expect(
+      wireWith([
+        {
+          area: "core",
+          executors: { "controls.stop": noop },
+          activationGates: CORE_RUNTIME.activationGates ?? [],
+        },
+      ]),
+    ).not.toThrow();
   });
 
   test("every problem is named in one error", () => {
     const problems = compositionProblems([
       { area: "nowhere", executors: { "controls.nope": noop, "controls.start": noop } },
     ]);
-    expect(problems).toHaveLength(3);
+    expect(problems).toHaveLength(4);
+    expect(problems).toContain('the core\'s "protected-environment" activation gate is missing');
   });
 });
 

@@ -4,7 +4,10 @@
  * and a sign-out. Every issuing answer is never cached and is unchanged by the masker.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
 import {
+  acceptInvite,
+  acceptInviteTabOnly,
   bearer,
   codeFrom,
   exchange,
@@ -22,10 +25,23 @@ afterEach(async () => {
   while (servers.length > 0) await (servers.pop() as TestServer).stop();
 });
 
-function boot(): TestServer {
-  const t = bootTestServer({});
+function boot(opts: Parameters<typeof bootTestServer>[0] = {}): TestServer {
+  const t = bootTestServer(opts);
   servers.push(t);
   return t;
+}
+
+/** An invite from the owner, as `crewhaus access invite` makes one. */
+async function inviteFrom(t: TestServer, role: string, scope = "home"): Promise<string> {
+  await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+  const read = loadAccessSnapshot(t.hangarRoot);
+  if (read.state !== "present") throw new Error("no access records");
+  const done = await openAccess(t.hangarRoot).createInvite(
+    { principal: read.snapshot.owner as string },
+    { role, scope },
+  );
+  if (!done.ok) throw new Error(done.reason);
+  return done.result.code;
 }
 
 const json = (body: unknown): RequestInit => ({
@@ -127,7 +143,7 @@ describe("refusals", () => {
     const t = boot();
     const wrong = await t.fetchRaw("/api/v1/auth/challenge", { method: "POST" });
     expect(wrong.status).toBe(405);
-    const missing = await t.fetchRaw("/api/v1/auth/accept-invite", json({}));
+    const missing = await t.fetchRaw("/api/v1/auth/nowhere", json({}));
     expect(missing.status).toBe(404);
     expect(((await missing.json()) as { error: { code: string } }).error.code).toBe("not_found");
   });
@@ -208,5 +224,81 @@ describe("a sign-in body is held to its limit as it is read", () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: { details: { reason: string } } };
     expect(body.error.details.reason).toBe("body_invalid");
+  });
+});
+
+describe("joining from an invite", () => {
+  test("a sealed join makes a member whose session reads what the invite's role may", async () => {
+    const t = boot();
+    const code = await inviteFrom(t, "viewer");
+    const member = await acceptInvite(t.fetchRaw, code, "Ana");
+    expect(Object.keys(member.answer).sort()).toEqual([
+      "device",
+      "expiresAt",
+      "issued",
+      "principal",
+    ]);
+    const list = await t.fetchRaw("/api/harnesses", { headers: bearer(member.session) });
+    expect(list.status).toBe(200);
+    // A viewer changes nothing.
+    const scan = await t.fetchRaw("/api/scan", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...bearer(member.session) },
+      body: "{}",
+    });
+    expect(scan.status).toBe(403);
+    expect(((await scan.json()) as { reason: string }).reason).toBe("permission");
+    // The code works once.
+    const again = await t.fetchRaw(
+      "/api/v1/auth/accept-invite",
+      json({ code, displayName: "Bo", sessionSecret: "A".repeat(43) }),
+    );
+    expect(again.status).toBe(403);
+    const reused = await acceptInvite(t.fetchRaw, code, "Bo").catch((err: Error) => err.message);
+    expect(String(reused)).toContain("401");
+    expect(String(reused)).toContain("consumed");
+  });
+
+  test("a tab-only join is refused on a Home started without the LAN door", async () => {
+    const t = boot();
+    const code = await inviteFrom(t, "viewer");
+    const tab = await acceptInviteTabOnly(t.fetchRaw, code, "Ana");
+    expect(tab.status).toBe(403);
+    expect((tab.body["error"] as { details: { reason: string } }).details.reason).toBe("tab_only");
+    // Nothing was spent: the same code still joins with keys.
+    expect((await acceptInvite(t.fetchRaw, code, "Ana")).session.startsWith("cha_")).toBe(true);
+  });
+
+  test("a tab-only join answers no secret, counts only on its address, and cannot be renewed", async () => {
+    const t = boot({ lanHost: "127.0.0.1" });
+    const code = await inviteFrom(t, "viewer");
+    // Relayed or on another name, it is refused before the invite is spent.
+    const relayed = await acceptInviteTabOnly(t.fetchRaw, code, "Ana", {
+      "x-forwarded-for": "10.0.0.9",
+    });
+    expect(relayed.status).toBe(403);
+    const elsewhere = await acceptInviteTabOnly(t.fetchRaw, code, "Ana", {
+      host: `localhost:${t.server.port}`,
+    });
+    expect(elsewhere.status).toBe(403);
+    const tab = await acceptInviteTabOnly(t.fetchRaw, code, "Ana");
+    expect(tab.status).toBe(200);
+    expect(Object.keys(tab.body).sort()).toEqual(["expiresAt", "ok", "principal", "tabOnly"]);
+    expect(JSON.stringify(tab.body)).not.toContain(tab.session.slice(4));
+    const read = await t.fetchRaw("/api/harnesses", { headers: bearer(tab.session) });
+    expect(read.status).toBe(200);
+    const offHost = await t.fetchRaw("/api/harnesses", {
+      headers: { ...bearer(tab.session), host: `localhost:${t.server.port}` },
+    });
+    expect(offHost.status).toBe(403);
+    const seal = await (await sealedJs()).makeSeal();
+    const renewed = await t.fetchRaw("/api/v1/auth/refresh", {
+      ...json({ seal: seal.seal }),
+      headers: { "content-type": "application/json", ...bearer(tab.session) },
+    });
+    expect(renewed.status).toBe(403);
+    expect(
+      ((await renewed.json()) as { error: { details: { reason: string } } }).error.details.reason,
+    ).toBe("tab_only");
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/permission-engine",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Permission decisions: modes (default/plan/auto/bypass) over a 5-source RuleSet, built on @crewhaus/tool-permission-matcher",
   "main": "src/index.ts",
@@ -12,10 +12,14 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/tool-permission-matcher": "workspace:*",
     "@crewhaus/tool-safety": "workspace:*",
     "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/control-contract": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

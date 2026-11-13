@@ -868,6 +868,7 @@ export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter
           supersededBy: generateApprovalId(),
           reason,
           parkedAt,
+          ...(by !== undefined && isId("prn", by) ? { byPrincipal: by } : {}),
         };
         const published = publishClaim(touch.ledger, `supersede/${id}`, claim);
         if (!published.ok) {

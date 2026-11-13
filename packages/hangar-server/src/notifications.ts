@@ -606,6 +606,8 @@ export type NotificationCentre = {
   inApp(): readonly Delivery[];
   /** Drop the in-app queue (the console's "mark all read"). */
   clear(): void;
+  /** Drop the in-app entries `drop` names, keeping the rest in order. */
+  clearWhere(drop: (delivery: Delivery) => boolean): void;
   /** Forget the dedupe set — used by the "send a test" path so an operator
    *  can re-fire a rule they just edited. */
   forget(key: string): void;
@@ -683,6 +685,9 @@ export function createNotificationCentre(sinks: NotificationSinks = {}): Notific
     inApp: () => queue,
     clear: () => {
       queue = [];
+    },
+    clearWhere: (drop) => {
+      queue = queue.filter((delivery) => !drop(delivery));
     },
     forget: (key) => {
       delivered.delete(key);

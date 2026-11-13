@@ -43,6 +43,7 @@ import {
   emptyState,
   jsonPre,
   numberedCode,
+  scrollRegion,
   skeleton,
   toast,
 } from "../dom.js";
@@ -102,9 +103,14 @@ export async function renderInspect(root, ctx) {
     return;
   }
   const view = res.body ?? {};
+  // `setup/files/<store>[/<entry>]` opens that store (and entry); an unknown
+  // store opens the default one.
+  const rest = Array.isArray(ctx.route?.rest) ? ctx.route.rest : [];
+  const stores = Array.isArray(view.stores) ? view.stores : [];
+  const known = stores.some((s) => s?.store === rest[0]);
   const state = {
-    store: DEFAULT_STORE,
-    entry: null,
+    store: known ? rest[0] : DEFAULT_STORE,
+    entry: known && typeof rest[1] === "string" ? rest[1] : null,
     rawPath: typeof view.root === "string" ? view.root : ".crewhaus",
   };
 
@@ -115,9 +121,10 @@ export async function renderInspect(root, ctx) {
   root.appendChild(storeHost);
   root.appendChild(rawHost);
 
-  const openStore = async (store, entry = null) => {
+  const openStore = async (store, entry = null, fromAddress = false) => {
     state.store = store;
     state.entry = entry;
+    if (!fromAddress) ctx.setSub?.(entry === null ? [store] : [store, entry]);
     await paintStore(storeHost, ctx, state, openStore);
   };
   const openRaw = async (path) => {
@@ -126,7 +133,7 @@ export async function renderInspect(root, ctx) {
   };
 
   indexHost.appendChild(indexCard(view, openStore, openRaw));
-  await openStore(state.store);
+  await openStore(state.store, state.entry, true);
   await openRaw(state.rawPath);
 }
 
@@ -203,7 +210,7 @@ function indexCard(view, openStore, openRaw) {
           typeof view.note === "string" ? view.note : "No inspectable stores yet",
           typeof view.verb === "string" ? view.verb : null,
         )
-      : el("div", { class: "table-scroll" }, [
+      : scrollRegion("Stores", [
           el("table", { class: "fleet" }, [
             el(
               "thead",
@@ -385,7 +392,7 @@ function entryTable(rows, state, openStore) {
       ]),
     );
   }
-  return el("div", { class: "table-scroll" }, [
+  return scrollRegion("Entries", [
     el("table", { class: "fleet" }, [
       el(
         "thead",

@@ -108,8 +108,10 @@ const HARNESS_USAGE_LINES: readonly string[] = [
   "                                                    channel env, MCP refs, ports, bundle",
   "                                                    freshness); exits 1 on blocking findings",
   "  crewhaus harness adopt <dir|hrn_id> [--slug <s>]  adopt a harness on this machine: a group",
-  "                                                    start includes it; writes its harness.json",
-  "                                                    when it has none",
+  "                                                    start includes it, and Home runs its jobs",
+  "                                                    and checks its spec with the harness's own",
+  "                                                    crewhaus; writes its harness.json when it",
+  "                                                    has none",
   "  crewhaus harness fork <dir>                       give a copied harness its own id (a fresh",
   "                                                    harness.json) and register it",
   "",
@@ -453,7 +455,7 @@ async function harnessShow(
   // The env chain the daemon would really read — including shared fleet
   // files declared in `manager.envFiles`, which resolve outside the harness
   // and are otherwise invisible from here.
-  const envFiles = alive ? loadEnvChain(entry.dir).refs : [];
+  const envFiles = alive ? loadEnvChain(entry.dir, { nodeEnv: process.env["NODE_ENV"] }).refs : [];
   // The operator steps a supervised start of this harness will run, and how
   // each last went — a hook that exists is a fact about the harness, not
   // something you should have to open settings.json to discover.
@@ -574,7 +576,7 @@ async function harnessAdopt(
     lines: [
       `adopted ${adopted.specName} (${adopted.id}) on this machine${
         adopted.slug !== undefined ? ` as ${adopted.slug}` : ""
-      } — a group start includes it`,
+      } — a group start includes it, and Home uses its own crewhaus for its jobs and spec checks`,
       ...disabledNote(reg),
     ],
     exitCode: 0,

@@ -191,10 +191,25 @@ const bashSchema = z.object({
     ),
 });
 
+/**
+ * The environment a command `Bash` runs gets: this process's environment as it is
+ * now, with `CREWHAUS_AGENT_TOOL` set to `Bash`, so a program can tell it was started
+ * by an agent's tool (`crewhaus approvals` refuses to decide under it). It is a
+ * marker, not a boundary. Passed explicitly, because a spawn given no `env` gets
+ * the environment the process started with.
+ */
+function agentToolEnv(): Record<string, string | undefined> {
+  return { ...process.env, CREWHAUS_AGENT_TOOL: "Bash" };
+}
+
 function startBackground(command: string): string {
   ensureBackgroundCleanup();
   const id = `bash_${randomBytes(6).toString("hex")}`;
-  const proc = Bun.spawn(["sh", "-c", command], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(["sh", "-c", command], {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: agentToolEnv(),
+  });
   const bg: BgProc = {
     id,
     command,
@@ -248,6 +263,7 @@ export const bash: RegisteredTool = buildTool({
     const proc = Bun.spawn(["sh", "-c", input.command], {
       stdout: "pipe",
       stderr: "pipe",
+      env: agentToolEnv(),
       // When the orchestrator aborts the turn (Ctrl-C, recovery exhaustion),
       // Bun forwards the signal as SIGTERM to the spawned shell.
       ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),

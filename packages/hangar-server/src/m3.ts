@@ -9,7 +9,10 @@
  * table (`m3-routes.ts`) matched against the request and validated in ONE
  * place. A handler therefore never re-checks any of this:
  *
- *   - AUTH — the bearer was verified before the path was even split.
+ *   - AUTH — the bearer was verified before the path was even split, and the
+ *     route's permission was authorized for the caller on this harness. A handler
+ *     whose permission depends on what is asked checks the rest with
+ *     `ctx.authorize`, the same rule the choke point used.
  *   - ID SHAPE — `:id` matched `HARNESS_ID_RE` and resolved to a registry
  *     entry whose directory exists (404 otherwise). Every other `:param`
  *     matched its guard ({@link PARAM_GUARDS}, {@link SAFE_SEGMENT_RE}
@@ -98,10 +101,11 @@
  * back through the spec write path above.
  */
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
-import type { JobQueue, JobRecord } from "@crewhaus/harness-supervisor";
+import type { JobRecord } from "@crewhaus/harness-supervisor";
+import { type CallerVerdict, TAB_ONLY_MESSAGE, permissionMessage } from "./access";
 import type { ControlClient } from "./control-client";
 import { HttpError } from "./http";
-import type { HarnessProcess } from "./process";
+import type { HarnessProcess, HomeJobQueue } from "./process";
 
 /** Path params, already validated by the dispatcher. */
 export type M3Params = Readonly<Record<string, string>>;
@@ -123,8 +127,8 @@ export type M3Context = {
   /** The harness's live directory, or null on a fleet-wide route. Present
    *  implies it exists (a vanished dir 404s before the handler runs). */
   readonly harnessDir: string | null;
-  /** True when the harness is adopted on this machine (`isAdopted` over its
-   *  registry row). Only an adopted harness's own code checks its spec. */
+  /** True when the harness was adopted with `crewhaus harness adopt` on this machine (its
+   *  registry row carries `home`). Only then does the harness's own code check its spec. */
   readonly adopted: boolean;
   /** Validated `:param` values from the path. */
   readonly params: M3Params;
@@ -138,27 +142,43 @@ export type M3Context = {
   readonly env: Readonly<Record<string, string | undefined>>;
   /** Injected clock (epoch ms) — handlers must not call `Date.now()`. */
   readonly now: () => number;
-  /** Identity recorded on any decision this request settles. */
+  /** The display label Home was started with; never a recorded actor. */
   readonly operator: string;
+  /**
+   * The principal this request acts as, `prn_…` (the owner's for Home's own key and a
+   * Home with sign-in turned off; Home's own label while no access records exist). Every
+   * record a handler writes names it as the actor.
+   */
+  readonly principal: string;
+  /**
+   * Whether this request's caller holds `permission` on a harness (this route's when none
+   * is named) or on the whole Home. The rule the choke point uses, bound to the request.
+   */
+  readonly authorize: (permission: string, target?: { readonly harness: string }) => CallerVerdict;
   /**
    * A `<harness>`-relative path, realpath-contained. Throws `HttpError(400)`
    * when the segments are unsafe or the resolved path escapes the harness
    * dir. Call it PER FILE — a listed name can be a symlink.
    */
   readonly contain: (segments: readonly string[]) => string;
-  /** Every live registered harness (fleet-wide folds). */
+  /** Every live registered harness this request may read (fleet-wide folds). */
   readonly harnesses: () => readonly M3Harness[];
   /** The supervised process handle (adopted first), for routes that need the
    *  runfile, the control port, or the port ledger. */
   readonly process: () => Promise<HarnessProcess>;
   /** The `crewhaus.control.v1` proxy — never returns the bearer. */
   readonly control: ControlClient;
-  /** The durable job queue: the ONLY sanctioned way to run a CLI verb. */
-  readonly jobs: JobQueue;
+  /** The durable job queue: the ONLY sanctioned way to run a CLI verb. Every submission
+   *  is checked where the job runs first (see `submitJob`). */
+  readonly jobs: HomeJobQueue;
   /** Submit a CLI job. `kind` is a display/lock key (`isReadOnlyJob` decides
    *  whether it takes the harness mutex); `argv` must come from the module's
-   *  own closed vocabulary, never from the request body verbatim. */
+   *  own closed vocabulary, never from the request body verbatim. A job whose directory
+   *  holds the home directory needs `workspace.holds-home` in the request's
+   *  `acknowledge`, for this job; otherwise it throws `JobRefusedError`, answered 409. */
   readonly submitJob: (kind: string, argv: readonly string[]) => JobRecord;
+  /** Throw the refusal `submitJob` would, before a handler writes anything its job needs. */
+  readonly checkJob: () => void;
   /** Warning sink — an honest degradation, never a thrown 500. */
   readonly warn: (message: string) => void;
 };
@@ -212,6 +232,40 @@ export function requireBoolean(body: Readonly<Record<string, unknown>>, key: str
   const value = body[key];
   if (typeof value !== "boolean") throw new HttpError(400, `missing "${key}" boolean`);
   return value;
+}
+
+/**
+ * Require a permission the request's own route did not already need: a 403 that names
+ * what is missing and the role the caller has, in the route's own words, never a
+ * permission id in the headline. `paths` names the spec paths that needed it, when any.
+ */
+export function requirePermission(
+  ctx: Pick<M3Context, "authorize">,
+  permission: string,
+  options: {
+    readonly target?: { readonly harness: string };
+    readonly paths?: readonly string[];
+    readonly message?: string;
+  } = {},
+): void {
+  const verdict = ctx.authorize(permission, options.target);
+  if (verdict.allow) return;
+  if ("reason" in verdict) {
+    throw new HttpError(403, TAB_ONLY_MESSAGE, {
+      code: "forbidden",
+      reason: verdict.reason,
+      needs: verdict.needs,
+      role: verdict.role,
+      ...(options.paths !== undefined ? { paths: [...options.paths] } : {}),
+    });
+  }
+  throw new HttpError(403, options.message ?? permissionMessage(permission, "harness"), {
+    code: "forbidden",
+    reason: "permission",
+    needs: verdict.needs,
+    role: verdict.role,
+    ...(options.paths !== undefined ? { paths: [...options.paths] } : {}),
+  });
 }
 
 /**

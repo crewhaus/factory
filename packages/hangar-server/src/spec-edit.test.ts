@@ -564,7 +564,7 @@ describe("the structured editor", () => {
       // Not adopted on this machine ⇒ the manager's copy answers, and the
       // badge says so rather than pretending the harness's schema was used.
       expect(body["schemaSource"]).toBe("manager");
-      expect(String(body["note"])).toContain("Adopt the harness");
+      expect(String(body["note"])).toContain(`run crewhaus harness adopt ${id}`);
       expect(body["rev"]).toBe(revOf(dir));
       expect(body["hash"]).toBe(body["rev"]);
       const effective = body["effective"] as Array<{ path: string; source: string }>;

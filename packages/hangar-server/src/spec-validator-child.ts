@@ -16,12 +16,13 @@
  * crash, output past the cap or output that is not the answer: the caller
  * falls back to Home's own schema and says why.
  *
- * Only a harness adopted on this machine is checked this way, and only when
- * its `@crewhaus/spec` resolves inside the harness; the caller decides both.
+ * Only a harness adopted with `crewhaus harness adopt` on this machine is checked this
+ * way, and only when its `@crewhaus/spec` resolves inside the harness; the caller decides
+ * both.
  */
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 
 /** The child's whole program. It imports the entry Home resolved and contained, and nothing else. */
 export const VALIDATOR_SOURCE = `
@@ -93,7 +94,11 @@ export const VALIDATOR_TIMEOUT_MS = 10_000;
 /** A schema document is large; an answer past this is not one. */
 export const VALIDATOR_MAX_BYTES = 8 * 1024 * 1024;
 
-/** The `bun` that runs the child: this process when it is `bun` itself, else `bun` on PATH. */
+/**
+ * The `bun` that runs the child: this process when it is `bun` itself, else `bun` on PATH,
+ * searching only absolute PATH entries, so the answer is an absolute path that never
+ * depends on the directory the child runs in.
+ */
 export function bunInterpreter(
   homeEnv: Readonly<Record<string, string | undefined>> = process.env,
   execPath: string = process.execPath,
@@ -102,7 +107,7 @@ export function bunInterpreter(
   if (name === "bun" || name === "bun.exe") return execPath;
   const sep = process.platform === "win32" ? ";" : ":";
   for (const dir of (homeEnv["PATH"] ?? "").split(sep)) {
-    if (dir === "") continue;
+    if (dir === "" || !isAbsolute(dir)) continue;
     for (const candidate of process.platform === "win32" ? ["bun.exe", "bun"] : ["bun"]) {
       const path = join(dir, candidate);
       if (existsSync(path)) return path;

@@ -548,16 +548,51 @@ export type CasAnswer =
       readonly current: LedgerRecord | null;
       /** The object was in the expected state, and the machine refuses the move. */
       readonly illegal?: true;
+      /** The objects the precondition names are not as the caller read them. */
+      readonly precondition?: "changed";
     }
   | SafeFsFailure;
 
 /**
+ * What a compare-and-set also requires of the rest of the ledger: the objects in state
+ * `inState` are exactly `exactly`, each at its listed generation, none added and none
+ * missing. A row written without `gen` folds to generation 0.
+ */
+export type CasPrecondition = {
+  readonly inState: string;
+  readonly exactly: readonly { readonly id: string; readonly gen: number }[];
+};
+
+/** Whether the fold holds exactly the objects a precondition lists, at their generations. */
+function preconditionHolds(
+  fold: Extract<FoldAnswer, { ok: true }>,
+  precondition: CasPrecondition,
+): boolean {
+  const listed = new Map<string, number>();
+  for (const { id, gen } of precondition.exactly) {
+    if (listed.has(id)) return false;
+    listed.set(id, gen);
+  }
+  let found = 0;
+  for (const object of fold.objects.values()) {
+    if (object.state !== precondition.inState) continue;
+    const gen = listed.get(object.id);
+    if (gen === undefined || (fold.generations.get(object.id) ?? 0) !== gen) return false;
+    found += 1;
+  }
+  return found === listed.size;
+}
+
+/**
  * Compare-and-set. Under the lock: fold the object; a state other than `expectState`
  * (`null` means absent) answers `current`; a move the machine refuses answers `illegal`.
- * Otherwise publish generation claim `gen/<id>/<g+1>`, which is what decides, and append
- * `{...next, id, gen}`. A lost claim answers the winner's record, after repairing it.
- * Generation claims are never removed. They are keyed by `id` alone, so ledgers that share
- * a claims directory must not reuse an id.
+ * With a `precondition`, the same fold must also hold exactly the objects it lists in its
+ * state, at their generations, or the answer is `precondition: "changed"` with nothing
+ * claimed or appended: a caller that decided from an earlier read acts only on the ledger
+ * it read. Otherwise publish generation claim `gen/<id>/<g+1>`, which is what decides, and
+ * append `{...next, id, gen}`. A lost claim answers the winner's record, after repairing
+ * it. Generation claims are never removed. They are keyed by `id` alone, so ledgers that
+ * share a claims directory must not reuse an id.
  *
  * First consumers: activation, `dec_` decisions and attention overlays.
  */
@@ -566,33 +601,67 @@ export async function casAppend(
   id: string,
   expectState: string | null,
   next: LedgerRecord,
+  precondition?: CasPrecondition,
 ): Promise<CasAnswer> {
   const seam = seams;
-  return withLedgerLock<CasAnswer>(ledger, async (lockedAppend) => {
-    const fold = foldStates(ledger);
-    if (!fold.ok) return fold;
-    const current = fold.objects.get(id);
-    const holds = expectState === null ? current === undefined : current?.state === expectState;
-    if (!holds) return { ok: true, applied: false, current: current?.record ?? null };
-    if (!rowIsLegal(ledger, current?.state, next["state"])) {
-      return { ok: true, applied: false, current: current?.record ?? null, illegal: true };
-    }
-    await seam.afterFold?.();
-    const gen = (fold.generations.get(id) ?? 0) + 1;
-    const claim = `${GENERATION_KIND}/${id}/${gen}`;
-    const row: LedgerRecord = { ...next, id, gen, claim };
-    const published = publishClaim(ledger, claim, row);
-    if (!published.ok) {
-      if (published.code !== "exists") return published;
-      const winner = readClaim(ledger, claim);
-      if (!winner.ok) return winner;
-      const repair = repairClaim(ledger, winner.content, lockedAppend);
-      if ("ok" in repair) return repair;
-      return { ok: true, applied: false, current: winner.content.record };
-    }
-    await seam.afterClaim?.();
-    const written = lockedAppend(row);
-    if (!written.ok) return written;
-    return { ok: true, applied: true, gen, seg: written.seg, record: row };
-  });
+  return withLedgerLock<CasAnswer>(ledger, (lockedAppend) =>
+    casUnderLock(ledger, lockedAppend, seam, id, expectState, next, precondition),
+  );
+}
+
+/**
+ * {@link casAppend} for a caller that already holds the lock `ledger.lock` names, taken
+ * through {@link withLedgerLock} on this ledger or on another that shares the lock (every
+ * `harnessLedger` does). One lock can then cover a compare-and-set on two ledgers and a
+ * write beside them. Calling it without the lock is a caller's bug: nothing here takes it.
+ *
+ * First consumers: standing rules and the requests that ask an owner for one.
+ */
+export async function casAppendLocked(
+  ledger: Ledger,
+  id: string,
+  expectState: string | null,
+  next: LedgerRecord,
+  precondition?: CasPrecondition,
+): Promise<CasAnswer> {
+  return casUnderLock(ledger, lockedAppendFor(ledger), seams, id, expectState, next, precondition);
+}
+
+async function casUnderLock(
+  ledger: Ledger,
+  lockedAppend: LockedAppend,
+  seam: LedgerSeams,
+  id: string,
+  expectState: string | null,
+  next: LedgerRecord,
+  precondition: CasPrecondition | undefined,
+): Promise<CasAnswer> {
+  const fold = foldStates(ledger);
+  if (!fold.ok) return fold;
+  const current = fold.objects.get(id);
+  const holds = expectState === null ? current === undefined : current?.state === expectState;
+  if (!holds) return { ok: true, applied: false, current: current?.record ?? null };
+  if (!rowIsLegal(ledger, current?.state, next["state"])) {
+    return { ok: true, applied: false, current: current?.record ?? null, illegal: true };
+  }
+  if (precondition !== undefined && !preconditionHolds(fold, precondition)) {
+    return { ok: true, applied: false, current: current?.record ?? null, precondition: "changed" };
+  }
+  await seam.afterFold?.();
+  const gen = (fold.generations.get(id) ?? 0) + 1;
+  const claim = `${GENERATION_KIND}/${id}/${gen}`;
+  const row: LedgerRecord = { ...next, id, gen, claim };
+  const published = publishClaim(ledger, claim, row);
+  if (!published.ok) {
+    if (published.code !== "exists") return published;
+    const winner = readClaim(ledger, claim);
+    if (!winner.ok) return winner;
+    const repair = repairClaim(ledger, winner.content, lockedAppend);
+    if ("ok" in repair) return repair;
+    return { ok: true, applied: false, current: winner.content.record };
+  }
+  await seam.afterClaim?.();
+  const written = lockedAppend(row);
+  if (!written.ok) return written;
+  return { ok: true, applied: true, gen, seg: written.seg, record: row };
 }

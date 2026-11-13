@@ -16,11 +16,16 @@
  *     run console masks. The run routes stay the only way in.
  *   - `run/gateway-jwt-secret` — a managed daemon's generated signing secret.
  *     A bare value carries no key for a masker to read, so it is refused whole.
+ *   - the rest of Home's run credentials and decision records under `run/`:
+ *     the control and MCP tokens, the decision log's keys and inputs, who may
+ *     approve, and link requests;
+ *   - every path an area module declares (`rawExclusions` in control-contract).
  * Those exclusions are enforced HERE, in the store allowlist and in the
- * generic raw browser, not in the UI — and they are matched CASE-FOLDED,
- * because the default filesystem on darwin and Windows resolves
- * `.crewhaus/AUDIT` to the real directory while a case-sensitive comparison
- * waves it through. See {@link exclusionFor}.
+ * generic raw browser, not in the UI — matched CASE-FOLDED, because the
+ * default filesystem on darwin and Windows resolves `.crewhaus/AUDIT` to the
+ * real directory, and matched again on the path a request RESOLVES to, so a
+ * link inside the harness to an excluded file is refused and hidden exactly
+ * like the file. See {@link exclusionFor}.
  *
  * The named stores this module browses ({@link INSPECT_STORE_NOTE}):
  *   scope-audit    `.crewhaus/scope-audit/baseline.json` (lint's output)
@@ -75,14 +80,23 @@
  * the fingerprint plus PRESENCE booleans for the key material, so the private
  * key cannot leave this process even if a masker regresses.
  */
-import { existsSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  existsSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { isAbsolute, join, relative, sep } from "node:path";
+import { AREA_MODULES } from "@crewhaus/control-contract";
 import { MAX_TEXT_BYTES } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
 import { replacePrivateKeyBlocks } from "./linear-mask";
 import type { M3Context, M3Handler } from "./m3";
-import { requireTypedConfirm } from "./m3";
+import { requirePermission, requireTypedConfirm } from "./m3";
 import { type TextScrubber, maskDeep, maskKeyedText } from "./mask";
 import { spawnEnvScrubber } from "./runs";
 
@@ -110,7 +124,7 @@ export function isInspectStore(value: string): value is InspectStore {
 
 /** Referenced by the module docblock so the store list has one home. */
 export const INSPECT_STORE_NOTE =
-  "secrets/, raw audit files, .env, the raw run captures and a generated signing secret are excluded from every inspect route";
+  "secrets, raw audit files, .env files, raw run output, and Home's run credentials and decision records never appear in any inspect route";
 
 /** Cap on directory entries listed for one store (a runaway `logs/` must not
  *  make a fleet console paint unbounded). */
@@ -259,6 +273,83 @@ export const INSPECT_EXCLUSIONS: readonly InspectExclusion[] = [
       "the key the decision log's digests are made with — a bare value, and with it a digest of a tool input or a user name could be tested by guessing",
     where: "nowhere: it never leaves the session root",
   },
+  {
+    path: ".crewhaus/run/control-token",
+    reason: "the daemon's control token — a bare value, with no key for a masker to read",
+    where: "Runs → the control panel, which uses it without showing it",
+  },
+  {
+    path: ".crewhaus/run/mcp-token",
+    reason: "the token a channel bundle's MCP door takes — a bare value",
+    where: "the file itself, on the daemon's machine",
+  },
+  {
+    path: ".crewhaus/run/control/keys/",
+    reason:
+      "the key Home's command and decision digests are made with — with it a digest could be tested by guessing",
+    where: "nowhere: it never leaves the harness",
+  },
+  {
+    path: ".crewhaus/run/control/inputs/",
+    reason: "the inputs decisions were asked about, kept whole for the decision they wait on",
+    where: "Approvals → each request, shown to whoever may decide it",
+  },
+  {
+    path: ".crewhaus/run/control/approvers.json",
+    reason: "who may approve on this harness, by person",
+    where: "Access → members and roles",
+  },
+  {
+    path: ".crewhaus/run/control/link-requests.jsonl",
+    reason: "requests to link an outside identity to a person",
+    where: "Access → links",
+  },
+];
+
+/** The row for a path in {@link INSPECT_EXCLUSIONS}, looked up by its path, never by position. */
+function exclusionAt(path: string): InspectExclusion {
+  const row = INSPECT_EXCLUSIONS.find((r) => r.path === path);
+  if (row === undefined) throw new Error(`hangar-server: no inspect exclusion for ${path}`);
+  return row;
+}
+
+/** The rows matched by name anywhere in a path rather than by where it sits. */
+const SECRETS_ROW = exclusionAt(".crewhaus/secrets/");
+const ENV_ROW = exclusionAt(".env, .env.*");
+const DECISION_KEYS_ROW = exclusionAt(".crewhaus/sessions/approvals.d/keys/");
+
+/** A harness-relative path as lower-cased segments, its trailing slash dropped. */
+function segmentsOfPath(path: string): string[] {
+  return path
+    .split("/")
+    .filter((segment) => segment !== "")
+    .map((segment) => segment.toLowerCase());
+}
+
+/**
+ * The exclusions area modules declare (`AreaModule.rawExclusions`), composed by the one
+ * enforcer: each path, and everything below it, is never served.
+ *
+ * First consumer: {@link exclusionFor}, over every module control-contract composes.
+ */
+export function moduleExclusions(
+  modules: ReadonlyArray<{ readonly area: string; readonly rawExclusions?: readonly string[] }>,
+): InspectExclusion[] {
+  return modules.flatMap((module) =>
+    (module.rawExclusions ?? []).map((path) => ({
+      path,
+      reason: `a record the ${module.area} area keeps that holds a secret, content or a person's identifier`,
+      where: `the ${module.area} screens, which show it to whoever may read it`,
+    })),
+  );
+}
+
+/** Every exclusion matched by place: the fixed rows, then every module's. */
+const PLACED: readonly InspectExclusion[] = [
+  ...INSPECT_EXCLUSIONS.filter(
+    (row) => row !== SECRETS_ROW && row !== ENV_ROW && row !== DECISION_KEYS_ROW,
+  ),
+  ...moduleExclusions(AREA_MODULES),
 ];
 
 /**
@@ -272,35 +363,59 @@ export const INSPECT_EXCLUSIONS: readonly InspectExclusion[] = [
  * sits (`approvals.d/keys` at any depth), because `CREWHAUS_SESSION_DIR` can
  * move the session root anywhere inside the harness.
  *
- * CASE-FOLDED, ALL SIX OF THEM. The default filesystem on darwin (APFS) and
- * on Windows (NTFS) is case-INSENSITIVE, so the OS happily resolves
- * `.crewhaus/AUDIT` and `.crewhaus/Run/Logs` to the real directories — and
- * `resolveContained` answers with the caller's casing rather than the
- * realpath, so containment passes. Comparing any branch of this list against
- * raw segments therefore makes that branch a suggestion, not a boundary:
- * two of the four were exactly-cased once, and `?path=.crewhaus/AUDIT/…`
- * walked straight through them.
+ * Every other row is matched by place: the path itself and everything below it.
+ *
+ * CASE-FOLDED, EVERY ONE. The default filesystem on darwin (APFS) and on
+ * Windows (NTFS) is case-INSENSITIVE, so the OS resolves `.crewhaus/AUDIT`
+ * and `.crewhaus/Run/Logs` to the real directories, and `resolveContained`
+ * answers with the caller's casing rather than the realpath — so every row is
+ * compared lower-cased, and the resolved path is compared again
+ * ({@link resolvedExclusion}).
+ *
+ * `extra` adds exclusions to the composed ones (a test plants a module's here).
  */
-export function exclusionFor(segments: readonly string[]): InspectExclusion | null {
+export function exclusionFor(
+  segments: readonly string[],
+  extra: readonly InspectExclusion[] = [],
+): InspectExclusion | null {
   const lower = segments.map((s) => s.toLowerCase());
   for (const [i, segment] of lower.entries()) {
-    if (segment === "secrets") return INSPECT_EXCLUSIONS[0] as InspectExclusion;
-    if (segment === ".env" || segment.startsWith(".env.")) {
-      return INSPECT_EXCLUSIONS[2] as InspectExclusion;
-    }
-    if (segment === "approvals.d" && lower[i + 1] === "keys") {
-      return INSPECT_EXCLUSIONS[5] as InspectExclusion;
-    }
+    if (segment === "secrets") return SECRETS_ROW;
+    if (segment === ".env" || segment.startsWith(".env.")) return ENV_ROW;
+    if (segment === "approvals.d" && lower[i + 1] === "keys") return DECISION_KEYS_ROW;
   }
-  if (lower[0] !== ".crewhaus") return null;
-  if (lower[1] === "audit") return INSPECT_EXCLUSIONS[1] as InspectExclusion;
-  if (lower[1] === "run" && lower[2] === "logs") {
-    return INSPECT_EXCLUSIONS[3] as InspectExclusion;
-  }
-  if (lower[1] === "run" && lower[2] === "gateway-jwt-secret") {
-    return INSPECT_EXCLUSIONS[4] as InspectExclusion;
+  for (const row of [...PLACED, ...extra]) {
+    const prefix = segmentsOfPath(row.path);
+    if (prefix.length === 0 || prefix.length > lower.length) continue;
+    if (prefix.every((segment, i) => segment === lower[i])) return row;
   }
   return null;
+}
+
+/**
+ * The exclusion the path a request RESOLVES to trips: `resolved` (already contained)
+ * taken through every link to its real place, made harness-relative with `relative()`,
+ * and checked like a requested path. A link inside the harness to an excluded file trips
+ * that file's row. Null when it trips none, or when nothing is there.
+ *
+ * First consumers: every inspect read and listing.
+ */
+export function resolvedExclusion(
+  harnessDir: string,
+  resolved: string,
+  extra: readonly InspectExclusion[] = [],
+): InspectExclusion | null {
+  let real: string;
+  let root: string;
+  try {
+    real = realpathSync(resolved);
+    root = realpathSync(harnessDir);
+  } catch {
+    return null;
+  }
+  const rel = relative(root, real);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return null;
+  return exclusionFor(sep === "/" ? rel.split("/") : rel.split(/[\\/]/), extra);
 }
 
 /** True when a harness-relative path is one of the exclusions. */
@@ -453,17 +568,23 @@ export type InspectEntryRow = {
 function listEntries(
   ctx: M3Context,
   base: readonly string[],
-): { rows: InspectEntryRow[]; truncated: boolean } {
+): { rows: InspectEntryRow[]; truncated: boolean; hidden: string[] } {
   let names: string[];
   try {
     const dir = ctx.contain(base);
     names = readdirSync(dir).sort();
   } catch {
-    return { rows: [], truncated: false };
+    return { rows: [], truncated: false, hidden: [] };
   }
   const rows: InspectEntryRow[] = [];
+  const hidden: string[] = [];
   const truncated = names.length > MAX_INSPECT_ENTRIES;
   for (const name of names.slice(0, MAX_INSPECT_ENTRIES)) {
+    // An excluded name, or one that resolves to an excluded file, is not listed at all.
+    if (exclusionFor([...base, name]) !== null) {
+      hidden.push(name);
+      continue;
+    }
     let resolved: string;
     try {
       resolved = ctx.contain([...base, name]);
@@ -475,6 +596,10 @@ function listEntries(
         modifiedAt: null,
         note: "this name resolves outside the harness directory and is not readable from here",
       });
+      continue;
+    }
+    if (ctx.harnessDir !== null && resolvedExclusion(ctx.harnessDir, resolved) !== null) {
+      hidden.push(name);
       continue;
     }
     try {
@@ -496,7 +621,24 @@ function listEntries(
       });
     }
   }
-  return { rows, truncated };
+  return { rows, truncated, hidden };
+}
+
+/**
+ * Refuse a path that is excluded as asked for, or whose resolved place is: 403, naming the
+ * reason and where the data IS available, and never the file's content.
+ */
+function refuseExcluded(ctx: M3Context, segments: readonly string[], resolved?: string): void {
+  const excluded =
+    exclusionFor(segments) ??
+    (resolved !== undefined && ctx.harnessDir !== null
+      ? resolvedExclusion(ctx.harnessDir, resolved)
+      : null);
+  if (excluded === null) return;
+  throw new HttpError(
+    403,
+    `${relPath(segments)} is excluded from every inspect route: ${excluded.reason}. See ${excluded.where}.`,
+  );
 }
 
 /** `statSync` that answers undefined instead of throwing. */
@@ -710,6 +852,7 @@ export const inspectStore: M3Handler = (ctx) => {
   const store = requireStore(ctx);
   const def = STORE_DEFS[store];
   const path = storePath(ctx, store);
+  if (path !== undefined) refuseExcluded(ctx, def.segments, path);
   const stat = path === undefined ? undefined : statOr(path);
   const base = {
     store,
@@ -815,6 +958,7 @@ export const inspectEntry: M3Handler = (ctx) => {
       truncated: false,
     };
   }
+  refuseExcluded(ctx, [...def.segments, name]);
   let path: string;
   try {
     path = ctx.contain([...def.segments, name]);
@@ -833,6 +977,7 @@ export const inspectEntry: M3Handler = (ctx) => {
       truncated: false,
     };
   }
+  refuseExcluded(ctx, [...def.segments, name], path);
   const stat = statOr(path);
   if (stat === undefined) {
     return {
@@ -858,7 +1003,9 @@ export const inspectEntry: M3Handler = (ctx) => {
     let body: InspectFileBody | undefined;
     if (skillFile !== undefined) {
       try {
-        body = readBody(ctx.contain([...def.segments, name, skillFile.name]), scrubberFor(ctx));
+        const skillPath = ctx.contain([...def.segments, name, skillFile.name]);
+        refuseExcluded(ctx, [...def.segments, name, skillFile.name], skillPath);
+        body = readBody(skillPath, scrubberFor(ctx));
       } catch {
         body = undefined;
       }
@@ -977,6 +1124,8 @@ export const inspectRaw: M3Handler = (ctx) => {
       truncated: false,
     };
   }
+  // The place it resolves to is checked too: a link to an excluded file is that file.
+  refuseExcluded(ctx, segments, path);
   const stat = statOr(path);
   if (stat === undefined) {
     return {
@@ -997,11 +1146,10 @@ export const inspectRaw: M3Handler = (ctx) => {
     };
   }
   if (stat.isDir) {
-    const { rows, truncated } = listEntries(ctx, segments);
-    // Excluded names are dropped from the listing AND named as excluded, so a
-    // browser at `.crewhaus/` shows why `secrets/` is not there.
-    const visible = rows.filter((r) => !isExcludedPath([...segments, r.name]));
-    const hidden = rows.filter((r) => isExcludedPath([...segments, r.name])).map((r) => r.name);
+    const { rows: visible, truncated, hidden } = listEntries(ctx, segments);
+    // Excluded names, and names that resolve to an excluded file, are dropped from the
+    // listing AND named as excluded, so a browser at `.crewhaus/` shows why `secrets/` is
+    // not there.
     return {
       present: true,
       note: visible.length === 0 ? "this directory holds nothing readable from here" : null,
@@ -1132,6 +1280,44 @@ function serializeSettings(value: unknown): string {
 }
 
 /**
+ * The settings keys that decide what the agent may do, what runs, and which environment
+ * files (with the credentials in them) the harness is started with.
+ */
+const SECURITY_SETTINGS_PATHS: ReadonlyArray<readonly string[]> = [
+  ["permissions"],
+  ["hooks"],
+  ["manager", "hooks"],
+  ["manager", "envFiles"],
+];
+
+/** Which of {@link SECURITY_SETTINGS_PATHS} differ between two settings documents. */
+export function securityKeysChanged(beforeText: string, afterText: string): string[] {
+  const parse = (text: string): unknown => {
+    if (text.trim() === "") return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      // A document that cannot be read compares as different everywhere.
+      return undefined;
+    }
+  };
+  const at = (doc: unknown, path: readonly string[]): unknown => {
+    let node = doc;
+    for (const key of path) {
+      if (typeof node !== "object" || node === null || Array.isArray(node)) return undefined;
+      node = (node as Record<string, unknown>)[key];
+    }
+    return node;
+  };
+  const before = parse(beforeText);
+  const after = parse(afterText);
+  return SECURITY_SETTINGS_PATHS.filter(
+    (path) =>
+      before === undefined || JSON.stringify(at(before, path)) !== JSON.stringify(at(after, path)),
+  ).map((path) => path.join("."));
+}
+
+/**
  * `PUT /api/h/:id/inspect/settings` — edit `.crewhaus/settings.json`.
  *
  * Permission rules and hooks — the files `tools audit` / `permissions
@@ -1157,6 +1343,17 @@ export const settingsWrite: M3Handler = (ctx) => {
   const before = existed ? readTextCapped(path, MAX_INSPECT_BYTES) : { text: "", truncated: false };
   const after = serializeSettings(next);
   const diff = settingsDiff(before.text, after);
+  // Permission rules, hooks and the environment files decide what the agent may do, what
+  // runs and with which credentials: changing any is the security edit permission's,
+  // previewed or not.
+  const touched = securityKeysChanged(before.text, after);
+  if (touched.length > 0) {
+    requirePermission(ctx, "h.spec.edit.security", {
+      paths: touched,
+      message:
+        "Only an owner of this harness can change its permission rules, hooks or environment files: they decide what the agent may do, what runs and with which credentials.",
+    });
+  }
 
   if (ctx.body["dryRun"] === true) {
     return {
@@ -1238,7 +1435,7 @@ export const settingsWrite: M3Handler = (ctx) => {
     diff,
     bytes: Buffer.byteLength(after, "utf8"),
     at: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
     note: null,
   };
 };

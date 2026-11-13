@@ -54,12 +54,14 @@
  * `--lan` is the phone door: it binds the address `lan-address.ts` picks for
  * this machine (and loopback beside it, so this computer's own browser still
  * signs in) and prints a QR code (`@crewhaus/qr-code`, imported STATICALLY
- * for the same compiled-binary reason as the UI assets) that encodes the bare
- * LAN address. It is its own opt-in rather than a second `--host`: typing it
- * is exactly the deliberate, visible act HM-201 asks for, so the environment
- * variable is not demanded on top. Nothing else is relaxed — auth stays
- * mandatory, and the code carries no credential: the phone opens Home and is
- * asked to sign in.
+ * for the same compiled-binary reason as the UI assets) that encodes an invite
+ * link, `<lan address>/invite#c=<code>`: a single-use invite that works for 10
+ * minutes, as a viewer of the whole Home unless `--lan-role` names another
+ * role. The phone opens it, types a name, and joins as a member with that
+ * role. `crewhaus hangar qr` mints a fresh one each time. It is its own opt-in
+ * rather than a second `--host`: typing it is exactly the deliberate, visible
+ * act HM-201 asks for, so the environment variable is not demanded on top.
+ * Nothing else is relaxed — auth stays mandatory.
  *
  * Every verb that resolves Home's directory first refuses one taken from a
  * `.env` file in the working directory (`hangar-env.ts`).
@@ -78,7 +80,12 @@ import {
 } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
-import { HOME_SOCKET, type LocalIdentity, loadAccessSnapshot } from "@crewhaus/access-control";
+import {
+  HOME_SOCKET,
+  type LocalIdentity,
+  loadAccessSnapshot,
+  noAuthRefusal,
+} from "@crewhaus/access-control";
 import {
   DEFAULT_HANGAR_PORT,
   type HangarServer,
@@ -94,10 +101,12 @@ import {
 } from "@crewhaus/harness-registry";
 import {
   type ShutdownSupervisor,
+  homeCrewhausArgv,
   runManagerShutdown,
   shutdownReportLines,
 } from "@crewhaus/harness-supervisor";
 import { encodeQr, renderQrLines, renderedWidth } from "@crewhaus/qr-code";
+import { inviteAsLocalUser } from "./access-cmd";
 import { dotenvRootRefusal } from "./hangar-env";
 import { rotateTokenVerb } from "./hangar-rotate";
 import { assetSmokeCheck, problemSummary } from "./hangar-smoke";
@@ -176,12 +185,13 @@ const HANGAR_USAGE_LINES: readonly string[] = [
   "       [--port <n>] [--host <h>] [--lan]       web UI over the machine-wide harness",
   "       [--allow-host <name>]...                registry) and open it in the browser",
   "       [--no-auth] [--no-open] [--no-qr]",
+  "       [--lan-role <role>]",
   "       [--smoke] [--read-only]",
   "       [--read-only-locked]",
   "  crewhaus hangar status [--json]              lock/port/registry report — works without",
   "                                               a running server",
   "  crewhaus hangar open [--print]               sign a browser on this computer in",
-  "  crewhaus hangar qr [--ascii] [--no-color]    reprint the running console's QR code",
+  "  crewhaus hangar qr [--ascii] [--no-color]    a fresh invite QR code for the running console",
   "  crewhaus hangar rotate-token [--socket-only | --tcp]",
   "                                               replace Home's own key",
   "",
@@ -192,11 +202,14 @@ const HANGAR_USAGE_LINES: readonly string[] = [
   "  key stays in its directory: it works only from this computer.",
   "  --host binds another interface: it REQUIRES auth and, because the console",
   `  is machine control over plain HTTP, also ${REMOTE_BIND_ENV}=1.`,
-  "  --no-auth is loopback-dev only.",
+  "  --no-auth is loopback-dev only, and is refused while a trusted proxy is",
+  "  set or anyone other than the owner has access.",
   "  --lan binds this machine's LAN address as well, and prints a QR code to",
   "  scan with a phone on the same network. It is its own opt-in — typing it",
-  `  is the deliberate act ${REMOTE_BIND_ENV} asks for. The code carries no`,
-  "  credential: the phone opens Home, over plain HTTP. --no-qr skips it.",
+  `  is the deliberate act ${REMOTE_BIND_ENV} asks for. The code is an invite:`,
+  "  it works once, for 10 minutes, and joins the phone as a viewer of this",
+  "  Home (--lan-role operator|maintainer|owner gives another role), over",
+  "  plain HTTP. --no-qr skips it.",
   "  --allow-host <name> adds a name Home answers to (a name in your hosts",
   "  file, say); any other name gets 421. Repeat it for more than one.",
   "  --read-only boots the console with every mutating route refused (403) —",
@@ -382,6 +395,7 @@ export const CLI_FAMILY = {
         port: "value",
         host: "value",
         lan: "boolean",
+        "lan-role": "value",
         "no-auth": "boolean",
         "no-open": "boolean",
         "no-qr": "boolean",
@@ -570,6 +584,8 @@ type ServeFlags = {
   readonly lan: boolean;
   /** Suppress the QR code a LAN bind would otherwise print. */
   readonly noQr: boolean;
+  /** The role the `--lan` QR code's invite joins with. */
+  readonly lanRole: LanRole;
   /** More names Home answers to (`--allow-host`, repeatable). */
   readonly allowHosts: readonly string[];
 };
@@ -594,6 +610,17 @@ function parseServeFlags(argv: readonly string[]): ServeFlags {
     }
   }
   const hostFlag = args.flags.get("host");
+  const lanRoleFlag = args.flags.get("lan-role");
+  if (lanRoleFlag !== undefined) {
+    if (typeof lanRoleFlag !== "string" || !isLanRole(lanRoleFlag)) {
+      throw new Error(
+        `hangar serve: --lan-role takes one of ${LAN_ROLES.join(", ")} (got "${String(lanRoleFlag)}")`,
+      );
+    }
+    if (args.flags.get("lan") !== true) {
+      throw new Error("hangar serve: --lan-role names the role the --lan invite gives — add --lan");
+    }
+  }
   // `--read-only-locked` is the strictly stronger posture, so it implies
   // `--read-only`: an operator who types only the lock must not get a
   // writable console because they omitted the weaker flag.
@@ -605,6 +632,7 @@ function parseServeFlags(argv: readonly string[]): ServeFlags {
     noAuth: args.flags.get("no-auth") === true,
     noOpen: args.flags.get("no-open") === true,
     noQr: args.flags.get("no-qr") === true,
+    lanRole: typeof lanRoleFlag === "string" && isLanRole(lanRoleFlag) ? lanRoleFlag : "viewer",
     smoke: args.flags.get("smoke") === true,
     readOnly: readOnlyLocked || args.flags.get("read-only") === true,
     readOnlyLocked,
@@ -714,6 +742,13 @@ async function runSmokeChecks(server: HangarServer, write: (line: string) => voi
       run: async () => {
         const res = await get("/api/harnesses");
         if (res.status !== 401) throw new Error(`status ${res.status} (expected 401)`);
+      },
+    },
+    {
+      name: "an undeclared /api path is refused (404)",
+      run: async () => {
+        const res = await asCli("/api/no-such-route", { authorization: `Bearer ${token}` });
+        if (res.status !== 404) throw new Error(`status ${res.status} (expected 404)`);
       },
     },
     {
@@ -838,6 +873,59 @@ export function qrBlockLines(url: string, options: QrBlockOptions = {}): string[
   return [...(caption !== undefined ? [caption, ""] : []), ...renderQrLines(qr, renderOptions)];
 }
 
+/** The roles a `--lan` invite can give. */
+export const LAN_ROLES = ["viewer", "operator", "maintainer", "owner"] as const;
+export type LanRole = (typeof LAN_ROLES)[number];
+
+function isLanRole(value: string): value is LanRole {
+  return (LAN_ROLES as readonly string[]).includes(value);
+}
+
+/** How long a `--lan` QR code's invite works. */
+export const LAN_INVITE_TTL_MS = 10 * 60_000;
+
+/** What the `--lan` QR code says above itself. */
+export const LAN_QR_CAPTION =
+  "scan to join Home on your phone — the code works once, for 10 minutes:";
+
+/**
+ * The link a `--lan` QR code encodes: Home's LAN address, the invite page, and the code in
+ * the fragment, which never reaches a server log. Pure.
+ */
+export function lanInviteUrl(baseUrl: string, code: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}/invite#c=${code}`;
+}
+
+/**
+ * A single-use invite for the `--lan` QR code, made as this OS user over Home's own
+ * records, and the link that carries it; or the reason none could be made.
+ */
+async function lanInvite(
+  baseUrl: string,
+  role: LanRole,
+  opts: HangarCommandOptions,
+): Promise<
+  { readonly ok: true; readonly url: string } | { readonly ok: false; readonly reason: string }
+> {
+  const made = await inviteAsLocalUser(
+    {
+      ...(opts.env !== undefined ? { env: opts.env } : {}),
+      ...(opts.now !== undefined ? { now: opts.now } : {}),
+      ...(opts.identity !== undefined ? { identity: opts.identity } : {}),
+      ...(opts.isPidAlive !== undefined ? { isPidAlive: opts.isPidAlive } : {}),
+    },
+    { role, scope: "home", ttlMs: LAN_INVITE_TTL_MS },
+  );
+  return made.ok ? { ok: true, url: lanInviteUrl(baseUrl, made.code) } : made;
+}
+
+/** The QR block for an invite link, and the link itself beneath it. */
+function inviteBlockLines(url: string, options: QrBlockOptions): string[] {
+  const block = qrBlockLines(url, { ...options, caption: LAN_QR_CAPTION });
+  // The link as text too, for a phone that cannot scan: it works once, like the code.
+  return block.includes(url) ? block : [...block, "", url];
+}
+
 /** The boxed boot summary (plain box-drawing, no color codes). It carries
  *  no credential: Home's own key is named by where it lives, never shown. */
 function summaryLines(
@@ -941,6 +1029,12 @@ async function hangarServe(
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
   const write = opts.write ?? ((line: string) => process.stdout.write(`${line}\n`));
   const hangarRoot = resolveHangarRoot(env);
+  if (flags.noAuth) {
+    // Turning sign-in off makes every local process the owner: never while Home answers
+    // to anyone else.
+    const refusal = noAuthRefusal(hangarRoot);
+    if (refusal !== undefined) throw new Error(`hangar serve: ${refusal}`);
+  }
 
   const alreadyRunning = (existing: HangarLock): Error =>
     new Error(
@@ -966,9 +1060,12 @@ async function hangarServe(
   }
 
   const version = cliVersion();
+  // Only the real server runs jobs with this process's own entry; a host that injects its
+  // own server (tests) runs another program as `Bun.main`.
+  const homeCrewhaus = opts.startServer === undefined ? ownCrewhausArgv(hangarRoot) : undefined;
   const server = (opts.startServer ?? startHangarServer)({
     port: flags.smoke ? 0 : (flags.port ?? DEFAULT_HANGAR_PORT),
-    ...(lan !== undefined ? { hostname: lan.address } : {}),
+    ...(lan !== undefined ? { hostname: lan.address, lanHost: lan.address } : {}),
     ...(flags.host !== undefined ? { hostname: flags.host } : {}),
     root: hangarRoot,
     ...(flags.noAuth ? { noAuth: true } : {}),
@@ -979,6 +1076,7 @@ async function hangarServe(
     env,
     now,
     ...(version !== undefined ? { version } : {}),
+    ...(homeCrewhaus !== undefined ? { homeCrewhaus } : {}),
   });
 
   // Claim the lock with the real bound port. The pre-boot check above makes
@@ -1023,16 +1121,20 @@ async function hangarServe(
 
   for (const line of summaryLines(server, registry?.list().length, lan)) write(line);
   // The QR goes last so it sits next to the shell prompt, which is the
-  // easiest place on the screen to point a phone at. It encodes the bare LAN
-  // address: no credential, so a photo of the screen gives nobody a way in.
+  // easiest place on the screen to point a phone at. It encodes a single-use
+  // invite that works for 10 minutes; `crewhaus hangar qr` makes another.
   if (lan !== undefined && !flags.noQr) {
     write("");
-    for (const line of qrBlockLines(server.url, {
-      color: wantsColor(opts, env),
-      columns: terminalColumns(opts),
-      caption: "scan to open Home on your phone:",
-    })) {
-      write(line);
+    const invite = await lanInvite(server.url, flags.lanRole, opts);
+    if (invite.ok) {
+      for (const line of inviteBlockLines(invite.url, {
+        color: wantsColor(opts, env),
+        columns: terminalColumns(opts),
+      })) {
+        write(line);
+      }
+    } else {
+      write(`no invite QR code: ${invite.reason} — run \`crewhaus access invite\` instead`);
     }
     write("");
   }
@@ -1214,15 +1316,18 @@ async function hangarOpen(
 // ---------------------------------------------------------------------------
 
 /**
- * Reprint the running console's QR code.
+ * A fresh invite QR code for the running console.
  *
- * Worth its own verb because the boot-time code scrolls away: a phone runs
- * out of battery, a second person wants in, the terminal gets cleared. It
- * reads the lock rather than the flags, so it reflects what the console is
- * actually bound to — including the honest answer when that is loopback and
- * no phone can reach it.
+ * Worth its own verb because the boot-time code scrolls away, works once and
+ * lasts 10 minutes: a second person wants in, the terminal gets cleared. Each
+ * call mints a new single-use viewer invite. It reads the lock rather than the
+ * flags, so it reflects what the console is actually bound to — including the
+ * honest answer when that is loopback and no phone can reach it.
  */
-function hangarQr(argv: readonly string[], opts: HangarCommandOptions): HangarCommandResult {
+async function hangarQr(
+  argv: readonly string[],
+  opts: HangarCommandOptions,
+): Promise<HangarCommandResult> {
   const args = parseVerbArgs("qr", argv, CLI_FAMILY.sub.qr.flags);
   refuseDotenvRoots(opts);
   const env = opts.env ?? process.env;
@@ -1248,13 +1353,18 @@ function hangarQr(argv: readonly string[], opts: HangarCommandOptions): HangarCo
     };
   }
 
-  // The bare address: the code carries no credential.
+  const invite = await lanInvite(lock.url, "viewer", opts);
+  if (!invite.ok) {
+    return {
+      lines: [`no invite could be made: ${invite.reason}`, "Try `crewhaus access invite`."],
+      exitCode: 1,
+    };
+  }
   return {
-    lines: qrBlockLines(lock.url, {
+    lines: inviteBlockLines(invite.url, {
       color: args.flags.get("no-color") === true ? false : wantsColor(opts, env),
       columns: terminalColumns(opts),
       ...(args.flags.get("ascii") === true ? { ascii: true } : {}),
-      caption: "scan to open Home on your phone:",
     }),
     exitCode: 0,
   };
@@ -1293,7 +1403,7 @@ export async function runHangarCommand(
     case "open":
       return await hangarOpen(argv.slice(1), opts);
     case "qr":
-      return hangarQr(argv.slice(1), opts);
+      return await hangarQr(argv.slice(1), opts);
     case "rotate-token": {
       const args = parseVerbArgs(
         "rotate-token",
@@ -1317,4 +1427,22 @@ export async function runHangarCommand(
         `unknown hangar verb "${verb}" (expected: ${Object.keys(CLI_FAMILY.sub).join(" | ")})`,
       );
   }
+}
+
+/**
+ * The argv that runs this `crewhaus` again for a Home job, taking no code or settings from
+ * the harness directory it runs in. A Bun-run `crewhaus` is given an empty `--config`
+ * (`/dev/null`, or an empty file in Home's directory on Windows).
+ */
+function ownCrewhausArgv(hangarRoot: string): string[] | undefined {
+  let emptyConfig = "/dev/null";
+  if (process.platform === "win32") {
+    emptyConfig = join(hangarRoot, "bunfig.empty.toml");
+    try {
+      if (!existsSync(emptyConfig)) writeFileSync(emptyConfig, "");
+    } catch {
+      return undefined;
+    }
+  }
+  return homeCrewhausArgv({ execPath: process.execPath, main: Bun.main, emptyConfig });
 }

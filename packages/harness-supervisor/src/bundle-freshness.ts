@@ -52,7 +52,14 @@ export type BundleFreshness = {
   readonly compiledWith?: string;
 };
 
-function readStamp(
+/**
+ * The stamp compile wrote into a bundle's manifest (`<outDir>/package.json` named
+ * {@link BUNDLE_MANIFEST_NAME}): the spec revision it compiled and the version that compiled
+ * it. Undefined when there is no such manifest or it names no spec revision.
+ *
+ * First consumers: the freshness check and the deployment a start records.
+ */
+export function readBundleStamp(
   outDir: string,
 ): { readonly specHash: string; readonly compiledWith?: string } | undefined {
   let parsed: unknown;
@@ -92,7 +99,7 @@ export function bundleFreshness(args: {
   readonly outDir: string;
   readonly entryPath: string;
 }): BundleFreshness {
-  const stamp = readStamp(args.outDir);
+  const stamp = readBundleStamp(args.outDir);
   if (stamp !== undefined) {
     const compiledWith =
       stamp.compiledWith !== undefined ? { compiledWith: stamp.compiledWith } : {};

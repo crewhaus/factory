@@ -165,6 +165,12 @@ export type FailureClass =
    *  below the declared floor with `on_fail: halt`. A CrewHaus-configured
    *  evidence floor, not a provider failure (3x band). */
   | "provability"
+  /** 0.9.0 — the harness's operator paused new work, and a run with no one at the
+   *  keyboard was refused before it started. Not a failure of the run. */
+  | "paused"
+  /** 0.9.0 — the harness's operator disabled it: a start, a daemon boot or new work
+   *  was refused. Not a failure of the run. */
+  | "disabled"
   /** Run input the prompt-injection check refused before any model call: a
    *  library classified the text where it entered the run (an API request, a
    *  queue payload, a Worker's chat messages) and the verdict was malicious,
@@ -235,6 +241,13 @@ export const EXIT_CODES = {
    *  `on_fail: halt`: its claims did not meet the declared evidence floor.
    *  Same 3x band rationale as `evaluation`: a CrewHaus-configured floor. */
   provability: 37,
+  /** 0.9.0 — the harness's operator disabled it: a start or a daemon boot refuses,
+   *  and so does new work a daemon was asked for. A supervisor never restarts it. */
+  disabled: 38,
+  /** 0.9.0 — the harness's operator paused new work: a non-interactive run refuses
+   *  before it starts. Never a daemon's exit: a paused daemon keeps running and
+   *  refuses new work. */
+  paused: 39,
   /** Tool or MCP failure (including MCP boot). */
   tool: 40,
   /** 0.9.0 control band (50-56): a refusal from the control plane, before or

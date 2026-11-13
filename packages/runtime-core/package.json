@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/runtime-core",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Minimal runtime imported by generated harness bundles",
   "main": "src/index.ts",
@@ -29,6 +29,7 @@
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/harness-registry": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/logging": "workspace:*",
     "@crewhaus/metrics-collector": "workspace:*",
     "@crewhaus/model-plan": "workspace:*",
     "@crewhaus/model-router": "workspace:*",
@@ -65,7 +66,6 @@
   },
   "devDependencies": {
     "@crewhaus/graph-engine": "workspace:*",
-    "@crewhaus/logging": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-plan": "workspace:*",
     "@crewhaus/tool-state": "workspace:*"

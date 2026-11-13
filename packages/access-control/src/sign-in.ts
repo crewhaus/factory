@@ -30,11 +30,14 @@ import {
   withLedgerLock,
 } from "@crewhaus/control-records";
 import { appendContained } from "@crewhaus/tool-safety/fs";
-import { ensureAccessSetUp } from "./access";
+import { checkDisplayName, ensureAccessSetUp, redeemInvite } from "./access";
 import { type BootTickets, createBootTickets } from "./bootstrap";
 import { readRevision, sealTornLine, writeRevision } from "./files";
-import { nextEpoch } from "./mutate";
+import { type AccessContext, nextEpoch, refusal, runMutation } from "./mutate";
 import { accessLedger, accessPaths } from "./paths";
+import type { AccessHarness } from "./projection";
+import type { GrantRow, PrincipalRow } from "./records";
+import { readScopedKey } from "./scoped";
 import { type Issued, type SealedOperation, sealSecret } from "./sealed";
 import { mintIssuedSecret, sha256Hex } from "./secrets";
 import {
@@ -82,13 +85,18 @@ export type SignInRefusalReason =
   | "signature_invalid"
   | "session_unknown"
   | "session_expired"
+  | "tab_only"
+  | "unknown"
+  | "expired"
+  | "revoked"
+  | "consumed"
   | "invalid"
   | "unavailable";
 
 export type SignInRefusal = {
   readonly ok: false;
-  readonly code: "unauthenticated" | "invalid" | "unavailable";
-  readonly status: 400 | 401 | 503;
+  readonly code: "unauthenticated" | "forbidden" | "invalid" | "unavailable";
+  readonly status: 400 | 401 | 403 | 503;
   readonly reason: SignInRefusalReason;
   /** One sentence for the person; names no secret. */
   readonly message: string;
@@ -102,12 +110,40 @@ export type SessionIssue = {
   readonly device: string;
 };
 
+/** A session a page on plain HTTP made for itself: nothing is sealed, and no secret comes back. */
+export type TabOnlyIssue = {
+  readonly ok: true;
+  readonly tabOnly: true;
+  readonly expiresAt: string;
+  readonly principal: string;
+};
+
+/** What joining from an invite takes: a device key and a seal, or, on plain HTTP, a secret the page made. */
+export type AcceptInviteInput =
+  | {
+      readonly code: string;
+      readonly displayName: string;
+      readonly deviceJwk: DeviceJwk;
+      readonly seal: DeviceJwk;
+    }
+  | {
+      readonly code: string;
+      readonly displayName: string;
+      /** 43 base64url characters the page made; the session's bearer is `cha_` and these. */
+      readonly sessionSecret: string;
+      /** The address the LAN door is bound to; the session is good only there. */
+      readonly bindHost: string;
+    };
+
 export type BearerCheck =
   | {
       readonly ok: true;
       readonly principal: string;
       readonly sessionRef: string;
-      readonly device: string;
+      /** Absent on a tab-only session. */
+      readonly device?: string;
+      readonly tabOnly?: true;
+      readonly bindHost?: string;
     }
   | { readonly ok: false; readonly reason: "session_unknown" | "session_expired" };
 
@@ -118,6 +154,8 @@ export type SignInOptions = {
   readonly now?: () => number;
   /** The OS user running Home, as `local:<user>@<host>`; set-up runs as it. */
   readonly localActor: string;
+  /** The registered harnesses, so a grant an invite gives reaches their approver lists. */
+  readonly harnesses?: () => readonly AccessHarness[];
 };
 
 export type SignInHandle = {
@@ -139,6 +177,11 @@ export type SignInHandle = {
     readonly seal: DeviceJwk;
   }): Promise<SessionIssue | SignInRefusal>;
   refresh(sessionRef: string, seal: DeviceJwk): Promise<SessionIssue | SignInRefusal>;
+  /**
+   * Join this Home from an invite: a new member, the invite's grant, and a session. The
+   * claim on the invite decides; nothing is written for a code that loses it.
+   */
+  acceptInvite(input: AcceptInviteInput): Promise<SessionIssue | TabOnlyIssue | SignInRefusal>;
   signOut(sessionRef: string): Promise<{ readonly signedOut: true } | SignInRefusal>;
   verifyBearer(secret: string): Promise<BearerCheck>;
   /** Call `cb` once when this session ends. Answers the unsubscribe. */
@@ -149,6 +192,8 @@ export type SignInHandle = {
   snapshot(): AccessSnapshotRead;
   /** The Hangar root's subject key, or `undefined` while there is none. */
   subjectKey(): Promise<CryptoKey | undefined>;
+  /** The key scoped tokens are checked with, or `undefined` while none was made. */
+  scopedKey(): Promise<CryptoKey | undefined>;
   /**
    * Record, at most once per peer per hour, that a proxy identity header from a request
    * that could not prove it came from the proxy was ignored. The line holds no address.
@@ -161,11 +206,33 @@ export type SignInHandle = {
 function refused(
   reason: SignInRefusalReason,
   message: string,
-  status: 400 | 401 | 503 = 401,
+  status: 400 | 401 | 403 | 503 = 401,
 ): SignInRefusal {
-  const code = status === 400 ? "invalid" : status === 503 ? "unavailable" : "unauthenticated";
+  const code =
+    status === 400
+      ? "invalid"
+      : status === 403
+        ? "forbidden"
+        : status === 503
+          ? "unavailable"
+          : "unauthenticated";
   return { ok: false, code, status, reason, message };
 }
+
+/** The 43 base64url characters of a session secret a page made for itself. */
+const SESSION_SECRET_RE = /^[A-Za-z0-9_-]{43}$/;
+
+const INVITE_REFUSALS: Readonly<Record<"unknown" | "expired" | "revoked" | "consumed", string>> =
+  Object.freeze({
+    unknown: "That invite is not one this Home made. Ask for a new one.",
+    expired: "That invite has expired. Ask for a new one.",
+    revoked: "That invite was withdrawn. Ask for a new one.",
+    consumed: "That invite has already been used. Ask for a new one.",
+  });
+
+/** Said when joining stopped after the invite was spent: the invite cannot be used again. */
+const JOIN_UNFINISHED =
+  "Joining could not be finished, and the invite cannot be used again. Ask the owner for a new invite.";
 
 const AGAIN = "Sign in again with a link from `crewhaus hangar open`.";
 
@@ -230,6 +297,29 @@ async function verifyDeviceSignature(
   }
 }
 
+/** Whether both keys import as P-256 points: checked before an invite is spent on them. */
+async function usableKeys(device: DeviceJwk, seal: DeviceJwk): Promise<boolean> {
+  try {
+    await crypto.subtle.importKey(
+      "jwk",
+      { kty: "EC", crv: "P-256", x: device.x, y: device.y },
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["verify"],
+    );
+    await crypto.subtle.importKey(
+      "jwk",
+      { kty: "EC", crv: "P-256", x: seal.x, y: seal.y },
+      { name: "ECDH", namedCurve: "P-256" },
+      false,
+      [],
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 type Index = {
   readonly key: string;
   readonly bySha: ReadonlyMap<string, SessionRow>;
@@ -264,6 +354,7 @@ export function openSignIn(hangarRoot: string, options: SignInOptions): SignInHa
   let index: Index | undefined;
   let snapshotCache: { readonly key: string; readonly read: AccessSnapshotRead } | undefined;
   let keyCache: CryptoKey | undefined;
+  let scopedKeyCache: CryptoKey | undefined;
 
   const revisionKey = (): string => {
     const revision = readRevision(hangarRoot);
@@ -304,7 +395,10 @@ export function openSignIn(hangarRoot: string, options: SignInOptions): SignInHa
   /** Why a session row no longer counts at `at`, or `undefined` while it does. */
   const sessionEnd = (row: SessionRow, devices: ReadonlyMap<string, DeviceRow>, at: number) => {
     if (row.state !== "active") return "revoked" as const;
-    if (devices.get(row.device)?.state !== "active") return "revoked" as const;
+    // A tab-only session has no device to withdraw; it ends with its deadlines.
+    if (row.tabOnly !== true && devices.get(row.device ?? "")?.state !== "active") {
+      return "revoked" as const;
+    }
     if (Date.parse(row.expiresAt) <= at) return "expired" as const;
     const last = lastUse.get(row.id) ?? Date.parse(row.at);
     if (at - last >= SIGN_IN_LIMITS.sessionIdleMs) return "expired" as const;
@@ -540,6 +634,13 @@ export function openSignIn(hangarRoot: string, options: SignInOptions): SignInHa
       if (row === undefined || current === undefined) {
         return refused("session_unknown", `This session is not one this Home knows. ${AGAIN}`);
       }
+      if (row.tabOnly === true || row.device === undefined) {
+        return refused(
+          "tab_only",
+          "A session made on a page that is not encrypted cannot be renewed. Ask for a new invite when it ends.",
+          403,
+        );
+      }
       const end = sessionEnd(row, current.devices, now());
       if (end !== undefined) {
         return refused(
@@ -569,6 +670,124 @@ export function openSignIn(hangarRoot: string, options: SignInOptions): SignInHa
         }
       }
       return answer;
+    },
+
+    async acceptInvite(input) {
+      const tabOnly = typeof input === "object" && input !== null && "sessionSecret" in input;
+      if (typeof input?.code !== "string" || input.code === "") {
+        return refused("invalid", "The request does not carry an invite code.", 400);
+      }
+      if (tabOnly) {
+        if (
+          typeof input.sessionSecret !== "string" ||
+          !SESSION_SECRET_RE.test(input.sessionSecret) ||
+          typeof input.bindHost !== "string" ||
+          input.bindHost === ""
+        ) {
+          return refused("invalid", "The request does not carry a secret this page made.", 400);
+        }
+      } else if (
+        !isDeviceJwk(input.deviceJwk) ||
+        !isDeviceJwk(input.seal) ||
+        !(await usableKeys(input.deviceJwk, input.seal))
+      ) {
+        return refused("invalid", "The request does not carry two P-256 public keys.", 400);
+      }
+      const name = checkDisplayName(String(input.displayName ?? ""));
+      if (typeof name !== "string") return refused("invalid", name.reason, 400);
+      // The principal is minted first so the claim on the invite names it; the claim decides.
+      const principal = mintId("prn");
+      const redeemed = await redeemInvite(hangarRoot, input.code, { now, principal });
+      if (!redeemed.ok) {
+        if (redeemed.code === "unreadable" || redeemed.code === "io-error") {
+          return refused(
+            "unavailable",
+            "Home's access records could not be changed. Try the invite again.",
+            503,
+          );
+        }
+        return refused(redeemed.code, INVITE_REFUSALS[redeemed.code]);
+      }
+      const invite = redeemed.invite;
+      // The claim is this caller's: only now are the member, its name and its grant written.
+      const ctx: AccessContext = {
+        root: hangarRoot,
+        now,
+        harnesses: options.harnesses ?? (() => []),
+        domains: new Map(),
+      };
+      const joined = await runMutation<{ readonly principal: string }>(
+        ctx,
+        undefined,
+        (state) => {
+          const snapshot = state.snapshot;
+          if (snapshot === undefined) {
+            return refusal("not-set-up", "Nobody else has access to this Home yet.");
+          }
+          const member: PrincipalRow = {
+            id: principal,
+            kind: "member",
+            state: "active",
+            at: state.at,
+            by: principal,
+          };
+          const grant: GrantRow = {
+            id: mintId("grt"),
+            principal,
+            role: invite.role,
+            scope: invite.scope,
+            grantedBy: invite.createdBy,
+            state: "active",
+            at: state.at,
+            by: principal,
+          };
+          return {
+            rows: [
+              { kind: "principals", row: member },
+              { kind: "grants", row: grant },
+            ],
+            subjects: {
+              v: 1,
+              principals: { ...snapshot.subjects.principals, [principal]: { displayName: name } },
+              links: { ...snapshot.subjects.links },
+            },
+            result: { principal },
+          };
+        },
+        { projections: true, setup: { by: () => principal } },
+      );
+      if (!joined.ok) return refused("unavailable", JOIN_UNFINISHED, 503);
+      if (tabOnly) {
+        const at = now();
+        const row: SessionRow = {
+          id: mintId("crd"),
+          state: "active",
+          at: new Date(at).toISOString(),
+          by: principal,
+          principal,
+          tabOnly: true,
+          bindHost: input.bindHost,
+          sha256: await sha256Hex(`cha_${input.sessionSecret}`),
+          expiresAt: new Date(at + SIGN_IN_LIMITS.sessionMaxMs).toISOString(),
+        };
+        const written = await write([{ kind: "sessions", row }], false);
+        if (!written.ok) return refused("unavailable", JOIN_UNFINISHED, 503);
+        lastUse.set(row.id, at);
+        return { ok: true, tabOnly: true, expiresAt: row.expiresAt, principal };
+      }
+      const device: DeviceRow = {
+        id: mintId("dev"),
+        state: "active",
+        at: new Date(now()).toISOString(),
+        by: principal,
+        principal,
+        deviceJwk: { kty: "EC", crv: "P-256", x: input.deviceJwk.x, y: input.deviceJwk.y },
+      };
+      const { answer } = await issue(
+        { principal, device: device.id, seal: input.seal, enrol: device },
+        "auth.acceptInvite",
+      );
+      return answer.ok ? answer : refused("unavailable", JOIN_UNFINISHED, 503);
     },
 
     async signOut(sessionRef) {
@@ -616,7 +835,14 @@ export function openSignIn(hangarRoot: string, options: SignInOptions): SignInHa
         return { ok: false, reason: end === "expired" ? "session_expired" : "session_unknown" };
       }
       lastUse.set(row.id, at);
-      return { ok: true, principal: row.principal, sessionRef: row.id, device: row.device };
+      return {
+        ok: true,
+        principal: row.principal,
+        sessionRef: row.id,
+        ...(row.device !== undefined ? { device: row.device } : {}),
+        ...(row.tabOnly === true ? { tabOnly: true as const } : {}),
+        ...(row.bindHost !== undefined ? { bindHost: row.bindHost } : {}),
+      };
     },
 
     onEnd(sessionRef, cb) {
@@ -649,6 +875,11 @@ export function openSignIn(hangarRoot: string, options: SignInOptions): SignInHa
       const read = await readDigestKey(hangarRoot, { file: paths.subjectKey });
       if (read.state === "present") keyCache = read.hmac;
       return keyCache;
+    },
+
+    async scopedKey() {
+      scopedKeyCache ??= await readScopedKey(hangarRoot);
+      return scopedKeyCache;
     },
 
     async noteIgnoredIdentity(listener, address) {

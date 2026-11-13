@@ -1,4 +1,10 @@
-import type { PermissionRule, RuleType } from "@crewhaus/permission-engine";
+import {
+  type NarrowPattern,
+  type NarrowRefusal,
+  type PermissionRule,
+  type RuleType,
+  narrowPatternFor,
+} from "@crewhaus/permission-engine";
 import {
   type OperativeArg,
   type RegisteredTool,
@@ -36,9 +42,7 @@ import {
   OPERATIVE_ARG_FIELDS as MATCHER_OPERATIVE_ARG_FIELDS,
   type OperativeValue,
   type OperativeValueKind,
-  compilePattern,
   escapeGlobLiteral,
-  matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
 import { type SessionEvents, payloadOf } from "./advise-rules";
 
@@ -66,15 +70,7 @@ import { type SessionEvents, payloadOf } from "./advise-rules";
  *   covers, and a proposal never writes one;
  * - `varied` — the calls acted on different places.
  */
-export type UnscopedReason =
-  | "undeclared"
-  | "no-scoping-argument"
-  | "not-parsed"
-  | "no-value"
-  | "several-places"
-  | "not-representable"
-  | "every-value"
-  | "varied";
+export type UnscopedReason = NarrowRefusal | "varied";
 
 export type AskAggregate = {
   readonly toolName: string;
@@ -149,24 +145,14 @@ const unscoped = (reason: UnscopedReason): CallReading => ({ kind: "unscoped", r
  * the tool's schema when the tool is at hand, the declared fields read from
  * it, and each value canonicalised (a path with `..` collapsed, a URL in its
  * parsed form). An undeclared tool falls back to the matcher's name table,
- * as it always has.
+ * as it always has. The value and the rule it proposes come from
+ * permission-engine's `narrowPatternFor`, the one derivation the decision
+ * service's standing rules use too.
  */
 function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup): CallReading {
   const info = lookup?.(toolName);
   const declared = info?.operativeArgs;
-  if (declared === undefined) {
-    const fields = OPERATIVE_ARG_FIELDS[toolName];
-    if (fields === undefined) return unscoped("undeclared");
-    if (input === null || typeof input !== "object") return unscoped("no-value");
-    const record = input as Record<string, unknown>;
-    for (const f of fields) {
-      const v = record[f];
-      if (typeof v === "string" && v.length > 0) {
-        return grantsItsCall(representable(v), toolName, (p) => matchesPattern(p, toolName, input));
-      }
-    }
-    return unscoped("no-value");
-  }
+  if (declared === undefined) return readingOf(narrowPatternFor(toolName, input, undefined));
   if (declared.length === 0) return unscoped("no-scoping-argument");
   let values: ReadonlyArray<OperativeValue>;
   if (info?.tool !== undefined) {
@@ -186,54 +172,16 @@ function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup):
   } else {
     values = operativeValuesOf(declared, input) ?? [];
   }
-  // A relocating field's default is read by a deny or ask only; an allow —
-  // what this proposes — is about the record the call named.
-  values = values.filter((v) => v.restrictOnly !== true);
-  if (values.length === 0) return unscoped("no-value");
-  if (values.length > 1) return unscoped("several-places");
-  const only = values[0] as OperativeValue;
-  const value = only.canonical[0];
-  if (only.outsideWorkspace === true || value === undefined) return unscoped("not-representable");
-  // `KvList {namespace: "scratch", prefix: "a"}` lists every key starting
-  // with `a`: its canonical `scratch/a*` is not a literal, and the escaped
-  // rule `KvList(scratch/a\*)` would never fire for the call it came from.
-  // A Glob pattern likewise stands for every path it lists.
-  if (only.standsForAny !== undefined || only.globPattern === true) {
-    return unscoped("every-value");
-  }
-  const allowOnly = values;
-  return grantsItsCall(representable(value, only.kind), toolName, (p) =>
-    matchesPattern(p, toolName, input, { operativeValues: allowOnly }),
-  );
+  return readingOf(narrowPatternFor(toolName, input, values));
 }
 
-/**
- * The reading, when the rule it proposes grants the call it came from, the
- * way the engine reads that call — else `not-representable`. A proposal that
- * never fires would keep the human being asked with no idea why.
- */
-function grantsItsCall(
-  reading: CallReading,
-  toolName: string,
-  grants: (pattern: ReturnType<typeof compilePattern>) => boolean,
-): CallReading {
-  if (reading.kind !== "value") return reading;
-  try {
-    const pattern = compilePattern(`${toolName}(${escapeGlobLiteral(reading.value)})`);
-    return grants(pattern) ? reading : unscoped("not-representable");
-  } catch {
-    return unscoped("not-representable");
-  }
-}
-
-/**
- * A value the `Tool(arg)` grammar can carry. A parenthesis is refused: the
- * pattern is split at its first `(`, and a reviewer reading a proposal with
- * nested parentheses cannot tell where the argument ends.
- */
-function representable(value: string, valueKind?: OperativeValueKind): CallReading {
-  if (value.includes("(") || value.includes(")")) return unscoped("not-representable");
-  return { kind: "value", value, ...(valueKind !== undefined ? { valueKind } : {}) };
+function readingOf(narrow: NarrowPattern): CallReading {
+  if ("refused" in narrow) return unscoped(narrow.refused);
+  return {
+    kind: "value",
+    value: narrow.value,
+    ...(narrow.valueKind !== undefined ? { valueKind: narrow.valueKind } : {}),
+  };
 }
 
 /** A justification-gated tool is logged with the `justification` the runtime

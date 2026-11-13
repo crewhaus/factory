@@ -31,6 +31,7 @@
  */
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import type { LocalIdentity } from "@crewhaus/access-control";
 import { EXIT_FOR_ERROR, EXIT_FOR_REJECTED_RECEIPT } from "@crewhaus/control-contract";
 import { ensureDigestKey, readHarnessIdentity } from "@crewhaus/control-records";
 import {
@@ -118,6 +119,8 @@ export type DaemonCommandOptions = {
   readonly followPollMs?: number;
   /** `fetch` for the control.v1 calls; injected in tests. */
   readonly fetch?: typeof fetch;
+  /** The local user this head acts as; injected in tests. Defaults to this process's. */
+  readonly identity?: LocalIdentity;
 };
 
 const DAEMON_USAGE_LINES: readonly string[] = [
@@ -325,7 +328,23 @@ export function supervisorFor(
     ops,
     // A person's start from this head: `daemon start|restart <dir>` and `daemon submit` may
     // record and activate the build on disk; a group member runs only an active build.
-    admit: async ({ harnessDir, target, entry, ledgerAbsent }) => {
+    admit: async ({ harnessDir, target, entry, ledgerAbsent, decideOnly }) => {
+      const registryId = openRegistrySafe(opts)
+        ?.list()
+        .find((entry) => entry.dir === harnessDir)?.id;
+      if (decideOnly) {
+        // A restart asking before it stops the daemon: decide, write nothing (no digest
+        // key is created and no actor is resolved).
+        return admitExplicitStart(harnessDir, target, {
+          head,
+          entry,
+          ledgerAbsent,
+          actor: "",
+          decideOnly: true,
+          ...(registryId !== undefined ? { registryId } : {}),
+          ...(opts.clock !== undefined ? { now: opts.clock.now } : {}),
+        });
+      }
       const key = await ensureDigestKey(harnessDir);
       if (key.state !== "present") {
         return {
@@ -334,9 +353,6 @@ export function supervisorFor(
         };
       }
       const actor = await storedActorFor(resolveHangarRoot(env), currentLocalIdentity(), key.hmac);
-      const registryId = openRegistrySafe(opts)
-        ?.list()
-        .find((entry) => entry.dir === harnessDir)?.id;
       return admitExplicitStart(harnessDir, target, {
         head,
         entry,
@@ -518,7 +534,7 @@ function controlLines(
  * did. A re-run it starts after a crash goes through this file's own supervisor, with
  * preflight on and nothing forced.
  */
-function directControl(opts: DaemonCommandOptions): ControlService {
+export function directControl(opts: DaemonCommandOptions): ControlService {
   const env = opts.env ?? process.env;
   return wireControl(
     {
@@ -531,7 +547,7 @@ function directControl(opts: DaemonCommandOptions): ControlService {
         const outcome = await control.drain(controlTargetFor(resolveHarness(dir, opts)));
         if (!outcome.ok) throw new Error(outcome.reason);
       },
-      identity: currentLocalIdentity(),
+      identity: opts.identity ?? currentLocalIdentity(),
       now: (opts.clock ?? systemClock).now,
       probe: withOwnStartTime(opts.ops ?? createProcessOps()),
     },
@@ -547,12 +563,25 @@ const recoveredHarnesses = new Set<string>();
  * `harness.json` carries; otherwise the receipt names itself. Only reads.
  */
 function targetFor(harness: ResolvedHarness, opts: DaemonCommandOptions): string | undefined {
+  const id = harnessIdOf(harness.dir, opts);
+  return id !== undefined ? `home/harness/${id}` : undefined;
+}
+
+/** A harness directory's id: its registry row's, else the one its `harness.json` carries. Only reads. */
+export function harnessIdOf(dir: string, opts: DaemonCommandOptions): string | undefined {
   const entry = openRegistrySafe(opts)
     ?.list()
-    .find((e) => e.dir === harness.dir);
-  if (entry !== undefined) return `home/harness/${entry.id}`;
-  const identity = readHarnessIdentity(harness.dir);
-  return identity.state === "present" ? `home/harness/${identity.identity.id}` : undefined;
+    .find((e) => e.dir === dir);
+  if (entry !== undefined) return entry.id;
+  const identity = readHarnessIdentity(dir);
+  return identity.state === "present" ? identity.identity.id : undefined;
+}
+
+/** Every registered harness whose directory is there now, for a head that must find one. */
+export function liveHarnessDirs(opts: DaemonCommandOptions): readonly string[] {
+  return (openRegistrySafe(opts)?.list() ?? [])
+    .filter((entry) => entry.missingSince === null && existsSync(entry.dir))
+    .map((entry) => entry.dir);
 }
 
 type Settled = { readonly result: DaemonCommandResult; readonly settle: Settlement };
@@ -611,6 +640,11 @@ async function receipted(
 // ---------------------------------------------------------------------------
 // start / restart
 // ---------------------------------------------------------------------------
+
+/** A restart refused before it stopped anything: the daemon keeps running. */
+function keptLine(name: string, reason: string): string {
+  return `${name}: not restarted, it keeps running — ${reason}`;
+}
 
 async function daemonStart(
   argv: readonly string[],
@@ -718,6 +752,14 @@ async function daemonStart(
               settle,
               result: {
                 lines: [
+                  ...(result.kept === true
+                    ? [
+                        keptLine(
+                          harness.specName,
+                          `preflight refused: ${result.gate.refused.map((i) => i.message).join("; ")}`,
+                        ),
+                      ]
+                    : []),
                   ...formatGateRefusal(result.gate),
                   "",
                   "  re-run with --force to wave through the forceable items,",
@@ -738,14 +780,24 @@ async function daemonStart(
             return {
               settle,
               result: {
-                lines: [`${harness.specName}: ${result.message}`],
+                lines: [
+                  result.kept === true
+                    ? keptLine(harness.specName, result.message)
+                    : `${harness.specName}: ${result.message}`,
+                ],
                 exitCode: EXIT_FOR_REJECTED_RECEIPT,
               },
             };
           case "plan-failed":
             return {
               settle,
-              result: { lines: [`${harness.specName}: ${result.error.message}`], exitCode: 1 },
+              result:
+                result.kept === true
+                  ? {
+                      lines: [keptLine(harness.specName, result.error.message)],
+                      exitCode: EXIT_FOR_REJECTED_RECEIPT,
+                    }
+                  : { lines: [`${harness.specName}: ${result.error.message}`], exitCode: 1 },
             };
         }
       } finally {
@@ -1332,7 +1384,7 @@ async function daemonStatus(
   // files does this daemon read" is exactly the question an operator has
   // when a key resolves from a shared fleet file rather than a local one,
   // and a harness with no bundle yet still answers it.
-  const envChain = loadEnvChain(harness.dir);
+  const envChain = loadEnvChain(harness.dir, { nodeEnv: (opts.env ?? process.env)["NODE_ENV"] });
   const settings = readManagerSettings(harness.dir);
   const hookRuns = readHookRunLog(harness.dir);
   const freshness = bundleStaleness(harness.dir, harness.target);

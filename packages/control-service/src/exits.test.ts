@@ -9,12 +9,12 @@ describe("the control exit band", () => {
     }
   });
 
-  test("every exit is one EXIT_CODES documents, except exactly the operator-state pair", () => {
+  test("every exit is one EXIT_CODES documents", () => {
     const documented = new Set<number>(Object.values(EXIT_CODES));
     const outside = Object.entries(EXIT_FOR_ERROR).filter(([, exit]) => !documented.has(exit));
-    // `paused` and `disabled` take their codes when the operator controls land in the
-    // runtime's table; until then they are the only two outside it.
-    expect(Object.fromEntries(outside)).toEqual({ paused: 39, disabled: 38 });
+    expect(Object.fromEntries(outside)).toEqual({});
+    expect(EXIT_FOR_ERROR.paused).toBe(EXIT_CODES.paused);
+    expect(EXIT_FOR_ERROR.disabled).toBe(EXIT_CODES.disabled);
     expect(documented.has(EXIT_FOR_REJECTED_RECEIPT)).toBe(true);
   });
 

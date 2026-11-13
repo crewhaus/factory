@@ -714,9 +714,10 @@ function defaultClientFactory(info: { name: string; version: string }): Client {
 
 function defaultTransportFactory(config: McpServerConfig): McpClientLikeTransport {
   if (config.transport === "stdio") {
+    const launch = stdioLaunch(config.command, config.args);
     return new StdioClientTransport({
-      command: config.command,
-      args: config.args ? [...config.args] : undefined,
+      command: launch.command,
+      args: launch.args,
       // `env: undefined` makes the SDK fall back to its safe default
       // (DEFAULT_INHERITED_ENV_VARS). When the config DOES declare env,
       // merge it ON TOP of that same default set — the SDK treats an
@@ -787,6 +788,24 @@ function streamableHttpTransport(
     opts.requestInit = { headers: { ...config.headers } };
   }
   return new StreamableHTTPClientTransport(new URL(config.url), opts);
+}
+
+/**
+ * How a stdio server is launched. A server started with `bun` or `bunx` (`bun x` included)
+ * gets `--no-env-file` first, so it reads no env file of the directory it runs in. Such a
+ * server's environment is exactly what the daemon gives it: the SDK's default names and the
+ * server's own `env`.
+ */
+export function stdioLaunch(
+  command: string,
+  args: readonly string[] | undefined,
+): { readonly command: string; readonly args: string[] | undefined } {
+  const base = (command.split(/[\\/]/).at(-1) ?? "").toLowerCase();
+  const isBun = ["bun", "bun.exe", "bunx", "bunx.exe"].includes(base);
+  if (!isBun || args?.[0] === "--no-env-file") {
+    return { command, args: args !== undefined ? [...args] : undefined };
+  }
+  return { command, args: ["--no-env-file", ...(args ?? [])] };
 }
 
 /**

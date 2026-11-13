@@ -319,8 +319,16 @@ test(
         .filter((l) => l !== "")
         .map((l) => JSON.parse(l) as { kind: string; payload: Record<string, unknown> })
         .filter((r) => r.kind === "gateway_request");
-      // Every control call is evidenced — including the 401 we opened with.
-      expect(records.length).toBeGreaterThanOrEqual(6);
+      // Every refused call and every POST is evidenced — the 401 we opened
+      // with, the two wakes, the unarmed lane's wake and the drain — and a
+      // successful read appends nothing.
+      expect(records).toHaveLength(5);
+      expect(
+        records.filter(
+          (r) =>
+            r.payload["status"] === 200 && /\/(?:healthz|status)$/.test(String(r.payload["route"])),
+        ),
+      ).toEqual([]);
       expect(records.some((r) => r.payload["status"] === 401)).toBe(true);
       expect(records.some((r) => r.payload["sessionId"] === sessionId)).toBe(true);
       // The bearer is never part of the record.

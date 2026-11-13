@@ -819,6 +819,17 @@ export function describeFleetExit(
       class: "crewhaus_budget",
       title: "run stopped by the configured budget cap",
     },
+    [EXIT_CODES.timeout]: { class: "timeout", title: "stopped by its configured time limit" },
+    [EXIT_CODES.evaluation]: {
+      class: "evaluation",
+      title: "stopped because its answer failed the configured evaluation",
+    },
+    [EXIT_CODES.provability]: {
+      class: "provability",
+      title: "stopped because its answer lacked the evidence its spec requires",
+    },
+    [EXIT_CODES.disabled]: { class: "disabled", title: "disabled by its operator" },
+    [EXIT_CODES.paused]: { class: "paused", title: "paused by its operator" },
     [EXIT_CODES.tool]: { class: "tool", title: "tool / MCP failure" },
     // Not breakage — the run PARKED awaiting a human decision, which is what
     // `EXIT_CODES.approval_pending`'s own docblock says this surface should

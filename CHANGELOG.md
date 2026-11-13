@@ -45,11 +45,16 @@ these on: they reach every harness that uses what each one names.
 
 - **Daemon verbs and Home's changes leave a receipt, and long CLI verbs take
   turns with Home.** `crewhaus daemon start`, `stop`, `restart` and `drain`,
-  and every change made in Home, first write a receipt under the harness's
+  `crewhaus approvals grant`, `deny`, `supersede` and `revoke`, and every
+  change made in Home, first write a receipt under the harness's
   `.crewhaus/run/control/` (ids and states, never arguments or secrets). A
   verb whose receipt cannot be written does nothing and exits 52. `crewhaus
   daemon start` and `restart` exit 55, where they exited 1, when the start is
-  refused: already running, or stopped by preflight. `compile`, `eval`,
+  refused: already running, or stopped by preflight. `crewhaus approvals`
+  exits 51 or 55, where it exited 1, when it refuses a decision: 51 when the
+  person may not decide it, 55 for an unknown or malformed id, a request
+  already decided or withdrawn, a reason it does not know, or `deny --always`.
+  `compile`, `eval`,
   `optimize`, `flywheel run` and `dream run` wait up to 10 seconds while a
   Home job changes the same harness, then exit 53 naming it; a Home job that
   meets one of them fails the same way. A Home write whose body is not a JSON
@@ -102,7 +107,8 @@ these on: they reach every harness that uses what each one names.
   as before, and a Thredz-backed wiki is not affected.
 
 - **The runtime-state floor also covers the staged proposals, the routing
-  freeze marker, the scope-audit baseline and the security corpus.** Beside
+  freeze marker, the scope-audit baseline, the security corpus and the SLO
+  intake gate.** Beside
   `.crewhaus/sessions`, `.crewhaus/tool-results` and `.crewhaus/proofs`, no
   permission rule lets an agent's tool write: `.crewhaus/run` (the runfiles, logs
   and control files a daemon keeps there); the settings file
@@ -115,8 +121,9 @@ these on: they reach every harness that uses what each one names.
   exactly that file, the proposals staged for a person to adopt,
   `.crewhaus/proposals`, the routing freeze marker
   `.crewhaus/routing/freeze.json`, the scope-audit baseline
-  `.crewhaus/scope-audit/baseline.json` and the security corpus
-  `.crewhaus/security-corpus/corpus.json`, exactly each of those files; the
+  `.crewhaus/scope-audit/baseline.json`, the security corpus
+  `.crewhaus/security-corpus/corpus.json` and the SLO intake gate
+  `.crewhaus/slo/intake.json`, exactly each of those files; the
   durable-execution idempotency records,
   `.crewhaus/idempotency` and the directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>`
   names; the continuity store's own files under `.crewhaus/state/<spec>/`,
@@ -127,7 +134,14 @@ these on: they reach every harness that uses what each one names.
   them); the working directory's `.env`,
   `.env.local`, `.env.development`, `.env.development.local`, `.env.production`,
   `.env.production.local`, `.env.test` and `.env.test.local`, and any file
-  `manager.envFiles` names; its `bunfig.toml` and `.npmrc`; the `approvals.jsonl`
+  `manager.envFiles` names; its `bunfig.toml` and `.npmrc`; the files a hook in
+  `.crewhaus/settings.json` (`manager.hooks` or `hooks`) or in the spec names
+  directly, exactly those files (a command word written as a path, and the
+  script a shell or an interpreter it starts is given, read through `cd`,
+  `sh -c` and wrappers such as `env`, `exec` and `timeout`; not a word built
+  when the hook runs, a here-document, a package script or a module, or what
+  that script runs in turn); for `crewhaus run` or `crewhaus runs resume` of
+  a spec in another directory, that directory's `.crewhaus/run/spec`; the `approvals.jsonl`
   beside session logs that `CREWHAUS_SESSION_DIR` puts at the working directory;
   a managed run's whole tenants root; and Hangar's directory and registry:
   `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always, and wherever the
@@ -260,7 +274,95 @@ these on: they reach every harness that uses what each one names.
 - **A supervised or Home start uses a harness's own
   `node_modules/.bin/crewhaus` only when it resolves inside the harness
   directory**, otherwise the `crewhaus` on `PATH`. Home's jobs for a harness
-  not adopted on this machine use the `crewhaus` on `PATH`.
+  not adopted on this machine use Home's own `crewhaus`.
+
+- **A restart that would be refused leaves the daemon running.** `crewhaus
+  daemon restart` and Home's Restart first check what the new start would
+  refuse: its plan, preflight (a directory that holds the home directory among
+  it) and the build it would run. When one refuses, nothing is stopped and the
+  refusal says the daemon keeps running; Home's answer carries `running: true`.
+  Ports the daemon holds are checked after it stops, and a start that compiles
+  first decides its build after the compile.
+
+- **While a deployment is active, an automatic restart of `crewhaus run` or
+  `serve --mcp` runs only that deployment's spec.** When the saved spec is not
+  the active revision, the restart stays stopped and says why; activate it with
+  `crewhaus deploy activate`, or restore the active spec. With no active
+  deployment, the saved spec runs.
+
+- **A Home job in a directory that holds the home directory needs the same
+  acknowledgement a start needs, for each job.** Home answers 409 with the
+  acknowledgeable `workspace.holds-home` item until the request acknowledges it;
+  the acknowledgement covers that one job and is not kept. A job with no harness
+  is checked in Home's own directory.
+
+- **Home's jobs and spec checks use a harness's own `crewhaus` and spec library
+  only after `crewhaus harness adopt` on this machine.** Until then, Home runs
+  the harness's jobs with its own `crewhaus`, which reads no `bunfig.toml` from
+  the harness directory, and checks its spec with Home's own schema. A harness
+  registered before this release keeps group start without adopting it. A Home
+  job runs with only the absolute entries of `PATH`.
+
+- **A supervised daemon's environment comes only from the manager:** it reads
+  the env files Bun reads (`.env`, `.env.<mode>`, `.env.local`,
+  `.env.<mode>.local`, by `NODE_ENV`), leaves out loader settings, and the
+  daemon reads no env file itself. A loader setting that an env file in the
+  harness or the manager's directory names is left out whatever its value. The
+  mode is `production` or `test` when `NODE_ENV` names it and `development`
+  otherwise, and `test` reads no `.env.local`. The compiled daemon runs as
+  `bun --no-env-file`, and so does a stdio MCP server started with `bun` or
+  `bunx`: give such a server what it needs through its `env`.
+
+- **A build runs from regular files only.** A start refuses a build whose files
+  hold a link, naming the path, and neither a start nor `crewhaus compile`
+  records one. Replace the link with the file, then run `crewhaus compile` and
+  `crewhaus deploy activate`.
+
+- **A daemon's control port can stop a run and re-read its operator settings,
+  and every daemon records when it was last alive.** `crewhaus.control.v1`
+  adds `POST /control/v1/runs/<run>/cancel`, `POST /control/v1/operator/reload`
+  and `POST /control/v1/runs/claim`, and `/status` shows the pause and disable
+  state, the controls the daemon supports and its active runs. Each daemon
+  writes `.crewhaus/run/control-heartbeat.json` every 15 seconds, with or
+  without a control port. A successful `/healthz` or `/status` call is not
+  written to the audit log; a refused call and every other call are. A control
+  port bound beyond this computer with `CREWHAUS_CONTROL_BIND` opens only with a
+  token set in `CREWHAUS_CONTROL_TOKEN`. Recompile a daemon to pick this up.
+
+- **Daemons honour pause and disable.** A daemon reads
+  `.crewhaus/run/control/operator.json` before new work starts. While it is
+  paused, scheduled lanes skip their ticks; a chat channel answers a new
+  message with "Paused by its operator; this message was not processed." (or
+  nothing, for a quiet pause) and keeps answering Slack's URL check and button
+  clicks; the managed API answers `runs.create` and `runs.continue` with
+  `paused` (HTTP 503 with `Retry-After`); a batch worker takes no jobs; a crew
+  or graph does not start its first step. Work already running finishes, and a
+  one-time grant lets its conversation run once more to pick up the approved
+  call. While it is disabled the same places refuse with `disabled`, and a
+  daemon started while disabled exits 38. A record that cannot be read counts
+  as paused and stops a start. SLO recovery lifts neither. A voice daemon
+  honours disable when it starts. The supervisor does not restart a daemon that
+  exits 34 (time limit), 35 (evaluation), 37 (provability) or 38 (disabled),
+  and the exit-code table gains 38 and 39. Recompile a daemon to pick this up.
+
+- **`Bash` and `RunCommand` children carry `CREWHAUS_AGENT_TOOL`.** Every command
+  `Bash` runs and every program `RunCommand`, `RunPipeline`, `Retry` and
+  `ProcessStart` start has `CREWHAUS_AGENT_TOOL` set to the tool's name, whatever
+  the call's `envSet` says, and `crewhaus approvals` refuses to decide, supersede,
+  defer or revoke under it (exit 51). It marks a tool's child; it is not a
+  boundary. `Bash` hands its command the environment as it is when the command
+  starts, so a variable the run set after it started reaches it too.
+
+- **A standing allow covers the call it came from, expires, and stops when
+  revoked.** `crewhaus approvals grant <id> --always` writes `Tool(<the call's
+  value>)` for 30 days (`--days`, at most 365) and only for the harness's owner; a
+  member's `--always` grants once and asks the owner. On a call no narrow rule
+  can name (a tool with no argument that decides where it acts, a call on
+  several places, a value that carries a credential), `--always` is refused
+  with exit 55 and nothing is decided. A revoked or expired rule
+  stops matching within a second, in a run already going too. A rule
+  `.crewhaus/settings.json` holds with no record keeps working and `crewhaus
+  approvals rules` lists it to narrow or remove. The file keeps its 0.8 shape.
 
 - **A protected quality bar only tightens, and only a person sets its
   protection.** `crewhaus optimize`, `crewhaus advise --apply` and Home's

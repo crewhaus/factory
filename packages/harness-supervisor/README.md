@@ -53,15 +53,21 @@ Retention keeps the last 20 runs or 50 MB, configurable per harness in
 | Run class | Shapes | Launch |
 |---|---|---|
 | `interactive` | cli, browser | `crewhaus run <spec>` when a `crewhaus` bin resolves (harness `node_modules/.bin` first, then PATH), else `bun dist/agent.ts`. Attached, piped stdio, tee'd to the run log. Only this launch can resume a session. |
-| `daemon` | channel, managed, crew, voice | `bun dist/daemon.ts`, detached, stdio redirected to the log **file descriptor** (pipes die with the manager). Singleton per harness. |
-| `worker` | batch | `bun dist/agent.ts` with daemon-class supervision. |
-| `one-shot` | workflow, graph, pipeline, research, eval, onchain, onchain-game | `bun dist/agent.ts`; tracked as a job, never restarted. |
+| `daemon` | channel, managed, crew, voice | `bun --no-env-file dist/daemon.ts`, detached, stdio redirected to the log **file descriptor** (pipes die with the manager). Singleton per harness. |
+| `worker` | batch | `bun --no-env-file dist/agent.ts` with daemon-class supervision. |
+| `one-shot` | workflow, graph, pipeline, research, eval, onchain, onchain-game | `bun --no-env-file dist/agent.ts`; tracked as a job, never restarted. |
 | `mcp-server` | `crewhaus serve --mcp` projections | stdio or HTTP+SSE, port-tracked. |
 | `serverless` / `export` | cf-worker / claude-plugin emits | not processes — a deployment record and an inspector target. |
 
 Every spawn: cwd is the **harness root** (never the bundle dir, never a temp
-dir), the `.env` chain is merged **under** `process.env`, `CREWHAUS_TRACE=json`
-and `CREWHAUS_COST_TRACKING=1` are stamped, the relocation variables
+dir), the `.env` chain is merged **under** `process.env`. The chain is the
+files Bun reads, in Bun's order for the mode `NODE_ENV` gives (`.env`,
+`.env.<mode>`, `.env.local`, `.env.<mode>.local`; `test` reads no
+`.env.local`), with loader settings left out, and a compiled bundle runs with
+`--no-env-file`, so that chain is all it takes from the harness's files. A
+loader setting that any of Bun's env files in the harness or the manager's own
+directory assigns is left out of `process.env` too, by name, whatever its value.
+`CREWHAUS_TRACE=json` and `CREWHAUS_COST_TRACKING=1` are stamped, the relocation variables
 (`CREWHAUS_SESSION_DIR`, `CREWHAUS_DATASETS_DIR`, `CREWHAUS_WATCHME_ROOT`,
 `CREWHAUS_SHARED_DIR`) are honoured and reported as overrides, and the
 control.v1 token is passed through the ENV — never argv.
@@ -118,6 +124,13 @@ running daemon (the other head started it) answers
 `{ stopped: false, reason: "not-adopted" }` rather than deleting a live
 daemon's lock and reporting success — call `adoptIfRunfile()` first, which
 `restart()` does for you.
+
+While a daemon runs, `restart()` first asks `decideStart()` what the new start
+would refuse that can be decided before it runs: its plan, preflight (every
+area but the ports the daemon holds) and, when no compile will run, the build
+check or the head's admission in decide-only mode. A refusal comes back with
+`kept: true` and the daemon is never stopped. A start that compiles first
+decides its build after the compile, and operator hooks run only in the start.
 
 One **mutating**
 job per harness — eval, optimize, flywheel, dream, compile, and one-shot runs

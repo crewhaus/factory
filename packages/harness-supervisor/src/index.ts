@@ -139,6 +139,7 @@ export type {
   BundleLocation,
   EnvChain,
   EnvFileRef,
+  EnvMode,
   LoadEnvChainOptions,
   RunOptions,
   SpawnEnv,
@@ -167,10 +168,12 @@ export {
   BUNDLE_STAMP_KEY,
   bundleFreshness,
   hashSpecSource,
+  readBundleStamp,
 } from "./bundle-freshness";
 
 export type {
   CommandOutcome,
+  CompileForecast,
   HookRunLog,
   HookRunRecord,
   PrepareDeps,
@@ -189,6 +192,7 @@ export {
   SAVED_NOT_ACTIVE_NOTE,
   compileOutDir,
   createPrepareRunner,
+  forecastCompile,
   formatPrepareRefusal,
   HOOK_OUTPUT_LINES,
   hookLogPath,
@@ -200,8 +204,11 @@ export {
 } from "./prepare";
 export {
   BRIEF_TARGETS,
+  BUN_DOTENV_FILES,
   BUNDLE_DIR_CANDIDATES,
+  dotenvAssignedNames,
   isLoaderEnvKey,
+  loaderKeysInEnvFiles,
   LOADER_ENV_KEYS,
   LOADER_ENV_PREFIXES,
   rootBundleCompiled,
@@ -210,9 +217,12 @@ export {
   cliTwin,
   DAEMON_ENTRY_TARGETS,
   ENV_FILENAMES,
+  envFilenamesFor,
+  envModeOf,
   entryFileFor,
   findHarnessRoot,
   findSpecPath,
+  homeCrewhausArgv,
   isInside,
   isSupervisedClass,
   loadEnvChain,
@@ -334,18 +344,24 @@ export {
   activeDeployment,
   artifactOf,
   BUILD_NOT_ACTIVE_MESSAGE,
+  buildLinkMessage,
+  buildLinkRefusal,
   launchedEntryOf,
   NO_ACTIVE_BUILD_ACTIVATE_MESSAGE,
   NO_ACTIVE_BUILD_MESSAGE,
   resolvedEntryOf,
+  SPEC_NOT_ACTIVE_MESSAGE,
   verifyActiveBuild,
 } from "./active-build";
+export type { StartDecisionInput, StartRefusal } from "./start-decision";
+export { automaticSpecRefusal, decideStart } from "./start-decision";
 export type { BuildArtifact } from "./build-inputs";
 export {
   bootInputsOf,
   buildDigest,
   bundleDirOf,
   collectBuildFiles,
+  linkEntriesOf,
   parseJsonc,
   RESOLVER_FILES,
 } from "./build-inputs";

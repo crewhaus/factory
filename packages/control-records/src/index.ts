@@ -16,6 +16,7 @@ export {
   type AppendAnswer,
   type AppendClaimAnswer,
   type CasAnswer,
+  type CasPrecondition,
   type ClaimContent,
   type ExpireAnswer,
   type FoldAnomaly,
@@ -28,6 +29,7 @@ export {
   append,
   appendClaim,
   casAppend,
+  casAppendLocked,
   foldStates,
   publishClaim,
   readClaim,
@@ -66,14 +68,18 @@ export {
   type OperatorDeployment,
   type OperatorIntake,
   type OperatorRead,
+  type OperatorReader,
   type OperatorRecord,
   type OperatorVerdict,
   createOperatorReader,
   operatorVerdict,
   readOperatorRecord,
+  refreshOperatorRecord,
 } from "./operator";
 export { type ApproverRead, createApproverReader, readApproverProjection } from "./approvers";
 export { type IntakeReason, type IntakeVerdict, intakeVerdict } from "./intake";
+export { intakeRoot, registerIntakeRoot, unregisterIntakeRoot } from "./intake-root";
+export { type Heartbeat, type HeartbeatWrite, writeHeartbeat } from "./heartbeat";
 export {
   type HeldLease,
   type LeaseHead,
@@ -100,3 +106,19 @@ export {
   readHarnessIdentity,
   writeHarnessIdentity,
 } from "./deployments";
+export {
+  type LedgerRead,
+  PROPOSAL_TTL_MS,
+  type ProposalRow,
+  type StandingRuleReason,
+  type StandingRuleRow,
+  createStandingRuleReader,
+  decisionsLedger,
+  proposalOf,
+  proposalState,
+  readProposals,
+  readStandingRules,
+  ruleIsLive,
+  standingRuleOf,
+  standingRulesLedger,
+} from "./standing-rules";

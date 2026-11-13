@@ -10,17 +10,23 @@
  * never with a value; then the record is refreshed. The run always continues:
  * this is a disclosure, not a gate.
  *
- * `.crewhaus/run` is a runtime-state floor root, relative to the run's
- * working directory: when a run starts in the spec's own directory (as Home
- * and the supervisor start one), no agent write tool can change the record.
- * Only this boot step writes it; the spec commit helper never does, so no
- * writer can clear a disclosure before it is shown.
+ * The record is on the runtime-state floor, so an agent's file-writing tools
+ * are refused there (`Bash` and `RunCommand` stay outside what the floor
+ * sees): as part of `.crewhaus/run` when a run starts in the spec's own
+ * directory (as Home and the supervisor start one), and, for `crewhaus run`
+ * and `crewhaus runs resume`, as the spec directory's `.crewhaus/run/spec`
+ * when the spec lives elsewhere ({@link withRunSpecDir}). Only this boot step
+ * writes it; the spec commit helper never does, so no writer can clear a
+ * disclosure before it is shown. A record missing after the spec's commit log
+ * has a line is said, and so is one that cannot be read: the changes since
+ * the last start cannot be shown then, and the settings are to be reviewed.
  *
  * `crewhaus dev` reloads every spec change and is for development; it keeps
  * no record and shows none.
  */
 import { lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { runSpecDirScope } from "@crewhaus/runtime-core";
 import {
   changedSurfaces,
   parseYamlOnly,
@@ -76,7 +82,9 @@ function readRecord(path: string): SurfaceRecord | undefined | "unreadable" {
     if (!stat.isFile()) return "unreadable";
     size = stat.size;
   } catch (err) {
-    return (err as { code?: unknown }).code === "ENOENT" ? undefined : "unreadable";
+    // No file, or no directory for one: there is no record.
+    const code = (err as { code?: unknown }).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? undefined : "unreadable";
   }
   if (size > MAX_RECORD_BYTES) return "unreadable";
   try {
@@ -88,6 +96,32 @@ function readRecord(path: string): SurfaceRecord | undefined | "unreadable" {
   } catch {
     return "unreadable";
   }
+}
+
+/** Whether the spec's commit log beside the record holds at least one complete line. */
+function hasCommitLine(path: string): boolean {
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile()) return false;
+    return /^[^\n]*\S[^\n]*\n/m.test(readFileSync(path, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Run `fn` with the spec's real directory as the run's spec directory, so the
+ * spec's own record (`<spec dir>/.crewhaus/run/spec`) is on the runtime-state
+ * floor for the whole run when the spec lives outside the working directory.
+ */
+export function withRunSpecDir<T>(absSpec: string, fn: () => T): T {
+  let dir = dirname(absSpec);
+  try {
+    dir = dirname(realpathSync(absSpec));
+  } catch {
+    // The spec was read a moment ago; its directory as given will do.
+  }
+  return runSpecDirScope.run(dir, fn);
 }
 
 /**
@@ -128,14 +162,29 @@ export function discloseSurfaceChange(
     }
   };
 
+  const review = `Review the security settings in ${basename(absSpec)} before you rely on this run.`;
+  const saveOrSay = (): void => {
+    const failed = save();
+    if (failed !== undefined) {
+      stderr(
+        `crewhaus: warning: the record of security settings could not be written to ${recordPath}: ${failed}`,
+      );
+    }
+  };
   const previous = readRecord(recordPath);
   if (previous === "unreadable") {
-    const reason = `the record of security settings at ${recordPath} could not be read; it is written again from this start`;
-    stderr(`crewhaus: warning: ${reason}`);
-    save();
+    const reason = `the record of security settings at ${recordPath} could not be read, so the changes since the last start can't be shown`;
+    stderr(`crewhaus: warning: ${reason}. ${review}`);
+    saveOrSay();
     return { kind: "warned", reason };
   }
   if (previous === undefined) {
+    if (hasCommitLine(join(dir, "commits.jsonl"))) {
+      const reason = `the record of security settings at ${recordPath} is missing although ${basename(absSpec)} has been changed since it was first recorded, so the changes since the last start can't be shown`;
+      stderr(`crewhaus: warning: ${reason}. ${review}`);
+      saveOrSay();
+      return { kind: "warned", reason };
+    }
     const failed = save();
     if (failed === undefined) return { kind: "recorded" };
     const reason = `the record of security settings could not be written to ${recordPath}: ${failed}`;

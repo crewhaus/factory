@@ -4,6 +4,7 @@
  * is a `--flag {param}` pair. `renderTwin` fills a template in and `parseTwin` maps
  * a command line back to its params, so one type serves both directions.
  */
+import { OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
 import type { CliTwin } from "./areas/types.js";
 import { APPROVAL_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
 import { deepFreeze } from "./util.js";
@@ -14,7 +15,7 @@ export type { CliTwin } from "./areas/types.js";
 export const CLI_VERBS = deepFreeze({
   harness: ["list", "show"],
   daemon: ["start", "stop", "restart", "drain"],
-  approvals: ["show", "grant", "deny"],
+  approvals: ["show", "grant", "deny", "supersede", "rules", "revoke"],
   deploy: ["activate", "list"],
   people: [
     "init",
@@ -39,7 +40,8 @@ export const CLI_VERBS = deepFreeze({
  * It is non-empty, has no control character and no leading `-`, so it can never
  * read as a flag. `{psn}` and `{pcl}` are a profile's and a note's ids, `{kind}` a
  * profile kind, `{area}` a note's area and `{verdict}` a review that needs no
- * further argument.
+ * further argument. `{supersedeReason}` is one of the reasons a person may give to
+ * supersede a decision, and `{rule}` a standing rule's id.
  */
 export const TWIN_PLACEHOLDERS = deepFreeze({
   "{hrn}": HARNESS_ID_RE,
@@ -53,6 +55,8 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{kind}": /^(?:personal|audience|synthetic)$/,
   "{area}": /^[a-z][a-z0-9-]{0,39}$/,
   "{verdict}": /^(?:keep|reject|reopen)$/,
+  "{supersedeReason}": new RegExp(`^(?:${OPERATOR_SUPERSEDE_REASONS.join("|")})$`),
+  "{rule}": /^rule_[0-9a-hjkmnp-tv-z]{26}$/,
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

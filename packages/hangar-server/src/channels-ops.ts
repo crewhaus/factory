@@ -859,7 +859,7 @@ export const channelSynthetic: M3Handler = async (ctx) => {
     error: posted.error,
     // The session the daemon opens is marked, so a synthetic turn is never
     // mistaken for a human one in any later fold.
-    synthetic: { synthetic: true, reason: "hangar tier-2 channel test", by: ctx.operator },
+    synthetic: { synthetic: true, reason: "hangar tier-2 channel test", by: ctx.principal },
     text: maskText(text),
     proves:
       "a real, signature-valid inbound event was accepted and driven through the daemon's full turn",

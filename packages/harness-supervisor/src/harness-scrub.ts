@@ -17,7 +17,7 @@ import { loadEnvChain } from "./spawn-contracts";
  *  adopted run's spawn env was never built by this process; prefer
  *  {@link spawnEnvScrubber}, which is a strict superset of it. */
 export function harnessScrubber(harnessDir: string): Scrubber {
-  return createEnvScrubber(loadEnvChain(harnessDir).vars);
+  return createEnvScrubber(loadEnvChain(harnessDir, { nodeEnv: process.env["NODE_ENV"] }).vars);
 }
 
 /**

@@ -19,6 +19,7 @@ import {
   NOW,
   deferred,
   fakeProbe,
+  plantReceipt,
   removeTempDirs,
   rig,
   rowsOf,
@@ -505,4 +506,129 @@ describe("what a receipt holds", () => {
 
 test("NOW is a fixed time", () => {
   expect(new Date(NOW).toISOString()).toBe("2026-11-11T12:00:00.000Z");
+});
+
+describe("the actor is the caller, and is checked again before a command runs", () => {
+  const MEMBER = "prn_01jc0000000000000000000001";
+  const OTHER = "prn_01jc0000000000000000000002";
+
+  test("a command from a member whose authority is gone settles rejected and never runs", async () => {
+    const asked: Array<readonly [string, string, string]> = [];
+    const { service, harness, supervisor } = rig({
+      authorizeActor: (actor, permission, target) => {
+        asked.push([actor, permission, target]);
+        return false;
+      },
+    });
+    const answer = await service.commands.submit({
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness },
+      via: "home",
+      actor: MEMBER,
+    });
+    if (!answer.ok || answer.replayed) throw new Error("submit refused");
+    expect(answer.receipt.actor).toBe(MEMBER);
+    expect(answer.receipt.state).toBe("rejected");
+    expect(answer.receipt.outcome?.code).toBe("forbidden");
+    expect(supervisor.calls).not.toContain("stop");
+    expect(asked).toEqual([[MEMBER, "h.control", HRN]]);
+    expect(rowsOf(commandsLedgerOf(harness)).map((row) => row["state"])).toEqual([
+      "accepted",
+      "rejected",
+    ]);
+  });
+
+  test("an accepted command recovered after its actor's grant was revoked is rejected, not run", async () => {
+    let allowed = true;
+    const r = rig({ authorizeActor: () => allowed });
+    const ledger = commandsLedgerOf(r.harness);
+    // Accepted while the member could stop this harness; the grant is revoked before it runs.
+    plantReceipt(ledger, { id: "cmd_01jc00000000000000000000aa", actor: MEMBER });
+    allowed = false;
+    await r.service.commands.recover({ harness: r.harness });
+    expect(r.supervisor.calls).not.toContain("stop");
+    const last = rowsOf(ledger).at(-1);
+    expect([last?.["state"], (last?.["outcome"] as { code?: string })?.code]).toEqual([
+      "rejected",
+      "forbidden",
+    ]);
+  });
+
+  test("the Home's owner, a system actor and an unlinked local user pass without asking", async () => {
+    const { service, harness, hangarRoot, supervisor } = rig({ authorizeActor: () => false });
+    const setUp = await ensureAccessSetUp(hangarRoot, {
+      localActor: localActorOf(IDENTITY),
+      now: () => NOW,
+    });
+    if (!setUp.ok) throw new Error(setUp.reason);
+    const owner = setUp.result.owner;
+    const asOwner = await service.commands.submit({
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness },
+      via: "home",
+      actor: owner,
+    });
+    expect(asOwner.ok && !asOwner.replayed && asOwner.receipt.state).toBe("succeeded");
+    // No actor given: the head's own user, which is the linked owner here.
+    const asHead = await service.commands.submit({
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness },
+      via: "cli",
+    });
+    expect(asHead.ok && !asHead.replayed && asHead.receipt.state).toBe("succeeded");
+    expect(supervisor.calls.filter((call) => call === "stop")).toHaveLength(2);
+  });
+
+  test("an authority that cannot be determined runs the command, with one warning", async () => {
+    const { service, harness, supervisor, warnings } = rig({ authorizeActor: () => undefined });
+    for (const _ of [1, 2]) {
+      const answer = await service.commands.submit({
+        kind: "controls.stop",
+        target: HRN,
+        ledger: { harness },
+        via: "home",
+        actor: MEMBER,
+      });
+      expect(answer.ok && !answer.replayed && answer.receipt.state).toBe("succeeded");
+    }
+    expect(supervisor.calls.filter((call) => call === "stop")).toHaveLength(2);
+    expect(warnings.filter((w) => w.includes("could not be determined"))).toHaveLength(1);
+  });
+
+  test("two principals with one idempotency key get two receipts", async () => {
+    const { service, harness } = rig({ authorizeActor: () => true });
+    const ask = (actor: string) =>
+      service.commands.submit({
+        kind: "controls.stop",
+        target: HRN,
+        ledger: { harness },
+        via: "home",
+        actor,
+        idempotency: "same-key",
+      });
+    const first = await ask(MEMBER);
+    const second = await ask(OTHER);
+    if (!first.ok || !second.ok) throw new Error("submit refused");
+    expect(first.replayed).toBe(false);
+    expect(second.replayed).toBe(false);
+    expect(first.receipt.id).not.toBe(second.receipt.id);
+    const again = await ask(MEMBER);
+    expect(again.ok && again.replayed).toBe(true);
+  });
+
+  test("an actor that is not a principal is refused before anything is written", async () => {
+    const { service, harness } = rig();
+    const answer = await service.commands.submit({
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness },
+      via: "home",
+      actor: "operator@example.invalid",
+    });
+    expect(answer.ok === false && answer.refusal.code).toBe("invalid");
+    expect(existsSync(join(harness, ".crewhaus", "run", "control", "commands"))).toBe(false);
+  });
 });

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-codehost",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic code-hosting tools: pull requests, issues, reviews, checks, releases and CI runs over the GitHub and GitLab APIs",
   "main": "src/index.ts",

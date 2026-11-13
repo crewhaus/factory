@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/sub-agent-permission-inheritance",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "resolveChildPermissions — inherit/scoped/replace + bypass non-propagation (Section 13)",
   "main": "src/index.ts",
@@ -16,6 +16,9 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/tool-permission-matcher": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/control-records": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

@@ -78,7 +78,7 @@ describe("the checker sees a planted defect", () => {
 });
 
 /**
- * The core's four machines, whole. A fold applies only legal moves, so a dropped edge
+ * The core's five machines, whole. A fold applies only legal moves, so a dropped edge
  * turns real rows into anomalies and an added one makes an illegal move legal, and
  * neither is something the soundness walk above can see.
  */
@@ -205,8 +205,24 @@ describe("the core's tables, literally", () => {
     } as never);
   });
 
-  test("the core has these four, and MACHINES holds them as they are", () => {
-    expect(Object.keys(CORE_MODULE.machines)).toEqual(["run", "command", "decision", "deployment"]);
+  test("a standing rule", () => {
+    expect(CORE_MODULE.machines.rule).toEqual({
+      states: ["active", "revoked", "expired"],
+      entry: ["active"],
+      terminal: ["revoked", "expired"],
+      transitions: { active: ["revoked", "expired"], revoked: [], expired: [] },
+      recoveryOwner: { active: "operator", revoked: "none", expired: "none" },
+    } as never);
+  });
+
+  test("the core has these five, and MACHINES holds them as they are", () => {
+    expect(Object.keys(CORE_MODULE.machines)).toEqual([
+      "run",
+      "command",
+      "decision",
+      "deployment",
+      "rule",
+    ]);
     for (const [name, machine] of Object.entries(CORE_MODULE.machines)) {
       expect(MACHINES[name as keyof typeof MACHINES]).toBe(machine as never);
     }

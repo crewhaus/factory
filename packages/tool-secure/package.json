@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-secure",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic security tools: PII detection and redaction, secret scanning, prompt-injection heuristics, policy checks and evidence hashing",
   "main": "src/index.ts",

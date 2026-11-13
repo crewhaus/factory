@@ -27,6 +27,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { type AppendInput, type AuditLog, openAuditLog } from "@crewhaus/audit-log";
 import { boundaryRuleIds, classifyBoundary } from "@crewhaus/boundary-classifier";
+import { type IntakeVerdict, intakeVerdict } from "@crewhaus/control-records";
 import { type BudgetStore, InMemoryBudgetStore } from "@crewhaus/durable-state";
 import { CrewhausError } from "@crewhaus/errors";
 import {
@@ -347,6 +348,16 @@ export type CreateGatewayServerOptions = {
    */
   readonly intakeGate?: () => { readonly paused: boolean; readonly reason?: string };
   /**
+   * The harness whose operator record (`.crewhaus/run/control/operator.json`)
+   * admits `runs.create` and `runs.continue`. Default `process.cwd()`, the
+   * directory the SLO gate's reader uses too. While the record closes intake,
+   * those two methods answer the verdict's code (`paused` or `disabled`, 503)
+   * before the SLO gate, with no reservation, no classification, no audit line
+   * and no handler call. The two gates are independent: SLO recovery never
+   * opens an operator pause.
+   */
+  readonly harnessDir?: string;
+  /**
    * Contract item 3 — resolver for `runs.subscribe` SSE streams. When set, a
    * `runs.subscribe` request (authenticated + tenant-scoped exactly like every
    * other method) resolves the run's per-run trace bus through this seam and
@@ -402,6 +413,59 @@ export type CreateGatewayServerOptions = {
  * to avoid.
  */
 export const DEFAULT_CLOSE_GRACE_MS = 10_000;
+
+/**
+ * `data.retryAfter` (seconds), sent as `Retry-After`, on a `paused` refusal
+ * whose verdict names no retry time of its own. A `disabled` refusal carries
+ * none: nothing comes back by waiting.
+ */
+export const PAUSED_RETRY_AFTER_SECONDS = 30;
+
+/**
+ * The error envelope for new work the operator record refuses. The wire code
+ * is the verdict's, so a later reason flows through unchanged; the message is
+ * the notice, or the code's own words when the operator chose quiet.
+ */
+function intakeClosedError(
+  id: string,
+  closed: { readonly code: string; readonly notice: string | null; readonly retryAfter?: number },
+): ResponseEnvelopeT {
+  const retryAfter =
+    closed.retryAfter ?? (closed.code === "disabled" ? undefined : PAUSED_RETRY_AFTER_SECONDS);
+  return encodeError(
+    id,
+    closed.code,
+    closed.notice ?? `${closed.code} by its operator`,
+    retryAfter !== undefined ? { retryAfter } : undefined,
+  );
+}
+
+/**
+ * A loop the runtime refused at its start because intake closed meanwhile: a
+ * `RunFailedError` whose report class is `paused` or `disabled`. Checked by
+ * shape, not `instanceof`, because a bundle can carry two copies of
+ * `@crewhaus/errors`.
+ */
+function intakeRefusalOf(
+  err: unknown,
+): { readonly code: string; readonly notice: string | null } | undefined {
+  const report = (err as { report?: { class?: unknown; detail?: unknown } } | null | undefined)
+    ?.report;
+  if (typeof report !== "object" || report === null) return undefined;
+  if (report.class !== "paused" && report.class !== "disabled") return undefined;
+  return {
+    code: report.class,
+    notice: typeof report.detail === "string" ? report.detail : null,
+  };
+}
+
+/** `error.data.retryAfter` of an error envelope, when it is a positive integer. */
+function retryAfterOf(out: unknown): number | undefined {
+  const data = (out as { error?: { data?: { retryAfter?: unknown } } } | null | undefined)?.error
+    ?.data;
+  const value = data?.retryAfter;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
 
 /**
  * Most bytes of a `POST /federation` body the server reads when
@@ -525,6 +589,7 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
   const budget = opts.budgetStore ?? new InMemoryBudgetStore();
   const auditLogByTenant = new Map<string, AuditLog>();
   const now = opts.now ?? Date.now;
+  const harnessDir = opts.harnessDir ?? process.cwd();
 
   // Item 2 (G31) — precompute the federation identity documents once. The
   // Agent Card's `url` is the concrete inbound endpoint (`<base>/federation`);
@@ -668,6 +733,13 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
       const tenant = tenantFor(claims);
       const decoded = decodeRequest(envelope);
       id = decoded.id;
+      // New work enters only while the operator record admits it: refused here,
+      // before the SLO gate, with no reservation, classification, audit line or
+      // handler call. Cancel, subscribe, sessions and audit reads pass.
+      if (decoded.method === "runs.create" || decoded.method === "runs.continue") {
+        const intake: IntakeVerdict = intakeVerdict(harnessDir);
+        if (intake.state === "closed") return intakeClosedError(id, intake);
+      }
       // Ops item 37 — SLO intake gate. When the durable gate is paused (an
       // operator or the SLO monitor's `pause-intake` rung on a sustained
       // breach), shed the request down the SAME 429 `budget_exceeded` path used
@@ -912,7 +984,11 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
             out !== null && typeof out === "object" && "error" in out
               ? statusFor((out as { error: { code: string } }).error.code ?? "")
               : 200;
-          return Response.json(out, { status });
+          const retryAfter = retryAfterOf(out);
+          return Response.json(out, {
+            status,
+            ...(retryAfter !== undefined ? { headers: { "retry-after": String(retryAfter) } } : {}),
+          });
         },
       });
       return {
@@ -968,6 +1044,9 @@ export function statusFor(code: string): number {
       return 500;
     case ErrorCode.InputBlocked:
       return 422;
+    case ErrorCode.Paused:
+    case ErrorCode.Disabled:
+      return 503;
     default:
       return 200;
   }
@@ -982,6 +1061,9 @@ export function statusFor(code: string): number {
  *   - `GatewayServerError`/tenancy auth failures (`JWT …`, `malformed JWT …`,
  *     `invalid tenantId`, `TenancyError`) → `unauthorized`
  *   - any other `GatewayServerError` → `bad_request`
+ *   - a `RunFailedError` whose report class is `paused` or `disabled` (a loop
+ *     the runtime refused at its start) → that code, as `handleEnvelope`
+ *     answers it
  *   - anything else → `internal_error`
  *
  * `input_blocked` is not one of these mappings: `handleEnvelope` answers it
@@ -989,6 +1071,8 @@ export function statusFor(code: string): number {
  * throws it.
  */
 function errorEnvelopeFor(err: unknown, id: string): ResponseEnvelopeT {
+  const refused = intakeRefusalOf(err);
+  if (refused !== undefined) return intakeClosedError(id, refused);
   if (err instanceof GatewayProtocolError) {
     return encodeError(id, ErrorCode.BadRequest, err.message);
   }
