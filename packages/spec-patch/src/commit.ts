@@ -26,11 +26,12 @@
  * ignored.
  *
  * Everything this module keeps lives under `.crewhaus/run/spec/` beside the
- * spec — `lock`, `commits.jsonl` and `drafts/` — inside the runtime-state
- * floor, so an agent's own write tools cannot reach it. Each of those
- * directories is a plain directory (never a link) whose real path lies inside
- * the spec's real directory; when one is not, nothing is written there or
- * read from there, and the commit answers `unwritable`.
+ * spec — `lock`, `commits.jsonl` and `drafts/` — written only by this helper,
+ * and on the runtime-state floor for a run in the spec's own directory (and
+ * for `crewhaus run` or `crewhaus runs resume` of that spec from elsewhere).
+ * Each of those directories is a plain directory (never a link) whose real
+ * path lies inside the spec's real directory; when one is not, nothing is
+ * written there or read from there, and the commit answers `unwritable`.
  */
 import { randomBytes } from "node:crypto";
 import {

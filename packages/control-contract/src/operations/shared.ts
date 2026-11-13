@@ -25,6 +25,11 @@ export const TWINS = {
   daemonRestart: { argv: ["daemon", "restart", "{hrn}"] },
   approvalsShow: { argv: ["approvals", "show", "{appr}", "--dir", "{dir}"] },
   approvalsChoice: { argv: ["approvals", "{choice}", "{appr}", "--dir", "{dir}"] },
+  approvalsSupersede: {
+    argv: ["approvals", "supersede", "{appr}", "--reason", "{supersedeReason}", "--dir", "{dir}"],
+  },
+  approvalsRules: { argv: ["approvals", "rules", "--dir", "{dir}"] },
+  approvalsRevoke: { argv: ["approvals", "revoke", "{rule}", "--dir", "{dir}"] },
   deployActivate: { argv: ["deploy", "activate", "{dep}", "--harness", "{hrn}"] },
   deployList: { argv: ["deploy", "list", "--harness", "{hrn}"] },
 } as const;

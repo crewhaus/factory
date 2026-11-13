@@ -43,7 +43,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan reads the sources", () => {
-    expect(SOURCES.length).toBe(19);
+    expect(SOURCES.length).toBe(21);
     expect(imports.some((i) => i.path === "@crewhaus/control-records")).toBe(true);
   });
 
@@ -104,7 +104,6 @@ describe("what the package exports", () => {
         "SETTINGS_FILENAME",
         "SIGN_IN_LIMITS",
         "TOKEN_FILENAME",
-        "admitUntilAuthorization",
         "authenticate",
         "cidrContains",
         "createBootTickets",
@@ -116,6 +115,16 @@ describe("what the package exports", () => {
         "rotateBootstrap",
         "tokenEquals",
         "writeOwnerBlock",
+        // Route authorization: every role and credential at Home's one choke point.
+        "SCOPED_ACT_PERMISSIONS",
+        "SCOPED_TOKEN_TTL_MS",
+        "domainOf",
+        "hasForwardingHeaders",
+        "hostNameOf",
+        "mintScopedToken",
+        "noAuthRefusal",
+        "registerDomainIn",
+        "verifyScopedToken",
       ].sort(),
     );
   });

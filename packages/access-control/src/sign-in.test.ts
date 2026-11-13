@@ -4,11 +4,13 @@
  * drift between the two halves.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mintId } from "@crewhaus/control-contract";
+import { authenticate } from "./authenticate";
 import { rotateBootstrap } from "./bootstrap";
 import { readRevision } from "./files";
+import { sha256Hex } from "./secrets";
 import { type SessionIssue, type SignInHandle, type SignInRefusal, openSignIn } from "./sign-in";
 import type { DeviceJwk } from "./sign-in-records";
 import {
@@ -17,6 +19,9 @@ import {
   HOUR,
   LOCAL,
   fakeClock,
+  filesUnder,
+  homeFixture,
+  ok,
   removeTempDirs,
   rowCount,
   tempDir,
@@ -382,5 +387,250 @@ describe("sessions", () => {
     if (!mine.ok) throw new Error("no session");
     await h.handle.signOut(mine.sessionRef);
     expect(epoch()).toBe(before + 1);
+  });
+});
+
+describe("joining from an invite", () => {
+  async function invited(role = "operator", scope?: string) {
+    const fixture = await homeFixture();
+    const harness = fixture.addHarness("a");
+    const minted = ok(
+      await fixture.access.createInvite(fixture.actor, {
+        role,
+        scope: scope ?? `harness:${harness.id}`,
+      }),
+    );
+    const handle = openSignIn(fixture.root, {
+      now: fixture.clock.now,
+      localActor: LOCAL,
+      harnesses: () => fixture.harnesses,
+    });
+    return { fixture, harness, handle, code: minted.code };
+  }
+
+  const sessionSecret = (): string =>
+    Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+
+  test("one member, one grant of the invite's role and scope, one device and one session", async () => {
+    const { fixture, harness, handle, code: inviteCode } = await invited();
+    const { signIn, sealed } = await ui();
+    const key = await signIn.makeDeviceKey();
+    const seal = await sealed.makeSeal();
+    const before = fixture.snapshot();
+    const answer = await handle.acceptInvite({
+      code: inviteCode,
+      displayName: "Ana",
+      deviceJwk: key.deviceJwk,
+      seal: seal.seal,
+    });
+    if (!answer.ok || "tabOnly" in answer) throw new Error("expected a sealed session");
+    const secret = await seal.open(answer.issued, "auth.acceptInvite");
+    const after = fixture.snapshot();
+    const added = after.principals.filter((p) => !before.principals.some((q) => q.id === p.id));
+    expect(added.map((p) => [p.id, p.kind])).toEqual([[answer.principal, "member"]]);
+    const grants = after.grants.filter((g) => g.principal === answer.principal);
+    expect(grants.map((g) => [g.role, g.scope, g.grantedBy])).toEqual([
+      ["operator", `harness:${harness.id}`, fixture.owner],
+    ]);
+    expect(after.subjects.principals[answer.principal]?.displayName).toBe("Ana");
+    expect(rowCount(fixture.root, join("access", "devices.jsonl"))).toBe(1);
+    expect(rowCount(fixture.root, join("access", "sessions.jsonl"))).toBe(1);
+    const check = await handle.verifyBearer(secret);
+    expect(check.ok && check.principal).toBe(answer.principal);
+    expect(check.ok && check.device).toBe(answer.device);
+    // The invite is spent, and names who spent it.
+    expect(after.invites.map((i) => [i.state, i.principal])).toEqual([
+      ["consumed", answer.principal],
+    ]);
+  });
+
+  test("a second use of the same code is refused as consumed, and writes nothing", async () => {
+    const { fixture, handle, code: inviteCode } = await invited();
+    const first = await handle.acceptInvite({
+      code: inviteCode,
+      displayName: "Ana",
+      sessionSecret: sessionSecret(),
+      bindHost: "192.168.1.20",
+    });
+    expect(first.ok).toBe(true);
+    const principals = fixture.snapshot().principals.length;
+    const second = await handle.acceptInvite({
+      code: inviteCode,
+      displayName: "Bo",
+      sessionSecret: sessionSecret(),
+      bindHost: "192.168.1.20",
+    });
+    expect(second.ok === false && `${second.status} ${second.reason}`).toBe("401 consumed");
+    expect(fixture.snapshot().principals.length).toBe(principals);
+  });
+
+  test("an expired, a withdrawn or an unknown invite is refused by reason", async () => {
+    const { fixture, handle, code: inviteCode } = await invited();
+    const accept = (codeText: string) =>
+      handle.acceptInvite({
+        code: codeText,
+        displayName: "Ana",
+        sessionSecret: sessionSecret(),
+        bindHost: "192.168.1.20",
+      });
+    const reasonOf = (answer: Awaited<ReturnType<typeof accept>>) =>
+      answer.ok ? "ok" : `${answer.status} ${answer.reason}`;
+    const withdrawn = ok(
+      await fixture.access.createInvite(fixture.actor, { role: "viewer", scope: "home" }),
+    );
+    ok(await fixture.access.revoke(fixture.actor, withdrawn.invite.id));
+    expect(reasonOf(await accept(withdrawn.code))).toBe("401 revoked");
+    expect(reasonOf(await accept(`chi_${"Z".repeat(43)}`))).toBe("401 unknown");
+    fixture.clock.advance(DAY + 1);
+    expect(reasonOf(await accept(inviteCode))).toBe("401 expired");
+    expect(fixture.snapshot().principals.length).toBe(1);
+  });
+
+  test("the display name is kept only in subjects.json, never in a ledger line", async () => {
+    const { fixture, handle, code: inviteCode } = await invited();
+    const name = ["Zephyrine", "Quillfeather"].join(" ");
+    const answer = await handle.acceptInvite({
+      code: inviteCode,
+      displayName: name,
+      sessionSecret: sessionSecret(),
+      bindHost: "192.168.1.20",
+    });
+    expect(answer.ok).toBe(true);
+    const access = join(fixture.root, "access");
+    const ledgers = filesUnder(access).filter((rel) => rel.endsWith(".jsonl"));
+    expect(ledgers.length).toBeGreaterThan(3);
+    for (const rel of ledgers) {
+      expect(`${rel}:${readFileSync(join(access, rel), "utf8").includes("Zephyrine")}`).toBe(
+        `${rel}:false`,
+      );
+    }
+    expect(readFileSync(join(access, "subjects.json"), "utf8")).toContain(name);
+  });
+
+  test("a tab-only session keeps only a digest, answers no secret, and cannot be renewed", async () => {
+    const { fixture, handle, code: inviteCode } = await invited("viewer", "home");
+    const secret = sessionSecret();
+    const answer = await handle.acceptInvite({
+      code: inviteCode,
+      displayName: "Ana",
+      sessionSecret: secret,
+      bindHost: "192.168.1.20",
+    });
+    if (!answer.ok || !("tabOnly" in answer)) throw new Error("expected a tab-only answer");
+    expect(Object.keys(answer).sort()).toEqual(["expiresAt", "ok", "principal", "tabOnly"]);
+    const sessions = readFileSync(join(fixture.root, "access", "sessions.jsonl"), "utf8");
+    expect(sessions).not.toContain(secret);
+    const row = JSON.parse(sessions.trim()) as Record<string, unknown>;
+    expect(row["sha256"]).toBe(await sha256Hex(`cha_${secret}`));
+    expect([row["tabOnly"], row["bindHost"], row["device"]]).toEqual([
+      true,
+      "192.168.1.20",
+      undefined,
+    ]);
+    const check = await handle.verifyBearer(`cha_${secret}`);
+    expect(check.ok && [check.tabOnly, check.bindHost, check.device]).toEqual([
+      true,
+      "192.168.1.20",
+      undefined,
+    ]);
+    const { sealed } = await ui();
+    const seal = await sealed.makeSeal();
+    const renewed = await handle.refresh(check.ok ? check.sessionRef : "", seal.seal);
+    expect(renewed.ok === false && `${renewed.status} ${renewed.reason}`).toBe("403 tab_only");
+  });
+
+  test("a tab-only session counts only over TCP, on its own address, unrelayed", async () => {
+    const { handle, code: inviteCode } = await invited("viewer", "home");
+    const secret = sessionSecret();
+    expect(
+      (
+        await handle.acceptInvite({
+          code: inviteCode,
+          displayName: "Ana",
+          sessionSecret: secret,
+          bindHost: "192.168.1.20",
+        })
+      ).ok,
+    ).toBe(true);
+    const lan = { lanHost: "192.168.1.20" };
+    const at = (host: string, extra: Record<string, string> = {}) =>
+      new Request(`http://${host}/api/harnesses`, {
+        headers: { host, authorization: `Bearer cha_${secret}`, ...extra },
+      });
+    const reason = async (
+      req: Request,
+      peer: { address: string | null; listener: "tcp" | "home.sock" | "proxy.sock" },
+      config = lan,
+    ) => {
+      const answer = await authenticate(req, peer, config, {
+        signIn: handle,
+        bootToken: undefined,
+      });
+      return answer.kind === "refused" ? `${answer.status} ${answer.reason}` : answer.kind;
+    };
+    const phone = { address: "192.168.1.31", listener: "tcp" as const };
+    expect(await reason(at("192.168.1.20:4200"), phone)).toBe("principal");
+    expect(await reason(at("home.example.test:4200"), phone)).toBe("403 tab_only");
+    expect(await reason(at("192.168.1.20:4200", { "x-forwarded-for": "10.0.0.9" }), phone)).toBe(
+      "403 tab_only",
+    );
+    expect(
+      await reason(at("192.168.1.20:4200", { "crewhaus-proxy-secret": "anything" }), phone),
+    ).toBe("403 tab_only");
+    expect(await reason(at("192.168.1.20:4200"), { address: null, listener: "home.sock" })).toBe(
+      "403 tab_only",
+    );
+    // Home started again without the LAN door, or on another address: the session is done.
+    expect(await reason(at("192.168.1.20:4200"), phone, {} as typeof lan)).toBe("403 tab_only");
+    expect(await reason(at("192.168.1.20:4200"), phone, { lanHost: "192.168.1.21" })).toBe(
+      "403 tab_only",
+    );
+  });
+
+  test("a write that fails after the claim answers 503, and the invite stays spent", async () => {
+    const { fixture, handle, code: inviteCode } = await invited("viewer", "home");
+    // The session ledger cannot take a line: the failure comes after the claim is won.
+    mkdirSync(join(fixture.root, "access", "sessions.jsonl"));
+    const secret = sessionSecret();
+    const answer = await handle.acceptInvite({
+      code: inviteCode,
+      displayName: "Ana",
+      sessionSecret: secret,
+      bindHost: "192.168.1.20",
+    });
+    expect(answer.ok === false && `${answer.status} ${answer.reason}`).toBe("503 unavailable");
+    expect(answer.ok === false && answer.message).toContain("new invite");
+    const snapshot = fixture.snapshot();
+    expect(snapshot.invites.map((i) => i.state)).toEqual(["consumed"]);
+    // Whatever was written before the failure has no way to authenticate.
+    expect((await handle.verifyBearer(`cha_${secret}`)).ok).toBe(false);
+    rmSync(join(fixture.root, "access", "sessions.jsonl"), { recursive: true });
+    const again = await handle.acceptInvite({
+      code: inviteCode,
+      displayName: "Ana",
+      sessionSecret: secret,
+      bindHost: "192.168.1.20",
+    });
+    expect(again.ok === false && again.reason).toBe("consumed");
+    expect((await handle.verifyBearer(`cha_${secret}`)).ok).toBe(false);
+  });
+
+  test("a body without two usable keys or a valid secret is refused before the invite is spent", async () => {
+    const { fixture, handle, code: inviteCode } = await invited();
+    const bad = await handle.acceptInvite({
+      code: inviteCode,
+      displayName: "Ana",
+      sessionSecret: "short",
+      bindHost: "192.168.1.20",
+    });
+    expect(bad.ok === false && `${bad.status} ${bad.reason}`).toBe("400 invalid");
+    const named = await handle.acceptInvite({
+      code: inviteCode,
+      displayName: "   ",
+      sessionSecret: sessionSecret(),
+      bindHost: "192.168.1.20",
+    });
+    expect(named.ok === false && `${named.status} ${named.reason}`).toBe("400 invalid");
+    expect(fixture.snapshot().invites.map((i) => i.state)).toEqual(["open"]);
   });
 });

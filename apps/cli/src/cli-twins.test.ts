@@ -337,6 +337,8 @@ describe("the server's twins, by import", () => {
         dep: "dep_01m76e6f05hp514w9j4v3qymka",
         ...PEOPLE,
         verdict: "keep",
+        supersedeReason: "decided-in-error",
+        rule: "rule_01m76e6f05hp514w9j4v3qymka",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -346,6 +348,8 @@ describe("the server's twins, by import", () => {
         dep: "dep_01m76e6f05hp514w9j4v3qymka",
         ...PEOPLE,
         verdict: "reopen",
+        supersedeReason: "policy-changed",
+        rule: "rule_01m76e6f05hp514w9j4v3qymka",
       },
     ];
     const twins = [
@@ -365,8 +369,8 @@ describe("the server's twins, by import", () => {
         checked++;
       }
     }
-    // Twenty-three operation twins, thirteen command kinds and eight route rows, each rendered twice.
-    expect(checked).toBeGreaterThanOrEqual(88);
+    // Twenty-six operation twins, fifteen command kinds and eight route rows, each rendered twice.
+    expect(checked).toBeGreaterThanOrEqual(98);
   });
 });
 

@@ -1,10 +1,8 @@
 /**
- * The accessibility report and its committed baseline: the format, the diff,
- * and the checks. The gate (`gate.ts`) reads this same format: a gated
- * screen's rows must be empty, and every other row is reported against the
- * baseline and never fails.
+ * The accessibility report: its format, and the summary a CI step shows. The
+ * gate (`gate.ts`) reads this format: every row must be empty. There is no
+ * committed baseline: every route the console serves is in the gate.
  */
-import { AXE_TAGS } from "./axe";
 
 export type AxeReport = {
   readonly schema: 1;
@@ -31,94 +29,6 @@ export function sortReport(report: AxeReport): AxeReport {
   return { schema: report.schema, axe: report.axe, tags: report.tags, rows };
 }
 
-/** Why a baseline's text is not one, or nothing when it is. */
-export function baselineProblems(text: string): readonly string[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return ["it is not JSON"];
-  }
-  if (parsed === null || typeof parsed !== "object") return ["it is not an object"];
-  const report = parsed as Partial<AxeReport>;
-  const problems: string[] = [];
-  if (report.schema !== 1) problems.push(`schema is ${String(report.schema)}, not 1`);
-  if (typeof report.axe !== "string" || report.axe === "") problems.push("axe names no version");
-  if (JSON.stringify(report.tags) !== JSON.stringify(AXE_TAGS)) {
-    problems.push(`tags are ${JSON.stringify(report.tags)}, not the known set`);
-  }
-  const rows = report.rows;
-  if (rows === undefined || rows === null || typeof rows !== "object") {
-    problems.push("rows is not an object");
-    return problems;
-  }
-  const keys = Object.keys(rows);
-  if (keys.length === 0) problems.push("rows is empty");
-  if (JSON.stringify(keys) !== JSON.stringify([...keys].sort())) {
-    problems.push("rows are not sorted");
-  }
-  for (const key of keys) {
-    if (key.split("|").length !== 3) problems.push(`row ${key} is not template|theme|width`);
-    const row = rows[key] as unknown;
-    if (row === null || typeof row !== "object") {
-      problems.push(`row ${key} is not an object`);
-      continue;
-    }
-    const rules = Object.keys(row);
-    if (JSON.stringify(rules) !== JSON.stringify([...rules].sort())) {
-      problems.push(`row ${key}'s rules are not sorted`);
-    }
-    for (const rule of rules) {
-      const count = (row as Record<string, unknown>)[rule];
-      if (typeof count !== "number" || !Number.isInteger(count) || count <= 0) {
-        problems.push(`row ${key} counts ${rule} as ${String(count)}`);
-      }
-    }
-  }
-  return problems;
-}
-
-export type BaselineDiff = {
-  /** A row, or a rule in a row, the baseline does not hold. */
-  readonly new: readonly string[];
-  readonly increased: readonly string[];
-  readonly decreased: readonly string[];
-  /** A row, or a rule in a row, the report no longer holds. */
-  readonly gone: readonly string[];
-};
-
-/** Compare a report with the baseline. Nothing here is fatal: the gate decides. */
-export function diffAgainstBaseline(baseline: AxeReport, report: AxeReport): BaselineDiff {
-  const diff = {
-    new: [] as string[],
-    increased: [] as string[],
-    decreased: [] as string[],
-    gone: [] as string[],
-  };
-  for (const key of Object.keys(report.rows).sort()) {
-    const was = baseline.rows[key];
-    const now = report.rows[key] ?? {};
-    if (was === undefined) {
-      diff.new.push(`row ${key}`);
-      continue;
-    }
-    for (const rule of Object.keys(now).sort()) {
-      const before = was[rule];
-      const after = now[rule] as number;
-      if (before === undefined) diff.new.push(`${key}: ${rule} (${after})`);
-      else if (after > before) diff.increased.push(`${key}: ${rule} ${before} to ${after}`);
-      else if (after < before) diff.decreased.push(`${key}: ${rule} ${before} to ${after}`);
-    }
-    for (const rule of Object.keys(was).sort()) {
-      if (now[rule] === undefined) diff.gone.push(`${key}: ${rule} (${was[rule]})`);
-    }
-  }
-  for (const key of Object.keys(baseline.rows).sort()) {
-    if (report.rows[key] === undefined) diff.gone.push(`row ${key}`);
-  }
-  return diff;
-}
-
 /** Node totals by rule across a report's rows. */
 export function reportTotals(report: AxeReport): Readonly<Record<string, number>> {
   const totals: Record<string, number> = {};
@@ -135,29 +45,18 @@ export type GateSummary = {
   readonly missing: number;
 };
 
-/** The diff as markdown, for a CI step summary, headed by the gate's result. */
-export function diffMarkdown(diff: BaselineDiff, report: AxeReport, gate?: GateSummary): string {
-  const section = (title: string, lines: readonly string[]): string =>
-    lines.length === 0
-      ? ""
-      : `\n**${title} (${lines.length})**\n\n${lines.map((line) => `- \`${line}\``).join("\n")}\n`;
+/** The gate's result as markdown, for a CI step summary. */
+export function gateMarkdown(report: AxeReport, gate: GateSummary): string {
   const totals = Object.entries(reportTotals(report))
     .map(([rule, count]) => `\`${rule}\` ${count}`)
     .join(", ");
   const verdict =
-    gate === undefined
-      ? ""
-      : gate.failures === 0 && gate.missing === 0
-        ? `**Gate passed:** ${gate.gated} gated screens have no violation in either theme at either width.\n\n`
-        : `**Gate failed:** ${gate.failures} violation(s) and ${gate.missing} missing row(s) on the ${gate.gated} gated screens.\n\n`;
+    gate.failures === 0 && gate.missing === 0
+      ? `**Gate passed:** ${gate.gated} routes have no violation in either theme at either width.\n\n`
+      : `**Gate failed:** ${gate.failures} violation(s) and ${gate.missing} missing row(s) across the ${gate.gated} routes.\n\n`;
   return [
-    "## Accessibility gate and report\n",
+    "## Accessibility gate\n",
     verdict,
-    "Rows for screens outside the gate are reported against the baseline and never fail the build.\n",
     `${Object.keys(report.rows).length} rows. Nodes by rule: ${totals === "" ? "none" : totals}.\n`,
-    section("New against the baseline", diff.new),
-    section("Increased", diff.increased),
-    section("Decreased", diff.decreased),
-    section("No longer found", diff.gone),
   ].join("");
 }

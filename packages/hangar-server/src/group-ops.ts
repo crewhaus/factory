@@ -56,6 +56,8 @@ export type GroupPlanMember = {
   readonly declaredOrder: number | null;
   /** Why this member will be skipped, or null when it will be acted on. */
   readonly skip: string | null;
+  /** `forbidden` when the caller may not control this member: it is never acted on. */
+  readonly skipCode?: "forbidden";
 };
 
 export type GroupPlan = {
@@ -174,7 +176,13 @@ export async function runGroup(
   const one = async (member: GroupPlanMember): Promise<GroupMemberResult> => {
     const base = { id: member.id, specName: member.specName, position: member.position };
     if (member.skip !== null) {
-      return { ...base, ok: true, skipped: true, message: `skipped — ${member.skip}` };
+      return {
+        ...base,
+        ok: true,
+        skipped: true,
+        message: `skipped — ${member.skip}`,
+        ...(member.skipCode !== undefined ? { reason: member.skipCode } : {}),
+      };
     }
     try {
       return { ...base, skipped: false, ...(await run(member)) };

@@ -12,7 +12,11 @@
  *
  * `boot()` runs before the router. Before anything else it takes an old `#t=<key>` link
  * (Home's own key in the address, which earlier releases printed) off the address and
- * keeps the key only in memory, for step (d). Then, in this order:
+ * keeps the key only in memory, for step (d). An invite link (`/invite#c=<code>`) is taken
+ * off the address the same way, and the join screen asks for one thing, the person's name:
+ * where this page can make keys it joins with a device key and a sealed session; on a page
+ * that is not encrypted it makes a session secret itself, which lives only in this tab and
+ * cannot be renewed. Then, in this order:
  *
  *   a. `#x=<code>` in the address: the one-time code a boot link (`crewhaus hangar open`)
  *      redirects to. It is removed from the address FIRST, then traded, with a new device
@@ -47,6 +51,8 @@ const SIGNED_OUT_KEY = "hangar.signed-out";
 const FORGET_REASONS = new Set(["device_unknown", "device_revoked", "device_expired"]);
 const BOOT_PATH_RE = /^\/boot\/[0-9a-f]{64}$/;
 const CODE_RE = /^[A-Za-z0-9_-]{16,128}$/;
+/** An invite code, as `crewhaus access invite` and the `--lan` QR code carry it. */
+const INVITE_CODE_RE = /^chi_[A-Za-z0-9_-]{43}$/;
 /** A second silent sign-in this soon after the last one means it is not working. */
 const SILENT_RETRY_MS = 60_000;
 
@@ -348,6 +354,64 @@ export async function migrateLegacyToken(fromAddress = null) {
 export const NOT_ENCRYPTED =
   "This page is not encrypted, so this browser can't sign in here. Open Home on its own computer.";
 
+/** Said on a join screen served over plain HTTP, where this tab keeps its own sign-in. */
+export const CONNECTION_NOT_ENCRYPTED = "This connection is not encrypted.";
+
+/**
+ * Join Home from an invite. Where this page can make keys, with a new device key and a
+ * session sealed to this tab; elsewhere, with a session secret this tab makes itself, which
+ * Home keeps only a digest of, lives in this tab alone and cannot be renewed.
+ */
+export async function acceptInvite(code, displayName) {
+  const name = String(displayName ?? "").trim();
+  if (name === "") return { ok: false, reason: "invalid", message: "Type your name." };
+  if (canSignIn()) {
+    const device = await makeDeviceKey();
+    const sealed = await makeSeal();
+    const answer = await api.authAcceptInvite({
+      code,
+      displayName: name,
+      deviceJwk: device.deviceJwk,
+      seal: sealed.seal,
+    });
+    if (!answer.ok) return refusalOf(answer);
+    let secret;
+    try {
+      secret = await sealed.open(answer.body.issued, "auth.acceptInvite");
+    } catch {
+      return { ok: false, reason: "sealed", message: "Home's answer could not be opened." };
+    }
+    setSession(secret);
+    markSignedOut(false);
+    if (typeof answer.body.device === "string") {
+      await saveDevice({ id: answer.body.device, key: device.privateKey });
+    }
+    return { ok: true, tabOnly: false };
+  }
+  if (typeof crypto === "undefined" || typeof crypto.getRandomValues !== "function") {
+    return { ok: false, reason: "insecure", message: NOT_ENCRYPTED };
+  }
+  const sessionSecret = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const answer = await api.authAcceptInvite({ code, displayName: name, sessionSecret });
+  if (!answer.ok) return refusalOf(answer);
+  if (answer.body?.tabOnly !== true) {
+    return { ok: false, reason: "tab_only", message: "Home did not accept this tab's sign-in." };
+  }
+  setSession(`cha_${sessionSecret}`);
+  markSignedOut(false);
+  return { ok: true, tabOnly: true };
+}
+
+/** The invite code an invite link carries, taken off the address; null when there is none. */
+function takeInviteCode() {
+  const loc = globalThis.location;
+  const found = /^#c=([A-Za-z0-9_-]+)$/.exec(loc.hash);
+  if (found === null) return null;
+  // Off the address first, and out of history: nothing after this can show or replay it.
+  globalThis.history?.replaceState(null, "", `/${loc.search}#/`);
+  return INVITE_CODE_RE.test(found[1]) ? found[1] : "";
+}
+
 export const OWN_KEY =
   "That is Home's own key. It stays on that computer; use the link from `crewhaus hangar open` instead.";
 
@@ -389,6 +453,12 @@ function takeLegacyAddressKey() {
 /** Sign in from the address and storage, before the router starts. */
 export async function boot() {
   const addressKey = takeLegacyAddressKey();
+  const invite = takeInviteCode();
+  if (invite !== null) {
+    return invite === ""
+      ? { signedIn: false, message: "That invite link is not complete. Ask for a new one." }
+      : { signedIn: false, invite };
+  }
   const loc = globalThis.location;
   let message = "";
   const fragment = /^#x=([A-Za-z0-9_-]+)$/.exec(loc.hash);

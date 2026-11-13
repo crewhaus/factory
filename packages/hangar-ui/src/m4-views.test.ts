@@ -23,7 +23,7 @@ import { createNotificationPoll } from "../assets/js/notify.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { canRunAction, omniRows } from "../assets/js/omnibox.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { GLOBAL_VIEWS, HARNESS_TABS, parseRoute } from "../assets/js/router.js";
+import { LEGACY_GLOBAL_VIEWS, LEGACY_HARNESS_TABS, parseRoute } from "../assets/js/router.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { dashboardReach, isLoopbackHostname } from "../assets/js/views/channels.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
@@ -311,6 +311,35 @@ describe("omniRows — HM-189", () => {
     expect(rows[0]?.confirm).toBe(true);
   });
 
+  test("an entry's source and index time reach the row; an older payload still yields a row", () => {
+    const rows = omniRows({
+      entries: [
+        {
+          kind: "session",
+          id: "sess_1",
+          title: "sess_1",
+          subtitle: "session · polymarket",
+          href: "#/h/hrn_1/work/sessions/sess_1",
+          source: "polymarket",
+          indexedAt: "2026-11-01T00:00:00.000Z",
+        },
+        { kind: "wiki", id: "deploy", title: "deploy", subtitle: "wiki", href: "#/h/hrn_1" },
+      ],
+      actions: [],
+    }) as Array<{
+      source: string | null;
+      indexedAt: string | null;
+      owner: string | null;
+      subtitle: string;
+    }>;
+    expect(rows[0]).toMatchObject({
+      source: "polymarket",
+      indexedAt: "2026-11-01T00:00:00.000Z",
+      owner: null,
+    });
+    expect(rows[1]).toMatchObject({ source: null, indexedAt: null, subtitle: "wiki" });
+  });
+
   test("a malformed payload yields no rows rather than throwing", () => {
     expect(omniRows(null)).toEqual([]);
     expect(omniRows({})).toEqual([]);
@@ -536,13 +565,20 @@ describe("settings helpers", () => {
 });
 
 describe("router — the M4 screens are deep-linkable", () => {
+  // Changed deliberately: the fleet screens and tabs are old addresses now,
+  // and each lands on its place in the destinations and sections.
   test("#/health and #/settings resolve, and so does the panes tab", () => {
-    expect(GLOBAL_VIEWS).toContain("health");
-    expect(GLOBAL_VIEWS).toContain("settings");
-    expect(HARNESS_TABS).toContain("panes");
-    expect(parseRoute("#/health")).toEqual({ view: "health" });
-    expect(parseRoute("#/settings")).toEqual({ view: "settings" });
-    expect(parseRoute("#/h/hrn_1/panes")).toEqual({ view: "harness", id: "hrn_1", tab: "panes" });
+    expect(LEGACY_GLOBAL_VIEWS).toContain("health");
+    expect(LEGACY_GLOBAL_VIEWS).toContain("settings");
+    expect(LEGACY_HARNESS_TABS).toContain("panes");
+    expect(parseRoute("#/health")).toMatchObject({ view: "harnesses", sub: "health" });
+    expect(parseRoute("#/settings")).toMatchObject({ view: "settings", sub: null });
+    expect(parseRoute("#/h/hrn_1/panes")).toMatchObject({
+      view: "harness",
+      id: "hrn_1",
+      section: "setup",
+      sub: "plugins",
+    });
   });
 });
 

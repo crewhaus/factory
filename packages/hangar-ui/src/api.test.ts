@@ -153,6 +153,9 @@ const DRIVERS: Record<
     call: () => api.authSession({ device: "dev_x", nonce: "n", signature: "s", seal: {} }),
   },
   authExchange: { call: () => api.authExchange({ code: "c", deviceJwk: {}, seal: {} }) },
+  authAcceptInvite: {
+    call: () => api.authAcceptInvite({ code: "c", displayName: "Sam", sessionSecret: "s" }),
+  },
   authRefresh: { call: () => api.authRefresh({ seal: {} }) },
   authSignOut: { call: () => api.authSignOut() },
   bootTicket: { call: () => api.bootTicket("legacy") },

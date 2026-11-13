@@ -1,18 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { AXE_TAGS } from "../a11y/axe";
-import {
-  type AxeReport,
-  baselineProblems,
-  diffAgainstBaseline,
-  diffMarkdown,
-  reportTotals,
-  rowKey,
-  sortReport,
-} from "../a11y/baseline";
-
-const BASELINE = join(import.meta.dir, "..", "..", "axe-baseline.json");
+import { type AxeReport, gateMarkdown, reportTotals, rowKey, sortReport } from "../a11y/baseline";
 
 const report = (rows: AxeReport["rows"]): AxeReport => ({
   schema: 1,
@@ -21,143 +9,18 @@ const report = (rows: AxeReport["rows"]): AxeReport => ({
   rows,
 });
 
-describe("the committed baseline", () => {
-  const text = readFileSync(BASELINE, "utf8");
-  const parsed = JSON.parse(text) as AxeReport;
-
-  test("is well formed", () => {
-    expect(baselineProblems(text)).toEqual([]);
+describe("the report format", () => {
+  test("rowKey names a row by template, theme and width", () => {
+    expect(rowKey("#/h/:id/setup/spec", "dark", 320)).toBe("#/h/:id/setup/spec|dark|320");
   });
 
-  test("names axe's exact pinned version", () => {
-    const manifest = JSON.parse(
-      readFileSync(join(import.meta.dir, "..", "..", "package.json"), "utf8"),
-    ) as { devDependencies: Record<string, string> };
-    expect(parsed.axe).toBe(manifest.devDependencies["axe-core"] as string);
-  });
-
-  test("covers both themes at both widths", () => {
-    const keys = Object.keys(parsed.rows);
-    expect(keys.length).toBeGreaterThanOrEqual(124);
-    for (const theme of ["dark", "light"]) {
-      for (const width of [1280, 320]) {
-        expect(keys).toContain(rowKey("#/", theme, width));
-        expect(keys).toContain(rowKey("#/h/:id/overview", theme, width));
-      }
-    }
-  });
-
-  test("holds no harness id, which changes every run", () => {
-    expect(text).not.toContain("hrn_");
-  });
-});
-
-describe("baselineProblems", () => {
-  const good = report({ "#/|dark|1280": { "color-contrast": 2 }, "#/|dark|320": {} });
-
-  test("a good report has none", () => {
-    expect(baselineProblems(JSON.stringify(good))).toEqual([]);
-  });
-
-  test("not JSON", () => {
-    expect(baselineProblems("{")).toEqual(["it is not JSON"]);
-    expect(baselineProblems("[]").length).toBeGreaterThan(0);
-  });
-
-  test("a wrong schema", () => {
-    const problems = baselineProblems(JSON.stringify({ ...good, schema: 2 }));
-    expect(problems).toEqual(["schema is 2, not 1"]);
-  });
-
-  test("no version of axe", () => {
-    expect(baselineProblems(JSON.stringify({ ...good, axe: "" }))).toEqual([
-      "axe names no version",
-    ]);
-  });
-
-  test("an unknown tag set", () => {
-    const problems = baselineProblems(JSON.stringify({ ...good, tags: ["wcag2a"] }));
-    expect(problems[0]).toContain("not the known set");
-  });
-
-  test("unsorted rows", () => {
-    const text = JSON.stringify({ ...good, rows: { "#/z|dark|320": {}, "#/a|dark|320": {} } });
-    expect(baselineProblems(text)).toEqual(["rows are not sorted"]);
-  });
-
-  test("unsorted rules in a row", () => {
-    const text = JSON.stringify({ ...good, rows: { "#/|dark|320": { b: 1, a: 1 } } });
-    expect(baselineProblems(text)).toEqual(["row #/|dark|320's rules are not sorted"]);
-  });
-
-  test("no rows, and a row that is not one", () => {
-    expect(baselineProblems(JSON.stringify({ ...good, rows: {} }))).toEqual(["rows is empty"]);
-    expect(baselineProblems(JSON.stringify({ ...good, rows: { "#/": {} } }))).toEqual([
-      "row #/ is not template|theme|width",
-    ]);
-  });
-
-  test.each([0, -1, 1.5, "2"])("a count of %p", (count) => {
-    const text = JSON.stringify({ ...good, rows: { "#/|dark|320": { a: count } } });
-    expect(baselineProblems(text)).toEqual([`row #/|dark|320 counts a as ${String(count)}`]);
-  });
-});
-
-describe("diffAgainstBaseline", () => {
-  const base = report({ "#/|dark|1280": { a: 2, b: 3 }, "#/|dark|320": {} });
-
-  test("a rule the baseline does not hold is new, and nothing else", () => {
-    const diff = diffAgainstBaseline(
-      base,
-      report({ "#/|dark|1280": { a: 2, b: 3, c: 1 }, "#/|dark|320": {} }),
-    );
-    expect(diff).toEqual({
-      new: ["#/|dark|1280: c (1)"],
-      increased: [],
-      decreased: [],
-      gone: [],
-    });
-  });
-
-  test("a row the baseline does not hold is new", () => {
-    const diff = diffAgainstBaseline(base, report({ ...base.rows, "#/runs|dark|320": { a: 1 } }));
-    expect(diff.new).toEqual(["row #/runs|dark|320"]);
-  });
-
-  test("a count that moved is increased or decreased", () => {
-    const diff = diffAgainstBaseline(
-      base,
-      report({ "#/|dark|1280": { a: 5, b: 1 }, "#/|dark|320": {} }),
-    );
-    expect(diff.increased).toEqual(["#/|dark|1280: a 2 to 5"]);
-    expect(diff.decreased).toEqual(["#/|dark|1280: b 3 to 1"]);
-    expect(diff.new).toEqual([]);
-  });
-
-  test("a rule or a row the report no longer holds is gone", () => {
-    const diff = diffAgainstBaseline(base, report({ "#/|dark|1280": { a: 2 } }));
-    expect(diff.gone).toEqual(["#/|dark|1280: b (3)", "row #/|dark|320"]);
-  });
-
-  test("the same report has no differences", () => {
-    expect(diffAgainstBaseline(base, base)).toEqual({
-      new: [],
-      increased: [],
-      decreased: [],
-      gone: [],
-    });
-  });
-});
-
-describe("the rest of the format", () => {
   test("sortReport orders rows and rules, so a file changes only with its content", () => {
     const sorted = sortReport(report({ "#/z|dark|1": { b: 1, a: 2 }, "#/a|dark|1": {} }));
     expect(Object.keys(sorted.rows)).toEqual(["#/a|dark|1", "#/z|dark|1"]);
     expect(Object.keys(sorted.rows["#/z|dark|1"] ?? {})).toEqual(["a", "b"]);
-    expect(baselineProblems(JSON.stringify(sorted))).toEqual([]);
   });
 
-  test("the top-level shape is exactly what a later gate reads", () => {
+  test("the top-level shape is exactly what the gate reads", () => {
     const sorted = sortReport(report({ "#/|dark|1": {} }));
     expect(Object.keys(sorted)).toEqual(["schema", "axe", "tags", "rows"]);
   });
@@ -169,33 +32,32 @@ describe("the rest of the format", () => {
     });
   });
 
-  // Changed deliberately: the sweep now gates some screens, so only the rows
-  // outside the gate are the ones that never fail the build, and the summary
-  // leads with the gate's own result.
-  test("the summary says the rows outside the gate never fail the build, and names what is new", () => {
-    const base = report({ "#/|dark|1": {} });
-    const now = report({ "#/|dark|1": { a: 1 } });
-    const markdown = diffMarkdown(diffAgainstBaseline(base, now), now);
-    expect(markdown).toContain(
-      "outside the gate are reported against the baseline and never fail the build",
-    );
-    expect(markdown).not.toContain("Gate passed");
-    expect(markdown).toContain("New against the baseline");
-    expect(markdown).toContain("#/|dark|1: a (1)");
+  test("the tag set includes the rule target size lives under", () => {
+    expect(AXE_TAGS).toContain("wcag22aa");
   });
+});
 
-  test("the summary leads with the gate's result when there is one", () => {
+describe("the step summary", () => {
+  test("leads with the gate's result over every route", () => {
     const now = report({ "#/|dark|1": {} });
-    const diff = diffAgainstBaseline(now, now);
-    expect(diffMarkdown(diff, now, { gated: 13, failures: 0, missing: 0 })).toContain(
-      "**Gate passed:** 13 gated screens",
+    expect(gateMarkdown(now, { gated: 46, failures: 0, missing: 0 })).toContain(
+      "**Gate passed:** 46 routes",
     );
-    expect(diffMarkdown(diff, now, { gated: 13, failures: 2, missing: 1 })).toContain(
+    expect(gateMarkdown(now, { gated: 46, failures: 2, missing: 1 })).toContain(
       "**Gate failed:** 2 violation(s) and 1 missing row(s)",
     );
   });
 
-  test("the tag set includes the rule target size lives under", () => {
-    expect(AXE_TAGS).toContain("wcag22aa");
+  test("names the nodes by rule, and says when there are none", () => {
+    const failing = report({
+      "#/|dark|1": { "target-size": 2 },
+      "#/|light|1": { "target-size": 1 },
+    });
+    expect(gateMarkdown(failing, { gated: 1, failures: 2, missing: 0 })).toContain(
+      "`target-size` 3",
+    );
+    expect(
+      gateMarkdown(report({ "#/|dark|1": {} }), { gated: 1, failures: 0, missing: 0 }),
+    ).toContain("Nodes by rule: none");
   });
 });

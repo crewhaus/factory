@@ -360,6 +360,17 @@ export const ErrorCode = {
    * `{ origin, rules, score }`, never the text. HTTP 422.
    */
   InputBlocked: "input_blocked",
+  /**
+   * The harness's operator paused new work: `runs.create` / `runs.continue` was
+   * refused before any work, with no reservation and no handler call. HTTP 503,
+   * and `data.retryAfter` (seconds) is sent as `Retry-After`.
+   */
+  Paused: "paused",
+  /**
+   * The harness's operator disabled it: `runs.create` / `runs.continue` was
+   * refused before any work, with no reservation and no handler call. HTTP 503.
+   */
+  Disabled: "disabled",
 } as const;
 
 export type ErrorCodeT = (typeof ErrorCode)[keyof typeof ErrorCode];

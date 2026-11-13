@@ -184,6 +184,11 @@ describe("actors", () => {
         "assignedTo",
         (assignedTo) => ({ ...(EXAMPLES["decision"] as object), assignedTo }),
       ],
+      [
+        "decision",
+        "proposedBy",
+        (proposedBy) => ({ ...(EXAMPLES["decision"] as object), proposedBy }),
+      ],
       ["decisionOverlays", "assigned.to", (to) => ({ assigned: { to, at: AT } })],
       [
         "commandReceipt",
@@ -196,6 +201,11 @@ describe("actors", () => {
         "standingRule",
         "createdBy",
         (createdBy) => ({ ...(EXAMPLES["standingRule"] as object), createdBy }),
+      ],
+      [
+        "standingRule",
+        "revokedBy",
+        (revokedBy) => ({ ...(EXAMPLES["standingRule"] as object), revokedBy }),
       ],
       [
         "deployment",
@@ -224,8 +234,8 @@ describe("actors", () => {
     }
 
     test("the table is every one the core has", () => {
-      expect(ACTOR_FIELDS).toHaveLength(11);
-      expect(new Set(ACTOR_FIELDS.map(([id, path]) => `${id}.${path}`)).size).toBe(11);
+      expect(ACTOR_FIELDS).toHaveLength(13);
+      expect(new Set(ACTOR_FIELDS.map(([id, path]) => `${id}.${path}`)).size).toBe(13);
     });
 
     test("and a walk of every schema finds no field that takes one", () => {
@@ -241,6 +251,8 @@ describe("actors", () => {
         "grantedBy",
         "owner",
         "principal",
+        "proposedBy",
+        "revokedBy",
         "subjectRef",
         "supersededBy",
         "to",

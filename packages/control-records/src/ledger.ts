@@ -604,39 +604,64 @@ export async function casAppend(
   precondition?: CasPrecondition,
 ): Promise<CasAnswer> {
   const seam = seams;
-  return withLedgerLock<CasAnswer>(ledger, async (lockedAppend) => {
-    const fold = foldStates(ledger);
-    if (!fold.ok) return fold;
-    const current = fold.objects.get(id);
-    const holds = expectState === null ? current === undefined : current?.state === expectState;
-    if (!holds) return { ok: true, applied: false, current: current?.record ?? null };
-    if (!rowIsLegal(ledger, current?.state, next["state"])) {
-      return { ok: true, applied: false, current: current?.record ?? null, illegal: true };
-    }
-    if (precondition !== undefined && !preconditionHolds(fold, precondition)) {
-      return {
-        ok: true,
-        applied: false,
-        current: current?.record ?? null,
-        precondition: "changed",
-      };
-    }
-    await seam.afterFold?.();
-    const gen = (fold.generations.get(id) ?? 0) + 1;
-    const claim = `${GENERATION_KIND}/${id}/${gen}`;
-    const row: LedgerRecord = { ...next, id, gen, claim };
-    const published = publishClaim(ledger, claim, row);
-    if (!published.ok) {
-      if (published.code !== "exists") return published;
-      const winner = readClaim(ledger, claim);
-      if (!winner.ok) return winner;
-      const repair = repairClaim(ledger, winner.content, lockedAppend);
-      if ("ok" in repair) return repair;
-      return { ok: true, applied: false, current: winner.content.record };
-    }
-    await seam.afterClaim?.();
-    const written = lockedAppend(row);
-    if (!written.ok) return written;
-    return { ok: true, applied: true, gen, seg: written.seg, record: row };
-  });
+  return withLedgerLock<CasAnswer>(ledger, (lockedAppend) =>
+    casUnderLock(ledger, lockedAppend, seam, id, expectState, next, precondition),
+  );
+}
+
+/**
+ * {@link casAppend} for a caller that already holds the lock `ledger.lock` names, taken
+ * through {@link withLedgerLock} on this ledger or on another that shares the lock (every
+ * `harnessLedger` does). One lock can then cover a compare-and-set on two ledgers and a
+ * write beside them. Calling it without the lock is a caller's bug: nothing here takes it.
+ *
+ * First consumers: standing rules and the requests that ask an owner for one.
+ */
+export async function casAppendLocked(
+  ledger: Ledger,
+  id: string,
+  expectState: string | null,
+  next: LedgerRecord,
+  precondition?: CasPrecondition,
+): Promise<CasAnswer> {
+  return casUnderLock(ledger, lockedAppendFor(ledger), seams, id, expectState, next, precondition);
+}
+
+async function casUnderLock(
+  ledger: Ledger,
+  lockedAppend: LockedAppend,
+  seam: LedgerSeams,
+  id: string,
+  expectState: string | null,
+  next: LedgerRecord,
+  precondition: CasPrecondition | undefined,
+): Promise<CasAnswer> {
+  const fold = foldStates(ledger);
+  if (!fold.ok) return fold;
+  const current = fold.objects.get(id);
+  const holds = expectState === null ? current === undefined : current?.state === expectState;
+  if (!holds) return { ok: true, applied: false, current: current?.record ?? null };
+  if (!rowIsLegal(ledger, current?.state, next["state"])) {
+    return { ok: true, applied: false, current: current?.record ?? null, illegal: true };
+  }
+  if (precondition !== undefined && !preconditionHolds(fold, precondition)) {
+    return { ok: true, applied: false, current: current?.record ?? null, precondition: "changed" };
+  }
+  await seam.afterFold?.();
+  const gen = (fold.generations.get(id) ?? 0) + 1;
+  const claim = `${GENERATION_KIND}/${id}/${gen}`;
+  const row: LedgerRecord = { ...next, id, gen, claim };
+  const published = publishClaim(ledger, claim, row);
+  if (!published.ok) {
+    if (published.code !== "exists") return published;
+    const winner = readClaim(ledger, claim);
+    if (!winner.ok) return winner;
+    const repair = repairClaim(ledger, winner.content, lockedAppend);
+    if ("ok" in repair) return repair;
+    return { ok: true, applied: false, current: winner.content.record };
+  }
+  await seam.afterClaim?.();
+  const written = lockedAppend(row);
+  if (!written.ok) return written;
+  return { ok: true, applied: true, gen, seg: written.seg, record: row };
 }

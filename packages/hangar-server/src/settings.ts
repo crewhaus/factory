@@ -14,14 +14,16 @@
  * tab, one keyboard shortcut or one `curl` still starts a daemon in front of
  * an audience. So the refusal lives in the SERVER's dispatch, ahead of every
  * handler, and it is expressed the only way that cannot drift as routes are
- * added: **every non-GET `/api` request is refused** unless it is on the
- * short exempt list below.
+ * added: **a route whose row in the route table writes a receipt is refused**,
+ * because a receipt is what every change writes, and the toggle itself is the
+ * one exemption. A request that only reads is answered, whatever its method.
  *
  * Be precise about the threat it answers. Read-only mode prevents ACCIDENTS
  * during a screen-share or a demo — a misclick, a keyboard binding, a
- * half-finished form. It is not an authorization boundary: the bearer token
- * is, and anyone holding it can turn the mode off again (that is the point —
- * an operator must be able to undo their own toggle). A server started with
+ * half-finished form. It is not an authorization boundary: route
+ * authorization is, and it runs first, so lifting the mode needs the
+ * permission to manage Home's settings (an owner can always undo their own
+ * toggle). A server started with
  * `readOnlyLocked` refuses even the un-toggle, for the case where the person
  * driving is not the person who owns the machine; the refusal names the
  * restart as the way out, because a lock that can be lifted over the wire is
@@ -38,6 +40,7 @@ import {
   normalizeQuietHours,
   normalizeRules,
 } from "./notifications";
+import { ROUTE_TABLE, type RouteRow } from "./route-table";
 
 export { SETTINGS_FILENAME };
 const SETTINGS_VERSION = 1;
@@ -241,26 +244,34 @@ export function openSettingsStore(
 // ---------------------------------------------------------------------------
 
 /**
- * The `<METHOD> <pathname>` pairs read-only mode still allows.
+ * The `<METHOD> <path template>` pairs read-only mode allows although their row writes a
+ * receipt: only the toggle itself, so whoever turned the mode on can turn it off (a lock
+ * nobody can lift is a support ticket).
  *
- * Kept as EXACT strings, not prefixes: an exemption that matched a prefix
- * would quietly widen every time a route was added underneath it, which is
- * precisely how a "read-only" mode stops being one.
- *
- *   - the toggle itself, so the operator who turned the mode on can turn it
- *     off (a lock nobody can lift is a support ticket);
- *   - the boot ticket, which mints a browser handoff and touches no state
- *     the mode is about.
+ * Kept as EXACT route-table templates, never prefixes: an exemption that matched a prefix
+ * would quietly widen every time a route was added underneath it.
  */
-export const READ_ONLY_EXEMPT: ReadonlySet<string> = new Set([
-  "PUT /api/read-only",
-  "POST /api/boot-ticket",
-]);
+export const READ_ONLY_EXEMPT: ReadonlySet<string> = new Set(["PUT /api/read-only"]);
 
-/** True when this request would be refused with read-only mode engaged. */
-export function isReadOnlyRefused(method: string, pathname: string): boolean {
-  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return false;
-  return !READ_ONLY_EXEMPT.has(`${method} ${pathname}`);
+/**
+ * True when read-only mode refuses this matched route: its row writes a receipt (it
+ * changes something) and it is not the toggle. A row that writes none only reads, and is
+ * answered whatever its method.
+ */
+export function isReadOnlyRefused(row: Pick<RouteRow, "method" | "path" | "receipt">): boolean {
+  if (row.receipt === "none") return false;
+  return !READ_ONLY_EXEMPT.has(`${row.method} ${row.path}`);
+}
+
+/**
+ * Every route other than a GET that read-only mode still answers, as `<METHOD> <path>`,
+ * sorted: derived from the route table, so it can never drift from what the gate does.
+ */
+export function readOnlyExempt(rows: readonly RouteRow[] = ROUTE_TABLE): string[] {
+  return rows
+    .filter((row) => row.method !== "GET" && !isReadOnlyRefused(row))
+    .map((row) => `${row.method} ${row.path}`)
+    .sort();
 }
 
 /** The refusal body — a fact about the manager, with the way out named. */
@@ -280,7 +291,8 @@ export function readOnlyRefusal(
   locked = false,
 ): Record<string, unknown> {
   return {
-    error: "read-only mode is engaged — this manager refuses every mutating request",
+    error:
+      "read-only mode is engaged — this manager refuses every request that would change something",
     code: "read_only",
     method,
     path: pathname,

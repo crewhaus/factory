@@ -274,7 +274,7 @@ describe("crewhaus approvals (CLI)", () => {
     await seedApproval(ID);
     expect((await runCli(["approvals", "grant", ID, "--by", "max"])).exitCode).toBe(0);
     const denied = await runCli(["approvals", "deny", ID, "--by", "eve"]);
-    expect(denied.exitCode).toBe(1);
+    expect(denied.exitCode).toBe(55);
     expect(denied.stderr).toContain(`${ID} was already granted`);
     expect(denied.stderr).toContain(`crewhaus approvals supersede ${ID} --reason <code>`);
     const shown = await runCli(["approvals", "show", ID, "--json"]);
@@ -288,7 +288,7 @@ describe("crewhaus approvals (CLI)", () => {
     await seedApproval(ID);
     await runCli(["approvals", "deny", ID]);
     const bad = await runCli(["approvals", "supersede", ID, "--reason", "because"]);
-    expect(bad.exitCode).toBe(1);
+    expect(bad.exitCode).toBe(55);
     expect(bad.stderr).toContain("decided-in-error, policy-changed, other");
     const replaced = await runCli([
       "approvals",
@@ -309,7 +309,7 @@ describe("crewhaus approvals (CLI)", () => {
     expect(listed.stdout).toContain("superseded");
     expect((await runCli(["approvals", "grant", fresh.id])).exitCode).toBe(0);
     const again = await runCli(["approvals", "supersede", ID, "--reason", "other"]);
-    expect(again.exitCode).toBe(1);
+    expect(again.exitCode).toBe(55);
     expect(again.stderr).toContain("cannot be replaced");
   }, 20_000);
 
@@ -325,11 +325,11 @@ describe("crewhaus approvals (CLI)", () => {
     const shown = await runCli(["approvals", "show", ID]);
     expect(shown.stdout).toContain(`withdrawn:  run ${run} was cancelled`);
     const granted = await runCli(["approvals", "grant", ID]);
-    expect(granted.exitCode).toBe(1);
+    expect(granted.exitCode).toBe(55);
     expect(granted.stderr).toContain("withdrawn when its run was cancelled");
     expect(granted.stderr).not.toContain("approvals grant|deny");
     const replaced = await runCli(["approvals", "supersede", ID, "--reason", "other"]);
-    expect(replaced.exitCode).toBe(1);
+    expect(replaced.exitCode).toBe(55);
     expect(replaced.stderr).toContain("withdrawn when its run was cancelled");
     expect(replaced.stderr).not.toContain(run);
   }, 20_000);
@@ -396,7 +396,7 @@ describe("crewhaus approvals (CLI)", () => {
   test("grant/deny/show of an unknown id fails cleanly", async () => {
     const unknown = "appr_0000000000000000";
     const grant = await runCli(["approvals", "grant", unknown]);
-    expect(grant.exitCode).toBe(1);
+    expect(grant.exitCode).toBe(55);
     expect(grant.stderr).toContain(`no approval "${unknown}"`);
     const show = await runCli(["approvals", "show", unknown]);
     expect(show.exitCode).toBe(1);
@@ -404,7 +404,7 @@ describe("crewhaus approvals (CLI)", () => {
 
   test("a malformed id is rejected with the store's message", async () => {
     const { exitCode, stderr } = await runCli(["approvals", "grant", "not-an-id"]);
-    expect(exitCode).toBe(1);
+    expect(exitCode).toBe(55);
     expect(stderr).toContain("invalid approvalId");
   }, 20_000);
 
@@ -441,21 +441,20 @@ describe("crewhaus approvals (CLI)", () => {
     }
   }, 20_000);
 
-  test("#383 — grant --always records the grant AND writes the standing settings rule", async () => {
-    await seedApproval(ID, "log_knowledge_gap");
+  test("grant --always records the grant and the narrow standing rule for the call", async () => {
+    await seedApproval(ID);
     const granted = await runCli(["approvals", "grant", ID, "--always", "--by", "max"]);
     expect(granted.exitCode).toBe(0);
     expect(granted.stdout).toContain("granted");
-    expect(granted.stdout).toContain("standing allow");
+    expect(granted.stdout).toContain("standing rule rule_");
+    expect(granted.stdout).toContain("crewhaus approvals revoke rule_");
     expect(granted.stdout).not.toContain("one-shot");
 
-    // The settings file carries the rule, in the exact shape buildRuleSet reads.
+    // The settings file carries exactly the approved call, in the shape buildRuleSet reads.
     const settings = JSON.parse(readFileSync(join(cwd, ".crewhaus", "settings.json"), "utf8")) as {
       permissions: { rules: Array<{ type: string; pattern: string }> };
     };
-    expect(settings.permissions.rules).toEqual([
-      { type: "alwaysAllow", pattern: "log_knowledge_gap" },
-    ]);
+    expect(settings.permissions.rules).toEqual([{ type: "alwaysAllow", pattern: "Bash(ls -la)" }]);
 
     // The record carries always, and the display status says so.
     const shown = await runCli(["approvals", "show", ID, "--json"]);
@@ -464,23 +463,29 @@ describe("crewhaus approvals (CLI)", () => {
     expect(parsed.always).toBe(true);
     const listed = await runCli(["approvals", "list"]);
     expect(listed.stdout).toContain("granted-always");
+    const rules = await runCli(["approvals", "rules"]);
+    expect(rules.exitCode).toBe(0);
+    expect(rules.stdout).toContain("Bash(ls -la)");
   }, 20_000);
 
-  test("#383 — a second grant --always for the same tool is a dedupe no-op", async () => {
-    await seedApproval(ID, "log_knowledge_gap");
+  test("a second grant --always for the same call shares its settings entry", async () => {
+    await seedApproval(ID);
     const other = "appr_00000000feedface";
-    await seedApproval(other, "log_knowledge_gap");
-    await runCli(["approvals", "grant", ID, "--always"]);
+    await seedApproval(other);
+    expect((await runCli(["approvals", "grant", ID, "--always"])).exitCode).toBe(0);
     const second = await runCli(["approvals", "grant", other, "--always"]);
     expect(second.exitCode).toBe(0);
-    expect(second.stdout).toContain("already carries");
     const settings = JSON.parse(readFileSync(join(cwd, ".crewhaus", "settings.json"), "utf8")) as {
       permissions: { rules: unknown[] };
     };
     expect(settings.permissions.rules).toHaveLength(1);
+    const listed = JSON.parse((await runCli(["approvals", "rules", "--json"])).stdout) as {
+      rules: unknown[];
+    };
+    expect(listed.rules).toHaveLength(2);
   }, 20_000);
 
-  test("#383 — --always preserves unrelated settings.json keys", async () => {
+  test("--always keeps unrelated settings.json keys", async () => {
     mkdirSync(join(cwd, ".crewhaus"), { recursive: true });
     writeFileSync(
       join(cwd, ".crewhaus", "settings.json"),
@@ -494,8 +499,28 @@ describe("crewhaus approvals (CLI)", () => {
       permissions: { rules: Array<{ pattern: string }> };
     };
     expect(settings.hooks).toEqual({ "pre-tool": [] });
-    expect(settings.permissions.rules[0]?.pattern).toBe("Bash");
+    expect(settings.permissions.rules[0]?.pattern).toBe("Bash(ls -la)");
   }, 20_000);
+
+  test("--always on a call no rule can name decides nothing", async () => {
+    await seedApproval(ID, "log_knowledge_gap");
+    const refused = await runCli(["approvals", "grant", ID, "--always"]);
+    expect(refused.exitCode).toBe(55);
+    expect(refused.stderr).toContain("no standing rule can name this call");
+    const shown = await runCli(["approvals", "show", ID, "--json"]);
+    expect((JSON.parse(shown.stdout) as PendingApproval).decision).toBeUndefined();
+    expect(existsSync(join(cwd, ".crewhaus", "settings.json"))).toBe(false);
+  }, 20_000);
+
+  test("--days outside 1-365 is refused before anything is decided", async () => {
+    await seedApproval(ID);
+    for (const days of ["0", "366", "two"]) {
+      const refused = await runCli(["approvals", "grant", ID, "--always", "--days", days]);
+      expect(refused.exitCode).toBe(55);
+    }
+    const shown = await runCli(["approvals", "show", ID, "--json"]);
+    expect((JSON.parse(shown.stdout) as PendingApproval).decision).toBeUndefined();
+  }, 30_000);
 
   test("#383 — --always with a CREWHAUS_SESSION_DIR-located store fails closed (needs --dir)", async () => {
     // Seed the store in a RELOCATED root — the env var finds it, but the
@@ -524,7 +549,7 @@ describe("crewhaus approvals (CLI)", () => {
         stderr: "pipe",
       });
       const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-      expect(exitCode).toBe(1);
+      expect(exitCode).toBe(55);
       expect(stderr).toContain("--dir <harness root>");
       // Fails BEFORE recording anything: still pending, and no rule written.
       const record = (await relocatedStore.list()).find((a) => a.id === ID);
@@ -538,7 +563,7 @@ describe("crewhaus approvals (CLI)", () => {
   test("#383 — deny --always is rejected", async () => {
     await seedApproval(ID);
     const { exitCode, stderr } = await runCli(["approvals", "deny", ID, "--always"]);
-    expect(exitCode).toBe(1);
+    expect(exitCode).toBe(55);
     expect(stderr).toContain("--always applies only");
     // Nothing was decided or written.
     const shown = await runCli(["approvals", "show", ID, "--json"]);
@@ -546,17 +571,16 @@ describe("crewhaus approvals (CLI)", () => {
     expect(existsSync(join(cwd, ".crewhaus", "settings.json"))).toBe(false);
   }, 20_000);
 
-  test("#383 — a malformed settings.json fails the --always write loudly, grant stays recorded", async () => {
+  test("a malformed settings.json refuses --always before anything is decided", async () => {
     mkdirSync(join(cwd, ".crewhaus"), { recursive: true });
     writeFileSync(join(cwd, ".crewhaus", "settings.json"), "{broken");
     await seedApproval(ID);
     const { exitCode, stderr } = await runCli(["approvals", "grant", ID, "--always"]);
-    expect(exitCode).toBe(1);
-    expect(stderr).toContain("standing alwaysAllow rule failed");
-    // The grant itself IS recorded (the operator's decision is not lost)…
+    expect(exitCode).toBe(55);
+    expect(stderr).toContain("settings");
+    // Nothing was decided, and the unparseable file is untouched.
     const shown = await runCli(["approvals", "show", ID, "--json"]);
-    expect((JSON.parse(shown.stdout) as PendingApproval).decision).toBe("grant");
-    // …and the unparseable file is untouched.
+    expect((JSON.parse(shown.stdout) as PendingApproval).decision).toBeUndefined();
     expect(readFileSync(join(cwd, ".crewhaus", "settings.json"), "utf8")).toBe("{broken");
   }, 20_000);
 });

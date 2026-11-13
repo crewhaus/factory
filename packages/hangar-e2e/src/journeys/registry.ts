@@ -1,13 +1,15 @@
 /** Every journey. A guard fails if a `*.journey.ts` on disk is not listed here. */
 import { a11yFloor } from "./a11y-floor.journey";
 import { a11ySelfTest } from "./a11y-self-test.journey";
-import { axeBaseline } from "./axe-baseline.journey";
+import { axeGate } from "./axe-gate.journey";
 import { axeStates } from "./axe-states.journey";
 import { benchDryRun } from "./bench-dry-run.journey";
 import { cliBoot } from "./cli-boot.journey";
 import { crawl } from "./crawl.journey";
 import type { Journey } from "./journey";
 import { keyboardTour } from "./keyboard-tour.journey";
+import { legacyRedirects } from "./legacy-redirects.journey";
+import { navigation } from "./navigation.journey";
 import { pluginPane } from "./plugin-pane.journey";
 import { runThenConsole } from "./run-then-console.journey";
 import { sessionSelfTest } from "./session-self-test.journey";
@@ -21,12 +23,14 @@ export const JOURNEYS: readonly Journey[] = [
   signIn,
   pluginPane,
   crawl,
+  legacyRedirects,
+  navigation,
   untrustedMarkup,
   thredzProxy,
   benchDryRun,
   a11ySelfTest,
   a11yFloor,
-  axeBaseline,
+  axeGate,
   axeStates,
   keyboardTour,
   specConflict,

@@ -10,7 +10,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runAxe } from "../a11y/axe";
-import { harnessRoute } from "../console-routes";
+import { routeFor } from "../console-routes";
 import { settle } from "../settle";
 import { freshVisit, waitFor } from "./a11y-states";
 import type { Journey } from "./journey";
@@ -44,7 +44,7 @@ export const specConflict: Journey = {
       }
     });
 
-    await freshVisit(session, harnessRoute(h.id, "spec"));
+    await freshVisit(session, routeFor("#/h/:id/setup/spec", h));
     const save = page.getByRole("button", { name: "Save", exact: true }).first();
     await save.waitFor({ state: "visible", timeout: 10_000 });
 

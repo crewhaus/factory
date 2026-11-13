@@ -1,7 +1,8 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { composeIntake, intakeVerdict } from "./intake";
+import { intakeRoot, registerIntakeRoot, unregisterIntakeRoot } from "./intake-root";
 import { type OperatorRead, createOperatorReader } from "./operator";
 import {
   UNREADABLE_OPERATOR,
@@ -60,6 +61,7 @@ describe("a closed verdict names each reason, and an unreadable record closes (b
       ],
       notice: PAUSED_TEXT,
       code: "paused",
+      exitName: "paused",
     });
   });
 
@@ -77,6 +79,7 @@ describe("a closed verdict names each reason, and an unreadable record closes (b
       ],
       notice: DISABLED_TEXT,
       code: "disabled",
+      exitName: "disabled",
     });
   });
 
@@ -104,6 +107,7 @@ describe("a closed verdict names each reason, and an unreadable record closes (b
       const verdict = intakeVerdict(root, { read: freshRead() });
       if (verdict.state !== "closed") throw new Error(verdict.state);
       expect(verdict.code).toBe("paused");
+      expect(verdict.exitName).toBe("paused");
       expect(verdict.notice).toBe(PAUSED_TEXT);
       expect(verdict.reasons).toHaveLength(1);
       expect(verdict.reasons[0]?.state).toBe("unreadable");
@@ -154,11 +158,69 @@ describe("composeIntake", () => {
     expect(composeIntake([], undefined)).toEqual({ state: "open" });
   });
 
+  test("exitName names the exit for the code: paused, disabled, and paused for unreadable", () => {
+    const unreadable = { kind: "operator", state: "unreadable", detail: "torn" } as const;
+    expect(composeIntake([{ kind: "operator", state: "paused" }], undefined)).toMatchObject({
+      code: "paused",
+      exitName: "paused",
+    });
+    expect(composeIntake([{ kind: "operator", state: "disabled" }], undefined)).toMatchObject({
+      code: "disabled",
+      exitName: "disabled",
+    });
+    expect(composeIntake([unreadable], undefined)).toMatchObject({
+      code: "paused",
+      exitName: "paused",
+    });
+  });
+
   test("any disabled reason makes the code disabled, whatever the order", () => {
     const paused = { kind: "operator", state: "paused" } as const;
     const disabled = { kind: "operator", state: "disabled" } as const;
     expect(composeIntake([paused, disabled], undefined)).toMatchObject({ code: "disabled" });
     expect(composeIntake([disabled, paused], undefined)).toMatchObject({ code: "disabled" });
     expect(composeIntake([paused], undefined)).toMatchObject({ code: "paused" });
+  });
+});
+
+describe("the intake root: the directory of the control plane this process serves", () => {
+  const SLOT = Symbol.for("@crewhaus/control-records/intake-root");
+  const slot = (): unknown => (globalThis as unknown as Record<symbol, unknown>)[SLOT];
+
+  afterEach(() => {
+    Reflect.deleteProperty(globalThis, SLOT);
+  });
+
+  test("absent until registered, then the directory, then absent again", () => {
+    const root = tempDir();
+    expect(intakeRoot()).toBeUndefined();
+    registerIntakeRoot(root);
+    expect(intakeRoot()).toBe(root);
+    unregisterIntakeRoot(root);
+    expect(intakeRoot()).toBeUndefined();
+  });
+
+  test("a relative directory is kept resolved, and unregistered by either spelling", () => {
+    registerIntakeRoot(".");
+    expect(intakeRoot()).toBe(process.cwd());
+    unregisterIntakeRoot(process.cwd());
+    expect(intakeRoot()).toBeUndefined();
+  });
+
+  test("unregistering another directory leaves the slot as it is", () => {
+    const root = tempDir();
+    registerIntakeRoot(root);
+    unregisterIntakeRoot(tempDir());
+    expect(intakeRoot()).toBe(root);
+  });
+
+  test("the slot lives on globalThis, so a second copy of the package reads the same root", () => {
+    const root = tempDir();
+    registerIntakeRoot(root);
+    expect(slot()).toBe(root);
+    // What a second copy does: it writes the same well-known symbol.
+    const elsewhere = tempDir();
+    (globalThis as unknown as Record<symbol, unknown>)[SLOT] = elsewhere;
+    expect(intakeRoot()).toBe(elsewhere);
   });
 });

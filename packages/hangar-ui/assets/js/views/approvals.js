@@ -22,6 +22,10 @@ import { toggleBtn } from "../ui/toggle.js";
 import { actionTwin, gatedBtn } from "./control.js";
 import { mountTriage } from "./inbox.js";
 
+/** Said where an input is withheld from someone who may not read the harness's content. */
+const WITHHELD_INPUT =
+  "The request's details are hidden: reading them needs content access to this harness.";
+
 export async function renderApprovals(root) {
   clear(root).appendChild(skeleton(6));
   await draw(root, { showSettled: false, seq: 0, toolbar: null, rollup: null, body: null });
@@ -145,8 +149,9 @@ function approvalCard(row, { perform }) {
       el("span", { class: "chip", text: row.surface }),
       el("span", { class: "muted", text: row.age }),
     ]),
-    // Verbatim (already masked) — the whole point of an approval screen.
-    jsonPre(row.input),
+    // Verbatim (already masked) — the whole point of an approval screen — unless this
+    // person may not read the harness's content.
+    row.inputWithheld ? el("p", { class: "muted", text: WITHHELD_INPUT }) : jsonPre(row.input),
     row.parkedRun !== null
       ? el("div", { class: "muted reason" }, [
           el("span", { text: "parked run " }),

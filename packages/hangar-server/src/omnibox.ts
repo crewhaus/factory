@@ -32,12 +32,13 @@
  */
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { APPROVALS_FILENAME, foldApprovals, statusOf } from "./approvals";
 import { MAX_JSONL_LINES, SAFE_SEGMENT_RE, SESSION_JSON_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
+import { MENU_ACTION_PROVIDERS } from "./menu/actions";
 import { resolveInside } from "./safety";
 import { resolveSessionRoot } from "./sessions";
 import { liveWikiSegments } from "./store-layout";
-import { twinWord } from "./twin-word";
 
 /** What an omnibox row IS — the kind drives its icon and its deep link. */
 export const OMNI_KINDS = [
@@ -65,9 +66,13 @@ export type OmniEntry = {
   /** Secondary line — never matched against, so a long path cannot outrank
    *  a real title. */
   readonly subtitle: string;
-  /** Console hash route (`#/h/<id>/sessions/<sess>`). */
+  /** Console hash route (`#/h/<id>/work/sessions/<sess>`). */
   readonly href: string;
   readonly harnessId: string | null;
+  /** Where the entry comes from: the harness's name, or "Home". */
+  readonly source: string;
+  /** When this entry's harness was indexed (ISO time). */
+  readonly indexedAt: string;
 };
 
 /**
@@ -101,7 +106,7 @@ export type OmniResults = {
   readonly actions: readonly OmniAction[];
   /** Harnesses whose entries were built for this query (the lazy cost). */
   readonly indexed: number;
-  /** Total entries currently held. */
+  /** Entries currently held for the harnesses searched. */
   readonly size: number;
 };
 
@@ -172,51 +177,12 @@ export function rankEntries(
 // ---------------------------------------------------------------------------
 
 /**
- * Verb → the route it maps to, its CLI twin, and how it reads in the list.
- *
- * THE TWIN HAS TO RUN. It is displayed as "the exact command that does the
- * same thing in a terminal", which is the console's whole trust affordance;
- * a twin that fails when pasted is worse than none. `crewhaus daemon` takes
- * the harness POSITIONALLY (`daemon start [<dir|hrn_id>]`) and its flag
- * parser hard-rejects anything it does not know, so `--dir <path>` is not a
- * near-miss — every verb throws on it. And the path is SHELL-QUOTED, the way
- * M2's own twins are (`shutdownReportLines`, `spawn-contracts`): an unquoted
- * `/srv/my harnesses/poly` splits into two arguments and targets the wrong
- * directory. A directory holding a control character shows as `<dir>`.
- * `apps/cli/src/cli-twins.test.ts` checks every twin against the CLI's own
+ * Verb → the route it maps to, its CLI twin, and how it reads in the list:
+ * the providers in `menu/actions`, one per area. Each twin has to run when
+ * pasted; `apps/cli/src/cli-twins.test.ts` checks them against the CLI's own
  * verb inventory.
  */
-const ACTION_VERBS: ReadonlyArray<{
-  readonly verb: string;
-  readonly route: string;
-  readonly cli: (dir: string) => string;
-  readonly label: (name: string) => string;
-}> = [
-  {
-    verb: "start",
-    route: "procStart",
-    cli: (dir) => `crewhaus daemon start ${twinWord(dir, "<dir>")}`,
-    label: (name) => `Start ${name}`,
-  },
-  {
-    verb: "stop",
-    route: "procStop",
-    cli: (dir) => `crewhaus daemon stop ${twinWord(dir, "<dir>")}`,
-    label: (name) => `Stop ${name}`,
-  },
-  {
-    verb: "restart",
-    route: "procRestart",
-    cli: (dir) => `crewhaus daemon restart ${twinWord(dir, "<dir>")}`,
-    label: (name) => `Restart ${name}`,
-  },
-  {
-    verb: "drain",
-    route: "procDrain",
-    cli: (dir) => `crewhaus daemon drain ${twinWord(dir, "<dir>")}`,
-    label: (name) => `Drain ${name}`,
-  },
-];
+const ACTION_VERBS = MENU_ACTION_PROVIDERS;
 
 /** Every CLI twin the omnibox can propose, for one harness directory —
  *  the surface `apps/cli/src/cli-twins.test.ts` validates against the CLI's
@@ -280,10 +246,16 @@ export type IndexHarness = {
   readonly tags: readonly string[];
 };
 
-const href = (id: string, tab: string, ...rest: string[]): string =>
-  [`#/h/${encodeURIComponent(id)}`, tab, ...rest.map((r) => encodeURIComponent(r))]
-    .filter((s) => s !== "")
-    .join("/");
+/** A console address inside a harness: `#/h/<id>/<section>/<sub>[/…]`. */
+const href = (id: string, section: string, sub: string, ...rest: string[]): string =>
+  [`#/h/${encodeURIComponent(id)}`, section, sub, ...rest.map((r) => encodeURIComponent(r))].join(
+    "/",
+  );
+
+/** Where every pending approval is decided: Home's Needs-you page. */
+export const APPROVALS_HREF = "#/home/needs-you?type=approvals";
+/** The harness list, where groups and tags are browsed. */
+export const HARNESSES_HREF = "#/harnesses";
 
 const listSafe = (dir: string | undefined): string[] => {
   if (dir === undefined) return [];
@@ -321,17 +293,23 @@ export function harnessIndexToken(dir: string): string {
     mtimeOf(join(crewhaus, "datasets")),
     mtimeOf(join(crewhaus, "evals")),
     mtimeOf(join(crewhaus, "incidents")),
-    mtimeOf(join(crewhaus, "approvals.jsonl")),
+    // The approvals log lives beside the sessions, wherever they resolve.
+    mtimeOf(join(resolveSessionRoot(dir).root, APPROVALS_FILENAME)),
   ];
   return parts.join(":");
 }
 
-/** Build one harness's entries. Names, ids and titles only. */
-export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[] {
+/** Build one harness's entries. Names, ids and titles only, each saying
+ *  where it comes from and when it was read. */
+export function buildHarnessEntries(
+  harness: IndexHarness,
+  nowMs: number = Date.now(),
+): readonly OmniEntry[] {
   const { id, dir, specName } = harness;
+  const indexedAt = new Date(nowMs).toISOString();
   const out: OmniEntry[] = [];
-  const push = (entry: OmniEntry): void => {
-    if (out.length < MAX_ENTRIES_PER_HARNESS) out.push(entry);
+  const push = (entry: Omit<OmniEntry, "source" | "indexedAt">): void => {
+    if (out.length < MAX_ENTRIES_PER_HARNESS) out.push({ ...entry, source: specName, indexedAt });
   };
 
   push({
@@ -348,7 +326,7 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
       id: `${id}:${group}`,
       title: group,
       subtitle: `group · ${specName}`,
-      href: "#/",
+      href: HARNESSES_HREF,
       harnessId: id,
     });
   }
@@ -358,7 +336,7 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
       id: `${id}:${tag}`,
       title: tag,
       subtitle: `tag · ${specName}`,
-      href: "#/",
+      href: HARNESSES_HREF,
       harnessId: id,
     });
   }
@@ -377,7 +355,7 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
       id: sessionId,
       title: sessionId,
       subtitle: `session · ${specName}`,
-      href: href(id, "sessions", sessionId),
+      href: href(id, "work", "sessions", sessionId),
       harnessId: id,
     });
   }
@@ -394,7 +372,7 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
       id: slug,
       title: slug.replace(/-/g, " "),
       subtitle: `wiki · ${specName}`,
-      href: href(id, "memory", "wiki", slug),
+      href: href(id, "knowledge", "wiki", slug),
       harnessId: id,
     });
   }
@@ -408,7 +386,7 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
       id: name,
       title: name.replace(/\.(json|jsonl)$/, ""),
       subtitle: `facts · ${specName}`,
-      href: href(id, "memory"),
+      href: href(id, "knowledge", "memory"),
       harnessId: id,
     });
   }
@@ -421,7 +399,7 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
       id: name,
       title: name.replace(/\.(jsonl|json)$/, ""),
       subtitle: `dataset · ${specName}`,
-      href: href(id, "data"),
+      href: href(id, "quality", "datasets"),
       harnessId: id,
     });
   }
@@ -432,7 +410,7 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
       id: name,
       title: name.replace(/\.(ts|js|json)$/, ""),
       subtitle: `grader · ${specName}`,
-      href: href(id, "evals"),
+      href: href(id, "quality", "results"),
       harnessId: id,
     });
   }
@@ -449,7 +427,7 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
         id: runId,
         title: runId,
         subtitle: `eval run · ${specName}`,
-        href: href(id, "evals", runId),
+        href: href(id, "quality", "results", runId),
         harnessId: id,
       });
     }
@@ -464,31 +442,27 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
       id: name.slice(0, -5),
       title: name.slice(0, -5),
       subtitle: `incident · ${specName}`,
-      href: href(id, "security"),
+      href: href(id, "setup", "security"),
       harnessId: id,
     });
   }
 
-  // Pending approval ids — read raw, never listed through the store
-  // (indexing is a read, and wants every id, not the live ones).
-  const approvals = resolveInside(dir, [".crewhaus", "approvals.jsonl"]);
-  if (approvals !== undefined && existsSync(approvals)) {
-    const { objects } = readJsonlCapped(approvals, MAX_JSONL_LINES);
-    const seen = new Set<string>();
-    for (const row of objects) {
-      const approvalId = (row as { id?: unknown }).id;
-      const toolName = (row as { toolName?: unknown }).toolName;
-      if (typeof approvalId !== "string" || approvalId === "" || seen.has(approvalId)) continue;
-      seen.add(approvalId);
-      push({
-        kind: "approval",
-        id: approvalId,
-        title: typeof toolName === "string" && toolName !== "" ? toolName : approvalId,
-        subtitle: `approval · ${specName}`,
-        href: "#/approvals",
-        harnessId: id,
-      });
-    }
+  // Pending approvals, folded the inbox's way at the resolved session root
+  // (read-only: never listed through the store, which compacts), and
+  // "pending" decided by the inbox's own rule.
+  for (const approval of foldApprovals(dir).approvals) {
+    if (statusOf(approval) !== "pending") continue;
+    const approvalId = approval.id;
+    if (typeof approvalId !== "string" || approvalId === "") continue;
+    const toolName = approval.toolName;
+    push({
+      kind: "approval",
+      id: approvalId,
+      title: typeof toolName === "string" && toolName !== "" ? toolName : approvalId,
+      subtitle: `approval · ${specName}`,
+      href: APPROVALS_HREF,
+      harnessId: id,
+    });
   }
 
   return out;
@@ -509,19 +483,25 @@ export type OmniIndex = {
 
 export function createOmniIndex(
   deps: {
-    readonly build?: (harness: IndexHarness) => readonly OmniEntry[];
+    readonly build?: (harness: IndexHarness, nowMs: number) => readonly OmniEntry[];
     readonly token?: (dir: string) => string;
+    /** The clock an index build is stamped with (each entry's `indexedAt`). */
+    readonly now?: () => number;
   } = {},
 ): OmniIndex {
   const build = deps.build ?? buildHarnessEntries;
   const token = deps.token ?? harnessIndexToken;
+  const now = deps.now ?? Date.now;
   const cache = new Map<string, { token: string; entries: readonly OmniEntry[] }>();
+  /** The entries indexed for these harnesses only: a search counts what its caller may see. */
+  const sizeOf = (harnesses: readonly IndexHarness[]): number =>
+    harnesses.reduce((n, harness) => n + (cache.get(harness.id)?.entries.length ?? 0), 0);
 
   return {
     search: (query, harnesses, limit = OMNI_LIMIT) => {
       const q = typeof query === "string" ? query.trim() : "";
       if (q === "") {
-        return { query: "", entries: [], actions: [], indexed: 0, size: cacheSize(cache) };
+        return { query: "", entries: [], actions: [], indexed: 0, size: sizeOf(harnesses) };
       }
       let indexed = 0;
       const all: OmniEntry[] = [];
@@ -529,7 +509,7 @@ export function createOmniIndex(
         const current = token(harness.dir);
         const hit = cache.get(harness.id);
         if (hit === undefined || hit.token !== current) {
-          const entries = build(harness);
+          const entries = build(harness, now());
           cache.set(harness.id, { token: current, entries });
           indexed += 1;
           all.push(...entries);
@@ -542,7 +522,7 @@ export function createOmniIndex(
         entries: rankEntries(all, q, limit),
         actions: matchActions(q, harnesses),
         indexed,
-        size: cacheSize(cache),
+        size: sizeOf(harnesses),
       };
     },
     size: () => cacheSize(cache),

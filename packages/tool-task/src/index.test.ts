@@ -450,6 +450,78 @@ Do what the prompt says.`,
     }
   });
 
+  test("a definition on disk keeps a parent's standing rule live: a revoked one stops allowing the child", async () => {
+    const root = newTempDir();
+    const subAgentDir = join(root, "subs");
+    mkdirSync(subAgentDir, { recursive: true });
+    writeFileSync(
+      join(subAgentDir, "lister.md"),
+      `---
+name: lister
+description: lister
+tools: [Bash]
+permissions:
+  allow: ["Bash(**)"]
+  deny: []
+---
+List the files.`,
+    );
+    try {
+      let captured: SpawnSubAgentOptions | undefined;
+      const spawn: SpawnSubAgentFn = mock(async (_p, opts) => {
+        captured = opts;
+        return {
+          finalMessage: "ok",
+          transcript: [],
+          toolCalls: [],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        };
+      });
+      const { bridge, close } = await makeBridge(root, spawn, [makeBashTool()]);
+      // A standing rule as the settings loader hands it to a run: it answers
+      // `live` from its record.
+      let active = true;
+      const standing = {
+        type: "alwaysAllow" as const,
+        pattern: "Bash(git status)",
+        source: "settings" as const,
+        live: () => active,
+      };
+      const guarded: RuntimeBridge = {
+        ...bridge,
+        permissionMode: "default",
+        permissionRules: {
+          ...emptyRuleSet,
+          settings: [standing],
+          builtin: [...BUILTIN_DEFAULT_RULES],
+        },
+      };
+      const said = await createTaskTool({ subAgentDir }).execute(
+        { description: "x", prompt: "list", subagent_type: "lister" },
+        { bridge: guarded },
+      );
+      if (captured === undefined) throw new Error(`spawnSubAgent was not called: ${String(said)}`);
+      const status = {
+        toolName: "Bash",
+        input: { command: "git status" },
+        readOnly: false,
+        destructive: false,
+      };
+      const decide = () =>
+        evaluateWithReason(
+          status,
+          captured?.permissionMode ?? "default",
+          captured?.permissionRules ?? emptyRuleSet,
+        ).decision;
+      expect(decide()).toBe("allow");
+      active = false;
+      expect(decide()).not.toBe("allow");
+      await close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("a definition on disk cannot give a pool candidate a tool_config (widening the parent's)", async () => {
     // A candidate's tool_config REPLACES the operator's block for every call
     // it serves — here, the http allow-list — and reads $VARs from the

@@ -98,6 +98,28 @@ module declares, a kind registered twice, an area with no module, or a kind that
 with an executor and no reconciler. The core registers daemon control: executors for `controls.start`,
 `stop`, `restart` and `drain` (the supervisor's verbs with their default options, adopting a daemon
 first) and one reconciler for start and restart (a live runfile whose daemon started after acceptance).
+It also registers the decision service's kinds, `decisions.resolve`, `decisions.supersede`,
+`rules.create` and `rules.revoke`: each executor observes what its receipt's target names (the
+decision claim, a request's row, a rule's row) and settles by it, and acts again on nothing. They act
+on records alone, so their area declares them `unsupervised` and they run with no supervisor.
+
+## Decisions and standing rules
+
+`decisions` is the one way a tool approval, or a request to a harness's owner, is decided, from
+Home or the CLI. The surface says who asks (`DecisionActor`): Home's signed-in principal, the CLI's
+local user (who counts as the member Home's access records link them to), or nobody; a display label
+is shown with the decision and carries no authority. On a harness with an approver projection a
+decision counts only from a member whose class reaches the request's (session-store's
+`principalAuthorizer`). The service writes no receipt itself: Home's receipts middleware and the
+CLI's `commands.submit` do.
+
+A grant with `always` also makes a standing rule: the narrowest allow that covers the approved call
+(permission-engine's `narrowPatternFor`), for 30 days unless `days` says otherwise, kept as a row in
+`.crewhaus/run/control/standing-rules.jsonl` beside its `.crewhaus/settings.json` entry. Only the
+owner makes one; a member's `always` grants once and files a `dec_` request the owner answers.
+`rules` lists live rules, waiting requests and whole-tool allows no record keeps, and ends a rule.
+`harnessForSessionRoot` finds the harness a session root found through the environment belongs to,
+and `settingsWriteClass` says which class a settings change needs.
 
 ## Jobs
 

@@ -1,5 +1,5 @@
 /** The ways into the console. */
-import { LIBRARY_ROUTE } from "../console-routes";
+import { HARNESSES_ROUTE, HOME_ROUTE } from "../console-routes";
 import { openPlainPage, signInPath } from "../session";
 import { settle, trackInFlight } from "../settle";
 import type { Journey } from "./journey";
@@ -39,13 +39,15 @@ export const signIn: Journey = {
     for (const fragment of ["#x=", "#t=", home.token]) {
       if (landed.includes(fragment)) throw new Error(`signing in left ${fragment} in the address`);
     }
-    if (new URL(landed).hash !== LIBRARY_ROUTE) {
-      throw new Error(`signing in landed on ${landed}, not the Library`);
+    if (new URL(landed).hash !== HOME_ROUTE) {
+      throw new Error(`signing in landed on ${landed}, not Home`);
     }
+    await session.visit(HARNESSES_ROUTE);
     const harnessName = fleet.harnesses[0]?.specName ?? "";
     if ((await session.page.getByText(harnessName).count()) === 0) {
-      throw new Error("the Library does not show the seeded harness after signing in");
+      throw new Error("the harness list does not show the seeded harness after signing in");
     }
+    await session.visit(HOME_ROUTE);
     const stored = await session.page.evaluate(
       () => sessionStorage.getItem("hangar.session") ?? "",
     );

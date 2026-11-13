@@ -18,7 +18,12 @@
     "@crewhaus/deployment-controller": "workspace:*",
     "@crewhaus/harness-registry": "workspace:*",
     "@crewhaus/harness-supervisor": "workspace:*",
-    "@crewhaus/ir": "workspace:*"
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/session-store": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/tool-executor": "workspace:*",
+    "@crewhaus/tool-registry-manifest": "workspace:*"
   },
   "devDependencies": {
     "@crewhaus/errors": "workspace:*",

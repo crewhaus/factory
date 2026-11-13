@@ -23,7 +23,13 @@ import type { CapabilityDescriptor } from "./capabilities.js";
 import type { CommandReceipt } from "./commands.js";
 import type { DecisionRecordView, IfUnanswered, OperatorSupersedeReason } from "./decisions.js";
 import type { ListEnvelope } from "./lists.js";
-import type { DecisionState, DeploymentState, HarnessDisplay, RunState } from "./machines.js";
+import type {
+  DecisionState,
+  DeploymentState,
+  HarnessDisplay,
+  RuleState,
+  RunState,
+} from "./machines.js";
 import type { Permission } from "./permissions.js";
 import type { PROTOCOL_ID } from "./protocol.js";
 import type { LinkProvider, RunCause, Trigger } from "./refs.js";
@@ -158,12 +164,18 @@ export type AuthExchangeRequest = {
   readonly seal: Seal;
 };
 
-export type AuthAcceptInviteRequest = {
-  readonly code: string;
-  readonly displayName: string;
-  readonly deviceJwk: DeviceJwk;
-  readonly seal: Seal;
-};
+export type AuthAcceptInviteRequest =
+  | {
+      readonly code: string;
+      readonly displayName: string;
+      readonly deviceJwk: DeviceJwk;
+      readonly seal: Seal;
+    }
+  | {
+      readonly code: string;
+      readonly displayName: string;
+      readonly sessionSecret: string;
+    };
 
 export type AuthRefreshRequest = {
   readonly seal: Seal;
@@ -243,17 +255,27 @@ export type DecisionResolved = {
   readonly receipt: CommandReceipt;
 };
 
-/** A standing rule's metadata; enforcement stays a plain settings entry. */
+/**
+ * A standing rule's record; enforcement stays a plain settings entry, which this
+ * record keeps live. `reason` is a closed code: the rule came from an owner's own
+ * grant, or from a proposal the owner accepted.
+ */
 export type StandingRule = {
   readonly id: string;
+  readonly kind: "allow";
   readonly tool: string;
   readonly pattern: string;
   readonly derivedFrom?: string;
+  readonly proposal?: string;
   readonly createdBy: string;
-  readonly reason: string;
+  readonly reason: "approval" | "proposal";
   readonly policyRevision?: string;
+  readonly createdAt: string;
   readonly expiresAt: string;
+  readonly state: RuleState;
   readonly revokedAt?: string;
+  readonly revokedBy?: string;
+  readonly expiredAt?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -416,6 +438,14 @@ export type SessionIssued = {
   readonly principal?: string;
   readonly receipt?: CommandReceipt;
 };
+
+export type InviteAccepted =
+  | SessionIssued
+  | {
+      readonly tabOnly: true;
+      readonly expiresAt: string;
+      readonly principal?: string;
+    };
 
 export type SignedOut = {
   readonly signedOut: true;

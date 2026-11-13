@@ -181,17 +181,20 @@ const GATE_FILES = [
   ".crewhaus/retention.json",
   // The knowledge-sync marker.
   ".crewhaus/knowledge.json",
-  // The routing freeze marker, the scope-audit baseline and the security corpus.
+  // The routing freeze marker, the scope-audit baseline, the security corpus
+  // and the SLO intake gate.
   ".crewhaus/routing/freeze.json",
   ".crewhaus/scope-audit/baseline.json",
   ".crewhaus/security-corpus/corpus.json",
+  ".crewhaus/slo/intake.json",
 ];
-/** The four gate records a run's floor names beside the others above. */
+/** The five gate records a run's floor names beside the others above. */
 const ADDED_GATE_RECORDS = [
   ".crewhaus/proposals",
   ".crewhaus/routing/freeze.json",
   ".crewhaus/scope-audit/baseline.json",
   ".crewhaus/security-corpus/corpus.json",
+  ".crewhaus/slo/intake.json",
 ];
 const ENV_FILES = [
   ".env",
@@ -228,6 +231,8 @@ const NEIGHBOURS = [
   ".crewhaus/scope-audit/2026-01-01.json",
   ".crewhaus/security-corpus/candidate-rules.json",
   ".crewhaus/proposals.md",
+  ".crewhaus/slo/intake.json.bak",
+  ".crewhaus/slo/other.json",
 ];
 /** Each writer whose field keeps its store in a gate record, and that record. */
 const OWN_STORES: Readonly<Record<string, readonly string[]>> = {
@@ -614,8 +619,8 @@ describe("the write matrix: every writer's path fields, in the spellings a call 
     }
   });
 
-  test("the default call of every writer decides the same with and without the four added gate records", () => {
-    // The roots without the four, in every spelling the run gives them.
+  test("the default call of every writer decides the same with and without the five added gate records", () => {
+    // The roots without the five, in every spelling the run gives them.
     const added = ADDED_GATE_RECORDS.map((rel) => rel.split("/").join(sep));
     const isAdded = (root: string): boolean =>
       added.some((rel) => root === rel || root.endsWith(`${sep}${rel}`));

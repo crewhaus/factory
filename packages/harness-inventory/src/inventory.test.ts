@@ -615,6 +615,23 @@ describe("runFleetBulk", () => {
     expect(describeFleetExit(77)).toBeUndefined();
   });
 
+  test("describeFleetExit titles the configured stops and the operator's two states", () => {
+    expect(describeFleetExit(34)).toEqual({
+      class: "timeout",
+      title: "stopped by its configured time limit",
+    });
+    expect(describeFleetExit(35)).toEqual({
+      class: "evaluation",
+      title: "stopped because its answer failed the configured evaluation",
+    });
+    expect(describeFleetExit(37)).toEqual({
+      class: "provability",
+      title: "stopped because its answer lacked the evidence its spec requires",
+    });
+    expect(describeFleetExit(38)).toEqual({ class: "disabled", title: "disabled by its operator" });
+    expect(describeFleetExit(39)).toEqual({ class: "paused", title: "paused by its operator" });
+  });
+
   test("formatBulkReport renders the failure title + class rollup for coded exits (0.3.0 Goal 6)", async () => {
     seedHarness("support-bot", { spec: CLI_SPEC.replace("concierge", "support-bot") });
     seedHarness("concierge", { spec: CLI_SPEC });

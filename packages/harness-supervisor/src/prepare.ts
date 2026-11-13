@@ -33,12 +33,16 @@
  * connects back to it.
  *
  * **Hooks run operator-authored code with the harness's own environment** —
- * the merged spawn env, exactly what `run.sh` gets today. The harness
- * directory is already the supervision trust boundary: whoever can write
- * `.crewhaus/settings.json` can already write the spec, the `.env` chain and
- * `run.sh`. (This is a different contract from `@crewhaus/hooks-engine`,
- * whose RUNTIME hooks fire on model-driven moments and therefore get a
- * deliberately restricted env.) Nothing extra is needed for the console's
+ * the merged spawn env, exactly what `run.sh` gets. The settings file that
+ * declares them, and the files a hook names directly (a command word written
+ * as a path, or the script a shell or an interpreter it starts is given, as
+ * runtime-core's `hookTargetFiles` reads them: not a word built when the hook
+ * runs, a package script or a module, or what that script runs in turn), are
+ * on the runtime-state floor of a run in the harness directory, so an agent's
+ * file-writing tools are refused there; `Bash` and `RunCommand` stay outside
+ * what the floor sees. (This is a different contract from
+ * `@crewhaus/hooks-engine`, whose RUNTIME hooks fire on model-driven moments
+ * and therefore get a deliberately restricted env.) Nothing extra is needed for the console's
  * `--read-only` posture: that mode refuses every mutating request, so no
  * start and no compile job reaches this module at all.
  */

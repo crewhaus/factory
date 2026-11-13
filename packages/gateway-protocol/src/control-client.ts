@@ -64,6 +64,10 @@ export type ControlRefusalCode =
   | "tick_in_flight"
   /** 409 `draining` — the daemon is shutting down; do not retry. */
   | "draining"
+  /** 409 `paused` — the operator paused new work; a tick starts once it is resumed. */
+  | "paused"
+  /** 409 `disabled` — the operator disabled this harness; nothing new starts. */
+  | "disabled"
   /** 401 — the token on disk is not the one the daemon is using. */
   | "unauthorized"
   /** Anything else the daemon answered. */
@@ -109,6 +113,17 @@ export type ControlStatusBody = {
   readonly timers: readonly ControlTimerReport[];
   readonly channels: readonly string[];
   readonly pendingApprovals: number;
+  /** The operator record this daemon enforces. Absent from a bundle built before it. */
+  readonly operator?: {
+    readonly rev: number | null;
+    readonly paused: boolean;
+    readonly disabled: boolean;
+    readonly unreadable: boolean;
+  };
+  /** The controls this daemon supports. Absent from a bundle built before it. */
+  readonly capabilities?: readonly string[];
+  /** Runs it is running, `null` where it cannot count them. Absent from an older bundle. */
+  readonly activeRuns?: number | null;
 };
 
 export type ControlWakeBody = {
@@ -216,7 +231,12 @@ const refusal = (
   reason,
   ...(extra.lane !== undefined ? { lane: extra.lane } : {}),
   retryable: code === "tick_in_flight",
-  expected: code === "no_control_port" || code === "lane_not_armed" || code === "draining",
+  expected:
+    code === "no_control_port" ||
+    code === "lane_not_armed" ||
+    code === "draining" ||
+    code === "paused" ||
+    code === "disabled",
 });
 
 /** Map a non-2xx control response onto a typed refusal. */
@@ -243,6 +263,22 @@ function classifyFailure(status: number, body: unknown, lane?: ControlLane): Con
   }
   if (status === 409 && code === "draining") {
     return refusal("draining", status, "the daemon is draining — it accepts no new work", withLane);
+  }
+  if (status === 409 && code === "paused") {
+    return refusal(
+      "paused",
+      status,
+      "the daemon's operator paused new work — it starts nothing new until resumed",
+      withLane,
+    );
+  }
+  if (status === 409 && code === "disabled") {
+    return refusal(
+      "disabled",
+      status,
+      "the daemon's operator disabled this harness — it starts nothing new",
+      withLane,
+    );
   }
   if (status === 401) {
     return refusal(

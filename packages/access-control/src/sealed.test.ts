@@ -28,8 +28,15 @@ describe("sealed issuance", () => {
     const client = await ui.makeSeal();
     expect(Object.keys(client.seal).sort()).toEqual(["crv", "kty", "x", "y"]);
     const secret = mintIssuedSecret("session");
-    const issued = await sealSecret(client.seal, secret, "auth.exchange");
-    expect(await client.open(issued, "auth.exchange")).toBe(secret);
+    for (const op of [
+      "auth.exchange",
+      "auth.session",
+      "auth.refresh",
+      "auth.acceptInvite",
+    ] as const) {
+      const issued = await sealSecret(client.seal, secret, op);
+      expect(await client.open(issued, op)).toBe(secret);
+    }
   });
 
   test("the answer is hex the contract parses, and its epk is a raw uncompressed point", async () => {

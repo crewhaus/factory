@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../control-records" },
     { "path": "../errors" },
     { "path": "../tool-permission-matcher" },
     { "path": "../tool-safety" }

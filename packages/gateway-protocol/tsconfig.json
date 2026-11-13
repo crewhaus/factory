@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../control-contract" },
+    { "path": "../control-records" },
     { "path": "../errors" },
     { "path": "../event-log" },
     { "path": "../provability" },

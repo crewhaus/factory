@@ -38,9 +38,9 @@ import {
 } from "@crewhaus/control-service";
 import { HARNESS_ID_RE, type HangarHarnessEntry } from "@crewhaus/harness-registry";
 import { HttpError, errResponse, json } from "./http";
-import { M3_ROUTES, matchM3 } from "./m3-routes";
 import { type TextScrubber, maskDeep } from "./mask";
-import { ROUTE_BY_KEY, type RouteRow, matchRoute } from "./route-table";
+import { matchRequest } from "./route-match";
+import type { RouteRow } from "./route-table";
 
 /** The header a non-object answer carries the receipt's id in. */
 export const COMMAND_HEADER = "x-crewhaus-command";
@@ -70,8 +70,6 @@ export function currentCommand(): { readonly commandId: string; readonly by: str
   const context = commandContext.getStore();
   return context === undefined ? undefined : { commandId: context.commandId, by: context.by };
 }
-
-const M3_KEYS: ReadonlySet<string> = new Set(M3_ROUTES.map((route) => route.key));
 
 /** The error code an answer's status means. */
 export function codeForStatus(status: number): ErrorCode {
@@ -154,6 +152,8 @@ export function settleForStatus(
 
 export type ReceiptsDeps = {
   readonly control: ControlService;
+  /** The signed-in principal the request is from, `prn_…`; absent, the head's own user. */
+  readonly actorOf?: (req: Request) => string | undefined;
   readonly harness: (id: string) => HangarHarnessEntry | undefined;
   /** The scrubber the route's own payload is masked with: a harness's, or the fleet's. */
   readonly scrubFor: (harnessDir: string | undefined) => TextScrubber;
@@ -209,12 +209,8 @@ export function createReceipts(deps: ReceiptsDeps): WithReceipt {
   return async (req, segments, next) => {
     const method = req.method;
     if (method === "GET" || method === "HEAD") return next();
-    // The server's own dispatch order: the M3 table first, then the hand-written routes.
-    const m3 = matchM3(method, segments);
-    const matched =
-      m3 !== undefined
-        ? { row: ROUTE_BY_KEY.get(m3.route.key), params: m3.params }
-        : matchRoute(method, segments, (row) => !M3_KEYS.has(row.key));
+    // The one matcher the choke point uses too.
+    const matched = matchRequest(method, segments);
     const row = matched?.row;
     if (
       matched === undefined ||
@@ -258,9 +254,11 @@ export function createReceipts(deps: ReceiptsDeps): WithReceipt {
     const query = [...new URL(req.url).searchParams.entries()];
 
     const scrub = deps.scrubFor(harnessDir);
+    const actor = deps.actorOf?.(req);
     const answer = await deps.control.commands.submit<Handled>(
       {
         kind: row.kind,
+        ...(actor !== undefined ? { actor } : {}),
         ...(target !== undefined ? { target } : {}),
         ledger,
         via: "home",
@@ -279,7 +277,11 @@ export function createReceipts(deps: ReceiptsDeps): WithReceipt {
           response = await commandContext.run(context, next);
         } catch (err) {
           if (err instanceof HttpError) {
-            response = errResponse(err.status, err.message);
+            // A refusal that carries fields beside its message (`needs`, `paths`) keeps them.
+            response =
+              err.body === undefined
+                ? errResponse(err.status, err.message)
+                : json(maskDeep({ error: err.message, ...err.body }, scrub), err.status);
           } else {
             deps.onWarn(
               `hangar-server: unhandled route error: ${err instanceof Error ? err.message : String(err)}`,

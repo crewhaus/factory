@@ -27,8 +27,10 @@ export {
   type CancelAbortReason,
   RUN_REGISTRY_CAP,
   type RunHoldOutcome,
+  activeRunCount,
   cancelRun,
   isCancelReason,
+  isRunHeld,
   onRunIdle,
   retainRun,
 } from "./run-registry";
