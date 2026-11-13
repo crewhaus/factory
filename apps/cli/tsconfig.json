@@ -27,6 +27,7 @@
     { "path": "../../packages/control-service" },
     { "path": "../../packages/people" },
     { "path": "../../packages/people-service" },
+    { "path": "../../packages/quality-service" },
     { "path": "../../packages/feedback-distill" },
     { "path": "../../packages/hangar-server" },
     { "path": "../../packages/hangar-ui" },

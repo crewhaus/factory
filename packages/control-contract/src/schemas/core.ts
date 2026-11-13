@@ -386,7 +386,7 @@ export const decision = z
     consumedAt: timestamp.optional(),
     consumedByRun: z.string().optional(),
     always: z.boolean().optional(),
-    kind: z.enum(["tool", "input", "standing-rule-proposal"]).optional(),
+    kind: z.enum(["tool", "input", "standing-rule-proposal", "change-adoption"]).optional(),
     decidedByPrincipal: storedActor.optional(),
     decidedVia: z.string().optional(),
     // A fresh request's id, or the run whose cancel withdrew this one (`run-cancelled`).
@@ -416,6 +416,15 @@ export const decision = z
     terms: standingRuleTerms.optional(),
     proposedBy: storedActor.optional(),
     derivedFrom: decisionId.optional(),
+    subject: z
+      .object({
+        chg: z.string().regex(/^chg_[0-9a-hjkmnp-tv-z]{26}$/),
+        patchDigest: z.string(),
+        baseRevision: z.string(),
+        evidenceDigest: z.string(),
+      })
+      .passthrough()
+      .optional(),
   })
   .passthrough();
 

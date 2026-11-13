@@ -306,6 +306,7 @@
     { "path": "./packages/control-service" },
     { "path": "./packages/people" },
     { "path": "./packages/people-service" },
+    { "path": "./packages/quality-service" },
     { "path": "./apps/cli" }
   ]
 }

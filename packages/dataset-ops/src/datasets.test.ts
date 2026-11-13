@@ -91,7 +91,8 @@ describe("parseSplitSpec", () => {
 
   test("rejects wrong arity, non-integers, and sums ≠ 100", () => {
     expect(() => parseSplitSpec("70")).toThrow(DatasetRefError);
-    expect(() => parseSplitSpec("70/15/10/5")).toThrow(DatasetRefError);
+    expect(() => parseSplitSpec("60/15/10/10/5")).toThrow(DatasetRefError);
+    expect(() => parseSplitSpec("70/15/10/4")).toThrow(DatasetRefError);
     expect(() => parseSplitSpec("70/15/14")).toThrow(DatasetRefError);
     expect(() => parseSplitSpec("70/-15/45")).toThrow(DatasetRefError);
     expect(() => parseSplitSpec("seventy/15/15")).toThrow(DatasetRefError);
@@ -271,7 +272,7 @@ describe("resolveRegistryRef — the registry: shorthand", () => {
     const resolved = await resolveRegistryRef(
       registry,
       { name: "locked", split: "test" },
-      { allowTestSplit: true },
+      { allowTestSplit: true, use: { purpose: "eval", via: "cli" } },
     );
     expect(resolved.splits).toEqual(["test"]);
     expect(resolved.datasetName).toBe("locked@v1#test");
@@ -287,7 +288,11 @@ describe("resolveRegistryRef — the registry: shorthand", () => {
     );
     // With the opt-in, the same ref reaches the normal versionless error.
     expect(
-      resolveRegistryRef(registry, { name: "ghost", split: "test" }, { allowTestSplit: true }),
+      resolveRegistryRef(
+        registry,
+        { name: "ghost", split: "test" },
+        { allowTestSplit: true, use: { purpose: "eval", via: "cli" } },
+      ),
     ).rejects.toThrow("no versions");
   });
 

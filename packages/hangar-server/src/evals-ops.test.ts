@@ -367,8 +367,8 @@ describe("the launcher", () => {
     expect(spent.status).toBe(200);
     expect(spent.body["argv"]).toContain("--allow-test-split");
     const warned = (spent.body["warnings"] as string[]).join(" ");
-    expect(warned).toContain("is not recorded");
-    expect(warned).toContain("Only crewhaus datasets release records a use.");
+    expect(warned).toContain("This run spends the held-out test cases. The use is recorded");
+    expect(warned).toContain("crewhaus datasets uses");
     expect(warned).not.toContain("burn");
   });
 
@@ -482,7 +482,7 @@ describe("the launcher", () => {
     );
   });
 
-  test("the test-split warning names the one verb that records a use", () => {
+  test("the test-split warning says the use is recorded and names the verb that lists it", () => {
     const { warnings } = evalArgv(
       { dataset: "smoke", graders: "g.yaml", allowTestSplit: true, releaseConfirm: true },
       {
@@ -492,8 +492,8 @@ describe("the launcher", () => {
         conventional: { dataset: false, graders: false },
       },
     );
-    expect(warnings.join(" ")).toContain("datasets release");
-    expect(warnings.join(" ")).toContain("is not recorded");
+    expect(warnings.join(" ")).toContain("datasets uses");
+    expect(warnings.join(" ")).toContain("The use is recorded");
   });
 });
 
@@ -614,7 +614,7 @@ describe("the optimizer launcher", () => {
     });
     expect(ok.status).toBe(200);
     expect((ok.body["argv"] as string[]).join(" ")).toBe(
-      "optimize crewhaus.yaml --mutator rule-based --dataset eval/dataset.jsonl --graders eval/graders.yaml",
+      "optimize crewhaus.yaml --mutator rule-based --dataset eval/dataset.jsonl --graders eval/graders.yaml --propose",
     );
   });
 
@@ -676,7 +676,8 @@ describe("the flywheel launcher", () => {
       body: JSON.stringify({ iterations: 2 }),
     });
     expect(status).toBe(200);
-    expect(body["argv"]).toEqual(["flywheel", "run", "--iterations", "2"]);
+    // A loop launched from Home files its candidate as a change; it never writes back.
+    expect(body["argv"]).toEqual(["flywheel", "run", "--iterations", "2", "--propose"]);
   });
 
   test("with neither a dataset file nor ratings it refuses, but scaffolding still runs", async () => {

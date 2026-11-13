@@ -124,6 +124,7 @@ describe("the inventory is the dispatch", () => {
     }
     expect(families.sort()).toEqual([
       "access",
+      "changes",
       "criteria",
       "daemon",
       "hangar",
@@ -249,8 +250,8 @@ describe("every flag list answers --help", () => {
         }
       }
     }
-    expect(asked).toBe(2 * (12 + 5 + 5 + 8 + 10 + 12));
-  }, 30_000); // six modules' imports and a hundred and four calls; slow on a loaded runner
+    expect(asked).toBe(2 * (12 + 5 + 5 + 8 + 10 + 12 + 8));
+  }, 30_000); // seven modules' imports and a hundred and twenty calls; slow on a loaded runner
 });
 
 describe("family parsers take their flags from CLI_FAMILY", () => {

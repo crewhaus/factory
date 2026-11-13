@@ -49,13 +49,19 @@ these on: they reach every harness that uses what each one names.
   change made in Home, first write a receipt under the harness's
   `.crewhaus/run/control/` (ids and states, never arguments or secrets). A
   verb whose receipt cannot be written does nothing and exits 52. `crewhaus
+  eval --rebaseline`, `crewhaus eval --regrade-baseline` and `crewhaus
+  eval-report baseline set` write a receipt before they move a baseline,
+  creating the harness's `harness.json` when it has none; when the receipt
+  cannot be written they keep the baseline and exit non-zero. `crewhaus
   daemon start` and `restart` exit 55, where they exited 1, when the start is
   refused: already running, or stopped by preflight. `crewhaus approvals`
   exits 51 or 55, where it exited 1, when it refuses a decision: 51 when the
   person may not decide it, 55 for an unknown or malformed id, a request
   already decided or withdrawn, a reason it does not know, or `deny --always`.
   `compile`, `eval`,
-  `optimize`, `flywheel run` and `dream run` wait up to 10 seconds while a
+  `optimize`, `flywheel run`, `dream run`, `changes propose`, `changes check`,
+  `changes adopt`, `changes decline`, `changes withdraw` and `changes rollback`
+  wait up to 10 seconds while a
   Home job changes the same harness, then exit 53 naming it; a Home job that
   meets one of them fails the same way. A Home write whose body is not a JSON
   object is answered 400 before anything runs.
@@ -467,6 +473,36 @@ these on: they reach every harness that uses what each one names.
   egress check as other non-user text does: a warning on a configured sink,
   a block on a dynamic one. A line the summary repeats verbatim keeps the
   origin it entered with.
+
+- **Reading held-out cases is counted.** `crewhaus eval --allow-test-split`,
+  `crewhaus deploy canary --allow-test-split`, `crewhaus datasets release` and
+  a `target: eval` bundle with `split: test` add one line to
+  `<version>.uses.jsonl` beside the dataset version before they read its cases,
+  and a read whose line cannot be written does not start. `crewhaus datasets
+  uses` lists every read, and `status`, `card` and Home count them.
+
+- **`deploy canary` needs every case the control version measured.** A step
+  fails, and the ramp rolls back, when the candidate did not measure a case the
+  control version measured (not measured, skipped, only observed or
+  abstained, or left out); the reason names the cases. With
+  `--traffic-split`, such a case counts as a failure for the candidate.
+
+- **Agent dataset and baseline tools stay out of the holdout and off
+  re-anchors.** `DatasetInspect`, `DatasetLint` and `DatasetPut` never return
+  or write held-out cases, from any version of the dataset: they report the
+  holdout's size and hash check, and a re-put carries the newest holdout
+  forward as it was. `EvalBaselinePin` never removes a pinned baseline, and
+  moves one only onto a run measured like it; a re-anchor is `crewhaus eval
+  --rebaseline --reason <code>`.
+
+- **Write-backs and proposals keep a change record.** `crewhaus optimize
+  --write-back`, `crewhaus optimize --from-advice --write-back` and an accepted
+  `crewhaus flywheel run` record the change they wrote to the spec: the spec
+  before and after under `.crewhaus/proposals/<id>/` (`0600`), and a row in
+  `.crewhaus/run/control/changes.jsonl`. `crewhaus
+  propose` files its proposal as a change record first, names its branch
+  `propose/<id>` after it, and stops before any git step when the record
+  cannot be written.
 
 ## [0.8.2] - 2026-11-12
 

@@ -195,7 +195,7 @@ export type DecisionRecordView = {
   readonly consumedAt?: string;
   readonly consumedByRun?: string;
   readonly always?: boolean;
-  readonly kind?: "tool" | "input" | "standing-rule-proposal";
+  readonly kind?: "tool" | "input" | "standing-rule-proposal" | "change-adoption";
   /** The decider as a stored actor: `prn_`, `local:#<digest>` or `sys:`. */
   readonly decidedByPrincipal?: string;
   readonly decidedVia?: string;
@@ -219,6 +219,16 @@ export type DecisionRecordView = {
   readonly proposedBy?: string;
   /** The tool approval a proposal was made from. */
   readonly derivedFrom?: string;
+  /** What a change-adoption decision is bound to: the change and the digests its check saw. */
+  readonly subject?: ChangeAdoptionSubject;
+};
+
+/** A change-adoption decision's subject: content-free ids, keyed digests and a revision. */
+export type ChangeAdoptionSubject = {
+  readonly chg: string;
+  readonly patchDigest: string;
+  readonly baseRevision: string;
+  readonly evidenceDigest: string;
 };
 
 /** What the workspace layers over a decision. A tool approval's deferral is on the record. */

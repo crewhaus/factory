@@ -13,6 +13,8 @@
  * A request to the owner is a `dec_` decision of kind `standing-rule-proposal`, on the
  * `decision` machine, in `.crewhaus/run/control/decisions/` (size segments). The first
  * decision on it wins through `casAppend(…, "pending", …)`: its generation claim decides.
+ * The same ledger holds `change-adoption` decisions (a change record waiting to be
+ * adopted); each reader reads its own kind and passes over the other known kind.
  *
  * Both ledgers are `harnessLedger`s, so they share the harness's control lock and claims
  * directory: a writer that holds the lock for one may compare-and-set on both
@@ -76,6 +78,43 @@ export type ProposalRow = {
   /** The rule a grant made. */
   readonly rule?: string;
 };
+
+/** What a change-adoption decision is bound to: content-free ids, keyed digests, a revision. */
+export type ChangeAdoptionSubjectRow = {
+  readonly chg: string;
+  readonly patchDigest: string;
+  readonly baseRevision: string;
+  readonly evidenceDigest: string;
+};
+
+/** A `dec_` decision that a change may be adopted, on the `decision` machine. */
+export type ChangeAdoptionRow = {
+  readonly id: string;
+  readonly kind: "change-adoption";
+  readonly createdAt: string;
+  /** When the decision stops waiting: it then reads `expired`. */
+  readonly expiresAt: string;
+  /** Who may decide: a maintainer, or the owner for a change to a protected, intent or
+   *  security surface. */
+  readonly requiredClass: "maintainer" | "owner";
+  readonly subject: ChangeAdoptionSubjectRow;
+  /** A keyed digest over the subject: what a grant is bound to. */
+  readonly bindingDigest: string;
+  readonly proposedBy: string;
+  readonly state: "pending" | "granted" | "denied" | "consumed" | "superseded";
+  readonly decision?: "grant" | "deny";
+  readonly decidedAt?: string;
+  readonly decidedByPrincipal?: string;
+  readonly consumedAt?: string;
+  readonly supersededAt?: string;
+  readonly supersededReason?: string;
+};
+
+/** The decision kinds the decisions ledger holds; a reader passes over the others. */
+const DECISION_ROW_KINDS: ReadonlySet<string> = new Set([
+  "standing-rule-proposal",
+  "change-adoption",
+]);
 
 export type LedgerRead<T> =
   | { readonly state: "absent" }
@@ -193,6 +232,8 @@ function readLedger<T>(
   fold: FoldAnswer,
   of: (row: LedgerRecord) => T | undefined,
   what: string,
+  /** A row of one of these other known kinds is another reader's, never an anomaly here. */
+  otherKinds: ReadonlySet<string> = new Set(),
 ): LedgerRead<T> {
   if (!fold.ok) {
     return fold.code === "not-found"
@@ -204,8 +245,13 @@ function readLedger<T>(
   const anomalies: string[] = [];
   for (const object of fold.objects.values()) {
     const row = of(object.record);
-    if (row === undefined) anomalies.push(`${object.id}: the row is not a ${what}`);
-    else rows.push(row);
+    if (row !== undefined) {
+      rows.push(row);
+      continue;
+    }
+    const kind = object.record["kind"];
+    if (typeof kind === "string" && otherKinds.has(kind)) continue;
+    anomalies.push(`${object.id}: the row is not a ${what}`);
   }
   for (const anomaly of fold.anomalies) {
     anomalies.push(
@@ -258,7 +304,90 @@ export function ruleIsLive(rule: StandingRuleRow, nowMs: number): boolean {
  * First consumers: the decision service and `crewhaus approvals rules`.
  */
 export function readProposals(harnessDir: string): LedgerRead<ProposalRow> {
-  return readLedger(foldStates(decisionsLedger(harnessDir)), proposalOf, "standing-rule request");
+  return readLedger(
+    foldStates(decisionsLedger(harnessDir)),
+    proposalOf,
+    "standing-rule request",
+    otherDecisionKinds("standing-rule-proposal"),
+  );
+}
+
+function otherDecisionKinds(own: string): ReadonlySet<string> {
+  return new Set([...DECISION_ROW_KINDS].filter((kind) => kind !== own));
+}
+
+const isDigestText = (value: unknown): value is string =>
+  typeof value === "string" && /^[A-Za-z0-9:_-]{8,200}$/.test(value);
+
+/**
+ * A row as a change-adoption decision, or `undefined` when it is not one.
+ *
+ * First consumer: {@link readChangeAdoptions}.
+ */
+export function changeAdoptionOf(row: LedgerRecord): ChangeAdoptionRow | undefined {
+  const r = withoutBookkeeping(row);
+  const subject = r["subject"];
+  const s =
+    typeof subject === "object" && subject !== null && !Array.isArray(subject)
+      ? (subject as Record<string, unknown>)
+      : undefined;
+  const state = r["state"];
+  const ok =
+    isId("dec", r["id"]) &&
+    r["kind"] === "change-adoption" &&
+    isTime(r["createdAt"]) &&
+    isTime(r["expiresAt"]) &&
+    (r["requiredClass"] === "maintainer" || r["requiredClass"] === "owner") &&
+    s !== undefined &&
+    isId("chg", s["chg"]) &&
+    isDigestText(s["patchDigest"]) &&
+    isDigestText(s["baseRevision"]) &&
+    isDigestText(s["evidenceDigest"]) &&
+    isDigestText(r["bindingDigest"]) &&
+    isStoredActor(r["proposedBy"]) &&
+    (state === "pending" ||
+      state === "granted" ||
+      state === "denied" ||
+      state === "consumed" ||
+      state === "superseded") &&
+    optional(r["decision"], (v) => v === "grant" || v === "deny") &&
+    optional(r["decidedAt"], isTime) &&
+    optional(r["decidedByPrincipal"], isStoredActor) &&
+    optional(r["consumedAt"], isTime) &&
+    optional(r["supersededAt"], isTime) &&
+    optional(r["supersededReason"], isText);
+  return ok ? (r as ChangeAdoptionRow) : undefined;
+}
+
+/**
+ * Every change-adoption decision in a harness, as its latest row says. A tolerant fold,
+ * like {@link readProposals}: a standing-rule request is passed over, any other row that
+ * is not one is reported.
+ *
+ * First consumers: the decision service and `@crewhaus/quality-service`.
+ */
+export function readChangeAdoptions(harnessDir: string): LedgerRead<ChangeAdoptionRow> {
+  return readLedger(
+    foldStates(decisionsLedger(harnessDir)),
+    changeAdoptionOf,
+    "change-adoption decision",
+    otherDecisionKinds("change-adoption"),
+  );
+}
+
+/**
+ * A change-adoption decision's state as every reader shows it: a pending one, or an
+ * unconsumed grant, past its `expiresAt` reads `expired`. Computed, never written.
+ *
+ * First consumers: the decision service and `@crewhaus/quality-service`.
+ */
+export function changeAdoptionState(
+  row: ChangeAdoptionRow,
+  nowMs: number,
+): ChangeAdoptionRow["state"] | "expired" {
+  if (row.state !== "pending" && row.state !== "granted") return row.state;
+  const ends = Date.parse(row.expiresAt);
+  return Number.isFinite(ends) && Number.isFinite(nowMs) && nowMs <= ends ? row.state : "expired";
 }
 
 /**

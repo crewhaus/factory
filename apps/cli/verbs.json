@@ -762,6 +762,131 @@
       ]
     },
     {
+      "verb": "changes",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "sub": {
+        "list": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "propose": {
+          "flags": [
+            {
+              "name": "from",
+              "takesValue": true
+            },
+            {
+              "name": "source",
+              "takesValue": true
+            },
+            {
+              "name": "kind",
+              "takesValue": true
+            },
+            {
+              "name": "dataset",
+              "takesValue": true
+            },
+            {
+              "name": "graders",
+              "takesValue": true
+            },
+            {
+              "name": "spec",
+              "takesValue": true
+            },
+            {
+              "name": "dry-run",
+              "takesValue": false
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "check": {
+          "flags": [
+            {
+              "name": "live",
+              "takesValue": false
+            },
+            {
+              "name": "yes",
+              "takesValue": false
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "adopt": {
+          "flags": [
+            {
+              "name": "expect",
+              "takesValue": true
+            },
+            {
+              "name": "without-holdout",
+              "takesValue": false
+            },
+            {
+              "name": "watch-hours",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "decline": {
+          "flags": [
+            {
+              "name": "reason",
+              "takesValue": true
+            }
+          ]
+        },
+        "withdraw": {
+          "flags": [
+            {
+              "name": "reason",
+              "takesValue": true
+            }
+          ]
+        },
+        "rollback": {
+          "flags": [
+            {
+              "name": "expect",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        }
+      },
+      "flags": null
+    },
+    {
       "verb": "channel",
       "kind": "legacy",
       "since": "0.8.0",
@@ -1940,6 +2065,18 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "fraction",
+              "takesValue": true
+            },
+            {
+              "name": "seed",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
             }
           ]
         },
@@ -1985,6 +2122,18 @@
             {
               "name": "help",
               "short": "h",
+              "takesValue": false
+            },
+            {
+              "name": "fraction",
+              "takesValue": true
+            },
+            {
+              "name": "seed",
+              "takesValue": true
+            },
+            {
+              "name": "json",
               "takesValue": false
             }
           ]
@@ -2032,6 +2181,18 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "fraction",
+              "takesValue": true
+            },
+            {
+              "name": "seed",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
             }
           ]
         },
@@ -2077,6 +2238,18 @@
             {
               "name": "help",
               "short": "h",
+              "takesValue": false
+            },
+            {
+              "name": "fraction",
+              "takesValue": true
+            },
+            {
+              "name": "seed",
+              "takesValue": true
+            },
+            {
+              "name": "json",
               "takesValue": false
             }
           ]
@@ -2124,6 +2297,18 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "fraction",
+              "takesValue": true
+            },
+            {
+              "name": "seed",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
             }
           ]
         },
@@ -2169,6 +2354,18 @@
             {
               "name": "help",
               "short": "h",
+              "takesValue": false
+            },
+            {
+              "name": "fraction",
+              "takesValue": true
+            },
+            {
+              "name": "seed",
+              "takesValue": true
+            },
+            {
+              "name": "json",
               "takesValue": false
             }
           ]
@@ -2216,6 +2413,134 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "fraction",
+              "takesValue": true
+            },
+            {
+              "name": "seed",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "holdout": {
+          "flags": [
+            {
+              "name": "file",
+              "takesValue": true
+            },
+            {
+              "name": "split",
+              "takesValue": true
+            },
+            {
+              "name": "split-spec",
+              "takesValue": true
+            },
+            {
+              "name": "canary",
+              "takesValue": false
+            },
+            {
+              "name": "spec",
+              "takesValue": true
+            },
+            {
+              "name": "graders",
+              "takesValue": true
+            },
+            {
+              "name": "force",
+              "takesValue": false
+            },
+            {
+              "name": "runs",
+              "takesValue": true
+            },
+            {
+              "name": "out",
+              "short": "o",
+              "takesValue": true
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            },
+            {
+              "name": "fraction",
+              "takesValue": true
+            },
+            {
+              "name": "seed",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "uses": {
+          "flags": [
+            {
+              "name": "file",
+              "takesValue": true
+            },
+            {
+              "name": "split",
+              "takesValue": true
+            },
+            {
+              "name": "split-spec",
+              "takesValue": true
+            },
+            {
+              "name": "canary",
+              "takesValue": false
+            },
+            {
+              "name": "spec",
+              "takesValue": true
+            },
+            {
+              "name": "graders",
+              "takesValue": true
+            },
+            {
+              "name": "force",
+              "takesValue": false
+            },
+            {
+              "name": "runs",
+              "takesValue": true
+            },
+            {
+              "name": "out",
+              "short": "o",
+              "takesValue": true
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            },
+            {
+              "name": "fraction",
+              "takesValue": true
+            },
+            {
+              "name": "seed",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
             }
           ]
         }
@@ -2261,6 +2586,18 @@
         {
           "name": "help",
           "short": "h",
+          "takesValue": false
+        },
+        {
+          "name": "fraction",
+          "takesValue": true
+        },
+        {
+          "name": "seed",
+          "takesValue": true
+        },
+        {
+          "name": "json",
           "takesValue": false
         }
       ]
@@ -4731,6 +5068,10 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "propose",
+              "takesValue": false
             }
           ]
         },
@@ -4792,6 +5133,10 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "propose",
+              "takesValue": false
             }
           ]
         }
@@ -4852,6 +5197,10 @@
         {
           "name": "help",
           "short": "h",
+          "takesValue": false
+        },
+        {
+          "name": "propose",
           "takesValue": false
         }
       ]
@@ -6595,6 +6944,18 @@
           "name": "help",
           "short": "h",
           "takesValue": false
+        },
+        {
+          "name": "propose",
+          "takesValue": false
+        },
+        {
+          "name": "replay-tools",
+          "takesValue": true
+        },
+        {
+          "name": "replay-miss",
+          "takesValue": true
         }
       ]
     },

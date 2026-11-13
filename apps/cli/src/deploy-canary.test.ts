@@ -826,3 +826,180 @@ describe("makeRoutingAwareCanaryGate", () => {
     expect(lines.join("\n")).toContain("--routing as-declared");
   });
 });
+
+describe("a canary step needs every case the control version measured", () => {
+  const notMeasured = (id: string): SampleResult => {
+    const s = sample(id, false, 0);
+    return {
+      ...s,
+      grades: {
+        ...s.grades,
+        overall: { ...s.grades.overall, status: "not_measured", statusReason: "no_proof_bundle" },
+      },
+    };
+  };
+  // The candidate passes what it measured and leaves the hardest case without a verdict.
+  const control = () =>
+    summary([sample("easy", true, 1), sample("mid", true, 1), sample("hard", false, 0)]);
+  const candidate = () =>
+    summary([sample("easy", true, 1), sample("mid", true, 1), notMeasured("hard")]);
+
+  test("the step fails naming the case, and the ramp rolls back", async () => {
+    const reg = createFileBackedRegistry({ rootDir: join(tmpRoot, "specs") });
+    await reg.put("hello", "v1", "spec-v1");
+    await reg.put("hello", "v2", "spec-v2");
+    await reg.pin("hello", "prod", "v1");
+    const audit = await openAuditLog({ rootDir: join(tmpRoot, "audit") });
+    const ctrl = createCanaryController({
+      registry: reg,
+      deploymentController: createDeploymentController({ registry: reg }),
+      auditLog: audit,
+    });
+    const gate = makeRegressionGate(
+      makeCanaryEvalGate({
+        evalVersion: async (v) => (v === "v1" ? control() : candidate()),
+      }),
+    );
+    const result = await driveCanaryRamp({
+      steps: [5, 100],
+      evaluateStep: (trafficPercent) =>
+        ctrl.evaluate(
+          { name: "hello", fromVersion: "v1", toVersion: "v2", trafficPercent },
+          { intervalMs: 0, gate },
+        ),
+    });
+    expect(result.promoted).toBe(false);
+    expect(result.steps[0]?.action).toBe("rollback");
+    expect(result.steps[0]?.reason).toBe(
+      "cases the control version measured were not measured by the candidate: hard",
+    );
+    expect(await reg.aliasFor("hello", "prod")).toBe("v1");
+  });
+
+  test("the routing-aware gate fails the step the same way, before any routing delta", async () => {
+    const gate = makeRoutingAwareCanaryGate({
+      evalVersion: async (v) => (v === "v1" ? control() : candidate()),
+      priceUsd: () => 0,
+    });
+    const verdict = await gate({
+      name: "hello",
+      fromVersion: "v1",
+      toVersion: "v2",
+      trafficPercent: 5,
+    } as never);
+    expect(verdict).toEqual({
+      verdict: "fail",
+      reason: "cases the control version measured were not measured by the candidate: hard",
+    });
+  });
+
+  test("projected against the control, the unmeasured case is a failure, never a lift", () => {
+    const records = experimentOutcomesFromEvalRun({
+      experiment: "hello",
+      version: "v2",
+      summary: candidate(),
+      ts: "2026-07-02T00:00:00Z",
+      control: control(),
+    });
+    expect(records.map((r) => [r.requestKey, r.outcome, r.score])).toEqual([
+      ["easy", "success", 1],
+      ["mid", "success", 1],
+      ["hard", "failure", 0],
+    ]);
+    // With no control run, a case with no verdict is left out.
+    expect(
+      experimentOutcomesFromEvalRun({
+        experiment: "hello",
+        version: "v2",
+        summary: candidate(),
+        ts: "2026-07-02T00:00:00Z",
+      }).map((r) => r.requestKey),
+    ).toEqual(["easy", "mid"]);
+  });
+
+  /** The success rate over a projection's records. */
+  const rateOf = (records: ReadonlyArray<{ outcome: string }>): number =>
+    records.filter((r) => r.outcome === "success").length / records.length;
+
+  test("projected against the control, a case the candidate's run leaves out is a failure", () => {
+    const left = summary([sample("easy", true, 1), sample("mid", true, 1)]);
+    const records = experimentOutcomesFromEvalRun({
+      experiment: "hello",
+      version: "v2",
+      summary: left,
+      ts: "2026-07-02T00:00:00Z",
+      control: control(),
+    });
+    expect(records.map((r) => [r.requestKey, r.outcome, r.score])).toEqual([
+      ["easy", "success", 1],
+      ["mid", "success", 1],
+      ["hard", "failure", 0],
+    ]);
+    const controlRecords = experimentOutcomesFromEvalRun({
+      experiment: "hello",
+      version: "v1",
+      summary: control(),
+      ts: "2026-07-02T00:00:00Z",
+    });
+    expect(rateOf(records)).toBeLessThanOrEqual(rateOf(controlRecords));
+  });
+
+  const abstained = (id: string): SampleResult => {
+    const s = sample(id, false, 0);
+    return { ...s, grades: { ...s.grades, overall: { ...s.grades.overall, abstained: true } } };
+  };
+  // The candidate's judge abstains on the case the control failed.
+  const abstaining = () =>
+    summary([sample("easy", true, 1), sample("mid", true, 1), abstained("hard")]);
+
+  test("a candidate that abstains on a case the control measured fails the step naming it", async () => {
+    const gate = makeCanaryEvalGate({
+      evalVersion: async (v) => (v === "v1" ? control() : abstaining()),
+    });
+    const verdict = await gate({
+      name: "hello",
+      fromVersion: "v1",
+      toVersion: "v2",
+      trafficPercent: 5,
+    } as never);
+    expect(verdict).toEqual({
+      verdict: "fail",
+      reason: "cases the control version measured were not measured by the candidate: hard",
+    });
+  });
+
+  test("projected against the control, an abstained case the control measured is a failure", () => {
+    const records = experimentOutcomesFromEvalRun({
+      experiment: "hello",
+      version: "v2",
+      summary: abstaining(),
+      ts: "2026-07-02T00:00:00Z",
+      control: control(),
+    });
+    expect(records.map((r) => [r.requestKey, r.outcome, r.score])).toEqual([
+      ["easy", "success", 1],
+      ["mid", "success", 1],
+      ["hard", "failure", 0],
+    ]);
+  });
+
+  test("the traffic-split recorder projects the candidate against the control's run", () => {
+    const appended: Array<{ version: string; outcome: string; requestKey?: string }> = [];
+    const recorder = makeTrafficSplitRecorder({
+      experiment: "hello",
+      dir: tmpRoot,
+      baselineVersion: "v1",
+      candidateVersion: "v2",
+      append: (records) => {
+        for (const r of records) appended.push(r);
+      },
+      writeAssignment: () => {},
+      removeAssignment: () => false,
+    });
+    recorder.recordVersionRun("v1", control());
+    recorder.recordVersionRun("v2", candidate());
+    recorder.finish("rolled-back");
+    const candidateHard = appended.find((r) => r.version === "v2" && r.requestKey === "hard");
+    expect(candidateHard?.outcome).toBe("failure");
+  });
+});

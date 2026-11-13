@@ -479,9 +479,6 @@ test("the vacuous-gate flag describes the state the call LEAVES behind", async (
     runId: "r1",
   });
   expect(real["vacuousGateRisk"]).toBe(false);
-
-  const cleared = await call(evalBaselinePin, { action: "clear", spec: "shop", dataset: "smoke" });
-  expect(cleared["vacuousGateRisk"]).toBe(true);
 });
 
 test("a pin records the run's own timestamp, not the clock", async () => {
@@ -492,30 +489,50 @@ test("a pin records the run's own timestamp, not the clock", async () => {
   expect((onDisk["shop::smoke"] as Json)["ts"]).toBe("2026-01-01T00:00:00Z");
 });
 
-test("a committed clear reports the state it LEAVES, not the pin it removed", async () => {
-  writeIndex(root, [row({ runId: "r1", ts: "2026-01-01T00:00:00Z" })]);
-  writeBaselines(root, { "shop::smoke": pin(row({ runId: "r1", ts: "2026-01-01T00:00:00Z" })) });
-  const out = await call(evalBaselinePin, { action: "clear", spec: "shop", dataset: "smoke" });
-  expect(out["committed"]).toBe(true);
-  // `pinned` is what the call FOUND — reported on its own it reads as "this
-  // lineage is pinned to r1", which is the opposite of what just happened.
-  expect((out["pinned"] as Json)["runId"]).toBe("r1");
-  expect(out["pinnedAfter"]).toBeNull();
-  expect(out["vacuousGateRisk"]).toBe(true);
-  expect(JSON.parse(readFileSync(baselinesPath(), "utf8"))).toEqual({});
-});
-
-test("clearing removes the named pin and leaves every sibling in place", async () => {
+test("EvalBaselinePin never removes a pinned baseline, and names the commands a person uses", async () => {
   writeIndex(root, [row({ runId: "r1", ts: "2026-01-01T00:00:00Z" })]);
   writeBaselines(root, {
     "shop::smoke": pin(row({ runId: "r1", ts: "2026-01-01T00:00:00Z" })),
     "shop::other": pin(row({ runId: "r2", ts: "2026-01-01T00:00:00Z", datasetName: "other" })),
   });
-  const out = await call(evalBaselinePin, { action: "clear", spec: "shop", dataset: "smoke" });
-  expect(out["committed"]).toBe(true);
-  const onDisk = JSON.parse(readFileSync(baselinesPath(), "utf8")) as Json;
-  expect(Object.keys(onDisk)).toEqual(["shop::other"]);
-  expect(String((out["warnings"] as string[]).join(" "))).toMatch(/nothing to fail against/);
+  const before = readFileSync(baselinesPath(), "utf8");
+  for (const dryRun of [true, false]) {
+    const out = await call(evalBaselinePin, {
+      action: "clear",
+      spec: "shop",
+      dataset: "smoke",
+      dryRun,
+    });
+    expect(out["ok"]).toBe(false);
+    expect(out["code"]).toBe("refused");
+    expect(String(out["error"])).toContain("never removes a pinned baseline");
+    expect(String(out["error"])).toContain("`crewhaus eval --rebaseline --reason <code>`");
+    expect(String(out["error"])).toContain("`crewhaus eval-report baseline set`");
+    expect(readFileSync(baselinesPath(), "utf8")).toBe(before);
+  }
+});
+
+test("a pinned baseline stays on its run when asked to clear it or to move it onto a run measured differently", async () => {
+  writeRun(root, "r2", { samples: [sample({ sampleId: "a" })] });
+  writeIndex(root, [
+    row({ runId: "r1", ts: "2026-01-01T00:00:00Z" }),
+    row({ runId: "r2", ts: "2026-01-02T00:00:00Z", gradersHash: "graders-2" }),
+  ]);
+  writeBaselines(root, { "shop::smoke": pin(row({ runId: "r1", ts: "2026-01-01T00:00:00Z" })) });
+  const before = readFileSync(baselinesPath(), "utf8");
+  const cleared = await call(evalBaselinePin, { action: "clear", spec: "shop", dataset: "smoke" });
+  expect(cleared["code"]).toBe("refused");
+  expect(readFileSync(baselinesPath(), "utf8")).toBe(before);
+  const set = await call(evalBaselinePin, {
+    action: "set",
+    spec: "shop",
+    dataset: "smoke",
+    runId: "r2",
+  });
+  expect(set["code"]).toBe("refused");
+  expect(readFileSync(baselinesPath(), "utf8")).toBe(before);
+  const pins = JSON.parse(before) as Record<string, Json>;
+  expect(pins["shop::smoke"]?.["runId"]).toBe("r1");
 });
 
 test("clearing a lineage that has no pin changes nothing and says the file is unchanged", async () => {
@@ -914,11 +931,36 @@ test("a fully covered dataset really does report zero gaps", async () => {
   expect(out["sessionsScanned"]).toBe(1);
 }, 20_000);
 
-test("re-pinning across an instrument change warns that it re-baselines", async () => {
+test("EvalBaselinePin pins only a run measured like the pin it replaces; a re-anchor names the command", async () => {
   writeRun(root, "r2", { samples: [sample({ sampleId: "a" })] });
   writeIndex(root, [
     row({ runId: "r1", ts: "2026-01-01T00:00:00Z" }),
     row({ runId: "r2", ts: "2026-01-02T00:00:00Z", gradersHash: "graders-2" }),
+  ]);
+  writeBaselines(root, { "shop::smoke": pin(row({ runId: "r1", ts: "2026-01-01T00:00:00Z" })) });
+  const before = readFileSync(baselinesPath(), "utf8");
+  for (const dryRun of [true, false]) {
+    const out = await call(evalBaselinePin, {
+      action: "set",
+      spec: "shop",
+      dataset: "smoke",
+      runId: "r2",
+      dryRun,
+    });
+    expect(out["ok"]).toBe(false);
+    expect(out["code"]).toBe("refused");
+    expect(String(out["error"])).toContain("measured differently from the pinned run r1");
+    expect(String(out["error"])).toContain("gradersHash");
+    expect(String(out["error"])).toContain("`crewhaus eval --rebaseline --reason <code>`");
+    expect(readFileSync(baselinesPath(), "utf8")).toBe(before);
+  }
+});
+
+test("EvalBaselinePin still pins a run measured with the same instrument", async () => {
+  writeRun(root, "r2", { samples: [sample({ sampleId: "a" })] });
+  writeIndex(root, [
+    row({ runId: "r1", ts: "2026-01-01T00:00:00Z" }),
+    row({ runId: "r2", ts: "2026-01-02T00:00:00Z" }),
   ]);
   writeBaselines(root, { "shop::smoke": pin(row({ runId: "r1", ts: "2026-01-01T00:00:00Z" })) });
   const out = await call(evalBaselinePin, {
@@ -928,9 +970,9 @@ test("re-pinning across an instrument change warns that it re-baselines", async 
     runId: "r2",
   });
   expect(out["committed"]).toBe(true);
-  expect(String((out["warnings"] as string[]).join(" "))).toMatch(
-    /gradersHash graders-1 -> graders-2/,
-  );
+  const pins = JSON.parse(readFileSync(baselinesPath(), "utf8")) as Record<string, Json>;
+  expect(pins["shop::smoke"]?.["runId"]).toBe("r2");
+  expect(pins["shop::smoke"]?.["rebaselined"]).toBeUndefined();
 });
 
 test("the newest sessions are the ones read when the count is capped", async () => {

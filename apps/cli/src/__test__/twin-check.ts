@@ -254,6 +254,17 @@ const peopleNeedsOne = (sub: string, what: string): Requirement => ({
   pins: [{ file: "people-cmd.ts", text: `exactlyOne("${sub}", args, "${what}")` }],
 });
 
+const changesNeedsOne = (sub: string, flag?: string): Requirement => ({
+  positionals: { min: 1, max: 1 },
+  ...(flag !== undefined ? { flags: [flag] } : {}),
+  pins: [
+    { file: "changes-cmd.ts", text: `changeId("${sub}", args)` },
+    ...(flag !== undefined
+      ? [{ file: "changes-cmd.ts", text: `requireValue("${sub}", args, "${flag}")` }]
+      : []),
+  ],
+});
+
 /**
  * The commands that parse but refuse to start without more, keyed by
  * `verb` or `verb sub`. A command shown in Home that misses one of these
@@ -390,6 +401,28 @@ export const REQUIRED: Readonly<Record<string, Requirement>> = {
   "people export": peopleNeedsOne("export", "<psn_…>"),
   "people activity": peopleNeedsOne("activity", "<psn_…>"),
   "people erase": peopleNeedsOne("erase", "<psn_…>"),
+  "changes show": changesNeedsOne("show"),
+  "changes check": changesNeedsOne("check"),
+  "changes withdraw": changesNeedsOne("withdraw"),
+  "changes adopt": changesNeedsOne("adopt", "expect"),
+  "changes rollback": changesNeedsOne("rollback", "expect"),
+  "changes decline": changesNeedsOne("decline", "reason"),
+  "changes propose": {
+    positionals: { max: 0 },
+    flags: ["from"],
+    pins: [{ file: "changes-cmd.ts", text: 'requireValue("propose", args, "from")' }],
+  },
+  "datasets holdout": {
+    positionals: { min: 1 },
+    flags: ["fraction"],
+    pins: [
+      {
+        file: "index.ts",
+        within: "async function runDatasetsHoldout(",
+        text: 'die("datasets holdout: missing --fraction <f> (e.g. 0.2)")',
+      },
+    ],
+  },
 };
 
 /** Why `given` falls short of what `key` needs, or null. */

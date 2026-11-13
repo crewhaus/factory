@@ -75,6 +75,7 @@ import {
   HistoryWriteError,
   type LoadedRun,
   type MeasuredOptions,
+  type PinOutcome,
   type RebaselineReason,
   type RecordEvalRunOptions,
   type ReportDiff,
@@ -202,6 +203,13 @@ export type FinishEvalOptions = {
   readonly ownerCheck?: () =>
     | { readonly ok: true; readonly principal?: string }
     | { readonly ok: false; readonly reason: string };
+  /**
+   * Run a re-anchor (`rebaseline`, `regradeBaseline`) under a command receipt: called
+   * with the pin, which takes the receipt's id for the mark it records. Absent, the pin
+   * runs with no receipt. A hook that cannot write its receipt answers a `receipt`
+   * refusal, and the baseline is kept.
+   */
+  readonly reanchorCommand?: (pin: (receipt?: string) => PinOutcome) => Promise<PinOutcome>;
 };
 
 export type FinishEvalResult = {
@@ -1005,15 +1013,21 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     warnReplayedPin();
     let outcome: ReturnType<typeof pinRun>;
     try {
-      outcome = pinRun(entry, entry.ts, opts.evalsDir, {
-        rebaselined: {
-          from: replaced.runId,
-          reason: "instrument-changed",
-          cmd: "crewhaus eval --regrade-baseline",
-          ...(owner.mark ?? {}),
-        },
-        ownerCheck: askOwner,
-      });
+      const pinWith = (receipt?: string): PinOutcome =>
+        pinRun(entry, entry.ts, opts.evalsDir, {
+          rebaselined: {
+            from: replaced.runId,
+            reason: "instrument-changed",
+            cmd: "crewhaus eval --regrade-baseline",
+            ...(owner.mark ?? {}),
+            ...(receipt !== undefined ? { receipt } : {}),
+          },
+          ownerCheck: askOwner,
+        });
+      outcome =
+        opts.reanchorCommand !== undefined
+          ? await opts.reanchorCommand(pinWith)
+          : pinWith(undefined);
     } catch (err) {
       if (!(err instanceof HistoryWriteError)) throw err;
       historyRefused("baseline not re-anchored", err);
@@ -1027,6 +1041,7 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     }
     if (!outcome.ok) {
       write(`[eval] --regrade-baseline: ${outcome.refusal.reason}`);
+      if (outcome.refusal.code === "receipt") write(`[eval] baseline kept: ${replaced.runId}`);
       return fail(`--regrade-baseline: ${outcome.refusal.reason}`);
     }
     write(`[eval] baseline re-anchored: ${summary.runId} (instrument-changed, regraded)`);
@@ -1106,15 +1121,21 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     warnReplayedPin();
     let outcome: ReturnType<typeof pinRun>;
     try {
-      outcome = pinRun(entry, entry.ts, opts.evalsDir, {
-        rebaselined: {
-          ...(replaced !== undefined ? { from: replaced.runId } : {}),
-          reason: rebaseline.reason,
-          cmd: rebaseline.cmd,
-          ...(protectedMark ?? {}),
-        },
-        ownerCheck: askOwner,
-      });
+      const pinWith = (receipt?: string): PinOutcome =>
+        pinRun(entry, entry.ts, opts.evalsDir, {
+          rebaselined: {
+            ...(replaced !== undefined ? { from: replaced.runId } : {}),
+            reason: rebaseline.reason,
+            cmd: rebaseline.cmd,
+            ...(protectedMark ?? {}),
+            ...(receipt !== undefined ? { receipt } : {}),
+          },
+          ownerCheck: askOwner,
+        });
+      outcome =
+        opts.reanchorCommand !== undefined
+          ? await opts.reanchorCommand(pinWith)
+          : pinWith(undefined);
     } catch (err) {
       if (!(err instanceof HistoryWriteError)) throw err;
       historyRefused("baseline not re-anchored", err);
@@ -1127,6 +1148,14 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     }
     if (!outcome.ok) {
       write(`[eval] --rebaseline: ${outcome.refusal.reason}`);
+      if (outcome.refusal.code === "receipt") {
+        write(`[eval] baseline kept: ${replaced?.runId ?? "(none)"}`);
+        return {
+          gateFailed: true,
+          gateReason: `--rebaseline: ${outcome.refusal.reason}`,
+          refused: outcome.refusal.reason,
+        };
+      }
       return opts.gateRequested
         ? { gateFailed: true, gateReason: `--rebaseline: ${outcome.refusal.reason}` }
         : { gateFailed: false };

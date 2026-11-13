@@ -155,3 +155,18 @@ export function _releaseHeldLeasesForTest(): void {
   for (const lease of held.values()) lease.release();
   held.clear();
 }
+
+/**
+ * Whether this process holds the harness's mutating lease now: it took it, or it runs
+ * as a job under the lease that holds the harness (`CREWHAUS_LEASE_REF`).
+ */
+export function holdsCliMutatingLease(
+  harnessDir: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  if (held.has(harnessDir)) return true;
+  const ref = env[LEASE_REF_ENV];
+  if (ref === undefined || ref === "") return false;
+  const current = readMutatingLease(harnessDir);
+  return current.state === "present" && current.lease.leaseRef === ref;
+}

@@ -1790,6 +1790,94 @@ describe("finishEvalRun — --rebaseline re-anchors the lineage", () => {
   });
 });
 
+describe("finishEvalRun — a re-anchor runs under its command receipt", () => {
+  async function anchored(ctx: ReturnType<typeof newCtx>) {
+    await finish(
+      ctx,
+      makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], { gradersHash: "g1" }),
+    );
+    return makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", false, 0)], {
+      gradersHash: "g2",
+    });
+  }
+
+  test("the pin's mark names the receipt the hook wrote it under, and the hook ran once", async () => {
+    const ctx = newCtx();
+    const next = await anchored(ctx);
+    const receipts: string[] = [];
+    const result = await finishEvalRun({
+      summary: next,
+      specName: "concierge",
+      datasetHash: "d".repeat(64),
+      outDir: next.outDir,
+      gateRequested: true,
+      promote: true,
+      evalsDir: ctx.evalsDir,
+      write: ctx.write,
+      warn: ctx.warn,
+      rebaseline: { reason: "instrument-changed", cmd: "crewhaus eval --rebaseline" },
+      reanchorCommand: async (pin) => {
+        const id = "cmd_01m76e6f05hp514w9j4v3qymka";
+        receipts.push(id);
+        return pin(id);
+      },
+    });
+    expect(result).toEqual({ gateFailed: false, rebaselined: true });
+    expect(receipts).toEqual(["cmd_01m76e6f05hp514w9j4v3qymka"]);
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.rebaselined).toEqual({
+      from: "run_aaaa1111aaaa1111",
+      reason: "instrument-changed",
+      cmd: "crewhaus eval --rebaseline",
+      receipt: "cmd_01m76e6f05hp514w9j4v3qymka",
+    });
+  });
+
+  test("a receipt that cannot be written keeps the baseline, and says so", async () => {
+    const ctx = newCtx();
+    const next = await anchored(ctx);
+    const result = await finishEvalRun({
+      summary: next,
+      specName: "concierge",
+      datasetHash: "d".repeat(64),
+      outDir: next.outDir,
+      gateRequested: false,
+      promote: true,
+      evalsDir: ctx.evalsDir,
+      write: ctx.write,
+      warn: ctx.warn,
+      rebaseline: { reason: "instrument-changed", cmd: "crewhaus eval --rebaseline" },
+      reanchorCommand: async () => ({
+        ok: false,
+        refusal: { code: "receipt", reason: "the re-anchor's receipt could not be written" },
+      }),
+    });
+    expect(result.gateFailed).toBe(true);
+    expect(result.refused).toContain("receipt could not be written");
+    expect(ctx.lines).toContain("[eval] baseline kept: run_aaaa1111aaaa1111");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+  });
+
+  test("without a hook, the mark has no receipt and every existing pin keeps its bytes", async () => {
+    const ctx = newCtx();
+    const next = await anchored(ctx);
+    await finishEvalRun({
+      summary: next,
+      specName: "concierge",
+      datasetHash: "d".repeat(64),
+      outDir: next.outDir,
+      gateRequested: true,
+      promote: true,
+      evalsDir: ctx.evalsDir,
+      write: ctx.write,
+      warn: ctx.warn,
+      rebaseline: { reason: "instrument-changed", cmd: "crewhaus eval --rebaseline" },
+    });
+    expect("receipt" in (getBaseline("concierge", "smoke", ctx.evalsDir)?.rebaselined ?? {})).toBe(
+      false,
+    );
+  });
+});
+
 describe("finishEvalRun — a regression-union run gates against its primary's baseline", () => {
   test("gates on the shared cases, names the predecessor, and pins its own lineage on a pass", async () => {
     const ctx = newCtx();

@@ -514,12 +514,24 @@ describe("the table holds together", () => {
     expect(CORE.some((op) => op.id === "deployments.rollback")).toBe(false);
   });
 
-  test("every twin verb and placeholder is used", () => {
-    expect(unusedTwinVocabulary(OPERATIONS, ENV, ["grant", "deny"])).toEqual([]);
+  // A kind with no row yet carries its twin itself, so its vocabulary is used.
+  const cliFirst = Object.values(COMMAND_KINDS).flatMap((kind) =>
+    "noRowReason" in kind && kind.noRowReason !== undefined
+      ? [{ ...OPERATIONS[0], id: kind.id, cliTwin: kind.cliTwin } as OperationRow]
+      : [],
+  );
+
+  test("every twin verb and placeholder is used, by a row or by a kind the CLI submits first", () => {
+    expect(cliFirst.length).toBe(9);
+    expect(unusedTwinVocabulary([...OPERATIONS, ...cliFirst], ENV, ["grant", "deny"])).toEqual([]);
+    // Without them the quality vocabulary would be unused.
+    expect(unusedTwinVocabulary(OPERATIONS, ENV, ["grant", "deny"])).toContain("{chg}");
   });
 
   test("a verb-slot {choice} counts for both verbs, or neither", () => {
-    const withoutChoice = OPERATIONS.filter((op) => op.id !== "decisions.resolve");
+    const withoutChoice = [...OPERATIONS, ...cliFirst].filter(
+      (op) => op.id !== "decisions.resolve",
+    );
     expect(unusedTwinVocabulary(withoutChoice, ENV, ["grant", "deny"])).toEqual([
       "approvals grant",
       "approvals deny",
@@ -649,6 +661,22 @@ describe("each rule sees its own planted defect", () => {
     expect(
       checkOperations(OPERATIONS, { ...ENV, commandKinds: [...ENV.commandKinds, extra as never] }),
     ).toEqual(["nope: a kind with no row"]);
+  });
+  test("a kind the CLI submits first says why it has no row, and only then", () => {
+    const pause = (COMMAND_KINDS as Record<string, never>)["controls.pause"];
+    const reasoned = { ...(pause as object), id: "nope", noRowReason: "later" };
+    expect(
+      checkOperations(OPERATIONS, {
+        ...ENV,
+        commandKinds: [...ENV.commandKinds, reasoned as never],
+      }),
+    ).toEqual([]);
+    const both = ENV.commandKinds.map((kind) =>
+      kind.id === "controls.pause" ? { ...kind, noRowReason: "later" } : kind,
+    );
+    expect(checkOperations(OPERATIONS, { ...ENV, commandKinds: both })).toEqual([
+      "controls.pause: a kind with a row gives a reason for having none",
+    ]);
   });
   test("a command kind on a row with no receipt", () => {
     const kind = { ...ENV.commandKinds[0], id: "me.get", permission: "authenticated" } as never;

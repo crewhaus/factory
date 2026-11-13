@@ -16,7 +16,7 @@
  * an exit code, and bad arguments throw plain `Error`s that `index.ts` routes
  * through `die()`. The clock, the owner check and the regrade are injected.
  */
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
@@ -52,7 +52,14 @@ import {
   createRegrade,
   readRecordedRun,
 } from "@crewhaus/eval-runner";
-import { appendContained } from "@crewhaus/tool-safety/fs";
+import {
+  CRITERIA_APPLY_CMD,
+  CRITERIA_HISTORY_REL,
+  type CriteriaHistoryLine,
+  appendCriteriaHistory,
+  gradersRevision,
+  readCriteriaHistory,
+} from "@crewhaus/quality-service/criteria-history";
 import { parse as parseYaml } from "yaml";
 import { type OwnerCheck, ownerCheck as defaultOwnerCheck } from "./owner-check";
 import type { CliFamily } from "./verbs";
@@ -93,17 +100,12 @@ export type CriteriaCommandOptions = {
   readonly regrade?: (args: PreviewRegradeArgs) => Promise<EvalRunSummary>;
 };
 
-/** Where the criteria history log lives, under the harness directory. */
-export const CRITERIA_HISTORY_REL = join(
-  ".crewhaus",
-  "run",
-  "control",
-  "quality",
-  "criteria-history.jsonl",
-);
-
-/** The command a history line records. */
-export const CRITERIA_APPLY_CMD = "crewhaus criteria apply";
+/** The criteria history log lives in `@crewhaus/quality-service`; re-exported here. */
+export {
+  CRITERIA_APPLY_CMD,
+  CRITERIA_HISTORY_REL,
+  gradersRevision,
+} from "@crewhaus/quality-service/criteria-history";
 
 const CRITERIA_USAGE_LINES: readonly string[] = [
   "usage:",
@@ -223,11 +225,6 @@ type GradersFile = {
   readonly compiled: ReadonlyArray<CompiledGrader>;
 };
 
-/** The revision `apply --expect` compares: sha256 of the file's raw text. */
-export function gradersRevision(text: string): string {
-  return `sha256:${createHash("sha256").update(text).digest("hex")}`;
-}
-
 function readGraders(session: Session, args: Args): GradersFile {
   const path = resolve(session.cwd, args.values.get("graders") ?? join("eval", "graders.yaml"));
   if (!existsSync(path)) {
@@ -262,36 +259,9 @@ function readSpecDoc(session: Session, args: Args): SpecFile {
   return { path, harnessDir, doc: record, ...(name !== undefined ? { name } : {}) };
 }
 
-/** A history line: `{criterion, digest, at, cmd, by?}`. */
-type HistoryLine = {
-  readonly criterion: string;
-  readonly digest: string;
-  readonly at: string;
-  readonly cmd: string;
-  readonly by?: string;
-};
+type HistoryLine = CriteriaHistoryLine;
 
-function historyPath(harnessDir: string): string {
-  return join(harnessDir, CRITERIA_HISTORY_REL);
-}
-
-function readHistory(harnessDir: string): HistoryLine[] {
-  const path = historyPath(harnessDir);
-  if (!existsSync(path)) return [];
-  const out: HistoryLine[] = [];
-  for (const line of readFileSync(path, "utf8").split("\n")) {
-    if (line.trim() === "") continue;
-    try {
-      const parsed = JSON.parse(line) as Partial<HistoryLine>;
-      if (typeof parsed.criterion === "string" && typeof parsed.digest === "string") {
-        out.push(parsed as HistoryLine);
-      }
-    } catch {
-      // a torn line is left out
-    }
-  }
-  return out;
-}
+const readHistory = readCriteriaHistory;
 
 /** `r<n>`: the digest's place among the criterion's recorded revisions, or "edited outside Home". */
 function revisionOf(history: ReadonlyArray<HistoryLine>, id: string, digest: string): string {
@@ -776,20 +746,13 @@ function applyVerb(session: Session, argv: readonly string[]): CriteriaCommandRe
   writeFileSync(file.path, result.yaml);
   const at = new Date(session.now()).toISOString();
   const by = owner.ok && owner.principal !== undefined ? { by: owner.principal } : {};
-  const logged = result.changed.filter((c) => c.after !== undefined);
-  if (logged.length > 0) {
+  {
     // Contained in the harness directory, and never through a link at the file.
-    const appended = appendContained(
-      spec.harnessDir,
-      CRITERIA_HISTORY_REL,
-      logged
-        .map(
-          (c) =>
-            `${JSON.stringify({ criterion: c.criterion, digest: c.after, at, cmd: CRITERIA_APPLY_CMD, ...by })}\n`,
-        )
-        .join(""),
-      { createParents: true },
-    );
+    const appended = appendCriteriaHistory(spec.harnessDir, result.changed, {
+      at,
+      cmd: CRITERIA_APPLY_CMD,
+      ...by,
+    });
     if (!appended.ok) {
       return {
         lines: [

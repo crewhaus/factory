@@ -16,6 +16,12 @@
  * `invalid`. Only the owner makes a rule: a member's `always` grants once and files a
  * request (`dec_`, kind `standing-rule-proposal`) the owner grants or denies here.
  *
+ * A `dec_` of kind `change-adoption` asks whether a checked change may be adopted. A
+ * member whose class reaches the decision's `requiredClass` grants or denies it (the
+ * owner reaches every class; a harness with no approver projection is single-owner),
+ * and a service principal never decides one, whatever its class. The first decision
+ * wins; nothing is applied on a grant: adopting is the change's own command.
+ *
  * The service writes no receipt itself: Home's receipts middleware does for its routes,
  * and the CLI wraps each call in `commands.submit`. A rule's own step can be wrapped in
  * a command of its own through `hooks.ruleCommand`, so its row carries that receipt.
@@ -39,14 +45,17 @@ import {
 } from "@crewhaus/control-contract";
 import {
   type ApproverRead,
+  type ChangeAdoptionRow,
   PROPOSAL_TTL_MS,
   type ProposalRow,
   type StandingRuleRow,
   casAppend,
+  changeAdoptionState,
   decisionsLedger,
   ensureDigestKey,
   proposalState,
   readApproverProjection,
+  readChangeAdoptions,
   readProposals,
   storedLocalActor,
 } from "@crewhaus/control-records";
@@ -295,6 +304,8 @@ export type ResolveAnswer = {
   readonly ruleError?: string;
   /** The request to the owner this decision filed or decided. */
   readonly proposal?: ProposalRow;
+  /** The change-adoption decision this decided. */
+  readonly adoption?: ChangeAdoptionRow;
 };
 
 export type SupersedeRequest = {
@@ -398,6 +409,80 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
   ): Promise<RuleWriteAnswer> =>
     hooks?.ruleCommand !== undefined ? hooks.ruleCommand(run) : run(undefined);
 
+  /**
+   * Whether this actor may decide a change-adoption decision of `requiredClass`: never a
+   * service principal; every local user on a harness with no approver projection; else
+   * a member whose class reaches it, now.
+   */
+  const mayDecideAdoption = (
+    harnessDir: string,
+    who: ApprovalPrincipal,
+    requiredClass: ChangeAdoptionRow["requiredClass"],
+  ): boolean => {
+    if (who.service === true) return false;
+    const read = approvers(harnessDir);
+    if (read.state === "absent") return true;
+    if (read.state !== "present" || who.principal === undefined) return false;
+    return memberMayDecide(read.projection, who.principal, requiredClass, deps.now());
+  };
+
+  async function resolveAdoption(
+    request: ResolveRequest,
+    harnessDir: string,
+    who: ApprovalPrincipal,
+    row: ChangeAdoptionRow,
+  ): Promise<ResolveAnswer> {
+    const read = approvers(harnessDir);
+    if (read.state === "unreadable") {
+      return {
+        outcome: "forbidden",
+        record: null,
+        reason: `this harness's list of who may approve cannot be read (${read.reason}); rewrite it with \`crewhaus access sync\``,
+      };
+    }
+    if (who.service === true) {
+      return {
+        outcome: "forbidden",
+        record: null,
+        adoption: row,
+        reason: "a service credential never decides whether a change is adopted; a person does",
+      };
+    }
+    if (!mayDecideAdoption(harnessDir, who, row.requiredClass)) {
+      return {
+        outcome: "forbidden",
+        record: null,
+        adoption: row,
+        reason: needsClassReason(row.requiredClass),
+      };
+    }
+    const nowMs = deps.now();
+    const state = changeAdoptionState(row, nowMs);
+    if (state === "expired") return { outcome: "expired", record: null, adoption: row };
+    if (state !== "pending") return { outcome: "already-decided", record: null, adoption: row };
+    if (request.expect !== undefined && request.expect !== "pending") {
+      return { outcome: "stale", record: null, adoption: row, reason: "the decision is pending" };
+    }
+    const by = await storedActor(harnessDir, request.actor, who);
+    const decided: ChangeAdoptionRow = {
+      ...row,
+      state: request.choice === "grant" ? "granted" : "denied",
+      decision: request.choice,
+      decidedAt: new Date(nowMs).toISOString(),
+      decidedByPrincipal: by,
+    };
+    // The first decision wins: its generation claim decides. A grant applies nothing.
+    const cas = await casAppend(decisionsLedger(harnessDir), row.id, "pending", decided);
+    if (!cas.ok) throw new Error(`control-service: the decision cannot be made: ${cas.reason}`);
+    if (!cas.applied) {
+      const current = readChangeAdoptions(harnessDir);
+      const winner =
+        current.state === "present" ? current.rows.find((r) => r.id === row.id) : undefined;
+      return { outcome: "already-decided", record: null, adoption: winner ?? row };
+    }
+    return { outcome: "decided", record: null, adoption: decided };
+  }
+
   async function resolveProposal(
     request: ResolveRequest,
     who: ApprovalPrincipal,
@@ -405,6 +490,12 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
   ): Promise<ResolveAnswer> {
     const { harnessDir } = request;
     if (harnessDir === undefined) return { outcome: "not-found", record: null };
+    // A change-adoption decision has its own path; every other `dec_` is a request to
+    // the owner.
+    const adoptions = readChangeAdoptions(harnessDir);
+    const adoption =
+      adoptions.state === "present" ? adoptions.rows.find((r) => r.id === request.ref) : undefined;
+    if (adoption !== undefined) return resolveAdoption(request, harnessDir, who, adoption);
     const read = approvers(harnessDir);
     if (read.state === "unreadable") {
       return {
