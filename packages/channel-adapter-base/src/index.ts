@@ -30,6 +30,12 @@
  * No new policy: the strict channel default lives in the classifier.
  * This is the "bring a new boundary under the same chokepoint" contract.
  *
+ * The emitted gateway hands each signed, parsed event to `handleInboundEvent`
+ * (`./inbound`), which records the run that will answer it before the platform
+ * is told `ok`, and each approval click to `createApprovalActions`
+ * (`./approval-actions`), which decides it only as a linked member. Neither
+ * reads the message text: classification stays here, in the turn.
+ *
  * Catalog layer: R8 (channel boundary, extension of §18 safety floor).
  */
 import {
@@ -114,9 +120,41 @@ export {
   type SupersededApproval,
   postApprovalPrompt,
   createApprovalPrompter,
-  resolveApproval,
   createRuntimeBackedApprovalStore,
   type RuntimeApprovalRecord,
   type RuntimeApprovalStoreLike,
   type RuntimeBackedApprovalStoreOptions,
+  type ApprovalReview,
+  type ApprovalSensitivity,
+  CARD_INPUT_MAX,
+  CARD_PLACES_MAX,
+  HOME_REVIEW_PATH,
+  POSTED_APPROVALS_KEPT,
+  approvalReview,
+  fitsCard,
 } from "./approvals.js";
+
+// 0.9.0 — a click on an approval card counts only from a linked member whose class
+// reaches the request's, and is answered once the decision is recorded.
+export {
+  type ApprovalActionAdapter,
+  type ApprovalActions,
+  type ApprovalActionsConfig,
+  type ApprovalInteraction,
+  type DecisionWatch,
+  NO_ROOT_ANSWER,
+  UNREADABLE_ANSWER,
+  createApprovalActions,
+  linkAnswer,
+  whereDecided,
+} from "./approval-actions.js";
+
+// 0.9.0 — every accepted channel message is on record before it is acknowledged.
+export {
+  type AcceptInboundOptions,
+  type AcceptedInbound,
+  type InboundDedup,
+  type InboundEventLike,
+  acceptInbound,
+  handleInboundEvent,
+} from "./inbound.js";

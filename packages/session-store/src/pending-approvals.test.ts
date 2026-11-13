@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
 import {
   DEFAULT_APPROVALS_FILENAME,
+  DEFAULT_ROOT_DIR,
   type PendingApproval,
   createPendingApprovalStore,
   evictExpiredApprovals,
@@ -307,5 +308,17 @@ describe("#383 — standing (always) grants", () => {
     ).toHaveLength(1);
     const again = await store.list();
     expect(again[0]?.always).toBe(true);
+  });
+});
+
+describe("the store names its session root", () => {
+  test("the root it was given, else the default, so a surface decides on the same root", () => {
+    const dir = mkdtempSync(join(tmpdir(), "approvals-root-"));
+    try {
+      expect(createPendingApprovalStore({ rootDir: dir }).rootDir).toBe(dir);
+      expect(createPendingApprovalStore().rootDir).toBe(DEFAULT_ROOT_DIR);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

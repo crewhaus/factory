@@ -29,7 +29,8 @@ are the run ledger and the receipts. Directories are created only on a write pat
 | `keys/digest.key` | the harness's digest key: 64 lowercase hex and a newline |
 | `leases/mutating.json` | `{v, pid, startedAt?, host, head, kind, acquiredAt, leaseRef}` |
 | `operator.json` | whether intake is paused and the deployment disabled |
-| `approvers.json` | the harness's copy of who may decide what |
+| `approvers.json` | the harness's copy of who may decide what, and Home's address (`homeUrl`) when the owner set one |
+| `runs/NNNNNN.jsonl` | the run ledger (`runsLedger(harnessDir)`, on the run machine) |
 
 `controlPaths(harnessDir).heartbeatFile` is `.crewhaus/run/control-heartbeat.json`, beside the control
 token and outside `control/`: when a daemon last said it was alive.
@@ -131,8 +132,18 @@ for the fixed text.
 | `ensureDigestKey(harnessDir, {file?})` | For writers. Publishes exclusively; a racing creator reads the winner's key. An unreadable key is refused, never replaced. | the decision log; access-control's subject key |
 | `keyedDigest(key, label, parts)` | HMAC-SHA256, lowercase hex, over the UTF-8 of `JSON.stringify([label, ...parts])`. | the decision log |
 | `storedLocalActor(key, localActor)`, `LOCAL_ACTOR_LABEL` | `local:#<keyedDigest(key, "local-actor", [actor])>`: what a record holds for an unlinked local OS user, under the key of the root the record lives in. One definition, so records join. | the command receipts; the decision log |
+| `CHANNEL_CONVERSATION_LABEL`, `CHANNEL_MESSAGE_LABEL`, `CHANNEL_SENDER_LABEL` | The labels of a channel message's keyed refs on its run rows: the conversation, the message and an unlinked sender. | channel-adapter-base's `acceptInbound` |
 
 Stored digests join forever, so this format is a pin. The label keeps two purposes from joining.
+
+## Runs a turn has not reached
+
+| Export | Contract | First consumer |
+|---|---|---|
+| `runsLedger(harnessDir)` | The run ledger, `.crewhaus/run/control/runs/`, on the run machine. One definition for every writer. | the managed daemon's run rows; the runtime's run rows; a channel daemon's accepted messages |
+| `appendPreparingRun(ledger, {id, at, trigger, holder})` | `queued`, then `preparing`, for one id, each line refused whole when it is not under 4 KiB. `holder` is `{pid, host, startedAt}`. | channel-adapter-base's `acceptInbound` |
+| `newestRunRows(ledger)` | The newest row per id among the ledger's newest `RUN_ROW_PAGE_LINES` (256) lines. A view. | the settle and the control plane's run sweep |
+| `settleUnstartedRun(ledger, id, close, accept?)` | Under the ledger's lock, closes a run whose newest row is still `preparing`, keeping its trigger, when the machine allows the close and `accept` agrees; a run the runtime has written after is never written after. | `acceptInbound`; the control plane's run sweep |
 
 ## The mutating lease
 

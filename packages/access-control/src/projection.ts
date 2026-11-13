@@ -13,6 +13,11 @@
  * older `epoch`. Every change moves the access revision above the highest `epoch` of any
  * registered harness's file, so a lost or rewound `revision.json` never leaves a file
  * ahead of the records; a file still ahead when it is written is reported as not updated.
+ *
+ * When the owner set the address Home is reached at (`links.baseUrl` in the Hangar
+ * settings file), the projection carries it as `homeUrl`, so a chat card can send a person
+ * to review a request there. It is part of the content: a changed address rewrites the
+ * file at the next access write or `crewhaus access sync`.
  */
 import { statSync } from "node:fs";
 import {
@@ -25,6 +30,7 @@ import { append, controlPaths, createApproverReader } from "@crewhaus/control-re
 import { ensureDirContained, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { type AccessTarget, coveringGrants, credentialHolds } from "./authorize";
 import { sealTornLine } from "./files";
+import { readOwnerSettings } from "./owner-settings";
 import { accessLedger, accessPaths } from "./paths";
 import { type GovernedRow, lineBytes } from "./records";
 import { type AccessSnapshot, isActivePrincipal, isLiveCredential, principalOf } from "./snapshot";
@@ -53,7 +59,10 @@ export const EMPTY_REPORT: ProjectionReport = Object.freeze({
   failed: [],
 });
 
-type Content = Pick<ApproverProjection, "owner" | "governedSince" | "members" | "links">;
+type Content = Pick<
+  ApproverProjection,
+  "owner" | "governedSince" | "members" | "links" | "homeUrl"
+>;
 
 let writeTap: ((harness: string) => void) | undefined;
 
@@ -189,12 +198,16 @@ export function governsNow(snapshot: AccessSnapshot, harness: AccessHarness, now
 
 const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
-/** The content a projection must hold now. Sorted, so equal access gives equal bytes. */
+/**
+ * The content a projection must hold now. Sorted, so equal access gives equal bytes.
+ * `homeUrl` is the address Home is reached at, when the owner set one.
+ */
 export function projectionContent(
   snapshot: AccessSnapshot,
   harness: AccessHarness,
   governedSince: string,
   now: number,
+  homeUrl?: string,
 ): Content {
   const owner = snapshot.owner as string;
   const members: { principal: string; decide: DecisionClass; until?: string }[] = [];
@@ -211,7 +224,7 @@ export function projectionContent(
     .filter((link) => deciders.has(link.principal))
     .map((link) => ({ external: link.external, principal: link.principal }))
     .sort((a, b) => byText(a.external, b.external) || byText(a.principal, b.principal));
-  return { owner, governedSince, members, links };
+  return { owner, governedSince, members, links, ...(homeUrl !== undefined ? { homeUrl } : {}) };
 }
 
 function normalize(content: Content): string {
@@ -228,7 +241,21 @@ function normalize(content: Content): string {
     links: content.links
       .map((link) => ({ external: link.external, principal: link.principal }))
       .sort((a, b) => byText(a.external, b.external) || byText(a.principal, b.principal)),
+    ...(content.homeUrl !== undefined ? { homeUrl: content.homeUrl } : {}),
   });
+}
+
+/**
+ * The owner's `links.baseUrl` under the Hangar root, as the projection carries it. Owner
+ * settings that cannot be read leave it out; they never fail a projection write.
+ */
+function ownerHomeUrl(root: string): string | undefined {
+  try {
+    const read = readOwnerSettings(root);
+    return read.ok ? read.settings.baseUrl : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function dirExists(dir: string): boolean {
@@ -289,6 +316,7 @@ export function writeApproverProjections(input: WriteProjectionsInput): Projecti
   if (snapshot.owner === undefined) return EMPTY_REPORT;
   const at = new Date(now).toISOString();
   const reader = createApproverReader({ now: () => now });
+  const homeUrl = ownerHomeUrl(root);
   const governed = new Map(snapshot.governed.map((row) => [row.id, row]));
   const ledger = accessLedger(root, "governed");
   const report = { written: [] as string[], unchanged: [] as string[] };
@@ -317,7 +345,7 @@ export function writeApproverProjections(input: WriteProjectionsInput): Projecti
       row = fresh;
       governed.set(harness.id, fresh);
     }
-    const content = projectionContent(snapshot, harness, row.since, now);
+    const content = projectionContent(snapshot, harness, row.since, now, homeUrl);
     const current = reader(harness.dir);
     if (current.state === "present") {
       const same =

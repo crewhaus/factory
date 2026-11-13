@@ -62,14 +62,46 @@ function projectionFault(body: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+/** A loopback host as a URL spells it: `localhost`, `127.x.x.x` or `[::1]`. */
+function loopbackHost(hostname: string): boolean {
+  if (hostname === "localhost" || hostname === "[::1]") return true;
+  const parts = hostname.split(".");
+  return (
+    parts.length === 4 &&
+    parts[0] === "127" &&
+    parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+  );
+}
+
+/**
+ * `homeUrl` as a reader may use it: an https origin, or http on a loopback host, with no
+ * user name or password. Anything else is `undefined`.
+ */
+function homeUrlOf(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return undefined;
+  }
+  if (url.username !== "" || url.password !== "") return undefined;
+  const ok = url.protocol === "https:" || (url.protocol === "http:" && loopbackHost(url.hostname));
+  return ok ? url.origin : undefined;
+}
+
 function readApproversNow(harnessDir: string): ApproverRead {
   const rel = controlPaths(harnessDir).approversFile;
   const read = readWholeRecord(harnessDir, rel, PROJECTION_MAX_BYTES);
   if (read.state !== "body") return read;
   const fault = projectionFault(read.body);
-  return fault === undefined
-    ? { state: "present", projection: read.body as unknown as ApproverProjection }
-    : { state: "unreadable", reason: `${rel}: ${fault}` };
+  if (fault !== undefined) return { state: "unreadable", reason: `${rel}: ${fault}` };
+  // A Home address that is not one is left out, never a fault: a card falls back to the
+  // host and the verb.
+  const { homeUrl: given, ...rest } = read.body;
+  const homeUrl = homeUrlOf(given);
+  const projection = { ...rest, ...(homeUrl !== undefined ? { homeUrl } : {}) };
+  return { state: "present", projection: projection as unknown as ApproverProjection };
 }
 
 /**

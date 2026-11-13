@@ -12,7 +12,13 @@ import { type Trigger, isId, mintRunId, parseResumeScope } from "@crewhaus/contr
 import { type Logger, createLogger } from "@crewhaus/logging";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { registerRunController } from "./run-registry";
-import { type AmbientRun, type InboundContent, takeAmbientRun, takePendingInbound } from "./scope";
+import {
+  type AmbientRun,
+  type InboundContent,
+  takeAmbientRun,
+  takePendingInbound,
+  takeScopeRunId,
+} from "./scope";
 import { trimToken } from "./token-trim";
 
 export {
@@ -238,18 +244,28 @@ function generateSessionId(): string {
  * input's origins (after `opts.originStack` when one is given). Outside a
  * scope nothing is adopted.
  * Inside a `runWithScope` scope, it takes the scope's lineage for any field
- * its options leave unset.
+ * its options leave unset. When that scope names a run id, the first context
+ * created with neither `runId` nor `parent` takes it as its own, and each
+ * later one mints its own id and names the first as its `parent`; the scope
+ * is read before any id is minted. A context given `runId` or `parent` is
+ * left as it is, and nothing is read from the environment.
  */
 export function createRunContext(opts: RunContextOptions = {}): RunContext {
-  const runId = opts.runId ?? mintRunId();
+  const ambient = takeAmbientRun();
+  const scoped = opts.runId === undefined && opts.parent === undefined ? takeScopeRunId() : {};
+  const runId = opts.runId ?? ("runId" in scoped ? scoped.runId : mintRunId());
   const sessionId = opts.sessionId ?? generateSessionId();
   const controller = opts.abortSignal === undefined ? new AbortController() : undefined;
   const abortSignal = opts.abortSignal ?? (controller as AbortController).signal;
   const baseLogger = opts.logger ?? createLogger();
   const logger = baseLogger.child({ runId, sessionId });
+  if ("dropped" in scoped) {
+    logger.warn("run lineage field dropped: it does not fit its grammar", { field: "runId" });
+  }
   const eventBus = opts.eventBus ?? new TraceEventBus({ runId, sessionId, logger });
   const inbound = takePendingInbound();
   const originStack = originStackOf(opts.originStack, inbound);
+  const own = "parent" in scoped ? { ...opts, parent: scoped.parent } : opts;
   const ctx: RunContext = {
     runId,
     sessionId,
@@ -258,7 +274,7 @@ export function createRunContext(opts: RunContextOptions = {}): RunContext {
     logger,
     eventBus,
     ...(originStack !== undefined ? { originStack } : {}),
-    ...lineageFrom(opts, takeAmbientRun(), logger),
+    ...lineageFrom(own, ambient, logger),
   };
   if (controller !== undefined) registerRunController(runId, controller);
   adoptInbound(ctx, inbound);
