@@ -16,6 +16,12 @@
  * block, a whole `steps` list or one edit among many is judged the same way.
  * A bar that is not protected stays tunable in both directions.
  *
+ * Workflow steps pair by name and occurrence: the k-th step named X before is
+ * judged against the k-th step named X after, keyed `steps.X.judge` when X is
+ * unique before and `steps.X#k.judge` when it repeats. A step without a name
+ * pairs with the step at its own position after, keyed `steps.<i>.judge`.
+ * Graph nodes pair by their map key.
+ *
  * Pure: no `node:` import, and it never imports `./index` (`surfaces.ts`
  * calls it, and `./index` loads `surfaces.ts` before its own constants exist).
  */
@@ -140,17 +146,32 @@ export function protectedBarChange(
     if (change !== undefined) return change;
   }
 
-  // Judge gates: workflow steps by name, graph nodes by key.
-  const stepsBefore = Array.isArray(was["steps"]) ? (was["steps"] as unknown[]) : [];
-  const stepsAfter = Array.isArray(now["steps"]) ? (now["steps"] as unknown[]) : [];
-  for (const [i, raw] of stepsBefore.entries()) {
-    const step = plain(raw);
+  // Judge gates: workflow steps by name and occurrence, graph nodes by key.
+  const stepsBefore = Array.isArray(was["steps"]) ? (was["steps"] as unknown[]).map(plain) : [];
+  const stepsAfter = Array.isArray(now["steps"]) ? (now["steps"] as unknown[]).map(plain) : [];
+  const stepName = (s: Record<string, unknown> | undefined): string | undefined =>
+    typeof s?.["name"] === "string" ? (s["name"] as string) : undefined;
+  const totalBefore = new Map<string, number>();
+  for (const s of stepsBefore) {
+    const n = stepName(s);
+    if (n !== undefined) totalBefore.set(n, (totalBefore.get(n) ?? 0) + 1);
+  }
+  const seenBefore = new Map<string, number>();
+  for (const [i, step] of stepsBefore.entries()) {
+    const stepId = stepName(step);
+    const occurrence = stepId === undefined ? 0 : (seenBefore.get(stepId) ?? 0) + 1;
+    if (stepId !== undefined) seenBefore.set(stepId, occurrence);
     const judge = plain(step?.["judge"]);
     if (judge?.["protected"] !== true) continue;
-    const id = typeof step?.["name"] === "string" ? (step["name"] as string) : String(i);
-    const match = stepsAfter
-      .map(plain)
-      .find((s) => (typeof step?.["name"] === "string" ? s?.["name"] === step["name"] : false));
+    let match: Record<string, unknown> | undefined;
+    let id: string;
+    if (stepId === undefined) {
+      match = stepsAfter[i];
+      id = String(i);
+    } else {
+      match = stepsAfter.filter((s) => stepName(s) === stepId)[occurrence - 1];
+      id = (totalBefore.get(stepId) ?? 0) > 1 ? `${stepId}#${occurrence}` : stepId;
+    }
     const name = `steps.${id}.judge`;
     const change = blockChange(name, judge, plain(match?.["judge"]), judgeBars(name));
     if (change !== undefined) return change;

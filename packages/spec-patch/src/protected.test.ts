@@ -249,3 +249,81 @@ describe("escalationFor names a loosening", () => {
     expect(escalationFor(before, raised)).toEqual([]);
   });
 });
+
+describe("protected judge steps pair by name and occurrence", () => {
+  const TWO_CHECKS = `name: w
+target: workflow
+model: base-model
+steps:
+  - name: draft
+    instructions: Draft it.
+  - name: check
+    kind: judge
+    judge:
+      criteria: is it right
+      threshold: 0.7
+      protected: true
+  - name: revise
+    instructions: Revise it.
+  - name: check
+    kind: judge
+    judge:
+      criteria: is it right
+      threshold: 0.7
+      protected: true
+`;
+
+  /** The steps with the k-th `check` (1-based) at `threshold`. */
+  function checks(thresholds: readonly [number, number]): Array<Record<string, unknown>> {
+    const doc = parse(TWO_CHECKS) as { steps: Array<Record<string, unknown>> };
+    let k = 0;
+    return doc.steps.map((s) => {
+      if (s["name"] !== "check") return s;
+      const threshold = thresholds[k++] as number;
+      return { ...s, judge: { ...(s["judge"] as Record<string, unknown>), threshold } };
+    });
+  }
+
+  test("the fixture with two steps of one name parses", () => {
+    expect(() => parseSpec(TWO_CHECKS)).not.toThrow();
+  });
+
+  test("lowering only the second check names it and is refused at both entry points", () => {
+    const before = parse(TWO_CHECKS);
+    expect(protectedBarChange(before, { steps: checks([0.7, 0.5]) })?.key).toBe(
+      "steps.check#2.judge.threshold",
+    );
+    refusedBoth(TWO_CHECKS, checks([0.7, 0.5]), /would loosen "steps\.check#2\.judge\.threshold"/);
+  });
+
+  test("lowering only the first check names the first occurrence", () => {
+    const before = parse(TWO_CHECKS);
+    expect(protectedBarChange(before, { steps: checks([0.5, 0.7]) })?.key).toBe(
+      "steps.check#1.judge.threshold",
+    );
+    refusedBoth(TWO_CHECKS, checks([0.5, 0.7]), /would loosen "steps\.check#1\.judge\.threshold"/);
+  });
+
+  test("raising either check, or both, passes", () => {
+    const before = parse(TWO_CHECKS);
+    for (const pair of [
+      [0.9, 0.7],
+      [0.7, 0.9],
+      [0.8, 0.9],
+    ] as const) {
+      expect(protectedBarChange(before, { steps: checks(pair) })).toBeUndefined();
+      admittedBoth(TWO_CHECKS, checks(pair));
+    }
+  });
+
+  test("an unnamed protected step pairs with the step at its own position", () => {
+    const doc = (threshold: number) => ({
+      steps: [
+        { name: "draft", instructions: "Draft it." },
+        { judge: { criteria: "x", threshold, protected: true } },
+      ],
+    });
+    expect(protectedBarChange(doc(0.7), doc(0.5))?.key).toBe("steps.1.judge.threshold");
+    expect(protectedBarChange(doc(0.7), doc(0.9))).toBeUndefined();
+  });
+});

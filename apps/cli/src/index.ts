@@ -10780,7 +10780,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     ...(rebaseline !== undefined ? { rebaseline } : {}),
     provabilityGraderNames,
     // A re-anchor over a protected criterion needs this harness's owner.
-    ownerCheck: () => ownerCheck(dirname(absSpec)),
+    ownerCheck: () => ownerCheck(dirname(absSpec), undefined, process.env),
     // A re-anchor is a quality decision: it runs under a command receipt in the
     // harness's own ledger, and the pin's mark names that receipt. A receipt that
     // cannot be written keeps the baseline.
@@ -12711,7 +12711,7 @@ async function runEvalReportBaseline(args: ParsedArgs): Promise<void> {
         pin: (receipt) =>
           pinRun(found, new Date().toISOString(), undefined, {
             cmd: "crewhaus eval-report baseline set",
-            ownerCheck: () => ownerCheck(process.cwd()),
+            ownerCheck: () => ownerCheck(process.cwd(), undefined, process.env),
             ...(receipt !== undefined ? { receipt } : {}),
           }),
       });

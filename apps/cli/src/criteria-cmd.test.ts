@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -241,6 +242,77 @@ describe("criteria apply", () => {
     await expect(run(dir, ["apply", edits, "--expect", gradersRevision(GRADERS)])).rejects.toThrow(
       /not a list of criteria edits/,
     );
+  });
+
+  test("a command started by an agent's tool cannot loosen a protected criterion, even confirmed", async () => {
+    const dir = harness();
+    const path = join(dir, "eval", "graders.yaml");
+    const loosen = editsFile(dir, [{ op: "setMode", id: "answers-match", value: "observe" }]);
+    const out = await run(
+      dir,
+      ["apply", loosen, "--expect", gradersRevision(GRADERS), "--confirm", "shop"],
+      { env: { CREWHAUS_AGENT_TOOL: "Bash" } },
+    );
+    expect(out.exitCode).not.toBe(0);
+    expect(out.lines.join("\n")).toContain("agent's tool");
+    expect(readFileSync(path, "utf8")).toBe(GRADERS);
+    expect(existsSync(join(dir, CRITERIA_HISTORY_REL))).toBe(false);
+    // A change that loosens nothing still writes under the same environment.
+    const title = editsFile(dir, [
+      { op: "setText", id: "answers-match", field: "title", value: "Answers match exactly" },
+    ]);
+    const done = await run(dir, ["apply", title, "--expect", gradersRevision(GRADERS)], {
+      env: { CREWHAUS_AGENT_TOOL: "Bash" },
+    });
+    expect(done.exitCode).toBe(0);
+    expect(readFileSync(path, "utf8")).toContain("title: Answers match exactly");
+  });
+
+  test("without an agent's tool, the local owner loosens with --confirm", async () => {
+    const dir = harness();
+    const loosen = editsFile(dir, [{ op: "setMode", id: "answers-match", value: "observe" }]);
+    const out = await run(
+      dir,
+      ["apply", loosen, "--expect", gradersRevision(GRADERS), "--confirm", "shop"],
+      { env: {} },
+    );
+    expect(out.exitCode).toBe(0);
+    expect(readFileSync(join(dir, "eval", "graders.yaml"), "utf8")).toContain("mode: observe");
+  });
+
+  test("a graders file outside the --spec harness is refused", async () => {
+    const a = harness();
+    const aGraders = join(a, "eval", "graders.yaml");
+    const b = mkdtempSync(join(tmpdir(), "crewhaus-criteria-other-"));
+    TMP.push(b);
+    writeFileSync(join(b, "crewhaus.yaml"), SPEC.replace("name: shop", "name: other"));
+    const loosen = editsFile(a, [{ op: "setMode", id: "answers-match", value: "observe" }]);
+    const refusal =
+      "criteria apply: the graders file is not inside the harness of --spec; nothing was written";
+    const argv = (graders: string) => [
+      "apply",
+      loosen,
+      "--graders",
+      graders,
+      "--spec",
+      join(b, "crewhaus.yaml"),
+      "--expect",
+      gradersRevision(GRADERS),
+      "--confirm",
+      "other",
+    ];
+    const out = await run(a, argv(aGraders), { env: {} });
+    expect(out.exitCode).toBe(1);
+    expect(out.lines).toEqual([refusal]);
+    // Through a link that sits inside the --spec harness, the file it names is what counts.
+    mkdirSync(join(b, "eval"));
+    symlinkSync(aGraders, join(b, "eval", "graders.yaml"));
+    const linked = await run(a, argv(join(b, "eval", "graders.yaml")), { env: {} });
+    expect(linked.exitCode).toBe(1);
+    expect(linked.lines).toEqual([refusal]);
+    expect(readFileSync(aGraders, "utf8")).toBe(GRADERS);
+    expect(existsSync(join(a, CRITERIA_HISTORY_REL))).toBe(false);
+    expect(existsSync(join(b, CRITERIA_HISTORY_REL))).toBe(false);
   });
 });
 

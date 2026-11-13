@@ -57,9 +57,10 @@ import { createSpecFile } from "@crewhaus/spec-patch/commit";
 import { MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
-import { type M3Context, type M3Handler, requireTypedConfirm } from "./m3";
+import { type M3Context, type M3Handler, requirePermission, requireTypedConfirm } from "./m3";
 import { maskSpecYaml, maskText } from "./mask";
 import {
+  SPEC_SECURITY_PERMISSION,
   commitSpecEdits,
   previewHomeEdits,
   readSpecFile,
@@ -497,16 +498,19 @@ export function newlyMaskedSpan(stored: string, incoming: string): string | null
  * Either way the result must parse (`parseGradersConfig`, 400 with the reason
  * and nothing written); when the file exists the write names the revision it
  * was computed from (`expectedRev`, 428 without one) and a stale one answers
- * 412 with `current.rev`; an edit that loosens a protected criterion needs the
- * spec's name typed and the security edit permission (409 with `needs`). The
+ * 412 with `current.rev`. An edit that loosens a protected criterion needs the
+ * security edit permission first (403 naming it, nothing written, whatever the
+ * body carries), then the spec's name typed (409 with `needs` until it
+ * matches): the typed name is a confirmation, never the authority. The
  * response is what is on disk, with its revision (`hash`) and `gradersHash`.
  *
  * Two refusals guard the raw round trip, because the pane the console posts
  * back was prefilled from {@link graderCatalog} — a MASKED, CAPPED read:
  *
- *   - a body that introduces a mask span the stored file does not have is
- *     the masked view being saved over the real document. Persisting `***`
- *     would replace whatever it hid: silent data loss dressed up as safety.
+ *   - a result, from either form, that introduces a mask span the stored file
+ *     does not have is the masked view being saved over the real document.
+ *     Persisting `***` would replace whatever it hid: silent data loss dressed
+ *     up as safety.
  *   - a stored file past the read cap cannot be compared (and the pane only
  *     ever held its head), so the write is refused rather than allowed to
  *     truncate it.
@@ -552,13 +556,6 @@ export const graderWrite: M3Handler = (ctx) => {
   let next: string;
   if (typeof yaml === "string") {
     if (yaml.trim() === "") throw new HttpError(400, '"yaml" is empty');
-    const mark = newlyMaskedSpan(stored.text, yaml);
-    if (mark !== null) {
-      throw new HttpError(
-        409,
-        `this body introduces a masked span (${mark}) the stored ${GRADERS_PATH.join("/")} does not have — the editor pane is served MASKED, and saving it would replace what the mask hid. Edit the file with \`${GRADERS_VERB}\` or an editor.`,
-      );
-    }
     next = yaml.endsWith("\n") ? yaml : `${yaml}\n`;
   } else {
     if (!present) {
@@ -580,6 +577,13 @@ export const graderWrite: M3Handler = (ctx) => {
       throw new HttpError(400, `the edits do not apply: ${maskText(errMessage(err))}`);
     }
   }
+  const mark = newlyMaskedSpan(stored.text, next);
+  if (mark !== null) {
+    throw new HttpError(
+      409,
+      `this body introduces a masked span (${mark}) the stored ${GRADERS_PATH.join("/")} does not have — the editor pane is served MASKED, and saving it would replace what the mask hid. Edit the file with \`${GRADERS_VERB}\` or an editor.`,
+    );
+  }
   let after: GradersConfig;
   try {
     after = parseGradersConfig(next).config;
@@ -594,15 +598,22 @@ export const graderWrite: M3Handler = (ctx) => {
     before = undefined;
   }
   const loosened = before !== undefined ? loosening(before, after) : [];
+  const loosenedPaths = [...new Set(loosened.map((l) => `criteria.${l.criterion}`))];
+  if (loosened.length > 0) {
+    requirePermission(ctx, SPEC_SECURITY_PERMISSION, {
+      paths: loosenedPaths,
+      message: "Only an owner of this harness can loosen a protected criterion.",
+    });
+  }
   if (loosened.length > 0 && ctx.body["confirmName"] !== file.specName) {
     const warning = loosened.map((l) => `${l.criterion}: ${l.reason}`).join("; ");
     throw new HttpError(
       409,
       `this change loosens a protected criterion (${warning}) — only the owner makes it: send "confirmName": "${file.specName}"`,
       {
-        needs: "h.spec.edit.security",
+        needs: SPEC_SECURITY_PERMISSION,
         warning,
-        paths: [...new Set(loosened.map((l) => `criteria.${l.criterion}`))],
+        paths: loosenedPaths,
         confirmName: file.specName,
       },
     );

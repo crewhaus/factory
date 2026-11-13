@@ -639,6 +639,80 @@ describe("handlers that escalate by what is asked", () => {
     );
     expect(ids).toEqual([otherId]);
   });
+
+  test("loosening a protected criterion needs the security permission; the typed name only confirms", async () => {
+    const h = await home();
+    const maintainer = await h.member("maintainer");
+    const gradersPath = join(h.dir, "eval", "graders.yaml");
+    mkdirSync(dirname(gradersPath), { recursive: true });
+    const stored = [
+      "graders:",
+      "  - name: judge",
+      "    type: llm_judge",
+      "    rubric:",
+      "      criteria:",
+      "        - name: correct",
+      "          description: the answer is correct",
+      '          anchors: { "1": a, "2": b, "3": c, "4": d, "5": e }',
+      "      passing_score: 4",
+      "criteria:",
+      "  - id: correct-answers",
+      "    protected: true",
+      "    measured_by: [judge]",
+      "",
+    ].join("\n");
+    writeFileSync(gradersPath, stored);
+    const route = `/api/h/${h.id}/builders/graders`;
+    const rev = async (): Promise<string> =>
+      String((await call(h, h.owner, "GET", route)).body["hash"]);
+    const loosen = [{ op: "setMode", id: "correct-answers", value: "observe" }];
+
+    // A maintainer: 403 naming the permission, with or without the typed name, in either form.
+    const unprotected = stored.replace("    protected: true\n", "");
+    for (const body of [
+      { edits: loosen },
+      { edits: loosen, confirmName: "escalation-fixture" },
+      { yaml: unprotected, confirmName: "escalation-fixture" },
+    ]) {
+      const refused = await call(h, maintainer.headers, "POST", route, {
+        ...body,
+        expectedRev: await rev(),
+      });
+      expect(refused.status).toBe(403);
+      expect([
+        refused.body["code"],
+        refused.body["reason"],
+        refused.body["needs"],
+        refused.body["role"],
+      ]).toEqual(["forbidden", "permission", "h.spec.edit.security", "maintainer"]);
+      expect(refused.body["paths"]).toEqual(["criteria.correct-answers"]);
+      expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+    }
+
+    // A tightening edit needs no security permission.
+    const tighten = await call(h, maintainer.headers, "POST", route, {
+      edits: [{ op: "setPassingScore", grader: "judge", value: 5 }],
+      expectedRev: await rev(),
+    });
+    expect(tighten.status).toBe(200);
+    expect(readFileSync(gradersPath, "utf8")).toContain("passing_score: 5");
+
+    // The owner: the typed-name interstitial, then the write once the name matches.
+    const asked = await call(h, h.owner, "POST", route, {
+      edits: loosen,
+      expectedRev: String(tighten.body["hash"]),
+    });
+    expect(asked.status).toBe(409);
+    expect(asked.body["needs"]).toBe("h.spec.edit.security");
+    expect(asked.body["confirmName"]).toBe("escalation-fixture");
+    const confirmed = await call(h, h.owner, "POST", route, {
+      edits: loosen,
+      expectedRev: String(tighten.body["hash"]),
+      confirmName: "escalation-fixture",
+    });
+    expect(confirmed.status).toBe(200);
+    expect(readFileSync(gradersPath, "utf8")).toContain("mode: observe");
+  });
 });
 
 describe("who a record names as its actor", () => {
