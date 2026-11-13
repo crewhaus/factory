@@ -75,7 +75,7 @@ import { type HealthPreflightItem, cadenceToMs, declaredBudgetUsd, dreamOverdue 
 import { HttpError } from "./http";
 import { readJsonlCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
-import { requireString } from "./m3";
+import { requirePermission, requireString } from "./m3";
 import {
   type ArmRow,
   buildLeaderboard,
@@ -188,6 +188,20 @@ export const ADVISOR_JOB_ARGV: Readonly<Record<string, readonly string[]>> = {
   "route-propose": ["route", "propose"],
   "models-audit": ["models", "audit", "crewhaus.yaml"],
   "models-explain": ["models", "explain", "crewhaus.yaml"],
+};
+
+/** The permission each advisor job kind needs: the one its own route needs. */
+export const ADVISOR_JOB_PERMISSIONS: Readonly<Record<string, string>> = {
+  doctor: "h.eval.run",
+  compile: "h.deploy",
+  eval: "h.eval.run",
+  "dream-run": "h.memory.write",
+  optimize: "h.quality.edit",
+  advise: "h.eval.run",
+  "route-status": "h.read",
+  "route-propose": "h.quality.edit",
+  "models-audit": "h.read",
+  "models-explain": "h.read",
 };
 
 /** The command each advisor job kind runs, shown beside its action. */
@@ -1078,6 +1092,8 @@ export const advisorAct: M3Handler = async (ctx) => {
   if (item.action?.kind === "job" && item.action.jobKind !== null) {
     const argv = ADVISOR_JOB_ARGV[item.action.jobKind];
     if (argv === undefined) throw new HttpError(500, "advisor action names an unknown job kind");
+    // Acting queues the item's job: the caller needs that job's own permission too.
+    requirePermission(ctx, ADVISOR_JOB_PERMISSIONS[item.action.jobKind] ?? "h.job.run");
     const record = ctx.submitJob(item.action.jobKind, argv);
     job = record;
     jobId = (record as { jobId?: string }).jobId;
@@ -1087,7 +1103,7 @@ export const advisorAct: M3Handler = async (ctx) => {
     itemId,
     action: "acted",
     at: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
     ...(comment !== null && comment !== "" ? { comment } : {}),
     ...(jobId !== undefined ? { jobId } : {}),
   };
@@ -1119,7 +1135,7 @@ export const advisorDismiss: M3Handler = (ctx) => {
     itemId,
     action: "dismissed",
     at: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
     reason,
   };
   appendAdvisorLine(ctx, "decisions.jsonl", decision);
@@ -1141,7 +1157,7 @@ export const advisorReopen: M3Handler = (ctx) => {
     itemId,
     action: "reopened",
     at: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
   };
   appendAdvisorLine(ctx, "decisions.jsonl", decision);
   return { ...found("reopened — the item returns to the open feed", null), itemId, reopened: true };
@@ -1427,7 +1443,7 @@ export const advisorReportRun: M3Handler = (ctx) => {
     reportId,
     kind,
     generatedAt: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
     body,
   };
   const reportsDir = ctx.contain([...ADVISOR_SEGMENTS, "reports"]);
@@ -1603,7 +1619,7 @@ export const advisorIssueSubmit: M3Handler = (ctx) => {
     detail,
     kind,
     at: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
     update: {
       ready: kind !== "note",
       jobId,

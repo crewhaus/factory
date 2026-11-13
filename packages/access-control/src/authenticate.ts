@@ -8,20 +8,25 @@
  *    configured digest, or on `<hangarRoot>/proxy.sock`, whose file mode is the proof.
  *    From anywhere else it is ignored, and the caller strips it before dispatch.
  * 2. **The bearer.** `cha_…` is a session, looked up by its digest; `chs_…` is a service
- *    token, looked up by its digest; any other value is compared as Home's own key, and
- *    is accepted only on `<hangarRoot>/home.sock`, or over TCP from a loopback peer that
- *    sent no forwarding header, when the key is not socket-only and no proxy is trusted.
- *    A reverse proxy on this computer therefore cannot relay it.
+ *    token, looked up by its digest; `chx_…` is a scoped token, checked by its MAC and its
+ *    minting service token; any other issued-secret shape (`chp_…`, `chi_…`) is refused
+ *    as unknown; any other value is compared as Home's own key, and is accepted only on
+ *    `<hangarRoot>/home.sock`, or over TCP from a loopback peer that sent no forwarding
+ *    header, when the key is not socket-only and no proxy is trusted. A reverse proxy on
+ *    this computer therefore cannot relay it. A tab-only session counts only over TCP, on
+ *    the address the LAN door was bound to, with no forwarding or proxy header.
  * 3. A bearer and a proxy identity that name different principals are refused.
- * 4. Until route authorization lands, only the home owner is admitted.
  *
- * The package still opens no socket: Home hands in the peer it saw.
+ * Every live identity is answered: what it may do is decided by `authorize()` at Home's
+ * one choke point, route by route. The package still opens no socket: Home hands in the
+ * peer it saw.
  */
 import { parseLinkSubject } from "@crewhaus/control-contract";
 import { keyedDigest } from "@crewhaus/control-records";
 import { LINK_SUBJECT_LABEL, normalizeLinkSubject } from "./access";
 import { type Cidr, cidrContains, isLoopbackAddress, parseCidr } from "./addresses";
 import { tokenEquals } from "./bootstrap";
+import { verifyScopedToken } from "./scoped";
 import { sha256Hex } from "./secrets";
 import type { SignInHandle } from "./sign-in";
 import { type AccessSnapshot, isActivePrincipal, isLiveCredential } from "./snapshot";
@@ -63,7 +68,11 @@ export type TrustedProxy = {
   readonly socket?: true;
 };
 
-export type AuthenticateConfig = { readonly trustedProxy?: TrustedProxy };
+export type AuthenticateConfig = {
+  readonly trustedProxy?: TrustedProxy;
+  /** The address Home's LAN door is bound to; a tab-only session counts only there. */
+  readonly lanHost?: string;
+};
 
 export type AuthenticateState = {
   readonly signIn: SignInHandle;
@@ -79,18 +88,37 @@ export type AuthenticateState = {
  */
 export const PROXY_SECRET_HEADER = "crewhaus-proxy-secret";
 
-export type AuthVia = "bootstrap" | "session" | "service" | "proxy";
+export type AuthVia = "bootstrap" | "session" | "service" | "proxy" | "scoped";
+
+/**
+ * What a scoped token may read: the run refs it names and the read acts it holds, until
+ * `exp` (epoch ms), after which it reads nothing, on a request or on a stream it opened.
+ */
+export type ScopedGrant = {
+  readonly refs: readonly string[];
+  readonly acts: readonly string[];
+  readonly exp: number;
+};
 
 export type Identified = { readonly principal: string; readonly via: AuthVia };
 
+type IdentityExtras = {
+  /** The session's reference, for a session. */
+  readonly sessionRef?: string;
+  /** The credential a service token or a scoped token's minter holds, `crd_…`. */
+  readonly credential?: string;
+  /** For a scoped token: exactly what it may read. */
+  readonly scoped?: ScopedGrant;
+  /** A session a page on plain HTTP made for itself. */
+  readonly tabOnly?: true;
+};
+
 export type Authenticated = (
-  | {
+  | ({
       readonly kind: "principal";
       readonly principal: string;
       readonly via: AuthVia;
-      /** The session's reference, for a session. */
-      readonly sessionRef?: string;
-    }
+    } & IdentityExtras)
   | { readonly kind: "anonymous" }
   | {
       readonly kind: "refused";
@@ -124,29 +152,34 @@ function refused(
 }
 
 /**
- * Admit only the home owner. Every other principal is refused with
- * `authorization_unavailable` until route authorization lands, when this function goes:
- * no route ever serves a principal that nothing has authorized.
+ * The host name a `Host` header names, lower-cased, without its port or brackets.
  *
- * First consumer: `authenticate`, as its last step.
+ * First consumers: `authenticate`, for a tab-only session, and Home's invite acceptance.
  */
-export function admitUntilAuthorization(
-  identity: Identified,
-  snapshot: AccessSnapshot | undefined,
-): { readonly admit: true } | Refused {
-  if (identity.via === "bootstrap") return { admit: true };
-  if (snapshot?.owner !== undefined && identity.principal === snapshot.owner) {
-    return { admit: true };
+export function hostNameOf(hostHeader: string | null): string | undefined {
+  if (hostHeader === null || hostHeader === "") return undefined;
+  try {
+    const name = new URL(`http://${hostHeader}`).hostname.toLowerCase();
+    return name.startsWith("[") && name.endsWith("]") ? name.slice(1, -1) : name;
+  } catch {
+    return undefined;
   }
-  return refused(
-    "authorization_unavailable",
-    403,
-    "owner_only",
-    "Only this Home's owner can use it for now.",
-  );
 }
 
-/** Whether the request carries a header a forwarding proxy adds, or the identity header. */
+/** The bare form of a bind address, for comparing with a `Host` header's name. */
+function bareHost(host: string): string {
+  const lower = host.toLowerCase();
+  return lower.startsWith("[") && lower.endsWith("]") ? lower.slice(1, -1) : lower;
+}
+
+/** An issued-secret shape this package recognizes but never accepts as a bearer. */
+const UNACCEPTED_SECRET_RE = /^ch[a-z]_/;
+
+/**
+ * Whether the request carries a header a forwarding proxy adds, or the identity header.
+ *
+ * First consumers: `authenticate`, and Home's invite acceptance on its LAN door.
+ */
 export function hasForwardingHeaders(request: Request, identityHeader?: string): boolean {
   for (const name of request.headers.keys()) {
     const lower = name.toLowerCase();
@@ -243,7 +276,7 @@ export async function authenticate(
     ignored ? { ...answer, ignoredProxyHeaders: true } : answer;
 
   // 2. The bearer.
-  let fromBearer: (Identified & { readonly sessionRef?: string }) | undefined;
+  let fromBearer: (Identified & IdentityExtras) | undefined;
   const bearer = bearerOf(request);
   if (bearer !== undefined) {
     if (bearer.startsWith("cha_")) {
@@ -260,7 +293,34 @@ export async function authenticate(
           ),
         );
       }
-      fromBearer = { principal: check.principal, via: "session", sessionRef: check.sessionRef };
+      if (check.tabOnly === true) {
+        // Good only where it was made: over TCP, on the LAN door's own address, unrelayed.
+        const where = hostNameOf(request.headers.get("host"));
+        if (
+          peer.listener !== "tcp" ||
+          config.lanHost === undefined ||
+          check.bindHost === undefined ||
+          bareHost(check.bindHost) !== bareHost(config.lanHost) ||
+          where !== bareHost(check.bindHost) ||
+          hasForwardingHeaders(request, proxy?.header) ||
+          request.headers.has(PROXY_SECRET_HEADER)
+        ) {
+          return tag(
+            refused(
+              "forbidden",
+              403,
+              "tab_only",
+              "This sign-in works only on the address it was made on, over the same network.",
+            ),
+          );
+        }
+      }
+      fromBearer = {
+        principal: check.principal,
+        via: "session",
+        sessionRef: check.sessionRef,
+        ...(check.tabOnly === true ? { tabOnly: true as const } : {}),
+      };
     } else if (bearer.startsWith("chs_")) {
       const digest = await sha256Hex(bearer);
       const row = snapshot?.tokens.find((t) => t.kind === "service" && t.sha256 === digest);
@@ -269,7 +329,37 @@ export async function authenticate(
           refused("unauthenticated", 401, "credential_unknown", "That token does not work here."),
         );
       }
-      fromBearer = { principal: row.principal, via: "service" };
+      fromBearer = { principal: row.principal, via: "service", credential: row.id };
+    } else if (bearer.startsWith("chx_")) {
+      const verified = await verifyScopedToken(
+        bearer,
+        snapshot,
+        await state.signIn.scopedKey(),
+        now,
+      );
+      if (!verified.ok) {
+        return tag(
+          refused(
+            "unauthenticated",
+            401,
+            verified.reason,
+            verified.reason === "token_expired"
+              ? "This link's access has ended. Ask for a new one."
+              : "That token does not work here.",
+          ),
+        );
+      }
+      fromBearer = {
+        principal: verified.principal,
+        via: "scoped",
+        credential: verified.credential,
+        scoped: { refs: verified.refs, acts: verified.acts, exp: verified.exp },
+      };
+    } else if (UNACCEPTED_SECRET_RE.test(bearer)) {
+      // An issued-secret shape Home never takes as a bearer; never compared as Home's key.
+      return tag(
+        refused("unauthenticated", 401, "credential_unknown", "That token does not work here."),
+      );
     } else {
       const bootstraps = snapshot?.tokens.filter((t) => t.kind === "bootstrap") ?? [];
       const socketOnly = bootstraps.some((t) => t.state === "active" && t.socketOnly === true);
@@ -319,7 +409,7 @@ export async function authenticate(
       ),
     );
   }
-  const identity: (Identified & { readonly sessionRef?: string }) | undefined =
+  const identity: (Identified & IdentityExtras) | undefined =
     fromBearer ??
     (fromProxy !== undefined && fromProxy !== null
       ? { principal: fromProxy, via: "proxy" }
@@ -333,13 +423,5 @@ export async function authenticate(
     return tag({ kind: "anonymous" });
   }
 
-  // 4. The owner only, until route authorization lands.
-  const admitted = admitUntilAuthorization(identity, snapshot);
-  if ("kind" in admitted) return tag(admitted);
-  return tag({
-    kind: "principal",
-    principal: identity.principal,
-    via: identity.via,
-    ...(identity.sessionRef !== undefined ? { sessionRef: identity.sessionRef } : {}),
-  });
+  return tag({ kind: "principal", ...identity });
 }

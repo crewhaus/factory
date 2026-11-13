@@ -4657,6 +4657,10 @@
               "takesValue": false
             },
             {
+              "name": "lan-role",
+              "takesValue": true
+            },
+            {
               "name": "no-auth",
               "takesValue": false
             },

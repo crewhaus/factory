@@ -82,6 +82,7 @@ import {
   readSpecFile,
   requireEditable,
   requireExpectedRev,
+  requireSpecEditAuthority,
   requireWholeSpec,
 } from "./spec-edit";
 
@@ -618,6 +619,9 @@ async function applyOrPropose(
   // Checked with the schema this harness is built against before any edit is
   // applied: a read-only spec is refused (409 `read-only`), and the preview
   // parses the way the guarded commit will.
+  // A change to a security surface, or one that raises spending, is the security edit
+  // permission's, whatever name was typed.
+  requireSpecEditAuthority(ctx, spec.text, edits);
   const check = await requireEditable(ctx, spec.text);
   const preview = await previewHomeEdits(ctx, spec.text, edits, check, {
     restrict: opts.restrict,

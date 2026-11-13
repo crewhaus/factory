@@ -1,12 +1,15 @@
 /**
  * A live run stream opened with a browser session closes when that session ends: past
  * its sliding deadline with `event: auth.expired`, on sign-out with `event: auth.revoked`,
- * each just before `done`. A stream opened with Home's own key is not tied to a session.
+ * each just before `done`. A stream whose caller has lost access to it closes with
+ * `event: revoked` once the access records move. A stream opened with Home's own key is
+ * not tied to a session.
  * The 30-second check is driven by calling it, on a fake clock, never by waiting.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { bearer, signInFromBootLink } from "./__test__/browser";
+import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
+import { acceptInvite, bearer, signInFromBootLink } from "./__test__/browser";
 import { makeFixtureHarness } from "./fixture";
 import { type TestServer, bootTestServer } from "./testkit";
 
@@ -65,7 +68,12 @@ async function openFeed(t: TestServer, path: string, secret: string): Promise<Fe
 }
 
 /** A Home on a clock the test moves, with one running daemon whose live feed is open. */
-async function liveRun(): Promise<{ t: TestServer; feedPath: string; advance(ms: number): void }> {
+async function liveRun(): Promise<{
+  t: TestServer;
+  feedPath: string;
+  advance(ms: number): void;
+  now(): number;
+}> {
   let clock = Date.parse("2026-11-11T00:00:00.000Z");
   const t = bootTestServer({ now: () => clock });
   servers.push(t);
@@ -84,6 +92,7 @@ async function liveRun(): Promise<{ t: TestServer; feedPath: string; advance(ms:
     advance: (ms) => {
       clock += ms;
     },
+    now: () => clock,
   };
 }
 
@@ -140,5 +149,80 @@ describe("a run stream opened with Home's own key", () => {
     expect(feed.text()).not.toContain("event: auth.");
     expect(ended(feed.text())).toBe(false);
     await feed.close();
+  });
+});
+
+describe("a run stream whose caller loses access", () => {
+  test("closes with revoked, not with data, once the member's grant is revoked", async () => {
+    const { t, feedPath } = await liveRun();
+    // The owner signs in first, which sets access up; then a member joins as an operator.
+    await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+    const read = loadAccessSnapshot(t.hangarRoot);
+    if (read.state !== "present") throw new Error("no access records");
+    const owner = { principal: read.snapshot.owner as string };
+    const access = openAccess(t.hangarRoot);
+    const id = feedPath.split("/")[3] as string;
+    const invite = await access.createInvite(owner, { role: "operator", scope: `harness:${id}` });
+    if (!invite.ok) throw new Error(invite.reason);
+    const member = await acceptInvite(t.fetchRaw, invite.result.code, "Otto");
+    const feed = await openFeed(t, feedPath, member.session);
+    await feed.until(replayed);
+    // The check with nothing moved closes nothing.
+    t.server.checkSessions();
+    await feed.drainWhile(t.fetchRaw("/healthz").then((r) => r.text()));
+    expect(ended(feed.text())).toBe(false);
+    const after = loadAccessSnapshot(t.hangarRoot);
+    if (after.state !== "present") throw new Error("no access records");
+    const grant = after.snapshot.grants.find(
+      (g) => g.principal === (member.answer["principal"] as string),
+    );
+    const revoked = await access.revoke(owner, grant?.id as string);
+    if (!revoked.ok) throw new Error(revoked.reason);
+    t.server.checkSessions();
+    await feed.until(ended);
+    const text = feed.text();
+    expect(text.indexOf("event: revoked")).toBeGreaterThan(-1);
+    expect(text.indexOf("event: revoked")).toBeLessThan(text.indexOf("event: done"));
+    expect(text).not.toContain("event: auth.revoked");
+    // …and the member's next request is refused.
+    const again = await t.fetchRaw(feedPath, { headers: bearer(member.session) });
+    expect(again.status).toBe(403);
+  });
+});
+
+describe("a run stream opened with a token that ends", () => {
+  test("closes with revoked once the token's time is up, with nothing in the access records moved", async () => {
+    const { t, feedPath, advance, now } = await liveRun();
+    await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+    const read = loadAccessSnapshot(t.hangarRoot);
+    if (read.state !== "present") throw new Error("no access records");
+    const owner = { principal: read.snapshot.owner as string };
+    const id = feedPath.split("/")[3] as string;
+    const service = await openAccess(t.hangarRoot, { now }).mintServiceToken(owner, {
+      service: "portal",
+      permissions: [],
+      harnesses: [id],
+      contentRead: true,
+      ttlMs: 20 * MINUTE,
+    });
+    if (!service.ok) throw new Error(service.reason);
+    const epoch = (): unknown => {
+      const at = loadAccessSnapshot(t.hangarRoot);
+      return at.state === "present" ? at.snapshot.epoch : at.state;
+    };
+    const before = epoch();
+    const feed = await openFeed(t, feedPath, service.result.secret);
+    await feed.until(replayed);
+    advance(19 * MINUTE);
+    t.server.checkSessions();
+    await feed.drainWhile(t.fetchRaw("/healthz").then((r) => r.text()));
+    expect(ended(feed.text())).toBe(false);
+    advance(2 * MINUTE);
+    t.server.checkSessions();
+    await feed.until(ended);
+    const text = feed.text();
+    expect(text.indexOf("event: revoked")).toBeGreaterThan(-1);
+    expect(text.indexOf("event: revoked")).toBeLessThan(text.indexOf("event: done"));
+    expect(epoch()).toEqual(before);
   });
 });

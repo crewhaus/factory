@@ -7,7 +7,8 @@
  * is, plus the routes the server answers that the map never names ({@link OFF_MAP_KEYS}).
  * `route-table.test.ts` holds the two to each other, so a route added to one and not the
  * other fails a test. The receipts middleware (`receipts.ts`) reads `receipt`, `kind`,
- * `dispatch`, `idempotent` and `secretFields`; nothing here enforces `permission` yet.
+ * `dispatch`, `idempotent` and `secretFields`; Home's one choke point (`access.ts`) reads
+ * `permission`, `ref` and `scopedAct`, and answers 404 for a request no row declares.
  *
  * Every write receipts. `harness` writes go to the harness's own command ledger,
  * `workspace` writes (registry edits, Home's settings) to Home's. A read writes nothing,
@@ -17,12 +18,14 @@
  *
  * Pure data: adding a route is one row, in its group.
  */
+import { domainOf } from "@crewhaus/access-control";
 import {
   COMMAND_KINDS,
   type CliTwin,
   type HttpMethod,
   type Qualifier,
   type ReceiptMode,
+  SCOPED_ACTS,
 } from "@crewhaus/control-contract";
 import { ROUTE_TWIN_NOTES } from "./route-twin-notes";
 
@@ -49,6 +52,13 @@ export type RouteRow = {
   /** The real CLI command, or `null` when there is none. */
   readonly cliTwin: CliTwin | null;
   readonly note?: string;
+  /**
+   * The one object the route is about, as a domain's checker names it: its kind, and the
+   * path parameter that holds its id. Every row whose permission is a domain's declares one.
+   */
+  readonly ref?: { readonly kind: string; readonly param: string };
+  /** The read a scoped token may make here, one of `SCOPED_ACTS`; only on a GET with `ref`. */
+  readonly scopedAct?: string;
 };
 
 type WriteExtras = {
@@ -67,6 +77,11 @@ function read(
   qualifiers: readonly Qualifier[] = [],
 ): RouteRow {
   return { key, method: "GET", path, permission, qualifiers, receipt: "none", cliTwin: null };
+}
+
+/** A read a scoped token may make: the act it needs, and the run it reads, by `:runId`. */
+function scopedRead(row: RouteRow, scopedAct: string): RouteRow {
+  return { ...row, ref: { kind: "run", param: "runId" }, scopedAct };
 }
 
 /** A non-GET route that only reads, and so writes no receipt. */
@@ -152,6 +167,13 @@ export const ROUTE_TABLE: readonly RouteRow[] = [
   read("authChallenge", "/api/v1/auth/challenge", "public"),
   readOnly("authSession", "POST", "/api/v1/auth/session", "public", "signs a browser in"),
   readOnly("authExchange", "POST", "/api/v1/auth/exchange", "public", "signs a browser in"),
+  readOnly(
+    "authAcceptInvite",
+    "POST",
+    "/api/v1/auth/accept-invite",
+    "public",
+    "joins Home from an invite",
+  ),
   readOnly("authRefresh", "POST", "/api/v1/auth/refresh", "public", "renews a browser session"),
   readOnly("authSignOut", "POST", "/api/v1/auth/sign-out", "public", "ends a browser session"),
   readOnly(
@@ -204,8 +226,11 @@ export const ROUTE_TABLE: readonly RouteRow[] = [
     kind: "controls.drain",
   }),
   read("runs", "/api/h/:id/runs", "h.read"),
-  read("run", "/api/h/:id/runs/:runId", "h.read.content"),
-  read("runEvents", "/api/h/:id/runs/:runId/events", "h.read.content"),
+  scopedRead(read("run", "/api/h/:id/runs/:runId", "h.read.content"), "run.result.read"),
+  scopedRead(
+    read("runEvents", "/api/h/:id/runs/:runId/events", "h.read.content"),
+    "run.events.read",
+  ),
   read("controlStatus", "/api/h/:id/control/status", "h.read"),
   write("controlWake", "harness", "POST", "/api/h/:id/control/wake", "h.control"),
   write("controlDrain", "harness", "POST", "/api/h/:id/control/drain", "h.control", {
@@ -794,4 +819,34 @@ export function matchRoute(
     }
   }
   return best;
+}
+
+/**
+ * The keys of the rows whose permission belongs to a domain but which name no object: a
+ * domain's checker decides per object, so such a row could never be allowed. Pure.
+ *
+ * First consumer: `route-table.test.ts`, over {@link ROUTE_TABLE} and planted rows.
+ */
+export function domainRowsWithoutRef(rows: readonly RouteRow[]): string[] {
+  return rows
+    .filter((row) => domainOf(row.permission) !== undefined && row.ref === undefined)
+    .map((row) => row.key);
+}
+
+/**
+ * The keys of the rows whose `scopedAct` is not a scoped act, or sits on a row a scoped
+ * token may not read through (not a GET, or naming no object). Pure.
+ *
+ * First consumer: `route-table.test.ts`.
+ */
+export function badScopedRows(rows: readonly RouteRow[]): string[] {
+  return rows
+    .filter(
+      (row) =>
+        row.scopedAct !== undefined &&
+        (!(SCOPED_ACTS as readonly string[]).includes(row.scopedAct) ||
+          row.method !== "GET" ||
+          row.ref === undefined),
+    )
+    .map((row) => row.key);
 }

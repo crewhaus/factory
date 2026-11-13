@@ -1654,7 +1654,7 @@ export const annotateSample: M3Handler = (ctx) => {
     verdict,
     ...(note !== undefined ? { note } : {}),
     ...(correction !== undefined ? { correction } : {}),
-    by: ctx.operator,
+    by: ctx.principal,
     ts: nowIso,
     ...(sessionId !== undefined ? { sessionId } : {}),
   };
@@ -1671,7 +1671,7 @@ export const annotateSample: M3Handler = (ctx) => {
       ts: nowIso,
       source: "ui",
       runId,
-      rater: ctx.operator,
+      rater: ctx.principal,
       adjudicate: true,
       thumbs: verdict === "pass" ? "up" : "down",
       ...(note !== undefined ? { comment: note } : {}),

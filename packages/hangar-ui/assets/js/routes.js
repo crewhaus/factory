@@ -48,6 +48,13 @@ export const ROUTES = {
   authChallenge: { method: "GET", path: "/api/v1/auth/challenge" },
   authSession: { method: "POST", path: "/api/v1/auth/session", body: "AuthSession" }, // {device, nonce, signature, seal}
   authExchange: { method: "POST", path: "/api/v1/auth/exchange", body: "AuthExchange" }, // {code, deviceJwk, seal}
+  // Joining from an invite (`/invite#c=<code>`): a new member's name and a sealed
+  // session, or, on a page that is not encrypted, a secret this tab made itself.
+  authAcceptInvite: {
+    method: "POST",
+    path: "/api/v1/auth/accept-invite",
+    body: "AuthAcceptInvite",
+  }, // {code, displayName, deviceJwk, seal} | {code, displayName, sessionSecret}
   authRefresh: { method: "POST", path: "/api/v1/auth/refresh", body: "AuthRefresh" }, // {seal}
   authSignOut: { method: "POST", path: "/api/v1/auth/sign-out", body: "Empty" }, // {}
   bootTicket: { method: "POST", path: "/api/boot-ticket", body: "Empty" }, // {} → {bootPath}

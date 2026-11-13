@@ -218,7 +218,8 @@ export function runArtifactsExist(harnessDir: string, runId: string): boolean {
 /** The SSE event names this server emits. Named here (and in the route map)
  *  so the UI and the server cannot drift on them. `auth.expired` and
  *  `auth.revoked` come just before `done` when the session that opened the
- *  stream ends: the console takes them as it takes a 401. */
+ *  stream ends: the console takes them as it takes a 401. `revoked` comes just
+ *  before `done` when whoever opened the stream has lost access to it. */
 export const SSE_EVENTS = [
   "state",
   "output",
@@ -227,11 +228,12 @@ export const SSE_EVENTS = [
   "done",
   "auth.expired",
   "auth.revoked",
+  "revoked",
 ] as const;
 export type SseEventName = (typeof SSE_EVENTS)[number];
 
 /** An abort reason that names the event a stream closes with. */
-const CLOSING_EVENTS: ReadonlySet<string> = new Set(["auth.expired", "auth.revoked"]);
+const CLOSING_EVENTS: ReadonlySet<string> = new Set(["auth.expired", "auth.revoked", "revoked"]);
 
 export const SSE_HEADERS: Record<string, string> = {
   "content-type": "text/event-stream; charset=utf-8",
@@ -295,8 +297,8 @@ export type RunStreamOptions = {
   readonly maxFrames?: number;
   /** Keep-alive cadence; see {@link SSE_HEARTBEAT_MS}. Tests shorten it. */
   readonly heartbeatMs?: number;
-  /** Closes the stream. An abort whose `reason` is `"auth.expired"` or
-   *  `"auth.revoked"` writes that event, with `{}`, before `done`. */
+  /** Closes the stream. An abort whose `reason` is `"auth.expired"`,
+   *  `"auth.revoked"` or `"revoked"` writes that event, with `{}`, before `done`. */
   readonly signal?: AbortSignal;
 };
 

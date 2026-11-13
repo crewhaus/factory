@@ -41,7 +41,10 @@ export function isReviewVerdict(value: string): value is ReviewVerdict {
   return (REVIEW_VERDICTS as readonly string[]).includes(value);
 }
 
-export type ReviewRow = ReviewQueueEntry & {
+export type ReviewRow = Omit<ReviewQueueEntry, "context"> & {
+  /** The quoted context, masked; `null` when the reader may not read this harness's content. */
+  readonly context?: string | null;
+  readonly contextWithheld?: true;
   readonly harnessId: string;
   readonly harnessDir: string;
   readonly specName: string;
@@ -74,7 +77,11 @@ function adjudicable(entry: ReviewQueueEntry): boolean {
 /** Fold every registered harness's review queue, oldest open first. */
 export function reviewInbox(
   harnesses: readonly ReviewHarness[],
-  opts: { readonly includeResolved?: boolean } = {},
+  opts: {
+    readonly includeResolved?: boolean;
+    /** Whether the reader may read this harness's content; quoted context is withheld otherwise. */
+    readonly showsContent?: (harnessId: string) => boolean;
+  } = {},
 ): ReviewView {
   const items: ReviewRow[] = [];
   for (const harness of harnesses) {
@@ -85,13 +92,18 @@ export function reviewInbox(
     } catch {
       continue; // unreadable queue — absence, not error
     }
+    const content = opts.showsContent?.(harness.id) ?? true;
     for (const entry of entries) {
       if (opts.includeResolved !== true && entry.status !== "open") continue;
       items.push({
         ...entry,
         // The feeders already redacted; masking again is defence in depth on
         // a field that is free text by construction.
-        ...(entry.context !== undefined ? { context: maskText(entry.context) } : {}),
+        ...(entry.context !== undefined
+          ? content
+            ? { context: maskText(entry.context) }
+            : { context: null, contextWithheld: true }
+          : {}),
         harnessId: harness.id,
         harnessDir: harness.dir,
         specName: harness.specName,

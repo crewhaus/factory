@@ -291,7 +291,7 @@ function readOnlyCard(state) {
     el("p", { class: "muted note" }, [
       el("span", { text: "Exempt while engaged: " }),
       el("code", {
-        class: "mono",
+        class: "mono exempt-list",
         text: (Array.isArray(state?.exempt) ? state.exempt : []).join(", ") || "—",
       }),
     ]),

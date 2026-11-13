@@ -130,3 +130,50 @@ export async function refresh(fetchRaw: Fetcher, session: string): Promise<strin
   if (res.status !== 200) throw new Error(`refresh answered ${res.status} ${JSON.stringify(body)}`);
   return seal.open(body["issued"], "auth.refresh");
 }
+
+/** Join Home from an invite the way the console does where it can make keys. */
+export async function acceptInvite(
+  fetchRaw: Fetcher,
+  code: string,
+  displayName: string,
+): Promise<Browser & { answer: Record<string, unknown> }> {
+  const key = await (await signInJs()).makeDeviceKey();
+  const seal = await (await sealedJs()).makeSeal();
+  const res = await post(fetchRaw, "/api/v1/auth/accept-invite", {
+    code,
+    displayName,
+    deviceJwk: key.deviceJwk,
+    seal: seal.seal,
+  });
+  const answer = (await res.json()) as Record<string, unknown>;
+  if (res.status !== 200) {
+    throw new Error(`accept-invite answered ${res.status} ${JSON.stringify(answer)}`);
+  }
+  return {
+    session: await seal.open(answer["issued"], "auth.acceptInvite"),
+    device: answer["device"] as string,
+    privateKey: key.privateKey,
+    answer,
+  };
+}
+
+/** Join Home from an invite the way a page that is not encrypted does: a secret it made. */
+export async function acceptInviteTabOnly(
+  fetchRaw: Fetcher,
+  code: string,
+  displayName: string,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; body: Record<string, unknown>; session: string }> {
+  const secret = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+  const res = await post(
+    fetchRaw,
+    "/api/v1/auth/accept-invite",
+    { code, displayName, sessionSecret: secret },
+    headers,
+  );
+  return {
+    status: res.status,
+    body: (await res.json()) as Record<string, unknown>,
+    session: `cha_${secret}`,
+  };
+}

@@ -11,22 +11,48 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { makeFixtureHarness } from "./fixture";
 import { M3_ROUTES } from "./m3-routes";
-import { READ_ONLY_EXEMPT, isReadOnlyRefused, readOnlyRefusal } from "./settings";
+import { ROUTE_BY_KEY, ROUTE_TABLE, type RouteRow } from "./route-table";
+import { READ_ONLY_EXEMPT, isReadOnlyRefused, readOnlyExempt, readOnlyRefusal } from "./settings";
 import { bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
 
 describe("isReadOnlyRefused", () => {
-  test("reads pass, writes do not, and the exempt list is exact rather than a prefix", () => {
-    expect(isReadOnlyRefused("GET", "/api/harnesses")).toBe(false);
-    expect(isReadOnlyRefused("POST", "/api/harnesses")).toBe(true);
-    expect(isReadOnlyRefused("PUT", "/api/h/hrn_1/pin")).toBe(true);
-    expect(isReadOnlyRefused("DELETE", "/api/h/hrn_1")).toBe(true);
-    expect(isReadOnlyRefused("PUT", "/api/read-only")).toBe(false);
-    expect(isReadOnlyRefused("POST", "/api/boot-ticket")).toBe(false);
-    // A path merely UNDER an exempt one is still refused — the exemption is
-    // the exact pair, so it cannot widen as routes are added beneath it.
-    expect(isReadOnlyRefused("POST", "/api/read-only/anything")).toBe(true);
+  const row = (key: string) => ROUTE_BY_KEY.get(key) as RouteRow;
+
+  test("it decides by the row's receipt: what changes something is refused, what reads is answered", () => {
+    expect(isReadOnlyRefused(row("harnesses"))).toBe(false);
+    expect(isReadOnlyRefused(row("addHarness"))).toBe(true);
+    expect(isReadOnlyRefused(row("setPin"))).toBe(true);
+    expect(isReadOnlyRefused(row("removeHarness"))).toBe(true);
+    // A POST that only reads writes no receipt, so it is answered.
+    for (const key of ["memoryRecall", "evalPlan", "specDiff", "datasetVerify", "bootTicket"]) {
+      expect(`${key}:${isReadOnlyRefused(row(key))}`).toBe(`${key}:false`);
+    }
+    // The toggle itself, by its exact template.
+    expect(isReadOnlyRefused(row("setReadOnly"))).toBe(false);
+    expect(READ_ONLY_EXEMPT).toEqual(new Set(["PUT /api/read-only"]));
+  });
+
+  test("every row that writes a receipt is refused, except the toggle, and every other row answers", () => {
+    for (const r of ROUTE_TABLE) {
+      const expected = r.receipt !== "none" && r.key !== "setReadOnly";
+      expect(`${r.key}:${isReadOnlyRefused(r)}`).toBe(`${r.key}:${expected}`);
+    }
+  });
+
+  test("the answered list is derived from the table: every non-GET row that writes no receipt", () => {
+    const exempt = readOnlyExempt();
+    expect(exempt).toContain("POST /api/h/:id/memory/recall");
+    expect(exempt).toContain("PUT /api/read-only");
+    expect(exempt).not.toContain("POST /api/scan");
+    expect(exempt).toEqual(
+      ROUTE_TABLE.filter(
+        (r) => r.method !== "GET" && (r.receipt === "none" || r.key === "setReadOnly"),
+      )
+        .map((r) => `${r.method} ${r.path}`)
+        .sort(),
+    );
   });
 
   test("the refusal names the mode and the way out", () => {

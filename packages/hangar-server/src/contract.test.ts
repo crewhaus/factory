@@ -41,6 +41,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
 import { createContinuityStore } from "@crewhaus/continuity-store";
 import { type Ledger, casAppend, deploymentsLedger, foldStates } from "@crewhaus/control-records";
 import { commandsLedgerOf, workspaceCommandsLedger } from "@crewhaus/control-service";
@@ -51,6 +52,7 @@ import { runCorpusEval } from "./__test__/eval-corpus";
 import { EVAL_JOB_ARGV } from "./eval-inputs";
 import { logLine, makeFixtureHarness } from "./fixture";
 import { M3_ROUTES } from "./m3-routes";
+import { matchRequest } from "./route-match";
 import { ROUTE_BY_KEY } from "./route-table";
 import { type TestServer, bootTestServer } from "./testkit";
 
@@ -104,6 +106,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["expiresAt", "string"],
   ],
   authExchange: SESSION_ISSUED,
+  authAcceptInvite: SESSION_ISSUED,
   authSession: SESSION_ISSUED,
   authRefresh: SESSION_ISSUED,
   authSignOut: [["signedOut", "boolean"]],
@@ -2017,6 +2020,15 @@ describe("UI route contract", () => {
         const route = ROUTES[key];
         if (route === undefined) throw new Error(`route "${key}" missing from routes.js`);
         driven.add(key);
+        // Every request the console makes is one the route table declares: the choke
+        // point answers 404 for anything else.
+        const segments = fill(route.path, params)
+          .split("/")
+          .filter((seg) => seg !== "")
+          .map((seg) => decodeURIComponent(seg));
+        expect(
+          `${key} -> ${matchRequest(route.method, segments)?.row === ROUTE_BY_KEY.get(key)}`,
+        ).toBe(`${key} -> true`);
         const before = commandCounts();
         const { status, body } = await t.api(`${fill(route.path, params)}${opts.query ?? ""}`, {
           method: route.method,
@@ -2075,6 +2087,33 @@ describe("UI route contract", () => {
         },
       );
       const device = exchanged["device"] as string;
+      // Joining from an invite: a new member, and a session sealed to the new device.
+      const access = loadAccessSnapshot(t.hangarRoot);
+      if (access.state !== "present") throw new Error("no access records after signing in");
+      const invited = await openAccess(t.hangarRoot).createInvite(
+        { principal: access.snapshot.owner as string },
+        { role: "viewer", scope: "home" },
+      );
+      if (!invited.ok) throw new Error(invited.reason);
+      const joinKey = await ui.signIn.makeDeviceKey();
+      const joinSeal = await ui.sealed.makeSeal();
+      const joined = await drive(
+        "authAcceptInvite",
+        {},
+        {
+          body: {
+            code: invited.result.code,
+            displayName: "Contract Member",
+            deviceJwk: joinKey.deviceJwk,
+            seal: joinSeal.seal,
+          },
+          readsKey: "authAcceptInvite",
+        },
+      );
+      const memberSession = await joinSeal.open(joined["issued"], "auth.acceptInvite");
+      expect((await t.fetchRaw("/api/version", { headers: bearer(memberSession) })).status).toBe(
+        200,
+      );
       const challenge = await drive("authChallenge", {}, { readsKey: "authChallenge" });
       const secondSeal = await ui.sealed.makeSeal();
       const signedIn = await drive(
@@ -2380,6 +2419,13 @@ describe("UI route contract", () => {
           throw new Error(`no M3_BODIES entry for write route "${key}" (${route.path})`);
         }
         driven.add(key);
+        const m3Segments = fill(route.path, params)
+          .split("/")
+          .filter((seg) => seg !== "")
+          .map((seg) => decodeURIComponent(seg));
+        expect(
+          `${key} -> ${matchRequest(route.method, m3Segments)?.row === ROUTE_BY_KEY.get(key)}`,
+        ).toBe(`${key} -> true`);
         const before = commandCounts();
         const { status, body } = await t.api(fill(route.path, params), {
           method: route.method,

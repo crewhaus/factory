@@ -35,7 +35,12 @@ import * as signIn from "./sign-in.js";
 import { openDialog } from "./ui/dialog.js";
 import { installLive } from "./ui/live.js";
 import { dismissTooltip, installTooltips } from "./ui/tooltip.js";
-import { SESSION_ENDED, openSignInDialog, renderSignInScreen } from "./views/sign-in.js";
+import {
+  SESSION_ENDED,
+  openSignInDialog,
+  renderJoinScreen,
+  renderSignInScreen,
+} from "./views/sign-in.js";
 
 // M4 (HM-190): overlay ownership. `inboxMounted` is set per navigation so
 // `?` goes to the inbox's own sheet on the two screens that bind it, and to
@@ -289,6 +294,10 @@ async function boot() {
   clear(appRoot);
   const main = el("main", { class: "view", id: "view", tabindex: "-1" });
   appRoot.appendChild(main);
+  if (typeof signedIn.invite === "string") {
+    renderJoinScreen(main, { code: signedIn.invite, onSignedIn: start });
+    return;
+  }
   renderSignInScreen(main, { message: signedIn.message ?? "", onSignedIn: start });
 }
 
