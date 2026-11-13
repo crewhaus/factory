@@ -429,6 +429,70 @@ describe("event-log — run-scoped handles", () => {
     ]);
   });
 
+  test("a run-scoped handle writes the line's `span` after `run`; an unscoped one leaves it out", async () => {
+    const rootDir = newTempRoot();
+    const span = "0123456789abcdef";
+    const scoped = await openEventLog(TEST_ID, {
+      rootDir,
+      now: () => 1_700_000_000_000,
+      run: "run_01",
+    });
+    await scoped.append({ kind: "span_closed", payload: { v: 1 }, span });
+    await scoped.append({ kind: "verdict", payload: { v: 1 } });
+    const plain = await openEventLog(TEST_ID, { rootDir, now: () => 1_700_000_000_001 });
+    await plain.append({ kind: "user_message", payload: { content: "b" }, span });
+    const lines = readFileSync(join(rootDir, `${TEST_ID}.jsonl`), "utf8")
+      .trimEnd()
+      .split("\n");
+    expect(lines).toEqual([
+      JSON.stringify({
+        ts: 1_700_000_000_000,
+        version: 1,
+        kind: "span_closed",
+        payload: { v: 1 },
+        run: "run_01",
+        span,
+      }),
+      JSON.stringify({
+        ts: 1_700_000_000_000,
+        version: 1,
+        kind: "verdict",
+        payload: { v: 1 },
+        run: "run_01",
+      }),
+      // The 0.8 line shape, byte for byte.
+      JSON.stringify({
+        ts: 1_700_000_000_001,
+        version: 1,
+        kind: "user_message",
+        payload: { content: "b" },
+      }),
+    ]);
+    const read = await collect(plain.read());
+    expect(read.map((e) => e.span)).toEqual([span, undefined, undefined]);
+  });
+
+  test("a span that is not 16 lowercase hex, or is all zeros, is refused on either handle", async () => {
+    const rootDir = newTempRoot();
+    const scoped = await openEventLog(TEST_ID, { rootDir, run: "run_01" });
+    const plain = await openEventLog(TEST_ID, { rootDir });
+    for (const bad of [
+      "",
+      "abc",
+      "0123456789ABCDEF",
+      "0".repeat(16),
+      "0123456789abcdef0",
+      "g".repeat(16),
+    ]) {
+      for (const log of [scoped, plain]) {
+        await expect(log.append({ kind: "user_message", payload: {}, span: bad })).rejects.toThrow(
+          /invalid span/,
+        );
+      }
+    }
+    expect(() => readFileSync(join(rootDir, `${TEST_ID}.jsonl`), "utf8")).toThrow();
+  });
+
   test("a run that does not fit the grammar is refused at open", async () => {
     const rootDir = newTempRoot();
     for (const bad of ["", "a b", "run/../x", "x".repeat(129), "run\nnext", "<b>"]) {

@@ -177,6 +177,12 @@ function runContextOf(ctx: ToolExecuteContext | undefined): RunContext | undefin
   return bridge?.runContext;
 }
 
+/** The span of this tool call on the parent bus, as the runtime bridge names it. */
+function parentSpanOf(ctx: ToolExecuteContext | undefined): string | undefined {
+  const span = (ctx?.bridge as { parentSpanId?: unknown } | undefined)?.parentSpanId;
+  return typeof span === "string" ? span : undefined;
+}
+
 function publishStage(
   bus: TraceEventBus | undefined,
   fields: Omit<ModelStageEvent, keyof ReturnType<TraceEventBus["envelope"]> | "kind">,
@@ -218,6 +224,8 @@ export type ConsultRequest = {
   readonly context?: string;
   /** The PARENT run's context — the runner mints the child from it. */
   readonly runContext?: RunContext;
+  /** The Consult call's span on the parent bus, which the side call nests under. */
+  readonly parentSpanId?: string;
   readonly signal?: AbortSignal;
 };
 
@@ -286,6 +294,7 @@ export function createConsultTool(opts: CreateConsultToolOptions): RegisteredToo
         );
       }
       const runContext = runContextOf(ctx);
+      const parentSpanId = parentSpanOf(ctx);
       const bus = runContext?.eventBus;
       const model = target.modelId ?? target.modelString;
       // The one boundary pass for EVERYTHING this tool hands back — reply,
@@ -316,6 +325,7 @@ export function createConsultTool(opts: CreateConsultToolOptions): RegisteredToo
           question: input.question,
           ...(input.context !== undefined ? { context: input.context } : {}),
           ...(runContext !== undefined ? { runContext } : {}),
+          ...(parentSpanId !== undefined ? { parentSpanId } : {}),
           ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
         });
       } catch (err) {
@@ -465,6 +475,7 @@ export function createEscalateTool(opts: CreateEscalateToolOptions): RegisteredT
     scope: "internal",
     execute: async (input, ctx) => {
       const runContext = runContextOf(ctx);
+      const parentSpanId = parentSpanOf(ctx);
       const bus = runContext?.eventBus;
       const turnNumber = runContext?.turnNumber ?? 0;
       const stage = {

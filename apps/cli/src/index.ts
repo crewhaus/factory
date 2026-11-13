@@ -16806,9 +16806,10 @@ async function runSessions(args: ParsedArgs): Promise<void> {
         "  the per-turn view `crewhaus dev` points at). With no <session>, tails the\n" +
         "  most-recently-updated one under .crewhaus/sessions. Each user/assistant turn,\n" +
         "  tool call + result, and failure prints one line as it lands, and so does each\n" +
-        "  routing decision (⇢), cost accrual ($), judge or provability verdict (⚖),\n" +
-        "  proof check (∎) and hybrid-strategy stage (◇) the session recorded — the\n" +
-        "  shape of a hybrid turn beside its text.\n" +
+        "  routing decision (⇢), cost accrual ($), judge or provability verdict and\n" +
+        "  check that refused, warned or parked a call (⚖), proof check (∎) and\n" +
+        "  hybrid-strategy stage (◇) the session recorded — the shape of a hybrid turn\n" +
+        "  beside its text.\n" +
         "  --transcript-only hides those. --no-follow dumps the current transcript and\n" +
         "  exits (scriptable/CI); --interval sets the poll ms (default 500). --dir points\n" +
         "  at a session store other than cwd/.crewhaus/sessions.\n" +

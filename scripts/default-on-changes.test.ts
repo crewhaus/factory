@@ -4623,3 +4623,258 @@ describe("run records, structured recall, context_assembled, ledger labels, comp
     expect(bullet).toContain("egress check");
   });
 });
+
+describe("spans nest from turn to tool to check, and every check writes a verdict", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  /** A scripted adapter: one script of tool calls, then a closing answer. */
+  const scriptedCalls = (calls: ReadonlyArray<{ id: string; name: string; input: unknown }>) => {
+    let n = 0;
+    return {
+      providerId: "anthropic" as const,
+      features: {
+        caching: "explicit" as const,
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      estimateTokens: () => 0,
+      stream: () => {
+        n += 1;
+        const first = n === 1;
+        return (async function* () {
+          yield { kind: "message_start" as const };
+          if (first) {
+            for (const [index, call] of calls.entries()) {
+              yield {
+                kind: "content_block_start" as const,
+                index,
+                block: { type: "tool_use" as const, id: call.id, name: call.name, input: {} },
+              };
+              yield {
+                kind: "content_block_delta" as const,
+                index,
+                delta: {
+                  type: "input_json_delta" as const,
+                  partial_json: JSON.stringify(call.input),
+                },
+              };
+              yield { kind: "content_block_stop" as const, index };
+            }
+          } else {
+            yield {
+              kind: "content_block_start" as const,
+              index: 0,
+              block: { type: "text" as const, text: "" },
+            };
+            yield {
+              kind: "content_block_delta" as const,
+              index: 0,
+              delta: { type: "text_delta" as const, text: "done" },
+            };
+            yield { kind: "content_block_stop" as const, index: 0 };
+          }
+          yield {
+            kind: "message_delta" as const,
+            stopReason: first ? "tool_use" : "end_turn",
+            usage: { input: 1, output: 1 },
+          };
+          yield { kind: "message_stop" as const };
+        })();
+      },
+    };
+  };
+
+  type Line = { kind: string; payload: Record<string, unknown>; span?: string };
+  const linesOf = (dir: string, sessionId: string): Line[] =>
+    readFileSync(join(dir, "sessions", `${sessionId}.jsonl`), "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l) as Line);
+
+  test("three calls run at once each nest their checks under their own span, and the log closes every span", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { normalizeText } = await import("../packages/tool-text/src/index");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-spans-")));
+    try {
+      const runContext = createRunContext();
+      const events: Array<{
+        kind: string;
+        spanId: string;
+        parentSpanId?: string;
+        toolUseId?: string;
+      }> = [];
+      runContext.eventBus.subscribe((e) => {
+        events.push(e as (typeof events)[number]);
+      });
+      await runChatLoop({
+        model: "test-model",
+        instructions: "x",
+        tools: [normalizeText],
+        sessionRootDir: join(dir, "sessions"),
+        runLedgerDir: dir,
+        settingsDir: dir,
+        permissionMode: "bypass",
+        runContext,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        installSigintHandler: false,
+        spinner: false,
+        stdout: () => {},
+        _adapter: scriptedCalls(
+          ["a", "b", "c"].map((t) => ({
+            id: `tu_${t}`,
+            name: "NormalizeText",
+            input: { text: t },
+          })),
+        ) as never,
+      });
+      const starts = events.filter((e) => e.kind === "tool_call_start");
+      expect(starts).toHaveLength(3);
+      const spanOf = new Map(starts.map((s) => [s.toolUseId, s.spanId]));
+      const decisions = events.filter((e) => e.kind === "permission_decision");
+      expect(decisions).toHaveLength(3);
+      for (const d of decisions) expect(d.parentSpanId).toBe(spanOf.get(d.toolUseId) as string);
+      const closed = linesOf(dir, runContext.sessionId)
+        .filter((l) => l.kind === "span_closed")
+        .map((l) => l.payload["kind"]);
+      for (const kind of ["run", "turn", "model"]) expect(closed).toContain(kind);
+      expect(closed.filter((k) => k === "tool")).toHaveLength(3);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Trace spans nest from turn to tool to check.");
+    for (const word of [
+      "`span_closed`",
+      "`span`",
+      "`crewhaus.retry_of`",
+      "OTLP traces change shape",
+      "`CREWHAUS_RUN_STAMPS=0`",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  }, 20_000); // imports the whole runtime the first time it runs
+
+  test("the audit records carry exactly their documented keys, and a denied call's verdict names it", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { normalizeText } = await import("../packages/tool-text/src/index");
+    const { APPROVALS_DIGEST_KEY_FILE } = await import("../packages/session-store/src/index");
+    const { ensureDigestKey } = await import("../packages/control-records/src/index");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-verdicts-")));
+    try {
+      mkdirSync(join(dir, "sessions"), { recursive: true });
+      await ensureDigestKey(join(dir, "sessions"), { file: APPROVALS_DIGEST_KEY_FILE });
+      const records: Array<{ kind: string; payload: Record<string, unknown> }> = [];
+      const sink = {
+        async append(input: { readonly kind: string; readonly payload: unknown }) {
+          records.push({ kind: input.kind, payload: input.payload as Record<string, unknown> });
+          return undefined;
+        },
+      };
+      const send = {
+        ...normalizeText,
+        name: "Send",
+        scope: "external" as const,
+        requireJustification: true,
+      };
+      const runContext = createRunContext();
+      const secret = "the vault code is 7741-alpha-omega";
+      tagContent(runContext, secret, "tool");
+      const common = {
+        model: "test-model",
+        instructions: "x",
+        sessionRootDir: join(dir, "sessions"),
+        runLedgerDir: dir,
+        settingsDir: dir,
+        singleTurn: true as const,
+        seedMessages: [{ role: "user" as const, content: "go" }],
+        installSigintHandler: false,
+        spinner: false,
+        stdout: () => {},
+      };
+      await runChatLoop({
+        ...common,
+        tools: [send],
+        permissionMode: "bypass",
+        runContext,
+        justificationJudge: async () => ({ allow: true, reason: "fits", judgeModel: "judge" }),
+        justificationAuditSink: sink,
+        egressAuditSink: sink,
+        resolveSinkScope: () => "external-configured",
+        _adapter: scriptedCalls([
+          { id: "tu_1", name: "Send", input: { text: secret, justification: "needed" } },
+        ]) as never,
+      });
+      const keysOf = (kind: string) =>
+        Object.keys(records.find((r) => r.kind === kind)?.payload ?? {}).sort();
+      expect(keysOf("permission_justification_evaluated")).toEqual(
+        [
+          "toolName",
+          "justification",
+          "verdict",
+          "reason",
+          "judgeModel",
+          "runId",
+          "sessionId",
+          "toolUseId",
+          "actionDigest",
+        ].sort(),
+      );
+      expect(keysOf("egress_decision")).toEqual(
+        [
+          "sinkId",
+          "sinkScope",
+          "verdict",
+          "originsFound",
+          "matchCount",
+          "runId",
+          "sessionId",
+          "toolUseId",
+          "actionDigest",
+        ].sort(),
+      );
+
+      const denied = createRunContext();
+      await runChatLoop({
+        ...common,
+        tools: [normalizeText],
+        permissionMode: "default",
+        permissionRules: {
+          flag: [],
+          settings: [],
+          yaml: [{ type: "alwaysDeny", pattern: "NormalizeText", source: "yaml" }],
+          hooks: [],
+          builtin: [],
+        },
+        runContext: denied,
+        _adapter: scriptedCalls([
+          { id: "tu_denied", name: "NormalizeText", input: { text: "x" } },
+        ]) as never,
+      });
+      const verdict = linesOf(dir, denied.sessionId).find(
+        (l) => l.kind === "verdict" && l.payload["gate"] === "permission",
+      );
+      expect(verdict?.payload).toMatchObject({
+        outcome: "deny",
+        on: { kind: "tool", toolUseId: "tu_denied", call: 1 },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Every check writes a `verdict` line");
+    for (const word of [
+      "`verdict`",
+      "`toolUseId`",
+      "`runId`",
+      "`sessionId`",
+      "`actionDigest`",
+      "never a judge's or a hook's own words",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  }, 20_000); // imports the whole runtime the first time it runs
+});

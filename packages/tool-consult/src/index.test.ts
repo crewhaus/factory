@@ -320,6 +320,20 @@ describe("Consult — the nested side call", () => {
     expect(ctx.dataLineage?.get("bridged reply text")).toBe("consult");
   });
 
+  test("the runner is handed the tool call's span the bridge names, and none without one", async () => {
+    const runner = scriptedRunner("ok");
+    const tool = createConsultTool({ roster: ROSTER, run: runner.run });
+    const ctx = createRunContext();
+    await executeTool(
+      tool,
+      { question: "q" },
+      { toolUseId: "tu_5", bridge: { runContext: ctx, parentSpanId: "0123456789abcdef" } },
+    );
+    await executeTool(tool, { question: "q" }, { toolUseId: "tu_6", bridge: { runContext: ctx } });
+    expect(runner.calls.map((c) => c.parentSpanId)).toEqual(["0123456789abcdef", undefined]);
+    expect("parentSpanId" in (runner.calls[1] as object)).toBe(false);
+  });
+
   test("construction refuses an empty roster or a defaultTo outside it", () => {
     expect(() => createConsultTool({ roster: [], run: scriptedRunner("x").run })).toThrow(
       ConsultError,

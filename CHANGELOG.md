@@ -504,6 +504,32 @@ these on: they reach every harness that uses what each one names.
   `propose/<id>` after it, and stops before any git step when the record
   cannot be written.
 
+- **Trace spans nest from turn to tool to check.** A turn's model calls and
+  tool calls nest under the turn's span, and each tool call's checks
+  (`permission_decision`, `hook_fired`, `approval_requested`) nest under that
+  call's own span, also when calls run at once. A turn's start and end share
+  one span id. A sub-agent's run nests under the Task call that started it,
+  and side calls under the turn or the Consult call. A retried model call is
+  a sibling of the call it retries and names it: `retryOf` on its
+  `model_request`, `crewhaus.retry_of` on its OpenTelemetry span. OTLP traces
+  change shape, so a dashboard that expects a flat tree sees depth. Every line
+  a run writes to its session log carries `span`, the span it belongs to, and
+  each span a run closes writes a `span_closed` line: its kind, parent, start,
+  duration and how it ended. `CREWHAUS_RUN_STAMPS=0` drops the `span_closed`
+  lines and the `span` keys; the nesting stays.
+
+- **Every check writes a `verdict` line that names what it judged.** Each
+  permission, justification, egress, post-tool, hook, approval, rate-limit,
+  loop, evaluation and provability decision writes one `verdict` line to the
+  session log, bound to the run, the check's span, the tool call (its id and
+  its number in the run) and the keyed action digest the approvals decision
+  log uses for the same action. The line holds outcome codes, rule ids and
+  ids: never tool input or model text, and never a judge's or a hook's own
+  words. `permission_decision`, `hook_fired` and `approval_requested` carry
+  `toolUseId`. The `permission_justification_evaluated` and `egress_decision`
+  audit records carry `runId`, `sessionId`, `toolUseId` and `actionDigest`.
+  `CREWHAUS_RUN_STAMPS=0` drops the `verdict` lines.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read

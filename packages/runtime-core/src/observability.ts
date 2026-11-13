@@ -31,15 +31,16 @@ import {
   formatJsonLine,
 } from "@crewhaus/structured-event-printer";
 import { appendContained } from "@crewhaus/tool-safety/fs";
-import type {
-  CostAccrualEvent,
-  JudgeVerdictEvent,
-  ModelDirectiveEvent,
-  ModelFailoverEvent,
-  ModelStageEvent,
-  TraceEvent,
-  TraceEventBus,
-  Unsubscribe,
+import {
+  type CostAccrualEvent,
+  type JudgeVerdictEvent,
+  type ModelDirectiveEvent,
+  type ModelFailoverEvent,
+  type ModelStageEvent,
+  type TraceEvent,
+  type TraceEventBus,
+  type Unsubscribe,
+  isValidSpanId,
 } from "@crewhaus/trace-event-bus";
 import {
   SessionMetricsAccumulator,
@@ -572,6 +573,14 @@ const CLEAN_STOP_REASONS = new Set(["end_turn", "tool_use", "stop_sequence"]);
  * `append()` failures must never abort a turn, so — like the cost_accrual
  * persistence path — the promise result is logged rather than thrown.
  */
+/**
+ * The span a mirrored line belongs to: the bus event's own span, when it is
+ * one (a hand-built envelope's id may not be).
+ */
+function spanOf(event: TraceEvent): { readonly span?: string } {
+  return isValidSpanId(event.spanId) ? { span: event.spanId } : {};
+}
+
 export function attachAdvisorPersistence(
   bus: TraceEventBus,
   eventLog: EventLog,
@@ -584,8 +593,9 @@ export function attachAdvisorPersistence(
   const persist = (
     kind: "recovery" | "tool_stats" | "permission" | "model_meta",
     payload: unknown,
+    event: TraceEvent,
   ): void => {
-    void eventLog.append({ kind, payload }).catch((err) => {
+    void eventLog.append({ kind, payload, ...spanOf(event) }).catch((err) => {
       runContext.logger.error("advisor_event.persist_failed", {
         kind,
         message: err instanceof Error ? err.message : String(err),
@@ -606,11 +616,15 @@ export function attachAdvisorPersistence(
     switch (event.kind) {
       case "error_recovered": {
         if (event.action === "continue") truncationContinues += 1;
-        persist("recovery", {
-          errorName: event.errorName,
-          action: event.action,
-          depth: event.depth,
-        });
+        persist(
+          "recovery",
+          {
+            errorName: event.errorName,
+            action: event.action,
+            depth: event.depth,
+          },
+          event,
+        );
         return;
       }
       case "tool_call_end": {
@@ -618,16 +632,20 @@ export function attachAdvisorPersistence(
         tally.calls += 1;
         if (event.isError) tally.errors += 1;
         toolTally.set(event.toolName, tally);
-        persist("tool_stats", {
-          toolName: event.toolName,
-          // Whole milliseconds — performance.now() floats add line bytes
-          // without adding advisory signal.
-          durationMs: Math.round(event.durationMs),
-          isError: event.isError,
-          // 0.6.0 §5.6 — the serving profile, so `tools audit` can group
-          // failures by profile; absent (byte-identical) on a single-model run.
-          ...(event.profile !== undefined ? { profile: event.profile } : {}),
-        });
+        persist(
+          "tool_stats",
+          {
+            toolName: event.toolName,
+            // Whole milliseconds — performance.now() floats add line bytes
+            // without adding advisory signal.
+            durationMs: Math.round(event.durationMs),
+            isError: event.isError,
+            // 0.6.0 §5.6 — the serving profile, so `tools audit` can group
+            // failures by profile; absent (byte-identical) on a single-model run.
+            ...(event.profile !== undefined ? { profile: event.profile } : {}),
+          },
+          event,
+        );
         return;
       }
       case "permission_decision": {
@@ -639,27 +657,35 @@ export function attachAdvisorPersistence(
           if (event.askOutcome === "approved") ask.approved += 1;
           askTally.set(event.toolName, ask);
         }
-        persist("permission", {
-          toolName: event.toolName,
-          decision: event.decision,
-          askOutcome: event.askOutcome ?? null,
-        });
+        persist(
+          "permission",
+          {
+            toolName: event.toolName,
+            decision: event.decision,
+            askOutcome: event.askOutcome ?? null,
+          },
+          event,
+        );
         return;
       }
       case "model_response": {
         responses += 1;
         if (!CLEAN_STOP_REASONS.has(event.stopReason)) anomalousStops += 1;
-        persist("model_meta", {
-          stopReason: event.stopReason,
-          model: event.model,
-          ...(event.role !== undefined ? { role: event.role } : {}),
-          ...(event.profile !== undefined ? { profile: event.profile } : {}),
-          usage: event.usage,
-          // Whole milliseconds — performance.now() floats add line bytes
-          // without adding attribution signal.
-          durationMs: Math.round(event.durationMs),
-          turnNumber: event.turnNumber,
-        });
+        persist(
+          "model_meta",
+          {
+            stopReason: event.stopReason,
+            model: event.model,
+            ...(event.role !== undefined ? { role: event.role } : {}),
+            ...(event.profile !== undefined ? { profile: event.profile } : {}),
+            usage: event.usage,
+            // Whole milliseconds — performance.now() floats add line bytes
+            // without adding attribution signal.
+            durationMs: Math.round(event.durationMs),
+            turnNumber: event.turnNumber,
+          },
+          event,
+        );
         return;
       }
       case "compaction_fired": {
@@ -733,6 +759,7 @@ export function attachMcpStatsPersistence(
     void eventLog
       .append({
         kind: "mcp_stats",
+        ...spanOf(event),
         payload: {
           server: event.server,
           toolName: event.toolName,
@@ -799,8 +826,8 @@ export function attachRoutingPersistence(
     readonly kinds?: ReadonlyArray<RoutingPersistedKind>;
   } = {},
 ): AttachedRoutingPersistence {
-  const persist = (kind: RoutingPersistedKind, payload: unknown): void => {
-    void eventLog.append({ kind, payload }).catch((err) => {
+  const persist = (kind: RoutingPersistedKind, payload: unknown, event: TraceEvent): void => {
+    void eventLog.append({ kind, payload, ...spanOf(event) }).catch((err) => {
       runContext.logger.error("routing_event.persist_failed", {
         kind,
         message: err instanceof Error ? err.message : String(err),
@@ -814,53 +841,69 @@ export function attachRoutingPersistence(
     switch (event.kind) {
       case "model_failover": {
         const e = event as ModelFailoverEvent;
-        persist("model_failover", {
-          turnNumber: e.turnNumber,
-          from: e.from,
-          to: e.to,
-          reason: e.reason,
-        });
+        persist(
+          "model_failover",
+          {
+            turnNumber: e.turnNumber,
+            from: e.from,
+            to: e.to,
+            reason: e.reason,
+          },
+          event,
+        );
         return;
       }
       case "model_stage": {
         const e = event as ModelStageEvent;
-        persist("model_stage", {
-          turnNumber: e.turnNumber,
-          stage: e.stage,
-          strategy: e.strategy,
-          role: e.role,
-          model: e.model,
-          ...(e.profile !== undefined ? { profile: e.profile } : {}),
-          outcome: e.outcome,
-          ...(e.cause !== undefined ? { cause: e.cause } : {}),
-          ...(e.costUsdMicros !== undefined ? { costUsdMicros: e.costUsdMicros } : {}),
-        });
+        persist(
+          "model_stage",
+          {
+            turnNumber: e.turnNumber,
+            stage: e.stage,
+            strategy: e.strategy,
+            role: e.role,
+            model: e.model,
+            ...(e.profile !== undefined ? { profile: e.profile } : {}),
+            outcome: e.outcome,
+            ...(e.cause !== undefined ? { cause: e.cause } : {}),
+            ...(e.costUsdMicros !== undefined ? { costUsdMicros: e.costUsdMicros } : {}),
+          },
+          event,
+        );
         return;
       }
       case "model_directive": {
         const e = event as ModelDirectiveEvent;
-        persist("model_directive", {
-          turnNumber: e.turnNumber,
-          source: e.source,
-          requested: e.requested,
-          ...(e.resolved !== undefined ? { resolved: e.resolved } : {}),
-          accepted: e.accepted,
-          ...(e.reason !== undefined ? { reason: e.reason } : {}),
-        });
+        persist(
+          "model_directive",
+          {
+            turnNumber: e.turnNumber,
+            source: e.source,
+            requested: e.requested,
+            ...(e.resolved !== undefined ? { resolved: e.resolved } : {}),
+            accepted: e.accepted,
+            ...(e.reason !== undefined ? { reason: e.reason } : {}),
+          },
+          event,
+        );
         return;
       }
       case "judge_verdict": {
         const e = event as JudgeVerdictEvent;
-        persist("judge_verdict", {
-          turnNumber: e.turnNumber,
-          stepOrNode: e.stepOrNode,
-          verdict: e.verdict,
-          score: e.score,
-          ...(e.rationale !== undefined ? { rationale: e.rationale } : {}),
-          ...(e.judgeModel !== undefined ? { judgeModel: e.judgeModel } : {}),
-          ...(e.panel !== undefined ? { panel: e.panel } : {}),
-          ...(e.costUsdMicros !== undefined ? { costUsdMicros: e.costUsdMicros } : {}),
-        });
+        persist(
+          "judge_verdict",
+          {
+            turnNumber: e.turnNumber,
+            stepOrNode: e.stepOrNode,
+            verdict: e.verdict,
+            score: e.score,
+            ...(e.rationale !== undefined ? { rationale: e.rationale } : {}),
+            ...(e.judgeModel !== undefined ? { judgeModel: e.judgeModel } : {}),
+            ...(e.panel !== undefined ? { panel: e.panel } : {}),
+            ...(e.costUsdMicros !== undefined ? { costUsdMicros: e.costUsdMicros } : {}),
+          },
+          event,
+        );
         return;
       }
       default:
@@ -951,6 +994,9 @@ const WATCHME_MIRRORED_KIND_RECORD: Readonly<Record<EventKind, true>> = {
   // the loop itself (`./run-records`).
   run_stamp: true,
   context_manifest: true,
+  // How the run's spans nested and what each check decided (`./run-spans`).
+  span_closed: true,
+  verdict: true,
 };
 export const WATCHME_MIRRORED_KINDS: ReadonlySet<string> = new Set(
   Object.keys(WATCHME_MIRRORED_KIND_RECORD),

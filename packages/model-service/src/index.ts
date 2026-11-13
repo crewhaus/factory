@@ -742,7 +742,7 @@ export const CONSULT_INSTRUCTIONS =
  * `@crewhaus/tool-consult`, exactly once.
  */
 export function buildConsultRunner(deps: WireModelsDeps): ConsultRunner {
-  return async ({ target, question, context, runContext: parent, signal }) => {
+  return async ({ target, question, context, runContext: parent, parentSpanId, signal }) => {
     const content =
       context !== undefined && context.trim().length > 0
         ? `${context.trim()}
@@ -760,6 +760,7 @@ Question: ${question}`
       seedMessages: [{ role: "user", content }],
       role: "consult",
       ...(parent !== undefined ? { parent } : {}),
+      ...(parentSpanId !== undefined ? { parentSpanId } : {}),
       ...(signal !== undefined ? { signal } : {}),
       sessionTarget: "consult",
       deps,
