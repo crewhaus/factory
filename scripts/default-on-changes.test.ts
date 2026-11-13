@@ -1293,7 +1293,7 @@ describe("the release notes name every change a harness without provability: see
       );
       // The boot check on where the tenants root belongs rides the same bullet.
       expect(checkTenantsRoot({ cwd, tenantsRoot: "live/tenants" })).toContain(
-        "CREWHAUS_TENANTS_ROOT must be outside the harness directory",
+        "CREWHAUS_TENANTS_ROOT must neither be the harness directory nor contain it",
       );
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -3808,6 +3808,102 @@ describe("the release notes name what the decision service changes for every har
       "for `crewhaus run` or `crewhaus runs resume` of a spec in another directory, that directory's `.crewhaus/run/spec`",
     );
   });
+
+  test("in-process eval, optimize, serve and change-check runs name the spec's directory to the floor", async () => {
+    // Every eval the CLI runs in-process names the spec it loaded.
+    const cli = readFileSync(join(ROOT, "apps", "cli", "src", "index.ts"), "utf8");
+    const callOf = (text: string, at: number): string => {
+      const open = text.indexOf("{", at);
+      let depth = 0;
+      for (let i = open; i < text.length; i++) {
+        if (text[i] === "{") depth++;
+        else if (text[i] === "}" && --depth === 0) return text.slice(at, i + 1);
+      }
+      return text.slice(at);
+    };
+    const calls: string[] = [];
+    for (
+      let at = cli.indexOf("runEvalLib({");
+      at !== -1;
+      at = cli.indexOf("runEvalLib({", at + 1)
+    ) {
+      calls.push(callOf(cli, at));
+    }
+    expect(calls).toHaveLength(9);
+    expect(calls.filter((call) => !/\bspecDir: /.test(call))).toEqual([]);
+    // `crewhaus serve --mcp` names the served spec's real directory on every turn.
+    const serveAt = cli.indexOf("async function buildServeRuntime(");
+    expect(serveAt).toBeGreaterThan(-1);
+    const serve = cli.slice(serveAt, cli.indexOf("\nasync function ", serveAt + 1));
+    const serveCalls: string[] = [];
+    for (
+      let at = serve.indexOf("runChatLoop({");
+      at !== -1;
+      at = serve.indexOf("runChatLoop({", at + 1)
+    ) {
+      serveCalls.push(callOf(serve, at));
+    }
+    expect(serveCalls).toHaveLength(2);
+    expect(
+      serveCalls.filter(
+        (call) =>
+          !call.includes("...commonOptions,") && !call.includes("...primaryOptionsForRun(),"),
+      ),
+    ).toEqual([]);
+    expect(serve).toContain("...commonOptions,\n    model,");
+    const commonAt = serve.indexOf("const commonOptions = {");
+    expect(commonAt).toBeGreaterThan(-1);
+    expect(callOf(serve, commonAt)).toMatch(/\n {4}specDir,\n/);
+    expect(cli).toContain("await buildServeRuntime(args, cliIr, runSpecDirOf(absSpec));");
+    // `crewhaus changes check` names the real directory of the spec the change targets.
+    const quality = readFileSync(join(ROOT, "apps", "cli", "src", "quality-runners.ts"), "utf8");
+    const qualityAt = quality.indexOf("runEvalCore({");
+    expect(qualityAt).toBeGreaterThan(-1);
+    expect(callOf(quality, qualityAt)).toMatch(/\bspecDir,/);
+    expect(quality).toContain(
+      'const specDir = runSpecDirOf(resolve(opts.harnessDir, opts.spec ?? "crewhaus.yaml"));',
+    );
+    const changes = readFileSync(join(ROOT, "apps", "cli", "src", "changes-cmd.ts"), "utf8");
+    const runnersAt = changes.indexOf("qualityRunners({");
+    expect(runnersAt).toBeGreaterThan(-1);
+    expect(callOf(changes, runnersAt)).toContain("spec: specRel,");
+    // The eval runner hands the directory to every sample's chat loop.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-spec-dir-")));
+    const seen: Array<Record<string, unknown>> = [];
+    try {
+      const ir = lower(
+        parseSpec("name: shop\ntarget: cli\nagent:\n  model: m\n  instructions: Answer.\n"),
+      );
+      if (ir.target !== "cli") throw new Error("expected a cli spec");
+      const { compiled } = parseGradersConfig(
+        'graders:\n  - name: any\n    type: contains\n    substring: "a"\n',
+      );
+      async function* samples() {
+        yield { id: "a", input: "q" };
+      }
+      await runEval({
+        ir,
+        dataset: { name: "smoke", samples: samples() },
+        compiledGraders: compiled,
+        opts: {
+          outDir: join(root, "run"),
+          cwd: root,
+          specDir: join(root, "spec"),
+          retryErrors: false,
+          chatLoop: async (opts) => {
+            seen.push(opts as unknown as Record<string, unknown>);
+            return "an answer";
+          },
+        },
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    expect(seen.map((opts) => opts["specDir"])).toEqual([join(root, "spec")]);
+    const bullet = bulletFor("keep a spec's records out of an").replace(/\s+/g, " ");
+    expect(bullet).toContain("`.crewhaus/run/spec`");
+    expect(bullet).toContain("`crewhaus optimize`");
+  });
 });
 
 describe("the release notes name what held-out reads, canary steps, agent dataset tools, re-anchors and write-backs change for every harness", () => {
@@ -4225,10 +4321,12 @@ describe("the release notes name what recorded managed runs and API input change
     expect(bullet).toContain("exit 41");
   }, 20_000); // imports the whole runtime the first time it runs
 
-  test("a managed daemon with a file tool refuses a tenants root inside the harness", () => {
+  test("a managed daemon with a file tool refuses a tenants root that is, lies inside or holds the harness", () => {
     const cwd = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-root-")));
     try {
       expect(checkTenantsRoot({ cwd, tenantsRoot: join(cwd, "tenants") })).toBeDefined();
+      expect(checkTenantsRoot({ cwd, tenantsRoot: ".." })).toBeDefined();
+      expect(checkTenantsRoot({ cwd, tenantsRoot: dirname(cwd) })).toBeDefined();
       expect(checkTenantsRoot({ cwd, tenantsRoot: join(tmpdir(), "elsewhere") })).toBeUndefined();
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -4240,6 +4338,10 @@ describe("the release notes name what recorded managed runs and API input change
     const bullet = bulletFor("A managed daemon whose spec declares a tool that works on files");
     expect(bullet).toContain("`CREWHAUS_TENANTS_ROOT`");
     expect(bullet).toContain("exits 21");
+    const holds = bulletFor("A managed tenants root may neither be the harness directory");
+    expect(holds).toContain("`CREWHAUS_TENANTS_ROOT`");
+    expect(holds).toContain("exits 21");
+    expect(holds).toContain("contain");
   });
 
   test("on a managed harness the floor holds project memory and skills, and the floor bullet says so", () => {

@@ -188,6 +188,16 @@ these on: they reach every harness that uses what each one names.
   `crewhaus route freeze`. `Bash` and `RunCommand` remain outside what the
   floor can see. Recompile a daemon to pick this up.
 
+- **`crewhaus eval`, `crewhaus optimize` and `crewhaus serve` keep a spec's
+  records out of an agent's reach wherever the spec lives.** When the CLI's eval
+  runner or `crewhaus serve --mcp` starts an agent for a spec whose real
+  directory is not the working directory, under `crewhaus eval` (suites and
+  matrices included), `crewhaus optimize` (`--from-advice` included),
+  `crewhaus flywheel`, `crewhaus model-scan`, `crewhaus model right-size`,
+  `crewhaus deploy canary`, `crewhaus changes check` (for the spec the change
+  targets) or `crewhaus serve --mcp`, that directory's `.crewhaus/run/spec` is
+  on the runtime-state floor, as it is for `crewhaus run`.
+
 - **An approval covers the work it was asked in, and is used once.** A grant
   counts for the call it was asked about, in the conversation, batch job,
   scheduled lane or supervised job that asked, and only while the harness runs
@@ -397,6 +407,11 @@ these on: they reach every harness that uses what each one names.
   exits 21 and names the variable, so tenant data stays apart from the harness's
   own files. Set it to an absolute path such as `~/.crewhaus/tenants/<harness>`.
   Recompile a daemon to pick this up.
+- **A managed tenants root may neither be the harness directory nor contain
+  it.** A managed daemon whose spec declares a tool that works on files exits 21
+  and names `CREWHAUS_TENANTS_ROOT` when the root is the harness directory, lies
+  inside it or holds it, such as `..`. Give tenants a directory of their own,
+  such as `~/.crewhaus/tenants/<harness>`. Recompile a daemon to pick this up.
 - **On a `channel` or `managed` harness, a tool call that names the run records
   or the inputs waiting for a run or a decision is refused.** As with the
   credential files, an agent's tool call that names `.crewhaus/run/control/runs`

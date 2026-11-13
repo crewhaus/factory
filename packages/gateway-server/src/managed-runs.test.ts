@@ -22,7 +22,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CANONICAL_RUN_ID_RE, mintId, mintRunId } from "@crewhaus/control-contract";
 import { run as runSchema } from "@crewhaus/control-contract/schemas";
@@ -1032,26 +1032,49 @@ describe("resolveGatewaySecret", () => {
 });
 
 describe("checkTenantsRoot", () => {
-  test("refuses the harness directory, a root inside it, linked into it, or not made yet inside it", () => {
+  test("refuses the harness directory, a root inside it or holding it, reached directly, through a link, or not made yet", () => {
     const cwd = tempDir();
     const link = join(tempDir(), "harness");
     symlinkSync(cwd, link, "dir");
-    for (const tenantsRoot of [
+    const parentLink = join(tempDir(), "parent");
+    symlinkSync(dirname(cwd), parentLink, "dir");
+    const cases = [
       cwd,
       ".",
       "live/tenants",
       join(cwd, "tenants"),
       join(link, "not", "yet", "there"),
-    ]) {
-      expect(`${tenantsRoot}:${checkTenantsRoot({ cwd, tenantsRoot }) ?? "kept"}`).toContain(
-        "CREWHAUS_TENANTS_ROOT must be outside the harness directory",
-      );
-    }
+      "..",
+      dirname(cwd),
+      parentLink,
+      "..tenants",
+      "./..data",
+      join(cwd, "..tenants"),
+    ];
+    const refused = cases.filter((tenantsRoot) =>
+      (checkTenantsRoot({ cwd, tenantsRoot }) ?? "").includes(
+        "CREWHAUS_TENANTS_ROOT must neither be the harness directory nor contain it",
+      ),
+    );
+    expect(refused).toEqual(cases);
   });
 
-  test("keeps a root outside the harness", () => {
+  test("refuses the parent of a harness whose directory name starts with two dots", () => {
+    const cwd = join(tempDir(), "..svc");
+    mkdirSync(cwd);
+    expect(checkTenantsRoot({ cwd, tenantsRoot: ".." }) ?? "").toContain(
+      "CREWHAUS_TENANTS_ROOT must neither be the harness directory nor contain it",
+    );
+    expect(checkTenantsRoot({ cwd, tenantsRoot: dirname(cwd) }) ?? "").toContain(
+      "CREWHAUS_TENANTS_ROOT must neither be the harness directory nor contain it",
+    );
+    expect(checkTenantsRoot({ cwd, tenantsRoot: "../elsewhere" })).toBeUndefined();
+  });
+
+  test("keeps a root outside the harness that does not hold it", () => {
     const cwd = tempDir();
     expect(checkTenantsRoot({ cwd, tenantsRoot: join(tempDir(), "tenants") })).toBeUndefined();
     expect(checkTenantsRoot({ cwd, tenantsRoot: "../elsewhere" })).toBeUndefined();
+    expect(checkTenantsRoot({ cwd, tenantsRoot: join(dirname(cwd), "other") })).toBeUndefined();
   });
 });
