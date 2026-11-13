@@ -1353,6 +1353,7 @@ export const STATE_SCHEMA: ParseArgsSchema = {
     // backup
     { name: "out", short: "o", takesValue: true },
     { name: "exclude", takesValue: true },
+    { name: "include", takesValue: true },
     // restore
     { name: "into", takesValue: true },
     { name: "merge", takesValue: true },

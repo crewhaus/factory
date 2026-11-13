@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -9,6 +10,8 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,8 +20,11 @@ import { openAuditLog, verify } from "@crewhaus/audit-log";
 import type { FeedbackRecord } from "./feedback";
 import {
   type BackupManifest,
+  DEFAULT_BACKUP_EXCLUDES,
   MANIFEST_FILENAME,
+  RUN_TOKEN_FILES,
   buildManifest,
+  createStateBackup,
   defaultBackupFileName,
   isBackupManifest,
   isExcluded,
@@ -26,6 +32,7 @@ import {
   parseExcludeGlobs,
   planAdditiveMerge,
   planFeedbackMerge,
+  removeRunTokens,
   sanitizeBackupLabel,
   sqliteSidecarBase,
 } from "./state-backup";
@@ -318,6 +325,203 @@ describe("crewhaus state backup", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("out of scope");
     expect(result.stdout).toContain("S3/R2");
+  }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// run tokens and the tarball's mode
+// ---------------------------------------------------------------------------
+
+const RUN_TOKENS = ["run/control-token", "run/gateway-jwt-secret", "run/mcp-token"] as const;
+
+/** A running daemon's state: its three run tokens (fresh random values,
+ *  0600), the run dir's .gitignore and one session. Returns the token values. */
+function seedRunningState(stateDir: string): Record<string, string> {
+  mkdirSync(join(stateDir, "run"), { recursive: true });
+  mkdirSync(join(stateDir, "sessions"), { recursive: true });
+  const values: Record<string, string> = {};
+  for (const rel of RUN_TOKENS) {
+    const value = randomBytes(24).toString("hex");
+    writeFileSync(join(stateDir, rel), value, { mode: 0o600 });
+    values[rel] = value;
+  }
+  writeFileSync(join(stateDir, "run", ".gitignore"), "*\n");
+  writeFileSync(join(stateDir, "sessions", `${SESSION_ID}.jsonl`), '{"ts":1}\n');
+  return values;
+}
+
+function archiveText(out: string): string {
+  return new TextDecoder().decode(Bun.gunzipSync(readFileSync(out)));
+}
+
+describe("a backup leaves a daemon's run tokens out and is readable only by its owner", () => {
+  test("the default list names each run token by its path", () => {
+    for (const rel of RUN_TOKENS) expect(DEFAULT_BACKUP_EXCLUDES).toContain(rel);
+  });
+
+  test("with no options, none of the three is archived and the tarball is 0600", async () => {
+    const stateDir = join(tmp, ".crewhaus");
+    const values = seedRunningState(stateDir);
+    const out = join(tmp, "b.tar.gz");
+    const result = await createStateBackup({ stateDir, outFile: out, crewhausVersion: "test" });
+
+    const entries = await tarEntries(out);
+    for (const rel of RUN_TOKENS) expect(entries).not.toContain(rel);
+    expect(entries).toContain(`sessions/${SESSION_ID}.jsonl`);
+    expect(entries).toContain("run/.gitignore");
+    expect(result.manifest.totals.files).toBe(2);
+    expect(result.defaultExcluded).toEqual([...RUN_TOKENS]);
+    expect(result.excluded).toEqual([]);
+    const bytes = archiveText(out);
+    for (const value of Object.values(values)) expect(bytes.includes(value)).toBe(false);
+    if (process.platform !== "win32") expect(statSync(out).mode & 0o777).toBe(0o600);
+    // No partial file is left beside the tarball.
+    expect(readdirSync(tmp).filter((f) => f.includes(".partial-"))).toEqual([]);
+  });
+
+  test("a tarball written over an existing wider-mode file is 0600", async () => {
+    const stateDir = join(tmp, ".crewhaus");
+    seedRunningState(stateDir);
+    const out = join(tmp, "b.tar.gz");
+    writeFileSync(out, "old");
+    chmodSync(out, 0o644);
+    await createStateBackup({ stateDir, outFile: out, crewhausVersion: "test" });
+    expect((await tarEntries(out)).length).toBeGreaterThan(0);
+    if (process.platform !== "win32") expect(statSync(out).mode & 0o777).toBe(0o600);
+  });
+
+  test("--include keeps the one file it names, with a warning that names its path only", async () => {
+    const stateDir = join(tmp, ".crewhaus");
+    const values = seedRunningState(stateDir);
+    const out = join(tmp, "b.tar.gz");
+    const result = await createStateBackup({
+      stateDir,
+      outFile: out,
+      crewhausVersion: "test",
+      includeGlobs: ["run/control-token"],
+    });
+    const entries = await tarEntries(out);
+    expect(entries).toContain("run/control-token");
+    expect(entries).not.toContain("run/gateway-jwt-secret");
+    expect(entries).not.toContain("run/mcp-token");
+    expect(result.defaultExcluded).toEqual(["run/gateway-jwt-secret", "run/mcp-token"]);
+    const extracted = await extractTo(out, join(tmp, "x"));
+    expect(readFileSync(join(extracted, "run", "control-token"), "utf-8")).toBe(
+      values["run/control-token"] as string,
+    );
+    const named = result.warnings.filter((w) => w.includes("run/control-token"));
+    expect(named).toHaveLength(1);
+    for (const value of Object.values(values)) {
+      expect(result.warnings.some((w) => w.includes(value))).toBe(false);
+    }
+  });
+
+  test("the list matches exact paths: a file of the same name elsewhere is archived", async () => {
+    // A boundary: it passes without the list too, and fails if the list
+    // matches by name rather than by path.
+    const stateDir = join(tmp, ".crewhaus");
+    seedRunningState(stateDir);
+    mkdirSync(join(stateDir, "memories"), { recursive: true });
+    writeFileSync(join(stateDir, "memories", "control-token"), "a note\n");
+    const out = join(tmp, "b.tar.gz");
+    const result = await createStateBackup({ stateDir, outFile: out, crewhausVersion: "test" });
+    expect(await tarEntries(out)).toContain("memories/control-token");
+    expect(result.defaultExcluded).not.toContain("memories/control-token");
+  });
+
+  test("--exclude wins over --include", async () => {
+    // A boundary: it passes without the list too, and fails if --include
+    // overrides an explicit --exclude.
+    const stateDir = join(tmp, ".crewhaus");
+    seedRunningState(stateDir);
+    const out = join(tmp, "b.tar.gz");
+    const result = await createStateBackup({
+      stateDir,
+      outFile: out,
+      crewhausVersion: "test",
+      includeGlobs: ["run/control-token"],
+      excludeGlobs: ["run/control-token"],
+    });
+    expect(await tarEntries(out)).not.toContain("run/control-token");
+    expect(result.excluded).toEqual(["run/control-token"]);
+    expect(result.warnings.some((w) => w.includes("run/control-token"))).toBe(false);
+  });
+
+  test("the CLI says what it left out, and --include keeps one with a warning", async () => {
+    const harness = join(tmp, "harness");
+    seedHarness(harness);
+    const values = seedRunningState(join(harness, ".crewhaus"));
+
+    const plainOut = join(tmp, "plain.tar.gz");
+    const plain = await runCli(["state", "backup", "-o", plainOut], harness);
+    expect(plain.exitCode).toBe(0);
+    expect(plain.stdout).toContain("left out 3 run token file(s)");
+    expect(await tarEntries(plainOut)).not.toContain("run/control-token");
+
+    const keptOut = join(tmp, "kept.tar.gz");
+    const kept = await runCli(
+      ["state", "backup", "-o", keptOut, "--include", "run/control-token"],
+      harness,
+    );
+    expect(kept.exitCode).toBe(0);
+    expect(kept.stderr).toContain("run/control-token");
+    expect(kept.stdout).toContain("left out 2 run token file(s)");
+    expect(await tarEntries(keptOut)).toContain("run/control-token");
+    for (const value of Object.values(values)) {
+      expect(`${kept.stdout}${kept.stderr}`.includes(value)).toBe(false);
+    }
+  }, 20_000);
+});
+
+describe("the state retire keeps in its archive holds no run token", () => {
+  test("removeRunTokens removes the three and nothing else", () => {
+    const stateDir = join(tmp, "crewhaus-state");
+    seedRunningState(stateDir);
+    mkdirSync(join(stateDir, "memories"), { recursive: true });
+    writeFileSync(join(stateDir, "memories", "control-token"), "a note\n");
+    expect(RUN_TOKEN_FILES).toEqual([...RUN_TOKENS]);
+    expect(removeRunTokens(stateDir)).toEqual([...RUN_TOKENS]);
+    for (const rel of RUN_TOKENS) expect(existsSync(join(stateDir, rel))).toBe(false);
+    expect(existsSync(join(stateDir, "run", ".gitignore"))).toBe(true);
+    expect(existsSync(join(stateDir, "memories", "control-token"))).toBe(true);
+    expect(existsSync(join(stateDir, "sessions", `${SESSION_ID}.jsonl`))).toBe(true);
+    // Nothing left to remove the second time.
+    expect(removeRunTokens(stateDir)).toEqual([]);
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "removeRunTokens never follows a linked run directory",
+    () => {
+      const outside = join(tmp, "outside");
+      seedRunningState(outside);
+      const stateDir = join(tmp, "crewhaus-state");
+      mkdirSync(stateDir, { recursive: true });
+      symlinkSync(join(outside, "run"), join(stateDir, "run"));
+      expect(removeRunTokens(stateDir)).toEqual([]);
+      for (const rel of RUN_TOKENS) expect(existsSync(join(outside, rel))).toBe(true);
+    },
+  );
+
+  test("crewhaus retire leaves the run tokens out of its tarball and its archived state", async () => {
+    const harness = join(tmp, "harness");
+    seedHarness(harness);
+    const values = seedRunningState(join(harness, ".crewhaus"));
+    const archive = join(tmp, "archive");
+    const res = await runCli(["retire", "demo", "--archive", archive], harness);
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toContain("left 3 run token file(s) out of the archived state");
+
+    const moved = join(archive, "crewhaus-state");
+    expect(existsSync(join(moved, "sessions", `${SESSION_ID}.jsonl`))).toBe(true);
+    for (const rel of RUN_TOKENS) expect(existsSync(join(moved, rel))).toBe(false);
+    const tarball = join(archive, "demo-state.tar.gz");
+    const entries = await tarEntries(tarball);
+    for (const rel of RUN_TOKENS) expect(entries).not.toContain(rel);
+    const bytes = archiveText(tarball);
+    for (const value of Object.values(values)) {
+      expect(bytes.includes(value)).toBe(false);
+      expect(res.stdout.includes(value)).toBe(false);
+    }
   }, 20_000);
 });
 

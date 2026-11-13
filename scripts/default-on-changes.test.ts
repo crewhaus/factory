@@ -40,7 +40,7 @@
  * in the `## [Unreleased]` list.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -50,6 +50,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -59,7 +60,12 @@ import { runApprovalsCommand } from "../apps/cli/src/approvals-cmd";
 import { assertOutDirNotLinked, writeBundleFile } from "../apps/cli/src/bundle-writer";
 import { directControl, runDaemonCommand } from "../apps/cli/src/daemon-cmd";
 import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
-import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
+import {
+  SERVE_TOKEN_FILE,
+  resolveServeBind,
+  screenedInvoke,
+  serveRequestRefusal,
+} from "../apps/cli/src/serve-mcp";
 import { discloseSurfaceChange } from "../apps/cli/src/surface-disclosure";
 import { cfWorkerUnwiredBlockWarnings, compile, lower } from "../packages/compiler/src/index";
 import { createContinuityStore } from "../packages/continuity-store/src/index";
@@ -94,6 +100,8 @@ import {
 } from "../packages/federation-protocol/src/index";
 import {
   CONTROL_ROUTES,
+  CONTROL_RUN_DIR,
+  CONTROL_TOKEN_FILENAME,
   type ControlAuditRecord,
   type ControlPlane,
   countPendingApprovals,
@@ -1300,7 +1308,7 @@ describe("the release notes name every change a harness without provability: see
     }
     // Named in a later list, since 0.8.0 did not ship it.
     const later = defaultOnBullets(changelog, LATER_HEADINGS);
-    const bullet = later.find((b) => b.includes("`.crewhaus/run/gateway-jwt-secret`")) ?? "";
+    const bullet = later.find((b) => b.includes("saves a signing secret it generates to")) ?? "";
     expect(bullet).not.toBe("");
     expect(daemonOf({ tools: ["read"] })).toContain(
       "checkTenantsRoot({ cwd: process.cwd(), tenantsRoot: TENANTS_ROOT })",
@@ -3807,6 +3815,129 @@ describe("the release notes name what the decision service changes for every har
     expect(floor.replace(/\s+/g, " ")).toContain(
       "for `crewhaus run` or `crewhaus runs resume` of a spec in another directory, that directory's `.crewhaus/run/spec`",
     );
+  });
+});
+
+describe("the release notes name what permission suggestions and state backups leave out", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("permissions suggest proposes no allow for a call that carried a credential", async () => {
+    const { aggregateAsks, rankSuggestions, skippedSuggestions } = await import(
+      "../packages/harness-advice/src/permissions-suggest"
+    );
+    const { parseJsonlObjects } = await import("../packages/harness-advice/src/advise-rules");
+    // Built at runtime from parts, so no credential-shaped literal is committed.
+    const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+    const line = (kind: string, payload: unknown) =>
+      JSON.stringify({ ts: 1, version: 1, kind, payload });
+    const ask = line("permission", { toolName: "Bash", decision: "ask", askOutcome: "approved" });
+    const text = [
+      line("tool_use", {
+        id: "toolu_1",
+        name: "Bash",
+        input: { command: `curl -H "Authorization: Bearer ${token}" https://x.test` },
+      }),
+      ask,
+      ask,
+      ask,
+    ].join("\n");
+    const aggregates = aggregateAsks([
+      { sessionId: "sess_00000000000000fc", objects: parseJsonlObjects(`${text}\n`) },
+    ]);
+    const suggestions = rankSuggestions(aggregates, new Map());
+    expect(suggestions.filter((g) => g.rule.type === "alwaysAllow")).toEqual([]);
+    expect(skippedSuggestions(aggregates).map((k) => [k.toolName, k.reason])).toEqual([
+      ["Bash", "carries-credential"],
+    ]);
+    expect(JSON.stringify(suggestions).includes(token)).toBe(false);
+
+    const bullet = bulletFor("proposes no rule whose value the credential").replace(/\s+/g, " ");
+    for (const word of [
+      "`crewhaus permissions suggest`",
+      "`PermissionsSuggest`",
+      "`alwaysAllow`",
+      "`--apply`",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  });
+
+  test("state backup leaves the run tokens out and writes 0600", async () => {
+    const { DEFAULT_BACKUP_EXCLUDES, createStateBackup } = await import(
+      "../apps/cli/src/state-backup"
+    );
+    // The writers' own paths, so a token that moves fails here until the list follows it.
+    const runRelative = CONTROL_RUN_DIR.replace(/^\.crewhaus\//, "");
+    expect(DEFAULT_BACKUP_EXCLUDES).toContain(`${runRelative}/${CONTROL_TOKEN_FILENAME}`);
+    expect(DEFAULT_BACKUP_EXCLUDES).toContain(SERVE_TOKEN_FILE.replace(/^\.crewhaus\//, ""));
+    expect(DEFAULT_BACKUP_EXCLUDES).toContain("run/gateway-jwt-secret");
+
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-backup-")));
+    try {
+      const stateDir = join(dir, ".crewhaus");
+      mkdirSync(join(stateDir, "run"), { recursive: true });
+      mkdirSync(join(stateDir, "sessions"), { recursive: true });
+      for (const rel of DEFAULT_BACKUP_EXCLUDES) {
+        mkdirSync(dirname(join(stateDir, rel)), { recursive: true });
+        writeFileSync(join(stateDir, rel), randomBytes(24).toString("hex"), { mode: 0o600 });
+      }
+      writeFileSync(join(stateDir, "sessions", "sess_00000000000000fe.jsonl"), '{"ts":1}\n');
+      const out = join(dir, "b.tar.gz");
+      const result = await createStateBackup({ stateDir, outFile: out, crewhausVersion: "test" });
+      const archived = result.manifest.totals.files;
+      expect(archived).toBe(1);
+      expect([...result.defaultExcluded].sort()).toEqual([...DEFAULT_BACKUP_EXCLUDES].sort());
+      if (process.platform !== "win32") expect(statSync(out).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    const bullet = bulletFor("leave a harness's run tokens out").replace(/\s+/g, " ");
+    for (const rel of DEFAULT_BACKUP_EXCLUDES) expect(bullet).toContain(`\`.crewhaus/${rel}\``);
+    expect(bullet).toContain("`crewhaus state backup --include <glob>`");
+    expect(bullet).toContain("`0600`");
+    expect(bullet).toContain("`--archive`");
+  });
+
+  test("only the backup verb passes includeGlobs; retire never keeps a run token", () => {
+    const cli = readFileSync(join(ROOT, "apps", "cli", "src", "index.ts"), "utf8");
+    const calls = cli.split("createStateBackup({").slice(1);
+    expect(calls).toHaveLength(2);
+    const bodies = calls.map((c) => c.slice(0, c.indexOf("})")));
+    expect(bodies.filter((b) => b.includes("includeGlobs"))).toHaveLength(1);
+    expect(bodies[0]).toContain("includeGlobs");
+    expect(bodies[1]).not.toContain("includeGlobs");
+  });
+
+  test("retire removes the run tokens from the state it keeps in its archive", async () => {
+    const { RUN_TOKEN_FILES, DEFAULT_BACKUP_EXCLUDES, removeRunTokens } = await import(
+      "../apps/cli/src/state-backup"
+    );
+    for (const rel of RUN_TOKEN_FILES) expect(DEFAULT_BACKUP_EXCLUDES).toContain(rel);
+    // retire moves the live state to `<archive>/crewhaus-state`, and the CLI
+    // strips the run tokens from exactly that directory.
+    const retire = readFileSync(
+      join(ROOT, "packages", "harness-lifecycle", "src", "retire.ts"),
+      "utf8",
+    );
+    expect(retire.split('join(plan.archiveDir, "crewhaus-state")')).toHaveLength(2);
+    const cli = readFileSync(join(ROOT, "apps", "cli", "src", "index.ts"), "utf8");
+    expect(
+      cli.split('removeRunTokens(join(plan.archiveDir, "crewhaus-state"))').slice(1),
+    ).toHaveLength(1);
+
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-retire-")));
+    try {
+      mkdirSync(join(dir, "run"), { recursive: true });
+      for (const rel of RUN_TOKEN_FILES) {
+        writeFileSync(join(dir, rel), randomBytes(24).toString("hex"), { mode: 0o600 });
+      }
+      expect(removeRunTokens(dir)).toEqual([...RUN_TOKEN_FILES].sort());
+      for (const rel of RUN_TOKEN_FILES) expect(existsSync(join(dir, rel))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
