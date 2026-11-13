@@ -81,7 +81,7 @@ import { SAFE_SEGMENT_RE } from "./constants";
 import { mergedSpawnEnv } from "./env-file";
 import { HttpError } from "./http";
 import type { M3Context, M3Handler, M3Harness } from "./m3";
-import { requireString } from "./m3";
+import { requirePermission, requireString } from "./m3";
 import { maskText } from "./mask";
 import { resolveInside } from "./safety";
 import { type YamlNode, asRecord, asString, at, readYamlLoose } from "./yaml-scan";
@@ -734,6 +734,8 @@ export const credentialsSetAcross: M3Handler = (ctx) => {
   const rawIds = ctx.body["harnessIds"];
   if (!Array.isArray(rawIds)) throw new HttpError(400, 'missing "harnessIds" array');
   const ids = rawIds.map((id) => String(id));
+  // Every target, before any write: one the caller may not write refuses the whole call.
+  for (const id of ids) requirePermission(ctx, "h.secrets.write", { target: { harness: id } });
   if (ids.length > 0 && ctx.body["confirmName"] !== key) {
     throw new HttpError(
       409,
@@ -831,7 +833,11 @@ export const doctorRun: M3Handler = (ctx) => {
   // reaches argv.
   const argv = ["doctor"];
   if (ctx.body["probe"] === true) argv.push("--probe");
-  if (ctx.body["fix"] === true) argv.push("--fix");
+  if (ctx.body["fix"] === true) {
+    // `--fix` writes this harness's env file: the permission that writes credentials.
+    requirePermission(ctx, "h.secrets.write");
+    argv.push("--fix");
+  }
   const job = ctx.submitJob("doctor", argv);
   return {
     job: { jobId: job.jobId, kind: job.kind, state: job.state, argv: job.argv },

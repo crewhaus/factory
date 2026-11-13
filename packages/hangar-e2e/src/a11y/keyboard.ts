@@ -241,6 +241,23 @@ async function countTabStops(page: Page): Promise<number> {
   }, TAB_STOP_SELECTOR);
 }
 
+/**
+ * Put the next Tab at the top of the page. Blurring is not enough: a browser
+ * keeps its place in the Tab order where focus last was (a page that moved
+ * focus to its heading would start the walk there), so focus goes to a
+ * marker at the very start of the body, which is then removed.
+ */
+async function startAtTop(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    const marker = document.createElement("span");
+    marker.tabIndex = -1;
+    document.body.prepend(marker);
+    marker.focus();
+    marker.remove();
+  });
+}
+
 /** Who holds focus, as `<tag> #index`, or null for nothing on the page. */
 async function activeId(page: Page, press: number): Promise<string | null> {
   return await page.evaluate((count) => {
@@ -260,9 +277,7 @@ async function activeId(page: Page, press: number): Promise<string | null> {
 export async function keyboardTrapFinding(page: Page): Promise<A11yFinding | undefined> {
   const stops = await countTabStops(page);
   if (stops === 0) return undefined;
-  await page.evaluate(() => {
-    (document.activeElement as HTMLElement | null)?.blur?.();
-  });
+  await startAtTop(page);
 
   const visited: (string | null)[] = [];
   const seen = new Set<string>();
@@ -294,9 +309,7 @@ export type FocusTour = {
 export async function focusTour(page: Page): Promise<FocusTour> {
   const stops = await countTabStops(page);
   if (stops === 0) return { findings: [], stops: 0, reached: 0 };
-  await page.evaluate(() => {
-    (document.activeElement as HTMLElement | null)?.blur?.();
-  });
+  await startAtTop(page);
   const findings: A11yFinding[] = [];
   const visited: (string | null)[] = [];
   const seen = new Set<string>();

@@ -20,7 +20,17 @@
  */
 
 import { api } from "../api.js";
-import { clear, collapsible, dot, el, emptyState, mdBlocks, skeleton, toast } from "../dom.js";
+import {
+  clear,
+  collapsible,
+  dot,
+  el,
+  emptyState,
+  mdBlocks,
+  scrollRegion,
+  skeleton,
+  toast,
+} from "../dom.js";
 import { fmtCount, fmtPct, fmtRelativeTime } from "../util.js";
 import { openConflict } from "./spec-edit.js";
 
@@ -112,7 +122,7 @@ function panel(title, res, draw) {
 }
 
 function table(headers, rows) {
-  return el("div", { class: "table-scroll" }, [
+  return scrollRegion(`Table of ${headers.join(", ")}`, [
     el("table", { class: "fleet" }, [
       el(
         "thead",

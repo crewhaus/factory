@@ -64,35 +64,44 @@ const SUPPRESSED_REASONS = {
   "sink-unavailable": "no sink this manager can deliver on was selected",
 };
 
-export async function renderSettings(root) {
-  clear(root).appendChild(skeleton(6));
-  const [notifRes, readOnlyRes, pluginsRes, groupsRes] = await Promise.allSettled([
-    // The shared poll's state — never a second evaluating GET from here.
-    notifications.current(),
-    api.readOnly(),
-    api.plugins(),
-    api.groups(),
-  ]);
-  clear(root);
-  root.appendChild(
-    el("div", { class: "rollup" }, [
-      el("h2", { text: "Settings" }),
-      el("span", { class: "muted", text: "manager preferences — never harness state" }),
-    ]),
-  );
+/**
+ * Readability (`#/settings/readability`). The first-run card's Adjust lands
+ * here, with focus on the current choice.
+ */
+export async function renderReadabilitySettings(root) {
   const readability = readabilityCard();
-  root.appendChild(readability);
-  root.appendChild(signOutCard());
-  root.appendChild(readOnlyCard(settled(readOnlyRes)));
-  root.appendChild(
-    notificationCard(settled(notifRes), settled(groupsRes), () => renderSettings(root)),
-  );
-  root.appendChild(pluginCard(settled(pluginsRes)));
-  // The first-run card's Adjust lands here, with focus in Readability.
+  clear(root).appendChild(readability);
   if (takeFocusRequest("readability")) {
     const first = readability.querySelector("input:checked") ?? readability.querySelector("input");
     if (first instanceof HTMLElement) first.focus();
   }
+}
+
+/** Notifications (`#/settings/notifications`): the rules, from the shared poll. */
+export async function renderNotificationSettings(root) {
+  clear(root).appendChild(skeleton(6));
+  const [notifRes, groupsRes] = await Promise.allSettled([
+    // The shared poll's state — never a second evaluating GET from here.
+    notifications.current(),
+    api.groups(),
+  ]);
+  clear(root).appendChild(
+    notificationCard(settled(notifRes), settled(groupsRes), () => renderNotificationSettings(root)),
+  );
+}
+
+/** Home settings (`#/settings/home`): read-only mode and the installed plugins. */
+export async function renderHomeSettings(root) {
+  clear(root).appendChild(skeleton(6));
+  const [readOnlyRes, pluginsRes] = await Promise.allSettled([api.readOnly(), api.plugins()]);
+  clear(root);
+  root.appendChild(readOnlyCard(settled(readOnlyRes)));
+  root.appendChild(pluginCard(settled(pluginsRes)));
+}
+
+/** Your account (`#/settings/account`): signing this browser out. */
+export function renderAccountSettings(root) {
+  clear(root).appendChild(signOutCard());
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +291,7 @@ function readOnlyCard(state) {
     el("p", { class: "muted note" }, [
       el("span", { text: "Exempt while engaged: " }),
       el("code", {
-        class: "mono",
+        class: "mono exempt-list",
         text: (Array.isArray(state?.exempt) ? state.exempt : []).join(", ") || "—",
       }),
     ]),

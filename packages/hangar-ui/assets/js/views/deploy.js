@@ -8,7 +8,17 @@
  */
 
 import { api } from "../api.js";
-import { clear, copyBtn, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
+import {
+  clear,
+  copyBtn,
+  dot,
+  el,
+  emptyState,
+  jsonPre,
+  scrollRegion,
+  skeleton,
+  toast,
+} from "../dom.js";
 import { deploymentRow } from "../supervision.js";
 
 /** The command that activates `dep` in harness `id`: the button's CLI twin. */
@@ -115,26 +125,22 @@ export async function renderDeploy(root, ctx) {
       );
     }
     root.appendChild(
-      el(
-        "div",
-        { class: "table-scroll", tabindex: "0", role: "region", "aria-label": "Deployments" },
-        [
-          el("table", { class: "fleet" }, [
+      scrollRegion("Deployments", [
+        el("table", { class: "fleet" }, [
+          el(
+            "thead",
+            null,
             el(
-              "thead",
+              "tr",
               null,
-              el(
-                "tr",
-                null,
-                ["Deployment", "State", "Environment", "When", "Build", "Action"].map((h) =>
-                  el("th", { text: h }),
-                ),
+              ["Deployment", "State", "Environment", "When", "Build", "Action"].map((h) =>
+                el("th", { text: h }),
               ),
             ),
-            tbody,
-          ]),
-        ],
-      ),
+          ),
+          tbody,
+        ]),
+      ]),
     );
   }
 
@@ -159,31 +165,22 @@ export async function renderDeploy(root, ctx) {
     root.appendChild(
       el("div", { class: "card" }, [
         el("p", { class: "muted", text: typeof view.note === "string" ? view.note : "" }),
-        el(
-          "div",
-          {
-            class: "table-scroll",
-            tabindex: "0",
-            role: "region",
-            "aria-label": "Unverified deployments",
-          },
-          [
-            el("table", { class: "fleet" }, [
+        scrollRegion("Unverified deployments", [
+          el("table", { class: "fleet" }, [
+            el(
+              "thead",
+              null,
               el(
-                "thead",
+                "tr",
                 null,
-                el(
-                  "tr",
-                  null,
-                  ["Env", "Class", "Provider", "Version", "When", "Health"].map((h) =>
-                    el("th", { text: h }),
-                  ),
+                ["Env", "Class", "Provider", "Version", "When", "Health"].map((h) =>
+                  el("th", { text: h }),
                 ),
               ),
-              tbody,
-            ]),
-          ],
-        ),
+            ),
+            tbody,
+          ]),
+        ]),
       ]),
     );
   }

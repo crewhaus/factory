@@ -21,7 +21,15 @@ import { mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "n
 import { join } from "node:path";
 import { createPendingApprovalStore } from "@crewhaus/session-store";
 import { makeFixtureHarness } from "./fixture";
-import { exclusionFor, maskRawText, settingsDiff, validateSettings } from "./inspect";
+import {
+  INSPECT_EXCLUSIONS,
+  exclusionFor,
+  maskRawText,
+  moduleExclusions,
+  resolvedExclusion,
+  settingsDiff,
+  validateSettings,
+} from "./inspect";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-04T00:00:00.000Z");
@@ -226,7 +234,7 @@ describe("inspect — the store index", () => {
 
       // The exclusions are DATA, so the console can say why they are absent.
       const excluded = body["excluded"] as Array<Record<string, unknown>>;
-      expect(excluded).toHaveLength(6);
+      expect(excluded).toHaveLength(12);
       expect(excluded.map((e) => e["path"])).toContain(".crewhaus/secrets/");
       expect(excluded.map((e) => e["path"])).toContain(".crewhaus/run/logs/");
       expect(excluded.map((e) => e["path"])).toContain(".crewhaus/run/gateway-jwt-secret");
@@ -816,5 +824,144 @@ describe("inspect — the settings.json write", () => {
     } finally {
       await t.stop();
     }
+  });
+});
+
+describe("Home's run credentials and decision records are never served", () => {
+  const RUN_FILES: ReadonlyArray<readonly [string, string]> = [
+    [".crewhaus/run/control-token", "control token"],
+    [".crewhaus/run/mcp-token", "MCP door"],
+    [".crewhaus/run/control/keys/digest.key", "digests are made with"],
+    [".crewhaus/run/control/inputs/dec_1.json", "inputs decisions were asked about"],
+    [".crewhaus/run/control/approvers.json", "who may approve"],
+    [".crewhaus/run/control/link-requests.jsonl", "link an outside identity"],
+    [".crewhaus/run/gateway-jwt-secret", "generated signing secret"],
+  ];
+
+  test("each one is refused at the raw browser, in any case, and left out of its listing", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const value = ["planted", "run", "value"].join("-");
+      for (const [path] of RUN_FILES) {
+        mkdirSync(join(dir, ...path.split("/").slice(0, -1)), { recursive: true });
+        writeFileSync(join(dir, ...path.split("/")), `${value}\n`);
+      }
+      // A record that holds none of these stays browsable.
+      writeFileSync(join(dir, ".crewhaus", "run", "control", "commands.jsonl"), "{}\n");
+      const id = await register(t, dir);
+      for (const [path, reason] of RUN_FILES) {
+        for (const spelled of [path, path.toUpperCase()]) {
+          const { status, body } = await t.api(
+            `/api/h/${id}/inspect/raw?path=${encodeURIComponent(spelled)}`,
+          );
+          expect(`${spelled}:${status}`).toBe(`${spelled}:403`);
+          expect(String(body["error"])).toContain(reason);
+          expect(JSON.stringify(body)).not.toContain(value);
+        }
+      }
+      const run = await t.api(`/api/h/${id}/inspect/raw?path=.crewhaus%2Frun`);
+      const names = (run.body["entries"] as Array<{ name: string }>).map((e) => e.name);
+      for (const hidden of ["control-token", "mcp-token", "gateway-jwt-secret", "logs"]) {
+        expect(names).not.toContain(hidden);
+        expect(run.body["excludedHere"]).toContain(hidden);
+      }
+      const control = await t.api(`/api/h/${id}/inspect/raw?path=.crewhaus%2Frun%2Fcontrol`);
+      expect(control.status).toBe(200);
+      const inControl = (control.body["entries"] as Array<{ name: string }>).map((e) => e.name);
+      expect(inControl).toEqual(["commands.jsonl"]);
+      expect([...(control.body["excludedHere"] as string[])].sort()).toEqual(
+        ["approvers.json", "inputs", "keys", "link-requests.jsonl"].sort(),
+      );
+      const ledger = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent(".crewhaus/run/control/commands.jsonl")}`,
+      );
+      expect(ledger.status).toBe(200);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a link inside the harness to an excluded file is that file: refused and unlisted", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const value = ["linked", "secret", "value"].join("-");
+      writeFileSync(join(dir, ".env"), `TOKEN=${value}\n`);
+      mkdirSync(join(dir, ".crewhaus", "run"), { recursive: true });
+      writeFileSync(join(dir, ".crewhaus", "run", "control-token"), `${value}\n`);
+      let linked = true;
+      try {
+        symlinkSync(join(dir, ".env"), join(dir, ".crewhaus", "alias"));
+        symlinkSync(
+          join(dir, ".crewhaus", "run", "control-token"),
+          join(dir, ".crewhaus", "skills", "alias-token"),
+        );
+        symlinkSync(join(dir, ".crewhaus", "run"), join(dir, ".crewhaus", "alias-run"));
+      } catch (err) {
+        // Windows without the symlink privilege: nothing to test here.
+        if ((err as { code?: string }).code !== "EPERM") throw err;
+        linked = false;
+      }
+      if (!linked) return;
+      const id = await register(t, dir);
+      for (const path of [
+        ".crewhaus/alias",
+        ".crewhaus/skills/alias-token",
+        ".crewhaus/alias-run/control-token",
+      ]) {
+        const { status, body } = await t.api(
+          `/api/h/${id}/inspect/raw?path=${encodeURIComponent(path)}`,
+        );
+        expect(`${path}:${status}`).toBe(`${path}:403`);
+        expect(JSON.stringify(body)).not.toContain(value);
+      }
+      const entry = await t.api(`/api/h/${id}/inspect/skills/alias-token`);
+      expect(entry.status).toBe(403);
+      expect(JSON.stringify(entry.body)).not.toContain(value);
+      const listing = await t.api(`/api/h/${id}/inspect/raw?path=.crewhaus`);
+      const names = (listing.body["entries"] as Array<{ name: string }>).map((e) => e.name);
+      expect(names).not.toContain("alias");
+      expect(listing.body["excludedHere"]).toEqual(expect.arrayContaining(["alias"]));
+      // A linked directory lists, and what it holds is checked where it really is.
+      const viaLink = await t.api(`/api/h/${id}/inspect/raw?path=.crewhaus%2Falias-run`);
+      expect(viaLink.status).toBe(200);
+      const linkedNames = (viaLink.body["entries"] as Array<{ name: string }>).map((e) => e.name);
+      expect(linkedNames).not.toContain("control-token");
+      expect(viaLink.body["excludedHere"]).toContain("control-token");
+      const skills = await t.api(`/api/h/${id}/inspect/skills`);
+      const skillNames = (skills.body["entries"] as Array<{ name: string }>).map((e) => e.name);
+      expect(skillNames).not.toContain("alias-token");
+      expect(resolvedExclusion(dir, join(dir, ".crewhaus", "alias"))?.path).toBe(".env, .env.*");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a path an area module declares is refused like the fixed ones", () => {
+    const planted = moduleExclusions([
+      { area: "planted", rawExclusions: [".crewhaus/work/items/"] },
+    ]);
+    expect(planted).toHaveLength(1);
+    expect(exclusionFor([".crewhaus", "work", "items", "w1.json"], planted)?.path).toBe(
+      ".crewhaus/work/items/",
+    );
+    expect(exclusionFor([".CREWHAUS", "Work", "ITEMS"], planted)?.path).toBe(
+      ".crewhaus/work/items/",
+    );
+    expect(exclusionFor([".crewhaus", "work", "checks"], planted)).toBeNull();
+    expect(exclusionFor([".crewhaus", "work", "items", "w1.json"])).toBeNull();
+  });
+
+  test("each fixed exclusion is found by its own path, so no row can borrow another's reason", () => {
+    const paths = INSPECT_EXCLUSIONS.map((row) => row.path);
+    expect(new Set(paths).size).toBe(paths.length);
+    for (const row of INSPECT_EXCLUSIONS) {
+      if (row.path === ".env, .env.*") continue;
+      const segments = row.path.split("/").filter((seg) => seg !== "");
+      expect(`${row.path} -> ${exclusionFor(segments)?.path}`).toBe(`${row.path} -> ${row.path}`);
+    }
+    expect(exclusionFor([".env.local"])?.path).toBe(".env, .env.*");
+    expect(exclusionFor(["deep", "secrets", "x"])?.path).toBe(".crewhaus/secrets/");
   });
 });

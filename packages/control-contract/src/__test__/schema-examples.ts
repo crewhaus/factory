@@ -204,6 +204,7 @@ export const EXAMPLES: Readonly<Record<string, unknown>> = {
   },
   seal: SEAL,
   sessionIssued: { issued: ISSUED },
+  inviteAccepted: { tabOnly: true, expiresAt: AT },
   signedOut: { signedOut: true },
   standingRule: RULE,
   streamQuery: {},

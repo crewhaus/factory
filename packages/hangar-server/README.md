@@ -47,12 +47,36 @@ by the other, and neither needs the other running.
   `<hangarRoot>/token` (0600; hangar root defaults to `~/.crewhaus/hangar`),
   is the owner only on `<hangarRoot>/home.sock` (0600) or from a direct
   loopback peer that sent no forwarding header, and no route ever sends it.
-  `POST /api/boot-ticket` takes only Home's own key. Until route
-  authorization lands, every principal but the home owner is refused with
-  `authorization_unavailable`. `/healthz`, the static UI shell, `/boot/`,
-  `/pane/` and the sign-in routes are the only unauthenticated surfaces. No
-  cookies anywhere, so there is no CSRF surface. `noAuth` disables the
-  check with a logged warning (trusted localhost dev only).
+  `POST /api/boot-ticket` takes only Home's own key. `/healthz`, the static
+  UI shell, `/invite`, `/boot/`, `/pane/` and the sign-in routes are the
+  only unauthenticated surfaces. No cookies anywhere, so there is no CSRF
+  surface. `noAuth` disables the check with a logged warning (trusted
+  localhost dev only).
+- **Authorization at one choke point** — every `/api` request matches
+  exactly one row of the route table (`route-table.ts`, through the one
+  matcher in `route-match.ts`); a method and path no row declares answers
+  404 for everyone, the owner included, and no handler runs. The row's
+  permission is then decided for the caller (`access.ts`) on the harness its
+  `:id` names, or on the whole Home: a member by role, a service token by
+  its own permission set, a scoped token only on the run it names, a
+  tab-only session never on access or Home's settings (in a handler's own
+  checks too), Home's own key and `noAuth` as the owner. A domain's checker, registered in Home's domain
+  table, gets the row's object ref. A refusal is 403 `forbidden` naming what
+  is missing and the caller's role. Handlers whose permission depends on
+  what is asked check the rest with `ctx.authorize` (a spec change that
+  touches a security surface or raises spending, decided by what the batch
+  changes, settings `permissions`, `hooks` and `manager.envFiles`, the raw
+  transcript, Home's notification settings, moving a harness, a job's kind,
+  a credential set across harnesses, a group walk, an advisor action).
+  Clearing the notification badge drops only the entries about harnesses
+  the caller may read. Fleet folds count
+  and quote only the harnesses the caller may read, a quoted input needs
+  content access, and an item marked `people` is released only by a people
+  domain. Every receipt and record names the signed-in principal.
+- **Joining from an invite** — `/invite#c=<code>` opens the console, which
+  asks for a name and joins through `POST /api/v1/auth/accept-invite`: a
+  device key and a sealed session, or, on a page served over plain HTTP
+  through `--lan`, a tab-only session that counts only on that address.
 - **Trusted proxy** — the owner's `access.trustedProxy` in
   `<hangarRoot>/settings.json` (`crewhaus access proxy`) lets a reverse
   proxy name the person signing in with a header, which counts only from a
@@ -68,13 +92,18 @@ by the other, and neither needs the other running.
   address served with the plugin's own policy and `sandbox allow-scripts`.
 - **Live streams end with the session** — a run stream opened with a
   session closes with `event: auth.expired` or `event: auth.revoked`
-  before `done` when that session expires or signs out.
+  before `done` when that session expires or signs out, and any run stream
+  closes with `event: revoked` once its caller has lost access to it,
+  checked whenever the access records move and on every 30-second check, so
+  a token or grant whose time is up closes it too.
 - **Path safety** — `:id` params are validated against their format
   regexes (`hrn_…`, `sess_…`, `run_…`, safe-segment) before any
   filesystem work, and every harness-relative read must realpath-contain
   inside that harness's registered dir (the registry is the allowlist;
-  symlink escapes are refused). Arbitrary absolute dirs enter only via
-  `POST /api/harnesses` bodies.
+  symlink escapes are refused) and never resolve into Home's own
+  directory. Arbitrary absolute dirs enter only via `POST /api/harnesses`
+  bodies; a harness never moves onto, into or around Home's own directory
+  or around another registered harness.
 - **Reads never mutate** — session browsing is raw directory scans plus
   tolerant JSONL parsing, never `SessionStore.list()` (whose TTL eviction
   deletes expired transcripts as a side-effect). The approvals inbox folds
@@ -380,11 +409,14 @@ mtime token. Sessions are listed by NAME from a directory scan — never
 query returns are PROPOSALS carrying a route key and a CLI twin; the search
 route executes nothing.
 
-**Read-only mode is enforced here, not in the UI.** Every non-GET `/api`
-request is refused unless it is on the short exact-match exempt list
-(`READ_ONLY_EXEMPT`), so a route added next month is covered by construction.
-It prevents accidents during a demo — signing in, not this toggle, is
-the security boundary — and `readOnlyLocked` refuses even the un-toggle for
+**Read-only mode is enforced here, not in the UI.** A route whose row in the
+route table writes a receipt (one that changes something) is refused; a route
+that only reads is answered, whatever its method; the toggle itself is the
+one exemption (`READ_ONLY_EXEMPT`). A route added next month is covered by
+construction. It runs after authorization, prevents accidents during a demo —
+route authorization, not this toggle, decides who may do what, and lifting
+the mode needs the permission to manage Home's settings — and
+`readOnlyLocked` refuses even the un-toggle for
 the case where the person driving is not the person who owns the machine. A
 `--read-only` BOOT flag is a posture for one process and is deliberately not
 persisted; an explicit toggle through the API is a preference and is.

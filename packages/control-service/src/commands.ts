@@ -7,6 +7,10 @@
  *
  * A receipt holds ids, refs, keyed digests and states: never an argument, an input or a
  * secret. Every row is the whole receipt, so the fold's current row is the receipt.
+ *
+ * A dispatched command runs only while its actor may still do it: before `accepted →
+ * running`, a member's authority is checked again, so a command accepted from someone whose
+ * access was withdrawn in between settles `rejected` and never runs.
  */
 import { mkdirSync } from "node:fs";
 import {
@@ -16,6 +20,7 @@ import {
   type ReceiptRetry,
   type ReceiptVia,
   isCommandKind,
+  isId,
   mintId,
   parseRef,
 } from "@crewhaus/control-contract";
@@ -37,6 +42,11 @@ import { type ControlRefusal, outcomeOf, refuse } from "./refusal";
 export type SubmitRequest = {
   /** A command kind, or `legacy.<route key>`. */
   readonly kind: string;
+  /**
+   * Who asked, as a principal `prn_…`: the signed-in caller. Absent, the head's own OS user
+   * stands in (the CLI in direct mode, or a Home with sign-in turned off).
+   */
+  readonly actor?: string;
   /** The most specific ref the request names. Absent: the receipt itself, `home/cmd/<id>`. */
   readonly target?: string;
   readonly ledger: LedgerChoice;
@@ -174,6 +184,14 @@ export function createCommands(core: ControlCore): CommandsInternals {
   ): Promise<CommandReceipt> => {
     let running = receipt;
     if (receipt.state === "accepted") {
+      if (core.actorRefused(receipt)) {
+        const rejected = settledRow(
+          receipt,
+          { state: "rejected", outcome: outcomeOf("forbidden") },
+          iso(core.now()),
+        );
+        return (await move(ledger, "accepted", rejected)) ?? receipt;
+      }
       const next: CommandReceipt = {
         ...receipt,
         state: "running",
@@ -239,6 +257,9 @@ export function createCommands(core: ControlCore): CommandsInternals {
     if (request.target !== undefined && "error" in parseRef(request.target)) {
       return { ok: false, refusal: refuse("invalid", "the command's target is not a ref") };
     }
+    if (request.actor !== undefined && !isId("prn", request.actor)) {
+      return { ok: false, refusal: refuse("invalid", "the command's actor is not a principal") };
+    }
     const ledger = ledgerOf(request.ledger);
     if (request.ledger === "workspace") {
       try {
@@ -254,7 +275,7 @@ export function createCommands(core: ControlCore): CommandsInternals {
         refusal: refuse("unavailable", "the ledger's digest key cannot be read; nothing was done"),
       };
     }
-    const actor = await storedActorFor(core.hangarRoot, core.identity, key.hmac);
+    const actor = request.actor ?? (await storedActorFor(core.hangarRoot, core.identity, key.hmac));
     let fingerprint: string;
     try {
       fingerprint = await fingerprintOf(key.hmac, {

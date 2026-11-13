@@ -65,7 +65,7 @@ import { containProbe, harnessDirOf, m3Base, readHarnessSpec } from "./creds-ops
 import { HttpError } from "./http";
 import { readJsonlCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
-import { isDryRun, jobArg, requireString, requireTypedConfirm } from "./m3";
+import { isDryRun, jobArg, requirePermission, requireString, requireTypedConfirm } from "./m3";
 import { maskDeep, maskText } from "./mask";
 import { asNumber, asRecord, asString, at } from "./yaml-scan";
 
@@ -401,7 +401,7 @@ export const egressReview: M3Handler = (ctx) => {
     decisionId,
     verdict,
     note,
-    by: ctx.operator,
+    by: ctx.principal,
     at: new Date(ctx.now()).toISOString(),
   };
   appendJsonl(path, record);
@@ -592,6 +592,8 @@ export const justificationCalibrate: M3Handler = (ctx) => {
       note: "this is the BEFORE side; submit with apply:true to run the calibration over session history",
     };
   }
+  // Calibrating the judge of what the agent may do is the security edit permission's.
+  requirePermission(ctx, "h.spec.edit.security");
   const job = ctx.submitJob("justification calibrate", ["justification", "calibrate"]);
   return {
     // `submitted`, not `applied`: calibration REPORTS a threshold, it never

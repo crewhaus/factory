@@ -75,7 +75,7 @@ import { type HealthPreflightItem, cadenceToMs, declaredBudgetUsd, dreamOverdue 
 import { HttpError } from "./http";
 import { readJsonlCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
-import { requireString } from "./m3";
+import { requirePermission, requireString } from "./m3";
 import {
   type ArmRow,
   buildLeaderboard,
@@ -111,6 +111,31 @@ export type AdvisorAction = {
   readonly jobKind: string | null;
 };
 
+/**
+ * Every console screen an advisor item can name as the owner of its fix: a
+ * harness screen by the id the console's link builder takes, or the fleet
+ * approvals inbox. `screen-routes.test.ts` sends each through the console's
+ * own builders and fails if one lands nowhere.
+ */
+export const ADVISOR_SCREENS = [
+  "overview",
+  "approvals",
+  "spec",
+  "runs",
+  "schedulers",
+  "evals",
+  "memory",
+  "feedback",
+  "costs",
+  "models",
+  "creds",
+  "channels",
+  "security",
+  "deploy",
+  "dev",
+] as const;
+export type AdvisorScreen = (typeof ADVISOR_SCREENS)[number];
+
 export type AdvisorItem = {
   /** Stable, {@link SAFE_SEGMENT_RE}-safe — it names a route segment and a
    *  ledger key, and it must survive re-derivation to keep a dismissal
@@ -125,9 +150,9 @@ export type AdvisorItem = {
   readonly explain: string;
   /** What to do about it — always present, even when no button is. */
   readonly guidance: string;
-  /** The console screen that owns the fix: a harness tab name, or one of the
-   *  fleet screens ("approvals"). The view renders it as a deep link. */
-  readonly screen: string;
+  /** The console screen that owns the fix: a harness screen, or the fleet
+   *  approvals inbox. The view renders it as a deep link. */
+  readonly screen: AdvisorScreen;
   /** The panel family the signal came from (preflight, spec, evals, …). */
   readonly source: string;
   readonly action: AdvisorAction | null;
@@ -165,6 +190,20 @@ export const ADVISOR_JOB_ARGV: Readonly<Record<string, readonly string[]>> = {
   "models-explain": ["models", "explain", "crewhaus.yaml"],
 };
 
+/** The permission each advisor job kind needs: the one its own route needs. */
+export const ADVISOR_JOB_PERMISSIONS: Readonly<Record<string, string>> = {
+  doctor: "h.eval.run",
+  compile: "h.deploy",
+  eval: "h.eval.run",
+  "dream-run": "h.memory.write",
+  optimize: "h.quality.edit",
+  advise: "h.eval.run",
+  "route-status": "h.read",
+  "route-propose": "h.quality.edit",
+  "models-audit": "h.read",
+  "models-explain": "h.read",
+};
+
 /** The command each advisor job kind runs, shown beside its action. */
 export const ADVISOR_CLI_TWINS: Readonly<Record<string, string>> = {
   doctor: "crewhaus doctor",
@@ -195,7 +234,7 @@ const linkAction = (label: string, cliTwin: string | null = null): AdvisorAction
 
 /** Preflight area → the tab that fixes it (the health module's own table,
  *  restated here so the advisor and the score can be tested independently). */
-const AREA_SCREEN: Readonly<Record<string, string>> = {
+const AREA_SCREEN: Readonly<Record<string, AdvisorScreen>> = {
   spec: "spec",
   credentials: "creds",
   channels: "channels",
@@ -1053,6 +1092,8 @@ export const advisorAct: M3Handler = async (ctx) => {
   if (item.action?.kind === "job" && item.action.jobKind !== null) {
     const argv = ADVISOR_JOB_ARGV[item.action.jobKind];
     if (argv === undefined) throw new HttpError(500, "advisor action names an unknown job kind");
+    // Acting queues the item's job: the caller needs that job's own permission too.
+    requirePermission(ctx, ADVISOR_JOB_PERMISSIONS[item.action.jobKind] ?? "h.job.run");
     const record = ctx.submitJob(item.action.jobKind, argv);
     job = record;
     jobId = (record as { jobId?: string }).jobId;
@@ -1062,7 +1103,7 @@ export const advisorAct: M3Handler = async (ctx) => {
     itemId,
     action: "acted",
     at: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
     ...(comment !== null && comment !== "" ? { comment } : {}),
     ...(jobId !== undefined ? { jobId } : {}),
   };
@@ -1094,7 +1135,7 @@ export const advisorDismiss: M3Handler = (ctx) => {
     itemId,
     action: "dismissed",
     at: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
     reason,
   };
   appendAdvisorLine(ctx, "decisions.jsonl", decision);
@@ -1116,7 +1157,7 @@ export const advisorReopen: M3Handler = (ctx) => {
     itemId,
     action: "reopened",
     at: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
   };
   appendAdvisorLine(ctx, "decisions.jsonl", decision);
   return { ...found("reopened — the item returns to the open feed", null), itemId, reopened: true };
@@ -1402,7 +1443,7 @@ export const advisorReportRun: M3Handler = (ctx) => {
     reportId,
     kind,
     generatedAt: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
     body,
   };
   const reportsDir = ctx.contain([...ADVISOR_SEGMENTS, "reports"]);
@@ -1578,7 +1619,7 @@ export const advisorIssueSubmit: M3Handler = (ctx) => {
     detail,
     kind,
     at: new Date(ctx.now()).toISOString(),
-    by: ctx.operator,
+    by: ctx.principal,
     update: {
       ready: kind !== "note",
       jobId,

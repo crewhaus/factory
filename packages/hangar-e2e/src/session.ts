@@ -225,7 +225,8 @@ export async function openSession(
     const { pathname } = new URL(response.url());
     const status = response.status();
     if (status >= 500) record("server-error", `${status} from ${pathname}`);
-    else if (pathname.startsWith("/assets/") && (status < 200 || status >= 300)) {
+    // A 304 is an asset the browser already holds, revalidated: not a failure.
+    else if (pathname.startsWith("/assets/") && (status < 200 || status >= 300) && status !== 304) {
       record("failed-asset", `${status} from ${pathname}`);
     }
   });

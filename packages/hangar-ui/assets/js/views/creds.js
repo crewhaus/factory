@@ -20,7 +20,17 @@
  */
 
 import { api } from "../api.js";
-import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
+import {
+  clear,
+  collapsible,
+  dot,
+  el,
+  emptyState,
+  jsonPre,
+  scrollRegion,
+  skeleton,
+  toast,
+} from "../dom.js";
 import { fmtRelativeTime } from "../util.js";
 
 /**
@@ -188,7 +198,7 @@ function keyTable(keys, ctx, reload) {
       ]),
     );
   }
-  return el("div", { class: "table-scroll" }, [
+  return scrollRegion("Environment variables", [
     el("table", { class: "fleet" }, [
       el(
         "thead",
@@ -368,7 +378,7 @@ function secretsCard(body, doctorBody) {
       );
     }
     nodes.push(
-      el("div", { class: "table-scroll" }, [
+      scrollRegion("Secret files", [
         el("table", { class: "fleet" }, [
           el(
             "thead",
@@ -514,7 +524,7 @@ function matrixTable(harnesses, keys) {
       ]),
     );
   }
-  return el("div", { class: "table-scroll" }, [
+  return scrollRegion("Credentials by harness", [
     el("table", { class: "fleet" }, [el("thead", null, head), tbody]),
   ]);
 }

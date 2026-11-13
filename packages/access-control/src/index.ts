@@ -39,6 +39,7 @@ export {
   ensureAccessSetUp,
   openAccess,
   redeemInvite,
+  registerDomainIn,
 } from "./access";
 export { cidrContains, isLoopbackAddress, parseCidr, type Cidr } from "./addresses";
 export {
@@ -48,7 +49,9 @@ export {
   type AuthorizeVerdict,
   type DomainChecker,
   type DomainRequest,
+  type ObjectRef,
   authorize,
+  domainOf,
   effectiveRole,
 } from "./authorize";
 export {
@@ -63,9 +66,11 @@ export {
   type Listener,
   PROXY_SECRET_HEADER,
   type Peer,
+  type ScopedGrant,
   type TrustedProxy,
-  admitUntilAuthorization,
   authenticate,
+  hasForwardingHeaders,
+  hostNameOf,
 } from "./authenticate";
 export {
   BOOT_TICKET_TTL_MS,
@@ -80,6 +85,7 @@ export {
   tokenEquals,
 } from "./bootstrap";
 export { type LocalIdentity, localActorOf } from "./local-actor";
+export { noAuthRefusal } from "./no-auth";
 export {
   OWNER_BLOCKS,
   type OwnerSettings,
@@ -99,9 +105,19 @@ export type {
   PrincipalKind,
   PrincipalRow,
 } from "./records";
+export {
+  SCOPED_ACT_PERMISSIONS,
+  SCOPED_TOKEN_TTL_MS,
+  type ScopedMintAnswer,
+  type ScopedMintInput,
+  type ScopedVerified,
+  mintScopedToken,
+  verifyScopedToken,
+} from "./scoped";
 export { type IssuedSecretKind, mintIssuedSecret } from "./secrets";
 export type { Issued, SealedOperation } from "./sealed";
 export {
+  type AcceptInviteInput,
   type BearerCheck,
   type SessionEnd,
   type SessionIssue,
@@ -110,6 +126,7 @@ export {
   type SignInOptions,
   type SignInRefusal,
   type SignInRefusalReason,
+  type TabOnlyIssue,
   openSignIn,
 } from "./sign-in";
 export type { DeviceJwk, DeviceRow, SessionRow } from "./sign-in-records";

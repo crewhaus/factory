@@ -1,6 +1,6 @@
 /** The console reaches Thredz through the server, and the key stays there. */
 import { fakeThredz } from "service-fakes";
-import { harnessRoute } from "../console-routes";
+import { routeFor } from "../console-routes";
 import { responseRecorder, unreadResponses, whereReceived } from "../responses";
 import type { Journey } from "./journey";
 
@@ -30,7 +30,7 @@ export const thredzProxy: Journey = {
     // From before sign-in, because the first load is when the harness list arrives.
     const recorder = responseRecorder();
     const session = await scope.session(scope.home(fleet), { onResponse: recorder.observe });
-    await session.visit(harnessRoute(harness.id, "thredz"));
+    await session.visit(routeFor("#/h/:id/knowledge/thredz", harness));
     session.assertClean();
     // With a key and an answering workspace, there is no refusal to show.
     if ((await session.page.locator(".error-card").count()) > 0) {

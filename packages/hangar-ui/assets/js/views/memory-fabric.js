@@ -365,7 +365,9 @@ function sessionLink(ctx, sessionId, label) {
 // ---------------------------------------------------------------------------
 
 export async function renderMemoryFabric(root, ctx) {
-  const state = { panel: "facts" };
+  // `knowledge/memory/<panel>` opens that panel; an unknown one opens Facts.
+  const asked = ctx.route?.rest?.[0];
+  const state = { panel: PANELS.some(([id]) => id === asked) ? asked : "facts" };
   clear(root);
   const host = el("div", { class: "tab-body" });
   const draw = () => {
@@ -379,6 +381,7 @@ export async function renderMemoryFabric(root, ctx) {
     current: state.panel,
     onSelect: (id) => {
       state.panel = id;
+      ctx.setSub?.([id]);
       draw();
     },
   });

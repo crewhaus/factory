@@ -316,6 +316,7 @@ export const api = {
   authChallenge: () => authCall(ROUTES.authChallenge),
   authSession: (body) => authCall(ROUTES.authSession, body),
   authExchange: (body) => authCall(ROUTES.authExchange, body),
+  authAcceptInvite: (body) => authCall(ROUTES.authAcceptInvite, body),
   authRefresh: (body) => authCall(ROUTES.authRefresh, body, getSession()),
   authSignOut: () => authCall(ROUTES.authSignOut, {}, getSession()),
   bootTicket: (bearer) => authCall(ROUTES.bootTicket, {}, bearer),

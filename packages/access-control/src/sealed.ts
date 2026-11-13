@@ -18,8 +18,12 @@ import type { DeviceJwk } from "./sign-in-records";
 /** The HKDF info string. A pin: both halves derive with it. */
 export const SEALED_INFO = "crewhaus.hangar.v1/issued";
 
-/** The three operations that issue a session. */
-export type SealedOperation = "auth.exchange" | "auth.session" | "auth.refresh";
+/** The operations that issue a session. */
+export type SealedOperation =
+  | "auth.exchange"
+  | "auth.session"
+  | "auth.refresh"
+  | "auth.acceptInvite";
 
 export type Issued = {
   readonly alg: "ECDH-ES+A256GCM";

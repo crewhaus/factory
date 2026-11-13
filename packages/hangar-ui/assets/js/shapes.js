@@ -9,6 +9,30 @@
  * surface and on its own 8% wash. `src/hangar-css.test.ts` computes both.
  */
 
+/**
+ * The compile targets, in the order the shape × panel matrix lists them.
+ * This is the strict union `@crewhaus/spec` validates against; a target that
+ * is NOT in this list is unknown to this build, and an unknown shape is gated
+ * at nothing — hiding a screen from a shape the console has never heard of
+ * would be a guess wearing the clothes of a rule. The router re-exports it.
+ */
+export const SHAPE_TARGETS = Object.freeze([
+  "cli",
+  "workflow",
+  "channel",
+  "graph",
+  "managed",
+  "pipeline",
+  "crew",
+  "research",
+  "batch",
+  "voice",
+  "browser",
+  "eval",
+  "onchain",
+  "onchain-game",
+]);
+
 export const DEFAULT_ACCENT = "#2ecc8b";
 /** The light theme's default, the console's light `--accent`. */
 export const DEFAULT_ACCENT_LIGHT = "#0a6e47";

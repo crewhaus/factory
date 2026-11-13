@@ -122,6 +122,11 @@ export function rig(
     readonly hangarRoot?: string;
     readonly harness?: string;
     readonly harnessDirs?: () => readonly string[];
+    readonly authorizeActor?: (
+      actor: string,
+      permission: string,
+      target: string,
+    ) => boolean | undefined;
   } = {},
 ): Rig {
   const hangarRoot = options.hangarRoot ?? tempDir("control-service-home-");
@@ -145,6 +150,7 @@ export function rig(
       pid,
       host: HOST,
       onWarn: (m) => warnings.push(m),
+      ...(options.authorizeActor !== undefined ? { authorizeActor: options.authorizeActor } : {}),
     },
     {
       mode: options.mode ?? "direct",

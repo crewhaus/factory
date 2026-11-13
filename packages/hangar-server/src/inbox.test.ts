@@ -134,7 +134,7 @@ describe("approvals inbox", () => {
     }
   }, 20_000);
 
-  test("a grant written through the API is the record the CLI's own store reads back", async () => {
+  test("a grant written through the API is the record the CLI's own store reads back, naming who decided", async () => {
     const t = bootTestServer({ now: () => NOW });
     try {
       const dir = inboxHarness(t, "inbox-grant");
@@ -154,7 +154,8 @@ describe("approvals inbox", () => {
       });
       const seen = await store.get("SendMessage", "hash-1");
       expect(seen?.decision).toBe("grant");
-      // The body's `by` is never read: Home's operator label is what is shown.
+      // The decider is who signed in (Home's own label, with no access records yet); a `by`
+      // in the body is not. Home's operator label is what is shown.
       expect(seen?.decidedBy).toBe("hangar");
     } finally {
       await t.stop();
