@@ -574,8 +574,18 @@ const CLEAN_STOP_REASONS = new Set(["end_turn", "tool_use", "stop_sequence"]);
  * persistence path — the promise result is logged rather than thrown.
  */
 /**
- * The span a mirrored line belongs to: the bus event's own span, when it is
- * one (a hand-built envelope's id may not be).
+ * The span a mirrored line belongs to, for the events the loop itself nests:
+ * a tool call's end (the tool span), a model response (the model span) and a
+ * check's `permission_decision` (a child of the tool span). Their own span
+ * sits under the loop's open turn, so the line names it. A hand-built
+ * envelope's id may not be a span id; that line takes the handle's default.
+ *
+ * Every other mirrored kind (a recovery, an MCP call, a routing stage,
+ * failover or directive, a judge verdict) can be published by code that
+ * does not know the loop's spans, so its bus span may hang off the bus root
+ * rather than off the turn or even the run. Those lines pass no span: the
+ * loop's handle (`stampLines` in `./run-spans`) stamps them with the open
+ * turn's span, else the loop's.
  */
 function spanOf(event: TraceEvent): { readonly span?: string } {
   return isValidSpanId(event.spanId) ? { span: event.spanId } : {};
@@ -590,17 +600,21 @@ export function attachAdvisorPersistence(
   const gate = env["CREWHAUS_ADVISOR_EVENTS"];
   if (gate === "0" || gate === "false") return undefined;
 
+  // `nested` is the mirrored event when the loop parents it (see `spanOf`);
+  // absent, the line takes the handle's default span.
   const persist = (
     kind: "recovery" | "tool_stats" | "permission" | "model_meta",
     payload: unknown,
-    event: TraceEvent,
+    nested?: TraceEvent,
   ): void => {
-    void eventLog.append({ kind, payload, ...spanOf(event) }).catch((err) => {
-      runContext.logger.error("advisor_event.persist_failed", {
-        kind,
-        message: err instanceof Error ? err.message : String(err),
+    void eventLog
+      .append({ kind, payload, ...(nested !== undefined ? spanOf(nested) : {}) })
+      .catch((err) => {
+        runContext.logger.error("advisor_event.persist_failed", {
+          kind,
+          message: err instanceof Error ? err.message : String(err),
+        });
       });
-    });
   };
 
   // In-run digest counters (item 14). Bumped inline in the same handler so
@@ -616,15 +630,11 @@ export function attachAdvisorPersistence(
     switch (event.kind) {
       case "error_recovered": {
         if (event.action === "continue") truncationContinues += 1;
-        persist(
-          "recovery",
-          {
-            errorName: event.errorName,
-            action: event.action,
-            depth: event.depth,
-          },
-          event,
-        );
+        persist("recovery", {
+          errorName: event.errorName,
+          action: event.action,
+          depth: event.depth,
+        });
         return;
       }
       case "tool_call_end": {
@@ -759,7 +769,6 @@ export function attachMcpStatsPersistence(
     void eventLog
       .append({
         kind: "mcp_stats",
-        ...spanOf(event),
         payload: {
           server: event.server,
           toolName: event.toolName,
@@ -826,8 +835,11 @@ export function attachRoutingPersistence(
     readonly kinds?: ReadonlyArray<RoutingPersistedKind>;
   } = {},
 ): AttachedRoutingPersistence {
-  const persist = (kind: RoutingPersistedKind, payload: unknown, event: TraceEvent): void => {
-    void eventLog.append({ kind, payload, ...spanOf(event) }).catch((err) => {
+  // No span from the event: these are published by the model router, the
+  // judge gate helpers and the loop's routing branches alike, not always under
+  // the loop's spans (see `spanOf`), so the handle stamps the line.
+  const persist = (kind: RoutingPersistedKind, payload: unknown): void => {
+    void eventLog.append({ kind, payload }).catch((err) => {
       runContext.logger.error("routing_event.persist_failed", {
         kind,
         message: err instanceof Error ? err.message : String(err),
@@ -841,69 +853,53 @@ export function attachRoutingPersistence(
     switch (event.kind) {
       case "model_failover": {
         const e = event as ModelFailoverEvent;
-        persist(
-          "model_failover",
-          {
-            turnNumber: e.turnNumber,
-            from: e.from,
-            to: e.to,
-            reason: e.reason,
-          },
-          event,
-        );
+        persist("model_failover", {
+          turnNumber: e.turnNumber,
+          from: e.from,
+          to: e.to,
+          reason: e.reason,
+        });
         return;
       }
       case "model_stage": {
         const e = event as ModelStageEvent;
-        persist(
-          "model_stage",
-          {
-            turnNumber: e.turnNumber,
-            stage: e.stage,
-            strategy: e.strategy,
-            role: e.role,
-            model: e.model,
-            ...(e.profile !== undefined ? { profile: e.profile } : {}),
-            outcome: e.outcome,
-            ...(e.cause !== undefined ? { cause: e.cause } : {}),
-            ...(e.costUsdMicros !== undefined ? { costUsdMicros: e.costUsdMicros } : {}),
-          },
-          event,
-        );
+        persist("model_stage", {
+          turnNumber: e.turnNumber,
+          stage: e.stage,
+          strategy: e.strategy,
+          role: e.role,
+          model: e.model,
+          ...(e.profile !== undefined ? { profile: e.profile } : {}),
+          outcome: e.outcome,
+          ...(e.cause !== undefined ? { cause: e.cause } : {}),
+          ...(e.costUsdMicros !== undefined ? { costUsdMicros: e.costUsdMicros } : {}),
+        });
         return;
       }
       case "model_directive": {
         const e = event as ModelDirectiveEvent;
-        persist(
-          "model_directive",
-          {
-            turnNumber: e.turnNumber,
-            source: e.source,
-            requested: e.requested,
-            ...(e.resolved !== undefined ? { resolved: e.resolved } : {}),
-            accepted: e.accepted,
-            ...(e.reason !== undefined ? { reason: e.reason } : {}),
-          },
-          event,
-        );
+        persist("model_directive", {
+          turnNumber: e.turnNumber,
+          source: e.source,
+          requested: e.requested,
+          ...(e.resolved !== undefined ? { resolved: e.resolved } : {}),
+          accepted: e.accepted,
+          ...(e.reason !== undefined ? { reason: e.reason } : {}),
+        });
         return;
       }
       case "judge_verdict": {
         const e = event as JudgeVerdictEvent;
-        persist(
-          "judge_verdict",
-          {
-            turnNumber: e.turnNumber,
-            stepOrNode: e.stepOrNode,
-            verdict: e.verdict,
-            score: e.score,
-            ...(e.rationale !== undefined ? { rationale: e.rationale } : {}),
-            ...(e.judgeModel !== undefined ? { judgeModel: e.judgeModel } : {}),
-            ...(e.panel !== undefined ? { panel: e.panel } : {}),
-            ...(e.costUsdMicros !== undefined ? { costUsdMicros: e.costUsdMicros } : {}),
-          },
-          event,
-        );
+        persist("judge_verdict", {
+          turnNumber: e.turnNumber,
+          stepOrNode: e.stepOrNode,
+          verdict: e.verdict,
+          score: e.score,
+          ...(e.rationale !== undefined ? { rationale: e.rationale } : {}),
+          ...(e.judgeModel !== undefined ? { judgeModel: e.judgeModel } : {}),
+          ...(e.panel !== undefined ? { panel: e.panel } : {}),
+          ...(e.costUsdMicros !== undefined ? { costUsdMicros: e.costUsdMicros } : {}),
+        });
         return;
       }
       default:

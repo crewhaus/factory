@@ -5534,7 +5534,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // per-call lines for); the FR-003 terminal role-less `summary` aggregate is
   // still skipped so a run total never double-counts. `append()` writes
   // synchronously, and a persist failure must never abort a turn, so the
-  // result is logged rather than thrown.
+  // result is logged rather than thrown. The line names no span of its own:
+  // the cost tracker publishes accruals without knowing the loop's spans, so
+  // the handle stamps it with the open turn's span, else the loop's.
   let costPersistUnsubscribe: Unsubscribe | undefined;
   if (subscribers.costTracker !== undefined || budgetSessionPersist) {
     costPersistUnsubscribe = bus.subscribe((event): void => {
@@ -5544,7 +5546,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       void eventLog
         .append({
           kind: "cost_accrual",
-          span: ev.spanId,
           payload: {
             provider: ev.provider,
             modelId: ev.modelId,

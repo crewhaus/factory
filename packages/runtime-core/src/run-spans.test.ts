@@ -280,6 +280,14 @@ function isUnder(
   return false;
 }
 
+/** A provider error the loop recovers from by retrying the call. */
+const rateLimited = (): Error =>
+  Object.assign(new Error("rate limited"), {
+    status: 429,
+    retryAfterMs: 0,
+    error: { type: "rate_limit_error" },
+  });
+
 /** A pre-tool hook command answering `decision` (and `reason`). */
 const hookAnswering = (decision: "allow" | "deny", reason?: string) =>
   `printf '${JSON.stringify({ decision, ...(reason !== undefined ? { reason } : {}) })}\\n'`;
@@ -425,9 +433,21 @@ describe("span_closed lines and the span on every line", () => {
         return "noted";
       },
     });
+    // A rate-limited first call (a `recovery` line), a guide side call (its
+    // `model_stage` lines) and a session budget on a priced model (its
+    // `cost_accrual` lines): mirrors of events the loop does not parent.
     const r = await run(tempDir(), {
+      model: "claude-sonnet-5",
       tools: [echo, planWriter],
-      _adapter: scripted([[callTool("tu_1", "Echo"), callTool("tu_2", "PlanNote")], [say("done")]]),
+      budget: { usdMicros: 10_000_000, scope: "session", onExceed: { kind: "stop" } },
+      sideCalls: {
+        guide: { every: "turn", model: "guide-model", run: async () => ({ text: "a plan" }) },
+      },
+      _adapter: scripted([
+        rateLimited(),
+        [callTool("tu_1", "Echo"), callTool("tu_2", "PlanNote")],
+        [say("done")],
+      ]),
     });
     expect(r.caught).toBeUndefined();
     const closed = closedOf(r.lines);
@@ -441,7 +461,7 @@ describe("span_closed lines and the span on every line", () => {
       status: "ok",
       turn: { run: 1, session: 1 },
     });
-    expect(models).toHaveLength(2);
+    expect(models).toHaveLength(3);
     expect(models.map((m) => m.call)).toEqual(manifestsOf(r.lines).map((m) => m.call));
     expect(models.map((m) => m.span)).toEqual(manifestsOf(r.lines).map((m) => m.span));
     for (const m of models) expect(m.parent).toBe(turn?.span as string);
@@ -461,9 +481,12 @@ describe("span_closed lines and the span on every line", () => {
     const turnCloseAt = r.lines.findIndex(
       (l) => l.kind === "span_closed" && l.payload["kind"] === "turn",
     );
-    const firstInTurn = r.lines.findIndex((l) => l.kind === "context_manifest");
-    expect(firstInTurn).toBeGreaterThan(-1);
-    const inTurn = r.lines.slice(firstInTurn, turnCloseAt + 1);
+    // The turn's first line is the one after the seed message, the last line
+    // written before the turn opens.
+    const seedAt = r.lines.findIndex((l) => l.kind === "user_message");
+    expect(seedAt).toBeGreaterThan(-1);
+    expect(turnCloseAt).toBeGreaterThan(seedAt);
+    const inTurn = r.lines.slice(seedAt + 1, turnCloseAt + 1);
     for (const line of inTurn) {
       expect({ kind: line.kind, under: isUnder(line.span, turn?.span as string, parents) }).toEqual(
         {
@@ -477,8 +500,18 @@ describe("span_closed lines and the span on every line", () => {
     expect(r.lines.find((l) => l.kind === "plan_update")?.span).toBe(
       toolSpanOf.get("tu_2") as string,
     );
-    expect(inTurn.some((l) => l.kind === "tool_stats")).toBe(true);
-    expect(inTurn.some((l) => l.kind === "permission")).toBe(true);
+    for (const kind of [
+      "tool_stats",
+      "permission",
+      "model_meta",
+      "recovery",
+      "model_stage",
+      "cost_accrual",
+    ]) {
+      expect({ kind, found: inTurn.some((l) => l.kind === kind) }).toEqual({ kind, found: true });
+    }
+    // The guide's stage lines come before the turn's first model call.
+    expect(inTurn[0]?.kind).toBe("model_stage");
     // A call's verdicts come before its span_closed.
     for (const t of tools) {
       const closeAt = r.lines.findIndex(
@@ -540,12 +573,54 @@ describe("span_closed lines and the span on every line", () => {
     expect(closed.filter((c) => c.kind === "model").map((c) => c.status)).toEqual(["ok"]);
   });
 
+  test("a second loop's recovery and stage lines belong to its own run span, not the first loop's", async () => {
+    const dir = tempDir();
+    const ctx = createRunContext();
+    const guide = {
+      guide: {
+        every: "turn" as const,
+        model: "guide-model",
+        run: async () => ({ text: "a plan" }),
+      },
+    };
+    await run(dir, { sideCalls: guide, _adapter: scripted([rateLimited(), [say("one")]]) }, ctx);
+    const second = await run(
+      dir,
+      { sideCalls: guide, _adapter: scripted([rateLimited(), [say("two")]]) },
+      ctx,
+    );
+    expect(second.caught).toBeUndefined();
+    const runs = closedOf(second.lines).filter((c) => c.kind === "run");
+    expect(runs).toHaveLength(2);
+    const [firstRun, secondRun] = runs;
+    // The second loop's lines are the ones after the first loop's run closed.
+    const firstEnd = second.lines.findIndex(
+      (l) => l.kind === "span_closed" && l.payload["span"] === firstRun?.span,
+    );
+    expect(firstEnd).toBeGreaterThan(-1);
+    const parents = parentsOf(second.events, second.lines);
+    const loop2 = second.lines.slice(firstEnd + 1);
+    for (const kind of ["recovery", "model_stage"]) {
+      const lines = loop2.filter((l) => l.kind === kind);
+      expect({ kind, count: lines.length > 0 }).toEqual({ kind, count: true });
+      for (const line of lines) {
+        expect({ kind, under: isUnder(line.span, secondRun?.span as string, parents) }).toEqual({
+          kind,
+          under: true,
+        });
+      }
+    }
+    // Every line the second loop wrote belongs to its run span.
+    for (const line of loop2) {
+      expect({
+        kind: line.kind,
+        under: isUnder(line.span, secondRun?.span as string, parents),
+      }).toEqual({ kind: line.kind, under: true });
+    }
+  });
+
   test("a recovery retry is a sibling of the failed call and names it", async () => {
-    const limited = Object.assign(new Error("rate limited"), {
-      status: 429,
-      retryAfterMs: 0,
-      error: { type: "rate_limit_error" },
-    });
+    const limited = rateLimited();
     const r = await run(tempDir(), { _adapter: scripted([limited, [say("done")]]) });
     expect(r.caught).toBeUndefined();
     const requests = ofKind(r.events, "model_request");
