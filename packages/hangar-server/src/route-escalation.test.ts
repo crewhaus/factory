@@ -713,6 +713,58 @@ describe("handlers that escalate by what is asked", () => {
     expect(confirmed.status).toBe(200);
     expect(readFileSync(gradersPath, "utf8")).toContain("mode: observe");
   });
+
+  test("a stored graders file that does not parse keeps its protected criteria the owner's", async () => {
+    const h = await home();
+    const maintainer = await h.member("maintainer");
+    const gradersPath = join(h.dir, "eval", "graders.yaml");
+    mkdirSync(dirname(gradersPath), { recursive: true });
+    const stored = [
+      "graders:",
+      "  - name: exact",
+      "    type: exact_match",
+      "  - name: broken",
+      "    type: regex",
+      "criteria:",
+      "  - id: correct-answers",
+      "    protected: true",
+      "    measured_by: [exact]",
+      "",
+    ].join("\n");
+    writeFileSync(gradersPath, stored);
+    const route = `/api/h/${h.id}/builders/graders`;
+    const rev = String((await call(h, h.owner, "GET", route)).body["hash"]);
+    const replacement = [
+      "graders:",
+      "  - name: exact",
+      "    type: exact_match",
+      "criteria:",
+      "  - id: correct-answers",
+      "    measured_by: [exact]",
+      "",
+    ].join("\n");
+    const body = { yaml: replacement, confirmName: "escalation-fixture", expectedRev: rev };
+
+    const refused = await call(h, maintainer.headers, "POST", route, body);
+    expect(refused.status).toBe(403);
+    expect([refused.body["code"], refused.body["needs"], refused.body["role"]]).toEqual([
+      "forbidden",
+      "h.spec.edit.security",
+      "maintainer",
+    ]);
+    expect(refused.body["paths"]).toEqual(["criteria.correct-answers"]);
+    expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+
+    const { confirmName: _typed, ...unconfirmed } = body;
+    const asked = await call(h, h.owner, "POST", route, unconfirmed);
+    expect(asked.status).toBe(409);
+    expect(asked.body["needs"]).toBe("h.spec.edit.security");
+    expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+
+    const written = await call(h, h.owner, "POST", route, body);
+    expect(written.status).toBe(200);
+    expect(readFileSync(gradersPath, "utf8")).toBe(replacement);
+  });
 });
 
 describe("who a record names as its actor", () => {

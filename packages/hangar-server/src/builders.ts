@@ -53,7 +53,7 @@ import {
   parseGradersConfig,
 } from "@crewhaus/eval-grader";
 import { applySpecEdits, isCredentialKey, maskCredentialTokens } from "@crewhaus/spec-patch";
-import { createSpecFile } from "@crewhaus/spec-patch/commit";
+import { createSpecFile, parseYamlOnly } from "@crewhaus/spec-patch/commit";
 import { MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
@@ -501,8 +501,11 @@ export function newlyMaskedSpan(stored: string, incoming: string): string | null
  * 412 with `current.rev`. An edit that loosens a protected criterion needs the
  * security edit permission first (403 naming it, nothing written, whatever the
  * body carries), then the spec's name typed (409 with `needs` until it
- * matches): the typed name is a confirmation, never the authority. The
- * response is what is on disk, with its revision (`hash`) and `gradersHash`.
+ * matches): the typed name is a confirmation, never the authority. A stored
+ * file that does not parse cannot be compared, so any criterion it marks
+ * protected (or, when it is not readable YAML, the whole file) is treated as
+ * loosened. The response is what is on disk, with its revision (`hash`) and
+ * `gradersHash`.
  *
  * Two refusals guard the raw round trip, because the pane the console posts
  * back was prefilled from {@link graderCatalog} — a MASKED, CAPPED read:
@@ -597,16 +600,22 @@ export const graderWrite: M3Handler = (ctx) => {
   } catch {
     before = undefined;
   }
-  const loosened = before !== undefined ? loosening(before, after) : [];
-  const loosenedPaths = [...new Set(loosened.map((l) => `criteria.${l.criterion}`))];
-  if (loosened.length > 0) {
+  // What the owner must make: each loosening, and, when the stored file does
+  // not parse, every criterion it marks protected. "Cannot compare" is never
+  // "does not loosen".
+  const owed: { readonly path: string; readonly why: string }[] = (
+    before !== undefined ? loosening(before, after) : []
+  ).map((l) => ({ path: `criteria.${l.criterion}`, why: `${l.criterion}: ${l.reason}` }));
+  if (present && before === undefined) owed.push(...protectedInUnparsed(stored.text));
+  const loosenedPaths = [...new Set(owed.map((o) => o.path))];
+  if (owed.length > 0) {
     requirePermission(ctx, SPEC_SECURITY_PERMISSION, {
       paths: loosenedPaths,
       message: "Only an owner of this harness can loosen a protected criterion.",
     });
   }
-  if (loosened.length > 0 && ctx.body["confirmName"] !== file.specName) {
-    const warning = loosened.map((l) => `${l.criterion}: ${l.reason}`).join("; ");
+  if (owed.length > 0 && ctx.body["confirmName"] !== file.specName) {
+    const warning = owed.map((o) => o.why).join("; ");
     throw new HttpError(
       409,
       `this change loosens a protected criterion (${warning}) — only the owner makes it: send "confirmName": "${file.specName}"`,
@@ -638,6 +647,41 @@ export const graderWrite: M3Handler = (ctx) => {
     note: "runs scored after this write carry a new gradersHash — earlier runs keep the graders they were scored by",
   };
 };
+
+/**
+ * The criteria a stored graders file that does not parse marks protected,
+ * read as plain YAML with no schema, each as the owner's to change. A file
+ * that is not readable YAML, or whose `criteria` is not a list, owes the
+ * whole `criteria` block: what it protects cannot be told.
+ */
+function protectedInUnparsed(text: string): { path: string; why: string }[] {
+  const why =
+    "the stored graders file does not parse, so this change cannot be shown to keep its bar";
+  const whole = [{ path: "criteria", why: `criteria: ${why}` }];
+  let doc: unknown;
+  try {
+    doc = parseYamlOnly(text);
+  } catch {
+    return whole;
+  }
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return [];
+  const criteria = (doc as Record<string, unknown>)["criteria"];
+  if (criteria === undefined || criteria === null) return [];
+  if (!Array.isArray(criteria)) return whole;
+  const out: { path: string; why: string }[] = [];
+  for (const entry of criteria) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const mark = (entry as Record<string, unknown>)["protected"];
+    if (mark === undefined || mark === null || mark === false) continue;
+    const id = (entry as Record<string, unknown>)["id"];
+    out.push(
+      typeof id === "string"
+        ? { path: `criteria.${id}`, why: `${id}: ${why}` }
+        : { path: "criteria", why: `criteria: ${why}` },
+    );
+  }
+  return out;
+}
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);

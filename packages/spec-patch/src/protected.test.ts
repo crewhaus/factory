@@ -326,4 +326,42 @@ steps:
     expect(protectedBarChange(doc(0.7), doc(0.5))?.key).toBe("steps.1.judge.threshold");
     expect(protectedBarChange(doc(0.7), doc(0.9))).toBeUndefined();
   });
+
+  describe("a pairing holds only while it gates the same step", () => {
+    const step = (name: string, threshold?: number) =>
+      threshold === undefined
+        ? { name, instructions: `${name} it.` }
+        : { name, kind: "judge", judge: { criteria: "is it right", threshold, protected: true } };
+    const before = { steps: [step("draft"), step("revise"), step("check", 0.7)] };
+    const needsOwner = (after: unknown): void => {
+      expect(protectedBarChange(before, after)?.key).toBe("steps.check.judge");
+      expect(escalationFor(before, after).map((e) => e.needs)).toContain("h.spec.edit.security");
+    };
+
+    test("a second step of the same name, added before or after it, needs the owner", () => {
+      needsOwner({
+        steps: [step("draft"), step("check", 0.9), step("revise"), step("check", 0.1)],
+      });
+      needsOwner({
+        steps: [step("draft"), step("revise"), step("check", 0.7), step("check", 0.1)],
+      });
+    });
+
+    test("a renamed gate with its name given to a new step needs the owner", () => {
+      needsOwner({
+        steps: [step("draft"), step("check", 0.9), step("revise"), step("final", 0.1)],
+      });
+      needsOwner({
+        steps: [step("draft"), step("revise"), step("final", 0.1), step("check", 0.9)],
+      });
+    });
+
+    test("raising the gate in place, or adding a step after it, passes", () => {
+      const raised = { steps: [step("draft"), step("revise"), step("check", 0.9)] };
+      expect(protectedBarChange(before, raised)).toBeUndefined();
+      expect(escalationFor(before, raised)).toEqual([]);
+      const extended = { steps: [...raised.steps, step("publish")] };
+      expect(protectedBarChange(before, extended)).toBeUndefined();
+    });
+  });
 });

@@ -313,6 +313,38 @@ describe("criteria apply", () => {
     expect(readFileSync(aGraders, "utf8")).toBe(GRADERS);
     expect(existsSync(join(a, CRITERIA_HISTORY_REL))).toBe(false);
     expect(existsSync(join(b, CRITERIA_HISTORY_REL))).toBe(false);
+
+    // A --spec in a directory above the graders file's own harness is not its harness either.
+    const p = mkdtempSync(join(tmpdir(), "crewhaus-criteria-parent-"));
+    TMP.push(p);
+    writeFileSync(join(p, "crewhaus.yaml"), SPEC.replace("name: shop", "name: other"));
+    const nested = join(p, "a");
+    mkdirSync(join(nested, "eval"), { recursive: true });
+    writeFileSync(join(nested, "crewhaus.yaml"), SPEC);
+    const nestedGraders = join(nested, "eval", "graders.yaml");
+    writeFileSync(nestedGraders, GRADERS);
+    const parentLoosen = editsFile(p, [{ op: "setMode", id: "answers-match", value: "observe" }]);
+    const above = await run(
+      p,
+      [
+        "apply",
+        parentLoosen,
+        "--graders",
+        nestedGraders,
+        "--spec",
+        join(p, "crewhaus.yaml"),
+        "--expect",
+        gradersRevision(GRADERS),
+        "--confirm",
+        "other",
+      ],
+      { env: {} },
+    );
+    expect(above.exitCode).toBe(1);
+    expect(above.lines).toEqual([refusal]);
+    expect(readFileSync(nestedGraders, "utf8")).toBe(GRADERS);
+    expect(existsSync(join(p, CRITERIA_HISTORY_REL))).toBe(false);
+    expect(existsSync(join(nested, CRITERIA_HISTORY_REL))).toBe(false);
   });
 });
 

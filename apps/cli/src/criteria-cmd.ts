@@ -694,7 +694,12 @@ function readEdits(verb: string, session: Session, path: string) {
   return parsed.data;
 }
 
-/** Whether the graders file, links resolved, lies inside the harness directory (by `relative()`). */
+/**
+ * Whether the graders file, links resolved, belongs to the harness directory:
+ * it lies inside it (by `relative()`), and no directory between the two holds
+ * a `crewhaus.yaml` of its own, so the harness of --spec is the file's
+ * nearest one.
+ */
 function gradersInHarness(gradersPath: string, harnessDir: string): boolean {
   let file: string;
   let root: string;
@@ -705,7 +710,13 @@ function gradersInHarness(gradersPath: string, harnessDir: string): boolean {
     return false;
   }
   const rel = relative(root, file);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  if (!(rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)))) return false;
+  for (let dir = dirname(file); dir !== root; dir = dirname(dir)) {
+    if (existsSync(join(dir, "crewhaus.yaml"))) return false;
+    // Unreachable while `file` is inside `root`; a guard against a loop.
+    if (dirname(dir) === dir) return false;
+  }
+  return true;
 }
 
 function applyVerb(session: Session, argv: readonly string[]): CriteriaCommandResult {
