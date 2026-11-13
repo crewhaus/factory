@@ -1,7 +1,5 @@
 import { HARNESS_COMMAND, TWINS } from "./shared.js";
 
-const NO_DAEMON_VERB = "`crewhaus daemon` has no command for this.";
-
 export const CONTROL_OPERATIONS = [
   {
     ...HARNESS_COMMAND,
@@ -10,8 +8,7 @@ export const CONTROL_OPERATIONS = [
     path: "/api/v1/harnesses/{h}/controls/pause",
     permission: "h.control",
     request: "pauseRequest",
-    cliTwin: null,
-    noTwinReason: NO_DAEMON_VERB,
+    cliTwin: TWINS.daemonPause,
     qualifiers: [],
   },
   {
@@ -21,8 +18,7 @@ export const CONTROL_OPERATIONS = [
     path: "/api/v1/harnesses/{h}/controls/resume",
     permission: "h.control",
     request: "emptyRequest",
-    cliTwin: null,
-    noTwinReason: NO_DAEMON_VERB,
+    cliTwin: TWINS.daemonResume,
     qualifiers: [],
   },
   {
@@ -72,8 +68,7 @@ export const CONTROL_OPERATIONS = [
     path: "/api/v1/harnesses/{h}/controls/disable",
     permission: "h.deploy",
     request: "emptyRequest",
-    cliTwin: null,
-    noTwinReason: NO_DAEMON_VERB,
+    cliTwin: TWINS.daemonDisable,
     qualifiers: [],
   },
   {
@@ -83,8 +78,7 @@ export const CONTROL_OPERATIONS = [
     path: "/api/v1/harnesses/{h}/controls/enable",
     permission: "h.deploy",
     request: "emptyRequest",
-    cliTwin: null,
-    noTwinReason: NO_DAEMON_VERB,
+    cliTwin: TWINS.daemonEnable,
     qualifiers: [],
   },
   {

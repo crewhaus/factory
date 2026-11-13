@@ -9,7 +9,7 @@
 import { AREA_MODULES, COMMAND_KINDS } from "@crewhaus/control-contract";
 import { CORE_RUNTIME } from "./core-runtime";
 import { PROTECTED_ENVIRONMENT_GATE } from "./deployments";
-import type { ActivationGate, AreaRuntime } from "./executor";
+import type { ActivationGate, AreaRuntime, RetireRevoker } from "./executor";
 
 // import { ATTENTION_RUNTIME } from "./areas/attention";
 
@@ -65,8 +65,9 @@ export const AREA_RUNTIMES: readonly AreaRuntime[] = [
 
 /**
  * What is wrong with a composition, one line per problem: a kind no area module declares,
- * a kind registered twice, an area no module names, and a kind that is not safe to repeat
- * with an executor but no reconciler, which recovery could only ever mark unknown.
+ * a kind registered twice, an area no module names, a kind that is not safe to repeat
+ * with an executor but no reconciler, which recovery could only ever mark unknown, and a
+ * retire revoker name registered twice.
  */
 export function compositionProblems(areas: readonly AreaRuntime[]): readonly string[] {
   const problems: string[] = [];
@@ -127,10 +128,28 @@ export function compositionProblems(areas: readonly AreaRuntime[]): readonly str
   } else if (order[0]?.name !== PROTECTED_ENVIRONMENT_GATE) {
     problems.push(`the core's "${PROTECTED_ENVIRONMENT_GATE}" activation gate is not first`);
   }
+  const revokers = new Map<string, string>();
+  for (const runtime of areas) {
+    for (const revoker of runtime.retireRevokers ?? []) {
+      const first = revokers.get(revoker.name);
+      if (first !== undefined) {
+        problems.push(
+          `retire revoker "${revoker.name}" registered twice (areas "${first}" and "${runtime.area}")`,
+        );
+      } else {
+        revokers.set(revoker.name, runtime.area);
+      }
+    }
+  }
   return problems;
 }
 
 /** Every area's activation gates, flattened in composition order. */
 export function activationGates(areas: readonly AreaRuntime[]): readonly ActivationGate[] {
   return areas.flatMap((runtime) => runtime.activationGates ?? []);
+}
+
+/** Every area's retire revokers, flattened in composition order. */
+export function retireRevokers(areas: readonly AreaRuntime[]): readonly RetireRevoker[] {
+  return areas.flatMap((runtime) => runtime.retireRevokers ?? []);
 }

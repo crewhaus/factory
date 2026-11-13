@@ -2,15 +2,19 @@
  * What a start decides before it acts, kept in one place so a restart can ask the same
  * questions before it stops the daemon it replaces.
  *
+ *   - {@link operatorRefusal}: the operator record. A harness its operator disabled, or
+ *     whose record cannot be read, is not started, restarted or restarted after adoption,
+ *     whatever build it runs. A pause alone refuses no start.
  *   - {@link decideStart}: every refusal a start can decide without compiling, writing or
- *     spawning: its plan, the preflight gate and the build check. A restart asks it while
- *     the daemon still runs and, on a refusal, leaves that daemon running.
+ *     spawning: the operator record, its plan, the preflight gate and the build check. A
+ *     restart asks it while the daemon still runs and, on a refusal, leaves that daemon
+ *     running.
  *   - {@link automaticSpecRefusal}: an automatic start of a launch that runs the saved
  *     spec (`crewhaus run`, `serve --mcp`) runs it only while it is the active
  *     deployment's spec.
  */
 import { readFileSync } from "node:fs";
-import { readDeployments } from "@crewhaus/control-records";
+import { assertRunnable, readDeployments, readOperatorRecord } from "@crewhaus/control-records";
 import { sameRevision, specRevision } from "@crewhaus/ir/policy";
 import {
   BUILD_NOT_ACTIVE_MESSAGE,
@@ -56,9 +60,39 @@ function withoutHeldItems(decision: GateDecision): GateDecision {
 }
 
 /**
+ * Why the operator record refuses a start: disabled, or unreadable. Read now, never from
+ * the one-second cache, because a start is rare and must see a disable written a moment
+ * ago. Undefined when it may start, a pause included.
+ *
+ * First consumers: the supervisor's `start()` and {@link decideStart}.
+ */
+export function operatorRefusal(harnessDir: string): StartRefusal | undefined {
+  const read = readOperatorRecord.refresh(harnessDir);
+  const verdict = assertRunnable(harnessDir, { mode: "start", read: () => read });
+  if (verdict.ok) return undefined;
+  if (read.state === "unreadable") {
+    return {
+      ok: false,
+      reason: "disabled",
+      exitName: "disabled",
+      cause: "unreadable",
+      message: `The operator record can't be read (${read.reason}), so nothing starts.`,
+    };
+  }
+  return {
+    ok: false,
+    reason: "disabled",
+    exitName: "disabled",
+    cause: "disabled",
+    message: `Disabled by its operator, so it doesn't start. Run \`crewhaus daemon enable ${harnessDir}\` to allow starts.`,
+  };
+}
+
+/**
  * Every refusal the start after a restart's stop would make that can be decided now,
  * writing nothing and spawning nothing:
  *
+ *   0. the operator record ({@link operatorRefusal});
  *   1. the plan (a throw is `plan-failed`);
  *   2. the preflight gate with the same options, every area but `ports`, which the running
  *      daemon holds until it stops; `workspace.holds-home` decides here like any other;
@@ -73,6 +107,8 @@ function withoutHeldItems(decision: GateDecision): GateDecision {
  * First consumer: the supervisor's restart, before it stops a running daemon.
  */
 export async function decideStart(input: StartDecisionInput): Promise<StartRefusal | undefined> {
+  const operator = operatorRefusal(input.harnessDir);
+  if (operator !== undefined) return operator;
   let plan: SpawnPlan;
   try {
     plan = await input.plan();

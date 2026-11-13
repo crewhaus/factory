@@ -30,6 +30,8 @@ export type ExecutorContext = {
   /** The control.v1 drain call `supervisor.drain` takes. */
   readonly drainRequest: () => Promise<void>;
   readonly now: () => number;
+  /** The head's probe, for an executor that asks whether a recorded daemon is alive. */
+  readonly probe?: LeaseProbe;
 };
 
 export type Executor = (ctx: ExecutorContext) => Promise<Settlement>;
@@ -38,6 +40,8 @@ export type ReconcileContext = {
   readonly harnessDir: string;
   readonly probe: LeaseProbe;
   readonly now: () => number;
+  /** Home's root, for a kind whose effect is recorded there (retire's lifecycle line). */
+  readonly hangarRoot?: string;
 };
 
 export type Reconciliation = "done" | "not-done" | "unknown";
@@ -67,6 +71,34 @@ export type ActivationGate = {
   >;
 };
 
+/** What a retire shows each revoker: the harness, who retires it, and when. */
+export type RetireRevokerContext = {
+  readonly harnessDir: string;
+  /** The harness's `hrn_` id, when it has one. */
+  readonly harnessId?: string;
+  /** The stored actor ref that retires it. */
+  readonly actor: string;
+  readonly now: number;
+};
+
+/** One thing a revoker will end, as a retire's plan lists it. */
+export type RetireItem = {
+  readonly kind: string;
+  /** `manual`: a person does this by hand, where it was issued. */
+  readonly status: "planned" | "manual";
+  readonly note?: string;
+};
+
+/**
+ * What an area ends when a harness is retired: its grants, leases or connections. `plan`
+ * reads and changes nothing; `revoke` ends them and answers one receipt effect each.
+ */
+export type RetireRevoker = {
+  readonly name: string;
+  plan(ctx: RetireRevokerContext): Promise<readonly RetireItem[]>;
+  revoke(ctx: RetireRevokerContext): Promise<readonly ReceiptEffect[]>;
+};
+
 /** An area's running code for the command kinds it owns. Later slots join this type. */
 export type AreaRuntime = {
   /** The area's name, as its module in control-contract declares it. */
@@ -80,6 +112,8 @@ export type AreaRuntime = {
   readonly unsupervised?: readonly string[];
   /** Checks every activation passes; the core's protected-environment gate runs first. */
   readonly activationGates?: readonly ActivationGate[];
+  /** What the area ends when a harness is retired, run in composition order. */
+  readonly retireRevokers?: readonly RetireRevoker[];
 };
 
 /** An executor stamp, with `probed: false` when the probe could not say when it started. */

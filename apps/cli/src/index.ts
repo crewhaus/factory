@@ -394,15 +394,7 @@ import {
 // orchestration + refusal are pure; heavy steps are an injected seam. In a
 // side-effect-free module so it is unit-testable (this entry file runs an argv
 // switch on import).
-import {
-  RetireError,
-  type RetirementSteps,
-  type StepOutcome,
-  buildRetirementPlan,
-  formatPlan,
-  formatRetirementResult,
-  runRetirement,
-} from "@crewhaus/harness-lifecycle/retire";
+import type { StepOutcome } from "@crewhaus/harness-lifecycle/retire";
 // Hangar F-1 — best-effort harness self-registration: run/compile/eval/dev
 // record the cwd in the machine-wide registry (`~/.crewhaus/harnesses.json`)
 // after a spec resolves. The hook never throws and honours
@@ -1314,6 +1306,7 @@ import {
   renderSentinelReport,
   renderTuneReport,
 } from "./onchain-tune";
+import { gateEntryPoint } from "./operator-gate";
 import {
   BridgedCandidateError,
   prepareBridgedCandidate,
@@ -1410,6 +1403,9 @@ import {
   pinRecoveriesAfterOptimize,
 } from "./regression-pin";
 import { parseReplayToolsFlags } from "./replay-flags";
+// Item 25 — model right-sizing downshift search core (pure enumeration + cost
+// projection + $/score ranking); side-effect-free so it is unit-testable.
+import { type HeavyRetireSteps, retireCommand } from "./retire-cmd";
 // Wave 3 (B20) — the persistent human-review queue
 // (.crewhaus/review/queue.jsonl): pure entry builders/formatters + the
 // append-only JSONL store, in a side-effect-free module so it is
@@ -1429,8 +1425,6 @@ import {
   readReviewQueue,
   resolveReviewEntry,
 } from "./review-queue";
-// Item 25 — model right-sizing downshift search core (pure enumeration + cost
-// projection + $/score ranking); side-effect-free so it is unit-testable.
 import {
   type BaselineEvalOutcome,
   type ModelSlot,
@@ -18616,12 +18610,15 @@ async function buildProductionKnowledgeRedactor(): Promise<Redactor> {
 async function runRetire(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus retire <spec> [--archive <dir>] [--dry-run] [--force]\n" +
+      "usage: crewhaus retire <spec> [--archive <dir>] [--dry-run] [--force] [--stop]\n" +
         "         [--force-unverified] [--push-knowledge] [--shared <dir>] [--root-dir <dir>]\n" +
         "\n" +
-        "  Decommission a harness with evidence. Refuses to retire a spec with an\n" +
-        "  active deployment pin unless --force. Steps (each logged into the archive):\n" +
-        "  export durable state → final compliance-evidence bundle → audit verify →\n" +
+        "  Decommission a harness with evidence. Refuses while its daemon runs unless\n" +
+        "  --stop, which stops it first, and refuses a spec with an active deployment\n" +
+        "  pin unless --force. Steps (each logged into the archive): disable it, cancel\n" +
+        "  its queued runs, expire its open approvals, revoke its standing rules and the\n" +
+        "  connections registered for it → export durable state → final\n" +
+        "  compliance-evidence bundle → audit verify →\n" +
         "  [--push-knowledge] → tombstone the registry entry (delete versions, clearing\n" +
         "  every env pin) → archive + remove the live .crewhaus state. A failing\n" +
         "  compliance bundle or a tamper-reporting audit verify ABORTS before the\n" +
@@ -18675,28 +18672,8 @@ async function runRetire(args: ParsedArgs): Promise<void> {
       : join(harnessDir, `retired-${registryName}-${new Date().toISOString().slice(0, 10)}`),
   );
 
-  let plan: ReturnType<typeof buildRetirementPlan>;
-  try {
-    plan = buildRetirementPlan({
-      specName: registryName,
-      harnessDir,
-      archiveDir,
-      pins,
-      force,
-      pushKnowledge,
-    });
-  } catch (err) {
-    if (err instanceof RetireError) die(err.message);
-    throw err;
-  }
-
-  if (dryRun) {
-    for (const line of formatPlan(plan)) process.stdout.write(`${line}\n`);
-    return;
-  }
-
-  // Wire the real heavy steps.
-  const steps: RetirementSteps = {
+  // Wire the real heavy steps; `retireCommand` runs the rest around them.
+  const steps: HeavyRetireSteps = {
     async backupState(archiveDirIn): Promise<StepOutcome & { tarball?: string }> {
       const stateDir = join(harnessDir, ".crewhaus");
       if (!existsSync(stateDir)) {
@@ -18849,19 +18826,22 @@ async function runRetire(args: ParsedArgs): Promise<void> {
     },
   };
 
-  let result: Awaited<ReturnType<typeof runRetirement>>;
-  try {
-    result = await runRetirement({
-      plan,
-      steps,
-      dryRun: false,
-      forceUnverified: args.flags["force-unverified"] === true,
-    });
-  } catch (err) {
-    if (err instanceof RetireError) die(err.message);
-    throw err;
+  const retired = await retireCommand({
+    harnessDir,
+    specName: registryName,
+    archiveDir,
+    pins,
+    force,
+    pushKnowledge,
+    stop: args.flags["stop"] === true,
+    dryRun,
+    forceUnverified: args.flags["force-unverified"] === true,
+    heavy: steps,
+  });
+  for (const line of retired.lines) {
+    (retired.exitCode === 0 ? process.stdout : process.stderr).write(`${line}\n`);
   }
-  for (const line of formatRetirementResult(result)) process.stdout.write(`${line}\n`);
+  if (retired.exitCode !== 0) process.exit(retired.exitCode);
 }
 
 /** A one-off y/N prompt on stdin. Empty / anything not starting with y → no. */
@@ -23991,6 +23971,12 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
+
+gateEntryPoint(subcommand, rest, {
+  cwd: process.cwd(),
+  write: (line) => process.stderr.write(line),
+  exit: (code) => process.exit(code),
+});
 
 switch (subcommand) {
   case "compile":

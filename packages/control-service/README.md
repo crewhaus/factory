@@ -72,7 +72,7 @@ the next touch. A claim whose receipt never landed is completed from the claim o
 | Found | Action |
 |---|---|
 | a job's receipt | the job queue moves it; Home settles one no job row names as `unknown` |
-| a daemon command a later daemon command on the same harness overtook | `unknown`: superseded by a later command, never run |
+| a control a later control of the same family on the same harness overtook | `unknown`: superseded by a later command, never run |
 | a daemon start accepted before the machine booted | `unknown`: not started, the machine restarted |
 | `accepted`, safe to repeat | run again |
 | `accepted`, not safe to repeat | reconcile: done → `succeeded`, not done → run again, else `unknown` |
@@ -80,8 +80,11 @@ the next touch. A claim whose receipt never landed is completed from the claim o
 | `running`, not safe to repeat | reconcile: done → `succeeded`, not done → `failed`, else `unknown` |
 | a legacy kind, or no executor | `unknown`: interrupted, needs a decision |
 
-A daemon command runs again only while it is the harness's latest: once an operator has started,
-stopped or drained the daemon since, re-running an older command would undo theirs.
+A control runs again only while it is the latest of its family on the harness: once an operator has
+started, stopped or drained the daemon since, re-running an older daemon command would undo theirs.
+The families are daemon (`controls.start`, `stop`, `restart`, `drain`), intake (`controls.pause`,
+`resume`) and deployment (`controls.disable`, `enable`), each on its own; `controls.retire` is in
+none, and has no executor, so it is never run again.
 
 It answers `{redispatched, reconciled, unknown}`. Recovery writes, so it never runs on a read.
 
@@ -102,6 +105,28 @@ It also registers the decision service's kinds, `decisions.resolve`, `decisions.
 `rules.create` and `rules.revoke`: each executor observes what its receipt's target names (the
 decision claim, a request's row, a rule's row) and settles by it, and acts again on nothing. They act
 on records alone, so their area declares them `unsupervised` and they run with no supervisor.
+
+## Operator controls and retire
+
+`applyOperatorControl(ctx, {kind, quiet?, reload?})` is the only writer of a harness's operator record
+(`.crewhaus/run/control/operator.json`) for `controls.pause`, `resume`, `disable` and `enable`: the
+block it writes carries the receipt's stored actor (`by`) and id (`cmd`). Writing the record is the
+effect, so the receipt settles `succeeded` once it is written; then the head's control client `reload`
+asks a running daemon to read it, and the receipt's daemon effect says what it saw (`confirmed`,
+`applies within a second`, `applies when it starts`, or `recorded, not enforced` for a build without
+the route). A record that cannot be read is never written: the receipt is `failed`, `unavailable`.
+The same function is the four kinds' executor (records only, `unsupervised`): run by recovery it leaves
+a block that already names the receipt alone, and otherwise writes a pause with the standard notice,
+since a receipt keeps no argument. `recordDesired(dir, desired)` records whether the harness should be
+running, for the recovery after a reboot; both heads lend it to their supervisors.
+
+`retireSteps({harnessDir, receipt, hangarRoot, stop, stopDaemon?, ...})` is retire's own part: stop
+(with `--stop`) and disable, cancel queued runs (taking each run's claim first), expire open approvals
+and unspent grants with reason `retired`, revoke standing rules, run every area's retire revoker, then,
+after the archive, append `harness.retired` to `<hangarRoot>/control/lifecycle.jsonl` and mark the
+registry row archived. An area registers a revoker in `AreaRuntime.retireRevokers`;
+`retireRevokers(areas)` lists them in composition order, and `wireControl` refuses a name registered
+twice. `controls.retire`'s reconciler reads the lifecycle record.
 
 ## Decisions and standing rules
 
@@ -131,7 +156,8 @@ command's id and who queued it (`commandId`, `by`).
 ## Exits
 
 A CLI command refused by the control plane exits through `EXIT_FOR_ERROR` in `@crewhaus/control-contract`:
-the band 50-56 of `@crewhaus/errors`' `EXIT_CODES`. A `rejected` receipt exits 55.
+the band 50-56 of `@crewhaus/errors`' `EXIT_CODES`. A `rejected` receipt exits 55, or 38 when its outcome
+is `disabled`.
 
 ## Limits
 

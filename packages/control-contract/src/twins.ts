@@ -15,7 +15,7 @@ export type { CliTwin } from "./areas/types.js";
 /** Only the verbs a twin uses. */
 export const CLI_VERBS = deepFreeze({
   harness: ["list", "show"],
-  daemon: ["start", "stop", "restart", "drain"],
+  daemon: ["start", "stop", "restart", "drain", "pause", "resume", "disable", "enable"],
   approvals: ["show", "grant", "deny", "supersede", "rules", "revoke"],
   deploy: ["activate", "list"],
   people: [

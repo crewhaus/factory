@@ -52,7 +52,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan really reads the sources", () => {
-    expect(SOURCES.length).toBe(21);
+    expect(SOURCES.length).toBe(22);
     expect(imports.length).toBeGreaterThan(40);
     expect(imports.some((i) => i.path === "node:fs")).toBe(true);
     expect(imports.some((i) => i.path === "@crewhaus/tool-safety/fs")).toBe(true);
@@ -171,6 +171,7 @@ describe("what the package exports", () => {
         "withMutatingLease",
         "writeHarnessIdentity",
         "writeHeartbeat",
+        "writeOperatorRecord",
       ].sort(),
     );
   });

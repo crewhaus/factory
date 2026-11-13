@@ -103,7 +103,7 @@ import {
 import { type Scrubber, createEnvScrubber, scrubbableEnvKeys } from "./scrub";
 import type { SupervisedChild } from "./shutdown";
 import { type SpawnPlan, isSupervisedClass, loadEnvChain, runClassFor } from "./spawn-contracts";
-import { automaticSpecRefusal, decideStart } from "./start-decision";
+import { automaticSpecRefusal, decideStart, operatorRefusal } from "./start-decision";
 import {
   type LogPump,
   createLogPump,
@@ -193,6 +193,20 @@ export type StartResult =
        *  "preSpawn hook ok") — nothing to act on, but an operator who asked
        *  for a recompile deserves to be told it happened. */
       readonly prepared?: readonly string[];
+      /** Whether the operator record now says the harness should be running: set on a
+       *  person's start of a daemon when the head lends `recordDesired`. */
+      readonly desired?: "recorded" | "not-recorded";
+    }
+  | {
+      /** The operator record refuses starts: its operator disabled the harness, or the
+       *  record cannot be read. Nothing was planned, compiled or spawned. */
+      readonly ok: false;
+      readonly reason: "disabled";
+      readonly exitName: "disabled";
+      readonly cause: "disabled" | "unreadable";
+      readonly message: string;
+      /** A restart refused before it stopped anything: the daemon keeps running. */
+      readonly kept?: true;
     }
   | {
       readonly ok: false;
@@ -250,6 +264,9 @@ export type StopResult = {
   readonly reason?: "not-adopted";
   /** The live runfile, on `not-adopted`. */
   readonly runfile?: DaemonRunfile;
+  /** Whether the operator record now says the harness should stay stopped: set on an
+   *  operator's stop or drain when the head lends `recordDesired`. */
+  readonly desired?: "recorded" | "not-recorded";
 };
 
 export type SupervisorOptions = {
@@ -315,6 +332,16 @@ export type SupervisorOptions = {
      *  the head can decide, and record and activate nothing. */
     readonly decideOnly: boolean;
   }) => Promise<AdmitAnswer>;
+  /**
+   * Records whether the harness should be running, in its operator record, for the
+   * recovery that runs after a reboot. Awaited with `"running"` after a person's start
+   * of a daemon spawns it, and with `"stopped"` at an operator's stop or drain before
+   * anything is signalled. Never on an automatic start, a restart's own stop, a stop or
+   * drain that reached no daemon (`not-adopted`), or a stop of a child that is not a
+   * daemon. A failed write never blocks the start or the stop: it is reported once
+   * through `warn`.
+   */
+  readonly recordDesired?: (desired: "running" | "stopped") => Promise<{ readonly ok: boolean }>;
 };
 
 /** A head's answer to a person's start. */
@@ -1037,6 +1064,22 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     if (state === "running" || state === "starting" || starting) {
       return { ok: false, reason: "already-running" };
     }
+    // The operator record first, before any plan, compile or spawn: a harness its operator
+    // disabled does not start, whatever build it runs. An automatic start refused here
+    // arms no further restart.
+    const disabled = operatorRefusal(options.harnessDir);
+    if (disabled !== undefined) {
+      if (internal.automatic === true) {
+        lastExit = {
+          disposition: "crash",
+          title: "disabled by its operator; not restarted",
+          restartable: false,
+          unexpectedClean: false,
+        };
+        setState("stopped");
+      }
+      return disabled;
+    }
     // `crash-looping` is manual-start-only, and an operator calling start()
     // IS the manual start — only the automatic path is blocked, and it is
     // blocked by never scheduling a restart timer in that state.
@@ -1297,12 +1340,18 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         // for the exit of the run it was made against, not the next one.
         operatorStop = false;
         setState("running");
+        // A person started this daemon: after a reboot it should come back.
+        const desired =
+          internal.automatic !== true && plan.kind === "daemon"
+            ? await recordDesired("running")
+            : undefined;
         return {
           ok: true,
           runId: id,
           pid,
           ...(currentRoot !== undefined ? { root: currentRoot } : {}),
           ...(prepared.length > 0 ? { prepared } : {}),
+          ...(desired !== undefined ? { desired } : {}),
         };
       } catch (err) {
         return abandonStart(id, child, ledgerOpened, err);
@@ -1316,7 +1365,40 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     }
   };
 
-  const stop = async (stopOptions: { graceMs?: number } = {}): Promise<StopResult> => {
+  /**
+   * Record what the operator asked for in the operator record, through the head's seam.
+   * Never throws: a write that fails is reported once and answered `not-recorded`.
+   */
+  const recordDesired = async (
+    desired: "running" | "stopped",
+  ): Promise<"recorded" | "not-recorded" | undefined> => {
+    const seam = options.recordDesired;
+    if (seam === undefined) return undefined;
+    let ok = false;
+    try {
+      ok = (await seam(desired)).ok === true;
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      warn(
+        `the operator record could not be updated to say this harness should be ${desired}; a reboot may not ${desired === "running" ? "bring it back" : "leave it stopped"}`,
+      );
+    }
+    return ok ? "recorded" : "not-recorded";
+  };
+
+  const stop = (stopOptions: { graceMs?: number } = {}): Promise<StopResult> =>
+    stopRun(stopOptions, { record: true });
+
+  /**
+   * Stop the current run. `record` is false for a restart's own stop, whose start says
+   * what the operator wants.
+   */
+  const stopRun = async (
+    stopOptions: { graceMs?: number },
+    internal: { readonly record: boolean },
+  ): Promise<StopResult> => {
     // An operator stop always cancels a scheduled auto-restart — otherwise
     // the backoff timer would resurrect the daemon after the stop.
     cancelPendingRestart();
@@ -1337,8 +1419,22 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         // next start.
         clearRunfile(options.harnessDir);
       }
+      // An operator's stop of a harness that is not running: it should stay stopped.
+      const desired = internal.record ? await recordDesired("stopped") : undefined;
       setState("stopped");
-      return { stopped: true, forced: false };
+      return { stopped: true, forced: false, ...(desired !== undefined ? { desired } : {}) };
+    }
+    // Recorded before anything is signalled, so a crash between the two never leaves a
+    // daemon stopped by hand marked to come back after a reboot. A child that is not a
+    // daemon is not what the record is about.
+    const desired =
+      internal.record && (currentKind === undefined || currentKind === "daemon")
+        ? await recordDesired("stopped")
+        : undefined;
+    if (pid === undefined) {
+      // It exited while the record was written.
+      setState("stopped");
+      return { stopped: true, forced: false, ...(desired !== undefined ? { desired } : {}) };
     }
     const target = pid;
     operatorStop = true;
@@ -1356,7 +1452,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     }, stopOptions.graceMs ?? graceMs);
     await exited;
     clock.clearTimeout(handle);
-    return { stopped: true, forced };
+    return { stopped: true, forced, ...(desired !== undefined ? { desired } : {}) };
   };
 
   /** Resolve on the next `exit` event. */
@@ -1533,7 +1629,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         });
         if (refused !== undefined) return { ...refused, kept: true };
       }
-      await stop();
+      await stopRun({}, { record: false });
       return start(gateOptions);
     },
     drain: async (request, timeoutMs) => {
@@ -1542,8 +1638,16 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         if (existing !== undefined && verifyRunfile(existing, options.ops).live) {
           return { stopped: false, forced: false, reason: "not-adopted", runfile: existing };
         }
-        return { stopped: true, forced: false };
+        const desired = await recordDesired("stopped");
+        return { stopped: true, forced: false, ...(desired !== undefined ? { desired } : {}) };
       }
+      // Recorded before the control call, as a stop records before it signals.
+      const desired =
+        currentKind === undefined || currentKind === "daemon"
+          ? await recordDesired("stopped")
+          : undefined;
+      const recorded = desired !== undefined ? { desired } : {};
+      if (pid === undefined) return { stopped: true, forced: false, ...recorded };
       // Subscribe BEFORE the control call: a daemon that drains promptly can
       // exit inside `request()`, and a subscription taken afterwards would
       // wait forever for an event that already fired.
@@ -1556,7 +1660,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         // The daemon has no control.v1 (a 0.4.x bundle) or refused —
         // fall through to the signal path rather than hang.
         operatorStop = false;
-        return stop();
+        return { ...(await stopRun({}, { record: false })), ...recorded };
       }
       let deadlineHandle: unknown;
       const deadline = new Promise<"timeout">((resolve) => {
@@ -1566,9 +1670,9 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       clock.clearTimeout(deadlineHandle);
       if (outcome === "timeout") {
         operatorStop = true;
-        return stop();
+        return { ...(await stopRun({}, { record: false })), ...recorded };
       }
-      return { stopped: true, forced: false };
+      return { stopped: true, forced: false, ...recorded };
     },
     adopt,
     adoptIfRunfile,

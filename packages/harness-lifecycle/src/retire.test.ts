@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   RETIREMENT_LOG_FILENAME,
   RetireError,
+  type RetirePlanItem,
   type RetirementSteps,
   type StepOutcome,
   activePins,
@@ -45,6 +46,7 @@ function stubSteps(
     failTombstone?: boolean;
     failAudit?: boolean;
     failCompliance?: boolean;
+    failPre?: "cancelQueuedRuns" | "revokeConnections";
   } = {},
 ): {
   steps: RetirementSteps;
@@ -60,6 +62,19 @@ function stubSteps(
     return { step, ok: false, detail };
   };
   const steps: RetirementSteps = {
+    stopAndDisable: async () => ok("stopAndDisable"),
+    cancelQueuedRuns: async () =>
+      opts.failPre === "cancelQueuedRuns"
+        ? fail("cancelQueuedRuns", "a run is already running")
+        : ok("cancelQueuedRuns"),
+    expireDecisions: async () => ok("expireDecisions"),
+    revokeStandingRules: async () => ok("revokeStandingRules"),
+    revokeConnections: async () =>
+      opts.failPre === "revokeConnections"
+        ? fail("revokeConnections", "a revoker failed")
+        : ok("revokeConnections"),
+    recordLifecycle: async () => ok("recordLifecycle"),
+    archiveRegistryRow: async () => ok("archiveRegistryRow"),
     backupState: async () =>
       opts.failBackup === true
         ? fail("backupState", "disk full")
@@ -173,6 +188,7 @@ describe("runRetirement — real", () => {
       pins: {},
       force: false,
       pushKnowledge: true,
+      control: { daemonLive: false, stop: false, revokerItems: [] },
     });
     const { steps, calls } = stubSteps();
     const result = await runRetirement({
@@ -182,13 +198,36 @@ describe("runRetirement — real", () => {
       now: () => new Date("2026-07-02T00:00:00Z"),
     });
 
-    // order: backup → compliance → audit → knowledge → tombstone
+    // order: end what it could do → backup → compliance → audit → knowledge → tombstone
+    // → (archive) → record the retirement
     expect(calls).toEqual([
+      "stopAndDisable",
+      "cancelQueuedRuns",
+      "expireDecisions",
+      "revokeStandingRules",
+      "revokeConnections",
       "backupState",
       "complianceEvidence",
       "auditVerify",
       "pushKnowledge",
       "tombstoneRegistry",
+      "recordLifecycle",
+      "archiveRegistryRow",
+    ]);
+    expect(plan.steps).toEqual([
+      "stopAndDisable",
+      "cancelQueuedRuns",
+      "expireDecisions",
+      "revokeStandingRules",
+      "revokeConnections",
+      "backupState",
+      "complianceEvidence",
+      "auditVerify",
+      "pushKnowledge",
+      "tombstoneRegistry",
+      "archive",
+      "recordLifecycle",
+      "archiveRegistryRow",
     ]);
     // state moved into the archive + removed from the harness
     expect(result.removedState).toBe(true);
@@ -199,6 +238,9 @@ describe("runRetirement — real", () => {
     expect(log?.specName).toBe("concierge");
     expect(log?.archived).toBe(true);
     expect(log?.outcomes.map((o) => o.step)).toContain("archive");
+    const logged = log?.outcomes.map((o) => o.step) ?? [];
+    expect(logged.indexOf("archive")).toBeGreaterThan(-1);
+    expect(logged.indexOf("recordLifecycle")).toBeGreaterThan(logged.indexOf("archive"));
     expect(existsSync(join(archiveDir, RETIREMENT_LOG_FILENAME))).toBe(true);
     expect(formatRetirementResult(result).join("\n")).toContain("retired concierge");
   });
@@ -362,4 +404,140 @@ describe("runRetirement — real", () => {
       expect(existsSync(join(stateDir, "marker"))).toBe(true);
     },
   );
+});
+
+describe("a retire that ends what the harness could still do", () => {
+  type Control = { daemonLive?: boolean; stop?: boolean; revokerItems?: RetirePlanItem[] };
+  const options = (over: Control = {}) => ({
+    specName: "concierge",
+    harnessDir: root,
+    archiveDir: join(root, "archive"),
+    pins: {},
+    force: false,
+    pushKnowledge: false,
+    control: { daemonLive: false, stop: false, revokerItems: [], ...over },
+  });
+
+  test("a running daemon without --stop is refused before any step, dry run too", async () => {
+    mkdirSync(join(root, ".crewhaus"), { recursive: true });
+    const { calls } = stubSteps();
+    expect(() => buildRetirementPlan(options({ daemonLive: true }))).toThrow(
+      "Stop it first, or run `crewhaus retire --stop`",
+    );
+    expect(calls).toEqual([]);
+    expect(existsSync(join(root, "archive"))).toBe(false);
+    // With --stop the plan is made, and it stops before it disables.
+    const plan = buildRetirementPlan(options({ daemonLive: true, stop: true }));
+    expect(plan.steps[0]).toBe("stopAndDisable");
+    expect(formatPlan(plan).join("\n")).toContain("stop the daemon, then disable the harness");
+  });
+
+  test("a dry run lists every step and each revoker item, a manual one marked", async () => {
+    const plan = buildRetirementPlan(
+      options({
+        revokerItems: [
+          { kind: "delegation rules", status: "planned", note: "2 rules" },
+          { kind: "slack token", status: "manual" },
+        ],
+      }),
+    );
+    const { steps, calls } = stubSteps();
+    await runRetirement({ plan, steps, dryRun: true });
+    expect(calls).toEqual([]);
+    const text = formatPlan(plan).join("\n");
+    for (const step of plan.steps) expect(text).toContain(`${plan.steps.indexOf(step) + 1}. `);
+    expect(text).toContain("cancel its queued runs");
+    expect(text).toContain("revoke its standing rules");
+    expect(text).toContain("Home's lifecycle record");
+    expect(text).toContain("delegation rules — 2 rules");
+    expect(text).toContain("slack token (do this by hand)");
+    expect(text).not.toContain("none are registered here");
+    const bare = formatPlan(buildRetirementPlan(options())).join("\n");
+    expect(bare).toContain("Connections: none are registered here.");
+  });
+
+  test("a failed pre-step aborts before the archive and leaves the state; the line names enable", async () => {
+    const stateDir = join(root, ".crewhaus");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, "marker"), "x");
+    const plan = buildRetirementPlan(options());
+    const { steps, calls } = stubSteps({ failPre: "cancelQueuedRuns" });
+    const run = runRetirement({ plan, steps, dryRun: false });
+    await expect(run).rejects.toThrow(RetireError);
+    await expect(run).rejects.toThrow("crewhaus daemon enable");
+    expect(calls).toEqual(["stopAndDisable", "cancelQueuedRuns"]);
+    expect(existsSync(join(stateDir, "marker"))).toBe(true);
+    expect(readRetirementLog(join(root, "archive"))?.archived).toBe(false);
+  });
+
+  test("a failed revoker aborts, and --force-unverified lets it through", async () => {
+    const stateDir = join(root, ".crewhaus");
+    mkdirSync(stateDir, { recursive: true });
+    const refused = stubSteps({ failPre: "revokeConnections" });
+    await expect(
+      runRetirement({ plan: buildRetirementPlan(options()), steps: refused.steps, dryRun: false }),
+    ).rejects.toThrow("--force-unverified");
+    expect(refused.calls).not.toContain("backupState");
+    expect(existsSync(stateDir)).toBe(true);
+
+    const forced = stubSteps({ failPre: "revokeConnections" });
+    const result = await runRetirement({
+      plan: buildRetirementPlan(options()),
+      steps: forced.steps,
+      dryRun: false,
+      forceUnverified: true,
+    });
+    expect(result.removedState).toBe(true);
+    expect(forced.calls).toContain("archiveRegistryRow");
+  });
+});
+
+describe("a host that runs no control steps", () => {
+  test("its plan is the backup, evidence and archive alone, and runs as before", async () => {
+    mkdirSync(join(root, ".crewhaus"), { recursive: true });
+    const plan = buildRetirementPlan({
+      specName: "c",
+      harnessDir: root,
+      archiveDir: join(root, "archive"),
+      pins: {},
+      force: false,
+      pushKnowledge: false,
+    });
+    expect(plan.steps).toEqual([
+      "backupState",
+      "complianceEvidence",
+      "auditVerify",
+      "tombstoneRegistry",
+      "archive",
+    ]);
+    expect(formatPlan(plan).join("\n")).not.toContain("Connections");
+    const { steps, calls } = stubSteps();
+    const { stopAndDisable: _a, recordLifecycle: _b, ...legacy } = steps;
+    await runRetirement({ plan, steps: legacy, dryRun: false });
+    expect(calls).toEqual([
+      "backupState",
+      "complianceEvidence",
+      "auditVerify",
+      "tombstoneRegistry",
+    ]);
+  });
+
+  test("a plan with control steps and a host without them is refused before anything", async () => {
+    const plan = buildRetirementPlan({
+      specName: "c",
+      harnessDir: root,
+      archiveDir: join(root, "archive"),
+      pins: {},
+      force: false,
+      pushKnowledge: false,
+      control: { daemonLive: false, stop: false, revokerItems: [] },
+    });
+    const { steps, calls } = stubSteps();
+    const { stopAndDisable: _gone, ...partial } = steps;
+    await expect(runRetirement({ plan, steps: partial, dryRun: false })).rejects.toThrow(
+      "stopAndDisable",
+    );
+    expect(calls).toEqual([]);
+    expect(existsSync(join(root, "archive"))).toBe(false);
+  });
 });
