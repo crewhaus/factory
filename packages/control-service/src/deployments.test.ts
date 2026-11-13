@@ -1,5 +1,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CommandReceipt } from "@crewhaus/control-contract";
 import {
@@ -13,14 +21,18 @@ import { HARNESS_IDENTITY_REL } from "@crewhaus/harness-registry";
 import {
   NO_ACTIVE_BUILD_ACTIVATE_MESSAGE,
   buildDigest,
+  buildLinkMessage,
   verifyActiveBuild,
 } from "@crewhaus/harness-supervisor";
+import { specRevision } from "@crewhaus/ir/policy";
 import { AREA_RUNTIMES, activationGates } from "./areas";
 import {
+  ACTIVATION_RACED_MESSAGE,
   ROOT_BUNDLE_UNRECORDED_MESSAGE,
   activateDeployment,
   admitExplicitStart,
   ensureHarnessIdentity,
+  noSpecRevisionMessage,
   reconcileActivation,
   supersedeEarlier,
 } from "./deployments";
@@ -47,7 +59,10 @@ function harness(): string {
 }
 
 let seq = 0;
-async function prepare(dir: string, specHash = `sha256:${"b".repeat(64)}`): Promise<string> {
+async function prepare(
+  dir: string,
+  specHash: string | null = `sha256:${"b".repeat(64)}`,
+): Promise<string> {
   seq += 1;
   const id = `dep_01${String(seq).padStart(24, "0")}`;
   const taken = buildDigest(dir, { entry: "dist/daemon.ts" });
@@ -57,7 +72,7 @@ async function prepare(dir: string, specHash = `sha256:${"b".repeat(64)}`): Prom
     state: "prepared",
     artifact: {
       digest: taken.digest,
-      specHash,
+      ...(specHash !== null ? { specHash } : {}),
       compiledWith: "0.9.0",
       shape: "channel",
       entry: "dist/daemon.ts",
@@ -295,6 +310,333 @@ describe("activateDeployment", () => {
     });
     expect(answer.ok && answer.record["envChain"]).toMatchObject({ files: [".env"] });
     expect(JSON.stringify(readDeployments(dir))).not.toContain(secret);
+  });
+});
+
+function protectProd(dir: string, approvedFor: readonly string[]): void {
+  put(
+    dir,
+    ".crewhaus/environments.json",
+    JSON.stringify({ environments: { prod: { requireApproval: true } } }),
+  );
+  put(
+    dir,
+    ".crewhaus/approvals/demo__prod.json",
+    JSON.stringify(approvedFor.map((specHash) => ({ approver: "a", ts: "t", specHash }))),
+  );
+}
+
+describe("an activation acts only on the records it decided from", () => {
+  const B_HASH = `sha256:${"b".repeat(64)}`;
+  const A_HASH = `sha256:${"c".repeat(64)}`;
+
+  test("another activation landing after the read refuses this one, and running it again is gated", async () => {
+    const dir = harness();
+    protectProd(dir, [B_HASH]);
+    const a = await prepare(dir, A_HASH);
+    const b = await prepare(dir, B_HASH);
+    // A reads the records (nothing active, so no environment and no protected gate), then
+    // B activates into prod with its quorum before A's compare-and-set.
+    const landB: ActivationGate = {
+      name: "land-b-first",
+      check: async () => {
+        const landed = await activateDeployment({
+          harnessDir: dir,
+          dep: b,
+          actor: ACTOR,
+          cmd: CMD,
+          gates,
+          environment: "prod",
+        });
+        expect(landed.ok).toBe(true);
+        return { ok: true };
+      },
+    };
+    const answer = await activateDeployment({
+      harnessDir: dir,
+      dep: a,
+      actor: ACTOR,
+      cmd: CMD,
+      gates: [...gates, landB],
+    });
+    expect(answer).toMatchObject({
+      ok: false,
+      code: "conflict",
+      message: "another activation landed first; run it again",
+    });
+    expect(ACTIVATION_RACED_MESSAGE).toBe("another activation landed first; run it again");
+    expect(stateOf(dir, b)).toBe("active");
+    expect(stateOf(dir, a)).toBe("prepared");
+    // Run again, it decides from the records as they are: prod's quorum is needed.
+    const again = await activateDeployment({
+      harnessDir: dir,
+      dep: a,
+      actor: ACTOR,
+      cmd: CMD,
+      gates,
+    });
+    expect(again).toMatchObject({ ok: false, code: "conflict" });
+    expect(!again.ok && again.message).toContain('"prod" is a protected environment');
+    expect(stateOf(dir, b)).toBe("active");
+    expect(stateOf(dir, a)).toBe("prepared");
+  });
+
+  test("two activations that both read before either lands: one lands, the other refuses", async () => {
+    const dir = harness();
+    const first = await prepare(dir);
+    const second = await prepare(dir);
+    let arrived = 0;
+    let release: () => void = () => {};
+    const bothRead = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const barrier: ActivationGate = {
+      name: "barrier",
+      check: async () => {
+        arrived += 1;
+        if (arrived === 2) release();
+        await bothRead;
+        return { ok: true };
+      },
+    };
+    const answers = await Promise.all(
+      [first, second].map((dep) =>
+        activateDeployment({
+          harnessDir: dir,
+          dep,
+          actor: ACTOR,
+          cmd: CMD,
+          gates: [...gates, barrier],
+        }),
+      ),
+    );
+    expect(answers.filter((answer) => answer.ok)).toHaveLength(1);
+    expect(answers.find((answer) => !answer.ok)).toMatchObject({
+      code: "conflict",
+      message: ACTIVATION_RACED_MESSAGE,
+    });
+    const read = readDeployments(dir);
+    if (read.state !== "present") throw new Error("absent");
+    expect(read.records.filter((r) => r["state"] === "active")).toHaveLength(1);
+  });
+});
+
+describe("a protected activation binds to the spec revision the build names", () => {
+  for (const [name, specHash] of [
+    ["no spec revision", null],
+    ["an empty spec revision", ""],
+  ] as const) {
+    test(`a build with ${name} is refused for a protected environment; nothing moves`, async () => {
+      const dir = harness();
+      // An approval recorded for an empty revision counts for nothing.
+      protectProd(dir, [""]);
+      const dep = await prepare(dir, specHash);
+      const before = readDeployments(dir);
+      const answer = await activateDeployment({
+        harnessDir: dir,
+        dep,
+        actor: ACTOR,
+        cmd: CMD,
+        gates,
+        environment: "prod",
+      });
+      expect(answer).toMatchObject({
+        ok: false,
+        code: "conflict",
+        message: noSpecRevisionMessage("prod"),
+        verb: "crewhaus compile",
+      });
+      expect(noSpecRevisionMessage("prod")).toBe(
+        'This build names no spec revision, so an approval for "prod" can\'t bind to it. Run crewhaus compile, then crewhaus deploy activate.',
+      );
+      expect(readDeployments(dir)).toEqual(before);
+    });
+  }
+
+  test("replacing a protected environment's build, and a start into it, refuse the same way", async () => {
+    const dir = harness();
+    protectProd(dir, [`sha256:${"b".repeat(64)}`]);
+    const inProd = await prepare(dir);
+    expect(
+      (
+        await activateDeployment({
+          harnessDir: dir,
+          dep: inProd,
+          actor: ACTOR,
+          cmd: CMD,
+          gates,
+          environment: "prod",
+        })
+      ).ok,
+    ).toBe(true);
+    const unnamed = await prepare(dir, null);
+    const elsewhere = await activateDeployment({
+      harnessDir: dir,
+      dep: unnamed,
+      actor: ACTOR,
+      cmd: CMD,
+      gates,
+      environment: "staging",
+    });
+    expect(elsewhere).toMatchObject({ ok: false, message: noSpecRevisionMessage("prod") });
+    const started = await activateDeployment({
+      harnessDir: dir,
+      dep: unnamed,
+      actor: ACTOR,
+      cmd: CMD,
+      gates: "not-run",
+    });
+    expect(started).toMatchObject({ ok: false, message: noSpecRevisionMessage("prod") });
+    expect(stateOf(dir, inProd)).toBe("active");
+    expect(stateOf(dir, unnamed)).toBe("prepared");
+  });
+
+  test("an unprotected environment takes a build with no spec revision", async () => {
+    const dir = harness();
+    const dep = await prepare(dir, null);
+    expect(
+      (
+        await activateDeployment({
+          harnessDir: dir,
+          dep,
+          actor: ACTOR,
+          cmd: CMD,
+          gates,
+          environment: "staging",
+        })
+      ).ok,
+    ).toBe(true);
+  });
+});
+
+describe("a start's record names only the spec revision its build came from", () => {
+  function artifactOfActive(dir: string): Record<string, unknown> {
+    const read = readDeployments(dir);
+    if (read.state !== "present") throw new Error("absent");
+    return read.active?.["artifact"] as Record<string, unknown>;
+  }
+  const stamp = (specHash: string) =>
+    JSON.stringify({ name: "crewhaus-compiled-bundle", crewhaus: { specHash } });
+
+  test("a bundle stamped with the saved spec's revision: the record names it", async () => {
+    const dir = harness();
+    put(dir, "dist/package.json", stamp(specRevision(SPEC)));
+    expect((await admitExplicitStart(dir, "channel", { head: "home", actor: ACTOR })).ok).toBe(
+      true,
+    );
+    expect(artifactOfActive(dir)["specHash"]).toBe(specRevision(SPEC));
+  });
+
+  test("a bundle stamped from another spec, or not stamped: the record names none", async () => {
+    for (const manifest of [stamp(specRevision("name: other\n")), undefined]) {
+      const dir = harness();
+      if (manifest !== undefined) put(dir, "dist/package.json", manifest);
+      expect((await admitExplicitStart(dir, "channel", { head: "home", actor: ACTOR })).ok).toBe(
+        true,
+      );
+      expect(artifactOfActive(dir)["specHash"]).toBeUndefined();
+      expect(artifactOfActive(dir)["digest"]).toMatch(/^sha256:/);
+    }
+  });
+});
+
+describe("a build runs from regular files only", () => {
+  function linked(dir: string): void {
+    const outside = mkdtempSync(join(tmpdir(), "cs-link-"));
+    put(outside, "lib.ts", "// elsewhere\n");
+    symlinkSync(join(outside, "lib.ts"), join(dir, "dist/lib.ts"));
+  }
+
+  test("a start does not record a build holding a link; it names the link", async () => {
+    const dir = harness();
+    linked(dir);
+    const answer = await admitExplicitStart(dir, "channel", { head: "home", actor: ACTOR });
+    expect(answer).toEqual({ ok: false, message: buildLinkMessage("dist/lib.ts") });
+    expect(readDeployments(dir).state).toBe("absent");
+  });
+
+  test("a prepared record of a build holding a link is never activated by a start", async () => {
+    const dir = harness();
+    linked(dir);
+    const compiled = await prepare(dir);
+    const answer = await admitExplicitStart(dir, "channel", {
+      head: "home",
+      actor: ACTOR,
+      ledgerAbsent: true,
+    });
+    expect(answer).toEqual({ ok: false, message: buildLinkMessage("dist/lib.ts") });
+    expect(stateOf(dir, compiled)).toBe("prepared");
+  });
+
+  test("an active build holding a link: Home's start is told which link", async () => {
+    const dir = harness();
+    linked(dir);
+    const dep = await prepare(dir);
+    expect(
+      (await activateDeployment({ harnessDir: dir, dep, actor: ACTOR, cmd: CMD, gates })).ok,
+    ).toBe(true);
+    const answer = await admitExplicitStart(dir, "channel", { head: "home", actor: ACTOR });
+    expect(answer).toEqual({ ok: false, message: buildLinkMessage("dist/lib.ts") });
+  });
+});
+
+describe("a start asked to decide only writes nothing", () => {
+  test("no records: it would record and activate, and nothing is written", async () => {
+    const dir = harness();
+    const answer = await admitExplicitStart(dir, "channel", {
+      head: "home",
+      actor: ACTOR,
+      decideOnly: true,
+    });
+    expect(answer).toEqual({ ok: true });
+    expect(readDeployments(dir).state).toBe("absent");
+    expect(existsSync(join(dir, ".crewhaus"))).toBe(false);
+  });
+
+  test("its refusals are the start's: a link, a root bundle, a changed build from Home", async () => {
+    const linkedDir = harness();
+    const outside = mkdtempSync(join(tmpdir(), "cs-link-"));
+    put(outside, "lib.ts", "x\n");
+    symlinkSync(join(outside, "lib.ts"), join(linkedDir, "dist/lib.ts"));
+    expect(
+      await admitExplicitStart(linkedDir, "channel", {
+        head: "home",
+        actor: ACTOR,
+        decideOnly: true,
+      }),
+    ).toEqual({ ok: false, message: buildLinkMessage("dist/lib.ts") });
+
+    const root = tempDir();
+    put(root, "crewhaus.yaml", "name: demo\ntarget: cli\n");
+    put(root, "agent.ts", "// compiled with -o .\n");
+    put(root, "package.json", JSON.stringify({ name: "crewhaus-compiled-bundle" }));
+    expect(
+      await admitExplicitStart(root, "cli", { head: "cli-direct", actor: ACTOR, decideOnly: true }),
+    ).toEqual({ ok: false, message: ROOT_BUNDLE_UNRECORDED_MESSAGE });
+
+    const changed = harness();
+    const dep = await prepare(changed);
+    await activateDeployment({ harnessDir: changed, dep, actor: ACTOR, cmd: CMD, gates });
+    put(changed, "dist/daemon.ts", "// recompiled\n");
+    const before = readDeployments(changed);
+    expect(
+      (
+        await admitExplicitStart(changed, "channel", {
+          head: "home",
+          actor: ACTOR,
+          decideOnly: true,
+        })
+      ).ok,
+    ).toBe(false);
+    // The CLI would record and activate it: decided, not done.
+    expect(
+      await admitExplicitStart(changed, "channel", {
+        head: "cli-direct",
+        actor: ACTOR,
+        decideOnly: true,
+      }),
+    ).toEqual({ ok: true });
+    expect(readDeployments(changed)).toEqual(before);
   });
 });
 

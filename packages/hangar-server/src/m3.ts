@@ -101,11 +101,11 @@
  * back through the spec write path above.
  */
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
-import type { JobQueue, JobRecord } from "@crewhaus/harness-supervisor";
+import type { JobRecord } from "@crewhaus/harness-supervisor";
 import { type CallerVerdict, TAB_ONLY_MESSAGE, permissionMessage } from "./access";
 import type { ControlClient } from "./control-client";
 import { HttpError } from "./http";
-import type { HarnessProcess } from "./process";
+import type { HarnessProcess, HomeJobQueue } from "./process";
 
 /** Path params, already validated by the dispatcher. */
 export type M3Params = Readonly<Record<string, string>>;
@@ -127,8 +127,8 @@ export type M3Context = {
   /** The harness's live directory, or null on a fleet-wide route. Present
    *  implies it exists (a vanished dir 404s before the handler runs). */
   readonly harnessDir: string | null;
-  /** True when the harness is adopted on this machine (`isAdopted` over its
-   *  registry row). Only an adopted harness's own code checks its spec. */
+  /** True when the harness was adopted with `crewhaus harness adopt` on this machine (its
+   *  registry row carries `home`). Only then does the harness's own code check its spec. */
   readonly adopted: boolean;
   /** Validated `:param` values from the path. */
   readonly params: M3Params;
@@ -168,12 +168,17 @@ export type M3Context = {
   readonly process: () => Promise<HarnessProcess>;
   /** The `crewhaus.control.v1` proxy — never returns the bearer. */
   readonly control: ControlClient;
-  /** The durable job queue: the ONLY sanctioned way to run a CLI verb. */
-  readonly jobs: JobQueue;
+  /** The durable job queue: the ONLY sanctioned way to run a CLI verb. Every submission
+   *  is checked where the job runs first (see `submitJob`). */
+  readonly jobs: HomeJobQueue;
   /** Submit a CLI job. `kind` is a display/lock key (`isReadOnlyJob` decides
    *  whether it takes the harness mutex); `argv` must come from the module's
-   *  own closed vocabulary, never from the request body verbatim. */
+   *  own closed vocabulary, never from the request body verbatim. A job whose directory
+   *  holds the home directory needs `workspace.holds-home` in the request's
+   *  `acknowledge`, for this job; otherwise it throws `JobRefusedError`, answered 409. */
   readonly submitJob: (kind: string, argv: readonly string[]) => JobRecord;
+  /** Throw the refusal `submitJob` would, before a handler writes anything its job needs. */
+  readonly checkJob: () => void;
   /** Warning sink — an honest degradation, never a thrown 500. */
   readonly warn: (message: string) => void;
 };

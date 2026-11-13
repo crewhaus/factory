@@ -105,16 +105,25 @@ import {
   signJwt,
 } from "../packages/gateway-server/src/index";
 import { groupPlan } from "../packages/hangar-server/src/group-ops";
+import {
+  absolutePathEnv,
+  homeCrewhausArgv,
+  jobCrewhausBin,
+} from "../packages/hangar-server/src/process";
 import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import {
   BUILD_NOT_ACTIVE_MESSAGE,
   LOADER_ENV_KEYS,
+  SPEC_NOT_ACTIVE_MESSAGE,
   TERMINAL_EXIT_CODES,
   buildSpawnEnv,
   buildSpawnPlan,
   createHarnessSupervisor,
+  evaluateGate,
+  loadEnvChain,
   resolveBundle,
+  verifyActiveBuild,
 } from "../packages/harness-supervisor/src/index";
 import { writeSupervisionRecord } from "../packages/harness-supervisor/src/runfiles";
 import { resolveCrewhausBin } from "../packages/harness-supervisor/src/spawn-contracts";
@@ -124,6 +133,7 @@ import {
   createFakeProcessOps,
 } from "../packages/harness-supervisor/src/testkit";
 import type { IrChannelV0, IrManagedV0 } from "../packages/ir/src/index";
+import { stdioLaunch } from "../packages/mcp-host/src/client";
 import { _setCompactSeamsForTest, createMemoryStore } from "../packages/memory-store/src/index";
 import {
   type RuleSet,
@@ -133,7 +143,7 @@ import {
   evaluateWithReason,
   loadSettingsRules,
 } from "../packages/permission-engine/src/index";
-import { runPreflight } from "../packages/preflight/src/index";
+import { buildReport, runPreflight, workspaceItems } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
 import { requiredClassFor } from "../packages/runtime-core/src/decision-binding";
 import {
@@ -1325,7 +1335,10 @@ describe("the release notes name every change a harness without provability: see
     const runtime = readFileSync(join(ROOT, "packages/runtime-core/src/index.ts"), "utf8");
     expect(runtime.includes("  reportWorkspaceHoldsHome();\n")).toBe(true);
     const later = defaultOnBullets(changelog, LATER_HEADINGS);
-    const bullet = later.find((b) => b.includes("`workspace.holds-home`")) ?? "";
+    // Narrowed on purpose: a later bullet names `workspace.holds-home` for Home's jobs.
+    const bullet =
+      later.find((b) => b.includes("`workspace.holds-home`") && b.includes("`[workspace]`")) ?? "";
+    expect(bullet).not.toBe("");
     expect(bullet).toContain("`[workspace]`");
   });
 
@@ -2991,6 +3004,205 @@ describe("the release notes name what guarded spec writes change for every harne
     const bullet = bulletFor("only when it resolves inside the harness");
     expect(bullet).toContain("`node_modules/.bin/crewhaus`");
     expect(bullet).toContain("`crewhaus` on `PATH`");
+  });
+});
+
+describe("the release notes name what checking before acting changes for every harness", () => {
+  const read = (rel: string): string => readFileSync(join(ROOT, rel), "utf8");
+  const count = (text: string, needle: string): number => text.split(needle).length - 1;
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+  const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+  const tempHarness = (prefix: string, target: string): string => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(join(dir, "crewhaus.yaml"), `name: demo\ntarget: ${target}\n`);
+    writeFileSync(join(dir, "dist", target === "cli" ? "agent.ts" : "daemon.ts"), "// bundle\n");
+    return dir;
+  };
+
+  test("a restart decides before it stops, and a refused one leaves the daemon running", async () => {
+    const supervisor = read("packages/harness-supervisor/src/supervisor.ts");
+    const restart = supervisor.slice(supervisor.indexOf("restart: async (gateOptions) =>"));
+    expect(supervisor.indexOf("restart: async (gateOptions) =>")).toBeGreaterThan(-1);
+    expect(restart.indexOf("await decideStart({")).toBeGreaterThan(-1);
+    expect(restart.indexOf("await stop();")).toBeGreaterThan(
+      restart.indexOf("await decideStart({"),
+    );
+    const dir = tempHarness("crewhaus-default-on-restart-", "channel");
+    try {
+      activateBuildForTest(dir, "dist/daemon.ts");
+      mkdirSync(join(dir, "home"));
+      const clock = createFakeClock();
+      const ops = createFakeProcessOps({ now: clock.now });
+      const supervised = createHarnessSupervisor({
+        harnessDir: dir,
+        target: "channel",
+        ops,
+        clock,
+        gate: async (options) =>
+          evaluateGate(buildReport(workspaceItems(dir, { HOME: join(dir, "home") })), options),
+        plan: () => buildSpawnPlan({ harnessDir: dir, target: "channel", processEnv: {} }),
+      });
+      expect((await supervised.start({ acknowledge: ["workspace.holds-home"] })).ok).toBe(true);
+      const refused = await supervised.restart();
+      expect(refused).toMatchObject({ ok: false, reason: "preflight-blocked", kept: true });
+      expect(ops.children).toHaveLength(1);
+      expect(ops.last()?.signals).toEqual([]);
+      supervised.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("A restart that would be refused leaves the daemon running");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("`crewhaus daemon restart`");
+    expect(bullet).toContain("Home's Restart");
+  });
+
+  test("an automatic restart of a launch that runs the saved spec runs only the active one", async () => {
+    const supervisor = read("packages/harness-supervisor/src/supervisor.ts");
+    expect(count(supervisor, "automaticSpecRefusal(options.harnessDir, plan.specPath)")).toBe(1);
+    const at = supervisor.indexOf("automaticSpecRefusal(options.harnessDir, plan.specPath)");
+    expect(supervisor.slice(at - 120, at)).toContain("if (internal.automatic === true) {");
+    const dir = tempHarness("crewhaus-default-on-spec-", "cli");
+    try {
+      const spec = "name: demo\ntarget: cli\n";
+      activateBuildForTest(dir, "dist/agent.ts", { specHash: specRev(spec) });
+      const clock = createFakeClock();
+      const ops = createFakeProcessOps({ now: clock.now });
+      const supervised = createHarnessSupervisor({
+        harnessDir: dir,
+        target: "cli",
+        ops,
+        clock,
+        // Marked supervised, so its crash schedules the automatic start.
+        plan: () => ({
+          ...buildSpawnPlan({
+            harnessDir: dir,
+            target: "cli",
+            processEnv: {},
+            crewhausBin: "/bin/crewhaus",
+          }),
+          supervised: true,
+        }),
+      });
+      expect((await supervised.start()).ok).toBe(true);
+      writeFileSync(join(dir, "crewhaus.yaml"), `${spec}# edited\n`);
+      ops.last()?.exit(EXIT_CODES.tool);
+      await tick();
+      clock.advance(30_000);
+      await tick();
+      expect(ops.children).toHaveLength(1);
+      expect(supervised.snapshot().refusal?.message).toBe(SPEC_NOT_ACTIVE_MESSAGE);
+      supervised.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("an automatic restart of `crewhaus run`");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("`crewhaus deploy activate`");
+  });
+
+  test("Home checks where each job runs before it enqueues it", () => {
+    const processLayer = read("packages/hangar-server/src/process.ts");
+    const checked = processLayer.indexOf("const refused = workspaceItems(");
+    expect(checked).toBeGreaterThan(-1);
+    const submit = processLayer.indexOf("return queue.submit(input);");
+    expect(submit).toBeGreaterThan(checked);
+    const before = processLayer.slice(submit - 200, submit);
+    expect(before).toContain("check({");
+    expect(before).toContain("harnessDir: input.harnessDir,");
+    const bullet = bulletFor("A Home job in a directory that holds the home directory");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("`workspace.holds-home`");
+  });
+
+  test("Home runs a harness's own code for its jobs only after it is adopted", () => {
+    const local = join("/h", "node_modules", ".bin", "crewhaus");
+    const deps = {
+      exists: (p: string) => p === local,
+      realpath: (p: string) => (p === local ? "/h/node_modules/crewhaus/cli.js" : p),
+      which: () => "/usr/local/bin/crewhaus",
+    };
+    // Registered before adoption began, never adopted: counted for a group start only.
+    const grandfathered = {
+      list: () => [{ dir: "/h", registeredAt: "2026-08-01T00:00:00.000Z" } as never],
+      adoptionSince: () => "2026-09-01T00:00:00.000Z",
+    };
+    expect(jobCrewhausBin(grandfathered, "/h", deps)).toEqual(["/usr/local/bin/crewhaus"]);
+    const home = ["/opt/bun", "--no-env-file", "--config=/dev/null", "/opt/crewhaus/index.js"];
+    expect(jobCrewhausBin(grandfathered, "/h", deps, home)).toEqual(home);
+    expect(
+      homeCrewhausArgv({ execPath: "/opt/bun", main: home[3] as string, emptyConfig: "/dev/null" }),
+    ).toEqual(home);
+    const adopted = {
+      list: () => [
+        {
+          dir: "/h",
+          registeredAt: "2026-08-01T00:00:00.000Z",
+          home: { adoptedAt: "t", by: "x" },
+        } as never,
+      ],
+    };
+    expect(jobCrewhausBin(adopted, "/h", deps, home)).toEqual([local]);
+    expect(absolutePathEnv({ PATH: "node_modules/.bin:/usr/bin" })).toEqual({ PATH: "/usr/bin" });
+    const bullet = bulletFor("Home's jobs and spec checks use");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("`crewhaus harness adopt`");
+    expect(bullet).toContain("`bunfig.toml`");
+  });
+
+  test("a supervised daemon's environment is the manager's filtered chain of Bun's files", () => {
+    const dir = tempHarness("crewhaus-default-on-env-", "channel");
+    try {
+      for (const name of [".env", ".env.development", ".env.production", ".env.local"]) {
+        writeFileSync(join(dir, name), `FROM=${name}\n`);
+      }
+      const plan = buildSpawnPlan({ harnessDir: dir, target: "channel", processEnv: {} });
+      expect(plan.argv[1]).toBe("--no-env-file");
+      expect(stdioLaunch("bun", ["server.ts"]).args).toEqual(["--no-env-file", "server.ts"]);
+      writeFileSync(join(dir, ".env.test"), "BUN_OPTIONS=--preload ./x.ts\n");
+      const spawn = buildSpawnEnv({
+        harnessRoot: dir,
+        managerCwd: dir,
+        processEnv: { BUN_OPTIONS: "--preload ./y.ts" },
+      });
+      expect(spawn.env["BUN_OPTIONS"]).toBeUndefined();
+      expect(loadEnvChain(dir, { sharedFiles: [] }).files).toEqual([
+        ".env",
+        ".env.development",
+        ".env.local",
+      ]);
+      expect(loadEnvChain(dir, { sharedFiles: [], nodeEnv: "production" }).files).toEqual([
+        ".env",
+        ".env.production",
+        ".env.local",
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("A supervised daemon's environment comes only from the manager");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("`.env.<mode>`");
+    expect(bullet).toContain("`NODE_ENV`");
+    expect(bullet).toContain("`bunx`");
+  });
+
+  test("a build holding a link is refused, naming it", () => {
+    const dir = tempHarness("crewhaus-default-on-link-", "channel");
+    try {
+      writeFileSync(join(dir, "elsewhere.ts"), "// elsewhere\n");
+      symlinkSync(join(dir, "elsewhere.ts"), join(dir, "dist", "lib.ts"));
+      activateBuildForTest(dir, "dist/daemon.ts");
+      expect(verifyActiveBuild(dir, "channel")).toMatchObject({ ok: false, reason: "link" });
+      const check = verifyActiveBuild(dir, "channel");
+      expect(!check.ok && check.message).toContain("dist/lib.ts");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("A build runs from regular files only");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("`crewhaus compile`");
   });
 });
 

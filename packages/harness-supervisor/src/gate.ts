@@ -129,7 +129,9 @@ export async function runPreflightGate(options: RunGateOptions): Promise<GateDec
     // The directory the spawn runs in: `buildSpawnPlan` resolves the same root.
     harnessDir: findHarnessRoot(options.harnessDir),
     env: options.env,
-    envFiles: options.envFiles ?? loadEnvChain(options.harnessDir).refs,
+    envFiles:
+      options.envFiles ??
+      loadEnvChain(options.harnessDir, { nodeEnv: options.env["NODE_ENV"] }).refs,
     hooks: options.hooks ?? harnessHookDisclosures(options.harnessDir),
     ...(options.compileWarnings !== undefined ? { compileWarnings: options.compileWarnings } : {}),
     ...(options.ports !== undefined ? { ports: options.ports } : {}),

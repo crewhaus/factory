@@ -22,9 +22,15 @@ import type { Clock } from "./types";
 export function activateBuildForTest(
   harnessDir: string,
   entry: string,
-  options: { readonly id?: string; readonly specHash?: string; readonly at?: string } = {},
+  options: {
+    readonly id?: string;
+    readonly specHash?: string;
+    readonly at?: string;
+    readonly bootInputs?: readonly string[];
+  } = {},
 ): { readonly id: string; readonly digest: string } {
-  const taken = buildDigest(harnessDir, { entry });
+  const bootInputs = [...(options.bootInputs ?? [])];
+  const taken = buildDigest(harnessDir, { entry, bootInputs });
   if ("unreadable" in taken) throw new Error(taken.unreadable);
   const id = options.id ?? "dep_01testtesttesttesttesttest";
   const record = {
@@ -36,7 +42,7 @@ export function activateBuildForTest(
       compiledWith: "0.0.0-test",
       shape: "test",
       entry,
-      bootInputs: [],
+      bootInputs,
     },
     policyRevision: `sha256:${"0".repeat(64)}`,
   };

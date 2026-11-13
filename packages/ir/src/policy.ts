@@ -55,6 +55,18 @@ export function specRevision(text: string): string {
   return `sha256:${sha256Hex(normalized)}`;
 }
 
+const REVISION_RE = /^sha256:[0-9a-f]{64}$/;
+
+/**
+ * Whether two revisions name the same content: true only when both are well-formed
+ * (`sha256:` and 64 lowercase hex digits) and equal. A missing or malformed revision never
+ * counts as equal, not even to another missing one. The one comparison for a spec revision,
+ * a policy revision and an intent digest.
+ */
+export function sameRevision(a: unknown, b: unknown): boolean {
+  return typeof a === "string" && typeof b === "string" && REVISION_RE.test(a) && a === b;
+}
+
 /** The digest of a spec's `intent:` block, or `undefined` when the spec has none. */
 export function intentDigest(block: unknown): string | undefined {
   if (block === undefined) return undefined;

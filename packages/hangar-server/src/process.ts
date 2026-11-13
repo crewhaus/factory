@@ -40,14 +40,14 @@
  *     supervisor holds no pid.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { type LeaseHolder, type LeaseOptions, withMutatingLease } from "@crewhaus/control-records";
 import { admitExplicitStart } from "@crewhaus/control-service";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import {
   type HangarHarnessEntry,
   type HangarRegistry,
-  isAdopted,
+  runsOwnCode,
 } from "@crewhaus/harness-registry";
 import {
   type BinResolverDeps,
@@ -63,6 +63,7 @@ import {
   type ProcessOps,
   type SpawnPlan,
   SpawnPlanError,
+  type SubmitInput,
   type SupervisorEvent,
   type SupervisorSnapshot,
   buildSpawnPlan,
@@ -74,6 +75,7 @@ import {
   createPrepareRunner,
   createProcessOps,
   ensureRunDir,
+  homeCrewhausArgv,
   isReadOnlyJob,
   processOpsChild,
   readManagerSettings,
@@ -86,6 +88,7 @@ import {
   systemClock,
   writeRunfile,
 } from "@crewhaus/harness-supervisor";
+import { type PreflightItem, workspaceItems } from "@crewhaus/preflight";
 import { knownControlPort, parseControlPort } from "./control-client";
 import { mergedSpawnEnv } from "./env-file";
 import { currentCommand } from "./receipts";
@@ -107,6 +110,9 @@ export {
   type JobOptions,
 } from "@crewhaus/harness-supervisor/job-kinds";
 
+/** How Home runs its own `crewhaus` for a job (from `@crewhaus/harness-supervisor`). */
+export { homeCrewhausArgv };
+
 export type ProcessLayerOptions = {
   readonly registry: HangarRegistry;
   /** The manager's own environment — the base layer of every spawn env. */
@@ -116,6 +122,12 @@ export type ProcessLayerOptions = {
   /** Where the durable job ledger lives (`<hangarRoot>/jobs.jsonl`). */
   readonly hangarRoot: string;
   readonly managerVersion: string;
+  /**
+   * The argv that runs this Home's own `crewhaus` (see {@link homeCrewhausArgv}): what a job
+   * runs for a harness that does not run its own code. Without it, such a job runs the
+   * `crewhaus` on `PATH`.
+   */
+  readonly homeCrewhaus?: readonly string[];
   /** Injected in tests — the fake never spawns anything. */
   readonly ops?: ProcessOps;
   readonly clock?: Clock;
@@ -162,6 +174,35 @@ export type HarnessProcess = {
   close(): void;
 };
 
+/** A Home job's submission: the queue's, plus the acknowledgements for this one job. */
+export type HomeJobInput = SubmitInput & {
+  /** Preflight item ids acknowledged for this job only. Never stored. */
+  readonly acknowledge?: readonly string[];
+};
+
+/** The job queue as Home submits to it: every submission is checked first. */
+export type HomeJobQueue = Omit<JobQueue, "submit"> & {
+  /**
+   * Enqueue a job, after the check a start makes of where it runs: a directory that holds
+   * the home directory needs `workspace.holds-home` in `acknowledge`, for this job, or
+   * {@link JobRefusedError} is thrown and nothing is enqueued. The acknowledgement is not
+   * kept: the job's record carries no trace of it, and the next job asks again.
+   */
+  submit(input: HomeJobInput): JobRecord;
+  /** Throw the refusal {@link HomeJobQueue.submit} would for these fields, enqueuing nothing. */
+  check(input: Pick<HomeJobInput, "harnessDir" | "acknowledge">): void;
+};
+
+/** A Home job refused before it was enqueued, carrying the preflight item that refused it. */
+export class JobRefusedError extends Error {
+  override readonly name = "JobRefusedError";
+  readonly item: PreflightItem;
+  constructor(item: PreflightItem) {
+    super(item.message);
+    this.item = item;
+  }
+}
+
 export type ProcessLayer = {
   /** The (memoized) supervision handle for a registered harness. */
   get(entry: HangarHarnessEntry): HarnessProcess;
@@ -180,7 +221,7 @@ export type ProcessLayer = {
    * nothing is adopted, so enumerating is never how a daemon gets picked up.
    */
   held(): readonly HarnessProcess[];
-  readonly jobs: JobQueue;
+  readonly jobs: HomeJobQueue;
   /** Adopt every registered harness, then restore the job queue. */
   boot(): Promise<{ readonly adopted: number; readonly lost: number; readonly jobs: number }>;
   close(): void;
@@ -241,12 +282,13 @@ export const LEASE_REF_ENV = "CREWHAUS_LEASE_REF";
  *  and is signalled explicitly through it. */
 export function defaultJobRunner(
   ops: ProcessOps,
-  harnessBin: (dir: string) => string | undefined,
+  harnessBin: (dir: string) => string | readonly string[] | undefined,
   lease: Omit<LeaseOptions, "probe"> = {},
 ): JobRunner {
   return async (job: JobRecord, ctx: JobRunContext) => {
-    const bin = harnessBin(job.harnessDir);
-    if (bin === undefined) {
+    const found = harnessBin(job.harnessDir);
+    const bin = typeof found === "string" ? [found] : found;
+    if (bin === undefined || bin.length === 0) {
       return { error: "no resolvable `crewhaus` CLI (harness node_modules/.bin, then PATH)" };
     }
     ensureRunDir(job.harnessDir);
@@ -268,19 +310,36 @@ export function defaultJobRunner(
   };
 }
 
+/**
+ * A job's environment with every `PATH` entry that is not absolute left out, so a command
+ * the job (or what it starts) finds on `PATH` never depends on the directory it runs in.
+ */
+export function absolutePathEnv(env: Readonly<Record<string, string>>): Record<string, string> {
+  const out: Record<string, string> = { ...env };
+  const sep = process.platform === "win32" ? ";" : ":";
+  for (const key of Object.keys(out)) {
+    if (key.toUpperCase() !== "PATH") continue;
+    out[key] = (out[key] as string)
+      .split(sep)
+      .filter((dir) => dir !== "" && isAbsolute(dir))
+      .join(sep);
+  }
+  return out;
+}
+
 async function runJobChild(
   ops: ProcessOps,
-  bin: string,
+  bin: readonly string[],
   job: JobRecord,
   ctx: JobRunContext,
   leaseRef: string | undefined,
 ): Promise<{ exitCode?: number; error?: string }> {
   const logFile = runLogPath(job.harnessDir, job.jobId.replace(/^job_/, "run_"));
   const child = ops.spawn({
-    argv: [bin, ...job.argv],
+    argv: [...bin, ...job.argv],
     cwd: job.harnessDir,
     env: {
-      ...(mergedSpawnEnv(process.env, job.harnessDir).env as Record<string, string>),
+      ...absolutePathEnv(mergedSpawnEnv(process.env, job.harnessDir).env as Record<string, string>),
       ...(leaseRef !== undefined ? { [LEASE_REF_ENV]: leaseRef } : {}),
     },
     stdio: { mode: "file", path: logFile },
@@ -306,8 +365,10 @@ async function runJobChild(
       harnessDir: job.harnessDir,
       target: liveTarget(job.harnessDir) ?? "cli",
       ops,
-      env: mergedSpawnEnv(process.env, job.harnessDir).env as Record<string, string>,
-      crewhausBin: bin,
+      env: absolutePathEnv(
+        mergedSpawnEnv(process.env, job.harnessDir).env as Record<string, string>,
+      ),
+      crewhausBin: bin[0],
     },
     readManagerSettings(job.harnessDir).hooks.timeoutMs,
   );
@@ -321,18 +382,22 @@ async function runJobChild(
 }
 
 /**
- * The `crewhaus` a Home job runs for the harness at `dir`: the harness's own
- * (contained) copy when the harness is adopted on this machine, otherwise the
- * `crewhaus` on PATH. A directory with no registry row counts as not adopted.
+ * The `crewhaus` a Home job runs for the harness at `dir`, as an argv prefix: the harness's
+ * own (contained) copy when its row was adopted with `crewhaus harness adopt` on this
+ * machine; otherwise Home's own `crewhaus` (`home`, {@link homeCrewhausArgv}) when the host
+ * names it, else the `crewhaus` on PATH. A directory with no registry row is not adopted.
  */
 export function jobCrewhausBin(
-  registry: Pick<HangarRegistry, "list" | "adoptionSince">,
+  registry: Pick<HangarRegistry, "list">,
   dir: string,
   deps: Omit<BinResolverDeps, "allowHarnessLocal"> = {},
-): string | undefined {
+  home?: readonly string[],
+): readonly string[] | undefined {
   const entry = registry.list().find((row) => row.dir === dir);
-  const adopted = entry !== undefined && isAdopted(entry, registry.adoptionSince());
-  return resolveCrewhausBin(dir, { ...deps, allowHarnessLocal: adopted });
+  const ownCode = entry !== undefined && runsOwnCode(entry);
+  if (!ownCode && home !== undefined && home.length > 0) return [...home];
+  const bin = resolveCrewhausBin(dir, { ...deps, allowHarnessLocal: ownCode });
+  return bin === undefined ? undefined : [bin];
 }
 
 export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
@@ -342,12 +407,35 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
   const handles = new Map<string, HarnessProcess>();
 
   const store = options.jobStore ?? createFileJobStore(`${options.hangarRoot}/jobs.jsonl`);
-  const jobs = createJobQueue({
+  const queue = createJobQueue({
     store: options.wrapJobStore !== undefined ? options.wrapJobStore(store) : store,
-    run: options.runJob ?? defaultJobRunner(ops, (dir) => jobCrewhausBin(options.registry, dir)),
+    run:
+      options.runJob ??
+      defaultJobRunner(ops, (dir) =>
+        jobCrewhausBin(options.registry, dir, {}, options.homeCrewhaus),
+      ),
     now: options.now,
     ...(options.jobConcurrency !== undefined ? { concurrency: options.jobConcurrency } : {}),
   });
+  // The env `/proc/start`'s gate checks; an empty directory is the server's own.
+  const check: HomeJobQueue["check"] = ({ harnessDir, acknowledge }) => {
+    const acknowledged = new Set(acknowledge ?? []);
+    const refused = workspaceItems(harnessDir, mergedSpawnEnv(options.env, harnessDir).env).find(
+      (item) => item.id === "workspace.holds-home" && !acknowledged.has(item.id),
+    );
+    if (refused !== undefined) throw new JobRefusedError(refused);
+  };
+  const jobs: HomeJobQueue = {
+    ...queue,
+    check,
+    submit: ({ acknowledge, ...input }) => {
+      check({
+        harnessDir: input.harnessDir,
+        ...(acknowledge !== undefined ? { acknowledge } : {}),
+      });
+      return queue.submit(input);
+    },
+  };
 
   const build = (entry: HangarHarnessEntry): HarnessProcess => {
     const harnessDir = entry.dir;
@@ -383,12 +471,19 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       plan,
       // Home's Start, Restart and group start run only the active build (a harness with no
       // deployment record yet is recorded at its first start).
-      admit: async ({ harnessDir: dir, target: shape, entry: launched, ledgerAbsent }) => {
+      admit: async ({
+        harnessDir: dir,
+        target: shape,
+        entry: launched,
+        ledgerAbsent,
+        decideOnly,
+      }) => {
         const command = currentCommand();
         return admitExplicitStart(dir, shape, {
           head: "home",
           entry: launched,
           ledgerAbsent,
+          decideOnly,
           actor: command?.by ?? "sys:executor",
           registryId: entry.id,
           ...(command !== undefined ? { cmd: command.commandId } : {}),

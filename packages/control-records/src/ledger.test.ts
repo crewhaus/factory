@@ -366,6 +366,127 @@ describe("casAppend", () => {
     }
   });
 
+  test("a precondition that holds: the move applies", async () => {
+    const root = tempDir();
+    const ledger = deploymentsLedger(root, "deployment");
+    await casAppend(ledger, "dep_a", null, { state: "prepared" });
+    await casAppend(ledger, "dep_a", "prepared", { state: "active" });
+    await casAppend(ledger, "dep_b", null, { state: "prepared" });
+    const moved = await casAppend(
+      ledger,
+      "dep_b",
+      "prepared",
+      { state: "active" },
+      { inState: "active", exactly: [{ id: "dep_a", gen: 2 }] },
+    );
+    expect(moved).toMatchObject({ ok: true, applied: true, gen: 2 });
+    // None active, read as none active.
+    const empty = tempDir();
+    const fresh = deploymentsLedger(empty, "deployment");
+    await casAppend(fresh, "dep_a", null, { state: "prepared" });
+    expect(
+      await casAppend(
+        fresh,
+        "dep_a",
+        "prepared",
+        { state: "active" },
+        { inState: "active", exactly: [] },
+      ),
+    ).toMatchObject({ applied: true });
+  });
+
+  test("a precondition the ledger no longer holds: nothing claimed, nothing appended", async () => {
+    const cases: Array<{
+      readonly name: string;
+      readonly exactly: readonly { readonly id: string; readonly gen: number }[];
+    }> = [
+      { name: "a listed id at another generation", exactly: [{ id: "dep_a", gen: 1 }] },
+      {
+        name: "an active id the read did not see",
+        exactly: [],
+      },
+      {
+        name: "a listed id that is no longer active",
+        exactly: [
+          { id: "dep_a", gen: 2 },
+          { id: "dep_c", gen: 2 },
+        ],
+      },
+      {
+        name: "an id listed twice",
+        exactly: [
+          { id: "dep_a", gen: 2 },
+          { id: "dep_a", gen: 2 },
+        ],
+      },
+    ];
+    for (const { name, exactly } of cases) {
+      const root = tempDir();
+      const ledger = deploymentsLedger(root, "deployment");
+      await casAppend(ledger, "dep_a", null, { state: "prepared" });
+      await casAppend(ledger, "dep_a", "prepared", { state: "active" });
+      await casAppend(ledger, "dep_c", null, { state: "prepared" });
+      await casAppend(ledger, "dep_b", null, { state: "prepared" });
+      const before = lines(segmentPath(ledger, 0)).length;
+      const answer = await casAppend(
+        ledger,
+        "dep_b",
+        "prepared",
+        { state: "active" },
+        { inState: "active", exactly },
+      );
+      expect({ name, answer }).toMatchObject({
+        name,
+        answer: { ok: true, applied: false, precondition: "changed", current: { id: "dep_b" } },
+      });
+      expect(lines(segmentPath(ledger, 0))).toHaveLength(before);
+      expect(existsSync(join(root, ledger.claims, "gen", "dep_b", "2.json"))).toBe(false);
+    }
+  });
+
+  test("a move that lands while the first writer waits for the lock fails its precondition", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root, "deployment");
+    await casAppend(ledger, "dep_a", null, { state: "prepared" });
+    await casAppend(ledger, "dep_a", "prepared", { state: "active" });
+    await casAppend(ledger, "dep_b", null, { state: "prepared" });
+    await casAppend(ledger, "dep_c", null, { state: "prepared" });
+    // A read dep_a active at generation 2 and is held just after taking the lock.
+    const a = gate();
+    _setLedgerSeamsForTest({ lockOptions: noWarn, afterLock: a.hold });
+    const writerA = casAppend(
+      ledger,
+      "dep_b",
+      "prepared",
+      { state: "active", who: "a" },
+      { inState: "active", exactly: [{ id: "dep_a", gen: 2 }] },
+    );
+    await a.reached;
+    // B steals the lock and moves a listed object.
+    _setLedgerSeamsForTest({ lockOptions: STEAL });
+    const b = await casAppend(ledger, "dep_c", "prepared", { state: "active", who: "b" });
+    expect(b).toMatchObject({ applied: true });
+    a.open();
+    const answerA = await writerA;
+    expect(answerA).toMatchObject({ ok: true, applied: false, precondition: "changed" });
+    const fold = foldStates(ledger);
+    if (!fold.ok) throw new Error(fold.reason);
+    expect(fold.objects.get("dep_b")?.state).toBe("prepared");
+    expect(fold.objects.get("dep_c")?.state).toBe("active");
+  });
+
+  test("without a precondition the answer carries no precondition field", async () => {
+    const root = tempDir();
+    const ledger = deploymentsLedger(root, "deployment");
+    await casAppend(ledger, "dep_a", null, { state: "prepared" });
+    const answer = await casAppend(ledger, "dep_a", "active", { state: "disabled" });
+    expect(answer).toEqual({
+      ok: true,
+      applied: false,
+      current: expect.objectContaining({ id: "dep_a", state: "prepared" }),
+    });
+  });
+
   test("generation claims remain, one per generation", async () => {
     const root = tempDir();
     const ledger = deploymentsLedger(root, "deployment");

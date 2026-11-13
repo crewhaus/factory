@@ -34,16 +34,19 @@ import {
   activeDeployment,
   artifactOf,
   bootInputsOf,
-  buildDigest,
+  buildLinkMessage,
   bundleDirOf,
+  collectBuildFiles,
   findSpecPath,
+  linkEntriesOf,
   loadEnvChain,
   mergedSpawnEnv,
+  readBundleStamp,
   resolveBundle,
   resolvedEntryOf,
   verifyActiveBuild,
 } from "@crewhaus/harness-supervisor";
-import { specRevision } from "@crewhaus/ir/policy";
+import { bundleDigest, sameRevision, specRevision } from "@crewhaus/ir/policy";
 import type { ActivationGate } from "./executor";
 import type { Reconciliation } from "./executor";
 import type { OutcomeCode } from "./refusal";
@@ -84,9 +87,19 @@ function specNameOf(harnessDir: string): string | undefined {
   }
 }
 
+/** Why a protected environment refuses a build that names no spec revision. */
+export function noSpecRevisionMessage(environment: string): string {
+  return `This build names no spec revision, so an approval for "${environment}" can't bind to it. Run crewhaus compile, then crewhaus deploy activate.`;
+}
+
+/** Shown when an activation decided from records another activation changed first. */
+export const ACTIVATION_RACED_MESSAGE = "another activation landed first; run it again";
+
 /**
  * The core's activation gate: activation into a protected environment takes the same
- * approval quorum every pin move takes, bound to the deployment's spec revision.
+ * approval quorum every pin move takes, bound to the deployment's spec revision. A build
+ * that names no well-formed spec revision is refused there, since no approval can bind to
+ * it.
  */
 export const protectedEnvironmentGate: ActivationGate = {
   name: PROTECTED_ENVIRONMENT_GATE,
@@ -113,7 +126,11 @@ export const protectedEnvironmentGate: ActivationGate = {
         }`,
       };
     }
-    if (!answer.protected || answer.decision.satisfied) return { ok: true };
+    if (!answer.protected) return { ok: true };
+    if (!sameRevision(specHash, specHash)) {
+      return { ok: false, reason: noSpecRevisionMessage(environment), verb: "crewhaus compile" };
+    }
+    if (answer.decision.satisfied) return { ok: true };
     return {
       ok: false,
       reason: `"${environment}" is a protected environment: ${answer.decision.reason}`,
@@ -127,7 +144,7 @@ async function envChainOf(
   harnessDir: string,
   key: CryptoKey,
 ): Promise<{ readonly files: readonly string[]; readonly digest: string }> {
-  const chain = loadEnvChain(harnessDir);
+  const chain = loadEnvChain(harnessDir, { nodeEnv: process.env["NODE_ENV"] });
   const files: string[] = [];
   const parts: string[] = [];
   for (const ref of chain.refs) {
@@ -218,7 +235,10 @@ export type ActivationAnswer =
  * Activate a prepared deployment: run the activation gates against it, move it to `active`
  * with a compare-and-set, then move every other active deployment to `superseded`. Each row
  * restates the whole record. Writes `harness.json` when it is absent. A digest key that
- * cannot be read refuses before anything is written.
+ * cannot be read refuses before anything is written. The environment and the gates are
+ * decided from one read of the records, and the compare-and-set applies only while the
+ * active deployments are still the ones that read saw, at the same generations; otherwise
+ * it refuses with `conflict` and the activation can be run again.
  *
  * First consumers: `crewhaus deploy activate`, Home's activate route and a person's start.
  */
@@ -354,8 +374,19 @@ export async function activateDeployment(request: ActivationRequest): Promise<Ac
   Reflect.deleteProperty(next, "gen");
   Reflect.deleteProperty(next, "claim");
   const ledger = deploymentsLedger(request.harnessDir);
-  const moved = await casAppend(ledger, request.dep, "prepared", next);
+  const moved = await casAppend(ledger, request.dep, "prepared", next, {
+    inState: "active",
+    exactly: read.state === "present" ? read.activeGens : [],
+  });
   if (!moved.ok) return { ok: false, code: "unavailable", message: moved.reason };
+  if (!moved.applied && moved.precondition === "changed") {
+    return {
+      ok: false,
+      code: "conflict",
+      message: ACTIVATION_RACED_MESSAGE,
+      ...(moved.current !== null ? { current: moved.current } : {}),
+    };
+  }
   if (!moved.applied) {
     return {
       ok: false,
@@ -447,16 +478,18 @@ function bootInputsOfSpec(harnessDir: string, specPath: string | undefined): str
 }
 
 /**
- * Record the build on disk as a `prepared` deployment, the way a start that admits it does:
+ * The `prepared` record a start would write for the build on disk, read without writing:
  * the bundle, its resolver configuration and the boot inputs the saved spec names. A bundle
- * at the harness root is recorded only by compile, which knows the files it wrote.
+ * at the harness root is recorded only by compile, which knows the files it wrote; a build
+ * whose files hold a link is refused, naming it. The record names a spec revision only when
+ * the bundle's stamped manifest names the saved spec's, so it never claims spec text the
+ * build did not come from.
  */
-async function recordCurrentBuild(
+function currentBuildRecord(
   harnessDir: string,
   target: string,
   registryId: string | undefined,
-  now: () => number,
-): Promise<{ readonly id: string } | { readonly message: string }> {
+): { readonly record: LedgerRecord } | { readonly message: string } {
   const bundle = resolveBundle(harnessDir, target);
   if (bundle === undefined) return { message: "no compiled bundle found" };
   const entry = relative(harnessDir, bundle.entryPath).split("\\").join("/");
@@ -470,14 +503,18 @@ async function recordCurrentBuild(
     };
   }
   const artifactBase = { entry, bootInputs };
-  const taken = buildDigest(harnessDir, artifactBase);
-  if ("unreadable" in taken) return { message: `the build can't be read: ${taken.unreadable}` };
-  let specHash: string | undefined;
+  const files = collectBuildFiles(harnessDir, artifactBase);
+  if (!Array.isArray(files)) return { message: `the build can't be read: ${files.unreadable}` };
+  const [link] = linkEntriesOf(files);
+  if (link !== undefined) return { message: buildLinkMessage(link) };
+  let saved: string | undefined;
   try {
-    specHash = specPath === undefined ? undefined : specRevision(readFileSync(specPath, "utf8"));
+    saved = specPath === undefined ? undefined : specRevision(readFileSync(specPath, "utf8"));
   } catch {
-    specHash = undefined;
+    saved = undefined;
   }
+  const stamped = readBundleStamp(bundle.bundleDir)?.specHash;
+  const specHash = sameRevision(stamped, saved) ? saved : undefined;
   const compiledWith = compiledWithOf(bundle.bundleDir);
   const identity = readHarnessIdentity(harnessDir);
   const harness =
@@ -486,19 +523,35 @@ async function recordCurrentBuild(
       : identity.state === "present"
         ? identity.identity.id
         : undefined;
+  return {
+    record: {
+      state: "prepared",
+      ...(harness !== undefined ? { harness } : {}),
+      artifact: {
+        digest: bundleDigest(files),
+        ...(specHash !== undefined ? { specHash } : {}),
+        ...(compiledWith !== undefined ? { compiledWith } : {}),
+        shape: target,
+        ...artifactBase,
+      },
+      preparedBy: "start",
+    },
+  };
+}
+
+/** Record the build on disk as a `prepared` deployment ({@link currentBuildRecord}). */
+async function recordCurrentBuild(
+  harnessDir: string,
+  target: string,
+  registryId: string | undefined,
+  now: () => number,
+): Promise<{ readonly id: string } | { readonly message: string }> {
+  const current = currentBuildRecord(harnessDir, target, registryId);
+  if ("message" in current) return current;
   const id = mintId("dep", { now: now() });
   const answer = await casAppend(deploymentsLedger(harnessDir), id, null, {
     id,
-    state: "prepared",
-    ...(harness !== undefined ? { harness } : {}),
-    artifact: {
-      digest: taken.digest,
-      ...(specHash !== undefined ? { specHash } : {}),
-      ...(compiledWith !== undefined ? { compiledWith } : {}),
-      shape: target,
-      ...artifactBase,
-    },
-    preparedBy: "start",
+    ...current.record,
   });
   if (!answer.ok) return { message: answer.reason };
   if (!answer.applied) return { message: "the deployment could not be recorded" };
@@ -522,6 +575,9 @@ export type AdmitOptions = {
   /** The receipt of the start, when there is one. */
   readonly cmd?: string;
   readonly now?: () => number;
+  /** Decide every refusal without writing: answer `{ ok: true }` where the start would
+   *  record and activate. A restart asks this before it stops a running daemon. */
+  readonly decideOnly?: boolean;
 };
 
 function deploymentOfRecord(record: LedgerRecord): ActiveDeployment | undefined {
@@ -536,7 +592,7 @@ function deploymentOfRecord(record: LedgerRecord): ActiveDeployment | undefined 
 }
 
 /** The newest prepared deployment whose build is the one on disk and the one the launch
- *  runs, when there is one. */
+ *  runs, when there is one. A build whose files hold a link is never one. */
 function preparedMatchingBuild(
   harnessDir: string,
   entry: string | undefined,
@@ -549,8 +605,9 @@ function preparedMatchingBuild(
     const artifact = artifactOf(record);
     if (artifact === undefined) continue;
     if (entry !== undefined && artifact.entry !== entry) continue;
-    const taken = buildDigest(harnessDir, artifact);
-    if ("digest" in taken && taken.digest === artifact.digest) return { id: String(record["id"]) };
+    const files = collectBuildFiles(harnessDir, artifact);
+    if (!Array.isArray(files) || linkEntriesOf(files).length > 0) continue;
+    if (bundleDigest(files) === artifact.digest) return { id: String(record["id"]) };
   }
   return undefined;
 }
@@ -561,6 +618,14 @@ async function recordAndActivate(
   options: AdmitOptions,
   autostart: boolean,
 ): Promise<AdmitAnswer> {
+  if (options.decideOnly === true) {
+    // What would be activated, decided without recording it.
+    if (preparedMatchingBuild(harnessDir, options.entry ?? resolvedEntryOf(harnessDir, target))) {
+      return { ok: true };
+    }
+    const current = currentBuildRecord(harnessDir, target, options.registryId);
+    return "message" in current ? { ok: false, message: current.message } : { ok: true };
+  }
   const now = options.now ?? (() => Date.now());
   // A prepared record of exactly this build (a compile's, with its boot inputs and policy
   // revision) is activated as it is; otherwise the build is recorded first.
@@ -593,6 +658,9 @@ async function recordAndActivate(
  * | otherwise, `cli-direct` (`crewhaus daemon start|restart`) | records the build and activates it, never into a protected environment |
  * | otherwise (Home, a group start, the server, the SDK) | refused: the build is not active |
  *
+ * A build whose files hold a link is refused, naming it. With `decideOnly`, every refusal
+ * is answered and nothing is recorded or activated.
+ *
  * First consumers: the CLI's and Home's supervisor builders, as `SupervisorOptions.admit`.
  */
 export async function admitExplicitStart(
@@ -620,7 +688,11 @@ export async function admitExplicitStart(
     return {
       ok: false,
       message:
-        check.reason === "no-active" ? NO_ACTIVE_BUILD_ACTIVATE_MESSAGE : BUILD_NOT_ACTIVE_MESSAGE,
+        check.reason === "no-active"
+          ? NO_ACTIVE_BUILD_ACTIVATE_MESSAGE
+          : check.reason === "link"
+            ? check.message
+            : BUILD_NOT_ACTIVE_MESSAGE,
     };
   }
   const environment = activeDeployment(harnessDir)?.record["environment"];

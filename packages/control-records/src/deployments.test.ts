@@ -71,6 +71,32 @@ describe("readDeployments", () => {
     expect(snapshotTree(root)).toEqual(before);
   });
 
+  test("activeGens names every active row at the generation the fold gives it", async () => {
+    const root = tempDir();
+    const ledger = deploymentsLedger(root);
+    await casAppend(ledger, DEP_A, null, prepared(DEP_A));
+    await casAppend(ledger, DEP_A, "prepared", { ...prepared(DEP_A), state: "active" });
+    await casAppend(ledger, DEP_B, null, prepared(DEP_B));
+    const read = readDeployments(root);
+    if (read.state !== "present") throw new Error(read.state);
+    expect(read.activeGens).toEqual([{ id: DEP_A, gen: 2 }]);
+    // A row planted without `gen` folds to generation 0.
+    const planted = tempDir();
+    plant(
+      join(planted, controlPaths(planted).deploymentsFile),
+      jsonLine({ ...prepared(DEP_A) }) +
+        jsonLine({ ...prepared(DEP_A), state: "active", activatedAt: "2026-11-01T00:00:00Z" }) +
+        jsonLine({ ...prepared(DEP_B) }) +
+        jsonLine({ ...prepared(DEP_B), state: "active", activatedAt: "2026-11-02T00:00:00Z" }),
+    );
+    const two = readDeployments(planted);
+    if (two.state !== "present") throw new Error(two.state);
+    expect(two.activeGens).toEqual([
+      { id: DEP_A, gen: 0 },
+      { id: DEP_B, gen: 0 },
+    ]);
+  });
+
   test("the ledger checks the deployment machine's moves", async () => {
     const root = tempDir();
     const ledger = deploymentsLedger(root);

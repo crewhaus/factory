@@ -104,6 +104,18 @@ export function isAdopted(entry: HangarHarnessEntry, adoptionSince: string | und
   return registered < since;
 }
 
+/**
+ * Whether Home runs this harness's own code for it (its `node_modules/.bin/crewhaus` for
+ * Home's jobs, its spec library for Home's spec checks): only when the row carries `home`,
+ * which only `crewhaus harness adopt` writes and a relocation removes. A row counted as
+ * adopted for a group start because it predates adoption does not.
+ *
+ * First consumers: Home's job runner and its spec checks.
+ */
+export function runsOwnCode(entry: HangarHarnessEntry): boolean {
+  return entry.home !== undefined;
+}
+
 /** A spec name as a slug: lower-kebab, letters and digits. */
 export function slugOf(name: string): string {
   const slug = name

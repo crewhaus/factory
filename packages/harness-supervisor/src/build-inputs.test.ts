@@ -2,7 +2,15 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { bootInputsOf, buildDigest, collectBuildFiles, parseJsonc } from "./build-inputs";
+import { buildLinkMessage, verifyActiveBuild } from "./active-build";
+import {
+  bootInputsOf,
+  buildDigest,
+  collectBuildFiles,
+  linkEntriesOf,
+  parseJsonc,
+} from "./build-inputs";
+import { activateBuildForTest } from "./testkit";
 
 const roots: string[] = [];
 function harness(): string {
@@ -113,6 +121,119 @@ describe("collectBuildFiles", () => {
       link: join(outside, "secret.ts"),
     });
     expect(digest(dir, DIST)).not.toBe(before);
+  });
+
+  test("a linked bundle directory is recorded as one link, and nothing is read through it", () => {
+    const dir = harness();
+    const outside = mkdtempSync(join(tmpdir(), "chsup-build-outside-"));
+    roots.push(outside);
+    put(outside, "daemon.ts", "// elsewhere\n");
+    put(outside, "tsconfig.json", '{"extends":"./base.json"}\n');
+    put(outside, "base.json", "{}\n");
+    rmSync(join(dir, "dist"), { recursive: true, force: true });
+    symlinkSync(outside, join(dir, "dist"), "dir");
+    const files = collectBuildFiles(dir, DIST);
+    if (!Array.isArray(files)) throw new Error(files.unreadable);
+    expect(files.find((f) => f.path === "dist")).toEqual({
+      path: "dist",
+      sha256: null,
+      link: outside,
+    });
+    expect(files.filter((f) => f.path.startsWith("dist/"))).toEqual([]);
+    expect(linkEntriesOf(files)).toEqual(["dist"]);
+  });
+
+  test("a linked directory on the way to a boot input is recorded as the link, not the file", () => {
+    const dir = harness();
+    const outside = mkdtempSync(join(tmpdir(), "chsup-build-outside-"));
+    roots.push(outside);
+    put(outside, "server.ts", "// elsewhere\n");
+    symlinkSync(outside, join(dir, "tools"), "dir");
+    const files = collectBuildFiles(dir, { ...DIST, bootInputs: ["tools/server.ts"] });
+    if (!Array.isArray(files)) throw new Error(files.unreadable);
+    expect(files.find((f) => f.path === "tools")).toEqual({
+      path: "tools",
+      sha256: null,
+      link: outside,
+    });
+    expect(files.find((f) => f.path === "tools/server.ts")).toBeUndefined();
+    expect(linkEntriesOf(files)).toEqual(["tools"]);
+  });
+
+  test("a boot input under a directory linked outside the harness is named, then refused as the link", () => {
+    const dir = harness();
+    put(dir, "crewhaus.yaml", "name: demo\ntarget: channel\n");
+    const outside = mkdtempSync(join(tmpdir(), "chsup-build-outside-"));
+    roots.push(outside);
+    put(outside, "server.ts", "// elsewhere\n");
+    symlinkSync(outside, join(dir, "tools"), "dir");
+    const ir = {
+      mcp_servers: { a: { transport: "stdio", command: "bun", args: ["tools/server.ts"] } },
+    };
+    const bootInputs = bootInputsOf(dir, ir);
+    expect(bootInputs).toEqual(["tools/server.ts"]);
+    const files = collectBuildFiles(dir, { ...DIST, bootInputs });
+    if (!Array.isArray(files)) throw new Error(files.unreadable);
+    expect(linkEntriesOf(files)).toEqual(["tools"]);
+    activateBuildForTest(dir, "dist/daemon.ts", { bootInputs });
+    expect(verifyActiveBuild(dir, "channel")).toEqual({
+      ok: false,
+      reason: "link",
+      message: buildLinkMessage("tools"),
+    });
+  });
+
+  test("a tsconfig extends through a directory linked outside the harness is refused as the link", () => {
+    const dir = harness();
+    const outside = mkdtempSync(join(tmpdir(), "chsup-build-outside-"));
+    roots.push(outside);
+    put(outside, "base.json", "{}\n");
+    symlinkSync(outside, join(dir, "cfg"), "dir");
+    put(dir, "tsconfig.json", '{ "extends": "./cfg/base.json" }\n');
+    const files = collectBuildFiles(dir, DIST);
+    if (!Array.isArray(files)) throw new Error(files.unreadable);
+    expect(linkEntriesOf(files)).toEqual(["cfg"]);
+    expect(files.find((f) => f.path === "cfg")).toEqual({
+      path: "cfg",
+      sha256: null,
+      link: outside,
+    });
+    expect(files.filter((f) => f.path.startsWith("extends:"))).toEqual([]);
+    activateBuildForTest(dir, "dist/daemon.ts");
+    expect(verifyActiveBuild(dir, "channel")).toMatchObject({ ok: false, reason: "link" });
+  });
+
+  test("a regular file on the way to a name leaves the name recorded absent", () => {
+    const dir = harness();
+    put(dir, "tools", "a file, not a directory\n");
+    const files = collectBuildFiles(dir, { ...DIST, bootInputs: ["tools/server.ts"] });
+    if (!Array.isArray(files)) throw new Error(files.unreadable);
+    expect(files.find((f) => f.path === "tools/server.ts")).toEqual({
+      path: "tools/server.ts",
+      sha256: null,
+    });
+    expect(linkEntriesOf(files)).toEqual([]);
+  });
+
+  test("a linked directory inside the bundle is recorded as a link (regression check)", () => {
+    const dir = harness();
+    const outside = mkdtempSync(join(tmpdir(), "chsup-build-outside-"));
+    roots.push(outside);
+    put(outside, "inner.ts", "x\n");
+    symlinkSync(outside, join(dir, "dist/lib"), "dir");
+    const files = collectBuildFiles(dir, DIST);
+    if (!Array.isArray(files)) throw new Error(files.unreadable);
+    expect(linkEntriesOf(files)).toEqual(["dist/lib"]);
+    expect(files.filter((f) => f.path.startsWith("dist/lib/"))).toEqual([]);
+  });
+
+  test("a build of regular files holds no link entry", () => {
+    const dir = harness();
+    put(dir, "tools/server.ts", "v1\n");
+    const files = collectBuildFiles(dir, { ...DIST, bootInputs: ["tools/server.ts"] });
+    if (!Array.isArray(files)) throw new Error(files.unreadable);
+    expect(linkEntriesOf(files)).toEqual([]);
+    expect(files.find((f) => f.path === "tools/server.ts")?.sha256).toMatch(/^[0-9a-f]{64}$/);
   });
 
   test("an edited stdio MCP script named as a boot input changes the digest", () => {

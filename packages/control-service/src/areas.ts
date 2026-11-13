@@ -117,10 +117,14 @@ export function compositionProblems(areas: readonly AreaRuntime[]): readonly str
     }
   }
   const order = activationGates(areas);
-  if (
-    order.some((gate) => gate.name === PROTECTED_ENVIRONMENT_GATE) &&
-    order[0]?.name !== PROTECTED_ENVIRONMENT_GATE
-  ) {
+  const coreGate = areas.some(
+    (runtime) =>
+      runtime.area === "core" &&
+      (runtime.activationGates ?? []).some((gate) => gate.name === PROTECTED_ENVIRONMENT_GATE),
+  );
+  if (!coreGate) {
+    problems.push(`the core's "${PROTECTED_ENVIRONMENT_GATE}" activation gate is missing`);
+  } else if (order[0]?.name !== PROTECTED_ENVIRONMENT_GATE) {
     problems.push(`the core's "${PROTECTED_ENVIRONMENT_GATE}" activation gate is not first`);
   }
   return problems;

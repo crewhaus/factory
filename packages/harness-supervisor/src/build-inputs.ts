@@ -17,18 +17,13 @@
  *   3. **The boot inputs the spec names.** The local files a stdio MCP server's `command`
  *      or `args` name, recorded at compile as `bootInputs`.
  *
- * Nothing is followed through a link: every name is `lstat`ed, and a link is recorded by its
- * own text and never read.
+ * Nothing is followed through a link: every segment of every name is `lstat`ed, and the
+ * first link on the way is recorded once, by its own text, under its own path; nothing below
+ * it is read. A build runs from regular files only, so a check refuses a build whose files
+ * hold any link ({@link linkEntriesOf}).
  */
 import { createHash } from "node:crypto";
-import {
-  type Dirent,
-  lstatSync,
-  readFileSync,
-  readdirSync,
-  readlinkSync,
-  realpathSync,
-} from "node:fs";
+import { type Dirent, lstatSync, readFileSync, readdirSync, readlinkSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { type BuildFile, bundleDigest } from "@crewhaus/ir/policy";
 
@@ -91,9 +86,42 @@ function probe(abs: string): Probe {
   return { kind: "other" };
 }
 
-/** Record one name relative to the harness. A directory or special file is recorded absent. */
+/** What one directory segment on the way to a name is, never followed and never read. */
+function segmentKind(abs: string): Probe {
+  let stats: ReturnType<typeof lstatSync>;
+  try {
+    stats = lstatSync(abs);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { kind: "absent" };
+    throw err;
+  }
+  if (stats.isSymbolicLink()) return { kind: "link", target: readlinkSync(abs) };
+  return stats.isDirectory() ? { kind: "dir" } : { kind: "other" };
+}
+
+/**
+ * Record one name relative to the harness. Each directory on the way is `lstat`ed first: the
+ * first that is a link is recorded once, as a link under its own path, and nothing below it
+ * is read; one that is absent or not a directory leaves the name recorded absent. A
+ * directory or special file at the name itself is recorded absent.
+ */
 function record(out: Collected, harnessDir: string, rel: string): Probe {
   const path = toPosix(rel);
+  const segments = path.split("/").filter((segment) => segment !== "" && segment !== ".");
+  let at = "";
+  for (const segment of segments.slice(0, -1)) {
+    at = at === "" ? segment : `${at}/${segment}`;
+    const parent = segmentKind(join(harnessDir, at));
+    if (parent.kind === "link") {
+      out.set(at, { path: at, sha256: null, link: parent.target });
+      return parent;
+    }
+    if (parent.kind !== "dir") {
+      out.set(path, { path, sha256: null });
+      return { kind: "absent" };
+    }
+  }
   const found = probe(join(harnessDir, rel));
   switch (found.kind) {
     case "link":
@@ -164,7 +192,11 @@ function extendsOf(text: string): readonly string[] {
   return [];
 }
 
-/** Where an `extends` lands inside the harness, or `undefined` when it does not. */
+/**
+ * Where an `extends` lands inside the harness, or `undefined` when it does not. Containment
+ * is lexical: a name inside the harness is kept even when a directory on the way is a link,
+ * so the collector records that link and a check refuses it.
+ */
 function extendsTarget(harnessDir: string, fromRel: string, spec: string): string | undefined {
   if (!(spec.startsWith(".") || isAbsolute(spec))) return undefined;
   const base = resolve(harnessDir, dirname(fromRel));
@@ -172,23 +204,25 @@ function extendsTarget(harnessDir: string, fromRel: string, spec: string): strin
   if (!spec.endsWith(".json")) candidates.push(resolve(base, `${spec}.json`));
   for (const abs of candidates) {
     if (!inside(harnessDir, abs)) return undefined;
-    // The directory it sits in must really be inside, not reached through a link.
-    let parentReal: string;
-    try {
-      parentReal = realpathSync(dirname(abs));
-    } catch {
-      continue;
-    }
-    let rootReal: string;
-    try {
-      rootReal = realpathSync(harnessDir);
-    } catch {
-      return undefined;
-    }
-    if (!inside(rootReal, parentReal)) return undefined;
-    if (probe(abs).kind !== "absent") return relative(harnessDir, abs);
+    const rel = relative(harnessDir, abs);
+    if (linkedSegment(harnessDir, rel) || probe(abs).kind !== "absent") return rel;
   }
   return relative(harnessDir, candidates[0] as string);
+}
+
+/** Whether a directory on the way to `rel` (relative to the harness) is a link. */
+function linkedSegment(harnessDir: string, rel: string): boolean {
+  const segments = toPosix(rel)
+    .split("/")
+    .filter((segment) => segment !== "" && segment !== ".");
+  let at = "";
+  for (const segment of segments.slice(0, -1)) {
+    at = at === "" ? segment : `${at}/${segment}`;
+    const kind = segmentKind(join(harnessDir, at)).kind;
+    if (kind === "link") return true;
+    if (kind !== "dir") return false;
+  }
+  return false;
 }
 
 /** Follow a config file's `extends` chain from `rel`, recording each file it names. */
@@ -274,6 +308,19 @@ export function collectBuildFiles(
   return [...out.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
+/**
+ * The paths of a build's files that are links, sorted. Compile writes none, so a build that
+ * holds one is refused before it runs.
+ *
+ * First consumers: `verifyActiveBuild`, the deployment a start records and compile's record.
+ */
+export function linkEntriesOf(files: readonly BuildFile[]): string[] {
+  return files
+    .filter((file) => file.link !== undefined)
+    .map((file) => file.path)
+    .sort();
+}
+
 /** `bundleDigest` over {@link collectBuildFiles}, or why it could not be taken. */
 export function buildDigest(
   harnessDir: string,
@@ -305,36 +352,26 @@ function stdioServers(ir: unknown): Array<{ command: string; args: readonly stri
 
 /**
  * The boot inputs a lowered IR names: each stdio MCP server's `command` and `args` that
- * resolve, against the harness root, to an existing regular file inside the harness and
- * outside `node_modules`. Posix, relative, sorted. Remote servers name nothing.
+ * resolve, against the harness root, to a name inside the harness by its path and outside
+ * `node_modules` that is a file or a link, or lies under a linked directory (recorded as that
+ * link, which a check refuses). Posix, relative, sorted. Remote servers name nothing.
  *
  * First consumer: compile's `prepared` record.
  */
 export function bootInputsOf(harnessDir: string, ir: unknown): string[] {
   const found = new Set<string>();
-  let rootReal: string;
-  try {
-    rootReal = realpathSync(harnessDir);
-  } catch {
-    return [];
-  }
   for (const server of stdioServers(ir)) {
     for (const word of [server.command, ...server.args]) {
       if (word === "" || word.startsWith("-")) continue;
       const abs = resolve(harnessDir, word);
+      // Lexical containment: a name under a linked directory is kept, and recorded as that
+      // link, so a check refuses it rather than passing over it.
       if (!inside(harnessDir, abs)) continue;
       const rel = relative(harnessDir, abs);
       if (rel === "" || rel.split(sep).includes("node_modules")) continue;
-      let parentReal: string;
-      try {
-        parentReal = realpathSync(dirname(abs));
-      } catch {
-        continue;
-      }
-      if (!inside(rootReal, parentReal)) continue;
       const kind = (() => {
         try {
-          return probe(abs).kind;
+          return linkedSegment(harnessDir, rel) ? "link" : probe(abs).kind;
         } catch {
           return "absent";
         }

