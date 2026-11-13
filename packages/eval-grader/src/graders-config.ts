@@ -54,6 +54,10 @@
  *       opts:                  # pack construction options (NEW-HUNT-7) —
  *         threshold: 0.8       # validated per pack at run start; unknown
  *         disableFallback: true # keys are a loud error, never ignored
+ *   criteria:                  # optional: what the graders check for, named
+ *     - id: capital-named      # (see ./criteria — mode, scope, protection)
+ *       mode: observe
+ *       measured_by: [math_exact]
  *
  * Combination modes (how per-grader results merge into the sample's overall):
  *   all       passed iff every grader passed; score = unweighted mean.
@@ -69,6 +73,15 @@
  */
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import {
+  type CompiledCriterion,
+  CriterionSpecSchema,
+  type GraderKind,
+  checkCriteria,
+  compiledCriterion,
+  criterionByGrader,
+  kindOfGraderSpec,
+} from "./criteria";
 import { GraderError } from "./errors";
 import {
   all,
@@ -370,6 +383,9 @@ export const GradersConfigSchema = z
     // per grader. A grader's own `per_model` entry wins field-by-field over
     // the file-level one for the same arm.
     per_model: PerModelMap.optional(),
+    // What the graders check for, named: see ./criteria. A file without it
+    // hashes and grades exactly as before.
+    criteria: z.array(CriterionSpecSchema).optional(),
   })
   // A4/A5 hardening — a typoed top-level key (`combined:`, `passing_treshold:`)
   // must fail loudly at parse, not be silently stripped so the run proceeds in
@@ -443,6 +459,14 @@ export type CompiledGrader = {
   readonly name: string;
   readonly grader: Grader;
   readonly weight: number;
+  /**
+   * What the grader is: the six deterministic types are `deterministic` and
+   * `llm_judge` is `model`. Absent on a `type: registry` entry, whose pack
+   * says at resolution.
+   */
+  readonly kind?: GraderKind;
+  /** The criterion this grader measures for, when one binds it. */
+  readonly criterion?: CompiledCriterion;
   readonly judgeSpec?: {
     /** Scalar (criteria/anchors) or, as of NEW-graders-2, categorical
      *  (`kind: categorical` + labels/passing_labels) — the runner
@@ -567,8 +591,12 @@ export function parseGradersConfig(yamlText: string): {
       "invalid graders config: top-level `per_model:` declares per-arm judge overrides, but no scalar `type: llm_judge` grader can consume them — add one or remove the block",
     );
   }
+  checkCriteria(config);
+  const bound = criterionByGrader(config);
   const compiled: CompiledGrader[] = config.graders.map((spec) => {
     const entry = compile(spec);
+    const criterion = bound.get(spec.name);
+    const kind = kindOfGraderSpec(spec);
     // The file-level map merges UNDER the grader's own, per arm and per
     // field: a grader that names its own judge for `$fast` keeps the
     // file-level `passing_score` for the same arm. CATEGORICAL judges are
@@ -598,6 +626,8 @@ export function parseGradersConfig(yamlText: string): {
     }
     return {
       ...entry,
+      ...(kind !== undefined ? { kind } : {}),
+      ...(criterion !== undefined ? { criterion: compiledCriterion(criterion) } : {}),
       ...(entry.judgeSpec !== undefined && perModel !== undefined
         ? { judgeSpec: { ...entry.judgeSpec, perModel } }
         : {}),

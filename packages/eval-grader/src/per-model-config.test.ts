@@ -212,7 +212,12 @@ describe("per_model and the graders lineage", () => {
   - name: exact
     type: exact_match
 `);
-    expect(mixed.compiled[0]).toEqual({ name: "exact", grader: expect.any(Function), weight: 1 });
+    expect(mixed.compiled[0]).toEqual({
+      name: "exact",
+      grader: expect.any(Function),
+      weight: 1,
+      kind: "deterministic",
+    });
   });
 
   test("introducing a per_model map changes the gradersHash (a new lineage)", () => {

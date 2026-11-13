@@ -20,9 +20,11 @@
  *              `applySpecEdits` behind the human-owned gate. The connector
  *              list is read leniently so a spec that does not validate (the
  *              exact moment an operator needs this tab) still renders.
- *   graders  → `eval/graders.yaml` is read leniently and written verbatim
- *              from the editor pane; the STRUCTURED builder refuses, because
- *              its serializer is not part of this build.
+ *   graders  → `eval/graders.yaml` is read leniently; a write is the editor
+ *              pane's whole file or structured criteria edits applied by
+ *              eval-grader's own `applyGradersEdits`, either one parsed with
+ *              `parseGradersConfig` and checked against the revision the
+ *              editor loaded before anything is written.
  *   dataset  → refuses, and points at the dataset routes + `crewhaus
  *              dataset` verbs that own that data.
  *
@@ -42,6 +44,14 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import {
+  type GradersConfig,
+  GradersEditsSchema,
+  applyGradersEdits,
+  gradersConfigHash,
+  loosening,
+  parseGradersConfig,
+} from "@crewhaus/eval-grader";
 import { applySpecEdits, isCredentialKey, maskCredentialTokens } from "@crewhaus/spec-patch";
 import { createSpecFile } from "@crewhaus/spec-patch/commit";
 import { MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
@@ -54,6 +64,7 @@ import {
   previewHomeEdits,
   readSpecFile,
   requireEditable,
+  requireExpectedRev,
   requireWholeSpec,
 } from "./spec-edit";
 import { keyValueParts } from "./spec-lines";
@@ -431,13 +442,23 @@ export const graderCatalog: M3Handler = (ctx) => {
      *  over whatever it hid. */
     yaml: present ? maskSpecYaml(read.text) : null,
     hash: present ? hashOf(read.text) : null,
+    /** The measuring identity a run graded by this file records (`gradersConfigHash`). */
+    gradersHash: present && !read.truncated ? gradersHashOf(read.text) : null,
     truncated: read.truncated,
     cardVerb: "crewhaus graders card eval/graders.yaml",
-    // The structured builder is a published package this build does not
-    // bundle; the YAML pane below it is the write path that works today.
-    structuredBuilder: false,
+    // Structured criteria edits are applied server-side to the whole file.
+    structuredBuilder: true,
   };
 };
+
+/** The file's `gradersConfigHash`, or null when it does not parse. */
+function gradersHashOf(text: string): string | null {
+  try {
+    return gradersConfigHash(parseGradersConfig(text).config);
+  } catch {
+    return null;
+  }
+}
 
 /** The two spans this server's maskers leave behind: `[redacted]` from the
  *  key-name redactor, `***` from the token-shape one. */
@@ -467,14 +488,21 @@ export function newlyMaskedSpan(stored: string, incoming: string): string | null
 /**
  * `POST /api/h/:id/builders/graders` — write `eval/graders.yaml`.
  *
- * `{ yaml, confirmName }` writes the editor pane verbatim, containment
- * checked, then re-reads so the response is what is actually on disk. A
- * STRUCTURED `{ graders: [...] }` write is refused: its serializer lives in
- * the published grader-builder, and hand-rolling a second one is exactly the
- * duplication this surface exists to avoid.
+ * Two forms, one set of guards:
  *
- * Two refusals guard the round trip, because the pane the console posts back
- * was prefilled from {@link graderCatalog} — a MASKED, CAPPED read:
+ *   - `{ yaml, confirmName, expectedRev }` writes the editor pane's whole file.
+ *   - `{ edits, expectedRev }` applies structured criteria edits
+ *     (`applyGradersEdits`) to the whole, unmasked file on disk.
+ *
+ * Either way the result must parse (`parseGradersConfig`, 400 with the reason
+ * and nothing written); when the file exists the write names the revision it
+ * was computed from (`expectedRev`, 428 without one) and a stale one answers
+ * 412 with `current.rev`; an edit that loosens a protected criterion needs the
+ * spec's name typed and the security edit permission (409 with `needs`). The
+ * response is what is on disk, with its revision (`hash`) and `gradersHash`.
+ *
+ * Two refusals guard the raw round trip, because the pane the console posts
+ * back was prefilled from {@link graderCatalog} — a MASKED, CAPPED read:
  *
  *   - a body that introduces a mask span the stored file does not have is
  *     the masked view being saved over the real document. Persisting `***`
@@ -488,43 +516,104 @@ export function newlyMaskedSpan(stored: string, incoming: string): string | null
  */
 export const graderWrite: M3Handler = (ctx) => {
   const yaml = ctx.body["yaml"];
+  const rawEdits = ctx.body["edits"];
   const path = ctx.contain([...GRADERS_PATH]);
-  if (typeof yaml !== "string") {
+  if (typeof yaml !== "string" && rawEdits === undefined) {
     return refusal(
-      "structured_writer_unavailable",
-      "the structured grader builder ships in the published grader-builder package, which this manager does not bundle",
+      "missing_body",
+      'send the whole file as "yaml", or structured criteria edits as "edits"',
       {
         ...base(existsSync(path), null, GRADERS_VERB),
         path: GRADERS_PATH.join("/"),
-        accepts: '{ "yaml": "<graders.yaml text>", "confirmName": "<spec name>" }',
+        accepts:
+          '{ "yaml": "<graders.yaml text>", "confirmName": "<spec name>", "expectedRev": "<hash>" } or { "edits": [...], "expectedRev": "<hash>" }',
       },
     );
   }
-  if (yaml.trim() === "") throw new HttpError(400, '"yaml" is empty');
-  const file = readSpecFile(ctx);
-  requireTypedConfirm(ctx.body, file.specName);
-  const stored = existsSync(path)
-    ? readTextCapped(path, MAX_TEXT_BYTES)
-    : { text: "", truncated: false };
+  const present = existsSync(path);
+  const stored = present ? readTextCapped(path, MAX_TEXT_BYTES) : { text: "", truncated: false };
   if (stored.truncated) {
     throw new HttpError(
       409,
       `the existing ${GRADERS_PATH.join("/")} is larger than this server reads (${MAX_TEXT_BYTES} bytes) — refusing to replace a file it could only show you the head of. Edit it with \`${GRADERS_VERB}\` or an editor.`,
     );
   }
-  const mark = newlyMaskedSpan(stored.text, yaml);
-  if (mark !== null) {
+  if (present) {
+    const expected = requireExpectedRev(ctx);
+    const current = hashOf(stored.text);
+    if (expected !== current) {
+      throw new HttpError(
+        412,
+        `${GRADERS_PATH.join("/")} changed since this editor loaded it — reload it and apply the change again`,
+        { current: { rev: current } },
+      );
+    }
+  }
+  let next: string;
+  if (typeof yaml === "string") {
+    if (yaml.trim() === "") throw new HttpError(400, '"yaml" is empty');
+    const mark = newlyMaskedSpan(stored.text, yaml);
+    if (mark !== null) {
+      throw new HttpError(
+        409,
+        `this body introduces a masked span (${mark}) the stored ${GRADERS_PATH.join("/")} does not have — the editor pane is served MASKED, and saving it would replace what the mask hid. Edit the file with \`${GRADERS_VERB}\` or an editor.`,
+      );
+    }
+    next = yaml.endsWith("\n") ? yaml : `${yaml}\n`;
+  } else {
+    if (!present) {
+      throw new HttpError(
+        409,
+        `this harness has no ${GRADERS_PATH.join("/")} to edit yet — write one first, with \`${GRADERS_VERB}\` or as "yaml"`,
+      );
+    }
+    const edits = GradersEditsSchema.safeParse(rawEdits);
+    if (!edits.success) {
+      throw new HttpError(
+        400,
+        `"edits" is not a list of criteria edits: ${maskText(edits.error.message)}`,
+      );
+    }
+    try {
+      next = applyGradersEdits(stored.text, edits.data).yaml;
+    } catch (err) {
+      throw new HttpError(400, `the edits do not apply: ${maskText(errMessage(err))}`);
+    }
+  }
+  let after: GradersConfig;
+  try {
+    after = parseGradersConfig(next).config;
+  } catch (err) {
+    throw new HttpError(400, `the graders file would not parse: ${maskText(errMessage(err))}`);
+  }
+  const file = readSpecFile(ctx);
+  let before: GradersConfig | undefined;
+  try {
+    before = present ? parseGradersConfig(stored.text).config : undefined;
+  } catch {
+    before = undefined;
+  }
+  const loosened = before !== undefined ? loosening(before, after) : [];
+  if (loosened.length > 0 && ctx.body["confirmName"] !== file.specName) {
+    const warning = loosened.map((l) => `${l.criterion}: ${l.reason}`).join("; ");
     throw new HttpError(
       409,
-      `this body introduces a masked span (${mark}) the stored ${GRADERS_PATH.join("/")} does not have — the editor pane is served MASKED, and saving it would replace what the mask hid. Edit the file with \`${GRADERS_VERB}\` or an editor.`,
+      `this change loosens a protected criterion (${warning}) — only the owner makes it: send "confirmName": "${file.specName}"`,
+      {
+        needs: "h.spec.edit.security",
+        warning,
+        paths: [...new Set(loosened.map((l) => `criteria.${l.criterion}`))],
+        confirmName: file.specName,
+      },
     );
   }
+  if (typeof yaml === "string") requireTypedConfirm(ctx.body, file.specName);
   const dir = ctx.contain([GRADERS_PATH[0]]);
   mkdirSync(dir, { recursive: true });
   // In PLACE, not tmp+rename: `mode` applies only when the file is created,
   // so an existing graders.yaml keeps the permissions its author gave it.
   // (A rename would replace the inode and impose this mode.)
-  writeFileSync(path, yaml.endsWith("\n") ? yaml : `${yaml}\n`, { mode: 0o644 });
+  writeFileSync(path, next, { mode: 0o644 });
   // Re-read: the answer is what is on disk, not what was sent.
   const onDisk = readTextCapped(path, MAX_TEXT_BYTES).text;
   return {
@@ -533,10 +622,15 @@ export const graderWrite: M3Handler = (ctx) => {
     graders: scanGraders(onDisk),
     yaml: maskSpecYaml(onDisk),
     hash: hashOf(onDisk),
+    gradersHash: gradersHashOf(onDisk),
     verb: GRADERS_VERB,
     note: "runs scored after this write carry a new gradersHash — earlier runs keep the graders they were scored by",
   };
 };
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 // ---------------------------------------------------------------------------
 // dataset builder

@@ -734,3 +734,21 @@ describe("calibration.abstentionAware + consistency.paraphraseGroup packs (A9/A1
     expect("paraphraseConsistency" in summary.aggregates).toBe(false);
   });
 });
+
+describe("defaultGraderRegistry — what each built-in grader declares", () => {
+  test("every registered name has a kind, and only a proof checker is proof", async () => {
+    const registry = await defaultGraderRegistry({ pluginRoot: "/nonexistent/plugins" });
+    const names = registry.list();
+    expect(names.length).toBeGreaterThan(30);
+    const missing = names.filter((name) => registry.metaOf(name)?.kind === undefined);
+    expect(missing).toEqual([]);
+    const proof = names.filter((name) => registry.metaOf(name)?.kind === "proof");
+    expect(proof.length).toBe(6);
+    expect(proof.every((name) => name.startsWith("provability."))).toBe(true);
+    expect(registry.metaOf("safety.toxicity")).toEqual({ kind: "model", regradable: true });
+    expect(registry.metaOf("nlg.rougeL")).toEqual({ kind: "deterministic", regradable: true });
+    expect(registry.metaOf("continuity.reAskRate")?.regradable).toBe(false);
+    expect(registry.metaOf("multimodal.imageSimilarity")?.regradable).toBe(false);
+    expect(registry.metaOf("twelve.p99LatencyMs")?.regradable).toBe(false);
+  });
+});

@@ -63,15 +63,19 @@ export function sampleWithoutVerdict(s: SampleResult): boolean {
 }
 
 /**
- * The {@link GradeStatus} of one grade: its `status`, or `not_measured` for a
- * provability grade whose rationale carries one of the pinned prefixes that
- * replace a measurement. That second reading is how a record written before
- * `status` existed is read, and it is the only reader of such records.
+ * The {@link GradeStatus} of one grade: its `status`. A caller that knows the
+ * grade was recorded by one of the provability graders passes
+ * `legacyProvability: true`, and a status-less grade then reads
+ * `not_measured` when its rationale starts with one of their pinned prefixes,
+ * which is how such a record written before `status` existed is read. No
+ * other grade is read by its rationale.
  */
 export function gradeStatusOf(
   g: Pick<GradeResult, "status" | "rationale">,
+  opts: { readonly legacyProvability?: boolean } = {},
 ): GradeStatus | undefined {
-  return g.status ?? (isUnmeasured(g) ? "not_measured" : undefined);
+  if (g.status !== undefined) return g.status;
+  return opts.legacyProvability === true && isUnmeasured(g) ? "not_measured" : undefined;
 }
 
 /**

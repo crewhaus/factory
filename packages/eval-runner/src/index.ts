@@ -169,6 +169,7 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { aggregate } from "./aggregate";
 import { pluginsDigestOf, writeCaseDigests } from "./cases";
 import { warnProvabilityOutsidePolicy, warnUnconsumedCombinePolicy } from "./combine-warnings";
+import { finishGraderEntry } from "./criteria-grading";
 import {
   defaultGraderRegistry,
   registryProvabilityRoles,
@@ -451,6 +452,25 @@ export {
   withProvabilityFloor,
 } from "./provability";
 export { registryProvabilityRoles } from "./default-registry";
+// The names the six provability graders are registered under, for readers of
+// recorded grades that must tell a proof check's entry from any other.
+export { PROVABILITY_GRADER_NAMES } from "@crewhaus/grader-provability";
+// Criteria in the runner: scope and observation per grader, and regrading a
+// recorded run's answers (see ./criteria-grading and ./regrade).
+export { criterionGrader, finishGraderEntry, outOfScope, regradeGrader } from "./criteria-grading";
+export { inCriterionScope, type RunCriterionRecord } from "@crewhaus/eval-grader";
+export {
+  createRecordedInvoker,
+  createRegrade,
+  notRegradable,
+  readRecordedRun,
+  type CreateRegradeArgs,
+  type RecordedCriterion,
+  type RecordedRun,
+  type RegradePlan,
+  type RegradePurpose,
+} from "./regrade";
+export { builtinGraderMeta } from "./default-registry";
 
 const DEFAULT_CONCURRENCY = 4;
 
@@ -545,6 +565,26 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     );
   }
 
+  // A regrade grades recorded answers: one per case, from the source run, with
+  // nothing else standing in for the agent.
+  if (opts.regrade !== undefined) {
+    const conflicts: Array<[boolean, string]> = [
+      [opts.invoker !== undefined, "a caller-supplied invoker"],
+      [
+        opts.recordToolsDir !== undefined || opts.replayToolsDir !== undefined,
+        "tool record or replay",
+      ],
+      [opts.resume === true, "resume"],
+      [opts.provability !== undefined, "a provability floor"],
+      [(opts.repeats ?? 1) > 1, "more than one trial per case"],
+    ];
+    const conflict = conflicts.find(([on]) => on)?.[1];
+    if (conflict !== undefined) {
+      throw new RunnerError(
+        `a regrade grades the recorded answers of run ${opts.regrade.of} and cannot be combined with ${conflict}`,
+      );
+    }
+  }
   // NEW-HUNT-6 — a resumed run re-opens an EXISTING run directory: the id and
   // the original start time come from its `run.json`, and the identity hashes
   // recorded there must still match this invocation's.
@@ -572,6 +612,15 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       `resume keeps the original runId ${resumeManifest.runId}, but runId ${opts.runId} was requested — drop one of the two`,
     );
   }
+
+  // The criteria record and the regrade marks, in run.json and results.json
+  // only when present, so every other run's record is unchanged.
+  const criteriaConfig = {
+    ...(opts.criteria !== undefined && opts.criteria.length > 0 ? { criteria: opts.criteria } : {}),
+    ...(opts.regrade !== undefined
+      ? { purpose: opts.regrade.purpose, regradeOf: opts.regrade.of }
+      : {}),
+  };
 
   const runId = resumeManifest?.runId ?? opts.runId ?? generateRunId();
   const outDir = resolveEvalOutDir(runId, opts.outDir);
@@ -718,135 +767,136 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // role the flag gives it, so a spec-declared gate graded by hand is gated
   // the same way (see registryProvabilityRoles).
   const registryRoles = await registryProvabilityRoles(compiledGraders);
-  const buildGraders = (arm: string | undefined): GraderEntry[] => [
-    ...compiledGraders.map((g) => {
-      if (g.judgeSpec) {
-        // 0.6.0 §6.2 — this arm's override, already merged (file-level under
-        // grader-level) at parse time. `undefined` for every arm the map does
-        // not name, and for an arm-less build.
-        // (never set on a categorical entry — those reject `per_model` at
-        // parse and are excluded from the file-level merge.)
-        const override = perModelOverrideFor(g.judgeSpec.perModel, arm);
-        const weight = override?.weight ?? g.weight;
-        // NEW-graders-2 — categorical dispatch: validate through
-        // `loadCategoricalRubric` (same belt-and-braces re-validation the
-        // scalar path gets from `loadRubric`) and bind the label grader.
-        // No G47 calibration (no scalar cut), no repeats/judges (rejected at
-        // parse); temperature and target thread exactly like scalar.
-        if (g.judgeSpec.rubric.kind === "categorical") {
-          const categoricalRubric = loadCategoricalRubric(g.judgeSpec.rubric);
-          const categoricalModel = g.judgeSpec.model ?? opts.judgeModel;
-          const grader = createJudgeGrader(categoricalRubric, {
-            ...(categoricalModel !== undefined ? { model: categoricalModel } : {}),
-            ...(g.judgeSpec.temperature !== undefined
-              ? { temperature: g.judgeSpec.temperature }
-              : {}),
-            ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
-            ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
-            // C35 — meter this grader's judge calls.
-            onUsage: meterJudgeUsageFor(arm),
-          });
-          return { name: g.name, grader, weight };
-        }
-        let rubric = loadRubric(g.judgeSpec.rubric);
-        // 0.6.0 §6.2 — the judge for THIS arm: the `per_model` override
-        // (a `$profile` ref already resolved against the roster) wins over
-        // the grader's own `model`, which wins over `--judge-model`.
-        const model = resolvedPerModelJudge(override) ?? g.judgeSpec.model ?? opts.judgeModel;
-        // G47 — an unspecified `passing_score` gates on the calibrated
-        // min-score instead of the schema default (3/5). The file's [0,1] cut
-        // projects onto the judge's 1–5 scale: gate = 1 + minScore·4 (the
-        // judge grader compares `score >= passing` where score is 1–5 and
-        // reports (score-1)/4, so this is exactly `(score-1)/4 >= minScore`).
-        //
-        // 0.6.0 §6.2 — the cut is now looked up for the (arm, judge) PAIR,
-        // falling back pair → spec → default inside the loader. An explicit
-        // per-arm `passing_score` outranks any calibration: a declared gate
-        // is a decision, not a default.
-        const pairCalibration =
-          calibration !== undefined ? calibrationForPair(calibration, arm, model) : undefined;
-        if (override?.passingScore !== undefined) {
-          rubric = { ...rubric, passing_score: override.passingScore };
-        } else if (
-          g.judgeSpec.rubric.passing_score === undefined &&
-          pairCalibration !== undefined
-        ) {
-          const passingScore = 1 + pairCalibration.minScore * 4;
-          rubric = { ...rubric, passing_score: passingScore };
-          const applied: JudgeCalibrationApplication = {
-            grader: g.name,
-            specKey: pairCalibration.specKey,
-            minScore: pairCalibration.minScore,
-            passingScore,
-            ...(pairCalibration.pairKey !== undefined ? { pairKey: pairCalibration.pairKey } : {}),
-            ...(arm !== undefined && pairCalibration.pairKey !== undefined ? { arm } : {}),
-          };
-          // Record the base build always; an arm build only when its pair cut
-          // differs from the base one.
-          if (arm === undefined) {
-            baseCutByGrader.set(g.name, passingScore);
-            calibrationApplied.push(applied);
-            logger.info("judge_calibration.applied", {
-              grader: g.name,
-              specKey: pairCalibration.specKey,
-              minScore: pairCalibration.minScore,
-              passingScore,
-              path: calibrationPath,
-            });
-          } else if (baseCutByGrader.get(g.name) !== passingScore) {
-            calibrationApplied.push(applied);
-            logger.info("judge_calibration.applied", {
-              grader: g.name,
-              arm,
-              specKey: pairCalibration.specKey,
-              minScore: pairCalibration.minScore,
-              passingScore,
-              path: calibrationPath,
-            });
-          }
-        }
-        // NEW-HUNT-2 — thread the rubric-level decoding controls through
-        // (temperature defaults to the pinned 0 inside `judge`; repeats
-        // defaults to a single call). A2 — a declared `judges` panel
-        // overrides the single model (and --judge-model) inside the grader.
-        // NEW-graders-3 — `target: transcript` makes every judge call read
-        // the bounded transcript digest instead of the final output.
-        const grader = createJudgeGrader(rubric, {
-          ...(model !== undefined ? { model } : {}),
-          ...(g.judgeSpec.judges !== undefined ? { judges: g.judgeSpec.judges } : {}),
-          ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
+  const resolveEntry = (g: CompiledGrader, arm: string | undefined): GraderEntry => {
+    if (g.judgeSpec) {
+      // 0.6.0 §6.2 — this arm's override, already merged (file-level under
+      // grader-level) at parse time. `undefined` for every arm the map does
+      // not name, and for an arm-less build.
+      // (never set on a categorical entry — those reject `per_model` at
+      // parse and are excluded from the file-level merge.)
+      const override = perModelOverrideFor(g.judgeSpec.perModel, arm);
+      const weight = override?.weight ?? g.weight;
+      // NEW-graders-2 — categorical dispatch: validate through
+      // `loadCategoricalRubric` (same belt-and-braces re-validation the
+      // scalar path gets from `loadRubric`) and bind the label grader.
+      // No G47 calibration (no scalar cut), no repeats/judges (rejected at
+      // parse); temperature and target thread exactly like scalar.
+      if (g.judgeSpec.rubric.kind === "categorical") {
+        const categoricalRubric = loadCategoricalRubric(g.judgeSpec.rubric);
+        const categoricalModel = g.judgeSpec.model ?? opts.judgeModel;
+        const grader = createJudgeGrader(categoricalRubric, {
+          ...(categoricalModel !== undefined ? { model: categoricalModel } : {}),
           ...(g.judgeSpec.temperature !== undefined
             ? { temperature: g.judgeSpec.temperature }
             : {}),
-          ...(g.judgeSpec.repeats !== undefined ? { repeats: g.judgeSpec.repeats } : {}),
+          ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
           ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
-          // C35 — meter this grader's judge calls (repeats and panelists each
-          // report their own call, with their own model string), attributed to
-          // the arm this set grades.
+          // C35 — meter this grader's judge calls.
           onUsage: meterJudgeUsageFor(arm),
         });
         return { name: g.name, grader, weight };
       }
-      if (g.registrySpec) {
-        if (graderRegistry === undefined) {
-          // Unreachable through the public entrypoint (the default registry
-          // is constructed above) — kept for direct/partial callers.
-          throw new RunnerError(
-            `grader "${g.name}" resolves by registry name "${g.registrySpec.grader}" but no graderRegistry was supplied — pass RunEvalOptions.graderRegistry (and register the pack, e.g. registerContinuityGraders(registry))`,
-          );
-        }
-        // NEW-HUNT-7 — shared with `createExamRunner` (A11): entry `opts:`
-        // validate per pack / pass through to plugins; loud at run start.
-        const role = registryRoles.get(g.registrySpec.grader);
-        return {
-          name: g.name,
-          grader: resolveRegistryGrader(graderRegistry, g.name, g.registrySpec),
-          weight: g.weight,
-          ...(role !== undefined ? { role } : {}),
+      let rubric = loadRubric(g.judgeSpec.rubric);
+      // 0.6.0 §6.2 — the judge for THIS arm: the `per_model` override
+      // (a `$profile` ref already resolved against the roster) wins over
+      // the grader's own `model`, which wins over `--judge-model`.
+      const model = resolvedPerModelJudge(override) ?? g.judgeSpec.model ?? opts.judgeModel;
+      // G47 — an unspecified `passing_score` gates on the calibrated
+      // min-score instead of the schema default (3/5). The file's [0,1] cut
+      // projects onto the judge's 1–5 scale: gate = 1 + minScore·4 (the
+      // judge grader compares `score >= passing` where score is 1–5 and
+      // reports (score-1)/4, so this is exactly `(score-1)/4 >= minScore`).
+      //
+      // 0.6.0 §6.2 — the cut is now looked up for the (arm, judge) PAIR,
+      // falling back pair → spec → default inside the loader. An explicit
+      // per-arm `passing_score` outranks any calibration: a declared gate
+      // is a decision, not a default.
+      const pairCalibration =
+        calibration !== undefined ? calibrationForPair(calibration, arm, model) : undefined;
+      if (override?.passingScore !== undefined) {
+        rubric = { ...rubric, passing_score: override.passingScore };
+      } else if (g.judgeSpec.rubric.passing_score === undefined && pairCalibration !== undefined) {
+        const passingScore = 1 + pairCalibration.minScore * 4;
+        rubric = { ...rubric, passing_score: passingScore };
+        const applied: JudgeCalibrationApplication = {
+          grader: g.name,
+          specKey: pairCalibration.specKey,
+          minScore: pairCalibration.minScore,
+          passingScore,
+          ...(pairCalibration.pairKey !== undefined ? { pairKey: pairCalibration.pairKey } : {}),
+          ...(arm !== undefined && pairCalibration.pairKey !== undefined ? { arm } : {}),
         };
+        // Record the base build always; an arm build only when its pair cut
+        // differs from the base one.
+        if (arm === undefined) {
+          baseCutByGrader.set(g.name, passingScore);
+          calibrationApplied.push(applied);
+          logger.info("judge_calibration.applied", {
+            grader: g.name,
+            specKey: pairCalibration.specKey,
+            minScore: pairCalibration.minScore,
+            passingScore,
+            path: calibrationPath,
+          });
+        } else if (baseCutByGrader.get(g.name) !== passingScore) {
+          calibrationApplied.push(applied);
+          logger.info("judge_calibration.applied", {
+            grader: g.name,
+            arm,
+            specKey: pairCalibration.specKey,
+            minScore: pairCalibration.minScore,
+            passingScore,
+            path: calibrationPath,
+          });
+        }
       }
-      return { name: g.name, grader: g.grader, weight: g.weight };
-    }),
+      // NEW-HUNT-2 — thread the rubric-level decoding controls through
+      // (temperature defaults to the pinned 0 inside `judge`; repeats
+      // defaults to a single call). A2 — a declared `judges` panel
+      // overrides the single model (and --judge-model) inside the grader.
+      // NEW-graders-3 — `target: transcript` makes every judge call read
+      // the bounded transcript digest instead of the final output.
+      const grader = createJudgeGrader(rubric, {
+        ...(model !== undefined ? { model } : {}),
+        ...(g.judgeSpec.judges !== undefined ? { judges: g.judgeSpec.judges } : {}),
+        ...(g.judgeSpec.target !== undefined ? { target: g.judgeSpec.target } : {}),
+        ...(g.judgeSpec.temperature !== undefined ? { temperature: g.judgeSpec.temperature } : {}),
+        ...(g.judgeSpec.repeats !== undefined ? { repeats: g.judgeSpec.repeats } : {}),
+        ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
+        // C35 — meter this grader's judge calls (repeats and panelists each
+        // report their own call, with their own model string), attributed to
+        // the arm this set grades.
+        onUsage: meterJudgeUsageFor(arm),
+      });
+      return { name: g.name, grader, weight };
+    }
+    if (g.registrySpec) {
+      if (graderRegistry === undefined) {
+        // Unreachable through the public entrypoint (the default registry
+        // is constructed above) — kept for direct/partial callers.
+        throw new RunnerError(
+          `grader "${g.name}" resolves by registry name "${g.registrySpec.grader}" but no graderRegistry was supplied — pass RunEvalOptions.graderRegistry (and register the pack, e.g. registerContinuityGraders(registry))`,
+        );
+      }
+      // NEW-HUNT-7 — shared with `createExamRunner` (A11): entry `opts:`
+      // validate per pack / pass through to plugins; loud at run start.
+      const role = registryRoles.get(g.registrySpec.grader);
+      return {
+        name: g.name,
+        grader: resolveRegistryGrader(graderRegistry, g.name, g.registrySpec),
+        weight: g.weight,
+        ...(role !== undefined ? { role } : {}),
+      };
+    }
+    return { name: g.name, grader: g.grader, weight: g.weight };
+  };
+  // What each entry is, and how a criterion and a regrade shape its grade
+  // (see `finishGraderEntry`). A file without criteria, on a live run, keeps
+  // every grader exactly as resolved.
+  const buildGraders = (arm: string | undefined): GraderEntry[] => [
+    ...compiledGraders.map((g) =>
+      finishGraderEntry(g, resolveEntry(g, arm), graderRegistry, opts.regrade),
+    ),
     ...provabilityGraders,
   ];
   const graders: GraderEntry[] = buildGraders(undefined);
@@ -1075,6 +1125,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     : undefined;
 
   const baseInvoker =
+    opts.regrade?.invoker ??
     opts.invoker ??
     (await defaultInvoker(
       ir,
@@ -1231,6 +1282,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         ...resumeRoutingIdentity,
         // 0.8.0 §9.1 — the floor `--provability` imposed (absent = the spec's).
         ...(opts.provability !== undefined ? { provability: opts.provability } : {}),
+        ...criteriaConfig,
         // NEW-HUNT-6 — this directory was resumed; `runId`/`startedAt` above
         // are the ORIGINAL run's. One ISO stamp per attempt, appended (the
         // typed round-trip lives in `ResumeManifest.resumedAt`), so a run
@@ -1673,6 +1725,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       ...routingConfig,
       // 0.8.0 §9.1 — mirrors run.json: the floor `--provability` imposed.
       ...(opts.provability !== undefined ? { provability: opts.provability } : {}),
+      ...criteriaConfig,
     },
     outDir,
   };

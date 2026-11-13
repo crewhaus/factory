@@ -709,6 +709,8 @@ agent:
       // 0.8.0 §9.2 — the provability floor and its failure mode.
       ["provability", "level"],
       ["provability", "on_fail"],
+      // A judge gate's protection (#514), wherever a step or node carries it.
+      ["judge", "protected"],
       // Who approves an on-chain write.
       ["transaction_policy", "defaultWriteApproval"],
       // The candidate roster a person declared (#514).

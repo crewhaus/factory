@@ -5121,8 +5121,10 @@ export function inertProvabilityKeys(spec: object): ReadonlyArray<string> {
     (spec as { readonly provability?: SpecProvabilityBlock }).provability,
   );
   if (block === undefined || block.level !== "off") return [];
+  // `protected` is an editing policy for the block, not gate behaviour, so
+  // it is never inert.
   return Object.keys(block)
-    .filter((k) => k !== "level")
+    .filter((k) => k !== "level" && k !== "protected")
     .sort();
 }
 

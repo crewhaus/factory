@@ -395,6 +395,42 @@ test("a run from another arm cannot be pinned onto this lineage's key, and the s
   expect(readFileSync(baselinesPath(), "utf8")).toBe(before);
 });
 
+test("a pin over a changed protected criterion is refused, plan and write, naming the owner's command", async () => {
+  writeRun(root, "r2", { samples: [sample({ sampleId: "a" })] });
+  writeIndex(root, [
+    row({
+      runId: "r2",
+      ts: "2026-01-02T00:00:00Z",
+      protectedCriteria: [{ id: "dates", digest: "d2" }],
+    }),
+  ]);
+  writeBaselines(root, {
+    "shop::smoke": {
+      ...pin(row({ runId: "r1", ts: "2026-01-01T00:00:00Z" })),
+      protectedCriteria: [{ id: "dates", digest: "d1" }],
+    },
+  });
+  const before = readFileSync(baselinesPath(), "utf8");
+  for (const dryRun of [true, false]) {
+    const out = await call(evalBaselinePin, {
+      action: "set",
+      spec: "shop",
+      dataset: "smoke",
+      runId: "r2",
+      dryRun,
+    });
+    expect(out["ok"]).toBe(false);
+    expect(String(out["error"])).toContain("protected criterion dates is measured differently");
+    expect(String(out["error"])).toContain("`crewhaus eval --rebaseline --reason <code>`");
+    expect(readFileSync(baselinesPath(), "utf8")).toBe(before);
+  }
+  // Clearing that pin would start the lineage over without the owner too.
+  const cleared = await call(evalBaselinePin, { action: "clear", spec: "shop", dataset: "smoke" });
+  expect(cleared["ok"]).toBe(false);
+  expect(String(cleared["error"])).toContain("measured with a protected criterion");
+  expect(readFileSync(baselinesPath(), "utf8")).toBe(before);
+});
+
 test("dryRun writes nothing and predicts exactly what the real call then writes", async () => {
   writeRun(root, "r1", { samples: [sample({ sampleId: "a" })] });
   writeIndex(root, [row({ runId: "r1", ts: "2026-01-01T00:00:00Z", costUsd: 0.25 })]);

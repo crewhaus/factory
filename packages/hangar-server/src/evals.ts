@@ -61,6 +61,8 @@ const PIN_REFUSAL_COPY: Readonly<Record<PinRefusal["code"], string>> = {
   all_errored: "Every case errored, so it can't be a baseline.",
   nothing_measured: "No case got a verdict, so it can't be a baseline.",
   lineage_mismatch: "It measured something else, so it can't be this baseline.",
+  regrade: "It graded another run's answers again, so it can't be a baseline.",
+  protected: "It changes a protected check, so only the owner can make it the baseline.",
 };
 
 export type EvalsView = {

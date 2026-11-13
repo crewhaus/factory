@@ -226,6 +226,7 @@ import { createMemoryEventLog, createMemorySessionStore } from "./ephemeral";
 import { type ExitRatingFeedback, FEEDBACK_EVENT_KIND, runExitRating } from "./exit-rating";
 import { type JsonSchemaLike, flattenUnionToObject } from "./flatten-union";
 import { createFooterLineGuard, neutralizeFooterLines } from "./forged-footer";
+import { admitJudgeFeedback } from "./grader-feedback";
 import { attachIncidentCollector } from "./incident-collector";
 import { type AdvertisedToolSummary, LIST_TOOLS_NAME, buildListToolsTool } from "./list-tools";
 import { createSpanUnionTracker, modelLatencyMs } from "./model-latency";
@@ -688,6 +689,11 @@ export type { ResolvedAuth } from "@crewhaus/adapter-anthropic";
 // with a stateless platform. These re-exports are purely additive — every
 // existing `runChatLoop` / `RunChatLoopOptions` consumer is unchanged.
 export { createInMemoryKV, createNodeWorkerPlatform } from "./worker-platform";
+export {
+  type AdmittedJudgeFeedback,
+  admitJudgeFeedback,
+  withoutJudgeRationale,
+} from "./grader-feedback";
 export {
   createEdgeAnthropicAdapter,
   classifyEdgeTool,
@@ -10168,36 +10174,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       scoreboard?.ungraded(turn.routeKey, turn.armId ?? turn.modelString);
     }
   };
-  /**
-   * Pillar 3 — grader text about to enter the MAIN transcript (the
-   * draft-verify `correction`, else the rationale nudge) is model-generated
-   * by a side call that read the — possibly injected — draft. It crosses the
-   * same boundary as a consult reply: classified at TrustOrigin `consult`
-   * (§7.4 / §7.5 posture for side-call model text), lineage-tagged when
-   * admitted. A blocked verdict admits nothing — the nudge then carries the
-   * score alone (no fall-through to the same grader's rationale).
-   */
-  type AdmittedGraderText =
-    | { readonly kind: "admitted"; readonly text: string }
-    | { readonly kind: "blocked" }
-    | { readonly kind: "empty" };
-  const admitGraderText = async (
-    text: string | undefined,
-    field: "correction" | "rationale",
-  ): Promise<AdmittedGraderText> => {
-    const trimmed = text?.trim() ?? "";
-    if (trimmed.length === 0) return { kind: "empty" };
-    const boundary = await classifyBoundary(trimmed, { origin: "consult" });
-    if (boundary.action === "redact") {
-      runContext.logger.warn(
-        "evaluation: grader text blocked at the transcript boundary — nudging with the score alone",
-        { field, rules: [...new Set(boundary.verdict.hits.map((h) => h.rule))] },
-      );
-      return { kind: "blocked" };
-    }
-    tagContent(runContext, trimmed, "consult");
-    return { kind: "admitted", text: trimmed };
-  };
+  /** Pillar 3 — grader text entering the transcript is screened at `consult` (./grader-feedback). */
+  const admitGraderText = (text: string | undefined, field: "correction" | "rationale") =>
+    admitJudgeFeedback(runContext, text, field);
   /** Run one turn on a forced rung as an `escalate` stage (started → done | failed). */
   const runEscalationStage = async (
     messages: Anthropic.MessageParam[],

@@ -753,8 +753,9 @@ const budgetBlock = z
  * final text with `grader`; a score below `threshold` triggers the
  * `on_fail` behaviour:
  *
- *   - `retry` (default) — re-prompt the model with the judge's rationale
- *     appended as a system nudge, at most `max_retries` times.
+ *   - `retry` (default) — re-prompt the model with the judge's rationale,
+ *     screened like a consult reply, as a user message, at most
+ *     `max_retries` times.
  *   - `halt`  — abort the turn with a classified `evaluation` failure.
  *   - `note`  — emit an `eval_graded` trace event only.
  *
@@ -913,6 +914,12 @@ const evaluationBlock = z
       .describe(
         "0.6.0: accept a judge that is also a serving arm (silences the judge-independence lint)",
       ),
+    protected: z
+      .boolean()
+      .optional()
+      .describe(
+        "the owner's: the optimizer and automatic apply only raise threshold, and loosening this bar needs the owner",
+      ),
   })
   .strict()
   .superRefine((e, ctx) => {
@@ -951,8 +958,8 @@ const evaluationBlock = z
  * below `threshold` (default 0.7), applies `on_fail`:
  *
  *   - `retry_previous` (default) — re-run the gated step/node with the
- *     judge rationale appended as a system nudge, at most `max_retries`
- *     times.
+ *     judge's feedback, screened like a consult reply, as a user message
+ *     after its input, at most `max_retries` times.
  *   - `halt`     — abort the run with a classified `evaluation` failure.
  *   - `continue` — record the `judge_verdict` trace event and proceed.
  *
@@ -1000,6 +1007,12 @@ const judgeGateBlock = z
       .optional()
       .describe(
         "0.6.0: pool tag or $profile the retry_previous re-run is forced onto (the gated step's/node's model_pool must declare it)",
+      ),
+    protected: z
+      .boolean()
+      .optional()
+      .describe(
+        "the owner's: the optimizer and automatic apply only raise threshold, and loosening this gate needs the owner",
       ),
   })
   .strict()
@@ -2643,6 +2656,12 @@ const provabilityObject = z
     execution: provabilityExecutionBlock.optional(),
     formal: provabilityFormalBlock.optional(),
     judge: provabilityJudgeBlock.optional(),
+    protected: z
+      .boolean()
+      .optional()
+      .describe(
+        "the owner's: threshold and grounded.coverage only rise and grounded.window_tokens only falls for the optimizer and automatic apply; loosening needs the owner",
+      ),
   })
   .strict();
 

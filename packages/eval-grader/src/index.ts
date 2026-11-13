@@ -55,6 +55,48 @@ export {
   type RubricSpec,
 } from "./graders-config";
 
+// Criteria (what the graders check for), the measuring instrument's hash, and
+// structured edits that keep the author's file.
+export {
+  CRITERION_ID_PATTERN,
+  CRITERION_MODES,
+  CRITERION_SEVERITIES,
+  CRITERION_SOURCES,
+  CriterionSpecSchema,
+  boundSpecsOf,
+  checkCriteria,
+  compiledCriterion,
+  criterionByGrader,
+  criterionDigest,
+  graderSpecDigest,
+  inCriterionScope,
+  kindOfGraderSpec,
+  loosening,
+  runCriteriaRecord,
+  type CompiledCriterion,
+  type CriterionMode,
+  type CriterionScope,
+  type CriterionSpec,
+  type GraderKind,
+  type Loosening,
+  type RunCriterionRecord,
+} from "./criteria";
+export {
+  gradersConfigHash,
+  measurementProjection,
+  stableDigest,
+  stableStringify,
+} from "./graders-hash";
+export {
+  GradersEditSchema,
+  GradersEditsSchema,
+  applyGradersEdits,
+  criteriaChanged,
+  type CriterionChange,
+  type GradersEdit,
+  type GradersEditResult,
+} from "./graders-edit";
+
 // Re-export for convenience so eval-runner consumers don't have to take a
 // transitive dep on @crewhaus/eval-dataset.
 export type { Sample } from "@crewhaus/eval-dataset";

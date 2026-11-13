@@ -65,7 +65,7 @@ describe("emitWorkflow — judge.escalate_to forces the retry_previous re-run", 
     expect(c).toContain("    ...(__force !== undefined ? { forcedCandidate: __force } : {}),");
     // First run: unforced. Retry: forced onto "strong".
     expect(c).toContain('priorOutput = await __runStep1("");');
-    expect(c).toContain('+ __result.rationale, "strong");');
+    expect(c).toContain(': __header, "strong");');
     // The step's pool blob still rides beside it (the runtime resolves the
     // forced arm against that roster).
     expect(c).toContain('"tags":["strong"]');
@@ -78,7 +78,7 @@ describe("emitWorkflow — judge.escalate_to forces the retry_previous re-run", 
     );
     expect(c).not.toContain("__force");
     expect(c).not.toContain("forcedCandidate");
-    expect(c).toContain("+ __result.rationale);");
+    expect(c).toContain(": __header);");
   });
 });
 

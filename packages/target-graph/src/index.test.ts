@@ -845,18 +845,50 @@ describe("emitGraph — judge gate nodes (loop contract 0.4, G02)", () => {
     expect(c).toContain('"[judge gate] retry "');
   });
 
-  test("the retry target's body appends the failing judge's rationale as a nudge", () => {
+  test("the retry target gets the failing judge's screened feedback as a user message", () => {
     const c = emitGraph(RETRY_IR).files[0]?.content ?? "";
     const draftBody = c.slice(c.indexOf('.addNode("draft"'), c.indexOf('.addNode("gate"'));
     expect(draftBody).toContain('for (const __j of ["gate"]) {');
     expect(draftBody).toContain('if (__judgeState[__j] !== "fail") continue;');
     expect(draftBody).toContain('__rec = __judgeState[__j + "_judge"]');
-    expect(draftBody).toContain("[judge feedback — the previous attempt failed the ");
-    expect(draftBody).toContain('instructions: "Write the report." + __nudge,');
+    // The rationale passes the consult screen before it is sent.
+    expect(c).toContain(
+      'import { admitJudgeFeedback, withoutJudgeRationale } from "@crewhaus/runtime-core";',
+    );
+    expect(draftBody).toContain(
+      'const __fb = await admitJudgeFeedback(ctx.runContext, __rec?.rationale, "rationale");',
+    );
+    expect(draftBody).toContain(
+      "__nudges.push('[judge feedback — the previous attempt failed the \"' + __j + '\" gate]:\\n' + __fb.text);",
+    );
+    // A blocked rationale leaves the score alone.
+    expect(draftBody).toContain('} else if (__fb.kind === "blocked") {');
+    expect(draftBody).toContain("__rec.score.toFixed(2)");
+    // The node's own instructions, and the feedback after the upstream state.
+    expect(draftBody).toContain('instructions: "Write the report.",');
+    expect(draftBody).not.toMatch(/instructions: [^\n]*__nudge/);
+    // The feedback follows the upstream state in the one user message.
+    expect(draftBody).toContain('+ (__nudge !== "" ? "\\n\\n" + __nudge : "") },');
+    expect(draftBody.indexOf("Upstream state:")).toBeGreaterThan(-1);
+    expect(draftBody.indexOf("Upstream state:")).toBeLessThan(
+      draftBody.indexOf('+ (__nudge !== ""'),
+    );
     // Nodes that no judge retries keep the plain instructions field.
     const publishBody = c.slice(c.indexOf('.addNode("publish"'), c.indexOf(".addEdge("));
     expect(publishBody).toContain('instructions: "Publish.",');
     expect(publishBody).not.toContain("__nudge");
+  });
+
+  test("the retry target's upstream state leaves its judge's rationale out", () => {
+    const c = emitGraph(RETRY_IR).files[0]?.content ?? "";
+    const draftBody = c.slice(c.indexOf('.addNode("draft"'), c.indexOf('.addNode("gate"'));
+    expect(draftBody).toContain('const __seedState = withoutJudgeRationale(prev, ["gate"]);');
+    expect(draftBody).toContain("${JSON.stringify(__seedState, null, 2)}");
+    expect(draftBody).not.toContain("JSON.stringify(prev");
+    // A node no judge retries serialises its upstream state as it is.
+    const publishBody = c.slice(c.indexOf('.addNode("publish"'), c.indexOf(".addEdge("));
+    expect(publishBody).toContain("${JSON.stringify(prev, null, 2)}");
+    expect(publishBody).not.toContain("withoutJudgeRationale");
   });
 
   test("halt: immediate classified throw, pass-gated outgoing edge, NO back-edge", () => {

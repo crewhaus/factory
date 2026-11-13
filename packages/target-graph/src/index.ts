@@ -67,8 +67,11 @@ import {
  *   - `on_fail: retry_previous` synthesizes a conditional BACK-EDGE from
  *     the judge to its single gated upstream node (`=== "fail"`); the
  *     retry counter lives in the checkpointed state, the gated node reads
- *     the failing judge's rationale out of the state as an instructions
- *     nudge, and exhausted retries throw the classified failure inside
+ *     the failing judge's rationale out of the state and, once the consult
+ *     screen admits it, receives it as a user message after the upstream
+ *     state (the score alone when the screen blocks it); the upstream state
+ *     it reads leaves that judge's rationale out, and exhausted
+ *     retries throw the classified failure inside
  *     the body (so an edge-visible "fail" always means retries remain).
  *     A retry_previous judge therefore requires exactly ONE non-judge
  *     upstream (transitively through other judges) — enforced at emit
@@ -543,9 +546,12 @@ const __EVAL_EXIT: number = (EXIT_CODES as Record<string, number>)["evaluation"]
  *
  * Loop contract 0.4 (Batch B, G02) — when this node is the retry target
  * of one or more `retry_previous` judges (`nudgeJudges`), the body reads
- * each currently-failing judge's rationale out of the state and appends
- * it to the instructions as a nudge, so a retried run self-corrects
- * against the gate's feedback.
+ * each currently-failing judge's rationale out of the state, screens it at
+ * the consult boundary, and sends the feedback as a user message after the
+ * upstream state (the score alone for a blocked rationale), so a retried run
+ * self-corrects against the gate's feedback. The upstream state it serialises
+ * leaves those judges' rationale out, so the screened feedback is the only
+ * copy the node reads.
  */
 /**
  * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field.
@@ -761,23 +767,31 @@ function renderNodeBody(
       : "";
   const hitlRecordBlock =
     node.hitlPrompt !== undefined ? `\n      __next[${nameJs} + "_decision"] = __decision;` : "";
-  // G02 — judge-retry nudge: read every currently-failing gating judge's
-  // rationale out of the state and append it to the instructions.
+  // G02 — judge-retry feedback: every currently-failing gating judge's
+  // rationale, screened at the consult boundary, becomes a user message after
+  // the upstream state.
   const nudgeBlock =
     nudgeJudges.length > 0
       ? `
       // G02 — a retry_previous judge sent the run back here when its state
-      // record reads "fail"; its rationale rides in as a nudge.
+      // record reads "fail"; its feedback rides in as a user message: the
+      // rationale once the consult screen admits it, else the score alone.
       const __judgeState = prev as Record<string, unknown>;
       const __nudges: string[] = [];
       for (const __j of [${nudgeJudges.map((n) => escapeJsonString(n)).join(", ")}]) {
         if (__judgeState[__j] !== "fail") continue;
-        const __rec = __judgeState[__j + "_judge"] as { rationale?: string } | undefined;
-        if (typeof __rec?.rationale === "string" && __rec.rationale.length > 0) {
-          __nudges.push('[judge feedback — the previous attempt failed the "' + __j + '" gate]:\\n' + __rec.rationale);
+        const __rec = __judgeState[__j + "_judge"] as { rationale?: string; score?: number } | undefined;
+        const __fb = await admitJudgeFeedback(ctx.runContext, __rec?.rationale, "rationale");
+        if (__fb.kind === "admitted") {
+          __nudges.push('[judge feedback — the previous attempt failed the "' + __j + '" gate]:\\n' + __fb.text);
+        } else if (__fb.kind === "blocked") {
+          __nudges.push('[judge feedback — the previous attempt failed the "' + __j + '" gate (score ' + (typeof __rec?.score === "number" ? __rec.score.toFixed(2) : "unknown") + ')]');
         }
       }
-      const __nudge = __nudges.length === 0 ? "" : "\\n\\n" + __nudges.join("\\n\\n");`
+      const __nudge = __nudges.join("\\n\\n");
+      // The upstream state this node reads leaves those judges' rationale
+      // out, so the screened feedback above is the only copy it gets.
+      const __seedState = withoutJudgeRationale(prev, [${nudgeJudges.map((n) => escapeJsonString(n)).join(", ")}]);`
       : "";
   // 0.6.0 §7.3 — a retry_previous judge with `escalate_to` forces the re-run
   // onto that roster arm: read like the nudge, off the checkpointed state.
@@ -796,7 +810,12 @@ function renderNodeBody(
     forcing.length > 0
       ? "\n        ...(__force !== undefined ? { forcedCandidate: __force } : {}),"
       : "";
-  const instructionsExpr = nudgeJudges.length > 0 ? `${instructionsJs} + __nudge` : instructionsJs;
+  // The judges' feedback follows the upstream state in the same user
+  // message, so every provider takes it.
+  const nudgeSeed = nudgeJudges.length > 0 ? ' + (__nudge !== "" ? "\\n\\n" + __nudge : "")' : "";
+  // A node a judge retries serialises the state without that judge's
+  // rationale; every other node serialises `prev` as it is.
+  const seedStateExpr = nudgeJudges.length > 0 ? "__seedState" : "prev";
   // Cluster S — the eval-entry variant reads THIS invocation's eval seams off
   // the per-run lookup keyed by the RunContext the caller passed (never a
   // module-scope mutable, which two concurrent samples would clobber):
@@ -813,11 +832,11 @@ function renderNodeBody(
   return `
     async (ctx, prev) => {${evalSeamBlock}${hitlPreBlock}${nudgeBlock}${forceBlock}
       const __seed = [
-        { role: "user", content: \`Upstream state:\\n\\\`\\\`\\\`json\\n\${JSON.stringify(prev, null, 2)}\\n\\\`\\\`\\\`\` },
+        { role: "user", content: \`Upstream state:\\n\\\`\\\`\\\`json\\n\${JSON.stringify(${seedStateExpr}, null, 2)}\\n\\\`\\\`\\\`\`${nudgeSeed} },
       ];
       const __reply = await runChatLoop({
         model: ${modelJs},
-        instructions: ${instructionsExpr},
+        instructions: ${instructionsJs},
         sessionName: ${escapeJsonString(node.name)} + "-" + ctx.graphRunId,
         sessionTarget: "graph-node",
         seedMessages: __seed,
@@ -1079,8 +1098,10 @@ function renderAgent(ir: IrGraphV0, evalEntry = false): string {
   const hybridImport = Object.values(ir.nodes).some((n) => poolNeedsHybridWiring(n.modelPool))
     ? `\n${HYBRID_WIRING_IMPORT}`
     : "";
+  // A retry_previous judge's feedback is screened before the re-run.
+  const hasRetryJudges = nudgeJudgesByNode.size > 0;
   const judgeImport = hasJudges
-    ? `\n${JUDGE_PANEL_IMPORT}\nimport { attachRunEventSink } from "@crewhaus/runtime-core";\nimport type { TraceEventBus } from "@crewhaus/trace-event-bus";`
+    ? `\n${JUDGE_PANEL_IMPORT}\nimport { attachRunEventSink } from "@crewhaus/runtime-core";${hasRetryJudges ? '\nimport { admitJudgeFeedback, withoutJudgeRationale } from "@crewhaus/runtime-core";' : ""}\nimport type { TraceEventBus } from "@crewhaus/trace-event-bus";`
     : "";
   // 0.6.0 §7.3 (PR 9c) — the judge nodes publish `judge_verdict` on the shared
   // bus between node loops, when no node's runChatLoop is live to mirror it

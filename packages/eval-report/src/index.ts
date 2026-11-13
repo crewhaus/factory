@@ -173,6 +173,7 @@ export {
   type MeasurementProblem,
   type PinOptions,
   type PinOutcome,
+  type PinOwnerCheck,
   type PinRefusal,
   manualRebaseline,
   measurementProblem,
@@ -213,12 +214,20 @@ export {
   type CaseDigests,
   type Comparability,
   type ComparabilityRule,
+  type MeasuredOptions,
   comparability,
   lostMeasurement,
   measuredInBaseline,
+  protectedChanges,
   readCaseDigests,
   unmeasurableRun,
 } from "./comparability";
+// What decides a run's protected criteria, as one digest each.
+export {
+  type ProtectedCriterionDigest,
+  protectedCriteriaOf,
+  protectedDigestChanges,
+} from "./protected-criteria";
 // Trends cut where the dataset or the instrument changed.
 export {
   type Boundary,

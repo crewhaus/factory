@@ -128,18 +128,26 @@ export function readPins(harnessDir: string): string[] {
 
 export type PinBaselineResult =
   | { readonly outcome: "ok"; readonly baseline: BaselineEntry }
-  | { readonly outcome: "rejected"; readonly reason: string };
+  | { readonly outcome: "rejected"; readonly reason: string }
+  /** The pin changes a protected criterion: the owner confirms with the spec's name. */
+  | { readonly outcome: "needs_owner"; readonly reason: string; readonly confirmName: string };
 
 /**
  * Re-pin the eval baseline to an existing run of THIS harness. The entry is
  * copied from the run index — never assembled from the request — so the
  * pinned `(specName, datasetName)` key and the dataset hash are exactly the
  * ones the run was measured under.
+ *
+ * A pin that changes a protected criterion the replaced pin was measured with
+ * is the owner's: it is refused (`needs_owner`) until the request carries the
+ * typed confirmation, the run's spec name, and then marked `protectedChange`.
  */
 export function pinBaseline(args: {
   readonly harnessDir: string;
   readonly runId: string;
   readonly nowIso: string;
+  /** The typed confirmation for a pin that changes a protected criterion. */
+  readonly confirmName?: string;
 }): PinBaselineResult {
   const evalsDir = resolveInside(args.harnessDir, [".crewhaus", "evals"]);
   if (evalsDir === undefined) {
@@ -164,7 +172,14 @@ export function pinBaseline(args: {
   }
   let pinned: ReturnType<typeof pinRun>;
   try {
-    pinned = pinRun(run, args.nowIso, evalsDir, { cmd: "hangar" });
+    const specName = run.specName;
+    pinned = pinRun(run, args.nowIso, evalsDir, {
+      cmd: "hangar",
+      ownerCheck: () =>
+        args.confirmName === specName
+          ? { ok: true }
+          : { ok: false, reason: `confirm with the spec's name, "${specName}"` },
+    });
   } catch (err) {
     // eval-report refuses a pin file that is a link, a FIFO or not a JSON
     // object, by name and reason: that is the operator's answer (a 409), not
@@ -172,7 +187,11 @@ export function pinBaseline(args: {
     if (err instanceof ReportError) return { outcome: "rejected", reason: err.message };
     throw err;
   }
-  if (!pinned.ok) return { outcome: "rejected", reason: pinned.refusal.reason };
+  if (!pinned.ok) {
+    return pinned.refusal.code === "protected"
+      ? { outcome: "needs_owner", reason: pinned.refusal.reason, confirmName: run.specName }
+      : { outcome: "rejected", reason: pinned.refusal.reason };
+  }
   return { outcome: "ok", baseline: pinned.pin };
 }
 

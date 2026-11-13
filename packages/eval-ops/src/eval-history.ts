@@ -74,6 +74,7 @@ import {
   type ComparabilityRule,
   HistoryWriteError,
   type LoadedRun,
+  type MeasuredOptions,
   type RebaselineReason,
   type RecordEvalRunOptions,
   type ReportDiff,
@@ -88,8 +89,10 @@ import {
   lineageOfEntry,
   loadRun,
   lostMeasurement,
+  measuredInBaseline,
   pinRefusal,
   pinRun,
+  protectedChanges,
   readBaselines,
   readCaseDigests,
   readRunIndexLatest,
@@ -102,6 +105,7 @@ import {
   type EvalRoutingMode,
   type EvalRunSummary,
   aggregate,
+  sampleNotMeasured,
   sampleWithoutVerdict,
 } from "@crewhaus/eval-runner";
 import { type GateThresholds, type GateVerdict, gate } from "@crewhaus/regression-runner";
@@ -177,6 +181,27 @@ export type FinishEvalOptions = {
    * a test passes them in.
    */
   readonly cases?: CaseDigests;
+  /**
+   * Names of the `perGrader` entries this run's graders file records through a
+   * provability grader under a name of its own (a `type: registry` entry),
+   * beside the canonical six. Reading which cases the baseline measured reads
+   * a status-less proof check's grade by its pinned prefix, and no other.
+   */
+  readonly provabilityGraderNames?: ReadonlySet<string>;
+  /**
+   * `--regrade-baseline`: when the baseline was measured with another
+   * instrument, regrade the baseline's recorded answers with this run's graders
+   * (the caller records that run) and gate this run against it on the cases
+   * both hold. On a pass this run is pinned, marked as a re-anchor.
+   */
+  readonly regradeBaseline?: (baseline: BaselineEntry) => Promise<LoadedRun>;
+  /**
+   * Whether the harness's owner allows a re-anchor that changes a protected
+   * criterion. Absent: such a re-anchor is refused.
+   */
+  readonly ownerCheck?: () =>
+    | { readonly ok: true; readonly principal?: string }
+    | { readonly ok: false; readonly reason: string };
 };
 
 export type FinishEvalResult = {
@@ -185,8 +210,15 @@ export type FinishEvalResult = {
   readonly gateReason?: string;
   /** Why the run could not be gated against its baseline, when it could not. */
   readonly notComparable?: ComparabilityRule;
-  /** This run re-anchored its lineage (`--rebaseline`). */
+  /** This run re-anchored its lineage (`--rebaseline`, `--regrade-baseline`). */
   readonly rebaselined?: true;
+  /**
+   * A re-anchor the caller asked for was refused before anything was pinned,
+   * with why (a protected criterion changed and the owner check did not pass).
+   */
+  readonly refused?: string;
+  /** The run `--regrade-baseline` recorded: the baseline's answers, regraded. */
+  readonly regradedBaseline?: string;
   /**
    * 0.6.0 §6.1 — this run PINNED a per-arm lineage that had no baseline of
    * its own (it is the lineage's second run, beside an older legacy pin). The
@@ -286,12 +318,16 @@ export function routedInstrumentMismatch(
  * already exclude each run's own such samples. A sample the baseline measured
  * that `next` did not measure fails the gate (`cases the baseline measured
  * were not measured: <ids>`), for every caller: a pass means every case the
- * baseline measured was measured again.
+ * baseline measured was measured again. A baseline case counts as measured
+ * unless a grade's status says otherwise or a proof check recorded it as not
+ * measured; `measured.provabilityGraderNames` names a graders file's own
+ * entries for the provability graders, beside the canonical six.
  */
 export function gateRuns(
   prev: EvalRunSummary,
   next: EvalRunSummary,
   thresholds: GateThresholds = {},
+  measured: MeasuredOptions = {},
 ): GateVerdict {
   // 0.6.0 §6.1 — two ROUTED runs that read different arm snapshots are two
   // different instruments: the learned policy served different arms on
@@ -336,7 +372,7 @@ export function gateRuns(
     const ids = verdict.report.regressions.map((r) => r.sampleId).join(", ");
     reasons.push(`sample regressions despite a flat pass rate: [${ids}]`);
   }
-  const lost = lostMeasurement(prev, next);
+  const lost = lostMeasurement(prev, next, measured);
   if (lost.length > 0) {
     reasons.push(`cases the baseline measured were not measured: ${lost.join(", ")}`);
   }
@@ -374,6 +410,39 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   const { summary, specName, specSource } = opts;
   const datasetName = summary.config.datasetName;
   const absOut = resolve(opts.outDir);
+  const measured: MeasuredOptions =
+    opts.provabilityGraderNames !== undefined
+      ? { provabilityGraderNames: opts.provabilityGraderNames }
+      : {};
+
+  /**
+   * A re-anchor over `base` that changes a protected criterion needs the
+   * owner: the refusal's reason when the check does not pass, else the
+   * `protectedChange` mark (or nothing when no protected criterion moved).
+   */
+  // The owner is asked at most once per run, whichever check needs it first.
+  let ownerAnswer: ReturnType<NonNullable<FinishEvalOptions["ownerCheck"]>> | undefined;
+  const askOwner = (): ReturnType<NonNullable<FinishEvalOptions["ownerCheck"]>> => {
+    ownerAnswer ??= opts.ownerCheck?.() ?? {
+      ok: false as const,
+      reason: "no owner check was supplied",
+    };
+    return ownerAnswer;
+  };
+  const protectedGate = (
+    base: EvalRunSummary,
+    flag: string,
+  ): { readonly refused: string } | { readonly mark?: { readonly protectedChange: true } } => {
+    const changes = protectedChanges(base, summary);
+    if (changes.length === 0) return {};
+    const check = askOwner();
+    if (!check.ok) {
+      return {
+        refused: `${flag}: ${changes.join("; ")} — re-anchoring over a protected criterion needs this harness's owner (${check.reason})`,
+      };
+    }
+    return { mark: { protectedChange: true } };
+  };
 
   // Build + append the index entry through eval-report's shared recorder —
   // the same call the standalone `target: eval` bundle makes, so one eval has
@@ -440,7 +509,9 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
       write(
         refusal.code === "partial"
           ? `[eval] partial run (budget exhausted) — baseline not pinned (${label})`
-          : `[eval] run measured nothing — baseline not pinned (${label})`,
+          : refusal.code === "regrade"
+            ? `[eval] run graded recorded answers — baseline not pinned (${label})`
+            : `[eval] run measured nothing — baseline not pinned (${label})`,
       );
       return;
     }
@@ -452,7 +523,14 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     // `entry` is this run's index row, so the pin and the row can never
     // disagree about which arm they are.
     try {
-      if (!pinRun(entry, entry.ts, opts.evalsDir, { cmd: "crewhaus eval" }).ok) return;
+      const pinned = pinRun(entry, entry.ts, opts.evalsDir, {
+        cmd: "crewhaus eval",
+        ownerCheck: askOwner,
+      });
+      if (!pinned.ok) {
+        write(`[eval] baseline not set (${label}): ${pinned.refusal.reason}`);
+        return;
+      }
     } catch (err) {
       if (!(err instanceof HistoryWriteError)) throw err;
       historyRefused(`baseline not set (${label})`, err);
@@ -518,7 +596,10 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
       );
     }
     const priorRuns = readRunIndexLatest(opts.evalsDir).filter(
-      (e) => e.runId !== summary.runId && baselineKeyFor(lineageOfEntry(e)) === lookup.key,
+      (e) =>
+        e.runId !== summary.runId &&
+        e.purpose === undefined &&
+        baselineKeyFor(lineageOfEntry(e)) === lookup.key,
     );
     if (priorRuns.length === 0) {
       write(
@@ -622,7 +703,37 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
       ...(baseCases !== undefined ? { cases: baseCases } : {}),
     },
     { entry, summary: nextLoaded.summary, ...(runCases !== undefined ? { cases: runCases } : {}) },
+    measured,
   );
+  // `--regrade-baseline`: the instrument changed, so grade the baseline's own
+  // answers with this run's graders and gate against that.
+  // Only what a regrade measures again can be regraded away: the graders,
+  // the judge, its calibration and the plugin graders. A routing change
+  // (another arm snapshot or policy) stays not comparable.
+  const notRegradable =
+    !comparable.comparable && comparable.rule === "instrument"
+      ? (comparable.changes ?? []).filter(
+          (c) => c.unverified !== true && !REGRADE_REMEASURES.has(c.field),
+        )
+      : [];
+  if (
+    !comparable.comparable &&
+    comparable.rule === "instrument" &&
+    notRegradable.length === 0 &&
+    prevLoaded !== undefined &&
+    opts.regradeBaseline !== undefined
+  ) {
+    return gateAgainstRegraded(baseline, prevLoaded, nextLoaded, runCases, baseCases);
+  }
+  if (opts.regradeBaseline !== undefined) {
+    write(
+      comparable.comparable
+        ? "[eval] --regrade-baseline: the baseline measured with the same instrument — gating against it as it is"
+        : notRegradable.length > 0
+          ? `[eval] --regrade-baseline: a regrade cannot measure again what changed (${notRegradable.map((c) => c.field).join(", ")}: routing) — the baseline stays as it is`
+          : "[eval] --regrade-baseline: only a changed instrument is regraded — the baseline stays as it is",
+    );
+  }
   if (!comparable.comparable || prevLoaded === undefined) {
     const rule: ComparabilityRule = comparable.comparable ? "baseline_unreadable" : comparable.rule;
     const reason = comparable.comparable
@@ -714,9 +825,14 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   // part of the run summaries regression-runner compares). A declared cost
   // ceiling that cannot be checked (pricing miss → costUsd absent) warns
   // loudly rather than failing on a number nobody computed.
-  const verdict = gateRuns(prevLoaded.summary, nextForGate.summary, {
-    ...(opts.maxP95LatencyMs !== undefined ? { latencyThreshold: opts.maxP95LatencyMs } : {}),
-  });
+  const verdict = gateRuns(
+    prevLoaded.summary,
+    nextForGate.summary,
+    {
+      ...(opts.maxP95LatencyMs !== undefined ? { latencyThreshold: opts.maxP95LatencyMs } : {}),
+    },
+    measured,
+  );
   if (opts.maxCostUsd !== undefined && opts.costUsd === undefined) {
     warn(
       "[eval] warning: --max-cost-usd declared but this run's cost is unknown (no pricing row for the model) — cost gate not applied",
@@ -744,6 +860,180 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   return { gateFailed: false };
 
   /**
+   * `--regrade-baseline`: the baseline's answers regraded with this run's
+   * graders, restricted to the cases the baseline held, then the same
+   * comparability and gate as any run (removed or changed cases stay not
+   * comparable). A pass pins this run, marked as a re-anchor; a protected
+   * criterion changed needs the owner first.
+   */
+  async function gateAgainstRegraded(
+    replaced: BaselineEntry,
+    prev: LoadedRun,
+    next: LoadedRun,
+    runCases: CaseDigests | undefined,
+    baseCases: CaseDigests | undefined,
+  ): Promise<FinishEvalResult> {
+    const owner = protectedGate(prev.summary, "--regrade-baseline");
+    if ("refused" in owner) {
+      write(`[eval] ${owner.refused}`);
+      write(`[eval] baseline kept: ${replaced.runId}`);
+      return { gateFailed: true, gateReason: owner.refused, refused: owner.refused };
+    }
+    // Cases the baseline held that this run does not cannot be compared on
+    // any grading of the baseline's answers: refused before anything is spent.
+    const runIds = new Set(next.summary.samples.map((x) => x.sampleId));
+    const removed = prev.summary.samples.map((x) => x.sampleId).filter((id) => !runIds.has(id));
+    if (removed.length > 0) {
+      const reason = `${removed.length} case(s) of the baseline are not in this run — re-anchor the baseline with \`crewhaus eval --rebaseline --reason cases-changed\``;
+      write(`[eval] not comparable with baseline ${replaced.runId}: ${reason}`);
+      write(`[eval]   cases: ${removed.join(", ")}`);
+      write(`[eval] baseline kept: ${replaced.runId}`);
+      const gateReason = `not comparable with baseline ${replaced.runId}: ${reason}`;
+      return opts.gateRequested
+        ? { gateFailed: true, gateReason, notComparable: "cases_removed" }
+        : { gateFailed: false, notComparable: "cases_removed" };
+    }
+    write(
+      `[eval] --regrade-baseline: the instrument changed since ${replaced.runId} — regrading its answers with this run's graders`,
+    );
+    let regraded: LoadedRun;
+    try {
+      regraded = await (opts.regradeBaseline as (b: BaselineEntry) => Promise<LoadedRun>)(replaced);
+    } catch (err) {
+      const reason = `--regrade-baseline: the baseline ${replaced.runId} could not be regraded (${err instanceof Error ? err.message : String(err)})`;
+      write(`[eval] ${reason}`);
+      write(`[eval] baseline kept: ${replaced.runId}`);
+      return opts.gateRequested
+        ? { gateFailed: true, gateReason: reason, notComparable: "instrument" }
+        : { gateFailed: false, notComparable: "instrument" };
+    }
+    const regradedId = regraded.summary.runId;
+    write(`[eval] --regrade-baseline: regraded ${replaced.runId} as ${regradedId}`);
+    const baseIds = prev.summary.samples.map((s) => s.sampleId);
+    const base = restrictTo(regraded, baseIds);
+    // A regrade stands in for the baseline only where it measured what the
+    // baseline measured: a case the baseline measured that the regrade could
+    // not (its answers missing, a grader that cannot grade recorded answers)
+    // leaves the gate nothing to hold this run to, so nothing is gated or
+    // pinned. A case the new graders skip or only observe is theirs to set
+    // aside, on this run too.
+    const regradedById = new Map(base.summary.samples.map((s) => [s.sampleId, s]));
+    const unregraded = prev.summary.samples
+      .filter((s) => {
+        if (!measuredInBaseline(s, measured)) return false;
+        const again = regradedById.get(s.sampleId);
+        return again === undefined || again.error !== undefined || sampleNotMeasured(again);
+      })
+      .map((s) => s.sampleId);
+    const nothingRegraded = unmeasurableRun(base.summary);
+    if (unregraded.length > 0 || nothingRegraded !== undefined) {
+      const reason =
+        unregraded.length > 0
+          ? `${unregraded.length} case(s) of the baseline could not be regraded: ${unregraded.join(", ")}`
+          : `the regraded baseline ${regradedId} measured nothing (${nothingRegraded?.reason})`;
+      write(`[eval] not comparable with the regraded baseline ${regradedId}: ${reason}`);
+      write(`[eval] baseline kept: ${replaced.runId}`);
+      const gateReason = `not comparable with the regraded baseline ${regradedId}: ${reason}`;
+      return opts.gateRequested
+        ? {
+            gateFailed: true,
+            gateReason,
+            notComparable: "instrument",
+            regradedBaseline: regradedId,
+          }
+        : { gateFailed: false, notComparable: "instrument", regradedBaseline: regradedId };
+    }
+    const result = comparability(
+      {
+        pin: replaced,
+        summary: base.summary,
+        ...(baseCases !== undefined ? { cases: baseCases } : {}),
+      },
+      { entry, summary: next.summary, ...(runCases !== undefined ? { cases: runCases } : {}) },
+      measured,
+    );
+    const fail = (reason: string, rule?: ComparabilityRule): FinishEvalResult => {
+      write(`[eval] baseline kept: ${replaced.runId}`);
+      return opts.gateRequested
+        ? {
+            gateFailed: true,
+            gateReason: reason,
+            regradedBaseline: regradedId,
+            ...(rule !== undefined ? { notComparable: rule } : {}),
+          }
+        : {
+            gateFailed: false,
+            regradedBaseline: regradedId,
+            ...(rule !== undefined ? { notComparable: rule } : {}),
+          };
+    };
+    if (!result.comparable) {
+      write(`[eval] not comparable with the regraded baseline ${regradedId}: ${result.reason}`);
+      if (result.ids !== undefined) write(`[eval]   cases: ${result.ids.join(", ")}`);
+      return fail(
+        `not comparable with the regraded baseline ${regradedId}: ${result.reason}`,
+        result.rule,
+      );
+    }
+    if (result.added.length > 0) {
+      write(`[eval] new cases, no baseline yet: ${result.added.join(", ")}`);
+    }
+    const nextForGate = result.added.length === 0 ? next : restrictTo(next, result.shared);
+    const verdict = gateRuns(
+      base.summary,
+      nextForGate.summary,
+      {
+        ...(opts.maxP95LatencyMs !== undefined ? { latencyThreshold: opts.maxP95LatencyMs } : {}),
+      },
+      measured,
+    );
+    const costReason = costGateReason(opts.costUsd, opts.maxCostUsd);
+    const reasons = [
+      ...(verdict.verdict === "fail" ? [verdict.reason ?? "regression gate failed"] : []),
+      ...(costReason !== undefined ? [costReason] : []),
+    ];
+    if (reasons.length > 0) {
+      const reason = reasons.join("; ");
+      write(`[eval] gate: FAIL — ${reason}`);
+      return fail(reason);
+    }
+    write(`[eval] gate: PASS (against the regraded baseline ${regradedId})`);
+    if (!opts.promote) {
+      write(`[eval] baseline kept: ${replaced.runId} (--no-promote)`);
+      return { gateFailed: false, regradedBaseline: regradedId };
+    }
+    warnReplayedPin();
+    let outcome: ReturnType<typeof pinRun>;
+    try {
+      outcome = pinRun(entry, entry.ts, opts.evalsDir, {
+        rebaselined: {
+          from: replaced.runId,
+          reason: "instrument-changed",
+          cmd: "crewhaus eval --regrade-baseline",
+          ...(owner.mark ?? {}),
+        },
+        ownerCheck: askOwner,
+      });
+    } catch (err) {
+      if (!(err instanceof HistoryWriteError)) throw err;
+      historyRefused("baseline not re-anchored", err);
+      return opts.gateRequested
+        ? {
+            gateFailed: true,
+            gateReason: `--regrade-baseline: baseline not re-anchored (${err.message})`,
+            regradedBaseline: regradedId,
+          }
+        : { gateFailed: false, regradedBaseline: regradedId };
+    }
+    if (!outcome.ok) {
+      write(`[eval] --regrade-baseline: ${outcome.refusal.reason}`);
+      return fail(`--regrade-baseline: ${outcome.refusal.reason}`);
+    }
+    write(`[eval] baseline re-anchored: ${summary.runId} (instrument-changed, regraded)`);
+    return { gateFailed: false, rebaselined: true, regradedBaseline: regradedId };
+  }
+
+  /**
    * `--rebaseline`: re-anchor the lineage on this run. Prints what changed
    * against the replaced baseline when it can be read, then pins with the
    * mark. The run is already known to be measurable.
@@ -752,6 +1042,7 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     replaced: BaselineEntry | undefined,
     rebaseline: { readonly reason: RebaselineReason; readonly cmd: string },
   ): Promise<FinishEvalResult> {
+    let replacedSummary: EvalRunSummary | undefined;
     if (replaced !== undefined) {
       write(`[eval] --rebaseline: re-anchoring ${lineageLabel} (was ${replaced.runId})`);
       let prev: EvalRunSummary | undefined;
@@ -760,6 +1051,7 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
       } catch {
         prev = undefined;
       }
+      replacedSummary = prev;
       if (prev === undefined) {
         write(`[eval]   the baseline run ${replaced.runId} could not be read`);
       } else {
@@ -787,6 +1079,30 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
         if (added.length > 0) write(`[eval]   cases added: ${added.join(", ")}`);
       }
     }
+    let protectedMark: { readonly protectedChange: true } | undefined;
+    if (replacedSummary !== undefined) {
+      const owner = protectedGate(replacedSummary, "--rebaseline");
+      if ("refused" in owner) {
+        write(`[eval] ${owner.refused}`);
+        write(`[eval] baseline kept: ${replaced?.runId ?? "(none)"}`);
+        return { gateFailed: true, gateReason: owner.refused, refused: owner.refused };
+      }
+      protectedMark = owner.mark;
+    } else if (
+      replaced !== undefined &&
+      (summary.config.criteria ?? []).some((c) => c.protected === true)
+    ) {
+      // The replaced baseline cannot be read, so nothing shows which of this
+      // run's protected criteria it was measured with: the owner decides.
+      const check = askOwner();
+      if (!check.ok) {
+        const refused = `--rebaseline: the baseline run ${replaced.runId} could not be read to check its protected criteria — re-anchoring over a protected criterion needs this harness's owner (${check.reason})`;
+        write(`[eval] ${refused}`);
+        write(`[eval] baseline kept: ${replaced.runId}`);
+        return { gateFailed: true, gateReason: refused, refused };
+      }
+      protectedMark = { protectedChange: true };
+    }
     warnReplayedPin();
     let outcome: ReturnType<typeof pinRun>;
     try {
@@ -795,12 +1111,19 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
           ...(replaced !== undefined ? { from: replaced.runId } : {}),
           reason: rebaseline.reason,
           cmd: rebaseline.cmd,
+          ...(protectedMark ?? {}),
         },
+        ownerCheck: askOwner,
       });
     } catch (err) {
       if (!(err instanceof HistoryWriteError)) throw err;
       historyRefused("baseline not re-anchored", err);
-      return { gateFailed: false };
+      return opts.gateRequested
+        ? {
+            gateFailed: true,
+            gateReason: `--rebaseline: baseline not re-anchored (${err.message})`,
+          }
+        : { gateFailed: false };
     }
     if (!outcome.ok) {
       write(`[eval] --rebaseline: ${outcome.refusal.reason}`);
@@ -812,6 +1135,19 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     return { gateFailed: false, rebaselined: true };
   }
 }
+
+/**
+ * The instrument fields a regrade measures again: it grades the baseline's
+ * recorded answers with this run's graders, judge, calibration and plugin
+ * graders. A routing change (`armsDigest`, `policyVersion`) is in the answers
+ * themselves, so no regrade can stand in for it.
+ */
+const REGRADE_REMEASURES: ReadonlySet<string> = new Set([
+  "gradersHash",
+  "judgeModel",
+  "calibrationDigest",
+  "pluginsDigest",
+]);
 
 /** The regression-union suffix a run's datasetName carries. */
 const UNION_SUFFIX = /^(.*)\+regressions@v(\d+)$/;

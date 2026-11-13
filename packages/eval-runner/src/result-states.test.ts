@@ -144,15 +144,29 @@ describe("aggregate — samples without a verdict", () => {
 });
 
 describe("gradeStatusOf", () => {
-  test("reads `status`, and a provability rationale prefix on a record without one", () => {
+  const legacy = { legacyProvability: true } as const;
+  test("reads `status`, and a provability rationale prefix on a provability record without one", () => {
     expect(gradeStatusOf({ status: "skipped", rationale: "x" })).toBe("skipped");
+    expect(gradeStatusOf({ status: "skipped", rationale: "x" }, legacy)).toBe("skipped");
     expect(
-      gradeStatusOf({ rationale: "no proof bundle (is provability: declared?) — nothing graded" }),
+      gradeStatusOf(
+        { rationale: "no proof bundle (is provability: declared?) — nothing graded" },
+        legacy,
+      ),
     ).toBe("not_measured");
-    expect(gradeStatusOf({ rationale: "the gate could not verify this answer (x)" })).toBe(
+    expect(gradeStatusOf({ rationale: "the gate could not verify this answer (x)" }, legacy)).toBe(
       "not_measured",
     );
-    expect(gradeStatusOf({ rationale: "output matched" })).toBeUndefined();
+    expect(gradeStatusOf({ rationale: "output matched" }, legacy)).toBeUndefined();
+  });
+
+  test("any other grade is read by its status alone, whatever its rationale says", () => {
+    expect(
+      gradeStatusOf({ rationale: "no proof bundle (is provability: declared?) — nothing graded" }),
+    ).toBeUndefined();
+    expect(
+      gradeStatusOf({ rationale: "the gate could not verify this answer (x)" }),
+    ).toBeUndefined();
   });
 });
 

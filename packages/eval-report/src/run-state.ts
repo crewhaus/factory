@@ -40,6 +40,8 @@ export type RunState = {
   readonly resumed?: true;
   /** Every tool result came from a recording. */
   readonly replayed?: true;
+  /** The run graded another run's recorded answers (a regrade or a preview). */
+  readonly regraded?: true;
 };
 
 /** The state of a run, from its summary. */
@@ -54,6 +56,7 @@ export function runState(summary: EvalRunSummary): RunState {
     total: samples.length,
     ...(summary.resumed !== undefined ? { resumed: true as const } : {}),
     ...(summary.config?.toolRecording?.mode === "replay" ? { replayed: true as const } : {}),
+    ...(summary.config?.purpose !== undefined ? { regraded: true as const } : {}),
   };
 }
 

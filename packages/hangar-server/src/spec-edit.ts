@@ -78,9 +78,11 @@ import {
   escalationFor,
   isCredentialKey,
   isOptimizable,
+  protectedBarChange,
   specHasPath,
   surfaceFor,
   surfaceMatchesFrom,
+  withPatchApplied,
 } from "@crewhaus/spec-patch";
 import {
   type CommitFailure,
@@ -898,11 +900,41 @@ function segmentsOf(edit: SpecEdit): string[] {
 
 type Split = { readonly auto: SpecTrustRow[]; readonly human: SpecTrustRow[] };
 
-function splitByTier(target: string, edits: readonly SpecEdit[]): Split {
+/**
+ * Each edit's tier. An edit the optimizer could make that loosens a bar the
+ * spec protects (`protectedBarChange` against the current spec, `current`) is
+ * the owner's: it moves to human-owned as a security surface, with the bar's
+ * reason, so it never applies under the optimizer's restriction.
+ */
+function splitByTier(target: string, edits: readonly SpecEdit[], current: string): Split {
   const auto: SpecTrustRow[] = [];
   const human: SpecTrustRow[] = [];
+  let doc: unknown;
+  try {
+    doc = parseYamlOnly(current);
+  } catch {
+    doc = undefined;
+  }
   for (const edit of edits) {
     const row = classifyPath(target, segmentsOf(edit));
+    if (row.tier === "auto-tunable" && doc !== undefined) {
+      const after = withPatchApplied(
+        doc,
+        edit.path,
+        edit.value === undefined ? "remove" : "replace",
+        edit.value,
+      );
+      const loosened = protectedBarChange(doc, after);
+      if (loosened !== undefined) {
+        human.push({
+          ...row,
+          tier: "human-owned",
+          securitySurface: true,
+          reason: `${loosened.reason} — loosening a protected bar is the owner's change`,
+        });
+        continue;
+      }
+    }
     (row.tier === "auto-tunable" ? auto : human).push(row);
   }
   return { auto, human };
@@ -1011,7 +1043,7 @@ async function applyBatch(
   requireWholeSpec(file);
   const check = await checkSpec(ctx, file.text, "issues");
   const readOnly = readOnlyOf(check, ctx.harnessDir);
-  const { auto, human } = splitByTier(file.target, edits);
+  const { auto, human } = splitByTier(file.target, edits, file.text);
 
   if (edits.length === 0) {
     // A zero-edit batch is the no-op the editor uses to re-read and rebase.
@@ -1255,7 +1287,7 @@ export const specDiff: M3Handler = async (ctx) => {
   const file = readSpecFile(ctx);
   const check = await checkSpec(ctx, file.text, "issues");
   const readOnly = readOnlyOf(check, ctx.harnessDir);
-  const { auto, human } = splitByTier(file.target, edits);
+  const { auto, human } = splitByTier(file.target, edits, file.text);
   const preview = await previewHomeEdits(ctx, file.text, edits, check);
   const escalations = escalationsFor(file.text, edits);
   return {
@@ -1788,7 +1820,7 @@ export const specPropose: M3Handler = async (ctx) => {
       verb: "crewhaus propose",
     });
   }
-  const { auto, human } = splitByTier(file.target, edits);
+  const { auto, human } = splitByTier(file.target, edits, file.text);
   const proposed = preview.yaml;
   const stamp = String(ctx.now());
   const rel = `${STATE_DIR}/${PROPOSAL_SUBDIR}/hangar-${stamp}/${PROPOSAL_FILE}`;

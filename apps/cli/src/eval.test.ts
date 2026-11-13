@@ -381,6 +381,61 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
     }
   }, 30_000);
 
+  test("baseline set over a changed protected criterion needs the owner", async () => {
+    const setUp = (): { root: string; evalsDir: string; pins: string } => {
+      const root = newTempRoot();
+      const evalsDir = join(root, ".crewhaus", "evals");
+      mkdirSync(evalsDir, { recursive: true });
+      const old = {
+        ...JSON.parse(indexEntry("run_aaaa1111aaaa1111")),
+        protectedCriteria: [{ id: "cites", digest: "d1" }],
+      };
+      const loosened = {
+        ...JSON.parse(indexEntry("run_bbbb2222bbbb2222")),
+        protectedCriteria: [{ id: "cites", digest: "d2" }],
+      };
+      writeFileSync(
+        join(evalsDir, "index.jsonl"),
+        `${JSON.stringify(old)}\n${JSON.stringify(loosened)}\n`,
+      );
+      const { sampleCount: _n, passRate: _p, meanScore: _m, specHash: _h, ...pin } = old;
+      const pins = JSON.stringify({ "concierge::smoke": pin });
+      writeFileSync(join(evalsDir, "baselines.json"), pins);
+      return { root, evalsDir, pins };
+    };
+    // An approver list that cannot be read: the owner check says no.
+    const refused = setUp();
+    mkdirSync(join(refused.root, ".crewhaus", "run", "control"), { recursive: true });
+    writeFileSync(join(refused.root, ".crewhaus", "run", "control", "approvers.json"), "{not json");
+    const child = Bun.spawn(
+      [process.execPath, CLI_PATH, "eval-report", "baseline", "set", "run_bbbb2222bbbb2222"],
+      {
+        cwd: refused.root,
+        env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("protected criterion cites is measured differently");
+    expect(stderr).toContain("`crewhaus access sync`");
+    expect(readFileSync(join(refused.evalsDir, "baselines.json"), "utf-8")).toBe(refused.pins);
+    // Single-owner mode: the local user is the owner, and the pin says so.
+    const allowed = setUp();
+    const yes = await runCli(
+      ["eval-report", "baseline", "set", "run_bbbb2222bbbb2222"],
+      allowed.root,
+    );
+    expect(yes.exitCode).toBe(0);
+    const baselines = JSON.parse(readFileSync(join(allowed.evalsDir, "baselines.json"), "utf-8"));
+    expect(baselines["concierge::smoke"]).toMatchObject({
+      runId: "run_bbbb2222bbbb2222",
+      rebaselined: { from: "run_aaaa1111aaaa1111", reason: "manual", protectedChange: true },
+    });
+  }, 30_000);
+
   test("a manual pin carries the run's latency and cost, as Hangar's always did", async () => {
     const root = newTempRoot();
     const evalsDir = join(root, ".crewhaus", "evals");

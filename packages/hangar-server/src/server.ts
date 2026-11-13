@@ -1809,12 +1809,26 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         if (typeof runId !== "string" || !isRunId(runId)) {
           throw new HttpError(400, 'missing "runId" (run_<16 hex>)');
         }
+        const confirmName = body["confirmName"];
         const result = pinBaseline({
           harnessDir: liveDirOr404(entry),
           runId,
           nowIso: new Date(now()).toISOString(),
+          ...(typeof confirmName === "string" ? { confirmName } : {}),
         });
         if (result.outcome === "rejected") throw new HttpError(409, result.reason);
+        if (result.outcome === "needs_owner") {
+          // The owner's escalation, as a protected criterion's loosening asks:
+          // answered, not thrown, so its fields reach the caller.
+          return jsonMasked(
+            {
+              error: result.reason,
+              needs: "h.spec.edit.security",
+              confirmName: result.confirmName,
+            },
+            409,
+          );
+        }
         return jsonMasked({ ok: true, baseline: result.baseline });
       }
 

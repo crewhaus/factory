@@ -165,8 +165,11 @@ import {
   type GraderCombinePolicy,
   type GradersConfig,
   type PerModelJudgeOverride,
+  type RunCriterionRecord,
+  gradersConfigHash,
   parseGradersConfig,
   perModelOverrideFor,
+  runCriteriaRecord,
 } from "@crewhaus/eval-grader";
 // "Watch me" (design/watch-me.md §7 phase 2) — the injection-hardened judge
 // prompt, reused verbatim for the watchme judge phase built on runChatLoop.
@@ -226,6 +229,7 @@ import {
   optimizeSpec,
 } from "@crewhaus/eval-optimizer-orchestrator";
 import {
+  type BaselineEntry,
   type ExportRunInput,
   type LoadedRun,
   type RunIndexEntry,
@@ -910,6 +914,12 @@ import { EvalPlanError, planSampleSize, renderEvalPlan } from "./eval-plan";
 // parks its provability: block at level: off (lowered to none otherwise).
 import { parkedProvabilityBlock } from "./eval-provability";
 import { parseRebaseline } from "./eval-rebaseline";
+import {
+  parseRegrade,
+  provabilityGraderNamesOf,
+  regradeRecordedRun,
+  resolveRegradeSource,
+} from "./eval-regrade";
 // Item 30 — model-drift sentinel comparison logic, in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
 // import). The fresh run + baseline load happen in index.ts; this decides drift.
@@ -1318,6 +1328,7 @@ import {
   runStagedOptimize,
   writeBackStagedResult,
 } from "./optimize-stages";
+import { ownerCheck } from "./owner-check";
 import { guardsOverridden, overrideNote } from "./permissions-override";
 // AUTOMATION-OPPORTUNITIES.md item 51 — `crewhaus pii tune` core (hashed
 // redaction-history aggregation → false-positive over-redaction candidates +
@@ -8484,31 +8495,6 @@ function makeAsyncIterable<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
 }
 
 /**
- * F2 (ops pre-merge) — sha256 hex digest of the parsed GradersConfig, keyed
- * on a deterministically-sorted JSON serialization so two byte-identical
- * graders.yaml files always hash equal and key ordering never causes a false
- * mismatch. Mirrors `hashDatasetFile`'s "content identity, not path" shape:
- * recorded into run.json/results.json so `--sentinel` can assert the graders
- * a baseline and a fresh run scored with are byte-identical (F2 — without
- * this, a changed judge model or edited graders.yaml silently reads as
- * "provider drift" because neither ever touches specHash or the dataset).
- */
-function hashGradersConfig(config: GradersConfig): string {
-  return createHash("sha256").update(stableStringify(config)).digest("hex");
-}
-
-function stableStringify(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v)).join(",")}]`;
-  if (value !== null && typeof value === "object") {
-    const keys = Object.keys(value as Record<string, unknown>).sort();
-    return `{${keys
-      .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
-/**
  * Build the model-driven Claude mutation provider for a spec — shared by
  * `optimize --mutator claude` and the flywheel's default mutator. Resolves
  * via the model-router so non-Anthropic specs drive their own provider:
@@ -9708,7 +9694,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
       }
     }
     // A voice replay pins no baseline, so there is nothing to re-anchor.
-    for (const flag of ["rebaseline", "reason"] as const) {
+    for (const flag of ["rebaseline", "reason", "regrade", "regrade-baseline"] as const) {
       if (args.flags[flag] !== undefined) {
         die(
           `--voice does not support --${flag}: --voice replays recorded call sessions and pins no baseline, so there is nothing to re-anchor`,
@@ -9739,6 +9725,10 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   const rebaselineParsed = parseRebaseline(args.flags);
   if (!rebaselineParsed.ok) die(rebaselineParsed.error);
   const rebaseline = rebaselineParsed.rebaseline;
+  // `--regrade <runId>`: grade a recorded run's answers again; and
+  // `--regrade-baseline`: gate against the baseline's answers regraded.
+  const regradeParsed = parseRegrade(args.flags);
+  if (!regradeParsed.ok) die(regradeParsed.error);
 
   // Item 30 — model-drift sentinel. --baseline points at the frozen run dir to
   // diff against; incompatible with lineage/matrix flags (a sentinel is a
@@ -10045,10 +10035,14 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     die(`could not read ${gradersPath}: ${(err as Error).message}`);
   }
   const { compiled, config: gradersConfig } = parseGradersConfig(gradersYaml);
-  // F2 — sha256 of the parsed graders config, recorded into run.json/
-  // results.json so `--sentinel` can assert a fresh run graded with the same
-  // rubric/thresholds as the baseline (see hashGradersConfig doc comment).
-  const gradersHash = hashGradersConfig(gradersConfig);
+  // F2 — the graders file's measuring identity (`gradersConfigHash` in
+  // eval-grader), recorded into run.json/results.json so `--sentinel` and the
+  // baseline gate can tell a run graded with other graders.
+  const gradersHash = gradersConfigHash(gradersConfig);
+  // What the run records about the file's criteria (absent without any), and
+  // the entries recorded through a provability grader under their own names.
+  const criteriaRecord = runCriteriaRecord(gradersConfig);
+  const provabilityGraderNames = provabilityGraderNamesOf(compiled);
   // G14 — graders that resolve by registry name get the default registry
   // (the specialty packs + .crewhaus/graders plugins), constructed ONCE here
   // and shared with every matrix cell; `runEval` has the identical fallback,
@@ -10168,6 +10162,61 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   // opts out (threaded into matrix cells and the single-run path alike).
   const retryErrors = args.flags["no-retry"] !== true;
 
+  // `--regrade <runId>`: the source run's answers, graded with this graders
+  // file. Recorded in the history as a regrade of its source; never gated or
+  // pinned, and no agent call is made.
+  if (regradeParsed.regrade !== undefined) {
+    let source: RunIndexEntry;
+    try {
+      source = resolveRegradeSource(regradeParsed.regrade.runId);
+    } catch (err) {
+      die(err instanceof Error ? err.message : String(err));
+    }
+    const samples = await collectSamples(dataset.samples);
+    process.stdout.write(
+      `[eval] regrading ${source.runId}: ${samples.length} case(s), ${compiled.length} grader(s), recorded answers only — no agent calls\n`,
+    );
+    const pricing = defaultMatrixPricing();
+    const judgeCost = (s: EvalRunSummary): number | undefined => {
+      const micros = evalRunCost(s, pricing).judgeMicros;
+      return micros !== undefined ? micros / 1_000_000 : undefined;
+    };
+    const regraded = await regradeRecordedRun({
+      ir: evalIr,
+      sourceDir: source.outDir,
+      purpose: "regrade",
+      datasetName: dataset.name,
+      samples,
+      datasetHash,
+      compiled,
+      gradersConfig,
+      gradersHash,
+      ...(typeof outDirArg === "string" ? { outDir: resolve(outDirArg) } : {}),
+      ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+      ...(graderRegistry !== undefined ? { graderRegistry } : {}),
+      ...(concurrency !== undefined ? { concurrency } : {}),
+      ...cliVersionOpt(),
+      pricing,
+      record: { specName: ir.name, specSource: absSpec, judgeCostUsd: judgeCost },
+    }).catch((err: unknown) => {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    });
+    const regradedOut = resolve(regraded.outDir);
+    writeFileSync(join(regradedOut, "index.html"), renderReport(await loadRun(regradedOut)).html);
+    const a = regraded.aggregates;
+    const cost = judgeCost(regraded);
+    process.stdout.write(
+      `[eval] runId=${regraded.runId} regrade of ${source.runId}: pass_rate=${(a.passRate * 100).toFixed(1)}% measured=${a.measured ?? regraded.samples.length}/${regraded.samples.length}${a.notMeasured !== undefined ? ` not_measured=${a.notMeasured}` : ""}\n`,
+    );
+    process.stdout.write(
+      `[eval] judge cost: ${a.judgeUsage === undefined ? "none (no judge calls)" : cost !== undefined ? `$${cost.toFixed(4)}` : "cost unknown"}\n`,
+    );
+    process.stdout.write(`[eval] report: ${join(regradedOut, "index.html")}\n`);
+    process.stdout.write("[eval] a regrade is recorded in the history and never gated or pinned\n");
+    return;
+  }
+
   // Item 11 — matrix mode: everything above (spec lowering, graders, item-12
   // registry resolution, item-9 regression union) ran ONCE, so every model
   // sees the identical sample set. The matrix path never reaches the item-3
@@ -10197,6 +10246,8 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
       datasetHash,
       compiled,
       retryErrors,
+      provabilityGraderNames,
+      ...(criteriaRecord !== undefined ? { criteria: criteriaRecord } : {}),
       ...(typeof outDirArg === "string" ? { outDirArg } : {}),
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
@@ -10287,6 +10338,8 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
       ...(warmArms ? { warmArms: true } : {}),
       // 0.8.0 §9.1 — the what-if floor (absent: the spec's own block, if any).
       ...(evalProvability !== undefined ? { provability: evalProvability } : {}),
+      // The file's criteria, recorded with the run (absent without any).
+      ...(criteriaRecord !== undefined ? { criteria: criteriaRecord } : {}),
       pricing: defaultMatrixPricing(),
     },
   }).catch((err: unknown) => {
@@ -10523,7 +10576,45 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     // `--rebaseline`: re-anchor instead of gating (the case digests come from
     // the run directory).
     ...(rebaseline !== undefined ? { rebaseline } : {}),
+    provabilityGraderNames,
+    // A re-anchor over a protected criterion needs this harness's owner.
+    ownerCheck: () => ownerCheck(dirname(absSpec)),
+    // `--regrade-baseline`: on a changed instrument, regrade the baseline's
+    // answers with this graders file and gate against them.
+    ...(regradeParsed.regradeBaseline === true
+      ? {
+          regradeBaseline: async (pin: BaselineEntry) => {
+            const pricing = defaultMatrixPricing();
+            const regraded = await regradeRecordedRun({
+              ir: evalIr,
+              sourceDir: pin.outDir,
+              purpose: "regrade",
+              datasetName: dataset.name,
+              samples: [...triageSamplesById.values()],
+              datasetHash,
+              compiled,
+              gradersConfig,
+              gradersHash,
+              ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+              ...(graderRegistry !== undefined ? { graderRegistry } : {}),
+              ...(concurrency !== undefined ? { concurrency } : {}),
+              ...cliVersionOpt(),
+              pricing,
+              record: {
+                specName: ir.name,
+                specSource: absSpec,
+                judgeCostUsd: (s) => {
+                  const micros = evalRunCost(s, pricing).judgeMicros;
+                  return micros !== undefined ? micros / 1_000_000 : undefined;
+                },
+              },
+            });
+            return loadRun(resolve(regraded.outDir));
+          },
+        }
+      : {}),
   });
+  if (finish.refused !== undefined) die(finish.refused);
   if (finish.gateFailed) {
     const reason = `eval --gate: ${finish.gateReason ?? "regression gate failed"}`;
     // NEW-HUNT-8 — under a suite the verdict is data (the tier keeps running
@@ -10758,6 +10849,10 @@ async function runEvalSuiteCommand(args: ParsedArgs): Promise<void> {
  * normal result).
  */
 async function runEvalMatrixCommand(opts: {
+  /** The perGrader names recorded through a provability grader (see `finishEvalRun`). */
+  readonly provabilityGraderNames?: ReadonlySet<string>;
+  /** The graders file's criteria record (absent without any). */
+  readonly criteria?: ReadonlyArray<RunCriterionRecord>;
   readonly ir: Extract<ReturnType<typeof lower>, { target: "cli" }>;
   readonly models: ReadonlyArray<string>;
   /** 0.6.0 §6.1 — the resolved arm behind each token (see `resolveMatrixArms`). */
@@ -10829,6 +10924,7 @@ async function runEvalMatrixCommand(opts: {
           outDir: cellOutDir,
           datasetHash: opts.datasetHash,
           retryErrors: opts.retryErrors,
+          ...(opts.criteria !== undefined ? { criteria: opts.criteria } : {}),
           ...(opts.concurrency !== undefined ? { concurrency: opts.concurrency } : {}),
           ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
           ...(opts.repeats !== undefined ? { repeats: opts.repeats } : {}),
@@ -10867,6 +10963,9 @@ async function runEvalMatrixCommand(opts: {
           routing: arm?.routing ?? (`candidate:${model}` as EvalRoutingMode),
           gateRequested: opts.gateRequested === true,
           promote: opts.promote !== false,
+          ...(opts.provabilityGraderNames !== undefined
+            ? { provabilityGraderNames: opts.provabilityGraderNames }
+            : {}),
           ...(cellCost.totalMicros !== undefined
             ? { costUsd: cellCost.totalMicros / 1_000_000 }
             : {}),
@@ -12385,8 +12484,11 @@ function runEvalReportBaseline(args: ParsedArgs): void {
       // Carries the spec source, the instrument identity and the lineage columns
       // forward: `setBaseline` keys on the lineage, so a pin that dropped them
       // would clobber the primary's baseline with a cheap candidate's run.
+      // A pin over a protected criterion is the owner's: the same check
+      // `crewhaus eval --rebaseline` makes, for the harness here.
       const pinned = pinRun(entry, new Date().toISOString(), undefined, {
         cmd: "crewhaus eval-report baseline set",
+        ownerCheck: () => ownerCheck(process.cwd()),
       });
       if (!pinned.ok) die(`eval-report baseline set: ${pinned.refusal.reason}`);
       if (pinned.pin.rebaselined !== undefined) {
@@ -17455,8 +17557,8 @@ async function runGradersTest(args: ParsedArgs): Promise<void> {
 /**
  * NEW-HUNT-11 — `crewhaus graders card`: render the graders.yaml as the
  * markdown rubric card (see graders-card.ts). The hash on the card is
- * computed by the SAME `hashGradersConfig` the run-history index and
- * baseline pins record, so the documented instrument identity can never
+ * computed by the SAME `gradersConfigHash` (eval-grader) the run-history
+ * index and baseline pins record, so the documented instrument identity can never
  * drift from the one the sentinel/baseline guards compare. Deterministic:
  * the only timestamp derives from the graders FILE's mtime — re-rendering
  * an unchanged config is byte-identical.
@@ -17530,7 +17632,7 @@ async function runGradersCard(args: ParsedArgs): Promise<void> {
   }
   const card = renderGradersCard({
     config,
-    gradersHash: hashGradersConfig(config),
+    gradersHash: gradersConfigHash(config),
     source,
   });
   const outArg = strFlag(args, "out");
@@ -24006,6 +24108,21 @@ switch (subcommand) {
     try {
       const { runDaemonCommand } = await import("./daemon-cmd");
       const out = await runDaemonCommand(rest);
+      for (const line of out.lines) process.stdout.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "criteria": {
+    // What the graders check for, in graders.yaml: list, show, lint, apply and
+    // preview. Heavy lifting lives in the side-effect-free ./criteria-cmd
+    // module; bad arguments throw plain Errors, routed through die().
+    try {
+      const { runCriteriaCommand } = await import("./criteria-cmd");
+      const out = await runCriteriaCommand(rest);
       for (const line of out.lines) process.stdout.write(`${line}\n`);
       if (out.exitCode !== 0) process.exit(out.exitCode);
     } catch (err) {

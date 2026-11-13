@@ -53,6 +53,18 @@ describe("what a run cannot be pinned for", () => {
     expect(pinRefusal(entry(), { lineageKey: key })).toBeUndefined();
   });
 
+  test("a regrade or a preview of another run, and pinRun writes nothing for it", () => {
+    for (const purpose of ["regrade", "preview"] as const) {
+      const refusal = pinRefusal(entry({ purpose, regradeOf: "run_src" }));
+      expect(refusal?.code).toBe("regrade");
+      expect(refusal?.reason).toContain(`is a ${purpose} of run run_src`);
+    }
+    const root = newTempRoot();
+    const outcome = pinRun(entry({ purpose: "regrade", regradeOf: "run_src" }), "t", root);
+    expect(outcome.ok).toBe(false);
+    expect(existsSync(join(root, BASELINES_FILENAME))).toBe(false);
+  });
+
   test("a run in which every case errored", () => {
     const refusal = pinRefusal(entry({ errorCount: 3, measuredCount: 0 }));
     expect(refusal?.code).toBe("all_errored");
@@ -229,5 +241,70 @@ describe("a pin over a different instrument records the re-anchor", () => {
       "pluginsDigest",
       "ts",
     ]);
+  });
+});
+
+describe("a pin over a changed protected criterion needs the owner, on every path", () => {
+  const guarded = (runId: string, digest: string) =>
+    entry({ runId, outDir: `/abs/${runId}`, protectedCriteria: [{ id: "dates", digest }] });
+
+  test("refused without an owner check, or when it says no, and the file is left as it was", () => {
+    const root = newTempRoot();
+    expect(pinRun(guarded("run_a", "d1"), "t1", root).ok).toBe(true);
+    const before = readBaselines(root);
+    for (const opts of [
+      {},
+      { ownerCheck: () => ({ ok: false as const, reason: "not the owner" }) },
+    ]) {
+      const outcome = pinRun(guarded("run_b", "d2"), "t2", root, opts);
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) {
+        expect(outcome.refusal.code).toBe("protected");
+        expect(outcome.refusal.reason).toContain(
+          "protected criterion dates is measured differently",
+        );
+        expect(outcome.refusal.reason).toContain("`crewhaus eval --rebaseline --reason <code>`");
+      }
+      expect(readBaselines(root)).toEqual(before);
+    }
+    // Unprotected, or gone: the same answer.
+    const gone = pinRun(entry({ runId: "run_c", outDir: "/abs/run_c" }), "t3", root);
+    expect(!gone.ok && gone.refusal.reason).toContain("dates is gone or unprotected");
+  });
+
+  test("with the owner it is pinned and marked; an unchanged one needs nobody", () => {
+    const root = newTempRoot();
+    pinRun(guarded("run_a", "d1"), "t1", root);
+    let asked = 0;
+    const outcome = pinRun(guarded("run_b", "d2"), "t2", root, {
+      cmd: "test",
+      ownerCheck: () => {
+        asked += 1;
+        return { ok: true };
+      },
+    });
+    expect(asked).toBe(1);
+    expect(outcome.ok && outcome.pin.rebaselined).toEqual({
+      from: "run_a",
+      reason: "manual",
+      cmd: "test",
+      protectedChange: true,
+    });
+    expect(outcome.ok && outcome.pin.protectedCriteria).toEqual([{ id: "dates", digest: "d2" }]);
+    const same = pinRun(guarded("run_c", "d2"), "t3", root, {
+      ownerCheck: () => {
+        asked += 1;
+        return { ok: false, reason: "never asked" };
+      },
+    });
+    expect(same.ok).toBe(true);
+    expect(asked).toBe(1);
+  });
+
+  test("a plan that names the pin it replaces is refused the same way", () => {
+    const replaced = pinFromIndexEntry(guarded("run_a", "d1"), "t1");
+    if (!replaced.ok) throw new Error("expected a pin");
+    const outcome = pinFromIndexEntry(guarded("run_b", "d2"), "t2", { replaced: replaced.pin });
+    expect(!outcome.ok && outcome.refusal.code).toBe("protected");
   });
 });

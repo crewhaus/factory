@@ -18,9 +18,11 @@ export type GradeStatus = "not_measured" | "skipped" | "observing";
  * Why a grade carries a {@link GradeStatus}. The provability graders produce
  * `no_proof_bundle`, `unverified`, `invalid_metadata` and
  * `floor_above_bundle`. `out_of_scope` is the runner's reason for a case every
- * enforced grader skipped. `no_judge_credentials` and `not_regradable` are
- * reserved for the judge and regrade producers that land with graders scoped
- * by criteria; nothing produces them yet.
+ * enforced grader skipped, and for a grader a criterion's scope leaves out of a
+ * case. `no_judge_credentials` is the runner's reason for a grader whose
+ * judge found no credentials for its model provider, and `not_regradable` a
+ * regrade's reason for a case, or a grader, it cannot grade again from what
+ * the source run recorded.
  */
 export type StatusReason =
   | "no_proof_bundle"

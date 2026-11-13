@@ -49,6 +49,7 @@ import {
 } from "@crewhaus/tool-safety/fs";
 import { ReportError } from "./errors";
 import { jsonSyntaxProblem } from "./json-problem";
+import { type ProtectedCriterionDigest, protectedCriteriaOf } from "./protected-criteria";
 import { sampleMeasured } from "./run-state";
 
 /** Default location of the run index + baselines, relative to the cwd. */
@@ -228,6 +229,20 @@ export type RunIndexEntry = {
    * different instruments and are never gated against each other.
    */
   readonly armsDigest?: string;
+  /**
+   * Why the run graded a recorded run's answers instead of running the agent
+   * (`config.purpose`): a regrade or a preview. Such a run is never a
+   * baseline. Absent on a live run.
+   */
+  readonly purpose?: "regrade" | "preview";
+  /** The run whose answers it graded (`config.regradeOf`). Present only with {@link purpose}. */
+  readonly regradeOf?: string;
+  /**
+   * The run's protected criteria, each with the digest of what decides its
+   * verdict ({@link protectedCriteriaOf}). Present only when it had one; a pin
+   * carries it on, so a later pin is checked against it.
+   */
+  readonly protectedCriteria?: ReadonlyArray<ProtectedCriterionDigest>;
   /** ISO-8601 completion timestamp. */
   readonly ts: string;
   /** Absolute path to the run's output directory. */
@@ -286,6 +301,8 @@ export type BaselineEntry = {
   readonly calibrationDigest?: string;
   /** The pinned run's plugin digest (see {@link RunIndexEntry.pluginsDigest}). */
   readonly pluginsDigest?: string;
+  /** The pinned run's protected criteria (see {@link RunIndexEntry.protectedCriteria}). */
+  readonly protectedCriteria?: ReadonlyArray<ProtectedCriterionDigest>;
   /**
    * Set when this pin re-anchored the lineage on a run measured differently
    * from the pin it replaced: `crewhaus eval --rebaseline --reason <code>`, or
@@ -297,6 +314,11 @@ export type BaselineEntry = {
     readonly from?: string;
     readonly reason: RebaselineReason;
     readonly cmd: string;
+    /**
+     * The re-anchor changed a protected criterion (its digest moved, it is
+     * gone, or cases inside its scope are) and the harness's owner allowed it.
+     */
+    readonly protectedChange?: true;
   };
   /** ISO-8601 timestamp of when the pin was written. */
   readonly ts: string;
@@ -625,6 +647,7 @@ export function runIndexEntryFromSummary(
   ).length;
   const calibrationDigest = calibrationDigestOf(summary);
   const pluginsDigest = summary.config.pluginsDigest;
+  const protectedCriteria = protectedCriteriaOf(summary);
   return {
     runId: summary.runId,
     specName: opts.specName,
@@ -673,6 +696,10 @@ export function runIndexEntryFromSummary(
     ...(observingCount > 0 ? { observingCount } : {}),
     ...(calibrationDigest !== undefined ? { calibrationDigest } : {}),
     ...(pluginsDigest !== undefined ? { pluginsDigest } : {}),
+    // A regrade or a preview says so, and which run it graded again.
+    ...(summary.config.purpose !== undefined ? { purpose: summary.config.purpose } : {}),
+    ...(summary.config.regradeOf !== undefined ? { regradeOf: summary.config.regradeOf } : {}),
+    ...(protectedCriteria.length > 0 ? { protectedCriteria } : {}),
     ts: summary.endedAt,
     outDir: opts.outDir,
   };

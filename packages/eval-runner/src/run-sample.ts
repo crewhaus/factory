@@ -1,5 +1,6 @@
 import { mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
+import { ProviderAuthError } from "@crewhaus/errors";
 import type { Sample } from "@crewhaus/eval-dataset";
 import {
   type CompiledGrader,
@@ -257,6 +258,14 @@ export async function runSample(args: {
   // verdict on the agent's output. It still lands as a failed perGrader entry
   // (so `overall` honestly fails), but the structured `graderError` below
   // lets the run loop retry the sample and triage classify it as noise.
+  //
+  // A judge with no credentials for its model provider is neither: nothing
+  // was measured, and retrying cannot change that. Its entry records
+  // `not_measured` (`no_judge_credentials`), never a verdict, and is not a
+  // grader error.
+  //
+  // A grader bound by an observing criterion never decides its case: any
+  // throw from it records `not_measured` and is not a grader error.
   const graderErrors: string[] = [];
   for (const g of graders) {
     let result: GradeResult;
@@ -264,12 +273,35 @@ export async function runSample(args: {
       result = await g.grader(sample, runResult);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      graderErrors.push(`${g.name}: ${msg}`);
-      result = {
-        passed: false,
-        score: 0,
-        rationale: `grader threw: ${msg}`,
-      };
+      const auth = providerAuthErrorIn(err);
+      if (g.observing === true) {
+        // An observing grader never decides its case, so a throw from it is
+        // neither a verdict nor a grader error: it measured nothing, and the
+        // sample is not retried for it.
+        result = {
+          passed: false,
+          score: 0,
+          rationale:
+            auth !== undefined ? `no judge credentials: ${auth.message}` : `grader threw: ${msg}`,
+          status: "not_measured",
+          ...(auth !== undefined ? { statusReason: "no_judge_credentials" as const } : {}),
+        };
+      } else if (auth !== undefined) {
+        result = {
+          passed: false,
+          score: 0,
+          rationale: `no judge credentials: ${auth.message}`,
+          status: "not_measured",
+          statusReason: "no_judge_credentials",
+        };
+      } else {
+        graderErrors.push(`${g.name}: ${msg}`);
+        result = {
+          passed: false,
+          score: 0,
+          rationale: `grader threw: ${msg}`,
+        };
+      }
     }
     perGrader.push({ name: g.name, ...result });
   }
@@ -396,6 +428,16 @@ export async function runSample(args: {
   return sampleResult;
 }
 
+/** The {@link ProviderAuthError} a thrown value is, or carries as a cause (a few levels down). */
+function providerAuthErrorIn(err: unknown): ProviderAuthError | undefined {
+  let at: unknown = err;
+  for (let depth = 0; depth < 5 && at !== undefined && at !== null; depth++) {
+    if (at instanceof ProviderAuthError) return at;
+    at = (at as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
 /**
  * G56 — extract per-sample loop-quality metrics from the captured trace
  * events. The safety buckets are DISJOINT (see `SafetyViolationCounts`):
@@ -461,8 +503,9 @@ function computeMetrics(
  * ahead of everything), exactly {@link combineVerdicts}. Otherwise the combine
  * is three-valued:
  *
- * - `report` entries, and entries that are `skipped` or `observing`, are
- *   recorded in `perGrader` and set aside;
+ * - `report` entries, entries that are `skipped` or `observing`, and every
+ *   entry of an observing criterion whatever it records, are recorded in
+ *   `perGrader` and set aside;
  * - `all` and the requirements: any measured fail fails; else any
  *   `not_measured` entry makes the sample not measured; else it passes;
  * - `any`: any measured pass passes; else any `not_measured` entry makes the
@@ -485,24 +528,34 @@ function combineOverall(
   const verdicts = combineVerdicts(perGrader, graders, policy, error);
   if (error !== undefined || perGrader.every((g) => g.status === undefined)) return verdicts;
 
-  type Entry = { readonly result: { name: string } & GradeResult; readonly weight: number };
+  type Entry = {
+    readonly result: { name: string } & GradeResult;
+    readonly weight: number;
+    readonly observes: boolean;
+  };
   const own: Entry[] = [];
   const required: Entry[] = [];
   perGrader.forEach((result, i) => {
     const role = graders[i]?.role;
-    const entry = { result, weight: graders[i]?.weight ?? 1 };
+    const entry = {
+      result,
+      weight: graders[i]?.weight ?? 1,
+      observes: graders[i]?.observing === true,
+    };
     if (role === undefined) own.push(entry);
     else if (role === "requirement") required.push(entry);
   });
   const enforced = [...own, ...required];
   if (enforced.length === 0) return verdicts;
   const setAside = (e: Entry): boolean =>
-    e.result.status === "skipped" || e.result.status === "observing";
+    e.observes || e.result.status === "skipped" || e.result.status === "observing";
   const ownVoting = own.filter((e) => !setAside(e));
   const requiredVoting = required.filter((e) => !setAside(e));
   const placeholder = { passed: false, score: 0, rationale: verdicts.rationale } as const;
   if (ownVoting.length === 0 && requiredVoting.length === 0) {
-    return enforced.some((e) => e.result.status === "observing")
+    return enforced.some(
+      (e) => e.result.status === "observing" || (e.observes && e.result.status !== "skipped"),
+    )
       ? { ...placeholder, status: "observing" }
       : { ...placeholder, status: "skipped", statusReason: "out_of_scope" };
   }
