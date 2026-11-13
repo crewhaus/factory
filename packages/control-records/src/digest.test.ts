@@ -259,7 +259,10 @@ describe("subjectRefOf", () => {
     expect(ref).not.toContain("user-7");
     expect(await subjectRefOf(root, SUBJECT)).toBe(ref);
     const keyFile = join(root, controlPaths(root).subjectKeyFile);
-    expect(statSync(keyFile).mode & 0o777).toBe(0o600);
+    expect(existsSync(keyFile)).toBe(true);
+    if (process.platform !== "win32") {
+      expect(statSync(keyFile).mode & 0o777).toBe(0o600);
+    }
     expect(existsSync(join(root, controlPaths(root).digestKeyFile))).toBe(false);
     expect(await subjectRefOf(root, "app:tenant-a:user-8")).not.toBe(ref);
   });
