@@ -5,6 +5,14 @@ for each spec in [`../../absent-corpus.ts`](../../absent-corpus.ts): one minimal
 It pins the rule from [#514](https://github.com/crewhaus/factory/issues/514) that a spec which does not
 declare a new key compiles to the same bytes. `delta-090-absent.test.ts` holds it.
 
+## The schedule object form
+
+`schedule-object.digests.json` pins the same thing for six specs in
+[`../../schedule-corpus.ts`](../../schedule-corpus.ts): the channel, managed and batch specs above, each
+with a cron `schedule:` object (timezone, jitter and instructions) and an interval one. It was
+generated before `schedule:` took a list, so the list form cannot move a byte of a spec that keeps the
+object form. `schedule-lanes.test.ts` holds it. Regenerate it under the same rule as the absent corpus.
+
 ## When to regenerate
 
 Only for a deliberate emitter change, and never to quiet a failure you cannot explain. A pull request

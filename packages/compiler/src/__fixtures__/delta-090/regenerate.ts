@@ -1,6 +1,7 @@
 /**
- * Rewrites `absent-corpus.digests.json`. Run it only for a deliberate emitter
- * change, and append a delta note to this directory's README:
+ * Rewrites `absent-corpus.digests.json` and `schedule-object.digests.json`. Run
+ * it only for a deliberate emitter change, and append a delta note to this
+ * directory's README:
  *
  *   bun packages/compiler/src/__fixtures__/delta-090/regenerate.ts
  */
@@ -8,6 +9,7 @@ import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { ABSENT_CORPUS } from "../../absent-corpus";
 import { compile } from "../../index";
+import { SCHEDULE_OBJECT_CORPUS } from "../../schedule-corpus";
 
 /** The date the corpus compiles at, so the model-sunset check cannot move a digest. */
 export const CORPUS_TODAY = "2026-09-04";
@@ -21,11 +23,23 @@ export function corpusFileDigests(yaml: string): Record<string, string> {
   return digests;
 }
 
-if (import.meta.main) {
+/** `{spec name: {path: sha256hex}}` for every spec of a corpus, in name order. */
+export function corpusDigests(
+  corpus: Readonly<Record<string, string>>,
+): Record<string, Record<string, string>> {
   const all: Record<string, Record<string, string>> = {};
-  for (const target of Object.keys(ABSENT_CORPUS).sort()) {
-    all[target] = corpusFileDigests(ABSENT_CORPUS[target as keyof typeof ABSENT_CORPUS]);
+  for (const name of Object.keys(corpus).sort()) {
+    all[name] = corpusFileDigests(corpus[name] as string);
   }
-  const file = new URL("./absent-corpus.digests.json", import.meta.url);
-  writeFileSync(file, `${JSON.stringify(all, null, 2)}\n`);
+  return all;
+}
+
+function write(name: string, corpus: Readonly<Record<string, string>>): void {
+  const file = new URL(`./${name}`, import.meta.url);
+  writeFileSync(file, `${JSON.stringify(corpusDigests(corpus), null, 2)}\n`);
+}
+
+if (import.meta.main) {
+  write("absent-corpus.digests.json", ABSENT_CORPUS);
+  write("schedule-object.digests.json", SCHEDULE_OBJECT_CORPUS);
 }
