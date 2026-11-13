@@ -261,6 +261,11 @@ export type ApproverProjection = {
     readonly external: string;
     readonly principal: string;
   }[];
+  /**
+   * The address Home is reached at (the owner's `links.baseUrl`), when the owner set one:
+   * where a chat card sends a person to review a request in full.
+   */
+  readonly homeUrl?: string;
 };
 
 // ---------------------------------------------------------------------------

@@ -56,7 +56,7 @@ import {
   writeSync,
 } from "node:fs";
 import { hostname } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AuditLog } from "@crewhaus/audit-log";
 import { boundaryRuleIds, classifyBoundary } from "@crewhaus/boundary-classifier";
 import {
@@ -1192,17 +1192,22 @@ function onDisk(path: string): string {
 
 /**
  * For a spec that declares a tool that works on files: the refusal message
- * when the tenants root is the harness directory or lies inside it, found on
- * disk (a root named through a link, or one that does not exist yet, is
- * compared by where it lands), else `undefined`.
+ * when the tenants root is the harness directory, lies inside it or contains
+ * it (such as `..`), found on disk (a root named through a link, or one that
+ * does not exist yet, is compared by where it lands), else `undefined`.
  */
 export function checkTenantsRoot(opts: {
   readonly cwd: string;
   readonly tenantsRoot: string;
 }): string | undefined {
-  const fromCwd = relative(onDisk(opts.cwd), onDisk(resolve(opts.cwd, opts.tenantsRoot)));
-  const inside = fromCwd === "" || (!fromCwd.startsWith("..") && !isAbsolute(fromCwd));
-  return inside
-    ? "[managed] this spec declares a tool that works on files, so CREWHAUS_TENANTS_ROOT must be outside the harness directory; set it to an absolute path such as /home/you/.crewhaus/tenants/<harness>."
+  const root = onDisk(resolve(opts.cwd, opts.tenantsRoot));
+  const here = onDisk(opts.cwd);
+  // Only `..` itself or a leading `..` segment leaves a directory: a child named `..tenants` is inside it.
+  const within = (rel: string): boolean =>
+    rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  // The root is the harness directory or lies inside it, or the harness lies inside the root.
+  const shared = within(relative(here, root)) || within(relative(root, here));
+  return shared
+    ? "[managed] this spec declares a tool that works on files, so CREWHAUS_TENANTS_ROOT must neither be the harness directory nor contain it; set it to an absolute path such as /home/you/.crewhaus/tenants/<harness>."
     : undefined;
 }

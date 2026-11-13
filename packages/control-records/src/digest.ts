@@ -137,6 +137,30 @@ export async function subjectRefOf(root: string, subject: string): Promise<strin
 export const LOCAL_ACTOR_LABEL = "local-actor";
 
 /**
+ * The label of a channel conversation's keyed ref on a run row (over the platform, the
+ * workspace, the channel and the thread). Stored digests join forever: a pin.
+ *
+ * First consumer: channel-adapter-base's `acceptInbound`.
+ */
+export const CHANNEL_CONVERSATION_LABEL = "channel-conversation";
+
+/**
+ * The label of a channel message's keyed ref on a run row (over the platform and the
+ * message's idempotency key). Stored digests join forever: a pin.
+ *
+ * First consumer: channel-adapter-base's `acceptInbound`.
+ */
+export const CHANNEL_MESSAGE_LABEL = "channel-message";
+
+/**
+ * The label of an unlinked channel sender's keyed ref on a run row (over the platform,
+ * the workspace and the user). Stored digests join forever: a pin.
+ *
+ * First consumer: channel-adapter-base's `acceptInbound`.
+ */
+export const CHANNEL_SENDER_LABEL = "channel-sender";
+
+/**
  * What an append-only record holds for an unlinked local actor (`local:<user>@<host>`):
  * `local:#<keyedDigest(key, LOCAL_ACTOR_LABEL, [actor])>`, under the key of the root the
  * record lives in. One definition, so the decision log and the receipts join.

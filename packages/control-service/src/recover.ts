@@ -19,6 +19,10 @@
  * A daemon command is run again only while it is the harness's latest: once an operator
  * has started, stopped or drained the daemon since, re-running an older command would
  * undo theirs.
+ * After the commands, each run sweep the composition registers runs once per harness the
+ * recovery visits (`AreaRuntime.runSweeps`), and `runsInterrupted` counts the runs they
+ * closed, present only when one did.
+ *
  * Recovery writes; it runs at Home's boot and before the CLI's first change to a harness,
  * never on a read.
  */
@@ -38,7 +42,7 @@ import {
   settledRow,
 } from "./commands";
 import type { ControlCore } from "./context";
-import { executorDead } from "./executor";
+import { type RunSweep, executorDead } from "./executor";
 import { commandsLedgerOf, workspaceCommandsLedger } from "./ledgers";
 import { NEEDS_DECISION, NOT_STARTED_REBOOT, type Outcome, SUPERSEDED } from "./refusal";
 
@@ -51,6 +55,8 @@ export type RecoverCounts = {
   readonly reconciled: number;
   /** Left for a person: interrupted, needs a decision. */
   readonly unknown: number;
+  /** Runs the composition's run sweeps closed; present only when one did. */
+  readonly runsInterrupted?: number;
 };
 
 /** What the job queue holds, for Home's recovery to tell a job that was never queued. */
@@ -94,6 +100,7 @@ export function createRecover(
   core: ControlCore,
   commands: CommandsInternals,
   jobs: { readonly idle: () => Promise<void>; readonly commandIds: JobRowsView },
+  sweeps: readonly RunSweep[] = [],
 ): (scope: RecoverScope) => Promise<RecoverCounts> {
   const iso = (ms: number): string => new Date(ms).toISOString();
 
@@ -247,6 +254,23 @@ export function createRecover(
         }
       }
     }
-    return counts;
+    // The run sweeps, once per harness this recovery visits.
+    let runsInterrupted = 0;
+    const harnesses = scope === "all" ? core.harnessDirs() : [scope.harness];
+    for (const harnessDir of harnesses) {
+      for (const sweep of sweeps) {
+        try {
+          runsInterrupted += await sweep(harnessDir, {
+            probe: core.probe,
+            host: core.host,
+            hostBootedAt,
+            now: core.now(),
+          });
+        } catch (err) {
+          core.warn(`control-service: a run sweep failed: ${(err as Error).message}`);
+        }
+      }
+    }
+    return runsInterrupted > 0 ? { ...counts, runsInterrupted } : counts;
   };
 }
