@@ -178,9 +178,24 @@ export function contextForSeed(
   if (verdict.kind !== "kept" || verdict.entries.length === 0) return supplied ?? build();
   if (supplied !== undefined) {
     adoptInbound(supplied, verdict.entries);
+    apiInputContexts.add(supplied);
     return supplied;
   }
-  return withInboundContent(verdict.entries, build);
+  const built = withInboundContent(verdict.entries, build);
+  apiInputContexts.add(built);
+  return built;
+}
+
+/** The contexts a kept API seed was adopted into, whoever built them. */
+const apiInputContexts = new WeakSet<object>();
+
+/**
+ * Whether `ctx` carries a job's API input: a kept seed was adopted into it,
+ * into a context the loop built or one its caller supplied (which keeps its
+ * own `originStack`). Every later loop that shares the context sees it too.
+ */
+export function isApiInputContext(ctx: object): boolean {
+  return apiInputContexts.has(ctx);
 }
 
 /** Throw the classified refusal of a blocked seed, before any model call. */

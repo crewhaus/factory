@@ -1612,6 +1612,7 @@ import { runSloProbe } from "./slo-doctor";
 import { makeSloRollback } from "./slo-rollback";
 import { buildSloSink, intakeGatePayload } from "./slo-sink";
 import { commitCliSpec, createSpecFile, exitOnOptimizeConflict, specRev } from "./spec-commit";
+import { specRevisionOf } from "./spec-revision-of";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -5114,6 +5115,7 @@ async function runRunCli(
       // Item 32 — stamp the spec name into any auto-assembled incident capture
       // (gated by CREWHAUS_INCIDENTS inside runtime-core).
       incidentSpec: { name: ir.name },
+      specRevision: specRevisionOf(specPath),
       ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
       // v0.3.0 Goal 1 — the continuity seam (plan tail + requirements ledger
       // + teardown handoff), default-on unless the spec said

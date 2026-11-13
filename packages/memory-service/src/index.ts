@@ -590,15 +590,62 @@ export type WireMemoryDeps = {
   readonly examRunner?: ExamRunner;
 };
 
+/** Where a recalled item lives: its store, backend, its id there and its version. */
+export type RecalledRef = {
+  readonly store: "fact" | "wiki" | "session";
+  readonly backend: "local" | "thredz";
+  readonly localId: string;
+  readonly version?: number;
+};
+
+/** One recalled item: the line `recall` returns, and the entry it came from when known. */
+export type RecalledItem = {
+  readonly text: string;
+  readonly ref: RecalledRef | null;
+  readonly score?: number;
+};
+
 /** The `RunChatLoopOptions.memory` seam shape (structural — assignability
  *  to runtime-core is pinned in tests; runtime-core is a devDependency). */
 export type MemorySeam = {
   readonly autoRecall?: boolean;
   readonly recallK?: number;
   readonly recall?: (query: string, k: number) => Promise<readonly string[]>;
+  /** The same items `recall` returns, in the same order, each with its ref. */
+  readonly recallItems?: (query: string, k: number) => Promise<readonly RecalledItem[]>;
   readonly autoCapture?: boolean;
   readonly onCapture?: (completedTurns: number, sessionId: string) => Promise<void>;
 };
+
+/** A ref id written to run records: 1-128 of `[A-Za-z0-9._:-]`, else no ref. */
+const REF_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/** A seam's structured recall: its own, or its `recall` lines with no refs. */
+function recallItemsOf(
+  seam:
+    | {
+        readonly recall?: (query: string, k: number) => Promise<readonly string[]>;
+        readonly recallItems?: (query: string, k: number) => Promise<readonly RecalledItem[]>;
+      }
+    | null
+    | undefined,
+): ((query: string, k: number) => Promise<readonly RecalledItem[]>) | undefined {
+  if (seam?.recallItems !== undefined) return seam.recallItems;
+  const recall = seam?.recall;
+  if (recall === undefined) return undefined;
+  return async (query, k) => (await recall(query, k)).map((text) => ({ text, ref: null }));
+}
+
+/** `recall` and `recallItems` over one items function, so their texts agree and each queries once. */
+function recallPair(items: (query: string, k: number) => Promise<readonly RecalledItem[]>): {
+  readonly recall: (query: string, k: number) => Promise<readonly string[]>;
+  readonly recallItems: (query: string, k: number) => Promise<readonly RecalledItem[]>;
+} {
+  return {
+    recall: async (query, k) => (await items(query, k)).map((item) => item.text),
+    recallItems: items,
+  };
+}
 
 /** Runtime-core's `HandoffInput`, structurally (see the assignability pin). */
 export type HandoffSeamInput = {
@@ -680,6 +727,8 @@ export type WiredWiki = {
   /** Recall lines for the §3.4 auto-recall fusion — the same
    *  `[wiki:<slug>] <title> — <excerpt>` bundle shape on both backends. */
   readonly recall: (query: string, k: number) => Promise<readonly string[]>;
+  /** The same lines as `recall`, each with the article it came from when known. */
+  readonly recallItems: (query: string, k: number) => Promise<readonly RecalledItem[]>;
 };
 
 export type WiredMemory = {
@@ -800,10 +849,13 @@ function wireFacts(fragment: MemoryWiringFragment, deps: WireMemoryDeps): WiredF
       ? {
           autoRecall: true,
           recallK: decision.recallK,
-          recall: async (query, k) => {
-            const results = await store.recall(query, k);
-            return results.map((r) => r.entry.text);
-          },
+          ...recallPair(async (query, k) =>
+            (await store.recall(query, k)).map((r) => ({
+              text: r.entry.text,
+              ref: { store: "fact", backend: "local", localId: r.entry.id },
+              score: r.score,
+            })),
+          ),
         }
       : {}),
     ...(mem.autoCapture === true
@@ -1077,18 +1129,25 @@ export type WireWikiExtras = {
  */
 export function foldWikiRecall(
   base: MemorySeam | undefined,
-  wiki: { readonly recall: (query: string, k: number) => Promise<readonly string[]> } | null,
+  wiki: {
+    readonly recall: (query: string, k: number) => Promise<readonly string[]>;
+    readonly recallItems?: (query: string, k: number) => Promise<readonly RecalledItem[]>;
+  } | null,
   k: number,
 ): MemorySeam | undefined {
   if (wiki === null) return base;
-  const baseRecall = base?.recall;
+  const baseItems = recallItemsOf(base);
+  const wikiItems =
+    wiki.recallItems ??
+    (async (query: string, wikiK: number): Promise<readonly RecalledItem[]> =>
+      (await wiki.recall(query, wikiK)).map((text) => ({ text, ref: null })));
   return {
     ...(base ?? {}),
     autoRecall: true,
-    recall: async (query, requestedK) => {
-      const factLines = baseRecall !== undefined ? await baseRecall(query, requestedK) : [];
-      return [...factLines, ...(await wiki.recall(query, k))];
-    },
+    ...recallPair(async (query, requestedK) => {
+      const factItems = baseItems !== undefined ? await baseItems(query, requestedK) : [];
+      return [...factItems, ...(await wikiItems(query, k))];
+    }),
   };
 }
 
@@ -1114,7 +1173,7 @@ export function wireWiki(
       backend: "thredz",
       store: null,
       tools: [],
-      recall: async (query, k) => {
+      ...recallPair(async (query, k) => {
         let res: { content: string; isError: boolean };
         try {
           res = await client.callTool("wiki_recall", { query, limit: k });
@@ -1128,8 +1187,11 @@ export function wireWiki(
           log?.(`[thredz] wiki recall failed (${classifyThredzFailure(res.content)})\n`);
           return [];
         }
-        return parseThredzRecallLines(res.content, k);
-      },
+        return parseThredzRecallLines(res.content, k).map((text) => ({
+          text,
+          ref: thredzWikiRef(text),
+        }));
+      }),
     };
   }
 
@@ -1167,11 +1229,21 @@ export function wireWiki(
     backend: "file",
     store,
     tools: bundle.all,
-    recall: async (query, k) => {
-      const hits = await store.recall(query, k);
-      return hits.map((h) => `[wiki:${h.ref.slug}] ${h.ref.title} — ${excerpt(h.body)}`);
-    },
+    ...recallPair(async (query, k) =>
+      (await store.recall(query, k)).map((h) => ({
+        text: `[wiki:${h.ref.slug}] ${h.ref.title} — ${excerpt(h.body)}`,
+        ref: { store: "wiki", backend: "local", localId: h.ref.slug, version: h.ref.version },
+        score: h.score,
+      })),
+    ),
   };
+}
+
+/** The article a Thredz recall line names (`[wiki:<slug>] …`), when its slug fits a ref id. */
+function thredzWikiRef(line: string): RecalledRef | null {
+  const slug = /^\[wiki:([^\]]*)\]/.exec(line)?.[1];
+  if (slug === undefined || slug === "unknown" || !REF_ID_RE.test(slug)) return null;
+  return { store: "wiki", backend: "thredz", localId: slug };
 }
 
 // ---------------------------------------------------------------------------
@@ -1333,18 +1405,18 @@ export async function wireMemory(
     const wikiFrag = fragment.memory?.wiki;
     if (wikiFrag?.autoRecall === true) {
       const wikiK = wikiFrag.recallK ?? DEFAULT_WIKI_RECALL_K;
-      const wikiRecall = wiki.recall;
+      const wikiItems = wiki.recallItems;
       const base = options.memory;
-      const baseRecall = base?.recall;
+      const baseItems = recallItemsOf(base);
       options = {
         ...options,
         memory: {
           ...(base ?? {}),
           autoRecall: true,
-          recall: async (query, k) => {
-            const factLines = baseRecall !== undefined ? await baseRecall(query, k) : [];
-            return [...factLines, ...(await wikiRecall(query, wikiK))];
-          },
+          ...recallPair(async (query, k) => {
+            const factItems = baseItems !== undefined ? await baseItems(query, k) : [];
+            return [...factItems, ...(await wikiItems(query, wikiK))];
+          }),
         },
       };
     }
@@ -1365,16 +1437,19 @@ export async function wireMemory(
       ...(deps.log !== undefined ? { log: deps.log } : {}),
     });
     const base = options.memory;
-    const baseRecall = base?.recall;
+    const baseItems = recallItemsOf(base);
     options = {
       ...options,
       memory: {
         ...(base ?? {}),
         autoRecall: true,
-        recall: async (query, k) => {
-          const priorLines = baseRecall !== undefined ? await baseRecall(query, k) : [];
-          return [...priorLines, ...(await sessionRecall.recall(query, DEFAULT_SESSION_RECALL_K))];
-        },
+        ...recallPair(async (query, k) => {
+          const priorItems = baseItems !== undefined ? await baseItems(query, k) : [];
+          return [
+            ...priorItems,
+            ...(await sessionRecall.recallItems(query, DEFAULT_SESSION_RECALL_K)),
+          ];
+        }),
       },
     };
     deps.log?.("[memory] sessionRecall on — folding the sessions-index as a third recall ranker\n");

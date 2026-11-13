@@ -87,6 +87,8 @@ export interface LoadedMemoryFile {
   readonly filename: string;
   readonly content: string;
   readonly truncated: boolean;
+  /** Set on a file loaded from `extraFiles`, outside the working directory. */
+  readonly outside?: true;
 }
 
 export interface ProjectMemoryLoadResult {
@@ -109,7 +111,7 @@ export async function loadProjectMemory(
   const filenames = opts.filenames ?? CANONICAL_MEMORY_FILES;
   const cap = opts.capBytes ?? DEFAULT_PROJECT_MEMORY_CAP_BYTES;
 
-  const matched: { filename: string; fullPath: string; size: number }[] = [];
+  const matched: { filename: string; fullPath: string; size: number; outside?: true }[] = [];
   for (const filename of filenames) {
     const fullPath = join(cwd, filename);
     if (!existsSync(fullPath)) continue;
@@ -127,7 +129,7 @@ export async function loadProjectMemory(
       if (!st.isFile()) continue;
       // Use the basename as the `file=` label in the wrapper.
       const filename = fullPath.split(/[/\\]/).pop() ?? fullPath;
-      matched.push({ filename, fullPath, size: st.size });
+      matched.push({ filename, fullPath, size: st.size, outside: true });
     } catch {}
   }
 
@@ -165,7 +167,12 @@ export async function loadProjectMemory(
     // Pillar 3: classify with origin "user" — `pass` policy runs the
     // classifier and emits trace events without modifying content.
     await classifyBoundary(content, { origin: "user" }).catch(() => undefined);
-    files.push({ filename: m.filename, content, truncated });
+    files.push({
+      filename: m.filename,
+      content,
+      truncated,
+      ...(m.outside === true ? { outside: true as const } : {}),
+    });
     remaining -= Buffer.byteLength(content, "utf8");
   }
 

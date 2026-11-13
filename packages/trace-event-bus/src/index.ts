@@ -16,6 +16,7 @@ export type {
   CacheRotationEvent,
   CircuitStateChangedEvent,
   CompactionFiredEvent,
+  ContextAssembledEvent,
   CostAccrualEvent,
   CoverageReportEvent,
   CrewDoneEvent,

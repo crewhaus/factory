@@ -74,6 +74,8 @@ const PALETTE: Record<TraceEventKind, string> = {
   judge_verdict: "\x1b[32m", // green
   provability_graded: "\x1b[32m", // green
   proof_checked: "\x1b[32m", // green
+  // What one model call was given, as counts: context bookkeeping, like curate.
+  context_assembled: "\x1b[2m", // dim — one line per model call
 };
 
 export function colorize(kind: TraceEventKind, text: string, useColor: boolean): string {

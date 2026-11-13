@@ -20,7 +20,7 @@
  */
 
 import { readdir } from "node:fs/promises";
-import type { SessionSummary } from "@crewhaus/session-store";
+import { SESSION_ID_RE, type SessionSummary } from "@crewhaus/session-store";
 import { openForRead } from "@crewhaus/tool-safety/fs";
 
 /** The recall seam the composition root folds into the auto-recall bundle. */
@@ -28,6 +28,21 @@ export type SessionSummaryRecall = {
   /** Top-`k` session-summary recall lines for the query, most-relevant first.
    *  Empty when the index is absent/empty or nothing lexically matches. */
   recall(query: string, k: number): Promise<string[]>;
+  /** The same lines as `recall`, each with the session it summarizes when its
+   *  id is a session id (`sess_` and 16 hex), else no ref. */
+  recallItems(
+    query: string,
+    k: number,
+  ): Promise<
+    {
+      readonly text: string;
+      readonly ref: {
+        readonly store: "session";
+        readonly backend: "local";
+        readonly localId: string;
+      } | null;
+    }[]
+  >;
 };
 
 export type CreateSessionSummaryRecallOptions = {
@@ -179,14 +194,24 @@ export function createSessionSummaryRecall(
     return out;
   }
 
+  async function ranked(query: string, k: number): Promise<SessionSummary[]> {
+    if (typeof query !== "string" || query.trim() === "" || k <= 0) return [];
+    const summaries = await loadSummaries();
+    if (summaries.length === 0) return [];
+    return bm25Rank(summaries, query).slice(0, k);
+  }
+
   return {
     async recall(query: string, k: number): Promise<string[]> {
-      if (typeof query !== "string" || query.trim() === "" || k <= 0) return [];
-      const summaries = await loadSummaries();
-      if (summaries.length === 0) return [];
-      return bm25Rank(summaries, query)
-        .slice(0, k)
-        .map((s) => formatLine(s));
+      return (await ranked(query, k)).map((s) => formatLine(s));
+    },
+    async recallItems(query: string, k: number) {
+      return (await ranked(query, k)).map((s) => ({
+        text: formatLine(s),
+        ref: SESSION_ID_RE.test(s.sessionId)
+          ? { store: "session" as const, backend: "local" as const, localId: s.sessionId }
+          : null,
+      }));
     },
   };
 }

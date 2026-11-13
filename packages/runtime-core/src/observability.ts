@@ -947,6 +947,10 @@ const WATCHME_MIRRORED_KIND_RECORD: Readonly<Record<EventKind, true>> = {
   // verdict summary and ProofCheck's checker runs, both mirrored durably.
   provability_graded: true,
   proof_checked: true,
+  // What a run started under and what each model call was given, written by
+  // the loop itself (`./run-records`).
+  run_stamp: true,
+  context_manifest: true,
 };
 export const WATCHME_MIRRORED_KINDS: ReadonlySet<string> = new Set(
   Object.keys(WATCHME_MIRRORED_KIND_RECORD),

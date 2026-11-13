@@ -1212,6 +1212,24 @@ export type EvalUnmeasuredEvent = TraceEventEnvelope & {
   errorName: string;
 };
 
+/**
+ * What one main model call was given, as counts only: how many system
+ * regions, how many recalled items were included, redacted (a split
+ * redaction counts here) or kept with a warning, how many tools were
+ * advertised and how many the loop carries, and how many messages. Published
+ * before the call's `model_request` unless `CREWHAUS_RUN_STAMPS=0`. Carries no
+ * text, so every exporter may send it on.
+ */
+export type ContextAssembledEvent = TraceEventEnvelope & {
+  kind: "context_assembled";
+  /** The system regions of the request. */
+  blocks: number;
+  recalled: { included: number; redacted: number; warned: number };
+  tools: { advertised: number; inSpec: number };
+  /** The messages of the request. */
+  messages: number;
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -1257,7 +1275,8 @@ export type TraceEvent =
   | EvalUnmeasuredEvent
   | JudgeVerdictEvent
   | ProvabilityGradedEvent
-  | ProofCheckedEvent;
+  | ProofCheckedEvent
+  | ContextAssembledEvent;
 
 export type TraceEventKind = TraceEvent["kind"];
 

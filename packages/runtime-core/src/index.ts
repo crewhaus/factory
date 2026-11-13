@@ -57,7 +57,13 @@ import {
   RuntimeError,
   isRunFailedError,
 } from "@crewhaus/errors";
-import { DEFAULT_ROOT_DIR, type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
+import {
+  type ContextBlockKind,
+  DEFAULT_ROOT_DIR,
+  type EventKind,
+  type EventLog,
+  openEventLog,
+} from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import {
   type Advertisement,
@@ -264,9 +270,37 @@ import {
   openRunRows,
   recordRunPark,
   resumeScopeOf,
+  runFactsOf,
   runSubjectRef,
   withRunRows,
 } from "./run-ledger";
+import {
+  type LedgerAnchor,
+  type RecallLineOutcome,
+  type RecalledItem,
+  SEED_SOURCE_LABEL,
+  type SeedSource,
+  contextDigestKey,
+  createManifestRecorder,
+  createRecordEvent,
+  ledgerAnchor,
+  ledgerEntryText,
+  ledgerHeader,
+  markReplayedSource,
+  noteLoopReply,
+  recordRunStamp,
+  recordsRun,
+  seedSourceFrom,
+  seedSourcesOf,
+} from "./run-records";
+export {
+  CONTEXT_FINGERPRINT_LABEL,
+  RUN_STAMPS_ENV,
+  type RecalledItem,
+  type RecalledRef,
+  type SeedSource,
+  runStampsEnabled,
+} from "./run-records";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 import {
@@ -491,6 +525,8 @@ export type ContinuityLedgerEntry = {
   readonly role: ContextEvictedRole;
   readonly text: string;
   readonly turnNumber?: number;
+  /** Where a user entry came from; absent is the run's own user. */
+  readonly source?: SeedSource;
 };
 
 /**
@@ -594,11 +630,14 @@ export function renderContinuityTail(input: {
     truncated: boolean,
   ): string => {
     const lines = entries.map((e) => {
-      const attribution = e.turnNumber !== undefined ? `(user, turn ${e.turnNumber})` : "(user)";
-      return `- ${attribution} ${escapeBoundaryDelimiter(e.text, "requirements_ledger")}`;
+      const label = SEED_SOURCE_LABEL[e.source ?? "user"];
+      const attribution =
+        e.turnNumber !== undefined ? `(${label}, turn ${e.turnNumber})` : `(${label})`;
+      const text = escapeBoundaryDelimiter(ledgerEntryText(e), "requirements_ledger");
+      return `- ${attribution} ${text}`;
     });
     const body = [...(truncated ? [LEDGER_TRUNCATED_MARKER] : []), ...lines].join("\n");
-    return `<requirements_ledger>\nUser requirements preserved verbatim before context compaction — they remain binding even though the original messages were evicted:\n${body}\n</requirements_ledger>`;
+    return `<requirements_ledger>\n${ledgerHeader(entries)}\n${body}\n</requirements_ledger>`;
   };
 
   // 1. Ledger block, oldest-first eviction until it fits the cap alone.
@@ -1175,6 +1214,7 @@ export async function replayMessageHistory(log: EventLog): Promise<Anthropic.Mes
         content: Anthropic.MessageParam["content"];
         synthetic?: boolean;
         directive?: boolean;
+        source?: unknown;
       };
       // 0.6.0 §7.2.1 — honour the logged `synthetic: true` flag on replay so
       // a resumed transcript's runtime-injected user messages stay marked
@@ -1193,6 +1233,8 @@ export async function replayMessageHistory(log: EventLog): Promise<Anthropic.Mes
         if (rest.length === 0 && !hasOtherBlocks) continue;
         replayed = stripDirectiveFromMessage(replayed, rest);
       }
+      // A message another source wrote keeps that source (`./run-records`).
+      markReplayedSource(replayed, seedSourceFrom(p.source));
       messages.push(p.synthetic === true ? markSynthetic(replayed) : replayed);
     } else if (ev.kind === "assistant_message") {
       const p = ev.payload as { content: Anthropic.MessageParam["content"] };
@@ -2052,6 +2094,17 @@ export type RunChatLoopOptions = {
    */
   seedMessages?: ReadonlyArray<Anthropic.MessageParam>;
   /**
+   * Where the user-role `seedMessages` came from, when not from the person
+   * the run serves: `"crew"` for a message one crew role sends another,
+   * `"workflow"` for a step's input built from an earlier step. The
+   * requirements ledger labels an evicted seed with it; `(user)` is kept for
+   * the run's own user. Absent, a seed is the user's, unless it starts as a
+   * workflow step's input does (`## Output of previous step:`). A seed's
+   * `user_message` line records a source other than the user's, so a
+   * resumed loop labels the replayed message the same.
+   */
+  seedSource?: "crew" | "workflow";
+  /**
    * Single-shot mode: run exactly one user→assistant turn (with the tool
    * inner-loop until Done) using `seedMessages`, then return the terminal
    * assistant text. Skips the stdin REPL entirely. Used by the workflow
@@ -2256,6 +2309,13 @@ export type RunChatLoopOptions = {
     readonly recallSeed?: string;
     /** Return recalled memory lines to inject; runtime wraps them in a block. */
     readonly recall?: (query: string, k: number) => Promise<readonly string[]>;
+    /**
+     * The same items `recall` returns, each with the entry it came from. When
+     * present the runtime calls it in place of `recall` (one store query per
+     * recall) and injects the items' text, so the run's context manifest can
+     * name each recalled item by ref.
+     */
+    readonly recallItems?: (query: string, k: number) => Promise<readonly RecalledItem[]>;
     readonly autoCapture?: boolean;
     /** Invoked at teardown with the completed user-text turn count and the
      *  run's session id (so the callback can read the transcript to summarize). */
@@ -2467,6 +2527,12 @@ export type RunChatLoopOptions = {
    * spec; the CLI `run` path passes `{ name, version?, hash? }`.
    */
   incidentSpec?: { readonly name: string; readonly version?: string; readonly hash?: string };
+  /**
+   * The revision of the spec this loop interprets (`specRevision` of its
+   * text), recorded in the run's `run_stamp` when its environment names no
+   * `CREWHAUS_SPEC_HASH`. Recording only: it binds no approval.
+   */
+  specRevision?: string;
   /** Item 32 — override the incidents dir (tests/tenants). */
   incidentsDir?: string;
   /**
@@ -3928,7 +3994,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   if (!hasRunRows(opts)) {
     const admitted = admitLoop(opts, () => resolveSessionRootDir(opts.sessionRootDir));
     if (!admitted.admit) return admitted.reply;
-    return withRunRows(opts, () => runChatLoop(opts));
+    return noteLoopReply(opts, await withRunRows(opts, () => runChatLoop(opts)));
   }
   // A one-shot job's seed is checked at "api" under CREWHAUS_INPUT_ORIGIN (`./input-origin`).
   const seed = await seedVerdict(opts);
@@ -4883,13 +4949,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         text?: unknown;
         turnNumber?: unknown;
         synthetic?: unknown;
+        source?: unknown;
       };
       if (p.synthetic === true) continue;
       if (p.role === "user" && typeof p.text === "string") {
+        const source = seedSourceFrom(p.source);
         resumedLedgerSeed.push({
           role: "user",
           text: p.text,
           ...(typeof p.turnNumber === "number" ? { turnNumber: p.turnNumber } : {}),
+          ...(source !== "user" ? { source } : {}),
         });
       }
     }
@@ -5278,9 +5347,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   if (opts.approvals !== undefined) {
     onCancelledRun(runContext, withdrawOnCancel(runContext, opts.approvals.store));
   }
+  // Run records (`./run-records`): when this loop records, every line its
+  // handle writes carries the run id.
+  const runRecorded = recordsRun(runContext, persistSession);
   const eventLog: EventLog = persistSession
-    ? await openEventLog(sessionId, { rootDir: sessionRootDir })
+    ? await openEventLog(sessionId, {
+        rootDir: sessionRootDir,
+        ...(runRecorded ? { run: runContext.runId } : {}),
+      })
     : createMemoryEventLog();
+  // Where each user-role message of this loop came from, for the ledger.
+  const seedSourceOf = seedSourcesOf(opts, runContext);
 
   // #405 — reconcile the session's recorded toolset with THIS run's.
   //
@@ -5668,7 +5745,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * text-bearing record is appended verbatim to the session event log as
    * `context_evicted` (zero model trust — the recall integration comes in a
    * later PR); user records additionally fold into the in-run ledger for
-   * per-call reinjection. A turn the runtime wrote (a grader's correction, a
+   * per-call reinjection. A user record that came from elsewhere than the
+   * run's own user (a crew role, a workflow step, a channel, API input)
+   * names its `source`. A turn the runtime wrote (a grader's correction, a
    * retry or loop nudge) is logged with `synthetic: true` and stays out of the
    * ledger.
    */
@@ -5678,14 +5757,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     if (!continuityLedgerEnabled) return;
     for (const message of evicted) {
       const runtimeAuthored = isSyntheticMessage(message);
+      const source = message.role === "user" ? seedSourceOf(message) : "user";
       for (const entry of extractEvictedEntries(message)) {
+        const sourced: ContinuityLedgerEntry =
+          entry.role === "user" && source !== "user" ? { ...entry, source } : entry;
         await logEvent("context_evicted", {
           role: entry.role,
           text: entry.text,
           ...(entry.turnNumber !== undefined ? { turnNumber: entry.turnNumber } : {}),
           ...(runtimeAuthored ? { synthetic: true } : {}),
+          ...(sourced.source !== undefined ? { source: sourced.source } : {}),
         });
-        if (entry.role === "user" && !runtimeAuthored) foldLedgerEntry(entry);
+        if (entry.role === "user" && !runtimeAuthored) foldLedgerEntry(sourced);
       }
     }
   };
@@ -5693,9 +5776,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   /** §2.3 — the ledger text handed to the autocompact summarizer as an
    *  anchor. Evaluated lazily AFTER the current step's evictions folded, so
    *  the requirements at risk in THIS compaction anchor THIS summary. */
-  const ledgerAnchorText = (): string | undefined => {
-    if (!continuityLedgerEnabled || ledgerEntries.length === 0) return undefined;
-    return ledgerEntries.map((e) => `- ${e.text}`).join("\n");
+  const ledgerAnchorText = (): LedgerAnchor | undefined => {
+    if (!continuityLedgerEnabled) return undefined;
+    return ledgerAnchor(ledgerEntries);
   };
 
   /**
@@ -5795,7 +5878,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const compactionSpecModel = opts.compactionModel ?? opts.model;
   const compactionExtras = (): Pick<
     CompactArgs,
-    "realInputTokens" | "curate" | "onCurate" | "bus" | "compactionSpecModel" | "compactionParams"
+    | "realInputTokens"
+    | "curate"
+    | "onCurate"
+    | "bus"
+    | "compactionSpecModel"
+    | "compactionParams"
+    | "runContext"
   > => ({
     ...(lastModelInputTokens !== undefined ? { realInputTokens: lastModelInputTokens } : {}),
     ...(curateConfig !== undefined ? { curate: curateConfig, onCurate: publishCurate } : {}),
@@ -5805,6 +5894,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     compactionSpecModel,
     // 0.6.0 §4.2 — the compaction profile's pinned request params.
     ...(opts.compactionParams !== undefined ? { compactionParams: opts.compactionParams } : {}),
+    // A kept summary is lineage-tagged into the run at `compaction`.
+    runContext,
   });
   const permissionMode: PermissionMode = opts.permissionMode ?? "default";
   // #383 — merge the harness's `.crewhaus/settings.json` rules into the
@@ -5864,6 +5955,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           ...(opts.memory.recallK !== undefined ? { recallK: opts.memory.recallK } : {}),
           ...(opts.memory.recallSeed !== undefined ? { recallSeed: opts.memory.recallSeed } : {}),
           recall: opts.memory.recall,
+          ...(opts.memory.recallItems !== undefined
+            ? { recallItems: opts.memory.recallItems }
+            : {}),
         }
       : undefined;
   const bridgeContinuitySeam =
@@ -5918,6 +6012,47 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         .join(", ")}\n`,
     );
   }
+  // Run records (`./run-records`): what each main model call is given, by
+  // reference, and the counts-only `context_assembled` event.
+  const manifestRecorder = createManifestRecorder({
+    runContext,
+    bus,
+    records: runRecorded,
+    write: createRecordEvent((event) => eventLog.append(event), runContext.logger),
+    digestKey: () =>
+      contextDigestKey(ledgerRoot(opts, opts.settingsDir), opts.runLedgerDir !== null),
+    inSpec: effectiveTools.length,
+    files: projectMemory.files,
+  });
+  // Once per run and session log, before the first turn: what started the
+  // run and what it runs under.
+  await recordRunStamp({
+    recorder: manifestRecorder,
+    sessionId,
+    facts: runFactsOf(runContext, opts, sessionId),
+    shape: opts.sessionTarget ?? "cli",
+    mode: opts.singleTurn === true ? "single-turn" : "repl",
+    model: opts.model,
+    sessionTurnBase: resumedTurns,
+    specRevision: opts.specRevision,
+    ...(opts.settingsDir !== null || permissionRules.settings.length > 0
+      ? { settingsRules: permissionRules.settings }
+      : {}),
+    ...(poolPolicyVersion !== undefined ? { poolPolicyVersion } : {}),
+    recording: {
+      advisorEvents: advisorPersist !== undefined,
+      costTracking: subscribers.costTracker !== undefined,
+      watchme: watchmeCapture !== undefined,
+      runLedger: process.env["CREWHAUS_RUN_LEDGER"] !== "0" && opts.runLedgerDir !== null,
+    },
+  });
+  /** One recall: structured items when the seam gives them, one store query either way. */
+  const recallItems = async (query: string, k: number): Promise<readonly RecalledItem[]> => {
+    const memory = opts.memory;
+    if (memory?.recallItems !== undefined) return memory.recallItems(query, k);
+    const lines = memory?.recall !== undefined ? await memory.recall(query, k) : [];
+    return lines.map((text) => ({ text, ref: null }));
+  };
   // Feature #53 / Item 2 (G21) — cross-session auto-recall. `recallMode`
   // decides WHERE the recalled evidence lives:
   //   - "session-start" (default): pull the top-K relevant memories ONCE at
@@ -5940,9 +6075,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // tool output from an earlier session; `renderRecalledMemory` classifies
       // each line at TrustOrigin "memory" (redacting a malicious one),
       // lineage-tags the admitted lines, and neutralizes breakout delimiters.
-      const lines = await opts.memory.recall(seed, k);
-      const text = await renderRecalledMemory(lines, runContext);
-      if (text !== undefined) {
+      const items = await recallItems(seed, k);
+      const lines = items.map((item) => item.text);
+      const rendered = await renderRecalledMemory(lines, runContext);
+      manifestRecorder.noteRecall({
+        at: "session-start",
+        query: seed,
+        requested: k,
+        items,
+        outcomes: rendered?.outcomes ?? [],
+      });
+      if (rendered !== undefined) {
+        const text = rendered.text;
         memoryRecallBlock = [{ type: "text", text, cache_control: { type: "ephemeral" } }];
         out.write(`[memory] recalled ${lines.length} memory(ies) into the prompt\n`);
       }
@@ -5966,16 +6110,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       return;
     }
     turnsSinceRecall = 1;
-    const recall = opts.memory?.recall;
-    if (recall === undefined) return;
+    if (opts.memory?.recall === undefined) return;
     // Recall against the LATEST user message (the interactive cadence), falling
     // back to the seed/instructions when the tail carries no human text.
     const query = latestUserText(msgs) ?? opts.memory?.recallSeed ?? opts.instructions;
     const k = opts.memory?.recallK ?? 5;
     try {
-      const lines = await recall(query, k);
-      const text = await renderRecalledMemory(lines, runContext);
-      volatileRecallBlocks = text !== undefined ? [{ type: "text", text }] : [];
+      const items = await recallItems(query, k);
+      const lines = items.map((item) => item.text);
+      const rendered = await renderRecalledMemory(lines, runContext);
+      volatileRecallBlocks = rendered !== undefined ? [{ type: "text", text: rendered.text }] : [];
+      manifestRecorder.noteRecall({
+        at: "per-turn",
+        query,
+        requested: k,
+        items,
+        outcomes: rendered?.outcomes ?? [],
+      });
       if (lines.length > 0) {
         out.write(`[memory] refreshed ${lines.length} recalled memory(ies) for this turn\n`);
       }
@@ -5994,6 +6145,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     ...projectMemoryBlock,
     ...memoryRecallBlock,
     ...skillsBlock,
+  ];
+  // The kind of each frozen block, in order (`manageCacheMarkers` keeps the
+  // blocks one to one, so it stays aligned).
+  const systemBlockKinds: ContextBlockKind[] = [
+    "instructions",
+    ...projectMemoryBlock.map(() => "project-memory" as const),
+    ...memoryRecallBlock.map(() => "recalled-memory" as const),
+    ...skillsBlock.map(() => "skills" as const),
   ];
 
   // Section 27 — rotate cache markers on the system block array if the
@@ -9347,6 +9506,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // serving adapter implements the projection and can project it
             // (a wrapper reports `undefined` for "cannot project").
             const effectiveParams = turnAdapter.effectiveParams?.(req);
+            // Run records (`./run-records`): `context_assembled` (counts) on
+            // the bus, then the call's `context_manifest` in the session log.
+            const assembledReq = manifestRecorder.assembled(req, {
+              frozen: systemBlockKinds,
+              volatileRecall: volatileRecallBlocks.length,
+              tail: continuityTail,
+              guide: guideBlocks.length,
+              overlay: plan.overlayBlock !== undefined,
+              hookAppend: hookSystemAppend !== undefined,
+            });
             bus.publish({
               ...modelStartEnv,
               kind: "model_request",
@@ -9359,6 +9528,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               ...modelAttribution(),
               ...planAttribution(plan),
               ...(effectiveParams !== undefined ? { effectiveParams } : {}),
+            });
+            await manifestRecorder.manifest(assembledReq, {
+              span: modelStartEnv.spanId,
+              turn: { run: runContext.turnNumber, session: resumedTurns + runContext.turnNumber },
+              model: {
+                wire: reqWireModelId,
+                ...(reqSpecModel !== reqWireModelId ? { spec: reqSpecModel } : {}),
+                provider: reqProviderId,
+                ...(plan.profile !== undefined ? { profile: plan.profile } : {}),
+              },
+              ...(effectiveParams !== undefined ? { effective: effectiveParams } : {}),
             });
             // G10 — arm the per-model-call watchdog for exactly the stream's
             // lifetime: cleared right after each drain below and (throw
@@ -9891,6 +10071,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...(opts.compactionParams !== undefined
                   ? { compactionParams: opts.compactionParams }
                   : {}),
+                // A kept summary is lineage-tagged into the run at `compaction`.
+                runContext,
               }).finally(() => out.spinner.stop());
               // §2.3 — persist the summary text alongside the counts (the
               // reactive path always ends in autocompact's [marker, summary,
@@ -11788,9 +11970,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const seedDirective = await applyDirective(messageText(last), "seed");
       for (const m of seed) {
         if (m.role === "user") {
+          // A seed from elsewhere than the run's own user names its source,
+          // so a resumed loop labels it the same.
+          const source = seedSourceOf(m);
           await logEvent("user_message", {
             content: m.content,
             ...(m === last && seedDirective?.stripped === true ? { directive: true } : {}),
+            ...(source !== "user" ? { source } : {}),
           });
         } else if (m.role === "assistant") {
           await logEvent("assistant_message", { content: m.content });
@@ -11804,7 +11990,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // model call, no turn.
           return seedDirective.ack;
         }
-        messages[messages.length - 1] = stripDirectiveFromMessage(last, seedDirective.rest);
+        const stripped = stripDirectiveFromMessage(last, seedDirective.rest);
+        seedSourceOf.carry(last, stripped);
+        messages[messages.length - 1] = stripped;
       }
       runContext.turnNumber += 1;
       bus.setTurnNumber(runContext.turnNumber);
@@ -11926,6 +12114,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       costPersistUnsubscribe?.();
       failoverNoteUnsubscribe?.();
       routingPersist.unsubscribe();
+      manifestRecorder.dispose();
       incidentCollector?.unsubscribe();
       ownBudgetMeter?.unsubscribe();
       advisorPersist?.unsubscribe();
@@ -12123,10 +12312,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           requestInput = directive.rest;
         }
       }
-      messages.push({ role: "user", content: requestInput });
+      const typed: Anthropic.MessageParam = { role: "user", content: requestInput };
+      const typedSource = seedSourceOf(typed);
+      messages.push(typed);
       await logEvent("user_message", {
         content: effectiveInput,
         ...(directive?.stripped === true ? { directive: true } : {}),
+        ...(typedSource !== "user" ? { source: typedSource } : {}),
       });
       runContext.turnNumber += 1;
       bus.setTurnNumber(runContext.turnNumber);
@@ -12252,6 +12444,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     costPersistUnsubscribe?.();
     failoverNoteUnsubscribe?.();
     routingPersist.unsubscribe();
+    manifestRecorder.dispose();
     incidentCollector?.unsubscribe();
     ownBudgetMeter?.unsubscribe();
     advisorPersist?.unsubscribe();
@@ -12538,14 +12731,17 @@ async function curateActiveContext(
  * has any
  * `</recalled_memory>` breakout delimiter neutralized. A classifier rejection
  * propagates, so both callers fail closed. Returns `undefined` when there is
- * nothing to recall.
+ * nothing to recall, else the block text and what became of each line
+ * (included, warned, redacted, split-redacted, with the rules behind it).
  */
 async function renderRecalledMemory(
   lines: readonly string[],
   runContext: RunContext,
-): Promise<string | undefined> {
+): Promise<{ readonly text: string; readonly outcomes: RecallLineOutcome[] } | undefined> {
   if (lines.length === 0) return undefined;
   const rendered = [...lines];
+  // What became of each line, for the run's context manifest (`./run-records`).
+  const outcomes: RecallLineOutcome[] = lines.map(() => ({ status: "included" }));
   const admitted: number[] = [];
   for (const [i, line] of lines.entries()) {
     const boundary = await classifyBoundary(line, { origin: "memory" });
@@ -12555,10 +12751,12 @@ async function renderRecalledMemory(
         rules,
       });
       rendered[i] = boundary.redacted ?? "";
+      outcomes[i] = { status: "redacted", rules };
       continue;
     }
     if (boundary.action === "warn") {
       runContext.logger.warn("suspicious recalled memory line kept", { rules });
+      outcomes[i] = { status: "warned", rules };
     }
     admitted.push(i);
   }
@@ -12567,12 +12765,17 @@ async function renderRecalledMemory(
     runContext,
   );
   admitted.forEach((i, j) => {
-    const notice = split.get(j);
-    if (notice !== undefined) rendered[i] = notice;
-    else tagContent(runContext, lines[i] as string, "memory");
+    const redaction = split.get(j);
+    if (redaction !== undefined) {
+      rendered[i] = redaction.notice;
+      outcomes[i] = { status: "split-redacted", rules: redaction.rules };
+    } else tagContent(runContext, lines[i] as string, "memory");
   });
   const body = rendered.map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`).join("\n");
-  return `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
+  return {
+    text: `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`,
+    outcomes,
+  };
 }
 
 /**
@@ -12587,25 +12790,27 @@ async function renderRecalledMemory(
  * classified and both lines of a malicious pair are redacted. When no pair
  * reproduces the verdict, or the lines left still join malicious (a split over
  * three lines, or weak hits that only add up across the block), every line is
- * redacted: fail closed. Returns the redaction notice for each line to redact,
- * by index into `lines`; a classifier rejection propagates.
+ * redacted: fail closed. Returns, for each line to redact by index into
+ * `lines`, the redaction notice and the rules behind it; a classifier rejection
+ * propagates.
  */
 async function redactSplitInjections(
   lines: readonly string[],
   runContext: RunContext,
-): Promise<Map<number, string>> {
-  const redacted = new Map<number, string>();
+): Promise<Map<number, { readonly notice: string; readonly rules: string[] }>> {
+  const redacted = new Map<number, { readonly notice: string; readonly rules: string[] }>();
   if (lines.length < 2) return redacted;
   const joined = await classifyBoundary(lines.join("\n"), { origin: "memory" });
   if (joined.action !== "redact") return redacted;
   for (let i = 0; i + 1 < lines.length; i++) {
     const pair = await classifyBoundary(`${lines[i]}\n${lines[i + 1]}`, { origin: "memory" });
     if (pair.action !== "redact") continue;
+    const rules = [...new Set(pair.verdict.hits.map((h) => h.rule))];
     runContext.logger.warn("recalled memory lines redacted (prompt injection split across lines)", {
-      rules: [...new Set(pair.verdict.hits.map((h) => h.rule))],
+      rules,
     });
-    redacted.set(i, pair.redacted ?? "");
-    redacted.set(i + 1, pair.redacted ?? "");
+    redacted.set(i, { notice: pair.redacted ?? "", rules });
+    redacted.set(i + 1, { notice: pair.redacted ?? "", rules });
   }
   const left = lines.filter((_, i) => !redacted.has(i));
   const residual =
@@ -12615,12 +12820,13 @@ async function redactSplitInjections(
         ? await classifyBoundary(left.join("\n"), { origin: "memory" })
         : undefined;
   if (residual?.action === "redact") {
+    const rules = [...new Set(residual.verdict.hits.map((h) => h.rule))];
     runContext.logger.warn(
       "recalled memory lines redacted (prompt injection across lines not localized to a pair)",
-      { rules: [...new Set(residual.verdict.hits.map((h) => h.rule))] },
+      { rules },
     );
     for (let i = 0; i < lines.length; i++) {
-      if (!redacted.has(i)) redacted.set(i, residual.redacted ?? "");
+      if (!redacted.has(i)) redacted.set(i, { notice: residual.redacted ?? "", rules });
     }
   }
   return redacted;
@@ -12714,7 +12920,7 @@ type CompactArgs = {
    *  the autocompact summarizer. Read AFTER `onEvict` folded this step's
    *  evictions, so the requirements at risk in THIS compaction anchor THIS
    *  summary. `undefined` keeps the summarizer prompt byte-identical. */
-  getLedgerText?: () => string | undefined;
+  getLedgerText?: () => LedgerAnchor | undefined;
   /**
    * Item 4 / G28 — the provider's ACTUAL input_tokens from the last
    * `model_response` (input + cache read + cache create). When set it is the
@@ -12744,6 +12950,8 @@ type CompactArgs = {
   compactionSpecModel?: string;
   /** 0.6.0 §4.2 — the compaction profile's pinned request params. */
   compactionParams?: AuxRequestParams;
+  /** The run a kept autocompact summary is lineage-tagged into, at `compaction`. */
+  runContext?: RunContext;
 };
 
 type OnCompaction = (info: CompactionInfo) => Promise<void>;
@@ -12803,6 +13011,7 @@ async function maybeCompact(
     bus,
     compactionSpecModel,
     compactionParams,
+    runContext,
   } = args;
 
   // Item 4 / G28 — real-token calibration. The initial array's real size is
@@ -12888,6 +13097,7 @@ async function maybeCompact(
     ...(bus !== undefined ? { bus } : {}),
     ...(compactionSpecModel !== undefined ? { compactionSpecModel } : {}),
     ...(compactionParams !== undefined ? { compactionParams } : {}),
+    ...(runContext !== undefined ? { runContext } : {}),
   });
   if (onCompaction !== undefined) {
     const summary = summaryTextOf(after);
@@ -12913,13 +13123,15 @@ type ForceCompactArgs = {
   /** See CompactArgs.onEvict — same contract on the reactive path. */
   onEvict?: (evicted: ReadonlyArray<Anthropic.MessageParam>) => Promise<void>;
   /** See CompactArgs.getLedgerText. */
-  getLedgerText?: () => string | undefined;
+  getLedgerText?: () => LedgerAnchor | undefined;
   /** See CompactArgs.bus. */
   bus?: TraceEventBus;
   /** See CompactArgs.compactionSpecModel. */
   compactionSpecModel?: string;
   /** See CompactArgs.compactionParams. */
   compactionParams?: AuxRequestParams;
+  /** See CompactArgs.runContext. */
+  runContext?: RunContext;
 };
 
 /**
@@ -12942,6 +13154,7 @@ async function forceCompact(args: ForceCompactArgs): Promise<Anthropic.MessagePa
     bus,
     compactionSpecModel,
     compactionParams,
+    runContext,
   } = args;
   const snipped = snip(messages, snipKeepHead, snipKeepTail);
   // §2.3 — same externalize-before-drop contract as the pre-turn ladder:
@@ -12962,6 +13175,7 @@ async function forceCompact(args: ForceCompactArgs): Promise<Anthropic.MessagePa
     ...(bus !== undefined ? { bus } : {}),
     ...(compactionSpecModel !== undefined ? { compactionSpecModel } : {}),
     ...(compactionParams !== undefined ? { compactionParams } : {}),
+    ...(runContext !== undefined ? { runContext } : {}),
   });
 }
 
@@ -12978,10 +13192,11 @@ type SummarizeHistoryArgs = {
   model: string;
   contextLimit: number;
   onEvict?: (evicted: ReadonlyArray<Anthropic.MessageParam>) => Promise<void>;
-  getLedgerText?: () => string | undefined;
+  getLedgerText?: () => LedgerAnchor | undefined;
   bus?: TraceEventBus;
   compactionSpecModel?: string;
   compactionParams?: AuxRequestParams;
+  runContext?: RunContext;
 };
 
 /**
@@ -13007,13 +13222,15 @@ async function summarizeHistory(args: SummarizeHistoryArgs): Promise<Anthropic.M
   // call, so the records survive even a summarizer failure. The ledger
   // anchor is read afterwards so this step's evictions are part of it.
   if (onEvict !== undefined && plan.toSummarize.length > 0) await onEvict(plan.toSummarize);
-  const ledgerText = getLedgerText?.();
+  const anchor = getLedgerText?.();
   const after = await autoCompact(snipped, adapter, model, {
     keepPendingMaxTokens,
-    ...(ledgerText !== undefined ? { ledgerText } : {}),
+    ...(anchor !== undefined ? { ledgerText: anchor.text } : {}),
+    ...(anchor?.labelled === true ? { ledgerLabelled: true } : {}),
     ...(args.bus !== undefined ? { bus: args.bus } : {}),
     ...(args.compactionSpecModel !== undefined ? { specModel: args.compactionSpecModel } : {}),
     ...(args.compactionParams !== undefined ? { params: args.compactionParams } : {}),
+    ...(args.runContext !== undefined ? { runContext: args.runContext } : {}),
   });
   const [marker, , final] = after;
   if (marker !== undefined) markSynthetic(marker);

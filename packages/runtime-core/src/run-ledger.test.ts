@@ -502,9 +502,15 @@ describe("when no rows are written", () => {
         },
       ],
     ];
+    // With the ledger off, or in a sub-run, a loop that writes run records
+    // may create the harness's digest key for their fingerprints; the run
+    // ledger stays absent. An in-memory session, `runLedgerDir: null` and a
+    // tenant run leave the harness root untouched.
+    const mayKey = new Set(["CREWHAUS_RUN_LEDGER=0", "a context with a parent"]);
     for (const [name, run] of cases) {
       const { dir, result } = await run();
-      expect(`${name}: ${existsSync(join(dir, ".crewhaus"))}`).toBe(`${name}: false`);
+      const absent = mayKey.has(name) ? join(dir, RUN_LEDGER_DIR) : join(dir, ".crewhaus");
+      expect(`${name}: ${existsSync(absent)}`).toBe(`${name}: false`);
       expect(`${name}: ${result}`).toBe(`${name}: ${baseline.result}`);
     }
   });
@@ -533,7 +539,7 @@ describe("when no rows are written", () => {
     } finally {
       await child.close();
     }
-    expect(existsSync(join(ledger, ".crewhaus"))).toBe(false);
+    expect(existsSync(join(ledger, RUN_LEDGER_DIR))).toBe(false);
   });
 });
 

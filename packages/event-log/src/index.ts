@@ -6,6 +6,10 @@
  * `{ ts, version: 1, kind, payload }`. The schema-version field is
  * stamped onto every event so future migrations can fan out on it.
  *
+ * A run-scoped handle (`openEventLog(id, { run })`) adds `run` after
+ * `payload` on every line it appends: `{ ts, version: 1, kind, payload, run }`.
+ * Readers that destructure `kind` and `payload` read both shapes.
+ *
  * Append semantics: each `append()` appends one line in place with mode
  * 0o600 (owner-only) per the `claude-code/utils/sessionStorage.ts`
  * precedent. Synchronous append on POSIX is atomic per line (when
@@ -265,7 +269,17 @@ export type EventKind =
   // non-conversational: `replayMessageHistory` ignores them, `--resume` is
   // unaffected, and readers written before these kinds existed keep parsing.
   | "provability_graded"
-  | "proof_checked";
+  | "proof_checked"
+  // What a run was started by and ran under (`run_stamp`, once per run and
+  // session log, before its first turn), and what each main model call was
+  // given (`context_manifest`, one per call, before the call): refs, sizes,
+  // counts, model settings and keyed fingerprints, never the text itself.
+  // Written by runtime-core unless `CREWHAUS_RUN_STAMPS=0`. Non-conversational:
+  // `replayMessageHistory` ignores them, `--resume` is unaffected, and readers
+  // that predate them skip them. Payloads: `RunStampPayload`,
+  // `ContextManifestPayload` below.
+  | "run_stamp"
+  | "context_manifest";
 
 /**
  * Payload for the `wiki_write` event kind (0.3.0 design §9): which article
@@ -309,13 +323,28 @@ export type Event = {
   readonly version: 1;
   readonly kind: EventKind;
   readonly payload: unknown;
+  /**
+   * The run that wrote the line, on every line a run-scoped handle appends
+   * (`OpenEventLogOptions.run`), last on the line. Absent on a line an
+   * unscoped handle writes.
+   */
+  readonly run?: string;
 };
 
 export type AppendEvent = Pick<Event, "kind" | "payload">;
 
+/** The grammar of a line's `run`: 1-128 of `[A-Za-z0-9._:-]`. */
+export const RUN_REF_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+
 export type OpenEventLogOptions = {
   readonly rootDir?: string;
   readonly now?: () => number;
+  /**
+   * Stamp every line this handle appends with `run`. It must match
+   * {@link RUN_REF_RE}; `openEventLog` throws otherwise. Unset, a line is
+   * exactly `{ts, version, kind, payload}`.
+   */
+  readonly run?: string;
 };
 
 export interface EventLog {
@@ -341,6 +370,12 @@ export async function openEventLog(
   opts: OpenEventLogOptions = {},
 ): Promise<EventLog> {
   validateId(sessionId);
+  const run = opts.run;
+  if (run !== undefined && !RUN_REF_RE.test(run)) {
+    throw new RuntimeError(
+      "event-log: invalid run — expected 1-128 characters of letters, digits and ._:-",
+    );
+  }
   const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
   const now = opts.now ?? (() => Date.now());
   const fullPath = resolve(rootDir, `${sessionId}.jsonl`);
@@ -359,12 +394,10 @@ export async function openEventLog(
   return {
     async append(event: AppendEvent): Promise<void> {
       fence();
-      const wire: Event = {
-        ts: now(),
-        version: 1,
-        kind: event.kind,
-        payload: event.payload,
-      };
+      const wire: Event =
+        run === undefined
+          ? { ts: now(), version: 1, kind: event.kind, payload: event.payload }
+          : { ts: now(), version: 1, kind: event.kind, payload: event.payload, run };
       const line = `${JSON.stringify(wire)}\n`;
       const appended = appendContained(dirname(fullPath), basename(fullPath), line, {
         mode: 0o600,
@@ -481,4 +514,181 @@ export type ActionProofEventPayload = {
   readonly verdict: "verified" | "missing" | "error_result" | "unverified";
   /** See `PlanUpdateEventPayload.agentIdentity`. */
   readonly agentIdentity?: string;
+};
+
+// ---- run records: `run_stamp` and `context_manifest` ----
+// Structural, so event-log stays dependency-free: runtime-core writes these
+// payloads, and its values are assignable to them.
+
+/** What started a run: the kinds a run record names (`Trigger` in control-contract). */
+export type RunStampTriggerKind =
+  | "queue"
+  | "heartbeat"
+  | "schedule"
+  | "approval-resume"
+  | "eval"
+  | "rehearsal"
+  | "api"
+  | "cli"
+  | "channel"
+  | "managed"
+  | "resume"
+  | "retry";
+
+/** Platform refs of a channel message, each 1-128 of `[A-Za-z0-9._:-]`. */
+export type RunStampChannelSource = {
+  readonly platform: string;
+  readonly conversationRef?: string;
+  readonly messageRef?: string;
+  readonly senderRef?: string;
+};
+
+/** A run's trigger as its run record has it; a channel trigger says whether its source was recorded. */
+export type RunStampTrigger = {
+  readonly kind: RunStampTriggerKind;
+  readonly lane?: string;
+  readonly via?: string;
+  readonly workItem?: string;
+  readonly synthetic?: true;
+  readonly source?: "not-recorded" | RunStampChannelSource;
+};
+
+/** The revision a run's spec was recorded at, and where the value came from. */
+export type RunStampSpecRevision =
+  | { readonly specHash: string; readonly source: "spawn-env" | "interpreter" }
+  | { readonly state: "not-recorded" };
+
+/** Payload of a `run_stamp` line: what started the run and what it ran under. */
+export type RunStampPayload = {
+  readonly v: 1;
+  readonly run: string;
+  /** The run that started this one: a verified root, or a sub-agent's parent. */
+  readonly parent?: string;
+  readonly continues?: string;
+  readonly execution?: string;
+  readonly resumeScope?: string;
+  readonly workItem?: string;
+  /** The session's target shape (`cli`, `workflow`, `channel`, …). */
+  readonly shape: string;
+  readonly mode: "repl" | "single-turn";
+  readonly model: string;
+  /** The turns the session already held when this run started. */
+  readonly sessionTurnBase: number;
+  readonly trigger: RunStampTrigger;
+  readonly revisions: {
+    readonly spec: RunStampSpecRevision;
+    /** runtime-core's version. */
+    readonly runtime: string;
+    readonly deployment?: string;
+    /** A keyed fingerprint of the merged settings rules, and how many there are. */
+    readonly settings?: { readonly fingerprint: string; readonly rules: number };
+    readonly pool?: { readonly policyVersion: string };
+  };
+  /** Which recordings were on for the run. */
+  readonly recording: {
+    readonly advisorEvents: boolean;
+    readonly costTracking: boolean;
+    readonly watchme: boolean;
+    readonly runLedger: boolean;
+  };
+};
+
+/** One system region of a model request, in request order. */
+export type ContextBlockKind =
+  | "instructions"
+  | "project-memory"
+  | "recalled-memory"
+  | "skills"
+  | "volatile-recall"
+  | "plan"
+  | "ledger"
+  | "guide"
+  | "overlay"
+  | "hook-append";
+
+/** What became of one recalled item before it reached the model. */
+export type RecalledItemStatus = "included" | "warned" | "redacted" | "split-redacted";
+
+/** Where a recalled item lives: its store, backend, id there and version. */
+export type RecalledItemRef = {
+  readonly store: "fact" | "wiki" | "session";
+  readonly backend: "local" | "thredz";
+  readonly localId: string;
+  readonly version?: number;
+};
+
+export type ContextManifestBlock = {
+  readonly kind: ContextBlockKind;
+  /** UTF-8 length of the block's text. */
+  readonly bytes: number;
+  readonly fingerprint: string;
+  /** Whether the block carries a cache marker in the request. */
+  readonly cached: boolean;
+};
+
+/** A project memory file: its name at the working directory, or `outside` for one loaded from elsewhere. */
+export type ContextManifestFile =
+  | { readonly path: string; readonly bytes: number; readonly fingerprint: string }
+  | { readonly outside: true; readonly bytes: number; readonly fingerprint: string };
+
+export type ContextManifestRecalledItem = {
+  readonly ref: RecalledItemRef | null;
+  readonly score?: number;
+  readonly status: RecalledItemStatus;
+  /** The detector rule ids behind a `warned` or redacted status. */
+  readonly rules?: readonly string[];
+};
+
+/** The recall a call carried, or `sameAs` the span of the manifest that listed the same items. */
+export type ContextManifestRecalled =
+  | {
+      readonly at: "session-start" | "per-turn";
+      readonly query: { readonly fingerprint: string };
+      readonly requested: number;
+      readonly returned: number;
+      readonly items: readonly ContextManifestRecalledItem[];
+    }
+  | { readonly sameAs: string };
+
+/** Payload of a `context_manifest` line: what one main model call was given, by reference. */
+export type ContextManifestPayload = {
+  readonly v: 1;
+  readonly run: string;
+  /** The model call's span, shared with its `model_request` and `model_response` events. */
+  readonly span: string;
+  readonly turn: { readonly run: number; readonly session: number };
+  /** 1-based ordinal of the call in the run. */
+  readonly call: number;
+  readonly blocks: readonly ContextManifestBlock[];
+  readonly files?: readonly ContextManifestFile[];
+  readonly recalled?: ContextManifestRecalled;
+  readonly tools: {
+    readonly fingerprint: string;
+    readonly advertised: number;
+    readonly inSpec: number;
+    /** The advertised names, written when the set differs from the run's previous call. */
+    readonly names?: readonly string[];
+  };
+  readonly model: {
+    readonly wire: string;
+    readonly spec?: string;
+    readonly provider: string;
+    readonly profile?: string;
+    readonly params: {
+      readonly maxTokens: number;
+      readonly thinkingBudget?: number;
+      readonly temperature?: number;
+      readonly reasoningEffort?: string;
+    };
+    /** What the adapter reports it sends, when it can say. */
+    readonly effective?: {
+      readonly model: string;
+      readonly maxTokens: number;
+      readonly thinkingBudget?: number;
+      readonly reasoningEffort?: string;
+      readonly temperature?: number;
+      readonly dropped: readonly string[];
+    };
+  };
+  readonly messages: { readonly count: number; readonly afterCompaction: boolean };
 };
