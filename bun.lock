@@ -1283,6 +1283,7 @@
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/eval-report": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/feedback-distill": "workspace:*",
@@ -1305,7 +1306,6 @@
       },
       "devDependencies": {
         "@crewhaus/compiler": "workspace:*",
-        "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
       },
     },

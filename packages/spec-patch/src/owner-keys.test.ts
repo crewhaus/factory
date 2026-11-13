@@ -56,7 +56,11 @@ describe("the lists derive from the table", () => {
     expect(OPTIMIZER_REFUSED_ROOTS).toEqual(
       DELTA_090_KEYS.filter((key) => key.refused && key.root === true).map((key) => key.pattern),
     );
-    expect(OPTIMIZER_REFUSED_ROOTS).toEqual([["intent"]]);
+    expect(OPTIMIZER_REFUSED_ROOTS).toEqual([
+      ["intent"],
+      ["evaluation", "protected"],
+      ["provability", "protected"],
+    ]);
     expect(Object.isFrozen(OPTIMIZER_REFUSED_ROOTS)).toBe(true);
   });
 
@@ -65,6 +69,8 @@ describe("the lists derive from the table", () => {
       ["model_pool", "learning", "seed"],
       ["provability", "level"],
       ["provability", "on_fail"],
+      // A judge gate's protection: matched inside a step or a node.
+      ["judge", "protected"],
       ["transaction_policy", "defaultWriteApproval"],
       ["model_pool", "candidates"],
     ]);

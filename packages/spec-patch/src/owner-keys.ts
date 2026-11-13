@@ -34,4 +34,29 @@ export const DELTA_090_KEYS: ReadonlyArray<OwnerKey> = Object.freeze([
     reason: "intent says what this harness is for, and only its owner changes that",
     since: "0.9.0",
   } as const),
+  Object.freeze({
+    pattern: Object.freeze(["evaluation", "protected"]),
+    root: true,
+    refused: true,
+    security: true,
+    reason: "whether this bar may be loosened is the owner's decision",
+    since: "0.9.0",
+  } as const),
+  Object.freeze({
+    pattern: Object.freeze(["provability", "protected"]),
+    root: true,
+    refused: true,
+    security: true,
+    reason: "whether this bar may be loosened is the owner's decision",
+    since: "0.9.0",
+  } as const),
+  // A judge gate sits inside a workflow step or a graph node, so this row
+  // matches wherever the key appears.
+  Object.freeze({
+    pattern: Object.freeze(["judge", "protected"]),
+    refused: true,
+    security: true,
+    reason: "whether this gate may be loosened is the owner's decision",
+    since: "0.9.0",
+  } as const),
 ]);

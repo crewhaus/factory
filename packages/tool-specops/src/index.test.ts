@@ -1410,3 +1410,57 @@ describe("SpecPatchApply: a prototype name is never a path segment", () => {
     expect(protoKeys()).toEqual(before);
   });
 });
+
+describe("SpecPatchApply — protected bars only tighten", () => {
+  const WORKFLOW = (threshold: number) => `name: w
+target: workflow
+model: base-model
+steps:
+  - name: draft
+    instructions: Draft it.
+  - name: gate
+    kind: judge
+    judge:
+      criteria: is it right
+      threshold: ${threshold}
+      protected: true
+`;
+  const stepsAt = (threshold: number): unknown =>
+    (parse(WORKFLOW(threshold)) as { steps: unknown }).steps;
+
+  it(
+    "refuses a whole steps value that lowers a protected judge threshold, naming the bar",
+    async () => {
+      const out = await run(specPatchApply, {
+        spec: WORKFLOW(0.7),
+        patches: [{ path: ["steps"], value: stepsAt(0.4) }],
+      });
+      expect(out["ok"]).toBe(false);
+      expect(JSON.stringify(out)).toContain("steps.gate.judge.threshold");
+      expect(JSON.stringify(out)).toContain("only rises");
+    },
+    BUDGET_MS,
+  );
+
+  it(
+    "applies one that raises it",
+    async () => {
+      const out = await run(specPatchApply, {
+        spec: WORKFLOW(0.7),
+        patches: [{ path: ["steps"], value: stepsAt(0.9) }],
+      });
+      expect(out["ok"]).toBe(true);
+      expect(String(out["yaml"])).toContain("threshold: 0.9");
+    },
+    BUDGET_MS,
+  );
+
+  it("ownedLeafChange names the loosened bar", () => {
+    const doc = parse(WORKFLOW(0.7));
+    expect(ownedLeafChange(doc, "workflow", ["steps"], "replace", stepsAt(0.5))).toEqual({
+      leaf: "steps.gate.judge.threshold",
+      reason: "a protected steps.gate.judge.threshold only rises (0.7 → 0.5)",
+      rule: "refused-leaf",
+    });
+  });
+});

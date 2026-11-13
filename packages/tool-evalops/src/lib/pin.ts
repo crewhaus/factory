@@ -171,6 +171,14 @@ export function planPin(input: PlanInput): Loaded<PinPlan> {
     );
   }
   if (input.action === "clear") {
+    // A pin measured with a protected criterion is held for the owner:
+    // clearing it would let the next run start the lineage over without them.
+    if ((previous?.protectedCriteria?.length ?? 0) > 0) {
+      return fail(
+        "refused",
+        `${label} is pinned to a run measured with a protected criterion — only this harness's owner re-anchors it, with \`crewhaus eval --rebaseline --reason <code>\``,
+      );
+    }
     return {
       ok: true,
       value: {
@@ -206,11 +214,19 @@ export function planPin(input: PlanInput): Loaded<PinPlan> {
   // A pin over a different instrument records the re-anchor, as the write
   // below does.
   const mark = manualRebaseline(previous, row, PIN_CMD);
+  // No owner check is offered here: a pin that changes a protected criterion
+  // is refused, and the refusal names the command the owner uses.
   const pinned = pinFromIndexEntry(row, row.ts, {
     lineageKey: key,
     ...(mark !== undefined ? { rebaselined: mark } : {}),
+    ...(previous !== undefined ? { replaced: previous } : {}),
   });
-  if (!pinned.ok) return fail("bad-input", pinned.refusal.reason);
+  if (!pinned.ok) {
+    return fail(
+      pinned.refusal.code === "protected" ? "refused" : "bad-input",
+      pinned.refusal.reason,
+    );
+  }
   const verified = verifyRunDir(row);
   if (!verified.ok) return verified;
   const next = pinned.pin;
@@ -319,7 +335,12 @@ export function commitPin(
   try {
     if (plan.action === "set" && plan.next !== undefined && row !== undefined) {
       const pinned = pinRun(row, row.ts, dir.real, { lineageKey: plan.key, cmd: PIN_CMD });
-      if (!pinned.ok) return fail("bad-input", pinned.refusal.reason);
+      if (!pinned.ok) {
+        return fail(
+          pinned.refusal.code === "protected" ? "refused" : "bad-input",
+          pinned.refusal.reason,
+        );
+      }
     } else if (plan.action === "clear" && plan.previous !== undefined) {
       clearBaseline(plan.key, dir.real);
     }

@@ -12,11 +12,17 @@
  *
  * A row written before `errorCount`/`measuredCount` existed cannot be told
  * from a clean one, so an old row is refused only for `partial` or for having
- * no samples.
+ * no samples. A regrade or a preview of another run is never a baseline.
  *
  * A pin that replaces one measured with a different instrument records the
  * re-anchor (`rebaselined`): the caller's reason when it gives one, otherwise
  * `manual`, with the run the replaced pin named and the command that pinned.
+ *
+ * A pin that replaces one measured with a protected criterion this run
+ * changes (its digest moved, or it is gone or unprotected; the index row
+ * carries the digests, see `./protected-criteria`) needs the harness's owner:
+ * the caller's `ownerCheck`, refused (`protected`) when it is absent or says
+ * no, and marked `protectedChange` when it allows it.
  */
 import {
   type BaselineEntry,
@@ -29,14 +35,26 @@ import {
   setBaseline,
 } from "./history";
 import { instrumentChanges } from "./instrument";
+import { protectedDigestChanges } from "./protected-criteria";
 
 /** Why a run says nothing about the spec it ran. */
 export type MeasurementProblem = "partial" | "all_errored" | "nothing_measured";
 
 export type PinRefusal = {
-  readonly code: MeasurementProblem | "lineage_mismatch";
+  /**
+   * `regrade`: the run graded another run's recorded answers (a regrade or a
+   * preview). `protected`: the pin it would replace was measured with a
+   * protected criterion this run changes, and the harness's owner did not
+   * allow it.
+   */
+  readonly code: MeasurementProblem | "lineage_mismatch" | "regrade" | "protected";
   readonly reason: string;
 };
+
+/** The owner's answer to a pin that changes a protected criterion. */
+export type PinOwnerCheck = () =>
+  | { readonly ok: true; readonly principal?: string }
+  | { readonly ok: false; readonly reason: string };
 
 export type PinOptions = {
   /** The lineage the caller means to pin. A run from another one is refused. */
@@ -48,6 +66,17 @@ export type PinOptions = {
    * `manual` re-anchor mark.
    */
   readonly cmd?: string;
+  /**
+   * The pin this one would replace. {@link pinRun} reads it from the file;
+   * a caller of {@link pinFromIndexEntry} passes the one it read.
+   */
+  readonly replaced?: BaselineEntry;
+  /**
+   * Asked only when the pin would replace one measured with a protected
+   * criterion this run changes (its digest moved, or it is gone or
+   * unprotected). Absent, or answering no, refuses the pin (`protected`).
+   */
+  readonly ownerCheck?: PinOwnerCheck;
 };
 
 export type { RebaselineReason };
@@ -68,6 +97,12 @@ export function measurementProblem(entry: RunIndexEntry): MeasurementProblem | u
 
 /** Why this run cannot be pinned, or `undefined` when it can. */
 export function pinRefusal(entry: RunIndexEntry, opts: PinOptions = {}): PinRefusal | undefined {
+  if (entry.purpose !== undefined) {
+    return {
+      code: "regrade",
+      reason: `run ${entry.runId} is a ${entry.purpose} of run ${entry.regradeOf ?? "(unknown)"} — it graded recorded answers, so it measured no run of the agent and cannot be a baseline.`,
+    };
+  }
   const problem = measurementProblem(entry);
   if (problem === "partial") {
     return {
@@ -111,6 +146,33 @@ export function pinFromIndexEntry(
 ): PinOutcome {
   const refusal = pinRefusal(entry, opts);
   if (refusal !== undefined) return { ok: false, refusal };
+  // A protected criterion the replaced pin was measured with, changed here,
+  // is the owner's to re-anchor over, whichever path pins.
+  const replaced = opts.replaced;
+  const moved =
+    replaced !== undefined && replaced.runId !== entry.runId
+      ? protectedDigestChanges(replaced.protectedCriteria, entry.protectedCriteria)
+      : [];
+  let rebaselined = opts.rebaselined;
+  if (moved.length > 0) {
+    const check = opts.ownerCheck?.() ?? {
+      ok: false as const,
+      reason: "no owner check was made for this pin",
+    };
+    if (!check.ok) {
+      return {
+        ok: false,
+        refusal: {
+          code: "protected",
+          reason: `run ${entry.runId} changes what the pinned run ${replaced?.runId} was measured with: ${moved.join("; ")} — re-anchoring over a protected criterion needs this harness's owner (${check.reason}); the owner re-anchors with \`crewhaus eval --rebaseline --reason <code>\``,
+        },
+      };
+    }
+    rebaselined = {
+      ...(rebaselined ?? { from: replaced?.runId, reason: "manual", cmd: opts.cmd ?? "unknown" }),
+      protectedChange: true,
+    };
+  }
   return {
     ok: true,
     pin: {
@@ -132,7 +194,10 @@ export function pinFromIndexEntry(
         ? { calibrationDigest: entry.calibrationDigest }
         : {}),
       ...(entry.pluginsDigest !== undefined ? { pluginsDigest: entry.pluginsDigest } : {}),
-      ...(opts.rebaselined !== undefined ? { rebaselined: opts.rebaselined } : {}),
+      ...(entry.protectedCriteria !== undefined
+        ? { protectedCriteria: entry.protectedCriteria }
+        : {}),
+      ...(rebaselined !== undefined ? { rebaselined } : {}),
       ts,
     },
   };
@@ -165,18 +230,18 @@ export function pinRun(
 ): PinOutcome {
   const refusal = pinRefusal(entry, opts);
   if (refusal !== undefined) return { ok: false, refusal };
-  let pinOpts = opts;
+  // The pin this one replaces, read as the write below reads the file. A
+  // file it refuses is the writer's to refuse, so it marks nothing here.
+  let replaced: BaselineEntry | undefined;
+  try {
+    replaced = pinnedUnder(baselineKeyFor(lineageOfEntry(entry)), evalsDir);
+  } catch {
+    replaced = undefined;
+  }
+  let pinOpts: PinOptions = replaced !== undefined ? { ...opts, replaced } : opts;
   if (opts.rebaselined === undefined) {
-    // The pin this one replaces, read as the write below reads the file. A
-    // file it refuses is the writer's to refuse, so it marks nothing here.
-    let replaced: BaselineEntry | undefined;
-    try {
-      replaced = pinnedUnder(baselineKeyFor(lineageOfEntry(entry)), evalsDir);
-    } catch {
-      replaced = undefined;
-    }
     const mark = manualRebaseline(replaced, entry, opts.cmd ?? "unknown");
-    if (mark !== undefined) pinOpts = { ...opts, rebaselined: mark };
+    if (mark !== undefined) pinOpts = { ...pinOpts, rebaselined: mark };
   }
   const outcome = pinFromIndexEntry(entry, ts, pinOpts);
   if (outcome.ok) setBaseline(outcome.pin, evalsDir);

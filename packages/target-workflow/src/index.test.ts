@@ -846,8 +846,13 @@ describe("emitWorkflow — judge gate steps (loop contract 0.4, G02)", () => {
     expect(c).toContain(
       "const __runStep1 = async (__nudge: string): Promise<string> => runChatLoop({",
     );
-    expect(c).toContain('instructions: "Write the report." + __nudge,');
-    expect(c).toContain('seedMessages: [{ role: "user", content: __step1Input }],');
+    // The step's own instructions; feedback arrives as a user message.
+    expect(c).toContain('instructions: "Write the report.",');
+    expect(c).not.toMatch(/instructions: [^\n]*__nudge/);
+    // The feedback follows the input in the one user message.
+    expect(c).toContain(
+      'content: __nudge === "" ? __step1Input : __step1Input + "\\n\\n" + __nudge,',
+    );
     expect(c).toContain('priorOutput = await __runStep1("");');
     // The un-gated step 3 keeps the plain call shape.
     expect(c).toContain('instructions: "Format and publish.",');
@@ -919,11 +924,22 @@ describe("emitWorkflow — judge gate steps (loop contract 0.4, G02)", () => {
     // run_failed publishes before the throw (graph-engine G69 convention).
     expect(c).toContain('kind: "run_failed"');
     expect(c).toContain("throw new RunFailedError(__report);");
-    // The retry re-invokes the gated step's closure with the nudge.
+    // The retry screens the judge's rationale at the consult boundary, then
+    // re-invokes the gated step's closure with the feedback: the header and
+    // the screened rationale, or the header with the score alone.
     expect(c).toContain('"[judge gate] retry "');
+    expect(c).toContain('import { admitJudgeFeedback } from "@crewhaus/runtime-core";');
     expect(c).toContain(
-      'priorOutput = await __runStep1("\\n\\n[judge feedback — the previous attempt failed the \\"gate\\" gate (score " + __result.score.toFixed(2) + " < threshold 0.9)]:\\n" + __result.rationale);',
+      'const __feedback = await admitJudgeFeedback(__runContext, __result.rationale, "rationale");',
     );
+    expect(c).toContain(
+      'const __header = "[judge feedback — the previous attempt failed the \\"gate\\" gate (score " + __result.score.toFixed(2) + " < threshold 0.9)]";',
+    );
+    expect(c).toContain(
+      'priorOutput = await __runStep1(__feedback.kind === "admitted" ? __header + ":\\n" + __feedback.text : __header);',
+    );
+    // The rationale reaches the re-run only through the screen.
+    expect(c).not.toMatch(/__runStep1\([^;]*__result\.rationale/);
   });
 
   test("halt: no retry loop, immediate classified stop", () => {
@@ -932,7 +948,7 @@ describe("emitWorkflow — judge gate steps (loop contract 0.4, G02)", () => {
     expect(c).not.toContain("for (;;)");
     expect(c).toContain('title: "judge gate failed",');
     expect(c).toContain("throw new RunFailedError(__report);");
-    expect(c).not.toContain('__runStep1("\\n\\n[judge feedback');
+    expect(c).not.toContain("admitJudgeFeedback");
     // The gated step still renders as a closure (uniform gated shape).
     expect(c).toContain('priorOutput = await __runStep1("");');
   });

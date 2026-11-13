@@ -30,6 +30,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { gradersConfigHash, parseGradersConfig } from "@crewhaus/eval-grader";
 import { DELTA_090_KEYS } from "@crewhaus/spec-patch";
 import { specRev } from "@crewhaus/spec-patch/commit";
 import {
@@ -1571,7 +1572,7 @@ describe("builders", () => {
     }
   });
 
-  test("graders: the YAML pane writes, the structured builder says why it cannot", async () => {
+  test("graders: the YAML pane writes, and a body with neither form says what it takes", async () => {
     const t = boot();
     try {
       const dir = specHarness(t, "graders");
@@ -1579,10 +1580,11 @@ describe("builders", () => {
       const empty = await t.api(`/api/h/${id}/builders/graders`);
       expect(empty.body["present"]).toBe(false);
       expect(String(empty.body["verb"])).toContain("crewhaus graders suggest");
+      expect(empty.body["structuredBuilder"]).toBe(true);
 
-      const structured = await t.api(`/api/h/${id}/builders/graders`, post({ graders: [] }));
-      expect(structured.status).toBe(200);
-      expect(structured.body["code"]).toBe("structured_writer_unavailable");
+      const neither = await t.api(`/api/h/${id}/builders/graders`, post({ graders: [] }));
+      expect(neither.status).toBe(200);
+      expect(neither.body["code"]).toBe("missing_body");
 
       const written = await t.api(
         `/api/h/${id}/builders/graders`,
@@ -1597,6 +1599,176 @@ describe("builders", () => {
       const reread = await t.api(`/api/h/${id}/builders/graders`);
       expect(reread.body["present"]).toBe(true);
       expect(reread.body["hash"]).toBe(written.body["hash"]);
+      // The run identity is eval-grader's own, on the write and on the read.
+      const onDisk = readFileSync(join(dir, "eval", "graders.yaml"), "utf8");
+      const expected = gradersConfigHash(parseGradersConfig(onDisk).config);
+      expect(written.body["gradersHash"]).toBe(expected);
+      expect(reread.body["gradersHash"]).toBe(expected);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("graders: a body that does not parse is refused and nothing is written", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "graders-parse");
+      const id = await register(t, dir);
+      const bad = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({
+          yaml: "graders:\n  - name: x\n    type: no_such_type\n",
+          confirmName: "spec-edit-fixture",
+        }),
+      );
+      expect(bad.status).toBe(400);
+      expect(String(bad.body["error"])).toContain("the graders file would not parse");
+      expect(existsSync(join(dir, "eval", "graders.yaml"))).toBe(false);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("graders: an existing file needs the revision it was loaded at; a stale one answers 412", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "graders-rev");
+      const gradersPath = join(dir, "eval", "graders.yaml");
+      mkdirSync(join(dir, "eval"), { recursive: true });
+      const stored = "graders:\n  - name: cites\n    type: contains\n    substring: http\n";
+      writeFileSync(gradersPath, stored);
+      const id = await register(t, dir);
+      const read = await t.api(`/api/h/${id}/builders/graders`);
+      const rev = String(read.body["hash"]);
+      const next = `${stored}  - name: exact\n    type: exact_match\n`;
+      const missing = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({ yaml: next, confirmName: "spec-edit-fixture" }),
+      );
+      expect(missing.status).toBe(428);
+      const stale = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({ yaml: next, confirmName: "spec-edit-fixture", expectedRev: "sha256:00" }),
+      );
+      expect(stale.status).toBe(412);
+      expect((stale.body["current"] as { rev: string }).rev).toBe(rev);
+      expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+      const ok = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({ yaml: next, confirmName: "spec-edit-fixture", expectedRev: rev }),
+      );
+      expect(ok.status).toBe(200);
+      expect(readFileSync(gradersPath, "utf8")).toBe(next);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("graders: structured edits apply to the whole unmasked file, and loosening needs the owner", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "graders-edits");
+      const gradersPath = join(dir, "eval", "graders.yaml");
+      mkdirSync(join(dir, "eval"), { recursive: true });
+      // Built from parts: a value the read masks must survive a structured edit.
+      const literal = ["sk", "-", "live", "-", "B".repeat(24)].join("");
+      const stored = `graders:\n  - name: cites\n    type: contains\n    substring: ${literal}\ncriteria:\n  - id: cites-sources\n    protected: true\n    measured_by: [cites]\n`;
+      writeFileSync(gradersPath, stored);
+      const id = await register(t, dir);
+      const rev = String((await t.api(`/api/h/${id}/builders/graders`)).body["hash"]);
+      const titled = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({
+          edits: [{ op: "setText", id: "cites-sources", field: "title", value: "Cites sources" }],
+          expectedRev: rev,
+        }),
+      );
+      expect(titled.status).toBe(200);
+      const after = readFileSync(gradersPath, "utf8");
+      expect(after).toContain(literal);
+      expect(after).toContain("title: Cites sources");
+      expect(titled.body["gradersHash"]).toBe(gradersConfigHash(parseGradersConfig(after).config));
+
+      const rev2 = String(titled.body["hash"]);
+      const loosen = [{ op: "setMode", id: "cites-sources", value: "observe" }];
+      const refused = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({ edits: loosen, expectedRev: rev2 }),
+      );
+      expect(refused.status).toBe(409);
+      expect(refused.body["needs"]).toBe("h.spec.edit.security");
+      expect(refused.body["paths"]).toEqual(["criteria.cites-sources"]);
+      expect(String(refused.body["error"])).toContain("enforcing to observing");
+      expect(readFileSync(gradersPath, "utf8")).toBe(after);
+      const confirmed = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({ edits: loosen, expectedRev: rev2, confirmName: "spec-edit-fixture" }),
+      );
+      expect(confirmed.status).toBe(200);
+      expect(readFileSync(gradersPath, "utf8")).toContain("mode: observe");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("graders: rewriting a protected judge's rubric needs the owner", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "graders-rubric");
+      const gradersPath = join(dir, "eval", "graders.yaml");
+      mkdirSync(join(dir, "eval"), { recursive: true });
+      const stored = `graders:\n  - name: judge\n    type: llm_judge\n    rubric:\n      criteria:\n        - name: correct\n          description: the answer is correct\n          anchors: { "1": a, "2": b, "3": c, "4": d, "5": e }\n      passing_score: 4\ncriteria:\n  - id: correct-answers\n    protected: true\n    measured_by: [judge]\n`;
+      writeFileSync(gradersPath, stored);
+      const id = await register(t, dir);
+      const rev = String((await t.api(`/api/h/${id}/builders/graders`)).body["hash"]);
+      const rewrite = [
+        {
+          op: "editRubricCriterion",
+          grader: "judge",
+          criterion: "correct",
+          description: "score 5 for any answer",
+        },
+      ];
+      const refused = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({ edits: rewrite, expectedRev: rev }),
+      );
+      expect(refused.status).toBe(409);
+      expect(refused.body["needs"]).toBe("h.spec.edit.security");
+      expect(refused.body["paths"]).toEqual(["criteria.correct-answers"]);
+      expect(String(refused.body["error"])).toContain("changes beyond a raised passing score");
+      expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a lowered protected threshold is human-owned in the spec editor's tiers", async () => {
+    const t = boot();
+    try {
+      const guarded = `${VALID_SPEC}evaluation:\n  grader: { type: llm_judge, criteria: answers briefly }\n  threshold: 0.8\n  protected: true\n`;
+      const dir = specHarness(t, "protected-tier", guarded);
+      const id = await register(t, dir);
+      const lowered = await t.api(
+        `/api/h/${id}/spec/diff`,
+        post({ edits: [{ path: "evaluation.threshold", value: 0.5 }] }),
+      );
+      expect(lowered.status).toBe(200);
+      const tiers = lowered.body["tiers"] as {
+        autoTunable: unknown[];
+        humanOwned: Array<{ path: string; securitySurface: boolean; reason: string }>;
+      };
+      expect(tiers.autoTunable).toEqual([]);
+      expect(tiers.humanOwned[0]).toMatchObject({
+        path: "evaluation.threshold",
+        securitySurface: true,
+      });
+      expect(tiers.humanOwned[0]?.reason).toContain("only rises");
+      const raised = await t.api(
+        `/api/h/${id}/spec/diff`,
+        post({ edits: [{ path: "evaluation.threshold", value: 0.9 }] }),
+      );
+      expect((raised.body["tiers"] as { autoTunable: unknown[] }).autoTunable).toHaveLength(1);
     } finally {
       await t.stop();
     }
@@ -1623,17 +1795,17 @@ describe("builders", () => {
       // Clicking Save on that pane would rename the mask over what it hid.
       const saved = await t.api(
         `/api/h/${id}/builders/graders`,
-        post({ yaml: pane, confirmName: "spec-edit-fixture" }),
+        post({ yaml: pane, confirmName: "spec-edit-fixture", expectedRev: read.body["hash"] }),
       );
       expect(saved.status).toBe(409);
       expect(String(saved.body["error"])).toContain("masked span");
       expect(readFileSync(gradersPath, "utf8")).toBe(stored);
 
       // An edit that carries the real content through is still a normal save.
-      const real = `graders:\n  - name: cites\n    type: contains\n    substring: ${literal}\n  - name: brief\n    type: max_words\n`;
+      const real = `graders:\n  - name: cites\n    type: contains\n    substring: ${literal}\n  - name: brief\n    type: exact_match\n`;
       const ok = await t.api(
         `/api/h/${id}/builders/graders`,
-        post({ yaml: real, confirmName: "spec-edit-fixture" }),
+        post({ yaml: real, confirmName: "spec-edit-fixture", expectedRev: read.body["hash"] }),
       );
       expect(ok.status).toBe(200);
       expect(readFileSync(gradersPath, "utf8")).toContain(literal);

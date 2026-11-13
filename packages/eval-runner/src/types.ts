@@ -1,6 +1,6 @@
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import type { Sample } from "@crewhaus/eval-dataset";
-import type { GradeResult, Grader } from "@crewhaus/eval-grader";
+import type { GradeResult, Grader, GraderKind, RunCriterionRecord } from "@crewhaus/eval-grader";
 import type { JudgeUsageSink } from "@crewhaus/eval-judge";
 import type { Event as TranscriptEvent } from "@crewhaus/event-log";
 import type { ProofBundle, ProvabilityLevel } from "@crewhaus/provability";
@@ -9,6 +9,7 @@ import type { runChatLoop } from "@crewhaus/runtime-core";
 import type { ModelRole, TraceEvent } from "@crewhaus/trace-event-bus";
 import type { CalibrationAggregates } from "./calibration-abstention";
 import type { ParaphraseConsistencySummary } from "./paraphrase-consistency";
+import type { RegradePlan, RegradePurpose } from "./regrade";
 import type { CapturedRouteObservation, EvalRoutingMode } from "./routing";
 import type { SemanticFallbackSummary } from "./semantic-fallback";
 import type { ToolReplayMissPolicy } from "./tool-record";
@@ -806,6 +807,17 @@ export type EvalRunSummary = {
      * spec's own block (or none), keeping un-flagged results byte-identical.
      */
     readonly provability?: ProvabilityLevel;
+    /**
+     * The criteria the run measured with: each criterion's digest, mode,
+     * protection and scope, and the digest of every grader it binds
+     * ({@link RunEvalOptions.criteria}). Absent when the graders file has no
+     * criteria, so such a run's record is the one it always was.
+     */
+    readonly criteria?: ReadonlyArray<RunCriterionRecord>;
+    /** Why the run graded recorded answers instead of running the agent. Absent on a live run. */
+    readonly purpose?: RegradePurpose;
+    /** The run whose recorded answers this run graded. Present only with {@link purpose}. */
+    readonly regradeOf?: string;
   };
   readonly outDir: string;
 };
@@ -844,6 +856,12 @@ export type GraderLookup = {
    * omits it simply does not meter, exactly as before.
    */
   setJudgeUsageSink?(sink: JudgeUsageSink): void;
+  /**
+   * What a registered grader declares about itself: its kind and whether a
+   * recorded run can be graded with it again. Optional: a registry without it
+   * declares nothing, so its graders read `custom` and are not regraded.
+   */
+  metaOf?(name: string): { readonly kind?: GraderKind; readonly regradable?: boolean } | undefined;
 };
 
 export type RunEvalOptions = {
@@ -1064,6 +1082,22 @@ export type RunEvalOptions = {
    * Absent ⇒ the spec's own block, if any, exactly as before.
    */
   readonly provability?: ProvabilityLevel;
+  /**
+   * The criteria the graders file declares, as the run records them in
+   * `run.json`/`results.json` (`config.criteria`). How a bound grader observes
+   * or is scoped is carried on its compiled entry (`CompiledGrader.criterion`);
+   * this is the record. Absent: nothing is recorded.
+   */
+  readonly criteria?: ReadonlyArray<RunCriterionRecord>;
+  /**
+   * Grade a recorded run's answers instead of running the agent (see
+   * `createRegrade`): its invoker hands back each recorded answer, and a case
+   * or grader it cannot grade again records `not_measured` /
+   * `not_regradable`. Recorded as `config.purpose` and `config.regradeOf`.
+   * Refused with a caller-supplied {@link invoker}, tool record or replay,
+   * {@link resume}, {@link provability} and more than one trial.
+   */
+  readonly regrade?: RegradePlan;
 };
 
 /** The chat-loop seam under {@link RunEvalOptions.chatLoop}. */
@@ -1090,4 +1124,18 @@ export type GraderEntry = {
    * any` / `weighted` policy written for the user's own graders.
    */
   readonly role?: "requirement" | "report";
+  /** What the grader is ({@link GraderKind}). Absent reads as `custom`. */
+  readonly kind?: GraderKind;
+  /**
+   * A recorded run can be graded with it again: it reads nothing but the
+   * sample, the answer, the transcript, the trace events and the proof
+   * bundle. Absent reads as false.
+   */
+  readonly regradable?: boolean;
+  /**
+   * Bound by an observing criterion: whatever this entry records, a
+   * verdict, not measured or a throw, the sample's verdict leaves it out.
+   * Absent reads as false.
+   */
+  readonly observing?: boolean;
 };

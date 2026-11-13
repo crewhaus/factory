@@ -172,3 +172,72 @@ describe("grader-registry — T8 plugin discovery", () => {
     expect(registered).toEqual([]);
   });
 });
+
+describe("grader-registry — what a grader declares about itself", () => {
+  const grade = async () => ({ passed: true, score: 1, rationale: "ok" });
+
+  test("register stores the metadata, and an unknown name has none", () => {
+    const reg = new GraderRegistry();
+    reg.register("a.b", grade, { kind: "deterministic", regradable: true });
+    reg.register("c.d", grade);
+    expect(reg.metaOf("a.b")).toEqual({ kind: "deterministic", regradable: true });
+    expect(reg.metaOf("c.d")).toEqual({});
+    expect(reg.metaOf("nope")).toBeUndefined();
+  });
+
+  test("upsert replaces the metadata with the new entry's", () => {
+    const reg = new GraderRegistry();
+    reg.register("a.b", grade, { kind: "proof", regradable: true });
+    reg.upsert("a.b", grade);
+    expect(reg.metaOf("a.b")).toEqual({});
+    reg.clear();
+    expect(reg.metaOf("a.b")).toBeUndefined();
+  });
+
+  const plugin = (body: string): string => {
+    const pluginRoot = join(tmpRoot, "plugins");
+    mkdirSync(join(pluginRoot, "p"), { recursive: true });
+    writeFileSync(join(pluginRoot, "p", "index.ts"), body);
+    return pluginRoot;
+  };
+
+  test("a plugin that declares kind proof is refused, naming why", async () => {
+    const root = plugin(`export default {
+  name: "fake.proof",
+  kind: "proof",
+  grader: async () => ({ passed: true, score: 1, rationale: "trust me" }),
+};
+`);
+    const reg = new GraderRegistry();
+    const err = await discoverPluginGraders(reg, root).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GraderRegistryError);
+    expect((err as Error).message).toContain('declares kind "proof"');
+    expect((err as Error).message).toContain("only a built-in proof checker");
+    expect(reg.has("fake.proof")).toBe(false);
+  });
+
+  test("a plugin's kind is kept; without one it reads custom; it is never regradable", async () => {
+    const root = plugin(`export default [
+  { name: "mine.a", kind: "model", grader: async () => ({ passed: true, score: 1, rationale: "" }) },
+  { name: "mine.b", grader: async () => ({ passed: true, score: 1, rationale: "" }) },
+];
+`);
+    const reg = new GraderRegistry();
+    reg.register("mine.b", grade, { kind: "deterministic", regradable: true });
+    await discoverPluginGraders(reg, root);
+    expect(reg.metaOf("mine.a")).toEqual({ kind: "model" });
+    expect(reg.metaOf("mine.b")).toEqual({ kind: "custom" });
+  });
+
+  test("a plugin kind outside the list is refused", async () => {
+    const root = plugin(`export default {
+  name: "odd.kind",
+  kind: "oracle",
+  grader: async () => ({ passed: true, score: 1, rationale: "" }),
+};
+`);
+    await expect(discoverPluginGraders(new GraderRegistry(), root)).rejects.toThrow(
+      /declares kind "oracle"/,
+    );
+  });
+});

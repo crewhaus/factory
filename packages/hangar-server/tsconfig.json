@@ -17,6 +17,7 @@
     { "path": "../dataset-registry" },
     { "path": "../audit-log" },
     { "path": "../data-retention-engine" },
+    { "path": "../eval-grader" },
     { "path": "../eval-report" },
     { "path": "../event-log" },
     { "path": "../feedback-distill" },

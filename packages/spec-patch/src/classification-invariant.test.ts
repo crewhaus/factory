@@ -349,6 +349,20 @@ describe("the owner-keys table — every leaf under a row is human-owned", () =>
     }
   }
 
+  test("the protection keys yield leaves where their blocks exist", () => {
+    const carrying = (name: string): string[] => {
+      const row = DELTA_090_KEYS.find((r) => r.pattern.join(".") === name);
+      expect(row).toBeDefined();
+      return shapes
+        .filter((shape) => leavesUnder(shape, row as (typeof DELTA_090_KEYS)[number]).length > 0)
+        .map(targetOf)
+        .sort();
+    };
+    expect(carrying("evaluation.protected")).toEqual(["channel", "cli", "managed"]);
+    expect(carrying("judge.protected")).toEqual(["graph", "workflow"]);
+    expect(carrying("provability.protected").length).toBeGreaterThanOrEqual(4);
+  });
+
   test("intent yields leaves on all fourteen shapes", () => {
     const intent = DELTA_090_KEYS.find((row) => row.pattern.join(".") === "intent");
     expect(intent).toBeDefined();

@@ -26,8 +26,10 @@ import {
   CASES_FILENAME,
   CASES_VERSION,
   type EvalRunSummary,
+  PROVABILITY_GRADER_NAMES,
   type SampleResult,
   gradeStatusOf,
+  inCriterionScope,
   sampleAbstained,
   sampleIsCanary,
   sampleWithoutVerdict,
@@ -39,6 +41,7 @@ import {
   instrumentChanges,
   instrumentOf,
 } from "./instrument";
+import { criterionMeasureDigest } from "./protected-criteria";
 import { runState } from "./run-state";
 
 /** A run directory's `cases.json`: each case id's digest. */
@@ -113,13 +116,37 @@ export type Comparability =
 const rebaselineHint = (code: string): string =>
   `re-anchor the baseline with \`crewhaus eval --rebaseline --reason ${code}\``;
 
-/** A baseline case that produced a verdict, by every grade it recorded. */
-export function measuredInBaseline(s: SampleResult): boolean {
+/** Options for reading which cases a baseline measured. */
+export type MeasuredOptions = {
+  /**
+   * Names of the `perGrader` entries recorded by a provability grader, beside
+   * the canonical six ({@link PROVABILITY_GRADER_NAMES}): a graders file's
+   * `type: registry` entry records under its own name.
+   */
+  readonly provabilityGraderNames?: ReadonlySet<string>;
+};
+
+/**
+ * A baseline case that produced a verdict, by every grade it recorded. The
+ * overall grade is read by its `status`; a per-grader grade too, except that a
+ * proof check's grade recorded before `status` existed is read by its pinned
+ * prefix. A case counts as measured unless a proof check recorded it as not
+ * measured or a grade's status says so; a per-grader grade that is `skipped`
+ * or `observing` decided nothing and leaves the case measured.
+ */
+export function measuredInBaseline(s: SampleResult, opts: MeasuredOptions = {}): boolean {
   if (s.error !== undefined || s.graderError !== undefined) return false;
   if (sampleAbstained(s) || sampleIsCanary(s)) return false;
   if (gradeStatusOf(s.grades.overall) !== undefined) return false;
+  const proof = (name: string): boolean =>
+    PROVABILITY_GRADER_NAMES.includes(name) || opts.provabilityGraderNames?.has(name) === true;
   // A record too old to carry per-grader grades is read by its overall grade.
-  return (s.grades.perGrader ?? []).every((g) => gradeStatusOf(g) === undefined);
+  // A grader outside its criterion's scope, or one that only observes, is set
+  // aside: the case's verdict came from the graders that enforce.
+  return (s.grades.perGrader ?? []).every((g) => {
+    const status = gradeStatusOf(g, { legacyProvability: proof(g.name) });
+    return status === undefined || status === "skipped" || status === "observing";
+  });
 }
 
 /**
@@ -128,12 +155,16 @@ export function measuredInBaseline(s: SampleResult): boolean {
  * observed), in this run's order. The gate fails on any: a measurement the
  * baseline had is not a pass when it goes missing.
  */
-export function lostMeasurement(base: EvalRunSummary, run: EvalRunSummary): string[] {
+export function lostMeasurement(
+  base: EvalRunSummary,
+  run: EvalRunSummary,
+  opts: MeasuredOptions = {},
+): string[] {
   const baseById = new Map(base.samples.map((s) => [s.sampleId, s]));
   return run.samples
     .filter((now) => {
       const before = baseById.get(now.sampleId);
-      return sampleWithoutVerdict(now) && before !== undefined && measuredInBaseline(before);
+      return sampleWithoutVerdict(now) && before !== undefined && measuredInBaseline(before, opts);
     })
     .map((s) => s.sampleId);
 }
@@ -176,6 +207,7 @@ export function comparability(
     readonly summary: EvalRunSummary;
     readonly cases?: CaseDigests;
   },
+  opts: MeasuredOptions = {},
 ): Comparability {
   const unmeasurable = unmeasurableRun(run.summary);
   if (unmeasurable !== undefined) return { comparable: false, ...unmeasurable };
@@ -244,7 +276,7 @@ export function comparability(
   }
 
   const added = runIds.filter((id) => !inBase.has(id));
-  const lost = lostMeasurement(base.summary, run.summary);
+  const lost = lostMeasurement(base.summary, run.summary, opts);
   const notes: string[] = [];
   if (base.summary.config.specHash !== run.summary.config.specHash) {
     notes.push(
@@ -260,4 +292,39 @@ export function comparability(
     notes.push(`${formatInstrumentChange(change)} — cannot be compared`);
   }
   return { comparable: true, shared, added, lostMeasurement: lost, notes };
+}
+
+/**
+ * How `run` changes the protected criteria `base` recorded
+ * (`config.criteria`): a protected criterion whose digest moved, one that is
+ * gone, one whose verdict is decided differently (the file's `combine`,
+ * `passing_threshold` or `per_model`, or the calibration applied to its
+ * judges, {@link criterionMeasureDigest}), and cases inside a protected
+ * criterion's scope that `run` no longer holds. Empty when nothing protected changed. A re-anchor over any of these
+ * needs the harness's owner.
+ */
+export function protectedChanges(base: EvalRunSummary, run: EvalRunSummary): string[] {
+  const reasons: string[] = [];
+  const now = new Map((run.config.criteria ?? []).map((c) => [c.id, c]));
+  const runIds = new Set(run.samples.map((s) => s.sampleId));
+  for (const c of base.config.criteria ?? []) {
+    if (c.protected !== true) continue;
+    const current = now.get(c.id);
+    if (current === undefined) reasons.push(`protected criterion ${c.id} is gone`);
+    else if (current.digest !== c.digest) reasons.push(`protected criterion ${c.id} changed`);
+    else if (criterionMeasureDigest(run, c.id) !== criterionMeasureDigest(base, c.id)) {
+      reasons.push(
+        `protected criterion ${c.id} is measured differently (the graders file's policy or its judge's calibration changed)`,
+      );
+    }
+    const missing = base.samples
+      .filter((s) => inCriterionScope(c.scope, s.metadata) && !runIds.has(s.sampleId))
+      .map((s) => s.sampleId);
+    if (missing.length > 0) {
+      reasons.push(
+        `cases inside protected criterion ${c.id}'s scope are gone: ${missing.join(", ")}`,
+      );
+    }
+  }
+  return reasons;
 }

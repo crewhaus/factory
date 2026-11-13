@@ -77,3 +77,87 @@ describe("a present intent changes nothing a compile returns", () => {
     }
   }
 });
+
+describe("a protected bar changes nothing a compile returns", () => {
+  /** `protected: true` under every `judge:` of a loop-projection spec. */
+  const protectJudges = (yaml: string): string =>
+    yaml.replace(
+      /^(\s*)judge:\n/gm,
+      (_m, indent: string) => `${indent}judge:\n${indent}  protected: true\n`,
+    );
+
+  const CLI = `name: guarded
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: Answer briefly.
+evaluation:
+  grader: { type: llm_judge, criteria: answers the question }
+  threshold: 0.8
+provability:
+  level: cited
+  threshold: 0.9
+`;
+  const PROTECTED_CLI = CLI.replace(
+    "  threshold: 0.8\n",
+    "  threshold: 0.8\n  protected: true\n",
+  ).replace("  threshold: 0.9\n", "  threshold: 0.9\n  protected: true\n");
+
+  const cases: ReadonlyArray<readonly [string, string, string, (s: Spec) => boolean]> = [
+    [
+      "workflow",
+      LOOP_PROJECTION_SPECS["workflow"] as string,
+      protectJudges(LOOP_PROJECTION_SPECS["workflow"] as string),
+      (s) =>
+        "steps" in s && s.steps.some((step) => "judge" in step && step.judge?.protected === true),
+    ],
+    [
+      "graph",
+      LOOP_PROJECTION_SPECS["graph"] as string,
+      protectJudges(LOOP_PROJECTION_SPECS["graph"] as string),
+      (s) =>
+        "nodes" in s &&
+        Object.values(s.nodes).some((node) => "judge" in node && node.judge?.protected === true),
+    ],
+    [
+      "cli",
+      CLI,
+      PROTECTED_CLI,
+      (s) =>
+        "evaluation" in s &&
+        s.evaluation?.protected === true &&
+        typeof s.provability === "object" &&
+        s.provability.protected === true,
+    ],
+  ];
+
+  for (const [label, plain, declared, parsedIt] of cases) {
+    test(`${label}: files, warnings and the IR are deep-equal`, () => {
+      const parsed = parseSpec(declared);
+      // The flag really parsed.
+      expect(parsedIt(parsed)).toBe(true);
+      const opts = { today: CORPUS_TODAY };
+      const without = compile(plain, opts);
+      const withFlag = compile(declared, opts);
+      expect(withFlag.files).toEqual(without.files);
+      expect(withFlag.warnings).toEqual(without.warnings);
+      expect(lower(parsed, opts)).toEqual(lower(parseSpec(plain), opts));
+    });
+  }
+
+  test("a parked provability block's warning does not name protected", () => {
+    const parked = `name: parked
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: Answer.
+provability:
+  level: off
+  threshold: 0.9
+  protected: true
+`;
+    const warnings = JSON.stringify(compile(parked, { today: CORPUS_TODAY }).warnings);
+    expect(warnings).toContain("provability.threshold has no effect");
+    expect(warnings).not.toContain("protected");
+  });
+});
