@@ -25,7 +25,17 @@
  */
 
 import { api } from "../api.js";
-import { asOf, clear, collapsible, dot, el, emptyState, skeleton, toast } from "../dom.js";
+import {
+  asOf,
+  clear,
+  collapsible,
+  dot,
+  el,
+  emptyState,
+  scrollRegion,
+  skeleton,
+  toast,
+} from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { fmtRelativeTime } from "../util.js";
 import { cliTwin, gatedBtn, runAction } from "./control.js";
@@ -103,7 +113,7 @@ function runsTable(ctx, runs) {
       ]),
     );
   }
-  return el("div", { class: "table-scroll" }, [
+  return scrollRegion("Dev server runs", [
     el("table", { class: "fleet" }, [
       el(
         "thead",

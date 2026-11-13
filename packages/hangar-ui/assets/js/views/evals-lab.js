@@ -32,6 +32,7 @@ import {
   el,
   emptyState,
   jsonPre,
+  scrollRegion,
   skeleton,
   text,
   toast,
@@ -151,7 +152,7 @@ function panel(title, res, draw, extraHead) {
 }
 
 function table(headers, rows) {
-  return el("div", { class: "table-scroll" }, [
+  return scrollRegion(`Table of ${headers.join(", ")}`, [
     el("table", { class: "fleet" }, [
       el(
         "thead",

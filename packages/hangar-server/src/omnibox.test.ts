@@ -9,7 +9,7 @@
  * action proposals, which must never be executable from the search route.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { makeFixtureHarness } from "./fixture";
@@ -23,6 +23,7 @@ import {
   rankEntries,
   scoreMatch,
 } from "./omnibox";
+import { resolveSessionRoot } from "./sessions";
 import { bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
@@ -35,7 +36,22 @@ const entry = (over: Partial<OmniEntry>): OmniEntry => ({
   subtitle: "",
   href: "#/",
   harnessId: null,
+  source: "x",
+  indexedAt: new Date(NOW).toISOString(),
   ...over,
+});
+
+/** One approvals-log line, pending unless `change` decides it. */
+const approvalLine = (id: string, change: Record<string, unknown> = {}) => ({
+  id,
+  toolName: "SendMessage",
+  inputHash: "hash-1",
+  input: { channel: "ops", text: "ship it" },
+  runId: "run_00000000000000b0",
+  sessionId: "sess_00000000000000aa",
+  surface: "daemon",
+  createdAt: new Date(NOW - DAY).toISOString(),
+  ...change,
 });
 
 describe("scoreMatch", () => {
@@ -163,7 +179,88 @@ describe("buildHarnessEntries", () => {
       }
       // Deep links are console routes, and the harness id is in them.
       const session = entries.find((e) => e.kind === "session");
-      expect(session?.href).toBe("#/h/hrn_00000000000000a1/sessions/sess_00000000000000aa");
+      expect(session?.href).toBe("#/h/hrn_00000000000000a1/work/sessions/sess_00000000000000aa");
+      expect(entries.find((e) => e.kind === "wiki")?.href).toBe(
+        "#/h/hrn_00000000000000a1/knowledge/wiki/how-to-deploy",
+      );
+      expect(entries.find((e) => e.kind === "eval-run")?.href).toBe(
+        "#/h/hrn_00000000000000a1/quality/results/run_00000000000000aa",
+      );
+      expect(entries.find((e) => e.kind === "group")?.href).toBe("#/harnesses");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("where an entry comes from", () => {
+  test("every entry names its harness and when that harness was indexed", () => {
+    const root = mkdtempSync(join(tmpdir(), "hangar-omni-source-"));
+    try {
+      const dir = join(root, "h");
+      makeFixtureHarness(dir, { specName: "sourced", sessions: [{ id: "sess_00000000000000aa" }] });
+      const harness: IndexHarness = { id: "hrn_1", specName: "sourced", dir, groups: [], tags: [] };
+      const entries = buildHarnessEntries(harness, NOW);
+      expect(entries.length).toBeGreaterThan(1);
+      for (const e of entries) {
+        expect(`${e.kind}:${e.source}:${e.indexedAt}`).toBe(
+          `${e.kind}:sourced:${new Date(NOW).toISOString()}`,
+        );
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the index keeps each harness's stamp until that harness is built again", () => {
+    let clock = NOW;
+    let token = "t0";
+    const index = createOmniIndex({
+      build: (h, nowMs) => [
+        entry({ id: h.id, title: h.specName, indexedAt: new Date(nowMs).toISOString() }),
+      ],
+      token: () => token,
+      now: () => clock,
+    });
+    const h: IndexHarness = { id: "hrn_1", specName: "poly", dir: "/x", groups: [], tags: [] };
+    expect(index.search("poly", [h]).entries[0]?.indexedAt).toBe(new Date(NOW).toISOString());
+    clock = NOW + DAY;
+    expect(index.search("poly", [h]).entries[0]?.indexedAt).toBe(new Date(NOW).toISOString());
+    token = "t1";
+    expect(index.search("poly", [h]).entries[0]?.indexedAt).toBe(new Date(NOW + DAY).toISOString());
+  });
+});
+
+describe("the approvals the menu finds", () => {
+  test("pending ones, at the resolved session root, linking to where they are decided", () => {
+    const root = mkdtempSync(join(tmpdir(), "hangar-omni-approvals-"));
+    try {
+      const dir = join(root, "h");
+      makeFixtureHarness(dir, {
+        specName: "asks",
+        approvals: [
+          approvalLine("appr_000000000000000a", { toolName: "Bash" }),
+          approvalLine("appr_000000000000000b", {
+            decision: "grant",
+            decidedBy: "max",
+            decidedAt: new Date(NOW).toISOString(),
+          }),
+          approvalLine("appr_000000000000000c", {
+            decision: "deny",
+            decidedBy: "max",
+            decidedAt: new Date(NOW).toISOString(),
+          }),
+          approvalLine("appr_000000000000000d", { supersededBy: "appr_000000000000000e" }),
+          approvalLine("appr_000000000000000e", { toolName: "Fetch" }),
+        ],
+      });
+      const harness: IndexHarness = { id: "hrn_1", specName: "asks", dir, groups: [], tags: [] };
+      const approvals = buildHarnessEntries(harness, NOW).filter((e) => e.kind === "approval");
+      expect(approvals.map((e) => [e.id, e.title])).toEqual([
+        ["appr_000000000000000a", "Bash"],
+        ["appr_000000000000000e", "Fetch"],
+      ]);
+      for (const e of approvals) expect(e.href).toBe("#/home/needs-you?type=approvals");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -228,9 +325,16 @@ describe("createOmniIndex", () => {
     const root = mkdtempSync(join(tmpdir(), "hangar-omni-token-"));
     try {
       const dir = join(root, "h");
-      makeFixtureHarness(dir, { specName: "h" });
+      makeFixtureHarness(dir, { specName: "h", sessions: [{ id: "sess_00000000000000aa" }] });
+      // The approvals log lives beside the sessions, at the resolved session
+      // root. Appending to it leaves the directory's own time alone, so only
+      // the log's time can move the token.
+      const log = join(resolveSessionRoot(dir).root, "approvals.jsonl");
+      writeFileSync(log, "{}\n");
       const before = harnessIndexToken(dir);
-      writeFileSync(join(dir, ".crewhaus", "approvals.jsonl"), "{}\n");
+      appendFileSync(log, "{}\n");
+      const later = new Date(NOW + DAY);
+      utimesSync(log, later, later);
       expect(harnessIndexToken(dir)).not.toBe(before);
     } finally {
       rmSync(root, { recursive: true, force: true });

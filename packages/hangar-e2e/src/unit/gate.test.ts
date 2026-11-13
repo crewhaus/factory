@@ -4,14 +4,22 @@ import { join } from "node:path";
 import { AXE_TAGS } from "../a11y/axe";
 import { type AxeReport, rowKey } from "../a11y/baseline";
 import {
-  GATED_TEMPLATES,
   GATE_EXPECTS,
   GATE_THEMES,
   GATE_WIDTHS,
+  TOURED_TEMPLATES,
   gateMessage,
   gateVerdict,
+  gatedTemplates,
 } from "../a11y/gate";
-import { fleetRoutes, harnessRoutes, loadConsoleGrammar } from "../console-routes";
+import { loadConsoleGrammar, routeFor } from "../console-routes";
+
+const grammar = await loadConsoleGrammar();
+const GATED = await gatedTemplates();
+const entry = import.meta.resolve("@crewhaus/hangar-ui");
+const { ROUTE_TEMPLATES, parseRoute } = (await import(
+  new URL("../assets/js/router.js", entry).href
+)) as { ROUTE_TEMPLATES: readonly string[]; parseRoute(hash: string): { view: string } };
 
 const report = (rows: AxeReport["rows"]): AxeReport => ({
   schema: 1,
@@ -31,43 +39,42 @@ function cleanRows(templates: readonly string[]): Record<string, Record<string, 
   return rows;
 }
 
+/** A harness as the seed writes one. */
+const SEEDED = {
+  id: "hrn_0123456789abcdef",
+  runId: "run_0123456789abcdef",
+  sessionIds: ["sess_0123456789abcdef"],
+  wikiSlug: "getting-started",
+};
+
 describe("gateVerdict", () => {
   test("a clean report passes", () => {
-    expect(gateVerdict(report(cleanRows(GATED_TEMPLATES)), GATED_TEMPLATES)).toEqual({
-      failures: [],
-      missing: [],
-    });
+    expect(gateVerdict(report(cleanRows(GATED)), GATED)).toEqual({ failures: [], missing: [] });
   });
 
-  test("one node of any rule on any gated row fails, and is named", () => {
+  test("one node of any rule on any row fails, and is named", () => {
     for (const rule of [
       "color-contrast",
       "target-size",
       "scrollable-region-focusable",
       "made-up",
     ]) {
-      const rows = cleanRows(GATED_TEMPLATES);
-      rows[rowKey("#/h/:id/spec", "light", 320)] = { [rule]: 1 };
-      const verdict = gateVerdict(report(rows), GATED_TEMPLATES);
+      const rows = cleanRows(GATED);
+      rows[rowKey("#/h/:id/setup/spec", "light", 320)] = { [rule]: 1 };
+      const verdict = gateVerdict(report(rows), GATED);
       expect(verdict.failures).toEqual([
-        { template: "#/h/:id/spec", theme: "light", width: 320, rule, count: 1 },
+        { template: "#/h/:id/setup/spec", theme: "light", width: 320, rule, count: 1 },
       ]);
       expect(verdict.missing).toEqual([]);
     }
   });
 
-  test("a row outside the gate never fails it", () => {
-    const rows = cleanRows(GATED_TEMPLATES);
-    rows[rowKey("#/runs", "dark", 1280)] = { "color-contrast": 40 };
-    expect(gateVerdict(report(rows), GATED_TEMPLATES).failures).toEqual([]);
-  });
-
-  test("a gated template without a width or a theme is missing, not passed", () => {
-    const rows = cleanRows(GATED_TEMPLATES);
-    Reflect.deleteProperty(rows, rowKey("#/approvals", "dark", 320));
+  test("a template without a width or a theme is missing, not passed", () => {
+    const rows = cleanRows(GATED);
+    Reflect.deleteProperty(rows, rowKey("#/home/working", "dark", 320));
     Reflect.deleteProperty(rows, rowKey("#/settings", "light", 1280));
-    expect(gateVerdict(report(rows), GATED_TEMPLATES).missing).toEqual([
-      "#/approvals dark 320",
+    expect(gateVerdict(report(rows), GATED).missing).toEqual([
+      "#/home/working dark 320",
       "#/settings light 1280",
     ]);
   });
@@ -87,47 +94,49 @@ describe("gateVerdict", () => {
   });
 });
 
-describe("the gated screens", () => {
-  test("are exactly the thirteen retrofitted templates", () => {
-    expect([...GATED_TEMPLATES]).toEqual([
-      "#/",
-      "#/approvals",
-      "#/review",
-      "#/activity",
-      "#/advisor",
-      "#/h/:id/advisor",
-      "#/settings",
-      "#/h/:id/overview",
-      "#/h/:id/costs",
-      "#/h/:id/spec",
-      "#/h/:id/memory",
-      "#/thredz",
-      "#/h/:id/thredz",
-    ]);
-    expect(new Set(GATED_TEMPLATES).size).toBe(13);
+describe("the gate is every route", () => {
+  test("it is the router's own route templates, all of them", () => {
+    expect(GATED).toBe(ROUTE_TEMPLATES);
+    expect(GATED.length).toBeGreaterThanOrEqual(40);
+    expect(new Set(GATED).size).toBe(GATED.length);
   });
 
-  test("each is a template the real route grammar produces", async () => {
-    const grammar = await loadConsoleGrammar();
-    const known = new Set(
-      [...fleetRoutes(grammar), ...harnessRoutes(grammar, "x")].map((r) => r.template),
-    );
-    for (const template of GATED_TEMPLATES) {
-      expect(`${template}:${known.has(template)}`).toBe(`${template}:true`);
+  test("each route says what must be on it before axe runs, and nothing else is listed", () => {
+    expect(Object.keys(GATE_EXPECTS).sort()).toEqual([...GATED].sort());
+    for (const [template, selector] of Object.entries(GATE_EXPECTS)) {
+      expect(`${template}:${selector.trim() !== ""}`).toBe(`${template}:true`);
+      // A heading alone is not content.
+      expect(`${template}:${/^(h1|#page-title|\.page-title)$/.test(selector.trim())}`).toBe(
+        `${template}:false`,
+      );
     }
   });
 
-  test("each says what must be on it before axe runs, and nothing else is listed", () => {
-    expect(Object.keys(GATE_EXPECTS).sort()).toEqual([...GATED_TEMPLATES].sort());
-    for (const selector of Object.values(GATE_EXPECTS)) expect(selector.trim()).not.toBe("");
+  test("every template is producible from a seeded harness, and lands on a screen", () => {
+    for (const template of GATED) {
+      const route = routeFor(template, SEEDED);
+      expect(`${template}:${parseRoute(route).view === "notfound"}`).toBe(`${template}:false`);
+    }
   });
 
-  test("the committed baseline holds every gated row, empty", () => {
-    const baseline = JSON.parse(
-      readFileSync(join(import.meta.dir, "..", "..", "axe-baseline.json"), "utf8"),
-    ) as AxeReport;
-    const verdict = gateVerdict(baseline, GATED_TEMPLATES);
-    expect(verdict).toEqual({ failures: [], missing: [] });
+  test("the toured screens are thirteen of them, each a route the gate holds", () => {
+    expect(TOURED_TEMPLATES.length).toBe(13);
+    expect(new Set(TOURED_TEMPLATES).size).toBe(13);
+    for (const template of TOURED_TEMPLATES) {
+      expect(`${template}:${GATED.includes(template)}`).toBe(`${template}:true`);
+    }
+  });
+
+  test("there is no baseline file and no allow-list to fall back on", () => {
+    const pkg = join(import.meta.dir, "..", "..");
+    expect(() => readFileSync(join(pkg, "axe-baseline.json"), "utf8")).toThrow();
+    const gate = readFileSync(join(import.meta.dir, "..", "a11y", "gate.ts"), "utf8");
+    for (const word of ["allow", "exempt", "skip", "baseline"]) {
+      expect(`${word}:${new RegExp(`export const \\w*${word}`, "i").test(gate)}`).toBe(
+        `${word}:false`,
+      );
+    }
+    expect(grammar.templates).toBe(GATED);
   });
 });
 

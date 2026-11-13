@@ -29,6 +29,8 @@ import { el, emptyState, toast } from "./dom.js";
 import { ROUTES } from "./routes.js";
 import { openDialog } from "./ui/dialog.js";
 import { comboboxKey, wireCombobox } from "./ui/listbox.js";
+import { timeEl } from "./ui/time.js";
+import { fmtRelativeTime } from "./util.js";
 
 /** Debounce for keystroke → request. Short enough to feel live, long enough
  *  that a fast typist issues one request per word, not per letter. */
@@ -149,14 +151,17 @@ export function openOmnibox(opts = {}) {
         input.focus();
       },
     });
+    // A child that is not there is left out: `replaceChildren` would draw null as text.
     confirmRow.replaceChildren(
-      el("strong", { text: `${row.title}?` }),
-      row.cliTwin !== "" ? el("code", { class: "omni-twin mono", text: row.cliTwin }) : null,
-      runnable
-        ? null
-        : el("span", { class: "muted", text: `this build cannot run “${row.route}” from here` }),
-      run,
-      cancel,
+      ...[
+        el("strong", { text: `${row.title}?` }),
+        row.cliTwin !== "" ? el("code", { class: "omni-twin mono", text: row.cliTwin }) : null,
+        runnable
+          ? null
+          : el("span", { class: "muted", text: `this build cannot run “${row.route}” from here` }),
+        run,
+        cancel,
+      ].filter((node) => node !== null),
     );
     confirmRow.hidden = false;
     confirmRow.focus();
@@ -211,11 +216,7 @@ export function openOmnibox(opts = {}) {
             el("span", { class: "omni-title", text: row.title }),
             el("code", { class: "omni-twin mono", text: row.cliTwin }),
           ]
-        : [
-            chip,
-            el("span", { class: "omni-title", text: row.title }),
-            el("span", { class: "omni-sub muted", text: row.subtitle }),
-          ];
+        : [chip, el("span", { class: "omni-title", text: row.title }), entryMeta(row)];
     return el(
       "div",
       {
@@ -327,6 +328,24 @@ export function openOmnibox(opts = {}) {
   return { close };
 }
 
+/** A result's second line: where it comes from, its owner when it has one,
+ *  and how fresh the index is; the subtitle when the server sent none. */
+function entryMeta(row) {
+  if (row.source === null && row.indexedAt === null) {
+    return el("span", { class: "omni-sub muted", text: row.subtitle });
+  }
+  const parts = [];
+  if (row.source !== null) parts.push(el("span", { text: row.source }));
+  if (row.owner !== null) parts.push(el("span", { text: ` · ${row.owner}` }));
+  if (row.indexedAt !== null) {
+    parts.push(el("span", { text: " · " }));
+    parts.push(
+      timeEl(row.indexedAt, { format: (iso, at) => `indexed ${fmtRelativeTime(iso, at)}` }),
+    );
+  }
+  return el("span", { class: "omni-sub muted" }, parts);
+}
+
 /**
  * The server payload → the overlay's row list: navigation entries first,
  * then actions. Pure, and exported so the ordering and the shape can be
@@ -343,6 +362,11 @@ export function omniRows(payload) {
       title: String(e.title ?? ""),
       subtitle: String(e.subtitle ?? ""),
       href: typeof e.href === "string" ? e.href : "#/",
+      // Where the result comes from and when it was read; an older server
+      // sends neither, and the row falls back to its subtitle.
+      source: typeof e.source === "string" && e.source !== "" ? e.source : null,
+      indexedAt: typeof e.indexedAt === "string" && e.indexedAt !== "" ? e.indexedAt : null,
+      owner: typeof e.owner === "string" && e.owner !== "" ? e.owner : null,
     })),
     ...actions.map((a) => ({
       kind: "action",

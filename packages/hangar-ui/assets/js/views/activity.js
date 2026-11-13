@@ -88,17 +88,20 @@ function paint(view) {
   const items = payload && Array.isArray(payload.items) ? payload.items : [];
   const groups = activityGroups(items, view.enabled);
 
+  // A child that is not there is left out: `replaceChildren` would draw null as text.
   view.rollup.replaceChildren(
-    el("span", {
-      text: `${items.length} change${items.length === 1 ? "" : "s"} since ${
-        payload && typeof payload.since === "string"
-          ? fmtRelativeTime(payload.since, nowMs)
-          : view.since
-      }`,
-    }),
-    payload && payload.truncated === true
-      ? el("span", { class: "chip chip-warn", text: "capped — older items not shown" })
-      : null,
+    ...[
+      el("span", {
+        text: `${items.length} change${items.length === 1 ? "" : "s"} since ${
+          payload && typeof payload.since === "string"
+            ? fmtRelativeTime(payload.since, nowMs)
+            : view.since
+        }`,
+      }),
+      payload && payload.truncated === true
+        ? el("span", { class: "chip chip-warn", text: "capped — older items not shown" })
+        : null,
+    ].filter((node) => node !== null),
   );
 
   // Per-kind toggles, keyed by kind: a toggle that stays is updated in place.

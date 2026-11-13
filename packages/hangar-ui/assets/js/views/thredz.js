@@ -264,7 +264,9 @@ export async function renderThredz(root, ctx) {
     return;
   }
   const host = el("div", { class: "tab-section" });
-  const state = { panel: "wiki" };
+  // `knowledge/thredz/<panel>` opens that panel; an unknown one opens the Wiki.
+  const asked = ctx.route?.rest?.[0];
+  const state = { panel: PANELS.some(([id]) => id === asked) ? asked : "wiki" };
   const paint = () => {
     clear(host).appendChild(skeleton(4));
     void renderPanel(host, ctx, state.panel);
@@ -276,6 +278,7 @@ export async function renderThredz(root, ctx) {
     current: state.panel,
     onSelect: (key) => {
       state.panel = key;
+      ctx.setSub?.([key]);
       paint();
     },
   });

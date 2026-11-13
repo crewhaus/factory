@@ -8,7 +8,7 @@
 import type { Page } from "playwright";
 import { type FakeThredz, fakeThredz } from "service-fakes";
 import type { Home } from "../boot";
-import { LIBRARY_ROUTE, globalRoute, harnessRoute } from "../console-routes";
+import { HARNESSES_ROUTE, HOME_ROUTE, type RouteHarness, routeFor } from "../console-routes";
 import type { Fleet, SeededHarness } from "../seed/fleet";
 import type { ExpectedStatus, Session } from "../session";
 import { settle } from "../settle";
@@ -75,9 +75,6 @@ export async function a11yFleet(scope: JourneyScope, seed: string): Promise<A11y
     ],
   };
 }
-
-/** A harness tab's template, spelled as the sweep's rows spell it. */
-const harnessTemplate = (tab: string): string => harnessRoute(":id", tab).replace("%3Aid", ":id");
 
 const startPath = (id: string): string => `/api/h/${encodeURIComponent(id)}/proc/start`;
 const specPatchPath = (id: string): string => `/api/h/${encodeURIComponent(id)}/spec/patch`;
@@ -215,8 +212,8 @@ export type ScreenState = {
 };
 
 /** Every state the sweep covers, for one harness. */
-export function screenStates(harnessId: string): readonly ScreenState[] {
-  const h = (tab: string): string => harnessRoute(harnessId, tab);
+export function screenStates(harness: RouteHarness): readonly ScreenState[] {
+  const h = (template: string): string => routeFor(template, harness);
   const panel = (nav: string, label: string) => async (page: Page) => {
     await page.locator(`nav[aria-label="${nav}"] button`, { hasText: label }).first().click();
     await settle(page, `${nav} ${label}`);
@@ -224,27 +221,27 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
   };
   const states: ScreenState[] = [
     {
-      template: LIBRARY_ROUTE,
+      template: HOME_ROUTE,
       state: "bindings sheet",
-      route: LIBRARY_ROUTE,
+      route: HOME_ROUTE,
       open: async (page) => {
         await pressOnPage(page, "?");
         await waitFor(page, "dialog.sheet[open]", "the bindings sheet");
       },
     },
     {
-      template: LIBRARY_ROUTE,
+      template: HOME_ROUTE,
       state: "command menu empty",
-      route: LIBRARY_ROUTE,
+      route: HOME_ROUTE,
       open: async (page) => {
         await pressOnPage(page, "/");
         await waitFor(page, "dialog.omni-panel[open]", "the command menu");
       },
     },
     {
-      template: LIBRARY_ROUTE,
+      template: HOME_ROUTE,
       state: "command menu results",
-      route: LIBRARY_ROUTE,
+      route: HOME_ROUTE,
       open: async (page) => {
         await pressOnPage(page, "/");
         await page.keyboard.type("fleet");
@@ -252,9 +249,9 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     },
     {
-      template: LIBRARY_ROUTE,
+      template: HOME_ROUTE,
       state: "command menu armed action",
-      route: LIBRARY_ROUTE,
+      route: HOME_ROUTE,
       open: async (page) => {
         await pressOnPage(page, "/");
         await page.keyboard.type("start fleet");
@@ -264,18 +261,63 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     },
     {
-      template: LIBRARY_ROUTE,
+      template: HOME_ROUTE,
+      state: "header list open",
+      route: HOME_ROUTE,
+      // Help on a wide screen; the Menu, which holds the destinations, Settings
+      // and Help, on a narrow one.
+      open: async (page) => {
+        const narrow = await page.evaluate(() => globalThis.innerWidth < 720);
+        await page
+          .locator(narrow ? "button.menu-toggle" : 'button[aria-controls="help-menu"]')
+          .click();
+        await waitFor(
+          page,
+          narrow ? "#narrow-menu .menu-link" : "#help-menu .menu-link",
+          "the open header list",
+        );
+      },
+    },
+    {
+      template: HOME_ROUTE,
+      state: "settings list open",
+      route: HOME_ROUTE,
+      open: async (page) => {
+        const narrow = await page.evaluate(() => globalThis.innerWidth < 720);
+        await page
+          .locator(narrow ? "button.menu-toggle" : 'button[aria-controls="settings-menu"]')
+          .click();
+        await waitFor(
+          page,
+          narrow ? "#narrow-menu .menu-link" : "#settings-menu .menu-link",
+          "the open settings list",
+        );
+      },
+    },
+    {
+      template: "#/h/:id/setup",
+      state: "sub-view list open",
+      route: h("#/h/:id/setup"),
+      // A disclosure on a narrow screen, a rail on a wide one: open it if it folds.
+      open: async (page) => {
+        const toggle = page.locator("button.subview-toggle");
+        if (await toggle.isVisible()) await toggle.click();
+        await waitFor(page, ".subview-list .subview-link", "the sub-view list");
+      },
+    },
+    {
+      template: HARNESSES_ROUTE,
       state: "tooltip open",
-      route: LIBRARY_ROUTE,
+      route: HARNESSES_ROUTE,
       open: async (page) => {
         await page.locator("#view button[data-tip]").first().focus();
         await waitFor(page, ".tip", "the tooltip");
       },
     },
     {
-      template: globalRoute("approvals"),
+      template: "#/home/needs-you?type=approvals",
       state: "row armed",
-      route: globalRoute("approvals"),
+      route: "#/home/needs-you?type=approvals",
       open: async (page) => {
         await page.locator(".inbox-card").first().focus();
         await page.keyboard.press("g");
@@ -283,9 +325,9 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     },
     {
-      template: globalRoute("approvals"),
+      template: "#/home/needs-you?type=approvals",
       state: "row menu",
-      route: globalRoute("approvals"),
+      route: "#/home/needs-you?type=approvals",
       open: async (page) => {
         await page.locator(".inbox-card").first().focus();
         await page.keyboard.press(".");
@@ -293,9 +335,9 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     },
     {
-      template: globalRoute("approvals"),
+      template: "#/home/needs-you?type=approvals",
       state: "inbox help",
-      route: globalRoute("approvals"),
+      route: "#/home/needs-you?type=approvals",
       open: async (page) => {
         await page.locator(".inbox-card").first().focus();
         await page.keyboard.press("?");
@@ -303,9 +345,9 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     },
     {
-      template: globalRoute("activity"),
+      template: "#/home/changes",
       state: "a kind off",
-      route: globalRoute("activity"),
+      route: "#/home/changes",
       open: async (page) => {
         await page
           .locator('[aria-label="activity kinds"] button[aria-pressed="true"]')
@@ -319,9 +361,9 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     },
     {
-      template: globalRoute("activity"),
+      template: "#/home/changes",
       state: "every kind off",
-      route: globalRoute("activity"),
+      route: "#/home/changes",
       open: async (page) => {
         const on = page.locator('[aria-label="activity kinds"] button[aria-pressed="true"]');
         while ((await on.count()) > 0) await on.first().click();
@@ -329,36 +371,36 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     },
     {
-      template: harnessTemplate("advisor"),
+      template: "#/h/:id/overview/needs-you",
       state: "why this matters open",
-      route: h("advisor"),
+      route: h("#/h/:id/overview/needs-you"),
       open: async (page) => {
         await page.locator("summary", { hasText: "Why this matters" }).first().click();
         await waitFor(page, "details[open] .adv-explain", "the open disclosure");
       },
     },
     {
-      template: harnessTemplate("spec"),
+      template: "#/h/:id/setup/spec",
       state: "value dialog",
-      route: h("spec"),
+      route: h("#/h/:id/setup/spec"),
       open: async (page) => {
         await page.getByRole("button", { name: "Edit any path…" }).click();
         await waitFor(page, "dialog[open] textarea", "the value dialog");
       },
     },
     {
-      template: harnessTemplate("spec"),
+      template: "#/h/:id/setup/spec",
       state: "typed confirm",
-      route: h("spec"),
+      route: h("#/h/:id/setup/spec"),
       open: async (page) => {
         await page.getByRole("button", { name: "Pin to…" }).first().click();
         await waitFor(page, "dialog[open] input[placeholder]", "the typed confirm");
       },
     },
     {
-      template: harnessTemplate("spec"),
+      template: "#/h/:id/setup/spec",
       state: "view dialog",
-      route: h("spec"),
+      route: h("#/h/:id/setup/spec"),
       open: async (page) => {
         await page.getByRole("button", { name: "View", exact: true }).first().click();
         await settle(page, "the view dialog");
@@ -366,18 +408,18 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
       },
     },
     {
-      template: harnessTemplate("spec"),
+      template: "#/h/:id/setup/spec",
       state: "conflict view",
-      route: h("spec"),
+      route: h("#/h/:id/setup/spec"),
       open: async (page) => {
         await page.getByRole("button", { name: "Save", exact: true }).first().click();
         await waitFor(page, "dialog[open] .conflict", "the conflict view");
       },
     },
     {
-      template: harnessTemplate("overview"),
+      template: "#/h/:id",
       state: "refusal dialog",
-      route: h("overview"),
+      route: h("#/h/:id"),
       open: async (page) => {
         await page.getByRole("button", { name: "Start", exact: true }).first().click();
         await waitFor(page, "dialog[open] .refusal-list", "the refusal dialog");
@@ -386,17 +428,17 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
   ];
   for (const label of MEMORY_PANELS) {
     states.push({
-      template: harnessTemplate("memory"),
+      template: "#/h/:id/knowledge/memory",
       state: `panel ${label}`,
-      route: h("memory"),
+      route: h("#/h/:id/knowledge/memory"),
       open: panel("memory fabric panels", label),
     });
   }
   for (const label of THREDZ_PANELS) {
     states.push({
-      template: harnessTemplate("thredz"),
+      template: "#/h/:id/knowledge/thredz",
       state: `panel ${label}`,
-      route: h("thredz"),
+      route: h("#/h/:id/knowledge/thredz"),
       open: panel("thredz panels", label),
     });
   }
@@ -406,12 +448,12 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
     ["compact density", { density: "compact" }],
   ] as const) {
     states.push({
-      template: LIBRARY_ROUTE,
+      template: HARNESSES_ROUTE,
       state,
-      route: LIBRARY_ROUTE,
+      route: HARNESSES_ROUTE,
       open: async (page) => {
         await setPrefs(page, prefs);
-        await waitFor(page, "table.fleet tbody.row-group", "the Library after a reload");
+        await waitFor(page, "table.fleet tbody.row-group", "the harness list after a reload");
       },
     });
   }
@@ -419,13 +461,13 @@ export function screenStates(harnessId: string): readonly ScreenState[] {
   states.push({
     template: SIGN_IN_TEMPLATE,
     state: "first paint",
-    route: LIBRARY_ROUTE,
+    route: HOME_ROUTE,
     open: showSignInScreen,
   });
   states.push({
     template: SIGN_IN_TEMPLATE,
     state: "a link refused",
-    route: LIBRARY_ROUTE,
+    route: HOME_ROUTE,
     open: async (page) => {
       await showSignInScreen(page);
       await page.getByLabel("Sign-in link").fill("not a link");

@@ -23,7 +23,7 @@
  *      control plane says "cadence only" instead of implying a gap.
  */
 
-import { hrefHarness } from "./router.js";
+import { hrefGlobal, hrefHarness } from "./router.js";
 import { fmtRelativeTime, parseTs, usdFromMicros } from "./util.js";
 
 // ---------------------------------------------------------------------------
@@ -1223,7 +1223,7 @@ export function activityHref(item) {
     case "deploy":
       return hrefHarness(id, "deploy");
     case "approval":
-      return "#/approvals";
+      return hrefGlobal("approvals");
     default:
       return hrefHarness(id);
   }

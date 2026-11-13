@@ -254,6 +254,7 @@ import {
 } from "./settings";
 import { SIGN_IN_ROUTES, isSignInPath, serveSignIn } from "./sign-in-routes";
 import { BADGE_KEYS, capabilityBadges, specView } from "./spec-view";
+import { assetResponse } from "./static-cache";
 
 export type StaticAsset = {
   readonly body: string | Uint8Array;
@@ -2600,11 +2601,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     const assets = opts.assets;
     if (assets !== undefined) {
       const asset = assets[pathname] ?? (pathname === "/" ? assets["/index.html"] : undefined);
-      if (asset !== undefined) {
-        return new Response(asset.body, {
-          headers: { ...SHELL_HEADERS, "content-type": asset.contentType },
-        });
-      }
+      if (asset !== undefined) return assetResponse(req, pathname, asset);
     }
     if (pathname === "/") return builtinIndex();
     return errResponse(404, "not found");

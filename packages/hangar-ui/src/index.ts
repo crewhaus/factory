@@ -3,119 +3,52 @@
  *
  * Zero-build by design: the `assets/` tree is hand-written browser code
  * (plain ES modules + one CSS file + one HTML shell, no framework, no npm
- * deps, no bundler). This module imports every asset `with { type: "text" }`
- * and exports them keyed by serve path, which is the exact map the CLI hands
- * to the hangar server's static-asset option.
+ * deps, no bundler). The embed modules under `./embed/` import every asset
+ * `with { type: "text" }`, one module per area, and this module merges them
+ * into the exact map, keyed by serve path, that the CLI hands to the hangar
+ * server's static-asset option.
  *
  * STATIC imports only, deliberately: `bun build --compile` embeds only what
  * the import graph references statically — a runtime `readFileSync` of a
  * package-relative path resolves under `/$bunfs` in the compiled binary,
  * where the files were never placed, and bricks every command at boot. The
- * checked-in asset files stay the single source of truth; this module only
- * re-exports their text.
+ * checked-in asset files stay the single source of truth; the embed modules
+ * only re-export their text.
  *
- * The unit tests enforce the embed map's completeness (every file under
- * `assets/` appears under its serve path, with the right content type, and
- * every relative import inside the JS modules resolves within the map), so
- * adding an asset file without registering it here fails CI.
+ * An area adds its screens to its OWN embed module, never here and never to
+ * another area's. The unit tests enforce the map's completeness (every file
+ * under `assets/` appears under its serve path, with the right content type,
+ * and every relative import inside the JS modules resolves within the map)
+ * and that no two embed modules claim the same path, so adding an asset file
+ * without registering it fails CI.
  */
-import hangarCss from "../assets/hangar.css" with { type: "text" };
-// bun-types declares `*.html` imports as HTMLBundle (Bun's HTML-bundle
-// feature) and that ambient wins over a local one, but the `type: "text"`
-// import attribute makes this a plain string at runtime — hence the cast.
-import indexHtmlBundle from "../assets/index.html" with { type: "text" };
-import apiJs from "../assets/js/api.js" with { type: "text" };
-import appJs from "../assets/js/app.js" with { type: "text" };
-import domJs from "../assets/js/dom.js" with { type: "text" };
-import keysJs from "../assets/js/keys.js" with { type: "text" };
-import markdownJs from "../assets/js/markdown.js" with { type: "text" };
-import notifyJs from "../assets/js/notify.js" with { type: "text" };
-import omniboxJs from "../assets/js/omnibox.js" with { type: "text" };
-import prefsJs from "../assets/js/prefs.js" with { type: "text" };
-import routerJs from "../assets/js/router.js" with { type: "text" };
-import routesJs from "../assets/js/routes.js" with { type: "text" };
-import sealedJs from "../assets/js/sealed.js" with { type: "text" };
-import shapesJs from "../assets/js/shapes.js" with { type: "text" };
-import signInJs from "../assets/js/sign-in.js" with { type: "text" };
-import supervisionJs from "../assets/js/supervision.js" with { type: "text" };
-import chartUiJs from "../assets/js/ui/chart.js" with { type: "text" };
-import conflictUiJs from "../assets/js/ui/conflict.js" with { type: "text" };
-import dialogUiJs from "../assets/js/ui/dialog.js" with { type: "text" };
-import draftUiJs from "../assets/js/ui/draft.js" with { type: "text" };
-import emptyUiJs from "../assets/js/ui/empty.js" with { type: "text" };
-import keyedUiJs from "../assets/js/ui/keyed.js" with { type: "text" };
-import listboxUiJs from "../assets/js/ui/listbox.js" with { type: "text" };
-import liveUiJs from "../assets/js/ui/live.js" with { type: "text" };
-import panelsUiJs from "../assets/js/ui/panels.js" with { type: "text" };
-import timeUiJs from "../assets/js/ui/time.js" with { type: "text" };
-import toggleUiJs from "../assets/js/ui/toggle.js" with { type: "text" };
-import tooltipUiJs from "../assets/js/ui/tooltip.js" with { type: "text" };
-import utilJs from "../assets/js/util.js" with { type: "text" };
-import activityViewJs from "../assets/js/views/activity.js" with { type: "text" };
-import advisorViewJs from "../assets/js/views/advisor.js" with { type: "text" };
-import approvalsViewJs from "../assets/js/views/approvals.js" with { type: "text" };
-import channelsViewJs from "../assets/js/views/channels.js" with { type: "text" };
-import controlViewJs from "../assets/js/views/control.js" with { type: "text" };
-import costsViewJs from "../assets/js/views/costs.js" with { type: "text" };
-import credsViewJs from "../assets/js/views/creds.js" with { type: "text" };
-import dataViewJs from "../assets/js/views/data.js" with { type: "text" };
-import deployViewJs from "../assets/js/views/deploy.js" with { type: "text" };
-import evalsLabViewJs from "../assets/js/views/evals-lab.js" with { type: "text" };
-import evalsViewJs from "../assets/js/views/evals.js" with { type: "text" };
-import feedbackViewJs from "../assets/js/views/feedback.js" with { type: "text" };
-import healthViewJs from "../assets/js/views/health.js" with { type: "text" };
-import inboxViewJs from "../assets/js/views/inbox.js" with { type: "text" };
-import inspectViewJs from "../assets/js/views/inspect.js" with { type: "text" };
-import jobsViewJs from "../assets/js/views/jobs.js" with { type: "text" };
-import libraryViewJs from "../assets/js/views/library.js" with { type: "text" };
-import memoryFabricViewJs from "../assets/js/views/memory-fabric.js" with { type: "text" };
-import memoryViewJs from "../assets/js/views/memory.js" with { type: "text" };
-import modelsViewJs from "../assets/js/views/models.js" with { type: "text" };
-import onboardingViewJs from "../assets/js/views/onboarding.js" with { type: "text" };
-import overviewViewJs from "../assets/js/views/overview.js" with { type: "text" };
-import panesViewJs from "../assets/js/views/panes.js" with { type: "text" };
-import procViewJs from "../assets/js/views/proc.js" with { type: "text" };
-import reviewViewJs from "../assets/js/views/review.js" with { type: "text" };
-import runsViewJs from "../assets/js/views/runs.js" with { type: "text" };
-import runtimeViewJs from "../assets/js/views/runtime.js" with { type: "text" };
-import schedulersViewJs from "../assets/js/views/schedulers.js" with { type: "text" };
-import securityViewJs from "../assets/js/views/security.js" with { type: "text" };
-import sessionsViewJs from "../assets/js/views/sessions.js" with { type: "text" };
-import settingsViewJs from "../assets/js/views/settings.js" with { type: "text" };
-import signInViewJs from "../assets/js/views/sign-in.js" with { type: "text" };
-import specEditViewJs from "../assets/js/views/spec-edit.js" with { type: "text" };
-import specViewJs from "../assets/js/views/spec.js" with { type: "text" };
-import thredzViewJs from "../assets/js/views/thredz.js" with { type: "text" };
+import type { HangarAsset } from "./embed/asset";
+import { attentionAssets } from "./embed/attention";
+import { creationAssets } from "./embed/creation";
+import { delegationAssets } from "./embed/delegation";
+import { homeAssets } from "./embed/home";
+import { inspectionAssets } from "./embed/inspection";
+import { integrationsAssets } from "./embed/integrations";
+import { knowledgeAssets } from "./embed/knowledge";
+import { peopleAssets } from "./embed/people";
+import { qualityAssets } from "./embed/quality";
+import { runtimeAssets } from "./embed/runtime";
 
-/** One embeddable asset: the file's text plus its HTTP content type. */
-export type HangarAsset = {
-  readonly body: string;
-  readonly contentType: string;
+export { CONTENT_TYPES, type HangarAsset, contentTypeFor } from "./embed/asset";
+
+/** Every embed module, by area. Their key sets never overlap (tested). */
+export const EMBED_MODULES: Readonly<Record<string, Readonly<Record<string, HangarAsset>>>> = {
+  home: homeAssets,
+  attention: attentionAssets,
+  creation: creationAssets,
+  delegation: delegationAssets,
+  inspection: inspectionAssets,
+  integrations: integrationsAssets,
+  knowledge: knowledgeAssets,
+  people: peopleAssets,
+  quality: qualityAssets,
+  runtime: runtimeAssets,
 };
-
-/** Extension → content type for everything the asset tree may contain. */
-export const CONTENT_TYPES: Readonly<Record<string, string>> = {
-  ".html": "text/html; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".mjs": "text/javascript; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".svg": "image/svg+xml",
-  ".txt": "text/plain; charset=utf-8",
-};
-
-/** Content type for a serve path by extension (octet-stream fallback). */
-export function contentTypeFor(path: string): string {
-  const dot = path.lastIndexOf(".");
-  const ext = dot >= 0 ? path.slice(dot).toLowerCase() : "";
-  return CONTENT_TYPES[ext] ?? "application/octet-stream";
-}
-
-const indexHtml = indexHtmlBundle as unknown as string;
-
-function asset(body: string, path: string): HangarAsset {
-  return { body, contentType: contentTypeFor(path) };
-}
 
 /**
  * The embed map, keyed by serve path. `"/"` is the SPA shell (the app is a
@@ -123,68 +56,14 @@ function asset(body: string, path: string): HangarAsset {
  * `/assets/…` exactly as laid out on disk.
  */
 export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
-  "/": asset(indexHtml, "index.html"),
-  "/assets/hangar.css": asset(hangarCss, "hangar.css"),
-  "/assets/js/app.js": asset(appJs, "app.js"),
-  "/assets/js/api.js": asset(apiJs, "api.js"),
-  "/assets/js/dom.js": asset(domJs, "dom.js"),
-  "/assets/js/keys.js": asset(keysJs, "keys.js"),
-  "/assets/js/markdown.js": asset(markdownJs, "markdown.js"),
-  "/assets/js/notify.js": asset(notifyJs, "notify.js"),
-  "/assets/js/omnibox.js": asset(omniboxJs, "omnibox.js"),
-  "/assets/js/prefs.js": asset(prefsJs, "prefs.js"),
-  "/assets/js/router.js": asset(routerJs, "router.js"),
-  "/assets/js/routes.js": asset(routesJs, "routes.js"),
-  "/assets/js/sealed.js": asset(sealedJs, "sealed.js"),
-  "/assets/js/shapes.js": asset(shapesJs, "shapes.js"),
-  "/assets/js/sign-in.js": asset(signInJs, "sign-in.js"),
-  "/assets/js/supervision.js": asset(supervisionJs, "supervision.js"),
-  "/assets/js/ui/chart.js": asset(chartUiJs, "chart.js"),
-  "/assets/js/ui/conflict.js": asset(conflictUiJs, "conflict.js"),
-  "/assets/js/ui/dialog.js": asset(dialogUiJs, "dialog.js"),
-  "/assets/js/ui/draft.js": asset(draftUiJs, "draft.js"),
-  "/assets/js/ui/empty.js": asset(emptyUiJs, "empty.js"),
-  "/assets/js/ui/keyed.js": asset(keyedUiJs, "keyed.js"),
-  "/assets/js/ui/listbox.js": asset(listboxUiJs, "listbox.js"),
-  "/assets/js/ui/live.js": asset(liveUiJs, "live.js"),
-  "/assets/js/ui/panels.js": asset(panelsUiJs, "panels.js"),
-  "/assets/js/ui/time.js": asset(timeUiJs, "time.js"),
-  "/assets/js/ui/toggle.js": asset(toggleUiJs, "toggle.js"),
-  "/assets/js/ui/tooltip.js": asset(tooltipUiJs, "tooltip.js"),
-  "/assets/js/util.js": asset(utilJs, "util.js"),
-  "/assets/js/views/activity.js": asset(activityViewJs, "activity.js"),
-  "/assets/js/views/advisor.js": asset(advisorViewJs, "advisor.js"),
-  "/assets/js/views/approvals.js": asset(approvalsViewJs, "approvals.js"),
-  "/assets/js/views/channels.js": asset(channelsViewJs, "channels.js"),
-  "/assets/js/views/control.js": asset(controlViewJs, "control.js"),
-  "/assets/js/views/costs.js": asset(costsViewJs, "costs.js"),
-  "/assets/js/views/creds.js": asset(credsViewJs, "creds.js"),
-  "/assets/js/views/data.js": asset(dataViewJs, "data.js"),
-  "/assets/js/views/deploy.js": asset(deployViewJs, "deploy.js"),
-  "/assets/js/views/evals-lab.js": asset(evalsLabViewJs, "evals-lab.js"),
-  "/assets/js/views/evals.js": asset(evalsViewJs, "evals.js"),
-  "/assets/js/views/feedback.js": asset(feedbackViewJs, "feedback.js"),
-  "/assets/js/views/health.js": asset(healthViewJs, "health.js"),
-  "/assets/js/views/inbox.js": asset(inboxViewJs, "inbox.js"),
-  "/assets/js/views/inspect.js": asset(inspectViewJs, "inspect.js"),
-  "/assets/js/views/jobs.js": asset(jobsViewJs, "jobs.js"),
-  "/assets/js/views/library.js": asset(libraryViewJs, "library.js"),
-  "/assets/js/views/memory-fabric.js": asset(memoryFabricViewJs, "memory-fabric.js"),
-  "/assets/js/views/memory.js": asset(memoryViewJs, "memory.js"),
-  "/assets/js/views/models.js": asset(modelsViewJs, "models.js"),
-  "/assets/js/views/onboarding.js": asset(onboardingViewJs, "onboarding.js"),
-  "/assets/js/views/overview.js": asset(overviewViewJs, "overview.js"),
-  "/assets/js/views/panes.js": asset(panesViewJs, "panes.js"),
-  "/assets/js/views/proc.js": asset(procViewJs, "proc.js"),
-  "/assets/js/views/review.js": asset(reviewViewJs, "review.js"),
-  "/assets/js/views/runs.js": asset(runsViewJs, "runs.js"),
-  "/assets/js/views/runtime.js": asset(runtimeViewJs, "runtime.js"),
-  "/assets/js/views/schedulers.js": asset(schedulersViewJs, "schedulers.js"),
-  "/assets/js/views/security.js": asset(securityViewJs, "security.js"),
-  "/assets/js/views/sign-in.js": asset(signInViewJs, "sign-in.js"),
-  "/assets/js/views/sessions.js": asset(sessionsViewJs, "sessions.js"),
-  "/assets/js/views/settings.js": asset(settingsViewJs, "settings.js"),
-  "/assets/js/views/spec-edit.js": asset(specEditViewJs, "spec-edit.js"),
-  "/assets/js/views/spec.js": asset(specViewJs, "spec.js"),
-  "/assets/js/views/thredz.js": asset(thredzViewJs, "thredz.js"),
+  ...homeAssets,
+  ...attentionAssets,
+  ...creationAssets,
+  ...delegationAssets,
+  ...inspectionAssets,
+  ...integrationsAssets,
+  ...knowledgeAssets,
+  ...peopleAssets,
+  ...qualityAssets,
+  ...runtimeAssets,
 };
