@@ -27,6 +27,11 @@ export type IntakeVerdict =
       readonly notice: string | null;
       /** Maps to each door's own wire form. */
       readonly code: "paused" | "disabled";
+      /**
+       * The `EXIT_CODES` name a door exits with. A door puts `code` on the wire and
+       * `exitName` on an exit, and switches on neither.
+       */
+      readonly exitName: "paused" | "disabled";
       /** Seconds. Absent from every operator answer: a door supplies its own default. */
       readonly retryAfter?: number;
     };
@@ -80,6 +85,7 @@ export function composeIntake(
     reasons,
     notice: recordNotice === undefined ? FIXED_NOTICE[code] : recordNotice,
     code,
+    exitName: code,
   };
 }
 

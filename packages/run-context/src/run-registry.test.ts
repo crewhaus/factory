@@ -7,9 +7,11 @@ import { describe, expect, test } from "bun:test";
 import {
   RUN_REGISTRY_CAP,
   type RunHoldOutcome,
+  activeRunCount,
   cancelRun,
   createRunContext,
   isCancelReason,
+  isRunHeld,
   onRunIdle,
   retainRun,
 } from "./index";
@@ -170,5 +172,39 @@ describe("holds", () => {
     releaseA({ outcome: "failed", error: new Error("late") });
     releaseB();
     expect(ended).toEqual({ outcome: "succeeded" });
+  });
+});
+
+describe("activeRunCount and isRunHeld", () => {
+  test("a run counts while it holds a hold, once however many it holds, and not after the last release", () => {
+    const base = activeRunCount();
+    const ctx = createRunContext();
+    expect(isRunHeld(ctx.runId)).toBe(false);
+    expect(activeRunCount()).toBe(base);
+    const first = retainRun(ctx);
+    const second = retainRun(ctx);
+    expect(isRunHeld(ctx.runId)).toBe(true);
+    expect(activeRunCount()).toBe(base + 1);
+    first();
+    expect(isRunHeld(ctx.runId)).toBe(true);
+    expect(activeRunCount()).toBe(base + 1);
+    second();
+    expect(isRunHeld(ctx.runId)).toBe(false);
+    expect(activeRunCount()).toBe(base);
+  });
+
+  test("an entry made only for a controller is not held, and an unknown run is not held", () => {
+    const ctx = createRunContext();
+    expect(cancelRun(ctx.runId)).toBe(true);
+    expect(isRunHeld(ctx.runId)).toBe(false);
+    expect(isRunHeld("run_00000000000000000000000000")).toBe(false);
+  });
+
+  test("two held runs count two", () => {
+    const base = activeRunCount();
+    const releases = [retainRun(createRunContext()), retainRun(createRunContext())];
+    expect(activeRunCount()).toBe(base + 2);
+    for (const release of releases) release();
+    expect(activeRunCount()).toBe(base);
   });
 });

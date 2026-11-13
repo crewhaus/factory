@@ -109,6 +109,8 @@ describe("standard error codes are wire-stable", () => {
     expect(ErrorCode.BudgetExceeded).toBe("budget_exceeded");
     expect(ErrorCode.InternalError).toBe("internal_error");
     expect(ErrorCode.InputBlocked).toBe("input_blocked");
+    expect(ErrorCode.Paused).toBe("paused");
+    expect(ErrorCode.Disabled).toBe("disabled");
   });
 });
 

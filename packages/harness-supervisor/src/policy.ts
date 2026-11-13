@@ -9,8 +9,11 @@
  * | 20 spec, 21 config/env | terminal | never auto-restart — restarting cannot fix a spec or a missing key |
  * | 30 auth, 31 billing | terminal | never auto-restart — the recovery engine already marks these halt; billing renders the add-credits remediation verbatim |
  * | 33 crewhaus budget | terminal | never auto-restart — a restart RESETS the in-memory budget ledger and re-arms the spend the cap just stopped |
+ * | 34 timeout | terminal | never auto-restart — the configured time limit ended the run, and a restart meets the same limit |
+ * | 35 evaluation, 37 provability | terminal | never auto-restart — the spec's own quality or evidence floor stopped the run, and a restart does not move the floor |
+ * | 38 disabled | terminal | never auto-restart — the operator disabled the harness, and only the operator lifts it |
  * | 36 approval_pending | parked | not a failure: the run is waiting on a human. Daemons re-drive on grant; cli shapes chain a resume |
- * | everything else (32 rate-limit, 40 tool/MCP, signals, unclassified) | crash | exponential backoff 500 ms → 30 s, max 5 restarts per rolling 10-minute window, then `crash-looping` (manual start only) |
+ * | everything else (32 rate-limit, 39 paused, 40 tool/MCP, signals, unclassified) | crash | exponential backoff 500 ms → 30 s, max 5 restarts per rolling 10-minute window, then `crash-looping` (manual start only) |
  *
  * The window is ROLLING, not a lifetime counter: a daemon that crashed
  * twice yesterday and once today is not crash-looping, and one that dies
@@ -27,6 +30,10 @@ export const TERMINAL_EXIT_CODES: readonly number[] = [
   EXIT_CODES.auth, // 30 — the provider rejected the credential
   EXIT_CODES.billing, // 31 — the account is out of funding
   EXIT_CODES.crewhaus_budget, // 33 — a restart re-arms the spend the cap stopped
+  EXIT_CODES.timeout, // 34 — the configured time limit stopped it; a restart meets the same limit
+  EXIT_CODES.evaluation, // 35 — the spec's quality floor stopped the answer
+  EXIT_CODES.provability, // 37 — the spec's evidence floor stopped the answer
+  EXIT_CODES.disabled, // 38 — the operator disabled the harness; only the operator lifts it
 ];
 
 /** The exit that means "waiting for a human", not "broken". */

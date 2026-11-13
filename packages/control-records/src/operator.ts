@@ -107,6 +107,14 @@ function readOperatorNow(harnessDir: string): OperatorRead {
 }
 
 /**
+ * A reader over `operator.json`, called as a function. `refresh(harnessDir)` reads the
+ * file now and keeps that answer, so the next call answers it whatever the clock says.
+ */
+export type OperatorReader = ((harnessDir: string) => OperatorRead) & {
+  readonly refresh: (harnessDir: string) => OperatorRead;
+};
+
+/**
  * A reader over `operator.json`: synchronous, no lock, creates nothing, consults no
  * environment variable, and caches for one second per path by the injected clock.
  *
@@ -114,7 +122,7 @@ function readOperatorNow(harnessDir: string): OperatorRead {
  */
 export function createOperatorReader(
   options: { readonly now?: () => number } = {},
-): (harnessDir: string) => OperatorRead {
+): OperatorReader {
   return cachedPerPath(readOperatorNow, options.now ?? (() => Date.now()));
 }
 
@@ -123,7 +131,18 @@ export function createOperatorReader(
  *
  * First consumer: the supervisor's start gate.
  */
-export const readOperatorRecord: (harnessDir: string) => OperatorRead = createOperatorReader();
+export const readOperatorRecord: OperatorReader = createOperatorReader();
+
+/**
+ * Read `operator.json` now through the default reader and keep that answer: every
+ * door that reads through the default reader, `intakeVerdict` included, answers from
+ * it at once, whatever the clock says.
+ *
+ * First consumer: the control plane's `POST /control/v1/operator/reload`.
+ */
+export function refreshOperatorRecord(harnessDir: string): OperatorRead {
+  return readOperatorRecord.refresh(harnessDir);
+}
 
 export type OperatorVerdict = {
   readonly intake: "open" | "paused" | "disabled";

@@ -39,7 +39,7 @@
  * a later list. A new kind of default-on change adds a check here and a bullet
  * in the `## [Unreleased]` list.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -68,8 +68,13 @@ import {
   EXIT_FOR_ERROR,
   EXIT_FOR_REJECTED_RECEIPT,
 } from "../packages/control-contract/src/index";
-import { foldStates } from "../packages/control-records/src/index";
-import { casAppend, standingRulesLedger } from "../packages/control-records/src/index";
+import {
+  casAppend,
+  foldStates,
+  intakeRoot,
+  standingRulesLedger,
+  unregisterIntakeRoot,
+} from "../packages/control-records/src/index";
 import {
   ROOT_BUNDLE_UNRECORDED_MESSAGE,
   admitExplicitStart,
@@ -87,10 +92,17 @@ import {
   FEDERATION_VERSION,
   encodeFederationEnvelope,
 } from "../packages/federation-protocol/src/index";
-import { countPendingApprovals } from "../packages/gateway-protocol/src/control";
+import {
+  CONTROL_ROUTES,
+  type ControlAuditRecord,
+  type ControlPlane,
+  countPendingApprovals,
+  createControlPlane,
+} from "../packages/gateway-protocol/src/control";
 import {
   FEDERATION_MAX_BODY_BYTES,
   createGatewayServer,
+  signJwt,
 } from "../packages/gateway-server/src/index";
 import { groupPlan } from "../packages/hangar-server/src/group-ops";
 import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
@@ -98,6 +110,7 @@ import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import {
   BUILD_NOT_ACTIVE_MESSAGE,
   LOADER_ENV_KEYS,
+  TERMINAL_EXIT_CODES,
   buildSpawnEnv,
   buildSpawnPlan,
   createHarnessSupervisor,
@@ -2978,6 +2991,190 @@ describe("the release notes name what guarded spec writes change for every harne
     const bullet = bulletFor("only when it resolves inside the harness");
     expect(bullet).toContain("`node_modules/.bin/crewhaus`");
     expect(bullet).toContain("`crewhaus` on `PATH`");
+  });
+});
+
+describe("the release notes name the operator controls every daemon honours", () => {
+  const read = (rel: string): string => readFileSync(join(ROOT, rel), "utf8");
+  const count = (text: string, needle: string): number => text.split(needle).length - 1;
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+  /** One top-level function of `source`, up to the next top-level declaration. */
+  const functionBody = (source: string, signature: string): string => {
+    const start = source.indexOf(signature);
+    expect({ signature, found: start > -1 }).toEqual({ signature, found: true });
+    const rest = source.slice(start + signature.length);
+    const next = rest.search(/\n(?:export )?(?:async )?function /);
+    return next === -1 ? rest : rest.slice(0, next);
+  };
+
+  const planes: ControlPlane[] = [];
+  const dirs: string[] = [];
+  afterEach(async () => {
+    for (const plane of planes.splice(0)) await plane.stop();
+    const root = intakeRoot();
+    if (root !== undefined) unregisterIntakeRoot(root);
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+  const tempHarness = (operator?: Record<string, unknown>): string => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-operator-")));
+    dirs.push(dir);
+    if (operator !== undefined) {
+      mkdirSync(join(dir, ".crewhaus", "run", "control"), { recursive: true });
+      writeFileSync(
+        join(dir, ".crewhaus", "run", "control", "operator.json"),
+        `${JSON.stringify({ v: 1, rev: 1, desired: "running", ...operator })}\n`,
+      );
+    }
+    return dir;
+  };
+  const token = ["default", "on", "control"].join("-");
+  const plane = (cwd: string, over: Partial<Parameters<typeof createControlPlane>[0]> = {}) => {
+    const audits: ControlAuditRecord[] = [];
+    const built = createControlPlane({
+      name: "probe",
+      target: "channel",
+      cwd,
+      env: { CREWHAUS_CONTROL_TOKEN: token },
+      audit: (record) => {
+        audits.push(record);
+      },
+      exit: () => undefined,
+      stdout: () => undefined,
+      stderr: () => undefined,
+      timers: { setInterval: () => 1, clearInterval: () => undefined },
+      ...over,
+    });
+    planes.push(built);
+    return { plane: built, audits };
+  };
+  const call = (target: ControlPlane, method: string, path: string): Promise<Response> =>
+    target.fetch(
+      new Request(`http://127.0.0.1:1${path}`, {
+        method,
+        headers: { authorization: `Bearer ${token}` },
+      }),
+    );
+
+  test("control.v1 cancels, reloads and claims, reads go unaudited, a heartbeat is written, and a wide bind needs a token", async () => {
+    const routes = CONTROL_ROUTES.map((r) => `${r.method} ${r.route}`);
+    for (const route of [
+      "POST /control/v1/runs/{runId}/cancel",
+      "POST /control/v1/operator/reload",
+      "POST /control/v1/runs/claim",
+    ]) {
+      expect(routes).toContain(route);
+    }
+    const dir = tempHarness();
+    const { plane: served, audits } = plane(dir);
+    expect((await call(served, "GET", "/control/v1/healthz")).status).toBe(200);
+    expect((await call(served, "GET", "/control/v1/status")).status).toBe(200);
+    expect(audits).toHaveLength(0);
+    expect((await call(served, "POST", "/control/v1/operator/reload")).status).toBe(200);
+    expect(audits).toHaveLength(1);
+
+    expect(await served.start()).toBeUndefined();
+    expect(existsSync(join(dir, ".crewhaus", "run", "control-heartbeat.json"))).toBe(true);
+
+    const wide = plane(tempHarness(), {
+      env: { CREWHAUS_CONTROL_PORT: "0", CREWHAUS_CONTROL_BIND: "0.0.0.0" },
+    });
+    expect(await wide.plane.start()).toBeUndefined();
+
+    const bullet = bulletFor("/control/v1/operator/reload");
+    expect(bullet).toContain("control-heartbeat.json");
+    expect(bullet).toContain("`CREWHAUS_CONTROL_TOKEN`");
+  });
+
+  test("every door that admits work asks the operator record, and the exits are named", async () => {
+    const gateway = read("packages/gateway-server/src/index.ts");
+    const envelopeStart = gateway.indexOf("async function handleEnvelope(");
+    const envelopeEnd = gateway.indexOf("async function handleSubscribe(");
+    expect(envelopeStart).toBeGreaterThan(-1);
+    expect(envelopeEnd).toBeGreaterThan(envelopeStart);
+    const envelope = gateway.slice(envelopeStart, envelopeEnd);
+    const admitted = envelope.indexOf("intakeVerdict(");
+    const slo = envelope.indexOf("opts.intakeGate");
+    expect(admitted).toBeGreaterThan(-1);
+    expect(slo).toBeGreaterThan(-1);
+    expect(admitted).toBeLessThan(slo);
+
+    const consumer = functionBody(
+      read("packages/queue-consumer/src/index.ts"),
+      "export function startConsumer<",
+    );
+    expect(count(consumer, "intakeVerdict(")).toBeGreaterThan(0);
+    const admission = functionBody(
+      read("packages/runtime-core/src/admission.ts"),
+      "export function admitLoop(",
+    );
+    expect(count(admission, "intakeVerdict(")).toBeGreaterThan(0);
+    expect(count(read("packages/runtime-core/src/index.ts"), "admitLoop(opts,")).toBe(1);
+
+    // The loop's decision: a paused managed loop fails with exit 39.
+    const { loopAdmission } = await import("../packages/runtime-core/src/admission");
+    const refused = loopAdmission({
+      served: true,
+      continuing: false,
+      verdict: () => ({
+        state: "closed",
+        reasons: [{ kind: "operator", state: "paused" }],
+        notice: null,
+        code: "paused",
+        exitName: "paused",
+      }),
+      grantWaiting: () => false,
+      sessionTarget: "managed",
+    });
+    expect("report" in refused && refused.report.exitCode).toBe(39);
+
+    // Lanes, by a probe: a paused record runs a tick's body 0 times.
+    const paused = tempHarness({ intake: { paused: true } });
+    let ran = 0;
+    const lane = plane(paused).plane.lane({
+      lane: "heartbeat",
+      cadence: "every 1000ms",
+      run: async () => {
+        ran += 1;
+      },
+    });
+    await lane.tick();
+    expect(ran).toBe(0);
+
+    // The managed API, by a probe: a paused record answers runs.create with paused.
+    const { buildTenant } = await import("../packages/tenancy/src/index");
+    const tenants = tempHarness();
+    const secret = ["default", "on", "operator"].join("-");
+    let handled = 0;
+    const server = createGatewayServer({
+      jwtSecret: secret,
+      tenantsRoot: tenants,
+      harnessDir: paused,
+      tenantOverrides: { probe: buildTenant("probe", { tenantsRoot: tenants }) },
+      handler: async () => {
+        handled += 1;
+        return { ok: true };
+      },
+    });
+    const answer = (await server.handle({
+      bearer: signJwt({ tenant_id: "probe" }, secret),
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "hi" },
+      },
+    })) as { error?: { code?: string } };
+    expect(answer.error?.code).toBe("paused");
+    expect(handled).toBe(0);
+
+    expect(EXIT_CODES.disabled).toBe(38);
+    expect(EXIT_CODES.paused).toBe(39);
+    for (const code of [34, 35, 37, 38]) expect(TERMINAL_EXIT_CODES).toContain(code);
+    expect(TERMINAL_EXIT_CODES).not.toContain(39);
+
+    const bullet = bulletFor("`.crewhaus/run/control/operator.json`");
+    for (const word of ["exits 38", "34", "35", "37"]) expect(bullet).toContain(word);
   });
 });
 

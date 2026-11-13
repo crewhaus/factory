@@ -17,6 +17,10 @@
  * drives several loops ends the run however it ended itself, not however its
  * last loop did.
  *
+ * {@link activeRunCount} counts the runs that hold at least one hold, and
+ * {@link isRunHeld} says whether one run does: an entry made only for a
+ * controller, by `createRunContext`, is not held.
+ *
  * One map, kept on `globalThis` under `Symbol.for("@crewhaus/run-context/runs")`
  * so two copies of this package in one process share it, capped at
  * {@link RUN_REGISTRY_CAP} entries. Entries leave by that cap, never by time:
@@ -159,4 +163,30 @@ export function onRunIdle(runId: string, fn: (ended: RunHoldOutcome | undefined)
   if (entry === undefined) return false;
   entry.idle = fn;
   return true;
+}
+
+/**
+ * How many runs in this process hold at least one hold: the runs it is running.
+ * A run that never took a hold is not counted.
+ *
+ * First consumer: the control plane's `/status` and heartbeat.
+ */
+export function activeRunCount(): number {
+  let count = 0;
+  for (const entry of registry().values()) {
+    if (entry.holds > 0) count += 1;
+  }
+  return count;
+}
+
+/**
+ * Whether `runId` holds at least one hold in this process: the run is still going.
+ * A hold says nothing about admission: a crew or a graph holds its run before its
+ * first loop is admitted.
+ *
+ * First consumer: the runtime's admission at loop start, which continues a later loop
+ * only on a run it admitted itself and that is still held.
+ */
+export function isRunHeld(runId: string): boolean {
+  return (registry().get(runId)?.holds ?? 0) > 0;
 }

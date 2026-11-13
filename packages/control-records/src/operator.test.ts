@@ -1,7 +1,14 @@
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { rmSync, writeFileSync } from "node:fs";
+import { intakeVerdict } from "./intake";
 import { _setIoTapForTest } from "./io";
-import { type OperatorRead, createOperatorReader, operatorVerdict } from "./operator";
+import {
+  type OperatorRead,
+  createOperatorReader,
+  operatorVerdict,
+  readOperatorRecord,
+  refreshOperatorRecord,
+} from "./operator";
 import {
   UNREADABLE_OPERATOR,
   controlFile,
@@ -249,5 +256,57 @@ describe("operatorVerdict", () => {
     const disabled = { intake: "disabled", start: "refused", unreadable: false };
     expect(operatorVerdict(present({ deployment: DISABLED }))).toEqual(disabled);
     expect(operatorVerdict(present({ intake: PAUSED, deployment: DISABLED }))).toEqual(disabled);
+  });
+});
+
+describe("a refresh answers the file as it is now, whatever the clock", () => {
+  const revOf = (read: OperatorRead): number | undefined =>
+    read.state === "present" ? read.record.rev : undefined;
+
+  test("the default reader keeps its answer until refreshOperatorRecord, and intakeVerdict follows at once", () => {
+    const frozen = spyOn(Date, "now").mockReturnValue(7_000_000);
+    try {
+      const root = harnessWith(jsonLine({ ...BASE, rev: 1 }));
+      expect(revOf(readOperatorRecord(root))).toBe(1);
+      expect(intakeVerdict(root).state).toBe("open");
+
+      writeFileSync(
+        controlFile(root, "operator.json"),
+        jsonLine({ ...BASE, rev: 2, intake: PAUSED }),
+      );
+      // The same instant: the cache still answers the first read.
+      expect(revOf(readOperatorRecord(root))).toBe(1);
+      expect(intakeVerdict(root).state).toBe("open");
+
+      expect(revOf(refreshOperatorRecord(root))).toBe(2);
+      expect(revOf(readOperatorRecord(root))).toBe(2);
+      expect(intakeVerdict(root)).toMatchObject({ state: "closed", code: "paused" });
+    } finally {
+      frozen.mockRestore();
+    }
+  });
+
+  test("a reader made with its own clock refreshes the same way, and only its own path", () => {
+    const root = harnessWith(jsonLine({ ...BASE, rev: 1 }));
+    const other = harnessWith(jsonLine({ ...BASE, rev: 5 }));
+    const read = createOperatorReader({ now: () => 0 });
+    expect(revOf(read(root))).toBe(1);
+    expect(revOf(read(other))).toBe(5);
+    writeFileSync(controlFile(root, "operator.json"), jsonLine({ ...BASE, rev: 2 }));
+    writeFileSync(controlFile(other, "operator.json"), jsonLine({ ...BASE, rev: 6 }));
+    expect(revOf(read(root))).toBe(1);
+    expect(revOf(read.refresh(root))).toBe(2);
+    expect(revOf(read(root))).toBe(2);
+    expect(revOf(read(other))).toBe(5);
+    expect(intakeVerdict(root, { read }).state).toBe("open");
+  });
+
+  test("a refresh of a removed record answers absent", () => {
+    const root = harnessWith(jsonLine({ ...BASE, rev: 1 }));
+    const read = createOperatorReader({ now: () => 0 });
+    expect(read(root).state).toBe("present");
+    rmSync(controlFile(root, "operator.json"));
+    expect(read.refresh(root)).toEqual({ state: "absent" });
+    expect(read(root)).toEqual({ state: "absent" });
   });
 });

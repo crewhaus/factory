@@ -98,6 +98,9 @@ const GATE_RECORDS: readonly string[] = [
   join(".crewhaus", "scope-audit", "baseline.json"),
   // The rule corpus `crewhaus security corpus` writes: exactly that file.
   join(".crewhaus", "security-corpus", "corpus.json"),
+  // The SLO intake gate the monitor flips: exactly that file. The operator record is a
+  // separate file under `.crewhaus/run`.
+  join(".crewhaus", "slo", "intake.json"),
 ];
 
 /** Where the durable-execution idempotency store keeps its records by default. */

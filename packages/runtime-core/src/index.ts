@@ -207,6 +207,7 @@ import {
   transition,
 } from "@crewhaus/turn-state-machine";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import { admitLoop } from "./admission";
 import {
   type StreamRenderer,
   createCliMarkdownRenderer,
@@ -3908,8 +3909,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   ) {
     return credentialFloorScope.run(true, () => runChatLoop(opts));
   }
-  // Each invocation records how it ended for its run's rows (`./run-ledger`).
-  if (!hasRunRows(opts)) return withRunRows(opts, () => runChatLoop(opts));
+  // Each invocation records how it ended for its run's rows (`./run-ledger`), once
+  // the operator record admits it (`./admission`).
+  if (!hasRunRows(opts)) {
+    const admitted = admitLoop(opts, () => resolveSessionRootDir(opts.sessionRootDir));
+    if (!admitted.admit) return admitted.reply;
+    return withRunRows(opts, () => runChatLoop(opts));
+  }
   // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
   // any plugin-contributed tools so the tool-capable-model feature gate and the
   // per-turn advertisement below read the same list.
