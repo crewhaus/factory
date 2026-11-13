@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/people",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "People profiles, kept outside every harness: an encrypted vault with keys in the OS credential store, sealed records that bind their profile and revision, and crypto-shred on erasure (module brief 328).",
   "main": "src/index.ts",

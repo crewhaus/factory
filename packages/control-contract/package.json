@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/control-contract",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "The one description of the control plane every surface shares: ids, state machines, permissions, envelopes and the crewhaus.hangar.v1 operation table, one module per area. The main entry imports nothing; zod lives in ./schemas.",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/control-service",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "The control plane's composition root: every change to a harness, from Home or the CLI, is a command whose receipt is written before anything answers. Receipts, idempotency claims, executors and reconcilers, recovery, and the job adapter.",
   "main": "src/index.ts",

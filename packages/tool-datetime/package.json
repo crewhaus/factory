@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-datetime",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "type": "module",
   "description": "Deterministic date and time tools: parsing, formatting, timezone conversion, business-day and duration arithmetic, recurrence expansion",
   "main": "src/index.ts",
