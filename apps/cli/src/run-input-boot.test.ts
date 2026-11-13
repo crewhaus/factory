@@ -133,6 +133,19 @@ describe("a compiled managed daemon classifies run input before the turn", () =>
   let daemon: ReturnType<typeof Bun.spawn> | undefined;
   let stderr = "";
   let base = "";
+  let cwd = "";
+
+  /** The run rows the daemon wrote under its working directory, oldest first. */
+  const runRows = (): Array<Record<string, unknown>> => {
+    const dir = join(cwd, ".crewhaus", "run", "control", "runs");
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir)
+      .filter((name) => name.endsWith(".jsonl"))
+      .sort()
+      .flatMap((name) => readFileSync(join(dir, name), "utf8").split("\n"))
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  };
 
   beforeAll(async () => {
     stub = startStubModel();
@@ -149,6 +162,7 @@ describe("a compiled managed daemon classifies run input before the turn", () =>
       ].join("\n"),
     );
     const sandbox = newTmp("crewhaus-run-input-cwd-");
+    cwd = sandbox;
     const proc = Bun.spawn([process.execPath, "--no-install", join(out, "daemon.ts")], {
       cwd: sandbox,
       env: {
@@ -230,6 +244,7 @@ describe("a compiled managed daemon classifies run input before the turn", () =>
 
   test("a malicious runs.create answers 422 input_blocked, and the model is never called", async () => {
     const before = stub.requests();
+    const rowsBefore = runRows().length;
     const res = await post("runs.create", { spec: "s", input: MALICIOUS });
     const text = await res.text();
     expect(res.status, stderr).toBe(422);
@@ -241,6 +256,14 @@ describe("a compiled managed daemon classifies run input before the turn", () =>
     expect(body.error?.data?.rules).toContain("ignore-previous");
     expect(text).not.toContain(CANARY);
     expect(stub.requests()).toBe(before);
+    // The refused run is recorded: running, then failed with input_blocked.
+    const rows = runRows().slice(rowsBefore);
+    expect(rows.map((row) => [row["state"], row["failureClass"]])).toEqual([
+      ["running", undefined],
+      ["failed", "input_blocked"],
+    ]);
+    expect(rows[0]?.["tenant"]).toBe("tenant-a");
+    expect(JSON.stringify(rows)).not.toContain(CANARY);
   }, 30_000);
 
   test("a clean runs.create runs its turn, with no warning on the run's trace", async () => {

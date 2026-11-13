@@ -632,6 +632,13 @@ describe("runFleetBulk", () => {
     expect(describeFleetExit(39)).toEqual({ class: "paused", title: "paused by its operator" });
   });
 
+  test("describeFleetExit titles a one-shot job refused at its seed", () => {
+    expect(describeFleetExit(41)).toEqual({
+      class: "input_blocked",
+      title: "input refused by the prompt-injection check",
+    });
+  });
+
   test("formatBulkReport renders the failure title + class rollup for coded exits (0.3.0 Goal 6)", async () => {
     seedHarness("support-bot", { spec: CLI_SPEC.replace("concierge", "support-bot") });
     seedHarness("concierge", { spec: CLI_SPEC });

@@ -173,9 +173,9 @@ export type FailureClass =
   | "disabled"
   /** Run input the prompt-injection check refused before any model call: a
    *  library classified the text where it entered the run (an API request, a
-   *  queue payload, a Worker's chat messages) and the verdict was malicious,
-   *  or the text was too long for the check to read. It has no exit code of
-   *  its own yet: a report of it carries `EXIT_CODES.generic`. */
+   *  queue payload, a Worker's chat messages, a one-shot job's seed) and the
+   *  verdict was malicious, or the text was too long for the check to read. A
+   *  one-shot job refused at its seed exits `EXIT_CODES.input_blocked` (41). */
   | "input_blocked"
   | "mcp_boot"
   | "context_overflow"
@@ -250,6 +250,9 @@ export const EXIT_CODES = {
   paused: 39,
   /** Tool or MCP failure (including MCP boot). */
   tool: 40,
+  /** 0.9.0 — the prompt-injection check refused a one-shot job's input at its
+   *  seed, before any model call. A retry meets the same verdict. */
+  input_blocked: 41,
   /** 0.9.0 control band (50-56): a refusal from the control plane, before or
    *  instead of the work. Not signed in, or the credential was refused. */
   not_signed_in: 50,

@@ -11,6 +11,7 @@ export {
   type RecordsAt,
   controlPaths,
   harnessLedger,
+  runsLedger,
 } from "./paths";
 export {
   type AppendAnswer,
@@ -62,7 +63,9 @@ export {
   keyedDigest,
   readDigestKey,
   LOCAL_ACTOR_LABEL,
+  RUN_SUBJECT_LABEL,
   storedLocalActor,
+  subjectRefOf,
 } from "./digest";
 export {
   type OperatorDeployment,
@@ -93,6 +96,7 @@ export {
   acquireMutatingLease,
   readMutatingLease,
   withMutatingLease,
+  defaultLeaseProbe,
   holderProvablyDead,
 } from "./lease";
 export { type RunnableMode, type RunnableVerdict, assertRunnable } from "./runnable";

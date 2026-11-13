@@ -1,5 +1,5 @@
 /**
- * A managed daemon's signing secret and the warning about where its tenants
+ * A managed daemon's signing secret and the boot check on where its tenants
  * root belongs, compiled and RUN. `index.test.ts` pins the emitted text; this
  * boots the emitted daemon the way an operator does (cwd = harness root, a
  * `node_modules/@crewhaus/*` link farm standing in for `bun install`) and asks
@@ -37,8 +37,8 @@ const REPO_ROOT = dirname(dirname(dirname(import.meta.dir)));
 const BANNER = /\[managed\] gateway listening on 127\.0\.0\.1:(\d+)/;
 const SAVED_LINE =
   "[managed] no CREWHAUS_GATEWAY_JWT_SECRET in env, so this run generated one and saved it to .crewhaus/run/gateway-jwt-secret.";
-const PLACEMENT_LINE =
-  "[managed] keep CREWHAUS_TENANTS_ROOT outside the harness directory, so tenant data stays apart from the harness's own files.";
+const REFUSAL =
+  "[managed] this spec declares a tool that works on files, so CREWHAUS_TENANTS_ROOT must be outside the harness directory";
 const ENV_SECRET = ["managed", "secret", "0".repeat(16)].join("-");
 
 const ir: IrManagedV0 = {
@@ -358,42 +358,39 @@ describe("where the tenants root belongs", () => {
   const withRead: IrManagedV0 = { ...ir, tools: ["read"] };
 
   test(
-    "with a path-taking tool: a relative root inside the harness gets the line",
+    "with a path-taking tool: a relative root inside the harness exits 21 with the refusal, and serves nothing",
     async () => {
-      const run = await boot(makeHarness(withRead), { CREWHAUS_TENANTS_ROOT: "live/tenants" });
-      try {
-        expect(run.exitCode).toBeUndefined();
-        expect(run.output()).toContain(PLACEMENT_LINE);
-      } finally {
-        await run.stop();
-      }
+      const root = makeHarness(withRead);
+      const run = await boot(root, { CREWHAUS_TENANTS_ROOT: "live/tenants" });
+      expect(run.exitCode).toBe(21);
+      expect(run.base).toBeUndefined();
+      expect(run.output()).toContain(REFUSAL);
+      // Refused before the secret: nothing was saved.
+      expect(existsSync(secretPath(root))).toBe(false);
     },
     TEST_TIMEOUT_MS,
   );
 
   test(
-    "with a file reader whose manifest row names no field: a root inside gets the line",
+    "with a file reader whose manifest row names no field: a root inside exits 21",
     async () => {
       const run = await boot(makeHarness({ ...ir, tools: ["readLines"] }), {
         CREWHAUS_TENANTS_ROOT: "live/tenants",
       });
-      try {
-        expect(run.exitCode).toBeUndefined();
-        expect(run.output()).toContain(PLACEMENT_LINE);
-      } finally {
-        await run.stop();
-      }
+      expect(run.exitCode).toBe(21);
+      expect(run.output()).toContain(REFUSAL);
     },
     TEST_TIMEOUT_MS,
   );
 
   test(
-    "with a path-taking tool: a root outside the harness does not",
+    "with a path-taking tool: a root outside the harness boots",
     async () => {
       const run = await boot(makeHarness(withRead));
       try {
         expect(run.exitCode).toBeUndefined();
-        expect(run.output()).not.toContain(PLACEMENT_LINE);
+        expect(run.base).toBeDefined();
+        expect(run.output()).not.toContain(REFUSAL);
       } finally {
         await run.stop();
       }
@@ -402,29 +399,29 @@ describe("where the tenants root belongs", () => {
   );
 
   test(
-    "with a path-taking tool: a root that lands inside through a symlink, and does not exist yet, gets the line",
+    "with a path-taking tool: a root that lands inside through a symlink, and does not exist yet, exits 21",
     async () => {
       const root = makeHarness(withRead);
       const link = join(scratch("crewhaus-managed-link-"), "harness");
       symlinkSync(root, link, "dir");
       const run = await boot(root, { CREWHAUS_TENANTS_ROOT: join(link, "not", "yet", "there") });
-      try {
-        expect(run.exitCode).toBeUndefined();
-        expect(run.output()).toContain(PLACEMENT_LINE);
-      } finally {
-        await run.stop();
-      }
+      expect(run.exitCode).toBe(21);
+      expect(run.output()).toContain(REFUSAL);
     },
     TEST_TIMEOUT_MS,
   );
 
   test(
-    "without one: a root inside the harness boots without the line",
+    "without one: a root inside the harness boots, and the daemon carries no check",
     async () => {
-      const run = await boot(makeHarness(ir), { CREWHAUS_TENANTS_ROOT: "live/tenants" });
+      const root = makeHarness(ir);
+      expect(readFileSync(join(root, "dist", "daemon.ts"), "utf8")).not.toContain(
+        "checkTenantsRoot",
+      );
+      const run = await boot(root, { CREWHAUS_TENANTS_ROOT: "live/tenants" });
       try {
         expect(run.exitCode).toBeUndefined();
-        expect(run.output()).not.toContain(PLACEMENT_LINE);
+        expect(run.output()).not.toContain(REFUSAL);
       } finally {
         await run.stop();
       }

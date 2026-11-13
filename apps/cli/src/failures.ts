@@ -330,7 +330,8 @@ export type TaxonomyProposal = {
  *  overflow `compact`. A human refines before adopting. `provability` (0.8.0,
  *  design §5.1 — exit 37) is a configured evidence floor beside `evaluation`:
  *  the spec's own `on_fail: halt` chose to stop the run, so a retry is not
- *  the draft's to suggest. */
+ *  the draft's to suggest. `input_blocked` fails too: a retry of the same
+ *  input meets the same verdict. */
 export function defaultRecoveryFor(cls: string): string {
   switch (cls) {
     case "timeout":
@@ -347,6 +348,8 @@ export function defaultRecoveryFor(cls: string): string {
     case "spec":
     case "config":
     case "mcp_boot":
+    // A retry meets the same prompt-injection verdict.
+    case "input_blocked":
       return "fail";
     default:
       return "retry";

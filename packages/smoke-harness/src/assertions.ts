@@ -248,15 +248,16 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
     expectedFiles: ["README.md", "agent.ts", "daemon.ts"],
     anchors: [
       { in: "daemon.ts", contains: "@crewhaus/gateway-server" },
-      { in: "daemon.ts", contains: "@crewhaus/policy-engine" },
       { in: "daemon.ts", contains: "@crewhaus/tenancy" },
       // Ops item 36 — boot-time self-heal janitor + pluggable budget store.
       { in: "daemon.ts", contains: "createJanitor" },
       { in: "daemon.ts", contains: "createBudgetStore" },
-      // 0.3.0 Goal 6 — classified failures render their report on stderr
-      // (the daemon rethrows to the gateway and keeps serving).
-      { in: "daemon.ts", contains: "formatRunFailure" },
-      { in: "daemon.ts", contains: "isRunFailedError" },
+      // The runs and the signing secret come from managed-runs, which records
+      // each run before its turn, checks policy, and renders a classified
+      // failure's report on stderr while the daemon keeps serving.
+      { in: "daemon.ts", contains: "@crewhaus/gateway-server/managed-runs" },
+      { in: "daemon.ts", contains: "createManagedRuns(" },
+      { in: "daemon.ts", contains: "resolveGatewaySecret(" },
     ],
   },
   {

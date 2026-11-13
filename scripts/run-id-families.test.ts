@@ -163,16 +163,41 @@ describe("mints the compiler emits", () => {
   const WORKFLOW_FIXTURE =
     "packages/compiler/src/__fixtures__/model-wiring/workflow-steps.agent.ts.txt";
 
-  test("a managed run is base36, or hex8 when every character happens to be hex", () => {
-    const plain = "const runId = `run_${Math.random().toString(36).slice(2, 10)}`;";
-    expectLine(MANAGED_FIXTURE, plain);
-    expectLine(
-      MANAGED_SOURCE,
-      "const runId = \\`run_\\${Math.random().toString(36).slice(2, 10)}\\`;",
-    );
-    const families = familyOf(expressionOf(plain));
-    expect(families.has("base36")).toBe(true);
-    expect([...families].filter((f) => f !== "base36" && f !== "hex8")).toEqual([]);
+  test("a managed run is canonical", async () => {
+    // The daemon delegates its runs to managed-runs, which mints with mintRunId.
+    expectLine("packages/gateway-server/src/managed-runs.ts", "const runId = mintRunId();");
+    for (const path of [MANAGED_FIXTURE, MANAGED_SOURCE]) {
+      expect(`${path}: ${read(path).includes("Math.random().toString(36)")}`).toBe(
+        `${path}: false`,
+      );
+    }
+    const { createManagedRuns } = await import("../packages/gateway-server/src/managed-runs");
+    const { buildTenant } = await import("../packages/tenancy/src/index");
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-run-id-managed-"));
+    try {
+      const runs = createManagedRuns({
+        harnessDir: dir,
+        tenantsRoot: dir,
+        env: { CREWHAUS_RUN_LEDGER: "0" },
+        getAuditLog: async () =>
+          ({ append: async () => undefined, read: async function* () {} }) as never,
+        recordUsage: async () => undefined,
+        executeTurn: async () => ({ reply: "done" }),
+      });
+      const tenant = buildTenant("tenant-a", { tenantsRoot: dir });
+      const ids: string[] = [];
+      for (let i = 0; i < 20; i++) {
+        const result = (await runs.handler({
+          method: "runs.create",
+          params: { spec: "s", input: "go" },
+          tenant,
+        })) as { runId: string };
+        ids.push(result.runId);
+      }
+      expect(new Set(ids.map((id) => classifyRunId(id).family))).toEqual(new Set(["canonical"]));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("a federated managed run", () => {

@@ -108,6 +108,28 @@ export async function keyedDigest(
 }
 
 /**
+ * The label of a run subject's digest. Stored digests join forever: a pin.
+ *
+ * First consumer: {@link subjectRefOf}.
+ */
+export const RUN_SUBJECT_LABEL = "run-subject";
+
+/**
+ * What a run row holds for the subject a run serves (`app:<tenant>:<sub>`, a person
+ * named by a verified token): `keyedDigest(key, RUN_SUBJECT_LABEL, [subject])` under the
+ * harness's subject key (`controlPaths(root).subjectKeyFile`, created `0600` by the first
+ * writer that needs it). A run row is append-only, so it never holds the subject itself.
+ * Rejects with the key's reason when the key cannot be read or made.
+ *
+ * First consumers: runtime-core's run rows and the managed daemon's run rows.
+ */
+export async function subjectRefOf(root: string, subject: string): Promise<string> {
+  const key = await ensureDigestKey(root, { file: controlPaths(root).subjectKeyFile });
+  if (key.state !== "present") throw new Error(key.reason);
+  return keyedDigest(key.hmac, RUN_SUBJECT_LABEL, [subject]);
+}
+
+/**
  * The label of an unlinked local actor's digest. Stored digests join forever: a pin.
  *
  * First consumers: the command receipts, through `storedLocalActor`, and the decision log.

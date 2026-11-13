@@ -249,6 +249,7 @@ export const run = z
     sessionAt: count.optional(),
     cause: runCause.optional(),
     by: storedActor.optional(),
+    tenant: z.string().min(1).optional(),
   })
   .passthrough();
 

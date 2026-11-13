@@ -46,12 +46,15 @@ describe("emitManaged", () => {
     expect(bundle.files.map((f) => f.path).sort()).toEqual(["agent.ts", "daemon.ts"]);
   });
 
-  test("daemon.ts wires gateway-server with JWT secret env check", () => {
+  test("daemon.ts wires gateway-server with the signing secret managed-runs resolves", () => {
     const bundle = emitManaged(ir);
-    const daemon = bundle.files.find((f) => f.path === "daemon.ts");
-    expect(daemon?.content).toContain("CREWHAUS_GATEWAY_JWT_SECRET");
-    expect(daemon?.content).toContain("createGatewayServer");
-    expect(daemon?.content).toContain("Refusing to start");
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain("CREWHAUS_GATEWAY_JWT_SECRET");
+    expect(daemon).toContain("createGatewayServer");
+    expect(daemon).toContain(
+      "const JWT_SECRET = resolveGatewaySecret({ cwd: process.cwd(), env: process.env });",
+    );
+    expect(daemon).toContain("  jwtSecret: JWT_SECRET,");
   });
 
   test("daemon.ts emits per-tenant overrides for both tenants", () => {
@@ -307,24 +310,16 @@ describe("emitManaged — resume-path idempotency (loop contract 0.4, Batch F, I
   const daemonOf = (i: IrManagedV0): string =>
     emitManaged(i).files.find((f) => f.path === "daemon.ts")?.content ?? "";
 
-  test("runs.continue with a prior sessionId reseats history and dedupes via withIdempotency", () => {
+  test("runs.continue with a prior sessionId reseats history; managed-runs dedupes the resume", () => {
     const daemon = daemonOf(ir);
+    // The turn takes `isResume` from managed-runs, which keeps the resume cache.
     expect(daemon).toContain(
-      'import {\n  createInMemoryIdempotencyStore,\n  idempotencyKey,\n  withIdempotency,\n} from "@crewhaus/idempotency-keys";',
+      "  executeTurn: async ({ tenant, sessionId, input, isResume, runContext, log }) => ({",
     );
-    expect(daemon).toContain("const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<string>();");
-    expect(daemon).toContain(
-      'const isResume = method === "runs.continue" && p.sessionId !== undefined;',
-    );
-    // The resume path passes `resume` into runOneTurn's extraOptions…
     expect(daemon).toContain("...(isResume ? { resume: { sessionId } } : {}),");
-    // …and wraps execution in withIdempotency keyed on (tenant, session, input).
-    expect(daemon).toContain(
-      "const guarded = withIdempotency<undefined, string>(() => executeTurn(), {",
-    );
-    expect(daemon).toContain("idempotencyKey(`${tenant.id}:${sessionId}:${p.input}`, 0)");
-    // runs.create still runs a fresh turn (no idempotency wrap).
-    expect(daemon).toContain("reply = await executeTurn();");
+    expect(daemon).not.toContain("@crewhaus/idempotency-keys");
+    expect(daemon).not.toContain("RESUME_IDEM_STORE");
+    expect(daemon).not.toContain("withIdempotency");
   });
 
   test("the audit sinks + runContext still ride the resume-aware extraOptions", () => {
@@ -507,78 +502,12 @@ describe("emitManaged — G11 headless `ask` parks instead of collapsing to a de
   });
 });
 
-describe("emitManaged — the default session id honors session-store's id contract", () => {
-  const daemonOf = (i: IrManagedV0): string =>
-    emitManaged(i).files.find((f) => f.path === "daemon.ts")?.content ?? "";
-
-  // Verbatim from packages/session-store/src/index.ts (ID_REGEX). session-store
-  // is not a dependency of this package, so the contract is restated here; if it
-  // ever changes there, this test is the thing that has to move with it.
-  const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
-
-  const workDir = mkdtempSync(join(tmpdir(), "crewhaus-managed-sessid-"));
-  afterAll(() => rmSync(workDir, { recursive: true, force: true }));
-
-  /**
-   * `runs.create` mints a session id when the caller omits one. Lift that exact
-   * expression out of the emitted daemon and RUN it the way a compiled bundle
-   * runs it — write it to a file, execute it with the same Bun — rather than
-   * asserting on its spelling. The defect this guards against was a perfectly
-   * readable base36 expression that produced store-invalid ids ~99.99% of the
-   * time; only executing it catches that class.
-   */
-  function mintDefaultSessionIds(daemon: string, count: number): string[] {
-    const match = daemon.match(/\n\s*const sessionId = p\.sessionId \?\? (.+);\n/);
-    expect(match).not.toBeNull();
-    const expr = (match as RegExpMatchArray)[1];
-    const file = join(workDir, "mint.ts");
-    writeFileSync(
-      file,
-      [
-        'import { randomBytes } from "node:crypto";',
-        "const p: { sessionId?: string } = {};",
-        `for (let i = 0; i < ${count}; i += 1) {`,
-        `  const sessionId = p.sessionId ?? ${expr};`,
-        "  console.log(sessionId);",
-        "}",
-      ].join("\n"),
-    );
-    const proc = Bun.spawnSync([process.execPath, file], {
-      env: { PATH: process.env["PATH"] ?? "" },
-    });
-    if (proc.exitCode !== 0) {
-      throw new Error(`session-id snippet failed: ${proc.stderr.toString()}`);
-    }
-    return proc.stdout.toString().trim().split("\n");
-  }
-
-  test("every minted default id matches sess_<16 hex>", () => {
-    const ids = mintDefaultSessionIds(daemonOf(ir), 500);
-    expect(ids).toHaveLength(500);
-    const invalid = ids.filter((id) => !SESSION_ID_REGEX.test(id));
-    // Report a sample so a regression names the shape it produced.
-    expect({ count: invalid.length, sample: invalid.slice(0, 3) }).toEqual({
-      count: 0,
-      sample: [],
-    });
-  });
-
-  test("minted ids are distinct — one run must not land on another run's session", () => {
-    const ids = mintDefaultSessionIds(daemonOf(ir), 500);
-    expect(new Set(ids).size).toBe(500);
-  });
-
-  test("the mint uses crypto randomBytes, the same source session-store uses", () => {
-    const daemon = daemonOf(ir);
-    const importLine = 'import { randomBytes } from "node:crypto";';
-    expect(daemon).toContain(importLine);
-    expect(daemon).toContain(
-      'const sessionId = p.sessionId ?? `sess_${randomBytes(8).toString("hex")}`;',
-    );
-    // The import has to precede the use or the emitted daemon does not run.
-    expect(daemon.indexOf(importLine)).toBeLessThan(
-      daemon.indexOf("const sessionId = p.sessionId ??"),
-    );
+describe("emitManaged — the default session id", () => {
+  test("is minted by managed-runs, never by the emitted daemon", () => {
+    const daemon = emitManaged(ir).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain("createManagedRuns({");
+    expect(daemon).not.toContain("const sessionId = p.sessionId");
+    expect(daemon).not.toContain("p.input");
   });
 });
 
@@ -586,45 +515,42 @@ describe("emitManaged — a generated signing secret", () => {
   const daemonOf = (over: Partial<IrManagedV0> = {}): string =>
     emitManaged({ ...ir, ...over }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
 
-  test("goes to a 0600 file in the run directory, and the log names the path", () => {
+  test("is resolved once by managed-runs, before anything listens", () => {
     const daemon = daemonOf();
-    expect(daemon).toContain("`${process.cwd()}/.crewhaus/run/gateway-jwt-secret`");
-    expect(daemon).toContain(
-      'writeFileSync(secretFile, `${JWT_SECRET}\\n`, { mode: 0o600, flag: "wx" });',
+    const resolved = daemon.indexOf(
+      "resolveGatewaySecret({ cwd: process.cwd(), env: process.env })",
     );
-    expect(daemon).toContain("saved it to .crewhaus/run/gateway-jwt-secret");
+    expect(resolved).toBeGreaterThan(-1);
+    expect(daemon.indexOf("resolveGatewaySecret(", resolved + 1)).toBe(-1);
+    expect(resolved).toBeLessThan(daemon.indexOf("await gateway.listen(PORT, HOST);"));
+    expect(daemon).toContain(
+      'import { createManagedRuns, resolveGatewaySecret } from "@crewhaus/gateway-server/managed-runs";',
+    );
+    // The bootstrap itself is the library's: no file is written from here.
+    expect(daemon).not.toContain("writeFileSync");
     expect(daemon).not.toContain("export CREWHAUS_GATEWAY_JWT_SECRET=${");
   });
 
-  test("an existing entry is removed before the exclusive write, and the daemon does not read the value back", () => {
-    const daemon = daemonOf();
-    const removed = daemon.indexOf("rmSync(secretFile, { force: true });");
-    const written = daemon.indexOf("writeFileSync(secretFile,");
-    expect(removed).toBeGreaterThan(-1);
-    expect(written).toBeGreaterThan(removed);
-    expect(daemon).not.toContain("readFileSync(secretFile");
-  });
-
-  test("the run directory keeps a .gitignore, and an existing one stays", () => {
-    const daemon = daemonOf();
-    expect(daemon).toContain("const ignoreFile = `${dirname(secretFile)}/.gitignore`;");
-    expect(daemon).toContain('writeFileSync(ignoreFile, "*\\n", { flag: "wx" });');
-    expect(daemon).toContain("if (!lstatSync(ignoreFile).isFile()) {");
-  });
-
-  test("the feedback handler's import does not name mkdirSync a second time", () => {
-    const imports = daemonOf({ feedback: { modality: "binary" } })
-      .split("\n")
-      .filter((line) => line.startsWith("import ") && line.includes("mkdirSync"));
-    expect(imports).toEqual([
-      'import { lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";',
-    ]);
+  test("the module names each specifier once, a feedback block's fs names included", () => {
+    for (const over of [{}, { feedback: { modality: "binary" as const } }]) {
+      const specifiers = daemonOf(over)
+        .split("\n")
+        .map((line) => /^import .* from "([^"]+)";$/.exec(line)?.[1])
+        .filter(
+          (spec): spec is string => spec !== undefined && spec !== "@crewhaus/feedback-distill",
+        );
+      expect(specifiers.length).toBeGreaterThan(10);
+      expect(specifiers.filter((spec, i) => specifiers.indexOf(spec) !== i)).toEqual([]);
+    }
+    expect(daemonOf({ feedback: { modality: "binary" } })).toContain(
+      'import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";',
+    );
   });
 });
 
 describe("emitManaged — where the tenants root belongs", () => {
-  const LINE =
-    "[managed] keep CREWHAUS_TENANTS_ROOT outside the harness directory, so tenant data stays apart from the harness's own files.";
+  const CHECK =
+    "const __rootRefusal = checkTenantsRoot({ cwd: process.cwd(), tenantsRoot: TENANTS_ROOT });";
   const daemonOf = (over: Partial<IrManagedV0> = {}): string =>
     emitManaged({ ...ir, ...over }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
 
@@ -635,8 +561,17 @@ describe("emitManaged — where the tenants root belongs", () => {
     ["readLines", "declares no operative argument"],
     ["tailFile", "declares no operative argument"],
     ["sqlQuery", "declares no operative argument"],
-  ])("%s declared (%s): the boot line is emitted", (tool) => {
-    expect(daemonOf({ tools: [tool] })).toContain(LINE);
+  ])("%s declared (%s): the boot refuses a root inside the harness with exit 21", (tool) => {
+    const daemon = daemonOf({ tools: [tool] });
+    expect(daemon).toContain(CHECK);
+    expect(daemon).toContain(
+      "if (__rootRefusal !== undefined) {\n  console.error(__rootRefusal);\n  process.exit(21);\n}",
+    );
+    expect(daemon).toContain(
+      'import { checkTenantsRoot, createManagedRuns, resolveGatewaySecret } from "@crewhaus/gateway-server/managed-runs";',
+    );
+    // Before the secret is resolved, and before anything listens.
+    expect(daemon.indexOf(CHECK)).toBeLessThan(daemon.indexOf("const JWT_SECRET ="));
   });
 
   test.each([
@@ -646,12 +581,10 @@ describe("emitManaged — where the tenants root belongs", () => {
   ])("%s: not a byte of it", (_name, tools) => {
     const over = tools === undefined ? {} : { tools };
     const daemon = daemonOf(over);
-    expect(daemon).not.toContain(LINE);
-    expect(daemon).not.toContain("onDisk");
-    expect(daemon).toContain('import { dirname } from "node:path";');
-    expect(daemon).toContain(
-      'import { lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";',
-    );
+    expect(daemon).not.toContain("checkTenantsRoot");
+    expect(daemon).not.toContain("__rootRefusal");
+    expect(daemon).not.toContain("node:path");
+    expect(daemon).toContain('import { readFileSync } from "node:fs";');
   });
 });
 
@@ -736,9 +669,10 @@ describe("emitManaged — SLO wiring (ops item 37)", () => {
     expect(daemon).toContain("intakeGate: readIntakeGate");
     expect(daemon).toContain(".crewhaus/slo/intake.json");
     expect(daemon).toContain("function readIntakeGate");
-    expect(daemon).toContain(
-      'import { lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"',
-    );
+    expect(daemon).toContain('import { readFileSync } from "node:fs"');
+    // managed-runs claims no queued run while the gate is paused, either.
+    const runs = daemon.slice(daemon.indexOf("const managedRuns = createManagedRuns({"));
+    expect(runs).toContain("  intakeGate: readIntakeGate,");
   });
 
   test("agent.ts threads sloTargets into runChatLoop when the spec declares SLO (F4)", () => {
@@ -755,23 +689,20 @@ describe("emitManaged — SLO wiring (ops item 37)", () => {
 });
 
 describe("emitManaged — terminal-failure reporting (0.3.0 Goal 6)", () => {
-  test("daemon renders a classified report on stderr and rethrows — the daemon keeps serving", () => {
+  test("the daemon hands its turn to managed-runs, which reports a classified failure and keeps serving", () => {
     const daemon = emitManaged(ir).files.find((f) => f.path === "daemon.ts")?.content ?? "";
-    expect(daemon).toContain(
+    // The report and the rethrow are managed-runs': the daemon holds no catch of its own.
+    expect(daemon).not.toContain("isRunFailedError");
+    expect(daemon).not.toContain("process.exit(1)");
+    // A schedule wake renders a failed tick itself, so it keeps the import.
+    const scheduled =
+      emitManaged({
+        ...ir,
+        schedule: { kind: "interval", everyMs: 60_000 },
+      }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(scheduled).toContain(
       'import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";',
     );
-    // runOneTurn is wrapped: classified failures print the report…
-    expect(daemon).toContain("if (isRunFailedError(err)) {");
-    expect(daemon).toContain(
-      'process.stderr.write(`${formatRunFailure(err.report, { prefix: "[managed]" })}\\n`);',
-    );
-    // …then rethrow to the gateway (error response, not process death).
-    expect(daemon).toContain("throw err;");
-    const catchIdx = daemon.indexOf("if (isRunFailedError(err)) {");
-    const rethrowIdx = daemon.indexOf("throw err;", catchIdx);
-    expect(rethrowIdx).toBeGreaterThan(catchIdx);
-    // No process.exit rides in that catch block.
-    expect(daemon.slice(catchIdx, rethrowIdx)).not.toContain("process.exit");
   });
 });
 
@@ -1070,25 +1001,14 @@ describe("emitManaged — the in-loop gates (loop contract 0.4 G02; 0.8.0 §4.4 
       emitManaged({ ...ir, provability: PROVABILITY }).files.find((f) => f.path === "daemon.ts")
         ?.content ?? "";
     expect(daemon).toContain('import type { ProofBundle } from "@crewhaus/evaluation-service";');
-    // The resume cache keeps the bundle beside the reply, so a duplicate
-    // resume answers with both.
+    // Each run hands runOneTurn its own observer; the last bundle stands, and
+    // the turn hands managed-runs the reply and the bundle, which its resume
+    // cache keeps together.
+    expect(daemon).toContain("      onProofBundle: (bundle) => {\n        graded.proof = bundle;");
     expect(daemon).toContain(
-      "type ServedTurn = { readonly reply: string; readonly proof?: ProofBundle };",
+      "    return graded.proof !== undefined ? { reply, proof: graded.proof } : { reply };",
     );
-    expect(daemon).toContain("createInMemoryIdempotencyStore<ServedTurn>();");
-    expect(daemon).toContain("withIdempotency<undefined, ServedTurn>(() => executeTurn(), {");
-    // Each run hands runOneTurn its own observer; the last bundle stands.
-    expect(daemon).toContain(
-      "          onProofBundle: (bundle) => {\n            graded.proof = bundle;",
-    );
-    expect(daemon).toContain(
-      "return { runId, sessionId, tenantId: tenant.id, reply, ...(served.proof !== undefined ? { proof: served.proof } : {}) };",
-    );
-    // The usage accounting still reads the reply text — the answer alone.
-    expect(daemon).toContain("      const reply = served.reply;");
-    expect(daemon.indexOf("const reply = served.reply;")).toBeLessThan(
-      daemon.indexOf("const outputTokens = Math.ceil(reply.length / 4);"),
-    );
+    expect(daemon).not.toContain("ServedTurn");
   });
 
   test("provability: the daemon says at boot that bundles under the /tmp tenants root are neither backed up nor kept (§5.3, §15)", () => {
@@ -1125,9 +1045,7 @@ describe("emitManaged — the in-loop gates (loop contract 0.4 G02; 0.8.0 §4.4 
       continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "session" },
     }).files;
     const daemon = files.find((f) => f.path === "daemon.ts")?.content ?? "";
-    expect(daemon).toContain(
-      "          input: p.input, tenant,\n          onProofBundle: (bundle) => {",
-    );
+    expect(daemon).toContain("      input, tenant,\n      onProofBundle: (bundle) => {");
   });
 
   test("Bun.Transpiler parses the provability agent.ts and daemon.ts", () => {
@@ -1147,9 +1065,11 @@ describe("emitManaged — the in-loop gates (loop contract 0.4 G02; 0.8.0 §4.4 
     const daemon = files.find((f) => f.path === "daemon.ts")?.content ?? "";
     expect(agent).not.toContain("onProofBundle");
     expect(agent).not.toContain("observeProofBundles");
-    expect(daemon).not.toContain("ServedTurn");
-    expect(daemon).toContain("createInMemoryIdempotencyStore<string>();");
-    expect(daemon).toContain("      return { runId, sessionId, tenantId: tenant.id, reply };");
+    expect(daemon).not.toContain("graded");
+    expect(daemon).not.toContain("ProofBundle");
+    expect(daemon).toContain(
+      "  executeTurn: async ({ tenant, sessionId, input, isResume, runContext, log }) => ({\n    reply: await runOneTurn({",
+    );
   });
 
   test("provability with spec-listed builtins: they register first, the gate's replace a same-named one", () => {
@@ -1218,49 +1138,49 @@ describe("emitManaged — runs.subscribe per-run bus registry (contract item 3)"
   const daemonOf = (over: Partial<IrManagedV0> = {}): string =>
     emitManaged({ ...ir, ...over }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
 
-  test("daemon imports run-context and holds a tenant-fenced per-run bus registry", () => {
+  test("the per-run bus registry and the run handler are managed-runs', handed to the gateway", () => {
     const daemon = daemonOf();
-    expect(daemon).toContain(
-      'import { createRunContext, type RunContext } from "@crewhaus/run-context";',
-    );
-    expect(daemon).toContain(
-      'const RUN_BUSES = new Map<string, { tenantId: string; bus: RunContext["eventBus"] }>();',
-    );
-    expect(daemon).toContain("function registerRunBus(runId: string, tenantId: string,");
-    // Bounded so completed runs' buffers don't accumulate forever.
-    expect(daemon).toContain("RUN_BUSES.size > RUN_BUS_CAP");
+    expect(daemon).toContain('import { createRunContext } from "@crewhaus/run-context";');
+    expect(daemon).not.toContain("RUN_BUSES");
+    expect(daemon).not.toContain("registerRunBus");
+    expect(daemon).toContain("  resolveRunEvents: managedRuns.resolveRunEvents,");
+    expect(daemon).toContain("  handler: managedRuns.handler,");
+    expect(daemon.match(/createManagedRuns\(/g) ?? []).toHaveLength(1);
   });
 
-  test("resolveRunEvents fences by tenant and replays-then-live-streams the bus atomically", () => {
+  test("the daemon mints no run id: managed-runs mints a canonical one", () => {
     const daemon = daemonOf();
-    expect(daemon).toContain("resolveRunEvents: ({ runId, tenant }) => {");
-    // Tenant fence: unknown OR cross-tenant runId → undefined → 404.
-    expect(daemon).toContain(
-      "if (entry === undefined || entry.tenantId !== tenant.id) return undefined;",
-    );
-    // Atomic snapshot (ring buffer) + live subscribe (no gap between).
-    expect(daemon).toContain("const replay = bus.recent();");
-    expect(daemon).toContain("const close = bus.subscribe(listener);");
-    expect(daemon).toContain("return { replay, close };");
+    expect(daemon).not.toContain("Math.random().toString(36)");
+    expect(daemon).not.toContain("const runId =");
+    // The federated dispatch keeps its own child family.
+    expect(daemon).toContain('runId: `fedrun_${randomBytes(4).toString("hex")}`,');
   });
 
-  test("each run mints + registers its bus up front and returns that runId", () => {
+  test("the daemon serves no method of its own beyond the turn", () => {
     const daemon = daemonOf();
-    expect(daemon).toContain("const runId = `run_${Math.random().toString(36).slice(2, 10)}`;");
-    expect(daemon).toContain("const runContext = createRunContext({ runId, sessionId });");
-    expect(daemon).toContain("registerRunBus(runId, tenant.id, runContext.eventBus);");
-    // The response runId is the registered bus's runId (the id a client
-    // subscribes with) — not a second, throwaway id.
-    expect(daemon).toContain("return { runId, sessionId, tenantId: tenant.id, reply };");
-    expect(daemon).not.toContain(
-      "return { runId: `run_${Math.random().toString(36).slice(2, 10)}`,",
+    expect(daemon).not.toContain("return { ok: true, method }");
+    expect(daemon).not.toContain('method === "runs.cancel"');
+    expect(daemon).not.toContain('method === "audit.tail"');
+  });
+
+  test("the follower starts after the gateway listens and stops with the drain and both signals", () => {
+    const daemon = daemonOf();
+    const listen = daemon.indexOf("const handle = await gateway.listen(PORT, HOST);");
+    const start = daemon.indexOf("void managedRuns.start();");
+    expect(listen).toBeGreaterThan(-1);
+    expect(start).toBeGreaterThan(listen);
+    expect(daemon.indexOf("managedRuns.start(", start + "void managedRuns.start();".length)).toBe(
+      -1,
     );
-    // runId is minted BEFORE the run is registered and executed (match the
-    // CALL site, not the `function registerRunBus(runId…)` definition).
-    const callIdx = daemon.indexOf("registerRunBus(runId, tenant.id,");
-    expect(callIdx).toBeGreaterThan(-1);
-    expect(daemon.indexOf("const runId = ")).toBeLessThan(callIdx);
-    expect(callIdx).toBeLessThan(daemon.indexOf("await runOneTurn("));
+    const drain = daemon.indexOf("__control.onDrain(async () => {");
+    expect(daemon.indexOf("managedRuns.stop();", drain)).toBeGreaterThan(drain);
+    for (const signal of ["SIGTERM", "SIGINT"]) {
+      const handler = daemon.indexOf(`process.on("${signal}", async () => {`);
+      expect(handler).toBeGreaterThan(-1);
+      const body = daemon.slice(handler, daemon.indexOf("process.exit(0);", handler));
+      expect(body).toContain("  janitor.stop();\n  managedRuns.stop();");
+    }
+    expect(daemon.match(/managedRuns\.stop\(\);/g) ?? []).toHaveLength(3);
   });
 
   test("the run's trace context is threaded into runOneTurn via extraOptions", () => {
@@ -1550,7 +1470,10 @@ describe("emitManaged — NEW-inloop-coverage: gateway rating capture", () => {
 
   test("a feedback block wires the feedback.submit route into the gateway handler", () => {
     const daemon = daemonOf({ ...ir, feedback: { modality: "binary" } });
-    expect(daemon).toContain('if (method === "feedback.submit") {');
+    // managed-runs hands every method it does not own to otherMethods.
+    expect(daemon).toContain(
+      '  otherMethods: {\n    "feedback.submit": async ({ params, tenant }) => {',
+    );
     // Writes the STANDARD record to the sink distill/optimize already read.
     expect(daemon).toContain(".crewhaus/feedback");
     expect(daemon).toContain("mode: 0o600");
@@ -1704,15 +1627,18 @@ describe("emitManaged — crewhaus.control.v1", () => {
     expect(daemon()).not.toContain("__control.lane({");
   });
 
-  test("counters.turns is bumped by the gateway handler and the scheduled fan-out", () => {
+  test("counters.turns is bumped by the scheduled fan-out, and managed-runs counts each run's turn", () => {
     const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
-    expect(d.split("__control.counters.turns++;").length - 1).toBe(2);
+    expect(d.split("__control.counters.turns++;").length - 1).toBe(1);
+    const runs = d.slice(d.indexOf("const managedRuns = createManagedRuns({"));
+    expect(runs).toContain("  control: __control,");
   });
 
   test("drain stops intake, cancels the timer, closes the gateway, THEN sweeps", () => {
     const d = daemon({ ...ir, schedule: { kind: "interval", everyMs: 60_000 } });
     const step = d.slice(d.indexOf("__control.onDrain("), d.indexOf("await __control.start();"));
     expect(step).toContain("janitor.stop();");
+    expect(step).toContain("managedRuns.stop();");
     expect(step).toContain("clearInterval(__scheduleTimer);");
     expect(step).toContain("await handle.close();");
     // The janitor sweep is housekeeping the next boot repeats, so it runs LAST

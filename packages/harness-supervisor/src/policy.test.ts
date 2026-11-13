@@ -31,6 +31,13 @@ describe("classifyExit", () => {
     expect(c.restartable).toBe(false);
   });
 
+  test("exit 41 from a one-shot job is input_blocked, and never restarted", () => {
+    const c = classifyExit({ exitCode: 41, operatorStop: false, longRunning: false });
+    expect(c.failureClass).toBe("input_blocked");
+    expect(c.title).toBe("input refused by the prompt-injection check");
+    expect(c.restartable).toBe(false);
+  });
+
   test("exit 0 from a daemon is 'exited cleanly (unexpected)' and restartable", () => {
     const c = classifyExit({ exitCode: 0, operatorStop: false, longRunning: true });
     expect(c.unexpectedClean).toBe(true);
