@@ -22,7 +22,11 @@ export type Settlement = {
 export type ExecutorContext = {
   readonly receipt: CommandReceipt;
   readonly harnessDir: string;
-  readonly supervisor: HarnessSupervisor;
+  /**
+   * The supervisor the head lends for this harness. Absent only for a kind its area
+   * declares `unsupervised`: those act on records alone.
+   */
+  readonly supervisor?: HarnessSupervisor;
   /** The control.v1 drain call `supervisor.drain` takes. */
   readonly drainRequest: () => Promise<void>;
   readonly now: () => number;
@@ -69,6 +73,11 @@ export type AreaRuntime = {
   readonly area: string;
   readonly executors?: Readonly<Record<string, Executor>>;
   readonly reconcilers?: Readonly<Record<string, Reconciler>>;
+  /**
+   * Kinds whose executor reads and writes records only, never a daemon: they are
+   * dispatched without asking the head for a supervisor.
+   */
+  readonly unsupervised?: readonly string[];
   /** Checks every activation passes; the core's protected-environment gate runs first. */
   readonly activationGates?: readonly ActivationGate[];
 };

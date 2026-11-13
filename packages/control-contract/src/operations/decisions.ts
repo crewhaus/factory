@@ -45,8 +45,7 @@ export const DECISION_OPERATIONS = [
     idempotency: "accepted",
     request: "decisionSupersedeRequest",
     response: "decisionResolved",
-    cliTwin: null,
-    noTwinReason: "`crewhaus approvals` has no supersede command yet.",
+    cliTwin: TWINS.approvalsSupersede,
     qualifiers: ["maintainer-or-above"],
   },
 ] as const;

@@ -11,7 +11,12 @@
     { "path": "../deployment-controller" },
     { "path": "../harness-registry" },
     { "path": "../harness-supervisor" },
-    { "path": "../ir" }
+    { "path": "../ir" },
+    { "path": "../permission-engine" },
+    { "path": "../session-store" },
+    { "path": "../spec-patch" },
+    { "path": "../tool-executor" },
+    { "path": "../tool-registry-manifest" }
   ],
   "include": ["src/**/*"]
 }

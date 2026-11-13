@@ -225,6 +225,8 @@ export type SupersedeClaim = {
   readonly reason: SupersedeReason;
   /** When the fresh request was parked, so a repair parks it with the same time. */
   readonly parkedAt: string;
+  /** The member who superseded it, when a surface named one: a `prn_`, never text. */
+  readonly byPrincipal?: string;
 };
 
 /** What a consume claim records: when the grant was spent, and by which run. */
@@ -299,7 +301,13 @@ export function parseSupersedeClaim(
     return "its supersededBy is not an approval id";
   }
   if (typeof parkedAt !== "string") return "its parkedAt is not a string";
-  return { supersededBy, reason: reason as SupersedeReason, parkedAt };
+  const { byPrincipal } = record;
+  return {
+    supersededBy,
+    reason: reason as SupersedeReason,
+    parkedAt,
+    ...(isId("prn", byPrincipal) ? { byPrincipal: byPrincipal as string } : {}),
+  };
 }
 
 /** Whether a record's supersede withdrew it (its run was cancelled), rather than replaced it. */
