@@ -20,6 +20,7 @@ import {
   type MemoryWiringFragment,
   type WireMemoryDeps,
   createDreamJanitorStep,
+  foldWikiRecall,
   guidePlanToStore,
   memoryFragmentFromIr,
   runDreamBootCatchUp,
@@ -751,6 +752,128 @@ describe("fragment construction — memoryFragmentFromIr", () => {
   });
 });
 
+describe("structured recall items beside the lines", () => {
+  test("fact store: the lines equal the items' texts, each item naming its entry and score", async () => {
+    const { deps: d } = deps();
+    const wired = await wireMemory({ specName: "items-fact", memory: { autoRecall: true } }, d);
+    await wired.stores.memory?.remember("the deploy password lives in vault");
+    await wired.stores.memory?.remember("the deploy window is on Fridays");
+    const seam = wired.options.memory;
+    const lines = (await seam?.recall?.("deploy", 5)) ?? [];
+    const items = (await seam?.recallItems?.("deploy", 5)) ?? [];
+    expect(lines.length).toBe(2);
+    expect(items.map((i) => i.text)).toEqual(lines);
+    const hits = (await wired.stores.memory?.recall("deploy", 5)) ?? [];
+    expect(items.map((i) => i.ref)).toEqual(
+      hits.map((h) => ({ store: "fact", backend: "local", localId: h.entry.id })),
+    );
+    expect(items.map((i) => i.score)).toEqual(hits.map((h) => h.score));
+  });
+
+  test("local wiki fold: wiki items name the article's slug and version after the fact items", async () => {
+    const { deps: d, catalog } = deps();
+    const wired = await wireMemory(
+      {
+        specName: "items-wiki",
+        memory: { autoRecall: true, wiki: { enabled: true, autoRecall: true, recallK: 2 } },
+      },
+      d,
+    );
+    await wired.stores.memory?.remember("csv files use commas in the US");
+    const wikiWrite = catalog.registered.find((t) => t.name === "wiki_write");
+    for (const body of ["EU locales use semicolons.", "EU locales use semicolon-delimited CSV."]) {
+      await wikiWrite?.execute({ slug: "csv-delimiters", title: "CSV delimiters", body });
+    }
+    const seam = wired.options.memory;
+    const lines = (await seam?.recall?.("csv delimiters", 5)) ?? [];
+    const items = (await seam?.recallItems?.("csv delimiters", 5)) ?? [];
+    expect(items.map((i) => i.text)).toEqual(lines);
+    const wikiHit = (await wired.stores.wiki?.recall("csv delimiters", 2))?.[0];
+    expect(wikiHit).toBeDefined();
+    expect(items.map((i) => i.ref?.store)).toEqual(["fact", "wiki"]);
+    expect(items[1]?.ref).toEqual({
+      store: "wiki",
+      backend: "local",
+      localId: "csv-delimiters",
+      version: wikiHit?.ref.version as number,
+    });
+    expect(wikiHit?.ref.version).toBe(2);
+  });
+
+  test("foldWikiRecall combines items the way it combines lines, with no ref for a seam that has only lines", async () => {
+    const calls: string[] = [];
+    const base: MemorySeam = {
+      recall: async () => {
+        calls.push("base");
+        return ["base line"];
+      },
+    };
+    const wiki = {
+      recall: async () => {
+        calls.push("wiki-lines");
+        return ["[wiki:a] A — x"];
+      },
+      recallItems: async () => {
+        calls.push("wiki-items");
+        return [
+          {
+            text: "[wiki:a] A — x",
+            ref: { store: "wiki", backend: "local", localId: "a" },
+          } as const,
+        ];
+      },
+    };
+    const folded = foldWikiRecall(base, wiki, 3);
+    const lines = (await folded?.recall?.("q", 2)) ?? [];
+    const items = (await folded?.recallItems?.("q", 2)) ?? [];
+    expect(lines).toEqual(["base line", "[wiki:a] A — x"]);
+    expect(items).toEqual([
+      { text: "base line", ref: null },
+      { text: "[wiki:a] A — x", ref: { store: "wiki", backend: "local", localId: "a" } },
+    ]);
+    // Each fold queries each ranker once per call, through the structured seam.
+    expect(calls).toEqual(["base", "wiki-items", "base", "wiki-items"]);
+  });
+
+  test("session recall: an index record whose id is a session id is a session ref; another is none", async () => {
+    const { deps: d } = deps();
+    const indexDir = join(tmp, ".crewhaus", "sessions-index");
+    mkdirSync(indexDir, { recursive: true });
+    for (const sessionId of ["sess_0123456789abcdef", "sess-legacy"]) {
+      writeFileSync(
+        join(indexDir, `${sessionId}.json`),
+        `${JSON.stringify({
+          schemaVersion: 1,
+          sessionId,
+          turnCount: 1,
+          toolsUsed: [],
+          ratings: { positive: 0, negative: 0 },
+          outcome: `shipped the csv export (${sessionId})`,
+          keyFacts: [],
+          hadError: false,
+          summarizedAt: "2026-07-15T09:00:00.000Z",
+        })}\n`,
+      );
+    }
+    const wired = await wireMemory(
+      { specName: "items-sessions", memory: { autoRecall: false, sessionRecall: true } },
+      d,
+    );
+    const seam = wired.options.memory;
+    const lines = (await seam?.recall?.("csv export", 5)) ?? [];
+    const items = (await seam?.recallItems?.("csv export", 5)) ?? [];
+    expect(items.map((i) => i.text)).toEqual(lines);
+    expect(lines).toHaveLength(2);
+    const byText = (id: string) => items.find((i) => i.text.includes(`(${id})`))?.ref;
+    expect(byText("sess_0123456789abcdef")).toEqual({
+      store: "session",
+      backend: "local",
+      localId: "sess_0123456789abcdef",
+    });
+    expect(byText("sess-legacy")).toBeNull();
+  });
+});
+
 describe("runtime-core assignability pin", () => {
   test("wired.options spreads into RunChatLoopOptions (compile-time pin)", async () => {
     const { deps: d } = deps();
@@ -766,6 +889,10 @@ describe("runtime-core assignability pin", () => {
       ...wired.options,
     };
     const memorySeam: RunChatLoopOptions["memory"] = wired.options.memory as MemorySeam;
+    // The structured recall seam is runtime-core's option, item for item.
+    const recallItems: NonNullable<RunChatLoopOptions["memory"]>["recallItems"] =
+      wired.options.memory?.recallItems;
+    expect(recallItems).toBeDefined();
     const continuitySeam: RunChatLoopOptions["continuity"] = wired.options
       .continuity as ContinuitySeam;
     const handoffInput: HandoffInput = {

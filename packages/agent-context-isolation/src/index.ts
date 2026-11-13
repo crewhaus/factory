@@ -24,7 +24,7 @@
 import { randomBytes } from "node:crypto";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
 import type { FailureReport } from "@crewhaus/errors";
-import { type EventLog, openEventLog } from "@crewhaus/event-log";
+import { type EventLog, type RecalledItemRef, openEventLog } from "@crewhaus/event-log";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import type {
   IrCircuitBreaker,
@@ -246,6 +246,19 @@ export type SubAgentMemorySeam = {
   /** The parent's recall closure — recalled lines inject into the child's
    *  system prompt through the same seam as the parent loop. */
   readonly recall?: (query: string, k: number) => Promise<readonly string[]>;
+  /** The parent's structured recall: the same items `recall` returns, each
+   *  with the ref of the entry it came from, so the child's run records name
+   *  them. */
+  readonly recallItems?: (
+    query: string,
+    k: number,
+  ) => Promise<
+    readonly {
+      readonly text: string;
+      readonly ref: RecalledItemRef | null;
+      readonly score?: number;
+    }[]
+  >;
 };
 
 /**

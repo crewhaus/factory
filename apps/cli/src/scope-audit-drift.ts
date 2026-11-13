@@ -273,7 +273,12 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
   { name: "tool-mcp", path: "packages/tool-mcp/src/index.ts" },
   { name: "sub-agent-spawner", path: "packages/sub-agent-spawner/src/index.ts" },
   { name: "skills-registry", path: "packages/skills-registry/src/index.ts" },
-  { name: "compaction-autocompact", path: "packages/compaction-autocompact/src/index.ts" },
+  // A kept summary is classified and lineage-tagged into the run at "compaction".
+  {
+    name: "compaction-autocompact",
+    path: "packages/compaction-autocompact/src/index.ts",
+    requireTag: true,
+  },
   { name: "federation-router", path: "packages/federation-router/src/index.ts" },
   { name: "channel-adapter-base", path: "packages/channel-adapter-base/src/index.ts" },
   // 0.3.0 memory release: recalled wiki bodies re-enter the model context

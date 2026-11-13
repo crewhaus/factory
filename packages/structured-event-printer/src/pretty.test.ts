@@ -1073,6 +1073,22 @@ describe("formatBody — every kind + optional-field branches", () => {
       `${prefix("role_start")}role=writer activation=2 model=claude-sonnet-5`,
     );
   });
+
+  test("context_assembled prints one line of counts", () => {
+    const ev = {
+      ...envelope,
+      kind: "context_assembled",
+      blocks: 5,
+      recalled: { included: 3, redacted: 1, warned: 2 },
+      tools: { advertised: 4, inSpec: 6 },
+      messages: 7,
+    } satisfies TraceEvent;
+    const line = formatLine(ev);
+    expect(line).toBe(
+      `${prefix("context_assembled")}blocks=5 recalled=3 redacted=1 warned=2 tools=4/6 messages=7`,
+    );
+    expect(line.split("\n")).toHaveLength(1);
+  });
 });
 
 describe("formatJsonLine — JSON Lines", () => {

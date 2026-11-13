@@ -29,6 +29,7 @@ export {
   buildApprovalResolvedSpan,
   buildCircuitStateChangedSpan,
   buildCompactionSpan,
+  buildContextAssembledSpan,
   buildCostAccrualSpan,
   buildCoverageReportSpan,
   buildErrorRecoveredSpan,

@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TenancyError, buildTenant, withTenant } from "@crewhaus/tenancy";
-import { type Event, openEventLog } from "./index";
+import { type Event, RUN_REF_RE, openEventLog } from "./index";
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
@@ -380,6 +380,63 @@ describe("event-log — security invariants", () => {
       "../escape",
     ]) {
       await expect(openEventLog(bad, { rootDir })).rejects.toThrow(/invalid sessionId/);
+    }
+  });
+});
+
+describe("event-log — run-scoped handles", () => {
+  test("a run-scoped handle writes `run` last on every line; an unscoped one writes the four keys", async () => {
+    const rootDir = newTempRoot();
+    const scoped = await openEventLog(TEST_ID, {
+      rootDir,
+      now: () => 1_700_000_000_000,
+      run: "run_0123456789abcdefghjkmnpqrs",
+    });
+    await scoped.append({ kind: "user_message", payload: { content: "a" } });
+    await scoped.append({ kind: "run_stamp", payload: { v: 1 } });
+    const plain = await openEventLog(TEST_ID, { rootDir, now: () => 1_700_000_000_001 });
+    await plain.append({ kind: "user_message", payload: { content: "b" } });
+    const lines = readFileSync(join(rootDir, `${TEST_ID}.jsonl`), "utf8")
+      .trimEnd()
+      .split("\n");
+    expect(lines).toEqual([
+      JSON.stringify({
+        ts: 1_700_000_000_000,
+        version: 1,
+        kind: "user_message",
+        payload: { content: "a" },
+        run: "run_0123456789abcdefghjkmnpqrs",
+      }),
+      JSON.stringify({
+        ts: 1_700_000_000_000,
+        version: 1,
+        kind: "run_stamp",
+        payload: { v: 1 },
+        run: "run_0123456789abcdefghjkmnpqrs",
+      }),
+      JSON.stringify({
+        ts: 1_700_000_000_001,
+        version: 1,
+        kind: "user_message",
+        payload: { content: "b" },
+      }),
+    ]);
+    const read = await collect(plain.read());
+    expect(read.map((e) => e.run)).toEqual([
+      "run_0123456789abcdefghjkmnpqrs",
+      "run_0123456789abcdefghjkmnpqrs",
+      undefined,
+    ]);
+  });
+
+  test("a run that does not fit the grammar is refused at open", async () => {
+    const rootDir = newTempRoot();
+    for (const bad of ["", "a b", "run/../x", "x".repeat(129), "run\nnext", "<b>"]) {
+      expect(RUN_REF_RE.test(bad)).toBe(false);
+      await expect(openEventLog(TEST_ID, { rootDir, run: bad })).rejects.toThrow(/invalid run/);
+    }
+    for (const good of ["run_01", "a.b:c-d_e", "x".repeat(128)]) {
+      await expect(openEventLog(TEST_ID, { rootDir, run: good })).resolves.toBeDefined();
     }
   });
 });

@@ -219,6 +219,37 @@ describe("wireMemory with a live thredz connection", () => {
     expect(calls.some((c) => c.name === "wiki_recall" && c.args["limit"] === 3)).toBe(true);
   });
 
+  test("a Thredz wiki line's item names its slug when the slug fits a ref, and no ref otherwise", async () => {
+    const { client } = fakeClient({
+      wiki_recall: () => ({
+        content: JSON.stringify({
+          results: [
+            { slug: "eu-csv", title: "EU CSV", body: "semicolons" },
+            { slug: "has spaces and <b>markup</b>", title: "Odd", body: "x" },
+          ],
+        }),
+        isError: false,
+      }),
+    });
+    const { deps: d } = deps({ thredz: { client } });
+    const wired = await wireMemory(
+      {
+        specName: "thredz-items",
+        memory: { backend: "thredz", wiki: { autoRecall: true, recallK: 3 } },
+        thredz: { goals: false },
+      },
+      d,
+    );
+    const seam = wired.options.memory;
+    const lines = (await seam?.recall?.("csv", 4)) ?? [];
+    const items = (await seam?.recallItems?.("csv", 4)) ?? [];
+    expect(items.map((i) => i.text)).toEqual(lines);
+    expect(items.map((i) => i.ref)).toEqual([
+      { store: "wiki", backend: "thredz", localId: "eu-csv" },
+      null,
+    ]);
+  });
+
   test("a failing thredz recall degrades to an empty contribution with a classified warning", async () => {
     const { client } = fakeClient({
       wiki_recall: () => ({ content: DISABLED_403, isError: true }),

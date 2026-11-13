@@ -426,3 +426,34 @@ describe("SpanTracker G58 routing", () => {
     expect(spans[0]?.name).toBe("crewhaus.crew_done");
   });
 });
+
+describe("context_assembled — counts only", () => {
+  test("one span per event, every count an integer attribute and no string carries content", () => {
+    const spans: import("./types").OtelSpan[] = [];
+    const tracker = new SpanTracker((s) => spans.push(s));
+    tracker.ingest({
+      ...env(),
+      kind: "context_assembled",
+      blocks: 6,
+      recalled: { included: 3, redacted: 2, warned: 1 },
+      tools: { advertised: 4, inSpec: 9 },
+      messages: 11,
+    } as TraceEvent);
+    expect(spans).toHaveLength(1);
+    const span = spans[0];
+    expect(span?.name).toBe("context_assembled");
+    const attrs = span?.attributes ?? [];
+    const int = (key: string) => findAttr(attrs, key)?.value;
+    expect(int(ATTR.CREWHAUS_CONTEXT_BLOCKS)).toEqual({ intValue: "6" });
+    expect(int(ATTR.CREWHAUS_CONTEXT_RECALLED_INCLUDED)).toEqual({ intValue: "3" });
+    expect(int(ATTR.CREWHAUS_CONTEXT_RECALLED_REDACTED)).toEqual({ intValue: "2" });
+    expect(int(ATTR.CREWHAUS_CONTEXT_RECALLED_WARNED)).toEqual({ intValue: "1" });
+    expect(int(ATTR.CREWHAUS_CONTEXT_TOOLS_ADVERTISED)).toEqual({ intValue: "4" });
+    expect(int(ATTR.CREWHAUS_CONTEXT_TOOLS_IN_SPEC)).toEqual({ intValue: "9" });
+    expect(int(ATTR.CREWHAUS_CONTEXT_MESSAGES)).toEqual({ intValue: "11" });
+    const strings = attrs.filter(
+      (a) => typeof (a.value as { stringValue?: unknown }).stringValue === "string",
+    );
+    for (const a of strings) expect(a.key.startsWith("crewhaus.context.")).toBe(false);
+  });
+});

@@ -697,6 +697,9 @@ async function* driveCrew(
               content: `[A2A from ${savedRole} → ${toRole}]\n\n${safePayload}`,
             },
           ],
+          // Another role wrote this seed, so the requirements ledger names it
+          // as the crew's, never as the user's.
+          seedSource: "crew",
           tools: composeRoleTools({
             role: toRole,
             roles: args.roleNames,
@@ -799,6 +802,9 @@ async function* driveCrew(
             : {}),
           singleTurn: def.singleTurn ?? true,
           seedMessages: messages.map((m) => ({ role: m.role, content: m.content })),
+          // After the first activation the seed is a handoff or a role's
+          // output, written by the crew rather than the user.
+          ...(activations > 0 ? { seedSource: "crew" as const } : {}),
           tools: composeRoleTools({
             role: currentRoleName,
             roles: args.roleNames,

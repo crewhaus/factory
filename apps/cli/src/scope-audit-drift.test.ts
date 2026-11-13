@@ -553,3 +553,29 @@ describe("run-input boundary sites", () => {
     }
   });
 });
+
+describe("compaction boundary site", () => {
+  const repoRoot = join(import.meta.dir, "..", "..", "..");
+  const site = BOUNDARY_SITES.find((s) => s.name === "compaction-autocompact");
+
+  test("it requires the lineage tag, and the summary path in this tree classifies and tags", () => {
+    if (site === undefined) throw new Error("compaction-autocompact site missing");
+    expect(site.requireTag).toBe(true);
+    const findings = auditBoundarySite(site, readFileSync(join(repoRoot, site.path), "utf8"));
+    expect(findings.map((f) => `${f.symbol}:${f.pass}:${f.warn ?? false}`)).toEqual([
+      "compaction-autocompact:true:false",
+      "compaction-autocompact-lineage:true:false",
+    ]);
+  });
+
+  test("a source that classifies the summary but never tags it fails the lineage check", () => {
+    if (site === undefined) throw new Error("compaction-autocompact site missing");
+    const findings = auditBoundarySite(
+      site,
+      'const boundary = await classifyBoundary(summary, { origin: "compaction" });',
+    );
+    const lineage = findings.find((f) => f.symbol === "compaction-autocompact-lineage");
+    expect(lineage?.pass).toBe(false);
+    expect(lineage?.reason).toContain("no reference to tagContent");
+  });
+});

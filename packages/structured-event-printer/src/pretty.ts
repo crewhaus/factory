@@ -216,5 +216,7 @@ function formatBody(ev: TraceEvent): string {
       return `checker=${ev.checker} ok=${ev.ok} artifact=${ev.artifactId} duration=${ev.durationMs.toFixed(0)}ms${
         ev.axioms.length > 0 ? ` axioms=${ev.axioms.join(",")}` : ""
       }`;
+    case "context_assembled":
+      return `blocks=${ev.blocks} recalled=${ev.recalled.included} redacted=${ev.recalled.redacted} warned=${ev.recalled.warned} tools=${ev.tools.advertised}/${ev.tools.inSpec} messages=${ev.messages}`;
   }
 }

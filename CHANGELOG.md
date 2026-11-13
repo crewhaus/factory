@@ -428,6 +428,52 @@ these on: they reach every harness that uses what each one names.
   retry carries the score alone. A retried node's upstream state carries its
   judge's verdict and score, not the rationale.
 
+- **Every run records what started it and what each model call was given, by
+  reference.** Before its first turn a run writes a `run_stamp` line to its
+  session log: what started it, the run it belongs to, its model, the spec
+  and runtime revisions it ran under and which recordings were on. Before
+  each model call it writes a `context_manifest` line: each prompt region's
+  kind, size and keyed fingerprint, the project memory files by name, the
+  recalled items by ref with what became of each, and the tools and model
+  settings. Neither line holds prompt, memory or tool text. Every line a run
+  writes to its own session log carries `run`, its run id. Fingerprints use
+  the harness's digest key in `.crewhaus/run/control/keys/`, which a harness
+  without one gets on its first recorded run. `CREWHAUS_RUN_STAMPS=0` turns
+  all of this off and restores the previous session-log and trace output.
+
+- **The memory seam returns recalled items with refs.** `wireMemory`'s memory
+  seam has `recallItems` beside `recall`: the same items in the same order,
+  each naming the fact, wiki article or session summary it came from. The
+  runtime asks `recallItems` when a seam has it, once per recall, and puts the
+  same text in the prompt.
+
+- **A `context_assembled` trace event before each model call.** It counts
+  the prompt's regions, the recalled items included, redacted or kept with a
+  warning, the tools advertised and carried, and the messages, and carries no
+  text. It reaches the JSON trace, the pretty printer and OpenTelemetry, as a
+  point span with `crewhaus.context.*` attributes. `CREWHAUS_RUN_STAMPS=0`
+  turns it off.
+
+- **The requirements ledger names where each entry came from.** An entry
+  that a crew role, a workflow step's input, a channel message or API input
+  wrote is labelled `(crew)`, `(workflow step)`, `(channel)` or `(API input)`.
+  On a `channel` or `managed` harness every entry carries the channel's or
+  the API's label, and the model reads that the entries remain binding. An
+  entry marked `(crew)` or `(workflow step)` is presented as written by
+  another agent or an earlier step, with no more authority than that source,
+  and the compaction summarizer is told the same. A labelled entry's text
+  cannot start a line of its own in the ledger. A seed's `user_message` line
+  and an entry's `context_evicted` line record its `source` when it is not
+  the user's, and a resumed run reads both back. A ledger of the user's own
+  entries is unchanged.
+
+- **A compaction summary carries its origin into the run.** A summary that
+  passes the compaction check is recorded in the run's lineage at
+  `compaction`, so an external tool call that carries summary text meets the
+  egress check as other non-user text does: a warning on a configured sink,
+  a block on a dynamic one. A line the summary repeats verbatim keeps the
+  origin it entered with.
+
 - **Reading held-out cases is counted.** `crewhaus eval --allow-test-split`,
   `crewhaus deploy canary --allow-test-split`, `crewhaus datasets release` and
   a `target: eval` bundle with `split: test` add one line to

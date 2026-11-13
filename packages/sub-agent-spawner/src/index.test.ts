@@ -503,6 +503,54 @@ describe("spawnSubAgent — §7.1 seam threading into the child loop", () => {
     }
   });
 
+  test("the parent's structured recall reaches the child, which queries it once in place of the lines", async () => {
+    const root = newTempRoot();
+    try {
+      const { parent, parentLog } = await makeParent(root);
+      let lineCalls = 0;
+      let itemCalls = 0;
+      const withMemory: ParentRunHandle = {
+        ...parent,
+        memory: {
+          autoRecall: true,
+          recallK: 2,
+          recall: async () => {
+            lineCalls += 1;
+            return ["the launch code is 1234"];
+          },
+          recallItems: async () => {
+            itemCalls += 1;
+            return [
+              {
+                text: "the launch code is 1234",
+                ref: { store: "fact", backend: "local", localId: "mem_launch" },
+              },
+            ];
+          },
+        },
+      };
+      const { adapter, requests } = makeCapturingClient([
+        [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+      ]);
+      await spawnSubAgent(withMemory, {
+        def: DEF_NO_TOOLS,
+        prompt: "recall something",
+        permissionMode: "bypass",
+        permissionRules: { ...emptyRuleSet },
+        childTools: [],
+        sessionRootDir: root,
+        _client: adapter,
+      });
+      expect(itemCalls).toBe(1);
+      expect(lineCalls).toBe(0);
+      const recalled = childSystemTexts(requests()).find((t) => t.includes("<recalled_memory>"));
+      expect(recalled).toContain("the launch code is 1234");
+      await parentLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("autoRecall respects the parent's setting: recall closure present but autoRecall off → no injection", async () => {
     const root = newTempRoot();
     try {

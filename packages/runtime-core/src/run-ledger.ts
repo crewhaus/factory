@@ -137,6 +137,10 @@ type OpenRun = {
   readonly stopRollups: () => void;
   /** The scope its `running` row recorded: what a grant parked in it is bound to. */
   readonly resumeScope?: string;
+  /** The verified root, work item and execution its `running` row recorded. */
+  readonly parent?: string;
+  readonly workItem?: string;
+  readonly execution?: string;
   parked: boolean;
   last?: LoopOutcome;
 };
@@ -234,6 +238,49 @@ export function continuesOf(ctx: RunContext): string | undefined {
  */
 export function resumeScopeOf(ctx: RunContext, sessionId: string): string {
   return openRunOf(ctx.runId)?.resumeScope ?? ctx.resumeScope ?? `session:${sessionId}`;
+}
+
+/** What started a run and the lineage it records. */
+export type RunFacts = {
+  readonly trigger: Trigger;
+  readonly parent?: string;
+  readonly continues?: string;
+  readonly resumeScope?: string;
+  readonly workItem?: string;
+  readonly execution?: string;
+};
+
+/**
+ * A run's facts as its run records have them: from the `running` row this
+ * process wrote for `ctx`'s run when there is one, so the two never disagree;
+ * else from the context, with the defaults that row would have taken (the
+ * trigger the shape implies, the execution the environment names, the
+ * session's resume scope). Reads only: it verifies no root and writes no row,
+ * so it answers with the ledger off. A sub-agent's facts name its parent run.
+ */
+export function runFactsOf(ctx: RunContext, opts: RunRowsLoopOptions, sessionId: string): RunFacts {
+  const run = openRuns.get(ctx.runId);
+  if (run !== undefined) {
+    const continues = run.ctx.continues;
+    return {
+      trigger: run.trigger,
+      ...(run.parent !== undefined ? { parent: run.parent } : {}),
+      ...(continues !== undefined ? { continues } : {}),
+      ...(run.resumeScope !== undefined ? { resumeScope: run.resumeScope } : {}),
+      ...(run.workItem !== undefined ? { workItem: run.workItem } : {}),
+      ...(run.execution !== undefined ? { execution: run.execution } : {}),
+    };
+  }
+  const resumeScope = ctx.resumeScope ?? defaultResumeScope(undefined, sessionId);
+  const execution = executionId();
+  return {
+    trigger: ctx.trigger ?? defaultTrigger(opts.sessionTarget),
+    ...(ctx.parent !== undefined ? { parent: ctx.parent } : {}),
+    ...(ctx.continues !== undefined ? { continues: ctx.continues } : {}),
+    ...(resumeScope !== undefined ? { resumeScope } : {}),
+    ...(ctx.workItem !== undefined ? { workItem: ctx.workItem } : {}),
+    ...(execution !== undefined ? { execution } : {}),
+  };
 }
 
 /** The open run `runId` is, or descends from. */
@@ -364,6 +411,9 @@ export function openRunRows(args: {
       rollups,
       stopRollups: countRollups(args.bus, rollups),
       ...(resumeScope !== undefined ? { resumeScope } : {}),
+      ...(root !== undefined ? { parent: root.id } : {}),
+      ...(workItem !== undefined ? { workItem } : {}),
+      ...(execution !== undefined ? { execution } : {}),
       parked: false,
     };
     openRuns.set(ctx.runId, run);

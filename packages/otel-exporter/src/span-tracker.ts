@@ -11,6 +11,7 @@ import type {
   ApprovalResolvedEvent,
   CircuitStateChangedEvent,
   CompactionFiredEvent,
+  ContextAssembledEvent,
   CostAccrualEvent,
   CoverageReportEvent,
   ErrorRecoveredEvent,
@@ -60,6 +61,7 @@ import {
   buildApprovalResolvedSpan,
   buildCircuitStateChangedSpan,
   buildCompactionSpan,
+  buildContextAssembledSpan,
   buildCostAccrualSpan,
   buildCoverageReportSpan,
   buildErrorRecoveredSpan,
@@ -496,6 +498,11 @@ export class SpanTracker {
         return;
       case "approval_resolved":
         this.emit(buildApprovalResolvedSpan(ev as ApprovalResolvedEvent));
+        return;
+      // Counts only, nested in their own attributes, which the generic
+      // scalar dump below would skip.
+      case "context_assembled":
+        this.emit(buildContextAssembledSpan(ev as ContextAssembledEvent));
         return;
       // G58 — never silently drop: any TraceEvent kind without a dedicated
       // mapping (a kind added after this exporter, or a low-traffic

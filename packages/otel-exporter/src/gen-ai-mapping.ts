@@ -19,6 +19,7 @@ import type {
   ApprovalResolvedEvent,
   CircuitStateChangedEvent,
   CompactionFiredEvent,
+  ContextAssembledEvent,
   CostAccrualEvent,
   CoverageReportEvent,
   ErrorRecoveredEvent,
@@ -149,6 +150,14 @@ export const ATTR = {
   CREWHAUS_CREW_ROLE: "crewhaus.crew.role",
   CREWHAUS_CREW_ACTIVATION: "crewhaus.crew.activation",
   CREWHAUS_CREW_FINAL_BYTES: "crewhaus.crew.final_message_bytes",
+  // What one model call was given, as counts (`context_assembled`).
+  CREWHAUS_CONTEXT_BLOCKS: "crewhaus.context.blocks",
+  CREWHAUS_CONTEXT_RECALLED_INCLUDED: "crewhaus.context.recalled.included",
+  CREWHAUS_CONTEXT_RECALLED_REDACTED: "crewhaus.context.recalled.redacted",
+  CREWHAUS_CONTEXT_RECALLED_WARNED: "crewhaus.context.recalled.warned",
+  CREWHAUS_CONTEXT_TOOLS_ADVERTISED: "crewhaus.context.tools.advertised",
+  CREWHAUS_CONTEXT_TOOLS_IN_SPEC: "crewhaus.context.tools.in_spec",
+  CREWHAUS_CONTEXT_MESSAGES: "crewhaus.context.messages",
   CREWHAUS_HANDOFF_FROM: "crewhaus.handoff.from",
   CREWHAUS_HANDOFF_TO: "crewhaus.handoff.to",
   CREWHAUS_HANDOFF_REASON: "crewhaus.handoff.reason",
@@ -716,6 +725,27 @@ export function buildRoleSpan(start: StartedRole, end: RoleEndEvent): OtelSpan {
     ],
     status: { code: STATUS_OK },
   };
+}
+
+/**
+ * What one model call was given — a point-in-time span of integer counts only,
+ * so no attribute carries prompt, memory or tool text.
+ */
+export function buildContextAssembledSpan(ev: ContextAssembledEvent): OtelSpan {
+  return pointSpan(
+    ev,
+    "context_assembled",
+    [
+      attrInt(ATTR.CREWHAUS_CONTEXT_BLOCKS, ev.blocks),
+      attrInt(ATTR.CREWHAUS_CONTEXT_RECALLED_INCLUDED, ev.recalled.included),
+      attrInt(ATTR.CREWHAUS_CONTEXT_RECALLED_REDACTED, ev.recalled.redacted),
+      attrInt(ATTR.CREWHAUS_CONTEXT_RECALLED_WARNED, ev.recalled.warned),
+      attrInt(ATTR.CREWHAUS_CONTEXT_TOOLS_ADVERTISED, ev.tools.advertised),
+      attrInt(ATTR.CREWHAUS_CONTEXT_TOOLS_IN_SPEC, ev.tools.inSpec),
+      attrInt(ATTR.CREWHAUS_CONTEXT_MESSAGES, ev.messages),
+    ],
+    { code: STATUS_OK },
+  );
 }
 
 /** A crew control-handoff — a point-in-time span carrying the from/to/depth. */
