@@ -4,13 +4,24 @@
  * table, so a route added in one place and not the other fails here.
  */
 import { describe, expect, test } from "bun:test";
-import { COMMAND_KINDS, PERMISSIONS, isCommandKind } from "@crewhaus/control-contract";
-import { M3_ROUTES } from "./m3-routes";
+import {
+  COMMAND_KINDS,
+  PERMISSIONS,
+  PERMISSION_DECLS,
+  SCOPED_ACTS,
+  isCommandKind,
+  isPermission,
+} from "@crewhaus/control-contract";
+import { M3_ROUTES, PARAM_GUARDS } from "./m3-routes";
+import { matchRequest } from "./route-match";
 import {
   OFF_MAP_KEYS,
   OFF_MAP_OUTSIDE_API,
   ROUTE_BY_KEY,
   ROUTE_TABLE,
+  type RouteRow,
+  badScopedRows,
+  domainRowsWithoutRef,
   matchRoute,
 } from "./route-table";
 
@@ -30,7 +41,7 @@ const keysOf = (row: { key: string; aliases?: readonly string[] }) => [
 describe("the route table", () => {
   test("every console route has exactly one row, under its key, method and path", async () => {
     const routes = await loadRoutes();
-    expect(Object.keys(routes)).toHaveLength(266);
+    expect(Object.keys(routes)).toHaveLength(267);
     for (const [key, route] of Object.entries(routes)) {
       const row = ROUTE_BY_KEY.get(key);
       if (row === undefined) throw new Error(`no row for ${key}`);
@@ -38,7 +49,7 @@ describe("the route table", () => {
     }
     const allKeys = ROUTE_TABLE.flatMap(keysOf);
     expect(new Set(allKeys).size).toBe(allKeys.length);
-    expect(allKeys).toHaveLength(266 + OFF_MAP_KEYS.length);
+    expect(allKeys).toHaveLength(267 + OFF_MAP_KEYS.length);
     const pairs = ROUTE_TABLE.map((row) => `${row.method} ${row.path}`);
     expect(new Set(pairs).size).toBe(pairs.length);
   });
@@ -93,6 +104,7 @@ describe("the route table", () => {
     expect(reads.map((row) => row.key).sort()).toEqual(
       [
         "auditVerify",
+        "authAcceptInvite",
         "authExchange",
         "authRefresh",
         "authSession",
@@ -205,5 +217,80 @@ describe("the route table", () => {
     expect(matchRoute("GET", ["api", "nowhere"])).toBeUndefined();
     expect(matchRoute("PATCH", ["api", "version"])).toBeUndefined();
     expect(matchRoute("GET", evals, (row) => row.key !== "evalMatrix")?.row.key).toBe("evalRun");
+  });
+
+  test("every row whose permission is a domain's names the object it is about", () => {
+    expect(domainRowsWithoutRef(ROUTE_TABLE)).toEqual([]);
+    const planted: RouteRow = {
+      key: "plantedPerson",
+      method: "GET",
+      path: "/api/people/:psn",
+      permission: "people.derived.read",
+      qualifiers: [],
+      receipt: "none",
+      cliTwin: null,
+    };
+    expect(domainRowsWithoutRef([...ROUTE_TABLE, planted])).toEqual(["plantedPerson"]);
+    expect(
+      domainRowsWithoutRef([...ROUTE_TABLE, { ...planted, ref: { kind: "person", param: "psn" } }]),
+    ).toEqual([]);
+  });
+
+  test("a scoped act is one of the closed list, on a GET that names its run", () => {
+    expect(badScopedRows(ROUTE_TABLE)).toEqual([]);
+    const scoped = ROUTE_TABLE.filter((row) => row.scopedAct !== undefined);
+    expect(scoped.map((row) => `${row.key}=${row.scopedAct}`).sort()).toEqual([
+      "run=run.result.read",
+      "runEvents=run.events.read",
+    ]);
+    for (const row of scoped) {
+      expect((SCOPED_ACTS as readonly string[]).includes(row.scopedAct as string)).toBe(true);
+      expect(row.ref).toEqual({ kind: "run", param: "runId" });
+    }
+    const run = ROUTE_BY_KEY.get("run") as RouteRow;
+    expect(badScopedRows([{ ...run, key: "w", method: "POST" }])).toEqual(["w"]);
+    expect(badScopedRows([{ ...run, key: "n", scopedAct: "run.events.write" }])).toEqual(["n"]);
+    const { ref: _ref, ...noRef } = run;
+    expect(badScopedRows([{ ...noRef, key: "r" }])).toEqual(["r"]);
+  });
+
+  test("the rows that carry a harness permission and name no harness are computed, not copied", () => {
+    const fleet = ROUTE_TABLE.filter(
+      (row) =>
+        !row.path.includes("/:id") &&
+        isPermission(row.permission) &&
+        PERMISSION_DECLS[row.permission].scope === "harness",
+    ).map((row) => row.key);
+    expect(fleet.sort()).toEqual(
+      ["credentialsSetAcross", "groupProc", "mcpCatalog", "runProof", "wizardTemplates"].sort(),
+    );
+  });
+
+  test("the one matcher finds every row for a path of its own, as the receipts middleware does", () => {
+    const sample = (name: string): string => {
+      if (name === "id") return "hrn_0123456789abcdef";
+      if (name === "runId") return "run_0123456789abcdef";
+      if (name === "optRunId") return "opt_0123456789abcdef";
+      return "sample-1";
+    };
+    for (const row of ROUTE_TABLE) {
+      const segments = row.path
+        .split("/")
+        .filter((s) => s !== "")
+        .map((s) => (s.startsWith(":") ? sample(s.slice(1)) : s));
+      const guard = Object.entries(PARAM_GUARDS).find(
+        ([name, ok]) => row.path.includes(`:${name}`) && !ok(sample(name)),
+      );
+      if (guard !== undefined) continue;
+      expect(`${row.method} ${row.path} -> ${matchRequest(row.method, segments)?.row.key}`).toBe(
+        `${row.method} ${row.path} -> ${row.key}`,
+      );
+    }
+    expect(matchRequest("GET", ["api", "nope"])).toBeUndefined();
+    expect(matchRequest("GET", ["api", "v1", "nope"])).toBeUndefined();
+    expect(matchRequest("GET", ["api"])).toBeUndefined();
+    expect(matchRequest("HEAD", ["api", "harnesses"])).toBeUndefined();
+    expect(matchRequest("OPTIONS", ["api", "harnesses"])).toBeUndefined();
+    expect(matchRequest("PATCH", ["api", "harnesses"])).toBeUndefined();
   });
 });

@@ -321,6 +321,22 @@ export const CORE_MODULE = {
         retired: "none",
       },
     },
+    // A standing rule: narrow, expiring, and ended by its owner or its clock.
+    rule: {
+      states: ["active", "revoked", "expired"],
+      entry: ["active"],
+      terminal: ["revoked", "expired"],
+      transitions: {
+        active: ["revoked", "expired"],
+        revoked: [],
+        expired: [],
+      },
+      recoveryOwner: {
+        active: "operator",
+        revoked: "none",
+        expired: "none",
+      },
+    },
   },
   commandKinds: [
     {
@@ -426,7 +442,7 @@ export const CORE_MODULE = {
       permission: "h.decision.resolve",
       idempotent: false,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.approvalsSupersede,
     },
     {
       id: "rules.create",
@@ -440,7 +456,7 @@ export const CORE_MODULE = {
       permission: "h.standing-rule.manage",
       idempotent: true,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.approvalsRevoke,
     },
     {
       id: "access.invites.create",

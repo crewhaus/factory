@@ -36,6 +36,8 @@ export type AccessPaths = {
   readonly revision: string;
   readonly subjects: string;
   readonly subjectKey: string;
+  /** The key scoped tokens are signed with. Under `access/`, so no browser route serves it. */
+  readonly scopedKey: string;
   /** The bootstrap token Home mints, beside `access/`, never inside it. */
   readonly token: string;
   readonly ledgers: Readonly<Record<LedgerKind, string>>;
@@ -57,6 +59,7 @@ export function accessPaths(): AccessPaths {
     revision: join(ACCESS_DIR, "revision.json"),
     subjects: join(ACCESS_DIR, "subjects.json"),
     subjectKey: join(ACCESS_DIR, "keys", "subject.key"),
+    scopedKey: join(ACCESS_DIR, "keys", "scoped.key"),
     token: "token",
     ledgers,
     signIn: {

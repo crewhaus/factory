@@ -45,11 +45,16 @@ these on: they reach every harness that uses what each one names.
 
 - **Daemon verbs and Home's changes leave a receipt, and long CLI verbs take
   turns with Home.** `crewhaus daemon start`, `stop`, `restart` and `drain`,
-  and every change made in Home, first write a receipt under the harness's
+  `crewhaus approvals grant`, `deny`, `supersede` and `revoke`, and every
+  change made in Home, first write a receipt under the harness's
   `.crewhaus/run/control/` (ids and states, never arguments or secrets). A
   verb whose receipt cannot be written does nothing and exits 52. `crewhaus
   daemon start` and `restart` exit 55, where they exited 1, when the start is
-  refused: already running, or stopped by preflight. `compile`, `eval`,
+  refused: already running, or stopped by preflight. `crewhaus approvals`
+  exits 51 or 55, where it exited 1, when it refuses a decision: 51 when the
+  person may not decide it, 55 for an unknown or malformed id, a request
+  already decided or withdrawn, a reason it does not know, or `deny --always`.
+  `compile`, `eval`,
   `optimize`, `flywheel run` and `dream run` wait up to 10 seconds while a
   Home job changes the same harness, then exit 53 naming it; a Home job that
   meets one of them fails the same way. A Home write whose body is not a JSON
@@ -129,7 +134,14 @@ these on: they reach every harness that uses what each one names.
   them); the working directory's `.env`,
   `.env.local`, `.env.development`, `.env.development.local`, `.env.production`,
   `.env.production.local`, `.env.test` and `.env.test.local`, and any file
-  `manager.envFiles` names; its `bunfig.toml` and `.npmrc`; the `approvals.jsonl`
+  `manager.envFiles` names; its `bunfig.toml` and `.npmrc`; the files a hook in
+  `.crewhaus/settings.json` (`manager.hooks` or `hooks`) or in the spec names
+  directly, exactly those files (a command word written as a path, and the
+  script a shell or an interpreter it starts is given, read through `cd`,
+  `sh -c` and wrappers such as `env`, `exec` and `timeout`; not a word built
+  when the hook runs, a here-document, a package script or a module, or what
+  that script runs in turn); for `crewhaus run` or `crewhaus runs resume` of
+  a spec in another directory, that directory's `.crewhaus/run/spec`; the `approvals.jsonl`
   beside session logs that `CREWHAUS_SESSION_DIR` puts at the working directory;
   a managed run's whole tenants root; and Hangar's directory and registry:
   `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always, and wherever the
@@ -290,6 +302,25 @@ these on: they reach every harness that uses what each one names.
   honours disable when it starts. The supervisor does not restart a daemon that
   exits 34 (time limit), 35 (evaluation), 37 (provability) or 38 (disabled),
   and the exit-code table gains 38 and 39. Recompile a daemon to pick this up.
+
+- **`Bash` and `RunCommand` children carry `CREWHAUS_AGENT_TOOL`.** Every command
+  `Bash` runs and every program `RunCommand`, `RunPipeline`, `Retry` and
+  `ProcessStart` start has `CREWHAUS_AGENT_TOOL` set to the tool's name, whatever
+  the call's `envSet` says, and `crewhaus approvals` refuses to decide, supersede,
+  defer or revoke under it (exit 51). It marks a tool's child; it is not a
+  boundary. `Bash` hands its command the environment as it is when the command
+  starts, so a variable the run set after it started reaches it too.
+
+- **A standing allow covers the call it came from, expires, and stops when
+  revoked.** `crewhaus approvals grant <id> --always` writes `Tool(<the call's
+  value>)` for 30 days (`--days`, at most 365) and only for the harness's owner; a
+  member's `--always` grants once and asks the owner. On a call no narrow rule
+  can name (a tool with no argument that decides where it acts, a call on
+  several places, a value that carries a credential), `--always` is refused
+  with exit 55 and nothing is decided. A revoked or expired rule
+  stops matching within a second, in a run already going too. A rule
+  `.crewhaus/settings.json` holds with no record keeps working and `crewhaus
+  approvals rules` lists it to narrow or remove. The file keeps its 0.8 shape.
 
 ## [0.8.2] - 2026-11-12
 

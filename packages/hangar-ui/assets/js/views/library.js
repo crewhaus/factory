@@ -24,7 +24,7 @@ import {
   toast,
   withTip,
 } from "../dom.js";
-import { hrefHarness } from "../router.js";
+import { hrefGlobal, hrefHarness } from "../router.js";
 import { shapeAccentVars, shapeLabel } from "../shapes.js";
 import { procStatePill } from "../supervision.js";
 import { confirmAction } from "../ui/dialog.js";
@@ -78,7 +78,7 @@ const COLUMNS = [
   { key: "edit", label: "", get: () => null, sortable: false },
 ];
 
-export async function renderLibrary(root) {
+export async function renderLibrary(root, ctx = {}) {
   clear(root).appendChild(skeleton(6));
   // First paint from the plain (cache-only) feed — instant, stale-labeled
   // via each row's cachedAt — then a background ?hydrate=1 refetch replaces
@@ -96,23 +96,23 @@ export async function renderLibrary(root) {
     const view = onboardingRes[0].status === "fulfilled" ? onboardingRes[0].value : null;
     if (shouldOnboard(view, rows.length)) {
       clear(root);
-      await renderOnboarding(root, { reload: () => renderLibrary(root) });
+      await renderOnboarding(root, { reload: () => renderLibrary(root, ctx) });
       return;
     }
   }
   const groups = normalizeGroups(groupsRes.status === "fulfilled" ? groupsRes.value : null, rows);
   draw(root, rows, groups, { hydrating: true });
-  hydrateInBackground(root, groups);
+  hydrateInBackground(root, groups, ctx.signal);
 }
 
-async function hydrateInBackground(root, groups) {
+async function hydrateInBackground(root, groups, signal) {
   let feed;
   try {
     feed = await api.harnesses(true);
   } catch {
     return; // the cold paint stands; the next reload retries
   }
-  if (!root.isConnected) return; // navigated away meanwhile
+  if (signal?.aborted === true) return; // navigated away meanwhile
   refresh(root, normalizeRows(feed), groups);
 }
 
@@ -727,7 +727,7 @@ function harnessRow(ctl) {
       row.pendingApprovals > 0
         ? el("a", {
             class: "chip chip-warn",
-            href: "#/approvals",
+            href: hrefGlobal("approvals"),
             text: `${row.pendingApprovals} waiting`,
           })
         : null,

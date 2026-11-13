@@ -5,7 +5,7 @@ import { makeFixtureHarness } from "@crewhaus/hangar-server";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import { SESSION_ID_RE } from "@crewhaus/session-store";
 import { fakeModel } from "service-fakes";
-import { harnessRoute } from "../console-routes";
+import { routeFor } from "../console-routes";
 import { childEnv, runCrewhaus, spawnHangar } from "../system";
 import type { Journey } from "./journey";
 
@@ -50,7 +50,7 @@ export const runThenConsole: Journey = {
       await hangar.stop();
     });
     const session = await scope.session(hangar.home);
-    await session.visit(harnessRoute(entry.id, "sessions"));
+    await session.visit(routeFor("#/h/:id/work/sessions", { id: entry.id }));
     if ((await session.page.getByText(sessionId).count()) === 0) {
       throw new Error(`the Sessions tab does not show ${sessionId}`);
     }

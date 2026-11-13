@@ -4,8 +4,9 @@
  * process did not start before it signals one, as `crewhaus daemon stop` does. One
  * reconciler serves start and restart, the two kinds that are not safe to repeat blindly.
  *
- * Activation's reconciler reads the deployment records. The operator record, run creation
- * and decisions get theirs with their writers.
+ * Activation's reconciler reads the deployment records, and the decision service's kinds
+ * observe their own records (`./decision-runtime`). The operator record and run creation
+ * get theirs with their writers.
  */
 import type { CommandReceipt } from "@crewhaus/control-contract";
 import {
@@ -14,6 +15,7 @@ import {
   type StopResult,
   readRunfile,
 } from "@crewhaus/harness-supervisor";
+import { DECISION_EXECUTORS, DECISION_RECONCILERS } from "./decision-runtime";
 import { protectedEnvironmentGate, reconcileActivation } from "./deployments";
 import type {
   AreaRuntime,
@@ -69,22 +71,29 @@ export function settleStop(result: StopResult): Settlement {
   };
 }
 
+/** A daemon command with no supervisor lent: never run. */
+const NO_SUPERVISOR: Settlement = { state: "failed", outcome: outcomeOf("unavailable") };
+
 const start: Executor = async ({ supervisor }) => {
+  if (supervisor === undefined) return NO_SUPERVISOR;
   await supervisor.adoptIfRunfile();
   return settleStart(await supervisor.start());
 };
 
 const restart: Executor = async ({ supervisor }) => {
+  if (supervisor === undefined) return NO_SUPERVISOR;
   await supervisor.adoptIfRunfile();
   return settleStart(await supervisor.restart());
 };
 
 const stop: Executor = async ({ supervisor }) => {
+  if (supervisor === undefined) return NO_SUPERVISOR;
   await supervisor.adoptIfRunfile();
   return settleStop(await supervisor.stop());
 };
 
 const drain: Executor = async ({ supervisor, drainRequest }) => {
+  if (supervisor === undefined) return NO_SUPERVISOR;
   await supervisor.adoptIfRunfile();
   return settleStop(await supervisor.drain(drainRequest));
 };
@@ -127,11 +136,14 @@ export const CORE_RUNTIME: AreaRuntime = {
     "controls.restart": restart,
     "controls.drain": drain,
     "deployments.activate": activate,
+    ...DECISION_EXECUTORS,
   },
   reconcilers: {
     "controls.start": reconcileDaemonStart,
     "controls.restart": reconcileDaemonStart,
     "deployments.activate": (receipt, ctx) => reconcileActivation(receipt, ctx),
+    ...DECISION_RECONCILERS,
   },
+  unsupervised: Object.keys(DECISION_EXECUTORS),
   activationGates: [protectedEnvironmentGate],
 };

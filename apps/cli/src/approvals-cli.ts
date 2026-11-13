@@ -1,9 +1,9 @@
 /**
  * Loop contract 0.4 (Batch C, G11) — the `crewhaus approvals` verbs' pure
- * rendering layer. The FS wiring (constructing the file-backed
- * `PendingApprovalStore` over the harness's `.crewhaus/sessions/`) lives in
- * `index.ts`; this module is side-effect-free so the status derivation +
- * table/detail formatting are unit-testable without spawning the CLI.
+ * rendering layer. The verbs themselves live in `approvals-cmd.ts`, over
+ * control-service's decision service; this module is side-effect-free so the
+ * status derivation + table/detail formatting are unit-testable without
+ * spawning the CLI.
  *
  * A `PendingApproval` is parked by the runtime when a tool permission resolves
  * to `ask` on a NON-interactive surface and `permissions.ask_mode` is `"pause"`
@@ -26,10 +26,10 @@ import { DEFER_REASONS, type PendingApproval, SUPERSEDE_REASONS } from "@crewhau
  * The operator-facing lifecycle state of a parked approval, derived from the
  * store record. `consumed` is a spent one-shot grant (a later identical call
  * re-asks under a fresh id); `granted`/`denied` are recorded-but-not-yet-spent
- * decisions; `granted-always` is a standing allow (#383 — the terminal state
- * whether or not the parked call was since consumed, because the standing
- * behavior rides the `alwaysAllow` rule in `.crewhaus/settings.json`, not
- * this record); `superseded` was replaced by a fresh request (checked first,
+ * decisions; `granted-always` is a grant that made a standing rule (the
+ * terminal state whether or not the parked call was since consumed, because
+ * the rule rides its `alwaysAllow` entry in `.crewhaus/settings.json` and its
+ * record, not this one); `superseded` was replaced by a fresh request (checked first,
  * as `effectiveDecisionState` does); `pending` still awaits one.
  */
 export type ApprovalDisplayStatus =

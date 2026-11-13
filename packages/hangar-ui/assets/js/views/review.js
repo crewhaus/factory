@@ -149,7 +149,14 @@ function reviewCard(row, { perform }) {
         : el("span", { class: "chip", text: "item verdict only" }),
       el("span", { class: "muted", text: row.age }),
     ]),
-    row.context !== "" ? el("pre", { class: "prose-pre", text: row.context }) : null,
+    row.contextWithheld
+      ? el("p", {
+          class: "muted",
+          text: "The quoted context is hidden: reading it needs content access to this harness.",
+        })
+      : row.context !== ""
+        ? el("pre", { class: "prose-pre", text: row.context })
+        : null,
     row.sessionId !== null
       ? el("div", { class: "muted reason" }, [
           el("span", { text: "turn " }),

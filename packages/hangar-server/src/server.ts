@@ -20,7 +20,12 @@
  *     answers 421 (`host-allowlist.ts`), so a page that rebinds its own name
  *     to loopback is turned away before it can spend a boot link.
  *   - AUTH: every `/api` route passes `authenticate()` from
- *     `@crewhaus/access-control` at one place (`access.ts`). A browser holds
+ *     `@crewhaus/access-control` at one place (`access.ts`), then matches exactly
+ *     one route-table row (none answers 404, for everyone) and is authorized for
+ *     that row's permission, on the harness its `:id` names, before any handler
+ *     runs. A member, a service token, a scoped token and a tab-only session act
+ *     within what they hold; fleet folds count and quote only the harnesses the
+ *     caller may read. A browser holds
  *     a session sealed to it, signed in through a single-use boot link or its
  *     own device key (`sign-in-routes.ts`); Home's own key (the bootstrap,
  *     `<hangarRoot>/token`) is the owner only on `<hangarRoot>/home.sock` or
@@ -53,21 +58,24 @@
  * only be about their own subject. The handlers ship as 501 stubs whose
  * docblocks carry the write covenant each must honour.
  */
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, hostname as osHostname, userInfo } from "node:os";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
+  type AccessSnapshotRead,
   type Authenticated,
+  type DomainChecker,
   type Peer,
   type SignInHandle,
   type TokenSetup,
+  authorize,
   ensureToken,
   loadAccessSnapshot,
   localActorOf,
   openSignIn,
   readOwnerSettings,
 } from "@crewhaus/access-control";
-import { DEPLOYMENT_ID_RE } from "@crewhaus/control-contract";
+import { DEPLOYMENT_ID_RE, parseRef } from "@crewhaus/control-contract";
 import {
   AREA_RUNTIMES,
   type RecoverCounts,
@@ -109,11 +117,28 @@ import {
 } from "@crewhaus/harness-supervisor";
 import { runPreflight } from "@crewhaus/preflight";
 import {
+  type AccessView,
+  type Caller,
   type HomeAccess,
+  type RequestAccess,
+  TAB_ONLY_MESSAGE,
+  authorizeCaller,
+  authorizeRequest,
   bootstrapKeyMismatch,
+  callerOf,
   checkAccess,
+  contentVisibleToRequest,
+  currentRequestAccess,
+  harnessTarget,
+  isOwnerCaller,
+  permissionRefusal,
   refusalOf,
   refusalResponse,
+  registerHomeDomain,
+  requestAccessFor,
+  visibleToRequest,
+  withRequestAccess,
+  withholdPeople,
 } from "./access";
 import { currentBaselines, pinBaseline, pinSession, readPins } from "./actions";
 import {
@@ -159,7 +184,14 @@ import {
   evalsView,
   isRunId,
 } from "./evals";
-import { GROUP_VERBS, groupPlan, isGroupVerb, runGroup } from "./group-ops";
+import {
+  GROUP_VERBS,
+  type GroupPlan,
+  type GroupPlanMember,
+  groupPlan,
+  isGroupVerb,
+  runGroup,
+} from "./group-ops";
 import {
   type HealthPreflightItem,
   type HealthResult,
@@ -228,6 +260,8 @@ import { isProofRunId, proofTenants, proofView } from "./proofs";
 import { commandFields, createReceipts, currentCommand } from "./receipts";
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
+import { type RequestMatch, matchRequest } from "./route-match";
+import type { RouteRow } from "./route-table";
 import {
   isLiveFeedState,
   isSupervisorRunId,
@@ -246,14 +280,15 @@ import {
   resolveSessionRoot,
 } from "./sessions";
 import {
-  READ_ONLY_EXEMPT,
   type SettingsStore,
   isReadOnlyRefused,
   openSettingsStore,
+  readOnlyExempt,
   readOnlyRefusal,
 } from "./settings";
 import { SIGN_IN_ROUTES, isSignInPath, serveSignIn } from "./sign-in-routes";
 import { BADGE_KEYS, capabilityBadges, specView } from "./spec-view";
+import { assetResponse } from "./static-cache";
 
 export type StaticAsset = {
   readonly body: string | Uint8Array;
@@ -274,6 +309,17 @@ export type HangarServerOptions = {
   readonly allowHosts?: readonly string[];
   /** Disable auth entirely (logged warning; trusted localhost dev only). */
   readonly noAuth?: boolean;
+  /**
+   * The address `--lan` bound: invites accepted on a page served over plain HTTP make a
+   * tab-only session that counts only on this address. Absent, no tab-only session is made.
+   */
+  readonly lanHost?: string;
+  /**
+   * Domain checkers for Home's domain table, by domain name: a permission `<name>.…` goes
+   * to its checker, with the route's object ref. Registered under the domain rules; a
+   * broken one refuses boot.
+   */
+  readonly domains?: Readonly<Record<string, DomainChecker>>;
   /** Prebuilt UI assets served at `/` and exact asset paths. Absent → a
    *  minimal built-in index page listing the API routes. */
   readonly assets?: Readonly<Record<string, StaticAsset>>;
@@ -351,8 +397,9 @@ export type HangarServer = {
   /** True while read-only mode refuses mutating requests (HM-187). */
   readOnly(): boolean;
   /** Run the session check now: every live run stream whose session has
-   *  expired or ended closes with `auth.expired` or `auth.revoked`. Home runs
-   *  it every 30 seconds on its own. */
+   *  expired or ended closes with `auth.expired` or `auth.revoked`, and, when
+   *  the access records have moved, every stream whose caller has lost
+   *  access to it closes with `revoked`. Home runs it every 30 seconds on its own. */
   checkSessions(): void;
   /**
    * Resolves once the boot sequence has run: port ledger open → `adopt()`
@@ -381,8 +428,60 @@ const asStringArray = (v: unknown): string[] | undefined =>
 /** A plugin pane's single-use address lives this long, and at most this many at once. */
 const PANE_LINK_TTL_MS = 60_000;
 const PANE_LINK_CAP = 256;
+
+/** A path's real place: its nearest existing ancestor resolved, the rest appended. */
+function realOr(path: string): string {
+  const absolute = resolve(path);
+  try {
+    return realpathSync(absolute);
+  } catch {
+    const parent = dirname(absolute);
+    return parent === absolute ? absolute : join(realOr(parent), basename(absolute));
+  }
+}
+
+/** Whether `path` is `root` or inside it, by `relative()`. */
+function isWithin(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/**
+ * Why a harness may not move to `newDir`, or null when it may: never onto, into or around
+ * Home's own records, and never onto or around another registered harness.
+ *
+ * First consumer: `POST /api/h/:id/relocate`.
+ */
+export function relocationRefusal(
+  newDir: string,
+  hangarRoot: string,
+  otherDirs: readonly string[],
+): string | null {
+  const target = realOr(newDir);
+  const home = realOr(hangarRoot);
+  if (isWithin(home, target) || isWithin(target, home)) {
+    return "newDir holds Home's own records; choose the directory the harness's files are in";
+  }
+  for (const dir of otherDirs) {
+    if (isWithin(target, realOr(dir))) {
+      return "newDir holds another registered harness; choose the directory this harness's files are in";
+    }
+  }
+  return null;
+}
+
+/** The notification settings: one block of Home's settings, shared by everyone. */
+const HOME_NOTIFICATION_FIELDS = ["rules", "quietHours", "mutedGroups", "webhookUrl"] as const;
 /** How often live run streams check that their session still holds. */
 const SESSION_CHECK_MS = 30_000;
+
+/** The permission each job kind needs: the one its own route needs. */
+const JOB_KIND_PERMISSIONS: Readonly<Record<string, string>> = Object.freeze({
+  doctor: "h.eval.run",
+  compile: "h.deploy",
+  eval: "h.eval.run",
+  "dream-run": "h.memory.write",
+});
 
 /** The OS user running Home, for the access records' local actor. */
 function osIdentity(env: Readonly<Record<string, string | undefined>>): {
@@ -457,23 +556,31 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     const mismatch = bootstrapKeyMismatch(hangarRoot, tokenSetup.token);
     if (mismatch !== undefined) throw new Error(mismatch);
   }
-  const signIn: SignInHandle = openSignIn(hangarRoot, {
-    now,
-    localActor: localActorOf(osIdentity(env)),
-  });
-  const homeAccess: HomeAccess = {
-    signIn,
-    config: trustedProxy !== undefined ? { trustedProxy } : {},
-    bootToken: tokenSetup?.token,
-    now,
-  };
-
   const registry: HangarRegistry = openHangarRegistry({
     ...(opts.registryRoot !== undefined ? { root: opts.registryRoot } : {}),
     env,
     now,
     onWarn,
   });
+  const signIn: SignInHandle = openSignIn(hangarRoot, {
+    now,
+    localActor: localActorOf(osIdentity(env)),
+    // A grant an invite gives reaches the registered harnesses' approver lists at once.
+    harnesses: () => registry.list().map((e) => ({ id: e.id, dir: e.dir, groups: e.groups })),
+  });
+  const homeAccess: HomeAccess = {
+    signIn,
+    config: {
+      ...(trustedProxy !== undefined ? { trustedProxy } : {}),
+      ...(opts.lanHost !== undefined ? { lanHost: opts.lanHost } : {}),
+    },
+    bootToken: tokenSetup?.token,
+    now,
+    domains: new Map(),
+  };
+  for (const [name, checker] of Object.entries(opts.domains ?? {})) {
+    registerHomeDomain(homeAccess, name, checker);
+  }
   const cache = openRollupCache(hangarRoot);
   const version = opts.version ?? HANGAR_SERVER_VERSION;
   const operator = opts.operator ?? "hangar";
@@ -505,12 +612,53 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       now,
       probe: withOwnStartTime(createProcessOps()),
       onWarn,
+      // A queued or recovered command runs only while its actor may still do it.
+      authorizeActor: (actor, permission, target) => {
+        const read = loadAccessSnapshot(hangarRoot);
+        if (read.state !== "present") return undefined;
+        const parsed = parseRef(target);
+        const harness =
+          "error" in parsed
+            ? undefined
+            : parsed.kind === "harness"
+              ? parsed.id
+              : parsed.scope !== "home"
+                ? parsed.scope
+                : undefined;
+        const at =
+          harness === undefined
+            ? ({ scope: "home" } as const)
+            : {
+                scope: "harness" as const,
+                harness,
+                groups: registry.get(harness)?.groups ?? [],
+              };
+        const options = { now: now(), domains: homeAccess.domains };
+        const snapshot = read.snapshot;
+        const who = snapshot.principals.find((p) => p.id === actor);
+        if (who?.kind === "service") {
+          // A receipt names the service, not the token it used: any live token of it counts.
+          return snapshot.tokens
+            .filter((c) => c.principal === actor && c.kind === "service")
+            .some(
+              (c) =>
+                authorize(snapshot, { principal: actor, credential: c.id }, permission, at, options)
+                  .allow,
+            );
+        }
+        return authorize(snapshot, { principal: actor }, permission, at, options).allow;
+      },
     },
     { mode: "server" },
   );
 
   /** Who each `/api` request authenticated as, for the routes that care which credential. */
   const callers = new WeakMap<Request, Authenticated>();
+  /** The row, params and caller each `/api` request was authorized as, for its stream. */
+  const authorized = new WeakMap<Request, RequestMatch & { readonly caller: Caller }>();
+  /** Every open run stream's re-check: whether its caller may still read it. */
+  const streamChecks = new Set<() => void>();
+  let streamEpoch: string | undefined;
   /** Single-use pane documents (`/pane/<nonce>`), minted inside the authenticated pane read. */
   const paneDocs = new Map<
     string,
@@ -523,13 +671,58 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   const streamSignal = (req: Request): AbortSignal | undefined => {
     const who = callers.get(req);
     const sessionRef = who?.kind === "principal" ? who.sessionRef : undefined;
-    if (sessionRef === undefined) return req.signal;
+    const decided = authorized.get(req);
+    if (sessionRef === undefined && decided === undefined) return req.signal;
     const ended = new AbortController();
-    const stop = signIn.onEnd(sessionRef, (end) =>
-      ended.abort(end === "expired" ? "auth.expired" : "auth.revoked"),
-    );
+    const stops: Array<() => void> = [];
+    if (sessionRef !== undefined) {
+      stops.push(
+        signIn.onEnd(sessionRef, (end) =>
+          ended.abort(end === "expired" ? "auth.expired" : "auth.revoked"),
+        ),
+      );
+    }
+    if (decided !== undefined) {
+      // Whoever opened it, a session, a token or Home's own key: when the access records
+      // move, the stream is authorized again, and closes with `revoked` once it is not.
+      const recheck = (): void => {
+        if (ended.signal.aborted) return;
+        const verdict = authorizeRequest({
+          ...decided,
+          view: accessView(signIn.snapshot()),
+        });
+        if (!verdict.allow) ended.abort("revoked");
+      };
+      streamChecks.add(recheck);
+      stops.push(() => streamChecks.delete(recheck));
+    }
+    const stop = (): void => {
+      for (const s of stops) s();
+    };
+    ended.signal.addEventListener("abort", stop, { once: true });
     req.signal?.addEventListener("abort", stop, { once: true });
     return req.signal === undefined ? ended.signal : AbortSignal.any([req.signal, ended.signal]);
+  };
+
+  /**
+   * The periodic check: sessions that ended close their streams, and every open stream is
+   * authorized again, whether or not the access records moved: a scoped token's end, a
+   * grant's and a service token's expiry pass with the clock alone.
+   */
+  const checkStreams = (): void => {
+    signIn.checkSessions();
+    const read = signIn.snapshot();
+    streamEpoch = read.state === "present" ? String(read.snapshot.epoch) : read.state;
+    for (const recheck of [...streamChecks]) recheck();
+  };
+
+  /** Authorize every open stream again, once per move of the access revision. */
+  const recheckStreams = (read: AccessSnapshotRead): void => {
+    if (streamChecks.size === 0) return;
+    const epoch = read.state === "present" ? String(read.snapshot.epoch) : read.state;
+    if (epoch === streamEpoch) return;
+    streamEpoch = epoch;
+    for (const recheck of [...streamChecks]) recheck();
   };
 
   const processes: ProcessLayer =
@@ -572,6 +765,101 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   const demosDir = opts.demosDir ?? env[DEMOS_DIR_ENV];
   const cwd = opts.cwd ?? process.cwd();
 
+  // ---- authorization -------------------------------------------------------
+
+  /** The access records and the registry, as one request's authorization sees them. */
+  const accessView = (read: AccessSnapshotRead): AccessView => ({
+    read,
+    now: now(),
+    domains: homeAccess.domains,
+    groupsOf: (id) => (HARNESS_ID_RE.test(id) ? registry.get(id)?.groups : undefined),
+    harnessIds: () => registry.list().map((entry) => entry.id),
+  });
+
+  /** The registry rows this request may read: every enumeration a fleet fold makes. */
+  const visibleEntries = (): HangarHarnessEntry[] =>
+    registry.list().filter((entry) => visibleToRequest(entry.id));
+
+  /** This request's caller, for the handlers that record who acted. */
+  const requestCaller = (): Caller =>
+    currentRequestAccess()?.caller ?? {
+      principal: loadOwnerOr(operator),
+      actor: null,
+      via: noAuth ? "no-auth" : "bootstrap",
+    };
+  const loadOwnerOr = (label: string): string => {
+    const read = signIn.snapshot();
+    return read.state === "present" ? (read.snapshot.owner ?? label) : label;
+  };
+
+  /** Whether this request's caller holds a permission on a harness, or the whole Home. */
+  const requestAllows = (permission: string, harness?: string): boolean => {
+    const access = currentRequestAccess();
+    if (access === undefined) return true;
+    return access.authorize(permission, harness !== undefined ? { harness } : undefined).allow;
+  };
+
+  /** The registry groups this request may see: those with a member it may read. */
+  const visibleGroups = (): ReturnType<HangarRegistry["listGroups"]> => {
+    const groups = registry.listGroups();
+    const access = currentRequestAccess();
+    if (access === undefined || isOwnerCaller(access.caller, signIn.snapshot())) return groups;
+    return groups.filter((group) =>
+      registry.groupMembers(group.name).some((entry) => visibleToRequest(entry.id)),
+    );
+  };
+
+  /**
+   * A group walk narrowed to this request: members it may not read are left out, and a
+   * member it may read but not control is skipped as `forbidden`, never acted on.
+   */
+  const narrowPlan = (plan: GroupPlan, _acting: boolean): GroupPlan => {
+    const members = plan.members
+      .filter((member) => visibleToRequest(member.id))
+      .map((member, index): GroupPlanMember => {
+        const position = index + 1;
+        if (requestAllows("h.control", member.id)) return { ...member, position };
+        return {
+          ...member,
+          position,
+          skip: "forbidden — ask the owner for operator access to this harness",
+          skipCode: "forbidden",
+        };
+      });
+    return {
+      ...plan,
+      members,
+      actionable: members.filter((m) => m.skip === null).length,
+      skipped: members.filter((m) => m.skip !== null).length,
+    };
+  };
+
+  /** A refusal for a permission this request's caller does not hold on one harness. */
+  const forbiddenOn = (permission: string, harness?: string): HttpError => {
+    const access = currentRequestAccess();
+    const verdict = access?.authorize(permission, harness !== undefined ? { harness } : undefined);
+    if (verdict !== undefined && !verdict.allow && "reason" in verdict) {
+      return new HttpError(403, TAB_ONLY_MESSAGE, {
+        code: "forbidden",
+        reason: verdict.reason,
+        needs: permission,
+        role: null,
+      });
+    }
+    const refusal = permissionRefusal(
+      access?.caller ?? requestCaller(),
+      permission,
+      verdict !== undefined && !verdict.allow ? verdict.role : null,
+      harness !== undefined ? "harness" : "home",
+    );
+    return new HttpError(403, refusal.message, {
+      code: refusal.code,
+      reason: refusal.reason,
+      needs: permission,
+      role: refusal.role ?? null,
+    });
+  };
+
   // ---- shared lookups -----------------------------------------------------
 
   const entryOr404 = (id: string): HangarHarnessEntry => {
@@ -610,7 +898,12 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
    * from.
    */
   const fleetScrub = (): TextScrubber => {
-    const scrubbers = liveHarnesses().map((h) => harnessScrub(h.dir));
+    // Every live harness's values, not only the ones this request may read: a value from a
+    // harness the caller cannot see is still one this manager holds.
+    const scrubbers = registry
+      .list()
+      .filter((e) => e.missingSince === null && existsSync(e.dir))
+      .map((e) => harnessScrub(e.dir));
     if (scrubbers.length === 0) return (text) => text;
     if (scrubbers.length === 1) return scrubbers[0] as TextScrubber;
     return (text) => scrubbers.reduce((acc, s) => s(acc), text);
@@ -659,7 +952,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   // ---- route bodies -------------------------------------------------------
 
   const harnessRows = (hydrate: boolean): unknown => {
-    const rows = registry.list().map((entry) => {
+    const rows = visibleEntries().map((entry) => {
       const missing = entry.missingSince !== null;
       const yamlText = missing ? "" : readYamlSafe(entry.dir);
       let header: { name?: string; target?: string; model?: string } = {};
@@ -860,7 +1153,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     let totalUsdMicros = 0;
     let spend7dUsdMicros = 0;
     let calls = 0;
-    for (const entry of registry.list()) {
+    for (const entry of visibleEntries()) {
       if (entry.missingSince !== null) continue;
       const rollup = cache.get(entry.id, entry.dir, now());
       const costs = rollup.costBreakdown;
@@ -938,8 +1231,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
    * badge poll would be the most expensive thing this manager does.
    */
   const fleetSignals = (): readonly HarnessSignal[] =>
-    registry
-      .list()
+    visibleEntries()
       .filter((e) => e.missingSince === null && existsSync(e.dir))
       .map((entry) => {
         const dir = entry.dir;
@@ -998,7 +1290,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       },
       current.webhookUrl,
     );
-    const inApp = notifications.inApp();
+    // The queue is Home's: each reader sees the entries about harnesses it may read.
+    const inApp = notifications.inApp().filter((d) => visibleToRequest(d.harnessId));
     return {
       rules: current.rules,
       quietHours: current.quietHours,
@@ -1010,10 +1303,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       sinkAvailability: notifications.availability(current.webhookUrl),
       /** Fired on THIS poll — the toast list. Each delivery's `sinks` names
        *  the sinks that actually carried it, never the ones asked for. */
-      delivered: result.deliveries,
+      delivered: result.deliveries.filter((d) => visibleToRequest(d.harnessId)),
       /** Events that did not notify, with the reason — a silent rule is
        *  always explainable from the screen. */
-      suppressed: result.suppressed,
+      suppressed: result.suppressed.filter((d) => visibleToRequest(d.harnessId)),
       /** The badge queue, newest first. */
       inApp,
       badge: inApp.length,
@@ -1030,8 +1323,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     groups: readonly string[];
     tags: readonly string[];
   }> =>
-    registry
-      .list()
+    visibleEntries()
       .filter((e) => e.missingSince === null && existsSync(e.dir))
       .map((e) => ({
         id: e.id,
@@ -1045,8 +1337,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
   /** Every live registered harness, as the inbox folders want it. */
   const liveHarnesses = (): Array<ApprovalHarness & ReviewHarness & ActivityHarness> =>
-    registry
-      .list()
+    visibleEntries()
       .filter((e) => e.missingSince === null && existsSync(e.dir))
       .map((e) => ({ id: e.id, dir: e.dir, specName: e.specName }));
 
@@ -1465,11 +1756,23 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       env: dir === null ? env : mergedSpawnEnv(env, dir).env,
       now,
       operator,
+      principal: requestCaller().principal,
+      authorize: (permission, target) => {
+        const access = currentRequestAccess();
+        const at = target ?? (entry !== null ? { harness: entry.id } : undefined);
+        if (access !== undefined) return access.authorize(permission, at);
+        // Outside a request nothing is authorized.
+        return { allow: false, needs: permission, role: null };
+      },
       contain: (segments) => {
         if (dir === null) throw new HttpError(400, "not a per-harness route");
         // Per FILE, never per directory: a listed name can be a symlink.
         const resolved = resolveInside(dir, segments);
         if (resolved === undefined) throw new HttpError(400, "path escapes the harness directory");
+        // Home's own records are never read or written through a harness, wherever it is.
+        if (isWithin(realOr(hangarRoot), realOr(resolved))) {
+          throw new HttpError(403, "this path holds Home's own records and is not served here");
+        }
         return resolved;
       },
       harnesses: (): readonly M3Harness[] => liveHarnesses(),
@@ -1553,11 +1856,26 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       json(maskDeep(value, scrubOf()), status);
 
     if (head === "relocate" && method === "POST" && tail.length === 0) {
+      // Moving a harness decides which directory every route on it reads and writes: a
+      // person who manages the whole Home's registry does it, never a token.
+      const via = requestCaller().via;
+      if (via === "service" || via === "scoped" || !requestAllows("home.registry.manage")) {
+        throw forbiddenOn("home.registry.manage");
+      }
       const body = await readBody(req);
       const newDir = requireAbsoluteDir(body["newDir"], "newDir");
       if (!existsSync(newDir) || !statSync(newDir).isDirectory()) {
         throw new HttpError(400, "newDir does not exist");
       }
+      const refused = relocationRefusal(
+        newDir,
+        hangarRoot,
+        registry
+          .list()
+          .filter((other) => other.id !== entry.id)
+          .map((other) => other.dir),
+      );
+      if (refused !== null) throw new HttpError(409, refused);
       try {
         return jsonMasked({ entry: registry.relocate(entry.id, newDir) });
       } catch (err) {
@@ -1679,7 +1997,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
               await control.wake(controlTarget(handle), {
                 lane,
                 ...(reason !== undefined ? { reason } : {}),
-                by: operator,
+                by: requestCaller().principal,
               }),
             ),
           );
@@ -1701,18 +2019,28 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         const verb = tail[1];
         if (!isApprovalId(apprId)) throw new HttpError(400, "invalid approval id");
         if (verb !== "grant" && verb !== "deny") throw new HttpError(404, "not found");
-        const body = await readBody(req);
-        const by = typeof body["by"] === "string" && body["by"] !== "" ? body["by"] : operator;
+        await readBody(req);
+        // The decision counts as the signed-in principal, decided by their class, and names
+        // them; Home's own key and a Home with sign-in off are shown with Home's label. A
+        // `by` in the body is not who decided.
+        const caller = requestCaller();
+        const actor: Parameters<typeof resolveApproval>[0]["actor"] = {
+          kind: "principal",
+          principal: caller.principal,
+          ...(caller.via === "service" ? { service: true as const } : {}),
+          display: caller.actor === null ? operator : caller.principal,
+        };
         const result = await resolveApproval({
+          decisions: controlService.decisions,
           harnessDir: liveDirOr404(entry),
           approvalId: apprId,
           decision: verb === "grant" ? "grant" : "deny",
-          by,
-          now: () => new Date(now()),
+          actor,
         });
         if (result.outcome === "not-found") throw new HttpError(404, "no such approval");
         if (result.outcome === "unreachable") throw new HttpError(409, result.reason);
         if (result.outcome === "forbidden") throw new HttpError(403, result.reason);
+        if (result.outcome === "invalid") throw new HttpError(400, result.reason);
         if (result.outcome !== "resolved") {
           // The first decision stands: say what state it left, never who made it.
           throw new HttpError(409, refusedDecisionMessage(result.outcome, result.approval));
@@ -1734,7 +2062,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           itemId,
           verdict,
           ...(note !== undefined ? { note } : {}),
-          by: operator,
+          by: requestCaller().principal,
           nowIso: new Date(now()).toISOString(),
         });
         if (result.outcome === "not-found") throw new HttpError(404, "no such review item");
@@ -1757,6 +2085,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         if (typeof kind !== "string" || !isJobKind(kind)) {
           throw new HttpError(400, 'missing "kind" — one of: doctor, compile, eval, dream-run');
         }
+        // Each kind needs the permission its own route needs.
+        const needed = JOB_KIND_PERMISSIONS[kind] ?? "h.job.run";
+        if (!requestAllows(needed, entry.id)) throw forbiddenOn(needed, entry.id);
         let argv: string[];
         try {
           argv = jobArgv(
@@ -1913,6 +2244,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const dir = liveDirOr404(entry);
       const rootInfo = resolveSessionRoot(dir);
       if (url.searchParams.get("raw") !== null) {
+        // The raw lines are the run's record as written: its owner's to read.
+        if (!requestAllows("h.files.raw", entry.id)) throw forbiddenOn("h.files.raw", entry.id);
         const raw = readTranscriptRaw(rootInfo.root, sess);
         if (raw === undefined) throw new HttpError(404, "no transcript recorded yet");
         return jsonMasked(raw);
@@ -2073,7 +2406,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     }
 
     if (head === "registry" && rest[0] === "groups" && rest.length === 1) {
-      if (method === "GET") return json({ groups: registry.listGroups() });
+      if (method === "GET") return json({ groups: visibleGroups() });
       if (method === "POST") {
         const body = await readBody(req);
         const name = body["name"];
@@ -2134,10 +2467,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           `unknown group verb "${verb}" (expected: ${GROUP_VERBS.join(" | ")})`,
         );
       }
-      if (registry.listGroups().every((g) => g.name !== groupName)) {
+      if (visibleGroups().every((g) => g.name !== groupName)) {
         throw new HttpError(404, `no group "${groupName}"`);
       }
-      const plan = groupPlan(registry, groupName, verb, { live: (dir) => existsSync(dir) });
+      const plan = narrowPlan(
+        groupPlan(registry, groupName, verb, { live: (dir) => existsSync(dir) }),
+        method === "POST",
+      );
       if (method === "GET") return json({ plan });
       if (method !== "POST") throw new HttpError(405, "method not allowed");
       if (plan.members.length === 0) {
@@ -2229,7 +2565,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (head === "health" && rest.length === 0) {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       const rows: unknown[] = [];
-      for (const entry of registry.list()) {
+      for (const entry of visibleEntries()) {
         if (entry.missingSince !== null || !existsSync(entry.dir)) continue;
         rows.push({ id: entry.id, specName: entry.specName, health: await healthFor(entry) });
       }
@@ -2240,7 +2576,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       return json(
         onboardingView({
-          harnessCount: registry.list().length,
+          harnessCount: visibleEntries().length,
           scanRootCount: registry.listScanRoots().length,
           suggestions: suggestScanRoots(env, homedir(), cwd),
           demo: demoAvailability(env, demosDir),
@@ -2305,6 +2641,17 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       if (method === "GET") return json(maskDeep(notificationsView(), fleetScrub()));
       if (method === "PUT") {
         const body = await readBody(req);
+        // Every field here is Home's, one block shared by everyone (the rules, quiet hours,
+        // muted groups and the webhook): changing any of them is managing Home's settings.
+        const current = settings.get().notifications as Readonly<Record<string, unknown>>;
+        const changes = HOME_NOTIFICATION_FIELDS.some(
+          (field) =>
+            Object.hasOwn(body, field) &&
+            JSON.stringify(body[field]) !== JSON.stringify(current[field]),
+        );
+        if (changes && !requestAllows("home.settings.manage")) {
+          throw forbiddenOn("home.settings.manage");
+        }
         try {
           settings.update({ notifications: body });
         } catch (err) {
@@ -2317,7 +2664,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
     if (head === "notifications" && rest[0] === "clear" && rest.length === 1) {
       if (method !== "POST") throw new HttpError(405, "method not allowed");
-      notifications.clear();
+      // The queue is Home's: a caller clears the entries it may read, and the rest stay.
+      notifications.clearWhere((d) => visibleToRequest(d.harnessId));
       return json({ ok: true, badge: 0 });
     }
 
@@ -2326,8 +2674,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         return json({
           enabled: readOnlyNow(),
           locked: readOnlyLocked,
-          exempt: [...READ_ONLY_EXEMPT].sort(),
-          note: "read-only mode prevents accidents during a demo or screen-share; the bearer token, not this toggle, is the security boundary",
+          exempt: readOnlyExempt(),
+          note: "read-only mode prevents accidents during a demo or screen-share; who may do what is decided per route, not by this toggle",
         });
       }
       if (method === "PUT") {
@@ -2399,6 +2747,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         maskDeep(
           approvalsInbox(liveHarnesses(), {
             includeSettled: url.searchParams.get("all") !== null,
+            showsContent: contentVisibleToRequest,
           }),
           fleetScrub(),
         ),
@@ -2411,6 +2760,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         maskDeep(
           reviewInbox(liveHarnesses(), {
             includeResolved: url.searchParams.get("all") !== null,
+            showsContent: contentVisibleToRequest,
           }),
           fleetScrub(),
         ),
@@ -2431,11 +2781,14 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       // visible to the operator it exists to inform.
       const limitRaw = url.searchParams.get("recent");
       const limit = limitRaw === null ? undefined : Number.parseInt(limitRaw, 10);
+      // Only the jobs of harnesses this caller may read.
+      const mine = <T extends { readonly harnessId?: string }>(jobs: readonly T[]): T[] =>
+        jobs.filter((job) => job.harnessId === undefined || visibleToRequest(job.harnessId));
       return json({
-        pending: processes.jobs.pending(),
-        running: processes.jobs.running(),
-        recent: processes.jobs.recent(
-          limit !== undefined && Number.isFinite(limit) ? limit : undefined,
+        pending: mine(processes.jobs.pending()),
+        running: mine(processes.jobs.running()),
+        recent: mine(
+          processes.jobs.recent(limit !== undefined && Number.isFinite(limit) ? limit : undefined),
         ),
       });
     }
@@ -2460,7 +2813,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const scope = url.searchParams.get("harness");
       const entries =
         scope === null
-          ? registry.list().filter((e) => e.missingSince === null && existsSync(e.dir))
+          ? visibleEntries().filter(
+              (e) => e.missingSince === null && existsSync(e.dir) && contentVisibleToRequest(e.id),
+            )
           : (() => {
               const entry = entryOr404(scope);
               liveDirOr404(entry);
@@ -2600,11 +2955,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     const assets = opts.assets;
     if (assets !== undefined) {
       const asset = assets[pathname] ?? (pathname === "/" ? assets["/index.html"] : undefined);
-      if (asset !== undefined) {
-        return new Response(asset.body, {
-          headers: { ...SHELL_HEADERS, "content-type": asset.contentType },
-        });
-      }
+      if (asset !== undefined) return assetResponse(req, pathname, asset);
     }
     if (pathname === "/") return builtinIndex();
     return errResponse(404, "not found");
@@ -2614,8 +2965,67 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     control: controlService,
     harness: (id) => registry.get(id),
     scrubFor: (dir) => (dir === undefined ? fleetScrub() : harnessScrub(dir)),
+    // The receipt's actor is the signed-in principal; Home's own key and a Home with
+    // sign-in turned off leave it to the head's own user, which is the owner.
+    actorOf: () => {
+      const caller = currentRequestAccess()?.caller;
+      return caller !== undefined && caller.actor !== null ? caller.principal : undefined;
+    },
     onWarn,
   });
+
+  /** The origins Home answers on: a scoped token is refused from any other page. */
+  const ownOrigin = (origin: string): boolean => {
+    const port = server.port ?? 0;
+    const own = new Set([
+      `http://${hostname}:${port}`,
+      `http://127.0.0.1:${port}`,
+      `http://localhost:${port}`,
+      ...(ownerSettings.baseUrl !== undefined ? [new URL(ownerSettings.baseUrl).origin] : []),
+    ]);
+    return own.has(origin);
+  };
+
+  /** The harness that holds a run's proof bundles, resolved before authorizing for it. */
+  const proofOwner = (runId: string | undefined, url: URL): string | null => {
+    if (runId === undefined || !isProofRunId(runId)) return null;
+    const scope = url.searchParams.get("harness");
+    if (scope !== null) {
+      return HARNESS_ID_RE.test(scope) && registry.get(scope) !== undefined ? scope : null;
+    }
+    const harnesses = registry
+      .list()
+      .filter((e) => e.missingSince === null && existsSync(e.dir))
+      .map((e) => {
+        const tenants = proofTenants(e.dir, e.target);
+        return {
+          id: e.id,
+          dir: e.dir,
+          specName: e.specName,
+          ...(tenants !== undefined ? { tenants } : {}),
+        };
+      });
+    return proofView(harnesses, runId).bundles[0]?.harnessId ?? null;
+  };
+
+  /** The one predicate at a filtered fold's exit: items about people are withheld. */
+  const peopleExit = async (response: Response, access: RequestAccess): Promise<Response> => {
+    if (response.status !== 200) return response;
+    if (!(response.headers.get("content-type") ?? "").includes("application/json")) {
+      return response;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await response.clone().text());
+    } catch {
+      return response;
+    }
+    const exited = withholdPeople(parsed, access.peopleAllowed);
+    if (exited === parsed) return response;
+    const headers = new Headers(response.headers);
+    headers.delete("content-length");
+    return new Response(`${JSON.stringify(exited)}\n`, { status: response.status, headers });
+  };
 
   const hosts = allowedHosts({
     bound: [hostname],
@@ -2674,25 +3084,23 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       });
     }
 
+    // An invite link (`/invite#c=…`) opens the console, which reads the code itself.
+    if (pathname === "/invite") return serveStatic(req, "/");
+
     if (isSignInPath(pathname)) {
       if (noAuth) return errResponse(404, "not found");
       return await serveSignIn(homeAccess, req, peer, pathname);
     }
 
     if (pathname === "/api" || pathname.startsWith("/api/")) {
+      let answer: Authenticated | undefined;
       if (!noAuth) {
         const checked = await checkAccess(homeAccess, req, peer);
         const refused = refusalOf(checked.answer);
         if (refused !== undefined) return refusalResponse(pathname, refused);
         req = checked.request;
+        answer = checked.answer;
         callers.set(req, checked.answer);
-      }
-      // HM-187 — read-only mode, enforced HERE, ahead of every handler.
-      // Placed after auth and before dispatch so it covers the M1/M2 chain
-      // and the M3 table identically, and so a route added next month is
-      // covered by construction rather than by remembering to be.
-      if (readOnlyNow() && isReadOnlyRefused(req.method, pathname)) {
-        return json(readOnlyRefusal(req.method, pathname, readOnlyLocked), 403);
       }
       let segs: string[];
       try {
@@ -2703,19 +3111,54 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       } catch {
         return errResponse(400, "malformed path encoding");
       }
-      try {
-        return await withReceipt(req, segs, () => api(req, url, segs.slice(1)));
-      } catch (err) {
-        if (err instanceof HttpError) {
-          return err.body === undefined
-            ? errResponse(err.status, err.message)
-            : json(maskDeep({ error: err.message, ...err.body }, fleetScrub()), err.status);
-        }
-        onWarn(
-          `hangar-server: unhandled route error: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        return errResponse(500, "internal error");
+      // Undeclared means unreachable: a method and path no row names answers 404 for
+      // everyone, the owner and Home's own key included, and no handler runs.
+      const matched = matchRequest(req.method, segs);
+      if (matched === undefined) return errResponse(404, "not found");
+      const read = signIn.snapshot();
+      // A request that sees the access records move re-checks the open streams too.
+      recheckStreams(read);
+      const caller = callerOf(answer, read, operator);
+      if (caller === undefined) return errResponse(401, "missing or invalid bearer token");
+      const view = accessView(read);
+      const decided = authorizeRequest({
+        row: matched.row,
+        params: matched.params,
+        caller,
+        view,
+        ...(matched.row.key === "runProof"
+          ? { runProofHarness: proofOwner(matched.params["sessionId"], url) }
+          : {}),
+        origin: req.headers.get("origin"),
+        ownOrigin,
+      });
+      if (!decided.allow) return refusalResponse(pathname, decided.refusal);
+      // HM-187 — read-only mode, after authorization (a caller who may not do something
+      // hears that first) and ahead of every handler. It decides by the matched row: a
+      // row that writes a receipt changes something, and is refused.
+      if (readOnlyNow() && isReadOnlyRefused(matched.row)) {
+        return json(readOnlyRefusal(req.method, pathname, readOnlyLocked), 403);
       }
+      authorized.set(req, { ...matched, caller });
+      const access = requestAccessFor(caller, view);
+      return await withRequestAccess(access, async () => {
+        try {
+          const response = await withReceipt(req, segs, () => api(req, url, segs.slice(1)));
+          return matched.row.qualifiers.includes("filtered")
+            ? await peopleExit(response, access)
+            : response;
+        } catch (err) {
+          if (err instanceof HttpError) {
+            return err.body === undefined
+              ? errResponse(err.status, err.message)
+              : json(maskDeep({ error: err.message, ...err.body }, fleetScrub()), err.status);
+          }
+          onWarn(
+            `hangar-server: unhandled route error: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return errResponse(500, "internal error");
+        }
+      });
     }
 
     return serveStatic(req, pathname);
@@ -2801,7 +3244,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   }
   // Live run streams opened with a session close when it ends.
   let stopped = false;
-  const sessionTimer = setInterval(() => signIn.checkSessions(), SESSION_CHECK_MS);
+  const sessionTimer = setInterval(checkStreams, SESSION_CHECK_MS);
   (sessionTimer as { unref?: () => void }).unref?.();
   // Boot the process picture: the port ledger is already open (the layer
   // owns it), every registered harness with a runfile is adopted, and only
@@ -2845,7 +3288,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     processes,
     controlService,
     readOnly: readOnlyNow,
-    checkSessions: () => signIn.checkSessions(),
+    checkSessions: checkStreams,
     ready,
     stop: async () => {
       if (stopped) return;

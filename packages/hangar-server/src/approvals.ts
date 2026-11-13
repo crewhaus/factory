@@ -11,10 +11,12 @@
  * it, so a line that disagrees with a claim never folds. A final line with no
  * newline is a write still landing: it waits for the next read.
  *
- * WRITES GO THROUGH THE SANCTIONED STORE. Grant and deny call the store's
+ * WRITES GO THROUGH THE DECISION SERVICE. Grant and deny call control-service's
+ * `decisions.resolve`, the one decision path the CLI takes too: it decides by the
+ * signed-in member's class and records that member, through the store's
  * `decide`, which takes the session root's lock and publishes an exclusive
- * decision claim: the first decision on a request wins, from Home, the CLI or
- * a channel, and a later one is answered with the winner. The CLI
+ * decision claim. The first decision on a request wins, from Home, the CLI or a
+ * channel, and a later one is answered with the winner. The CLI
  * (`crewhaus approvals`) and the runtime's re-resolve path read through the
  * same store, so a manager can never write a shape they do not recognize.
  *
@@ -27,12 +29,11 @@
 import { join } from "node:path";
 import { APPROVAL_ID_RE } from "@crewhaus/control-contract";
 import { readTail } from "@crewhaus/control-records";
+import type { DecisionActor, Decisions } from "@crewhaus/control-service";
 import {
   type ApprovalDecision,
   type PendingApproval,
-  createPendingApprovalStore,
   foldWithClaims,
-  ownerAuthorizer,
 } from "@crewhaus/session-store";
 import { MAX_JSONL_BYTES, MAX_JSONL_LINES } from "./constants";
 import { maskDeep } from "./mask";
@@ -54,16 +55,18 @@ export type ApprovalRow = {
   readonly harnessDir: string;
   readonly specName: string;
   readonly toolName: string;
-  /** Verbatim tool input, credential-masked. */
+  /** Verbatim tool input, credential-masked; `null` when the reader may not read content. */
   readonly input: unknown;
+  /** Set when the input exists but this reader may not read this harness's content. */
+  readonly inputWithheld?: true;
   readonly inputHash: string;
   readonly surface: string;
   readonly createdAt: string;
   readonly status: "pending" | "granted" | "granted-always" | "denied" | "consumed" | "superseded";
   readonly decidedBy: string | null;
   readonly decidedAt: string | null;
-  /** #383 — the grant was recorded as a standing allow (an `alwaysAllow`
-   *  rule in the harness's `.crewhaus/settings.json` covers the tool). */
+  /** The grant was recorded with a standing rule: a narrow, expiring `alwaysAllow`
+   *  in the harness's `.crewhaus/settings.json` covers the call it was made from. */
   readonly always?: boolean;
   /** The run that parked on this approval — the grant-and-resume link. */
   readonly runId: string;
@@ -83,7 +86,9 @@ export type ApprovalsView = {
   readonly truncatedHarnesses: readonly string[];
 };
 
-function statusOf(a: PendingApproval): ApprovalRow["status"] {
+/** One request's state, the inbox's own rule: only `"pending"` waits on a person.
+ *  Exported for the command menu, which indexes what is pending by it. */
+export function statusOf(a: PendingApproval): ApprovalRow["status"] {
   // A replaced request is settled whatever it said before; first, as
   // `effectiveDecisionState` puts it.
   if (a.supersededBy !== undefined) return "superseded";
@@ -125,13 +130,18 @@ export type ApprovalHarness = {
 /** Fold every registered harness's approvals into one inbox, newest first. */
 export function approvalsInbox(
   harnesses: readonly ApprovalHarness[],
-  opts: { readonly includeSettled?: boolean } = {},
+  opts: {
+    readonly includeSettled?: boolean;
+    /** Whether the reader may read this harness's content; the tool input is withheld otherwise. */
+    readonly showsContent?: (harnessId: string) => boolean;
+  } = {},
 ): ApprovalsView {
   const rows: ApprovalRow[] = [];
   const truncatedHarnesses: string[] = [];
   for (const harness of harnesses) {
     const { approvals, truncated } = foldApprovals(harness.dir);
     if (truncated) truncatedHarnesses.push(harness.id);
+    const content = opts.showsContent?.(harness.id) ?? true;
     for (const a of approvals) {
       const status = statusOf(a);
       if (opts.includeSettled !== true && status !== "pending") continue;
@@ -142,8 +152,10 @@ export function approvalsInbox(
         specName: harness.specName,
         toolName: a.toolName,
         // Verbatim, then masked: the approver sees the real call, never a
-        // credential that happened to be an argument to it.
-        input: maskDeep(a.input ?? null),
+        // credential that happened to be an argument to it. A reader who may not read
+        // this harness's content sees that it is withheld, not what it says.
+        input: content ? maskDeep(a.input ?? null) : null,
+        ...(content ? {} : { inputWithheld: true }),
         inputHash: a.inputHash,
         surface: a.surface,
         createdAt: a.createdAt,
@@ -174,14 +186,18 @@ export type ResolveApprovalResult =
   /** The request is spent or replaced, so there is nothing left to decide. */
   | { readonly outcome: "stale"; readonly approval: PendingApproval }
   | { readonly outcome: "expired"; readonly approval: PendingApproval }
-  | { readonly outcome: "forbidden"; readonly reason: string };
+  | { readonly outcome: "forbidden"; readonly reason: string }
+  | { readonly outcome: "invalid"; readonly reason: string };
 
 /**
- * Record a decision THROUGH the sanctioned store's `decide`, so the CLI verbs
- * and the runtime's re-resolve path see exactly the record they expect, and
- * the first decision wins: a request already decided from any surface answers
- * `already-decided`. The decision is recorded as coming through Home, and the
- * harness's approver projection says who it is recorded as (`ownerAuthorizer`).
+ * Record a decision through the decision service, so the CLI verbs and the
+ * runtime's re-resolve path see exactly the record they expect, and the first
+ * decision wins: a request already decided from any surface answers
+ * `already-decided`. The decision is recorded as coming through Home, as the
+ * member `actor` names, with Home's operator label as its display name.
+ *
+ * The session root is the harness's own, contained to it: one that leaves the
+ * harness is refused before anything is read.
  *
  * `ttlDays` is passed as `Number.MAX_SAFE_INTEGER` deliberately: `resolve`
  * folds the file to find the record, and a manager settling an approval that
@@ -190,27 +206,26 @@ export type ResolveApprovalResult =
  * disk. Eviction stays the store's own job, on its own schedule.
  */
 export async function resolveApproval(args: {
+  readonly decisions: Decisions;
   readonly harnessDir: string;
   readonly approvalId: string;
   readonly decision: ApprovalDecision;
-  readonly by: string;
-  readonly now?: () => Date;
+  readonly actor: DecisionActor;
 }): Promise<ResolveApprovalResult> {
   if (!isApprovalId(args.approvalId)) return { outcome: "not-found" };
   const { root } = resolveSessionRoot(args.harnessDir);
   if (resolveContained(root, APPROVALS_FILENAME) === undefined) {
     return { outcome: "unreachable", reason: "the session root escapes the harness dir" };
   }
-  const store = createPendingApprovalStore({
+  const answer = await args.decisions.resolve({
+    harnessDir: args.harnessDir,
     rootDir: root,
+    ref: args.approvalId,
+    choice: args.decision,
+    actor: args.actor,
+    via: "home",
     ttlDays: Number.MAX_SAFE_INTEGER,
-    ...(args.now !== undefined ? { now: args.now } : {}),
   });
-  const answer = await store.decide(
-    args.approvalId,
-    { choice: args.decision, actor: { display: args.by }, via: "home" },
-    { authorize: ownerAuthorizer(args.harnessDir) },
-  );
   switch (answer.outcome) {
     case "decided":
       return answer.record === null
@@ -223,6 +238,8 @@ export async function resolveApproval(args: {
         outcome: "forbidden",
         reason: answer.reason ?? "not allowed to decide this request",
       };
+    case "invalid":
+      return { outcome: "invalid", reason: answer.reason ?? "the request is not valid" };
     case "already-decided":
     case "stale":
     case "expired":

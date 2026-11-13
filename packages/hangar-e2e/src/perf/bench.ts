@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { bootHome } from "../boot";
-import { LIBRARY_ROUTE, globalRoute, harnessRoute } from "../console-routes";
+import { HOME_ROUTE, routeFor } from "../console-routes";
 import { seedFleet } from "../seed/fleet";
 import { closeSharedBrowser, openSession } from "../session";
 import { type MachineFingerprint, machineFingerprint } from "./machine";
@@ -43,12 +43,13 @@ export async function runBench(opts: {
     const home = bootHome(fleet);
     try {
       const session = await openSession(home, { label: "bench" });
-      const id = fleet.harnesses[0]?.id ?? "";
+      const harness = fleet.harnesses[0] ?? { id: "" };
+      const id = harness.id;
       const routes = [
-        LIBRARY_ROUTE,
-        globalRoute("runs"),
-        harnessRoute(id, "overview"),
-        harnessRoute(id, "sessions"),
+        HOME_ROUTE,
+        routeFor("#/home/working"),
+        routeFor("#/h/:id", harness),
+        routeFor("#/h/:id/work/sessions", harness),
       ];
       const samples: Record<string, number[]> = {};
       for (const route of routes) {
@@ -56,7 +57,7 @@ export async function runBench(opts: {
         samples[key] = [];
         for (let pass = 0; pass < SMOKE_PASSES; pass++) {
           // Leave the route first, or a second visit to it would not navigate.
-          await session.visit(pass % 2 === 0 ? globalRoute("settings") : globalRoute("health"));
+          await session.visit(pass % 2 === 0 ? "#/settings" : "#/harnesses/health");
           const started = performance.now();
           await session.visit(route);
           samples[key]?.push(Math.round(performance.now() - started));

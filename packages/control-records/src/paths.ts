@@ -47,6 +47,10 @@ export type ControlPaths = {
    * directory, outside `control/`.
    */
   readonly heartbeatFile: string;
+  /** The standing rules: one row per change to a narrow, expiring allow. */
+  readonly standingRulesFile: string;
+  /** The `dec_` decisions that are not tool approvals, in size segments. */
+  readonly decisionsDir: string;
 };
 
 /**
@@ -70,6 +74,8 @@ export function controlPaths(harnessDir: string): ControlPaths {
     deploymentsFile: join(controlDir, "deployments.jsonl"),
     harnessIdentityFile: join(controlDir, "harness.json"),
     heartbeatFile: join(runDir, "control-heartbeat.json"),
+    standingRulesFile: join(controlDir, "standing-rules.jsonl"),
+    decisionsDir: join(controlDir, "decisions"),
   };
 }
 

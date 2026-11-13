@@ -31,6 +31,7 @@
  */
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import type { LocalIdentity } from "@crewhaus/access-control";
 import { EXIT_FOR_ERROR, EXIT_FOR_REJECTED_RECEIPT } from "@crewhaus/control-contract";
 import { ensureDigestKey, readHarnessIdentity } from "@crewhaus/control-records";
 import {
@@ -118,6 +119,8 @@ export type DaemonCommandOptions = {
   readonly followPollMs?: number;
   /** `fetch` for the control.v1 calls; injected in tests. */
   readonly fetch?: typeof fetch;
+  /** The local user this head acts as; injected in tests. Defaults to this process's. */
+  readonly identity?: LocalIdentity;
 };
 
 const DAEMON_USAGE_LINES: readonly string[] = [
@@ -518,7 +521,7 @@ function controlLines(
  * did. A re-run it starts after a crash goes through this file's own supervisor, with
  * preflight on and nothing forced.
  */
-function directControl(opts: DaemonCommandOptions): ControlService {
+export function directControl(opts: DaemonCommandOptions): ControlService {
   const env = opts.env ?? process.env;
   return wireControl(
     {
@@ -531,7 +534,7 @@ function directControl(opts: DaemonCommandOptions): ControlService {
         const outcome = await control.drain(controlTargetFor(resolveHarness(dir, opts)));
         if (!outcome.ok) throw new Error(outcome.reason);
       },
-      identity: currentLocalIdentity(),
+      identity: opts.identity ?? currentLocalIdentity(),
       now: (opts.clock ?? systemClock).now,
       probe: withOwnStartTime(opts.ops ?? createProcessOps()),
     },
@@ -547,12 +550,25 @@ const recoveredHarnesses = new Set<string>();
  * `harness.json` carries; otherwise the receipt names itself. Only reads.
  */
 function targetFor(harness: ResolvedHarness, opts: DaemonCommandOptions): string | undefined {
+  const id = harnessIdOf(harness.dir, opts);
+  return id !== undefined ? `home/harness/${id}` : undefined;
+}
+
+/** A harness directory's id: its registry row's, else the one its `harness.json` carries. Only reads. */
+export function harnessIdOf(dir: string, opts: DaemonCommandOptions): string | undefined {
   const entry = openRegistrySafe(opts)
     ?.list()
-    .find((e) => e.dir === harness.dir);
-  if (entry !== undefined) return `home/harness/${entry.id}`;
-  const identity = readHarnessIdentity(harness.dir);
-  return identity.state === "present" ? `home/harness/${identity.identity.id}` : undefined;
+    .find((e) => e.dir === dir);
+  if (entry !== undefined) return entry.id;
+  const identity = readHarnessIdentity(dir);
+  return identity.state === "present" ? identity.identity.id : undefined;
+}
+
+/** Every registered harness whose directory is there now, for a head that must find one. */
+export function liveHarnessDirs(opts: DaemonCommandOptions): readonly string[] {
+  return (openRegistrySafe(opts)?.list() ?? [])
+    .filter((entry) => entry.missingSince === null && existsSync(entry.dir))
+    .map((entry) => entry.dir);
 }
 
 type Settled = { readonly result: DaemonCommandResult; readonly settle: Settlement };

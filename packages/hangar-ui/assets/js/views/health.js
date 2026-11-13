@@ -13,7 +13,7 @@
 
 import { api } from "../api.js";
 import { clear, collapsible, dot, el, emptyState, skeleton } from "../dom.js";
-import { hrefHarness } from "../router.js";
+import { hrefHarness, screenHref, screenLabel } from "../router.js";
 
 /** band → the traffic-light state, always paired with the text below. */
 const BAND_DOT = { good: "ok", fair: "warn", poor: "bad" };
@@ -27,14 +27,15 @@ const BAND_TEXT = {
 function deductionRow(id, deduction) {
   const points = Number(deduction?.points ?? 0);
   const screen = String(deduction?.screen ?? "overview");
+  const where = screenLabel(screen);
   return el("li", { class: "ded-row" }, [
     el("span", { class: "ded-points mono", text: `−${points}` }),
     el("span", { class: "ded-label", text: String(deduction?.label ?? "") }),
     el("span", { class: "ded-detail muted", text: String(deduction?.detail ?? "") }),
     // The whole point of the item: a deduction that names where it is fixed.
     id
-      ? el("a", { class: "ded-fix", href: hrefHarness(id, screen), text: `fix in ${screen} →` })
-      : el("span", { class: "ded-fix muted", text: `fix in ${screen}` }),
+      ? el("a", { class: "ded-fix", href: screenHref(id, screen), text: `Fix in ${where} →` })
+      : el("span", { class: "ded-fix muted", text: `Fix in ${where}` }),
   ]);
 }
 

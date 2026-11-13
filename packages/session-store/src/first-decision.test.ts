@@ -18,11 +18,12 @@ import {
   APPROVALS_DIRNAME,
   type AuthorizeRequest,
   DEFAULT_APPROVALS_FILENAME,
+  NO_PRINCIPAL_REASON,
   type PendingApproval,
   createPendingApprovalStore,
   evictExpiredApprovals,
   foldReadOnly,
-  ownerAuthorizer,
+  principalAuthorizer,
 } from "./index";
 import {
   ALLOW,
@@ -516,8 +517,11 @@ describe("the tenant fence", () => {
   });
 });
 
-describe("ownerAuthorizer", () => {
+describe("principalAuthorizer", () => {
   const OWNER = mintId("prn");
+  const OPERATOR = mintId("prn");
+  const MAINTAINER = mintId("prn");
+  const SERVICE = mintId("prn");
   const projection = {
     v: 1,
     epoch: 1,
@@ -525,7 +529,11 @@ describe("ownerAuthorizer", () => {
     harness: "hrn_0123456789abcdef",
     owner: OWNER,
     governedSince: "2026-11-01T00:00:00.000Z",
-    members: [],
+    members: [
+      { principal: OPERATOR, decide: "operator" },
+      { principal: MAINTAINER, decide: "maintainer" },
+      { principal: SERVICE, decide: "maintainer" },
+    ],
     links: [],
   };
   const reader = () => createApproverReader({ now: () => 0 });
@@ -538,43 +546,159 @@ describe("ownerAuthorizer", () => {
     }
     return dir;
   };
-  const request = { op: "decide", record: pending(), requiredClass: "operator" } as const;
+  const governed = () => harness(`${JSON.stringify(projection)}\n`);
+  const claimsOf = (root: string): string[] => claimTexts(root);
 
-  test("no projection: allowed, and no principal is recorded", async () => {
-    expect(await ownerAuthorizer(harness(), reader())(request)).toEqual({ ok: true });
-  });
-
-  test("a projection: allowed, and the decision is recorded as the owner's", async () => {
-    const dir = harness(`${JSON.stringify(projection)}\n`);
-    expect(await ownerAuthorizer(dir, reader())(request)).toEqual({ ok: true, principal: OWNER });
+  async function parked(requiredClass?: "maintainer") {
     const root = tempRoot();
     const store = createPendingApprovalStore({ rootDir: root });
-    const p = pending();
+    const p = pending(requiredClass !== undefined ? { requiredClass } : {});
     await store.persist(p);
+    return { root, store, p };
+  }
+
+  test("no projection: decided, and no principal is recorded", async () => {
+    const { root, store, p } = await parked();
+    const answer = await store.decide(
+      p.id,
+      { choice: "grant", actor: { display: "alice" } },
+      { authorize: principalAuthorizer(harness(), {}, { reader: reader() }) },
+    );
+    expect(answer.outcome).toBe("decided");
+    expect(answer.record?.decidedByPrincipal).toBeUndefined();
+    expect(decideLines(root, p.id)[0]?.["by"]).toBeUndefined();
+  });
+
+  test("no projection: a signed-in principal is recorded", async () => {
+    const { store, p } = await parked();
+    const answer = await store.decide(
+      p.id,
+      { choice: "grant", actor: {} },
+      { authorize: principalAuthorizer(harness(), { principal: OWNER }, { reader: reader() }) },
+    );
+    expect(answer.record?.decidedByPrincipal).toBe(OWNER);
+  });
+
+  test("an operator on a request that needs a maintainer: refused by class, nothing claimed", async () => {
+    const { root, store, p } = await parked("maintainer");
+    const answer = await store.decide(
+      p.id,
+      { choice: "grant", actor: { display: "op" } },
+      { authorize: principalAuthorizer(governed(), { principal: OPERATOR }, { reader: reader() }) },
+    );
+    expect(answer.outcome).toBe("forbidden");
+    expect(answer.reason).toBe("Needs a maintainer.");
+    expect(answer.reason).not.toContain(MAINTAINER);
+    expect(claimsOf(root)).toEqual([]);
+    expect(decideLines(root, p.id)).toHaveLength(0);
+  });
+
+  test("a maintainer decides it, and the decision is recorded as that member", async () => {
+    const { root, store, p } = await parked("maintainer");
     const answer = await store.decide(
       p.id,
       { choice: "grant", actor: { local: "local:alice@host", display: "alice" } },
-      { authorize: ownerAuthorizer(dir, reader()) },
+      {
+        authorize: principalAuthorizer(governed(), { principal: MAINTAINER }, { reader: reader() }),
+      },
     );
-    expect(answer.record?.decidedByPrincipal).toBe(OWNER);
-    expect(decideLines(root, p.id)[0]?.["by"]).toBe(OWNER);
+    expect(answer.outcome).toBe("decided");
+    expect(answer.record?.decidedByPrincipal).toBe(MAINTAINER);
+    expect(answer.record?.decidedBy).toBe("alice");
+    expect(decideLines(root, p.id)[0]?.["by"]).toBe(MAINTAINER);
+  });
+
+  test("an operator cannot supersede; the owner can", async () => {
+    const { store, p } = await parked();
+    await store.decide(
+      p.id,
+      { choice: "grant", actor: {} },
+      { authorize: principalAuthorizer(governed(), { principal: OWNER }, { reader: reader() }) },
+    );
+    const refused = await store.supersede(
+      p.id,
+      { actor: {}, reason: "decided-in-error" },
+      { authorize: principalAuthorizer(governed(), { principal: OPERATOR }, { reader: reader() }) },
+    );
+    expect(refused.outcome).toBe("forbidden");
+    expect(refused.reason).toBe("Needs a maintainer.");
+    const done = await store.supersede(
+      p.id,
+      { actor: {}, reason: "decided-in-error" },
+      { authorize: principalAuthorizer(governed(), { principal: OWNER }, { reader: reader() }) },
+    );
+    expect(done.outcome).toBe("superseded");
+  });
+
+  test("a service principal decides nothing above operator", async () => {
+    const { root, store, p } = await parked("maintainer");
+    const answer = await store.decide(
+      p.id,
+      { choice: "grant", actor: {} },
+      {
+        authorize: principalAuthorizer(
+          governed(),
+          { principal: SERVICE, service: true },
+          { reader: reader() },
+        ),
+      },
+    );
+    expect(answer.outcome).toBe("forbidden");
+    expect(answer.reason).toBe("Needs a maintainer.");
+    expect(claimsOf(root)).toEqual([]);
+    // The same member signed in as a person reaches maintainer.
+    const asPerson = await store.decide(
+      p.id,
+      { choice: "grant", actor: {} },
+      { authorize: principalAuthorizer(governed(), { principal: SERVICE }, { reader: reader() }) },
+    );
+    expect(asPerson.outcome).toBe("decided");
+  });
+
+  test("a governed harness refuses a decision with no principal", async () => {
+    const { root, store, p } = await parked();
+    const answer = await store.decide(
+      p.id,
+      { choice: "deny", actor: { display: "anyone" } },
+      { authorize: principalAuthorizer(governed(), {}, { reader: reader() }) },
+    );
+    expect(answer.outcome).toBe("forbidden");
+    expect(answer.reason).toBe(NO_PRINCIPAL_REASON);
+    expect(claimsOf(root)).toEqual([]);
+  });
+
+  test("a stranger to the projection is refused; the owner always decides", async () => {
+    const { store, p } = await parked("maintainer");
+    const stranger = await store.decide(
+      p.id,
+      { choice: "grant", actor: {} },
+      {
+        authorize: principalAuthorizer(
+          governed(),
+          { principal: mintId("prn") },
+          { reader: reader() },
+        ),
+      },
+    );
+    expect(stranger.outcome).toBe("forbidden");
+    const owner = await store.decide(
+      p.id,
+      { choice: "grant", actor: {} },
+      { authorize: principalAuthorizer(governed(), { principal: OWNER }, { reader: reader() }) },
+    );
+    expect(owner.record?.decidedByPrincipal).toBe(OWNER);
   });
 
   test("an unreadable projection: forbidden, naming crewhaus access sync", async () => {
     const dir = harness("{ not json");
-    const answer = await ownerAuthorizer(dir, reader())(request);
-    expect(answer.ok).toBe(false);
-    expect(answer.ok === false && answer.reason).toContain("crewhaus access sync");
-    const root = tempRoot();
-    const store = createPendingApprovalStore({ rootDir: root });
-    const p = pending();
-    await store.persist(p);
+    const { root, store, p } = await parked();
     const decided = await store.decide(
       p.id,
       { choice: "grant", actor: {} },
-      { authorize: ownerAuthorizer(dir, reader()) },
+      { authorize: principalAuthorizer(dir, { principal: OWNER }, { reader: reader() }) },
     );
     expect(decided.outcome).toBe("forbidden");
+    expect(decided.reason).toContain("crewhaus access sync");
     expect(decidedLines(root, p.id)).toHaveLength(0);
   });
 });

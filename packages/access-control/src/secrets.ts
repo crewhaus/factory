@@ -4,7 +4,7 @@
  */
 import { ISSUED_SECRET_RES } from "@crewhaus/control-contract";
 
-/** The kinds minted here. A scoped `chx_` token is not minted by this package yet. */
+/** The kinds minted here. A scoped `chx_` token carries signed claims: `scoped.ts` mints it. */
 export type IssuedSecretKind = "session" | "personal" | "service" | "invite";
 
 const PREFIXES: Readonly<Record<IssuedSecretKind, string>> = Object.freeze({

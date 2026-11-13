@@ -86,10 +86,27 @@ own key do. Their fold is tolerant: a torn line is skipped, never a reason to si
   `hangar-ui/assets/js/sealed.js`; a test seals here and opens there.
 - **`authenticate(request, peer, config, state)`** takes the proxy identity (only from a listed peer
   with the proxy's secret, or on `proxy.sock`), then the bearer (`cha_` a session, `chs_` a service
-  token, anything else Home's own key under the rules above), refuses a bearer and an identity that
-  name different principals (`identity_mismatch`), and answers 403 `not_invited` for an identity nobody
-  linked. Until route authorization lands, `admitUntilAuthorization` admits only the home owner: any
-  other principal is refused with `authorization_unavailable` (`owner_only`).
+  token, `chx_` a scoped token, any other `ch?_` shape unknown, anything else Home's own key under the
+  rules above), refuses a bearer and an identity that name different principals (`identity_mismatch`),
+  and answers 403 `not_invited` for an identity nobody linked. It answers every live identity, with the
+  credential a token used; what each may do is Home's choke point's to decide, route by route, with
+  `authorize()`. A tab-only session counts only over TCP, on the address the LAN door bound, with no
+  forwarding or proxy header.
+- **Joining from an invite.** `acceptInvite` spends the code first (the claim decides; a second use is
+  `consumed`), then writes a new member, their display name (in `subjects.json` only), the invite's
+  grant, and either a device key and a sealed session, or, for a page served over plain HTTP, a
+  tab-only session from a secret the page made, of which only the digest is kept. A tab-only session
+  cannot be renewed. A write that fails after the claim answers 503 and the invite stays spent.
+- **Scoped tokens.** `mintScopedToken` makes a `chx_<payload>.<mac>` token from a live service token:
+  run refs only, read acts only (`run.events.read`, `run.result.read`), each one the service may
+  delegate on every ref's harness, for at most 15 minutes, signed with `access/keys/scoped.key` (0600).
+  `verifyScopedToken` checks its MAC in constant time, its clock, and that the minting service token is
+  still live, so revoking that token ends every token it minted. Nothing about a token is stored.
+- **Domains and objects.** A domain's checker receives the object the request is about (`ref`) exactly
+  as the caller named it, and no `ref` key at all when none was named: a checker that decides per object
+  refuses then. `registerDomainIn` keeps every domain table to one set of rules.
+- **`--no-auth`.** `noAuthRefusal` says why Home must not turn sign-in off: a trusted proxy is set, or
+  someone other than the owner has access.
 - **Rotation.** `rotateBootstrap` writes a new key at 0600, revokes the old digest, records the new one
   (socket-only when asked, and it stays so until `tcp`), ends every session and revokes every device
   key, and moves the revision once. Another user of the computer is refused.
@@ -104,9 +121,10 @@ own key do. Their fold is tolerant: a torn line is skipped, never a reason to si
 |---|---|---|
 | `ensureAccessSetUp(hangarRoot, {localActor, now?, displayName?})` | The bootstrap migration, idempotent and piece by piece: the owner, its `owner` grant over the whole Home, a `local` link from the OS user, and the bootstrap's digest | every mutating `crewhaus access` verb |
 | `openAccess(hangarRoot, {now?, harnesses?})` | A handle: `createInvite`, `grant`, `revoke`, `removeMember`, `link`, `unlink`, `mintServiceToken`, `sync`, `authorize`, `registerDomain`, `load` | `crewhaus access` |
-| `redeemInvite(hangarRoot, code, {now?, principal?})` | Spend an invite once: the claim on its end decides | the invite-acceptance route, later in this release |
+| `redeemInvite(hangarRoot, code, {now?, principal?})` | Spend an invite once: the claim on its end decides | the sign-in handle's `acceptInvite` |
 | `loadAccessSnapshot(hangarRoot)` | `absent` (no `access/`: one owner implied), `present` with a frozen snapshot, or `unreadable` naming the file | `crewhaus access members`, `tokens`, every mutation |
-| `authorize(snapshot, actor, permission, target, {now, domains?})` | Pure: `{allow: true, grant}` or `{allow: false, needs, role}` | every mutating verb (`home.access.manage`) |
+| `authorize(snapshot, actor, permission, target, {now, domains?, ref?})` | Pure: `{allow: true, grant}` or `{allow: false, needs, role}`; a domain's checker gets `ref` unchanged | every mutating verb (`home.access.manage`), Home's choke point |
+| `domainOf`, `registerDomainIn` | A permission's domain; the one set of rules every domain table keeps | `authorize`, Home's domain table |
 | `effectiveRole` | The highest live grant covering a target | `authorize`, the projection writer |
 | `listMembers`, `listTokens`, `listInvites` | Views with no digest and no readable subject | `crewhaus access members`, `tokens` |
 | `localActorOf({username, hostname})` | `local:<user>@<host>`, always within the grammar | `crewhaus access` |
@@ -114,8 +132,10 @@ own key do. Their fold is tolerant: a torn line is skipped, never a reason to si
 | `mintIssuedSecret(kind)` | A new secret of a kind | invites and service tokens |
 | `INVITE_TTL_MS`, `SERVICE_TOKEN_TTL_MS` | The lifetimes: an invite 24 hours by default and 7 days at most; a service token 180 days | `--expires` |
 | `ensureToken`, `tokenEquals`, `TOKEN_FILENAME`, `createBootTickets`, `BOOT_TICKET_TTL_MS` | Home's own key and the boot tickets, moved from hangar-server (which re-exports them for one release) | Home's boot |
-| `openSignIn(hangarRoot, {now?, localActor})` | The sign-in handle: boot tickets, exchange codes, challenges, `exchange`, `signInWithDevice`, `refresh`, `signOut`, `verifyBearer`, `onEnd`, `checkSessions` | Home's sign-in routes |
-| `authenticate`, `admitUntilAuthorization` | One request to at most one principal; the owner-only rule until route authorization | Home's choke point |
+| `openSignIn(hangarRoot, {now?, localActor, harnesses?})` | The sign-in handle: boot tickets, exchange codes, challenges, `exchange`, `acceptInvite`, `signInWithDevice`, `refresh`, `signOut`, `verifyBearer`, `onEnd`, `checkSessions`, `scopedKey` | Home's sign-in routes |
+| `authenticate`, `hasForwardingHeaders`, `hostNameOf` | One request to at most one principal | Home's choke point |
+| `mintScopedToken`, `verifyScopedToken`, `SCOPED_TOKEN_TTL_MS`, `SCOPED_ACT_PERMISSIONS` | Scoped tokens for one run's reads | Home's route tests; `authenticate` |
+| `noAuthRefusal(hangarRoot)` | Why `--no-auth` must not be used here, or nothing | `crewhaus hangar --no-auth` |
 | `rotateBootstrap(hangarRoot, {localActor, socketOnly?, tcp?, now?})` | Replace Home's own key | `crewhaus hangar rotate-token` |
 | `readOwnerSettings`, `writeOwnerBlock`, `SETTINGS_FILENAME`, `OWNER_BLOCKS` | The owner's settings blocks | Home's boot, `crewhaus access proxy` |
 | `isLoopbackAddress`, `parseCidr`, `cidrContains` | Addresses as bytes | `authenticate` |

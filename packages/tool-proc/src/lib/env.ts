@@ -11,6 +11,12 @@
  *    and message language, `TZ` fixes any timestamp the program prints.
  *    Without those, the same command produces different bytes on two
  *    machines that differ only in locale.
+ *
+ * The floor every child gets: `PATH` and `HOME` from the parent, `LC_ALL`,
+ * `LANG` and `TZ` pinned, and, when a tool names itself (`agentTool`),
+ * `CREWHAUS_AGENT_TOOL` set to that tool's name, after what the caller asked to
+ * forward or set, so a call cannot clear it. It marks a tool's child; it is not
+ * a boundary.
  */
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -36,6 +42,8 @@ export function buildSpawnEnv(
   options: {
     readonly forward?: readonly string[];
     readonly set?: Readonly<Record<string, string>>;
+    /** The agent tool that starts the child: `CREWHAUS_AGENT_TOOL`, set last. */
+    readonly agentTool?: string;
   } = {},
 ): SpawnEnvResult {
   const out = new Map<string, string>();
@@ -69,6 +77,7 @@ export function buildSpawnEnv(
     }
     out.set(name, value);
   }
+  if (options.agentTool !== undefined) out.set("CREWHAUS_AGENT_TOOL", options.agentTool);
 
   const env: Record<string, string> = {};
   for (const name of [...out.keys()].sort()) env[name] = out.get(name) as string;

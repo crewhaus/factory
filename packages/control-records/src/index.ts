@@ -28,6 +28,7 @@ export {
   append,
   appendClaim,
   casAppend,
+  casAppendLocked,
   foldStates,
   publishClaim,
   readClaim,
@@ -104,3 +105,19 @@ export {
   readHarnessIdentity,
   writeHarnessIdentity,
 } from "./deployments";
+export {
+  type LedgerRead,
+  PROPOSAL_TTL_MS,
+  type ProposalRow,
+  type StandingRuleReason,
+  type StandingRuleRow,
+  createStandingRuleReader,
+  decisionsLedger,
+  proposalOf,
+  proposalState,
+  readProposals,
+  readStandingRules,
+  ruleIsLive,
+  standingRuleOf,
+  standingRulesLedger,
+} from "./standing-rules";

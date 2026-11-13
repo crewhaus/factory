@@ -350,6 +350,16 @@ export const decisionOverlays = z
   .object({ assigned: z.object({ to: storedActor, at: timestamp }).strict().optional() })
   .strict();
 
+/** A standing-rule proposal's terms; `ruleKind` says which terms follow. */
+export const standingRuleTerms = z
+  .object({
+    ruleKind: z.literal("allow"),
+    tool: z.string(),
+    pattern: z.string(),
+    expiresAt: timestamp,
+  })
+  .passthrough();
+
 export const decision = z
   .object({
     id: decisionId,
@@ -375,7 +385,7 @@ export const decision = z
     consumedAt: timestamp.optional(),
     consumedByRun: z.string().optional(),
     always: z.boolean().optional(),
-    kind: z.enum(["tool", "input"]).optional(),
+    kind: z.enum(["tool", "input", "standing-rule-proposal"]).optional(),
     decidedByPrincipal: storedActor.optional(),
     decidedVia: z.string().optional(),
     // A fresh request's id, or the run whose cancel withdrew this one (`run-cancelled`).
@@ -402,6 +412,9 @@ export const decision = z
     harness: harnessId.optional(),
     choices: z.array(z.string()).optional(),
     evidenceRefs: z.array(z.string()).optional(),
+    terms: standingRuleTerms.optional(),
+    proposedBy: storedActor.optional(),
+    derivedFrom: decisionId.optional(),
   })
   .passthrough();
 
@@ -442,14 +455,20 @@ export const approverProjection = z
 export const standingRule = z
   .object({
     id: ruleId,
+    kind: z.literal("allow"),
     tool: z.string(),
     pattern: z.string(),
     derivedFrom: decisionId.optional(),
+    proposal: decisionId.optional(),
     createdBy: storedActor,
-    reason: z.string(),
+    reason: z.enum(["approval", "proposal"]),
     policyRevision: z.string().optional(),
+    createdAt: timestamp,
     expiresAt: timestamp,
+    state: z.enum(["active", "revoked", "expired"]),
     revokedAt: timestamp.optional(),
+    revokedBy: storedActor.optional(),
+    expiredAt: timestamp.optional(),
   })
   .passthrough();
 
@@ -736,6 +755,18 @@ export const sessionIssued = z
   })
   .passthrough();
 
+/** Joining from an invite answers a sealed session, or, for a tab-only session, no secret at all. */
+export const inviteAccepted = z.union([
+  sessionIssued,
+  z
+    .object({
+      tabOnly: z.literal(true),
+      expiresAt: timestamp,
+      principal: principalId.optional(),
+    })
+    .passthrough(),
+]);
+
 export const signedOut = z.object({ signedOut: z.literal(true) }).passthrough();
 
 export const authChallenge = z.object({ nonce: z.string(), expiresAt: timestamp }).passthrough();
@@ -746,9 +777,21 @@ export const authSessionRequest = z
 
 export const authExchangeRequest = z.object({ code: z.string().min(1), deviceJwk, seal }).strict();
 
-export const authAcceptInviteRequest = z
-  .object({ code: z.string().min(1), displayName: z.string().min(1), deviceJwk, seal })
-  .strict();
+/**
+ * Joining from an invite: a device key and a seal where the page can make them, or, on a
+ * page served over plain HTTP, a 32-byte secret the page made itself (43 base64url
+ * characters), of which Home keeps only a digest.
+ */
+export const authAcceptInviteRequest = z.union([
+  z.object({ code: z.string().min(1), displayName: z.string().min(1), deviceJwk, seal }).strict(),
+  z
+    .object({
+      code: z.string().min(1),
+      displayName: z.string().min(1),
+      sessionSecret: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    })
+    .strict(),
+]);
 
 export const authRefreshRequest = z.object({ seal }).strict();
 
@@ -907,6 +950,7 @@ export const CORE_SCHEMAS = {
   harnessOverview,
   invite,
   inviteCreateRequest,
+  inviteAccepted,
   inviteIssued,
   inviteList,
   issued,

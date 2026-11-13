@@ -13,9 +13,19 @@
  *     queue row — otherwise the next `crewhaus distill` re-opens it.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { mintRunId } from "@crewhaus/control-contract";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { ensureAccessSetUp, ensureToken, localActorOf } from "@crewhaus/access-control";
+import { mintId, mintRunId } from "@crewhaus/control-contract";
 import { extractFeedbackRecords } from "@crewhaus/feedback-distill";
 import { createPendingApprovalStore, foldReadOnly } from "@crewhaus/session-store";
 import { pendingApprovalCount } from "./approvals";
@@ -124,7 +134,7 @@ describe("approvals inbox", () => {
     }
   }, 20_000);
 
-  test("a grant written through the API is the record the CLI's own store reads back", async () => {
+  test("a grant written through the API is the record the CLI's own store reads back, naming who decided", async () => {
     const t = bootTestServer({ now: () => NOW });
     try {
       const dir = inboxHarness(t, "inbox-grant");
@@ -144,7 +154,9 @@ describe("approvals inbox", () => {
       });
       const seen = await store.get("SendMessage", "hash-1");
       expect(seen?.decision).toBe("grant");
-      expect(seen?.decidedBy).toBe("operator@example.invalid");
+      // The decider is who signed in (Home's own label, with no access records yet); a `by`
+      // in the body is not. Home's operator label is what is shown.
+      expect(seen?.decidedBy).toBe("hangar");
     } finally {
       await t.stop();
     }
@@ -243,6 +255,76 @@ describe("approvals inbox", () => {
         "This request was withdrawn: its run was cancelled.",
       );
       expect(JSON.stringify(granted.body)).not.toContain("replaced");
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("a decision is recorded as the signed-in owner, with Home's label and never the body's", async () => {
+    const root = join(mkdtempSync(join(tmpdir(), "hangar-inbox-owner-")), "hangar");
+    ensureToken(root);
+    const setup = await ensureAccessSetUp(root, {
+      localActor: localActorOf({ username: "tester", hostname: "test-host" }),
+    });
+    if (!setup.ok) throw new Error(setup.reason);
+    const t = bootTestServer({
+      now: () => NOW,
+      prepare: (dirs) => cpSync(root, dirs.hangarRoot, { recursive: true }),
+    });
+    try {
+      const dir = inboxHarness(t, "inbox-owner");
+      const id = await register(t, dir);
+      const res = await t.api(`/api/h/${id}/approvals/appr_00000000000000b1/grant`, {
+        method: "POST",
+        body: JSON.stringify({ by: "mallory" }),
+      });
+      expect(res.status).toBe(200);
+      expect((res.body["receipt"] as { kind?: string }).kind).toBe("decisions.resolve");
+      const record = foldReadOnly(join(dir, ".crewhaus", "sessions")).records[0];
+      expect(record?.decidedBy).toBe("hangar");
+      expect(record?.decidedByPrincipal).toBe(setup.result.owner);
+      expect(JSON.stringify(record)).not.toContain("mallory");
+    } finally {
+      await t.stop();
+      rmSync(dirname(root), { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("a governed harness refuses a decision nobody signed in for: 403, nothing claimed", async () => {
+    const t = bootTestServer({ now: () => NOW, noAuth: true });
+    try {
+      const dir = inboxHarness(t, "inbox-anonymous");
+      const control = join(dir, ".crewhaus", "run", "control");
+      mkdirSync(control, { recursive: true });
+      writeFileSync(
+        join(control, "approvers.json"),
+        `${JSON.stringify({
+          v: 1,
+          epoch: 1,
+          generatedAt: iso(NOW - DAY),
+          harness: "hrn_00000000000000c1",
+          owner: mintId("prn"),
+          governedSince: iso(NOW - DAY),
+          members: [],
+          links: [],
+        })}\n`,
+      );
+      const id = await register(t, dir);
+      const res = await t.api(`/api/h/${id}/approvals/appr_00000000000000b1/grant`, {
+        method: "POST",
+        body: JSON.stringify({ by: "owner" }),
+      });
+      expect(res.status).toBe(403);
+      expect(String(res.body["error"])).toBe(
+        "Decisions on this harness are made by its members. Sign in to Home, or ask its owner.",
+      );
+      const receipt = res.body["receipt"] as { kind?: string; state?: string };
+      expect(receipt.kind).toBe("decisions.resolve");
+      expect(receipt.state).toBe("rejected");
+      expect(foldReadOnly(join(dir, ".crewhaus", "sessions")).records[0]?.decision).toBeUndefined();
+      expect(
+        existsSync(join(dir, ".crewhaus", "sessions", "approvals.d", "claims", "decision")),
+      ).toBe(false);
     } finally {
       await t.stop();
     }

@@ -23,7 +23,7 @@
  *      control plane says "cadence only" instead of implying a gap.
  */
 
-import { hrefHarness } from "./router.js";
+import { hrefGlobal, hrefHarness } from "./router.js";
 import { fmtRelativeTime, parseTs, usdFromMicros } from "./util.js";
 
 // ---------------------------------------------------------------------------
@@ -1133,6 +1133,8 @@ export function approvalRow(row, nowMs) {
     // Verbatim (the server already masked it) — an approver cannot judge a
     // call they cannot see.
     input: r.input ?? null,
+    // The reader may not read this harness's content: the row says so, not what it held.
+    inputWithheld: r.inputWithheld === true,
     inputHash: typeof r.inputHash === "string" ? r.inputHash : "",
     surface: typeof r.surface === "string" ? r.surface : "",
     createdAt: typeof r.createdAt === "string" ? r.createdAt : null,
@@ -1169,6 +1171,7 @@ export function reviewRow(row, nowMs) {
     ts: typeof r.ts === "string" ? r.ts : null,
     age: fmtRelativeTime(r.ts ?? null, nowMs),
     context: typeof r.context === "string" ? r.context : "",
+    contextWithheld: r.contextWithheld === true,
     sourceRef,
     sessionId: typeof sourceRef.sessionId === "string" ? sourceRef.sessionId : null,
     turn: typeof sourceRef.turn === "number" ? sourceRef.turn : null,
@@ -1223,7 +1226,7 @@ export function activityHref(item) {
     case "deploy":
       return hrefHarness(id, "deploy");
     case "approval":
-      return "#/approvals";
+      return hrefGlobal("approvals");
     default:
       return hrefHarness(id);
   }

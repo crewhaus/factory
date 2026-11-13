@@ -1,4 +1,4 @@
-import { HARNESS_COMMAND, NO_VERB, READ } from "./shared.js";
+import { HARNESS_COMMAND, READ, TWINS } from "./shared.js";
 
 export const RULE_OPERATIONS = [
   {
@@ -9,8 +9,7 @@ export const RULE_OPERATIONS = [
     permission: "h.read",
     request: "listQuery",
     response: "ruleList",
-    cliTwin: null,
-    noTwinReason: NO_VERB,
+    cliTwin: TWINS.approvalsRules,
     qualifiers: [],
   },
   {
@@ -21,7 +20,8 @@ export const RULE_OPERATIONS = [
     permission: "h.standing-rule.manage",
     request: "ruleCreateRequest",
     cliTwin: null,
-    noTwinReason: NO_VERB,
+    noTwinReason:
+      "A standing rule is made from a decision: `crewhaus approvals grant <id> --always`.",
     qualifiers: ["human-only"],
   },
   {
@@ -31,8 +31,7 @@ export const RULE_OPERATIONS = [
     path: "/api/v1/harnesses/{h}/standing-rules/{rule}/revoke",
     permission: "h.standing-rule.manage",
     request: "emptyRequest",
-    cliTwin: null,
-    noTwinReason: NO_VERB,
+    cliTwin: TWINS.approvalsRevoke,
     qualifiers: ["human-only"],
   },
 ] as const;

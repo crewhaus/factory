@@ -406,6 +406,27 @@ async function actingPrincipal(
   return { principal, lines };
 }
 
+/**
+ * Make an invite as this OS user, setting access up first when nobody has signed in yet,
+ * so a Home whose owner never opened a browser still has an owner to invite as.
+ *
+ * First consumers: `crewhaus hangar --lan` and `crewhaus hangar qr`, whose QR code carries one.
+ */
+export async function inviteAsLocalUser(
+  opts: AccessCommandOptions,
+  input: { readonly role: string; readonly scope: string; readonly ttlMs: number },
+): Promise<
+  | { readonly ok: true; readonly code: string; readonly expiresAt: string }
+  | { readonly ok: false; readonly reason: string }
+> {
+  const session = sessionFor(opts);
+  const acting = await actingPrincipal(session);
+  if ("ok" in acting) return { ok: false, reason: acting.reason };
+  const done = await session.access.createInvite({ principal: acting.principal }, input);
+  if (!done.ok) return { ok: false, reason: done.reason };
+  return { ok: true, code: done.result.code, expiresAt: done.result.invite.expiresAt };
+}
+
 function memberRef(ref: string, me: string): string {
   return ref === "me" ? me : ref;
 }

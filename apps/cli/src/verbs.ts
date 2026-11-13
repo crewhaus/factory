@@ -150,6 +150,8 @@ export const LEGACY_VERBS: readonly LegacyVerb[] = deepFreeze<LegacyVerb[]>([
       deny: null,
       supersede: null,
       defer: null,
+      rules: null,
+      revoke: null,
     },
     subCheckedBy: "dispatch",
   },

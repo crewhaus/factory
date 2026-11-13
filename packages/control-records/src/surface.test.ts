@@ -52,7 +52,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan really reads the sources", () => {
-    expect(SOURCES.length).toBe(20);
+    expect(SOURCES.length).toBe(21);
     expect(imports.length).toBeGreaterThan(40);
     expect(imports.some((i) => i.path === "node:fs")).toBe(true);
     expect(imports.some((i) => i.path === "@crewhaus/tool-safety/fs")).toBe(true);
@@ -118,9 +118,12 @@ describe("what the package exports", () => {
         "appendClaim",
         "assertRunnable",
         "casAppend",
+        "casAppendLocked",
         "controlPaths",
         "createApproverReader",
         "createOperatorReader",
+        "createStandingRuleReader",
+        "decisionsLedger",
         "deploymentsLedger",
         "dropSegmentsBefore",
         "ensureDigestKey",
@@ -131,8 +134,11 @@ describe("what the package exports", () => {
         "intakeRoot",
         "intakeVerdict",
         "LOCAL_ACTOR_LABEL",
+        "PROPOSAL_TTL_MS",
         "keyedDigest",
         "operatorVerdict",
+        "proposalOf",
+        "proposalState",
         "publishClaim",
         "readApproverProjection",
         "readClaim",
@@ -142,11 +148,16 @@ describe("what the package exports", () => {
         "readMutatingLease",
         "readOperatorRecord",
         "readPage",
+        "readProposals",
+        "readStandingRules",
         "readTail",
         "refreshOperatorRecord",
         "registerIntakeRoot",
         "resume",
+        "ruleIsLive",
         "snapshotAt",
+        "standingRuleOf",
+        "standingRulesLedger",
         "storedLocalActor",
         "unregisterIntakeRoot",
         "withLedgerLock",

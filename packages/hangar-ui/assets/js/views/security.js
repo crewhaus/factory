@@ -19,7 +19,7 @@
  */
 
 import { api } from "../api.js";
-import { clear, collapsible, dot, el, jsonPre, skeleton, toast } from "../dom.js";
+import { clear, collapsible, dot, el, jsonPre, scrollRegion, skeleton, toast } from "../dom.js";
 import { fmtPct, fmtRelativeTime } from "../util.js";
 import { m3, m3Card, m3Empty } from "./creds.js";
 
@@ -166,7 +166,7 @@ function auditCard(body, ctx) {
     );
   }
   nodes.push(
-    el("div", { class: "table-scroll" }, [
+    scrollRegion("Audit records", [
       el("table", { class: "fleet" }, [
         el(
           "thead",
@@ -224,7 +224,7 @@ function egressCard(body, ctx, reload) {
     );
   }
   nodes.push(
-    el("div", { class: "table-scroll" }, [
+    scrollRegion("Egress decisions", [
       el("table", { class: "fleet" }, [
         el(
           "thead",
@@ -328,7 +328,7 @@ function sloCard(body) {
       );
     }
     nodes.push(
-      el("div", { class: "table-scroll" }, [
+      scrollRegion("Service levels", [
         el("table", { class: "fleet" }, [
           el(
             "thead",
@@ -804,7 +804,7 @@ function complianceCard(body, ctx, reload) {
     );
   }
   nodes.push(
-    el("div", { class: "table-scroll" }, [
+    scrollRegion("Compliance bundles", [
       el("table", { class: "fleet" }, [
         el(
           "thead",

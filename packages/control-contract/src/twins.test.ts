@@ -4,6 +4,7 @@ import {
   type CliTwin,
   DEPLOYMENT_ID_RE,
   OPERATIONS,
+  OPERATOR_SUPERSEDE_REASONS,
   TWIN_PLACEHOLDERS,
   isId,
   mintId,
@@ -20,8 +21,20 @@ const HARNESS: CliTwin = { argv: ["harness", "show", "{hrn}"] };
 const DEP = "dep_01m76e6f05hp514w9j4v3qymka";
 const PEOPLE = { psn: mintId("psn"), pcl: mintId("pcl"), kind: "personal", area: "communication" };
 
+const RULE_ID = mintId("rule");
+
 const SAMPLES = [
-  { hrn: HRN, appr: APPR, dir: "/srv/poly", choice: "grant", dep: DEP, ...PEOPLE, verdict: "keep" },
+  {
+    hrn: HRN,
+    appr: APPR,
+    dir: "/srv/poly",
+    choice: "grant",
+    dep: DEP,
+    ...PEOPLE,
+    verdict: "keep",
+    supersedeReason: "decided-in-error",
+    rule: RULE_ID,
+  },
   {
     hrn: HRN,
     appr: APPR,
@@ -30,6 +43,8 @@ const SAMPLES = [
     dep: DEP,
     ...PEOPLE,
     verdict: "reject",
+    supersedeReason: "other",
+    rule: RULE_ID,
   },
 ];
 
@@ -142,8 +157,25 @@ test("the placeholders, pinned, with empty flags", () => {
     "{kind}",
     "{area}",
     "{verdict}",
+    "{supersedeReason}",
+    "{rule}",
   ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
+});
+
+test("{supersedeReason} is the reasons a person may give, and {rule} a rule id", () => {
+  for (const reason of OPERATOR_SUPERSEDE_REASONS) {
+    expect(TWIN_PLACEHOLDERS["{supersedeReason}"].test(reason)).toBe(true);
+  }
+  // A reason the system records on its own is never one a command may claim.
+  for (const reason of ["revision-changed", "run-cancelled", "re-asked", "other-thing", ""]) {
+    expect(TWIN_PLACEHOLDERS["{supersedeReason}"].test(reason)).toBe(false);
+  }
+  expect(TWIN_PLACEHOLDERS["{rule}"].test(RULE_ID)).toBe(true);
+  expect(isId("rule", RULE_ID)).toBe(true);
+  for (const value of [`${RULE_ID}x`, RULE_ID.toUpperCase(), "rule_short", APPR]) {
+    expect(TWIN_PLACEHOLDERS["{rule}"].test(value)).toBe(isId("rule", value));
+  }
 });
 
 test("the {dep} placeholder is the deployment id grammar", () => {

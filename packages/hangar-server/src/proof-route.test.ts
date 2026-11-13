@@ -243,8 +243,9 @@ describe("GET /api/runs/:id/proof", () => {
     // `..` as its own segment is folded by URL parsing before it reaches the
     // server, so it lands on another (absent) route rather than this one.
     expect((await t.api("/api/runs/../proof")).status).not.toBe(200);
+    // A method no route-table row declares for this path is not a route at all.
     expect((await t.api(`/api/runs/${SESS}/proof`, { method: "POST", body: "{}" })).status).toBe(
-      405,
+      404,
     );
   });
 

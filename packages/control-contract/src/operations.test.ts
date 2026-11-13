@@ -450,7 +450,7 @@ const CORE_ROWS = [
     "public",
     "workspace",
     "authAcceptInviteRequest",
-    "sessionIssued",
+    "inviteAccepted",
   ],
   [
     "auth.refresh",
@@ -806,7 +806,7 @@ describe("rows, pinned", () => {
       "auth.acceptInvite",
     ]);
     expect(coreRow("auth.exchange").secretFields).toEqual(["code"]);
-    expect(coreRow("auth.acceptInvite").secretFields).toEqual(["code"]);
+    expect(coreRow("auth.acceptInvite").secretFields).toEqual(["code", "sessionSecret"]);
   });
 
   test("no core row declares modelBound yet", () => {
@@ -829,7 +829,14 @@ describe("rows, pinned", () => {
       ["controls.restart", "daemon restart {hrn}"],
       ["decisions.get", "approvals show {appr} --dir {dir}"],
       ["decisions.resolve", "approvals {choice} {appr} --dir {dir}"],
+      ["decisions.supersede", "approvals supersede {appr} --reason {supersedeReason} --dir {dir}"],
+      ["rules.list", "approvals rules --dir {dir}"],
+      ["rules.revoke", "approvals revoke {rule} --dir {dir}"],
     ]);
+    expect(coreRow("rules.create").cliTwin).toBeNull();
+    expect(coreRow("rules.create").noTwinReason).toContain(
+      "crewhaus approvals grant <id> --always",
+    );
     expect(coreRow("runs.resume").cliTwin).toBeNull();
     expect(coreRow("runs.resume").noTwinReason).toContain("cli session");
   });

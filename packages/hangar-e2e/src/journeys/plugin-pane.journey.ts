@@ -6,7 +6,7 @@
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { harnessRoute } from "../console-routes";
+import { routeFor } from "../console-routes";
 import type { Journey } from "./journey";
 
 /** What the planted pane's own script writes, so the journey can tell it ran. */
@@ -45,7 +45,7 @@ export const pluginPane: Journey = {
         if (path.startsWith("/pane/")) panes.push(`${path} ${response.status()}`);
       },
     });
-    await session.visit(harnessRoute(harness.id, "panes"));
+    await session.visit(routeFor("#/h/:id/setup/plugins", harness));
     const frame = session.page.frameLocator("iframe.pane-frame");
     try {
       await frame.getByText(RAN).waitFor({ timeout: 10_000 });

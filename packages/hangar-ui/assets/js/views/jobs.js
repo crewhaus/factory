@@ -9,7 +9,7 @@
  */
 
 import { api } from "../api.js";
-import { clear, dot, el, emptyState, skeleton, toast } from "../dom.js";
+import { clear, dot, el, emptyState, scrollRegion, skeleton, toast } from "../dom.js";
 import { jobQueueModel, jobRow } from "../supervision.js";
 import { actionTwin, runAction } from "./control.js";
 
@@ -51,7 +51,7 @@ function jobsTable(rows) {
       ]),
     );
   }
-  return el("div", { class: "table-scroll" }, [
+  return scrollRegion("Jobs", [
     el("table", { class: "fleet" }, [
       el(
         "thead",

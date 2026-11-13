@@ -148,6 +148,7 @@ function prepare(
   const built = buildSpawnEnv(process.env, {
     forward: input.env ?? [],
     set: input.envSet ?? {},
+    agentTool: toolName,
   });
   if (built.invalid.length > 0) {
     return {

@@ -1,8 +1,14 @@
 /** `registerDomain`: a domain's permissions go to its own checker, and only there. */
 import { afterAll, describe, expect, test } from "bun:test";
 import { PERMISSIONS, ROLES } from "@crewhaus/control-contract";
-import { openAccess } from "./access";
-import { CORE_PERMISSION_PREFIXES, type DomainRequest, domainOf } from "./authorize";
+import { openAccess, registerDomainIn } from "./access";
+import {
+  CORE_PERMISSION_PREFIXES,
+  type DomainChecker,
+  type DomainRequest,
+  authorize,
+  domainOf,
+} from "./authorize";
 import { homeFixture, removeTempDirs } from "./test-helpers";
 
 afterAll(removeTempDirs);
@@ -34,6 +40,56 @@ describe("domains", () => {
     expect(seen).toHaveLength(2);
     expect(seen[0]?.principal.id).toBe(home.owner);
     expect(seen[0]?.snapshot).toBe(snapshot);
+  });
+
+  test("the object a request is about reaches the checker unchanged", async () => {
+    const home = await homeFixture();
+    const seen: DomainRequest[] = [];
+    const domains = new Map<string, DomainChecker>();
+    registerDomainIn(domains, "people", (request) => {
+      seen.push(request);
+      return { allow: true, grant: "people-rule" };
+    });
+    const ref = { kind: "person", id: "psn_01h00000000000000000000001" };
+    expect(
+      authorize(home.snapshot(), home.actor, "people.derived.read", HOME, {
+        now: home.clock.now(),
+        domains,
+        ref,
+      }),
+    ).toEqual({ allow: true, grant: "people-rule" });
+    expect(seen[0]?.ref).toEqual(ref);
+  });
+
+  test("with no object named, the checker's request has no ref key, and a per-object checker refuses", async () => {
+    const home = await homeFixture();
+    const seen: DomainRequest[] = [];
+    const domains = new Map<string, DomainChecker>();
+    // A checker that decides per object: no object, no answer but no.
+    registerDomainIn(domains, "people", (request) => {
+      seen.push(request);
+      return request.ref === undefined
+        ? { allow: false, needs: request.permission, role: null }
+        : { allow: true, grant: "people-rule" };
+    });
+    const verdict = authorize(home.snapshot(), home.actor, "people.derived.read", HOME, {
+      now: home.clock.now(),
+      domains,
+    });
+    expect(verdict.allow).toBe(false);
+    expect(seen).toHaveLength(1);
+    expect(Object.hasOwn(seen[0] as object, "ref")).toBe(false);
+  });
+
+  test("a table kept outside a handle takes the same registration rules", () => {
+    const domains = new Map<string, DomainChecker>();
+    const allow: DomainChecker = () => ({ allow: true, grant: "x" });
+    registerDomainIn(domains, "people", allow);
+    expect(() => registerDomainIn(domains, "people", allow)).toThrow("already registered");
+    expect(() => registerDomainIn(domains, "h", allow)).toThrow("core permission prefix");
+    expect(() => registerDomainIn(domains, "Bad Name", allow)).toThrow("not a domain name");
+    expect(() => registerDomainIn(domains, "vault", "nope" as never)).toThrow("needs a checker");
+    expect([...domains.keys()]).toEqual(["people"]);
   });
 
   test("no role implies a domain permission: an owner the checker refuses is refused", async () => {

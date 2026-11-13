@@ -14,6 +14,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ensureAccessSetUp, loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
 import {
   type HangarServer,
   type HangarServerOptions,
@@ -28,9 +29,13 @@ import { encodeQr, renderQrLines } from "@crewhaus/qr-code";
 import {
   HANGAR_LOCK_FILENAME,
   type HangarLock,
+  LAN_INVITE_TTL_MS,
+  LAN_QR_CAPTION,
   acquireHangarLock,
   defaultIsPidAlive,
   heldSupervisors,
+  lanInviteUrl,
+  qrBlockLines,
   readHangarLock,
   releaseHangarLock,
   resolveHangarRoot,
@@ -315,7 +320,7 @@ describe("hangar serve --lan", () => {
     expect(existsSync(join(ws.hangarRoot, HANGAR_LOCK_FILENAME))).toBe(false);
   });
 
-  test("prints a QR code that encodes the bare LAN address, and no credential", async () => {
+  test("prints a QR code that encodes a single-use viewer invite to the LAN address", async () => {
     const ws = newWorkspace();
     const out = sink();
     const opened: string[] = [];
@@ -328,22 +333,54 @@ describe("hangar serve --lan", () => {
       openBrowser: (url) => opened.push(url),
     });
     const printed = out.lines.join("\n");
-    // The bare address the fake server composed: no token, no fragment.
-    const url = "http://192.168.7.31:4321";
-    expect(printed).toContain("scan to open Home on your phone");
-    // …and the code really is that url, not merely some code-shaped output.
-    const want = renderQrLines(encodeQr(url, { ecLevel: "M" }), { color: false });
-    for (const line of want) expect(out.lines).toContain(line);
-    const withToken = renderQrLines(encodeQr(`${url}/#t=fake-token`, { ecLevel: "M" }), {
+    // The address the fake server composed, the invite page, and the code in the fragment.
+    const url = out.lines.find((line) => line.startsWith("http://192.168.7.31:4321/invite#c="));
+    expect(url).toMatch(/^http:\/\/192\.168\.7\.31:4321\/invite#c=chi_[A-Za-z0-9_-]{43}$/);
+    const code = (url as string).slice("http://192.168.7.31:4321/invite#c=".length);
+    expect(lanInviteUrl("http://192.168.7.31:4321", code)).toBe(url as string);
+    // The printed block is exactly the one that link makes: the code really is the link.
+    const block = qrBlockLines(url as string, {
       color: false,
+      columns: 200,
+      caption: LAN_QR_CAPTION,
     });
-    expect(withToken.every((line) => out.lines.includes(line))).toBe(false);
-    // The summary names the interface and the exposure.
+    const at = out.lines.indexOf(LAN_QR_CAPTION);
+    expect(at).toBeGreaterThan(-1);
+    expect(out.lines.slice(at, at + block.length)).toEqual(block);
+    expect(printed).toContain("works once, for 10 minutes");
+    // The invite: a viewer of the whole Home, for 10 minutes.
+    const read = loadAccessSnapshot(ws.hangarRoot);
+    if (read.state !== "present") throw new Error("no access records");
+    expect(read.snapshot.invites).toHaveLength(1);
+    const invite = read.snapshot.invites[0];
+    expect([invite?.role, invite?.scope, invite?.state]).toEqual(["viewer", "home", "open"]);
+    expect(Date.parse(invite?.expiresAt as string) - Date.parse(invite?.at as string)).toBe(
+      LAN_INVITE_TTL_MS,
+    );
+    // The summary names the interface and the exposure; nothing carries Home's own key.
     expect(printed).toContain("on en0 — every device on this network can reach this console");
-    // No printed line and no opener argument carries Home's own key.
     expect(printed).not.toContain("fake-token");
     expect(printed).not.toContain("#t=");
     expect(opened.join(" ")).not.toContain("fake-token");
+  });
+
+  test("--lan-role gives the invite another role, and needs --lan", async () => {
+    const ws = newWorkspace();
+    await driveServe(["--lan", "--lan-role", "operator"], {
+      env: ws.env,
+      networkInterfaces: () => LAN_INTERFACES,
+      color: false,
+      columns: 200,
+    });
+    const read = loadAccessSnapshot(ws.hangarRoot);
+    if (read.state !== "present") throw new Error("no access records");
+    expect(read.snapshot.invites.map((i) => [i.role, i.scope])).toEqual([["operator", "home"]]);
+    await expect(
+      runHangarCommand(["serve", "--lan-role", "operator"], { env: ws.env }),
+    ).rejects.toThrow(/add --lan/);
+    await expect(
+      runHangarCommand(["serve", "--lan", "--lan-role", "admin"], { env: ws.env }),
+    ).rejects.toThrow(/--lan-role takes one of viewer, operator, maintainer, owner/);
   });
 
   test("--no-qr boots the LAN console without printing one", async () => {
@@ -357,7 +394,8 @@ describe("hangar serve --lan", () => {
       columns: 200,
     });
     const printed = out.lines.join("\n");
-    expect(printed).not.toContain("scan to open Hangar");
+    expect(printed).not.toContain(LAN_QR_CAPTION);
+    expect(printed).not.toContain("/invite#c=");
     expect(printed).not.toContain("\u2588");
     // The console itself is unaffected.
     expect(printed).toContain("http://192.168.7.31:4321");
@@ -395,7 +433,7 @@ describe("hangar serve --lan", () => {
 // ---------------------------------------------------------------------------
 
 describe("hangar qr", () => {
-  test("reprints the running console's code from the lock: the bare address, no key", () => {
+  test("shows a fresh single-use invite for the running console each time, and no key", async () => {
     const ws = newWorkspace();
     mkdirSync(ws.hangarRoot, { recursive: true });
     writeFileSync(join(ws.hangarRoot, "token"), "lan-token\n");
@@ -405,20 +443,32 @@ describe("hangar qr", () => {
       port: 4200,
       url: "http://192.168.7.31:4200",
     });
-    const got = runHangarCommand(["qr"], {
-      env: ws.env,
-      isPidAlive: () => true,
-      color: false,
-      columns: 200,
-    });
-    return got.then((result) => {
-      expect(result.exitCode).toBe(0);
-      const want = renderQrLines(encodeQr("http://192.168.7.31:4200", { ecLevel: "M" }), {
+    const links: string[] = [];
+    for (const _ of [1, 2]) {
+      const result = await runHangarCommand(["qr"], {
+        env: ws.env,
+        isPidAlive: () => true,
         color: false,
+        columns: 200,
+      });
+      expect(result.exitCode).toBe(0);
+      const link = result.lines.find((line) =>
+        line.startsWith("http://192.168.7.31:4200/invite#c="),
+      );
+      expect(link).toBeDefined();
+      const want = qrBlockLines(link as string, {
+        color: false,
+        columns: 200,
+        caption: LAN_QR_CAPTION,
       });
       for (const line of want) expect(result.lines).toContain(line);
       expect(result.lines.join("\n")).not.toContain("lan-token");
-    });
+      links.push(link as string);
+    }
+    expect(new Set(links).size).toBe(2);
+    const read = loadAccessSnapshot(ws.hangarRoot);
+    if (read.state !== "present") throw new Error("no access records");
+    expect(read.snapshot.invites.map((i) => i.role)).toEqual(["viewer", "viewer"]);
   });
 
   test("refuses for a loopback console, and names the flag that fixes it", async () => {
@@ -529,6 +579,42 @@ describe("hangar serve argument validation", () => {
     const open = await driveServe([], { env: ws.env });
     expect(open[0]?.readOnly).toBeUndefined();
     expect(open[0]?.readOnlyLocked).toBeUndefined();
+  });
+
+  test("--no-auth is refused while anyone other than the owner has access", async () => {
+    const ws = newWorkspace();
+    const setUp = await ensureAccessSetUp(ws.hangarRoot, { localActor: "local:tester@test-host" });
+    if (!setUp.ok) throw new Error(setUp.reason);
+    // The owner alone: allowed.
+    const seen = await driveServe(["--no-auth"], { env: ws.env });
+    expect(seen[0]?.noAuth).toBe(true);
+    const granted = await openAccess(ws.hangarRoot).grant(
+      { principal: setUp.result.owner },
+      { member: "Ana", create: true, role: "viewer", scope: "home" },
+    );
+    if (!granted.ok) throw new Error(granted.reason);
+    await expect(refuseServe(["--no-auth"], ws.env)).rejects.toThrow(
+      /someone else has access to this Home/,
+    );
+  });
+
+  test("--no-auth is refused while a trusted proxy is set", async () => {
+    const ws = newWorkspace();
+    mkdirSync(ws.hangarRoot, { recursive: true });
+    writeFileSync(
+      join(ws.hangarRoot, "settings.json"),
+      JSON.stringify({
+        access: {
+          trustedProxy: {
+            header: "X-Auth-User",
+            hosts: [],
+            peers: ["127.0.0.1/32"],
+            secretDigest: "0".repeat(64),
+          },
+        },
+      }),
+    );
+    await expect(refuseServe(["--no-auth"], ws.env)).rejects.toThrow(/a trusted proxy is set/);
   });
 
   test("--smoke with --no-auth and --smoke with --port are rejected", () => {
@@ -973,6 +1059,7 @@ describe("hangar serve --smoke", () => {
     expect(stdout).toContain("✓ GET /api/harnesses with Home's own key answers 200 JSON");
     expect(stdout).toContain("✓ GET /api/harnesses without a credential is refused (401)");
     expect(stdout).toContain("✓ a request with a foreign Host is refused (421)");
+    expect(stdout).toContain("✓ an undeclared /api path is refused (404)");
     expect(stdout).toContain("smoke: all checks passed");
     // The boot minted a real token file and the clean exit released the lock.
     expect(readFileSync(join(ws.hangarRoot, "token"), "utf8").trim().length).toBeGreaterThan(0);

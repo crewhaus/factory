@@ -687,6 +687,11 @@
         "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/harness-supervisor": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-registry-manifest": "workspace:*",
       },
       "devDependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -1610,10 +1615,14 @@
       "name": "@crewhaus/permission-engine",
       "version": "0.8.2",
       "dependencies": {
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/control-contract": "workspace:*",
       },
     },
     "packages/permission-tokengated": {
@@ -2180,6 +2189,9 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/control-records": "workspace:*",
       },
     },
     "packages/sub-agent-spawner": {
