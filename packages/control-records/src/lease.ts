@@ -50,8 +50,12 @@ export type LeaseProbe = {
   startTimeMs(pid: number): number | undefined;
 };
 
-/** `kill(pid, 0)`, with an unknown start time, so holders it records carry no `startedAt`. */
-const DEFAULT_PROBE: LeaseProbe = {
+/**
+ * `kill(pid, 0)`, with an unknown start time, so holders it records carry no `startedAt`.
+ *
+ * First consumers: the mutating lease, and the managed daemon judging a run's holder.
+ */
+export const defaultLeaseProbe: LeaseProbe = {
   isAlive(pid) {
     try {
       process.kill(pid, 0);
@@ -249,7 +253,7 @@ export async function acquireMutatingLease(
 ): Promise<HeldLease | LeaseRefused> {
   const seam = seams;
   const waitMs = options.waitMs ?? DEFAULT_WAIT_MS;
-  const probe = options.probe ?? DEFAULT_PROBE;
+  const probe = options.probe ?? defaultLeaseProbe;
   const now = options.now ?? (() => Date.now());
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const host = hostname();

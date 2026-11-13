@@ -34,7 +34,13 @@ export {
   onRunIdle,
   retainRun,
 } from "./run-registry";
-export { type InboundContent, type RunScope, runWithScope, withInboundContent } from "./scope";
+export {
+  type InboundContent,
+  type RunScope,
+  currentSubject,
+  runWithScope,
+  withInboundContent,
+} from "./scope";
 
 /**
  * Where content currently flowing through the runtime originated. Mirrors
@@ -227,8 +233,10 @@ function generateSessionId(): string {
  *
  * Created inside a {@link withInboundContent} scope, the first context
  * adopts the run input a library classified and kept (see `./scope`): the
- * text is tagged into its lineage at its origin, and a warning is published
- * and logged for text kept with one. Outside a scope nothing is adopted.
+ * text is tagged into its lineage at its origin, a warning is published
+ * and logged for text kept with one, and its `originStack` starts with the
+ * input's origins (after `opts.originStack` when one is given). Outside a
+ * scope nothing is adopted.
  * Inside a `runWithScope` scope, it takes the scope's lineage for any field
  * its options leave unset.
  */
@@ -240,6 +248,8 @@ export function createRunContext(opts: RunContextOptions = {}): RunContext {
   const baseLogger = opts.logger ?? createLogger();
   const logger = baseLogger.child({ runId, sessionId });
   const eventBus = opts.eventBus ?? new TraceEventBus({ runId, sessionId, logger });
+  const inbound = takePendingInbound();
+  const originStack = originStackOf(opts.originStack, inbound);
   const ctx: RunContext = {
     runId,
     sessionId,
@@ -247,12 +257,28 @@ export function createRunContext(opts: RunContextOptions = {}): RunContext {
     abortSignal,
     logger,
     eventBus,
-    ...(opts.originStack !== undefined ? { originStack: opts.originStack } : {}),
+    ...(originStack !== undefined ? { originStack } : {}),
     ...lineageFrom(opts, takeAmbientRun(), logger),
   };
   if (controller !== undefined) registerRunController(runId, controller);
-  adoptInbound(ctx, takePendingInbound());
+  adoptInbound(ctx, inbound);
   return ctx;
+}
+
+/**
+ * A new context's origin chain: the one its options give, then the distinct
+ * origins of the run input it adopts, in order. Absent when both are empty.
+ */
+function originStackOf(
+  given: ReadonlyArray<TrustOrigin> | undefined,
+  inbound: readonly InboundContent[],
+): ReadonlyArray<TrustOrigin> | undefined {
+  const adopted: TrustOrigin[] = [];
+  for (const entry of inbound) {
+    if (!adopted.includes(entry.origin)) adopted.push(entry.origin);
+  }
+  if (adopted.length === 0) return given;
+  return [...(given ?? []), ...adopted];
 }
 
 /**
@@ -298,9 +324,11 @@ export function lineageOf(ctx: RunContext): RunLineage {
  * Tag each kept input into `ctx`'s lineage at its origin, and report the ones
  * kept with a warning: one `permission_decision` event each (the template
  * runtime-core uses for suspicious tool output) and one log line. Neither
- * carries the text.
+ * carries the text. `createRunContext` calls it for the input its scope holds;
+ * a caller that classified run input for a context it was handed calls it
+ * directly, and the context's `originStack` stays as it was.
  */
-function adoptInbound(ctx: RunContext, entries: readonly InboundContent[]): void {
+export function adoptInbound(ctx: RunContext, entries: readonly InboundContent[]): void {
   for (const entry of entries) {
     tagContent(ctx, entry.content, entry.origin);
     if (entry.warning === undefined) continue;

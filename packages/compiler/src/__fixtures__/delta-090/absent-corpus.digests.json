@@ -34,7 +34,7 @@
   },
   "managed": {
     "agent.ts": "1385df3f2d18c5b902d3ba57f8079fbe317facd1b3a73a3bef2324425f0452c6",
-    "daemon.ts": "e21e4394fd750b59691ae38365c4470c2a9e840694662f4379b9c1e62d386747",
+    "daemon.ts": "ee4bcbf513025fd7e0b7a4007e002f26a4906d18629c6fad19adc1c3b444cb8e",
     "README.md": "79ed7c2dd168a6922763833103f033dff5d08c6f20b0d35b560cb85bd037ce90"
   },
   "onchain": {

@@ -169,6 +169,10 @@ describe("proposeTaxonomy", () => {
     expect(billing?.recovery).toBe("fail");
   });
 
+  test("an input the prompt-injection check refused drafts recovery: fail", () => {
+    expect(defaultRecoveryFor("input_blocked")).toBe("fail");
+  });
+
   test("a provability halt drafts recovery: fail, like the evaluation floor beside it (0.8.0 §5.1)", () => {
     // Exit 37 sits in the 3x configured-stop band beside evaluation's 35: the
     // spec's own on_fail: halt ended the run, so the draft never says retry.

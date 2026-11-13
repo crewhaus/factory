@@ -116,6 +116,8 @@ const HELD_FILES = [
   ".crewhaus/run/gateway-jwt-secret",
   ".crewhaus/run/logs/child.log",
   ".crewhaus/run/control/keys/lease",
+  ".crewhaus/run/control/inputs/run_1.json",
+  ".crewhaus/run/control/runs/seg-000001.jsonl",
 ];
 /** Neighbours a call names freely. */
 const OPEN_FILES = [

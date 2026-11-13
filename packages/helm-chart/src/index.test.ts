@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { TARGET_SHAPES } from "@crewhaus/docker-images";
 
 import {
@@ -25,6 +27,13 @@ describe("chart on disk", () => {
     expect(files).toContain("servicemonitor.yaml");
     expect(files).toContain("otel-collector.yaml");
     expect(files).toContain("_helpers.tpl");
+  });
+
+  test("values.yaml has no gateway block, and says where a managed daemon's signing secret comes from", () => {
+    const values = readFileSync(join(chartRoot(), "values.yaml"), "utf8");
+    expect(values).toMatch(/^secrets:/m); // control: top-level keys are found
+    expect(values).not.toMatch(/^gateway:/m);
+    expect(values).toContain("CREWHAUS_GATEWAY_JWT_SECRET");
   });
 
   test("readTemplate refuses traversal", () => {

@@ -371,6 +371,12 @@ export const ErrorCode = {
    * refused before any work, with no reservation and no handler call. HTTP 503.
    */
   Disabled: "disabled",
+  /**
+   * This daemon does not serve the method: a managed daemon keeps each
+   * tenant's session logs under its tenants root and serves no session
+   * listing, so `sessions.list` and `sessions.fork` answer this. HTTP 501.
+   */
+  Unsupported: "unsupported",
 } as const;
 
 export type ErrorCodeT = (typeof ErrorCode)[keyof typeof ErrorCode];

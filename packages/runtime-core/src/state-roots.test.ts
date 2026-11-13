@@ -13,10 +13,19 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import {
+  type RuleSet,
+  type ToolCallContext,
+  emptyRuleSet,
+  evaluateWithReason,
+} from "@crewhaus/permission-engine";
 import { buildTenant } from "@crewhaus/tenancy";
 import { protectedRootHolding } from "@crewhaus/tool-safety/fs";
+import { CANONICAL_MEMORY_FILES } from "./project-memory";
 import {
+  MEMORY_FLOOR_TARGETS,
   credentialFileRoots,
+  credentialFloorScope,
   declaredEnvFiles,
   relocatingFieldLeftOut,
   runtimeRecordRoots,
@@ -1200,6 +1209,8 @@ describe("the credential file roots", () => {
     join(".crewhaus", "run", "gateway-jwt-secret"),
     join(".crewhaus", "run", "logs"),
     join(".crewhaus", "run", "control", "keys"),
+    join(".crewhaus", "run", "control", "inputs"),
+    join(".crewhaus", "run", "control", "runs"),
   ];
   const settle = (cwd: string, envFiles: readonly string[]): void => {
     mkdirSync(join(cwd, ".crewhaus"), { recursive: true });
@@ -1334,5 +1345,76 @@ describe("storeFileRoots", () => {
       [focus, join(".crewhaus", "state", "s", "focus.md")].sort(),
     );
     expect(storeFileRoots([], cwd)).toEqual([]);
+  });
+});
+
+describe("project memory and skills on a managed run", () => {
+  const managedHarness = (target = "managed"): string => {
+    const cwd = tempDir("crewhaus-memory-floor-");
+    writeFileSync(join(cwd, "crewhaus.yaml"), `name: h\ntarget: ${target}\n`);
+    return cwd;
+  };
+  const inFloor = <T>(fn: () => T): T => credentialFloorScope.run(true, fn);
+  const rootsAt = (cwd: string): string[] => runtimeStateRoots(undefined, undefined, cwd, {});
+  const write = (path: string): ToolCallContext => ({
+    toolName: "Write",
+    input: { path },
+    operativeValues: [{ kind: "path", canonical: [path] }],
+    readOnly: false,
+    destructive: true,
+  });
+  const allowWrite: RuleSet = {
+    ...emptyRuleSet,
+    flag: [{ type: "alwaysAllow", pattern: "Write", source: "flag" }],
+  };
+  const decide = (cwd: string, path: string) =>
+    evaluateWithReason(write(join(cwd, path)), "auto", allowWrite, {
+      protectedRoots: inFloor(() => rootsAt(cwd)),
+    });
+
+  test("the managed target is named", () => {
+    expect(MEMORY_FLOOR_TARGETS).toContain("managed");
+  });
+
+  test("in the floor's scope: each memory name at the working directory and both skill directories are roots", () => {
+    const cwd = managedHarness();
+    const roots = inFloor(() => rootsAt(cwd));
+    for (const name of CANONICAL_MEMORY_FILES) {
+      expect(roots).toContain(join(cwd, name));
+      expect(roots).toContain(name);
+    }
+    expect(roots).toContain(join(cwd, ".crewhaus", "skills"));
+    expect(roots).toContain(join(homedir(), ".crewhaus", "skills"));
+  });
+
+  test("a write to AGENTS.md or a skill is denied by the floor; the same names elsewhere are not", () => {
+    const cwd = managedHarness();
+    for (const path of ["AGENTS.md", "LESSONS.md", join(".crewhaus", "skills", "x", "SKILL.md")]) {
+      const verdict = decide(cwd, path);
+      expect(`${path}:${verdict.decision}`).toBe(`${path}:deny`);
+      expect(verdict.reason).toContain("no rule can allow that");
+    }
+    for (const path of [
+      join("docs", "AGENTS.md"),
+      "AGENTS.md.bak",
+      join("work", "clone", "AGENTS.md"),
+    ]) {
+      expect(`${path}:${decide(cwd, path).decision}`).toBe(`${path}:allow`);
+    }
+  });
+
+  test("a harness whose spec cannot be read is held the same way", () => {
+    const cwd = tempDir("crewhaus-memory-floor-");
+    expect(inFloor(() => rootsAt(cwd))).toContain(join(cwd, "AGENTS.md"));
+  });
+
+  test("a cli spec, or a run outside the floor's scope, adds none of them", () => {
+    const cli = managedHarness("cli");
+    expect(inFloor(() => rootsAt(cli))).not.toContain(join(cli, "AGENTS.md"));
+    const managed = managedHarness();
+    const outside = rootsAt(managed);
+    expect(outside).not.toContain(join(managed, "AGENTS.md"));
+    expect(outside).not.toContain(join(managed, ".crewhaus", "skills"));
+    expect(decide(cli, "AGENTS.md").decision).toBe("allow");
   });
 });

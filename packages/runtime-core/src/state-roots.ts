@@ -54,14 +54,17 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DEFAULT_ROOT_DIR } from "@crewhaus/event-log";
 import { hangarStateRoots, registryStateFiles } from "@crewhaus/harness-registry";
 import { APPROVALS_DIRNAME, DEFAULT_APPROVALS_FILENAME } from "@crewhaus/session-store";
+import { SKILLS_RELATIVE } from "@crewhaus/skills-registry";
 import type { Tenant } from "@crewhaus/tenancy";
 import { DEFAULT_ROOT_DIR as TOOL_RESULTS_ROOT_DIR } from "@crewhaus/tool-result-store";
 import { protectedRootHolding, rootsBesideStore } from "@crewhaus/tool-safety/fs";
 import { hookTargetFiles } from "./hook-targets";
+import { CANONICAL_MEMORY_FILES } from "./project-memory";
 
 /**
  * The files that control a run, relative to its working directory: the run
@@ -532,6 +535,13 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   when `more.specDir` (else {@link runSpecDirScope}'s value) is set and its real
  *   path is not the working directory's. In the spec's own directory the record
  *   is already under `.crewhaus/run`.
+ * - Project memory and skills, on a run in {@link credentialFloorScope} whose spec
+ *   at the working directory has a target {@link MEMORY_FLOOR_TARGETS} names, or
+ *   none can be read: the memory files the runtime loads at the working directory
+ *   (`CANONICAL_MEMORY_FILES`, exactly those names) and the skill directories
+ *   discovery reads, `<cwd>/.crewhaus/skills` and `~/.crewhaus/skills`, whole. The
+ *   same names under another directory are not roots, and plugin skill
+ *   directories are not either.
  *
  * The floor reads calls that write. A read of the run's record, a spilled
  * output's parts included, goes on as before.
@@ -601,6 +611,8 @@ export function runtimeStateRoots(
     { roots: hookTargetFiles(cwd, more.hookCommands ?? []), holdingCwd: "skip" },
     // The spec record of a spec kept in another directory.
     { roots: specRecordRoots(specDir, cwd), holdingCwd: "skip" },
+    // Project memory and skills on a run that answers people other than its operator.
+    { roots: memoryFloorRoots(cwd), holdingCwd: "skip" },
   ];
   const roots = new Set<string>();
   for (const group of groups) {
@@ -696,8 +708,10 @@ export function relocatingFieldLeftOut(
 
 /**
  * The files a run that answers people other than its operator keeps from its
- * agent's tools, relative to its working directory. Exact names: the rest of
- * `.crewhaus/run`, such as a daemon's status file, stays readable.
+ * agent's tools, relative to its working directory: its credentials, and the
+ * records that name the people it serves (the run ledger and the inputs
+ * waiting for a decision or a run). Exact names: the rest of `.crewhaus/run`,
+ * such as a daemon's status file, stays readable.
  */
 const CREDENTIAL_ROOTS: readonly string[] = [
   ".env", // a directory of that name; the file is caught by name too
@@ -708,6 +722,8 @@ const CREDENTIAL_ROOTS: readonly string[] = [
   join(".crewhaus", "run", "gateway-jwt-secret"),
   join(".crewhaus", "run", "logs"),
   join(".crewhaus", "run", "control", "keys"),
+  join(".crewhaus", "run", "control", "inputs"),
+  join(".crewhaus", "run", "control", "runs"),
 ];
 
 /**
@@ -729,6 +745,31 @@ export function credentialFileRoots(cwd: string = process.cwd()): string[] {
 
 /** Set for the whole of a run that answers people other than its operator, nested loops included. */
 export const credentialFloorScope = new AsyncLocalStorage<true>();
+
+/**
+ * The targets whose runs keep their project memory and skills from their
+ * agent's tools: the people a run answers can edit neither, and an operator
+ * can. Read with {@link credentialFloorScope}.
+ */
+export const MEMORY_FLOOR_TARGETS = ["managed"] as const;
+
+/**
+ * The memory files and skill directories of a run in {@link credentialFloorScope}
+ * whose spec at `cwd` has a {@link MEMORY_FLOOR_TARGETS} target, or whose target
+ * cannot be read; `[]` otherwise.
+ */
+function memoryFloorRoots(cwd: string): string[] {
+  if (credentialFloorScope.getStore() !== true) return [];
+  const target = specTarget(cwd);
+  if (target !== undefined && !(MEMORY_FLOOR_TARGETS as readonly string[]).includes(target)) {
+    return [];
+  }
+  return [
+    ...CANONICAL_MEMORY_FILES.map((name) => resolve(cwd, name)),
+    resolve(cwd, SKILLS_RELATIVE),
+    join(homedir(), SKILLS_RELATIVE),
+  ];
+}
 
 /**
  * The directory of the spec a run was started from, for the whole of that run, nested

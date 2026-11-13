@@ -110,6 +110,7 @@ describe("standard error codes are wire-stable", () => {
     expect(ErrorCode.InternalError).toBe("internal_error");
     expect(ErrorCode.InputBlocked).toBe("input_blocked");
     expect(ErrorCode.Paused).toBe("paused");
+    expect(ErrorCode.Unsupported).toBe("unsupported");
     expect(ErrorCode.Disabled).toBe("disabled");
   });
 });

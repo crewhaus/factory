@@ -16,8 +16,8 @@
  * Lifecycle, per run id in this process:
  *  - `running`, by the first loop that opens (`openRunRows`), with the
  *    session, its byte length before this loop (`sessionAt`), the resume
- *    scope, what started the run, and the root run, work item, parked run
- *    and execution when known;
+ *    scope, what started the run, and the root run, work item, parked run,
+ *    execution and a keyed digest of the subject (`subjectRef`) when known;
  *  - `waiting-for-approval {decision}` at a park (`recordRunPark`), after
  *    which this process writes nothing more for the run: the park is durable.
  *    A park inside a sub-agent is the top-level run's park: the sub-agent's
@@ -77,6 +77,7 @@ import {
   controlPaths,
   harnessLedger,
   readPage,
+  subjectRefOf,
 } from "@crewhaus/control-records";
 import { type CostTracker, createCostTracker } from "@crewhaus/cost-tracker";
 import { EXIT_CODES, type FailureClass, RunFailedError } from "@crewhaus/errors";
@@ -84,6 +85,7 @@ import { DEFAULT_ROOT_DIR } from "@crewhaus/event-log";
 import {
   type RunContext,
   type RunHoldOutcome,
+  currentSubject,
   isCancelReason,
   onRunIdle,
   retainRun,
@@ -110,6 +112,7 @@ const CLOSED_RUNS_KEPT = 1024;
 export type RunRowsLoopOptions = {
   readonly runLedgerDir?: string | null;
   readonly sessionTarget?: string;
+  readonly subject?: string;
 };
 
 type LoopOutcome = { readonly threw: false } | { readonly threw: true; readonly error: unknown };
@@ -160,6 +163,7 @@ const verifiedRoots = new Map<string, VerifiedRoot | null>();
  */
 const descendsFrom = new Map<string, string>();
 let appendWarned = false;
+let subjectWarned = false;
 let exitHandlerSet = false;
 
 /** Whether this `runChatLoop` invocation already runs under {@link withRunRows}. */
@@ -240,11 +244,57 @@ function openRunOf(runId: string): OpenRun | undefined {
   return top === undefined ? undefined : openRuns.get(top);
 }
 
+/** Whether this loop's {@link openRunRows} appends the run's `running` row. */
+function opensRunningRow(
+  ctx: RunContext,
+  opts: RunRowsLoopOptions,
+  persistSession: boolean,
+): boolean {
+  const slot = slots.getStore();
+  if (slot === undefined || slot.opts !== opts || slot.release !== undefined) return false;
+  if (!persistSession || opts.runLedgerDir === null) return false;
+  if (process.env["CREWHAUS_RUN_LEDGER"] === "0") return false;
+  if (ctx.parent !== undefined || currentTenantContext() !== undefined) return false;
+  return !closedRuns.has(ctx.runId) && !openRuns.has(ctx.runId);
+}
+
+/**
+ * The keyed digest of who the run serves, for its `running` row: of
+ * `opts.subject`, else of the ambient scope's subject (run-context's
+ * `currentSubject`), under the harness's subject key (`subjectRefOf`). Made
+ * only when this loop appends the `running` row, so a loop that records no
+ * rows of its own, a managed tenant's among them, makes no key. A key that
+ * cannot be made omits the field, with one warning; the run goes on.
+ */
+export async function runSubjectRef(args: {
+  readonly runContext: RunContext;
+  readonly opts: RunRowsLoopOptions;
+  /** The harness root the loop's settings load reads, when it names one. */
+  readonly harnessRoot: string | null | undefined;
+  readonly persistSession: boolean;
+}): Promise<string | undefined> {
+  const subject = args.opts.subject ?? currentSubject();
+  if (subject === undefined || subject === "") return undefined;
+  if (!opensRunningRow(args.runContext, args.opts, args.persistSession)) return undefined;
+  try {
+    return await subjectRefOf(ledgerRoot(args.opts, args.harnessRoot), subject);
+  } catch {
+    if (!subjectWarned) {
+      subjectWarned = true;
+      args.runContext.logger.warn(
+        "the run's subject key could not be made; run records leave the subject out",
+      );
+    }
+    return undefined;
+  }
+}
+
 /**
  * Open the loop's rows, right before its session log opens: hold the run, set
- * its idle handler, verify a root, and append `running` once per run id.
- * Writes nothing when the loop is not one that records (see the module
- * docblock), or when this process already ended the run.
+ * its idle handler, verify a root, and append `running` once per run id, with
+ * `subjectRef` when {@link runSubjectRef} gave one. Writes nothing when the
+ * loop is not one that records (see the module docblock), or when this
+ * process already ended the run.
  */
 export function openRunRows(args: {
   readonly runContext: RunContext;
@@ -255,6 +305,7 @@ export function openRunRows(args: {
   readonly sessionRootDir: string | undefined;
   readonly persistSession: boolean;
   readonly bus: TraceEventBus;
+  readonly subjectRef?: string;
 }): void {
   const { runContext: ctx, opts } = args;
   const slot = slots.getStore();
@@ -296,6 +347,7 @@ export function openRunRows(args: {
       ...(ctx.continues !== undefined ? { continues: ctx.continues } : {}),
       ...(workItem !== undefined ? { workItem } : {}),
       ...(execution !== undefined ? { execution } : {}),
+      ...(args.subjectRef !== undefined ? { subjectRef: args.subjectRef } : {}),
     });
     if (!written.ok) {
       warnAppend(ctx.logger, written.code);
@@ -621,4 +673,5 @@ export function _resetRunLedgerForTest(): void {
   descendsFrom.clear();
   verifiedRoots.clear();
   appendWarned = false;
+  subjectWarned = false;
 }

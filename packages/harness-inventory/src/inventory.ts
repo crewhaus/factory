@@ -831,6 +831,10 @@ export function describeFleetExit(
     [EXIT_CODES.disabled]: { class: "disabled", title: "disabled by its operator" },
     [EXIT_CODES.paused]: { class: "paused", title: "paused by its operator" },
     [EXIT_CODES.tool]: { class: "tool", title: "tool / MCP failure" },
+    [EXIT_CODES.input_blocked]: {
+      class: "input_blocked",
+      title: "input refused by the prompt-injection check",
+    },
     // Not breakage — the run PARKED awaiting a human decision, which is what
     // `EXIT_CODES.approval_pending`'s own docblock says this surface should
     // report as "needs approval" rather than alert on. Reachable for the
