@@ -20,9 +20,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readDeployments } from "@crewhaus/control-records";
-import { buildDigest, collectBuildFiles } from "@crewhaus/harness-supervisor";
+import { buildDigest, buildLinkMessage, collectBuildFiles } from "@crewhaus/harness-supervisor";
 import { BundleWriteError, probeBundleFile, writeBundleFile } from "./bundle-writer";
-import { harnessBundleOf } from "./compile-record";
+import { harnessBundleOf, recordCompiledBundle } from "./compile-record";
 
 const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 const CLI_PATH = join(SRC_DIR, "index.ts");
@@ -118,6 +118,43 @@ describe("crewhaus compile records a prepared deployment", () => {
     expect(readFileSync(join(target, "agent.ts"), "utf8")).toBe("theirs\n");
     expect(readDeployments(harness)).toEqual({ state: "absent" });
   }, 60_000);
+});
+
+describe("compile records a build of regular files only", () => {
+  function harnessWithDist(): { readonly harness: string; readonly yamlText: string } {
+    const harness = tmp("compile-record-links-");
+    const yamlText = readFileSync(join(WORKFLOW_FIXTURE, "crewhaus.yaml"), "utf8");
+    writeFileSync(join(harness, "crewhaus.yaml"), yamlText);
+    mkdirSync(join(harness, "dist"));
+    writeFileSync(join(harness, "dist", "agent.ts"), "// bundle\n");
+    return { harness, yamlText };
+  }
+  const record = (harness: string, yamlText: string) =>
+    recordCompiledBundle({
+      specPath: join(harness, "crewhaus.yaml"),
+      outDir: join(harness, "dist"),
+      yamlText,
+      written: [],
+      registryIdOf: () => undefined,
+    });
+
+  test("a link in the bundle is named, and nothing is recorded", async () => {
+    const { harness, yamlText } = harnessWithDist();
+    const outside = tmp("compile-record-outside-");
+    writeFileSync(join(outside, "helper.ts"), "// elsewhere\n");
+    symlinkSync(join(outside, "helper.ts"), join(harness, "dist", "helper.ts"));
+    expect(await record(harness, yamlText)).toEqual({
+      recorded: false,
+      reason: buildLinkMessage("dist/helper.ts"),
+    });
+    expect(readDeployments(harness)).toEqual({ state: "absent" });
+  });
+
+  test("regular files are recorded", async () => {
+    const { harness, yamlText } = harnessWithDist();
+    expect(await record(harness, yamlText)).toMatchObject({ recorded: true });
+    expect(readDeployments(harness).state).toBe("present");
+  });
 });
 
 describe("harnessBundleOf", () => {

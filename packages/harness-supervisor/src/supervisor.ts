@@ -51,7 +51,7 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { mintRunId as mintCanonicalRunId } from "@crewhaus/control-contract";
 import { readDeployments } from "@crewhaus/control-records";
-import { specRevision } from "@crewhaus/ir/policy";
+import { sameRevision, specRevision } from "@crewhaus/ir/policy";
 import {
   type ActiveDeployment,
   BUILD_NOT_ACTIVE_MESSAGE,
@@ -103,6 +103,7 @@ import {
 import { type Scrubber, createEnvScrubber, scrubbableEnvKeys } from "./scrub";
 import type { SupervisedChild } from "./shutdown";
 import { type SpawnPlan, isSupervisedClass, loadEnvChain, runClassFor } from "./spawn-contracts";
+import { automaticSpecRefusal, decideStart } from "./start-decision";
 import {
   type LogPump,
   createLogPump,
@@ -193,8 +194,19 @@ export type StartResult =
        *  for a recompile deserves to be told it happened. */
       readonly prepared?: readonly string[];
     }
-  | { readonly ok: false; readonly reason: "already-running"; readonly runfile?: DaemonRunfile }
-  | { readonly ok: false; readonly reason: "preflight-blocked"; readonly gate: GateDecision }
+  | {
+      readonly ok: false;
+      readonly reason: "already-running";
+      readonly runfile?: DaemonRunfile;
+      readonly kept?: true;
+    }
+  | {
+      readonly ok: false;
+      readonly reason: "preflight-blocked";
+      readonly gate: GateDecision;
+      /** A restart refused before it stopped anything: the daemon keeps running. */
+      readonly kept?: true;
+    }
   | {
       /** A compile or an operator hook refused. Blocking exactly like a
        *  preflight finding: a prep step that cannot run must not be waved
@@ -202,6 +214,7 @@ export type StartResult =
       readonly ok: false;
       readonly reason: "prepare-refused";
       readonly refusal: PrepareRefusal;
+      readonly kept?: true;
     }
   | {
       /** The build on disk is not the one a start may run: an automatic start runs only
@@ -209,11 +222,15 @@ export type StartResult =
       readonly ok: false;
       readonly reason: "build-not-active";
       readonly message: string;
+      /** A restart refused before it stopped anything: the daemon keeps running. */
+      readonly kept?: true;
     }
   | {
       readonly ok: false;
       readonly reason: "plan-failed";
       readonly error: Error;
+      /** A restart refused before it stopped anything: the daemon keeps running. */
+      readonly kept?: true;
       /** Which half of `start()` failed. `plan` is a spec/bundle problem the
        *  operator can fix; `spawn` is the machine refusing to launch
        *  (EMFILE, ENOSPC, EACCES on the run dir) — same shape, different
@@ -294,6 +311,9 @@ export type SupervisorOptions = {
     /** True when the harness had no deployment record when this start began, before
      *  any compile it ran: a harness from before deployments, recorded at this start. */
     readonly ledgerAbsent: boolean;
+    /** True when a restart asks before it stops the running daemon: answer every refusal
+     *  the head can decide, and record and activate nothing. */
+    readonly decideOnly: boolean;
   }) => Promise<AdmitAnswer>;
 };
 
@@ -317,6 +337,11 @@ export type HarnessSupervisor = {
   liveChild(): SupervisedChild | undefined;
   start(options?: GateOptions): Promise<StartResult>;
   stop(options?: { readonly graceMs?: number }): Promise<StopResult>;
+  /**
+   * Stop, then start. While a daemon runs, everything the start would refuse that can be
+   * decided before it runs (`decideStart`) is decided first; a refusal is answered with
+   * `kept: true` and the daemon keeps running.
+   */
   restart(options?: GateOptions): Promise<StartResult>;
   /** Graceful intake-stop: the caller performs the control.v1 `drain` call;
    *  this only drives the state and waits for the exit. */
@@ -371,7 +396,9 @@ function deploymentOfSpec(
   const active = activeDeployment(harnessDir);
   if (active?.specHash === undefined || specPath === undefined) return undefined;
   try {
-    return specRevision(readFileSync(specPath, "utf8")) === active.specHash ? active : undefined;
+    return sameRevision(specRevision(readFileSync(specPath, "utf8")), active.specHash)
+      ? active
+      : undefined;
   } catch {
     return undefined;
   }
@@ -430,7 +457,9 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
   let lastRunFailed: Record<string, unknown> | undefined;
   // Default to a scrubber over the harness's own `.env` chain so even an
   // adopted run — where no spawn env was ever built here — is scrubbed.
-  let scrub: Scrubber = options.scrub ?? createEnvScrubber(loadEnvChain(options.harnessDir).vars);
+  let scrub: Scrubber =
+    options.scrub ??
+    createEnvScrubber(loadEnvChain(options.harnessDir, { nodeEnv: process.env["NODE_ENV"] }).vars);
   const listeners = new Set<(event: SupervisorEvent) => void>();
   const idleWaiters: Array<() => void> = [];
   const ownerPid = options.ownerPid ?? process.pid;
@@ -1121,6 +1150,12 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       // The deployment stamped on the spawn is one this launch was checked against.
       let deployment: ActiveDeployment | undefined;
       if (plan.launchMode !== "compiled") {
+        // An automatic start of a launch that runs the saved spec runs it only while it is
+        // the active deployment's spec.
+        if (internal.automatic === true) {
+          const refused = automaticSpecRefusal(options.harnessDir, plan.specPath);
+          if (refused !== undefined) return refuseBuild(refused);
+        }
         deployment = deploymentOfSpec(options.harnessDir, plan.specPath);
       } else {
         const launched = launchedEntryOf(options.harnessDir, plan.bundleDir, plan.entry);
@@ -1134,6 +1169,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
             target: options.target,
             entry: launched,
             ledgerAbsent,
+            decideOnly: false,
           });
           if (!admitted.ok) return refuseBuild(admitted.message);
           if (admitted.deployment !== undefined) {
@@ -1354,7 +1390,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       const keys = runfile?.scrubKeys ?? [];
       if (keys.length > 0) {
         const base: Record<string, string | undefined> = {
-          ...loadEnvChain(options.harnessDir).vars,
+          ...loadEnvChain(options.harnessDir, { nodeEnv: process.env["NODE_ENV"] }).vars,
         };
         for (const key of keys) {
           const value = process.env[key];
@@ -1483,6 +1519,20 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       // "stop" without a pid is a no-op that used to delete a LIVE daemon's
       // runfile and spawn a duplicate beside it.
       await adoptIfRunfile();
+      // While a daemon runs, the start this restart makes is decided before the stop: a
+      // refusal leaves the daemon running and says so.
+      if (pid !== undefined || verifyRunfile(readRunfile(options.harnessDir), options.ops).live) {
+        const refused = await decideStart({
+          harnessDir: options.harnessDir,
+          target: options.target,
+          plan: options.plan,
+          gateOptions: gateOptions ?? {},
+          ...(options.gate !== undefined ? { gate: options.gate } : {}),
+          ...(options.prepare !== undefined ? { prepare: options.prepare } : {}),
+          ...(options.admit !== undefined ? { admit: options.admit } : {}),
+        });
+        if (refused !== undefined) return { ...refused, kept: true };
+      }
       await stop();
       return start(gateOptions);
     },

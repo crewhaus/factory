@@ -91,8 +91,8 @@ import {
   HARNESS_ID_RE,
   type HangarHarnessEntry,
   type HangarRegistry,
-  isAdopted,
   openHangarRegistry,
+  runsOwnCode,
 } from "@crewhaus/harness-registry";
 import {
   type GateDecision,
@@ -219,6 +219,7 @@ import {
 import {
   type HarnessProcess,
   JobArgumentError,
+  JobRefusedError,
   type ProcessLayer,
   createProcessLayer,
   isJobKind,
@@ -290,6 +291,9 @@ export type HangarServerOptions = {
    *  clock) to drive supervision in tests without spawning anything;
    *  omitted, the server builds a real one. */
   readonly processLayer?: ProcessLayer;
+  /** The argv that runs this Home's own `crewhaus`, for the process layer the server builds
+   *  (`ProcessLayerOptions.homeCrewhaus`). */
+  readonly homeCrewhaus?: readonly string[];
   /** control.v1 client; injected in tests to point at a stub daemon. */
   readonly controlClient?: ControlClient;
   /** Identity recorded on approvals/review decisions made through the API. */
@@ -542,6 +546,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       hangarRoot,
       managerVersion: version,
       wrapJobStore: controlService.jobs.wrapStore,
+      ...(opts.homeCrewhaus !== undefined ? { homeCrewhaus: opts.homeCrewhaus } : {}),
     });
   const control: ControlClient = opts.controlClient ?? createControlClient();
 
@@ -1105,6 +1110,26 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     report: { ok: gate.report.ok },
   });
 
+  /** A job refused before it was enqueued, in the same shape: acknowledging the item, for
+   *  this one job, lets it through. */
+  const jobRefusalBody = (err: JobRefusedError): Record<string, unknown> => ({
+    ok: false,
+    reason: "preflight-blocked",
+    refused: [
+      {
+        id: err.item.id,
+        area: err.item.area,
+        level: err.item.level,
+        message: err.item.message,
+        remediation: err.item.remediation ?? null,
+        acknowledgeable: !isUnforceable(err.item),
+      },
+    ],
+    unforceable: isUnforceable(err.item) ? [err.item.id] : [],
+    acknowledged: [],
+    report: { ok: false },
+  });
+
   /** control.v1 answers are ALWAYS a 200 envelope: the UI needs the reason
    *  text in the disabled/refused cases just as much as in the happy one,
    *  and a non-2xx would make the client's `api.js` throw instead of
@@ -1301,6 +1326,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         prepared: result.prepared ?? [],
       });
     }
+    // A restart refused before it stopped anything says the daemon keeps running.
+    const kept = result.kept === true ? { running: true } : {};
     switch (result.reason) {
       case "prepare-refused":
         // 409 like the gate: well-formed request, refused by a fact about
@@ -1314,6 +1341,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
             exitCode: result.refusal.exitCode ?? null,
             // Already scrubbed at the capture (`runPrepareCommand`).
             output: result.refusal.output,
+            ...kept,
           },
           409,
         );
@@ -1324,13 +1352,14 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
             reason: "already-running",
             message: "a daemon is already running for this harness (the runfile is the lock)",
             runfile: result.runfile ?? null,
+            ...kept,
           },
           409,
         );
       case "preflight-blocked":
         // 409, not 400: the request was well-formed and the refusal is a
         // fact about the harness that `force`/`acknowledge` may clear.
-        return json(gateRefusalBody(result.gate), 409);
+        return json({ ...gateRefusalBody(result.gate), ...kept }, 409);
       case "build-not-active":
         // 409: the build on disk is not the active deployment's. Activating it, or
         // restoring the active build, clears it.
@@ -1340,6 +1369,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
             reason: "build-not-active",
             message: result.message,
             verb: "crewhaus deploy activate",
+            ...kept,
           },
           409,
         );
@@ -1351,6 +1381,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
             message: result.error.message,
             // The UI turns a remedy into a button, not an error toast.
             remedy: result.error instanceof SpawnPlanError ? result.error.remedy : null,
+            ...kept,
           },
           409,
         );
@@ -1453,9 +1484,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     const context: M3Context = {
       entry,
       harnessDir,
-      // Adopted on THIS machine (a row from before adoption began counts):
-      // only then is the harness's own code trusted to check its spec.
-      adopted: entry !== null && isAdopted(entry, registry.adoptionSince()),
+      // Only a harness adopted here with `crewhaus harness adopt` (its row carries `home`) has its own code check its spec.
+      adopted: entry !== null && runsOwnCode(entry),
       params,
       query: url.searchParams,
       body,
@@ -1479,20 +1509,42 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       },
       control,
       jobs: processes.jobs,
-      submitJob: (kind, argv) =>
-        processes.jobs.submit({
+      // Each job is checked where it runs (a fleet route's job runs in the server's own
+      // directory); `acknowledge` in the request covers this one job and is not kept.
+      submitJob: (kind, argv) => {
+        const acknowledge = asStringArray(body["acknowledge"]);
+        return processes.jobs.submit({
           harnessDir: dir ?? "",
           ...(entry !== null ? { harnessId: entry.id } : {}),
           kind,
           argv,
+          ...(acknowledge !== undefined ? { acknowledge } : {}),
           ...commandFields(),
-        }),
+        });
+      },
+      checkJob: () => {
+        const acknowledge = asStringArray(body["acknowledge"]);
+        processes.jobs.check({
+          harnessDir: dir ?? "",
+          ...(acknowledge !== undefined ? { acknowledge } : {}),
+        });
+      },
       warn: onWarn,
     };
     let result: unknown;
     try {
       result = await route.handler(context);
     } catch (err) {
+      // A job refused before it was enqueued answers like `/proc/start`'s gate.
+      if (err instanceof JobRefusedError) {
+        return json(
+          maskDeep(
+            { error: err.message, ...jobRefusalBody(err) },
+            dir === null ? fleetScrub() : harnessScrub(dir),
+          ),
+          409,
+        );
+      }
       // A refusal that carries fields beside its message (a 412's `current`,
       // a 409's `needs`) is masked and scrubbed like any answer.
       if (err instanceof HttpError && err.body !== undefined) {
@@ -1772,13 +1824,22 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           if (err instanceof JobArgumentError) throw new HttpError(400, err.message);
           throw err;
         }
-        const record = processes.jobs.submit({
-          harnessDir: dir,
-          harnessId: entry.id,
-          kind,
-          argv,
-          ...commandFields(),
-        });
+        // Acknowledged for this one job: the record carries no trace of it.
+        const acknowledge = asStringArray(body["acknowledge"]);
+        let record: ReturnType<ProcessLayer["jobs"]["submit"]>;
+        try {
+          record = processes.jobs.submit({
+            harnessDir: dir,
+            harnessId: entry.id,
+            kind,
+            argv,
+            ...(acknowledge !== undefined ? { acknowledge } : {}),
+            ...commandFields(),
+          });
+        } catch (err) {
+          if (err instanceof JobRefusedError) return json(jobRefusalBody(err), 409);
+          throw err;
+        }
         return jsonMasked({ ok: true, job: record }, 202);
       }
 
@@ -2175,7 +2236,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
             handle.clearDraining();
             return { ok: true, message: `${verb}ed ${started.runId}`, runId: started.runId };
           }
-          return { ok: false, message: groupRefusalMessage(started), reason: started.reason };
+          return {
+            ok: false,
+            message: groupRefusalMessage(started),
+            reason: started.reason,
+            // A restart refused before it stopped anything: the member keeps running.
+            ...(started.kept === true ? { running: true } : {}),
+          };
         },
         { parallel: body["parallel"] === true },
       );

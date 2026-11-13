@@ -26,6 +26,7 @@ export {
   openHangarRegistry,
   registerHarnessHook,
   resolveRegistryRoot,
+  runsOwnCode,
   slugOf,
   sortGroupMembers,
   type HangarRegistry,

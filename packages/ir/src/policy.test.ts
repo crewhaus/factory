@@ -9,6 +9,7 @@ import {
   intentDigest,
   policyMaterialOf,
   policyRevision,
+  sameRevision,
   specRevision,
 } from "./policy";
 
@@ -20,6 +21,41 @@ describe("specRevision", () => {
     expect(specRevision("name: a\ntarget: cli")).toBe(lf);
     expect(specRevision("name: a\ntarget: cli\n\n")).not.toBe(lf);
     expect(specRevision("name: a\ntarget:  cli\n")).not.toBe(lf);
+  });
+});
+
+describe("sameRevision", () => {
+  const a = specRevision("name: a\n");
+  const b = specRevision("name: b\n");
+
+  test("equal well-formed revisions are the same", () => {
+    expect(sameRevision(a, a)).toBe(true);
+    expect(sameRevision(a, specRevision("name: a"))).toBe(true);
+  });
+
+  test("different well-formed revisions are not", () => {
+    expect(sameRevision(a, b)).toBe(false);
+  });
+
+  test("a missing or malformed revision never counts as equal, not even to itself", () => {
+    const malformed: unknown[] = [
+      undefined,
+      null,
+      "",
+      "sha256:",
+      a.toUpperCase(),
+      `sha256:${a.slice(7).toUpperCase()}`,
+      a.slice(0, -1),
+      `${a}0`,
+      a.slice(7),
+      42,
+      { a },
+    ];
+    for (const value of malformed) {
+      expect(sameRevision(value, value)).toBe(false);
+      expect(sameRevision(value, a)).toBe(false);
+      expect(sameRevision(a, value)).toBe(false);
+    }
   });
 });
 

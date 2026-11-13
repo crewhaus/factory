@@ -260,7 +260,49 @@ these on: they reach every harness that uses what each one names.
 - **A supervised or Home start uses a harness's own
   `node_modules/.bin/crewhaus` only when it resolves inside the harness
   directory**, otherwise the `crewhaus` on `PATH`. Home's jobs for a harness
-  not adopted on this machine use the `crewhaus` on `PATH`.
+  not adopted on this machine use Home's own `crewhaus`.
+
+- **A restart that would be refused leaves the daemon running.** `crewhaus
+  daemon restart` and Home's Restart first check what the new start would
+  refuse: its plan, preflight (a directory that holds the home directory among
+  it) and the build it would run. When one refuses, nothing is stopped and the
+  refusal says the daemon keeps running; Home's answer carries `running: true`.
+  Ports the daemon holds are checked after it stops, and a start that compiles
+  first decides its build after the compile.
+
+- **While a deployment is active, an automatic restart of `crewhaus run` or
+  `serve --mcp` runs only that deployment's spec.** When the saved spec is not
+  the active revision, the restart stays stopped and says why; activate it with
+  `crewhaus deploy activate`, or restore the active spec. With no active
+  deployment, the saved spec runs.
+
+- **A Home job in a directory that holds the home directory needs the same
+  acknowledgement a start needs, for each job.** Home answers 409 with the
+  acknowledgeable `workspace.holds-home` item until the request acknowledges it;
+  the acknowledgement covers that one job and is not kept. A job with no harness
+  is checked in Home's own directory.
+
+- **Home's jobs and spec checks use a harness's own `crewhaus` and spec library
+  only after `crewhaus harness adopt` on this machine.** Until then, Home runs
+  the harness's jobs with its own `crewhaus`, which reads no `bunfig.toml` from
+  the harness directory, and checks its spec with Home's own schema. A harness
+  registered before this release keeps group start without adopting it. A Home
+  job runs with only the absolute entries of `PATH`.
+
+- **A supervised daemon's environment comes only from the manager:** it reads
+  the env files Bun reads (`.env`, `.env.<mode>`, `.env.local`,
+  `.env.<mode>.local`, by `NODE_ENV`), leaves out loader settings, and the
+  daemon reads no env file itself. A loader setting that an env file in the
+  harness or the manager's directory names is left out whatever its value. The
+  mode is `production` or `test` when `NODE_ENV` names it and `development`
+  otherwise, and `test` reads no `.env.local`. The compiled daemon runs as
+  `bun --no-env-file`, and so does a stdio MCP server started with `bun` or
+  `bunx`: give such a server what it needs through its `env`.
+
+- **A build runs from regular files only.** A start refuses a build whose files
+  hold a link, naming the path, and neither a start nor `crewhaus compile`
+  records one. Replace the link with the file, then run `crewhaus compile` and
+  `crewhaus deploy activate`.
 
 ## [0.8.2] - 2026-11-12
 

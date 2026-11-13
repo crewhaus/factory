@@ -16,6 +16,7 @@ export {
   type AppendAnswer,
   type AppendClaimAnswer,
   type CasAnswer,
+  type CasPrecondition,
   type ClaimContent,
   type ExpireAnswer,
   type FoldAnomaly,

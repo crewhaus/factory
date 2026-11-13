@@ -6,16 +6,30 @@
  * does not know is read-only here.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { openHangarRegistry } from "@crewhaus/harness-registry";
+import { isAbsolute, join, relative } from "node:path";
+import { REGISTRY_FILENAME, isAdopted, openHangarRegistry } from "@crewhaus/harness-registry";
 import { SECURITY_SURFACES as SPEC_PATCH_SURFACES } from "@crewhaus/spec-patch";
 import { specRev } from "@crewhaus/spec-patch/commit";
 import { makeFixtureHarness } from "./fixture";
 import { jobCrewhausBin } from "./process";
 import { SECURITY_SURFACES, setSchemaCheckDeps } from "./spec-edit";
-import { type ChildHandle, type SpawnChild, validateInHarness } from "./spec-validator-child";
+import {
+  type ChildHandle,
+  type SpawnChild,
+  bunInterpreter,
+  validateInHarness,
+} from "./spec-validator-child";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
@@ -115,7 +129,7 @@ describe("a harness's schema never runs in Home's process", () => {
     const schema = await t.api(`/api/h/${id}/spec/schema`);
     expect(schema.body["schemaSource"]).toBe("manager");
     expect(String(schema.body["note"])).toBe(
-      "Checked with this CrewHaus's schema. Adopt the harness to check it with its own.",
+      `Checked with this CrewHaus's schema. To check it with its own, run crewhaus harness adopt ${id}.`,
     );
     await t.api(`/api/h/${id}/spec/trust`);
     await t.api(`/api/h/${id}/spec/diff`, { method: "POST", body: JSON.stringify({ edits: [] }) });
@@ -124,6 +138,28 @@ describe("a harness's schema never runs in Home's process", () => {
       put({ edits: [{ path: "agent.instructions", value: "Hi." }], expectedRev: revOf(dir) }),
     );
     expect(wrote.status).toBe(200);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("a harness registered before this release keeps group start, and is checked with Home's schema", async () => {
+    const t = boot();
+    const { dir, marker } = harness(t, "grandfathered");
+    const id = await register(t, dir);
+    // The registry as an earlier release wrote it: every row predates adoption.
+    const file = join(t.registryRoot, REGISTRY_FILENAME);
+    const doc = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    Reflect.deleteProperty(doc, "adoptionSince");
+    writeFileSync(file, JSON.stringify(doc));
+    const registry = openHangarRegistry({ root: t.registryRoot, env: {} });
+    const row = registry.get(id);
+    if (row === undefined) throw new Error("not registered");
+    expect(isAdopted(row, registry.adoptionSince())).toBe(true);
+    expect(row.home).toBeUndefined();
+    const schema = await t.api(`/api/h/${id}/spec/schema`);
+    expect(schema.body["schemaSource"]).toBe("manager");
+    expect(String(schema.body["note"])).toBe(
+      `Checked with this CrewHaus's schema. To check it with its own, run crewhaus harness adopt ${id}.`,
+    );
     expect(existsSync(marker)).toBe(false);
   });
 
@@ -627,7 +663,7 @@ describe("the crewhaus a Home job runs", () => {
       list: () => [row({})],
       adoptionSince: () => "2026-07-01T00:00:00.000Z",
     };
-    expect(jobCrewhausBin(registry, "/h", deps)).toBe("/usr/local/bin/crewhaus");
+    expect(jobCrewhausBin(registry, "/h", deps)).toEqual(["/usr/local/bin/crewhaus"]);
   });
 
   test("an adopted harness runs its own contained crewhaus", () => {
@@ -635,11 +671,69 @@ describe("the crewhaus a Home job runs", () => {
       list: () => [row({ home: { adoptedAt: "2026-08-02T00:00:00.000Z", by: "prn_x" } })],
       adoptionSince: () => "2026-07-01T00:00:00.000Z",
     };
-    expect(jobCrewhausBin(registry, "/h", deps)).toBe(local);
+    expect(jobCrewhausBin(registry, "/h", deps)).toEqual([local]);
   });
 
   test("a directory with no row runs the crewhaus on PATH", () => {
     const registry = { list: () => [], adoptionSince: () => undefined };
-    expect(jobCrewhausBin(registry, "/h", deps)).toBe("/usr/local/bin/crewhaus");
+    expect(jobCrewhausBin(registry, "/h", deps)).toEqual(["/usr/local/bin/crewhaus"]);
   });
+
+  test("a harness not adopted here runs Home's own crewhaus when the host names it", () => {
+    const home = ["/opt/bun", "--no-env-file", "--config=/dev/null", "/opt/crewhaus/index.js"];
+    const notAdopted = { list: () => [row({})], adoptionSince: () => "2026-09-01T00:00:00.000Z" };
+    expect(jobCrewhausBin(notAdopted, "/h", deps, home)).toEqual(home);
+    const adopted = {
+      list: () => [row({ home: { adoptedAt: "2026-08-02T00:00:00.000Z", by: "prn_x" } })],
+      adoptionSince: () => "2026-07-01T00:00:00.000Z",
+    };
+    expect(jobCrewhausBin(adopted, "/h", deps, home)).toEqual([local]);
+  });
+
+  test("a row registered before this release, never adopted, runs the crewhaus on PATH", () => {
+    // Registered before adoption began: counted as adopted for a group start only.
+    for (const adoptionSince of ["2026-09-01T00:00:00.000Z", undefined]) {
+      const registry = { list: () => [row({})], adoptionSince: () => adoptionSince };
+      expect(jobCrewhausBin(registry, "/h", deps)).toEqual(["/usr/local/bin/crewhaus"]);
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "the PATH fallback never resolves inside the harness",
+    () => {
+      const home = realpathSync(mkdtempSync(join(tmpdir(), "home-cwd-")));
+      const harnessDir = realpathSync(mkdtempSync(join(tmpdir(), "home-harness-")));
+      for (const root of [home, harnessDir]) {
+        mkdirSync(join(root, "node_modules", ".bin"), { recursive: true });
+        for (const name of ["crewhaus", "bun"]) {
+          writeFileSync(join(root, "node_modules", ".bin", name), "#!/bin/sh\n");
+          chmodSync(join(root, "node_modules", ".bin", name), 0o755);
+        }
+      }
+      const cwd = process.cwd();
+      const path = process.env["PATH"];
+      try {
+        process.chdir(home);
+        process.env["PATH"] = ["node_modules/.bin", "."].join(":");
+        const registry = {
+          list: () => [{ dir: harnessDir, registeredAt: "2026-08-01T00:00:00.000Z" } as never],
+          adoptionSince: () => "2026-07-01T00:00:00.000Z",
+        };
+        const bin = jobCrewhausBin(registry, harnessDir);
+        const outside = (p: string) => {
+          const rel = relative(harnessDir, p);
+          return isAbsolute(p) && (rel.startsWith("..") || isAbsolute(rel));
+        };
+        expect(bin === undefined || bin.every(outside)).toBe(true);
+        expect(bin).toBeUndefined();
+        expect(bunInterpreter({ PATH: "node_modules/.bin" }, "/usr/bin/node")).toBeUndefined();
+      } finally {
+        process.chdir(cwd);
+        if (path === undefined) Reflect.deleteProperty(process.env, "PATH");
+        else process.env["PATH"] = path;
+        rmSync(home, { recursive: true, force: true });
+        rmSync(harnessDir, { recursive: true, force: true });
+      }
+    },
+  );
 });

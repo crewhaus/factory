@@ -44,8 +44,9 @@
  * THE SCHEMA IS CHECKED PER HARNESS, OUTSIDE THIS PROCESS
  * ---------------------------------------------------------------------------
  * A machine's harnesses span crewhaus versions; that is the normal case. A
- * harness adopted on this machine whose `@crewhaus/spec` realpath-contains
- * inside it is checked with that copy, in a child process
+ * harness adopted with `crewhaus harness adopt` on this machine whose
+ * `@crewhaus/spec` realpath-contains inside it is checked with that copy, in a
+ * child process
  * (`spec-validator-child.ts`): a harness's code never runs inside Home. Any
  * other harness, or a check that cannot answer, is checked with this
  * manager's own schema, with a note that says so. A spec carrying keys the
@@ -231,9 +232,13 @@ export type SchemaCheck = {
   readonly parseError?: string;
 };
 
-/** The note a harness not adopted on this machine gets. */
-export const NOT_ADOPTED_NOTE =
-  "Checked with this CrewHaus's schema. Adopt the harness to check it with its own.";
+/** The note a harness not adopted with `crewhaus harness adopt` on this machine gets; with
+ *  no registry row there is no id to name. */
+export function notAdoptedNote(id: string | undefined): string {
+  return id === undefined
+    ? "Checked with this CrewHaus's schema. To check it with its own, run crewhaus harness adopt <dir>."
+    : `Checked with this CrewHaus's schema. To check it with its own, run crewhaus harness adopt ${id}.`;
+}
 
 /** Test seam for the child check: its spawn, timer and interpreter. */
 export type SchemaCheckDeps = {
@@ -316,18 +321,20 @@ function managerCheck(yamlText: string, op: "issues" | "schema", note: string | 
 /**
  * Check `yamlText` with the schema this harness is built against.
  *
- * A harness adopted on this machine whose `@crewhaus/spec` resolves inside
- * it is checked with that copy, in a child process; anything else, or a
- * child that cannot answer, with this manager's schema and a note naming
- * why. Never throws.
+ * A harness adopted with `crewhaus harness adopt` on this machine whose
+ * `@crewhaus/spec` resolves inside it is checked with that copy, in a child
+ * process; anything else, or a child that cannot answer, with this manager's
+ * schema and a note naming why. Never throws.
  */
 export async function checkSpec(
-  ctx: Pick<M3Context, "harnessDir" | "adopted">,
+  ctx: Pick<M3Context, "harnessDir" | "adopted" | "entry">,
   yamlText: string,
   op: "issues" | "schema",
 ): Promise<SchemaCheck> {
   const dir = ctx.harnessDir;
-  if (dir === null || ctx.adopted !== true) return managerCheck(yamlText, op, NOT_ADOPTED_NOTE);
+  if (dir === null || ctx.adopted !== true) {
+    return managerCheck(yamlText, op, notAdoptedNote(ctx.entry?.id));
+  }
   let resolved: string;
   try {
     resolved = Bun.resolveSync("@crewhaus/spec", dir);
@@ -436,7 +443,7 @@ export function readOnlyRefusal(state: ReadOnlyState): HttpError {
  * caller previews with the same schema ({@link previewHomeEdits}).
  */
 export async function requireEditable(
-  ctx: Pick<M3Context, "harnessDir" | "adopted">,
+  ctx: Pick<M3Context, "harnessDir" | "adopted" | "entry">,
   yamlText: string,
 ): Promise<SchemaCheck> {
   const check = await checkSpec(ctx, yamlText, "issues");
@@ -958,7 +965,7 @@ export function previewSpecEdits(
  * by that schema in its child; otherwise this manager's schema decides.
  */
 export async function previewHomeEdits(
-  ctx: Pick<M3Context, "harnessDir" | "adopted">,
+  ctx: Pick<M3Context, "harnessDir" | "adopted" | "entry">,
   before: string,
   edits: readonly SpecEdit[],
   check: SchemaCheck,
@@ -1795,6 +1802,8 @@ export const specPropose: M3Handler = async (ctx) => {
   if (!PROPOSAL_PATH_RE.test(rel)) {
     throw new HttpError(500, "refusing to stage a proposal outside the proposals directory");
   }
+  // Its job is checked before the proposal is staged, so a refused job leaves nothing.
+  ctx.checkJob();
   const dir = ctx.contain([STATE_DIR, PROPOSAL_SUBDIR, `hangar-${stamp}`]);
   mkdirSync(dir, { recursive: true });
   const target = ctx.contain([STATE_DIR, PROPOSAL_SUBDIR, `hangar-${stamp}`, PROPOSAL_FILE]);

@@ -94,6 +94,7 @@ import {
 } from "@crewhaus/harness-registry";
 import {
   type ShutdownSupervisor,
+  homeCrewhausArgv,
   runManagerShutdown,
   shutdownReportLines,
 } from "@crewhaus/harness-supervisor";
@@ -966,6 +967,9 @@ async function hangarServe(
   }
 
   const version = cliVersion();
+  // Only the real server runs jobs with this process's own entry; a host that injects its
+  // own server (tests) runs another program as `Bun.main`.
+  const homeCrewhaus = opts.startServer === undefined ? ownCrewhausArgv(hangarRoot) : undefined;
   const server = (opts.startServer ?? startHangarServer)({
     port: flags.smoke ? 0 : (flags.port ?? DEFAULT_HANGAR_PORT),
     ...(lan !== undefined ? { hostname: lan.address } : {}),
@@ -979,6 +983,7 @@ async function hangarServe(
     env,
     now,
     ...(version !== undefined ? { version } : {}),
+    ...(homeCrewhaus !== undefined ? { homeCrewhaus } : {}),
   });
 
   // Claim the lock with the real bound port. The pre-boot check above makes
@@ -1317,4 +1322,22 @@ export async function runHangarCommand(
         `unknown hangar verb "${verb}" (expected: ${Object.keys(CLI_FAMILY.sub).join(" | ")})`,
       );
   }
+}
+
+/**
+ * The argv that runs this `crewhaus` again for a Home job, taking no code or settings from
+ * the harness directory it runs in. A Bun-run `crewhaus` is given an empty `--config`
+ * (`/dev/null`, or an empty file in Home's directory on Windows).
+ */
+function ownCrewhausArgv(hangarRoot: string): string[] | undefined {
+  let emptyConfig = "/dev/null";
+  if (process.platform === "win32") {
+    emptyConfig = join(hangarRoot, "bunfig.empty.toml");
+    try {
+      if (!existsSync(emptyConfig)) writeFileSync(emptyConfig, "");
+    } catch {
+      return undefined;
+    }
+  }
+  return homeCrewhausArgv({ execPath: process.execPath, main: Bun.main, emptyConfig });
 }

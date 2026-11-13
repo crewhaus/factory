@@ -138,6 +138,8 @@ export type GroupMemberResult = {
   /** The typed refusal reason, when the supervisor gave one. */
   readonly reason?: string;
   readonly runId?: string;
+  /** True when a restart was refused before it stopped anything: the member keeps running. */
+  readonly running?: true;
 };
 
 export type GroupRunResult = {

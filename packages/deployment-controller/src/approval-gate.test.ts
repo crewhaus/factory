@@ -359,6 +359,52 @@ describe("decideApproval — a recorded approval counts only for the content it 
     );
   });
 
+  test("an empty, truncated, uppercase or absent specHash never matches, even an equal one", () => {
+    const malformed = ["", "sha256:", H.toUpperCase(), `sha256:${"A".repeat(64)}`, H.slice(0, -1)];
+    for (const value of malformed) {
+      const d = decideApproval({
+        specName: "c",
+        toEnv: "prod",
+        toVersion: "v3",
+        specHash: value,
+        policy,
+        approvals: [{ approver: "alice", ts: "t", specHash: value }],
+      });
+      expect({ value, satisfied: d.satisfied }).toEqual({ value, satisfied: false });
+      expect(d.countedApprovers).toEqual([]);
+      // Recorded against a well-formed candidate, the malformed value counts for nothing too.
+      const named = decide([{ approver: "alice", ts: "t", specHash: value }]);
+      expect(named.satisfied).toBe(false);
+      expect(named.reason).toContain("1 recorded approval(s) ignored for naming no specHash");
+    }
+  });
+
+  test("a candidate that names no spec revision is told so, never asked for an empty specHash", () => {
+    const d = decideApproval({
+      specName: "c",
+      toEnv: "prod",
+      toVersion: "v3",
+      specHash: "",
+      policy,
+      approvals: [
+        { approver: "alice", ts: "t", specHash: "" },
+        { approver: "bob", ts: "t", specHash: H },
+      ],
+    });
+    expect(d.satisfied).toBe(false);
+    expect(d.reason).toContain("the candidate names no spec revision");
+    expect(d.reason).not.toContain('"specHash": ""');
+  });
+
+  test("equal well-formed values count", () => {
+    expect(
+      decide([{ approver: "alice", ts: "t", specHash: `sha256:${"a".repeat(64)}` }]),
+    ).toMatchObject({
+      satisfied: true,
+      countedApprovers: ["alice"],
+    });
+  });
+
   test("the governance payload carries the content it was decided for", () => {
     const input = {
       specName: "c",

@@ -49,6 +49,9 @@ export type DeploymentsRead =
       readonly records: readonly LedgerRecord[];
       /** The active deployment; with two, the later `activatedAt`. */
       readonly active?: LedgerRecord;
+      /** Every active deployment's id and generation, from the same fold, so a caller can
+       *  carry what it read into a compare-and-set as its precondition. */
+      readonly activeGens: readonly { readonly id: string; readonly gen: number }[];
       /** What the fold could not reconcile, one sentence each. */
       readonly anomalies: readonly string[];
     };
@@ -61,7 +64,8 @@ function activatedAt(record: LedgerRecord): number {
 /**
  * The harness's deployment records, read-only: no lock, no repair, nothing created. Two
  * rows `active` at once (an activation that stopped between its two compare-and-sets)
- * answer the later `activatedAt` as `active` and report the other.
+ * answer the later `activatedAt` as `active` and report the other. Records leave the
+ * ledger's own fields out; `activeGens` carries the active rows' generations.
  *
  * First consumers: activation, the supervisor's build check, Home's deployments view.
  */
@@ -75,10 +79,14 @@ export function readDeployments(harnessDir: string): DeploymentsRead {
   if (fold.records === 0 && fold.gaps.length === 0) return { state: "absent" };
   const records: LedgerRecord[] = [];
   const actives: LedgerRecord[] = [];
+  const activeGens: { readonly id: string; readonly gen: number }[] = [];
   for (const object of fold.objects.values()) {
     const record = deploymentOf(object.record);
     records.push(record);
-    if (object.state === "active") actives.push(record);
+    if (object.state === "active") {
+      actives.push(record);
+      activeGens.push({ id: object.id, gen: fold.generations.get(object.id) ?? 0 });
+    }
   }
   const anomalies: string[] = [];
   for (const anomaly of fold.anomalies) {
@@ -104,6 +112,7 @@ export function readDeployments(harnessDir: string): DeploymentsRead {
     state: "present",
     records,
     ...(active !== undefined ? { active } : {}),
+    activeGens,
     anomalies,
   };
 }

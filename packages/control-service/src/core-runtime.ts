@@ -24,12 +24,22 @@ import type {
 } from "./executor";
 import { NEEDS_DECISION, outcomeOf } from "./refusal";
 
+/** A restart refused before it stopped anything: the daemon it would replace still runs. */
+const KEPT_RUNNING = { kind: "daemon", status: "skipped", note: "kept running" } as const;
+
 /** A start or restart's answer, as a settlement. */
 export function settleStart(result: StartResult): Settlement {
   if (result.ok) {
     return {
       state: "succeeded",
       effects: [{ kind: "daemon", status: "done", observed: "started" }],
+    };
+  }
+  if (result.kept === true) {
+    return {
+      state: "rejected",
+      effects: [KEPT_RUNNING],
+      outcome: outcomeOf(result.reason === "already-running" ? "conflict" : "precondition_failed"),
     };
   }
   switch (result.reason) {

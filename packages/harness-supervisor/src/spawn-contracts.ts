@@ -255,11 +255,36 @@ export function resolveCrewhausBin(
   return which("crewhaus");
 }
 
+/**
+ * The argv that runs this process's own `crewhaus` (Home's, for its jobs) in another
+ * directory without taking code or settings from it. A compiled `crewhaus` is its own executable, built to read no
+ * `bunfig.toml` from the directory it runs in. A `crewhaus` run as a script by Bun (`main`)
+ * runs as `bun --no-env-file --config=<emptyConfig> <main>`, so the directory's env files
+ * and `bunfig.toml` are not read. Undefined when `execPath` is neither.
+ */
+export function homeCrewhausArgv(self: {
+  readonly execPath: string;
+  readonly main: string;
+  readonly emptyConfig: string;
+}): string[] | undefined {
+  const compiled = self.main.startsWith("/$bunfs/") || /^[A-Za-z]:[\\/]~BUN[\\/]/.test(self.main);
+  if (compiled) return [self.execPath];
+  const runtime = (self.execPath.split(/[\\/]/).at(-1) ?? "").toLowerCase();
+  if (runtime !== "bun" && runtime !== "bun.exe") return undefined;
+  if (!isAbsolute(self.main)) return undefined;
+  return [self.execPath, "--no-env-file", `--config=${self.emptyConfig}`, self.main];
+}
+
+/**
+ * The first `cmd` on this process's `PATH`, as an absolute path. Only absolute `PATH`
+ * entries are searched, so the answer never depends on the directory a caller later runs
+ * it in.
+ */
 function defaultWhich(cmd: string): string | undefined {
   const pathVar = process.env["PATH"] ?? "";
   const sep = process.platform === "win32" ? ";" : ":";
   for (const dir of pathVar.split(sep)) {
-    if (dir === "") continue;
+    if (dir === "" || !isAbsolute(dir)) continue;
     const candidate = join(dir, cmd);
     if (existsSync(candidate)) return candidate;
   }
@@ -328,8 +353,29 @@ export function unquoteEnvValue(raw: string): string {
   return hash === -1 ? raw : raw.slice(0, hash).trim();
 }
 
-/** The harness-LOCAL env-file chain, in precedence order (later wins). */
+/** The two harness-local env files that decide the chain's mode when the manager's
+ *  environment sets no `NODE_ENV`, in precedence order (later wins). {@link envFilenamesFor}
+ *  names every file a mode reads. */
 export const ENV_FILENAMES = [".env", ".env.local"] as const;
+
+/** The mode an env-file chain is read for: Bun's, from `NODE_ENV`. */
+export type EnvMode = "development" | "production" | "test";
+
+/** Bun's mode for a `NODE_ENV`: `production` and `test` as named, anything else `development`. */
+export function envModeOf(nodeEnv: string | undefined): EnvMode {
+  return nodeEnv === "production" || nodeEnv === "test" ? nodeEnv : "development";
+}
+
+/**
+ * The harness-local env files a mode reads, lowest precedence first, as Bun reads them:
+ * `.env`, `.env.<mode>`, `.env.local`, `.env.<mode>.local`; under `test` there is no
+ * `.env.local`.
+ */
+export function envFilenamesFor(mode: EnvMode): readonly string[] {
+  return mode === "test"
+    ? [".env", ".env.test", ".env.test.local"]
+    : [".env", `.env.${mode}`, ".env.local", `.env.${mode}.local`];
+}
 
 /** One file in the chain, whether or not it exists. */
 export type EnvFileRef = {
@@ -339,7 +385,7 @@ export type EnvFileRef = {
   /** Resolved absolute path — what was actually read. */
   readonly path: string;
   /** `shared` files come from `manager.envFiles` and load UNDER the local
-   *  chain; `harness` files are `<harness>/.env{,.local}`. */
+   *  chain; `harness` files are the harness's own (see {@link envFilenamesFor}). */
   readonly scope: "shared" | "harness";
   /** False for a declared file that is absent or unreadable. A declared
    *  file that is not there is REPORTED, never silently skipped: that is
@@ -361,12 +407,21 @@ export type LoadEnvChainOptions = {
    *  to `manager.envFiles` from `<harness>/.crewhaus/settings.json`; pass
    *  `[]` to read the harness-local chain alone. */
   readonly sharedFiles?: readonly string[];
+  /** The `NODE_ENV` the manager's environment starts the child with. When it is
+   *  undefined, the `NODE_ENV` the shared files, `.env` and `.env.local` set decides the
+   *  mode, else `development`. */
+  readonly nodeEnv?: string | undefined;
 };
 
 /**
  * Read the env chain a spawn from this harness sees, LOWEST precedence
- * first: every declared shared file (`manager.envFiles`), then
- * `<harness>/.env`, then `<harness>/.env.local`.
+ * first: every declared shared file (`manager.envFiles`), then the
+ * harness's own files in Bun's order for the mode (`.env`, `.env.<mode>`,
+ * `.env.local`, `.env.<mode>.local`; see {@link envFilenamesFor}). The mode
+ * comes from the `NODE_ENV` the child starts with: the manager's, else the
+ * one the shared files, `.env` and `.env.local` set. A supervised daemon
+ * reads no env file itself, so this chain, filtered, is all it gets from
+ * the harness's files.
  *
  * Shared files exist for the fleet case: sibling harnesses that share one
  * Anthropic key, one search provider, one set of opt-ins. Before this the
@@ -415,8 +470,29 @@ export function loadEnvChain(harnessRoot: string, options: LoadEnvChainOptions =
   for (const declared of shared) {
     read(declared, isAbsolute(declared) ? declared : resolve(harnessRoot, declared), "shared");
   }
-  for (const name of ENV_FILENAMES) read(name, join(harnessRoot, name), "harness");
+  const mode = envModeOf(options.nodeEnv ?? nodeEnvOfFiles(harnessRoot, vars));
+  for (const name of envFilenamesFor(mode)) read(name, join(harnessRoot, name), "harness");
   return { vars, files, refs };
+}
+
+/** The `NODE_ENV` the shared files (already folded into `shared`), `.env` and `.env.local`
+ *  set, later winning; undefined when none sets it. */
+function nodeEnvOfFiles(
+  harnessRoot: string,
+  shared: Readonly<Record<string, string>>,
+): string | undefined {
+  let nodeEnv = shared["NODE_ENV"];
+  for (const name of ENV_FILENAMES) {
+    const path = join(harnessRoot, name);
+    if (!existsSync(path)) continue;
+    try {
+      const value = parseEnvText(readFileSync(path, "utf8"))["NODE_ENV"];
+      if (value !== undefined) nodeEnv = value;
+    } catch {
+      // Unreadable: it sets nothing, as the chain itself reports.
+    }
+  }
+  return nodeEnv;
 }
 
 /** Variables whose value relocates a harness data root. Reported so the UI
@@ -434,6 +510,9 @@ export type SpawnEnvInput = {
   readonly processEnv: Readonly<Record<string, string | undefined>>;
   /** Pre-read chain; read from disk when omitted. */
   readonly envChain?: EnvChain;
+  /** The directory the manager was started in, whose env files Bun loaded into
+   *  `processEnv`. Defaults to `process.cwd()`. */
+  readonly managerCwd?: string;
   /** Caller-stamped variables that win over everything (ports, control
    *  token; the trace stamps are applied here too). */
   readonly extra?: Readonly<Record<string, string>>;
@@ -501,6 +580,55 @@ export function isLoaderEnvKey(name: string): boolean {
   );
 }
 
+/** Every env file Bun loads into a process started in a directory, whichever `NODE_ENV`. */
+export const BUN_DOTENV_FILES = [
+  ".env",
+  ".env.local",
+  ".env.development",
+  ".env.development.local",
+  ".env.production",
+  ".env.production.local",
+  ".env.test",
+  ".env.test.local",
+] as const;
+
+/**
+ * The names an env file's lines assign, in any spelling Bun's loader takes: leading spaces,
+ * an `export ` prefix, spaces around the `=` (or `:`), CRLF endings. Over-matching (a line
+ * inside another key's multi-line quoted value) only leaves a setting out.
+ */
+export function dotenvAssignedNames(text: string): Set<string> {
+  const names = new Set<string>();
+  for (const raw of text.split(/\r?\n|\r/)) {
+    let line = raw.trimStart();
+    if (/^export[ \t]/.test(line)) line = line.slice(6).trimStart();
+    const m = /^([^\s=:#]+)[ \t]*[=:]/.exec(line);
+    if (m !== null) names.add(m[1] as string);
+  }
+  return names;
+}
+
+/**
+ * The loader settings any of Bun's env files in `dirs` assigns, by name, whatever the value
+ * and whichever mode would read the file. A caller leaves each one out by name, whatever
+ * value it holds.
+ */
+export function loaderKeysInEnvFiles(dirs: readonly string[]): Set<string> {
+  const found = new Set<string>();
+  for (const dir of new Set(dirs)) {
+    for (const name of BUN_DOTENV_FILES) {
+      let text: string;
+      try {
+        text = readFileSync(join(dir, name), "utf8");
+      } catch {
+        continue;
+      }
+      for (const key of dotenvAssignedNames(text)) if (isLoaderEnvKey(key)) found.add(key);
+    }
+  }
+  return found;
+}
+
 /**
  * Build the exact environment a spawn receives: harness `.env` chain UNDER
  * `process.env`, then the manager's own stamps. The same record is what the
@@ -508,7 +636,8 @@ export function isLoaderEnvKey(name: string): boolean {
  * gets is how "it passed preflight and then died on a missing key" happens.
  */
 export function buildSpawnEnv(input: SpawnEnvInput): SpawnEnv {
-  const chain = input.envChain ?? loadEnvChain(input.harnessRoot);
+  const chain =
+    input.envChain ?? loadEnvChain(input.harnessRoot, { nodeEnv: input.processEnv["NODE_ENV"] });
   const env: Record<string, string> = {};
   const dropped = new Set<string>();
   for (const [k, v] of Object.entries(chain.vars)) {
@@ -518,12 +647,16 @@ export function buildSpawnEnv(input: SpawnEnvInput): SpawnEnv {
     }
     env[k] = v;
   }
+  // A loader setting any of Bun's env files in the harness or the manager's directory
+  // assigns is left out by name, whatever its value. `PATH` is the one exception: the child
+  // always runs with the manager's `PATH`.
+  const fromFiles = loaderKeysInEnvFiles([input.harnessRoot, input.managerCwd ?? process.cwd()]);
   for (const [k, v] of Object.entries(input.processEnv)) {
     if (typeof v !== "string") continue;
-    // A loader setting whose value is the env files' own came from them (loaded into the
-    // manager's environment at its start), not from whoever started the manager.
-    // `PATH` is the one exception: the child always runs with the manager's `PATH`.
-    if (isLoaderEnvKey(k) && chain.vars[k] === v && k !== "PATH") continue;
+    if (isLoaderEnvKey(k) && k !== "PATH" && (fromFiles.has(k) || chain.vars[k] === v)) {
+      dropped.add(k);
+      continue;
+    }
     if (isLoaderEnvKey(k)) dropped.delete(k);
     env[k] = v;
   }
@@ -793,7 +926,9 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
   const detached = runClass !== "interactive";
   return {
     ...base,
-    argv: [bunBin, bundle.entryPath],
+    // The daemon reads no env file itself: the filtered chain in `env` is all it gets
+    // from the harness's files, and what it starts inherits only that.
+    argv: [bunBin, "--no-env-file", bundle.entryPath],
     detached,
     ...(input.briefFile !== undefined ? { stdinFile: input.briefFile } : {}),
     // Detached children write straight into the log fd; an attached run is

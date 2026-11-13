@@ -185,7 +185,9 @@ function normalizer(root: string): (text: string) => string {
  */
 const EXPECTED = {
   spawn: {
-    argv: ["bun", "<tmp>/harness/dist/daemon.ts"],
+    // Added on purpose: the daemon reads no env file itself; the supervisor's filtered
+    // chain is its whole environment from the harness's files.
+    argv: ["bun", "--no-env-file", "<tmp>/harness/dist/daemon.ts"],
     cwd: "<tmp>/harness",
     envKeys: [
       "CREWHAUS_CONTROL_PORT",
@@ -198,7 +200,9 @@ const EXPECTED = {
       "CREWHAUS_EXECUTION_ID",
       "CREWHAUS_NO_REGISTRY",
       "CREWHAUS_REGISTRY_ROOT",
-      "CREWHAUS_SPEC_HASH",
+      // Changed on purpose: the build a start records names a spec revision only when its
+      // bundle's stamped manifest names the saved spec's, and this fixture's bundle carries
+      // no stamp, so the spawn carries no CREWHAUS_SPEC_HASH.
       "CREWHAUS_TRACE",
       "SEQ_API_KEY",
     ],
@@ -225,7 +229,8 @@ const EXPECTED = {
         "    <run>  daemon  <time> (open)",
         "  env files (lowest precedence first, all UNDER process.env):",
         "    .env",
-        "  would run: cd '<tmp>/harness' && 'bun' '<tmp>/harness/dist/daemon.ts'",
+        // Added on purpose: the daemon reads no env file itself.
+        "  would run: cd '<tmp>/harness' && 'bun' '--no-env-file' '<tmp>/harness/dist/daemon.ts'",
       ],
     },
     {

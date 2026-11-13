@@ -65,6 +65,25 @@ describe("the composition", () => {
     );
   });
 
+  test("a composition without the core's protected-environment gate is refused, naming it", () => {
+    const missing = 'the core\'s "protected-environment" activation gate is missing';
+    const quality: ActivationGate = { name: "quality", check: async () => ({ ok: true }) };
+    const { activationGates: _gates, ...coreWithoutGate } = CORE_RUNTIME;
+    expect(compositionProblems([coreWithoutGate])).toEqual([missing]);
+    expect(compositionProblems([{ ...coreWithoutGate, activationGates: [quality] }])).toEqual([
+      missing,
+    ]);
+    // A gate of that name from another area is not the core's.
+    const lookalike: ActivationGate = {
+      name: "protected-environment",
+      check: async () => ({ ok: true }),
+    };
+    expect(
+      compositionProblems([coreWithoutGate, { area: "quality", activationGates: [lookalike] }]),
+    ).toContain(missing);
+    expect(wireWith([coreWithoutGate])).toThrow(missing);
+  });
+
   test("a kind registered twice is refused, naming it", () => {
     const twice: AreaRuntime = { area: "core", executors: { "controls.stop": noop } };
     expect(wireWith([CORE_RUNTIME, twice])).toThrow(
@@ -90,14 +109,23 @@ describe("the composition", () => {
       '"controls.start" is not safe to repeat and has an executor but no reconciler',
     );
     // A kind that is safe to repeat needs none.
-    expect(wireWith([{ area: "core", executors: { "controls.stop": noop } }])).not.toThrow();
+    expect(
+      wireWith([
+        {
+          area: "core",
+          executors: { "controls.stop": noop },
+          activationGates: CORE_RUNTIME.activationGates ?? [],
+        },
+      ]),
+    ).not.toThrow();
   });
 
   test("every problem is named in one error", () => {
     const problems = compositionProblems([
       { area: "nowhere", executors: { "controls.nope": noop, "controls.start": noop } },
     ]);
-    expect(problems).toHaveLength(3);
+    expect(problems).toHaveLength(4);
+    expect(problems).toContain('the core\'s "protected-environment" activation gate is missing');
   });
 });
 

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { REGISTRY_FILENAME } from "./doc";
 import { HARNESS_IDENTITY_REL, readHarnessIdentityFile } from "./identity";
-import { isAdopted, openHangarRegistry, slugOf } from "./registry";
+import { isAdopted, openHangarRegistry, runsOwnCode, slugOf } from "./registry";
 
 const roots: string[] = [];
 function newRoot(): string {
@@ -169,6 +169,34 @@ describe("adoption", () => {
     expect(isAdopted(row("2026-11-13T00:00:00.000Z", { adoptedAt: "t", by: "x" }), since)).toBe(
       true,
     );
+  });
+});
+
+describe("runsOwnCode", () => {
+  test("only a row adopted with crewhaus harness adopt runs its own code", () => {
+    const root = newRoot();
+    let now = Date.parse("2026-11-01T00:00:00.000Z");
+    const reg = registry(root, () => now);
+    const entry = reg.upsert({ dir: harnessDir(root, "bot"), specName: "bot" });
+    // The registry as an earlier release wrote it: the row predates adoption.
+    const file = join(root, "registry", REGISTRY_FILENAME);
+    const doc = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    Reflect.deleteProperty(doc, "adoptionSince");
+    writeFileSync(file, JSON.stringify(doc));
+    now = Date.parse("2026-11-12T00:00:00.000Z");
+    const legacy = registry(root, () => now);
+    const grandfathered = legacy.get(entry.id) as NonNullable<ReturnType<typeof legacy.get>>;
+    // It keeps group start, and still gets Home's own code.
+    expect(isAdopted(grandfathered, legacy.adoptionSince())).toBe(true);
+    expect(runsOwnCode(grandfathered)).toBe(false);
+    // A row registered under this release without adopting: neither.
+    const fresh = legacy.upsert({ dir: harnessDir(root, "fresh"), specName: "fresh" });
+    expect(runsOwnCode(fresh)).toBe(false);
+    // Adopted, it runs its own; relocated, it no longer does.
+    legacy.adopt(entry.id, `local:#${"a".repeat(64)}`);
+    expect(runsOwnCode(legacy.get(entry.id) as typeof grandfathered)).toBe(true);
+    legacy.relocate(entry.id, harnessDir(root, "bot-moved"));
+    expect(runsOwnCode(legacy.get(entry.id) as typeof grandfathered)).toBe(false);
   });
 });
 

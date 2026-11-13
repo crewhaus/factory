@@ -45,7 +45,7 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { specRevision } from "@crewhaus/ir/policy";
+import { sameRevision, specRevision } from "@crewhaus/ir/policy";
 
 /** Thrown for malformed config / approvals files. The CLI routes the message
  *  through `die()`; tests assert on `.message`. */
@@ -302,18 +302,21 @@ export type ApprovalDecision = {
  * Decide whether the gate is satisfied. Counts DISTINCT approvers whose
  * approval names the candidate's `specHash` (and, when it names a version,
  * `toVersion`), plus one collective witness for a green PR check. Satisfied
- * when `witnesses >= required`.
+ * when `witnesses >= required`. Revisions compare with `sameRevision`: an
+ * approval naming no well-formed `specHash` counts for nothing, and when the
+ * candidate itself names none, no recorded approval counts.
  */
 export function decideApproval(input: ApprovalDecisionInput): ApprovalDecision {
   const required = input.policy.minApprovals;
   const counted = new Set<string>();
+  const candidateNamed = sameRevision(input.specHash, input.specHash);
   let namingNoContent = 0;
   for (const a of input.approvals) {
-    if (a.specHash === undefined) {
+    if (!sameRevision(a.specHash, a.specHash)) {
       namingNoContent += 1;
       continue;
     }
-    if (a.specHash !== input.specHash) continue;
+    if (!sameRevision(a.specHash, input.specHash)) continue;
     if (a.version !== undefined && a.version !== input.toVersion) continue;
     counted.add(a.approver);
   }
@@ -339,7 +342,9 @@ export function decideApproval(input: ApprovalDecisionInput): ApprovalDecision {
     if (namingNoContent > 0) {
       detail.push(`${namingNoContent} recorded approval(s) ignored for naming no specHash`);
     }
-    reason = `quorum NOT met — ${detail.join("; ")} (${missing} more needed; record approvals in ${APPROVALS_RELDIR}/${approvalsFileName(input.specName, input.toEnv)} with "specHash": "${input.specHash}", or land a green proposal PR)`;
+    reason = candidateNamed
+      ? `quorum NOT met — ${detail.join("; ")} (${missing} more needed; record approvals in ${APPROVALS_RELDIR}/${approvalsFileName(input.specName, input.toEnv)} with "specHash": "${input.specHash}", or land a green proposal PR)`
+      : `quorum NOT met — ${detail.join("; ")} (${missing} more needed; the candidate names no spec revision, so no recorded approval can bind to it)`;
   }
   return { satisfied, countedApprovers: [...counted].sort(), prWitness, required, reason };
 }

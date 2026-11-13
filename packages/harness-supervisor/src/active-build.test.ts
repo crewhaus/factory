@@ -5,7 +5,7 @@
  * setting.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { EXIT_CODES } from "@crewhaus/errors";
@@ -14,6 +14,8 @@ import {
   BUILD_NOT_ACTIVE_MESSAGE,
   NO_ACTIVE_BUILD_MESSAGE,
   activeDeployment,
+  buildLinkMessage,
+  buildLinkRefusal,
   verifyActiveBuild,
 } from "./active-build";
 import { type PrepareOutcome, type PrepareRunner, createPrepareRunner } from "./prepare";
@@ -101,6 +103,28 @@ describe("verifyActiveBuild", () => {
       reason: "mismatch",
       message: BUILD_NOT_ACTIVE_MESSAGE,
     });
+  });
+
+  test("a build holding a link is refused with reason link, naming it", () => {
+    const dir = harness();
+    const outside = mkdtempSync(join(tmpdir(), "chsup-active-outside-"));
+    roots.push(outside);
+    put(outside, "daemon.ts", "// bundle\n");
+    // The record's digest is taken over the link itself, so only the link refuses.
+    unlinkSync(join(dir, "dist/daemon.ts"));
+    symlinkSync(join(outside, "daemon.ts"), join(dir, "dist/daemon.ts"));
+    activateBuildForTest(dir, "dist/daemon.ts");
+    const message = buildLinkMessage("dist/daemon.ts");
+    expect(message).toBe(
+      "The build holds a link at dist/daemon.ts. A build runs from regular files only: replace it with the file, then run crewhaus compile and crewhaus deploy activate.",
+    );
+    expect(verifyActiveBuild(dir, "channel")).toEqual({ ok: false, reason: "link", message });
+    expect(buildLinkRefusal(dir, { entry: "dist/daemon.ts" })).toBe(message);
+  });
+
+  test("a regular build holds no link to refuse", () => {
+    const dir = harness();
+    expect(buildLinkRefusal(dir, { entry: "dist/daemon.ts" })).toBeUndefined();
   });
 
   test("unreadable when the records cannot be read", () => {
