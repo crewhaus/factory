@@ -114,12 +114,15 @@ import {
   type RegistryRoot,
   allSamplesOf,
   assignmentOf,
+  heldOutAcross,
+  holdoutIdsOf,
   listDatasets,
   listVersions,
   openRegistry,
   presentSplits,
   readRecord,
   resolveRegistryRoot,
+  samplesOutsideHoldout,
   splitSamplesOf,
 } from "./lib/registry";
 import { type Loaded, errorMessage, fail, json, renderGiven, renderMessage } from "./lib/result";
@@ -245,6 +248,9 @@ type AuditSummary =
       readonly hitGroups: number;
       readonly hits: Array<{ sampleId?: string; field: string; kind: string; count: number }>;
       readonly hitsElided?: number;
+      /** Hits inside the holdout: counted above, never located. */
+      readonly heldOutHits?: number;
+      readonly heldOutNote?: string;
       readonly note: string;
     }
   | { readonly status: "skipped"; readonly reason: string };
@@ -252,12 +258,15 @@ type AuditSummary =
 /**
  * The PII/secret audit, summarized for a result. `withheldIds` names samples
  * whose id must not be echoed (the locked test split without
- * `allowTestSplit`): their hits still COUNT — a leak in the holdout is still a
- * leak — they just arrive without the id.
+ * `allowTestSplit`): their hits still COUNT — a leak in the test split is
+ * still a leak — they just arrive without the id. `hiddenIds` names samples
+ * (the holdout) whose hits count in every total and appear in no hit row at
+ * all, so neither their ids nor where a hit sits is returned.
  */
 function auditSummary(
   samples: ReadonlyArray<Sample>,
   withheldIds: ReadonlySet<string> = new Set(),
+  hiddenIds: ReadonlySet<string> = new Set(),
 ): AuditSummary {
   if (samples.length > MAX_AUDITED_SAMPLES) {
     return {
@@ -268,6 +277,10 @@ function auditSummary(
   const report = auditSamples(samples);
   const byKind: Record<string, number> = {};
   for (const hit of report.hits) byKind[hit.kind] = (byKind[hit.kind] ?? 0) + hit.count;
+  const shown = report.hits.filter((h) => !hiddenIds.has(h.sampleId));
+  const heldOutHits = report.hits
+    .filter((h) => hiddenIds.has(h.sampleId))
+    .reduce((n, h) => n + h.count, 0);
   return {
     status: "scanned",
     samplesScanned: report.samplesScanned,
@@ -277,15 +290,20 @@ function auditSummary(
     // The list is CUT here, and a cut list that does not say so reads as the
     // whole story: `totalHits` counts matches, `hitGroups` counts the
     // (sample, field, detector) rows this list is a prefix of.
-    hitGroups: report.hits.length,
-    hits: report.hits.slice(0, MAX_LISTED_IDS).map((h) => ({
+    hitGroups: shown.length,
+    hits: shown.slice(0, MAX_LISTED_IDS).map((h) => ({
       ...(withheldIds.has(h.sampleId) ? {} : { sampleId: h.sampleId }),
       field: h.field,
       kind: h.kind,
       count: h.count,
     })),
-    ...(report.hits.length > MAX_LISTED_IDS
-      ? { hitsElided: report.hits.length - MAX_LISTED_IDS }
+    ...(shown.length > MAX_LISTED_IDS ? { hitsElided: shown.length - MAX_LISTED_IDS } : {}),
+    ...(hiddenIds.size > 0
+      ? {
+          heldOutHits,
+          heldOutNote:
+            "hits in the holdout count in every total above and are never located — a person reviews the holdout with `crewhaus datasets`",
+        }
       : {}),
     note: "matched text is never echoed — inspect the listed samples by id",
   };
@@ -367,7 +385,7 @@ const putSchema = z.object({
     .string()
     .optional()
     .describe(
-      `train/dev or train/dev/test integer percentages summing to 100, e.g. "70/15/15" (default ${DEFAULT_SPLIT_SPEC.train}/${DEFAULT_SPLIT_SPEC.dev}/${DEFAULT_SPLIT_SPEC.test})`,
+      `train/dev or train/dev/test integer percentages summing to 100, e.g. "70/15/15" (default ${DEFAULT_SPLIT_SPEC.train}/${DEFAULT_SPLIT_SPEC.dev}/${DEFAULT_SPLIT_SPEC.test}); a holdout share is refused, because a person cuts a holdout with \`crewhaus datasets\``,
     ),
   split: z
     .enum(["train", "dev", "test"])
@@ -430,6 +448,10 @@ export const datasetPut: RegisteredTool = buildTool({
     }
     if (input.split !== undefined && input.splitSpec !== undefined) {
       return `${toolName}: "split" puts everything in one split and "splitSpec" divides them — pass one or the other`;
+    }
+    // The schema names three splits; this holds for a caller that skipped it.
+    if ((input.split as string | undefined) === "holdout") {
+      return `${toolName}: this tool writes train, dev and test only; a person cuts a holdout with \`crewhaus datasets holdout\``;
     }
     const opened = openRoot(toolName, input.registryDir);
     if (!opened.ok) return opened.message;
@@ -538,11 +560,16 @@ export const datasetPut: RegisteredTool = buildTool({
 
     let spec = DEFAULT_SPLIT_SPEC;
     if (input.splitSpec !== undefined) {
+      let parsed: ReturnType<typeof parseSplitSpec>;
       try {
-        spec = parseSplitSpec(input.splitSpec);
+        parsed = parseSplitSpec(input.splitSpec);
       } catch (err) {
         return `${toolName}: ${errorMessage(err)}`;
       }
+      if (parsed.holdout !== undefined) {
+        return `${toolName}: "${renderGiven(input.splitSpec)}" names a holdout share — this tool writes train, dev and test only; a person cuts a holdout with \`crewhaus datasets put --split-spec\` or \`crewhaus datasets holdout\``;
+      }
+      spec = { train: parsed.train, dev: parsed.dev, test: parsed.test };
     }
 
     // The previous version's assignment is the ground truth stability is
@@ -551,6 +578,12 @@ export const datasetPut: RegisteredTool = buildTool({
     // package is built around, so it refuses instead.
     const basedOn = input.basedOn ?? versions.value[versions.value.length - 1];
     let previous: Map<string, DatasetSplit> | undefined;
+    // The newest holdout of the dataset rides along unread, whatever version this
+    // put is based on: carried into the new version as it is, never returned,
+    // listed or reported by id. A case any version holds out never enters the
+    // new version's other splits, and is never reported as dropped.
+    let heldOut: ReadonlyArray<Sample> | undefined;
+    let heldOutIds: ReadonlySet<string> = new Set();
     if (basedOn !== undefined) {
       if (input.basedOn !== undefined && !versions.value.includes(input.basedOn)) {
         return `${toolName}: basedOn "${renderGiven(input.basedOn)}" is not a version of "${renderGiven(input.name)}" (have: ${versions.value.join(", ") || "none"})`;
@@ -559,16 +592,23 @@ export const datasetPut: RegisteredTool = buildTool({
       if (!record.ok) {
         return `${toolName}: the previous version "${renderGiven(basedOn)}" could not be read (${record.message}) — refusing to write a version whose split lineage cannot be verified; pass basedOn to choose another version`;
       }
-      previous = assignmentOf(record.value);
+      const across = await heldOutAcross(registry, input.name, versions.value);
+      if (!across.ok) return `${toolName}: ${across.message}`;
+      heldOutIds = across.value.ids;
+      if (across.value.newest !== undefined) heldOut = across.value.newest.rows;
+      previous = new Map([...assignmentOf(record.value)].filter(([id]) => !heldOutIds.has(id)));
     }
+    const incoming = samples.filter((s) => !heldOutIds.has(s.id));
+    const heldOutLeftOut = samples.length - incoming.length;
 
     const mode: SplitMode = input.splitMode ?? "stable";
     const plan = planSplits({
-      samples,
+      samples: incoming,
       spec,
       ...(previous !== undefined ? { previous } : {}),
       mode,
       ...(input.split !== undefined ? { singleSplit: input.split } : {}),
+      ...(heldOut !== undefined ? { heldOut } : {}),
     });
 
     // The hash a real put will store, derived the way the registry derives it
@@ -582,12 +622,15 @@ export const datasetPut: RegisteredTool = buildTool({
         train: plan.splits.train.map(hashSample),
         dev: plan.splits.dev.map(hashSample),
         ...(plan.splits.test !== undefined ? { test: plan.splits.test.map(hashSample) } : {}),
+        ...(plan.splits.holdout !== undefined
+          ? { holdout: plan.splits.holdout.map(hashSample) }
+          : {}),
       },
       createdAt: "",
     };
     const datasetHash = overallDatasetHash(planned, presentSplits(planned));
 
-    const provenance = [...offTaxonomySources(samples)].map(([source, ids]) => ({
+    const provenance = [...offTaxonomySources(incoming)].map(([source, ids]) => ({
       source,
       count: ids.length,
       ...listIds(ids),
@@ -623,6 +666,16 @@ export const datasetPut: RegisteredTool = buildTool({
       splitMode: mode,
       ...(input.split !== undefined ? { singleSplit: input.split } : {}),
       splitSpec: input.split !== undefined ? null : `${spec.train}/${spec.dev}/${spec.test}`,
+      ...(plan.splits.holdout !== undefined
+        ? {
+            holdout: {
+              count: plan.splits.holdout.length,
+              carriedForward: true,
+              note: "the dataset's holdout is carried as it was — its rows are never returned to an agent",
+              ...(heldOutLeftOut > 0 ? { incomingLeftOut: heldOutLeftOut } : {}),
+            },
+          }
+        : {}),
       stability: {
         basedOn: basedOn ?? null,
         carriedForward: plan.carriedForward,
@@ -642,7 +695,7 @@ export const datasetPut: RegisteredTool = buildTool({
         : {}),
       redaction,
       provenanceWarnings: provenance,
-      pii: auditSummary(samples),
+      pii: auditSummary(samples, new Set(), heldOutIds),
       warnings,
     };
 
@@ -675,7 +728,7 @@ const inspectSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      "echo per-sample detail (ids, PII hit locations) for the locked test split; counts and hashes are reported either way",
+      "echo per-sample detail (ids, PII hit locations) for the locked test split; counts and hashes are reported either way. The holdout's detail is never returned, whatever this says",
     ),
   includeSampleIds: z.boolean().optional().describe("list the sample ids of each split"),
   audit: z
@@ -756,8 +809,11 @@ export const datasetInspect: RegisteredTool = buildTool({
     // whole dataset under a reference that asks about one split — a
     // `sampleCount` read as a split's size. House rule: act on the parsed
     // value or refuse it; never parse it and carry on with something else.
+    if (ref.value.split === "holdout") {
+      return `${toolName}: "${renderGiven(input.dataset)}" names the holdout, and no agent tool reads it — its count, golds and hash check are in "splits" on the bare reference; a person reviews it with \`crewhaus datasets\``;
+    }
     if (ref.value.split !== undefined) {
-      return `${toolName}: "${renderGiven(input.dataset)}" names the "${ref.value.split}" split, and this tool reports every split of a version (per-split counts, golds and hashes are in "splits") — drop the #${ref.value.split} suffix, and pass allowTestSplit to see per-sample detail for the holdout`;
+      return `${toolName}: "${renderGiven(input.dataset)}" names the "${ref.value.split}" split, and this tool reports every split of a version (per-split counts, golds and hashes are in "splits") — drop the #${ref.value.split} suffix, and pass allowTestSplit to see per-sample detail for the test split`;
     }
     const versions = await listVersions(registry, ref.value.name);
     if (!versions.ok) return `${toolName}: ${versions.message}`;
@@ -791,18 +847,32 @@ export const datasetInspect: RegisteredTool = buildTool({
     if (testDetailWithheld) {
       for (const s of splitSamplesOf(record.value, "test")) withheld.add(s.id);
     }
+    // The holdout's per-sample detail is withheld whatever the caller asks: this
+    // version's holdout, and every case another version of the dataset holds out
+    // (the version a holdout was cut from still lists them in train or dev).
+    const across = await heldOutAcross(registry, ref.value.name, versions.value);
+    if (!across.ok) return `${toolName}: ${across.message}`;
+    const heldOut = new Set([...holdoutIdsOf(record.value), ...across.value.ids]);
+    for (const id of heldOut) withheld.add(id);
 
     const splitFacts: Record<string, unknown> = {};
     for (const split of splits) {
       const rows = splitSamplesOf(record.value, split);
-      const ids = rows.map((s) => s.id);
+      const ids = rows.map((s) => s.id).filter((id) => !heldOut.has(id));
+      const heldOutRows = rows.length - ids.length;
+      const detailWithheld = split === "holdout" || (split === "test" && testDetailWithheld);
       splitFacts[split] = {
         count: rows.length,
         golds: goldCount(rows),
-        ...(input.includeSampleIds === true && !(split === "test" && testDetailWithheld)
-          ? listIds(ids)
+        ...(input.includeSampleIds === true && !detailWithheld ? listIds(ids) : {}),
+        ...(detailWithheld ? { detailWithheld: true } : {}),
+        ...(split !== "holdout" && heldOutRows > 0
+          ? {
+              heldOutRows,
+              heldOutNote:
+                "these rows are held out by a later version's holdout: counted, never listed",
+            }
           : {}),
-        ...(split === "test" && testDetailWithheld ? { detailWithheld: true } : {}),
       };
     }
 
@@ -879,6 +949,15 @@ export const datasetInspect: RegisteredTool = buildTool({
           ? { note: "pass allowTestSplit to see per-sample detail for the held-out split" }
           : {}),
       },
+      ...(splits.includes("holdout")
+        ? {
+            holdout: {
+              present: true,
+              detailWithheld: true,
+              note: "the holdout is read only by a change's promotion check; its rows are never returned to an agent — a person reviews them with `crewhaus datasets`",
+            },
+          }
+        : {}),
       hashes,
       sources: sourceHistogram(samples),
       offTaxonomySources: [...offTaxonomySources(samples)].map(([source, ids]) => ({
@@ -890,7 +969,7 @@ export const datasetInspect: RegisteredTool = buildTool({
       pii:
         input.audit === false
           ? { status: "skipped", reason: "audit was turned off by the caller — not a clean result" }
-          : auditSummary(samples, withheld),
+          : auditSummary(samples, withheld, heldOut),
     });
   },
 });
@@ -970,22 +1049,39 @@ export const datasetLint: RegisteredTool = buildTool({
     /** True when the samples linted are a PREFIX of the source, so no finding
      *  count and no "clean" is about the whole dataset. */
     let truncated = false;
+    /** The version's holdout, left out of the linted set. */
+    let holdoutFacts: { count: number; excluded: true } | undefined;
+    /** Every case a version of the dataset holds out: never linted or named. */
+    let lintHeldOut: ReadonlySet<string> = new Set();
 
     if (input.dataset !== undefined) {
       const ref = parseDatasetRef(input.dataset);
       if (!ref.ok) return `${toolName}: ${ref.message}`;
+      if (ref.value.split === "holdout") {
+        return `${toolName}: "${renderGiven(input.dataset)}" names the holdout, and no agent tool reads it — lint the bare reference (the holdout is reported as a count) or have a person review it with \`crewhaus datasets\``;
+      }
       const opened = openRoot(toolName, input.registryDir);
       if (!opened.ok) return opened.message;
       const { registry } = opened.value;
       let inspected: Awaited<ReturnType<typeof inspectRegistryRef>>;
       try {
         // The read-side resolver: every split, test included. A hygiene gate
-        // over a partial record misreports — PII in the holdout is still PII.
+        // over a partial record misreports — PII in the test split is still PII.
         inspected = await inspectRegistryRef(registry, ref.value);
       } catch (err) {
         return `${toolName}: ${errorMessage(err)}`;
       }
-      samples = inspected.samples;
+      // The holdout is never linted here: its rows are counted, not read. That is
+      // every case any version of the dataset holds out, in this version too.
+      const versionsOf = await listVersions(registry, ref.value.name);
+      if (!versionsOf.ok) return `${toolName}: ${versionsOf.message}`;
+      const across = await heldOutAcross(registry, ref.value.name, versionsOf.value);
+      if (!across.ok) return `${toolName}: ${across.message}`;
+      const heldOut = new Set([...holdoutIdsOf(inspected.record), ...across.value.ids]);
+      samples = inspected.samples.filter((s) => !heldOut.has(s.id));
+      const excluded = inspected.samples.length - samples.length;
+      if (excluded > 0) holdoutFacts = { count: excluded, excluded: true };
+      lintHeldOut = heldOut;
       version = inspected.version;
       label = inspected.datasetName;
       if (input.crossVersion !== false) {
@@ -1001,7 +1097,10 @@ export const datasetLint: RegisteredTool = buildTool({
             skippedVersions.push(`${other}: ${record.message}`);
             continue;
           }
-          otherVersions.push({ version: other, samples: allSamplesOf(record.value) });
+          otherVersions.push({
+            version: other,
+            samples: samplesOutsideHoldout(record.value).filter((s) => !lintHeldOut.has(s.id)),
+          });
         }
       }
     } else if (input.path !== undefined) {
@@ -1108,6 +1207,14 @@ export const datasetLint: RegisteredTool = buildTool({
       dataset: label,
       ...(version !== undefined ? { version } : {}),
       sampleCount: samples.length,
+      ...(holdoutFacts !== undefined
+        ? {
+            holdout: {
+              ...holdoutFacts,
+              note: "the holdout is not linted by an agent tool — a person reviews it with `crewhaus datasets`",
+            },
+          }
+        : {}),
       ...(truncated
         ? {
             truncated: true,
@@ -1323,6 +1430,9 @@ export const datasetMine: RegisteredTool = buildTool({
         : {}),
     };
     let index: ReturnType<typeof buildDedupeIndex> | undefined;
+    // Every case any version holds out, by id: the version a holdout was cut from
+    // still lists its cases in train or dev, and a match there is never named either.
+    const heldOutMatches = new Set<string>();
     let dedupeStatus: Record<string, unknown> = {
       performed: false,
       reason:
@@ -1343,6 +1453,9 @@ export const datasetMine: RegisteredTool = buildTool({
           continue;
         }
         versionsRead += 1;
+        // A candidate matching a held-out row is still dropped, and the match
+        // is never named.
+        for (const id of holdoutIdsOf(record.value)) heldOutMatches.add(id);
         for (const s of allSamplesOf(record.value)) {
           corpus.push({ id: s.id, version, input: s.input, sample: s });
         }
@@ -1429,7 +1542,8 @@ export const datasetMine: RegisteredTool = buildTool({
         comparisons += classified.comparisons;
         if (classified.verdict.verdict !== "new") {
           droppedBy[classified.verdict.verdict] = (droppedBy[classified.verdict.verdict] ?? 0) + 1;
-          if (droppedExamples.length < 10) {
+          const matchedHeldOut = heldOutMatches.has(classified.verdict.matchedId);
+          if (droppedExamples.length < 10 && !matchedHeldOut) {
             droppedExamples.push({
               candidateId: sample.id,
               verdict: classified.verdict.verdict,

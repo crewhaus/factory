@@ -73,6 +73,9 @@ describe("the argv the console queues parses under the real schemas", () => {
     const { flags } = parse(OPTIMIZE_SCHEMA, argv);
     hasInputs(flags);
     expect(flags["mutator"]).toBe("rule-based");
+    // A loop launched from Home files its candidate as a change; it never writes back.
+    expect(flags["propose"]).toBe(true);
+    expect(flags["write-back"]).toBeUndefined();
   });
 
   test("applying saved suggestions, which the CLI will not take with a mutator", () => {
@@ -80,6 +83,7 @@ describe("the argv the console queues parses under the real schemas", () => {
     const { flags } = parse(OPTIMIZE_SCHEMA, argv);
     hasInputs(flags);
     expect(flags["from-advice"]).toBe("suggestions.json");
+    expect(flags["propose"]).toBe(true);
     expect(() =>
       assertFromAdviceFlagsCompatible({
         mutator: typeof flags["mutator"] === "string",
@@ -104,5 +108,6 @@ describe("the argv the console queues parses under the real schemas", () => {
     expect(flags["dataset"]).toBeUndefined();
     expect(flags["graders"]).toBeUndefined();
     expect(flags["iterations"]).toBe("2");
+    expect(flags["propose"]).toBe(true);
   });
 });

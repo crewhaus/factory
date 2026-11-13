@@ -325,7 +325,7 @@ export function evalArgv(body: Body, offers: LaunchOffers): EvalPlan {
     }
     argv.push("--allow-test-split");
     warnings.push(
-      "This run uses the held-out test cases and is not recorded. Only crewhaus datasets release records a use.",
+      "This run spends the held-out test cases. The use is recorded: crewhaus datasets uses lists it.",
     );
   }
   return { argv, warnings };
@@ -367,6 +367,9 @@ export function optimizeArgv(
   const concurrency = positiveInt(body, "concurrency");
   if (concurrency !== undefined) argv.push("--concurrency", String(concurrency));
   if (adviceFile !== undefined) argv.push("--from-advice", adviceFile);
+  // A loop launched from Home never writes the spec: an accepted candidate is
+  // filed as a change a person checks and adopts.
+  argv.push("--propose");
   return { argv, mutator };
 }
 
@@ -393,6 +396,9 @@ export function flywheelArgv(
     if (budgetUsd !== undefined) argv.push("--budget-usd", String(budgetUsd));
     const iterations = positiveInt(body, "iterations");
     if (iterations !== undefined) argv.push("--iterations", String(iterations));
+    // A loop launched from Home never writes the spec: an accepted candidate is
+    // filed as a change a person checks and adopts.
+    argv.push("--propose");
   }
   return { argv, action };
 }

@@ -102,6 +102,7 @@
         "@crewhaus/proof-checker": "workspace:*",
         "@crewhaus/provability": "workspace:*",
         "@crewhaus/qr-code": "workspace:*",
+        "@crewhaus/quality-service": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/regression-runner": "workspace:*",
         "@crewhaus/routing-store": "workspace:*",
@@ -1307,6 +1308,7 @@
       "devDependencies": {
         "@crewhaus/compiler": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
+        "@crewhaus/quality-service": "workspace:*",
       },
     },
     "packages/hangar-ui": {
@@ -1782,6 +1784,25 @@
     "packages/qr-code": {
       "name": "@crewhaus/qr-code",
       "version": "0.8.2",
+    },
+    "packages/quality-service": {
+      "name": "@crewhaus/quality-service",
+      "version": "0.8.2",
+      "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/dataset-ops": "workspace:*",
+        "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-ops": "workspace:*",
+        "@crewhaus/eval-report": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
+        "yaml": "^2.6.0",
+      },
     },
     "packages/queue-consumer": {
       "name": "@crewhaus/queue-consumer",
@@ -4339,6 +4360,8 @@
     "@crewhaus/provability": ["@crewhaus/provability@workspace:packages/provability"],
 
     "@crewhaus/qr-code": ["@crewhaus/qr-code@workspace:packages/qr-code"],
+
+    "@crewhaus/quality-service": ["@crewhaus/quality-service@workspace:packages/quality-service"],
 
     "@crewhaus/queue-consumer": ["@crewhaus/queue-consumer@workspace:packages/queue-consumer"],
 

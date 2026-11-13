@@ -47,7 +47,8 @@
   },
   "devDependencies": {
     "@crewhaus/compiler": "workspace:*",
-    "@crewhaus/eval-runner": "workspace:*"
+    "@crewhaus/eval-runner": "workspace:*",
+    "@crewhaus/quality-service": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

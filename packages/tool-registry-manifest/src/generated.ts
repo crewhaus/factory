@@ -22,7 +22,7 @@ import type { RegistryEntry } from "./types";
  * bundle compiled three releases ago carries whatever was stamped then, which
  * is exactly the skew an operator wants to see.
  */
-export const REGISTRY_VERSION = "0.7.0";
+export const REGISTRY_VERSION = "0.8.2";
 
 export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
   abiDecode: {
@@ -2438,7 +2438,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "evalBaselinePin",
     name: "EvalBaselinePin",
     description:
-      "Show, move or clear the pinned baseline run a lineage's regression gate compares against. Use when a gate needs re-baselining after a deliberate change, or to check what a lineage is being held to — including the case that matters most, a lineage with NO pin, where the gate passes because there is nothing to fail against. The lineage comes from the run's own recorded columns, so pinning can never drop one arm's run onto another arm's key; a partial, budget-aborted run is refused outright; and dryRun runs the same checks and reports the exact pin it would write.",
+      "Show the pinned baseline run a lineage's regression gate compares against, or move it to another run measured the same way. Use to check what a lineage is being held to — including the case that matters most, a lineage with NO pin, where the gate passes because there is nothing to fail against. A pinned baseline is never removed here and is never moved onto a run measured differently: that re-anchor is a person's, with `crewhaus eval --rebaseline --reason <code>`. The lineage comes from the run's own recorded columns, so pinning can never drop one arm's run onto another arm's key; a partial, budget-aborted run is refused outright; and dryRun runs the same checks and reports the exact pin it would write.",
     readOnly: false,
     destructive: true,
     scope: "internal",

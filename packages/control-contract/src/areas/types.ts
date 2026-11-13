@@ -69,6 +69,11 @@ export type CommandKindDecl = {
   readonly idempotent: boolean;
   readonly effect: "local" | "external";
   readonly cliTwin: CliTwin | null;
+  /**
+   * Why no operation row carries this kind yet: a command the CLI submits before
+   * its v1 operation is declared. Absent: an operation row carries it.
+   */
+  readonly noRowReason?: string;
 };
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";

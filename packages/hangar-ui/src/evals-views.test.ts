@@ -540,8 +540,8 @@ describe("the lab's cards draw a control only where its job can start", () => {
     const yes = lab.launcherCard(CTX_LAB, flywheelRes({ eval: offered }), () => {});
     expect(yes.all("form").length).toBe(1);
     expect(buttons(yes)).toContain("Run eval");
-    // Said plainly, and the same way everywhere: a run from here is not recorded.
-    expect(yes.textContent).toContain("Use the held-out test cases (this run is not recorded)");
+    // Said plainly, and the same way everywhere: a run from here is counted.
+    expect(yes.textContent).toContain("Use the held-out test cases (this use is counted)");
     expect(yes.textContent).toContain('Type "release" to confirm.');
     for (const word of ["burn", "gesture", "locked", "release flow"]) {
       expect(yes.textContent).not.toContain(word);

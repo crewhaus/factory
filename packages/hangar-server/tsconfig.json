@@ -26,6 +26,7 @@
     { "path": "../harness-registry" },
     { "path": "../harness-supervisor" },
     { "path": "../preflight" },
+    { "path": "../quality-service" },
     { "path": "../spec" },
     { "path": "../spec-changelog" },
     { "path": "../spec-patch" }

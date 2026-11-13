@@ -45,9 +45,18 @@ export type PinRefusal = {
    * `regrade`: the run graded another run's recorded answers (a regrade or a
    * preview). `protected`: the pin it would replace was measured with a
    * protected criterion this run changes, and the harness's owner did not
-   * allow it.
+   * allow it. `receipt`: the command receipt a re-anchor is made under could
+   * not be written, so the pin was not either. `reanchor`: the caller pins only
+   * a run measured like the pin it replaces, and this one was measured
+   * differently.
    */
-  readonly code: MeasurementProblem | "lineage_mismatch" | "regrade" | "protected";
+  readonly code:
+    | MeasurementProblem
+    | "lineage_mismatch"
+    | "regrade"
+    | "protected"
+    | "receipt"
+    | "reanchor";
   readonly reason: string;
 };
 
@@ -66,6 +75,13 @@ export type PinOptions = {
    * `manual` re-anchor mark.
    */
   readonly cmd?: string;
+  /** The command receipt this pin is made under, recorded on a `manual` re-anchor mark. */
+  readonly receipt?: string;
+  /**
+   * Pin only a run measured like the pin it replaces: a pin that would record a
+   * `manual` re-anchor is refused (`reanchor`), and the file is untouched.
+   */
+  readonly sameInstrumentOnly?: boolean;
   /**
    * The pin this one would replace. {@link pinRun} reads it from the file;
    * a caller of {@link pinFromIndexEntry} passes the one it read.
@@ -218,6 +234,21 @@ export function manualRebaseline(
   return changed.length > 0 ? { from: replaced.runId, reason: "manual", cmd } : undefined;
 }
 
+/** Why a caller that pins only same-instrument runs refuses this one. */
+export function reanchorRefusal(
+  entry: RunIndexEntry,
+  replaced: BaselineEntry | undefined,
+): PinRefusal {
+  const changed =
+    replaced === undefined
+      ? []
+      : instrumentChanges(replaced, entry).filter((c) => c.unverified !== true);
+  return {
+    code: "reanchor",
+    reason: `run ${entry.runId} was measured differently from the pinned run ${replaced?.runId ?? "(none)"}${changed.length > 0 ? ` (${changed.map((c) => c.field).join(", ")})` : ""} — moving the baseline onto it is a re-anchor, which a person makes: \`crewhaus eval --rebaseline --reason <code>\``,
+  };
+}
+
 /**
  * Pin this run, or refuse before touching the file. The only path to
  * `setBaseline` outside tests.
@@ -241,7 +272,15 @@ export function pinRun(
   let pinOpts: PinOptions = replaced !== undefined ? { ...opts, replaced } : opts;
   if (opts.rebaselined === undefined) {
     const mark = manualRebaseline(replaced, entry, opts.cmd ?? "unknown");
-    if (mark !== undefined) pinOpts = { ...pinOpts, rebaselined: mark };
+    if (mark !== undefined && opts.sameInstrumentOnly === true) {
+      return { ok: false, refusal: reanchorRefusal(entry, replaced) };
+    }
+    if (mark !== undefined) {
+      pinOpts = {
+        ...pinOpts,
+        rebaselined: { ...mark, ...(opts.receipt !== undefined ? { receipt: opts.receipt } : {}) },
+      };
+    }
   }
   const outcome = pinFromIndexEntry(entry, ts, pinOpts);
   if (outcome.ok) setBaseline(outcome.pin, evalsDir);

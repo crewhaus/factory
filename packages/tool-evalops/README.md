@@ -6,7 +6,7 @@ What the eval runs add up to, without running one.
 |---|---|
 | `EvalHistory` | where this suite is heading — per lineage, cut wherever the instrument changed |
 | `EvalAggregate` | what one run's numbers actually come to, recomputed from its own samples |
-| `EvalBaselinePin` | which run the gate is holding the line against — show, move, clear |
+| `EvalBaselinePin` | which run the gate is holding the line against — show, or move onto a run measured the same way |
 | `EvalCoverage` | what production does that the dataset never tries |
 | `GraderMetaTest` | how far a grader is from the humans who labelled the same outputs |
 
@@ -112,8 +112,11 @@ caller-supplied strings can therefore drop one arm's run onto another arm's key
 and clobber a sibling's baseline. `EvalBaselinePin` derives the key from the
 run's own recorded columns and refuses a mismatch. It also refuses a partial
 run (mirroring `finishEvalRun`, which refuses one on every pin path), refuses a
-run whose `results.json` cannot be read, and warns when a re-pin moves the
-instrument.
+run whose `results.json` cannot be read, and pins only a run measured like the
+pin it replaces: moving a baseline onto a run measured differently is a
+re-anchor a person makes with `crewhaus eval --rebaseline --reason <code>`.
+It never removes a pinned baseline either: `clear` answers only for a lineage
+with no pin.
 
 `dryRun` runs the same planner the real call runs and then simply does not
 commit it. There is no parallel preview path — that is how `tool-hostfs`'s

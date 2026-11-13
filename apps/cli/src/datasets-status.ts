@@ -15,7 +15,12 @@
  */
 import type { LintFinding } from "@crewhaus/dataset-ops/dataset-lint";
 import { overallDatasetHash, splitsPresent } from "@crewhaus/dataset-ops/datasets";
-import type { DatasetRecord, ReleaseEntry } from "@crewhaus/dataset-registry";
+import {
+  type DatasetRecord,
+  type HeldOutUsesReport,
+  type ReleaseEntry,
+  countHeldOutUses,
+} from "@crewhaus/dataset-registry";
 
 /** The slice of a run-index entry status/card consume (structural, so tests
  *  don't build full RunIndexEntry objects). */
@@ -60,6 +65,11 @@ export type VersionStatus = {
   readonly testRunCount: number;
   /** NEW-HUNT-9 — sanctioned releases recorded on the record. */
   readonly releaseCount: number;
+  /** Absent when the version has no holdout. */
+  readonly holdout?: number;
+  /** Recorded reads per held-out split, from the version's use ledger
+   *  (absent when the caller passed no ledger reader). */
+  readonly heldOutUses?: { readonly test: number; readonly holdout: number };
 };
 
 export type SaturationReport = {
@@ -102,6 +112,9 @@ export type ComputeDatasetStatusOptions = {
   /** Load one joined run's per-sample outcomes; undefined → run dir
    *  unreadable (skipped, best-effort like refresh-goldens). */
   readonly loadOutcomes: (outDir: string) => Promise<ReadonlyArray<RunSampleOutcome> | undefined>;
+  /** Read one version's held-out use ledger; with it, the burn column and
+   *  summary count recorded reads per split. */
+  readonly uses?: (version: string) => HeldOutUsesReport;
 };
 
 export async function computeDatasetStatus(
@@ -131,6 +144,18 @@ export async function computeDatasetStatus(
       ...(last !== undefined ? { lastRunTs: last.ts } : {}),
       testRunCount: mine.filter((e) => e.datasetName.includes("#test")).length,
       releaseCount: (record.releases ?? []).length,
+      ...(record.splits.holdout !== undefined ? { holdout: record.splits.holdout.length } : {}),
+      ...(opts.uses !== undefined
+        ? (() => {
+            const report = opts.uses(version);
+            return {
+              heldOutUses: {
+                test: countHeldOutUses(report, "test"),
+                holdout: countHeldOutUses(report, "holdout"),
+              },
+            };
+          })()
+        : {}),
     });
   }
 
@@ -178,7 +203,11 @@ export function statusTableRows(report: DatasetStatusReport): string[][] {
     v.test !== undefined ? String(v.test) : "-",
     String(v.runCount),
     v.lastRunTs ?? "-",
-    v.testRunCount > 0 || v.releaseCount > 0 ? `${v.releaseCount} (${v.testRunCount} runs)` : "0",
+    v.heldOutUses !== undefined
+      ? `test ${v.heldOutUses.test}${v.holdout !== undefined || v.heldOutUses.holdout > 0 ? ` · holdout ${v.heldOutUses.holdout}` : ""}`
+      : v.testRunCount > 0 || v.releaseCount > 0
+        ? `${v.releaseCount} (${v.testRunCount} runs)`
+        : "0",
   ]);
 }
 
@@ -188,6 +217,13 @@ export function statusSummaryLines(report: DatasetStatusReport): string[] {
     `[datasets] status ${report.name}: ${report.versions.length} version(s), ` +
       `${report.runsJoined} indexed run(s), test burn ${report.totalReleases} release(s)`,
   );
+  if (report.versions.some((v) => v.heldOutUses !== undefined)) {
+    const test = report.versions.reduce((n, v) => n + (v.heldOutUses?.test ?? 0), 0);
+    const holdout = report.versions.reduce((n, v) => n + (v.heldOutUses?.holdout ?? 0), 0);
+    lines.push(
+      `[datasets] held-out reads: test ${test}, holdout ${holdout} — every one is counted (\`crewhaus datasets uses ${report.name}@<version>\`)`,
+    );
+  }
   const sat = report.saturation;
   if (sat === undefined) {
     lines.push(
@@ -226,6 +262,9 @@ export type DatasetCardOptions = {
   /** Run-history entries joined to this version (any split). */
   readonly runCount: number;
   readonly now: Date;
+  /** The version's held-out use ledger; with it, the card counts reads per
+   *  split. */
+  readonly uses?: HeldOutUsesReport;
 };
 
 /** Provenance breakdown over samples: source value (or "(untagged)") →
@@ -249,7 +288,10 @@ export function provenanceBreakdown(
 export function renderDatasetCard(opts: DatasetCardOptions): string {
   const { record } = opts;
   const total =
-    record.splits.train.length + record.splits.dev.length + (record.splits.test?.length ?? 0);
+    record.splits.train.length +
+    record.splits.dev.length +
+    (record.splits.test?.length ?? 0) +
+    (record.splits.holdout?.length ?? 0);
   const lines: string[] = [];
   lines.push(`# Dataset card — ${opts.name}@${opts.version}`);
   lines.push("");
@@ -266,6 +308,15 @@ export function renderDatasetCard(opts: DatasetCardOptions): string {
   );
   lines.push(`- **Indexed eval runs:** ${opts.runCount}`);
   lines.push(`- **Test-split burn:** ${(record.releases ?? []).length} release(s)`);
+  if (opts.uses !== undefined) {
+    const holdoutPart =
+      record.splits.holdout !== undefined || countHeldOutUses(opts.uses, "holdout") > 0
+        ? `, holdout ${countHeldOutUses(opts.uses, "holdout")}`
+        : "";
+    lines.push(
+      `- **Held-out reads:** test ${countHeldOutUses(opts.uses, "test")}${holdoutPart} (every read is counted; \`crewhaus datasets uses\`)`,
+    );
+  }
   lines.push("");
   lines.push("## Splits");
   lines.push("");

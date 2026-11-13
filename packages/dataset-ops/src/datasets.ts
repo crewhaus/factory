@@ -23,6 +23,9 @@ import {
   type DatasetRecord,
   type DatasetRegistry,
   type DatasetSplit,
+  type HeldOutSplit,
+  type HeldOutUseInput,
+  compareVersions,
   latestVersion,
   overallDatasetHash,
 } from "@crewhaus/dataset-registry";
@@ -133,7 +136,7 @@ export function canarySample(name: string, version: string): Sample {
 /** `--dataset` values with this prefix resolve via the registry, not a file. */
 export const REGISTRY_PREFIX = "registry:";
 
-const SPLIT_ORDER: ReadonlyArray<DatasetSplit> = ["train", "dev", "test"];
+const SPLIT_ORDER: ReadonlyArray<DatasetSplit> = ["train", "dev", "test", "holdout"];
 
 /** Thrown on a malformed ref / split-spec or an unresolvable registry lookup.
  *  The CLI entry file catches it and routes the message through `die()`;
@@ -159,8 +162,8 @@ export type RegistryRef = {
   readonly name: string;
   /** Omitted → resolve to the latest version at lookup time. */
   readonly version?: string;
-  /** Omitted → the union of train + dev only (the locked test split never
-   *  rides along on a bare ref — see {@link resolveRegistryRef}). */
+  /** Omitted → the union of train + dev only (the locked test split and the
+   *  holdout never ride along on a bare ref — see {@link resolveRegistryRef}). */
   readonly split?: DatasetSplit;
 };
 
@@ -189,7 +192,7 @@ export function parseRegistryRef(value: string): RegistryRef | undefined {
     rest = rest.slice(0, hash);
     if (!isDatasetSplit(s)) {
       throw new DatasetRefError(
-        `invalid split "#${s}" in "${value}" — expected #train, #dev, or #test`,
+        `invalid split "#${s}" in "${value}" — expected #train, #dev, #test, or #holdout`,
       );
     }
     split = s;
@@ -224,13 +227,18 @@ import {
 
 export { DEFAULT_SPLIT_SPEC, type SplitSpec, nextVersion, splitSamples };
 
-/** Parse `--split-spec`: `train/dev` or `train/dev/test` integer percentages
- *  summing to 100 (e.g. `70/15/15`, `80/20`). */
-export function parseSplitSpec(s: string): SplitSpec {
+/** A `--split-spec`: train/dev/test percentages, plus an optional holdout
+ *  share (`train/dev/test/holdout`). */
+export type DatasetSplitSpec = SplitSpec & { readonly holdout?: number };
+
+/** Parse `--split-spec`: `train/dev`, `train/dev/test` or
+ *  `train/dev/test/holdout` integer percentages summing to 100 (e.g.
+ *  `70/15/15`, `80/20`, `60/15/15/10`). */
+export function parseSplitSpec(s: string): DatasetSplitSpec {
   const parts = s.split("/");
-  if (parts.length !== 2 && parts.length !== 3) {
+  if (parts.length < 2 || parts.length > 4) {
     throw new DatasetRefError(
-      `invalid split spec "${s}" — expected train/dev or train/dev/test percentages (e.g. 70/15/15)`,
+      `invalid split spec "${s}" — expected train/dev, train/dev/test or train/dev/test/holdout percentages (e.g. 70/15/15)`,
     );
   }
   const nums = parts.map((p) => {
@@ -242,18 +250,42 @@ export function parseSplitSpec(s: string): SplitSpec {
   const train = nums[0] ?? 0;
   const dev = nums[1] ?? 0;
   const test = nums[2] ?? 0;
-  if (train + dev + test !== 100) {
+  const holdout = nums[3] ?? 0;
+  if (train + dev + test + holdout !== 100) {
     throw new DatasetRefError(
-      `invalid split spec "${s}" — must sum to 100 (got ${train + dev + test})`,
+      `invalid split spec "${s}" — must sum to 100 (got ${train + dev + test + holdout})`,
     );
   }
-  return { train, dev, test };
+  return parts.length === 4 ? { train, dev, test, holdout } : { train, dev, test };
+}
+
+/**
+ * {@link splitSamples} with a holdout share: the same hash-ordered cut, with
+ * the test+holdout tail cut once more at `floor(n·(train+dev+test)/100)`, so
+ * train and dev are exactly what `train/dev/(test+holdout)` gives and a
+ * three-share spec is untouched.
+ */
+export function splitSamplesWithHoldout(
+  samples: ReadonlyArray<Sample>,
+  spec: DatasetSplitSpec,
+): { train: Sample[]; dev: Sample[]; test: Sample[]; holdout: Sample[] } {
+  const holdoutShare = spec.holdout ?? 0;
+  const { train, dev, test } = splitSamples(samples, {
+    train: spec.train,
+    dev: spec.dev,
+    test: spec.test + holdoutShare,
+  });
+  const n = samples.length;
+  const devEnd = Math.floor((n * (spec.train + spec.dev)) / 100);
+  const testEnd = Math.floor((n * (spec.train + spec.dev + spec.test)) / 100);
+  const cut = Math.max(0, Math.min(test.length, testEnd - devEnd));
+  return { train, dev, test: test.slice(0, cut), holdout: test.slice(cut) };
 }
 
 // -------- registry resolution (the `registry:` shorthand) --------
 
 /** The splits a record actually carries (train/dev are always present keys;
- *  test is optional), in canonical train→dev→test order. */
+ *  test and holdout are optional), in canonical train→dev→test→holdout order. */
 export function splitsPresent(record: DatasetRecord): DatasetSplit[] {
   return SPLIT_ORDER.filter((s) => record.splits[s] !== undefined);
 }
@@ -291,7 +323,7 @@ export type ResolvedRegistryRef = {
   readonly record: DatasetRecord;
   readonly version: string;
   /** The splits the ref selects: the explicit `#split`, or train + dev (a
-   *  bare ref excludes the locked test split). */
+   *  bare ref excludes the locked test split and the holdout). */
   readonly splits: DatasetSplit[];
   /** `<name>@<version>[#split]` — see {@link registryDatasetName}. */
   readonly datasetName: string;
@@ -301,17 +333,46 @@ export type ResolvedRegistryRef = {
   readonly datasetHash: string;
 };
 
-export type ResolveRegistryRefOptions = {
-  /** B16 — explicit opt-in for an explicit `#test` ref (mirrors
-   *  dataset-registry's `GetOptions.allowTestSplit`). Without it a `#test`
-   *  ref throws: the held-out test split is reserved for release gating
-   *  (`--allow-test-split` on `crewhaus eval` / `crewhaus deploy canary`).
-   *  Never re-includes test in a bare ref — bare refs are train + dev, full
-   *  stop. */
-  readonly allowTestSplit?: boolean;
+/** The two readers allowed to read a `#holdout` ref. */
+export type HeldOutRead = { readonly purpose: "promotion" | "release" };
+
+type ResolveRegistryRefBase = {
   /** Warning sink; defaults to stderr. */
   readonly warn?: (line: string) => void;
 };
+
+/**
+ * Options for {@link resolveRegistryRef}. A caller that may read a held-out
+ * split (`allowTestSplit` or `heldOut`) must say what the read is for in
+ * `use`: the read is recorded before the samples are returned.
+ */
+export type ResolveRegistryRefOptions = ResolveRegistryRefBase &
+  (
+    | {
+        readonly allowTestSplit?: false;
+        readonly heldOut?: undefined;
+        readonly use?: HeldOutUseInput;
+      }
+    | {
+        /** B16 — explicit opt-in for an explicit `#test` ref (mirrors
+         *  dataset-registry's `GetOptions.allowTestSplit`). Without it a
+         *  `#test` ref throws: the held-out test split is reserved for release
+         *  gating (`--allow-test-split` on `crewhaus eval` / `crewhaus deploy
+         *  canary`). Never re-includes test in a bare ref — bare refs are
+         *  train + dev, full stop. */
+        readonly allowTestSplit?: boolean;
+        /** The only way to read `#holdout`: a change's promotion check or a
+         *  holdout release. `crewhaus eval` and `crewhaus deploy canary`
+         *  never pass it. */
+        readonly heldOut?: HeldOutRead;
+        /** What the use line records. */
+        readonly use: HeldOutUseInput;
+      }
+  );
+
+function isHeldOutSplit(s: DatasetSplit): s is HeldOutSplit {
+  return s === "test" || s === "holdout";
+}
 
 /**
  * Resolve a parsed `registry:` ref against a registry: pick the latest
@@ -331,9 +392,23 @@ export async function resolveRegistryRef(
   ref: RegistryRef,
   opts: ResolveRegistryRefOptions = {},
 ): Promise<ResolvedRegistryRef> {
+  if ((opts.allowTestSplit === true || opts.heldOut !== undefined) && opts.use === undefined) {
+    throw new DatasetRefError(
+      `a read that may reach a held-out split of "${ref.name}" must say what it is for (use) — the read is refused`,
+    );
+  }
   if (ref.split === "test" && opts.allowTestSplit !== true) {
     throw new DatasetRefError(
       `test split locked for "${ref.name}" — the held-out split is reserved for release gating (pass --allow-test-split on \`crewhaus eval\` / \`crewhaus deploy canary\`)`,
+    );
+  }
+  if (
+    ref.split === "holdout" &&
+    opts.heldOut?.purpose !== "promotion" &&
+    opts.heldOut?.purpose !== "release"
+  ) {
+    throw new DatasetRefError(
+      `the holdout of "${ref.name}" is read only by a change's promotion check (\`crewhaus changes check\`) or a holdout release (\`crewhaus datasets release ${ref.name} --split holdout\`)`,
     );
   }
   const version = ref.version ?? (await latestVersion(registry, ref.name));
@@ -347,12 +422,58 @@ export async function resolveRegistryRef(
     throw new DatasetRefError(`split "${ref.split}" not present in "${ref.name}@${version}"`);
   }
   const splits =
-    ref.split !== undefined ? [ref.split] : splitsPresent(record).filter((s) => s !== "test");
-  if (ref.split === undefined && record.splits.test !== undefined) {
+    ref.split !== undefined ? [ref.split] : splitsPresent(record).filter((s) => !isHeldOutSplit(s));
+  if (
+    ref.split === undefined &&
+    (record.splits.test !== undefined || record.splits.holdout !== undefined)
+  ) {
     const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
+    const carried =
+      record.splits.test !== undefined && record.splits.holdout !== undefined
+        ? "a locked test split and a holdout"
+        : record.splits.test !== undefined
+          ? "a locked test split"
+          : "a holdout";
     warn(
-      `[datasets] note: "${ref.name}@${version}" carries a locked test split — excluded (bare refs select train+dev; #test needs --allow-test-split on \`crewhaus eval\` / \`crewhaus deploy canary\`)`,
+      `[datasets] note: "${ref.name}@${version}" carries ${carried} — excluded (bare refs select train+dev; #test needs --allow-test-split on \`crewhaus eval\` / \`crewhaus deploy canary\`; the holdout is read only by \`crewhaus changes check\` and \`crewhaus datasets release --split holdout\`)`,
     );
+  }
+  // A case some version of this dataset holds out is never consumed through
+  // another version (the one it was cut from, or a later one that dropped the
+  // holdout): such a read is refused, naming the version that holds it out.
+  const consumed = splits.filter((s) => s !== "holdout");
+  if (consumed.length > 0) {
+    const heldOut = await heldOutIdsOfDataset(registry, ref.name);
+    const reached = samplesForSplits(record, consumed).filter((s) => heldOut.ids.has(s.id)).length;
+    if (reached > 0) {
+      const newest = heldOut.versions[heldOut.versions.length - 1];
+      throw new DatasetRefError(
+        `"${ref.name}@${version}" holds ${reached} case(s) the holdout of "${ref.name}@${newest}" keeps out, so it is not read — read a version that carries the holdout (\`registry:${ref.name}@${newest}\`)`,
+      );
+    }
+  }
+  // Every held-out read is counted before the samples are handed back; a
+  // use that cannot be recorded refuses the read.
+  for (const split of splits) {
+    if (!isHeldOutSplit(split)) continue;
+    const use = opts.use;
+    if (use === undefined) {
+      throw new DatasetRefError(
+        `a read of "${ref.name}@${version}#${split}" must say what it is for (use) — the read is refused`,
+      );
+    }
+    if (registry.recordUse === undefined) {
+      throw new DatasetRefError(
+        `this dataset registry cannot record a held-out use, so "${ref.name}@${version}#${split}" is not read`,
+      );
+    }
+    try {
+      registry.recordUse(ref.name, version, split, use);
+    } catch (err) {
+      throw new DatasetRefError(
+        `could not record the held-out use of "${ref.name}@${version}#${split}", so it is not read: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   return {
     record,
@@ -374,16 +495,52 @@ export async function resolveRegistryRef(
  * pointing at an escape hatch those commands don't have.
  */
 export function refuseTestSplitRef(command: "optimize" | "flywheel", ref: RegistryRef): void {
+  if (ref.split === "holdout") {
+    throw new DatasetRefError(
+      `${command} never runs over the holdout — "registry:${ref.name}#holdout" is read only by a change's promotion check (\`crewhaus changes check\`) or a holdout release (\`crewhaus datasets release --split holdout\`); use a bare ref, #train, or #dev`,
+    );
+  }
   if (ref.split !== "test") return;
   throw new DatasetRefError(
     `${command} never runs over the test split — "registry:${ref.name}#test" is the held-out release gate (use a bare ref, #train, or #dev; only the release-gating commands \`crewhaus eval\` / \`crewhaus deploy canary\` consume #test, behind --allow-test-split)`,
   );
 }
 
+/**
+ * The ids every version of a dataset keeps in its holdout, and the versions that
+ * have one. A holdout is cut into a NEW version, so the version it was cut from
+ * still lists its cases in train or dev: the union is what keeps them held out
+ * across versions. A version whose record cannot be read refuses (its holdout
+ * cannot be known).
+ */
+export async function heldOutIdsOfDataset(
+  registry: DatasetRegistry,
+  name: string,
+): Promise<{ readonly ids: ReadonlySet<string>; readonly versions: readonly string[] }> {
+  const ids = new Set<string>();
+  const versions: string[] = [];
+  for (const version of [...(await registry.list(name))].sort(compareVersions)) {
+    let record: DatasetRecord;
+    try {
+      record = await registry.getRecord(name, version);
+    } catch (err) {
+      throw new DatasetRefError(
+        `"${name}@${version}" cannot be read, so which cases "${name}" holds out cannot be known: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const holdout = record.splits.holdout ?? [];
+    if (holdout.length === 0) continue;
+    versions.push(version);
+    for (const s of holdout) ids.add(s.id);
+  }
+  return { ids, versions };
+}
+
 export type InspectedRegistryRef = {
   readonly record: DatasetRecord;
   readonly version: string;
-  /** The explicit `#split`, or EVERY split present — test included. */
+  /** The explicit `#split`, or EVERY split present — test and holdout
+   *  included. Inspection records no use. */
   readonly splits: DatasetSplit[];
   /** `<name>@<version>[#split]` — see {@link registryDatasetName}. */
   readonly datasetName: string;
@@ -430,8 +587,9 @@ export type RegisterDatasetOptions = {
   readonly registry: DatasetRegistry;
   readonly name: string;
   readonly samples: ReadonlyArray<Sample>;
-  /** Percentage split (default {@link DEFAULT_SPLIT_SPEC}); ignored with `split`. */
-  readonly splitSpec?: SplitSpec;
+  /** Percentage split (default {@link DEFAULT_SPLIT_SPEC}); ignored with `split`.
+   *  A `holdout` share cuts the promotion-only split off the test tail. */
+  readonly splitSpec?: DatasetSplitSpec;
   /** Put every sample into this single named split instead of splitting. */
   readonly split?: DatasetSplit;
   /** B18 — inject the version's one deterministic contamination-canary
@@ -468,19 +626,138 @@ export async function registerDataset(opts: RegisterDatasetOptions): Promise<Dat
       `[datasets] warning: metadata.source "${source}" is outside the provenance taxonomy (${SOURCE_TAXONOMY.join(" | ")}) — ${ids.length} sample(s): ${shown}${elided}`,
     );
   }
-  let splits: { train: Sample[]; dev: Sample[]; test?: Sample[] };
+  let splits: { train: Sample[]; dev: Sample[]; test?: Sample[]; holdout?: Sample[] };
   if (opts.split !== undefined) {
     splits = {
       train: opts.split === "train" ? [...samples] : [],
       dev: opts.split === "dev" ? [...samples] : [],
       ...(opts.split === "test" ? { test: [...samples] } : {}),
+      ...(opts.split === "holdout" ? { holdout: [...samples] } : {}),
     };
   } else {
-    const spec = opts.splitSpec ?? DEFAULT_SPLIT_SPEC;
-    const { train, dev, test } = splitSamples(samples, spec);
-    splits = { train, dev, ...(spec.test > 0 ? { test } : {}) };
+    const spec: DatasetSplitSpec = opts.splitSpec ?? DEFAULT_SPLIT_SPEC;
+    if ((spec.holdout ?? 0) > 0) {
+      const { train, dev, test, holdout } = splitSamplesWithHoldout(samples, spec);
+      splits = { train, dev, ...(spec.test > 0 ? { test } : {}), holdout };
+    } else {
+      const { train, dev, test } = splitSamples(samples, spec);
+      splits = { train, dev, ...(spec.test > 0 ? { test } : {}) };
+    }
   }
   return opts.registry.put({ name: opts.name, version, splits });
+}
+
+// -------- holdout creation (datasets holdout) --------
+
+/** The seed {@link selectHoldout} uses when the caller names none. */
+export const DEFAULT_HOLDOUT_SEED = "crewhaus-holdout";
+
+/** The largest share of train+dev a holdout may take. */
+export const MAX_HOLDOUT_FRACTION = 0.5;
+
+/**
+ * The ids a holdout of `fraction` takes from a record's train and dev
+ * splits: train+dev ordered by sha256(seed + "\0" + id), ties on the id,
+ * and the first `ceil(fraction·n)` taken. Never the test split. The same ids
+ * in any order give the same selection.
+ */
+export function selectHoldout(
+  record: DatasetRecord,
+  fraction: number,
+  seed: string = DEFAULT_HOLDOUT_SEED,
+): string[] {
+  const pool = [...record.splits.train, ...record.splits.dev].map((s) => s.id);
+  const keyed = pool.map((id) => ({
+    id,
+    key: createHash("sha256").update(`${seed}\0${id}`).digest("hex"),
+  }));
+  keyed.sort((a, b) =>
+    a.key !== b.key ? (a.key < b.key ? -1 : 1) : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+  );
+  return keyed.slice(0, Math.ceil(fraction * pool.length)).map((k) => k.id);
+}
+
+export type CreateHoldoutOptions = {
+  readonly registry: DatasetRegistry;
+  readonly name: string;
+  /** The source version; default the latest. */
+  readonly version?: string;
+  /** The share of train+dev to move, `0 < fraction ≤ 0.5`. */
+  readonly fraction: number;
+  readonly seed?: string;
+};
+
+export type CreatedHoldout = {
+  /** The new version's record. */
+  readonly record: DatasetRecord;
+  /** The version the holdout was cut from (left untouched). */
+  readonly source: string;
+  readonly moved: number;
+  readonly fromTrain: number;
+  readonly fromDev: number;
+};
+
+/**
+ * Write a NEW version of `name` whose holdout is a seeded selection of the
+ * source version's train and dev cases ({@link selectHoldout}); the test
+ * split is carried as it is and the source version is untouched (the new
+ * version is created exclusively, as every `put` is). Refuses a fraction
+ * outside `0 < f ≤ 0.5`, a source that already has a holdout, and a cut that
+ * would leave train or dev empty.
+ */
+export async function createHoldoutVersion(opts: CreateHoldoutOptions): Promise<CreatedHoldout> {
+  if (
+    !Number.isFinite(opts.fraction) ||
+    opts.fraction <= 0 ||
+    opts.fraction > MAX_HOLDOUT_FRACTION
+  ) {
+    throw new DatasetRefError(
+      `invalid holdout fraction ${String(opts.fraction)} — must be more than 0 and at most ${MAX_HOLDOUT_FRACTION}`,
+    );
+  }
+  const source = opts.version ?? (await latestVersion(opts.registry, opts.name));
+  if (source === undefined) {
+    throw new DatasetRefError(
+      `dataset "${opts.name}" has no versions in the registry — import one with \`crewhaus datasets put\``,
+    );
+  }
+  const record = await opts.registry.getRecord(opts.name, source);
+  if (record.splits.holdout !== undefined) {
+    throw new DatasetRefError(
+      `"${opts.name}@${source}" already has a holdout (${record.splits.holdout.length} case(s)) — a version carries one holdout`,
+    );
+  }
+  const taken = new Set(selectHoldout(record, opts.fraction, opts.seed ?? DEFAULT_HOLDOUT_SEED));
+  const train = record.splits.train.filter((s) => !taken.has(s.id));
+  const dev = record.splits.dev.filter((s) => !taken.has(s.id));
+  if (train.length === 0 || dev.length === 0) {
+    throw new DatasetRefError(
+      `a holdout of ${opts.fraction} would leave "${opts.name}@${source}" with an empty ${train.length === 0 ? "train" : "dev"} split — use a smaller --fraction or add cases`,
+    );
+  }
+  // Hash order, so the holdout is the same whatever order the source lists.
+  const order = selectHoldout(record, opts.fraction, opts.seed ?? DEFAULT_HOLDOUT_SEED);
+  const byId = new Map<string, Sample>();
+  for (const s of [...record.splits.train, ...record.splits.dev]) byId.set(s.id, s);
+  const holdout = order.map((id) => byId.get(id) as Sample);
+  const version = nextVersion(await opts.registry.list(opts.name));
+  const written = await opts.registry.put({
+    name: opts.name,
+    version,
+    splits: {
+      train,
+      dev,
+      ...(record.splits.test !== undefined ? { test: [...record.splits.test] } : {}),
+      holdout,
+    },
+  });
+  return {
+    record: written,
+    source,
+    moved: holdout.length,
+    fromTrain: record.splits.train.length - train.length,
+    fromDev: record.splits.dev.length - dev.length,
+  };
 }
 
 // -------- serialization (datasets get) --------

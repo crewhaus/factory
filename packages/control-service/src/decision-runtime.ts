@@ -5,7 +5,7 @@
  *
  * | Kind | What is observed |
  * |---|---|
- * | `decisions.resolve` | an `appr_`: its decision claim in the approvals ledger of the harness's session root; a `dec_`: its row in the harness's requests |
+ * | `decisions.resolve` | an `appr_`: its decision claim in the approvals ledger of the harness's session root; a `dec_`: its row in the harness's requests or change-adoption decisions |
  * | `decisions.supersede` | the `appr_`'s supersede claim |
  * | `rules.create` | the standing rule whose row carries this receipt's id |
  * | `rules.revoke` | the `rule_`'s row |
@@ -17,7 +17,12 @@
  * becomes `succeeded` without an observation.
  */
 import { type CommandReceipt, isId, parseRef } from "@crewhaus/control-contract";
-import { readClaim, readProposals, readStandingRules } from "@crewhaus/control-records";
+import {
+  readChangeAdoptions,
+  readClaim,
+  readProposals,
+  readStandingRules,
+} from "@crewhaus/control-records";
 import { readHarnessEnvFiles } from "@crewhaus/harness-supervisor";
 import {
   approvalsLedger,
@@ -56,8 +61,16 @@ export function observeResolve(receipt: CommandReceipt, harnessDir: string): Obs
   if (isId("dec", id)) {
     const read = readProposals(harnessDir);
     const row = read.state === "present" ? read.rows.find((r) => r.id === id) : undefined;
-    if (row === undefined || row.state === "pending") return "unknown";
-    return compare(row.decidedByPrincipal, receipt.actor);
+    if (row !== undefined) {
+      if (row.state === "pending") return "unknown";
+      return compare(row.decidedByPrincipal, receipt.actor);
+    }
+    // A change-adoption decision is observed the same way.
+    const adoptions = readChangeAdoptions(harnessDir);
+    const adoption =
+      adoptions.state === "present" ? adoptions.rows.find((r) => r.id === id) : undefined;
+    if (adoption === undefined || adoption.state === "pending") return "unknown";
+    return compare(adoption.decidedByPrincipal, receipt.actor);
   }
   const claim = readClaim(approvalsLedgerOf(harnessDir), `decision/${id}`);
   if (!claim.ok) return "unknown";

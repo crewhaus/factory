@@ -603,7 +603,11 @@ export const evalAggregate: RegisteredTool = buildTool({
 // ---------------------------------------------------------------------------
 
 const evalBaselinePinSchema = z.object({
-  action: z.enum(["show", "set", "clear"]).describe("show the pin, move it to a run, or remove it"),
+  action: z
+    .enum(["show", "set", "clear"])
+    .describe(
+      "show the pin, or move it to a run measured like it; clear only reports a lineage with no pin — a pinned baseline is never removed here",
+    ),
   spec: z.string().min(1).describe("the spec name the lineage is keyed on"),
   dataset: z.string().min(1).describe("the dataset name the lineage is keyed on"),
   armId: z.string().optional().describe("for a per-arm lineage: the arm the runs measured"),
@@ -627,7 +631,7 @@ export const evalBaselinePin: RegisteredTool = buildTool({
     { field: "dataset", kind: "id", within: "spec" },
   ],
   description:
-    "Show, move or clear the pinned baseline run a lineage's regression gate compares against. Use when a gate needs re-baselining after a deliberate change, or to check what a lineage is being held to — including the case that matters most, a lineage with NO pin, where the gate passes because there is nothing to fail against. The lineage comes from the run's own recorded columns, so pinning can never drop one arm's run onto another arm's key; a partial, budget-aborted run is refused outright; and dryRun runs the same checks and reports the exact pin it would write.",
+    "Show the pinned baseline run a lineage's regression gate compares against, or move it to another run measured the same way. Use to check what a lineage is being held to — including the case that matters most, a lineage with NO pin, where the gate passes because there is nothing to fail against. A pinned baseline is never removed here and is never moved onto a run measured differently: that re-anchor is a person's, with `crewhaus eval --rebaseline --reason <code>`. The lineage comes from the run's own recorded columns, so pinning can never drop one arm's run onto another arm's key; a partial, budget-aborted run is refused outright; and dryRun runs the same checks and reports the exact pin it would write.",
   inputSchema: evalBaselinePinSchema,
   readOnly: false,
   destructive: true,

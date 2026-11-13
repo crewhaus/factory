@@ -112,6 +112,8 @@ export const SYSTEM_ACTORS = deepFreeze([
   "sys:reconcile",
   "sys:runtime",
   "sys:executor",
+  // The spec's own SLO rollback, recorded on a change it rolled back.
+  "sys:slo",
 ] as const);
 
 /** The OS user who owns a Hangar root. A person identifier: never stored raw. */

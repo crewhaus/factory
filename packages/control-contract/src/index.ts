@@ -60,6 +60,21 @@ export {
   type VaultCustody,
   type VaultStateView,
 } from "./areas/people.js";
+export {
+  CHANGE_KINDS,
+  CHANGE_REASONS,
+  CHANGE_SOURCES,
+  CHANGE_STATES,
+  CHANGE_SURFACES,
+  CHECK_ISOLATIONS,
+  type ChangeKind,
+  type ChangeReason,
+  type ChangeSource,
+  type ChangeState,
+  type ChangeSurface,
+  PERSON_CHANGE_REASONS,
+  QUALITY_MODULE,
+} from "./areas/quality.js";
 export type {
   AreaModule,
   CommandKindDecl,
@@ -121,6 +136,7 @@ export {
   type DecisionOverlays,
   type DeferReason,
   type DecisionPlace,
+  type ChangeAdoptionSubject,
   type DecisionRecordView,
   type DecisionSensitivity,
   type StandingRuleTerms,

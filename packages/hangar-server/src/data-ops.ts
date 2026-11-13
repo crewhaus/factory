@@ -18,10 +18,13 @@
  *   - `<spec>-ratings` and `<spec>-regressions` are AUTO-MAINTAINED. They are
  *     rendered as such; this surface offers no hand edit that the next
  *     distill would overwrite.
- *   - HELD-OUT TEST CASES STAY OUT OF NORMAL RUNS, and `releases[]` holds each
- *     `crewhaus datasets release`, the only thing that records a use. A direct
- *     run needs a typed confirmation (`eval-inputs.ts` enforces it server-side)
- *     and is not recorded.
+ *   - HELD-OUT CASES STAY OUT OF NORMAL RUNS. Every read of a version's test
+ *     split or holdout leaves one line in `<version>.uses.jsonl` beside it,
+ *     and the burn counts here are those lines (a legacy `releases[]` entry
+ *     counts once). A direct run needs a typed confirmation (`eval-inputs.ts`
+ *     enforces it server-side). The holdout is counted, never listed: these
+ *     reads return its size and its provenance tally, no row and no id. A
+ *     read here is inspection and records no use.
  *   - QUARANTINE IS EVIDENCE. `_quarantine/` entries surface beside the
  *     registry WITH their provenance — a quarantined sample that vanishes
  *     from the UI is a bug report nobody can file.
@@ -41,7 +44,9 @@ import {
   type DatasetRecord,
   type DatasetSplit,
   compareVersions,
+  countHeldOutUses,
   createFileBackedRegistry,
+  readHeldOutUses,
   verifySplitHashes,
 } from "@crewhaus/dataset-registry";
 import { readRunIndexLatest } from "@crewhaus/eval-report";
@@ -101,7 +106,7 @@ function autoMaintained(ctx: M3Context, name: string): string | null {
   return null;
 }
 
-type SplitSizes = { train: number; dev: number; test: number | null };
+type SplitSizes = { train: number; dev: number; test: number | null; holdout: number | null };
 
 function splitSizes(record: DatasetRecord): SplitSizes {
   // `splits` is required by the type and optional on disk — these records are
@@ -113,6 +118,8 @@ function splitSizes(record: DatasetRecord): SplitSizes {
     train: splits.train?.length ?? 0,
     dev: splits.dev?.length ?? 0,
     test: splits.test === undefined ? null : splits.test.length,
+    // A count only: the holdout's rows never leave the registry here.
+    holdout: splits.holdout === undefined ? null : splits.holdout.length,
   };
 }
 
@@ -125,7 +132,7 @@ function splitSizes(record: DatasetRecord): SplitSizes {
  */
 function provenance(record: DatasetRecord): Record<string, number> {
   const tally: Record<string, number> = {};
-  const splits: readonly DatasetSplit[] = ["train", "dev", "test"];
+  const splits: readonly DatasetSplit[] = ["train", "dev", "test", "holdout"];
   const recordSplits = record.splits ?? {};
   for (const split of splits) {
     for (const sample of recordSplits[split] ?? []) {
@@ -154,11 +161,36 @@ function verifyRecord(record: DatasetRecord): VerifyState {
   };
 }
 
-/** Release entries: how many times `crewhaus datasets release` used this
- *  version's test split. A direct run is not recorded. */
-function burn(record: DatasetRecord): { count: number; releases: ReadonlyArray<unknown> } {
-  const releases = record.releases ?? [];
-  return { count: releases.length, releases: releases.map((r) => ({ ...r })) };
+type Burn = {
+  /** Recorded reads of the test split (release entries included). */
+  readonly count: number;
+  /** Recorded reads of the holdout. */
+  readonly holdout: number;
+  readonly releases: ReadonlyArray<unknown>;
+};
+
+/** Held-out reads of one version, from the use ledger beside it: test and
+ *  holdout counted apart, a legacy `releases[]` entry counted once. A read:
+ *  the ledger is contained to the harness and never written. */
+function burn(ctx: M3Context, name: string, version: string, record: DatasetRecord): Burn {
+  const releases = (record.releases ?? []).map((r) => ({ ...r }));
+  const root = registryRoot(ctx);
+  const contained =
+    root !== undefined &&
+    safeContain(ctx, [...REGISTRY_SEGMENTS, name, `${version}.uses.jsonl`]) !== undefined;
+  if (!contained) {
+    return { count: releases.length, holdout: 0, releases };
+  }
+  try {
+    const report = readHeldOutUses(root, name, version);
+    return {
+      count: countHeldOutUses(report, "test"),
+      holdout: countHeldOutUses(report, "holdout"),
+      releases,
+    };
+  } catch {
+    return { count: releases.length, holdout: 0, releases };
+  }
 }
 
 async function loadVersions(
@@ -220,7 +252,10 @@ export const datasets: M3Handler = async (ctx) => {
       splits: latest === undefined ? null : splitSizes(latest),
       provenance: latest === undefined ? null : provenance(latest),
       verify: latest === undefined ? null : verifyRecord(latest),
-      testSplitBurn: latest === undefined ? null : burn(latest).count,
+      testSplitBurn:
+        latest === undefined || latestVersion === undefined
+          ? null
+          : burn(ctx, name, latestVersion, latest).count,
       autoMaintained: autoMaintained(ctx, name),
     });
   }
@@ -274,7 +309,7 @@ export const dataset: M3Handler = async (ctx) => {
       splits: splitSizes(record),
       provenance: provenance(record),
       verify: verifyRecord(record),
-      burn: burn(record),
+      burn: burn(ctx, name, version, record),
     };
   });
   const latest = versions[versions.length - 1];
@@ -286,7 +321,7 @@ export const dataset: M3Handler = async (ctx) => {
     autoMaintained: autoMaintained(ctx, name),
     testSplit: {
       locked: true,
-      note: "Held-out test cases stay out of normal runs. Only crewhaus datasets release records a use.",
+      note: "Held-out cases stay out of normal runs. Every run that reads them is counted: crewhaus datasets uses lists each one.",
       verb: "crewhaus datasets release",
     },
   };
@@ -348,7 +383,7 @@ export const datasetStatus: M3Handler = async (ctx) => {
         splits: record === undefined ? null : splitSizes(record),
         runCount: joined.length,
         lastRunTs: joined[0]?.ts ?? null,
-        testSplitBurn: record === undefined ? 0 : burn(record).count,
+        testSplitBurn: record === undefined ? 0 : burn(ctx, name, version, record).count,
         saturation: saturationFor(
           ctx,
           joined.slice(0, 5).map((e) => e.runId),

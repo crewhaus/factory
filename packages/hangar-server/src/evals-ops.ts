@@ -30,8 +30,8 @@
  *     collision, gradersHash/judgeModel instrument change, and dataset
  *     keyset change are first-class banners, not buried stderr.
  *   - HELD-OUT TEST CASES STAY OUT OF NORMAL RUNS. `--allow-test-split` needs a
- *     typed confirmation, never a stray checkbox. Only `crewhaus datasets
- *     release` records a use; a direct run with the flag is not recorded.
+ *     typed confirmation, never a stray checkbox. Every run that reads them
+ *     leaves a use line beside the dataset version (`crewhaus datasets uses`).
  *   - SENTINEL ATTRIBUTION IS CONDITIONAL. A flip is provider drift ONLY
  *     when specHash + datasetHash + gradersHash + judgeModel all match the
  *     frozen baseline. Otherwise say what changed instead.

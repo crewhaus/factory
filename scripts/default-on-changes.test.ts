@@ -3773,3 +3773,279 @@ describe("the release notes name what the decision service changes for every har
     );
   });
 });
+
+describe("the release notes name what held-out reads, canary steps, agent dataset tools, re-anchors and write-backs change for every harness", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("a held-out read leaves one use line before it reads, through get and through a resolved ref", async () => {
+    const { createFileBackedRegistry, readHeldOutUses } = await import(
+      "../packages/dataset-registry/src/index"
+    );
+    const { resolveRegistryRef } = await import("../packages/dataset-ops/src/datasets");
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-held-out-")));
+    try {
+      const reg = createFileBackedRegistry({ rootDir: root });
+      await reg.put({
+        name: "cases",
+        version: "v1",
+        splits: { train: [{ id: "a", input: "a" }], dev: [], test: [{ id: "t", input: "t" }] },
+      });
+      for await (const _ of reg.get("cases", "v1", "test", { allowTestSplit: true })) void _;
+      expect(readHeldOutUses(root, "cases", "v1").uses).toHaveLength(1);
+      await resolveRegistryRef(
+        reg,
+        { name: "cases", split: "test" },
+        { allowTestSplit: true, use: { purpose: "eval", via: "cli" } },
+      );
+      expect(readHeldOutUses(root, "cases", "v1").uses.map((u) => u.purpose)).toEqual([
+        "unattributed",
+        "eval",
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Reading held-out cases is counted");
+    for (const name of [
+      "`crewhaus eval --allow-test-split`",
+      "`<version>.uses.jsonl`",
+      "`target: eval`",
+    ]) {
+      expect(bullet).toContain(name);
+    }
+  });
+
+  test("a canary step fails naming a case the control measured and the candidate did not", async () => {
+    const { makeCanaryEvalGate } = await import("../apps/cli/src/deploy-canary");
+    const result = (id: string, measured: boolean) => ({
+      sampleId: id,
+      sessionId: `sess-${id}`,
+      startedAt: "t",
+      endedAt: "t",
+      latencyMs: 1,
+      turns: 1,
+      tokens: { input: 0, output: 0 },
+      model: "m",
+      agentOutput: "x",
+      grades: {
+        overall: {
+          passed: measured,
+          score: measured ? 1 : 0,
+          rationale: "",
+          ...(measured ? {} : { status: "not_measured" as const }),
+        },
+        perGrader: [],
+      },
+    });
+    const run = (hardMeasured: boolean): EvalRunSummary =>
+      ({
+        runId: "run_x",
+        startedAt: "t",
+        endedAt: "t",
+        samples: [result("easy", true), result("hard", hardMeasured)],
+        aggregates: {
+          passRate: 1,
+          meanScore: 1,
+          p50Turns: 1,
+          p95Turns: 1,
+          p50LatencyMs: 1,
+          p95LatencyMs: 1,
+          totalTokens: { input: 0, output: 0 },
+          errorCount: 0,
+        },
+        config: { specHash: "s", datasetName: "d", graderNames: [], model: "m", concurrency: 1 },
+        outDir: "/x",
+      }) as unknown as EvalRunSummary;
+    const gate = makeCanaryEvalGate({
+      evalVersion: async (version) => run(version === "v1"),
+    });
+    const verdict = await gate({ name: "n", fromVersion: "v1", toVersion: "v2" } as never);
+    expect(verdict).toEqual({
+      verdict: "fail",
+      reason: "cases the control version measured were not measured by the candidate: hard",
+    });
+    const bullet = bulletFor("needs every case the control version measured");
+    expect(bullet).toContain("rolls back");
+    expect(bullet).toContain("`--traffic-split`");
+  });
+
+  test("DatasetInspect returns no holdout id, and EvalBaselinePin refuses a pin over another instrument", async () => {
+    const { datasetInspect } = await import("../packages/tool-dataset/src/index");
+    const { createFileBackedRegistry } = await import("../packages/dataset-registry/src/index");
+    const cwd = process.cwd();
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-holdout-tools-")));
+    try {
+      process.chdir(dir);
+      const reg = createFileBackedRegistry({ rootDir: join(dir, ".crewhaus", "datasets") });
+      await reg.put({
+        name: "cases",
+        version: "v1",
+        splits: {
+          train: [{ id: "a", input: "a" }],
+          dev: [],
+          holdout: [{ id: "held-out-row", input: "h" }],
+        },
+      });
+      const out = String(
+        await datasetInspect.execute({
+          dataset: "cases",
+          allowTestSplit: true,
+          includeSampleIds: true,
+        } as never),
+      );
+      expect(out).toContain('"detailWithheld":true');
+      expect(out).not.toContain("held-out-row");
+    } finally {
+      process.chdir(cwd);
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const lineage = { specName: "shop", datasetName: "smoke" };
+    const row = (runId: string, gradersHash: string) => ({
+      runId,
+      specName: "shop",
+      specHash: "h",
+      datasetName: "smoke",
+      datasetHash: "d",
+      passRate: 1,
+      meanScore: 1,
+      sampleCount: 1,
+      measuredCount: 1,
+      gradersHash,
+      ts: "2026-11-01T00:00:00.000Z",
+      outDir: `.crewhaus/evals/${runId}`,
+    });
+    const pinned = { ...row("run_a", "g1"), ts: "2026-11-01T00:00:00.000Z" };
+    const plan = planPin({
+      action: "set",
+      lineage,
+      lookup: lookupBaseline({ "shop::smoke": pinned }, lineage),
+      baselines: { "shop::smoke": pinned },
+      row: row("run_b", "g2"),
+      evalsDir: { abs: "", real: "", given: "", rel: ".crewhaus/evals" },
+    });
+    expect(plan).toMatchObject({ ok: false });
+    expect(JSON.stringify(plan)).toContain("crewhaus eval --rebaseline --reason <code>");
+    // Nor is a pinned baseline removed.
+    const cleared = planPin({
+      action: "clear",
+      lineage,
+      lookup: lookupBaseline({ "shop::smoke": pinned }, lineage),
+      baselines: { "shop::smoke": pinned },
+      evalsDir: { abs: "", real: "", given: "", rel: ".crewhaus/evals" },
+    });
+    expect(cleared).toMatchObject({ ok: false });
+    expect(JSON.stringify(cleared)).toContain("never removes a pinned baseline");
+    const bullet = bulletFor("stay out of the holdout and off").replace(/\s+/g, " ");
+    for (const name of ["`DatasetInspect`", "`DatasetLint`", "`DatasetPut`", "`EvalBaselinePin`"]) {
+      expect(bullet).toContain(name);
+    }
+    expect(bullet).toContain("never removes a pinned baseline");
+  });
+
+  test("a re-anchor writes its receipt first, and one whose receipt cannot be written keeps the baseline", async () => {
+    const { reanchorUnderReceipt } = await import("../apps/cli/src/quality-receipts");
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-reanchor-")));
+    try {
+      const harness = join(root, "harness");
+      // A file where the harness's control directory belongs: no receipt can be written.
+      mkdirSync(join(harness, ".crewhaus", "run"), { recursive: true });
+      writeFileSync(join(harness, ".crewhaus", "run", "control"), "not a directory");
+      let pinned = false;
+      const outcome = await reanchorUnderReceipt({
+        harnessDir: harness,
+        runId: "run_0123456789abcdef",
+        reason: "instrument-changed",
+        env: {
+          CREWHAUS_HANGAR_ROOT: join(root, "hangar"),
+          CREWHAUS_REGISTRY_ROOT: join(root, "registry"),
+          CREWHAUS_NO_REGISTRY: "1",
+        },
+        pin: () => {
+          pinned = true;
+          return { ok: false, refusal: { code: "nothing_measured", reason: "unused" } };
+        },
+      });
+      expect(pinned).toBe(false);
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) expect(outcome.refusal.code).toBe("receipt");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const receipts = bulletFor("Daemon verbs and Home's changes leave a receipt").replace(
+      /\s+/g,
+      " ",
+    );
+    for (const name of [
+      "`crewhaus eval --rebaseline`",
+      "`crewhaus eval --regrade-baseline`",
+      "`crewhaus eval-report baseline set`",
+    ]) {
+      expect(receipts).toContain(name);
+    }
+    expect(receipts).toContain("keep the baseline and exit non-zero");
+  });
+
+  test("a write-back records the change it made, and a proposal is filed as a change on its own branch", async () => {
+    const { recordWriteBack } = await import("../apps/cli/src/change-producers");
+    const { readChanges } = await import("../packages/quality-service/src/index");
+    const { buildProposalPrPlan } = await import("../packages/spec-changelog/src/proposal");
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-change-records-")));
+    try {
+      const harness = join(root, "harness");
+      mkdirSync(join(harness, "eval"), { recursive: true });
+      const before =
+        "name: shop\ntarget: cli\nagent:\n  model: claude-sonnet-4-5\n  instructions: Help.\n";
+      const after = before.replace("Help.", "Help, briefly.");
+      writeFileSync(join(harness, "crewhaus.yaml"), after);
+      writeFileSync(
+        join(harness, "eval", "graders.yaml"),
+        "graders:\n  - name: exact\n    type: exact_match\n",
+      );
+      const recorded = await recordWriteBack({
+        specPath: join(harness, "crewhaus.yaml"),
+        source: "optimize",
+        baseText: before,
+        candidateText: after,
+        env: {
+          CREWHAUS_HANGAR_ROOT: join(root, "hangar"),
+          CREWHAUS_REGISTRY_ROOT: join(root, "registry"),
+          CREWHAUS_NO_REGISTRY: "1",
+        },
+      });
+      if (!recorded.ok) throw new Error(recorded.reason);
+      const read = readChanges(harness);
+      expect(read.state === "present" && read.rows.map((r) => r.state)).toEqual(["adopted"]);
+      expect(
+        readFileSync(
+          join(harness, ".crewhaus", "proposals", recorded.row.id, "proposed.yaml"),
+          "utf8",
+        ),
+      ).toBe(after);
+      const { plan } = buildProposalPrPlan({
+        assembled: {
+          patch: { specName: "shop", provenance: { patchHash: "0".repeat(64) } },
+          patchJson: "{}",
+          changelogEntry: "",
+          prBody: "",
+          prTitle: "t",
+        } as never,
+        proposedYaml: after,
+        specRelPath: "crewhaus.yaml",
+        proposedVersion: "v2",
+        change: recorded.row.id,
+      });
+      expect(plan.branch).toBe(`propose/${recorded.row.id}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Write-backs and proposals keep a change record").replace(/\s+/g, " ");
+    for (const name of [
+      "`crewhaus optimize --write-back`",
+      "`crewhaus flywheel run`",
+      "`.crewhaus/proposals/<id>/`",
+      "`propose/<id>`",
+    ]) {
+      expect(bullet).toContain(name);
+    }
+  });
+});

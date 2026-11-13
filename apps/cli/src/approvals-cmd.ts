@@ -602,7 +602,7 @@ export async function runApprovalsCommand(
       if (isRequest || answer.record === null) {
         return fail(
           exitFor(answer.outcome),
-          `${id} was already ${answer.proposal?.state ?? "decided"}`,
+          `${id} was already ${answer.proposal?.state ?? answer.adoption?.state ?? "decided"}`,
         );
       }
       return fail(
@@ -615,15 +615,24 @@ export async function runApprovalsCommand(
   if (json) {
     out(
       `${JSON.stringify(
-        isRequest
-          ? {
-              proposal: answer.proposal,
-              ...(answer.rule !== undefined ? { rule: answer.rule } : {}),
-            }
-          : answer.record,
+        answer.adoption !== undefined
+          ? { adoption: answer.adoption }
+          : isRequest
+            ? {
+                proposal: answer.proposal,
+                ...(answer.rule !== undefined ? { rule: answer.rule } : {}),
+              }
+            : answer.record,
         null,
         2,
       )}\n`,
+    );
+  } else if (answer.adoption !== undefined) {
+    // A change-adoption decision: a grant applies nothing; adopting is its own command.
+    out(
+      choice === "grant"
+        ? `granted ${id} — ${answer.adoption.subject.chg} may be adopted: crewhaus changes adopt ${answer.adoption.subject.chg} --expect ${answer.adoption.subject.baseRevision}\n`
+        : `denied ${id} — ${answer.adoption.subject.chg} will not be adopted\n`,
     );
   } else if (isRequest) {
     out(

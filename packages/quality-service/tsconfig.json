@@ -1,0 +1,46 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../control-contract"
+    },
+    {
+      "path": "../control-records"
+    },
+    {
+      "path": "../dataset-ops"
+    },
+    {
+      "path": "../dataset-registry"
+    },
+    {
+      "path": "../eval-dataset"
+    },
+    {
+      "path": "../eval-grader"
+    },
+    {
+      "path": "../eval-ops"
+    },
+    {
+      "path": "../eval-report"
+    },
+    {
+      "path": "../eval-runner"
+    },
+    {
+      "path": "../ir"
+    },
+    {
+      "path": "../spec-patch"
+    },
+    {
+      "path": "../tool-safety"
+    }
+  ],
+  "include": ["src/**/*"]
+}

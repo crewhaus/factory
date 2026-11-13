@@ -81,6 +81,8 @@ export const WRITER_IDS = Object.freeze([
   "tool.SpecPatchApply",
   "tool.DoctorFix",
   "service-setup",
+  "quality.adopt",
+  "quality.rollback",
 ] as const);
 
 export type WriterId = (typeof WRITER_IDS)[number];
