@@ -16,6 +16,7 @@
  * constant before it is initialized.
  */
 import { DELTA_090_KEYS } from "./owner-keys";
+import { protectedBarChange } from "./protected";
 
 /** `"*"` inside a row's `prefix` matches any one segment. Equal to `WILDCARD_SEGMENT`. */
 export const SURFACE_WILDCARD = "*";
@@ -307,6 +308,10 @@ export const RENAME_WARNING =
 export const BUDGET_RAISE_WARNING =
   "This raises or removes the spending cap, so the harness can spend more before it stops.";
 
+/** The sentence a change to a protected quality bar shows before it is confirmed. */
+export const PROTECTED_LOOSENING_WARNING =
+  "This loosens a quality bar the owner protected, so only the owner can make it.";
+
 function plainObject(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -348,7 +353,9 @@ function budgetRaises(before: unknown, after: unknown): string[] {
  * because history, baselines and memory are kept under the name. Raising the
  * budget (a higher `usd`, the cap or `usd` removed, a `session` scope widened,
  * `on_exceed` moved from `stop` to `degrade`) needs the security edit
- * permission. A first budget and a lowered one need nothing.
+ * permission. A first budget and a lowered one need nothing. Loosening a
+ * protected quality bar (`protectedBarChange`) needs the security edit
+ * permission too; tightening one needs nothing.
  */
 export function escalationFor(before: unknown, after: unknown): SpecEscalation[] {
   const out: SpecEscalation[] = [];
@@ -360,6 +367,14 @@ export function escalationFor(before: unknown, after: unknown): SpecEscalation[]
   const raised = budgetRaises(before, after);
   if (raised.length > 0) {
     out.push({ needs: "h.spec.edit.security", reason: BUDGET_RAISE_WARNING, paths: raised });
+  }
+  const loosened = protectedBarChange(before, after);
+  if (loosened !== undefined) {
+    out.push({
+      needs: "h.spec.edit.security",
+      reason: `${PROTECTED_LOOSENING_WARNING} (${loosened.reason})`,
+      paths: [loosened.key],
+    });
   }
   return out;
 }

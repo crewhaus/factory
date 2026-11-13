@@ -389,6 +389,10 @@ export function usageText(): string {
     "                                       verbs drive the supervisor directly, so they work",
     "                                       with no Hangar console running (and either head",
     "                                       adopts what the other started).",
+    "  criteria <verb> ...                  what the graders check for, in eval/graders.yaml:",
+    "       list [--json] | show <id> [--json] | lint [--dataset D] [--json]",
+    "       apply <edits.json> --expect REV [--confirm NAME]   loosening a protected one needs the owner",
+    "       preview <edits.json> --dataset D [--run RUN] [--yes] [--json]   regrade a recorded run",
     "  access <verb> ...                    who may use this Home; works with Home stopped:",
     "       members [--json] | tokens [--json]   who has access, and the service tokens",
     "       invite --role R (--home | --group G | --harness H) [--expires D]   a one-use link",
@@ -513,7 +517,7 @@ export const EVAL_USAGE =
   "[--resume <runDir>] " +
   "[--provability <level>] " +
   "[--models <m1,m2,...>] " +
-  "[--rebaseline --reason <code>]\n" +
+  "[--rebaseline --reason <code>] [--regrade <runId>] [--regrade-baseline]\n" +
   "  Before any model spend, an OFFLINE preflight lint-lite refuses runs with\n" +
   "  duplicate sample ids (artifact dirs collide, flip detection corrupts) or\n" +
   "  gold-needing graders (exact_match/expected_contains) over a dataset where NO\n" +
@@ -550,6 +554,14 @@ export const EVAL_USAGE =
   "  baseline-unreadable, reset), and the pin records the reason and the run it\n" +
   "  replaced. It refuses a run that cannot be a baseline, and is refused with\n" +
   "  --no-promote, --models, --sentinel, --resume, --provability and --voice.\n" +
+  "  --regrade <runId> grades that run's recorded answers again with this graders\n" +
+  "  file: the dataset gives each case's input, the run gives the answer, and no\n" +
+  "  agent call is made. A case the run cannot supply, or a grader that reads more\n" +
+  "  than a run records, reads not measured. It is recorded and never gated or\n" +
+  "  pinned. --regrade-baseline, on a live run whose baseline was graded with other\n" +
+  "  graders, regrades the baseline's answers with this file and gates this run\n" +
+  "  against them; a pass pins this run and the pin says so. Either re-anchor over\n" +
+  "  a protected criterion needs the harness's owner.\n" +
   "  --max-p95-latency-ms N / --max-cost-usd F declare ops thresholds for the same\n" +
   "  baseline gate: the verdict FAILS (and exits non-zero under --gate) when p95\n" +
   "  per-sample latency rose more than N ms vs the pinned baseline, or when this\n" +

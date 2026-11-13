@@ -336,6 +336,59 @@ describe("recordEvalRun / runIndexEntryFromSummary", () => {
       });
     });
 
+    test("a regrade's row says what it is and which run it graded; a live row does not", () => {
+      const samples = [makeSampleResult("a", true)];
+      const regrade = runIndexEntryFromSummary(
+        makeSummary(samples, { purpose: "regrade", regradeOf: "run_src0001" }),
+        opts,
+      );
+      expect(regrade.purpose).toBe("regrade");
+      expect(regrade.regradeOf).toBe("run_src0001");
+      const live = runIndexEntryFromSummary(makeSummary(samples), opts);
+      expect(Object.keys(live)).not.toContain("purpose");
+      expect(Object.keys(live)).not.toContain("regradeOf");
+    });
+
+    test("a row carries its protected criteria's digests, and only when it has one", () => {
+      const samples = [makeSampleResult("a", true)];
+      const record = (prot: boolean) => ({
+        id: "dates",
+        digest: "c1",
+        measuring: "m1",
+        mode: "enforce" as const,
+        ...(prot ? { protected: true as const } : {}),
+        graders: [{ name: "exact", digest: "x" }],
+      });
+      const guarded = runIndexEntryFromSummary(
+        makeSummary(samples, { criteria: [record(true)] }),
+        opts,
+      );
+      expect(guarded.protectedCriteria?.map((c) => c.id)).toEqual(["dates"]);
+      expect(guarded.protectedCriteria?.[0]?.digest).toMatch(/^[0-9a-f]{64}$/);
+      // A calibration applied to the criterion's grader moves it.
+      const calibrated = runIndexEntryFromSummary(
+        makeSummary(samples, {
+          criteria: [record(true)],
+          judgeCalibration: {
+            path: "/c.json",
+            applied: [{ grader: "exact", specKey: "default", minScore: 0.1, passingScore: 1.4 }],
+          },
+        }),
+        opts,
+      );
+      expect(calibrated.protectedCriteria?.[0]?.digest).not.toBe(
+        guarded.protectedCriteria?.[0]?.digest as string,
+      );
+      for (const summary of [
+        makeSummary(samples),
+        makeSummary(samples, { criteria: [record(false)] }),
+      ]) {
+        expect(Object.keys(runIndexEntryFromSummary(summary, opts))).not.toContain(
+          "protectedCriteria",
+        );
+      }
+    });
+
     test("an invoker error and a grader throw both count as errored, and neither as measured", () => {
       expect(
         counts([

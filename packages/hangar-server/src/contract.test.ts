@@ -724,6 +724,8 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["graders", "array"],
     ["yaml", "string|null"],
     ["hash", "string|null"],
+    ["gradersHash", "string|null"],
+    ["structuredBuilder", "boolean"],
     ["cardVerb", "string"],
   ),
   datasetBuilder: m3Read(["state", "string|null"], ["events", "array"]),
@@ -1447,6 +1449,7 @@ const M3_BODIES: Record<string, unknown> = {
   specRollback: { env: "prod", version: "1.0.0", confirmName: "contract-harness" },
   specPropose: { edits: [], title: "tune instructions" },
   wizardCreate: { dir: "/nonexistent", template: "cli", answers: {} },
+  // Neither a whole file nor edits: the typed refusal that says what it takes.
   graderWrite: { graders: [] },
   datasetBuilderStep: { event: "start" },
   mcpConnectorWrite: { name: "files", command: "bunx", args: [] },

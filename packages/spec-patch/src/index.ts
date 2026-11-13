@@ -36,6 +36,7 @@ import { isCollection, isSeq, parse, parseDocument, stringify } from "yaml";
 import { z } from "zod";
 import { renderMinimal } from "./minimal-diff";
 import { DELTA_090_KEYS } from "./owner-keys";
+import { protectedBarChange } from "./protected";
 import { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
 import {
   admitBlockPatch,
@@ -50,6 +51,7 @@ import {
 // free-form provenance) without duplicating the pattern table a third time.
 export { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
 export { DELTA_090_KEYS, type OwnerKey } from "./owner-keys";
+export { type ProtectedBarChange, protectedBarChange } from "./protected";
 export * from "./surfaces";
 export {
   type AdmitBlockPatchOptions,
@@ -304,6 +306,13 @@ export function validatePatch(spec: Spec, patch: SpecPatch): void {
   if (blocked !== undefined) {
     throw new SpecPatchError(
       `patch at ${formatPath(patch.path)} would change "${blocked.leaf}", which the optimizer may not change: ${blocked.reason}. ${PERSON_CAN}`,
+    );
+  }
+  // A protected bar only tightens, wherever the patch lands.
+  const loosened = protectedBarChange(before, after);
+  if (loosened !== undefined) {
+    throw new SpecPatchError(
+      `patch at ${formatPath(patch.path)} would loosen "${loosened.key}": ${loosened.reason}. ${PERSON_CAN}`,
     );
   }
 }
@@ -621,6 +630,13 @@ export function applySpecEdits(
         by >= 0 ? `edit #${by} (${formatEditPath(edits[by]?.path ?? [])})` : "the edits together";
       throw new SpecPatchError(
         `${who} would change "${blocked.leaf}", which the optimizer may not change: ${blocked.reason}. ${PERSON_CAN}`,
+      );
+    }
+    // The batch as a whole may only tighten a protected bar.
+    const loosened = protectedBarChange(before, after);
+    if (loosened !== undefined) {
+      throw new SpecPatchError(
+        `the edits would loosen "${loosened.key}": ${loosened.reason}. ${PERSON_CAN}`,
       );
     }
   }

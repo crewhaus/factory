@@ -3,7 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { type CaseDigests, comparability, readCaseDigests } from "./comparability";
+import {
+  type CaseDigests,
+  comparability,
+  measuredInBaseline,
+  protectedChanges,
+  readCaseDigests,
+} from "./comparability";
 import type { BaselineEntry, RunIndexEntry } from "./history";
 import { runState, staleness } from "./run-state";
 
@@ -206,8 +212,8 @@ describe("comparability — each rule, in order", () => {
     const rationale = "no proof bundle (is provability: declared?) — nothing graded";
     const legacy = summary([
       s("a", true),
-      s("b", false, { rationale: `[p: ✗] ${rationale}` }, [
-        { name: "p", passed: false, score: 0, rationale },
+      s("b", false, { rationale: `[provability.claimCoverage: ✗] ${rationale}` }, [
+        { name: "provability.claimCoverage", passed: false, score: 0, rationale },
       ]),
     ]);
     const result = comparability(
@@ -215,6 +221,75 @@ describe("comparability — each rule, in order", () => {
       { entry: entry(), summary: summary([s("a", true), notMeasured("b")]) },
     );
     expect(result).toMatchObject({ comparable: true, lostMeasurement: [] });
+  });
+
+  test("a baseline judge whose rationale starts with a proof prefix measured its case", () => {
+    const rationale = "no proof bundle (is provability: declared?) — the judge wrote this";
+    const judged = summary([
+      s("a", true),
+      s("b", false, { rationale }, [{ name: "quality_judge", passed: false, score: 0, rationale }]),
+    ]);
+    const result = comparability(
+      { pin: pin(), summary: judged },
+      { entry: entry(), summary: summary([s("a", true), notMeasured("b")]) },
+    );
+    expect(result).toMatchObject({ comparable: true, lostMeasurement: ["b"] });
+    expect(measuredInBaseline(judged.samples[1] as SampleResult)).toBe(true);
+  });
+
+  test("a baseline case decided by its enforced grader, beside a skipped and an observing one, was measured", () => {
+    const decided = s("b", true, {}, [
+      { name: "has", passed: true, score: 1, rationale: "" },
+      {
+        name: "exact",
+        passed: false,
+        score: 0,
+        rationale: "outside criterion json-only's cases",
+        status: "skipped",
+        statusReason: "out_of_scope",
+      },
+      { name: "watch", passed: false, score: 0, rationale: "", status: "observing" },
+    ]);
+    expect(measuredInBaseline(decided)).toBe(true);
+    const lostRun = summary([
+      s("a", true),
+      s("b", false, { status: "not_measured", statusReason: "no_judge_credentials" }),
+    ]);
+    expect(
+      comparability(
+        { pin: pin(), summary: summary([s("a", true), decided]) },
+        { entry: entry(), summary: lostRun },
+      ),
+    ).toMatchObject({ comparable: true, lostMeasurement: ["b"] });
+    // A per-grader grade that is not measured still leaves the case unmeasured.
+    const unmeasured = s("c", true, {}, [
+      { name: "has", passed: true, score: 1, rationale: "" },
+      { name: "judge", passed: false, score: 0, rationale: "", status: "not_measured" },
+    ]);
+    expect(measuredInBaseline(unmeasured)).toBe(false);
+  });
+
+  test("a graders file's own name for a provability grader is read like the six, when passed", () => {
+    const rationale = "the gate could not verify this answer (x)";
+    const sample = s("b", false, { rationale: "[cov: ✗]" }, [
+      { name: "cov", passed: false, score: 0, rationale },
+    ]);
+    expect(measuredInBaseline(sample, { provabilityGraderNames: new Set(["cov"]) })).toBe(false);
+    expect(measuredInBaseline(sample)).toBe(true);
+    const base2 = summary([s("a", true), sample]);
+    const run2 = summary([s("a", true), notMeasured("b")]);
+    expect(
+      comparability(
+        { pin: pin(), summary: base2 },
+        { entry: entry(), summary: run2 },
+        {
+          provabilityGraderNames: new Set(["cov"]),
+        },
+      ),
+    ).toMatchObject({ comparable: true, lostMeasurement: [] });
+    expect(
+      comparability({ pin: pin(), summary: base2 }, { entry: entry(), summary: run2 }),
+    ).toMatchObject({ comparable: true, lostMeasurement: ["b"] });
   });
 
   test("the same dataset and the same cases: comparable, nothing added", () => {
@@ -228,6 +303,14 @@ describe("comparability — each rule, in order", () => {
 });
 
 describe("runState and staleness", () => {
+  test("a regrade or a preview of another run says so; a live run does not", () => {
+    expect(
+      runState(summary([s("a", true)], { purpose: "regrade", regradeOf: "run_src" })).regraded,
+    ).toBe(true);
+    expect(runState(summary([s("a", true)], { purpose: "preview" })).regraded).toBe(true);
+    expect("regraded" in runState(summary([s("a", true)]))).toBe(false);
+  });
+
   test("complete, partial and not measured", () => {
     expect(runState(summary([s("a", true), notMeasured("b")]))).toEqual({
       state: "complete",
@@ -290,5 +373,54 @@ describe("readCaseDigests", () => {
     const other = dir();
     mkdirSync(join(other, "cases.json"));
     expect(readCaseDigests(other)).toBeUndefined();
+  });
+});
+
+describe("protectedChanges", () => {
+  const record = (id: string, digest: string, extra: Record<string, unknown> = {}) => ({
+    id,
+    digest,
+    mode: "enforce" as const,
+    graders: [],
+    ...extra,
+  });
+  const withMeta = (id: string, family: string) =>
+    s(id, true, {}, undefined, { metadata: { family } });
+
+  test("a protected criterion that changed or went is named", () => {
+    const base = summary([withMeta("a", "csv")], {
+      criteria: [
+        record("kept", "d1", { protected: true }),
+        record("moved", "d2", { protected: true }),
+        record("gone", "d3", { protected: true }),
+        record("open", "d5"),
+      ],
+    });
+    const run = summary([withMeta("a", "csv")], {
+      criteria: [record("kept", "d1"), record("moved", "d2x"), record("open", "zz")],
+    });
+    expect(protectedChanges(base, run)).toEqual([
+      "protected criterion moved changed",
+      "protected criterion gone is gone",
+    ]);
+  });
+
+  test("a case inside a protected criterion's scope that is gone is named; one outside is not", () => {
+    const criteria = [
+      record("scoped", "d4", { protected: true, scope: { metadata: { family: ["json"] } } }),
+    ];
+    const base = summary([withMeta("a", "csv"), withMeta("b", "json"), withMeta("c", "csv")], {
+      criteria,
+    });
+    expect(protectedChanges(base, summary([withMeta("b", "json")], { criteria }))).toEqual([]);
+    expect(protectedChanges(base, summary([withMeta("a", "csv")], { criteria }))).toEqual([
+      "cases inside protected criterion scoped's scope are gone: b",
+    ]);
+  });
+
+  test("nothing protected, nothing named", () => {
+    const base = summary([withMeta("a", "csv")], { criteria: [record("open", "d5")] });
+    expect(protectedChanges(base, summary([], { criteria: [] }))).toEqual([]);
+    expect(protectedChanges(summary([withMeta("a", "csv")]), summary([]))).toEqual([]);
   });
 });

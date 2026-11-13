@@ -400,6 +400,28 @@ these on: they reach every harness that uses what each one names.
   its input there only until the daemon reads it, or the run is cancelled.
   Only `bypass` mode skips this. Recompile a daemon to pick this up.
 
+- **A protected quality bar only tightens, and only a person sets its
+  protection.** `crewhaus optimize`, `crewhaus advise --apply` and Home's
+  automatic apply never set or clear `evaluation.protected`,
+  `provability.protected` or `judge.protected`, alone or inside a whole
+  `steps`, `nodes` or `roles` value. On a protected block they only raise
+  `threshold` and `provability.grounded.coverage` and only lower
+  `provability.grounded.window_tokens`. A person can make any of these
+  changes with `crewhaus propose` or by editing `crewhaus.yaml`.
+
+- **An eval judge with no credentials leaves its cases not measured.** When
+  a judge's model provider has no credentials, `crewhaus eval` records its
+  cases as not measured (`no_judge_credentials`), never a pass or a fail:
+  they leave the pass rate, `eval --gate` reports them (a case the baseline
+  measured fails the gate), and the judge is not retried.
+
+- **A retried workflow step or graph node receives its judge's feedback as a
+  user message.** On `on_fail: retry_previous`, the judge's rationale is
+  screened like a consult reply and sent after the step's input or the
+  node's upstream state; feedback the screen blocks is left out, and the
+  retry carries the score alone. A retried node's upstream state carries its
+  judge's verdict and score, not the rationale.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read

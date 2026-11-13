@@ -61,7 +61,7 @@ import { directControl, runDaemonCommand } from "../apps/cli/src/daemon-cmd";
 import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
 import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
 import { discloseSurfaceChange } from "../apps/cli/src/surface-disclosure";
-import { cfWorkerUnwiredBlockWarnings, lower } from "../packages/compiler/src/index";
+import { cfWorkerUnwiredBlockWarnings, compile, lower } from "../packages/compiler/src/index";
 import { createContinuityStore } from "../packages/continuity-store/src/index";
 import {
   DECISION_LOG_KEYS,
@@ -82,11 +82,11 @@ import {
 import { commandsLedgerOf } from "../packages/control-service/src/index";
 import { decideApproval } from "../packages/deployment-controller/src/approval-gate";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
-import { EXIT_CODES } from "../packages/errors/src/index";
+import { EXIT_CODES, ProviderAuthError } from "../packages/errors/src/index";
 import { parseGradersConfig } from "../packages/eval-grader/src/index";
 import { finishEvalRun } from "../packages/eval-ops/src/eval-history";
 import { lookupBaseline } from "../packages/eval-report/src/index";
-import { type EvalRunSummary, runEval } from "../packages/eval-runner/src/index";
+import { type EvalRunSummary, runEval, runSample } from "../packages/eval-runner/src/index";
 import { buildRunEvaluation } from "../packages/evaluation-service/src/evaluation";
 import {
   FEDERATION_VERSION,
@@ -3040,6 +3040,185 @@ describe("the release notes name what guarded spec writes change for every harne
     const bullet = bulletFor("only when it resolves inside the harness");
     expect(bullet).toContain("`node_modules/.bin/crewhaus`");
     expect(bullet).toContain("`crewhaus` on `PATH`");
+  });
+});
+
+describe("the release notes name what criteria and protected bars change for every harness", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("the optimizer never sets a gate's protection, and a protected bar only rises", () => {
+    const workflow = (judge: string) => `name: w
+target: workflow
+model: m
+steps:
+  - name: draft
+    instructions: Draft it.
+  - name: gate
+    kind: judge
+    judge:
+      criteria: is it right
+      threshold: 0.7
+${judge}`;
+    type Step = Record<string, unknown>;
+    const steps = (yaml: string, judge: (j: Step) => Step, draft?: (s: Step) => Step): unknown =>
+      (parseSpec(yaml) as unknown as { steps: Step[] }).steps.map((s) =>
+        s["name"] === "gate"
+          ? { ...s, judge: judge(s["judge"] as Step) }
+          : draft !== undefined
+            ? draft(s)
+            : s,
+      );
+    const refused = (yaml: string, value: unknown): void => {
+      expect(() =>
+        validatePatch(parseSpec(yaml), {
+          target: "workflow",
+          path: ["steps"],
+          op: "replace",
+          value,
+        }),
+      ).toThrow();
+      expect(() =>
+        applySpecEdits(yaml, [{ path: ["steps"], value }], { restrictToOptimizable: true }),
+      ).toThrow();
+    };
+    const admitted = (yaml: string, value: unknown): void => {
+      expect(() =>
+        validatePatch(parseSpec(yaml), {
+          target: "workflow",
+          path: ["steps"],
+          op: "replace",
+          value,
+        }),
+      ).not.toThrow();
+      expect(() =>
+        applySpecEdits(yaml, [{ path: ["steps"], value }], { restrictToOptimizable: true }),
+      ).not.toThrow();
+    };
+    const open = workflow("");
+    refused(
+      open,
+      steps(open, (j) => ({ ...j, protected: true })),
+    );
+    const guarded = workflow("      protected: true\n");
+    refused(
+      guarded,
+      steps(guarded, (j) => ({ ...j, threshold: 0.5 })),
+    );
+    admitted(
+      guarded,
+      steps(guarded, (j) => ({ ...j, threshold: 0.9 })),
+    );
+    admitted(
+      guarded,
+      steps(
+        guarded,
+        (j) => j,
+        (s) => ({ ...s, instructions: "Draft it carefully." }),
+      ),
+    );
+    const bullet = bulletFor("A protected quality bar only tightens");
+    for (const key of ["`evaluation.protected`", "`provability.protected`", "`judge.protected`"]) {
+      expect(bullet).toContain(key);
+    }
+  });
+
+  test("an eval judge with no credentials leaves its case not measured, called once", async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-judge-auth-")));
+    try {
+      let calls = 0;
+      const result = await runSample({
+        sample: { id: "a", input: "q", expected_output: "a" },
+        invoker: async () => ({ agentOutput: "a" }),
+        graders: [
+          {
+            name: "judge",
+            grader: async () => {
+              calls += 1;
+              throw new ProviderAuthError("anthropic", "no Anthropic credentials found");
+            },
+          },
+        ],
+        outDir: dir,
+        model: "m",
+      });
+      expect(calls).toBe(1);
+      expect(result.graderError).toBeUndefined();
+      expect(result.grades.perGrader[0]?.status).toBe("not_measured");
+      expect(result.grades.perGrader[0]?.statusReason).toBe("no_judge_credentials");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("An eval judge with no credentials");
+    expect(bullet).toContain("`no_judge_credentials`");
+    expect(bullet).toContain("`eval --gate`");
+  });
+
+  test("a retried step or node gets its judge's feedback as a screened user message", () => {
+    const WORKFLOW = `name: w
+target: workflow
+model: m
+steps:
+  - name: draft
+    instructions: Draft it.
+  - name: gate
+    kind: judge
+    judge:
+      criteria: is it right
+      on_fail: retry_previous
+`;
+    const GRAPH = `name: g
+target: graph
+model: m
+entry: draft
+nodes:
+  draft:
+    instructions: Draft it.
+  gate:
+    kind: judge
+    judge:
+      criteria: is it right
+      on_fail: retry_previous
+edges:
+  - { from: draft, to: gate }
+`;
+    const agentOf = (yaml: string): string =>
+      compile(yaml).files.find((f) => f.path.endsWith("agent.ts"))?.content ?? "";
+    const workflow = agentOf(WORKFLOW);
+    const graph = agentOf(GRAPH);
+    for (const code of [workflow, graph]) {
+      expect(code.length).toBeGreaterThan(0);
+      expect(code).not.toMatch(/instructions: [^\n]*__nudge/);
+    }
+    expect(workflow).toContain('import { admitJudgeFeedback } from "@crewhaus/runtime-core";');
+    expect(graph).toContain(
+      'import { admitJudgeFeedback, withoutJudgeRationale } from "@crewhaus/runtime-core";',
+    );
+    // The retried node's upstream state leaves the judge's rationale out, so
+    // the screened feedback is the only copy it reads.
+    const draftBody = graph.slice(
+      graph.indexOf('.addNode("draft"'),
+      graph.indexOf('.addNode("gate"'),
+    );
+    expect(draftBody.length).toBeGreaterThan(0);
+    expect(draftBody).toContain('const __seedState = withoutJudgeRationale(prev, ["gate"]);');
+    expect(draftBody).toContain("${JSON.stringify(__seedState, null, 2)}");
+    expect(draftBody).not.toContain("JSON.stringify(prev");
+    // The feedback joins the step's input, or the node's upstream state, in a user seed message.
+    expect(workflow).toContain(
+      'content: __nudge === "" ? __step1Input : __step1Input + "\\n\\n" + __nudge,',
+    );
+    expect(graph).toContain('+ (__nudge !== "" ? "\\n\\n" + __nudge : "") },');
+    expect(workflow).toContain(
+      'await admitJudgeFeedback(__runContext, __result.rationale, "rationale")',
+    );
+    expect(graph).toContain(
+      'await admitJudgeFeedback(ctx.runContext, __rec?.rationale, "rationale")',
+    );
+    const bullet = bulletFor("receives its judge's feedback as a user message");
+    expect(bullet).toContain("`on_fail: retry_previous`");
+    expect(bullet).toContain("score alone");
+    expect(bullet).toContain("not the rationale");
   });
 });
 

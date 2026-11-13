@@ -90,7 +90,7 @@ import { join } from "node:path";
 import { GraderError } from "@crewhaus/eval-grader";
 import type { GradeResult, Grader, RunResult, Sample } from "@crewhaus/eval-grader";
 import type { JudgeUsageSink } from "@crewhaus/eval-judge";
-import { GraderRegistry, discoverPluginGraders } from "@crewhaus/grader-registry";
+import { type GraderMeta, GraderRegistry, discoverPluginGraders } from "@crewhaus/grader-registry";
 import { z } from "zod";
 import {
   CALIBRATION_ABSTENTION_GRADER,
@@ -572,6 +572,12 @@ export async function defaultGraderRegistry(
     packOptsFactory(CalibrationAbstentionOptsSchema, calibrationAbstentionAware),
   );
 
+  // Every built-in name declares its kind and whether a recorded run can be
+  // graded with it again. Plugins, discovered next, replace what they take over.
+  for (const name of registry.list()) {
+    registry.upsert(name, registry.lookup(name), builtinGraderMeta(name));
+  }
+
   const pluginRoot = opts.pluginRoot ?? join(opts.cwd ?? process.cwd(), ".crewhaus", "graders");
   registry.markPluginNames(
     await discoverPluginGraders(registry, pluginRoot, (name, modulePath) =>
@@ -580,6 +586,40 @@ export async function defaultGraderRegistry(
   );
 
   return registry;
+}
+
+/** Built-in names whose verdict comes from a model call (a judge, an embedder, OCR, speech). */
+const MODEL_BACKED = new Set([
+  "semantic.similarity",
+  "safety.toxicity",
+  "safety.bias",
+  "multimodal.imageOcrThenGrade",
+  "multimodal.audioTranscriptMatch",
+]);
+
+/**
+ * Built-in names that read something a recorded run does not keep: session
+ * files and state under the case's directory (`continuity.*`), an image the
+ * agent produced (`multimodal.*`), or the case's own wall-clock time.
+ */
+const READS_MORE_THAN_RECORDED = (name: string): boolean =>
+  name.startsWith("continuity.") ||
+  name.startsWith("multimodal.") ||
+  name === "twelve.p99LatencyMs";
+
+/**
+ * What a built-in grader of the default registry declares: `provability.*`
+ * are proof checks, the judge-, embedder- and OCR-backed packs are `model`,
+ * the rest `deterministic`; each is regradable unless it reads more than the
+ * sample, the answer, the transcript, the trace events and the proof bundle.
+ */
+export function builtinGraderMeta(name: string): GraderMeta {
+  const kind = name.startsWith("provability.")
+    ? "proof"
+    : MODEL_BACKED.has(name)
+      ? "model"
+      : "deterministic";
+  return { kind, regradable: !READS_MORE_THAN_RECORDED(name) };
 }
 
 /**

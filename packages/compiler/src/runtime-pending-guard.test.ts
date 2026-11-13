@@ -303,7 +303,8 @@ const CASCADE: ReadonlyArray<
     (b) =>
       b.includes("const __runStep1 = async (__nudge: string, __force?: string)") &&
       b.includes("...(__force !== undefined ? { forcedCandidate: __force } : {}),") &&
-      b.includes('+ __result.rationale, "strong");'),
+      // The forced re-run carries the screened judge feedback beside the rung.
+      b.includes(': __header, "strong");'),
   ],
 ];
 

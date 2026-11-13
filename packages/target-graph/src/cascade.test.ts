@@ -77,8 +77,9 @@ describe("emitGraph — judge.escalate_to forces the retry_previous re-run", () 
     expect(draftBody).toContain(
       "        ...(__force !== undefined ? { forcedCandidate: __force } : {}),",
     );
-    // The nudge machinery still rides beside it.
-    expect(draftBody).toContain('instructions: "Write the report." + __nudge,');
+    // The feedback machinery still rides beside it.
+    expect(draftBody).toContain('instructions: "Write the report.",');
+    expect(draftBody).toContain('"\\n\\n" + __nudge');
     // Nodes no judge retries carry neither.
     const publishBody = c.slice(c.indexOf('.addNode("publish"'), c.indexOf(".addEdge("));
     expect(publishBody).not.toContain("__force");
@@ -88,7 +89,8 @@ describe("emitGraph — judge.escalate_to forces the retry_previous re-run", () 
     const c = emitGraph(graph()).files[0]?.content ?? "";
     expect(c).not.toContain("__force");
     expect(c).not.toContain("forcedCandidate");
-    expect(c).toContain('instructions: "Write the report." + __nudge,');
+    expect(c).toContain('instructions: "Write the report.",');
+    expect(c).toContain('"\\n\\n" + __nudge');
   });
 });
 

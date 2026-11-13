@@ -53,9 +53,10 @@ import {
  *     on the judge step's resolved `model`.
  *   - Every scoring pass publishes a `judge_verdict` trace event on the
  *     bundle's shared RunContext bus and prints a `[judge <name>]` line.
- *   - `on_fail: retry_previous` re-runs the gated step with the judge
- *     rationale appended to its instructions as a system nudge, at most
- *     `maxRetries` times; a still-failing gate then stops the run
+ *   - `on_fail: retry_previous` re-runs the gated step with the judge's
+ *     feedback as a user message after its input — the rationale screened
+ *     at the consult boundary first, the score alone when the screen blocks
+ *     it — at most `maxRetries` times; a still-failing gate then stops the run
  *     CLASSIFIED (fail-closed — the loop projection's outgoing edge only
  *     fires on "pass"). `halt` stops classified immediately; `continue`
  *     records the verdict and proceeds with the flagged output.
@@ -366,14 +367,20 @@ function renderGatedStep(
   // ── Step ${stepNum}/${total}: ${step.name} ──
 ${deadlineGuard}${stdinReadLine}  process.stdout.write(${escapeJsonString(`\n[step ${stepNum}/${total}: ${step.name}]\n`)});
   // Judge-gated (loop contract 0.4, G02): input captured up front, call
-  // wrapped in a closure so the gate can re-run this step with the judge
-  // rationale appended as a nudge (bounded by the judge's max_retries).
+  // wrapped in a closure so the gate can re-run this step with its judge's
+  // screened feedback in the user message, after the input (bounded by the
+  // judge's max_retries). One message, so every provider takes it.
   const __step${stepNum}Input = ${inputExpr};
   const __runStep${stepNum} = async (__nudge: string${forceParam}): Promise<string> => runChatLoop({
     model: ${escapeJsonString(step.model)},
-    instructions: ${escapeJsonString(step.instructions)} + __nudge,
+    instructions: ${escapeJsonString(step.instructions)},
     singleTurn: true,
-    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${hybridFields}${forceField}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}${shared.sandboxField}
+    seedMessages: [
+      {
+        role: "user",
+        content: __nudge === "" ? __step${stepNum}Input : __step${stepNum}Input + "\\n\\n" + __nudge,
+      },
+    ],${toolsField}${stepTuningFields}${modelFailoverFields}${hybridFields}${forceField}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}${shared.sandboxField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
@@ -389,8 +396,8 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write(${escapeJsonString(`\n[st
  * `judge_verdict` trace event per scoring pass, prints a `[judge <name>]`
  * line, then applies the resolved `onFail`:
  *
- *   - `retry_previous`: re-invoke the gated step's closure with the
- *     rationale nudge, at most `maxRetries` times; retries exhausted with
+ *   - `retry_previous`: re-invoke the gated step's closure with the judge's
+ *     screened feedback, at most `maxRetries` times; retries exhausted with
  *     the gate still failing stops the run classified (fail-closed — the
  *     projection's outgoing edge fires only on "pass").
  *   - `halt`: publish `run_failed` (the graph-engine G69 convention) and
@@ -477,7 +484,10 @@ ${deadlineGuard}  process.stdout.write(${escapeJsonString(`\n[step ${stepNum}/${
     ].join("\n");
 
   if (gate.onFail === "retry_previous") {
-    const nudgeExpr = `${escapeJsonString(`\n\n[judge feedback — the previous attempt failed the "${step.name}" gate (score `)} + __result.score.toFixed(2) + ${escapeJsonString(` < threshold ${gate.threshold})]:\n`)} + __result.rationale`;
+    // The re-run gets the judge's feedback as a user message: the header is
+    // this emitter's own text, and the rationale (model output) joins it only
+    // once it passes the consult screen; otherwise the score alone is sent.
+    const headerExpr = `${escapeJsonString(`[judge feedback — the previous attempt failed the "${step.name}" gate (score `)} + __result.score.toFixed(2) + ${escapeJsonString(` < threshold ${gate.threshold})]`)}`;
     // 0.6.0 §7.3 — `escalate_to` forces the re-run onto the named roster arm
     // (the gated step's closure gained the `__force` parameter for it).
     const forceArg = gate.escalateTo !== undefined ? `, ${escapeJsonString(gate.escalateTo)}` : "";
@@ -495,7 +505,9 @@ ${throwBlock(
       }
       __retries += 1;
       process.stdout.write(${escapeJsonString(`[judge ${step.name}] retry `)} + __retries + ${escapeJsonString(`/${gate.maxRetries} of step ${gatedNum}/${total}: ${gated.name}\n`)});
-      priorOutput = await __runStep${gatedNum}(${nudgeExpr}${forceArg});
+      const __feedback = await admitJudgeFeedback(__runContext, __result.rationale, "rationale");
+      const __header = ${headerExpr};
+      priorOutput = await __runStep${gatedNum}(__feedback.kind === "admitted" ? __header + ":\\n" + __feedback.text : __header${forceArg});
     }
   }
 `;
@@ -1143,12 +1155,16 @@ const __durableStep = (name: string, fn: () => Promise<string>): Promise<string>
   const errorsMembers = hasThrowingJudges
     ? "EXIT_CODES, RunFailedError, formatRunFailure, toFailureReport"
     : "formatRunFailure, toFailureReport";
+  // A retry_previous gate screens its judge's feedback before the re-run.
+  const hasRetryJudges = ir.steps.some(
+    (s) => isJudgeStep(s) && s.judge !== undefined && s.judge.onFail === "retry_previous",
+  );
   const judgeImports = hasJudges
     ? `import { ${errorsMembers} } from "@crewhaus/errors";
 ${JUDGE_PANEL_IMPORT}
 import { createRunContext } from "@crewhaus/run-context";
 import { attachRunEventSink } from "@crewhaus/runtime-core";
-import type { TraceEventBus } from "@crewhaus/trace-event-bus";
+${hasRetryJudges ? 'import { admitJudgeFeedback } from "@crewhaus/runtime-core";\n' : ""}import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 `
     : "";
   // Cluster S — the eval-entry variant always mints/accepts a RunContext, so

@@ -790,6 +790,12 @@ export const EVAL_SCHEMA: ParseArgsSchema = {
     { name: "rebaseline", takesValue: false },
     { name: "reason", takesValue: true },
     { name: "help", short: "h" },
+    // Grade a recorded run's answers again with this graders file
+    // (`--regrade <runId>`), never gated or pinned; and gate against the
+    // baseline's answers regraded when its instrument changed
+    // (`--regrade-baseline`).
+    { name: "regrade", takesValue: true },
+    { name: "regrade-baseline", takesValue: false },
   ],
 };
 

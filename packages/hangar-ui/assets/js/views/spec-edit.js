@@ -1320,7 +1320,15 @@ function gradersCard(ctx, body, confirmName, reload) {
       confirmName,
       action: "Write the file",
       onConfirm: async () => {
-        const res = await api.graderWrite({ id: ctx.id }, { yaml: editor.value, confirmName });
+        // The revision this pane was loaded from: a file changed since is refused.
+        const res = await api.graderWrite(
+          { id: ctx.id },
+          {
+            yaml: editor.value,
+            confirmName,
+            ...(typeof body.hash === "string" ? { expectedRev: body.hash } : {}),
+          },
+        );
         if (reportWrite(res, "Wrote eval/graders.yaml")) reload();
       },
     });
@@ -1329,7 +1337,7 @@ function gradersCard(ctx, body, confirmName, reload) {
     collapsible([el("span", { class: "muted", text: "edit graders.yaml" })], [editor, save]),
     el("p", {
       class: "muted",
-      text: "The structured grader builder ships as a published package this manager does not bundle; the YAML pane above is the write path it has.",
+      text: "Saving checks the file still matches what you loaded and that it is a valid graders file.",
     }),
     el("p", { class: "muted" }, [
       el("span", { text: "Render the rubric card with " }),

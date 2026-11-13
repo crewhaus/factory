@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runCorpusEval } from "./__test__/eval-corpus";
 import { logLine, makeFixtureHarness } from "./fixture";
@@ -284,6 +284,59 @@ describe("eval routes", () => {
     const runs = (await t.api(`/api/h/${id}/evals`)).body["runs"] as Array<Record<string, unknown>>;
     expect(runs[0]?.["pinRefusal"]).toBe("Every case errored, so it can't be a baseline.");
   }, 20_000); // loads the whole eval runner
+
+  test("a pin over a changed protected criterion asks the owner, and records it when confirmed", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "guarded"), { specName: "guarded" });
+    const id = await register(t, dir);
+    const evalsDir = join(dir, ".crewhaus", "evals");
+    mkdirSync(evalsDir, { recursive: true });
+    const row = (runId: string, digest: string) => ({
+      runId,
+      specName: "guarded",
+      specHash: "h",
+      datasetName: "smoke",
+      datasetHash: "d",
+      passRate: 1,
+      meanScore: 1,
+      sampleCount: 1,
+      protectedCriteria: [{ id: "dates", digest }],
+      ts: "2026-11-01T00:00:00.000Z",
+      outDir: join(evalsDir, runId),
+    });
+    const old = row("run_00000000000000e1", "d1");
+    writeFileSync(
+      join(evalsDir, "index.jsonl"),
+      `${JSON.stringify(old)}\n${JSON.stringify(row("run_00000000000000e2", "d2"))}\n`,
+    );
+    const { passRate: _p, meanScore: _m, sampleCount: _n, specHash: _h, ...pin } = old;
+    const pins = JSON.stringify({ "guarded::smoke": pin });
+    writeFileSync(join(evalsDir, "baselines.json"), pins);
+    const post = (body: Record<string, unknown>) =>
+      t.api(`/api/h/${id}/evals/baseline`, { method: "POST", body: JSON.stringify(body) });
+
+    const asked = await post({ runId: "run_00000000000000e2" });
+    expect(asked.status).toBe(409);
+    expect(asked.body["needs"]).toBe("h.spec.edit.security");
+    expect(asked.body["confirmName"]).toBe("guarded");
+    expect(String(asked.body["error"])).toContain(
+      "protected criterion dates is measured differently",
+    );
+    expect(readFileSync(join(evalsDir, "baselines.json"), "utf8")).toBe(pins);
+    const wrong = await post({ runId: "run_00000000000000e2", confirmName: "other" });
+    expect(wrong.status).toBe(409);
+    expect(readFileSync(join(evalsDir, "baselines.json"), "utf8")).toBe(pins);
+
+    const confirmed = await post({ runId: "run_00000000000000e2", confirmName: "guarded" });
+    expect(confirmed.status).toBe(200);
+    const baseline = confirmed.body["baseline"] as Record<string, unknown>;
+    expect(baseline["runId"]).toBe("run_00000000000000e2");
+    expect(baseline["rebaselined"]).toMatchObject({
+      from: "run_00000000000000e1",
+      cmd: "hangar",
+      protectedChange: true,
+    });
+  });
 
   test("history rows newest-first + baselines; run view; per-sample artifacts", async () => {
     const t = boot();

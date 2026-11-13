@@ -67,6 +67,7 @@ import {
   diffSpecYaml,
   humanOwnedReason,
   isOptimizable,
+  protectedBarChange,
   specHasPath,
   validatePatch,
   withPatchApplied,
@@ -377,21 +378,35 @@ export function ownedLeafChange(
 ): OwnedLeaf | undefined {
   const after = withPatchApplied(document, path, op, value);
   const refusal = admitBlockPatch(target, document, after, path, { leafRule: modelTurnLeafRule });
-  return refusal === undefined
-    ? undefined
-    : { leaf: ownedName(refusal.path, path), reason: refusal.reason, rule: refusal.rule };
+  if (refusal !== undefined) {
+    return { leaf: ownedName(refusal.path, path), reason: refusal.reason, rule: refusal.rule };
+  }
+  return protectedLoosening(document, after);
 }
 
-/** The human-owned leaf two whole documents differ on, if any. */
+/**
+ * The human-owned leaf two whole documents differ on, if any, and a protected
+ * bar the second loosens: a batch of patches that each pass on their own may
+ * not lower a protected bar together.
+ */
 export function ownedLeafDrift(
   before: unknown,
   after: unknown,
   target: Spec["target"],
 ): OwnedLeaf | undefined {
   const refusal = admitBlockPatch(target, before, after, [], { leafRule: modelTurnLeafRule });
-  return refusal === undefined
+  if (refusal !== undefined) {
+    return { leaf: ownedName(refusal.path, []), reason: refusal.reason, rule: refusal.rule };
+  }
+  return protectedLoosening(before, after);
+}
+
+/** A protected bar `after` loosens, as the setting a refusal names. */
+function protectedLoosening(before: unknown, after: unknown): OwnedLeaf | undefined {
+  const loosened = protectedBarChange(before, after);
+  return loosened === undefined
     ? undefined
-    : { leaf: ownedName(refusal.path, []), reason: refusal.reason, rule: refusal.rule };
+    : { leaf: loosened.key, reason: loosened.reason, rule: "refused-leaf" };
 }
 
 /** What a model-turn patch would move: the setting it names, why, and which rule refused it. */

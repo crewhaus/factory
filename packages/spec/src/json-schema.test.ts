@@ -294,6 +294,8 @@ describe("specJsonSchema — document structure", () => {
         "execution",
         "formal",
         "judge",
+        // the owner's editing policy for the block (#514)
+        "protected",
       ].sort(),
     );
     // Every leaf carries a description (the VS Code forms read them), and
