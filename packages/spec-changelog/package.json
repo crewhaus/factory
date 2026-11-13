@@ -7,6 +7,7 @@
   "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./proposal": "./src/proposal.ts",
     "./spec-changelog": "./src/spec-changelog.ts",
     "./upgrade": "./src/upgrade.ts"
   },

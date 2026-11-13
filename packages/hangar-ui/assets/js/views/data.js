@@ -4,8 +4,8 @@
  * Rules the screen carries rather than hides: a verify MISMATCH means
  * TAMPERED (not stale); `<spec>-ratings` and `<spec>-regressions` are
  * auto-maintained and invite no hand edit the next distill would overwrite;
- * held-out test cases stay out of normal runs, and only `crewhaus datasets
- * release` records a use;
+ * held-out cases stay out of normal runs, and every run that reads them is
+ * counted;
  * and quarantined samples appear beside the registry with their provenance,
  * because a quarantined sample nobody can see is a bug nobody can file.
  *
@@ -113,12 +113,16 @@ async function call(fn, params, body) {
   }));
 }
 
-/** Split sizes as one string, with the locked holdout marked. */
+/** Split sizes as one string, with the locked held-out splits marked. */
 function splitsText(splits) {
   if (!splits) return "—";
   const test =
     splits.test === null || splits.test === undefined ? "no test" : `${splits.test} test 🔒`;
-  return `${fmtCount(splits.train)} train · ${fmtCount(splits.dev)} dev · ${test}`;
+  const holdout =
+    splits.holdout === null || splits.holdout === undefined
+      ? ""
+      : ` · ${fmtCount(splits.holdout)} holdout 🔒`;
+  return `${fmtCount(splits.train)} train · ${fmtCount(splits.dev)} dev · ${test}${holdout}`;
 }
 
 /** Provenance is a TAXONOMY — render the tally, not a free-text note. */
@@ -175,15 +179,12 @@ function registryCard(ctx, res, reload) {
       ]),
     );
     card.appendChild(
-      table(
-        ["Dataset", "Latest", "Splits", "Provenance", "Verify", "Test-split releases", ""],
-        rows,
-      ),
+      table(["Dataset", "Latest", "Splits", "Provenance", "Verify", "Test-split uses", ""], rows),
     );
     card.appendChild(
       el("p", {
         class: "muted",
-        text: "Held-out test cases stay out of normal runs. Only crewhaus datasets release records a use.",
+        text: "Held-out cases stay out of normal runs. Every run that reads them is counted.",
       }),
     );
   });
@@ -208,7 +209,7 @@ function detailBtn(ctx, name) {
     }
     holder.appendChild(
       table(
-        ["Version", "Created", "Splits", "Verify", "Releases"],
+        ["Version", "Created", "Splits", "Verify", "Test-split uses"],
         (data.versions ?? []).map((v) =>
           el("tr", null, [
             el("td", { class: "mono", text: String(v.version) }),

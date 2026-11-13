@@ -22,6 +22,12 @@ const DEP = "dep_01m76e6f05hp514w9j4v3qymka";
 const PEOPLE = { psn: mintId("psn"), pcl: mintId("pcl"), kind: "personal", area: "communication" };
 
 const RULE_ID = mintId("rule");
+const QUALITY = {
+  chg: mintId("chg"),
+  rev: `sha256:${"ab".repeat(32)}`,
+  dataset: "support-cases",
+  evalRun: "run_0123456789abcdef",
+};
 
 const SAMPLES = [
   {
@@ -34,6 +40,9 @@ const SAMPLES = [
     verdict: "keep",
     supersedeReason: "decided-in-error",
     rule: RULE_ID,
+    ...QUALITY,
+    changeReason: "not-worth-it",
+    fraction: "0.2",
   },
   {
     hrn: HRN,
@@ -45,6 +54,9 @@ const SAMPLES = [
     verdict: "reject",
     supersedeReason: "other",
     rule: RULE_ID,
+    ...QUALITY,
+    changeReason: "other",
+    fraction: ".5",
   },
 ];
 
@@ -159,8 +171,36 @@ test("the placeholders, pinned, with empty flags", () => {
     "{verdict}",
     "{supersedeReason}",
     "{rule}",
+    "{chg}",
+    "{rev}",
+    "{changeReason}",
+    "{dataset}",
+    "{fraction}",
+    "{evalRun}",
   ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
+});
+
+test("the quality placeholders take their ids and closed values, nothing else", () => {
+  const grammar = TWIN_PLACEHOLDERS as Readonly<Record<string, RegExp>>;
+  const holds = (token: string, value: string) => (grammar[token] as RegExp).test(value);
+  expect(holds("{chg}", QUALITY.chg)).toBe(true);
+  expect(isId("chg", QUALITY.chg)).toBe(true);
+  expect(holds("{chg}", "chg_x")).toBe(false);
+  expect(holds("{rev}", QUALITY.rev)).toBe(true);
+  expect(holds("{rev}", "sha256:AB")).toBe(false);
+  for (const ok of ["0.2", ".5", "0.5", "0.05", "0.4999"])
+    expect(holds("{fraction}", ok)).toBe(true);
+  for (const bad of ["0", "0.0", "0.6", "1", "-0.2", "0.51", ""]) {
+    expect(holds("{fraction}", bad)).toBe(false);
+  }
+  expect(holds("{dataset}", "-rm")).toBe(false);
+  expect(holds("{dataset}", "support-cases")).toBe(true);
+  // A reason the system records on its own is never one a command may claim.
+  for (const reason of ["base-moved", "instrument-changed", "regressed", "slo-rollback"]) {
+    expect(holds("{changeReason}", reason)).toBe(false);
+  }
+  expect(holds("{evalRun}", QUALITY.evalRun)).toBe(true);
 });
 
 test("{supersedeReason} is the reasons a person may give, and {rule} a rule id", () => {

@@ -1,0 +1,52 @@
+{
+  "name": "@crewhaus/quality-service",
+  "version": "0.8.2",
+  "type": "module",
+  "description": "Change records for a harness's spec, graders and cases: a held-out promotion check, adoption through a decision, and the watch after activation",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./criteria-history": "./src/criteria-history.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
+    "@crewhaus/dataset-ops": "workspace:*",
+    "@crewhaus/dataset-registry": "workspace:*",
+    "@crewhaus/eval-dataset": "workspace:*",
+    "@crewhaus/eval-grader": "workspace:*",
+    "@crewhaus/eval-ops": "workspace:*",
+    "@crewhaus/eval-report": "workspace:*",
+    "@crewhaus/eval-runner": "workspace:*",
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
+    "yaml": "^2.6.0"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/quality-service"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/quality-service#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

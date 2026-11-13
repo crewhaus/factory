@@ -48,6 +48,7 @@ import type {
   ExperimentOutcomeRecord,
   RegressionGate,
 } from "@crewhaus/canary-controller";
+import { measuredInBaseline } from "@crewhaus/eval-report";
 import type { EvalRunSummary } from "@crewhaus/eval-runner";
 import { sampleAbstained, sampleIsCanary, sampleWithoutVerdict } from "@crewhaus/eval-runner";
 import { type GateThresholds, gate } from "@crewhaus/regression-runner";
@@ -85,6 +86,42 @@ export class CanaryRampError extends Error {
   override readonly name = "CanaryRampError";
 }
 
+/** A candidate case with no verdict to count: not measured, skipped, only observed,
+ *  or abstained. */
+function candidateWithoutVerdict(s: EvalRunSummary["samples"][number]): boolean {
+  return sampleWithoutVerdict(s) || sampleAbstained(s);
+}
+
+/**
+ * The cases the control version measured that the candidate did not: held by both
+ * runs and left without a verdict by the candidate (not measured, skipped, only
+ * observed, or abstained), or left out of the candidate's run altogether. A step
+ * fails on any.
+ */
+export function casesLostByCandidate(control: EvalRunSummary, candidate: EvalRunSummary): string[] {
+  const controlById = new Map(control.samples.map((s) => [s.sampleId, s]));
+  const lost = candidate.samples
+    .filter((now) => {
+      const before = controlById.get(now.sampleId);
+      return before !== undefined && measuredInBaseline(before) && candidateWithoutVerdict(now);
+    })
+    .map((s) => s.sampleId);
+  return [...lost, ...casesAbsentFromCandidate(control, candidate)];
+}
+
+/** The cases the control version measured that the candidate's run leaves out. */
+function casesAbsentFromCandidate(control: EvalRunSummary, candidate: EvalRunSummary): string[] {
+  const held = new Set(candidate.samples.map((s) => s.sampleId));
+  return control.samples
+    .filter((s) => !held.has(s.sampleId) && measuredInBaseline(s))
+    .map((s) => s.sampleId);
+}
+
+/** The reason a step fails on cases the candidate did not measure. */
+export function lostMeasurementReason(ids: ReadonlyArray<string>): string {
+  return `cases the control version measured were not measured by the candidate: ${ids.join(", ")}`;
+}
+
 /**
  * Build the {@link RegressionGate} closure the controller calls at each step:
  * eval both versions with the injected `evalVersion`, then run the real
@@ -114,6 +151,9 @@ export function makeCanaryEvalGate(opts: {
         `candidate pass_rate=${(candidate.aggregates.passRate * 100).toFixed(1)}% ` +
         `p95=${candidate.aggregates.p95LatencyMs}ms`,
     );
+    // A step needs every case the control version measured.
+    const lost = casesLostByCandidate(baseline, candidate);
+    if (lost.length > 0) return { verdict: "fail", reason: lostMeasurementReason(lost) };
     if (verdict.verdict === "fail") {
       return { verdict: "fail", reason: verdict.reason ?? "regression gate failed" };
     }
@@ -140,6 +180,11 @@ export function makeCanaryEvalGate(opts: {
  * is precisely the "count a guess" behaviour A3 exists to forbid. A canary
  * tripwire is never a measurement of the spec at all, and a sample that was
  * not measured, skipped or only observed has no verdict to project either.
+ *
+ * With `control` (the control version's run over the same cases), a candidate
+ * case the control measured and the candidate did not (no verdict, abstained, or
+ * left out of the candidate's run) is projected as a `failure` with score 0: the
+ * candidate's success rate never rises from what it did not measure.
  */
 export function experimentOutcomesFromEvalRun(args: {
   readonly experiment: string;
@@ -147,18 +192,44 @@ export function experimentOutcomesFromEvalRun(args: {
   readonly summary: EvalRunSummary;
   /** Timestamp stamped on every record (one run = one observation batch). */
   readonly ts: string;
+  /** The control version's run, when this one is the candidate. */
+  readonly control?: EvalRunSummary;
 }): ExperimentOutcomeRecord[] {
-  return args.summary.samples
-    .filter((s) => !sampleAbstained(s) && !sampleIsCanary(s) && !sampleWithoutVerdict(s))
-    .map((s) => ({
+  const controlById = new Map((args.control?.samples ?? []).map((s) => [s.sampleId, s]));
+  const controlMeasured = (id: string): boolean => {
+    const s = controlById.get(id);
+    return s !== undefined && measuredInBaseline(s);
+  };
+  const record = (requestKey: string, lost: boolean, passed: boolean, score: number) =>
+    ({
       ts: args.ts,
       experiment: args.experiment,
       version: args.version,
-      outcome: s.grades.overall.passed ? "success" : "failure",
-      requestKey: s.sampleId,
-      score: s.grades.overall.score,
+      outcome: !lost && passed ? "success" : "failure",
+      requestKey,
+      score: lost ? 0 : score,
       source: "eval",
-    }));
+    }) as const;
+  const measured = args.summary.samples
+    .filter(
+      (s) => !sampleIsCanary(s) && (!candidateWithoutVerdict(s) || controlMeasured(s.sampleId)),
+    )
+    .map((s) =>
+      record(
+        s.sampleId,
+        candidateWithoutVerdict(s),
+        s.grades.overall.passed,
+        s.grades.overall.score,
+      ),
+    );
+  // A case the control measured that the candidate's run leaves out is its failure too.
+  const absent =
+    args.control === undefined
+      ? []
+      : casesAbsentFromCandidate(args.control, args.summary).map((id) =>
+          record(id, true, false, 0),
+        );
+  return [...measured, ...absent];
 }
 
 /**
@@ -267,9 +338,17 @@ export function makeTrafficSplitRecorder(opts: {
     finish(outcome) {
       guard("ledger write", () => {
         const ts = now();
+        const control = latest.get(opts.baselineVersion);
         for (const [version, summary] of latest) {
           opts.append(
-            experimentOutcomesFromEvalRun({ experiment: opts.experiment, version, summary, ts }),
+            experimentOutcomesFromEvalRun({
+              experiment: opts.experiment,
+              version,
+              summary,
+              ts,
+              // The candidate is projected against the control's measurement.
+              ...(version !== opts.baselineVersion && control !== undefined ? { control } : {}),
+            }),
             opts.dir,
           );
         }
@@ -492,6 +571,7 @@ export function makeRoutingAwareCanaryGate(opts: {
     const baseline = await opts.evalVersion(fromVersion);
     const candidate = await opts.evalVersion(toVersion);
     const verdict = gate(baseline, candidate, opts.thresholds ?? {});
+    const lost = casesLostByCandidate(baseline, candidate);
     const before = routingProfileOf(baseline, opts.priceUsd);
     const after = routingProfileOf(candidate, opts.priceUsd);
     write(
@@ -504,6 +584,8 @@ export function makeRoutingAwareCanaryGate(opts: {
         `p95=${candidate.aggregates.p95LatencyMs}ms escalation=${(after.escalationRate * 100).toFixed(1)}% ` +
         `$${after.costPerTurnUsd.toFixed(5)}/turn floor_blocked=${(after.floorBlockedRate * 100).toFixed(1)}%`,
     );
+    // A step needs every case the control version measured, before any routing delta.
+    if (lost.length > 0) return { verdict: "fail", reason: lostMeasurementReason(lost) };
     if (verdict.verdict === "fail") {
       return { verdict: "fail", reason: verdict.reason ?? "regression gate failed" };
     }

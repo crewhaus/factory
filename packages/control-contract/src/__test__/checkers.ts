@@ -425,7 +425,13 @@ export function checkOperations(rows: readonly OperationRow[], env: OperationEnv
     }
   }
   for (const kind of env.commandKinds) {
-    if (!rows.some((row) => row.id === kind.id)) problems.push(`${kind.id}: a kind with no row`);
+    const carried = rows.some((row) => row.id === kind.id);
+    if (!carried && kind.noRowReason === undefined) {
+      problems.push(`${kind.id}: a kind with no row`);
+    }
+    if (carried && kind.noRowReason !== undefined) {
+      problems.push(`${kind.id}: a kind with a row gives a reason for having none`);
+    }
   }
   return problems;
 }

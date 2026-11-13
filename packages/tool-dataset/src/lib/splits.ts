@@ -52,11 +52,13 @@ export type SplitMove = {
 };
 
 /** The record-shaped splits a `put` writes: train and dev always present,
- *  test present only when something is in it. */
+ *  test present only when something is in it, holdout only when the previous
+ *  version had one (its rows carried as they were). */
 export type PlannedSplits = {
   train: Sample[];
   dev: Sample[];
   test?: Sample[];
+  holdout?: Sample[];
 };
 
 export type SplitPlan = {
@@ -83,11 +85,20 @@ export type PlanSplitsOptions = {
   readonly previous?: ReadonlyMap<string, DatasetSplit>;
   readonly mode: SplitMode;
   /** Put every sample in this one split instead of splitting (the CLI's
-   *  `--split` flag). Stability is trivial here and still measured. */
-  readonly singleSplit?: DatasetSplit;
+   *  `--split` flag). Stability is trivial here and still measured. Never
+   *  `holdout`: a holdout is cut by a person, through `crewhaus datasets`. */
+  readonly singleSplit?: Exclude<DatasetSplit, "holdout">;
+  /** The previous version's holdout rows. They are carried into the new
+   *  version exactly as they were, in their order, and never assigned,
+   *  moved, listed or reported by id; an incoming sample whose id is held
+   *  out is left out of the plan (the held-out row stays). */
+  readonly heldOut?: ReadonlyArray<Sample>;
 };
 
-const SPLIT_ORDER: ReadonlyArray<DatasetSplit> = ["train", "dev", "test"];
+const SPLIT_ORDER: ReadonlyArray<DatasetSplit> = ["train", "dev", "test", "holdout"];
+
+/** The splits a plan assigns rows to: the holdout is only ever carried. */
+const ASSIGNED_SPLITS: ReadonlyArray<Exclude<DatasetSplit, "holdout">> = ["train", "dev", "test"];
 
 export function planSplits(opts: PlanSplitsOptions): SplitPlan {
   const previous = opts.previous ?? new Map<string, DatasetSplit>();
@@ -99,30 +110,32 @@ export function planSplits(opts: PlanSplitsOptions): SplitPlan {
   for (const id of previous.keys()) previousRank.set(id, previousRank.size);
 
   const assignment = new Map<string, DatasetSplit>();
-  const buckets: Record<DatasetSplit, Sample[]> = { train: [], dev: [], test: [] };
+  const buckets: Record<DatasetSplit, Sample[]> = { train: [], dev: [], test: [], holdout: [] };
   let carriedForward = 0;
   let newlyAssigned = 0;
+  const heldOutIds = new Set((opts.heldOut ?? []).map((s) => s.id));
+  const incoming = opts.samples.filter((s) => !heldOutIds.has(s.id));
 
   if (opts.singleSplit !== undefined) {
-    for (const s of opts.samples) {
+    for (const s of incoming) {
       assignment.set(s.id, opts.singleSplit);
       buckets[opts.singleSplit].push(s);
       if (previous.has(s.id)) carriedForward += 1;
       else newlyAssigned += 1;
     }
   } else if (opts.mode === "recompute") {
-    const fresh = splitSamples(opts.samples, opts.spec);
-    for (const split of SPLIT_ORDER) {
+    const fresh = splitSamples(incoming, opts.spec);
+    for (const split of ASSIGNED_SPLITS) {
       for (const s of fresh[split]) {
         assignment.set(s.id, split);
         buckets[split].push(s);
       }
     }
-    newlyAssigned = opts.samples.length;
+    newlyAssigned = incoming.length;
   } else {
     const carried: Sample[] = [];
     const fresh: Sample[] = [];
-    for (const s of opts.samples) (previous.has(s.id) ? carried : fresh).push(s);
+    for (const s of incoming) (previous.has(s.id) ? carried : fresh).push(s);
     carriedForward = carried.length;
     newlyAssigned = fresh.length;
     for (const s of carried) {
@@ -137,7 +150,7 @@ export function planSplits(opts: PlanSplitsOptions): SplitPlan {
       buckets[split].sort((a, b) => (previousRank.get(a.id) ?? 0) - (previousRank.get(b.id) ?? 0));
     }
     const assigned = splitSamples(fresh, opts.spec);
-    for (const split of SPLIT_ORDER) {
+    for (const split of ASSIGNED_SPLITS) {
       for (const s of assigned[split]) {
         assignment.set(s.id, split);
         buckets[split].push(s);
@@ -161,6 +174,8 @@ export function planSplits(opts: PlanSplitsOptions): SplitPlan {
   // 80/20` — a silent deletion disguised as a split change.
   const splits: PlannedSplits = { train: buckets.train, dev: buckets.dev };
   if (opts.spec.test > 0 || buckets.test.length > 0) splits.test = buckets.test;
+  // The holdout travels as it was: never recomputed, never moved.
+  if (opts.heldOut !== undefined && opts.heldOut.length > 0) splits.holdout = [...opts.heldOut];
 
   return { splits, assignment, carriedForward, newlyAssigned, moved, dropped };
 }
@@ -171,5 +186,6 @@ export function splitCounts(splits: PlannedSplits): Record<string, number> {
     train: splits.train.length,
     dev: splits.dev.length,
     ...(splits.test !== undefined ? { test: splits.test.length } : {}),
+    ...(splits.holdout !== undefined ? { holdout: splits.holdout.length } : {}),
   };
 }

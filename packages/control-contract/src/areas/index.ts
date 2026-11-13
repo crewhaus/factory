@@ -28,7 +28,7 @@ import type { AreaModule } from "./types.js";
 
 import { PEOPLE_MODULE } from "./people.js";
 
-// import { QUALITY_MODULE } from "./quality.js";
+import { QUALITY_MODULE } from "./quality.js";
 
 // import { RUNTIME_MODULE } from "./runtime.js";
 
@@ -55,7 +55,7 @@ export const AREA_MODULES = [
 
   PEOPLE_MODULE,
 
-  // QUALITY_MODULE,
+  QUALITY_MODULE,
 
   // RUNTIME_MODULE,
 

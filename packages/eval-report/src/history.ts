@@ -319,6 +319,8 @@ export type BaselineEntry = {
      * gone, or cases inside its scope are) and the harness's owner allowed it.
      */
     readonly protectedChange?: true;
+    /** The command receipt (`cmd_…`) the re-anchor was made under. */
+    readonly receipt?: string;
   };
   /** ISO-8601 timestamp of when the pin was written. */
   readonly ts: string;

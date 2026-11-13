@@ -206,6 +206,8 @@ export const LEGACY_VERBS: readonly LegacyVerb[] = deepFreeze<LegacyVerb[]>([
       status: null,
       release: null,
       card: null,
+      holdout: null,
+      uses: null,
     },
     subCheckedBy: "handler",
   },

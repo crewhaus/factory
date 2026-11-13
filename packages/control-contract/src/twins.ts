@@ -5,6 +5,7 @@
  * a command line back to its params, so one type serves both directions.
  */
 import { OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
+import { PERSON_CHANGE_REASONS } from "./areas/quality.js";
 import type { CliTwin } from "./areas/types.js";
 import { APPROVAL_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
 import { deepFreeze } from "./util.js";
@@ -30,6 +31,9 @@ export const CLI_VERBS = deepFreeze({
     "activity",
     "erase",
   ],
+  changes: ["check", "adopt", "decline", "withdraw", "rollback"],
+  datasets: ["holdout"],
+  "eval-report": ["baseline"],
 } as const);
 
 /**
@@ -41,7 +45,11 @@ export const CLI_VERBS = deepFreeze({
  * read as a flag. `{psn}` and `{pcl}` are a profile's and a note's ids, `{kind}` a
  * profile kind, `{area}` a note's area and `{verdict}` a review that needs no
  * further argument. `{supersedeReason}` is one of the reasons a person may give to
- * supersede a decision, and `{rule}` a standing rule's id.
+ * supersede a decision, and `{rule}` a standing rule's id. `{chg}` is a change
+ * record's id, `{rev}` a content revision (`sha256:` and 64 hex), `{changeReason}`
+ * a reason a person may give to decline or withdraw a change, `{dataset}` a
+ * dataset name, `{fraction}` a holdout share above 0 and at most 0.5, and
+ * `{evalRun}` an eval run's id.
  */
 export const TWIN_PLACEHOLDERS = deepFreeze({
   "{hrn}": HARNESS_ID_RE,
@@ -57,6 +65,12 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{verdict}": /^(?:keep|reject|reopen)$/,
   "{supersedeReason}": new RegExp(`^(?:${OPERATOR_SUPERSEDE_REASONS.join("|")})$`),
   "{rule}": /^rule_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{chg}": /^chg_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{rev}": /^sha256:[0-9a-f]{64}$/,
+  "{changeReason}": new RegExp(`^(?:${PERSON_CHANGE_REASONS.join("|")})$`),
+  "{dataset}": /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/,
+  "{fraction}": /^0?\.(?!0+$)(?:[0-4][0-9]{0,3}|50{0,3})$/,
+  "{evalRun}": /^run_[0-9a-f]{16}$/,
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

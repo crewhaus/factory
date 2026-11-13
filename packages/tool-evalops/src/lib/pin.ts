@@ -36,6 +36,7 @@ import {
   manualRebaseline,
   pinFromIndexEntry,
   pinRun,
+  reanchorRefusal,
 } from "@crewhaus/eval-report";
 import { probeKind, resolveContained } from "@crewhaus/tool-safety/fs";
 import { type SafePath, workspaceRoot } from "../paths";
@@ -179,22 +180,23 @@ export function planPin(input: PlanInput): Loaded<PinPlan> {
         `${label} is pinned to a run measured with a protected criterion — only this harness's owner re-anchors it, with \`crewhaus eval --rebaseline --reason <code>\``,
       );
     }
+    // A pinned baseline is the bar every later run is gated against: removing it
+    // is a person's quality decision, made under a receipt, never an agent tool's.
+    if (previous !== undefined) {
+      return fail(
+        "refused",
+        `${label} is pinned to run ${previous.runId} — this tool never removes a pinned baseline. A person re-anchors it with \`crewhaus eval --rebaseline --reason <code>\`, or pins another run with \`crewhaus eval-report baseline set\``,
+      );
+    }
     return {
       ok: true,
       value: {
         ...base,
-        ...(previous !== undefined ? { previous } : {}),
-        warnings:
-          previous === undefined
-            ? [
-                ...warnings,
-                "nothing to clear — the file is unchanged, which is not the same as a pin having been removed",
-              ]
-            : [
-                ...warnings,
-                `clearing this pin leaves ${label} with no baseline: the next gate against it will pass because there is nothing to fail against`,
-              ],
-        changes: previous !== undefined,
+        warnings: [
+          ...warnings,
+          "nothing to clear — the file is unchanged, which is not the same as a pin having been removed",
+        ],
+        changes: false,
       },
     };
   }
@@ -211,14 +213,15 @@ export function planPin(input: PlanInput): Loaded<PinPlan> {
   // spec/dataset/arm strings only select which lineage is being operated on.
   // The pin carries the run's OWN timestamp, not the clock: a result that moves
   // because it was computed twice is not a result.
-  // A pin over a different instrument records the re-anchor, as the write
-  // below does.
+  // A pin over a different instrument would re-anchor the lineage: that is a
+  // person's quality decision, made under a receipt, so this tool refuses it and
+  // names the command. A run measured like the pin it replaces is pinned.
   const mark = manualRebaseline(previous, row, PIN_CMD);
+  if (mark !== undefined) return fail("refused", reanchorRefusal(row, previous).reason);
   // No owner check is offered here: a pin that changes a protected criterion
   // is refused, and the refusal names the command the owner uses.
   const pinned = pinFromIndexEntry(row, row.ts, {
     lineageKey: key,
-    ...(mark !== undefined ? { rebaselined: mark } : {}),
     ...(previous !== undefined ? { replaced: previous } : {}),
   });
   if (!pinned.ok) {
@@ -334,10 +337,16 @@ export function commitPin(
   }
   try {
     if (plan.action === "set" && plan.next !== undefined && row !== undefined) {
-      const pinned = pinRun(row, row.ts, dir.real, { lineageKey: plan.key, cmd: PIN_CMD });
+      const pinned = pinRun(row, row.ts, dir.real, {
+        lineageKey: plan.key,
+        cmd: PIN_CMD,
+        sameInstrumentOnly: true,
+      });
       if (!pinned.ok) {
         return fail(
-          pinned.refusal.code === "protected" ? "refused" : "bad-input",
+          pinned.refusal.code === "protected" || pinned.refusal.code === "reanchor"
+            ? "refused"
+            : "bad-input",
           pinned.refusal.reason,
         );
       }

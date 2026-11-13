@@ -176,6 +176,7 @@ export {
   type PinOwnerCheck,
   type PinRefusal,
   manualRebaseline,
+  reanchorRefusal,
   measurementProblem,
   pinFromIndexEntry,
   pinRefusal,

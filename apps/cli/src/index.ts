@@ -102,6 +102,7 @@ import {
   DEFAULT_SPLIT_SPEC,
   DatasetRefError,
   REGISTRY_PREFIX,
+  createHoldoutVersion,
   defaultDatasetsRoot,
   inspectRegistryRef,
   isDatasetSplit,
@@ -150,6 +151,7 @@ import {
   createFileBackedRegistry,
   latestVersion,
   overallDatasetHash,
+  readHeldOutUses,
   verifySplitHashes,
 } from "@crewhaus/dataset-registry";
 // Loop contract 0.4 (Batch A) — `memory.embedder`: the run path constructs
@@ -232,6 +234,7 @@ import {
   type BaselineEntry,
   type ExportRunInput,
   type LoadedRun,
+  type PinOutcome,
   type RunIndexEntry,
   buildExportRows,
   buildMatrix,
@@ -264,7 +267,9 @@ import {
   type GraderLookup,
   createExamRunner,
   defaultGraderRegistry,
+  generateRunId,
   parseEvalRoutingMode,
+  readRunManifest,
   resolveJudgeModelRef,
   resolveRegistryGrader,
   runEval as runEvalCore,
@@ -456,6 +461,7 @@ import {
   type ProvabilityLevel,
   isProvabilityLevel,
 } from "@crewhaus/provability";
+import { mintChangeId, readChangeContent } from "@crewhaus/quality-service";
 // Adaptive model routing — `crewhaus route status|reset` inspects/clears the
 // per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
 // mines the same scoreboard into pool-policy suggestions.
@@ -690,6 +696,7 @@ import {
 // the compiler-worker's remote `POST /compile { emitAs: "cf-worker" }`, so
 // `crewhaus compile --emit-as cf-worker` emits the same Worker bundle locally.
 import { emitCfWorkerBundle } from "./cf-worker-emit";
+import { producedLines, proposeChange, recordWriteBack } from "./change-producers";
 // Item 61 — `crewhaus channel provision|verify` core (adapter-derived Slack
 // manifest, Telegram setWebhook, Discord interactions-endpoint registration,
 // doctor-style scope/webhook probes), in a side-effect-free module so it is
@@ -759,6 +766,7 @@ import {
   buildContextPressureReport,
   formatContextPressureLines,
 } from "./context-pressure";
+import { holdoutCreatedLines, releaseUseCount, usesJson, usesLines } from "./datasets-holdout";
 import { recordRelease } from "./datasets-release";
 // Wave 3 cluster C (B17/B21) — the `datasets status` freshness/saturation
 // report + the `datasets card` markdown datasheet, side-effect-free (run
@@ -1012,6 +1020,7 @@ import {
   CONVENTIONAL_DATASET,
   CONVENTIONAL_GRADERS,
   FLYWHEEL_WORKFLOW_RELPATH,
+  type FlywheelAcceptedEvidence,
   FlywheelConfigError,
   type FlywheelDataResolution,
   type FlywheelGateSplit,
@@ -1346,6 +1355,7 @@ import {
 import {
   type GitPrDriver,
   type OpenedPr,
+  PROPOSALS_RELDIR,
   PROPOSE_SOURCES,
   ProposeError,
   type ProposeSource,
@@ -1359,6 +1369,7 @@ import {
   provabilityDoctorChecks,
   runProvabilityCommand,
 } from "./provability-cli";
+import { reanchorUnderReceipt } from "./quality-receipts";
 import { redactInTurn } from "./redact-in-turn";
 // E49 — `crewhaus redteam generate|report`: the behaviour-taxonomy attack
 // generator (deterministic + offline; attack strings composed from inert
@@ -1398,6 +1409,7 @@ import {
   isRegistrySafeName,
   pinRecoveriesAfterOptimize,
 } from "./regression-pin";
+import { parseReplayToolsFlags } from "./replay-flags";
 // Wave 3 (B20) — the persistent human-review queue
 // (.crewhaus/review/queue.jsonl): pure entry builders/formatters + the
 // append-only JSONL store, in a side-effect-free module so it is
@@ -7233,7 +7245,12 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         "[--min-score F] [--no-redact] [--mutator rule-based|claude|meta-harness] [--stage <name>] " +
         "[--iterations N] [--seed N] [--concurrency N] " +
         "[--improvement-threshold F] [--budget-usd N] [--from-advice <suggestions.json>] " +
-        "[--write-back] [--no-register] [--no-pin-regressions] [--no-retry] [-o <out-dir>]\n" +
+        "[--write-back | --propose] [--no-register] [--no-pin-regressions] [--no-retry] " +
+        "[--replay-tools <dir> [--replay-miss error|live]] [-o <out-dir>]\n" +
+        "  --propose files an accepted candidate as a change (`crewhaus changes`) and never\n" +
+        "  writes the spec; --write-back writes it and records the change it made.\n" +
+        "  --replay-tools <dir> replays every candidate's tool results from a recording\n" +
+        "  (`crewhaus eval --record-tools`), as `crewhaus eval --replay-tools` does.\n" +
         "  MULTI-STAGE SPECS (D36). workflow / graph / crew / pipeline are optimizable: each\n" +
         "  candidate is compiled with the eval-entry variant (the same emission `crewhaus\n" +
         "  compile --with-eval-harness` performs) and measured by DRIVING that compiled\n" +
@@ -7338,6 +7355,24 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   }
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
+  // `--propose`: an accepted candidate becomes a proposed change and the spec
+  // is never written; `--write-back` writes it and records the change it made.
+  const propose = args.flags["propose"] === true;
+  if (propose && args.flags["write-back"] === true) {
+    die(
+      "--propose and --write-back are mutually exclusive — --propose files the candidate as a change (`crewhaus changes`) and never writes the spec",
+    );
+  }
+  // `--replay-tools <dir>`: every candidate's eval replays tool results from
+  // a recording, validated like `crewhaus eval`'s, before anything is spent.
+  const optimizeReplay = parseReplayToolsFlags(args.flags);
+  if (!optimizeReplay.ok) die(optimizeReplay.error);
+  const replayOpts = {
+    ...(optimizeReplay.replayToolsDir !== undefined
+      ? { replayToolsDir: optimizeReplay.replayToolsDir }
+      : {}),
+    ...(optimizeReplay.replayMiss !== undefined ? { replayMiss: optimizeReplay.replayMiss } : {}),
+  };
   // Item 15 — `--from-advice` replaces the mutation search: the knobs that
   // steer it have nothing to act on, so the combination is rejected up
   // front (before any dataset is loaded or eval is paid for).
@@ -7423,6 +7458,8 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   const outDirArg = args.flags["out"];
   const absSpec = resolve(specPath);
   await holdCliMutatingLease(dirname(absSpec), "optimize");
+  // The spec as it was before this run: the base of the change it records.
+  const changeBaseYaml = readFileSync(absSpec, "utf-8");
   const runId = `opt_${Date.now().toString(16)}`;
   const outDir =
     typeof outDirArg === "string"
@@ -7683,6 +7720,10 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       seed,
       retryErrors,
       writeBack,
+      propose,
+      replay: replayOpts,
+      ...(typeof datasetPath === "string" ? { datasetRef: datasetPath } : {}),
+      ...(typeof gradersPath === "string" ? { gradersRef: gradersPath } : {}),
       noRegister: args.flags["no-register"] === true,
       pinRegressions: args.flags["no-pin-regressions"] !== true,
       originalById,
@@ -7884,6 +7925,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
           retryErrors,
           ...(graderRegistry !== undefined ? { graderRegistry } : {}),
           ...(bridged !== undefined ? { invoker: bridged.invoker as never } : {}),
+          ...replayOpts,
         },
       });
       // Item 7 — failure-arbiter pre-filter: classify this candidate's failing
@@ -8141,6 +8183,17 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       process.stdout.write(
         `[optimize] no stage improved above threshold ${improvementThreshold}; source untouched.\n`,
       );
+    } else if (propose) {
+      const filed = await proposeChange({
+        specPath: absSpec,
+        source: "optimize",
+        baseText: changeBaseYaml,
+        candidateText: readFileSync(staged.finalYamlPath, "utf-8"),
+        ...(typeof datasetPath === "string" ? { dataset: datasetPath } : {}),
+        ...(typeof gradersPath === "string" ? { graders: gradersPath } : {}),
+        evidence: { v: 1, source: "optimize", runId, accepted: staged.acceptedCount },
+      });
+      for (const line of producedLines("[optimize]", filed)) process.stdout.write(`${line}\n`);
     } else if (writeBack && !fewShotDisablesWriteBack) {
       // ONE write-back for the composed result: the accepted stages' patches
       // are already folded into staged.finalYamlPath. The composition + stamp
@@ -8154,6 +8207,16 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         iterations,
       });
       process.stdout.write(`[optimize] wrote patched YAML to ${absSpec}\n`);
+      const recorded = await recordWriteBack({
+        specPath: absSpec,
+        source: "optimize",
+        baseText: changeBaseYaml,
+        candidateText: readFileSync(absSpec, "utf-8"),
+        ...(typeof datasetPath === "string" ? { dataset: datasetPath } : {}),
+        ...(typeof gradersPath === "string" ? { graders: gradersPath } : {}),
+        evidence: { v: 1, source: "optimize", runId, accepted: staged.acceptedCount },
+      });
+      for (const line of producedLines("[optimize]", recorded)) process.stdout.write(`${line}\n`);
       if (args.flags["no-register"] !== true) {
         // Item 46 — the staged run's patches live per stage, so name the LAST
         // accepted stage's patch.json explicitly; the default
@@ -8181,7 +8244,8 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         outDir,
         // Item #54 — the few-shot path is patch-only so the injected examples never
         // land in the tracked spec (they'd double-inject on the next run).
-        writeBack: writeBack && !fewShotDisablesWriteBack,
+        // `--propose` never writes: the candidate is filed as a change below.
+        writeBack: writeBack && !fewShotDisablesWriteBack && !propose,
         runId,
         traceBus,
         ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
@@ -8204,8 +8268,43 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     );
     process.stdout.write(`[optimize] patch: ${join(result.outDir, "patch.json")}\n`);
     if (result.applied) {
-      if (result.writtenTo) {
+      if (propose) {
+        const filed = await proposeChange({
+          specPath: absSpec,
+          source: "optimize",
+          baseText: changeBaseYaml,
+          candidateText: result.patchedYaml,
+          ...(typeof datasetPath === "string" ? { dataset: datasetPath } : {}),
+          ...(typeof gradersPath === "string" ? { graders: gradersPath } : {}),
+          evidence: {
+            v: 1,
+            source: "optimize",
+            runId,
+            scoreBefore: result.scoreBefore,
+            scoreAfter: result.scoreAfter,
+          },
+        });
+        for (const line of producedLines("[optimize]", filed)) process.stdout.write(`${line}\n`);
+      } else if (result.writtenTo) {
         process.stdout.write(`[optimize] wrote patched YAML to ${result.writtenTo}\n`);
+        const recorded = await recordWriteBack({
+          specPath: absSpec,
+          source: "optimize",
+          baseText: changeBaseYaml,
+          candidateText: readFileSync(result.writtenTo, "utf-8"),
+          ...(typeof datasetPath === "string" ? { dataset: datasetPath } : {}),
+          ...(typeof gradersPath === "string" ? { graders: gradersPath } : {}),
+          evidence: {
+            v: 1,
+            source: "optimize",
+            runId,
+            scoreBefore: result.scoreBefore,
+            scoreAfter: result.scoreAfter,
+          },
+        });
+        for (const line of producedLines("[optimize]", recorded)) {
+          process.stdout.write(`${line}\n`);
+        }
         // Item 46 — a successful write-back changed the working spec, so run
         // the same auto-register + changelog flow as `compile`. Re-read the
         // written file (it now carries the formatWriteBackHeader stamp the
@@ -8263,6 +8362,13 @@ async function runOptimizeFromAdvice(opts: {
   readonly seed: number;
   readonly retryErrors: boolean;
   readonly writeBack: boolean;
+  /** File the accepted spec as a proposed change instead of writing it. */
+  readonly propose?: boolean;
+  /** Tool results replayed from a recording, for every eval. */
+  readonly replay?: { readonly replayToolsDir?: string; readonly replayMiss?: "live" };
+  /** The dataset and graders as given, for the change record. */
+  readonly datasetRef?: string;
+  readonly gradersRef?: string;
   readonly noRegister: boolean;
   readonly pinRegressions: boolean;
   readonly originalById: ReadonlyMap<string, Sample>;
@@ -8330,6 +8436,7 @@ async function runOptimizeFromAdvice(opts: {
         // refuses the pair as two instruments.
         ...(opts.routing !== undefined ? { routing: opts.routing } : {}),
         ...(opts.warmArms === true ? { warmArms: true } : {}),
+        ...(opts.replay ?? {}),
       },
     });
     const routed = summary.config.routing;
@@ -8415,6 +8522,27 @@ async function runOptimizeFromAdvice(opts: {
       `(pass_rate ${pct(passRateBefore)} → ${pct(passRateAfter)}, Δ ${((passRateAfter - passRateBefore) * 100).toFixed(1)} pts)\n`,
   );
 
+  const adviceEvidence = {
+    v: 1,
+    source: "advise",
+    runId: opts.runId,
+    passRateBefore,
+    passRateAfter,
+    accepted: result.accepted,
+  };
+  if (opts.propose === true) {
+    const filed = await proposeChange({
+      specPath: opts.absSpec,
+      source: "advise",
+      baseText: sourceYaml,
+      candidateText: stamped,
+      ...(opts.datasetRef !== undefined ? { dataset: opts.datasetRef } : {}),
+      ...(opts.gradersRef !== undefined ? { graders: opts.gradersRef } : {}),
+      evidence: adviceEvidence,
+    });
+    for (const line of producedLines("[optimize]", filed)) process.stdout.write(`${line}\n`);
+    return;
+  }
   if (!opts.writeBack) {
     process.stdout.write(
       `[optimize] patched YAML saved to ${join(adviceDir, "patched.yaml")}. Re-run with --write-back to apply it to the source spec.\n`,
@@ -8431,6 +8559,18 @@ async function runOptimizeFromAdvice(opts: {
     { expectedRev: specRev(sourceYaml), writer: "cli.optimize" },
   );
   process.stdout.write(`[optimize] wrote patched YAML to ${opts.absSpec}\n`);
+  {
+    const recorded = await recordWriteBack({
+      specPath: opts.absSpec,
+      source: "advise",
+      baseText: sourceYaml,
+      candidateText: stamped,
+      ...(opts.datasetRef !== undefined ? { dataset: opts.datasetRef } : {}),
+      ...(opts.gradersRef !== undefined ? { graders: opts.gradersRef } : {}),
+      evidence: adviceEvidence,
+    });
+    for (const line of producedLines("[optimize]", recorded)) process.stdout.write(`${line}\n`);
+  }
   if (!opts.noRegister) {
     await autoRegisterSpec(stamped, { patchJsonPath: join(adviceDir, "patch.json") });
   }
@@ -8527,7 +8667,7 @@ function gitSpecStatus(absSpec: string): { inRepo: boolean; dirty: boolean } {
 async function runFlywheelCmd(args: ParsedArgs, action: "init" | "run"): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      `usage:\n  crewhaus flywheel run [spec.yaml] [--dataset <data>] [--graders <graders.yaml>]\n      [--budget-usd N] [--iterations N] [--seed N] [--concurrency N]\n      [--mutator rule-based|claude] [--gate-split train|dev] [--dry-run]\n      [--allow-dirty]\n  crewhaus flywheel init [--force] [--suite <suite.yaml>]\n\n  \`run\` executes the nightly self-improvement loop in one command:\n  compile gate → baseline eval → optimize (budget-capped; claude mutator\n  by default when an ANTHROPIC credential is present, rule-based fallback\n  otherwise) → post-patch compile → after eval → acceptance gate. The\n  patch is applied to the spec ONLY when pass_rate strictly improved with\n  zero per-sample regressions (the same strict gate \`eval --gate\` uses);\n  an accepted write-back then runs the standard auto-register + changelog\n  + regression-pin flow. A rejected patch never touches disk. --dry-run\n  runs everything but never writes.\n\n  Defaults: <spec> is ./crewhaus.yaml; --dataset falls back to\n  ${CONVENTIONAL_DATASET} then registry:<spec>-ratings (when the spec has a\n  feedback: block and ratings were distilled); --graders falls back to\n  ${CONVENTIONAL_GRADERS}; conventional paths resolve from the SPEC's directory,\n  not the cwd, so a spec passed by path brings its own eval/ files. When the\n  dataset is a registry ref (including the ratings fallback), bare refs resolve\n  train+dev only — the locked test split NEVER enters the flywheel, and an\n  explicit #test ref is refused (the held-out split gates releases, not\n  nightly loops). Every run prints the resolved dataset + its source\n  (flag|convention|ratings-registry) and warns when a conventional\n  ${CONVENTIONAL_DATASET} shadows a distilled <spec>-ratings dataset.\n\n  --gate-split train|dev (D42) narrows the BEFORE/AFTER acceptance evals to\n  one registry split; the optimizer's own train/dev sets are unchanged, so\n  the search still reads what it always read. Omitted, the gate scores every\n  split the ref resolved (train+dev) — the historical behavior. A split-gated\n  run keys into its own baseline lineage (<name>@<version>#<split>), and the\n  flag is REFUSED for a flat-file dataset (no split boundaries) and for\n  #test (B16 — the holdout gates releases, not nightly loops).\n\n  The optimizer only ever rewrites agent.instructions from this command —\n  permissions:, the model roster, and every security/allowlist field stay\n  exactly as a human reviewed them (spec-patch's OPTIMIZABLE_PATHS enforces\n  it). D43's numeric-dial search is implemented in the optimizer library and\n  is reachable programmatically (optimizeSpec({ knobs })); no CLI flag builds\n  the dial set yet, so a flywheel run proposes no knob changes. The flywheel\n  refuses to run over uncommitted spec changes (--allow-dirty opts out).\n\n  \`init\` scaffolds .github/workflows/crewhaus-flywheel.yml: nightly cron +\n  workflow_dispatch, budget knobs as env, PR creation via gh for HUMAN\n  review — the workflow never merges on its own. Refuses to overwrite an\n  existing workflow without --force. --suite <suite.yaml> (NEW-HUNT-8) appends\n  a \`crewhaus eval suite --tier nightly --gate\` step to the same cron, running\n  even when the flywheel step failed so neither signal can hide the other; the\n  path is harness-relative and a manifest declaring no nightly tier warns.\n\n${formatFlywheelKnobsGuide()
+      `usage:\n  crewhaus flywheel run [spec.yaml] [--dataset <data>] [--graders <graders.yaml>]\n      [--budget-usd N] [--iterations N] [--seed N] [--concurrency N]\n      [--mutator rule-based|claude] [--gate-split train|dev] [--dry-run]\n      [--allow-dirty] [--propose]\n  crewhaus flywheel init [--force] [--suite <suite.yaml>]\n\n  \`run\` executes the nightly self-improvement loop in one command:\n  compile gate → baseline eval → optimize (budget-capped; claude mutator\n  by default when an ANTHROPIC credential is present, rule-based fallback\n  otherwise) → post-patch compile → after eval → acceptance gate. The\n  patch is applied to the spec ONLY when pass_rate strictly improved with\n  zero per-sample regressions (the same strict gate \`eval --gate\` uses);\n  an accepted write-back then runs the standard auto-register + changelog\n  + regression-pin flow. A rejected patch never touches disk. --dry-run\n  runs everything but never writes. --propose files an accepted patch as a\n  change (\`crewhaus changes\`) instead of writing it.\n\n  Defaults: <spec> is ./crewhaus.yaml; --dataset falls back to\n  ${CONVENTIONAL_DATASET} then registry:<spec>-ratings (when the spec has a\n  feedback: block and ratings were distilled); --graders falls back to\n  ${CONVENTIONAL_GRADERS}; conventional paths resolve from the SPEC's directory,\n  not the cwd, so a spec passed by path brings its own eval/ files. When the\n  dataset is a registry ref (including the ratings fallback), bare refs resolve\n  train+dev only — the locked test split NEVER enters the flywheel, and an\n  explicit #test ref is refused (the held-out split gates releases, not\n  nightly loops). Every run prints the resolved dataset + its source\n  (flag|convention|ratings-registry) and warns when a conventional\n  ${CONVENTIONAL_DATASET} shadows a distilled <spec>-ratings dataset.\n\n  --gate-split train|dev (D42) narrows the BEFORE/AFTER acceptance evals to\n  one registry split; the optimizer's own train/dev sets are unchanged, so\n  the search still reads what it always read. Omitted, the gate scores every\n  split the ref resolved (train+dev) — the historical behavior. A split-gated\n  run keys into its own baseline lineage (<name>@<version>#<split>), and the\n  flag is REFUSED for a flat-file dataset (no split boundaries) and for\n  #test (B16 — the holdout gates releases, not nightly loops).\n\n  The optimizer only ever rewrites agent.instructions from this command —\n  permissions:, the model roster, and every security/allowlist field stay\n  exactly as a human reviewed them (spec-patch's OPTIMIZABLE_PATHS enforces\n  it). D43's numeric-dial search is implemented in the optimizer library and\n  is reachable programmatically (optimizeSpec({ knobs })); no CLI flag builds\n  the dial set yet, so a flywheel run proposes no knob changes. The flywheel\n  refuses to run over uncommitted spec changes (--allow-dirty opts out).\n\n  \`init\` scaffolds .github/workflows/crewhaus-flywheel.yml: nightly cron +\n  workflow_dispatch, budget knobs as env, PR creation via gh for HUMAN\n  review — the workflow never merges on its own. Refuses to overwrite an\n  existing workflow without --force. --suite <suite.yaml> (NEW-HUNT-8) appends\n  a \`crewhaus eval suite --tier nightly --gate\` step to the same cron, running\n  even when the flywheel step failed so neither signal can hide the other; the\n  path is harness-relative and a manifest declaring no nightly tier warns.\n\n${formatFlywheelKnobsGuide()
         .map((l) => `  ${l}`)
         .join("\n")}\n`,
     );
@@ -8628,6 +8768,8 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
   }
   await holdCliMutatingLease(dirname(absSpec), "flywheel run");
   const dryRun = args.flags["dry-run"] === true;
+  // `--propose`: an accepted candidate is filed as a change, never written.
+  const flywheelPropose = args.flags["propose"] === true;
 
   // Invariant: never run over uncommitted spec changes (see gitSpecStatus).
   const git = gitSpecStatus(absSpec);
@@ -9045,7 +9187,39 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
     };
   };
 
-  const applyAccepted = async (outcome: FlywheelOptimizeOutcome): Promise<void> => {
+  const applyAccepted = async (
+    outcome: FlywheelOptimizeOutcome,
+    measured?: FlywheelAcceptedEvidence,
+  ): Promise<void> => {
+    const flywheelEvidence = {
+      v: 1,
+      source: "flywheel",
+      runId: outcome.runId,
+      scoreBefore: outcome.scoreBefore,
+      scoreAfter: outcome.scoreAfter,
+      ...(measured !== undefined
+        ? {
+            passRateBefore: measured.before.aggregates.passRate,
+            passRateAfter: measured.after.aggregates.passRate,
+            reason: measured.verdict.reason,
+          }
+        : {}),
+    };
+    if (flywheelPropose) {
+      // `--propose`: the accepted candidate is filed as a change; the spec is
+      // never written.
+      const filed = await proposeChange({
+        specPath: absSpec,
+        source: "flywheel",
+        baseText: sourceYaml,
+        candidateText: outcome.patchedYaml,
+        dataset: data.dataset,
+        graders: data.graders,
+        evidence: flywheelEvidence,
+      });
+      for (const line of producedLines("[flywheel]", filed)) process.stdout.write(`${line}\n`);
+      return;
+    }
     // The kept `optimize --write-back` semantics: stamp the provenance
     // header spec-changelog distills, write the source, then auto-register
     // (+ changelog) and pin the fail→pass recoveries into the per-spec
@@ -9065,6 +9239,18 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       { expectedRev: specRev(sourceYaml), writer: "cli.flywheel" },
     );
     process.stdout.write(`[flywheel] wrote patched YAML to ${absSpec}\n`);
+    {
+      const recorded = await recordWriteBack({
+        specPath: absSpec,
+        source: "flywheel",
+        baseText: sourceYaml,
+        candidateText: stamped,
+        dataset: data.dataset,
+        graders: data.graders,
+        evidence: flywheelEvidence,
+      });
+      for (const line of producedLines("[flywheel]", recorded)) process.stdout.write(`${line}\n`);
+    }
     await autoRegisterSpec(stamped, { patchJsonPath: join(outcome.outDir, "patch.json") });
     try {
       const pin = await pinRecoveriesAfterOptimize({
@@ -9642,7 +9828,31 @@ function runScheduleGenerate(args: ParsedArgs): void {
  */
 type EvalRunHooks = {
   readonly onGateFailure?: (reason: string) => void;
+  /**
+   * What the run's held-out use line records, for a caller that runs an
+   * eval on a person's behalf (`datasets release`). Never a flag: a typed
+   * `crewhaus eval` records `eval` and can never read the holdout.
+   */
+  readonly heldOutUse?: {
+    readonly purpose: "release";
+    /** The holdout read a holdout release makes. */
+    readonly heldOut?: { readonly purpose: "release" };
+  };
 };
+
+/** A fresh eval run id, minted before the run reads its dataset. */
+function mintEvalRunId(): string {
+  return generateRunId();
+}
+
+/** The run id a run directory's run.json recorded (a resume keeps it). */
+function recordedRunIdOf(runDir: string): string | undefined {
+  try {
+    return readRunManifest(runDir).runId;
+  } catch {
+    return undefined;
+  }
+}
 
 async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Promise<void> {
   if (args.flags["help"]) {
@@ -10023,6 +10233,16 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     pricing: defaultMatrixPricing(),
   });
 
+  // The run's id, known before the dataset is read so a held-out use line
+  // names the run that read it. A resumed run keeps the id in its run.json;
+  // a matrix or a regrade records runs of its own, so it names none.
+  const evalRunId =
+    matrixModels !== undefined || regradeParsed.regrade !== undefined
+      ? undefined
+      : resumeDir !== undefined
+        ? recordedRunIdOf(resumeDir)
+        : mintEvalRunId();
+
   // Item 12 — `--dataset registry:<name>[@version][#split]` resolves via the
   // Section 29 dataset registry instead of loadDataset. datasetName becomes
   // `<name>@<version>[#split]` and datasetHash a stable digest of the
@@ -10045,8 +10265,15 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
       // B16 — bare refs resolve train+dev only; an explicit #test needs the
       // --allow-test-split opt-in (the CLI face of the registry's
       // test-split lock — spend the holdout at release-gate time only).
+      // A held-out read leaves a use line naming this run before it starts.
       resolved = await resolveRegistryRef(registry, registryRef, {
         allowTestSplit: args.flags["allow-test-split"] === true,
+        ...(hooks.heldOutUse?.heldOut !== undefined ? { heldOut: hooks.heldOutUse.heldOut } : {}),
+        use: {
+          purpose: hooks.heldOutUse?.purpose ?? "eval",
+          via: "cli",
+          ...(evalRunId !== undefined ? { runId: evalRunId } : {}),
+        },
       });
     } catch (err) {
       if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
@@ -10278,6 +10505,8 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     opts: {
       // C33 — which CLI produced this run (reproducibility manifest).
       ...cliVersionOpt(),
+      // The id the dataset's held-out use line already names.
+      ...(evalRunId !== undefined ? { runId: evalRunId } : {}),
       // NEW-HUNT-6 — a resume writes into the run directory it re-opened;
       // -o is refused alongside it, so the two can never disagree.
       ...(resumeDir !== undefined
@@ -10550,6 +10779,20 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     provabilityGraderNames,
     // A re-anchor over a protected criterion needs this harness's owner.
     ownerCheck: () => ownerCheck(dirname(absSpec)),
+    // A re-anchor is a quality decision: it runs under a command receipt in the
+    // harness's own ledger, and the pin's mark names that receipt. A receipt that
+    // cannot be written keeps the baseline.
+    ...(rebaseline !== undefined || regradeParsed.regradeBaseline === true
+      ? {
+          reanchorCommand: (pin: (receipt?: string) => PinOutcome) =>
+            reanchorUnderReceipt({
+              harnessDir: dirname(absSpec),
+              runId: summary.runId,
+              reason: rebaseline?.reason ?? "instrument-changed",
+              pin,
+            }),
+        }
+      : {}),
     // `--regrade-baseline`: on a changed instrument, regrade the baseline's
     // answers with this graders file and gate against them.
     ...(regradeParsed.regradeBaseline === true
@@ -12068,7 +12311,7 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
       await runEvalReportExport(args);
       return;
     case "baseline":
-      runEvalReportBaseline(args);
+      await runEvalReportBaseline(args);
       return;
     default:
       die(
@@ -12405,7 +12648,7 @@ async function runEvalReportExport(args: ParsedArgs): Promise<void> {
   }
 }
 
-function runEvalReportBaseline(args: ParsedArgs): void {
+async function runEvalReportBaseline(args: ParsedArgs): Promise<void> {
   const sub = args.positional[1];
   switch (sub) {
     case "show": {
@@ -12457,9 +12700,18 @@ function runEvalReportBaseline(args: ParsedArgs): void {
       // would clobber the primary's baseline with a cheap candidate's run.
       // A pin over a protected criterion is the owner's: the same check
       // `crewhaus eval --rebaseline` makes, for the harness here.
-      const pinned = pinRun(entry, new Date().toISOString(), undefined, {
-        cmd: "crewhaus eval-report baseline set",
-        ownerCheck: () => ownerCheck(process.cwd()),
+      // A person's pin is a quality decision: it runs under a receipt.
+      const found = entry;
+      const pinned = await reanchorUnderReceipt({
+        harnessDir: process.cwd(),
+        runId: found.runId,
+        kind: "quality.baselines.pin",
+        pin: (receipt) =>
+          pinRun(found, new Date().toISOString(), undefined, {
+            cmd: "crewhaus eval-report baseline set",
+            ownerCheck: () => ownerCheck(process.cwd()),
+            ...(receipt !== undefined ? { receipt } : {}),
+          }),
       });
       if (!pinned.ok) die(`eval-report baseline set: ${pinned.refusal.reason}`);
       if (pinned.pin.rebaselined !== undefined) {
@@ -12493,16 +12745,18 @@ async function runDatasets(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus datasets <action>\n" +
         "  list                                        all datasets + versions (split sizes, createdAt)\n" +
-        "  get <name>[@version] [--split train|dev|test]\n" +
+        "  get <name>[@version] [--split train|dev|test|holdout]\n" +
         "                                              print samples as JSONL to stdout. Default: the\n" +
         "                                              latest version, all splits merged with a top-level\n" +
         "                                              `split` column; --split prints one split verbatim.\n" +
-        "                                              Emitting locked test-split rows prints a stderr note\n" +
+        "                                              Emitting test or holdout rows prints a stderr note;\n" +
+        "                                              inspection is not counted as a use\n" +
         "  put <name> --file <data.jsonl|csv|yaml> [--split-spec 70/15/15 | --split train] [--canary]\n" +
         "                                              import a dataset file as a new auto-bumped version\n" +
         "                                              (v1, v2, …). Split assignment is deterministic —\n" +
         "                                              stable by sample-id hash, no RNG — per the\n" +
-        "                                              train/dev[/test] percentages (default 70/15/15);\n" +
+        "                                              train/dev[/test[/holdout]] percentages (default\n" +
+        "                                              70/15/15; e.g. 60/15/15/10 adds a holdout);\n" +
         "                                              --split puts every sample into one named split.\n" +
         "                                              --canary injects ONE contamination-canary sample\n" +
         "                                              (deterministic hex phrase from the name+version\n" +
@@ -12519,14 +12773,22 @@ async function runDatasets(args: ParsedArgs): Promise<void> {
         "                                              versions the run history evaluated, always-passing\n" +
         "                                              sample ids across the last N joined runs (default\n" +
         "                                              10; rotation candidates), and test-split burn\n" +
-        "  release <name>[@version] --spec <spec.yaml> --graders <g.yaml> [--force]\n" +
+        "  release <name>[@version] --spec <spec.yaml> --graders <g.yaml> [--split test|holdout] [--force]\n" +
         "                                              the sanctioned holdout spend: run `crewhaus eval`\n" +
         "                                              over the version's locked #test split (threading\n" +
         "                                              --allow-test-split; regression union skipped so the\n" +
         "                                              holdout stays pure) and append a release entry\n" +
         "                                              {version, runId, ts, passRate} to the record —\n" +
         "                                              the version's burn count. Refuses when the version\n" +
-        "                                              was already released (--force overrides, loudly)\n" +
+        "                                              was already released (--force overrides, loudly).\n" +
+        "                                              --split holdout releases the holdout instead\n" +
+        "  holdout <name>[@version] --fraction <f> [--seed <s>]\n" +
+        "                                              write a NEW version that holds out a seeded share\n" +
+        "                                              (0 < f <= 0.5) of train+dev as the promotion-only\n" +
+        "                                              holdout; never takes test; the source version is\n" +
+        "                                              untouched\n" +
+        "  uses <name>[@version] [--json]              every recorded read of the test split and the\n" +
+        "                                              holdout, newest first, counted by purpose\n" +
         "  card <name>[@version] [-o <file.md>]        markdown datasheet: split sizes, provenance\n" +
         "                                              breakdown by metadata.source, sample-hash counts,\n" +
         "                                              createdAt, release/burn history, and an offline\n" +
@@ -12560,9 +12822,15 @@ async function runDatasets(args: ParsedArgs): Promise<void> {
       case "card":
         await runDatasetsCard(args);
         return;
+      case "holdout":
+        await runDatasetsHoldout(args);
+        return;
+      case "uses":
+        await runDatasetsUses(args);
+        return;
       default:
         die(
-          `datasets: unknown action "${action ?? ""}" — supported: list, get, put, verify, status, release, card`,
+          `datasets: unknown action "${action ?? ""}" — supported: list, get, put, verify, status, release, card, holdout, uses`,
         );
     }
   } catch (err) {
@@ -12605,7 +12873,8 @@ async function runDatasetsList(): Promise<void> {
 function splitFlag(args: ParsedArgs): DatasetSplit | undefined {
   const flag = args.flags["split"];
   if (typeof flag !== "string") return undefined;
-  if (!isDatasetSplit(flag)) die(`invalid --split "${flag}" — expected train, dev, or test`);
+  if (!isDatasetSplit(flag))
+    die(`invalid --split "${flag}" — expected train, dev, test, or holdout`);
   return flag;
 }
 
@@ -12625,11 +12894,24 @@ async function runDatasetsGet(args: ParsedArgs): Promise<void> {
   }
   // B16 — `datasets get` keeps printing test rows (inspection is not
   // consumption), but says so on stderr whenever it does: the test split is
-  // meant to be spent only at release-gate time.
+  // meant to be spent only at release-gate time, and the holdout only by a
+  // promotion check.
   const testRows = split === undefined || split === "test" ? (record.splits.test?.length ?? 0) : 0;
+  const holdoutRows =
+    split === undefined || split === "holdout" ? (record.splits.holdout?.length ?? 0) : 0;
   if (testRows > 0) {
     process.stderr.write(
       `[datasets] note: ${testRows} locked test-split row(s) emitted from "${name}@${resolvedVersion}" — the test split is reserved for release gating (--allow-test-split on \`crewhaus eval\` / \`crewhaus deploy canary\`)\n`,
+    );
+  }
+  if (holdoutRows > 0) {
+    process.stderr.write(
+      `[datasets] note: ${holdoutRows} holdout row(s) emitted from "${name}@${resolvedVersion}" — the holdout is read only by \`crewhaus changes check\` and \`crewhaus datasets release --split holdout\`\n`,
+    );
+  }
+  if (testRows > 0 || holdoutRows > 0) {
+    process.stderr.write(
+      "[datasets] Not counted as a use. Anything you copy from here is no longer held out.\n",
     );
   }
   process.stdout.write(recordToJsonl(record, split));
@@ -12665,7 +12947,7 @@ async function runDatasetsPut(args: ParsedArgs): Promise<void> {
   process.stdout.write(
     `[datasets] put ${rec.name}@${rec.version} ` +
       `(train ${rec.splits.train.length} / dev ${rec.splits.dev.length} / ` +
-      `test ${rec.splits.test?.length ?? 0}) — use with --dataset registry:${rec.name}\n`,
+      `test ${rec.splits.test?.length ?? 0}${rec.splits.holdout !== undefined ? ` / holdout ${rec.splits.holdout.length}` : ""}) — use with --dataset registry:${rec.name}\n`,
   );
   if (canary) {
     process.stdout.write(
@@ -12751,6 +13033,8 @@ async function runDatasetsStatus(args: ParsedArgs): Promise<void> {
     versions,
     entries: readEvalRunIndex(),
     now: new Date(),
+    // Held-out reads, counted per split from each version's use ledger.
+    uses: (version) => readHeldOutUses(defaultDatasetsRoot(), name, version),
     ...(lastN !== undefined ? { lastN } : {}),
     loadOutcomes: async (outDir) => {
       try {
@@ -12789,6 +13073,11 @@ async function runDatasetsRelease(args: ParsedArgs): Promise<void> {
   if (specPath === undefined) die("datasets release: missing --spec <spec.yaml>");
   const gradersPath = strFlag(args, "graders");
   if (gradersPath === undefined) die("datasets release: missing --graders <graders.yaml>");
+  const splitArg = strFlag(args, "split") ?? "test";
+  if (splitArg !== "test" && splitArg !== "holdout") {
+    die(`datasets release: invalid --split "${splitArg}" — expected test or holdout`);
+  }
+  const split: "test" | "holdout" = splitArg;
   const { name, version: pinned } = parseNameVersion(refStr);
   const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
   const version = pinned ?? (await latestVersion(registry, name));
@@ -12796,45 +13085,71 @@ async function runDatasetsRelease(args: ParsedArgs): Promise<void> {
     die(`dataset "${name}" has no versions in the registry (${defaultDatasetsRoot()})`);
   }
   const record = await registry.getRecord(name, version);
-  if (record.splits.test === undefined || record.splits.test.length === 0) {
+  const rows = record.splits[split];
+  if (rows === undefined || rows.length === 0) {
     die(
-      `datasets release: "${name}@${version}" has no test split — nothing to release (import with a test percentage, e.g. --split-spec 70/15/15)`,
+      split === "test"
+        ? `datasets release: "${name}@${version}" has no test split — nothing to release (import with a test percentage, e.g. --split-spec 70/15/15)`
+        : `datasets release: "${name}@${version}" has no holdout split — nothing to release (cut one with \`crewhaus datasets holdout ${name} --fraction 0.2\`)`,
     );
   }
-  const releases = record.releases ?? [];
-  if (releases.length > 0) {
-    const last = releases[releases.length - 1] as ReleaseEntry;
+  // A split's release count: release use lines for that split, plus (for
+  // the test split) the legacy entries no use line names.
+  const uses = readHeldOutUses(defaultDatasetsRoot(), name, version);
+  const released = releaseUseCount(uses, split);
+  if (released > 0) {
+    const releases = record.releases ?? [];
+    const lastRelease = [...uses.uses]
+      .reverse()
+      .find((u) => u.split === split && u.purpose === "release");
+    const lastEntry = releases[releases.length - 1] as ReleaseEntry | undefined;
+    const last =
+      lastRelease !== undefined
+        ? `run ${lastRelease.runId ?? "(unnamed)"} at ${lastRelease.at}`
+        : lastEntry !== undefined
+          ? `run ${lastEntry.runId} at ${lastEntry.ts}`
+          : "unknown";
     if (args.flags["force"] !== true) {
       die(
-        `datasets release: "${name}@${version}" test split was already released ${releases.length} time(s) (last: run ${last.runId} at ${last.ts}) — the holdout is spent; release a NEW version, or pass --force to burn it again (the score is no longer a first look)`,
+        `datasets release: "${name}@${version}" ${split} split was already released ${released} time(s) (last: ${last}) — the holdout is spent; release a NEW version, or pass --force to burn it again (the score is no longer a first look)`,
       );
     }
     process.stderr.write(
-      `[datasets] warning: re-releasing "${name}@${version}" (burn ${releases.length + 1}) — a re-run holdout score is not a first look\n`,
+      `[datasets] warning: re-releasing "${name}@${version}" ${split} (burn ${released + 1}) — a re-run holdout score is not a first look\n`,
     );
   }
 
-  const datasetRef = `registry:${name}@${version}#test`;
+  const datasetRef = `registry:${name}@${version}#${split}`;
   process.stdout.write(
-    `[datasets] release ${name}@${version}: evaluating the locked test split (${record.splits.test.length} samples) via \`crewhaus eval\`\n`,
+    `[datasets] release ${name}@${version}: evaluating the ${split === "test" ? "locked test" : "holdout"} split (${rows.length} samples) via \`crewhaus eval\`\n`,
   );
   // Thread the Wave-0 machinery: an explicit #test ref behind
   // --allow-test-split; --no-regressions keeps the holdout pure (a union
-  // would grade regression pins alongside it and change the identity).
-  await runEvalSubcommand({
-    positional: [specPath],
-    flags: {
-      dataset: datasetRef,
-      graders: gradersPath,
-      "allow-test-split": true,
-      "no-regressions": true,
+  // would grade regression pins alongside it and change the identity). The
+  // run's use line records it as a release; a holdout release is the one
+  // eval that may read the holdout.
+  await runEvalSubcommand(
+    {
+      positional: [specPath],
+      flags: {
+        dataset: datasetRef,
+        graders: gradersPath,
+        ...(split === "test" ? { "allow-test-split": true } : {}),
+        "no-regressions": true,
+      },
     },
-  });
+    {
+      heldOutUse: {
+        purpose: "release",
+        ...(split === "holdout" ? { heldOut: { purpose: "release" } } : {}),
+      },
+    },
+  );
 
   // The eval recorded itself in the run-history index (die() on failure
   // never reaches here) — the newest entry for this exact datasetName is
   // the release run.
-  const expectedName = registryDatasetName(name, version, "test");
+  const expectedName = registryDatasetName(name, version, split);
   const entry = readEvalRunIndex()
     .filter((e) => e.datasetName === expectedName)
     .pop();
@@ -12842,6 +13157,15 @@ async function runDatasetsRelease(args: ParsedArgs): Promise<void> {
     die(
       `datasets release: eval completed but no run-history entry for ${expectedName} was found — release not recorded`,
     );
+  }
+  if (split === "holdout") {
+    // The run's use line is the holdout's release record.
+    const after = readHeldOutUses(defaultDatasetsRoot(), name, version);
+    process.stdout.write(
+      `[datasets] release recorded: ${name}@${version} holdout run ${entry.runId} ` +
+        `pass_rate ${(entry.passRate * 100).toFixed(1)}% — holdout releases ${releaseUseCount(after, "holdout")}\n`,
+    );
+    return;
   }
   const recorded = recordRelease({ entry, rootDir: defaultDatasetsRoot(), name, version });
   if (!recorded.ok) {
@@ -12902,6 +13226,7 @@ async function runDatasetsCard(args: ParsedArgs): Promise<void> {
     name,
     version,
     record,
+    uses: readHeldOutUses(defaultDatasetsRoot(), name, version),
     provenance: provenanceBreakdown(samples),
     lintFindings: findings,
     runCount: entries.length,
@@ -12914,6 +13239,57 @@ async function runDatasetsCard(args: ParsedArgs): Promise<void> {
   } else {
     process.stdout.write(card);
   }
+}
+
+/**
+ * `crewhaus datasets holdout <name>[@version] --fraction <f> [--seed <s>]`:
+ * write a NEW version that holds out a seeded share of train+dev. The source
+ * version is untouched; the new version is written exclusively.
+ */
+async function runDatasetsHoldout(args: ParsedArgs): Promise<void> {
+  const refStr = args.positional[1];
+  if (typeof refStr !== "string") die("datasets holdout: missing <name>[@version]");
+  const fractionFlag = strFlag(args, "fraction");
+  if (fractionFlag === undefined) die("datasets holdout: missing --fraction <f> (e.g. 0.2)");
+  const fraction = Number(fractionFlag);
+  if (!/^\d*\.?\d+$/.test(fractionFlag.trim()) || !Number.isFinite(fraction)) {
+    die(
+      `datasets holdout: invalid --fraction "${fractionFlag}" — a number above 0 and at most 0.5`,
+    );
+  }
+  const { name, version } = parseNameVersion(refStr);
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const seed = strFlag(args, "seed");
+  const created = await createHoldoutVersion({
+    registry,
+    name,
+    ...(version !== undefined ? { version } : {}),
+    fraction,
+    ...(seed !== undefined ? { seed } : {}),
+  });
+  for (const line of holdoutCreatedLines(name, created)) process.stdout.write(`${line}\n`);
+}
+
+/**
+ * `crewhaus datasets uses <name>[@version] [--json]`: every recorded read of
+ * the version's test split and holdout. A read: nothing is written.
+ */
+async function runDatasetsUses(args: ParsedArgs): Promise<void> {
+  const refStr = args.positional[1];
+  if (typeof refStr !== "string") die("datasets uses: missing <name>[@version]");
+  const { name, version: pinned } = parseNameVersion(refStr);
+  const root = defaultDatasetsRoot();
+  const registry = createFileBackedRegistry({ rootDir: root });
+  const version = pinned ?? (await latestVersion(registry, name));
+  if (version === undefined) {
+    die(`dataset "${name}" has no versions in the registry (${root})`);
+  }
+  const report = readHeldOutUses(root, name, version);
+  if (args.flags["json"] === true) {
+    process.stdout.write(`${JSON.stringify(usesJson(name, version, report), null, 2)}\n`);
+    return;
+  }
+  for (const line of usesLines(name, version, report)) process.stdout.write(`${line}\n`);
 }
 
 // -------- item 2: `crewhaus dataset` (singular) growth family --------
@@ -13778,6 +14154,8 @@ async function runRefreshGoldens(args: ParsedArgs): Promise<void> {
       ...(record.splits.test !== undefined
         ? { test: promoteVerifiedSynthetics(applyProposals(record.splits.test, result.proposals)) }
         : {}),
+      // The holdout travels as it is: no proposal names a holdout case.
+      ...(record.splits.holdout !== undefined ? { holdout: [...record.splits.holdout] } : {}),
     },
   });
   process.stdout.write(
@@ -13874,6 +14252,9 @@ async function runDatasetAudit(args: ParsedArgs): Promise<void> {
         ...(record.splits.test !== undefined
           ? { test: record.splits.test.map((s) => redactSample(s)) }
           : {}),
+        ...(record.splits.holdout !== undefined
+          ? { holdout: record.splits.holdout.map((s) => redactSample(s)) }
+          : {}),
       };
       const version = nextVersion(await registry.list(registryRef.name));
       const rec = await registry.put({ name: registryRef.name, version, splits });
@@ -13884,7 +14265,7 @@ async function runDatasetAudit(args: ParsedArgs): Promise<void> {
       // graders (live agent output is never redacted). Count before/after so
       // the operator knows the instrument changed, not the agent.
       let redactedGolds = 0;
-      for (const name of ["train", "dev", "test"] as const) {
+      for (const name of ["train", "dev", "test", "holdout"] as const) {
         const before = record.splits[name];
         const after = splits[name];
         if (before === undefined || after === undefined) continue;
@@ -19411,6 +19792,7 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
       // bare refs still resolve train+dev only (with the exclusion notice).
       resolved = await resolveRegistryRef(dsReg, registryRef, {
         allowTestSplit: args.flags["allow-test-split"] === true,
+        use: { purpose: "canary", via: "cli" },
       });
     } catch (err) {
       if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
@@ -19853,6 +20235,9 @@ async function runPropose(args: ParsedArgs): Promise<void> {
         }
       : undefined;
 
+  // The proposal is filed as a change record; its id keys the bundle, the
+  // branch and the PR body. A dry run mints it and writes nothing.
+  const chg = mintChangeId();
   let assembled: ReturnType<typeof assembleProposal>;
   try {
     assembled = assembleProposal({
@@ -19864,21 +20249,25 @@ async function runPropose(args: ParsedArgs): Promise<void> {
       ...(evalDelta !== undefined ? { evalDelta } : {}),
       ...(optimizeRootDir !== undefined ? { optimizeRootDir } : {}),
       proposedVersion,
+      change: chg,
     });
   } catch (err) {
     if (err instanceof ProposeError) die(err.message);
     throw err;
   }
 
-  const { plan, proposalId: id } = buildProposalPrPlan({
+  const built = buildProposalPrPlan({
     assembled,
     proposedYaml,
     specRelPath,
     proposedVersion,
+    change: chg,
   });
+  const id = built.proposalId;
+  let plan = built.plan;
 
   if (args.flags["dry-run"] === true) {
-    process.stdout.write(`[propose] ${id} — dry run (no git/gh)\n`);
+    process.stdout.write(`[propose] ${id} — dry run (no git/gh); the change id it would file\n`);
     process.stdout.write(`  branch: ${plan.branch}\n`);
     process.stdout.write(`  title:  ${plan.title}\n`);
     process.stdout.write(`  files:  ${Object.keys(plan.files).join(", ")}\n`);
@@ -19886,6 +20275,32 @@ async function runPropose(args: ParsedArgs): Promise<void> {
     process.stdout.write("\n");
     process.stdout.write(assembled.prBody);
     return;
+  }
+
+  // The change record, before the PR: its content under
+  // .crewhaus/proposals/<chg>/ and its `proposed` row. The branch carries the
+  // same bundle files.
+  {
+    const filed = await proposeChange({
+      specPath: currentPath,
+      source,
+      baseText: currentYaml,
+      candidateText: proposedYaml,
+      ...(typeof datasetFlag === "string" ? { dataset: datasetFlag } : {}),
+      changelogEntry: assembled.changelogEntry,
+      chg,
+      prBody: assembled.prBody,
+      patchExtra: assembled.patch,
+    });
+    if (!filed.ok) die(`propose: the change record was not written: ${filed.reason}`);
+    const bundle = `${PROPOSALS_RELDIR}/${chg}`;
+    const patchText = readChangeContent(dirname(currentPath), chg, "patch.json");
+    if (patchText !== undefined) {
+      plan = { ...plan, files: { ...plan.files, [`${bundle}/patch.json`]: patchText } };
+    }
+    process.stdout.write(
+      `[propose] filed ${chg} — check it with \`crewhaus changes check ${chg}\`\n`,
+    );
   }
 
   const driver = createGitPrDriver();
@@ -23878,6 +24293,33 @@ switch (subcommand) {
     try {
       const { runCriteriaCommand } = await import("./criteria-cmd");
       const out = await runCriteriaCommand(rest);
+      for (const line of out.lines) process.stdout.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "changes": {
+    // Change records: propose, check, adopt, decline, withdraw and roll back a
+    // change to the spec, graders or cases. Heavy lifting lives in the
+    // side-effect-free ./changes-cmd module; bad arguments throw plain Errors.
+    try {
+      const { runChangesCommand } = await import("./changes-cmd");
+      // A spec-registry version is registered for an adopted spec when the
+      // harness keeps a registry, as a write-back does.
+      const usesRegistry = existsSync(join(process.cwd(), ".crewhaus", "specs"));
+      const out = await runChangesCommand(rest, {
+        ...(usesRegistry
+          ? {
+              register: async (yaml: string) => {
+                await autoRegisterSpec(yaml, {});
+                return undefined;
+              },
+            }
+          : {}),
+      });
       for (const line of out.lines) process.stdout.write(`${line}\n`);
       if (out.exitCode !== 0) process.exit(out.exitCode);
     } catch (err) {

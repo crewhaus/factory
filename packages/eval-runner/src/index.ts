@@ -2227,7 +2227,12 @@ async function defaultInvoker(
   };
 }
 
-function generateRunId(): string {
+/**
+ * A fresh eval run id (`run_<16 hex>`). Exported so a caller that must name
+ * the run before it starts (a held-out use line written before the dataset
+ * is read) mints the same shape the runner would, and passes it as `runId`.
+ */
+export function generateRunId(): string {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
   return `run_${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;

@@ -132,7 +132,14 @@ instead of reporting: a version written from a partial read is a version that si
   reaches the prompt is precisely the contamination it was planted to detect — the sample id comes
   back instead, and the phrase stays derivable offline from `(name, version)`.
 - Per-sample detail for the locked `test` split is withheld unless `allowTestSplit` is passed.
-  Counts, hashes and PII *totals* are reported either way: a leak in the holdout is still a leak.
+  Counts, hashes and PII *totals* are reported either way: a leak in the test split is still a leak.
+- The `holdout` split is never read back to an agent. `DatasetInspect` reports its count, golds
+  and hash check, and counts its PII hits without locating them, whatever `allowTestSplit` says;
+  `DatasetLint` leaves it out of the linted set and reports it as a count; `DatasetPut` writes no
+  holdout itself and carries the dataset's newest holdout forward as it was. The same holds for
+  every case any version holds out, read through any version: the version a holdout was cut from
+  lists none of them, and a re-put never puts one back. A `#holdout` reference is refused. A
+  person cuts and reviews a holdout with `crewhaus datasets`.
 - Sample ids and rule messages are rendered before they are echoed. Ids come from a caller's file,
   and one carrying an ANSI escape or a newline would otherwise forge a line in whatever reads the
   result.

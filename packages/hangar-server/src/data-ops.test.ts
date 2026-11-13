@@ -174,7 +174,7 @@ describe("pure registry rules", () => {
       synthetic: 1,
       "(unlabelled)": 1,
     });
-    expect(splitSizes(record as never)).toEqual({ train: 2, dev: 1, test: null });
+    expect(splitSizes(record as never)).toEqual({ train: 2, dev: 1, test: null, holdout: null });
   });
 
   test("a version's runs include its split-pinned and regression-unioned names", () => {
@@ -194,13 +194,13 @@ describe("the registry panel", () => {
     const rows = body["datasets"] as Array<{
       name: string;
       verify: { ok: boolean; badge: string };
-      splits: { train: number; dev: number; test: number | null };
+      splits: { train: number; dev: number; test: number | null; holdout: number | null };
       provenance: Record<string, number>;
       testSplitBurn: number;
       autoMaintained: string | null;
     }>;
     const core = rows.find((r) => r.name === "core") as (typeof rows)[number];
-    expect(core.splits).toEqual({ train: 1, dev: 1, test: 1 });
+    expect(core.splits).toEqual({ train: 1, dev: 1, test: 1, holdout: null });
     expect(core.provenance).toEqual({ human: 2, mined: 1 });
     expect(core.verify.badge).toBe("tampered");
     expect(core.testSplitBurn).toBe(1);
@@ -271,10 +271,10 @@ describe("the registry panel", () => {
     const byhand = rows.find((r) => r.name === "byhand") as (typeof rows)[number];
     expect(byhand.verify?.badge).toBe("tampered");
     expect(byhand.verify?.mismatches).toBe(1);
-    expect(byhand.splits).toEqual({ train: 1, dev: 0, test: null });
+    expect(byhand.splits).toEqual({ train: 1, dev: 0, test: null, holdout: null });
     const bare = rows.find((r) => r.name === "bare") as (typeof rows)[number];
     expect(bare.verify?.ok).toBe(true);
-    expect(bare.splits).toEqual({ train: 0, dev: 0, test: null });
+    expect(bare.splits).toEqual({ train: 0, dev: 0, test: null, holdout: null });
 
     const detail = await t.api(`/api/h/${id}/data/datasets/byhand`);
     expect(detail.status).toBe(200);

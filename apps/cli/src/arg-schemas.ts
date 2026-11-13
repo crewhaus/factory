@@ -556,6 +556,13 @@ export const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     { name: "warm-arms", takesValue: false },
     { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
+    // An accepted candidate is filed as a change (`crewhaus changes`); the
+    // spec is never written. Refused with --write-back.
+    { name: "propose", takesValue: false },
+    // Every candidate's eval replays tool results from this recording, like
+    // `crewhaus eval --replay-tools`; --replay-miss as eval's.
+    { name: "replay-tools", takesValue: true },
+    { name: "replay-miss", takesValue: true },
   ],
 };
 
@@ -594,6 +601,9 @@ export const FLYWHEEL_SCHEMA: ParseArgsSchema = {
     // --suite` emit). Harness-relative, like every other path in the job.
     { name: "suite", takesValue: true },
     { name: "help", short: "h" },
+    // `flywheel run` — an accepted candidate is filed as a change
+    // (`crewhaus changes`); the spec is never written.
+    { name: "propose", takesValue: false },
   ],
 };
 
@@ -1263,6 +1273,11 @@ export const DATASETS_SCHEMA: ParseArgsSchema = {
     // `card` (B21) — write the markdown datasheet to a file instead of stdout.
     { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
+    // `holdout` — the share of train+dev to hold out, and the selection seed.
+    { name: "fraction", takesValue: true },
+    { name: "seed", takesValue: true },
+    // `uses` — print the use ledger as JSON.
+    { name: "json", takesValue: false },
   ],
 };
 

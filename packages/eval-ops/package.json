@@ -9,6 +9,7 @@
     ".": "./src/index.ts",
     "./eval-coverage": "./src/eval-coverage.ts",
     "./eval-history": "./src/eval-history.ts",
+    "./flywheel-acceptance": "./src/flywheel-acceptance.ts",
     "./graders-test": "./src/graders-test.ts"
   },
   "scripts": {

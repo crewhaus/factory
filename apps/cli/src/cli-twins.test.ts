@@ -205,8 +205,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(35);
-    expect(pins).toBe(47);
+    expect(Object.keys(REQUIRED).length).toBe(43);
+    expect(pins).toBe(58);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -328,6 +328,12 @@ describe("the server's twins, by import", () => {
       kind: "audience",
       area: "communication",
     };
+    const QUALITY = {
+      chg: mintId("chg"),
+      rev: `sha256:${"ab".repeat(32)}`,
+      dataset: "support-cases",
+      evalRun: "run_0123456789abcdef",
+    };
     const SAMPLES = [
       {
         hrn: "hrn_0123456789abcdef",
@@ -339,6 +345,9 @@ describe("the server's twins, by import", () => {
         verdict: "keep",
         supersedeReason: "decided-in-error",
         rule: "rule_01m76e6f05hp514w9j4v3qymka",
+        ...QUALITY,
+        changeReason: "not-worth-it",
+        fraction: "0.2",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -350,6 +359,9 @@ describe("the server's twins, by import", () => {
         verdict: "reopen",
         supersedeReason: "policy-changed",
         rule: "rule_01m76e6f05hp514w9j4v3qymka",
+        ...QUALITY,
+        changeReason: "other",
+        fraction: ".5",
       },
     ];
     const twins = [
@@ -369,8 +381,8 @@ describe("the server's twins, by import", () => {
         checked++;
       }
     }
-    // Twenty-six operation twins, fifteen command kinds and eight route rows, each rendered twice.
-    expect(checked).toBeGreaterThanOrEqual(98);
+    // Twenty-six operation twins, twenty-two command kinds and eight route rows, each rendered twice.
+    expect(checked).toBeGreaterThanOrEqual(112);
   });
 });
 

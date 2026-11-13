@@ -234,8 +234,7 @@ function refusalText(res) {
  * Conventional paths default from the harness dir, so the common launch is
  * one click. `--allow-test-split` is deliberately NOT a checkbox like the others:
  * it reads the held-out test cases, and the server refuses it without the typed
- * confirmation. Only `crewhaus datasets release` records a use; a run from here
- * is not recorded.
+ * confirmation. The read is counted beside the dataset version.
  */
 export function launcherCard(ctx, flywheelRes, reload) {
   const offer = launchOf(flywheelRes, "eval");
@@ -269,7 +268,7 @@ export function launcherCard(ctx, flywheelRes, reload) {
   form.appendChild(
     el("label", { class: "check" }, [
       holdout,
-      el("span", { text: " Use the held-out test cases (this run is not recorded)" }),
+      el("span", { text: " Use the held-out test cases (this use is counted)" }),
     ]),
   );
   form.appendChild(confirmField);

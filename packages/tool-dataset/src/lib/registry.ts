@@ -45,6 +45,7 @@ import {
   compareVersions,
   createFileBackedRegistry,
 } from "@crewhaus/dataset-registry";
+import type { Sample } from "@crewhaus/eval-dataset";
 import { joinRel, probeKind, resolveContained } from "@crewhaus/tool-safety/fs";
 import { type SafePath, ToolPermissionError, resolveSafe, workspaceRoot } from "../paths";
 import { type Loaded, errorMessage, fail, renderGiven } from "./result";
@@ -269,7 +270,55 @@ export async function readRecord(
  *  `splitsPresent` from dataset-ops assumes the key is there. */
 export function presentSplits(record: DatasetRecord): DatasetSplit[] {
   const splits = record.splits ?? {};
-  return (["train", "dev", "test"] as const).filter((s) => splits[s] !== undefined);
+  return (["train", "dev", "test", "holdout"] as const).filter((s) => splits[s] !== undefined);
+}
+
+/** The ids of a record's holdout rows: the rows no agent tool reads, lists
+ *  or returns. Empty when the record has no holdout. */
+export function holdoutIdsOf(record: DatasetRecord): Set<string> {
+  return new Set(splitSamplesOf(record, "holdout").map((s) => s.id));
+}
+
+/**
+ * The ids every version of a dataset keeps in its holdout, and the newest holdout's
+ * rows. A holdout is cut into a new version, so the version it was cut from still
+ * lists those cases in train or dev: this union is what no agent tool returns, from
+ * any version. A version that cannot be read refuses (its holdout cannot be known).
+ * `versions` in version order, oldest first.
+ */
+export async function heldOutAcross(
+  registry: DatasetRegistry,
+  name: string,
+  versions: ReadonlyArray<string>,
+): Promise<
+  Loaded<{
+    readonly ids: ReadonlySet<string>;
+    readonly newest?: { readonly version: string; readonly rows: ReadonlyArray<Sample> };
+  }>
+> {
+  const ids = new Set<string>();
+  let newest: { version: string; rows: ReadonlyArray<Sample> } | undefined;
+  for (const version of versions) {
+    const record = await readRecord(registry, name, version);
+    if (!record.ok) {
+      return fail(
+        record.code,
+        `${record.message} — so which cases "${renderGiven(name)}" holds out cannot be known, and nothing is returned`,
+      );
+    }
+    const rows = splitSamplesOf(record.value, "holdout");
+    if (rows.length === 0) continue;
+    newest = { version, rows };
+    for (const s of rows) ids.add(s.id);
+  }
+  return { ok: true, value: { ids, ...(newest !== undefined ? { newest } : {}) } };
+}
+
+/** Every sample outside the holdout, canonical split order. */
+export function samplesOutsideHoldout(record: DatasetRecord) {
+  return presentSplits(record)
+    .filter((s) => s !== "holdout")
+    .flatMap((s) => [...splitSamplesOf(record, s)]);
 }
 
 /** A record's samples for one split, or `[]` when the split is absent. */
@@ -286,10 +335,12 @@ export function allSamplesOf(record: DatasetRecord) {
 
 /** id → the split it currently sits in. The ground truth a stable re-put
  *  carries forward: what actually happened last time, not what a hash says
- *  should have happened. */
+ *  should have happened. The holdout is left out: its rows are carried as
+ *  they are, never assigned, listed or reported (see `planSplits`). */
 export function assignmentOf(record: DatasetRecord): Map<string, DatasetSplit> {
   const out = new Map<string, DatasetSplit>();
   for (const split of presentSplits(record)) {
+    if (split === "holdout") continue;
     for (const s of splitSamplesOf(record, split)) out.set(s.id, split);
   }
   return out;

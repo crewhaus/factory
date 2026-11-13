@@ -128,9 +128,10 @@ describe("EvalBaselinePin writes only a regular baselines.json", () => {
       "index.jsonl",
       "r1",
     ]);
+    const pinned = readFileSync(baselinesPath(), "utf8");
     const cleared = await call(evalBaselinePin, { ...SET, action: "clear" });
-    expect(cleared.out["committed"]).toBe(true);
-    expect(readFileSync(baselinesPath(), "utf8")).toBe("{}\n");
+    expect(cleared.out["code"]).toBe("refused");
+    expect(readFileSync(baselinesPath(), "utf8")).toBe(pinned);
   });
 
   test("a run whose results.json links out of the workspace is not pinned", async () => {
