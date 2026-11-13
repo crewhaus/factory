@@ -111,6 +111,31 @@ export type AdvisorAction = {
   readonly jobKind: string | null;
 };
 
+/**
+ * Every console screen an advisor item can name as the owner of its fix: a
+ * harness screen by the id the console's link builder takes, or the fleet
+ * approvals inbox. `screen-routes.test.ts` sends each through the console's
+ * own builders and fails if one lands nowhere.
+ */
+export const ADVISOR_SCREENS = [
+  "overview",
+  "approvals",
+  "spec",
+  "runs",
+  "schedulers",
+  "evals",
+  "memory",
+  "feedback",
+  "costs",
+  "models",
+  "creds",
+  "channels",
+  "security",
+  "deploy",
+  "dev",
+] as const;
+export type AdvisorScreen = (typeof ADVISOR_SCREENS)[number];
+
 export type AdvisorItem = {
   /** Stable, {@link SAFE_SEGMENT_RE}-safe — it names a route segment and a
    *  ledger key, and it must survive re-derivation to keep a dismissal
@@ -125,9 +150,9 @@ export type AdvisorItem = {
   readonly explain: string;
   /** What to do about it — always present, even when no button is. */
   readonly guidance: string;
-  /** The console screen that owns the fix: a harness tab name, or one of the
-   *  fleet screens ("approvals"). The view renders it as a deep link. */
-  readonly screen: string;
+  /** The console screen that owns the fix: a harness screen, or the fleet
+   *  approvals inbox. The view renders it as a deep link. */
+  readonly screen: AdvisorScreen;
   /** The panel family the signal came from (preflight, spec, evals, …). */
   readonly source: string;
   readonly action: AdvisorAction | null;
@@ -209,7 +234,7 @@ const linkAction = (label: string, cliTwin: string | null = null): AdvisorAction
 
 /** Preflight area → the tab that fixes it (the health module's own table,
  *  restated here so the advisor and the score can be tested independently). */
-const AREA_SCREEN: Readonly<Record<string, string>> = {
+const AREA_SCREEN: Readonly<Record<string, AdvisorScreen>> = {
   spec: "spec",
   credentials: "creds",
   channels: "channels",

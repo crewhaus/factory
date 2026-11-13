@@ -1,12 +1,13 @@
 /**
- * A route's first paint is not its whole UI. This sweeps the gated screens'
- * other states — every overlay, an armed inbox row, a filtered digest, an
- * open disclosure, each panel of the memory fabric and of the Thredz tab,
- * and the Library under each Readability choice — with the same matrix and
- * the same verdict as the first-paint sweep: any violation fails.
+ * A route's first paint is not its whole UI. This sweeps the screens' other
+ * states — every overlay, the header's lists, a section's sub-view list, an
+ * armed inbox row, a filtered digest, an open disclosure, each panel of the
+ * memory fabric and of the Thredz screen, and the harness list under each
+ * Readability choice — with the same matrix and the same verdict as the
+ * first-paint sweep: any violation fails.
  *
  * Its rows are `<template>><state>`, written to their own artifact
- * (`axe-states-report.json`), never to the committed baseline.
+ * (`axe-states-report.json`).
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -20,13 +21,14 @@ export const axeStates: Journey = {
   id: "axe-states",
   shard: "axe",
   proves:
-    "Every overlay and state of the gated screens — the dialogs, the command menu, the tooltip, an armed inbox row, the row menu, a filtered digest, every memory and Thredz panel, and each Readability choice — has no axe violation in either theme at either width.",
+    "Every overlay and state of the screens — the dialogs, the command menu, the header's Help, Settings and Menu lists, a section's sub-view list, the tooltip, an armed inbox row, the row menu, a filtered digest, every memory and Thredz panel, and each Readability choice — has no axe violation in either theme at either width.",
   run: async (scope) => {
     const world = await a11yFleet(scope, "axe-states");
-    const states = screenStates(world.harness.id);
+    const states = screenStates(world.harness);
     const rows: Record<string, Record<string, number>> = {};
     const samples: Record<string, Readonly<Record<string, readonly string[]>>> = {};
     const notRun: string[] = [];
+    const strays: string[] = [];
     let version = "";
     for (const theme of GATE_THEMES) {
       for (const width of GATE_WIDTHS) {
@@ -39,6 +41,13 @@ export const axeStates: Journey = {
         await mockRefusals(session.page, world.harness.id);
         for (const state of states) {
           await enterState(session, state);
+          // A value that was never there, drawn as a word, is a broken state too.
+          const stray = /^(null|undefined|\[object Object\])$/m.exec(
+            await session.page.locator("body").innerText(),
+          );
+          if (stray !== null) {
+            strays.push(`${state.template}>${state.state} ${theme} ${width}: "${stray[0]}"`);
+          }
           const result = await runAxe(session.page);
           version = result.version;
           const template = `${state.template}>${state.state}`;
@@ -60,6 +69,8 @@ export const axeStates: Journey = {
       );
     }
     if (notRun.length > 0) throw new Error(`axe did not run on: ${notRun.join(", ")}`);
+    if (strays.length > 0)
+      throw new Error(`a state shows a missing value:\n  ${strays.join("\n  ")}`);
     const verdict = gateVerdict(
       report,
       states.map((state) => `${state.template}>${state.state}`),

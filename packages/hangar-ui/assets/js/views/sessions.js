@@ -11,7 +11,17 @@
  */
 
 import { api } from "../api.js";
-import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
+import {
+  clear,
+  collapsible,
+  dot,
+  el,
+  emptyState,
+  jsonPre,
+  scrollRegion,
+  skeleton,
+  toast,
+} from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { NO_TWIN_NOTES } from "../supervision.js";
 import {
@@ -71,7 +81,7 @@ export async function renderSessions(root, ctx) {
     );
   }
   root.appendChild(
-    el("div", { class: "table-scroll" }, [
+    scrollRegion("Sessions", [
       el("table", { class: "fleet" }, [
         el(
           "thead",

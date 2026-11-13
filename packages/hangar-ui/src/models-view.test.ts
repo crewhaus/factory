@@ -6,7 +6,7 @@
  */
 import { describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { HARNESS_TABS, M3_TABS, parseRoute } from "../assets/js/router.js";
+import { LEGACY_HARNESS_TABS, LEGACY_REST_TABS, parseRoute } from "../assets/js/router.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { ROUTES } from "../assets/js/routes.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
@@ -44,22 +44,26 @@ describe("declaredPools", () => {
   });
 });
 
-describe("the models tab is routable", () => {
-  test("it sits in the strip right after Costs, and deep-links resolve", () => {
-    const tabs = HARNESS_TABS as string[];
-    expect(tabs).toContain("models");
-    expect(tabs[tabs.indexOf("models") - 1]).toBe("costs");
-    // An M3 tab so trailing segments are captured generically — a route
-    // timeline is `#/h/<id>/models/routes/<sess>`.
-    expect(M3_TABS as string[]).toContain("models");
+describe("the models screen is routable", () => {
+  // Changed deliberately: the Models tab is Setup › Models now; its old
+  // address redirects, and its trailing segments still reach the view.
+  test("its old address lands in Setup, and a route timeline's address keeps its session", () => {
+    expect(LEGACY_HARNESS_TABS as string[]).toContain("models");
+    expect(LEGACY_REST_TABS as string[]).toContain("models");
     expect(parseRoute("#/h/hrn_0123456789abcdef/models")).toEqual({
       view: "harness",
       id: "hrn_0123456789abcdef",
-      tab: "models",
+      section: "setup",
+      sub: "models",
+      rest: [],
+      query: {},
     });
-    expect(parseRoute("#/h/hrn_0123456789abcdef/models/routes/sess_0123456789abcdef").rest).toEqual(
-      ["routes", "sess_0123456789abcdef"],
-    );
+    for (const hash of [
+      "#/h/hrn_0123456789abcdef/models/routes/sess_0123456789abcdef",
+      "#/h/hrn_0123456789abcdef/setup/models/routes/sess_0123456789abcdef",
+    ]) {
+      expect(parseRoute(hash).rest).toEqual(["routes", "sess_0123456789abcdef"]);
+    }
   });
 
   test("all four routes are in the map, GET-only, in the models group", () => {

@@ -31,7 +31,7 @@ import {
   toast,
   withTip,
 } from "../dom.js";
-import { hrefGlobal, hrefHarness } from "../router.js";
+import { hrefHarness, screenHref, screenLabel } from "../router.js";
 import { chart, chartModel } from "../ui/chart.js";
 import { bindDraft, draftKey } from "../ui/draft.js";
 import { fmtPct } from "../util.js";
@@ -61,13 +61,16 @@ export function itemActionModel(item, id) {
     };
   }
   const screen = String(item.screen ?? "overview");
-  // Fleet screens (the approvals inbox) are global; everything else is a tab
-  // on this harness.
-  const href = screen === "approvals" ? hrefGlobal("approvals") : hrefHarness(id, screen);
+  // Fleet screens (the approvals inbox) are global; everything else is a
+  // screen on this harness, named the way the console names it.
+  const href = screenHref(id, screen);
+  const where = screenLabel(screen);
+  const generic = action.label === undefined || String(action.label) === `Open ${screen}`;
   return {
     kind: "link",
-    label: String(action.label ?? `Open ${screen}`),
+    label: generic ? `Open ${where}` : String(action.label),
     href,
+    where,
     cliTwin: typeof action.cliTwin === "string" ? action.cliTwin : null,
   };
 }

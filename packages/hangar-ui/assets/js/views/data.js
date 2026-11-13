@@ -18,7 +18,17 @@
  */
 
 import { api } from "../api.js";
-import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
+import {
+  clear,
+  collapsible,
+  dot,
+  el,
+  emptyState,
+  jsonPre,
+  scrollRegion,
+  skeleton,
+  toast,
+} from "../dom.js";
 import { fmtCount, fmtRelativeTime } from "../util.js";
 
 export async function renderData(root, ctx) {
@@ -66,7 +76,7 @@ function panel(title, res, draw) {
 }
 
 function table(headers, rows) {
-  return el("div", { class: "table-scroll" }, [
+  return scrollRegion(`Table of ${headers.join(", ")}`, [
     el("table", { class: "fleet" }, [
       el(
         "thead",

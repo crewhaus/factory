@@ -6,7 +6,7 @@
  */
 
 import { api } from "../api.js";
-import { clear, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
+import { clear, dot, el, emptyState, jsonPre, scrollRegion, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
 import {
   fmtRelativeTime,
@@ -100,7 +100,7 @@ export function drawHistory(root, ctx, data, reload) {
     );
   }
   root.appendChild(
-    el("div", { class: "table-scroll" }, [
+    scrollRegion("Eval runs", [
       el("table", { class: "fleet" }, [
         el(
           "thead",
@@ -271,7 +271,7 @@ export function drawRun(root, ctx, runId, data) {
       );
     }
     listWrap.appendChild(
-      el("div", { class: "table-scroll" }, [
+      scrollRegion("Samples", [
         el("table", { class: "fleet" }, [
           el(
             "thead",

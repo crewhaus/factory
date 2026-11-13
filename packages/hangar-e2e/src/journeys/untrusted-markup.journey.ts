@@ -1,13 +1,6 @@
 /** Outside text stays text. */
 import type { Page } from "playwright";
-import {
-  crawlRoutes,
-  harnessRoute,
-  loadConsoleGrammar,
-  runRoute,
-  sessionRoute,
-  wikiRoute,
-} from "../console-routes";
+import { crawlRoutes, loadConsoleGrammar, routeFor } from "../console-routes";
 import { MARKUP_PAYLOAD, MARKUP_VISIBLE } from "../seed/fleet";
 import { settle } from "../settle";
 import type { Journey } from "./journey";
@@ -46,12 +39,8 @@ export const untrustedMarkup: Journey = {
       expectedStatuses: [{ pathname: patchPath, status: 412 }],
     });
 
-    const routes = [
-      ...crawlRoutes(grammar, [harness.id]).map(({ route }) => route),
-      sessionRoute(harness.id, harness.sessionIds[0] ?? ""),
-      runRoute(harness.id, harness.runId),
-      wikiRoute(harness.id, harness.wikiSlug),
-    ];
+    // Every route, the deep ones (a transcript, a run, a wiki article) included.
+    const routes = crawlRoutes(grammar, [harness]).map(({ route }) => route);
     const visibleOn: string[] = [];
     const liveLinks: string[] = [];
     for (const route of routes) {
@@ -78,7 +67,7 @@ export const untrustedMarkup: Journey = {
         `the payload was on ${visibleOn.length} screens, under ${MIN_SCREENS_SHOWING_PAYLOAD}: [${visibleOn}]`,
       );
     }
-    const wiki = wikiRoute(harness.id, harness.wikiSlug);
+    const wiki = routeFor("#/h/:id/knowledge/wiki/:slug", harness);
     if (!visibleOn.includes(wiki)) {
       throw new Error(`the wiki article did not show the payload as text; on: ${visibleOn}`);
     }
@@ -133,16 +122,16 @@ export const untrustedMarkup: Journey = {
     await settle(page, "a reload");
     components["toast"] = await shownText(page, ".toast", "the notification toast");
 
-    await session.visit(harnessRoute(harness.id, "advisor"));
+    await session.visit(routeFor("#/h/:id/overview/needs-you", harness));
     const reportButton = page.locator("button[data-tip]", { hasText: "Generate" }).first();
     await reportButton.focus();
     components["tooltip"] = await shownText(page, ".tip", "the report tooltip");
 
-    await session.visit(harnessRoute(harness.id, "costs"));
+    await session.visit(routeFor("#/h/:id/setup/budget", harness));
     await page.locator("figure.chart summary").first().click();
     components["chart label"] = await shownText(page, "figure.chart td", "the chart's data table");
 
-    await session.visit(harnessRoute(harness.id, "spec"));
+    await session.visit(routeFor("#/h/:id/setup/spec", harness));
     await page.getByRole("button", { name: "View", exact: true }).first().click();
     components["dialog title"] = await shownText(page, "dialog[open] h2", "the version dialog");
     await page.keyboard.press("Escape");

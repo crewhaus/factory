@@ -56,9 +56,9 @@
 import type { EvalHealthState } from "./evals";
 import { withoutTrailingComment } from "./spec-lines";
 
-/** The console tab a deduction is fixed on — every value is a real tab in
- *  the harness detail strip (`HARNESS_TABS` in the console's router), so a
- *  deduction can always be rendered as a link. */
+/** The console screen a deduction is fixed on, by the id the console's link
+ *  builder (`hrefHarness` in its router) takes, so a deduction can always be
+ *  rendered as a link; `screen-routes.test.ts` holds every value to it. */
 export const HEALTH_SCREENS = [
   "overview",
   "spec",
