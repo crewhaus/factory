@@ -67,6 +67,21 @@ export type ActivationGate = {
   >;
 };
 
+/** What a run sweep is given: the head's probe and clock, and when the machine booted. */
+export type RunSweepContext = {
+  readonly probe: LeaseProbe;
+  readonly host: string;
+  readonly hostBootedAt: number;
+  readonly now: number;
+};
+
+/**
+ * A recovery step over one harness's run ledger: it closes the runs a process that died
+ * left open where nothing else will, and answers how many it closed. It writes; a read
+ * never runs one.
+ */
+export type RunSweep = (harnessDir: string, ctx: RunSweepContext) => Promise<number>;
+
 /** An area's running code for the command kinds it owns. Later slots join this type. */
 export type AreaRuntime = {
   /** The area's name, as its module in control-contract declares it. */
@@ -80,6 +95,8 @@ export type AreaRuntime = {
   readonly unsupervised?: readonly string[];
   /** Checks every activation passes; the core's protected-environment gate runs first. */
   readonly activationGates?: readonly ActivationGate[];
+  /** Run once per harness each recovery visits, in composition order. */
+  readonly runSweeps?: readonly RunSweep[];
 };
 
 /** An executor stamp, with `probed: false` when the probe could not say when it started. */

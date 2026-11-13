@@ -213,6 +213,7 @@ export const EXAMPLES: Readonly<Record<string, unknown>> = {
   tokenMintRequest: { principal: mintId("prn"), seal: SEAL },
   tokenRow: TOKEN_ROW,
   trigger: { kind: "api" },
+  triggerSource: { platform: "slack", conversationRef: "c".repeat(64), messageRef: "m".repeat(64) },
 };
 
 /** An area's examples live in its own `__test__/<area>.examples.ts`, exporting `EXAMPLES`. */

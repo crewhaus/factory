@@ -273,6 +273,7 @@ export {
   TRIGGER_KINDS,
   type Trigger,
   type TriggerKind,
+  type TriggerSource,
   formatRef,
   formatResumeScope,
   isGrantScope,

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { hostname } from "node:os";
 import {
   type ApprovalDecision,
   type ApprovalStore,
@@ -14,7 +15,6 @@ import {
   createRuntimeBackedApprovalStore,
   postApprovalPrompt,
   previewApprovalInput,
-  resolveApproval,
 } from "./index";
 
 /** Deterministic id generator: appr_1, appr_2, … */
@@ -129,71 +129,10 @@ describe("postApprovalPrompt", () => {
   });
 });
 
-describe("resolveApproval", () => {
-  test("publishes approval_resolved and appends one audit record on the transition", async () => {
-    const store = new InMemoryApprovalStore({ genId: seqIds() });
-    const p = await store.put({
-      toolName: "bash",
-      inputPreview: "{}",
-      surface: "daemon",
-      sessionId: "s1",
-    });
-    const published: string[] = [];
-    const audit: Array<{ kind: string; payload: unknown }> = [];
-    const resolved = await resolveApproval({
-      store,
-      approvalId: p.id,
-      decision: "grant",
-      by: "slack:U9",
-      publish: (e) => published.push(`${e.kind}:${e.approvalId}`),
-      auditSink: { append: async (r) => audit.push(r) },
-    });
-    expect(resolved?.status).toBe("grant");
-    expect(published).toEqual([`approval_resolved:${p.id}`]);
-    expect(audit.length).toBe(1);
-    expect(audit[0]?.kind).toBe("approval_resolved");
-    expect((audit[0]?.payload as { decision: string }).decision).toBe("grant");
-  });
-
-  test("a duplicate resolve is a no-op: returns null, no second audit/publish", async () => {
-    const store = new InMemoryApprovalStore({ genId: seqIds() });
-    const p = await store.put({ toolName: "t", inputPreview: "{}", surface: "d", sessionId: "s1" });
-    const published: string[] = [];
-    const audit: unknown[] = [];
-    const deps = {
-      store,
-      approvalId: p.id,
-      decision: "grant" as ApprovalDecision,
-      by: "cli",
-      publish: (e: { kind: string }) => published.push(e.kind),
-      auditSink: { append: async (r: unknown) => audit.push(r) },
-    };
-    expect((await resolveApproval(deps))?.status).toBe("grant");
-    expect(await resolveApproval(deps)).toBeNull(); // Slack retried the click
-    expect(published.length).toBe(1);
-    expect(audit.length).toBe(1);
-  });
-
-  test("resolving an unknown id returns null with no effects", async () => {
-    const store = new InMemoryApprovalStore({ genId: seqIds() });
-    const published: string[] = [];
-    const out = await resolveApproval({
-      store,
-      approvalId: "missing",
-      decision: "deny",
-      by: "cli",
-      publish: (e) => published.push(e.kind),
-    });
-    expect(out).toBeNull();
-    expect(published).toEqual([]);
-  });
-});
-
 describe("park → approve → resume e2e", () => {
   test("in-process: prompter parks, the store resolves grant, the tool proceeds", async () => {
     const store = new InMemoryApprovalStore({ genId: seqIds() });
     const trace: string[] = [];
-    const audit: Array<{ kind: string; payload: unknown }> = [];
     const publish = (e: { kind: string; approvalId: string }): void => {
       trace.push(`${e.kind}:${e.approvalId}`);
     };
@@ -218,18 +157,9 @@ describe("park → approve → resume e2e", () => {
     expect(pendings[0]?.inputPreview).toBe('{"command":"deploy prod"}');
     expect(trace).toEqual([`approval_requested:${id}`, `notify:${id}`]);
 
-    // APPROVE — the Slack button (or CLI verb) resolves the same store.
-    const resolved = await resolveApproval({
-      store,
-      approvalId: id,
-      decision: "grant",
-      by: "slack:U9",
-      publish,
-      auditSink: { append: async (r) => audit.push(r) },
-    });
-    expect(resolved?.decidedBy).toBe("slack:U9");
-    expect(trace).toContain(`approval_resolved:${id}`);
-    expect(audit.length).toBe(1);
+    // APPROVE — a decision recorded in the same store.
+    const resolved = await store.resolve(id, "grant", "cli");
+    expect(resolved?.decidedBy).toBe("cli");
 
     // RESUME — the parked prompter unblocks with grant, so the tool executes.
     await expect(parked).resolves.toBe(true);
@@ -246,7 +176,7 @@ describe("park → approve → resume e2e", () => {
     const parked = prompter("bash", { command: "rm -rf /" });
     await tick();
     const id = (await store.list({ status: "pending" }))[0]?.id ?? "";
-    await resolveApproval({ store, approvalId: id, decision: "deny", by: "slack:U9" });
+    await store.resolve(id, "deny", "cli");
     await expect(parked).resolves.toBe(false);
   });
 
@@ -410,6 +340,7 @@ describe("createRuntimeBackedApprovalStore", () => {
         cards.push(card);
         return {};
       },
+      approvers: () => ({ state: "absent" }),
     });
     expect(cards).toEqual([
       {
@@ -418,6 +349,8 @@ describe("createRuntimeBackedApprovalStore", () => {
         inputPreview: second.inputPreview,
         surface: "channel",
         landsAt: text,
+        fitsCard: true,
+        review: { host: hostname(), verb: `crewhaus approvals show ${again.id}` },
       },
     ]);
     const sent: string[] = [];
@@ -568,84 +501,6 @@ describe("createRuntimeBackedApprovalStore", () => {
 });
 
 describe("#383 — standing (always) grants through the channel seam", () => {
-  test("resolveApproval threads always into the store, trace event, and audit record", async () => {
-    const store = new InMemoryApprovalStore({ genId: seqIds(), now: () => 0 });
-    const p = await store.put({
-      toolName: "log_knowledge_gap",
-      inputPreview: '{"gap":"x"}',
-      surface: "channel",
-      sessionId: "sess_1",
-    });
-    const events: ApprovalTraceEvent[] = [];
-    const audit: Array<{ kind: string; payload: unknown }> = [];
-    const resolved = await resolveApproval({
-      store,
-      approvalId: p.id,
-      decision: "grant",
-      by: "slack:U1",
-      always: true,
-      publish: (e) => events.push(e),
-      auditSink: {
-        append: async (r) => {
-          audit.push(r);
-        },
-      },
-    });
-    expect(resolved?.status).toBe("grant");
-    expect(resolved?.always).toBe(true);
-    expect(events).toEqual([
-      {
-        kind: "approval_resolved",
-        approvalId: p.id,
-        decision: "grant",
-        by: "slack:U1",
-        always: true,
-      },
-    ]);
-    expect(audit).toHaveLength(1);
-    expect((audit[0]?.payload as { always?: boolean }).always).toBe(true);
-  });
-
-  test("always is dropped on a deny", async () => {
-    const store = new InMemoryApprovalStore({ genId: seqIds(), now: () => 0 });
-    const p = await store.put({
-      toolName: "t",
-      inputPreview: "{}",
-      surface: "channel",
-      sessionId: "sess_1",
-    });
-    const events: ApprovalTraceEvent[] = [];
-    const resolved = await resolveApproval({
-      store,
-      approvalId: p.id,
-      decision: "deny",
-      by: "slack:U1",
-      always: true,
-      publish: (e) => events.push(e),
-    });
-    expect(resolved?.status).toBe("deny");
-    expect(resolved?.always).toBeUndefined();
-    expect(events[0]).not.toHaveProperty("always");
-  });
-
-  test("an always grant still resolves first-decision-wins (idempotent)", async () => {
-    const store = new InMemoryApprovalStore({ genId: seqIds(), now: () => 0 });
-    const p = await store.put({
-      toolName: "t",
-      inputPreview: "{}",
-      surface: "channel",
-      sessionId: "sess_1",
-    });
-    expect(
-      (await resolveApproval({ store, approvalId: p.id, decision: "grant", by: "a", always: true }))
-        ?.always,
-    ).toBe(true);
-    // The duplicate click is a no-op (nothing to ACK), not a second effect.
-    expect(
-      await resolveApproval({ store, approvalId: p.id, decision: "grant", by: "b", always: true }),
-    ).toBeNull();
-  });
-
   test("the runtime-backed bridge passes always through and surfaces it on the record", async () => {
     const persisted: RuntimeApprovalRecord[] = [];
     let record: RuntimeApprovalRecord = {

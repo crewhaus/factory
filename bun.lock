@@ -424,8 +424,12 @@
       "version": "0.8.2",
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/control-service": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
       },
     },
     "packages/channel-adapter-discord": {

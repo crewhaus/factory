@@ -83,7 +83,10 @@ the next touch. A claim whose receipt never landed is completed from the claim o
 A daemon command runs again only while it is the harness's latest: once an operator has started,
 stopped or drained the daemon since, re-running an older command would undo theirs.
 
-It answers `{redispatched, reconciled, unknown}`. Recovery writes, so it never runs on a read.
+It answers `{redispatched, reconciled, unknown}`, and `runsInterrupted` when a run sweep closed a
+run: the core's sweep marks a chat message a channel daemon accepted, and whose process died before
+its turn started, `interrupted` (`reason: "not-processed"`, by `sys:reconcile`). Recovery writes, so
+it never runs on a read.
 
 Each head stamps its receipts with its own process (`executor: {pid, startedAt, host, head}`). Both
 heads pass their probe through `withOwnStartTime`, which answers the head's own start time from its
@@ -111,7 +114,9 @@ local user (who counts as the member Home's access records link them to), or nob
 is shown with the decision and carries no authority. On a harness with an approver projection a
 decision counts only from a member whose class reaches the request's (session-store's
 `principalAuthorizer`). The service writes no receipt itself: Home's receipts middleware and the
-CLI's `commands.submit` do.
+CLI's `commands.submit` do. A tool approval's step is `resolveToolApproval`
+(`@crewhaus/control-service/approval-resolve`), which a channel daemon's buttons call too: its
+imports reach no Home package, so a compiled daemon can load it.
 
 A grant with `always` also makes a standing rule: the narrowest allow that covers the approved call
 (permission-engine's `narrowPatternFor`), for 30 days unless `days` says otherwise, kept as a row in

@@ -6,9 +6,16 @@
  *
  * Activation's reconciler reads the deployment records, and the decision service's kinds
  * observe their own records (`./decision-runtime`). The operator record and run creation
- * get theirs with their writers.
+ * get theirs with their writers. One run sweep closes a channel message whose daemon died
+ * before its turn started ({@link channelRunSweep}).
  */
 import type { CommandReceipt } from "@crewhaus/control-contract";
+import {
+  type LedgerRecord,
+  newestRunRows,
+  runsLedger,
+  settleUnstartedRun,
+} from "@crewhaus/control-records";
 import {
   START_TIME_TOLERANCE_MS,
   type StartResult,
@@ -17,12 +24,14 @@ import {
 } from "@crewhaus/harness-supervisor";
 import { DECISION_EXECUTORS, DECISION_RECONCILERS } from "./decision-runtime";
 import { protectedEnvironmentGate, reconcileActivation } from "./deployments";
-import type {
-  AreaRuntime,
-  Executor,
-  ReconcileContext,
-  Reconciliation,
-  Settlement,
+import {
+  type AreaRuntime,
+  type Executor,
+  type ReconcileContext,
+  type Reconciliation,
+  type RunSweep,
+  type Settlement,
+  executorDead,
 } from "./executor";
 import { NEEDS_DECISION, outcomeOf } from "./refusal";
 
@@ -138,6 +147,51 @@ export function reconcileDaemonStart(
  */
 const activate: Executor = async () => ({ state: "unknown", outcome: NEEDS_DECISION });
 
+/** A holder as a run row records it, when the row has one that names a process. */
+function holderOf(
+  row: LedgerRecord,
+): { pid: number; host: string; startedAt?: string } | undefined {
+  const holder = row["holder"];
+  if (typeof holder !== "object" || holder === null) return undefined;
+  const { pid, host, startedAt } = holder as Record<string, unknown>;
+  if (typeof pid !== "number" || typeof host !== "string") return undefined;
+  return { pid, host, ...(typeof startedAt === "string" ? { startedAt } : {}) };
+}
+
+/**
+ * A chat message a channel daemon accepted and whose turn never started: the run's newest
+ * row, among the ledger's newest 256 lines, is `preparing`, its trigger is `channel`, and
+ * the process that held it is provably gone (by the lease's rule, or because it started
+ * before the machine booted). It is closed `interrupted {reason: "not-processed", by:
+ * "sys:reconcile"}`, under the ledger's lock with the row read again. A holder that is
+ * alive, or that the probe cannot judge, is left; so is a run the runtime has started.
+ */
+export const channelRunSweep: RunSweep = async (harnessDir, ctx) => {
+  const ledger = runsLedger(harnessDir);
+  const left = (row: LedgerRecord): boolean => {
+    if (row["state"] !== "preparing") return false;
+    const trigger = row["trigger"];
+    if (typeof trigger !== "object" || trigger === null) return false;
+    if ((trigger as Record<string, unknown>)["kind"] !== "channel") return false;
+    const holder = holderOf(row);
+    return holder !== undefined && executorDead(holder, ctx.probe, ctx.host, ctx.hostBootedAt);
+  };
+  const at = new Date(ctx.now).toISOString();
+  let closed = 0;
+  for (const [id, row] of newestRunRows(ledger)) {
+    if (!left(row)) continue;
+    const settled = await settleUnstartedRun(
+      ledger,
+      id,
+      { state: "interrupted", at, fields: { reason: "not-processed", by: "sys:reconcile" } },
+      left,
+    );
+    if (!settled.ok) throw new Error(settled.reason);
+    if (settled.settled) closed += 1;
+  }
+  return closed;
+};
+
 export const CORE_RUNTIME: AreaRuntime = {
   area: "core",
   executors: {
@@ -156,4 +210,5 @@ export const CORE_RUNTIME: AreaRuntime = {
   },
   unsupervised: Object.keys(DECISION_EXECUTORS),
   activationGates: [protectedEnvironmentGate],
+  runSweeps: [channelRunSweep],
 };

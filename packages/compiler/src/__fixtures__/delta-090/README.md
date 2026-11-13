@@ -39,3 +39,10 @@ registry and the signing-secret bootstrap delegate to `@crewhaus/gateway-server/
 daemon starts and stops the queued-run follower with the gateway. Imports follow. The tenants-root
 check is emitted only for a spec that declares a tool that works on files, which the managed spec here
 does not. No other digest moves.
+
+**Channel delegation delta — `channel`'s `gateway.ts` only.** The gateway hands its actions route to
+`createApprovalActions(…).handle(interaction, actionAdapter)` after its capped read, `verify()` and
+`parseInteraction`, and its events route to `handleInboundEvent(parsed.event, adapter, {dedup,
+sessionRouter})` after its handshake, capped read, `verify()` and `parseInbound`, both from
+`@crewhaus/channel-adapter-base`; it imports nothing from `@crewhaus/permission-engine`. No other
+digest moves.
