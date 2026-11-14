@@ -41,13 +41,14 @@ import type { DaemonState, V1Context, V1Deps } from "./context";
 import { V1Error, v1ErrorBody } from "./errors";
 import { OPERATION_BY_ID, matchOperation } from "./match";
 import { commandLedgerOf, entryOf } from "./resolve";
+import { findRun } from "./runs";
 
 const BINARY = "crewhaus";
 
 /** A body the API takes is a few kilobytes; anything past this is not one. */
 const MAX_BODY_BYTES = 256 * 1024;
 
-/** The query names each request schema takes; an operation with a `{ref}` or `{cmd}` also takes `harness`. */
+/** The query names each request schema takes; an operation with a `{ref}`, `{cmd}` or `{run}` also takes `harness`. */
 const QUERY_NAMES: Readonly<Record<string, readonly string[]>> = {
   listQuery: ["limit", "cursor"],
   streamQuery: ["after"],
@@ -65,7 +66,12 @@ export type V1Router = {
     matched: RequestMatch,
     url: URL,
     caller: Caller,
-  ): { readonly targetHarness?: string | null; readonly selfScope?: true };
+  ): {
+    readonly targetHarness?: string | null;
+    readonly selfScope?: true;
+    /** On a row qualified `creating-service`: who started the run it names (or, for a list, the caller). */
+    readonly runBy?: string;
+  };
   /** `GET /api/v1` for a caller who sent no credential: the protocol and how to sign in. */
   discoverAnonymous(): Response;
 };
@@ -161,7 +167,9 @@ export function createV1Router(
 
   const queryOf = (op: OperationRow, url: URL): Record<string, string> => {
     const allowed = new Set(QUERY_NAMES[op.request] ?? []);
-    if (op.path.includes("{ref}") || op.path.includes("{cmd}")) allowed.add("harness");
+    if (op.path.includes("{ref}") || op.path.includes("{cmd}") || op.path.includes("{run}")) {
+      allowed.add("harness");
+    }
     const out: Record<string, string> = {};
     const unknown: string[] = [];
     for (const [name, value] of url.searchParams.entries()) {
@@ -286,9 +294,22 @@ export function createV1Router(
           message: `${IDEMPOTENCY_HEADER} must be 1-128 of A-Z a-z 0-9 . _ : -`,
         });
       }
+      const caller = access.caller;
+      // A service repeats a command only under the key it was first sent with.
+      if (
+        op.idempotency === "required-for-services" &&
+        caller.via === "service" &&
+        idempotency === undefined
+      ) {
+        throw new V1Error({
+          status: 400,
+          code: "invalid",
+          reason: "idempotency_required",
+          message: `A service sends ${IDEMPOTENCY_HEADER} with this operation.`,
+        });
+      }
       const query = queryOf(op, url);
       const body = await bodyOf(op, req);
-      const caller = access.caller;
       const ctx: V1Context = {
         req,
         url,
@@ -337,10 +358,17 @@ export function createV1Router(
   const targetOf: V1Router["targetOf"] = (matched, url, caller) => {
     const op = OPERATION_BY_ID.get(matched.row.key);
     if (op === undefined) return {};
-    const out: { targetHarness?: string | null; selfScope?: true } = {};
-    const { h, ref, cmd } = matched.params;
+    const out: { targetHarness?: string | null; selfScope?: true; runBy?: string } = {};
+    const { h, ref, cmd, run } = matched.params;
+    const creating = op.qualifiers.includes("creating-service");
     if (h !== undefined) {
       out.targetHarness = entryOf(deps, h)?.id ?? null;
+      // A service lists the runs it started there, and no others.
+      if (creating && caller.via === "service") out.runBy = caller.principal;
+    } else if (run !== undefined) {
+      const found = findRun(deps, run, url.searchParams.get("harness") ?? undefined);
+      out.targetHarness = found?.entry.id ?? null;
+      if (creating && found?.by !== undefined) out.runBy = found.by;
     } else if (ref !== undefined) {
       const parsed = parseRef(ref);
       if (!("error" in parsed)) {

@@ -8,6 +8,7 @@ import {
   TWIN_PLACEHOLDERS,
   isId,
   mintId,
+  mintRunId,
   parseTwin,
   renderTwin,
 } from "./index.js";
@@ -37,6 +38,8 @@ const ACCESS = {
   cmd: mintId("cmd"),
 };
 
+const RUN = mintRunId();
+
 const SAMPLES = [
   {
     hrn: HRN,
@@ -54,6 +57,7 @@ const SAMPLES = [
     ...ACCESS,
     until: "2026-12-01T09:00:00Z",
     deferReason: "scheduled",
+    run: RUN,
   },
   {
     hrn: HRN,
@@ -71,6 +75,7 @@ const SAMPLES = [
     ...ACCESS,
     until: "2026-12-01T09:00:00.000+01:00",
     deferReason: "awaiting-someone",
+    run: RUN,
   },
 ];
 
@@ -198,8 +203,21 @@ test("the placeholders, pinned, with empty flags", () => {
     "{cmd}",
     "{until}",
     "{deferReason}",
+    "{run}",
   ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
+});
+
+test("{run} takes a canonical run id, never an execution's", () => {
+  const grammar = TWIN_PLACEHOLDERS as Readonly<Record<string, RegExp>>;
+  const run = grammar["{run}"] as RegExp;
+  expect(run.test(RUN)).toBe(true);
+  for (const bad of ["run_0123456789abcdef", `${RUN}x`, "", "--harness", RUN.toUpperCase()]) {
+    expect(run.test(bad)).toBe(false);
+  }
+  expect(renderTwin({ argv: ["runs", "show", "{run}"] }, { run: "run_0123456789abcdef" })).toEqual({
+    invalid: ["run"],
+  });
 });
 
 test("the quality placeholders take their ids and closed values, nothing else", () => {

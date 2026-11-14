@@ -17,7 +17,9 @@ import {
   readDeployments,
   readOperatorRecord,
 } from "@crewhaus/control-records";
+import { RUNS_MIN_BUNDLE, RUN_ADAPTER_SHAPES, versionAtLeast } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
+import { readBundleStamp, resolveBundle } from "@crewhaus/harness-supervisor";
 import { pendingApprovalCount } from "../approvals";
 import { readTextCapped } from "../jsonl";
 import { resolveContained } from "../safety";
@@ -171,6 +173,46 @@ function fromDaemon(
     : { supported: false, reason: "This build does not support it.", verb: null };
 }
 
+/**
+ * `runs.create` for one harness, from the run adapter its shape has: a managed daemon
+ * answers for itself (a daemon that is not running is "unknown"); a job shape's build must
+ * be one that checks a run's input where the run starts; every other shape names its own
+ * intake.
+ */
+function runsCreateOf(
+  entry: HangarHarnessEntry,
+  dir: string | undefined,
+  status: DaemonStatus,
+  shape: CapabilityDescriptor | undefined,
+): CapabilityDescriptor {
+  const adapter = RUN_ADAPTER_SHAPES[entry.target as RunControlShape];
+  if (adapter === undefined || adapter === "daemon" || shape === undefined) {
+    return shape?.supported === false
+      ? shape
+      : {
+          supported: false,
+          reason: `A ${entry.target} harness does not start runs this way.`,
+          verb: null,
+        };
+  }
+  if (adapter === "managed") {
+    if (!status.ok) return { supported: "unknown", reason: "The executor is offline." };
+    return fromDaemon("runs.create", shape, status);
+  }
+  if (dir === undefined) return { supported: "unknown", reason: "The harness folder is missing." };
+  if (entry.target === "cli") return { supported: true };
+  const bundle = resolveBundle(dir, entry.target);
+  const compiledWith =
+    bundle === undefined ? undefined : readBundleStamp(bundle.bundleDir)?.compiledWith;
+  return compiledWith !== undefined && versionAtLeast(compiledWith, RUNS_MIN_BUNDLE)
+    ? { supported: true }
+    : {
+        supported: false,
+        reason: `This build is older than ${RUNS_MIN_BUNDLE}, which checks a run's input where it starts.`,
+        verb: "crewhaus compile",
+      };
+}
+
 const capabilities: V1Handler = async (ctx) => {
   const entry = harnessOf(ctx);
   const dir = liveDirOf(entry);
@@ -192,6 +234,16 @@ const capabilities: V1Handler = async (ctx) => {
       } as const);
     out[key] = fromDaemon(key, shape, status);
   }
+  // Starting a run: the adapter table decides, the one admission reads too.
+  out["runs.create"] = runsCreateOf(entry, dir, status, row?.["runs.create"]);
+  out["runs.clientRunId"] =
+    RUN_ADAPTER_SHAPES[entry.target as RunControlShape] === "managed"
+      ? fromDaemon("runs.clientRunId", undefined, status)
+      : {
+          supported: false,
+          reason: "Only a managed daemon takes a client's own run id.",
+          verb: null,
+        };
   const beat = dir === undefined ? undefined : heartbeatOf(dir);
   out["runs.ledger"] =
     beat?.runLedger === false

@@ -8,8 +8,12 @@
  * and, when there are several, joined (an injection split across two of them),
  * before its first model call. A message's text is its string, or the text its
  * blocks carry: a text block's text, a tool result's content (a string or
- * blocks, read the same way), a tool call's input as JSON, and the text or
- * content of any other block. A message with no text adds nothing.
+ * blocks, read the same way), a tool call's input as JSON, a document's text
+ * (`source: {type: "text", data}`), and the text or content of any other
+ * block. A message with no text adds nothing. Every block's text is read: one
+ * whose content cannot be read as text (a `source` that is not a text source,
+ * such as base64 or a URL, or a `data` field outside a text source) refuses
+ * the seed with the rule `unreadable_seed_block`, as a malicious verdict does.
  *  - a malicious verdict tags nothing, and the loop throws a `RunFailedError`
  *    of class `input_blocked` (exit 41) right after its run rows open, so the
  *    rows record `failed {input_blocked}` and the job's process exits 41;
@@ -71,16 +75,26 @@ function jsonOf(value: unknown): string {
   }
 }
 
+/** What a message's content carries: its texts, and whether any block could not be read. */
+type Read = { readonly texts: string[]; unreadable: boolean };
+
+/** The text a block's `source` carries, or `undefined` when it is not a text source. */
+function sourceText(source: unknown): string | undefined {
+  if (typeof source !== "object" || source === null) return undefined;
+  const { type, data } = source as { type?: unknown; data?: unknown };
+  return type === "text" && typeof data === "string" ? data : undefined;
+}
+
 /** Every text a message's content carries, in order, the empty ones left out. */
-function textsOf(content: unknown, depth = 0, out: string[] = []): string[] {
+function textsOf(content: unknown, depth = 0, out: Read = { texts: [], unreadable: false }): Read {
   if (typeof content === "string") {
-    if (content !== "") out.push(content);
+    if (content !== "") out.texts.push(content);
     return out;
   }
   if (content === null || content === undefined) return out;
   if (depth >= MAX_BLOCK_DEPTH) {
     const json = jsonOf(content);
-    if (json !== "") out.push(json);
+    if (json !== "") out.texts.push(json);
     return out;
   }
   if (Array.isArray(content)) {
@@ -88,20 +102,30 @@ function textsOf(content: unknown, depth = 0, out: string[] = []): string[] {
     return out;
   }
   if (typeof content !== "object") return out;
-  const block = content as { type?: unknown; text?: unknown; content?: unknown; input?: unknown };
-  if (typeof block.text === "string" && block.text !== "") out.push(block.text);
+  const block = content as {
+    type?: unknown;
+    text?: unknown;
+    content?: unknown;
+    input?: unknown;
+    source?: unknown;
+  };
+  if (typeof block.text === "string" && block.text !== "") out.texts.push(block.text);
   if (block.content !== undefined) textsOf(block.content, depth + 1, out);
   if (block.type === "tool_use" && block.input !== undefined) {
     const json = jsonOf(block.input);
-    if (json !== "" && json !== "{}") out.push(json);
+    if (json !== "" && json !== "{}") out.texts.push(json);
   }
+  if (Object.hasOwn(block, "source")) {
+    const text = sourceText(block.source);
+    if (text === undefined) out.unreadable = true;
+    else if (text !== "") out.texts.push(text);
+  }
+  if (Object.hasOwn(block, "data")) out.unreadable = true;
   return out;
 }
 
-/** The text of a message: every text its content carries, joined with newlines. */
-function textOf(content: unknown): string {
-  return textsOf(content).join("\n");
-}
+/** The rule a seed with a block whose text cannot be read is refused under. */
+export const UNREADABLE_SEED_BLOCK = "unreadable_seed_block";
 
 /**
  * The seed check for one loop, run before its context is built. `none`
@@ -128,9 +152,11 @@ export async function seedVerdict(
   }
   if (opts.runContext?.parent !== undefined || firstLoopTaken) return NONE;
   firstLoopTaken = true;
-  const texts = (opts.seedMessages ?? [])
-    .map((m) => textOf(m.content))
-    .filter((text) => text !== "");
+  const read = (opts.seedMessages ?? []).map((m) => textsOf(m.content));
+  if (read.some((r) => r.unreadable)) {
+    return { kind: "blocked", rules: [UNREADABLE_SEED_BLOCK], score: 1 };
+  }
+  const texts = read.map((r) => r.texts.join("\n")).filter((text) => text !== "");
   if (texts.length === 0) return { kind: "kept", entries: [] };
   const each = await Promise.all(texts.map((text) => classify(text, { origin: "api" })));
   const joined = texts.length > 1 ? await classify(texts.join("\n"), { origin: "api" }) : undefined;

@@ -365,6 +365,13 @@ export interface ControlPlane {
    */
   onClaim(handler: () => void | Promise<void>): void;
   /**
+   * Whether `runs.create` and `runs.continue` take a client's own run handle
+   * (`idempotency`, `runId`): exactly while a follower is registered through
+   * {@link ControlPlane.onClaim}, when `/status` lists `runs.create` and
+   * `runs.clientRunId`. One condition, read by `/status` and by the gateway's decode.
+   */
+  clientRunIds(): boolean;
+  /**
    * Register how this process counts the runs it is running. The last
    * registration wins. On target `managed`, `/status` and the heartbeat
    * answer this count; a counter that throws or answers anything but a
@@ -845,8 +852,13 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
       "controls.drain",
       "controls.disable",
       ...(runLedgerOn() ? (["runs.ledger"] as const) : []),
-      ...(claimHandler !== undefined ? (["runs.create"] as const) : []),
+      ...(clientRunIds() ? (["runs.create", "runs.clientRunId"] as const) : []),
     ];
+  }
+
+  /** Whether a queued-runs follower is registered: what lists `runs.create`. */
+  function clientRunIds(): boolean {
+    return claimHandler !== undefined;
   }
 
   /** Write one heartbeat; a failure is one stderr line per reason, never a throw. */
@@ -1361,6 +1373,8 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
     onClaim(handler): void {
       claimHandler = handler;
     },
+
+    clientRunIds,
 
     onActiveRuns(count): void {
       activeRunsCounter = count;

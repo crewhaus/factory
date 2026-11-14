@@ -1465,7 +1465,7 @@ describe("status reports the operator record, the controls and the active runs",
     expect((await statusOf(channel.plane)).activeRuns).toBe(activeRunCount());
   });
 
-  test("capabilities are control-contract names: pause for every shape but voice, runs.create only with a follower", async () => {
+  test("capabilities are control-contract names: pause for every shape but voice, runs.create and runs.clientRunId only with a follower", async () => {
     const channel = harness();
     const listed = (await statusOf(channel.plane)).capabilities;
     expect(listed.every((name) => (CAPABILITY_NAMES as readonly string[]).includes(name))).toBe(
@@ -1478,8 +1478,18 @@ describe("status reports the operator record, the controls and the active runs",
       "controls.disable",
       "runs.ledger",
     ]);
+    expect(channel.plane.clientRunIds()).toBe(false);
     channel.plane.onClaim(() => undefined);
-    expect((await statusOf(channel.plane)).capabilities).toContain("runs.create");
+    expect((await statusOf(channel.plane)).capabilities).toEqual([
+      "controls.pauseIntake",
+      "controls.cancelRun",
+      "controls.drain",
+      "controls.disable",
+      "runs.ledger",
+      "runs.create",
+      "runs.clientRunId",
+    ]);
+    expect(channel.plane.clientRunIds()).toBe(true);
 
     const voice = (await statusOf(harness({ target: "voice" }).plane)).capabilities;
     expect(voice).not.toContain("controls.pauseIntake");

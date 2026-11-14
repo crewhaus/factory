@@ -38,6 +38,7 @@ import {
   COMMAND_KINDS,
   OPERATIONS,
   mintId,
+  mintRunId,
   renderTwin,
 } from "@crewhaus/control-contract";
 import {
@@ -347,6 +348,7 @@ describe("the server's twins, by import", () => {
       crd: mintId("crd"),
       lnk: mintId("lnk"),
       cmd: mintId("cmd"),
+      run: mintRunId(),
     };
     const SAMPLES = [
       {

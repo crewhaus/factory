@@ -23,7 +23,8 @@ import { protectedEnvironmentGate, reconcileActivation } from "./deployments";
  * Activation's reconciler reads the deployment records, and the decision service's kinds
  * observe their own records (`./decision-runtime`). The operator controls write and observe
  * the operator record (`./operator-controls`), and retire is observed in Home's lifecycle
- * record (`./retire`). Run creation gets its reconciler with its writer. One run sweep
+ * record (`./retire`). The run commands run inline and are observed in the run ledger
+ * (`./runs`). One run sweep
  * closes a channel message whose daemon died before its turn started ({@link channelRunSweep}).
  */
 import { reconcileDeviceDecide } from "./device-runtime";
@@ -43,6 +44,7 @@ import {
 } from "./operator-controls";
 import { NEEDS_DECISION, outcomeOf } from "./refusal";
 import { reconcileRetire } from "./retire";
+import { RUN_RECONCILERS } from "./runs";
 
 /** A restart refused before it stopped anything: the daemon it would replace still runs. */
 const KEPT_RUNNING = { kind: "daemon", status: "skipped", note: "kept running" } as const;
@@ -257,6 +259,7 @@ export const CORE_RUNTIME: AreaRuntime = {
     // A device sign-in's choice runs inline; the sweep reads the request it recorded.
     "auth.device.decide": reconcileDeviceDecide,
     ...DECISION_RECONCILERS,
+    ...RUN_RECONCILERS,
   },
   unsupervised: [...OPERATOR_CONTROL_KINDS, ...Object.keys(DECISION_EXECUTORS)],
   activationGates: [protectedEnvironmentGate],

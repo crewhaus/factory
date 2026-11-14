@@ -32,6 +32,7 @@
  */
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { CANONICAL_RUN_ID_RE } from "@crewhaus/control-contract";
 import { readDeployments } from "@crewhaus/control-records";
 import { readManagerSettings } from "./manager-settings";
 import type { EnvOverride, RunClass, RunKind } from "./types";
@@ -808,6 +809,31 @@ export type SpawnPlanInput = {
   readonly bunBin?: string;
   /** HTTP+SSE instead of stdio for the mcp-server class. */
   readonly mcpSse?: boolean;
+  /**
+   * A run the control API started, under its canonical id. A cli harness runs one
+   * non-interactive turn from `inputFile` (`crewhaus run <spec> --input-file <file>`); a
+   * crew, workflow or graph bundle reads `stdinFile` on stdin. The child's environment
+   * names the run (`CREWHAUS_RUN_ID`) and the origin of its input
+   * (`CREWHAUS_INPUT_ORIGIN=api`); its argv comes from this closed vocabulary only.
+   */
+  readonly apiRun?: ApiRunInput;
+};
+
+/** A control-API run as a plan's input: its id, and the file its input is read from. */
+export type ApiRunInput = {
+  readonly runId: string;
+  /** cli: the input record `crewhaus run --input-file` reads. */
+  readonly inputFile?: string;
+  /** crew, workflow, graph: the input text the bundle reads on stdin. */
+  readonly stdinFile?: string;
+};
+
+/** The shapes the control API starts a run of, and how each takes its input. */
+export const API_RUN_SHAPES: Readonly<Record<string, "inputFile" | "stdinFile">> = {
+  cli: "inputFile",
+  crew: "stdinFile",
+  workflow: "stdinFile",
+  graph: "stdinFile",
 };
 
 export type SpawnPlan = {
@@ -843,6 +869,8 @@ export type SpawnPlan = {
     readonly controlPort?: number;
   };
   readonly controlTokenPath?: string;
+  /** A run the control API started: the supervisor opens its root under this id. */
+  readonly apiRun?: { readonly runId: string };
 };
 
 /** Raised when a plan cannot be built (no bundle, no spec). Carries a
@@ -884,6 +912,30 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
   }
   if (input.controlToken !== undefined && input.controlToken !== "") {
     extra["CREWHAUS_CONTROL_TOKEN"] = input.controlToken;
+  }
+  const apiRun = input.apiRun;
+  if (apiRun !== undefined) {
+    const takes = API_RUN_SHAPES[input.target];
+    if (takes === undefined) {
+      throw new SpawnPlanError(
+        `the control API starts no run of a ${input.target} harness`,
+        "compile",
+      );
+    }
+    if (!CANONICAL_RUN_ID_RE.test(apiRun.runId)) {
+      throw new SpawnPlanError(
+        "an API run needs a crewhaus run id: run_ and 26 characters",
+        "compile",
+      );
+    }
+    if (apiRun[takes] === undefined) {
+      throw new SpawnPlanError(
+        `an API run of a ${input.target} harness needs its ${takes}`,
+        "compile",
+      );
+    }
+    extra["CREWHAUS_INPUT_ORIGIN"] = "api";
+    extra["CREWHAUS_RUN_ID"] = apiRun.runId;
   }
   const { env, envFiles, envFileRefs, overrides } = buildSpawnEnv({
     harnessRoot,
@@ -933,6 +985,35 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
     };
   }
 
+  // A cli run the control API started: one non-interactive turn, detached, read
+  // from the input record. The record's path is the only argument that varies.
+  if (apiRun?.inputFile !== undefined) {
+    if (crewhausBin === undefined) {
+      throw new SpawnPlanError(
+        "a run started through the control API needs a resolvable `crewhaus` CLI (harness node_modules/.bin, then PATH)",
+        "install-cli",
+      );
+    }
+    if (specPath === undefined) {
+      throw new SpawnPlanError("no crewhaus.yaml at the harness root", "add-spec");
+    }
+    return {
+      ...base,
+      runClass: "one-shot",
+      kind: "job",
+      supervised: false,
+      argv: [crewhausBin, "run", specPath, "--input-file", apiRun.inputFile],
+      detached: true,
+      stdio: "file",
+      launchMode: "cli-verb",
+      canResume: false,
+      entry: specPath,
+      bundleDir: harnessRoot,
+      specPath,
+      apiRun: { runId: apiRun.runId },
+    };
+  }
+
   // Interactive shapes prefer the interpreter: it re-reads the spec each
   // start (a free recompile) and it is the ONLY launch that can resume.
   if (runClass === "interactive" && crewhausBin !== undefined && specPath !== undefined) {
@@ -963,7 +1044,8 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
   // guaranteed to die — which, before the class was corrected, walked the
   // crash-backoff ladder into `crash-looping` and made a crew harness
   // effectively unsupervisable.
-  if (readsBriefOnStdin(input.target) && input.briefFile === undefined) {
+  const stdinFile = apiRun?.stdinFile ?? input.briefFile;
+  if (readsBriefOnStdin(input.target) && stdinFile === undefined) {
     throw new SpawnPlanError(
       "a crew bundle reads its brief on stdin — start it with `crewhaus daemon submit <dir> --brief-file <file>` (or run `bun dist/daemon.ts < brief.md` by hand)",
       "submit-brief",
@@ -976,7 +1058,8 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
     // from the harness's files, and what it starts inherits only that.
     argv: [bunBin, "--no-env-file", bundle.entryPath],
     detached,
-    ...(input.briefFile !== undefined ? { stdinFile: input.briefFile } : {}),
+    ...(stdinFile !== undefined ? { stdinFile } : {}),
+    ...(apiRun !== undefined ? { apiRun: { runId: apiRun.runId } } : {}),
     // Detached children write straight into the log fd; an attached run is
     // piped so the manager can carry stdin, and tees to the log itself.
     stdio: detached ? "file" : "pipe",

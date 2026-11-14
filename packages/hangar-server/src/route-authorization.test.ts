@@ -1313,6 +1313,8 @@ describe("the versioned API: every served operation, for every role and credenti
     const device = DEVICE_APPROVAL.has(op.id);
     const harnessAbout = op.path.includes("{h}") || op.path.includes("{ref}");
     const cmdRow = op.path.includes("{cmd}");
+    // A run's id the matrix samples names no run this Home has: nothing to authorize against.
+    const runRow = op.path.includes("{run}");
     const member = (
       grants: Grants,
       opts: { personal?: boolean; readOnly?: boolean } = {},
@@ -1339,7 +1341,7 @@ describe("the versioned API: every served operation, for every role and credenti
         return refuse;
       }
       if (capped(op.permission)) return refuse;
-      if (cmdRow) return refuse; // names no receipt this Home has: nothing to authorize against
+      if (cmdRow || runRow) return refuse; // names nothing this Home has: nothing to authorize against
       if (harnessAbout) return holds(best(grants.home, grants.a), op.permission) ? ALLOW : refuse;
       return [grants.home, grants.a, grants.b].some((role) => holds(role, op.permission))
         ? ALLOW
@@ -1365,7 +1367,7 @@ describe("the versioned API: every served operation, for every role and credenti
         if (isPublic) return ALLOW;
         if (device) return "403 session_required";
         if (op.permission === "authenticated") return ALLOW;
-        if (cmdRow) return "403 permission";
+        if (cmdRow || runRow) return "403 permission";
         return op.permission === "h.read" && harnessAbout ? ALLOW : "403 permission";
       }
       case "scoped":

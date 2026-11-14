@@ -353,6 +353,189 @@ describe("a run is recorded before it executes", () => {
   });
 });
 
+describe("a client's own run handle", () => {
+  /** A real control plane, as the emitted daemon hands its `__control`. */
+  function plane(): ControlPlane {
+    const made = createControlPlane({
+      name: "managed-runs",
+      target: "managed",
+      cwd: tempDir(),
+      env: { CREWHAUS_CONTROL_TOKEN: CONTROL_TOKEN },
+      audit: () => undefined,
+      stderr: () => undefined,
+      exit: () => undefined,
+    });
+    planes.push(made);
+    return made;
+  }
+  const statusCaps = async (made: ControlPlane): Promise<string[]> =>
+    (
+      (await (
+        await made.fetch(
+          new Request("http://127.0.0.1:9/control/v1/status", {
+            headers: { authorization: `Bearer ${CONTROL_TOKEN}` },
+          }),
+        )
+      ).json()) as { capabilities: string[] }
+    ).capabilities;
+  async function served(): Promise<Setup> {
+    const s = setup({ control: plane() });
+    await s.runs.start();
+    return s;
+  }
+  const runningRows = (s: Setup): Row[] =>
+    rowsAt(s.harnessDir).filter((r) => r["state"] === "running");
+
+  test("the same idempotency value twice: one turn, one running row, and the second answer names the first run", async () => {
+    const s = await served();
+    const first = await s.call("runs.create", create(CLEAN, { idempotency: "order-42" }));
+    expect(first.error).toBeUndefined();
+    const second = await s.call("runs.create", create(CLEAN, { idempotency: "order-42" }));
+    expect(second.error).toBeUndefined();
+    expect(second.result).toEqual({
+      runId: first.result?.["runId"],
+      sessionId: first.result?.["sessionId"],
+      tenantId: "tenant-a",
+    });
+    expect(s.calls).toHaveLength(1);
+    expect(runningRows(s)).toHaveLength(1);
+    // Another tenant's same value is its own run.
+    const other = await s.call("runs.create", create(CLEAN, { idempotency: "order-42" }), {
+      tenant: "tenant-b",
+    });
+    expect(other.result?.["runId"]).not.toBe(first.result?.["runId"]);
+    expect(s.calls).toHaveLength(2);
+    // The value itself is written nowhere.
+    for (const file of controlFiles(s.harnessDir)) expect(file.text).not.toContain("order-42");
+  });
+
+  test("the same value with other params answers conflict, HTTP 409, and runs nothing", async () => {
+    const s = await served();
+    await s.call("runs.create", create(CLEAN, { idempotency: "order-43" }));
+    const reused = await s.call("runs.create", create(SUSPICIOUS, { idempotency: "order-43" }));
+    expect(reused.error?.code).toBe("conflict");
+    expect(statusFor(reused.error?.code ?? "")).toBe(409);
+    expect(s.calls).toHaveLength(1);
+    expect(runningRows(s)).toHaveLength(1);
+  });
+
+  test("runId names the run; one another run holds answers conflict before any row", async () => {
+    const s = await served();
+    const runId = mintRunId();
+    const named = await s.call("runs.create", create(CLEAN, { runId }));
+    expect(named.result?.["runId"]).toBe(runId);
+    expect(statesOf(s.harnessDir, runId)).toEqual(["running", "succeeded"]);
+
+    const held = mintRunId();
+    expect(publishClaim(runsLedger(s.harnessDir), `run/${held}`, { pid: 1, host: "h" }).ok).toBe(
+      true,
+    );
+    const before = rowsAt(s.harnessDir).length;
+    const taken = await s.call("runs.create", create(CLEAN, { runId: held, idempotency: "k-1" }));
+    expect(taken.error?.code).toBe("conflict");
+    expect(statusFor(taken.error?.code ?? "")).toBe(409);
+    expect(rowsAt(s.harnessDir)).toHaveLength(before);
+    expect(s.calls).toHaveLength(1);
+    // The value names no run, so it can start one under a free id.
+    const retried = await s.call("runs.create", create(CLEAN, { idempotency: "k-1" }));
+    expect(retried.error).toBeUndefined();
+    expect(retried.result?.["runId"]).not.toBe(held);
+    expect(s.calls).toHaveLength(2);
+  });
+
+  test("runs.continue takes them too", async () => {
+    const s = await served();
+    const sessionId = `sess_${"a".repeat(16)}`;
+    const runId = mintRunId();
+    const first = await s.call("runs.continue", {
+      sessionId,
+      input: CLEAN,
+      runId,
+      idempotency: "c-1",
+    });
+    expect(first.result?.["runId"]).toBe(runId);
+    const again = await s.call("runs.continue", {
+      sessionId,
+      input: CLEAN,
+      runId,
+      idempotency: "c-1",
+    });
+    expect(again.result).toEqual({ runId, sessionId, tenantId: "tenant-a" });
+    expect(s.calls).toHaveLength(1);
+  });
+
+  test("without the capability the params are refused as strict, and /status lists runs.clientRunId only with a follower", async () => {
+    const strict = setup();
+    for (const extra of [{ idempotency: "order-1" }, { runId: mintRunId() }]) {
+      const res = await strict.call("runs.create", create(CLEAN, extra));
+      expect(res.error?.code).toBe("bad_request");
+      expect(res.error?.message).toContain("Unrecognized key");
+    }
+    expect(strict.calls).toHaveLength(0);
+
+    const made = plane();
+    expect(await statusCaps(made)).not.toContain("runs.clientRunId");
+    const s = setup({ control: made });
+    const early = await s.call("runs.create", create(CLEAN, { idempotency: "order-2" }));
+    expect(early.error?.code).toBe("bad_request");
+    await s.runs.start();
+    expect(await statusCaps(made)).toContain("runs.clientRunId");
+    expect(
+      (await s.call("runs.create", create(CLEAN, { idempotency: "order-2" }))).error,
+    ).toBeUndefined();
+  });
+});
+
+describe("session ids", () => {
+  const LONG = `sess_${"f".repeat(5 * 1024)}`;
+  const OFF_GRAMMAR = "not-a-session";
+
+  test("a 5 KB id and one outside the session grammar: bad_request on the wire, and no file holds either", async () => {
+    const s = setup();
+    for (const sessionId of [LONG, OFF_GRAMMAR]) {
+      for (const [method, params] of [
+        ["runs.create", create(CLEAN, { sessionId })],
+        ["runs.continue", { sessionId, input: CLEAN }],
+      ] as const) {
+        const res = await s.call(method, params);
+        expect(`${method} ${res.error?.code}`).toBe(`${method} bad_request`);
+        expect(statusFor(res.error?.code ?? "")).toBe(400);
+      }
+    }
+    expect(s.calls).toHaveLength(0);
+    for (const file of controlFiles(s.harnessDir)) {
+      expect(file.text).not.toContain(OFF_GRAMMAR);
+      expect(file.text).not.toContain("f".repeat(64));
+    }
+    expect(s.warnings).toEqual([]);
+  });
+
+  test("an id that fits the grammar but is not a session id is refused by the handler, not only at decode", async () => {
+    const s = setup();
+    const res = await s.call("runs.continue", { sessionId: "sess_XYZ", input: CLEAN });
+    expect(res.error?.code).toBe("bad_request");
+    expect(res.error?.message).toContain("sess_ and 16 hex");
+    expect(rowsAt(s.harnessDir)).toEqual([]);
+  });
+
+  test("a refusal spends nothing: a later, separate ledger failure still warns its one line", async () => {
+    const s = setup();
+    expect(
+      (await s.call("runs.continue", { sessionId: OFF_GRAMMAR, input: CLEAN })).error?.code,
+    ).toBe("bad_request");
+    expect(s.warnings).toEqual([]);
+    const runsDir = join(s.harnessDir, controlPaths(s.harnessDir).runsDir);
+    mkdirSync(dirname(runsDir), { recursive: true });
+    writeFileSync(runsDir, "not a directory\n");
+    for (let i = 0; i < 2; i++) {
+      expect((await s.call("runs.create", create(CLEAN))).error).toBeUndefined();
+    }
+    expect(s.warnings.filter((w) => w.includes("run records could not be written"))).toHaveLength(
+      1,
+    );
+  });
+});
+
 describe("how a run ends", () => {
   const thrown = (error: unknown) => async (): Promise<ManagedTurn> => {
     throw error;

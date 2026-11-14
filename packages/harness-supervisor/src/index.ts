@@ -142,6 +142,7 @@ export {
 } from "./trace-pump";
 
 export type {
+  ApiRunInput,
   BinResolverDeps,
   BundleLocation,
   EnvChain,
@@ -210,6 +211,7 @@ export {
   runPrepareCommand,
 } from "./prepare";
 export {
+  API_RUN_SHAPES,
   BRIEF_TARGETS,
   BUN_DOTENV_FILES,
   BUNDLE_DIR_CANDIDATES,
@@ -391,3 +393,4 @@ export {
 } from "./env-writer";
 export { harnessScrubber, spawnEnvScrubber } from "./harness-scrub";
 export { isSafePathSegment, resolveContained, resolveInside } from "./containment";
+export { type ApiRootHolder, openApiRoot, removeApiRunInput } from "./run-rows";

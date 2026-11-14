@@ -429,7 +429,7 @@ export const CORE_MODULE = {
       permission: "h.control",
       idempotent: true,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.runsCancel,
     },
     {
       id: "runs.resume",
@@ -610,5 +610,6 @@ export const CORE_MODULE = {
     "runs.ledger",
     "decisions.consumeChecks",
     "events.trace",
+    "runs.clientRunId",
   ],
 } as const satisfies AreaModule;

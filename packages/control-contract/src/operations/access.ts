@@ -1,4 +1,4 @@
-import { NO_VERB, READ, TWINS, WORKSPACE_COMMAND } from "./shared.js";
+import { NOT_MODEL_BOUND, NO_VERB, READ, TWINS, WORKSPACE_COMMAND } from "./shared.js";
 
 export const ACCESS_OPERATIONS = [
   {
@@ -188,5 +188,6 @@ export const ACCESS_OPERATIONS = [
     cliTwin: null,
     noTwinReason: "Only a service mints these, for the browsers it serves.",
     qualifiers: ["service-delegation"],
+    modelBound: { subject: NOT_MODEL_BOUND.subject },
   },
 ] as const;

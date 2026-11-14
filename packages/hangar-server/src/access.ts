@@ -479,6 +479,11 @@ export type AuthorizeRequestInput = {
    * device or link (or its own part of a list), which `self.preferences` covers.
    */
   readonly selfScope?: true;
+  /**
+   * For a versioned-API row qualified `creating-service`: who started the run it names (a
+   * run list: the caller itself). A service whose principal it is may act on that run.
+   */
+  readonly runBy?: string;
   /** The request's `Origin` header. */
   readonly origin?: string | null;
   /** Whether an origin is Home's own. */
@@ -571,6 +576,10 @@ export function authorizeRequest(input: AuthorizeRequestInput): RequestAuthoriza
   }
   const verdict = authorizeCaller(caller, view, row.permission, target, ref);
   if (verdict.allow) return { allow: true };
+  // The service that started a run acts on it, whatever else it holds.
+  if (input.runBy !== undefined && caller.via === "service" && caller.principal === input.runBy) {
+    return { allow: true };
+  }
   if ("reason" in verdict) return { allow: false, refusal: TAB_ONLY_REFUSAL };
   return {
     allow: false,

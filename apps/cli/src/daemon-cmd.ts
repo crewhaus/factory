@@ -73,6 +73,7 @@ import {
   resolveHangarRoot,
 } from "@crewhaus/harness-registry";
 import {
+  type ApiRunInput,
   type Clock,
   type HarnessSupervisor,
   MANAGER_HOOK_NAMES,
@@ -344,7 +345,7 @@ export function supervisorFor(
   opts: DaemonCommandOptions,
   gate: { readonly enabled: boolean; readonly force?: boolean; readonly acknowledge?: string[] },
   prep: { readonly compile?: boolean } = {},
-  run: { readonly briefFile?: string } = {},
+  run: { readonly briefFile?: string; readonly apiRun?: ApiRunInput } = {},
   head: StartHead = "cli-direct",
 ): HarnessSupervisor {
   const env = opts.env ?? process.env;
@@ -418,6 +419,8 @@ export function supervisorFor(
         // A crew brief, as a PATH: never in argv, and readable by the child
         // for as long as it needs it.
         ...(run.briefFile !== undefined ? { briefFile: run.briefFile } : {}),
+        // A run the control API queued: its id and its input file, never its text.
+        ...(run.apiRun !== undefined ? { apiRun: run.apiRun } : {}),
       }),
     // Built per start, like the plan: `.crewhaus/settings.json` is edited
     // between starts exactly as the spec is.
@@ -455,7 +458,7 @@ export function supervisorFor(
 type ControlTarget = { harnessDir: string; controlPort: number | undefined };
 
 /** The control.v1 target for a harness, from its runfile. */
-function controlTargetFor(harness: ResolvedHarness): ControlTarget {
+export function controlTargetFor(harness: ResolvedHarness): ControlTarget {
   // `knownControlPort` because the runfile records the plan's request (0 =
   // "kernel, pick one") until the daemon announces the real number.
   return {

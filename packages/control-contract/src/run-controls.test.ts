@@ -12,7 +12,14 @@ import { capabilityDescriptor } from "./schemas/core.js";
  * The cells a truth test proves `true`, as `shape key`, each naming the test that does.
  * Empty until one exists: a `true` cell with no row here fails.
  */
-const TRUTH_TESTS: Readonly<Record<string, string>> = {};
+const SEED_CHECK = "control-service runs.test.ts: each shape that starts a run reads its input";
+const TRUTH_TESTS: Readonly<Record<string, string>> = {
+  "cli runs.create": SEED_CHECK,
+  "workflow runs.create": SEED_CHECK,
+  "graph runs.create": SEED_CHECK,
+  "managed runs.create": SEED_CHECK,
+  "crew runs.create": SEED_CHECK,
+};
 
 /** The compiler's targets, written apart from the table, minus the three with no run controls. */
 const COMPILER_TARGETS = [

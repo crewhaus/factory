@@ -9,6 +9,8 @@
     { "path": "../control-contract" },
     { "path": "../control-records" },
     { "path": "../deployment-controller" },
+    { "path": "../gateway-protocol" },
+    { "path": "../gateway-server" },
     { "path": "../harness-registry" },
     { "path": "../harness-supervisor" },
     { "path": "../ir" },

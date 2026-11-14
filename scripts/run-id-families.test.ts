@@ -164,8 +164,12 @@ describe("mints the compiler emits", () => {
     "packages/compiler/src/__fixtures__/model-wiring/workflow-steps.agent.ts.txt";
 
   test("a managed run is canonical", async () => {
-    // The daemon delegates its runs to managed-runs, which mints with mintRunId.
-    expectLine("packages/gateway-server/src/managed-runs.ts", "const runId = mintRunId();");
+    // The daemon delegates its runs to managed-runs, which mints with mintRunId unless the
+    // client named the run with a canonical id of its own.
+    expectLine(
+      "packages/gateway-server/src/managed-runs.ts",
+      "const runId = p.runId ?? mintRunId();",
+    );
     for (const path of [MANAGED_FIXTURE, MANAGED_SOURCE]) {
       expect(`${path}: ${read(path).includes("Math.random().toString(36)")}`).toBe(
         `${path}: false`,

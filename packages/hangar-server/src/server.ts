@@ -3328,6 +3328,15 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         ? { ok: true, body: status.body as unknown as Record<string, unknown> }
         : { ok: false, reason: status.reason };
     },
+    // Runs the control API starts: one job each, on a supervisor of its own.
+    ...(processes.startApiRun !== undefined
+      ? { startRunJob: processes.startApiRun.bind(processes) }
+      : {}),
+    ...(processes.stopApiRun !== undefined
+      ? { stopRunJob: processes.stopApiRun.bind(processes) }
+      : {}),
+    controlClient: control,
+    controlTarget: async (entry) => controlTarget(await processFor(entry)),
     stopDaemon: async (entry) => {
       const handle = await processFor(entry);
       const stopped = await handle.supervisor.stop();

@@ -49,6 +49,7 @@
  * unit tests without spawning a harness.
  */
 import { appendFileSync, readFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { mintRunId as mintCanonicalRunId } from "@crewhaus/control-contract";
 import { readDeployments } from "@crewhaus/control-records";
 import { sameRevision, specRevision } from "@crewhaus/ir/policy";
@@ -76,7 +77,13 @@ import {
 import { type PortLedger, runfilePortClaims } from "./ports";
 import type { PrepareRefusal, PrepareRunner } from "./prepare";
 import { type ProcessOps, type SpawnedProcess, argvFingerprint } from "./process-ops";
-import { type RootEnding, closeExecution, openRootRun, runLedgerOff } from "./run-rows";
+import {
+  type RootEnding,
+  closeExecution,
+  openApiRoot,
+  openRootRun,
+  runLedgerOff,
+} from "./run-rows";
 import {
   acquireStartLock,
   appendRunLedger,
@@ -909,12 +916,16 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
    * id, plus, for a one-shot job, a root run queued in the run ledger before
    * the spawn. An operator's own `CREWHAUS_RUN_ID` is passed through
    * untouched and gets no root; `CREWHAUS_RUN_LEDGER=0` adds nothing.
+   *
+   * A run the control API started (`plan.apiRun`) is already on the ledger:
+   * its root is held here (`openApiRoot`), under its own id and with no new
+   * mint, or the start is refused before the spawn.
    */
-  const stampRunIds = (
+  const stampRunIds = async (
     plan: SpawnPlan,
     execution: string,
     deployment: ActiveDeployment | undefined,
-  ): Record<string, string> => {
+  ): Promise<{ readonly env: Record<string, string> } | { readonly refused: string }> => {
     currentRoot = undefined;
     // The deployment stamps come from the active record alone, run ledger on or off: a
     // `.env` line or the manager's own environment never supplies them.
@@ -926,9 +937,23 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       if (deployment.specHash !== undefined) stamped[SPEC_HASH_ENV] = deployment.specHash;
     }
     rowsOff = runLedgerOff(plan.env);
-    if (rowsOff) return stamped;
+    if (plan.apiRun !== undefined) {
+      if (rowsOff) return { refused: "this harness records no run rows (CREWHAUS_RUN_LEDGER=0)" };
+      const held = await openApiRoot(options.harnessDir, {
+        id: plan.apiRun.runId,
+        execution,
+        at: new Date(clock.now()).toISOString(),
+        holder: { pid: process.pid, host: hostname() },
+      });
+      if (!held.ok) return { refused: held.reason };
+      currentRoot = plan.apiRun.runId;
+      return {
+        env: { ...stamped, CREWHAUS_EXECUTION_ID: execution, CREWHAUS_RUN_ID: plan.apiRun.runId },
+      };
+    }
+    if (rowsOff) return { env: stamped };
     const env = { ...stamped, CREWHAUS_EXECUTION_ID: execution };
-    if (plan.kind !== "job" || plan.env["CREWHAUS_RUN_ID"] !== undefined) return env;
+    if (plan.kind !== "job" || plan.env["CREWHAUS_RUN_ID"] !== undefined) return { env };
     const root = mintCanonicalRunId();
     const opened = openRootRun(
       options.harnessDir,
@@ -938,10 +963,10 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     );
     if (!opened.ok) {
       warn(`run records: this job runs without a root run (${opened.reason})`);
-      return env;
+      return { env };
     }
     currentRoot = root;
-    return { ...env, CREWHAUS_RUN_ID: root };
+    return { env: { ...env, CREWHAUS_RUN_ID: root } };
   };
 
   /** Close what an execution left in the run ledger, and its root, if it has one. */
@@ -1302,7 +1327,19 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         // and so an fd-redirected child appends rather than creates.
         appendFileSync(logFile, "", { mode: 0o600 });
 
-        const env = stampRunIds(plan, id, deployment);
+        const stampedRun = await stampRunIds(plan, id, deployment);
+        if ("refused" in stampedRun) {
+          // Nothing was spawned and the run's rows are as they were: the start is refused.
+          runId = undefined;
+          setState("stopped");
+          return {
+            ok: false,
+            reason: "plan-failed",
+            stage: "plan",
+            error: new Error(`the run was not started: ${stampedRun.refused}`),
+          };
+        }
+        const env = stampedRun.env;
         child = options.ops.spawn({
           argv: plan.argv,
           cwd: plan.cwd,

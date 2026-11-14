@@ -6,7 +6,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { openAccess, openDeviceRequests } from "@crewhaus/access-control";
-import { OPERATIONS, mintId } from "@crewhaus/control-contract";
+import { OPERATIONS, mintId, mintRunId } from "@crewhaus/control-contract";
 import { makeSeal } from "@crewhaus/control-contract/http";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import { casAppend, deploymentsLedger } from "@crewhaus/control-records";
@@ -124,6 +124,10 @@ describe("every served operation answers its row's shape", () => {
     const ref = `${a.id}/decision/${APPR}`;
     const until = new Date(Date.now() + 86_400_000).toISOString();
     type Ask = { path: string; body?: unknown; secret?: string };
+    const firstRun = async (): Promise<string> => {
+      const list = await home.call("GET", `/api/v1/harnesses/${a.id}/runs?limit=1`);
+      return ((list.body["items"] as { id: string }[])[0]?.id ?? mintRunId()) as string;
+    };
     const asks: Record<string, Ask | (() => Promise<Ask>)> = {
       "meta.discover": { path: "/api/v1" },
       "me.get": { path: "/api/v1/me" },
@@ -213,6 +217,15 @@ describe("every served operation answers its row's shape", () => {
         body: { refs: [`${a.id}/exec/${exec}`], acts: ["run.result.read"], seal: await seal() },
         secret: service.secret,
       }),
+      "runs.create": {
+        path: `/api/v1/harnesses/${a.id}/runs`,
+        body: { input: "Summarise the report." },
+      },
+      "runs.list": { path: `/api/v1/harnesses/${a.id}/runs` },
+      "runs.get": async () => ({ path: `/api/v1/runs/${await firstRun()}` }),
+      "runs.result": async () => ({ path: `/api/v1/runs/${await firstRun()}/result` }),
+      "runs.cancel": async () => ({ path: `/api/v1/runs/${await firstRun()}/cancel`, body: {} }),
+      "runs.resume": async () => ({ path: `/api/v1/runs/${await firstRun()}/resume`, body: {} }),
       "auth.device.lookup": {
         path: "/api/v1/access/device-requests/lookup",
         body: { code: started.userCode },
@@ -266,6 +279,9 @@ describe("every served operation answers its row's shape", () => {
       "decisions.resolve",
       "commands.list",
       "commands.get",
+      "runs.list",
+      "runs.get",
+      "runs.result",
       "access.members.list",
       "access.tokens.list",
       "access.invites.create",

@@ -10,7 +10,19 @@
  * run ended follows it: `succeeded`, `cancelled` (`runs.cancel`, or control.v1's
  * per-run cancel), `waiting-for-approval` for a parked turn, or `failed` with
  * the failure class. An input the prompt-injection check refused is recorded
- * as `failed` with `input_blocked`, and no turn runs. A run cut off when its
+ * as `failed` with `input_blocked`, and no turn runs. A `sessionId` that is
+ * not a session id (`sess_` and 16 hex) is refused with `bad_request` before
+ * anything is claimed or written, so a row's `session` and `resumeScope` only
+ * ever hold a session id.
+ *
+ * A client's own run handle, taken while the daemon lists `runs.clientRunId`:
+ * with `runId` the run is recorded under that canonical id instead of a minted
+ * one, and an id another run holds answers `conflict`; with `idempotency` the
+ * claim `idem/<digest of tenant, subject and value>` names the first run, so
+ * the same value with the same params answers that run's ids with no turn and
+ * no row, and with other params answers `conflict`. Neither the value nor the
+ * input is written anywhere: the claim holds the run, its session and a digest
+ * of the params. A run cut off when its
  * process ended is marked `interrupted` at the next start, and never run
  * again. A row holds ids, states, the tenant and, on the terminal row, a keyed
  * digest of the subject (`subjectRefOf`); never the subject, the input or the
@@ -39,7 +51,7 @@
  * Light: this module loads no runtime and never the server (`./index` for
  * types only), so an adapter that only queues runs can import it.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
   constants as fsConstants,
@@ -62,7 +74,9 @@ import { boundaryRuleIds, classifyBoundary } from "@crewhaus/boundary-classifier
 import {
   CANONICAL_RUN_ID_RE,
   EXECUTION_RUN_ID_RE,
+  SESSION_ID_RE,
   type Trigger,
+  canonicalJson,
   isId,
   isStoredActor,
   parseResumeScope,
@@ -73,6 +87,7 @@ import {
   append,
   controlPaths,
   defaultLeaseProbe,
+  expireClaim,
   foldStates,
   holderProvablyDead,
   intakeVerdict,
@@ -103,7 +118,12 @@ import {
   withInboundContent,
 } from "@crewhaus/run-context";
 import { type Tenant, buildTenant, validateTenantId, withTenant } from "@crewhaus/tenancy";
-import { GatewayCodedError, MANAGED_RUN_HANDLER } from "./coded";
+import {
+  GatewayCodedError,
+  MANAGED_RUN_HANDLER,
+  MANAGED_RUN_PLANE,
+  type ManagedRunPlane,
+} from "./coded";
 import type { ResolveRunEvents, RunHandler, RunInputVerdict, UsageDelta } from "./index";
 
 export { GatewayCodedError, MANAGED_RUN_HANDLER } from "./coded";
@@ -153,10 +173,26 @@ export type ManagedTurnArgs = {
 /** A served turn: its reply and, under `provability:`, the bundle its gate graded. */
 export type ManagedTurn = { readonly reply: string; readonly proof?: unknown };
 
-/** The control plane pieces the runs use. The emitted `__control` satisfies it. */
-export type ManagedControl = Pick<ControlPlane, "onClaim" | "onActiveRuns"> & {
-  readonly counters: { turns: number };
-};
+/**
+ * The control plane pieces the runs use. The emitted `__control` satisfies it.
+ * `clientRunIds`, when given, says whether requests take a client's own run handle.
+ */
+export type ManagedControl = Pick<ControlPlane, "onClaim" | "onActiveRuns"> &
+  Partial<Pick<ControlPlane, "clientRunIds">> & {
+    readonly counters: { turns: number };
+  };
+
+type Classify = typeof classifyBoundary;
+
+let classify: Classify = classifyBoundary;
+
+/**
+ * Test seam: count or script the classifier a run's input meets, a request's and a
+ * queued run's alike. `undefined` restores it.
+ */
+export function _setManagedClassifierForTest(next: Classify | undefined): void {
+  classify = next ?? classifyBoundary;
+}
 
 /** A method the daemon serves beyond the runs, such as `feedback.submit`. */
 export type ManagedMethod = (args: {
@@ -194,12 +230,15 @@ export type CreateManagedRunsOptions = {
   readonly log?: (line: string) => void;
 };
 
-/** What a synchronous run answers with, as `RunsCreateResult` says. */
+/**
+ * What a synchronous run answers with, as `RunsCreateResult` says. A repeated
+ * idempotency value answers the first run's ids alone, with no `reply`.
+ */
 export type ManagedRunResult = {
   readonly runId: string;
   readonly sessionId: string;
   readonly tenantId: string;
-  readonly reply: string;
+  readonly reply?: string;
   readonly proof?: unknown;
 };
 
@@ -386,6 +425,8 @@ function readQueuedInput(
 
 export type QueueManagedRunOptions = {
   readonly harnessDir: string;
+  /** The command receipt (`cmd_…`) that queued it, written on its `queued` row. */
+  readonly cmd?: string;
   /** A canonical run id; minted when absent. */
   readonly runId?: string;
   /** The tenant id the run serves. */
@@ -443,6 +484,9 @@ export function queueManagedRun(opts: QueueManagedRunOptions): QueueManagedRunAn
   if (opts.deployment !== undefined && !isId("dep", opts.deployment)) {
     return { ok: false, reason: "deployment must be a deployment id (dep_…)" };
   }
+  if (opts.cmd !== undefined && !isId("cmd", opts.cmd)) {
+    return { ok: false, reason: "cmd must be a command receipt id (cmd_…)" };
+  }
   const now = opts.now ?? Date.now;
   const record: QueuedInput = {
     v: 1,
@@ -480,6 +524,7 @@ export function queueManagedRun(opts: QueueManagedRunOptions): QueueManagedRunAn
     tenant: opts.tenant,
     by: opts.by,
     ...(opts.deployment !== undefined ? { deployment: opts.deployment } : {}),
+    ...(opts.cmd !== undefined ? { cmd: opts.cmd } : {}),
   });
   if (!queued.ok) {
     rmSync(file, { force: true });
@@ -594,19 +639,41 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     };
   }
 
-  /** Win `run/<id>` and append `running`. */
+  /**
+   * Win `run/<id>` and append `running`. `taken` when the caller named the id and
+   * another run holds it; any other failed claim warns once and the run goes on
+   * without rows.
+   */
   function claimAndStart(
     runId: string,
     tenantId: string,
     fields: { readonly session: string; readonly resumeScope: string | undefined },
-  ): RunRows {
+    clientNamed: boolean,
+  ): RunRows | "taken" {
     if (!ledgerOn) return NO_ROWS;
     const claimed = publishClaim(ledger, `run/${runId}`, holderRecord());
     if (!claimed.ok) {
+      if (clientNamed && claimed.code === "exists") return "taken";
       warnOnce(claimed.code);
       return NO_ROWS;
     }
     return startRows(runId, tenantId, fields);
+  }
+
+  /** The claim an idempotency value takes: a digest of who asked and the value, never the value. */
+  function idempotencyClaimOf(tenant: Tenant, sub: string | undefined, value: string): string {
+    const digest = createHash("sha256")
+      .update(`${tenant.id}\u0000${sub ?? ""}\u0000${value}`)
+      .digest("hex");
+    return `idem/${digest.slice(0, 32)}`;
+  }
+
+  /** A digest of a request's params, its idempotency value left out. */
+  function paramsFingerprint(method: string, params: Readonly<Record<string, unknown>>): string {
+    const { idempotency: _left, ...rest } = params;
+    return createHash("sha256")
+      .update(canonicalJson({ method, params: rest }))
+      .digest("hex");
   }
 
   function registerBus(runId: string, tenantId: string, bus: RunContext["eventBus"]): void {
@@ -726,7 +793,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     if (typeof input !== "string") {
       throw new GatewayCodedError(ErrorCode.BadRequest, "params.input must be a string");
     }
-    const boundary = await classifyBoundary(input, { origin: "api" });
+    const boundary = await classify(input, { origin: "api" });
     const rules = boundaryRuleIds(boundary.verdict);
     const verdict: RunInputVerdict = {
       action: boundary.action,
@@ -745,23 +812,99 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     };
   }
 
+  /**
+   * The checks a run request passes before anything is claimed or written: a
+   * `sessionId` is a session id, and a client's own run handle is taken only
+   * where run rows are written (it needs them to be honoured).
+   */
+  function checkRunParams(p: RunParams): void {
+    if (p.sessionId !== undefined && !SESSION_ID_RE.test(p.sessionId)) {
+      throw new GatewayCodedError(
+        ErrorCode.BadRequest,
+        "params.sessionId must be a session id: sess_ and 16 hex",
+      );
+    }
+    if ((p.idempotency !== undefined || p.runId !== undefined) && !ledgerOn) {
+      throw new GatewayCodedError(
+        ErrorCode.BadRequest,
+        "this daemon records no run rows, so it takes no idempotency or runId",
+      );
+    }
+    if (p.runId !== undefined && !CANONICAL_RUN_ID_RE.test(p.runId)) {
+      throw new GatewayCodedError(
+        ErrorCode.BadRequest,
+        "params.runId must be a crewhaus run id: run_ and 26 characters",
+      );
+    }
+  }
+
+  type RunParams = {
+    readonly input: string;
+    readonly sessionId?: string;
+    readonly idempotency?: string;
+    readonly runId?: string;
+  };
+
   /** `runs.create` / `runs.continue`: recorded, then run, then recorded again. */
   async function startRun(args: Parameters<RunHandler>[0]): Promise<ManagedRunResult> {
     const { method, tenant } = args;
-    const p = args.params as { readonly input: string; readonly sessionId?: string };
+    const p = args.params as RunParams;
+    checkRunParams(p);
     const { verdict, entry } = await verdictFor(args, p.input);
     const blocked = verdict.action === "redact";
     const log = await opts.getAuditLog(tenant);
     // A refused input runs no turn, so it meets no policy check either.
     if (!blocked) await checkPolicy(log, tenant, p.input);
     const sessionId = p.sessionId ?? `sess_${randomBytes(8).toString("hex")}`;
-    const runId = mintRunId();
+    const runId = p.runId ?? mintRunId();
+    let idemClaim: string | undefined;
+    if (p.idempotency !== undefined && !blocked) {
+      idemClaim = idempotencyClaimOf(tenant, args.sub, p.idempotency);
+      const fingerprint = paramsFingerprint(method, p as Readonly<Record<string, unknown>>);
+      const published = publishClaim(ledger, idemClaim, {
+        run: runId,
+        session: sessionId,
+        fingerprint,
+      });
+      if (!published.ok) {
+        if (published.code !== "exists") {
+          throw new Error(`the run's idempotency claim could not be written (${published.code})`);
+        }
+        const winner = readClaim(ledger, idemClaim);
+        if (!winner.ok) {
+          throw new Error(`the run's idempotency claim could not be read (${winner.code})`);
+        }
+        const first = winner.content.record;
+        if (
+          first["fingerprint"] !== fingerprint ||
+          typeof first["run"] !== "string" ||
+          typeof first["session"] !== "string"
+        ) {
+          throw new GatewayCodedError(
+            ErrorCode.Conflict,
+            "this idempotency value was used for a different request",
+          );
+        }
+        return { runId: first["run"], sessionId: first["session"], tenantId: tenant.id };
+      }
+    }
     const subject = subjectOf(tenant, args.sub);
     const resumeScope = sessionScope(sessionId);
+    const started = claimAndStart(
+      runId,
+      tenant.id,
+      { session: sessionId, resumeScope },
+      p.runId !== undefined,
+    );
+    if (started === "taken") {
+      // Nothing runs under this value, so it names no run.
+      if (idemClaim !== undefined) await expireClaim(ledger, idemClaim, Number.POSITIVE_INFINITY);
+      throw new GatewayCodedError(ErrorCode.Conflict, `run ${runId} is already taken`);
+    }
+    const rows = started;
     const run: LiveRun = { tenantId: tenant.id, cancelled: false };
     live.set(runId, run);
     try {
-      const rows = claimAndStart(runId, tenant.id, { session: sessionId, resumeScope });
       if (blocked) {
         await rows.end({ state: "failed", failureClass: "input_blocked" }, subject);
         throw new GatewayCodedError(
@@ -916,7 +1059,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
         }
         // A queued input enters here, never through a request: classified at
         // "api" before anything runs, and kept text tags the run's context.
-        const boundary = await classifyBoundary(input.input, { origin: "api" });
+        const boundary = await classify(input.input, { origin: "api" });
         if (boundary.action === "redact") {
           await rows.end({ state: "failed", failureClass: "input_blocked" }, subject);
           return;
@@ -1078,6 +1221,11 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     }
   };
   Object.defineProperty(handler, MANAGED_RUN_HANDLER, { value: true, enumerable: false });
+  const control = opts.control;
+  if (control?.clientRunIds !== undefined) {
+    const plane: ManagedRunPlane = { clientRunIds: () => control.clientRunIds?.() === true };
+    Object.defineProperty(handler, MANAGED_RUN_PLANE, { value: plane, enumerable: false });
+  }
 
   const resolveRunEvents: ResolveRunEvents = ({ runId, tenant }) => {
     const entry = buses.get(runId);

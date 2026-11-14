@@ -1,4 +1,4 @@
-import { READ, TWINS } from "./shared.js";
+import { NOT_MODEL_BOUND, READ, TWINS } from "./shared.js";
 
 export const DECISION_OPERATIONS = [
   {
@@ -35,6 +35,7 @@ export const DECISION_OPERATIONS = [
     response: "decisionResolved",
     cliTwin: TWINS.approvalsChoice,
     qualifiers: ["class"],
+    modelBound: { expect: NOT_MODEL_BOUND.revision, note: NOT_MODEL_BOUND.note },
   },
   {
     id: "decisions.supersede",
