@@ -1,8 +1,11 @@
 /**
- * The integrations area's console modules, keyed by serve path. Empty until the
- * area adds a screen: it imports each new file `with { type: "text" }` here
- * and adds its row, and `../index.ts` already spreads this map.
+ * The integrations area's console modules, keyed by serve path. Each new file is
+ * imported `with { type: "text" }` here and gets its row; `../index.ts` already
+ * spreads this map.
  */
-import type { HangarAsset } from "./asset";
+import pluginsViewJs from "../../assets/js/views/plugins.js" with { type: "text" };
+import { type HangarAsset, asset } from "./asset";
 
-export const integrationsAssets: Readonly<Record<string, HangarAsset>> = {};
+export const integrationsAssets: Readonly<Record<string, HangarAsset>> = {
+  "/assets/js/views/plugins.js": asset(pluginsViewJs, "plugins.js"),
+};

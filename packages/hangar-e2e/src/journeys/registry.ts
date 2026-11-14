@@ -10,6 +10,7 @@ import type { Journey } from "./journey";
 import { keyboardTour } from "./keyboard-tour.journey";
 import { legacyRedirects } from "./legacy-redirects.journey";
 import { navigation } from "./navigation.journey";
+import { pluginGrant } from "./plugin-grant.journey";
 import { pluginPane } from "./plugin-pane.journey";
 import { runThenConsole } from "./run-then-console.journey";
 import { sessionSelfTest } from "./session-self-test.journey";
@@ -22,6 +23,7 @@ export const JOURNEYS: readonly Journey[] = [
   sessionSelfTest,
   signIn,
   pluginPane,
+  pluginGrant,
   crawl,
   legacyRedirects,
   navigation,

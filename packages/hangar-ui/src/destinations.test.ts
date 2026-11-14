@@ -65,6 +65,7 @@ describe("the destinations", () => {
       "notifications",
       "home",
       "account",
+      "plugins",
     ]);
   });
 });

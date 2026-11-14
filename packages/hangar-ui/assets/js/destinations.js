@@ -63,8 +63,9 @@ export const CONNECTION_KINDS = Object.freeze([
 export const SETTINGS_PAGES = Object.freeze([
   { id: "readability", title: "Readability", describe: "Text size, density, motion, contrast, shortcuts and theme on this device.", load: () => import("./views/settings.js"), render: (m, root, ctx) => m.renderReadabilitySettings(root, ctx) },
   { id: "notifications", title: "Notifications", describe: "What interrupts you, where, and when it stays quiet.", load: () => import("./views/settings.js"), render: (m, root, ctx) => m.renderNotificationSettings(root, ctx) },
-  { id: "home", title: "Home settings", describe: "Read-only mode, and the plugins this Home has installed.", load: () => import("./views/settings.js"), render: (m, root, ctx) => m.renderHomeSettings(root, ctx) },
+  { id: "home", title: "Home settings", describe: "Read-only mode for this Home.", load: () => import("./views/settings.js"), render: (m, root, ctx) => m.renderHomeSettings(root, ctx) },
   { id: "account", title: "Your account", describe: "Sign this browser out, or allow a sign-in from another computer.", load: () => import("./views/settings.js"), render: (m, root, ctx) => m.renderAccountSettings(root, ctx) },
+  { id: "plugins", title: "Plugins", describe: "What each installed plugin asks for, and what you allow it.", load: () => import("./views/plugins.js"), render: (m, root, ctx) => m.renderPluginSettings(root, ctx) },
 ]);
 
 /**

@@ -107,6 +107,29 @@ describe("plugins through the API", () => {
     expect(tree(home.t.hangarRoot)).toEqual(before);
   });
 
+  test("the review carries every field Settings › Plugins reads, with its type", async () => {
+    const body = (await home.call("GET", `${P}/review`)).body;
+    const types: Record<string, string> = {
+      plugin: "string",
+      version: "string",
+      signed: "boolean",
+      state: "string",
+      legacy: "boolean",
+      asks: "object",
+      served: "object",
+      envNames: "object",
+      verb: "string",
+    };
+    for (const [field, type] of Object.entries(types)) {
+      expect(`${field}: ${typeof body[field]}`).toBe(`${field}: ${type}`);
+    }
+    expect("gen" in body && "granted" in body && "crewhausRange" in body).toBe(true);
+    for (const group of ["harnesses", "panes", "events", "reads", "net", "tools"]) {
+      expect(Array.isArray((body["asks"] as Record<string, unknown>)[group])).toBe(true);
+      expect(Array.isArray((body["served"] as Record<string, unknown>)[group])).toBe(true);
+    }
+  });
+
   test("an unknown plugin answers 404 with the install verb", async () => {
     const res = await home.call("GET", "/api/v1/plugins/not-installed/review");
     expect(res.status).toBe(404);
