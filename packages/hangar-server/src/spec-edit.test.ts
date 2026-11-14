@@ -25,10 +25,12 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gradersConfigHash, parseGradersConfig } from "@crewhaus/eval-grader";
 import { DELTA_090_KEYS } from "@crewhaus/spec-patch";
@@ -47,10 +49,13 @@ import {
   classifyPath,
   declaredPaths,
   effectiveConfig,
+  effectiveConfigOf,
   isAutoTunable,
   provenanceOf,
   registryDirName,
   renderDiff,
+  specSchemaView,
+  unknownKeyPaths,
 } from "./spec-edit";
 import { type TestServer, bootTestServer } from "./testkit";
 
@@ -399,6 +404,49 @@ describe("effective config", () => {
     expect(byPath.get("agent.model")?.source).toBe("declared");
     expect(byPath.get("compaction.threshold")?.source).toBe("default");
     expect(byPath.get("compaction.threshold")?.value).toBe(0.8);
+  });
+
+  test("the rows stop at 600 settings and say so; a 600-setting spec is whole", () => {
+    // Plain objects, not a parsed spec: a parse adds zod defaults, so it could never hold exactly 600.
+    const leaves = (n: number) =>
+      Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, i]));
+    const over = effectiveConfigOf({ block: leaves(601) }, "");
+    expect(over.rows).toHaveLength(600);
+    expect(over.truncated).toBe(true);
+    const exact = effectiveConfigOf({ block: leaves(600) }, "");
+    expect(exact.rows).toHaveLength(600);
+    expect(exact.truncated).toBe(false);
+    // The wrapper answers the same rows, and nothing counts them twice.
+    expect(effectiveConfig({ block: leaves(601) }, "")).toEqual(over.rows);
+  });
+
+  test("every row carries its segments, and a key holding a dot keeps them apart", () => {
+    const { rows } = effectiveConfigOf(
+      { models: { "claude-3.5": { tier: "fast" } }, name: "x" },
+      "name: x\n",
+    );
+    expect(rows.map((r) => r.segments)).toEqual([["models", "claude-3.5", "tier"], ["name"]]);
+    const dotted = rows.find((r) => r.segments.length === 3);
+    // The dotted path cannot say where the key ends; the segments can.
+    expect(dotted?.path).toBe("models.claude-3.5.tier");
+    expect(dotted?.path.split(".")).toHaveLength(4);
+  });
+
+  test("an absent spec's schema view says so, with the verb that makes one", async () => {
+    const dir = makeFixtureHarness(join(tmpdir(), `spec-view-${process.pid}-${Date.now()}`), {
+      noSpec: true,
+    });
+    const view = await specSchemaView({
+      entry: null,
+      harnessDir: dir,
+      adopted: false,
+      contain: (segments) => join(dir, ...segments),
+    });
+    expect(view["present"]).toBe(false);
+    expect(view["verb"]).toBe("crewhaus init");
+    expect(view["effectiveTruncated"]).toBe(false);
+    expect(view["effective"]).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test("a credential-carrying path renders redacted — the row's key is `value`, so the tree masker cannot see it", () => {
@@ -938,6 +986,82 @@ describe("the structured editor", () => {
       expect(body["ok"]).toBe(false);
       expect(body["code"]).toBe("edit_rejected");
       expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  type Issue = { path: string[]; message: string; code: string | null };
+  const issuesOf = (body: Record<string, unknown>): Issue[] => body["issues"] as Issue[];
+
+  test("an invalid edit is refused with the edited text's issues", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "edited-issues");
+      const id = await register(t, dir);
+      const before = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
+      const { status, body } = await t.api(
+        `/api/h/${id}/spec`,
+        put({ edits: [{ path: ["agent", "max_tokens"], value: "many" }], expectedRev: revOf(dir) }),
+      );
+      expect(status).toBe(200);
+      expect(body["code"]).toBe("edit_rejected");
+      // The spec as it was has no issue; the one named is the edit's.
+      const issues = issuesOf(body);
+      expect(issues.map((i) => `${i.path.join(".")} ${i.code}`)).toEqual([
+        "agent.max_tokens invalid_type",
+      ]);
+      expect(body["schemaSource"]).toBe("manager");
+      expect(String(body["schemaNote"])).toContain(`crewhaus harness adopt ${id}`);
+      expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("an added unknown key is refused naming it, by the write and by its preview", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "edited-unknown");
+      const id = await register(t, dir);
+      const edits = [{ path: ["agent", "zz_new"], value: 1 }];
+      const { body } = await t.api(
+        `/api/h/${id}/spec`,
+        put({ edits, confirmName: "spec-edit-fixture", expectedRev: revOf(dir) }),
+      );
+      expect(body["code"]).toBe("edit_rejected");
+      const [issue] = issuesOf(body);
+      expect(issue?.path).toEqual(["agent"]);
+      expect(issue?.code).toBe("unrecognized_keys");
+      expect(issue?.message).toContain("zz_new");
+      expect(unknownKeyPaths(issuesOf(body))).toContain("agent.zz_new");
+      // The preview the review step and the JSON pane read first says the same.
+      const diff = await t.api(`/api/h/${id}/spec/diff`, post({ edits }));
+      expect(diff.body["ok"]).toBe(false);
+      expect(diff.body["code"]).toBe("edit_rejected");
+      expect(issuesOf(diff.body)).toEqual(issuesOf(body));
+      expect(diff.body["schemaSource"]).toBe("manager");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a batch that does not apply even as YAML answers the issues of the spec as it was", async () => {
+    const t = boot();
+    try {
+      // A spec that already carries one issue, so the answer can be told apart from none.
+      const dir = specHarness(t, "edited-fallback", VALID_SPEC.replace("4096", "-5"));
+      const id = await register(t, dir);
+      const { body } = await t.api(
+        `/api/h/${id}/spec`,
+        put({
+          edits: [{ path: ["agent", "model", "x"], value: "y" }],
+          confirmName: "spec-edit-fixture",
+          expectedRev: revOf(dir),
+        }),
+      );
+      expect(body["code"]).toBe("edit_rejected");
+      expect(issuesOf(body).map((i) => i.path.join("."))).toEqual(["agent.max_tokens"]);
     } finally {
       await t.stop();
     }

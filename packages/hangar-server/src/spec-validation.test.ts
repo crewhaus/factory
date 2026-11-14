@@ -18,12 +18,23 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
-import { REGISTRY_FILENAME, isAdopted, openHangarRegistry } from "@crewhaus/harness-registry";
+import {
+  type HangarHarnessEntry,
+  REGISTRY_FILENAME,
+  isAdopted,
+  openHangarRegistry,
+} from "@crewhaus/harness-registry";
 import { SECURITY_SURFACES as SPEC_PATCH_SURFACES } from "@crewhaus/spec-patch";
 import { specRev } from "@crewhaus/spec-patch/commit";
 import { makeFixtureHarness } from "./fixture";
 import { jobCrewhausBin } from "./process";
-import { SECURITY_SURFACES, setSchemaCheckDeps } from "./spec-edit";
+import {
+  SECURITY_SURFACES,
+  type SchemaCheck,
+  notAdoptedNote,
+  readOnlyOf,
+  setSchemaCheckDeps,
+} from "./spec-edit";
 import {
   type ChildHandle,
   type SpawnChild,
@@ -205,6 +216,58 @@ describe("a harness's schema never runs in Home's process", () => {
     expect(String(refused.body["reason"])).toContain("brand_new");
     expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
   }, 20_000); // starts real child processes
+
+  test("the refusal carries the rows its own schema found in the edited text", async () => {
+    const t = boot();
+    const { dir } = harness(t, "refuses-rows");
+    const id = await register(t, dir);
+    adopt(t, id);
+    const refused = await t.api(
+      `/api/h/${id}/spec`,
+      put({
+        edits: [{ path: "agent.brand_new", value: 1 }],
+        confirmName: "validated",
+        expectedRev: revOf(dir),
+      }),
+    );
+    expect(refused.body["code"]).toBe("edit_rejected");
+    expect(refused.body["schemaSource"]).toBe("harness");
+    // The spec as it was has no issue: these are the child's rows for the edited text.
+    const issues = refused.body["issues"] as Array<{ path: string[]; code: string | null }>;
+    expect(issues).toEqual([
+      {
+        path: ["agent"],
+        code: "unrecognized_keys",
+        message: "Unrecognized key(s) in object: 'brand_new'",
+      },
+    ] as never);
+  }, 20_000); // starts real child processes
+
+  test("a row that predates adoption is refused by Home's schema, and its own code never loads", async () => {
+    const t = boot();
+    const { dir, marker } = harness(t, "grandfathered-invalid");
+    const id = await register(t, dir);
+    const file = join(t.registryRoot, REGISTRY_FILENAME);
+    const doc = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    Reflect.deleteProperty(doc, "adoptionSince");
+    writeFileSync(file, JSON.stringify(doc));
+    const registry = openHangarRegistry({ root: t.registryRoot, env: {} });
+    const row = registry.get(id);
+    if (row === undefined) throw new Error("not registered");
+    expect(isAdopted(row, registry.adoptionSince())).toBe(true);
+    const refused = await t.api(
+      `/api/h/${id}/spec`,
+      put({ edits: [{ path: "agent.max_tokens", value: "many" }], expectedRev: revOf(dir) }),
+    );
+    expect(refused.body["code"]).toBe("edit_rejected");
+    expect(refused.body["schemaSource"]).toBe("manager");
+    expect(refused.body["schemaNote"]).toBe(notAdoptedNote(id));
+    const issues = refused.body["issues"] as Array<{ path: string[]; code: string | null }>;
+    expect(issues.map((i) => `${i.path.join(".")} ${i.code}`)).toEqual([
+      "agent.max_tokens invalid_type",
+    ]);
+    expect(existsSync(marker)).toBe(false);
+  });
 });
 
 describe("a spec with settings the schema in use does not know is read-only", () => {
@@ -218,8 +281,9 @@ describe("a spec with settings the schema in use does not know is read-only", ()
       const read = await t.api(path);
       const readOnly = read.body["readOnly"] as { paths: string[]; reason: string; verb: string };
       expect(readOnly.paths).toEqual(["future_block"]);
-      expect(readOnly.reason).toContain("read-only here");
-      expect(readOnly.verb).toContain("bunx crewhaus");
+      expect(readOnly.reason).toContain("future_block");
+      expect(readOnly.reason).toContain("not change it");
+      expect(readOnly.verb).toBe(`crewhaus harness adopt ${id}`);
     }
     const refused = await t.api(
       `/api/h/${id}/spec`,
@@ -227,6 +291,10 @@ describe("a spec with settings the schema in use does not know is read-only", ()
     );
     expect(refused.status).toBe(409);
     expect(refused.body["code"]).toBe("read-only");
+    expect(refused.body["verb"]).toBe(`crewhaus harness adopt ${id}`);
+    expect((refused.body["readOnly"] as { verb: string }).verb).toBe(
+      `crewhaus harness adopt ${id}`,
+    );
     expect(String(refused.body["error"])).toContain("future_block");
     expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(FUTURE);
   });
@@ -245,6 +313,45 @@ describe("a spec with settings the schema in use does not know is read-only", ()
     expect(wrote.status).toBe(200);
     expect(wrote.body["wrote"]).toBe(true);
   }, 20_000); // starts real child processes
+
+  test("the reason is plain sentences, and the verb is a whole command or none", () => {
+    const unknown: SchemaCheck["issues"] = [
+      { path: [], code: "unrecognized_keys", message: "Unrecognized key(s) in object: 'zz_block'" },
+    ];
+    const check = (source: "harness" | "manager"): SchemaCheck => ({
+      source,
+      version: null,
+      note: null,
+      issues: unknown,
+    });
+    const entry = { id: "hrn_0123456789abcdef" } as HangarHarnessEntry;
+    const cases = [
+      [
+        "Home's schema, a registered row that does not run its own code",
+        check("manager"),
+        { adopted: false, entry },
+        "crewhaus harness adopt hrn_0123456789abcdef",
+      ],
+      ["no registry row", check("manager"), { adopted: false, entry: null }, null],
+      ["its own schema answered", check("harness"), { adopted: true, entry }, null],
+      [
+        "it runs its own code, but Home's schema answered",
+        check("manager"),
+        { adopted: true, entry },
+        null,
+      ],
+    ] as const;
+    for (const [name, c, ctx, verb] of cases) {
+      const state = readOnlyOf(c, ctx);
+      expect(`${name}: ${String(state?.verb)}`).toBe(`${name}: ${String(verb)}`);
+      const reason = String(state?.reason);
+      expect(reason).toContain("zz_block");
+      for (const shell of ["`", "&&", "cd ", "$"])
+        expect(`${name}: ${reason.includes(shell)}`).toBe(`${name}: false`);
+      if (verb !== null) expect(reason.includes(verb)).toBe(false);
+    }
+    expect(readOnlyOf({ ...check("manager"), issues: [] }, { adopted: false, entry })).toBeNull();
+  });
 
   test("a child that never answers falls back to Home's schema with the reason", async () => {
     const t = boot();

@@ -2667,3 +2667,67 @@ figure.chart svg {
     overflow-wrap: anywhere;
   }
 }
+
+/* The settings form: one fieldset per block of settings, a field per setting.
+   Nothing here sets `display` on a part the form hides with `hidden`. */
+.settings-block {
+  min-width: 0;
+  margin: 10px 0;
+  padding: 6px 12px 10px;
+  border: 1px solid var(--rule-2);
+  border-radius: var(--radius-sm);
+}
+.settings-block legend {
+  padding: 0 4px;
+  font-weight: 600;
+}
+.settings-block.nested {
+  margin: 8px 0;
+  padding: 4px 10px 8px;
+}
+.form-field {
+  min-width: 0;
+  padding: 6px 0;
+  border-top: 1px solid var(--rule);
+}
+.form-field-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+}
+.form-label {
+  font-weight: 600;
+  color: var(--ink);
+}
+.field-help,
+.field-path {
+  margin: 2px 0;
+  font-size: 0.75rem;
+}
+.field-path code {
+  overflow-wrap: anywhere;
+}
+.field-issue {
+  margin: 4px 0;
+  font-size: 0.8rem;
+  color: var(--bad-text);
+}
+.form-field textarea {
+  width: min(100%, 40rem);
+}
+.settings-fold {
+  margin: 8px 0;
+}
+.list-items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.settings-defaults-toggle {
+  margin: 10px 0 4px;
+}
+.settings-issues .btn {
+  text-align: left;
+  white-space: normal;
+}
