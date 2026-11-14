@@ -116,7 +116,7 @@ for the fixed text.
 | Export | Contract | First consumer |
 |---|---|---|
 | `registerIntakeRoot(harnessDir)`, `intakeRoot()`, `unregisterIntakeRoot(harnessDir)` | The directory of the control plane this process serves, resolved, in one slot on `globalThis` under `Symbol.for("@crewhaus/control-records/intake-root")` so two copies in a bundle share it. Absent in every CLI process. Unregistering another directory leaves the slot as it is. | the control plane's `start()` and `stop()`; the runtime's admission at loop start |
-| `writeHeartbeat(harnessDir, beat)` | `.crewhaus/run/control-heartbeat.json`: `{v: 1, pid, at, operatorRev, paused, disabled, activeRuns, runLedger}`, written whole, atomically, at `0600`, its directory at `0700` and contained. Only those fields are written. The caller supplies every value. Answers `{ok: true}` or `{ok: false, reason}` and never throws. | the control plane's heartbeat; its first reader is Home's "last verified" |
+| `writeHeartbeat(harnessDir, beat)` | `.crewhaus/run/control-heartbeat.json`: `{v: 1, pid, at, operatorRev, paused, disabled, operatorUnreadable, activeRuns, runLedger}`, written whole, atomically, at `0600`, its directory at `0700` and contained. Only those fields are written. The caller supplies every value. Answers `{ok: true}` or `{ok: false, reason}` and never throws. | the control plane's heartbeat; its first reader is Home's "last verified" |
 
 | Record | `interactive` | `run` | `start` |
 |---|---|---|---|

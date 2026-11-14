@@ -254,6 +254,22 @@ describe("the container port is one number, in one place", () => {
     }
   });
 
+  test("a managed pod names its replica by its pod name; no other shape gets a replica id", () => {
+    for (const target of ["managed", "channel", "crew"] as const) {
+      const deployment = renderChart({ ...defaultValues(), target })["deployment.yaml"] ?? "";
+      const named = deployment.includes("- name: CREWHAUS_REPLICA_ID");
+      expect(`${target}: ${named}`).toBe(`${target}: ${target === "managed"}`);
+      expect(`${target}: ${deployment.includes("fieldPath: metadata.name")}`).toBe(
+        `${target}: ${target === "managed"}`,
+      );
+      if (target === "managed") {
+        expect(deployment).toMatch(
+          /- name: CREWHAUS_REPLICA_ID\n\s+valueFrom:\n\s+fieldRef:\n\s+fieldPath: metadata\.name\n/,
+        );
+      }
+    }
+  });
+
   test("a socket-less shape gets no PORT, no Service and an exec probe", () => {
     // crew, voice and browser run continuously but open no socket, so an
     // httpGet probe could never pass. They take `doctor --liveness`.

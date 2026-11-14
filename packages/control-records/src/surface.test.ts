@@ -293,6 +293,7 @@ describe("no field name is one the masker would redact", () => {
         operatorRev: 1,
         paused: false,
         disabled: false,
+        operatorUnreadable: false,
         activeRuns: 0,
         runLedger: true,
       } as const;
@@ -321,6 +322,7 @@ describe("no field name is one the masker would redact", () => {
         "claims",
         "heartbeatFile",
         "operatorRev",
+        "operatorUnreadable",
         "activeRuns",
         "runLedger",
         "exitName",

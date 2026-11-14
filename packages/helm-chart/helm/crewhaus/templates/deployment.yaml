@@ -42,6 +42,17 @@ spec:
             - name: PORT
               value: {{ .Values.service.targetPort | quote }}
             {{- end }}
+            {{- if eq .Values.target "managed" }}
+            # Each pod is its own replica: a run's claim names the replica
+            # that holds it, and a restarted daemon marks only its own
+            # replica's runs interrupted. Pods can share a host name (with
+            # hostNetwork) and see different processes under one pid, so the
+            # pod name, unique among live pods, is the replica id.
+            - name: CREWHAUS_REPLICA_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
             {{- if .Values.secrets.anthropic }}
             - name: ANTHROPIC_AUTH_TOKEN
               valueFrom:
