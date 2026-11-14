@@ -45,8 +45,8 @@
  * References: claude-code/utils/permissions/ (24 files); AI-Harness-Systems
  * §Policy engine.
  */
-import { lstatSync, mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, join, relative, sep } from "node:path";
 import {
   type LedgerRead,
   type StandingRuleRow,
@@ -1252,12 +1252,26 @@ function readSettingsRoot(path: string): Record<string, unknown> | undefined {
  *  - otherwise it is loaded with `live`, which asks the record again (at
  *    most once a second per harness, by `opts.now`), so a rule revoked or
  *    past its end stops matching within a second, in a run already going;
- *  - an entry the record does not name loads as written, with no `live`:
- *    the rule is exactly `{ type, pattern, source }`.
+ *  - an entry the record does not name, from a record read in full, loads as
+ *    written, with no `live`: the rule is exactly `{ type, pattern, source }`.
  *
- * A record that cannot be read revives nothing and hides nothing: a loaded
- * rule keeps the last answer its record gave, and a load with no good read
- * loads every entry as written.
+ * What the load reads from the record decides which `alwaysAllow` entries
+ * load at all:
+ *
+ *  - no record (`absent`): every entry loads as written, so a harness with no
+ *    standing rules keeps its own allows;
+ *  - a record that cannot be read (`unreadable`): no `alwaysAllow` loads,
+ *    except under a `.crewhaus` that is an operator's link out of the harness
+ *    (state kept elsewhere), where no record can be kept and every entry loads
+ *    as written;
+ *  - a record with lines or rows it cannot use (`present` with anomalies: a
+ *    sealed torn or garbage line, a row of another shape, a move its machine
+ *    does not allow): an entry no readable row names does not load, since the
+ *    lost lines may be an ended rule's, and one a row names follows its rows,
+ *    with `live`, as above.
+ *
+ * Every `alwaysDeny` and `alwaysAsk` loads in every case. A loaded rule keeps
+ * the last answer its record gave while a later read is not `present`.
  */
 export function loadSettingsRules(
   dir: string,
@@ -1271,11 +1285,20 @@ export function loadSettingsRules(
   const now = opts.now ?? (() => Date.now());
   const reader = createStandingRuleReader({ now });
   const first = reader(dir);
-  if (first.state !== "present") return tagged;
+  if (first.state === "absent") return tagged;
+  if (first.state === "unreadable") {
+    if (stateKeptOutside(dir)) return tagged;
+    return tagged.filter((rule) => rule.type !== "alwaysAllow");
+  }
+  const damaged = first.anomalies.length > 0;
   const out: PermissionRule[] = [];
   for (const rule of tagged) {
-    if (rule.type !== "alwaysAllow" || !first.rows.some((row) => row.pattern === rule.pattern)) {
+    if (rule.type !== "alwaysAllow") {
       out.push(rule);
+      continue;
+    }
+    if (!first.rows.some((row) => row.pattern === rule.pattern)) {
+      if (!damaged) out.push(rule);
       continue;
     }
     if (!livePattern(first, rule.pattern, now())) continue;
@@ -1288,6 +1311,20 @@ export function loadSettingsRules(
     out.push({ ...rule, live });
   }
   return out;
+}
+
+/**
+ * Whether the harness's `.crewhaus` is a link that leads out of the harness: the layout
+ * an operator uses to keep its state elsewhere, where no standing-rule record can be kept.
+ */
+function stateKeptOutside(dir: string): boolean {
+  if (!isSymlink(join(dir, ".crewhaus"))) return false;
+  try {
+    const rel = relative(realpathSync(dir), realpathSync(join(dir, ".crewhaus")));
+    return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+  } catch {
+    return false;
+  }
 }
 
 /** Whether any row for `pattern` is active and before its end. */
@@ -1419,8 +1456,9 @@ export function removeSettingsRule(
  * - `several-places` — the call acted on more than one place, which one rule
  *   value cannot cover;
  * - `not-representable` — the value cannot be written as a rule value (a path
- *   outside the workspace, a parenthesis), or the rule written for it would
- *   not match the call it came from;
+ *   outside the workspace, a parenthesis, a control or bidirectional-text
+ *   character), or the rule written for it would not match the call it came
+ *   from;
  * - `every-value` — the call acted on every value at once (a listing by
  *   prefix or pattern), which only a wildcard rule covers.
  *
@@ -1501,10 +1539,26 @@ export function narrowPatternFor(
 }
 
 /**
+ * A character a rule's pattern never holds: a C0 or C1 control (U+0000-U+001F,
+ * U+007F-U+009F), a bidirectional embedding, override or isolate
+ * (U+202A-U+202E, U+2066-U+2069), or a bidirectional mark (U+200E, U+200F,
+ * U+061C). Each can make a pattern read differently from what it matches.
+ */
+export const DISPLAY_CONTROL_RE =
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
+  /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+
+/** Whether `text` holds a character of {@link DISPLAY_CONTROL_RE}. */
+export function holdsDisplayControl(text: string): boolean {
+  return DISPLAY_CONTROL_RE.test(text);
+}
+
+/**
  * The pattern for `value`, when the rule it writes grants the call it came
  * from. A parenthesis is refused: the pattern is split at its first `(`, and
  * a reader of a rule with nested parentheses cannot tell where the argument
- * ends.
+ * ends. A control or bidirectional-text character is refused: a person reads
+ * the pattern before it allows anything, and it must read as it matches.
  */
 function grantsItsCall(
   toolName: string,
@@ -1512,7 +1566,9 @@ function grantsItsCall(
   valueKind: OperativeValueKind | undefined,
   grants: (pattern: CompiledPattern) => boolean,
 ): NarrowPattern {
-  if (value.includes("(") || value.includes(")")) return { refused: "not-representable" };
+  if (value.includes("(") || value.includes(")") || holdsDisplayControl(value)) {
+    return { refused: "not-representable" };
+  }
   const pattern = `${toolName}(${escapeGlobLiteral(value)})`;
   try {
     if (!grants(compilePattern(pattern))) return { refused: "not-representable" };

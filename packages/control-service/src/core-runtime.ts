@@ -1,15 +1,3 @@
-/**
- * The core's own runtime: daemon control. Each executor acts through the supervisor's verbs
- * with their default options (preflight runs, nothing is forced), adopting a daemon this
- * process did not start before it signals one, as `crewhaus daemon stop` does. One
- * reconciler serves start and restart, the two kinds that are not safe to repeat blindly.
- *
- * Activation's reconciler reads the deployment records, and the decision service's kinds
- * observe their own records (`./decision-runtime`). The operator controls write and observe
- * the operator record (`./operator-controls`), and retire is observed in Home's lifecycle
- * record (`./retire`). Run creation gets its reconciler with its writer. One run sweep
- * closes a channel message whose daemon died before its turn started ({@link channelRunSweep}).
- */
 import type { CommandReceipt } from "@crewhaus/control-contract";
 import type { ReceiptEffect } from "@crewhaus/control-contract";
 import {
@@ -26,6 +14,19 @@ import {
 } from "@crewhaus/harness-supervisor";
 import { DECISION_EXECUTORS, DECISION_RECONCILERS } from "./decision-runtime";
 import { protectedEnvironmentGate, reconcileActivation } from "./deployments";
+/**
+ * The core's own runtime: daemon control. Each executor acts through the supervisor's verbs
+ * with their default options (preflight runs, nothing is forced), adopting a daemon this
+ * process did not start before it signals one, as `crewhaus daemon stop` does. One
+ * reconciler serves start and restart, the two kinds that are not safe to repeat blindly.
+ *
+ * Activation's reconciler reads the deployment records, and the decision service's kinds
+ * observe their own records (`./decision-runtime`). The operator controls write and observe
+ * the operator record (`./operator-controls`), and retire is observed in Home's lifecycle
+ * record (`./retire`). Run creation gets its reconciler with its writer. One run sweep
+ * closes a channel message whose daemon died before its turn started ({@link channelRunSweep}).
+ */
+import { reconcileDeviceDecide } from "./device-runtime";
 import {
   type AreaRuntime,
   type Executor,
@@ -253,6 +254,8 @@ export const CORE_RUNTIME: AreaRuntime = {
     // Retire has no executor: recovery leaves an interrupted one for a person, and the
     // reconcile sweep reads Home's lifecycle record.
     "controls.retire": reconcileRetire,
+    // A device sign-in's choice runs inline; the sweep reads the request it recorded.
+    "auth.device.decide": reconcileDeviceDecide,
     ...DECISION_RECONCILERS,
   },
   unsupervised: [...OPERATOR_CONTROL_KINDS, ...Object.keys(DECISION_EXECUTORS)],

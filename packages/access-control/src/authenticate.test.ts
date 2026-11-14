@@ -362,7 +362,7 @@ describe("every live identity is answered; what it may do is the choke point's",
     );
   });
 
-  test("a personal-token shape is unknown, and is never compared as Home's own key", async () => {
+  test("an unminted personal token is unknown, and is never compared as Home's own key", async () => {
     const h = await home(false);
     const personal = `chp_${"A".repeat(43)}`;
     // Even as the key Home read at boot, from a direct loopback peer, it is not one.
@@ -397,5 +397,112 @@ describe("every live identity is answered; what it may do is the choke point's",
     expect(reasonOf(await auth(h, request(bearer(`cha_${"A".repeat(43)}`)), LAN))).toBe(
       "401 unauthenticated session_unknown",
     );
+  });
+});
+
+describe("personal tokens", () => {
+  async function withToken(readOnly = false) {
+    const { homeFixture, ok } = await import("./test-helpers");
+    const { openDeviceRequests } = await import("./device-requests");
+    const fixture = await homeFixture();
+    const member = ok(
+      await fixture.access.grant(fixture.actor, {
+        member: "Sam",
+        create: true,
+        role: "operator",
+        scope: "home",
+      }),
+    ).principal;
+    const devices = openDeviceRequests(fixture.root, { now: fixture.clock.now });
+    const start = await devices.start({ readOnly });
+    if (!start.ok) throw new Error(start.reason);
+    await devices.decide({ caller: member, code: start.userCode, choice: "allow" });
+    const polled = await devices.poll(start.pollRef);
+    if (!polled.ok || polled.state !== "allowed") throw new Error("no token");
+    const signIn = openSignIn(fixture.root, { now: fixture.clock.now, localActor: LOCAL });
+    const check = (secret = polled.secret) =>
+      authenticate(
+        request(bearer(secret)),
+        LAN,
+        {},
+        {
+          signIn,
+          bootToken: undefined,
+          now: fixture.clock.now,
+        },
+      );
+    return { fixture, member, secret: polled.secret, credential: polled.token.id, check };
+  }
+
+  test("a live one authenticates as its member, from any address", async () => {
+    const t = await withToken();
+    expect(await t.check()).toEqual({
+      kind: "principal",
+      principal: t.member,
+      via: "personal",
+      credential: t.credential,
+    });
+  });
+
+  test("revoked, expired, or its member removed: unauthenticated", async () => {
+    const revoked = await withToken();
+    const { ok } = await import("./test-helpers");
+    ok(await revoked.fixture.access.revoke(revoked.fixture.actor, revoked.credential));
+    expect(reasonOf(await revoked.check())).toBe("401 unauthenticated credential_unknown");
+
+    const expired = await withToken();
+    expired.fixture.clock.advance(91 * 24 * 60 * 60 * 1000);
+    expect(reasonOf(await expired.check())).toBe("401 unauthenticated credential_unknown");
+
+    const removed = await withToken();
+    ok(await removed.fixture.access.removeMember(removed.fixture.actor, removed.member));
+    expect(reasonOf(await removed.check())).toBe("401 unauthenticated credential_unknown");
+  });
+
+  test("a read-only one is refused anything above reading, naming what it needs", async () => {
+    const { authorize } = await import("./authorize");
+    const t = await withToken(true);
+    const snapshot = t.fixture.snapshot();
+    const actor = { principal: t.member, credential: t.credential };
+    const harness = { scope: "harness" as const, harness: "hrn_00000000000000aa", groups: [] };
+    const now = { now: t.fixture.clock.now() };
+    expect(authorize(snapshot, actor, "h.read", harness, now).allow).toBe(true);
+    expect(authorize(snapshot, actor, "h.control", harness, now)).toEqual({
+      allow: false,
+      needs: "h.control",
+      role: "operator",
+    });
+    // The same member through a session holds it.
+    expect(authorize(snapshot, { principal: t.member }, "h.control", harness, now).allow).toBe(
+      true,
+    );
+  });
+
+  test("whatever its member's role, it never manages access", async () => {
+    const { authorize } = await import("./authorize");
+    const t = await withToken();
+    const { ok } = await import("./test-helpers");
+    ok(
+      await t.fixture.access.grant(t.fixture.actor, {
+        member: t.member,
+        role: "owner",
+        scope: "home",
+      }),
+    );
+    const snapshot = t.fixture.snapshot();
+    const now = { now: t.fixture.clock.now() };
+    const home = { scope: "home" as const };
+    expect(
+      authorize(snapshot, { principal: t.member }, "home.access.manage", home, now).allow,
+    ).toBe(true);
+    expect(
+      authorize(
+        snapshot,
+        { principal: t.member, credential: t.credential },
+        "home.access.manage",
+        home,
+        now,
+      ).allow,
+    ).toBe(false);
   });
 });

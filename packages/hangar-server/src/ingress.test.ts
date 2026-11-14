@@ -372,7 +372,7 @@ describe("Home's listeners", () => {
     // console's host would be seen.
     const t = bootTestServer({
       hostname: "localhost",
-      areas: [HOME_CORE, { area: "integrations", receivers: [receiver()] }],
+      areas: [HOME_CORE, { area: "quality", receivers: [receiver()] }],
       ingress: { port: 0 },
     });
     try {

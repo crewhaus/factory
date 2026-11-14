@@ -9,6 +9,7 @@ export {
   DECISION_EXECUTORS,
   DECISION_RECONCILERS,
   type Observed,
+  observeDefer,
   observeResolve,
   observeRuleCreate,
   observeRuleRevoke,
@@ -16,15 +17,19 @@ export {
 } from "./decision-runtime";
 export {
   type DecisionActor,
+  type DecisionSupersedeAnswer,
   type Decisions,
   type DecisionsDeps,
   type DeferRequest,
+  type DerivedRule,
   type HarnessFound,
   type ResolveAnswer,
   type ResolveHooks,
   type ResolveRequest,
+  SECURITY_SETTINGS_PATHS,
   type SupersedeRequest,
   createDecisions,
+  governedAncestorOf,
   harnessForSessionRoot,
   principalOfActor,
   settingsWriteClass,
@@ -54,6 +59,7 @@ export {
   revokeStandingRule,
   ruleDaysProblem,
   ruleEnd,
+  ruleEndProblem,
   standingPatternFor,
   widenedPatternProblem,
 } from "./rules";
@@ -138,6 +144,7 @@ export {
   reconcileOperatorControl,
   recordDesired,
 } from "./operator-controls";
+export { type ObjectPage, type ObjectPageOptions, pageObjects } from "./pages";
 export type { ReconcileCounts } from "./reconcile";
 export { type RecoverCounts, type RecoverScope, isJobReceipt } from "./recover";
 export {

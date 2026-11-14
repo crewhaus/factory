@@ -3,7 +3,7 @@
  * surface shares. Types, data, minters and a few pure functions. This entry opens
  * no file, makes no network call and imports no package; zod is in `./schemas`.
  */
-export { CORE_MODULE } from "./areas/core.js";
+export { CORE_MODULE, DEFER_REASONS } from "./areas/core.js";
 export { AREA_MODULES } from "./areas/index.js";
 export {
   AUDIENCE_BASES,
@@ -168,6 +168,13 @@ export {
 } from "./errors.js";
 export { EXIT_FOR_ERROR, EXIT_FOR_REJECTED_RECEIPT } from "./exits.js";
 export {
+  RUN_CONTROL_KEYS,
+  RUN_CONTROL_SHAPES,
+  type RunControlKey,
+  type RunControlShape,
+  SHAPE_RUN_CONTROLS,
+} from "./run-controls.js";
+export {
   EVENT_TAXONOMY,
   EVENT_TAXONOMY_VERSION,
   EVENT_TYPES,
@@ -304,4 +311,10 @@ export {
 export { type MintUlidOptions, ULID_LENGTH, mintUlid } from "./ulid.js";
 
 /** The scoped browser token's closed actions, composed from the modules. */
-export { SCOPED_ACTS, type ScopedAct } from "./scoped-acts.js";
+export {
+  SCOPED_ACTS,
+  SCOPED_REF_KINDS,
+  type ScopedAct,
+  type ScopedRefKind,
+  scopedRunRef,
+} from "./scoped-acts.js";

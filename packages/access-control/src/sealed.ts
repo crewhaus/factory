@@ -18,12 +18,20 @@ import type { DeviceJwk } from "./sign-in-records";
 /** The HKDF info string. A pin: both halves derive with it. */
 export const SEALED_INFO = "crewhaus.hangar.v1/issued";
 
-/** The operations that issue a session. */
+/**
+ * The operations that issue a secret: a session, a device sign-in's poll reference and its
+ * token, and the tokens and invites the control API mints.
+ */
 export type SealedOperation =
   | "auth.exchange"
   | "auth.session"
   | "auth.refresh"
-  | "auth.acceptInvite";
+  | "auth.acceptInvite"
+  | "auth.device.start"
+  | "auth.device.poll"
+  | "access.tokens.mint"
+  | "access.invites.create"
+  | "access.scopedTokens.mint";
 
 export type Issued = {
   readonly alg: "ECDH-ES+A256GCM";

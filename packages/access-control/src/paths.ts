@@ -45,6 +45,17 @@ export type AccessPaths = {
   readonly signIn: Readonly<Record<SignInKind, string>>;
   /** Content-free lines about proxy identity headers Home ignored. */
   readonly security: string;
+  /**
+   * Pending device sign-ins (`device-requests.json`): rewritable, never a ledger, so a
+   * request never moves the access revision. Written under the access lock.
+   */
+  readonly deviceRequests: string;
+  /**
+   * When each token and device was last used (`usage.json`), on its own lock, so signing in
+   * never waits on the access lock. Never a ledger, never in the revision.
+   */
+  readonly usage: string;
+  readonly usageLock: string;
 };
 
 /** The fixed names, relative to the Hangar root. Pure: touches no file. */
@@ -67,6 +78,9 @@ export function accessPaths(): AccessPaths {
       sessions: join(ACCESS_DIR, "sessions.jsonl"),
     },
     security: join(ACCESS_DIR, "security.jsonl"),
+    deviceRequests: join(ACCESS_DIR, "device-requests.json"),
+    usage: join(ACCESS_DIR, "usage.json"),
+    usageLock: join(ACCESS_DIR, "usage.lock"),
   };
 }
 

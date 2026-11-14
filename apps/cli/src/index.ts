@@ -24338,6 +24338,64 @@ switch (subcommand) {
     }
     break;
   }
+  case "api": {
+    // One operation of Home's versioned API, by its id: Home's own key on this computer,
+    // or the token `crewhaus login` kept for a Home elsewhere (./api-cmd).
+    try {
+      const { runApiCommand } = await import("./api-cmd");
+      const out = await runApiCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "login": {
+    // Sign this computer in to a Home elsewhere with a short code (./login-cmd).
+    try {
+      const { runLoginCommand } = await import("./login-cmd");
+      const out = await runLoginCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "logout": {
+    // End that sign-in: the token is revoked in Home and deleted here (./logout-cmd).
+    try {
+      const { runLogoutCommand } = await import("./logout-cmd");
+      const out = await runLogoutCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "commands": {
+    // The receipts every change is recorded under, read from the command ledgers
+    // (./commands-cmd), through the same control service the other verbs use.
+    try {
+      const { runCommandsCommand } = await import("./commands-cmd");
+      const out = await runCommandsCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "people": {
     // People profiles, kept in an encrypted vault under the Hangar root, outside every
     // harness. The verbs read and write the vault themselves, so they work with Home

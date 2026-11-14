@@ -18,8 +18,14 @@
  * settings file), the projection carries it as `homeUrl`, so a chat card can send a person
  * to review a request there. It is part of the content: a changed address rewrites the
  * file at the next access write or `crewhaus access sync`.
+ *
+ * The projection also names the Hangar root whose access records wrote it, as its real
+ * path (`accessRoot`): a local user's principal counts on the harness only when it comes
+ * from that root's records. It is part of the content too, so a file without it, or one
+ * another root wrote, is rewritten at the next access write or `crewhaus access sync`.
  */
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   type ApproverProjection,
   type DecisionClass,
@@ -61,7 +67,7 @@ export const EMPTY_REPORT: ProjectionReport = Object.freeze({
 
 type Content = Pick<
   ApproverProjection,
-  "owner" | "governedSince" | "members" | "links" | "homeUrl"
+  "owner" | "governedSince" | "members" | "links" | "homeUrl" | "accessRoot"
 >;
 
 let writeTap: ((harness: string) => void) | undefined;
@@ -200,7 +206,8 @@ const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
  * The content a projection must hold now. Sorted, so equal access gives equal bytes.
- * `homeUrl` is the address Home is reached at, when the owner set one.
+ * `homeUrl` is the address Home is reached at, when the owner set one; `accessRoot` the
+ * real path of the Hangar root whose records these are.
  */
 export function projectionContent(
   snapshot: AccessSnapshot,
@@ -208,6 +215,7 @@ export function projectionContent(
   governedSince: string,
   now: number,
   homeUrl?: string,
+  accessRoot?: string,
 ): Content {
   const owner = snapshot.owner as string;
   const members: { principal: string; decide: DecisionClass; until?: string }[] = [];
@@ -224,7 +232,14 @@ export function projectionContent(
     .filter((link) => deciders.has(link.principal))
     .map((link) => ({ external: link.external, principal: link.principal }))
     .sort((a, b) => byText(a.external, b.external) || byText(a.principal, b.principal));
-  return { owner, governedSince, members, links, ...(homeUrl !== undefined ? { homeUrl } : {}) };
+  return {
+    owner,
+    governedSince,
+    members,
+    links,
+    ...(homeUrl !== undefined ? { homeUrl } : {}),
+    ...(accessRoot !== undefined ? { accessRoot } : {}),
+  };
 }
 
 function normalize(content: Content): string {
@@ -242,6 +257,7 @@ function normalize(content: Content): string {
       .map((link) => ({ external: link.external, principal: link.principal }))
       .sort((a, b) => byText(a.external, b.external) || byText(a.principal, b.principal)),
     ...(content.homeUrl !== undefined ? { homeUrl: content.homeUrl } : {}),
+    ...(content.accessRoot !== undefined ? { accessRoot: content.accessRoot } : {}),
   });
 }
 
@@ -255,6 +271,15 @@ function ownerHomeUrl(root: string): string | undefined {
     return read.ok ? read.settings.baseUrl : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** The Hangar root as the projection names it: its real path, else as resolved. */
+function accessRootOf(root: string): string {
+  try {
+    return realpathSync(root);
+  } catch {
+    return resolve(root);
   }
 }
 
@@ -352,6 +377,7 @@ export function writeApproverProjections(input: WriteProjectionsInput): Projecti
   const at = new Date(now).toISOString();
   const reader = createApproverReader({ now: () => now });
   const homeUrl = ownerHomeUrl(root);
+  const accessRoot = accessRootOf(root);
   const governed = new Map(snapshot.governed.map((row) => [row.id, row]));
   const ledger = accessLedger(root, "governed");
   const report = { written: [] as string[], unchanged: [] as string[] };
@@ -385,7 +411,7 @@ export function writeApproverProjections(input: WriteProjectionsInput): Projecti
       row = fresh;
       governed.set(harness.id, fresh);
     }
-    const content = projectionContent(snapshot, harness, row.since, now, homeUrl);
+    const content = projectionContent(snapshot, harness, row.since, now, homeUrl, accessRoot);
     const current = reader(harness.dir);
     if (current.state === "present") {
       const same =

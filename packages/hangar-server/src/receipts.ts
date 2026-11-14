@@ -215,9 +215,11 @@ export function createReceipts(deps: ReceiptsDeps): WithReceipt {
     // The one matcher the choke point uses too.
     const matched = matchRequest(method, segments);
     const row = matched?.row;
+    // A versioned-API row's handler submits its own receipt.
     if (
       matched === undefined ||
       row === undefined ||
+      row.v1 === true ||
       row.receipt === "none" ||
       row.kind === undefined
     ) {

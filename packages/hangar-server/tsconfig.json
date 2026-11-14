@@ -26,6 +26,7 @@
     { "path": "../harness-inventory" },
     { "path": "../harness-registry" },
     { "path": "../harness-supervisor" },
+    { "path": "../ir" },
     { "path": "../preflight" },
     { "path": "../quality-service" },
     { "path": "../spec" },

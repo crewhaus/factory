@@ -29,6 +29,14 @@ const QUALITY = {
   evalRun: "run_0123456789abcdef",
 };
 
+const ACCESS = {
+  grt: mintId("grt"),
+  inv: mintId("inv"),
+  crd: mintId("crd"),
+  lnk: mintId("lnk"),
+  cmd: mintId("cmd"),
+};
+
 const SAMPLES = [
   {
     hrn: HRN,
@@ -43,6 +51,9 @@ const SAMPLES = [
     ...QUALITY,
     changeReason: "not-worth-it",
     fraction: "0.2",
+    ...ACCESS,
+    until: "2026-12-01T09:00:00Z",
+    deferReason: "scheduled",
   },
   {
     hrn: HRN,
@@ -57,6 +68,9 @@ const SAMPLES = [
     ...QUALITY,
     changeReason: "other",
     fraction: ".5",
+    ...ACCESS,
+    until: "2026-12-01T09:00:00.000+01:00",
+    deferReason: "awaiting-someone",
   },
 ];
 
@@ -177,6 +191,13 @@ test("the placeholders, pinned, with empty flags", () => {
     "{dataset}",
     "{fraction}",
     "{evalRun}",
+    "{grt}",
+    "{inv}",
+    "{crd}",
+    "{lnk}",
+    "{cmd}",
+    "{until}",
+    "{deferReason}",
   ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
 });
@@ -230,4 +251,74 @@ test("the {dep} placeholder is the deployment id grammar", () => {
     expect(DEPLOYMENT_ID_RE.test(value)).toBe(isId("dep", value));
   }
   expect(TWIN_PLACEHOLDERS["{dep}"]).toBe(DEPLOYMENT_ID_RE);
+});
+
+describe("a deferral's twin", () => {
+  const DEFER: CliTwin = {
+    argv: [
+      "approvals",
+      "defer",
+      "{appr}",
+      "--until",
+      "{until}",
+      "--reason",
+      "{deferReason}",
+      "--dir",
+      "{dir}",
+    ],
+  };
+
+  test("round-trips, flags in any order", () => {
+    const argv = [
+      "approvals",
+      "defer",
+      APPR,
+      "--until",
+      "2026-12-01T09:00:00Z",
+      "--reason",
+      "scheduled",
+      "--dir",
+      "d",
+    ];
+    expect(parseTwin(DEFER, argv)).toEqual({
+      params: { appr: APPR, until: "2026-12-01T09:00:00Z", deferReason: "scheduled", dir: "d" },
+    });
+    expect(
+      renderTwin(DEFER, {
+        appr: APPR,
+        until: "2026-12-01T09:00:00Z",
+        deferReason: "scheduled",
+        dir: "d",
+      }),
+    ).toEqual({ argv });
+  });
+
+  test("a time without a zone, or a reason not on the closed list, is refused", () => {
+    for (const until of ["2026-12-01T09:00:00", "2026-12-01", "tomorrow", "2026-12-01T09:00Zx"]) {
+      expect(renderTwin(DEFER, { appr: APPR, until, deferReason: "scheduled", dir: "d" })).toEqual({
+        invalid: ["until"],
+      });
+    }
+    for (const reason of ["because", "", "Scheduled", "scheduled later"]) {
+      expect(
+        renderTwin(DEFER, {
+          appr: APPR,
+          until: "2026-12-01T09:00:00Z",
+          deferReason: reason,
+          dir: "d",
+        }),
+      ).toEqual({ invalid: ["deferReason"] });
+    }
+  });
+
+  test("the access and command placeholders take their own ids only", () => {
+    const grammar = TWIN_PLACEHOLDERS as Readonly<Record<string, RegExp>>;
+    for (const [name, id] of Object.entries(ACCESS)) {
+      expect((grammar[`{${name}}`] as RegExp).test(id)).toBe(true);
+      expect((grammar[`{${name}}`] as RegExp).test(`${id}x`)).toBe(false);
+      for (const [other, otherId] of Object.entries(ACCESS)) {
+        if (other !== name) expect((grammar[`{${name}}`] as RegExp).test(otherId)).toBe(false);
+      }
+    }
+  });
 });

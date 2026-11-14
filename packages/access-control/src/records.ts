@@ -42,7 +42,11 @@ export type GrantRow = RowBase & {
   readonly revokedAt?: string;
 };
 
-export type CredentialKind = "bootstrap" | "service";
+/**
+ * `personal` is a member's own token for a CLI or a script: it acts as that member and
+ * never beyond what the member holds.
+ */
+export type CredentialKind = "bootstrap" | "service" | "personal";
 
 export type CredentialRow = RowBase & {
   readonly principal: string;
@@ -56,6 +60,8 @@ export type CredentialRow = RowBase & {
   readonly subjectAssert?: true;
   /** A bootstrap only `<hangarRoot>/home.sock` accepts (`crewhaus hangar rotate-token --socket-only`). */
   readonly socketOnly?: true;
+  /** A personal token that can only read, whatever its member's role. */
+  readonly readOnly?: true;
   readonly expiresAt?: string;
   readonly state: "active" | "revoked";
   readonly revokedAt?: string;
@@ -140,7 +146,7 @@ const CHECKS: { readonly [K in keyof RowOf]: (row: Record<string, unknown>) => b
   credentials: (row) =>
     base(row, "crd") &&
     isId("prn", row["principal"]) &&
-    (row["kind"] === "bootstrap" || row["kind"] === "service") &&
+    (row["kind"] === "bootstrap" || row["kind"] === "service" || row["kind"] === "personal") &&
     typeof row["sha256"] === "string" &&
     HEX64_RE.test(row["sha256"]) &&
     optional(row["prefixHint"], (v) => typeof v === "string") &&
@@ -149,6 +155,7 @@ const CHECKS: { readonly [K in keyof RowOf]: (row: Record<string, unknown>) => b
     optional(row["contentRead"], (v) => v === true) &&
     optional(row["subjectAssert"], (v) => v === true) &&
     optional(row["socketOnly"], (v) => v === true && row["kind"] === "bootstrap") &&
+    optional(row["readOnly"], (v) => v === true && row["kind"] === "personal") &&
     optional(row["expiresAt"], isTime) &&
     (row["state"] === "active" || row["state"] === "revoked") &&
     ended(row, "revoked", "revokedAt"),

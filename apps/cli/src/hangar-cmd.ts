@@ -804,6 +804,24 @@ async function runSmokeChecks(server: HangarServer, write: (line: string) => voi
       },
     },
     {
+      name: "the versioned API answers and /api/version lists it",
+      run: async () => {
+        const auth = { authorization: `Bearer ${token}` };
+        const version = await asCli("/api/version", auth);
+        if (version.status !== 200) throw new Error(`/api/version answered ${version.status}`);
+        const listed = ((await version.json()) as { api?: unknown }).api;
+        if (!Array.isArray(listed) || !listed.includes("crewhaus.hangar.v1")) {
+          throw new Error("/api/version does not list crewhaus.hangar.v1");
+        }
+        const discovery = await asCli("/api/v1", auth);
+        if (discovery.status !== 200) throw new Error(`/api/v1 answered ${discovery.status}`);
+        const body = (await discovery.json()) as { protocol?: unknown; operations?: unknown };
+        if (body.protocol !== "crewhaus.hangar.v1" || !Array.isArray(body.operations)) {
+          throw new Error("/api/v1 did not answer its operation table");
+        }
+      },
+    },
+    {
       name: "GET /api/harnesses without a credential is refused (401)",
       run: async () => {
         const res = await get("/api/harnesses");

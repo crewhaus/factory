@@ -1301,6 +1301,7 @@
         "@crewhaus/harness-inventory": "workspace:*",
         "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/harness-supervisor": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/plugin-loader": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
@@ -1955,6 +1956,7 @@
       "devDependencies": {
         "@crewhaus/graph-engine": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-plan": "workspace:*",
         "@crewhaus/tool-state": "workspace:*",
       },

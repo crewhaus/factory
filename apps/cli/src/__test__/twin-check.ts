@@ -381,6 +381,23 @@ export const REQUIRED: Readonly<Record<string, Requirement>> = {
       { file: "access-cmd.ts", text: '"access unlink: name a link id' },
     ],
   },
+  "access approve": {
+    positionals: { min: 1, max: 1 },
+    pins: [
+      { file: "access-cmd.ts", text: 'noPositional("approve", args, 1);' },
+      { file: "access-cmd.ts", text: '"access approve: name the code' },
+    ],
+  },
+  "commands list": {
+    flags: ["harness"],
+    pins: [
+      { file: "commands-cmd.ts", text: '"commands list: name the harness with --harness <h>"' },
+    ],
+  },
+  "commands show": {
+    positionals: { min: 1, max: 1 },
+    pins: [{ file: "commands-cmd.ts", text: '"commands show: name a command, cmd_…"' }],
+  },
   "people add": {
     positionals: { max: 0 },
     flags: ["kind"],

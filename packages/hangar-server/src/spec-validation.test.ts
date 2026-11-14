@@ -674,6 +674,23 @@ describe("the crewhaus a Home job runs", () => {
     expect(jobCrewhausBin(registry, "/h", deps)).toEqual([local]);
   });
 
+  test("a row whose home is not a well-formed adoption runs Home's own crewhaus", () => {
+    const home = ["/opt/bun", "--no-env-file", "--config=/dev/null", "/opt/crewhaus/index.js"];
+    for (const malformed of [
+      {},
+      "yes",
+      { adoptedAt: "nope", by: "prn_x" },
+      { adoptedAt: "2026-08-02T00:00:00.000Z", by: "" },
+    ]) {
+      const registry = {
+        list: () => [row({ home: malformed })],
+        adoptionSince: () => "2026-07-01T00:00:00.000Z",
+      };
+      expect(jobCrewhausBin(registry, "/h", deps, home)).toEqual(home);
+      expect(jobCrewhausBin(registry, "/h", deps)).toEqual(["/usr/local/bin/crewhaus"]);
+    }
+  });
+
   test("a directory with no row runs the crewhaus on PATH", () => {
     const registry = { list: () => [], adoptionSince: () => undefined };
     expect(jobCrewhausBin(registry, "/h", deps)).toEqual(["/usr/local/bin/crewhaus"]);

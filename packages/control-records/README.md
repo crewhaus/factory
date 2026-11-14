@@ -29,7 +29,7 @@ are the run ledger and the receipts. Directories are created only on a write pat
 | `keys/digest.key` | the harness's digest key: 64 lowercase hex and a newline |
 | `leases/mutating.json` | `{v, pid, startedAt?, host, head, kind, acquiredAt, leaseRef}` |
 | `operator.json` | whether intake is paused and the deployment disabled |
-| `approvers.json` | the harness's copy of who may decide what, and Home's address (`homeUrl`) when the owner set one |
+| `approvers.json` | the harness's copy of who may decide what, Home's address (`homeUrl`) when the owner set one, and the Home root whose access records wrote it (`accessRoot`) |
 | `runs/NNNNNN.jsonl` | the run ledger (`runsLedger(harnessDir)`, on the run machine) |
 
 `controlPaths(harnessDir).heartbeatFile` is `.crewhaus/run/control-heartbeat.json`, beside the control

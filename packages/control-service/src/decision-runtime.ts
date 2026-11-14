@@ -7,6 +7,7 @@
  * |---|---|
  * | `decisions.resolve` | an `appr_`: its decision claim in the approvals ledger of the harness's session root; a `dec_`: its row in the harness's requests or change-adoption decisions |
  * | `decisions.supersede` | the `appr_`'s supersede claim |
+ * | `decisions.defer` | the `appr_`'s `defer` line in the decision log, at or after the receipt was accepted |
  * | `rules.create` | the standing rule whose row carries this receipt's id |
  * | `rules.revoke` | the `rule_`'s row |
  *
@@ -16,10 +17,16 @@
  * target that names only the harness → `unknown`, which a person decides. Nothing
  * becomes `succeeded` without an observation.
  */
-import { type CommandReceipt, isId, parseRef } from "@crewhaus/control-contract";
+import {
+  type CommandReceipt,
+  type CursorPosition,
+  isId,
+  parseRef,
+} from "@crewhaus/control-contract";
 import {
   readChangeAdoptions,
   readClaim,
+  readPage,
   readProposals,
   readStandingRules,
 } from "@crewhaus/control-records";
@@ -88,6 +95,50 @@ export function observeSupersede(receipt: CommandReceipt, harnessDir: string): O
   return typeof parsed === "string" ? "unknown" : compare(parsed.byPrincipal, receipt.actor);
 }
 
+/** Lines read per page when a deferral is looked for in the decision log. */
+const DEFER_SCAN_PAGE = 512;
+
+/**
+ * Who deferred what a `decisions.defer` receipt names: the receipt's actor's `defer` line
+ * for that `appr_`, written at or after the receipt was accepted, is the same; a decision
+ * or a supersede recorded for it since is another's; anything else is unknown. Reads the
+ * log newest first and stops at the first line older than the receipt.
+ */
+export function observeDefer(receipt: CommandReceipt, harnessDir: string): Observed {
+  const id = targetId(receipt, "decision");
+  if (id === undefined || isId("dec", id)) return "unknown";
+  const ledger = approvalsLedgerOf(harnessDir);
+  const accepted = Date.parse(receipt.acceptedAt);
+  let before: CursorPosition | undefined;
+  for (;;) {
+    const page = readPage(ledger, {
+      limit: DEFER_SCAN_PAGE,
+      ...(before !== undefined ? { before } : {}),
+    });
+    for (const item of page.items) {
+      const line = item.record;
+      const at = Date.parse(String(line["at"]));
+      if (Number.isNaN(accepted) || Number.isNaN(at) || at < accepted) {
+        if (!Number.isNaN(at) && at < accepted) return settledElsewhere(ledger, id);
+        continue;
+      }
+      if (line["decision"] !== id || line["event"] !== "defer") continue;
+      // Another member's deferral is not this receipt's; an older line may still be.
+      if (compare(line["by"], receipt.actor) === "same") return "same";
+    }
+    if (page.next === undefined) return settledElsewhere(ledger, id);
+    before = page.next;
+  }
+}
+
+/** A deferral that is not found: another's when the request was decided or replaced since. */
+function settledElsewhere(ledger: ReturnType<typeof approvalsLedgerOf>, id: string): Observed {
+  for (const claim of [`decision/${id}`, `supersede/${id}`]) {
+    if (readClaim(ledger, claim).ok) return "other";
+  }
+  return "unknown";
+}
+
 /** Who made the standing rule that carries a `rules.create` receipt's id. */
 export function observeRuleCreate(receipt: CommandReceipt, harnessDir: string): Observed {
   const read = readStandingRules(harnessDir);
@@ -131,6 +182,7 @@ const reconcilerFor =
 export const DECISION_EXECUTORS: Readonly<Record<string, Executor>> = {
   "decisions.resolve": executorFor(observeResolve),
   "decisions.supersede": executorFor(observeSupersede),
+  "decisions.defer": executorFor(observeDefer),
   "rules.create": executorFor(observeRuleCreate),
   "rules.revoke": executorFor(observeRuleRevoke),
 };

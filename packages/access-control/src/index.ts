@@ -118,7 +118,8 @@ export {
   verifyScopedToken,
 } from "./scoped";
 export { type IssuedSecretKind, mintIssuedSecret } from "./secrets";
-export type { Issued, SealedOperation } from "./sealed";
+export { type Issued, type SealedOperation, sealSecret } from "./sealed";
+export { foldSignIn } from "./sign-in-records";
 export {
   type AcceptInviteInput,
   type BearerCheck,
@@ -140,12 +141,51 @@ export {
   localPrincipalOf,
 } from "./snapshot";
 export {
+  type DeviceView,
   type GrantView,
   type InviteView,
+  type LastUsed,
   type LinkView,
   type MemberView,
   type TokenView,
+  listDevices,
+  listGrants,
   listInvites,
+  listLinks,
   listMembers,
   listTokens,
 } from "./views";
+export {
+  DEVICE_LIMITS,
+  type DeviceDecide,
+  type DeviceLookup,
+  type DevicePoll,
+  type DeviceRefusal,
+  type DeviceRequestRow,
+  type DeviceRequestState,
+  type DeviceRequests,
+  type DeviceStart,
+  openDeviceRequests,
+} from "./device-requests";
+export {
+  PERSONAL_TOKEN_TTL_MS,
+  type PersonalIssue,
+  revokeOwnToken,
+  unlinkOwn,
+} from "./personal";
+export {
+  SHORT_CODE_ALPHABET,
+  mintShortCode,
+  normalizeShortCode,
+  shortCodeDigest,
+} from "./short-code";
+export {
+  USAGE_THROTTLE_MS,
+  type UsageRecord,
+  type UsageRecorder,
+  type UsageRecorderOptions,
+  type UsageUse,
+  createUsageRecorder,
+  readUsage,
+  recordUsage,
+} from "./usage";

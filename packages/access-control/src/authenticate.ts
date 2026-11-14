@@ -8,9 +8,9 @@
  *    configured digest, or on `<hangarRoot>/proxy.sock`, whose file mode is the proof.
  *    From anywhere else it is ignored, and the caller strips it before dispatch.
  * 2. **The bearer.** `cha_…` is a session, looked up by its digest; `chs_…` is a service
- *    token, looked up by its digest; `chx_…` is a scoped token, checked by its MAC and its
- *    minting service token; any other issued-secret shape (`chp_…`, `chi_…`) is refused
- *    as unknown; any other value is compared as Home's own key, and is accepted only on
+ *    token and `chp_…` a member's personal token, each looked up by its digest; `chx_…` is
+ *    a scoped token, checked by its MAC and its minting service token; any other
+ *    issued-secret shape (`chi_…`) is refused as unknown; any other value is compared as Home's own key, and is accepted only on
  *    `<hangarRoot>/home.sock`, or over TCP from a loopback peer that sent no forwarding
  *    header, when the key is not socket-only and no proxy is trusted. A reverse proxy on
  *    this computer therefore cannot relay it. A tab-only session counts only over TCP, on
@@ -88,7 +88,7 @@ export type AuthenticateState = {
  */
 export const PROXY_SECRET_HEADER = "crewhaus-proxy-secret";
 
-export type AuthVia = "bootstrap" | "session" | "service" | "proxy" | "scoped";
+export type AuthVia = "bootstrap" | "session" | "service" | "personal" | "proxy" | "scoped";
 
 /**
  * What a scoped token may read: the run refs it names and the read acts it holds, until
@@ -105,8 +105,10 @@ export type Identified = { readonly principal: string; readonly via: AuthVia };
 type IdentityExtras = {
   /** The session's reference, for a session. */
   readonly sessionRef?: string;
-  /** The credential a service token or a scoped token's minter holds, `crd_…`. */
+  /** The credential a service, personal or scoped token's minter holds, `crd_…`. */
   readonly credential?: string;
+  /** The device a session was issued to, `dev_…`. */
+  readonly device?: string;
   /** For a scoped token: exactly what it may read. */
   readonly scoped?: ScopedGrant;
   /** A session a page on plain HTTP made for itself. */
@@ -319,6 +321,7 @@ export async function authenticate(
         principal: check.principal,
         via: "session",
         sessionRef: check.sessionRef,
+        ...(check.device !== undefined ? { device: check.device } : {}),
         ...(check.tabOnly === true ? { tabOnly: true as const } : {}),
       };
     } else if (bearer.startsWith("chs_")) {
@@ -330,6 +333,21 @@ export async function authenticate(
         );
       }
       fromBearer = { principal: row.principal, via: "service", credential: row.id };
+    } else if (bearer.startsWith("chp_")) {
+      // A member's own token: live, unexpired, and held by a member who is still one.
+      const digest = await sha256Hex(bearer);
+      const row = snapshot?.tokens.find((t) => t.kind === "personal" && t.sha256 === digest);
+      if (
+        snapshot === undefined ||
+        row === undefined ||
+        !isLiveCredential(snapshot, row, now) ||
+        snapshot.principals.find((p) => p.id === row.principal)?.kind !== "member"
+      ) {
+        return tag(
+          refused("unauthenticated", 401, "credential_unknown", "That token does not work here."),
+        );
+      }
+      fromBearer = { principal: row.principal, via: "personal", credential: row.id };
     } else if (bearer.startsWith("chx_")) {
       const verified = await verifyScopedToken(
         bearer,

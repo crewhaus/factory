@@ -43,7 +43,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan reads the sources", () => {
-    expect(SOURCES.length).toBe(21);
+    expect(SOURCES.length).toBe(25);
     expect(imports.some((i) => i.path === "@crewhaus/control-records")).toBe(true);
   });
 
@@ -127,6 +127,25 @@ describe("what the package exports", () => {
         // Home's reconcile sweep: approver lists follow group moves and grant ends.
         "refreshApproverProjections",
         "verifyScopedToken",
+        // Signing in from another computer, and the access lists' last use.
+        "DEVICE_LIMITS",
+        "PERSONAL_TOKEN_TTL_MS",
+        "SHORT_CODE_ALPHABET",
+        "USAGE_THROTTLE_MS",
+        "createUsageRecorder",
+        "foldSignIn",
+        "listDevices",
+        "listGrants",
+        "listLinks",
+        "mintShortCode",
+        "normalizeShortCode",
+        "openDeviceRequests",
+        "readUsage",
+        "recordUsage",
+        "revokeOwnToken",
+        "sealSecret",
+        "shortCodeDigest",
+        "unlinkOwn",
       ].sort(),
     );
   });

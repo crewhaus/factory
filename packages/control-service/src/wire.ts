@@ -17,16 +17,23 @@
  */
 import { hostname, uptime } from "node:os";
 import { type LocalIdentity, loadAccessSnapshot } from "@crewhaus/access-control";
-import { COMMAND_KINDS, type CommandReceipt, isId } from "@crewhaus/control-contract";
+import {
+  COMMAND_KINDS,
+  type CommandReceipt,
+  type CursorPosition,
+  MACHINES,
+  isId,
+} from "@crewhaus/control-contract";
 import type { LeaseProbe } from "@crewhaus/control-records";
 import type { HarnessSupervisor } from "@crewhaus/harness-supervisor";
 import { AREA_RUNTIMES, compositionProblems } from "./areas";
-import { type Commands, createCommands, settledRow } from "./commands";
+import { type Commands, createCommands, receiptOf, settledRow } from "./commands";
 import type { ControlCore, ControlMode } from "./context";
 import { type Decisions, createDecisions } from "./decisions";
 import type { AreaRuntime, Executor, ExecutorStamp, Reconciler, Settlement } from "./executor";
 import { type JobAdapter, createJobAdapter } from "./jobs";
 import { type LedgerChoice, commandsLedgerOf, workspaceCommandsLedger } from "./ledgers";
+import { type ObjectPage, pageObjects } from "./pages";
 import { type ReconcileCounts, createReconcile } from "./reconcile";
 import { type RecoverCounts, type RecoverScope, createRecover } from "./recover";
 import { type Rules, createRules } from "./rules";
@@ -87,6 +94,11 @@ export type ControlService = {
       id: string,
       settlement: Settlement,
     ): Promise<CommandReceipt | undefined>;
+    /** One page of a ledger's receipts, newest first, each at its current state. A read. */
+    list(
+      choice: LedgerChoice,
+      options: { readonly limit: number; readonly before?: CursorPosition },
+    ): ObjectPage<CommandReceipt>;
   };
   readonly jobs: JobAdapter;
   readonly ledgers: {
@@ -133,7 +145,9 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
     const permission = (COMMAND_KINDS as Readonly<Record<string, { permission: string }>>)[
       receipt.kind
     ]?.permission;
-    if (permission === undefined || permission === "public") return false;
+    if (permission === undefined || permission === "public" || permission === "authenticated") {
+      return false;
+    }
     const read = loadAccessSnapshot(deps.hangarRoot);
     if (read.state === "present" && read.snapshot.owner === receipt.actor) return false;
     let answer: boolean | undefined;
@@ -229,7 +243,20 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
     mode: options.mode,
     decisions,
     rules: createRules(decisions, now),
-    commands: { submit: commands.submit, get: commands.get, recover, reconcile, settle },
+    commands: {
+      submit: commands.submit,
+      get: commands.get,
+      recover,
+      reconcile,
+      settle,
+      list: (choice, page) =>
+        pageObjects(commands.ledgerOf(choice), {
+          limit: page.limit,
+          ...(page.before !== undefined ? { before: page.before } : {}),
+          entry: MACHINES.command.entry,
+          view: receiptOf,
+        }),
+    },
     jobs,
     ledgers: {
       harness: commandsLedgerOf,

@@ -52,6 +52,26 @@ const toIso = (value: unknown, fallback: string): string => {
   return fallback;
 };
 
+/**
+ * Whether a row's `home` is a well-formed adoption: a plain object whose `adoptedAt` is a
+ * timestamp that parses and whose `by` is a non-empty string, as `crewhaus harness adopt`
+ * writes it. Only such a `home` counts as adoption.
+ */
+export function isWellFormedHome(
+  value: unknown,
+): value is { readonly adoptedAt: string; readonly by: string } {
+  const home = asRecord(value);
+  if (home === undefined) return false;
+  const adoptedAt = home["adoptedAt"];
+  const by = home["by"];
+  return (
+    typeof adoptedAt === "string" &&
+    Number.isFinite(Date.parse(adoptedAt)) &&
+    typeof by === "string" &&
+    by !== ""
+  );
+}
+
 export type NormalizeCtx = {
   readonly nowIso: string;
   /** Mint an id for `dir`, avoiding everything in `taken`. */
@@ -87,9 +107,16 @@ function normalizeEntry(
   const watchmeRaw = asRecord(raw["watchme"]);
   const share =
     typeof watchmeRaw?.["share"] === "boolean" ? watchmeRaw["share"] : raw["share"] === true;
-  const carried = liftingV1
-    ? Object.fromEntries(Object.entries(raw).filter(([key]) => key !== "share"))
-    : raw;
+  // A `home` is carried only when it is a well-formed adoption.
+  const homeKept = !("home" in raw) || isWellFormedHome(raw["home"]);
+  const carried =
+    liftingV1 || !homeKept
+      ? Object.fromEntries(
+          Object.entries(raw).filter(
+            ([key]) => !(liftingV1 && key === "share") && !(key === "home" && !homeKept),
+          ),
+        )
+      : raw;
 
   const entry: HangarHarnessEntry = {
     ...carried,

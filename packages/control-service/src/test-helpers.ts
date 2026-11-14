@@ -157,8 +157,12 @@ export function rig(
       ...(options.areas !== undefined ? { areas: options.areas } : {}),
     },
   );
+  HOME_OF.set(harness, hangarRoot);
   return { hangarRoot, harness, service, supervisor, probe, warnings, clock };
 }
+
+/** The Home root each rig's harness was made with: the root its projection names by default. */
+const HOME_OF = new Map<string, string>();
 
 /** Every line of every segment of a ledger, in order. */
 export function rowsOf(ledger: Ledger): Record<string, unknown>[] {
@@ -270,8 +274,8 @@ export function linkLocalMember(
   hangarRoot: string,
   identity: { readonly username: string; readonly hostname: string },
   by: string,
+  principal: string = mintId("prn"),
 ): string {
-  const principal = mintId("prn");
   const link = mintId("lnk");
   const at = new Date(NOW).toISOString();
   const dir = join(hangarRoot, "access");
@@ -302,12 +306,23 @@ export function linkLocalMember(
   return principal;
 }
 
-/** Write a harness's approver projection: its owner and members by class. */
+/**
+ * Write a harness's approver projection: its owner and members by class, and the Hangar
+ * root that wrote it (`accessRoot`, a real path). That root is, by default, the Home of
+ * the rig the harness was made with; `accessRoot: null` writes a projection that names
+ * none.
+ */
 export function plantProjection(
   harness: string,
   owner: string,
   members: ReadonlyArray<{ readonly principal: string; readonly decide: string }> = [],
+  extra: { readonly accessRoot?: string | null } = {},
 ): void {
+  const home = HOME_OF.get(harness);
+  const accessRoot =
+    extra.accessRoot === null
+      ? undefined
+      : (extra.accessRoot ?? (home !== undefined ? realpathSync(home) : undefined));
   const control = join(harness, ".crewhaus", "run", "control");
   mkdirSync(control, { recursive: true });
   writeFileSync(
@@ -321,6 +336,7 @@ export function plantProjection(
       governedSince: new Date(NOW - 86_400_000).toISOString(),
       members,
       links: [],
+      ...(accessRoot !== undefined ? { accessRoot } : {}),
     })}\n`,
   );
 }

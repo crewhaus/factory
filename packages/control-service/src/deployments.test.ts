@@ -1,8 +1,10 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -15,6 +17,7 @@ import {
   controlPaths,
   deploymentsLedger,
   readDeployments,
+  readDigestKey,
   readHarnessIdentity,
 } from "@crewhaus/control-records";
 import { HARNESS_IDENTITY_REL } from "@crewhaus/harness-registry";
@@ -834,4 +837,149 @@ describe("admitExplicitStart", () => {
 
 test("the registry reads harness.json where control-records writes it", () => {
   expect(HARNESS_IDENTITY_REL).toBe(controlPaths("/any").harnessIdentityFile);
+});
+
+describe("with decideOnly, every refusal of a start's activation is decided and nothing is written", () => {
+  const keyPath = (dir: string): string => join(dir, controlPaths(dir).digestKeyFile);
+  const ledgerPath = (dir: string): string => join(dir, controlPaths(dir).deploymentsFile);
+
+  /** The bytes of a path, or `null` when nothing is there. */
+  function bytesOf(path: string): string | null {
+    return existsSync(path) ? readFileSync(path, "latin1") : null;
+  }
+
+  function unreadableKey(dir: string): void {
+    put(dir, controlPaths(dir).digestKeyFile, "this is not a digest key\n");
+  }
+
+  /**
+   * Two active builds: `prod` (protected, no approval covers this build) activated first,
+   * then an unprotected `staging`, so the records' active build is the staging one. The
+   * build on disk is then changed, so a start from the terminal records and activates it.
+   */
+  async function protectedSecondEnvironment(prepareChanged: boolean): Promise<string> {
+    const dir = harness();
+    protectProd(dir, []);
+    const ledger = deploymentsLedger(dir);
+    for (const [environment, activatedAt] of [
+      ["prod", "2026-01-01T00:00:00.000Z"],
+      ["staging", "2026-01-02T00:00:00.000Z"],
+    ] as const) {
+      const id = await prepare(dir);
+      const read = readDeployments(dir);
+      const record = read.state === "present" ? read.records.find((r) => r["id"] === id) : {};
+      const rest = { ...record };
+      Reflect.deleteProperty(rest, "gen");
+      await casAppend(ledger, id, "prepared", {
+        ...rest,
+        state: "active",
+        environment,
+        activatedAt,
+        activatedBy: ACTOR,
+        autostart: true,
+        gates: "not-run",
+        cmd: CMD,
+      });
+    }
+    const read = readDeployments(dir);
+    expect(read.state === "present" && read.active?.["environment"]).toBe("staging");
+    put(dir, "dist/daemon.ts", "// recompiled\n");
+    if (prepareChanged) await prepare(dir);
+    return dir;
+  }
+
+  const cliDecide = (dir: string) =>
+    admitExplicitStart(dir, "channel", { head: "cli-direct", actor: ACTOR, decideOnly: true });
+  const cliStart = (dir: string) =>
+    admitExplicitStart(dir, "channel", { head: "cli-direct", actor: ACTOR });
+
+  /** A copy of a fixture, so the real start runs where the decision did not. */
+  function copyOf(dir: string): string {
+    const copy = tempDir();
+    cpSync(dir, copy, { recursive: true, verbatimSymlinks: true });
+    return copy;
+  }
+
+  test("a digest key that cannot be read refuses, and the ledger and the key are unchanged", async () => {
+    const dir = harness();
+    unreadableKey(dir);
+    expect((await readDigestKey(dir)).state).toBe("unreadable");
+    const key = bytesOf(keyPath(dir));
+    const answer = await cliDecide(dir);
+    expect(answer).toEqual({
+      ok: false,
+      message: "the harness's digest key cannot be read; nothing was done",
+    });
+    expect(bytesOf(keyPath(dir))).toBe(key);
+    expect(existsSync(ledgerPath(dir))).toBe(false);
+    expect(readDeployments(dir).state).toBe("absent");
+    const real = await cliStart(copyOf(dir));
+    expect(real).toEqual(answer);
+  });
+
+  test("an absent digest key decides the start, and no key is created", async () => {
+    const dir = harness();
+    expect(await cliDecide(dir)).toEqual({ ok: true });
+    expect(existsSync(keyPath(dir))).toBe(false);
+    expect(existsSync(join(dir, HARNESS_IDENTITY_REL))).toBe(false);
+    expect(readDeployments(dir).state).toBe("absent");
+  });
+
+  for (const prepareChanged of [false, true]) {
+    test(`a protected environment whose active build the start replaces refuses it${prepareChanged ? " (a compile's prepared record)" : ""}, as the start does`, async () => {
+      const dir = await protectedSecondEnvironment(prepareChanged);
+      const before = bytesOf(ledgerPath(dir));
+      const key = bytesOf(keyPath(dir));
+      const answer = await cliDecide(dir);
+      expect(answer.ok).toBe(false);
+      const message = !answer.ok ? answer.message : "";
+      if (prepareChanged) expect(message).toStartWith('"prod" is a protected environment: ');
+      else expect(message).toBe(noSpecRevisionMessage("prod"));
+      expect(bytesOf(ledgerPath(dir))).toBe(before);
+      expect(bytesOf(keyPath(dir))).toBe(key);
+      const real = await cliStart(copyOf(dir));
+      expect(real).toEqual(answer);
+    });
+  }
+
+  test("decide-only and the start agree on every fixture", async () => {
+    const fixtures: Record<string, () => Promise<{ dir: string; ledgerAbsent?: boolean }>> = {
+      "an unreadable key": async () => {
+        const dir = harness();
+        unreadableKey(dir);
+        return { dir };
+      },
+      "an absent key": async () => ({ dir: harness() }),
+      "a protected second environment": async () => ({
+        dir: await protectedSecondEnvironment(false),
+      }),
+      "the build is active": async () => {
+        const dir = harness();
+        const dep = await prepare(dir);
+        await activateDeployment({ harnessDir: dir, dep, actor: ACTOR, cmd: CMD, gates });
+        return { dir };
+      },
+      "an absent ledger": async () => ({ dir: harness() }),
+      "only the start's own compile's prepared records": async () => {
+        const dir = harness();
+        await prepare(dir);
+        return { dir, ledgerAbsent: true };
+      },
+    };
+    for (const [name, make] of Object.entries(fixtures)) {
+      const { dir, ledgerAbsent } = await make();
+      const copy = copyOf(dir);
+      for (const head of ["cli-direct", "home"] as const) {
+        const options = {
+          head,
+          actor: ACTOR,
+          ...(ledgerAbsent !== undefined ? { ledgerAbsent } : {}),
+        };
+        const decided = await admitExplicitStart(dir, "channel", { ...options, decideOnly: true });
+        const started = await admitExplicitStart(copyOf(dir), "channel", options);
+        expect({ name, head, ok: decided.ok }).toEqual({ name, head, ok: started.ok });
+      }
+      expect(readDeployments(dir)).toEqual(readDeployments(copy));
+    }
+  });
 });

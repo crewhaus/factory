@@ -67,6 +67,11 @@ export type RouteRow = {
    * target is the harness.
    */
   readonly receiptRef?: { readonly kind: string; readonly param: string };
+  /**
+   * A row of the versioned API, built from its operation (`v1/match.ts`): its handler
+   * submits its own receipt, so the receipts middleware never writes one for it.
+   */
+  readonly v1?: true;
 };
 
 type WriteExtras = {
@@ -151,6 +156,8 @@ export const OFF_MAP_KEYS: readonly string[] = [
   "removeScanRoot",
   "fleetCosts",
   "runProof",
+  "authDeviceStart",
+  "authDevicePoll",
 ];
 
 /** Routes outside `/api`, answered before authentication. */
@@ -177,15 +184,23 @@ export const ROUTE_TABLE: readonly RouteRow[] = [
   read("authChallenge", "/api/v1/auth/challenge", "public"),
   readOnly("authSession", "POST", "/api/v1/auth/session", "public", "signs a browser in"),
   readOnly("authExchange", "POST", "/api/v1/auth/exchange", "public", "signs a browser in"),
-  readOnly(
-    "authAcceptInvite",
-    "POST",
-    "/api/v1/auth/accept-invite",
-    "public",
-    "joins Home from an invite",
-  ),
+  // Joining is on record: the sign-in route writes this receipt itself, once the invite is
+  // spent and the new member exists, as that member.
+  write("authAcceptInvite", "workspace", "POST", "/api/v1/auth/accept-invite", "public", {
+    kind: "auth.acceptInvite",
+    secretFields: ["code", "sessionSecret"],
+    note: "The sign-in route writes this receipt itself, once the invite is spent.",
+  }),
   readOnly("authRefresh", "POST", "/api/v1/auth/refresh", "public", "renews a browser session"),
   readOnly("authSignOut", "POST", "/api/v1/auth/sign-out", "public", "ends a browser session"),
+  readOnly("authDeviceStart", "POST", "/api/v1/auth/device", "public", "starts a device sign-in"),
+  readOnly(
+    "authDevicePoll",
+    "POST",
+    "/api/v1/auth/device/poll",
+    "public",
+    "collects a device sign-in once a member allows it",
+  ),
   readOnly(
     "bootTicket",
     "POST",

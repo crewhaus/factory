@@ -37,6 +37,16 @@ describe("the main entry type-checks as NodeNext, with no Bun types", () => {
   }, 20_000); // A full program check.
 });
 
+describe("./http type-checks as NodeNext, with no Bun types", () => {
+  test("no diagnostics over its graph", () => {
+    const entry = join(import.meta.dir, "http", "index.ts");
+    const { files, diagnostics } = check(entry);
+    expect(diagnostics).toEqual([]);
+    expect(files).toBe(scanImportGraph(entry).files.length);
+    expect(files).toBeGreaterThanOrEqual(4);
+  }, 20_000); // A full program check.
+});
+
 describe("the check sees a planted defect", () => {
   const dir = mkdtempSync(join(tmpdir(), "control-contract-nodenext-"));
   afterAll(() => rmSync(dir, { recursive: true, force: true }));

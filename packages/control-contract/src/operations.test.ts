@@ -234,6 +234,15 @@ const CORE_ROWS = [
     "decisionResolved",
   ],
   [
+    "decisions.defer",
+    "POST",
+    "/api/v1/decisions/{ref}/defer",
+    "h.decision.resolve",
+    "harness",
+    "decisionDeferRequest",
+    "decisionResolved",
+  ],
+  [
     "rules.list",
     "GET",
     "/api/v1/harnesses/{h}/standing-rules",
@@ -470,6 +479,42 @@ const CORE_ROWS = [
     "emptyRequest",
     "signedOut",
   ],
+  [
+    "auth.device.start",
+    "POST",
+    "/api/v1/auth/device",
+    "public",
+    "none",
+    "deviceStartRequest",
+    "deviceStarted",
+  ],
+  [
+    "auth.device.poll",
+    "POST",
+    "/api/v1/auth/device/poll",
+    "public",
+    "none",
+    "devicePollRequest",
+    "devicePolled",
+  ],
+  [
+    "auth.device.lookup",
+    "POST",
+    "/api/v1/access/device-requests/lookup",
+    "authenticated",
+    "none",
+    "deviceLookupRequest",
+    "deviceRequestView",
+  ],
+  [
+    "auth.device.decide",
+    "POST",
+    "/api/v1/access/device-requests/decide",
+    "authenticated",
+    "workspace",
+    "deviceDecideRequest",
+    "commandAccepted",
+  ],
 ] as const;
 
 /** What each core command kind needs, written apart from its row. */
@@ -489,6 +534,7 @@ const CORE_KIND_PERMISSIONS = {
   "runs.resume": "h.run.submit",
   "decisions.resolve": "h.decision.resolve",
   "decisions.supersede": "h.decision.resolve",
+  "decisions.defer": "h.decision.resolve",
   "rules.create": "h.standing-rule.manage",
   "rules.revoke": "h.standing-rule.manage",
   "access.invites.create": "home.access.manage",
@@ -501,16 +547,17 @@ const CORE_KIND_PERMISSIONS = {
   "access.links.revoke": "home.access.manage",
   "access.devices.revoke": "home.access.manage",
   "auth.acceptInvite": "public",
+  "auth.device.decide": "authenticated",
 } as const;
 
 describe("the table holds together", () => {
   test("no rule is broken", () => {
     expect(checkOperations(OPERATIONS, ENV)).toEqual([]);
-    expect(OPERATIONS.length).toBeGreaterThanOrEqual(59);
+    expect(OPERATIONS.length).toBeGreaterThanOrEqual(64);
   });
 
-  test("the core has exactly 59 rows, and rollback is not one of them", () => {
-    expect(CORE).toHaveLength(59);
+  test("the core has exactly 64 rows, and rollback is not one of them", () => {
+    expect(CORE).toHaveLength(64);
     expect(CORE.some((op) => op.id === "deployments.rollback")).toBe(false);
   });
 
@@ -724,7 +771,7 @@ describe("rows, pinned", () => {
       op.response,
     ]);
     expect(actual).toEqual(CORE_ROWS.map((cells) => [...cells]));
-    expect(actual).toHaveLength(59);
+    expect(actual).toHaveLength(64);
   });
 
   test("each core command kind's permission, written apart from its row", () => {
@@ -732,7 +779,7 @@ describe("rows, pinned", () => {
       CORE_MODULE.commandKinds.map((kind) => [kind.id, kind.permission]),
     );
     expect(actual).toEqual(CORE_KIND_PERMISSIONS);
-    expect(Object.keys(actual)).toHaveLength(27);
+    expect(Object.keys(actual)).toHaveLength(29);
   });
 
   test("permissions where the cell is not a member", () => {
@@ -749,6 +796,10 @@ describe("rows, pinned", () => {
       "auth.session": "public",
       "auth.exchange": "public",
       "auth.acceptInvite": "public",
+      "auth.device.start": "public",
+      "auth.device.poll": "public",
+      "auth.device.lookup": "authenticated",
+      "auth.device.decide": "authenticated",
     };
     for (const [id, permission] of Object.entries(expected)) {
       expect(`${id} ${coreRow(id).permission}`).toBe(`${id} ${permission}`);
@@ -771,6 +822,9 @@ describe("rows, pinned", () => {
       ["auth.exchange", "authentication, not a command"],
       ["auth.refresh", "authentication, not a command"],
       ["auth.signOut", "authentication, not a command"],
+      ["auth.device.start", "authentication, not a command"],
+      ["auth.device.poll", "authentication, not a command"],
+      ["auth.device.lookup", "it reads a pending sign-in request"],
     ]);
   });
 
@@ -786,6 +840,7 @@ describe("rows, pinned", () => {
       "access.links.revoke",
       "access.devices.revoke",
       "auth.acceptInvite",
+      "auth.device.decide",
     ]);
     expect(coreRow("runs.create").idempotency).toBe("required-for-services");
   });
@@ -810,6 +865,7 @@ describe("rows, pinned", () => {
         "access.links.revoke",
         "access.tokens.list",
         "access.tokens.revoke",
+        "auth.device.decide",
         "auth.refresh",
         "auth.signOut",
       ],
@@ -832,7 +888,13 @@ describe("rows, pinned", () => {
     expect(CORE.filter((op) => op.secretFields !== undefined).map((op) => op.id)).toEqual([
       "auth.exchange",
       "auth.acceptInvite",
+      "auth.device.poll",
+      "auth.device.lookup",
+      "auth.device.decide",
     ]);
+    expect(coreRow("auth.device.poll").secretFields).toEqual(["pollRef"]);
+    expect(coreRow("auth.device.lookup").secretFields).toEqual(["code"]);
+    expect(coreRow("auth.device.decide").secretFields).toEqual(["code"]);
     expect(coreRow("auth.exchange").secretFields).toEqual(["code"]);
     expect(coreRow("auth.acceptInvite").secretFields).toEqual(["code", "sessionSecret"]);
   });
@@ -862,9 +924,27 @@ describe("rows, pinned", () => {
       ["decisions.get", "approvals show {appr} --dir {dir}"],
       ["decisions.resolve", "approvals {choice} {appr} --dir {dir}"],
       ["decisions.supersede", "approvals supersede {appr} --reason {supersedeReason} --dir {dir}"],
+      [
+        "decisions.defer",
+        "approvals defer {appr} --until {until} --reason {deferReason} --dir {dir}",
+      ],
       ["rules.list", "approvals rules --dir {dir}"],
       ["rules.revoke", "approvals revoke {rule} --dir {dir}"],
+      ["commands.get", "commands show {cmd}"],
+      ["commands.list", "commands list --harness {hrn}"],
+      ["access.members.list", "access members"],
+      ["access.tokens.list", "access tokens"],
+      ["access.invites.revoke", "access revoke {inv}"],
+      ["access.grants.revoke", "access revoke {grt}"],
+      ["access.tokens.revoke", "access revoke {crd}"],
+      ["access.links.revoke", "access unlink {lnk}"],
     ]);
+    // A code is a secret and a twin is shown on screen, so approving a device has none.
+    for (const id of ["auth.device.lookup", "auth.device.decide"]) {
+      expect(coreRow(id).cliTwin).toBeNull();
+      expect(coreRow(id).noTwinReason).toContain("crewhaus access approve");
+    }
+    expect(coreRow("controls.retire").cliTwin).toBeNull();
     expect(coreRow("rules.create").cliTwin).toBeNull();
     expect(coreRow("rules.create").noTwinReason).toContain(
       "crewhaus approvals grant <id> --always",
@@ -888,6 +968,7 @@ describe("rows, pinned", () => {
         "controls.stop",
         "runs.cancel",
         "decisions.resolve",
+        "decisions.defer",
         "rules.revoke",
         "access.invites.revoke",
         "access.grants.revoke",
@@ -897,8 +978,8 @@ describe("rows, pinned", () => {
       ].sort(),
     );
     const receipted = CORE.filter((op) => op.receipt !== "none");
-    expect(receipted).toHaveLength(27);
-    expect(CORE_MODULE.commandKinds).toHaveLength(27);
+    expect(receipted).toHaveLength(29);
+    expect(CORE_MODULE.commandKinds).toHaveLength(29);
     expect(CORE_MODULE.commandKinds.every((kind) => kind.effect === "local")).toBe(true);
   });
 
@@ -908,6 +989,9 @@ describe("rows, pinned", () => {
     expect(coreRow("runs.create").response).toBe("runCreated");
     expect(coreRow("decisions.resolve").response).toBe("decisionResolved");
     expect(coreRow("decisions.supersede").response).toBe("decisionResolved");
+    expect(coreRow("decisions.defer").response).toBe("decisionResolved");
+    expect(coreRow("decisions.defer").request).toBe("decisionDeferRequest");
+    expect(coreRow("auth.device.poll").response).toBe("devicePolled");
     expect(coreRow("auth.exchange").request).toBe("authExchangeRequest");
     expect(coreRow("access.invites.create").response).toBe("inviteIssued");
     expect(coreRow("access.tokens.mint").response).toBe("tokenIssued");
@@ -971,5 +1055,71 @@ describe("path params", () => {
     expect(isPathParam("ref", [hrn, "decision"])).toBe(false);
     expect(isPathParam("ref", ["home", "session", "sess_0123456789abcdef"])).toBe(false);
     expect(isPathParam("ref", ["run_abcd1234"])).toBe(false);
+  });
+});
+
+describe("a deferral is a receipted command", () => {
+  test("its row, its permission, its kind and its twin", () => {
+    const defer = coreRow("decisions.defer");
+    expect(defer.method).toBe("POST");
+    expect(defer.path).toBe("/api/v1/decisions/{ref}/defer");
+    expect(defer.permission).toBe("h.decision.resolve");
+    expect(defer.receipt).toBe("harness");
+    expect(defer.idempotency).toBe("accepted");
+    expect(defer.cliTwin?.argv).toEqual([
+      "approvals",
+      "defer",
+      "{appr}",
+      "--until",
+      "{until}",
+      "--reason",
+      "{deferReason}",
+      "--dir",
+      "{dir}",
+    ]);
+    const kind = COMMAND_KINDS["decisions.defer"];
+    expect(kind.permission).toBe("h.decision.resolve");
+    expect(kind.idempotent).toBe(true);
+    expect(kind.effect).toBe("local");
+    expect(kind.cliTwin).toEqual(defer.cliTwin);
+  });
+
+  test("its request is strict, takes a reason from the closed list, and carries no expect", () => {
+    const schema = SCHEMAS["decisionDeferRequest"] as z.ZodTypeAny;
+    expect(schema.safeParse({ until: "2026-12-01T09:00:00Z", reason: "scheduled" }).success).toBe(
+      true,
+    );
+    expect(schema.safeParse({ until: "2026-12-01T09:00:00Z", reason: "because" }).success).toBe(
+      false,
+    );
+    expect(
+      schema.safeParse({ until: "2026-12-01T09:00:00Z", reason: "other", expect: "pending" })
+        .success,
+    ).toBe(false);
+  });
+});
+
+describe("device sign-in rows", () => {
+  test("start and poll are answered before sign-in; lookup and decide need a caller", () => {
+    expect(coreRow("auth.device.start").permission).toBe("public");
+    expect(coreRow("auth.device.poll").permission).toBe("public");
+    expect(coreRow("auth.device.lookup").permission).toBe("authenticated");
+    expect(coreRow("auth.device.decide").permission).toBe("authenticated");
+    // A code never sits in a path: lookup and decide are POSTs outside the sign-in prefix.
+    for (const id of ["auth.device.lookup", "auth.device.decide"]) {
+      expect(coreRow(id).method).toBe("POST");
+      expect(coreRow(id).path.startsWith("/api/v1/auth/")).toBe(false);
+      expect(coreRow(id).path).not.toContain("{");
+    }
+    expect(coreRow("auth.device.decide").qualifiers).toEqual(["self"]);
+    expect(COMMAND_KINDS["auth.device.decide"].idempotent).toBe(false);
+  });
+
+  test("the token is sealed to the poll that collects it", () => {
+    const poll = SCHEMAS["devicePollRequest"] as z.ZodTypeAny;
+    expect(poll.safeParse({ pollRef: "ab".repeat(32) }).success).toBe(false);
+    const polled = SCHEMAS["devicePolled"] as z.ZodTypeAny;
+    expect(polled.safeParse({ state: "pending" }).success).toBe(true);
+    expect(polled.safeParse({ state: "allowed" }).success).toBe(false);
   });
 });

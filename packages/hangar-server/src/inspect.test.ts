@@ -28,6 +28,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
+import { SECURITY_SETTINGS_PATHS } from "@crewhaus/control-service";
 import { createPendingApprovalStore } from "@crewhaus/session-store";
 import { bearer, signInFromBootLink } from "./__test__/browser";
 import { makeFixtureHarness } from "./fixture";
@@ -38,6 +39,7 @@ import {
   maskRawText,
   moduleExclusions,
   resolvedExclusion,
+  securityKeysChanged,
   settingsDiff,
   validateSettings,
 } from "./inspect";
@@ -975,6 +977,31 @@ describe("Home's run credentials and decision records are never served", () => {
     }
     expect(exclusionFor([".env.local"])?.path).toBe(".env, .env.*");
     expect(exclusionFor(["deep", "secrets", "x"])?.path).toBe(".crewhaus/secrets/");
+  });
+});
+
+describe("the security settings paths are the decision service's one list", () => {
+  test("securityKeysChanged names every path of SECURITY_SETTINGS_PATHS that differs", () => {
+    const before = JSON.stringify({ alerts: { x: 1 } });
+    const after = JSON.stringify({
+      alerts: { x: 1 },
+      permissions: { rules: [] },
+      hooks: [{ event: "stop", command: "true" }],
+      manager: { hooks: { preSpawn: "./prep.sh" }, envFiles: [".env.prod"] },
+    });
+    expect(securityKeysChanged(before, after)).toEqual(
+      SECURITY_SETTINGS_PATHS.map((path) => path.join(".")),
+    );
+    expect(securityKeysChanged(before, JSON.stringify({ alerts: { x: 2 } }))).toEqual([]);
+  });
+
+  test("inspect.ts reads the list from @crewhaus/control-service and keeps none of its own", () => {
+    const source = readFileSync(join(import.meta.dir, "inspect.ts"), "utf8");
+    const imports = source.match(
+      /import \{ SECURITY_SETTINGS_PATHS \} from "@crewhaus\/control-service";/g,
+    );
+    expect(imports?.length ?? 0).toBe(1);
+    expect(source.match(/const SECURITY_SETTINGS_PATHS\b/g)?.length ?? 0).toBe(0);
   });
 });
 

@@ -16,9 +16,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireMutatingLease } from "@crewhaus/control-records";
+import { acquireMutatingLease, controlPaths } from "@crewhaus/control-records";
 import { type HangarHarnessEntry, openHangarRegistry } from "@crewhaus/harness-registry";
-import { createProcessOps } from "@crewhaus/harness-supervisor";
+import { buildDigest, createProcessOps } from "@crewhaus/harness-supervisor";
 import { makeFixtureHarness } from "./fixture";
 import {
   JobArgumentError,
@@ -690,6 +690,42 @@ describe("process control", () => {
     }
   }, 20_000);
 
+  test("a restart whose start Home would refuse keeps the daemon running and writes nothing", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = daemonHarness(t, "proc-restart-decided");
+      const id = await register(t, dir);
+      const started = await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+      expect(started.status).toBe(200);
+      // No deployment record, and a digest key that cannot be read.
+      const ledger = join(dir, controlPaths(dir).deploymentsFile);
+      rmSync(ledger, { force: true });
+      const keyFile = join(dir, controlPaths(dir).digestKeyFile);
+      writeFileSync(keyFile, "this is not a digest key\n");
+      const key = readFileSync(keyFile, "latin1");
+
+      // Home's own process layer, so the restart reaches Home's admission.
+      const home = terminalManager(t);
+      try {
+        const restarted = await home.get(entryFor(t, id)).supervisor.restart();
+        expect(restarted).toMatchObject({
+          ok: false,
+          reason: "build-not-active",
+          message: "the harness's digest key cannot be read; nothing was done",
+          kept: true,
+        });
+      } finally {
+        home.close();
+      }
+      expect(t.ops?.children.length).toBe(1);
+      expect(t.ops?.last()?.signals).toEqual([]);
+      expect(existsSync(ledger)).toBe(false);
+      expect(readFileSync(keyFile, "latin1")).toBe(key);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
   test("the live feed follows a DRAINING run instead of reporting it finished", async () => {
     const stub = startStubControlPlane(STUB_TOKEN);
     const t = bootTestServer({ now: () => NOW });
@@ -1160,3 +1196,152 @@ describe("a mutating job holds the harness's mutating lease", () => {
     );
   });
 });
+
+describe("a disabled harness at each of Home's entry points", () => {
+  const post = (body: unknown): RequestInit => ({ method: "POST", body: JSON.stringify(body) });
+
+  function disable(dir: string): void {
+    const control = join(dir, ".crewhaus", "run", "control");
+    mkdirSync(control, { recursive: true });
+    writeFileSync(
+      join(control, "operator.json"),
+      `${JSON.stringify({
+        v: 1,
+        rev: 2,
+        intake: null,
+        deployment: { disabled: true, since: new Date(NOW).toISOString(), by: "prn_a" },
+        desired: "running",
+      })}\n`,
+    );
+  }
+
+  test("a start of a harness disabled before it ever ran is refused 409 disabled and spawns nothing", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = daemonHarness(t, "proc-disabled-cold");
+      const id = await register(t, dir);
+      disable(dir);
+      const started = await t.api(`/api/h/${id}/proc/start`, post({}));
+      expect(started.status).toBe(409);
+      expect(started.body).toMatchObject({
+        ok: false,
+        reason: "disabled",
+        verb: "crewhaus daemon enable",
+      });
+      expect(t.ops?.children.length).toBe(0);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("a disabled harness is refused at a group start and restart and spawns nothing; the other member runs", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const on = daemonHarness(t, "group-enabled");
+      const off = daemonHarness(t, "group-disabled");
+      const onId = await register(t, on);
+      const offId = await register(t, off);
+      expect((await t.api("/api/registry/groups", post({ name: "g" }))).status).toBe(201);
+      const registry = openHangarRegistry({ root: t.registryRoot, env: {} });
+      for (const id of [onId, offId]) {
+        await t.api(`/api/h/${id}/groups`, {
+          method: "PUT",
+          body: JSON.stringify({ groups: ["g"] }),
+        });
+        // Both members are adopted, so only the operator record can refuse one.
+        expect(registry.adopt(id, "prn_test")).toBeDefined();
+      }
+      disable(off);
+      const swept = await t.api("/api/registry/groups/g/proc/start", post({}));
+      const members = (swept.body["result"] as { members: Array<Record<string, unknown>> }).members;
+      const offRow = members.find((m) => m["id"] === offId);
+      expect(offRow).toMatchObject({ ok: false, reason: "disabled" });
+      expect(String(offRow?.["message"])).toContain("crewhaus daemon enable");
+      expect(members.find((m) => m["id"] === onId)).toMatchObject({ ok: true });
+      expect(t.ops?.children.map((c) => c.request.cwd)).toEqual([on]);
+
+      // Enabled long enough to run, then disabled: a group restart keeps it running.
+      rmSync(join(off, ".crewhaus", "run", "control", "operator.json"));
+      expect((await t.api(`/api/h/${offId}/proc/start`, post({}))).status).toBe(200);
+      const offChild = t.ops?.last();
+      disable(off);
+      const restarted = await t.api("/api/registry/groups/g/proc/restart", post({}));
+      const again = (restarted.body["result"] as { members: Array<Record<string, unknown>> })
+        .members;
+      expect(again.find((m) => m["id"] === offId)).toMatchObject({
+        ok: false,
+        reason: "disabled",
+        running: true,
+      });
+      expect(offChild?.signals).toEqual([]);
+      expect(t.ops?.children.filter((c) => c.request.cwd === off)).toHaveLength(1);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("Home's boot starts nothing for a disabled harness whose active build autostarts", async () => {
+    // Whatever path Home's boot takes to start a harness, it starts nothing for one its
+    // operator disabled.
+    let dir = "";
+    const t = bootTestServer({
+      now: () => NOW,
+      prepare: ({ workspace }) => {
+        dir = daemonHarnessAt(join(workspace, "harnesses", "boot-disabled"));
+        const registry = openHangarRegistry({
+          root: join(workspace, "registry"),
+          env: { CREWHAUS_WATCHME_ROOT: join(workspace, "watchme") },
+          now: () => NOW,
+          onWarn: () => {},
+        });
+        registry.upsert({ dir, specName: "boot-disabled", target: "channel" });
+        activateForBoot(dir);
+        disable(dir);
+      },
+    });
+    try {
+      await t.server.ready;
+      expect(existsSync(join(dir, ".crewhaus", "run", "daemon.json"))).toBe(false);
+      expect(t.ops?.children.length).toBe(0);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+});
+
+/** A daemon harness at `dir`, as {@link daemonHarness} makes one. */
+function daemonHarnessAt(dir: string): string {
+  return makeFixtureHarness(dir, {
+    specName: "boot-disabled",
+    target: "channel",
+    controlToken: STUB_TOKEN,
+    bundle: { entry: "daemon.ts" },
+  });
+}
+
+/** An active deployment of the build on disk that autostarts, written as activation does. */
+function activateForBoot(dir: string): void {
+  const taken = buildDigest(dir, { entry: "dist/daemon.ts" });
+  if ("unreadable" in taken) throw new Error(taken.unreadable);
+  const record = {
+    id: "dep_01bootbootbootbootbootboot",
+    artifact: {
+      digest: taken.digest,
+      shape: "channel",
+      entry: "dist/daemon.ts",
+      bootInputs: [],
+    },
+  };
+  const file = join(dir, controlPaths(dir).deploymentsFile);
+  mkdirSync(join(file, ".."), { recursive: true });
+  writeFileSync(
+    file,
+    `${JSON.stringify({ ...record, state: "prepared" })}\n${JSON.stringify({
+      ...record,
+      state: "active",
+      activatedAt: new Date(NOW).toISOString(),
+      autostart: true,
+      gates: "not-run",
+    })}\n`,
+  );
+}
