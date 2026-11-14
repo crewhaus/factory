@@ -78,12 +78,46 @@ import {
   isRunFailedError,
   toFailureReport,
 } from "@crewhaus/errors";
-import { type EventLog, openEventLog } from "@crewhaus/event-log";
+import { type EventLog, type SpanStatus, openEventLog } from "@crewhaus/event-log";
 import { type FederationRouter, classifyRouterError } from "@crewhaus/federation-router";
 import { buildFailureReport, classify } from "@crewhaus/recovery-engine";
 import { tagContent } from "@crewhaus/run-context";
 import { type RunChatLoopOptions, runChatLoop } from "@crewhaus/runtime-core";
-import type { CostAccrualEvent, ModelResponseEvent, ProviderId } from "@crewhaus/trace-event-bus";
+import type {
+  CostAccrualEvent,
+  ModelResponseEvent,
+  ProviderId,
+  TraceEventEnvelope,
+} from "@crewhaus/trace-event-bus";
+
+/**
+ * Report a sub-agent's span to the parent's session log, when the parent
+ * records its runs. Best effort: a write that fails never fails the spawn.
+ */
+async function recordSubAgentSpan(
+  parent: ParentRunHandle,
+  envelope: TraceEventEnvelope,
+  durationMs: number,
+  status: SpanStatus,
+  failureClass: string | undefined,
+): Promise<void> {
+  if (parent.recordSpanClosed === undefined) return;
+  try {
+    await parent.recordSpanClosed({
+      v: 1,
+      run: parent.runContext.runId,
+      span: envelope.spanId,
+      ...(envelope.parentSpanId !== undefined ? { parent: envelope.parentSpanId } : {}),
+      kind: "subagent",
+      startedAt: envelope.timestamp,
+      durationMs,
+      status,
+      ...(failureClass !== undefined ? { failureClass } : {}),
+    });
+  } catch {
+    // The record is best effort; the spawn's own result stands.
+  }
+}
 
 /**
  * Item 2 (G31) — the federation extension to {@link SpawnSubAgentOptions}. A
@@ -386,12 +420,18 @@ export async function spawnSubAgent(
   // 0.8.0 §8 — under a gated parent the child's instructions carry the
   // read-only provability guidance (`childProvabilityGuidance`).
   const instructions = childInstructions(parent, plan, opts.childTools);
+  // The sub-agent's span nests under the tool call that started it, and the
+  // child's run nests under the sub-agent's span: minted before the child's
+  // bus, which is rooted under it.
+  const parentBus = parent.runContext.eventBus;
+  const subAgentEnvelope = parentBus.envelope(undefined, { parentSpanId: parent.parentSpanId });
   const isoOpts: CreateIsolatedContextOptions = {
     name: opts.def.name,
     instructions,
     tools: opts.childTools,
     model: plan.model,
     ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
+    parentSpanId: subAgentEnvelope.spanId,
   };
   const child: IsolatedContext = await createIsolatedContext(parent, isoOpts);
 
@@ -410,8 +450,6 @@ export async function spawnSubAgent(
 
   // Section 15: also publish on the parent bus so OTel/metrics see the boundary.
   // Use the same spanId for start/end so the OTel exporter pairs them.
-  const parentBus = parent.runContext.eventBus;
-  const subAgentEnvelope = parentBus.envelope();
   parentBus.publish({
     ...subAgentEnvelope,
     kind: "sub_agent_start",
@@ -671,9 +709,9 @@ export async function spawnSubAgent(
     },
   });
 
+  const subAgentMs = performance.now() - t0SubAgent;
   parentBus.publish({
-    ...parentBus.envelope(),
-    spanId: subAgentEnvelope.spanId,
+    ...parentBus.endEnvelope(subAgentEnvelope),
     kind: "sub_agent_end",
     name: opts.def.name,
     childRunId: child.runContext.runId,
@@ -682,9 +720,22 @@ export async function spawnSubAgent(
     ...(childFailure !== undefined ? { failureClass: childFailure.failureClass } : {}),
     toolCallCount: toolCalls.length,
     finalMessageBytes: Buffer.byteLength(finalMessage, "utf8"),
-    durationMs: performance.now() - t0SubAgent,
+    durationMs: subAgentMs,
     ...planAttribution,
   });
+  await recordSubAgentSpan(
+    parent,
+    subAgentEnvelope,
+    subAgentMs,
+    !isError
+      ? "ok"
+      : childFailure === undefined
+        ? "aborted"
+        : childFailure.report.class === "approval_pending"
+          ? "parked"
+          : "error",
+    childFailure?.report.class,
+  );
 
   await child.close();
 
@@ -778,7 +829,7 @@ async function spawnFederatedSubAgent(
   });
 
   const parentBus = parent.runContext.eventBus;
-  const subAgentEnvelope = parentBus.envelope();
+  const subAgentEnvelope = parentBus.envelope(undefined, { parentSpanId: parent.parentSpanId });
   parentBus.publish({
     ...subAgentEnvelope,
     kind: "sub_agent_start",
@@ -853,9 +904,9 @@ async function spawnFederatedSubAgent(
     },
   });
 
+  const federatedMs = performance.now() - t0;
   parentBus.publish({
-    ...parentBus.envelope(),
-    spanId: subAgentEnvelope.spanId,
+    ...parentBus.endEnvelope(subAgentEnvelope),
     kind: "sub_agent_end",
     name: opts.def.name,
     childRunId,
@@ -864,8 +915,15 @@ async function spawnFederatedSubAgent(
     ...(childFailure !== undefined ? { failureClass: childFailure.failureClass } : {}),
     toolCallCount: 0,
     finalMessageBytes: Buffer.byteLength(finalMessage, "utf8"),
-    durationMs: performance.now() - t0,
+    durationMs: federatedMs,
   });
+  await recordSubAgentSpan(
+    parent,
+    subAgentEnvelope,
+    federatedMs,
+    isError ? "error" : "ok",
+    childFailure?.report.class,
+  );
 
   // Pillar 3 sink-side — the router already redacted a malicious peer reply at
   // origin "federation"; tag the (safe) reply into the parent's data-lineage so

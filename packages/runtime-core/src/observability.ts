@@ -31,15 +31,16 @@ import {
   formatJsonLine,
 } from "@crewhaus/structured-event-printer";
 import { appendContained } from "@crewhaus/tool-safety/fs";
-import type {
-  CostAccrualEvent,
-  JudgeVerdictEvent,
-  ModelDirectiveEvent,
-  ModelFailoverEvent,
-  ModelStageEvent,
-  TraceEvent,
-  TraceEventBus,
-  Unsubscribe,
+import {
+  type CostAccrualEvent,
+  type JudgeVerdictEvent,
+  type ModelDirectiveEvent,
+  type ModelFailoverEvent,
+  type ModelStageEvent,
+  type TraceEvent,
+  type TraceEventBus,
+  type Unsubscribe,
+  isValidSpanId,
 } from "@crewhaus/trace-event-bus";
 import {
   SessionMetricsAccumulator,
@@ -572,6 +573,24 @@ const CLEAN_STOP_REASONS = new Set(["end_turn", "tool_use", "stop_sequence"]);
  * `append()` failures must never abort a turn, so — like the cost_accrual
  * persistence path — the promise result is logged rather than thrown.
  */
+/**
+ * The span a mirrored line belongs to, for the events the loop itself nests:
+ * a tool call's end (the tool span), a model response (the model span) and a
+ * check's `permission_decision` (a child of the tool span). Their own span
+ * sits under the loop's open turn, so the line names it. A hand-built
+ * envelope's id may not be a span id; that line takes the handle's default.
+ *
+ * Every other mirrored kind (a recovery, an MCP call, a routing stage,
+ * failover or directive, a judge verdict) can be published by code that
+ * does not know the loop's spans, so its bus span may hang off the bus root
+ * rather than off the turn or even the run. Those lines pass no span: the
+ * loop's handle (`stampLines` in `./run-spans`) stamps them with the open
+ * turn's span, else the loop's.
+ */
+function spanOf(event: TraceEvent): { readonly span?: string } {
+  return isValidSpanId(event.spanId) ? { span: event.spanId } : {};
+}
+
 export function attachAdvisorPersistence(
   bus: TraceEventBus,
   eventLog: EventLog,
@@ -581,16 +600,21 @@ export function attachAdvisorPersistence(
   const gate = env["CREWHAUS_ADVISOR_EVENTS"];
   if (gate === "0" || gate === "false") return undefined;
 
+  // `nested` is the mirrored event when the loop parents it (see `spanOf`);
+  // absent, the line takes the handle's default span.
   const persist = (
     kind: "recovery" | "tool_stats" | "permission" | "model_meta",
     payload: unknown,
+    nested?: TraceEvent,
   ): void => {
-    void eventLog.append({ kind, payload }).catch((err) => {
-      runContext.logger.error("advisor_event.persist_failed", {
-        kind,
-        message: err instanceof Error ? err.message : String(err),
+    void eventLog
+      .append({ kind, payload, ...(nested !== undefined ? spanOf(nested) : {}) })
+      .catch((err) => {
+        runContext.logger.error("advisor_event.persist_failed", {
+          kind,
+          message: err instanceof Error ? err.message : String(err),
+        });
       });
-    });
   };
 
   // In-run digest counters (item 14). Bumped inline in the same handler so
@@ -618,16 +642,20 @@ export function attachAdvisorPersistence(
         tally.calls += 1;
         if (event.isError) tally.errors += 1;
         toolTally.set(event.toolName, tally);
-        persist("tool_stats", {
-          toolName: event.toolName,
-          // Whole milliseconds — performance.now() floats add line bytes
-          // without adding advisory signal.
-          durationMs: Math.round(event.durationMs),
-          isError: event.isError,
-          // 0.6.0 §5.6 — the serving profile, so `tools audit` can group
-          // failures by profile; absent (byte-identical) on a single-model run.
-          ...(event.profile !== undefined ? { profile: event.profile } : {}),
-        });
+        persist(
+          "tool_stats",
+          {
+            toolName: event.toolName,
+            // Whole milliseconds — performance.now() floats add line bytes
+            // without adding advisory signal.
+            durationMs: Math.round(event.durationMs),
+            isError: event.isError,
+            // 0.6.0 §5.6 — the serving profile, so `tools audit` can group
+            // failures by profile; absent (byte-identical) on a single-model run.
+            ...(event.profile !== undefined ? { profile: event.profile } : {}),
+          },
+          event,
+        );
         return;
       }
       case "permission_decision": {
@@ -639,27 +667,35 @@ export function attachAdvisorPersistence(
           if (event.askOutcome === "approved") ask.approved += 1;
           askTally.set(event.toolName, ask);
         }
-        persist("permission", {
-          toolName: event.toolName,
-          decision: event.decision,
-          askOutcome: event.askOutcome ?? null,
-        });
+        persist(
+          "permission",
+          {
+            toolName: event.toolName,
+            decision: event.decision,
+            askOutcome: event.askOutcome ?? null,
+          },
+          event,
+        );
         return;
       }
       case "model_response": {
         responses += 1;
         if (!CLEAN_STOP_REASONS.has(event.stopReason)) anomalousStops += 1;
-        persist("model_meta", {
-          stopReason: event.stopReason,
-          model: event.model,
-          ...(event.role !== undefined ? { role: event.role } : {}),
-          ...(event.profile !== undefined ? { profile: event.profile } : {}),
-          usage: event.usage,
-          // Whole milliseconds — performance.now() floats add line bytes
-          // without adding attribution signal.
-          durationMs: Math.round(event.durationMs),
-          turnNumber: event.turnNumber,
-        });
+        persist(
+          "model_meta",
+          {
+            stopReason: event.stopReason,
+            model: event.model,
+            ...(event.role !== undefined ? { role: event.role } : {}),
+            ...(event.profile !== undefined ? { profile: event.profile } : {}),
+            usage: event.usage,
+            // Whole milliseconds — performance.now() floats add line bytes
+            // without adding attribution signal.
+            durationMs: Math.round(event.durationMs),
+            turnNumber: event.turnNumber,
+          },
+          event,
+        );
         return;
       }
       case "compaction_fired": {
@@ -799,6 +835,9 @@ export function attachRoutingPersistence(
     readonly kinds?: ReadonlyArray<RoutingPersistedKind>;
   } = {},
 ): AttachedRoutingPersistence {
+  // No span from the event: these are published by the model router, the
+  // judge gate helpers and the loop's routing branches alike, not always under
+  // the loop's spans (see `spanOf`), so the handle stamps the line.
   const persist = (kind: RoutingPersistedKind, payload: unknown): void => {
     void eventLog.append({ kind, payload }).catch((err) => {
       runContext.logger.error("routing_event.persist_failed", {
@@ -951,6 +990,9 @@ const WATCHME_MIRRORED_KIND_RECORD: Readonly<Record<EventKind, true>> = {
   // the loop itself (`./run-records`).
   run_stamp: true,
   context_manifest: true,
+  // How the run's spans nested and what each check decided (`./run-spans`).
+  span_closed: true,
+  verdict: true,
 };
 export const WATCHME_MIRRORED_KINDS: ReadonlySet<string> = new Set(
   Object.keys(WATCHME_MIRRORED_KIND_RECORD),

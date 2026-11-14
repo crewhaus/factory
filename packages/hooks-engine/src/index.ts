@@ -104,6 +104,14 @@ export type RunHooksOptions = {
   readonly parentEnv?: NodeJS.ProcessEnv;
   /** Optional Section 15 trace bus. Each fired hook emits a `hook_fired` event. */
   readonly eventBus?: TraceEventBus;
+  /**
+   * The span each `hook_fired` event nests under (the tool call a `pre-tool`
+   * hook guards, the turn a `pre-model` hook runs in). Absent, the bus's
+   * current span is the parent.
+   */
+  readonly parentSpanId?: string;
+  /** The tool call the hooks fire for, stamped on each `hook_fired` event. */
+  readonly toolUseId?: string;
 };
 
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -241,13 +249,14 @@ export async function runHooks(
     for (const r of results) {
       const allowed = r.decision.decision === "allow";
       bus.publish({
-        ...bus.envelope(),
+        ...bus.envelope(undefined, { parentSpanId: opts.parentSpanId }),
         kind: "hook_fired",
         event,
         ...(r.hook.matcher ? { matcher: r.hook.matcher } : {}),
         allowed,
         durationMs: r.durationMs,
         ...(r.decision.reason ? { reason: r.decision.reason } : {}),
+        ...(opts.toolUseId !== undefined ? { toolUseId: opts.toolUseId } : {}),
       });
     }
   }

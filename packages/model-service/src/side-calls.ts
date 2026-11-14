@@ -118,6 +118,12 @@ export type NestedSingleTurnArgs = {
   readonly stage?: string;
   /** The parent run's context; a fresh child is minted when absent. */
   readonly parent?: RunContext;
+  /**
+   * The parent span the side call nests under (the turn a guide, shadow or
+   * committee call serves; the Consult tool call). Absent, the parent bus's
+   * current span.
+   */
+  readonly parentSpanId?: string;
   readonly signal?: AbortSignal;
   readonly maxTokens?: number;
   readonly sessionTarget: string;
@@ -154,7 +160,7 @@ export async function runNestedSingleTurn(
     ...(parent !== undefined
       ? {
           inheritTraceId: parent.eventBus.traceId,
-          inheritParentSpanId: parent.eventBus.currentSpanId,
+          inheritParentSpanId: args.parentSpanId ?? parent.eventBus.currentSpanId,
           logger: parent.logger,
         }
       : {}),
@@ -177,6 +183,9 @@ export async function runNestedSingleTurn(
     ...(args.stage !== undefined ? { stage: args.stage } : {}),
   };
   const usage = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+  // A child call's request and response share one span id on the child bus;
+  // they share one on the parent bus too, so the pair still matches there.
+  const parentSpans = new Map<string, string>();
   let served: { model: string; provider: ProviderId } | undefined;
   let costUsdMicros: number | undefined;
   let durationMs = 0;
@@ -207,7 +216,13 @@ export async function runNestedSingleTurn(
     // Re-publish on the parent so its meter, cost-tracker and session mirror
     // see the call (the child stamped the role; re-stamped defensively).
     if (parent !== undefined) {
-      parent.eventBus.publish({ ...event, ...parent.eventBus.envelope(), ...attribution });
+      const envelope = parent.eventBus.envelope(undefined, { parentSpanId: args.parentSpanId });
+      let spanId = parentSpans.get(event.spanId);
+      if (spanId === undefined) {
+        spanId = envelope.spanId;
+        parentSpans.set(event.spanId, spanId);
+      }
+      parent.eventBus.publish({ ...event, ...envelope, spanId, ...attribution });
     }
   });
   const injected = deps._consultAdapters?.get(args.target.modelString);
@@ -373,6 +388,7 @@ export function buildGuideSideCall(
         role: "guide",
         stage: "guide",
         parent: ctx.runContext,
+        ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
         signal: ctx.signal,
         maxTokens,
         sessionTarget: "guide",
@@ -420,6 +436,7 @@ export function buildShadowSideCall(
         role: "shadow",
         stage: "shadow",
         parent: ctx.runContext,
+        ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
         signal: ctx.signal,
         sessionTarget: "shadow",
         deps,
@@ -559,6 +576,7 @@ export function buildCommitteeSideCall(
             role: "committee",
             stage: "member",
             parent: ctx.runContext,
+            ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
             signal: ctx.signal,
             sessionTarget: "committee",
             deps,
@@ -673,6 +691,7 @@ export function buildCommitteeSideCall(
               role: "escalation",
               stage: "tie-break",
               parent: ctx.runContext,
+              ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
               signal: ctx.signal,
               sessionTarget: "committee",
               deps,
