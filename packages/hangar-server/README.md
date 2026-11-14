@@ -576,7 +576,10 @@ only the active build.
 which binds when `ingress` is set and an area composes one; the console's
 listener answers 404 for `/hooks/*`. A delivery is verified, its delivery
 id claimed once, and its receipt and raw body recorded before it is
-acknowledged; the work runs after and settles the receipt.
+acknowledged; the work runs after and settles the receipt. A delivery
+whose record cannot be written is answered 503, its receipt settles
+`failed` and its claim is given up, so the provider's retry is accepted
+and handled once.
 
 The live run feed is an SSE stream over a daemon that is *supposed* to be
 quiet, so two settings keep it open: the server binds with an explicit

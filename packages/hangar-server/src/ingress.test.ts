@@ -3,8 +3,8 @@
  * acknowledged, and its receipt settles when the work does.
  */
 import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
-import { createHmac } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { createHash, createHmac } from "node:crypto";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { foldStates } from "@crewhaus/control-records";
@@ -44,7 +44,7 @@ function receiver(overrides: Partial<Receiver> = {}, gate?: Promise<void>): Rece
   };
 }
 
-function setUp(r: Receiver) {
+function setUp(r: Receiver, warnings: string[] = []) {
   const hangarRoot = mkdtempSync(join(tmpdir(), "hangar-ingress-"));
   roots.push(hangarRoot);
   const control = wireControl(
@@ -62,7 +62,7 @@ function setUp(r: Receiver) {
     receivers: [r],
     control,
     now: () => Date.parse("2026-11-13T00:00:00.000Z"),
-    onWarn: () => undefined,
+    onWarn: (message) => warnings.push(message),
   });
   const receipts = () => {
     const fold = foldStates(workspaceCommandsLedger(hangarRoot));
@@ -72,7 +72,7 @@ function setUp(r: Receiver) {
     const dir = join(hangarRoot, "ingress", "test");
     return existsSync(dir) ? readdirSync(dir) : [];
   };
-  return { hangarRoot, ingress, receipts, inbound };
+  return { hangarRoot, control, ingress, receipts, inbound };
 }
 
 function delivery(body: string, id: string | undefined, signature?: string): Request {
@@ -142,6 +142,97 @@ describe("a delivery", () => {
     const claims = readdirSync(join(s.hangarRoot, "control", "claims", "ingress"));
     expect(claims).toHaveLength(1);
     expect(claims[0]).toMatch(/^test-[0-9a-f]{32}\.json$/);
+  });
+
+  test("a record that cannot be written: 503, the claim is given up, and the retry is handled once", async () => {
+    let handled = 0;
+    const warnings: string[] = [];
+    const s = setUp(
+      receiver({
+        handle: async () => {
+          handled += 1;
+          return { state: "succeeded" };
+        },
+      }),
+      warnings,
+    );
+    // A file where the inbound records' directory goes: the record cannot be written.
+    writeFileSync(join(s.hangarRoot, "ingress"), "in the way");
+    const first = await s.ingress.fetch(delivery('{"n":1}', "delivery-lost"));
+    expect(first.status).toBe(503);
+    await s.ingress.idle();
+    expect(handled).toBe(0);
+    const [failed] = s.receipts();
+    expect(failed?.["state"]).toBe("failed");
+    expect((failed?.["outcome"] as { code: string }).code).toBe("unavailable");
+    expect(failed?.["effects"]).toEqual([{ kind: "inbound-record", status: "failed" }]);
+    expect(warnings.some((w) => w.includes("could not be recorded"))).toBe(true);
+    expect(readdirSync(join(s.hangarRoot, "control", "claims", "ingress"))).toEqual([]);
+
+    rmSync(join(s.hangarRoot, "ingress"));
+    const retry = await s.ingress.fetch(delivery('{"n":1}', "delivery-lost"));
+    expect(retry.status).toBe(200);
+    expect(((await retry.json()) as { ok?: boolean }).ok).toBe(true);
+    await s.ingress.idle();
+    expect(handled).toBe(1);
+    const again = await s.ingress.fetch(delivery('{"n":1}', "delivery-lost"));
+    expect(await again.json()).toEqual({ duplicate: true });
+    await s.ingress.idle();
+    expect(handled).toBe(1);
+    expect(s.receipts().map((r) => r["state"])).toEqual(["failed", "succeeded"]);
+  });
+
+  test("a claim still held by a delivery that was never recorded is given up on the next attempt", async () => {
+    let handled = 0;
+    const warnings: string[] = [];
+    const s = setUp(
+      receiver({
+        handle: async () => {
+          handled += 1;
+          return { state: "succeeded" };
+        },
+      }),
+      warnings,
+    );
+    writeFileSync(join(s.hangarRoot, "ingress"), "in the way");
+    // The first release fails, so the never-recorded receipt keeps the claim.
+    const ledgers = spyOn(s.control.ledgers, "workspace").mockImplementationOnce(() => {
+      throw new Error("the ledger is busy");
+    });
+    try {
+      expect((await s.ingress.fetch(delivery("{}", "delivery-held"))).status).toBe(503);
+    } finally {
+      ledgers.mockRestore();
+    }
+    expect(warnings.some((w) => w.includes("was not released"))).toBe(true);
+    expect(readdirSync(join(s.hangarRoot, "control", "claims", "ingress"))).toHaveLength(1);
+    rmSync(join(s.hangarRoot, "ingress"));
+    // Replayed onto a receipt that never recorded it: not a duplicate, and the claim goes.
+    const replay = await s.ingress.fetch(delivery("{}", "delivery-held"));
+    expect(replay.status).toBe(503);
+    expect(readdirSync(join(s.hangarRoot, "control", "claims", "ingress"))).toEqual([]);
+    const retry = await s.ingress.fetch(delivery("{}", "delivery-held"));
+    expect(retry.status).toBe(200);
+    await s.ingress.idle();
+    expect(handled).toBe(1);
+  });
+
+  test("a claim whose delivery is still being recorded is answered 503, not duplicate", async () => {
+    const s = setUp(receiver());
+    // The winner of the claim has its receipt and no inbound record yet.
+    const digest = createHash("sha256").update("delivery-busy").digest("hex").slice(0, 32);
+    const held = await s.control.commands.submit({
+      kind: "legacy.hookTest",
+      actor: "sys:ingress",
+      ledger: "workspace",
+      via: "github",
+      params: { provider: "test", delivery: digest },
+      dedupeClaim: `ingress/test-${digest}`,
+    });
+    expect(held.ok).toBe(true);
+    const res = await s.ingress.fetch(delivery("{}", "delivery-busy"));
+    expect(res.status).toBe(503);
+    expect(s.receipts()).toHaveLength(1);
   });
 
   test("work that throws settles the receipt failed", async () => {
@@ -276,13 +367,25 @@ describe("Home's listeners", () => {
   });
 
   test("with a receiver composed, the ingress binds loopback and answers it there only", async () => {
+    serveSpy = spyOn(Bun, "serve");
+    // The console on another host than the ingress's, so an ingress that took the
+    // console's host would be seen.
     const t = bootTestServer({
+      hostname: "localhost",
       areas: [HOME_CORE, { area: "integrations", receivers: [receiver()] }],
       ingress: { port: 0 },
     });
     try {
       const ingress = t.server.ingress;
       if (ingress === undefined) throw new Error("no ingress");
+      expect(t.server.hostname).toBe("localhost");
+      // The bind itself: the call that made the ingress's socket asked for loopback.
+      const results = serveSpy.mock.results as { readonly value: { readonly port?: number } }[];
+      const bound = serveSpy.mock.calls.filter(
+        (_call, i) => results[i]?.value?.port === ingress.port,
+      );
+      expect(bound).toHaveLength(1);
+      expect((bound[0]?.[0] as { hostname?: string }).hostname).toBe("127.0.0.1");
       expect(ingress.hostname).toBe("127.0.0.1");
       const body = '{"n":1}';
       const res = await fetch(`${ingress.url}/hooks/test/events`, {

@@ -3730,11 +3730,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     openStreamChecks: () => streamChecks.size,
     ready,
     scheduler: { tick: () => scheduler.tick(), idle: () => scheduler.idle() },
+    // Read back from the bound socket, never restated: the address callers are told is the
+    // one the listener holds.
     ...(ingressServer !== undefined
       ? {
           ingress: {
-            url: `http://127.0.0.1:${ingressServer.port ?? 0}`,
-            hostname: "127.0.0.1",
+            url: `http://${ingressServer.hostname ?? ""}:${ingressServer.port ?? 0}`,
+            hostname: ingressServer.hostname ?? "",
             port: ingressServer.port ?? 0,
           },
         }

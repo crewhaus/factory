@@ -13,19 +13,23 @@
  * | the body is over the limit | 413, nothing written |
  * | `verify` says no | 401, nothing written |
  * | no delivery id | 400, nothing written |
- * | the delivery id was claimed before | 200 `{duplicate: true}`, nothing else |
+ * | the delivery id was claimed and its inbound record is there, or its receipt has settled | 200 `{duplicate: true}`, nothing else |
+ * | the delivery id was claimed and is still being recorded | 503, so the provider sends it again |
+ * | the inbound record cannot be written | 503: the receipt settles `failed` and the claim is released, so the provider's retry is accepted |
  * | otherwise | the receipt (`accepted`, actor `sys:ingress`, Home's ledger) and the inbound record are durable, then 200, then `handle` runs |
  *
- * The delivery id is claimed exactly once (`ingress/<provider>-<first 32 hex of its
+ * The delivery id is claimed once it is recorded (`ingress/<provider>-<first 32 hex of its
  * sha256>`, in Home's command ledger, with the receipt). The inbound record,
  * `<hangarRoot>/ingress/<provider>/<cmd_ id>.json` (0600), keeps the raw body until the
  * receipt settles, when it is removed; a crash after the 200 leaves the receipt
- * `accepted` for recovery. `handle` is handed the delivery's `origin`, and the area that
+ * `accepted` for recovery. A delivery whose record could not be written settles its
+ * receipt `failed` (`unavailable`, with an `inbound-record` effect `failed`) and gives up
+ * its claim, so a later delivery of the same id is accepted and handled once. `handle` is handed the delivery's `origin`, and the area that
  * owns the receiver classifies the text where it reaches a model: verifying a signature
  * says who sent it, never what it says.
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { TRUST_ORIGINS, type TrustOrigin } from "@crewhaus/boundary-classifier";
 import {
   type CommandReceipt,
@@ -33,6 +37,7 @@ import {
   type ReceiptVia,
   isCommandKind,
 } from "@crewhaus/control-contract";
+import { expireClaim } from "@crewhaus/control-records";
 import { type ControlService, type Settlement, outcomeOf } from "@crewhaus/control-service";
 import {
   DEFAULT_WEBHOOK_MAX_BYTES,
@@ -40,6 +45,19 @@ import {
 } from "@crewhaus/gateway-protocol/body-limit";
 import { json } from "./http";
 import { resolveInside } from "./safety";
+
+/** The effect a receipt carries when its delivery's inbound record could not be written. */
+export const INBOUND_RECORD_EFFECT = "inbound-record";
+
+/** Whether a receipt is one whose delivery was never recorded: its claim is not a delivery. */
+function neverRecorded(receipt: CommandReceipt): boolean {
+  return (
+    receipt.state === "failed" &&
+    receipt.effects.some(
+      (effect) => effect.kind === INBOUND_RECORD_EFFECT && effect.status === "failed",
+    )
+  );
+}
 
 /** A receiver's provider name: it names a claim and a directory. */
 export const RECEIVER_PROVIDER_RE = /^[a-z][a-z0-9-]{0,31}$/;
@@ -196,6 +214,27 @@ export function createIngress(deps: {
     }
   };
 
+  /**
+   * Give up a delivery's claim, so the provider's next attempt is accepted. Only the
+   * request that won the claim, or one that finds it held by a receipt that never recorded
+   * its delivery, calls this.
+   */
+  const release = async (claim: string): Promise<void> => {
+    try {
+      const answer = await expireClaim(
+        deps.control.ledgers.workspace(),
+        claim,
+        Number.POSITIVE_INFINITY,
+      );
+      if (!answer.ok)
+        deps.onWarn(`hangar-server: a delivery claim was not released: ${answer.reason}`);
+    } catch (err) {
+      deps.onWarn(
+        `hangar-server: a delivery claim was not released: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
   return {
     fetch: async (req) => {
       const url = new URL(req.url);
@@ -222,6 +261,8 @@ export function createIngress(deps: {
       }
       const digest = sha256Hex(ref).slice(0, 32);
       const receivedAt = new Date(deps.now()).toISOString();
+      const claim = `ingress/${receiver.provider}-${digest}`;
+      const notRecorded = () => json({ error: "the delivery could not be recorded" }, 503);
       const answer = await deps.control.commands
         .submit(
           {
@@ -230,41 +271,75 @@ export function createIngress(deps: {
             ledger: "workspace",
             via: receiver.via,
             params: { provider: receiver.provider, delivery: digest },
-            dedupeClaim: `ingress/${receiver.provider}-${digest}`,
+            dedupeClaim: claim,
           },
           async (receipt) => {
             // The raw body is kept until the receipt settles, so recovery has the delivery.
-            mkdirSync(deps.hangarRoot, { recursive: true, mode: 0o700 });
-            const dir = resolveInside(deps.hangarRoot, ["ingress", receiver.provider]);
-            if (dir === undefined) throw new Error("the inbound records would leave Home's root");
-            mkdirSync(dir, { recursive: true, mode: 0o700 });
-            const path = inboundPath(receiver.provider, receipt.id);
-            if (path === undefined) throw new Error("the inbound record would leave Home's root");
-            writeFileSync(
-              path,
-              `${JSON.stringify({
-                v: 1,
-                provider: receiver.provider,
-                receivedAt,
-                deliveryDigest: digest,
-                origin: receiver.origin,
-                body: raw,
-              })}\n`,
-              { mode: 0o600, flag: "wx" },
-            );
+            try {
+              mkdirSync(deps.hangarRoot, { recursive: true, mode: 0o700 });
+              const dir = resolveInside(deps.hangarRoot, ["ingress", receiver.provider]);
+              if (dir === undefined) {
+                throw new Error("the inbound records would leave Home's root");
+              }
+              mkdirSync(dir, { recursive: true, mode: 0o700 });
+              const path = inboundPath(receiver.provider, receipt.id);
+              if (path === undefined) throw new Error("the inbound record would leave Home's root");
+              writeFileSync(
+                path,
+                `${JSON.stringify({
+                  v: 1,
+                  provider: receiver.provider,
+                  receivedAt,
+                  deliveryDigest: digest,
+                  origin: receiver.origin,
+                  body: raw,
+                })}\n`,
+                { mode: 0o600, flag: "wx" },
+              );
+            } catch (err) {
+              deps.onWarn(
+                `hangar-server: a ${receiver.provider} delivery could not be recorded: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              // Nothing was done: the receipt says so, and the claim is given up below.
+              return {
+                settle: {
+                  state: "failed",
+                  outcome: outcomeOf("unavailable"),
+                  effects: [{ kind: INBOUND_RECORD_EFFECT, status: "failed" }],
+                },
+                value: undefined,
+              };
+            }
             return { value: receipt };
           },
         )
         .catch(() => undefined);
-      if (answer === undefined) return json({ error: "the delivery could not be recorded" }, 503);
+      if (answer === undefined) return notRecorded();
       if (!answer.ok) {
         if (answer.refusal.code === "idempotency_key_reused") {
           return json({ duplicate: true }, 200);
         }
         return json({ error: answer.refusal.message }, 503);
       }
-      if (answer.replayed) return json({ duplicate: true }, 200);
-      const receipt = answer.value ?? answer.receipt;
+      if (answer.replayed) {
+        const winner = answer.receipt;
+        // The claim is held by a receipt that never recorded its delivery: give it up.
+        if (neverRecorded(winner)) {
+          await release(claim);
+          return notRecorded();
+        }
+        // Still being recorded by the request that won it: that one answers the provider.
+        if (winner.state === "accepted") {
+          const path = inboundPath(receiver.provider, winner.id);
+          if (path === undefined || !existsSync(path)) return notRecorded();
+        }
+        return json({ duplicate: true }, 200);
+      }
+      if (answer.value === undefined) {
+        await release(claim);
+        return notRecorded();
+      }
+      const receipt = answer.value;
       const delivery: IngressDelivery = {
         provider: receiver.provider,
         origin: receiver.origin,
