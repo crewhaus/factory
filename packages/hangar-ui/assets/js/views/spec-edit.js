@@ -50,7 +50,7 @@ import {
 } from "../dom.js";
 import { conflictView } from "../ui/conflict.js";
 import { confirmAction, openDialog } from "../ui/dialog.js";
-import { CLEAR, carriesMasked, fieldEdit, formModel, issuesByField } from "../ui/schema-form.js";
+import { CLEAR, fieldEdit, formModel, issuesByField, maskedMarkerOf } from "../ui/schema-form.js";
 import { call } from "../v1.js";
 
 // ---------------------------------------------------------------------------
@@ -475,9 +475,51 @@ function renderValue(value) {
  * Values typed into the form and not saved yet, by harness and setting. They
  * survive a re-render that another write on this page causes. Kept in memory
  * only, never in stored drafts: a person can paste a key into this editor.
+ *
+ * Each entry keeps the value the setting had when it was typed (`seed`): when
+ * the file's value has changed since, the typed value is dropped, so a control
+ * never shows a draft over a value it was not typed against. A kept value is
+ * labelled as not saved, in words.
  */
 const unsaved = new Map();
 const unsavedKey = (ctx, node) => `${ctx.id}\u0000${node.key}`;
+const seedMark = (node) => {
+  try {
+    return JSON.stringify(node.seed) ?? "";
+  } catch {
+    return "";
+  }
+};
+
+/** The typed value kept for a setting, or undefined (and dropped) when its seed has moved. */
+function keptValue(ctx, node) {
+  const at = unsavedKey(ctx, node);
+  const entry = unsaved.get(at);
+  if (entry === undefined) return undefined;
+  if (entry.seed !== seedMark(node)) {
+    unsaved.delete(at);
+    return undefined;
+  }
+  return entry.value;
+}
+
+/** Drop every typed value kept for a setting at or under `segments` of this harness. */
+function dropUnsavedUnder(ctx, segments) {
+  const prefix = (Array.isArray(segments) ? segments : []).map(String);
+  for (const [at, entry] of unsaved) {
+    if (!at.startsWith(`${ctx.id}\u0000`)) continue;
+    const own = Array.isArray(entry.segments) ? entry.segments : [];
+    if (prefix.length <= own.length && prefix.every((seg, i) => own[i] === seg)) {
+      unsaved.delete(at);
+    }
+  }
+}
+
+/** The re-read that puts focus back on the control that opened a write, when it has a key. */
+const focusOf = (opener) =>
+  opener instanceof HTMLElement && typeof opener.dataset.focusKey === "string"
+    ? { focusKey: opener.dataset.focusKey }
+    : {};
 
 /** Ids of one render of the form; a re-render mints new ones. */
 let formSeq = 0;
@@ -538,6 +580,30 @@ const optionText = (value) => (value === null ? "None" : String(value));
 const yesNo = (value) => (value === true ? "Yes" : value === false ? "No" : String(value));
 
 /**
+ * What the Settings card is, from the schema read: no spec at all (an empty
+ * state that says why and names the command that makes one, with no form and
+ * no "Edit any path"), read-only, a schema with no form to show, or editable.
+ * The traffic light always comes with its word. Pure.
+ */
+export function settingsState(body, groupCount, held) {
+  if (body?.present === false) {
+    return {
+      absent: true,
+      tone: "off",
+      word: "no spec",
+      note:
+        typeof body.note === "string" && body.note !== ""
+          ? body.note
+          : "This harness has no crewhaus.yaml yet.",
+      verb: typeof body.verb === "string" && body.verb !== "" ? body.verb : "crewhaus init",
+    };
+  }
+  if (held === true) return { absent: false, tone: "warn", word: "read-only" };
+  if (!(groupCount > 0)) return { absent: false, tone: "warn", word: "no form" };
+  return { absent: false, tone: "ok", word: "editable" };
+}
+
+/**
  * The settings form: one fieldset per block the spec declares, the blocks only
  * the schema's defaults set collapsed under "Using defaults", and the settings
  * at the top level in their own fieldset. Every control is labelled; its help
@@ -546,6 +612,15 @@ const yesNo = (value) => (value === true ? "Yes" : value === false ? "No" : Stri
  * what it needs), and an issue the schema finds is placed beside its field.
  */
 function settingsCard(ctx, body, trust, live, reload) {
+  // No spec in this harness: nothing to edit, so say why and name the command that makes one.
+  const absent = settingsState(body, 0, false);
+  if (absent.absent) {
+    const empty = card("Settings", dot(absent.tone, absent.word), [
+      emptyState(absent.note, absent.verb),
+    ]);
+    empty.classList.add("settings-card");
+    return empty;
+  }
   const trustRows = Array.isArray(trust?.paths) ? trust.paths : [];
   const model = formModel(body.schema, body.effective, trustRows);
   const prefix = `sf${++formSeq}`;
@@ -656,7 +731,9 @@ function settingsCard(ctx, body, trust, live, reload) {
       valueDialog(ctx, {
         path: node.segments.join("."),
         segments: node.segments,
-        value: node.paneSeed,
+        // Never a masked read: a node holding a hidden value starts empty and names it.
+        value: node.writeOnly === true ? undefined : node.paneSeed,
+        hidden: node.writeOnly === true && Array.isArray(node.hidden) ? node.hidden : [],
         pathEditable: false,
         reload,
         live,
@@ -670,6 +747,12 @@ function settingsCard(ctx, body, trust, live, reload) {
   /** Write one field's edit: directly when the optimizer may, reviewed otherwise. */
   const write = async (node, input, opener) => {
     if (isHeld(opener)) return;
+    if (input !== CLEAR && maskedMarkerOf(input) !== null) {
+      toast(
+        `Nothing saved: ${node.label} still holds a hidden value (${maskedMarkerOf(input)}). Type the real value.`,
+      );
+      return;
+    }
     const edit = fieldEdit(node, input);
     if (edit === null) {
       toast(`Nothing to save: ${node.label} is unchanged.`, "info");
@@ -677,6 +760,11 @@ function settingsCard(ctx, body, trust, live, reload) {
     }
     const focusKey = opener.dataset.focusKey;
     const saved = () => {
+      unsaved.delete(unsavedKey(ctx, node));
+      reload({ focusKey });
+    };
+    // "Use the version on disk": the typed value is dropped, so the control shows the file's.
+    const useDisk = () => {
       unsaved.delete(unsavedKey(ctx, node));
       reload({ focusKey });
     };
@@ -695,7 +783,7 @@ function settingsCard(ctx, body, trust, live, reload) {
         opener,
         draft: JSON.stringify(edit, null, 2),
         retry: (rev) => api.specPatch({ id: ctx.id }, { edit, expectedRev: rev }),
-        reload,
+        reload: useDisk,
         done: saved,
       };
       if (reportWrite(res, savedMessage(node), conflict)) saved();
@@ -708,7 +796,7 @@ function settingsCard(ctx, body, trust, live, reload) {
       live,
       opener,
       form,
-      reload,
+      reload: useDisk,
       done: saved,
     });
   };
@@ -720,9 +808,17 @@ function settingsCard(ctx, body, trust, live, reload) {
     const helpId = node.help !== null || node.writeOnly ? `${id}-help` : "";
     const slot = el("p", { class: "field-issue", id: `${id}-issue`, hidden: true });
     const draftAt = unsavedKey(ctx, node);
-    const kept = unsaved.has(draftAt) ? unsaved.get(draftAt) : undefined;
+    const kept = keptValue(ctx, node);
     const current = kept !== undefined ? kept : node.writeOnly ? undefined : node.seed;
-    const remember = (value) => unsaved.set(draftAt, value);
+    const unsavedNote = el("p", {
+      class: "muted field-unsaved",
+      text: "Not saved yet.",
+      hidden: kept === undefined,
+    });
+    const remember = (value) => {
+      unsaved.set(draftAt, { value, seed: seedMark(node), segments: node.segments.map(String) });
+      unsavedNote.hidden = false;
+    };
     let input = null;
     let read = () => undefined;
     let control;
@@ -824,6 +920,7 @@ function settingsCard(ctx, body, trust, live, reload) {
       ]),
       help,
       el("div", { class: "row-editor" }, [control, save, clearBtn]),
+      unsavedNote,
       slot,
       el("p", { class: "muted field-path" }, [
         el("span", { text: "Setting " }),
@@ -985,11 +1082,8 @@ function settingsCard(ctx, body, trust, live, reload) {
       addBlock,
     ]),
   ];
-  const node = card(
-    "Settings",
-    live.readOnly.held ? dot("warn", "read-only") : dot("ok", "editable"),
-    inner,
-  );
+  const state = settingsState(body, model.groups.length, live.readOnly.held);
+  const node = card("Settings", dot(state.tone, state.word), inner);
   node.classList.add("settings-card");
   // The answer to a read that already carried issues: place them now, without moving focus.
   if (Array.isArray(body.issues) && body.issues.length > 0) form.showIssues(body.issues, false);
@@ -1174,7 +1268,8 @@ async function applyEdits(
   }
   const conflict = {
     draft: JSON.stringify(edits, null, 2),
-    reload,
+    // The re-read goes back to the control that wrote, never to the page.
+    reload: () => reload(focusOf(opener)),
     done,
     ...(opener instanceof HTMLElement ? { opener } : {}),
   };
@@ -1226,18 +1321,18 @@ export function parseJsonValue(text) {
 /** The one-edit batch a path + pane produce — or a refusal carrying the
  *  sentence to render, because "nothing happened" is not an answer. `path` is
  *  dotted, or the segments themselves (a key may hold a `.`). Text that still
- *  carries the masker's placeholder is refused: a masked read is a view, and
- *  is never written back. */
+ *  carries any masker's placeholder (`[redacted]`, `***`, `«NAME»`) is refused:
+ *  a masked read is a view, and is never written back. */
 export function editsFor(path, text) {
   const segments = Array.isArray(path) ? path.map(String) : editPath(path);
   if (segments.length === 0) return { ok: false, message: "a path is required" };
   const parsed = parseJsonValue(text);
   if (!parsed.ok) return { ok: false, message: `that is not valid JSON: ${parsed.message}` };
-  if (!parsed.remove && carriesMasked(parsed.value)) {
+  const marker = parsed.remove ? null : maskedMarkerOf(parsed.value);
+  if (marker !== null) {
     return {
       ok: false,
-      message:
-        'Replace every "[redacted]" with the real value first. A hidden value is never written back.',
+      message: `Replace every hidden value (${marker}) with the real value first. A hidden value is never written back.`,
     };
   }
   // No `value` key at all ⇒ the server deletes the path. `value: undefined`
@@ -1259,7 +1354,10 @@ export function editsFor(path, text) {
  * finds is shown here and placed beside its field in the form (`form`).
  * Focus goes back to `opener` when a conflict view it opens closes.
  */
-function valueDialog(ctx, { path, segments, value, pathEditable, reload, live, opener, form }) {
+function valueDialog(
+  ctx,
+  { path, segments, value, hidden = [], pathEditable, reload, live, opener, form },
+) {
   let dialog = null;
   // The form behind a modal cannot take focus: close the pane, then place the issues.
   const formBehind =
@@ -1354,7 +1452,9 @@ function valueDialog(ctx, { path, segments, value, pathEditable, reload, live, o
         reload,
         done: () => {
           if (dialog !== null) dialog.close();
-          reload(opener instanceof HTMLElement ? { focusKey: opener.dataset.focusKey } : {});
+          // What the form held typed under this path is what was just replaced.
+          dropUnsavedUnder(ctx, batch.edits[0]?.path ?? []);
+          reload(focusOf(opener));
         },
       });
       if (wrote?.status === 412 && dialog !== null) dialog.close();
@@ -1409,7 +1509,7 @@ function valueDialog(ctx, { path, segments, value, pathEditable, reload, live, o
         )
       ) {
         if (dialog !== null) dialog.close();
-        reload();
+        reload(focusOf(opener));
       }
     });
     out.appendChild(
@@ -1436,6 +1536,18 @@ function valueDialog(ctx, { path, segments, value, pathEditable, reload, live, o
             pathInput,
           ])
         : el("p", { class: "muted mono", text: path }),
+      hidden.length === 0
+        ? null
+        : el("div", { class: "reason" }, [
+            el("p", {
+              text: "This screen hides a value here, so the pane starts empty. Writing here replaces all of it, hidden values included. To keep them, change one setting at a time in the form instead.",
+            }),
+            el(
+              "ul",
+              { class: "issue-list" },
+              hidden.map((p) => el("li", null, [el("code", { text: p })])),
+            ),
+          ]),
       el("p", {
         class: "muted",
         text: "The value is JSON. An empty pane deletes the path. Nothing is written until the diff below has been read.",
@@ -2117,10 +2229,50 @@ export async function renderSpecEdit(root, ctx, opts = {}) {
         : errorCard("New harness", templates),
   );
   if (typeof opts.focusKey === "string") {
-    const target = [...root.querySelectorAll("[data-focus-key]")].find(
-      (node) => node instanceof HTMLElement && node.dataset.focusKey === opts.focusKey,
-    );
-    if (target instanceof HTMLElement) target.focus();
+    const keyed = [...root.querySelectorAll("[data-focus-key]")];
+    const target = focusCandidates(opts.focusKey)
+      .map((key) =>
+        keyed.find((node) => node instanceof HTMLElement && node.dataset.focusKey === key),
+      )
+      .find((node) => node instanceof HTMLElement);
+    if (target instanceof HTMLElement) {
+      revealForFocus(target, root);
+      target.focus();
+    }
+  }
+}
+
+/**
+ * The keys to try, in order, for focus after a re-read. A control can be gone
+ * after its own write (Clear removes the setting, so its Clear goes too): its
+ * field's Save, then its input, stands in.
+ */
+export function focusCandidates(focusKey) {
+  const key = String(focusKey ?? "");
+  const at = key.indexOf(":");
+  if (at < 0) return [key];
+  const kind = key.slice(0, at);
+  const rest = key.slice(at + 1);
+  if (kind === "clear") return [key, `save:${rest}`, `input:${rest}`];
+  if (kind === "save") return [key, `input:${rest}`];
+  if (kind === "input") return [key, `save:${rest}`];
+  return [key];
+}
+
+/** Open whatever hides a control (the "Using defaults" panel, a folded block) so it can take focus. */
+function revealForFocus(target, root) {
+  for (let at = target.parentElement; at !== null && at !== root; at = at.parentElement) {
+    if (at instanceof HTMLDetailsElement && !at.open) at.open = true;
+    if (at.hidden === true) {
+      at.hidden = false;
+      if (at.id !== "") {
+        for (const toggle of root.querySelectorAll("[aria-controls]")) {
+          if (toggle.getAttribute("aria-controls") === at.id) {
+            toggle.setAttribute("aria-expanded", "true");
+          }
+        }
+      }
+    }
   }
 }
 

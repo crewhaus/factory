@@ -4,10 +4,14 @@
  * control the form shows for a setting a file declares, an unchanged control
  * sends nothing, a changed one changes bytes only inside that setting's own
  * lines, and writing the old value back gives the file back byte for byte. A
- * setting whose value comes back redacted never becomes an edit.
+ * declared block's JSON pane, written back as it starts, gives the same spec. A
+ * setting or block holding a value that comes back masked never becomes an edit
+ * and never seeds a pane.
  *
- * The form is the console's own module (`schema-form.js`), loaded by URL; the
- * edits go through the same writer every spec write uses.
+ * The form is the console's own module (`schema-form.js`), and the pane's batch
+ * its own `editsFor`, loaded by URL, over what the console is served: the
+ * schema and its rows after the dispatch-site masker. The edits go through the
+ * same writer every spec write uses.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -15,6 +19,7 @@ import { join, resolve } from "node:path";
 import { parseSpec, specJsonSchema } from "@crewhaus/spec";
 import { parseYamlOnly } from "@crewhaus/spec-patch/commit";
 import { Glob } from "bun";
+import { maskDeep } from "./mask";
 import { effectiveConfig, narrowSchema, previewSpecEdits } from "./spec-edit";
 import { keyLineParts } from "./spec-lines";
 
@@ -39,6 +44,7 @@ type FormNode = {
   source: string | null;
   options?: unknown[];
   writeOnly: boolean;
+  paneSeed?: unknown;
 };
 type SchemaForm = {
   CONTROL_KINDS: readonly string[];
@@ -52,6 +58,29 @@ const loadForm = async (): Promise<SchemaForm> =>
   (await import(
     new URL("../../hangar-ui/assets/js/ui/schema-form.js", import.meta.url).href
   )) as SchemaForm;
+
+type SpecPane = {
+  editsFor(
+    path: readonly string[],
+    text: string,
+  ): { ok: boolean; message?: string; edits?: Array<{ path: string[]; value?: unknown }> };
+};
+
+/** The console's JSON pane: the batch a block's "Edit as JSON…" sends. */
+const loadPane = async (): Promise<SpecPane> =>
+  (await import(
+    new URL("../../hangar-ui/assets/js/views/spec-edit.js", import.meta.url).href
+  )) as SpecPane;
+
+/** A value as JSON with every object's keys sorted, so key order is not compared. */
+const canonical = (value: unknown): string =>
+  JSON.stringify(value, (_key, v: unknown) =>
+    v !== null && typeof v === "object" && !Array.isArray(v)
+      ? Object.fromEntries(
+          Object.entries(v as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : 1)),
+        )
+      : v,
+  );
 
 /**
  * Where a key's lines are in `text`: from the start of its key line to the next
@@ -170,26 +199,69 @@ describe("the settings form over the spec corpus", () => {
     let checked = 0;
     let located = 0;
     let hidden = 0;
+    let panes = 0;
+    let refusedPanes = 0;
+    const pane = await loadPane();
     const folded: string[] = [];
     const problems: string[] = [];
     for (const rel of CORPUS) {
       const source = readSpec(rel);
       const spec = parseSpec(source) as { target: string };
-      const schema = narrowSchema(whole, spec.target).schema;
-      const model = form.formModel(schema, effectiveConfig(spec, source), []);
+      // What the console is served: the schema and its rows after the dispatch-site masker.
+      const served = maskDeep({
+        schema: narrowSchema(whole, spec.target).schema,
+        effective: effectiveConfig(spec, source),
+      }) as { schema: unknown; effective: unknown };
+      const model = form.formModel(served.schema, served.effective, []);
+      for (const node of model.groups) {
+        if (node.kind !== "group" || node.source !== "declared") continue;
+        const where = `${rel} ${node.segments.join(".")} (pane)`;
+        if (node.writeOnly) {
+          // A block holding a hidden value: no pane seed, and its masked read is refused.
+          refusedPanes += 1;
+          if (node.paneSeed !== undefined) problems.push(`${where}: a masked pane seed`);
+          if (pane.editsFor(node.segments, JSON.stringify(node.seed)).ok) {
+            problems.push(`${where}: the masked read was accepted as an edit`);
+          }
+          continue;
+        }
+        const batch = pane.editsFor(node.segments, JSON.stringify(node.paneSeed));
+        if (!batch.ok || batch.edits === undefined) {
+          problems.push(`${where}: the pane's own seed was refused: ${batch.message}`);
+          continue;
+        }
+        const out = previewSpecEdits(source, batch.edits, { parse: parseYamlOnly });
+        if (!out.ok || out.yaml === null) {
+          problems.push(`${where}: does not apply: ${out.error}`);
+          continue;
+        }
+        // The block written back as the pane starts gives the same spec. A block written
+        // whole takes the pane's key order, and a list item's rows carry the defaults the
+        // schema fills in, so the specs are compared parsed, with keys sorted.
+        if (canonical(parseSpec(out.yaml)) !== canonical(parseSpec(source))) {
+          problems.push(`${where}: writing the pane's seed back changed the spec`);
+          continue;
+        }
+        panes += 1;
+      }
       for (const node of form.flatten(model.groups)) {
+        if (node.writeOnly) {
+          hidden += 1;
+          const where = `${rel} ${node.segments.join(".")}`;
+          if (node.paneSeed !== undefined) problems.push(`${where}: a hidden value's pane seed`);
+          if (form.CONTROL_KINDS.includes(node.kind)) {
+            // An empty control sends nothing, and the placeholder itself is never sent.
+            if (form.fieldEdit(node, "") !== null)
+              problems.push(`${where}: empty hidden control wrote`);
+            if (form.fieldEdit(node, node.seed) !== null)
+              problems.push(`${where}: placeholder wrote`);
+          }
+          continue;
+        }
         if (!form.CONTROL_KINDS.includes(node.kind) || node.source !== "declared") continue;
         const seed = node.seed;
         if (seed === undefined || seed === null || typeof seed === "object") continue;
         const where = `${rel} ${node.segments.join(".")}`;
-        if (form.carriesMasked(seed)) {
-          hidden += 1;
-          // An empty control sends nothing, and the placeholder itself is never sent.
-          if (form.fieldEdit(node, "") !== null)
-            problems.push(`${where}: empty hidden control wrote`);
-          if (form.fieldEdit(node, seed) !== null) problems.push(`${where}: placeholder wrote`);
-          continue;
-        }
         if (form.fieldEdit(node, seedInput(node)) !== null) {
           problems.push(`${where}: an unchanged control made an edit`);
         }
@@ -243,7 +315,13 @@ describe("the settings form over the spec corpus", () => {
     expect(checked).toBe(196);
     // The rest sit inside a flow map (`exam: { dataset: …, graders: … }`), bounded by its lines.
     expect(located).toBe(182);
-    expect(hidden).toBe(15);
+    // Nodes holding a value that came back masked (a credential-named setting, and every
+    // block around one): none has a pane seed, and none makes an edit from its read.
+    expect(hidden).toBe(31);
+    // Declared top-level blocks whose pane, written back as it starts, gives the same spec…
+    expect(panes).toBe(64);
+    // …and those holding a hidden value, whose masked read the pane refuses.
+    expect(refusedPanes).toBe(8);
     expect(folded).toEqual([
       "packages/spec-patch/src/__corpus__/trader.crewhaus.yaml learning.domain",
     ]);

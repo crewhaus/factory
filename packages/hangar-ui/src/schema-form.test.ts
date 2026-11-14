@@ -12,6 +12,7 @@ import {
   formModel,
   issuesByField,
   labelOf,
+  maskedMarkerOf,
   nodeKey,
   resolvePointer,
   // @ts-expect-error — hand-written browser JS, typed as text for the embed map
@@ -232,6 +233,88 @@ describe("carriesMasked", () => {
     expect(carriesMasked({ a: { b: [{ c: "redacted" }] } })).toBe(false);
     expect(carriesMasked("[redacted]")).toBe(true);
     expect(carriesMasked(null)).toBe(false);
+  });
+
+  test("finds every masker's placeholder inside a string: [redacted], *** and «NAME»", () => {
+    expect(carriesMasked("token is [redacted] here")).toBe(true);
+    expect(carriesMasked("Use *** for calls")).toBe(true);
+    expect(carriesMasked("«X»")).toBe(true);
+    expect(carriesMasked({ channel: "«SLACK_CHANNEL»" })).toBe(true);
+    expect(carriesMasked(["ok", { deep: ["model «FIXTURE_MODEL» here"] }])).toBe(true);
+    // Look-alikes that no masker writes.
+    expect(carriesMasked("a ** b")).toBe(false);
+    expect(carriesMasked("« not a name »")).toBe(false);
+    expect(carriesMasked("«1X»")).toBe(false);
+    expect(maskedMarkerOf({ a: "Use *** for calls" })).toBe("***");
+    expect(maskedMarkerOf({ a: "«FIXTURE_MODEL»" })).toBe("«FIXTURE_MODEL»");
+    expect(maskedMarkerOf({ a: "plain" })).toBeNull();
+  });
+});
+
+describe("a value masked mid-string is write-only", () => {
+  const schema = doc({
+    agent: {
+      type: "object",
+      properties: {
+        model: { type: "string" },
+        instructions: { type: "string" },
+        max_tokens: { type: "integer" },
+        tags: { type: "array", items: { type: "string" } },
+      },
+    },
+  });
+  const rows = (model: string, instructions: string) => [
+    { segments: ["agent", "model"], value: model, source: "declared" },
+    { segments: ["agent", "instructions"], value: instructions, source: "declared" },
+    { segments: ["agent", "max_tokens"], value: 1000, source: "declared" },
+    { segments: ["agent", "tags"], value: ["a", "«TAG_VALUE»"], source: "declared" },
+  ];
+  type Pane = Node & { paneSeed?: unknown; hidden: string[] };
+
+  test("a «NAME» seed: no edit from it, write-only, and its block's pane never starts from it", () => {
+    const { at } = nodesOf(schema, rows("«FIXTURE_MODEL»", "Answer briefly."));
+    const model = at("agent.model") as Pane;
+    expect(model.writeOnly).toBe(true);
+    expect(model.paneSeed).toBeUndefined();
+    expect(fieldEdit(model, "«FIXTURE_MODEL»")).toBeNull();
+    expect(fieldEdit(model, "")).toBeNull();
+    expect(fieldEdit(model, "anthropic/claude-opus-5")).toEqual({
+      path: ["agent", "model"],
+      value: "anthropic/claude-opus-5",
+    });
+    const agent = at("agent") as Pane;
+    expect(agent.writeOnly).toBe(true);
+    expect(agent.paneSeed).toBeUndefined();
+    expect(agent.hidden).toEqual(["agent.model", "agent.tags"]);
+    // A setting beside it that holds nothing masked is still an ordinary control.
+    const max = at("agent.max_tokens") as Pane;
+    expect(max.writeOnly).toBe(false);
+    expect(fieldEdit(max, "2000")).toEqual({ path: ["agent", "max_tokens"], value: 2000 });
+  });
+
+  test("a *** seed: no edit from it, write-only, and no pane seed", () => {
+    const { at } = nodesOf(schema, rows("anthropic/claude-opus-5", "Use *** for calls"));
+    const instructions = at("agent.instructions") as Pane;
+    expect(instructions.writeOnly).toBe(true);
+    expect(instructions.paneSeed).toBeUndefined();
+    expect(fieldEdit(instructions, "Use *** for calls")).toBeNull();
+    expect(fieldEdit(instructions, "Use *** for calls, now briefly")).toBeNull();
+    expect((at("agent") as Pane).paneSeed).toBeUndefined();
+  });
+
+  test("a list holding a masked item starts empty, and an empty one sends nothing", () => {
+    const { at } = nodesOf(schema, rows("anthropic/claude-opus-5", "Answer briefly."));
+    const tags = at("agent.tags") as Pane;
+    expect(tags.kind).toBe("list");
+    expect(tags.writeOnly).toBe(true);
+    expect(fieldEdit(tags, [])).toBeNull();
+    expect(fieldEdit(tags, ["a", "«TAG_VALUE»"])).toBeNull();
+    expect(fieldEdit(tags, ["a", "b"])).toEqual({ path: ["agent", "tags"], value: ["a", "b"] });
+  });
+
+  test("a choice whose literal was masked is never offered", () => {
+    const { at } = nodesOf(doc({ mode: { type: "string", enum: ["plain", "«MODE_VALUE»"] } }), []);
+    expect(at("mode").kind).toBe("json");
   });
 });
 

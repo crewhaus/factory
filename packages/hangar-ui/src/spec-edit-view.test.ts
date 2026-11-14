@@ -376,6 +376,114 @@ describe("the settings form", () => {
       { path: ["models", "claude-3.5"], value: {} },
     ]);
   });
+
+  test("the JSON pane refuses text that carries a value-shape mask or a scrubbed name", () => {
+    const shaped = editsFor(
+      ["agent"],
+      JSON.stringify({ model: "x", instructions: "Use *** for calls", max_tokens: 2000 }),
+    );
+    expect(shaped.ok).toBe(false);
+    expect(String(shaped.message)).toContain("***");
+    const scrubbed = editsFor(["agent"], JSON.stringify({ model: "«FIXTURE_MODEL»" }));
+    expect(scrubbed.ok).toBe(false);
+    expect(String(scrubbed.message)).toContain("«FIXTURE_MODEL»");
+    expect(editsFor("slack", '{"channel":"«X»"}').ok).toBe(false);
+    // An empty pane is still a delete: it carries no value to have been masked.
+    expect(editsFor(["agent"], "").ok).toBe(true);
+  });
+
+  test("a block's pane never starts from a masked read, and says which values it hides", async () => {
+    const source = await viewSource("spec-edit.js");
+    expect(source).toContain("value: node.writeOnly === true ? undefined : node.paneSeed,");
+    expect(source).toContain(
+      "hidden: node.writeOnly === true && Array.isArray(node.hidden) ? node.hidden : [],",
+    );
+    expect(source).toContain("This screen hides a value here, so the pane starts empty.");
+    // A typed value that still holds a placeholder is refused before any request.
+    expect(source).toContain("if (input !== CLEAR && maskedMarkerOf(input) !== null) {");
+  });
+});
+
+describe("the Settings card with no spec", () => {
+  test("says why and names the command, with no form", async () => {
+    const { settingsState } = await import("../assets/js/views/spec-edit.js");
+    const absent = settingsState(
+      {
+        present: false,
+        note: "no crewhaus.yaml in this harness",
+        verb: "crewhaus init",
+        schema: null,
+      },
+      0,
+      false,
+    );
+    expect(absent).toEqual({
+      absent: true,
+      tone: "off",
+      word: "no spec",
+      note: "no crewhaus.yaml in this harness",
+      verb: "crewhaus init",
+    });
+    // The remedy is named even when the read names none.
+    expect(settingsState({ present: false }, 0, false).verb).toBe("crewhaus init");
+    // "editable" only when there is a form to edit.
+    expect(settingsState({ present: true }, 0, false).word).toBe("no form");
+    expect(settingsState({ present: true }, 3, false).word).toBe("editable");
+    expect(settingsState({ present: true }, 3, true).word).toBe("read-only");
+  });
+
+  test("the card returns before the form and before Edit any path", async () => {
+    const source = await viewSource("spec-edit.js");
+    const at = source.indexOf("function settingsCard(");
+    expect(at).toBeGreaterThan(-1);
+    const early = source.indexOf("if (absent.absent) {", at);
+    const form = source.indexOf("formModel(body.schema, body.effective, trustRows)", at);
+    const anyPath = source.indexOf('text: "Edit any path…"', at);
+    expect(early).toBeGreaterThan(at);
+    expect(form).toBeGreaterThan(early);
+    expect(anyPath).toBeGreaterThan(early);
+    expect(source).toContain("emptyState(absent.note, absent.verb)");
+  });
+});
+
+describe("unsaved values and focus across a re-read", () => {
+  test("a typed value is kept against the value it was typed over, and dropped when that moved", async () => {
+    const source = await viewSource("spec-edit.js");
+    expect(source).toContain("if (entry.seed !== seedMark(node)) {");
+    expect(source).toContain('text: "Not saved yet.",');
+    // "Use the version on disk" drops the typed value before the re-read.
+    expect(source).toMatch(
+      /const useDisk = \(\) => \{\s+unsaved\.delete\(unsavedKey\(ctx, node\)\);\s+reload\(\{ focusKey \}\);/,
+    );
+    expect(source.match(/reload: useDisk,/g)?.length).toBe(2);
+    // A JSON pane write drops what the form held typed under its path.
+    expect(source).toContain("dropUnsavedUnder(ctx, batch.edits[0]?.path ?? []);");
+  });
+
+  test("every conflict's re-read and a proposal's go back to the control that wrote", async () => {
+    const source = await viewSource("spec-edit.js");
+    expect(source).toContain("reload: () => reload(focusOf(opener)),");
+    expect(source).toContain("reportWrite(\n          staged,");
+    expect(source.match(/reload\(focusOf\(opener\)\);/g)?.length).toBe(2);
+  });
+
+  test("a control gone after its own write hands focus to its field's Save, then its input", async () => {
+    const { focusCandidates } = await import("../assets/js/views/spec-edit.js");
+    expect(focusCandidates('clear:["agent","x"]')).toEqual([
+      'clear:["agent","x"]',
+      'save:["agent","x"]',
+      'input:["agent","x"]',
+    ]);
+    expect(focusCandidates('save:["a"]')).toEqual(['save:["a"]', 'input:["a"]']);
+    expect(focusCandidates("json:any")).toEqual(["json:any"]);
+  });
+
+  test("a control in the folded defaults or a closed block is revealed before it takes focus", async () => {
+    const source = await viewSource("spec-edit.js");
+    expect(source).toContain("revealForFocus(target, root);");
+    expect(source).toContain("if (at instanceof HTMLDetailsElement && !at.open) at.open = true;");
+    expect(source).toContain('toggle.setAttribute("aria-expanded", "true");');
+  });
 });
 
 describe("focus after a watch-me or advice 412", () => {

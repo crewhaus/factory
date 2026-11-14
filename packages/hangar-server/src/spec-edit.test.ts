@@ -2127,3 +2127,94 @@ describe("a whole step on the editor", () => {
     }
   });
 });
+
+describe("the settings form never writes back a value Home served masked", () => {
+  type FormNode = {
+    segments: string[];
+    kind: string;
+    seed?: unknown;
+    paneSeed?: unknown;
+    hidden: string[];
+    writeOnly: boolean;
+  };
+  type Form = {
+    formModel(schema: unknown, effective: unknown, trust: unknown): { groups: FormNode[] };
+    flatten(groups: FormNode[]): FormNode[];
+    fieldEdit(node: FormNode, input: unknown): { path: string[]; value?: unknown } | null;
+    carriesMasked(value: unknown): boolean;
+  };
+  type Pane = {
+    editsFor(path: readonly string[], text: string): { ok: boolean; edits?: unknown[] };
+  };
+  const ui = (rel: string) => new URL(`../../hangar-ui/assets/js/${rel}`, import.meta.url).href;
+
+  test("a .env value the spec also holds: its block's pane has no seed, and no edit built from the read reaches disk", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "scrubbed-seed");
+      // The harness's .env holds the spec's model string, so the scrubber names it.
+      writeFileSync(join(dir, ".env"), "FIXTURE_MODEL=anthropic/claude-sonnet-4\n");
+      const specPath = join(dir, "crewhaus.yaml");
+      const before = readFileSync(specPath, "utf8");
+      const id = await register(t, dir);
+      const read = await t.api(`/api/h/${id}/spec/schema`);
+      expect(read.status).toBe(200);
+      const trust = await t.api(`/api/h/${id}/spec/trust`);
+      const effective = read.body["effective"] as Array<{ path: string; value: unknown }>;
+      // Anti-vacuity: the read really came back scrubbed.
+      expect(effective.find((r) => r.path === "agent.model")?.value).toBe("«FIXTURE_MODEL»");
+
+      const form = (await import(ui("ui/schema-form.js"))) as Form;
+      const pane = (await import(ui("views/spec-edit.js"))) as Pane;
+      const model = form.formModel(read.body["schema"], effective, trust.body["paths"] ?? []);
+      const nodes = form.flatten(model.groups);
+      const at = (path: string) => nodes.find((n) => n.segments.join(".") === path) as FormNode;
+
+      const agent = at("agent");
+      expect(agent.kind).toBe("group");
+      expect(agent.writeOnly).toBe(true);
+      expect(agent.paneSeed).toBeUndefined();
+      expect(agent.hidden).toEqual(["agent.model"]);
+      // The masked read, with one setting changed, is what the pane would have sent.
+      const tampered = { ...(agent.seed as Record<string, unknown>), max_tokens: 2000 };
+      expect(pane.editsFor(["agent"], JSON.stringify(tampered)).ok).toBe(false);
+      // The model's own control starts empty and sends nothing from the read.
+      const modelNode = at("agent.model");
+      expect(modelNode.writeOnly).toBe(true);
+      expect(form.fieldEdit(modelNode, modelNode.seed)).toBeNull();
+      expect(form.fieldEdit(modelNode, "")).toBeNull();
+
+      // Every control, saved as it starts, sends nothing; one changed beside it saves alone.
+      for (const node of nodes) {
+        const start = node.writeOnly ? "" : node.seed;
+        const edit = form.fieldEdit(node, typeof start === "number" ? String(start) : start);
+        expect(`${node.segments.join(".")} ${edit === null}`).toBe(
+          `${node.segments.join(".")} true`,
+        );
+      }
+      const edit = form.fieldEdit(at("agent.max_tokens"), "2000");
+      expect(edit).toEqual({ path: ["agent", "max_tokens"], value: 2000 });
+      expect(form.carriesMasked(edit)).toBe(false);
+      const preview = await t.api(`/api/h/${id}/spec/diff`, post({ edits: [edit] }));
+      expect(preview.status).toBe(200);
+      const wrote = await t.api(
+        `/api/h/${id}/spec`,
+        put({
+          edits: [edit],
+          expectedRev: String(preview.body["rev"] ?? read.body["rev"]),
+          ...(preview.body["autoApplicable"] === true
+            ? {}
+            : { confirmName: String(preview.body["confirmName"]) }),
+        }),
+      );
+      expect(wrote.status).toBe(200);
+      const after = readFileSync(specPath, "utf8");
+      expect(after).toContain("max_tokens: 2000");
+      expect(after).toContain("model: anthropic/claude-sonnet-4");
+      expect(after.includes("«")).toBe(false);
+      expect(after).toBe(before.replace("max_tokens: 4096", "max_tokens: 2000"));
+    } finally {
+      await t.stop();
+    }
+  });
+});

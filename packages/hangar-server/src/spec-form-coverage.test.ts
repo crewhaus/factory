@@ -84,8 +84,15 @@ describe("the settings form covers every target's schema", () => {
       const narrowed = narrowSchema(WHOLE, target);
       expect(`${target} ${narrowed.narrowed}`).toBe(`${target} true`);
       for (const run of ["raw", "masked"] as const) {
-        const schema = run === "raw" ? narrowed.schema : maskDeep(narrowed.schema);
-        const model = form.formModel(schema, [], []);
+        // The masked run is the body the console is served: schema and rows, masked together.
+        const served =
+          run === "raw"
+            ? { schema: narrowed.schema, effective: [] }
+            : (maskDeep({ schema: narrowed.schema, effective: [] }) as {
+                schema: unknown;
+                effective: unknown[];
+              });
+        const model = form.formModel(served.schema, served.effective, []);
         const where = `${target} (${run})`;
         expect(`${where} ${model.why}`).toBe(`${where} null`);
         expect(`${where} ${model.counts.visited}`).toBe(`${where} ${model.counts.classified}`);

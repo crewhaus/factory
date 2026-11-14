@@ -6,6 +6,9 @@
  * answers 412 with the current revision and a kept draft, the conflict dialog
  * opens with focus on its heading, axe passes on that state, the change on disk
  * is kept, and closing the dialog gives focus back to the control that saved.
+ * Saving again and choosing "Use the version on disk" shows the file's value in
+ * the control, drops the typed one, and puts focus on the Save that replaced
+ * the one that wrote.
  *
  * The same holds for a watch-me proposal's "Apply selected" and an advice's
  * "Apply to the spec": each 412 opens the conflict view, and closing it puts
@@ -68,7 +71,7 @@ export const specConflict: Journey = {
   id: "spec-conflict",
   shard: "axe",
   proves:
-    "A spec saved after it changed on disk is refused by the real server, never written over: the conflict dialog opens with focus on its heading, passes axe, and gives focus back to the control that saved when it closes; a watch-me or advice apply refused the same way gives focus back to a live control in its view.",
+    "A spec saved after it changed on disk is refused by the real server, never written over: the conflict dialog opens with focus on its heading, passes axe, and gives focus back to the control that saved when it closes; choosing the version on disk shows the file's value with focus on the replacement Save; a watch-me or advice apply refused the same way gives focus back to a live control in its view.",
   run: async (scope) => {
     const fleet = await scope.fleet({ seed: "spec-conflict", shapes: ["cli"] });
     const [harness] = fleet.harnesses;
@@ -129,6 +132,36 @@ export const specConflict: Journey = {
     await settle(page, "the conflict view closed");
     const back = await save.evaluate((node) => node === document.activeElement);
     if (!back) fail("closing the conflict view did not give focus back to Save");
+
+    // The same Save again, still against the revision the screen loaded: this time the
+    // person keeps the version on disk. The control shows the file's value, not the typed
+    // one, and focus lands on the Save that replaced the one that wrote.
+    await save.click();
+    await waitFor(page, "dialog[open] .conflict", "the second conflict view");
+    await settle(page, "the second conflict view");
+    if (saves !== 2) fail(`the second Save sent ${saves - 1} writes, not 1`);
+    await page.locator('dialog[open] button:text-is("Use the version on disk")').click();
+    await save.waitFor({ state: "visible", timeout: 10_000 });
+    await settle(page, "the version on disk re-read");
+    const shown = await field.inputValue();
+    if (shown.trim() !== "You are a fixture. Answer briefly.") {
+      fail(
+        `"Use the version on disk" left the typed value in the control: ${JSON.stringify(shown)}`,
+      );
+    }
+    const unsavedNote = page.locator(
+      `[data-field-key='${JSON.stringify(["agent", "instructions"])}'] .field-unsaved`,
+    );
+    if (await unsavedNote.isVisible()) fail('the value on disk is still labelled "Not saved yet"');
+    const onReplacement = await save.evaluate(
+      (node) => node === document.activeElement && node.isConnected,
+    );
+    if (!onReplacement) {
+      fail('"Use the version on disk" did not put focus on the Save that replaced the opener');
+    }
+    if (readFileSync(join(h.dir, "crewhaus.yaml"), "utf8") !== edited) {
+      fail("choosing the version on disk wrote to the spec");
+    }
 
     // A watch-me proposal, applied after the spec moved.
     const synthesized = join(h.dir, ".crewhaus", "watchme", "synthesized");

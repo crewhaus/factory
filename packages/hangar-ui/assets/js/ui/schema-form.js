@@ -73,12 +73,47 @@ export function labelOf(key) {
   return `${words[0].toUpperCase()}${words.slice(1)}`;
 }
 
-/** True when a value is, or holds at any depth, the masker's placeholder. */
-export function carriesMasked(value, depth = 0) {
-  if (typeof value === "string") return value === REDACTED;
-  if (depth > 64 || value === null || typeof value !== "object") return false;
-  const items = Array.isArray(value) ? value : Object.values(value);
-  return items.some((item) => carriesMasked(item, depth + 1));
+/** What the value-shape masker puts where a credential-shaped span was. */
+export const SHAPE_MASK = "***";
+
+/** What the harness's env scrubber puts where a value its `.env` holds was: `«NAME»`. */
+const SCRUBBED_RE = /«[A-Za-z_][A-Za-z0-9_]*»/;
+
+/**
+ * The first placeholder a masker left in a string, or null: the key-name
+ * redactor's `[redacted]`, the value-shape masker's `***`, or the env
+ * scrubber's `«NAME»`, anywhere in the text. A string holding one is a view of
+ * a value this screen was not shown, so it is never a source for a write.
+ */
+export function maskMarkerIn(text) {
+  if (typeof text !== "string") return null;
+  if (text.includes(REDACTED)) return REDACTED;
+  if (text.includes(SHAPE_MASK)) return SHAPE_MASK;
+  const scrubbed = SCRUBBED_RE.exec(text);
+  return scrubbed === null ? null : scrubbed[0];
+}
+
+/** The first placeholder a value holds at any depth, in a string or an object's key, or null. */
+export function maskedMarkerOf(value, depth = 0) {
+  if (typeof value === "string") return maskMarkerIn(value);
+  if (depth > 64 || value === null || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = maskedMarkerOf(item, depth + 1);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    const found = maskMarkerIn(key) ?? maskedMarkerOf(item, depth + 1);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/** True when a value is, or holds at any depth, any masker's placeholder. */
+export function carriesMasked(value) {
+  return maskedMarkerOf(value) !== null;
 }
 
 const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -92,7 +127,9 @@ function maskedShape(schema) {
   for (const [key, value] of Object.entries(schema)) {
     if (value === REDACTED) return true;
     if (key === "type" && Array.isArray(value) && value.includes(REDACTED)) return true;
-    if (key === "enum" && Array.isArray(value) && value.includes(REDACTED)) return true;
+    // A choice the masker rewrote would offer its placeholder as a value to save.
+    if (key === "enum" && Array.isArray(value) && carriesMasked(value)) return true;
+    if (key === "const" && carriesMasked(value)) return true;
     if ((key === "anyOf" || key === "oneOf" || key === "allOf") && Array.isArray(value)) {
       if (value.some((branch) => maskedShape(branch))) return true;
     }
@@ -280,20 +317,32 @@ export function formModel(schema, effective = [], trust = []) {
 
   const doc = isObject(schema) ? schema : {};
 
+  // The settings at or under a path whose value came back masked, as dotted paths.
+  const hiddenUnder = (segments) =>
+    prefixRows
+      .filter((r) => startsWith(r.segments, segments) && carriesMasked(r.value))
+      .map((r) => r.segments.join("."));
+
   const base = (segments, help) => {
     const key = segments[segments.length - 1];
     const tierRow = tiers.get(nodeKey(segments));
     const seed = valueUnder(segments);
     const declaredSeed = valueUnder(segments, true);
     const exact = rows.get(nodeKey(segments));
+    const hidden = hiddenUnder(segments);
+    // A node holding any masked value is write-only: its control starts empty,
+    // and its JSON pane never starts from the masked read.
+    const writeOnly = hidden.length > 0 || carriesMasked(seed) || carriesMasked(declaredSeed);
     return {
       segments,
       key: nodeKey(segments),
       label: labelOf(key),
       help: typeof help === "string" && help !== "" ? help : null,
       seed,
-      // What the JSON pane starts from: what the file says, or the defaults when it says nothing.
-      paneSeed: declaredSeed !== undefined ? declaredSeed : seed,
+      // What the JSON pane starts from: what the file says, or the defaults when it
+      // says nothing; nothing at all when a value under it came back masked.
+      paneSeed: writeOnly ? undefined : declaredSeed !== undefined ? declaredSeed : seed,
+      hidden: hidden.length > 0 ? hidden : writeOnly ? [segments.join(".")] : [],
       source:
         exact !== undefined
           ? exact.source
@@ -305,7 +354,7 @@ export function formModel(schema, effective = [], trust = []) {
       tier: tierRow?.tier ?? null,
       security: tierRow?.securitySurface === true,
       badges: [],
-      writeOnly: carriesMasked(seed),
+      writeOnly,
       nullable: false,
     };
   };
@@ -471,7 +520,8 @@ function coerceAs(kind, input) {
  * The one edit a control's value makes: `{path, value}`, `{path}` to remove the
  * setting (`CLEAR`), or null when nothing would change: the value equals the
  * seed, nothing was typed, a hidden value's control was left empty, or the value
- * still carries the masker's placeholder (a masked read is never written back).
+ * still carries any masker's placeholder (`[redacted]`, `***` or `«NAME»`): a
+ * masked read is never written back.
  * Coercion is by the node's kind, never by the seed's type.
  */
 export function fieldEdit(node, input) {
@@ -479,7 +529,13 @@ export function fieldEdit(node, input) {
   const path = node.segments.map(String);
   if (input === CLEAR) return node.source === "declared" ? { path } : null;
   // A hidden value's control starts empty, and an empty one sends nothing, whatever its kind.
-  if (node.writeOnly === true && (input === "" || input === undefined || input === null)) {
+  if (
+    node.writeOnly === true &&
+    (input === "" ||
+      input === undefined ||
+      input === null ||
+      (Array.isArray(input) && input.length === 0))
+  ) {
     return null;
   }
   let value;
