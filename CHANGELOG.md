@@ -637,6 +637,15 @@ these on: they reach every harness that uses what each one names.
   card update, the follow-up and the continued reply happen after the answer.
   Recompile a daemon to pick this up.
 
+- **A graph node's upstream state is labelled as a workflow step's.** The
+  input a graph node receives — the run's state with earlier nodes' outputs,
+  and a retried node's judge feedback — is recorded with `source: "workflow"`
+  on its `user_message` line. In a loop that keeps a requirements ledger, an
+  evicted copy carries the same `source` on its `context_evicted` line and is
+  labelled `(workflow step)` in the ledger and in the compaction summarizer's
+  anchor: presented as written by an earlier step, with no more authority than
+  that source. The run's own input, carried in that state, is labelled with it.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read

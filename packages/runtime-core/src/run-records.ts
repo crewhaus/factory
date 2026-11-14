@@ -838,7 +838,10 @@ export type SeedSourceOf = {
 
 /**
  * Where each user-role message of a loop came from, decided at loop start:
- *  - a seed message is what the caller said (`seedSource`), else `workflow`
+ *  - a seed message is what the caller said (`seedSource`); else `workflow`
+ *    when the loop is a graph node's (`sessionTarget: "graph-node"`), whose
+ *    seed the emitted graph builds from the run's state and earlier nodes'
+ *    outputs; else `workflow`
  *    when its text starts with {@link WORKFLOW_STEP_PREFIX}, or carries that
  *    prefix followed by the reply the previous top-level loop in this
  *    process returned; a message replayed from the session log is what its
@@ -874,6 +877,10 @@ export function seedSourcesOf(
     if (message.role !== "user") continue;
     if (opts.seedSource !== undefined) {
       seeds.set(message, opts.seedSource);
+      continue;
+    }
+    if (opts.sessionTarget === "graph-node") {
+      seeds.set(message, "workflow");
       continue;
     }
     const text = messageText(message);

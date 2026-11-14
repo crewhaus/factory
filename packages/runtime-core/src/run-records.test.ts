@@ -1289,6 +1289,56 @@ describe("the requirements ledger names where an entry came from", () => {
     expect(ledgerSent(step.adapter)).toContain("- (workflow step) ## Output of previous step:");
   });
 
+  test("a graph node's seed is a workflow step's, whatever the loop's context; its other messages are not", () => {
+    const upstream: Anthropic.MessageParam = {
+      role: "user",
+      content: 'Upstream state:\n```json\n{"input":"x","plan":"y"}\n```',
+    };
+    const node = { sessionTarget: "graph-node", seedMessages: [upstream] } as const;
+    expect(seedSourcesOf(node, {})(upstream)).toBe("workflow");
+    // An API run's graph: the seed stays the step's, a later message is the API's.
+    const underApi = seedSourcesOf(node, { originStack: ["api"] as const });
+    expect(underApi(upstream)).toBe("workflow");
+    const later: Anthropic.MessageParam = { role: "user", content: "later" };
+    expect(underApi(later)).toBe("api");
+    const other: Anthropic.MessageParam = { role: "user", content: "not a seed" };
+    expect(seedSourcesOf(node, {})(other)).toBe("user");
+    // A caller's own label still wins.
+    expect(seedSourcesOf({ ...node, seedSource: "crew" }, {})(upstream)).toBe("crew");
+    // A retried node's seed carries the judge's feedback after the state.
+    const retried: Anthropic.MessageParam = {
+      role: "user",
+      content:
+        'Upstream state:\n```json\n{"input":"x"}\n```\n\n[judge feedback — the previous attempt failed the "q" gate]:\nbe precise',
+    };
+    expect(
+      seedSourcesOf({ sessionTarget: "graph-node", seedMessages: [retried] }, {})(retried),
+    ).toBe("workflow");
+  });
+
+  test("a graph node's upstream state evicted by compaction is recorded and labelled as a workflow step's", async () => {
+    const dir = tempDir();
+    const { ctx, adapter, summarizer } = await compacted(
+      dir,
+      { sessionTarget: "graph-node" },
+      longSeed('Upstream state:\n```json\n{"input":"Count the widgets."}\n```'),
+    );
+    expect(evictedOf(dir, ctx.sessionId)[0]?.payload).toMatchObject({ source: "workflow" });
+    expect(
+      linesOf(dir, ctx.sessionId).find((l) => l.kind === "user_message")?.payload,
+    ).toMatchObject({ source: "workflow" });
+    const ledger = ledgerSent(adapter);
+    expect(ledger).toContain(`<requirements_ledger>\n${LEDGER_HEADER_DELEGATED}\n`);
+    expect(ledger).toContain("- (workflow step) Upstream state:");
+    expect(ledger).toContain("\n  (workflow step) ```json");
+    expect(ledger).not.toContain("- (user) Upstream state");
+    expect(ledger).not.toContain(LEDGER_HEADER_USER);
+    const request = summaryRequest(summarizer);
+    expect(request).toContain("- (workflow step) Upstream state:");
+    expect(request).not.toContain("\n- Upstream state:");
+    expect(request).not.toContain("The following user requirements were stated earlier");
+  });
+
   test("a crew or workflow seed keeps its label in a channel or API loop; the loop's other messages take the loop's", () => {
     for (const [loop, ctx, expected] of [
       [{ sessionTarget: "channel" }, {}, "channel"],

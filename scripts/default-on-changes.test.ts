@@ -4857,6 +4857,29 @@ describe("run records, structured recall, context_assembled, ledger labels, comp
     }
   });
 
+  test("a graph node's upstream state is a workflow step's", async () => {
+    const { seedSourcesOf } = await import("../packages/runtime-core/src/run-records");
+    const upstream = {
+      role: "user" as const,
+      content: 'Upstream state:\n```json\n{"input":"x"}\n```',
+    };
+    expect(
+      seedSourcesOf({ sessionTarget: "graph-node", seedMessages: [upstream] }, {})(upstream),
+    ).toBe("workflow");
+    // The emitted graph names its node loops and their seeds this way.
+    const emitted = readFileSync(
+      join(ROOT, "packages/compiler/src/__fixtures__/model-wiring/graph-nodes.agent.ts.txt"),
+      "utf8",
+    );
+    const nodeLoops = emitted.split('sessionTarget: "graph-node",').length - 1;
+    const seeded = emitted.split("seedMessages: __seed,").length - 1;
+    expect(nodeLoops).toBe(3);
+    expect(seeded).toBe(nodeLoops);
+    const bullet = bulletFor("A graph node's upstream state is labelled as a workflow step's.");
+    expect(bullet).toContain("`(workflow step)`");
+    expect(bullet).toContain("`source`");
+  });
+
   test("a kept compaction summary is in the run's lineage at compaction", async () => {
     const { autoCompact } = await import("../packages/compaction-autocompact/src/index");
     const summary = "The weekly report goes to the finance list every Monday.";
