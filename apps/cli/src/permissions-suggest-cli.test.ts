@@ -9,6 +9,7 @@
  * `alwaysAllow RunCommand` ("run any command"), with no warning in the output.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -60,6 +61,7 @@ async function suggest(json: boolean): Promise<{ stdout: string; exitCode: numbe
 type Json = {
   suggestions: Array<{ rule: { type: string; pattern: string }; evidence: string[] }>;
   rejected: unknown[];
+  skipped?: Array<{ toolName: string; reason: string; note: string }>;
 };
 
 describe("crewhaus permissions suggest", () => {
@@ -285,4 +287,26 @@ describe("crewhaus permissions suggest --apply on a harness with an approver lis
     expect(stderr).toContain("Needs the owner.");
     expect(readFileSync(settings, "utf8")).toBe('{"hooks":[]}\n');
   }, 60_000);
+});
+
+describe("crewhaus permissions suggest, screening each recorded call", () => {
+  test("a call that carried a credential gets no allow rule, and the report names the tool only", async () => {
+    // Built at runtime from parts, so no credential-shaped literal is committed.
+    const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+    const command = `curl -H "Authorization: Bearer ${token}" https://x.test`;
+    seed([{ name: "Bash", input: { command } }]);
+
+    const json = await suggest(true);
+    expect(json.exitCode).toBe(0);
+    expect(json.stdout.includes(token)).toBe(false);
+    const out = JSON.parse(json.stdout) as Json;
+    expect(out.skipped?.[0]?.toolName).toBe("Bash");
+    expect(out.skipped?.[0]?.reason).toBe("carries-credential");
+    expect(out.suggestions.filter((s) => s.rule.pattern.startsWith("Bash"))).toEqual([]);
+
+    const text = await suggest(false);
+    expect(text.exitCode).toBe(0);
+    expect(text.stdout).toContain("[skipped] Bash\n");
+    expect(text.stdout.includes(token)).toBe(false);
+  }, 30_000);
 });

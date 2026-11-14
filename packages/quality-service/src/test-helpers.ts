@@ -161,6 +161,8 @@ export function fakeRunners(
     async loadFileDataset() {
       throw new Error("no file datasets in these tests");
     },
+    // The candidate adds no MCP server or tool, so a recording may stand in.
+    addedToolSurface: () => [],
     ...extra,
   };
   return { runners, calls };

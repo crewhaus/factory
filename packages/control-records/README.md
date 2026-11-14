@@ -29,7 +29,8 @@ are the run ledger and the receipts. Directories are created only on a write pat
 | `keys/digest.key` | the harness's digest key: 64 lowercase hex and a newline |
 | `leases/mutating.json` | `{v, pid, startedAt?, host, head, kind, acquiredAt, leaseRef}` |
 | `operator.json` | whether intake is paused and the deployment disabled |
-| `approvers.json` | the harness's copy of who may decide what |
+| `approvers.json` | the harness's copy of who may decide what, and Home's address (`homeUrl`) when the owner set one |
+| `runs/NNNNNN.jsonl` | the run ledger (`runsLedger(harnessDir)`, on the run machine) |
 
 `controlPaths(harnessDir).heartbeatFile` is `.crewhaus/run/control-heartbeat.json`, beside the control
 token and outside `control/`: when a daemon last said it was alive.
@@ -107,6 +108,7 @@ file anywhere up its path inside the root. The reason names the file and the fau
 | `readApproverProjection(harnessDir)`, `createApproverReader({now})` | `approvers.json`, cap 1 MiB. Absent is single-owner mode, present is enforced, unreadable fails closed. An answer goes straight to `verifyDecision`. Unknown keys stay on it. | the runtime's consume check |
 | `intakeVerdict(harnessDir, {read?})` | `{state: "open"}` or `{state: "closed", reasons, notice, code, exitName, retryAfter?}`. Read `state`, `code`, `exitName`, `notice` and `retryAfter`; never switch exhaustively on `reasons[].kind`. A door puts `code` on the wire and `exitName` (the `EXIT_CODES` name) on an exit. A record both paused and disabled lists both reasons, so lifting one never lifts the other. The SLO gate's file is not a reason. | the doors that admit work, and `assertRunnable` |
 | `assertRunnable(harnessDir, {mode, ignorePause?, read?})` | One answer per CLI entry point. It never exits or throws for an operator state; `exitName` names the exit code. | the CLI's entry points |
+| `writeOperatorRecord(harnessDir, change)` | The record's one writer, format and lock only: `change` replaces each block it names whole (`intake`, `deployment`, `desired`). Under the control lock, from a fresh read: an absent record starts at `rev` 1 with `desired: "stopped"`, a present one gains one `rev` and keeps top-level fields it does not know, and one that cannot be read is never written. Atomic, `0600`, never through a link; the default reader is refreshed after. Answers `{ok: true, record}` or `{ok: false, reason}`. Never call it while holding a ledger lock: it takes the same lock. | the control service's operator controls and `recordDesired` |
 
 `notice` in the operator record is a string to show, `null` for a pause recorded as quiet, or absent
 for the fixed text.
@@ -114,7 +116,7 @@ for the fixed text.
 | Export | Contract | First consumer |
 |---|---|---|
 | `registerIntakeRoot(harnessDir)`, `intakeRoot()`, `unregisterIntakeRoot(harnessDir)` | The directory of the control plane this process serves, resolved, in one slot on `globalThis` under `Symbol.for("@crewhaus/control-records/intake-root")` so two copies in a bundle share it. Absent in every CLI process. Unregistering another directory leaves the slot as it is. | the control plane's `start()` and `stop()`; the runtime's admission at loop start |
-| `writeHeartbeat(harnessDir, beat)` | `.crewhaus/run/control-heartbeat.json`: `{v: 1, pid, at, operatorRev, paused, disabled, activeRuns, runLedger}`, written whole, atomically, at `0600`, its directory at `0700` and contained. Only those fields are written. The caller supplies every value. Answers `{ok: true}` or `{ok: false, reason}` and never throws. | the control plane's heartbeat; its first reader is Home's "last verified" |
+| `writeHeartbeat(harnessDir, beat)` | `.crewhaus/run/control-heartbeat.json`: `{v: 1, pid, at, operatorRev, paused, disabled, operatorUnreadable, activeRuns, runLedger}`, written whole, atomically, at `0600`, its directory at `0700` and contained. Only those fields are written. The caller supplies every value. Answers `{ok: true}` or `{ok: false, reason}` and never throws. | the control plane's heartbeat; its first reader is Home's "last verified" |
 
 | Record | `interactive` | `run` | `start` |
 |---|---|---|---|
@@ -131,8 +133,18 @@ for the fixed text.
 | `ensureDigestKey(harnessDir, {file?})` | For writers. Publishes exclusively; a racing creator reads the winner's key. An unreadable key is refused, never replaced. | the decision log; access-control's subject key |
 | `keyedDigest(key, label, parts)` | HMAC-SHA256, lowercase hex, over the UTF-8 of `JSON.stringify([label, ...parts])`. | the decision log |
 | `storedLocalActor(key, localActor)`, `LOCAL_ACTOR_LABEL` | `local:#<keyedDigest(key, "local-actor", [actor])>`: what a record holds for an unlinked local OS user, under the key of the root the record lives in. One definition, so records join. | the command receipts; the decision log |
+| `CHANNEL_CONVERSATION_LABEL`, `CHANNEL_MESSAGE_LABEL`, `CHANNEL_SENDER_LABEL` | The labels of a channel message's keyed refs on its run rows: the conversation, the message and an unlinked sender. | channel-adapter-base's `acceptInbound` |
 
 Stored digests join forever, so this format is a pin. The label keeps two purposes from joining.
+
+## Runs a turn has not reached
+
+| Export | Contract | First consumer |
+|---|---|---|
+| `runsLedger(harnessDir)` | The run ledger, `.crewhaus/run/control/runs/`, on the run machine. One definition for every writer. | the managed daemon's run rows; the runtime's run rows; a channel daemon's accepted messages |
+| `appendPreparingRun(ledger, {id, at, trigger, holder})` | `queued`, then `preparing`, for one id, each line refused whole when it is not under 4 KiB. `holder` is `{pid, host, startedAt}`. | channel-adapter-base's `acceptInbound` |
+| `newestRunRows(ledger)` | The newest row per id among the ledger's newest `RUN_ROW_PAGE_LINES` (256) lines. A view. | the settle and the control plane's run sweep |
+| `settleUnstartedRun(ledger, id, close, accept?)` | Under the ledger's lock, closes a run whose newest row is still `preparing`, keeping its trigger, when the machine allows the close and `accept` agrees; a run the runtime has written after is never written after. | `acceptInbound`; the control plane's run sweep |
 
 ## The mutating lease
 

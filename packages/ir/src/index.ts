@@ -3,6 +3,8 @@
  * In the slice, IR shape mirrors the spec; later passes (ir-passes module)
  * will perform optimization and target-specific lowering.
  */
+import type { IrScheduleLane } from "./schedule-lanes";
+
 export type IrPermissionRule = {
   readonly type: "alwaysAllow" | "alwaysDeny" | "alwaysAsk";
   readonly pattern: string;
@@ -1877,6 +1879,9 @@ export type IrChannelV0 = {
   /** Loop contract 0.4 (Batch F) — cron/interval wake trigger. Optional;
    *  absent when the spec omits `schedule:`. */
   readonly schedule?: IrSchedule;
+  /** Named schedule lanes (#514), sorted by name; each is its own control
+   *  lane `schedule:<name>`. Never present together with `schedule`. */
+  readonly scheduleLanes?: ReadonlyArray<IrScheduleLane>;
   readonly gateway?: IrChannelGateway;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
@@ -1999,6 +2004,9 @@ export type IrManagedV0 = {
   readonly hooks?: readonly IrHook[];
   /** Loop contract 0.4 (Batch F) — cron/interval wake trigger. Optional. */
   readonly schedule?: IrSchedule;
+  /** Named schedule lanes (#514), sorted by name; each is its own control
+   *  lane `schedule:<name>`. Never present together with `schedule`. */
+  readonly scheduleLanes?: ReadonlyArray<IrScheduleLane>;
   /** Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
    *  Optional; absent when the spec omits the `evaluation` block. */
   readonly evaluation?: IrEvaluation;
@@ -2504,6 +2512,9 @@ export type IrBatchV0 = {
   /** Loop contract 0.4 (Batch F) — cron/interval wake trigger for the queue
    *  worker daemon. Optional. */
   readonly schedule?: IrSchedule;
+  /** Named schedule lanes (#514), sorted by name; each is its own control
+   *  lane `schedule:<name>`. Never present together with `schedule`. */
+  readonly scheduleLanes?: ReadonlyArray<IrScheduleLane>;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -2830,6 +2841,9 @@ export type Bundle = {
     readonly content: string;
   }>;
 };
+
+// Named schedule lanes (#514). See ./schedule-lanes.ts.
+export type { IrScheduleLane } from "./schedule-lanes";
 
 // Generated-bundle README renderer (item 42) — pure functions over the IR,
 // shared by every target emitter. See ./readme.ts for the module docs.

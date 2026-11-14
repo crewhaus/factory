@@ -758,9 +758,13 @@ describe("emitChannelBot — agent.ts", () => {
 
 describe("emitChannelBot — gateway.ts", () => {
   test("dedups by adapter-supplied idempotencyKey", () => {
+    // The event and the gateway's dedupe store go to channel-adapter-base's
+    // handleInboundEvent, which remembers the event's idempotencyKey first
+    // (its own tests hold the duplicate answer).
     const c = fileMap(MIN_IR).get("gateway.ts") ?? "";
-    expect(c).toContain("idempotencyKey");
-    expect(c).toContain("dedup");
+    expect(c).toContain(
+      "return handleInboundEvent(parsed.event, adapter, { dedup, sessionRouter: config.sessionRouter });",
+    );
   });
 
   // SECURITY (audit R3): the dedup store is pluggable, the in-memory default
@@ -771,7 +775,9 @@ describe("emitChannelBot — gateway.ts", () => {
     expect(c).toContain('from "@crewhaus/durable-state"');
     expect(c).toContain("dedupStore?: DedupStore");
     expect(c).toContain("config.dedupStore ?? new InMemoryDedupStore");
-    expect(c).toContain("await dedup.remember(parsed.event.idempotencyKey)");
+    // The awaited remember() lives in handleInboundEvent, which this store is handed to.
+    expect(c).toContain('import { handleInboundEvent } from "@crewhaus/channel-adapter-base";');
+    expect(c).toContain("handleInboundEvent(parsed.event, adapter, { dedup,");
   });
 
   test("daemon wires CREWHAUS_DEDUP_STORE through createDedupStore", () => {
@@ -816,17 +822,16 @@ describe("emitChannelBot — gateway.ts", () => {
 
   test("ACKs 200 immediately and dispatches the model turn asynchronously", () => {
     // Slack/Telegram/Discord/WhatsApp all expect a fast ACK on inbound
-    // webhooks (Slack's documented bound is 3 s). Driving the model turn
-    // synchronously would block the response and surface transient API
-    // errors as 500s, prompting platform-side retries and duplicate work.
-    // Confirm the generated handler dispatches the model call out-of-band
-    // and never returns 500 from the inline handler path.
+    // webhooks (Slack's documented bound is 3 s). The gateway hands the event
+    // to handleInboundEvent, which answers once the message is on record and
+    // runs the turn off the request path (its own tests hold that order).
     const c = fileMap(MIN_IR).get("gateway.ts") ?? "";
-    expect(c).toContain("queueMicrotask(");
-    expect(c).toContain("config.sessionRouter.handle(parsed.event, adapter).catch");
-    // The 500-on-handler-error branch from the prior synchronous-await
-    // implementation should be gone. Any remaining `status: 500` in this
-    // file would indicate a regression.
+    expect(c).toContain("handleInboundEvent(");
+    // The event path builds no answer of its own after the hand-off.
+    const tail = c.slice(c.indexOf("return handleInboundEvent("));
+    expect(c.indexOf("return handleInboundEvent(")).toBeGreaterThan(-1);
+    expect(tail).not.toContain("new Response(");
+    // A handler error never becomes a 500 on the inline path.
     expect(c).not.toContain("status: 500");
     expect(c).not.toContain('"handler error"');
   });
@@ -2372,35 +2377,34 @@ describe("emitChannelBot — G11 pending-approval channel surface (ask_mode paus
     expect(agent).not.toContain("runtimeApprovals: RuntimeApprovalStore;");
   });
 
-  test("gateway adds the /<adapter>/actions route: verify → resolve → ack → resume", () => {
+  test("gateway adds the /<adapter>/actions route: capped read → verify → parse → delegate", () => {
     const gateway = fileMap(MIN_IR).get("gateway.ts") ?? "";
-    expect(gateway).toContain('import { resolveApproval } from "@crewhaus/channel-adapter-base";');
+    expect(gateway).toContain(
+      'import { createApprovalActions } from "@crewhaus/channel-adapter-base";',
+    );
     expect(gateway).toContain("url.pathname.match(/^\\/([^/]+)\\/actions$/)");
-    expect(gateway).toContain("actionAdapter.parseInteraction(actionReq)");
-    // Same signing machinery as an events webhook.
-    expect(gateway).toContain("actionAdapter.verify(actionReq)");
-    expect(gateway).toContain("await resolveApproval({");
-    expect(gateway).toContain("await ackApproval({ interaction, decision: interaction.decision");
-    expect(gateway).toContain("config.sessionRouter.resumeApproval(resolved, actionAdapter)");
+    const read = gateway.indexOf(
+      "const actionRead = await readRequestBodyCapped(req, maxBodyBytes);",
+    );
+    const verify = gateway.indexOf("actionAdapter.verify(actionReq)");
+    const parse = gateway.indexOf("actionAdapter.parseInteraction(actionReq)");
+    const delegate = gateway.indexOf("return approvalActions.handle(interaction, actionAdapter);");
+    // Same signing machinery as an events webhook, in this order.
+    expect(read).toBeGreaterThan(-1);
+    expect(verify).toBeGreaterThan(read);
+    expect(parse).toBeGreaterThan(verify);
+    expect(delegate).toBeGreaterThan(parse);
+    expect(gateway).toContain("createApprovalActions({");
     expect(gateway).toContain("approvals?: ApprovalStore;");
     expect(gateway).toContain("auditSink?: ApprovalAuditSink;");
   });
 
-  test("#383 — gateway persists a standing settings rule on an always grant, pre-resume", () => {
+  test("the gateway writes no settings rule and imports no permission engine", () => {
+    // A standing rule is made by the one decision step channel-adapter-base calls.
     const gateway = fileMap(MIN_IR).get("gateway.ts") ?? "";
-    expect(gateway).toContain('import { appendSettingsRule } from "@crewhaus/permission-engine";');
-    // always threads into the store resolution…
-    expect(gateway).toContain("...(interaction.always === true ? { always: true } : {}),");
-    // …and writes the rule for the RESOLVED tool before the resume re-drives.
-    expect(gateway).toContain(
-      'appendSettingsRule(process.cwd(), { type: "alwaysAllow", pattern: resolved.toolName })',
-    );
-    const writeAt = gateway.indexOf("appendSettingsRule(process.cwd()");
-    const resumeAt = gateway.indexOf("config.sessionRouter.resumeApproval(");
-    expect(writeAt).toBeGreaterThan(-1);
-    expect(writeAt).toBeLessThan(resumeAt);
-    // Best-effort: a write failure must not fail the resolution.
-    expect(gateway).toContain("standing-allow settings write failed");
+    expect(gateway).not.toContain("appendSettingsRule");
+    expect(gateway).not.toContain("@crewhaus/permission-engine");
+    expect(gateway).not.toContain("resolveApproval");
   });
 
   test("session-router parks on approval_pending and re-drives on resume", () => {
@@ -2437,6 +2441,11 @@ describe("emitChannelBot — permissions.ask_mode: deny opts out of the approval
     expect(daemon).not.toContain("approvals: __approvals");
     expect(gateway).not.toContain("/actions");
     expect(gateway).not.toContain("resolveApproval");
+    expect(gateway).not.toContain("createApprovalActions");
+    // The events route still hands each message to handleInboundEvent.
+    expect(gateway).toContain(
+      "return handleInboundEvent(parsed.event, adapter, { dedup, sessionRouter: config.sessionRouter });",
+    );
     expect(router).not.toContain("resumeApproval");
     expect(router).not.toContain("postApprovalPrompt");
     expect(router).not.toContain("approval_pending");
@@ -2515,6 +2524,66 @@ describe("emitChannelBot — schedule: wake loop (Batch F, temporal contract)", 
     const shutdownIdx = daemon.indexOf("const shutdown = async");
     expect(shutdownIdx).toBeGreaterThan(-1);
     expect(daemon.indexOf("__schedule.cancel();", shutdownIdx)).toBeGreaterThan(shutdownIdx);
+  });
+});
+
+describe("emitChannelBot — named schedule lanes (#514)", () => {
+  // A quote, a backtick, `${x}` and a newline: the prompt must reach the
+  // output only as a quoted literal.
+  const TRICKY = 'Write the "weekly" report: `totals` for ${x}\nthen stop.';
+  const withLanes: IrChannelV0 = {
+    ...MIN_IR,
+    scheduleLanes: [
+      { name: "discovery", kind: "interval", everyMs: 7_200_000 },
+      {
+        name: "weekly-report",
+        kind: "cron",
+        cron: "0 17 * * 5",
+        timezone: "Europe/Berlin",
+        jitterMs: 60_000,
+        instructions: TRICKY,
+      },
+    ],
+  };
+  const daemon = fileMap(withLanes).get("daemon.ts") ?? "";
+  const count = (needle: string): number => daemon.split(needle).length - 1;
+
+  test("each lane is its own control lane, in name order, armed by one armScheduleLanes call", () => {
+    const discovery = daemon.indexOf('lane: "schedule:discovery"');
+    const weekly = daemon.indexOf('lane: "schedule:weekly-report"');
+    expect(discovery).toBeGreaterThan(-1);
+    expect(weekly).toBeGreaterThan(discovery);
+    expect(count("armScheduleLanes(")).toBe(1);
+    expect(daemon).not.toContain('lane: "schedule",');
+    expect(daemon).not.toContain("armSchedule(");
+    expect(daemon).toContain(
+      'import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";',
+    );
+  });
+
+  test("each wake runs a fresh-session turn with its lane's prompt, logged under the lane", () => {
+    expect(daemon).toContain("message: __scheduleLanes[0].instructions,");
+    expect(daemon).toContain("message: __scheduleLanes[1].instructions,");
+    expect(count("isNew: true,")).toBeGreaterThanOrEqual(2);
+    expect(daemon).toContain("[schedule:discovery] wake #");
+    expect(daemon).toContain("[schedule:weekly-report] wake #");
+    // The default prompt for a lane without instructions.
+    expect(daemon).toContain('"[scheduled wake] proceed with your standing instructions."');
+    // Drain and signal shutdown both cancel every lane.
+    expect(count("__scheduleLanesArmed?.cancel();")).toBe(2);
+  });
+
+  test("the prompt appears only as a quoted literal, and the file parses", () => {
+    expect(count(JSON.stringify(TRICKY))).toBe(1);
+    expect(count("${x}")).toBe(1);
+    expect(daemon).not.toContain(TRICKY);
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(daemon)).not.toThrow();
+  });
+
+  test("no lanes → nothing of the lane form is emitted", () => {
+    const plain = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(plain).not.toContain("__scheduleLanes");
+    expect(plain).not.toContain("armScheduleLanes");
   });
 });
 

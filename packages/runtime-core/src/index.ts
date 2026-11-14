@@ -301,12 +301,22 @@ export {
   type SeedSource,
   runStampsEnabled,
 } from "./run-records";
+import {
+  type ChildSpan,
+  type HookAt,
+  type ToolSpan,
+  actionDigests,
+  createSpanRecorder,
+  isAbortError,
+  stampLines,
+} from "./run-spans";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 import {
   credentialFileRoots,
   credentialFloorScope,
   relocatingFieldLeftOut,
+  runSpecDirScope,
   runtimeRecordRoots,
   runtimeStateRoots,
   storeFileRoots,
@@ -1784,6 +1794,8 @@ export type SideCallTurnContext = {
   readonly signal: AbortSignal;
   /** The pool's scope (step / node / role name), when any. */
   readonly scope?: string;
+  /** The span the side call nests under: the turn it serves. */
+  readonly parentSpanId?: string;
   /**
    * §7.12 / §14(2) — the run's budget gate (`enforceBudget` for the current
    * turn), so a closure that makes SEVERAL model calls (the committee's
@@ -2190,6 +2202,13 @@ export type RunChatLoopOptions = {
    * event-log `.jsonl` files live. Defaults to `.crewhaus/sessions`.
    */
   sessionRootDir?: string;
+  /**
+   * The directory of the spec this run was started from. When its real path is
+   * not the working directory's, `<specDir>/.crewhaus/run/spec` is on the
+   * runtime-state floor for this run and every loop it starts (`./state-roots`).
+   * Absent: the directory {@link runSpecDirScope} holds for the run, if any.
+   */
+  specDir?: string;
   /**
    * 0.6.0 §16 Q6 — `false` keeps this run entirely IN MEMORY: no session
    * `.json`, no event-log `.jsonl`, no watch-me sidecar, no TTL sweep of the
@@ -3989,6 +4008,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   ) {
     return credentialFloorScope.run(true, () => runChatLoop(opts));
   }
+  // The spec's directory holds for this run and the loops it starts (a sub-agent,
+  // a workflow step, a crew role), which compute their own floor.
+  if (opts.specDir !== undefined && runSpecDirScope.getStore() !== opts.specDir) {
+    const specDir = opts.specDir;
+    return runSpecDirScope.run(specDir, () => runChatLoop(opts));
+  }
   // Each invocation records how it ended for its run's rows (`./run-ledger`), once
   // the operator record admits it (`./admission`).
   if (!hasRunRows(opts)) {
@@ -4324,7 +4349,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     undefined,
     undefined,
     undefined,
-    { hookCommands: opts.hooks?.map((hook) => hook.command) ?? [] },
+    {
+      hookCommands: opts.hooks?.map((hook) => hook.command) ?? [],
+      ...(opts.specDir !== undefined ? { specDir: opts.specDir } : {}),
+    },
   );
   // The continuity store's own files: only its tools write them. Files, not
   // roots, so a tool that checks its own targets (StateImport) keeps working
@@ -5350,12 +5378,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Run records (`./run-records`): when this loop records, every line its
   // handle writes carries the run id.
   const runRecorded = recordsRun(runContext, persistSession);
-  const eventLog: EventLog = persistSession
-    ? await openEventLog(sessionId, {
-        rootDir: sessionRootDir,
-        ...(runRecorded ? { run: runContext.runId } : {}),
-      })
-    : createMemoryEventLog();
+  // Run spans (`./run-spans`): the loop's, its turns', model and tool calls'
+  // spans and its checks' verdicts; every line its handle writes carries the
+  // span it belongs to.
+  const spans = createSpanRecorder({
+    runContext,
+    bus,
+    records: runRecorded,
+    write: createRecordEvent((event) => eventLog.append(event), runContext.logger),
+    sessionTurnBase: resumedTurns,
+    digests: actionDigests(sessionRootDir),
+  });
+  const eventLog: EventLog = stampLines(
+    persistSession
+      ? await openEventLog(sessionId, {
+          rootDir: sessionRootDir,
+          ...(runRecorded ? { run: runContext.runId } : {}),
+        })
+      : createMemoryEventLog(),
+    () => spans.lineSpan(),
+  );
   // Where each user-role message of this loop came from, for the ledger.
   const seedSourceOf = seedSourcesOf(opts, runContext);
 
@@ -5509,7 +5551,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // per-call lines for); the FR-003 terminal role-less `summary` aggregate is
   // still skipped so a run total never double-counts. `append()` writes
   // synchronously, and a persist failure must never abort a turn, so the
-  // result is logged rather than thrown.
+  // result is logged rather than thrown. The line names no span of its own:
+  // the cost tracker publishes accruals without knowing the loop's spans, so
+  // the handle stamps it with the open turn's span, else the loop's.
   let costPersistUnsubscribe: Unsubscribe | undefined;
   if (subscribers.costTracker !== undefined || budgetSessionPersist) {
     costPersistUnsubscribe = bus.subscribe((event): void => {
@@ -5622,8 +5666,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
   // Tight helper so call sites stay one line. Errors propagate so an I/O
   // failure on the audit trail surfaces rather than silently dropping.
-  async function logEvent(kind: EventKind, payload: unknown): Promise<void> {
-    await eventLog.append({ kind, payload });
+  async function logEvent(kind: EventKind, payload: unknown, span?: string): Promise<void> {
+    await eventLog.append(span !== undefined ? { kind, payload, span } : { kind, payload });
   }
 
   // Section 11 — fire matching hooks for `event` and aggregate the result.
@@ -5632,16 +5676,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // `pre-slash` (the `expanded` field). Errors are caught and surfaced as
   // a deny so a misbehaving hook implementation does not crash the run.
   const hooks = opts.hooks ?? [];
+  // `at` names the span the hooks nest under and the tool call they fire for;
+  // each hook that fires there writes a `hook` verdict (`./run-spans`).
   async function fireHook(
     event: HookEvent,
     payload: unknown,
+    at?: HookAt,
   ): Promise<{ allowed: boolean; reason?: string; mutate?: Record<string, unknown> }> {
     if (hooks.length === 0) return { allowed: true };
     try {
       const results = await runHooks(event, payload, hooks, {
         logger: runContext.logger,
         eventBus: bus,
+        ...(at !== undefined ? { parentSpanId: at.span } : {}),
+        ...(at?.toolUseId !== undefined ? { toolUseId: at.toolUseId } : {}),
       });
+      if (at !== undefined) await spans.hookVerdicts(at, event, results);
       return aggregateDecisions(results);
     } catch (err) {
       runContext.logger.warn("hook firing failed", {
@@ -6803,6 +6853,27 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   async function executeOneToolUse(
     tuAsRequested: TsmToolUseBlock,
   ): Promise<Anthropic.ToolResultBlockParam> {
+    // The call's own span, under the turn: every check below nests under it,
+    // so concurrent calls never share one (`./run-spans`).
+    const toolSpan = spans.openTool(
+      tuAsRequested.id,
+      tuAsRequested.name,
+      operativeToolInput(tuAsRequested.name, tuAsRequested.input),
+    );
+    try {
+      return await executeToolUseIn(tuAsRequested, toolSpan);
+    } catch (err) {
+      // A park, an abort or an error ends the call's span as it says.
+      await spans.closeTool(toolSpan, { err });
+      throw err;
+    }
+  }
+
+  /** {@link executeOneToolUse} inside the call's span: `finish` closes it. */
+  async function executeToolUseIn(
+    tuAsRequested: TsmToolUseBlock,
+    toolSpan: ToolSpan,
+  ): Promise<Anthropic.ToolResultBlockParam> {
     // REBINDABLE on purpose (#400): a replayed approval substitutes the
     // operator-approved input for the model's regenerated one, and every
     // consumer below — the validator, the executor, the justification gate,
@@ -6827,15 +6898,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // event of this call (stamped only while a pool candidate serves, so a
     // single-model run's events are byte-identical).
     const callAttribution = toolAttribution();
-    await logEvent("tool_use", {
-      id: tu.id,
-      name: tu.name,
-      input: tu.input,
-      ...(attributedCostUsdMicros !== undefined ? { attributedCostUsdMicros } : {}),
-      ...callAttribution,
-    });
+    await logEvent(
+      "tool_use",
+      {
+        id: tu.id,
+        name: tu.name,
+        input: tu.input,
+        ...(attributedCostUsdMicros !== undefined ? { attributedCostUsdMicros } : {}),
+        ...callAttribution,
+      },
+      toolSpan.id,
+    );
     const inputBytes = Buffer.byteLength(JSON.stringify(tu.input ?? null), "utf8");
-    const toolStartEnvelope = bus.envelope();
+    const toolStartEnvelope = toolSpan.envelope;
+    /** The envelope of a check this call makes: under the call's span. */
+    const checkEnvelope = () => bus.envelope(undefined, { parentSpanId: toolSpan.id });
     bus.publish({
       ...toolStartEnvelope,
       kind: "tool_call_start",
@@ -6874,27 +6951,30 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 content: [{ type: "text" as const, text: notice }, ...(result.content ?? [])],
               };
       }
-      await logEvent("tool_result", {
-        toolUseId: tu.id,
-        content:
-          typeof result.content === "string"
-            ? result.content
-            : summariseNonStringContent(
-                result.content as Exclude<
-                  Anthropic.ToolResultBlockParam["content"],
-                  string | undefined
-                >,
-              ),
-        isError: result.is_error === true,
-      });
+      await logEvent(
+        "tool_result",
+        {
+          toolUseId: tu.id,
+          content:
+            typeof result.content === "string"
+              ? result.content
+              : summariseNonStringContent(
+                  result.content as Exclude<
+                    Anthropic.ToolResultBlockParam["content"],
+                    string | undefined
+                  >,
+                ),
+          isError: result.is_error === true,
+        },
+        toolSpan.id,
+      );
       const outputContent = result.content;
       const outputBytes =
         typeof outputContent === "string"
           ? Buffer.byteLength(outputContent, "utf8")
           : Buffer.byteLength(JSON.stringify(outputContent ?? null), "utf8");
       bus.publish({
-        ...bus.envelope(),
-        spanId: toolStartEnvelope.spanId,
+        ...bus.endEnvelope(toolStartEnvelope),
         kind: "tool_call_end",
         toolUseId: tu.id,
         toolName: tu.name,
@@ -6907,17 +6987,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // is observational here: a deny on post-tool logs a warning but does
       // not rewrite the result (the model has already received it once on
       // the prior turn in some streaming scenarios).
-      const post = await fireHook("post-tool", {
-        id: tu.id,
-        ...hookToolName(tu.name),
-        isError: result.is_error === true,
-      });
+      const post = await fireHook(
+        "post-tool",
+        {
+          id: tu.id,
+          ...hookToolName(tu.name),
+          isError: result.is_error === true,
+        },
+        { span: toolSpan.id, toolUseId: tu.id },
+      );
       if (!post.allowed) {
         runContext.logger.warn("post-tool hook denied", {
           tool: tu.name,
           reason: post.reason,
         });
       }
+      // Last, so the post-tool hook's verdict is written with the call's others.
+      await spans.closeTool(toolSpan, { isError: result.is_error === true });
       return result;
     };
     if (!tool) {
@@ -6950,11 +7036,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
     // Section 11 — pre-tool hook: short-circuit with the hook's reason
     // when any matching hook returns deny/block.
-    const preHook = await fireHook("pre-tool", {
-      id: tu.id,
-      ...hookToolName(tu.name),
-      input: tu.input,
-    });
+    const preHook = await fireHook(
+      "pre-tool",
+      {
+        id: tu.id,
+        ...hookToolName(tu.name),
+        input: tu.input,
+      },
+      { span: toolSpan.id, toolUseId: tu.id },
+    );
     if (!preHook.allowed) {
       return finish({
         type: "tool_result",
@@ -7040,14 +7130,24 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     );
     const decision = decisionDetails.decision;
     bus.publish({
-      ...bus.envelope(),
+      ...checkEnvelope(),
       kind: "permission_decision",
       toolName: tu.name,
       decision,
       mode: permissionMode,
       ...(decisionDetails.reason !== undefined ? { reason: decisionDetails.reason } : {}),
       ...callAttribution,
+      toolUseId: tu.id,
     });
+    // An `ask` is recorded as it resolves (approved, denied or parked) below.
+    if (decision !== "ask") {
+      await spans.verdict(toolSpan.id, {
+        gate: "permission",
+        outcome: decision,
+        mode: permissionMode,
+        ...(decisionDetails.reason !== undefined ? { reason: decisionDetails.reason } : {}),
+      });
+    }
     let approved = decision === "allow";
     let denialMessage: string | undefined;
     // The store grant this call runs under, spent once it has passed every
@@ -7317,14 +7417,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             } else {
               tu = { ...tu, input: approvedInput };
               operativeInput = approvedOperative;
+              toolSpan.replayed(approvedOperative);
               // The `pre-tool` hook already judged the input the MODEL sent,
               // several steps above. A hook that can deny must judge what will
               // actually RUN, so re-fire it against the substituted input.
-              const replayHook = await fireHook("pre-tool", {
-                id: tu.id,
-                ...hookToolName(tu.name),
-                input: tu.input,
-              });
+              const replayHook = await fireHook(
+                "pre-tool",
+                {
+                  id: tu.id,
+                  ...hookToolName(tu.name),
+                  input: tu.input,
+                },
+                { span: toolSpan.id, toolUseId: tu.id },
+              );
               if (!replayHook.allowed) {
                 approved = false;
                 denialMessage = `[blocked by hook] ${replayHook.reason ?? "denied"}`;
@@ -7343,13 +7448,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           }
           if (replayedFrom !== undefined && approved) {
             bus.publish({
-              ...bus.envelope(),
+              ...checkEnvelope(),
               kind: "permission_decision",
               toolName: tu.name,
               decision: "allow",
               mode: permissionMode,
               reason: `approval ${replayedFrom.id} replayed: executing the APPROVED input, not the regenerated one`,
               ...callAttribution,
+              toolUseId: tu.id,
             });
             runContext.logger.info("tool approval replayed", {
               approvalId: replayedFrom.id,
@@ -7361,13 +7467,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // correct, that is what the model did — but nothing yet recorded
             // what RAN, and an audit trail showing only the discarded input is
             // worse than one showing both.
-            await logEvent("tool_use", {
-              id: tu.id,
-              name: tu.name,
-              input: replayedFrom.input,
-              approvalReplayedFrom: replayedFrom.id,
-              requestedInput: tuAsRequested.input,
-            });
+            await logEvent(
+              "tool_use",
+              {
+                id: tu.id,
+                name: tu.name,
+                input: replayedFrom.input,
+                approvalReplayedFrom: replayedFrom.id,
+                requestedInput: tuAsRequested.input,
+              },
+              toolSpan.id,
+            );
           }
         } else if (existing?.decision === "deny") {
           approved = false;
@@ -7427,11 +7537,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             });
           }
           bus.publish({
-            ...bus.envelope(),
+            ...checkEnvelope(),
             kind: "approval_requested",
             approvalId: pending.id,
             toolName: tu.name,
             surface: approvalSurface,
+            toolUseId: tu.id,
+          });
+          await spans.verdict(toolSpan.id, {
+            gate: "permission",
+            outcome: "ask:parked",
+            mode: permissionMode,
+          });
+          await spans.verdict(toolSpan.id, {
+            gate: "approval",
+            outcome: "parked",
+            refs: { approval: pending.id },
           });
           runContext.logger.info("tool approval parked", {
             approvalId: pending.id,
@@ -7479,13 +7600,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // (observability.ts) keys on `askOutcome` to persist exactly this resolved
       // form. Unreached on the PARK path, which throws above.
       bus.publish({
-        ...bus.envelope(),
+        ...checkEnvelope(),
         kind: "permission_decision",
         toolName: tu.name,
         decision: "ask",
         mode: permissionMode,
         askOutcome: approved ? "approved" : "denied",
         ...callAttribution,
+        toolUseId: tu.id,
+      });
+      await spans.verdict(toolSpan.id, {
+        gate: "permission",
+        outcome: approved ? "ask:approved" : "ask:denied",
+        mode: permissionMode,
       });
     }
     /**
@@ -7567,7 +7694,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         judge,
       );
       bus.publish({
-        ...bus.envelope(),
+        ...checkEnvelope(),
         kind: "permission_decision",
         toolName: tu.name,
         decision: verdict.allow ? "allow" : "deny",
@@ -7583,6 +7710,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           ? { justificationConfidence: verdict.confidence }
           : {}),
         ...callAttribution,
+        toolUseId: tu.id,
       });
       runContext.logger.info("justification evaluated", {
         toolUseId: tu.id,
@@ -7601,8 +7729,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // surfaced: an I/O failure on the audit trail is logged and swallowed so
       // a full audit disk does not crash a governed run, mirroring how the
       // egress fabric treats its own audit surface. Absent sink → no-op.
+      // The record names its run, session and tool call, and the action's
+      // keyed digest, so it joins the call's verdict lines by id.
+      let justificationAudited = false;
       if (opts.justificationAuditSink !== undefined) {
         try {
+          const actionDigest = await spans.toolDigest(toolSpan);
           await opts.justificationAuditSink.append({
             kind: "permission_justification_evaluated",
             payload: {
@@ -7612,8 +7744,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               reason: verdict.reason,
               judgeModel: verdict.judgeModel,
               ...(verdict.confidence !== undefined ? { confidence: verdict.confidence } : {}),
+              runId: runContext.runId,
+              sessionId,
+              toolUseId: tu.id,
+              ...(actionDigest !== undefined ? { actionDigest } : {}),
             },
           });
+          justificationAudited = true;
         } catch (err) {
           runContext.logger.warn("justification audit append failed", {
             toolUseId: tu.id,
@@ -7622,6 +7759,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           });
         }
       }
+      // The judge's identity, never its words: a model wrote the reason.
+      await spans.verdict(toolSpan.id, {
+        gate: "justification",
+        outcome: verdict.allow ? "allow" : "deny",
+        mode: permissionMode,
+        judge: {
+          model: verdict.judgeModel,
+          ...(verdict.confidence !== undefined ? { confidence: verdict.confidence } : {}),
+        },
+        ...(justificationAudited
+          ? { refs: { audit: { kind: "permission_justification_evaluated" } } }
+          : {}),
+      });
       if (!verdict.allow) {
         heldGrant?.release();
         return finish({
@@ -7683,22 +7833,24 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           : egress.verdict === "warn"
             ? "egress-warned"
             : "egress-blocked";
+      const egressReason =
+        egress.originsFound.length > 0
+          ? `egress: ${summarizeEgress(egress)}${
+              approvedReason !== undefined ? `; ${approvedReason}` : ""
+            }`
+          : undefined;
       bus.publish({
-        ...bus.envelope(),
+        ...checkEnvelope(),
         kind: "permission_decision",
         toolName: tu.name,
         decision: egress.verdict === "block" ? "deny" : "allow",
         mode: permissionMode,
         outcome: egressOutcome,
-        ...(egress.originsFound.length > 0
-          ? {
-              reason: `egress: ${summarizeEgress(egress)}${
-                approvedReason !== undefined ? `; ${approvedReason}` : ""
-              }`,
-            }
-          : {}),
+        ...(egressReason !== undefined ? { reason: egressReason } : {}),
         ...callAttribution,
+        toolUseId: tu.id,
       });
+      let egressAudited = false;
       if (egress.verdict !== "pass") {
         runContext.logger.warn("egress classification non-clean", {
           toolUseId: tu.id,
@@ -7719,6 +7871,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // run, mirroring the justification sink above. Absent sink → no-op.
         if (opts.egressAuditSink !== undefined) {
           try {
+            const actionDigest = await spans.toolDigest(toolSpan);
             await opts.egressAuditSink.append({
               kind: "egress_decision",
               payload: {
@@ -7730,8 +7883,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...(approvedOver !== undefined
                   ? { approvalId: approvedOver, reason: approvedReason }
                   : {}),
+                runId: runContext.runId,
+                sessionId,
+                toolUseId: tu.id,
+                ...(actionDigest !== undefined ? { actionDigest } : {}),
               },
             });
+            egressAudited = true;
           } catch (err) {
             runContext.logger.warn("egress audit append failed", {
               toolUseId: tu.id,
@@ -7741,6 +7899,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           }
         }
       }
+      const egressRefs = {
+        ...(approvedOver !== undefined ? { approval: approvedOver } : {}),
+        ...(egressAudited ? { audit: { kind: "egress_decision" } } : {}),
+      };
+      await spans.verdict(toolSpan.id, {
+        gate: "egress",
+        outcome: egress.verdict,
+        mode: permissionMode,
+        ...(egressReason !== undefined ? { reason: egressReason } : {}),
+        ...(Object.keys(egressRefs).length > 0 ? { refs: egressRefs } : {}),
+      });
       if (egress.verdict === "block") {
         heldGrant?.release();
         return finish({
@@ -7782,6 +7951,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           toolName: tu.name,
           error: (err as Error).message,
         });
+        await spans.verdict(toolSpan.id, { gate: "rate-limit", outcome: "deny" });
         return finish({
           type: "tool_result",
           tool_use_id: tu.id,
@@ -7802,6 +7972,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const spendView =
         replayedFrom !== undefined && replayView !== undefined ? replayView : gateView;
       const spent = await held.spend(spendView.places());
+      await spans.verdict(toolSpan.id, {
+        gate: "approval",
+        outcome: spent.outcome,
+        ...(spent.outcome === "refused" ? { reason: spent.reason } : {}),
+        refs: { approval: held.approvalId },
+      });
       if (spent.outcome === "refused") {
         runContext.logger.info("tool approval not used", {
           approvalId: held.approvalId,
@@ -7811,15 +7987,24 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // A rule allows the call; the grant only let it out past an egress
           // `block`. Without the grant, the egress check's verdict stands.
           if (egressReliedOnGrant) {
+            const blockStands = `approval ${held.approvalId} not used (${spent.reason}): the egress check's block stands`;
             bus.publish({
-              ...bus.envelope(),
+              ...checkEnvelope(),
               kind: "permission_decision",
               toolName: tu.name,
               decision: "deny",
               mode: permissionMode,
               outcome: "egress-blocked",
-              reason: `approval ${held.approvalId} not used (${spent.reason}): the egress check's block stands`,
+              reason: blockStands,
               ...callAttribution,
+              toolUseId: tu.id,
+            });
+            await spans.verdict(toolSpan.id, {
+              gate: "egress",
+              outcome: "block",
+              mode: permissionMode,
+              reason: blockStands,
+              refs: { approval: held.approvalId },
             });
             return finish({
               type: "tool_result",
@@ -7830,13 +8015,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           }
         } else {
           bus.publish({
-            ...bus.envelope(),
+            ...checkEnvelope(),
             kind: "permission_decision",
             toolName: tu.name,
             decision: "ask",
             mode: permissionMode,
             reason: `approval ${held.approvalId} not used (${spent.reason}): asked again`,
             ...callAttribution,
+            toolUseId: tu.id,
           });
           replayedFrom = undefined;
           if (parkCall === undefined) {
@@ -7888,7 +8074,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       : tools;
     const bridge: RuntimeBridge = {
       runContext,
-      eventLog,
+      // What the tool (and a sub-agent it starts) writes belongs to this call.
+      eventLog: stampLines(eventLog, () => toolSpan.id),
+      parentSpanId: toolSpan.id,
+      ...(spans.records
+        ? { recordSpanClosed: (payload) => spans.writeSpanClosed(payload, tu.id) }
+        : {}),
       // 0.8.0 — the runtime-state roots, for the tools that write beneath a
       // directory they name and must not reach one (see RuntimeBridge).
       ...(protectedRoots.length + protectedFiles.length > 0
@@ -8027,7 +8218,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // notice; on suspicious it's kept but the trace event records a
     // warning. Tools opt out by setting `classifyOutput: false` (only the
     // in-process Task wrapper does today).
-    const finalPreview = await applyInjectionClassification(tool, tu, stored.previewContent);
+    const finalPreview = await applyInjectionClassification(
+      tool,
+      tu,
+      stored.previewContent,
+      toolSpan,
+    );
     // Pillar 3 sink-side fabric — tag the (post-classification) tool result
     // into run-context's dataLineage so the egress classifier can detect
     // exfiltration of this content on a subsequent external-tool call.
@@ -8080,6 +8276,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     tool: RegisteredTool,
     tu: TsmToolUseBlock,
     previewContent: string | ReadonlyArray<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>,
+    toolSpan: ToolSpan,
   ): Promise<string | ReadonlyArray<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>> {
     // Runs on ALL tool results, including `is_error` ones: an error preview is
     // just as prompt-injectable as a successful one (e.g. an MCP error string),
@@ -8105,7 +8302,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     if (verdict.classification === "malicious") {
       const notice = buildRedactionNotice(verdict.hits);
       bus.publish({
-        ...bus.envelope(),
+        ...bus.envelope(undefined, { parentSpanId: toolSpan.id }),
         kind: "permission_decision",
         toolName: tu.name,
         decision: "allow",
@@ -8113,7 +8310,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         outcome: "redacted",
         rules: ruleIds,
         reason: `prompt injection in tool output (${ruleIds.slice(0, 3).join(", ")})`,
+        toolUseId: tu.id,
       });
+      await spans.verdict(toolSpan.id, { gate: "post-tool", outcome: "redacted", rules: ruleIds });
       runContext.logger.warn("tool output redacted (prompt injection detected)", {
         toolUseId: tu.id,
         toolName: tu.name,
@@ -8123,7 +8322,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
     // suspicious — keep content but emit a once-per-session warning.
     bus.publish({
-      ...bus.envelope(),
+      ...bus.envelope(undefined, { parentSpanId: toolSpan.id }),
       kind: "permission_decision",
       toolName: tu.name,
       decision: "allow",
@@ -8131,7 +8330,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       outcome: "warned",
       rules: ruleIds,
       reason: `suspicious tool output (${ruleIds.slice(0, 3).join(", ")})`,
+      toolUseId: tu.id,
     });
+    await spans.verdict(toolSpan.id, { gate: "post-tool", outcome: "warned", rules: ruleIds });
     if (!injectionWarningEmitted) {
       injectionWarningEmitted = true;
       runContext.logger.warn(
@@ -8311,6 +8512,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
     // escalation "warn" — the warning already fired once; stay quiet.
     return { kind: "none" };
+  }
+
+  /** The loop detector's verdict, about the newest call the detection counted. */
+  async function loopVerdict(outcome: LoopOutcome): Promise<void> {
+    if (outcome.kind === "none") return;
+    await spans.loopVerdict(outcome.detection, outcome.kind === "abort" ? "abort" : outcome.stage);
   }
 
   /**
@@ -8495,6 +8702,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // call returns (and the shadow runs while it does).
     messages: [...messages],
     signal,
+    // The side call nests under the turn it serves.
+    ...(spans.turnSpan !== undefined ? { parentSpanId: spans.turnSpan } : {}),
     ...(poolScope !== undefined ? { scope: poolScope } : {}),
     // §7.12 — a multi-call closure re-reads the total cap between its calls.
     ...(opts.budget !== undefined
@@ -8653,11 +8862,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const primaryModel = lastResponseWireModel ?? wireModelId;
     const seed = [...messagesBefore];
     publishStage({ ...stage, outcome: "started" });
+    // Built now, while the turn it audits is open, so it nests under it.
+    const shadowContext = sideCallContext(seed, runAbort.signal);
     const prior = shadowInFlight ?? Promise.resolve();
     shadowInFlight = prior.then(async () => {
       try {
         const v = await shadow.run({
-          ...sideCallContext(seed, runAbort.signal),
+          ...shadowContext,
           turnNumber: turn,
           primaryText,
           primaryModel,
@@ -8846,11 +9057,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // a synthetic "[blocked by hook]" assistant message so the loop
           // exits cleanly (state transitions through ModelReturnedText →
           // Done(no_tools)).
-          const preModel = await fireHook("pre-model", {
-            model: opts.model,
-            streaming: opts.streaming === true,
-            messageCount: messages.length,
-          });
+          const preModel = await fireHook(
+            "pre-model",
+            {
+              model: opts.model,
+              streaming: opts.streaming === true,
+              messageCount: messages.length,
+            },
+            spans.turnAt(),
+          );
           // 0.6.0 §7.4 — the hook's `mutate.systemAppend` is HONOURED: a
           // string is appended to this call's system prompt in the volatile
           // region (after the cache-marked prefix, beside the candidate
@@ -8893,6 +9108,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 readonly candidate: PoolCandidate;
               }
             | undefined;
+          // The call's span, so the catch can close it (`./run-spans`).
+          let modelSpanId: string | undefined;
           let modelCallStartMs = performance.now();
           try {
             // Section 27 — rate-limit the model call before opening the
@@ -8902,7 +9119,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             if (opts.rateLimiter && opts.rateLimitKeys && opts.rateLimitKeys.length > 0) {
               await opts.rateLimiter.acquire(opts.rateLimitKeys, 1);
             }
-            const modelStartEnv = bus.envelope();
+            const modelStartEnv = bus.envelope(undefined, { parentSpanId: spans.turnSpan });
+            modelSpanId = modelStartEnv.spanId;
+            const modelAttempt = spans.openModel(modelStartEnv);
             // Section 27 — `model` carries the WIRE model id (the stripped
             // form the provider bills against, e.g. `bedrock/us.anthropic.…`
             // → `us.anthropic.…`) so cost-tracker pricing lookups and the
@@ -9528,10 +9747,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               ...modelAttribution(),
               ...planAttribution(plan),
               ...(effectiveParams !== undefined ? { effectiveParams } : {}),
+              ...(modelAttempt.retryOf !== undefined ? { retryOf: modelAttempt.retryOf } : {}),
             });
-            await manifestRecorder.manifest(assembledReq, {
+            const manifestCall = await manifestRecorder.manifest(assembledReq, {
               span: modelStartEnv.spanId,
               turn: { run: runContext.turnNumber, session: resumedTurns + runContext.turnNumber },
+              ...(modelAttempt.attempt !== undefined ? { attempt: modelAttempt.attempt } : {}),
               model: {
                 wire: reqWireModelId,
                 ...(reqSpecModel !== reqWireModelId ? { spec: reqSpecModel } : {}),
@@ -9540,6 +9761,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               },
               ...(effectiveParams !== undefined ? { effective: effectiveParams } : {}),
             });
+            spans.noteCall(modelStartEnv.spanId, manifestCall);
             // G10 — arm the per-model-call watchdog for exactly the stream's
             // lifetime: cleared right after each drain below and (throw
             // paths) at the top of the catch.
@@ -9559,7 +9781,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 writeText(chunk);
                 bus.publish(
                   {
-                    ...bus.envelope(),
+                    ...bus.envelope(undefined, { parentSpanId: modelStartEnv.spanId }),
                     kind: "model_stream_token",
                     chunkIndex: streamChunkIndex++,
                     deltaChars: chunk.length,
@@ -9627,7 +9849,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   role: "assistant",
                   content: committedStreamContent as Anthropic.MessageParam["content"],
                 });
-                await logEvent("assistant_message", { content: committedStreamContent });
+                await logEvent(
+                  "assistant_message",
+                  { content: committedStreamContent },
+                  modelStartEnv.spanId,
+                );
               }
               terminalContent = [...committedStreamContent] as Anthropic.ContentBlock[];
               // Item 22 — lastServed() is exact: the candidate that actually
@@ -9652,8 +9878,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   ? (poolServedS?.providerId ?? reqProviderId)
                   : (servedStreaming?.providerId ?? providerId);
               bus.publish({
-                ...bus.envelope(),
-                spanId: modelStartEnv.spanId,
+                ...bus.endEnvelope(modelStartEnv),
                 kind: "model_response",
                 // Wire model id, NOT the spec string — cost-tracker resolves
                 // pricing on this field (see the model_request publish above).
@@ -9666,6 +9891,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...modelAttribution(),
                 ...planAttribution(plan),
               });
+              await spans.closeModel(modelStartEnv.spanId);
               await recordServedModel(respModelIdS);
               // Item 4 / G28 — record the provider's real input_tokens for the
               // next pre-turn compaction trigger + routing signal. A response
@@ -9694,10 +9920,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   ...(costUsd !== undefined ? { costUsd } : {}),
                 });
               }
-              await fireHook("post-model", {
-                streaming: true,
-                contentBlocks: finalContent.length,
-              });
+              await fireHook(
+                "post-model",
+                {
+                  streaming: true,
+                  contentBlocks: finalContent.length,
+                },
+                { span: modelStartEnv.spanId },
+              );
 
               const toolUses = committedStreamContent.filter(
                 (b): b is Extract<typeof b, { type: "tool_use" }> => b.type === "tool_use",
@@ -9724,6 +9954,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               messages.push({ role: "user", content: [...toolResults] });
               await logEvent("user_message", { content: [...toolResults] });
               const loopOutcome = evaluateToolLoop();
+              await loopVerdict(loopOutcome);
               if (loopOutcome.kind === "message") {
                 messages.push(markSynthetic(loopOutcome.message));
                 await logEvent("user_message", {
@@ -9760,7 +9991,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 writeText(chunk);
                 bus.publish(
                   {
-                    ...bus.envelope(),
+                    ...bus.envelope(undefined, { parentSpanId: modelStartEnv.spanId }),
                     kind: "model_stream_token",
                     chunkIndex: streamChunkIndex++,
                     deltaChars: chunk.length,
@@ -9793,8 +10024,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ? (poolServed?.providerId ?? reqProviderId)
                 : (servedCandidate?.providerId ?? providerId);
             bus.publish({
-              ...bus.envelope(),
-              spanId: modelStartEnv.spanId,
+              ...bus.endEnvelope(modelStartEnv),
               kind: "model_response",
               // Wire model id, NOT the spec string — cost-tracker resolves
               // pricing on this field (see the model_request publish above).
@@ -9807,6 +10037,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               ...modelAttribution(),
               ...planAttribution(plan),
             });
+            await spans.closeModel(modelStartEnv.spanId);
             await recordServedModel(respWireModelId);
             // Item 4 / G28 — record the provider's real input_tokens for the
             // next pre-turn compaction trigger + routing signal. A response that
@@ -9855,14 +10086,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 role: "assistant",
                 content: committedContent as Anthropic.MessageParam["content"],
               });
-              await logEvent("assistant_message", { content: committedContent });
+              await logEvent(
+                "assistant_message",
+                { content: committedContent },
+                modelStartEnv.spanId,
+              );
             }
             terminalContent = [...committedContent] as Anthropic.ContentBlock[];
-            await fireHook("post-model", {
-              streaming: false,
-              stopReason: final.stopReason,
-              contentBlocks: final.content.length,
-            });
+            await fireHook(
+              "post-model",
+              {
+                streaming: false,
+                stopReason: final.stopReason,
+                contentBlocks: final.content.length,
+              },
+              { span: modelStartEnv.spanId },
+            );
 
             // Synthetic max_output_tokens recovery: route the truncation through
             // the recovery state machine so we ask the model to continue. The
@@ -9914,6 +10153,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           } catch (err) {
             // G10 — the watchdog must not outlive the call it watched.
             clearModelCallTimer();
+            // A call that failed is the one recovery retries next.
+            if (modelSpanId !== undefined) await spans.closeModel(modelSpanId, err);
             // Tear down the "thinking" animation before any error/abort output.
             out.spinner.stop();
             if (isAbortError(err)) {
@@ -9995,6 +10236,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           messages.push({ role: "user", content: toolResults });
           await logEvent("user_message", { content: toolResults });
           const loopOutcome = evaluateToolLoop();
+          await loopVerdict(loopOutcome);
           if (loopOutcome.kind === "message") {
             messages.push(markSynthetic(loopOutcome.message));
             await logEvent("user_message", {
@@ -10051,7 +10293,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           switch (action.kind) {
             case "compact": {
               const before = messages.length;
-              await fireHook("pre-compact", { kind: "reactive", before });
+              const compaction = spans.openChild("compaction");
+              await fireHook("pre-compact", { kind: "reactive", before }, spans.turnAt());
               // Reactive compaction summarizes via a model call — show the wait.
               out.spinner.start("compacting context");
               const compacted = await forceCompact({
@@ -10080,25 +10323,35 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               const reactiveSummary = summaryTextOf(compacted);
               messages.length = 0;
               messages.push(...compacted);
-              await logEvent("compaction", {
-                kind: "reactive",
-                before,
-                after: messages.length,
-                ...(reactiveSummary !== undefined ? { summary: reactiveSummary } : {}),
-              });
+              await logEvent(
+                "compaction",
+                {
+                  kind: "reactive",
+                  before,
+                  after: messages.length,
+                  ...(reactiveSummary !== undefined ? { summary: reactiveSummary } : {}),
+                },
+                compaction.id,
+              );
+              manifestRecorder.noteCompaction();
               bus.publish({
-                ...bus.envelope(),
+                ...compaction.envelope,
                 kind: "compaction_fired",
                 subKind: "reactive",
                 before,
                 after: messages.length,
                 phase: "reactive",
               });
-              await fireHook("post-compact", {
-                kind: "reactive",
-                before,
-                after: messages.length,
-              });
+              await compaction.close();
+              await fireHook(
+                "post-compact",
+                {
+                  kind: "reactive",
+                  before,
+                  after: messages.length,
+                },
+                spans.turnAt(),
+              );
               state = transition(state, { kind: "RecoveryDone" });
               break;
             }
@@ -10593,6 +10846,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         const rejected = attempt;
         const rejectedStage = current;
         ladder.reruns += 1;
+        spans.beginAttempt(step.kind === "escalate" ? "escalation" : "provability");
         if (step.kind === "escalate") {
           turnEscalations.escalations += 1;
           const escalated = await escalateOnProvability(
@@ -10673,6 +10927,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         return served(attempt);
       }
       let graded: EvaluationResult;
+      // The grade is a span of its turn; its verdict names it.
+      const judgeSpan = spans.openChild("judge");
       out.spinner.start("evaluating");
       try {
         graded = await evaluation.evaluate({
@@ -10696,6 +10952,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // cascade records NO arm line for the ungraded attempt (an omitted
         // quality would read as a perfect 1.0 through the reward) and counts
         // it as `ungraded`; stages already graded still fold.
+        await judgeSpan.close({ err });
         const errObj = err as { name?: unknown; message?: unknown };
         const name = typeof errObj.name === "string" ? errObj.name : "EvaluationError";
         const message = typeof errObj.message === "string" ? errObj.message : String(err);
@@ -10715,6 +10972,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       } finally {
         out.spinner.stop();
       }
+      await judgeSpan.close();
       // A rogue evaluator returning NaN/±Infinity must not poison the
       // trace surface; treat non-finite as 0 (an unambiguous fail).
       const score = Number.isFinite(graded.score) ? graded.score : 0;
@@ -10764,6 +11022,27 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           ? { escalatedTo: cascade.target.modelString }
           : {}),
         ...(shareExhausted ? { reason: "judge_share_exhausted" as const } : {}),
+      });
+      // The judge's identity and cost, never its rationale.
+      await spans.verdict(judgeSpan.id, {
+        gate: "eval",
+        outcome: verdict,
+        score: { value: score, threshold: evaluation.threshold },
+        ...(graded.judge !== undefined
+          ? {
+              judge: {
+                model: graded.judge.model,
+                ...(graded.judge.costUsdMicros !== undefined
+                  ? { costUsdMicros: graded.judge.costUsdMicros }
+                  : {}),
+              },
+            }
+          : {}),
+        ...(willEscalate
+          ? { next: "escalate" as const }
+          : verdict === "fail" && evaluation.onFail === "retry" && retryIndex < maxRetries
+            ? { next: "retry" as const }
+            : {}),
       });
       const standing = (): typeof attempt => {
         if (cascade !== undefined) {
@@ -10845,6 +11124,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           costUsd: 0,
         };
         try {
+          spans.beginAttempt("escalation");
           attempt = await runEscalationStage(
             messages,
             cascade.target,
@@ -10888,6 +11168,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       if (retryIndex >= maxRetries) return served(attempt);
       messages.push(markSynthetic({ role: "user", content: correction }));
       await logEvent("user_message", { content: correction, synthetic: true });
+      spans.beginAttempt("eval");
       // An answer a provability escalation produced is corrected on its rung.
       attempt =
         heldRung !== undefined
@@ -11455,7 +11736,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * result. Built per verification over the transcript it reads.
    */
   const gateEgressScreen =
-    (messages: readonly Anthropic.MessageParam[]) =>
+    (messages: readonly Anthropic.MessageParam[], pass: ChildSpan) =>
     async (payload: string, sinkId: string): Promise<GateEgressScreen> => {
       const egress = await classifyEgress(payload, runContext, {
         sinkId,
@@ -11464,8 +11745,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
       const handed = egress.verdict === "block" && handedByBoundary(messages, payload, egress);
       const verdict = handed ? "pass" : egress.verdict;
+      const reason =
+        egress.originsFound.length > 0
+          ? handed
+            ? `egress: the URL was handed to the run verbatim (${summarizeEgress(egress)})`
+            : `egress: ${summarizeEgress(egress)}`
+          : undefined;
       bus.publish({
-        ...bus.envelope(),
+        ...bus.envelope(undefined, { parentSpanId: pass.id }),
         kind: "permission_decision",
         toolName: sinkId,
         decision: verdict === "block" ? "deny" : "allow",
@@ -11476,13 +11763,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             : verdict === "warn"
               ? "egress-warned"
               : "egress-blocked",
-        ...(egress.originsFound.length > 0
-          ? {
-              reason: handed
-                ? `egress: the URL was handed to the run verbatim (${summarizeEgress(egress)})`
-                : `egress: ${summarizeEgress(egress)}`,
-            }
-          : {}),
+        ...(reason !== undefined ? { reason } : {}),
+      });
+      await spans.verdict(pass.id, {
+        gate: "egress",
+        outcome: verdict,
+        mode: permissionMode,
+        ...(reason !== undefined ? { reason } : {}),
       });
       if (verdict !== "pass") {
         runContext.logger.warn("egress classification non-clean", {
@@ -11558,6 +11845,28 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     attempt: ServedTurn,
     stage: string | undefined,
   ): Promise<ProvabilityStep> {
+    // Each pass is a span of its turn; its egress checks and its verdict name it.
+    const pass = spans.openChild("provability");
+    try {
+      const step = await provabilityPassIn(provability, ladder, messages, attempt, stage, pass);
+      const stopped = step.kind === "stopped" || (step.kind === "stands" && step.aborted);
+      await pass.close(stopped ? { status: "aborted" } : undefined);
+      return step;
+    } catch (err) {
+      await pass.close({ err });
+      throw err;
+    }
+  }
+
+  /** {@link provabilityPass} inside the pass's span. */
+  async function provabilityPassIn(
+    provability: RunProvability,
+    ladder: ProvabilityLadder,
+    messages: Anthropic.MessageParam[],
+    attempt: ServedTurn,
+    stage: string | undefined,
+    pass: ChildSpan,
+  ): Promise<ProvabilityStep> {
     const maxRetries = provabilityRetryCap(provability);
     // 1 — an aborted turn never completed: verifying its partial output
     // would be noise, and a retry would fight the very signal that stopped
@@ -11596,7 +11905,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // (§6.1, §10).
         ...(opts.budget !== undefined ? { judgeShareExhausted } : {}),
         ...(opts.egressAuditSink !== undefined ? { egressAuditSink: opts.egressAuditSink } : {}),
-        screenEgress: gateEgressScreen(messages),
+        screenEgress: gateEgressScreen(messages, pass),
       });
     out.spinner.start("verifying");
     try {
@@ -11717,6 +12026,27 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       turnNumber,
       ...(bundlePath !== undefined ? { bundlePath } : {}),
       ...(escalateTo !== undefined ? { escalatedTo: escalateTo.modelString } : {}),
+    });
+    await spans.verdict(pass.id, {
+      gate: "provability",
+      outcome: summary.verdict,
+      score: { value: summary.score, threshold: summary.threshold },
+      ...(summary.judgeModel !== undefined
+        ? {
+            judge: {
+              model: summary.judgeModel,
+              ...(summary.judgeCostUsdMicros !== undefined
+                ? { costUsdMicros: summary.judgeCostUsdMicros }
+                : {}),
+            },
+          }
+        : {}),
+      refs: {
+        bundle: {
+          ...(bundlePath !== undefined ? { path: bundlePath } : {}),
+          hash: summary.bundleHash,
+        },
+      },
     });
     // §5.3 — the hash-chained audit record beside the justification gate's,
     // best-effort but surfaced exactly like that path: a full audit disk
@@ -11927,6 +12257,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         if (step.kind === "stands") return finishGated(provability, ladder, attempt);
         if (step.kind === "halt") return await haltOnProvability(provability, step);
         ladder.reruns += 1;
+        spans.beginAttempt(step.kind === "escalate" ? "escalation" : "provability");
         if (step.kind === "escalate") {
           ladder.escalations += 1;
           const escalated = await escalateOnProvability(messages, step, false);
@@ -11997,8 +12328,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       runContext.turnNumber += 1;
       bus.setTurnNumber(runContext.turnNumber);
       const t0SingleTurn = performance.now();
+      const turnEnv = spans.openTurn();
       bus.publish({
-        ...bus.envelope(),
+        ...turnEnv,
         kind: "turn_start",
         turn: runContext.turnNumber,
         messageCount: messages.length,
@@ -12023,22 +12355,25 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           ...compactionExtras(),
         },
         async (info) => {
-          await logEvent("compaction", info);
+          const compaction = spans.openChild("compaction");
+          await logEvent("compaction", info, compaction.id);
+          manifestRecorder.noteCompaction();
           bus.publish({
-            ...bus.envelope(),
+            ...compaction.envelope,
             kind: "compaction_fired",
             subKind: info.kind,
             before: info.before,
             after: info.after,
             phase: "pre-turn",
           });
+          await compaction.close();
           // Fire one pre-compact (info has the before-count from the work
           // that just ran) followed by post-compact. Pre-compact in this
           // path is observational — by the time onCompaction fires the
           // step has already happened — but the pair lets hooks see both
           // events for symmetry with the reactive path.
-          await fireHook("pre-compact", { ...info, phase: "pre-turn" });
-          await fireHook("post-compact", { ...info, phase: "pre-turn" });
+          await fireHook("pre-compact", { ...info, phase: "pre-turn" }, spans.turnAt());
+          await fireHook("post-compact", { ...info, phase: "pre-turn" }, spans.turnAt());
         },
       );
 
@@ -12063,11 +12398,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const answer = terminalText(terminalContent);
       maybeScheduleShadow(shadowSeed, answer);
       bus.publish({
-        ...bus.envelope(),
+        ...bus.endEnvelope(turnEnv),
         kind: "turn_end",
         turn: runContext.turnNumber,
         durationMs: performance.now() - t0SingleTurn,
       });
+      await spans.closeTurn(turnAbort.signal.aborted ? "aborted" : "ok");
       // §5.4 — `footerTarget: "reply"`: the proof footer travels in the text
       // the run RETURNS (what a channel bot sends, what the gateway answers),
       // after a blank line — never in `messages`, so the transcript the model
@@ -12080,6 +12416,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const served = opts.provability !== undefined ? neutralizeFooterLines(answer) : answer;
       if (footer === undefined) return served;
       return served === "" ? footer : `${served}\n\n${footer}`;
+    } catch (err) {
+      // The open turn closes as the failure says, and so does the loop.
+      await spans.thrown(err);
+      throw err;
     } finally {
       // 0.6.0 §7.8 — the single turn IS the run. A per-message host
       // (`sideCallDrain`) takes the in-flight shadow and the served text
@@ -12101,11 +12441,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }
       clearAllTimers();
       out.spinner.stop();
-      await fireHook("stop", {
-        sessionId,
-        turnCount: runContext.turnNumber,
-        reason: "complete",
-      });
+      await fireHook(
+        "stop",
+        {
+          sessionId,
+          turnCount: runContext.turnNumber,
+          reason: "complete",
+        },
+        spans.turnAt(),
+      );
       await maybeAutoCapture();
       // §2.8 — deterministic handoff, same teardown slot as onCapture.
       await maybeHandoff("complete");
@@ -12114,7 +12458,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       costPersistUnsubscribe?.();
       failoverNoteUnsubscribe?.();
       routingPersist.unsubscribe();
-      manifestRecorder.dispose();
+      await spans.closeLoop();
       incidentCollector?.unsubscribe();
       ownBudgetMeter?.unsubscribe();
       advisorPersist?.unsubscribe();
@@ -12264,11 +12608,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       if (opts.slashCommands && opts.slashCommands.size > 0) {
         const slash = expandSlash(userInput, opts.slashCommands);
         if (slash.handled) {
-          const decision = await fireHook("pre-slash", {
-            name: slash.command?.name,
-            arguments: slash.arguments,
-            expanded: slash.expanded,
-          });
+          const decision = await fireHook(
+            "pre-slash",
+            {
+              name: slash.command?.name,
+              arguments: slash.arguments,
+              expanded: slash.expanded,
+            },
+            spans.turnAt(),
+          );
           if (decision.allowed) {
             const override = decision.mutate?.["expanded"];
             effectiveInput = typeof override === "string" ? override : slash.expanded;
@@ -12323,8 +12671,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       runContext.turnNumber += 1;
       bus.setTurnNumber(runContext.turnNumber);
       const t0Turn = performance.now();
+      const turnEnv = spans.openTurn();
       bus.publish({
-        ...bus.envelope(),
+        ...turnEnv,
         kind: "turn_start",
         turn: runContext.turnNumber,
         messageCount: messages.length,
@@ -12350,17 +12699,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           ...compactionExtras(),
         },
         async (info) => {
-          await logEvent("compaction", info);
+          const compaction = spans.openChild("compaction");
+          await logEvent("compaction", info, compaction.id);
+          manifestRecorder.noteCompaction();
           bus.publish({
-            ...bus.envelope(),
+            ...compaction.envelope,
             kind: "compaction_fired",
             subKind: info.kind,
             before: info.before,
             after: info.after,
             phase: "pre-turn",
           });
-          await fireHook("pre-compact", { ...info, phase: "pre-turn" });
-          await fireHook("post-compact", { ...info, phase: "pre-turn" });
+          await compaction.close();
+          await fireHook("pre-compact", { ...info, phase: "pre-turn" }, spans.turnAt());
+          await fireHook("post-compact", { ...info, phase: "pre-turn" }, spans.turnAt());
         },
       );
 
@@ -12404,11 +12756,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }
 
       bus.publish({
-        ...bus.envelope(),
+        ...bus.endEnvelope(turnEnv),
         kind: "turn_end",
         turn: runContext.turnNumber,
         durationMs: performance.now() - t0Turn,
       });
+      await spans.closeTurn(turnAbort.signal.aborted ? "aborted" : "ok");
       runContext.logger.debug("turn end", {
         turn: runContext.turnNumber,
       });
@@ -12426,16 +12779,24 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       await throwTimeout(runTimeout);
     }
     replExitedCleanly = !runAbort.signal.aborted;
+  } catch (err) {
+    // The open turn closes as the failure says, and so does the loop.
+    await spans.thrown(err);
+    throw err;
   } finally {
     // 0.6.0 §7.8 — let an in-flight shadow finish before teardown.
     await awaitShadow();
     clearAllTimers();
     out.spinner.stop();
-    await fireHook("stop", {
-      sessionId,
-      turnCount: runContext.turnNumber,
-      reason: runAbort.signal.aborted ? "abort" : "exit",
-    });
+    await fireHook(
+      "stop",
+      {
+        sessionId,
+        turnCount: runContext.turnNumber,
+        reason: runAbort.signal.aborted ? "abort" : "exit",
+      },
+      spans.turnAt(),
+    );
     await maybeAutoCapture();
     // §2.8 — deterministic handoff, same teardown slot as onCapture.
     await maybeHandoff(runAbort.signal.aborted ? "abort" : "exit");
@@ -12444,7 +12805,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     costPersistUnsubscribe?.();
     failoverNoteUnsubscribe?.();
     routingPersist.unsubscribe();
-    manifestRecorder.dispose();
+    await spans.closeLoop();
     incidentCollector?.unsubscribe();
     ownBudgetMeter?.unsubscribe();
     advisorPersist?.unsubscribe();
@@ -12479,16 +12840,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 function printAdvisorDigest(advisorPersist: AttachedAdvisorPersistence | undefined): void {
   const line = advisorPersist?.digestLine();
   if (line !== undefined) process.stderr.write(`${line}\n`);
-}
-
-function isAbortError(err: unknown): boolean {
-  // Section 17 — runtime-core no longer imports the Anthropic SDK at
-  // runtime, so we name-match instead of `instanceof`. The provider
-  // adapters preserve the SDK error names through their normalisation
-  // layers, so this catches both Anthropic and OpenAI/Gemini/Bedrock
-  // abort errors uniformly.
-  const name = (err as { name?: unknown }).name;
-  return typeof name === "string" && (name === "AbortError" || name === "APIUserAbortError");
 }
 
 // ---------------------------------------------------------------------------

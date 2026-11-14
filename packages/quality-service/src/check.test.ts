@@ -131,6 +131,72 @@ describe("checking a spec change", () => {
     expect(readChange(dir, row.id)?.isolation).toBe("recorded-tools");
   });
 
+  const recordedTools = () => ({
+    summary: run("run_rec", { c0: "pass" }, { toolRecording: { mode: "record", dir: "/rec/r1" } }),
+    dir: "/runs/rec",
+  });
+
+  test("a candidate that adds an MCP server or tool needs a live check, said before anything runs", async () => {
+    const dir = await harness();
+    const row = await propose(dir);
+    const { runners, calls } = fakeRunners((_l, a) => allPass(a), {
+      recordedRun: recordedTools,
+      externalWriteTools: () => true,
+      addedToolSurface: () => ["fs"],
+    });
+    const plan = await planCheck({ harnessDir: dir, chg: row.id, runners, actor: ACTOR, now });
+    if (!("kind" in plan)) throw new Error(JSON.stringify(plan));
+    expect(plan.isolation).toBe("needs-live");
+    expect(plan.isolationReason).toContain("adds an MCP server or tool (fs)");
+    const refused = await checkChange({ harnessDir: dir, chg: row.id, runners, actor: ACTOR, now });
+    if (refused.ok) throw new Error("checked");
+    expect(refused.code).toBe("needs-live");
+    expect(refused.reason).toBe(plan.isolationReason as string);
+    expect(calls.evals).toHaveLength(0);
+    expect(readChange(dir, row.id)?.state).toBe("proposed");
+  });
+
+  test("a runner that cannot say what the candidate adds needs a live check, and a live one runs without the recording", async () => {
+    const dir = await harness();
+    const row = await propose(dir);
+    const made = fakeRunners((_l, a) => allPass(a), {
+      recordedRun: recordedTools,
+      externalWriteTools: () => true,
+    });
+    const { addedToolSurface: _dropped, ...rest } = made.runners;
+    const runners: CheckRunners = rest;
+    const plan = await planCheck({ harnessDir: dir, chg: row.id, runners, actor: ACTOR, now });
+    expect("kind" in plan && plan.isolation).toBe("needs-live");
+    const refused = await checkChange({ harnessDir: dir, chg: row.id, runners, actor: ACTOR, now });
+    expect(!refused.ok && refused.code).toBe("needs-live");
+    expect(made.calls.evals).toHaveLength(0);
+    const live = await checkChange({
+      harnessDir: dir,
+      chg: row.id,
+      runners,
+      actor: ACTOR,
+      live: { confirmedBy: ACTOR },
+      now,
+    });
+    if (!live.ok) throw new Error(live.reason);
+    expect(readChange(dir, row.id)?.isolation).toBe("live");
+    expect(made.calls.evals.length).toBeGreaterThan(0);
+    for (const e of made.calls.evals) expect(e.replayToolsDir).toBeUndefined();
+  });
+
+  test("a candidate that adds no MCP server or tool replays the recording", async () => {
+    const dir = await harness();
+    const row = await propose(dir);
+    const { runners } = fakeRunners((_l, a) => allPass(a), {
+      recordedRun: recordedTools,
+      externalWriteTools: () => true,
+      addedToolSurface: () => [],
+    });
+    const plan = await planCheck({ harnessDir: dir, chg: row.id, runners, actor: ACTOR, now });
+    expect("kind" in plan && plan.isolation).toBe("recorded-tools");
+    expect("kind" in plan && plan.isolationReason).toBeUndefined();
+  });
+
   test("a harness with an outside-writing tool and no recording needs a live check", async () => {
     const dir = await harness();
     const row = await propose(dir);
@@ -597,6 +663,16 @@ describe("the instrument is held to the one the check measured with", () => {
       expect(out.code).toBe("instrument-changed");
       expect(out.reason).toContain("pluginsDigest");
     }
+  });
+
+  test("an instrument field recorded on one side only refuses the adoption", async () => {
+    const { dir, adopt, decision } = await granted({ pluginsDigest: "p", cliVersion: "0.9.0" });
+    const out = await adopt(sameInstrument);
+    if (out.ok) throw new Error("adopted");
+    expect(out.code).toBe("instrument-changed");
+    expect(out.reason).toContain("pluginsDigest, recorded on one side only");
+    expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(SPEC);
+    expect(readAdoptionDecision(dir, decision)?.state).toBe("granted");
   });
 
   test("an unreadable graders file is a refusal, never a match", async () => {

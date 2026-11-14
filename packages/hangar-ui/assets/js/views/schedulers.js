@@ -15,7 +15,7 @@
 
 import { api } from "../api.js";
 import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton } from "../dom.js";
-import { laneModels } from "../supervision.js";
+import { isWakeableLane, laneModels } from "../supervision.js";
 import { controlBtn } from "./control.js";
 import { jobButton } from "./jobs.js";
 
@@ -97,7 +97,7 @@ function laneCard(lane, headerReason, ctx, dir, reload) {
   ]);
 
   const actions = el("div", { class: "lane-actions" });
-  if (lane.lane === "heartbeat" || lane.lane === "schedule") {
+  if (isWakeableLane(lane.lane)) {
     actions.appendChild(
       controlBtn(
         "Wake",

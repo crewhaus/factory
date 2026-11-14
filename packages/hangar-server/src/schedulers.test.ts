@@ -184,6 +184,166 @@ describe("scheduler timeline", () => {
   rmSync(root, { recursive: true, force: true });
 });
 
+describe("named schedule lanes (#514)", () => {
+  const LIST_INDENTED = [
+    "name: lanes",
+    "target: channel",
+    "schedule:",
+    "  - name: weekly-report",
+    "    kind: cron",
+    '    cron: "0 17 * * 5"',
+    "    timezone: Europe/Berlin",
+    "    jitter: 1m",
+    "  - name: discovery",
+    "    kind: interval",
+    "    every: 2h",
+    "memory:",
+    "  recall: true",
+    "",
+  ].join("\n");
+  // YAML also allows the items at the key's own indent.
+  const LIST_COLUMN_0 = [
+    "name: lanes",
+    "target: channel",
+    "schedule:",
+    "- name: weekly-report",
+    "  kind: cron",
+    '  cron: "0 17 * * 5"',
+    "  timezone: Europe/Berlin",
+    "  jitter: 1m",
+    "- {name: discovery, kind: interval, every: 2h}",
+    "memory:",
+    "  recall: true",
+    "",
+  ].join("\n");
+  const LANES = [
+    { name: "discovery", cadence: "every 2h" },
+    { name: "weekly-report", cadence: 'cron "0 17 * * 5" Europe/Berlin ±1m' },
+  ];
+
+  test("the list form is read leniently, items indented or at column 0, in name order", () => {
+    expect(declaredCadences(LIST_INDENTED)).toEqual({ scheduleLanes: LANES });
+    expect(declaredCadences(LIST_COLUMN_0)).toEqual({ scheduleLanes: LANES });
+  });
+
+  test("an item whose trigger cannot be read still yields its lane", () => {
+    const spec = ["schedule:", "  - name: later", "    kind: someday", ""].join("\n");
+    expect(declaredCadences(spec)).toEqual({
+      scheduleLanes: [{ name: "later", cadence: "declared (no trigger read)" }],
+    });
+  });
+
+  const root = mkdtempSync(join(tmpdir(), "hangar-sched-lanes-"));
+  const dir = makeFixtureHarness(join(root, "h"), { specName: "lanes", noSpec: true });
+  writeFileSync(join(dir, "crewhaus.yaml"), LIST_INDENTED);
+  const status = (timers: ReadonlyArray<{ lane: string; cadence: string; nextDueAt?: string }>) =>
+    ({
+      protocol: "crewhaus.control.v1",
+      name: "lanes",
+      target: "channel",
+      pid: 1,
+      startedAt: "2026-08-03T00:00:00.000Z",
+      draining: false,
+      counters: { turns: 0, heartbeatTicks: 0, scheduleWakes: 0, janitorRuns: 0 },
+      timers,
+      channels: [],
+      pendingApprovals: 0,
+    }) as const;
+
+  for (const [label, yaml] of [
+    ["indented", LIST_INDENTED],
+    ["at column 0", LIST_COLUMN_0],
+  ] as const) {
+    test(`online (${label}): one pokeable row per lane, and no bare schedule row`, () => {
+      const view = buildSchedulersView({
+        harnessDir: dir,
+        specYaml: yaml,
+        target: "channel",
+        control: status([
+          {
+            lane: "schedule:discovery",
+            cadence: "every 7200000ms",
+            nextDueAt: "2026-08-03T02:00:00.000Z",
+          },
+          { lane: "schedule:weekly-report", cadence: 'cron "0 17 * * 5" Europe/Berlin' },
+        ]),
+      });
+      expect(view.lanes.map((l) => l.lane)).toEqual([
+        "heartbeat",
+        "schedule:discovery",
+        "schedule:weekly-report",
+        "dream",
+        "janitor",
+      ]);
+      const discovery = view.lanes.find((l) => l.lane === "schedule:discovery");
+      expect(discovery?.armed).toBe(true);
+      expect(discovery?.cadence).toBe("every 2h");
+      expect(discovery?.nextDueAt).toBe("2026-08-03T02:00:00.000Z");
+      expect(discovery?.pokeable).toBe(true);
+      expect(view.lanes.find((l) => l.lane === "schedule:weekly-report")?.pokeable).toBe(true);
+    });
+  }
+
+  test("offline: armed with the spec's cadence, not pokeable, with the control reason", () => {
+    const view = buildSchedulersView({
+      harnessDir: dir,
+      specYaml: LIST_INDENTED,
+      target: "channel",
+      controlReason: "no control port — the daemon is not running",
+    });
+    const named = view.lanes.filter((l) => l.lane.startsWith("schedule"));
+    expect(named.map((l) => [l.lane, l.armed, l.cadence, l.pokeable, l.pokeReason])).toEqual([
+      [
+        "schedule:discovery",
+        true,
+        "every 2h",
+        false,
+        "no control port — the daemon is not running",
+      ],
+      [
+        "schedule:weekly-report",
+        true,
+        'cron "0 17 * * 5" Europe/Berlin ±1m',
+        false,
+        "no control port — the daemon is not running",
+      ],
+    ]);
+  });
+
+  test("a lane the spec lists but the bundle did not arm says recompile", () => {
+    const view = buildSchedulersView({
+      harnessDir: dir,
+      specYaml: LIST_INDENTED,
+      target: "channel",
+      control: status([{ lane: "schedule:discovery", cadence: "every 7200000ms" }]),
+    });
+    const weekly = view.lanes.find((l) => l.lane === "schedule:weekly-report");
+    expect(weekly?.pokeable).toBe(false);
+    expect(weekly?.pokeReason).toContain("armed no schedule:weekly-report lane");
+  });
+
+  test("a lane only the daemon reports is listed from /status; a malformed one is not", () => {
+    const view = buildSchedulersView({
+      harnessDir: dir,
+      specYaml: "name: x\ntarget: channel\n",
+      target: "channel",
+      control: status([
+        { lane: "schedule:nightly", cadence: "every 86400000ms" },
+        { lane: "schedule:Bad", cadence: "every 1ms" },
+      ]),
+    });
+    const nightly = view.lanes.find((l) => l.lane === "schedule:nightly");
+    expect(nightly?.cadence).toBe("every 86400000ms");
+    expect(nightly?.cadenceSource).toBe("control");
+    expect(nightly?.pokeable).toBe(true);
+    expect(view.lanes.some((l) => l.lane === "schedule:Bad")).toBe(false);
+    // An object-form-or-absent spec keeps its bare schedule row.
+    expect(view.lanes.some((l) => l.lane === "schedule")).toBe(true);
+  });
+
+  rmSync(root, { recursive: true, force: true });
+});
+
 describe("bundle freshness (F-5)", () => {
   const root = mkdtempSync(join(tmpdir(), "hangar-fresh-"));
   const yaml = "name: fresh\ntarget: channel\n";

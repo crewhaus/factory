@@ -5,6 +5,7 @@ import {
   renderGateSkills,
 } from "@crewhaus/evaluation-service";
 import {
+  SCHEDULE_LANES_ARMED_VAR,
   renderControlDrain,
   renderControlImports,
   renderControlLane,
@@ -12,6 +13,7 @@ import {
   renderControlStart,
   renderControlTimer,
   renderPublicGateFetch,
+  renderScheduleLanes,
 } from "@crewhaus/gateway-protocol/control-codegen";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
@@ -1701,15 +1703,29 @@ function renderGateway(ir: IrChannelV0): string {
   // whenever `permissions.ask_mode` is not "deny".
   const approvalsOn = ir.permissions.askMode !== "deny";
   const gatewayApprovalImports = approvalsOn
-    ? '\nimport { resolveApproval } from "@crewhaus/channel-adapter-base";\nimport type { ApprovalStore, ApprovalAuditSink } from "@crewhaus/channel-adapter-base";\nimport { appendSettingsRule } from "@crewhaus/permission-engine";'
+    ? '\nimport { createApprovalActions } from "@crewhaus/channel-adapter-base";\nimport type { ApprovalStore, ApprovalAuditSink } from "@crewhaus/channel-adapter-base";'
+    : "";
+  // A click is decided by channel-adapter-base, once per gateway.
+  const gatewayApprovalActions = approvalsOn
+    ? `
+  // A click on an approval card is decided as the member the clicker is linked to.
+  const approvalActions =
+    config.approvals !== undefined
+      ? createApprovalActions({
+          approvals: config.approvals,
+          adapters: config.adapters,
+          sessionRouter: config.sessionRouter,
+          ...(config.auditSink !== undefined ? { auditSink: config.auditSink } : {}),
+        })
+      : undefined;`
     : "";
   const gatewayApprovalConfig = approvalsOn
     ? `
   /**
-   * G11 — the shared pending-approval store. The \`/<adapter>/actions\` route
-   * resolves a parked approval here on a button click; the parked turn (in the
-   * session-router) awaits the same store. Absent ⇒ the actions route ACKs and
-   * ignores (no approval surface).
+   * G11 — the shared pending-approval store. A click on the
+   * \`/<adapter>/actions\` route is decided on its session root; the parked turn
+   * (in the session-router) awaits the same store. Absent ⇒ the actions route
+   * ACKs and ignores (no approval surface).
    */
   approvals?: ApprovalStore;
   /** G48 — durable audit sink; an approval resolution appends one record. */
@@ -1717,8 +1733,8 @@ function renderGateway(ir: IrChannelV0): string {
     : "";
   const gatewayActionsBlock = approvalsOn
     ? `      // G11 — interactivity webhook (an Approve/Deny button click), verified
-      // with the SAME signing machinery as an events webhook and resolved via
-      // the shared store. Path: /<adapter>/actions.
+      // with the SAME signing machinery as an events webhook, then decided by
+      // channel-adapter-base. Path: /<adapter>/actions.
       const actionMatch = url.pathname.match(/^\\/([^/]+)\\/actions$/);
       if (actionMatch && actionMatch[1] !== undefined) {
         const actionAdapter = config.adapters.get(actionMatch[1]);
@@ -1734,46 +1750,10 @@ function renderGateway(ir: IrChannelV0): string {
           return new Response("invalid signature", { status: 401 });
         }
         const interaction = actionAdapter.parseInteraction(actionReq);
-        if (interaction.kind !== "approval_action" || config.approvals === undefined) {
+        if (interaction.kind !== "approval_action" || approvalActions === undefined) {
           return new Response("ok", { status: 200 });
         }
-        const by = actionAdapter.id + ":" + interaction.userId;
-        const resolved = await resolveApproval({
-          store: config.approvals,
-          approvalId: interaction.approvalId,
-          decision: interaction.decision,
-          by,
-          ...(interaction.always === true ? { always: true } : {}),
-          ...(config.auditSink !== undefined ? { auditSink: config.auditSink } : {}),
-        });
-        if (resolved === null) return new Response("unknown approval", { status: 200 });
-        // #383 — "Always allow": persist a standing settings-source rule for
-        // the tool BEFORE the resume re-drives the turn, so the re-driven run
-        // (and every later one) loads it at loop start and stops re-asking.
-        // Best-effort: the grant above already covers this exact call.
-        if (interaction.always === true) {
-          try {
-            appendSettingsRule(process.cwd(), { type: "alwaysAllow", pattern: resolved.toolName });
-          } catch (err) {
-            process.stderr.write("[gateway] standing-allow settings write failed: " + (err as Error).message + "\\n");
-          }
-        }
-        const ackApproval = actionAdapter.ackApproval;
-        if (ackApproval !== undefined) {
-          try {
-            await ackApproval({ interaction, decision: interaction.decision, by, toolName: resolved.toolName });
-          } catch (err) {
-            process.stderr.write("[gateway] approval ack error: " + (err as Error).message + "\\n");
-          }
-        }
-        // Resume runs off the ACK path so a slow re-drive can't stall the 3s
-        // interactivity response; the parked turn re-executes pre-resolved.
-        queueMicrotask(() => {
-          config.sessionRouter.resumeApproval(resolved, actionAdapter).catch((err) => {
-            process.stderr.write("[gateway] approval resume error: " + (err as Error).message + "\\n");
-          });
-        });
-        return new Response("ok", { status: 200 });
+        return approvalActions.handle(interaction, actionAdapter);
       }
 `
     : "";
@@ -1782,7 +1762,8 @@ function renderGateway(ir: IrChannelV0): string {
 // Channel-generic gateway: dispatches signed webhooks to the matching adapter.
 import { InMemoryDedupStore, type DedupStore } from "@crewhaus/durable-state";
 import { readRequestBodyCapped, resolveWebhookBodyLimit } from "@crewhaus/gateway-protocol/body-limit";
-import type { ChannelAdapter } from "@crewhaus/channel-adapter-slack";${gatewayApprovalImports}
+import type { ChannelAdapter } from "@crewhaus/channel-adapter-slack";
+import { handleInboundEvent } from "@crewhaus/channel-adapter-base";${gatewayApprovalImports}
 import type { SessionRouter } from "./session-router.js";
 
 export type GatewayConfig = {
@@ -1816,7 +1797,7 @@ export type Gateway = {
 export function createGateway(config: GatewayConfig): Gateway {
   const dedup: DedupStore =
     config.dedupStore ?? new InMemoryDedupStore({ capacity: config.dedupCapacity ?? 10_000 });
-  const maxBodyBytes = config.maxBodyBytes ?? resolveWebhookBodyLimit(process.env).maxBytes;
+  const maxBodyBytes = config.maxBodyBytes ?? resolveWebhookBodyLimit(process.env).maxBytes;${gatewayApprovalActions}
 
   return {
     async handle(req: Request): Promise<Response> {
@@ -1865,26 +1846,9 @@ ${gatewayActionsBlock}${gatewayMcpBlock}      // Match adapter by path prefix: /
         return new Response("ok", { status: 200 });
       }
 ${reactionBranch}
-      // event — atomic check-and-record so concurrent deliveries of the
-      // same key (platform retries, multi-process daemons on a durable
-      // store) collapse to exactly one handled event.
-      const seen = await dedup.remember(parsed.event.idempotencyKey);
-      if (seen) return new Response("duplicate", { status: 200 });
-      // Slack expects an ACK within 3 s (and Telegram/Discord/WhatsApp have
-      // similar tight inbound windows). Drive the model turn asynchronously
-      // so the model's inner-loop latency — and any transient API error —
-      // can't bubble into the webhook response. The channel adapter's own
-      // outbound (chat.postMessage, sendMessage, etc.) delivers the reply
-      // when the turn finishes. Errors are surfaced via stderr; the
-      // operator's observability stack catches them there.
-      queueMicrotask(() => {
-        config.sessionRouter.handle(parsed.event, adapter).catch((err) => {
-          process.stderr.write(
-            \`[gateway] handler error (\${parsed.event.idempotencyKey}): \${(err as Error).message}\\n\`,
-          );
-        });
-      });
-      return new Response("ok", { status: 200 });
+      // event — deduped, put on record, then acknowledged; the model turn runs
+      // off the request path (channel-adapter-base's handleInboundEvent).
+      return handleInboundEvent(parsed.event, adapter, { dedup, sessionRouter: config.sessionRouter });
     },
   };
 }
@@ -2363,9 +2327,43 @@ try {
   // channel bundles stay byte-identical.
   const scheduleImport = ir.schedule
     ? `import { armSchedule, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
-    : "";
+    : ir.scheduleLanes
+      ? `import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
+      : "";
   const schedScopeField =
-    ir.schedule && ir.continuity !== undefined ? `\n    continuityScope: "spec",` : "";
+    (ir.schedule || ir.scheduleLanes) && ir.continuity !== undefined
+      ? `\n    continuityScope: "spec",`
+      : "";
+  // The body of one schedule wake, for the single `schedule` lane and for each
+  // named lane alike: a fresh-session turn with that lane's prompt, logged
+  // under the lane's id.
+  const scheduleTickBody = (laneId: string, instructionsVar: string, tickVar: string): string =>
+    `${tickVar}++;${ir.gateway ? "\n__heartbeatCount++; // gateway /status wake counter (heartbeat + schedule)" : ""}
+const __sessionId = __tick.sessionId;
+const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
+process.stdout.write(\`[${laneId}] wake #\${${tickVar}}\${__origin} (session \${__sessionId})\\n\`);
+try {
+  const __out = await agent.runTurn({
+    sessionId: __sessionId,
+    isNew: true,
+    message: ${instructionsVar},${schedScopeField}
+  });
+  // Untrusted turn output on a pumped, machine-parsed stream — flattened to
+  // one bounded line (see the heartbeat lane).
+  const __preview = sanitizeControlText(__out, 200);
+  process.stdout.write(\`[${laneId}] → \${__preview}\\n\`);
+} catch (__err) {
+  // A classified terminal failure renders its full report; anything else
+  // keeps the bare line. Rethrown so the control lane records the wake's
+  // outcome as \`error\` for /control/v1/status; the lane absorbs it there,
+  // so the daemon keeps serving and armSchedule still re-arms.
+  if (isRunFailedError(__err)) {
+    process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[${laneId}]" })}\\n\`);
+  } else {
+    process.stderr.write(\`[${laneId}] error: \${(__err as Error).message}\\n\`);
+  }
+  throw __err;
+}`;
   const scheduleBoot = ir.schedule
     ? `
   // Loop contract 0.4 (Batch F) — schedule: wake loop (cron|interval + jitter)
@@ -2380,32 +2378,7 @@ ${renderControlLane({
   // reports the same arithmetic armSchedule itself uses (jitter aside).
   nextDueAtExpr: "new Date(Date.now() + nextWakeDelayMs(__scheduleSpec, Date.now())).toISOString()",
   indent: "  ",
-  body: `__scheduleTick++;${ir.gateway ? "\n__heartbeatCount++; // gateway /status wake counter (heartbeat + schedule)" : ""}
-const __sessionId = __tick.sessionId;
-const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
-process.stdout.write(\`[schedule] wake #\${__scheduleTick}\${__origin} (session \${__sessionId})\\n\`);
-try {
-  const __out = await agent.runTurn({
-    sessionId: __sessionId,
-    isNew: true,
-    message: __scheduleInstructions,${schedScopeField}
-  });
-  // Untrusted turn output on a pumped, machine-parsed stream — flattened to
-  // one bounded line (see the heartbeat lane).
-  const __preview = sanitizeControlText(__out, 200);
-  process.stdout.write(\`[schedule] → \${__preview}\\n\`);
-} catch (__err) {
-  // A classified terminal failure renders its full report; anything else
-  // keeps the bare line. Rethrown so the control lane records the wake's
-  // outcome as \`error\` for /control/v1/status; the lane absorbs it there,
-  // so the daemon keeps serving and armSchedule still re-arms.
-  if (isRunFailedError(__err)) {
-    process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[schedule]" })}\\n\`);
-  } else {
-    process.stderr.write(\`[schedule] error: \${(__err as Error).message}\\n\`);
-  }
-  throw __err;
-}`,
+  body: scheduleTickBody("schedule", "__scheduleInstructions", "__scheduleTick"),
 })}  const __schedule = armSchedule(__scheduleSpec, {
     onWake: async () => {
       await __scheduleLane.tick();
@@ -2420,6 +2393,30 @@ try {
 `
     : "";
   const scheduleShutdown = ir.schedule ? "\n      __schedule.cancel();" : "";
+
+  // Named schedule lanes (#514): the same wake body per lane, each its own
+  // control lane `schedule:<name>` on its own clock (`armScheduleLanes`), so a
+  // slow lane never holds up another. Absent `scheduleLanes` emits nothing.
+  const scheduleLanesBoot = ir.scheduleLanes
+    ? `
+  // Named schedule lanes: one wake loop per lane (cron|interval + jitter)
+  const __scheduleLaneTicks = [${ir.scheduleLanes.map(() => "0").join(", ")}];
+${renderScheduleLanes({
+  lanes: ir.scheduleLanes.map((lane) => ({
+    ...lane,
+    instructions: lane.instructions ?? "[scheduled wake] proceed with your standing instructions.",
+  })),
+  indent: "  ",
+  body: ({ laneId, index, instructionsVar }) =>
+    scheduleTickBody(laneId, instructionsVar, `__scheduleLaneTicks[${index}]`),
+  onErrorBody:
+    "process.stderr.write(`[schedule:${__name}] error: ${(__err as Error).message}\\n`);",
+  afterArm:
+    "for (const __l of __scheduleLanes) process.stdout.write(`[schedule:${__l.name}] armed (${__l.cadence})\\n`);",
+})}`
+    : "";
+  const scheduleLanesCancel = ir.scheduleLanes ? `${SCHEDULE_LANES_ARMED_VAR}?.cancel();` : "";
+  const scheduleLanesShutdown = ir.scheduleLanes ? `\n      ${scheduleLanesCancel}` : "";
 
   // Phase 3 §3.4 — gateway control-UI. When set, spawn a second
   // Bun.serve on the configured port serving a minimal status JSON
@@ -2689,7 +2686,7 @@ ${
     body: `process.stdout.write("[daemon] draining — intake stopped\\n");
 __janitor.stop();${ir.heartbeat ? "\nclearInterval(__heartbeatTimer);" : ""}${
       ir.schedule ? "\n__schedule.cancel();" : ""
-    }
+    }${ir.scheduleLanes ? `\n${scheduleLanesCancel}` : ""}
 // GRACEFUL stop (no closeActiveConnections): a channel turn runs INSIDE the
 // webhook request that carried it, so forcing connections shut here would
 // abort exactly the in-flight turns a drain exists to finish.
@@ -2707,7 +2704,7 @@ await runDrainSweep(() => __janitor.runOnce(), {
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: channel, ir version: ${ir.version}, file: daemon.ts)
-import { formatRunFailure, ${ir.heartbeat || ir.schedule ? "isRunFailedError, " : ""}toFailureReport } from "@crewhaus/errors";
+import { formatRunFailure, ${ir.heartbeat || ir.schedule || ir.scheduleLanes ? "isRunFailedError, " : ""}toFailureReport } from "@crewhaus/errors";
 ${extensionImports}
 ${adapterImports.join("\n")}
 import { registerChannelAdapter } from "@crewhaus/tool-message-channel";
@@ -2720,7 +2717,7 @@ import { resolveWebhookBodyLimit } from "@crewhaus/gateway-protocol/body-limit";
 import { createJanitor } from "@crewhaus/runtime-core";
 ${distill.imports}import { openAuditLog } from "@crewhaus/audit-log";
 import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
-${approvalsImport}${renderControlImports({ pendingApprovals: approvalsOn, drainSweep: true, logSafe: ir.heartbeat !== undefined || ir.schedule !== undefined })}import { join } from "node:path";
+${approvalsImport}${renderControlImports({ pendingApprovals: approvalsOn, drainSweep: true, logSafe: ir.heartbeat !== undefined || ir.schedule !== undefined || ir.scheduleLanes !== undefined })}import { join } from "node:path";
 
 ${startupEnvCheck}${observabilityEnvStamp}
 async function main(): Promise<void> {
@@ -2812,7 +2809,7 @@ ${controlJanitorTimer}
     fetch: ${renderPublicGateFetch({ innerExpr: "(req: Request) => gateway.handle(req)" })},
   });
   process.stdout.write(\`[daemon] listening on http://localhost:\${server.port}\\n\`);
-${exposeMcpBanner}${gatewayBoot}${heartbeatBoot}${scheduleBoot}${controlDrain}${controlStart}
+${exposeMcpBanner}${gatewayBoot}${heartbeatBoot}${scheduleBoot}${scheduleLanesBoot}${controlDrain}${controlStart}
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
@@ -2820,7 +2817,7 @@ ${exposeMcpBanner}${gatewayBoot}${heartbeatBoot}${scheduleBoot}${controlDrain}${
     process.stdout.write(\`[daemon] received \${signal}, shutting down...\\n\`);
     __janitor.stop();
     try {
-      await server.stop(true);${gatewayShutdown}${heartbeatShutdown}${scheduleShutdown}${mcpCleanup}${exposeMcpCleanup}
+      await server.stop(true);${gatewayShutdown}${heartbeatShutdown}${scheduleShutdown}${scheduleLanesShutdown}${mcpCleanup}${exposeMcpCleanup}
     } catch (err) {
       process.stderr.write(\`[daemon] shutdown error: \${(err as Error).message}\\n\`);
     }

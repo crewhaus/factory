@@ -78,8 +78,9 @@ export type PinOptions = {
   /** The command receipt this pin is made under, recorded on a `manual` re-anchor mark. */
   readonly receipt?: string;
   /**
-   * Pin only a run measured like the pin it replaces: a pin that would record a
-   * `manual` re-anchor is refused (`reanchor`), and the file is untouched.
+   * Pin only a run measured verifiably like the pin it replaces: an instrument
+   * field that differs, or is recorded on one side only, refuses the pin
+   * (`reanchor`, {@link sameInstrumentRefusal}), and the file is untouched.
    */
   readonly sameInstrumentOnly?: boolean;
   /**
@@ -234,19 +235,39 @@ export function manualRebaseline(
   return changed.length > 0 ? { from: replaced.runId, reason: "manual", cmd } : undefined;
 }
 
-/** Why a caller that pins only same-instrument runs refuses this one. */
+/**
+ * Why a caller that pins only same-instrument runs refuses this one: every field
+ * {@link instrumentChanges} reports, a field recorded on one side only named as such.
+ */
 export function reanchorRefusal(
   entry: RunIndexEntry,
   replaced: BaselineEntry | undefined,
 ): PinRefusal {
-  const changed =
-    replaced === undefined
-      ? []
-      : instrumentChanges(replaced, entry).filter((c) => c.unverified !== true);
+  const changed = replaced === undefined ? [] : instrumentChanges(replaced, entry);
+  const named = changed.map((c) =>
+    c.unverified === true ? `${c.field}, recorded on one side only` : c.field,
+  );
   return {
     code: "reanchor",
-    reason: `run ${entry.runId} was measured differently from the pinned run ${replaced?.runId ?? "(none)"}${changed.length > 0 ? ` (${changed.map((c) => c.field).join(", ")})` : ""} — moving the baseline onto it is a re-anchor, which a person makes: \`crewhaus eval --rebaseline --reason <code>\``,
+    reason: `run ${entry.runId} was measured differently from the pinned run ${replaced?.runId ?? "(none)"}${named.length > 0 ? ` (${named.join("; ")})` : ""} — moving the baseline onto it is a re-anchor, which a person makes: \`crewhaus eval --rebaseline --reason <code>\``,
   };
+}
+
+/**
+ * The refusal for pinning `entry` over `replaced` when only a run measured
+ * verifiably like the pinned one may replace it: `undefined` when nothing is
+ * replaced or it is the same run, else a `reanchor` refusal when any instrument
+ * field differs or is recorded on one side only ({@link instrumentChanges},
+ * unverified fields included).
+ */
+export function sameInstrumentRefusal(
+  entry: RunIndexEntry,
+  replaced: BaselineEntry | undefined,
+): PinRefusal | undefined {
+  if (replaced === undefined || replaced.runId === entry.runId) return undefined;
+  return instrumentChanges(replaced, entry).length > 0
+    ? reanchorRefusal(entry, replaced)
+    : undefined;
 }
 
 /**
@@ -271,10 +292,11 @@ export function pinRun(
   }
   let pinOpts: PinOptions = replaced !== undefined ? { ...opts, replaced } : opts;
   if (opts.rebaselined === undefined) {
-    const mark = manualRebaseline(replaced, entry, opts.cmd ?? "unknown");
-    if (mark !== undefined && opts.sameInstrumentOnly === true) {
-      return { ok: false, refusal: reanchorRefusal(entry, replaced) };
+    if (opts.sameInstrumentOnly === true) {
+      const refused = sameInstrumentRefusal(entry, replaced);
+      if (refused !== undefined) return { ok: false, refusal: refused };
     }
+    const mark = manualRebaseline(replaced, entry, opts.cmd ?? "unknown");
     if (mark !== undefined) {
       pinOpts = {
         ...pinOpts,

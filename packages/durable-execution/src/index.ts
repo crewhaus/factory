@@ -159,8 +159,11 @@ export { InMemoryIdempotencyStore };
 export {
   type ArmedSchedule,
   type ArmScheduleHandlers,
+  type ArmScheduleLanesHandlers,
   type WakeSchedule,
+  type WakeScheduleLane,
   armSchedule,
+  armScheduleLanes,
   nextCronMatch,
   nextWakeDelayMs,
 } from "./schedule";

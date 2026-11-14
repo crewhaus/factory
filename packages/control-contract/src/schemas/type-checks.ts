@@ -132,4 +132,5 @@ export type SchemaTypeChecks = [
   Expect<Same<z.infer<typeof S.tokenMintRequest>, T.TokenMintRequest>>,
   Expect<Same<z.infer<typeof S.tokenRow>, T.TokenRow>>,
   Expect<Same<z.infer<typeof S.trigger>, T.Trigger>>,
+  Expect<Same<z.infer<typeof S.triggerSource>, T.TriggerSource>>,
 ];

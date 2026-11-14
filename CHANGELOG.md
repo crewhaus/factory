@@ -149,11 +149,13 @@ these on: they reach every harness that uses what each one names.
   that script runs in turn); for `crewhaus run` or `crewhaus runs resume` of
   a spec in another directory, that directory's `.crewhaus/run/spec`; the `approvals.jsonl`
   beside session logs that `CREWHAUS_SESSION_DIR` puts at the working directory;
-  a managed run's whole tenants root; on a `managed` harness, the project memory
-  files the runtime loads at the working directory, `AGENTS.md`, `CLAUDE.md`,
-  `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`, exactly those files, and the
-  skill directories `.crewhaus/skills` and `~/.crewhaus/skills`, which an operator
-  edits; and Hangar's directory and registry:
+  a managed run's whole tenants root; on a `channel` or `managed` run, and in
+  the loops it starts, whose spec at the working directory has that target or
+  cannot be read, the project memory files the runtime loads there,
+  `AGENTS.md`, `CLAUDE.md`, `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`,
+  exactly those files, and the skill directories `.crewhaus/skills` and
+  `~/.crewhaus/skills`, which an operator edits; and Hangar's directory and
+  registry:
   `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always, and wherever the
   run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT` puts them. The floor
   also reads the directory a call keeps a tool's store in. In a working directory
@@ -188,6 +190,16 @@ these on: they reach every harness that uses what each one names.
   `crewhaus route freeze`. `Bash` and `RunCommand` remain outside what the
   floor can see. Recompile a daemon to pick this up.
 
+- **`crewhaus eval`, `crewhaus optimize` and `crewhaus serve` keep a spec's
+  records out of an agent's reach wherever the spec lives.** When the CLI's eval
+  runner or `crewhaus serve --mcp` starts an agent for a spec whose real
+  directory is not the working directory, under `crewhaus eval` (suites and
+  matrices included), `crewhaus optimize` (`--from-advice` included),
+  `crewhaus flywheel`, `crewhaus model-scan`, `crewhaus model right-size`,
+  `crewhaus deploy canary`, `crewhaus changes check` (for the spec the change
+  targets) or `crewhaus serve --mcp`, that directory's `.crewhaus/run/spec` is
+  on the runtime-state floor, as it is for `crewhaus run`.
+
 - **An approval covers the work it was asked in, and is used once.** A grant
   counts for the call it was asked about, in the conversation, batch job,
   scheduled lane or supervised job that asked, and only while the harness runs
@@ -198,11 +210,11 @@ these on: they reach every harness that uses what each one names.
   granted it can still approve at that level. Destructive tools, and tools that
   ask for a justification, need a maintainer or the owner once a harness has
   members. In a harness with members, a grant counts only when it names the
-  owner or a member: one made with a chat channel's buttons names no one, so the
-  call is asked again until it is granted with `crewhaus approvals grant` or in
-  Hangar. Cancelling a run withdraws the requests it was waiting on. A denied
-  call's message to the model names the role that denied it, never a person's
-  own words, and a parked run says to continue with `crewhaus runs resume`.
+  owner or a member: a chat channel's buttons count once the person who clicks
+  is linked to a member (`crewhaus access link`). Cancelling a run withdraws the
+  requests it was waiting on. A denied call's message to the model names the
+  role that denied it, never a person's own words, and a parked run says to
+  continue with `crewhaus runs resume`.
   Requests parked before the upgrade count for their conversation only, so a
   batch job or a scheduled lane parked before it asks once more.
 
@@ -373,6 +385,15 @@ these on: they reach every harness that uses what each one names.
   stops matching within a second, in a run already going too. A rule
   `.crewhaus/settings.json` holds with no record keeps working and `crewhaus
   approvals rules` lists it to narrow or remove. The file keeps its 0.8 shape.
+- **`crewhaus permissions suggest` proposes no rule whose value the credential
+  screen flags.** When the screen flags the value a recorded call's rule would
+  name (a token, a header whose name names a credential, a URL password, or a
+  variable or query key that names one), `crewhaus permissions suggest` and the
+  `PermissionsSuggest` tool propose no `alwaysAllow` for that tool, neither
+  scoped nor for the whole tool. They name the tool as skipped and never print
+  the value, so `--apply` never writes it to `.crewhaus/settings.json`. An
+  `alwaysAsk` for recurring denials is still proposed, for the whole tool. A
+  rule names a value of at most 8192 characters.
 - **A managed daemon records each run before its turn starts.** `runs.create` and
   `runs.continue` write content-free rows to `.crewhaus/run/control/runs/` with a
   canonical run id (`run_` and 26 characters) and the tenant: `running` before
@@ -397,6 +418,11 @@ these on: they reach every harness that uses what each one names.
   exits 21 and names the variable, so tenant data stays apart from the harness's
   own files. Set it to an absolute path such as `~/.crewhaus/tenants/<harness>`.
   Recompile a daemon to pick this up.
+- **A managed tenants root may neither be the harness directory nor contain
+  it.** A managed daemon whose spec declares a tool that works on files exits 21
+  and names `CREWHAUS_TENANTS_ROOT` when the root is the harness directory, lies
+  inside it or holds it, such as `..`. Give tenants a directory of their own,
+  such as `~/.crewhaus/tenants/<harness>`. Recompile a daemon to pick this up.
 - **On a `channel` or `managed` harness, a tool call that names the run records
   or the inputs waiting for a run or a decision is refused.** As with the
   credential files, an agent's tool call that names `.crewhaus/run/control/runs`
@@ -534,6 +560,82 @@ these on: they reach every harness that uses what each one names.
   settings file that is a link or whose real place is elsewhere (409, edit it
   in the harness's own directory), and one that an inspector exclusion or
   another registered harness holds (403), before it shows or writes anything.
+
+- **Trace spans nest from turn to tool to check.** A turn's model calls and
+  tool calls nest under the turn's span, and each tool call's checks
+  (`permission_decision`, `hook_fired`, `approval_requested`) nest under that
+  call's own span, also when calls run at once. A turn's start and end share
+  one span id. A sub-agent's run nests under the Task call that started it,
+  and side calls under the turn or the Consult call. A retried model call is
+  a sibling of the call it retries and names it: `retryOf` on its
+  `model_request`, `crewhaus.retry_of` on its OpenTelemetry span. OTLP traces
+  change shape, so a dashboard that expects a flat tree sees depth. Every line
+  a run writes to its session log carries `span`, the span it belongs to, and
+  each span a run closes writes a `span_closed` line: its kind, parent, start,
+  duration and how it ended. `CREWHAUS_RUN_STAMPS=0` drops the `span_closed`
+  lines and the `span` keys; the nesting stays.
+
+- **Every check writes a `verdict` line that names what it judged.** Each
+  permission, justification, egress, post-tool, hook, approval, rate-limit,
+  loop, evaluation and provability decision writes one `verdict` line to the
+  session log, bound to the run, the check's span, the tool call (its id and
+  its number in the run) and the keyed action digest the approvals decision
+  log uses for the same action. The line holds outcome codes, rule ids and
+  ids: never tool input or model text, and never a judge's or a hook's own
+  words. `permission_decision`, `hook_fired` and `approval_requested` carry
+  `toolUseId`. The `permission_justification_evaluated` and `egress_decision`
+  audit records carry `runId`, `sessionId`, `toolUseId` and `actionDigest`.
+  `CREWHAUS_RUN_STAMPS=0` drops the `verdict` lines.
+
+- **`crewhaus retire` ends what a harness could still do, and refuses while
+  its daemon runs.** With the daemon running, `crewhaus retire` stops nothing
+  and says so; `--stop` stops it first. Before the backup it leaves the
+  harness disabled, cancels its queued runs, expires its open approvals and
+  unspent grants, revokes its standing rules and runs each area's revoker.
+  After the archive the harness stays disabled where it lives, so nothing
+  starts it from its spec and bundle; then retire records `harness.retired`
+  in Home's lifecycle record (`control/lifecycle.jsonl` under Home's
+  directory) and marks the harness's registry row archived, so a group start
+  passes it by. A step that fails
+  stops the retire before anything is archived, and the harness stays
+  disabled until `crewhaus daemon enable`. The retire's receipt is kept in
+  Home's own ledger.
+
+- **A drain from Home always ends with the daemon stopped.** Home's
+  control-port drain goes through the supervisor, as its process drain does:
+  when the daemon refuses the call or cannot be reached, it is stopped by
+  signal, and the answer adds `stopped` and `viaSignal: true`. The request
+  answers once the daemon has exited.
+
+- **The tarballs `crewhaus state backup` and `crewhaus retire` write leave a
+  harness's run tokens out, and are `0600`.**
+  `.crewhaus/run/gateway-jwt-secret`, `.crewhaus/run/control-token` and
+  `.crewhaus/run/mcp-token` are made again at every start, so a restore loses
+  nothing. `crewhaus state backup --include <glob>` keeps one, with a warning.
+  The tarball is readable only by its owner. `crewhaus retire` also leaves them
+  out of the state it keeps in its `--archive` directory.
+
+- **A Slack click decides an approval only for a linked member whose role can
+  decide it.** An Approve, Always allow or Deny click on a channel daemon's card
+  counts once the clicker's Slack account is linked (`crewhaus access link
+  slack:<team>:<user> --member <name>`), as that member, and only when their
+  role reaches what the request needs; anyone else is told how to link and
+  nothing is decided. Always allow from the owner makes a rule for exactly that
+  call for 30 days; from anyone else it allows the call once and asks the owner.
+  Approve appears only when the whole request fits the card; otherwise the card
+  links to Home. A grant made in Home or with `crewhaus approvals` on a card with
+  buttons continues the waiting reply in its thread. Recompile a daemon to pick
+  this up.
+
+- **A channel message is on record before it is acknowledged.** For each
+  accepted message a channel daemon appends content-free run rows to
+  `.crewhaus/run/control/runs/` before it answers the platform; one cut off
+  before its turn starts shows as not processed. `CREWHAUS_RUN_LEDGER=0` turns
+  it off with the other run rows. Recompile a daemon to pick this up.
+
+- **Slack approval clicks are answered once the decision is recorded.** The
+  card update, the follow-up and the continued reply happen after the answer.
+  Recompile a daemon to pick this up.
 
 ## [0.8.2] - 2026-11-12
 

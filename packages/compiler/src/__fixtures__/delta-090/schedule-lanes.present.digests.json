@@ -1,0 +1,18 @@
+{
+  "batch-lanes": {
+    "agent.ts": "660eb39babcd0be6b40511b7c0d92fc811b57e68ac14cfd209685454488601c1",
+    "README.md": "2137bf49f0fdb845998cf61a7a66224bc99b64109562b730934d4a16e035614d"
+  },
+  "channel-lanes": {
+    "agent.ts": "bfebf6a53ea9b773c109471a198d912a498cd28950498343649a7b45eb23d603",
+    "session-router.ts": "d712670e1b9f733c5194a0bde65d6f5ca1d97e9779949a9221dd957a39a793d9",
+    "gateway.ts": "9c1ddd78ed9d5538bab1a64430931da42138c2b2bbcd07d54b7e15f3bb89e379",
+    "daemon.ts": "b5ffa8e2b3e766a6b0cb8c63904ebf458996319c972f81c7d4a1bfa8ab627a94",
+    "README.md": "5e4ef406ed614d645422bf50c0cb484b5b3a6b48439be80be60df3d662b7e04f"
+  },
+  "managed-lanes": {
+    "agent.ts": "1385df3f2d18c5b902d3ba57f8079fbe317facd1b3a73a3bef2324425f0452c6",
+    "daemon.ts": "322d15a8ffa1fa5d19a336f0a1e4ffb3436651f8acae165e5c2e4c5b95549255",
+    "README.md": "79ed7c2dd168a6922763833103f033dff5d08c6f20b0d35b560cb85bd037ce90"
+  }
+}

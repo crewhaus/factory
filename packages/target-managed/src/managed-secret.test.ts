@@ -38,7 +38,7 @@ const BANNER = /\[managed\] gateway listening on 127\.0\.0\.1:(\d+)/;
 const SAVED_LINE =
   "[managed] no CREWHAUS_GATEWAY_JWT_SECRET in env, so this run generated one and saved it to .crewhaus/run/gateway-jwt-secret.";
 const REFUSAL =
-  "[managed] this spec declares a tool that works on files, so CREWHAUS_TENANTS_ROOT must be outside the harness directory";
+  "[managed] this spec declares a tool that works on files, so CREWHAUS_TENANTS_ROOT must neither be the harness directory nor contain it";
 const ENV_SECRET = ["managed", "secret", "0".repeat(16)].join("-");
 
 const ir: IrManagedV0 = {
@@ -366,6 +366,32 @@ describe("where the tenants root belongs", () => {
       expect(run.base).toBeUndefined();
       expect(run.output()).toContain(REFUSAL);
       // Refused before the secret: nothing was saved.
+      expect(existsSync(secretPath(root))).toBe(false);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "with a path-taking tool: a root that holds the harness exits 21 with the refusal, and serves nothing",
+    async () => {
+      const root = makeHarness(withRead);
+      const run = await boot(root, { CREWHAUS_TENANTS_ROOT: ".." });
+      expect(run.exitCode).toBe(21);
+      expect(run.base).toBeUndefined();
+      expect(run.output()).toContain(REFUSAL);
+      expect(existsSync(secretPath(root))).toBe(false);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "with a path-taking tool: a root inside the harness whose name starts with two dots exits 21",
+    async () => {
+      const root = makeHarness(withRead);
+      const run = await boot(root, { CREWHAUS_TENANTS_ROOT: "..tenants" });
+      expect(run.exitCode).toBe(21);
+      expect(run.base).toBeUndefined();
+      expect(run.output()).toContain(REFUSAL);
       expect(existsSync(secretPath(root))).toBe(false);
     },
     TEST_TIMEOUT_MS,

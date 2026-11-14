@@ -956,6 +956,29 @@ test("EvalBaselinePin pins only a run measured like the pin it replaces; a re-an
   }
 });
 
+test("EvalBaselinePin pins only a run whose instrument is verifiably the same: a field recorded on one side only is refused at plan time", async () => {
+  writeRun(root, "r2", { samples: [sample({ sampleId: "a" })] });
+  writeIndex(root, [
+    row({ runId: "r1", ts: "2026-01-01T00:00:00Z" }),
+    row({ runId: "r2", ts: "2026-01-02T00:00:00Z", gradersHash: undefined }),
+  ]);
+  writeBaselines(root, { "shop::smoke": pin(row({ runId: "r1", ts: "2026-01-01T00:00:00Z" })) });
+  const before = readFileSync(baselinesPath(), "utf8");
+  for (const dryRun of [true, false]) {
+    const out = await call(evalBaselinePin, {
+      action: "set",
+      spec: "shop",
+      dataset: "smoke",
+      runId: "r2",
+      dryRun,
+    });
+    expect(out["ok"]).toBe(false);
+    expect(out["code"]).toBe("refused");
+    expect(String(out["error"])).toContain("gradersHash, recorded on one side only");
+    expect(readFileSync(baselinesPath(), "utf8")).toBe(before);
+  }
+});
+
 test("EvalBaselinePin still pins a run measured with the same instrument", async () => {
   writeRun(root, "r2", { samples: [sample({ sampleId: "a" })] });
   writeIndex(root, [
