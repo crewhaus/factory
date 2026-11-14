@@ -29,7 +29,7 @@ import {
   readPluginInventory,
   revokePlugin,
   standingFrom,
-} from "@crewhaus/hangar-server";
+} from "@crewhaus/hangar-server/plugin-grants";
 import { openHangarRegistry, resolveHangarRoot } from "@crewhaus/harness-registry";
 import { type DaemonCommandOptions, directControl } from "./daemon-cmd";
 

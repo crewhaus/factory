@@ -44,6 +44,10 @@ import {
   pluginSeesHarness,
 } from "./plugins";
 
+// What `crewhaus plugins grants|grant|revoke` reads beside the ledger, through this
+// module's own subpath, so the CLI writes the same rows as Home without taking the server.
+export { type PluginRow, readPluginInventory } from "./plugins";
+
 /** The plugin grants ledger under the Hangar root, with its own lock and claims. */
 export function pluginGrantsLedger(hangarRoot: string): Ledger {
   return {
