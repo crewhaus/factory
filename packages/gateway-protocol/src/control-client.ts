@@ -30,6 +30,7 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { isLaneId } from "@crewhaus/control-contract";
 import {
   CONTROL_PATH_PREFIX,
   CONTROL_PROTOCOL,
@@ -42,10 +43,16 @@ import {
 
 export type { ControlLane, ControlTimerReport };
 
+/**
+ * The two fixed lane ids. A daemon may also arm one `schedule:<name>` lane per
+ * named schedule (#513), which this list does not hold: {@link isControlLane}
+ * is the test for any lane id.
+ */
 export const CONTROL_LANES: readonly ControlLane[] = ["heartbeat", "schedule"];
 
+/** `heartbeat`, `schedule` or `schedule:<name>`: the daemon's own check, so the two cannot drift. */
 export function isControlLane(value: string): value is ControlLane {
-  return (CONTROL_LANES as readonly string[]).includes(value);
+  return isLaneId(value);
 }
 
 /** Why a control call did not succeed. Every one is renderable as a sentence. */
@@ -68,6 +75,9 @@ export type ControlRefusalCode =
   | "paused"
   /** 409 `disabled` — the operator disabled this harness; nothing new starts. */
   | "disabled"
+  /** 404 on a route this daemon's build does not serve (`operator/reload` on a bundle
+   *  built before it). A fact about the bundle: rebuild it to get the route. */
+  | "unsupported_by_bundle"
   /** 401 — the token on disk is not the one the daemon is using. */
   | "unauthorized"
   /** Anything else the daemon answered. */
@@ -138,6 +148,16 @@ export type ControlDrainBody = {
   readonly alreadyDraining: boolean;
 };
 
+/** The `/control/v1/operator/reload` body: the operator record the daemon enforces now. */
+export type ControlReloadBody = {
+  readonly operator: {
+    readonly rev: number | null;
+    readonly paused: boolean;
+    readonly disabled: boolean;
+    readonly unreadable: boolean;
+  };
+};
+
 /** Where to reach one harness's control plane. */
 export type ControlTarget = {
   readonly harnessDir: string;
@@ -165,6 +185,12 @@ export type ControlClient = {
     args: { readonly lane: ControlLane; readonly reason?: string; readonly by?: string },
   ): Promise<ControlResult<ControlWakeBody>>;
   drain(target: ControlTarget): Promise<ControlResult<ControlDrainBody>>;
+  /**
+   * Ask the daemon to read the operator record now. A bundle built before the route
+   * answers 404, which is `unsupported_by_bundle`: the record is written, and that
+   * build does not enforce it.
+   */
+  reload(target: ControlTarget): Promise<ControlResult<ControlReloadBody>>;
 };
 
 export const DEFAULT_CONTROL_TIMEOUT_MS = 5_000;
@@ -236,7 +262,8 @@ const refusal = (
     code === "lane_not_armed" ||
     code === "draining" ||
     code === "paused" ||
-    code === "disabled",
+    code === "disabled" ||
+    code === "unsupported_by_bundle",
 });
 
 /** Map a non-2xx control response onto a typed refusal. */
@@ -299,7 +326,12 @@ export function createControlClient(options: ControlClientOptions = {}): Control
   const call = async <T>(
     target: ControlTarget,
     route: string,
-    init: { readonly method: string; readonly body?: unknown },
+    init: {
+      readonly method: string;
+      readonly body?: unknown;
+      /** A 404 here means the bundle has no such route. */
+      readonly notFoundIsBundle?: boolean;
+    },
     lane?: ControlLane,
   ): Promise<ControlResult<T>> => {
     const port = target.controlPort;
@@ -346,6 +378,13 @@ export function createControlClient(options: ControlClientOptions = {}): Control
     } catch {
       body = undefined;
     }
+    if (!res.ok && res.status === 404 && init.notFoundIsBundle === true) {
+      return refusal(
+        "unsupported_by_bundle",
+        404,
+        "this daemon's build predates the route — recompile it to enable it",
+      );
+    }
     if (!res.ok) return classifyFailure(res.status, body, lane);
     return { ok: true, status: res.status, body: body as T };
   };
@@ -370,5 +409,10 @@ export function createControlClient(options: ControlClientOptions = {}): Control
     // exit as an operator stop, or the supervisor reads a graceful drain as
     // "exited cleanly (unexpected)" and restarts what was just shut down.
     drain: (target) => call<ControlDrainBody>(target, "/drain", { method: "POST" }),
+    reload: (target) =>
+      call<ControlReloadBody>(target, "/operator/reload", {
+        method: "POST",
+        notFoundIsBundle: true,
+      }),
   };
 }

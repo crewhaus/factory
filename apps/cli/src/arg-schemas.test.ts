@@ -154,6 +154,12 @@ describe("the knowledge-editing verbs' flags parse", () => {
     ).toBe("2026-11-01T00-00-00");
   });
 
+  test("state backup --include", () => {
+    expect(
+      parseArgs(["backup", "--include", "run/mcp-token"], SCHEMAS.STATE_SCHEMA).flags["include"],
+    ).toBe("run/mcp-token");
+  });
+
   test("lessons retire --reason", () => {
     expect(
       parseArgs(["retire", "l0123456789abcdef", "--reason", "wrong"], SCHEMAS.LESSONS_SCHEMA).flags[

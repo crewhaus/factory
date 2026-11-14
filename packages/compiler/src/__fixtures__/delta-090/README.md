@@ -5,6 +5,23 @@ for each spec in [`../../absent-corpus.ts`](../../absent-corpus.ts): one minimal
 It pins the rule from [#514](https://github.com/crewhaus/factory/issues/514) that a spec which does not
 declare a new key compiles to the same bytes. `delta-090-absent.test.ts` holds it.
 
+## The schedule object form
+
+`schedule-object.digests.json` pins the same thing for six specs in
+[`../../schedule-corpus.ts`](../../schedule-corpus.ts): the channel, managed and batch specs above, each
+with a cron `schedule:` object (timezone, jitter and instructions) and an interval one. It was
+generated before `schedule:` took a list, so the list form cannot move a byte of a spec that keeps the
+object form. `schedule-lanes.test.ts` holds it. Regenerate it under the same rule as the absent corpus.
+
+## The schedule list form
+
+`schedule-lanes.present.digests.json` pins what the list form compiles to: the same three specs, each
+with two named lanes declared out of name order (`weekly-report`, a cron lane whose instructions hold a
+quote, a backtick, `${x}` and a newline; then `discovery`, an interval lane). Unlike the files above it
+pins a feature that is present, so a deliberate change to how named lanes are emitted moves it:
+regenerate it in that pull request and add a delta note below. A change that moves it while touching
+nothing about named lanes is the same bug as above.
+
 ## When to regenerate
 
 Only for a deliberate emitter change, and never to quiet a failure you cannot explain. A pull request
@@ -39,3 +56,10 @@ registry and the signing-secret bootstrap delegate to `@crewhaus/gateway-server/
 daemon starts and stops the queued-run follower with the gateway. Imports follow. The tenants-root
 check is emitted only for a spec that declares a tool that works on files, which the managed spec here
 does not. No other digest moves.
+
+**Channel delegation delta — `channel`'s `gateway.ts` only.** The gateway hands its actions route to
+`createApprovalActions(…).handle(interaction, actionAdapter)` after its capped read, `verify()` and
+`parseInteraction`, and its events route to `handleInboundEvent(parsed.event, adapter, {dedup,
+sessionRouter})` after its handshake, capped read, `verify()` and `parseInbound`, both from
+`@crewhaus/channel-adapter-base`; it imports nothing from `@crewhaus/permission-engine`. No other
+digest moves.

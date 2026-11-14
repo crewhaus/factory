@@ -52,7 +52,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan really reads the sources", () => {
-    expect(SOURCES.length).toBe(21);
+    expect(SOURCES.length).toBe(23);
     expect(imports.length).toBeGreaterThan(40);
     expect(imports.some((i) => i.path === "node:fs")).toBe(true);
     expect(imports.some((i) => i.path === "@crewhaus/tool-safety/fs")).toBe(true);
@@ -116,6 +116,13 @@ describe("what the package exports", () => {
         "acquireMutatingLease",
         "append",
         "appendClaim",
+        "appendPreparingRun",
+        "CHANNEL_CONVERSATION_LABEL",
+        "CHANNEL_MESSAGE_LABEL",
+        "CHANNEL_SENDER_LABEL",
+        "newestRunRows",
+        "RUN_ROW_PAGE_LINES",
+        "settleUnstartedRun",
         "assertRunnable",
         "casAppend",
         "casAppendLocked",
@@ -171,6 +178,7 @@ describe("what the package exports", () => {
         "withMutatingLease",
         "writeHarnessIdentity",
         "writeHeartbeat",
+        "writeOperatorRecord",
       ].sort(),
     );
   });
@@ -285,6 +293,7 @@ describe("no field name is one the masker would redact", () => {
         operatorRev: 1,
         paused: false,
         disabled: false,
+        operatorUnreadable: false,
         activeRuns: 0,
         runLedger: true,
       } as const;
@@ -313,6 +322,7 @@ describe("no field name is one the masker would redact", () => {
         "claims",
         "heartbeatFile",
         "operatorRev",
+        "operatorUnreadable",
         "activeRuns",
         "runLedger",
         "exitName",

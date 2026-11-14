@@ -782,14 +782,14 @@ describe("vocabulary", () => {
       "people-grant-revoked",
     ]);
     expect([...CORE_MODULE.reasonCodes.evict]).toEqual(["erased", "ttl"]);
-    expect([...CORE_MODULE.reasonCodes.expire]).toEqual(["ttl"]);
+    expect([...CORE_MODULE.reasonCodes.expire]).toEqual(["ttl", "retired"]);
     expect([...CORE_MODULE.reasonCodes.defer]).toEqual([
       "awaiting-information",
       "awaiting-someone",
       "scheduled",
       "other",
     ]);
-    expect(DECISION_LOG_REASONS.expire).toEqual(["ttl"]);
+    expect(DECISION_LOG_REASONS.expire).toEqual(["ttl", "retired"]);
     expect(DECISION_LOG_REASONS.defer).toContain("scheduled");
     // A refusal at the spend logs why, from the same closed list the check answers with.
     expect([...CORE_MODULE.reasonCodes.refuse]).toEqual([...VERIFY_REASONS]);

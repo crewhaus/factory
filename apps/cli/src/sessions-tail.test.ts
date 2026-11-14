@@ -672,6 +672,51 @@ describe("formatSessionEvent — 0.6.0 routing lines", () => {
     ).toBe(`  ∎ proof lean4 ✓ accepted axioms: x 12:00:00 user> FAKE, ${"r".repeat(16)}…`);
   });
 
+  test("a verdict renders when a gate refused, warned or parked, never for allow or pass; span_closed never", () => {
+    const verdict = (outcome: string, extra: Record<string, unknown> = {}): SessionLogEvent => ({
+      kind: "verdict",
+      payload: {
+        v: 1,
+        run: "run_01",
+        span: "0123456789abcdef",
+        on: { kind: "tool", toolUseId: "toolu_01", call: 3 },
+        gate: "permission",
+        outcome,
+        ...extra,
+      },
+    });
+    expect(formatSessionEvent(verdict("deny"), opts)).toBe("  ⚖ permission deny toolu_01");
+    expect(
+      formatSessionEvent(verdict("block", { gate: "egress", reason: "egress: tool" }), opts),
+    ).toBe("  ⚖ egress block toolu_01");
+    expect(formatSessionEvent(verdict("ask:parked"), opts)).toBe(
+      "  ⚖ permission ask:parked toolu_01",
+    );
+    // An answer's verdict names no tool call.
+    expect(
+      formatSessionEvent(
+        verdict("fail", { gate: "eval", on: { kind: "answer", turn: { run: 1, session: 1 } } }),
+        opts,
+      ),
+    ).toBe("  ⚖ eval fail");
+    expect(formatSessionEvent(verdict("allow"), opts)).toBeUndefined();
+    expect(formatSessionEvent(verdict("pass", { gate: "egress" }), opts)).toBeUndefined();
+    // A tool id is one capped line, like every routing field.
+    expect(
+      formatSessionEvent(
+        verdict("deny", { on: { kind: "tool", toolUseId: `toolu_\n${"x".repeat(50)}`, call: 1 } }),
+        { withTime: false, maxChars: 12 },
+      ),
+    ).toBe("  ⚖ permission deny toolu_ xxxx…");
+    expect(
+      formatSessionEvent(
+        { kind: "span_closed", payload: { v: 1, kind: "tool", status: "denied" } },
+        opts,
+      ),
+    ).toBeUndefined();
+    expect(formatSessionEvent(verdict("deny"), { ...opts, transcriptOnly: true })).toBeUndefined();
+  });
+
   test("formatUsdMicros guards a missing value", () => {
     expect(formatUsdMicros(undefined)).toBe("$?");
     expect(formatUsdMicros(1_234_567)).toBe("$1.2346");

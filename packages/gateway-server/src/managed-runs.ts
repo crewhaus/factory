@@ -25,7 +25,8 @@
  * run runs. The file holds the input and the subject only until the run leaves
  * `queued`: the follower removes it once it has read it, and `runs.cancel`
  * removes a cancelled run's. A queued run survives a restart: the next start
- * claims it.
+ * claims it. An input with no row past {@link ORPHAN_INPUT_GRACE_MS} is removed
+ * and never looked at again.
  *
  * The handler is branded (`MANAGED_RUN_HANDLER`), so the gateway hands it the
  * verdict on the run input it classified at "api", and the handler records a
@@ -55,7 +56,7 @@ import {
   writeSync,
 } from "node:fs";
 import { hostname } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AuditLog } from "@crewhaus/audit-log";
 import { boundaryRuleIds, classifyBoundary } from "@crewhaus/boundary-classifier";
 import {
@@ -116,6 +117,17 @@ export const RUN_BUS_CAP = 256;
 /** How often the follower looks for queued runs when no control port can wake it. */
 export const CLAIM_POLL_MS = 2000;
 
+/**
+ * How old a queued run's input file with no row must be before the follower
+ * removes it. {@link queueManagedRun} writes the input before its `queued`
+ * row, so a younger one is left alone: its row may be about to land. Well
+ * above that gap, and above clock skew on a shared volume.
+ */
+export const ORPHAN_INPUT_GRACE_MS = 5 * 60_000;
+
+/** The longest `CREWHAUS_REPLICA_ID` a claim records (a pod name's limit). */
+const REPLICA_ID_MAX = 253;
+
 /** The most bytes of a queued run's input file read back. */
 const INPUT_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -142,7 +154,7 @@ export type ManagedTurnArgs = {
 export type ManagedTurn = { readonly reply: string; readonly proof?: unknown };
 
 /** The control plane pieces the runs use. The emitted `__control` satisfies it. */
-export type ManagedControl = Pick<ControlPlane, "onClaim"> & {
+export type ManagedControl = Pick<ControlPlane, "onClaim" | "onActiveRuns"> & {
   readonly counters: { turns: number };
 };
 
@@ -226,8 +238,35 @@ const NO_ROWS: RunRows = { end: async () => undefined };
 /** A run this process is running, as `runs.cancel` finds it. */
 type LiveRun = { readonly tenantId: string; cancelled: boolean; ctx?: RunContext };
 
-/** The process a run's claim names, as `holderProvablyDead` reads it. */
-type Holder = { readonly pid: number; readonly host: string; readonly startedAtMs?: number };
+/**
+ * The process a run's claim names. `replica` is the replica that holds it; a
+ * claim without one is keyed by its `host`.
+ */
+type Holder = {
+  readonly pid: number;
+  readonly host: string;
+  readonly replica?: string;
+  readonly startedAtMs?: number;
+};
+
+/** The replica a holder's claim names. */
+function replicaKey(holder: Holder): string {
+  return holder.replica ?? holder.host;
+}
+
+/**
+ * This process's replica id: `CREWHAUS_REPLICA_ID` when it is a non-empty name
+ * of at most 253 characters with no control characters, else the host name.
+ */
+function replicaIdFrom(env: Readonly<Record<string, string | undefined>>, host: string): string {
+  const raw = env["CREWHAUS_REPLICA_ID"];
+  if (typeof raw !== "string" || raw === "" || raw.length > REPLICA_ID_MAX) return host;
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return host;
+  }
+  return raw;
+}
 
 /**
  * The subject a verified token names, as a run serves it: `app:<tenant>:<sub>`.
@@ -260,11 +299,12 @@ function endingOf(err: unknown, ctx: RunContext): Ending {
 }
 
 function holderOf(record: LedgerRecord): Holder | undefined {
-  const { pid, host, startedAtMs } = record as Partial<Record<string, unknown>>;
+  const { pid, host, replica, startedAtMs } = record as Partial<Record<string, unknown>>;
   if (!Number.isSafeInteger(pid) || typeof host !== "string") return undefined;
   return {
     pid: pid as number,
     host,
+    ...(typeof replica === "string" ? { replica } : {}),
     ...(typeof startedAtMs === "number" ? { startedAtMs } : {}),
   };
 }
@@ -461,9 +501,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
   const ledgerOn = env["CREWHAUS_RUN_LEDGER"] !== "0";
   const ledger = runsLedger(harnessDir);
   const host = hostname();
-  // A claim this process's pid holds, made before this process started, was made
-  // by an earlier process on a reused pid (a container's pid 1, restarted).
-  const bootedAt = Date.now();
+  const replicaId = replicaIdFrom(env, host);
   const execution = env["CREWHAUS_EXECUTION_ID"];
   const executionField =
     execution !== undefined && EXECUTION_RUN_ID_RE.test(execution) ? { execution } : {};
@@ -481,6 +519,9 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
   let started = false;
   let stopped = false;
   let timer: ReturnType<typeof setInterval> | undefined;
+  // Registered at construction, so the count holds with run rows off and the
+  // first beat counts. A count, not a hold: admission reads holds.
+  opts.control?.onActiveRuns(() => live.size);
 
   const stamp = (): string => new Date(now()).toISOString();
 
@@ -501,6 +542,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     return {
       pid: process.pid,
       host,
+      replica: replicaId,
       ...(startedAtMs !== undefined ? { startedAtMs } : {}),
     };
   }
@@ -788,7 +830,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     return { ok: true };
   }
 
-  /** Mark `interrupted` each run a dead process of this host left `running`. */
+  /** Mark `interrupted` each run a provably gone process of this replica left `running`. */
   function sweep(): void {
     const folded = foldStates(ledger);
     if (!folded.ok) {
@@ -802,11 +844,23 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
       if (!claim.ok) continue;
       const holder = holderOf(claim.content.record);
       if (holder === undefined) continue;
+      // A claim on this replica and this pid, made before this process started,
+      // was made by an earlier process on a reused pid (a container's pid 1,
+      // restarted). Only when the probe cannot tell processes on one pid apart
+      // by start time; when it can, `holderProvablyDead` compares them.
       const reusedPid =
-        holder.host === host &&
+        replicaKey(holder) === replicaId &&
         holder.pid === process.pid &&
-        Date.parse(claim.content.at) < bootedAt;
-      if (!reusedPid && !holderProvablyDead(holder, probe, host)) continue;
+        probe.startTimeMs(process.pid) === undefined &&
+        Date.parse(claim.content.at) < performance.timeOrigin;
+      const judged = {
+        pid: holder.pid,
+        host: replicaKey(holder),
+        ...(holder.startedAtMs !== undefined ? { startedAtMs: holder.startedAtMs } : {}),
+      };
+      // A holder on another replica is never probed: a pid means nothing across
+      // pid namespaces.
+      if (!reusedPid && !holderProvablyDead(judged, probe, replicaId)) continue;
       const written = append(ledger, {
         id: object.id,
         state: "interrupted",
@@ -913,7 +967,8 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
    * The runs a claim pass looks at: one input file each (a queued run's input
    * is written before its row), less those this process saw leave `queued` or
    * found not its own, so a daemon with nothing queued reads one directory and
-   * folds nothing.
+   * folds nothing. An input with no row past the grace period is removed and
+   * never looked at again.
    */
   function claimCandidates(): string[] {
     let names: string[];
@@ -926,6 +981,17 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
       .filter((name) => name.endsWith(".json"))
       .map((name) => name.slice(0, -".json".length))
       .filter((id) => CANONICAL_RUN_ID_RE.test(id) && !settled.has(id));
+  }
+
+  /** Whether a rowless input is past the grace period, by its own mtime (a link's, never its target's). */
+  function orphaned(runId: string): boolean {
+    try {
+      const file = join(harnessDir, controlPaths(harnessDir).inputsDir, `${runId}.json`);
+      return now() - lstatSync(file).mtimeMs > ORPHAN_INPUT_GRACE_MS;
+    } catch {
+      // Gone already, or not readable: the next listing decides.
+      return false;
+    }
   }
 
   async function claimQueued(): Promise<void> {
@@ -941,8 +1007,16 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     for (const id of candidates) {
       if (stopped) break;
       const object = folded.objects.get(id);
-      // Its row is not written yet: the next pass looks again.
-      if (object === undefined) continue;
+      if (object === undefined) {
+        // Past the grace period, an input with no row is an orphan: removed, and
+        // never looked at again (one that cannot be removed warns once).
+        // Younger, its row may not be written yet: the next pass looks again.
+        if (orphaned(id)) {
+          forgetInput(id);
+          settled.add(id);
+        }
+        continue;
+      }
       const tenantId = object.record["tenant"];
       const deployment = object.record["deployment"];
       if (object.state !== "queued") {
@@ -1118,17 +1192,22 @@ function onDisk(path: string): string {
 
 /**
  * For a spec that declares a tool that works on files: the refusal message
- * when the tenants root is the harness directory or lies inside it, found on
- * disk (a root named through a link, or one that does not exist yet, is
- * compared by where it lands), else `undefined`.
+ * when the tenants root is the harness directory, lies inside it or contains
+ * it (such as `..`), found on disk (a root named through a link, or one that
+ * does not exist yet, is compared by where it lands), else `undefined`.
  */
 export function checkTenantsRoot(opts: {
   readonly cwd: string;
   readonly tenantsRoot: string;
 }): string | undefined {
-  const fromCwd = relative(onDisk(opts.cwd), onDisk(resolve(opts.cwd, opts.tenantsRoot)));
-  const inside = fromCwd === "" || (!fromCwd.startsWith("..") && !isAbsolute(fromCwd));
-  return inside
-    ? "[managed] this spec declares a tool that works on files, so CREWHAUS_TENANTS_ROOT must be outside the harness directory; set it to an absolute path such as /home/you/.crewhaus/tenants/<harness>."
+  const root = onDisk(resolve(opts.cwd, opts.tenantsRoot));
+  const here = onDisk(opts.cwd);
+  // Only `..` itself or a leading `..` segment leaves a directory: a child named `..tenants` is inside it.
+  const within = (rel: string): boolean =>
+    rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  // The root is the harness directory or lies inside it, or the harness lies inside the root.
+  const shared = within(relative(here, root)) || within(relative(root, here));
+  return shared
+    ? "[managed] this spec declares a tool that works on files, so CREWHAUS_TENANTS_ROOT must neither be the harness directory nor contain it; set it to an absolute path such as /home/you/.crewhaus/tenants/<harness>."
     : undefined;
 }

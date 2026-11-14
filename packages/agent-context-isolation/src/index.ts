@@ -24,7 +24,12 @@
 import { randomBytes } from "node:crypto";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
 import type { FailureReport } from "@crewhaus/errors";
-import { type EventLog, type RecalledItemRef, openEventLog } from "@crewhaus/event-log";
+import {
+  type EventLog,
+  type RecalledItemRef,
+  type SpanClosedPayload,
+  openEventLog,
+} from "@crewhaus/event-log";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import type {
   IrCircuitBreaker,
@@ -381,6 +386,18 @@ export type ParentRunHandle = {
    */
   readonly justificationAuditSink?: ChildAuditSink<"permission_justification_evaluated">;
   readonly egressAuditSink?: ChildAuditSink<"egress_decision">;
+  /**
+   * The span of the parent's tool call this handle was built for (the Task
+   * call that starts a child). A sub-agent's span nests under it, and the
+   * child's run nests under the sub-agent's. Absent, the parent bus's current
+   * span is used.
+   */
+  readonly parentSpanId?: string;
+  /**
+   * Writes a closed span to the parent's session log (best effort), when the
+   * parent records its runs. The spawner reports the sub-agent's span here.
+   */
+  readonly recordSpanClosed?: (payload: SpanClosedPayload) => Promise<void>;
 };
 
 /** An audit sink a child writes to: `@crewhaus/audit-log`'s `append`, narrowed to one kind. */
@@ -616,6 +633,8 @@ export function projectParentHandle(bridge: RuntimeBridge): ParentRunHandle {
       ? { justificationAuditSink: bridge.justificationAuditSink }
       : {}),
     ...(bridge.egressAuditSink !== undefined ? { egressAuditSink: bridge.egressAuditSink } : {}),
+    ...(bridge.parentSpanId !== undefined ? { parentSpanId: bridge.parentSpanId } : {}),
+    ...(bridge.recordSpanClosed !== undefined ? { recordSpanClosed: bridge.recordSpanClosed } : {}),
   };
 }
 
@@ -641,6 +660,11 @@ export type CreateIsolatedContextOptions = {
   readonly tools: ReadonlyArray<RegisteredTool>;
   readonly model?: string;
   readonly sessionRootDir?: string;
+  /**
+   * The span the child's bus is rooted under (the sub-agent's span). Absent,
+   * the parent bus's current span.
+   */
+  readonly parentSpanId?: string;
 };
 
 /**
@@ -672,9 +696,9 @@ export async function createIsolatedContext(
   // Fresh identity: a canonical run id from the one minter and a
   // sess_<16hex> session id; we let the parent's logger seed the child's logger so
   // every log line carries the inherited app/session bindings. The child's
-  // event bus inherits the parent's traceId and is rooted under the parent
-  // bus's currently-open span, so OpenTelemetry stitches both runs into one
-  // trace. The runId/sessionId on the child's events differ from the parent's
+  // event bus inherits the parent's traceId and is rooted under the span the
+  // caller names (the sub-agent's), else the parent bus's currently-open
+  // span, so OpenTelemetry stitches both runs into one trace. The runId/sessionId on the child's events differ from the parent's
   // so subscribers can still distinguish per-run aggregates.
   const childRunId = mintRunId();
   const childSessionId = `sess_${randomBytes(8).toString("hex")}`;
@@ -682,7 +706,7 @@ export async function createIsolatedContext(
     runId: childRunId,
     sessionId: childSessionId,
     inheritTraceId: parent.runContext.eventBus.traceId,
-    inheritParentSpanId: parent.runContext.eventBus.currentSpanId,
+    inheritParentSpanId: opts.parentSpanId ?? parent.runContext.eventBus.currentSpanId,
     logger: parent.runContext.logger,
   });
   const runContext = createRunContext({

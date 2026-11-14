@@ -40,7 +40,7 @@
  * in the `## [Unreleased]` list.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -50,6 +50,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -59,19 +60,32 @@ import { runApprovalsCommand } from "../apps/cli/src/approvals-cmd";
 import { assertOutDirNotLinked, writeBundleFile } from "../apps/cli/src/bundle-writer";
 import { directControl, runDaemonCommand } from "../apps/cli/src/daemon-cmd";
 import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
-import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
+import {
+  SERVE_TOKEN_FILE,
+  resolveServeBind,
+  screenedInvoke,
+  serveRequestRefusal,
+} from "../apps/cli/src/serve-mcp";
 import { discloseSurfaceChange } from "../apps/cli/src/surface-disclosure";
+import {
+  acceptInbound,
+  createApprovalActions,
+  createRuntimeBackedApprovalStore,
+} from "../packages/channel-adapter-base/src/index";
 import { cfWorkerUnwiredBlockWarnings, compile, lower } from "../packages/compiler/src/index";
 import { createContinuityStore } from "../packages/continuity-store/src/index";
 import {
   DECISION_LOG_KEYS,
   EXIT_FOR_ERROR,
   EXIT_FOR_REJECTED_RECEIPT,
+  mintId,
+  mintRunId,
 } from "../packages/control-contract/src/index";
 import {
   casAppend,
   foldStates,
   intakeRoot,
+  runsLedger,
   standingRulesLedger,
   unregisterIntakeRoot,
 } from "../packages/control-records/src/index";
@@ -94,6 +108,8 @@ import {
 } from "../packages/federation-protocol/src/index";
 import {
   CONTROL_ROUTES,
+  CONTROL_RUN_DIR,
+  CONTROL_TOKEN_FILENAME,
   type ControlAuditRecord,
   type ControlPlane,
   countPendingApprovals,
@@ -1293,14 +1309,14 @@ describe("the release notes name every change a harness without provability: see
       );
       // The boot check on where the tenants root belongs rides the same bullet.
       expect(checkTenantsRoot({ cwd, tenantsRoot: "live/tenants" })).toContain(
-        "CREWHAUS_TENANTS_ROOT must be outside the harness directory",
+        "CREWHAUS_TENANTS_ROOT must neither be the harness directory nor contain it",
       );
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
     // Named in a later list, since 0.8.0 did not ship it.
     const later = defaultOnBullets(changelog, LATER_HEADINGS);
-    const bullet = later.find((b) => b.includes("`.crewhaus/run/gateway-jwt-secret`")) ?? "";
+    const bullet = later.find((b) => b.includes("saves a signing secret it generates to")) ?? "";
     expect(bullet).not.toBe("");
     expect(daemonOf({ tools: ["read"] })).toContain(
       "checkTenantsRoot({ cwd: process.cwd(), tenantsRoot: TENANTS_ROOT })",
@@ -2369,7 +2385,9 @@ describe("approval decisions", () => {
       ) ?? "";
     expect(bullet).toContain("used once");
     expect(bullet).toContain("maintainer");
-    expect(bullet).toContain("chat channel's buttons names no one");
+    expect(bullet).toContain(
+      "a chat channel's buttons count once the person who clicks is linked to a member",
+    );
   });
 });
 
@@ -3241,7 +3259,8 @@ describe("the release notes name what checking before acting changes for every h
     const restart = supervisor.slice(supervisor.indexOf("restart: async (gateOptions) =>"));
     expect(supervisor.indexOf("restart: async (gateOptions) =>")).toBeGreaterThan(-1);
     expect(restart.indexOf("await decideStart({")).toBeGreaterThan(-1);
-    expect(restart.indexOf("await stop();")).toBeGreaterThan(
+    // The restart's own stop, which records nothing: its start says what the operator wants.
+    expect(restart.indexOf("await stopRun({}, { record: false });")).toBeGreaterThan(
       restart.indexOf("await decideStart({"),
     );
     const dir = tempHarness("crewhaus-default-on-restart-", "channel");
@@ -3808,6 +3827,226 @@ describe("the release notes name what the decision service changes for every har
       "for `crewhaus run` or `crewhaus runs resume` of a spec in another directory, that directory's `.crewhaus/run/spec`",
     );
   });
+
+  test("in-process eval, optimize, serve and change-check runs name the spec's directory to the floor", async () => {
+    // Every eval the CLI runs in-process names the spec it loaded.
+    const cli = readFileSync(join(ROOT, "apps", "cli", "src", "index.ts"), "utf8");
+    const callOf = (text: string, at: number): string => {
+      const open = text.indexOf("{", at);
+      let depth = 0;
+      for (let i = open; i < text.length; i++) {
+        if (text[i] === "{") depth++;
+        else if (text[i] === "}" && --depth === 0) return text.slice(at, i + 1);
+      }
+      return text.slice(at);
+    };
+    const calls: string[] = [];
+    for (
+      let at = cli.indexOf("runEvalLib({");
+      at !== -1;
+      at = cli.indexOf("runEvalLib({", at + 1)
+    ) {
+      calls.push(callOf(cli, at));
+    }
+    expect(calls).toHaveLength(9);
+    expect(calls.filter((call) => !/\bspecDir: /.test(call))).toEqual([]);
+    // `crewhaus serve --mcp` names the served spec's real directory on every turn.
+    const serveAt = cli.indexOf("async function buildServeRuntime(");
+    expect(serveAt).toBeGreaterThan(-1);
+    const serve = cli.slice(serveAt, cli.indexOf("\nasync function ", serveAt + 1));
+    const serveCalls: string[] = [];
+    for (
+      let at = serve.indexOf("runChatLoop({");
+      at !== -1;
+      at = serve.indexOf("runChatLoop({", at + 1)
+    ) {
+      serveCalls.push(callOf(serve, at));
+    }
+    expect(serveCalls).toHaveLength(2);
+    expect(
+      serveCalls.filter(
+        (call) =>
+          !call.includes("...commonOptions,") && !call.includes("...primaryOptionsForRun(),"),
+      ),
+    ).toEqual([]);
+    expect(serve).toContain("...commonOptions,\n    model,");
+    const commonAt = serve.indexOf("const commonOptions = {");
+    expect(commonAt).toBeGreaterThan(-1);
+    expect(callOf(serve, commonAt)).toMatch(/\n {4}specDir,\n/);
+    expect(cli).toContain("await buildServeRuntime(args, cliIr, runSpecDirOf(absSpec));");
+    // `crewhaus changes check` names the real directory of the spec the change targets.
+    const quality = readFileSync(join(ROOT, "apps", "cli", "src", "quality-runners.ts"), "utf8");
+    const qualityAt = quality.indexOf("runEvalCore({");
+    expect(qualityAt).toBeGreaterThan(-1);
+    expect(callOf(quality, qualityAt)).toMatch(/\bspecDir,/);
+    expect(quality).toContain(
+      'const specDir = runSpecDirOf(resolve(opts.harnessDir, opts.spec ?? "crewhaus.yaml"));',
+    );
+    const changes = readFileSync(join(ROOT, "apps", "cli", "src", "changes-cmd.ts"), "utf8");
+    const runnersAt = changes.indexOf("qualityRunners({");
+    expect(runnersAt).toBeGreaterThan(-1);
+    expect(callOf(changes, runnersAt)).toContain("spec: specRel,");
+    // The eval runner hands the directory to every sample's chat loop.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-spec-dir-")));
+    const seen: Array<Record<string, unknown>> = [];
+    try {
+      const ir = lower(
+        parseSpec("name: shop\ntarget: cli\nagent:\n  model: m\n  instructions: Answer.\n"),
+      );
+      if (ir.target !== "cli") throw new Error("expected a cli spec");
+      const { compiled } = parseGradersConfig(
+        'graders:\n  - name: any\n    type: contains\n    substring: "a"\n',
+      );
+      async function* samples() {
+        yield { id: "a", input: "q" };
+      }
+      await runEval({
+        ir,
+        dataset: { name: "smoke", samples: samples() },
+        compiledGraders: compiled,
+        opts: {
+          outDir: join(root, "run"),
+          cwd: root,
+          specDir: join(root, "spec"),
+          retryErrors: false,
+          chatLoop: async (opts) => {
+            seen.push(opts as unknown as Record<string, unknown>);
+            return "an answer";
+          },
+        },
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    expect(seen.map((opts) => opts["specDir"])).toEqual([join(root, "spec")]);
+    const bullet = bulletFor("keep a spec's records out of an").replace(/\s+/g, " ");
+    expect(bullet).toContain("`.crewhaus/run/spec`");
+    expect(bullet).toContain("`crewhaus optimize`");
+  });
+});
+
+describe("the release notes name what permission suggestions and state backups leave out", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("permissions suggest proposes no allow for a call that carried a credential", async () => {
+    const { aggregateAsks, rankSuggestions, skippedSuggestions } = await import(
+      "../packages/harness-advice/src/permissions-suggest"
+    );
+    const { parseJsonlObjects } = await import("../packages/harness-advice/src/advise-rules");
+    // Built at runtime from parts, so no credential-shaped literal is committed.
+    const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+    const line = (kind: string, payload: unknown) =>
+      JSON.stringify({ ts: 1, version: 1, kind, payload });
+    const ask = line("permission", { toolName: "Bash", decision: "ask", askOutcome: "approved" });
+    const text = [
+      line("tool_use", {
+        id: "toolu_1",
+        name: "Bash",
+        input: { command: `curl -H "Authorization: Bearer ${token}" https://x.test` },
+      }),
+      ask,
+      ask,
+      ask,
+    ].join("\n");
+    const aggregates = aggregateAsks([
+      { sessionId: "sess_00000000000000fc", objects: parseJsonlObjects(`${text}\n`) },
+    ]);
+    const suggestions = rankSuggestions(aggregates, new Map());
+    expect(suggestions.filter((g) => g.rule.type === "alwaysAllow")).toEqual([]);
+    expect(skippedSuggestions(aggregates).map((k) => [k.toolName, k.reason])).toEqual([
+      ["Bash", "carries-credential"],
+    ]);
+    expect(JSON.stringify(suggestions).includes(token)).toBe(false);
+
+    const bullet = bulletFor("proposes no rule whose value the credential").replace(/\s+/g, " ");
+    for (const word of [
+      "`crewhaus permissions suggest`",
+      "`PermissionsSuggest`",
+      "`alwaysAllow`",
+      "`--apply`",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  });
+
+  test("state backup leaves the run tokens out and writes 0600", async () => {
+    const { DEFAULT_BACKUP_EXCLUDES, createStateBackup } = await import(
+      "../apps/cli/src/state-backup"
+    );
+    // The writers' own paths, so a token that moves fails here until the list follows it.
+    const runRelative = CONTROL_RUN_DIR.replace(/^\.crewhaus\//, "");
+    expect(DEFAULT_BACKUP_EXCLUDES).toContain(`${runRelative}/${CONTROL_TOKEN_FILENAME}`);
+    expect(DEFAULT_BACKUP_EXCLUDES).toContain(SERVE_TOKEN_FILE.replace(/^\.crewhaus\//, ""));
+    expect(DEFAULT_BACKUP_EXCLUDES).toContain("run/gateway-jwt-secret");
+
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-backup-")));
+    try {
+      const stateDir = join(dir, ".crewhaus");
+      mkdirSync(join(stateDir, "run"), { recursive: true });
+      mkdirSync(join(stateDir, "sessions"), { recursive: true });
+      for (const rel of DEFAULT_BACKUP_EXCLUDES) {
+        mkdirSync(dirname(join(stateDir, rel)), { recursive: true });
+        writeFileSync(join(stateDir, rel), randomBytes(24).toString("hex"), { mode: 0o600 });
+      }
+      writeFileSync(join(stateDir, "sessions", "sess_00000000000000fe.jsonl"), '{"ts":1}\n');
+      const out = join(dir, "b.tar.gz");
+      const result = await createStateBackup({ stateDir, outFile: out, crewhausVersion: "test" });
+      const archived = result.manifest.totals.files;
+      expect(archived).toBe(1);
+      expect([...result.defaultExcluded].sort()).toEqual([...DEFAULT_BACKUP_EXCLUDES].sort());
+      if (process.platform !== "win32") expect(statSync(out).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    const bullet = bulletFor("leave a harness's run tokens out").replace(/\s+/g, " ");
+    for (const rel of DEFAULT_BACKUP_EXCLUDES) expect(bullet).toContain(`\`.crewhaus/${rel}\``);
+    expect(bullet).toContain("`crewhaus state backup --include <glob>`");
+    expect(bullet).toContain("`0600`");
+    expect(bullet).toContain("`--archive`");
+  });
+
+  test("only the backup verb passes includeGlobs; retire never keeps a run token", () => {
+    const cli = readFileSync(join(ROOT, "apps", "cli", "src", "index.ts"), "utf8");
+    const calls = cli.split("createStateBackup({").slice(1);
+    expect(calls).toHaveLength(2);
+    const bodies = calls.map((c) => c.slice(0, c.indexOf("})")));
+    expect(bodies.filter((b) => b.includes("includeGlobs"))).toHaveLength(1);
+    expect(bodies[0]).toContain("includeGlobs");
+    expect(bodies[1]).not.toContain("includeGlobs");
+  });
+
+  test("retire removes the run tokens from the state it keeps in its archive", async () => {
+    const { RUN_TOKEN_FILES, DEFAULT_BACKUP_EXCLUDES, removeRunTokens } = await import(
+      "../apps/cli/src/state-backup"
+    );
+    for (const rel of RUN_TOKEN_FILES) expect(DEFAULT_BACKUP_EXCLUDES).toContain(rel);
+    // retire moves the live state to `<archive>/crewhaus-state`, and the CLI
+    // strips the run tokens from exactly that directory.
+    const retire = readFileSync(
+      join(ROOT, "packages", "harness-lifecycle", "src", "retire.ts"),
+      "utf8",
+    );
+    expect(retire.split('join(plan.archiveDir, "crewhaus-state")')).toHaveLength(2);
+    // `crewhaus retire` runs its steps in `retire-cmd.ts`, which `runRetire` calls.
+    const cli = readFileSync(join(ROOT, "apps", "cli", "src", "retire-cmd.ts"), "utf8");
+    expect(
+      cli.split('removeRunTokens(join(plan.archiveDir, "crewhaus-state"))').slice(1),
+    ).toHaveLength(1);
+
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-retire-")));
+    try {
+      mkdirSync(join(dir, "run"), { recursive: true });
+      for (const rel of RUN_TOKEN_FILES) {
+        writeFileSync(join(dir, rel), randomBytes(24).toString("hex"), { mode: 0o600 });
+      }
+      expect(removeRunTokens(dir)).toEqual([...RUN_TOKEN_FILES].sort());
+      for (const rel of RUN_TOKEN_FILES) expect(existsSync(join(dir, rel))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("the release notes name what held-out reads, canary steps, agent dataset tools, re-anchors and write-backs change for every harness", () => {
@@ -4225,10 +4464,12 @@ describe("the release notes name what recorded managed runs and API input change
     expect(bullet).toContain("exit 41");
   }, 20_000); // imports the whole runtime the first time it runs
 
-  test("a managed daemon with a file tool refuses a tenants root inside the harness", () => {
+  test("a managed daemon with a file tool refuses a tenants root that is, lies inside or holds the harness", () => {
     const cwd = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-root-")));
     try {
       expect(checkTenantsRoot({ cwd, tenantsRoot: join(cwd, "tenants") })).toBeDefined();
+      expect(checkTenantsRoot({ cwd, tenantsRoot: ".." })).toBeDefined();
+      expect(checkTenantsRoot({ cwd, tenantsRoot: dirname(cwd) })).toBeDefined();
       expect(checkTenantsRoot({ cwd, tenantsRoot: join(tmpdir(), "elsewhere") })).toBeUndefined();
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -4240,6 +4481,10 @@ describe("the release notes name what recorded managed runs and API input change
     const bullet = bulletFor("A managed daemon whose spec declares a tool that works on files");
     expect(bullet).toContain("`CREWHAUS_TENANTS_ROOT`");
     expect(bullet).toContain("exits 21");
+    const holds = bulletFor("A managed tenants root may neither be the harness directory");
+    expect(holds).toContain("`CREWHAUS_TENANTS_ROOT`");
+    expect(holds).toContain("exits 21");
+    expect(holds).toContain("contain");
   });
 
   test("on a managed harness the floor holds project memory and skills, and the floor bullet says so", () => {
@@ -4266,7 +4511,7 @@ describe("the release notes name what recorded managed runs and API input change
     }
     const floor = bulletFor("The runtime-state floor also covers the staged proposals");
     expect(floor).toContain(
-      "on a `managed` harness, the project memory files the runtime loads at the working directory, `AGENTS.md`, `CLAUDE.md`, `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`, exactly those files, and the skill directories `.crewhaus/skills` and `~/.crewhaus/skills`",
+      "on a `channel` or `managed` run, and in the loops it starts, whose spec at the working directory has that target or cannot be read, the project memory files the runtime loads there, `AGENTS.md`, `CLAUDE.md`, `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`, exactly those files, and the skill directories `.crewhaus/skills` and `~/.crewhaus/skills`, which an operator edits",
     );
   });
 });
@@ -4621,5 +4866,524 @@ describe("run records, structured recall, context_assembled, ledger labels, comp
     const bullet = bulletFor("A compaction summary carries its origin into the run.");
     expect(bullet).toContain("`compaction`");
     expect(bullet).toContain("egress check");
+  });
+});
+
+describe("spans nest from turn to tool to check, and every check writes a verdict", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  /** A scripted adapter: one script of tool calls, then a closing answer. */
+  const scriptedCalls = (calls: ReadonlyArray<{ id: string; name: string; input: unknown }>) => {
+    let n = 0;
+    return {
+      providerId: "anthropic" as const,
+      features: {
+        caching: "explicit" as const,
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      estimateTokens: () => 0,
+      stream: () => {
+        n += 1;
+        const first = n === 1;
+        return (async function* () {
+          yield { kind: "message_start" as const };
+          if (first) {
+            for (const [index, call] of calls.entries()) {
+              yield {
+                kind: "content_block_start" as const,
+                index,
+                block: { type: "tool_use" as const, id: call.id, name: call.name, input: {} },
+              };
+              yield {
+                kind: "content_block_delta" as const,
+                index,
+                delta: {
+                  type: "input_json_delta" as const,
+                  partial_json: JSON.stringify(call.input),
+                },
+              };
+              yield { kind: "content_block_stop" as const, index };
+            }
+          } else {
+            yield {
+              kind: "content_block_start" as const,
+              index: 0,
+              block: { type: "text" as const, text: "" },
+            };
+            yield {
+              kind: "content_block_delta" as const,
+              index: 0,
+              delta: { type: "text_delta" as const, text: "done" },
+            };
+            yield { kind: "content_block_stop" as const, index: 0 };
+          }
+          yield {
+            kind: "message_delta" as const,
+            stopReason: first ? "tool_use" : "end_turn",
+            usage: { input: 1, output: 1 },
+          };
+          yield { kind: "message_stop" as const };
+        })();
+      },
+    };
+  };
+
+  type Line = { kind: string; payload: Record<string, unknown>; span?: string };
+  const linesOf = (dir: string, sessionId: string): Line[] =>
+    readFileSync(join(dir, "sessions", `${sessionId}.jsonl`), "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l) as Line);
+
+  test("three calls run at once each nest their checks under their own span, and the log closes every span", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { normalizeText } = await import("../packages/tool-text/src/index");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-spans-")));
+    try {
+      const runContext = createRunContext();
+      const events: Array<{
+        kind: string;
+        spanId: string;
+        parentSpanId?: string;
+        toolUseId?: string;
+      }> = [];
+      runContext.eventBus.subscribe((e) => {
+        events.push(e as (typeof events)[number]);
+      });
+      await runChatLoop({
+        model: "test-model",
+        instructions: "x",
+        tools: [normalizeText],
+        sessionRootDir: join(dir, "sessions"),
+        runLedgerDir: dir,
+        settingsDir: dir,
+        permissionMode: "bypass",
+        runContext,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        installSigintHandler: false,
+        spinner: false,
+        stdout: () => {},
+        _adapter: scriptedCalls(
+          ["a", "b", "c"].map((t) => ({
+            id: `tu_${t}`,
+            name: "NormalizeText",
+            input: { text: t },
+          })),
+        ) as never,
+      });
+      const starts = events.filter((e) => e.kind === "tool_call_start");
+      expect(starts).toHaveLength(3);
+      const spanOf = new Map(starts.map((s) => [s.toolUseId, s.spanId]));
+      const decisions = events.filter((e) => e.kind === "permission_decision");
+      expect(decisions).toHaveLength(3);
+      for (const d of decisions) expect(d.parentSpanId).toBe(spanOf.get(d.toolUseId) as string);
+      const closed = linesOf(dir, runContext.sessionId)
+        .filter((l) => l.kind === "span_closed")
+        .map((l) => l.payload["kind"]);
+      for (const kind of ["run", "turn", "model"]) expect(closed).toContain(kind);
+      expect(closed.filter((k) => k === "tool")).toHaveLength(3);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Trace spans nest from turn to tool to check.");
+    for (const word of [
+      "`span_closed`",
+      "`span`",
+      "`crewhaus.retry_of`",
+      "OTLP traces change shape",
+      "`CREWHAUS_RUN_STAMPS=0`",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  }, 20_000); // imports the whole runtime the first time it runs
+
+  test("the audit records carry exactly their documented keys, and a denied call's verdict names it", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { normalizeText } = await import("../packages/tool-text/src/index");
+    const { APPROVALS_DIGEST_KEY_FILE } = await import("../packages/session-store/src/index");
+    const { ensureDigestKey } = await import("../packages/control-records/src/index");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-verdicts-")));
+    try {
+      mkdirSync(join(dir, "sessions"), { recursive: true });
+      await ensureDigestKey(join(dir, "sessions"), { file: APPROVALS_DIGEST_KEY_FILE });
+      const records: Array<{ kind: string; payload: Record<string, unknown> }> = [];
+      const sink = {
+        async append(input: { readonly kind: string; readonly payload: unknown }) {
+          records.push({ kind: input.kind, payload: input.payload as Record<string, unknown> });
+          return undefined;
+        },
+      };
+      const send = {
+        ...normalizeText,
+        name: "Send",
+        scope: "external" as const,
+        requireJustification: true,
+      };
+      const runContext = createRunContext();
+      const secret = "the vault code is 7741-alpha-omega";
+      tagContent(runContext, secret, "tool");
+      const common = {
+        model: "test-model",
+        instructions: "x",
+        sessionRootDir: join(dir, "sessions"),
+        runLedgerDir: dir,
+        settingsDir: dir,
+        singleTurn: true as const,
+        seedMessages: [{ role: "user" as const, content: "go" }],
+        installSigintHandler: false,
+        spinner: false,
+        stdout: () => {},
+      };
+      await runChatLoop({
+        ...common,
+        tools: [send],
+        permissionMode: "bypass",
+        runContext,
+        justificationJudge: async () => ({ allow: true, reason: "fits", judgeModel: "judge" }),
+        justificationAuditSink: sink,
+        egressAuditSink: sink,
+        resolveSinkScope: () => "external-configured",
+        _adapter: scriptedCalls([
+          { id: "tu_1", name: "Send", input: { text: secret, justification: "needed" } },
+        ]) as never,
+      });
+      const keysOf = (kind: string) =>
+        Object.keys(records.find((r) => r.kind === kind)?.payload ?? {}).sort();
+      expect(keysOf("permission_justification_evaluated")).toEqual(
+        [
+          "toolName",
+          "justification",
+          "verdict",
+          "reason",
+          "judgeModel",
+          "runId",
+          "sessionId",
+          "toolUseId",
+          "actionDigest",
+        ].sort(),
+      );
+      expect(keysOf("egress_decision")).toEqual(
+        [
+          "sinkId",
+          "sinkScope",
+          "verdict",
+          "originsFound",
+          "matchCount",
+          "runId",
+          "sessionId",
+          "toolUseId",
+          "actionDigest",
+        ].sort(),
+      );
+
+      const denied = createRunContext();
+      await runChatLoop({
+        ...common,
+        tools: [normalizeText],
+        permissionMode: "default",
+        permissionRules: {
+          flag: [],
+          settings: [],
+          yaml: [{ type: "alwaysDeny", pattern: "NormalizeText", source: "yaml" }],
+          hooks: [],
+          builtin: [],
+        },
+        runContext: denied,
+        _adapter: scriptedCalls([
+          { id: "tu_denied", name: "NormalizeText", input: { text: "x" } },
+        ]) as never,
+      });
+      const verdict = linesOf(dir, denied.sessionId).find(
+        (l) => l.kind === "verdict" && l.payload["gate"] === "permission",
+      );
+      expect(verdict?.payload).toMatchObject({
+        outcome: "deny",
+        on: { kind: "tool", toolUseId: "tu_denied", call: 1 },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Every check writes a `verdict` line");
+    for (const word of [
+      "`verdict`",
+      "`toolUseId`",
+      "`runId`",
+      "`sessionId`",
+      "`actionDigest`",
+      "never a judge's or a hook's own words",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  }, 20_000); // imports the whole runtime the first time it runs
+});
+
+describe("the release notes name what retire and Home's drain change for every harness", () => {
+  const read = (rel: string): string => readFileSync(join(ROOT, rel), "utf8");
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  test("`crewhaus retire` refuses a running daemon without --stop, and ends what the harness could do", async () => {
+    const { buildRetirementPlan, PRE_ARCHIVE_STEPS, POST_ARCHIVE_STEPS } = await import(
+      "../packages/harness-lifecycle/src/retire"
+    );
+    const plan = (daemonLive: boolean, stop: boolean) =>
+      buildRetirementPlan({
+        specName: "default-on",
+        harnessDir: ROOT,
+        archiveDir: join(ROOT, "never-written"),
+        pins: {},
+        force: false,
+        pushKnowledge: false,
+        control: { daemonLive, stop, revokerItems: [] },
+      });
+    expect(() => plan(true, false)).toThrow("crewhaus retire --stop");
+    const steps = plan(true, true).steps;
+    for (const step of [...PRE_ARCHIVE_STEPS, ...POST_ARCHIVE_STEPS]) expect(steps).toContain(step);
+    // The CLI is the host that runs them, from the daemon's liveness.
+    const cli = read("apps/cli/src/retire-cmd.ts");
+    expect(cli).toContain("control: { daemonLive: daemonIsLive(o.harnessDir, opts)");
+    expect(read("apps/cli/src/index.ts")).toContain("await retireCommand({");
+    const bullet = bulletFor("`crewhaus retire`");
+    expect(bullet).not.toBe("");
+    for (const word of ["--stop", "disabled", "standing rules", "registry", "lifecycle"]) {
+      expect(bullet).toContain(word);
+    }
+  });
+
+  test("a drain from Home goes through the supervisor, so a refused control call still stops the daemon", () => {
+    const server = read("packages/hangar-server/src/server.ts");
+    const at = server.indexOf('if (tail[0] === "drain") {');
+    expect(at).toBeGreaterThan(-1);
+    const route = server.slice(at, server.indexOf('throw new HttpError(404, "not found");', at));
+    expect(route).toContain("await handle.supervisor.drain(");
+    expect(route).toContain("viaSignal: true");
+    const bullet = bulletFor("A drain from Home");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("signal");
+    expect(bullet).toContain("Home");
+  });
+});
+
+describe("the release notes name what a channel daemon does with clicks and messages", () => {
+  const count = (text: string, needle: string): number => text.split(needle).length - 1;
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+  const CHANNEL_IR: IrChannelV0 = {
+    version: 0,
+    name: "default-on-channel",
+    target: "channel",
+    agent: { model: "claude-sonnet-4-6", instructions: "be helpful" },
+    tools: [],
+    toolConfigs: {},
+    channels: {
+      slack: {
+        botToken: { kind: "env", name: "SLACK_BOT_TOKEN" },
+        signingSecret: { kind: "env", name: "SLACK_SIGNING_SECRET" },
+      },
+    },
+    routing: { sessionKey: "thread" },
+    mcp_servers: {},
+    permissions: { rules: [] },
+    subAgents: [],
+    compaction: {},
+  };
+  const gateway = (): string =>
+    emitChannelBot(CHANNEL_IR).files.find((f) => f.path === "gateway.ts")?.content ?? "";
+
+  /** A temp harness with a parked approval in its own session root, and a Slack-shaped click. */
+  async function parkedClick() {
+    const harness = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-clicks-")));
+    const rootDir = join(harness, ".crewhaus", "sessions");
+    const runtime = createPendingApprovalStore({ rootDir });
+    const input = { path: "a.md" };
+    const id = generateApprovalId();
+    await runtime.persist({
+      id,
+      toolName: "Write",
+      inputHash: hashApprovalInput("Write", input),
+      input,
+      runId: mintRunId(),
+      sessionId: "sess_00000000000000aa",
+      surface: "channel",
+      createdAt: new Date().toISOString(),
+    });
+    const interaction = {
+      kind: "approval_action" as const,
+      approvalId: id,
+      decision: "grant" as const,
+      userId: "U0",
+      teamId: "T0",
+    };
+    return { harness, rootDir, runtime, id, interaction };
+  }
+
+  test("a click counts only from a linked member: the gateway delegates, and an unlinked one decides nothing", async () => {
+    const g = gateway();
+    expect(count(g, "createApprovalActions(")).toBe(1);
+    expect(count(g, "approvalActions.handle(interaction, actionAdapter)")).toBe(1);
+    expect(g).not.toContain("appendSettingsRule");
+    const { harness, rootDir, runtime, id, interaction } = await parkedClick();
+    try {
+      const answers: string[] = [];
+      const adapter = {
+        id: "slack",
+        parseInteraction: () => undefined,
+        answerInteraction: async (args: { text: string }) => void answers.push(args.text),
+      };
+      const actions = createApprovalActions({
+        approvals: createRuntimeBackedApprovalStore(runtime),
+        adapters: new Map([["slack", adapter]]),
+        sessionRouter: { resumeApproval: async () => undefined },
+        harnessDir: harness,
+        watch: { onChange: () => undefined, close: () => undefined },
+      });
+      expect((await actions.handle(interaction, adapter)).status).toBe(200);
+      for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+      expect(answers).toHaveLength(1);
+      expect(answers[0]).toContain("crewhaus access link slack:T0:U0");
+      expect(existsSync(join(rootDir, "approvals.d", "claims"))).toBe(false);
+      expect((await runtime.list()).find((a) => a.id === id)?.decision).toBeUndefined();
+    } finally {
+      rmSync(harness, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("A Slack click decides an approval only for a linked member");
+    expect(bullet).toContain("`crewhaus access link slack:<team>:<user> --member <name>`");
+    expect(bullet).toContain("for 30 days");
+    expect(bullet).toContain("Approve appears only when the whole request fits the card");
+  });
+
+  test("a message is on record before the answer: the events route hands off, and the rows fold", async () => {
+    const g = gateway();
+    const events = g.slice(g.indexOf("const match = url.pathname.match(/^\\/([^/]+)\\/events$/);"));
+    expect(g.indexOf("const match = url.pathname.match(/^\\/([^/]+)\\/events$/);")).toBeGreaterThan(
+      -1,
+    );
+    expect(count(events, "return handleInboundEvent(parsed.event, adapter, {")).toBe(1);
+    // The skip and the reaction answer on their own; the event's answer is the library's.
+    expect(count(events, 'new Response("ok"')).toBe(2);
+    expect(count(events, "queueMicrotask(")).toBe(0);
+    const harness = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-inbound-")));
+    try {
+      const accepted = await acceptInbound(
+        {
+          idempotencyKey: "Ev1",
+          workspaceId: "T0",
+          channelId: "C0",
+          userId: "U0",
+          ts: "1700000000.000100",
+        },
+        { id: "slack" },
+        { harnessDir: harness },
+      );
+      const ledger = runsLedger(harness);
+      const fold = foldStates(ledger);
+      if (!fold.ok) throw new Error(fold.reason);
+      expect(fold.anomalies).toEqual([]);
+      const row = fold.objects.get(accepted.runId);
+      expect(row?.state).toBe("preparing");
+      expect(Object.keys(row?.record ?? {}).sort()).toEqual([
+        "at",
+        "holder",
+        "id",
+        "state",
+        "trigger",
+      ]);
+    } finally {
+      rmSync(harness, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("A channel message is on record before it is acknowledged");
+    expect(bullet).toContain("`.crewhaus/run/control/runs/`");
+    expect(bullet).toContain("`CREWHAUS_RUN_LEDGER=0`");
+  });
+
+  test("a click is answered once the decision is recorded, whatever the card update does", async () => {
+    const { harness, rootDir, runtime, id, interaction } = await parkedClick();
+    try {
+      const owner = mintId("prn");
+      mkdirSync(join(harness, ".crewhaus", "run", "control"), { recursive: true });
+      writeFileSync(
+        join(harness, ".crewhaus", "run", "control", "approvers.json"),
+        JSON.stringify({
+          v: 1,
+          epoch: 1,
+          generatedAt: new Date().toISOString(),
+          harness: "hrn_00000000000000c1",
+          owner,
+          governedSince: new Date().toISOString(),
+          members: [],
+          links: [{ external: "slack:T0:U0", principal: owner }],
+        }),
+      );
+      const adapter = {
+        id: "slack",
+        parseInteraction: () => undefined,
+        ackApproval: () => new Promise<void>(() => undefined),
+      };
+      const actions = createApprovalActions({
+        approvals: createRuntimeBackedApprovalStore(runtime),
+        adapters: new Map([["slack", adapter]]),
+        sessionRouter: { resumeApproval: async () => undefined },
+        harnessDir: harness,
+        watch: { onChange: () => undefined, close: () => undefined },
+      });
+      const res = await actions.handle(interaction, adapter);
+      expect(res.status).toBe(200);
+      expect(readdirSync(join(rootDir, "approvals.d", "claims")).length).toBeGreaterThan(0);
+      expect((await runtime.list()).find((a) => a.id === id)?.decidedByPrincipal).toBe(owner);
+    } finally {
+      rmSync(harness, { recursive: true, force: true });
+    }
+    expect(bulletFor("Slack approval clicks are answered once the decision is recorded")).toContain(
+      "happen after the answer",
+    );
+  });
+
+  test("on a channel harness the floor holds the project memory files and the skill directories", () => {
+    expect(MEMORY_FLOOR_TARGETS).toContain("channel");
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-memory-")));
+    try {
+      writeFileSync(join(cwd, "crewhaus.yaml"), "name: x\ntarget: channel\n");
+      const roots = credentialFloorScope.run(true, () =>
+        runtimeStateRoots(undefined, undefined, cwd, {}, undefined),
+      );
+      for (const name of [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CODE-COMPANION.md",
+        "AGENT.md",
+        "LESSONS.md",
+      ]) {
+        expect(roots).toContain(join(cwd, name));
+      }
+      expect(roots).toContain(join(cwd, ".crewhaus", "skills"));
+      expect(roots).toContain(join(homedir(), ".crewhaus", "skills"));
+      expect(roots).not.toContain(join(cwd, "docs", "AGENTS.md"));
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+    const floor = bulletFor("The runtime-state floor also covers the staged proposals").replace(
+      /\s+/g,
+      " ",
+    );
+    expect(floor).toContain(
+      "on a `channel` or `managed` run, and in the loops it starts, whose spec at the working directory has that target or cannot be read, the project memory files the runtime loads there, `AGENTS.md`, `CLAUDE.md`, `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`, exactly those files, and the skill directories `.crewhaus/skills` and `~/.crewhaus/skills`, which an operator edits",
+    );
+    // One floor bullet in this release's list, not two.
+    const unreleased = changelog.slice(0, changelog.indexOf("\n## [0.8.2]"));
+    expect(unreleased.length).toBeGreaterThan(0);
+    expect(
+      defaultOnBullets(unreleased, LATER_HEADINGS).filter((b) =>
+        b.includes("runtime-state floor also covers"),
+      ),
+    ).toHaveLength(1);
   });
 });

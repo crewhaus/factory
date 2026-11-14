@@ -15,9 +15,11 @@
  * sees): as part of `.crewhaus/run` when a run starts in the spec's own
  * directory (as Home and the supervisor start one), and, for `crewhaus run`
  * and `crewhaus runs resume`, as the spec directory's `.crewhaus/run/spec`
- * when the spec lives elsewhere ({@link withRunSpecDir}). Only this boot step
- * writes it; the spec commit helper never does, so no writer can clear a
- * disclosure before it is shown. A record missing after the spec's commit log
+ * when the spec lives elsewhere ({@link withRunSpecDir}), and for every agent
+ * an in-process eval, a change check or `crewhaus serve --mcp` starts, through
+ * the loop's `specDir` ({@link runSpecDirOf}).
+ * Only this boot step writes it; the spec commit helper never does, so no
+ * writer can clear a disclosure before it is shown. A record missing after the spec's commit log
  * has a line is said, and so is one that cannot be read: the changes since
  * the last start cannot be shown then, and the settings are to be reviewed.
  *
@@ -58,15 +60,23 @@ export type DisclosureOutcome =
 /** A record is small; one past this is not ours. */
 const MAX_RECORD_BYTES = 1024 * 1024;
 
-/** The directory the record lives in: `<the spec's real directory>/.crewhaus/run/spec`. */
-export function surfaceRecordDir(absSpec: string): string {
-  let dir = dirname(absSpec);
+/**
+ * The spec's real directory: the directory of the file a link to the spec
+ * points at, or the spec's directory as given when its real path cannot be read.
+ * The record's location, `crewhaus run` and every in-process eval derive it here.
+ */
+export function runSpecDirOf(absSpec: string): string {
   try {
-    dir = dirname(realpathSync(absSpec));
+    return dirname(realpathSync(absSpec));
   } catch {
     // The spec was read a moment ago; its directory as given will do.
+    return dirname(absSpec);
   }
-  return join(dir, ".crewhaus", "run", "spec");
+}
+
+/** The directory the record lives in: `<the spec's real directory>/.crewhaus/run/spec`. */
+export function surfaceRecordDir(absSpec: string): string {
+  return join(runSpecDirOf(absSpec), ".crewhaus", "run", "spec");
 }
 
 function defaultWrite(dir: string, text: string): void {
@@ -115,13 +125,7 @@ function hasCommitLine(path: string): boolean {
  * floor for the whole run when the spec lives outside the working directory.
  */
 export function withRunSpecDir<T>(absSpec: string, fn: () => T): T {
-  let dir = dirname(absSpec);
-  try {
-    dir = dirname(realpathSync(absSpec));
-  } catch {
-    // The spec was read a moment ago; its directory as given will do.
-  }
-  return runSpecDirScope.run(dir, fn);
+  return runSpecDirScope.run(runSpecDirOf(absSpec), fn);
 }
 
 /**

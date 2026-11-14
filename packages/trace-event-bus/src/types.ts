@@ -181,6 +181,11 @@ export type ModelRequestEvent = TraceEventEnvelope &
     messageCount: number;
     toolCount: number;
     streaming: boolean;
+    /**
+     * The span of the call this one retries, when the loop's recovery re-ran
+     * a call that failed. The two calls are siblings under their turn.
+     */
+    retryOf?: string;
   };
 
 export type ModelUsage = {
@@ -280,6 +285,8 @@ export type HookFiredEvent = TraceEventEnvelope & {
   allowed: boolean;
   durationMs: number;
   reason?: string;
+  /** The tool call a `pre-tool` or `post-tool` hook fired for, when the publisher named it. */
+  toolUseId?: string;
 };
 
 export type CompactionFiredEvent = TraceEventEnvelope & {
@@ -388,6 +395,13 @@ export type PermissionDecisionEvent = TraceEventEnvelope & {
    */
   model?: string;
   profile?: string;
+  /**
+   * The tool call this decision is about, on every decision runtime-core
+   * makes inside a tool call (the event's parent is that call's span).
+   * Absent on a decision that is not about one call, such as the
+   * provability gate's own egress check.
+   */
+  toolUseId?: string;
 };
 
 export type ErrorRecoveredEvent = TraceEventEnvelope & {
@@ -682,6 +696,8 @@ export type ApprovalRequestedEvent = TraceEventEnvelope & {
   approvalId: string;
   toolName: string;
   surface: string;
+  /** The parked tool call, when the publisher named it (runtime-core does). */
+  toolUseId?: string;
 };
 
 /**

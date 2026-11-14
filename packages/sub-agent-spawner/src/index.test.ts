@@ -18,6 +18,7 @@ import { createPendingApprovalStore } from "@crewhaus/session-store";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { createTaskTool } from "@crewhaus/tool-task";
+import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import { spawnSubAgent } from "./index.js";
 
@@ -1223,6 +1224,89 @@ describe("spawnSubAgent — §7.1 end-to-end through a parent runChatLoop + Task
       expect(content).not.toContain("[sub-agent error]");
       // No run_failed on the parent: the failure was non-fatal.
       expect(parentLines.some((l) => l.kind === "run_failed")).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the sub-agent nests under the Task call, and the child's run under the sub-agent", async () => {
+    const root = newTempRoot();
+    try {
+      const runContext = createRunContext();
+      const events: TraceEvent[] = [];
+      runContext.eventBus.subscribe((e) => {
+        events.push(e);
+      });
+      const subAgents = new Map([[RESEARCHER.name, RESEARCHER]]);
+      await runChatLoop({
+        model: "test-model",
+        instructions: "delegate to the researcher",
+        runContext,
+        _adapter: makeScriptedClient([
+          [
+            {
+              type: "tool_use",
+              id: "tu_task",
+              name: "Task",
+              input: { description: "r", prompt: "dig in", subagent_type: "researcher" },
+            } as Anthropic.ToolUseBlock,
+          ],
+          [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+        ]),
+        sessionRootDir: root,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go research" }],
+        tools: [createTaskTool({ subAgents })],
+        permissionMode: "bypass",
+        installSigintHandler: false,
+        subAgents,
+        spawnSubAgent: (parent, opts: SpawnSubAgentOptions) =>
+          spawnSubAgent(parent, {
+            ...opts,
+            _client: makeScriptedClient([
+              [{ type: "text", text: "found it", citations: null } as Anthropic.TextBlock],
+            ]),
+          }),
+      });
+      const task = events.find((e) => e.kind === "tool_call_start");
+      const start = events.find((e) => e.kind === "sub_agent_start");
+      const end = events.find((e) => e.kind === "sub_agent_end");
+      expect(task?.spanId).toMatch(/^[0-9a-f]{16}$/);
+      expect(start?.parentSpanId).toBe(task?.spanId as string);
+      expect(end?.spanId).toBe(start?.spanId as string);
+      expect(end?.parentSpanId).toBe(task?.spanId as string);
+
+      const { readdirSync, readFileSync } = await import("node:fs");
+      type Line = { kind: string; payload: Record<string, unknown>; span?: string };
+      const logs = readdirSync(root)
+        .filter((f) => f.endsWith(".jsonl"))
+        .map((f) =>
+          readFileSync(join(root, f), "utf8")
+            .split("\n")
+            .filter((l) => l !== "")
+            .map((l) => JSON.parse(l) as Line),
+        );
+      const parentLines = logs.find((ls) => ls.some((l) => l.kind === "sub_agent_start")) ?? [];
+      const childLines = logs.find((ls) => ls !== parentLines) ?? [];
+      // The bracket lines the spawner writes carry the Task call's span.
+      for (const kind of ["sub_agent_start", "sub_agent_end"]) {
+        expect(parentLines.find((l) => l.kind === kind)?.span).toBe(task?.spanId as string);
+      }
+      // The parent log closes the sub-agent's span under the Task call.
+      const subagent = parentLines.find(
+        (l) => l.kind === "span_closed" && l.payload["kind"] === "subagent",
+      );
+      expect(subagent?.payload).toMatchObject({
+        span: start?.spanId,
+        parent: task?.spanId,
+        toolUseId: "tu_task",
+        status: "ok",
+      });
+      // The child's run span nests under the sub-agent's span.
+      const childRun = childLines.find(
+        (l) => l.kind === "span_closed" && l.payload["kind"] === "run",
+      );
+      expect(childRun?.payload["parent"]).toBe(start?.spanId);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

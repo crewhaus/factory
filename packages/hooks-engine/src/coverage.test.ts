@@ -7,7 +7,7 @@
  * real `TraceEventBus`/subscriber machinery is stood up.
  */
 import { describe, expect, test } from "bun:test";
-import type { TraceEventBus } from "@crewhaus/trace-event-bus";
+import { type TraceEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 import { type HookDef, defaultLogger, runHooks } from "./index";
 
 describe("defaultLogger", () => {
@@ -98,5 +98,41 @@ describe("runHooks — eventBus emission (Section 15 trace surface)", () => {
     const results = await runHooks("pre-tool", { name: "Read" }, hooks, { eventBus: bus });
     expect(results).toEqual([]);
     expect(published.length).toBe(0);
+  });
+});
+
+describe("runHooks — the span and tool call a hook fires for", () => {
+  const allowHook: HookDef = { event: "pre-tool", command: `printf '{"decision":"allow"}\\n'` };
+
+  test("hook_fired nests under the named span and names the tool call", async () => {
+    const bus = new TraceEventBus({ runId: "run_h", sessionId: "sess_h", env: {} });
+    const published: TraceEvent[] = [];
+    bus.subscribe((e) => {
+      published.push(e);
+    });
+    const call = bus.envelope();
+    await runHooks("pre-tool", { name: "Bash" }, [allowHook], {
+      eventBus: bus,
+      parentSpanId: call.spanId,
+      toolUseId: "toolu_1",
+    });
+    expect(published).toHaveLength(1);
+    expect(published[0]).toMatchObject({
+      kind: "hook_fired",
+      parentSpanId: call.spanId,
+      toolUseId: "toolu_1",
+    });
+  });
+
+  test("without them, the event is the one it always was: under the bus's span, no toolUseId", async () => {
+    const bus = new TraceEventBus({ runId: "run_h", sessionId: "sess_h", env: {} });
+    const published: TraceEvent[] = [];
+    bus.subscribe((e) => {
+      published.push(e);
+    });
+    await runHooks("pre-tool", { name: "Bash" }, [allowHook], { eventBus: bus });
+    expect(published).toHaveLength(1);
+    expect(published[0]?.parentSpanId).toBe(bus.rootSpanId);
+    expect("toolUseId" in (published[0] ?? {})).toBe(false);
   });
 });

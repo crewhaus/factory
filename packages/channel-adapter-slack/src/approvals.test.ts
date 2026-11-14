@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  ALWAYS_ALLOW_LINE,
   APPROVAL_BLOCK_ID_PREFIX,
   APPROVE_ACTION_ID,
   APPROVE_ALWAYS_ACTION_ID,
@@ -40,6 +41,7 @@ function slackButtonClickBody(
     toolName: "bash",
     inputPreview: '{"command":"deploy"}',
     surface: "daemon",
+    fitsCard: true,
   });
   const actionsBlock = (built.blocks as Any[]).find((b) => b.type === "actions");
   const button = actionsBlock.elements.find((e: Any) => e.action_id === actionId);
@@ -59,16 +61,18 @@ function slackButtonClickBody(
 }
 
 describe("buildApprovalMessage (block-kit)", () => {
-  test("renders a section, an actions block, and a context hint", () => {
+  test("renders a section, an actions block, the Always allow line and a context hint", () => {
     const msg = buildApprovalMessage({
       approvalId: "appr_abc",
       toolName: "bash",
       inputPreview: '{"command":"ls"}',
       surface: "daemon",
+      fitsCard: true,
     });
     expect(msg.text).toContain("bash");
     const types = (msg.blocks as Any[]).map((b) => b.type);
-    expect(types).toEqual(["section", "actions", "context"]);
+    expect(types).toEqual(["section", "actions", "context", "context"]);
+    expect((msg.blocks as Any[])[2].elements[0].text).toBe(ALWAYS_ALLOW_LINE);
   });
 
   test("0.7.1 — where the call lands is a section of its own, so a card asked again reads differently (critic8)", () => {
@@ -77,14 +81,20 @@ describe("buildApprovalMessage (block-kit)", () => {
       toolName: "Write",
       inputPreview: '{"path":"pub/link/x.md"}',
       surface: "daemon",
+      fitsCard: true,
     };
     const landsAt =
       "asked again: approval appr_old was granted for pub/link/x.md -> /ws/public/x.md, and a symlink on the path now leads elsewhere\nlands at: pub/link/x.md -> /ws/secrets/x.md ```";
     const plain = buildApprovalMessage(content);
     const placed = buildApprovalMessage({ ...content, landsAt });
-    expect((plain.blocks as Any[]).map((b) => b.type)).toEqual(["section", "actions", "context"]);
+    expect((plain.blocks as Any[]).map((b) => b.type)).toEqual([
+      "section",
+      "actions",
+      "context",
+      "context",
+    ]);
     const types = (placed.blocks as Any[]).map((b) => b.type);
-    expect(types).toEqual(["section", "section", "actions", "context"]);
+    expect(types).toEqual(["section", "section", "actions", "context", "context"]);
     const where = (placed.blocks as Any[])[1].text.text as string;
     expect(where).toContain("approval appr_old was granted for pub/link/x.md -> /ws/public/x.md");
     expect(where).toContain("lands at: pub/link/x.md -> /ws/secrets/x.md");
@@ -99,6 +109,7 @@ describe("buildApprovalMessage (block-kit)", () => {
       toolName: "t",
       inputPreview: "{}",
       surface: "s",
+      fitsCard: true,
     });
     const actions = (msg.blocks as Any[]).find((b) => b.type === "actions");
     expect(actions.block_id).toBe(`${APPROVAL_BLOCK_ID_PREFIX}${id}`);
@@ -120,6 +131,7 @@ describe("buildApprovalMessage (block-kit)", () => {
       toolName: longName,
       inputPreview: "{}",
       surface: "s",
+      fitsCard: true,
     });
     const actions = (msg.blocks as Any[]).find((b) => b.type === "actions");
     const label: string = actions.elements[1].text.text;
@@ -138,6 +150,74 @@ describe("buildApprovalMessage (block-kit)", () => {
     const section = (msg.blocks as Any[]).find((b) => b.type === "section");
     // The only ``` fences are the two we wrote; the injected ones are stripped.
     expect(section.text.text.match(/```/g)?.length).toBe(2);
+  });
+});
+
+describe("the whole request on the card, or no grant on it", () => {
+  const base = { approvalId: "appr_full", toolName: "Write", inputPreview: "{}", surface: "s" };
+  const buttons = (msg: { blocks: readonly unknown[] }): string[] =>
+    ((msg.blocks as Any[]).find((b) => b.type === "actions")?.elements ?? []).map(
+      (e: Any) => e.action_id,
+    );
+  const texts = (msg: { blocks: readonly unknown[] }): string =>
+    JSON.stringify(msg.blocks as Any[]);
+
+  test("a request that fits offers all three buttons and says what Always allow does", () => {
+    const msg = buildApprovalMessage({ ...base, fitsCard: true });
+    expect(buttons(msg)).toEqual([APPROVE_ACTION_ID, APPROVE_ALWAYS_ACTION_ID, DENY_ACTION_ID]);
+    expect(texts(msg)).toContain(ALWAYS_ALLOW_LINE);
+    expect(texts(msg)).not.toContain("Review");
+    // The id line says the same rule.
+    expect(texts(msg)).toContain(
+      "makes a 30-day rule for exactly this call when the owner runs it; anyone else's allows it once and asks the owner",
+    );
+  });
+
+  test("a request that does not fit keeps Deny and links to Home", () => {
+    const msg = buildApprovalMessage({
+      ...base,
+      fitsCard: false,
+      review: { url: "https://home.example.test/#/home/needs-you?type=approvals" },
+    });
+    expect(buttons(msg)).toEqual([DENY_ACTION_ID]);
+    expect(texts(msg)).toContain("*Review in Home*");
+    expect(texts(msg)).toContain("https://home.example.test/#/home/needs-you?type=approvals");
+    expect(texts(msg)).not.toContain(ALWAYS_ALLOW_LINE);
+  });
+
+  test("with no Home address the card names the host and the verb", () => {
+    const msg = buildApprovalMessage({
+      ...base,
+      fitsCard: false,
+      review: { host: "build-box", verb: "crewhaus approvals show appr_full" },
+    });
+    expect(buttons(msg)).toEqual([DENY_ACTION_ID]);
+    expect(texts(msg)).toContain("*Review on build-box*");
+    expect(texts(msg)).toContain("`crewhaus approvals show appr_full`");
+  });
+
+  test("an absent fitsCard counts as not fitting", () => {
+    const msg = buildApprovalMessage(base);
+    expect(buttons(msg)).toEqual([DENY_ACTION_ID]);
+    expect(texts(msg)).toContain("crewhaus approvals show appr_full");
+  });
+
+  test("a class above operator gets one line; operator gets none", () => {
+    const line = (requiredClass?: "operator" | "maintainer" | "owner") =>
+      (
+        buildApprovalMessage({
+          ...base,
+          fitsCard: true,
+          ...(requiredClass ? { requiredClass } : {}),
+        }).blocks as Any[]
+      )
+        .filter((b) => b.type === "context")
+        .map((b) => b.elements[0].text)
+        .filter((t: string) => t.startsWith("Needs "));
+    expect(line("maintainer")).toEqual(["Needs a maintainer"]);
+    expect(line("owner")).toEqual(["Needs the owner"]);
+    expect(line("operator")).toEqual([]);
+    expect(line()).toEqual([]);
   });
 });
 
@@ -178,6 +258,26 @@ describe("parseSlackInteraction — button payload round-trip", () => {
     // A plain Approve carries NO always key (wire back-compat).
     const plain = parseSlackInteraction(slackButtonClickBody("appr_round4", APPROVE_ACTION_ID));
     expect(plain).not.toHaveProperty("always");
+  });
+
+  test("the clicker's workspace comes from team.id, else user.team_id, else none", () => {
+    const fromTeam = parseSlackInteraction(
+      slackButtonClickBody("appr_t1", APPROVE_ACTION_ID, { team: { id: "T7" } }),
+    );
+    expect(fromTeam.kind === "approval_action" && fromTeam.teamId).toBe("T7");
+    const fromUser = parseSlackInteraction(
+      slackButtonClickBody("appr_t2", APPROVE_ACTION_ID, { user: { id: "U9", team_id: "T8" } }),
+    );
+    expect(fromUser.kind === "approval_action" && fromUser.teamId).toBe("T8");
+    const both = parseSlackInteraction(
+      slackButtonClickBody("appr_t3", APPROVE_ACTION_ID, {
+        team: { id: "T7" },
+        user: { id: "U9", team_id: "T8" },
+      }),
+    );
+    expect(both.kind === "approval_action" && both.teamId).toBe("T7");
+    const none = parseSlackInteraction(slackButtonClickBody("appr_t4", APPROVE_ACTION_ID));
+    expect(none).not.toHaveProperty("teamId");
   });
 
   test("recovers the approvalId from block_id when value is absent", () => {
@@ -350,6 +450,72 @@ describe("createSlackAdapter — approval methods", () => {
     expect(captured[0]?.body.text).toContain("Denied");
   });
 
+  test("answerInteraction answers the clicker alone, leaving the card", async () => {
+    const captured: Array<{ url: string; body: Any }> = [];
+    const fakeFetch: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      captured.push({
+        url: typeof input === "string" ? input : input.toString(),
+        body: JSON.parse(typeof init?.body === "string" ? init.body : "{}"),
+      });
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb-tok", signingSecret: SECRET },
+      { apiBaseUrl: "https://slack.test/api", fetch: fakeFetch },
+    );
+    const interaction = {
+      kind: "approval_action" as const,
+      approvalId: "appr_eph",
+      decision: "grant" as const,
+      userId: "U9",
+      responseUrl: "https://hooks.slack.test/actions/eph",
+    };
+    await adapter.answerInteraction?.({ interaction, text: "Link your CrewHaus account" });
+    expect(captured).toEqual([
+      {
+        url: "https://hooks.slack.test/actions/eph",
+        body: {
+          response_type: "ephemeral",
+          replace_original: false,
+          text: "Link your CrewHaus account",
+        },
+      },
+    ]);
+    // With nowhere to answer, it says so rather than posting anywhere else.
+    const { responseUrl: _gone, ...bare } = interaction;
+    await expect(adapter.answerInteraction?.({ interaction: bare, text: "x" })).rejects.toThrow(
+      /response_url/,
+    );
+    expect(captured).toHaveLength(1);
+  });
+
+  test("ackApproval renders the current state when it is given", async () => {
+    const captured: Array<{ body: Any }> = [];
+    const fakeFetch: typeof fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      captured.push({ body: JSON.parse(typeof init?.body === "string" ? init.body : "{}") });
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb-tok", signingSecret: SECRET },
+      { apiBaseUrl: "https://slack.test/api", fetch: fakeFetch },
+    );
+    await adapter.ackApproval?.({
+      interaction: {
+        kind: "approval_action",
+        approvalId: "appr_state",
+        decision: "grant",
+        always: true,
+        userId: "U9",
+        responseUrl: "https://hooks.slack.test/actions/state",
+      },
+      decision: "grant",
+      by: "slack",
+      toolName: "Write",
+      state: "Approved, and allowed for 30 days",
+    });
+    expect(captured[0]?.body.text).toBe("✅ `Write`: Approved, and allowed for 30 days");
+  });
+
   test("parseInteraction delegates to the parser", () => {
     const adapter = createSlackAdapter({ botToken: "xoxb", signingSecret: SECRET });
     const parsed = adapter.parseInteraction?.({
@@ -361,7 +527,7 @@ describe("createSlackAdapter — approval methods", () => {
 });
 
 describe("#383 — always-allow ack rendering", () => {
-  test("an always grant acks as 'Approved (always)' with the standing-allow note", () => {
+  test("an always grant acks as 'Approved (always)' with the narrow rule's note", () => {
     const msg = buildApprovalAckMessage({
       decision: "grant",
       by: "slack:U9",
@@ -369,7 +535,21 @@ describe("#383 — always-allow ack rendering", () => {
       always: true,
     });
     expect(msg.text).toBe(
-      "✅ Approved (always) `log_knowledge_gap` by slack:U9 — future calls run pre-approved",
+      "✅ Approved (always) `log_knowledge_gap` by slack:U9 — this exact call is allowed for 30 days",
+    );
+  });
+
+  test("a state line is the ack, with the tool and no person", () => {
+    const msg = buildApprovalAckMessage({
+      decision: "grant",
+      by: "slack",
+      toolName: "Write",
+      always: true,
+      state: "Allowed once; the owner was asked to allow it from now on",
+    });
+    expect(msg.text).toBe("✅ `Write`: Allowed once; the owner was asked to allow it from now on");
+    expect(buildApprovalAckMessage({ decision: "deny", by: "slack", state: "Denied" }).text).toBe(
+      "🚫 Denied",
     );
   });
 
