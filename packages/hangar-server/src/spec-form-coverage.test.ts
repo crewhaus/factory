@@ -54,9 +54,10 @@ const TARGETS = Object.keys(WHOLE["definitions"] as Record<string, unknown>).fil
 
 /** Controls and JSON nodes per target, measured on this schema (the raw run). */
 const PINNED: Readonly<Record<string, readonly [controls: number, json: number]>> = {
-  cli: [169, 21],
+  // `plugins:` on cli and channel takes a name or a `{name, tools}` entry, so it is a JSON node.
+  cli: [168, 22],
   workflow: [35, 11],
-  channel: [181, 22],
+  channel: [180, 23],
   graph: [36, 11],
   managed: [156, 18],
   pipeline: [70, 7],
