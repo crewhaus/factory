@@ -333,6 +333,7 @@ import {
   isArgScoped,
   rankSuggestions,
   readOnlyByName,
+  skippedSuggestions,
   suggestLookupFromTools,
 } from "@crewhaus/harness-advice/permissions-suggest";
 // 0.6.0 §7.8 / §9.1 — the shadow lane holds BOTH sides of one audition under
@@ -394,15 +395,7 @@ import {
 // orchestration + refusal are pure; heavy steps are an injected seam. In a
 // side-effect-free module so it is unit-testable (this entry file runs an argv
 // switch on import).
-import {
-  RetireError,
-  type RetirementSteps,
-  type StepOutcome,
-  buildRetirementPlan,
-  formatPlan,
-  formatRetirementResult,
-  runRetirement,
-} from "@crewhaus/harness-lifecycle/retire";
+import type { StepOutcome } from "@crewhaus/harness-lifecycle/retire";
 // Hangar F-1 — best-effort harness self-registration: run/compile/eval/dev
 // record the cwd in the machine-wide registry (`~/.crewhaus/harnesses.json`)
 // after a spec resolves. The hook never throws and honours
@@ -1314,6 +1307,7 @@ import {
   renderSentinelReport,
   renderTuneReport,
 } from "./onchain-tune";
+import { gateEntryPoint } from "./operator-gate";
 import {
   BridgedCandidateError,
   prepareBridgedCandidate,
@@ -1410,6 +1404,9 @@ import {
   pinRecoveriesAfterOptimize,
 } from "./regression-pin";
 import { parseReplayToolsFlags } from "./replay-flags";
+// Item 25 — model right-sizing downshift search core (pure enumeration + cost
+// projection + $/score ranking); side-effect-free so it is unit-testable.
+import { type HeavyRetireSteps, retireCommand } from "./retire-cmd";
 // Wave 3 (B20) — the persistent human-review queue
 // (.crewhaus/review/queue.jsonl): pure entry builders/formatters + the
 // append-only JSONL store, in a side-effect-free module so it is
@@ -1429,8 +1426,6 @@ import {
   readReviewQueue,
   resolveReviewEntry,
 } from "./review-queue";
-// Item 25 — model right-sizing downshift search core (pure enumeration + cost
-// projection + $/score ranking); side-effect-free so it is unit-testable.
 import {
   type BaselineEvalOutcome,
   type ModelSlot,
@@ -1638,7 +1633,7 @@ import {
   parseExcludeGlobs,
   restoreStateArchive,
 } from "./state-backup";
-import { discloseSurfaceChange, withRunSpecDir } from "./surface-disclosure";
+import { discloseSurfaceChange, runSpecDirOf, withRunSpecDir } from "./surface-disclosure";
 // v0.3.0 Goal 3 — `doctor --probe`'s thredz check (wiki_stats round-trip
 // through the spec's synthesized/user-declared thredz MCP server).
 import { probeThredz, thredzProbeTarget, thredzProbeToCheck } from "./thredz-probe";
@@ -5924,7 +5919,8 @@ async function runServeMcp(args: ParsedArgs): Promise<void> {
     };
   }
 
-  const runtime = await buildServeRuntime(args, cliIr);
+  // The spec's real directory: its record is on the floor of every served turn.
+  const runtime = await buildServeRuntime(args, cliIr, runSpecDirOf(absSpec));
   const version = cliVersion();
   const handle = createMcpServer({
     invoke: runtime.invoke,
@@ -6015,6 +6011,7 @@ async function runServeMcp(args: ParsedArgs): Promise<void> {
 async function buildServeRuntime(
   args: ParsedArgs,
   ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+  specDir: string,
 ): Promise<{ invoke: McpInvoke; cleanup: () => Promise<void> }> {
   // Built-in tools (Section 14 per-tool config applied first).
   let tools: RegisteredTool[] = [];
@@ -6232,6 +6229,8 @@ async function buildServeRuntime(
     ...approvalRunOptions(args, ir.permissions),
     sessionName: ir.name,
     sessionTarget: ir.target,
+    // The served spec's record is on the floor of every turn, primary or sub-agent.
+    specDir,
     hooks,
     skills,
     slashCommands,
@@ -7459,6 +7458,8 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   const retryErrors = args.flags["no-retry"] !== true;
   const outDirArg = args.flags["out"];
   const absSpec = resolve(specPath);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(absSpec);
   await holdCliMutatingLease(dirname(absSpec), "optimize");
   // The spec as it was before this run: the base of the change it records.
   const changeBaseYaml = readFileSync(absSpec, "utf-8");
@@ -7921,6 +7922,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         opts: {
           // C33 — which CLI produced this run (reproducibility manifest).
           ...cliVersionOpt(),
+          specDir: runSpecDir,
           outDir: evalOutDir,
           concurrency,
           seed,
@@ -8428,6 +8430,7 @@ async function runOptimizeFromAdvice(opts: {
       opts: {
         // C33 — which CLI produced this run (reproducibility manifest).
         ...cliVersionOpt(),
+        specDir: runSpecDirOf(opts.absSpec),
         outDir: join(adviceDir, label),
         concurrency: opts.concurrency,
         seed: opts.seed,
@@ -8763,6 +8766,8 @@ function runFlywheelInit(args: ParsedArgs): void {
 async function runFlywheelRun(args: ParsedArgs): Promise<void> {
   const specPath = args.positional[0] ?? "crewhaus.yaml";
   const absSpec = resolve(specPath);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(absSpec);
   if (!existsSync(absSpec)) {
     die(
       `spec not found at ${absSpec} — run from the harness directory (standalone-harness convention) or pass <spec.yaml>`,
@@ -9048,6 +9053,7 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       opts: {
         // C33 — which CLI produced this run (reproducibility manifest).
         ...cliVersionOpt(),
+        specDir: runSpecDir,
         outDir: join(outRoot, label),
         concurrency: knobs.concurrency,
         seed: knobs.seed,
@@ -9100,6 +9106,7 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       opts: {
         // C33 — which CLI produced this run (reproducibility manifest).
         ...cliVersionOpt(),
+        specDir: runSpecDir,
         outDir: join(
           outRoot,
           "optimize",
@@ -10170,6 +10177,8 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   }
 
   const absSpec = resolve(specPath);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(absSpec);
   let yamlText: string;
   try {
     yamlText = readFileSync(absSpec, "utf-8");
@@ -10441,6 +10450,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
       gateRequested,
       promote,
       specSource: absSpec,
+      specDir: runSpecDir,
       datasetName: dataset.name,
       samples: await collectSamples(dataset.samples),
       datasetHash,
@@ -10507,6 +10517,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     opts: {
       // C33 — which CLI produced this run (reproducibility manifest).
       ...cliVersionOpt(),
+      specDir: runSpecDir,
       // The id the dataset's held-out use line already names.
       ...(evalRunId !== undefined ? { runId: evalRunId } : {}),
       // NEW-HUNT-6 — a resume writes into the run directory it re-opened;
@@ -11081,6 +11092,8 @@ async function runEvalMatrixCommand(opts: {
   readonly promote?: boolean;
   /** Resolved spec source path, for the recorded lineage's collision guard. */
   readonly specSource?: string;
+  /** The spec's real directory, named to the floor of every agent a cell starts. */
+  readonly specDir: string;
   readonly datasetName: string;
   readonly samples: ReadonlyArray<Sample>;
   readonly datasetHash: string;
@@ -11137,6 +11150,7 @@ async function runEvalMatrixCommand(opts: {
         opts: {
           // C33 — which CLI produced this run (reproducibility manifest).
           ...cliVersionOpt(),
+          specDir: opts.specDir,
           outDir: cellOutDir,
           datasetHash: opts.datasetHash,
           retryErrors: opts.retryErrors,
@@ -11402,6 +11416,8 @@ async function runModelScan(args: ParsedArgs): Promise<void> {
 
   const specPath = join(process.cwd(), "crewhaus.yaml");
   if (!existsSync(specPath)) die(`model-scan: no crewhaus.yaml in ${process.cwd()}`);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(specPath);
   const yamlText = readFileSync(specPath, "utf-8");
   let ir: ReturnType<typeof lower>;
   try {
@@ -11497,6 +11513,7 @@ async function runModelScan(args: ParsedArgs): Promise<void> {
         opts: {
           // C33 — which CLI produced this run (reproducibility manifest).
           ...cliVersionOpt(),
+          specDir: runSpecDir,
           outDir: cellOutDir,
           datasetHash,
           ...(concurrency !== undefined ? { concurrency } : {}),
@@ -11973,6 +11990,8 @@ async function runModelRightSize(args: ParsedArgs): Promise<void> {
   const specPath =
     typeof specArg === "string" ? resolve(specArg) : join(process.cwd(), "crewhaus.yaml");
   if (!existsSync(specPath)) die(`model right-size: no spec at ${specPath}`);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(specPath);
   const yamlText = readFileSync(specPath, "utf-8");
   let ir: ReturnType<typeof lower>;
   try {
@@ -12093,6 +12112,7 @@ async function runModelRightSize(args: ParsedArgs): Promise<void> {
       opts: {
         // C33 — which CLI produced this run (reproducibility manifest).
         ...cliVersionOpt(),
+        specDir: runSpecDir,
         outDir: cellDir,
         datasetHash,
         ...(concurrency !== undefined ? { concurrency } : {}),
@@ -15621,6 +15641,9 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
   const toolMap = await loadToolMap();
   const readOnly = readOnlyByName(toolMap);
   const aggregates = aggregateAsks(sessions, suggestLookupFromTools(toolMap));
+  // A tool a recorded call of which carried a credential gets no allow rule;
+  // the report names the tool and never the value.
+  const skipped = skippedSuggestions(aggregates);
   // Every proposal is checked against the real permission matcher before it
   // is shown: a rule that would also cover a call nobody approved is refused.
   const { verifyRule } = await import("@crewhaus/tool-approvals");
@@ -15698,6 +15721,7 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
           sessionIds: sessions.map((s) => s.sessionId),
           suggestions,
           rejected,
+          skipped,
           diff,
           overrideCheck: {
             spec: overrideCheck.spec ?? null,
@@ -15724,6 +15748,9 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
     for (const line of formatSuggestionLines(suggestions)) process.stdout.write(`${line}\n`);
     for (const r of rejected) {
       process.stdout.write(`[refused] ${r.pattern}\n  · ${r.reason}\n`);
+    }
+    for (const skip of skipped) {
+      process.stdout.write(`[skipped] ${skip.toolName}\n  · ${skip.note}\n`);
     }
     process.stdout.write("\n");
     for (const line of formatSettingsDiff(diff)) process.stdout.write(`${line}\n`);
@@ -17877,7 +17904,7 @@ async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise
   if (args.flags["help"]) {
     process.stdout.write(
       "usage:\n" +
-        "  crewhaus state backup [-o <file.tar.gz>] [--exclude <glob,glob>]\n" +
+        "  crewhaus state backup [-o <file.tar.gz>] [--exclude <glob,glob>] [--include <glob,glob>]\n" +
         "  crewhaus state restore <file.tar.gz> [--into <dir>] [--merge feedback|all] [--force]\n" +
         "\n" +
         "backup: archive the cwd .crewhaus/ state dir (sessions, feedback,\n" +
@@ -17893,6 +17920,11 @@ async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise
         "  --exclude   comma-separated globs matched against paths relative to\n" +
         "              .crewhaus; a bare pattern also matches file/dir names\n" +
         '              anywhere (e.g. --exclude "sessions,*.sqlite").\n' +
+        "  --include   keeps a run token a backup leaves out by default\n" +
+        "              (run/control-token, run/gateway-jwt-secret,\n" +
+        "              run/mcp-token; a daemon makes each again at start),\n" +
+        "              with a warning. --exclude still wins. The tarball is\n" +
+        "              readable only by its owner.\n" +
         "\n" +
         "restore: unpack a backup into <dir>/.crewhaus (default: cwd). By\n" +
         "  default it REFUSES to overwrite an existing non-empty .crewhaus.\n" +
@@ -17916,6 +17948,7 @@ async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise
 
   if (action === "backup") {
     const excludeGlobs = parseExcludeGlobs(strFlag(args, "exclude"));
+    const includeGlobs = parseExcludeGlobs(strFlag(args, "include"));
     const outFile = resolve(
       strFlag(args, "out") ?? defaultBackupFileName(stateBackupLabel(), new Date()),
     );
@@ -17924,11 +17957,17 @@ async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise
         stateDir: join(process.cwd(), ".crewhaus"),
         outFile,
         excludeGlobs,
+        includeGlobs,
         crewhausVersion: cliVersion() ?? "unknown",
       });
       for (const w of result.warnings) process.stderr.write(`[state] warning: ${w}\n`);
       if (result.excluded.length > 0) {
         process.stdout.write(`[state] excluded ${result.excluded.length} file(s) via --exclude\n`);
+      }
+      if (result.defaultExcluded.length > 0) {
+        process.stdout.write(
+          `[state] left out ${result.defaultExcluded.length} run token file(s) a daemon makes again at start (--include <path> keeps one)\n`,
+        );
       }
       const { totals } = result.manifest;
       process.stdout.write(
@@ -18617,12 +18656,15 @@ async function buildProductionKnowledgeRedactor(): Promise<Redactor> {
 async function runRetire(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus retire <spec> [--archive <dir>] [--dry-run] [--force]\n" +
+      "usage: crewhaus retire <spec> [--archive <dir>] [--dry-run] [--force] [--stop]\n" +
         "         [--force-unverified] [--push-knowledge] [--shared <dir>] [--root-dir <dir>]\n" +
         "\n" +
-        "  Decommission a harness with evidence. Refuses to retire a spec with an\n" +
-        "  active deployment pin unless --force. Steps (each logged into the archive):\n" +
-        "  export durable state → final compliance-evidence bundle → audit verify →\n" +
+        "  Decommission a harness with evidence. Refuses while its daemon runs unless\n" +
+        "  --stop, which stops it first, and refuses a spec with an active deployment\n" +
+        "  pin unless --force. Steps (each logged into the archive): disable it, cancel\n" +
+        "  its queued runs, expire its open approvals, revoke its standing rules and the\n" +
+        "  connections registered for it → export durable state → final\n" +
+        "  compliance-evidence bundle → audit verify →\n" +
         "  [--push-knowledge] → tombstone the registry entry (delete versions, clearing\n" +
         "  every env pin) → archive + remove the live .crewhaus state. A failing\n" +
         "  compliance bundle or a tamper-reporting audit verify ABORTS before the\n" +
@@ -18676,28 +18718,8 @@ async function runRetire(args: ParsedArgs): Promise<void> {
       : join(harnessDir, `retired-${registryName}-${new Date().toISOString().slice(0, 10)}`),
   );
 
-  let plan: ReturnType<typeof buildRetirementPlan>;
-  try {
-    plan = buildRetirementPlan({
-      specName: registryName,
-      harnessDir,
-      archiveDir,
-      pins,
-      force,
-      pushKnowledge,
-    });
-  } catch (err) {
-    if (err instanceof RetireError) die(err.message);
-    throw err;
-  }
-
-  if (dryRun) {
-    for (const line of formatPlan(plan)) process.stdout.write(`${line}\n`);
-    return;
-  }
-
-  // Wire the real heavy steps.
-  const steps: RetirementSteps = {
+  // Wire the real heavy steps; `retireCommand` runs the rest around them.
+  const steps: HeavyRetireSteps = {
     async backupState(archiveDirIn): Promise<StepOutcome & { tarball?: string }> {
       const stateDir = join(harnessDir, ".crewhaus");
       if (!existsSync(stateDir)) {
@@ -18850,19 +18872,22 @@ async function runRetire(args: ParsedArgs): Promise<void> {
     },
   };
 
-  let result: Awaited<ReturnType<typeof runRetirement>>;
-  try {
-    result = await runRetirement({
-      plan,
-      steps,
-      dryRun: false,
-      forceUnverified: args.flags["force-unverified"] === true,
-    });
-  } catch (err) {
-    if (err instanceof RetireError) die(err.message);
-    throw err;
+  const retired = await retireCommand({
+    harnessDir,
+    specName: registryName,
+    archiveDir,
+    pins,
+    force,
+    pushKnowledge,
+    stop: args.flags["stop"] === true,
+    dryRun,
+    forceUnverified: args.flags["force-unverified"] === true,
+    heavy: steps,
+  });
+  for (const line of retired.lines) {
+    (retired.exitCode === 0 ? process.stdout : process.stderr).write(`${line}\n`);
   }
-  for (const line of formatRetirementResult(result)) process.stdout.write(`${line}\n`);
+  if (retired.exitCode !== 0) process.exit(retired.exitCode);
 }
 
 /** A one-off y/N prompt on stdin. Empty / anything not starting with y → no. */
@@ -19697,6 +19722,8 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
 
   // Read + validate the candidate spec (must be target: cli for eval).
   const absSpec = resolve(specPath);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(absSpec);
   let candidateYaml: string;
   try {
     candidateYaml = readFileSync(absSpec, "utf-8");
@@ -19863,6 +19890,7 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
       opts: {
         // C33 — which CLI produced this run (reproducibility manifest).
         ...cliVersionOpt(),
+        specDir: runSpecDir,
         datasetHash,
         ...(concurrency !== undefined ? { concurrency } : {}),
         ...(seed !== undefined ? { seed } : {}),
@@ -23992,6 +24020,12 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
+
+gateEntryPoint(subcommand, rest, {
+  cwd: process.cwd(),
+  write: (line) => process.stderr.write(line),
+  exit: (code) => process.exit(code),
+});
 
 switch (subcommand) {
   case "compile":

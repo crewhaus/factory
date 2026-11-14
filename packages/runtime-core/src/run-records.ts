@@ -49,6 +49,7 @@ import {
   RUN_REF_RE,
   type RecalledItemRef,
   type RecalledItemStatus,
+  type RunStampChannelSource,
   type RunStampPayload,
   type RunStampSpecRevision,
   type RunStampTrigger,
@@ -220,7 +221,12 @@ export function recordedSpecRevision(
   return { state: "not-recorded" };
 }
 
-/** A trigger's fields, copied: no text, and a channel trigger says its source was not recorded. */
+/**
+ * A trigger's fields, copied, with no text. A channel trigger carries where its message
+ * came from: the platform, and each of `conversationRef`, `messageRef` and `senderRef`
+ * whose value fits a run ref (`RUN_REF_RE`), any other left out. Its source is
+ * `"not-recorded"` only when the trigger has none, or its platform does not fit.
+ */
 export function stampTrigger(trigger: Trigger): RunStampTrigger {
   return {
     kind: trigger.kind,
@@ -228,7 +234,26 @@ export function stampTrigger(trigger: Trigger): RunStampTrigger {
     ...(trigger.via !== undefined ? { via: trigger.via } : {}),
     ...(trigger.workItem !== undefined ? { workItem: trigger.workItem } : {}),
     ...(trigger.synthetic === true ? { synthetic: true as const } : {}),
-    ...(trigger.kind === "channel" ? { source: "not-recorded" as const } : {}),
+    ...(trigger.kind === "channel" ? { source: stampSource(trigger.source) } : {}),
+  };
+}
+
+/** Whether a value read from a trigger is a ref a stamp may hold. */
+function isRunRef(value: unknown): value is string {
+  return typeof value === "string" && RUN_REF_RE.test(value);
+}
+
+/** A channel trigger's source as its stamp holds it (see {@link stampTrigger}). */
+function stampSource(source: Trigger["source"]): "not-recorded" | RunStampChannelSource {
+  if (source === undefined || source === null || !isRunRef(source.platform)) {
+    return "not-recorded";
+  }
+  const { conversationRef, messageRef, senderRef } = source;
+  return {
+    platform: source.platform,
+    ...(isRunRef(conversationRef) ? { conversationRef } : {}),
+    ...(isRunRef(messageRef) ? { messageRef } : {}),
+    ...(isRunRef(senderRef) ? { senderRef } : {}),
   };
 }
 

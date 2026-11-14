@@ -62,6 +62,8 @@ export const DREAM_CLI_SCHEMA: ParseArgsSchema = {
     { name: "force" },
     // `init`: overwrite an existing workflow scaffold.
     { name: "help", short: "h" },
+    // Run once while the harness's operator has paused new work.
+    { name: "ignore-pause", takesValue: false },
   ],
 };
 

@@ -18,6 +18,7 @@ const BEAT: Heartbeat = {
   operatorRev: 3,
   paused: true,
   disabled: false,
+  operatorUnreadable: false,
   activeRuns: 2,
   runLedger: true,
 };
@@ -32,7 +33,17 @@ describe("writeHeartbeat", () => {
     const file = join(root, controlPaths(root).heartbeatFile);
     const body = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
     expect(Object.keys(body).sort()).toEqual(
-      ["activeRuns", "at", "disabled", "operatorRev", "paused", "pid", "runLedger", "v"].sort(),
+      [
+        "activeRuns",
+        "at",
+        "disabled",
+        "operatorRev",
+        "operatorUnreadable",
+        "paused",
+        "pid",
+        "runLedger",
+        "v",
+      ].sort(),
     );
     expect(body).toEqual({ ...BEAT });
     if (process.platform !== "win32") {

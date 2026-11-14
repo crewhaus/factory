@@ -64,6 +64,7 @@ import {
   recordedSpecRevision,
   recordsRun,
   seedSourcesOf,
+  stampTrigger,
 } from "./run-records";
 
 const ROOTS: string[] = [];
@@ -368,6 +369,61 @@ describe("run_stamp", () => {
     const [stamp] = stampsOf(linesOf(dir, channel.sessionId));
     expect(stamp?.shape).toBe("channel");
     expect(stamp?.trigger).toEqual({ kind: "channel", source: "not-recorded" });
+  });
+
+  test("a channel trigger's source: copied ref for ref, a ref that does not fit left out, none recorded as not-recorded", async () => {
+    const source = {
+      platform: "slack",
+      conversationRef: "a".repeat(64),
+      messageRef: "b".repeat(64),
+      senderRef: "prn_01h0000000000000000000000a",
+    };
+    expect(stampTrigger({ kind: "channel", via: "slack", source })).toEqual({
+      kind: "channel",
+      via: "slack",
+      source,
+    });
+
+    // One bad ref, too long or holding a "/": that ref alone is left out.
+    const long = stampTrigger({
+      kind: "channel",
+      source: { ...source, messageRef: "m".repeat(129) },
+    });
+    expect(long.source).toEqual({
+      platform: "slack",
+      conversationRef: source.conversationRef,
+      senderRef: source.senderRef,
+    });
+    const slashed = stampTrigger({
+      kind: "channel",
+      source: { ...source, conversationRef: "C0/1700000000.000100" },
+    });
+    expect(slashed.source).toEqual({
+      platform: "slack",
+      messageRef: source.messageRef,
+      senderRef: source.senderRef,
+    });
+
+    // No source, or a platform that does not fit: not recorded.
+    expect(stampTrigger({ kind: "channel" }).source).toBe("not-recorded");
+    expect(
+      stampTrigger({ kind: "channel", source: { ...source, platform: "sl/ack" } }).source,
+    ).toBe("not-recorded");
+    // Only a channel trigger carries a source.
+    expect("source" in stampTrigger({ kind: "queue" })).toBe(false);
+
+    // Through a run: the scope's channel trigger reaches the stamp with its source.
+    const dir = tempDir();
+    await runWithScope({ trigger: { kind: "channel", via: "slack", source } }, async () => {
+      const ctx = createRunContext();
+      await runOn(ctx, {
+        ...base(dir),
+        sessionTarget: "channel",
+        _adapter: scripted([[say("c")]]),
+      });
+      const [stamp] = stampsOf(linesOf(dir, ctx.sessionId));
+      expect(stamp?.trigger).toEqual({ kind: "channel", via: "slack", source });
+    });
   });
 
   test("under a verified root, the stamp names what the run's running row records", async () => {

@@ -1411,9 +1411,10 @@ if (process.env.CREWHAUS_TENANTS_ROOT === undefined) {
     \`[managed] provability: proof bundles go to \${TENANTS_ROOT}/<tenant>/proofs/ — outside .crewhaus/, so crewhaus state backup does not carry them, and an OS tmp cleaner may delete them. Set CREWHAUS_TENANTS_ROOT to an absolute path outside the harness directory to keep them, such as /home/you/.crewhaus/tenants/<harness>.\`,
   );
 }`;
-  // A spec that declares a tool working on harness files starts only with its
-  // tenants root outside the harness directory (exit 21, the config exit, so a
-  // supervisor never restarts it); a spec with none emits no byte of it.
+  // A spec that declares a tool working on harness files starts only with a
+  // tenants root that neither is nor contains the harness directory (exit 21,
+  // the config exit, so a supervisor never restarts it); a spec with none emits
+  // no byte of it.
   const pathToolDeclared = declaresPathTool(ir);
   const tenantsRootPlacement = pathToolDeclared
     ? `

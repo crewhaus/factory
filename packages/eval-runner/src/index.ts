@@ -2209,6 +2209,8 @@ async function defaultInvoker(
         sessionTarget: wired.sessionTarget,
         runContext: req.runContext,
         sessionRootDir: req.sessionRootDir,
+        // The spec's own record is on the floor of every agent a sample starts.
+        ...(opts.specDir !== undefined ? { specDir: opts.specDir } : {}),
         singleTurn: true,
         // B14 — a multi-turn sample's `history` seeds the conversation
         // VERBATIM: the chat loop logs each seeded message straight into the

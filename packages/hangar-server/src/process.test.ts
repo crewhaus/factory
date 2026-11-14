@@ -569,14 +569,23 @@ describe("process control", () => {
       announceControlPort(t, stub.port);
       expect((await t.api(`/api/h/${id}/proc`)).body["control"]).toMatchObject({ port: stub.port });
 
-      const drained = await t.api(`/api/h/${id}/control/drain`, { method: "POST", body: "{}" });
-      expect(drained.body["ok"]).toBe(true);
+      // The route waits for the daemon to go: start it, let the control call land, then
+      // exit the child while the request is in flight.
+      const pending = t.api(`/api/h/${id}/control/drain`, { method: "POST", body: "{}" });
+      for (let i = 0; i < 200 && !stub.calls.some((c) => c.path.endsWith("/drain")); i++) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      expect(stub.calls.some((c) => c.path.endsWith("/drain"))).toBe(true);
 
       // The drain contract: the daemon answers 202, finishes in flight work,
       // and exits 0 ON ITS OWN. An unflagged exit 0 from a long-running
       // shape reads as "exited cleanly (unexpected)" — restartable — so this
       // is the exit that used to resurrect what the operator just shut down.
       t.ops?.last()?.exit(0, null);
+      const drained = await pending;
+      expect(drained.body["ok"]).toBe(true);
+      expect(drained.body["stopped"]).toBe(true);
+      expect(drained.body["viaSignal"]).toBeUndefined();
       await t.api(`/api/h/${id}/proc`); // flush the exit handler
       t.clock?.advance(60_000); // …and run any backoff timer it armed
 
@@ -594,23 +603,78 @@ describe("process control", () => {
     }
   }, 20_000);
 
-  test("a REFUSED control drain leaves the process verbs alone", async () => {
+  test("a refused control drain stops the daemon by signal", async () => {
     const t = bootTestServer({ now: () => NOW });
     try {
       const dir = daemonHarness(t, "ctl-drain-refused");
       const id = await register(t, dir);
       await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
 
-      // No control port ⇒ `no_control_port`, an EXPECTED refusal. The daemon
-      // was told nothing, so it is not draining and must not be marked so:
-      // the flag is only ever cleared by an exit that is not coming.
+      // No control port ⇒ `no_control_port`: the daemon was told nothing, so the
+      // supervisor stops it by signal, and the answer says so beside the refusal.
       const refused = await t.api(`/api/h/${id}/control/drain`, { method: "POST", body: "{}" });
       expect(refused.body["ok"]).toBe(false);
       expect(refused.body["code"]).toBe("no_control_port");
+      expect(refused.body["stopped"]).toBe(true);
+      expect(refused.body["viaSignal"]).toBe(true);
+      expect(t.ops?.last()?.signals).toEqual(["SIGTERM"]);
 
       const proc = await t.api(`/api/h/${id}/proc`);
-      expect(proc.body["state"]).toBe("running");
+      expect(proc.body["state"]).toBe("stopped");
       expect(proc.body["draining"]).toBe(false);
+      // Stopped by its operator: it stays stopped after a reboot.
+      const operator = JSON.parse(
+        readFileSync(join(dir, ".crewhaus", "run", "control", "operator.json"), "utf8"),
+      ) as Record<string, unknown>;
+      expect(operator["desired"]).toBe("stopped");
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("a disabled harness is refused 409 disabled on start, and a restart keeps it running", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = daemonHarness(t, "proc-disabled");
+      const id = await register(t, dir);
+      const started = await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+      expect(started.status).toBe(200);
+      const operatorFile = join(dir, ".crewhaus", "run", "control", "operator.json");
+      // A person's start from Home is written down for the recovery after a reboot.
+      expect(JSON.parse(readFileSync(operatorFile, "utf8"))["desired"]).toBe("running");
+      writeFileSync(
+        operatorFile,
+        `${JSON.stringify({
+          v: 1,
+          rev: 2,
+          intake: null,
+          deployment: {
+            disabled: true,
+            since: new Date(NOW).toISOString(),
+            by: "prn_a",
+            cmd: "cmd_x",
+          },
+          desired: "running",
+        })}\n`,
+      );
+
+      const restarted = await t.api(`/api/h/${id}/proc/restart`, { method: "POST", body: "{}" });
+      expect(restarted.status).toBe(409);
+      expect(restarted.body).toMatchObject({
+        ok: false,
+        reason: "disabled",
+        verb: "crewhaus daemon enable",
+        running: true,
+      });
+      expect(t.ops?.children.length).toBe(1);
+      expect(t.ops?.last()?.signals).toEqual([]);
+
+      await t.api(`/api/h/${id}/proc/stop`, { method: "POST", body: "{}" });
+      const again = await t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" });
+      expect(again.status).toBe(409);
+      expect(again.body).toMatchObject({ ok: false, reason: "disabled" });
+      expect(again.body["running"]).toBeUndefined();
+      expect(t.ops?.children.length).toBe(1);
     } finally {
       await t.stop();
     }
