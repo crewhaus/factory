@@ -2,15 +2,17 @@
  * Scoped tokens: `chx_<payload>.<mac>`, a short-lived token a service hands a browser so it
  * can read one run, and nothing else.
  *
- * The payload is base64url JSON `{v: 1, cred, refs, acts, exp, sub?}`: the minting
- * service token's credential, the run refs it may read, the read acts it may perform, and
- * when it ends. The MAC is HMAC-SHA256 over the payload part, under
- * `<hangarRoot>/access/keys/scoped.key` (32 random bytes, `0600`, inside `access/`, which
- * no route serves), and is checked in constant time.
+ * The payload is base64url JSON `{v: 1, cred, refs, acts, exp, ep, sub?}`: the minting
+ * service token's credential, the run refs it may read, the read acts it may perform, when
+ * it ends, and the minting service's scoped-token epoch. The MAC is HMAC-SHA256 over the
+ * payload part, under `<hangarRoot>/access/keys/scoped.key` (32 random bytes, `0600`,
+ * inside `access/`, which no route serves), and is checked in constant time.
  *
  * Nothing about a token is stored: it is checked against the access records each time it
- * is presented, so revoking the service token that minted it ends every token it minted.
- * A token lives at most 15 minutes, so a field added later needs no migration.
+ * is presented, so revoking the service token that minted it ends every token it minted,
+ * and bumping the service's epoch (`bumpScopedEpoch`) ends every scoped token it minted
+ * while its own tokens stay live. A token lives at most 15 minutes, so a field added later
+ * needs no migration.
  */
 import { timingSafeEqual } from "node:crypto";
 import {
@@ -24,7 +26,12 @@ import {
 import { ensureDigestKey, readDigestKey } from "@crewhaus/control-records";
 import { authorize } from "./authorize";
 import { accessPaths } from "./paths";
-import { type AccessSnapshot, isLiveCredential, loadAccessSnapshot } from "./snapshot";
+import {
+  type AccessSnapshot,
+  isLiveCredential,
+  loadAccessSnapshot,
+  scopedEpochOf,
+} from "./snapshot";
 
 /**
  * A scoped token lives this long unless asked for less, and never longer.
@@ -57,6 +64,8 @@ export type ScopedClaims = {
   readonly acts: readonly ScopedAct[];
   /** When the token stops working, epoch ms. */
   readonly exp: number;
+  /** The minting service's scoped-token epoch when it was minted. */
+  readonly ep: number;
   readonly sub?: string;
 };
 
@@ -90,7 +99,11 @@ export type ScopedMintAnswer =
     }
   | { readonly ok: false; readonly reason: ScopedRefusalReason; readonly message: string };
 
-export type ScopedVerifyReason = "token_invalid" | "token_expired" | "credential_unknown";
+export type ScopedVerifyReason =
+  | "token_invalid"
+  | "token_expired"
+  | "credential_unknown"
+  | "token_revoked";
 
 export type ScopedVerified =
   | {
@@ -101,6 +114,8 @@ export type ScopedVerified =
       readonly refs: readonly string[];
       readonly acts: readonly ScopedAct[];
       readonly exp: number;
+      /** The minting service's scoped-token epoch the token was minted under. */
+      readonly ep: number;
     }
   | { readonly ok: false; readonly reason: ScopedVerifyReason };
 
@@ -232,6 +247,7 @@ export async function mintScopedToken(
     refs: [...new Set(input.refs)],
     acts,
     exp,
+    ep: scopedEpochOf(snapshot, credential.principal),
     ...(input.subjectRef !== undefined ? { sub: input.subjectRef } : {}),
   };
   const payload = Buffer.from(JSON.stringify(claims), "utf8").toString("base64url");
@@ -267,6 +283,8 @@ function claimsOf(payload: string): ScopedClaims | undefined {
     !acts.every(isScopedAct) ||
     typeof claims["exp"] !== "number" ||
     !Number.isFinite(claims["exp"]) ||
+    !Number.isSafeInteger(claims["ep"]) ||
+    (claims["ep"] as number) < 0 ||
     (claims["sub"] !== undefined && typeof claims["sub"] !== "string")
   ) {
     return undefined;
@@ -275,9 +293,10 @@ function claimsOf(payload: string): ScopedClaims | undefined {
 }
 
 /**
- * Check a presented scoped token. Refused: a bad shape or MAC (`token_invalid`), a passed
- * `exp` (`token_expired`), a minting credential that is not a live service token
- * (`credential_unknown`). Pure but for WebCrypto: it reads no file.
+ * Check a presented scoped token. Refused, in this order: a bad shape or MAC
+ * (`token_invalid`), a passed `exp` (`token_expired`), a minting credential that is not a
+ * live service token (`credential_unknown`), and an epoch below the minting service's
+ * current one (`token_revoked`). Pure but for WebCrypto: it reads no file.
  *
  * First consumer: `authenticate`, for a `chx_` bearer.
  */
@@ -318,6 +337,9 @@ export async function verifyScopedToken(
   ) {
     return { ok: false, reason: "credential_unknown" };
   }
+  if (claims.ep < scopedEpochOf(snapshot, credential.principal)) {
+    return { ok: false, reason: "token_revoked" };
+  }
   return {
     ok: true,
     principal: credential.principal,
@@ -325,5 +347,6 @@ export async function verifyScopedToken(
     refs: claims.refs,
     acts: claims.acts,
     exp: claims.exp,
+    ep: claims.ep,
   };
 }
