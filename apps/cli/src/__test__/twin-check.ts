@@ -254,6 +254,16 @@ const peopleNeedsOne = (sub: string, what: string): Requirement => ({
   pins: [{ file: "people-cmd.ts", text: `exactlyOne("${sub}", args, "${what}")` }],
 });
 
+const pluginNeedsOne = (): Requirement => ({
+  positionals: { min: 1, max: 1 },
+  pins: [
+    {
+      file: "plugins-grant-cmd.ts",
+      text: 'if (typeof name !== "string") return refuse(`missing <name>',
+    },
+  ],
+});
+
 const changesNeedsOne = (sub: string, flag?: string): Requirement => ({
   positionals: { min: 1, max: 1 },
   ...(flag !== undefined ? { flags: [flag] } : {}),
@@ -418,6 +428,8 @@ export const REQUIRED: Readonly<Record<string, Requirement>> = {
   "people export": peopleNeedsOne("export", "<psn_…>"),
   "people activity": peopleNeedsOne("activity", "<psn_…>"),
   "people erase": peopleNeedsOne("erase", "<psn_…>"),
+  "plugins grant": pluginNeedsOne(),
+  "plugins revoke": pluginNeedsOne(),
   "changes show": changesNeedsOne("show"),
   "changes check": changesNeedsOne("check"),
   "changes withdraw": changesNeedsOne("withdraw"),

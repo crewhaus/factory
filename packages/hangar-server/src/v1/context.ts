@@ -20,6 +20,8 @@ export type DaemonStatus =
 
 export type V1Deps = {
   readonly hangarRoot: string;
+  /** Where installed plugins live (`~/.crewhaus/plugins`). */
+  readonly pluginsDir: string;
   readonly registry: HangarRegistry;
   readonly control: ControlService;
   readonly home: HomeAccess;

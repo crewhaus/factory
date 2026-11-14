@@ -7539,6 +7539,38 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all-harnesses",
+              "takesValue": false
+            },
+            {
+              "name": "panes",
+              "takesValue": true
+            },
+            {
+              "name": "events",
+              "takesValue": true
+            },
+            {
+              "name": "reads",
+              "takesValue": true
+            },
+            {
+              "name": "net",
+              "takesValue": true
+            },
+            {
+              "name": "tools",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
             }
           ]
         },
@@ -7585,6 +7617,38 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all-harnesses",
+              "takesValue": false
+            },
+            {
+              "name": "panes",
+              "takesValue": true
+            },
+            {
+              "name": "events",
+              "takesValue": true
+            },
+            {
+              "name": "reads",
+              "takesValue": true
+            },
+            {
+              "name": "net",
+              "takesValue": true
+            },
+            {
+              "name": "tools",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
             }
           ]
         },
@@ -7631,6 +7695,38 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all-harnesses",
+              "takesValue": false
+            },
+            {
+              "name": "panes",
+              "takesValue": true
+            },
+            {
+              "name": "events",
+              "takesValue": true
+            },
+            {
+              "name": "reads",
+              "takesValue": true
+            },
+            {
+              "name": "net",
+              "takesValue": true
+            },
+            {
+              "name": "tools",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
             }
           ]
         },
@@ -7677,6 +7773,38 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all-harnesses",
+              "takesValue": false
+            },
+            {
+              "name": "panes",
+              "takesValue": true
+            },
+            {
+              "name": "events",
+              "takesValue": true
+            },
+            {
+              "name": "reads",
+              "takesValue": true
+            },
+            {
+              "name": "net",
+              "takesValue": true
+            },
+            {
+              "name": "tools",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
             }
           ]
         },
@@ -7723,6 +7851,38 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all-harnesses",
+              "takesValue": false
+            },
+            {
+              "name": "panes",
+              "takesValue": true
+            },
+            {
+              "name": "events",
+              "takesValue": true
+            },
+            {
+              "name": "reads",
+              "takesValue": true
+            },
+            {
+              "name": "net",
+              "takesValue": true
+            },
+            {
+              "name": "tools",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
             }
           ]
         },
@@ -7769,6 +7929,38 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all-harnesses",
+              "takesValue": false
+            },
+            {
+              "name": "panes",
+              "takesValue": true
+            },
+            {
+              "name": "events",
+              "takesValue": true
+            },
+            {
+              "name": "reads",
+              "takesValue": true
+            },
+            {
+              "name": "net",
+              "takesValue": true
+            },
+            {
+              "name": "tools",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
             }
           ]
         },
@@ -7815,6 +8007,272 @@
               "name": "help",
               "short": "h",
               "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all-harnesses",
+              "takesValue": false
+            },
+            {
+              "name": "panes",
+              "takesValue": true
+            },
+            {
+              "name": "events",
+              "takesValue": true
+            },
+            {
+              "name": "reads",
+              "takesValue": true
+            },
+            {
+              "name": "net",
+              "takesValue": true
+            },
+            {
+              "name": "tools",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
+            }
+          ]
+        },
+        "grants": {
+          "flags": [
+            {
+              "name": "registry",
+              "takesValue": true
+            },
+            {
+              "name": "query",
+              "short": "q",
+              "takesValue": true
+            },
+            {
+              "name": "version",
+              "takesValue": true
+            },
+            {
+              "name": "plugins-dir",
+              "takesValue": true
+            },
+            {
+              "name": "registry-file",
+              "takesValue": true
+            },
+            {
+              "name": "allow-unsigned",
+              "takesValue": false
+            },
+            {
+              "name": "trust-anchor",
+              "takesValue": true
+            },
+            {
+              "name": "manifest",
+              "takesValue": true
+            },
+            {
+              "name": "dry-run",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all-harnesses",
+              "takesValue": false
+            },
+            {
+              "name": "panes",
+              "takesValue": true
+            },
+            {
+              "name": "events",
+              "takesValue": true
+            },
+            {
+              "name": "reads",
+              "takesValue": true
+            },
+            {
+              "name": "net",
+              "takesValue": true
+            },
+            {
+              "name": "tools",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
+            }
+          ]
+        },
+        "grant": {
+          "flags": [
+            {
+              "name": "registry",
+              "takesValue": true
+            },
+            {
+              "name": "query",
+              "short": "q",
+              "takesValue": true
+            },
+            {
+              "name": "version",
+              "takesValue": true
+            },
+            {
+              "name": "plugins-dir",
+              "takesValue": true
+            },
+            {
+              "name": "registry-file",
+              "takesValue": true
+            },
+            {
+              "name": "allow-unsigned",
+              "takesValue": false
+            },
+            {
+              "name": "trust-anchor",
+              "takesValue": true
+            },
+            {
+              "name": "manifest",
+              "takesValue": true
+            },
+            {
+              "name": "dry-run",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all-harnesses",
+              "takesValue": false
+            },
+            {
+              "name": "panes",
+              "takesValue": true
+            },
+            {
+              "name": "events",
+              "takesValue": true
+            },
+            {
+              "name": "reads",
+              "takesValue": true
+            },
+            {
+              "name": "net",
+              "takesValue": true
+            },
+            {
+              "name": "tools",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
+            }
+          ]
+        },
+        "revoke": {
+          "flags": [
+            {
+              "name": "registry",
+              "takesValue": true
+            },
+            {
+              "name": "query",
+              "short": "q",
+              "takesValue": true
+            },
+            {
+              "name": "version",
+              "takesValue": true
+            },
+            {
+              "name": "plugins-dir",
+              "takesValue": true
+            },
+            {
+              "name": "registry-file",
+              "takesValue": true
+            },
+            {
+              "name": "allow-unsigned",
+              "takesValue": false
+            },
+            {
+              "name": "trust-anchor",
+              "takesValue": true
+            },
+            {
+              "name": "manifest",
+              "takesValue": true
+            },
+            {
+              "name": "dry-run",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all-harnesses",
+              "takesValue": false
+            },
+            {
+              "name": "panes",
+              "takesValue": true
+            },
+            {
+              "name": "events",
+              "takesValue": true
+            },
+            {
+              "name": "reads",
+              "takesValue": true
+            },
+            {
+              "name": "net",
+              "takesValue": true
+            },
+            {
+              "name": "tools",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
             }
           ]
         }
@@ -7861,6 +8319,38 @@
           "name": "help",
           "short": "h",
           "takesValue": false
+        },
+        {
+          "name": "harness",
+          "takesValue": true
+        },
+        {
+          "name": "all-harnesses",
+          "takesValue": false
+        },
+        {
+          "name": "panes",
+          "takesValue": true
+        },
+        {
+          "name": "events",
+          "takesValue": true
+        },
+        {
+          "name": "reads",
+          "takesValue": true
+        },
+        {
+          "name": "net",
+          "takesValue": true
+        },
+        {
+          "name": "tools",
+          "takesValue": true
+        },
+        {
+          "name": "expect",
+          "takesValue": true
         }
       ]
     },

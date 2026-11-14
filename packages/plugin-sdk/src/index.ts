@@ -461,6 +461,20 @@ function assertIoSchema(value: unknown, field: string): void {
   }
 }
 
+/**
+ * Why an `integration` section is not valid, in the words {@link validatePluginManifest}
+ * refuses it with, or undefined when it is. For a reader that must stay tolerant (Home's
+ * plugin inventory shows the problem beside the plugin rather than failing).
+ */
+export function pluginIntegrationProblem(integration: unknown): string | undefined {
+  try {
+    validateIntegration(integration);
+    return undefined;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
 /** Hold an `integration` section to its exact shape, naming the field that is wrong. */
 function validateIntegration(integration: unknown): void {
   if (!isPlainObject(integration)) {

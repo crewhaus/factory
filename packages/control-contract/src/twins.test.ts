@@ -54,6 +54,7 @@ const SAMPLES = [
     ...ACCESS,
     until: "2026-12-01T09:00:00Z",
     deferReason: "scheduled",
+    plugin: "notes-pane",
   },
   {
     hrn: HRN,
@@ -71,6 +72,7 @@ const SAMPLES = [
     ...ACCESS,
     until: "2026-12-01T09:00:00.000+01:00",
     deferReason: "awaiting-someone",
+    plugin: "abc",
   },
 ];
 
@@ -198,6 +200,7 @@ test("the placeholders, pinned, with empty flags", () => {
     "{cmd}",
     "{until}",
     "{deferReason}",
+    "{plugin}",
   ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
 });

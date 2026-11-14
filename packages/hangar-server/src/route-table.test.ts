@@ -41,7 +41,7 @@ const keysOf = (row: { key: string; aliases?: readonly string[] }) => [
 describe("the route table", () => {
   test("every console route has exactly one row, under its key, method and path", async () => {
     const routes = await loadRoutes();
-    expect(Object.keys(routes)).toHaveLength(267);
+    expect(Object.keys(routes)).toHaveLength(268);
     for (const [key, route] of Object.entries(routes)) {
       const row = ROUTE_BY_KEY.get(key);
       if (row === undefined) throw new Error(`no row for ${key}`);
@@ -49,7 +49,7 @@ describe("the route table", () => {
     }
     const allKeys = ROUTE_TABLE.flatMap(keysOf);
     expect(new Set(allKeys).size).toBe(allKeys.length);
-    expect(allKeys).toHaveLength(267 + OFF_MAP_KEYS.length);
+    expect(allKeys).toHaveLength(268 + OFF_MAP_KEYS.length);
     const pairs = ROUTE_TABLE.map((row) => `${row.method} ${row.path}`);
     expect(new Set(pairs).size).toBe(pairs.length);
   });

@@ -1,4 +1,5 @@
 /** What each `{param}` in an operation's path accepts. Closed. */
+import { PLUGIN_NAME_RE } from "../areas/integrations.js";
 import { CANONICAL_RUN_ID_RE, HARNESS_ID_RE, isId, parseId } from "../ids.js";
 import { isRef } from "../refs.js";
 import { deepFreeze } from "../util.js";
@@ -38,6 +39,8 @@ export const PATH_PARAMS = deepFreeze({
   ref: refParam,
   psn: prefixed("psn"),
   pcl: prefixed("pcl"),
+  plugin: (segments: readonly string[]): boolean =>
+    segments.length === 1 && PLUGIN_NAME_RE.test(segments[0] ?? ""),
 });
 
 export type PathParam = keyof typeof PATH_PARAMS;

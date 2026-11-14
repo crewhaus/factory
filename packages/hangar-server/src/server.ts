@@ -256,11 +256,13 @@ import {
   installStarter,
   suggestScanRoots,
 } from "./onboarding";
+import { readPluginGrants, servedPlugins, standingFrom } from "./plugin-grants";
 import {
   defaultPluginsDir,
   panesForHarness,
   readPaneDocument,
   readPluginInventory,
+  servesHarness,
   traceObservers,
 } from "./plugins";
 import {
@@ -863,6 +865,19 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   // needs, so boot does no indexing work at all (HM-189).
   const omni: OmniIndex = createOmniIndex();
   const pluginsDir = opts.pluginsDir ?? defaultPluginsDir(homedir());
+  /**
+   * The installed plugins with where each stands with its owner, and what Home serves
+   * each: the live grant intersected with what its manifest asks now. A grants ledger
+   * that cannot be read serves nothing, and says so once per read.
+   */
+  const pluginsNow = () => {
+    const read = readPluginGrants(hangarRoot);
+    if (!read.ok)
+      onWarn(`hangar-server: plugin grants are unreadable, so no plugin is served: ${read.reason}`);
+    const grants = read.ok ? read.grants : new Map();
+    const inventory = readPluginInventory(pluginsDir, standingFrom(grants));
+    return { inventory, served: read.ok ? servedPlugins(inventory, grants) : [] };
+  };
   const demosDir = opts.demosDir ?? env[DEMOS_DIR_ENV];
   const cwd = opts.cwd ?? process.cwd();
 
@@ -2056,6 +2071,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         });
       },
       warn: onWarn,
+      hangarRoot,
+      pluginsDir,
     };
     let result: unknown;
     try {
@@ -2643,20 +2660,23 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       return jsonMasked({ id: entry.id, health: await healthFor(entry) });
     }
     if (head === "panes" && tail.length === 0 && method === "GET") {
-      const dir = liveDirOr404(entry);
-      const inventory = readPluginInventory(pluginsDir);
+      liveDirOr404(entry);
+      const { inventory, served } = pluginsNow();
       return jsonMasked({
         id: entry.id,
-        // Both extension points, evaluated against the SAME fail-closed
-        // filesystem permission: a plugin that may not read this harness
-        // neither draws a tab on it nor sees its trace events.
-        panes: panesForHarness(inventory.plugins, dir).map((row) => ({
+        // Both extension points serve only what the plugin's owner granted on
+        // this harness: its granted panes, and `run.trace` for an observer.
+        panes: panesForHarness(served, entry.id).map((row) => ({
           plugin: row.plugin,
           id: row.pane.id,
           title: row.pane.title,
           sandbox: row.sandbox,
         })),
-        traceObservers: traceObservers(inventory.plugins, dir),
+        traceObservers: traceObservers(served, entry.id),
+        // Installed plugins that wait for the owner's OK, so the tab strip can say why it is empty.
+        waiting: inventory.plugins
+          .filter((p) => p.problems.length === 0 && p.grant.state === "waiting")
+          .map((p) => p.name),
         deferred: inventory.deferred,
       });
     }
@@ -3048,7 +3068,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
     if (head === "plugins" && rest.length === 0) {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
-      return json(maskDeep(readPluginInventory(pluginsDir), fleetScrub()));
+      return json(maskDeep(pluginsNow().inventory, fleetScrub()));
     }
 
     if (head === "plugins" && rest.length === 3 && rest[1] === "panes") {
@@ -3058,9 +3078,12 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       if (!SAFE_SEGMENT_RE.test(name) || !SAFE_SEGMENT_RE.test(paneId)) {
         throw new HttpError(400, "invalid plugin or pane id");
       }
-      const plugin = readPluginInventory(pluginsDir).plugins.find((p) => p.name === name);
-      if (plugin === undefined) throw new HttpError(404, "no such plugin");
-      const doc = readPaneDocument(plugin, paneId);
+      // Served only when a live grant covers this pane on a harness the caller can see;
+      // anything else is the same 404, so the answer says nothing about what is installed.
+      const one = pluginsNow().served.find((p) => p.plugin.name === name);
+      const covered =
+        one !== undefined && visibleEntries().some((entry) => servesHarness(one.served, entry.id));
+      const doc = covered ? readPaneDocument(one.plugin, paneId, one.served) : undefined;
       if (doc === undefined) throw new HttpError(404, "no such pane");
       // NOT masked: the pane document is the plugin's own markup, and
       // maskDeep would rewrite its text. It is contained by the sandbox and
@@ -3311,6 +3334,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   const deviceRequests = openDeviceRequests(hangarRoot, { now });
   const v1Router = createV1Router({
     hangarRoot,
+    pluginsDir,
     registry,
     control: controlService,
     home: homeAccess,

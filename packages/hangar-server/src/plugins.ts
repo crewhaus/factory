@@ -5,10 +5,15 @@
  *
  *   - **`onTraceEvent`** — an observer on the run feed. A plugin declaring
  *     it is offered the scrubbed TraceEvents the console already streams,
- *     for the harnesses its `permissions.fs` allow-list actually covers.
+ *     for the harnesses its owner granted it `run.trace` on.
  *   - **`panes`** — per-harness tabs, rendered inside an iframe with an
- *     opaque origin and a Content-Security-Policy computed from the
- *     plugin's `permissions.net` allow-list.
+ *     opaque origin and a Content-Security-Policy whose `connect-src` holds
+ *     only the origins its owner granted.
+ *
+ * Home serves a plugin only what its owner granted (#522): every serving
+ * function here takes the SERVED view, the intersection of the live grant
+ * (`plugin-grants.ts`) and what the current manifest asks for. A manifest
+ * asks; it is never itself a grant.
  *
  * `onSpecLoad` and `onEvalSampleRendered` are DEFERRED, and this module says
  * so in its payload rather than in a changelog: a plugin declaring one gets
@@ -30,15 +35,20 @@
  * `plugin-loader`'s `activatePlugins` (which does import) stays where it is,
  * in the runtime that compiles bundles.
  *
- * Permissions are evaluated with `@crewhaus/plugin-loader`'s OWN
+ * What a manifest asks for is read with `@crewhaus/plugin-loader`'s OWN
  * `isFsAllowed`/`isNetAllowed` — fail-closed by construction (an undefined
  * section means zero access) — rather than a second implementation that
  * could drift from them.
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import type { PluginGrantSet, PluginReviewState } from "@crewhaus/control-contract";
 import { isFsAllowed, isNetAllowed } from "@crewhaus/plugin-loader";
-import type { PluginManifest, PluginPermissions } from "@crewhaus/plugin-sdk";
+import {
+  type PluginManifest,
+  type PluginPermissions,
+  pluginIntegrationProblem,
+} from "@crewhaus/plugin-sdk";
 import { SAFE_SEGMENT_RE } from "./constants";
 import { resolveInside } from "./safety";
 
@@ -69,6 +79,19 @@ export type PluginExtensionStatus = {
   readonly reason: string | null;
 };
 
+/** Where a plugin stands with its owner: the state word, and whether it predates asking. */
+export type PluginGrantStanding = {
+  readonly state: PluginReviewState;
+  /** No grant yet, and a manifest with no `integration` section. */
+  readonly legacy: boolean;
+};
+
+/** What a manifest's `integration` section asks for, read tolerantly. */
+export type PluginIntegrationAsk = {
+  readonly events: readonly string[];
+  readonly reads: readonly string[];
+};
+
 export type PluginRow = {
   readonly name: string;
   readonly version: string;
@@ -82,10 +105,34 @@ export type PluginRow = {
   readonly permissions: {
     readonly fs: readonly string[];
     readonly net: readonly string[];
+    /** Host tools the manifest asks its tools may drive. */
+    readonly tools: readonly string[];
   };
+  /** The environment variables the manifest says it reads: names only. */
+  readonly envNames: readonly string[];
+  /** The `integration` section, or null when the manifest has none (or it is malformed). */
+  readonly integration: PluginIntegrationAsk | null;
+  readonly entrypointDigest: string | null;
+  /** Whether the manifest carries a signature. Home does not verify it: a bundle does, when it loads the plugin. */
+  readonly signed: boolean;
+  /** The crewhaus versions the manifest says it runs on. */
+  readonly crewhausRange: string | null;
+  /** Where the plugin stands with its owner. */
+  readonly grant: PluginGrantStanding;
   /** Problems that stopped this entry being read as a plugin. */
   readonly problems: readonly string[];
 };
+
+/** A plugin and what Home serves it: the live grant, intersected with what it asks for now. */
+export type ServedPlugin = {
+  readonly plugin: PluginRow;
+  readonly served: PluginGrantSet;
+};
+
+/** Whether a served view covers one harness. */
+export function servesHarness(served: PluginGrantSet, harnessId: string): boolean {
+  return served.harnesses === "all" || served.harnesses.includes(harnessId);
+}
 
 export type PluginInventory = {
   readonly pluginsDir: string;
@@ -149,29 +196,35 @@ export function classifyExtensionPoints(manifest: unknown): readonly PluginExten
 export const PANE_SANDBOX = "allow-scripts";
 
 /**
- * The CSP for a pane document, from the plugin's `net` allow-list.
- * Fail-closed: no `net` permission ⇒ `connect-src 'none'`, and every other
- * fetching directive is `'none'` regardless, so a pane cannot pull a script
- * or a pixel from anywhere.
+ * The origins a manifest's `net` allow-list asks to reach, sorted. `net`
+ * entries are `fetch:<glob>`; a CSP source cannot express a glob, so only the
+ * ORIGIN is taken from each and `isNetAllowed` remains the check that decides
+ * an individual URL. A pattern with no usable origin is dropped rather than
+ * widened.
  */
-export function panePolicy(permissions: PluginPermissions | undefined): {
-  readonly csp: string;
-  readonly connectSrc: readonly string[];
-} {
-  const declared = permissions?.net ?? [];
-  // `net` entries are `fetch:<glob>`; a CSP source cannot express a glob, so
-  // only the ORIGIN is taken from each and `isNetAllowed` remains the check
-  // that decides an individual URL. A pattern with no usable origin is
-  // dropped rather than widened.
+export function netOriginsOf(net: readonly string[] | undefined): readonly string[] {
   const origins = new Set<string>();
-  for (const entry of declared) {
+  for (const entry of net ?? []) {
     const colon = entry.indexOf(":");
     if (colon === -1 || entry.slice(0, colon) !== "fetch") continue;
     const pattern = entry.slice(colon + 1);
-    const m = pattern.match(/^(https?:\/\/[^/*?]+)/);
+    const m = pattern.match(/^(https?:\/\/[^/*?#\s]+)/);
     if (m?.[1] !== undefined) origins.add(m[1]);
   }
-  const connectSrc = [...origins].sort();
+  return [...origins].sort();
+}
+
+/**
+ * The CSP for a pane document, from the origins its owner granted it.
+ * Fail-closed: none ⇒ `connect-src 'none'`, and every other fetching
+ * directive is `'none'` regardless, so a pane cannot pull a script or a pixel
+ * from anywhere.
+ */
+export function panePolicy(origins: readonly string[]): {
+  readonly csp: string;
+  readonly connectSrc: readonly string[];
+} {
+  const connectSrc = [...new Set(origins)].sort();
   const csp = [
     "default-src 'none'",
     // Inline only: the document is served from this manager, and a pane that
@@ -188,12 +241,12 @@ export function panePolicy(permissions: PluginPermissions | undefined): {
 }
 
 /**
- * May this plugin observe / render for this harness?
+ * Does this plugin's manifest ask to see this harness?
  *
- * The gate is its FILESYSTEM read permission over the harness directory: a
- * plugin that may not read a harness's files has no business being handed
- * its trace events or drawing a tab on it. `isFsAllowed` is
- * `plugin-loader`'s, so "no `fs` section" means no — fail-closed.
+ * Read off its FILESYSTEM read permission over the harness directory, to
+ * prefill the harnesses an owner's review offers. It grants nothing: Home
+ * serves a harness only to a plugin whose live grant names it. `isFsAllowed`
+ * is `plugin-loader`'s, so "no `fs` section" means no — fail-closed.
  */
 export function pluginSeesHarness(
   permissions: PluginPermissions | undefined,
@@ -225,30 +278,34 @@ export function pluginMayFetch(permissions: PluginPermissions | undefined, url: 
   return isNetAllowed(permissions, url);
 }
 
-/** Plugins permitted to observe one harness's trace events. */
+/** Plugins served `run.trace` on one harness, that declare an observer. */
 export function traceObservers(
-  plugins: readonly PluginRow[],
-  harnessDir: string,
+  served: readonly ServedPlugin[],
+  harnessId: string,
 ): readonly string[] {
-  return plugins
-    .filter((p) => p.extensionPoints.some((e) => e.point === "onTraceEvent" && e.wired))
-    .filter((p) => pluginSeesHarness({ fs: p.permissions.fs }, harnessDir))
-    .map((p) => p.name);
+  return served
+    .filter(({ plugin }) =>
+      plugin.extensionPoints.some((e) => e.point === "onTraceEvent" && e.wired),
+    )
+    .filter(({ served: view }) => view.reads.includes("run.trace"))
+    .filter(({ served: view }) => servesHarness(view, harnessId))
+    .map(({ plugin }) => plugin.name);
 }
 
-/** Panes available on one harness's tab strip. */
+/** Panes served on one harness's tab strip. */
 export function panesForHarness(
-  plugins: readonly PluginRow[],
-  harnessDir: string,
+  served: readonly ServedPlugin[],
+  harnessId: string,
 ): ReadonlyArray<{
   readonly plugin: string;
   readonly pane: PluginPaneDecl;
   readonly sandbox: string;
 }> {
   const out: Array<{ plugin: string; pane: PluginPaneDecl; sandbox: string }> = [];
-  for (const plugin of plugins) {
-    if (!pluginSeesHarness({ fs: plugin.permissions.fs }, harnessDir)) continue;
+  for (const { plugin, served: view } of served) {
+    if (!servesHarness(view, harnessId)) continue;
     for (const pane of plugin.panes) {
+      if (!view.panes.includes(pane.id)) continue;
       out.push({ plugin: plugin.name, pane, sandbox: PANE_SANDBOX });
     }
   }
@@ -270,13 +327,47 @@ const readJson = (path: string): unknown => {
   }
 };
 
+/** A row before its standing is known. */
+export type PluginRowBase = Omit<PluginRow, "grant">;
+
+/** Where a plugin stands when no grant has been read: waiting, and legacy without a section. */
+export function standingWithoutGrants(row: PluginRowBase): PluginGrantStanding {
+  return { state: "waiting", legacy: row.integration === null };
+}
+
+/** A manifest's `integration` section, tolerantly: null and a problem when it is malformed. */
+function readIntegration(
+  manifest: Record<string, unknown> | undefined,
+  problems: string[],
+): PluginIntegrationAsk | null {
+  const section = manifest?.["integration"];
+  if (section === undefined) return null;
+  const problem = pluginIntegrationProblem(section);
+  if (problem !== undefined) {
+    problems.push(problem.replace(/^plugin manifest: /, "plugin.json: "));
+    return null;
+  }
+  const s = section as {
+    readonly events?: readonly string[];
+    readonly data?: { readonly reads?: readonly string[] };
+  };
+  return { events: [...(s.events ?? [])], reads: [...(s.data?.reads ?? [])] };
+}
+
 /**
  * Read `~/.crewhaus/plugins/*` into the inventory. Tolerant throughout: a
  * directory with no manifest, an unparseable manifest, or a manifest missing
  * `name`/`version` yields a row carrying its PROBLEM rather than vanishing,
  * because a plugin an operator installed and cannot see is a support ticket.
+ * A malformed `integration` section is a problem on the row, not a crash.
+ *
+ * `standingOf` says where each plugin stands with its owner
+ * (`plugin-grants.ts`'s `standingFrom`); without it every plugin is waiting.
  */
-export function readPluginInventory(pluginsDir: string): PluginInventory {
+export function readPluginInventory(
+  pluginsDir: string,
+  standingOf: (row: PluginRowBase) => PluginGrantStanding = standingWithoutGrants,
+): PluginInventory {
   const plugins: PluginRow[] = [];
   let names: string[] = [];
   try {
@@ -308,7 +399,11 @@ export function readPluginInventory(pluginsDir: string): PluginInventory {
       }
     }
     const permissions = manifest?.permissions;
-    plugins.push({
+    const record = manifest as unknown as Record<string, unknown> | undefined;
+    const integration = readIntegration(record, problems);
+    const digest = record?.["entrypointDigest"];
+    const engines = record?.["engines"] as { readonly crewhaus?: unknown } | undefined;
+    const base: PluginRowBase = {
       name: typeof manifest?.name === "string" && manifest.name !== "" ? manifest.name : name,
       version: typeof manifest?.version === "string" ? manifest.version : "unknown",
       description: typeof manifest?.description === "string" ? manifest.description : null,
@@ -318,9 +413,19 @@ export function readPluginInventory(pluginsDir: string): PluginInventory {
       permissions: {
         fs: asStringArray(permissions?.fs),
         net: asStringArray(permissions?.net),
+        tools: asStringArray(permissions?.tools),
       },
+      envNames: asStringArray(permissions?.secrets),
+      integration,
+      entrypointDigest: typeof digest === "string" && /^[a-f0-9]{64}$/.test(digest) ? digest : null,
+      signed: typeof record?.["signature"] === "object" && record["signature"] !== null,
+      crewhausRange:
+        typeof engines === "object" && engines !== null && typeof engines.crewhaus === "string"
+          ? engines.crewhaus
+          : null,
       problems,
-    });
+    };
+    plugins.push({ ...base, grant: standingOf(base) });
   }
   return {
     pluginsDir,
@@ -343,12 +448,18 @@ export type PaneDocument = {
 };
 
 /**
- * Read one pane document out of a plugin directory. Containment is per FILE
- * (the manifest names it, and a name can be a symlink), the read is capped,
- * and the policy travels WITH the document so a client cannot render it
- * without the sandbox and the CSP that make it safe.
+ * Read one pane document out of a plugin directory, when its served view
+ * holds the pane. Containment is per FILE (the manifest names it, and a name
+ * can be a symlink), the read is capped, and the policy travels WITH the
+ * document so a client cannot render it without the sandbox and the CSP that
+ * make it safe. The CSP's `connect-src` is the served origins.
  */
-export function readPaneDocument(plugin: PluginRow, paneId: string): PaneDocument | undefined {
+export function readPaneDocument(
+  plugin: PluginRow,
+  paneId: string,
+  served: PluginGrantSet,
+): PaneDocument | undefined {
+  if (!served.panes.includes(paneId)) return undefined;
   const pane = plugin.panes.find((p) => p.id === paneId);
   if (pane === undefined) return undefined;
   const path = resolveInside(plugin.dir, [pane.file]);
@@ -360,7 +471,7 @@ export function readPaneDocument(plugin: PluginRow, paneId: string): PaneDocumen
     return undefined;
   }
   const truncated = doc.length > MAX_PANE_BYTES;
-  const { csp } = panePolicy({ fs: plugin.permissions.fs, net: plugin.permissions.net });
+  const { csp } = panePolicy(served.net);
   return {
     plugin: plugin.name,
     paneId,

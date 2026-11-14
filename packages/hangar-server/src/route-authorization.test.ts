@@ -1291,6 +1291,8 @@ describe("the versioned API: every served operation, for every role and credenti
     return path.replace(/\{(\w+)\}/g, (_m, name: string) => {
       if (name === "h") return world.a;
       if (name === "ref") return `${world.a}/decision/appr_00000000000000a1`;
+      // A plugin is named by the manifest name grammar, not an id.
+      if (name === "plugin") return "notes-pane";
       return `${name}_${ULID_SAMPLE}`;
     });
   }

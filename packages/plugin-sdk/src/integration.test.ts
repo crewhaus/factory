@@ -11,6 +11,7 @@ import {
   type PluginManifest,
   PluginSdkError,
   manifestPayloadForSigning,
+  pluginIntegrationProblem,
   validatePluginManifest,
   validatePluginManifestRecord,
 } from "./index";
@@ -102,6 +103,13 @@ describe("the integration section", () => {
     ).not.toThrow();
     expect(refusal({ io: { output: nested(33) } })).toContain(
       "`integration.io.output` nests deeper than 32",
+    );
+  });
+
+  test("pluginIntegrationProblem answers the same reason without throwing", () => {
+    expect(pluginIntegrationProblem(valid)).toBeUndefined();
+    expect(pluginIntegrationProblem({ events: ["runs"] })).toContain(
+      '`integration.events` entry "runs" is not one of',
     );
   });
 

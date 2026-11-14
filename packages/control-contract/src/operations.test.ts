@@ -1018,6 +1018,7 @@ describe("path params", () => {
         "run",
         "psn",
         "pcl",
+        "plugin",
       ].sort(),
     );
     expect(isPathParam("nope", ["x"])).toBe(false);

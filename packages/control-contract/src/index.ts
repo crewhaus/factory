@@ -61,6 +61,20 @@ export {
   type VaultStateView,
 } from "./areas/people.js";
 export {
+  INTEGRATIONS_MODULE,
+  PLUGIN_EVENT_FAMILIES,
+  PLUGIN_GRANT_LIST_MAX,
+  PLUGIN_NAME_RE,
+  PLUGIN_READS,
+  PLUGIN_REVIEW_STATES,
+  type PluginEventFamily,
+  type PluginGrantRequest,
+  type PluginGrantSet,
+  type PluginRead,
+  type PluginReview,
+  type PluginReviewState,
+} from "./areas/integrations.js";
+export {
   CHANGE_KINDS,
   CHANGE_REASONS,
   CHANGE_SOURCES,

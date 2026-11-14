@@ -52,6 +52,8 @@ import { runCorpusEval } from "./__test__/eval-corpus";
 import { EVAL_JOB_ARGV } from "./eval-inputs";
 import { logLine, makeFixtureHarness } from "./fixture";
 import { M3_ROUTES } from "./m3-routes";
+import { grantPlugin } from "./plugin-grants";
+import { type PluginRow, readPluginInventory } from "./plugins";
 import { matchRequest } from "./route-match";
 import { ROUTE_BY_KEY } from "./route-table";
 import { type TestServer, bootTestServer } from "./testkit";
@@ -551,10 +553,15 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["exempt", "array"],
     ["note", "string"],
   ],
-  // views/settings.js pluginCard
+  // views/plugins.js renderPlugins
   plugins: [
     ["pluginsDir", "string"],
     ["plugins", "array"],
+    ["plugins[].name", "string"],
+    ["plugins[].version", "string"],
+    ["plugins[].grant.state", "string"],
+    ["plugins[].grant.legacy", "boolean"],
+    ["plugins[].problems", "array"],
     ["wired", "array"],
     ["deferred", "object"],
   ],
@@ -574,6 +581,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["id", "string"],
     ["panes", "array"],
     ["traceObservers", "array"],
+    ["waiting", "array"],
     ["deferred", "object"],
   ],
   // views/library.js findPanel — discovery without registration
@@ -1444,6 +1452,7 @@ const READ_ONLY_SPEC_WRITES = new Set([
   "specPatch",
   "specPropose",
   "mcpConnectorWrite",
+  "pluginUseWrite",
   "watchmeToggle",
 ]);
 
@@ -1460,6 +1469,7 @@ const M3_BODIES: Record<string, unknown> = {
   graderWrite: { graders: [] },
   datasetBuilderStep: { event: "start" },
   mcpConnectorWrite: { name: "files", command: "bunx", args: [] },
+  pluginUseWrite: { tools: [], dryRun: true },
   memoryForget: { factId: "mem_0000000000000001", reason: "superseded by policy", confirm: true },
   memorySweep: { dryRun: true },
   memoryRecall: { query: "what is the deploy step" },
@@ -2587,8 +2597,28 @@ describe("UI route contract", () => {
         }),
       );
       writeFileSync(join(pluginsDir, "cost-lens", "spend.html"), "<p>spend</p>");
+      // Home serves a plugin only what its owner granted: grant the pane and the
+      // trace on this harness first, as Settings › Plugins would.
+      const costLens = readPluginInventory(pluginsDir).plugins[0] as PluginRow;
+      const granted = await grantPlugin(t.hangarRoot, {
+        row: costLens,
+        grant: {
+          harnesses: [id],
+          panes: ["spend"],
+          events: [],
+          reads: ["run.trace"],
+          net: [],
+          tools: [],
+        },
+        by: "local:test",
+        cmd: "cmd_test",
+      });
+      expect(granted.ok).toBe(true);
       const inventory = await drive("plugins", {}, { readsKey: "plugins" });
       expect(inventory["wired"]).toEqual(["onTraceEvent", "panes"]);
+      expect((inventory["plugins"] as Array<{ grant: { state: string } }>)[0]?.grant.state).toBe(
+        "allowed",
+      );
       const pane = await drive(
         "pluginPane",
         { plugin: "cost-lens", pane: "spend" },

@@ -5,6 +5,7 @@
  * a command line back to its params, so one type serves both directions.
  */
 import { DEFER_REASONS, OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
+import { PLUGIN_NAME_RE } from "./areas/integrations.js";
 import { PERSON_CHANGE_REASONS } from "./areas/quality.js";
 import type { CliTwin } from "./areas/types.js";
 import { APPROVAL_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
@@ -36,6 +37,7 @@ export const CLI_VERBS = deepFreeze({
   changes: ["check", "adopt", "decline", "withdraw", "rollback"],
   datasets: ["holdout"],
   "eval-report": ["baseline"],
+  plugins: ["grants", "revoke"],
 } as const);
 
 /**
@@ -56,7 +58,8 @@ export const CLI_VERBS = deepFreeze({
  * `{grt}`, `{inv}`, `{crd}` and `{lnk}` are a grant's, an invite's, a token's and a
  * link's ids, and `{cmd}` a command receipt's, each its own id grammar. `{until}` is an
  * ISO date and time with `Z` or an offset, and `{deferReason}` one of the reasons a
- * person may give to defer a decision.
+ * person may give to defer a decision. `{plugin}` is a plugin's name, the manifest
+ * name grammar.
  */
 export const TWIN_PLACEHOLDERS = deepFreeze({
   "{hrn}": HARNESS_ID_RE,
@@ -85,6 +88,7 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{cmd}": /^cmd_[0-9a-hjkmnp-tv-z]{26}$/,
   "{until}": /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/,
   "{deferReason}": new RegExp(`^(?:${DEFER_REASONS.join("|")})$`),
+  "{plugin}": PLUGIN_NAME_RE,
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

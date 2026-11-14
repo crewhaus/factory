@@ -148,6 +148,7 @@ import {
   memorySweep,
 } from "./memory-ops";
 import { modelArms, modelLeaderboard, modelRoutes, modelsOverview } from "./models";
+import { pluginUseWrite } from "./plugin-use";
 import { dev, devStart, devStop, mcpServerStart, mcpServerStop, mcpServers } from "./runtime-ops";
 import {
   audit,
@@ -353,6 +354,7 @@ export const M3_ROUTES: readonly M3Route[] = [
     "spec",
     mcpConnectorRemove,
   ),
+  route("pluginUseWrite", "PUT", "/api/h/:id/builders/plugins/:name", "spec", pluginUseWrite),
 
   // ---- memory: facts, continuity, wiki, watchme, learning, knowledge -----
   route("memoryFacts", "GET", "/api/h/:id/memory/facts/:spec", "memory", memoryFacts),
