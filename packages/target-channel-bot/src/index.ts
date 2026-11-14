@@ -5,6 +5,7 @@ import {
   renderGateSkills,
 } from "@crewhaus/evaluation-service";
 import {
+  SCHEDULE_LANES_ARMED_VAR,
   renderControlDrain,
   renderControlImports,
   renderControlLane,
@@ -12,6 +13,7 @@ import {
   renderControlStart,
   renderControlTimer,
   renderPublicGateFetch,
+  renderScheduleLanes,
 } from "@crewhaus/gateway-protocol/control-codegen";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
@@ -2325,9 +2327,43 @@ try {
   // channel bundles stay byte-identical.
   const scheduleImport = ir.schedule
     ? `import { armSchedule, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
-    : "";
+    : ir.scheduleLanes
+      ? `import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
+      : "";
   const schedScopeField =
-    ir.schedule && ir.continuity !== undefined ? `\n    continuityScope: "spec",` : "";
+    (ir.schedule || ir.scheduleLanes) && ir.continuity !== undefined
+      ? `\n    continuityScope: "spec",`
+      : "";
+  // The body of one schedule wake, for the single `schedule` lane and for each
+  // named lane alike: a fresh-session turn with that lane's prompt, logged
+  // under the lane's id.
+  const scheduleTickBody = (laneId: string, instructionsVar: string, tickVar: string): string =>
+    `${tickVar}++;${ir.gateway ? "\n__heartbeatCount++; // gateway /status wake counter (heartbeat + schedule)" : ""}
+const __sessionId = __tick.sessionId;
+const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
+process.stdout.write(\`[${laneId}] wake #\${${tickVar}}\${__origin} (session \${__sessionId})\\n\`);
+try {
+  const __out = await agent.runTurn({
+    sessionId: __sessionId,
+    isNew: true,
+    message: ${instructionsVar},${schedScopeField}
+  });
+  // Untrusted turn output on a pumped, machine-parsed stream — flattened to
+  // one bounded line (see the heartbeat lane).
+  const __preview = sanitizeControlText(__out, 200);
+  process.stdout.write(\`[${laneId}] → \${__preview}\\n\`);
+} catch (__err) {
+  // A classified terminal failure renders its full report; anything else
+  // keeps the bare line. Rethrown so the control lane records the wake's
+  // outcome as \`error\` for /control/v1/status; the lane absorbs it there,
+  // so the daemon keeps serving and armSchedule still re-arms.
+  if (isRunFailedError(__err)) {
+    process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[${laneId}]" })}\\n\`);
+  } else {
+    process.stderr.write(\`[${laneId}] error: \${(__err as Error).message}\\n\`);
+  }
+  throw __err;
+}`;
   const scheduleBoot = ir.schedule
     ? `
   // Loop contract 0.4 (Batch F) — schedule: wake loop (cron|interval + jitter)
@@ -2342,32 +2378,7 @@ ${renderControlLane({
   // reports the same arithmetic armSchedule itself uses (jitter aside).
   nextDueAtExpr: "new Date(Date.now() + nextWakeDelayMs(__scheduleSpec, Date.now())).toISOString()",
   indent: "  ",
-  body: `__scheduleTick++;${ir.gateway ? "\n__heartbeatCount++; // gateway /status wake counter (heartbeat + schedule)" : ""}
-const __sessionId = __tick.sessionId;
-const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
-process.stdout.write(\`[schedule] wake #\${__scheduleTick}\${__origin} (session \${__sessionId})\\n\`);
-try {
-  const __out = await agent.runTurn({
-    sessionId: __sessionId,
-    isNew: true,
-    message: __scheduleInstructions,${schedScopeField}
-  });
-  // Untrusted turn output on a pumped, machine-parsed stream — flattened to
-  // one bounded line (see the heartbeat lane).
-  const __preview = sanitizeControlText(__out, 200);
-  process.stdout.write(\`[schedule] → \${__preview}\\n\`);
-} catch (__err) {
-  // A classified terminal failure renders its full report; anything else
-  // keeps the bare line. Rethrown so the control lane records the wake's
-  // outcome as \`error\` for /control/v1/status; the lane absorbs it there,
-  // so the daemon keeps serving and armSchedule still re-arms.
-  if (isRunFailedError(__err)) {
-    process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[schedule]" })}\\n\`);
-  } else {
-    process.stderr.write(\`[schedule] error: \${(__err as Error).message}\\n\`);
-  }
-  throw __err;
-}`,
+  body: scheduleTickBody("schedule", "__scheduleInstructions", "__scheduleTick"),
 })}  const __schedule = armSchedule(__scheduleSpec, {
     onWake: async () => {
       await __scheduleLane.tick();
@@ -2382,6 +2393,30 @@ try {
 `
     : "";
   const scheduleShutdown = ir.schedule ? "\n      __schedule.cancel();" : "";
+
+  // Named schedule lanes (#514): the same wake body per lane, each its own
+  // control lane `schedule:<name>` on its own clock (`armScheduleLanes`), so a
+  // slow lane never holds up another. Absent `scheduleLanes` emits nothing.
+  const scheduleLanesBoot = ir.scheduleLanes
+    ? `
+  // Named schedule lanes: one wake loop per lane (cron|interval + jitter)
+  const __scheduleLaneTicks = [${ir.scheduleLanes.map(() => "0").join(", ")}];
+${renderScheduleLanes({
+  lanes: ir.scheduleLanes.map((lane) => ({
+    ...lane,
+    instructions: lane.instructions ?? "[scheduled wake] proceed with your standing instructions.",
+  })),
+  indent: "  ",
+  body: ({ laneId, index, instructionsVar }) =>
+    scheduleTickBody(laneId, instructionsVar, `__scheduleLaneTicks[${index}]`),
+  onErrorBody:
+    "process.stderr.write(`[schedule:${__name}] error: ${(__err as Error).message}\\n`);",
+  afterArm:
+    "for (const __l of __scheduleLanes) process.stdout.write(`[schedule:${__l.name}] armed (${__l.cadence})\\n`);",
+})}`
+    : "";
+  const scheduleLanesCancel = ir.scheduleLanes ? `${SCHEDULE_LANES_ARMED_VAR}?.cancel();` : "";
+  const scheduleLanesShutdown = ir.scheduleLanes ? `\n      ${scheduleLanesCancel}` : "";
 
   // Phase 3 §3.4 — gateway control-UI. When set, spawn a second
   // Bun.serve on the configured port serving a minimal status JSON
@@ -2651,7 +2686,7 @@ ${
     body: `process.stdout.write("[daemon] draining — intake stopped\\n");
 __janitor.stop();${ir.heartbeat ? "\nclearInterval(__heartbeatTimer);" : ""}${
       ir.schedule ? "\n__schedule.cancel();" : ""
-    }
+    }${ir.scheduleLanes ? `\n${scheduleLanesCancel}` : ""}
 // GRACEFUL stop (no closeActiveConnections): a channel turn runs INSIDE the
 // webhook request that carried it, so forcing connections shut here would
 // abort exactly the in-flight turns a drain exists to finish.
@@ -2669,7 +2704,7 @@ await runDrainSweep(() => __janitor.runOnce(), {
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: channel, ir version: ${ir.version}, file: daemon.ts)
-import { formatRunFailure, ${ir.heartbeat || ir.schedule ? "isRunFailedError, " : ""}toFailureReport } from "@crewhaus/errors";
+import { formatRunFailure, ${ir.heartbeat || ir.schedule || ir.scheduleLanes ? "isRunFailedError, " : ""}toFailureReport } from "@crewhaus/errors";
 ${extensionImports}
 ${adapterImports.join("\n")}
 import { registerChannelAdapter } from "@crewhaus/tool-message-channel";
@@ -2682,7 +2717,7 @@ import { resolveWebhookBodyLimit } from "@crewhaus/gateway-protocol/body-limit";
 import { createJanitor } from "@crewhaus/runtime-core";
 ${distill.imports}import { openAuditLog } from "@crewhaus/audit-log";
 import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
-${approvalsImport}${renderControlImports({ pendingApprovals: approvalsOn, drainSweep: true, logSafe: ir.heartbeat !== undefined || ir.schedule !== undefined })}import { join } from "node:path";
+${approvalsImport}${renderControlImports({ pendingApprovals: approvalsOn, drainSweep: true, logSafe: ir.heartbeat !== undefined || ir.schedule !== undefined || ir.scheduleLanes !== undefined })}import { join } from "node:path";
 
 ${startupEnvCheck}${observabilityEnvStamp}
 async function main(): Promise<void> {
@@ -2774,7 +2809,7 @@ ${controlJanitorTimer}
     fetch: ${renderPublicGateFetch({ innerExpr: "(req: Request) => gateway.handle(req)" })},
   });
   process.stdout.write(\`[daemon] listening on http://localhost:\${server.port}\\n\`);
-${exposeMcpBanner}${gatewayBoot}${heartbeatBoot}${scheduleBoot}${controlDrain}${controlStart}
+${exposeMcpBanner}${gatewayBoot}${heartbeatBoot}${scheduleBoot}${scheduleLanesBoot}${controlDrain}${controlStart}
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
@@ -2782,7 +2817,7 @@ ${exposeMcpBanner}${gatewayBoot}${heartbeatBoot}${scheduleBoot}${controlDrain}${
     process.stdout.write(\`[daemon] received \${signal}, shutting down...\\n\`);
     __janitor.stop();
     try {
-      await server.stop(true);${gatewayShutdown}${heartbeatShutdown}${scheduleShutdown}${mcpCleanup}${exposeMcpCleanup}
+      await server.stop(true);${gatewayShutdown}${heartbeatShutdown}${scheduleShutdown}${scheduleLanesShutdown}${mcpCleanup}${exposeMcpCleanup}
     } catch (err) {
       process.stderr.write(\`[daemon] shutdown error: \${(err as Error).message}\\n\`);
     }

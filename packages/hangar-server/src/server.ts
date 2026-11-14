@@ -2056,7 +2056,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           const body = await readBody(req);
           const lane = body["lane"];
           if (typeof lane !== "string" || !isControlLane(lane)) {
-            throw new HttpError(400, 'missing "lane" — one of: heartbeat, schedule');
+            throw new HttpError(400, 'missing "lane": heartbeat, schedule or schedule:<name>');
           }
           const reason = typeof body["reason"] === "string" ? body["reason"] : undefined;
           return jsonMasked(
