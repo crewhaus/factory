@@ -6,15 +6,17 @@
  * spec's revision; `{"dryRun": false, "confirmName": "<spec name>", "expectedRev":
  * "<rev>"}` writes it through the one revision-guarded spec write. It always writes the
  * `{name, tools}` form, `tools: []` when none is chosen, because a bare name lets the
- * plugin drive every host tool its manifest asks for. A tool outside what the live
- * grant serves is refused. No CLI twin: edit `plugins:` in crewhaus.yaml.
+ * plugin drive every host tool its manifest asks for. It writes only what the grant
+ * allows on this harness: a plugin whose live grant does not cover this harness is
+ * refused before the dry run, and a tool outside what the grant serves is refused. No
+ * CLI twin: edit `plugins:` in crewhaus.yaml.
  */
 import { PLUGIN_NAME_RE } from "@crewhaus/control-contract";
 import { parseYamlOnly } from "@crewhaus/spec-patch/commit";
 import { HttpError } from "./http";
 import { type M3Handler, requireTypedConfirm } from "./m3";
 import { asksOf, liveGrantOf, readPluginGrants, servedOf, standingFrom } from "./plugin-grants";
-import { readPluginInventory } from "./plugins";
+import { readPluginInventory, servesHarness } from "./plugins";
 import {
   commitSpecEdits,
   previewHomeEdits,
@@ -80,13 +82,19 @@ export const pluginUseWrite: M3Handler = async (ctx) => {
     (p) => p.name === name,
   );
   const live = liveGrantOf(read.grants, name);
-  if (row === undefined || live === undefined || row.problems.length > 0) {
+  const served =
+    row === undefined || live === undefined || row.problems.length > 0
+      ? undefined
+      : servedOf(live, asksOf(row));
+  // One answer whether there is no live grant or it covers other harnesses only, so the
+  // refusal never hints that a grant exists on a harness this caller may not see.
+  if (served === undefined || ctx.entry === null || !servesHarness(served, ctx.entry.id)) {
+    const id = ctx.entry?.id ?? "<id>";
     throw new HttpError(
       409,
-      `"${name}" has no live grant: allow it in Settings › Plugins first (crewhaus plugins grant ${name})`,
+      `"${name}" is not allowed on this harness: allow it in Settings › Plugins first (crewhaus plugins grant ${name} --harness ${id})`,
     );
   }
-  const served = servedOf(live, asksOf(row));
   const raw = ctx.body["tools"] ?? [];
   if (!Array.isArray(raw) || raw.some((t) => typeof t !== "string")) {
     throw new HttpError(400, '"tools" must be a list of host tool names');

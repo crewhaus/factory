@@ -1,8 +1,8 @@
 /**
  * Using a granted plugin in one harness (#522): `PUT /api/h/:id/builders/plugins/:name`
  * is dry-run-first and typed-confirm, writes the `{name, tools}` form only, refuses a
- * tool the live grant does not serve, and answers a stale revision with the spec
- * write's own 412.
+ * tool the live grant does not serve, writes only on a harness the grant covers, and
+ * answers a stale revision with the spec write's own 412.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -20,7 +20,9 @@ afterEach(async () => {
   for (const done of cleanups.splice(0)) await done();
 });
 
-async function setUp(opts: { grant?: boolean; target?: string; spec?: string } = {}) {
+async function setUp(
+  opts: { grant?: boolean; target?: string; spec?: string; grantOn?: "first" | "all" } = {},
+) {
   const scratch = mkdtempSync(join(tmpdir(), "plugin-use-"));
   const pluginsDir = join(scratch, "plugins");
   mkdirSync(join(pluginsDir, "notes-pane"), { recursive: true });
@@ -46,23 +48,37 @@ async function setUp(opts: { grant?: boolean; target?: string; spec?: string } =
   });
   const added = await t.api("/api/harnesses", { method: "POST", body: JSON.stringify({ dir }) });
   const id = (added.body["entry"] as { id: string }).id;
+  const otherDir = join(t.harnessesRoot, "other");
+  makeFixtureHarness(otherDir, { specName: "other" });
+  const addedOther = await t.api("/api/harnesses", {
+    method: "POST",
+    body: JSON.stringify({ dir: otherDir }),
+  });
+  const otherId = (addedOther.body["entry"] as { id: string }).id;
   if (opts.grant !== false) {
     const row = readPluginInventory(pluginsDir).plugins[0] as PluginRow;
     const done = await grantPlugin(t.hangarRoot, {
       row,
-      grant: { ...SERVED_NOTHING, harnesses: [id], tools: ["Read"] },
+      grant: {
+        ...SERVED_NOTHING,
+        harnesses: opts.grantOn === "all" ? "all" : [id],
+        tools: ["Read"],
+      },
       by: "local:test",
       cmd: "cmd_test",
     });
     if (!done.ok) throw new Error("no grant");
   }
   const spec = () => readFileSync(join(dir, "crewhaus.yaml"), "utf8");
-  const put = (body: Record<string, unknown>) =>
-    t.api(`/api/h/${id}/builders/plugins/notes-pane`, {
+  const otherSpec = () => readFileSync(join(otherDir, "crewhaus.yaml"), "utf8");
+  const putOn = (harness: string, body: Record<string, unknown>) =>
+    t.api(`/api/h/${harness}/builders/plugins/notes-pane`, {
       method: "PUT",
       body: JSON.stringify(body),
     });
-  return { t, id, dir, spec, put };
+  const put = (body: Record<string, unknown>) => putOn(id, body);
+  const putOther = (body: Record<string, unknown>) => putOn(otherId, body);
+  return { t, id, otherId, dir, spec, otherSpec, put, putOther };
 }
 
 describe("using a granted plugin in a harness", () => {
@@ -130,12 +146,57 @@ describe("using a granted plugin in a harness", () => {
     const ungranted = await setUp({ grant: false });
     const res = await ungranted.put({ tools: [] });
     expect(res.status).toBe(409);
-    expect(String(res.body["error"])).toContain("no live grant");
+    expect(String(res.body["error"])).toBe(
+      `"notes-pane" is not allowed on this harness: allow it in Settings › Plugins first (crewhaus plugins grant notes-pane --harness ${ungranted.id})`,
+    );
     const workflow = await setUp({ target: "workflow" });
     const shaped = await workflow.put({ tools: [] });
     expect(shaped.status).toBe(409);
     expect(String(shaped.body["error"])).toContain("only cli and channel");
   }, 40_000);
+});
+
+describe("the grant decides which harnesses a plugin may be used in", () => {
+  test("a grant on one harness refuses another, on the dry run and the write", async () => {
+    const { otherId, otherSpec, putOther } = await setUp({ grantOn: "first" });
+    const before = otherSpec();
+    const message = `"notes-pane" is not allowed on this harness: allow it in Settings › Plugins first (crewhaus plugins grant notes-pane --harness ${otherId})`;
+    const dry = await putOther({ tools: ["Read"] });
+    expect(dry.status).toBe(409);
+    expect(String(dry.body["error"])).toBe(message);
+    expect(dry.body["diff"]).toBeUndefined();
+    const wrote = await putOther({
+      tools: ["Read"],
+      dryRun: false,
+      confirmName: "other",
+      expectedRev: "any",
+    });
+    expect(wrote.status).toBe(409);
+    expect(String(wrote.body["error"])).toBe(message);
+    expect(otherSpec()).toBe(before);
+  }, 20_000);
+
+  test("the same grant answers the diff on the harness it names", async () => {
+    const { put } = await setUp({ grantOn: "first" });
+    const dry = await put({ tools: ["Read"] });
+    expect(dry.status).toBe(200);
+    expect(String(dry.body["diff"])).toContain("notes-pane");
+  }, 20_000);
+
+  test("a grant on every harness allows any of them", async () => {
+    const { otherSpec, putOther } = await setUp({ grantOn: "all" });
+    const dry = await putOther({ tools: ["Read"] });
+    expect(dry.status).toBe(200);
+    expect(String(dry.body["diff"])).toContain("notes-pane");
+    const wrote = await putOther({
+      tools: ["Read"],
+      dryRun: false,
+      confirmName: "other",
+      expectedRev: dry.body["rev"],
+    });
+    expect(wrote.status).toBe(200);
+    expect(otherSpec()).toContain("name: notes-pane");
+  }, 20_000);
 });
 
 describe("withPluginEntry", () => {

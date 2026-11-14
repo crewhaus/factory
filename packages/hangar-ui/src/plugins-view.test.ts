@@ -1,15 +1,22 @@
 /**
  * Settings › Plugins (#522): the state words, the ticks a review starts with (unticked
  * unless the plugin predates asking, or already has a grant), the request a set of
- * ticks makes, the embed row a compiled binary needs, and no markup assignment.
+ * ticks makes, what the review says about a signature, which harnesses offer "Use in
+ * this harness", the embed row a compiled binary needs, and no markup assignment.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import * as destinations from "../assets/js/destinations.js";
-// @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { STATE_WORDS, grantBody, initialTicks } from "../assets/js/views/plugins.js";
+import {
+  STATE_WORDS,
+  grantBody,
+  initialTicks,
+  servesThisHarness,
+  signatureWords,
+  // @ts-expect-error — hand-written browser JS, typed as text for the embed map
+} from "../assets/js/views/plugins.js";
 import { integrationsAssets } from "./embed/integrations";
 
 const SOURCE = readFileSync(
@@ -59,6 +66,28 @@ describe("Settings › Plugins", () => {
     expect(grantBody(ticks, { gen: 3 })).toEqual({ ...ASKS, expect: 3 });
     expect(grantBody(ticks, { gen: null })).toEqual(ASKS);
     expect(grantBody({ ...ticks, all: true }, { gen: null }).harnesses).toBe("all");
+  });
+
+  test("a signature is reported as present, never as verified", () => {
+    // Home sees only that a manifest carries a signature; the loader checks it.
+    const signed = signatureWords({ signed: true });
+    expect(signed).toBe("Has a signature (checked when a harness loads it)");
+    expect(signatureWords({ signed: false })).toBe("No signature");
+    expect(signatureWords({})).toBe("No signature");
+    for (const words of [signed, signatureWords({ signed: false })]) {
+      expect(/\bsigned\b|verified/i.test(words)).toBe(false);
+    }
+    expect(SOURCE.includes('" · Signed"')).toBe(false);
+  });
+
+  test("Use in this harness is offered only where the served view covers the harness", () => {
+    const a = "hrn_00000000000000a1";
+    const b = "hrn_00000000000000b2";
+    expect(servesThisHarness({ served: { harnesses: [a] } }, a)).toBe(true);
+    expect(servesThisHarness({ served: { harnesses: [a] } }, b)).toBe(false);
+    expect(servesThisHarness({ served: { harnesses: "all" } }, b)).toBe(true);
+    expect(servesThisHarness({ served: { harnesses: [] } }, a)).toBe(false);
+    expect(servesThisHarness(null, a)).toBe(false);
   });
 
   test("the page is a Settings row, and its module is embedded", () => {

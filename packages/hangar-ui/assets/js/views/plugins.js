@@ -10,14 +10,18 @@
  * with the bundle's authority, and the screen says so.
  *
  * The review and its writes go through Home's versioned API (`plugins.review`,
- * `plugins.grant`, `plugins.revoke`). After a write, focus moves to the result's
- * heading; a 412 (someone changed the grant meanwhile) shows the fresh review
- * and keeps your ticks. DOM by createElement and textContent only.
+ * `plugins.grant`, `plugins.revoke`). After a write, the review and the card's
+ * state reload from Home and focus moves to the result's heading above them; a
+ * 412 (the access changed since the review was read) shows the fresh review,
+ * keeps your ticks and moves focus to the notice that says so. "Not now" hands
+ * focus back to the card's Review button. DOM by createElement and textContent
+ * only.
  */
 
 import { api } from "../api.js";
 import { clear, dot, el, emptyState, skeleton, statusBadge } from "../dom.js";
 import { confirmAction } from "../ui/dialog.js";
+import { announce } from "../ui/live.js";
 import { normalizeRows } from "../util.js";
 import { call, createAction } from "../v1.js";
 
@@ -40,6 +44,26 @@ const STATE_TONE = Object.freeze({
 export function stateBadge(state) {
   return statusBadge(STATE_TONE[state] ?? "off", STATE_WORDS[state] ?? String(state ?? ""));
 }
+
+/**
+ * What the review says about a manifest's signature. Home only sees that a
+ * signature is there; the loader checks it when a harness loads the plugin. So
+ * the words never claim more than that.
+ */
+export function signatureWords(review) {
+  return review?.signed === true
+    ? "Has a signature (checked when a harness loads it)"
+    : "No signature";
+}
+
+/** Whether a review's served view covers one harness. */
+export function servesThisHarness(review, harnessId) {
+  const harnesses = review?.served?.harnesses;
+  return harnesses === "all" || (Array.isArray(harnesses) && harnesses.includes(harnessId));
+}
+
+const STALE_NOTICE =
+  "This plugin's access changed since you opened it. Your choices are kept; check them and allow again.";
 
 const LIMIT_SENTENCE =
   "These choices limit what CrewHaus hands this plugin. They do not limit what its own code can do: a harness that loads it runs its code with the harness's own access.";
@@ -136,11 +160,14 @@ function pluginCard(plugin, harnesses) {
   const problems = asList(plugin?.problems);
   const card = el("section", { class: "card plugin-card", "aria-label": name });
   const body = el("div");
+  const badgeSlot = el("span", { class: "plugin-state" }, [
+    problems.length > 0 ? dot("bad", "Cannot be used") : stateBadge(plugin?.grant?.state),
+  ]);
   card.appendChild(
     el("div", { class: "rollup" }, [
       el("h3", { class: "card-title", text: name }),
       el("span", { class: "muted mono", text: String(plugin?.version ?? "") }),
-      problems.length > 0 ? dot("bad", "Cannot be used") : stateBadge(plugin?.grant?.state),
+      badgeSlot,
     ]),
   );
   if (plugin?.description)
@@ -150,9 +177,10 @@ function pluginCard(plugin, harnesses) {
     return card;
   }
   const review = el("button", { class: "btn btn-primary", type: "button", text: "Review" });
+  const parts = { badgeSlot, reviewButton: review };
   review.addEventListener("click", async () => {
     review.disabled = true;
-    await openReview(body, name, harnesses, null);
+    await openReview(body, name, harnesses, { card: parts });
     review.disabled = false;
   });
   card.appendChild(
@@ -169,24 +197,36 @@ function twin(command) {
   ]);
 }
 
-/** Load a review into `host`, keeping `keep` (ticks) when given, as after a 412. */
-async function openReview(host, name, harnesses, keep, notice) {
+/**
+ * Load a review into `host`, fresh from Home. `opts.card` holds the card's state
+ * badge (refreshed from the review) and its Review button; `opts.keep` keeps the
+ * ticks, as after a 412, and `opts.notice` says why, taking focus; `opts.result`
+ * shows a write's outcome above the fresh review, its heading taking focus.
+ */
+async function openReview(host, name, harnesses, opts = {}) {
+  const { card, keep, notice, result } = opts;
+  const hadFocus = host.contains(document.activeElement);
   clear(host).appendChild(skeleton(3));
   const res = await call("plugins.review", { params: { plugin: name } });
   clear(host);
   if (!res.ok) {
-    host.appendChild(
-      el("p", {
-        class: "muted",
-        role: "status",
-        text: res.error?.message ?? "The review could not be read.",
-      }),
-    );
+    const message = res.error?.message ?? "The review could not be read.";
+    const line = el("p", { class: "muted", tabindex: "-1", text: message });
+    host.appendChild(line);
+    if (hadFocus) line.focus();
+    else announce(message);
     return;
   }
-  host.appendChild(
-    reviewForm(host, name, res.body, harnesses, keep ?? initialTicks(res.body), notice),
-  );
+  if (card?.badgeSlot) clear(card.badgeSlot).appendChild(stateBadge(res.body?.state));
+  const outcome = result ? resultBlock(result.res, result.title) : null;
+  if (outcome) host.appendChild(outcome.node);
+  const form = reviewForm(host, name, res.body, harnesses, keep ?? initialTicks(res.body), {
+    card,
+    notice,
+  });
+  host.appendChild(form);
+  if (outcome) outcome.focus();
+  else if (notice) form.querySelector(".notice")?.focus();
 }
 
 function checkboxRow(label, checked, onChange, value) {
@@ -196,7 +236,8 @@ function checkboxRow(label, checked, onChange, value) {
   return el("label", { class: "check-row" }, [input, el("span", { text: label })]);
 }
 
-function reviewForm(host, name, review, harnesses, ticks, notice) {
+function reviewForm(host, name, review, harnesses, ticks, opts = {}) {
+  const { card, notice } = opts;
   const form = el("form", { class: "plugin-review", "aria-label": `Review ${name}` });
   form.addEventListener("submit", (event) => event.preventDefault());
   const asks = review?.asks ?? {};
@@ -208,11 +249,11 @@ function reviewForm(host, name, review, harnesses, ticks, notice) {
           : "Choose what this plugin may see",
     }),
   );
-  if (notice) form.appendChild(el("p", { class: "notice", role: "status", text: notice }));
+  if (notice) form.appendChild(el("p", { class: "notice", tabindex: "-1", text: notice }));
   form.appendChild(
     el("p", { class: "muted small" }, [
       el("span", { text: `Version ${String(review?.version ?? "")}` }),
-      el("span", { text: review?.signed === true ? " · Signed" : " · Not signed" }),
+      el("span", { text: ` · ${signatureWords(review)}` }),
       review?.crewhausRange
         ? el("span", { text: ` · Runs on CrewHaus ${review.crewhausRange}` })
         : null,
@@ -283,19 +324,18 @@ function reviewForm(host, name, review, harnesses, ticks, notice) {
     });
     allow.disabled = false;
     if (res.status === 412) {
-      await openReview(
-        host,
-        name,
-        harnesses,
-        ticks,
-        "Someone changed this plugin's access meanwhile. This is the latest; your choices are kept. Send them again when ready.",
-      );
+      await openReview(host, name, harnesses, { card, keep: ticks, notice: STALE_NOTICE });
       return;
     }
-    showResult(result, res, res.ok ? "Allowed" : "Not allowed");
+    if (res.ok) {
+      await openReview(host, name, harnesses, { card, result: { res, title: "Allowed" } });
+      return;
+    }
+    showResult(result, res, "Not allowed");
   });
   notNow.addEventListener("click", () => {
     clear(host);
+    card?.reviewButton?.focus();
   });
   if (typeof review?.gen === "number") {
     const remove = el("button", { class: "btn btn-danger", type: "button", text: "Remove access" });
@@ -305,7 +345,14 @@ function reviewForm(host, name, review, harnesses, ticks, notice) {
         body: {},
       });
       remove.disabled = false;
-      showResult(result, res, res.ok ? "Access removed" : "Access not removed");
+      if (res.ok) {
+        await openReview(host, name, harnesses, {
+          card,
+          result: { res, title: "Access removed" },
+        });
+        return;
+      }
+      showResult(result, res, "Access not removed");
     });
     actions.push(remove);
   }
@@ -323,25 +370,31 @@ function reviewForm(host, name, review, harnesses, ticks, notice) {
   return form;
 }
 
-function showResult(host, res, title) {
-  clear(host);
+/** A write's outcome: a heading that takes focus, and what happened. */
+function resultBlock(res, title) {
   const heading = el("h4", { tabindex: "-1", text: title });
-  host.appendChild(heading);
-  host.appendChild(
+  const node = el("div", { class: "plugin-result" }, [
+    heading,
     el("p", {
       class: "muted",
-      role: "status",
       text: res.ok
         ? "Saved. Home serves this plugin only what you allowed."
         : (res.error?.message ?? "Home did not take it."),
     }),
-  );
-  heading.focus();
+  ]);
+  return { node, focus: () => heading.focus() };
+}
+
+function showResult(host, res, title) {
+  const outcome = resultBlock(res, title);
+  clear(host).appendChild(outcome.node);
+  outcome.focus();
 }
 
 /**
  * Setup › Plugins' "Use in this harness": choose which host tools the plugin's
  * tools may use here, see the change to crewhaus.yaml, then type the spec's name.
+ * `reload(flash)` re-renders the page after the write and focuses `flash.text`.
  * It always writes `{name, tools}`: a bare name would let the plugin use every
  * host tool it asks for.
  */
@@ -384,10 +437,14 @@ export function useInHarness(ctx, plugin, servedTools, reload) {
           { id: ctx.id, name },
           { tools, dryRun: false, confirmName, expectedRev: String(plan.body?.rev ?? "") },
         );
+        if (res.ok && reload) {
+          // The page re-renders and this button goes; the new page focuses this line.
+          await reload({ plugin: name, text: `${name} is in this harness's plugins: list.` });
+          return;
+        }
         host.textContent = res.ok
           ? `${name} is in this harness's plugins: list.`
           : String(res.body?.error ?? `HTTP ${res.status}`);
-        if (res.ok) reload?.();
       },
     });
   });
