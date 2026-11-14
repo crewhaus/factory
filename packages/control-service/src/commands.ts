@@ -24,6 +24,7 @@ import {
   isCommandKind,
   isId,
   mintId,
+  parseActor,
   parseRef,
 } from "@crewhaus/control-contract";
 import {
@@ -45,7 +46,8 @@ export type SubmitRequest = {
   /** A command kind, or `legacy.<route key>`. */
   readonly kind: string;
   /**
-   * Who asked, as a principal `prn_…`: the signed-in caller. Absent, the head's own OS user
+   * Who asked, as a principal `prn_…` (the signed-in caller) or one of the system actors
+   * (`sys:ingress` for a receiver's verified delivery). Absent, the head's own OS user
    * stands in (the CLI in direct mode, or a Home with sign-in turned off).
    */
   readonly actor?: string;
@@ -69,6 +71,12 @@ export type SubmitRequest = {
   readonly secretFields?: readonly string[];
   /** The `Idempotency-Key` value, when the caller sent one. */
   readonly idempotency?: string;
+  /**
+   * A claim name (`<kind>/<name>`) the head chose for a delivery that must be accepted
+   * exactly once, in place of an idempotency key's: a receiver's delivery id. The first
+   * request writes the receipt with the claim; every later one is answered as a replay.
+   */
+  readonly dedupeClaim?: string;
   /** Whether repeating is safe, for a legacy kind (a command kind declares its own). */
   readonly idempotent?: boolean;
   /** The command is carried out by a queued job, which moves the receipt. */
@@ -263,11 +271,27 @@ export function createCommands(core: ControlCore): CommandsInternals {
         refusal: refuse("invalid", "an idempotency key is 1-128 of A-Z a-z 0-9 . _ : -"),
       };
     }
+    if (request.dedupeClaim !== undefined && request.idempotency !== undefined) {
+      return {
+        ok: false,
+        refusal: refuse(
+          "invalid",
+          "a command takes an idempotency key or a delivery claim, not both",
+        ),
+      };
+    }
     if (request.target !== undefined && "error" in parseRef(request.target)) {
       return { ok: false, refusal: refuse("invalid", "the command's target is not a ref") };
     }
-    if (request.actor !== undefined && !isId("prn", request.actor)) {
-      return { ok: false, refusal: refuse("invalid", "the command's actor is not a principal") };
+    if (
+      request.actor !== undefined &&
+      !isId("prn", request.actor) &&
+      parseActor(request.actor)?.form !== "system"
+    ) {
+      return {
+        ok: false,
+        refusal: refuse("invalid", "the command's actor is not a principal or a system actor"),
+      };
     }
     if (request.credentialRef !== undefined) {
       if (!isId("crd", request.credentialRef)) {
@@ -318,12 +342,13 @@ export function createCommands(core: ControlCore): CommandsInternals {
         ? parsedTarget.id
         : "home";
     const dedupeRef =
-      request.idempotency === undefined
+      request.dedupeClaim ??
+      (request.idempotency === undefined
         ? undefined
         : idempotencyClaim(
             { actor, harness: harnessScope, kind: request.kind },
             request.idempotency,
-          );
+          ));
     const accepted: CommandReceipt = {
       id,
       v: 1,

@@ -5,7 +5,11 @@ import type { LeaseProbe } from "@crewhaus/control-records";
 import type { HarnessSupervisor } from "@crewhaus/harness-supervisor";
 import type { Executor, ExecutorStamp, Reconciler } from "./executor";
 
-export type ControlMode = "server" | "direct";
+/**
+ * Where the control plane runs: Home in a window (`server`), Home as the installed
+ * service (`resident`), or the CLI acting on one harness (`direct`).
+ */
+export type ControlMode = "server" | "resident" | "direct";
 
 export type ControlCore = {
   readonly mode: ControlMode;

@@ -7,7 +7,7 @@
  * |---|---|
  * | a job's receipt | the job queue moves it; Home alone settles one no job row names |
  * | a control a later control of the same family on the same harness overtook | `unknown`: superseded, never run |
- * | a daemon start accepted before the machine booted | `unknown`: not started, the machine restarted |
+ * | a daemon start accepted before the machine booted | `unknown`: not started, the machine restarted; the installed service (`resident`) takes the accepted rows below instead |
  * | `accepted`, safe to repeat | run again |
  * | `accepted`, not safe to repeat | reconcile: done → `succeeded`, not done → run again |
  * | `running`, safe to repeat | the first recoverer to claim it runs it again, or settles it `failed` (forbidden) when its submitter may no longer do it |
@@ -38,8 +38,9 @@
  * recovery visits (`AreaRuntime.runSweeps`), and `runsInterrupted` counts the runs they
  * closed, present only when one did.
  *
- * Recovery writes; it runs at Home's boot and before the CLI's first change to a harness,
- * never on a read.
+ * Recovery writes; it runs at Home's boot (in a window or as the installed service) and
+ * before the CLI's first change to a harness, never on a read. Only the installed service
+ * starts a daemon whose start was asked for before the machine booted.
  */
 import type { CommandReceipt } from "@crewhaus/control-contract";
 import {
@@ -146,7 +147,8 @@ export function createRecover(
     } else {
       targets.push({ ledger: commandsLedgerOf(scope.harness), dir: scope.harness });
     }
-    const queued = scope === "all" && core.mode === "server" ? jobs.commandIds() : undefined;
+    // Home, in a window or as the installed service, owns the job queue.
+    const queued = scope === "all" && core.mode !== "direct" ? jobs.commandIds() : undefined;
     const hostBootedAt = core.hostBootedAt();
 
     const settle = async (
@@ -209,6 +211,7 @@ export function createRecover(
         }
 
         if (
+          core.mode !== "resident" &&
           receipt.state === "accepted" &&
           DAEMON_STARTS.has(receipt.kind) &&
           Date.parse(receipt.acceptedAt) < hostBootedAt

@@ -19,6 +19,7 @@ export {
   type CasAnswer,
   type CasPrecondition,
   type ClaimContent,
+  type ClaimList,
   type ExpireAnswer,
   type FoldAnomaly,
   type FoldAnswer,
@@ -36,6 +37,7 @@ export {
   readClaim,
   withLedgerLock,
   expireClaim,
+  listClaims,
 } from "./ledger";
 export { type DropAnswer, dropSegmentsBefore } from "./retention";
 export {

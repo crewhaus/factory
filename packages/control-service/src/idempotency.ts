@@ -6,7 +6,13 @@
  */
 import { createHash } from "node:crypto";
 import { canonicalJson } from "@crewhaus/control-contract";
-import { type Ledger, expireClaim, keyedDigest, readClaim } from "@crewhaus/control-records";
+import {
+  type Ledger,
+  expireClaim,
+  keyedDigest,
+  listClaims,
+  readClaim,
+} from "@crewhaus/control-records";
 
 export const IDEMPOTENCY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -35,6 +41,27 @@ export async function expireStaleClaim(ledger: Ledger, claim: string, now: numbe
   const notBefore = now - IDEMPOTENCY_TTL_MS;
   const at = Date.parse(read.content.at);
   if (Number.isFinite(at) && at < notBefore) await expireClaim(ledger, claim, notBefore);
+}
+
+/**
+ * Remove every idempotency claim in a ledger older than the seven days a key is honoured,
+ * each by {@link expireStaleClaim}'s own rule: listed without a lock, and the lock taken
+ * only for a claim that is due. Answers how many claims were looked at, and whether the
+ * listing was cut short.
+ *
+ * First consumer: Home's `claims` sweep.
+ */
+export async function expireIdempotencyClaims(
+  ledger: Ledger,
+  now: number,
+): Promise<{ readonly checked: number; readonly truncated: boolean }> {
+  const listed = listClaims(ledger, "idem");
+  if (!listed.ok) {
+    if (listed.code === "not-found") return { checked: 0, truncated: false };
+    throw new Error(listed.reason);
+  }
+  for (const claim of listed.names) await expireStaleClaim(ledger, claim, now);
+  return { checked: listed.names.length, truncated: listed.truncated };
 }
 
 /** The body without the fields that hold a secret, so no receipt hashes a credential. */

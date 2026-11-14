@@ -1,8 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  type Dirent,
+  appendFileSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { adoptRunning, verifyRunfile } from "./adoption";
+import { adoptRunning, observeRunfile, verifyRunfile } from "./adoption";
 import { argvFingerprint } from "./process-ops";
 import {
   appendRunLedger,
@@ -156,6 +164,74 @@ describe("verifyRunfile", () => {
     const verdict = verifyRunfile(seedRunning(dir, { pidStartTimeMs: 1 }), ops);
     expect(verdict.live).toBe(false);
     expect(verdict.reason).toBe("start-time-mismatch");
+  });
+});
+
+/** Every file under a directory, path to bytes. */
+function treeBytes(dir: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const walk = (at: string): void => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(at, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const path = join(at, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else out.set(path, readFileSync(path, "latin1"));
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+describe("observeRunfile", () => {
+  test("live, judged as adoption judges it, and the harness is byte-identical after", () => {
+    const ops = createFakeProcessOps();
+    ops.register(4242, START, ARGV.join(" "));
+    const dir = tempHarness();
+    const runfile = seedRunning(dir);
+    const before = treeBytes(dir);
+    const seen = observeRunfile(dir, ops);
+    expect(seen.state).toBe("live");
+    expect(seen.state === "live" && seen.runfile).toEqual(runfile);
+    expect(treeBytes(dir)).toEqual(before);
+  });
+
+  type Ops = ReturnType<typeof createFakeProcessOps>;
+  for (const [name, reason, register] of [
+    ["the pid is dead", "pid-dead", () => undefined],
+    [
+      "the start time does not match",
+      "start-time-mismatch",
+      (ops: Ops) => ops.register(4242, START + 60_000, ARGV.join(" ")),
+    ],
+    [
+      "the command line is another program's",
+      "argv-mismatch",
+      (ops: Ops) => ops.register(4242, START, "python other.py"),
+    ],
+  ] as const) {
+    test(`stale when ${name}, and the runfile and the ledger are left as they are`, () => {
+      const ops = createFakeProcessOps();
+      register(ops);
+      const dir = tempHarness();
+      seedRunning(dir);
+      const before = treeBytes(dir);
+      const seen = observeRunfile(dir, ops);
+      expect(seen.state === "stale" && seen.reason).toBe(reason);
+      expect(readRunfile(dir)).toBeDefined();
+      expect(treeBytes(dir)).toEqual(before);
+    });
+  }
+
+  test("none without a runfile, writing nothing", () => {
+    const dir = tempHarness();
+    const before = treeBytes(dir);
+    expect(observeRunfile(dir, createFakeProcessOps())).toEqual({ state: "none" });
+    expect(treeBytes(dir)).toEqual(before);
   });
 });
 

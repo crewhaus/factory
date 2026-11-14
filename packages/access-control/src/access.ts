@@ -55,7 +55,12 @@ import {
   runMutation,
 } from "./mutate";
 import { accessLedger, accessPaths, inviteEndClaim } from "./paths";
-import type { AccessHarness, ProjectionReport } from "./projection";
+import {
+  type AccessHarness,
+  EMPTY_REPORT,
+  type ProjectionReport,
+  projectionsBehind,
+} from "./projection";
 import type {
   CredentialRow,
   GrantRow,
@@ -1306,6 +1311,89 @@ async function syncProjections(
   );
   if (!done.ok) return done;
   return { ...done, epoch: synced ?? done.epoch, projections: report ?? done.projections };
+}
+
+/** The stored actor Home's own projection refresh writes as. */
+const RECONCILE_ACTOR = "sys:reconcile";
+
+export type RefreshInput = {
+  /** The registered harnesses, each with the groups it is in now. */
+  readonly harnesses: readonly AccessHarness[];
+  readonly now: number;
+};
+
+export type RefreshAnswer = {
+  /** Whether the access lock was taken: something was behind. */
+  readonly refreshed: boolean;
+  readonly projections: ProjectionReport;
+};
+
+/**
+ * Keep every approver list where the access records and the registry put it now, as
+ * Home's own system writer: a group move that changes who a grant covers, and a deciding
+ * credential's end, reach the lists within a tick, with no access write. It checks first,
+ * without a lock ({@link projectionsBehind}), and does nothing at all when every list
+ * holds what it should, so an idle tick writes nothing. Otherwise, under the access lock,
+ * it brings the projections to the records at the snapshot's revision (moved above a file
+ * that is ahead first, as `sync` does), writing only a governed harness whose content
+ * differs. A harness a grant has newly come to cover is governed here exactly as an access
+ * write would govern it, with a `governed.jsonl` row by `sys:reconcile`.
+ *
+ * It takes no actor and checks none: `sys:reconcile` never acts on its own authority, and
+ * this changes nothing about who has access, only where the lists already say. Over a Home
+ * nobody else has access to, it does nothing and creates nothing. No route reaches it.
+ *
+ * First consumer: Home's reconcile sweep.
+ */
+export async function refreshApproverProjections(
+  hangarRoot: string,
+  input: RefreshInput,
+): Promise<RefreshAnswer> {
+  const idle: RefreshAnswer = { refreshed: false, projections: EMPTY_REPORT };
+  const read = loadAccessSnapshot(hangarRoot);
+  if (read.state !== "present") return idle;
+  if (
+    !projectionsBehind({
+      root: hangarRoot,
+      snapshot: read.snapshot,
+      harnesses: input.harnesses,
+      now: input.now,
+    })
+  ) {
+    return idle;
+  }
+  const ctx = contextFor(hangarRoot, { now: () => input.now, harnesses: () => input.harnesses });
+  const at = new Date(input.now).toISOString();
+  const locked = await withLedgerLock(
+    accessLedger(hangarRoot, "principals"),
+    (): ProjectionReport => {
+      const again = loadAccessSnapshot(hangarRoot);
+      if (again.state !== "present") return EMPTY_REPORT;
+      let epoch = again.snapshot.epoch;
+      const floor = projectionEpochFloor(ctx, input.now);
+      if (floor > epoch) {
+        const moved = writeRevision(hangarRoot, floor + 1, at);
+        if (!moved.ok) {
+          return {
+            ...EMPTY_REPORT,
+            failed: [{ harness: "every governed harness", reason: moved.reason }],
+          };
+        }
+        epoch = floor + 1;
+      }
+      return projectAfter(ctx, { epoch, now: input.now, by: RECONCILE_ACTOR });
+    },
+  );
+  if ("ok" in locked && locked.ok === false) {
+    return {
+      refreshed: true,
+      projections: {
+        ...EMPTY_REPORT,
+        failed: [{ harness: "every governed harness", reason: locked.reason }],
+      },
+    };
+  }
+  return { refreshed: true, projections: locked as ProjectionReport };
 }
 
 // ---------------------------------------------------------------------------

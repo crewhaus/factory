@@ -418,8 +418,9 @@ describe("defaultNotificationSinks — the sinks the shipping binary uses", () =
 });
 
 describe("GET/PUT /api/notifications", () => {
-  test("the route returns the badge, and a PUT round-trips through the settings file", async () => {
-    const t = bootTestServer({ now: () => NOW });
+  test("a read delivers nothing; the tick delivers once; a PUT round-trips through the settings file", async () => {
+    let clock = NOW;
+    const t = bootTestServer({ now: () => clock });
     try {
       const dir = join(t.harnessesRoot, "notified");
       makeFixtureHarness(dir, {
@@ -439,15 +440,30 @@ describe("GET/PUT /api/notifications", () => {
       });
       await t.api("/api/harnesses", { method: "POST", body: JSON.stringify({ dir }) });
 
-      const first = await t.api("/api/notifications");
-      expect(first.status).toBe(200);
-      expect(first.body["badge"]).toBe(1);
-      expect((first.body["delivered"] as Delivery[])[0]?.kind).toBe("approval-parked");
+      // Before Home's tick, a read delivers nothing and fires no sink.
+      const before = await t.api("/api/notifications");
+      expect(before.status).toBe(200);
+      expect(before.body["delivered"]).toEqual([]);
+      expect(before.body["badge"]).toBe(0);
+      expect(t.sinks?.os).toEqual([]);
 
-      // A second poll delivers nothing new but the badge persists.
+      await t.server.scheduler.tick();
+      const first = await t.api("/api/notifications");
+      expect(first.body["badge"]).toBe(1);
+      const delivered = first.body["delivered"] as Delivery[];
+      expect(delivered.map((d) => d.kind)).toEqual(["approval-parked"]);
+      expect(delivered[0]?.at).toBe(new Date(NOW).toISOString());
+
+      // Read again with no tick: the same list, and nothing fires.
+      const again = await t.api("/api/notifications");
+      expect(again.body["delivered"]).toEqual(delivered);
+      // The next tick delivers nothing new; the badge persists.
+      clock += 10_000;
+      await t.server.scheduler.tick();
       const second = await t.api("/api/notifications");
-      expect(second.body["delivered"]).toEqual([]);
+      expect(second.body["delivered"]).toEqual(delivered);
       expect(second.body["badge"]).toBe(1);
+      expect((second.body["inApp"] as unknown[]).length).toBe(1);
 
       const put = await t.api("/api/notifications", {
         method: "PUT",

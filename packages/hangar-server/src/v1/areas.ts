@@ -1,15 +1,22 @@
 /**
- * Home's area slots for the versioned API: what each area hands Home to serve its
- * operations. One entry per area, in the order the contract composes them. An area's
- * first change uncomments its own lines and nothing else; each placeholder sits between
- * blank lines so two areas editing their own lines never conflict. Keep the blanks.
+ * Home's area slots: what each area hands Home to run while it runs and to serve its
+ * versioned-API operations. One entry per area, in the order the contract composes them.
+ * An area's first change uncomments its own lines and nothing else; each placeholder sits
+ * between blank lines so two areas editing their own lines never conflict. Keep the blanks.
  *
- * Only the slots something iterates are here: handlers by operation id, ref resolvers by
- * ref kind, and capability providers. Home's boot refuses a composition with a handler for
- * an operation no module declares, a handler or a ref kind registered twice, or an area
- * with no module (`homeCompositionProblems`).
+ * Only the slots something iterates are here: the sweeps Home's tick runs, the receivers
+ * its ingress listener answers for, handlers by operation id, ref resolvers by ref kind,
+ * and capability providers. Home's boot refuses a composition with a sweep named twice or
+ * run more often than once a second; a receiver whose provider is named twice or is not a
+ * provider name, whose origin is not a `TrustOrigin`, whose `via` is not a receipt door or
+ * whose kind is not a receipt kind; a handler for an operation no module declares, a
+ * handler or a ref kind registered twice, or an area with no module
+ * (`homeCompositionProblems`).
  */
 import { AREA_MODULES, OPERATIONS } from "@crewhaus/control-contract";
+import { type Receiver, receiverProblems } from "../ingress";
+import type { Sweep } from "../scheduler-host";
+import { CORE_SWEEPS, type HomePorts } from "../sweeps";
 import { ACCESS_HANDLERS } from "./access-ops";
 import { COMMAND_HANDLERS } from "./commands";
 import type { CapabilityProvider, RefResolver, V1Handler } from "./context";
@@ -23,6 +30,10 @@ import { RULE_HANDLERS } from "./rules";
 
 export type HomeAreaRuntime = {
   readonly area: string;
+  /** What Home's tick runs for this area, in order. */
+  readonly sweeps?: readonly Sweep<HomePorts>[];
+  /** The deliveries this area receives on Home's ingress listener. */
+  readonly receivers?: readonly Receiver[];
   /** The operations this area serves, by operation id. */
   readonly handlers?: Readonly<Record<string, V1Handler>>;
   /** What `refs.resolve` answers for the ref kinds this area owns. */
@@ -31,9 +42,10 @@ export type HomeAreaRuntime = {
   readonly capabilityProviders?: readonly CapabilityProvider[];
 };
 
-/** The core's own handlers: Home's control core, first. */
+/** The core's own entry: Home's control core, first. */
 export const HOME_CORE: HomeAreaRuntime = {
   area: "core",
+  sweeps: CORE_SWEEPS,
   handlers: {
     ...META_HANDLERS,
     ...HARNESS_HANDLERS,
@@ -75,6 +87,19 @@ export const HOME_AREAS: readonly HomeAreaRuntime[] = [
 
   // HOME_VERIFICATION,
 ];
+
+/** The shortest period a sweep may run at. */
+export const MIN_SWEEP_EVERY_MS = 1000;
+
+/** Every sweep, flattened in composition order. */
+export function sweepsOf(areas: readonly HomeAreaRuntime[]): readonly Sweep<HomePorts>[] {
+  return areas.flatMap((area) => area.sweeps ?? []);
+}
+
+/** Every receiver, flattened in composition order. */
+export function receiversOf(areas: readonly HomeAreaRuntime[]): readonly Receiver[] {
+  return areas.flatMap((area) => area.receivers ?? []);
+}
 
 /**
  * The operations declared and not served yet, each with a plain reason. The router answers
@@ -159,12 +184,39 @@ export function capabilityProvidersOf(
 }
 
 /**
- * What is wrong with a composition, one line per problem: a handler for an operation no
- * module declares, a handler, a ref kind or a capability key registered twice, an area no
- * module names, and a not-served entry for an operation that has a handler.
+ * What is wrong with a composition, one line per problem: a sweep named twice or run more
+ * often than {@link MIN_SWEEP_EVERY_MS}; every receiver problem (`receiverProblems`); a
+ * handler for an operation no module declares; a handler, a ref kind or a capability key
+ * registered twice; an area no module names; and a not-served entry for an operation that
+ * has a handler.
  */
 export function homeCompositionProblems(areas: readonly HomeAreaRuntime[]): readonly string[] {
   const problems: string[] = [];
+  const sweeps = new Map<string, string>();
+  for (const area of areas) {
+    for (const sweep of area.sweeps ?? []) {
+      const first = sweeps.get(sweep.name);
+      if (first !== undefined) {
+        problems.push(
+          `sweep "${sweep.name}" registered twice (areas "${first}" and "${area.area}")`,
+        );
+      } else {
+        sweeps.set(sweep.name, area.area);
+      }
+      if (!Number.isFinite(sweep.everyMs) || sweep.everyMs < MIN_SWEEP_EVERY_MS) {
+        problems.push(
+          `sweep "${sweep.name}" runs every ${sweep.everyMs} ms, more often than once a second (area "${area.area}")`,
+        );
+      }
+    }
+  }
+  problems.push(
+    ...receiverProblems(
+      areas.flatMap((area) =>
+        (area.receivers ?? []).map((receiver) => ({ area: area.area, receiver })),
+      ),
+    ),
+  );
   const known = new Set<string>(AREA_MODULES.map((module) => module.area));
   const operations = new Set(OPERATIONS.map((op) => op.id));
   const kinds = new Set<string>(

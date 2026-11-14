@@ -140,6 +140,50 @@ describe("a daemon start", () => {
     });
   });
 
+  test("accepted before the machine booted, in the installed service: reconciled, then run once", async () => {
+    const r = rig({ pid: 1000, mode: "resident", harnessDirs: () => [] });
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: CMD,
+      kind: "controls.start",
+      acceptedAt: iso(BOOTED - 60_000),
+      executor: { pid: 999, startedAt: iso(BOOTED - 120_000), host: HOST, head: "resident" },
+      retry: { retryable: true, safety: "reconcile-first" },
+    });
+    // No runfile: the start did not happen, so it runs, stamped by the service.
+    expect(await r.service.commands.recover({ harness: r.harness })).toEqual({
+      redispatched: 1,
+      reconciled: 0,
+      unknown: 0,
+    });
+    expect(r.supervisor.calls.filter((call) => call === "start")).toHaveLength(1);
+    const running = rowsOf(commandsLedgerOf(r.harness)).find((row) => row["state"] === "running");
+    expect((running?.["executor"] as { head?: string } | undefined)?.head).toBe("resident");
+    expect(lastRow(r.harness)?.["state"]).toBe("succeeded");
+  });
+
+  test("a start another start overtook stays superseded in the installed service too", async () => {
+    const r = rig({ pid: 1000, mode: "resident" });
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: CMD,
+      kind: "controls.start",
+      acceptedAt: iso(BOOTED - 60_000),
+      executor: { pid: 999, startedAt: iso(BOOTED - 120_000), host: HOST, head: "resident" },
+      retry: { retryable: true, safety: "reconcile-first" },
+    });
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: "cmd_01m76e6f05hp514w9j4v3qymkz",
+      kind: "controls.stop",
+      acceptedAt: iso(BOOTED - 30_000),
+      state: "succeeded",
+    });
+    await r.service.commands.recover({ harness: r.harness });
+    expect(r.supervisor.calls).toEqual([]);
+    expect(lastRow(r.harness)?.["outcome"]).toEqual({
+      code: "interrupted",
+      message: "superseded by a later command",
+    });
+  });
+
   const acceptedStart = (harness: string, state = "accepted") =>
     plantReceipt(commandsLedgerOf(harness), {
       id: CMD,
@@ -395,6 +439,25 @@ describe("Home's recovery", () => {
     expect(stateOf(other, "cmd_01m76e6f05hp514w9j4v3qymkw")).toBe("succeeded");
     const home = rowsOf(workspaceCommandsLedger(r.hangarRoot));
     expect(home.at(-1)?.["state"]).toBe("unknown");
+  });
+
+  test("the installed service settles a job that never reached the queue as Home in a window does", async () => {
+    const r = rig({ pid: 1000, mode: "resident" });
+    r.service.jobs.wrapStore(createMemoryJobStore());
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: CMD,
+      kind: "legacy.evalLaunch",
+      effects: [{ kind: "job", status: "unknown" }],
+    });
+    expect(await r.service.commands.recover("all")).toEqual({
+      redispatched: 0,
+      reconciled: 0,
+      unknown: 1,
+    });
+    expect(lastRow(r.harness)?.["outcome"]).toEqual({
+      code: "interrupted",
+      message: "interrupted, needs a decision",
+    });
   });
 
   test("a harness with no control tree is read and nothing is created", async () => {

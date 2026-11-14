@@ -132,6 +132,37 @@ export function verifyRunfile(
   };
 }
 
+export type RunfileObservation =
+  | { readonly state: "none" }
+  | { readonly state: "live"; readonly runfile: DaemonRunfile; readonly verdict: LivenessVerdict }
+  | { readonly state: "stale"; readonly runfile: DaemonRunfile; readonly reason: LivenessFailure };
+
+/**
+ * What a runfile says right now, judged exactly as {@link adoptRunning} judges it (the
+ * pid, its start time and the ledger's argv), for a reader: it never clears a runfile,
+ * patches the run ledger, opens a log pump or reconciles one. A stale runfile is reported
+ * and left where it is, for the next adoption to clear.
+ *
+ * First consumers: Home's read routes (`/proc`, `/runs/:runId`, `/control/status`,
+ * `/schedulers`) and reboot recovery's verdict.
+ */
+export function observeRunfile(
+  harnessDir: string,
+  ops: ProcessOps,
+  options: { readonly toleranceMs?: number } = {},
+): RunfileObservation {
+  const runfile = readRunfile(harnessDir);
+  if (runfile === undefined) return { state: "none" };
+  const ledgerArgv = readRunLedger(harnessDir).find((e) => e.runId === runfile.runId)?.argv;
+  const verdict = verifyRunfile(runfile, ops, {
+    ...(options.toleranceMs !== undefined ? { toleranceMs: options.toleranceMs } : {}),
+    ...(ledgerArgv !== undefined ? { expectedArgv: ledgerArgv } : {}),
+  });
+  return verdict.live
+    ? { state: "live", runfile, verdict }
+    : { state: "stale", runfile, reason: verdict.reason ?? "pid-dead" };
+}
+
 export type AdoptionResult =
   | { readonly status: "none" }
   | {

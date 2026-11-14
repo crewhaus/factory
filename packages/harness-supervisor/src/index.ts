@@ -93,8 +93,15 @@ export {
   writeRunfile,
 } from "./runfiles";
 
-export type { AdoptOptions, AdoptionResult, LivenessFailure, LivenessVerdict } from "./adoption";
-export { adoptRunning, verifyRunfile } from "./adoption";
+export type {
+  AdoptOptions,
+  AdoptionResult,
+  LivenessFailure,
+  LivenessVerdict,
+  RunfileObservation,
+} from "./adoption";
+export { adoptRunning, observeRunfile, verifyRunfile } from "./adoption";
+export { type RebootReason, type RebootVerdict, rebootVerdict } from "./reboot";
 
 export type { EnvScrubberOptions, Scrubber } from "./scrub";
 export {

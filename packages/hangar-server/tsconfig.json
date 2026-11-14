@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../access-control" },
+    { "path": "../boundary-classifier" },
     { "path": "../spec-registry" },
     { "path": "../memory-store" },
     { "path": "../wiki-store" },
@@ -30,7 +31,8 @@
     { "path": "../quality-service" },
     { "path": "../spec" },
     { "path": "../spec-changelog" },
-    { "path": "../spec-patch" }
+    { "path": "../spec-patch" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }

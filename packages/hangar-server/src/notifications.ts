@@ -16,16 +16,17 @@
  * the operator already opens, so making it interrupt them by default would
  * be the product deciding what deserves attention. They opt in.
  *
- * NO TIMER, NO BOOT COST. Evaluation runs when the console asks for the
- * notification state (the same poll that draws the badge), so the manager
- * has no background loop and boot does no work. The consequence — stated
- * because it is a real one — is that deliveries are computed from the
- * snapshot at poll time, so a condition that appears and clears between two
- * polls is never delivered. That is the honest trade for a manager with no
- * daemon of its own.
+ * DELIVERY RUNS ON HOME'S TICK. While Home runs (in a window, or as the
+ * installed service), its ten-second tick evaluates the rules over the fleet
+ * and fans out (`server.ts`'s notifications sweep); reading the notification
+ * state never delivers. While Home is not running, nothing is delivered at
+ * all, and the settings screen says so in one line with the command that
+ * installs the service. Deliveries are computed from the snapshot at tick
+ * time, so a condition that appears and clears between two ticks is not
+ * delivered.
  *
  * DEDUPE IS IN MEMORY, ON PURPOSE. A delivery key (`kind:harness:ref`) fires
- * once per manager process. Restarting the manager re-notifies whatever is
+ * once per Home process. Restarting the manager re-notifies whatever is
  * still true, which is right: after a restart the operator has not seen
  * anything, and a persisted "already told you" would silently swallow the
  * first badge of the session.
@@ -37,7 +38,7 @@
  * reaching someone who is NOT looking at the console. `poll` therefore fans
  * out first, reports the sinks that ACTUALLY took the delivery, and only
  * remembers the key when at least one did; an event no sink could carry
- * comes back as `suppressed: sink-unavailable`, every poll, until it can.
+ * comes back as `suppressed: sink-unavailable`, every tick, until it can.
  */
 import { spawn } from "node:child_process";
 
@@ -295,7 +296,7 @@ export function deriveEvents(signals: readonly HarnessSignal[]): readonly Notifi
     if (s.budgetUsedRatio !== null && s.budgetUsedRatio >= 0.8) {
       const pct = Math.round(s.budgetUsedRatio * 100);
       // Keyed by decile so a budget creeping from 81% to 89% does not
-      // re-notify on every poll, but crossing 90% does.
+      // re-notify on every tick, but crossing 90% does.
       push(
         s,
         "budget-80",
@@ -345,7 +346,7 @@ export type SuppressedEvent = {
    *  `sink-unavailable` means the rule's sinks all exist but none could
    *  carry this delivery on this manager (no webhook URL configured, or no
    *  OS notifier on this platform). It is NOT deduped: the event returns on
-   *  every poll until a sink can take it. */
+   *  every tick until a sink can take it. */
   readonly reason:
     | "rule-off"
     | "group-muted"

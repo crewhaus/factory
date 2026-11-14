@@ -5,6 +5,7 @@ import { AT, EXAMPLES, SEAL } from "./__test__/schema-examples.js";
 import {
   CORE_MODULE,
   RUN_CAUSE_KINDS,
+  SYSTEM_ACTORS,
   TRIGGER_KINDS,
   classifyRunId,
   formatRef,
@@ -144,6 +145,19 @@ describe("actors", () => {
     for (const name of ["scheduler", "reconcile", "runtime", "executor"]) {
       expect(parseActor(`sys:${name}`)?.form).toBe("system");
     }
+  });
+
+  test("the system actors are a closed list, a receiver's delivery among them", () => {
+    expect([...SYSTEM_ACTORS]).toEqual([
+      "sys:scheduler",
+      "sys:reconcile",
+      "sys:runtime",
+      "sys:executor",
+      "sys:slo",
+      "sys:ingress",
+    ]);
+    expect(parseActor("sys:ingress")).toEqual({ form: "system", id: "sys:ingress" });
+    expect(isStoredActor("sys:ingress")).toBe(true);
   });
 
   for (const bad of [

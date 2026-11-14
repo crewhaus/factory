@@ -35,6 +35,7 @@ import {
   defaultIsPidAlive,
   heldSupervisors,
   lanInviteUrl,
+  lockMode,
   qrBlockLines,
   readHangarLock,
   releaseHangarLock,
@@ -1417,5 +1418,148 @@ describe("lock contention (exclusive create)", () => {
     // Now 7777 holds it and is alive: a third console must be refused.
     const third = acquireHangarLock(ws.hangarRoot, { ...LOCK, pid: 8888 }, () => true);
     expect(third.ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The installed service
+// ---------------------------------------------------------------------------
+
+describe("hangar and the installed service", () => {
+  const plist = (home: string) => join(home, "Library", "LaunchAgents", "ai.crewhaus.hangar.plist");
+  const service = (ws: Workspace) => ({ platform: "darwin" as const, homedir: ws.root });
+
+  test("status says absent, installed and running, in text and in --json", async () => {
+    const ws = newWorkspace();
+    const statusOf = async (alive: boolean) => {
+      const text = await runHangarCommand(["status"], {
+        env: ws.env,
+        isPidAlive: () => alive,
+        service: service(ws),
+      });
+      const json = await runHangarCommand(["status", "--json"], {
+        env: ws.env,
+        isPidAlive: () => alive,
+        service: service(ws),
+      });
+      return {
+        text: text.lines.join("\n"),
+        resident: (JSON.parse(json.lines.join("\n")) as { resident: Record<string, unknown> })
+          .resident,
+      };
+    };
+    const absent = await statusOf(false);
+    expect(absent.text).toContain("resident: absent");
+    expect(absent.resident).toEqual({ state: "absent", unitPath: plist(ws.root) });
+
+    mkdirSync(join(ws.root, "Library", "LaunchAgents"), { recursive: true });
+    writeFileSync(
+      plist(ws.root),
+      '<?xml version="1.0" encoding="UTF-8"?>\n<!-- written by crewhaus hangar install -->\n<plist/>\n',
+    );
+    const installed = await statusOf(false);
+    expect(installed.text).toContain("resident: installed, not running");
+    expect(installed.resident["state"]).toBe("installed");
+
+    writeHangarLock(ws.hangarRoot, { ...LOCK, mode: "resident", version: "0.9.0" });
+    const running = await statusOf(true);
+    expect(running.text).toContain("resident: running (pid 4242, port 4200, version 0.9.0)");
+    expect(running.resident).toEqual({
+      state: "running",
+      unitPath: plist(ws.root),
+      pid: 4242,
+      port: 4200,
+      version: "0.9.0",
+    });
+  });
+
+  test("status reads the last recovery report, and an unreadable one is no report", async () => {
+    const ws = newWorkspace();
+    mkdirSync(join(ws.hangarRoot, "service"), { recursive: true });
+    writeFileSync(join(ws.hangarRoot, "service", "recovery.json"), "{not json");
+    const unreadable = await runHangarCommand(["status"], { env: ws.env, service: service(ws) });
+    expect(unreadable.exitCode).toBe(0);
+    expect(unreadable.lines.join("\n")).not.toContain("last recovery");
+    writeFileSync(
+      join(ws.hangarRoot, "service", "recovery.json"),
+      JSON.stringify({
+        v: 1,
+        at: "2026-11-13T00:00:00.000Z",
+        mode: "resident",
+        restarted: [{ harness: "hrn_0000000000000001", runId: "run_0000000000000001" }],
+        skipped: [],
+        failed: [],
+      }),
+    );
+    const read = await runHangarCommand(["status", "--json"], {
+      env: ws.env,
+      service: service(ws),
+    });
+    expect(
+      (JSON.parse(read.lines.join("\n")) as { resident: { lastRecovery: unknown } }).resident
+        .lastRecovery,
+    ).toEqual({ at: "2026-11-13T00:00:00.000Z", restarted: 1, skipped: 0 });
+  });
+
+  test("a lock with no mode is a window's", () => {
+    const ws = newWorkspace();
+    writeHangarLock(ws.hangarRoot, LOCK);
+    const lock = readHangarLock(ws.hangarRoot);
+    expect(lock?.mode).toBeUndefined();
+    expect(lockMode(lock as HangarLock)).toBe("foreground");
+    writeHangarLock(ws.hangarRoot, { ...LOCK, mode: "resident" });
+    expect(lockMode(readHangarLock(ws.hangarRoot) as HangarLock)).toBe("resident");
+  });
+
+  test("crewhaus hangar with the service running opens it, and exits 0", async () => {
+    const ws = newWorkspace();
+    writeHangarLock(ws.hangarRoot, { ...LOCK, mode: "resident" });
+    const opened: string[] = [];
+    let booted = false;
+    const out = await runHangarCommand([], {
+      env: ws.env,
+      isPidAlive: () => true,
+      openBrowser: (url) => opened.push(url),
+      startServer: () => {
+        booted = true;
+        throw new Error("no second Home");
+      },
+    });
+    expect(out.exitCode).toBe(0);
+    expect(out.lines[0]).toBe("Home is running as a service at http://127.0.0.1:4200");
+    expect(opened).toEqual(["http://127.0.0.1:4200"]);
+    expect(booted).toBe(false);
+    // A window's live lock is still refused.
+    writeHangarLock(ws.hangarRoot, LOCK);
+    await expect(
+      runHangarCommand([], { env: ws.env, isPidAlive: () => true, openBrowser: () => undefined }),
+    ).rejects.toThrow("hangar is already running");
+  });
+
+  test("serve --resident refuses sign-in off, --lan, --smoke and read-only, with exit 55", async () => {
+    const ws = newWorkspace();
+    for (const flag of ["--no-auth", "--lan", "--smoke", "--read-only", "--read-only-locked"]) {
+      let booted = false;
+      const out = await runHangarCommand(["serve", "--resident", flag], {
+        env: ws.env,
+        startServer: () => {
+          booted = true;
+          throw new Error("not reached");
+        },
+      });
+      expect([flag, out.exitCode]).toEqual([flag, 55]);
+      expect(out.lines.join("\n")).toContain(flag);
+      expect(booted).toBe(false);
+    }
+  });
+
+  test("install on Windows is refused with exit 54 through the verb", async () => {
+    const ws = newWorkspace();
+    const out = await runHangarCommand(["install", "--yes"], {
+      env: ws.env,
+      service: { platform: "win32", homedir: ws.root },
+    });
+    expect(out.exitCode).toBe(54);
+    expect(existsSync(join(ws.hangarRoot, "control"))).toBe(false);
   });
 });

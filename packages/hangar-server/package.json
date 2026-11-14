@@ -17,6 +17,7 @@
   "dependencies": {
     "@crewhaus/access-control": "workspace:*",
     "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/continuity-store": "workspace:*",
     "@crewhaus/control-contract": "workspace:*",
     "@crewhaus/control-records": "workspace:*",
@@ -43,6 +44,7 @@
     "@crewhaus/spec-changelog": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",
     "@crewhaus/spec-registry": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
     "@crewhaus/watchme-store": "workspace:*",
     "@crewhaus/wiki-store": "workspace:*"
   },

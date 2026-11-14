@@ -267,6 +267,8 @@ export type ProcessLayer = {
    */
   held(): readonly HarnessProcess[];
   readonly jobs: HomeJobQueue;
+  /** The process seam every supervisor here acts through: what a read judges a runfile by. */
+  readonly ops: ProcessOps;
   /** Adopt every registered harness, then restore the job queue. */
   boot(): Promise<{ readonly adopted: number; readonly lost: number; readonly jobs: number }>;
   close(): void;
@@ -655,6 +657,7 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
     peek: (harnessDir) => handles.get(harnessDir),
     held: () => [...handles.values()],
     jobs,
+    ops,
     boot: async () => {
       let adopted = 0;
       let lost = 0;

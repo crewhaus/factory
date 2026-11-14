@@ -287,10 +287,11 @@ function operatorExecutor(kind: OperatorControlKind): Executor {
 
 /**
  * Did this control land? The block its kind writes names this receipt: `done`; a readable
- * record names another command (or there is none): `not-done`; unreadable: `unknown`.
+ * record names another command (or there is none): `not-done`; unreadable, or a harness
+ * with no live directory: `unknown`.
  */
 export const reconcileOperatorControl: Reconciler = (receipt, ctx) => {
-  if (!isOperatorControlKind(receipt.kind)) return "unknown";
+  if (!isOperatorControlKind(receipt.kind) || ctx.harnessDir === undefined) return "unknown";
   const read = readOperatorRecord.refresh(ctx.harnessDir);
   if (read.state === "unreadable") return "unknown";
   if (read.state === "absent") return "not-done";

@@ -127,6 +127,8 @@ describe("what the package exports", () => {
         "registerDomainIn",
         "scopedEpochBumpRow",
         "scopedEpochOf",
+        // Home's reconcile sweep: approver lists follow group moves and grant ends.
+        "refreshApproverProjections",
         "verifyScopedToken",
         // Signing in from another computer, and the access lists' last use.
         "DEVICE_LIMITS",

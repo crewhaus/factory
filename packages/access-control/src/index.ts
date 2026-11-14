@@ -29,6 +29,8 @@ export {
   type RedeemAnswer,
   type RedeemOptions,
   type RedeemRefusalCode,
+  type RefreshAnswer,
+  type RefreshInput,
   type Refusal,
   type RemoveResult,
   type RevokeResult,
@@ -40,6 +42,7 @@ export {
   ensureAccessSetUp,
   openAccess,
   redeemInvite,
+  refreshApproverProjections,
   registerDomainIn,
   scopedEpochBumpRow,
 } from "./access";

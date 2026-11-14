@@ -389,6 +389,13 @@ export type HarnessSupervisor = {
    */
   adoptIfRunfile(): Promise<"adopted" | "lost" | "none">;
   /**
+   * Start the harness again after the machine started: the automatic start path, so it
+   * runs only the active deployment's build, never records what a person wants, and counts
+   * in the kept restart window like any automatic restart. The caller decides first that a
+   * person last started it (`rebootVerdict`).
+   */
+  startAfterReboot(): Promise<StartResult>;
+  /**
    * Record that the NEXT exit was asked for by an operator — the exit then
    * classifies as a clean stop and no restart is scheduled. For the drain
    * path, where the daemon exits on its own after a control.v1 call and
@@ -734,6 +741,13 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     nextRestartAtMs = undefined;
   };
 
+  /**
+   * The one automatic start: it runs only the active deployment's build, records nothing
+   * a person wants, and keeps the restart window. The restart timer and the start after a
+   * reboot both come through here.
+   */
+  const startAutomatically = (): Promise<StartResult> => start({}, { automatic: true });
+
   const scheduleRestart = (): void => {
     const attempt = window.record();
     const delay = backoffDelayMs(
@@ -753,7 +767,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       // `automatic: true` is what keeps the rolling window intact: a manual
       // start clears it, an auto-restart must not (that would make the
       // 5-in-10-minutes rule unreachable).
-      void start({}, { automatic: true })
+      void startAutomatically()
         .catch((err: unknown) => {
           lastExit = {
             disposition: "crash",
@@ -1724,6 +1738,13 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     },
     adopt,
     adoptIfRunfile,
+    startAfterReboot: async () => {
+      // Counted only when it is about to start: an attached daemon is "already running".
+      if (!closed && pid === undefined && state !== "running" && state !== "starting") {
+        window.record();
+      }
+      return startAutomatically();
+    },
     pumpNow: drainPump,
     subscribe,
     idle: () =>

@@ -161,13 +161,15 @@ const drain: Executor = async ({ supervisor, drainRequest }) => {
 /**
  * Did a start or restart happen? A live runfile whose daemon started after the command was
  * accepted is `done`; no runfile, or a recorded daemon that is gone or whose pid now names
- * another process, is `not-done`; anything else, including a probe that cannot answer and
- * a daemon that started before the command, is `unknown`.
+ * another process, is `not-done`; anything else, including a probe that cannot answer, a
+ * daemon that started before the command and a harness with no live directory, is
+ * `unknown`.
  */
 export function reconcileDaemonStart(
   receipt: CommandReceipt,
   ctx: ReconcileContext,
 ): Reconciliation {
+  if (ctx.harnessDir === undefined) return "unknown";
   const runfile = readRunfile(ctx.harnessDir);
   if (runfile === undefined) return "not-done";
   const alive = ctx.probe.isAlive(runfile.pid);

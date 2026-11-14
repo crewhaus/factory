@@ -143,6 +143,7 @@ describe("what the package exports", () => {
         "holderProvablyDead",
         "intakeRoot",
         "intakeVerdict",
+        "listClaims",
         "LOCAL_ACTOR_LABEL",
         "PROPOSAL_TTL_MS",
         "RUN_SUBJECT_LABEL",
