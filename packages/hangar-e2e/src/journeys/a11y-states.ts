@@ -125,6 +125,25 @@ export async function mockRefusals(
   );
 }
 
+/** The settings form's Save for the spec's instructions, a setting the optimizer may write. */
+export const SPEC_SAVE = `[data-focus-key='save:["agent","instructions"]']`;
+
+/**
+ * Change the spec's instructions in the settings form, so its Save has an edit
+ * to send: an unchanged control sends nothing.
+ */
+export async function editSpecInstructions(page: Page): Promise<void> {
+  const field = page.locator(`[data-focus-key='input:["agent","instructions"]']`);
+  await field.waitFor({ state: "visible", timeout: 10_000 });
+  await field.fill("You are a fixture. Answer in one line.");
+}
+
+/** Change the spec's instructions and press their Save. */
+export async function pressSpecSave(page: Page): Promise<void> {
+  await editSpecInstructions(page);
+  await page.locator(SPEC_SAVE).click();
+}
+
 /** Wait until `selector` matches something visible, or fail naming it. */
 export async function waitFor(page: Page, selector: string, what: string): Promise<void> {
   try {
@@ -412,7 +431,7 @@ export function screenStates(harness: RouteHarness): readonly ScreenState[] {
       state: "conflict view",
       route: h("#/h/:id/setup/spec"),
       open: async (page) => {
-        await page.getByRole("button", { name: "Save", exact: true }).first().click();
+        await pressSpecSave(page);
         await waitFor(page, "dialog[open] .conflict", "the conflict view");
       },
     },

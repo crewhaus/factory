@@ -3,6 +3,7 @@ import type { Page } from "playwright";
 import { crawlRoutes, loadConsoleGrammar, routeFor } from "../console-routes";
 import { MARKUP_PAYLOAD, MARKUP_VISIBLE } from "../seed/fleet";
 import { settle } from "../settle";
+import { pressSpecSave } from "./a11y-states";
 import type { Journey } from "./journey";
 
 const json = (body: unknown) => ({
@@ -142,7 +143,7 @@ export const untrustedMarkup: Journey = {
     await page.getByRole("button", { name: "View", exact: true }).first().click();
     components["dialog title"] = await shownText(page, "dialog[open] h2", "the version dialog");
     await page.keyboard.press("Escape");
-    await page.getByRole("button", { name: "Save", exact: true }).first().click();
+    await pressSpecSave(page);
     components["conflict diff"] = await shownText(
       page,
       "dialog[open] .conflict-diff",

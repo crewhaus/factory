@@ -45,6 +45,7 @@ import keyedUiJs from "../../assets/js/ui/keyed.js" with { type: "text" };
 import listboxUiJs from "../../assets/js/ui/listbox.js" with { type: "text" };
 import liveUiJs from "../../assets/js/ui/live.js" with { type: "text" };
 import panelsUiJs from "../../assets/js/ui/panels.js" with { type: "text" };
+import schemaFormUiJs from "../../assets/js/ui/schema-form.js" with { type: "text" };
 import timeUiJs from "../../assets/js/ui/time.js" with { type: "text" };
 import toggleUiJs from "../../assets/js/ui/toggle.js" with { type: "text" };
 import tooltipUiJs from "../../assets/js/ui/tooltip.js" with { type: "text" };
@@ -133,6 +134,7 @@ export const homeAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/ui/listbox.js": asset(listboxUiJs, "listbox.js"),
   "/assets/js/ui/live.js": asset(liveUiJs, "live.js"),
   "/assets/js/ui/panels.js": asset(panelsUiJs, "panels.js"),
+  "/assets/js/ui/schema-form.js": asset(schemaFormUiJs, "schema-form.js"),
   "/assets/js/ui/time.js": asset(timeUiJs, "time.js"),
   "/assets/js/ui/toggle.js": asset(toggleUiJs, "toggle.js"),
   "/assets/js/ui/tooltip.js": asset(tooltipUiJs, "tooltip.js"),

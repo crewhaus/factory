@@ -179,7 +179,7 @@ export type SpecFileRead = {
 
 /** Read the harness's spec through the dispatcher's containment closure.
  *  Absence is not an error: `present: false` with empty text. */
-export function readSpecFile(ctx: M3Context): SpecFileRead {
+export function readSpecFile(ctx: Pick<M3Context, "contain" | "entry">): SpecFileRead {
   const path = ctx.contain([SPEC_FILE]);
   const present = existsSync(path);
   const read = present ? readTextCapped(path, MAX_TEXT_BYTES) : { text: "", truncated: false };
@@ -390,7 +390,7 @@ export async function checkSpec(
 }
 
 /** Diagnostics, as the plain rows the editor anchors to a field. */
-function issueRows(check: SchemaCheck): Array<Record<string, unknown>> {
+function issueRows(check: SchemaCheck): EditIssueRow[] {
   return check.issues.map((issue) => ({
     path: issue.path.map((p) => String(p)),
     message: issue.message,
@@ -403,9 +403,11 @@ function issueRows(check: SchemaCheck): Array<Record<string, unknown>> {
 // ---------------------------------------------------------------------------
 
 export type ReadOnlyState = {
+  /** Plain sentences: why, and what can help. Never a command line. */
   readonly reason: string;
   readonly paths: ReadonlyArray<string>;
-  readonly verb: string;
+  /** A complete command that can help, or null when none can be named. */
+  readonly verb: string | null;
 };
 
 /**
@@ -426,15 +428,42 @@ export function unknownKeyPaths(issues: ReadonlyArray<SpecIssueRow>): string[] {
   return [...new Set(out)];
 }
 
-/** The read-only state a check implies, or null when the spec may be edited here. */
-export function readOnlyOf(check: SchemaCheck, harnessDir: string | null): ReadOnlyState | null {
+/**
+ * The read-only state a check implies, or null when the spec may be edited here.
+ *
+ * `reason` is plain sentences, never a command. `verb` is a complete command or
+ * null: adopting the harness is offered when this Home's schema answered for a
+ * registered harness that does not run its own code here (its own schema may know
+ * the keys; adopting is still the person's act). With no registry row there is no
+ * id to name, and when the harness's own schema answered, or one that runs its own
+ * code was checked with this Home's schema anyway, no command here can help.
+ */
+export function readOnlyOf(
+  check: SchemaCheck,
+  ctx: Pick<M3Context, "adopted" | "entry">,
+): ReadOnlyState | null {
   const paths = unknownKeyPaths(check.issues);
   if (paths.length === 0) return null;
-  const verb = `cd ${harnessDir ?? "<harness dir>"} && bunx crewhaus`;
+  const lead = `This harness uses settings this version of CrewHaus doesn't know: ${paths.join(", ")}. You can read it here but not change it.`;
+  if (check.source === "manager" && ctx.adopted !== true) {
+    const id = ctx.entry?.id;
+    if (id !== undefined) {
+      return {
+        reason: `${lead} Adopting it into this Home lets its own copy of CrewHaus check these settings.`,
+        paths,
+        verb: `crewhaus harness adopt ${id}`,
+      };
+    }
+    return {
+      reason: `${lead} Adopt it into this Home so its own copy of CrewHaus checks these settings, or edit crewhaus.yaml with the CrewHaus that wrote it.`,
+      paths,
+      verb: null,
+    };
+  }
   return {
-    reason: `This harness uses settings this version of CrewHaus doesn't know (${paths.join(", ")}). It's read-only here. Edit it with the CrewHaus that built it (\`${verb} …\`), or upgrade CrewHaus.`,
+    reason: `${lead} Edit crewhaus.yaml with the CrewHaus that wrote it, or upgrade CrewHaus.`,
     paths,
-    verb,
+    verb: null,
   };
 }
 
@@ -456,7 +485,7 @@ export async function requireEditable(
   yamlText: string,
 ): Promise<SchemaCheck> {
   const check = await checkSpec(ctx, yamlText, "issues");
-  const state = readOnlyOf(check, ctx.harnessDir);
+  const state = readOnlyOf(check, ctx);
   if (state !== null) throw readOnlyRefusal(state);
   return check;
 }
@@ -653,6 +682,8 @@ export async function commitHomeEdits(
 ): Promise<CommitSuccess | HomeCommitRefusal> {
   const check = await checkSpec(ctx, file.text, "issues");
   let securityRefusal: { readonly role: unknown; readonly paths: readonly string[] } | undefined;
+  /** The check of the text the validator refused, so the answer names who refused it. */
+  let refusedBy: SchemaCheck | undefined;
   const committed = await commitSpec(
     { specPath: file.path },
     { kind: "edits", edits, ...(opts.restrict ? { restrictToOptimizable: true } : {}) },
@@ -665,7 +696,7 @@ export async function commitHomeEdits(
       ...(check.source === "harness" ? { parse: parseYamlOnly } : {}),
       validate: async (yamlText, { before }) => {
         if (before !== undefined) {
-          const state = readOnlyOf(await checkSpec(ctx, before, "issues"), ctx.harnessDir);
+          const state = readOnlyOf(await checkSpec(ctx, before, "issues"), ctx);
           if (state !== null) {
             return { ok: false, code: "read-only", reason: state.reason, paths: state.paths };
           }
@@ -695,6 +726,7 @@ export async function commitHomeEdits(
         if (check.source === "harness") {
           const after = await checkSpec(ctx, yamlText, "issues");
           if (after.issues.length > 0) {
+            refusedBy = after;
             return {
               ok: false,
               reason: after.issues.map((i) => i.message).join("; "),
@@ -717,7 +749,7 @@ export async function commitHomeEdits(
       paths: [...securityRefusal.paths],
     });
   }
-  return await homeCommitFailure(ctx, file, edits, committed, check, opts.restrict);
+  return await homeCommitFailure(ctx, file, edits, committed, check, opts.restrict, refusedBy);
 }
 
 /** The confirmations the change from `before` to `after` would need, by its text. */
@@ -729,6 +761,66 @@ function escalationBetween(before: string, after: string): ReturnType<typeof esc
   }
 }
 
+/** One issue row, as the editor anchors it to a field. */
+export type EditIssueRow = {
+  readonly path: string[];
+  readonly message: string;
+  readonly code: string | null;
+};
+
+/** Whether a value a validator handed back is an issue row this module can name. */
+function isIssueLike(
+  value: unknown,
+): value is { path: ReadonlyArray<unknown>; message: string; code?: unknown } {
+  return (
+    isPlainObject(value) &&
+    Array.isArray(value["path"]) &&
+    (value["path"] as unknown[]).every((p) => typeof p === "string" || typeof p === "number") &&
+    typeof value["message"] === "string"
+  );
+}
+
+/**
+ * The issues that refused a batch, as the rows the editor places beside a field, and the
+ * check that found them. In order of preference:
+ *
+ *   1. the rows the in-lock validator produced (`failureIssues`; only the harness's own
+ *      schema fills them), found by `failureCheck` when it is known;
+ *   2. the issues of the EDITED text: the batch applied as YAML only, then checked with
+ *      the schema {@link checkSpec} picks for this harness (its own only when it runs its
+ *      own code here, this Home's otherwise, whose note names `crewhaus harness adopt`);
+ *   3. when the batch does not apply even as YAML, the issues of the text before it.
+ *
+ * Messages are masked: they come from rows {@link checkSpec} built, or are masked here.
+ *
+ * First consumers: the `invalid` answer of {@link commitHomeEdits}, and {@link specDiff}'s
+ * refusal.
+ */
+export async function editedIssues(
+  ctx: Pick<M3Context, "harnessDir" | "adopted" | "entry">,
+  before: string,
+  edits: readonly SpecEdit[],
+  check: SchemaCheck,
+  restrict: boolean,
+  failureIssues?: ReadonlyArray<unknown>,
+  failureCheck?: SchemaCheck,
+): Promise<{ issues: EditIssueRow[]; check: SchemaCheck }> {
+  const given = (failureIssues ?? []).filter(isIssueLike).map(
+    (issue): EditIssueRow => ({
+      path: issue.path.map((p) => String(p)),
+      message: maskText(issue.message),
+      code: typeof issue.code === "string" ? issue.code : null,
+    }),
+  );
+  if (given.length > 0) return { issues: given, check: failureCheck ?? check };
+  const applied = previewSpecEdits(before, edits, { parse: parseYamlOnly, restrict });
+  if (applied.yaml !== null) {
+    const after = await checkSpec(ctx, applied.yaml, "issues");
+    return { issues: issueRows(after), check: after };
+  }
+  return { issues: issueRows(check), check };
+}
+
 /** Map a refused commit onto Home's answers. Throws for the request-level ones. */
 async function homeCommitFailure(
   ctx: M3Context,
@@ -737,6 +829,7 @@ async function homeCommitFailure(
   failure: CommitFailure,
   check: SchemaCheck,
   restrict: boolean,
+  refusedBy?: SchemaCheck,
 ): Promise<HomeCommitRefusal> {
   switch (failure.code) {
     case "conflict": {
@@ -762,10 +855,10 @@ async function homeCommitFailure(
     }
     case "read-only":
       throw readOnlyRefusal(
-        readOnlyOf(check, ctx.harnessDir) ?? {
+        readOnlyOf(check, ctx) ?? {
           reason: failure.reason,
           paths: failure.paths ?? [],
-          verb: `cd ${ctx.harnessDir ?? "<harness dir>"} && bunx crewhaus`,
+          verb: null,
         },
       );
     case "needs-confirmation":
@@ -793,17 +886,29 @@ async function homeCommitFailure(
       );
     case "too-large":
       throw new HttpError(409, `${failure.reason}. Edit it with the CLI.`);
-    case "invalid":
+    case "invalid": {
+      const found = await editedIssues(
+        ctx,
+        file.text,
+        edits,
+        check,
+        restrict,
+        failure.issues,
+        refusedBy,
+      );
       return {
         refused: refusal("edit_rejected", maskText(failure.reason), {
           specName: file.specName,
           target: file.target,
-          issues: issueRows(check),
+          issues: found.issues,
+          schemaSource: found.check.source,
+          schemaNote: found.check.note,
           rev: file.rev,
           hash: file.hash,
           verb: "crewhaus compile crewhaus.yaml -o dist",
         }),
       };
+    }
     case "unwritable":
       return { refused: refusal("not_writable", maskText(failure.reason), { rev: file.rev }) };
   }
@@ -975,6 +1080,8 @@ export function declaredPaths(yamlText: string): string[][] {
 
 export type EffectiveRow = {
   readonly path: string;
+  /** The same path as segments: a dotted path cannot tell a key holding a `.` (a model id) from two keys. */
+  readonly segments: readonly string[];
   readonly value: unknown;
   /** `declared` when the TEXT carries the key; `default` when only the
    *  schema does — the whole point of the viewer. */
@@ -995,23 +1102,41 @@ export type EffectiveRow = {
  * redaction has to happen at the point the row is built.
  */
 export function effectiveConfig(spec: unknown, yamlText: string): EffectiveRow[] {
+  return effectiveConfigOf(spec, yamlText).rows;
+}
+
+/**
+ * {@link effectiveConfig}'s rows, and whether the walk stopped at
+ * `MAX_EFFECTIVE_ROWS` with a setting left over (`truncated`), so a screen
+ * can say it shows only the first ones.
+ */
+export function effectiveConfigOf(
+  spec: unknown,
+  yamlText: string,
+): { rows: EffectiveRow[]; truncated: boolean } {
   const rows: EffectiveRow[] = [];
+  let truncated = false;
   const walk = (node: unknown, segments: string[]): void => {
-    if (rows.length >= MAX_EFFECTIVE_ROWS) return;
+    if (truncated) return;
     if (isPlainObject(node)) {
       for (const [key, child] of Object.entries(node)) walk(child, [...segments, key]);
       return;
     }
     if (segments.length === 0) return;
+    if (rows.length >= MAX_EFFECTIVE_ROWS) {
+      truncated = true;
+      return;
+    }
     const redacted = segments.some((seg) => isCredentialKey(seg));
     rows.push({
       path: segments.join("."),
+      segments,
       value: redacted ? REDACTED_VALUE : node,
       source: specHasPath(yamlText, segments) ? "declared" : "default",
     });
   };
   walk(spec, []);
-  return rows;
+  return { rows, truncated };
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,7 +1354,7 @@ async function applyBatch(
   // be the whole document.
   requireWholeSpec(file);
   const check = await checkSpec(ctx, file.text, "issues");
-  const readOnly = readOnlyOf(check, ctx.harnessDir);
+  const readOnly = readOnlyOf(check, ctx);
   const { auto, human } = splitByTier(file.target, edits, file.text);
 
   if (edits.length === 0) {
@@ -1476,13 +1601,22 @@ export const specDiff: M3Handler = async (ctx) => {
   const edits = parseEdits(ctx.body);
   const file = readSpecFile(ctx);
   const check = await checkSpec(ctx, file.text, "issues");
-  const readOnly = readOnlyOf(check, ctx.harnessDir);
+  const readOnly = readOnlyOf(check, ctx);
   const { auto, human } = splitByTier(file.target, edits, file.text);
   const preview = await previewHomeEdits(ctx, file.text, edits, check);
   const escalations = escalationsFor(file.text, edits);
+  // A refused preview names the edited text's issues, so the editor can put each beside its field.
+  const refused = preview.ok ? null : await editedIssues(ctx, file.text, edits, check, false);
   return {
     ok: preview.ok,
-    ...(preview.ok ? {} : { code: "edit_rejected", reason: preview.error }),
+    ...(refused === null
+      ? {}
+      : {
+          code: "edit_rejected",
+          reason: preview.error,
+          schemaSource: refused.check.source,
+          schemaNote: refused.check.note,
+        }),
     specName: file.specName,
     target: file.target,
     rev: file.rev,
@@ -1500,7 +1634,7 @@ export const specDiff: M3Handler = async (ctx) => {
     autoApplicable: human.length === 0 && !file.truncated && readOnly === null,
     confirmName: human.length > 0 ? file.specName : null,
     proposeRoute: human.length > 0 ? "specPropose" : null,
-    issues: issueRows(check),
+    issues: refused === null ? issueRows(check) : refused.issues,
   };
 };
 
@@ -1538,19 +1672,26 @@ export function narrowSchema(
   return { schema: { $ref: `#/definitions/${target}`, definitions: kept }, narrowed: true };
 }
 
+/** What a schema read needs of a request: the harness, its directory, whether it runs its own code here, and containment. */
+export type SpecView = Pick<M3Context, "entry" | "harnessDir" | "adopted" | "contain">;
+
 /**
- * `GET /api/h/:id/spec/schema` — the schema the structured editor renders,
- * plus the effective configuration.
+ * The schema the structured editor renders, plus the effective configuration.
  *
- * The schema is loaded from the HARNESS's own `@crewhaus/spec` when it has
- * one, so a mixed-version fleet renders each harness against the schema it
- * was built with; `schemaSource` says which copy answered. `effective` is
- * the parsed spec with zod defaults materialized, each row marked declared
- * or defaulted — echoing raw YAML would hide every default-ON block.
+ * The schema is the one {@link checkSpec} checks this harness with: its own
+ * `@crewhaus/spec` when it runs its own code here, this Home's otherwise, so a
+ * mixed-version fleet renders each harness against the schema that decides for
+ * it; `schemaSource` says which copy answered and `schemaNote` why. `effective`
+ * is the parsed spec with zod defaults materialized, each row marked declared
+ * or defaulted and carrying its `segments`; `effectiveTruncated` says the rows
+ * stopped at the cap. Echoing raw YAML would hide every default-ON block.
+ *
+ * First consumers: `GET /api/h/:id/spec/schema` and the versioned API's
+ * `specs.schema`, which answer the same body.
  */
-export const specSchema: M3Handler = async (ctx) => {
-  const file = readSpecFile(ctx);
-  const check = await checkSpec(ctx, file.text, "schema");
+export async function specSchemaView(view: SpecView): Promise<Record<string, unknown>> {
+  const file = readSpecFile(view);
+  const check = await checkSpec(view, file.text, "schema");
   if (!file.present) {
     return {
       ...base(false, `no ${SPEC_FILE} in this harness`, "crewhaus init"),
@@ -1559,7 +1700,9 @@ export const specSchema: M3Handler = async (ctx) => {
       schema: null,
       schemaSource: check.source,
       schemaVersion: check.version,
+      schemaNote: check.note,
       effective: [],
+      effectiveTruncated: false,
       effectiveNote: null,
       declaredCount: 0,
       defaultedCount: 0,
@@ -1587,9 +1730,12 @@ export const specSchema: M3Handler = async (ctx) => {
   }
 
   let effective: EffectiveRow[] = [];
+  let effectiveTruncated = false;
   let effectiveNote: string | null = null;
   if (check.parsed !== undefined) {
-    effective = effectiveConfig(check.parsed, file.text);
+    const walked = effectiveConfigOf(check.parsed, file.text);
+    effective = walked.rows;
+    effectiveTruncated = walked.truncated;
   } else {
     effectiveNote = `defaults cannot be materialized until the spec validates: ${maskText(
       check.parseError ?? "the spec does not validate",
@@ -1603,7 +1749,9 @@ export const specSchema: M3Handler = async (ctx) => {
     schema,
     schemaSource: check.source,
     schemaVersion: check.version,
+    schemaNote,
     effective,
+    effectiveTruncated,
     effectiveNote,
     declaredCount,
     defaultedCount: effective.length - declaredCount,
@@ -1617,12 +1765,17 @@ export const specSchema: M3Handler = async (ctx) => {
     rev: file.rev,
     hash: file.hash,
     /** Set when the spec carries settings the schema in use does not know: no write is taken. */
-    readOnly: readOnlyOf(check, ctx.harnessDir),
+    readOnly: readOnlyOf(check, view),
     /** This VIEW may show the head of an over-cap spec; the write path
      *  refuses it. The flag is what stops the two reading as the same file. */
     truncated: file.truncated,
   };
-};
+}
+
+/**
+ * `GET /api/h/:id/spec/schema` — {@link specSchemaView} for this harness.
+ */
+export const specSchema: M3Handler = async (ctx) => await specSchemaView(ctx);
 
 /**
  * `GET /api/h/:id/spec/trust` — the trust-tier map for this spec.
@@ -1649,7 +1802,7 @@ export const specTrust: M3Handler = async (ctx) => {
       truncated: false,
     };
   }
-  const readOnly = readOnlyOf(await checkSpec(ctx, file.text, "issues"), ctx.harnessDir);
+  const readOnly = readOnlyOf(await checkSpec(ctx, file.text, "issues"), ctx);
   const paths = declaredPaths(file.text).map((segments) => classifyPath(file.target, segments));
   const auto = paths.filter((row) => row.tier === "auto-tunable").length;
   return {

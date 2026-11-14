@@ -15,6 +15,8 @@ import { runThenConsole } from "./run-then-console.journey";
 import { sessionSelfTest } from "./session-self-test.journey";
 import { signIn } from "./sign-in.journey";
 import { specConflict } from "./spec-conflict.journey";
+import { specForm } from "./spec-form.journey";
+import { specReadOnly } from "./spec-read-only.journey";
 import { thredzProxy } from "./thredz-proxy.journey";
 import { untrustedMarkup } from "./untrusted-markup.journey";
 
@@ -34,6 +36,8 @@ export const JOURNEYS: readonly Journey[] = [
   axeStates,
   keyboardTour,
   specConflict,
+  specReadOnly,
+  specForm,
   cliBoot,
   runThenConsole,
 ];

@@ -132,6 +132,7 @@ describe("every served operation answers its row's shape", () => {
       "harnesses.get": { path: `/api/v1/harnesses/${a.id}` },
       "harnesses.capabilities": { path: `/api/v1/harnesses/${a.id}/capabilities` },
       "harnesses.health": { path: `/api/v1/harnesses/${a.id}/health` },
+      "specs.schema": { path: `/api/v1/harnesses/${a.id}/spec/schema` },
       "deployments.list": { path: `/api/v1/harnesses/${a.id}/deployments` },
       "deployments.get": { path: `/api/v1/harnesses/${a.id}/deployments/${dep}` },
       "deployments.activate": {
@@ -255,6 +256,7 @@ describe("every served operation answers its row's shape", () => {
       "harnesses.get",
       "harnesses.capabilities",
       "harnesses.health",
+      "specs.schema",
       "deployments.list",
       "deployments.get",
       "controls.pause",

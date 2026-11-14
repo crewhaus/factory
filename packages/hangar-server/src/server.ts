@@ -58,9 +58,9 @@
  * only be about their own subject. The handlers ship as 501 stubs whose
  * docblocks carry the write covenant each must honour.
  */
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir, hostname as osHostname, uptime, userInfo } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import {
   type AccessSnapshotRead,
   type Authenticated,
@@ -201,6 +201,7 @@ import {
   isGroupVerb,
   runGroup,
 } from "./group-ops";
+import { harnessPathOf, isWithin, realOr } from "./harness-paths";
 import {
   type HealthPreflightItem,
   type HealthResult,
@@ -489,23 +490,6 @@ const asStringArray = (v: unknown): string[] | undefined =>
 /** A plugin pane's single-use address lives this long, and at most this many at once. */
 const PANE_LINK_TTL_MS = 60_000;
 const PANE_LINK_CAP = 256;
-
-/** A path's real place: its nearest existing ancestor resolved, the rest appended. */
-function realOr(path: string): string {
-  const absolute = resolve(path);
-  try {
-    return realpathSync(absolute);
-  } catch {
-    const parent = dirname(absolute);
-    return parent === absolute ? absolute : join(realOr(parent), basename(absolute));
-  }
-}
-
-/** Whether `path` is `root` or inside it, by `relative()`. */
-function isWithin(root: string, path: string): boolean {
-  const rel = relative(root, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
 
 /**
  * Why a harness may not move to `newDir`, or null when it may: never onto, into or around
@@ -1997,14 +1981,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       },
       contain: (segments) => {
         if (dir === null) throw new HttpError(400, "not a per-harness route");
-        // Per FILE, never per directory: a listed name can be a symlink.
-        const resolved = resolveInside(dir, segments);
-        if (resolved === undefined) throw new HttpError(400, "path escapes the harness directory");
-        // Home's own records are never read or written through a harness, wherever it is.
-        if (isWithin(realOr(hangarRoot), realOr(resolved))) {
-          throw new HttpError(403, "this path holds Home's own records and is not served here");
-        }
-        return resolved;
+        // Per FILE, never per directory: a listed name can be a symlink. Home's own
+        // records are never read or written through a harness, wherever it is.
+        const found = harnessPathOf(dir, hangarRoot, segments);
+        if (found.ok) return found.path;
+        throw found.reason === "escapes"
+          ? new HttpError(400, "path escapes the harness directory")
+          : new HttpError(403, "this path holds Home's own records and is not served here");
       },
       harnesses: (): readonly M3Harness[] => liveHarnesses(),
       // Every registered row, not only those this request may read: a harness the caller

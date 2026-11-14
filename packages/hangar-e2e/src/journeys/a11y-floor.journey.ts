@@ -21,6 +21,7 @@ import {
   freshVisit,
   mockRefusals,
   pressOnPage,
+  pressSpecSave,
   resetOverlays,
   waitFor,
 } from "./a11y-states";
@@ -144,7 +145,7 @@ async function overlaySnapshots(
   await snapshotHolds(page, out, "the view dialog", "dialog[open]", ["dialog", 'button "Close"']);
   await resetOverlays(page);
 
-  await page.getByRole("button", { name: "Save", exact: true }).first().click();
+  await pressSpecSave(page);
   await waitFor(page, "dialog[open] .conflict", "the conflict view");
   await snapshotHolds(page, out, "the conflict view", "dialog[open]", [
     'dialog "This changed since you opened it"',
