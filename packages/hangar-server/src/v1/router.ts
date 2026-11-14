@@ -324,7 +324,10 @@ export function createV1Router(
         refResolvers,
         capabilityProviders,
         ...(caller.actor !== null && isId("prn", caller.principal)
-          ? { actor: caller.principal }
+          ? {
+              actor: caller.principal,
+              ...("credential" in caller.actor ? { credentialRef: caller.actor.credential } : {}),
+            }
           : {}),
       };
       const answer = await handler(ctx);

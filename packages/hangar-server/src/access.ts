@@ -46,6 +46,7 @@ import {
   loadAccessSnapshot,
   recordUsage,
   registerDomainIn,
+  scopedEpochOf,
 } from "@crewhaus/access-control";
 import {
   PERMISSION_DECLS,
@@ -596,8 +597,15 @@ function authorizeScoped(input: AuthorizeRequestInput): RequestAuthorization {
   const { row, params, caller, view } = input;
   const scoped = caller.scoped as ScopedGrant;
   const refused = { allow: false, refusal: SCOPED_REFUSAL } as const;
-  // Its end is checked here too, so a stream it opened closes when it ends.
+  // Its end and its service's epoch are checked here too, so a stream it opened closes when
+  // it ends or when its service's scoped tokens are ended.
   if (view.now >= scoped.exp) return refused;
+  if (
+    view.read.state !== "present" ||
+    scoped.ep < scopedEpochOf(view.read.snapshot, caller.principal)
+  ) {
+    return refused;
+  }
   if (row.method !== "GET" || row.scopedAct === undefined || row.ref === undefined) return refused;
   if (!scoped.acts.includes(row.scopedAct)) return refused;
   if (

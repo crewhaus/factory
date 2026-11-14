@@ -123,7 +123,10 @@ describe("what the package exports", () => {
         "hostNameOf",
         "mintScopedToken",
         "noAuthRefusal",
+        "queuedActorHolds",
         "registerDomainIn",
+        "scopedEpochBumpRow",
+        "scopedEpochOf",
         // Home's reconcile sweep: approver lists follow group moves and grant ends.
         "refreshApproverProjections",
         "verifyScopedToken",

@@ -6,6 +6,7 @@ import {
   CLI_VERBS,
   COMMAND_KINDS,
   CORE_MODULE,
+  CREATION_MODULE,
   OPERATIONS,
   PATH_PARAMS,
   PERMISSIONS,
@@ -1157,5 +1158,28 @@ describe("device sign-in rows", () => {
     const polled = SCHEMAS["devicePolled"] as z.ZodTypeAny;
     expect(polled.safeParse({ state: "pending" }).success).toBe(true);
     expect(polled.safeParse({ state: "allowed" }).success).toBe(false);
+  });
+});
+
+describe("the creation area's rows", () => {
+  test("specs.schema reads one harness's spec schema, with no receipt and no twin", () => {
+    const op = row("specs.schema");
+    expect(op).toBeDefined();
+    expect([op.method, op.path, op.permission, op.receipt, op.idempotency]).toEqual([
+      "GET",
+      "/api/v1/harnesses/{h}/spec/schema",
+      "h.read",
+      "none",
+      "none",
+    ]);
+    expect([op.request, op.response]).toEqual(["noBody", "specSchemaView"]);
+    // No CLI command prints a schema, and a twin is never made up.
+    expect(op.cliTwin).toBeNull();
+    expect(op.noTwinReason).toBe("The CLI has no command for this.");
+    expect(op.qualifiers).toEqual([]);
+    expect(CREATION_MODULE.area).toBe("creation");
+    expect(CREATION_MODULE.operations.map((o) => o.id)).toEqual(["specs.schema"]);
+    // Not one of the core's own rows: the core's pins do not move.
+    expect(CORE.some((o) => o.id === "specs.schema")).toBe(false);
   });
 });

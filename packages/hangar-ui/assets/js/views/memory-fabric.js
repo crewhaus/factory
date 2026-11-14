@@ -263,8 +263,12 @@ async function load(host, call) {
  * (`conflict` says how to re-apply), so a spec that moved is never just a toast.
  */
 async function run(btn, label, call, onDone, conflict = null) {
+  // Held with aria-disabled and this guard, never `disabled`: a disabled button
+  // drops focus to the page while the request runs, and the conflict view a 412
+  // opens gives focus back to this button when it closes.
+  if (btn.getAttribute("aria-disabled") === "true") return undefined;
   const original = btn.textContent;
-  btn.disabled = true;
+  btn.setAttribute("aria-disabled", "true");
   btn.textContent = `${label}…`;
   let res;
   try {
@@ -273,7 +277,7 @@ async function run(btn, label, call, onDone, conflict = null) {
     res = { ok: false, status: 0, body: { message: String(err) } };
   }
   btn.textContent = original;
-  btn.disabled = false;
+  btn.removeAttribute("aria-disabled");
   const body = res.body && typeof res.body === "object" ? res.body : {};
   if (res.status === 412 && body.current && typeof body.current === "object") {
     openConflict(body.current, `${label} done`, { opener: btn, ...(conflict ?? {}) });

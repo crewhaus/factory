@@ -272,6 +272,7 @@ export const commandReceipt = z
     kind: z.string().refine((kind) => isCommandKind(kind), "unknown command kind"),
     target: refString,
     actor: storedActor,
+    credentialRef: credentialId.optional(),
     via: oneOf(RECEIPT_VIA),
     dedupeRef: z.string().optional(),
     fingerprint: z.string(),

@@ -997,7 +997,7 @@ describe("an item about people is released only by a people domain", () => {
         credential: world.principals["portalCredential"] as string,
       },
       via: "scoped",
-      scoped: { refs: [`${world.a}/run/${RUN_OF_A}`], acts: ["run.events.read"], exp },
+      scoped: { refs: [`${world.a}/run/${RUN_OF_A}`], acts: ["run.events.read"], exp, ep: 0 },
     };
     const row = ROUTE_BY_KEY.get("runEvents") as RouteRow;
     const params = { id: world.a, runId: RUN_OF_A };
@@ -1005,6 +1005,47 @@ describe("an item about people is released only by a people domain", () => {
     const ended = authorizeRequest({ row, params, caller, view: viewAt(exp) });
     expect(ended.allow).toBe(false);
     expect(ended.allow === false ? ended.refusal.reason : undefined).toBe("scoped");
+  });
+
+  test("a scoped token reads nothing once its service's scoped epoch moves past it", () => {
+    const snapshot = snapshotOf(world.t);
+    const portal = world.principals["portal"] as string;
+    const exp = Date.parse("2026-11-11T00:15:00.000Z");
+    const viewOf = (at: AccessSnapshot): AccessView => ({
+      read: { state: "present", snapshot: at },
+      now: exp - 1,
+      domains: new Map(),
+      groupsOf: (id) => (id === world.a || id === world.b ? [] : undefined),
+      harnessIds: () => [world.a, world.b],
+    });
+    const bumped: AccessSnapshot = {
+      ...snapshot,
+      principals: snapshot.principals.map((p) => (p.id === portal ? { ...p, scopedEpoch: 1 } : p)),
+    };
+    const callerAt = (ep: number): Caller => ({
+      principal: portal,
+      actor: { principal: portal, credential: world.principals["portalCredential"] as string },
+      via: "scoped",
+      scoped: { refs: [`${world.a}/run/${RUN_OF_A}`], acts: ["run.events.read"], exp, ep },
+    });
+    const row = ROUTE_BY_KEY.get("runEvents") as RouteRow;
+    const params = { id: world.a, runId: RUN_OF_A };
+    const answer = (caller: Caller, at: AccessSnapshot) =>
+      authorizeRequest({ row, params, caller, view: viewOf(at) });
+    expect(answer(callerAt(0), snapshot).allow).toBe(true);
+    const withdrawn = answer(callerAt(0), bumped);
+    expect(withdrawn.allow).toBe(false);
+    expect(withdrawn.allow === false ? withdrawn.refusal.reason : undefined).toBe("scoped");
+    // A token minted under the new epoch reads as before.
+    expect(answer(callerAt(1), bumped).allow).toBe(true);
+    // Records that cannot be read answer nothing.
+    const unreadable = authorizeRequest({
+      row,
+      params,
+      caller: callerAt(0),
+      view: { ...viewOf(snapshot), read: { state: "absent" } },
+    });
+    expect(unreadable.allow).toBe(false);
   });
 
   test("the choke point hands a domain row's object ref to its checker, every time", () => {

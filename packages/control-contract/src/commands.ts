@@ -66,6 +66,12 @@ export type CommandReceipt = {
   readonly kind: string;
   readonly target: string;
   readonly actor: string;
+  /**
+   * The credential (`crd_…`) the caller authenticated with, when it used one: a command
+   * dispatched from this receipt, when it is submitted or recovered, is checked against
+   * exactly it.
+   */
+  readonly credentialRef?: string;
   readonly via: ReceiptVia;
   readonly dedupeRef?: string;
   readonly fingerprint: string;
