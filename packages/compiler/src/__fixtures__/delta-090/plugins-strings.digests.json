@@ -1,0 +1,13 @@
+{
+  "channel-strings": {
+    "agent.ts": "bfebf6a53ea9b773c109471a198d912a498cd28950498343649a7b45eb23d603",
+    "session-router.ts": "d712670e1b9f733c5194a0bde65d6f5ca1d97e9779949a9221dd957a39a793d9",
+    "gateway.ts": "9c1ddd78ed9d5538bab1a64430931da42138c2b2bbcd07d54b7e15f3bb89e379",
+    "daemon.ts": "842dfb047a21014da53e36fa4d9d6a96f7330d822641562af5d06095cb8d12e7",
+    "README.md": "5e4ef406ed614d645422bf50c0cb484b5b3a6b48439be80be60df3d662b7e04f"
+  },
+  "cli-strings": {
+    "agent.ts": "ed3d29f8dc17f56471811d53220324df4aef30ae4dacb00a410efd624d3cca31",
+    "README.md": "90a1da88dc7a62c525ee8d2e94852a3183a256cd64dd1643210867ce6f937f2c"
+  }
+}

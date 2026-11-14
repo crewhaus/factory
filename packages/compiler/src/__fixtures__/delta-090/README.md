@@ -22,6 +22,14 @@ pins a feature that is present, so a deliberate change to how named lanes are em
 regenerate it in that pull request and add a delta note below. A change that moves it while touching
 nothing about named lanes is the same bug as above.
 
+## The plugins name list
+
+`plugins-strings.digests.json` pins the same thing for two specs in
+[`../../plugins-corpus.ts`](../../plugins-corpus.ts): the cli and channel specs above, each with a
+`plugins:` list of plain names (one listed twice). It was generated before `plugins:` took a
+`{name, tools}` entry, so that form cannot move a byte of a spec that lists plain names.
+`plugins-entries.test.ts` holds it. Regenerate it under the same rule as the absent corpus.
+
 ## When to regenerate
 
 Only for a deliberate emitter change, and never to quiet a failure you cannot explain. A pull request
