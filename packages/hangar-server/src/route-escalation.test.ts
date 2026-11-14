@@ -211,6 +211,7 @@ describe("spec writes that touch security or spending", () => {
       principal: "prn_01jc0000000000000000000009",
       authorize: (permission: string) => ({ allow: false, needs: permission, role: "maintainer" }),
       contain: (segments: readonly string[]) => resolveInside(h.dir, segments) as string,
+      nestedHarnessAt: () => undefined,
       warn: () => undefined,
     } as unknown as M3Context;
     const edits: SpecEdit[] = [
@@ -274,6 +275,7 @@ describe("spec writes that touch security or spending", () => {
       principal: "prn_01jc0000000000000000000009",
       authorize: (permission: string) => ({ allow: false, needs: permission, role: "maintainer" }),
       contain: (segments: readonly string[]) => resolveInside(h.dir, segments) as string,
+      nestedHarnessAt: () => undefined,
       warn: () => undefined,
     } as unknown as M3Context;
     // The caller's read says the budget is 20, so setting 10 reads as a cut; the file says 5.

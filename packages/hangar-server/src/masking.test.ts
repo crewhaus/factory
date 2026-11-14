@@ -210,6 +210,7 @@ describe("credential hygiene (the seams, below the dispatcher)", () => {
       harnessDir: dir,
       env: { HOME: "/tmp" },
       contain: (segments: readonly string[]) => join(dir, ...segments),
+      nestedHarnessAt: () => undefined,
     } as unknown as M3Context) as Record<string, unknown>;
     expect(JSON.stringify(body)).not.toContain(PLANTED);
     expect(JSON.stringify(body)).toContain(PLANTED_MARK);

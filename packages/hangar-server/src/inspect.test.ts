@@ -17,13 +17,24 @@
  *     lands atomically.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
+import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
 import { createPendingApprovalStore } from "@crewhaus/session-store";
+import { bearer, signInFromBootLink } from "./__test__/browser";
 import { makeFixtureHarness } from "./fixture";
 import {
   INSPECT_EXCLUSIONS,
   exclusionFor,
+  isIdentityPath,
   maskRawText,
   moduleExclusions,
   resolvedExclusion,
@@ -964,5 +975,365 @@ describe("Home's run credentials and decision records are never served", () => {
     }
     expect(exclusionFor([".env.local"])?.path).toBe(".env, .env.*");
     expect(exclusionFor(["deep", "secrets", "x"])?.path).toBe(".crewhaus/secrets/");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The identity file, by any path that leads to it
+// ---------------------------------------------------------------------------
+
+/** Make a link, or answer false where the OS refuses links (Windows without the privilege). */
+function linked(target: string, at: string): boolean {
+  try {
+    symlinkSync(target, at);
+    return true;
+  } catch (err) {
+    if ((err as { code?: string }).code !== "EPERM") throw err;
+    return false;
+  }
+}
+
+describe("the identity file, by any path that leads to it", () => {
+  /** A run of each key's bytes: neither may appear anywhere in an answer. */
+  const KEY_RUNS = ["Z".repeat(20), "A".repeat(20)];
+
+  function expectProjection(label: string, status: number, body: Record<string, unknown>): void {
+    expect(`${label}: ${status}`).toBe(`${label}: 200`);
+    const doc = body["document"] as Record<string, unknown>;
+    expect(doc["fingerprint"]).toBe("a".repeat(64));
+    expect(doc["privateKeyPresent"]).toBe(true);
+    expect(doc["publicKeyPresent"]).toBe(true);
+    expect(body["text"]).toBeNull();
+    expect(body["parseError"]).toBeNull();
+    for (const run of KEY_RUNS) expect(JSON.stringify(body)).not.toContain(run);
+  }
+
+  test("a raw read answers its fingerprint and key presence only", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const id = await register(t, inspectHarness(t));
+      const raw = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent(".crewhaus/identity.json")}`,
+      );
+      expectProjection("raw", raw.status, raw.body);
+      expect(isIdentityPath([".crewhaus", "IDENTITY.json"])).toBe(true);
+      expect(isIdentityPath(["sub", ".crewhaus", "identity.json"])).toBe(true);
+      expect(isIdentityPath(["identity.json"])).toBe(false);
+      expect(isIdentityPath([".crewhaus", "identity.json.bak"])).toBe(false);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a link to the identity file answers its fingerprint only", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      if (!linked("../.crewhaus/identity.json", join(dir, "notes", "id.json"))) return;
+      if (!linked("../identity.json", join(dir, ".crewhaus", "skills", "idlink"))) return;
+      const id = await register(t, dir);
+      const raw = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/id.json")}`,
+      );
+      expectProjection("raw link", raw.status, raw.body);
+      const entry = await t.api(`/api/h/${id}/inspect/skills/idlink`);
+      expectProjection("skills entry", entry.status, entry.body);
+      // Another single-file store that leads to it answers the same.
+      rmSync(join(dir, ".crewhaus", "meta.json"));
+      if (!linked("identity.json", join(dir, ".crewhaus", "meta.json"))) return;
+      const meta = await t.api(`/api/h/${id}/inspect/meta`);
+      expectProjection("meta store", meta.status, meta.body);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a case-varied spelling never carries key bytes", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const id = await register(t, dir);
+      const spelled = ".CREWHAUS/Identity.JSON";
+      const { status, body } = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent(spelled)}`,
+      );
+      for (const run of KEY_RUNS) expect(JSON.stringify(body)).not.toContain(run);
+      if (existsSync(join(dir, ".CREWHAUS", "Identity.JSON"))) {
+        // A case-insensitive filesystem (APFS, NTFS) resolves it to the file.
+        expectProjection("case-varied", status, body);
+      } else {
+        expect([status, body["present"]]).toEqual([200, false]);
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a torn identity file answers no key bytes and no parser message", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const file = join(dir, ".crewhaus", "identity.json");
+      const whole = readFileSync(file, "utf8");
+      // The whole public key and half the private key.
+      const cut = whole.indexOf("Z".repeat(40));
+      expect(cut).toBeGreaterThan(-1);
+      writeFileSync(file, whole.slice(0, cut + 20));
+      const id = await register(t, dir);
+      const { status, body } = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent(".crewhaus/identity.json")}`,
+      );
+      expect(status).toBe(200);
+      expect(body["text"]).toBeNull();
+      expect(body["parseError"]).toBeNull();
+      expect((body["document"] as Record<string, unknown>)["fingerprint"]).toBeNull();
+      for (const run of KEY_RUNS) expect(JSON.stringify(body)).not.toContain(run);
+    } finally {
+      await t.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A harness inside the one being browsed
+// ---------------------------------------------------------------------------
+
+describe("a harness inside the one being browsed", () => {
+  test("its run, audit and key files are refused and named as excluded", async () => {
+    expect(exclusionFor(["a", "b", ".crewhaus", "run", "control-token"])).not.toBeNull();
+    expect(exclusionFor(["sub", ".crewhaus", "run", "control-token"])?.path).toBe(
+      ".crewhaus/run/control-token",
+    );
+    expect(exclusionFor(["x", ".CREWHAUS", "Audit", "y"])?.path).toBe(".crewhaus/audit/");
+    expect(exclusionFor(["dist", ".crewhaus", "run", "runs.jsonl"])).toBeNull();
+    expect(exclusionFor(["dist", "run", "control-token"])).toBeNull();
+
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const sub = makeFixtureHarness(join(dir, "apps", "sub"), { specName: "sub" });
+      const value = ["nested", "secret", "value"].join("-");
+      const plant = (rel: string): void => {
+        const full = join(sub, ".crewhaus", ...rel.split("/"));
+        mkdirSync(join(full, ".."), { recursive: true });
+        writeFileSync(full, `${value}\n`);
+      };
+      plant("run/control-token");
+      plant("run/gateway-jwt-secret");
+      plant("audit/x");
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      const link = linked("../apps/sub/.crewhaus/run/control-token", join(dir, "notes", "tok"));
+      const id = await register(t, dir);
+      const cases: Array<readonly [string, string]> = [
+        ["apps/sub/.crewhaus/run/control-token", ".crewhaus/run/control-token"],
+        ["apps/sub/.crewhaus/run/gateway-jwt-secret", ".crewhaus/run/gateway-jwt-secret"],
+        ["apps/sub/.crewhaus/audit/x", ".crewhaus/audit/"],
+        ...(link ? [["notes/tok", ".crewhaus/run/control-token"] as const] : []),
+      ];
+      for (const [path, row] of cases) {
+        const { status, body } = await t.api(
+          `/api/h/${id}/inspect/raw?path=${encodeURIComponent(path)}`,
+        );
+        const reason = INSPECT_EXCLUSIONS.find((r) => r.path === row)?.reason as string;
+        expect(`${path}: ${status}`).toBe(`${path}: 403`);
+        expect(String(body["error"])).toContain(reason);
+        expect(JSON.stringify(body)).not.toContain(value);
+      }
+      const run = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("apps/sub/.crewhaus/run")}`,
+      );
+      expect(run.status).toBe(200);
+      const names = (run.body["entries"] as Array<{ name: string }>).map((e) => e.name);
+      for (const hidden of ["control-token", "gateway-jwt-secret"]) {
+        expect(names).not.toContain(hidden);
+        expect(run.body["excludedHere"]).toContain(hidden);
+      }
+      if (link) {
+        const notes = await t.api(`/api/h/${id}/inspect/raw?path=notes`);
+        expect(notes.body["excludedHere"]).toContain("tok");
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a registered harness inside this one is read only through its own inspector", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const sub = makeFixtureHarness(join(dir, "apps", "sub"), { specName: "sub" });
+      const marker = ["sub", "notes", "marker"].join("-");
+      writeFileSync(join(sub, "notes.md"), `${marker}\n`);
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      writeFileSync(join(dir, "notes", "plain.md"), "plain notes\n");
+      const parent = await register(t, dir);
+      const subId = await register(t, sub);
+      const raw = (path: string) => `/api/h/${parent}/inspect/raw?path=${encodeURIComponent(path)}`;
+
+      // The owner is told whose it is.
+      const asOwner = await t.api(raw("apps/sub/notes.md"));
+      expect(asOwner.status).toBe(403);
+      expect(String(asOwner.body["error"])).toContain(subId);
+      expect(JSON.stringify(asOwner.body)).not.toContain(marker);
+      const apps = await t.api(raw("apps"));
+      expect(apps.status).toBe(200);
+      expect((apps.body["entries"] as Array<{ name: string }>).map((e) => e.name)).not.toContain(
+        "sub",
+      );
+      expect(apps.body["excludedHere"]).toContain("sub");
+
+      // A token that may browse the parent but not read sub hears no id.
+      await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+      const read = loadAccessSnapshot(t.hangarRoot);
+      if (read.state !== "present") throw new Error("no access records");
+      const minted = await openAccess(t.hangarRoot).mintServiceToken(
+        { principal: read.snapshot.owner as string },
+        { service: "inspector", permissions: ["h.files.raw"], harnesses: [parent] },
+      );
+      if (!minted.ok) throw new Error(minted.reason);
+      const asToken = (path: string) =>
+        t.fetchRaw(raw(path), { headers: bearer(minted.result.secret) });
+      const plain = await asToken("notes/plain.md");
+      expect(plain.status).toBe(200);
+      const refused = await asToken("apps/sub/notes.md");
+      const text = await refused.text();
+      expect(refused.status).toBe(403);
+      expect(text).toContain("another harness registered with this Home");
+      expect(text).not.toContain(subId);
+      expect(text).not.toContain(marker);
+
+      // Its own inspector reads it: the harness that holds it is not nested in it.
+      const own = await t.api(`/api/h/${subId}/inspect/raw?path=${encodeURIComponent("notes.md")}`);
+      expect(own.status).toBe(200);
+      expect(String(own.body["text"])).toContain(marker);
+    } finally {
+      await t.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The settings write reads and replaces only the harness's own settings file
+// ---------------------------------------------------------------------------
+
+describe("the settings write, on the harness's own settings file only", () => {
+  const NEXT = { permissions: { allow: ["Read"], deny: [] }, hooks: [] };
+
+  /** A dry run and a confirmed write of the same document, each answered with its text. */
+  async function bothWrites(
+    t: TestServer,
+    id: string,
+    confirmName: string,
+  ): Promise<Array<{ label: string; status: number; text: string }>> {
+    const out: Array<{ label: string; status: number; text: string }> = [];
+    for (const [label, extra] of [
+      ["dry run", { dryRun: true }],
+      ["confirmed", { confirmName }],
+    ] as const) {
+      const res = await t.apiText(`/api/h/${id}/inspect/settings`, {
+        method: "PUT",
+        body: JSON.stringify({ settings: NEXT, ...extra }),
+      });
+      out.push({ label, ...res });
+    }
+    return out;
+  }
+
+  test("a link to another file is refused, and that file's bytes are not shown or replaced", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const ch = join(dir, ".crewhaus");
+      const token = ["control", "token", "bytes"].join("-");
+      const person = ["person", "marker", "xyz"].join("-");
+      mkdirSync(join(ch, "run", "control"), { recursive: true });
+      writeFileSync(join(ch, "run", "control-token"), `${token}\n`);
+      writeFileSync(
+        join(ch, "run", "control", "approvers.json"),
+        `${JSON.stringify({ approvers: [person] })}\n`,
+      );
+      const id = await register(t, dir);
+      const settings = join(ch, "settings.json");
+      const cases: Array<readonly [string, number, readonly string[]]> = [
+        ["run/control-token", 403, [token]],
+        ["run/control/approvers.json", 403, [person]],
+        ["identity.json", 409, ["Z".repeat(20), "A".repeat(20)]],
+        ["knowledge.json", 409, ["share"]],
+      ];
+      for (const [target, status, secrets] of cases) {
+        rmSync(settings, { force: true });
+        if (!linked(target, settings)) return;
+        const targetBytes = readFileSync(join(ch, ...target.split("/")), "utf8");
+        for (const answer of await bothWrites(t, id, "inspect-harness")) {
+          const label = `${target} (${answer.label})`;
+          expect(`${label}: ${answer.status}`).toBe(`${label}: ${status}`);
+          for (const secret of secrets) expect(answer.text).not.toContain(secret);
+        }
+        expect(readFileSync(join(ch, ...target.split("/")), "utf8")).toBe(targetBytes);
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a settings file another registered harness holds is never read or replaced through this one", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const sub = makeFixtureHarness(join(dir, "apps", "sub"), { specName: "sub" });
+      const marker = ["sub", "settings", "marker"].join("-");
+      const subSettings = join(sub, ".crewhaus", "settings.json");
+      mkdirSync(join(sub, ".crewhaus"), { recursive: true });
+      writeFileSync(subSettings, `${JSON.stringify({ permissions: { allow: [marker] } })}\n`);
+      const subBytes = readFileSync(subSettings, "utf8");
+      const settings = join(dir, ".crewhaus", "settings.json");
+      rmSync(settings);
+      if (!linked("../apps/sub/.crewhaus/settings.json", settings)) return;
+      const id = await register(t, dir);
+
+      // Not registered yet: a link is refused for being one.
+      for (const answer of await bothWrites(t, id, "inspect-harness")) {
+        expect(`unregistered (${answer.label}): ${answer.status}`).toBe(
+          `unregistered (${answer.label}): 409`,
+        );
+        expect(answer.text).not.toContain(marker);
+      }
+      await register(t, sub);
+      for (const answer of await bothWrites(t, id, "inspect-harness")) {
+        expect(`registered (${answer.label}): ${answer.status}`).toBe(
+          `registered (${answer.label}): 403`,
+        );
+        expect(answer.text).not.toContain(marker);
+      }
+      expect(readFileSync(subSettings, "utf8")).toBe(subBytes);
+
+      // The harness's `.crewhaus` itself leading into the registered one: refused, unchanged.
+      rmSync(join(dir, ".crewhaus"), { recursive: true, force: true });
+      if (!linked("apps/sub/.crewhaus", join(dir, ".crewhaus"))) return;
+      for (const answer of await bothWrites(t, id, "inspect-harness")) {
+        expect(`linked folder (${answer.label}): ${answer.status}`).toBe(
+          `linked folder (${answer.label}): 403`,
+        );
+        expect(answer.text).not.toContain(marker);
+      }
+      expect(readFileSync(subSettings, "utf8")).toBe(subBytes);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("the harness's own settings file is still written", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const id = await register(t, dir);
+      const [dry, confirmed] = await bothWrites(t, id, "inspect-harness");
+      expect([dry?.status, confirmed?.status]).toEqual([200, 200]);
+      const written = JSON.parse(readFileSync(join(dir, ".crewhaus", "settings.json"), "utf8"));
+      expect(written).toEqual(NEXT);
+    } finally {
+      await t.stop();
+    }
   });
 });
