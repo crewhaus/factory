@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { AREA_RUNTIMES, activationGates, compositionProblems } from "./areas";
+import { AREA_RUNTIMES, activationGates, compositionProblems, retireRevokers } from "./areas";
 import { CORE_RUNTIME } from "./core-runtime";
-import type { ActivationGate, AreaRuntime, Executor } from "./executor";
+import type { ActivationGate, AreaRuntime, Executor, RetireRevoker } from "./executor";
 import { IDENTITY, fakeProbe, removeTempDirs, tempDir } from "./test-helpers";
 import { wireControl } from "./wire";
 
@@ -30,8 +30,12 @@ describe("the composition", () => {
     expect(compositionProblems(AREA_RUNTIMES)).toEqual([]);
     expect(AREA_RUNTIMES.map((runtime) => runtime.area)).toEqual(["core"]);
     expect(Object.keys(CORE_RUNTIME.executors ?? {}).sort()).toEqual([
+      "controls.disable",
       "controls.drain",
+      "controls.enable",
+      "controls.pause",
       "controls.restart",
+      "controls.resume",
       "controls.start",
       "controls.stop",
       "decisions.resolve",
@@ -41,14 +45,24 @@ describe("the composition", () => {
       "rules.revoke",
     ]);
     expect(Object.keys(CORE_RUNTIME.reconcilers ?? {}).sort()).toEqual([
+      "controls.disable",
+      "controls.enable",
+      "controls.pause",
       "controls.restart",
+      "controls.resume",
+      "controls.retire",
       "controls.start",
       "decisions.supersede",
       "deployments.activate",
       "rules.create",
     ]);
-    // The decision kinds act on records alone: dispatched with no supervisor.
+    // The decision kinds and the operator controls act on records alone: dispatched with
+    // no supervisor.
     expect([...(CORE_RUNTIME.unsupervised ?? [])].sort()).toEqual([
+      "controls.disable",
+      "controls.enable",
+      "controls.pause",
+      "controls.resume",
       "decisions.resolve",
       "decisions.supersede",
       "rules.create",
@@ -57,7 +71,31 @@ describe("the composition", () => {
     expect(activationGates(AREA_RUNTIMES).map((gate) => gate.name)).toEqual([
       "protected-environment",
     ]);
+    // No area registers a retire revoker yet: the next one to do so changes this on purpose.
+    expect(retireRevokers(AREA_RUNTIMES)).toHaveLength(0);
     expect(wireWith(AREA_RUNTIMES)).not.toThrow();
+  });
+
+  test("a retire revoker name registered twice is refused, naming both areas", () => {
+    const revoker: RetireRevoker = {
+      name: "delegation-rules",
+      plan: async () => [],
+      revoke: async () => [],
+    };
+    expect(
+      compositionProblems([
+        CORE_RUNTIME,
+        { area: "people", retireRevokers: [revoker] },
+        { area: "quality", retireRevokers: [revoker] },
+      ]),
+    ).toEqual([
+      'retire revoker "delegation-rules" registered twice (areas "people" and "quality")',
+    ]);
+    expect(
+      retireRevokers([CORE_RUNTIME, { area: "people", retireRevokers: [revoker] }]).map(
+        (r) => r.name,
+      ),
+    ).toEqual(["delegation-rules"]);
   });
 
   test("an activation gate registered twice is refused, naming it", () => {

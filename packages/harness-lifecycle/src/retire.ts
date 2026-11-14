@@ -4,7 +4,13 @@
  *
  *   1. refuse if the spec still has an ACTIVE deployment pin (an env points at
  *      a live version) — unless `--force`; retiring a deployed bot silently
- *      would be the worst failure mode;
+ *      would be the worst failure mode — and refuse while its daemon runs,
+ *      unless `--stop`, which stops it first;
+ *   1a. end what the harness could still do (#507, #513): stop it (`--stop`) and
+ *      disable it, cancel its queued runs, expire its open approvals, revoke its
+ *      standing rules, and run each area's revoker for the connections it
+ *      holds. A failure here aborts before anything is archived, and the harness
+ *      stays disabled;
  *   2. export the harness's durable state to the archive (reuse `crewhaus
  *      state backup` — the merged tarball path — so sessions/feedback/memories/
  *      audit travel out byte-identical);
@@ -17,7 +23,9 @@
  *      step);
  *   6. archive everything + remove the live `.crewhaus` state, with a
  *      retirement log (`retirement.json`) written INTO the archive recording
- *      every step + its outcome — so the retirement is itself evidenced.
+ *      every step + its outcome — so the retirement is itself evidenced;
+ *   7. record `harness.retired` in Home's lifecycle record, and mark the
+ *      harness's registry row archived.
  *
  * `--dry-run` prints the plan and touches nothing.
  *
@@ -87,6 +95,19 @@ export type StepOutcome = {
  * tests inject stubs that record the call order.
  */
 export type RetirementSteps = {
+  // The control steps: supplied by a host whose plan has `control` (the CLI). A plan
+  // that lists one whose seam is missing is refused before anything runs.
+  /** Stop the daemon (only with `--stop`), then disable the harness. */
+  stopAndDisable?(): Promise<StepOutcome>;
+  /** Cancel every queued run, taking each run's claim first. */
+  cancelQueuedRuns?(): Promise<StepOutcome>;
+  /** Expire every pending approval and unspent grant. */
+  expireDecisions?(): Promise<StepOutcome>;
+  /** Revoke every active standing rule. */
+  revokeStandingRules?(): Promise<StepOutcome>;
+  /** Run each registered area revoker. A failure here is waved through only by
+   *  `forceUnverified`, as the audit gate is. */
+  revokeConnections?(): Promise<StepOutcome>;
   /** Export durable state (`.crewhaus`) into the archive; return the tarball path. */
   backupState(archiveDir: string): Promise<StepOutcome & { readonly tarball?: string }>;
   /** Write the final compliance-evidence bundle into the archive. */
@@ -98,7 +119,39 @@ export type RetirementSteps = {
   pushKnowledge(archiveDir: string): Promise<StepOutcome>;
   /** Tombstone the registry entry (delete versions → clears pins). */
   tombstoneRegistry(): Promise<StepOutcome>;
+  /** Disable the harness again in its live directory. After the archive, which moved its
+   *  operator record away with the rest of its state. */
+  keepDisabled?(): Promise<StepOutcome>;
+  /** Append `harness.retired` to Home's lifecycle record. After the archive. */
+  recordLifecycle?(): Promise<StepOutcome>;
+  /** Mark the harness's Home registry row archived. After the archive. */
+  archiveRegistryRow?(): Promise<StepOutcome>;
 };
+
+/** One thing an area's revoker will end, as the plan lists it. */
+export type RetirePlanItem = {
+  readonly kind: string;
+  /** `manual`: a person does it by hand, where it was issued. */
+  readonly status: "planned" | "manual";
+  readonly note?: string;
+};
+
+/** The steps that end what a harness could still do, run before anything is archived. */
+export const PRE_ARCHIVE_STEPS = [
+  "stopAndDisable",
+  "cancelQueuedRuns",
+  "expireDecisions",
+  "revokeStandingRules",
+  "revokeConnections",
+] as const;
+
+/** The steps that keep the harness disabled and record the retirement once the state is
+ *  archived. */
+export const POST_ARCHIVE_STEPS = [
+  "keepDisabled",
+  "recordLifecycle",
+  "archiveRegistryRow",
+] as const;
 
 // ---------------------------------------------------------------------------
 // plan
@@ -111,6 +164,12 @@ export type RetirementPlan = {
   readonly activePins: ReadonlyArray<ActivePin>;
   readonly force: boolean;
   readonly pushKnowledge: boolean;
+  /** The control steps, when the host runs them: whether `--stop` was given, and what
+   *  each registered revoker will end. */
+  readonly control?: {
+    readonly stop: boolean;
+    readonly revokerItems: ReadonlyArray<RetirePlanItem>;
+  };
   /** The ordered step names the run will execute. */
   readonly steps: ReadonlyArray<string>;
 };
@@ -122,14 +181,34 @@ export type BuildPlanOptions = {
   readonly pins: Readonly<Record<string, string>>;
   readonly force: boolean;
   readonly pushKnowledge: boolean;
+  /**
+   * The control steps, for a host that runs them (`crewhaus retire`): they end what the
+   * harness could still do before the backup, and record the retirement after the
+   * archive. Without it the plan is the backup, evidence and archive alone.
+   */
+  readonly control?: {
+    /** Whether the harness's daemon is running now. */
+    readonly daemonLive: boolean;
+    /** `--stop`: stop a running daemon first. */
+    readonly stop: boolean;
+    /** What each registered revoker will end (`RetireRevoker.plan`). */
+    readonly revokerItems: ReadonlyArray<RetirePlanItem>;
+  };
 };
 
 /**
  * Build the retirement plan (pure). Throws {@link RetireError} when the
- * harness has an active pin and `--force` was not given — the plan itself is
- * the refusal gate, so `--dry-run` surfaces the refusal without side effects.
+ * harness's daemon is running and `--stop` was not given, or when it has an
+ * active pin and `--force` was not given — the plan itself is the refusal
+ * gate, so `--dry-run` surfaces the refusal without side effects.
  */
 export function buildRetirementPlan(opts: BuildPlanOptions): RetirementPlan {
+  const control = opts.control;
+  if (control?.daemonLive && !control.stop) {
+    throw new RetireError(
+      `${opts.specName}'s daemon is running. Stop it first, or run \`crewhaus retire --stop\` to stop and disable it.`,
+    );
+  }
   const pins = activePins(opts.pins);
   if (pins.length > 0 && !opts.force) {
     throw new RetireError(
@@ -141,12 +220,14 @@ export function buildRetirementPlan(opts: BuildPlanOptions): RetirementPlan {
     );
   }
   const steps = [
+    ...(control !== undefined ? PRE_ARCHIVE_STEPS : []),
     "backupState",
     "complianceEvidence",
     "auditVerify",
     ...(opts.pushKnowledge ? ["pushKnowledge"] : []),
     "tombstoneRegistry",
     "archive",
+    ...(control !== undefined ? POST_ARCHIVE_STEPS : []),
   ];
   return {
     specName: opts.specName,
@@ -155,6 +236,9 @@ export function buildRetirementPlan(opts: BuildPlanOptions): RetirementPlan {
     activePins: pins,
     force: opts.force,
     pushKnowledge: opts.pushKnowledge,
+    ...(control !== undefined
+      ? { control: { stop: control.stop, revokerItems: [...control.revokerItems] } }
+      : {}),
     steps,
   };
 }
@@ -174,25 +258,59 @@ export function formatPlan(plan: RetirementPlan): ReadonlyArray<string> {
     );
   }
   lines.push("  steps:");
-  for (const s of plan.steps) lines.push(`    ${describeStep(s, plan)}`);
+  plan.steps.forEach((s, i) => {
+    lines.push(`    ${i + 1}. ${describeStep(s, plan)}`);
+  });
+  const items = plan.control?.revokerItems;
+  if (items !== undefined && items.length === 0) {
+    lines.push(
+      "  Connections: none are registered here. Revoke this harness's channel and service credentials where they were issued.",
+    );
+  } else if (items !== undefined) {
+    lines.push("  connections:");
+    for (const item of items) {
+      const note = item.note !== undefined ? ` — ${item.note}` : "";
+      lines.push(
+        `    - ${item.kind}${note}${item.status === "manual" ? " (do this by hand)" : ""}`,
+      );
+    }
+  }
   lines.push("  nothing was executed (dry run)");
   return lines;
 }
 
 function describeStep(step: string, plan: RetirementPlan): string {
   switch (step) {
+    case "stopAndDisable":
+      return plan.control?.stop === true
+        ? "stop the daemon, then disable the harness so nothing starts it"
+        : "disable the harness so nothing starts it";
+    case "cancelQueuedRuns":
+      return "cancel its queued runs";
+    case "expireDecisions":
+      return "expire its open approvals and unspent grants";
+    case "revokeStandingRules":
+      return "revoke its standing rules";
+    case "revokeConnections":
+      return "revoke the connections each area holds for it";
     case "backupState":
-      return "1. export durable state (.crewhaus → archive tarball)";
+      return "export durable state (.crewhaus → archive tarball)";
     case "complianceEvidence":
-      return "2. write a final compliance-evidence bundle";
+      return "write a final compliance-evidence bundle";
     case "auditVerify":
-      return "3. verify the audit chain (tamper check)";
+      return "verify the audit chain (tamper check)";
     case "pushKnowledge":
-      return "4. push knowledge to the shared store (#63)";
+      return "push knowledge to the shared store (#63)";
     case "tombstoneRegistry":
-      return `${plan.pushKnowledge ? "5" : "4"}. tombstone the registry entry (delete versions → clear pins)`;
+      return "tombstone the registry entry (delete versions → clear pins)";
     case "archive":
-      return `${plan.pushKnowledge ? "6" : "5"}. archive + remove the live .crewhaus state`;
+      return "archive + remove the live .crewhaus state";
+    case "keepDisabled":
+      return "keep the harness disabled where it lives, now that its state is archived";
+    case "recordLifecycle":
+      return "record the retirement in Home's lifecycle record";
+    case "archiveRegistryRow":
+      return "mark the harness archived in Home's registry";
     default:
       return step;
   }
@@ -269,6 +387,16 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
     };
   }
 
+  // Every control step the plan lists has its seam, or nothing runs.
+  const missing = [...PRE_ARCHIVE_STEPS, ...POST_ARCHIVE_STEPS].filter(
+    (name) => plan.steps.includes(name) && steps[name] === undefined,
+  );
+  if (missing.length > 0) {
+    throw new RetireError(
+      `the plan lists ${missing.join(", ")}, which this host does not supply; nothing was done`,
+    );
+  }
+
   mkdirSync(plan.archiveDir, { recursive: true });
   const outcomes: StepOutcome[] = [];
 
@@ -278,6 +406,31 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
   };
 
   const forceUnverified = opts.forceUnverified ?? false;
+
+  // End what the harness could still do, before anything is archived. A failure aborts
+  // like a failed backup, and the harness stays disabled for a person to look at.
+  for (const name of PRE_ARCHIVE_STEPS) {
+    const run = steps[name];
+    if (!plan.steps.includes(name) || run === undefined) continue;
+    const outcome = record(await run());
+    if (outcome.ok) continue;
+    if (name === "revokeConnections" && forceUnverified) continue;
+    writeLogDurably(join(plan.archiveDir, RETIREMENT_LOG_FILENAME), {
+      specName: plan.specName,
+      harnessDir: plan.harnessDir,
+      retiredAt,
+      force: plan.force,
+      activePinsAtRetirement: plan.activePins,
+      outcomes,
+      archived: false,
+    });
+    const disabled = outcomes.some((o) => o.step === "stopAndDisable" && o.ok);
+    throw new RetireError(
+      `${name} failed — aborting before any destructive step: ${outcome.detail}.${
+        disabled ? " The harness stays disabled; `crewhaus daemon enable` allows starts again." : ""
+      }${name === "revokeConnections" ? " Pass --force-unverified to retire anyway." : ""}`,
+    );
+  }
 
   // 1–4/5: the non-destructive steps. A failure aborts before archiving.
   const backup = record(await steps.backupState(plan.archiveDir));
@@ -363,6 +516,14 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
         ? "archive skipped (test seam)"
         : "no .crewhaus state to archive",
     });
+  }
+
+  // The state is archived: disable the harness again where it lives (the archive took its
+  // operator record), then record the retirement where Home keeps it. A failure here is
+  // logged, never undone: the harness is already retired.
+  for (const name of POST_ARCHIVE_STEPS) {
+    const run = steps[name];
+    if (plan.steps.includes(name) && run !== undefined) record(await run());
   }
 
   const log: RetirementLog = {

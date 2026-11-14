@@ -173,6 +173,13 @@ describe("the checker", () => {
       "crewhaus experiment record --name <name> --version <version> --outcome pass|fail",
       "crewhaus harness relocate <id> <dir>",
       "crewhaus access link <account> --member <member>",
+      "crewhaus daemon pause --quiet",
+      "crewhaus daemon resume <dir>",
+      "crewhaus daemon disable",
+      "crewhaus daemon enable <dir>",
+      "crewhaus daemon submit --brief-file <file> --ignore-pause",
+      "crewhaus eval crewhaus.yaml --dataset <dataset> --graders <graders> --ignore-pause",
+      "crewhaus retire crewhaus.yaml --stop --force-unverified --dry-run",
     ]) {
       expectRunnable("accepted", line);
     }
@@ -381,8 +388,9 @@ describe("the server's twins, by import", () => {
         checked++;
       }
     }
-    // Twenty-six operation twins, twenty-two command kinds and eight route rows, each rendered twice.
-    expect(checked).toBeGreaterThanOrEqual(112);
+    // Thirty operation twins, twenty-six command kinds and eight route rows, each rendered
+    // twice: pause, resume, disable and enable are `crewhaus daemon` verbs.
+    expect(checked).toBeGreaterThanOrEqual(128);
   });
 });
 

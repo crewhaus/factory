@@ -907,6 +907,8 @@ export type PendingApproval = {
   readonly bindingDigest?: string;
   /** The run that spent the grant. */
   readonly consumedByRun?: string;
+  /** When it was ended before it was decided or spent, for a reason a log line records. */
+  readonly expiredAt?: string;
 };
 
 /**
@@ -1224,6 +1226,7 @@ export {
   type SupersedeAnswer,
   type SupersedeRequest,
   allowSingleOwner,
+  expireOpenApprovals,
   generateApprovalId,
   parseDeferUntil,
 } from "./approvals/decide";

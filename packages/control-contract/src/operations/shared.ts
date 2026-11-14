@@ -23,6 +23,10 @@ export const TWINS = {
   daemonStop: { argv: ["daemon", "stop", "{hrn}"] },
   daemonStart: { argv: ["daemon", "start", "{hrn}"] },
   daemonRestart: { argv: ["daemon", "restart", "{hrn}"] },
+  daemonPause: { argv: ["daemon", "pause", "{hrn}"] },
+  daemonResume: { argv: ["daemon", "resume", "{hrn}"] },
+  daemonDisable: { argv: ["daemon", "disable", "{hrn}"] },
+  daemonEnable: { argv: ["daemon", "enable", "{hrn}"] },
   approvalsShow: { argv: ["approvals", "show", "{appr}", "--dir", "{dir}"] },
   approvalsChoice: { argv: ["approvals", "{choice}", "{appr}", "--dir", "{dir}"] },
   approvalsSupersede: {

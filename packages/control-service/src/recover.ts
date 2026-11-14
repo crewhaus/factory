@@ -6,7 +6,7 @@
  * | Found | Action |
  * |---|---|
  * | a job's receipt | the job queue moves it; Home alone settles one no job row names |
- * | a daemon command a later daemon command on the same harness overtook | `unknown`: superseded, never run |
+ * | a control a later control of the same family on the same harness overtook | `unknown`: superseded, never run |
  * | a daemon start accepted before the machine booted | `unknown`: not started, the machine restarted |
  * | `accepted`, safe to repeat | run again |
  * | `accepted`, not safe to repeat | reconcile: done → `succeeded`, not done → run again |
@@ -16,9 +16,18 @@
  *
  * An inline effect never writes `running`, so an `accepted` receipt does not prove its
  * effect never started: that is why a kind that is not safe to repeat is reconciled first.
- * A daemon command is run again only while it is the harness's latest: once an operator
- * has started, stopped or drained the daemon since, re-running an older command would
- * undo theirs.
+ * A control is run again only while it is the latest of its family on the harness: once
+ * an operator has started, stopped or drained the daemon since, re-running an older daemon
+ * command would undo theirs, and the same holds for a pause or resume, and for a disable
+ * or enable. The families are independent: a pause after a stop leaves the stop to run.
+ *
+ * | Family | Kinds |
+ * |---|---|
+ * | daemon | `controls.start`, `controls.stop`, `controls.restart`, `controls.drain` |
+ * | intake | `controls.pause`, `controls.resume` |
+ * | deployment | `controls.disable`, `controls.enable` |
+ *
+ * `controls.retire` is in none: it has no executor, so it is never run again.
  * After the commands, each run sweep the composition registers runs once per harness the
  * recovery visits (`AreaRuntime.runSweeps`), and `runsInterrupted` counts the runs they
  * closed, present only when one did.
@@ -68,12 +77,24 @@ export function isJobReceipt(receipt: CommandReceipt): boolean {
   return receipt.effects.some((effect) => effect.kind === "job");
 }
 
+/** The family each control belongs to; a kind not named here is in none. */
+const CONTROL_FAMILIES: Readonly<Record<string, string>> = {
+  "controls.start": "daemon",
+  "controls.stop": "daemon",
+  "controls.restart": "daemon",
+  "controls.drain": "daemon",
+  "controls.pause": "intake",
+  "controls.resume": "intake",
+  "controls.disable": "deployment",
+  "controls.enable": "deployment",
+};
+
 /**
- * The daemon commands in one ledger that a later daemon command on the same harness
- * overtook: every one but the latest per harness, by acceptance time, then by place in
- * the ledger. In a harness's own ledger every daemon command is that harness's; in Home's
- * they are told apart by target. A later command counts whatever state it reached: the
- * operator asked for it after.
+ * The controls in one ledger that a later control of the same family on the same harness
+ * overtook: every one but the latest per harness and family, by acceptance time, then by
+ * place in the ledger. In a harness's own ledger every control is that harness's; in
+ * Home's they are told apart by target. A later command counts whatever state it reached:
+ * the operator asked for it after.
  */
 export function supersededControls(
   objects: Iterable<FoldedObject>,
@@ -83,8 +104,12 @@ export function supersededControls(
   const all: string[] = [];
   for (const object of objects) {
     const kind = object.record["kind"];
-    if (typeof kind !== "string" || !kind.startsWith("controls.")) continue;
-    const subject = ownHarness ? "" : String(object.record["target"]);
+    const family =
+      typeof kind === "string" && Object.hasOwn(CONTROL_FAMILIES, kind)
+        ? CONTROL_FAMILIES[kind]
+        : undefined;
+    if (family === undefined) continue;
+    const subject = `${family}\0${ownHarness ? "" : String(object.record["target"])}`;
     const parsed = Date.parse(String(object.record["acceptedAt"]));
     const at = Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
     all.push(object.id);
@@ -194,7 +219,12 @@ export function createRecover(
         const observe = async () =>
           reconciler === undefined
             ? "unknown"
-            : await reconciler(receipt, { harnessDir, probe: core.probe, now: core.now });
+            : await reconciler(receipt, {
+                harnessDir,
+                probe: core.probe,
+                now: core.now,
+                hangarRoot: core.hangarRoot,
+              });
 
         if (receipt.state === "accepted") {
           if (idempotent) {

@@ -62,7 +62,7 @@ export {
   type ToolApprovalRequest,
   resolveToolApproval,
 } from "./approval-resolve";
-export { AREA_RUNTIMES, activationGates, compositionProblems } from "./areas";
+export { AREA_RUNTIMES, activationGates, compositionProblems, retireRevokers } from "./areas";
 export {
   type Commands,
   type InlineEffect,
@@ -82,6 +82,9 @@ export {
   type ReconcileContext,
   type Reconciler,
   type Reconciliation,
+  type RetireItem,
+  type RetireRevoker,
+  type RetireRevokerContext,
   type RunSweep,
   type RunSweepContext,
   type Settlement,
@@ -111,7 +114,35 @@ export {
   commandsLedgerOf,
   workspaceCommandsLedger,
 } from "./ledgers";
+export {
+  OPERATOR_CONTROL_KINDS,
+  OPERATOR_EXECUTORS,
+  OPERATOR_RECONCILERS,
+  type OperatorControlAnswer,
+  type OperatorControlContext,
+  type OperatorControlKind,
+  type OperatorControlRequest,
+  type OperatorDaemonAnswer,
+  type OperatorReload,
+  type OperatorReloadAnswer,
+  type OperatorReloadTarget,
+  applyOperatorControl,
+  isOperatorControlKind,
+  operatorControlLine,
+  reconcileOperatorControl,
+  recordDesired,
+} from "./operator-controls";
 export { type RecoverCounts, type RecoverScope, isJobReceipt } from "./recover";
+export {
+  LIFECYCLE_FILE,
+  type RetireRegistry,
+  type RetireStepOutcome,
+  type RetireSteps,
+  type RetireStepsOptions,
+  lifecycleLedger,
+  reconcileRetire,
+  retireSteps,
+} from "./retire";
 export {
   CANCELLED,
   type ControlRefusal,

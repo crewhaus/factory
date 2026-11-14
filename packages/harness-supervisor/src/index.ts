@@ -354,7 +354,7 @@ export {
   verifyActiveBuild,
 } from "./active-build";
 export type { StartDecisionInput, StartRefusal } from "./start-decision";
-export { automaticSpecRefusal, decideStart } from "./start-decision";
+export { automaticSpecRefusal, decideStart, operatorRefusal } from "./start-decision";
 export type { BuildArtifact } from "./build-inputs";
 export {
   bootInputsOf,

@@ -49,7 +49,12 @@ import {
 // Re-exported so downstream renderers (the CLI changelog, future reporters)
 // can apply the SAME redaction to strings the differ never sees (rationales,
 // free-form provenance) without duplicating the pattern table a third time.
-export { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
+export {
+  REDACTED_VALUE,
+  carriesCredential,
+  isCredentialKey,
+  maskCredentialTokens,
+} from "./redact";
 export { DELTA_090_KEYS, type OwnerKey } from "./owner-keys";
 export { type ProtectedBarChange, protectedBarChange } from "./protected";
 export * from "./surfaces";
