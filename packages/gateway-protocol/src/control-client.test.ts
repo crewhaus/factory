@@ -369,11 +369,72 @@ describe("the port", () => {
     expect(parseControlPort("listening on http://127.0.0.1:41777")).toBeUndefined();
   });
 
-  test("the two lanes, and nothing else, are lanes", () => {
+  test("the two fixed lanes and the named schedule lanes, and nothing else, are lanes", () => {
     expect([...CONTROL_LANES]).toEqual(["heartbeat", "schedule"]);
     expect(isControlLane("heartbeat")).toBe(true);
     expect(isControlLane("schedule")).toBe(true);
+    expect(isControlLane("schedule:discovery")).toBe(true);
+    expect(isControlLane(`schedule:a${"b".repeat(31)}`)).toBe(true);
     expect(isControlLane("janitor")).toBe(false);
+    expect(isControlLane("dream")).toBe(false);
     expect(isControlLane("")).toBe(false);
+    expect(isControlLane("schedule:")).toBe(false);
+    expect(isControlLane("schedule:Bad")).toBe(false);
+    expect(isControlLane("schedule:a_b")).toBe(false);
+    expect(isControlLane(`schedule:a${"b".repeat(32)}`)).toBe(false);
+    expect(isControlLane("heartbeat:x")).toBe(false);
+  });
+});
+
+describe("reload", () => {
+  test("a 200 answers the operator record the daemon enforces now", async () => {
+    const operator = { rev: 3, paused: true, disabled: false, unreadable: false };
+    const { fetch, seen } = answering(200, { operator });
+    const result = await createControlClient({ fetch }).reload({
+      harnessDir: harness(TOKEN),
+      controlPort: PORT,
+    });
+    expect(result).toEqual({ ok: true, status: 200, body: { operator } });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.method).toBe("POST");
+    expect(seen[0]?.url).toBe(`http://127.0.0.1:${PORT}${CONTROL_PATH_PREFIX}/operator/reload`);
+  });
+
+  test("a 404 is a build without the route: expected, not retryable", async () => {
+    const { fetch } = answering(404, { error: "not found" });
+    const refusal = refused(
+      await createControlClient({ fetch }).reload({
+        harnessDir: harness(TOKEN),
+        controlPort: PORT,
+      }),
+    );
+    expect(refusal).toMatchObject({
+      code: "unsupported_by_bundle",
+      status: 404,
+      expected: true,
+      retryable: false,
+    });
+  });
+
+  test("a 401 is unauthorized, as on every other route", async () => {
+    const { fetch } = answering(401, { error: "unauthorized" });
+    const refusal = refused(
+      await createControlClient({ fetch }).reload({
+        harnessDir: harness(TOKEN),
+        controlPort: PORT,
+      }),
+    );
+    expect(refusal).toMatchObject({ code: "unauthorized", status: 401, expected: false });
+  });
+
+  test("a 404 on wake stays what it was", async () => {
+    const { fetch } = answering(404, { error: "nope" });
+    const refusal = refused(
+      await createControlClient({ fetch }).wake(
+        { harnessDir: harness(TOKEN), controlPort: PORT },
+        { lane: "heartbeat" },
+      ),
+    );
+    expect(refusal.code).toBe("error");
   });
 });

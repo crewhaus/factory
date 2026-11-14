@@ -5,10 +5,19 @@
  * reconciler serves start and restart, the two kinds that are not safe to repeat blindly.
  *
  * Activation's reconciler reads the deployment records, and the decision service's kinds
- * observe their own records (`./decision-runtime`). The operator record and run creation
- * get theirs with their writers.
+ * observe their own records (`./decision-runtime`). The operator controls write and observe
+ * the operator record (`./operator-controls`), and retire is observed in Home's lifecycle
+ * record (`./retire`). Run creation gets its reconciler with its writer. One run sweep
+ * closes a channel message whose daemon died before its turn started ({@link channelRunSweep}).
  */
 import type { CommandReceipt } from "@crewhaus/control-contract";
+import type { ReceiptEffect } from "@crewhaus/control-contract";
+import {
+  type LedgerRecord,
+  newestRunRows,
+  runsLedger,
+  settleUnstartedRun,
+} from "@crewhaus/control-records";
 import {
   START_TIME_TOLERANCE_MS,
   type StartResult,
@@ -17,34 +26,68 @@ import {
 } from "@crewhaus/harness-supervisor";
 import { DECISION_EXECUTORS, DECISION_RECONCILERS } from "./decision-runtime";
 import { protectedEnvironmentGate, reconcileActivation } from "./deployments";
-import type {
-  AreaRuntime,
-  Executor,
-  ReconcileContext,
-  Reconciliation,
-  Settlement,
+import {
+  type AreaRuntime,
+  type Executor,
+  type ReconcileContext,
+  type Reconciliation,
+  type RunSweep,
+  type Settlement,
+  executorDead,
 } from "./executor";
+import {
+  OPERATOR_CONTROL_KINDS,
+  OPERATOR_EXECUTORS,
+  OPERATOR_RECONCILERS,
+} from "./operator-controls";
 import { NEEDS_DECISION, outcomeOf } from "./refusal";
+import { reconcileRetire } from "./retire";
 
 /** A restart refused before it stopped anything: the daemon it would replace still runs. */
 const KEPT_RUNNING = { kind: "daemon", status: "skipped", note: "kept running" } as const;
+
+/** Whether the operator record says what was asked: one effect, when the head recorded it. */
+function desiredEffect(
+  desired: "recorded" | "not-recorded" | undefined,
+  value: "running" | "stopped",
+): ReceiptEffect[] {
+  if (desired === undefined) return [];
+  return [
+    {
+      kind: "operator",
+      status: desired === "recorded" ? "done" : "failed",
+      observed: `desired ${value}`,
+    },
+  ];
+}
 
 /** A start or restart's answer, as a settlement. */
 export function settleStart(result: StartResult): Settlement {
   if (result.ok) {
     return {
       state: "succeeded",
-      effects: [{ kind: "daemon", status: "done", observed: "started" }],
+      effects: [
+        { kind: "daemon", status: "done", observed: "started" },
+        ...desiredEffect(result.desired, "running"),
+      ],
     };
   }
   if (result.kept === true) {
     return {
       state: "rejected",
       effects: [KEPT_RUNNING],
-      outcome: outcomeOf(result.reason === "already-running" ? "conflict" : "precondition_failed"),
+      outcome: outcomeOf(
+        result.reason === "already-running"
+          ? "conflict"
+          : result.reason === "disabled"
+            ? "disabled"
+            : "precondition_failed",
+      ),
     };
   }
   switch (result.reason) {
+    case "disabled":
+      return { state: "rejected", outcome: outcomeOf("disabled") };
     case "already-running":
       return { state: "rejected", outcome: outcomeOf("conflict") };
     case "preflight-blocked":
@@ -65,7 +108,10 @@ export function settleStop(result: StopResult): Settlement {
   if (result.stopped) {
     return {
       state: "succeeded",
-      effects: [{ kind: "daemon", status: "done", observed: "stopped" }],
+      effects: [
+        { kind: "daemon", status: "done", observed: "stopped" },
+        ...desiredEffect(result.desired, "stopped"),
+      ],
     };
   }
   if (result.reason === "not-adopted") {
@@ -77,7 +123,10 @@ export function settleStop(result: StopResult): Settlement {
   }
   return {
     state: "succeeded",
-    effects: [{ kind: "daemon", status: "skipped", note: "not running" }],
+    effects: [
+      { kind: "daemon", status: "skipped", note: "not running" },
+      ...desiredEffect(result.desired, "stopped"),
+    ],
   };
 }
 
@@ -138,6 +187,51 @@ export function reconcileDaemonStart(
  */
 const activate: Executor = async () => ({ state: "unknown", outcome: NEEDS_DECISION });
 
+/** A holder as a run row records it, when the row has one that names a process. */
+function holderOf(
+  row: LedgerRecord,
+): { pid: number; host: string; startedAt?: string } | undefined {
+  const holder = row["holder"];
+  if (typeof holder !== "object" || holder === null) return undefined;
+  const { pid, host, startedAt } = holder as Record<string, unknown>;
+  if (typeof pid !== "number" || typeof host !== "string") return undefined;
+  return { pid, host, ...(typeof startedAt === "string" ? { startedAt } : {}) };
+}
+
+/**
+ * A chat message a channel daemon accepted and whose turn never started: the run's newest
+ * row, among the ledger's newest 256 lines, is `preparing`, its trigger is `channel`, and
+ * the process that held it is provably gone (by the lease's rule, or because it started
+ * before the machine booted). It is closed `interrupted {reason: "not-processed", by:
+ * "sys:reconcile"}`, under the ledger's lock with the row read again. A holder that is
+ * alive, or that the probe cannot judge, is left; so is a run the runtime has started.
+ */
+export const channelRunSweep: RunSweep = async (harnessDir, ctx) => {
+  const ledger = runsLedger(harnessDir);
+  const left = (row: LedgerRecord): boolean => {
+    if (row["state"] !== "preparing") return false;
+    const trigger = row["trigger"];
+    if (typeof trigger !== "object" || trigger === null) return false;
+    if ((trigger as Record<string, unknown>)["kind"] !== "channel") return false;
+    const holder = holderOf(row);
+    return holder !== undefined && executorDead(holder, ctx.probe, ctx.host, ctx.hostBootedAt);
+  };
+  const at = new Date(ctx.now).toISOString();
+  let closed = 0;
+  for (const [id, row] of newestRunRows(ledger)) {
+    if (!left(row)) continue;
+    const settled = await settleUnstartedRun(
+      ledger,
+      id,
+      { state: "interrupted", at, fields: { reason: "not-processed", by: "sys:reconcile" } },
+      left,
+    );
+    if (!settled.ok) throw new Error(settled.reason);
+    if (settled.settled) closed += 1;
+  }
+  return closed;
+};
+
 export const CORE_RUNTIME: AreaRuntime = {
   area: "core",
   executors: {
@@ -146,14 +240,20 @@ export const CORE_RUNTIME: AreaRuntime = {
     "controls.restart": restart,
     "controls.drain": drain,
     "deployments.activate": activate,
+    ...OPERATOR_EXECUTORS,
     ...DECISION_EXECUTORS,
   },
   reconcilers: {
     "controls.start": reconcileDaemonStart,
     "controls.restart": reconcileDaemonStart,
     "deployments.activate": (receipt, ctx) => reconcileActivation(receipt, ctx),
+    ...OPERATOR_RECONCILERS,
+    // Retire has no executor: recovery leaves an interrupted one for a person, and the
+    // reconcile sweep reads Home's lifecycle record.
+    "controls.retire": reconcileRetire,
     ...DECISION_RECONCILERS,
   },
-  unsupervised: Object.keys(DECISION_EXECUTORS),
+  unsupervised: [...OPERATOR_CONTROL_KINDS, ...Object.keys(DECISION_EXECUTORS)],
   activationGates: [protectedEnvironmentGate],
+  runSweeps: [channelRunSweep],
 };

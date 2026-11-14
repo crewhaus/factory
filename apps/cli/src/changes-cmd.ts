@@ -625,16 +625,19 @@ async function checkVerb(session: Session, argv: readonly string[]): Promise<Cha
       exitCode: EXIT_FOR_ERROR.forbidden,
     };
   }
-  const gradersRel = (() => {
+  const patchTargets = (() => {
     try {
-      const patch = JSON.parse(
-        readChangeContent(session.harnessDir, chg, "patch.json") ?? "{}",
-      ) as { graders?: string };
-      return patch.graders ?? join("eval", "graders.yaml");
+      return JSON.parse(readChangeContent(session.harnessDir, chg, "patch.json") ?? "{}") as {
+        graders?: unknown;
+        spec?: unknown;
+      };
     } catch {
-      return join("eval", "graders.yaml");
+      return {};
     }
   })();
+  const gradersRel =
+    typeof patchTargets.graders === "string" ? patchTargets.graders : join("eval", "graders.yaml");
+  const specRel = typeof patchTargets.spec === "string" ? patchTargets.spec : "crewhaus.yaml";
   const gradersYaml = (() => {
     try {
       return readFileSync(join(session.harnessDir, gradersRel), "utf8");
@@ -665,6 +668,7 @@ async function checkVerb(session: Session, argv: readonly string[]): Promise<Cha
   }
   const runners = qualityRunners({
     harnessDir: session.harnessDir,
+    spec: specRel,
     gradersYaml,
     externalWrites: writes,
     ...(specName !== undefined ? { specName } : {}),

@@ -32,12 +32,14 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import {
+  SCHEDULE_LANES_ARMED_VAR,
   renderControlDrain,
   renderControlImports,
   renderControlLane,
   renderControlPlaneBoot,
   renderControlStart,
   renderControlTimer,
+  renderScheduleLanes,
 } from "@crewhaus/gateway-protocol/control-codegen";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
@@ -546,7 +548,7 @@ function renderAgent(ir: IrBatchV0): string {
   // specs keep the exact pre-Batch-F selection, so their bundles stay
   // byte-identical.
   const idleLoop =
-    ir.queue.adapter === "in-memory" && ir.schedule === undefined
+    ir.queue.adapter === "in-memory" && ir.schedule === undefined && ir.scheduleLanes === undefined
       ? `  // For the hello-batch smoke: when the queue empties + no in-flight,
   // emit a queue_idle event and exit so the smoke can assert on a
   // clean shutdown without sending a signal. Production users will
@@ -596,7 +598,21 @@ function renderAgent(ir: IrBatchV0): string {
   // byte-identical.
   const scheduleImport = ir.schedule
     ? `import { armSchedule, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
-    : "";
+    : ir.scheduleLanes
+      ? `import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
+      : "";
+  // The body of one schedule wake, for the single `schedule` lane and for each
+  // named lane alike: enqueue that lane's prompt as a job. A named lane's
+  // event says which lane it was.
+  const scheduleTickBody = (instructionsVar: string, tickVar: string, lane?: string): string =>
+    `${tickVar}++;
+const jobId = await queue.enqueue(${instructionsVar});
+emit({
+  kind: "scheduled_wake",${lane !== undefined ? `\n  lane: ${escapeJsonString(lane)},` : ""}
+  tick: ${tickVar},
+  jobId,
+  ...(__tick.synthetic !== undefined ? { synthetic: true, reason: __tick.synthetic.reason, by: __tick.synthetic.by } : {}),
+});`;
   // crewhaus.control.v1 — the wake body is a control LANE, so `POST
   // /control/v1/wake {lane:"schedule"}` enqueues a job down the exact path the
   // timer uses (and 409s while an enqueue is in flight). This shape is a
@@ -618,14 +634,7 @@ ${renderControlLane({
   nextDueAtExpr: "new Date(Date.now() + nextWakeDelayMs(__scheduleSpec, Date.now())).toISOString()",
   indent: "  ",
   ownsSession: false,
-  body: `__scheduleTick++;
-const jobId = await queue.enqueue(__scheduleInstructions);
-emit({
-  kind: "scheduled_wake",
-  tick: __scheduleTick,
-  jobId,
-  ...(__tick.synthetic !== undefined ? { synthetic: true, reason: __tick.synthetic.reason, by: __tick.synthetic.by } : {}),
-});`,
+  body: scheduleTickBody("__scheduleInstructions", "__scheduleTick"),
 })}  const __schedule = armSchedule(__scheduleSpec, {
     onWake: async () => {
       await __scheduleLane.tick();
@@ -636,6 +645,32 @@ emit({
 `
     : "";
   const scheduleShutdown = ir.schedule ? "\n    __schedule.cancel();" : "";
+
+  // Named schedule lanes (#514): each lane enqueues its own prompt on its own
+  // clock (`armScheduleLanes`), as its own control lane `schedule:<name>`, a
+  // producer like the single lane (`ownsSession: false`). Absent
+  // `scheduleLanes` emits nothing.
+  const scheduleLanesBoot = ir.scheduleLanes
+    ? `
+  // Named schedule lanes: one wake loop per lane (cron|interval + jitter)
+  const __scheduleLaneTicks = [${ir.scheduleLanes.map(() => "0").join(", ")}];
+${renderScheduleLanes({
+  lanes: ir.scheduleLanes.map((lane) => ({
+    ...lane,
+    instructions: lane.instructions ?? "[scheduled wake]",
+  })),
+  indent: "  ",
+  ownsSession: false,
+  body: ({ name, index, instructionsVar }) =>
+    scheduleTickBody(instructionsVar, `__scheduleLaneTicks[${index}]`, name),
+  onErrorBody:
+    'emit({ kind: "scheduled_wake_error", lane: __name, error: (__err as Error).message ?? String(__err) });',
+  afterArm:
+    'for (const __l of __scheduleLanes) emit({ kind: "schedule_armed", lane: __l.name, schedule: __l.cadence });',
+})}`
+    : "";
+  const scheduleLanesCancel = `${SCHEDULE_LANES_ARMED_VAR}?.cancel();`;
+  const scheduleLanesShutdown = ir.scheduleLanes ? `\n    ${scheduleLanesCancel}` : "";
 
   // crewhaus.control.v1, from the shared gateway-protocol renderers. The batch
   // worker has no public HTTP port, so control.v1 is its ONLY remote surface;
@@ -657,7 +692,7 @@ emit({
   const controlDrain = renderControlDrain({
     indent: "  ",
     body: `stopping = true;
-janitor.stop();${ir.schedule ? "\n__schedule.cancel();" : ""}
+janitor.stop();${ir.schedule ? "\n__schedule.cancel();" : ""}${ir.scheduleLanes ? `\n${scheduleLanesCancel}` : ""}
 emit({ kind: "drain_requested", via: "control.v1" });
 await consumer.drain();${mcp.hasAny ? `\n${mcp.cleanupBlock}` : ""}
 emit({ kind: "worker_stop", stats: await queue.stats() });`,
@@ -842,12 +877,12 @@ ${mcpBoot}  // G11 — a compiled bundle is NON-INTERACTIVE: a tool that lands o
       onDrainEnd: () => emit({ kind: "drain_end" }),
     },
   });
-${scheduleBoot}
+${scheduleBoot}${scheduleLanesBoot}
   let stopping = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (stopping) return;
     stopping = true;
-    janitor.stop();${scheduleShutdown}
+    janitor.stop();${scheduleShutdown}${scheduleLanesShutdown}
     emit({ kind: "shutdown_received", signal });
     await consumer.drain();${mcpShutdownCleanup}
     const stats = await queue.stats();

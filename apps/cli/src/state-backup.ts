@@ -35,15 +35,23 @@
  * instead and the manifest records `sqliteConsistent: false` so the
  * operator knows the copy may be torn.
  *
+ * SECRETS: a backup leaves out the bearer secrets a daemon makes again at
+ * every start (`DEFAULT_BACKUP_EXCLUDES`) unless `--include` names one, and
+ * the tarball is readable only by its owner (mode 0600) from the moment it
+ * exists.
+ *
  * Deliberately OUT OF SCOPE: S3/R2 upload (sync the tarball with your own
  * tooling — `aws s3 cp`, rclone, …) and a scheduled-cron template (a
  * `templates/` convention is landing on another branch).
  */
 import { Database } from "bun:sqlite";
+import { randomBytes } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -62,6 +70,48 @@ import { type FeedbackRecord, extractFeedbackRecords, mergeFeedback } from "./fe
 
 /** Manifest file name at the archive root (NOT restored into `.crewhaus`). */
 export const MANIFEST_FILENAME = "backup-manifest.json";
+
+/**
+ * A daemon's run bearer secrets, relative to the state directory. A daemon
+ * makes each again at every start, so a restore loses nothing without them.
+ */
+export const RUN_TOKEN_FILES: readonly string[] = [
+  "run/control-token",
+  "run/gateway-jwt-secret",
+  "run/mcp-token",
+];
+
+/**
+ * Files a backup leaves out unless `--include` names one, so a restore loses
+ * nothing without them. Paths are relative to the state directory and match
+ * exactly (a file of the same name anywhere else is archived).
+ */
+export const DEFAULT_BACKUP_EXCLUDES: readonly string[] = [...RUN_TOKEN_FILES];
+
+/**
+ * Remove {@link RUN_TOKEN_FILES} from a state directory that is no longer
+ * live (the copy `crewhaus retire` keeps in its archive), so it holds no run
+ * token. A daemon makes each again at start. Only a file under a real `run/`
+ * directory is removed (a link is removed, never followed). Returns the
+ * removed paths, sorted.
+ */
+export function removeRunTokens(stateDir: string): string[] {
+  const removed: string[] = [];
+  for (const rel of RUN_TOKEN_FILES) {
+    const parent = join(stateDir, dirname(rel));
+    const path = join(stateDir, rel);
+    try {
+      if (!lstatSync(parent).isDirectory()) continue;
+      const st = lstatSync(path);
+      if (!st.isFile() && !st.isSymbolicLink()) continue;
+    } catch {
+      continue;
+    }
+    rmSync(path, { force: true });
+    removed.push(rel);
+  }
+  return removed.sort();
+}
 
 /** First 16 bytes of every SQLite main database file: "SQLite format 3\\0"
  *  (spelled as code points so the source carries no literal NUL). */
@@ -425,6 +475,11 @@ export type BackupOptions = {
   /** Absolute output tarball path. */
   outFile: string;
   excludeGlobs?: ReadonlyArray<string>;
+  /**
+   * Keeps a file `DEFAULT_BACKUP_EXCLUDES` names, with a warning. Glob
+   * semantics are `excludeGlobs`'; `excludeGlobs` still wins.
+   */
+  includeGlobs?: ReadonlyArray<string>;
   /** Stamped into the manifest. */
   crewhausVersion: string;
   /** Test seam: clock. */
@@ -436,6 +491,8 @@ export type BackupResult = {
   outFile: string;
   /** Files dropped by --exclude. */
   excluded: string[];
+  /** Files `DEFAULT_BACKUP_EXCLUDES` names that existed and were left out, sorted. */
+  defaultExcluded: string[];
   /** Non-fatal warnings (skipped symlinks, raw-copied sqlite files). */
   warnings: string[];
 };
@@ -445,6 +502,8 @@ export type BackupResult = {
  * an exact byte copy (sqlite files as a consistent read-only snapshot — see
  * the file header), a manifest is written at the archive root, and the
  * system `tar` packs the staging dir. Source files are never modified.
+ * A file `DEFAULT_BACKUP_EXCLUDES` names is left out unless `includeGlobs`
+ * keeps it, and the tarball is mode 0600 from the moment it exists.
  */
 export async function createStateBackup(opts: BackupOptions): Promise<BackupResult> {
   const stateDir = resolve(opts.stateDir);
@@ -458,9 +517,22 @@ export async function createStateBackup(opts: BackupOptions): Promise<BackupResu
     warnings.push(`skipped symlink ${s} (backups archive regular files only)`);
   }
 
+  const includeGlobs = opts.includeGlobs ?? [];
   const excluded: string[] = [];
+  const defaultExcluded: string[] = [];
   const kept: string[] = [];
   for (const f of files) {
+    if (DEFAULT_BACKUP_EXCLUDES.includes(f)) {
+      if (!isExcluded(f, includeGlobs)) {
+        defaultExcluded.push(f);
+        continue;
+      }
+      if (!isExcluded(f, globs)) {
+        warnings.push(
+          `kept ${f} (--include): a bearer secret a backup leaves out by default; keep the archive private`,
+        );
+      }
+    }
     (isExcluded(f, globs) ? excluded : kept).push(f);
   }
 
@@ -556,10 +628,30 @@ export async function createStateBackup(opts: BackupOptions): Promise<BackupResu
     });
     writeFileSync(join(staging, MANIFEST_FILENAME), `${JSON.stringify(manifest, null, 2)}\n`);
 
-    await runTar(["-czf", outFile, "-C", staging, "."]);
-    return { manifest, outFile, excluded, warnings };
+    await packOwnerOnly(outFile, staging);
+    return { manifest, outFile, excluded, defaultExcluded, warnings };
   } finally {
     rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Pack `staging` into `outFile` with mode 0600 from the first byte: tar
+ * writes into a sibling file created 0600, which is then renamed over
+ * `outFile` (replacing any file there, whatever its mode). The sibling sits
+ * in `outFile`'s own directory, so the rename never crosses a filesystem.
+ */
+async function packOwnerOnly(outFile: string, staging: string): Promise<void> {
+  const tmp = `${outFile}.partial-${randomBytes(4).toString("hex")}`;
+  try {
+    closeSync(openSync(tmp, "wx", 0o600));
+    await runTar(["-czf", tmp, "-C", staging, "."]);
+    // In case a tar replaces the file rather than writing into it.
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, outFile);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
   }
 }
 

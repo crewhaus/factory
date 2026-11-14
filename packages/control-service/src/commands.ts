@@ -222,6 +222,7 @@ export function createCommands(core: ControlCore): CommandsInternals {
           ...(supervisor !== undefined ? { supervisor } : {}),
           drainRequest: core.drainRequest(harnessDir),
           now: core.now,
+          probe: core.probe,
         });
       } catch {
         settle = {

@@ -11,6 +11,8 @@ import type {
   ModelRequestEvent,
   ModelResponseEvent,
   PermissionDecisionEvent,
+  TurnEndEvent,
+  TurnStartEvent,
 } from "@crewhaus/trace-event-bus";
 import { SpanTracker } from "./span-tracker";
 import type { OtelSpan } from "./types";
@@ -348,5 +350,93 @@ describe("SpanTracker turn pairing", () => {
     tracker.ingest({ ...env(), kind: "turn_end", turn: 1, durationMs: 5 });
     expect(spans).toHaveLength(1);
     expect(spans[0]?.name).toBe("turn");
+  });
+});
+
+describe("SpanTracker nested turns (two loops on one bus)", () => {
+  const span = (n: number) => n.toString(16).padStart(16, "0");
+  const LOOP_A = span(0xa0);
+  const LOOP_B = span(0xb0);
+  const TURN_A = span(0xa1);
+  const TURN_B = span(0xb1);
+  const MODEL_A = span(0xa2);
+  const RETRY_A = span(0xa3);
+  const turnStart = (spanId: string, parentSpanId: string): TurnStartEvent => ({
+    ...env({ spanId, parentSpanId }),
+    kind: "turn_start",
+    turn: 1,
+    messageCount: 1,
+  });
+  const turnEnd = (spanId: string, parentSpanId: string): TurnEndEvent => ({
+    ...env({ spanId, parentSpanId, timestamp: "2026-05-07T12:00:05.000Z" }),
+    kind: "turn_end",
+    turn: 1,
+    durationMs: 5,
+  });
+  const request = (spanId: string, extra: Partial<ModelRequestEvent> = {}): ModelRequestEvent => ({
+    ...env({ spanId, parentSpanId: TURN_A }),
+    kind: "model_request",
+    model: "m",
+    messageCount: 1,
+    toolCount: 0,
+    streaming: false,
+    ...extra,
+  });
+
+  test("A start, B start, B end, A end: two turn spans with their own ids and parents", () => {
+    const { tracker, spans } = tracked();
+    tracker.ingest(turnStart(TURN_A, LOOP_A));
+    tracker.ingest(turnStart(TURN_B, LOOP_B));
+    tracker.ingest(turnEnd(TURN_B, LOOP_B));
+    tracker.ingest(turnEnd(TURN_A, LOOP_A));
+    const turns = spans.filter((s) => s.name === "turn");
+    expect(turns.map((s) => [s.spanId, s.parentSpanId])).toEqual([
+      [TURN_B, LOOP_B],
+      [TURN_A, LOOP_A],
+    ]);
+  });
+
+  test("B's end does not abandon a model call still open under A; A's end does", () => {
+    const { tracker, spans } = tracked();
+    tracker.ingest(turnStart(TURN_A, LOOP_A));
+    tracker.ingest(request(MODEL_A));
+    tracker.ingest(turnStart(TURN_B, LOOP_B));
+    tracker.ingest(turnEnd(TURN_B, LOOP_B));
+    expect(tracker.inFlightModelCalls()).toBe(1);
+    expect(spans.some((s) => s.name === "gen_ai.chat")).toBe(false);
+    tracker.ingest(turnEnd(TURN_A, LOOP_A));
+    expect(tracker.inFlightModelCalls()).toBe(0);
+    const abandoned = spans.find((s) => s.name === "gen_ai.chat");
+    expect(abandoned?.spanId).toBe(MODEL_A);
+    expect(abandoned?.status.code).toBe(2);
+  });
+
+  test("a retried model call carries crewhaus.retry_of, and no span carries an action digest", () => {
+    const { tracker, spans } = tracked();
+    tracker.ingest(turnStart(TURN_A, LOOP_A));
+    tracker.ingest(request(RETRY_A, { retryOf: MODEL_A }));
+    const response: ModelResponseEvent = {
+      ...env({ spanId: RETRY_A, parentSpanId: TURN_A }),
+      kind: "model_response",
+      model: "m",
+      stopReason: "end_turn",
+      usage: { input: 1, output: 1 },
+      durationMs: 1,
+    };
+    tracker.ingest(response);
+    tracker.ingest(turnEnd(TURN_A, LOOP_A));
+    const model = spans.find((s) => s.name === "gen_ai.chat");
+    expect(model?.parentSpanId).toBe(TURN_A);
+    expect(model?.attributes.find((a) => a.key === "crewhaus.retry_of")?.value).toEqual({
+      stringValue: MODEL_A,
+    });
+    // A call that is not a retry has no such attribute.
+    const { tracker: plain, spans: plainSpans } = tracked();
+    plain.ingest(request(MODEL_A));
+    plain.ingest({ ...response, spanId: MODEL_A });
+    expect(plainSpans[0]?.attributes.some((a) => a.key === "crewhaus.retry_of")).toBe(false);
+    for (const s of [...spans, ...plainSpans]) {
+      expect(s.attributes.some((a) => /digest/i.test(a.key))).toBe(false);
+    }
   });
 });

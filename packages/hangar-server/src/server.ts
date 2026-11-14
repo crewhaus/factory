@@ -1575,6 +1575,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
    *  routes use, flattened so a sweep's summary reads as a list. */
   function groupRefusalMessage(result: StartResult & { readonly ok: false }): string {
     switch (result.reason) {
+      case "disabled":
+        return result.message;
       case "already-running":
         return "already running (the runfile is the lock)";
       case "preflight-blocked":
@@ -1620,6 +1622,19 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     // A restart refused before it stopped anything says the daemon keeps running.
     const kept = result.kept === true ? { running: true } : {};
     switch (result.reason) {
+      case "disabled":
+        // 409: the operator disabled this harness (or its operator record cannot be read);
+        // enabling it clears it.
+        return json(
+          {
+            ok: false,
+            reason: "disabled",
+            message: result.message,
+            verb: "crewhaus daemon enable",
+            ...kept,
+          },
+          409,
+        );
       case "prepare-refused":
         // 409 like the gate: well-formed request, refused by a fact about
         // the harness. The step's own output is what makes it actionable.
@@ -2041,7 +2056,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           const body = await readBody(req);
           const lane = body["lane"];
           if (typeof lane !== "string" || !isControlLane(lane)) {
-            throw new HttpError(400, 'missing "lane" — one of: heartbeat, schedule');
+            throw new HttpError(400, 'missing "lane": heartbeat, schedule or schedule:<name>');
           }
           const reason = typeof body["reason"] === "string" ? body["reason"] : undefined;
           return jsonMasked(
@@ -2055,13 +2070,40 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           );
         }
         if (tail[0] === "drain") {
-          const outcome = await control.drain(controlTarget(handle));
-          // ONLY after the daemon accepted it. A refusal (`no_control_port`,
-          // say) told the daemon nothing, and marking anyway would both
-          // suppress a restart the daemon still needs and disable every
-          // process verb in the console with "this daemon is draining".
-          if (outcome.ok) handle.markDraining();
-          return jsonMasked(controlEnvelope(outcome));
+          // Through the supervisor, as `/proc/drain` is: the control call is ours, and
+          // when it is refused the supervisor stops the daemon by signal, so a drain from
+          // Home always ends with the daemon stopped. The answer stays the control call's
+          // envelope, plus `stopped`, and `viaSignal` when the signal stopped it.
+          if (handle.snapshot().pid !== undefined) handle.markDraining();
+          let outcome: ControlResult<unknown> | undefined;
+          try {
+            const result = await handle.supervisor.drain(async () => {
+              outcome = await control.drain(controlTarget(handle));
+              if (!outcome.ok) throw new Error(outcome.reason);
+            });
+            if (notAdopted(result)) return notAdoptedResponse("drain", result);
+            const envelope =
+              outcome !== undefined
+                ? controlEnvelope(outcome)
+                : controlEnvelope({
+                    ok: false,
+                    code: "no_control_port",
+                    status: 0,
+                    reason: "the daemon is not running",
+                    retryable: false,
+                    expected: true,
+                  });
+            const viaSignal = outcome !== undefined && !outcome.ok && result.stopped;
+            return jsonMasked({
+              ...envelope,
+              stopped: result.stopped,
+              ...(viaSignal ? { viaSignal: true } : {}),
+            });
+          } finally {
+            // As `/proc/drain`: a drain that did not take the daemon away must not leave
+            // the display flag latched.
+            if (!isGoingAway(handle)) handle.clearDraining();
+          }
         }
         throw new HttpError(404, "not found");
       }

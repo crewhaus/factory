@@ -548,3 +548,58 @@ describe("a grant with an end time", () => {
     expect(readProjection(h)["members"]).toEqual([]);
   });
 });
+
+describe("the Home address on the projection", () => {
+  const setBaseUrl = (root: string, baseUrl: unknown): void => {
+    writeFileSync(join(root, "settings.json"), `${JSON.stringify({ links: { baseUrl } })}\n`);
+  };
+
+  test("the owner's links.baseUrl is carried as homeUrl, and a changed one rewrites the file", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    setBaseUrl(home.root, "https://home.example.test/ignored/path");
+    ok(await home.access.link(home.actor, { subject: "slack:T0:U0", member: home.owner }));
+    expect(readProjection(h)["homeUrl"]).toBe("https://home.example.test");
+    const read = createApproverReader({ now: home.clock.now })(h.dir);
+    expect(read.state === "present" && approverProjection.safeParse(read.projection).success).toBe(
+      true,
+    );
+    // Nothing else moved: a sync leaves the file as it is.
+    const writes = countWrites();
+    home.clock.advance(HOUR);
+    ok(await home.access.sync(home.actor));
+    expect(writes).toEqual([]);
+    // The address moved: the next sync rewrites it.
+    setBaseUrl(home.root, "https://other.example.test");
+    home.clock.advance(HOUR);
+    ok(await home.access.sync(home.actor));
+    expect(writes).toEqual([h.id]);
+    expect(readProjection(h)["homeUrl"]).toBe("https://other.example.test");
+  });
+
+  test("with no links.baseUrl, or one that cannot be used, there is no homeUrl key", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    ok(await home.access.link(home.actor, { subject: "slack:T0:U0", member: home.owner }));
+    expect("homeUrl" in readProjection(h)).toBe(false);
+    setBaseUrl(home.root, "http://home.example.test");
+    home.clock.advance(HOUR);
+    ok(await home.access.sync(home.actor));
+    expect("homeUrl" in readProjection(h)).toBe(false);
+    // Owner settings that cannot be read never fail the projection write.
+    writeFileSync(join(home.root, "settings.json"), "{ not json");
+    home.clock.advance(HOUR);
+    ok(
+      await home.access.grant(home.actor, {
+        member: "Ana",
+        create: true,
+        role: "operator",
+        scope: `harness:${h.id}`,
+      }),
+    );
+    expect("homeUrl" in readProjection(h)).toBe(false);
+    expect(readProjection(h)["members"]).toHaveLength(1);
+  });
+});

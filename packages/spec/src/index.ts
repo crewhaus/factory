@@ -10,6 +10,7 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { DELTA_090_ISSUES, type SpecAddIssue } from "./blocks/delta-090";
 import { intentBlock } from "./blocks/intent";
+import { scheduleBlockFrom } from "./blocks/schedule";
 
 export { DELTA_090_ISSUES, type SpecAddIssue };
 
@@ -2827,6 +2828,11 @@ const heartbeatBlock = z
  * Unlike `heartbeat` (channel-only, interval-only), `schedule` is the general
  * temporal surface: it accepts a cron expression AND rides the `runs resume`
  * rehydration path, so an interrupted scheduled run resumes exactly-once.
+ *
+ * Two forms (#514): this one object, armed as the control lane `schedule`, or
+ * a list of one to eight such objects each with a `name`, each armed as its own
+ * lane `schedule:<name>` (#513). `instructions`, `jitter` and `timezone` (cron
+ * only) mean the same per lane. The list form lives in `blocks/schedule.ts`.
  */
 // A 5- or 6-field cron expression (minute-granularity, optional seconds/year).
 // Field validity beyond the char class is the daemon's cron parser's job.
@@ -2863,9 +2869,7 @@ const scheduleIntervalBlock = z
   })
   .strict();
 
-const scheduleBlock = z
-  .discriminatedUnion("kind", [scheduleCronBlock, scheduleIntervalBlock])
-  .optional();
+const scheduleBlock = scheduleBlockFrom(scheduleCronBlock, scheduleIntervalBlock);
 
 /**
  * Phase 3 §3.4 — channel daemon control-UI gateway. When set, the

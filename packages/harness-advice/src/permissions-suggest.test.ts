@@ -4,6 +4,7 @@
  * ranking, the arg-glob derivation, and the additive settings.json diff/merge.
  */
 import { describe, expect, it } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { parsePermissionsConfig } from "@crewhaus/permission-engine";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
@@ -15,17 +16,21 @@ import { z } from "zod";
 import { type SessionEvents, parseJsonlObjects } from "./advise-rules";
 import {
   type AskAggregate,
+  MAX_RULE_VALUE_LENGTH,
   OPERATIVE_ARG_FIELDS,
+  type SuggestToolLookup,
   aggregateAsks,
   applyToSettingsRoot,
   blanketGrantNote,
   diffPermissions,
   existingSettingsRules,
   formatSettingsDiff,
+  formatSuggestionLines,
   hasUnescapedWildcard,
   patternFor,
   rankSuggestions,
   readOnlyByName,
+  skippedSuggestions,
   suggestLookupFromTools,
 } from "./permissions-suggest";
 
@@ -337,6 +342,121 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
     const rm = aggregateAsks([asked("RemovePath", { path: "build" })]).get("RemovePath");
     expect(patternFor(rm as AskAggregate)).toBe("RemovePath");
     expect(blanketGrantNote(rm as AskAggregate)).toContain("does not declare");
+  });
+
+  describe("a recorded call that carries a credential", () => {
+    // Built at runtime from parts, so no credential-shaped literal is committed.
+    const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+    const credentialCommand = `curl -H "Authorization: Bearer ${token}" https://x.test`;
+    const plainCommand = 'curl -H "Accept: text/plain" https://x.test';
+    const shellBash = declared("Bash", [{ field: "command", kind: "command", shell: true }], {
+      command: z.string(),
+    });
+    const readings: Array<[string, SuggestToolLookup | undefined]> = [
+      ["the matcher's name table", undefined],
+      ["the tool's own declaration", suggestLookupFromTools({ bash: shellBash })],
+    ];
+
+    for (const [label, bashLookup] of readings) {
+      it(`gets no allow rule, and no report names its value (${label})`, () => {
+        const aggs = aggregateAsks(
+          [asked("Bash", { command: credentialCommand }, { command: credentialCommand })],
+          bashLookup,
+        );
+        const agg = aggs.get("Bash") as AskAggregate;
+        expect(agg.asks).toBe(3);
+        expect(agg.unscoped).toContain("carries-credential");
+        expect(agg.argSamples.some((v) => v.includes(token))).toBe(false);
+
+        const suggestions = rankSuggestions(aggs, new Map([["Bash", false]]));
+        expect(
+          suggestions.filter((g) => g.toolName === "Bash" && g.rule.type === "alwaysAllow"),
+        ).toEqual([]);
+        const skipped = skippedSuggestions(aggs);
+        expect(skipped).toHaveLength(1);
+        expect(skipped[0]?.toolName).toBe("Bash");
+        expect(skipped[0]?.reason).toBe("carries-credential");
+        expect(skipped[0]?.note).toContain("carried a credential");
+
+        const diff = diffPermissions([], suggestions);
+        const shown = [
+          JSON.stringify({ suggestions, skipped, diff }),
+          formatSuggestionLines(suggestions).join("\n"),
+          formatSettingsDiff(diff).join("\n"),
+          JSON.stringify(applyToSettingsRoot({}, diff.merged)),
+          blanketGrantNote(agg) ?? "",
+        ];
+        for (const text of shown) expect(text.includes(token)).toBe(false);
+      });
+    }
+
+    it("a call that carries none still gets its scoped rule", () => {
+      // A control: it passes without the screen too, and fails if the screen
+      // reaches a header that names no credential.
+      const aggs = aggregateAsks(
+        [asked("Bash", { command: plainCommand })],
+        suggestLookupFromTools({ bash: shellBash }),
+      );
+      const [grant] = rankSuggestions(aggs, new Map());
+      expect(grant?.rule.type).toBe("alwaysAllow");
+      expect(grant?.rule.pattern.startsWith("Bash(curl")).toBe(true);
+      expect(skippedSuggestions(aggs)).toEqual([]);
+    });
+
+    it("one such call among plain ones leaves the tool with no allow at all", () => {
+      const aggs = aggregateAsks(
+        [
+          asked(
+            "Bash",
+            { command: credentialCommand },
+            { command: plainCommand },
+            { command: "git status" },
+          ),
+        ],
+        suggestLookupFromTools({ bash: shellBash }),
+      );
+      expect(aggs.get("Bash")?.unscoped).toContain("carries-credential");
+      const suggestions = rankSuggestions(aggs, new Map());
+      expect(suggestions.filter((g) => g.rule.type === "alwaysAllow")).toEqual([]);
+      expect(skippedSuggestions(aggs).map((k) => k.toolName)).toEqual(["Bash"]);
+      expect(JSON.stringify(suggestions).includes(token)).toBe(false);
+    });
+
+    it("recurring denials of such a call are still tightened, for the whole tool", () => {
+      const denied = session("sess_00000000000000ed", [
+        toolUse("Bash", { command: credentialCommand }),
+        ask("Bash", "denied"),
+        ask("Bash", "denied"),
+        ask("Bash", "denied"),
+      ]);
+      const aggs = aggregateAsks([denied], suggestLookupFromTools({ bash: shellBash }));
+      const suggestions = rankSuggestions(aggs, new Map());
+      expect(suggestions).toHaveLength(1);
+      expect(suggestions[0]?.rule).toEqual({
+        type: "alwaysAsk",
+        pattern: "Bash",
+        source: "settings",
+      });
+      expect(skippedSuggestions(aggs)).toEqual([]);
+      expect(JSON.stringify(suggestions).includes(token)).toBe(false);
+    });
+  });
+
+  it("a value longer than the rule-value cap is not representable and is never sampled", () => {
+    const shellBash = declared("Bash", [{ field: "command", kind: "command", shell: true }], {
+      command: z.string(),
+    });
+    const lookup = suggestLookupFromTools({ bash: shellBash });
+    const atCap = `echo ${"a".repeat(MAX_RULE_VALUE_LENGTH - "echo ".length)}`;
+    expect(atCap).toHaveLength(MAX_RULE_VALUE_LENGTH);
+    const fits = aggregateAsks([asked("Bash", { command: atCap })], lookup).get("Bash");
+    expect(fits?.argSamples).toEqual([atCap]);
+    expect(fits?.unscoped ?? []).toEqual([]);
+
+    const overCap = `${atCap}a`;
+    const over = aggregateAsks([asked("Bash", { command: overCap })], lookup).get("Bash");
+    expect(over?.unscoped).toEqual(["not-representable"]);
+    expect(over?.argSamples).toEqual([]);
   });
 });
 

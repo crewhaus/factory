@@ -160,11 +160,41 @@ describe("readApproverProjection", () => {
   });
 
   test("an unknown key survives on the answer, so a later field passes through", () => {
-    const read = reader()(harnessWith({ ...PROJECTION, homeUrl: "https://example.test/home" }));
+    const read = reader()(harnessWith({ ...PROJECTION, laterField: "https://example.test/home" }));
     if (read.state !== "present") throw new Error(read.state);
-    expect((read.projection as unknown as Record<string, unknown>)["homeUrl"]).toBe(
+    expect((read.projection as unknown as Record<string, unknown>)["laterField"]).toBe(
       "https://example.test/home",
     );
+  });
+
+  test("homeUrl is read as an origin: https, or http on a loopback host", () => {
+    const homeOf = (homeUrl: unknown) => {
+      const read = reader()(harnessWith({ ...PROJECTION, homeUrl }));
+      if (read.state !== "present") throw new Error(read.state);
+      return read.projection.homeUrl;
+    };
+    expect(homeOf("https://home.example.test/some/path")).toBe("https://home.example.test");
+    expect(homeOf("http://127.0.0.1:4545")).toBe("http://127.0.0.1:4545");
+    expect(homeOf("http://localhost:4545")).toBe("http://localhost:4545");
+    expect(homeOf("http://[::1]:4545")).toBe("http://[::1]:4545");
+  });
+
+  test("a homeUrl that is not one is left out, and the file stays readable", () => {
+    for (const bad of [
+      42,
+      "not a url",
+      "http://home.example.test",
+      "http://127.0.0.1.example.test",
+      "https://user:pw@home.example.test",
+      "javascript:alert(1)",
+      "file:///etc/passwd",
+    ]) {
+      const read = reader()(harnessWith({ ...PROJECTION, homeUrl: bad }));
+      expect(read.state).toBe("present");
+      if (read.state !== "present") continue;
+      expect("homeUrl" in read.projection).toBe(false);
+      expect(read.projection.owner).toBe(PROJECTION.owner);
+    }
   });
 
   test("a member's until is read: before it the member decides, after it the member does not", () => {

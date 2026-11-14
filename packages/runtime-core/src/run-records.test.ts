@@ -64,6 +64,7 @@ import {
   recordedSpecRevision,
   recordsRun,
   seedSourcesOf,
+  stampTrigger,
 } from "./run-records";
 
 const ROOTS: string[] = [];
@@ -197,6 +198,7 @@ type Line = {
   readonly kind: string;
   readonly payload: Record<string, unknown>;
   readonly run?: string;
+  readonly span?: string;
 };
 
 function rawLog(dir: string, sessionId: string): string {
@@ -367,6 +369,61 @@ describe("run_stamp", () => {
     const [stamp] = stampsOf(linesOf(dir, channel.sessionId));
     expect(stamp?.shape).toBe("channel");
     expect(stamp?.trigger).toEqual({ kind: "channel", source: "not-recorded" });
+  });
+
+  test("a channel trigger's source: copied ref for ref, a ref that does not fit left out, none recorded as not-recorded", async () => {
+    const source = {
+      platform: "slack",
+      conversationRef: "a".repeat(64),
+      messageRef: "b".repeat(64),
+      senderRef: "prn_01h0000000000000000000000a",
+    };
+    expect(stampTrigger({ kind: "channel", via: "slack", source })).toEqual({
+      kind: "channel",
+      via: "slack",
+      source,
+    });
+
+    // One bad ref, too long or holding a "/": that ref alone is left out.
+    const long = stampTrigger({
+      kind: "channel",
+      source: { ...source, messageRef: "m".repeat(129) },
+    });
+    expect(long.source).toEqual({
+      platform: "slack",
+      conversationRef: source.conversationRef,
+      senderRef: source.senderRef,
+    });
+    const slashed = stampTrigger({
+      kind: "channel",
+      source: { ...source, conversationRef: "C0/1700000000.000100" },
+    });
+    expect(slashed.source).toEqual({
+      platform: "slack",
+      messageRef: source.messageRef,
+      senderRef: source.senderRef,
+    });
+
+    // No source, or a platform that does not fit: not recorded.
+    expect(stampTrigger({ kind: "channel" }).source).toBe("not-recorded");
+    expect(
+      stampTrigger({ kind: "channel", source: { ...source, platform: "sl/ack" } }).source,
+    ).toBe("not-recorded");
+    // Only a channel trigger carries a source.
+    expect("source" in stampTrigger({ kind: "queue" })).toBe(false);
+
+    // Through a run: the scope's channel trigger reaches the stamp with its source.
+    const dir = tempDir();
+    await runWithScope({ trigger: { kind: "channel", via: "slack", source } }, async () => {
+      const ctx = createRunContext();
+      await runOn(ctx, {
+        ...base(dir),
+        sessionTarget: "channel",
+        _adapter: scripted([[say("c")]]),
+      });
+      const [stamp] = stampsOf(linesOf(dir, ctx.sessionId));
+      expect(stamp?.trigger).toEqual({ kind: "channel", via: "slack", source });
+    });
   });
 
   test("under a verified root, the stamp names what the run's running row records", async () => {
@@ -691,7 +748,6 @@ describe("context_manifest and context_assembled", () => {
     ] as const) {
       await recorder.manifest(recorder.assembled(req([...names]), regions), call(span));
     }
-    recorder.dispose();
     expect(written.map((w) => w.payload.tools.names)).toEqual([
       ["A"],
       undefined,
@@ -702,7 +758,7 @@ describe("context_manifest and context_assembled", () => {
     expect(written[0]?.payload.blocks[0]?.fingerprint).toBe(FINGERPRINT_UNAVAILABLE);
   });
 
-  test("a manifest says when a compaction fired since the call before", async () => {
+  test("a manifest says when this loop compacted since the call before", async () => {
     const bus = new TraceEventBus({ runId: "run_t", sessionId: "sess_0123456789abcdef" });
     const ctx = createRunContext({ eventBus: bus });
     const written: ContextManifestPayload[] = [];
@@ -733,6 +789,55 @@ describe("context_manifest and context_assembled", () => {
     };
     const call = { span: "s", turn: { run: 1, session: 1 }, model: { wire: "m", provider: "p" } };
     await recorder.manifest(recorder.assembled(req, regions), call);
+    recorder.noteCompaction();
+    await recorder.manifest(recorder.assembled(req, regions), call);
+    await recorder.manifest(recorder.assembled(req, regions), call);
+    expect(written.map((m) => m.messages.afterCompaction)).toEqual([false, true, false]);
+  });
+
+  test("two loops on one run: only the loop that compacted says so", async () => {
+    // A crew role's peer run and a workflow step share the outer loop's run
+    // context, and so its bus.
+    const bus = new TraceEventBus({ runId: "run_t", sessionId: "sess_0123456789abcdef" });
+    const ctx = createRunContext({ eventBus: bus });
+    const recorderFor = (written: ContextManifestPayload[]) =>
+      createManifestRecorder({
+        runContext: ctx,
+        bus,
+        records: true,
+        write: async (_kind, payload) => {
+          written.push(payload as ContextManifestPayload);
+        },
+        digestKey: async () => undefined,
+        inSpec: 0,
+        files: [],
+      });
+    const outerWritten: ContextManifestPayload[] = [];
+    const innerWritten: ContextManifestPayload[] = [];
+    const outer = recorderFor(outerWritten);
+    const inner = recorderFor(innerWritten);
+    const req: ProviderRequest = {
+      model: "m",
+      system: [{ type: "text", text: "x" }],
+      messages: [{ role: "user", content: "hi" }],
+      maxTokens: 1,
+    };
+    const regions = {
+      frozen: ["instructions" as const],
+      volatileRecall: 0,
+      tail: [],
+      guide: 0,
+      overlay: false,
+      hookAppend: false,
+    };
+    const call = { span: "s", turn: { run: 1, session: 1 }, model: { wire: "m", provider: "p" } };
+    inner.noteCompaction();
+    await outer.manifest(outer.assembled(req, regions), call);
+    await inner.manifest(inner.assembled(req, regions), call);
+    await inner.manifest(inner.assembled(req, regions), call);
+    expect(outerWritten.map((m) => m.messages.afterCompaction)).toEqual([false]);
+    expect(innerWritten.map((m) => m.messages.afterCompaction)).toEqual([true, false]);
+    // Another loop's compaction on the shared bus is not this loop's.
     bus.publish({
       ...bus.envelope(),
       kind: "compaction_fired",
@@ -741,10 +846,10 @@ describe("context_manifest and context_assembled", () => {
       after: 4,
       phase: "pre-turn",
     });
-    await recorder.manifest(recorder.assembled(req, regions), call);
-    await recorder.manifest(recorder.assembled(req, regions), call);
-    recorder.dispose();
-    expect(written.map((m) => m.messages.afterCompaction)).toEqual([false, true, false]);
+    await outer.manifest(outer.assembled(req, regions), call);
+    await inner.manifest(inner.assembled(req, regions), call);
+    expect(outerWritten.map((m) => m.messages.afterCompaction)).toEqual([false, false]);
+    expect(innerWritten.map((m) => m.messages.afterCompaction)).toEqual([true, false, false]);
   });
 });
 
@@ -761,20 +866,20 @@ describe("the switch and best effort", () => {
     return { lines: linesOf(dir, ctx.sessionId), events };
   }
 
-  test("CREWHAUS_RUN_STAMPS=0: the session log is the same run's log without the two kinds and the run key, and no context_assembled", async () => {
+  test("CREWHAUS_RUN_STAMPS=0: the session log is the same run's log without the four kinds and the run and span keys, and no context_assembled", async () => {
     const on = await fixedRun(tempDir());
     process.env[RUN_STAMPS_ENV] = "0";
     const off = await fixedRun(tempDir());
+    const RECORDS = ["run_stamp", "context_manifest", "span_closed", "verdict"];
     const strip = (lines: Line[]) =>
       lines
-        .filter((l) => l.kind !== "run_stamp" && l.kind !== "context_manifest")
-        .map(({ ts: _ts, run: _run, ...rest }) => rest);
-    expect(on.lines.some((l) => l.kind === "run_stamp")).toBe(true);
+        .filter((l) => !RECORDS.includes(l.kind))
+        .map(({ ts: _ts, run: _run, span: _span, ...rest }) => rest);
+    for (const kind of RECORDS) expect(on.lines.some((l) => l.kind === kind)).toBe(true);
     expect(on.lines.every((l) => l.run !== undefined)).toBe(true);
-    expect(off.lines.some((l) => l.kind === "run_stamp" || l.kind === "context_manifest")).toBe(
-      false,
-    );
-    expect(off.lines.every((l) => !("run" in l))).toBe(true);
+    expect(on.lines.every((l) => l.span !== undefined)).toBe(true);
+    expect(off.lines.some((l) => RECORDS.includes(l.kind))).toBe(false);
+    expect(off.lines.every((l) => !("run" in l) && !("span" in l))).toBe(true);
     expect(strip(off.lines)).toEqual(strip(on.lines));
     expect(on.events.some((e) => e.kind === "context_assembled")).toBe(true);
     expect(off.events.some((e) => e.kind === "context_assembled")).toBe(false);
@@ -1285,5 +1390,90 @@ describe("a compaction summary in the run's lineage", () => {
     const after = await egress();
     expect(after.originsFound).toEqual(["api"]);
     expect(after.verdict).toBe("warn");
+  });
+});
+
+describe("a manifest's compaction flag counts the loop's own compactions", () => {
+  const longSeed = `Please ${"Keep the tone formal and the answer short. ".repeat(12)}`;
+
+  test("a single-turn loop's pre-turn compaction marks its first manifest", async () => {
+    const dir = tempDir();
+    const ctx = createRunContext();
+    await runOn(ctx, {
+      ...base(dir, longSeed),
+      contextLimit: 40,
+      continuity: { loadPlan: async () => null },
+      _adapter: scripted([[say("done")]]),
+      _compactionAdapter: scripted([[say("A short summary of the conversation so far.")]]),
+    });
+    const lines = linesOf(dir, ctx.sessionId);
+    expect(lines.some((l) => l.kind === "compaction")).toBe(true);
+    expect(manifestsOf(lines).map((m) => m.messages.afterCompaction)).toEqual([true]);
+  });
+
+  test("a REPL turn's pre-turn compaction marks that turn's manifest", async () => {
+    const dir = tempDir();
+    const ctx = createRunContext();
+    const input = new PassThrough();
+    const lines = [longSeed];
+    const writeNext = (): void => {
+      const line = lines.shift();
+      if (line === undefined) input.end();
+      else input.write(`${line}\n`);
+    };
+    ctx.eventBus.subscribe((e) => {
+      if (e.kind === "turn_end") setImmediate(writeNext);
+    });
+    setImmediate(writeNext);
+    await runOn(ctx, {
+      ...base(dir),
+      singleTurn: false,
+      seedMessages: undefined,
+      input,
+      contextLimit: 40,
+      continuity: { loadPlan: async () => null },
+      _adapter: scripted([[say("done")]]),
+      _compactionAdapter: scripted([[say("A short summary of the conversation so far.")]]),
+    });
+    const logged = linesOf(dir, ctx.sessionId);
+    expect(logged.some((l) => l.kind === "compaction")).toBe(true);
+    expect(manifestsOf(logged).map((m) => m.messages.afterCompaction)).toEqual([true]);
+  });
+
+  test("a reactive compaction in a turn marks the retried call's manifest, not the call before", async () => {
+    const dir = tempDir();
+    const ctx = createRunContext();
+    const answers = scripted([[say("done")]]);
+    let calls = 0;
+    const adapter: ProviderAdapter = {
+      ...answers,
+      stream: (req) => {
+        calls += 1;
+        if (calls === 1) {
+          throw Object.assign(new Error("prompt is too long: 250000 tokens > 200000 maximum"), {
+            name: "BadRequestError",
+            status: 400,
+            error: { type: "invalid_request_error", message: "prompt is too long" },
+          });
+        }
+        return answers.stream(req);
+      },
+    };
+    await runOn(ctx, {
+      ...base(dir),
+      seedMessages: [
+        { role: "user", content: "u1" },
+        { role: "assistant", content: "a1" },
+        { role: "user", content: "summarise the incident" },
+      ],
+      continuity: { loadPlan: async () => null },
+      _adapter: adapter,
+      _compactionAdapter: scripted([[say("compacted summary")]]),
+    });
+    const logged = linesOf(dir, ctx.sessionId);
+    expect(logged.some((l) => l.kind === "compaction" && l.payload["kind"] === "reactive")).toBe(
+      true,
+    );
+    expect(manifestsOf(logged).map((m) => m.messages.afterCompaction)).toEqual([false, true]);
   });
 });

@@ -17,8 +17,8 @@
  * through `die()`. The clock, the owner check and the regrade are injected.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import {
   type CompiledGrader,
@@ -211,6 +211,7 @@ function onlyPositional(verb: string, args: Args, count: number, what: string): 
 
 type Session = {
   readonly cwd: string;
+  readonly env: Readonly<Record<string, string | undefined>>;
   readonly now: () => number;
   readonly ownerCheck: (harnessDir: string) => OwnerCheck;
   readonly evalsDir: string;
@@ -693,6 +694,31 @@ function readEdits(verb: string, session: Session, path: string) {
   return parsed.data;
 }
 
+/**
+ * Whether the graders file, links resolved, belongs to the harness directory:
+ * it lies inside it (by `relative()`), and no directory between the two holds
+ * a `crewhaus.yaml` of its own, so the harness of --spec is the file's
+ * nearest one.
+ */
+function gradersInHarness(gradersPath: string, harnessDir: string): boolean {
+  let file: string;
+  let root: string;
+  try {
+    file = realpathSync(gradersPath);
+    root = realpathSync(harnessDir);
+  } catch {
+    return false;
+  }
+  const rel = relative(root, file);
+  if (!(rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)))) return false;
+  for (let dir = dirname(file); dir !== root; dir = dirname(dir)) {
+    if (existsSync(join(dir, "crewhaus.yaml"))) return false;
+    // Unreachable while `file` is inside `root`; a guard against a loop.
+    if (dirname(dir) === dir) return false;
+  }
+  return true;
+}
+
 function applyVerb(session: Session, argv: readonly string[]): CriteriaCommandResult {
   const args = parseArgs("apply", argv, CLI_FAMILY.sub.apply.flags);
   const [editsPath] = onlyPositional("apply", args, 1, "<edits.json>");
@@ -715,6 +741,16 @@ function applyVerb(session: Session, argv: readonly string[]): CriteriaCommandRe
   }
   const result = applyGradersEdits(file.text, edits);
   const spec = readSpecDoc(session, args);
+  // One harness: the owner check, the typed name, the write and the history
+  // line all bind to the harness of --spec, so the graders file must be in it.
+  if (!gradersInHarness(file.path, spec.harnessDir)) {
+    return {
+      lines: [
+        "criteria apply: the graders file is not inside the harness of --spec; nothing was written",
+      ],
+      exitCode: 1,
+    };
+  }
   const owner = session.ownerCheck(spec.harnessDir);
   const loosened = loosening(file.config, result.config);
   if (loosened.length > 0) {
@@ -972,10 +1008,12 @@ export async function runCriteriaCommand(
     return { lines: CRITERIA_USAGE_LINES, exitCode: 0 };
   }
   const cwd = opts.cwd ?? process.cwd();
+  const env = opts.env ?? process.env;
   const session: Session = {
     cwd,
+    env,
     now: opts.now ?? Date.now,
-    ownerCheck: opts.ownerCheck ?? ((dir) => defaultOwnerCheck(dir)),
+    ownerCheck: opts.ownerCheck ?? ((dir) => defaultOwnerCheck(dir, undefined, env)),
     evalsDir: opts.evalsDir ?? join(cwd, ".crewhaus", "evals"),
     regrade: opts.regrade ?? cliPreviewRegrade,
   };

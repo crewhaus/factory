@@ -7,13 +7,19 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { runtimeStateRoots } from "@crewhaus/runtime-core";
+import { runSpecDirScope, runtimeStateRoots } from "@crewhaus/runtime-core";
 import { protectedRootHolding } from "@crewhaus/tool-safety/fs";
-import { discloseSurfaceChange, surfaceRecordDir, withRunSpecDir } from "./surface-disclosure";
+import {
+  discloseSurfaceChange,
+  runSpecDirOf,
+  surfaceRecordDir,
+  withRunSpecDir,
+} from "./surface-disclosure";
 
 const SPEC = `name: disclosed
 target: cli
@@ -188,6 +194,27 @@ describe("crewhaus run's start-up disclosure of security settings", () => {
     // A log with no complete line is no commit.
     writeFileSync(join(surfaceRecordDir(spec), "commits.jsonl"), '{"v":1');
     expect(start(spec, SPEC)).toEqual({ lines: [], kind: "recorded" });
+  });
+});
+
+describe("the spec's real directory", () => {
+  test("a spec reached through a link names its target's directory, where its record is kept", () => {
+    const spec = harness();
+    const links = mkdtempSync(join(tmpdir(), "surface-disclosure-links-"));
+    dirs.push(links);
+    const link = join(links, "crewhaus.yaml");
+    symlinkSync(spec, link);
+    const real = realpathSync(dirname(spec));
+    expect(runSpecDirOf(link)).toBe(real);
+    expect(runSpecDirOf(spec)).toBe(real);
+    expect(surfaceRecordDir(link)).toBe(join(real, ".crewhaus", "run", "spec"));
+    // The same directory reaches the floor through the run's scope.
+    expect(withRunSpecDir(link, () => runSpecDirScope.getStore())).toBe(real);
+  });
+
+  test("a spec whose real path cannot be read names its directory as given", () => {
+    const missing = join(tmpdir(), "surface-disclosure-missing", "crewhaus.yaml");
+    expect(runSpecDirOf(missing)).toBe(dirname(missing));
   });
 });
 
