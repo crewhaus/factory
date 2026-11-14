@@ -1102,8 +1102,12 @@ export async function evictExpiredApprovals(
   return { evictedIds };
 }
 
-/** The file-backed store: the runtime's seam plus the decision lifecycle. */
-export type FilePendingApprovalStore = PendingApprovalStore & ApprovalDecisions;
+/**
+ * The file-backed store: the runtime's seam plus the decision lifecycle, and the session
+ * root it keeps its files in, so a surface can decide on the same root.
+ */
+export type FilePendingApprovalStore = PendingApprovalStore &
+  ApprovalDecisions & { readonly rootDir: string };
 
 /** Newest-touched first: a decision counts from when it was made. */
 function touchedAt(approval: PendingApproval): number {
@@ -1128,6 +1132,7 @@ export function createPendingApprovalStore(
   const writer = createApprovalWriter({ rootDir, ttlDays, now });
 
   return {
+    rootDir,
     persist: writer.persist,
     decide: writer.decide,
     supersede: writer.supersede,

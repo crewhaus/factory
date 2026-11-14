@@ -1701,15 +1701,29 @@ function renderGateway(ir: IrChannelV0): string {
   // whenever `permissions.ask_mode` is not "deny".
   const approvalsOn = ir.permissions.askMode !== "deny";
   const gatewayApprovalImports = approvalsOn
-    ? '\nimport { resolveApproval } from "@crewhaus/channel-adapter-base";\nimport type { ApprovalStore, ApprovalAuditSink } from "@crewhaus/channel-adapter-base";\nimport { appendSettingsRule } from "@crewhaus/permission-engine";'
+    ? '\nimport { createApprovalActions } from "@crewhaus/channel-adapter-base";\nimport type { ApprovalStore, ApprovalAuditSink } from "@crewhaus/channel-adapter-base";'
+    : "";
+  // A click is decided by channel-adapter-base, once per gateway.
+  const gatewayApprovalActions = approvalsOn
+    ? `
+  // A click on an approval card is decided as the member the clicker is linked to.
+  const approvalActions =
+    config.approvals !== undefined
+      ? createApprovalActions({
+          approvals: config.approvals,
+          adapters: config.adapters,
+          sessionRouter: config.sessionRouter,
+          ...(config.auditSink !== undefined ? { auditSink: config.auditSink } : {}),
+        })
+      : undefined;`
     : "";
   const gatewayApprovalConfig = approvalsOn
     ? `
   /**
-   * G11 — the shared pending-approval store. The \`/<adapter>/actions\` route
-   * resolves a parked approval here on a button click; the parked turn (in the
-   * session-router) awaits the same store. Absent ⇒ the actions route ACKs and
-   * ignores (no approval surface).
+   * G11 — the shared pending-approval store. A click on the
+   * \`/<adapter>/actions\` route is decided on its session root; the parked turn
+   * (in the session-router) awaits the same store. Absent ⇒ the actions route
+   * ACKs and ignores (no approval surface).
    */
   approvals?: ApprovalStore;
   /** G48 — durable audit sink; an approval resolution appends one record. */
@@ -1717,8 +1731,8 @@ function renderGateway(ir: IrChannelV0): string {
     : "";
   const gatewayActionsBlock = approvalsOn
     ? `      // G11 — interactivity webhook (an Approve/Deny button click), verified
-      // with the SAME signing machinery as an events webhook and resolved via
-      // the shared store. Path: /<adapter>/actions.
+      // with the SAME signing machinery as an events webhook, then decided by
+      // channel-adapter-base. Path: /<adapter>/actions.
       const actionMatch = url.pathname.match(/^\\/([^/]+)\\/actions$/);
       if (actionMatch && actionMatch[1] !== undefined) {
         const actionAdapter = config.adapters.get(actionMatch[1]);
@@ -1734,46 +1748,10 @@ function renderGateway(ir: IrChannelV0): string {
           return new Response("invalid signature", { status: 401 });
         }
         const interaction = actionAdapter.parseInteraction(actionReq);
-        if (interaction.kind !== "approval_action" || config.approvals === undefined) {
+        if (interaction.kind !== "approval_action" || approvalActions === undefined) {
           return new Response("ok", { status: 200 });
         }
-        const by = actionAdapter.id + ":" + interaction.userId;
-        const resolved = await resolveApproval({
-          store: config.approvals,
-          approvalId: interaction.approvalId,
-          decision: interaction.decision,
-          by,
-          ...(interaction.always === true ? { always: true } : {}),
-          ...(config.auditSink !== undefined ? { auditSink: config.auditSink } : {}),
-        });
-        if (resolved === null) return new Response("unknown approval", { status: 200 });
-        // #383 — "Always allow": persist a standing settings-source rule for
-        // the tool BEFORE the resume re-drives the turn, so the re-driven run
-        // (and every later one) loads it at loop start and stops re-asking.
-        // Best-effort: the grant above already covers this exact call.
-        if (interaction.always === true) {
-          try {
-            appendSettingsRule(process.cwd(), { type: "alwaysAllow", pattern: resolved.toolName });
-          } catch (err) {
-            process.stderr.write("[gateway] standing-allow settings write failed: " + (err as Error).message + "\\n");
-          }
-        }
-        const ackApproval = actionAdapter.ackApproval;
-        if (ackApproval !== undefined) {
-          try {
-            await ackApproval({ interaction, decision: interaction.decision, by, toolName: resolved.toolName });
-          } catch (err) {
-            process.stderr.write("[gateway] approval ack error: " + (err as Error).message + "\\n");
-          }
-        }
-        // Resume runs off the ACK path so a slow re-drive can't stall the 3s
-        // interactivity response; the parked turn re-executes pre-resolved.
-        queueMicrotask(() => {
-          config.sessionRouter.resumeApproval(resolved, actionAdapter).catch((err) => {
-            process.stderr.write("[gateway] approval resume error: " + (err as Error).message + "\\n");
-          });
-        });
-        return new Response("ok", { status: 200 });
+        return approvalActions.handle(interaction, actionAdapter);
       }
 `
     : "";
@@ -1782,7 +1760,8 @@ function renderGateway(ir: IrChannelV0): string {
 // Channel-generic gateway: dispatches signed webhooks to the matching adapter.
 import { InMemoryDedupStore, type DedupStore } from "@crewhaus/durable-state";
 import { readRequestBodyCapped, resolveWebhookBodyLimit } from "@crewhaus/gateway-protocol/body-limit";
-import type { ChannelAdapter } from "@crewhaus/channel-adapter-slack";${gatewayApprovalImports}
+import type { ChannelAdapter } from "@crewhaus/channel-adapter-slack";
+import { handleInboundEvent } from "@crewhaus/channel-adapter-base";${gatewayApprovalImports}
 import type { SessionRouter } from "./session-router.js";
 
 export type GatewayConfig = {
@@ -1816,7 +1795,7 @@ export type Gateway = {
 export function createGateway(config: GatewayConfig): Gateway {
   const dedup: DedupStore =
     config.dedupStore ?? new InMemoryDedupStore({ capacity: config.dedupCapacity ?? 10_000 });
-  const maxBodyBytes = config.maxBodyBytes ?? resolveWebhookBodyLimit(process.env).maxBytes;
+  const maxBodyBytes = config.maxBodyBytes ?? resolveWebhookBodyLimit(process.env).maxBytes;${gatewayApprovalActions}
 
   return {
     async handle(req: Request): Promise<Response> {
@@ -1865,26 +1844,9 @@ ${gatewayActionsBlock}${gatewayMcpBlock}      // Match adapter by path prefix: /
         return new Response("ok", { status: 200 });
       }
 ${reactionBranch}
-      // event — atomic check-and-record so concurrent deliveries of the
-      // same key (platform retries, multi-process daemons on a durable
-      // store) collapse to exactly one handled event.
-      const seen = await dedup.remember(parsed.event.idempotencyKey);
-      if (seen) return new Response("duplicate", { status: 200 });
-      // Slack expects an ACK within 3 s (and Telegram/Discord/WhatsApp have
-      // similar tight inbound windows). Drive the model turn asynchronously
-      // so the model's inner-loop latency — and any transient API error —
-      // can't bubble into the webhook response. The channel adapter's own
-      // outbound (chat.postMessage, sendMessage, etc.) delivers the reply
-      // when the turn finishes. Errors are surfaced via stderr; the
-      // operator's observability stack catches them there.
-      queueMicrotask(() => {
-        config.sessionRouter.handle(parsed.event, adapter).catch((err) => {
-          process.stderr.write(
-            \`[gateway] handler error (\${parsed.event.idempotencyKey}): \${(err as Error).message}\\n\`,
-          );
-        });
-      });
-      return new Response("ok", { status: 200 });
+      // event — deduped, put on record, then acknowledged; the model turn runs
+      // off the request path (channel-adapter-base's handleInboundEvent).
+      return handleInboundEvent(parsed.event, adapter, { dedup, sessionRouter: config.sessionRouter });
     },
   };
 }

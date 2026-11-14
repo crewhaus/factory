@@ -21,6 +21,7 @@ import {
   loadRun,
 } from "@crewhaus/eval-report";
 import {
+  type EvalChatLoopFn,
   type EvalRunSummary,
   JUDGE_CALIBRATION_RELPATH,
   pluginsDigestOf,
@@ -32,6 +33,7 @@ import { BUILTIN_TOOLS } from "@crewhaus/tool-categories";
 import { defaultMatrixPricing } from "./eval-matrix";
 import { evalRunCost, graderRegistryForCompiled } from "./eval-output";
 import { provabilityGraderNamesOf, regradeRecordedRun } from "./eval-regrade";
+import { runSpecDirOf } from "./surface-disclosure";
 import { importToolPackage, loadBuiltinTools } from "./tool-packages";
 import { cliVersion } from "./version";
 
@@ -72,6 +74,12 @@ export async function hasExternalWriteTools(specYaml: string): Promise<boolean> 
 
 export type QualityRunnersOptions = {
   readonly harnessDir: string;
+  /**
+   * The spec file the change targets, relative to the harness (default
+   * `crewhaus.yaml`). Its real directory's `.crewhaus/run/spec` is on the floor
+   * of every agent the check starts.
+   */
+  readonly spec?: string;
   /** The graders file the check measures with, for what counts as measured. */
   readonly gradersYaml: string;
   /** Whether each spec text the check runs (base, candidate) writes outside. */
@@ -79,6 +87,8 @@ export type QualityRunnersOptions = {
   /** The spec's name: the lineage a pinned run is looked up under. */
   readonly specName?: string;
   readonly evalsDir?: string;
+  /** The eval runner's chat-loop seam (tests); production callers omit it. */
+  readonly chatLoop?: EvalChatLoopFn;
 };
 
 /** The check's runners over the CLI's eval stack. */
@@ -86,6 +96,7 @@ export function qualityRunners(opts: QualityRunnersOptions): CheckRunners {
   const pricing = defaultMatrixPricing();
   const version = cliVersion();
   const evalsDir = opts.evalsDir ?? join(opts.harnessDir, ".crewhaus", "evals");
+  const specDir = runSpecDirOf(resolve(opts.harnessDir, opts.spec ?? "crewhaus.yaml"));
   const compiledForNames = parseGradersConfig(opts.gradersYaml).compiled;
   const usd = (micros: number | undefined): number | undefined =>
     micros !== undefined ? micros / 1_000_000 : undefined;
@@ -104,6 +115,9 @@ export function qualityRunners(opts: QualityRunnersOptions): CheckRunners {
           datasetHash: args.datasetHash,
           gradersHash: gradersConfigHash(config),
           cwd: opts.harnessDir,
+          // The checked spec's record is on the floor of every agent the check starts.
+          specDir,
+          ...(opts.chatLoop !== undefined ? { chatLoop: opts.chatLoop } : {}),
           ...(args.replayToolsDir !== undefined ? { replayToolsDir: args.replayToolsDir } : {}),
           ...(graderRegistry !== undefined ? { graderRegistry } : {}),
           ...(version !== undefined ? { cliVersion: version } : {}),

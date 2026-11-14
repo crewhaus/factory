@@ -234,12 +234,26 @@ export const RECEIPT_VIA = deepFreeze([
 
 export type ReceiptVia = (typeof RECEIPT_VIA)[number];
 
+/**
+ * Where a channel message came from, as a run row may hold it: the platform's name and
+ * keyed digests of the conversation and the message, and the sender as a linked member's
+ * `prn_` or a keyed digest. Never text, never a raw platform id.
+ */
+export type TriggerSource = {
+  readonly platform: string;
+  readonly conversationRef: string;
+  readonly messageRef: string;
+  readonly senderRef?: string;
+};
+
 export type Trigger = {
   readonly kind: TriggerKind;
   readonly lane?: string;
   readonly via?: ReceiptVia;
   readonly workItem?: string;
   readonly synthetic?: true;
+  /** A channel message's origin, on the rows of the run that answers it. */
+  readonly source?: TriggerSource;
 };
 
 export const RUN_CAUSE_KINDS = deepFreeze([

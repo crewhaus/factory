@@ -65,7 +65,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPendingApprovalStore } from "@crewhaus/session-store";
-import { createRuntimeBackedApprovalStore, resolveApproval } from "@crewhaus/channel-adapter-base";
+import { createRuntimeBackedApprovalStore } from "@crewhaus/channel-adapter-base";
 import { RunFailedError } from "@crewhaus/errors";
 import { createSessionRouter } from "./session-router.ts";
 
@@ -141,22 +141,14 @@ const event = {
 // 1. The turn parks. The router must catch it and post a prompt.
 await router.handle(event, adapter);
 
-// 2. A human clicks Approve. This is the gateway's path, verbatim.
-const resolved = await resolveApproval({
-  store: approvals,
-  approvalId: "appr_00000000000000aa",
-  decision: "grant",
-  by: "slack:U1",
-});
+// 2. The approval is granted through the bridge. Who may decide is
+//    createApprovalActions' concern and its own tests'; this one is about the
+//    router's park, prompt and resume.
+const resolved = await approvals.resolve("appr_00000000000000aa", "grant", "slack:U1");
 
-// 3. Slack retries the interaction — the guard must refuse the second one, or
+// 3. A second decision is refused by the bridge's first-decision-wins guard, or
 //    the turn is driven twice and the side effect happens twice.
-const second = await resolveApproval({
-  store: approvals,
-  approvalId: "appr_00000000000000aa",
-  decision: "grant",
-  by: "slack:U1",
-});
+const second = await approvals.resolve("appr_00000000000000aa", "grant", "slack:U1");
 
 // 4. The grant re-drives the parked turn.
 granted = true;

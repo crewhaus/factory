@@ -56,6 +56,12 @@ export {
   standingPatternFor,
   widenedPatternProblem,
 } from "./rules";
+export {
+  NARROW_WORDS,
+  type ToolApprovalDeps,
+  type ToolApprovalRequest,
+  resolveToolApproval,
+} from "./approval-resolve";
 export { AREA_RUNTIMES, activationGates, compositionProblems, retireRevokers } from "./areas";
 export {
   type Commands,
@@ -79,6 +85,8 @@ export {
   type RetireItem,
   type RetireRevoker,
   type RetireRevokerContext,
+  type RunSweep,
+  type RunSweepContext,
   type Settlement,
   executorDead,
   withOwnStartTime,

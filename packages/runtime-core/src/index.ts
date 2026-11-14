@@ -307,6 +307,7 @@ import {
   credentialFileRoots,
   credentialFloorScope,
   relocatingFieldLeftOut,
+  runSpecDirScope,
   runtimeRecordRoots,
   runtimeStateRoots,
   storeFileRoots,
@@ -2191,6 +2192,13 @@ export type RunChatLoopOptions = {
    */
   sessionRootDir?: string;
   /**
+   * The directory of the spec this run was started from. When its real path is
+   * not the working directory's, `<specDir>/.crewhaus/run/spec` is on the
+   * runtime-state floor for this run and every loop it starts (`./state-roots`).
+   * Absent: the directory {@link runSpecDirScope} holds for the run, if any.
+   */
+  specDir?: string;
+  /**
    * 0.6.0 §16 Q6 — `false` keeps this run entirely IN MEMORY: no session
    * `.json`, no event-log `.jsonl`, no watch-me sidecar, no TTL sweep of the
    * sessions dir or the approvals log. Set by the nested single-turn side
@@ -3989,6 +3997,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   ) {
     return credentialFloorScope.run(true, () => runChatLoop(opts));
   }
+  // The spec's directory holds for this run and the loops it starts (a sub-agent,
+  // a workflow step, a crew role), which compute their own floor.
+  if (opts.specDir !== undefined && runSpecDirScope.getStore() !== opts.specDir) {
+    const specDir = opts.specDir;
+    return runSpecDirScope.run(specDir, () => runChatLoop(opts));
+  }
   // Each invocation records how it ended for its run's rows (`./run-ledger`), once
   // the operator record admits it (`./admission`).
   if (!hasRunRows(opts)) {
@@ -4324,7 +4338,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     undefined,
     undefined,
     undefined,
-    { hookCommands: opts.hooks?.map((hook) => hook.command) ?? [] },
+    {
+      hookCommands: opts.hooks?.map((hook) => hook.command) ?? [],
+      ...(opts.specDir !== undefined ? { specDir: opts.specDir } : {}),
+    },
   );
   // The continuity store's own files: only its tools write them. Files, not
   // roots, so a tool that checks its own targets (StateImport) keeps working

@@ -11,18 +11,25 @@
  * approval surface writing to the same store).
  *
  * This module is the channel-generic half — the store contract, an in-memory
- * default store, and the park/resolve orchestration primitives. It is
- * deliberately dependency-free: every collaborator (the Slack block-kit
- * builder, the durable audit sink, the trace bus) is reached through a MINIMAL
- * STRUCTURAL SEAM so this package neither imports a specific adapter nor the
- * audit-log/trace-event-bus packages (mirrors the `JustificationAuditSink`
- * seam runtime-core declares to avoid a dependency cycle). The Slack-specific
- * block-kit + interaction parsing lives in `@crewhaus/channel-adapter-slack`;
- * the daemon wiring (gateway action route, boot-time store construction) is
- * emitted by `@crewhaus/target-channel-bot`.
+ * default store, and the park and prompt primitives. Every collaborator (the
+ * Slack block-kit builder, the durable audit sink, the trace bus) is reached
+ * through a MINIMAL STRUCTURAL SEAM so this package neither imports a specific
+ * adapter nor the audit-log/trace-event-bus packages (mirrors the
+ * `JustificationAuditSink` seam runtime-core declares to avoid a dependency
+ * cycle). A button click is decided by `createApprovalActions`
+ * (`./approval-actions`), as the member the clicker is linked to. The
+ * Slack-specific block-kit + interaction parsing lives in
+ * `@crewhaus/channel-adapter-slack`; the daemon wiring (gateway action route,
+ * boot-time store construction) is emitted by `@crewhaus/target-channel-bot`.
+ *
+ * A card offers an in-channel grant only when the whole request fits on it
+ * ({@link fitsCard}); otherwise it says where to review it in full.
  *
  * Catalog layer: R8 (channel boundary), G11 (generalized pending-approval).
  */
+
+import { hostname } from "node:os";
+import { type ApproverRead, readApproverProjection } from "@crewhaus/control-records";
 
 /** The two terminal decisions an approval can reach. */
 export type ApprovalDecision = "grant" | "deny";
@@ -55,6 +62,14 @@ export type ApprovalPlace = {
   readonly at: ReadonlyArray<string>;
 };
 
+/** 0.9.0 — the sensitivity a parked request may carry, as the card reads it. */
+export type ApprovalSensitivity = "internal" | "restricted" | "people";
+
+/** 0.9.0 — where a request that does not fit the card is reviewed in full. */
+export type ApprovalReview =
+  | { readonly url: string }
+  | { readonly host: string; readonly verb: string };
+
 /**
  * 0.7.1 — the approval a park was asked in place of: the same call, granted
  * or still waiting, when a symlink on its path led somewhere else. Mirrors
@@ -84,10 +99,9 @@ export type PendingApproval = {
   /** Free-form deciding identity (e.g. `"cli"`, `"slack:U0123"`). */
   readonly decidedBy?: string;
   /**
-   * #383 — present (true) when a `grant` was recorded as a STANDING allow
-   * (the Slack "Always allow" button / `crewhaus approvals grant --always`):
-   * the resolving surface also persists an `alwaysAllow` permission rule for
-   * the tool, so future calls skip the approval flow entirely.
+   * #383 — present (true) when the owner's `grant` also made a standing rule
+   * (Slack's "Always allow", `crewhaus approvals grant --always`): a 30-day
+   * allow for exactly this call.
    */
   readonly always?: boolean;
   /** 0.7.1 — where the call lands (runtime-parked approvals only). */
@@ -105,6 +119,19 @@ export type PendingApproval = {
    * request parked before grants were bound.
    */
   readonly resourceVersionBound?: boolean;
+  /** 0.9.0 — the run that parked it (runtime-parked approvals only). */
+  readonly runId?: string;
+  /** 0.9.0 — the door the decision came through (`home`, `cli`, `slack`, …). */
+  readonly decidedVia?: string;
+  /** 0.9.0 — the decider as a stored actor: a `prn_` member id or a keyed digest. */
+  readonly decidedByPrincipal?: string;
+  /** 0.9.0 — the request's sensitivity, when the runtime recorded one. */
+  readonly sensitivity?: ApprovalSensitivity;
+  /**
+   * 0.9.0 — the whole request fits on the card ({@link fitsCard}): only then is
+   * it granted in the channel. Absent counts as not fitting.
+   */
+  readonly fitsCard?: boolean;
 };
 
 /** Filter for {@link ApprovalStore.list}. */
@@ -127,6 +154,12 @@ export type ApprovalListFilter = {
 export interface ApprovalStore {
   /** Persist a new pending approval, minting its id + `createdAt`. */
   put(input: NewPendingApproval): Promise<PendingApproval>;
+  /**
+   * 0.9.0 — the session root the store keeps its files in, when it is the
+   * runtime's file-backed store: where a click is decided. Absent on a store
+   * that has none, which decides no click.
+   */
+  readonly rootDir?: string;
   /** Fetch by id, or `null` when unknown. */
   get(id: string): Promise<PendingApproval | null>;
   /**
@@ -309,15 +342,16 @@ export class InMemoryApprovalStore implements ApprovalStore {
   }
 }
 
+/** `bytes` random bytes as lowercase hex, from the platform's CSPRNG. */
+function randomHex(bytes: number): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(bytes)), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
 function defaultGenId(): string {
   // 24 hex chars of randomness — id collisions are the store's rendezvous key.
-  let hex = "";
-  for (let i = 0; i < 3; i++) {
-    hex += Math.floor(Math.random() * 0x1_0000_0000)
-      .toString(16)
-      .padStart(8, "0");
-  }
-  return `appr_${hex}`;
+  return `appr_${randomHex(12)}`;
 }
 
 /** Default one-line preview of a tool's input for the approval prompt — JSON,
@@ -335,7 +369,110 @@ export function previewApprovalInput(input: unknown, max = 200): string {
 /** The channel-generic text every non-interactive adapter falls back to when it
  *  cannot render Approve/Deny buttons. */
 export function approvalFallbackText(approvalId: string): string {
-  return `approval pending — run \`crewhaus approvals grant ${approvalId}\` (or \`deny\`) to decide; add \`--always\` to allow the tool from now on`;
+  return `approval pending — run \`crewhaus approvals grant ${approvalId}\` (or \`deny\`) to decide; \`--always\` makes a 30-day rule for exactly this call when the owner runs it, and anyone else's allows it once and asks the owner`;
+}
+
+/** The longest a request's input may be, as JSON, and still be granted on the card. */
+export const CARD_INPUT_MAX = 200;
+/** The longest a request's places may be, in words, and still be granted on the card. */
+export const CARD_PLACES_MAX = 2_000;
+
+/**
+ * 0.9.0 — whether the whole request fits on a card, so a person sees all of what
+ * they approve there: its input as JSON in {@link CARD_INPUT_MAX} characters (the
+ * preview's own cut), where it lands in {@link CARD_PLACES_MAX} (the card's cut),
+ * and a sensitivity other than `people`. An input that cannot be written as JSON
+ * does not fit.
+ */
+export function fitsCard(
+  input: unknown,
+  approval: Pick<PendingApproval, "places" | "supersedes" | "sensitivity">,
+): boolean {
+  let text: string | undefined;
+  try {
+    text = JSON.stringify(input);
+  } catch {
+    return false;
+  }
+  if (text === undefined || text.length > CARD_INPUT_MAX) return false;
+  const places = approvalPlacesText(approval);
+  if (places !== undefined && places.length > CARD_PLACES_MAX) return false;
+  return approval.sensitivity !== "people";
+}
+
+/** Home's list of requests waiting on a person, under the address the owner set. */
+export const HOME_REVIEW_PATH = "/#/home/needs-you?type=approvals";
+
+/**
+ * Where a request that does not fit the card is reviewed: Home, when the harness's
+ * approver projection carries its address, else this host and the CLI verb.
+ */
+export function approvalReview(
+  approvalId: string,
+  harnessDir: string,
+  approvers: (harnessDir: string) => ApproverRead = readApproverProjection,
+): ApprovalReview {
+  let homeUrl: string | undefined;
+  try {
+    const read = approvers(harnessDir);
+    homeUrl = read.state === "present" ? read.projection.homeUrl : undefined;
+  } catch {
+    homeUrl = undefined;
+  }
+  return homeUrl !== undefined
+    ? { url: `${homeUrl}${HOME_REVIEW_PATH}` }
+    : { host: hostname(), verb: `crewhaus approvals show ${approvalId}` };
+}
+
+/** How many posted cards this process remembers the reply of, oldest out. */
+export const POSTED_APPROVALS_KEPT = 256;
+
+/**
+ * A posted card's reply closure, by approval id: what a later follow-up is sent with,
+ * and whether the card was posted with buttons (only an adapter that takes clicks does).
+ */
+const posted = new Map<
+  string,
+  { readonly sendText: (text: string) => Promise<void>; readonly interactive: boolean }
+>();
+
+function rememberPosted(
+  id: string,
+  sendText: (text: string) => Promise<void>,
+  interactive: boolean,
+): void {
+  posted.delete(id);
+  posted.set(id, { sendText, interactive });
+  while (posted.size > POSTED_APPROVALS_KEPT) {
+    const oldest = posted.keys().next().value;
+    if (oldest === undefined) break;
+    posted.delete(oldest);
+  }
+}
+
+/** The ids of the cards this process posted and has not followed up, oldest first. */
+export function postedApprovalIds(): string[] {
+  return [...posted.keys()];
+}
+
+/** The reply closure of a posted card, or `undefined`. */
+export function postedReply(id: string): ((text: string) => Promise<void>) | undefined {
+  return posted.get(id)?.sendText;
+}
+
+/** Whether a posted card was posted with buttons; `false` for a text card or an unknown id. */
+export function postedInteractively(id: string): boolean {
+  return posted.get(id)?.interactive === true;
+}
+
+/** Forget a posted card: it was decided, or followed up. */
+export function forgetPosted(id: string): void {
+  posted.delete(id);
+}
+
+/** Test seam: forget every posted card, as a restart does. */
+export function _resetPostedApprovalsForTest(): void {
+  posted.clear();
 }
 
 /** `<path> -> <place> and <place>` for each path, `; `-separated. */
@@ -379,6 +516,13 @@ export function approvalPlacesText(
  * interactive message; otherwise it sends {@link approvalFallbackText} through
  * `sendText`, which every adapter supports. Returns whether the interactive
  * path was taken plus the posted message ts (when the adapter reports one).
+ *
+ * The card is told whether the whole request fits on it (`fitsCard`), the class
+ * it needs, and where to review it otherwise (`review`, from the approver
+ * projection at `harnessDir`, the working directory by default). Either way
+ * `sendText` is kept for the approval id, with whether the card had buttons, so a
+ * decision made elsewhere can be followed up in the same thread
+ * ({@link POSTED_APPROVALS_KEPT} kept, oldest out).
  */
 export async function postApprovalPrompt(args: {
   readonly pending: PendingApproval;
@@ -390,17 +534,32 @@ export async function postApprovalPrompt(args: {
     readonly surface: string;
     /** 0.7.1 — {@link approvalPlacesText}: where the call lands, and why it is asked again. */
     readonly landsAt?: string;
+    /** 0.9.0 — {@link fitsCard}: the card offers a grant only when it is true. */
+    readonly fitsCard?: boolean;
+    /** 0.9.0 — the lowest class that may decide it. */
+    readonly requiredClass?: "operator" | "maintainer" | "owner";
+    /** 0.9.0 — where to review it in full. */
+    readonly review?: ApprovalReview;
   }) => Promise<{ messageTs?: string }>;
+  /** 0.9.0 — the harness whose approver projection names Home's address; default the working directory. */
+  readonly harnessDir?: string;
+  /** 0.9.0 — the projection reader (tests). */
+  readonly approvers?: (harnessDir: string) => ApproverRead;
 }): Promise<{ interactive: boolean; messageTs?: string }> {
   const p = args.pending;
   const landsAt = approvalPlacesText(p);
+  rememberPosted(p.id, args.sendText, args.postInteractive !== undefined);
   if (args.postInteractive !== undefined) {
+    const review = approvalReview(p.id, args.harnessDir ?? process.cwd(), args.approvers);
     const res = await args.postInteractive({
       approvalId: p.id,
       toolName: p.toolName,
       inputPreview: p.inputPreview,
       surface: p.surface,
       ...(landsAt !== undefined ? { landsAt } : {}),
+      fitsCard: p.fitsCard === true,
+      ...(p.requiredClass !== undefined ? { requiredClass: p.requiredClass } : {}),
+      review,
     });
     return {
       interactive: true,
@@ -460,58 +619,6 @@ export function createApprovalPrompter(deps: {
   };
 }
 
-/**
- * Resolve a parked approval from an out-of-band decision (a Slack button, a CLI
- * verb). Records the decision in the store (idempotent — the first decision
- * wins), publishes `approval_resolved`, and appends a durable audit record when
- * a sink is wired. Returns the resolved record, or `null` when the id is
- * unknown. The caller (the gateway action route) ACKs in-thread and, on
- * `grant`, drives the resume.
- */
-export async function resolveApproval(deps: {
-  readonly store: ApprovalStore;
-  readonly approvalId: string;
-  readonly decision: ApprovalDecision;
-  readonly by: string;
-  /** #383 — record a `grant` as a standing allow (Slack "Always allow"). */
-  readonly always?: boolean;
-  readonly publish?: ApprovalTracePublish;
-  readonly auditSink?: ApprovalAuditSink;
-}): Promise<PendingApproval | null> {
-  const always = deps.decision === "grant" && deps.always === true;
-  const resolved = await deps.store.resolve(
-    deps.approvalId,
-    deps.decision,
-    deps.by,
-    always ? { always: true } : undefined,
-  );
-  if (resolved === null) return null;
-  deps.publish?.({
-    kind: "approval_resolved",
-    approvalId: resolved.id,
-    decision: deps.decision,
-    by: deps.by,
-    ...(always ? { always: true } : {}),
-  });
-  if (deps.auditSink !== undefined) {
-    await deps.auditSink.append({
-      kind: "approval_resolved",
-      payload: {
-        schemaVersion: 1,
-        approvalId: resolved.id,
-        toolName: resolved.toolName,
-        surface: resolved.surface,
-        sessionId: resolved.sessionId,
-        decision: deps.decision,
-        by: deps.by,
-        ...(always ? { always: true } : {}),
-        ...(resolved.decidedAt !== undefined ? { decidedAt: resolved.decidedAt } : {}),
-      },
-    });
-  }
-  return resolved;
-}
-
 // ---------------------------------------------------------------------------
 // Loop contract 0.4 (G11) — bridging the channel store to the RUNTIME store.
 // ---------------------------------------------------------------------------
@@ -548,9 +655,17 @@ export type RuntimeApprovalRecord = {
    * `resourceRevisionBound`: the rest is the runtime's to check.
    */
   readonly binding?: { readonly resourceRevisionBound?: unknown };
+  /** 0.9.0 — the door the decision came through; read defensively. */
+  readonly decidedVia?: string;
+  /** 0.9.0 — the decider as a stored actor; read defensively. */
+  readonly decidedByPrincipal?: string;
+  /** 0.9.0 — the request's sensitivity; read defensively. */
+  readonly sensitivity?: string;
 };
 
 export type RuntimeApprovalStoreLike = {
+  /** 0.9.0 — the session root the store keeps its files in. */
+  readonly rootDir?: string;
   persist(approval: RuntimeApprovalRecord): Promise<void>;
   get(toolName: string, inputHash: string): Promise<RuntimeApprovalRecord | null>;
   resolve(
@@ -612,11 +727,25 @@ function resourceVersionBoundOf(binding: unknown): boolean | undefined {
   return typeof bound === "boolean" ? bound : undefined;
 }
 
-function toChannelApproval(r: RuntimeApprovalRecord): PendingApproval {
+const SENSITIVITIES: ReadonlyArray<string> = ["internal", "restricted", "people"];
+
+/** A string field, if the record carries one. */
+function textOf(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+export function toChannelApproval(r: RuntimeApprovalRecord): PendingApproval {
   const places = placesOf(r.places);
   const supersedes = supersededOf(r.supersedes);
   const requiredClass = requiredClassOf(r.requiredClass);
   const resourceVersionBound = resourceVersionBoundOf(r.binding);
+  const runId = textOf(r.runId);
+  const decidedVia = textOf(r.decidedVia);
+  const decidedByPrincipal = textOf(r.decidedByPrincipal);
+  const sensitivity =
+    typeof r.sensitivity === "string" && SENSITIVITIES.includes(r.sensitivity)
+      ? (r.sensitivity as ApprovalSensitivity)
+      : undefined;
   return {
     id: r.id,
     toolName: r.toolName,
@@ -635,6 +764,16 @@ function toChannelApproval(r: RuntimeApprovalRecord): PendingApproval {
     ...(supersedes !== undefined ? { supersedes } : {}),
     ...(requiredClass !== undefined ? { requiredClass } : {}),
     ...(resourceVersionBound !== undefined ? { resourceVersionBound } : {}),
+    ...(runId !== undefined ? { runId } : {}),
+    ...(decidedVia !== undefined ? { decidedVia } : {}),
+    ...(decidedByPrincipal !== undefined ? { decidedByPrincipal } : {}),
+    ...(sensitivity !== undefined ? { sensitivity } : {}),
+    // Worked out from the raw input here: the channel record keeps only its preview.
+    fitsCard: fitsCard(r.input, {
+      ...(places !== undefined ? { places } : {}),
+      ...(supersedes !== undefined ? { supersedes } : {}),
+      ...(sensitivity !== undefined ? { sensitivity } : {}),
+    }),
   };
 }
 
@@ -651,15 +790,12 @@ function toChannelApproval(r: RuntimeApprovalRecord): PendingApproval {
  * consults ONLY its own store, keyed `(toolName, inputHash)`. A decision
  * recorded anywhere else is a decision the agent never sees.
  *
- * Three semantics worth knowing, each load-bearing:
+ * Four semantics worth knowing, each load-bearing:
  *
- *   - `resolve` returns `null` when the record was ALREADY decided. The
- *     runtime's own `resolve` overwrites and returns the record, but the
- *     gateway's `/actions` route treats a non-null return as "this call
- *     transitioned it" and uses it to decide whether to ACK Slack and re-drive
- *     the turn. Passing the runtime's return through directly would double-ACK
- *     and double-drive on a Slack retry, which is a real duplicate-side-effect
- *     bug, not a cosmetic one.
+ *   - `resolve` returns `null` when the record was ALREADY decided, so a
+ *     caller can treat a non-null return as "this call transitioned it".
+ *   - `rootDir` is the runtime store's session root: where
+ *     `createApprovalActions` decides a click, as the linked member.
  *   - ids stay in the runtime's `appr_<16 hex>` space. The channel store minted
  *     24 hex, which `session-store.resolve()` rejects outright and which
  *     `crewhaus approvals grant` — the command the Slack prompt itself tells
@@ -674,15 +810,8 @@ export function createRuntimeBackedApprovalStore(
 ): ApprovalStore {
   const now = opts.now ?? (() => new Date());
   const waitForPollMs = opts.waitForPollMs ?? 1_000;
-  const genId =
-    opts.genId ??
-    (() => {
-      // Mirror of the runtime's `appr_` + 16 lowercase hex. Kept local rather
-      // than imported so this module stays dependency-free.
-      let out = "appr_";
-      for (let i = 0; i < 16; i++) out += Math.floor(Math.random() * 16).toString(16);
-      return out;
-    });
+  // Mirror of the runtime's `appr_` + 16 lowercase hex.
+  const genId = opts.genId ?? (() => `appr_${randomHex(8)}`);
 
   async function byId(id: string): Promise<RuntimeApprovalRecord | null> {
     for (const r of await runtime.list()) if (r.id === id) return r;
@@ -690,6 +819,7 @@ export function createRuntimeBackedApprovalStore(
   }
 
   return {
+    ...(runtime.rootDir !== undefined ? { rootDir: runtime.rootDir } : {}),
     /**
      * Present for interface parity. Production parks are written by
      * runtime-core itself, which has the real `inputHash` — the key a grant is

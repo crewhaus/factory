@@ -13,8 +13,12 @@
   },
   "dependencies": {
     "@crewhaus/boundary-classifier": "workspace:*",
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
+    "@crewhaus/control-service": "workspace:*",
     "@crewhaus/errors": "workspace:*",
-    "@crewhaus/run-context": "workspace:*"
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/session-store": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

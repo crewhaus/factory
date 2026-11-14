@@ -16,6 +16,7 @@
  * nothing.
  */
 import { hostname } from "node:os";
+import { join } from "node:path";
 import type { ReceiptEffect } from "@crewhaus/control-contract";
 import {
   AREA_RUNTIMES,
@@ -49,6 +50,7 @@ import {
   resolveHarness,
   supervisorFor,
 } from "./daemon-cmd";
+import { removeRunTokens } from "./state-backup";
 
 /** The steps `runRetire` wires itself, from the spec registry and the harness's files. */
 export type HeavyRetireSteps = Pick<
@@ -231,9 +233,20 @@ export async function retireCommand(o: RetireCommandOptions): Promise<DaemonComm
           dryRun: false,
           forceUnverified: o.forceUnverified,
         });
+        const lines = [...formatRetirementResult(result)];
+        // The state kept in the archive holds no run token: a daemon makes each
+        // again at start, so nothing is lost.
+        if (result.removedState) {
+          const removed = removeRunTokens(join(plan.archiveDir, "crewhaus-state"));
+          if (removed.length > 0) {
+            lines.push(
+              `  left ${removed.length} run token file(s) out of the archived state (a daemon makes each again at start)`,
+            );
+          }
+        }
         return {
           settle: { state: "succeeded", effects: effects.ordered },
-          value: { lines: [...formatRetirementResult(result)], exitCode: 0 },
+          value: { lines, exitCode: 0 },
         };
       } catch (err) {
         if (!(err instanceof RetireError)) throw err;

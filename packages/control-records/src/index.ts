@@ -58,6 +58,9 @@ export {
   snapshotAt,
 } from "./cursor";
 export {
+  CHANNEL_CONVERSATION_LABEL,
+  CHANNEL_MESSAGE_LABEL,
+  CHANNEL_SENDER_LABEL,
   type DigestKeyRead,
   ensureDigestKey,
   keyedDigest,
@@ -67,6 +70,16 @@ export {
   storedLocalActor,
   subjectRefOf,
 } from "./digest";
+export {
+  type PreparingRun,
+  RUN_ROW_PAGE_LINES,
+  type RunHolder,
+  type SettleAnswer,
+  type UnstartedClose,
+  appendPreparingRun,
+  newestRunRows,
+  settleUnstartedRun,
+} from "./runs";
 export {
   type OperatorDeployment,
   type OperatorIntake,
