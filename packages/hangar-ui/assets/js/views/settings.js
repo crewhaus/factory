@@ -34,7 +34,7 @@ import {
   writePrefs,
   writeTheme,
 } from "../prefs.js";
-import { hrefHarness } from "../router.js";
+import { hrefFleet, hrefHarness } from "../router.js";
 import { signOut } from "../sign-in.js";
 import { fmtRelativeTime } from "../util.js";
 
@@ -99,9 +99,14 @@ export async function renderHomeSettings(root) {
   root.appendChild(pluginCard(settled(pluginsRes)));
 }
 
-/** Your account (`#/settings/account`): signing this browser out. */
+/**
+ * Your account (`#/settings/account`): signing this browser out, and the way to
+ * allow a sign-in from another computer (`#/device`).
+ */
 export function renderAccountSettings(root) {
-  clear(root).appendChild(signOutCard());
+  clear(root);
+  root.appendChild(signOutCard());
+  root.appendChild(otherComputerCard());
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +251,27 @@ function signOutCard() {
       text: "Sign out ends this tab's session. Forget this browser also removes its key, so signing in again needs a new link from crewhaus hangar open.",
     }),
     el("div", { class: "editor-actions" }, [out, forget]),
+  ]);
+}
+
+/** The command that shows a code on another computer, and the one that allows it here. */
+export const DEVICE_LOGIN_VERB = "crewhaus login --server <this Home's address>";
+export const DEVICE_APPROVE_VERB = "crewhaus access approve <code>";
+
+function otherComputerCard() {
+  return el("section", { class: "card" }, [
+    el("h3", { class: "card-title", text: "Another computer" }),
+    el("p", { class: "muted" }, [
+      "To use this Home from another computer, run ",
+      el("code", { text: DEVICE_LOGIN_VERB }),
+      " there. It shows a code to allow here.",
+    ]),
+    el("p", {}, [el("a", { href: hrefFleet("device"), text: "Allow a sign-in" })]),
+    el("p", { class: "muted" }, [
+      "On Home's own computer, ",
+      el("code", { text: DEVICE_APPROVE_VERB }),
+      " does the same.",
+    ]),
   ]);
 }
 

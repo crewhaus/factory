@@ -11,6 +11,8 @@ import { join } from "node:path";
 import { resetDiscovery } from "../assets/js/v1.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { DEVICE_MESSAGES, codeFromHash, renderDevice } from "../assets/js/views/device.js";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import { DEVICE_APPROVE_VERB, DEVICE_LOGIN_VERB } from "../assets/js/views/settings.js";
 import { homeAssets as CONSOLE_ASSETS } from "./embed/home";
 
 const SOURCE = readFileSync(
@@ -19,6 +21,17 @@ const SOURCE = readFileSync(
 );
 
 describe("#/device", () => {
+  test("the account page links here, and names the commands on both computers", () => {
+    const settings = readFileSync(
+      join(import.meta.dir, "..", "assets", "js", "views", "settings.js"),
+      "utf8",
+    );
+    expect(settings).toContain('el("a", { href: hrefFleet("device"), text: "Allow a sign-in" })');
+    expect(settings).toContain("root.appendChild(otherComputerCard());");
+    expect(DEVICE_LOGIN_VERB).toBe("crewhaus login --server <this Home's address>");
+    expect(DEVICE_APPROVE_VERB).toBe("crewhaus access approve <code>");
+  });
+
   test("the code field is labelled, takes a one-time code, and says what it takes", () => {
     expect(SOURCE).toContain('el("label", { for: "device-code"');
     expect(SOURCE).toContain('autocomplete: "one-time-code"');
