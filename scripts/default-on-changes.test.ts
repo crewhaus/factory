@@ -3385,7 +3385,7 @@ describe("the release notes name what checking before acting changes for every h
         {
           dir: "/h",
           registeredAt: "2026-08-01T00:00:00.000Z",
-          home: { adoptedAt: "t", by: "x" },
+          home: { adoptedAt: "2026-08-02T00:00:00.000Z", by: "x" },
         } as never,
       ],
     };

@@ -10,6 +10,8 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,9 +19,9 @@ import { dirname, join } from "node:path";
 import { EXIT_CODES } from "@crewhaus/errors";
 import { specRevision } from "@crewhaus/ir/policy";
 import { type PreflightItem, buildReport, workspaceItems } from "@crewhaus/preflight";
-import { SPEC_NOT_ACTIVE_MESSAGE } from "./active-build";
+import { SPEC_NOT_ACTIVE_MESSAGE, buildLinkMessage, verifyActiveBuild } from "./active-build";
 import { type GateDecision, type GateOptions, evaluateGate } from "./gate";
-import { createPrepareRunner, forecastCompile } from "./prepare";
+import { compileActiveRevision, createPrepareRunner, forecastCompile } from "./prepare";
 import { buildSpawnPlan } from "./spawn-contracts";
 import { automaticSpecRefusal } from "./start-decision";
 import { type AdmitAnswer, type SupervisorOptions, createHarnessSupervisor } from "./supervisor";
@@ -432,5 +434,168 @@ describe("forecastCompile decides what the compile step would, without compiling
       compileMayRun: true,
       activeOnly: false,
     });
+  });
+});
+
+describe("a restart whose start compiles first decides its build after the compile", () => {
+  const SPEC = "name: demo\ntarget: channel\n";
+
+  /**
+   * A supervisor whose stops and compiles land in one ordered list. A compile's child
+   * exits 1 at once, so its start ends at the compile and spawns no daemon.
+   */
+  function ordered(dir: string, compile: true | undefined, admit?: SupervisorOptions["admit"]) {
+    const events: string[] = [];
+    const clock = createFakeClock();
+    const ops = createFakeProcessOps({ now: clock.now });
+    const compileOps = createFakeProcessOps();
+    const runnerOps = {
+      ...compileOps,
+      spawn: (request: Parameters<typeof compileOps.spawn>[0]) => {
+        events.push(`spawn ${request.argv.slice(1).join(" ")}`);
+        const spawned = compileOps.spawn(request);
+        compileOps.last()?.exit(1);
+        return spawned;
+      },
+    };
+    const supervisor = createHarnessSupervisor({
+      harnessDir: dir,
+      target: "channel",
+      ops: {
+        ...ops,
+        terminate: (pid) => {
+          events.push(`SIGTERM ${pid}`);
+          ops.terminate(pid);
+        },
+      },
+      clock,
+      plan: () =>
+        buildSpawnPlan({
+          harnessDir: dir,
+          target: "channel",
+          processEnv: {},
+          ports: { port: 3000, controlPort: 3001 },
+        }),
+      managerVersion: "0.9.0-test",
+      prepare: () =>
+        createPrepareRunner({
+          harnessDir: dir,
+          target: "channel",
+          ops: runnerOps,
+          env: {},
+          crewhausBin: "/bin/crewhaus",
+          ...(compile !== undefined ? { compile } : {}),
+        }),
+      ...(admit !== undefined ? { admit } : {}),
+    });
+    return { events, ops, supervisor };
+  }
+
+  test("autoCompile, the active revision's build changed: the stop comes before the compile", async () => {
+    const dir = harness();
+    put(dir, ".crewhaus/settings.json", JSON.stringify({ manager: { autoCompile: true } }));
+    activateBuildForTest(dir, "dist/daemon.ts", { specHash: specRevision(SPEC) });
+    const h = ordered(dir, undefined);
+    expect(await h.supervisor.start()).toMatchObject({ ok: true });
+    const daemon = h.ops.last()?.pid;
+    expect(h.events).toEqual([]);
+    put(dir, "dist/daemon.ts", "// changed by hand\n");
+    const result = await h.supervisor.restart();
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.kept).toBeUndefined();
+    const stop = h.events.indexOf(`SIGTERM ${daemon}`);
+    const compile = h.events.findIndex((e) => e.startsWith("spawn compile"));
+    expect(stop).toBeGreaterThan(-1);
+    expect(compile).toBeGreaterThan(-1);
+    expect(stop).toBeLessThan(compile);
+  });
+
+  test("an explicit compile of a stale bundle from Home: the stop comes before the compile", async () => {
+    const dir = harness();
+    const asked: boolean[] = [];
+    const h = ordered(dir, true, async (request) => {
+      asked.push(request.decideOnly);
+      return { ok: true };
+    });
+    expect(await h.supervisor.start()).toMatchObject({ ok: true });
+    expect(asked).toEqual([false]);
+    const daemon = h.ops.last()?.pid;
+    // The bundle is stamped from another spec, so the compile step compiles.
+    put(
+      dir,
+      "dist/package.json",
+      JSON.stringify({
+        name: "crewhaus-compiled-bundle",
+        crewhaus: { specHash: specRevision("name: other\n") },
+      }),
+    );
+    const result = await h.supervisor.restart();
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.kept).toBeUndefined();
+    // The admission is the start's own, after its compile: never asked before the stop.
+    expect(asked).toEqual([false]);
+    const stop = h.events.indexOf(`SIGTERM ${daemon}`);
+    const compile = h.events.findIndex((e) => e.startsWith("spawn compile"));
+    expect(stop).toBeGreaterThan(-1);
+    expect(compile).toBeGreaterThan(-1);
+    expect(stop).toBeLessThan(compile);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("an active build whose files hold a link", () => {
+  const SPEC = "name: demo\ntarget: channel\n";
+  const deps = (dir: string, ops = createFakeProcessOps()) => ({
+    harnessDir: dir,
+    target: "channel",
+    ops,
+    env: {},
+    crewhausBin: "/bin/crewhaus",
+  });
+
+  /** Replace the active build's entry with a link, and activate the build over the link. */
+  function linkTheActiveBuild(dir: string): void {
+    const outside = mkdtempSync(join(tmpdir(), "chsup-decide-outside-"));
+    roots.push(outside);
+    put(outside, "daemon.ts", "// bundle\n");
+    unlinkSync(join(dir, "dist/daemon.ts"));
+    symlinkSync(join(outside, "daemon.ts"), join(dir, "dist/daemon.ts"));
+    activateBuildForTest(dir, "dist/daemon.ts", {
+      id: "dep_01linklinklinklinklinklink",
+      specHash: specRevision(SPEC),
+      at: "2026-11-02T00:00:00.000Z",
+    });
+    expect(verifyActiveBuild(dir, "channel")).toMatchObject({ ok: false, reason: "link" });
+  }
+
+  test("autoCompile compiles nothing for it, and the start runs only the active build", async () => {
+    const dir = harness();
+    activateBuildForTest(dir, "dist/daemon.ts", { specHash: specRevision(SPEC) });
+    linkTheActiveBuild(dir);
+    expect(forecastCompile(deps(dir), "auto")).toEqual({ compileMayRun: false, activeOnly: true });
+    const ops = createFakeProcessOps();
+    const outcome = await compileActiveRevision(deps(dir, ops));
+    expect(outcome).toMatchObject({ ok: true, replan: false, activeOnly: true });
+    expect(ops.children).toHaveLength(0);
+  });
+
+  test("a restart under autoCompile refuses before its stop, naming the link", async () => {
+    const dir = harness();
+    put(dir, ".crewhaus/settings.json", JSON.stringify({ manager: { autoCompile: true } }));
+    activateBuildForTest(dir, "dist/daemon.ts", { specHash: specRevision(SPEC) });
+    const compiles = createFakeProcessOps();
+    const h = supervise(dir, { prepare: () => createPrepareRunner(deps(dir, compiles)) });
+    expect(await h.supervisor.start()).toMatchObject({ ok: true });
+    linkTheActiveBuild(dir);
+    const result = await restart(h);
+    expect(result).toEqual({
+      ok: false,
+      reason: "build-not-active",
+      message: buildLinkMessage("dist/daemon.ts"),
+      kept: true,
+    });
+    expect(h.stops()).toBe(0);
+    expect(h.ops.last()?.signals).toEqual([]);
+    expect(h.ops.children).toHaveLength(1);
+    expect(compiles.children).toHaveLength(0);
   });
 });
