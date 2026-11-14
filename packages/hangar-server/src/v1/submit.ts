@@ -32,6 +32,9 @@ export async function submitCommand<T>(
     {
       kind: input.kind ?? ctx.op.id,
       ...(ctx.actor !== undefined ? { actor: ctx.actor } : {}),
+      ...(ctx.actor !== undefined && ctx.credentialRef !== undefined
+        ? { credentialRef: ctx.credentialRef }
+        : {}),
       ...(input.target !== undefined ? { target: input.target } : {}),
       ledger: input.ledger,
       via: ctx.via,

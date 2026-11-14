@@ -157,6 +157,8 @@ export type ReceiptsDeps = {
   readonly control: ControlService;
   /** The signed-in principal the request is from, `prn_…`; absent, the head's own user. */
   readonly actorOf?: (req: Request) => string | undefined;
+  /** The credential (`crd_…`) the request authenticated with, when it used one. */
+  readonly credentialOf?: (req: Request) => string | undefined;
   readonly harness: (id: string) => HangarHarnessEntry | undefined;
   /** The scrubber the route's own payload is masked with: a harness's, or the fleet's. */
   readonly scrubFor: (harnessDir: string | undefined) => TextScrubber;
@@ -272,10 +274,12 @@ export function createReceipts(deps: ReceiptsDeps): WithReceipt {
 
     const scrub = deps.scrubFor(harnessDir);
     const actor = deps.actorOf?.(req);
+    const credentialRef = actor !== undefined ? deps.credentialOf?.(req) : undefined;
     const answer = await deps.control.commands.submit<Handled>(
       {
         kind: row.kind,
         ...(actor !== undefined ? { actor } : {}),
+        ...(credentialRef !== undefined ? { credentialRef } : {}),
         ...(target !== undefined ? { target } : {}),
         ledger,
         via: "home",
