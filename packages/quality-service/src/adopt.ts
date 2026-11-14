@@ -482,12 +482,17 @@ export async function adoptChange(opts: AdoptOptions): Promise<AdoptAnswer> {
       row,
     };
   }
-  const moved = instrumentChanges(recorded, current).filter((c) => c.unverified !== true);
+  // Adoption holds the check to an instrument that is verifiably the same: a field
+  // recorded on one side only counts as changed.
+  const moved = instrumentChanges(recorded, current);
   if (moved.length > 0) {
+    const named = moved.map((c) =>
+      c.unverified === true ? `${c.field}, recorded on one side only` : c.field,
+    );
     return {
       ok: false,
       code: "instrument-changed",
-      reason: `the measuring instrument changed since the check (${moved.map((c) => c.field).join(", ")}), so its result no longer says what this change does; check it again`,
+      reason: `the measuring instrument changed since the check (${named.join("; ")}), so its result no longer says what this change does; check it again`,
       row,
     };
   }

@@ -33,10 +33,9 @@ import {
   baselineKey,
   baselineKeyFor,
   clearBaseline,
-  manualRebaseline,
   pinFromIndexEntry,
   pinRun,
-  reanchorRefusal,
+  sameInstrumentRefusal,
 } from "@crewhaus/eval-report";
 import { probeKind, resolveContained } from "@crewhaus/tool-safety/fs";
 import { type SafePath, workspaceRoot } from "../paths";
@@ -215,9 +214,10 @@ export function planPin(input: PlanInput): Loaded<PinPlan> {
   // because it was computed twice is not a result.
   // A pin over a different instrument would re-anchor the lineage: that is a
   // person's quality decision, made under a receipt, so this tool refuses it and
-  // names the command. A run measured like the pin it replaces is pinned.
-  const mark = manualRebaseline(previous, row, PIN_CMD);
-  if (mark !== undefined) return fail("refused", reanchorRefusal(row, previous).reason);
+  // names the command. A run measured verifiably like the pin it replaces is
+  // pinned; the write below asks the same question (`sameInstrumentOnly`).
+  const reanchor = sameInstrumentRefusal(row, previous);
+  if (reanchor !== undefined) return fail("refused", reanchor.reason);
   // No owner check is offered here: a pin that changes a protected criterion
   // is refused, and the refusal names the command the owner uses.
   const pinned = pinFromIndexEntry(row, row.ts, {

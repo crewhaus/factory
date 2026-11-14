@@ -139,7 +139,7 @@ import {
   sessionRel,
   traceRel,
 } from "./lib/sessions";
-import { type SplitMode, planSplits, splitCounts } from "./lib/splits";
+import { type SplitMode, planSplits, separateFromHoldout, splitCounts } from "./lib/splits";
 import { ToolPermissionError, resolveSafe, workspaceRoot } from "./paths";
 
 export { ToolPermissionError } from "./paths";
@@ -580,8 +580,8 @@ export const datasetPut: RegisteredTool = buildTool({
     let previous: Map<string, DatasetSplit> | undefined;
     // The newest holdout of the dataset rides along unread, whatever version this
     // put is based on: carried into the new version as it is, never returned,
-    // listed or reported by id. A case any version holds out never enters the
-    // new version's other splits, and is never reported as dropped.
+    // listed or reported by id. Rows of the previous version that any version
+    // holds out are not part of the lineage this put carries forward.
     let heldOut: ReadonlyArray<Sample> | undefined;
     let heldOutIds: ReadonlySet<string> = new Set();
     if (basedOn !== undefined) {
@@ -598,18 +598,20 @@ export const datasetPut: RegisteredTool = buildTool({
       if (across.value.newest !== undefined) heldOut = across.value.newest.rows;
       previous = new Map([...assignmentOf(record.value)].filter(([id]) => !heldOutIds.has(id)));
     }
-    const incoming = samples.filter((s) => !heldOutIds.has(s.id));
-    const heldOutLeftOut = samples.length - incoming.length;
 
+    // DatasetPut answers the same whether or not an incoming id is held out: every
+    // incoming sample is planned under the id it was given, and everything this
+    // call returns is built from that plan.
     const mode: SplitMode = input.splitMode ?? "stable";
     const plan = planSplits({
-      samples: incoming,
+      samples,
       spec,
       ...(previous !== undefined ? { previous } : {}),
       mode,
       ...(input.split !== undefined ? { singleSplit: input.split } : {}),
       ...(heldOut !== undefined ? { heldOut } : {}),
     });
+    const toWrite = separateFromHoldout(plan.splits, heldOutIds, version);
 
     // The hash a real put will store, derived the way the registry derives it
     // (its own `hashSample`, its own canonical fold) so the dry run predicts
@@ -617,20 +619,18 @@ export const datasetPut: RegisteredTool = buildTool({
     const planned: DatasetRecord = {
       name: input.name,
       version,
-      splits: plan.splits,
+      splits: toWrite,
       sampleHashes: {
-        train: plan.splits.train.map(hashSample),
-        dev: plan.splits.dev.map(hashSample),
-        ...(plan.splits.test !== undefined ? { test: plan.splits.test.map(hashSample) } : {}),
-        ...(plan.splits.holdout !== undefined
-          ? { holdout: plan.splits.holdout.map(hashSample) }
-          : {}),
+        train: toWrite.train.map(hashSample),
+        dev: toWrite.dev.map(hashSample),
+        ...(toWrite.test !== undefined ? { test: toWrite.test.map(hashSample) } : {}),
+        ...(toWrite.holdout !== undefined ? { holdout: toWrite.holdout.map(hashSample) } : {}),
       },
       createdAt: "",
     };
     const datasetHash = overallDatasetHash(planned, presentSplits(planned));
 
-    const provenance = [...offTaxonomySources(incoming)].map(([source, ids]) => ({
+    const provenance = [...offTaxonomySources(samples)].map(([source, ids]) => ({
       source,
       count: ids.length,
       ...listIds(ids),
@@ -660,19 +660,18 @@ export const datasetPut: RegisteredTool = buildTool({
       registryRoot: root.rel,
       registryRootSource: root.source,
       sampleCount: samples.length,
-      splits: splitCounts(plan.splits),
+      splits: splitCounts(toWrite),
       golds: goldCount(samples),
       datasetHash,
       splitMode: mode,
       ...(input.split !== undefined ? { singleSplit: input.split } : {}),
       splitSpec: input.split !== undefined ? null : `${spec.train}/${spec.dev}/${spec.test}`,
-      ...(plan.splits.holdout !== undefined
+      ...(toWrite.holdout !== undefined
         ? {
             holdout: {
-              count: plan.splits.holdout.length,
+              count: toWrite.holdout.length,
               carriedForward: true,
               note: "the dataset's holdout is carried as it was — its rows are never returned to an agent",
-              ...(heldOutLeftOut > 0 ? { incomingLeftOut: heldOutLeftOut } : {}),
             },
           }
         : {}),
@@ -695,7 +694,7 @@ export const datasetPut: RegisteredTool = buildTool({
         : {}),
       redaction,
       provenanceWarnings: provenance,
-      pii: auditSummary(samples, new Set(), heldOutIds),
+      pii: auditSummary(samples),
       warnings,
     };
 
@@ -705,7 +704,7 @@ export const datasetPut: RegisteredTool = buildTool({
     try {
       // The registry computes the per-sample hashes and the timestamp itself;
       // this call hands it exactly what the dry run above described.
-      const written = await registry.put({ name: input.name, version, splits: plan.splits });
+      const written = await registry.put({ name: input.name, version, splits: toWrite });
       return json({ wrote: true, createdAt: written.createdAt, ...result });
     } catch (err) {
       return `${toolName}: the registry refused the write — ${errorMessage(err)}`;

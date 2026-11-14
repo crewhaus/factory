@@ -67,7 +67,7 @@ async function runCli(
 async function runCliStderr(
   args: ReadonlyArray<string>,
   cwd: string,
-): Promise<{ exitCode: number; stderr: string }> {
+): Promise<{ exitCode: number; stderr: string; stdout: string }> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
     cwd,
     env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY },
@@ -75,8 +75,12 @@ async function runCliStderr(
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-  return { exitCode, stderr };
+  const [stderr, stdout, exitCode] = await Promise.all([
+    new Response(proc.stderr).text(),
+    new Response(proc.stdout).text(),
+    proc.exited,
+  ]);
+  return { exitCode, stderr, stdout };
 }
 
 function writeDatasetFile(dir: string, n: number, name = "dataset.jsonl"): string {
@@ -632,6 +636,23 @@ describe("crewhaus datasets release (NEW-HUNT-9)", () => {
     // The record's release history is untouched by the refusal.
     const after = JSON.parse(readFileSync(path, "utf-8"));
     expect(after.releases).toHaveLength(1);
+  }, 20_000);
+
+  test("a release count that cannot be determined refuses without --force and evaluates nothing", async () => {
+    const root = newTempRoot();
+    const { spec, graders } = writeSpecAndGraders(root);
+    const file = writeDatasetFile(root, 10);
+    expect((await runCli(["datasets", "put", "unread", "--file", file], root)).exitCode).toBe(0);
+    // A ledger that is not a regular file cannot be read whole.
+    mkdirSync(join(root, ".crewhaus", "datasets", "unread", "v1.uses.jsonl"));
+    const result = await runCliStderr(
+      ["datasets", "release", "unread", "--spec", spec, "--graders", graders],
+      root,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("cannot be determined");
+    expect(result.stderr).toContain("--force");
+    expect(result.stdout).not.toContain("evaluating");
   }, 20_000);
 
   test("missing --spec/--graders/name exit 1", async () => {
