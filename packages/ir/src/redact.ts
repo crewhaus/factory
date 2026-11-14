@@ -13,6 +13,9 @@
  *      tokens preceded by key-ish context words. Deliberately conservative: a
  *      bare 32-char identifier with no "key/token/secret/password" context is
  *      left alone so normal prose never gets chewed up.
+ *   3. `carriesCredential` — a yes/no screen built on both layers: whether a
+ *      value (a permission rule's pattern, a command line) carries a
+ *      credential, so the caller can refuse to store or show it at all.
  *
  * KEEP IN SYNC: this module is intentionally duplicated as
  * `packages/ir/src/redact.ts` and `packages/spec-patch/src/redact.ts`.
@@ -119,4 +122,40 @@ export function maskCredentialTokens(text: string): string {
   out = out.replace(BEARER_RE, `$1 ${MASKED_TOKEN}`);
   out = out.replace(CONTEXTUAL_OPAQUE_RE, `$1${MASKED_TOKEN}`);
   return out;
+}
+
+/**
+ * A URL in a value: its scheme through the next space or quote (group 1). A
+ * match starts only where a run of scheme characters starts, so each run is
+ * scanned once, however long it is.
+ */
+const URL_IN_TEXT = /(?<![A-Za-z0-9+.-])[0-9+.-]*([A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>]+)/g;
+/** `NAME=value`, a variable a command sets. */
+const ASSIGNMENT_IN_TEXT = /(?:^|[\s"'])([A-Za-z_][A-Za-z0-9_]*)=[^\s"']/g;
+/** `Name: value`, a header line a command sends. */
+const HEADER_IN_TEXT = /(?:^|[\s"'])([A-Za-z][A-Za-z0-9-]*)\s*:\s*[^\s/"']/g;
+
+/**
+ * Whether a rule value carries a credential: a credential-shaped token anywhere in it
+ * (the masker's own shapes), a URL with a password or a query key that names one, or
+ * a variable or a header line whose name names one (`isCredentialKey`).
+ */
+export function carriesCredential(value: string): boolean {
+  if (maskCredentialTokens(value) !== value) return true;
+  for (const match of value.matchAll(URL_IN_TEXT)) {
+    try {
+      const url = new URL(match[1] as string);
+      if (url.password !== "") return true;
+      for (const key of url.searchParams.keys()) if (isCredentialKey(key)) return true;
+    } catch {
+      // Not a URL the parser reads: the other checks still apply.
+    }
+  }
+  for (const match of value.matchAll(ASSIGNMENT_IN_TEXT)) {
+    if (isCredentialKey(match[1] as string)) return true;
+  }
+  for (const match of value.matchAll(HEADER_IN_TEXT)) {
+    if (isCredentialKey(match[1] as string)) return true;
+  }
+  return false;
 }

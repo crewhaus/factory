@@ -333,6 +333,7 @@ import {
   isArgScoped,
   rankSuggestions,
   readOnlyByName,
+  skippedSuggestions,
   suggestLookupFromTools,
 } from "@crewhaus/harness-advice/permissions-suggest";
 // 0.6.0 §7.8 / §9.1 — the shadow lane holds BOTH sides of one audition under
@@ -1636,6 +1637,7 @@ import {
   mergeAllFromArchive,
   mergeFeedbackFromArchive,
   parseExcludeGlobs,
+  removeRunTokens,
   restoreStateArchive,
 } from "./state-backup";
 import { discloseSurfaceChange, runSpecDirOf, withRunSpecDir } from "./surface-disclosure";
@@ -15646,6 +15648,9 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
   const toolMap = await loadToolMap();
   const readOnly = readOnlyByName(toolMap);
   const aggregates = aggregateAsks(sessions, suggestLookupFromTools(toolMap));
+  // A tool a recorded call of which carried a credential gets no allow rule;
+  // the report names the tool and never the value.
+  const skipped = skippedSuggestions(aggregates);
   // Every proposal is checked against the real permission matcher before it
   // is shown: a rule that would also cover a call nobody approved is refused.
   const { verifyRule } = await import("@crewhaus/tool-approvals");
@@ -15723,6 +15728,7 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
           sessionIds: sessions.map((s) => s.sessionId),
           suggestions,
           rejected,
+          skipped,
           diff,
           overrideCheck: {
             spec: overrideCheck.spec ?? null,
@@ -15749,6 +15755,9 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
     for (const line of formatSuggestionLines(suggestions)) process.stdout.write(`${line}\n`);
     for (const r of rejected) {
       process.stdout.write(`[refused] ${r.pattern}\n  · ${r.reason}\n`);
+    }
+    for (const skip of skipped) {
+      process.stdout.write(`[skipped] ${skip.toolName}\n  · ${skip.note}\n`);
     }
     process.stdout.write("\n");
     for (const line of formatSettingsDiff(diff)) process.stdout.write(`${line}\n`);
@@ -17901,7 +17910,7 @@ async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise
   if (args.flags["help"]) {
     process.stdout.write(
       "usage:\n" +
-        "  crewhaus state backup [-o <file.tar.gz>] [--exclude <glob,glob>]\n" +
+        "  crewhaus state backup [-o <file.tar.gz>] [--exclude <glob,glob>] [--include <glob,glob>]\n" +
         "  crewhaus state restore <file.tar.gz> [--into <dir>] [--merge feedback|all] [--force]\n" +
         "\n" +
         "backup: archive the cwd .crewhaus/ state dir (sessions, feedback,\n" +
@@ -17917,6 +17926,11 @@ async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise
         "  --exclude   comma-separated globs matched against paths relative to\n" +
         "              .crewhaus; a bare pattern also matches file/dir names\n" +
         '              anywhere (e.g. --exclude "sessions,*.sqlite").\n' +
+        "  --include   keeps a run token a backup leaves out by default\n" +
+        "              (run/control-token, run/gateway-jwt-secret,\n" +
+        "              run/mcp-token; a daemon makes each again at start),\n" +
+        "              with a warning. --exclude still wins. The tarball is\n" +
+        "              readable only by its owner.\n" +
         "\n" +
         "restore: unpack a backup into <dir>/.crewhaus (default: cwd). By\n" +
         "  default it REFUSES to overwrite an existing non-empty .crewhaus.\n" +
@@ -17940,6 +17954,7 @@ async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise
 
   if (action === "backup") {
     const excludeGlobs = parseExcludeGlobs(strFlag(args, "exclude"));
+    const includeGlobs = parseExcludeGlobs(strFlag(args, "include"));
     const outFile = resolve(
       strFlag(args, "out") ?? defaultBackupFileName(stateBackupLabel(), new Date()),
     );
@@ -17948,11 +17963,17 @@ async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise
         stateDir: join(process.cwd(), ".crewhaus"),
         outFile,
         excludeGlobs,
+        includeGlobs,
         crewhausVersion: cliVersion() ?? "unknown",
       });
       for (const w of result.warnings) process.stderr.write(`[state] warning: ${w}\n`);
       if (result.excluded.length > 0) {
         process.stdout.write(`[state] excluded ${result.excluded.length} file(s) via --exclude\n`);
+      }
+      if (result.defaultExcluded.length > 0) {
+        process.stdout.write(
+          `[state] left out ${result.defaultExcluded.length} run token file(s) a daemon makes again at start (--include <path> keeps one)\n`,
+        );
       }
       const { totals } = result.manifest;
       process.stdout.write(
@@ -18887,6 +18908,16 @@ async function runRetire(args: ParsedArgs): Promise<void> {
     throw err;
   }
   for (const line of formatRetirementResult(result)) process.stdout.write(`${line}\n`);
+  // The state kept in the archive holds no run token: a daemon makes each
+  // again at start, so nothing is lost.
+  if (result.removedState) {
+    const removed = removeRunTokens(join(plan.archiveDir, "crewhaus-state"));
+    if (removed.length > 0) {
+      process.stdout.write(
+        `  left ${removed.length} run token file(s) out of the archived state (a daemon makes each again at start)\n`,
+      );
+    }
+  }
 }
 
 /** A one-off y/N prompt on stdin. Empty / anything not starting with y → no. */

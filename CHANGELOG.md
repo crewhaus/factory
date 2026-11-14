@@ -385,6 +385,15 @@ these on: they reach every harness that uses what each one names.
   stops matching within a second, in a run already going too. A rule
   `.crewhaus/settings.json` holds with no record keeps working and `crewhaus
   approvals rules` lists it to narrow or remove. The file keeps its 0.8 shape.
+- **`crewhaus permissions suggest` proposes no rule whose value the credential
+  screen flags.** When the screen flags the value a recorded call's rule would
+  name (a token, a header whose name names a credential, a URL password, or a
+  variable or query key that names one), `crewhaus permissions suggest` and the
+  `PermissionsSuggest` tool propose no `alwaysAllow` for that tool, neither
+  scoped nor for the whole tool. They name the tool as skipped and never print
+  the value, so `--apply` never writes it to `.crewhaus/settings.json`. An
+  `alwaysAsk` for recurring denials is still proposed, for the whole tool. A
+  rule names a value of at most 8192 characters.
 - **A managed daemon records each run before its turn starts.** `runs.create` and
   `runs.continue` write content-free rows to `.crewhaus/run/control/runs/` with a
   canonical run id (`run_` and 26 characters) and the tenant: `running` before
@@ -520,6 +529,14 @@ these on: they reach every harness that uses what each one names.
   propose` files its proposal as a change record first, names its branch
   `propose/<id>` after it, and stops before any git step when the record
   cannot be written.
+
+- **The tarballs `crewhaus state backup` and `crewhaus retire` write leave a
+  harness's run tokens out, and are `0600`.**
+  `.crewhaus/run/gateway-jwt-secret`, `.crewhaus/run/control-token` and
+  `.crewhaus/run/mcp-token` are made again at every start, so a restore loses
+  nothing. `crewhaus state backup --include <glob>` keeps one, with a warning.
+  The tarball is readable only by its owner. `crewhaus retire` also leaves them
+  out of the state it keeps in its `--archive` directory.
 
 - **A Slack click decides an approval only for a linked member whose role can
   decide it.** An Approve, Always allow or Deny click on a channel daemon's card

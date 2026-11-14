@@ -45,10 +45,12 @@ import {
   removeSettingsRule,
   settingsFilePath,
 } from "@crewhaus/permission-engine";
-import { isCredentialKey, maskCredentialTokens } from "@crewhaus/spec-patch";
+import { carriesCredential } from "@crewhaus/spec-patch";
 import { lexicalPathValues, operativeValuesOf } from "@crewhaus/tool-executor";
 import { TOOL_REGISTRY } from "@crewhaus/tool-registry-manifest";
 import type { DecisionActor, Decisions } from "./decisions";
+
+export { carriesCredential } from "@crewhaus/spec-patch";
 
 type OperativeArgs = NonNullable<Parameters<typeof operativeValuesOf>[0]>;
 
@@ -134,38 +136,6 @@ export type StandingPattern =
       /** The call's value carries a credential, which a rule must never hold. */
       readonly refused: "carries-credential";
     };
-
-/** A URL in a value: its scheme through the next space or quote. */
-const URL_IN_TEXT = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>]+/g;
-/** `NAME=value`, a variable a command sets. */
-const ASSIGNMENT_IN_TEXT = /(?:^|[\s"'])([A-Za-z_][A-Za-z0-9_]*)=[^\s"']/g;
-/** `Name: value`, a header line a command sends. */
-const HEADER_IN_TEXT = /(?:^|[\s"'])([A-Za-z][A-Za-z0-9-]*)\s*:\s*[^\s/"']/g;
-
-/**
- * Whether a rule value carries a credential: a credential-shaped token anywhere in it
- * (the masker's own shapes), a URL with a password or a query key that names one, or
- * a variable or a header line whose name names one (`isCredentialKey`).
- */
-export function carriesCredential(value: string): boolean {
-  if (maskCredentialTokens(value) !== value) return true;
-  for (const match of value.matchAll(URL_IN_TEXT)) {
-    try {
-      const url = new URL(match[0]);
-      if (url.password !== "") return true;
-      for (const key of url.searchParams.keys()) if (isCredentialKey(key)) return true;
-    } catch {
-      // Not a URL the parser reads: the other checks still apply.
-    }
-  }
-  for (const match of value.matchAll(ASSIGNMENT_IN_TEXT)) {
-    if (isCredentialKey(match[1] as string)) return true;
-  }
-  for (const match of value.matchAll(HEADER_IN_TEXT)) {
-    if (isCredentialKey(match[1] as string)) return true;
-  }
-  return false;
-}
 
 /**
  * The narrowest standing rule for an approved call, or why there is none. A tool the
