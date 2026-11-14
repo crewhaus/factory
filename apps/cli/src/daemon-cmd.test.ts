@@ -1356,3 +1356,159 @@ describe("crewhaus daemon writes a receipt for every change", () => {
     }
   });
 });
+
+// --- pause, resume, disable, enable --------------------------------------------
+
+/** The harness's operator record, parsed. */
+function operatorOf(dir: string): Record<string, unknown> {
+  return JSON.parse(
+    readFileSync(join(dir, ".crewhaus", "run", "control", "operator.json"), "utf8"),
+  ) as Record<string, unknown>;
+}
+
+describe("crewhaus daemon pause|resume|disable|enable", () => {
+  test("each writes the record as a receipted command, and says what the daemon made of it", async () => {
+    const f = fixture();
+    try {
+      const paused = await runDaemonCommand(["pause", "--quiet"], f.opts);
+      expect(paused.exitCode).toBe(0);
+      expect(paused.lines[0]).toBe(
+        "daemon-fixture: Recorded; the daemon isn't running and applies it when it starts",
+      );
+      const pause = receiptsOf(f.dir).find((r) => r["kind"] === "controls.pause");
+      expect(pause?.["state"]).toBe("succeeded");
+      expect(paused.lines.at(-1)).toBe(`Done (${pause?.["id"]})`);
+      expect(operatorOf(f.dir)["intake"]).toMatchObject({
+        paused: true,
+        notice: null,
+        cmd: pause?.["id"],
+        by: pause?.["actor"],
+      });
+
+      expect((await runDaemonCommand(["resume"], f.opts)).exitCode).toBe(0);
+      expect((await runDaemonCommand(["disable"], f.opts)).exitCode).toBe(0);
+      const record = operatorOf(f.dir);
+      expect(record["intake"]).toMatchObject({ paused: false });
+      expect(record["deployment"]).toMatchObject({ disabled: true });
+      expect(record["rev"]).toBe(3);
+      expect((await runDaemonCommand(["enable"], f.opts)).exitCode).toBe(0);
+      expect(operatorOf(f.dir)["deployment"]).toMatchObject({ disabled: false });
+      expect(receiptsOf(f.dir).map((r) => r["kind"])).toEqual([
+        "controls.pause",
+        "controls.resume",
+        "controls.disable",
+        "controls.enable",
+      ]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a running daemon is asked to reload; its answer is the line", async () => {
+    const f = fixture();
+    try {
+      const control = join(f.dir, ".crewhaus", "run");
+      mkdirSync(control, { recursive: true });
+      writeFileSync(join(control, "control-token"), "t0k3n-for-test\n", { mode: 0o600 });
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      // The daemon announces its port, as a compiled one does at boot.
+      f.ops
+        .last()
+        ?.writeLog(
+          "[control] crewhaus.control.v1 listening on http://127.0.0.1:41999 (token: .crewhaus/run/control-token)\n",
+        );
+      const seen: string[] = [];
+      const fetch = (async (input: string | URL | Request) => {
+        seen.push(String(input));
+        return new Response(
+          JSON.stringify({
+            operator: { rev: 2, paused: true, disabled: false, unreadable: false },
+          }),
+          { status: 200 },
+        );
+      }) as typeof globalThis.fetch;
+      const out = await runDaemonCommand(["pause"], { ...f.opts, fetch });
+      expect(out.exitCode).toBe(0);
+      expect(out.lines[0]).toBe("daemon-fixture: Paused new work; the daemon confirmed");
+      expect(seen).toEqual(["http://127.0.0.1:41999/control/v1/operator/reload"]);
+      const build = (async () =>
+        new Response(JSON.stringify({ error: "not found" }), {
+          status: 404,
+        })) as unknown as typeof globalThis.fetch;
+      const old = await runDaemonCommand(["disable"], { ...f.opts, fetch: build });
+      expect(old.lines[0]).toBe(
+        "daemon-fixture: Recorded, not enforced: this build predates disable. Recompile to apply it.",
+      );
+      await runDaemonCommand(["stop"], f.opts);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a start of a disabled harness exits 38, names enable, and its receipt is rejected disabled", async () => {
+    const f = fixture();
+    try {
+      expect((await runDaemonCommand(["disable"], f.opts)).exitCode).toBe(0);
+      const out = await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      expect(out.exitCode).toBe(38);
+      expect(out.lines[0]).toContain("crewhaus daemon enable");
+      expect(f.ops.children).toHaveLength(0);
+      const start = receiptsOf(f.dir).find((r) => r["kind"] === "controls.start");
+      expect(start?.["state"]).toBe("rejected");
+      expect((start?.["outcome"] as { code?: string } | undefined)?.code).toBe("disabled");
+      expect(out.lines.at(-1)).toBe(`Not done (${start?.["id"]})`);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a person's start records running, and a stop of a harness with no daemon records stopped", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      expect(operatorOf(f.dir)["desired"]).toBe("running");
+      await runDaemonCommand(["stop"], f.opts);
+      expect(operatorOf(f.dir)["desired"]).toBe("stopped");
+
+      const other = fixture();
+      try {
+        const out = await runDaemonCommand(["stop"], other.opts);
+        expect(out.exitCode).toBe(0);
+        expect(operatorOf(other.dir)["desired"]).toBe("stopped");
+        const stop = receiptsOf(other.dir).find((r) => r["kind"] === "controls.stop");
+        expect(stop?.["effects"]).toContainEqual({
+          kind: "operator",
+          status: "done",
+          observed: "desired stopped",
+        });
+      } finally {
+        other.cleanup();
+      }
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("daemon submit is work with no one there: paused exits 39, disabled 38", async () => {
+    const f = crewFixture();
+    try {
+      writeFileSync(join(f.dir, "brief.md"), "a brief\n");
+      await runDaemonCommand(["pause"], f.opts);
+      const paused = await runDaemonCommand(
+        ["submit", "--brief-file", "brief.md", "--no-preflight"],
+        f.opts,
+      );
+      expect(paused.exitCode).toBe(39);
+      expect(paused.lines[0]).toContain("New work is paused");
+      await runDaemonCommand(["disable"], f.opts);
+      const disabled = await runDaemonCommand(
+        ["submit", "--brief-file", "brief.md", "--no-preflight", "--ignore-pause"],
+        f.opts,
+      );
+      expect(disabled.exitCode).toBe(38);
+      expect(f.ops.children).toHaveLength(0);
+    } finally {
+      f.cleanup();
+    }
+  });
+});

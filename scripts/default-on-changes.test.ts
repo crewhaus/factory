@@ -40,7 +40,7 @@
  * in the `## [Unreleased]` list.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -50,6 +50,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -59,7 +60,12 @@ import { runApprovalsCommand } from "../apps/cli/src/approvals-cmd";
 import { assertOutDirNotLinked, writeBundleFile } from "../apps/cli/src/bundle-writer";
 import { directControl, runDaemonCommand } from "../apps/cli/src/daemon-cmd";
 import { LEASE_BUSY_EXIT } from "../apps/cli/src/mutating-lease";
-import { resolveServeBind, screenedInvoke, serveRequestRefusal } from "../apps/cli/src/serve-mcp";
+import {
+  SERVE_TOKEN_FILE,
+  resolveServeBind,
+  screenedInvoke,
+  serveRequestRefusal,
+} from "../apps/cli/src/serve-mcp";
 import { discloseSurfaceChange } from "../apps/cli/src/surface-disclosure";
 import {
   acceptInbound,
@@ -102,6 +108,8 @@ import {
 } from "../packages/federation-protocol/src/index";
 import {
   CONTROL_ROUTES,
+  CONTROL_RUN_DIR,
+  CONTROL_TOKEN_FILENAME,
   type ControlAuditRecord,
   type ControlPlane,
   countPendingApprovals,
@@ -1308,7 +1316,7 @@ describe("the release notes name every change a harness without provability: see
     }
     // Named in a later list, since 0.8.0 did not ship it.
     const later = defaultOnBullets(changelog, LATER_HEADINGS);
-    const bullet = later.find((b) => b.includes("`.crewhaus/run/gateway-jwt-secret`")) ?? "";
+    const bullet = later.find((b) => b.includes("saves a signing secret it generates to")) ?? "";
     expect(bullet).not.toBe("");
     expect(daemonOf({ tools: ["read"] })).toContain(
       "checkTenantsRoot({ cwd: process.cwd(), tenantsRoot: TENANTS_ROOT })",
@@ -3251,7 +3259,8 @@ describe("the release notes name what checking before acting changes for every h
     const restart = supervisor.slice(supervisor.indexOf("restart: async (gateOptions) =>"));
     expect(supervisor.indexOf("restart: async (gateOptions) =>")).toBeGreaterThan(-1);
     expect(restart.indexOf("await decideStart({")).toBeGreaterThan(-1);
-    expect(restart.indexOf("await stop();")).toBeGreaterThan(
+    // The restart's own stop, which records nothing: its start says what the operator wants.
+    expect(restart.indexOf("await stopRun({}, { record: false });")).toBeGreaterThan(
       restart.indexOf("await decideStart({"),
     );
     const dir = tempHarness("crewhaus-default-on-restart-", "channel");
@@ -3913,6 +3922,130 @@ describe("the release notes name what the decision service changes for every har
     const bullet = bulletFor("keep a spec's records out of an").replace(/\s+/g, " ");
     expect(bullet).toContain("`.crewhaus/run/spec`");
     expect(bullet).toContain("`crewhaus optimize`");
+  });
+});
+
+describe("the release notes name what permission suggestions and state backups leave out", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("permissions suggest proposes no allow for a call that carried a credential", async () => {
+    const { aggregateAsks, rankSuggestions, skippedSuggestions } = await import(
+      "../packages/harness-advice/src/permissions-suggest"
+    );
+    const { parseJsonlObjects } = await import("../packages/harness-advice/src/advise-rules");
+    // Built at runtime from parts, so no credential-shaped literal is committed.
+    const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+    const line = (kind: string, payload: unknown) =>
+      JSON.stringify({ ts: 1, version: 1, kind, payload });
+    const ask = line("permission", { toolName: "Bash", decision: "ask", askOutcome: "approved" });
+    const text = [
+      line("tool_use", {
+        id: "toolu_1",
+        name: "Bash",
+        input: { command: `curl -H "Authorization: Bearer ${token}" https://x.test` },
+      }),
+      ask,
+      ask,
+      ask,
+    ].join("\n");
+    const aggregates = aggregateAsks([
+      { sessionId: "sess_00000000000000fc", objects: parseJsonlObjects(`${text}\n`) },
+    ]);
+    const suggestions = rankSuggestions(aggregates, new Map());
+    expect(suggestions.filter((g) => g.rule.type === "alwaysAllow")).toEqual([]);
+    expect(skippedSuggestions(aggregates).map((k) => [k.toolName, k.reason])).toEqual([
+      ["Bash", "carries-credential"],
+    ]);
+    expect(JSON.stringify(suggestions).includes(token)).toBe(false);
+
+    const bullet = bulletFor("proposes no rule whose value the credential").replace(/\s+/g, " ");
+    for (const word of [
+      "`crewhaus permissions suggest`",
+      "`PermissionsSuggest`",
+      "`alwaysAllow`",
+      "`--apply`",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  });
+
+  test("state backup leaves the run tokens out and writes 0600", async () => {
+    const { DEFAULT_BACKUP_EXCLUDES, createStateBackup } = await import(
+      "../apps/cli/src/state-backup"
+    );
+    // The writers' own paths, so a token that moves fails here until the list follows it.
+    const runRelative = CONTROL_RUN_DIR.replace(/^\.crewhaus\//, "");
+    expect(DEFAULT_BACKUP_EXCLUDES).toContain(`${runRelative}/${CONTROL_TOKEN_FILENAME}`);
+    expect(DEFAULT_BACKUP_EXCLUDES).toContain(SERVE_TOKEN_FILE.replace(/^\.crewhaus\//, ""));
+    expect(DEFAULT_BACKUP_EXCLUDES).toContain("run/gateway-jwt-secret");
+
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-backup-")));
+    try {
+      const stateDir = join(dir, ".crewhaus");
+      mkdirSync(join(stateDir, "run"), { recursive: true });
+      mkdirSync(join(stateDir, "sessions"), { recursive: true });
+      for (const rel of DEFAULT_BACKUP_EXCLUDES) {
+        mkdirSync(dirname(join(stateDir, rel)), { recursive: true });
+        writeFileSync(join(stateDir, rel), randomBytes(24).toString("hex"), { mode: 0o600 });
+      }
+      writeFileSync(join(stateDir, "sessions", "sess_00000000000000fe.jsonl"), '{"ts":1}\n');
+      const out = join(dir, "b.tar.gz");
+      const result = await createStateBackup({ stateDir, outFile: out, crewhausVersion: "test" });
+      const archived = result.manifest.totals.files;
+      expect(archived).toBe(1);
+      expect([...result.defaultExcluded].sort()).toEqual([...DEFAULT_BACKUP_EXCLUDES].sort());
+      if (process.platform !== "win32") expect(statSync(out).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    const bullet = bulletFor("leave a harness's run tokens out").replace(/\s+/g, " ");
+    for (const rel of DEFAULT_BACKUP_EXCLUDES) expect(bullet).toContain(`\`.crewhaus/${rel}\``);
+    expect(bullet).toContain("`crewhaus state backup --include <glob>`");
+    expect(bullet).toContain("`0600`");
+    expect(bullet).toContain("`--archive`");
+  });
+
+  test("only the backup verb passes includeGlobs; retire never keeps a run token", () => {
+    const cli = readFileSync(join(ROOT, "apps", "cli", "src", "index.ts"), "utf8");
+    const calls = cli.split("createStateBackup({").slice(1);
+    expect(calls).toHaveLength(2);
+    const bodies = calls.map((c) => c.slice(0, c.indexOf("})")));
+    expect(bodies.filter((b) => b.includes("includeGlobs"))).toHaveLength(1);
+    expect(bodies[0]).toContain("includeGlobs");
+    expect(bodies[1]).not.toContain("includeGlobs");
+  });
+
+  test("retire removes the run tokens from the state it keeps in its archive", async () => {
+    const { RUN_TOKEN_FILES, DEFAULT_BACKUP_EXCLUDES, removeRunTokens } = await import(
+      "../apps/cli/src/state-backup"
+    );
+    for (const rel of RUN_TOKEN_FILES) expect(DEFAULT_BACKUP_EXCLUDES).toContain(rel);
+    // retire moves the live state to `<archive>/crewhaus-state`, and the CLI
+    // strips the run tokens from exactly that directory.
+    const retire = readFileSync(
+      join(ROOT, "packages", "harness-lifecycle", "src", "retire.ts"),
+      "utf8",
+    );
+    expect(retire.split('join(plan.archiveDir, "crewhaus-state")')).toHaveLength(2);
+    // `crewhaus retire` runs its steps in `retire-cmd.ts`, which `runRetire` calls.
+    const cli = readFileSync(join(ROOT, "apps", "cli", "src", "retire-cmd.ts"), "utf8");
+    expect(
+      cli.split('removeRunTokens(join(plan.archiveDir, "crewhaus-state"))').slice(1),
+    ).toHaveLength(1);
+
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-retire-")));
+    try {
+      mkdirSync(join(dir, "run"), { recursive: true });
+      for (const rel of RUN_TOKEN_FILES) {
+        writeFileSync(join(dir, rel), randomBytes(24).toString("hex"), { mode: 0o600 });
+      }
+      expect(removeRunTokens(dir)).toEqual([...RUN_TOKEN_FILES].sort());
+      for (const rel of RUN_TOKEN_FILES) expect(existsSync(join(dir, rel))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -4733,6 +4866,310 @@ describe("run records, structured recall, context_assembled, ledger labels, comp
     const bullet = bulletFor("A compaction summary carries its origin into the run.");
     expect(bullet).toContain("`compaction`");
     expect(bullet).toContain("egress check");
+  });
+});
+
+describe("spans nest from turn to tool to check, and every check writes a verdict", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  /** A scripted adapter: one script of tool calls, then a closing answer. */
+  const scriptedCalls = (calls: ReadonlyArray<{ id: string; name: string; input: unknown }>) => {
+    let n = 0;
+    return {
+      providerId: "anthropic" as const,
+      features: {
+        caching: "explicit" as const,
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      estimateTokens: () => 0,
+      stream: () => {
+        n += 1;
+        const first = n === 1;
+        return (async function* () {
+          yield { kind: "message_start" as const };
+          if (first) {
+            for (const [index, call] of calls.entries()) {
+              yield {
+                kind: "content_block_start" as const,
+                index,
+                block: { type: "tool_use" as const, id: call.id, name: call.name, input: {} },
+              };
+              yield {
+                kind: "content_block_delta" as const,
+                index,
+                delta: {
+                  type: "input_json_delta" as const,
+                  partial_json: JSON.stringify(call.input),
+                },
+              };
+              yield { kind: "content_block_stop" as const, index };
+            }
+          } else {
+            yield {
+              kind: "content_block_start" as const,
+              index: 0,
+              block: { type: "text" as const, text: "" },
+            };
+            yield {
+              kind: "content_block_delta" as const,
+              index: 0,
+              delta: { type: "text_delta" as const, text: "done" },
+            };
+            yield { kind: "content_block_stop" as const, index: 0 };
+          }
+          yield {
+            kind: "message_delta" as const,
+            stopReason: first ? "tool_use" : "end_turn",
+            usage: { input: 1, output: 1 },
+          };
+          yield { kind: "message_stop" as const };
+        })();
+      },
+    };
+  };
+
+  type Line = { kind: string; payload: Record<string, unknown>; span?: string };
+  const linesOf = (dir: string, sessionId: string): Line[] =>
+    readFileSync(join(dir, "sessions", `${sessionId}.jsonl`), "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l) as Line);
+
+  test("three calls run at once each nest their checks under their own span, and the log closes every span", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { normalizeText } = await import("../packages/tool-text/src/index");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-spans-")));
+    try {
+      const runContext = createRunContext();
+      const events: Array<{
+        kind: string;
+        spanId: string;
+        parentSpanId?: string;
+        toolUseId?: string;
+      }> = [];
+      runContext.eventBus.subscribe((e) => {
+        events.push(e as (typeof events)[number]);
+      });
+      await runChatLoop({
+        model: "test-model",
+        instructions: "x",
+        tools: [normalizeText],
+        sessionRootDir: join(dir, "sessions"),
+        runLedgerDir: dir,
+        settingsDir: dir,
+        permissionMode: "bypass",
+        runContext,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        installSigintHandler: false,
+        spinner: false,
+        stdout: () => {},
+        _adapter: scriptedCalls(
+          ["a", "b", "c"].map((t) => ({
+            id: `tu_${t}`,
+            name: "NormalizeText",
+            input: { text: t },
+          })),
+        ) as never,
+      });
+      const starts = events.filter((e) => e.kind === "tool_call_start");
+      expect(starts).toHaveLength(3);
+      const spanOf = new Map(starts.map((s) => [s.toolUseId, s.spanId]));
+      const decisions = events.filter((e) => e.kind === "permission_decision");
+      expect(decisions).toHaveLength(3);
+      for (const d of decisions) expect(d.parentSpanId).toBe(spanOf.get(d.toolUseId) as string);
+      const closed = linesOf(dir, runContext.sessionId)
+        .filter((l) => l.kind === "span_closed")
+        .map((l) => l.payload["kind"]);
+      for (const kind of ["run", "turn", "model"]) expect(closed).toContain(kind);
+      expect(closed.filter((k) => k === "tool")).toHaveLength(3);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Trace spans nest from turn to tool to check.");
+    for (const word of [
+      "`span_closed`",
+      "`span`",
+      "`crewhaus.retry_of`",
+      "OTLP traces change shape",
+      "`CREWHAUS_RUN_STAMPS=0`",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  }, 20_000); // imports the whole runtime the first time it runs
+
+  test("the audit records carry exactly their documented keys, and a denied call's verdict names it", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { normalizeText } = await import("../packages/tool-text/src/index");
+    const { APPROVALS_DIGEST_KEY_FILE } = await import("../packages/session-store/src/index");
+    const { ensureDigestKey } = await import("../packages/control-records/src/index");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-verdicts-")));
+    try {
+      mkdirSync(join(dir, "sessions"), { recursive: true });
+      await ensureDigestKey(join(dir, "sessions"), { file: APPROVALS_DIGEST_KEY_FILE });
+      const records: Array<{ kind: string; payload: Record<string, unknown> }> = [];
+      const sink = {
+        async append(input: { readonly kind: string; readonly payload: unknown }) {
+          records.push({ kind: input.kind, payload: input.payload as Record<string, unknown> });
+          return undefined;
+        },
+      };
+      const send = {
+        ...normalizeText,
+        name: "Send",
+        scope: "external" as const,
+        requireJustification: true,
+      };
+      const runContext = createRunContext();
+      const secret = "the vault code is 7741-alpha-omega";
+      tagContent(runContext, secret, "tool");
+      const common = {
+        model: "test-model",
+        instructions: "x",
+        sessionRootDir: join(dir, "sessions"),
+        runLedgerDir: dir,
+        settingsDir: dir,
+        singleTurn: true as const,
+        seedMessages: [{ role: "user" as const, content: "go" }],
+        installSigintHandler: false,
+        spinner: false,
+        stdout: () => {},
+      };
+      await runChatLoop({
+        ...common,
+        tools: [send],
+        permissionMode: "bypass",
+        runContext,
+        justificationJudge: async () => ({ allow: true, reason: "fits", judgeModel: "judge" }),
+        justificationAuditSink: sink,
+        egressAuditSink: sink,
+        resolveSinkScope: () => "external-configured",
+        _adapter: scriptedCalls([
+          { id: "tu_1", name: "Send", input: { text: secret, justification: "needed" } },
+        ]) as never,
+      });
+      const keysOf = (kind: string) =>
+        Object.keys(records.find((r) => r.kind === kind)?.payload ?? {}).sort();
+      expect(keysOf("permission_justification_evaluated")).toEqual(
+        [
+          "toolName",
+          "justification",
+          "verdict",
+          "reason",
+          "judgeModel",
+          "runId",
+          "sessionId",
+          "toolUseId",
+          "actionDigest",
+        ].sort(),
+      );
+      expect(keysOf("egress_decision")).toEqual(
+        [
+          "sinkId",
+          "sinkScope",
+          "verdict",
+          "originsFound",
+          "matchCount",
+          "runId",
+          "sessionId",
+          "toolUseId",
+          "actionDigest",
+        ].sort(),
+      );
+
+      const denied = createRunContext();
+      await runChatLoop({
+        ...common,
+        tools: [normalizeText],
+        permissionMode: "default",
+        permissionRules: {
+          flag: [],
+          settings: [],
+          yaml: [{ type: "alwaysDeny", pattern: "NormalizeText", source: "yaml" }],
+          hooks: [],
+          builtin: [],
+        },
+        runContext: denied,
+        _adapter: scriptedCalls([
+          { id: "tu_denied", name: "NormalizeText", input: { text: "x" } },
+        ]) as never,
+      });
+      const verdict = linesOf(dir, denied.sessionId).find(
+        (l) => l.kind === "verdict" && l.payload["gate"] === "permission",
+      );
+      expect(verdict?.payload).toMatchObject({
+        outcome: "deny",
+        on: { kind: "tool", toolUseId: "tu_denied", call: 1 },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Every check writes a `verdict` line");
+    for (const word of [
+      "`verdict`",
+      "`toolUseId`",
+      "`runId`",
+      "`sessionId`",
+      "`actionDigest`",
+      "never a judge's or a hook's own words",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  }, 20_000); // imports the whole runtime the first time it runs
+});
+
+describe("the release notes name what retire and Home's drain change for every harness", () => {
+  const read = (rel: string): string => readFileSync(join(ROOT, rel), "utf8");
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  test("`crewhaus retire` refuses a running daemon without --stop, and ends what the harness could do", async () => {
+    const { buildRetirementPlan, PRE_ARCHIVE_STEPS, POST_ARCHIVE_STEPS } = await import(
+      "../packages/harness-lifecycle/src/retire"
+    );
+    const plan = (daemonLive: boolean, stop: boolean) =>
+      buildRetirementPlan({
+        specName: "default-on",
+        harnessDir: ROOT,
+        archiveDir: join(ROOT, "never-written"),
+        pins: {},
+        force: false,
+        pushKnowledge: false,
+        control: { daemonLive, stop, revokerItems: [] },
+      });
+    expect(() => plan(true, false)).toThrow("crewhaus retire --stop");
+    const steps = plan(true, true).steps;
+    for (const step of [...PRE_ARCHIVE_STEPS, ...POST_ARCHIVE_STEPS]) expect(steps).toContain(step);
+    // The CLI is the host that runs them, from the daemon's liveness.
+    const cli = read("apps/cli/src/retire-cmd.ts");
+    expect(cli).toContain("control: { daemonLive: daemonIsLive(o.harnessDir, opts)");
+    expect(read("apps/cli/src/index.ts")).toContain("await retireCommand({");
+    const bullet = bulletFor("`crewhaus retire`");
+    expect(bullet).not.toBe("");
+    for (const word of ["--stop", "disabled", "standing rules", "registry", "lifecycle"]) {
+      expect(bullet).toContain(word);
+    }
+  });
+
+  test("a drain from Home goes through the supervisor, so a refused control call still stops the daemon", () => {
+    const server = read("packages/hangar-server/src/server.ts");
+    const at = server.indexOf('if (tail[0] === "drain") {');
+    expect(at).toBeGreaterThan(-1);
+    const route = server.slice(at, server.indexOf('throw new HttpError(404, "not found");', at));
+    expect(route).toContain("await handle.supervisor.drain(");
+    expect(route).toContain("viaSignal: true");
+    const bullet = bulletFor("A drain from Home");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("signal");
+    expect(bullet).toContain("Home");
   });
 });
 

@@ -32,14 +32,21 @@
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { LocalIdentity } from "@crewhaus/access-control";
-import { EXIT_FOR_ERROR, EXIT_FOR_REJECTED_RECEIPT } from "@crewhaus/control-contract";
-import { ensureDigestKey, readHarnessIdentity } from "@crewhaus/control-records";
+import {
+  type CommandReceipt,
+  EXIT_FOR_ERROR,
+  EXIT_FOR_REJECTED_RECEIPT,
+} from "@crewhaus/control-contract";
+import { assertRunnable, ensureDigestKey, readHarnessIdentity } from "@crewhaus/control-records";
 import {
   type ControlService,
+  type OperatorControlKind,
   type Settlement,
   type StartHead,
   admitExplicitStart,
+  applyOperatorControl,
   currentLocalIdentity,
+  recordDesired,
   settleStart,
   settleStop,
   storedActorFor,
@@ -93,6 +100,7 @@ import { runDetail, runLogFile } from "@crewhaus/harness-supervisor/run-detail";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { hashSpecSource, readBundleSpecStamp } from "./bundle-manifest";
 import { envChainLines } from "./env-chain-view";
+import { IGNORE_PAUSE_NOTICE, entryRefusalLine } from "./operator-gate";
 import type { CliFamily } from "./verbs";
 import { cliVersion } from "./version";
 
@@ -146,6 +154,14 @@ const DAEMON_USAGE_LINES: readonly string[] = [
   "       --lane heartbeat|schedule [--reason R] path, via crewhaus.control.v1",
   "       (or --lane schedule:<name>)            for a named schedule lane",
   "  crewhaus daemon drain [<dir|hrn_id>]        stop intake, finish in-flight work, exit 0",
+  "  crewhaus daemon pause [<dir|hrn_id>]        pause new work: nothing new starts until",
+  "       [--quiet]                              resumed (--quiet: channels show no notice)",
+  "  crewhaus daemon resume [<dir|hrn_id>]       take new work again",
+  "  crewhaus daemon disable [<dir|hrn_id>]      nothing starts or runs, a supervisor start",
+  "                                              included, until it is enabled",
+  "  crewhaus daemon enable [<dir|hrn_id>]       allow starts and new work again",
+  "",
+  "  submit takes --ignore-pause to run once while new work is paused.",
   "",
   "  start | stop | restart also take --group <name> [--parallel] instead of a",
   "  harness: every member in the group's boot order (REVERSED for stop), set with",
@@ -194,6 +210,7 @@ export const CLI_FAMILY = {
         ack: "value",
         compile: "boolean",
         "no-compile": "boolean",
+        "ignore-pause": "boolean",
       },
     },
     stop: { flags: { grace: "value", group: "value", parallel: "boolean" } },
@@ -202,6 +219,10 @@ export const CLI_FAMILY = {
     logs: { flags: { tail: "value", follow: "boolean", run: "value" } },
     wake: { flags: { lane: "value", reason: "value" } },
     drain: { flags: {} },
+    pause: { flags: { quiet: "boolean" } },
+    resume: { flags: {} },
+    disable: { flags: {} },
+    enable: { flags: {} },
   },
 } as const satisfies CliFamily;
 
@@ -365,6 +386,8 @@ export function supervisorFor(
     },
     clock: opts.clock ?? systemClock,
     managerVersion: cliVersion() ?? "0.0.0",
+    // A person's start and stop are written down for the recovery that runs after a reboot.
+    recordDesired: (desired) => recordDesired(harness.dir, desired),
     plan: () =>
       buildSpawnPlan({
         harnessDir: harness.dir,
@@ -591,13 +614,20 @@ type Settled = { readonly result: DaemonCommandResult; readonly settle: Settleme
  * Run a verb as a command: recover this harness's unfinished commands (once per
  * process), write the `accepted` receipt, run the verb, and settle the receipt from what
  * it did. The verb's own lines stand, followed by the receipt's id. A refusal before
- * acceptance exits through the control band (50-56); a `rejected` receipt exits 55.
+ * acceptance exits through the control band (50-56); a `rejected` receipt exits 55, or
+ * 38 when the harness is disabled.
  */
 async function receipted(
   harness: ResolvedHarness,
-  kind: "controls.start" | "controls.restart" | "controls.stop" | "controls.drain",
+  kind:
+    | "controls.start"
+    | "controls.restart"
+    | "controls.stop"
+    | "controls.drain"
+    | OperatorControlKind,
   opts: DaemonCommandOptions,
-  verb: () => Promise<Settled>,
+  verb: (receipt: CommandReceipt) => Promise<Settled>,
+  body?: Readonly<Record<string, unknown>>,
 ): Promise<DaemonCommandResult> {
   const control = directControl(opts);
   if (!recoveredHarnesses.has(harness.dir)) {
@@ -615,9 +645,10 @@ async function receipted(
       ...(target !== undefined ? { target } : {}),
       ledger: { harness: harness.dir },
       via: "cli",
+      ...(body !== undefined ? { body } : {}),
     },
-    async () => {
-      const done = await verb();
+    async (receipt) => {
+      const done = await verb(receipt);
       return { settle: done.settle, value: done.result };
     },
   );
@@ -632,7 +663,12 @@ async function receipted(
   const { id, state } = answer.receipt;
   if (state === "succeeded") return { lines: [...lines, `Done (${id})`], exitCode: 0 };
   if (state === "rejected") {
-    return { lines: [...lines, `Not done (${id})`], exitCode: EXIT_FOR_REJECTED_RECEIPT };
+    // A disabled harness exits with the operator-state code, whatever the verb.
+    const exitCode =
+      answer.receipt.outcome?.code === "disabled"
+        ? EXIT_FOR_ERROR.disabled
+        : EXIT_FOR_REJECTED_RECEIPT;
+    return { lines: [...lines, `Not done (${id})`], exitCode };
   }
   const exitCode = result === undefined || result.exitCode === 0 ? 1 : result.exitCode;
   return { lines: [...lines, `Not done (${id})`], exitCode };
@@ -734,6 +770,18 @@ async function daemonStart(
           };
         }
         switch (result.reason) {
+          case "disabled":
+            return {
+              settle,
+              result: {
+                lines: [
+                  result.kept === true
+                    ? keptLine(harness.specName, result.message)
+                    : `${harness.specName}: ${result.message}`,
+                ],
+                exitCode: EXIT_FOR_ERROR.disabled,
+              },
+            };
           case "already-running":
             return {
               settle,
@@ -1019,6 +1067,15 @@ async function daemonSubmit(
 ): Promise<DaemonCommandResult> {
   const args = parseVerbArgs("submit", argv, CLI_FAMILY.sub.submit.flags);
   const harness = resolveHarness(args.positional[0], opts);
+  // A submitted run is work with no one at the keyboard: paused or disabled, it does not run.
+  const ignorePause = args.flags.get("ignore-pause") === true;
+  const runnable = assertRunnable(harness.dir, { mode: "run", ignorePause });
+  if (!runnable.ok) {
+    return {
+      lines: [entryRefusalLine(harness.specName, runnable.reason, harness.dir)],
+      exitCode: EXIT_FOR_ERROR[runnable.exitName],
+    };
+  }
   if (!readsBriefOnStdin(harness.target)) {
     // Only the brief-taking shapes have an input document. Saying which verb
     // this harness DOES take is more useful than "unsupported".
@@ -1071,6 +1128,7 @@ async function daemonSubmit(
     if (result.ok) {
       return {
         lines: [
+          ...(runnable.pauseIgnored === true ? [IGNORE_PAUSE_NOTICE] : []),
           `${harness.specName}: submitted ${result.runId}${
             result.pid !== undefined ? ` (pid ${result.pid})` : ""
           }`,
@@ -1083,6 +1141,11 @@ async function daemonSubmit(
       };
     }
     switch (result.reason) {
+      case "disabled":
+        return {
+          lines: [`${harness.specName}: ${result.message}`],
+          exitCode: EXIT_FOR_ERROR.disabled,
+        };
       case "already-running":
         return {
           lines: [`${harness.specName}: a run is already in flight for this harness`],
@@ -1150,23 +1213,24 @@ async function daemonStop(
       // Adopt first: a daemon this process did not spawn is exactly the case
       // `stop` exists for, and without adoption there is no pid to signal.
       const adopted = await supervisor.adopt();
-      const nothingToStop = settleStop({ stopped: false, forced: false });
-      if (adopted === "none") {
-        return {
-          settle: nothingToStop,
-          result: { lines: [`${harness.specName}: not running (no runfile)`], exitCode: 0 },
-        };
-      }
-      if (adopted === "lost") {
-        return {
-          settle: nothingToStop,
-          result: {
-            lines: [
-              `${harness.specName}: the recorded daemon is gone — the stale runfile was cleared`,
-            ],
-            exitCode: 0,
-          },
-        };
+      if (adopted === "none" || adopted === "lost") {
+        // A person who stops a harness that is not running means it to stay stopped.
+        const desired = await desiredStopped(harness);
+        const nothingToStop = settleStop({ stopped: false, forced: false, desired });
+        return adopted === "none"
+          ? {
+              settle: nothingToStop,
+              result: { lines: [`${harness.specName}: not running (no runfile)`], exitCode: 0 },
+            }
+          : {
+              settle: nothingToStop,
+              result: {
+                lines: [
+                  `${harness.specName}: the recorded daemon is gone — the stale runfile was cleared`,
+                ],
+                exitCode: 0,
+              },
+            };
       }
       const result = await supervisor.stop(graceMs !== undefined ? { graceMs } : {});
       if (!result.stopped) {
@@ -1215,8 +1279,10 @@ async function drainOnce(harness: ResolvedHarness, opts: DaemonCommandOptions): 
   try {
     const adopted = await supervisor.adopt();
     if (adopted !== "adopted") {
+      // A person who drains a harness that is not running means it to stay stopped.
+      const desired = await desiredStopped(harness);
       return {
-        settle: settleStop({ stopped: false, forced: false }),
+        settle: settleStop({ stopped: false, forced: false, desired }),
         result: { lines: [`${harness.specName}: not running`], exitCode: 0 },
       };
     }
@@ -1263,6 +1329,69 @@ async function drainOnce(harness: ResolvedHarness, opts: DaemonCommandOptions): 
   } finally {
     supervisor.close();
   }
+}
+
+/** Record that the harness should stay stopped, for a stop or drain that found no daemon. */
+async function desiredStopped(harness: ResolvedHarness): Promise<"recorded" | "not-recorded"> {
+  const written = await recordDesired(harness.dir, "stopped");
+  return written.ok ? "recorded" : "not-recorded";
+}
+
+// ---------------------------------------------------------------------------
+// pause / resume / disable / enable
+// ---------------------------------------------------------------------------
+
+/**
+ * `crewhaus daemon pause|resume|disable|enable`: write the harness's operator record as a
+ * command, then ask a running daemon to read it now. The line says what the daemon made
+ * of it: confirmed, within a second, when it starts, or not enforced by an older build.
+ */
+async function daemonOperator(
+  verb: "pause" | "resume" | "disable" | "enable",
+  argv: readonly string[],
+  opts: DaemonCommandOptions,
+): Promise<DaemonCommandResult> {
+  const args = parseVerbArgs(verb, argv, CLI_FAMILY.sub[verb].flags);
+  const harness = resolveHarness(args.positional[0], opts);
+  const kind: OperatorControlKind = `controls.${verb}`;
+  const quiet = verb === "pause" && args.flags.get("quiet") === true;
+  const control = createControlClient(opts.fetch !== undefined ? { fetch: opts.fetch } : {});
+  const ops = opts.ops ?? createProcessOps();
+  return await receipted(
+    harness,
+    kind,
+    opts,
+    async (receipt) => {
+      // A daemon this terminal started announces its control port on stdout: pump once so
+      // the port reaches the runfile, as `wake` does.
+      const runfile = readRunfile(harness.dir);
+      if (runfile !== undefined && knownControlPort(runfile.controlPort) === undefined) {
+        const supervisor = supervisorFor(harness, opts, { enabled: false });
+        try {
+          if ((await supervisor.adopt()) === "adopted") supervisor.pumpNow();
+        } finally {
+          supervisor.close();
+        }
+      }
+      const done = await applyOperatorControl(
+        {
+          receipt,
+          harnessDir: harness.dir,
+          now: (opts.clock ?? systemClock).now,
+          probe: ops,
+        },
+        { kind, quiet, reload: (target) => control.reload(target) },
+      );
+      return {
+        settle: done.settle,
+        result: {
+          lines: [`${harness.specName}: ${done.line}`],
+          exitCode: done.settle.state === "succeeded" ? 0 : EXIT_FOR_ERROR.unavailable,
+        },
+      };
+    },
+    verb === "pause" ? { quiet } : undefined,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1859,6 +1988,11 @@ export async function runDaemonCommand(
       return await daemonStop(rest, opts);
     case "drain":
       return await daemonDrain(rest, opts);
+    case "pause":
+    case "resume":
+    case "disable":
+    case "enable":
+      return await daemonOperator(verb, rest, opts);
     case "wake":
       return await daemonWake(rest, opts);
     case "status":

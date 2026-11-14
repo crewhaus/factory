@@ -14,6 +14,7 @@
  * call, and nothing adjacent to it.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -419,6 +420,39 @@ describe("a session log that links outside the workspace", () => {
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+describe("a recorded call that carried a credential", () => {
+  test("gets no allow rule, and the answer names the tool, never the value", async () => {
+    // Built at runtime from parts, so no credential-shaped literal is committed.
+    const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+    const command = `curl -H "Authorization: Bearer ${token}" https://x.test`;
+    const sessions = path.join(tmp, "h", ".crewhaus", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(
+      path.join(sessions, "sess_00000000000000fd.jsonl"),
+      `${[
+        toolUse("Bash", { command }),
+        permissionAsk("Bash", "approved"),
+        permissionAsk("Bash", "approved"),
+        permissionAsk("Bash", "approved"),
+      ].join("\n")}\n`,
+    );
+
+    const raw = await permissionsSuggest.execute({ dir: "h" });
+    const out = JSON.parse(raw) as {
+      mined: { mined: string[] };
+      suggestions: Array<{ type: string; toolName: string }>;
+      unknown: Array<{ field: string; reason: string }>;
+    };
+    expect(out.mined.mined).toEqual(["sess_00000000000000fd"]);
+    expect(
+      out.suggestions.filter((s) => s.toolName === "Bash" && s.type === "alwaysAllow"),
+    ).toEqual([]);
+    const skipped = out.unknown.find((u) => u.field === "skipped");
+    expect(skipped?.reason).toContain("Bash: a recorded call carried a credential");
+    expect(raw.includes(token)).toBe(false);
   });
 });
 

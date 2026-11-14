@@ -364,6 +364,14 @@ export interface ControlPlane {
    * `runs.create`.
    */
   onClaim(handler: () => void | Promise<void>): void;
+  /**
+   * Register how this process counts the runs it is running. The last
+   * registration wins. On target `managed`, `/status` and the heartbeat
+   * answer this count; a counter that throws or answers anything but a
+   * non-negative safe integer reads as `null` ("could not determine"). Other
+   * targets count their runs by run holds and ignore it.
+   */
+  onActiveRuns(count: () => number): void;
 }
 
 /**
@@ -636,6 +644,7 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
   let server: { stop(closeActiveConnections?: boolean): unknown; port?: number } | undefined;
   let resolved: ResolvedControlToken | undefined;
   let claimHandler: (() => void | Promise<void>) | undefined;
+  let activeRunsCounter: (() => number) | undefined;
   let heartbeatHandle: unknown;
   const heartbeatFailures = new Set<string>();
   const timers = opts.timers ?? {
@@ -808,11 +817,24 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
   }
 
   /**
-   * Runs this process is running, or `null` where it cannot count them: a
-   * managed tenant's run and a run with run rows off take no hold.
+   * Runs this process is running, or `null` where it cannot count them. A
+   * managed plane answers its registered counter (with run rows on or off),
+   * and `null` while none is registered or when the counter throws or answers
+   * anything but a non-negative safe integer. Every other shape counts run
+   * holds, and answers `null` with run rows off (such a run takes no hold).
    */
   function activeRuns(): number | null {
-    return opts.target === "managed" || !runLedgerOn() ? null : activeRunCount();
+    if (opts.target === "managed") {
+      if (activeRunsCounter === undefined) return null;
+      let count: unknown;
+      try {
+        count = activeRunsCounter();
+      } catch {
+        return null;
+      }
+      return typeof count === "number" && Number.isSafeInteger(count) && count >= 0 ? count : null;
+    }
+    return !runLedgerOn() ? null : activeRunCount();
   }
 
   /** The controls `/status` says this daemon supports. */
@@ -837,6 +859,7 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
       operatorRev: operator.rev,
       paused: operator.paused,
       disabled: operator.disabled,
+      operatorUnreadable: operator.unreadable,
       activeRuns: activeRuns(),
       runLedger: runLedgerOn(),
     });
@@ -1337,6 +1360,10 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
 
     onClaim(handler): void {
       claimHandler = handler;
+    },
+
+    onActiveRuns(count): void {
+      activeRunsCounter = count;
     },
   };
 }

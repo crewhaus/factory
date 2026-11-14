@@ -5,11 +5,13 @@
  * reconciler serves start and restart, the two kinds that are not safe to repeat blindly.
  *
  * Activation's reconciler reads the deployment records, and the decision service's kinds
- * observe their own records (`./decision-runtime`). The operator record and run creation
- * get theirs with their writers. One run sweep closes a channel message whose daemon died
- * before its turn started ({@link channelRunSweep}).
+ * observe their own records (`./decision-runtime`). The operator controls write and observe
+ * the operator record (`./operator-controls`), and retire is observed in Home's lifecycle
+ * record (`./retire`). Run creation gets its reconciler with its writer. One run sweep
+ * closes a channel message whose daemon died before its turn started ({@link channelRunSweep}).
  */
 import type { CommandReceipt } from "@crewhaus/control-contract";
+import type { ReceiptEffect } from "@crewhaus/control-contract";
 import {
   type LedgerRecord,
   newestRunRows,
@@ -33,27 +35,59 @@ import {
   type Settlement,
   executorDead,
 } from "./executor";
+import {
+  OPERATOR_CONTROL_KINDS,
+  OPERATOR_EXECUTORS,
+  OPERATOR_RECONCILERS,
+} from "./operator-controls";
 import { NEEDS_DECISION, outcomeOf } from "./refusal";
+import { reconcileRetire } from "./retire";
 
 /** A restart refused before it stopped anything: the daemon it would replace still runs. */
 const KEPT_RUNNING = { kind: "daemon", status: "skipped", note: "kept running" } as const;
+
+/** Whether the operator record says what was asked: one effect, when the head recorded it. */
+function desiredEffect(
+  desired: "recorded" | "not-recorded" | undefined,
+  value: "running" | "stopped",
+): ReceiptEffect[] {
+  if (desired === undefined) return [];
+  return [
+    {
+      kind: "operator",
+      status: desired === "recorded" ? "done" : "failed",
+      observed: `desired ${value}`,
+    },
+  ];
+}
 
 /** A start or restart's answer, as a settlement. */
 export function settleStart(result: StartResult): Settlement {
   if (result.ok) {
     return {
       state: "succeeded",
-      effects: [{ kind: "daemon", status: "done", observed: "started" }],
+      effects: [
+        { kind: "daemon", status: "done", observed: "started" },
+        ...desiredEffect(result.desired, "running"),
+      ],
     };
   }
   if (result.kept === true) {
     return {
       state: "rejected",
       effects: [KEPT_RUNNING],
-      outcome: outcomeOf(result.reason === "already-running" ? "conflict" : "precondition_failed"),
+      outcome: outcomeOf(
+        result.reason === "already-running"
+          ? "conflict"
+          : result.reason === "disabled"
+            ? "disabled"
+            : "precondition_failed",
+      ),
     };
   }
   switch (result.reason) {
+    case "disabled":
+      return { state: "rejected", outcome: outcomeOf("disabled") };
     case "already-running":
       return { state: "rejected", outcome: outcomeOf("conflict") };
     case "preflight-blocked":
@@ -74,7 +108,10 @@ export function settleStop(result: StopResult): Settlement {
   if (result.stopped) {
     return {
       state: "succeeded",
-      effects: [{ kind: "daemon", status: "done", observed: "stopped" }],
+      effects: [
+        { kind: "daemon", status: "done", observed: "stopped" },
+        ...desiredEffect(result.desired, "stopped"),
+      ],
     };
   }
   if (result.reason === "not-adopted") {
@@ -86,7 +123,10 @@ export function settleStop(result: StopResult): Settlement {
   }
   return {
     state: "succeeded",
-    effects: [{ kind: "daemon", status: "skipped", note: "not running" }],
+    effects: [
+      { kind: "daemon", status: "skipped", note: "not running" },
+      ...desiredEffect(result.desired, "stopped"),
+    ],
   };
 }
 
@@ -200,15 +240,20 @@ export const CORE_RUNTIME: AreaRuntime = {
     "controls.restart": restart,
     "controls.drain": drain,
     "deployments.activate": activate,
+    ...OPERATOR_EXECUTORS,
     ...DECISION_EXECUTORS,
   },
   reconcilers: {
     "controls.start": reconcileDaemonStart,
     "controls.restart": reconcileDaemonStart,
     "deployments.activate": (receipt, ctx) => reconcileActivation(receipt, ctx),
+    ...OPERATOR_RECONCILERS,
+    // Retire has no executor: recovery leaves an interrupted one for a person, and the
+    // reconcile sweep reads Home's lifecycle record.
+    "controls.retire": reconcileRetire,
     ...DECISION_RECONCILERS,
   },
-  unsupervised: Object.keys(DECISION_EXECUTORS),
+  unsupervised: [...OPERATOR_CONTROL_KINDS, ...Object.keys(DECISION_EXECUTORS)],
   activationGates: [protectedEnvironmentGate],
   runSweeps: [channelRunSweep],
 };

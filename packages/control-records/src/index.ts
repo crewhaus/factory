@@ -92,6 +92,7 @@ export {
   readOperatorRecord,
   refreshOperatorRecord,
 } from "./operator";
+export { type OperatorChange, type OperatorWrite, writeOperatorRecord } from "./operator-write";
 export { type ApproverRead, createApproverReader, readApproverProjection } from "./approvers";
 export { type IntakeReason, type IntakeVerdict, intakeVerdict } from "./intake";
 export { intakeRoot, registerIntakeRoot, unregisterIntakeRoot } from "./intake-root";

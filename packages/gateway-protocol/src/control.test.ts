@@ -1428,6 +1428,43 @@ describe("status reports the operator record, the controls and the active runs",
     expect(typeof (await statusOf(harness().plane)).activeRuns).toBe("number");
   });
 
+  test("a managed plane answers its registered counter", async () => {
+    const managed = harness({ target: "managed" });
+    managed.plane.onActiveRuns(() => 2);
+    expect((await statusOf(managed.plane)).activeRuns).toBe(2);
+
+    // Run rows off: the managed counter still counts.
+    const off = harness({
+      target: "managed",
+      env: { CREWHAUS_CONTROL_TOKEN: TOKEN, CREWHAUS_RUN_LEDGER: "0" },
+    });
+    off.plane.onActiveRuns(() => 2);
+    expect((await statusOf(off.plane)).activeRuns).toBe(2);
+
+    // The last registration wins.
+    off.plane.onActiveRuns(() => 0);
+    expect((await statusOf(off.plane)).activeRuns).toBe(0);
+
+    // A counter that cannot answer a count is "could not determine", never zero.
+    for (const counter of [
+      () => {
+        throw new Error("count broke");
+      },
+      () => -1,
+      () => 1.5,
+      () => Number.NaN,
+    ]) {
+      const bad = harness({ target: "managed" });
+      bad.plane.onActiveRuns(counter);
+      expect((await statusOf(bad.plane)).activeRuns).toBeNull();
+    }
+
+    // Every other shape counts its run holds, whatever counter it is given.
+    const channel = harness();
+    channel.plane.onActiveRuns(() => 999);
+    expect((await statusOf(channel.plane)).activeRuns).toBe(activeRunCount());
+  });
+
   test("capabilities are control-contract names: pause for every shape but voice, runs.create only with a follower", async () => {
     const channel = harness();
     const listed = (await statusOf(channel.plane)).capabilities;
@@ -1554,6 +1591,7 @@ describe("the heartbeat", () => {
       operatorRev: 2,
       paused: true,
       disabled: false,
+      operatorUnreadable: false,
       activeRuns: activeRunCount(),
       runLedger: true,
     });
@@ -1570,6 +1608,66 @@ describe("the heartbeat", () => {
     await plane.stop();
     expect(cleared).toEqual([armed[0]?.handle]);
     expect(intakeRoot()).toBeUndefined();
+  });
+
+  test("a managed plane's heartbeat carries its registered count", async () => {
+    const armed: Array<() => void> = [];
+    const { plane } = harness({
+      target: "managed",
+      env: {},
+      now: () => Date.parse("2026-11-12T00:00:00.000Z"),
+      operatorRead: () => OPEN,
+      timers: {
+        setInterval: (fn) => {
+          armed.push(fn);
+          return 1;
+        },
+        clearInterval: () => undefined,
+      },
+    });
+    plane.onActiveRuns(() => 2);
+    await plane.start();
+    const file = join(tmp, CONTROL_RUN_DIR, "control-heartbeat.json");
+    expect((JSON.parse(readFileSync(file, "utf8")) as { activeRuns: unknown }).activeRuns).toBe(2);
+  });
+
+  test("an operator record that cannot be read beats as paused, unreadable and with no rev", async () => {
+    const armed: Array<() => void> = [];
+    // Readable at construction, so the boot goes ahead; unreadable by the first beat.
+    const operator = flippable(OPEN);
+    const { plane, exits } = harness({
+      env: {},
+      operatorRead: operator.read,
+      timers: {
+        setInterval: (fn) => {
+          armed.push(fn);
+          return 1;
+        },
+        clearInterval: () => undefined,
+      },
+    });
+    expect(exits).toEqual([]);
+    operator.set({ state: "unreadable", reason: "torn" });
+    await plane.start();
+    const file = join(tmp, CONTROL_RUN_DIR, "control-heartbeat.json");
+    const first = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    expect(first).toMatchObject({
+      operatorRev: null,
+      paused: true,
+      disabled: false,
+      operatorUnreadable: true,
+    });
+
+    operator.set(OPEN);
+    expect(armed).toHaveLength(1);
+    armed[0]?.();
+    const next = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    expect(next).toMatchObject({
+      operatorRev: null,
+      paused: false,
+      disabled: false,
+      operatorUnreadable: false,
+    });
   });
 
   test("a heartbeat that cannot be written is one stderr line per reason, never a throw", async () => {

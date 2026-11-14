@@ -5,6 +5,7 @@ import {
   type RuleType,
   narrowPatternFor,
 } from "@crewhaus/permission-engine";
+import { carriesCredential } from "@crewhaus/spec-patch";
 import {
   type OperativeArg,
   type RegisteredTool,
@@ -62,15 +63,20 @@ import { type SessionEvents, payloadOf } from "./advise-rules";
  * - `several-places` — one call acted on more than one place (a source and a
  *   destination, several recipients), which one rule value cannot cover;
  * - `not-representable` — a value cannot be written as a rule value: a path
- *   outside the workspace, text that is not a URL, a parenthesis, or a value
+ *   outside the workspace, text that is not a URL, a parenthesis, a value
  *   the rule written for it would not match (the proposal is checked against
- *   the call it came from, the way the engine reads it);
+ *   the call it came from, the way the engine reads it), or a value longer
+ *   than {@link MAX_RULE_VALUE_LENGTH};
  * - `every-value` — a call acted on every value at once (a listing by prefix
  *   or by pattern, a query with no filter), which only a wildcard rule
  *   covers, and a proposal never writes one;
- * - `varied` — the calls acted on different places.
+ * - `varied` — the calls acted on different places;
+ * - `carries-credential` — `carriesCredential` (`@crewhaus/spec-patch`)
+ *   flags a recorded call's value, so no sample, rule or report holds it. A
+ *   tool with this reason gets no `alwaysAllow` proposal at all
+ *   ({@link skippedSuggestions} names it).
  */
-export type UnscopedReason = NarrowRefusal | "varied";
+export type UnscopedReason = NarrowRefusal | "varied" | "carries-credential";
 
 export type AskAggregate = {
   readonly toolName: string;
@@ -175,8 +181,19 @@ function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup):
   return readingOf(narrowPatternFor(toolName, input, values));
 }
 
+/**
+ * The longest rule value a proposal names, in characters: far longer than
+ * any rule a person reviews. A longer value is `not-representable`, and the
+ * credential screen never runs on it.
+ */
+export const MAX_RULE_VALUE_LENGTH = 8192;
+
+/** A value `carriesCredential` flags is screened here, so it never becomes a
+ *  sample, a rule or an example in a report. */
 function readingOf(narrow: NarrowPattern): CallReading {
   if ("refused" in narrow) return unscoped(narrow.refused);
+  if (narrow.value.length > MAX_RULE_VALUE_LENGTH) return unscoped("not-representable");
+  if (carriesCredential(narrow.value)) return unscoped("carries-credential");
   return {
     kind: "value",
     value: narrow.value,
@@ -336,11 +353,13 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
   if (isArgScoped(agg)) return undefined;
   const reasons = agg.unscoped ?? [];
   const why: Record<UnscopedReason, string> = {
+    "carries-credential":
+      "a recorded call carried a credential, which a rule must never hold, so no rule names its value",
     undeclared: `${agg.toolName} does not declare which argument decides where it acts, so the proposal cannot be narrowed to the approved calls`,
     "no-scoping-argument": `${agg.toolName} has no argument that decides where it acts, so no rule can be narrower than the tool`,
     "not-parsed": "a recorded call no longer fits the tool's input, so what it acted on is unknown",
     "not-representable":
-      "an approved call acted on a place a rule cannot name (outside the workspace, not a URL, containing a parenthesis, or a value its own rule would not match)",
+      "an approved call acted on a place a rule cannot name (outside the workspace, not a URL, containing a parenthesis, a value its own rule would not match, or longer than any rule a person reviews)",
     "every-value":
       "an approved call acted on every value at once (a listing by prefix or by pattern, a query with no filter), which only a wildcard rule covers, and a proposal never widens what was approved",
     "several-places":
@@ -349,6 +368,7 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
     varied: `the approved calls acted on ${agg.argSamples.length === MAX_ARG_SAMPLES ? "many" : agg.argSamples.length} different places`,
   };
   const order: UnscopedReason[] = [
+    "carries-credential",
     "undeclared",
     "no-scoping-argument",
     "not-parsed",
@@ -372,6 +392,18 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
   return `BLANKET GRANT: this allows every ${agg.toolName} call — ${why[reason]}${example}`;
 }
 
+/** Whether an aggregate's asks meet the bar for an `alwaysAllow` proposal:
+ *  enough asks, none denied, and the approval rate met. */
+function meetsAllowBar(agg: AskAggregate, thresholds: SuggestThresholds): boolean {
+  if (agg.asks < thresholds.minAsks) return false;
+  return agg.denied === 0 && agg.approved / agg.asks >= thresholds.approveRate;
+}
+
+/** Whether a recorded call of this tool carried a credential. */
+function carriedCredential(agg: AskAggregate): boolean {
+  return (agg.unscoped ?? []).includes("carries-credential");
+}
+
 /**
  * Rank ask aggregates into reviewable permission suggestions. Deterministic:
  *   - recurring-APPROVED tools (100% approved, ≥ minAsks) → `alwaysAllow`,
@@ -381,6 +413,9 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
  *     by denial count.
  * Read-only-ness comes from the tool map; an unknown tool defaults to false
  * (treated as non-read-only ⇒ ranked after read-only grants).
+ *
+ * A tool a recorded call of which carried a credential gets no `alwaysAllow`,
+ * neither scoped nor for the whole tool: {@link skippedSuggestions} names it.
  */
 export function rankSuggestions(
   aggregates: ReadonlyMap<string, AskAggregate>,
@@ -393,11 +428,11 @@ export function rankSuggestions(
   for (const agg of aggregates.values()) {
     if (agg.asks < thresholds.minAsks) continue;
     const ro = readOnly.get(agg.toolName) ?? false;
-    const approveRate = agg.approved / agg.asks;
     const denyRate = agg.denied / agg.asks;
     const pattern = patternFor(agg);
 
-    if (agg.denied === 0 && approveRate >= thresholds.approveRate) {
+    if (meetsAllowBar(agg, thresholds)) {
+      if (carriedCredential(agg)) continue;
       const blanket = blanketGrantNote(agg);
       grants.push({
         rule: { type: "alwaysAllow", pattern, source: "settings" },
@@ -443,6 +478,38 @@ export function rankSuggestions(
   });
 
   return [...grants, ...tightenings];
+}
+
+/** A tool that met the bar for an `alwaysAllow` and gets none, and why. */
+export type PermissionSkip = {
+  readonly toolName: string;
+  readonly reason: "carries-credential";
+  readonly note: string;
+};
+
+/** The note a skipped tool carries. It names no value. */
+export const CARRIES_CREDENTIAL_NOTE =
+  "a recorded call carried a credential, so no allow rule is proposed; approve such calls one at a time";
+
+/**
+ * The tools {@link rankSuggestions} would propose an `alwaysAllow` for, but
+ * does not, because a recorded call carried a credential. Sorted by tool name.
+ * A skip names the tool and never the value.
+ */
+export function skippedSuggestions(
+  aggregates: ReadonlyMap<string, AskAggregate>,
+  thresholds: SuggestThresholds = DEFAULT_SUGGEST_THRESHOLDS,
+): PermissionSkip[] {
+  const out: PermissionSkip[] = [];
+  for (const agg of aggregates.values()) {
+    if (!meetsAllowBar(agg, thresholds) || !carriedCredential(agg)) continue;
+    out.push({
+      toolName: agg.toolName,
+      reason: "carries-credential",
+      note: CARRIES_CREDENTIAL_NOTE,
+    });
+  }
+  return out.sort((a, b) => a.toolName.localeCompare(b.toolName));
 }
 
 // -------- settings.json diff + merge --------

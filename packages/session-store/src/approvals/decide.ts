@@ -1198,3 +1198,77 @@ export async function sweepApprovals(
     return { evictedIds: evicted.map((r) => r.id), live };
   });
 }
+
+// ---------------------------------------------------------------------------
+// Expiring what is open, for a retired harness
+// ---------------------------------------------------------------------------
+
+/**
+ * Expire every pending request and every unspent grant in a session root, under the lock:
+ * for each one not already expired, an `expire` line with `reason` in the decision log,
+ * then the file rewritten with `expiredAt` set on it and every record kept, so a backup
+ * taken afterwards still holds them. What refuses a later decide or spend is the record's
+ * `expiredAt`, which every reader's effective state honours; a log line alone refuses
+ * nothing. A consumed grant, a deny and a superseded request are left as they are. A root
+ * with no approvals file, or one that folds to no record, is left alone and nothing is
+ * created.
+ *
+ * First consumer: the control service's retire.
+ */
+export async function expireOpenApprovals(
+  rootDir: string,
+  options: { readonly reason: "retired"; readonly now: () => Date },
+): Promise<{ readonly expired: readonly string[] }> {
+  const first = readApprovalsFile(rootDir);
+  if (first.state === "absent") return { expired: [] };
+  if (first.state === "unreadable") {
+    throw new RuntimeError(
+      `session-store: refusing to expire the approvals at ${first.path}: ${first.reason} (code ${first.code})`,
+    );
+  }
+  if (foldApprovalRecords(first.objects).records.length === 0) return { expired: [] };
+  const seam = seams;
+  return locked(rootDir, async (touch) => {
+    await repairAll(touch);
+    await seam.afterFold?.();
+    const nowMs = options.now().getTime();
+    const at = options.now().toISOString();
+    const order = [...touch.order];
+    // Repairs can park a fresh request that the file did not hold yet.
+    for (const id of touch.records.keys()) if (!order.includes(id)) order.push(id);
+    const kept: PendingApproval[] = [];
+    const expired: string[] = [];
+    for (const id of order) {
+      const record = touch.records.get(id);
+      if (record === undefined) continue;
+      if (
+        !expiresBeforeEviction(record) ||
+        effectiveDecisionState(record, null, nowMs).state === "expired"
+      ) {
+        kept.push(record);
+        continue;
+      }
+      await touch.log(record, {
+        event: "expire",
+        at,
+        surface: record.surface,
+        reason: options.reason,
+      });
+      const ended: PendingApproval = { ...record, expiredAt: at };
+      touch.records.set(id, ended);
+      kept.push(ended);
+      expired.push(id);
+    }
+    if (expired.length === 0) return { expired };
+    await seam.beforeRewrite?.();
+    const abs = approvalsFilePath(rootDir);
+    const written = writeFileSafe(
+      dirname(abs),
+      basename(abs),
+      `${kept.map((a) => JSON.stringify(a)).join("\n")}\n`,
+      { overwrite: true, mode: 0o600 },
+    );
+    if (!written.ok) throw refusal("write", "the approvals log", written);
+    return { expired };
+  });
+}

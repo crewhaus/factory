@@ -75,7 +75,9 @@ function modelWithProfile(payload: Record<string, unknown>, maxChars: number): s
  * lines the session JSONL now carries, one indented line each, so `sessions
  * tail` shows the shape of a hybrid turn beside its transcript. 0.8.0 adds
  * the provability gate's verdict (`provability_graded`) and each ProofCheck
- * run (`proof_checked`). Every field
+ * run (`proof_checked`); a gate's `verdict` line renders when it refused,
+ * warned, redacted or parked something (never for an `allow` or a `pass`).
+ * Every field
  * is duck-typed and optional (0.5.x lines carry fewer of them); a payload
  * that names nothing renderable still yields a line naming the kind. Every
  * string field is passed through {@link field} (one line, capped at
@@ -228,6 +230,20 @@ function formatRoutingEvent(
       }
       return parts.join(" ");
     }
+    case "verdict": {
+      // One gate's decision. Only the ones worth a reader's attention: a
+      // check that let a call through (`allow`, `pass`) stays quiet.
+      const outcome = f(payload["outcome"]);
+      if (outcome === undefined || outcome === "allow" || outcome === "pass") return undefined;
+      const parts = [`  ⚖ ${f(payload["gate"]) ?? "?"} ${outcome}`];
+      const on = payload["on"];
+      const toolUseId =
+        on !== null && typeof on === "object"
+          ? f((on as Record<string, unknown>)["toolUseId"])
+          : undefined;
+      if (toolUseId !== undefined) parts.push(toolUseId);
+      return parts.join(" ");
+    }
     default:
       return undefined;
   }
@@ -245,6 +261,7 @@ export const ROUTING_TAIL_KINDS: ReadonlySet<string> = new Set([
   "judge_verdict",
   "provability_graded",
   "proof_checked",
+  "verdict",
 ]);
 
 /** UTC HH:MM:SS for a session event's epoch-ms `ts` (deterministic across TZs). */

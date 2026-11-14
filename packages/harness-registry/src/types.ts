@@ -87,6 +87,9 @@ export type HangarHarnessEntry = {
   /** When the row was moved to another directory: it counts as adopted only once adopted
    *  there (`home`). */
   readonly relocatedAt?: string;
+  /** Retired: when, by whom (a stored actor ref) and by which command. The row stays, so
+   *  its history does, but no group walk starts it. User-managed, like `hidden`. */
+  readonly archived?: { readonly at: string; readonly by: string; readonly cmd: string };
   /** Unknown fields from newer writers, preserved on rewrite. */
   readonly [extra: string]: unknown;
 };

@@ -18,6 +18,11 @@ export type Heartbeat = {
   readonly operatorRev: number | null;
   readonly paused: boolean;
   readonly disabled: boolean;
+  /**
+   * `true` when `operator.json` could not be read: the daemon counts it as paused, and
+   * `operatorRev` is `null`.
+   */
+  readonly operatorUnreadable: boolean;
   /** Runs this process is running, or `null` where it cannot count them. */
   readonly activeRuns: number | null;
   /** Whether this process records run rows. */
@@ -45,6 +50,7 @@ export function writeHeartbeat(harnessDir: string, beat: Heartbeat): HeartbeatWr
       operatorRev: beat.operatorRev,
       paused: beat.paused,
       disabled: beat.disabled,
+      operatorUnreadable: beat.operatorUnreadable,
       activeRuns: beat.activeRuns,
       runLedger: beat.runLedger,
     };
