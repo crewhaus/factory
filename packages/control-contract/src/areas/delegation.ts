@@ -288,7 +288,13 @@ export type DelegationList = {
   readonly next?: string;
   readonly snapshotAt: string;
   readonly truncated?: { readonly reason: string; readonly verb?: string };
-  readonly empty?: { readonly reason: "not-allowed" | "no-data"; readonly remedy?: string };
+  readonly empty?: {
+    readonly reason: "not-allowed" | "no-data" | "unreadable";
+    readonly remedy?: string;
+    readonly verb?: string;
+  };
+  /** What could not be read, one sentence each; absent when everything was. */
+  readonly unreadable?: readonly string[];
   /** Whether the active deployment's agreement allows any delegation, and for how long. */
   readonly ceiling: { readonly present: boolean; readonly maxDays?: number };
   readonly offers: readonly DelegationOffer[];

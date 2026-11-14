@@ -12,6 +12,7 @@ import {
   GATE_IDS,
   type GateVerdict,
   authorizeDelegated,
+  commandLineOf,
   decidedByText,
   effectiveRuleState,
   normalizeRuleTerms,
@@ -483,6 +484,44 @@ describe("renderConsequences", () => {
     expect(() =>
       renderConsequences(page({ host: [{ template: "evidence.none", params: { x: "<b>" } }] })),
     ).toThrow("takes no parameter");
+  });
+
+  test("a name with a space is one quoted word on the CLI line, and the page still draws", () => {
+    const spaced = renderConsequences(
+      page({ harness: { id: "hrn_0123456789abcdef", name: "Support bot" } }),
+    );
+    expect(spaced.title).toBe("Let Support bot merge its own pull requests");
+    expect(spaced.argv.at(-1)).toBe("Support bot");
+    expect(spaced.text.trimEnd().split("\n").at(-1)).toBe(
+      "CLI: crewhaus delegations enable merge --harness hrn_0123456789abcdef --days 14 --confirm 'Support bot'",
+    );
+    expect(commandLineOf(["delegations", "show", "Support bot"])).toBe(
+      "delegations show 'Support bot'",
+    );
+    for (const bad of [["it's"], ["a\nb"], [""], [], [1]]) {
+      expect(commandLineOf(bad)).toBeUndefined();
+    }
+  });
+
+  test("the page's digest and a request's id go on its CLI line, never into its material", () => {
+    const digest = "e".repeat(64);
+    const proposal = mintId("dec");
+    const plain = renderConsequences(page());
+    const bound = renderConsequences(page({ digest, command: { kind: "enable", proposal } }));
+    expect(bound.argv.slice(-6)).toEqual([
+      "--proposal",
+      proposal,
+      "--digest",
+      digest,
+      "--confirm",
+      "codebase-steward",
+    ]);
+    expect(JSON.stringify(bound.material)).toBe(JSON.stringify(plain.material));
+    expect(JSON.stringify(bound.material)).not.toContain(digest);
+    expect(() => renderConsequences(page({ digest: "not-a-digest" }))).toThrow("not a digest");
+    expect(() =>
+      renderConsequences(page({ command: { kind: "enable", proposal: "dec_bad" } })),
+    ).toThrow("not a decision id");
   });
 
   test("every action has its title, does, if-wrong, never and label lines; every gate its line", () => {

@@ -12,12 +12,16 @@
  * else reads it. A page that changed while it was open is drawn again from the server's
  * answer, keeping the typed name and the focus.
  *
+ * An owner also sees each maintainer's request with Review request, which opens the same
+ * page with the request's terms; turning the rule on there answers the request.
+ *
  * Every call goes through `v1.js` by operation id. DOM by `createElement` and
  * `textContent` only. The models below are pure, so the tests read them without a DOM.
  */
 
 import { clear, el, statusBadge } from "../dom.js";
 import { hrefHarness } from "../router.js";
+import { reconcile } from "../ui/keyed.js";
 import { announce } from "../ui/live.js";
 import { call, createAction } from "../v1.js";
 
@@ -34,7 +38,53 @@ export const DELEGATIONS_COPY = Object.freeze({
   readOnly: "Only an owner can turn this on. You can read what it would do.",
   typeToConfirm: (name) => `Type ${name} to confirm`,
   changed: "What this means has changed. Read the page again before you confirm.",
+  asked: "Sent to the owner. They'll see it under Setup › Delegations.",
+  requests: "Asked for by a maintainer",
+  reviewRequest: "Review request",
+  requestGone: "This request is no longer waiting.",
 });
+
+const MONTHS = Object.freeze([
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+]);
+
+/** A time as a calendar date in words ("28 November 2026"), as the page writes it. */
+export function dateWords(iso) {
+  const ms = typeof iso === "string" ? Date.parse(iso) : Number.NaN;
+  if (!Number.isFinite(ms)) return null;
+  const d = new Date(ms);
+  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+}
+
+/** When a rule ends, in the right tense for its state. */
+function endsWords(state, iso) {
+  const date = dateWords(iso);
+  if (date === null) return null;
+  if (state === "active" || state === "suspended") return `Ends on ${date}`;
+  if (state === "expired") return `Ended on ${date}`;
+  // Turned off or used up before its end: the date it was set to end on.
+  return `Was set to end on ${date}`;
+}
+
+/** How often a rule was used, in words. */
+function usesWords(uses, maxUses) {
+  const n = Number.isSafeInteger(uses) && uses > 0 ? uses : 0;
+  const cap = Number.isSafeInteger(maxUses) && maxUses > 0 ? maxUses : undefined;
+  if (n === 0) return cap === undefined ? "Not used yet" : `Not used yet, of ${cap} times`;
+  if (cap !== undefined) return `Used ${n} of ${cap} times`;
+  return n === 1 ? "Used once" : `Used ${n} times`;
+}
 
 /** A rule's state as a word, and the mark beside it. Never colour alone. */
 export const STATE_WORDS = Object.freeze({
@@ -59,6 +109,7 @@ export const SUSPEND_WORDS = Object.freeze({
 
 const ACTIONS = Object.freeze(["merge", "rollout", "adopt", "assistant"]);
 const RULE_RE = /^rule_[0-9a-hjkmnp-tv-z]{26}$/;
+const DEC_RE = /^dec_[0-9a-hjkmnp-tv-z]{26}$/;
 
 /**
  * Which page the address names, from the rest of `#/h/<id>/setup/delegations/…`: the
@@ -69,6 +120,15 @@ export function routeOf(rest) {
   if (parts.length === 0) return { page: "list" };
   if (parts.length === 2 && parts[0] === "new" && ACTIONS.includes(parts[1])) {
     return { page: "new", action: parts[1] };
+  }
+  // A maintainer's request, answered from the same page with its terms.
+  if (
+    parts.length === 3 &&
+    parts[0] === "new" &&
+    ACTIONS.includes(parts[1]) &&
+    DEC_RE.test(parts[2])
+  ) {
+    return { page: "new", action: parts[1], proposal: parts[2] };
   }
   if (
     parts.length === 2 &&
@@ -114,23 +174,55 @@ export function listModel(list) {
       label: String(rule.label ?? ""),
       word: why === undefined ? known.word : `${known.word}: ${why}`,
       tone: known.tone,
-      ends: String(rule.endsAt ?? ""),
-      uses: `${Number(rule.uses ?? 0)}${rule.maxUses !== undefined ? ` of ${Number(rule.maxUses)}` : ""}`,
+      ends: endsWords(rule.state, rule.endsAt),
+      uses: usesWords(rule.uses, rule.maxUses),
       buttons,
     };
   });
+  const empty = list && typeof list.empty === "object" && list.empty !== null ? list.empty : {};
+  const unreadable = empty.reason === "unreadable";
   const state =
-    !allowed && rows.length === 0 ? "not-allowed" : rows.length === 0 ? "empty" : "rules";
+    rows.length > 0 ? "rules" : unreadable ? "unreadable" : !allowed ? "not-allowed" : "empty";
+  const labels = new Map(offers.map((offer) => [String(offer.action), String(offer.label)]));
+  const proposals = you.manage && Array.isArray(list?.proposals) ? list.proposals : [];
   return {
     state,
     sentence:
+      state === "unreadable"
+        ? String(empty.remedy ?? "This harness's records cannot be read.")
+        : state === "not-allowed"
+          ? DELEGATIONS_COPY.notAllowed
+          : state === "empty"
+            ? offers.length === 0
+              ? DELEGATIONS_COPY.noActions
+              : DELEGATIONS_COPY.canDelegate
+            : null,
+    // What fills the empty state: the server's own step, and who may take it.
+    remedy:
       state === "not-allowed"
-        ? DELEGATIONS_COPY.notAllowed
-        : state === "empty"
-          ? offers.length === 0
-            ? DELEGATIONS_COPY.noActions
-            : DELEGATIONS_COPY.canDelegate
-          : null,
+        ? typeof empty.remedy === "string"
+          ? empty.remedy
+          : "An owner allows delegation in this harness's agreement, then activates that build."
+        : null,
+    allowAgreement: state === "not-allowed" && you.manage,
+    emptyVerb: typeof empty.verb === "string" ? empty.verb : null,
+    unreadable: (Array.isArray(list?.unreadable) ? list.unreadable : []).map(String),
+    truncated:
+      list && typeof list.truncated === "object" && list.truncated !== null
+        ? {
+            reason: String(list.truncated.reason ?? ""),
+            verb: typeof list.truncated.verb === "string" ? list.truncated.verb : null,
+          }
+        : null,
+    // A maintainer's request, for the owner to answer: only an owner is shown one.
+    proposals: proposals.map((p) => ({
+      id: String(p.id),
+      action: String(p.action),
+      label: labels.get(String(p.action)) ?? String(p.action),
+      days: Number(p.days),
+      text: `${labels.get(String(p.action)) ?? String(p.action)}, for ${Number(p.days)} days. The request ${dateWords(p.expiresAt) === null ? "expires soon" : `expires on ${dateWords(p.expiresAt)}`}.`,
+      verb: String(p.verb ?? ""),
+    })),
     // A kind is offered only when the agreement allows it and Home can do it.
     offers: offers.map((offer) => ({
       action: String(offer.action),
@@ -192,20 +284,55 @@ function errorLine(error) {
   ]);
 }
 
-async function drawList(root, ctx) {
+/** The list's parts that outlive a redraw, per root, so kept rows keep their focus. */
+const LISTS = new WeakMap();
+
+/**
+ * The list. Drawn again after Pause or Turn off: rows are reconciled by rule id, so a row
+ * that did not change is kept as it is, and focus moves to the acted-on row's first
+ * remaining control, its label, or the heading when the row is gone.
+ */
+async function drawList(root, ctx, focusRule) {
   const answer = await call("delegations.list", { params: { h: ctx.id } });
-  clear(root);
-  root.appendChild(el("h2", { text: "Delegations" }));
+  let parts = LISTS.get(root);
+  if (parts === undefined || parts.list.parentNode !== root) {
+    clear(root);
+    parts = {
+      heading: el("h2", { tabindex: "-1", text: "Delegations" }),
+      head: el("div", { class: "delegations-head" }),
+      list: el("ul", { class: "delegation-rules" }),
+      foot: el("div", { class: "delegations-foot" }),
+    };
+    for (const node of [parts.heading, parts.head, parts.list, parts.foot]) root.appendChild(node);
+    LISTS.set(root, parts);
+  }
+  const { head, list, foot } = parts;
+  clear(head);
+  clear(foot);
+  const listTwin = `crewhaus delegations list --harness ${ctx.id}`;
   if (!answer.ok) {
-    root.appendChild(errorLine(answer.error));
-    root.appendChild(twin(`crewhaus delegations list --harness ${ctx.id}`));
+    head.appendChild(errorLine(answer.error));
+    reconcile(list, [], { keyOf: (r) => r.id, create: () => el("li") });
+    foot.appendChild(twin(listTwin));
     return;
   }
   const model = listModel(answer.body);
-  root.appendChild(el("p", { class: "muted", text: model.note }));
-  if (model.sentence !== null) root.appendChild(el("p", { text: model.sentence }));
-  if (model.state === "not-allowed") {
-    root.appendChild(
+  head.appendChild(el("p", { class: "muted", text: model.note }));
+  for (const line of model.unreadable) {
+    head.appendChild(
+      el("p", { class: "muted" }, [el("span", { "aria-hidden": "true", text: "⚠ " }), line]),
+    );
+  }
+  if (model.truncated !== null) {
+    head.appendChild(el("p", { class: "muted", text: "Only part of this list is shown here." }));
+    if (model.truncated.verb !== null) head.appendChild(twin(model.truncated.verb));
+  }
+  if (model.sentence !== null) head.appendChild(el("p", { text: model.sentence }));
+  if (model.remedy !== null) head.appendChild(el("p", { class: "muted", text: model.remedy }));
+  if (model.state === "unreadable" && model.emptyVerb !== null)
+    head.appendChild(twin(model.emptyVerb));
+  if (model.allowAgreement) {
+    head.appendChild(
       el("a", {
         class: "btn",
         href: hrefHarness(ctx.id, "setup", "spec"),
@@ -214,7 +341,7 @@ async function drawList(root, ctx) {
     );
   }
   for (const offer of model.offers) {
-    root.appendChild(
+    head.appendChild(
       el("p", {}, [
         el("a", {
           class: "btn",
@@ -224,12 +351,49 @@ async function drawList(root, ctx) {
       ]),
     );
   }
-  if (model.rows.length > 0) {
-    const list = el("ul", { class: "delegation-rules" });
-    for (const row of model.rows) list.appendChild(ruleRow(row, ctx, () => drawList(root, ctx)));
-    root.appendChild(list);
+  if (model.proposals.length > 0) {
+    head.appendChild(el("h3", { text: DELEGATIONS_COPY.requests }));
+    const requests = el("ul", { class: "delegation-requests" });
+    for (const proposal of model.proposals) {
+      requests.appendChild(
+        el("li", {}, [
+          el("p", { text: proposal.text }),
+          el("a", {
+            class: "btn",
+            href: hrefHarness(ctx.id, "setup", "delegations", "new", proposal.action, proposal.id),
+            text: DELEGATIONS_COPY.reviewRequest,
+          }),
+          twin(proposal.verb),
+        ]),
+      );
+    }
+    head.appendChild(requests);
   }
-  root.appendChild(twin(`crewhaus delegations list --harness ${ctx.id}`));
+  const redraw = (ruleId) => drawList(root, ctx, ruleId);
+  reconcile(list, model.rows, {
+    keyOf: (row) => row.id,
+    create: (row) => {
+      const node = el("li", { class: "delegation-rule" });
+      fillRow(node, row, ctx, redraw);
+      return node;
+    },
+    update: (node, row) => {
+      // A row that reads the same is left alone, with whatever holds focus in it.
+      if (node.dataset.sig !== signatureOf(row)) fillRow(node, row, ctx, redraw);
+    },
+  });
+  foot.appendChild(twin(listTwin));
+  if (focusRule !== undefined) {
+    const node = [...list.children].find((child) => child.dataset.key === focusRule);
+    const target =
+      node?.querySelector("button, a") ?? node?.querySelector("[data-row-label]") ?? parts.heading;
+    target.focus();
+  }
+}
+
+/** What a row shows, as one string: a row whose signature is unchanged is not redrawn. */
+function signatureOf(row) {
+  return JSON.stringify([row.word, row.tone, row.ends, row.uses, row.buttons, row.label]);
 }
 
 const BUTTON_WORDS = Object.freeze({
@@ -239,7 +403,9 @@ const BUTTON_WORDS = Object.freeze({
   revoke: "Turn off",
 });
 
-function ruleRow(row, ctx, redraw) {
+function fillRow(node, row, ctx, redraw) {
+  clear(node);
+  node.dataset.sig = signatureOf(row);
   const status = el("p", { class: "muted", role: "status", "aria-live": "polite" });
   const buttons = row.buttons.map((name) => {
     if (name === "resume" || name === "change") {
@@ -260,7 +426,7 @@ function ruleRow(row, ctx, redraw) {
       button.disabled = false;
       if (answer.ok) {
         announce(name === "pause" ? "Paused." : "Turned off.");
-        await redraw();
+        await redraw(row.id);
         return;
       }
       status.textContent = `Not done: ${answer.error?.message ?? "Something went wrong."}`;
@@ -268,10 +434,11 @@ function ruleRow(row, ctx, redraw) {
     });
     return button;
   });
-  return el("li", { class: "delegation-rule" }, [
-    el("p", {}, [el("strong", { text: row.label })]),
+  const when = [row.ends, row.uses].filter((part) => typeof part === "string" && part !== "");
+  for (const child of [
+    el("p", { tabindex: "-1", "data-row-label": "" }, [el("strong", { text: row.label })]),
     el("p", {}, [statusBadge(row.tone, row.word)]),
-    el("p", { class: "muted", text: `Ends ${row.ends}. Used ${row.uses}.` }),
+    el("p", { class: "muted", text: when.map((part) => `${part}.`).join(" ") }),
     buttons.length > 0 ? el("div", { class: "row-actions" }, buttons) : null,
     status,
     twin(
@@ -279,7 +446,9 @@ function ruleRow(row, ctx, redraw) {
         ? `crewhaus delegations pause ${row.id} --harness ${ctx.id}`
         : `crewhaus delegations show ${row.id} --harness ${ctx.id}`,
     ),
-  ]);
+  ]) {
+    if (child !== null) node.appendChild(child);
+  }
 }
 
 /**
@@ -295,7 +464,13 @@ async function drawPage(root, ctx, route) {
       : undefined;
   const action = route.page === "new" ? route.action : rule?.action;
   const ask = (body) => call("delegations.preview", { params: { h: ctx.id }, body });
-  let days;
+  // A maintainer's request: its terms are where the page starts, and turning the rule on
+  // answers it.
+  const request =
+    route.proposal !== undefined && list.ok && Array.isArray(list.body?.proposals)
+      ? list.body.proposals.find((p) => p.id === route.proposal)
+      : undefined;
+  let days = request !== undefined && Number.isInteger(request.days) ? request.days : undefined;
   const previewBody = () => ({
     ...(route.page === "rule" ? { action, rule: route.rule, mode: route.mode } : { action }),
     ...(days !== undefined && route.mode !== "resume" ? { terms: { days } } : {}),
@@ -303,7 +478,9 @@ async function drawPage(root, ctx, route) {
   let answer =
     action === undefined
       ? { ok: false, error: { message: "This rule is not here." } }
-      : await ask(previewBody());
+      : route.proposal !== undefined && request === undefined
+        ? { ok: false, error: { message: DELEGATIONS_COPY.requestGone } }
+        : await ask(previewBody());
   let typed = "";
   let digest = answer.ok ? answer.body.consequencesDigest : undefined;
   const write =
@@ -396,7 +573,13 @@ async function drawPage(root, ctx, route) {
         const terms = days !== undefined && route.mode !== "resume" ? { terms: { days } } : {};
         const bodyFor = (bound) =>
           route.page === "new"
-            ? { action, ...terms, consequencesDigest: bound, confirm: typed }
+            ? {
+                action,
+                ...terms,
+                consequencesDigest: bound,
+                confirm: typed,
+                ...(route.proposal !== undefined ? { proposal: route.proposal } : {}),
+              }
             : route.mode === "resume"
               ? { expect: Number(rule?.revision), consequencesDigest: bound, confirm: typed }
               : {
@@ -406,6 +589,9 @@ async function drawPage(root, ctx, route) {
                   confirm: typed,
                 };
         const shown = answer.body.text;
+        // Whether the page the owner read had its digest: only a page without one (a
+        // harness with no key yet) is confirmed again on its own.
+        const hadDigest = digest !== undefined;
         let done = await write.run({ body: bodyFor(digest ?? "0".repeat(64)) });
         if (!done.ok && (done.status === 412 || done.error?.code === "precondition_failed")) {
           const fresh = await ask(previewBody());
@@ -413,9 +599,9 @@ async function drawPage(root, ctx, route) {
             answer = fresh;
             digest = fresh.body.consequencesDigest;
           }
-          // A harness with no key makes one as the rule is turned on: the same words, now
-          // with their digest, are confirmed once more. Different words are shown first.
-          if (fresh.ok && fresh.body.text === shown && digest !== undefined) {
+          // The key was made as the rule was turned on: the same words, now with their
+          // digest. Every other refusal shows the page as it is now and waits for a click.
+          if (!hadDigest && fresh.ok && fresh.body.text === shown && digest !== undefined) {
             done = await write.run({ body: bodyFor(digest) });
           } else {
             draw(DELEGATIONS_COPY.changed, true);
@@ -456,7 +642,7 @@ async function drawPage(root, ctx, route) {
         });
         askButton.disabled = false;
         status.textContent = done.ok
-          ? "Asked the owner. They decide from this page."
+          ? DELEGATIONS_COPY.asked
           : `Not done: ${done.error?.message ?? "Something went wrong."}`;
         askButton.focus();
       });
@@ -465,7 +651,8 @@ async function drawPage(root, ctx, route) {
       root.appendChild(el("p", { class: "muted", text: DELEGATIONS_COPY.readOnly }));
     }
     root.appendChild(status);
-    root.appendChild(twin(model.cli));
+    // A request's own line carries its id; any other page prints its exact command.
+    root.appendChild(twin(request !== undefined ? String(request.verb ?? model.cli) : model.cli));
     if (!keepFocus) heading.focus();
   };
   draw(null, false);

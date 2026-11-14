@@ -15,6 +15,7 @@ import {
   STATE_WORDS,
   SUSPEND_WORDS,
   confirms,
+  dateWords,
   listModel,
   pageModel,
   routeOf,
@@ -43,6 +44,14 @@ const row = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
+describe("dates in words", () => {
+  test("a time reads as its calendar date, and anything else as nothing", () => {
+    expect(dateWords("2026-11-28T09:14:03.512Z")).toBe("28 November 2026");
+    expect(dateWords("not a time")).toBeNull();
+    expect(dateWords(undefined)).toBeNull();
+  });
+});
+
 describe("the list", () => {
   test("no ceiling: nothing can be delegated, and the agreement is where to allow it", () => {
     const model = listModel({
@@ -56,8 +65,52 @@ describe("the list", () => {
     expect(model.sentence).toBe(
       "Nothing can be delegated on this harness yet. Its agreement doesn't allow it.",
     );
+    // The step that fills it includes activating the build, and only an owner is offered it.
+    expect(model.remedy).toBe(
+      "An owner allows delegation in this harness's agreement, then activates that build.",
+    );
+    expect(model.allowAgreement).toBe(true);
     expect(SOURCE).toContain("DELEGATIONS_COPY.allowAgreement");
     expect(DELEGATIONS_COPY.allowAgreement).toBe("Allow in the agreement");
+    for (const you of [MAINTAINER, VIEWER]) {
+      const other = listModel({
+        items: [],
+        offers: [],
+        proposals: [],
+        ceiling: { present: false },
+        you,
+      });
+      expect(other).toMatchObject({ state: "not-allowed", allowAgreement: false });
+      expect(other.remedy).toContain("then activates that build");
+    }
+  });
+
+  test("records that cannot be read say so, never that the agreement forbids it", () => {
+    const model = listModel({
+      items: [],
+      offers: [],
+      proposals: [],
+      ceiling: { present: false },
+      empty: {
+        reason: "unreadable",
+        remedy:
+          "Whether this harness may delegate is unknown: its deployment records cannot be read (bad line).",
+        verb: "crewhaus delegations list --harness hrn_1",
+      },
+      unreadable: ["The deployment records cannot be read: bad line"],
+      truncated: { reason: "log_cap", verb: "crewhaus delegations list --harness hrn_1" },
+      you: OWNER,
+    });
+    expect(model.state).toBe("unreadable");
+    expect(model.sentence).toContain("cannot be read");
+    expect(model.sentence).not.toContain("doesn't allow");
+    expect(model.allowAgreement).toBe(false);
+    expect(model.emptyVerb).toBe("crewhaus delegations list --harness hrn_1");
+    expect(model.unreadable).toEqual(["The deployment records cannot be read: bad line"]);
+    expect(model.truncated).toEqual({
+      reason: "log_cap",
+      verb: "crewhaus delegations list --harness hrn_1",
+    });
   });
 
   test("a ceiling and no rules: what asks a person, and a button only for an offered kind", () => {
@@ -97,7 +150,8 @@ describe("the list", () => {
     expect(list(OWNER).rows[0]).toMatchObject({
       word: "Active",
       tone: "ok",
-      uses: "2",
+      ends: "Ends on 28 November 2026",
+      uses: "Used 2 times",
       buttons: ["pause", "change", "revoke"],
     });
     expect(list(MAINTAINER).rows[0]?.buttons).toEqual(["pause"]);
@@ -110,19 +164,85 @@ describe("the list", () => {
     expect(list(OWNER, paused).rows[0]).toMatchObject({
       word: "Paused: its owner is no longer an owner",
       tone: "warn",
-      uses: "2 of 5",
+      ends: "Ends on 28 November 2026",
+      uses: "Used 2 of 5 times",
       buttons: ["resume", "revoke"],
     });
     expect(list(MAINTAINER, paused).rows[0]?.buttons).toEqual([]);
     expect(list(OWNER, row({ state: "expired" })).rows[0]).toMatchObject({
       word: "Ended",
+      ends: "Ended on 28 November 2026",
       buttons: [],
     });
+    expect(list(OWNER, row({ state: "revoked", uses: 0 })).rows[0]).toMatchObject({
+      ends: "Was set to end on 28 November 2026",
+      uses: "Not used yet",
+    });
+    expect(list(OWNER, row({ uses: 1 })).rows[0]?.uses).toBe("Used once");
+    // No machine time in what a person reads.
+    expect(JSON.stringify(list(OWNER).rows[0])).not.toContain("T12:00");
     // A caller the server said nothing about is offered nothing.
     expect(listModel({ items: [row()], ceiling: { present: true } }).rows[0]?.buttons).toEqual([]);
     for (const state of Object.keys(STATE_WORDS))
       expect(STATE_WORDS[state].word.length).toBeGreaterThan(2);
     expect(Object.keys(SUSPEND_WORDS)).toHaveLength(8);
+  });
+});
+
+describe("a maintainer's request", () => {
+  const PROPOSAL = {
+    id: "dec_01m76e6f05hp514w9j4v3qymkb",
+    action: "merge",
+    days: 7,
+    createdAt: "2026-11-14T09:00:00.000Z",
+    expiresAt: "2026-11-21T09:00:00.000Z",
+    verb: "crewhaus delegations enable merge --harness hrn_1 --days 7 --proposal dec_01m76e6f05hp514w9j4v3qymkb",
+  };
+  const OFFER = {
+    action: "merge",
+    label: "Merges its own pull requests",
+    verb: "crewhaus delegations preview merge --harness hrn_1",
+  };
+
+  test("an owner sees each request with its terms; others are not shown one", () => {
+    const listed = (you: unknown) =>
+      listModel({
+        items: [],
+        offers: [OFFER],
+        proposals: [PROPOSAL],
+        ceiling: { present: true },
+        you,
+      });
+    expect(listed(OWNER).proposals).toEqual([
+      {
+        id: PROPOSAL.id,
+        action: "merge",
+        label: "Merges its own pull requests",
+        days: 7,
+        text: "Merges its own pull requests, for 7 days. The request expires on 21 November 2026.",
+        verb: PROPOSAL.verb,
+      },
+    ]);
+    expect(listed(MAINTAINER).proposals).toEqual([]);
+    expect(SOURCE).toContain("DELEGATIONS_COPY.reviewRequest");
+    expect(DELEGATIONS_COPY.reviewRequest).toBe("Review request");
+  });
+
+  test("its page is the new-rule page with the request's id, and turning on answers it", () => {
+    expect(routeOf(["new", "merge", PROPOSAL.id])).toEqual({
+      page: "new",
+      action: "merge",
+      proposal: PROPOSAL.id,
+    });
+    expect(routeOf(["new", "merge", "dec_x"])).toEqual({ page: "unknown" });
+    expect(SOURCE).toContain(
+      "...(route.proposal !== undefined ? { proposal: route.proposal } : {})",
+    );
+    // What the maintainer is told is where the owner will see it.
+    expect(DELEGATIONS_COPY.asked).toBe(
+      "Sent to the owner. They'll see it under Setup › Delegations.",
+    );
+    expect(SOURCE).not.toContain("They decide from this page.");
   });
 });
 
@@ -183,8 +303,23 @@ describe("the consequences page", () => {
     expect(SOURCE).toContain("draw(DELEGATIONS_COPY.changed, true)");
     expect(SOURCE).toContain("field.value = typed;");
     expect(SOURCE).toContain("if (keepFocus) field.focus();");
-    // The same words, now with their digest, are confirmed once more; others are shown first.
-    expect(SOURCE).toContain("fresh.body.text === shown");
+    // Only a page that had no digest is confirmed again on its own, and only with the
+    // same words: any other refusal waits for a fresh click on the page as it is now.
+    expect(SOURCE).toContain("const hadDigest = digest !== undefined;");
+    expect(SOURCE).toContain(
+      "if (!hadDigest && fresh.ok && fresh.body.text === shown && digest !== undefined) {",
+    );
+    expect(SOURCE.match(/write\.run\(/g)).toHaveLength(2);
+  });
+
+  test("after Pause or Turn off the list is reconciled by rule and focus stays on the row", () => {
+    expect(SOURCE).toContain('import { reconcile } from "../ui/keyed.js";');
+    expect(SOURCE).toContain("keyOf: (row) => row.id");
+    expect(SOURCE).toContain("await redraw(row.id);");
+    expect(SOURCE).toContain(
+      'node?.querySelector("button, a") ?? node?.querySelector("[data-row-label]") ?? parts.heading',
+    );
+    expect(SOURCE).toContain('el("h2", { tabindex: "-1", text: "Delegations" })');
   });
 });
 

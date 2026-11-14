@@ -8,9 +8,10 @@
  * |---|---|---|
  * | `list [--harness <h>] [--all]` · `show <rule>` | anyone | the rules, their state, ends and uses |
  * | `preview <action> --harness <h> [--days N] [--uses N]` | anyone | the consequences page, and the exact command that turns it on |
- * | `enable <action> --harness <h> --confirm <name>` | the owner | prints the page, then turns the rule on |
+ * | `enable <action> --harness <h>` | the owner | prints the page and the exact command that confirms it |
+ * | `enable <action> --harness <h> --digest <d> --confirm <name>` | the owner | turns the rule on, if the page still reads as it did |
  * | `propose <action> --harness <h>` | a maintainer | asks the owner for the rule |
- * | `change <rule> --expect N --confirm <name>` · `resume <rule> --expect N --confirm <name>` | the owner | a new revision, after its page |
+ * | `change <rule> --expect N` · `resume <rule> --expect N` | the owner | the same two steps: the page, then `--digest <d> --confirm <name>` |
  * | `pause <rule>` | a maintainer | stops it applying until an owner resumes it |
  * | `revoke <rule>` · `revoke --all` | the owner | turns it off |
  * | `apply [--harness <h>]` | an operator | one pass of what Home's sweep runs every minute |
@@ -56,15 +57,35 @@ export const CLI_FAMILY = {
     show: { flags: { harness: "value", json: "boolean" } },
     preview: { flags: { harness: "value", ...TERMS, json: "boolean" } },
     enable: {
-      flags: { harness: "value", ...TERMS, confirm: "value", proposal: "value", json: "boolean" },
+      flags: {
+        harness: "value",
+        ...TERMS,
+        digest: "value",
+        confirm: "value",
+        proposal: "value",
+        json: "boolean",
+      },
     },
     propose: { flags: { harness: "value", ...TERMS, json: "boolean" } },
     change: {
-      flags: { harness: "value", ...TERMS, confirm: "value", expect: "value", json: "boolean" },
+      flags: {
+        harness: "value",
+        ...TERMS,
+        digest: "value",
+        confirm: "value",
+        expect: "value",
+        json: "boolean",
+      },
     },
     pause: { flags: { harness: "value", reason: "value", json: "boolean" } },
     resume: {
-      flags: { harness: "value", confirm: "value", expect: "value", json: "boolean" },
+      flags: {
+        harness: "value",
+        digest: "value",
+        confirm: "value",
+        expect: "value",
+        json: "boolean",
+      },
     },
     revoke: { flags: { harness: "value", all: "boolean", expect: "value", json: "boolean" } },
     apply: { flags: { harness: "value", json: "boolean" } },
@@ -87,11 +108,12 @@ const USAGE = [
   "usage: crewhaus delegations list [--harness <h> | --all] [--json]",
   "       crewhaus delegations show <rule> --harness <h> [--json]",
   "       crewhaus delegations preview <action> --harness <h> [--days N] [--uses N] [--json]",
-  "       crewhaus delegations enable <action> --harness <h> [--days N] [--uses N] --confirm <name> [--proposal <dec_>]",
+  "       crewhaus delegations enable <action> --harness <h> [--days N] [--uses N] [--proposal <dec_>] [--digest <d> --confirm <name>]",
   "       crewhaus delegations propose <action> --harness <h> [--days N] [--uses N]",
-  "       crewhaus delegations change <rule> --harness <h> --expect N [--days N] [--uses N] --confirm <name>",
+  "       crewhaus delegations change <rule> --harness <h> --expect N [--days N] [--uses N] [--digest <d> --confirm <name>]",
   "       crewhaus delegations pause <rule> --harness <h> [--reason paused-by-member]",
-  "       crewhaus delegations resume <rule> --harness <h> --expect N --confirm <name>",
+  "       crewhaus delegations resume <rule> --harness <h> --expect N [--digest <d> --confirm <name>]",
+  "  Without --digest, enable, change and resume print the page and the exact command that confirms it.",
   "       crewhaus delegations revoke <rule> --harness <h> | revoke --all --harness <h>",
   "       crewhaus delegations apply [--harness <h>]",
   `  <action> is one of ${DELEGATION_ACTIONS.join(", ")}. <h> is a harness id, its name, or its directory.`,
@@ -253,10 +275,39 @@ const EXIT: Readonly<Record<DelegationRefusal["code"], number>> = {
 function refusedOut(sub: Sub, refusal: DelegationRefusal, json: boolean): DelegationsOut {
   return {
     lines: json
-      ? [JSON.stringify({ ok: false, code: refusal.code, reason: refusal.reason }, null, 2)]
+      ? [
+          JSON.stringify(
+            {
+              ok: false,
+              code: refusal.code,
+              reason: refusal.reason,
+              ...(refusal.page !== undefined ? { page: refusal.page } : {}),
+            },
+            null,
+            2,
+          ),
+        ]
       : [`delegations ${sub}: ${refusal.reason}`],
     exitCode: EXIT[refusal.code],
   };
+}
+
+/** A page's digest, as its CLI line prints it. */
+const DIGEST_RE = /^[0-9a-f]{64}$/;
+
+/** The page to read, and the line that confirms it: nothing was written. */
+function toConfirm(sub: Sub, page: DelegationPage, json: boolean): DelegationsOut {
+  const reason =
+    "Nothing changed yet. Read the page, then run the command on its CLI line to confirm.";
+  return json
+    ? {
+        lines: [JSON.stringify({ ok: false, code: "precondition-failed", reason, page }, null, 2)],
+        exitCode: EXIT["precondition-failed"],
+      }
+    : {
+        lines: [...pageLines(page), "", `delegations ${sub}: ${reason}`],
+        exitCode: EXIT["precondition-failed"],
+      };
 }
 
 /** The page in words: the server's own text, with the command that turns it on. */
@@ -379,9 +430,11 @@ export async function runDelegationsCommand(
           if (listings.length > 1) lines.push(`${harness.name} (${harness.id})`);
           if (listing.items.length === 0) {
             lines.push(
-              listing.ceiling.present
-                ? "No delegation rules yet."
-                : "Nothing can be delegated on this harness yet. Its agreement doesn't allow it.",
+              listing.empty?.reason === "unreadable"
+                ? (listing.empty.remedy ?? "The deployment records cannot be read.")
+                : listing.ceiling.present
+                  ? "No delegation rules yet."
+                  : "Nothing can be delegated on this harness yet. Its agreement doesn't allow it.",
             );
           }
           for (const rule of listing.items) {
@@ -447,30 +500,29 @@ export async function runDelegationsCommand(
       case "change":
       case "resume": {
         const harness = requireHarness(verb, args, deps);
-        const confirm = requireValue(verb, args, "confirm");
+        const digest = flagValue(args, "digest");
+        if (digest !== undefined && !DIGEST_RE.test(digest)) {
+          throw new Refused(
+            `delegations ${verb}: --digest is the digest on the page's CLI line`,
+            EXIT_FOR_ERROR.invalid,
+          );
+        }
+        // Without --digest nothing is written: the page is printed with the exact command
+        // that confirms it, so what is turned on is the page the owner read.
+        const confirm =
+          digest === undefined
+            ? (flagValue(args, "confirm") ?? "")
+            : requireValue(verb, args, "confirm");
         const service = control();
         const terms = termsOf(verb, args);
         const rule = verb === "enable" ? undefined : ruleIdOf(verb, args);
         const action = verb === "enable" ? actionOf(verb, args) : undefined;
+        const proposal = verb === "enable" ? flagValue(args, "proposal") : undefined;
         const expect =
           verb === "enable"
             ? undefined
             : (wholeNumber(verb, "expect", requireValue(verb, args, "expect")) as number);
-        // The page first: what this turns on, in the server's own words.
-        const shown =
-          verb === "enable"
-            ? await service.delegations.preview(harness, {
-                action: action as DelegationAction,
-                ...(terms !== undefined ? { terms } : {}),
-              })
-            : await service.delegations.previewRule(harness, {
-                rule: rule as string,
-                mode: verb === "change" ? "change" : "resume",
-                ...(terms !== undefined ? { terms } : {}),
-              });
-        if (!shown.ok) return refusedOut(verb, shown, json);
-        const lines = json ? [] : pageLines(shown.page);
-        const attempt = (digest: string) =>
+        const attempt = (bound: string) =>
           receipted(
             service,
             verb,
@@ -486,11 +538,9 @@ export async function runDelegationsCommand(
                 ? service.delegations.enable(harness, {
                     action: action as DelegationAction,
                     ...(terms !== undefined ? { terms } : {}),
-                    consequencesDigest: digest,
+                    consequencesDigest: bound,
                     confirm,
-                    ...(flagValue(args, "proposal") !== undefined
-                      ? { proposal: flagValue(args, "proposal") as string }
-                      : {}),
+                    ...(proposal !== undefined ? { proposal } : {}),
                     actor,
                     cmd,
                   })
@@ -499,7 +549,7 @@ export async function runDelegationsCommand(
                       rule: rule as string,
                       expect: expect as number,
                       ...(terms !== undefined ? { terms } : {}),
-                      consequencesDigest: digest,
+                      consequencesDigest: bound,
                       confirm,
                       actor,
                       cmd,
@@ -507,32 +557,45 @@ export async function runDelegationsCommand(
                   : service.delegations.resume(harness, {
                       rule: rule as string,
                       expect: expect as number,
-                      consequencesDigest: digest,
+                      consequencesDigest: bound,
                       confirm,
                       actor,
                       cmd,
                     }),
           );
-        let answer = await attempt(shown.page.consequencesDigest ?? "0".repeat(64));
-        // A harness with no key yet makes one as it turns the rule on: the page is the one
-        // just printed, now with its digest, so it is confirmed again with the same words.
-        if (
-          !answer.ok &&
-          answer.code === "precondition-failed" &&
-          shown.page.consequencesDigest === undefined &&
-          answer.page?.text === shown.page.text &&
-          answer.page.consequencesDigest !== undefined
-        ) {
-          answer = await attempt(answer.page.consequencesDigest);
+        if (digest === undefined) {
+          const shown =
+            verb === "enable"
+              ? await service.delegations.preview(harness, {
+                  action: action as DelegationAction,
+                  ...(terms !== undefined ? { terms } : {}),
+                })
+              : await service.delegations.previewRule(harness, {
+                  rule: rule as string,
+                  mode: verb === "change" ? "change" : "resume",
+                  ...(terms !== undefined ? { terms } : {}),
+                });
+          if (!shown.ok) return refusedOut(verb, shown, json);
+          if (shown.page.consequencesDigest !== undefined && proposal === undefined) {
+            return toConfirm(verb, shown.page, json);
+          }
+          // A harness with no key yet, or a request's own command line: asking once sets
+          // up the key and answers the page with its digest. Nothing is turned on.
+          const asked = await attempt("");
+          if (!asked.ok && asked.page?.consequencesDigest !== undefined) {
+            return toConfirm(verb, asked.page, json);
+          }
+          return asked.ok ? out([]) : refusedOut(verb, asked, json);
         }
+        const answer = await attempt(digest);
         if (!answer.ok) {
           const refused = refusedOut(verb, answer, json);
-          return { lines: [...lines, ...refused.lines], exitCode: refused.exitCode };
+          // A page that changed since it was read: the page as it is now, and its command.
+          const page = answer.page !== undefined && !json ? [...pageLines(answer.page), ""] : [];
+          return { lines: [...page, ...refused.lines], exitCode: refused.exitCode };
         }
         if (json) return out([JSON.stringify(answer, null, 2)]);
         return out([
-          ...lines,
-          "",
           `${verb === "enable" ? "Turned on" : verb === "change" ? "Changed" : "Resumed"}: ${answer.rule?.id ?? ""}`,
         ]);
       }

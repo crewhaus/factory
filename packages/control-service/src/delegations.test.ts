@@ -4,7 +4,16 @@
  * calls), on two command kinds no shipped runtime serves. Nothing ships a test kind.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   AREA_MODULES,
@@ -20,6 +29,7 @@ import type {
 } from "@crewhaus/control-contract/delegation";
 import {
   acquireMutatingLease,
+  appendDelegationLog,
   casAppend,
   controlPaths,
   decisionsLedger,
@@ -91,7 +101,7 @@ const KINDS = borrowedKinds();
 
 type Script = {
   verdicts: Partial<Record<GateId, Partial<GateVerdict> | "throw">>;
-  oneAtATime: boolean;
+  oneAtATime: boolean | ((log: readonly DelegationLogLine[]) => boolean);
   plan: RollbackPlan | undefined;
   revision: string | undefined;
   signal: SignalReading;
@@ -101,6 +111,10 @@ type Script = {
   /** Run while a gate answers, or while the rollback is planned. */
   duringGate?: () => Promise<void>;
   duringPlan?: () => Promise<void>;
+  /** Run inside the effect, after the grant is spent. */
+  duringEffect?: () => Promise<void>;
+  /** What the host says, as the page's lines. */
+  host?: { template: string; params?: Record<string, unknown> }[];
 };
 
 function script(): Script {
@@ -146,7 +160,7 @@ function fakeAction(s: Script): { action: DelegatedAction; runtime: AreaRuntime 
         ? { fields: {}, ceiling: ceiling["merge"] as Record<string, unknown> }
         : undefined,
     inScope: (_terms, _scope, subject) => subject.ref.startsWith(`${HRN}/`),
-    oneAtATime: () => s.oneAtATime,
+    oneAtATime: (log) => (typeof s.oneAtATime === "function" ? s.oneAtATime(log) : s.oneAtATime),
     planRollback: async () => {
       await s.duringPlan?.();
       return s.plan;
@@ -155,7 +169,7 @@ function fakeAction(s: Script): { action: DelegatedAction; runtime: AreaRuntime 
     signals: async () => s.signal,
     signalIds: ["base-checks"],
     watchMs: () => 60_000,
-    previewTerms: async () => [],
+    previewTerms: async () => s.host ?? [],
     executeKind: KINDS.execute,
     rollbackKind: KINDS.rollback,
   };
@@ -164,6 +178,7 @@ function fakeAction(s: Script): { action: DelegatedAction; runtime: AreaRuntime 
     executors: {
       [KINDS.execute]: delegatedExecutor(action, async () => {
         s.effects += 1;
+        await s.duringEffect?.();
         return { state: "succeeded" };
       }),
       [KINDS.rollback]: delegatedRollbackExecutor(async () => {
@@ -561,6 +576,20 @@ describe("a rule stays inside the ceiling", () => {
     }
   });
 
+  test("deployment records that cannot be read say so, never that the agreement forbids it", async () => {
+    const t = await setup({ ceiling: null, active: false });
+    const file = join(t.r.harness, controlPaths(t.r.harness).deploymentsFile);
+    rmSync(file, { recursive: true, force: true });
+    mkdirSync(file, { recursive: true });
+    const listed = t.service.list(t.harness);
+    expect(listed.empty).toMatchObject({
+      reason: "unreadable",
+      verb: `crewhaus delegations list --harness ${HRN}`,
+    });
+    expect(listed.empty?.remedy).toContain("cannot be read");
+    expect(listed.unreadable.length).toBeGreaterThan(0);
+  });
+
   test("the shipped composition serves no action, so every action is unsupported", async () => {
     const r = rig();
     await deploy(r.harness, {
@@ -819,6 +848,213 @@ describe("revocation", () => {
   });
 });
 
+describe("the effect checks again before it acts", () => {
+  /** What changed between the grant and the effect leaves the grant unspent and asks a person. */
+  async function refusedAtEffect(
+    t: Awaited<ReturnType<typeof setup>>,
+    reason: string,
+    supersede: string,
+  ) {
+    const d = await decision(t.r.harness);
+    await apply(t);
+    expect(t.s.effects).toBe(0);
+    const row = decisionRow(t.r.harness, d.id);
+    expect(row).toMatchObject({
+      state: "superseded",
+      resolvedBy: "delegation",
+      supersededReason: supersede,
+    });
+    expect(decisionRow(t.r.harness, row?.supersededBy as string)).toMatchObject({
+      state: "pending",
+      kind: "merge",
+      subject: d.subject,
+    });
+    const mine = linesOf(t.r.harness).filter((l) => l.decision === d.id);
+    expect(mine.at(-1)).toMatchObject({ event: "refused", reason });
+    expect(mine.map((l) => l.event)).not.toContain("acted");
+  }
+
+  test("the operator paused intake after the grant: paused", async () => {
+    const t = await setup();
+    ruleOf(await enable(t));
+    t.s.duringPlan = async () => {
+      t.s.duringPlan = undefined;
+      await writeOperatorRecord(t.r.harness, { intake: { paused: true } });
+    };
+    await refusedAtEffect(t, "paused", "paused");
+  });
+
+  test("the owner was demoted after the grant: the rule no longer holds", async () => {
+    const t = await setup();
+    const owner = await setUpOwner(t.r.hangarRoot);
+    plantProjection(t.r.harness, owner);
+    ruleOf(await enable(t));
+    t.s.duringPlan = async () => {
+      t.s.duringPlan = undefined;
+      plantProjection(t.r.harness, mintId("prn"), [{ principal: owner, decide: "maintainer" }]);
+    };
+    await refusedAtEffect(t, "rule-revoked", "rule-revoked");
+  });
+
+  test("another build was activated after the grant: its policy or ceiling no longer binds", async () => {
+    for (const ceiling of [
+      { maxDays: 30, merge: {} },
+      { maxDays: 20, merge: {} },
+    ]) {
+      const t = await setup();
+      ruleOf(await enable(t));
+      t.s.duringPlan = async () => {
+        t.s.duringPlan = undefined;
+        await deploy(t.r.harness, { ceiling, active: true, policy: POLICY_2, at: NOW + 5 });
+      };
+      await refusedAtEffect(t, "rule-revoked", "rule-revoked");
+    }
+  });
+
+  test("another action started after the grant: one at a time, a person is asked", async () => {
+    const t = await setup();
+    ruleOf(await enable(t));
+    t.s.duringPlan = async () => {
+      t.s.duringPlan = undefined;
+      t.s.oneAtATime = false;
+    };
+    await refusedAtEffect(t, "one-at-a-time", "re-asked");
+  });
+
+  test("the rule's last use was spent after the grant: used up, never called revoked", async () => {
+    const t = await setup();
+    const ruleId = ruleOf(await enable(t, { maxUses: 1 }));
+    t.s.duringPlan = async () => {
+      t.s.duringPlan = undefined;
+      await appendDelegationLog(t.r.harness, {
+        v: 1,
+        at: new Date(NOW).toISOString(),
+        event: "acted",
+        rule: ruleId,
+        revision: 1,
+        cmd: mintId("cmd"),
+      });
+    };
+    await refusedAtEffect(t, "uses-exhausted", "re-asked");
+  });
+});
+
+describe("a pass sees what it just did", () => {
+  test("at a cap of one use, two waiting decisions: one is decided, the other waits", async () => {
+    const t = await setup();
+    ruleOf(await enable(t, { maxUses: 1 }));
+    const a = await decision(t.r.harness);
+    const b = await decision(t.r.harness);
+    const summary = await apply(t);
+    expect(summary).toMatchObject({ decided: 1 });
+    expect(t.s.effects).toBe(1);
+    expect(decisionRow(t.r.harness, a.id)?.state).toBe("consumed");
+    expect(decisionRow(t.r.harness, b.id)).toMatchObject({ state: "pending" });
+    expect(decisionRow(t.r.harness, b.id)?.resolvedBy).toBeUndefined();
+    // Its rule is used up: no rule applies to it, so nothing is logged against it.
+    expect(linesOf(t.r.harness).filter((l) => l.decision === b.id)).toEqual([]);
+    expect(linesOf(t.r.harness).filter((l) => l.event === "decided")).toHaveLength(1);
+  });
+
+  test("an action that waits for the last one to act runs once per pass", async () => {
+    const t = await setup();
+    ruleOf(await enable(t));
+    const seen: string[][] = [];
+    t.s.oneAtATime = (log) => {
+      seen.push(log.map((l) => l.event));
+      return !log.some((l) => l.event === "acted");
+    };
+    const a = await decision(t.r.harness);
+    const b = await decision(t.r.harness);
+    expect(await apply(t)).toMatchObject({ decided: 1 });
+    expect(t.s.effects).toBe(1);
+    expect(decisionRow(t.r.harness, a.id)?.state).toBe("consumed");
+    expect(decisionRow(t.r.harness, b.id)?.state).toBe("pending");
+    // The second decision was shown the first one's effect.
+    expect(seen.at(-1)).toContain("acted");
+  });
+});
+
+/** Make every segment of the application log read-only; answers the files it locked. */
+function lockLog(harness: string, locked: string[]): void {
+  const logDir = join(harness, controlPaths(harness).delegationLogDir);
+  for (const name of readdirSync(logDir)) {
+    const file = join(logDir, name);
+    if (!statSync(file).isFile()) continue;
+    chmodSync(file, 0o444);
+    locked.push(file);
+  }
+}
+
+describe("the rollback plan is on disk before anything acts", () => {
+  test("a plan that cannot be written: nothing is decided and nothing acts", async () => {
+    if (process.getuid?.() === 0) return; // root writes through a read-only file
+    const t = await setup();
+    ruleOf(await enable(t));
+    const d = await decision(t.r.harness);
+    const locked: string[] = [];
+    t.s.duringPlan = async () => {
+      t.s.duringPlan = undefined;
+      lockLog(t.r.harness, locked);
+    };
+    let summary: Awaited<ReturnType<typeof apply>>;
+    try {
+      summary = await apply(t);
+    } finally {
+      for (const file of locked) chmodSync(file, 0o644);
+    }
+    expect(locked.length).toBeGreaterThan(0);
+    expect(summary).toMatchObject({ decided: 0, refused: 1 });
+    expect(t.s.effects).toBe(0);
+    expect(decisionRow(t.r.harness, d.id)?.state).toBe("pending");
+    expect(events(t.r.harness)).toEqual(["checked"]);
+  });
+
+  test("an action whose record could not be written says so on its receipt", async () => {
+    if (process.getuid?.() === 0) return; // root writes through a read-only file
+    const t = await setup();
+    ruleOf(await enable(t));
+    await decision(t.r.harness);
+    const locked: string[] = [];
+    t.s.duringEffect = async () => {
+      t.s.duringEffect = undefined;
+      lockLog(t.r.harness, locked);
+    };
+    try {
+      await apply(t);
+    } finally {
+      for (const file of locked) chmodSync(file, 0o644);
+    }
+    expect(t.s.effects).toBe(1);
+    expect(events(t.r.harness)).not.toContain("acted");
+    const final = rowsOf(commandsLedgerOf(t.r.harness))
+      .filter((r) => r["kind"] === KINDS.execute)
+      .at(-1) as Record<string, unknown>;
+    expect(final["effects"]).toContainEqual(
+      expect.objectContaining({ kind: "delegation.acted", status: "failed" }),
+    );
+  });
+});
+
+describe("a page that cannot be drawn", () => {
+  test("a name with a space draws, quoted on its CLI line; a broken page answers a sentence", async () => {
+    const t = await setup();
+    const spaced = await t.service.preview(
+      { ...t.harness, name: "Support bot" },
+      { action: "merge" },
+    );
+    if (!spaced.ok) throw new Error(spaced.reason);
+    expect(spaced.page.verb).toEndWith("--confirm 'Support bot'");
+    t.s.host = [{ template: "does.deploy" }];
+    const broken = await t.service.preview(t.harness, { action: "merge" });
+    expect(broken).toEqual({
+      ok: false,
+      code: "invalid",
+      reason: "This page could not be built for this harness.",
+    });
+  });
+});
+
 describe("suspension", () => {
   test("an owner demoted, a new policy revision, or a new ceiling suspends in one pass", async () => {
     const t = await setup();
@@ -863,6 +1099,77 @@ describe("suspension", () => {
       state: "suspended",
       reason: "ceiling-changed",
     });
+  });
+
+  test("a pass that read an older revision never writes over a newer one", async () => {
+    const t = await setup();
+    const ruleId = ruleOf(await enable(t));
+    const change = async (expect: number, days: number) => {
+      const page = await t.service.previewRule(t.harness, {
+        rule: ruleId,
+        mode: "change",
+        terms: { days },
+      });
+      if (!page.ok) throw new Error(page.reason);
+      return t.service.update(t.harness, {
+        rule: ruleId,
+        expect,
+        terms: { days },
+        consequencesDigest: page.page.consequencesDigest as string,
+        confirm: "codebase-steward",
+        actor: OWNER_LOCAL,
+        cmd: mintId("cmd"),
+      });
+    };
+    expect(await change(1, 10)).toMatchObject({ ok: true });
+    // A pass reads revision 2 into its one-second cache.
+    await apply(t);
+    // Inside that second: the owner narrows the rule, then another ceiling is activated.
+    expect(await change(2, 5)).toMatchObject({ ok: true });
+    await deploy(t.r.harness, {
+      ceiling: { maxDays: 20, merge: {} },
+      active: true,
+      policy: POLICY_2,
+      at: NOW + 5,
+    });
+    await apply(t);
+    expect(ruleState(t.r.harness, ruleId)).toMatchObject({
+      state: "suspended",
+      reason: "ceiling-changed",
+      revision: 3,
+      terms: { days: 5 },
+    });
+  });
+
+  test("two changes made from the same revision: one lands, the other is told to read again", async () => {
+    const t = await setup();
+    const ruleId = ruleOf(await enable(t));
+    const pages = await Promise.all(
+      [6, 8].map((days) =>
+        t.service.previewRule(t.harness, { rule: ruleId, mode: "change", terms: { days } }),
+      ),
+    );
+    const answers = await Promise.all(
+      pages.map((page, i) => {
+        if (!page.ok) throw new Error(page.reason);
+        return t.service.update(t.harness, {
+          rule: ruleId,
+          expect: 1,
+          terms: { days: i === 0 ? 6 : 8 },
+          consequencesDigest: page.page.consequencesDigest as string,
+          confirm: "codebase-steward",
+          actor: OWNER_LOCAL,
+          cmd: mintId("cmd"),
+        });
+      }),
+    );
+    expect(answers.map((a) => (a.ok ? "ok" : a.code)).sort()).toEqual(["conflict", "ok"]);
+    const read = readDelegations(t.r.harness);
+    const revisions =
+      read.state === "present"
+        ? read.rows.filter((r) => r.id === ruleId).map((r) => r.revision)
+        : [];
+    expect(revisions).toEqual([2]);
   });
 
   test("resume is the owner's, with a fresh page", async () => {
@@ -1175,6 +1482,8 @@ describe("retire", () => {
       });
     }
     expect(await DELEGATIONS_REVOKER.plan(ctx)).toEqual([]);
+    // With nothing left to end it answers no effect, so retire's guidance stands.
+    expect(await DELEGATIONS_REVOKER.revoke(ctx)).toEqual([]);
   });
 });
 

@@ -174,6 +174,7 @@ const list: V1Handler = async (ctx) => {
     body: {
       ...listing,
       you,
+      ...(unreadable.length > 0 ? { unreadable } : {}),
       snapshotAt: fleetSnapshot(0),
       ...(unreadable.length > 0 && listing.truncated === undefined
         ? {

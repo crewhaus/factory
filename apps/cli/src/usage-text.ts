@@ -432,7 +432,7 @@ export function usageText(): string {
     "                                       the receipts changes are recorded under",
     "  delegations <verb> ...               what a harness may do on its own, under an owner's rule:",
     "       list [--harness <h>] [--all] | show <rule> | preview <action> --harness <h>",
-    "       enable <action> --harness <h> --confirm <name>   the owner, after the page it prints",
+    "       enable <action> --harness <h>   prints the page and the command that confirms it",
     "       propose <action> | pause <rule> | resume <rule> | change <rule> | revoke <rule>|--all",
     "       apply [--harness <h>]   one pass; a cron line runs it where Home's service does not",
     "  people <verb> ...                    people profiles, kept encrypted outside every harness:",

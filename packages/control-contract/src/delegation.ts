@@ -653,6 +653,7 @@ const HARNESS_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const GLOB_RE = /^[A-Za-z0-9._*?/{}[\],!-]{1,200}$/;
 const ARGV_TOKEN_RE = /^(?:--)?[A-Za-z0-9_][A-Za-z0-9._:/=@+,-]{0,199}$/;
+const DIGEST_RE = /^[0-9a-f]{64}$/;
 
 const MONTHS = [
   "January",
@@ -700,12 +701,30 @@ function paramText(template: string, name: string, kind: ParamKind, value: unkno
       return (typeof value === "string" ? dateWords(value) : undefined) ?? wrong();
     case "glob":
       return typeof value === "string" && GLOB_RE.test(value) ? value : wrong();
-    case "argv":
-      if (!Array.isArray(value) || value.length === 0 || value.length > 40) return wrong();
-      return value
-        .map((token) => (typeof token === "string" && ARGV_TOKEN_RE.test(token) ? token : wrong()))
-        .join(" ");
+    case "argv": {
+      const line = Array.isArray(value) ? commandLineOf(value) : undefined;
+      return line ?? wrong();
+    }
   }
+}
+
+/**
+ * An argv as one line a shell reads back as the same argv, or `undefined` when a token is
+ * neither a plain token nor a harness's name. A name with a space is one single-quoted
+ * word: the name's grammar admits no quote, so the quoting is exact.
+ *
+ * First consumers: the consequences page's CLI line and the delegation service's `verb`.
+ */
+export function commandLineOf(argv: readonly unknown[]): string | undefined {
+  if (argv.length === 0 || argv.length > 40) return undefined;
+  const words: string[] = [];
+  for (const token of argv) {
+    if (typeof token !== "string") return undefined;
+    if (ARGV_TOKEN_RE.test(token)) words.push(token);
+    else if (HARNESS_RE.test(token)) words.push(`'${token}'`);
+    else return undefined;
+  }
+  return words.join(" ");
 }
 
 /** One line in words. An unknown template id, a missing or extra parameter, or one of the
@@ -750,7 +769,7 @@ export type ConsequenceSection = (typeof CONSEQUENCE_SECTIONS)[number];
 
 /** Which command the page's last line prints: turn a rule on, change one, or resume one. */
 export type ConsequenceCommand =
-  | { readonly kind: "enable" }
+  | { readonly kind: "enable"; readonly proposal?: string }
   | { readonly kind: "change"; readonly rule: string; readonly expect: number }
   | { readonly kind: "resume"; readonly rule: string; readonly expect: number };
 
@@ -775,6 +794,12 @@ export type ConsequencesInput = {
   /** The calendar date the rule would end, `YYYY-MM-DD`: shown, never digested. */
   readonly endsOn: string;
   readonly command?: ConsequenceCommand;
+  /**
+   * The page's own digest, taken by the caller over `material`: printed on the CLI line
+   * as `--digest`, so the command a person copies binds to the page they read. Never part
+   * of `material`.
+   */
+  readonly digest?: string;
 };
 
 export type ConsequencesPage = {
@@ -806,9 +831,21 @@ function commandArgv(input: ConsequencesInput): string[] {
     const values = Array.isArray(value) ? value : [value];
     for (const item of values) terms.push(flagOf(name), String(item));
   }
-  const confirm = ["--confirm", input.harness.name];
+  const digest = input.digest;
+  if (digest !== undefined && (typeof digest !== "string" || !DIGEST_RE.test(digest))) {
+    throw new TypeError("control-contract: the page's digest is not a digest");
+  }
+  const confirm = [
+    ...(digest !== undefined ? ["--digest", digest] : []),
+    "--confirm",
+    input.harness.name,
+  ];
   switch (command.kind) {
-    case "enable":
+    case "enable": {
+      const proposal = command.proposal;
+      if (proposal !== undefined && !/^dec_[0-9a-hjkmnp-tv-z]{26}$/.test(proposal)) {
+        throw new TypeError("control-contract: the request is not a decision id");
+      }
       return [
         "delegations",
         "enable",
@@ -816,8 +853,10 @@ function commandArgv(input: ConsequencesInput): string[] {
         "--harness",
         input.harness.id,
         ...terms,
+        ...(proposal !== undefined ? ["--proposal", proposal] : []),
         ...confirm,
       ];
+    }
     case "change":
       return [
         "delegations",

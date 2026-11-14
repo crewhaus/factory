@@ -122,6 +122,11 @@ export type RetireItem = {
  */
 export type RetireRevoker = {
   readonly name: string;
+  /**
+   * `true` when this revoker ends channel or service credentials. While none that ran
+   * does, a retire still tells the person to revoke those where they were issued.
+   */
+  readonly connections?: boolean;
   plan(ctx: RetireRevokerContext): Promise<readonly RetireItem[]>;
   revoke(ctx: RetireRevokerContext): Promise<readonly ReceiptEffect[]>;
 };
@@ -187,7 +192,11 @@ export type DelegatedAction = {
   scopeOf(ceiling: Readonly<Record<string, unknown>>): DelegatedActionScope | undefined;
   /** Whether a rule's terms, inside the scope, hold this subject. */
   inScope(terms: DelegationTerms, scope: DelegatedActionScope, subject: DelegationSubject): boolean;
-  /** The action's one-at-a-time condition, read from the application log. */
+  /**
+   * The action's one-at-a-time condition, read from the application log. Asked by the
+   * pass before a decision is taken, and again at the effect from the log as it is then,
+   * when the log also holds this decision's own `planned` and `decided` lines.
+   */
   oneAtATime(log: readonly DelegationLogLine[], subject: DelegationSubject): boolean;
   /** How the action would be undone; `undefined` when it cannot be planned. */
   planRollback(

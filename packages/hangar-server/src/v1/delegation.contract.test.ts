@@ -14,6 +14,7 @@ import { type V1Home, v1Home } from "../__test__/v1-home";
 import type { HomePorts } from "../sweeps";
 import { HOME_AREAS, handlersOf, sweepsOf } from "./areas";
 import { DELEGATIONS_SWEEP, HOME_DELEGATION } from "./delegations";
+import { fleetSnapshot } from "./lists";
 
 type Schema = {
   safeParse(value: unknown): { success: boolean; error?: unknown };
@@ -185,6 +186,35 @@ describe("every delegation operation answers its row's shape", () => {
     ]) {
       expect(Object.hasOwn(view.shape, field)).toBe(true);
     }
+    // The list's own fields: why it is empty and what to run, what could not be read, and
+    // each maintainer's request an owner reviews.
+    const list = schemaOf("delegationList") as unknown as { shape: Record<string, unknown> };
+    for (const field of ["empty", "unreadable", "truncated", "proposals", "you", "offers"]) {
+      expect([field, Object.hasOwn(list.shape, field)]).toEqual([field, true]);
+    }
+    const unreadable = {
+      items: [],
+      snapshotAt: fleetSnapshot(0),
+      offers: [],
+      proposals: [
+        {
+          id: mintId("dec"),
+          action: "merge",
+          days: 7,
+          createdAt: new Date().toISOString(),
+          expiresAt: new Date().toISOString(),
+          verb: "crewhaus delegations enable merge --harness hrn_1 --days 7",
+        },
+      ],
+      ceiling: { present: false },
+      empty: { reason: "unreadable", remedy: "Its deployment records cannot be read.", verb: "x" },
+      unreadable: ["The deployment records cannot be read: bad"],
+      note: "n",
+    };
+    expect(schemaOf("delegationList")?.safeParse(unreadable).success).toBe(true);
+    expect(
+      schemaOf("delegationList")?.safeParse({ ...unreadable, empty: { reason: "broken" } }).success,
+    ).toBe(false);
   });
 
   test("the reads and the preview leave the harness byte-identical", async () => {

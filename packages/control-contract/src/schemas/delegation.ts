@@ -81,9 +81,14 @@ export const delegationList = z
     snapshotAt: cursorString,
     truncated: truncated.optional(),
     empty: z
-      .object({ reason: z.enum(["not-allowed", "no-data"]), remedy: z.string().optional() })
+      .object({
+        reason: z.enum(["not-allowed", "no-data", "unreadable"]),
+        remedy: z.string().optional(),
+        verb: z.string().optional(),
+      })
       .passthrough()
       .optional(),
+    unreadable: z.array(z.string()).optional(),
     ceiling: z.object({ present: z.boolean(), maxDays: count.optional() }).passthrough(),
     offers: z.array(z.object({ action, label: z.string(), verb: z.string() }).passthrough()),
     proposals: z.array(

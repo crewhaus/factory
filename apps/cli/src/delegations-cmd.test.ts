@@ -1,6 +1,7 @@
 /**
  * `crewhaus delegations`: every write refuses under an agent's tool, `enable` prints the
- * consequences page before it writes and refuses a wrong name, `apply` runs one pass, and
+ * consequences page and the command that confirms it before anything is written, binds
+ * to that page's digest and refuses a wrong name, `apply` runs one pass, and
  * the page the CLI prints is the page Home's API answers, byte for byte.
  */
 import { afterAll, describe, expect, test } from "bun:test";
@@ -139,7 +140,45 @@ async function world() {
       control: () => service,
       identity: IDENTITY,
     });
-  return { harness, service, run, counts };
+  return { harness, service, run, counts, dep };
+}
+
+/** The command a printed page's CLI line names, as argv after `crewhaus`. */
+function commandOf(lines: readonly string[]): string[] {
+  const line = lines.find((l) => l.startsWith("CLI: crewhaus "));
+  if (line === undefined) throw new Error(`no CLI line in:\n${lines.join("\n")}`);
+  return line.slice("CLI: crewhaus ".length).split(" ");
+}
+
+/** The same argv with `--harness` given as the directory, where no registry knows the id. */
+function withDir(argv: readonly string[], dir: string): string[] {
+  const out = [...argv];
+  const at = out.indexOf("--harness");
+  if (at >= 0) out[at + 1] = dir;
+  return out;
+}
+
+/** Activate another build of the harness, under another policy revision. */
+async function deploy(harness: string, previous: string, policyRevision: string): Promise<void> {
+  const dep = mintId("dep");
+  const row = {
+    id: dep,
+    harness: HRN,
+    artifact: { digest: "e".repeat(64), shape: "cli", entry: "dist/agent.ts" },
+    policyRevision,
+    delegation: { maxDays: 30, merge: {} },
+  };
+  await casAppend(deploymentsLedger(harness), dep, null, { ...row, state: "prepared" });
+  await casAppend(deploymentsLedger(harness), dep, "prepared", {
+    ...row,
+    state: "active",
+    activatedAt: new Date().toISOString(),
+  });
+  await casAppend(deploymentsLedger(harness), previous, "active", {
+    id: previous,
+    harness: HRN,
+    state: "superseded",
+  });
 }
 
 describe("crewhaus delegations", () => {
@@ -168,43 +207,47 @@ describe("crewhaus delegations", () => {
     expect(existsSync(join(w.harness, controlPaths(w.harness).digestKeyFile))).toBe(false);
   });
 
-  test("enable prints the page before it writes, and refuses a wrong name", async () => {
+  test("enable prints the page and its command first; the command it prints turns the rule on", async () => {
     const w = await world();
-    const wrong = await w.run([
-      "enable",
-      "merge",
-      "--harness",
-      w.harness,
-      "--confirm",
-      "someone-else",
-    ]);
+    const first = await w.run(["enable", "merge", "--harness", w.harness, "--days", "7"]);
+    expect(first.exitCode).toBe(53);
+    expect(first.lines[0]).toBe("Let support merge its own pull requests");
+    expect(first.lines.at(-1)).toContain("Nothing changed yet.");
+    expect(readDelegations(w.harness)).toEqual({ state: "absent" });
+    const argv = commandOf(first.lines);
+    expect(argv.slice(0, 4)).toEqual(["delegations", "enable", "merge", "--harness"]);
+    expect(argv).toContain("--digest");
+    const wrong = await w.run(withDir([...argv.slice(1, -1), "someone-else"], w.harness));
     expect(wrong.exitCode).toBe(55);
-    expect(wrong.lines[0]).toBe("Let support merge its own pull requests");
     expect(wrong.lines.at(-1)).toBe("delegations enable: Type support to confirm.");
     expect(readDelegations(w.harness)).toEqual({ state: "absent" });
-    const on = await w.run([
-      "enable",
-      "merge",
-      "--harness",
-      w.harness,
-      "--days",
-      "7",
-      "--confirm",
-      "support",
-    ]);
+    // The printed line names the harness by id: run here it is given the directory.
+    const on = await w.run(withDir(argv.slice(1), w.harness));
     expect(on.exitCode).toBe(0);
-    const text = on.lines.join("\n");
-    expect(text.indexOf("Let support merge its own pull requests")).toBe(0);
-    expect(text.indexOf("Turned on: rule_")).toBeGreaterThan(
-      text.indexOf("CLI: crewhaus delegations enable"),
-    );
+    expect(on.lines.join("\n")).toContain("Turned on: rule_");
     const read = readDelegations(w.harness);
     expect(read.state === "present" && read.rows[0]?.terms).toEqual({ days: 7 });
   });
 
+  test("a page that changed after it was printed is refused, with the page as it is now", async () => {
+    const w = await world();
+    const printed = commandOf((await w.run(["enable", "merge", "--harness", w.harness])).lines);
+    const digest = printed[printed.indexOf("--digest") + 1];
+    // A new build is activated: another policy revision, so another page.
+    await deploy(w.harness, w.dep, `sha256:${"2".repeat(64)}`);
+    const stale = await w.run(withDir(printed.slice(1), w.harness));
+    expect(stale.exitCode).toBe(53);
+    expect(stale.lines.at(-1)).toContain("has changed");
+    const now = commandOf(stale.lines);
+    expect(now[now.indexOf("--digest") + 1]).not.toBe(digest);
+    expect(readDelegations(w.harness)).toEqual({ state: "absent" });
+    expect((await w.run(withDir(now.slice(1), w.harness))).exitCode).toBe(0);
+  });
+
   test("apply runs one pass", async () => {
     const w = await world();
-    await w.run(["enable", "merge", "--harness", w.harness, "--confirm", "support"]);
+    const argv = commandOf((await w.run(["enable", "merge", "--harness", w.harness])).lines);
+    expect((await w.run(withDir(argv.slice(1), w.harness))).exitCode).toBe(0);
     const opened = await openActionDecision(w.harness, {
       kind: "merge",
       subject: { ref: `${HRN}/work/${mintId("wi")}`, revision: REV },

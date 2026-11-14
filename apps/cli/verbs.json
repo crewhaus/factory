@@ -2773,6 +2773,10 @@
               "takesValue": true
             },
             {
+              "name": "digest",
+              "takesValue": true
+            },
+            {
               "name": "confirm",
               "takesValue": true
             },
@@ -2821,6 +2825,10 @@
               "takesValue": true
             },
             {
+              "name": "digest",
+              "takesValue": true
+            },
+            {
               "name": "confirm",
               "takesValue": true
             },
@@ -2854,6 +2862,10 @@
           "flags": [
             {
               "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "digest",
               "takesValue": true
             },
             {
