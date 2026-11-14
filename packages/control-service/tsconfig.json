@@ -15,8 +15,11 @@
     { "path": "../harness-supervisor" },
     { "path": "../ir" },
     { "path": "../permission-engine" },
+    { "path": "../run-context" },
+    { "path": "../runtime-core" },
     { "path": "../session-store" },
     { "path": "../spec-patch" },
+    { "path": "../tool-builder" },
     { "path": "../tool-executor" },
     { "path": "../tool-registry-manifest" }
   ],

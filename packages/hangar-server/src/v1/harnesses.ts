@@ -17,9 +17,8 @@ import {
   readDeployments,
   readOperatorRecord,
 } from "@crewhaus/control-records";
-import { RUNS_MIN_BUNDLE, RUN_ADAPTER_SHAPES, versionAtLeast } from "@crewhaus/control-service";
+import { RUN_ADAPTER_SHAPES, runBundleRefusal } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
-import { readBundleStamp, resolveBundle } from "@crewhaus/harness-supervisor";
 import { pendingApprovalCount } from "../approvals";
 import { readTextCapped } from "../jsonl";
 import { resolveContained } from "../safety";
@@ -195,22 +194,17 @@ function runsCreateOf(
           verb: null,
         };
   }
+  if (dir === undefined) return { supported: "unknown", reason: "The harness folder is missing." };
+  // The build is read first: a managed daemon that is offline still has a build on disk.
+  const old = runBundleRefusal(dir, entry.target);
+  if (old !== undefined) {
+    return { supported: false, reason: old.message, verb: old.verb ?? "crewhaus compile" };
+  }
   if (adapter === "managed") {
     if (!status.ok) return { supported: "unknown", reason: "The executor is offline." };
     return fromDaemon("runs.create", shape, status);
   }
-  if (dir === undefined) return { supported: "unknown", reason: "The harness folder is missing." };
-  if (entry.target === "cli") return { supported: true };
-  const bundle = resolveBundle(dir, entry.target);
-  const compiledWith =
-    bundle === undefined ? undefined : readBundleStamp(bundle.bundleDir)?.compiledWith;
-  return compiledWith !== undefined && versionAtLeast(compiledWith, RUNS_MIN_BUNDLE)
-    ? { supported: true }
-    : {
-        supported: false,
-        reason: `This build is older than ${RUNS_MIN_BUNDLE}, which checks a run's input where it starts.`,
-        verb: "crewhaus compile",
-      };
+  return { supported: true };
 }
 
 const capabilities: V1Handler = async (ctx) => {

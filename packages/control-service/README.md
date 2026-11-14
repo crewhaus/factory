@@ -180,10 +180,16 @@ origin of its input (`CREWHAUS_INPUT_ORIGIN=api`); its argv is a closed vocabula
 A cancel goes by the run's folded state: a queued run is cancelled once its claim is won
 (a run that already started is answered `running`); a running one is stopped by whoever
 holds it; a parked job run is cancelled with no daemon running, after what it waits on is
-withdrawn (`run-cancelled`, naming the run). A parked managed run keeps its requests with
-its tenant, and is not cancelled here. A resume starts a parked job run again under the same
-run once what it waited on is decided. The CLI twins are `crewhaus runs
-list|show|create|cancel|resume`.
+withdrawn (`run-cancelled`, naming the run): the requests bound to it, to the top-level runs
+its job started under it (`childRunsOf`) and to the runs those continue. It and each of its
+parked runs end `cancelled`, so no id or session of theirs resumes. A parked managed run
+keeps its requests with its tenant, and is not cancelled here. A resume starts a parked job
+run the API started again under the same run once what it waited on is decided; the job's
+loops continue the run that parked, so the decided grant is spent once. The CLI twins are
+`crewhaus runs list|show|create|cancel|resume`.
+
+A repeated `Idempotency-Key` is answered before anything is planned: `commands.replayOf`
+reads the first receipt the key names, and writes nothing.
 
 ## Exits
 

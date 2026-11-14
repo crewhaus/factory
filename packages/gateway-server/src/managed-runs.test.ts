@@ -8,6 +8,7 @@
  * reaches a model, and no clock is read for timing.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -25,7 +26,7 @@ import {
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
-import { CANONICAL_RUN_ID_RE, mintId, mintRunId } from "@crewhaus/control-contract";
+import { CANONICAL_RUN_ID_RE, canonicalJson, mintId, mintRunId } from "@crewhaus/control-contract";
 import { run as runSchema } from "@crewhaus/control-contract/schemas";
 import {
   append,
@@ -407,6 +408,25 @@ describe("a client's own run handle", () => {
     expect(s.calls).toHaveLength(2);
     // The value itself is written nowhere.
     for (const file of controlFiles(s.harnessDir)) expect(file.text).not.toContain("order-42");
+  });
+
+  test("the claim holds a keyed fingerprint: no plain digest of the params, which carry the input", async () => {
+    const s = await served();
+    const params = create(CLEAN, { idempotency: "order-44" });
+    expect((await s.call("runs.create", params)).error).toBeUndefined();
+    const { idempotency: _value, ...rest } = params;
+    const plain = [
+      canonicalJson({ method: "runs.create", params }),
+      canonicalJson({ method: "runs.create", params: rest }),
+    ].map((text) => createHash("sha256").update(text).digest("hex"));
+    const claims = controlFiles(s.harnessDir).filter((f) => f.path.includes("/claims/idem/"));
+    expect(claims).toHaveLength(1);
+    expect(claims[0]?.text).toMatch(/"fingerprint":"[0-9a-f]{64}"/);
+    for (const digest of plain) expect(claims[0]?.text).not.toContain(digest);
+    // A retry with the same params still finds its first run.
+    const again = await s.call("runs.create", params);
+    expect(again.error).toBeUndefined();
+    expect(s.calls).toHaveLength(1);
   });
 
   test("the same value with other params answers conflict, HTTP 409, and runs nothing", async () => {

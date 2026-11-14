@@ -467,6 +467,57 @@ describe("CREWHAUS_INPUT_ORIGIN=api: a document's text, and blocks with no reada
     }
   });
 
+  test("a document's title and context, a server tool call's input and a thinking block's text are each read: blocked, and the loop makes no model call", async () => {
+    const blocks: ReadonlyArray<Record<string, unknown>> = [
+      { ...documentOf(CLEAN), title: injection() },
+      { ...documentOf(CLEAN), context: injection() },
+      { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: { q: injection() } },
+      { type: "thinking", thinking: injection(), signature: "c2ln" },
+    ];
+    for (const block of blocks) {
+      _resetInputOriginForTest();
+      const seed = [{ role: "user", content: [block] }];
+      const verdict = await seedVerdict({ seedMessages: seed }, API);
+      expect(verdict.kind).toBe("blocked");
+      expect(verdict.kind === "blocked" ? verdict.rules : []).not.toContain(
+        "unreadable_seed_block",
+      );
+
+      _resetInputOriginForTest();
+      process.env["CREWHAUS_INPUT_ORIGIN"] = "api";
+      const model = stubModel();
+      const { caught } = await loop("", {
+        _adapter: model.adapter,
+        seedMessages: seed as RunChatLoopOptions["seedMessages"],
+      });
+      expect(model.calls()).toBe(0);
+      expect((caught as RunFailedError).report.class).toBe("input_blocked");
+    }
+  });
+
+  test("a block's kind, ids, media type and signature are not read as its text", async () => {
+    const classified = countingClassifier();
+    const verdict = await seedVerdict(
+      {
+        seedMessages: [
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "toolu_1", content: CLEAN },
+              { type: "thinking", thinking: "", signature: "c2lnbmF0dXJl" },
+            ],
+          },
+        ],
+      },
+      API,
+    );
+    expect(classified()).toBe(1);
+    expect(verdict).toEqual({
+      kind: "kept",
+      entries: [{ content: CLEAN, origin: "api", door: "seed" }],
+    });
+  });
+
   test("the same blocks with the variable unset: nothing is checked", async () => {
     for (const block of [documentOf(injection()), base64Image, unknownWithData]) {
       _resetInputOriginForTest();

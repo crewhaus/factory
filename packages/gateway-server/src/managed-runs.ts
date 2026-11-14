@@ -21,8 +21,8 @@
  * claim `idem/<digest of tenant, subject and value>` names the first run, so
  * the same value with the same params answers that run's ids with no turn and
  * no row, and with other params answers `conflict`. Neither the value nor the
- * input is written anywhere: the claim holds the run, its session and a digest
- * of the params. A run cut off when its
+ * input is written anywhere: the claim holds the run, its session and a keyed
+ * digest of the params (HMAC under the harness's subject key). A run cut off when its
  * process ended is marked `interrupted` at the next start, and never run
  * again. A row holds ids, states, the tenant and, on the terminal row, a keyed
  * digest of the subject (`subjectRefOf`); never the subject, the input or the
@@ -87,10 +87,12 @@ import {
   append,
   controlPaths,
   defaultLeaseProbe,
+  ensureDigestKey,
   expireClaim,
   foldStates,
   holderProvablyDead,
   intakeVerdict,
+  keyedDigest,
   publishClaim,
   readClaim,
   runsLedger,
@@ -365,6 +367,12 @@ type QueuedInput = {
   readonly sessionId?: string;
   readonly subject?: string;
 };
+
+/**
+ * The label of a managed run's idempotency fingerprint. A stored claim is compared with
+ * the next request's: a pin.
+ */
+export const MANAGED_RUN_FINGERPRINT_LABEL = "managed-run-fingerprint";
 
 /**
  * Remove a queued run's input file: a regular file at its name inside the
@@ -668,12 +676,26 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     return `idem/${digest.slice(0, 32)}`;
   }
 
-  /** A digest of a request's params, its idempotency value left out. */
-  function paramsFingerprint(method: string, params: Readonly<Record<string, unknown>>): string {
+  /**
+   * A keyed digest of a request's params, its idempotency value left out: HMAC under
+   * the harness's subject key ({@link MANAGED_RUN_FINGERPRINT_LABEL}), so a claim file
+   * cannot be used to test a guess at the input. Rejects when the key cannot be read or
+   * made.
+   */
+  async function paramsFingerprint(
+    method: string,
+    params: Readonly<Record<string, unknown>>,
+  ): Promise<string> {
     const { idempotency: _left, ...rest } = params;
-    return createHash("sha256")
-      .update(canonicalJson({ method, params: rest }))
-      .digest("hex");
+    const key = await ensureDigestKey(harnessDir, {
+      file: controlPaths(harnessDir).subjectKeyFile,
+    });
+    if (key.state !== "present") {
+      throw new Error(`the run's idempotency claim could not be keyed (${key.reason})`);
+    }
+    return keyedDigest(key.hmac, MANAGED_RUN_FINGERPRINT_LABEL, [
+      canonicalJson({ method, params: rest }),
+    ]);
   }
 
   function registerBus(runId: string, tenantId: string, bus: RunContext["eventBus"]): void {
@@ -860,7 +882,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     let idemClaim: string | undefined;
     if (p.idempotency !== undefined && !blocked) {
       idemClaim = idempotencyClaimOf(tenant, args.sub, p.idempotency);
-      const fingerprint = paramsFingerprint(method, p as Readonly<Record<string, unknown>>);
+      const fingerprint = await paramsFingerprint(method, p as Readonly<Record<string, unknown>>);
       const published = publishClaim(ledger, idemClaim, {
         run: runId,
         session: sessionId,

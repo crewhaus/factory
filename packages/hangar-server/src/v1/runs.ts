@@ -30,7 +30,7 @@ import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { emptyOf, nextCursor, pagingOf, snapshotCursor } from "./lists";
 import { entryOf, harnessOf, liveDirOf, liveDirOr409 } from "./resolve";
-import { acceptedAnswer, submitCommand } from "./submit";
+import { type Submitted, acceptedAnswer, replayedCommand, submitCommand } from "./submit";
 
 /** A ledger's own fields, never part of a run as served. */
 const BOOKKEEPING = new Set(["claim", "gen", "repaired"]);
@@ -107,6 +107,23 @@ export function findRun(
     if (found.length > 1) return undefined;
   }
   return found[0];
+}
+
+/**
+ * Whether `by` started a run recorded among a harness's newest run-ledger lines: what
+ * lets a service list that harness's runs (its own only) without reading the harness.
+ * Reads only.
+ */
+export function startedRunIn(entry: HangarHarnessEntry, by: string): boolean {
+  const dir = liveDirOf(entry);
+  if (dir === undefined) return false;
+  try {
+    return readPage(runsLedger(dir), { limit: RUN_LOOKUP_LINES }).items.some(
+      (item) => item.record["by"] === by,
+    );
+  } catch {
+    return false;
+  }
 }
 
 function notFound(): V1Error {
@@ -334,6 +351,11 @@ const create: V1Handler = async (ctx) => {
       message: "Starting a run for a work item is not served yet.",
     });
   }
+  // The harness is the target: a repeat under the same key fingerprints alike.
+  const command = { target: `home/harness/${entry.id}`, ledger: { harness: dir } } as const;
+  // A retry is answered with the run it started, whatever would be refused now.
+  const replay = await replayedCommand(ctx, command);
+  if (replay !== undefined) return createdReplay(replay, entry, dir);
   const runId = mintRunId();
   const plan = await runAdapterFor(entry.target).createRun({
     harnessDir: dir,
@@ -346,21 +368,11 @@ const create: V1Handler = async (ctx) => {
     home: await homeFor(ctx, entry),
   });
   if (!plan.ok) throw refusalError(plan.refusal);
-  // The harness is the target: a repeat under the same key fingerprints alike.
   const submitted = await submitCommand(ctx, {
-    target: `home/harness/${entry.id}`,
-    ledger: { harness: dir },
+    ...command,
     effect: async (receipt) => plan.effect(receipt),
   });
-  if (submitted.replayed) {
-    const first = runOfReceipt(submitted.receipt);
-    const rows = first === undefined ? [] : rowsIn(dir, first);
-    const run = rows.at(-1);
-    return {
-      ...acceptedAnswer(submitted, run !== undefined ? { run: servedRun(run, entry.id) } : {}, dir),
-      status: 202,
-    };
-  }
+  if (submitted.replayed) return createdReplay(submitted, entry, dir);
   const value = submitted.value;
   if (value?.run === undefined) {
     throw new V1Error({
@@ -382,10 +394,34 @@ const create: V1Handler = async (ctx) => {
   };
 };
 
+/** A replayed `runs.create`: 202 with the first run, as it is recorded now. */
+function createdReplay(
+  submitted: Submitted<unknown>,
+  entry: HangarHarnessEntry,
+  dir: string,
+): ReturnType<typeof acceptedAnswer> {
+  const first = runOfReceipt(submitted.receipt);
+  const rows = first === undefined ? [] : rowsIn(dir, first);
+  // Newest first: the row it was queued with, as the first answer served it.
+  const run = rows.at(-1);
+  return {
+    ...acceptedAnswer(submitted, run !== undefined ? { run: servedRun(run, entry.id) } : {}, dir),
+    status: 202,
+  };
+}
+
 function runCommand(kind: "runs.cancel" | "runs.resume"): V1Handler {
   return async (ctx) => {
     const found = runOf(ctx);
     const dir = liveDirOr409(found.entry);
+    const command = {
+      target: runRefOf(found.entry.id, found.runId),
+      ledger: { harness: dir },
+    } as const;
+    // A retry is answered with the receipt it repeats: a cancel that succeeded is not
+    // refused because the run it cancelled has ended.
+    const replay = await replayedCommand(ctx, command);
+    if (replay !== undefined) return acceptedAnswer(replay, {}, dir);
     const request = {
       harnessDir: dir,
       harness: found.entry.id,
@@ -398,8 +434,7 @@ function runCommand(kind: "runs.cancel" | "runs.resume"): V1Handler {
       kind === "runs.cancel" ? await adapter.cancelRun(request) : await adapter.resumeRun(request);
     if (!plan.ok) throw refusalError(plan.refusal);
     const submitted = await submitCommand(ctx, {
-      target: runRefOf(found.entry.id, found.runId),
-      ledger: { harness: dir },
+      ...command,
       effect: async (receipt) => plan.effect(receipt),
     });
     return acceptedAnswer(submitted, {}, dir);

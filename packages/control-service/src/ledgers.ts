@@ -11,6 +11,7 @@ import {
   controlPaths,
   ensureDigestKey,
   harnessLedger,
+  readDigestKey,
 } from "@crewhaus/control-records";
 
 /** Which ledger a command is written to. */
@@ -46,6 +47,13 @@ export function ledgerFor(choice: LedgerChoice, hangarRoot: string): Ledger {
 }
 
 /** The key the ledger's digests are made under: the harness's own, or Home's. */
+/** The ledger's digest key, read: creates nothing. */
+export function readLedgerKey(choice: LedgerChoice, hangarRoot: string): Promise<DigestKeyRead> {
+  return choice === "workspace"
+    ? readDigestKey(hangarRoot, { file: WORKSPACE_DIGEST_KEY_FILE })
+    : readDigestKey(choice.harness);
+}
+
 export function ensureLedgerKey(
   choice: LedgerChoice,
   hangarRoot: string,

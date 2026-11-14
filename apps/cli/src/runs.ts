@@ -170,6 +170,25 @@ function newestParked(
   );
 }
 
+/**
+ * The session's newest run, when a command cancelled it (its `cancelled` row names the
+ * command, as a cancel through the control plane writes): that session is not resumed,
+ * since what its run waited on was withdrawn.
+ */
+function cancelledByCommand(
+  ledger: Ledger,
+  rows: readonly RunningRow[],
+  sessionId: string,
+): string | undefined {
+  const newest = rows.find((row) => row.session === sessionId);
+  if (newest === undefined) return undefined;
+  const fold = foldStates(ledger);
+  const last = fold.ok ? fold.objects.get(newest.id) : undefined;
+  return last?.state === "cancelled" && typeof last.record["cmd"] === "string"
+    ? newest.id
+    : undefined;
+}
+
 /** What a resume of `sessionId` continues, and the scope it re-enters. */
 function resumeOf(sessionId: string, parked: RunningRow | undefined): RunsResumeTarget {
   return {
@@ -190,8 +209,8 @@ function resumeOf(sessionId: string, parked: RunningRow | undefined): RunsResume
  * and the current states come from the fold.
  *
  * Throws `RunsError` naming the id when no run record here has it, when the
- * run has ended (a cancelled run is never resumed), and when the records
- * cannot be read whole.
+ * run has ended (a cancelled run is never resumed), when a session's newest
+ * run was cancelled by a command, and when the records cannot be read whole.
  */
 export function resolveRunsResumeTarget(id: string, harnessDir: string): RunsResumeTarget {
   const ledger = runsLedgerAt(harnessDir);
@@ -203,6 +222,10 @@ export function resolveRunsResumeTarget(id: string, harnessDir: string): RunsRes
       rows = runningRows(ledger, dir);
     } catch {
       return { sessionId: id };
+    }
+    const cancelled = cancelledByCommand(ledger, rows, id);
+    if (cancelled !== undefined) {
+      throw new RunsError(`session ${id}'s run ${cancelled} was cancelled; nothing was resumed`);
     }
     return resumeOf(id, newestParked(ledger, rows, id));
   }

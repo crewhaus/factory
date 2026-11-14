@@ -145,6 +145,16 @@ describe("the canary: a run's input is classified at api before it reaches a mod
   test("a managed run queued through Home: its follower classifies it before the turn", async () => {
     const canary = canaryOf();
     const h = await home.harness("canary-managed", { target: "managed" });
+    // A build that follows queued runs (compiled with 0.9.0 or later).
+    mkdirSync(join(h.dir, "dist"), { recursive: true });
+    writeFileSync(join(h.dir, "dist", "daemon.ts"), "// bundle\n");
+    writeFileSync(
+      join(h.dir, "dist", "package.json"),
+      JSON.stringify({
+        name: "crewhaus-compiled-bundle",
+        crewhaus: { specHash: "x", compiledWith: "0.9.0" },
+      }),
+    );
     const res = await home.call("POST", `/api/v1/harnesses/${h.id}/runs`, {
       body: { input: canary, admission: "queue" },
     });

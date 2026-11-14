@@ -7,7 +7,15 @@
  * job starter is a stub that records what it was asked to start.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   type CapabilityDescriptor,
@@ -27,7 +35,11 @@ import {
 } from "@crewhaus/control-records";
 import type { ControlClient } from "@crewhaus/gateway-protocol/control-client";
 import type { ApiRunInput, StartResult } from "@crewhaus/harness-supervisor";
-import { createPendingApprovalStore, foldReadOnly } from "@crewhaus/session-store";
+import {
+  type PendingApproval,
+  createPendingApprovalStore,
+  foldReadOnly,
+} from "@crewhaus/session-store";
 import {
   HOME_RUN_TENANT,
   RUN_ADAPTER_SHAPES,
@@ -102,18 +114,45 @@ function inputsOf(harness: string): string[] {
   return existsSync(dir) ? readdirSync(dir).sort() : [];
 }
 
-/** A job run parked on a decision: its rows, its input file and its pending request. */
-async function parkedRun(r: Rig, over: Record<string, unknown> = {}) {
+const PARKED_SESSION = "sess_00000000000000aa";
+
+/**
+ * A job run the API started, parked on a decision as the runtime leaves one: the root's
+ * rows, its top-level loop's own run (`parent` the root, `childOver` on its running row)
+ * that parked, the root closed parked (`over` on that row), its input file, and the
+ * pending request bound to the loop run.
+ */
+async function parkedRun(
+  r: Rig,
+  over: Record<string, unknown> = {},
+  childOver: Record<string, unknown> = {},
+) {
   const runId = mintRunId();
+  const child = mintRunId();
+  const execution = "run_00000000000000aa";
   plant(r.harness, { id: runId, state: "queued", by: "sys:reconcile", cmd: mintId("cmd") });
-  plant(r.harness, { id: runId, state: "preparing", execution: "run_00000000000000aa" });
-  plant(r.harness, { id: runId, state: "running", execution: "run_00000000000000aa" });
+  plant(r.harness, { id: runId, state: "preparing", execution });
+  plant(r.harness, { id: runId, state: "running", execution });
+  plant(r.harness, {
+    id: child,
+    state: "running",
+    parent: runId,
+    session: PARKED_SESSION,
+    resumeScope: `run:${runId}`,
+    execution,
+    ...childOver,
+  });
+  plant(r.harness, { id: child, state: "waiting-for-approval" });
   plant(r.harness, { id: runId, state: "waiting-for-approval", ...over });
   const dir = join(r.harness, controlPaths(r.harness).inputsDir);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, `${runId}.txt`), "Summarise the report.", { mode: 0o600 });
-  const approval = await park(r.harness, "Bash", { command: "ls" }, { runId });
-  return { runId, approval };
+  const approval = await park(r.harness, "Bash", { command: "ls" }, {
+    runId: child,
+    sessionId: PARKED_SESSION,
+    binding: { runId: child, resumeScope: `run:${runId}` },
+  } as Partial<PendingApproval>);
+  return { runId, child, approval };
 }
 
 const sessionRoot = (r: Rig) => join(r.harness, ".crewhaus", "sessions");
@@ -187,9 +226,9 @@ describe("the adapter table", () => {
 });
 
 describe("starting a run", () => {
-  function stamp(harness: string, compiledWith: string): void {
+  function stamp(harness: string, compiledWith: string, entry = "agent.ts"): void {
     mkdirSync(join(harness, "dist"), { recursive: true });
-    writeFileSync(join(harness, "dist", "agent.ts"), "// bundle\n");
+    writeFileSync(join(harness, "dist", entry), "// bundle\n");
     writeFileSync(
       join(harness, "dist", "package.json"),
       JSON.stringify({
@@ -345,6 +384,7 @@ describe("starting a run", () => {
       controlTarget: (harnessDir) => ({ harnessDir }),
       now: () => NOW,
     };
+    stamp(r.harness, "0.9.0", "daemon.ts");
     const ask = (admission: "reject" | "queue", runId = mintRunId()) =>
       runAdapterFor("managed").createRun({
         harnessDir: r.harness,
@@ -376,6 +416,35 @@ describe("starting a run", () => {
     ).toBe("done");
   });
 
+  test("a managed build older than 0.9.0, or none, is refused before acceptance even when asked to queue: no row, no input, no receipt", async () => {
+    const r = rig();
+    const offline = {
+      status: async () => ({ ok: false, code: "unreachable", status: 0, reason: "down" }),
+    } as unknown as ControlClient;
+    const ask = () =>
+      runAdapterFor("managed").createRun({
+        harnessDir: r.harness,
+        harness: HRN,
+        target: "managed",
+        runId: mintRunId(),
+        input: "Summarise.",
+        admission: "queue",
+        home: { controlClient: offline, controlTarget: (harnessDir) => ({ harnessDir }) },
+      });
+    const none = await ask();
+    expect(none.ok ? "" : `${none.refusal.code} ${none.refusal.verb}`).toBe(
+      "unsupported crewhaus compile",
+    );
+    stamp(r.harness, "0.8.2", "daemon.ts");
+    const old = await ask();
+    expect(old.ok ? "" : `${old.refusal.code} ${old.refusal.reason} ${old.refusal.verb}`).toBe(
+      "unsupported bundle_too_old crewhaus compile",
+    );
+    expect(existsSync(join(r.harness, ".crewhaus", "run", "control", "runs"))).toBe(false);
+    expect(inputsOf(r.harness)).toEqual([]);
+    expect(receiptsOf(r.harness)).toEqual([]);
+  });
+
   test("a shape that takes its work through its own intake is refused with its own words", async () => {
     for (const target of ["channel", "pipeline", "batch", "voice", "research", "browser"]) {
       const plan = await runAdapterFor(target).createRun({
@@ -404,7 +473,7 @@ describe("starting a run", () => {
 describe("cancelling a parked job run with no daemon", () => {
   test("its request is withdrawn naming the run, its last row is cancelled, its input is gone, and nothing re-drives it", async () => {
     const r = rig();
-    const { runId, approval } = await parkedRun(r);
+    const { runId, child, approval } = await parkedRun(r);
     const plan = await runAdapterFor("workflow").cancelRun({
       harnessDir: r.harness,
       harness: HRN,
@@ -414,6 +483,8 @@ describe("cancelling a parked job run with no daemon", () => {
     });
     const done = await submit(r, "runs.cancel", runId, plan);
     expect(done.receipt?.state).toBe("succeeded");
+    // The loop run that parked is closed too, so neither id resumes.
+    expect(statesOf(r.harness, child)).toEqual(["running", "waiting-for-approval", "cancelled"]);
     const withdrawn = approvalOf(r, approval.id);
     expect(withdrawn?.supersededBy).toBe(runId);
     expect(withdrawn?.supersededReason).toBe("run-cancelled");
@@ -446,7 +517,7 @@ describe("cancelling a parked job run with no daemon", () => {
     const r = rig();
     const earlier = mintRunId();
     const before = await park(r.harness, "Bash", { command: "pwd" }, { runId: earlier });
-    const { runId } = await parkedRun(r, { continues: earlier });
+    const { runId } = await parkedRun(r, {}, { continues: earlier });
     const plan = await runAdapterFor("cli").cancelRun({
       harnessDir: r.harness,
       harness: HRN,
@@ -492,6 +563,27 @@ describe("cancelling a parked job run with no daemon", () => {
     );
     expect(approvalOf(r, approval.id)?.supersededBy).toBeUndefined();
     expect(statesOf(r.harness, runId).at(-1)).toBe("preparing");
+  });
+
+  test("a run a resume takes between the plan and its effect: the receipt is rejected, and nothing is withdrawn or closed", async () => {
+    const r = rig();
+    const { runId, child, approval } = await parkedRun(r);
+    const plan = await runAdapterFor("workflow").cancelRun({
+      harnessDir: r.harness,
+      harness: HRN,
+      target: "workflow",
+      runId,
+      home: {},
+    });
+    expect(plan.ok).toBe(true);
+    // A resume holds the run again before the effect takes the ledger's lock.
+    plant(r.harness, { id: runId, state: "preparing", execution: "run_00000000000000bb" });
+    const done = await submit(r, "runs.cancel", runId, plan);
+    expect(done.receipt?.state).toBe("rejected");
+    expect(approvalOf(r, approval.id)?.supersededBy).toBeUndefined();
+    expect(statesOf(r.harness, runId).at(-1)).toBe("preparing");
+    expect(statesOf(r.harness, child).at(-1)).toBe("waiting-for-approval");
+    expect(inputsOf(r.harness)).toEqual([`${runId}.txt`]);
   });
 
   test("a parked managed run (its row names a tenant) is refused before acceptance: no receipt, and its request stays pending", async () => {
@@ -614,6 +706,36 @@ describe("resuming a parked job run", () => {
     expect(s.starts).toEqual([
       { runId, stdinFile: join(r.harness, controlPaths(r.harness).inputsDir, `${runId}.txt`) },
     ]);
+  });
+
+  test("a parked run the API did not start, or whose input is gone, is refused before acceptance and stays parked", async () => {
+    const r = rig();
+    const s = starter();
+    const ask = (runId: string) =>
+      runAdapterFor("workflow").resumeRun({
+        harnessDir: r.harness,
+        harness: HRN,
+        target: "workflow",
+        runId,
+        home: s.home,
+      });
+    // A run a person started in a terminal: its trigger is not the API's, and it has no input file.
+    const cliRun = mintRunId();
+    plant(r.harness, { id: cliRun, state: "running", trigger: { kind: "cli" } });
+    plant(r.harness, { id: cliRun, state: "waiting-for-approval", trigger: { kind: "cli" } });
+    // An API run whose input file is not there any more.
+    const { runId: gone } = await parkedRun(r);
+    rmSync(join(r.harness, controlPaths(r.harness).inputsDir, `${gone}.txt`));
+    for (const runId of [cliRun, gone]) {
+      const plan = await ask(runId);
+      expect(plan.ok ? "" : `${plan.refusal.code} ${plan.refusal.reason}`).toBe(
+        "unsupported not_started_by_api",
+      );
+      expect(plan.ok ? "" : plan.refusal.verb).toBe(`crewhaus runs resume ${runId}`);
+      expect(statesOf(r.harness, runId).at(-1)).toBe("waiting-for-approval");
+    }
+    expect(receiptsOf(r.harness)).toEqual([]);
+    expect(s.starts).toHaveLength(0);
   });
 
   test("managed and daemon shapes do not resume through the API", async () => {

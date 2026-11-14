@@ -10,7 +10,7 @@
  * - **job** (cli, crew, workflow, graph): the input goes to a `0600` file inside the
  *   harness, the run is `queued` on the run ledger, and the head's supervisor starts one
  *   job for it, whose environment names the run and the origin of its input (`api`). A
- *   parked job resumes under the same run.
+ *   parked job resumes under the same run, continuing the run that parked.
  * - **daemon** (every other shape): a run is not started this way; the answer names the
  *   shape's own intake.
  *
@@ -21,13 +21,21 @@
  *
  * Cancelling a run withdraws what it waits on. A parked job run that nothing holds (its
  * process ends when it parks) is cancelled here, with no daemon and no Home running: under
- * the run ledger's lock, while it is still parked, every request bound to it or to the run
- * it continues is withdrawn (`run-cancelled`, naming the run), and then it is `cancelled`.
- * A grant decided after that finds nothing to decide, and no resume starts it again.
+ * the run ledger's lock, while it is still parked, every request bound to it, to the
+ * top-level runs it started or to a run any of them continues is withdrawn
+ * (`run-cancelled`, naming the run), and then it and each of its parked runs are
+ * `cancelled`. A grant decided after that finds nothing to decide, and no resume starts
+ * any of them again.
+ *
+ * A resumed job is started again under the same run; runtime-core's loops under that
+ * root continue its parked top-level run, so a grant decided for the park is spent by the
+ * resumed job. Only a run the API started (trigger `api`, its input file still there) is
+ * resumed this way.
  */
 import {
   closeSync,
   constants as fsConstants,
+  lstatSync,
   mkdirSync,
   openSync,
   realpathSync,
@@ -340,22 +348,32 @@ function runningOutcome(runId: string): Outcome {
 // The job adapter: cli, crew, workflow, graph
 // ---------------------------------------------------------------------------
 
-/** Why a compiled job shape's bundle cannot start an API run, when it cannot. */
-function bundleRefusal<T>(harnessDir: string, target: string): RunPlan<T> | undefined {
-  // A cli run is the interpreter's: `crewhaus run`, never a bundle.
+/**
+ * Why a harness's compiled build cannot start an API run, when it cannot: no build, or
+ * one stamped older than {@link RUNS_MIN_BUNDLE} (a managed build that old has no
+ * queued-run follower; a job build that old does not check its input where it starts).
+ * A cli run is the interpreter's, `crewhaus run`, never a bundle.
+ */
+export function runBundleRefusal(harnessDir: string, target: string): RunRefusal | undefined {
   if (target === "cli") return undefined;
   const bundle = resolveBundle(harnessDir, target);
   const stamp = bundle === undefined ? undefined : readBundleStamp(bundle.bundleDir);
   const compiledWith = stamp?.compiledWith;
   if (compiledWith !== undefined && versionAtLeast(compiledWith, RUNS_MIN_BUNDLE)) return undefined;
-  return refused(
-    "unsupported",
-    "bundle_too_old",
-    bundle === undefined
-      ? "This harness has no compiled build to start a run with."
-      : `This harness's build is older than ${RUNS_MIN_BUNDLE}, which checks a run's input where it starts. Compile it again.`,
-    { verb: "crewhaus compile" },
-  );
+  return {
+    code: "unsupported",
+    reason: "bundle_too_old",
+    message:
+      bundle === undefined
+        ? "This harness has no compiled build to start a run with."
+        : `This harness's build is older than ${RUNS_MIN_BUNDLE}, which starts runs through the control API. Compile it again.`,
+    verb: "crewhaus compile",
+  };
+}
+
+function bundleRefusal<T>(harnessDir: string, target: string): RunPlan<T> | undefined {
+  const refusal = runBundleRefusal(harnessDir, target);
+  return refusal === undefined ? undefined : { ok: false, refusal };
 }
 
 const jobRunAdapter: RunAdapter = {
@@ -487,7 +505,23 @@ const jobRunAdapter: RunAdapter = {
         { remedy: "Continue its session with crewhaus.v1 `runs.continue`." },
       );
     }
-    const pending = await pendingFor(req.harnessDir, [req.runId, continuesOf(row)]);
+    if (!startedByApi(req.harnessDir, row, req.target === "cli")) {
+      return refused(
+        "unsupported",
+        "not_started_by_api",
+        "This run was not started through the control API, so it is not resumed here.",
+        { verb: `crewhaus runs resume ${req.runId}` },
+      );
+    }
+    const children = childRunsOf(req.harnessDir, req.runId);
+    if (children === undefined) {
+      return refused(
+        "unavailable",
+        "records_unreadable",
+        "The run records could not be read whole, so nothing was resumed.",
+      );
+    }
+    const pending = await pendingFor(req.harnessDir, familyOf(row, children));
     if (pending.length > 0) {
       return refused(
         "conflict",
@@ -539,6 +573,76 @@ const jobRunAdapter: RunAdapter = {
 function continuesOf(row: RunRow): string | undefined {
   const continues = row["continues"];
   return typeof continues === "string" && continues !== "" ? continues : undefined;
+}
+
+/**
+ * Whether a run is one the control API started and can start again: its trigger is
+ * `api`, and its input file (`inputs/<run>.json` for cli, `.txt` otherwise) is a regular
+ * file, not a link, in an inputs directory that lies inside the harness.
+ */
+function startedByApi(harnessDir: string, row: RunRow, cli: boolean): boolean {
+  const trigger = row["trigger"] as { readonly kind?: unknown } | undefined;
+  if (trigger?.kind !== "api") return false;
+  const dir = join(harnessDir, controlPaths(harnessDir).inputsDir);
+  try {
+    if (!landsInside(harnessDir, dir)) return false;
+    return lstatSync(join(dir, cli ? `${row.id}.json` : `${row.id}.txt`)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** A top-level run a root started: its id, and the run it continues when it names one. */
+type ChildRun = { readonly id: string; readonly continues?: string };
+
+/**
+ * The top-level runs `rootId` started: each run whose `running` row names it as
+ * `parent`, newest first, with the run each continues. A job's loops run under their own
+ * ids and name the API run only as their parent, so what a park waits on is bound to one
+ * of these. Read whole, following every page; `undefined` when a page has a gap (this
+ * read decides a withdrawal, so a gap is never skipped).
+ */
+export function childRunsOf(harnessDir: string, rootId: string): ChildRun[] | undefined {
+  const ledger = runsLedger(harnessDir);
+  const out: ChildRun[] = [];
+  const seen = new Set<string>();
+  let before: CursorPosition | undefined;
+  for (;;) {
+    let page: ReturnType<typeof readPage>;
+    try {
+      page = readPage(ledger, { limit: 1000, ...(before !== undefined ? { before } : {}) });
+    } catch {
+      return undefined;
+    }
+    if (page.gaps.length > 0) return undefined;
+    for (const { record } of page.items) {
+      const id = record["id"];
+      if (record["state"] !== "running" || record["parent"] !== rootId) continue;
+      if (typeof id !== "string" || id === rootId || seen.has(id)) continue;
+      seen.add(id);
+      const continues = record["continues"];
+      out.push({
+        id,
+        ...(typeof continues === "string" && continues !== "" ? { continues } : {}),
+      });
+    }
+    if (page.next === undefined) return out;
+    before = page.next;
+  }
+}
+
+/**
+ * Every run a request a parked API run waits on can be bound to: the run, the run it
+ * continues, each top-level run it started and the run each of those continues. The run
+ * comes first, so a withdrawal names it.
+ */
+function familyOf(row: RunRow, children: readonly ChildRun[]): string[] {
+  const ids = [
+    row.id,
+    continuesOf(row),
+    ...children.flatMap((child) => [child.id, child.continues]),
+  ].filter((id): id is string => id !== undefined);
+  return [...new Set(ids)];
 }
 
 /** The harness's approval store, at its session root. */
@@ -701,9 +805,12 @@ async function cancelPlan(
 
 /**
  * Cancel a parked job run that nothing holds. Under the run ledger's lock, with the run
- * folded again there: only while it is still parked, withdraw every request bound to it
- * or to the run it continues (`supersedeRun`, the run first so it names the run), then
- * append `cancelled` by compare-and-set and remove its input file. A run that moved
+ * folded again there, and only while it is still parked: withdraw every request bound
+ * to it, to the run it continues, to each top-level run it started (a job's loops run
+ * under their own ids and name it as their parent) and to the runs those continue
+ * (`supersedeRun`, the run first so it names the run); then append `cancelled` to it by
+ * compare-and-set, and to each of its top-level runs still parked, so neither it nor any
+ * of them, nor their sessions, is resumed; then remove its input file. A run that moved
  * meanwhile (a resume holds it) is left as it is, and nothing is withdrawn.
  */
 async function cancelParked(
@@ -719,30 +826,56 @@ async function cancelParked(
     if (current?.state !== "waiting-for-approval") {
       return { kind: "moved" as const, state: current?.state ?? "absent" };
     }
-    const record = { ...current.record, id: req.runId } as RunRow;
-    const runs = [
-      req.runId,
-      ...(continuesOf(record) !== undefined ? [continuesOf(record) as string] : []),
-    ];
-    const withdrawn = await approvalStoreOf(req.harnessDir).supersedeRun?.(runs, {
-      reason: "run-cancelled",
-      via: "system",
-    });
+    const children = childRunsOf(req.harnessDir, req.runId);
+    if (children === undefined) {
+      return {
+        kind: "failed" as const,
+        reason: "the run records could not be read whole; nothing was withdrawn",
+      };
+    }
     if (!canTransition("run", "waiting-for-approval", "cancelled")) {
       return { kind: "failed" as const, reason: "the run machine refuses the move" };
     }
-    const moved = await casAppendLocked(ledger, req.runId, "waiting-for-approval", {
-      id: req.runId,
-      state: "cancelled",
-      at: at(),
-      trigger: current.record["trigger"] ?? API_TRIGGER,
-      by: receipt.actor,
-      cmd: receipt.id,
-    } as LedgerRecord);
+    const record = { ...current.record, id: req.runId } as RunRow;
+    const withdrawn = await approvalStoreOf(req.harnessDir).supersedeRun?.(
+      familyOf(record, children),
+      { reason: "run-cancelled", via: "system" },
+    );
+    const cancelledRow = (id: string, trigger: unknown): LedgerRecord =>
+      ({
+        id,
+        state: "cancelled",
+        at: at(),
+        trigger: trigger ?? API_TRIGGER,
+        by: receipt.actor,
+        cmd: receipt.id,
+      }) as LedgerRecord;
+    const moved = await casAppendLocked(
+      ledger,
+      req.runId,
+      "waiting-for-approval",
+      cancelledRow(req.runId, current.record["trigger"]),
+    );
     if (!moved.ok) return { kind: "failed" as const, reason: moved.reason };
     if (!moved.applied) return { kind: "moved" as const, state: "changed" };
+    const problems: string[] = [];
+    for (const child of children) {
+      const folded = fold.objects.get(child.id);
+      if (folded?.state !== "waiting-for-approval") continue;
+      const closed = await casAppendLocked(
+        ledger,
+        child.id,
+        "waiting-for-approval",
+        cancelledRow(child.id, folded.record["trigger"]),
+      );
+      if (!closed.ok) problems.push(`${child.id}: ${closed.reason}`);
+    }
     removeApiRunInput(req.harnessDir, req.runId);
-    return { kind: "cancelled" as const, withdrawn: withdrawn?.superseded.length ?? 0 };
+    return {
+      kind: "cancelled" as const,
+      withdrawn: withdrawn?.superseded.length ?? 0,
+      problems,
+    };
   });
   if ("ok" in answer || answer.kind === "failed") {
     return {
@@ -764,7 +897,13 @@ async function cancelParked(
         { kind: "decisions", status: "done", observed: `${answer.withdrawn} withdrawn` },
       ],
     },
-    value: { run: req.runId, state: "cancelled" },
+    value: {
+      run: req.runId,
+      state: "cancelled",
+      ...(answer.problems.length > 0
+        ? { problem: `some of its runs could not be closed: ${answer.problems.join("; ")}` }
+        : {}),
+    },
   };
 }
 
@@ -778,6 +917,9 @@ const managedRunAdapter: RunAdapter = {
   async createRun(req) {
     const operator = operatorRefusal<RunCreateValue>(req.harnessDir, req.admission === "queue");
     if (operator.plan !== undefined) return operator.plan;
+    // A build without the queued-run follower would never claim what is queued for it.
+    const old = bundleRefusal<RunCreateValue>(req.harnessDir, "managed");
+    if (old !== undefined) return old;
     const client = req.home.controlClient;
     const target = req.home.controlTarget?.(req.harnessDir);
     const status =

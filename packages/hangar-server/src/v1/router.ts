@@ -41,7 +41,7 @@ import type { DaemonState, V1Context, V1Deps } from "./context";
 import { V1Error, v1ErrorBody } from "./errors";
 import { OPERATION_BY_ID, matchOperation } from "./match";
 import { commandLedgerOf, entryOf } from "./resolve";
-import { findRun } from "./runs";
+import { findRun, startedRunIn } from "./runs";
 
 const BINARY = "crewhaus";
 
@@ -362,9 +362,13 @@ export function createV1Router(
     const { h, ref, cmd, run } = matched.params;
     const creating = op.qualifiers.includes("creating-service");
     if (h !== undefined) {
-      out.targetHarness = entryOf(deps, h)?.id ?? null;
-      // A service lists the runs it started there, and no others.
-      if (creating && caller.via === "service") out.runBy = caller.principal;
+      const entry = entryOf(deps, h);
+      out.targetHarness = entry?.id ?? null;
+      // A service that started a run there lists the runs it started, and no others; one
+      // that started none is refused as for a harness this Home does not have.
+      if (creating && caller.via === "service" && entry !== undefined) {
+        if (startedRunIn(entry, caller.principal)) out.runBy = caller.principal;
+      }
     } else if (run !== undefined) {
       const found = findRun(deps, run, url.searchParams.get("harness") ?? undefined);
       out.targetHarness = found?.entry.id ?? null;

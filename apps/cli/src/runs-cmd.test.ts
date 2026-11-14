@@ -82,11 +82,28 @@ const statesOf = (runId: string) =>
 
 const sessionRoot = () => join(dir, ".crewhaus", "sessions");
 
-async function parked(): Promise<{ runId: string; approval: string }> {
+const PARKED_SESSION = "sess_00000000000000aa";
+
+/**
+ * An API run parked as the runtime leaves one: the root's rows, its top-level loop's
+ * own run (`parent` the root) that parked, and the request bound to that loop run.
+ */
+async function parked(): Promise<{ runId: string; child: string; approval: string }> {
   const runId = mintRunId();
+  const child = mintRunId();
+  const execution = "run_00000000000000aa";
   plant({ id: runId, state: "queued", by: "sys:reconcile", cmd: mintId("cmd") });
-  plant({ id: runId, state: "preparing", execution: "run_00000000000000aa" });
-  plant({ id: runId, state: "running", execution: "run_00000000000000aa" });
+  plant({ id: runId, state: "preparing", execution });
+  plant({ id: runId, state: "running", execution });
+  plant({
+    id: child,
+    state: "running",
+    parent: runId,
+    session: PARKED_SESSION,
+    resumeScope: `run:${runId}`,
+    execution,
+  });
+  plant({ id: child, state: "waiting-for-approval" });
   plant({ id: runId, state: "waiting-for-approval" });
   const inputs = join(dir, controlPaths(dir).inputsDir);
   mkdirSync(inputs, { recursive: true });
@@ -97,17 +114,18 @@ async function parked(): Promise<{ runId: string; approval: string }> {
     toolName: "Bash",
     inputHash: hashApprovalInput("Bash", { command: "ls" }),
     input: { command: "ls" },
-    runId,
-    sessionId: "sess_00000000000000aa",
+    runId: child,
+    sessionId: PARKED_SESSION,
     surface: "single-turn",
     createdAt: new Date().toISOString(),
-  });
-  return { runId, approval };
+    binding: { runId: child, resumeScope: `run:${runId}` },
+  } as Parameters<ReturnType<typeof createPendingApprovalStore>["persist"]>[0]);
+  return { runId, child, approval };
 }
 
 describe("crewhaus runs cancel, of a parked run with no daemon", () => {
   test("withdraws what it waits on, ends it cancelled, removes its input, and a later grant re-drives nothing", async () => {
-    const { runId, approval } = await parked();
+    const { runId, child, approval } = await parked();
     const control = directControl({ env, cwd: dir });
     const starts: ApiRunInput[] = [];
     const out = await runRunsCommand(["cancel", runId, "--harness", dir], {
@@ -139,6 +157,14 @@ describe("crewhaus runs cancel, of a parked run with no daemon", () => {
     // `runs resume <run>` refuses it before any spec is read or model is called.
     expect(() => resolveRunsResumeTarget(runId, dir)).toThrow(
       `run ${runId} was cancelled; nothing was resumed`,
+    );
+    // Nor the loop run that parked, nor its session.
+    expect(statesOf(child).at(-1)).toBe("cancelled");
+    expect(() => resolveRunsResumeTarget(child, dir)).toThrow(
+      `run ${child} was cancelled; nothing was resumed`,
+    );
+    expect(() => resolveRunsResumeTarget(PARKED_SESSION, dir)).toThrow(
+      `session ${PARKED_SESSION}'s run ${child} was cancelled; nothing was resumed`,
     );
     expect(starts).toHaveLength(0);
     // A second cancel is refused: the run ended.

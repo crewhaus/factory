@@ -14,6 +14,7 @@ import { append, controlPaths, foldStates, readPage, runsLedger } from "@crewhau
 import { reconcileRunCreate } from "@crewhaus/control-service";
 import {
   createPendingApprovalStore,
+  foldReadOnly,
   generateApprovalId,
   hashApprovalInput,
 } from "@crewhaus/session-store";
@@ -150,6 +151,7 @@ describe("starting a run", () => {
 
   test("a managed harness with no daemon: reject is 503 and writes nothing; queue records it for tenant home, settled by its reconciler", async () => {
     const h = await home.harness("managed-start", { target: "managed" });
+    stamp(h.dir, "daemon.ts", "0.9.0");
     const rejected = await home.call("POST", `/api/v1/harnesses/${h.id}/runs`, {
       body: { input: "x" },
     });
@@ -175,6 +177,23 @@ describe("starting a run", () => {
       now: Date.now,
     });
     expect(seen).toBe("done");
+  });
+
+  test("a managed harness stamped 0.8.2 with no daemon: queue is 501 with `crewhaus compile`, and nothing is written", async () => {
+    const h = await home.harness("managed-old", { target: "managed" });
+    stamp(h.dir, "daemon.ts", "0.8.2");
+    const res = await home.call("POST", `/api/v1/harnesses/${h.id}/runs`, {
+      body: { input: "x", admission: "queue" },
+    });
+    expect(res.status).toBe(501);
+    expect(errorOf(res.body)).toMatchObject({ code: "unsupported", verb: "crewhaus compile" });
+    expect(rowsOf(h.dir)).toEqual([]);
+    expect(existsSync(join(h.dir, controlPaths(h.dir).inputsDir))).toBe(false);
+    const commands = await home.call("GET", `/api/v1/harnesses/${h.id}/commands`);
+    expect(commands.body["items"]).toEqual([]);
+    const caps = await home.call("GET", `/api/v1/harnesses/${h.id}/capabilities`);
+    expect(caps.status).toBe(200);
+    expect(JSON.stringify(caps.body)).toContain("crewhaus compile");
   });
 
   test("paused and disabled are 503 before anything is written; work is 501", async () => {
@@ -226,6 +245,50 @@ describe("a service starting runs", () => {
       (res.body["run"] as Record<string, unknown> | undefined)?.["id"];
     expect(id(second)).toBe(id(first));
     expect(rowsOf(h.dir).filter((row) => row["state"] === "queued")).toHaveLength(1);
+    // Paused now, a retry is still told the run it started, not refused.
+    await home.call("POST", `/api/v1/harnesses/${h.id}/controls/pause`, { body: {} });
+    const paused = await send();
+    expect(paused.status).toBe(202);
+    expect(paused.headers.get(IDEMPOTENT_REPLAYED_HEADER)).toBe("true");
+    expect(id(paused)).toBe(id(first));
+    // A fresh key is refused as paused.
+    const fresh = await home.call("POST", `/api/v1/harnesses/${h.id}/runs`, {
+      body: { input: "x" },
+      secret: svc.secret,
+      headers: { "Idempotency-Key": "order-2" },
+    });
+    expect(fresh.status).toBe(503);
+    expect(errorOf(fresh.body)["code"]).toBe("paused");
+    await home.call("POST", `/api/v1/harnesses/${h.id}/controls/resume`, { body: {} });
+  });
+
+  test("a cancel retried after it succeeded is answered with its receipt, not run_ended", async () => {
+    const h = await cliHarness("service-cancel-retry");
+    const elsewhere = await home.harness("service-cancel-elsewhere");
+    // It cancels the run it started, whatever else it holds.
+    const svc = await home.service("canceller", [elsewhere.id], { permissions: ["h.run.submit"] });
+    const runId = mintRunId();
+    append(runsLedger(h.dir), {
+      id: runId,
+      state: "queued",
+      at: new Date().toISOString(),
+      trigger: { kind: "api" },
+      by: svc.principal,
+    });
+    const cancel = () =>
+      home.call("POST", `/api/v1/runs/${runId}/cancel`, {
+        body: {},
+        secret: svc.secret,
+        headers: { "Idempotency-Key": "cancel-1" },
+      });
+    const first = await cancel();
+    expect(first.status).toBe(200);
+    const again = await cancel();
+    expect(again.status).toBe(200);
+    expect(again.headers.get(IDEMPOTENT_REPLAYED_HEADER)).toBe("true");
+    expect((again.body["receipt"] as Record<string, unknown>)["id"]).toBe(
+      (first.body["receipt"] as Record<string, unknown>)["id"],
+    );
   });
 
   test("a subject without h.subject.assert is 403", async () => {
@@ -281,6 +344,32 @@ describe("a service starting runs", () => {
       [mineId, theirsId].sort(),
     );
   });
+
+  test("a service that started no run on a harness it may not read is refused its runs as for a harness this Home does not have", async () => {
+    const h = await home.harness("not-mine");
+    const elsewhere = await home.harness("not-mine-elsewhere");
+    const svc = await home.service("stranger", [elsewhere.id], { permissions: ["h.run.submit"] });
+    append(runsLedger(h.dir), {
+      id: mintRunId(),
+      state: "queued",
+      at: new Date().toISOString(),
+      trigger: { kind: "api" },
+      by: "sys:reconcile",
+    });
+    const registered = await home.call("GET", `/api/v1/harnesses/${h.id}/runs`, {
+      secret: svc.secret,
+    });
+    const absent = await home.call("GET", "/api/v1/harnesses/no-such-harness/runs", {
+      secret: svc.secret,
+    });
+    expect(registered.status).toBe(403);
+    expect(absent.status).toBe(registered.status);
+    const shape = (res: typeof registered) => {
+      const { code, reason } = errorOf(res.body);
+      return { code, reason };
+    };
+    expect(shape(registered)).toEqual(shape(absent));
+  });
 });
 
 describe("reading a run and its result", () => {
@@ -331,19 +420,30 @@ describe("reading a run and its result", () => {
 });
 
 describe("cancelling and resuming", () => {
+  /**
+   * An API run parked as the runtime leaves one: the root's rows, its top-level loop's own
+   * run (`parent` the root) that parked, the root closed parked, its input file, and the
+   * request bound to the loop run.
+   */
   async function parkedRun(dir: string) {
     const runId = mintRunId();
+    const child = mintRunId();
     const at = new Date().toISOString();
     const ledger = runsLedger(dir);
-    for (const state of ["queued", "preparing", "running", "waiting-for-approval"]) {
-      append(ledger, {
-        id: runId,
-        state,
-        at,
-        trigger: { kind: "api" },
-        ...(state === "queued" ? { by: "sys:reconcile" } : { execution: "run_00000000000000aa" }),
-      });
-    }
+    const execution = "run_00000000000000aa";
+    const row = (id: string, state: string, more: Record<string, unknown> = {}) =>
+      append(ledger, { id, state, at, trigger: { kind: "api" }, ...more });
+    row(runId, "queued", { by: "sys:reconcile" });
+    row(runId, "preparing", { execution });
+    row(runId, "running", { execution });
+    row(child, "running", {
+      parent: runId,
+      session: "sess_00000000000000cc",
+      resumeScope: `run:${runId}`,
+      execution,
+    });
+    row(child, "waiting-for-approval");
+    row(runId, "waiting-for-approval", { execution });
     const inputs = join(dir, controlPaths(dir).inputsDir);
     mkdirSync(inputs, { recursive: true });
     writeFileSync(join(inputs, `${runId}.json`), JSON.stringify({ v: 1, run: runId, input: "x" }), {
@@ -355,12 +455,13 @@ describe("cancelling and resuming", () => {
       id: approval,
       toolName: "Bash",
       inputHash: hashApprovalInput("Bash", { command: "ls" }),
-      runId,
+      runId: child,
       sessionId: "sess_00000000000000cc",
       surface: "single-turn",
       createdAt: at,
-    });
-    return { runId, approval, store };
+      binding: { runId: child, resumeScope: `run:${runId}` },
+    } as Parameters<typeof store.persist>[0]);
+    return { runId, child, approval, store };
   }
 
   test("a pending park is 409 to resume; once decided it is started again under the same run", async () => {
@@ -381,10 +482,16 @@ describe("cancelling and resuming", () => {
 
   test("cancelling a parked run withdraws what it waits on; an ended one is 409", async () => {
     const h = await cliHarness("cancel-run");
-    const { runId } = await parkedRun(h.dir);
+    const { runId, child, approval } = await parkedRun(h.dir);
     const cancelled = await home.call("POST", `/api/v1/runs/${runId}/cancel`, { body: {} });
     expect(cancelled.status).toBe(200);
     expect((cancelled.body["receipt"] as Record<string, unknown>)["state"]).toBe("succeeded");
+    const record = foldReadOnly(join(h.dir, ".crewhaus", "sessions")).records.find(
+      (r) => r.id === approval,
+    );
+    expect(record?.supersededBy).toBe(runId);
+    const fold = foldStates(runsLedger(h.dir));
+    expect(fold.ok ? fold.objects.get(child)?.state : "").toBe("cancelled");
     const again = await home.call("POST", `/api/v1/runs/${runId}/cancel`, { body: {} });
     expect(again.status).toBe(409);
     expect(errorOf(again.body)["reason"]).toBe("run_ended");

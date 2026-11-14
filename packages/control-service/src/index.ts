@@ -73,6 +73,7 @@ export { AREA_RUNTIMES, activationGates, compositionProblems, retireRevokers } f
 export {
   type Commands,
   type InlineEffect,
+  type ReplayLookup,
   type SubmitAnswer,
   type SubmitRequest,
   receiptOf,
@@ -189,7 +190,9 @@ export {
   reconcileRunCancel,
   reconcileRunCreate,
   reconcileRunResume,
+  childRunsOf,
   runAdapterFor,
+  runBundleRefusal,
   runRefOf,
   runRowOf,
   versionAtLeast,

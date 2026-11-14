@@ -30,7 +30,10 @@
   },
   "devDependencies": {
     "@crewhaus/errors": "workspace:*",
-    "@crewhaus/spec-patch": "workspace:*"
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {
