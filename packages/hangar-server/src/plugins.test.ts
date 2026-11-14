@@ -5,19 +5,24 @@
  * assertions below are as much about the deferred pair as about the live
  * one: `onSpecLoad` and `onEvalSampleRendered` must be reported declared,
  * not wired, and carry the reason. The rest is containment — the sandbox
- * token list, the fail-closed CSP, and the filesystem permission that
- * decides whether a plugin sees a harness at all.
+ * token list, the fail-closed CSP — and serving: a pane, a trace and a
+ * pane's network reach come only from what the plugin's owner granted
+ * (`plugin-grants.test.ts` holds the ledger side).
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PluginGrantSet } from "@crewhaus/control-contract";
 import { makeFixtureHarness } from "./fixture";
+import { SERVED_NOTHING, grantPlugin } from "./plugin-grants";
 import {
   DEFERRED_EXTENSION_POINTS,
   PANE_SANDBOX,
+  type ServedPlugin,
   WIRED_EXTENSION_POINTS,
   classifyExtensionPoints,
+  netOriginsOf,
   panePolicy,
   panesForHarness,
   pluginMayFetch,
@@ -106,18 +111,24 @@ describe("the pane sandbox and CSP are fail-closed", () => {
     expect(PANE_SANDBOX).not.toContain("allow-same-origin");
   });
 
-  test("no net permission ⇒ connect-src 'none' and nothing else may load", () => {
-    const { csp, connectSrc } = panePolicy(undefined);
+  test("no origin served ⇒ connect-src 'none' and nothing else may load", () => {
+    const { csp, connectSrc } = panePolicy([]);
     expect(connectSrc).toEqual([]);
     expect(csp).toContain("default-src 'none'");
     expect(csp).toContain("connect-src 'none'");
     expect(csp).toContain("form-action 'none'");
   });
 
-  test("declared origins reach connect-src; a glob is narrowed to its origin", () => {
-    const { csp, connectSrc } = panePolicy({
-      net: ["fetch:https://api.example.test/**", "fetch:https://api.example.test/v2/*", "read:x"],
-    });
+  test("a manifest's net globs ask for their origins; served origins reach connect-src", () => {
+    expect(
+      netOriginsOf([
+        "fetch:https://api.example.test/**",
+        "fetch:https://api.example.test/v2/*",
+        "fetch:https://*.wild.test/**",
+        "read:x",
+      ]),
+    ).toEqual(["https://api.example.test"]);
+    const { csp, connectSrc } = panePolicy(["https://api.example.test"]);
     expect(connectSrc).toEqual(["https://api.example.test"]);
     expect(csp).toContain("connect-src https://api.example.test");
     // The per-URL decision still belongs to the loader's own evaluator.
@@ -130,7 +141,7 @@ describe("the pane sandbox and CSP are fail-closed", () => {
   });
 });
 
-describe("pluginSeesHarness", () => {
+describe("pluginSeesHarness (the harnesses a review prefills)", () => {
   test("fail-closed: no fs permission means no visibility", () => {
     expect(pluginSeesHarness(undefined, "/h/one")).toBe(false);
     expect(pluginSeesHarness({}, "/h/one")).toBe(false);
@@ -186,8 +197,14 @@ describe("readPluginInventory", () => {
   });
 });
 
-describe("panes and trace observers are gated by the same permission", () => {
-  test("a plugin that may not read the harness neither draws a pane nor observes it", () => {
+/** A served view: nothing, then these fields. */
+const servedSet = (over: Partial<PluginGrantSet>): PluginGrantSet => ({
+  ...SERVED_NOTHING,
+  ...over,
+});
+
+describe("panes and trace observers come from the served view", () => {
+  test("only what is served on that harness: its panes, and run.trace for an observer", () => {
     const root = mkdtempSync(join(tmpdir(), "hangar-plugins-"));
     try {
       const dir = makePluginsDir(root, [
@@ -197,28 +214,49 @@ describe("panes and trace observers are gated by the same permission", () => {
             name: "allowed",
             version: "1.0.0",
             onTraceEvent: true,
-            panes: [{ id: "a", title: "A", file: "a.html" }],
+            panes: [
+              { id: "a", title: "A", file: "a.html" },
+              { id: "a2", title: "A2", file: "a2.html" },
+            ],
             permissions: { fs: ["read:/h/**"] },
           },
-          files: { "a.html": "<p>a</p>" },
         },
         {
-          name: "denied",
+          name: "ungranted",
           manifest: {
-            name: "denied",
+            name: "ungranted",
             version: "1.0.0",
             onTraceEvent: true,
             panes: [{ id: "b", title: "B", file: "b.html" }],
-            permissions: { fs: ["read:/elsewhere/**"] },
+            // It asks to see every harness; asking is not a grant.
+            permissions: { fs: ["read:/**"] },
           },
-          files: { "b.html": "<p>b</p>" },
         },
       ]);
-      const plugins = readPluginInventory(dir).plugins;
-      expect(panesForHarness(plugins, "/h/one").map((p) => p.plugin)).toEqual(["allowed"]);
-      expect(traceObservers(plugins, "/h/one")).toEqual(["allowed"]);
-      expect(panesForHarness(plugins, "/h/one")[0]?.sandbox).toBe(PANE_SANDBOX);
-      expect(traceObservers(plugins, "/nowhere/near")).toEqual([]);
+      const [allowed, ungranted] = readPluginInventory(dir).plugins as [
+        ServedPlugin["plugin"],
+        ServedPlugin["plugin"],
+      ];
+      const served: ServedPlugin[] = [
+        {
+          plugin: allowed,
+          served: servedSet({ harnesses: ["hrn_a"], panes: ["a"], reads: ["run.trace"] }),
+        },
+        { plugin: ungranted, served: SERVED_NOTHING },
+      ];
+      expect(panesForHarness(served, "hrn_a").map((p) => `${p.plugin}/${p.pane.id}`)).toEqual([
+        "allowed/a",
+      ]);
+      expect(panesForHarness(served, "hrn_a")[0]?.sandbox).toBe(PANE_SANDBOX);
+      expect(traceObservers(served, "hrn_a")).toEqual(["allowed"]);
+      expect(panesForHarness(served, "hrn_b")).toEqual([]);
+      expect(traceObservers(served, "hrn_b")).toEqual([]);
+      // A pane without run.trace observes nothing; "all" covers every harness.
+      const panesOnly: ServedPlugin[] = [
+        { plugin: allowed, served: servedSet({ harnesses: "all", panes: ["a", "a2"] }) },
+      ];
+      expect(traceObservers(panesOnly, "hrn_z")).toEqual([]);
+      expect(panesForHarness(panesOnly, "hrn_z").map((p) => p.pane.id)).toEqual(["a", "a2"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -243,11 +281,21 @@ describe("readPaneDocument", () => {
       ]);
       const plugin = readPluginInventory(dir).plugins[0];
       expect(plugin).toBeDefined();
-      const doc = readPaneDocument(plugin as NonNullable<typeof plugin>, "a");
+      const p = plugin as NonNullable<typeof plugin>;
+      const doc = readPaneDocument(p, "a", servedSet({ panes: ["a"] }));
       expect(doc?.doc).toBe("<p>hello</p>");
       expect(doc?.sandbox).toBe(PANE_SANDBOX);
       expect(doc?.csp).toContain("connect-src 'none'");
-      expect(readPaneDocument(plugin as NonNullable<typeof plugin>, "nope")).toBeUndefined();
+      expect(readPaneDocument(p, "nope", servedSet({ panes: ["a", "nope"] }))).toBeUndefined();
+      // A pane the served view does not hold is never read.
+      expect(readPaneDocument(p, "a", SERVED_NOTHING)).toBeUndefined();
+      // The served origins, and only those, reach connect-src.
+      const reaching = readPaneDocument(
+        p,
+        "a",
+        servedSet({ panes: ["a"], net: ["https://api.example.test"] }),
+      );
+      expect(reaching?.csp).toContain("connect-src https://api.example.test;");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -270,7 +318,9 @@ describe("readPaneDocument", () => {
       ]);
       symlinkSync(secret, join(dir, "p", "a.html"));
       const plugin = readPluginInventory(dir).plugins[0];
-      expect(readPaneDocument(plugin as NonNullable<typeof plugin>, "a")).toBeUndefined();
+      expect(
+        readPaneDocument(plugin as NonNullable<typeof plugin>, "a", servedSet({ panes: ["a"] })),
+      ).toBeUndefined();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -278,105 +328,150 @@ describe("readPaneDocument", () => {
 });
 
 describe("GET /api/plugins, /api/plugins/:name/panes/:paneId and /api/h/:id/panes", () => {
-  test("the routes report the wiring, the panes and the deferred pair", async () => {
+  /** A manifest asking to see every harness under `root`, with a pane and an observer. */
+  const costLens = (root: string) => ({
+    name: "cost-lens",
+    version: "1.0.0",
+    onTraceEvent: true,
+    onSpecLoad: true,
+    panes: [{ id: "spend", title: "Spend", file: "spend.html" }],
+    permissions: {
+      fs: [`read:${root}/**`],
+      net: ["fetch:https://api.example.test/**"],
+    },
+  });
+
+  async function bootWithPlugin() {
     const scratch = mkdtempSync(join(tmpdir(), "hangar-plugins-route-"));
-    // A read glob that covers nothing this server registers: the plugin is
-    // installed and visible in the inventory, but it draws no pane and
-    // observes no harness.
     const pluginsDir = makePluginsDir(scratch, [
-      {
-        name: "cost-lens",
-        manifest: {
-          name: "cost-lens",
-          version: "1.0.0",
-          onTraceEvent: true,
-          onSpecLoad: true,
-          panes: [{ id: "spend", title: "Spend", file: "spend.html" }],
-          permissions: { fs: ["read:/nowhere-near-this-machine/**"] },
-        },
-        files: { "spend.html": "<p>spend</p>" },
-      },
+      { name: "cost-lens", manifest: { name: "cost-lens", version: "1.0.0" } },
     ]);
     const t = bootTestServer({ now: () => NOW, pluginsDir });
-    try {
-      const dir = join(t.harnessesRoot, "paned");
-      makeFixtureHarness(dir, { specName: "paned" });
+    // The glob is written against THIS server's temp harness root, which only
+    // exists once the server has been booted.
+    writeFileSync(
+      join(pluginsDir, "cost-lens", "plugin.json"),
+      JSON.stringify(costLens(t.harnessesRoot)),
+    );
+    writeFileSync(join(pluginsDir, "cost-lens", "spend.html"), "<p>spend</p>");
+    const add = async (name: string): Promise<string> => {
+      const dir = join(t.harnessesRoot, name);
+      makeFixtureHarness(dir, { specName: name });
       const added = await t.api("/api/harnesses", {
         method: "POST",
         body: JSON.stringify({ dir }),
       });
-      const id = (added.body["entry"] as { id: string }).id;
+      return (added.body["entry"] as { id: string }).id;
+    };
+    const a = await add("paned-a");
+    const b = await add("paned-b");
+    const done = async () => {
+      await t.stop();
+      rmSync(scratch, { recursive: true, force: true });
+    };
+    return { t, pluginsDir, a, b, done };
+  }
 
+  test("with no grant: no pane, no observer, the document 404s, and the plugin waits", async () => {
+    const { t, a, done } = await bootWithPlugin();
+    try {
       const inventory = await t.api("/api/plugins");
       expect(inventory.status).toBe(200);
       const plugins = inventory.body["plugins"] as Array<{
         name: string;
+        grant: { state: string; legacy: boolean };
         extensionPoints: Array<{ point: string; wired: boolean; reason: string | null }>;
       }>;
+      expect(plugins[0]?.grant).toEqual({ state: "waiting", legacy: true });
       const points = plugins[0]?.extensionPoints ?? [];
       expect(points.find((p) => p.point === "onSpecLoad")?.wired).toBe(false);
       expect(String(points.find((p) => p.point === "onSpecLoad")?.reason)).toContain("deferred");
       expect(points.find((p) => p.point === "onTraceEvent")?.wired).toBe(true);
 
       const doc = await t.api("/api/plugins/cost-lens/panes/spend");
-      expect(doc.status).toBe(200);
-      expect(doc.body["sandbox"]).toBe(PANE_SANDBOX);
-      expect(String(doc.body["csp"])).toContain("default-src 'none'");
-      expect((await t.api("/api/plugins/cost-lens/panes/missing")).status).toBe(404);
-      expect((await t.api("/api/plugins/nope/panes/spend")).status).toBe(404);
+      expect(doc.status).toBe(404);
+      expect(doc.body["error"]).toBe("no such pane");
+      // An unknown plugin answers the same: nothing says what is installed.
+      expect((await t.api("/api/plugins/nope/panes/spend")).body["error"]).toBe("no such pane");
 
-      const panes = await t.api(`/api/h/${id}/panes`);
+      const panes = await t.api(`/api/h/${a}/panes`);
       expect(panes.status).toBe(200);
       expect(panes.body["panes"]).toEqual([]);
       expect(panes.body["traceObservers"]).toEqual([]);
+      expect(panes.body["waiting"]).toEqual(["cost-lens"]);
       expect(Object.keys(panes.body["deferred"] as object).sort()).toEqual([
         "onEvalSampleRendered",
         "onSpecLoad",
       ]);
     } finally {
-      await t.stop();
-      rmSync(scratch, { recursive: true, force: true });
+      await done();
     }
   }, 20_000);
 
-  test("a plugin whose read glob covers the harness gets its pane on that harness", async () => {
-    const scratch = mkdtempSync(join(tmpdir(), "hangar-plugins-route2-"));
-    const pluginsDir = makePluginsDir(scratch, [
-      { name: "cost-lens", manifest: { name: "cost-lens", version: "1.0.0" } },
-    ]);
-    const t = bootTestServer({ now: () => NOW, pluginsDir });
+  test("a grant on harness A serves its pane and trace on A only, and only the granted origins", async () => {
+    const { t, pluginsDir, a, b, done } = await bootWithPlugin();
     try {
-      const dir = join(t.harnessesRoot, "paned");
-      makeFixtureHarness(dir, { specName: "paned" });
-      // The glob is written against THIS server's temp harness root, which
-      // only exists once the server has been booted.
-      writeFileSync(
-        join(pluginsDir, "cost-lens", "plugin.json"),
-        JSON.stringify({
-          name: "cost-lens",
-          version: "1.0.0",
-          onTraceEvent: true,
-          panes: [{ id: "spend", title: "Spend", file: "spend.html" }],
-          permissions: { fs: [`read:${t.harnessesRoot}/**`] },
-        }),
-      );
-      writeFileSync(join(pluginsDir, "cost-lens", "spend.html"), "<p>spend</p>");
-      const added = await t.api("/api/harnesses", {
-        method: "POST",
-        body: JSON.stringify({ dir }),
+      const row = readPluginInventory(pluginsDir).plugins[0] as ServedPlugin["plugin"];
+      const granted = await grantPlugin(t.hangarRoot, {
+        row,
+        grant: { ...SERVED_NOTHING, harnesses: [a], panes: ["spend"], reads: ["run.trace"] },
+        by: "local:test",
+        cmd: "cmd_test",
       });
-      const id = (added.body["entry"] as { id: string }).id;
-      const panes = await t.api(`/api/h/${id}/panes`);
-      const rows = panes.body["panes"] as Array<{ plugin: string; id: string; sandbox: string }>;
+      expect(granted.ok).toBe(true);
+      const onA = await t.api(`/api/h/${a}/panes`);
+      const rows = onA.body["panes"] as Array<{ plugin: string; id: string; sandbox: string }>;
       expect(rows.map((r) => `${r.plugin}/${r.id}`)).toEqual(["cost-lens/spend"]);
       expect(rows[0]?.sandbox).toBe(PANE_SANDBOX);
-      expect(panes.body["traceObservers"]).toEqual(["cost-lens"]);
+      expect(onA.body["traceObservers"]).toEqual(["cost-lens"]);
+      expect(onA.body["waiting"]).toEqual([]);
+      const onB = await t.api(`/api/h/${b}/panes`);
+      expect(onB.body["panes"]).toEqual([]);
+      expect(onB.body["traceObservers"]).toEqual([]);
+
+      const doc = await t.api("/api/plugins/cost-lens/panes/spend");
+      expect(doc.status).toBe(200);
+      expect(doc.body["sandbox"]).toBe(PANE_SANDBOX);
+      // The manifest asks for an origin; none was granted, so none is reachable.
+      expect(String(doc.body["csp"])).toContain("connect-src 'none'");
+      expect((await t.api("/api/plugins/cost-lens/panes/missing")).status).toBe(404);
+      const plugins = (await t.api("/api/plugins")).body["plugins"] as Array<{
+        grant: { state: string };
+      }>;
+      expect(plugins[0]?.grant.state).toBe("allowed");
     } finally {
-      await t.stop();
-      rmSync(scratch, { recursive: true, force: true });
+      await done();
+    }
+  }, 20_000);
+
+  test("the reads leave Home's root as they found it", async () => {
+    const { t, a, done } = await bootWithPlugin();
+    try {
+      const before = listTree(t.hangarRoot);
+      await t.api("/api/plugins");
+      await t.api(`/api/h/${a}/panes`);
+      await t.api("/api/plugins/cost-lens/panes/spend");
+      expect(listTree(t.hangarRoot)).toEqual(before);
+      expect(before.some((path) => path.startsWith("plugins"))).toBe(false);
+    } finally {
+      await done();
     }
   }, 20_000);
 });
+
+/** Every path under `root`, relative and sorted. */
+function listTree(root: string): string[] {
+  const out: string[] = [];
+  const walk = (rel: string) => {
+    for (const entry of readdirSync(join(root, rel), { withFileTypes: true })) {
+      const path = rel === "" ? entry.name : `${rel}/${entry.name}`;
+      out.push(path);
+      if (entry.isDirectory()) walk(path);
+    }
+  };
+  walk("");
+  return out.sort();
+}
 
 describe("pane scoping speaks the glob's alphabet on both sides", () => {
   // Provable on ANY platform: feed the Windows-shaped strings directly.

@@ -27,6 +27,7 @@ import { HOME_DELEGATION } from "./delegations";
 import { DEPLOYMENT_HANDLERS } from "./deployments";
 import { DEVICE_HANDLERS } from "./device";
 import { HARNESS_HANDLERS } from "./harnesses";
+import { HOME_INTEGRATIONS } from "./integrations";
 import { CORE_REF_RESOLVERS, META_HANDLERS } from "./meta";
 import { RULE_HANDLERS } from "./rules";
 import { RUN_HANDLERS } from "./runs";
@@ -82,7 +83,7 @@ export const HOME_AREAS: readonly HomeAreaRuntime[] = [
 
   // HOME_INSPECTION,
 
-  // HOME_INTEGRATIONS,
+  HOME_INTEGRATIONS,
 
   // HOME_KNOWLEDGE,
 

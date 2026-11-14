@@ -67,6 +67,7 @@ export const ROUTE_TWIN_NOTES: Readonly<Record<string, string>> = Object.freeze(
   datasetBuilderStep: NONE,
   mcpConnectorWrite: NONE,
   mcpConnectorRemove: NONE,
+  pluginUseWrite: "No command-line equivalent: edit `plugins:` in crewhaus.yaml.",
   // Memory.
   memoryForget: NONE,
   memorySweep:

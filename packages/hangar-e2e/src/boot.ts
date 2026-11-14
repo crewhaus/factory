@@ -37,6 +37,8 @@ export type Home = HomeAddress & {
   readonly port: number;
   /** Where this Home looks for installed plugins (empty until a journey installs one). */
   readonly pluginsDir: string;
+  /** Home's own root, where its control records (plugin grants among them) live. */
+  readonly hangarRoot: string;
   readonly fleet: Fleet;
   readonly notifications: RecordedNotifications;
   readonly server: HangarServer;
@@ -100,6 +102,7 @@ export function bootHome(fleet: Fleet, opts: BootHomeOptions = {}): Home {
     url: server.url,
     port: server.port,
     pluginsDir,
+    hangarRoot: root,
     bootPath,
     token,
     fleet,

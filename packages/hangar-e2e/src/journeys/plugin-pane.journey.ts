@@ -3,9 +3,11 @@
  * strict one. A pane in a `srcdoc` frame would inherit the console's policy, which runs
  * no inline script; the pane loads from a single-use address that serves the plugin's
  * policy and the sandbox as headers instead. The session fails on any policy violation.
+ * Home serves a plugin only what its owner granted, so the pane is granted first.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { SERVED_NOTHING, grantPlugin, readPluginInventory } from "@crewhaus/hangar-server";
 import { routeFor } from "../console-routes";
 import type { Journey } from "./journey";
 
@@ -37,6 +39,15 @@ export const pluginPane: Journey = {
       join(plugin, "probe.html"),
       `<p id="out">waiting</p><script>document.getElementById("out").textContent = ${JSON.stringify(RAN)};</script>`,
     );
+    const row = readPluginInventory(home.pluginsDir).plugins.find((p) => p.name === "pane-probe");
+    if (row === undefined) throw new Error("the planted plugin is not in the inventory");
+    const granted = await grantPlugin(home.hangarRoot, {
+      row,
+      grant: { ...SERVED_NOTHING, harnesses: [harness.id], panes: ["probe"] },
+      by: "local:e2e",
+      cmd: "cmd_e2e",
+    });
+    if (!granted.ok) throw new Error(`the pane was not granted: ${granted.code}`);
 
     const panes: string[] = [];
     const session = await scope.session(home, {

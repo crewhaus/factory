@@ -9,7 +9,8 @@
     ".": "./src/index.ts",
     "./eval-inputs": "./src/eval-inputs.ts",
     "./twin-sources": "./src/twin-sources.ts",
-    "./scaffolded-workflows": "./src/scaffolded-workflows.ts"
+    "./scaffolded-workflows": "./src/scaffolded-workflows.ts",
+    "./plugin-grants": "./src/plugin-grants.ts"
   },
   "scripts": {
     "test": "bun test src"

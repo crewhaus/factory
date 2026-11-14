@@ -1334,7 +1334,12 @@ import {
 // Item 3 (G32) — `plugins:` activation resolution for `run`/`dev` + the
 // `--plugins` override. Pure name resolution (unit-testable); the real
 // `activatePlugins` / dev spec-override wiring is below in this entry file.
-import { parsePluginsFlag, resolvePluginNames } from "./plugin-activation";
+import {
+  parsePluginsFlag,
+  pluginEntryNames,
+  resolvePluginNames,
+  withPluginsOverride,
+} from "./plugin-activation";
 // Item 4 (§59) — `crewhaus export claude-plugin` helpers: author / out-dir
 // resolution, the harness's authored `.crewhaus/` skills + commands (item 14),
 // and the post-emit smoke check (the emitted plugin.json / .mcp.json parse).
@@ -1345,6 +1350,9 @@ import {
   resolveExportOutDir,
   smokeCheckClaudePluginBundle,
 } from "./plugin-export";
+// Item 25 — model right-sizing downshift search core (pure enumeration + cost
+// projection + $/score ranking); side-effect-free so it is unit-testable.
+import { runPluginGrants } from "./plugins-grant-cmd";
 import { readPrCheckViaGh } from "./pr-witness";
 // Item 59 — PR-based optimize/advise proposals. `crewhaus propose` packages a
 // spec change into a review artifact + opens a PR (never auto-merges), in a
@@ -1408,8 +1416,6 @@ import {
   pinRecoveriesAfterOptimize,
 } from "./regression-pin";
 import { parseReplayToolsFlags } from "./replay-flags";
-// Item 25 — model right-sizing downshift search core (pure enumeration + cost
-// projection + $/score ranking); side-effect-free so it is unit-testable.
 import { type HeavyRetireSteps, retireCommand } from "./retire-cmd";
 // Wave 3 (B20) — the persistent human-review queue
 // (.crewhaus/review/queue.jsonl): pure entry builders/formatters + the
@@ -4698,7 +4704,7 @@ async function runRunCli(
     pluginSkillDirs = activated.skillDirs;
     pluginTools = activated.tools;
     process.stdout.write(
-      `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
+      `[plugins] ${activated.loaded.length} activated: ${pluginEntryNames(pluginNames)}\n`,
     );
   }
 
@@ -5507,9 +5513,7 @@ function devCompileAndEmit(
   // an empty override serializes `plugins: []`, which lowers to "activate none".
   if (pluginsOverride !== undefined) {
     try {
-      const doc = parseDocument(yamlText);
-      doc.set("plugins", [...pluginsOverride]);
-      yamlText = doc.toString();
+      yamlText = withPluginsOverride(yamlText, pluginsOverride);
     } catch (err) {
       return { ok: false, error: `--plugins override failed: ${(err as Error).message}` };
     }
@@ -6067,7 +6071,7 @@ async function buildServeRuntime(
     pluginSkillDirs = activated.skillDirs;
     pluginTools = activated.tools;
     process.stdout.write(
-      `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
+      `[plugins] ${activated.loaded.length} activated: ${pluginEntryNames(pluginNames)}\n`,
     );
   }
 
@@ -18966,6 +18970,12 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
         "  crewhaus plugins outdated [--registry <ref>]           installed vs latest report\n" +
         "  crewhaus plugins publish --manifest <plugin.json>      open a publish PR (item 60)\n" +
         "       [--registry <ref>] [--dry-run]\n" +
+        "  crewhaus plugins grants [<name>]                       what each plugin asks, and what Home serves it\n" +
+        "  crewhaus plugins grant <name> [--harness <id|dir>[,…]] [--all-harnesses]\n" +
+        "       [--panes <id>[,…]] [--events <family>[,…]] [--reads <kind>[,…]]\n" +
+        "       [--net <origin>[,…]] [--tools <name>[,…]] [--expect <generation>]\n" +
+        "                                                         allow what you choose; nothing else is served\n" +
+        "  crewhaus plugins revoke <name>                         remove a plugin's grant\n" +
         "\n" +
         "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
         "  http(s):// index; falls back to CREWHAUS_PLUGIN_REGISTRY, then the default\n" +
@@ -18980,6 +18990,13 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
 
   const pluginsDirFlag = args.flags["plugins-dir"];
   const pluginsDir = typeof pluginsDirFlag === "string" ? pluginsDirFlag : defaultPluginsDir();
+  if (action === "grants" || action === "grant" || action === "revoke") {
+    const done = await runPluginGrants(action, args, pluginsDir);
+    for (const line of done.lines)
+      (done.exitCode === 0 ? process.stdout : process.stderr).write(`${line}\n`);
+    if (done.exitCode !== 0) process.exit(done.exitCode);
+    return;
+  }
   const registryFileFlag = args.flags["registry-file"];
   const registryPath =
     typeof registryFileFlag === "string" ? registryFileFlag : defaultPluginRegistryPath();

@@ -242,6 +242,13 @@ describe("every served operation answers its row's shape", () => {
         path: "/api/v1/access/device-requests/decide",
         body: { code: started.userCode, choice: "deny" },
       },
+      // No plugin is installed here: each answers the error envelope.
+      "plugins.review": { path: "/api/v1/plugins/notes-pane/review" },
+      "plugins.grant": {
+        path: "/api/v1/plugins/notes-pane/grant",
+        body: { harnesses: [a.id], panes: [], events: [], reads: [], net: [], tools: [] },
+      },
+      "plugins.revoke": { path: "/api/v1/plugins/notes-pane/revoke", body: {} },
     };
     // The core's handlers and creation's; delegation's are asked in its own contract test.
     const served = [...handlersOf([HOME_CORE, HOME_CREATION]).keys()];

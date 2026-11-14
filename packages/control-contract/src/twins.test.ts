@@ -59,6 +59,7 @@ const SAMPLES = [
     ...ACCESS,
     until: "2026-12-01T09:00:00Z",
     deferReason: "scheduled",
+    plugin: "notes-pane",
     delegationAction: "merge",
     run: RUN,
   },
@@ -78,6 +79,7 @@ const SAMPLES = [
     ...ACCESS,
     until: "2026-12-01T09:00:00.000+01:00",
     deferReason: "awaiting-someone",
+    plugin: "abc",
     delegationAction: "rollout",
     run: RUN,
   },
@@ -207,6 +209,7 @@ test("the placeholders, pinned, with empty flags", () => {
     "{cmd}",
     "{until}",
     "{deferReason}",
+    "{plugin}",
     "{delegationAction}",
     "{run}",
   ]);

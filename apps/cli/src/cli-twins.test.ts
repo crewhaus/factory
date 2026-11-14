@@ -213,8 +213,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(54);
-    expect(pins).toBe(82);
+    expect(Object.keys(REQUIRED).length).toBe(56);
+    expect(pins).toBe(84);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -367,6 +367,7 @@ describe("the server's twins, by import", () => {
         ...ACCESS,
         until: "2026-12-01T09:00:00Z",
         deferReason: "scheduled",
+        plugin: "notes-pane",
         delegationAction: "merge",
       },
       {
@@ -385,6 +386,7 @@ describe("the server's twins, by import", () => {
         ...ACCESS,
         until: "2026-12-01T09:00:00+01:00",
         deferReason: "other",
+        plugin: "notes-pane",
         delegationAction: "rollout",
       },
     ];
@@ -918,7 +920,7 @@ describe("every write has an equivalent or a note", () => {
 
   test("the route table's writes", () => {
     expect(coverage(ROUTE_TABLE, ROUTE_TWIN_NOTES)).toEqual({ uncovered: [], stray: [] });
-    expect(Object.keys(ROUTE_TWIN_NOTES).length).toBe(101);
+    expect(Object.keys(ROUTE_TWIN_NOTES).length).toBe(102);
     for (const [key, note] of Object.entries(ROUTE_TWIN_NOTES)) {
       expect(ROUTE_TABLE.find((row) => row.key === key)?.note).toBe(note);
     }

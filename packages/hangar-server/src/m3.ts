@@ -189,6 +189,10 @@ export type M3Context = {
   readonly checkJob: () => void;
   /** Warning sink — an honest degradation, never a thrown 500. */
   readonly warn: (message: string) => void;
+  /** Home's own root, where its control records (plugin grants among them) live. */
+  readonly hangarRoot?: string;
+  /** Where installed plugins live. */
+  readonly pluginsDir?: string;
 };
 
 /** A route body. Return a plain value (masked + JSON-encoded for you) or a

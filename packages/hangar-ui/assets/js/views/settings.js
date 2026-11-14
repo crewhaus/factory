@@ -1,10 +1,10 @@
 /**
  * HM-198's console half — Settings: Readability (this device's text size,
  * density, motion, contrast, shortcuts and theme), signing this browser out,
- * notification rules (HM-183), read-only mode (HM-187), and the
- * installed-plugin inventory (HM-179).
+ * notification rules (HM-183) and read-only mode (HM-187). Plugins have
+ * their own page (`views/plugins.js`).
  *
- * Three deliberate choices show up here as UI:
+ * Two deliberate choices show up here as UI:
  *
  *   - Every rule ships OFF except parked approvals, and the screen says so,
  *     because a product that decides what deserves to interrupt you is a
@@ -12,9 +12,6 @@
  *   - The read-only toggle is labelled with what it actually protects. It
  *     prevents accidents during a demo; signing in is the security
  *     boundary. Claiming more would be a lie a screen-share could disprove.
- *   - The plugin table lists the DEFERRED extension points beside the wired
- *     ones, with their reasons. A capability that is declared but not wired
- *     has to be visible, or the next person wires it a second time.
  *
  * This screen does NOT read `GET /api/notifications` itself. That GET is the
  * rules evaluation (HM-183), so a second caller consumes deliveries the app's
@@ -90,13 +87,12 @@ export async function renderNotificationSettings(root) {
   );
 }
 
-/** Home settings (`#/settings/home`): read-only mode and the installed plugins. */
+/** Home settings (`#/settings/home`): read-only mode. Plugins have their own page. */
 export async function renderHomeSettings(root) {
   clear(root).appendChild(skeleton(6));
-  const [readOnlyRes, pluginsRes] = await Promise.allSettled([api.readOnly(), api.plugins()]);
+  const [readOnlyRes] = await Promise.allSettled([api.readOnly()]);
   clear(root);
   root.appendChild(readOnlyCard(settled(readOnlyRes)));
-  root.appendChild(pluginCard(settled(pluginsRes)));
 }
 
 /**
@@ -621,85 +617,4 @@ export function splitList(text) {
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s !== "");
-}
-
-// ---------------------------------------------------------------------------
-// Plugins
-// ---------------------------------------------------------------------------
-
-function pluginCard(inventory) {
-  const plugins = Array.isArray(inventory?.plugins) ? inventory.plugins : [];
-  const card = el("section", { class: "card" }, [
-    el("h3", { class: "card-title", text: "Plugins" }),
-    el("p", { class: "muted" }, [
-      el("span", { text: "This build wires " }),
-      el("code", { class: "mono", text: (inventory?.wired ?? []).join(", ") || "nothing" }),
-      el("span", {
-        text: ". A plugin's pane runs in a sandboxed frame with an opaque origin and a policy built from its own net allow-list; a plugin that may not read a harness sees neither its panes nor its trace events.",
-      }),
-    ]),
-  ]);
-  const deferred =
-    inventory?.deferred && typeof inventory.deferred === "object"
-      ? Object.entries(inventory.deferred)
-      : [];
-  if (deferred.length > 0) {
-    card.appendChild(
-      el("ul", { class: "check-list" }, [
-        el("li", { class: "muted", text: "Declared but NOT wired (deferred):" }),
-        ...deferred.map(([point, reason]) =>
-          el("li", null, [
-            dot("off", point),
-            el("span", { class: "muted", text: ` — ${String(reason)}` }),
-          ]),
-        ),
-      ]),
-    );
-  }
-  if (plugins.length === 0) {
-    card.appendChild(emptyState("No plugins installed", "crewhaus plugins install <name>"));
-    return card;
-  }
-  card.appendChild(
-    el(
-      "ul",
-      { class: "check-list" },
-      plugins.map((plugin) => pluginRow(plugin)),
-    ),
-  );
-  return card;
-}
-
-function pluginRow(plugin) {
-  const problems = Array.isArray(plugin?.problems) ? plugin.problems : [];
-  const points = Array.isArray(plugin?.extensionPoints) ? plugin.extensionPoints : [];
-  const panes = Array.isArray(plugin?.panes) ? plugin.panes : [];
-  return el("li", { class: "plugin-row" }, [
-    el("div", null, [
-      el("strong", { text: String(plugin?.name ?? "") }),
-      el("span", { class: "muted mono", text: ` ${String(plugin?.version ?? "")}` }),
-      problems.length > 0 ? dot("bad", problems.join("; ")) : null,
-    ]),
-    plugin?.description ? el("div", { class: "muted", text: String(plugin.description) }) : null,
-    el(
-      "div",
-      { class: "safety-strip" },
-      points
-        .filter((p) => p.declared === true)
-        .map((p) =>
-          el("span", {
-            class: `chip${p.wired === true ? "" : " chip-warn"}`,
-            title: p.wired === true ? "wired" : String(p.reason ?? "not wired"),
-            text: `${p.point}: ${p.wired === true ? "wired" : "deferred"}`,
-          }),
-        ),
-    ),
-    panes.length > 0
-      ? el("div", { class: "muted", text: `panes: ${panes.map((p) => p.id).join(", ")}` })
-      : null,
-    el("div", { class: "muted mono note" }, [
-      el("span", { text: `fs: ${(plugin?.permissions?.fs ?? []).join(" ") || "none"}` }),
-      el("span", { text: ` · net: ${(plugin?.permissions?.net ?? []).join(" ") || "none"}` }),
-    ]),
-  ]);
 }

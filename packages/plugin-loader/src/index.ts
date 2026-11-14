@@ -1152,12 +1152,46 @@ export type ActivatedPlugins = {
   readonly warnings: ReadonlyArray<string>;
 };
 
+/**
+ * One `plugins:` entry: a plugin name, or `{name, tools}`. A name lets the
+ * plugin's tools drive every host tool its manifest's `permissions.tools`
+ * asks for; `{name, tools}` narrows that to the host tools in both lists.
+ * (Structurally the IR's `IrPluginEntry`; the loader does not depend on ir.)
+ */
+export type PluginEntry = string | { readonly name: string; readonly tools: ReadonlyArray<string> };
+
+/** The plugin an entry names. */
+export function pluginEntryName(entry: PluginEntry): string {
+  return typeof entry === "string" ? entry : entry.name;
+}
+
+/**
+ * The host tools a plugin's tools may reach through `ctx.bridge`: what its
+ * manifest asks for, narrowed by an object entry to those it also lists.
+ * `notGranted` is each tool the entry lists that the manifest does not ask
+ * for: it stays unreachable.
+ */
+export function grantedBridgeTools(
+  asked: ReadonlyArray<string> | undefined,
+  entry: PluginEntry,
+): { readonly tools: ReadonlySet<string>; readonly notGranted: ReadonlyArray<string> } {
+  const manifest = new Set(asked ?? []);
+  if (typeof entry === "string") return { tools: manifest, notGranted: [] };
+  const listed = [...new Set(entry.tools)];
+  return {
+    tools: new Set(listed.filter((t) => manifest.has(t))),
+    notGranted: listed.filter((t) => !manifest.has(t)),
+  };
+}
+
 export type ActivatePluginsOptions = {
   /**
-   * Plugin names to activate, in load order (the spec's `plugins:` list, or the
-   * CLI `--plugins` override). Repeats are de-duplicated, first occurrence wins.
+   * Plugins to activate, in load order (the spec's `plugins:` list, or the
+   * CLI `--plugins` override): names, or `{name, tools}` entries that narrow
+   * the host tools the plugin may drive. Repeats are de-duplicated by name,
+   * first occurrence wins.
    */
-  readonly names: ReadonlyArray<string>;
+  readonly names: ReadonlyArray<PluginEntry>;
   /** The catalog of installed plugins (name → pinned install record). */
   readonly registry: PluginRegistry;
   /** The activator that verifies + imports each pinned entry's manifest. */
@@ -1541,8 +1575,9 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
     opts.warn?.(`[plugins] ${msg}`);
   };
   const seen = new Set<string>();
-  for (const name of opts.names) {
-    if (seen.has(name)) continue; // de-dupe repeats; keep first-occurrence order
+  for (const pluginEntry of opts.names) {
+    const name = pluginEntryName(pluginEntry);
+    if (seen.has(name)) continue; // de-dupe repeats by name; keep first-occurrence order
     seen.add(name);
     const entry = await opts.registry.get(name);
     if (entry === undefined) {
@@ -1597,8 +1632,15 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
         `plugin "${name}": ${providesProblem} — refusing to load the plugin`,
       );
     }
-    // The host tools this plugin's tools may reach through ctx.bridge.
-    const bridgeTools: ReadonlySet<string> = new Set(plugin.permissions.tools ?? []);
+    // The host tools this plugin's tools may reach through ctx.bridge: what
+    // its manifest asks for, narrowed by an object entry to those it lists.
+    const granted = grantedBridgeTools(plugin.permissions.tools, pluginEntry);
+    const bridgeTools = granted.tools;
+    for (const tool of granted.notGranted) {
+      note(
+        `plugin "${name}" asks for no host tool ${JSON.stringify(tool)}; it was not granted. Its manifest's permissions.tools must list a host tool before plugins: can grant it.`,
+      );
+    }
     // Each tool is checked: a malformed one refuses the whole plugin at boot,
     // naming the tool and the field, instead of failing open on a flag or
     // crashing the first turn. Then it is normalized through buildTool, the
@@ -1705,13 +1747,23 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
  * fails verification is ever imported; the daemon only goes without it.
  */
 export async function activatePluginsOrStartWithout(opts: {
-  readonly names: ReadonlyArray<string>;
+  readonly names: ReadonlyArray<PluginEntry>;
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly homeDir?: string;
   readonly warn?: (line: string) => void;
 }): Promise<ActivatedPlugins> {
   const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
-  const names = [...new Set(opts.names)];
+  // De-duplicated by name, first occurrence wins, so a repeat in object form
+  // cannot widen or narrow the entry that came first.
+  const entries: PluginEntry[] = [];
+  const seenNames = new Set<string>();
+  for (const entry of opts.names) {
+    const name = pluginEntryName(entry);
+    if (seenNames.has(name)) continue;
+    seenNames.add(name);
+    entries.push(entry);
+  }
+  const names = entries.map(pluginEntryName);
   const merged: {
     loaded: LoadedPlugin[];
     tools: RegisteredTool[];
@@ -1752,9 +1804,10 @@ export async function activatePluginsOrStartWithout(opts: {
     skip(names.map((n) => `"${n}"`).join(", "), err, names.length === 1 ? "it" : "them");
     return merged;
   }
-  for (const name of names) {
+  for (const entry of entries) {
+    const name = pluginEntryName(entry);
     try {
-      const one = await activatePlugins({ names: [name], ...runtime, onMissing: "throw", warn });
+      const one = await activatePlugins({ names: [entry], ...runtime, onMissing: "throw", warn });
       merged.warnings.push(...one.warnings);
       merged.loaded.push(...one.loaded);
       merged.tools.push(...one.tools);

@@ -7,11 +7,14 @@
  * so its script cannot reach this page's DOM, its sessionStorage (where the
  * session lives) or its history.
  *
+ * Home serves a plugin only what its owner allowed in Settings › Plugins: its
+ * tabs on the harnesses it was allowed, and only the websites it was allowed.
+ *
  * The frame loads the pane from a single-use address the pane read hands out
  * (`src`, `/pane/<nonce>`), which serves the document with the Content-
- * Security-Policy the server computed from the plugin's own `net` allow-list
- * — fail-closed, so a plugin with no declared network permission gets
- * `connect-src 'none'` — and the same sandbox, both as response headers. A
+ * Security-Policy the server computed from the origins its owner allowed —
+ * fail-closed, so a plugin allowed none gets `connect-src 'none'` — and the
+ * same sandbox, both as response headers. A
  * `srcdoc` frame would inherit this console's own policy instead, under
  * which a pane's own script never runs. No markup string reaches the DOM on
  * this screen; everything is built with createElement like the rest of the app.
@@ -19,6 +22,10 @@
 
 import { api } from "../api.js";
 import { clear, dot, el, emptyState, skeleton } from "../dom.js";
+import { hrefFleet } from "../router.js";
+import { announce } from "../ui/live.js";
+import { call } from "../v1.js";
+import { servesThisHarness, stateBadge, useInHarness } from "./plugins.js";
 
 const PANE_SRC_RE = /^\/pane\/[0-9a-f]{64}$/;
 
@@ -38,7 +45,12 @@ export function paneSandbox(doc) {
   return tokens.length > 0 ? tokens.join(" ") : "allow-scripts";
 }
 
-export async function renderPanes(root, ctx) {
+/**
+ * `flash` ({plugin, text}), after "Use in this harness" wrote the spec: the
+ * re-rendered page shows that line in the plugin's card and moves focus to it,
+ * since the button that opened the dialog is gone.
+ */
+export async function renderPanes(root, ctx, flash) {
   clear(root).appendChild(skeleton(4));
   let payload = null;
   try {
@@ -71,12 +83,25 @@ export async function renderPanes(root, ctx) {
           ),
       el("p", {
         class: "muted small",
-        text: "A plugin observes a harness only when its filesystem read permission covers that harness's directory — the same fail-closed evaluator the loader uses.",
+        text: "A plugin sees this harness's run activity only when you allowed it in Settings › Plugins.",
       }),
     ]),
   );
 
-  if (panes.length === 0) {
+  const waiting = Array.isArray(payload?.waiting) ? payload.waiting : [];
+  if (panes.length === 0 && waiting.length > 0) {
+    root.appendChild(
+      el("div", { class: "empty" }, [
+        el("div", { class: "empty-msg", text: "Waiting for your OK" }),
+        el("p", { class: "muted", text: `${waiting.join(", ")} asks to add panels here.` }),
+        el("a", {
+          class: "btn btn-primary",
+          href: hrefFleet("settings", "plugins"),
+          text: "Review",
+        }),
+      ]),
+    );
+  } else if (panes.length === 0) {
     root.appendChild(
       emptyState("No plugin pane applies to this harness", "crewhaus plugins install <name>"),
     );
@@ -84,6 +109,51 @@ export async function renderPanes(root, ctx) {
   for (const pane of panes) {
     root.appendChild(await paneCard(pane));
   }
+  const flashed = await appendUseCards(root, ctx, flash);
+  if (flashed) flashed.focus();
+  else if (flash) announce(flash.text);
+}
+
+/**
+ * One "Use in this harness" card per plugin whose live grant covers this
+ * harness, so the button never leads to a refusal. Returns the flash line, when
+ * one was shown.
+ */
+async function appendUseCards(root, ctx, flash) {
+  let inventory = null;
+  try {
+    inventory = await api.plugins();
+  } catch {
+    return;
+  }
+  const live = (Array.isArray(inventory?.plugins) ? inventory.plugins : []).filter(
+    (p) =>
+      (p?.problems ?? []).length === 0 &&
+      (p?.grant?.state === "allowed" || p?.grant?.state === "asks-for-more"),
+  );
+  let flashed = null;
+  for (const plugin of live) {
+    const name = String(plugin.name);
+    const review = await call("plugins.review", { params: { plugin: name } });
+    if (!review.ok || !servesThisHarness(review.body, ctx.id)) continue;
+    const served = Array.isArray(review.body?.served?.tools) ? review.body.served.tools : [];
+    const line =
+      flash && flash.plugin === name
+        ? el("p", { class: "muted", tabindex: "-1", text: String(flash.text) })
+        : null;
+    if (line) flashed = line;
+    root.appendChild(
+      el("section", { class: "card" }, [
+        el("div", { class: "rollup" }, [
+          el("h3", { class: "card-title", text: name }),
+          stateBadge(plugin.grant.state),
+        ]),
+        line,
+        useInHarness(ctx, plugin, served.map(String), (done) => renderPanes(root, ctx, done)),
+      ]),
+    );
+  }
+  return flashed;
 }
 
 async function paneCard(pane) {

@@ -638,6 +638,16 @@ export const PLUGINS_SCHEMA: ParseArgsSchema = {
     // publish/outdated: assemble + print without touching git/gh / network write.
     { name: "dry-run", takesValue: false },
     { name: "help", short: "h" },
+    // grant: what the owner allows, each a comma-separated list (#522).
+    { name: "harness", takesValue: true },
+    { name: "all-harnesses", takesValue: false },
+    { name: "panes", takesValue: true },
+    { name: "events", takesValue: true },
+    { name: "reads", takesValue: true },
+    { name: "net", takesValue: true },
+    { name: "tools", takesValue: true },
+    // grant: the live grant's generation the owner read.
+    { name: "expect", takesValue: true },
   ],
 };
 

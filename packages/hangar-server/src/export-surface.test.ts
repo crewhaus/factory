@@ -97,6 +97,7 @@ const INDEX_VALUES: readonly string[] = [
   "SCAFFOLDED_WORKFLOWS",
   "SCAFFOLDED_WORKFLOW_FILENAMES",
   "SCHEDULER_LANES",
+  "SERVED_NOTHING",
   "SESSION_DIR_ENV",
   "SESSION_ID_RE",
   "SETTINGS_FILENAME",
@@ -112,6 +113,8 @@ const INDEX_VALUES: readonly string[] = [
   "activityDigest",
   "adjudicateReview",
   "approvalsInbox",
+  "askedOf",
+  "asksOf",
   "buildHarnessEntries",
   "buildLeaderboard",
   "buildSchedulersView",
@@ -146,12 +149,15 @@ const INDEX_VALUES: readonly string[] = [
   "evalSampleView",
   "evalsView",
   "evaluateNotifications",
+  "expectHolds",
   "factsView",
   "feedbackRecord",
   "foldApprovals",
   "foldFactsFile",
   "foldHarnessCosts",
   "foldRouteStats",
+  "grantPlugin",
+  "grantProblem",
   "harnessActivity",
   "harnessIndexToken",
   "harnessScrubber",
@@ -180,6 +186,7 @@ const INDEX_VALUES: readonly string[] = [
   "json",
   "knownControlPort",
   "listSessions",
+  "liveGrantOf",
   "logLine",
   "makeFixtureHarness",
   "maskDeep",
@@ -187,6 +194,7 @@ const INDEX_VALUES: readonly string[] = [
   "matchActions",
   "matchM3",
   "mergedSpawnEnv",
+  "netOriginsOf",
   "normalizeQuietHours",
   "normalizeRules",
   "normalizeWebhookUrl",
@@ -204,7 +212,9 @@ const INDEX_VALUES: readonly string[] = [
   "pendingApprovalCount",
   "pinBaseline",
   "pinSession",
+  "pluginGrantsLedger",
   "pluginMayFetch",
+  "pluginReviewOf",
   "pluginSeesHarness",
   "proofCliTwin",
   "proofTenants",
@@ -219,6 +229,7 @@ const INDEX_VALUES: readonly string[] = [
   "readPaneDocument",
   "readPinServeStates",
   "readPins",
+  "readPluginGrants",
   "readPluginInventory",
   "readPoolView",
   "readPoolViews",
@@ -235,6 +246,8 @@ const INDEX_VALUES: readonly string[] = [
   "resolveInside",
   "resolveSessionRoot",
   "reviewInbox",
+  "reviewVerbOf",
+  "revokePlugin",
   "rosterModels",
   "rosterSunsets",
   "runDetail",
@@ -243,9 +256,15 @@ const INDEX_VALUES: readonly string[] = [
   "runsView",
   "scaffoldedWorkflowPath",
   "scoreMatch",
+  "servedOf",
+  "servedPlugins",
+  "servesHarness",
   "spawnEnvScrubber",
   "specView",
   "splitModelString",
+  "standingFrom",
+  "standingOf",
+  "standingWithoutGrants",
   "startHangarServer",
   "stateView",
   "suggestScanRoots",
@@ -294,10 +313,10 @@ describe("the export surface", () => {
   test("the root entry exports exactly the values it exported before the move, and the ones added since", () => {
     // The count first, so a failure says how far off the surface is before
     // the diff says where.
-    expect(INDEX_VALUES).toHaveLength(219);
+    expect(INDEX_VALUES).toHaveLength(238);
     expect(SIGN_IN_VALUES).toHaveLength(14);
     const live = Object.keys(entry).sort();
-    expect(live).toHaveLength(219 + 14);
+    expect(live).toHaveLength(238 + 14);
     expect(live).toEqual([...INDEX_VALUES, ...SIGN_IN_VALUES].sort());
   });
 

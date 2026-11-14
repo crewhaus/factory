@@ -17,7 +17,9 @@
  *   - from `.`: what `crewhaus hangar` needs to start the server — the
  *     function, its two types, the default port, and the token file name;
  *   - from `./scaffolded-workflows`: the workflow file names the flywheel
- *     and CI scaffolds share with the server's flywheel route.
+ *     and CI scaffolds share with the server's flywheel route;
+ *   - from `./plugin-grants`: Home's plugin grants ledger, which
+ *     `crewhaus plugins grants|grant|revoke` reads and writes as Home does.
  * `daemon-cmd.ts` may not import the server at all. A namespace, default,
  * side-effect or dynamic import of the server is a violation wherever it is,
  * because none of them can be held to a list of names.
@@ -40,6 +42,22 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   "@crewhaus/hangar-server/scaffolded-workflows": [
     "SCAFFOLDED_WORKFLOWS",
     "WORKFLOWS_DIR_SEGMENTS",
+  ],
+  // Home's plugin grants ledger: `crewhaus plugins grants|grant|revoke` reads and
+  // writes the same rows Home's `plugins.*` operations do, through the same code.
+  "@crewhaus/hangar-server/plugin-grants": [
+    "GrantOutcome",
+    "PluginGrantInput",
+    "PluginRow",
+    "expectHolds",
+    "grantPlugin",
+    "grantProblem",
+    "liveGrantOf",
+    "pluginReviewOf",
+    "readPluginGrants",
+    "readPluginInventory",
+    "revokePlugin",
+    "standingFrom",
   ],
 };
 
@@ -185,13 +203,14 @@ describe("what the CLI takes from @crewhaus/hangar-server", () => {
     expect(scanned.some((name) => name.endsWith(".test.ts"))).toBe(false);
   });
 
-  test("it finds exactly the three statements that may import the server", () => {
+  test("it finds exactly the four statements that may import the server", () => {
     // Its own hit count: a grammar that silently stopped matching would
     // otherwise pass every test below by finding nothing.
     expect(hits.map((hit) => `${hit.file} ← ${hit.specifier}`).sort()).toEqual([
       "ci-scaffold.ts ← @crewhaus/hangar-server/scaffolded-workflows",
       "flywheel.ts ← @crewhaus/hangar-server/scaffolded-workflows",
       "hangar-cmd.ts ← @crewhaus/hangar-server",
+      "plugins-grant-cmd.ts ← @crewhaus/hangar-server/plugin-grants",
     ]);
   });
 

@@ -22,7 +22,7 @@ import { DELEGATION_MODULE } from "./delegation.js";
 
 // import { INSPECTION_MODULE } from "./inspection.js";
 
-// import { INTEGRATIONS_MODULE } from "./integrations.js";
+import { INTEGRATIONS_MODULE } from "./integrations.js";
 
 // import { KNOWLEDGE_MODULE } from "./knowledge.js";
 
@@ -49,7 +49,7 @@ export const AREA_MODULES = [
 
   // INSPECTION_MODULE,
 
-  // INTEGRATIONS_MODULE,
+  INTEGRATIONS_MODULE,
 
   // KNOWLEDGE_MODULE,
 

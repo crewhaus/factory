@@ -159,6 +159,52 @@ export type PluginPermissions = {
   readonly secrets?: ReadonlyArray<string>;
 };
 
+/** A JSON Schema, as a plain object. Checked for structure only; nothing executes it. */
+export type PluginJsonSchema = Readonly<Record<string, unknown>>;
+
+/** The protocol an `integration` section speaks: Home's versioned control API. */
+export const PLUGIN_INTEGRATION_PROTOCOL = "crewhaus.hangar.v1";
+
+/** Event families an integration may ask to receive. */
+export const PLUGIN_INTEGRATION_EVENT_FAMILIES = [
+  "run",
+  "decision",
+  "deployment",
+  "harness",
+] as const;
+export type PluginIntegrationEventFamily = (typeof PLUGIN_INTEGRATION_EVENT_FAMILIES)[number];
+
+/** Data an integration may ask to read. */
+export const PLUGIN_INTEGRATION_READS = [
+  "run.lifecycle",
+  "run.trace",
+  "decisions",
+  "costs",
+] as const;
+export type PluginIntegrationRead = (typeof PLUGIN_INTEGRATION_READS)[number];
+
+/** The largest canonical JSON an `integration.io` schema may have. */
+export const MAX_PLUGIN_IO_SCHEMA_BYTES = 16 * 1024;
+/** How deep an `integration.io` schema may nest. */
+export const MAX_PLUGIN_IO_SCHEMA_DEPTH = 32;
+
+/**
+ * What a plugin asks Home for: the event families it wants to receive, the
+ * data it wants to read, and the shape of what it takes and returns.
+ *
+ * It asks; the owner grants; Home serves only the grant. Nothing here is
+ * handed to a plugin because the manifest lists it: the owner reviews the
+ * asks once per plugin (and again when a new version asks for more), and Home
+ * serves the intersection of the live grant and what the current manifest
+ * asks. It is signed with the rest of the manifest.
+ */
+export type PluginIntegration = {
+  readonly protocol?: typeof PLUGIN_INTEGRATION_PROTOCOL;
+  readonly events?: ReadonlyArray<PluginIntegrationEventFamily>;
+  readonly data?: { readonly reads?: ReadonlyArray<PluginIntegrationRead> };
+  readonly io?: { readonly input?: PluginJsonSchema; readonly output?: PluginJsonSchema };
+};
+
 export type PluginSignatureAlgorithm = "ed25519";
 
 /**
@@ -212,6 +258,12 @@ export type PluginManifest = {
    * a sandbox: the code has already run by the time the list is compared.)
    */
   readonly provides?: { readonly tools?: ReadonlyArray<string> };
+  /**
+   * What the plugin asks Home for ({@link PluginIntegration}). It asks, the
+   * owner grants, and Home serves only the grant. `permissions` stays the
+   * reach the plugin asks for in a bundle.
+   */
+  readonly integration?: PluginIntegration;
   readonly contributions?: PluginContributions;
   /**
    * Lowercase hex SHA-256 of the plugin's entrypoint (`index.js`). It is part
@@ -253,7 +305,8 @@ export type PluginManifest = {
  */
 export const MAX_PLUGIN_MANIFEST_BYTES = 1024 * 1024;
 
-const NAME_PATTERN = /^[a-z][a-z0-9-]{1,62}[a-z0-9]$/;
+/** A plugin name: 3-64 chars, lowercase a-z / 0-9 / "-", starting with a letter, no trailing hyphen. */
+export const PLUGIN_NAME_PATTERN = /^[a-z][a-z0-9-]{1,62}[a-z0-9]$/;
 /** A tool name every model provider accepts. */
 export const PLUGIN_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:-[\w.+-]+)?(?:\+[\w.-]+)?$/;
@@ -293,7 +346,8 @@ function assertOptionalStringArray(
  *
  * This is the check for a manifest crewhaus is about to install or load:
  * {@link validatePluginManifestRecord}'s, plus the fields 0.7.1 gave a
- * meaning to (`notAfter`, `provides`), held to their exact shape.
+ * meaning to (`notAfter`, `provides`) and 0.9.0's `integration`, held to their
+ * exact shape.
  */
 export function validatePluginManifest(m: unknown): PluginManifest {
   const manifest = validatePluginManifestRecord(m) as unknown as Record<string, unknown>;
@@ -326,7 +380,131 @@ export function validatePluginManifest(m: unknown): PluginManifest {
     }
   }
 
+  if (manifest["integration"] !== undefined) validateIntegration(manifest["integration"]);
+
   return manifest as unknown as PluginManifest;
+}
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+function refuseUnknownKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  field: string,
+): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) {
+      throw new PluginSdkError(
+        `plugin manifest: \`${field}\` has an unknown key ${JSON.stringify(key)} (allowed: ${allowed.join(", ")})`,
+      );
+    }
+  }
+}
+
+function assertClosedList(value: unknown, allowed: readonly string[], field: string): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    throw new PluginSdkError(`plugin manifest: \`${field}\` must be an array`);
+  }
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || !allowed.includes(item)) {
+      throw new PluginSdkError(
+        `plugin manifest: \`${field}\` entry ${JSON.stringify(item)} is not one of ${allowed.join(", ")}`,
+      );
+    }
+    if (seen.has(item)) {
+      throw new PluginSdkError(`plugin manifest: \`${field}\` lists ${JSON.stringify(item)} twice`);
+    }
+    seen.add(item);
+  }
+}
+
+/** How deep a JSON value nests: a scalar is 0, `{}` and `[]` are 1. */
+function jsonDepth(value: unknown): number {
+  let deepest = 0;
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  while (stack.length > 0) {
+    const top = stack.pop() as { value: unknown; depth: number };
+    if (top.value === null || typeof top.value !== "object") continue;
+    const depth = top.depth + 1;
+    if (depth > deepest) deepest = depth;
+    // Stop descending once past the limit: the answer is already "too deep".
+    if (depth > MAX_PLUGIN_IO_SCHEMA_DEPTH) return depth;
+    const children = Array.isArray(top.value) ? top.value : Object.values(top.value);
+    for (const child of children) stack.push({ value: child, depth });
+  }
+  return deepest;
+}
+
+function assertIoSchema(value: unknown, field: string): void {
+  if (value === undefined) return;
+  if (!isPlainObject(value)) {
+    throw new PluginSdkError(`plugin manifest: \`${field}\` must be a JSON Schema object`);
+  }
+  if (jsonDepth(value) > MAX_PLUGIN_IO_SCHEMA_DEPTH) {
+    throw new PluginSdkError(
+      `plugin manifest: \`${field}\` nests deeper than ${MAX_PLUGIN_IO_SCHEMA_DEPTH} levels`,
+    );
+  }
+  let bytes: number;
+  try {
+    bytes = Buffer.byteLength(canonicalJson(value), "utf8");
+  } catch {
+    throw new PluginSdkError(`plugin manifest: \`${field}\` must hold only JSON values`);
+  }
+  if (bytes > MAX_PLUGIN_IO_SCHEMA_BYTES) {
+    throw new PluginSdkError(
+      `plugin manifest: \`${field}\` is larger than ${MAX_PLUGIN_IO_SCHEMA_BYTES / 1024} KiB as canonical JSON`,
+    );
+  }
+}
+
+/**
+ * Why an `integration` section is not valid, in the words {@link validatePluginManifest}
+ * refuses it with, or undefined when it is. For a reader that must stay tolerant (Home's
+ * plugin inventory shows the problem beside the plugin rather than failing).
+ */
+export function pluginIntegrationProblem(integration: unknown): string | undefined {
+  try {
+    validateIntegration(integration);
+    return undefined;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
+/** Hold an `integration` section to its exact shape, naming the field that is wrong. */
+function validateIntegration(integration: unknown): void {
+  if (!isPlainObject(integration)) {
+    throw new PluginSdkError("plugin manifest: `integration` must be an object");
+  }
+  refuseUnknownKeys(integration, ["protocol", "events", "data", "io"], "integration");
+  const protocol = integration["protocol"];
+  if (protocol !== undefined && protocol !== PLUGIN_INTEGRATION_PROTOCOL) {
+    throw new PluginSdkError(
+      `plugin manifest: \`integration.protocol\` must be "${PLUGIN_INTEGRATION_PROTOCOL}" (got ${JSON.stringify(protocol)})`,
+    );
+  }
+  assertClosedList(integration["events"], PLUGIN_INTEGRATION_EVENT_FAMILIES, "integration.events");
+  const data = integration["data"];
+  if (data !== undefined) {
+    if (!isPlainObject(data)) {
+      throw new PluginSdkError("plugin manifest: `integration.data` must be an object");
+    }
+    refuseUnknownKeys(data, ["reads"], "integration.data");
+    assertClosedList(data["reads"], PLUGIN_INTEGRATION_READS, "integration.data.reads");
+  }
+  const io = integration["io"];
+  if (io !== undefined) {
+    if (!isPlainObject(io)) {
+      throw new PluginSdkError("plugin manifest: `integration.io` must be an object");
+    }
+    refuseUnknownKeys(io, ["input", "output"], "integration.io");
+    assertIoSchema(io["input"], "integration.io.input");
+    assertIoSchema(io["output"], "integration.io.output");
+  }
 }
 
 /**
@@ -345,7 +523,7 @@ export function validatePluginManifestRecord(m: unknown): PluginManifest {
   }
   const manifest = m as Record<string, unknown>;
   assertString(manifest["name"], "name");
-  if (!NAME_PATTERN.test(manifest["name"])) {
+  if (!PLUGIN_NAME_PATTERN.test(manifest["name"])) {
     throw new PluginSdkError(
       `plugin manifest: \`name\` must be 3-64 chars, lowercase a-z / 0-9 / "-", start with a letter, no trailing hyphen (got "${manifest["name"]}")`,
     );

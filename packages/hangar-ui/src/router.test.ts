@@ -181,7 +181,7 @@ describe("ROUTE_TEMPLATES", () => {
     const fleetTemplates = ROUTE_TEMPLATES.filter((t) => !t.startsWith("#/h/"));
     const harnessTemplates = ROUTE_TEMPLATES.filter((t) => t.startsWith("#/h/"));
     // The device sign-in page is a fleet address of its own.
-    expect(fleetTemplates.length).toBe(20);
+    expect(fleetTemplates.length).toBe(21);
     // Setup › Delegations is the twenty-eighth.
     expect(harnessTemplates.length).toBe(28);
     expect(ROUTE_TEMPLATES).toContain("#/h/:id/setup/delegations");
@@ -192,6 +192,7 @@ describe("ROUTE_TEMPLATES", () => {
       "#/home/needs-you?type=advice",
       "#/connections/thredz",
       "#/settings/account",
+      "#/settings/plugins",
       "#/device",
       "#/h/:id",
       "#/h/:id/overview/needs-you",

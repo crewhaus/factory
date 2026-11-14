@@ -166,6 +166,7 @@ import {
 // gate never drags the loop into the compiler-worker's CF bundle.
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
 import { lowerDelegation } from "./lower/delegation";
+import { lowerPlugins } from "./lower/plugins";
 import { lowerSchedule, parseDurationToMs } from "./lower/schedule";
 import { toolConfigWidenings } from "./tool-config-widening";
 
@@ -1871,19 +1872,6 @@ function lowerExpose(spec: {
   const mcp = spec.expose?.mcp;
   if (mcp === undefined) return {};
   return { expose: { mcp: { transport: mcp.transport, tools: mcp.tools ?? "chat" } } };
-}
-
-/**
- * Item 3 (G32) — lower the `plugins:` list. Carried only when non-empty so an
- * empty (or absent) declaration leaves bundles byte-identical; order is
- * preserved (load order). Carried on the codegen-serving shapes (cli/channel).
- */
-function lowerPlugins(spec: { readonly plugins?: readonly string[] }): {
-  plugins?: readonly string[];
-} {
-  return spec.plugins !== undefined && spec.plugins.length > 0
-    ? { plugins: [...spec.plugins] }
-    : {};
 }
 
 /**

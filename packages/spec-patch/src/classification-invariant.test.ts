@@ -388,6 +388,21 @@ describe("the owner-keys table — every leaf under a row is human-owned", () =>
       expect(paths.some((path) => path !== "schedule.name" && path.endsWith(".name"))).toBe(true);
     }
   });
+
+  test("plugins yields leaves on exactly cli and channel, in both forms", () => {
+    const plugins = DELTA_090_KEYS.find((row) => row.pattern.join(".") === "plugins");
+    expect(plugins).toBeDefined();
+    const row = plugins as (typeof DELTA_090_KEYS)[number];
+    const carrying = shapes.filter((shape) => leavesUnder(shape, row).length > 0);
+    expect(carrying.map(targetOf).sort()).toEqual(["channel", "cli"]);
+    for (const shape of carrying) {
+      const paths = leavesUnder(shape, row).map((path) => path.join("."));
+      // The name form's leaf, and the object form's two.
+      expect(paths).toContain("plugins.*");
+      expect(paths).toContain("plugins.*.name");
+      expect(paths).toContain("plugins.*.tools.*");
+    }
+  });
 });
 
 /**

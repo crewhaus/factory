@@ -5,6 +5,8 @@
  * each of its states. A route's first paint is not its whole UI, so the
  * states are swept too.
  */
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Page } from "playwright";
 import { type FakeThredz, fakeThredz } from "service-fakes";
 import type { Home } from "../boot";
@@ -61,6 +63,18 @@ export async function a11yFleet(scope: JourneyScope, seed: string): Promise<A11y
   const [harness] = fleet.harnesses;
   if (harness === undefined) throw new Error("the accessibility fleet has no harness");
   const home = scope.home(fleet);
+  // One installed plugin, waiting for the owner's OK, so the plugin review is swept.
+  mkdirSync(join(home.pluginsDir, "notes-pane"), { recursive: true });
+  writeFileSync(
+    join(home.pluginsDir, "notes-pane", "plugin.json"),
+    JSON.stringify({
+      name: "notes-pane",
+      version: "1.0.0",
+      panes: [{ id: "board", title: "Board", file: "board.html" }],
+      permissions: { net: ["fetch:https://api.notes.test/**"], secrets: ["NOTES_API_KEY"] },
+      integration: { protocol: "crewhaus.hangar.v1", events: ["run"] },
+    }),
+  );
   return {
     fleet,
     home,
@@ -361,6 +375,15 @@ export function screenStates(harness: RouteHarness): readonly ScreenState[] {
         await page.locator(".inbox-card").first().focus();
         await page.keyboard.press("?");
         await waitFor(page, ".keyhelp li", "the inbox help");
+      },
+    },
+    {
+      template: "#/settings/plugins",
+      state: "plugin review",
+      route: "#/settings/plugins",
+      open: async (page) => {
+        await page.getByRole("button", { name: "Review" }).first().click();
+        await waitFor(page, "form.plugin-review fieldset legend", "the plugin review");
       },
     },
     {

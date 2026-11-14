@@ -358,6 +358,13 @@ export const ROUTE_TABLE: readonly RouteRow[] = [
     "/api/h/:id/builders/mcp/:name",
     "h.spec.edit.security",
   ),
+  write(
+    "pluginUseWrite",
+    "harness",
+    "PUT",
+    "/api/h/:id/builders/plugins/:name",
+    "h.spec.edit.security",
+  ),
 
   // ---- memory ----
   read("memoryFacts", "/api/h/:id/memory/facts/:spec", "h.read.content"),

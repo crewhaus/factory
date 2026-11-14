@@ -264,6 +264,12 @@ export const ROUTES = {
     group: "spec",
   },
   mcpConnectorRemove: { method: "DELETE", path: "/api/h/:id/builders/mcp/:name", group: "spec" },
+  pluginUseWrite: {
+    method: "PUT",
+    path: "/api/h/:id/builders/plugins/:name",
+    body: "PluginUse",
+    group: "spec",
+  },
 
   // ---- group "memory": facts, continuity, wiki, watchme, learning -------
   // NO HARD DELETE ANYWHERE: forget = a supersede tombstone with a reason,
