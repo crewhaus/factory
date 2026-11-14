@@ -1213,6 +1213,7 @@ export const ACTIVITY_KINDS = [
   { kind: "wiki", label: "Wiki" },
   { kind: "incident", label: "Incidents" },
   { kind: "deploy", label: "Deploys" },
+  { kind: "recovery", label: "After a restart" },
 ];
 
 /** Deep link for one digest item — every row lands on the screen that owns it. */
@@ -1225,6 +1226,7 @@ export function activityHref(item) {
     case "session":
       return ref !== null ? hrefHarness(id, "sessions", ref) : hrefHarness(id, "sessions");
     case "run":
+    case "recovery":
       return ref !== null ? hrefHarness(id, "runs", ref) : hrefHarness(id, "runs");
     case "eval":
       return ref !== null ? hrefHarness(id, "evals", ref) : hrefHarness(id, "evals");

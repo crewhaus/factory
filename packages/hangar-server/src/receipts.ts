@@ -5,8 +5,10 @@
  * table (`route-table.ts`): a route added there is covered by construction.
  *
  * A request refused before its handler writes nothing: an unmatched route, a read, an
- * unknown or malformed harness id, a body that is not a JSON object, a malformed
- * `Idempotency-Key`, a key reused for another request. Once accepted, the handler's answer
+ * unknown or malformed harness id, a path value that is not the ref its row's
+ * `receiptRef` names, a body that is not a JSON object, a malformed `Idempotency-Key`, a
+ * key reused for another request. A receipt's target is the most specific ref the row
+ * names: the harness, or, with `receiptRef`, the object inside it the command settles. Once accepted, the handler's answer
  * settles the receipt by its status:
  *
  * | Answer | Receipt |
@@ -29,6 +31,7 @@ import {
   IDEMPOTENCY_VALUE_RE,
   IDEMPOTENT_REPLAYED_HEADER,
   type ReceiptEffect,
+  parseRef,
 } from "@crewhaus/control-contract";
 import {
   type ControlService,
@@ -233,6 +236,15 @@ export function createReceipts(deps: ReceiptsDeps): WithReceipt {
       const entry = deps.harness(id);
       if (entry === undefined) return next();
       target = `home/harness/${id}`;
+      const named = row.receiptRef;
+      if (named !== undefined) {
+        // The row names what the command settles: `<hrn>/<kind>/<value>`. A value that is
+        // not that ref is the handler's to refuse, before it acts, with no receipt.
+        const value = matched.params[named.param];
+        const ref = value === undefined ? undefined : `${id}/${named.kind}/${value}`;
+        if (ref === undefined || "error" in parseRef(ref)) return next();
+        target = ref;
+      }
       if (entry.missingSince === null && existsSync(entry.dir)) harnessDir = entry.dir;
       if (row.receipt === "harness" && harnessDir !== undefined) ledger = { harness: harnessDir };
     }
@@ -250,8 +262,11 @@ export function createReceipts(deps: ReceiptsDeps): WithReceipt {
     // Everything that addresses the request is fingerprinted, so one key reused on another
     // path (`/env/A`, then `/env/B`) or another query is refused, not replayed.
     const params: Record<string, string> = {};
+    const inTarget = new Set(
+      target === undefined ? [] : ["id", ...(row.receiptRef ? [row.receiptRef.param] : [])],
+    );
     for (const [name, value] of Object.entries(matched.params)) {
-      if (name !== "id" || target === undefined) params[name] = value;
+      if (!inTarget.has(name)) params[name] = value;
     }
     const query = [...new URL(req.url).searchParams.entries()];
 

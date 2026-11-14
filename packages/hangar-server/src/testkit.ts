@@ -32,6 +32,9 @@ import { type HangarServer, type HangarServerOptions, startHangarServer } from "
 
 export const FETCH_TIMEOUT_MS = 10_000;
 
+/** Timers that never fire: a test server's tick runs only when the test calls it. */
+const MANUAL_TIMERS = { setTimeout: () => undefined, clearTimeout: () => undefined };
+
 /** What the recording notification sinks captured. The sinks are PRESENT
  *  (so availability matches production) but they reach nothing outside the
  *  test: no `osascript`, no socket. */
@@ -291,6 +294,8 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
   }
 
   const server = startHangarServer({
+    // Home's tick never fires on its own in a test: a test drives `scheduler.tick()`.
+    schedulerTimers: MANUAL_TIMERS,
     ...rest,
     port: 0,
     root: hangarRoot,

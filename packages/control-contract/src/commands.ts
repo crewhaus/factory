@@ -19,9 +19,10 @@ export const COMMAND_KINDS: Readonly<Record<CommandKindId, CommandKindDecl>> = d
 );
 
 /**
- * A receipt kind for a legacy Hangar route that has no core kind of its own:
- * `legacy.<route key>`. The route table is the closed list of them; no executor
- * is ever registered for one, so recovery never runs one again.
+ * A receipt kind for a legacy Hangar route, or a CLI verb, that has no core kind of its
+ * own: `legacy.<key>`. The closed list of them is a legacy route's key (Home's route
+ * table) or a CLI verb with no core kind of its own (`hangarInstall`, `hangarUninstall`);
+ * no executor is ever registered for one, so recovery never runs one again.
  */
 export const LEGACY_COMMAND_KIND_RE = /^legacy\.[a-z][A-Za-z0-9]{0,63}$/;
 

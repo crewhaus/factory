@@ -657,9 +657,45 @@ describe("reconcileActivation", () => {
     expect(
       reconcileActivation(receipt(target, "cmd_01bbbbbbbbbbbbbbbbbbbbbbbb"), { harnessDir: dir }),
     ).toBe("unknown");
-    expect(reconcileActivation(receipt(`home/harness/${HRN}`), { harnessDir: dir })).toBe(
-      "unknown",
+    expect(reconcileActivation(receipt(target), { harnessDir: undefined })).toBe("unknown");
+  });
+
+  test("a receipt that names only the harness: every row of the table", async () => {
+    const byHarness = receipt(`home/harness/${HRN}`);
+    // No deployment recorded at all: it did not happen.
+    const empty = harness();
+    expect(reconcileActivation(byHarness, { harnessDir: empty })).toBe("not-done");
+    // Records that cannot be read: nobody can say.
+    const broken = harness();
+    mkdirSync(join(broken, ".crewhaus", "run", "control", "deployments.jsonl"), {
+      recursive: true,
+    });
+    expect(reconcileActivation(byHarness, { harnessDir: broken })).toBe("unknown");
+    // Prepared, but no record carries this command: not done.
+    const dir = harness();
+    const first = await prepare(dir);
+    expect(reconcileActivation(byHarness, { harnessDir: dir })).toBe("not-done");
+    // Activated by this command: done, and still done once a later activation supersedes it.
+    await activateDeployment({ harnessDir: dir, dep: first, actor: ACTOR, cmd: CMD, gates });
+    expect(reconcileActivation(byHarness, { harnessDir: dir })).toBe("done");
+    const second = await prepare(dir);
+    const later = "cmd_01cccccccccccccccccccccccc";
+    await activateDeployment({ harnessDir: dir, dep: second, actor: ACTOR, cmd: later, gates });
+    const read = readDeployments(dir);
+    if (read.state !== "present") throw new Error("absent");
+    expect(read.records.find((r) => r["id"] === first)?.["state"]).toBe("superseded");
+    expect(reconcileActivation(byHarness, { harnessDir: dir })).toBe("done");
+    expect(reconcileActivation(receipt(`home/harness/${HRN}`, later), { harnessDir: dir })).toBe(
+      "done",
     );
+    expect(
+      reconcileActivation(receipt(`home/harness/${HRN}`, "cmd_01bbbbbbbbbbbbbbbbbbbbbbbb"), {
+        harnessDir: dir,
+      }),
+    ).toBe("not-done");
+    // A harness with no live directory, and a target that is neither: nobody can say.
+    expect(reconcileActivation(byHarness, { harnessDir: undefined })).toBe("unknown");
+    expect(reconcileActivation(receipt(`home/cmd/${CMD}`), { harnessDir: dir })).toBe("unknown");
   });
 });
 

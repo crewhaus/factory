@@ -15,6 +15,7 @@
  *   | deploy        | `.crewhaus/deployments.json` mtime         | stat   |
  *   | approval      | folded `approvals.jsonl` timestamps        | capped |
  *   | run           | `.crewhaus/run/runs.jsonl` (folded ledger) | capped |
+ *   | recovery      | Home's last boot report, `service/recovery.json` | small |
  *
  * NO TRANSCRIPT IS EVER OPENED. The session signal is a file mtime, not a
  * parse — the same discipline the rollup digest uses, for the same reason:
@@ -45,6 +46,7 @@ export const ACTIVITY_KINDS = [
   "incident",
   "deploy",
   "approval",
+  "recovery",
 ] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
@@ -247,12 +249,61 @@ export function harnessActivity(
   return { items: items.slice(0, MAX_ACTIVITY_PER_HARNESS), truncated };
 }
 
-/** The fleet digest since `sinceMs`, newest first. */
+/** What Home's last boot did to harnesses, as its recovery report records it. */
+export type RecoveryActivity = {
+  readonly at: string;
+  readonly restarted: ReadonlyArray<{ readonly harness: string; readonly runId: string }>;
+  readonly failed: ReadonlyArray<{ readonly harness: string; readonly message: string }>;
+};
+
+/**
+ * The boot's restarts and the restarts that failed, one item each, for the harnesses
+ * listed (those the reader may see), when the boot is since `sinceMs`.
+ */
+export function recoveryItems(
+  report: RecoveryActivity | undefined,
+  harnesses: readonly ActivityHarness[],
+  sinceMs: number,
+): ActivityItem[] {
+  if (report === undefined) return [];
+  const atMs = Date.parse(report.at);
+  if (!Number.isFinite(atMs) || atMs < sinceMs) return [];
+  const byId = new Map(harnesses.map((harness) => [harness.id, harness]));
+  const items: ActivityItem[] = [];
+  for (const row of report.restarted) {
+    const harness = byId.get(row.harness);
+    if (harness === undefined) continue;
+    items.push({
+      kind: "recovery",
+      harnessId: harness.id,
+      specName: harness.specName,
+      at: iso(atMs),
+      label: "restarted after the machine started",
+      ref: typeof row.runId === "string" ? row.runId : null,
+    });
+  }
+  for (const row of report.failed) {
+    const harness = byId.get(row.harness);
+    if (harness === undefined) continue;
+    items.push({
+      kind: "recovery",
+      harnessId: harness.id,
+      specName: harness.specName,
+      at: iso(atMs),
+      label: maskText(`not restarted after the machine started: ${String(row.message)}`),
+      ref: null,
+    });
+  }
+  return items;
+}
+
+/** The fleet digest since `sinceMs`, newest first, with any extra items merged in. */
 export function activityDigest(
   harnesses: readonly ActivityHarness[],
   sinceMs: number,
+  extra: readonly ActivityItem[] = [],
 ): ActivityDigest {
-  const all: ActivityItem[] = [];
+  const all: ActivityItem[] = [...extra];
   let truncated = false;
   for (const harness of harnesses) {
     const one = harnessActivity(harness, sinceMs);

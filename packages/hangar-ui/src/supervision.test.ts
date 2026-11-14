@@ -1031,6 +1031,10 @@ describe("activity digest", () => {
       "#/h/h/quality/results/run_9",
     );
     expect(sup.activityHref({ kind: "spec", harnessId: "h" })).toBe("#/h/h/setup/spec");
+    // A restart after the machine started opens the run it began.
+    expect(sup.activityHref({ kind: "recovery", harnessId: "h", ref: "run_2" })).toBe(
+      "#/h/h/work/runs/run_2",
+    );
     expect(sup.activityHref({ kind: "deploy", harnessId: "h" })).toBe("#/h/h/setup/deployment");
     expect(sup.activityHref({ kind: "approval", harnessId: "h" })).toBe(
       "#/home/needs-you?type=approvals",

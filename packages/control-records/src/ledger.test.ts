@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { _setIoTapForTest } from "./io";
 import {
@@ -9,6 +9,7 @@ import {
   casAppend,
   expireClaim,
   foldStates,
+  listClaims,
   publishClaim,
   readClaim,
   withLedgerLock,
@@ -803,6 +804,66 @@ describe("expiring a claim", () => {
     const answer = await expireClaim(ledger, "gen/d/1", T0 + 365 * 86_400_000);
     expect(answer).toMatchObject({ ok: false, code: "invalid-path" });
     expect(existsSync(claimFile(root, "gen/d/1.json"))).toBe(true);
+  });
+});
+
+describe("listing one kind's claims", () => {
+  const claimsDir = (root: string): string => join(root, ".crewhaus", "run", "control", "claims");
+
+  test("only that kind's names, sorted, and nothing is written", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root);
+    await appendClaim(ledger, { claim: "idem/b", record: { id: "b" } });
+    await appendClaim(ledger, { claim: "idem/a", record: { id: "a" } });
+    await appendClaim(ledger, { claim: "recover/c", record: { id: "c" } });
+    const before = readdirSync(join(claimsDir(root), "idem")).sort();
+    expect(listClaims(ledger, "idem")).toEqual({
+      ok: true,
+      names: ["idem/a", "idem/b"],
+      truncated: false,
+    });
+    expect(listClaims(ledger, "recover")).toEqual({
+      ok: true,
+      names: ["recover/c"],
+      truncated: false,
+    });
+    expect(readdirSync(join(claimsDir(root), "idem")).sort()).toEqual(before);
+  });
+
+  test("a kind with no directory, and a ledger with no claims at all, have none", () => {
+    const root = tempDir();
+    expect(listClaims(runsLedger(root), "idem")).toEqual({ ok: true, names: [], truncated: false });
+    expect(existsSync(claimsDir(root))).toBe(false);
+  });
+
+  test("a kind that is not a claim kind is refused", () => {
+    const ledger = runsLedger(tempDir());
+    for (const bad of ["../idem", "idem/x", "", "Idem", "gen"]) {
+      expect(listClaims(ledger, bad)).toMatchObject({ ok: false, code: "invalid-path" });
+    }
+  });
+
+  test("a kind directory that leads out of the claims directory is refused", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root);
+    await appendClaim(ledger, { claim: "recover/c", record: { id: "c" } });
+    const elsewhere = join(root, "elsewhere");
+    mkdirSync(elsewhere, { recursive: true });
+    symlinkSync(elsewhere, join(claimsDir(root), "idem"));
+    expect(listClaims(ledger, "idem")).toMatchObject({ ok: false, code: "escapes-root" });
+  });
+
+  test("past the cap, the names are cut and that is said", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root);
+    for (const name of ["a", "b", "c"]) {
+      await appendClaim(ledger, { claim: `idem/${name}`, record: { id: name } });
+    }
+    expect(listClaims(ledger, "idem", { cap: 2 })).toEqual({
+      ok: true,
+      names: ["idem/a", "idem/b"],
+      truncated: true,
+    });
   });
 });
 

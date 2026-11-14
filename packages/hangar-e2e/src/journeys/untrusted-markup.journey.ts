@@ -77,7 +77,14 @@ export const untrustedMarkup: Journey = {
     const { page } = session;
     const id = encodeURIComponent(harness.id);
     await page.route("**/api/notifications", (route) =>
-      route.fulfill(json({ badge: 1, rules: [], delivered: [{ label: MARKUP_PAYLOAD }] })),
+      route.fulfill(
+        json({
+          badge: 1,
+          rules: [],
+          // A delivery is announced once, by the tick time it carries.
+          delivered: [{ label: MARKUP_PAYLOAD, at: new Date().toISOString() }],
+        }),
+      ),
     );
     await page.route(`**/api/h/${id}/advisor/reports`, (route) =>
       route.fulfill(json({ kinds: [MARKUP_PAYLOAD], reports: [] })),

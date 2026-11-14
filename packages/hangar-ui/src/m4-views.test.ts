@@ -379,11 +379,9 @@ describe("the notification poll — HM-183", () => {
     };
   }
 
-  test("a console left open keeps evaluating — the poll is a loop, not a boot-time read", async () => {
-    // `GET /api/notifications` IS the rules evaluation (the manager runs no
-    // timer of its own), so a console that asks once at boot notifies nobody
-    // for as long as it stays open — which is exactly the case the one
-    // default-on rule, a parked approval, exists for.
+  test("a console left open keeps asking — the poll is a loop, not a boot-time read", async () => {
+    // Home delivers on its own tick; the console asks again and again so the badge and
+    // the toasts follow what Home delivered while the screen was open.
     const timers = fakeTimers();
     let calls = 0;
     const poll = createNotificationPoll({
@@ -408,16 +406,17 @@ describe("the notification poll — HM-183", () => {
     expect(calls).toBe(3);
   });
 
-  test("two screens asking at once share ONE evaluating GET", async () => {
-    // The GET is a mutation in one respect: a delivery it returns is deduped
-    // away and never returned again. A second caller would not read the same
-    // state, it would EAT it — so a view asks the shared poll instead.
+  test("two screens asking at once share ONE GET", async () => {
+    // Each GET is a fleet-wide read on the server: a view asks the shared poll instead.
     let calls = 0;
     const poll = createNotificationPoll({
       load: async () => {
         calls += 1;
         await flush();
-        return { badge: 1, delivered: [{ label: "polymarket: 1 approval parked" }] };
+        return {
+          badge: 1,
+          delivered: [{ label: "polymarket: 1 approval parked", at: "2026-11-13T00:00:00.000Z" }],
+        };
       },
       schedule: () => 0,
       cancel: () => {},
@@ -432,27 +431,88 @@ describe("the notification poll — HM-183", () => {
     expect(calls).toBe(1);
   });
 
-  test("nothing consumes a delivery without showing it", async () => {
+  test("each delivery is announced once, however often the state is read", async () => {
     const shown: string[] = [];
+    const parked = { label: "polymarket: 1 approval parked", at: "2026-11-13T00:00:10.000Z" };
+    let delivered: Array<{ label: string; at: string }> = [parked];
     const poll = createNotificationPoll({
-      load: async () => ({
-        badge: 1,
-        delivered: [{ label: "polymarket: 1 approval parked" }],
-      }),
+      load: async () => ({ badge: 1, delivered }),
       schedule: () => 0,
       cancel: () => {},
     });
-    poll.subscribe((_payload: unknown, delivered: Array<{ label?: string }>) => {
-      for (const d of delivered) shown.push(String(d?.label ?? ""));
+    poll.subscribe((_payload: unknown, fresh: Array<{ label?: string }>) => {
+      for (const d of fresh) shown.push(String(d?.label ?? ""));
     });
     await poll.refresh();
+    // The same delivery in the next read is not announced again.
+    await poll.refresh();
     expect(shown).toEqual(["polymarket: 1 approval parked"]);
-    // The PUT that saves the rules answers with the same evaluated view,
-    // deliveries and all. Folding it back in is what stops a write from
-    // eating a toast nothing ever showed.
-    poll.accept({ badge: 2, delivered: [{ label: "brewbird: eval gate failed" }] });
+    // A later tick's delivery is, once.
+    const gate = { label: "brewbird: eval gate failed", at: "2026-11-13T00:00:20.000Z" };
+    delivered = [gate, parked];
+    await poll.refresh();
+    await poll.refresh();
     expect(shown).toEqual(["polymarket: 1 approval parked", "brewbird: eval gate failed"]);
+    // The PUT that saves the rules answers with the same view: folded in, it announces
+    // only what is newer still.
+    poll.accept({
+      badge: 2,
+      delivered: [{ label: "relay: crash looping", at: "2026-11-13T00:00:30.000Z" }, gate],
+    });
+    expect(shown).toEqual([
+      "polymarket: 1 approval parked",
+      "brewbird: eval gate failed",
+      "relay: crash looping",
+    ]);
     expect((poll.snapshot() as { badge: number }).badge).toBe(2);
+  });
+
+  test("a reload in the same tab does not announce a delivery again", async () => {
+    const kept = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => kept.get(key) ?? null,
+      setItem: (key: string, value: string) => void kept.set(key, value),
+    };
+    const delivered = [{ label: "polymarket: 1 approval parked", at: "2026-11-13T00:00:10.000Z" }];
+    const shownBy = async () => {
+      const shown: string[] = [];
+      const poll = createNotificationPoll({
+        load: async () => ({ badge: 1, delivered }),
+        schedule: () => 0,
+        cancel: () => {},
+        storage,
+      });
+      poll.subscribe((_payload: unknown, fresh: Array<{ label?: string }>) => {
+        for (const d of fresh) shown.push(String(d?.label ?? ""));
+      });
+      await poll.refresh();
+      return shown;
+    };
+    expect(await shownBy()).toEqual(["polymarket: 1 approval parked"]);
+    // The page again, in the same tab: the same delivery is not announced twice.
+    expect(await shownBy()).toEqual([]);
+    // Storage that refuses still announces, once per page.
+    const refusing = {
+      getItem: () => {
+        throw new Error("blocked");
+      },
+      setItem: () => {
+        throw new Error("blocked");
+      },
+    };
+    const shown: string[] = [];
+    const poll = createNotificationPoll({
+      load: async () => ({ badge: 1, delivered }),
+      schedule: () => 0,
+      cancel: () => {},
+      storage: refusing,
+    });
+    poll.subscribe((_payload: unknown, fresh: Array<{ label?: string }>) => {
+      for (const d of fresh) shown.push(String(d?.label ?? ""));
+    });
+    await poll.refresh();
+    await poll.refresh();
+    expect(shown).toEqual(["polymarket: 1 approval parked"]);
   });
 
   test("a failed poll, and a listener that throws, both leave the loop running", async () => {

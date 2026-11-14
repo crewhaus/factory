@@ -320,6 +320,36 @@ function writeOne(
   return written.ok ? undefined : { harness: harness.id, reason: written.reason };
 }
 
+/**
+ * Whether any approver list is behind the snapshot right now: a governed harness whose
+ * file is absent, unreadable or holds other content than the snapshot gives at `now`
+ * (a group move, or a deciding credential past its end, changes that content), or a
+ * harness a grant has newly come to cover. It asks the writer itself in its probe mode,
+ * so "behind" means exactly "a write would change something": the two can never disagree
+ * about what a list must hold. A read: no lock, no write, one reader made for this call,
+ * so a file is read now. A harness whose directory is missing is not counted: no write
+ * could reach it.
+ */
+export function projectionsBehind(input: {
+  readonly root: string;
+  readonly snapshot: AccessSnapshot;
+  readonly harnesses: readonly AccessHarness[];
+  readonly now: number;
+}): boolean {
+  const report = writeApproverProjections({
+    ...input,
+    // A file ahead of the revision is still behind the records: the refresh moves the
+    // revision above it and then writes it.
+    epoch: Number.MAX_SAFE_INTEGER,
+    by: RECONCILE_PROBE,
+    probe: true,
+  });
+  return report.written.length > 0 || report.failed.length > 0;
+}
+
+/** The `by` a probe passes; a probe appends no row, so it is never stored. */
+const RECONCILE_PROBE = "sys:probe";
+
 export type WriteProjectionsInput = {
   readonly root: string;
   readonly snapshot: AccessSnapshot;
@@ -329,6 +359,11 @@ export type WriteProjectionsInput = {
   readonly now: number;
   /** The stored actor of a `governed.jsonl` row this call appends. */
   readonly by: string;
+  /**
+   * Write nothing and append nothing: `written` then lists the harnesses a write would
+   * change. A harness whose directory is missing is left out, since no write could reach it.
+   */
+  readonly probe?: boolean;
 };
 
 /**
@@ -351,9 +386,14 @@ export function writeApproverProjections(input: WriteProjectionsInput): Projecti
   for (const harness of input.harnesses) {
     if (seen.has(harness.id)) continue;
     seen.add(harness.id);
+    if (input.probe === true && !dirExists(harness.dir)) continue;
     let row: GovernedRow | undefined = governed.get(harness.id);
     if (row === undefined) {
       if (!governsNow(snapshot, harness, now)) continue;
+      if (input.probe === true) {
+        report.written.push(harness.id);
+        continue;
+      }
       const fresh: GovernedRow = { id: harness.id, state: "governed", since: at, at, by };
       const sealed = sealTornLine(root, accessPaths().ledgers.governed);
       const appended = sealed.ok && lineBytes(fresh) < 4096 ? append(ledger, fresh) : undefined;
@@ -390,6 +430,10 @@ export function writeApproverProjections(input: WriteProjectionsInput): Projecti
         });
         continue;
       }
+    }
+    if (input.probe === true) {
+      report.written.push(harness.id);
+      continue;
     }
     const failure = writeOne(harness, content, epoch, at);
     if (failure === undefined) report.written.push(harness.id);

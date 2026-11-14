@@ -176,7 +176,7 @@ const executorFor =
 const reconcilerFor =
   (observe: Observer): Reconciler =>
   (receipt, { harnessDir }) =>
-    reconcileOf(observe(receipt, harnessDir));
+    harnessDir === undefined ? "unknown" : reconcileOf(observe(receipt, harnessDir));
 
 /** The decision service's executors: each settles by observation, and none acts again. */
 export const DECISION_EXECUTORS: Readonly<Record<string, Executor>> = {
@@ -187,8 +187,13 @@ export const DECISION_EXECUTORS: Readonly<Record<string, Executor>> = {
   "rules.revoke": executorFor(observeRuleRevoke),
 };
 
-/** The reconcilers of the two kinds that are not safe to repeat. */
+/**
+ * The reconcilers the reconcile sweep asks about a receipt recovery left `unknown`: the two
+ * kinds that are not safe to repeat, which recovery asks first too, and `decisions.resolve`,
+ * which recovery runs again instead (it is safe to repeat), so only the sweep asks it.
+ */
 export const DECISION_RECONCILERS: Readonly<Record<string, Reconciler>> = {
+  "decisions.resolve": reconcilerFor(observeResolve),
   "decisions.supersede": reconcilerFor(observeSupersede),
   "rules.create": reconcilerFor(observeRuleCreate),
 };

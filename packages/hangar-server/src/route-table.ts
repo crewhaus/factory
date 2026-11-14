@@ -60,6 +60,14 @@ export type RouteRow = {
   /** The read a scoped token may make here, one of `SCOPED_ACTS`; only on a GET with `ref`. */
   readonly scopedAct?: string;
   /**
+   * What completes the receipt's target beyond the harness: the ref kind and the path
+   * parameter holding its id, so the target is `<hrn>/<kind>/<value>` (the decision a
+   * grant or deny settles is `<hrn>/decision/<apprId>`, the ref the CLI's decision verbs
+   * build). Separate from `ref`, which the choke point's domain checkers read. Absent, the
+   * target is the harness.
+   */
+  readonly receiptRef?: { readonly kind: string; readonly param: string };
+  /**
    * A row of the versioned API, built from its operation (`v1/match.ts`): its handler
    * submits its own receipt, so the receipts middleware never writes one for it.
    */
@@ -69,6 +77,7 @@ export type RouteRow = {
 type WriteExtras = {
   readonly qualifiers?: readonly Qualifier[];
   readonly kind?: keyof typeof COMMAND_KINDS;
+  readonly receiptRef?: { readonly kind: string; readonly param: string };
   readonly dispatch?: "job";
   readonly secretFields?: readonly string[];
   readonly aliases?: readonly string[];
@@ -133,6 +142,7 @@ function write(
     dispatch: extras.dispatch ?? "inline",
     ...(core === undefined ? { idempotent: method === "PUT" || method === "DELETE" } : {}),
     ...(extras.secretFields !== undefined ? { secretFields: extras.secretFields } : {}),
+    ...(extras.receiptRef !== undefined ? { receiptRef: extras.receiptRef } : {}),
     cliTwin: core?.cliTwin ?? null,
     ...(note !== undefined ? { note } : {}),
   };
@@ -259,7 +269,11 @@ export const ROUTE_TABLE: readonly RouteRow[] = [
     "POST",
     "/api/h/:id/approvals/:apprId/grant",
     "h.decision.resolve",
-    { qualifiers: ["class"], kind: "decisions.resolve" },
+    {
+      qualifiers: ["class"],
+      kind: "decisions.resolve",
+      receiptRef: { kind: "decision", param: "apprId" },
+    },
   ),
   write(
     "denyApproval",
@@ -267,7 +281,11 @@ export const ROUTE_TABLE: readonly RouteRow[] = [
     "POST",
     "/api/h/:id/approvals/:apprId/deny",
     "h.decision.resolve",
-    { qualifiers: ["class"], kind: "decisions.resolve" },
+    {
+      qualifiers: ["class"],
+      kind: "decisions.resolve",
+      receiptRef: { kind: "decision", param: "apprId" },
+    },
   ),
   read("review", "/api/review", "home.read", ["filtered"]),
   write("adjudicateReview", "harness", "POST", "/api/h/:id/review/:itemId", "h.decision.resolve", {

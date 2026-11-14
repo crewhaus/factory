@@ -37,7 +37,12 @@ export type ExecutorContext = {
 export type Executor = (ctx: ExecutorContext) => Promise<Settlement>;
 
 export type ReconcileContext = {
-  readonly harnessDir: string;
+  /**
+   * The harness's live directory, when it has one. A receipt in Home's own ledger whose
+   * harness is gone (a retire's, after the harness was archived) has none: a reconciler
+   * that reads a directory then answers `unknown`.
+   */
+  readonly harnessDir: string | undefined;
   readonly probe: LeaseProbe;
   readonly now: () => number;
   /** Home's root, for a kind whose effect is recorded there (retire's lifecycle line). */
