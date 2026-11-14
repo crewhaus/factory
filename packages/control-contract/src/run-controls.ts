@@ -68,13 +68,53 @@ function cellsFor(shape: RunControlShape): Readonly<Record<RunControlKey, Capabi
     "controls.cancelRun": NOT_CHECKED,
     "controls.drain": runsOnce ? noIntake : NOT_CHECKED,
     "controls.disable": NOT_CHECKED,
-    "runs.create": {
-      supported: false,
-      reason: "Starting a run through the control API is not served yet.",
-      verb: null,
-    },
+    "runs.create": RUNS_CREATE[shape],
   };
 }
+
+/**
+ * Whether the control API can start a run of each shape: the shapes whose entry reads its
+ * input (a cli turn, a crew brief, the seed of a workflow or a graph, a managed run's
+ * input) start one, and the others name their own intake. Each `true` cell is held by a
+ * truth test that reads the shape's compiled entry.
+ */
+const RUNS_CREATE: Readonly<Record<RunControlShape, CapabilityDescriptor>> = {
+  cli: { supported: true },
+  crew: { supported: true },
+  workflow: { supported: true },
+  graph: { supported: true },
+  managed: { supported: true },
+  channel: {
+    supported: false,
+    reason: "A channel harness takes its work as messages: message it in the channel.",
+    verb: null,
+  },
+  batch: {
+    supported: false,
+    reason: "A batch harness takes its work from its queue: enqueue it.",
+    verb: null,
+  },
+  voice: {
+    supported: false,
+    reason: "A voice harness takes its work as calls.",
+    verb: null,
+  },
+  pipeline: {
+    supported: false,
+    reason: "A pipeline harness's build reads no input, so there is nothing to start it with.",
+    verb: null,
+  },
+  research: {
+    supported: false,
+    reason: "A research harness's build reads no input, so there is nothing to start it with.",
+    verb: null,
+  },
+  browser: {
+    supported: false,
+    reason: "A browser harness takes its task in the terminal.",
+    verb: "crewhaus run crewhaus.yaml --prompt <text>",
+  },
+};
 
 /** Every run-control shape, with one descriptor per run-control key. */
 export const SHAPE_RUN_CONTROLS: Readonly<

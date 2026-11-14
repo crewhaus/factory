@@ -15,6 +15,34 @@ export const MANAGED_RUN_HANDLER: unique symbol = Symbol.for(
   "@crewhaus/gateway-server/managed-run-handler",
 );
 
+/**
+ * What a branded handler carries of the control plane it was given: whether its
+ * daemon takes a client's own run handle right now. A handler made without a
+ * plane carries nothing, and its requests are decoded strictly.
+ */
+export const MANAGED_RUN_PLANE: unique symbol = Symbol.for(
+  "@crewhaus/gateway-server/managed-run-plane",
+);
+
+/** The part of a control plane a branded handler carries. */
+export type ManagedRunPlane = { readonly clientRunIds?: () => boolean };
+
+/**
+ * Whether requests for `handler` take `idempotency` and `runId`: a branded handler whose
+ * plane says so (`ControlPlane.clientRunIds`). Asked per request; a throw is a no.
+ */
+export function clientRunIdsOf(handler: unknown): boolean {
+  if (!isManagedRunHandler(handler)) return false;
+  const plane = (handler as unknown as Record<symbol, ManagedRunPlane | undefined>)[
+    MANAGED_RUN_PLANE
+  ];
+  try {
+    return plane?.clientRunIds?.() === true;
+  } catch {
+    return false;
+  }
+}
+
 /** Whether `handler` carries {@link MANAGED_RUN_HANDLER}. */
 export function isManagedRunHandler(handler: unknown): boolean {
   return (
@@ -26,8 +54,8 @@ export function isManagedRunHandler(handler: unknown): boolean {
 /**
  * A handler's refusal with a wire `ErrorCode` of its own: the gateway answers
  * it with this `wireCode`, `message` and `data`, at the code's HTTP status.
- * The codes it maps are `input_blocked` and `unsupported`; any other answers
- * `internal_error`.
+ * The codes it maps are `input_blocked`, `unsupported`, `bad_request` and
+ * `conflict`; any other answers `internal_error`.
  */
 export class GatewayCodedError extends CrewhausError {
   override readonly name = "GatewayCodedError";

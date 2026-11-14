@@ -334,6 +334,8 @@ export const runResult = z
     evaluationRefs: z.array(z.string()).optional(),
     cost: runCost.optional(),
     inspectionUrl: z.string().optional(),
+    sensitivity: z.enum(["internal", "restricted", "people"]),
+    hidden: z.array(z.string()).optional(),
   })
   .passthrough();
 

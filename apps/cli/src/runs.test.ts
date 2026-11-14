@@ -91,15 +91,24 @@ describe("resolveRunsResumeTarget", () => {
     expect(written.ok).toBe(true);
   }
 
-  test("a run id resolves to its session, whatever its last row says", () => {
+  test("a run id resolves to its session; a run that ended is refused by name, and its session id still resumes", () => {
     const dir = harness();
-    const [finished, parked] = [mintRunId(), mintRunId()];
+    const [finished, parked, cancelled] = [mintRunId(), mintRunId(), mintRunId()];
     plant(dir, { id: finished, state: "running", session: sessionId(1) });
     plant(dir, { id: finished, state: "succeeded" });
     plant(dir, { id: parked, state: "running", session: sessionId(2) });
     plant(dir, { id: parked, state: "waiting-for-approval", decision: "appr_0123456789abcdef" });
-    // The last rows carry no session: a resolver that read only the fold would find none.
-    expect(resolveRunsResumeTarget(finished, dir)).toEqual({ sessionId: sessionId(1) });
+    plant(dir, { id: cancelled, state: "running", session: sessionId(5) });
+    plant(dir, { id: cancelled, state: "waiting-for-approval" });
+    plant(dir, { id: cancelled, state: "cancelled" });
+    expect(() => resolveRunsResumeTarget(finished, dir)).toThrow(
+      `run ${finished} was succeeded; nothing was resumed`,
+    );
+    expect(() => resolveRunsResumeTarget(cancelled, dir)).toThrow(
+      `run ${cancelled} was cancelled; nothing was resumed`,
+    );
+    expect(resolveRunsResumeTarget(sessionId(1), dir)).toEqual({ sessionId: sessionId(1) });
+    // The parked run's last row carries no session: a resolver that read only the fold would find none.
     expect(resolveRunsResumeTarget(parked, dir)).toEqual({
       sessionId: sessionId(2),
       continues: parked,

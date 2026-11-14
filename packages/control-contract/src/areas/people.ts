@@ -526,7 +526,13 @@ export const PEOPLE_MODULE = {
       cliTwin: { argv: ["people", "erase", "{psn}"] },
       qualifiers: [],
       secretFields: ["confirm"],
-      modelBound: { confirm: SEALED },
+      modelBound: {
+        confirm: SEALED,
+        nonce: {
+          none: true,
+          reason: "Matched against the plan a preview handed back; no model reads it.",
+        },
+      },
     },
   ],
   grammars: [

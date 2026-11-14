@@ -217,6 +217,7 @@ describe("closed lists", () => {
       "runs.ledger",
       "decisions.consumeChecks",
       "events.trace",
+      "runs.clientRunId",
     ]);
     expect([...CORE_MODULE.scopedActs]).toEqual(["run.events.read", "run.result.read"]);
   });

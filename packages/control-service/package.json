@@ -17,6 +17,8 @@
     "@crewhaus/control-contract": "workspace:*",
     "@crewhaus/control-records": "workspace:*",
     "@crewhaus/deployment-controller": "workspace:*",
+    "@crewhaus/gateway-protocol": "workspace:*",
+    "@crewhaus/gateway-server": "workspace:*",
     "@crewhaus/harness-registry": "workspace:*",
     "@crewhaus/harness-supervisor": "workspace:*",
     "@crewhaus/ir": "workspace:*",
@@ -28,7 +30,10 @@
   },
   "devDependencies": {
     "@crewhaus/errors": "workspace:*",
-    "@crewhaus/spec-patch": "workspace:*"
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

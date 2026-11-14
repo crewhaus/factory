@@ -7,7 +7,7 @@
 import { DEFER_REASONS, OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
 import { PERSON_CHANGE_REASONS } from "./areas/quality.js";
 import type { CliTwin } from "./areas/types.js";
-import { APPROVAL_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
+import { APPROVAL_ID_RE, CANONICAL_RUN_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
 import { deepFreeze } from "./util.js";
 
 export type { CliTwin } from "./areas/types.js";
@@ -20,6 +20,7 @@ export const CLI_VERBS = deepFreeze({
   deploy: ["activate", "list"],
   access: ["members", "tokens", "revoke", "unlink"],
   commands: ["list", "show"],
+  runs: ["list", "show", "cancel"],
   people: [
     "init",
     "keys",
@@ -57,6 +58,9 @@ export const CLI_VERBS = deepFreeze({
  * link's ids, and `{cmd}` a command receipt's, each its own id grammar. `{until}` is an
  * ISO date and time with `Z` or an offset, and `{deferReason}` one of the reasons a
  * person may give to defer a decision.
+ *
+ * `{run}` is a run's canonical id (`run_` and 26 characters), the id the run ledger
+ * keys a run by; an execution's `run_<16 hex>` never fits it.
  */
 export const TWIN_PLACEHOLDERS = deepFreeze({
   "{hrn}": HARNESS_ID_RE,
@@ -85,6 +89,7 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{cmd}": /^cmd_[0-9a-hjkmnp-tv-z]{26}$/,
   "{until}": /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/,
   "{deferReason}": new RegExp(`^(?:${DEFER_REASONS.join("|")})$`),
+  "{run}": CANONICAL_RUN_ID_RE,
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

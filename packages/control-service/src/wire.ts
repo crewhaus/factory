@@ -262,6 +262,7 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
     commands: {
       submit: commands.submit,
       get: commands.get,
+      replayOf: commands.replayOf,
       recover,
       reconcile,
       settle,
