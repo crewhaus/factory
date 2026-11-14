@@ -28,6 +28,14 @@ export const OPERATOR_SUPERSEDE_REASONS = deepFreeze([
   "other",
 ] as const);
 
+/** The reasons a person may give for deferring a decision: the `defer` list, whole. */
+export const DEFER_REASONS = deepFreeze([
+  "awaiting-information",
+  "awaiting-someone",
+  "scheduled",
+  "other",
+] as const);
+
 /**
  * Why a grant was not spent: the checks made just before it is used, each a
  * code from this closed list. They are the `refuse` reasons of the decision log.
@@ -445,6 +453,13 @@ export const CORE_MODULE = {
       cliTwin: TWINS.approvalsSupersede,
     },
     {
+      id: "decisions.defer",
+      permission: "h.decision.resolve",
+      idempotent: true,
+      effect: "local",
+      cliTwin: TWINS.approvalsDefer,
+    },
+    {
       id: "rules.create",
       permission: "h.standing-rule.manage",
       idempotent: false,
@@ -491,28 +506,28 @@ export const CORE_MODULE = {
       permission: "home.access.manage",
       idempotent: true,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.accessRevokeInvite,
     },
     {
       id: "access.grants.revoke",
       permission: "home.access.manage",
       idempotent: true,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.accessRevokeGrant,
     },
     {
       id: "access.tokens.revoke",
       permission: "home.access.manage",
       idempotent: true,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.accessRevokeToken,
     },
     {
       id: "access.links.revoke",
       permission: "home.access.manage",
       idempotent: true,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.accessUnlink,
     },
     {
       id: "access.devices.revoke",
@@ -524,6 +539,13 @@ export const CORE_MODULE = {
     {
       id: "auth.acceptInvite",
       permission: "public",
+      idempotent: false,
+      effect: "local",
+      cliTwin: null,
+    },
+    {
+      id: "auth.device.decide",
+      permission: "authenticated",
       idempotent: false,
       effect: "local",
       cliTwin: null,
@@ -577,7 +599,7 @@ export const CORE_MODULE = {
     refuse: [...VERIFY_REASONS],
     evict: ["erased", "ttl"],
     expire: ["ttl", "retired"],
-    defer: ["awaiting-information", "awaiting-someone", "scheduled", "other"],
+    defer: [...DEFER_REASONS],
   },
   capabilityKeys: [
     "controls.pauseIntake",

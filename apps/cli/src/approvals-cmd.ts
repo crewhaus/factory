@@ -4,10 +4,10 @@
  * `list` and `show` read the approvals store under the harness's session root
  * (`foldReadOnly`, never a rewrite). `rules` lists the harness's standing rules, the
  * requests waiting for its owner and the whole-tool allows no record names. Every
- * change — `grant`, `deny`, `supersede`, `revoke`, and the standing rule a grant with
- * `--always` makes — goes through control-service's `decisions` and `rules`, the same
- * code Home's routes use, wrapped in a command whose receipt is written first, in the
- * harness's own command ledger (`defer` keeps its decision-log line as its record).
+ * change — `grant`, `deny`, `supersede`, `defer`, `revoke`, and the standing rule a grant
+ * with `--always` makes — goes through control-service's `decisions` and `rules`, the
+ * same code Home's routes use, wrapped in a command whose receipt is written first, in
+ * the harness's own command ledger.
  * Receipts and control state are kept only in a known harness ({@link isKnownHarness}):
  * in any other directory a change answers without writing anything there.
  *
@@ -215,6 +215,7 @@ function settlementOf(answer: { readonly outcome: string }): Settlement {
   switch (answer.outcome) {
     case "decided":
     case "superseded":
+    case "deferred":
     case "revoked":
     case "removed":
       return { state: "succeeded" };
@@ -315,7 +316,7 @@ const recovered = new Set<string>();
 async function receipted<T extends { readonly outcome: string }>(
   deps: ApprovalsDeps,
   harnessDir: string | undefined,
-  kind: "decisions.resolve" | "decisions.supersede" | "rules.revoke",
+  kind: "decisions.resolve" | "decisions.supersede" | "decisions.defer" | "rules.revoke",
   target: string | undefined,
   change: (receipt: CommandReceipt | undefined) => Promise<T>,
 ): Promise<
@@ -512,10 +513,7 @@ export async function runApprovalsCommand(
   // With no harness to keep it in, a store that is not there holds nothing to decide,
   // and none is made.
   if (harnessDir === undefined && APPROVAL_ID_RE.test(id) && !existsSync(rootDir)) {
-    return fail(
-      action === "defer" ? 1 : EXIT_FOR_REJECTED_RECEIPT,
-      `no approval "${id}" under ${rootDir}`,
-    );
+    return fail(EXIT_FOR_REJECTED_RECEIPT, `no approval "${id}" under ${rootDir}`);
   }
   const display = str(args, "by") ?? deps.env["CREWHAUS_USER"] ?? "cli";
   const actor: DecisionActor = { kind: "local", identity: deps.identity, display };
@@ -604,23 +602,29 @@ export async function runApprovalsCommand(
     }
     if (!APPROVAL_ID_RE.test(id))
       return fail(1, `${id} is a request to the owner; it cannot be deferred`);
-    const answer = await deps.control.decisions.defer({
-      ...(harnessDir !== undefined ? { harnessDir } : {}),
-      rootDir,
-      ref: id,
-      until,
-      reason,
-      actor,
-      via: "cli",
-    });
-    if (answer.outcome === "not-found") return fail(1, `no approval "${id}" under ${rootDir}`);
-    if (answer.outcome === "forbidden") {
-      return fail(EXIT_FOR_ERROR.forbidden, answer.reason ?? "not allowed to defer this request");
+    const done = await receipted(deps, harnessDir, "decisions.defer", decisionTarget, () =>
+      deps.control.decisions.defer({
+        ...(harnessDir !== undefined ? { harnessDir } : {}),
+        rootDir,
+        ref: id,
+        until,
+        reason,
+        actor,
+        via: "cli",
+      }),
+    );
+    if ("refused" in done) return fail(done.code, done.refused);
+    const answer = done.value;
+    if (answer.outcome === "not-found") {
+      return fail(exitFor(answer.outcome), `no approval "${id}" under ${rootDir}`);
     }
-    if (answer.outcome === "expired") return fail(1, `${id} has expired`);
+    if (answer.outcome === "forbidden") {
+      return fail(exitFor(answer.outcome), answer.reason ?? "not allowed to defer this request");
+    }
+    if (answer.outcome === "expired") return fail(exitFor(answer.outcome), `${id} has expired`);
     if (answer.outcome === "already-decided") {
       return fail(
-        1,
+        exitFor(answer.outcome),
         `${id} is not waiting: ${alreadyDecidedMessage(id, answer.winner ?? answer.record ?? ({} as PendingApproval))}`,
       );
     }

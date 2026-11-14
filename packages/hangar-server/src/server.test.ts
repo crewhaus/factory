@@ -127,7 +127,11 @@ describe("healthz + version + static", () => {
     expect((await t.fetchRaw("/api/version")).status).toBe(401);
     const { status, body } = await t.api("/api/version");
     expect(status).toBe(200);
-    expect(body).toEqual({ hangar: HANGAR_SERVER_VERSION, protocolV: PROTOCOL_V });
+    expect(body).toEqual({
+      hangar: HANGAR_SERVER_VERSION,
+      protocolV: PROTOCOL_V,
+      api: ["crewhaus.hangar.v1"],
+    });
   });
 
   test("static shell serves injected assets, falls back to a builtin index, and 404s the rest", async () => {

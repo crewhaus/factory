@@ -1,4 +1,4 @@
-import { NO_VERB, READ, WORKSPACE_COMMAND } from "./shared.js";
+import { NO_VERB, READ, TWINS, WORKSPACE_COMMAND } from "./shared.js";
 
 export const ACCESS_OPERATIONS = [
   {
@@ -9,8 +9,7 @@ export const ACCESS_OPERATIONS = [
     permission: "home.access.manage",
     request: "listQuery",
     response: "memberList",
-    cliTwin: null,
-    noTwinReason: NO_VERB,
+    cliTwin: TWINS.accessMembers,
     qualifiers: [],
   },
   {
@@ -45,8 +44,7 @@ export const ACCESS_OPERATIONS = [
     permission: "home.access.manage",
     request: "listQuery",
     response: "tokenList",
-    cliTwin: null,
-    noTwinReason: NO_VERB,
+    cliTwin: TWINS.accessTokens,
     qualifiers: ["self"],
   },
   {
@@ -129,8 +127,7 @@ export const ACCESS_OPERATIONS = [
     permission: "home.access.manage",
     request: "emptyRequest",
     response: "commandAccepted",
-    cliTwin: null,
-    noTwinReason: NO_VERB,
+    cliTwin: TWINS.accessRevokeInvite,
     qualifiers: [],
   },
   {
@@ -141,8 +138,7 @@ export const ACCESS_OPERATIONS = [
     permission: "home.access.manage",
     request: "emptyRequest",
     response: "commandAccepted",
-    cliTwin: null,
-    noTwinReason: NO_VERB,
+    cliTwin: TWINS.accessRevokeGrant,
     qualifiers: [],
   },
   {
@@ -153,8 +149,7 @@ export const ACCESS_OPERATIONS = [
     permission: "home.access.manage",
     request: "emptyRequest",
     response: "commandAccepted",
-    cliTwin: null,
-    noTwinReason: NO_VERB,
+    cliTwin: TWINS.accessRevokeToken,
     qualifiers: ["self"],
   },
   {
@@ -165,8 +160,7 @@ export const ACCESS_OPERATIONS = [
     permission: "home.access.manage",
     request: "emptyRequest",
     response: "commandAccepted",
-    cliTwin: null,
-    noTwinReason: NO_VERB,
+    cliTwin: TWINS.accessUnlink,
     qualifiers: ["self"],
   },
   {

@@ -4,6 +4,7 @@
  * control-contract's `issued`, and the masker must leave every field of it alone.
  */
 import { describe, expect, test } from "bun:test";
+import { makeSeal } from "@crewhaus/control-contract/http";
 import { issued as issuedSchema } from "@crewhaus/control-contract/schemas";
 import { isCredentialKey, maskCredentialTokens } from "@crewhaus/spec-patch";
 import { type Issued, sealSecret } from "./sealed";
@@ -85,5 +86,18 @@ describe("sealed issuance", () => {
         "auth.session",
       ),
     ).rejects.toThrow();
+  });
+});
+
+describe("the CLI half", () => {
+  test("a secret sealed here opens with control-contract/http, for its operation only", async () => {
+    const client = await makeSeal();
+    const secret = mintIssuedSecret("personal");
+    for (const op of ["auth.device.start", "auth.device.poll", "access.tokens.mint"] as const) {
+      const issued = await sealSecret(client.seal, secret, op);
+      expect(await client.open(issued, op)).toBe(secret);
+    }
+    const issued = await sealSecret(client.seal, secret, "auth.device.poll");
+    await expect(client.open(issued, "auth.device.start")).rejects.toThrow();
   });
 });

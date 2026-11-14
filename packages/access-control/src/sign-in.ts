@@ -201,6 +201,15 @@ export type SignInHandle = {
   noteIgnoredIdentity(listener: string, address: string | null): Promise<void>;
   /** Live exchange codes and challenges: what the caps bound. */
   pending(): { readonly codes: number; readonly challenges: number };
+  /**
+   * End a browser's device key, and with it every session issued to it. `owner` says
+   * whose it must be, unless `undefined` (the Home's owner may end anyone's). `by` is the
+   * stored actor recorded. Never moves the access revision: a device is a sign-in.
+   */
+  revokeDevice(
+    device: string,
+    input: { readonly by: string; readonly owner?: string },
+  ): Promise<{ readonly ok: true; readonly device: DeviceRow } | SignInRefusal>;
 };
 
 function refused(
@@ -911,5 +920,23 @@ export function openSignIn(hangarRoot: string, options: SignInOptions): SignInHa
     },
 
     pending: () => ({ codes: codes.size, challenges: challenges.size }),
+
+    async revokeDevice(device, input) {
+      const fold = foldSignIn(hangarRoot);
+      const row = fold.ok ? fold.devices.get(device) : undefined;
+      if (row === undefined || (input.owner !== undefined && row.principal !== input.owner)) {
+        return refused("device_unknown", "No device of yours has that id.", 400);
+      }
+      if (row.state !== "active") {
+        return refused("device_revoked", "That device is already signed out.", 400);
+      }
+      const at = new Date(now()).toISOString();
+      const ended: DeviceRow = { ...row, state: "revoked", revokedAt: at, at, by: input.by };
+      const written = await write([{ kind: "devices", row: ended }], false);
+      if (!written.ok) {
+        return refused("unavailable", "The device could not be signed out.", 503);
+      }
+      return { ok: true, device: ended };
+    },
   };
 }

@@ -864,3 +864,100 @@ describe("permissions suggest --apply on a harness with an approver list", () =>
     expect(settingsApplyGate(tmp("approvals-plain-"), deps(STRANGER))).toBeUndefined();
   }, 30_000);
 });
+
+describe("a deferral is a receipted command", () => {
+  const lines = (harness: string, id: string): Record<string, unknown>[] => {
+    const dir = commandsLedgerOf(harness).records;
+    const base = join(harness, "dir" in dir ? dir.dir : "");
+    if (!existsSync(base)) return [];
+    return readdirSync(base)
+      .sort()
+      .flatMap((name) => readFileSync(join(base, name), "utf8").split("\n"))
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((row) => row["id"] === id);
+  };
+  const deferLines = (root: string, id: string): number => {
+    const dir = join(root, "approvals.d", "decisions");
+    if (!existsSync(dir)) return 0;
+    return readdirSync(dir)
+      .flatMap((name) => readFileSync(join(dir, name), "utf8").split("\n"))
+      .filter((line) => line.includes('"event":"defer"') && line.includes(id)).length;
+  };
+
+  test("a defer writes one receipt, accepted then succeeded, beside its decision-log line", async () => {
+    const { hangarRoot } = await home();
+    const r = rig(hangarRoot);
+    const root = sessionsOf(r.harness);
+    const p = await park(root);
+    const done = await r.run([
+      "defer",
+      p.id,
+      "--until",
+      "2099-01-01T00:00:00Z",
+      "--reason",
+      "scheduled",
+      "--dir",
+      r.harness,
+    ]);
+    expect(done.code).toBe(0);
+    const deferReceipts = receipts(r.harness).filter((x) => x["kind"] === "decisions.defer");
+    expect(deferReceipts).toHaveLength(1);
+    const id = String(deferReceipts[0]?.["id"]);
+    expect(lines(r.harness, id).map((row) => row["state"])).toEqual(["accepted", "succeeded"]);
+    expect(deferLines(root, p.id)).toBe(1);
+  }, 30_000);
+
+  test("a refused defer (an expired request) writes one rejected receipt and exits 55", async () => {
+    const { hangarRoot } = await home();
+    const r = rig(hangarRoot);
+    const root = sessionsOf(r.harness);
+    const p = await park(root);
+    // The request's own deadline has passed.
+    await createPendingApprovalStore({ rootDir: root }).persist({
+      ...p,
+      id: generateApprovalId(),
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    } as PendingApproval);
+    const expired = foldReadOnly(root).records.find((x) => x.id !== p.id);
+    if (expired === undefined) throw new Error("no expired request");
+    const refused = await r.run([
+      "defer",
+      expired.id,
+      "--until",
+      "2099-01-01T00:00:00Z",
+      "--reason",
+      "scheduled",
+      "--dir",
+      r.harness,
+    ]);
+    expect(refused.code).toBe(55);
+    const rows = receipts(r.harness).filter((x) => x["kind"] === "decisions.defer");
+    expect(rows.map((x) => x["state"])).toEqual(["rejected"]);
+    expect(lines(r.harness, String(rows[0]?.["id"])).map((row) => row["state"])).toEqual([
+      "accepted",
+      "rejected",
+    ]);
+    expect(deferLines(root, expired.id)).toBe(0);
+  }, 30_000);
+
+  test("argument errors write nothing and keep their exit", async () => {
+    const { hangarRoot } = await home();
+    const r = rig(hangarRoot);
+    const p = await park(sessionsOf(r.harness));
+    const missing = await r.run(["defer", p.id, "--reason", "scheduled", "--dir", r.harness]);
+    expect(missing.code).toBe(1);
+    const badReason = await r.run([
+      "defer",
+      p.id,
+      "--until",
+      "2099-01-01T00:00:00Z",
+      "--reason",
+      "because",
+      "--dir",
+      r.harness,
+    ]);
+    expect(badReason.code).toBe(1);
+    expect(receipts(r.harness)).toEqual([]);
+  }, 30_000);
+});

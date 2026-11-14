@@ -4,6 +4,8 @@
  * and a sign-out. Every issuing answer is never cached and is unchanged by the masker.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
 import {
   acceptInvite,
@@ -237,6 +239,7 @@ describe("joining from an invite", () => {
       "expiresAt",
       "issued",
       "principal",
+      "receipt",
     ]);
     const list = await t.fetchRaw("/api/harnesses", { headers: bearer(member.session) });
     expect(list.status).toBe(200);
@@ -283,7 +286,13 @@ describe("joining from an invite", () => {
     expect(elsewhere.status).toBe(403);
     const tab = await acceptInviteTabOnly(t.fetchRaw, code, "Ana");
     expect(tab.status).toBe(200);
-    expect(Object.keys(tab.body).sort()).toEqual(["expiresAt", "ok", "principal", "tabOnly"]);
+    expect(Object.keys(tab.body).sort()).toEqual([
+      "expiresAt",
+      "ok",
+      "principal",
+      "receipt",
+      "tabOnly",
+    ]);
     expect(JSON.stringify(tab.body)).not.toContain(tab.session.slice(4));
     const read = await t.fetchRaw("/api/harnesses", { headers: bearer(tab.session) });
     expect(read.status).toBe(200);
@@ -300,5 +309,42 @@ describe("joining from an invite", () => {
     expect(
       ((await renewed.json()) as { error: { details: { reason: string } } }).error.details.reason,
     ).toBe("tab_only");
+  });
+});
+
+describe("joining is on record", () => {
+  const joins = (t: TestServer): Record<string, unknown>[] => {
+    const dir = join(t.hangarRoot, "control", "commands");
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir)
+      .filter((name) => name.endsWith(".jsonl"))
+      .flatMap((name) => readFileSync(join(dir, name), "utf8").split("\n"))
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((row) => row["kind"] === "auth.acceptInvite");
+  };
+
+  test("an accepted invite writes one workspace receipt, as the new member", async () => {
+    const t = boot();
+    const code = await inviteFrom(t, "viewer");
+    const member = await acceptInvite(t.fetchRaw, code, "Ana");
+    const rows = joins(t);
+    expect(rows.map((row) => row["state"])).toEqual(["accepted", "succeeded"]);
+    expect(rows[0]?.["actor"]).toBe(member.answer["principal"]);
+    expect(String(rows[0]?.["target"]).startsWith("home/cmd/")).toBe(true);
+    expect((member.answer["receipt"] as Record<string, unknown>)["id"]).toBe(rows[0]?.["id"]);
+    // A second acceptance of the same code is refused and writes none.
+    await acceptInvite(t.fetchRaw, code, "Bo").catch(() => undefined);
+    expect(joins(t)).toHaveLength(2);
+  });
+
+  test("a tab-only join is on record too", async () => {
+    const t = boot({ lanHost: "127.0.0.1" });
+    const code = await inviteFrom(t, "viewer");
+    const joined = await acceptInviteTabOnly(t.fetchRaw, code, "Tab");
+    expect(joined.status).toBe(200);
+    const rows = joins(t);
+    expect(rows.map((row) => row["state"])).toEqual(["accepted", "succeeded"]);
+    expect(rows[0]?.["actor"]).toBe(joined.body["principal"]);
   });
 });

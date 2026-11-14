@@ -212,8 +212,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(43);
-    expect(pins).toBe(58);
+    expect(Object.keys(REQUIRED).length).toBe(46);
+    expect(pins).toBe(62);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -341,6 +341,13 @@ describe("the server's twins, by import", () => {
       dataset: "support-cases",
       evalRun: "run_0123456789abcdef",
     };
+    const ACCESS = {
+      grt: mintId("grt"),
+      inv: mintId("inv"),
+      crd: mintId("crd"),
+      lnk: mintId("lnk"),
+      cmd: mintId("cmd"),
+    };
     const SAMPLES = [
       {
         hrn: "hrn_0123456789abcdef",
@@ -355,6 +362,9 @@ describe("the server's twins, by import", () => {
         ...QUALITY,
         changeReason: "not-worth-it",
         fraction: "0.2",
+        ...ACCESS,
+        until: "2026-12-01T09:00:00Z",
+        deferReason: "scheduled",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -369,6 +379,9 @@ describe("the server's twins, by import", () => {
         ...QUALITY,
         changeReason: "other",
         fraction: ".5",
+        ...ACCESS,
+        until: "2026-12-01T09:00:00+01:00",
+        deferReason: "other",
       },
     ];
     const twins = [
@@ -388,9 +401,9 @@ describe("the server's twins, by import", () => {
         checked++;
       }
     }
-    // Thirty operation twins, twenty-six command kinds and eight route rows, each rendered
-    // twice: pause, resume, disable and enable are `crewhaus daemon` verbs.
-    expect(checked).toBeGreaterThanOrEqual(128);
+    // Thirty-nine operation twins, thirty-one command kinds and eight route rows, each
+    // rendered twice: pause, resume, disable and enable are `crewhaus daemon` verbs.
+    expect(checked).toBeGreaterThanOrEqual(156);
   });
 });
 

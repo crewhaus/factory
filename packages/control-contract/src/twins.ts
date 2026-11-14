@@ -4,7 +4,7 @@
  * is a `--flag {param}` pair. `renderTwin` fills a template in and `parseTwin` maps
  * a command line back to its params, so one type serves both directions.
  */
-import { OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
+import { DEFER_REASONS, OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
 import { PERSON_CHANGE_REASONS } from "./areas/quality.js";
 import type { CliTwin } from "./areas/types.js";
 import { APPROVAL_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
@@ -16,8 +16,10 @@ export type { CliTwin } from "./areas/types.js";
 export const CLI_VERBS = deepFreeze({
   harness: ["list", "show"],
   daemon: ["start", "stop", "restart", "drain", "pause", "resume", "disable", "enable"],
-  approvals: ["show", "grant", "deny", "supersede", "rules", "revoke"],
+  approvals: ["show", "grant", "deny", "supersede", "defer", "rules", "revoke"],
   deploy: ["activate", "list"],
+  access: ["members", "tokens", "revoke", "unlink"],
+  commands: ["list", "show"],
   people: [
     "init",
     "keys",
@@ -50,6 +52,11 @@ export const CLI_VERBS = deepFreeze({
  * a reason a person may give to decline or withdraw a change, `{dataset}` a
  * dataset name, `{fraction}` a holdout share above 0 and at most 0.5, and
  * `{evalRun}` an eval run's id.
+ *
+ * `{grt}`, `{inv}`, `{crd}` and `{lnk}` are a grant's, an invite's, a token's and a
+ * link's ids, and `{cmd}` a command receipt's, each its own id grammar. `{until}` is an
+ * ISO date and time with `Z` or an offset, and `{deferReason}` one of the reasons a
+ * person may give to defer a decision.
  */
 export const TWIN_PLACEHOLDERS = deepFreeze({
   "{hrn}": HARNESS_ID_RE,
@@ -71,6 +78,13 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{dataset}": /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/,
   "{fraction}": /^0?\.(?!0+$)(?:[0-4][0-9]{0,3}|50{0,3})$/,
   "{evalRun}": /^run_[0-9a-f]{16}$/,
+  "{grt}": /^grt_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{inv}": /^inv_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{crd}": /^crd_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{lnk}": /^lnk_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{cmd}": /^cmd_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{until}": /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/,
+  "{deferReason}": new RegExp(`^(?:${DEFER_REASONS.join("|")})$`),
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

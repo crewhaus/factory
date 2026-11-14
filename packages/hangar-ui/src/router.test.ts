@@ -180,7 +180,8 @@ describe("ROUTE_TEMPLATES", () => {
   test("every fleet and harness template, derived from the tables", () => {
     const fleetTemplates = ROUTE_TEMPLATES.filter((t) => !t.startsWith("#/h/"));
     const harnessTemplates = ROUTE_TEMPLATES.filter((t) => t.startsWith("#/h/"));
-    expect(fleetTemplates.length).toBe(19);
+    // The device sign-in page is a fleet address of its own.
+    expect(fleetTemplates.length).toBe(20);
     expect(harnessTemplates.length).toBe(27);
     expect(new Set(ROUTE_TEMPLATES).size).toBe(ROUTE_TEMPLATES.length);
     expect(Object.isFrozen(ROUTE_TEMPLATES)).toBe(true);
@@ -189,6 +190,7 @@ describe("ROUTE_TEMPLATES", () => {
       "#/home/needs-you?type=advice",
       "#/connections/thredz",
       "#/settings/account",
+      "#/device",
       "#/h/:id",
       "#/h/:id/overview/needs-you",
       "#/h/:id/work/runs/:run",

@@ -554,3 +554,46 @@ describe("access proxy", () => {
     expect(existsSync(join(hangarRoot, "settings.json"))).toBe(false);
   });
 });
+
+describe("access approve", () => {
+  test("allows a waiting sign-in as the local member, and the other computer collects it", async () => {
+    const { ensureAccessSetUp, localActorOf, openDeviceRequests } = await import(
+      "@crewhaus/access-control"
+    );
+    // Access set up with this OS user as the owner, as Home's first sign-in does.
+    const setUp = await ensureAccessSetUp(hangarRoot, {
+      localActor: localActorOf(ME),
+      now: () => clock,
+    });
+    expect(setUp.ok).toBe(true);
+    const devices = openDeviceRequests(hangarRoot, { now: () => clock });
+    const start = await devices.start({ clientName: "laptop" });
+    if (!start.ok) throw new Error(start.reason);
+    const allowed = await run(["approve", start.userCode.toLowerCase()]);
+    expect(allowed.exitCode).toBe(0);
+    expect(allowed.lines.join("\n")).toContain("Allowed a sign-in from laptop");
+    clock += 6_000;
+    const polled = await devices.poll(start.pollRef);
+    expect(polled.ok && polled.state).toBe("allowed");
+  });
+
+  test("--deny denies it, and a wrong code is refused in words", async () => {
+    const { ensureAccessSetUp, localActorOf, openDeviceRequests } = await import(
+      "@crewhaus/access-control"
+    );
+    const setUp = await ensureAccessSetUp(hangarRoot, {
+      localActor: localActorOf(ME),
+      now: () => clock,
+    });
+    expect(setUp.ok).toBe(true);
+    const devices = openDeviceRequests(hangarRoot, { now: () => clock });
+    const start = await devices.start({});
+    if (!start.ok) throw new Error(start.reason);
+    const denied = await run(["approve", start.userCode, "--deny"]);
+    expect(denied.exitCode).toBe(0);
+    expect(denied.lines.join("\n")).toContain("Denied");
+    const wrong = await run(["approve", "BBBB-BBBB"]);
+    expect(wrong.exitCode).toBe(1);
+    expect(wrong.lines.join("\n")).toContain("does not match");
+  });
+});

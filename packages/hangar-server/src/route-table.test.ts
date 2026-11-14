@@ -70,6 +70,8 @@ describe("the route table", () => {
       "removeScanRoot",
       "fleetCosts",
       "runProof",
+      "authDeviceStart",
+      "authDevicePoll",
     ]);
     expect(OFF_MAP_OUTSIDE_API.map((route) => `${route.method} ${route.path}`)).toEqual([
       "GET /healthz",
@@ -104,7 +106,8 @@ describe("the route table", () => {
     expect(reads.map((row) => row.key).sort()).toEqual(
       [
         "auditVerify",
-        "authAcceptInvite",
+        "authDevicePoll",
+        "authDeviceStart",
         "authExchange",
         "authRefresh",
         "authSession",
@@ -143,6 +146,7 @@ describe("the route table", () => {
     );
     expect(core.map((row) => `${row.key}=${row.kind}`).sort()).toEqual(
       [
+        "authAcceptInvite=auth.acceptInvite",
         "controlDrain=controls.drain",
         "denyApproval=decisions.resolve",
         "deploymentActivate=deployments.activate",
@@ -172,7 +176,7 @@ describe("the route table", () => {
       row.kind?.startsWith("legacy.") === true ? [row.kind] : [],
     );
     expect(new Set(legacy).size).toBe(legacy.length);
-    expect(legacy.length).toBe(ROUTE_TABLE.filter((row) => row.receipt !== "none").length - 8);
+    expect(legacy.length).toBe(ROUTE_TABLE.filter((row) => row.receipt !== "none").length - 9);
     expect(legacy.length).toBeGreaterThanOrEqual(100);
   });
 
@@ -181,7 +185,8 @@ describe("the route table", () => {
     for (const row of ROUTE_TABLE) {
       if (row.kind !== undefined && !row.kind.startsWith("legacy.")) {
         expect(row.cliTwin).toEqual(kinds[row.kind]?.cliTwin as never);
-        expect(row.cliTwin).not.toBeNull();
+        // Joining from an invite has no command: only an API client calls it.
+        if (row.kind !== "auth.acceptInvite") expect(row.cliTwin).not.toBeNull();
       } else {
         expect(row.cliTwin).toBeNull();
       }
@@ -292,5 +297,25 @@ describe("the route table", () => {
     expect(matchRequest("HEAD", ["api", "harnesses"])).toBeUndefined();
     expect(matchRequest("OPTIONS", ["api", "harnesses"])).toBeUndefined();
     expect(matchRequest("PATCH", ["api", "harnesses"])).toBeUndefined();
+  });
+});
+
+describe("joining from an invite is on record", () => {
+  test("the row and the operation agree: a workspace receipt of kind auth.acceptInvite", async () => {
+    const { OPERATIONS } = await import("@crewhaus/control-contract");
+    const row = ROUTE_BY_KEY.get("authAcceptInvite");
+    const op = OPERATIONS.find((o) => o.id === "auth.acceptInvite");
+    expect(row?.receipt).toBe("workspace");
+    expect(row?.kind).toBe("auth.acceptInvite");
+    expect(op?.receipt).toBe("workspace");
+    expect(row?.note).toContain("writes this receipt itself");
+  });
+
+  test("the device sign-in rows are sign-in routes that write nothing", () => {
+    for (const key of ["authDeviceStart", "authDevicePoll"]) {
+      const row = ROUTE_BY_KEY.get(key);
+      expect(row?.receipt).toBe("none");
+      expect(row?.path.startsWith("/api/v1/auth/")).toBe(true);
+    }
   });
 });

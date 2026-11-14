@@ -8,6 +8,7 @@
  */
 import { M3_ROUTES, matchM3 } from "./m3-routes";
 import { ROUTE_BY_KEY, type RouteRow, matchRoute } from "./route-table";
+import { matchOperation } from "./v1/match";
 
 const M3_KEYS: ReadonlySet<string> = new Set(M3_ROUTES.map((route) => route.key));
 
@@ -25,6 +26,10 @@ export function matchRequest(
   method: string,
   segments: readonly string[],
 ): RequestMatch | undefined {
+  // The versioned API, sign-in aside: its operation table is its route table.
+  if (segments[0] === "api" && segments[1] === "v1" && segments[2] !== "auth") {
+    return matchOperation(method, segments);
+  }
   const m3 = matchM3(method, segments);
   if (m3 !== undefined) {
     const row = ROUTE_BY_KEY.get(m3.route.key);

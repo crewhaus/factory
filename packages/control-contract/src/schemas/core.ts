@@ -12,6 +12,7 @@ import {
   DECISION_CLASSES,
   DECISION_LOG_REASONS,
   type DecisionState,
+  type DeferReason,
   type DeploymentState,
   EMPTY_REASONS,
   ERROR_CODES,
@@ -26,6 +27,7 @@ import {
   PROTOCOL_ID,
   QUALIFIERS,
   RECEIPT_VIA,
+  REF_MAX_LENGTH,
   ROLES,
   RUN_CAUSE_KINDS,
   type RunState,
@@ -452,6 +454,14 @@ export const decisionSupersedeRequest = z
   .object({ reason: oneOf(OPERATOR_SUPERSEDE_REASONS) })
   .strict();
 
+/** Deferring a decision: until when, and why, from the closed `defer` list. No `expect`. */
+export const decisionDeferRequest = z
+  .object({
+    until: timestamp,
+    reason: oneOf(asTuple(DECISION_LOG_REASONS.defer as readonly DeferReason[])),
+  })
+  .strict();
+
 export const decisionResolved = z.object({ decision, receipt: commandReceipt }).passthrough();
 
 /** Local actors are not projected: a CLI decision is recorded under its linked `prn_`. */
@@ -585,8 +595,10 @@ export const deployment = z
     artifact: z
       .object({
         digest: z.string(),
-        specHash: z.string(),
-        compiledWith: z.string(),
+        // A build whose stamp does not match the saved spec has no spec hash to name, and a
+        // bundle with no `compiledWith` names none: a guessed value would be wrong.
+        specHash: z.string().optional(),
+        compiledWith: z.string().optional(),
         shape: z.string(),
         entry: z.string(),
       })
@@ -746,10 +758,14 @@ export const linkCreateRequest = z
 /** A scoped token lives at most 15 minutes. */
 const SCOPED_TOKEN_MAX_SECONDS = 900;
 
+/**
+ * The refs are checked by Home against its own records, each one: a ref that does not
+ * parse, or names a run Home does not have, is named back in `details.refs`.
+ */
 export const scopedTokenMintRequest = z
   .object({
     subject: z.string().min(1).optional(),
-    refs: z.array(refString).min(1),
+    refs: z.array(z.string().min(1).max(REF_MAX_LENGTH)).min(1),
     acts: z.array(oneOf(asTuple(SCOPED_ACTS))).min(1),
     ttlSeconds: z.number().int().min(1).max(SCOPED_TOKEN_MAX_SECONDS).optional(),
     seal,
@@ -816,6 +832,60 @@ export const authAcceptInviteRequest = z.union([
 ]);
 
 export const authRefreshRequest = z.object({ seal }).strict();
+
+// ---------------------------------------------------------------------------
+// Signing in a device with a short code
+// ---------------------------------------------------------------------------
+
+/** What a device names itself on the page that allows it: a short label, never authority. */
+const clientName = z
+  .string()
+  .min(1)
+  .max(64)
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
+  .regex(/^[^\u0000-\u001f\u007f]+$/);
+
+export const deviceStartRequest = z
+  .object({ seal, clientName: clientName.optional(), readOnly: z.boolean().optional() })
+  .strict();
+
+/** The start's answer: the poll reference travels sealed to the start's own seal. */
+export const deviceStarted = z
+  .object({
+    issued,
+    userCode: z.string().regex(/^[A-Z]{4}-[A-Z]{4}$/),
+    verificationUrl: z.string(),
+    intervalMs: count,
+    expiresAt: timestamp,
+  })
+  .passthrough();
+
+export const devicePollRequest = z
+  .object({ pollRef: z.string().regex(/^[0-9a-f]{64}$/), seal })
+  .strict();
+
+/** Still waiting, refused, ended or already collected; or, once, the sealed token. */
+export const devicePolled = z.union([
+  z.object({ state: z.enum(["pending", "denied", "expired", "consumed"]) }).passthrough(),
+  tokenIssued,
+]);
+
+export const deviceLookupRequest = z.object({ code: z.string().min(1).max(32) }).strict();
+
+/** A pending sign-in request, as the person allowing it sees it. */
+export const deviceRequestView = z
+  .object({
+    state: z.enum(["pending", "allowed", "denied", "consumed", "expired"]),
+    readOnly: z.boolean(),
+    expiresAt: timestamp,
+    clientName: z.string().optional(),
+    tokenDays: count,
+  })
+  .passthrough();
+
+export const deviceDecideRequest = z
+  .object({ code: z.string().min(1).max(32), choice: z.enum(["allow", "deny"]) })
+  .strict();
 
 // ---------------------------------------------------------------------------
 // Events
@@ -896,6 +966,7 @@ export const discovery = z
       .object({ pageLimitDefault: count, pageLimitMax: count, cursorMaxLength: count })
       .passthrough()
       .optional(),
+    links: z.object({ baseUrl: z.string().optional() }).passthrough().optional(),
   })
   .passthrough();
 
@@ -907,8 +978,27 @@ export const me = z
   })
   .passthrough();
 
+const refCandidate = z.object({ kind: z.string(), ref: refString, href: z.string() }).passthrough();
+
 export const refResolved = z
-  .object({ kind: z.string(), href: z.string(), summary: z.string() })
+  .object({
+    kind: z.string(),
+    href: z.string(),
+    /** What changes when the object does: a row count, a state, an id. */
+    rev: z.string(),
+    url: z.string().optional(),
+    revisions: z
+      .object({
+        spec: z.string().optional(),
+        deployedSpec: z.string().optional(),
+        deployment: z.string().optional(),
+        policy: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
+    candidates: z.array(refCandidate).optional(),
+    summary: z.string(),
+  })
   .passthrough();
 
 /** Every core schema, by the id an operation row names it with. */
@@ -945,6 +1035,7 @@ export const CORE_SCHEMAS = {
   commandReceipt,
   decision,
   decisionBinding,
+  decisionDeferRequest,
   decisionList,
   decisionOverlays,
   decisionResolveRequest,
@@ -954,8 +1045,15 @@ export const CORE_SCHEMAS = {
   deploymentActivateRequest,
   deploymentList,
   device,
+  deviceDecideRequest,
   deviceJwk,
   deviceList,
+  deviceLookupRequest,
+  devicePollRequest,
+  devicePolled,
+  deviceRequestView,
+  deviceStartRequest,
+  deviceStarted,
   discovery,
   discoveryOperation,
   emptyRequest,

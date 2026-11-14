@@ -43,19 +43,20 @@ import {
   authenticate,
   authorize,
   domainOf,
-  effectiveRole,
   loadAccessSnapshot,
+  recordUsage,
   registerDomainIn,
 } from "@crewhaus/access-control";
 import {
   PERMISSION_DECLS,
-  ROLE_PERMISSIONS,
   type Role,
   isPermission,
   parseRef,
+  scopedRunRef,
 } from "@crewhaus/control-contract";
 import { json } from "./http";
 import type { RouteRow } from "./route-table";
+import { v1Error } from "./v1/errors";
 
 export type AccessCheck = {
   readonly answer: Authenticated;
@@ -74,6 +75,8 @@ export type HomeAccess = {
    * name, with the route's object ref. Fill it through {@link registerHomeDomain}.
    */
   readonly domains: Map<string, DomainChecker>;
+  /** Where a failed usage note is reported, once. */
+  readonly onWarn?: (message: string) => void;
 };
 
 /**
@@ -109,9 +112,30 @@ export async function checkAccess(
     bootToken: home.bootToken,
     now: home.now,
   });
+  noteUse(home, answer);
   if (answer.ignoredProxyHeaders !== true) return { answer, request: req };
   await home.signIn.noteIgnoredIdentity(peer.listener, peer.address).catch(() => {});
   return { answer, request: stripProxyHeaders(req, home.config.trustedProxy?.header) };
+}
+
+/**
+ * Note when a personal or service token, or a session's device, was last used: a separate,
+ * throttled record, written off the request's path. Never awaited, never a refusal.
+ */
+function noteUse(home: HomeAccess, answer: Authenticated): void {
+  if (answer.kind !== "principal") return;
+  const credential =
+    answer.via === "personal" || answer.via === "service" ? answer.credential : undefined;
+  if (credential === undefined && answer.device === undefined) return;
+  void recordUsage(
+    home.signIn.root,
+    {
+      ...(credential !== undefined ? { credential } : {}),
+      ...(answer.device !== undefined ? { device: answer.device } : {}),
+    },
+    home.now(),
+    home.onWarn ?? ((message) => console.warn(message)),
+  );
 }
 
 /** Whether a path is under the v1 API, which answers in the v1 envelope. */
@@ -142,16 +166,15 @@ export function refusalResponse(pathname: string, refusal: RefusalBody): Respons
     ...(refusal.role !== undefined ? { role: refusal.role } : {}),
   };
   if (isV1Path(pathname)) {
-    return json(
+    return v1Error(
       {
-        error: {
-          code: refusal.code,
-          message: refusal.message,
-          retryable: refusal.status === 503,
-          details: { reason: refusal.reason, ...needs },
-        },
+        status: refusal.status,
+        code: refusal.code,
+        message: refusal.message,
+        reason: refusal.reason,
+        ...(refusal.needs !== undefined ? { needs: refusal.needs } : {}),
+        ...(refusal.role !== undefined ? { role: refusal.role } : {}),
       },
-      refusal.status,
       headers,
     );
   }
@@ -331,6 +354,9 @@ export function authorizeCaller(
   });
 }
 
+/** A harness target only a grant over the whole Home covers. */
+const ANY_HARNESS: AccessTarget = Object.freeze({ scope: "harness", harness: "", groups: [] });
+
 /**
  * Whether the caller holds a harness permission on at least one registered harness, or
  * through its grant over the whole Home: the rule for a route about several harnesses,
@@ -338,12 +364,9 @@ export function authorizeCaller(
  */
 function holdsOnSomeHarness(caller: Caller, view: AccessView, permission: string): boolean {
   if (caller.actor === null) return true;
-  if (view.read.state === "present") {
-    const role = effectiveRole(view.read.snapshot, caller.principal, { scope: "home" }, view.now);
-    if (role !== null && (ROLE_PERMISSIONS[role] as readonly string[]).includes(permission)) {
-      return true;
-    }
-  }
+  // A grant over the whole Home covers every harness, registered or not: asked on a harness
+  // no grant names, so only a home grant answers, through `authorize()` and its caps.
+  if (authorizeCaller(caller, view, permission, ANY_HARNESS).allow) return true;
   return view
     .harnessIds()
     .some((id) => authorizeCaller(caller, view, permission, harnessTarget(view, id)).allow);
@@ -390,12 +413,49 @@ const SCOPED_REFUSAL: RefusalBody = Object.freeze({
   message: "This link can read only the run it was made for.",
 });
 
+/** The rows that allow a device sign-in, which mints a token as the member who allows it. */
+const DEVICE_APPROVAL: ReadonlySet<string> = new Set(["auth.device.lookup", "auth.device.decide"]);
+
+const SESSION_REQUIRED: RefusalBody = Object.freeze({
+  status: 403,
+  code: "forbidden",
+  reason: "session_required",
+  message:
+    "Only a member signed in to Home in a browser can allow a sign-in, or the owner with `crewhaus access approve <code>` on Home's computer.",
+});
+
 const TAB_ONLY_REFUSAL: RefusalBody = Object.freeze({
   status: 403,
   code: "forbidden",
   reason: "tab_only",
   message: TAB_ONLY_MESSAGE,
 });
+
+/** What a personal token hears when it asks to revoke anything but itself. */
+export const PERSONAL_SELF_MESSAGE =
+  "A personal token can revoke only itself. Sign in to Home in a browser to manage your devices and links.";
+
+const PERSONAL_SELF_REFUSAL: RefusalBody = Object.freeze({
+  status: 403,
+  code: "forbidden",
+  reason: "permission",
+  message: PERSONAL_SELF_MESSAGE,
+});
+
+/**
+ * What a personal token may do about its own member: read the member's own tokens, links
+ * and devices, and revoke the one token it is.
+ */
+function personalSelfAllows(
+  row: RouteRow,
+  params: Readonly<Record<string, string>>,
+  caller: Caller,
+): boolean {
+  if (row.method === "GET") return true;
+  const own =
+    caller.actor !== null && "credential" in caller.actor ? caller.actor.credential : undefined;
+  return row.key === "access.tokens.revoke" && own !== undefined && params["crd"] === own;
+}
 
 export type RequestAuthorization =
   | { readonly allow: true }
@@ -408,6 +468,17 @@ export type AuthorizeRequestInput = {
   readonly view: AccessView;
   /** For the proof route: the harness that owns the run, resolved first; `null` when none does. */
   readonly runProofHarness?: string | null;
+  /**
+   * For a versioned-API row with a harness permission: the harness its `{h}`, `{ref}` or
+   * `{cmd}` names, resolved first; `null` when it names none this Home has. Absent: the
+   * row is decided as one about several harnesses.
+   */
+  readonly targetHarness?: string | null;
+  /**
+   * For a versioned-API row qualified `self`: the request is about the caller's own token,
+   * device or link (or its own part of a list), which `self.preferences` covers.
+   */
+  readonly selfScope?: true;
   /** The request's `Origin` header. */
   readonly origin?: string | null;
   /** Whether an origin is Home's own. */
@@ -434,6 +505,14 @@ export function authorizeRequest(input: AuthorizeRequestInput): RequestAuthoriza
   const { row, params, caller, view } = input;
   if (row.permission === "public") return { allow: true };
   if (caller.scoped !== undefined) return authorizeScoped(input);
+  // A sign-in is allowed by a person in a browser: never by a token, nor a tab-only page.
+  if (
+    row.v1 === true &&
+    DEVICE_APPROVAL.has(row.key) &&
+    (caller.tabOnly === true || caller.via === "service" || caller.via === "personal")
+  ) {
+    return { allow: false, refusal: SESSION_REQUIRED };
+  }
   if (row.permission === "authenticated") return { allow: true };
   // Before the target is chosen: the refusal is about the connection, not the harness.
   if (caller.tabOnly === true && NOT_FROM_A_TAB.has(row.permission)) {
@@ -444,8 +523,31 @@ export function authorizeRequest(input: AuthorizeRequestInput): RequestAuthoriza
       ? { kind: row.ref.kind, id: params[row.ref.param] as string }
       : undefined;
   const owner = isOwnerCaller(caller, view.read);
+  // One's own token, device or link: `self.preferences` covers it, whatever else is held.
+  // A personal token reads its member's own lists and revokes itself, and nothing more.
+  if (
+    input.selfScope === true &&
+    !authorizeCaller(caller, view, row.permission, { scope: "home" }).allow &&
+    authorizeCaller(caller, view, "self.preferences", { scope: "home" }).allow
+  ) {
+    if (caller.via !== "personal" || personalSelfAllows(row, params, caller)) {
+      return { allow: true };
+    }
+    return { allow: false, refusal: PERSONAL_SELF_REFUSAL };
+  }
+  const harnessScoped =
+    isPermission(row.permission) && PERMISSION_DECLS[row.permission].scope === "harness";
   let target: AccessTarget;
-  if (row.key === "runProof") {
+  if (row.v1 === true && harnessScoped && input.targetHarness !== undefined) {
+    const harness = input.targetHarness;
+    if (harness === null || view.groupsOf(harness) === undefined) {
+      // Nothing this Home has: the owner hears the handler's 404, others the same 403.
+      return owner
+        ? { allow: true }
+        : { allow: false, refusal: permissionRefusal(caller, row.permission, null, "harness") };
+    }
+    target = harnessTarget(view, harness);
+  } else if (row.key === "runProof") {
     const harness = input.runProofHarness;
     if (harness === undefined || harness === null) {
       // Nothing to authorize against: the owner hears the handler's 404, others the same 403.
@@ -499,9 +601,10 @@ function authorizeScoped(input: AuthorizeRequestInput): RequestAuthorization {
   const harness = params["id"];
   const id = params[row.ref.param];
   if (harness === undefined || id === undefined) return refused;
-  const ref = `${harness}/${row.ref.kind}/${id}`;
-  const parsed = parseRef(ref);
-  if ("error" in parsed || parsed.kind !== "run" || !scoped.refs.includes(ref)) return refused;
+  // The ref names a run as its grammar does: `run` for a run row's id, `exec` for a
+  // supervisor's execution, so a token reads the one it was minted for and nothing else.
+  const ref = scopedRunRef(harness, id);
+  if (ref === undefined || "error" in parseRef(ref) || !scoped.refs.includes(ref)) return refused;
   // The minter's authority, now: the act's permission and the row's own, on this harness.
   const target = harnessTarget(view, harness);
   const act = row.scopedAct as keyof typeof SCOPED_ACT_PERMISSIONS;

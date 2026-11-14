@@ -45,6 +45,15 @@ async function signedInAgain(info) {
   }
 }
 
+/**
+ * Ask the registered handler to sign the tab in again (the sign-in dialog over the view,
+ * so drafts survive); whether it did. For a client that sends its own requests, such as
+ * the versioned API's.
+ */
+export function recoverSession(info) {
+  return signedInAgain(info);
+}
+
 /** This tab's session secret, or null. */
 export function getSession() {
   try {

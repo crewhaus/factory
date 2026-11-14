@@ -115,6 +115,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
   version: [
     ["hangar", "string"],
     ["protocolV", "number"],
+    ["api", "array"],
   ],
   // util.js normalizeRows ← library.js fleet table (cold: cache may be empty)
   "harnesses:cold": [

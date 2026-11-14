@@ -1057,6 +1057,7 @@ describe("hangar serve --smoke", () => {
     expect(stdout).toContain("✓ GET / serves the embedded UI shell");
     expect(stdout).toContain("✓ every embedded console file serves with its content type");
     expect(stdout).toContain("✓ GET /api/harnesses with Home's own key answers 200 JSON");
+    expect(stdout).toContain("✓ the versioned API answers and /api/version lists it");
     expect(stdout).toContain("✓ GET /api/harnesses without a credential is refused (401)");
     expect(stdout).toContain("✓ a request with a foreign Host is refused (421)");
     expect(stdout).toContain("✓ an undeclared /api path is refused (404)");

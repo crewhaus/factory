@@ -21,7 +21,12 @@ import type {
 } from "./areas/types.js";
 import type { CapabilityDescriptor } from "./capabilities.js";
 import type { CommandReceipt } from "./commands.js";
-import type { DecisionRecordView, IfUnanswered, OperatorSupersedeReason } from "./decisions.js";
+import type {
+  DecisionRecordView,
+  DeferReason,
+  IfUnanswered,
+  OperatorSupersedeReason,
+} from "./decisions.js";
 import type { ListEnvelope } from "./lists.js";
 import type {
   DecisionState,
@@ -104,6 +109,12 @@ export type DecisionResolveRequest = {
 /** A code an operator may give, from a closed list. The system's own reasons are not among them. */
 export type DecisionSupersedeRequest = {
   readonly reason: OperatorSupersedeReason;
+};
+
+/** Until when a decision waits, and why: a code from the closed `defer` list. */
+export type DecisionDeferRequest = {
+  readonly until: string;
+  readonly reason: DeferReason;
 };
 
 export type RuleCreateRequest = {
@@ -317,8 +328,10 @@ export type HarnessHealth = {
 
 export type DeploymentArtifact = {
   readonly digest: string;
-  readonly specHash: string;
-  readonly compiledWith: string;
+  /** Absent when no spec hash can be named for the build, never guessed. */
+  readonly specHash?: string;
+  /** Absent for a bundle that does not say which compiler built it. */
+  readonly compiledWith?: string;
   readonly shape: string;
   readonly entry: string;
 };
@@ -449,6 +462,55 @@ export type InviteAccepted =
       readonly principal?: string;
     };
 
+// ---------------------------------------------------------------------------
+// Signing in a device with a short code
+// ---------------------------------------------------------------------------
+
+export type DeviceStartRequest = {
+  readonly seal: Seal;
+  /** What the device calls itself on the page that allows it. A label, never authority. */
+  readonly clientName?: string;
+  /** Ask for a token that can only read. */
+  readonly readOnly?: boolean;
+};
+
+/** `issued` is the poll reference, sealed to the start's own `seal`. */
+export type DeviceStarted = {
+  readonly issued: Issued;
+  readonly userCode: string;
+  readonly verificationUrl: string;
+  readonly intervalMs: number;
+  readonly expiresAt: string;
+};
+
+export type DevicePollRequest = {
+  readonly pollRef: string;
+  /** The token, once allowed, is sealed to this poll's key. */
+  readonly seal: Seal;
+};
+
+export type DevicePolled =
+  | { readonly state: "pending" | "denied" | "expired" | "consumed" }
+  | TokenIssued;
+
+export type DeviceLookupRequest = {
+  readonly code: string;
+};
+
+export type DeviceRequestView = {
+  readonly state: "pending" | "allowed" | "denied" | "consumed" | "expired";
+  readonly readOnly: boolean;
+  readonly expiresAt: string;
+  readonly clientName?: string;
+  /** How many days the token lasts once collected. */
+  readonly tokenDays: number;
+};
+
+export type DeviceDecideRequest = {
+  readonly code: string;
+  readonly choice: "allow" | "deny";
+};
+
 export type SignedOut = {
   readonly signedOut: true;
 };
@@ -495,6 +557,8 @@ export type Discovery = {
   readonly operations?: readonly DiscoveryOperation[];
   readonly capabilities?: readonly string[];
   readonly limits?: DiscoveryLimits;
+  /** Where Home is reached from outside, when its owner set it. */
+  readonly links?: { readonly baseUrl?: string };
 };
 
 export type Me = {
@@ -504,9 +568,27 @@ export type Me = {
   readonly can: Readonly<Record<string, boolean>>;
 };
 
+/** One object a bare id may name, when it names more than one. */
+export type RefCandidate = {
+  readonly kind: string;
+  readonly ref: string;
+  readonly href: string;
+};
+
 export type RefResolved = {
   readonly kind: string;
   readonly href: string;
+  /** What moves when the object changes: a row count, a state, an id. */
+  readonly rev: string;
+  /** The absolute address, when Home's base URL is set. */
+  readonly url?: string;
+  readonly revisions?: {
+    readonly spec?: string;
+    readonly deployedSpec?: string;
+    readonly deployment?: string;
+    readonly policy?: string;
+  };
+  readonly candidates?: readonly RefCandidate[];
   readonly summary: string;
 };
 
