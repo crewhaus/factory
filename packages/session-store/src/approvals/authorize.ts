@@ -4,7 +4,8 @@
  * signed the person in as.
  *
  *  - No projection: single-owner mode. Anyone who can reach the store decides, and the
- *    principal, when the surface has one, is recorded.
+ *    principal, when the surface has one, is recorded; a service principal decides only
+ *    `operator` requests.
  *  - A projection: a decision counts only from a member whose class reaches the class
  *    the request needs (`memberMayDecide`), or from the owner. It is recorded as that
  *    member (`decidedByPrincipal`). A request with no principal is refused, and so is a
@@ -12,6 +13,9 @@
  *    never who has it.
  *  - A projection that cannot be read: nothing is decided until it is rewritten with
  *    `crewhaus access sync`.
+ *
+ * A service principal decides `operator` requests only, with a projection, without one,
+ * and while one cannot be read.
  *
  * It imports nothing from access-control, so a compiled channel daemon can call it.
  */
@@ -48,6 +52,9 @@ export function principalAuthorizer(
   const reader = opts.reader ?? readApproverProjection;
   const now = opts.now ?? (() => Date.now());
   return ({ requiredClass }) => {
+    if (who.service === true && requiredClass !== "operator") {
+      return { ok: false, reason: needsClassReason(requiredClass) };
+    }
     const read = reader(harnessDir);
     if (read.state === "absent") {
       return who.principal !== undefined ? { ok: true, principal: who.principal } : { ok: true };
@@ -59,9 +66,6 @@ export function principalAuthorizer(
       };
     }
     if (who.principal === undefined) return { ok: false, reason: NO_PRINCIPAL_REASON };
-    if (who.service === true && requiredClass !== "operator") {
-      return { ok: false, reason: needsClassReason(requiredClass) };
-    }
     return memberMayDecide(read.projection, who.principal, requiredClass, now())
       ? { ok: true, principal: who.principal }
       : { ok: false, reason: needsClassReason(requiredClass) };

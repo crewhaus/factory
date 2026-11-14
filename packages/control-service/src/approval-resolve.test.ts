@@ -3,7 +3,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { mintId } from "@crewhaus/control-contract";
 import { readProposals, readStandingRules } from "@crewhaus/control-records";
-import { resolveToolApproval } from "./approval-resolve";
+import { authorizerFor, resolveToolApproval } from "./approval-resolve";
 import { NOW, park, plantProjection, removeTempDirs, rig, settingsOf } from "./test-helpers";
 
 afterAll(removeTempDirs);
@@ -121,6 +121,33 @@ describe("resolveToolApproval, called directly", () => {
       { now: () => NOW },
     );
     expect(answer.outcome).toBe("invalid");
+  });
+});
+
+describe("authorizerFor", () => {
+  const judged = { approvers: () => ({ state: "absent" as const }), now: () => NOW };
+  const ask = (requiredClass: "operator" | "maintainer" | "owner", who: object) =>
+    authorizerFor(
+      undefined,
+      who,
+      judged,
+    )({
+      op: "decide",
+      record: {} as never,
+      requiredClass,
+    });
+
+  test("with no harness, a service decides operator requests only", async () => {
+    const service = { principal: mintId("prn"), service: true as const };
+    expect(await ask("maintainer", service)).toEqual({ ok: false, reason: "Needs a maintainer." });
+    expect(await ask("owner", service)).toEqual({ ok: false, reason: "Needs the owner." });
+    expect(await ask("operator", service)).toEqual({ ok: true, principal: service.principal });
+  });
+
+  test("with no harness, a person decides at every class, recorded when named", async () => {
+    const principal = mintId("prn");
+    expect(await ask("owner", { principal })).toEqual({ ok: true, principal });
+    expect(await ask("maintainer", {})).toEqual({ ok: true });
   });
 });
 

@@ -224,10 +224,10 @@ function localMayDecide(session: Session, requiredClass: "maintainer" | "owner")
   const read = readApproverProjection(session.harnessDir);
   if (read.state === "absent") return true;
   if (read.state !== "present") return false;
-  const who = session.control.decisions.principalOf({
-    kind: "local",
-    identity: currentLocalIdentity(),
-  });
+  const who = session.control.decisions.principalOf(
+    { kind: "local", identity: currentLocalIdentity() },
+    session.harnessDir,
+  );
   if (who.service === true || who.principal === undefined) return false;
   return memberMayDecide(read.projection, who.principal, requiredClass, session.now());
 }
@@ -778,10 +778,10 @@ async function adoptVerb(session: Session, argv: readonly string[]): Promise<Cha
   await holdCliMutatingLease(session.harnessDir, "changes adopt", { env: session.env });
   await observe(session);
   const actor = await localStoredActor(session.harnessDir, session.control);
-  const principal = session.control.decisions.principalOf({
-    kind: "local",
-    identity: currentLocalIdentity(),
-  }).principal;
+  const principal = session.control.decisions.principalOf(
+    { kind: "local", identity: currentLocalIdentity() },
+    session.harnessDir,
+  ).principal;
   const answer = await withQualityReceipt<{ ok: boolean; lines: string[] }>(
     {
       harnessDir: session.harnessDir,
@@ -881,10 +881,10 @@ async function rollbackVerb(
   await holdCliMutatingLease(session.harnessDir, "changes rollback", { env: session.env });
   await observe(session);
   const actor = await localStoredActor(session.harnessDir, session.control);
-  const principal = session.control.decisions.principalOf({
-    kind: "local",
-    identity: currentLocalIdentity(),
-  }).principal;
+  const principal = session.control.decisions.principalOf(
+    { kind: "local", identity: currentLocalIdentity() },
+    session.harnessDir,
+  ).principal;
   const answer = await withQualityReceipt<{ ok: boolean; lines: string[] }>(
     {
       harnessDir: session.harnessDir,

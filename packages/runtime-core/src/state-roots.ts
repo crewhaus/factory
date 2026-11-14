@@ -58,6 +58,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DEFAULT_ROOT_DIR } from "@crewhaus/event-log";
 import { hangarStateRoots, registryStateFiles } from "@crewhaus/harness-registry";
+import { userSettingsFile } from "@crewhaus/hooks-engine";
 import { APPROVALS_DIRNAME, DEFAULT_APPROVALS_FILENAME } from "@crewhaus/session-store";
 import { SKILLS_RELATIVE } from "@crewhaus/skills-registry";
 import type { Tenant } from "@crewhaus/tenancy";
@@ -514,6 +515,10 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   (`registryStateFiles`), so a variable can add a protected root and never
  *   move one. The default follows the home directory (`homedir()`), as the
  *   Hangar server's own fallback does.
+ * - The user-level hooks file, `~/.crewhaus/settings.json`
+ *   (`userSettingsFile` in `@crewhaus/hooks-engine`, the file its `loadHooks`
+ *   reads first), exactly that file: a neighbour such as
+ *   `~/.crewhaus/settings.json.bak` is not one.
  * - The idempotency store's records: `.crewhaus/idempotency`, and the
  *   directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>` names. One that holds
  *   the working directory (`file:.`) is left to the rules. `env` is read for
@@ -602,6 +607,8 @@ export function runtimeStateRoots(
     // its registry file. One that holds the working directory stays protected:
     // the floor refuses a run inside Hangar's directory that writes there.
     { roots: [...hangarStateRoots(env), ...registryStateFiles(env)], holdingCwd: "protect" },
+    // The user-level hooks file: what runs around every run of this user's.
+    { roots: [userSettingsFile()], holdingCwd: "protect" },
     // The idempotency store's records. A `file:<dir>` that holds the working
     // directory is left to the rules rather than walling it off.
     { roots: idempotencyRoots(cwd, env), holdingCwd: "skip" },

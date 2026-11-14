@@ -7,6 +7,7 @@
  * only before then, so a member whose credential has ended stops counting at that
  * instant, however long ago the file was written.
  */
+import { isAbsolute } from "node:path";
 import {
   type ApproverProjection,
   DECISION_CLASSES,
@@ -97,10 +98,16 @@ function readApproversNow(harnessDir: string): ApproverRead {
   const fault = projectionFault(read.body);
   if (fault !== undefined) return { state: "unreadable", reason: `${rel}: ${fault}` };
   // A Home address that is not one is left out, never a fault: a card falls back to the
-  // host and the verb.
-  const { homeUrl: given, ...rest } = read.body;
+  // host and the verb. So is a Home root that is not an absolute path: a local user's
+  // principal then counts on no Home's records here.
+  const { homeUrl: given, accessRoot: root, ...rest } = read.body;
   const homeUrl = homeUrlOf(given);
-  const projection = { ...rest, ...(homeUrl !== undefined ? { homeUrl } : {}) };
+  const accessRoot = typeof root === "string" && isAbsolute(root) ? root : undefined;
+  const projection = {
+    ...rest,
+    ...(homeUrl !== undefined ? { homeUrl } : {}),
+    ...(accessRoot !== undefined ? { accessRoot } : {}),
+  };
   return { state: "present", projection: projection as unknown as ApproverProjection };
 }
 

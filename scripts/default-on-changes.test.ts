@@ -163,6 +163,7 @@ import {
   evaluate,
   evaluateWithReason,
   loadSettingsRules,
+  narrowPatternFor,
 } from "../packages/permission-engine/src/index";
 import { buildReport, runPreflight, workspaceItems } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
@@ -882,7 +883,8 @@ describe("the release notes name every change a harness without provability: see
 
   test("the runtime-state floor: Hangar's directory is every root the environment names, and the default", () => {
     // Each variable names a root of its own, outside the workspace, so the
-    // roots the run protects there are exactly Hangar's. The expected set is
+    // roots the run protects there are exactly Hangar's and the user-level
+    // hooks file, `~/.crewhaus/settings.json`. The expected set is
     // written out here, not read from the code that makes it: a root added
     // there fails this until the notes and this list name it.
     const base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-home-")));
@@ -903,6 +905,7 @@ describe("the release notes name every change a harness without provability: see
         join(base, "registry", "harnesses.json"),
         join(homedir(), ".crewhaus", "hangar"),
         join(homedir(), ".crewhaus", "harnesses.json"),
+        join(homedir(), ".crewhaus", "settings.json"),
       ];
       expect(rootsDiffer(outside, expected)).toEqual({ unexpected: [], missing: [] });
       // The comparison reports a root nobody listed, and one that went missing.
@@ -928,11 +931,17 @@ describe("the release notes name every change a harness without provability: see
     for (const name of [
       "~/.crewhaus/hangar",
       "~/.crewhaus/harnesses.json",
+      "~/.crewhaus/settings.json",
       "CREWHAUS_HANGAR_ROOT",
       "CREWHAUS_REGISTRY_ROOT",
     ]) {
       expect({ name, named: floor.includes(`\`${name}\``) }).toEqual({ name, named: true });
     }
+    // The user-level hooks file is named once, as exactly that file.
+    expect(floor.split("`~/.crewhaus/settings.json`").length - 1).toBe(1);
+    expect(floor.replace(/\s+/g, " ")).toContain(
+      "the user-level hooks file `~/.crewhaus/settings.json`, exactly that file",
+    );
   });
 
   test("the runtime-state floor: a managed run's tenants root is named with the rest", () => {
@@ -3717,6 +3726,64 @@ describe("the release notes name what the decision service changes for every har
     expect(bullet).toContain("`crewhaus approvals grant <id> --always`");
     expect(bullet).toContain("`--days`");
     expect(bullet).toContain("`crewhaus approvals rules`");
+  });
+
+  test("a rule's pattern is printable, and a damaged rule record loads only the allows it names", async () => {
+    // A value with a control character is no rule, wherever a rule is proposed from.
+    expect(narrowPatternFor("Write", { path: "a\u001b[2Jb" }, undefined)).toEqual({
+      refused: "not-representable",
+    });
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-damaged-")));
+    try {
+      mkdirSync(join(dir, ".crewhaus", "run", "control"), { recursive: true });
+      writeFileSync(
+        join(dir, ".crewhaus", "settings.json"),
+        JSON.stringify({
+          permissions: {
+            rules: [
+              { type: "alwaysAllow", pattern: "Write(a.txt)" },
+              { type: "alwaysDeny", pattern: "Bash" },
+            ],
+          },
+        }),
+      );
+      // The whole record is one sealed line that does not parse.
+      writeFileSync(join(dir, ".crewhaus", "run", "control", "standing-rules.jsonl"), "{ torn\n");
+      expect(loadSettingsRules(dir)).toEqual([
+        { type: "alwaysDeny", pattern: "Bash", source: "settings" },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    // A tool whose approved calls hold such a value gets no allow proposal at
+    // all: none for the value, and none for the whole tool.
+    const { aggregateAsks, rankSuggestions, skippedSuggestions } = await import(
+      "../packages/harness-advice/src/permissions-suggest"
+    );
+    const { parseJsonlObjects } = await import("../packages/harness-advice/src/advise-rules");
+    const line = (kind: string, payload: unknown) =>
+      JSON.stringify({ ts: 1, version: 1, kind, payload });
+    const ask = line("permission", { toolName: "Bash", decision: "ask", askOutcome: "approved" });
+    const text = [
+      line("tool_use", { id: "toolu_1", name: "Bash", input: { command: "cat <<EOF\nx\nEOF" } }),
+      ask,
+      ask,
+      ask,
+    ].join("\n");
+    const aggregates = aggregateAsks([
+      { sessionId: "sess_00000000000000fb", objects: parseJsonlObjects(`${text}\n`) },
+    ]);
+    expect(
+      rankSuggestions(aggregates, new Map()).filter((g) => g.rule.type === "alwaysAllow"),
+    ).toEqual([]);
+    expect(skippedSuggestions(aggregates).map((k) => [k.toolName, k.reason])).toEqual([
+      ["Bash", "holds-control"],
+    ]);
+    const bullet = bulletFor("A standing rule's pattern is printable").replace(/\s+/g, " ");
+    expect(bullet).toContain("`crewhaus permissions suggest`");
+    expect(bullet).toContain("`standing-rules.jsonl`");
+    expect(bullet).toContain("denies and asks always load");
+    expect(bullet).toContain("gets no allow proposal");
   });
 
   test("crewhaus approvals leaves a receipt, refuses with 55, and an --always no rule can name decides nothing", async () => {

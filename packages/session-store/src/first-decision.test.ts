@@ -655,6 +655,45 @@ describe("principalAuthorizer", () => {
     expect(asPerson.outcome).toBe("decided");
   });
 
+  test("a service never decides above operator, with or without an approver list", async () => {
+    const service = { principal: SERVICE, service: true as const };
+    // No projection: single-owner mode, where a service decides only operator requests.
+    const { root, store, p } = await parked("maintainer");
+    const refused = await store.decide(
+      p.id,
+      { choice: "grant", actor: {} },
+      { authorize: principalAuthorizer(harness(), service, { reader: reader() }) },
+    );
+    expect(refused.outcome).toBe("forbidden");
+    expect(refused.reason).toBe("Needs a maintainer.");
+    expect(claimsOf(root)).toEqual([]);
+    const operatorClass = await parked();
+    const decided = await operatorClass.store.decide(
+      operatorClass.p.id,
+      { choice: "grant", actor: {} },
+      { authorize: principalAuthorizer(harness(), service, { reader: reader() }) },
+    );
+    expect(decided.outcome).toBe("decided");
+    expect(decided.record?.decidedByPrincipal).toBe(SERVICE);
+    // A projection that cannot be read: the class is the reason.
+    const unreadable = await parked("maintainer");
+    const answer = await unreadable.store.decide(
+      unreadable.p.id,
+      { choice: "grant", actor: {} },
+      { authorize: principalAuthorizer(harness("{ torn"), service, { reader: reader() }) },
+    );
+    expect(answer.outcome).toBe("forbidden");
+    expect(answer.reason).toBe("Needs a maintainer.");
+    // A supersede needs a maintainer too.
+    const superseded = await operatorClass.store.supersede(
+      operatorClass.p.id,
+      { actor: {}, reason: "decided-in-error" },
+      { authorize: principalAuthorizer(harness(), service, { reader: reader() }) },
+    );
+    expect(superseded.outcome).toBe("forbidden");
+    expect(superseded.reason).toBe("Needs a maintainer.");
+  });
+
   test("a governed harness refuses a decision with no principal", async () => {
     const { root, store, p } = await parked();
     const answer = await store.decide(

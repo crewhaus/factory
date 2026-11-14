@@ -16,17 +16,24 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { type LocalIdentity, ensureAccessSetUp, localActorOf } from "@crewhaus/access-control";
 import { mintId } from "@crewhaus/control-contract";
-import { foldStates, readProposals, readStandingRules } from "@crewhaus/control-records";
+import {
+  foldStates,
+  readProposals,
+  readStandingRules,
+  writeHarnessIdentity,
+} from "@crewhaus/control-records";
 import { commandsLedgerOf } from "@crewhaus/control-service";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import { parseManagerHook, resolveHookCommand } from "@crewhaus/harness-supervisor";
 import {
+  NO_PRINCIPAL_REASON,
   type PendingApproval,
   createPendingApprovalStore,
   foldReadOnly,
@@ -41,6 +48,8 @@ import {
   AGENT_TOOL_REFUSAL,
   type ApprovalsDeps,
   NO_HARNESS_LINE,
+  displayPattern,
+  isKnownHarness,
   runApprovalsCommand,
   settingsApplyGate,
 } from "./approvals-cmd";
@@ -100,10 +109,15 @@ function linkMember(hangarRoot: string, identity: LocalIdentity, by: string): st
   return principal;
 }
 
+/**
+ * Write a harness's approver list as Home's access records would: its owner, its members
+ * by class, and the real path of the Hangar root that wrote it (`accessRoot`), when given.
+ */
 function project(
   harness: string,
   owner: string,
   members: ReadonlyArray<{ readonly principal: string; readonly decide: string }> = [],
+  accessRoot?: string,
 ): void {
   const control = join(harness, ".crewhaus", "run", "control");
   mkdirSync(control, { recursive: true });
@@ -118,6 +132,7 @@ function project(
       governedSince: new Date(Date.now() - 86_400_000).toISOString(),
       members,
       links: [],
+      ...(accessRoot !== undefined ? { accessRoot: realpathSync(accessRoot) } : {}),
     })}\n`,
   );
 }
@@ -226,7 +241,7 @@ describe("who a CLI decision is recorded as", () => {
     const { hangarRoot, owner } = await home();
     const r = rig(hangarRoot);
     const member = linkMember(hangarRoot, MEMBER_USER, owner);
-    project(r.harness, owner, [{ principal: member, decide: "operator" }]);
+    project(r.harness, owner, [{ principal: member, decide: "operator" }], hangarRoot);
     const root = sessionsOf(r.harness);
 
     const a = await park(root);
@@ -262,7 +277,7 @@ describe("finding the harness when the store was found through the environment",
   test("a registered harness whose own root it is decides by its own approver list", async () => {
     const { hangarRoot, owner } = await home();
     const h = harnessWith("custom");
-    project(h, owner);
+    project(h, owner, [], hangarRoot);
     const r = rig(hangarRoot, tmp("approvals-elsewhere-"));
     openHangarRegistry({ env: r.env }).upsert({ dir: h, specName: "h", target: "cli" });
     const root = join(h, "custom");
@@ -283,7 +298,7 @@ describe("finding the harness when the store was found through the environment",
     const inner = join(outer, "inner");
     mkdirSync(join(inner, ".crewhaus"), { recursive: true });
     writeFileSync(join(inner, ".env"), "CREWHAUS_SESSION_DIR=s\n");
-    project(inner, owner);
+    project(inner, owner, [], hangarRoot);
     const r = rig(hangarRoot, tmp("approvals-elsewhere-"));
     const root = join(inner, "s");
     const p = await park(root);
@@ -317,6 +332,285 @@ describe("finding the harness when the store was found through the environment",
     const answer = await r.run(["grant", p.id], { scopedSessionRoot: () => root });
     expect(answer.code).toBe(0);
     expect(answer.stderr).toContain(NO_HARNESS_LINE);
+    // No harness decided it, so nothing is kept in the working directory.
+    expect(existsSync(join(r.harness, ".crewhaus"))).toBe(false);
+  }, 30_000);
+
+  test("a root inside a governed harness that names no harness is decided only with --dir", async () => {
+    const { hangarRoot, owner } = await home();
+    const g = tmp("approvals-governed-");
+    project(g, owner, [], hangarRoot);
+    const root = join(g, "elsewhere", "sessions");
+    const p = await park(root);
+    const plain = rig(hangarRoot, tmp("approvals-elsewhere-"));
+    const fromPlain = await plain.run(["grant", p.id], { scopedSessionRoot: () => root });
+    expect(fromPlain.code).toBe(55);
+    expect(fromPlain.stderr).toContain("--dir");
+    expect(fromPlain.stderr).toContain(g);
+    // A known harness as the working directory, with no approver list of its own: the same.
+    const known = tmp("approvals-known-");
+    mkdirSync(join(known, ".crewhaus"), { recursive: true });
+    const fromKnown = await rig(hangarRoot, known).run(["grant", p.id], {
+      scopedSessionRoot: () => root,
+    });
+    expect(fromKnown.code).toBe(55);
+    expect(fromKnown.stderr).toContain("--dir");
+    expect(foldReadOnly(root).records[0]?.decision).toBeUndefined();
+    expect(receipts(known)).toEqual([]);
+  }, 30_000);
+
+  test("a working directory that only names the root in its .env decides nothing", async () => {
+    const { hangarRoot, owner } = await home();
+    const g = tmp("approvals-governed-");
+    project(g, owner, [], hangarRoot);
+    const cwd = join(g, "elsewhere");
+    mkdirSync(cwd, { recursive: true });
+    writeFileSync(join(cwd, ".env"), "CREWHAUS_SESSION_DIR=sessions\n");
+    const root = join(cwd, "sessions");
+    const p = await park(root);
+    const answer = await rig(hangarRoot, cwd).run(["grant", p.id], {
+      identity: STRANGER,
+      scopedSessionRoot: () => root,
+    });
+    expect(answer.code).toBe(55);
+    expect(answer.stderr).toContain("--dir");
+    expect(foldReadOnly(root).records[0]?.decision).toBeUndefined();
+    expect(existsSync(join(cwd, ".crewhaus"))).toBe(false);
+  }, 30_000);
+
+  test("a session root reached through a link is decided by the harness it lies in", async () => {
+    const { hangarRoot, owner } = await home();
+    const h = tmp("approvals-linked-");
+    project(h, owner, [], hangarRoot);
+    const p = await park(sessionsOf(h));
+    const link = join(tmp("approvals-link-"), "sessions");
+    try {
+      symlinkSync(sessionsOf(h), link, "dir");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return;
+      throw err;
+    }
+    const r = rig(hangarRoot, tmp("approvals-elsewhere-"));
+    const stranger = await r.run(["grant", p.id], {
+      identity: STRANGER,
+      scopedSessionRoot: () => link,
+    });
+    expect(stranger.code).toBe(51);
+    expect(stranger.stderr).toContain(NO_PRINCIPAL_REASON);
+    expect(foldReadOnly(sessionsOf(h)).records[0]?.decision).toBeUndefined();
+    const ownerRun = await r.run(["grant", p.id], { scopedSessionRoot: () => link });
+    expect(ownerRun.code).toBe(0);
+    expect(foldReadOnly(sessionsOf(h)).records[0]?.decidedByPrincipal).toBe(owner);
+  }, 30_000);
+});
+
+describe("receipts and control state are kept only in a known harness", () => {
+  test("in a plain directory, a change answers without creating .crewhaus/", async () => {
+    const { hangarRoot } = await home();
+    const r = rig(hangarRoot, tmp("approvals-plain-"));
+    const id = generateApprovalId();
+    const grant = await r.run(["grant", id]);
+    expect(grant.code).toBe(55);
+    expect(grant.stderr).toContain("no approval");
+    for (const argv of [
+      ["supersede", id, "--reason", "other"],
+      ["revoke", "--legacy", "Bash"],
+      ["revoke", mintId("rule")],
+    ]) {
+      const answer = await r.run(argv);
+      expect([argv[0], answer.code]).toEqual([argv[0], 55]);
+    }
+    expect(existsSync(join(r.harness, ".crewhaus"))).toBe(false);
+    expect(isKnownHarness(r.harness, { registryDirs: () => [] })).toBe(false);
+  }, 30_000);
+
+  test("a harness with its own harness.json keeps the receipt of each refusal", async () => {
+    const { hangarRoot } = await home();
+    const r = rig(hangarRoot, tmp("approvals-identified-"));
+    const written = writeHarnessIdentity(r.harness, { id: "hrn_00000000000000e1" });
+    expect(written.ok).toBe(true);
+    expect((await r.run(["grant", generateApprovalId()])).code).toBe(55);
+    expect((await r.run(["revoke", "--legacy", "Bash"])).code).toBe(55);
+    expect(receipts(r.harness).map((x) => [x["kind"], x["state"]])).toEqual([
+      ["decisions.resolve", "rejected"],
+      ["rules.revoke", "rejected"],
+    ]);
+  }, 30_000);
+
+  test("a registry row alone is a known harness", async () => {
+    const { hangarRoot } = await home();
+    const r = rig(hangarRoot, tmp("approvals-registered-"));
+    openHangarRegistry({ env: r.env }).upsert({ dir: r.harness, specName: "h", target: "cli" });
+    expect(existsSync(join(r.harness, ".crewhaus"))).toBe(false);
+    expect(isKnownHarness(r.harness, { registryDirs: () => liveHarnessDirs({ env: r.env }) })).toBe(
+      true,
+    );
+    expect((await r.run(["grant", generateApprovalId()])).code).toBe(55);
+    expect(receipts(r.harness).map((x) => [x["kind"], x["state"]])).toEqual([
+      ["decisions.resolve", "rejected"],
+    ]);
+  }, 30_000);
+});
+
+describe("a local user's authority comes from the Home that wrote the approver list", () => {
+  /** Plant an active `local` link from `identity` to `principal`, an active member of `hangarRoot`'s records. */
+  function linkTo(
+    hangarRoot: string,
+    identity: LocalIdentity,
+    principal: string,
+    by: string,
+  ): void {
+    const link = mintId("lnk");
+    const at = new Date().toISOString();
+    const dir = join(hangarRoot, "access");
+    appendFileSync(
+      join(dir, "principals.jsonl"),
+      `${JSON.stringify({ id: principal, kind: "member", state: "active", at, by })}\n`,
+    );
+    appendFileSync(
+      join(dir, "links.jsonl"),
+      `${JSON.stringify({
+        id: link,
+        principal,
+        provider: "local",
+        subjectRef: "e".repeat(64),
+        verifiedVia: "owner",
+        state: "active",
+        at,
+        by,
+      })}\n`,
+    );
+    const file = join(dir, "subjects.json");
+    const subjects = JSON.parse(readFileSync(file, "utf8")) as { links: Record<string, string> };
+    subjects.links[link] = localActorOf(identity);
+    writeFileSync(file, `${JSON.stringify(subjects, null, 2)}\n`);
+  }
+
+  test("another Home root that links the user to the owner decides nothing on this harness", async () => {
+    const a = await home();
+    const r = rig(a.hangarRoot);
+    project(r.harness, a.owner, [], a.hangarRoot);
+    const b = join(tmp("approvals-other-home-"), "hangar");
+    const setUp = await ensureAccessSetUp(b, {
+      localActor: localActorOf({ username: "eve", hostname: "laptop" }),
+    });
+    if (!setUp.ok) throw new Error(setUp.reason);
+    linkTo(b, STRANGER, a.owner, setUp.result.owner);
+    const env = { ...r.env, CREWHAUS_HANGAR_ROOT: b };
+    const fromB = { identity: STRANGER, env, control: directControl({ env, identity: STRANGER }) };
+    // Under B's records, the stranger is A's owner.
+    expect(fromB.control.decisions.principalOf({ kind: "local", identity: STRANGER })).toEqual({
+      principal: a.owner,
+    });
+    const p = await park(sessionsOf(r.harness));
+    const once = await r.run(["grant", p.id], fromB);
+    expect(once.code).toBe(51);
+    expect(once.stderr).toContain(NO_PRINCIPAL_REASON);
+    const always = await r.run(["grant", p.id, "--always"], fromB);
+    expect(always.code).toBe(51);
+    expect(foldReadOnly(sessionsOf(r.harness)).records[0]?.decision).toBeUndefined();
+    expect(readStandingRules(r.harness).state).toBe("absent");
+    // From A, the owner decides.
+    const ownerRun = await r.run(["grant", p.id]);
+    expect(ownerRun.code).toBe(0);
+    expect(foldReadOnly(sessionsOf(r.harness)).records[0]?.decidedByPrincipal).toBe(a.owner);
+  }, 30_000);
+
+  test("an approver list that names no Home root asks for crewhaus access sync", async () => {
+    const { hangarRoot, owner } = await home();
+    const r = rig(hangarRoot);
+    project(r.harness, owner);
+    const p = await park(sessionsOf(r.harness));
+    const answer = await r.run(["grant", p.id]);
+    expect(answer.code).toBe(51);
+    expect(answer.stderr).toContain("crewhaus access sync");
+    expect(foldReadOnly(sessionsOf(r.harness)).records[0]?.decision).toBeUndefined();
+  }, 30_000);
+});
+
+describe("a rule's pattern prints as it is held", () => {
+  test("displayPattern: a plain pattern as it is, one with a control character as an escaped string", () => {
+    expect(displayPattern("Write(notes/a.md)")).toBe("Write(notes/a.md)");
+    expect(displayPattern("a\u0085b")).toBe('"a\\u0085b"');
+    expect(displayPattern("a\u001b[2Jb")).toBe('"a\\u001b[2Jb"');
+    expect(displayPattern("a\u202eb\u2066")).toBe('"a\\u202eb\\u2066"');
+  });
+
+  test("a hand-written allow holding a bidirectional override lists escaped", async () => {
+    const { hangarRoot } = await home();
+    const r = rig(hangarRoot);
+    mkdirSync(join(r.harness, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(r.harness, ".crewhaus", "settings.json"),
+      `${JSON.stringify({ permissions: { rules: [{ type: "alwaysAllow", pattern: "Write\u202e" }] } })}\n`,
+    );
+    const listed = await r.run(["rules"]);
+    expect(listed.code).toBe(0);
+    expect(listed.stdout.indexOf("Write\\u202e")).toBeGreaterThan(-1);
+    expect(listed.stdout.includes("\u202e")).toBe(false);
+  }, 30_000);
+
+  test("a wider pattern's preview prints an approval's input escaped", async () => {
+    const { hangarRoot, owner } = await home();
+    const r = rig(hangarRoot);
+    project(r.harness, owner, [], hangarRoot);
+    const root = sessionsOf(r.harness);
+    const p = await park(root);
+    await park(root, "Write", { path: "notes/a\u202eb.md" });
+    const done = await r.run(["grant", p.id, "--always", "--pattern", "Write(notes/**)"], {
+      isTTY: () => true,
+      ask: async () => "",
+    });
+    expect(done.stdout).toContain("also covers 2 approval(s)");
+    expect(done.stdout.indexOf("notes/a\\u202eb.md")).toBeGreaterThan(-1);
+    expect(done.stdout.includes("\u202e")).toBe(false);
+  }, 30_000);
+
+  test("a rule record with a line that cannot be read: listed with a note, exit 1", async () => {
+    const { hangarRoot, owner } = await home();
+    const r = rig(hangarRoot);
+    project(r.harness, owner, [], hangarRoot);
+    const root = sessionsOf(r.harness);
+    const p = await park(root);
+    expect((await r.run(["grant", p.id, "--always"])).code).toBe(0);
+    const file = join(r.harness, ".crewhaus", "run", "control", "standing-rules.jsonl");
+    writeFileSync(file, `${readFileSync(file, "utf8")}{ torn\n`);
+    const listed = await r.run(["rules"]);
+    expect(listed.code).toBe(1);
+    expect(listed.stdout).toContain("a settings allow no readable rule names is not loaded");
+    // A supersede stands, names what it ended, and says the record needs a look.
+    const sup = await r.run(["supersede", p.id, "--reason", "decided-in-error"]);
+    expect(sup.stdout).toContain("ended");
+    expect(sup.stderr).toContain("crewhaus approvals rules");
+    expect(sup.code).toBe(1);
+  }, 30_000);
+
+  test("a supersede names the standing rule it ended, or the one still standing", async () => {
+    const { hangarRoot, owner } = await home();
+    const r = rig(hangarRoot);
+    project(r.harness, owner, [], hangarRoot);
+    const root = sessionsOf(r.harness);
+    const p = await park(root);
+    expect((await r.run(["grant", p.id, "--always"])).code).toBe(0);
+    const rules = readStandingRules(r.harness);
+    const first = rules.state === "present" ? (rules.rows[0]?.id ?? "") : "";
+    const ended = await r.run(["supersede", p.id, "--reason", "decided-in-error"]);
+    expect(ended.code).toBe(0);
+    expect(ended.stdout).toContain(`standing rule ${first} ended`);
+    const q = await park(root, "Write", { path: "notes/b.md" });
+    expect((await r.run(["grant", q.id, "--always"])).code).toBe(0);
+    const after = readStandingRules(r.harness);
+    const second =
+      after.state === "present" ? (after.rows.find((row) => row.id !== first)?.id ?? "") : "";
+    const kept = await r.run(["supersede", q.id, "--reason", "policy-changed", "--json"]);
+    expect(kept.code).toBe(0);
+    expect((JSON.parse(kept.stdout) as { derivedRules?: unknown }).derivedRules).toEqual([
+      {
+        id: second,
+        revoked: false,
+        verb: `crewhaus approvals revoke ${second} --dir ${r.harness}`,
+      },
+    ]);
   }, 30_000);
 });
 
@@ -325,7 +619,7 @@ describe("standing rules and requests to the owner", () => {
     const { hangarRoot, owner } = await home();
     const r = rig(hangarRoot);
     const member = linkMember(hangarRoot, MEMBER_USER, owner);
-    project(r.harness, owner, [{ principal: member, decide: "maintainer" }]);
+    project(r.harness, owner, [{ principal: member, decide: "maintainer" }], hangarRoot);
     const p = await park(sessionsOf(r.harness));
     const asked = await r.run(["grant", p.id, "--always"], { identity: MEMBER_USER });
     expect(asked.code).toBe(0);
@@ -361,7 +655,7 @@ describe("standing rules and requests to the owner", () => {
   test("a wider glob is the owner's, at a terminal, confirmed by the tool's name", async () => {
     const { hangarRoot, owner } = await home();
     const r = rig(hangarRoot);
-    project(r.harness, owner);
+    project(r.harness, owner, [], hangarRoot);
     const root = sessionsOf(r.harness);
     const p = await park(root);
     await park(root, "Write", { path: "notes/b.md" });
@@ -387,7 +681,7 @@ describe("standing rules and requests to the owner", () => {
     const { hangarRoot, owner } = await home();
     const r = rig(hangarRoot);
     const member = linkMember(hangarRoot, MEMBER_USER, owner);
-    project(r.harness, owner, [{ principal: member, decide: "maintainer" }]);
+    project(r.harness, owner, [{ principal: member, decide: "maintainer" }], hangarRoot);
     const p = await park(sessionsOf(r.harness));
     expect((await r.run(["grant", p.id, "--always"])).code).toBe(0);
     const rules = readStandingRules(r.harness);
@@ -419,7 +713,7 @@ describe("whole-tool allows no record keeps", () => {
     const { hangarRoot, owner } = await home();
     const r = rig(hangarRoot);
     const member = linkMember(hangarRoot, MEMBER_USER, owner);
-    project(r.harness, owner, [{ principal: member, decide: "maintainer" }]);
+    project(r.harness, owner, [{ principal: member, decide: "maintainer" }], hangarRoot);
     writeFileSync(
       join(r.harness, ".crewhaus", "settings.json"),
       `${JSON.stringify({ permissions: { rules: [{ type: "alwaysAllow", pattern: "Bash" }] } })}\n`,
@@ -550,7 +844,7 @@ describe("permissions suggest --apply on a harness with an approver list", () =>
     const { hangarRoot, owner } = await home();
     const r = rig(hangarRoot);
     const member = linkMember(hangarRoot, MEMBER_USER, owner);
-    project(r.harness, owner, [{ principal: member, decide: "maintainer" }]);
+    project(r.harness, owner, [{ principal: member, decide: "maintainer" }], hangarRoot);
     const settings = join(r.harness, ".crewhaus", "settings.json");
     writeFileSync(settings, `${JSON.stringify({ hooks: [] })}\n`);
     const before = readFileSync(settings);

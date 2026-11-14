@@ -3,6 +3,7 @@ import {
   type NarrowRefusal,
   type PermissionRule,
   type RuleType,
+  holdsDisplayControl,
   narrowPatternFor,
 } from "@crewhaus/permission-engine";
 import { carriesCredential } from "@crewhaus/spec-patch";
@@ -74,9 +75,14 @@ import { type SessionEvents, payloadOf } from "./advise-rules";
  * - `carries-credential` — `carriesCredential` (`@crewhaus/spec-patch`)
  *   flags a recorded call's value, so no sample, rule or report holds it. A
  *   tool with this reason gets no `alwaysAllow` proposal at all
+ *   ({@link skippedSuggestions} names it);
+ * - `holds-control` — a recorded call's operative value holds a control or
+ *   bidirectional-text character (a multi-line command's newline is one),
+ *   which a rule's pattern never holds. A tool with this reason gets no
+ *   `alwaysAllow` proposal at all, neither scoped nor for the whole tool
  *   ({@link skippedSuggestions} names it).
  */
-export type UnscopedReason = NarrowRefusal | "varied" | "carries-credential";
+export type UnscopedReason = NarrowRefusal | "varied" | "carries-credential" | "holds-control";
 
 export type AskAggregate = {
   readonly toolName: string;
@@ -158,7 +164,10 @@ const unscoped = (reason: UnscopedReason): CallReading => ({ kind: "unscoped", r
 function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup): CallReading {
   const info = lookup?.(toolName);
   const declared = info?.operativeArgs;
-  if (declared === undefined) return readingOf(narrowPatternFor(toolName, input, undefined));
+  if (declared === undefined) {
+    if (undeclaredValueHoldsControl(toolName, input)) return unscoped("holds-control");
+    return readingOf(narrowPatternFor(toolName, input, undefined));
+  }
   if (declared.length === 0) return unscoped("no-scoping-argument");
   let values: ReadonlyArray<OperativeValue>;
   if (info?.tool !== undefined) {
@@ -178,7 +187,26 @@ function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup):
   } else {
     values = operativeValuesOf(declared, input) ?? [];
   }
+  if (values.some((v) => v.canonical.some(holdsDisplayControl))) return unscoped("holds-control");
   return readingOf(narrowPatternFor(toolName, input, values));
+}
+
+/**
+ * Whether the value the matcher's name table reads for an undeclared tool
+ * (its first non-empty operative field, as `narrowPatternFor` reads it)
+ * holds a control or bidirectional-text character.
+ */
+function undeclaredValueHoldsControl(toolName: string, input: unknown): boolean {
+  const fields = Object.hasOwn(MATCHER_OPERATIVE_ARG_FIELDS, toolName)
+    ? MATCHER_OPERATIVE_ARG_FIELDS[toolName]
+    : undefined;
+  if (fields === undefined || input === null || typeof input !== "object") return false;
+  const record = input as Record<string, unknown>;
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string" && value.length > 0) return holdsDisplayControl(value);
+  }
+  return false;
 }
 
 /**
@@ -355,6 +383,8 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
   const why: Record<UnscopedReason, string> = {
     "carries-credential":
       "a recorded call carried a credential, which a rule must never hold, so no rule names its value",
+    "holds-control":
+      "a recorded call's value holds a control or bidirectional-text character, which a rule's pattern never holds",
     undeclared: `${agg.toolName} does not declare which argument decides where it acts, so the proposal cannot be narrowed to the approved calls`,
     "no-scoping-argument": `${agg.toolName} has no argument that decides where it acts, so no rule can be narrower than the tool`,
     "not-parsed": "a recorded call no longer fits the tool's input, so what it acted on is unknown",
@@ -369,6 +399,7 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
   };
   const order: UnscopedReason[] = [
     "carries-credential",
+    "holds-control",
     "undeclared",
     "no-scoping-argument",
     "not-parsed",
@@ -399,9 +430,16 @@ function meetsAllowBar(agg: AskAggregate, thresholds: SuggestThresholds): boolea
   return agg.denied === 0 && agg.approved / agg.asks >= thresholds.approveRate;
 }
 
-/** Whether a recorded call of this tool carried a credential. */
-function carriedCredential(agg: AskAggregate): boolean {
-  return (agg.unscoped ?? []).includes("carries-credential");
+/**
+ * Why no `alwaysAllow` at all is proposed for this tool, when none is: a
+ * recorded call carried a credential, or held a value no rule's pattern can
+ * hold. A credential is named first.
+ */
+function noAllowReason(agg: AskAggregate): PermissionSkip["reason"] | undefined {
+  const reasons = agg.unscoped ?? [];
+  if (reasons.includes("carries-credential")) return "carries-credential";
+  if (reasons.includes("holds-control")) return "holds-control";
+  return undefined;
 }
 
 /**
@@ -414,8 +452,10 @@ function carriedCredential(agg: AskAggregate): boolean {
  * Read-only-ness comes from the tool map; an unknown tool defaults to false
  * (treated as non-read-only ⇒ ranked after read-only grants).
  *
- * A tool a recorded call of which carried a credential gets no `alwaysAllow`,
- * neither scoped nor for the whole tool: {@link skippedSuggestions} names it.
+ * A tool a recorded call of which carried a credential, or held a control or
+ * bidirectional-text character in a value a rule is read against, gets no
+ * `alwaysAllow`, neither scoped nor for the whole tool:
+ * {@link skippedSuggestions} names it.
  */
 export function rankSuggestions(
   aggregates: ReadonlyMap<string, AskAggregate>,
@@ -432,7 +472,7 @@ export function rankSuggestions(
     const pattern = patternFor(agg);
 
     if (meetsAllowBar(agg, thresholds)) {
-      if (carriedCredential(agg)) continue;
+      if (noAllowReason(agg) !== undefined) continue;
       const blanket = blanketGrantNote(agg);
       grants.push({
         rule: { type: "alwaysAllow", pattern, source: "settings" },
@@ -483,7 +523,7 @@ export function rankSuggestions(
 /** A tool that met the bar for an `alwaysAllow` and gets none, and why. */
 export type PermissionSkip = {
   readonly toolName: string;
-  readonly reason: "carries-credential";
+  readonly reason: "carries-credential" | "holds-control";
   readonly note: string;
 };
 
@@ -491,10 +531,15 @@ export type PermissionSkip = {
 export const CARRIES_CREDENTIAL_NOTE =
   "a recorded call carried a credential, so no allow rule is proposed; approve such calls one at a time";
 
+/** The note a tool skipped for `holds-control` carries. It names no value. */
+export const HOLDS_CONTROL_NOTE =
+  "a recorded call's value holds a control or bidirectional-text character (a newline is one), which no rule's pattern can show, so no allow rule is proposed; approve such calls one at a time";
+
 /**
  * The tools {@link rankSuggestions} would propose an `alwaysAllow` for, but
- * does not, because a recorded call carried a credential. Sorted by tool name.
- * A skip names the tool and never the value.
+ * does not, because a recorded call carried a credential or held a value no
+ * rule's pattern can hold. Sorted by tool name. A skip names the tool and
+ * never the value.
  */
 export function skippedSuggestions(
   aggregates: ReadonlyMap<string, AskAggregate>,
@@ -502,11 +547,13 @@ export function skippedSuggestions(
 ): PermissionSkip[] {
   const out: PermissionSkip[] = [];
   for (const agg of aggregates.values()) {
-    if (!meetsAllowBar(agg, thresholds) || !carriedCredential(agg)) continue;
+    if (!meetsAllowBar(agg, thresholds)) continue;
+    const reason = noAllowReason(agg);
+    if (reason === undefined) continue;
     out.push({
       toolName: agg.toolName,
-      reason: "carries-credential",
-      note: CARRIES_CREDENTIAL_NOTE,
+      reason,
+      note: reason === "carries-credential" ? CARRIES_CREDENTIAL_NOTE : HOLDS_CONTROL_NOTE,
     });
   }
   return out.sort((a, b) => a.toolName.localeCompare(b.toolName));

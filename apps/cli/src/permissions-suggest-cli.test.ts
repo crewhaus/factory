@@ -10,7 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
@@ -266,6 +266,8 @@ describe("crewhaus permissions suggest --apply on a harness with an approver lis
         governedSince: at,
         members: [{ principal: member, decide: "maintainer" }],
         links: [],
+        // The Home whose records link this OS user wrote this list.
+        accessRoot: realpathSync(hangarRoot),
       }),
     );
     const settings = join(cwd, ".crewhaus", "settings.json");
