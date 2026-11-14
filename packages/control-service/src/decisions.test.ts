@@ -7,8 +7,10 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  rmdirSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join, relative } from "node:path";
@@ -1241,14 +1243,26 @@ describe("a local user decides only through the Home that wrote the harness's ap
       if ((err as NodeJS.ErrnoException).code === "EPERM") return;
       throw err;
     }
+    // Windows removes a directory link with rmdir; elsewhere it is an unlink.
+    const relink = (target: string): void => {
+      if (process.platform === "win32") rmdirSync(link);
+      else unlinkSync(link);
+      symlinkSync(target, link, "dir");
+    };
+    try {
+      relink(bRoot);
+    } catch (err) {
+      // A runner that cannot move a directory link cannot run this case.
+      if (process.platform === "win32") return;
+      throw err;
+    }
     let flips = 0;
     const decisions = createDecisions({
       hangarRoot: link,
       identity: ZED,
       now: () => NOW,
       approvers: (dir) => {
-        rmSync(link);
-        symlinkSync(flips++ % 2 === 0 ? a.hangarRoot : bRoot, link, "dir");
+        relink(flips++ % 2 === 0 ? a.hangarRoot : bRoot);
         return readApproverProjection(dir);
       },
     });
