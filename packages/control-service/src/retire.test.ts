@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { type CommandReceipt, mintId, mintRunId } from "@crewhaus/control-contract";
 import {
@@ -199,6 +199,38 @@ describe("retire's own steps", () => {
     });
     expect(calls).toEqual(["absent"]);
     expect(readOperatorRecord.refresh(s.harness)).toEqual({ state: "absent" });
+  });
+
+  test("after the archive took its state, the harness is disabled where it lives again", async () => {
+    const s = setUp();
+    expect(await s.steps.stopAndDisable()).toMatchObject({ ok: true });
+    // The archive moves `.crewhaus`, operator record and all.
+    rmSync(join(s.harness, ".crewhaus"), { recursive: true, force: true });
+    expect(readOperatorRecord.refresh(s.harness)).toEqual({ state: "absent" });
+    expect(await s.steps.keepDisabled()).toMatchObject({ step: "keepDisabled", ok: true });
+    expect(readOperatorRecord.refresh(s.harness)).toMatchObject({
+      state: "present",
+      record: {
+        rev: 1,
+        desired: "stopped",
+        deployment: { disabled: true, by: ACTOR, cmd: s.receipt.id },
+      },
+    });
+    expect(s.steps.effects().map((e) => [e.kind, e.status, e.observed])).toEqual([
+      ["retire.disable", "done", "rev 1"],
+      ["retire.keep-disabled", "done", "rev 1"],
+    ]);
+  });
+
+  test("a live record that can't be read is left alone, and the step says so", async () => {
+    const s = setUp();
+    mkdirSync(join(s.harness, ".crewhaus", "run", "control", "operator.json"), {
+      recursive: true,
+    });
+    const outcome = await s.steps.keepDisabled();
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("crewhaus daemon disable");
+    expect(s.steps.effects()).toEqual([{ kind: "retire.keep-disabled", status: "failed" }]);
   });
 
   test("an unregistered harness's row is skipped", async () => {

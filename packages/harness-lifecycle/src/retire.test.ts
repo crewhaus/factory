@@ -73,6 +73,7 @@ function stubSteps(
       opts.failPre === "revokeConnections"
         ? fail("revokeConnections", "a revoker failed")
         : ok("revokeConnections"),
+    keepDisabled: async () => ok("keepDisabled"),
     recordLifecycle: async () => ok("recordLifecycle"),
     archiveRegistryRow: async () => ok("archiveRegistryRow"),
     backupState: async () =>
@@ -211,6 +212,7 @@ describe("runRetirement — real", () => {
       "auditVerify",
       "pushKnowledge",
       "tombstoneRegistry",
+      "keepDisabled",
       "recordLifecycle",
       "archiveRegistryRow",
     ]);
@@ -226,6 +228,7 @@ describe("runRetirement — real", () => {
       "pushKnowledge",
       "tombstoneRegistry",
       "archive",
+      "keepDisabled",
       "recordLifecycle",
       "archiveRegistryRow",
     ]);
@@ -240,7 +243,8 @@ describe("runRetirement — real", () => {
     expect(log?.outcomes.map((o) => o.step)).toContain("archive");
     const logged = log?.outcomes.map((o) => o.step) ?? [];
     expect(logged.indexOf("archive")).toBeGreaterThan(-1);
-    expect(logged.indexOf("recordLifecycle")).toBeGreaterThan(logged.indexOf("archive"));
+    expect(logged.indexOf("keepDisabled")).toBeGreaterThan(logged.indexOf("archive"));
+    expect(logged.indexOf("recordLifecycle")).toBeGreaterThan(logged.indexOf("keepDisabled"));
     expect(existsSync(join(archiveDir, RETIREMENT_LOG_FILENAME))).toBe(true);
     expect(formatRetirementResult(result).join("\n")).toContain("retired concierge");
   });

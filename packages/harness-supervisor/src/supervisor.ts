@@ -1424,6 +1424,10 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       setState("stopped");
       return { stopped: true, forced: false, ...(desired !== undefined ? { desired } : {}) };
     }
+    // This is an operator stop from here on: the latch is set before the record is
+    // written, so a daemon that exits while the write waits on the control lock is
+    // classified as stopped by its operator and never scheduled to come back.
+    operatorStop = true;
     // Recorded before anything is signalled, so a crash between the two never leaves a
     // daemon stopped by hand marked to come back after a reboot. A child that is not a
     // daemon is not what the record is about.
@@ -1432,11 +1436,13 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         ? await recordDesired("stopped")
         : undefined;
     if (pid === undefined) {
-      // It exited while the record was written.
+      // It exited while the record was written: the stop stands.
+      cancelPendingRestart();
       setState("stopped");
       return { stopped: true, forced: false, ...(desired !== undefined ? { desired } : {}) };
     }
     const target = pid;
+    // The exit handler clears the latch; set it again for the signal below.
     operatorStop = true;
     const exited = onceExit();
     options.ops.terminate(target);
@@ -1641,13 +1647,21 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         const desired = await recordDesired("stopped");
         return { stopped: true, forced: false, ...(desired !== undefined ? { desired } : {}) };
       }
+      // A drain is an operator stop from here on: the latch is set before the record is
+      // written, as a stop sets it, so an exit while the write waits is never restarted.
+      operatorStop = true;
       // Recorded before the control call, as a stop records before it signals.
       const desired =
         currentKind === undefined || currentKind === "daemon"
           ? await recordDesired("stopped")
           : undefined;
       const recorded = desired !== undefined ? { desired } : {};
-      if (pid === undefined) return { stopped: true, forced: false, ...recorded };
+      if (pid === undefined) {
+        // It exited while the record was written: the drain stands.
+        cancelPendingRestart();
+        setState("stopped");
+        return { stopped: true, forced: false, ...recorded };
+      }
       // Subscribe BEFORE the control call: a daemon that drains promptly can
       // exit inside `request()`, and a subscription taken afterwards would
       // wait forever for an event that already fired.

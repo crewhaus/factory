@@ -191,7 +191,6 @@ describe("crewhaus retire", () => {
     ]);
 
     // The harness's state moved into the archive, disabled and recorded stopped.
-    expect(existsSync(join(s.dir, ".crewhaus"))).toBe(false);
     const operator = JSON.parse(
       readFileSync(
         join(s.root, "archive", "crewhaus-state", "run", "control", "operator.json"),
@@ -200,6 +199,17 @@ describe("crewhaus retire", () => {
     ) as Record<string, unknown>;
     expect(operator["deployment"]).toMatchObject({ disabled: true });
     expect(operator["desired"]).toBe("stopped");
+    // Where it lives, only its control directory is left, and it says disabled again.
+    const live = [...tree(join(s.dir, ".crewhaus")).keys()];
+    const controlDir = join(s.dir, ".crewhaus", "run", "control");
+    expect(live.length).toBeGreaterThan(0);
+    expect(
+      live.filter((p) => p !== join(s.dir, ".crewhaus", "run") && !p.startsWith(controlDir)),
+    ).toEqual([]);
+    const kept = JSON.parse(readFileSync(join(controlDir, "operator.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
 
     // One receipt in Home's own ledger, one lifecycle line naming it, the row archived.
     const fold = foldStates(workspaceCommandsLedger(s.hangarRoot));
@@ -222,11 +232,29 @@ describe("crewhaus retire", () => {
       cmd: receipt["id"],
       by: receipt["actor"],
     });
+    expect(kept["deployment"]).toMatchObject({
+      disabled: true,
+      cmd: receipt["id"],
+      by: receipt["actor"],
+    });
+    expect(kept["desired"]).toBe("stopped");
     const row = openHangarRegistry({ root: s.registryRoot, env: {} }).get(s.row.id);
     expect(row?.archived).toMatchObject({ cmd: receipt["id"], by: receipt["actor"] });
     const kinds = (receipt["effects"] as Array<{ kind: string }>).map((e) => e.kind);
     expect(kinds.indexOf("retire.stop")).toBe(0);
-    expect(kinds.indexOf("retire.archive")).toBeLessThan(kinds.indexOf("retire.lifecycle"));
     expect(kinds.indexOf("retire.archive")).toBeGreaterThan(-1);
+    expect(kinds.indexOf("retire.archive")).toBeLessThan(kinds.indexOf("retire.keep-disabled"));
+    expect(kinds.indexOf("retire.keep-disabled")).toBeLessThan(kinds.indexOf("retire.lifecycle"));
+  }, 20_000); // an adopted daemon's exit is noticed on the pump's real-time poll
+
+  test("a retired harness is not started again from where it lives", async () => {
+    const s = setUp();
+    expect((await runDaemonCommand(["start", "--no-preflight"], s.opts)).exitCode).toBe(0);
+    expect((await s.retire({ stop: true })).exitCode).toBe(0);
+    expect(s.ops.children).toHaveLength(1);
+    const again = await runDaemonCommand(["start", "--no-preflight"], s.opts);
+    expect(again.exitCode).toBe(38);
+    expect(again.lines.join("\n")).toContain("crewhaus daemon enable");
+    expect(s.ops.children).toHaveLength(1);
   }, 20_000); // an adopted daemon's exit is noticed on the pump's real-time poll
 });

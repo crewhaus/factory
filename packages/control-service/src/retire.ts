@@ -11,11 +11,13 @@
  *      pending `dec_` decision with no expire writer is listed for a person;
  *   4. revoke every active standing rule;
  *   5. run each area's retire revoker;
+ *   6. (the archive, which moves the operator record away with the rest of the state)
+ *      then disable the harness again in its live directory, so nothing starts it there;
  *   7. append `harness.retired` to Home's lifecycle record (`<hangarRoot>/control/
  *      lifecycle.jsonl`);
  *   8. mark the harness's registry row archived.
  *
- * Step 6 is the archive itself. Each step answers an outcome for the retirement log and
+ * Step 6 is the archive itself and the disable that follows it. Each step answers an outcome for the retirement log and
  * one receipt effect for the `controls.retire` receipt, which lives in Home's ledger: the
  * harness's own ledger moves into the archive with its state.
  */
@@ -33,6 +35,7 @@ import {
   readTail,
   runsLedger,
   withLedgerLock,
+  writeOperatorRecord,
 } from "@crewhaus/control-records";
 import { expireOpenApprovals } from "@crewhaus/session-store";
 import type { Reconciler, RetireRevoker } from "./executor";
@@ -95,6 +98,7 @@ export type RetireSteps = {
   expireDecisions(): Promise<RetireStepOutcome>;
   revokeStandingRules(): Promise<RetireStepOutcome>;
   revokeConnections(): Promise<RetireStepOutcome>;
+  keepDisabled(): Promise<RetireStepOutcome>;
   recordLifecycle(): Promise<RetireStepOutcome>;
   archiveRegistryRow(): Promise<RetireStepOutcome>;
   /** One receipt effect per step that ran, in the order they ran. */
@@ -310,6 +314,36 @@ export function retireSteps(options: RetireStepsOptions): RetireSteps {
       return failed.length === 0
         ? outcome("revokeConnections", true, `${revokers.length} revoker(s) ran`)
         : outcome("revokeConnections", false, `failed: ${failed.join("; ")}`);
+    },
+
+    async keepDisabled() {
+      // The archive moved the operator record with the rest of `.crewhaus`; the spec and
+      // the bundle stay where they were, so the harness is disabled there again, under
+      // the retire's own receipt.
+      let written: { readonly ok: boolean; readonly rev?: number; readonly reason?: string };
+      try {
+        const answer = await writeOperatorRecord(harnessDir, {
+          deployment: { disabled: true, since: iso(), by: receipt.actor, cmd: receipt.id },
+          desired: "stopped",
+        });
+        written = answer.ok
+          ? { ok: true, rev: answer.record.rev }
+          : { ok: false, reason: answer.reason };
+      } catch (err) {
+        written = { ok: false, reason: messageOf(err) };
+      }
+      effect({
+        kind: "retire.keep-disabled",
+        status: written.ok ? "done" : "failed",
+        ...(written.rev !== undefined ? { observed: `rev ${written.rev}` } : {}),
+      });
+      return written.ok
+        ? outcome("keepDisabled", true, "disabled where it lives, so nothing starts it")
+        : outcome(
+            "keepDisabled",
+            false,
+            `${written.reason ?? "not written"}; run \`crewhaus daemon disable\` in its directory`,
+          );
     },
 
     async recordLifecycle() {

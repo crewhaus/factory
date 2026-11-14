@@ -509,9 +509,11 @@ these on: they reach every harness that uses what each one names.
   and says so; `--stop` stops it first. Before the backup it leaves the
   harness disabled, cancels its queued runs, expires its open approvals and
   unspent grants, revokes its standing rules and runs each area's revoker.
-  After the archive it records `harness.retired` in Home's lifecycle record
-  (`control/lifecycle.jsonl` under Home's directory) and marks the harness's
-  registry row archived, so a group start passes it by. A step that fails
+  After the archive the harness stays disabled where it lives, so nothing
+  starts it from its spec and bundle; then retire records `harness.retired`
+  in Home's lifecycle record (`control/lifecycle.jsonl` under Home's
+  directory) and marks the harness's registry row archived, so a group start
+  passes it by. A step that fails
   stops the retire before anything is archived, and the harness stays
   disabled until `crewhaus daemon enable`. The retire's receipt is kept in
   Home's own ledger.

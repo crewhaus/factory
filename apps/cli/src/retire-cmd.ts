@@ -216,11 +216,12 @@ export async function retireCommand(o: RetireCommandOptions): Promise<DaemonComm
         auditVerify: heavyStep(o.heavy.auditVerify),
         pushKnowledge: heavyStep(o.heavy.pushKnowledge),
         tombstoneRegistry: heavyStep(o.heavy.tombstoneRegistry),
-        recordLifecycle: async () => {
+        keepDisabled: async () => {
           // The post-archive steps run only once the state is archived.
           effects.push({ kind: "retire.archive", status: "done" });
-          return coreStep(core.recordLifecycle)();
+          return coreStep(core.keepDisabled)();
         },
+        recordLifecycle: coreStep(core.recordLifecycle),
         archiveRegistryRow: coreStep(core.archiveRegistryRow),
       };
       try {

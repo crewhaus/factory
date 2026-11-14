@@ -123,8 +123,9 @@ running, for the recovery after a reboot; both heads lend it to their supervisor
 `retireSteps({harnessDir, receipt, hangarRoot, stop, stopDaemon?, ...})` is retire's own part: stop
 (with `--stop`) and disable, cancel queued runs (taking each run's claim first), expire open approvals
 and unspent grants with reason `retired`, revoke standing rules, run every area's retire revoker, then,
-after the archive, append `harness.retired` to `<hangarRoot>/control/lifecycle.jsonl` and mark the
-registry row archived. An area registers a revoker in `AreaRuntime.retireRevokers`;
+after the archive, disable the harness again in its live directory (the archive took its operator
+record), append `harness.retired` to `<hangarRoot>/control/lifecycle.jsonl` and mark the registry row
+archived. An area registers a revoker in `AreaRuntime.retireRevokers`;
 `retireRevokers(areas)` lists them in composition order, and `wireControl` refuses a name registered
 twice. `controls.retire`'s reconciler reads the lifecycle record.
 

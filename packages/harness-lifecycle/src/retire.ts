@@ -119,6 +119,9 @@ export type RetirementSteps = {
   pushKnowledge(archiveDir: string): Promise<StepOutcome>;
   /** Tombstone the registry entry (delete versions → clears pins). */
   tombstoneRegistry(): Promise<StepOutcome>;
+  /** Disable the harness again in its live directory. After the archive, which moved its
+   *  operator record away with the rest of its state. */
+  keepDisabled?(): Promise<StepOutcome>;
   /** Append `harness.retired` to Home's lifecycle record. After the archive. */
   recordLifecycle?(): Promise<StepOutcome>;
   /** Mark the harness's Home registry row archived. After the archive. */
@@ -142,8 +145,13 @@ export const PRE_ARCHIVE_STEPS = [
   "revokeConnections",
 ] as const;
 
-/** The steps that record the retirement once the state is archived. */
-export const POST_ARCHIVE_STEPS = ["recordLifecycle", "archiveRegistryRow"] as const;
+/** The steps that keep the harness disabled and record the retirement once the state is
+ *  archived. */
+export const POST_ARCHIVE_STEPS = [
+  "keepDisabled",
+  "recordLifecycle",
+  "archiveRegistryRow",
+] as const;
 
 // ---------------------------------------------------------------------------
 // plan
@@ -297,6 +305,8 @@ function describeStep(step: string, plan: RetirementPlan): string {
       return "tombstone the registry entry (delete versions → clear pins)";
     case "archive":
       return "archive + remove the live .crewhaus state";
+    case "keepDisabled":
+      return "keep the harness disabled where it lives, now that its state is archived";
     case "recordLifecycle":
       return "record the retirement in Home's lifecycle record";
     case "archiveRegistryRow":
@@ -508,7 +518,8 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
     });
   }
 
-  // The state is archived: record the retirement where Home keeps it. A failure here is
+  // The state is archived: disable the harness again where it lives (the archive took its
+  // operator record), then record the retirement where Home keeps it. A failure here is
   // logged, never undone: the harness is already retired.
   for (const name of POST_ARCHIVE_STEPS) {
     const run = steps[name];

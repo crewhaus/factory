@@ -63,7 +63,6 @@ function gate(dir: string, argv: readonly string[]): { exit?: number; out: strin
 
 const ROWS: ReadonlyArray<{ readonly argv: readonly string[]; readonly mode: string }> = [
   { argv: ["run", "crewhaus.yaml", "--prompt", "x"], mode: "run" },
-  { argv: ["run", "crewhaus.yaml", "--prompt=x"], mode: "run" },
   { argv: ["run", "crewhaus.yaml"], mode: "interactive" },
   { argv: ["eval", "crewhaus.yaml", "--dataset", "d"], mode: "run" },
   { argv: ["eval", "suite", "suite.yaml"], mode: "run" },
@@ -150,6 +149,58 @@ describe("gateEntryPoint", () => {
     });
   }
 
+  test("a flag is read as the verb's own parser reads it: a value or a token after -- is not a flag", () => {
+    const rows: ReadonlyArray<{
+      readonly argv: readonly string[];
+      readonly state: State;
+      readonly exit: number;
+    }> = [
+      { argv: ["run", "crewhaus.yaml", "--prompt", "-h"], state: "disabled", exit: 38 },
+      { argv: ["run", "crewhaus.yaml", "--prompt", "--help"], state: "disabled", exit: 38 },
+      {
+        argv: ["run", "crewhaus.yaml", "--prompt", "x", "--", "--help"],
+        state: "disabled",
+        exit: 38,
+      },
+      { argv: ["eval", "crewhaus.yaml", "--dataset", "-h"], state: "disabled", exit: 38 },
+      { argv: ["eval", "suite", "suite.yaml", "--", "--help"], state: "disabled", exit: 38 },
+      { argv: ["flywheel", "run", "--", "-h"], state: "disabled", exit: 38 },
+      { argv: ["serve", "crewhaus.yaml", "--", "-h"], state: "disabled", exit: 38 },
+      { argv: ["dev", "crewhaus.yaml", "--", "--help"], state: "disabled", exit: 38 },
+      { argv: ["run", "crewhaus.yaml", "--prompt", "-h"], state: "paused", exit: 39 },
+      { argv: ["run", "crewhaus.yaml", "--prompt", "--ignore-pause"], state: "paused", exit: 39 },
+      {
+        argv: ["run", "crewhaus.yaml", "--prompt", "x", "--", "--ignore-pause"],
+        state: "paused",
+        exit: 39,
+      },
+      { argv: ["optimize", "crewhaus.yaml", "--", "--ignore-pause"], state: "paused", exit: 39 },
+    ];
+    for (const row of rows) {
+      const got = gate(harness(row.state), row.argv);
+      expect([row.state, row.argv.join(" "), got.exit]).toEqual([
+        row.state,
+        row.argv.join(" "),
+        row.exit,
+      ]);
+      expect(got.out).not.toContain("--ignore-pause).");
+    }
+  });
+
+  test("an argv the verb's parser refuses is still checked, in its strictest mode", () => {
+    for (const argv of [
+      ["run", "crewhaus.yaml", "--no-such-flag"],
+      ["run", "crewhaus.yaml", "--prompt"],
+      // The parser has no `--name=value` form: the dispatch dies on it, so it lifts nothing.
+      ["run", "crewhaus.yaml", "--prompt=x", "--ignore-pause"],
+      ["eval", "crewhaus.yaml", "--no-such-flag", "-h"],
+    ]) {
+      expect([argv.join(" "), gate(harness("paused"), argv).exit]).toEqual([argv.join(" "), 39]);
+      expect([argv.join(" "), gate(harness("disabled"), argv).exit]).toEqual([argv.join(" "), 38]);
+    }
+    expect(gate(harness("disabled"), ["serve", "crewhaus.yaml", "--no-such-flag"]).exit).toBe(38);
+  });
+
   test("each refusal says why in one line and names the verb that lifts it", () => {
     expect(gate(harness("disabled"), ["eval", "crewhaus.yaml"]).out).toBe(
       "gate-fixture is disabled by its operator, so this doesn't run. `crewhaus daemon enable` allows it again.\n",
@@ -194,6 +245,7 @@ describe("the crewhaus binary", () => {
     expect(evaled.exitCode).toBe(38);
     expect(evaled.stderr).toContain("is disabled by its operator");
     expect((await cli(disabled, ["run", "crewhaus.yaml", "--prompt", "x"])).exitCode).toBe(38);
+    expect((await cli(disabled, ["run", "crewhaus.yaml", "--prompt", "-h"])).exitCode).toBe(38);
 
     const paused = harness("paused");
     const refused = await cli(paused, ["run", "crewhaus.yaml", "--prompt", "x"]);
@@ -202,5 +254,5 @@ describe("the crewhaus binary", () => {
     const ignored = await cli(paused, ["run", "crewhaus.yaml", "--prompt", "x", "--ignore-pause"]);
     expect(ignored.stderr).toContain("Running although new work is paused (--ignore-pause).");
     expect(ignored.exitCode).not.toBe(39);
-  }, 20_000); // four CLI subprocesses, each loading the whole entry file
+  }, 20_000); // five CLI subprocesses, each loading the whole entry file
 });

@@ -70,6 +70,11 @@ function supervise(
     readonly ownerPid?: number;
     readonly recordAnswer?: boolean;
     readonly withRecord?: boolean;
+    /** Runs inside the record write, as the write waits on the control lock. */
+    readonly whileRecording?: (
+      desired: "running" | "stopped",
+      ops: ReturnType<typeof createFakeProcessOps>,
+    ) => void;
   } = {},
 ) {
   const clock = options.clock ?? createFakeClock();
@@ -88,6 +93,7 @@ function supervise(
       signals: live?.signals.length ?? 0,
       drains: drains.count,
     });
+    options.whileRecording?.(desired, ops);
     return { ok: options.recordAnswer ?? true };
   };
   const supervisor = createHarnessSupervisor({
@@ -337,6 +343,44 @@ describe("what the operator asked for is recorded", () => {
     expect(drain).toMatchObject({ stopped: false, reason: "not-adopted" });
     expect(second.recorded).toEqual([]);
     expect(ops.last()?.signals).toEqual([]);
+  });
+
+  test("a daemon that exits while a stop's record is written stays stopped", async () => {
+    const dir = harness();
+    const h = supervise(dir, {
+      whileRecording: (desired, ops) => {
+        if (desired === "stopped") ops.last()?.exit(1);
+      },
+    });
+    await h.supervisor.start();
+    expect(await h.supervisor.stop()).toMatchObject({ stopped: true, desired: "recorded" });
+    expect(h.supervisor.snapshot().state).toBe("stopped");
+    expect(h.clock.pendingCount()).toBe(0);
+    h.clock.advance(120_000);
+    await h.supervisor.idle();
+    expect(h.ops.children).toHaveLength(1);
+    expect(h.supervisor.snapshot().state).toBe("stopped");
+  });
+
+  test("a daemon that exits while a drain's record is written stays stopped", async () => {
+    const dir = harness();
+    const h = supervise(dir, {
+      whileRecording: (desired, ops) => {
+        if (desired === "stopped") ops.last()?.exit(1);
+      },
+    });
+    await h.supervisor.start();
+    const result = await h.supervisor.drain(async () => {
+      h.drains.count += 1;
+    });
+    expect(result).toMatchObject({ stopped: true, desired: "recorded" });
+    expect(h.drains.count).toBe(0);
+    expect(h.supervisor.snapshot().state).toBe("stopped");
+    expect(h.clock.pendingCount()).toBe(0);
+    h.clock.advance(120_000);
+    await h.supervisor.idle();
+    expect(h.ops.children).toHaveLength(1);
+    expect(h.supervisor.snapshot().state).toBe("stopped");
   });
 
   test("a record that cannot be written never blocks the start, and says so once", async () => {
