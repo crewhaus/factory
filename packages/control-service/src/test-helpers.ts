@@ -114,7 +114,7 @@ export type Rig = {
 /** A service over a temp Home and one temp harness, with a fake probe and supervisor. */
 export function rig(
   options: {
-    readonly mode?: "server" | "direct";
+    readonly mode?: "server" | "resident" | "direct";
     readonly pid?: number;
     readonly probe?: ReturnType<typeof fakeProbe>;
     readonly areas?: readonly AreaRuntime[];

@@ -295,6 +295,45 @@ function writeOne(
   return written.ok ? undefined : { harness: harness.id, reason: written.reason };
 }
 
+/**
+ * Whether any approver list is behind the snapshot right now: a governed harness whose
+ * file is absent, unreadable or holds other content than the snapshot gives at `now`
+ * (a group move, or a deciding credential past its end, changes that content), or a
+ * harness a grant has newly come to cover. A read: no lock, no write, one reader made for
+ * this call, so a file is read now. A harness whose directory is missing is not counted:
+ * no write could reach it.
+ */
+export function projectionsBehind(input: {
+  readonly root: string;
+  readonly snapshot: AccessSnapshot;
+  readonly harnesses: readonly AccessHarness[];
+  readonly now: number;
+}): boolean {
+  const { root, snapshot, now } = input;
+  if (snapshot.owner === undefined) return false;
+  const reader = createApproverReader({ now: () => now });
+  const homeUrl = ownerHomeUrl(root);
+  const governed = new Map(snapshot.governed.map((row) => [row.id, row]));
+  for (const harness of input.harnesses) {
+    if (!dirExists(harness.dir)) continue;
+    const row = governed.get(harness.id);
+    if (row === undefined) {
+      if (governsNow(snapshot, harness, now)) return true;
+      continue;
+    }
+    const current = reader(harness.dir);
+    if (current.state !== "present") return true;
+    const content = projectionContent(snapshot, harness, row.since, now, homeUrl);
+    if (
+      current.projection.harness !== harness.id ||
+      normalize(current.projection) !== normalize(content)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export type WriteProjectionsInput = {
   readonly root: string;
   readonly snapshot: AccessSnapshot;

@@ -726,15 +726,37 @@ export function deploymentIdOf(target: string): string | undefined {
 }
 
 /**
- * Did an activation happen? The deployment active with this receipt's id as its `cmd` is
- * `done`; still `prepared` is `not-done`; anything else is `unknown`.
+ * Did an activation happen? A receipt names the deployment it activates (`<hrn>/deployment/
+ * <dep_>`), or only the harness (Home's activate route targets `home/harness/<hrn>`):
+ *
+ * | Target | Deployments | Answer |
+ * |---|---|---|
+ * | a `dep_` | that one active with this receipt's id as its `cmd` | `done` |
+ * | a `dep_` | that one still `prepared` | `not-done` |
+ * | a `dep_` | anything else, or unreadable | `unknown` |
+ * | the harness | unreadable | `unknown` |
+ * | the harness | none recorded | `not-done` |
+ * | the harness | a record whose `cmd` is this receipt's id, whatever its later state | `done` |
+ * | the harness | no record carries it | `not-done` |
+ *
+ * The `cmd` is written in the same compare-and-set that activates, so a record carrying it
+ * was activated by this command. A harness with no live directory, and any other target,
+ * are `unknown`.
  */
 export function reconcileActivation(
   receipt: CommandReceipt,
-  ctx: { readonly harnessDir: string },
+  ctx: { readonly harnessDir: string | undefined },
 ): Reconciliation {
+  if (ctx.harnessDir === undefined) return "unknown";
   const dep = deploymentIdOf(receipt.target);
-  if (dep === undefined) return "unknown";
+  if (dep === undefined) {
+    const parsed = parseRef(receipt.target);
+    if ("error" in parsed || parsed.kind !== "harness") return "unknown";
+    const all = readDeployments(ctx.harnessDir);
+    if (all.state === "unreadable") return "unknown";
+    if (all.state === "absent") return "not-done";
+    return all.records.some((r) => r["cmd"] === receipt.id) ? "done" : "not-done";
+  }
   const read = readDeployments(ctx.harnessDir);
   if (read.state !== "present") return "unknown";
   const record = read.records.find((r) => r["id"] === dep);

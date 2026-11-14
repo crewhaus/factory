@@ -23,7 +23,7 @@
  */
 
 import { api } from "../api.js";
-import { clear, dot, el, emptyState, scrollRegion, skeleton, toast } from "../dom.js";
+import { clear, copyBtn, dot, el, emptyState, scrollRegion, skeleton, toast } from "../dom.js";
 import { notifications } from "../notify.js";
 import {
   applyPrefs,
@@ -303,6 +303,24 @@ function readOnlyCard(state) {
 // Notification rules
 // ---------------------------------------------------------------------------
 
+/**
+ * The one line that says notifications stop when this window closes, with the command
+ * that keeps them going, when Home is not running as the installed service. Said in
+ * words, never by colour alone.
+ */
+function notificationServiceLine(service) {
+  if (service === null || typeof service !== "object" || service.state === "running") return null;
+  const note =
+    typeof service.note === "string" && service.note !== ""
+      ? service.note
+      : "Install the service to get notifications while this window is closed";
+  const verb = typeof service.verb === "string" && service.verb !== "" ? service.verb : null;
+  return el("p", { class: "muted note notification-service" }, [
+    el("span", { text: note }),
+    ...(verb !== null ? [" ", el("code", { class: "mono", text: verb }), " ", copyBtn(verb)] : []),
+  ]);
+}
+
 function notificationCard(state, groupsPayload, reload) {
   const rules = Array.isArray(state?.rules) ? state.rules : [];
   const card = el("section", { class: "card" }, [
@@ -312,6 +330,8 @@ function notificationCard(state, groupsPayload, reload) {
       text: "Only parked approvals notify by default — everything else is visible on a screen you already open, so it waits for you to ask for it.",
     }),
   ]);
+  const serviceLine = notificationServiceLine(state?.service);
+  if (serviceLine !== null) card.appendChild(serviceLine);
   if (rules.length === 0) {
     card.appendChild(emptyState("No rules loaded", "crewhaus hangar serve"));
     return card;

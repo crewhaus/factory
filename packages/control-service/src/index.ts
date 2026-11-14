@@ -48,6 +48,7 @@ export {
   carriesCredential,
   createRules,
   createStandingRule,
+  endExpiredRules,
   legacyBroadAllows,
   revokeLegacyAllow,
   revokeStandingRule,
@@ -106,7 +107,12 @@ export {
   protectedEnvironmentGate,
   reconcileActivation,
 } from "./deployments";
-export { FINGERPRINT_LABEL, IDEMPOTENCY_TTL_MS, idempotencyClaim } from "./idempotency";
+export {
+  FINGERPRINT_LABEL,
+  IDEMPOTENCY_TTL_MS,
+  expireIdempotencyClaims,
+  idempotencyClaim,
+} from "./idempotency";
 export type { JobAdapter } from "./jobs";
 export {
   type LedgerChoice,
@@ -132,6 +138,7 @@ export {
   reconcileOperatorControl,
   recordDesired,
 } from "./operator-controls";
+export type { ReconcileCounts } from "./reconcile";
 export { type RecoverCounts, type RecoverScope, isJobReceipt } from "./recover";
 export {
   LIFECYCLE_FILE,
@@ -150,6 +157,8 @@ export {
   NEEDS_DECISION,
   NOT_STARTED_REBOOT,
   OUTCOME_MESSAGES,
+  RECONCILED_NOT_DONE,
+  SUPERSEDED,
   type Outcome,
   type OutcomeCode,
   outcomeOf,

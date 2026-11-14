@@ -62,6 +62,12 @@ export const NOT_STARTED_REBOOT: Outcome = Object.freeze({
   message: "not started: the machine restarted",
 });
 
+/** Recovery looked for the effect of a command it could not settle and found it did not happen. */
+export const RECONCILED_NOT_DONE: Outcome = Object.freeze({
+  code: "interrupted",
+  message: "not done: recovery found it did not happen",
+});
+
 /** A daemon command another daemon command on the same harness overtook: never run again. */
 export const SUPERSEDED: Outcome = Object.freeze({
   code: "interrupted",

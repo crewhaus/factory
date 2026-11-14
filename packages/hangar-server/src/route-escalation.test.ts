@@ -448,6 +448,8 @@ describe("handlers that escalate by what is asked", () => {
       ).id;
     const a = await register(aDir);
     const b = await register(bDir);
+    // Home's tick delivers both parked approvals into its queue.
+    await h.t.server.scheduler.tick();
     const harnessesIn = (body: Record<string, unknown>): string[] =>
       (body["inApp"] as Array<{ harnessId: string }>).map((d) => d.harnessId).sort();
     const first = await call(h, h.owner, "GET", "/api/notifications");

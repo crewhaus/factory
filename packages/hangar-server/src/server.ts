@@ -59,7 +59,7 @@
  * docblocks carry the write covenant each must honour.
  */
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { homedir, hostname as osHostname, userInfo } from "node:os";
+import { homedir, hostname as osHostname, uptime, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   type AccessSnapshotRead,
@@ -105,15 +105,18 @@ import {
 } from "@crewhaus/harness-registry";
 import {
   type GateDecision,
+  type RunfileObservation,
   SpawnPlanError,
   type StartResult,
   type StopResult,
   cliTwin,
   createProcessOps,
   isUnforceable,
+  observeRunfile,
   readRunfile,
   resolveBundle,
   runClassFor,
+  runfileExists,
   shellQuote,
 } from "@crewhaus/harness-supervisor";
 import { runPreflight } from "@crewhaus/preflight";
@@ -149,6 +152,7 @@ import {
   DEFAULT_ACTIVITY_WINDOW_MS,
   activityDigest,
   parseSince,
+  recoveryItems,
 } from "./activity";
 import {
   type ApprovalHarness,
@@ -172,6 +176,7 @@ import {
   type ControlResult,
   createControlClient,
   isControlLane,
+  knownControlPort,
 } from "./control-client";
 import { foldHarnessCosts } from "./costs";
 import { SHELL_HEADERS } from "./csp";
@@ -205,6 +210,7 @@ import {
 } from "./health";
 import { allowedHosts, hostAllowed, misdirected } from "./host-allowlist";
 import { HttpError, errResponse, json } from "./http";
+import { createIngress } from "./ingress";
 import {
   HOME_SOCKET,
   PROXY_SOCKET,
@@ -228,9 +234,12 @@ import {
   wikiView,
 } from "./memory";
 import {
+  type Delivery,
   type HarnessSignal,
+  MAX_INAPP_DELIVERIES,
   type NotificationCentre,
   type NotificationSinks,
+  type SuppressedEvent,
   createNotificationCentre,
   defaultNotificationSinks,
   deriveEvents,
@@ -263,6 +272,13 @@ import {
   jobArgv,
 } from "./process";
 import { isProofRunId, proofTenants, proofView } from "./proofs";
+import {
+  type HomeMode,
+  type RecoveryReport,
+  readRecoveryReport,
+  restartAfterReboot,
+  writeRecoveryReport,
+} from "./reboot-recovery";
 import { commandFields, createReceipts, currentCommand } from "./receipts";
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
@@ -277,6 +293,7 @@ import {
   safeSpawnEnvScrubber,
 } from "./runs";
 import { resolveInside } from "./safety";
+import { type SchedulerTimers, type TickReport, createSchedulerHost } from "./scheduler-host";
 import { buildSchedulersView, declaredCadences, dreamStates, readSpecYaml } from "./schedulers";
 import {
   isSessionId,
@@ -295,6 +312,14 @@ import {
 import { SIGN_IN_ROUTES, isSignInPath, serveSignIn } from "./sign-in-routes";
 import { BADGE_KEYS, capabilityBadges, specView } from "./spec-view";
 import { assetResponse } from "./static-cache";
+import type { HomePorts } from "./sweeps";
+import {
+  HOME_AREAS,
+  type HomeAreaRuntime,
+  homeCompositionProblems,
+  receiversOf,
+  sweepsOf,
+} from "./v1/areas";
 
 export type StaticAsset = {
   readonly body: string | Uint8Array;
@@ -372,6 +397,25 @@ export type HangarServerOptions = {
    *  `fetch` webhook POST); overridden in tests so the suite neither spawns
    *  `osascript` nor opens a socket. */
   readonly notificationSinks?: NotificationSinks;
+  /**
+   * Home in a window (`foreground`, the default) or as the installed service
+   * (`resident`, `crewhaus hangar serve --resident`). Only the service starts again,
+   * after the machine starts, the harnesses a person last started.
+   */
+  readonly mode?: HomeMode;
+  /** Whether the service is installed on this computer; the CLI knows, the server asks. */
+  readonly residentUnit?: () => "absent" | "installed";
+  /**
+   * A second loopback listener for the receivers the composition holds (`/hooks/…`). It
+   * binds only when this is set and at least one receiver is composed.
+   */
+  readonly ingress?: { readonly port: number };
+  /** The areas Home composes: its sweeps and receivers. Defaults to the shipped ones. */
+  readonly areas?: readonly HomeAreaRuntime[];
+  /** The timers Home's tick arms; injected in tests, which drive `scheduler.tick()`. */
+  readonly schedulerTimers?: SchedulerTimers;
+  /** When the machine last booted, epoch ms; injected in tests. */
+  readonly hostBootedAt?: () => number;
 };
 
 export type HangarServer = {
@@ -415,19 +459,21 @@ export type HangarServer = {
   openStreamChecks(): number;
   /**
    * Resolves once the boot sequence has run: port ledger open → `adopt()`
-   * per registered harness → `jobQueue.restore()`. `Bun.serve` binds
+   * per registered harness → `jobQueue.restore()` → command recovery → (the
+   * installed service only) the restarts after a reboot. It resolves with the
+   * report Home writes to `service/recovery.json`. `Bun.serve` binds
    * synchronously, so the socket is live before this settles; awaiting it
-   * is how a caller knows the process picture is accurate.
+   * is how a caller knows the process picture is accurate. Home's tick starts
+   * once it settles.
    */
-  readonly ready: Promise<{
-    readonly adopted: number;
-    readonly lost: number;
-    readonly jobs: number;
-    /** What command recovery did, after adoption and the job restore. */
-    readonly commands: RecoverCounts;
-  }>;
+  readonly ready: Promise<RecoveryReport>;
   /** The control service this server writes command receipts through. */
   readonly controlService: ReturnType<typeof wireControl>;
+  /** Home's tick: `tick()` runs every sweep that is due now, as the timer does; `idle()`
+   *  resolves once no sweep is running. */
+  readonly scheduler: { tick(): Promise<TickReport>; idle(): Promise<void> };
+  /** The ingress listener, when one is bound: loopback only. */
+  readonly ingress?: { readonly url: string; readonly hostname: string; readonly port: number };
   stop(): Promise<void>;
 };
 
@@ -535,6 +581,21 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     );
   }
 
+  // The installed service is always signed in, whatever a caller passes.
+  const homeMode: HomeMode = opts.mode === "resident" ? "resident" : "foreground";
+  if (homeMode === "resident" && noAuth) {
+    throw new Error("hangar-server: the installed service always runs with sign-in on");
+  }
+  // What the areas compose, checked before anything is written or bound.
+  const areas = opts.areas ?? HOME_AREAS;
+  const compositionRefused = homeCompositionProblems(areas);
+  if (compositionRefused.length > 0) {
+    throw new Error(
+      `hangar-server: Home's composition is refused:\n  ${compositionRefused.join("\n  ")}`,
+    );
+  }
+  const hostBootedAt = opts.hostBootedAt ?? (() => Date.now() - uptime() * 1000);
+
   // ---- signing in: the owner's settings, the sign-in handle, the Host allowlist ----
   // The owner's `access` and `links` blocks are read once, here; a block that is not
   // right refuses boot, because guessing at who Home may trust is worse than not starting.
@@ -633,6 +694,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       identity: currentLocalIdentity(),
       now,
       probe: withOwnStartTime(createProcessOps()),
+      hostBootedAt,
       onWarn,
       // A queued or recovered command runs only while its actor may still do it.
       authorizeActor: (actor, permission, target) => {
@@ -671,7 +733,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         return authorize(snapshot, { principal: actor }, permission, at, options).allow;
       },
     },
-    { mode: "server" },
+    { mode: homeMode === "resident" ? "resident" : "server" },
   );
 
   /** Who each `/api` request authenticated as, for the routes that care which credential. */
@@ -1306,22 +1368,78 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         } satisfies HarnessSignal;
       });
 
-  /** GET /api/notifications — rules + the badge, evaluated at poll time. */
-  const notificationsView = (): unknown => {
+  /** How long a delivery stays in `delivered`: two of the console's polls. */
+  const DELIVERED_KEPT_MS = 60_000;
+  /** The deliveries of recent ticks, newest first, and the last tick's suppressions. */
+  let recentDeliveries: Delivery[] = [];
+  let lastSuppressed: readonly SuppressedEvent[] = [];
+
+  /**
+   * One notifications tick: evaluate the rules over the fleet and deliver what is due, on
+   * the sinks people turned on. Runs on Home's tick, under the `notifications` sweep's
+   * own system principal, and after a write to the rules; never on a read.
+   */
+  const notificationsTick = (): void => {
     const current = settings.get().notifications;
-    const events = deriveEvents(fleetSignals());
     const result = notifications.poll(
       {
         rules: current.rules,
         quietHours: current.quietHours,
         mutedGroups: current.mutedGroups,
-        events,
+        events: deriveEvents(fleetSignals()),
         nowMs: now(),
       },
       current.webhookUrl,
     );
+    const keptFrom = now() - DELIVERED_KEPT_MS;
+    recentDeliveries = [...result.deliveries, ...recentDeliveries]
+      .filter((d) => Date.parse(d.at) >= keptFrom)
+      .slice(0, MAX_INAPP_DELIVERIES);
+    lastSuppressed = result.suppressed;
+  };
+
+  /** Whether Home keeps delivering with this window closed: the installed service's state. */
+  const serviceView = (): {
+    readonly present: boolean;
+    readonly state: "running" | "installed" | "absent";
+    readonly note: string;
+    readonly verb: string | null;
+  } => {
+    if (homeMode === "resident") {
+      return {
+        present: true,
+        state: "running",
+        note: "Home is running as a service: notifications arrive while this window is closed",
+        verb: null,
+      };
+    }
+    let unit: "absent" | "installed" = "absent";
+    try {
+      unit = opts.residentUnit?.() ?? "absent";
+    } catch {
+      unit = "absent";
+    }
+    return unit === "installed"
+      ? {
+          present: true,
+          state: "installed",
+          note: "The service is installed but not running here: notifications stop when this window closes",
+          verb: "crewhaus hangar status",
+        }
+      : {
+          present: false,
+          state: "absent",
+          note: "Install the service to get notifications while this window is closed",
+          verb: "crewhaus hangar install",
+        };
+  };
+
+  /** GET /api/notifications — the rules, the badge and what Home's tick delivered. A read. */
+  const notificationsView = (): unknown => {
+    const current = settings.get().notifications;
     // The queue is Home's: each reader sees the entries about harnesses it may read.
     const inApp = notifications.inApp().filter((d) => visibleToRequest(d.harnessId));
+    const keptFrom = now() - DELIVERED_KEPT_MS;
     return {
       rules: current.rules,
       quietHours: current.quietHours,
@@ -1331,15 +1449,19 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
        *  that cannot fire here is visibly unusable rather than a checkbox
        *  the operator ticks into silence. */
       sinkAvailability: notifications.availability(current.webhookUrl),
-      /** Fired on THIS poll — the toast list. Each delivery's `sinks` names
-       *  the sinks that actually carried it, never the ones asked for. */
-      delivered: result.deliveries.filter((d) => visibleToRequest(d.harnessId)),
-      /** Events that did not notify, with the reason — a silent rule is
+      /** What Home's recent ticks delivered, newest first, each with its tick's `at`: the
+       *  toast list. Each delivery's `sinks` names the sinks that actually carried it. */
+      delivered: recentDeliveries.filter(
+        (d) => Date.parse(d.at) >= keptFrom && visibleToRequest(d.harnessId),
+      ),
+      /** What the last tick did not deliver, with the reason — a silent rule is
        *  always explainable from the screen. */
-      suppressed: result.suppressed.filter((d) => visibleToRequest(d.harnessId)),
+      suppressed: lastSuppressed.filter((d) => visibleToRequest(d.harnessId)),
       /** The badge queue, newest first. */
       inApp,
       badge: inApp.length,
+      /** Whether delivery goes on with this window closed. */
+      service: serviceView(),
       /** No CLI verb shows the same thing yet; said as `null`, never a near-miss. */
       cliTwin: null,
     };
@@ -1373,17 +1495,12 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
   /**
    * The supervision handle for a harness, RE-ATTACHED to a daemon this
-   * manager did not spawn.
-   *
-   * Adoption at boot only sees the daemons that existed at that instant. A
-   * daemon started from a terminal, by a launchd unit, or for a harness
-   * registered after boot is otherwise invisible: the supervisor holds no
-   * pid, so `/proc` reports `stopped` while the same payload's runfile
-   * carries a live one, and stop/drain would return "stopped" having sent no
-   * signal and made no control call. `adoptIfRunfile()` is the cheap guard
-   * for that — it returns immediately unless a runfile exists AND this
-   * supervisor holds no pid — so it belongs on the request path, which is
-   * exactly what `crewhaus daemon stop` already does before every signal.
+   * manager did not spawn: adopt-before-act, for every path that changes a
+   * process. A daemon started from a terminal, by a launchd unit, or for a
+   * harness registered after boot is attached here before Home signals it,
+   * exactly as `crewhaus daemon stop` does. `adoptIfRunfile()` returns at once
+   * unless a runfile exists AND this supervisor holds no pid. Reads use
+   * {@link observedFor}; Home's tick attaches what reads only observe.
    */
   const processFor = async (entry: HangarHarnessEntry): Promise<HarnessProcess> => {
     liveDirOr404(entry);
@@ -1400,6 +1517,25 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       );
     }
     return handle;
+  };
+
+  /**
+   * The supervision handle for a read: never adopts, clears or patches anything. What
+   * the runfile says is observed (`observeRunfile`, the check adoption makes) and shown
+   * beside the supervisor's own picture; the next tick attaches a live one.
+   */
+  const observedFor = (
+    entry: HangarHarnessEntry,
+  ): { readonly handle: HarnessProcess; readonly observed: RunfileObservation } => {
+    liveDirOr404(entry);
+    const handle = processes.get(entry);
+    let observed: RunfileObservation = { state: "none" };
+    try {
+      observed = observeRunfile(handle.harnessDir, processes.ops);
+    } catch {
+      observed = { state: "none" };
+    }
+    return { handle, observed };
   };
 
   /**
@@ -1466,10 +1602,18 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     };
   };
 
-  const procView = (entry: HangarHarnessEntry, handle: HarnessProcess): Record<string, unknown> => {
+  const procView = (
+    entry: HangarHarnessEntry,
+    handle: HarnessProcess,
+    observed?: RunfileObservation,
+  ): Record<string, unknown> => {
     const dir = handle.harnessDir;
     const snapshot = handle.snapshot();
     const runfile = readRunfile(dir) ?? null;
+    // Whether this Home holds the process. A live runfile it does not hold yet is shown
+    // running, from the runfile, until the next tick attaches it.
+    const attached = snapshot.pid !== undefined;
+    const seen = !attached && observed?.state === "live" ? observed.runfile : undefined;
     const bundle = resolveBundle(dir, handle.target);
     const controlPort = handle.controlPort() ?? null;
     // Plan-building is a filesystem probe, not a spawn. `cliTwin` is the
@@ -1506,12 +1650,14 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       id: entry.id,
       target: handle.target,
       runClass: runClassFor(handle.target),
-      state: snapshot.state,
-      runId: snapshot.runId ?? null,
-      pid: snapshot.pid ?? null,
-      startedAt: snapshot.startedAt ?? null,
+      state: seen !== undefined ? "running" : snapshot.state,
+      runId: seen?.runId ?? snapshot.runId ?? null,
+      pid: seen?.pid ?? snapshot.pid ?? null,
+      startedAt: seen?.startedAt ?? snapshot.startedAt ?? null,
       sessionId: snapshot.sessionId ?? null,
       adopted: snapshot.adopted === true,
+      attached,
+      note: seen !== undefined ? "running (not attached): Home attaches on its next check" : null,
       draining: handle.isDraining(),
       restartsInWindow: snapshot.restartsInWindow,
       nextRestartAtMs: snapshot.nextRestartAtMs ?? null,
@@ -1746,15 +1892,29 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     return state === "running" || state === "draining";
   };
 
+  /**
+   * Where a control call reaches the daemon: the port this Home holds for it, or, for a
+   * read of a daemon it has not attached yet, the port its live runfile records.
+   */
   const controlTarget = (
     handle: HarnessProcess,
+    observed?: RunfileObservation,
   ): {
     harnessDir: string;
     controlPort: number | undefined;
-  } => ({ harnessDir: handle.harnessDir, controlPort: handle.controlPort() });
+  } => {
+    const seen =
+      observed?.state === "live" && handle.snapshot().pid === undefined
+        ? knownControlPort(observed.runfile.controlPort)
+        : undefined;
+    return { harnessDir: handle.harnessDir, controlPort: seen ?? handle.controlPort() };
+  };
 
-  const schedulersFor = async (handle: HarnessProcess): Promise<unknown> => {
-    const status = await control.status(controlTarget(handle));
+  const schedulersFor = async (
+    handle: HarnessProcess,
+    observed?: RunfileObservation,
+  ): Promise<unknown> => {
+    const status = await control.status(controlTarget(handle, observed));
     return buildSchedulersView({
       harnessDir: handle.harnessDir,
       specYaml: readSpecYaml(handle.harnessDir),
@@ -1865,6 +2025,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       },
       process: async () => {
         if (entry === null) throw new HttpError(400, "not a per-harness route");
+        // A read never attaches: only a route that acts adopts before it acts.
+        if (req.method === "GET" || req.method === "HEAD") return observedFor(entry).handle;
         return await processFor(entry);
       },
       control,
@@ -2314,11 +2476,12 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (method !== "GET") throw new HttpError(405, "method not allowed");
 
     if (head === "proc" && tail.length === 0) {
-      const handle = await processFor(entry);
+      // A read: it observes the runfile and attaches nothing.
+      const { handle, observed } = observedFor(entry);
       // maskDeep on the way out: the runfile and the plan preview carry
       // operator-supplied strings (env overrides, a bundle path, a control
       // token PATH) that no route should be trusted to have pre-filtered.
-      return jsonMasked(procView(entry, handle));
+      return jsonMasked(procView(entry, handle, observed));
     }
     if (head === "runs" && tail.length === 0) {
       return jsonMasked(runsView(liveDirOr404(entry)));
@@ -2327,7 +2490,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const runId = tail[0] as string;
       if (!isSupervisorRunId(runId)) throw new HttpError(400, "invalid run id");
       const dir = liveDirOr404(entry);
-      const handle = await processFor(entry);
+      const { handle } = observedFor(entry);
       const snapshot = handle.snapshot();
       // Every state the pump still serves, not just `running`: a drain can
       // take ~30 s, and "watch the live run" is what the operator clicks the
@@ -2361,12 +2524,12 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       });
     }
     if (head === "control" && tail.length === 1 && tail[0] === "status") {
-      return jsonMasked(
-        controlEnvelope(await control.status(controlTarget(await processFor(entry)))),
-      );
+      const { handle, observed } = observedFor(entry);
+      return jsonMasked(controlEnvelope(await control.status(controlTarget(handle, observed))));
     }
     if (head === "schedulers" && tail.length === 0) {
-      return jsonMasked(await schedulersFor(await processFor(entry)));
+      const { handle, observed } = observedFor(entry);
+      return jsonMasked(await schedulersFor(handle, observed));
     }
     if (head === "deployments" && tail.length === 0) {
       return jsonMasked(deploymentsView(liveDirOr404(entry)));
@@ -2829,6 +2992,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         } catch (err) {
           throw new HttpError(400, err instanceof Error ? err.message : String(err));
         }
+        // A write to the rules: one notifications tick runs before the answer, so the
+        // screen shows what the rules just saved deliver.
+        await scheduler.runNow("notifications");
         return json(maskDeep(notificationsView(), fleetScrub()));
       }
       throw new HttpError(405, "method not allowed");
@@ -2942,7 +3108,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (head === "activity" && rest.length === 0) {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       const since = parseSince(url.searchParams.get("since"), now(), DEFAULT_ACTIVITY_WINDOW_MS);
-      return json(maskDeep(activityDigest(liveHarnesses(), since), fleetScrub()));
+      const harnesses = liveHarnesses();
+      const recovered = recoveryItems(readRecoveryReport(hangarRoot), harnesses, since);
+      return json(maskDeep(activityDigest(harnesses, since, recovered), fleetScrub()));
     }
 
     if (head === "jobs" && rest.length === 0) {
@@ -3214,6 +3382,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     const url = new URL(req.url);
     const pathname = url.pathname;
     if (pathname === "/healthz") return json({ ok: true });
+    // Receivers answer on the ingress listener only, never here.
+    if (pathname === "/hooks" || pathname.startsWith("/hooks/"))
+      return errResponse(404, "not found");
 
     // Before everything else, a boot link and a static file included: a name this Home
     // does not answer to is a page that rebound its own name to this address.
@@ -3336,6 +3507,34 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     return serveStatic(req, pathname);
   };
 
+  // ---- Home's tick: the composed sweeps, while Home runs --------------------
+  const homePorts: HomePorts = {
+    hangarRoot,
+    liveHarnesses: () => liveHarnesses().map((h) => ({ id: h.id, dir: h.dir })),
+    accessHarnesses: () =>
+      registry.list().map((entry) => ({ id: entry.id, dir: entry.dir, groups: entry.groups })),
+    adoptIfRunfile: async (dir) => {
+      // Only a harness with a runfile can have anything to attach.
+      if (!runfileExists(dir)) return;
+      const entry = registry.list().find((row) => row.dir === dir);
+      if (entry === undefined) return;
+      await processes.get(entry).supervisor.adoptIfRunfile();
+    },
+    control: {
+      recover: (scope) => controlService.commands.recover(scope),
+      reconcile: (scope) => controlService.commands.reconcile(scope),
+    },
+    notificationsTick,
+  };
+  const scheduler = createSchedulerHost<HomePorts>({
+    now,
+    home: homePorts,
+    jobs: processes.jobs,
+    onWarn,
+    ...(opts.schedulerTimers !== undefined ? { timers: opts.schedulerTimers } : {}),
+  });
+  for (const sweep of sweepsOf(areas)) scheduler.register(sweep);
+
   const tcpPeer = (
     req: Request,
     srv: { requestIP(r: Request): { address: string } | null },
@@ -3414,6 +3613,23 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "hangar-server: the trusted proxy's socket could not be created — the proxy cannot reach Home",
     );
   }
+  // ---- receivers: a loopback listener of their own, never the console's -----
+  const receivers = receiversOf(areas);
+  const ingressPort = opts.ingress?.port;
+  const ingress =
+    ingressPort !== undefined && receivers.length > 0
+      ? createIngress({ hangarRoot, receivers, control: controlService, now, onWarn })
+      : undefined;
+  const ingressServer =
+    ingress === undefined
+      ? undefined
+      : Bun.serve({
+          port: ingressPort,
+          hostname: "127.0.0.1",
+          development: false,
+          fetch: (req) => withRequestAccess(systemAccess("ingress"), () => ingress.fetch(req)),
+        });
+
   // Live run streams opened with a session close when it ends.
   let stopped = false;
   const sessionTimer = setInterval(checkStreams, SESSION_CHECK_MS);
@@ -3446,7 +3662,53 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         );
         return { redispatched: 0, reconciled: 0, unknown: 0 };
       }),
-    }));
+    }))
+    // Then, in the installed service only, what a person last started comes back; and
+    // both modes leave the report.
+    .then(async (booted): Promise<RecoveryReport> => {
+      const none = { restarted: [], skipped: [], failed: [] };
+      const outcome =
+        homeMode === "resident"
+          ? await withRequestAccess(systemAccess("reboot-recovery"), () =>
+              restartAfterReboot({
+                entries: registry
+                  .list()
+                  .filter((entry) => entry.missingSince === null && existsSync(entry.dir)),
+                processes,
+                ops: processes.ops,
+                now,
+              }),
+            ).catch((err) => {
+              onWarn(
+                `hangar-server: reboot recovery failed: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              return none;
+            })
+          : none;
+      const report: RecoveryReport = {
+        v: 1,
+        at: new Date(now()).toISOString(),
+        mode: homeMode,
+        hostBootedAt: new Date(hostBootedAt()).toISOString(),
+        adopted: booted.adopted,
+        lost: booted.lost,
+        jobs: booted.jobs,
+        commands: booted.commands,
+        ...outcome,
+      };
+      try {
+        writeRecoveryReport(hangarRoot, report);
+      } catch (err) {
+        onWarn(
+          `hangar-server: the recovery report could not be written: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      return report;
+    });
+  // Home's tick starts once the boot sequence has settled, in both modes.
+  void ready.then(() => {
+    if (!stopped) scheduler.start();
+  });
 
   return {
     url: `http://${hostname}:${boundPort}`,
@@ -3467,9 +3729,24 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     checkSessions: checkStreams,
     openStreamChecks: () => streamChecks.size,
     ready,
+    scheduler: { tick: () => scheduler.tick(), idle: () => scheduler.idle() },
+    ...(ingressServer !== undefined
+      ? {
+          ingress: {
+            url: `http://127.0.0.1:${ingressServer.port ?? 0}`,
+            hostname: "127.0.0.1",
+            port: ingressServer.port ?? 0,
+          },
+        }
+      : {}),
     stop: async () => {
       if (stopped) return;
       stopped = true;
+      // The tick first, before any listener or supervisor goes: a sweep in flight ends.
+      scheduler.stop();
+      await scheduler.idle();
+      await ingressServer?.stop(true);
+      await ingress?.idle();
       // Release timers and subscriptions; the CHILDREN are deliberately left
       // alone. A detached daemon outliving its manager is the whole point of
       // the runfile — the next boot adopts it.

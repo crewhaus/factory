@@ -69,7 +69,7 @@
  * Bad arguments throw plain `Error`s; the entry file routes them through
  * `die()` like `harness` does.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -78,7 +78,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { networkInterfaces } from "node:os";
+import { homedir, networkInterfaces, userInfo } from "node:os";
 import { join } from "node:path";
 import {
   HOME_SOCKET,
@@ -86,6 +86,13 @@ import {
   loadAccessSnapshot,
   noAuthRefusal,
 } from "@crewhaus/access-control";
+import { EXIT_FOR_ERROR } from "@crewhaus/control-contract";
+import {
+  currentLocalIdentity,
+  outcomeOf,
+  wireControl,
+  withOwnStartTime,
+} from "@crewhaus/control-service";
 import {
   DEFAULT_HANGAR_PORT,
   type HangarServer,
@@ -101,6 +108,7 @@ import {
 } from "@crewhaus/harness-registry";
 import {
   type ShutdownSupervisor,
+  createProcessOps,
   homeCrewhausArgv,
   runManagerShutdown,
   shutdownReportLines,
@@ -109,6 +117,13 @@ import { encodeQr, renderQrLines, renderedWidth } from "@crewhaus/qr-code";
 import { inviteAsLocalUser } from "./access-cmd";
 import { dotenvRootRefusal } from "./hangar-env";
 import { rotateTokenVerb } from "./hangar-rotate";
+import {
+  type ServiceDeps,
+  install as installService,
+  readLastRecovery,
+  residentState,
+  uninstall as uninstallService,
+} from "./hangar-service";
 import { assetSmokeCheck, problemSummary } from "./hangar-smoke";
 import {
   type InterfaceMap,
@@ -125,7 +140,8 @@ import { cliVersion } from "./version";
  *  back empty. */
 export type HangarCommandResult = {
   readonly lines: readonly string[];
-  readonly exitCode: 0 | 1;
+  /** 0, 1, or a control-plane exit (53 conflict, 54 unsupported, 55 invalid). */
+  readonly exitCode: number;
 };
 
 export type HangarCommandOptions = {
@@ -177,6 +193,11 @@ export type HangarCommandOptions = {
   readonly readFile?: (path: string) => string | undefined;
   /** The OS user acting (`rotate-token`); `os.userInfo()` and `os.hostname()` by default. */
   readonly identity?: LocalIdentity;
+  /**
+   * The installed service's seams (`install`, `uninstall`, `status`): the platform, home
+   * directory, PATH lookup, command runner and the rest. Each defaults to the real one.
+   */
+  readonly service?: Partial<ServiceDeps>;
 };
 
 const HANGAR_USAGE_LINES: readonly string[] = [
@@ -194,6 +215,9 @@ const HANGAR_USAGE_LINES: readonly string[] = [
   "  crewhaus hangar qr [--ascii] [--no-color]    a fresh invite QR code for the running console",
   "  crewhaus hangar rotate-token [--socket-only | --tcp]",
   "                                               replace Home's own key",
+  "  crewhaus hangar install [--yes]              run Home as a service that starts when you",
+  "                                               sign in and needs no open window",
+  "  crewhaus hangar uninstall [--yes]            stop and remove that service, keeping your data",
   "",
   "  The console binds 127.0.0.1:4200 by default. A browser on this computer",
   "  signs in through a one-time link that `crewhaus hangar` and",
@@ -228,6 +252,11 @@ const HANGAR_USAGE_LINES: readonly string[] = [
   "  from your shell only, never from a .env file.",
   "  One instance per hangar root: <hangarRoot>/hangar.lock (stale locks",
   "  from dead pids are replaced automatically).",
+  "  install shows the file it writes and the commands it runs, then asks",
+  "  (--yes skips the question). The service runs `crewhaus hangar serve",
+  "  --resident`: sign-in is always on, it opens no browser, and after the",
+  "  machine starts it restarts only the harnesses a person last started.",
+  "  `crewhaus hangar` opens it when it is running.",
 ];
 
 // ---------------------------------------------------------------------------
@@ -241,7 +270,16 @@ export type HangarLock = {
   readonly startedAt: string;
   readonly port: number;
   readonly url: string;
+  /** Home in a window, or the installed service. A lock without one is a window's. */
+  readonly mode?: "foreground" | "resident";
+  /** The `crewhaus` version that holds it, when it said. */
+  readonly version?: string;
 };
+
+/** What a lock says it is: one written before the service existed is a window's. */
+export function lockMode(lock: HangarLock): "foreground" | "resident" {
+  return lock.mode === "resident" ? "resident" : "foreground";
+}
 
 export type LockAcquisition =
   | { readonly ok: true; readonly staleNote?: string }
@@ -270,11 +308,15 @@ export function readHangarLock(hangarRoot: string): HangarLock | undefined {
     >;
     const pid = raw["pid"];
     if (typeof pid !== "number" || !Number.isInteger(pid)) return undefined;
+    const mode = raw["mode"];
+    const version = raw["version"];
     return {
       pid,
       startedAt: typeof raw["startedAt"] === "string" ? raw["startedAt"] : "",
       port: typeof raw["port"] === "number" ? raw["port"] : 0,
       url: typeof raw["url"] === "string" ? raw["url"] : "",
+      ...(mode === "resident" || mode === "foreground" ? { mode } : {}),
+      ...(typeof version === "string" ? { version } : {}),
     };
   } catch {
     return undefined;
@@ -403,12 +445,15 @@ export const CLI_FAMILY = {
         "read-only": "boolean",
         "read-only-locked": "boolean",
         "allow-host": "values",
+        resident: "boolean",
       },
     },
     status: { flags: { json: "boolean" } },
     open: { flags: { print: "boolean" } },
     qr: { flags: { ascii: "boolean", "no-color": "boolean" } },
     "rotate-token": { flags: { "socket-only": "boolean", tcp: "boolean" } },
+    install: { flags: { yes: "boolean" } },
+    uninstall: { flags: { yes: "boolean" } },
   },
 } as const satisfies CliFamily;
 
@@ -588,7 +633,27 @@ type ServeFlags = {
   readonly lanRole: LanRole;
   /** More names Home answers to (`--allow-host`, repeatable). */
   readonly allowHosts: readonly string[];
+  /** Run as the installed service: sign-in on, no browser, no QR, reboot recovery. */
+  readonly resident: boolean;
 };
+
+/** The flags the installed service refuses: it is always signed in, local and writable. */
+const RESIDENT_REFUSED_FLAGS = [
+  "no-auth",
+  "lan",
+  "smoke",
+  "read-only",
+  "read-only-locked",
+] as const;
+
+/** Why `serve --resident` refuses these flags, or `undefined` when it does not. */
+function residentFlagRefusal(argv: readonly string[]): string | undefined {
+  const args = parseVerbArgs("serve", argv, CLI_FAMILY.sub.serve.flags);
+  if (args.flags.get("resident") !== true) return undefined;
+  const refused = RESIDENT_REFUSED_FLAGS.filter((flag) => args.flags.get(flag) === true);
+  if (refused.length === 0) return undefined;
+  return `hangar serve --resident: the service always runs with sign-in on, on this computer, and writable — drop ${refused.map((flag) => `--${flag}`).join(", ")}`;
+}
 
 function parseServeFlags(argv: readonly string[]): ServeFlags {
   const args = parseVerbArgs("serve", argv, CLI_FAMILY.sub.serve.flags);
@@ -637,6 +702,7 @@ function parseServeFlags(argv: readonly string[]): ServeFlags {
     readOnly: readOnlyLocked || args.flags.get("read-only") === true,
     readOnlyLocked,
     allowHosts,
+    resident: args.flags.get("resident") === true,
   };
   if (flags.lan && flags.host !== undefined) {
     throw new Error(
@@ -932,9 +998,12 @@ function summaryLines(
   server: HangarServer,
   harnessCount: number | undefined,
   lan: LanAddress | undefined,
+  resident = false,
 ): string[] {
   const rows: Array<[string, string]> = [["url", server.loopbackUrl ?? server.url]];
-  if (lan !== undefined) {
+  if (resident) {
+    rows.push(["mode", "the installed service: `crewhaus hangar` opens it"]);
+  } else if (lan !== undefined) {
     rows.push([
       "network",
       `${server.url} on ${lan.interfaceName} — every device on this network can reach this console over plain HTTP`,
@@ -1009,6 +1078,10 @@ async function hangarServe(
   argv: readonly string[],
   opts: HangarCommandOptions,
 ): Promise<HangarCommandResult> {
+  const residentRefusal = residentFlagRefusal(argv);
+  if (residentRefusal !== undefined) {
+    return { lines: [residentRefusal], exitCode: EXIT_FOR_ERROR.invalid };
+  }
   const flags = parseServeFlags(argv);
   refuseDotenvRoots(opts);
   const env = opts.env ?? process.env;
@@ -1041,9 +1114,17 @@ async function hangarServe(
       `hangar is already running at ${existing.url !== "" ? existing.url : "an unknown url"} (pid ${existing.pid}) — use \`crewhaus hangar open\`, or stop that instance first`,
     );
 
-  // Fail fast BEFORE booting anything when a live instance holds the lock.
+  // Fail fast BEFORE booting anything when a live instance holds the lock. The installed
+  // service is the Home a window would show: `crewhaus hangar` opens it.
   const existing = readHangarLock(hangarRoot);
   if (existing !== undefined && existing.pid !== pid && isPidAlive(existing.pid)) {
+    if (lockMode(existing) === "resident" && !flags.resident && !flags.smoke) {
+      const opened = await hangarOpen([], opts);
+      return {
+        lines: [`Home is running as a service at ${existing.url}`, ...opened.lines],
+        exitCode: opened.exitCode,
+      };
+    }
     throw alreadyRunning(existing);
   }
 
@@ -1063,7 +1144,10 @@ async function hangarServe(
   // Only the real server runs jobs with this process's own entry; a host that injects its
   // own server (tests) runs another program as `Bun.main`.
   const homeCrewhaus = opts.startServer === undefined ? ownCrewhausArgv(hangarRoot) : undefined;
+  const service = serviceDepsOf(opts, hangarRoot);
   const server = (opts.startServer ?? startHangarServer)({
+    ...(flags.resident ? { mode: "resident" as const } : {}),
+    residentUnit: () => residentState(service).state,
     port: flags.smoke ? 0 : (flags.port ?? DEFAULT_HANGAR_PORT),
     ...(lan !== undefined ? { hostname: lan.address, lanHost: lan.address } : {}),
     ...(flags.host !== undefined ? { hostname: flags.host } : {}),
@@ -1083,7 +1167,14 @@ async function hangarServe(
   // this a formality, but a boot race still resolves to exactly one winner.
   const acquired = acquireHangarLock(
     hangarRoot,
-    { pid, startedAt: new Date(now()).toISOString(), port: server.port, url: server.url },
+    {
+      pid,
+      startedAt: new Date(now()).toISOString(),
+      port: server.port,
+      url: server.url,
+      mode: flags.resident ? "resident" : "foreground",
+      ...(version !== undefined ? { version } : {}),
+    },
     isPidAlive,
   );
   if (!acquired.ok) {
@@ -1119,7 +1210,9 @@ async function hangarServe(
     return { lines: [], exitCode };
   }
 
-  for (const line of summaryLines(server, registry?.list().length, lan)) write(line);
+  for (const line of summaryLines(server, registry?.list().length, lan, flags.resident)) {
+    write(line);
+  }
   // The QR goes last so it sits next to the shell prompt, which is the
   // easiest place on the screen to point a phone at. It encodes a single-use
   // invite that works for 10 minutes; `crewhaus hangar qr` makes another.
@@ -1138,7 +1231,8 @@ async function hangarServe(
     }
     write("");
   }
-  if (!flags.noOpen) {
+  // The service has no one at a screen: it opens nothing, and `crewhaus hangar` opens it.
+  if (!flags.noOpen && !flags.resident) {
     (opts.openBrowser ?? openInBrowser)(
       handoffUrl(server.loopbackUrl ?? server.url, server.bootPath),
     );
@@ -1183,6 +1277,105 @@ async function hangarServe(
 }
 
 // ---------------------------------------------------------------------------
+// the installed service
+// ---------------------------------------------------------------------------
+
+/** One y/N question at the terminal. */
+async function confirmAtTerminal(question: string): Promise<boolean> {
+  const { createInterface } = await import("node:readline");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await new Promise<string>((resolve) =>
+      rl.question(`${question} [y/N] `, resolve),
+    );
+    return /^y(es)?$/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/** The service's seams, each the real one unless a caller injected it. */
+function serviceDepsOf(opts: HangarCommandOptions, hangarRoot: string): ServiceDeps {
+  const env = opts.env ?? process.env;
+  const given = opts.service ?? {};
+  const write = opts.write ?? ((line: string) => process.stdout.write(`${line}\n`));
+  let control: ReturnType<typeof wireControl> | undefined;
+  return {
+    platform: given.platform ?? process.platform,
+    homedir: given.homedir ?? env["HOME"] ?? homedir(),
+    uid: given.uid ?? process.getuid?.() ?? 0,
+    username:
+      given.username ??
+      (() => {
+        try {
+          return userInfo().username;
+        } catch {
+          return env["USER"] ?? env["USERNAME"] ?? "";
+        }
+      })(),
+    env,
+    hangarRoot,
+    which: given.which ?? ((name) => Bun.which(name, { PATH: env["PATH"] ?? "" }) ?? undefined),
+    ...(given.isExecutable !== undefined ? { isExecutable: given.isExecutable } : {}),
+    runner:
+      given.runner ??
+      ((argv) => {
+        const [program, ...rest] = argv;
+        const ran = spawnSync(program ?? "", rest, { encoding: "utf8" });
+        return { code: ran.status ?? 1, stdout: ran.stdout ?? "", stderr: ran.stderr ?? "" };
+      }),
+    write: given.write ?? write,
+    isTty: given.isTty ?? (process.stdin.isTTY === true && process.stdout.isTTY === true),
+    confirm: given.confirm ?? confirmAtTerminal,
+    receipt:
+      given.receipt ??
+      (async (kind, effect) => {
+        control ??= wireControl(
+          {
+            hangarRoot,
+            identity: opts.identity ?? currentLocalIdentity(),
+            ...(opts.now !== undefined ? { now: opts.now } : {}),
+            probe: withOwnStartTime(createProcessOps()),
+            supervisorFor: () => undefined,
+            drainRequest: () => async () => undefined,
+          },
+          { mode: "direct" },
+        );
+        const answer = await control.commands.submit(
+          { kind, ledger: "workspace", via: "cli" },
+          async () =>
+            (await effect())
+              ? { settle: { state: "succeeded" as const }, value: undefined }
+              : {
+                  settle: { state: "failed" as const, outcome: outcomeOf("internal") },
+                  value: undefined,
+                },
+        );
+        return answer.ok
+          ? { ok: true as const, id: answer.receipt.id }
+          : { ok: false as const, message: answer.refusal.message };
+      }),
+  };
+}
+
+async function hangarInstall(
+  verb: "install" | "uninstall",
+  argv: readonly string[],
+  opts: HangarCommandOptions,
+): Promise<HangarCommandResult> {
+  const args = parseVerbArgs(verb, argv, CLI_FAMILY.sub[verb].flags);
+  if (args.positional.length > 0) {
+    throw new Error(`hangar ${verb}: unexpected argument "${args.positional[0]}"`);
+  }
+  refuseDotenvRoots(opts);
+  const deps = serviceDepsOf(opts, resolveHangarRoot(opts.env ?? process.env));
+  const yes = args.flags.get("yes") === true;
+  return verb === "install"
+    ? await installService(deps, { yes })
+    : await uninstallService(deps, { yes });
+}
+
+// ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------
 
@@ -1199,6 +1392,10 @@ function hangarStatus(argv: readonly string[], opts: HangarCommandOptions): Hang
   const harnessCount = registry !== undefined ? registry.list().length : undefined;
   const tokenPath = join(hangarRoot, TOKEN_FILENAME);
   const tokenPresent = existsSync(tokenPath);
+  const unit = residentState(serviceDepsOf(opts, hangarRoot));
+  const residentLive = running && lock !== undefined && lockMode(lock) === "resident";
+  const resident = residentLive ? "running" : unit.state;
+  const lastRecovery = readLastRecovery(hangarRoot);
 
   if (args.flags.get("json") === true) {
     return {
@@ -1214,6 +1411,26 @@ function hangarStatus(argv: readonly string[], opts: HangarCommandOptions): Hang
         harnessCount: harnessCount ?? null,
         tokenPath,
         tokenPresent,
+        resident: {
+          state: resident,
+          unitPath: unit.unitPath ?? null,
+          ...(residentLive && lock !== undefined
+            ? {
+                pid: lock.pid,
+                port: lock.port,
+                ...(lock.version !== undefined ? { version: lock.version } : {}),
+              }
+            : {}),
+          ...(lastRecovery !== undefined
+            ? {
+                lastRecovery: {
+                  at: lastRecovery.at,
+                  restarted: lastRecovery.restarted,
+                  skipped: lastRecovery.skipped,
+                },
+              }
+            : {}),
+        },
       }),
       exitCode: 0,
     };
@@ -1248,6 +1465,22 @@ function hangarStatus(argv: readonly string[], opts: HangarCommandOptions): Hang
       ? `key: ${tokenPath} (Home's own key; it stays on this computer)`
       : `key: none minted yet (${tokenPath})`,
   );
+  if (resident === "running" && lock !== undefined) {
+    lines.push(
+      `resident: running (pid ${lock.pid}, port ${lock.port}${lock.version !== undefined ? `, version ${lock.version}` : ""})`,
+    );
+  } else if (resident === "installed") {
+    lines.push(`resident: installed, not running (${unit.unitPath ?? "unit file"})`);
+  } else {
+    lines.push(
+      "resident: absent — `crewhaus hangar install` keeps Home running with no window open",
+    );
+  }
+  if (lastRecovery !== undefined) {
+    lines.push(
+      `last recovery: ${lastRecovery.at} (${lastRecovery.restarted} restarted, ${lastRecovery.skipped} skipped)`,
+    );
+  }
   return { lines, exitCode: 0 };
 }
 
@@ -1404,6 +1637,10 @@ export async function runHangarCommand(
       return await hangarOpen(argv.slice(1), opts);
     case "qr":
       return await hangarQr(argv.slice(1), opts);
+    case "install":
+      return await hangarInstall("install", argv.slice(1), opts);
+    case "uninstall":
+      return await hangarInstall("uninstall", argv.slice(1), opts);
     case "rotate-token": {
       const args = parseVerbArgs(
         "rotate-token",

@@ -16,8 +16,8 @@
  * be taken rejects with `withFileLock`'s own error, its message intact; anything but a
  * regular file at the lock's name is refused before the lock is created, in the same words.
  */
-import { closeSync, unlinkSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { closeSync, readdirSync, unlinkSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { MACHINES, canTransition } from "@crewhaus/control-contract";
 import type { AcquireFileLockOptions } from "@crewhaus/infra-utils";
 import {
@@ -367,6 +367,68 @@ export async function appendClaim(
     const written = lockedAppend({ ...record, claim });
     return written.ok ? { ok: true, won: true, seg: written.seg } : written;
   });
+}
+
+/** At most this many names come back from {@link listClaims}; the rest are reported cut. */
+const LIST_CLAIMS_CAP = 10_000;
+
+export type ClaimList =
+  | {
+      readonly ok: true;
+      /** `<kind>/<name>`, sorted. */
+      readonly names: readonly string[];
+      /** True when the directory held more than the cap. */
+      readonly truncated: boolean;
+    }
+  | SafeFsFailure;
+
+/**
+ * The claims of one kind in a ledger, as `<kind>/<name>`: a read, which writes nothing and
+ * takes no lock. A kind that is not a claim kind (or is `gen`, whose claims are per
+ * object), and a kind directory that resolves outside the ledger's claims directory, are
+ * refused. A missing directory has none. Names that are not claim names are skipped, and
+ * at most `cap` come back, with `truncated` saying when more were there.
+ *
+ * First consumer: control-service's idempotency-claim expiry sweep.
+ */
+export function listClaims(
+  ledger: Ledger,
+  kind: string,
+  options: { readonly cap?: number } = {},
+): ClaimList {
+  if (typeof kind !== "string" || !CLAIM_KIND_RE.test(kind) || kind === GENERATION_KIND) {
+    return refusal("invalid-path", String(kind), `${JSON.stringify(kind)} is not a claim kind`);
+  }
+  const rel = join(ledger.claims, kind);
+  const claimsDir = resolveContained(ledger.root, ledger.claims);
+  if (!claimsDir.ok) {
+    return claimsDir.code === "not-found" ? { ok: true, names: [], truncated: false } : claimsDir;
+  }
+  const at = resolveContained(ledger.root, rel);
+  if (!at.ok) return at.code === "not-found" ? { ok: true, names: [], truncated: false } : at;
+  const inside = relative(claimsDir.real, at.real);
+  if (inside === "" || inside.startsWith("..") || isAbsolute(inside)) {
+    return refusal("escapes-root", rel, `${JSON.stringify(rel)} is not inside the ledger's claims`);
+  }
+  let entries: readonly string[];
+  try {
+    entries = readdirSync(at.real);
+  } catch (err) {
+    if ((err as { code?: unknown }).code === "ENOENT")
+      return { ok: true, names: [], truncated: false };
+    return ioFailure(rel, err, "listed");
+  }
+  const cap = options.cap ?? LIST_CLAIMS_CAP;
+  const names: string[] = [];
+  for (const entry of [...entries].sort()) {
+    if (!entry.endsWith(".json")) continue;
+    const name = entry.slice(0, -".json".length);
+    if (!SAFE_SEGMENT_RE.test(name)) continue;
+    names.push(`${kind}/${name}`);
+  }
+  return names.length > cap
+    ? { ok: true, names: names.slice(0, cap), truncated: true }
+    : { ok: true, names, truncated: false };
 }
 
 export type ExpireAnswer = { readonly ok: true; readonly removed: boolean } | SafeFsFailure;

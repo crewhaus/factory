@@ -52,6 +52,8 @@ describe("the composition", () => {
       "controls.resume",
       "controls.retire",
       "controls.start",
+      // Asked by the reconcile sweep only: recovery runs a resolve again instead.
+      "decisions.resolve",
       "decisions.supersede",
       "deployments.activate",
       "rules.create",

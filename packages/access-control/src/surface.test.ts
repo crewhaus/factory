@@ -124,6 +124,8 @@ describe("what the package exports", () => {
         "mintScopedToken",
         "noAuthRefusal",
         "registerDomainIn",
+        // Home's reconcile sweep: approver lists follow group moves and grant ends.
+        "refreshApproverProjections",
         "verifyScopedToken",
       ].sort(),
     );

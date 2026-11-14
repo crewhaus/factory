@@ -224,6 +224,30 @@ async function endExpiredLocked(harnessDir: string, nowMs: number): Promise<void
   }
 }
 
+/**
+ * End the rules past their end in one harness, for Home's tick: the rules file is read
+ * first, without a lock, and nothing happens unless an `active` row is past its end. Only
+ * then is the control lock taken (as {@link createStandingRule} takes it) and each such
+ * rule ended, with the rows read again under the lock: an `expired` row each, and the
+ * settings entry of a pattern no live row still names is removed. A harness with no rules
+ * file, or none past its end, is never touched. Answers how many patterns were looked at
+ * under the lock (0 when nothing was due).
+ *
+ * First consumer: Home's `standing-rules` sweep.
+ */
+export async function endExpiredRules(harnessDir: string, nowMs: number): Promise<number> {
+  const read = readStandingRules(harnessDir);
+  if (read.state !== "present") return 0;
+  const due = read.rows.filter((row) => row.state === "active" && !ruleIsLive(row, nowMs));
+  if (due.length === 0) return 0;
+  const answer = await withLedgerLock(standingRulesLedger(harnessDir), async () => {
+    await endExpiredLocked(harnessDir, nowMs);
+    return due.length;
+  });
+  if (typeof answer === "number") return answer;
+  throw new Error(answer.reason);
+}
+
 /** Throw unless the settings file reads: nothing is written beside a file that does not. */
 function assertSettingsReadable(harnessDir: string): void {
   loadSettingsRules(harnessDir);

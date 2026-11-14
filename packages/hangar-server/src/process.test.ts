@@ -475,7 +475,7 @@ describe("process control", () => {
     }
   }, 20_000);
 
-  test("a daemon this manager did not start is adopted on the next request", async () => {
+  test("a daemon this manager did not start shows running at once, and the next tick attaches it", async () => {
     const t = bootTestServer({ now: () => NOW });
     try {
       const dir = daemonHarness(t, "proc-foreign");
@@ -487,11 +487,21 @@ describe("process control", () => {
       expect(t.ops?.isAlive(pid)).toBe(true);
 
       // The console must not report `stopped` over a live runfile: every
-      // button it paints is decided by this payload.
+      // button it paints is decided by this payload. A read attaches nothing.
       const proc = await t.api(`/api/h/${id}/proc`);
       expect(proc.body["state"]).toBe("running");
-      expect(proc.body["adopted"]).toBe(true);
+      expect(proc.body["attached"]).toBe(false);
+      expect(proc.body["adopted"]).toBe(false);
       expect(proc.body["pid"]).toBe(pid);
+      expect(String(proc.body["note"])).toContain("running (not attached)");
+      expect(t.server.processes.peek(dir)?.supervisor.liveChild()).toBeUndefined();
+
+      // Home's tick attaches it.
+      await t.server.scheduler.tick();
+      const attached = await t.api(`/api/h/${id}/proc`);
+      expect(attached.body["attached"]).toBe(true);
+      expect(attached.body["adopted"]).toBe(true);
+      expect(attached.body["pid"]).toBe(pid);
 
       // …and Stop must SIGNAL the daemon rather than answer 200 having done
       // nothing at all.
@@ -1030,7 +1040,8 @@ describe("ProcessLayer.held", () => {
       expect(t.ops?.isAlive(pid)).toBe(true);
       expect(t.server.processes.held()).toEqual([]);
 
-      // The ordinary request path still adopts it.
+      // The next tick adopts it.
+      await t.server.scheduler.tick();
       expect((await t.api(`/api/h/${id}/proc`)).body["adopted"]).toBe(true);
       expect(t.server.processes.held().map((h) => h.harnessDir)).toEqual([dir]);
     } finally {

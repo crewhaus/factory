@@ -236,6 +236,23 @@ describe("the route table", () => {
     ).toEqual([]);
   });
 
+  test("a decision row's receipt names the decision, by a parameter of its own path", () => {
+    const resolving = ROUTE_TABLE.filter((row) => row.kind === "decisions.resolve");
+    expect(resolving.map((row) => row.key).sort()).toEqual(["denyApproval", "grantApproval"]);
+    for (const row of resolving) {
+      expect(row.receiptRef).toEqual({ kind: "decision", param: "apprId" });
+    }
+    const named = ROUTE_TABLE.filter((row) => row.receiptRef !== undefined);
+    expect(named.length).toBeGreaterThanOrEqual(2);
+    for (const row of named) {
+      expect([row.key, row.path.split("/").includes(`:${row.receiptRef?.param}`)]).toEqual([
+        row.key,
+        true,
+      ]);
+      expect([row.key, row.receipt]).toEqual([row.key, "harness"]);
+    }
+  });
+
   test("a scoped act is one of the closed list, on a GET that names its run", () => {
     expect(badScopedRows(ROUTE_TABLE)).toEqual([]);
     const scoped = ROUTE_TABLE.filter((row) => row.scopedAct !== undefined);

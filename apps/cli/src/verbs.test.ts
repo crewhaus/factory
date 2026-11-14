@@ -250,7 +250,7 @@ describe("every flag list answers --help", () => {
         }
       }
     }
-    expect(asked).toBe(2 * (12 + 5 + 5 + 8 + 10 + 12 + 12));
+    expect(asked).toBe(2 * (12 + 7 + 5 + 8 + 10 + 12 + 12));
   }, 30_000); // seven modules' imports and a hundred and twenty calls; slow on a loaded runner
 });
 

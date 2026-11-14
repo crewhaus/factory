@@ -147,7 +147,10 @@ by the other, and neither needs the other running.
   harness's mutating lease, so a terminal `crewhaus eval` and a queued one
   never write the tree at once; the MCP projection and the dev loop, which
   serve until stopped, take none, as a running daemon takes none. Command
-  recovery runs at boot, after adoption and the job restore.
+  recovery runs at boot, after adoption and the job restore, and again on
+  each reconcile tick. A grant or deny names the decision it settles
+  (`<hrn>/decision/<appr_>`, the row's `receiptRef`), so a decision
+  interrupted after it was accepted settles by what the approval records.
 - **Torn-line tolerance + caps** — every JSONL reader skips unparseable
   lines and caps both lines (`MAX_JSONL_LINES`) and bytes
   (`MAX_JSONL_BYTES`) read; truncation is reported, never hidden.
@@ -381,7 +384,7 @@ the test stay one truth rather than three opinions.
 | `GET /api/h/:id/health` · `GET /api/health` | the 0–100 score with its DEDUCTIONS, each naming the console tab that fixes it (HM-11) |
 | `GET /api/onboarding` · `POST /api/onboarding/demo` | first-boot state + scan-root suggestions; demo mode copies a starter out of a LOCAL demos checkout (HM-12) |
 | `GET /api/search?q=` | the lazy ⌘K index over harnesses/sessions/wiki/facts/datasets/graders/eval runs/incidents/approvals, plus ACTION proposals (HM-189) |
-| `GET·PUT /api/notifications` · `POST /api/notifications/clear` | the rules engine + the badge; the GET is also the evaluation pass (HM-183) |
+| `GET·PUT /api/notifications` · `POST /api/notifications/clear` | the rules, the badge and what Home's tick delivered; a read delivers nothing, and a PUT runs one notifications tick before it answers (HM-183) |
 | `GET·PUT /api/read-only` | the demo/screen-share mode, enforced ahead of every handler (HM-187) |
 | `GET /api/plugins` · `GET /api/plugins/:plugin/panes/:pane` · `GET /api/h/:id/panes` | the plugin inventory, one sandboxed pane document, and the panes a harness shows (HM-179) |
 
@@ -533,17 +536,47 @@ injectable `processLayer` and `controlClient`.
 
 `server.ready` resolves once the boot sequence has run: **open the port
 ledger → `adopt()` every registered harness with a runfile →
-`jobQueue.restore()`**. Restore is last on purpose, so a job that was
-*running* when the previous manager died is closed as `interrupted`
-against an already-accurate process picture — never silently re-run.
-`Bun.serve` binds synchronously, so the socket is live either way.
+`jobQueue.restore()` → command recovery → (the installed service only)
+the restarts after a reboot**, with the report Home writes to
+`<hangarRoot>/service/recovery.json`. Restore comes before recovery on
+purpose, so a job that was *running* when the previous manager died is
+closed as `interrupted` against an already-accurate process picture —
+never silently re-run. `Bun.serve` binds synchronously, so the socket is
+live either way.
 
-Boot adoption is not the whole story: it only sees the daemons that
-existed at that instant. Every request that touches a harness's process
-state calls `supervisor.adoptIfRunfile()` first — a no-op unless a runfile
-exists and the supervisor holds no pid — so a daemon started from a
-terminal (or one belonging to a harness registered after boot) is picked
-up rather than reported `stopped` over its own live runfile.
+**Home's tick** (`scheduler-host.ts`, the core's sweeps in `sweeps.ts`,
+composed in `v1/areas.ts`) starts once `ready` settles, in a window and as
+the installed service alike, and runs each sweep under its own system
+principal, which reads every harness and is refused every write
+permission:
+
+| Sweep | Every | What it keeps true |
+|---|---|---|
+| `reconcile` | 10 s | a daemon started from a terminal is attached (and a stale runfile cleared); commands whose process died are recovered; `unknown` receipts settle by what their reconciler observes; approver lists follow group moves and grant ends |
+| `notifications` | 10 s | the rules people turned on are delivered, on the sinks they chose |
+| `standing-rules` | 10 s | a standing rule past its end is ended |
+| `claims` | 1 h | an idempotency key older than seven days can be used again |
+
+**Reads change nothing.** A `GET` never adopts, clears a runfile or
+delivers a notification: `/proc`, `/runs/:runId`, `/control/status` and
+`/schedulers` observe the runfile (`observeRunfile`) and show a live daemon
+Home has not attached as `running`, `attached: false`, until the next tick
+attaches it. Every route that acts adopts first, as `crewhaus daemon stop`
+does before it signals.
+
+**The installed service** (`crewhaus hangar install`) runs
+`crewhaus hangar serve --resident`: the same server with `mode:
+"resident"`. After the machine starts it restarts only the harnesses a
+person last started (active, `autostart`, `desired: running`, not
+disabled, no live daemon, the kept restart window not full, the last exit
+not one a restart cannot fix), through the automatic start, which runs
+only the active build.
+
+**Receivers** (`ingress.ts`) answer on a second listener, `127.0.0.1` only,
+which binds when `ingress` is set and an area composes one; the console's
+listener answers 404 for `/hooks/*`. A delivery is verified, its delivery
+id claimed once, and its receipt and raw body recorded before it is
+acknowledged; the work runs after and settles the receipt.
 
 The live run feed is an SSE stream over a daemon that is *supposed* to be
 quiet, so two settings keep it open: the server binds with an explicit

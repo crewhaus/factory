@@ -323,6 +323,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["runClass", "string"],
     ["state", "string"],
     ["adopted", "boolean"],
+    ["attached", "boolean"],
     ["draining", "boolean"],
     ["restartsInWindow", "number"],
     ["runfile", "object|null"],
@@ -537,6 +538,10 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["suppressed", "array"],
     ["inApp", "array"],
     ["badge", "number"],
+    ["service.present", "boolean"],
+    ["service.state", "string"],
+    ["service.note", "string"],
+    ["service.verb", "string|null"],
   ],
   // views/settings.js readOnlyCard + app.js banner
   readOnly: [

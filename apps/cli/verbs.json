@@ -5405,6 +5405,10 @@
               "name": "allow-host",
               "takesValue": true,
               "repeatable": true
+            },
+            {
+              "name": "resident",
+              "takesValue": false
             }
           ]
         },
@@ -5444,6 +5448,22 @@
             },
             {
               "name": "tcp",
+              "takesValue": false
+            }
+          ]
+        },
+        "install": {
+          "flags": [
+            {
+              "name": "yes",
+              "takesValue": false
+            }
+          ]
+        },
+        "uninstall": {
+          "flags": [
+            {
+              "name": "yes",
               "takesValue": false
             }
           ]

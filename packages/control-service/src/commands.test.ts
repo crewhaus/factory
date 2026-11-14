@@ -621,14 +621,94 @@ describe("the actor is the caller, and is checked again before a command runs", 
 
   test("an actor that is not a principal is refused before anything is written", async () => {
     const { service, harness } = rig();
-    const answer = await service.commands.submit({
-      kind: "controls.stop",
-      target: HRN,
-      ledger: { harness },
-      via: "home",
-      actor: "operator@example.invalid",
-    });
-    expect(answer.ok === false && answer.refusal.code).toBe("invalid");
+    for (const actor of ["operator@example.invalid", "sys:nobody", "local:sam@laptop"]) {
+      const answer = await service.commands.submit({
+        kind: "controls.stop",
+        target: HRN,
+        ledger: { harness },
+        via: "home",
+        actor,
+      });
+      expect(answer.ok === false && answer.refusal).toEqual({
+        code: "invalid",
+        message: "the command's actor is not a principal or a system actor",
+      });
+    }
     expect(existsSync(join(harness, ".crewhaus", "run", "control", "commands"))).toBe(false);
+  });
+
+  test("settle moves an accepted receipt to its end, once", async () => {
+    const { service, hangarRoot } = rig();
+    const answer = await service.commands.submit({
+      kind: "legacy.hookDelivery",
+      ledger: "workspace",
+      via: "github",
+      actor: "sys:ingress",
+    });
+    if (!answer.ok) throw new Error(answer.refusal.message);
+    const settled = await service.commands.settle("workspace", answer.receipt.id, {
+      state: "succeeded",
+    });
+    expect(settled?.state).toBe("succeeded");
+    expect(
+      await service.commands.settle("workspace", answer.receipt.id, { state: "failed" }),
+    ).toBeUndefined();
+    expect(
+      await service.commands.settle("workspace", "cmd_01m76e6f05hp514w9j4v3qymkt", {
+        state: "failed",
+      }),
+    ).toBeUndefined();
+    expect(rowsOf(workspaceCommandsLedger(hangarRoot)).map((row) => row["state"])).toEqual([
+      "accepted",
+      "succeeded",
+    ]);
+  });
+
+  test("a delivery claim accepts one receipt, and answers every later request as its replay", async () => {
+    const { service, hangarRoot } = rig();
+    const deliver = () =>
+      service.commands.submit({
+        kind: "legacy.hookDelivery",
+        ledger: "workspace",
+        via: "github",
+        actor: "sys:ingress",
+        params: { provider: "test", delivery: "d".repeat(32) },
+        dedupeClaim: `ingress/test-${"d".repeat(32)}`,
+      });
+    const first = await deliver();
+    const second = await deliver();
+    if (!first.ok || !second.ok) throw new Error("refused");
+    expect(first.replayed).toBe(false);
+    expect(second.replayed).toBe(true);
+    expect(second.receipt.id).toBe(first.receipt.id);
+    expect(first.receipt.dedupeRef).toBe(`ingress/test-${"d".repeat(32)}`);
+    expect(rowsOf(workspaceCommandsLedger(hangarRoot))).toHaveLength(1);
+    expect(
+      existsSync(join(hangarRoot, "control", "claims", "ingress", `test-${"d".repeat(32)}.json`)),
+    ).toBe(true);
+    const both = await service.commands.submit({
+      kind: "legacy.hookDelivery",
+      ledger: "workspace",
+      via: "github",
+      idempotency: "k",
+      dedupeClaim: "ingress/test-x",
+    });
+    expect(both.ok === false && both.refusal.code).toBe("invalid");
+  });
+
+  test("a system actor is accepted: a receiver's verified delivery", async () => {
+    const { service, hangarRoot } = rig();
+    const answer = await service.commands.submit({
+      kind: "legacy.hookDelivery",
+      ledger: "workspace",
+      via: "github",
+      actor: "sys:ingress",
+    });
+    if (!answer.ok) throw new Error(answer.refusal.message);
+    expect(answer.receipt.actor).toBe("sys:ingress");
+    expect(answer.receipt.state).toBe("accepted");
+    expect(rowsOf(workspaceCommandsLedger(hangarRoot)).map((row) => row["actor"])).toEqual([
+      "sys:ingress",
+    ]);
   });
 });
