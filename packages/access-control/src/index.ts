@@ -33,6 +33,7 @@ export {
   type RemoveResult,
   type RevokeResult,
   SERVICE_TOKEN_TTL_MS,
+  type ScopedEpochResult,
   type SetUpInput,
   type SetUpResult,
   type SyncResult,
@@ -40,6 +41,7 @@ export {
   openAccess,
   redeemInvite,
   registerDomainIn,
+  scopedEpochBumpRow,
 } from "./access";
 export { cidrContains, isLoopbackAddress, parseCidr, type Cidr } from "./addresses";
 export {
@@ -50,9 +52,11 @@ export {
   type DomainChecker,
   type DomainRequest,
   type ObjectRef,
+  type QueuedActor,
   authorize,
   domainOf,
   effectiveRole,
+  queuedActorHolds,
 } from "./authorize";
 export {
   type AuthVia,
@@ -94,7 +98,7 @@ export {
   readOwnerSettings,
   writeOwnerBlock,
 } from "./owner-settings";
-export type { RefusalCode } from "./mutate";
+export type { PlannedRow, Planning, RefusalCode } from "./mutate";
 export type { AccessHarness, ProjectionFailure, ProjectionReport } from "./projection";
 export type {
   CredentialRow,
@@ -111,6 +115,7 @@ export {
   type ScopedMintAnswer,
   type ScopedMintInput,
   type ScopedVerified,
+  type ScopedVerifyReason,
   mintScopedToken,
   verifyScopedToken,
 } from "./scoped";
@@ -136,6 +141,7 @@ export {
   type AccessSnapshotRead,
   loadAccessSnapshot,
   localPrincipalOf,
+  scopedEpochOf,
 } from "./snapshot";
 export {
   type DeviceView,

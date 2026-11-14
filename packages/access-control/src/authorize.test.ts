@@ -12,7 +12,13 @@ import {
   type Role,
   mintId,
 } from "@crewhaus/control-contract";
-import { type AccessTarget, type AuthorizeVerdict, authorize, effectiveRole } from "./authorize";
+import {
+  type AccessTarget,
+  type AuthorizeVerdict,
+  authorize,
+  effectiveRole,
+  queuedActorHolds,
+} from "./authorize";
 import { EMPTY_SUBJECTS } from "./files";
 import type { CredentialRow, GrantRow, PrincipalRow } from "./records";
 import type { AccessSnapshot } from "./snapshot";
@@ -397,5 +403,113 @@ describe("services", () => {
     expect(authorize(snapshot, { principal: SERVICE }, "h.read", ON_H1, { now: NOW }).allow).toBe(
       false,
     );
+  });
+});
+
+describe("queuedActorHolds: a command answers to the credential that submitted it", () => {
+  const PORTAL = mintId("prn");
+  const KIOSK = mintId("prn");
+  const A = mintId("crd");
+  const B = mintId("crd");
+  const K = mintId("crd");
+  const PERSONAL = mintId("crd");
+  const ON_H1: AccessTarget = { scope: "harness", harness: H1, groups: [] };
+
+  function token(
+    id: string,
+    principalId: string,
+    kind: CredentialRow["kind"],
+    extra: Partial<CredentialRow> = {},
+  ): CredentialRow {
+    return {
+      id,
+      principal: principalId,
+      kind,
+      sha256: "0".repeat(64),
+      state: "active",
+      at: AT,
+      by: OWNER,
+      ...extra,
+    };
+  }
+
+  function world(revokedA: boolean): AccessSnapshot {
+    return snapshotOf(
+      [grant(ALICE, "operator", `harness:${H1}`)],
+      [
+        principal(OWNER),
+        principal(ALICE),
+        principal(PORTAL, "service"),
+        principal(KIOSK, "service"),
+      ],
+      [
+        token(A, PORTAL, "service", {
+          permissions: ["h.control"],
+          harnesses: [H1],
+          expiresAt: new Date(NOW + 60_000).toISOString(),
+          ...(revokedA ? { state: "revoked" as const, revokedAt: AT } : {}),
+        }),
+        token(B, PORTAL, "service", { permissions: ["h.control", "h.deploy"], harnesses: [H1] }),
+        token(K, KIOSK, "service", { permissions: ["h.control"], harnesses: [H1] }),
+        token(PERSONAL, ALICE, "personal", { readOnly: true }),
+      ],
+    );
+  }
+
+  const holds = (
+    snapshot: AccessSnapshot,
+    actor: string,
+    credentialRef: string | undefined,
+    permission = "h.control",
+    now = NOW,
+  ) =>
+    queuedActorHolds(
+      snapshot,
+      credentialRef === undefined ? { actor } : { actor, credentialRef },
+      permission,
+      ON_H1,
+      { now },
+    );
+
+  test("a receipt that names a revoked credential holds nothing, while a sibling token of its service stays live", () => {
+    expect(holds(world(false), PORTAL, A)).toBe(true);
+    expect(holds(world(true), PORTAL, A)).toBe(false);
+    // A receipt that names no credential passes on its service's live token B.
+    expect(holds(world(true), PORTAL, undefined)).toBe(true);
+    expect(holds(world(true), PORTAL, B)).toBe(true);
+  });
+
+  test("the named credential must be its actor's own, and live", () => {
+    expect(holds(world(false), KIOSK, B)).toBe(false);
+    expect(holds(world(false), KIOSK, K)).toBe(true);
+    // A expires a minute after NOW.
+    expect(holds(world(false), PORTAL, A, "h.control", NOW + 60_000)).toBe(false);
+    expect(holds(world(false), PORTAL, B, "h.control", NOW + 60_000)).toBe(true);
+  });
+
+  test("the named credential's own permissions decide", () => {
+    expect(holds(world(false), PORTAL, A, "h.deploy")).toBe(false);
+    expect(holds(world(false), PORTAL, B, "h.deploy")).toBe(true);
+  });
+
+  test("a member's read-only personal token keeps its cap", () => {
+    expect(holds(world(false), ALICE, PERSONAL)).toBe(false);
+    expect(holds(world(false), ALICE, undefined)).toBe(true);
+    // A service token named for a member is the wrong kind.
+    expect(holds(world(false), ALICE, A)).toBe(false);
+  });
+
+  test("an absent snapshot holds nothing", () => {
+    expect(
+      queuedActorHolds(
+        { state: "absent" },
+        { actor: PORTAL, credentialRef: B },
+        "h.control",
+        ON_H1,
+        {
+          now: NOW,
+        },
+      ),
+    ).toBe(false);
   });
 });

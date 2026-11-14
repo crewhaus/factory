@@ -333,3 +333,53 @@ export function authorize(
     ? authorizeService(snapshot, actor, permission, target, options.now)
     : authorizeMember(snapshot, principal.id, permission, target, options.now);
 }
+
+/** Who submitted a command: its receipt's actor, and the credential it used. */
+export type QueuedActor = {
+  /** The receipt's actor, `prn_…`. */
+  readonly actor: string;
+  /** The credential (`crd_…`) the actor authenticated with, when the receipt names one. */
+  readonly credentialRef?: string;
+};
+
+/**
+ * Whether a command's submitter may still do it when the command is dispatched from its
+ * receipt, at submit or on recovery, over a snapshot read.
+ * A receipt that names a credential passes only while exactly that credential, used by its
+ * actor, holds the permission: a revoked or expired credential, another principal's, or one
+ * of the wrong kind holds nothing, and a personal token keeps its cap. A receipt that names
+ * no credential passes while its service still holds the permission through a live token of
+ * its own, or while its member holds it.
+ *
+ * First consumer: Home's re-check of a command before it is dispatched.
+ */
+export function queuedActorHolds(
+  read: AccessSnapshotRead | AccessSnapshot,
+  submitter: QueuedActor,
+  permission: string,
+  target: AccessTarget,
+  options: AuthorizeOptions,
+): boolean {
+  const snapshot = "state" in read ? (read.state === "present" ? read.snapshot : undefined) : read;
+  if (snapshot === undefined) return false;
+  const { actor, credentialRef } = submitter;
+  if (credentialRef !== undefined) {
+    return authorize(
+      snapshot,
+      { principal: actor, credential: credentialRef },
+      permission,
+      target,
+      options,
+    ).allow;
+  }
+  if (principalOf(snapshot, actor)?.kind === "service") {
+    return snapshot.tokens
+      .filter((row) => row.principal === actor && row.kind === "service")
+      .some(
+        (row) =>
+          authorize(snapshot, { principal: actor, credential: row.id }, permission, target, options)
+            .allow,
+      );
+  }
+  return authorize(snapshot, { principal: actor }, permission, target, options).allow;
+}

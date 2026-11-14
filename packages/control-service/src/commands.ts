@@ -8,9 +8,11 @@
  * A receipt holds ids, refs, keyed digests and states: never an argument, an input or a
  * secret. Every row is the whole receipt, so the fold's current row is the receipt.
  *
- * A dispatched command runs only while its actor may still do it: before `accepted →
- * running`, a member's authority is checked again, so a command accepted from someone whose
- * access was withdrawn in between settles `rejected` and never runs.
+ * A dispatched command runs only while the credential that submitted it, or for a receipt
+ * without one its actor, may still do it: before `accepted → running`, and before recovery
+ * runs a `running` one again, that authority is checked again, so a command whose authority
+ * was withdrawn in between settles `rejected` (`failed`, once it had started) and does not
+ * run.
  */
 import { mkdirSync } from "node:fs";
 import {
@@ -47,6 +49,12 @@ export type SubmitRequest = {
    * stands in (the CLI in direct mode, or a Home with sign-in turned off).
    */
   readonly actor?: string;
+  /**
+   * The credential (`crd_…`) `actor` authenticated with, when it used one. A command
+   * dispatched from its receipt, when it is submitted or recovered, is checked against
+   * exactly it. Given only with `actor`.
+   */
+  readonly credentialRef?: string;
   /** The most specific ref the request names. Absent: the receipt itself, `home/cmd/<id>`. */
   readonly target?: string;
   readonly ledger: LedgerChoice;
@@ -261,6 +269,17 @@ export function createCommands(core: ControlCore): CommandsInternals {
     if (request.actor !== undefined && !isId("prn", request.actor)) {
       return { ok: false, refusal: refuse("invalid", "the command's actor is not a principal") };
     }
+    if (request.credentialRef !== undefined) {
+      if (!isId("crd", request.credentialRef)) {
+        return { ok: false, refusal: refuse("invalid", "the command's credential is not one") };
+      }
+      if (request.actor === undefined) {
+        return {
+          ok: false,
+          refusal: refuse("invalid", "a command's credential is given with its actor"),
+        };
+      }
+    }
     const ledger = ledgerOf(request.ledger);
     if (request.ledger === "workspace") {
       try {
@@ -311,6 +330,7 @@ export function createCommands(core: ControlCore): CommandsInternals {
       kind: request.kind,
       target: request.target ?? `home/cmd/${id}`,
       actor,
+      ...(request.credentialRef !== undefined ? { credentialRef: request.credentialRef } : {}),
       via: request.via,
       ...(dedupeRef !== undefined ? { dedupeRef } : {}),
       fingerprint,

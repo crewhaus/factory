@@ -123,7 +123,10 @@ describe("what the package exports", () => {
         "hostNameOf",
         "mintScopedToken",
         "noAuthRefusal",
+        "queuedActorHolds",
         "registerDomainIn",
+        "scopedEpochBumpRow",
+        "scopedEpochOf",
         "verifyScopedToken",
         // Signing in from another computer, and the access lists' last use.
         "DEVICE_LIMITS",

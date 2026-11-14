@@ -68,13 +68,13 @@ import {
   type Peer,
   type SignInHandle,
   type TokenSetup,
-  authorize,
   ensureToken,
   loadAccessSnapshot,
   localActorOf,
   noAuthRefusal,
   openDeviceRequests,
   openSignIn,
+  queuedActorHolds,
   readOwnerSettings,
 } from "@crewhaus/access-control";
 import { DEPLOYMENT_ID_RE, PROTOCOL_ID, parseRef } from "@crewhaus/control-contract";
@@ -638,8 +638,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       now,
       probe: withOwnStartTime(createProcessOps()),
       onWarn,
-      // A queued or recovered command runs only while its actor may still do it.
-      authorizeActor: (actor, permission, target) => {
+      // A command dispatched from its receipt, when it is submitted or recovered, runs only
+      // while the credential that submitted it, or for a receipt without one its actor, may
+      // still do it.
+      authorizeActor: (actor, permission, target, credentialRef) => {
         const read = loadAccessSnapshot(hangarRoot);
         if (read.state !== "present") return undefined;
         const parsed = parseRef(target);
@@ -659,20 +661,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
                 harness,
                 groups: registry.get(harness)?.groups ?? [],
               };
-        const options = { now: now(), domains: homeAccess.domains };
-        const snapshot = read.snapshot;
-        const who = snapshot.principals.find((p) => p.id === actor);
-        if (who?.kind === "service") {
-          // A receipt names the service, not the token it used: any live token of it counts.
-          return snapshot.tokens
-            .filter((c) => c.principal === actor && c.kind === "service")
-            .some(
-              (c) =>
-                authorize(snapshot, { principal: actor, credential: c.id }, permission, at, options)
-                  .allow,
-            );
-        }
-        return authorize(snapshot, { principal: actor }, permission, at, options).allow;
+        return queuedActorHolds(
+          read.snapshot,
+          credentialRef !== undefined ? { actor, credentialRef } : { actor },
+          permission,
+          at,
+          { now: now(), domains: homeAccess.domains },
+        );
       },
     },
     { mode: "server" },
@@ -3178,6 +3173,14 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     actorOf: () => {
       const caller = currentRequestAccess()?.caller;
       return caller !== undefined && caller.actor !== null ? caller.principal : undefined;
+    },
+    // The credential the signed-in principal used, when it used one: a command dispatched
+    // from its receipt is checked against exactly that credential.
+    credentialOf: () => {
+      const actor = currentRequestAccess()?.caller?.actor;
+      return actor !== undefined && actor !== null && "credential" in actor
+        ? actor.credential
+        : undefined;
     },
     onWarn,
   });

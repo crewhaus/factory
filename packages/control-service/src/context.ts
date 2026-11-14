@@ -25,6 +25,8 @@ export type ControlCore = {
   readonly releaseSupervisor: (harnessDir: string, supervisor: HarnessSupervisor) => void;
   readonly drainRequest: (harnessDir: string) => () => Promise<void>;
   readonly warn: (message: string) => void;
+  /** Whether this head checks a receipt's actor again before it runs (Home does). */
+  readonly checksActors: boolean;
   /** Whether a receipt's actor has lost the authority to do what it asked: checked before it runs. */
   actorRefused(receipt: CommandReceipt): boolean;
   /** This process, as a receipt's executor. Stamped once. */

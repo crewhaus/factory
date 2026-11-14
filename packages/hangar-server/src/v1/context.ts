@@ -58,6 +58,8 @@ export type V1Context = {
   readonly via: ReceiptVia;
   /** The caller as a receipt's actor: a `prn_`, or absent for Home's own OS user. */
   readonly actor?: string;
+  /** The credential (`crd_…`) the caller authenticated with, when it used one. */
+  readonly credentialRef?: string;
   /** Every area's ref resolvers, by kind. */
   readonly refResolvers: ReadonlyMap<string, RefResolver>;
   /** Every area's capability providers. */

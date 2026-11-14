@@ -427,7 +427,7 @@ describe("what a receipt holds", () => {
   });
 
   test("every row validates as a receipt, and no field name is one the masker eats", async () => {
-    const { service, harness, hangarRoot } = rig({ pid: 1000 });
+    const { service, harness, hangarRoot } = rig({ pid: 1000, authorizeActor: () => true });
     await service.commands.submit(
       { kind: "controls.stop", target: HRN, ledger: { harness }, via: "home", idempotency: "k" },
       async () => ({ value: undefined }),
@@ -453,6 +453,18 @@ describe("what a receipt holds", () => {
         value: 0,
       }),
     );
+    // A caller that authenticated with a credential.
+    await service.commands.submit(
+      {
+        kind: "controls.stop",
+        target: HRN,
+        ledger: { harness },
+        via: "home",
+        actor: "prn_01jc0000000000000000000003",
+        credentialRef: "crd_01jc0000000000000000000003",
+      },
+      async () => ({ settle: { state: "succeeded" }, value: undefined }),
+    );
     // A stamp the probe could not confirm.
     const unprobed = rig({ probe: fakeProbe() });
     await unprobed.service.commands.submit(
@@ -471,7 +483,15 @@ describe("what a receipt holds", () => {
     }
     const names = new Set<string>();
     for (const row of rows) fieldNames(row, names);
-    for (const name of ["claim", "repaired", "gen", "probed", "dedupeRef", "fingerprint"]) {
+    for (const name of [
+      "claim",
+      "repaired",
+      "gen",
+      "probed",
+      "dedupeRef",
+      "fingerprint",
+      "credentialRef",
+    ]) {
       expect(names.has(name)).toBe(true);
     }
     expect([...names].filter(isCredentialKey)).toEqual([]);
@@ -617,6 +637,187 @@ describe("the actor is the caller, and is checked again before a command runs", 
     expect(first.receipt.id).not.toBe(second.receipt.id);
     const again = await ask(MEMBER);
     expect(again.ok && again.replayed).toBe(true);
+  });
+
+  test("a command is checked against the credential that submitted it, and every row keeps it", async () => {
+    const SERVICE = "prn_01jc0000000000000000000005";
+    const CRD_A = "crd_01jc0000000000000000000005";
+    const asked: Array<readonly string[]> = [];
+    const { service, harness, supervisor } = rig({
+      authorizeActor: (...args) => {
+        asked.push(args.filter((arg) => arg !== undefined) as string[]);
+        return false;
+      },
+    });
+    const answer = await service.commands.submit({
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness },
+      via: "home",
+      actor: SERVICE,
+      credentialRef: CRD_A,
+    });
+    if (!answer.ok || answer.replayed) throw new Error("submit refused");
+    expect(answer.receipt.credentialRef).toBe(CRD_A);
+    expect([answer.receipt.state, answer.receipt.outcome?.code]).toEqual(["rejected", "forbidden"]);
+    expect(supervisor.calls).not.toContain("stop");
+    expect(asked).toEqual([[SERVICE, "h.control", HRN, CRD_A]]);
+    const rows = rowsOf(commandsLedgerOf(harness));
+    expect(rows.map((row) => row["state"])).toEqual(["accepted", "rejected"]);
+    expect(rows.map((row) => row["credentialRef"])).toEqual([CRD_A, CRD_A]);
+  });
+
+  test("the Home's owner submitting with a credential is checked against it", async () => {
+    const asked: Array<readonly string[]> = [];
+    const { service, harness, hangarRoot, supervisor } = rig({
+      authorizeActor: (...args) => {
+        asked.push(args.filter((arg) => arg !== undefined) as string[]);
+        return false;
+      },
+    });
+    const setUp = await ensureAccessSetUp(hangarRoot, {
+      localActor: localActorOf(IDENTITY),
+      now: () => NOW,
+    });
+    if (!setUp.ok) throw new Error(setUp.reason);
+    const owner = setUp.result.owner;
+    const CRD = "crd_01jc0000000000000000000006";
+    const answer = await service.commands.submit({
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness },
+      via: "home",
+      actor: owner,
+      credentialRef: CRD,
+    });
+    expect(answer.ok && !answer.replayed && answer.receipt.state).toBe("rejected");
+    expect(asked).toEqual([[owner, "h.control", HRN, CRD]]);
+    expect(supervisor.calls).not.toContain("stop");
+  });
+
+  test("a recovered command is checked against the credential its receipt names", async () => {
+    const SERVICE = "prn_01jc0000000000000000000007";
+    const CRD = "crd_01jc0000000000000000000007";
+    const asked: Array<readonly string[]> = [];
+    const r = rig({
+      authorizeActor: (...args) => {
+        asked.push(args.filter((arg) => arg !== undefined) as string[]);
+        return false;
+      },
+    });
+    const ledger = commandsLedgerOf(r.harness);
+    plantReceipt(ledger, {
+      id: "cmd_01jc00000000000000000000ab",
+      actor: SERVICE,
+      credentialRef: CRD,
+    });
+    await r.service.commands.recover({ harness: r.harness });
+    expect(asked).toEqual([[SERVICE, "h.control", HRN, CRD]]);
+    expect(r.supervisor.calls).not.toContain("stop");
+    const last = rowsOf(ledger).at(-1);
+    expect([
+      last?.["state"],
+      (last?.["outcome"] as { code?: string })?.code,
+      last?.["credentialRef"],
+    ]).toEqual(["rejected", "forbidden", CRD]);
+  });
+
+  test("a recovered running command runs again only while the credential its receipt names may still do it", async () => {
+    const SERVICE = "prn_01jc0000000000000000000009";
+    const CRD = "crd_01jc0000000000000000000009";
+    for (const allowed of [false, true]) {
+      const asked: Array<readonly string[]> = [];
+      const r = rig({
+        authorizeActor: (...args) => {
+          asked.push(args.filter((arg) => arg !== undefined) as string[]);
+          return allowed;
+        },
+      });
+      const ledger = commandsLedgerOf(r.harness);
+      plantReceipt(ledger, {
+        id: "cmd_01jc00000000000000000000ac",
+        actor: SERVICE,
+        credentialRef: CRD,
+        state: "running",
+        startedAt: new Date(NOW - 30_000).toISOString(),
+      });
+      await r.service.commands.recover({ harness: r.harness });
+      expect(asked).toEqual([[SERVICE, "h.control", HRN, CRD]]);
+      const last = rowsOf(ledger).at(-1);
+      if (allowed) {
+        expect(r.supervisor.calls).toContain("stop");
+        expect(last?.["state"]).toBe("succeeded");
+      } else {
+        expect(r.supervisor.calls).not.toContain("stop");
+        expect([
+          last?.["state"],
+          (last?.["outcome"] as { code?: string })?.code,
+          last?.["credentialRef"],
+        ]).toEqual(["failed", "forbidden", CRD]);
+      }
+    }
+  });
+
+  test("a head that cannot check a credential leaves a receipt that names one for a head that can", async () => {
+    const SERVICE = "prn_01jc000000000000000000000a";
+    const CRD = "crd_01jc000000000000000000000a";
+    const r = rig();
+    const ledger = commandsLedgerOf(r.harness);
+    plantReceipt(ledger, {
+      id: "cmd_01jc00000000000000000000ad",
+      actor: SERVICE,
+      credentialRef: CRD,
+    });
+    plantReceipt(ledger, {
+      id: "cmd_01jc00000000000000000000ae",
+      kind: "controls.drain",
+      actor: SERVICE,
+      credentialRef: CRD,
+      state: "running",
+      startedAt: new Date(NOW - 30_000).toISOString(),
+    });
+    const before = rowsOf(ledger).length;
+    await r.service.commands.recover({ harness: r.harness });
+    expect(r.supervisor.calls).toEqual([]);
+    expect(rowsOf(ledger)).toHaveLength(before);
+    expect(
+      r.service.commands.get({ harness: r.harness }, "cmd_01jc00000000000000000000ad")?.state,
+    ).toBe("accepted");
+    // …and one submitted to it with a credential does not run.
+    const answer = await r.service.commands.submit({
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness: r.harness },
+      via: "home",
+      actor: SERVICE,
+      credentialRef: CRD,
+    });
+    expect(
+      answer.ok && !answer.replayed && [answer.receipt.state, answer.receipt.outcome?.code],
+    ).toEqual(["rejected", "forbidden"]);
+    expect(r.supervisor.calls).not.toContain("stop");
+  });
+
+  test("a credential without an actor, or one that is not a credential id, is refused before anything is written", async () => {
+    const { service, harness } = rig();
+    const withoutActor = await service.commands.submit({
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness },
+      via: "home",
+      credentialRef: "crd_01jc0000000000000000000008",
+    });
+    expect(withoutActor.ok === false && withoutActor.refusal.code).toBe("invalid");
+    const notACredential = await service.commands.submit({
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness },
+      via: "home",
+      actor: MEMBER,
+      credentialRef: "prn_01jc0000000000000000000008",
+    });
+    expect(notACredential.ok === false && notACredential.refusal.code).toBe("invalid");
+    expect(existsSync(join(harness, ".crewhaus", "run", "control", "commands"))).toBe(false);
   });
 
   test("an actor that is not a principal is refused before anything is written", async () => {

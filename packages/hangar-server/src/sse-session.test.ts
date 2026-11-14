@@ -2,14 +2,16 @@
  * A live run stream opened with a browser session closes when that session ends: past
  * its sliding deadline with `event: auth.expired`, on sign-out with `event: auth.revoked`,
  * each just before `done`. A stream whose caller has lost access to it closes with
- * `event: revoked` once the access records move. A stream opened with Home's own key is
+ * `event: revoked` once the access records move, and so does a stream opened with a scoped
+ * token once its service's scoped tokens are ended. A stream opened with Home's own key is
  * not tied to a session.
  * A stream's re-check ends with the stream, whatever closed it.
  * The 30-second check is driven by calling it, on a fake clock, never by waiting.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
+import { loadAccessSnapshot, mintScopedToken, openAccess } from "@crewhaus/access-control";
+import { scopedRunRef } from "@crewhaus/control-contract";
 import { acceptInvite, bearer, signInFromBootLink } from "./__test__/browser";
 import { makeFixtureHarness } from "./fixture";
 import { type TestServer, bootTestServer } from "./testkit";
@@ -225,6 +227,55 @@ describe("a run stream opened with a token that ends", () => {
     expect(text.indexOf("event: revoked")).toBeGreaterThan(-1);
     expect(text.indexOf("event: revoked")).toBeLessThan(text.indexOf("event: done"));
     expect(epoch()).toEqual(before);
+  });
+});
+
+describe("a run stream opened with a scoped token", () => {
+  test("closes with revoked once its service's scoped epoch moves, while the service token stays live", async () => {
+    const { t, feedPath, now } = await liveRun();
+    await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+    const read = loadAccessSnapshot(t.hangarRoot);
+    if (read.state !== "present") throw new Error("no access records");
+    const owner = { principal: read.snapshot.owner as string };
+    const [, , , id, , runId] = feedPath.split("/") as string[];
+    const access = openAccess(t.hangarRoot, { now });
+    const service = await access.mintServiceToken(owner, {
+      service: "portal",
+      permissions: [],
+      harnesses: [id as string],
+      contentRead: true,
+    });
+    if (!service.ok) throw new Error(service.reason);
+    const minted = await mintScopedToken(
+      t.hangarRoot,
+      {
+        credential: service.result.token.id,
+        refs: [scopedRunRef(id as string, runId as string) as string],
+        acts: ["run.events.read"],
+      },
+      { now },
+    );
+    if (!minted.ok) throw new Error(minted.message);
+    const feed = await openFeed(t, feedPath, minted.token);
+    await feed.until(replayed);
+    // The check with nothing moved closes nothing.
+    t.server.checkSessions();
+    await feed.drainWhile(t.fetchRaw("/healthz").then((r) => r.text()));
+    expect(ended(feed.text())).toBe(false);
+    const bumped = await access.bumpScopedEpoch(owner, service.result.principal);
+    if (!bumped.ok) throw new Error(bumped.reason);
+    t.server.checkSessions();
+    await feed.until(ended);
+    const text = feed.text();
+    expect(text.indexOf("event: revoked")).toBeGreaterThan(-1);
+    expect(text.indexOf("event: revoked")).toBeLessThan(text.indexOf("event: done"));
+    // The token's next request is refused, and the service's own token still answers.
+    const again = await t.fetchRaw(feedPath, { headers: bearer(minted.token) });
+    expect(again.status).toBe(401);
+    await again.body?.cancel();
+    const own = await t.fetchRaw(feedPath, { headers: bearer(service.result.secret) });
+    expect(own.status).toBe(200);
+    await own.body?.cancel();
   });
 });
 

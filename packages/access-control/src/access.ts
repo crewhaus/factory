@@ -1,6 +1,6 @@
 /**
- * The access operations: set up, invite, redeem, grant, revoke, remove, link, unlink, mint
- * and sync, each over the records `<hangarRoot>/access/` holds. Every change but a
+ * The access operations: set up, invite, redeem, grant, revoke, remove, link, unlink, mint,
+ * end a service's scoped tokens and sync, each over the records `<hangarRoot>/access/` holds. Every change but a
  * redemption runs through `runMutation`, so it is authorized, size-checked and recorded
  * whole under the access lock, and moves the access revision once.
  */
@@ -46,6 +46,7 @@ import {
   type Change,
   type Done,
   type PlannedClaim,
+  type PlannedRow,
   type Planning,
   type Refusal,
   projectAfter,
@@ -1191,6 +1192,70 @@ async function mintServiceToken(
 }
 
 // ---------------------------------------------------------------------------
+// Scoped-token epoch
+// ---------------------------------------------------------------------------
+
+export type ScopedEpochResult = {
+  readonly principal: string;
+  /** The service's scoped-token epoch after the bump. */
+  readonly scopedEpoch: number;
+};
+
+/**
+ * The one principals row that moves a service's scoped-token epoch up by one: every scoped
+ * token it minted before stops verifying, and its own tokens stay live. A planner, so a
+ * change that already holds the access lock can make it part of its own rows.
+ *
+ * First consumer: {@link bumpScopedEpoch}.
+ */
+export function scopedEpochBumpRow(row: PrincipalRow, state: Planning): PlannedRow {
+  const next: PrincipalRow = {
+    ...row,
+    scopedEpoch: (row.scopedEpoch ?? 0) + 1,
+    at: state.at,
+    by: state.by,
+  };
+  return { kind: "principals", row: next };
+}
+
+/**
+ * End every scoped token a service minted, under the access lock: its scoped-token epoch
+ * moves up by one. The service's own tokens and grants are untouched. Refused: an id that
+ * is not a `prn_…`, an unknown principal, a member, a removed service, and an actor without
+ * `home.access.manage`.
+ */
+async function bumpScopedEpoch(
+  ctx: AccessContext,
+  actor: AccessActor,
+  service: string,
+): Promise<Done<ScopedEpochResult> | Refusal> {
+  if (!isId("prn", service)) return refusal("invalid", `"${service}" is not a principal id.`);
+  return runMutation<ScopedEpochResult>(
+    ctx,
+    actor,
+    (state) => {
+      const snapshot = requireSnapshot(state);
+      const target = principalOf(snapshot, service);
+      if (target === undefined) return refusal("not-found", "No member or service has that id.");
+      if (target.kind !== "service") {
+        return refusal("invalid", "Only a service mints scoped tokens.");
+      }
+      if (target.state !== "active") return refusal("ended", "That service was removed.");
+      const planned = scopedEpochBumpRow(target, state);
+      return {
+        rows: [planned],
+        result: {
+          principal: target.id,
+          scopedEpoch: (planned.row as PrincipalRow).scopedEpoch ?? 0,
+        },
+      };
+    },
+    // Who may decide on a harness does not move.
+    { projections: false },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Sync
 // ---------------------------------------------------------------------------
 
@@ -1313,6 +1378,8 @@ export type AccessHandle = {
   link(actor: AccessActor, input: LinkInput): Promise<Done<LinkResult> | Refusal>;
   unlink(actor: AccessActor, ref: string): Promise<Done<{ readonly link: LinkView }> | Refusal>;
   mintServiceToken(actor: AccessActor, input: MintInput): Promise<Done<MintResult> | Refusal>;
+  /** End every scoped token a service minted; its own tokens stay live. */
+  bumpScopedEpoch(actor: AccessActor, service: string): Promise<Done<ScopedEpochResult> | Refusal>;
   sync(actor: AccessActor): Promise<Done<SyncResult> | Refusal>;
 };
 
@@ -1340,6 +1407,7 @@ export function openAccess(hangarRoot: string, options: OpenAccessOptions = {}):
     link: (actor, input) => linkSubject(ctx, actor, input),
     unlink: (actor, ref) => unlinkSubject(ctx, actor, ref),
     mintServiceToken: (actor, input) => mintServiceToken(ctx, actor, input),
+    bumpScopedEpoch: (actor, service) => bumpScopedEpoch(ctx, actor, service),
     sync: (actor) => syncProjections(ctx, actor),
   };
 }

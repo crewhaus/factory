@@ -126,6 +126,7 @@ export function rig(
       actor: string,
       permission: string,
       target: string,
+      credentialRef?: string,
     ) => boolean | undefined;
   } = {},
 ): Rig {
