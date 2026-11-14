@@ -126,6 +126,8 @@ import {
   resolveGatewaySecret,
 } from "../packages/gateway-server/src/managed-runs";
 import { groupPlan } from "../packages/hangar-server/src/group-ops";
+import { exclusionFor, isIdentityPath } from "../packages/hangar-server/src/inspect";
+import { gateOnboarding } from "../packages/hangar-server/src/onboarding";
 import {
   absolutePathEnv,
   homeCrewhausArgv,
@@ -4922,6 +4924,29 @@ describe("run records, structured recall, context_assembled, ledger labels, comp
     }
   });
 
+  test("a graph node's upstream state is a workflow step's", async () => {
+    const { seedSourcesOf } = await import("../packages/runtime-core/src/run-records");
+    const upstream = {
+      role: "user" as const,
+      content: 'Upstream state:\n```json\n{"input":"x"}\n```',
+    };
+    expect(
+      seedSourcesOf({ sessionTarget: "graph-node", seedMessages: [upstream] }, {})(upstream),
+    ).toBe("workflow");
+    // The emitted graph names its node loops and their seeds this way.
+    const emitted = readFileSync(
+      join(ROOT, "packages/compiler/src/__fixtures__/model-wiring/graph-nodes.agent.ts.txt"),
+      "utf8",
+    );
+    const nodeLoops = emitted.split('sessionTarget: "graph-node",').length - 1;
+    const seeded = emitted.split("seedMessages: __seed,").length - 1;
+    expect(nodeLoops).toBe(3);
+    expect(seeded).toBe(nodeLoops);
+    const bullet = bulletFor("A graph node's upstream state is labelled as a workflow step's.");
+    expect(bullet).toContain("`(workflow step)`");
+    expect(bullet).toContain("`source`");
+  });
+
   test("a kept compaction summary is in the run's lineage at compaction", async () => {
     const { autoCompact } = await import("../packages/compaction-autocompact/src/index");
     const summary = "The weekly report goes to the finance list every Monday.";
@@ -4933,6 +4958,81 @@ describe("run records, structured recall, context_assembled, ledger labels, comp
     const bullet = bulletFor("A compaction summary carries its origin into the run.");
     expect(bullet).toContain("`compaction`");
     expect(bullet).toContain("egress check");
+  });
+});
+
+describe("Home's inspector, onboarding and a library start with sign-in off", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  test("the raw inspector answers an identity file as its projection, at any depth", () => {
+    expect(isIdentityPath([".crewhaus", "IDENTITY.json"])).toBe(true);
+    expect(isIdentityPath(["sub", ".crewhaus", "identity.json"])).toBe(true);
+    const bullet = bulletFor("shows a harness's identity file as its fingerprint");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("fingerprint");
+  });
+
+  test("the raw inspector refuses a nested harness's run files", () => {
+    expect(exclusionFor(["sub", ".crewhaus", "run", "control-token"])).not.toBeNull();
+    const bullet = bulletFor("refuses a nested harness's run, audit and key files");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("nested");
+  });
+
+  test("onboarding names places on this computer only to registry managers", () => {
+    const gated = gateOnboarding(
+      {
+        harnessCount: 0,
+        completedAt: null,
+        scanRootCount: () => 1,
+        suggestions: () => [{ dir: "/somewhere", exists: true, why: "planted" }],
+        demo: () => ({
+          available: true,
+          source: "/demos",
+          starters: ["hello"],
+          reason: null,
+          remedy: null,
+        }),
+      },
+      false,
+    );
+    expect(gated.suggestions).toEqual([]);
+    expect(gated.demo.source).toBeNull();
+    const bullet = bulletFor("sees scan-root paths, folder suggestions and the demo source");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("manage");
+  });
+
+  test("a library start with sign-in off is refused before Home binds", () => {
+    const source = readFileSync(join(ROOT, "packages/hangar-server/src/server.ts"), "utf8");
+    const refusal = source.indexOf("noAuthRefusal(hangarRoot)");
+    expect(refusal).toBeGreaterThan(-1);
+    expect(refusal).toBeLessThan(source.indexOf("Bun.serve("));
+    const loopback = source.indexOf("noAuth && (!isLoopbackHostname(hostname)");
+    expect(loopback).toBeGreaterThan(-1);
+    expect(loopback).toBeLessThan(source.indexOf("Bun.serve("));
+    const bullet = bulletFor("Starting Home from code with sign-in off fails");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("startHangarServer");
+    expect(bullet).toContain("--no-auth");
+    expect(bullet).toContain("beyond this computer");
+  });
+
+  test("the settings editor checks where its file really is before reading it", () => {
+    const source = readFileSync(join(ROOT, "packages/hangar-server/src/inspect.ts"), "utf8");
+    const write = source.indexOf("export const settingsWrite");
+    expect(write).toBeGreaterThan(-1);
+    const guard = source.indexOf("refuseSettingsPlace(ctx, def.segments, path);", write);
+    const read = source.indexOf("readTextCapped(path", write);
+    expect(guard).toBeGreaterThan(-1);
+    expect(read).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(read);
+    const bullet = bulletFor("settings editor reads and replaces only");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("settings.json");
   });
 });
 

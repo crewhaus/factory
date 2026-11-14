@@ -16,6 +16,7 @@ import { json } from "./http";
 import type { ProcessLayer } from "./process";
 import { COMMAND_HEADER, codeForStatus, createReceipts, settleForStatus } from "./receipts";
 import { ROUTE_BY_KEY } from "./route-table";
+import { startHangarServer } from "./server";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
@@ -498,5 +499,60 @@ describe("Home's boot", () => {
       t.server.controlService.commands.get({ harness: dir }, "cmd_01m76e6f05hp514w9j4v3qymkt")
         ?.state,
     ).toBe("succeeded");
+  });
+});
+
+describe("command recovery's reach", () => {
+  test("outside a request it reads no harness; at boot it reads every one under its own name", async () => {
+    const t = boot();
+    const dir = daemonHarness(t, "orphan");
+    await register(t, dir);
+    await t.server.ready;
+    // A stop whose process died after writing its receipt, as in the boot test above.
+    const id = "cmd_01m76e6f05hp514w9j4v3qymku";
+    const booted = Date.now() - uptime() * 1000;
+    const answer = append(commandsLedgerOf(dir), {
+      id,
+      v: 1,
+      kind: "controls.stop",
+      target: `home/cmd/${id}`,
+      actor: `local:#${"a".repeat(64)}`,
+      via: "cli",
+      fingerprint: "f".repeat(64),
+      state: "accepted",
+      acceptedAt: new Date(Date.now() - 1000).toISOString(),
+      executor: {
+        pid: 2_147_483_646,
+        startedAt: new Date(booted - 60_000).toISOString(),
+        host: hostname(),
+        head: "cli",
+      },
+      effects: [],
+      retry: { retryable: true, safety: "idempotent" },
+    });
+    expect(answer.ok).toBe(true);
+
+    // Called from here, outside any request and any named background work: no harness is
+    // visible to it, so it touches no harness's ledger.
+    const outside = await t.server.controlService.commands.recover("all");
+    expect(outside.redispatched).toBe(0);
+    expect(t.server.controlService.commands.get({ harness: dir }, id)?.state).toBe("accepted");
+
+    // A fresh boot over the same Home runs recovery under its own name, which reads them all.
+    await t.server.stop();
+    const again = startHangarServer({
+      port: 0,
+      root: t.hangarRoot,
+      registryRoot: t.registryRoot,
+      env: { CREWHAUS_WATCHME_ROOT: join(t.workspace, "watchme") },
+      onWarn: () => undefined,
+    });
+    try {
+      const ready = await again.ready;
+      expect(ready.commands.redispatched).toBe(1);
+      expect(again.controlService.commands.get({ harness: dir }, id)?.state).toBe("succeeded");
+    } finally {
+      await again.stop();
+    }
   });
 });

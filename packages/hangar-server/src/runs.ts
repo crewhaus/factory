@@ -300,6 +300,9 @@ export type RunStreamOptions = {
   /** Closes the stream. An abort whose `reason` is `"auth.expired"`,
    *  `"auth.revoked"` or `"revoked"` writes that event, with `{}`, before `done`. */
   readonly signal?: AbortSignal;
+  /** Called once when the stream finishes, for every reason: what the caller set up for
+   *  this stream (its re-check, its session listener) ends with it. */
+  readonly dispose?: () => void;
 };
 
 export const MAX_SSE_FRAMES = 5_000;
@@ -347,6 +350,7 @@ export function runEventStream(options: RunStreamOptions): Response {
         closed = true;
         unsubscribe?.();
         if (heartbeat !== undefined) clearInterval(heartbeat);
+        options.dispose?.();
         try {
           if (CLOSING_EVENTS.has(reason)) {
             controller.enqueue(encoder.encode(frame(reason as SseEventName, {})));

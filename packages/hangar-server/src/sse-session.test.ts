@@ -4,6 +4,7 @@
  * each just before `done`. A stream whose caller has lost access to it closes with
  * `event: revoked` once the access records move. A stream opened with Home's own key is
  * not tied to a session.
+ * A stream's re-check ends with the stream, whatever closed it.
  * The 30-second check is driven by calling it, on a fake clock, never by waiting.
  */
 import { afterEach, describe, expect, test } from "bun:test";
@@ -224,5 +225,70 @@ describe("a run stream opened with a token that ends", () => {
     expect(text.indexOf("event: revoked")).toBeGreaterThan(-1);
     expect(text.indexOf("event: revoked")).toBeLessThan(text.indexOf("event: done"));
     expect(epoch()).toEqual(before);
+  });
+});
+
+describe("a run stream's re-check ends with the stream", () => {
+  test("a replay-only stream leaves no check behind; a live one is checked until its grant goes", async () => {
+    const { t, feedPath } = await liveRun();
+    const runId = "run_00000000000000f1";
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "replayer"), {
+      specName: "replayer",
+      runLedger: [
+        {
+          runId,
+          kind: "daemon",
+          argv: ["bun", "dist/daemon.ts"],
+          startedAt: "2026-11-10T23:00:00.000Z",
+          endedAt: "2026-11-10T23:05:00.000Z",
+          exitCode: 0,
+          logFile: `logs/${runId}.log`,
+        },
+      ],
+      runLogs: [{ runId, log: "boot\nturn ok\n" }],
+    });
+    const added = await t.api("/api/harnesses", { method: "POST", body: JSON.stringify({ dir }) });
+    const replayer = (added.body["entry"] as { id: string }).id;
+    await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+    const read = loadAccessSnapshot(t.hangarRoot);
+    if (read.state !== "present") throw new Error("no access records");
+    const owner = { principal: read.snapshot.owner as string };
+    const access = openAccess(t.hangarRoot);
+    const invite = await access.createInvite(owner, { role: "viewer", scope: "home" });
+    if (!invite.ok) throw new Error(invite.reason);
+    const member = await acceptInvite(t.fetchRaw, invite.result.code, "Vee");
+
+    // A stream with no live run replays its history and ends; its check ends with it.
+    expect(t.server.openStreamChecks()).toBe(0);
+    const replay = await openFeed(t, `/api/h/${replayer}/runs/${runId}/events`, member.session);
+    await replay.until(ended);
+    expect(replay.text().indexOf("event: replay")).toBeGreaterThan(-1);
+    expect(t.server.openStreamChecks()).toBe(0);
+    t.server.checkSessions();
+    expect(t.server.openStreamChecks()).toBe(0);
+
+    // A live stream keeps its check while it is open…
+    const live = await openFeed(t, feedPath, member.session);
+    await live.until(replayed);
+    expect(t.server.openStreamChecks()).toBe(1);
+    t.server.checkSessions();
+    await live.drainWhile(t.fetchRaw("/healthz").then((r) => r.text()));
+    expect(ended(live.text())).toBe(false);
+    expect(t.server.openStreamChecks()).toBe(1);
+
+    // …and closes with revoked once the grant goes, after which nothing is checked.
+    const after = loadAccessSnapshot(t.hangarRoot);
+    if (after.state !== "present") throw new Error("no access records");
+    const grant = after.snapshot.grants.find(
+      (g) => g.principal === (member.answer["principal"] as string),
+    );
+    const revoked = await access.revoke(owner, grant?.id as string);
+    if (!revoked.ok) throw new Error(revoked.reason);
+    t.server.checkSessions();
+    await live.until(ended);
+    const text = live.text();
+    expect(text.indexOf("event: revoked")).toBeGreaterThan(-1);
+    expect(text.indexOf("event: revoked")).toBeLessThan(text.indexOf("event: done"));
+    expect(t.server.openStreamChecks()).toBe(0);
   });
 });

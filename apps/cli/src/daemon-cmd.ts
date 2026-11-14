@@ -152,6 +152,7 @@ const DAEMON_USAGE_LINES: readonly string[] = [
   "       [--tail N] [--follow] [--run <run_id>]",
   "  crewhaus daemon wake [<dir|hrn_id>]         one synthetic tick down the daemon's OWN timer",
   "       --lane heartbeat|schedule [--reason R] path, via crewhaus.control.v1",
+  "       (or --lane schedule:<name>)            for a named schedule lane",
   "  crewhaus daemon drain [<dir|hrn_id>]        stop intake, finish in-flight work, exit 0",
   "  crewhaus daemon pause [<dir|hrn_id>]        pause new work: nothing new starts until",
   "       [--quiet]                              resumed (--quiet: channels show no notice)",
@@ -1405,7 +1406,7 @@ async function daemonWake(
   const harness = resolveHarness(args.positional[0], opts);
   const laneFlag = args.flags.get("lane");
   if (typeof laneFlag !== "string" || !isControlLane(laneFlag)) {
-    throw new Error("daemon wake: --lane must be heartbeat or schedule");
+    throw new Error("daemon wake: --lane must be heartbeat, schedule or schedule:<name>");
   }
   const lane: ControlLane = laneFlag;
   const reasonFlag = args.flags.get("reason");

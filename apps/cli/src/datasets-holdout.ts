@@ -119,3 +119,40 @@ export function usesLines(name: string, version: string, report: HeldOutUsesRepo
 export function releaseUseCount(report: HeldOutUsesReport, split: HeldOutSplit): number {
   return countHeldOutUses(report, split, "release");
 }
+
+/**
+ * How many times a split was released, when the ledger was read whole:
+ * `undefined` when the report is truncated or carries a note, since a count
+ * from part of the ledger is not the count.
+ */
+export function releaseCountOf(report: HeldOutUsesReport, split: HeldOutSplit): number | undefined {
+  if (report.truncated || report.note !== undefined) return undefined;
+  return releaseUseCount(report, split);
+}
+
+/** What `datasets release` does about a split's release count. */
+export type ReleaseGate =
+  | { readonly refuse: string }
+  | { readonly warn: string }
+  | { readonly count: number };
+
+/**
+ * A known release count passes through; a count that cannot be determined
+ * refuses unless `force` is set, and then warns.
+ */
+export function releaseGate(
+  report: HeldOutUsesReport,
+  split: HeldOutSplit,
+  force: boolean,
+): ReleaseGate {
+  const count = releaseCountOf(report, split);
+  if (count !== undefined) return { count };
+  const why = report.note ?? "the use ledger is longer than one read";
+  return force
+    ? {
+        warn: `how many times the ${split} split was released cannot be determined (${why}) — releasing it anyway under --force`,
+      }
+    : {
+        refuse: `how many times the ${split} split was released cannot be determined (${why}) — pass --force to release it anyway`,
+      };
+}

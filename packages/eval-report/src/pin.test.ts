@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,7 +9,13 @@ import {
   lineageOfEntry,
   readBaselines,
 } from "./history";
-import { measurementProblem, pinFromIndexEntry, pinRefusal, pinRun } from "./pin";
+import {
+  measurementProblem,
+  pinFromIndexEntry,
+  pinRefusal,
+  pinRun,
+  sameInstrumentRefusal,
+} from "./pin";
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
@@ -241,6 +247,48 @@ describe("a pin over a different instrument records the re-anchor", () => {
       "pluginsDigest",
       "ts",
     ]);
+  });
+});
+
+describe("a pin that keeps only same-instrument runs requires the instrument to be verifiably the same", () => {
+  test("a graders hash recorded on one side only refuses the pin, and the file is byte-identical", () => {
+    const evalsDir = newTempRoot();
+    expect(pinRun(entry({ runId: "run_a", gradersHash: "g1" }), "t1", evalsDir).ok).toBe(true);
+    const before = readFileSync(join(evalsDir, BASELINES_FILENAME));
+    const outcome = pinRun(entry({ runId: "run_b" }), "t2", evalsDir, {
+      sameInstrumentOnly: true,
+      cmd: "x",
+    });
+    if (outcome.ok) throw new Error("pinned");
+    expect(outcome.refusal.code).toBe("reanchor");
+    expect(outcome.refusal.reason).toContain("gradersHash, recorded on one side only");
+    expect(readFileSync(join(evalsDir, BASELINES_FILENAME)).equals(before)).toBe(true);
+  });
+
+  test("without sameInstrumentOnly the same pin is made, with no re-anchor mark", () => {
+    const evalsDir = newTempRoot();
+    pinRun(entry({ runId: "run_a", gradersHash: "g1" }), "t1", evalsDir);
+    const outcome = pinRun(entry({ runId: "run_b" }), "t2", evalsDir, { cmd: "x" });
+    expect(outcome.ok).toBe(true);
+    expect(outcome.ok && outcome.pin.rebaselined).toBeUndefined();
+  });
+
+  test("the same instrument, the same run, or nothing replaced, is no refusal", () => {
+    const pinned = pinFromIndexEntry(entry({ runId: "run_a", gradersHash: "g1" }), "t");
+    if (!pinned.ok) throw new Error("expected a pin");
+    expect(sameInstrumentRefusal(entry({ runId: "run_b", gradersHash: "g1" }), pinned.pin)).toBe(
+      undefined,
+    );
+    expect(sameInstrumentRefusal(entry({ runId: "run_a" }), pinned.pin)).toBeUndefined();
+    expect(sameInstrumentRefusal(entry({ runId: "run_b" }), undefined)).toBeUndefined();
+  });
+
+  test("a changed field is named without the one-sided note", () => {
+    const pinned = pinFromIndexEntry(entry({ runId: "run_a", gradersHash: "g1" }), "t");
+    if (!pinned.ok) throw new Error("expected a pin");
+    const refused = sameInstrumentRefusal(entry({ runId: "run_b", gradersHash: "g2" }), pinned.pin);
+    expect(refused?.code).toBe("reanchor");
+    expect(refused?.reason).toContain("(gradersHash)");
   });
 });
 

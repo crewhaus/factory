@@ -561,14 +561,11 @@ import { alertWebhookFromSettings, buildAlertSink } from "./alert-sink";
 // import). The gate runs BEFORE the deployment-controller flips the pin.
 import {
   ApprovalGateError,
-  type PrCheckReader,
   buildGovernancePayload,
   candidateSpecHash,
   evaluateProtectedEnvGate,
   loadEnvironmentsConfig,
   policyForEnv,
-  prReferencesVersion,
-  rollupConclusion,
 } from "./approval-gate";
 import {
   ADVISE_SCHEMA,
@@ -759,7 +756,13 @@ import {
   buildContextPressureReport,
   formatContextPressureLines,
 } from "./context-pressure";
-import { holdoutCreatedLines, releaseUseCount, usesJson, usesLines } from "./datasets-holdout";
+import {
+  holdoutCreatedLines,
+  releaseGate,
+  releaseUseCount,
+  usesJson,
+  usesLines,
+} from "./datasets-holdout";
 import { recordRelease } from "./datasets-release";
 // Wave 3 cluster C (B17/B21) — the `datasets status` freshness/saturation
 // report + the `datasets card` markdown datasheet, side-effect-free (run
@@ -1342,6 +1345,7 @@ import {
   resolveExportOutDir,
   smokeCheckClaudePluginBundle,
 } from "./plugin-export";
+import { readPrCheckViaGh } from "./pr-witness";
 // Item 59 — PR-based optimize/advise proposals. `crewhaus propose` packages a
 // spec change into a review artifact + opens a PR (never auto-merges), in a
 // side-effect-free module so it is unit-testable (this entry file runs an argv
@@ -10791,7 +10795,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     ...(rebaseline !== undefined ? { rebaseline } : {}),
     provabilityGraderNames,
     // A re-anchor over a protected criterion needs this harness's owner.
-    ownerCheck: () => ownerCheck(dirname(absSpec)),
+    ownerCheck: () => ownerCheck(dirname(absSpec), undefined, process.env),
     // A re-anchor is a quality decision: it runs under a command receipt in the
     // harness's own ledger, and the pin's mark names that receipt. A receipt that
     // cannot be written keeps the baseline.
@@ -12731,7 +12735,7 @@ async function runEvalReportBaseline(args: ParsedArgs): Promise<void> {
         pin: (receipt) =>
           pinRun(found, new Date().toISOString(), undefined, {
             cmd: "crewhaus eval-report baseline set",
-            ownerCheck: () => ownerCheck(process.cwd()),
+            ownerCheck: () => ownerCheck(process.cwd(), undefined, process.env),
             ...(receipt !== undefined ? { receipt } : {}),
           }),
       });
@@ -13118,7 +13122,11 @@ async function runDatasetsRelease(args: ParsedArgs): Promise<void> {
   // A split's release count: release use lines for that split, plus (for
   // the test split) the legacy entries no use line names.
   const uses = readHeldOutUses(defaultDatasetsRoot(), name, version);
-  const released = releaseUseCount(uses, split);
+  const gate = releaseGate(uses, split, args.flags["force"] === true);
+  if ("refuse" in gate) die(`datasets release: "${name}@${version}" ${gate.refuse}`);
+  if ("warn" in gate)
+    process.stderr.write(`[datasets] warning: "${name}@${version}" ${gate.warn}\n`);
+  const released = "count" in gate ? gate.count : 0;
   if (released > 0) {
     const releases = record.releases ?? [];
     const lastRelease = [...uses.uses]
@@ -20114,59 +20122,6 @@ async function enforceApprovalGate(opts: {
     ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
     auditLog: opts.auditLog,
   });
-}
-
-/** Read a proposal PR's rollup check state via `gh` (the "clients never speak
- *  git" precedent — shell out to gh, not a git library; argv array, no shell).
- *  Any gh failure / absence resolves to `conclusion: "none"` (no witness),
- *  never a throw: a missing gh must not crash a promotion, only withhold the
- *  PR witness. `GITHUB_TOKEN`/`GH_TOKEN` in the environment authenticates gh. */
-function readPrCheckViaGh(query: {
-  specName: string;
-  env: string;
-  version: string;
-}): Awaited<ReturnType<PrCheckReader>> {
-  try {
-    const list = spawnSync(
-      "gh",
-      [
-        "pr",
-        "list",
-        "--state",
-        "open",
-        "--search",
-        `head:propose/${query.specName}`,
-        "--json",
-        "number,url,headRefName,title,body,statusCheckRollup",
-        "--limit",
-        "20",
-      ],
-      { encoding: "utf-8" },
-    );
-    if (list.status !== 0 || typeof list.stdout !== "string") return { conclusion: "none" };
-    const parsed = JSON.parse(list.stdout) as Array<{
-      number: number;
-      url: string;
-      headRefName?: string;
-      title?: string;
-      body?: string;
-      statusCheckRollup?: Array<{ conclusion?: string; state?: string }>;
-    }>;
-    // F3(b): bind the witness to the EXACT version. `propose` names the branch
-    // `propose/<slug>-<version>-<hash>-<stamp>`, so the version is a bounded
-    // segment of the head ref; also accept a version reference in the title/
-    // body. A green PR for a DIFFERENT version must NOT witness this promotion.
-    const pr = parsed.find((p) => prReferencesVersion(p, query.version));
-    if (pr === undefined) return { conclusion: "none" };
-    // F3(a): fail-closed rollup — only an all-SUCCESS (>=1 check) rollup wins.
-    return {
-      conclusion: rollupConclusion(pr.statusCheckRollup ?? []),
-      prNumber: pr.number,
-      url: pr.url,
-    };
-  } catch {
-    return { conclusion: "none" };
-  }
 }
 
 /**

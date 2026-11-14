@@ -11,6 +11,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { lower } from "@crewhaus/compiler";
+import { canonicalJson } from "@crewhaus/control-contract";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { gradersConfigHash, parseGradersConfig } from "@crewhaus/eval-grader";
 import {
@@ -70,6 +71,37 @@ export async function hasExternalWriteTools(specYaml: string): Promise<boolean> 
   if (keys.length === 0) return false;
   const tools = await loadBuiltinTools(keys);
   return Object.values(tools).some((tool) => tool.scope === "external" && tool.readOnly !== true);
+}
+
+/**
+ * The MCP servers a candidate spec adds or defines differently from the base (each
+ * entry compared as canonical JSON of its compiled form), then the tool keys it names
+ * that the base does not, by name; `[]` when it adds neither, and `undefined` when
+ * either spec cannot be compiled, so the caller cannot be told it adds nothing.
+ */
+export function addedToolSurface(
+  baseYaml: string,
+  candidateYaml: string,
+): ReadonlyArray<string> | undefined {
+  try {
+    const base = cliIr(baseYaml);
+    const candidate = cliIr(candidateYaml);
+    const baseServers = (base.mcp_servers ?? {}) as Record<string, unknown>;
+    const added: string[] = [];
+    for (const [name, entry] of Object.entries(candidate.mcp_servers ?? {})) {
+      if (
+        !Object.hasOwn(baseServers, name) ||
+        canonicalJson(baseServers[name]) !== canonicalJson(entry)
+      ) {
+        added.push(name);
+      }
+    }
+    const baseTools = new Set(base.tools);
+    for (const key of candidate.tools) if (!baseTools.has(key)) added.push(key);
+    return added;
+  } catch {
+    return undefined;
+  }
 }
 
 export type QualityRunnersOptions = {
@@ -167,6 +199,7 @@ export function qualityRunners(opts: QualityRunnersOptions): CheckRunners {
     },
     provabilityGraderNames: provabilityGraderNamesOf(compiledForNames),
     externalWriteTools: (specYaml) => opts.externalWrites.get(specYaml) ?? true,
+    addedToolSurface,
     judgeCostUsd: (s: EvalRunSummary) => usd(evalRunCost(s, pricing).judgeMicros),
     agentCostUsd: (s: EvalRunSummary) => usd(evalRunCost(s, pricing).agentMicros),
   };

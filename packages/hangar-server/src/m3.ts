@@ -163,6 +163,14 @@ export type M3Context = {
   readonly contain: (segments: readonly string[]) => string;
   /** Every live registered harness this request may read (fleet-wide folds). */
   readonly harnesses: () => readonly M3Harness[];
+  /**
+   * The registered harness whose directory holds `real` (a real path) when that directory
+   * sits strictly inside this route's harness, whether or not this request may read it;
+   * `visible` says whether it may. Undefined when none does, and on a fleet-wide route.
+   */
+  readonly nestedHarnessAt: (
+    real: string,
+  ) => { readonly id: string; readonly visible: boolean } | undefined;
   /** The supervised process handle (adopted first), for routes that need the
    *  runfile, the control port, or the port ledger. */
   readonly process: () => Promise<HarnessProcess>;

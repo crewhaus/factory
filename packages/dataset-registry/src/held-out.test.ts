@@ -5,6 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  appendFileSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -19,6 +20,8 @@ import type { Sample } from "@crewhaus/eval-dataset";
 import {
   type DatasetRecord,
   DatasetRegistryError,
+  HELD_OUT_USES_READ_CAP,
+  HELD_OUT_USE_LINE_MAX_BYTES,
   appendReleaseEntry,
   countHeldOutUses,
   createFileBackedRegistry,
@@ -254,6 +257,62 @@ describe("readHeldOutUses is a read", () => {
     const report = readHeldOutUses(root, "cases", "v1");
     expect(report).toMatchObject({ present: false, uses: [], skipped: 0, truncated: false });
     expect(existsSync(usesFile())).toBe(false);
+  });
+
+  const useLine = (split: string, purpose: string, at = "2026-01-01T00:00:00Z"): string =>
+    `${JSON.stringify({ v: 1, at, split, purpose, via: "cli" })}\n`;
+
+  test("the newest lines are the ones read: a release on the last line of an over-cap ledger counts", async () => {
+    await seed();
+    appendFileSync(
+      usesFile(),
+      useLine("test", "eval").repeat(HELD_OUT_USES_READ_CAP + 4) + useLine("test", "release"),
+    );
+    const report = readHeldOutUses(root, "cases", "v1");
+    expect(report.truncated).toBe(true);
+    expect(report.uses).toHaveLength(HELD_OUT_USES_READ_CAP);
+    expect(report.uses.at(-1)?.purpose).toBe("release");
+    expect(countHeldOutUses(report, "test", "release")).toBeGreaterThan(0);
+  }, 20_000); // writes and parses ten thousand ledger lines
+
+  test("a ledger larger than the read window is read from its end, and the cut line is not counted as skipped", async () => {
+    await seed();
+    // Few lines, each wide: the byte window, not the line cap, is what is exceeded.
+    const pad = "p".repeat(HELD_OUT_USE_LINE_MAX_BYTES * 3);
+    const wide = (at: string): string =>
+      `${JSON.stringify({ v: 1, at, split: "test", purpose: "eval", via: "cli", pad })}\n`;
+    const count = Math.ceil(HELD_OUT_USES_READ_CAP / 3) + 10;
+    let text = "";
+    for (let i = 0; i < count; i++)
+      text += wide(`2026-01-01T00:00:00.${String(i).padStart(6, "0")}Z`);
+    appendFileSync(usesFile(), text);
+    const report = readHeldOutUses(root, "cases", "v1");
+    expect(report.truncated).toBe(true);
+    expect(report.skipped).toBe(0);
+    expect(report.uses.length).toBeGreaterThan(0);
+    expect(report.uses.length).toBeLessThan(count);
+    expect(report.uses[0]?.at).not.toBe("2026-01-01T00:00:00.000000Z");
+    expect(report.uses.at(-1)?.at).toBe(
+      `2026-01-01T00:00:00.${String(count - 1).padStart(6, "0")}Z`,
+    );
+  }, 20_000); // writes a ledger over ten megabytes
+
+  test("a short ledger is read whole, in file order", async () => {
+    await seed();
+    appendFileSync(
+      usesFile(),
+      useLine("test", "eval", "2026-01-01T00:00:01Z") +
+        useLine("holdout", "eval", "2026-01-01T00:00:02Z") +
+        useLine("test", "release", "2026-01-01T00:00:03Z"),
+    );
+    const report = readHeldOutUses(root, "cases", "v1");
+    expect(report.truncated).toBe(false);
+    expect(report.skipped).toBe(0);
+    expect(report.uses.map((u) => u.at)).toEqual([
+      "2026-01-01T00:00:01Z",
+      "2026-01-01T00:00:02Z",
+      "2026-01-01T00:00:03Z",
+    ]);
   });
 
   test("getRecord, the inspection read, records no use", async () => {
