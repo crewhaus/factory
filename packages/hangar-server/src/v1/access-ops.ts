@@ -26,6 +26,7 @@ import { type ErrorCode, parseRef } from "@crewhaus/control-contract";
 import { foldStates, runsLedger } from "@crewhaus/control-records";
 import { outcomeOf } from "@crewhaus/control-service";
 import { readRunLedger } from "@crewhaus/harness-supervisor";
+import { PERSONAL_SELF_MESSAGE } from "../access";
 import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { fleetSnapshot } from "./lists";
@@ -367,6 +368,19 @@ function revoker(param: "inv" | "grt" | "crd"): V1Handler {
     const access = handleOf(ctx);
     const manager = manages(ctx);
     if (param === "crd" && !manager) {
+      // A personal token revokes only itself; a session, any of its member's own.
+      const actor = ctx.access.caller.actor;
+      if (ctx.access.caller.via === "personal") {
+        const own = actor !== null && "credential" in actor ? actor.credential : undefined;
+        if (id !== own) {
+          throw new V1Error({
+            status: 404,
+            code: "not_found",
+            reason: "not_found",
+            message: "Nothing of yours has that id.",
+          });
+        }
+      }
       // One's own personal token, which `crewhaus logout` ends.
       const { submitted } = await accessCommand(ctx, () =>
         revokeOwnToken(
@@ -390,7 +404,19 @@ function revoker(param: "inv" | "grt" | "crd"): V1Handler {
   };
 }
 
+/** A personal token revokes itself only: never its member's links or devices. */
+function refusePersonal(ctx: V1Context): void {
+  if (ctx.access.caller.via !== "personal") return;
+  throw new V1Error({
+    status: 403,
+    code: "forbidden",
+    reason: "permission",
+    message: PERSONAL_SELF_MESSAGE,
+  });
+}
+
 const linksRevoke: V1Handler = async (ctx) => {
+  refusePersonal(ctx);
   const id = String(ctx.params["lnk"]);
   const ctxOf = {
     root: ctx.deps.hangarRoot,
@@ -407,6 +433,7 @@ const linksRevoke: V1Handler = async (ctx) => {
 };
 
 const devicesRevoke: V1Handler = async (ctx) => {
+  refusePersonal(ctx);
   const id = String(ctx.params["dev"]);
   const caller = ctx.access.caller.principal;
   const manager = manages(ctx);

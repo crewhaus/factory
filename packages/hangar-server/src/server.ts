@@ -291,6 +291,7 @@ import {
 import { SIGN_IN_ROUTES, isSignInPath, serveSignIn } from "./sign-in-routes";
 import { BADGE_KEYS, capabilityBadges, specView } from "./spec-view";
 import { assetResponse } from "./static-cache";
+import { V1_NOT_SERVED } from "./v1/areas";
 import { createV1Router, daemonStateOf } from "./v1/router";
 
 export type StaticAsset = {
@@ -3301,18 +3302,26 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const caller = callerOf(answer, read, operator);
       if (caller === undefined) return errResponse(401, "missing or invalid bearer token");
       const view = accessView(read);
-      const decided = authorizeRequest({
-        row: matched.row,
-        params: matched.params,
-        caller,
-        view,
-        ...(matched.row.key === "runProof"
-          ? { runProofHarness: proofOwner(matched.params["sessionId"], url) }
-          : {}),
-        ...(matched.row.v1 === true ? v1Router.targetOf(matched, url, caller) : {}),
-        origin: req.headers.get("origin"),
-        ownOrigin,
-      });
+      // An operation this Home does not serve yet says so to anyone signed in, before any
+      // permission is asked: there is nothing it would do.
+      const notServedYet =
+        matched.row.v1 === true &&
+        caller.scoped === undefined &&
+        Object.hasOwn(V1_NOT_SERVED, matched.row.key);
+      const decided = notServedYet
+        ? ({ allow: true } as const)
+        : authorizeRequest({
+            row: matched.row,
+            params: matched.params,
+            caller,
+            view,
+            ...(matched.row.key === "runProof"
+              ? { runProofHarness: proofOwner(matched.params["sessionId"], url) }
+              : {}),
+            ...(matched.row.v1 === true ? v1Router.targetOf(matched, url, caller) : {}),
+            origin: req.headers.get("origin"),
+            ownOrigin,
+          });
       if (!decided.allow) return refusalResponse(pathname, decided.refusal);
       // HM-187 — read-only mode, after authorization (a caller who may not do something
       // hears that first) and ahead of every handler. It decides by the matched row: a

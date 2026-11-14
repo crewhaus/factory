@@ -57,7 +57,11 @@ function daemonControl(): V1Handler {
   };
 }
 
-/** The steps a retirement runs from Home, in order. The archive is the CLI's. */
+/**
+ * The steps a retirement runs from Home, in order. The archive is the CLI's. They stop at
+ * the first that fails: nothing is recorded as retired, and its registry row stays, unless
+ * every step before has done its part.
+ */
 const RETIRE_STEPS = [
   "stopAndDisable",
   "cancelQueuedRuns",
@@ -87,6 +91,11 @@ function spendNonce(nonce: string, harness: string, caller: string, now: number)
   nonces.delete(nonce);
   return held !== undefined && held.harness === harness && held.caller === caller && held.exp > now;
 }
+
+type RetireAnswer = {
+  readonly steps: readonly Readonly<Record<string, unknown>>[];
+  readonly remedy?: string;
+};
 
 const retire: V1Handler = async (ctx) => {
   const entry = harnessOf(ctx);
@@ -139,7 +148,7 @@ const retire: V1Handler = async (ctx) => {
       current: { daemon: state },
     });
   }
-  const submitted = await submitCommand(ctx, {
+  const submitted = await submitCommand<RetireAnswer>(ctx, {
     target: `home/harness/${entry.id}`,
     ledger: "workspace",
     effect: async (receipt) => {
@@ -157,24 +166,45 @@ const retire: V1Handler = async (ctx) => {
         holder: { pid: process.pid },
       });
       const outcomes = [];
-      for (const step of RETIRE_STEPS) outcomes.push(await steps[step]());
-      const ok = outcomes.every((outcome) => outcome.ok);
+      for (const step of RETIRE_STEPS) {
+        const outcome = await steps[step]();
+        outcomes.push(outcome);
+        if (!outcome.ok) break;
+      }
+      const ok = outcomes.length === RETIRE_STEPS.length && outcomes.every((o) => o.ok);
+      const ran = outcomes.map((o) => ({
+        kind: o.step,
+        status: o.ok ? "done" : "failed",
+        note: o.detail,
+      }));
+      const notRun = RETIRE_STEPS.slice(outcomes.length).map((kind) => ({
+        kind,
+        status: "skipped",
+        note: "Not run: an earlier step failed.",
+      }));
+      const disabled = outcomes.some((o) => o.step === "stopAndDisable" && o.ok);
       return {
         settle: { state: ok ? "succeeded" : "failed", effects: [...steps.effects()] },
-        value: [
-          ...outcomes.map((o) => ({
-            kind: o.step,
-            status: o.ok ? "done" : "failed",
-            note: o.detail,
-          })),
-          archiveNote,
-        ],
+        value: ok
+          ? { steps: [...ran, archiveNote] }
+          : {
+              steps: [...ran, ...notRun],
+              remedy: disabled
+                ? "The harness is not retired and stays disabled. Fix what failed and retire it again, or run `crewhaus daemon enable` to allow starts again."
+                : "The harness is not retired. Fix what failed and retire it again.",
+            },
       };
     },
   });
+  const value = submitted.value;
   return {
     status: 200,
-    body: { dryRun: false, steps: submitted.value ?? [], receipt: submitted.receipt },
+    body: {
+      dryRun: false,
+      steps: value?.steps ?? [],
+      ...(value?.remedy !== undefined ? { remedy: value.remedy } : {}),
+      receipt: submitted.receipt,
+    },
     scrubDir: dir,
   };
 };

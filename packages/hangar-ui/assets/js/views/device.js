@@ -6,8 +6,9 @@
  *
  * The code is typed in any case, with or without its hyphen; a `?code=` in the page's
  * address fills it in. Every answer is said in words with its reason, status is a word
- * and an icon (never colour alone), the result heading takes focus, and the live region
- * is polite. DOM by `createElement` and `textContent` only.
+ * and an icon (never colour alone), the result heading takes focus and says how it
+ * ended, a refused choice gives focus back to the button pressed, and the live region is
+ * polite. DOM by `createElement` and `textContent` only.
  */
 
 import { append, clear, el } from "../dom.js";
@@ -24,6 +25,7 @@ export const DEVICE_MESSAGES = Object.freeze({
   session_required:
     "This page cannot allow a sign-in. Open Home on its own computer or over HTTPS, signed in as a member.",
   access_not_set_up: "Nobody can allow a sign-in on this Home yet.",
+  no_credential: "Your sign-in to this Home ended. Sign in again, then look up the code.",
 });
 
 function messageOf(error) {
@@ -86,16 +88,32 @@ export function renderDevice(root, _ctx) {
     el("div", { class: "field-inline" }, [input, lookUp]),
   ]);
 
-  const decide = async (code, choice, buttons) => {
-    for (const b of buttons) b.disabled = true;
+  // While a choice is sent its buttons say so with `aria-disabled`, never `disabled`: a
+  // disabled button drops focus, and the person pressing it would lose their place.
+  const busy = (buttons, on) => {
+    for (const b of buttons) {
+      if (on) b.setAttribute("aria-disabled", "true");
+      else b.removeAttribute("aria-disabled");
+    }
+  };
+  const decide = async (code, choice, heading, pressed, buttons) => {
+    if (pressed.getAttribute("aria-disabled") === "true") return;
+    busy(buttons, true);
     say("info", choice === "allow" ? "allowing the sign-in…" : "denying the sign-in…");
-    const action = createAction("auth.device.decide", { body: { code, choice } });
-    const answer = await action.run();
-    for (const b of buttons) b.disabled = false;
+    let answer;
+    try {
+      const action = createAction("auth.device.decide", { body: { code, choice } });
+      answer = await action.run();
+    } finally {
+      busy(buttons, false);
+    }
     if (!answer.ok) {
       say("error", messageOf(answer.error));
+      pressed.focus();
       return;
     }
+    heading.textContent = choice === "allow" ? "Sign-in allowed" : "Sign-in denied";
+    heading.focus();
     for (const b of buttons) b.hidden = true;
     say(
       "ok",
@@ -115,8 +133,12 @@ export function renderDevice(root, _ctx) {
     }
     lookUp.disabled = true;
     say("info", "looking up the code…");
-    const answer = await call("auth.device.lookup", { body: { code } });
-    lookUp.disabled = false;
+    let answer;
+    try {
+      answer = await call("auth.device.lookup", { body: { code } });
+    } finally {
+      lookUp.disabled = false;
+    }
     clear(result);
     if (!answer.ok) {
       result.hidden = true;
@@ -137,8 +159,8 @@ export function renderDevice(root, _ctx) {
       text: "Allow this sign-in",
     });
     const deny = el("button", { class: "btn", type: "button", text: "Deny" });
-    allow.addEventListener("click", () => decide(code, "allow", [allow, deny]));
-    deny.addEventListener("click", () => decide(code, "deny", [allow, deny]));
+    allow.addEventListener("click", () => decide(code, "allow", heading, allow, [allow, deny]));
+    deny.addEventListener("click", () => decide(code, "deny", heading, deny, [allow, deny]));
     append(result, [
       heading,
       el("ul", { class: "check-list" }, [

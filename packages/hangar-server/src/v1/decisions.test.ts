@@ -154,8 +154,16 @@ describe("reading", () => {
   });
 
   test("a bare id needs its harness", async () => {
+    // Even one match is not a guess: the answer names it as a candidate.
     const res = await home.call("GET", "/api/v1/decisions/appr_00000000000000a3");
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(422);
+    const error = res.body["error"] as Record<string, unknown>;
+    expect(error["reason"]).toBe("harness_needed");
+    expect(
+      ((error["details"] as Record<string, unknown>)["candidates"] as { ref: string }[]).map(
+        (c) => c.ref,
+      ),
+    ).toEqual([`${a.id}/decision/appr_00000000000000a3`]);
     const b = await home.harness("bravo", { approvals: [approval("appr_00000000000000a3")] });
     const both = await home.call("GET", "/api/v1/decisions/appr_00000000000000a3");
     expect(both.status).toBe(422);
@@ -172,4 +180,49 @@ describe("reading", () => {
     expect(hinted.status).toBe(200);
     expect(hinted.body["harness"]).toBe(b.id);
   });
+});
+
+describe("a decision is settled only where the caller may settle it", () => {
+  test("operator on one harness and viewer on another cannot settle the other's by bare id", async () => {
+    const id = "appr_00000000000000d1";
+    const viewed = await home.harness("delta", { approvals: [approval(id)] });
+    const own = await home.harness("charlie", {
+      approvals: [approval("appr_00000000000000c1")],
+    });
+    const sam = await home.member("Sam", "viewer", { scope: `harness:${viewed.id}` });
+    const { openAccess } = await import("@crewhaus/access-control");
+    const granted = await openAccess(home.t.hangarRoot).grant(
+      { principal: home.owner },
+      { member: sam.principal, role: "operator", scope: `harness:${own.id}` },
+    );
+    if (!granted.ok) throw new Error(granted.reason);
+    const until = new Date(Date.now() + 86_400_000).toISOString();
+    const asks = [
+      ["resolve", { choice: "grant" }],
+      ["supersede", { reason: "other" }],
+      ["defer", { until, reason: "scheduled" }],
+    ] as const;
+    const paths = (verb: string) => [
+      `/api/v1/decisions/${id}/${verb}`,
+      `/api/v1/decisions/${id}/${verb}?harness=${viewed.id}`,
+      `/api/v1/decisions/${viewed.id}/decision/${id}/${verb}`,
+    ];
+    for (const [verb, body] of asks) {
+      for (const at of paths(verb)) {
+        const res = await home.call("POST", at, { body, secret: sam.secret });
+        expect(`${at}: ${res.status}`).toMatch(/: (403|422)$/);
+      }
+    }
+    const after = await home.call("GET", `/api/v1/decisions/${viewed.id}/decision/${id}`);
+    expect(after.status).toBe(200);
+    expect(after.body["state"]).toBe("pending");
+    expect(after.body["decision"]).toBeUndefined();
+    // Their own harness's decision they may settle.
+    const mine = await home.call(
+      "POST",
+      `/api/v1/decisions/${own.id}/decision/appr_00000000000000c1/resolve`,
+      { body: { choice: "deny" }, secret: sam.secret },
+    );
+    expect(mine.status).toBe(200);
+  }, 30_000); // a member's device sign-in and ten requests through a live server
 });

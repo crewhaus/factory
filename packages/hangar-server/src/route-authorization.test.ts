@@ -1119,8 +1119,12 @@ describe("the versioned API: every served operation, for every role and credenti
       if (decl.scope === "home") {
         const held = !capped(op.permission) && memberOutcome(row, grants) === ALLOW;
         if (held) return ALLOW;
-        // One's own tokens, links and devices: any live grant covers them.
-        if (selfRow && Object.values(grants).length > 0) return ALLOW;
+        // One's own tokens, links and devices: any live grant covers them. A personal
+        // token reads its member's own lists and revokes only itself, and the matrix's
+        // sample ids name nothing of its own.
+        if (selfRow && Object.values(grants).length > 0) {
+          return opts.personal === true && op.path.endsWith("/revoke") ? refuse : ALLOW;
+        }
         return refuse;
       }
       if (capped(op.permission)) return refuse;
@@ -1271,8 +1275,79 @@ describe("the versioned API: every served operation, for every role and credenti
     }, 120_000); // ~50 requests through a live server
   }
 
+  test("a bare decision id is settled on no harness the request did not name", async () => {
+    const until = new Date(Date.now() + 86_400_000).toISOString();
+    const asks = [
+      ["resolve", { choice: "grant" }],
+      ["supersede", { reason: "other" }],
+      ["defer", { until, reason: "scheduled" }],
+    ] as const;
+    const wrong: string[] = [];
+    for (const cred of ["memberB", "viewerA", "personalReadOnlyA"] as const) {
+      for (const [verb, body] of asks) {
+        for (const id of ["appr_00000000000000a1", "appr_00000000000000b1"]) {
+          const res = await world.t.fetchRaw(`/api/v1/decisions/${id}/${verb}`, {
+            method: "POST",
+            headers: { "content-type": "application/json", ...credOf(cred).headers },
+            body: JSON.stringify(body),
+          });
+          if (res.status !== 403 && res.status !== 422) {
+            wrong.push(`${cred} ${verb} ${id}: ${res.status}`);
+          }
+        }
+      }
+    }
+    expect(wrong).toEqual([]);
+    const pending = (await world.t
+      .fetchRaw("/api/approvals", { headers: credOf("owner").headers })
+      .then((r) => r.json())) as { approvals: Array<Record<string, unknown>> };
+    const a1 = pending.approvals.find((row) => row["id"] === "appr_00000000000000a1");
+    expect(a1).toBeDefined();
+    expect(a1?.["decision"]).toBeUndefined();
+  }, 60_000); // eighteen requests through a live server
+
+  test("a read-only personal token is capped on a row about several harnesses", async () => {
+    const { v1Home } = await import("./__test__/v1-home");
+    const home = await v1Home();
+    try {
+      const readOnly = await home.member("Olive", "operator", { readOnly: true });
+      const full = await home.member("Otto", "operator");
+      const snapshot = loadAccessSnapshot(home.t.hangarRoot);
+      if (snapshot.state !== "present") throw new Error("no access records");
+      const view: AccessView = {
+        read: snapshot,
+        now: Date.now(),
+        domains: new Map(),
+        groupsOf: () => undefined,
+        harnessIds: () => [],
+      };
+      const row: RouteRow = {
+        key: "plantedFleetWrite",
+        method: "POST",
+        path: "/api/v1/planted",
+        permission: "h.decision.resolve",
+        qualifiers: [],
+        receipt: "harness",
+        cliTwin: null,
+        v1: true,
+      } as RouteRow;
+      const as = (m: { principal: string; credential: string }): Caller => ({
+        principal: m.principal,
+        actor: { principal: m.principal, credential: m.credential },
+        via: "personal",
+      });
+      const capped = authorizeRequest({ row, params: {}, caller: as(readOnly), view });
+      expect(capped.allow).toBe(false);
+      expect(capped.allow === false ? capped.refusal.reason : undefined).toBe("permission");
+      expect(authorizeRequest({ row, params: {}, caller: as(full), view }).allow).toBe(true);
+    } finally {
+      await home.t.stop();
+    }
+  }, 30_000);
+
   test("a personal token may revoke only itself", async () => {
     const { v1Home } = await import("./__test__/v1-home");
+    const { openDeviceRequests } = await import("@crewhaus/access-control");
     const home = await v1Home();
     try {
       const sam = await home.member("Sam", "viewer");
@@ -1281,7 +1356,76 @@ describe("the versioned API: every served operation, for every role and credenti
         body: {},
         secret: sam.secret,
       });
-      expect(other.status).toBe(404);
+      expect(other.status).toBe(403);
+      expect((other.body["error"] as Record<string, unknown>)["reason"]).toBe("permission");
+
+      // Ivy: a browser session (a device), an identity link, and two personal tokens.
+      const invited = await openAccess(home.t.hangarRoot).createInvite(
+        { principal: home.owner },
+        { role: "viewer", scope: "home" },
+      );
+      if (!invited.ok) throw new Error(invited.reason);
+      const browser = await acceptInvite(home.t.fetchRaw, invited.result.code, "Ivy");
+      const me = await home.call("GET", "/api/v1/me", { secret: browser.session });
+      const ivy = String((me.body["principal"] as Record<string, unknown>)["id"]);
+      expect(ivy).toMatch(/^prn_/);
+      const devices = openDeviceRequests(home.t.hangarRoot);
+      const token = async (readOnly: boolean) => {
+        const start = await devices.start({ ...(readOnly ? { readOnly: true } : {}) });
+        if (!start.ok) throw new Error(start.reason);
+        const decided = await devices.decide({
+          caller: ivy,
+          code: start.userCode,
+          choice: "allow",
+        });
+        if (!decided.ok) throw new Error(decided.reason);
+        const polled = await devices.poll(start.pollRef);
+        if (!polled.ok || polled.state !== "allowed") throw new Error("no personal token");
+        return { secret: polled.secret, credential: polled.token.id };
+      };
+      const full = await token(false);
+      const readOnly = await token(true);
+      const linked = await home.call("POST", "/api/v1/access/links", {
+        body: { subject: "github:4242", principal: ivy },
+      });
+      const lnk = String((linked.body["link"] as Record<string, unknown>)["id"]);
+      expect(lnk).toMatch(/^lnk_/);
+
+      for (const [holder, sibling] of [
+        [full, readOnly],
+        [readOnly, full],
+      ] as const) {
+        const asks = [
+          `/api/v1/access/tokens/${sibling.credential}/revoke`,
+          `/api/v1/access/devices/${browser.device}/revoke`,
+          `/api/v1/access/links/${lnk}/revoke`,
+        ];
+        for (const path of asks) {
+          const res = await home.call("POST", path, { body: {}, secret: holder.secret });
+          expect(`${path}: ${res.status}`).toBe(`${path}: 403`);
+          expect((res.body["error"] as Record<string, unknown>)["reason"]).toBe("permission");
+        }
+      }
+      // Nothing was revoked: the other token, the browser and the link all still work.
+      expect((await home.call("GET", "/api/v1/me", { secret: full.secret })).status).toBe(200);
+      expect((await home.call("GET", "/api/v1/me", { secret: readOnly.secret })).status).toBe(200);
+      expect((await home.call("GET", "/api/v1/me", { secret: browser.session })).status).toBe(200);
+      const links = await home.call("GET", "/api/v1/access/links");
+      const kept = (links.body["items"] as Array<Record<string, unknown>>).find(
+        (row) => row["id"] === lnk,
+      );
+      expect(kept).toBeDefined();
+      expect(kept?.["revokedAt"]).toBeUndefined();
+
+      // Each revokes itself.
+      for (const self of [readOnly, full]) {
+        const own = await home.call("POST", `/api/v1/access/tokens/${self.credential}/revoke`, {
+          body: {},
+          secret: self.secret,
+        });
+        expect(own.status).toBe(200);
+        expect((await home.call("GET", "/api/v1/me", { secret: self.secret })).status).toBe(401);
+      }
       const own = await home.call("POST", `/api/v1/access/tokens/${sam.credential}/revoke`, {
         body: {},
         secret: sam.secret,

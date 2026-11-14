@@ -107,4 +107,39 @@ describe("a not-served operation answers 501", () => {
     if (op === undefined) throw new Error("no people.persons.get");
     expect(twinVerb(op, { psn })).toBe(`crewhaus people show ${psn}`);
   });
+
+  // One operation from each not-served group, over HTTP as the owner: each says it is not
+  // served yet, before any permission is asked, so nobody is told to ask for access.
+  for (const [id, path] of [
+    ["events.fleet", "/api/v1/events"],
+    ["people.persons.list", "/api/v1/people"],
+  ] as const) {
+    test(`${id} answers 501 not_served to the owner`, async () => {
+      const res = await home.call("GET", path);
+      expect(res.status).toBe(501);
+      const error = res.body["error"] as Record<string, unknown>;
+      expect(error["code"]).toBe("unsupported");
+      expect(error["reason"]).toBe("not_served");
+      expect(error["message"]).toBe(V1_NOT_SERVED[id]);
+    });
+  }
+
+  test("a not-served people row names its twin over HTTP", async () => {
+    const psn = "psn_01m76e6f05hp514w9j4v3qymka";
+    const res = await home.call("GET", `/api/v1/people/${psn}`);
+    expect(res.status).toBe(501);
+    const error = res.body["error"] as Record<string, unknown>;
+    expect(error["reason"]).toBe("not_served");
+    expect(error["message"]).toBe(V1_NOT_SERVED["people.persons.get"]);
+    expect(error["verb"]).toBe(`crewhaus people show ${psn}`);
+  });
+
+  test("a member without the permission hears the same answer, not a refusal", async () => {
+    const viewer = await home.member("Vic", "viewer");
+    const res = await home.call("GET", "/api/v1/people", { secret: viewer.secret });
+    expect(res.status).toBe(501);
+    expect((res.body["error"] as Record<string, unknown>)["reason"]).toBe("not_served");
+    const anonymous = await home.call("GET", "/api/v1/people", { secret: null });
+    expect(anonymous.status).toBe(401);
+  });
 });

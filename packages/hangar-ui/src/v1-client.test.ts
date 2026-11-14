@@ -1,8 +1,12 @@
 /**
  * The console's v1 client: every path comes from the operation table Home publishes, and
- * one user action carries one Idempotency-Key, the same on its retry.
+ * one user action carries one Idempotency-Key, the same on its retry. It never throws:
+ * Home offline or a table it could not read comes back as an answer, and a session that
+ * ended is signed in again and the call sent once more with its key.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import { onUnauthorized } from "../assets/js/api.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { call, createAction, pathFor, resetDiscovery } from "../assets/js/v1.js";
 
@@ -29,6 +33,7 @@ function home(answers: (url: string) => Response) {
 }
 
 beforeEach(() => resetDiscovery());
+afterEach(() => onUnauthorized(null));
 
 describe("the v1 client", () => {
   test("builds paths from the planted table only, and reads it once", async () => {
@@ -116,5 +121,80 @@ describe("the v1 client", () => {
         reason: "permission",
       },
     });
+  });
+
+  test("Home offline answers, never throws, and the next call reads the table again", async () => {
+    let up = false;
+    const seen: string[] = [];
+    const fetchImpl = async (url: string) => {
+      seen.push(url);
+      if (!up) throw new Error("offline");
+      return url === "/api/v1" ? Response.json(PLANTED) : Response.json({ ok: 1 });
+    };
+    const answer = await call("auth.device.decide", { body: {} }, fetchImpl);
+    expect(answer).toMatchObject({ ok: false, status: 0, error: { code: "unavailable" } });
+    up = true;
+    expect((await call("auth.device.decide", { body: {} }, fetchImpl)).ok).toBe(true);
+    expect(seen).toEqual(["/api/v1", "/api/v1", "/api/v1/somewhere/decide"]);
+  });
+
+  test("a table refused with 401 and no way to sign in again is an answer", async () => {
+    const fetchImpl = async () =>
+      Response.json(
+        { error: { code: "unauthenticated", message: "missing", reason: "no_credential" } },
+        { status: 401 },
+      );
+    const answer = await call("auth.device.decide", { body: {} }, fetchImpl);
+    expect(answer).toMatchObject({
+      ok: false,
+      status: 401,
+      error: { code: "unauthenticated", reason: "no_credential" },
+    });
+  });
+
+  test("a session that ended is signed in again, then the call goes once more with its key", async () => {
+    let signedIn = false;
+    let asked = 0;
+    onUnauthorized(() => {
+      asked += 1;
+      signedIn = true;
+      return true;
+    });
+    const seen: Seen[] = [];
+    const fetchImpl = async (url: string, init: RequestInit) => {
+      seen.push({ url, init });
+      if (!signedIn && url !== "/api/v1") {
+        return Response.json({ error: { code: "unauthenticated", message: "x" } }, { status: 401 });
+      }
+      return url === "/api/v1" ? Response.json(PLANTED) : Response.json({ receipt: {} });
+    };
+    const action = createAction("auth.device.decide", { body: { code: "c" } }, fetchImpl);
+    const answer = await action.run();
+    expect(answer.ok).toBe(true);
+    expect(asked).toBe(1);
+    // The table was read again after signing in, and both sends carried one key.
+    expect(seen.map((s) => s.url)).toEqual([
+      "/api/v1",
+      "/api/v1/somewhere/decide",
+      "/api/v1",
+      "/api/v1/somewhere/decide",
+    ]);
+    const keys = seen
+      .filter((s) => s.url !== "/api/v1")
+      .map((s) => new Headers(s.init.headers).get("Idempotency-Key"));
+    expect(keys).toEqual([action.key, action.key]);
+  });
+
+  test("a 401 reading the table signs in again too, and is retried once at most", async () => {
+    let asked = 0;
+    onUnauthorized(() => {
+      asked += 1;
+      return true;
+    });
+    const fetchImpl = async () =>
+      Response.json({ error: { code: "unauthenticated", message: "x" } }, { status: 401 });
+    const answer = await call("auth.device.decide", { body: {} }, fetchImpl);
+    expect(answer.status).toBe(401);
+    expect(asked).toBe(1);
   });
 });

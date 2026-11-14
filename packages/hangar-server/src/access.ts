@@ -43,14 +43,12 @@ import {
   authenticate,
   authorize,
   domainOf,
-  effectiveRole,
   loadAccessSnapshot,
   recordUsage,
   registerDomainIn,
 } from "@crewhaus/access-control";
 import {
   PERMISSION_DECLS,
-  ROLE_PERMISSIONS,
   type Role,
   isPermission,
   parseRef,
@@ -355,6 +353,9 @@ export function authorizeCaller(
   });
 }
 
+/** A harness target only a grant over the whole Home covers. */
+const ANY_HARNESS: AccessTarget = Object.freeze({ scope: "harness", harness: "", groups: [] });
+
 /**
  * Whether the caller holds a harness permission on at least one registered harness, or
  * through its grant over the whole Home: the rule for a route about several harnesses,
@@ -362,12 +363,9 @@ export function authorizeCaller(
  */
 function holdsOnSomeHarness(caller: Caller, view: AccessView, permission: string): boolean {
   if (caller.actor === null) return true;
-  if (view.read.state === "present") {
-    const role = effectiveRole(view.read.snapshot, caller.principal, { scope: "home" }, view.now);
-    if (role !== null && (ROLE_PERMISSIONS[role] as readonly string[]).includes(permission)) {
-      return true;
-    }
-  }
+  // A grant over the whole Home covers every harness, registered or not: asked on a harness
+  // no grant names, so only a home grant answers, through `authorize()` and its caps.
+  if (authorizeCaller(caller, view, permission, ANY_HARNESS).allow) return true;
   return view
     .harnessIds()
     .some((id) => authorizeCaller(caller, view, permission, harnessTarget(view, id)).allow);
@@ -431,6 +429,32 @@ const TAB_ONLY_REFUSAL: RefusalBody = Object.freeze({
   reason: "tab_only",
   message: TAB_ONLY_MESSAGE,
 });
+
+/** What a personal token hears when it asks to revoke anything but itself. */
+export const PERSONAL_SELF_MESSAGE =
+  "A personal token can revoke only itself. Sign in to Home in a browser to manage your devices and links.";
+
+const PERSONAL_SELF_REFUSAL: RefusalBody = Object.freeze({
+  status: 403,
+  code: "forbidden",
+  reason: "permission",
+  message: PERSONAL_SELF_MESSAGE,
+});
+
+/**
+ * What a personal token may do about its own member: read the member's own tokens, links
+ * and devices, and revoke the one token it is.
+ */
+function personalSelfAllows(
+  row: RouteRow,
+  params: Readonly<Record<string, string>>,
+  caller: Caller,
+): boolean {
+  if (row.method === "GET") return true;
+  const own =
+    caller.actor !== null && "credential" in caller.actor ? caller.actor.credential : undefined;
+  return row.key === "access.tokens.revoke" && own !== undefined && params["crd"] === own;
+}
 
 export type RequestAuthorization =
   | { readonly allow: true }
@@ -499,12 +523,16 @@ export function authorizeRequest(input: AuthorizeRequestInput): RequestAuthoriza
       : undefined;
   const owner = isOwnerCaller(caller, view.read);
   // One's own token, device or link: `self.preferences` covers it, whatever else is held.
+  // A personal token reads its member's own lists and revokes itself, and nothing more.
   if (
     input.selfScope === true &&
     !authorizeCaller(caller, view, row.permission, { scope: "home" }).allow &&
     authorizeCaller(caller, view, "self.preferences", { scope: "home" }).allow
   ) {
-    return { allow: true };
+    if (caller.via !== "personal" || personalSelfAllows(row, params, caller)) {
+      return { allow: true };
+    }
+    return { allow: false, refusal: PERSONAL_SELF_REFUSAL };
   }
   const harnessScoped =
     isPermission(row.permission) && PERMISSION_DECLS[row.permission].scope === "harness";

@@ -4,12 +4,14 @@
  * from it by operation id, so the console keeps no second route map for the API. It
  * sends this tab's session, and one `Idempotency-Key` per user action, reused when that
  * action is retried. An error comes back as the envelope's own words: `{code, message,
- * verb, needs, reason}`.
+ * verb, needs, reason}`. A session that ended is signed in again the way every other
+ * request does it (the sign-in dialog over the view), then the call is sent once more
+ * with the same key.
  *
  * No DOM: a test imports it with an injected fetch.
  */
 
-import { getSession } from "./api.js";
+import { getSession, recoverSession } from "./api.js";
 
 const PROTOCOL = "crewhaus.hangar.v1";
 const KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -28,20 +30,40 @@ function headersFor(extra) {
   return headers;
 }
 
-/** The operation table, read once. A failed read is not kept. */
+/**
+ * The operation table, read once. A failed read is not kept. It rejects with `{code,
+ * status, reason}` when Home cannot be reached or answers without its operations.
+ */
 export function discover(fetchImpl = fetch) {
   if (table !== null) return table;
   table = (async () => {
-    const res = await fetchImpl("/api/v1", { method: "GET", headers: headersFor({}) });
+    let res;
+    try {
+      res = await fetchImpl("/api/v1", { method: "GET", headers: headersFor({}) });
+    } catch {
+      throw Object.assign(new Error("Home could not be reached."), {
+        code: "unavailable",
+        status: 0,
+      });
+    }
     const body = await res.json().catch(() => ({}));
     if (!res.ok || !Array.isArray(body.operations)) {
-      table = null;
-      throw Object.assign(new Error("Home did not answer with its operations."), {
-        code: "unsupported_protocol",
-      });
+      const error = errorOf(res.status, body);
+      throw Object.assign(
+        new Error(res.status === 401 ? error.message : "Home did not answer with its operations."),
+        {
+          code: res.status === 401 ? "unauthenticated" : "unsupported_protocol",
+          status: res.status,
+          ...(error.reason !== undefined ? { reason: error.reason } : {}),
+        },
+      );
     }
     return body;
   })();
+  // A failed read is not kept: the next call asks again.
+  table.catch(() => {
+    table = null;
+  });
   return table;
 }
 
@@ -89,10 +111,31 @@ function errorOf(status, body) {
 
 /**
  * Call one operation by id. Answers `{ok: true, status, body}` or `{ok: false, status,
- * error}`; never throws for an answer Home gave.
+ * error}`; never throws. A 401, from the call or from reading the table, asks the tab to
+ * sign in again and, when it did, reads the table afresh and sends the call once more.
  */
 export async function call(id, opts = {}, fetchImpl = fetch) {
-  const found = await discover(fetchImpl);
+  const first = await attempt(id, opts, fetchImpl);
+  if (first.status !== 401 || !(await recoverSession())) return first;
+  resetDiscovery();
+  return attempt(id, opts, fetchImpl);
+}
+
+async function attempt(id, opts, fetchImpl) {
+  let found;
+  try {
+    found = await discover(fetchImpl);
+  } catch (err) {
+    return {
+      ok: false,
+      status: typeof err?.status === "number" ? err.status : 0,
+      error: {
+        code: typeof err?.code === "string" ? err.code : "unavailable",
+        message: err instanceof Error ? err.message : "Home could not be reached.",
+        ...(typeof err?.reason === "string" ? { reason: err.reason } : {}),
+      },
+    };
+  }
   const operation = found.operations.find((op) => op.id === id);
   if (operation === undefined) {
     return {

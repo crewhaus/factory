@@ -14,6 +14,7 @@ import {
   parseDeferUntil,
   resolveHarnessSessionRoot,
 } from "@crewhaus/session-store";
+import { permissionMessage } from "../access";
 import { foldApprovals } from "../approvals";
 import { maskDeep } from "../mask";
 import type { V1Context, V1Handler } from "./context";
@@ -66,7 +67,12 @@ type Located = {
   readonly record: PendingApproval;
 };
 
-/** The decision `{ref}` names, in a harness the caller may read. */
+/**
+ * The decision `{ref}` names, in a harness the caller may read. A bare id is looked up
+ * only in the harness `?harness=` names; without one it is 422 `harness_needed` with the
+ * candidates the caller may read, never a guess, so every decision is acted on in the
+ * harness the request named.
+ */
 function locate(ctx: V1Context): Located {
   const raw = ctx.params["ref"] ?? "";
   const parsed = parseRef(raw);
@@ -89,11 +95,14 @@ function locate(ctx: V1Context): Located {
     return found;
   }
   const hint = ctx.query["harness"];
-  const found = (hint !== undefined ? [entryOf(ctx.deps, hint)] : visibleHarnesses(ctx.deps))
+  if (hint !== undefined) {
+    const found = lookIn(entryOf(ctx.deps, hint), raw);
+    if (found === undefined) throw missing;
+    return found;
+  }
+  const found = visibleHarnesses(ctx.deps)
     .map((entry) => lookIn(entry, raw))
     .filter((f): f is Located => f !== undefined);
-  if (found.length === 1) return found[0] as Located;
-  if (found.length === 0 && hint !== undefined) throw missing;
   throw new V1Error({
     status: 422,
     code: "invalid",
@@ -277,6 +286,18 @@ function decisionCommand(
 ): V1Handler {
   return async (ctx) => {
     const located = locate(ctx);
+    // The row's permission, on the harness the decision lives in, before anything is written.
+    const verdict = ctx.access.authorize(ctx.op.permission, { harness: located.entry.id });
+    if (!verdict.allow) {
+      throw new V1Error({
+        status: 403,
+        code: "forbidden",
+        reason: "permission",
+        message: permissionMessage(ctx.op.permission, "harness"),
+        needs: ctx.op.permission,
+        role: verdict.role,
+      });
+    }
     check?.(ctx, located);
     const submitted = await submitCommand<Settled>(ctx, {
       target: `${located.entry.id}/decision/${located.record.id}`,
