@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  CLI_VERBS,
   COMMAND_KINDS,
   type CliTwin,
+  DELEGATION_ACTIONS,
   DEPLOYMENT_ID_RE,
   OPERATIONS,
   OPERATOR_SUPERSEDE_REASONS,
@@ -57,6 +59,7 @@ const SAMPLES = [
     ...ACCESS,
     until: "2026-12-01T09:00:00Z",
     deferReason: "scheduled",
+    delegationAction: "merge",
     run: RUN,
   },
   {
@@ -75,6 +78,7 @@ const SAMPLES = [
     ...ACCESS,
     until: "2026-12-01T09:00:00.000+01:00",
     deferReason: "awaiting-someone",
+    delegationAction: "rollout",
     run: RUN,
   },
 ];
@@ -203,6 +207,7 @@ test("the placeholders, pinned, with empty flags", () => {
     "{cmd}",
     "{until}",
     "{deferReason}",
+    "{delegationAction}",
     "{run}",
   ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
@@ -255,6 +260,32 @@ test("{supersedeReason} is the reasons a person may give, and {rule} a rule id",
   for (const value of [`${RULE_ID}x`, RULE_ID.toUpperCase(), "rule_short", APPR]) {
     expect(TWIN_PLACEHOLDERS["{rule}"].test(value)).toBe(isId("rule", value));
   }
+});
+
+test("{delegationAction} is an action a rule may cover, and nothing else", () => {
+  const grammar = TWIN_PLACEHOLDERS["{delegationAction}"];
+  for (const action of DELEGATION_ACTIONS) expect(grammar.test(action)).toBe(true);
+  for (const value of ["deploy", "Merge", "merge ", "", "--merge", "rollout|adopt"]) {
+    expect(grammar.test(value)).toBe(false);
+  }
+  const preview: CliTwin = {
+    argv: ["delegations", "preview", "{delegationAction}", "--harness", "{hrn}"],
+  };
+  expect(renderTwin(preview, { delegationAction: "adopt", hrn: HRN })).toEqual({
+    argv: ["delegations", "preview", "adopt", "--harness", HRN],
+  });
+  expect(renderTwin(preview, { delegationAction: "deploy", hrn: HRN })).toEqual({
+    invalid: ["delegationAction"],
+  });
+  expect(CLI_VERBS.delegations).toEqual([
+    "list",
+    "show",
+    "preview",
+    "propose",
+    "pause",
+    "revoke",
+    "apply",
+  ]);
 });
 
 test("the {dep} placeholder is the deployment id grammar", () => {

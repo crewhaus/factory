@@ -79,6 +79,19 @@ function defaultRegistryIdOf(dir: string): string | undefined {
   }
 }
 
+/**
+ * The build's delegation ceiling as the deployment record keeps it: `{delegation}` when
+ * the spec declares `permissions.delegation`, nothing when it does not.
+ */
+function delegationCeilingOf(ir: unknown): {
+  readonly delegation?: Readonly<Record<string, unknown>>;
+} {
+  const permissions = (ir as { permissions?: { delegation?: unknown } } | undefined)?.permissions;
+  const ceiling = permissions?.delegation;
+  if (typeof ceiling !== "object" || ceiling === null) return {};
+  return { delegation: { ...(ceiling as Record<string, unknown>) } };
+}
+
 export type CompileRecordAnswer =
   | { readonly recorded: true; readonly id: string; readonly digest: string }
   | { readonly recorded: false; readonly reason: string };
@@ -143,6 +156,8 @@ export async function recordCompiledBundle(
       ...artifactFiles,
     },
     policyRevision: policyRevision(ir),
+    // The agreement's delegation ceiling, read later from the active record only.
+    ...delegationCeilingOf(ir),
     ...(intent !== undefined ? { intentDigest: intent } : {}),
     preparedAt: new Date(now()).toISOString(),
   });

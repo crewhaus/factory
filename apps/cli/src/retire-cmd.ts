@@ -106,15 +106,25 @@ export async function retireCommand(o: RetireCommandOptions): Promise<DaemonComm
   const revokers = retireRevokers(AREA_RUNTIMES);
   const now = (opts.clock ?? systemClock).now;
   const items: RetireItem[] = [];
+  let connections = false;
   for (const revoker of revokers) {
-    items.push(
-      ...(await revoker.plan({
-        harnessDir: o.harnessDir,
-        ...(harnessId !== undefined ? { harnessId } : {}),
-        actor: "",
-        now: now(),
-      })),
-    );
+    const planned = await revoker.plan({
+      harnessDir: o.harnessDir,
+      ...(harnessId !== undefined ? { harnessId } : {}),
+      actor: "",
+      now: now(),
+    });
+    if (planned.length > 0 && revoker.connections === true) connections = true;
+    items.push(...planned);
+  }
+  // What a revoker ends is listed; channel and service credentials none of them ends are
+  // still the person's to revoke where they were issued.
+  if (items.length > 0 && !connections) {
+    items.push({
+      kind: "channel and service credentials",
+      status: "manual",
+      note: "none are registered here; revoke them where they were issued",
+    });
   }
   let plan: ReturnType<typeof buildRetirementPlan>;
   try {

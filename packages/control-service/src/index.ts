@@ -17,6 +17,8 @@ export {
 } from "./decision-runtime";
 export {
   type DecisionActor,
+  type DelegatedResolveAnswer,
+  type DelegatedResolveRequest,
   type DecisionSupersedeAnswer,
   type Decisions,
   type DecisionsDeps,
@@ -69,7 +71,39 @@ export {
   type ToolApprovalRequest,
   resolveToolApproval,
 } from "./approval-resolve";
-export { AREA_RUNTIMES, activationGates, compositionProblems, retireRevokers } from "./areas";
+export {
+  AREA_RUNTIMES,
+  activationGates,
+  compositionProblems,
+  delegatedActions,
+  retireRevokers,
+} from "./areas";
+export { DELEGATION_RUNTIME } from "./areas/delegation";
+export {
+  type ActiveCeiling,
+  APPLY_NOTE,
+  type ApplySummary,
+  type CeilingRead,
+  DELEGATIONS_REVOKER,
+  type DelegationDetailAnswer,
+  type DelegationHarness,
+  type DelegationListing,
+  type DelegationRefusal,
+  type DelegationWrite,
+  type Delegations,
+  type DelegationsDeps,
+  NOTHING_DELEGABLE,
+  NOT_ALLOWED,
+  type PreviewAnswer,
+  activeCeiling,
+  ceilingDigestOf,
+  ceilingOf,
+  createDelegations,
+  delegatedExecutor,
+  delegatedRollbackExecutor,
+  ownerHolds,
+  ruleViewOf,
+} from "./delegations";
 export {
   type Commands,
   type InlineEffect,
@@ -84,9 +118,14 @@ export {
   type ActivationGate,
   type ActivationGateContext,
   type AreaRuntime,
+  type DelegatedAction,
+  type DelegatedActionContext,
+  type DelegatedActionScope,
   type Executor,
   type ExecutorContext,
   type ExecutorStamp,
+  type Gate,
+  type GateContext,
   type ReconcileContext,
   type Reconciler,
   type Reconciliation,

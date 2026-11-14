@@ -21,17 +21,22 @@ describe("the main entry", () => {
     expect(graph.problems).toEqual([]);
   });
 
-  test("reaches every source file outside ./schemas and ./http, and none inside them", () => {
+  test("reaches every source file outside ./schemas, ./http and ./delegation, and none inside them", () => {
     const expected = sourceFiles(SRC)
       .filter((file) => {
         const rel = relative(SRC, file);
-        return !rel.startsWith("schemas") && !rel.startsWith("http");
+        return !rel.startsWith("schemas") && !rel.startsWith("http") && rel !== "delegation.ts";
       })
       .sort();
     expect(graph.files).toEqual(expected);
     expect(graph.files.length).toBeGreaterThanOrEqual(30);
     // The main entry never carries the transport.
     expect(graph.files.filter((file) => relative(SRC, file).startsWith("http"))).toEqual([]);
+  });
+
+  test("does not reach ./delegation", () => {
+    expect(graph.files).not.toContain(join(SRC, "delegation.ts"));
+    expect(graph.files).toContain(join(SRC, "areas", "delegation.ts"));
   });
 
   test("only src/schemas imports zod, and the manifest declares only zod", () => {
@@ -49,6 +54,7 @@ describe("the main entry", () => {
       ".": "./src/index.ts",
       "./schemas": "./src/schemas/index.ts",
       "./http": "./src/http/index.ts",
+      "./delegation": "./src/delegation.ts",
     });
   });
 });
@@ -67,6 +73,22 @@ describe("./http", () => {
     );
     expect(outside).toEqual([]);
     expect(graph.files.filter((file) => relative(SRC, file).startsWith("http")).length).toBe(3);
+  });
+});
+
+describe("./delegation", () => {
+  const graph = scanImportGraph(join(SRC, "delegation.ts"));
+  const main = new Set(scanImportGraph(join(SRC, "index.ts")).files);
+
+  test("imports nothing but relative .js files: no package, no builtin, no ./schemas", () => {
+    expect(graph.problems).toEqual([]);
+  });
+
+  test("reaches only its own file and files the main entry reaches", () => {
+    const own = join(SRC, "delegation.ts");
+    expect(graph.files).toContain(own);
+    expect(graph.files.filter((file) => file !== own && !main.has(file))).toEqual([]);
+    expect(graph.files.length).toBeGreaterThan(1);
   });
 });
 

@@ -47,6 +47,16 @@ describe("./http type-checks as NodeNext, with no Bun types", () => {
   }, 20_000); // A full program check.
 });
 
+describe("./delegation type-checks as NodeNext, with no Bun types", () => {
+  test("no diagnostics over its graph", () => {
+    const entry = join(import.meta.dir, "delegation.ts");
+    const { files, diagnostics } = check(entry);
+    expect(diagnostics).toEqual([]);
+    expect(files).toBe(scanImportGraph(entry).files.length);
+    expect(files).toBeGreaterThanOrEqual(3);
+  }, 20_000); // A full program check.
+});
+
 describe("the check sees a planted defect", () => {
   const dir = mkdtempSync(join(tmpdir(), "control-contract-nodenext-"));
   afterAll(() => rmSync(dir, { recursive: true, force: true }));

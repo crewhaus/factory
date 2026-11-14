@@ -26,10 +26,11 @@ import {
 } from "@crewhaus/control-contract";
 import type { LeaseProbe } from "@crewhaus/control-records";
 import type { HarnessSupervisor } from "@crewhaus/harness-supervisor";
-import { AREA_RUNTIMES, compositionProblems } from "./areas";
+import { AREA_RUNTIMES, compositionProblems, delegatedActions } from "./areas";
 import { type Commands, createCommands, receiptOf, settledRow } from "./commands";
 import type { ControlCore, ControlMode } from "./context";
 import { type Decisions, createDecisions } from "./decisions";
+import { type Delegations, createDelegations } from "./delegations";
 import type { AreaRuntime, Executor, ExecutorStamp, Reconciler, Settlement } from "./executor";
 import { type JobAdapter, createJobAdapter } from "./jobs";
 import { type LedgerChoice, commandsLedgerOf, workspaceCommandsLedger } from "./ledgers";
@@ -83,6 +84,8 @@ export type ControlService = {
   readonly decisions: Decisions;
   /** The standing rules a head lists and ends. */
   readonly rules: Rules;
+  /** An owner's delegation rules: turned on, applied, and ended. */
+  readonly delegations: Delegations;
   readonly commands: Commands & {
     recover(scope: RecoverScope): Promise<RecoverCounts>;
     /** Settle what recovery left `unknown` by what its reconciler observes. Never on a read. */
@@ -255,10 +258,19 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
     );
   };
   const decisions = createDecisions({ hangarRoot: deps.hangarRoot, identity: deps.identity, now });
+  const delegations = createDelegations({
+    hangarRoot: deps.hangarRoot,
+    identity: deps.identity,
+    now,
+    decisions,
+    commands: { submit: commands.submit, settle },
+    actions: delegatedActions(areas),
+  });
   return {
     mode: options.mode,
     decisions,
     rules: createRules(decisions, now),
+    delegations,
     commands: {
       submit: commands.submit,
       get: commands.get,

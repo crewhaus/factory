@@ -86,6 +86,8 @@ export type FingerprintInput = {
   readonly query?: readonly (readonly [string, string])[];
   readonly body?: Readonly<Record<string, unknown>>;
   readonly secretFields?: readonly string[];
+  /** The rule a system actor acts under, when it acts under one. */
+  readonly authority?: Readonly<Record<string, unknown>>;
 };
 
 /**
@@ -105,6 +107,8 @@ export function fingerprintOf(key: CryptoKey, input: FingerprintInput): Promise<
       params: input.params ?? {},
       query,
       body: withoutSecrets(input.body ?? {}, input.secretFields ?? []),
+      // Absent from every fingerprint made without one, so none of those moves.
+      ...(input.authority !== undefined ? { authority: input.authority } : {}),
     }),
   ]);
 }

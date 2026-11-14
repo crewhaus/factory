@@ -1,0 +1,12 @@
+{
+  "mode": "default",
+  "delegation": {
+    "maxDays": 20
+  },
+  "rules": [
+    {
+      "type": "alwaysAllow",
+      "pattern": "Read"
+    }
+  ]
+}

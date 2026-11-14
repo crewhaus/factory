@@ -129,6 +129,7 @@ describe("the inventory is the dispatch", () => {
       "commands",
       "criteria",
       "daemon",
+      "delegations",
       "hangar",
       "harness",
       "login",
@@ -255,8 +256,8 @@ describe("every flag list answers --help", () => {
         }
       }
     }
-    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 12 + 1 + 1 + 12 + 5));
-  }, 30_000); // twelve modules' imports and a hundred and sixty calls; slow on a loaded runner
+    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 12 + 1 + 1 + 12 + 5));
+  }, 30_000); // thirteen modules' imports and a hundred and seventy calls; slow on a loaded runner
 });
 
 describe("family parsers take their flags from CLI_FAMILY", () => {

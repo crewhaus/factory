@@ -28,6 +28,7 @@ import {
   mintId,
 } from "@crewhaus/control-contract";
 import {
+  type ActionDecisionRow,
   type ApproverRead,
   type ChangeAdoptionRow,
   PROPOSAL_TTL_MS,
@@ -89,6 +90,8 @@ export type ResolveAnswer = {
   readonly proposal?: ProposalRow;
   /** The change-adoption decision this decided. */
   readonly adoption?: ChangeAdoptionRow;
+  /** The merge or rollout decision this decided. */
+  readonly actionDecision?: ActionDecisionRow;
 };
 
 export type ToolApprovalRequest = {

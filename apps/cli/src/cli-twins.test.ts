@@ -213,8 +213,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(46);
-    expect(pins).toBe(62);
+    expect(Object.keys(REQUIRED).length).toBe(54);
+    expect(pins).toBe(82);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -367,6 +367,7 @@ describe("the server's twins, by import", () => {
         ...ACCESS,
         until: "2026-12-01T09:00:00Z",
         deferReason: "scheduled",
+        delegationAction: "merge",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -384,6 +385,7 @@ describe("the server's twins, by import", () => {
         ...ACCESS,
         until: "2026-12-01T09:00:00+01:00",
         deferReason: "other",
+        delegationAction: "rollout",
       },
     ];
     const twins = [

@@ -12,6 +12,8 @@ import {
 } from "@crewhaus/control-records";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import { createPendingApprovalStore } from "@crewhaus/session-store";
+import { AREA_RUNTIMES, retireRevokers } from "./areas";
+import type { RetireRevoker } from "./executor";
 import { LIFECYCLE_FILE, reconcileRetire, retireSteps } from "./retire";
 import { createStandingRule } from "./rules";
 import { NOW, fakeProbe, park, removeTempDirs, tempDir } from "./test-helpers";
@@ -51,7 +53,7 @@ function queue(harness: string): string {
   return id;
 }
 
-function setUp() {
+function setUp(extra: { readonly revokers?: readonly RetireRevoker[] } = {}) {
   const hangarRoot = tempDir("control-service-home-");
   const harness = tempDir("control-service-harness-");
   const registry = openHangarRegistry({
@@ -70,6 +72,7 @@ function setUp() {
     probe: fakeProbe(),
     registry,
     holder: { pid: 1, host: "h" },
+    ...(extra.revokers !== undefined ? { revokers: extra.revokers } : {}),
   });
   return { hangarRoot, harness, registry, row, receipt, steps };
 }
@@ -231,6 +234,38 @@ describe("retire's own steps", () => {
     expect(outcome.ok).toBe(false);
     expect(outcome.detail).toContain("crewhaus daemon disable");
     expect(s.steps.effects()).toEqual([{ kind: "retire.keep-disabled", status: "failed" }]);
+  });
+
+  test("with the shipped revokers, a harness that has nothing to end still says to revoke its connections", async () => {
+    const s = setUp({ revokers: retireRevokers(AREA_RUNTIMES) });
+    expect(retireRevokers(AREA_RUNTIMES).length).toBeGreaterThan(0);
+    const outcome = await s.steps.revokeConnections();
+    expect(outcome).toMatchObject({ ok: true });
+    expect(outcome.detail).toBe(
+      "none are registered here; revoke this harness's channel and service credentials where they were issued",
+    );
+    expect(s.steps.effects().map((e) => [e.kind, e.status])).toEqual([
+      ["retire.connections", "skipped"],
+    ]);
+  });
+
+  test("a revoker that ends something keeps the connections guidance unless it ends connections", async () => {
+    const ending: RetireRevoker = {
+      name: "rules",
+      plan: async () => [],
+      revoke: async () => [{ kind: "retire.rules-extra", status: "done", observed: "1 revoked" }],
+    };
+    const s = setUp({ revokers: [ending] });
+    const outcome = await s.steps.revokeConnections();
+    expect(outcome.detail).toContain(
+      "revoke this harness's channel and service credentials where they were issued",
+    );
+    expect(s.steps.effects().map((e) => [e.kind, e.status])).toEqual([
+      ["retire.rules-extra", "done"],
+      ["retire.connections", "skipped"],
+    ]);
+    const t = setUp({ revokers: [{ ...ending, connections: true }] });
+    expect((await t.steps.revokeConnections()).detail).toBe("1 revoker(s) ran");
   });
 
   test("an unregistered harness's row is skipped", async () => {

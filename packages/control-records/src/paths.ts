@@ -60,6 +60,10 @@ export type ControlPaths = {
   readonly inputsDir: string;
   /** The key a run's subject is digested under (`subjectRefOf`), beside the digest key. */
   readonly subjectKeyFile: string;
+  /** The owner's delegation rules: one row per change to a rule. */
+  readonly delegationsFile: string;
+  /** What each delegation rule did and why, in size segments, never compacted. */
+  readonly delegationLogDir: string;
 };
 
 /**
@@ -88,6 +92,8 @@ export function controlPaths(harnessDir: string): ControlPaths {
     runsDir: join(controlDir, "runs"),
     inputsDir: join(controlDir, "inputs"),
     subjectKeyFile: join(controlDir, "keys", "subject.key"),
+    delegationsFile: join(controlDir, "delegations.jsonl"),
+    delegationLogDir: join(controlDir, "delegation-log"),
   };
 }
 

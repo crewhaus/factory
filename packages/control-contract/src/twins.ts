@@ -5,6 +5,7 @@
  * a command line back to its params, so one type serves both directions.
  */
 import { DEFER_REASONS, OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
+import { DELEGATION_ACTIONS } from "./areas/delegation.js";
 import { PERSON_CHANGE_REASONS } from "./areas/quality.js";
 import type { CliTwin } from "./areas/types.js";
 import { APPROVAL_ID_RE, CANONICAL_RUN_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
@@ -37,6 +38,7 @@ export const CLI_VERBS = deepFreeze({
   changes: ["check", "adopt", "decline", "withdraw", "rollback"],
   datasets: ["holdout"],
   "eval-report": ["baseline"],
+  delegations: ["list", "show", "preview", "propose", "pause", "revoke", "apply"],
 } as const);
 
 /**
@@ -58,6 +60,8 @@ export const CLI_VERBS = deepFreeze({
  * link's ids, and `{cmd}` a command receipt's, each its own id grammar. `{until}` is an
  * ISO date and time with `Z` or an offset, and `{deferReason}` one of the reasons a
  * person may give to defer a decision.
+ *
+ * `{delegationAction}` is one of the actions a delegation rule may cover.
  *
  * `{run}` is a run's canonical id (`run_` and 26 characters), the id the run ledger
  * keys a run by; an execution's `run_<16 hex>` never fits it.
@@ -89,6 +93,7 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{cmd}": /^cmd_[0-9a-hjkmnp-tv-z]{26}$/,
   "{until}": /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/,
   "{deferReason}": new RegExp(`^(?:${DEFER_REASONS.join("|")})$`),
+  "{delegationAction}": new RegExp(`^(?:${DELEGATION_ACTIONS.join("|")})$`),
   "{run}": CANONICAL_RUN_ID_RE,
 });
 

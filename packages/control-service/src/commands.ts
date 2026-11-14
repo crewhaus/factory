@@ -19,6 +19,8 @@ import {
   COMMAND_KINDS,
   type CommandReceipt,
   IDEMPOTENCY_VALUE_RE,
+  RECEIPT_AUTHORITY_KINDS,
+  type ReceiptAuthority,
   type ReceiptRetry,
   type ReceiptVia,
   isCommandKind,
@@ -87,7 +89,26 @@ export type SubmitRequest = {
   readonly idempotent?: boolean;
   /** The command is carried out by a queued job, which moves the receipt. */
   readonly queued?: boolean;
+  /**
+   * The owner's rule a system actor acts under: copied onto the receipt and into its
+   * fingerprint. Only a system actor carries one.
+   */
+  readonly authority?: ReceiptAuthority;
 };
+
+/** Whether a receipt's authority is one of the closed kinds, naming a rule at a revision. */
+function authorityIsValid(authority: unknown): authority is ReceiptAuthority {
+  if (typeof authority !== "object" || authority === null || Array.isArray(authority)) return false;
+  const a = authority as Record<string, unknown>;
+  return (
+    Object.keys(a).every((key) => ["kind", "rule", "revision", "clause"].includes(key)) &&
+    (RECEIPT_AUTHORITY_KINDS as readonly unknown[]).includes(a["kind"]) &&
+    isId("rule", a["rule"]) &&
+    Number.isSafeInteger(a["revision"]) &&
+    (a["revision"] as number) >= 1 &&
+    (a["clause"] === undefined || a["clause"] === "rollback")
+  );
+}
 
 /** An inline effect: what it returns to the caller, and how the command ended. A missing
  *  `settle` leaves the receipt `accepted`, for work a job carries on. */
@@ -184,6 +205,7 @@ function fingerprintInputOf(request: SubmitRequest): Parameters<typeof fingerpri
     ...(request.query !== undefined ? { query: request.query } : {}),
     ...(request.body !== undefined ? { body: request.body } : {}),
     ...(request.secretFields !== undefined ? { secretFields: request.secretFields } : {}),
+    ...(request.authority !== undefined ? { authority: request.authority } : {}),
   };
 }
 
@@ -333,6 +355,17 @@ export function createCommands(core: ControlCore): CommandsInternals {
         refusal: refuse("invalid", "the command's actor is not a principal or a system actor"),
       };
     }
+    if (request.authority !== undefined) {
+      if (!authorityIsValid(request.authority)) {
+        return { ok: false, refusal: refuse("invalid", "the command's authority is not a rule") };
+      }
+      if (request.actor === undefined || parseActor(request.actor)?.form !== "system") {
+        return {
+          ok: false,
+          refusal: refuse("invalid", "only a system actor acts under a rule's authority"),
+        };
+      }
+    }
     if (request.credentialRef !== undefined) {
       if (!isId("crd", request.credentialRef)) {
         return { ok: false, refusal: refuse("invalid", "the command's credential is not one") };
@@ -393,6 +426,7 @@ export function createCommands(core: ControlCore): CommandsInternals {
       executor: core.selfExecutor(),
       effects: request.queued === true ? [{ kind: "job", status: "unknown" }] : [],
       retry: retryFor(idempotent),
+      ...(request.authority !== undefined ? { authority: request.authority } : {}),
     };
 
     try {

@@ -18,9 +18,13 @@ The design is in [module brief 322](https://github.com/crewhaus/docs/blob/main/m
 |---|---|---|
 | `@crewhaus/control-contract` | ids, refs, `MACHINES`, permissions, `OPERATIONS`, twins, errors, lists, receipts, capabilities, events, cursors, `verifyDecision` | nothing |
 | `@crewhaus/control-contract/schemas` | one zod schema per shape, by name and in `SCHEMAS` | zod |
+| `@crewhaus/control-contract/delegation` | the pure half of a delegation rule: `effectiveRuleState`, `authorizeDelegated`, `renderConsequences`, `decidedByText`, `ruleTermsProblem`, the gate, watch and rollback types | nothing |
 
 The main entry imports no package and no `node:` module, not even for types, and uses relative `.js`
-specifiers only. `zero-deps.test.ts` and `nodenext.test.ts` hold that. The package itself targets
+specifiers only. `./delegation` holds to the same rule and reaches only its own file and files the
+main entry reaches; the main entry never imports it, and keeps the record keys and the action
+vocabulary it needs (`DELEGATION_ACTIONS`, `DELEGATION_RULE_KEYS`, `RECEIPT_AUTHORITY_KINDS`, …)
+itself. `zero-deps.test.ts` and `nodenext.test.ts` hold that. The package itself targets
 Bun, like every workspace package.
 
 ```ts

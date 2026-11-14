@@ -355,6 +355,11 @@ export type Deployment = {
   readonly autostart?: boolean;
   readonly activatedBy?: string;
   readonly cmd?: string;
+  /**
+   * The agreement's delegation ceiling, copied from the build's IR when it was recorded.
+   * Read only from the active deployment; absent, nothing can be delegated.
+   */
+  readonly delegation?: Readonly<Record<string, unknown>>;
 };
 
 export type RetireStep = {

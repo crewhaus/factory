@@ -16,7 +16,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { foldStates } from "@crewhaus/control-records";
+import { mintId } from "@crewhaus/control-contract";
+import { casAppend, delegationsLedger, foldStates } from "@crewhaus/control-records";
 import { workspaceCommandsLedger } from "@crewhaus/control-service";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import type { ProcessOps, SpawnedProcess } from "@crewhaus/harness-supervisor";
@@ -175,6 +176,37 @@ describe("crewhaus retire", () => {
     expect(tree(s.dir)).toEqual(harnessBefore);
     expect(tree(s.hangarRoot)).toEqual(homeBefore);
     expect(existsSync(join(s.hangarRoot, "control"))).toBe(false);
+  });
+
+  test("a dry run lists the delegation rules that end, and still says to revoke connections", async () => {
+    const s = setUp();
+    const id = mintId("rule");
+    const planted = await casAppend(delegationsLedger(s.dir), id, null, {
+      v: 1,
+      at: new Date().toISOString(),
+      id,
+      state: "enabled",
+      kind: "delegate",
+      action: "merge",
+      revision: 1,
+      scope: { harness: "hrn_0123456789abcdef" },
+      terms: { days: 14 },
+      termsDigest: "a".repeat(64),
+      ceilingDigest: `sha256:${"b".repeat(64)}`,
+      policyRevision: `sha256:${"c".repeat(64)}`,
+      consequencesDigest: "d".repeat(64),
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+      owner: `local:#${"e".repeat(64)}`,
+      cmd: mintId("cmd"),
+    });
+    expect(planted.ok && planted.applied).toBe(true);
+    const out = await s.retire({ dryRun: true });
+    expect(out.exitCode).toBe(0);
+    const text = out.lines.join("\n");
+    expect(text).toContain("retire.delegations — 1 delegation rule(s) end");
+    expect(text).toContain(
+      "channel and service credentials — none are registered here; revoke them where they were issued (do this by hand)",
+    );
   });
 
   test("--stop stops it, disables it, records the retirement and archives the row", async () => {

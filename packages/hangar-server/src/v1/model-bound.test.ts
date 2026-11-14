@@ -103,7 +103,7 @@ describe("every free-text request field says whether it reaches a model", () => 
   test("the walk finds every such row, and each declares every such field", () => {
     const walked = undeclared(OPERATIONS);
     expect(walked.missing).toEqual([]);
-    expect(walked.checked).toBe(15);
+    expect(walked.checked).toBe(18);
   });
 
   test("a planted undeclared field is caught", () => {

@@ -54,20 +54,20 @@ const TARGETS = Object.keys(WHOLE["definitions"] as Record<string, unknown>).fil
 
 /** Controls and JSON nodes per target, measured on this schema (the raw run). */
 const PINNED: Readonly<Record<string, readonly [controls: number, json: number]>> = {
-  cli: [168, 21],
-  workflow: [34, 11],
-  channel: [180, 22],
-  graph: [35, 11],
-  managed: [155, 18],
-  pipeline: [69, 7],
-  crew: [82, 15],
-  research: [111, 17],
-  batch: [86, 15],
-  voice: [25, 6],
-  browser: [80, 11],
+  cli: [169, 21],
+  workflow: [35, 11],
+  channel: [181, 22],
+  graph: [36, 11],
+  managed: [156, 18],
+  pipeline: [70, 7],
+  crew: [83, 15],
+  research: [112, 17],
+  batch: [87, 15],
+  voice: [26, 6],
+  browser: [81, 11],
   eval: [15, 3],
-  onchain: [25, 9],
-  "onchain-game": [43, 6],
+  onchain: [26, 9],
+  "onchain-game": [44, 6],
 };
 
 describe("the settings form covers every target's schema", () => {

@@ -3587,6 +3587,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       reconcile: (scope) => controlService.commands.reconcile(scope),
     },
     notificationsTick,
+    delegations: controlService.delegations,
   };
   const scheduler = createSchedulerHost<HomePorts>({
     now,
