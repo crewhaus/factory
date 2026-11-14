@@ -237,7 +237,8 @@ export type HangarRegistry = {
   ): HangarHarnessEntry | undefined;
   /** The members of a group in BOOT order: declared orders ascending first,
    *  then the undeclared ones, each tier by spec name so the walk is stable
-   *  across machines. `stop` is this list reversed. */
+   *  across machines. `stop` is this list reversed. An archived (retired) row is
+   *  not a member. */
   groupMembers(group: string, opts?: ListOptions): HangarHarnessEntry[];
   setTags(dirOrId: string, tags: readonly string[]): HangarHarnessEntry | undefined;
   setPinned(dirOrId: string, pinned: boolean): HangarHarnessEntry | undefined;
@@ -245,6 +246,12 @@ export type HangarRegistry = {
    *  stays registered with all its state — hiding is curation, not removal. */
   setHidden(dirOrId: string, hidden: boolean): HangarHarnessEntry | undefined;
   setNotes(dirOrId: string, notes: string): HangarHarnessEntry | undefined;
+  /** Mark a row retired: `archived: {at, by, cmd}`. The row stays registered and listed;
+   *  refreshes keep the mark; `remove` still deletes it. `undefined` when no row matches. */
+  archive(
+    dirOrId: string,
+    stamp: { readonly at: string; readonly by: string; readonly cmd: string },
+  ): HangarHarnessEntry | undefined;
   listGroups(): GroupDef[];
   /** Idempotent by name; new groups append at the end of the order. */
   addGroup(def: { readonly name: string; readonly color?: string }): GroupDef;
@@ -1033,11 +1040,20 @@ export function openHangarRegistry(opts: OpenHangarRegistryOptions = {}): Hangar
         }
         return { ...e, groupOrder: next };
       }),
-    groupMembers: (group, opts) => sortGroupMembers(group, list(opts)),
+    groupMembers: (group, opts) =>
+      sortGroupMembers(
+        group,
+        list(opts).filter((entry) => entry.archived === undefined),
+      ),
     setTags: (dirOrId, tags) => patchEntry(dirOrId, (e) => ({ ...e, tags: [...tags] })),
     setPinned: (dirOrId, pinned) => patchEntry(dirOrId, (e) => ({ ...e, pinned })),
     setHidden: (dirOrId, hidden) => patchEntry(dirOrId, (e) => ({ ...e, hidden })),
     setNotes: (dirOrId, notes) => patchEntry(dirOrId, (e) => ({ ...e, notes })),
+    archive: (dirOrId, stamp) =>
+      patchEntry(dirOrId, (e) => ({
+        ...e,
+        archived: { at: stamp.at, by: stamp.by, cmd: stamp.cmd },
+      })),
     listGroups,
     addGroup,
     updateGroup,

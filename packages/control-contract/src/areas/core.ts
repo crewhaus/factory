@@ -351,14 +351,14 @@ export const CORE_MODULE = {
       permission: "h.control",
       idempotent: true,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.daemonPause,
     },
     {
       id: "controls.resume",
       permission: "h.control",
       idempotent: true,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.daemonResume,
     },
     {
       id: "controls.drain",
@@ -393,14 +393,14 @@ export const CORE_MODULE = {
       permission: "h.deploy",
       idempotent: true,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.daemonDisable,
     },
     {
       id: "controls.enable",
       permission: "h.deploy",
       idempotent: true,
       effect: "local",
-      cliTwin: null,
+      cliTwin: TWINS.daemonEnable,
     },
     {
       id: "controls.retire",
@@ -576,7 +576,7 @@ export const CORE_MODULE = {
     ],
     refuse: [...VERIFY_REASONS],
     evict: ["erased", "ttl"],
-    expire: ["ttl"],
+    expire: ["ttl", "retired"],
     defer: ["awaiting-information", "awaiting-someone", "scheduled", "other"],
   },
   capabilityKeys: [

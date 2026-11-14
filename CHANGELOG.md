@@ -530,6 +530,26 @@ these on: they reach every harness that uses what each one names.
   `propose/<id>` after it, and stops before any git step when the record
   cannot be written.
 
+- **`crewhaus retire` ends what a harness could still do, and refuses while
+  its daemon runs.** With the daemon running, `crewhaus retire` stops nothing
+  and says so; `--stop` stops it first. Before the backup it leaves the
+  harness disabled, cancels its queued runs, expires its open approvals and
+  unspent grants, revokes its standing rules and runs each area's revoker.
+  After the archive the harness stays disabled where it lives, so nothing
+  starts it from its spec and bundle; then retire records `harness.retired`
+  in Home's lifecycle record (`control/lifecycle.jsonl` under Home's
+  directory) and marks the harness's registry row archived, so a group start
+  passes it by. A step that fails
+  stops the retire before anything is archived, and the harness stays
+  disabled until `crewhaus daemon enable`. The retire's receipt is kept in
+  Home's own ledger.
+
+- **A drain from Home always ends with the daemon stopped.** Home's
+  control-port drain goes through the supervisor, as its process drain does:
+  when the daemon refuses the call or cannot be reached, it is stopped by
+  signal, and the answer adds `stopped` and `viaSignal: true`. The request
+  answers once the daemon has exited.
+
 - **The tarballs `crewhaus state backup` and `crewhaus retire` write leave a
   harness's run tokens out, and are `0600`.**
   `.crewhaus/run/gateway-jwt-secret`, `.crewhaus/run/control-token` and

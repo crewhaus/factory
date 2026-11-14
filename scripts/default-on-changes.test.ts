@@ -3259,7 +3259,8 @@ describe("the release notes name what checking before acting changes for every h
     const restart = supervisor.slice(supervisor.indexOf("restart: async (gateOptions) =>"));
     expect(supervisor.indexOf("restart: async (gateOptions) =>")).toBeGreaterThan(-1);
     expect(restart.indexOf("await decideStart({")).toBeGreaterThan(-1);
-    expect(restart.indexOf("await stop();")).toBeGreaterThan(
+    // The restart's own stop, which records nothing: its start says what the operator wants.
+    expect(restart.indexOf("await stopRun({}, { record: false });")).toBeGreaterThan(
       restart.indexOf("await decideStart({"),
     );
     const dir = tempHarness("crewhaus-default-on-restart-", "channel");
@@ -4028,7 +4029,8 @@ describe("the release notes name what permission suggestions and state backups l
       "utf8",
     );
     expect(retire.split('join(plan.archiveDir, "crewhaus-state")')).toHaveLength(2);
-    const cli = readFileSync(join(ROOT, "apps", "cli", "src", "index.ts"), "utf8");
+    // `crewhaus retire` runs its steps in `retire-cmd.ts`, which `runRetire` calls.
+    const cli = readFileSync(join(ROOT, "apps", "cli", "src", "retire-cmd.ts"), "utf8");
     expect(
       cli.split('removeRunTokens(join(plan.archiveDir, "crewhaus-state"))').slice(1),
     ).toHaveLength(1);
@@ -4864,6 +4866,55 @@ describe("run records, structured recall, context_assembled, ledger labels, comp
     const bullet = bulletFor("A compaction summary carries its origin into the run.");
     expect(bullet).toContain("`compaction`");
     expect(bullet).toContain("egress check");
+  });
+});
+
+describe("the release notes name what retire and Home's drain change for every harness", () => {
+  const read = (rel: string): string => readFileSync(join(ROOT, rel), "utf8");
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  test("`crewhaus retire` refuses a running daemon without --stop, and ends what the harness could do", async () => {
+    const { buildRetirementPlan, PRE_ARCHIVE_STEPS, POST_ARCHIVE_STEPS } = await import(
+      "../packages/harness-lifecycle/src/retire"
+    );
+    const plan = (daemonLive: boolean, stop: boolean) =>
+      buildRetirementPlan({
+        specName: "default-on",
+        harnessDir: ROOT,
+        archiveDir: join(ROOT, "never-written"),
+        pins: {},
+        force: false,
+        pushKnowledge: false,
+        control: { daemonLive, stop, revokerItems: [] },
+      });
+    expect(() => plan(true, false)).toThrow("crewhaus retire --stop");
+    const steps = plan(true, true).steps;
+    for (const step of [...PRE_ARCHIVE_STEPS, ...POST_ARCHIVE_STEPS]) expect(steps).toContain(step);
+    // The CLI is the host that runs them, from the daemon's liveness.
+    const cli = read("apps/cli/src/retire-cmd.ts");
+    expect(cli).toContain("control: { daemonLive: daemonIsLive(o.harnessDir, opts)");
+    expect(read("apps/cli/src/index.ts")).toContain("await retireCommand({");
+    const bullet = bulletFor("`crewhaus retire`");
+    expect(bullet).not.toBe("");
+    for (const word of ["--stop", "disabled", "standing rules", "registry", "lifecycle"]) {
+      expect(bullet).toContain(word);
+    }
+  });
+
+  test("a drain from Home goes through the supervisor, so a refused control call still stops the daemon", () => {
+    const server = read("packages/hangar-server/src/server.ts");
+    const at = server.indexOf('if (tail[0] === "drain") {');
+    expect(at).toBeGreaterThan(-1);
+    const route = server.slice(at, server.indexOf('throw new HttpError(404, "not found");', at));
+    expect(route).toContain("await handle.supervisor.drain(");
+    expect(route).toContain("viaSignal: true");
+    const bullet = bulletFor("A drain from Home");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("signal");
+    expect(bullet).toContain("Home");
   });
 });
 

@@ -809,3 +809,33 @@ describe("file shape", () => {
     expect(raw.map((e) => e["dir"])).toEqual([a, b]);
   });
 });
+
+describe("archive", () => {
+  const STAMP = { at: "2026-11-13T12:00:00.000Z", by: "prn_owner", cmd: "cmd_retire" };
+
+  test("marks the row, refreshes keep it, a group walk skips it, and remove still deletes", () => {
+    const root = newRoot();
+    const retired = newHarnessDir(root, "retired");
+    const live = newHarnessDir(root, "live");
+    const reg = openReg(root);
+    reg.upsert({ dir: retired, specName: "a", target: "channel" });
+    reg.upsert({ dir: live, specName: "b", target: "channel" });
+    reg.setGroups(retired, ["fleet"]);
+    reg.setGroups(live, ["fleet"]);
+    expect(reg.groupMembers("fleet").map((e) => e.dir)).toEqual([retired, live]);
+
+    const archived = reg.archive(retired, STAMP);
+    expect(archived?.archived).toEqual(STAMP);
+    expect(reg.archive(join(root, "nowhere"), STAMP)).toBeUndefined();
+
+    // A refresh and a run hook keep the mark: it is the user's, like `hidden`.
+    expect(reg.upsert({ dir: retired, specName: "a2" }).archived).toEqual(STAMP);
+    expect(reg.registerHook({ dir: retired, originDetail: "run" }).ok).toBe(true);
+    expect(openReg(root).get(retired)?.archived).toEqual(STAMP);
+
+    expect(reg.groupMembers("fleet").map((e) => e.dir)).toEqual([live]);
+    expect(reg.list().map((e) => e.dir)).toContain(retired);
+    expect(reg.remove(retired)).toBe(true);
+    expect(reg.get(retired)).toBeUndefined();
+  });
+});
