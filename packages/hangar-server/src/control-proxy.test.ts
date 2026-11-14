@@ -176,6 +176,58 @@ describe("control.v1 proxy", () => {
     }
   }, 20_000);
 
+  test("a named schedule lane's wake reaches the daemon; an id outside the grammar does not", async () => {
+    const stub = startStubControlPlane(STUB_TOKEN);
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = controlHarness(t.harnessesRoot, "ctl-lanes");
+      const id = (
+        (await t.api("/api/harnesses", { method: "POST", body: JSON.stringify({ dir }) })).body[
+          "entry"
+        ] as { id: string }
+      ).id;
+      mkdirSync(join(dir, ".crewhaus", "run"), { recursive: true });
+      writeFileSync(
+        join(dir, ".crewhaus", "run", "daemon.json"),
+        JSON.stringify({
+          v: 1,
+          pid: process.pid,
+          pidStartTimeMs: NOW,
+          argvFingerprint: "x",
+          controlPort: stub.port,
+          entry: "daemon.ts",
+          bundleDir: join(dir, "dist"),
+          runId: "run_00000000000000ce",
+          startedAt: new Date(NOW).toISOString(),
+          managerVersion: "test",
+        }),
+      );
+      stub.armed = new Set(["schedule:discovery"]);
+      const wake = (lane: string): Promise<{ status: number; body: Record<string, unknown> }> =>
+        t.api(`/api/h/${id}/control/wake`, { method: "POST", body: JSON.stringify({ lane }) });
+
+      const bad = await wake("schedule:Bad");
+      expect(bad.status).toBe(400);
+      expect(JSON.stringify(bad.body)).toContain("schedule:<name>");
+      expect(stub.calls.some((c) => c.path === "/control/v1/wake")).toBe(false);
+
+      const woken = await wake("schedule:discovery");
+      expect(woken.status).toBe(200);
+      expect(woken.body["ok"]).toBe(true);
+      expect(woken.body["lane"]).toBe("schedule:discovery");
+      expect(stub.calls.filter((c) => c.path === "/control/v1/wake").length).toBe(1);
+
+      // The daemon, not the route, says which lanes are armed.
+      const other = await wake("schedule:weekly-report");
+      expect(other.status).toBe(200);
+      expect(other.body["code"]).toBe("lane_not_armed");
+      expect(stub.calls.filter((c) => c.path === "/control/v1/wake").length).toBe(2);
+    } finally {
+      await t.stop();
+      await stub.stop();
+    }
+  }, 20_000);
+
   test("a stale token on disk surfaces as unauthorized, not as a generic error", async () => {
     const stub = startStubControlPlane(STUB_TOKEN);
     try {

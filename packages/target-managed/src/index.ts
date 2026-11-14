@@ -5,12 +5,14 @@ import {
   renderGateSkills,
 } from "@crewhaus/evaluation-service";
 import {
+  SCHEDULE_LANES_ARMED_VAR,
   renderControlDrain,
   renderControlImports,
   renderControlLane,
   renderControlPlaneBoot,
   renderControlStart,
   renderControlTimer,
+  renderScheduleLanes,
 } from "@crewhaus/gateway-protocol/control-codegen";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
@@ -851,6 +853,81 @@ ${memBlock}${approvalsBoot}  return await runChatLoop({
 }
 
 /**
+ * The body of one schedule wake on this shape, for the single `schedule` lane
+ * and for each named lane alike: one fresh-session turn per declared tenant
+ * with that lane's prompt, logged under the lane's id.
+ */
+function scheduleTickBody(
+  ir: IrManagedV0,
+  laneId: string,
+  instructionsVar: string,
+  tickVar: string,
+): string {
+  const wakeTenant = memoryFabric(ir).wired ? "\n        tenant: __tenant," : "";
+  return `const __tickNo = ${tickVar}++;
+const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
+for (const __tenantId of Object.keys(TENANT_OVERRIDES)) {
+  const __tenant = tenantOverrides[__tenantId];
+  if (__tenant === undefined) continue;
+  const __sessionId = \`sess_\${randomBytes(8).toString("hex")}\`;
+  try {
+    const __reply = await runOneTurn({
+      tenantId: __tenantId,
+      sessionId: __sessionId,
+      input: ${instructionsVar},${wakeTenant.replace("\n        ", "\n      ")}
+    });
+    __control.counters.turns++;
+    // The tenant turn's output is UNTRUSTED text on a stream the manager's log
+    // pump parses for the control-port announcement — flattened to one bounded
+    // line so a reply can never start a line.
+    const __preview = sanitizeControlText(__reply, 200);
+    console.error(\`[${laneId}] tenant \${__tenantId} tick #\${__tickNo}\${__origin} → \${__preview}\`);
+  } catch (__err) {
+    // A dead provider account / classified failure for one tenant must not
+    // stop the scheduler; render its report and keep ticking.
+    if (isRunFailedError(__err)) {
+      process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[${laneId}]" })}\\n\`);
+    } else {
+      process.stderr.write(
+        \`[${laneId}] tenant \${__tenantId} tick #\${__tickNo} error: \${(__err as Error).message}\\n\`,
+      );
+    }
+  }
+}`;
+}
+
+/**
+ * Named schedule lanes (#514): the same per-tenant fan-out as the single
+ * `schedule` lane, once per lane, each registered as its own control lane
+ * `schedule:<name>` (`ownsSession: false`, as above) and woken on its own clock
+ * by durable-execution's `armScheduleLanes`. Unlike the single lane's local
+ * matcher, the shared scheduler evaluates a lane's cron in its `timezone`
+ * (UTC when absent). `CREWHAUS_SCHEDULE=0` disarms every lane; they stay
+ * listed in `/status` and pokeable. Empty when the IR carries no lanes.
+ */
+function renderScheduleLanesWake(ir: IrManagedV0): { block: string; shutdown: string } {
+  const lanes = ir.scheduleLanes;
+  if (lanes === undefined) return { block: "", shutdown: "" };
+  const block = `
+// Named schedule lanes: one wake loop per lane (cron|interval + jitter).
+const __scheduleLaneTicks = [${lanes.map(() => "0").join(", ")}];
+${renderScheduleLanes({
+  lanes: lanes.map((lane) => ({
+    ...lane,
+    instructions: lane.instructions ?? "Scheduled wake tick — check for due work and act on it.",
+  })),
+  ownsSession: false,
+  body: ({ laneId, index, instructionsVar }) =>
+    scheduleTickBody(ir, laneId, instructionsVar, `__scheduleLaneTicks[${index}]`),
+  onErrorBody: "console.error(`[schedule:${__name}] error: ${(__err as Error).message}`);",
+  armGuard: 'process.env.CREWHAUS_SCHEDULE !== "0"',
+  afterArm:
+    "for (const __l of __scheduleLanes) console.error(`[schedule:${__l.name}] wake armed (${__l.cadence})`);",
+})}`;
+  return { block, shutdown: `\n  ${SCHEDULE_LANES_ARMED_VAR}?.cancel();` };
+}
+
+/**
  * Loop contract 0.4 (Batch F, temporal contract / ITEM 7) — lower `ir.schedule`
  * into the managed daemon's wake loop. Each tick runs a synthetic agent turn
  * per DECLARED tenant (deterministic, mirroring the janitor's per-tenant sweep)
@@ -869,7 +946,6 @@ ${memBlock}${approvalsBoot}  return await runChatLoop({
 function renderScheduleWake(ir: IrManagedV0): { helpers: string; block: string; shutdown: string } {
   const schedule = ir.schedule;
   if (schedule === undefined) return { helpers: "", block: "", shutdown: "" };
-  const wakeTenant = memoryFabric(ir).wired ? "\n        tenant: __tenant," : "";
   const instructions = escapeJsonString(
     schedule.instructions ?? "Scheduled wake tick — check for due work and act on it.",
   );
@@ -900,36 +976,7 @@ ${renderControlLane({
       : `every ${schedule.everyMs}ms`,
   ...(schedule.kind === "interval" ? { everyMs: schedule.everyMs } : {}),
   ownsSession: false,
-  body: `const __tickNo = __scheduleTick++;
-const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
-for (const __tenantId of Object.keys(TENANT_OVERRIDES)) {
-  const __tenant = tenantOverrides[__tenantId];
-  if (__tenant === undefined) continue;
-  const __sessionId = \`sess_\${randomBytes(8).toString("hex")}\`;
-  try {
-    const __reply = await runOneTurn({
-      tenantId: __tenantId,
-      sessionId: __sessionId,
-      input: __SCHEDULE_INSTRUCTIONS,${wakeTenant.replace("\n        ", "\n      ")}
-    });
-    __control.counters.turns++;
-    // The tenant turn's output is UNTRUSTED text on a stream the manager's log
-    // pump parses for the control-port announcement — flattened to one bounded
-    // line so a reply can never start a line.
-    const __preview = sanitizeControlText(__reply, 200);
-    console.error(\`[schedule] tenant \${__tenantId} tick #\${__tickNo}\${__origin} → \${__preview}\`);
-  } catch (__err) {
-    // A dead provider account / classified failure for one tenant must not
-    // stop the scheduler; render its report and keep ticking.
-    if (isRunFailedError(__err)) {
-      process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[schedule]" })}\\n\`);
-    } else {
-      process.stderr.write(
-        \`[schedule] tenant \${__tenantId} tick #\${__tickNo} error: \${(__err as Error).message}\\n\`,
-      );
-    }
-  }
-}`,
+  body: scheduleTickBody(ir, "schedule", "__SCHEDULE_INSTRUCTIONS", "__scheduleTick"),
 })}async function __fireScheduledWake(): Promise<void> {
   await __scheduleLane.tick();
 }`;
@@ -1189,6 +1236,7 @@ function renderDaemon(ir: IrManagedV0): string {
   // Loop contract 0.4 (Batch F, temporal contract / ITEM 7) — schedule: wake
   // loop pieces (empty when the spec omits `schedule:`).
   const scheduleWake = renderScheduleWake(ir);
+  const scheduleLanesWake = renderScheduleLanesWake(ir);
   // Item 2 (G31) — the A2A federation peer surface (env-gated at runtime).
   const federationSurface = renderFederation(ir);
   // v0.3.0 PR 14 (§6.3) — the dream consolidation step, registered into the
@@ -1388,7 +1436,9 @@ const DISTILL_STEP = createDistillJanitorStep({
   const controlDrain = renderControlDrain({
     body: `console.error("[managed] draining — intake stopped");
 janitor.stop();
-managedRuns.stop();${ir.schedule ? "\nif (__scheduleTimer !== undefined) clearInterval(__scheduleTimer);" : ""}
+managedRuns.stop();${ir.schedule ? "\nif (__scheduleTimer !== undefined) clearInterval(__scheduleTimer);" : ""}${
+      ir.scheduleLanes ? `\n${SCHEDULE_LANES_ARMED_VAR}?.cancel();` : ""
+    }
 await handle.close();
 await runDrainSweep(() => janitor.runOnce(), {
   onOutcome: (__o) => {
@@ -1411,9 +1461,10 @@ if (process.env.CREWHAUS_TENANTS_ROOT === undefined) {
     \`[managed] provability: proof bundles go to \${TENANTS_ROOT}/<tenant>/proofs/ — outside .crewhaus/, so crewhaus state backup does not carry them, and an OS tmp cleaner may delete them. Set CREWHAUS_TENANTS_ROOT to an absolute path outside the harness directory to keep them, such as /home/you/.crewhaus/tenants/<harness>.\`,
   );
 }`;
-  // A spec that declares a tool working on harness files starts only with its
-  // tenants root outside the harness directory (exit 21, the config exit, so a
-  // supervisor never restarts it); a spec with none emits no byte of it.
+  // A spec that declares a tool working on harness files starts only with a
+  // tenants root that neither is nor contains the harness directory (exit 21,
+  // the config exit, so a supervisor never restarts it); a spec with none emits
+  // no byte of it.
   const pathToolDeclared = declaresPathTool(ir);
   const tenantsRootPlacement = pathToolDeclared
     ? `
@@ -1431,8 +1482,12 @@ if (__rootRefusal !== undefined) {
     : "readFileSync";
   // The schedule wake renders a failed tick's report; nothing else here does.
   const errorsImport =
-    ir.schedule !== undefined
+    ir.schedule !== undefined || ir.scheduleLanes !== undefined
       ? 'import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";\n'
+      : "";
+  const scheduleLanesImport =
+    ir.scheduleLanes !== undefined
+      ? 'import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";\n'
       : "";
 
   const tenantList = ir.tenants
@@ -1448,10 +1503,13 @@ if (__rootRefusal !== undefined) {
 // Source spec: ${escapeJsonString(ir.name)} (target: managed, ir version: ${ir.version})
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createBudgetStore } from "@crewhaus/durable-state";
-${errorsImport}${gatewayServerImport}
+${errorsImport}${scheduleLanesImport}${gatewayServerImport}
 ${managedRunsImport}
 import { openAuditLog } from "@crewhaus/audit-log";
-${renderControlImports({ drainSweep: true, logSafe: ir.schedule !== undefined })}import { createRunContext } from "@crewhaus/run-context";
+${renderControlImports({
+  drainSweep: true,
+  logSafe: ir.schedule !== undefined || ir.scheduleLanes !== undefined,
+})}import { createRunContext } from "@crewhaus/run-context";
 ${dreamImport}${distillImport}${feedbackImport}import { createJanitor } from "@crewhaus/runtime-core";
 import { buildTenant, withTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
@@ -1612,18 +1670,18 @@ const gateway = createGatewayServer({
 const handle = await gateway.listen(PORT, HOST);
 console.error(\`[managed] gateway listening on \${HOST}:\${handle.port}\`);
 void managedRuns.start();
-${scheduleWake.helpers}${scheduleWake.block}${controlDrain}${controlStart}
+${scheduleWake.helpers}${scheduleWake.block}${scheduleLanesWake.block}${controlDrain}${controlStart}
 process.on("SIGTERM", async () => {
   console.error("[managed] SIGTERM — closing gateway");
   janitor.stop();
-  managedRuns.stop();${scheduleWake.shutdown}
+  managedRuns.stop();${scheduleWake.shutdown}${scheduleLanesWake.shutdown}
   await handle.close();
   process.exit(0);
 });
 process.on("SIGINT", async () => {
   console.error("[managed] SIGINT — closing gateway");
   janitor.stop();
-  managedRuns.stop();${scheduleWake.shutdown}
+  managedRuns.stop();${scheduleWake.shutdown}${scheduleLanesWake.shutdown}
   await handle.close();
   process.exit(0);
 });

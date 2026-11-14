@@ -301,3 +301,74 @@ export function armSchedule(schedule: WakeSchedule, handlers: ArmScheduleHandler
     },
   };
 }
+
+/** One named lane of {@link armScheduleLanes}: a wake schedule plus its name. */
+export type WakeScheduleLane = WakeSchedule & { readonly name: string };
+
+export interface ArmScheduleLanesHandlers {
+  /** Runs on every wake of lane `name`; awaited so that lane's ticks can't stack. */
+  readonly onWake: (name: string) => void | Promise<void>;
+  /** A thrown `onWake` lands here, with the lane's name, instead of crashing the scheduler. */
+  readonly onError?: (err: unknown, name: string) => void;
+  readonly now?: () => number;
+  readonly rand?: () => number;
+  readonly setTimer?: (fn: () => void, ms: number) => unknown;
+  readonly clearTimer?: (handle: unknown) => void;
+}
+
+/** The most lanes one daemon arms; the spec's list form takes no more. */
+const MAX_SCHEDULE_LANES = 8;
+
+/**
+ * Arm several named wake loops (#514): one {@link armSchedule} per lane, so
+ * each lane computes its own next delay and re-arms only after its OWN wake
+ * resolves. A slow tick in one lane never delays or overlaps another, and a
+ * failed wake reaches `onError` with the lane's name and that lane re-arms.
+ *
+ * Throws a `TypeError`, before arming anything, for zero lanes, more than
+ * eight, an empty name or a repeated one: the name is how a wake is
+ * dispatched, so two lanes may not share one. The lane-name grammar itself is
+ * the spec's and the control contract's. `cancel()` cancels every lane and is
+ * idempotent.
+ */
+export function armScheduleLanes(
+  lanes: ReadonlyArray<WakeScheduleLane>,
+  handlers: ArmScheduleLanesHandlers,
+): ArmedSchedule {
+  if (lanes.length === 0) throw new TypeError("armScheduleLanes: at least one lane is required");
+  if (lanes.length > MAX_SCHEDULE_LANES) {
+    throw new TypeError(
+      `armScheduleLanes: at most ${MAX_SCHEDULE_LANES} lanes, got ${lanes.length}`,
+    );
+  }
+  const names = new Set<string>();
+  for (const lane of lanes) {
+    if (typeof lane.name !== "string" || lane.name === "") {
+      throw new TypeError("armScheduleLanes: every lane needs a non-empty name");
+    }
+    if (names.has(lane.name)) {
+      throw new TypeError(`armScheduleLanes: lane name "${lane.name}" is used twice`);
+    }
+    names.add(lane.name);
+  }
+
+  const armed = lanes.map((lane) => {
+    const { name } = lane;
+    return armSchedule(lane, {
+      onWake: () => handlers.onWake(name),
+      onError: (err) => handlers.onError?.(err, name),
+      ...(handlers.now !== undefined ? { now: handlers.now } : {}),
+      ...(handlers.rand !== undefined ? { rand: handlers.rand } : {}),
+      ...(handlers.setTimer !== undefined ? { setTimer: handlers.setTimer } : {}),
+      ...(handlers.clearTimer !== undefined ? { clearTimer: handlers.clearTimer } : {}),
+    });
+  });
+  let cancelled = false;
+  return {
+    cancel(): void {
+      if (cancelled) return;
+      cancelled = true;
+      for (const one of armed) one.cancel();
+    },
+  };
+}

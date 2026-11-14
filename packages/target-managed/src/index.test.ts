@@ -306,6 +306,69 @@ describe("emitManaged — schedule wake loop (loop contract 0.4, Batch F, ITEM 7
   });
 });
 
+describe("emitManaged — named schedule lanes (#514)", () => {
+  // A quote, a backtick, `${x}` and a newline: the prompt must reach the
+  // output only as a quoted literal.
+  const TRICKY = 'Write the "weekly" report: `totals` for ${x}\nthen stop.';
+  const withLanes: IrManagedV0 = {
+    ...ir,
+    scheduleLanes: [
+      { name: "discovery", kind: "interval", everyMs: 7_200_000 },
+      {
+        name: "weekly-report",
+        kind: "cron",
+        cron: "0 17 * * 5",
+        timezone: "Europe/Berlin",
+        jitterMs: 60_000,
+        instructions: TRICKY,
+      },
+    ],
+  };
+  const daemon = emitManaged(withLanes).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+  const count = (needle: string): number => daemon.split(needle).length - 1;
+
+  test("each lane is its own control lane, in name order, armed by one armScheduleLanes call", () => {
+    const discovery = daemon.indexOf('lane: "schedule:discovery"');
+    const weekly = daemon.indexOf('lane: "schedule:weekly-report"');
+    expect(discovery).toBeGreaterThan(-1);
+    expect(weekly).toBeGreaterThan(discovery);
+    expect(count("armScheduleLanes(")).toBe(1);
+    expect(daemon).not.toContain('lane: "schedule",');
+    expect(daemon).toContain(
+      'import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";',
+    );
+    // The lane form uses the shared scheduler, not the object form's local timers.
+    expect(daemon).not.toContain("__scheduleTimer");
+    expect(daemon).not.toContain("__cronMatches");
+  });
+
+  test("arming stays behind CREWHAUS_SCHEDULE, and each lane fans out per tenant", () => {
+    const guard = daemon.indexOf('if (process.env.CREWHAUS_SCHEDULE !== "0") {');
+    expect(guard).toBeGreaterThan(-1);
+    expect(daemon.indexOf("armScheduleLanes(", guard)).toBeGreaterThan(guard);
+    expect(count("for (const __tenantId of Object.keys(TENANT_OVERRIDES))")).toBe(2);
+    expect(daemon).toContain("input: __scheduleLanes[0].instructions,");
+    expect(daemon).toContain("input: __scheduleLanes[1].instructions,");
+    expect(count("ownsSession: false,")).toBeGreaterThanOrEqual(2);
+    expect(daemon).toContain('"Scheduled wake tick — check for due work and act on it."');
+    // Drain and both signal handlers cancel every lane.
+    expect(count("__scheduleLanesArmed?.cancel();")).toBe(3);
+  });
+
+  test("the prompt appears only as a quoted literal, and the file parses", () => {
+    expect(count(JSON.stringify(TRICKY))).toBe(1);
+    expect(count("${x}")).toBe(1);
+    expect(daemon).not.toContain(TRICKY);
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(daemon)).not.toThrow();
+  });
+
+  test("no lanes → nothing of the lane form is emitted", () => {
+    const plain = emitManaged(ir).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(plain).not.toContain("__scheduleLanes");
+    expect(plain).not.toContain("armScheduleLanes");
+  });
+});
+
 describe("emitManaged — resume-path idempotency (loop contract 0.4, Batch F, ITEM 7)", () => {
   const daemonOf = (i: IrManagedV0): string =>
     emitManaged(i).files.find((f) => f.path === "daemon.ts")?.content ?? "";

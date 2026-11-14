@@ -6,6 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   CONTROL_RUNTIME_MODULE,
+  type ScheduleLaneEmit,
   renderControlDrain,
   renderControlImports,
   renderControlLane,
@@ -13,6 +14,8 @@ import {
   renderControlStart,
   renderControlTimer,
   renderPublicGateFetch,
+  renderScheduleLanes,
+  scheduleLaneCadence,
 } from "./control-codegen";
 
 describe("renderControlImports", () => {
@@ -162,5 +165,81 @@ describe("renderPublicGateFetch", () => {
     expect(out).toBe(
       "(__req) => __control.publicGate(__req) ?? ((req: Request) => gateway.handle(req))(__req)",
     );
+  });
+});
+
+describe("renderScheduleLanes (#514)", () => {
+  const TRICKY = 'Say "hi", `x` and ${y}\nthen stop.';
+  const lanes: ReadonlyArray<ScheduleLaneEmit> = [
+    {
+      name: "weekly-report",
+      kind: "cron",
+      cron: "0 17 * * 5",
+      timezone: "Europe/Berlin",
+      jitterMs: 60_000,
+      instructions: TRICKY,
+    },
+    { name: "discovery", kind: "interval", everyMs: 7_200_000, instructions: "Look around." },
+  ];
+  const render = (input: ReadonlyArray<ScheduleLaneEmit>): string =>
+    renderScheduleLanes({
+      lanes: input,
+      body: ({ laneId, index, instructionsVar }) =>
+        `await run(${JSON.stringify(laneId)}, ${index}, ${instructionsVar});`,
+      onErrorBody: "report(__err, __name);",
+      indent: "  ",
+    });
+  const out = render(lanes);
+  const count = (needle: string): number => out.split(needle).length - 1;
+
+  test("is deterministic, and writes lanes in name order whatever the input order", () => {
+    expect(render(lanes)).toBe(out);
+    expect(render([...lanes].reverse())).toBe(out);
+    const discovery = out.indexOf('lane: "schedule:discovery"');
+    expect(discovery).toBeGreaterThan(-1);
+    expect(out.indexOf('lane: "schedule:weekly-report"')).toBeGreaterThan(discovery);
+  });
+
+  test("one registration per lane, each bound by index, and one armScheduleLanes call", () => {
+    expect(out).toContain("const __scheduleLane0 = __control.lane({");
+    expect(out).toContain("const __scheduleLane1 = __control.lane({");
+    expect(count("__control.lane({")).toBe(2);
+    expect(count("armScheduleLanes(")).toBe(1);
+    expect(out).toContain('await run("schedule:discovery", 0, __scheduleLanes[0].instructions);');
+    expect(out).toContain(
+      "nextDueAt: () => new Date(Date.now() + nextWakeDelayMs(__scheduleLanes[1].wake, Date.now())).toISOString(),",
+    );
+    expect(out).toContain('["weekly-report", __scheduleLane1],');
+    expect(out).toContain("report(__err, __name);");
+  });
+
+  test("quotes every string: the prompt appears only as a JSON literal", () => {
+    expect(count(JSON.stringify(TRICKY))).toBe(1);
+    expect(count("${y}")).toBe(1);
+    expect(out).not.toContain(TRICKY);
+    expect(out).toContain('cadence: "cron \\"0 17 * * 5\\" Europe/Berlin +/-60000ms jitter"');
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(out)).not.toThrow();
+  });
+
+  test("a guard registers the lanes but arms them only while it holds", () => {
+    const guarded = renderScheduleLanes({
+      lanes,
+      body: () => "noop();",
+      onErrorBody: "",
+      armGuard: 'process.env.X !== "0"',
+    });
+    const guard = guarded.indexOf('if (process.env.X !== "0") {');
+    expect(guard).toBeGreaterThan(-1);
+    expect(guarded.indexOf("__control.lane({")).toBeLessThan(guard);
+    expect(guarded.indexOf("armScheduleLanes(")).toBeGreaterThan(guard);
+  });
+
+  test("the cadence text matches the single lane's", () => {
+    expect(scheduleLaneCadence({ name: "a", kind: "interval", everyMs: 5, instructions: "" })).toBe(
+      "every 5ms",
+    );
+    expect(
+      scheduleLaneCadence({ name: "a", kind: "cron", cron: "* * * * *", instructions: "" }),
+    ).toBe('cron "* * * * *" UTC');
   });
 });

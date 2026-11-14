@@ -74,6 +74,7 @@ import {
   CANONICAL_RUN_ID_RE,
   type CapabilityName,
   effectiveDecisionState,
+  isLaneId,
 } from "@crewhaus/control-contract";
 import {
   type IntakeVerdict,
@@ -172,12 +173,22 @@ export function isLoopbackBind(host: string): boolean {
   );
 }
 
-/** The two lanes an operator can poke. Both are in-process timers. */
-export type ControlLane = "heartbeat" | "schedule";
+/**
+ * The lanes an operator can poke, all in-process timers: `heartbeat`, the
+ * single `schedule`, and one `schedule:<name>` per named schedule lane, where
+ * `<name>` matches `^[a-z][a-z0-9-]{0,31}$` (#513). control-contract's
+ * `isLaneId` is the one check of that grammar.
+ */
+export type ControlLane = "heartbeat" | "schedule" | `schedule:${string}`;
 
 export type ControlOutcome = "ok" | "error";
 
-/** Counters `/control/v1/status` reports. Mutated in place by the daemon. */
+/**
+ * Counters `/control/v1/status` reports. Mutated in place by the daemon.
+ * `scheduleWakes` counts the wakes of every schedule lane, the single
+ * `schedule` and each `schedule:<name>` alike; `/status`'s `timers` lists each
+ * registered lane on its own row.
+ */
 export type ControlCounters = {
   turns: number;
   heartbeatTicks: number;
@@ -319,7 +330,10 @@ export type ControlPlaneOptions = {
 
 export interface ControlPlane {
   readonly counters: ControlCounters;
-  /** Register a pokeable lane. Returns the handle the timer body fires. */
+  /**
+   * Register a pokeable lane. Returns the handle the timer body fires. Throws a
+   * `TypeError` for an id outside the lane grammar or one already registered.
+   */
   lane(opts: ControlLaneOptions): ControlLaneHandle;
   /** Register a read-only timer row (janitor, dream) for `/status`. */
   timer(report: () => ControlTimerReport): void;
@@ -350,6 +364,14 @@ export interface ControlPlane {
    * `runs.create`.
    */
   onClaim(handler: () => void | Promise<void>): void;
+  /**
+   * Register how this process counts the runs it is running. The last
+   * registration wins. On target `managed`, `/status` and the heartbeat
+   * answer this count; a counter that throws or answers anything but a
+   * non-negative safe integer reads as `null` ("could not determine"). Other
+   * targets count their runs by run holds and ignore it.
+   */
+  onActiveRuns(count: () => number): void;
 }
 
 /**
@@ -622,6 +644,7 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
   let server: { stop(closeActiveConnections?: boolean): unknown; port?: number } | undefined;
   let resolved: ResolvedControlToken | undefined;
   let claimHandler: (() => void | Promise<void>) | undefined;
+  let activeRunsCounter: (() => number) | undefined;
   let heartbeatHandle: unknown;
   const heartbeatFailures = new Set<string>();
   const timers = opts.timers ?? {
@@ -794,11 +817,24 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
   }
 
   /**
-   * Runs this process is running, or `null` where it cannot count them: a
-   * managed tenant's run and a run with run rows off take no hold.
+   * Runs this process is running, or `null` where it cannot count them. A
+   * managed plane answers its registered counter (with run rows on or off),
+   * and `null` while none is registered or when the counter throws or answers
+   * anything but a non-negative safe integer. Every other shape counts run
+   * holds, and answers `null` with run rows off (such a run takes no hold).
    */
   function activeRuns(): number | null {
-    return opts.target === "managed" || !runLedgerOn() ? null : activeRunCount();
+    if (opts.target === "managed") {
+      if (activeRunsCounter === undefined) return null;
+      let count: unknown;
+      try {
+        count = activeRunsCounter();
+      } catch {
+        return null;
+      }
+      return typeof count === "number" && Number.isSafeInteger(count) && count >= 0 ? count : null;
+    }
+    return !runLedgerOn() ? null : activeRunCount();
   }
 
   /** The controls `/status` says this daemon supports. */
@@ -823,6 +859,7 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
       operatorRev: operator.rev,
       paused: operator.paused,
       disabled: operator.disabled,
+      operatorUnreadable: operator.unreadable,
       activeRuns: activeRuns(),
       runLedger: runLedgerOn(),
     });
@@ -938,15 +975,18 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
       body = undefined;
     }
     const parsed = (body ?? {}) as { lane?: unknown; reason?: unknown; by?: unknown };
-    const lane = parsed.lane;
-    if (lane !== "heartbeat" && lane !== "schedule") {
+    if (typeof parsed.lane !== "string" || !isLaneId(parsed.lane)) {
       return {
         res: jsonResponse(
-          { error: 'wake requires {"lane": "heartbeat" | "schedule"}', code: "bad_request" },
+          {
+            error: 'wake requires {"lane": "heartbeat" | "schedule" | "schedule:<name>"}',
+            code: "bad_request",
+          },
           400,
         ),
       };
     }
+    const lane = parsed.lane as ControlLane;
     if (draining) {
       // A poke during a drain would start work the drain is about to abandon.
       return {
@@ -1220,6 +1260,14 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
   return {
     counters,
     lane(laneOpts): ControlLaneHandle {
+      // One handle per lane id: a second registration would silently take the
+      // first one's wakes, so it is a bug in the emitting code.
+      if (!isLaneId(laneOpts.lane)) {
+        throw new TypeError(`control lane "${String(laneOpts.lane)}" is not a lane id`);
+      }
+      if (lanes.has(laneOpts.lane)) {
+        throw new TypeError(`control lane "${laneOpts.lane}" is already registered`);
+      }
       const handle = makeLane(laneOpts);
       lanes.set(laneOpts.lane, handle);
       return handle;
@@ -1312,6 +1360,10 @@ export function createControlPlane(opts: ControlPlaneOptions): ControlPlane {
 
     onClaim(handler): void {
       claimHandler = handler;
+    },
+
+    onActiveRuns(count): void {
+      activeRunsCounter = count;
     },
   };
 }

@@ -148,6 +148,7 @@ function handlerContext(dir: string, spec: string): M3Context {
       if (path === undefined) throw new Error("escapes");
       return path;
     },
+    nestedHarnessAt: () => undefined,
   } as unknown as M3Context;
 }
 

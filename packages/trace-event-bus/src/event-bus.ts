@@ -138,21 +138,50 @@ export class TraceEventBus {
    * trace id, the bus's current span as the parent, and a fresh span id.
    * Publishers call this when emitting fire-and-forget single-point events
    * (hook_fired, permission_decision, etc.). For paired start/end events
-   * publishers should reuse the same spanId across both.
+   * publishers should reuse the same spanId across both: build the end with
+   * {@link endEnvelope}.
+   *
+   * `opts.parentSpanId` names the span the event nests under (a turn, a tool
+   * call) when it is a valid span id; otherwise the bus's current span is the
+   * parent, as with no options at all. A publisher that runs several calls at
+   * once passes each call's own span here, since one bus-wide current span
+   * cannot tell them apart.
    */
-  envelope(now: Date = new Date()): TraceEventEnvelope {
+  envelope(
+    now: Date = new Date(),
+    opts: { readonly parentSpanId?: string | undefined } = {},
+  ): TraceEventEnvelope {
     const spanId = newSpanId();
+    const parentSpanId =
+      opts.parentSpanId !== undefined && isValidSpanId(opts.parentSpanId)
+        ? opts.parentSpanId
+        : this._currentSpanId;
     return {
       runId: this.runId,
       sessionId: this.sessionId,
       turnNumber: this._turnNumber,
       traceId: this.traceId,
       spanId,
-      parentSpanId: this._currentSpanId,
+      parentSpanId,
       timestamp: now.toISOString(),
       // Loop contract 0.4 (Batch C, item 4) — stamp agent identity when set.
       ...(this.agentId !== undefined ? { agentId: this.agentId } : {}),
     };
+  }
+
+  /**
+   * The envelope that ends the span `start` opened: a fresh timestamp and the
+   * bus's current turn, with `start`'s span id and parent, so the end event
+   * (`turn_end`, `model_response`, `tool_call_end`, `sub_agent_end`) names the
+   * same span and the same parent as its start.
+   */
+  endEnvelope(start: TraceEventEnvelope, now: Date = new Date()): TraceEventEnvelope {
+    const env = this.envelope(now);
+    if (start.parentSpanId === undefined) {
+      const { parentSpanId: _none, ...unparented } = env;
+      return { ...unparented, spanId: start.spanId };
+    }
+    return { ...env, spanId: start.spanId, parentSpanId: start.parentSpanId };
   }
 
   /**

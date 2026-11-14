@@ -42,7 +42,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { type LeaseHolder, type LeaseOptions, withMutatingLease } from "@crewhaus/control-records";
-import { admitExplicitStart } from "@crewhaus/control-service";
+import { admitExplicitStart, recordDesired } from "@crewhaus/control-service";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import {
   type HangarHarnessEntry,
@@ -468,6 +468,9 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       clock,
       ports,
       managerVersion: options.managerVersion,
+      // A person's start and stop from Home are written down for the recovery that runs
+      // after a reboot.
+      recordDesired: (desired) => recordDesired(harnessDir, desired),
       plan,
       // Home's Start, Restart and group start run only the active build (a harness with no
       // deployment record yet is recorded at its first start).

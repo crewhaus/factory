@@ -180,7 +180,12 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
 
   const commands = createCommands(core);
   const jobs = createJobAdapter(core, commands);
-  const recover = createRecover(core, commands, jobs);
+  const recover = createRecover(
+    core,
+    commands,
+    jobs,
+    areas.flatMap((area) => area.runSweeps ?? []),
+  );
   const decisions = createDecisions({ hangarRoot: deps.hangarRoot, identity: deps.identity, now });
   return {
     mode: options.mode,

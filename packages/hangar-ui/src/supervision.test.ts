@@ -542,6 +542,18 @@ describe("laneModel — cadence is offline, phase is not", () => {
   });
 });
 
+describe("the Wake button's lanes (#514)", () => {
+  test("heartbeat, schedule and named schedule lanes can be woken; nothing else", () => {
+    for (const id of ["heartbeat", "schedule", "schedule:discovery", "schedule:weekly-report"]) {
+      expect(sup.isWakeableLane(id)).toBe(true);
+    }
+    for (const id of ["dream", "janitor", "schedule:Bad", "schedule:", "schedule:a_b", "", null]) {
+      expect(sup.isWakeableLane(id)).toBe(false);
+    }
+    expect(sup.isWakeableLane(`schedule:a${"b".repeat(32)}`)).toBe(false);
+  });
+});
+
 describe("SSE parsing + the run feed", () => {
   test("frames split across chunks reassemble", () => {
     const parser = sup.createSseParser();

@@ -1340,6 +1340,7 @@ describe("an unfinished channel block is reported, never a 500", () => {
         env: {},
         now: () => NOW,
         harnesses: () => [healthyHarness, exploding],
+        nestedHarnessAt: () => undefined,
       } as unknown as M3Context)) as Record<string, unknown>;
       const harnesses = body["harnesses"] as Array<Record<string, unknown>>;
       expect(harnesses).toHaveLength(2);

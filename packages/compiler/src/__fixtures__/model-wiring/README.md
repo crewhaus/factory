@@ -108,3 +108,16 @@ daemon starts and stops the queued-run follower with the gateway. Imports
 follow. The tenants-root check is emitted only for a spec that declares a tool
 that works on files, which the spec pinned here does not. Nothing else in the
 bundle moves.
+
+**Channel delegation delta — `channel-pool.gateway.ts` only.** The channel gateway hands its two
+library-owned routes to `@crewhaus/channel-adapter-base`. The actions route keeps
+its capped read, `verify()` and `parseInteraction`, then calls
+`approvalActions.handle(interaction, actionAdapter)`, where `approvalActions` is
+one `createApprovalActions({approvals, adapters, sessionRouter, auditSink?})` per
+gateway: a click is decided as the member the clicker is linked to. The events
+route keeps its handshake, capped read, `verify()` and `parseInbound`, then
+returns `handleInboundEvent(parsed.event, adapter, {dedup, sessionRouter})`,
+which dedupes, records the run that will answer the message and answers `ok`.
+The gateway imports nothing from `@crewhaus/permission-engine`: a standing rule is
+made by the one decision step every surface calls.
+Nothing else in the bundle moves.

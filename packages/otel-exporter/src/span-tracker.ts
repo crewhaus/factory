@@ -1,8 +1,17 @@
 /**
  * SpanTracker — pairs `*_start` events with their matching `*_end` events
  * and emits OTLP spans. The orchestrator publishes events in lifecycle order
- * so this tracker just needs to remember the most recent start per logical
- * key (turn / model / tool / etc) until its end arrives.
+ * so this tracker just needs to remember the open start per logical key
+ * (turn / model / tool / etc) until its end arrives.
+ *
+ * The tree runtime-core publishes: a loop's run span (the bus root, or a
+ * span under it for a second loop on the same bus) → each turn → the turn's
+ * model calls and tool calls, as siblings → each tool call's checks
+ * (`permission_decision`, `hook_fired`, `approval_requested`) and a
+ * sub-agent's span, under which the child run nests. A retried model call is
+ * a sibling of the call it retries, carrying `crewhaus.retry_of`. A start and
+ * its end share one span id and one parent, and the exporter reads the
+ * parent off the end event.
  */
 import type {
   A2AMessageEvent,
@@ -122,7 +131,11 @@ const MAX_REMEMBERED_ABANDONED = 64;
 const MAX_AWAITING_COST = 64;
 
 export class SpanTracker {
-  private turn: StartedTurn | undefined;
+  /**
+   * Open turns keyed by span id: two loops on one bus (a crew role's peer run
+   * inside a tool call) each open and close their own turn.
+   */
+  private readonly turns = new Map<string, StartedTurn>();
   /**
    * 0.6.0 (design §8.4) — in-flight model calls keyed by the request's
    * `spanId`. runtime-core publishes each `model_response` with the SAME
@@ -203,6 +216,17 @@ export class SpanTracker {
     for (const key of [...this.models.keys()]) this.abandonModelCall(key, endIso, cause);
   }
 
+  /** Abandon the open model calls that nest under `parentSpanId` (a closing turn's span). */
+  private abandonModelCallsUnder(
+    parentSpanId: string,
+    endIso: string,
+    cause: AbandonedModelCause,
+  ): void {
+    for (const [key, started] of [...this.models.entries()]) {
+      if (started.ev.parentSpanId === parentSpanId) this.abandonModelCall(key, endIso, cause);
+    }
+  }
+
   /** Number of completed model spans still waiting for a `cost_accrual` (diagnostic). */
   awaitingCostCalls(): number {
     return this.awaitingCostCount;
@@ -254,20 +278,23 @@ export class SpanTracker {
   ingest(ev: TraceEvent): void {
     switch (ev.kind) {
       case "turn_start":
-        this.turn = { startNano: isoToNano(ev.timestamp), ev: ev as TurnStartEvent };
+        this.turns.set(ev.spanId, { startNano: isoToNano(ev.timestamp), ev: ev as TurnStartEvent });
         return;
-      case "turn_end":
-        // Nothing can still be streaming once the turn closes (single-writer
-        // bus, no parallel `runOneTurn`; side calls run on their own child
-        // bus and re-publish as `cost_accrual`), so whatever is still in the
-        // Map is a call whose stream threw. Close those first so the turn
-        // span is the last thing emitted for the turn.
-        this.abandonAllModelCalls(ev.timestamp, "turn_end");
-        if (this.turn) {
-          this.emit(buildTurnSpan(this.turn, ev as TurnEndEvent));
-          this.turn = undefined;
-        }
+      case "turn_end": {
+        // Nothing of THIS turn can still be streaming once it closes (no
+        // parallel `runOneTurn` in a loop; side calls re-publish their pairs
+        // complete), so a call still open under the turn is one whose stream
+        // threw. Close those first so the turn span is the last thing emitted
+        // for the turn. A call under another loop's open turn is left alone;
+        // once no turn is open, every call still open is closed, as a call a
+        // publisher parented elsewhere was before turns nested.
+        const started = this.turns.get(ev.spanId);
+        this.turns.delete(ev.spanId);
+        if (this.turns.size === 0) this.abandonAllModelCalls(ev.timestamp, "turn_end");
+        else this.abandonModelCallsUnder(ev.spanId, ev.timestamp, "turn_end");
+        if (started) this.emit(buildTurnSpan(started, ev as TurnEndEvent));
         return;
+      }
       case "model_request":
         this.models.set(ev.spanId, {
           startNano: isoToNano(ev.timestamp),

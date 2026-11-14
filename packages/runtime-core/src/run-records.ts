@@ -12,7 +12,9 @@
  *    kind, size, keyed fingerprint and cache marker, the project memory files
  *    by name, the recalled items by ref with what became of each, the
  *    advertised tools, the model and its settings, and the message count.
- *  - `run` on every line the run's own session-log handle writes.
+ *  - `run` on every line the run's own session-log handle writes, and the
+ *    span the line belongs to (`./run-spans` writes `span_closed` and
+ *    `verdict` and decides each line's span).
  *  - `context_assembled` on the trace bus, before each main model call:
  *    counts only.
  *
@@ -47,9 +49,11 @@ import {
   RUN_REF_RE,
   type RecalledItemRef,
   type RecalledItemStatus,
+  type RunStampChannelSource,
   type RunStampPayload,
   type RunStampSpecRevision,
   type RunStampTrigger,
+  type SpanAttempt,
 } from "@crewhaus/event-log";
 import type { RunContext } from "@crewhaus/run-context";
 import { currentTenantContext } from "@crewhaus/tenancy";
@@ -113,13 +117,17 @@ export function recordsRun(
 // ---------------------------------------------------------------------------
 
 /** An event-log append, as a loop's handle has it. */
-export type RecordAppend = (event: { kind: EventKind; payload: unknown }) => Promise<void>;
+export type RecordAppend = (event: {
+  kind: EventKind;
+  payload: unknown;
+  span?: string;
+}) => Promise<void>;
 
-/** Append one run record; never throws. */
-export type RecordEvent = (
-  kind: "run_stamp" | "context_manifest",
-  payload: unknown,
-) => Promise<void>;
+/** The run records a loop writes. */
+export type RecordKind = "run_stamp" | "context_manifest" | "span_closed" | "verdict";
+
+/** Append one run record, on `span` when given; never throws. */
+export type RecordEvent = (kind: RecordKind, payload: unknown, span?: string) => Promise<void>;
 
 /**
  * The loop's record writer over `append`: a failed append is logged once per
@@ -127,9 +135,9 @@ export type RecordEvent = (
  */
 export function createRecordEvent(append: RecordAppend, logger: Logger): RecordEvent {
   let warned = false;
-  return async (kind, payload) => {
+  return async (kind, payload, span) => {
     try {
-      await append({ kind, payload });
+      await append(span !== undefined ? { kind, payload, span } : { kind, payload });
     } catch (err) {
       if (warned) return;
       warned = true;
@@ -213,7 +221,12 @@ export function recordedSpecRevision(
   return { state: "not-recorded" };
 }
 
-/** A trigger's fields, copied: no text, and a channel trigger says its source was not recorded. */
+/**
+ * A trigger's fields, copied, with no text. A channel trigger carries where its message
+ * came from: the platform, and each of `conversationRef`, `messageRef` and `senderRef`
+ * whose value fits a run ref (`RUN_REF_RE`), any other left out. Its source is
+ * `"not-recorded"` only when the trigger has none, or its platform does not fit.
+ */
 export function stampTrigger(trigger: Trigger): RunStampTrigger {
   return {
     kind: trigger.kind,
@@ -221,7 +234,26 @@ export function stampTrigger(trigger: Trigger): RunStampTrigger {
     ...(trigger.via !== undefined ? { via: trigger.via } : {}),
     ...(trigger.workItem !== undefined ? { workItem: trigger.workItem } : {}),
     ...(trigger.synthetic === true ? { synthetic: true as const } : {}),
-    ...(trigger.kind === "channel" ? { source: "not-recorded" as const } : {}),
+    ...(trigger.kind === "channel" ? { source: stampSource(trigger.source) } : {}),
+  };
+}
+
+/** Whether a value read from a trigger is a ref a stamp may hold. */
+function isRunRef(value: unknown): value is string {
+  return typeof value === "string" && RUN_REF_RE.test(value);
+}
+
+/** A channel trigger's source as its stamp holds it (see {@link stampTrigger}). */
+function stampSource(source: Trigger["source"]): "not-recorded" | RunStampChannelSource {
+  if (source === undefined || source === null || !isRunRef(source.platform)) {
+    return "not-recorded";
+  }
+  const { conversationRef, messageRef, senderRef } = source;
+  return {
+    platform: source.platform,
+    ...(isRunRef(conversationRef) ? { conversationRef } : {}),
+    ...(isRunRef(messageRef) ? { messageRef } : {}),
+    ...(isRunRef(senderRef) ? { senderRef } : {}),
   };
 }
 
@@ -424,6 +456,8 @@ export type RecallNote = {
 export type ManifestCall = {
   readonly span: string;
   readonly turn: { readonly run: number; readonly session: number };
+  /** The call's attempt, for a re-run or a retried call. */
+  readonly attempt?: SpanAttempt;
   readonly model: {
     readonly wire: string;
     readonly spec?: string;
@@ -445,10 +479,17 @@ export type ManifestRecorder = {
   noteRecall(note: RecallNote): void;
   /** Publish `context_assembled` for `req` (unless the switch is off) and keep what the manifest needs. */
   assembled(req: ProviderRequest, regions: RequestRegions): AssembledRequest;
-  /** Write the `context_manifest` for an assembled request (when the loop records). Never throws. */
-  manifest(assembled: AssembledRequest, call: ManifestCall): Promise<void>;
-  /** Stop listening to the bus. */
-  dispose(): void;
+  /**
+   * Write the `context_manifest` for an assembled request (when the loop
+   * records), on the call's span. Resolves to the call's ordinal in the run
+   * when a manifest was written. Never throws.
+   */
+  manifest(assembled: AssembledRequest, call: ManifestCall): Promise<number | undefined>;
+  /**
+   * This loop compacted its messages: the next manifest says so. Only the
+   * loop's own compactions count, not another loop's on the same run.
+   */
+  noteCompaction(): void;
 };
 
 /** Calls made per run, so a manifest's `call` counts the run's calls, whichever loop made them. */
@@ -498,8 +539,9 @@ function bytesOf(text: string): number {
 
 /**
  * The loop's recorder. `records` decides whether manifests are written;
- * `context_assembled` is published whenever the switch is on. Listens on the
- * bus for compactions, so a manifest says whether one fired since the last.
+ * `context_assembled` is published whenever the switch is on. The loop tells
+ * it when it compacts (`noteCompaction`), so a manifest says whether this
+ * loop compacted since its last call.
  */
 export function createManifestRecorder(args: {
   readonly runContext: RunContext;
@@ -551,9 +593,6 @@ export function createManifestRecorder(args: {
   let lastToolsKey: string | undefined;
   let compacted = false;
   let warnedMismatch = false;
-  const unsubscribe = bus.subscribe((event) => {
-    if (event.kind === "compaction_fired") compacted = true;
-  });
 
   const recalledOf = async (span: string): Promise<ContextManifestRecalled | undefined> => {
     if (current === undefined) return undefined;
@@ -603,7 +642,7 @@ export function createManifestRecorder(args: {
       return { req, kinds: regionKinds(regions) };
     },
     async manifest(assembled, call) {
-      if (!args.records) return;
+      if (!args.records) return undefined;
       try {
         const { req, kinds } = assembled;
         if (kinds.length !== req.system.length) {
@@ -613,11 +652,12 @@ export function createManifestRecorder(args: {
               "a model call's regions could not be named; its context manifest was not written",
             );
           }
-          return;
+          return undefined;
         }
         const counter = callsByRun.get(runContext) ?? { n: 0 };
         callsByRun.set(runContext, counter);
         counter.n += 1;
+        const ordinal = counter.n;
         const blocks = await Promise.all(
           req.system.map(async (block, i) => {
             const kind = kinds[i] as ContextBlockKind;
@@ -651,7 +691,8 @@ export function createManifestRecorder(args: {
           run: runContext.runId,
           span: call.span,
           turn: call.turn,
-          call: counter.n,
+          call: ordinal,
+          ...(call.attempt !== undefined ? { attempt: call.attempt } : {}),
           blocks,
           ...(files.length > 0 ? { files } : {}),
           ...(recalled !== undefined ? { recalled } : {}),
@@ -696,7 +737,8 @@ export function createManifestRecorder(args: {
           messages: { count: req.messages.length, afterCompaction: compacted },
         };
         compacted = false;
-        await args.write("context_manifest", payload);
+        await args.write("context_manifest", payload, call.span);
+        return ordinal;
       } catch (err) {
         if (!warnedMismatch) {
           warnedMismatch = true;
@@ -704,10 +746,11 @@ export function createManifestRecorder(args: {
             code: errorCode(err),
           });
         }
+        return undefined;
       }
     },
-    dispose() {
-      unsubscribe();
+    noteCompaction() {
+      compacted = true;
     },
   };
 }

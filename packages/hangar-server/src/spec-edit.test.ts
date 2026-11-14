@@ -1814,6 +1814,38 @@ describe("builders", () => {
     }
   });
 
+  test("graders: a structured edit that introduces a masked span is refused too", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "graders-edits-mask");
+      const gradersPath = join(dir, "eval", "graders.yaml");
+      mkdirSync(join(dir, "eval"), { recursive: true });
+      const stored =
+        "graders:\n  - name: cites\n    type: contains\n    substring: http\ncriteria:\n  - id: cites-sources\n    description: the answer cites a source\n    measured_by: [cites]\n";
+      writeFileSync(gradersPath, stored);
+      const id = await register(t, dir);
+      const rev = String((await t.api(`/api/h/${id}/builders/graders`)).body["hash"]);
+      const setDescription = (value: string) =>
+        t.api(
+          `/api/h/${id}/builders/graders`,
+          post({
+            edits: [{ op: "setText", id: "cites-sources", field: "description", value }],
+            expectedRev: rev,
+          }),
+        );
+      const masked = await setDescription("***");
+      expect(masked.status).toBe(409);
+      expect(String(masked.body["error"])).toContain("masked span (***)");
+      expect(String(masked.body["error"])).toContain("crewhaus graders suggest");
+      expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+      const plain = await setDescription("the answer cites a primary source");
+      expect(plain.status).toBe(200);
+      expect(readFileSync(gradersPath, "utf8")).toContain("the answer cites a primary source");
+    } finally {
+      await t.stop();
+    }
+  });
+
   test("the dataset builder refuses honestly instead of growing a second state machine", async () => {
     const t = boot();
     try {

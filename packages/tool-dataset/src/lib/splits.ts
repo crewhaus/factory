@@ -37,9 +37,10 @@
  * move detection, so the stable mode's empty `moved` list is a measurement,
  * not a claim the mode makes about itself.
  */
+import { createHash } from "node:crypto";
 import { splitSamples } from "@crewhaus/dataset-ops";
 import type { SplitSpec } from "@crewhaus/dataset-ops";
-import type { DatasetSplit } from "@crewhaus/dataset-registry";
+import { type DatasetSplit, hashSample } from "@crewhaus/dataset-registry";
 import type { Sample } from "@crewhaus/eval-dataset";
 
 export type SplitMode = "stable" | "recompute";
@@ -88,10 +89,12 @@ export type PlanSplitsOptions = {
    *  `--split` flag). Stability is trivial here and still measured. Never
    *  `holdout`: a holdout is cut by a person, through `crewhaus datasets`. */
   readonly singleSplit?: Exclude<DatasetSplit, "holdout">;
-  /** The previous version's holdout rows. They are carried into the new
-   *  version exactly as they were, in their order, and never assigned,
-   *  moved, listed or reported by id; an incoming sample whose id is held
-   *  out is left out of the plan (the held-out row stays). */
+  /** The dataset's holdout rows. They are carried into the new version
+   *  exactly as they were, in their order, and never assigned, moved, listed
+   *  or reported by id. Every incoming sample is planned under the id it was
+   *  given, so the plan is the same whichever ids are held out; the rows a
+   *  write stores under an id the holdout also uses are given another one by
+   *  {@link separateFromHoldout}. */
   readonly heldOut?: ReadonlyArray<Sample>;
 };
 
@@ -113,8 +116,7 @@ export function planSplits(opts: PlanSplitsOptions): SplitPlan {
   const buckets: Record<DatasetSplit, Sample[]> = { train: [], dev: [], test: [], holdout: [] };
   let carriedForward = 0;
   let newlyAssigned = 0;
-  const heldOutIds = new Set((opts.heldOut ?? []).map((s) => s.id));
-  const incoming = opts.samples.filter((s) => !heldOutIds.has(s.id));
+  const incoming = opts.samples;
 
   if (opts.singleSplit !== undefined) {
     for (const s of incoming) {
@@ -187,5 +189,47 @@ export function splitCounts(splits: PlannedSplits): Record<string, number> {
     dev: splits.dev.length,
     ...(splits.test !== undefined ? { test: splits.test.length } : {}),
     ...(splits.holdout !== undefined ? { holdout: splits.holdout.length } : {}),
+  };
+}
+
+/**
+ * The splits a put writes when its dataset holds cases out: every planned
+ * train/dev/test row whose id any version holds out is stored under a minted
+ * id, so the held-out row is never replaced or duplicated, and the holdout is
+ * carried as it was. The minted id is `<id>~` and 16 hex characters of a
+ * SHA-256 over the version, the id and the newest holdout's per-row hashes:
+ * the same on every call with the same inputs, and derived from the
+ * holdout's own content, which no agent tool returns. A minted id that
+ * collides with any id in the version or
+ * in the holdout takes a counter. Rows are kept in place and in order; with
+ * no held-out ids the splits are returned as they are.
+ */
+export function separateFromHoldout(
+  splits: PlannedSplits,
+  heldOutIds: ReadonlySet<string>,
+  version: string,
+): PlannedSplits {
+  if (heldOutIds.size === 0) return splits;
+  const salt = (splits.holdout ?? []).map(hashSample).join("\n");
+  const taken = new Set<string>(heldOutIds);
+  for (const split of SPLIT_ORDER) for (const s of splits[split] ?? []) taken.add(s.id);
+  const rename = (rows: Sample[]): Sample[] =>
+    rows.map((s) => {
+      if (!heldOutIds.has(s.id)) return s;
+      const digest = createHash("sha256")
+        .update(`${version}\0${s.id}\0${salt}`)
+        .digest("hex")
+        .slice(0, 16);
+      const base = `${s.id}~${digest}`;
+      let id = base;
+      for (let n = 2; taken.has(id); n++) id = `${base}-${n}`;
+      taken.add(id);
+      return { ...s, id };
+    });
+  return {
+    train: rename(splits.train),
+    dev: rename(splits.dev),
+    ...(splits.test !== undefined ? { test: rename(splits.test) } : {}),
+    ...(splits.holdout !== undefined ? { holdout: splits.holdout } : {}),
   };
 }

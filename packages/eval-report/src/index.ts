@@ -177,6 +177,7 @@ export {
   type PinRefusal,
   manualRebaseline,
   reanchorRefusal,
+  sameInstrumentRefusal,
   measurementProblem,
   pinFromIndexEntry,
   pinRefusal,

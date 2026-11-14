@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { isCredentialKey, maskCredentialTokens } from "./redact";
+import { carriesCredential, isCredentialKey, maskCredentialTokens } from "./redact";
 
 describe("isCredentialKey (adversarial review F1)", () => {
   test("matches the credential-key set and close variants, case-insensitively", () => {
@@ -139,5 +139,58 @@ describe("redact.ts keep-in-sync duplication", () => {
     const here = join(import.meta.dir, "redact.ts");
     const mirror = join(import.meta.dir, "..", "..", "ir", "src", "redact.ts");
     expect(readFileSync(here, "utf-8")).toBe(readFileSync(mirror, "utf-8"));
+  });
+});
+
+describe("carriesCredential", () => {
+  // Built from parts at run time: no credential-shaped literal sits in the source.
+  const token = ["sk", "ant", "api03", "x".repeat(24)].join("-");
+  const bearer = ["tok", "en", "0123456789abcdef0123456789abcdef"].join("");
+
+  test("a value that carries a credential is screened", () => {
+    for (const value of [
+      `curl -H "x-api-key: ${token}" https://api.example.com`,
+      'curl -H "Authorization: Basic abc" https://api.example.com',
+      "API_TOKEN=abc123 ./deploy.sh",
+      "https://api.example.com/items?access_token=abc123",
+      `curl -H "Authorization: Bearer ${bearer}" https://x.test`,
+      "https://user:hunter2@example.com/items",
+    ]) {
+      expect({ value, carries: carriesCredential(value) }).toEqual({ value, carries: true });
+    }
+  });
+
+  test("a value with no credential passes", () => {
+    for (const value of [
+      "curl -H 'Accept: text/plain' https://example.com?page=2",
+      'curl -H "Accept: text/plain" https://x.test',
+      "https://example.com/items?monkey=1",
+      "MAX_TOKENS=5 ./run.sh",
+      "Write(notes/a.md)",
+      "git status && git log",
+    ]) {
+      expect({ value, carries: carriesCredential(value) }).toEqual({ value, carries: false });
+    }
+  });
+
+  test("a URL is found wherever its scheme starts, inside a run of other characters too", () => {
+    // A boundary: each URL is the one a scan from every start position finds,
+    // so these hold for any correct URL scan, and fail if a scheme is missed.
+    for (const value of [
+      "1ab://u:pw@x",
+      "x12+a.b-c://u:pw@h?q=1",
+      "a:// b://u:pw@c",
+      "git+ssh://h/x https://u:pw@y",
+      "-https://u:pw@x",
+      "..a://u:pw@b",
+      `echo ${"a".repeat(50_000)} https://u:pw@x`,
+      `${"1".repeat(50_000)}https://u:pw@x`,
+    ]) {
+      expect({ value: value.slice(0, 40), carries: carriesCredential(value) }).toEqual({
+        value: value.slice(0, 40),
+        carries: true,
+      });
+    }
+    expect(carriesCredential(`echo ${"a".repeat(50_000)}`)).toBe(false);
   });
 });

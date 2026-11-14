@@ -137,6 +137,8 @@ export const RUN_SCHEMA: ParseArgsSchema = {
     // instead of the spec's. `--plugins ""` activates none.
     { name: "plugins", takesValue: true },
     { name: "help", short: "h" },
+    // Run once while the harness's operator has paused new work.
+    { name: "ignore-pause", takesValue: false },
   ],
 };
 
@@ -563,6 +565,8 @@ export const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // `crewhaus eval --replay-tools`; --replay-miss as eval's.
     { name: "replay-tools", takesValue: true },
     { name: "replay-miss", takesValue: true },
+    // Run once while the harness's operator has paused new work.
+    { name: "ignore-pause", takesValue: false },
   ],
 };
 
@@ -604,6 +608,8 @@ export const FLYWHEEL_SCHEMA: ParseArgsSchema = {
     // `flywheel run` — an accepted candidate is filed as a change
     // (`crewhaus changes`); the spec is never written.
     { name: "propose", takesValue: false },
+    // Run once while the harness's operator has paused new work.
+    { name: "ignore-pause", takesValue: false },
   ],
 };
 
@@ -659,6 +665,10 @@ export const RETIRE_SCHEMA: ParseArgsSchema = {
     { name: "shared", takesValue: true },
     { name: "root-dir", takesValue: true },
     { name: "help", short: "h" },
+    // Stop a running daemon first; without it a live daemon refuses the retire.
+    { name: "stop", takesValue: false },
+    // Proceed past a tampered audit chain, a failed evidence bundle or a failed revoker.
+    { name: "force-unverified", takesValue: false },
   ],
 };
 
@@ -806,6 +816,8 @@ export const EVAL_SCHEMA: ParseArgsSchema = {
     // (`--regrade-baseline`).
     { name: "regrade", takesValue: true },
     { name: "regrade-baseline", takesValue: false },
+    // Run once while the harness's operator has paused new work.
+    { name: "ignore-pause", takesValue: false },
   ],
 };
 
@@ -900,6 +912,8 @@ export const EVAL_SUITE_SCHEMA: ParseArgsSchema = {
     // Exit non-zero when the tier verdict fails (report-only without it).
     { name: "gate", takesValue: false },
     { name: "help", short: "h" },
+    // Run once while the harness's operator has paused new work.
+    { name: "ignore-pause", takesValue: false },
   ],
 };
 
@@ -1353,6 +1367,7 @@ export const STATE_SCHEMA: ParseArgsSchema = {
     // backup
     { name: "out", short: "o", takesValue: true },
     { name: "exclude", takesValue: true },
+    { name: "include", takesValue: true },
     // restore
     { name: "into", takesValue: true },
     { name: "merge", takesValue: true },
