@@ -28,7 +28,7 @@ describe("#/device", () => {
     );
     expect(settings).toContain('el("a", { href: hrefFleet("device"), text: "Allow a sign-in" })');
     expect(settings).toContain("root.appendChild(otherComputerCard());");
-    expect(DEVICE_LOGIN_VERB).toBe("crewhaus login --server <this Home's address>");
+    expect(DEVICE_LOGIN_VERB).toBe("crewhaus login --server <url>");
     expect(DEVICE_APPROVE_VERB).toBe("crewhaus access approve <code>");
   });
 

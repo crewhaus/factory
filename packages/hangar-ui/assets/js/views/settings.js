@@ -255,7 +255,7 @@ function signOutCard() {
 }
 
 /** The command that shows a code on another computer, and the one that allows it here. */
-export const DEVICE_LOGIN_VERB = "crewhaus login --server <this Home's address>";
+export const DEVICE_LOGIN_VERB = "crewhaus login --server <url>";
 export const DEVICE_APPROVE_VERB = "crewhaus access approve <code>";
 
 function otherComputerCard() {
@@ -264,7 +264,7 @@ function otherComputerCard() {
     el("p", { class: "muted" }, [
       "To use this Home from another computer, run ",
       el("code", { text: DEVICE_LOGIN_VERB }),
-      " there. It shows a code to allow here.",
+      " there, with this Home's address. It shows a code to allow here.",
     ]),
     el("p", {}, [el("a", { href: hrefFleet("device"), text: "Allow a sign-in" })]),
     el("p", { class: "muted" }, [
