@@ -111,7 +111,7 @@ describe("what a request must be", () => {
   });
 
   test("an operation declared and not served yet answers 501 with its reason", async () => {
-    const res = await home.call("GET", `/api/v1/harnesses/${a.id}/runs`);
+    const res = await home.call("GET", "/api/v1/people");
     expect(res.status).toBe(501);
     const error = res.body["error"] as Record<string, unknown>;
     expect(error["code"]).toBe("unsupported");

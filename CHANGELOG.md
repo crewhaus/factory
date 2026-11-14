@@ -406,11 +406,17 @@ these on: they reach every harness that uses what each one names.
   run of the caller's tenant; `sessions.list` and `sessions.fork` answer
   `unsupported` (HTTP 501); `audit.tail` honours `sinceTs`. The daemon also runs
   the runs queued for it, so control.v1's `/status` lists `runs.create` and
-  `POST /control/v1/runs/claim` wakes it. `CREWHAUS_RUN_LEDGER=0` turns the rows
-  off with the other run rows. Recompile a daemon to pick this up.
+  `POST /control/v1/runs/claim` wakes it. A `sessionId` that is not a session id
+  (`sess_` and 16 hex) is refused with `bad_request` (HTTP 400) before anything is
+  written. While `/status` lists `runs.clientRunId`, `runs.create` and
+  `runs.continue` take `idempotency` (a repeat answers the first run) and `runId`
+  (the run's own canonical id); a reused value with other params, or a run id
+  already taken, answers `conflict` (HTTP 409). `CREWHAUS_RUN_LEDGER=0` turns the
+  rows off with the other run rows. Recompile a daemon to pick this up.
 - **A one-shot job the control API starts has its input checked at `api`.**
   Under `CREWHAUS_INPUT_ORIGIN=api`, the first top-level loop checks its seed
-  messages before its first model call; a refused seed ends the job with exit 41
+  messages before its first model call, a document's text included; a refused
+  seed, or one with a block whose text cannot be read, ends the job with exit 41
   (`input_blocked`), which a supervisor records as `failed` with `input_blocked`
   and does not restart, and a kept one is tagged at `api`. The variable takes the
   one value `api`; unset, nothing changes.
@@ -441,6 +447,11 @@ these on: they reach every harness that uses what each one names.
   `threshold` and `provability.grounded.coverage` and only lower
   `provability.grounded.window_tokens`. A person can make any of these
   changes with `crewhaus propose` or by editing `crewhaus.yaml`.
+
+- **Only an owner sets how long delegation rules may last.** `crewhaus
+  optimize`, `crewhaus advise --apply` and Home's automatic apply never set or
+  change `permissions.delegation`, alone or inside a whole `permissions` value.
+  An owner sets it by editing `crewhaus.yaml`.
 
 - **An eval judge with no credentials leaves its cases not measured.** When
   a judge's model provider has no credentials, `crewhaus eval` records its

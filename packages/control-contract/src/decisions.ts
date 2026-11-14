@@ -8,6 +8,7 @@
  * counts as passed, and a check that cannot be made refuses.
  */
 import { OPERATOR_SUPERSEDE_REASONS, VERIFY_REASONS } from "./areas/core.js";
+import type { DelegableDecisionKind, DelegationSubject } from "./areas/delegation.js";
 import { MODULES, type ModuleField } from "./areas/index.js";
 import type { Role } from "./areas/types.js";
 import type { DecisionState } from "./machines.js";
@@ -104,6 +105,8 @@ export const DECISION_LOG_KEYS = deepFreeze([
   "choice",
   "answered",
   "sensitivity",
+  "delegation",
+  "appliedBy",
 ] as const);
 
 export type DecisionLogKey = (typeof DECISION_LOG_KEYS)[number];
@@ -162,14 +165,31 @@ export type DecisionSensitivity = "internal" | "restricted" | "people";
 
 /**
  * What a standing-rule proposal asks the owner to allow: a narrow allow for one
- * tool, until a time. `ruleKind` says which terms follow, so another kind of rule
- * adds its own.
+ * tool, until a time, or a delegation rule for one action, for some days. `ruleKind`
+ * says which terms follow, so a reader narrows on it before it reads the rest.
  */
-export type StandingRuleTerms = {
-  readonly ruleKind: "allow";
-  readonly tool: string;
-  readonly pattern: string;
-  readonly expiresAt: string;
+export type StandingRuleTerms =
+  | {
+      readonly ruleKind: "allow";
+      readonly tool: string;
+      readonly pattern: string;
+      readonly expiresAt: string;
+    }
+  | {
+      readonly ruleKind: "delegate";
+      readonly action: string;
+      readonly terms: {
+        readonly days: number;
+        readonly maxUses?: number;
+        readonly scope?: Readonly<Record<string, string | number | boolean | readonly string[]>>;
+      };
+      readonly days: number;
+    };
+
+/** The rule, at its revision, a delegated decision was made under. */
+export type DecisionDelegation = {
+  readonly rule: string;
+  readonly revision: number;
 };
 
 /**
@@ -195,7 +215,12 @@ export type DecisionRecordView = {
   readonly consumedAt?: string;
   readonly consumedByRun?: string;
   readonly always?: boolean;
-  readonly kind?: "tool" | "input" | "standing-rule-proposal" | "change-adoption";
+  readonly kind?:
+    | "tool"
+    | "input"
+    | "standing-rule-proposal"
+    | "change-adoption"
+    | DelegableDecisionKind;
   /** The decider as a stored actor: `prn_`, `local:#<digest>` or `sys:`. */
   readonly decidedByPrincipal?: string;
   readonly decidedVia?: string;
@@ -207,7 +232,16 @@ export type DecisionRecordView = {
   readonly sensitivity?: DecisionSensitivity;
   readonly ifUnanswered?: IfUnanswered;
   readonly expiredAt?: string;
-  readonly resolvedBy?: "policy";
+  /**
+   * Set when no person decided: the agreement's fallback (`policy`), or an owner's
+   * delegation rule (`delegation`, with the rule and its revision).
+   */
+  readonly resolvedBy?: "policy" | "delegation";
+  readonly delegation?: DecisionDelegation;
+  /** Who ran the pass that applied a delegation rule. It decided nothing. */
+  readonly appliedBy?: string;
+  /** A delegable decision's class of action. */
+  readonly actionClass?: "ship";
   readonly agreementRevision?: string;
   readonly requiredClass?: DecisionClass;
   readonly binding?: DecisionBinding;
@@ -219,8 +253,11 @@ export type DecisionRecordView = {
   readonly proposedBy?: string;
   /** The tool approval a proposal was made from. */
   readonly derivedFrom?: string;
-  /** What a change-adoption decision is bound to: the change and the digests its check saw. */
-  readonly subject?: ChangeAdoptionSubject;
+  /**
+   * What the decision is bound to: a change and the digests its check saw, or (a merge
+   * or a rollout) the subject's ref and revision.
+   */
+  readonly subject?: ChangeAdoptionSubject | DelegationSubject;
 };
 
 /** A change-adoption decision's subject: content-free ids, keyed digests and a revision. */
@@ -371,12 +408,26 @@ export type VerifyApprovers =
   | { readonly state: "absent" | "unreadable" }
   | { readonly state: "present"; readonly projection: ApproverProjection };
 
+/**
+ * What a delegated grant is checked against, as its caller read it: the rule's computed
+ * state (`effectiveRuleState` in `./delegation`), whether its enabling owner still holds
+ * the owner's authority (`undefined`: it could not be told), and the subject's current
+ * revision.
+ */
+export type VerifyDelegation = {
+  readonly ruleState: { readonly state: string; readonly revision?: number };
+  readonly ownerHolds: boolean | undefined;
+  readonly subjectRevision: string | undefined;
+};
+
 export type VerifyDecisionInput = {
   readonly decision: DecisionRecordView;
   readonly overlays?: DecisionOverlays | null;
   readonly consumer: VerifyConsumer;
   readonly approvers: VerifyApprovers;
   readonly now: number;
+  /** Required for a delegated grant; read by nothing else. */
+  readonly delegation?: VerifyDelegation;
 };
 
 export type VerifyVerdict =
@@ -403,8 +454,14 @@ const OK: VerifyVerdict = Object.freeze({ ok: true });
 function supersedeReasonOf(
   record: DecisionRecordView,
   reason: VerifyReason,
+  ruleGone: boolean,
 ): SupersedeReason | undefined {
   if (reason === "revision-changed") return "revision-changed";
+  // A delegated grant whose rule no longer stands is never spent: the person asked in
+  // its place decides.
+  if (record.resolvedBy === "delegation") {
+    return reason === "decider-not-authorized" && ruleGone ? "rule-revoked" : undefined;
+  }
   if (
     reason === "decider-not-authorized" &&
     record.resolvedBy !== "policy" &&
@@ -415,8 +472,13 @@ function supersedeReasonOf(
   return undefined;
 }
 
-function refuse(record: DecisionRecordView, reason: VerifyReason, detail?: string): VerifyVerdict {
-  const supersedeReason = supersedeReasonOf(record, reason);
+function refuse(
+  record: DecisionRecordView,
+  reason: VerifyReason,
+  detail?: string,
+  ruleGone = false,
+): VerifyVerdict {
+  const supersedeReason = supersedeReasonOf(record, reason, ruleGone);
   return {
     ok: false,
     reason,
@@ -510,6 +572,44 @@ function verifyDecider(
 }
 
 /**
+ * A delegated grant: no person decided it, so no run binding or decider is read. It
+ * counts only while the rule it was made under still applies, its enabling owner still
+ * holds the owner's authority, and the subject is still at the revision it was bound to.
+ * A delegated record that names a decider is not one the service writes, and refuses.
+ */
+function verifyDelegated(
+  record: DecisionRecordView,
+  delegation: VerifyDelegation | undefined,
+): VerifyVerdict {
+  const bound = record.delegation;
+  if (typeof delegation !== "object" || delegation === null) {
+    return refuse(record, "decider-not-authorized", "no rule state was given");
+  }
+  if (typeof bound !== "object" || bound === null || !isText(bound.rule)) {
+    return refuse(record, "decider-not-authorized", "the record names no rule");
+  }
+  if (record.decidedByPrincipal !== undefined) {
+    return refuse(record, "decider-not-authorized", "a delegated decision names no decider");
+  }
+  if (delegation.ruleState?.state !== "active" || delegation.ownerHolds !== true) {
+    return refuse(record, "decider-not-authorized", "the rule no longer applies", true);
+  }
+  const ruleRevision = delegation.ruleState.revision;
+  if (ruleRevision !== undefined && ruleRevision !== bound.revision) {
+    return refuse(record, "revision-changed", "the rule has a newer revision");
+  }
+  const subject = record.subject as Partial<DelegationSubject> | undefined;
+  if (
+    !isText(subject?.revision) ||
+    !isText(delegation.subjectRevision) ||
+    subject.revision !== delegation.subjectRevision
+  ) {
+    return refuse(record, "revision-changed");
+  }
+  return OK;
+}
+
+/**
  * The checks made just before a grant is spent, in order; the first failure wins.
  * It reads no ledger, so turning run tracking off cannot weaken it. Current policy
  * and the pre-tool hook stay the runtime's own check. Any refusal leaves the grant
@@ -535,6 +635,7 @@ export function verifyDecision(input: VerifyDecisionInput): VerifyVerdict {
   if (effectiveDecisionState(record, overlays, now).state === "expired") {
     return refuse(record, "expired");
   }
+  if (record.resolvedBy === "delegation") return verifyDelegated(record, input.delegation);
 
   if (typeof consumer !== "object" || consumer === null) return refuse(record, "scope-mismatch");
   if (!isText(consumer.resumeScope)) return refuse(record, "scope-mismatch");

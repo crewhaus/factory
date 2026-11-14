@@ -10,9 +10,9 @@ import { CORE_SCHEMAS } from "./core.js";
 
 // import { COMPILER_SCHEMAS } from "./compiler.js";
 
-// import { CREATION_SCHEMAS } from "./creation.js";
+import { CREATION_SCHEMAS } from "./creation.js";
 
-// import { DELEGATION_SCHEMAS } from "./delegation.js";
+import { DELEGATION_SCHEMAS } from "./delegation.js";
 
 // import { HOME_SCHEMAS } from "./home.js";
 
@@ -37,9 +37,9 @@ export const AREA_SCHEMAS: readonly Readonly<Record<string, z.ZodTypeAny>>[] = [
 
   // COMPILER_SCHEMAS,
 
-  // CREATION_SCHEMAS,
+  CREATION_SCHEMAS,
 
-  // DELEGATION_SCHEMAS,
+  DELEGATION_SCHEMAS,
 
   // HOME_SCHEMAS,
 

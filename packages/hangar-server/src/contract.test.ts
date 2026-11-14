@@ -657,7 +657,10 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["target", "string|null"],
     ["schemaSource", "string"],
     ["schemaVersion", "string|null"],
+    ["schemaNote", "string|null"],
     ["effective", "array"],
+    // The rows stopped at their cap with settings left over: the editor says so.
+    ["effectiveTruncated", "boolean"],
     ["effectiveNote", "string|null"],
     ["declaredCount", "number"],
     ["defaultedCount", "number"],

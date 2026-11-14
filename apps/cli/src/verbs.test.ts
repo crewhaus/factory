@@ -27,7 +27,7 @@ import {
 const INDEX = readFileSync(join(CLI_SRC, "index.ts"), "utf8");
 
 /** The legacy rows there were when the inventory was written. */
-const LEGACY_COUNT = 78;
+const LEGACY_COUNT = 77;
 
 /** The top-level dispatch labels: `case "<verb>":` from `switch (subcommand) {` on. */
 function dispatchVerbs(source: string): string[] {
@@ -129,11 +129,13 @@ describe("the inventory is the dispatch", () => {
       "commands",
       "criteria",
       "daemon",
+      "delegations",
       "hangar",
       "harness",
       "login",
       "logout",
       "people",
+      "runs",
     ]);
     expect(LEGACY_VERBS.length, "a new verb is a `<verb>-cmd.ts` module exporting CLI_FAMILY").toBe(
       LEGACY_COUNT,
@@ -254,8 +256,8 @@ describe("every flag list answers --help", () => {
         }
       }
     }
-    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 12 + 1 + 1 + 12));
-  }, 30_000); // eleven modules' imports and a hundred and fifty calls; slow on a loaded runner
+    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 12 + 1 + 1 + 12 + 5));
+  }, 30_000); // thirteen modules' imports and a hundred and seventy calls; slow on a loaded runner
 });
 
 describe("family parsers take their flags from CLI_FAMILY", () => {

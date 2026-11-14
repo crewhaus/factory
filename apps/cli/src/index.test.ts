@@ -3737,7 +3737,7 @@ describe("crewhaus runs resume (item 7)", () => {
   test("an unknown runs action is rejected", async () => {
     const result = await runCli(["runs", "subscribe"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain('runs action must be "resume"');
+    expect(result.stderr).toContain('unknown runs verb "subscribe"');
   }, 20_000);
 
   test("runs resume --help prints usage", async () => {

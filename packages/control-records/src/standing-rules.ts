@@ -14,7 +14,8 @@
  * `decision` machine, in `.crewhaus/run/control/decisions/` (size segments). The first
  * decision on it wins through `casAppend(…, "pending", …)`: its generation claim decides.
  * The same ledger holds `change-adoption` decisions (a change record waiting to be
- * adopted); each reader reads its own kind and passes over the other known kind.
+ * adopted) and the `merge` and `rollout` decisions a delegation rule may resolve; each
+ * reader reads its own kind and passes over the other known kinds.
  *
  * Both ledgers are `harnessLedger`s, so they share the harness's control lock and claims
  * directory: a writer that holds the lock for one may compare-and-set on both
@@ -22,13 +23,21 @@
  */
 import {
   DECISION_CLASSES,
+  DECISION_LOG_REASONS,
+  DELEGABLE_DECISION_KINDS,
+  DELEGATION_ACTIONS,
   type DecisionClass,
+  type DelegableDecisionKind,
+  type DelegationSubject,
   type StandingRuleTerms,
   isId,
+  isRef,
   isStoredActor,
+  mintId,
 } from "@crewhaus/control-contract";
+import { isDelegationTerms } from "./delegations";
 import { cachedPerPath } from "./fail-closed";
-import { type FoldAnswer, type LedgerRecord, foldStates } from "./ledger";
+import { type FoldAnswer, type LedgerRecord, casAppend, foldStates } from "./ledger";
 import { type Ledger, controlPaths, harnessLedger } from "./paths";
 
 /**
@@ -68,7 +77,8 @@ export type ProposalRow = {
   /** When the request stops waiting: it then reads `expired`. */
   readonly expiresAt: string;
   readonly requiredClass: DecisionClass;
-  readonly derivedFrom: string;
+  /** The tool approval an `allow` request was made from. A `delegate` request has none. */
+  readonly derivedFrom?: string;
   readonly proposedBy: string;
   readonly terms: StandingRuleTerms;
   readonly state: "pending" | "granted" | "denied";
@@ -110,10 +120,41 @@ export type ChangeAdoptionRow = {
   readonly supersededReason?: string;
 };
 
+/**
+ * A decision a delegation rule may resolve (`merge`, `rollout`), or a person in its place:
+ * a `ship`-class action bound to its subject's ref and revision, on the `decision` machine.
+ */
+export type ActionDecisionRow = {
+  readonly id: string;
+  readonly kind: DelegableDecisionKind;
+  readonly actionClass: "ship";
+  readonly createdAt: string;
+  /** When the decision stops waiting: it then reads `expired`. */
+  readonly expiresAt: string;
+  readonly requiredClass: DecisionClass;
+  readonly subject: DelegationSubject;
+  readonly proposedBy: string;
+  readonly state: "pending" | "granted" | "denied" | "consumed" | "superseded";
+  readonly decision?: "grant" | "deny";
+  readonly decidedAt?: string;
+  /** A person who decided. Never set when a rule did. */
+  readonly decidedByPrincipal?: string;
+  readonly resolvedBy?: "delegation";
+  readonly delegation?: { readonly rule: string; readonly revision: number };
+  /** Who ran the pass that applied the rule. It decided nothing. */
+  readonly appliedBy?: string;
+  readonly consumedAt?: string;
+  readonly supersededAt?: string;
+  readonly supersededReason?: string;
+  /** The fresh decision asked in this one's place. */
+  readonly supersededBy?: string;
+};
+
 /** The decision kinds the decisions ledger holds; a reader passes over the others. */
 const DECISION_ROW_KINDS: ReadonlySet<string> = new Set([
   "standing-rule-proposal",
   "change-adoption",
+  ...DELEGABLE_DECISION_KINDS,
 ]);
 
 export type LedgerRead<T> =
@@ -217,19 +258,30 @@ export function proposalOf(row: LedgerRecord): ProposalRow | undefined {
     typeof terms === "object" && terms !== null && !Array.isArray(terms)
       ? (terms as Record<string, unknown>)
       : undefined;
+  // An `allow` request names the approval it came from; a `delegate` request names none.
+  const termsOk =
+    t === undefined
+      ? false
+      : t["ruleKind"] === "allow"
+        ? isId("appr", r["derivedFrom"]) &&
+          isText(t["tool"]) &&
+          isText(t["pattern"]) &&
+          isInstant(t["expiresAt"])
+        : t["ruleKind"] === "delegate" &&
+          r["derivedFrom"] === undefined &&
+          (DELEGATION_ACTIONS as readonly unknown[]).includes(t["action"]) &&
+          isDelegationTerms(t["terms"]) &&
+          Number.isSafeInteger(t["days"]) &&
+          (t["days"] as number) >= 1 &&
+          (t["days"] as number) <= 90;
   const ok =
     isId("dec", r["id"]) &&
     r["kind"] === "standing-rule-proposal" &&
     isInstant(r["createdAt"]) &&
     isInstant(r["expiresAt"]) &&
     (DECISION_CLASSES as readonly unknown[]).includes(r["requiredClass"]) &&
-    isId("appr", r["derivedFrom"]) &&
     isStoredActor(r["proposedBy"]) &&
-    t !== undefined &&
-    t["ruleKind"] === "allow" &&
-    isText(t["tool"]) &&
-    isText(t["pattern"]) &&
-    isInstant(t["expiresAt"]) &&
+    termsOk &&
     (r["state"] === "pending" || r["state"] === "granted" || r["state"] === "denied") &&
     optional(r["decision"], (v) => v === "grant" || v === "deny") &&
     optional(r["decidedAt"], isInstant) &&
@@ -398,6 +450,161 @@ export function changeAdoptionState(
   if (row.state !== "pending" && row.state !== "granted") return row.state;
   const ends = Date.parse(row.expiresAt);
   return Number.isFinite(ends) && Number.isFinite(nowMs) && nowMs <= ends ? row.state : "expired";
+}
+
+const SUBJECT_REVISION_RE = /^[A-Za-z0-9:_.-]{1,200}$/;
+
+/**
+ * A row as a decision a delegation rule may resolve, or `undefined` when it is not one. A
+ * row that says a rule resolved it names the rule and no person; one a person decided
+ * names no rule.
+ *
+ * First consumer: {@link readActionDecisions}.
+ */
+export function actionDecisionOf(row: LedgerRecord): ActionDecisionRow | undefined {
+  const r = withoutBookkeeping(row);
+  const subject = r["subject"];
+  const s =
+    typeof subject === "object" && subject !== null && !Array.isArray(subject)
+      ? (subject as Record<string, unknown>)
+      : undefined;
+  const delegation = r["delegation"];
+  const d =
+    typeof delegation === "object" && delegation !== null && !Array.isArray(delegation)
+      ? (delegation as Record<string, unknown>)
+      : undefined;
+  const state = r["state"];
+  const delegated = r["resolvedBy"] === "delegation";
+  const ok =
+    isId("dec", r["id"]) &&
+    (DELEGABLE_DECISION_KINDS as readonly unknown[]).includes(r["kind"]) &&
+    r["actionClass"] === "ship" &&
+    isInstant(r["createdAt"]) &&
+    isInstant(r["expiresAt"]) &&
+    (DECISION_CLASSES as readonly unknown[]).includes(r["requiredClass"]) &&
+    s !== undefined &&
+    Object.keys(s).every((key) => key === "ref" || key === "revision") &&
+    isRef(s["ref"]) &&
+    typeof s["revision"] === "string" &&
+    SUBJECT_REVISION_RE.test(s["revision"]) &&
+    isStoredActor(r["proposedBy"]) &&
+    (state === "pending" ||
+      state === "granted" ||
+      state === "denied" ||
+      state === "consumed" ||
+      state === "superseded") &&
+    optional(r["decision"], (v) => v === "grant" || v === "deny") &&
+    optional(r["decidedAt"], isInstant) &&
+    optional(r["resolvedBy"], (v) => v === "delegation") &&
+    (delegated
+      ? r["decidedByPrincipal"] === undefined &&
+        d !== undefined &&
+        isId("rule", d["rule"]) &&
+        Number.isSafeInteger(d["revision"]) &&
+        (d["revision"] as number) >= 1 &&
+        optional(r["appliedBy"], isStoredActor)
+      : r["delegation"] === undefined &&
+        r["appliedBy"] === undefined &&
+        optional(r["decidedByPrincipal"], isStoredActor)) &&
+    optional(r["consumedAt"], isInstant) &&
+    optional(r["supersededAt"], isInstant) &&
+    optional(r["supersededReason"], (v) =>
+      (DECISION_LOG_REASONS.supersede as readonly unknown[]).includes(v),
+    ) &&
+    optional(r["supersededBy"], (v) => isId("dec", v));
+  return ok ? (r as ActionDecisionRow) : undefined;
+}
+
+/**
+ * Every decision a delegation rule may resolve in a harness, as its latest row says. A
+ * tolerant fold, like {@link readProposals}: the other known kinds are passed over.
+ *
+ * First consumers: the delegation service and the decision service.
+ */
+export function readActionDecisions(harnessDir: string): LedgerRead<ActionDecisionRow> {
+  const fold = foldStates(decisionsLedger(harnessDir));
+  const others = new Set(
+    [...DECISION_ROW_KINDS].filter(
+      (kind) => !(DELEGABLE_DECISION_KINDS as readonly string[]).includes(kind),
+    ),
+  );
+  return readLedger(fold, actionDecisionOf, "delegable decision", others);
+}
+
+/**
+ * An action decision's state as every reader shows it: a pending one, or an unconsumed
+ * grant, past its `expiresAt` reads `expired`. Computed, never written.
+ *
+ * First consumers: the delegation service and the decision service.
+ */
+export function actionDecisionState(
+  row: ActionDecisionRow,
+  nowMs: number,
+): ActionDecisionRow["state"] | "expired" {
+  if (row.state !== "pending" && row.state !== "granted") return row.state;
+  const ends = Date.parse(row.expiresAt);
+  return Number.isFinite(ends) && Number.isFinite(nowMs) && nowMs < ends ? row.state : "expired";
+}
+
+/**
+ * How long a decision a rule may resolve waits for an answer when its producer names none.
+ *
+ * First consumer: {@link openActionDecision}.
+ */
+export const ACTION_DECISION_TTL_MS = 7 * 86_400_000;
+
+export type OpenActionDecision = {
+  readonly kind: DelegableDecisionKind;
+  readonly subject: DelegationSubject;
+  readonly requiredClass: DecisionClass;
+  /** Who raised it: the producer's stored actor (a system actor, for an area's producer). */
+  readonly proposedBy: string;
+  readonly ttlMs?: number;
+  readonly now: number;
+  /** The id, when the caller names it first. */
+  readonly id?: string;
+};
+
+/**
+ * Open a pending decision a delegation rule may resolve: a `ship`-class `merge` or
+ * `rollout` bound to its subject's revision. A person may decide it from any surface, and
+ * the first decision wins. A row that would not read back is refused before anything is
+ * written.
+ *
+ * First consumers: the producers that raise merges and rollouts, and the delegation
+ * service when a refused grant is asked again.
+ */
+export async function openActionDecision(
+  harnessDir: string,
+  input: OpenActionDecision,
+): Promise<
+  | { readonly ok: true; readonly row: ActionDecisionRow }
+  | { readonly ok: false; readonly reason: string }
+> {
+  const id = input.id ?? mintId("dec", { now: input.now });
+  const row: ActionDecisionRow = {
+    id,
+    kind: input.kind,
+    actionClass: "ship",
+    createdAt: new Date(input.now).toISOString(),
+    expiresAt: new Date(input.now + (input.ttlMs ?? ACTION_DECISION_TTL_MS)).toISOString(),
+    requiredClass: input.requiredClass,
+    subject: { ref: input.subject.ref, revision: input.subject.revision },
+    proposedBy: input.proposedBy,
+    state: "pending",
+  };
+  if (actionDecisionOf(row as unknown as LedgerRecord) === undefined) {
+    return { ok: false, reason: "the decision would not be one a reader accepts" };
+  }
+  const cas = await casAppend(
+    decisionsLedger(harnessDir),
+    id,
+    null,
+    row as unknown as LedgerRecord,
+  );
+  if (!cas.ok) return { ok: false, reason: cas.reason };
+  if (!cas.applied) return { ok: false, reason: "the decision's id was taken" };
+  return { ok: true, row };
 }
 
 /**

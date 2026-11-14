@@ -30,6 +30,8 @@ describe("the layout", () => {
       runsDir: join(CONTROL, "runs"),
       inputsDir: join(CONTROL, "inputs"),
       subjectKeyFile: join(CONTROL, "keys", "subject.key"),
+      delegationsFile: join(CONTROL, "delegations.jsonl"),
+      delegationLogDir: join(CONTROL, "delegation-log"),
     });
     expect(readdirSync(root)).toEqual([]);
   });

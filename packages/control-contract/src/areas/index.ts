@@ -14,9 +14,9 @@ import type { AreaModule } from "./types.js";
 
 // import { COMPILER_MODULE } from "./compiler.js";
 
-// import { CREATION_MODULE } from "./creation.js";
+import { CREATION_MODULE } from "./creation.js";
 
-// import { DELEGATION_MODULE } from "./delegation.js";
+import { DELEGATION_MODULE } from "./delegation.js";
 
 // import { HOME_MODULE } from "./home.js";
 
@@ -41,9 +41,9 @@ export const AREA_MODULES = [
 
   // COMPILER_MODULE,
 
-  // CREATION_MODULE,
+  CREATION_MODULE,
 
-  // DELEGATION_MODULE,
+  DELEGATION_MODULE,
 
   // HOME_MODULE,
 

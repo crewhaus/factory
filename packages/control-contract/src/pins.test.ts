@@ -193,6 +193,7 @@ describe("closed lists", () => {
       "not-indexed",
       "unreachable",
       "expired",
+      "not-allowed",
     ]);
     expect(PAGE_LIMIT_DEFAULT).toBe(50);
     expect(PAGE_LIMIT_MAX).toBe(500);
@@ -217,6 +218,7 @@ describe("closed lists", () => {
       "runs.ledger",
       "decisions.consumeChecks",
       "events.trace",
+      "runs.clientRunId",
     ]);
     expect([...CORE_MODULE.scopedActs]).toEqual(["run.events.read", "run.result.read"]);
   });

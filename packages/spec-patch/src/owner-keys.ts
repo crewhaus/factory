@@ -79,4 +79,12 @@ export const DELTA_090_KEYS: ReadonlyArray<OwnerKey> = Object.freeze([
     reason: "what a plugin may load and drive unchecked is the owner's decision",
     since: "0.9.0",
   } as const),
+  // The delegation ceiling sits inside `permissions:` on every shape that has one.
+  Object.freeze({
+    pattern: Object.freeze(["permissions", "delegation"]),
+    refused: true,
+    security: true,
+    reason: "who may act without asking is the owner's decision",
+    since: "0.9.0",
+  } as const),
 ]);

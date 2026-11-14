@@ -3,15 +3,16 @@
  * version history with pins and diffs, and the four builders (new-spec
  * wizard, grader builder, dataset builder, MCP connectors).
  *
- * The field editor is honest about its two halves. A SCALAR leaf edits
- * inline. Everything else — a block, a list, a field inside a list item, or
- * a block this spec does not declare at all — edits through the JSON pane,
- * which sends ONE edit (`path` + `value`) down the same `specDiff` →
- * `specEdit` road every other write here takes, so the server's trust tiers
- * and typed confirmation still decide what may land. There is no YAML
- * editor in this console and this screen never says there is: the console is
- * zero-build and dependency-free, so it has no YAML parser to be honest
- * with.
+ * The settings form is built from the schema this harness's spec is checked
+ * with (`specs.schema`): a labelled control for every setting the form can
+ * show, and the JSON pane for every one it cannot (a record keyed by names, a
+ * list of entries, a setting that takes several forms, one whose shape the
+ * masker hid). Every save is ONE edit down the same guarded routes: a setting
+ * the optimizer may write saves with `specPatch`; any other is previewed with
+ * `specDiff` and applied with `specEdit` after the confirmation the server's
+ * answer asks for. There is no YAML editor in this console and this screen
+ * never says there is: the console is zero-build and dependency-free, so it
+ * has no YAML parser to be honest with.
  *
  * The M1 read (`views/spec.js`: YAML, issues, env-ref presence, badges)
  * stays where it is and is rendered above this.
@@ -49,6 +50,8 @@ import {
 } from "../dom.js";
 import { conflictView } from "../ui/conflict.js";
 import { confirmAction, openDialog } from "../ui/dialog.js";
+import { CLEAR, fieldEdit, formModel, issuesByField, maskedMarkerOf } from "../ui/schema-form.js";
+import { call } from "../v1.js";
 
 // ---------------------------------------------------------------------------
 // small shared pieces
@@ -93,12 +96,6 @@ function pre(text) {
   return el("pre", { class: "rawjson", tabindex: "0", text: text === "" ? "(no change)" : text });
 }
 
-/** The tier badge — colour is never alone, the tier word rides with it. */
-function tierBadge(row) {
-  if (row.tier === "auto-tunable") return dot("ok", "auto-tunable");
-  return dot(row.securitySurface === true ? "bad" : "warn", "human-owned");
-}
-
 /**
  * The read-only state a spec read answered (`readOnly`), as this screen
  * shows it. Pure. A spec carrying settings the schema in use does not know
@@ -121,13 +118,22 @@ export function readOnlyModel(readOnly) {
   };
 }
 
-const READ_ONLY_NOTE_ID = "spec-read-only-note";
+/** The read-only notice's sentence: what every held control is described by. */
+const READ_ONLY_REASON_ID = "spec-read-only-reason";
 
-/** Hold a write control while the spec is read-only: still focusable, announced as unavailable, with the reason. */
+/**
+ * Mark a write control, and hold it while the spec is read-only: still
+ * focusable, announced as unavailable, described by the reason first and then
+ * by its own description. Its handler returns before any request while held.
+ */
 function holdWhenReadOnly(control, live) {
+  control.dataset.write = "true";
   if (live?.readOnly?.held === true) {
     control.setAttribute("aria-disabled", "true");
-    control.setAttribute("aria-describedby", READ_ONLY_NOTE_ID);
+    const own = (control.getAttribute("aria-describedby") ?? "")
+      .split(/\s+/)
+      .filter((token) => token !== "" && token !== READ_ONLY_REASON_ID);
+    control.setAttribute("aria-describedby", [READ_ONLY_REASON_ID, ...own].join(" "));
   }
   return control;
 }
@@ -135,18 +141,18 @@ function holdWhenReadOnly(control, live) {
 /** True while a control is held (read-only spec, or a write in flight). */
 const isHeld = (control) => control.getAttribute("aria-disabled") === "true";
 
-/** The notice a read-only spec renders above the editor. */
+/** The notice a read-only spec renders above the editor: the reason, then the one command, when there is one. */
 function readOnlyCard(model) {
-  return el("div", { class: "card", id: READ_ONLY_NOTE_ID }, [
+  return el("div", { class: "card spec-read-only" }, [
     el("h3", { class: "card-title" }, [
       el("span", { text: "Read-only here" }),
       dot("warn", "read-only"),
     ]),
-    el("p", { text: model.notice }),
+    el("p", { id: READ_ONLY_REASON_ID, text: model.notice }),
     model.verb === null
       ? null
       : el("p", { class: "muted" }, [
-          el("span", { text: "Edit it with " }),
+          el("span", { text: "Run " }),
           el("code", { text: model.verb }),
         ]),
   ]);
@@ -364,9 +370,11 @@ function stubCard(title, res) {
     el("p", {
       class: "muted",
       text:
-        typeof res?.body?.error === "string"
-          ? res.body.error
-          : "the server has no handler for this yet",
+        typeof res?.error?.message === "string"
+          ? res.error.message
+          : typeof res?.body?.error === "string"
+            ? res.body.error
+            : "the server has no handler for this yet",
     }),
   ]);
 }
@@ -460,128 +468,818 @@ function renderValue(value) {
 }
 
 // ---------------------------------------------------------------------------
-// the field editor (trust tiers)
+// the settings form — every setting the schema describes
 // ---------------------------------------------------------------------------
 
 /**
- * One row per declared path, badged by tier, with the edit control the tier
- * allows:
+ * Values typed into the form and not saved yet, by harness and setting. They
+ * survive a re-render that another write on this page causes. Kept in memory
+ * only, never in stored drafts: a person can paste a key into this editor.
  *
- *   auto-tunable → an inline input that saves through `specPatch` (the same
- *     restriction the optimizer runs under, enforced server-side);
- *   human-owned  → "Review & apply", which fetches the redacted diff FIRST
- *     and only then offers the typed confirmation, plus "Propose" for the
- *     review-PR path;
- *   a block or a list → the JSON pane, which takes the same diff → tier →
- *     confirm road with the whole value as one edit.
+ * Each entry keeps the value the setting had when it was typed (`seed`): when
+ * the file's value has changed since, the typed value is dropped, so a control
+ * never shows a draft over a value it was not typed against. A kept value is
+ * labelled as not saved, in words.
  */
-function trustCard(ctx, trust, valueByPath, reload, live) {
-  const rows = Array.isArray(trust.paths) ? trust.paths : [];
-  // Rows are what the spec DECLARES; the pane is how anything else is
-  // reached, so it belongs on the empty screen too — a spec with no rows is
-  // exactly the one an operator needs to add a block to.
+const unsaved = new Map();
+const unsavedKey = (ctx, node) => `${ctx.id}\u0000${node.key}`;
+const seedMark = (node) => {
+  try {
+    return JSON.stringify(node.seed) ?? "";
+  } catch {
+    return "";
+  }
+};
+
+/** The typed value kept for a setting, or undefined (and dropped) when its seed has moved. */
+function keptValue(ctx, node) {
+  const at = unsavedKey(ctx, node);
+  const entry = unsaved.get(at);
+  if (entry === undefined) return undefined;
+  if (entry.seed !== seedMark(node)) {
+    unsaved.delete(at);
+    return undefined;
+  }
+  return entry.value;
+}
+
+/** Drop every typed value kept for a setting at or under `segments` of this harness. */
+function dropUnsavedUnder(ctx, segments) {
+  const prefix = (Array.isArray(segments) ? segments : []).map(String);
+  for (const [at, entry] of unsaved) {
+    if (!at.startsWith(`${ctx.id}\u0000`)) continue;
+    const own = Array.isArray(entry.segments) ? entry.segments : [];
+    if (prefix.length <= own.length && prefix.every((seg, i) => own[i] === seg)) {
+      unsaved.delete(at);
+    }
+  }
+}
+
+/** The re-read that puts focus back on the control that opened a write, when it has a key. */
+const focusOf = (opener) =>
+  opener instanceof HTMLElement && typeof opener.dataset.focusKey === "string"
+    ? { focusKey: opener.dataset.focusKey }
+    : {};
+
+/** Ids of one render of the form; a re-render mints new ones. */
+let formSeq = 0;
+
+/** What a saved setting says: it is saved, and not active yet. */
+export function savedMessage(node) {
+  const segments = Array.isArray(node?.segments) ? node.segments.map(String) : [];
+  const label = String(node?.label ?? segments.join("."));
+  if (segments[0] === "permissions" && segments[1] === "delegation") {
+    return `Saved ${label}. It is not active until a person activates a deployment.`;
+  }
+  return `Saved ${label}. It is not active until the harness is rebuilt.`;
+}
+
+/** The words a field's state is shown with, beside its traffic light. */
+function fieldBadge(node) {
+  if (node.security === true) return dot("bad", "security setting");
+  if (node.tier === "auto-tunable") return dot("ok", "saves directly");
+  if (node.tier === "human-owned") return dot("warn", "needs your confirmation");
+  return dot("unknown", "reviewed before saving");
+}
+
+/** A refusal whose issues the form can place beside their fields. */
+function rejectedIssues(res) {
+  const body = res?.ok === true ? res.body : null;
+  return body?.ok === false &&
+    body.code === "edit_rejected" &&
+    Array.isArray(body.issues) &&
+    body.issues.length > 0
+    ? body.issues
+    : null;
+}
+
+/** Set a control's description ids, the read-only reason first when it is held. */
+function describe(control, ids) {
+  const held = (control.getAttribute("aria-describedby") ?? "")
+    .split(/\s+/)
+    .includes(READ_ONLY_REASON_ID);
+  const tokens = [...(held ? [READ_ONLY_REASON_ID] : []), ...ids.filter((id) => id !== "")];
+  if (tokens.length === 0) control.removeAttribute("aria-describedby");
+  else control.setAttribute("aria-describedby", tokens.join(" "));
+}
+
+/** The options of a choice, with "Not set" first when the setting has no value. */
+function choiceSelect(id, options, current, labelFor) {
+  const select = el("select", { class: "input", id });
+  const unset = current === undefined;
+  if (unset) select.appendChild(el("option", { value: "", text: "Not set" }));
+  options.forEach((option, index) => {
+    const opt = el("option", { value: String(index), text: labelFor(option) });
+    if (!unset && JSON.stringify(option) === JSON.stringify(current)) opt.selected = true;
+    select.appendChild(opt);
+  });
+  return select;
+}
+
+const optionText = (value) => (value === null ? "None" : String(value));
+const yesNo = (value) => (value === true ? "Yes" : value === false ? "No" : String(value));
+
+/**
+ * What the Settings card is, from the schema read: no spec at all (an empty
+ * state that says why and names the command that makes one, with no form and
+ * no "Edit any path"), read-only, a schema with no form to show, or editable.
+ * The traffic light always comes with its word. Pure.
+ */
+export function settingsState(body, groupCount, held) {
+  if (body?.present === false) {
+    return {
+      absent: true,
+      tone: "off",
+      word: "no spec",
+      note:
+        typeof body.note === "string" && body.note !== ""
+          ? body.note
+          : "This harness has no crewhaus.yaml yet.",
+      verb: typeof body.verb === "string" && body.verb !== "" ? body.verb : "crewhaus init",
+    };
+  }
+  if (held === true) return { absent: false, tone: "warn", word: "read-only" };
+  if (!(groupCount > 0)) return { absent: false, tone: "warn", word: "no form" };
+  return { absent: false, tone: "ok", word: "editable" };
+}
+
+/**
+ * The settings form: one fieldset per block the spec declares, the blocks only
+ * the schema's defaults set collapsed under "Using defaults", and the settings
+ * at the top level in their own fieldset. Every control is labelled; its help
+ * and any issue describe it. A save is one edit: a setting the optimizer may
+ * write saves directly, any other is reviewed first (the server's preview says
+ * what it needs), and an issue the schema finds is placed beside its field.
+ */
+function settingsCard(ctx, body, trust, live, reload) {
+  // No spec in this harness: nothing to edit, so say why and name the command that makes one.
+  const absent = settingsState(body, 0, false);
+  if (absent.absent) {
+    const empty = card("Settings", dot(absent.tone, absent.word), [
+      emptyState(absent.note, absent.verb),
+    ]);
+    empty.classList.add("settings-card");
+    return empty;
+  }
+  const trustRows = Array.isArray(trust?.paths) ? trust.paths : [];
+  const model = formModel(body.schema, body.effective, trustRows);
+  const prefix = `sf${++formSeq}`;
+  const fields = new Map();
+  let seq = 0;
+  const nextId = (what) => `${prefix}-${what}-${++seq}`;
+
+  const issueBox = el("div", { class: "settings-issues", hidden: true });
+  const defaultsPanel = el("div", {
+    class: "settings-defaults",
+    id: `${prefix}-defaults`,
+    hidden: true,
+  });
+  const defaultsBtn = el("button", {
+    class: "btn btn-ghost disclosure-btn",
+    type: "button",
+    "aria-expanded": "false",
+    "aria-controls": defaultsPanel.id,
+    text: "Using defaults",
+  });
+  const expandDefaults = (open) => {
+    defaultsPanel.hidden = !open;
+    defaultsBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  };
+  defaultsBtn.addEventListener("click", () => expandDefaults(defaultsPanel.hidden));
+
+  const form = {
+    /** Put each issue beside its field and list them above the form; focus the first placed one. */
+    showIssues(issues, focusFirst) {
+      for (const field of fields.values()) {
+        field.slot.hidden = true;
+        field.slot.textContent = "";
+        if (field.input !== null) field.input.removeAttribute("aria-invalid");
+        for (const target of field.described) describe(target, field.baseIds(target));
+      }
+      const { byPath, unplaced } = issuesByField(model.groups, issues);
+      const placed = [];
+      for (const [key, list] of byPath) {
+        const field = fields.get(key);
+        if (field === undefined) {
+          unplaced.push(...list);
+          continue;
+        }
+        field.slot.textContent = list.map((issue) => String(issue?.message ?? "")).join(" ");
+        field.slot.hidden = false;
+        if (field.input !== null) field.input.setAttribute("aria-invalid", "true");
+        for (const target of field.described) {
+          describe(target, [...field.baseIds(target), field.slot.id]);
+        }
+        if (defaultsPanel.contains(field.slot)) expandDefaults(true);
+        // A block of defaults folded inside another opens, so the issue is seen.
+        for (let fold = field.slot.closest("details"); fold !== null; ) {
+          fold.open = true;
+          fold = fold.parentElement?.closest("details") ?? null;
+        }
+        placed.push({ field, list });
+      }
+      clear(issueBox);
+      issueBox.hidden = placed.length === 0 && unplaced.length === 0;
+      if (!issueBox.hidden) {
+        issueBox.appendChild(el("h4", { class: "sub-title", text: "Fix these first" }));
+        issueBox.appendChild(
+          el("ul", { class: "issue-list" }, [
+            ...placed.map(({ field, list }) => {
+              const go = el("button", {
+                class: "btn btn-ghost",
+                type: "button",
+                text: `${field.node.label}: ${list.map((i) => String(i?.message ?? "")).join(" ")}`,
+              });
+              go.addEventListener("click", () => field.focusTarget.focus());
+              return el("li", null, [dot("bad", "problem"), go]);
+            }),
+            ...unplaced.map((issue) =>
+              el("li", null, [
+                dot("bad", String(issue?.message ?? "problem")),
+                el("code", {
+                  text:
+                    Array.isArray(issue?.path) && issue.path.length > 0
+                      ? issue.path.join(".")
+                      : "(the whole spec)",
+                }),
+              ]),
+            ),
+          ]),
+        );
+      }
+      if (focusFirst === true) {
+        const first = placed[0]?.field.focusTarget ?? issueBox.querySelector("button");
+        if (first instanceof HTMLElement) first.focus();
+      }
+    },
+  };
+
+  /** The JSON pane for one node's path, from a button that stays its opener. */
+  const jsonButton = (node, label, describedBy) => {
+    const open = holdWhenReadOnly(
+      el("button", {
+        class: "btn btn-ghost",
+        type: "button",
+        text: label,
+        dataset: { focusKey: `json:${node.key}` },
+      }),
+      live,
+    );
+    if (describedBy.length > 0) describe(open, describedBy);
+    open.addEventListener("click", () => {
+      if (isHeld(open)) return;
+      valueDialog(ctx, {
+        path: node.segments.join("."),
+        segments: node.segments,
+        // Never a masked read: a node holding a hidden value starts empty and names it.
+        value: node.writeOnly === true ? undefined : node.paneSeed,
+        hidden: node.writeOnly === true && Array.isArray(node.hidden) ? node.hidden : [],
+        pathEditable: false,
+        reload,
+        live,
+        opener: open,
+        form,
+      });
+    });
+    return open;
+  };
+
+  /** Write one field's edit: directly when the optimizer may, reviewed otherwise. */
+  const write = async (node, input, opener) => {
+    if (isHeld(opener)) return;
+    if (input !== CLEAR && maskedMarkerOf(input) !== null) {
+      toast(
+        `Nothing saved: ${node.label} still holds a hidden value (${maskedMarkerOf(input)}). Type the real value.`,
+      );
+      return;
+    }
+    const edit = fieldEdit(node, input);
+    if (edit === null) {
+      toast(`Nothing to save: ${node.label} is unchanged.`, "info");
+      return;
+    }
+    const focusKey = opener.dataset.focusKey;
+    const saved = () => {
+      unsaved.delete(unsavedKey(ctx, node));
+      reload({ focusKey });
+    };
+    // "Use the version on disk": the typed value is dropped, so the control shows the file's.
+    const useDisk = () => {
+      unsaved.delete(unsavedKey(ctx, node));
+      reload({ focusKey });
+    };
+    if (node.tier === "auto-tunable" && node.security !== true) {
+      // Held with aria-disabled, not `disabled`: a disabled button drops focus
+      // to the page, and the answer may open a dialog that must return it here.
+      opener.setAttribute("aria-disabled", "true");
+      const res = await api.specPatch({ id: ctx.id }, { edit, expectedRev: live?.rev ?? "" });
+      opener.removeAttribute("aria-disabled");
+      const issues = rejectedIssues(res);
+      if (issues !== null) {
+        form.showIssues(issues, true);
+        return;
+      }
+      const conflict = {
+        opener,
+        draft: JSON.stringify(edit, null, 2),
+        retry: (rev) => api.specPatch({ id: ctx.id }, { edit, expectedRev: rev }),
+        reload: useDisk,
+        done: saved,
+      };
+      if (reportWrite(res, savedMessage(node), conflict)) saved();
+      return;
+    }
+    await reviewAndApply(ctx, {
+      edits: [edit],
+      label: node.label,
+      okMessage: savedMessage(node),
+      live,
+      opener,
+      form,
+      reload: useDisk,
+      done: saved,
+    });
+  };
+
+  /** One setting the form can show: its label, help, control, state and actions. */
+  const leaf = (node) => {
+    const id = nextId("field");
+    const labelId = `${id}-label`;
+    const helpId = node.help !== null || node.writeOnly ? `${id}-help` : "";
+    const slot = el("p", { class: "field-issue", id: `${id}-issue`, hidden: true });
+    const draftAt = unsavedKey(ctx, node);
+    const kept = keptValue(ctx, node);
+    const current = kept !== undefined ? kept : node.writeOnly ? undefined : node.seed;
+    const unsavedNote = el("p", {
+      class: "muted field-unsaved",
+      text: "Not saved yet.",
+      hidden: kept === undefined,
+    });
+    const remember = (value) => {
+      unsaved.set(draftAt, { value, seed: seedMark(node), segments: node.segments.map(String) });
+      unsavedNote.hidden = false;
+    };
+    let input = null;
+    let read = () => undefined;
+    let control;
+    if (node.kind === "boolean") {
+      input = choiceSelect(id, [true, false], current, yesNo);
+      read = () => (input.value === "" ? "" : input.value === "0");
+      input.addEventListener("change", () => remember(input.value === "" ? undefined : read()));
+      control = input;
+    } else if (node.kind === "select") {
+      const options = Array.isArray(node.options) ? node.options : [];
+      input = choiceSelect(id, options, current, optionText);
+      read = () => (input.value === "" ? undefined : options[Number(input.value)]);
+      input.addEventListener("change", () => remember(read()));
+      control = input;
+    } else if (node.kind === "list") {
+      const list = listEditor(
+        node,
+        id,
+        labelId,
+        Array.isArray(current) ? current : [],
+        live,
+        remember,
+      );
+      read = list.read;
+      control = list.node;
+      input = list.first;
+    } else {
+      const multiline = typeof current === "string" && current.includes("\n");
+      input = multiline
+        ? el("textarea", { class: "input notes", id, rows: 4, spellcheck: "false" })
+        : el("input", {
+            class: "input",
+            id,
+            type: "text",
+            autocomplete: "off",
+            ...(node.kind === "integer" ? { inputmode: "numeric" } : {}),
+            ...(node.kind === "number" ? { inputmode: "decimal" } : {}),
+          });
+      input.value = current === undefined || current === null ? "" : String(current);
+      read = () => input.value;
+      input.addEventListener("input", () => remember(input.value));
+      control = input;
+    }
+    if (input !== null && node.kind !== "list") {
+      input.dataset.focusKey = `input:${node.key}`;
+    }
+    const isAuto = node.tier === "auto-tunable" && node.security !== true;
+    const save = holdWhenReadOnly(
+      el("button", {
+        class: isAuto ? "btn btn-primary" : "btn",
+        type: "button",
+        text: isAuto ? "Save" : "Review and apply",
+        "aria-label": `${isAuto ? "Save" : "Review and apply"} ${node.label}`,
+        dataset: { focusKey: `save:${node.key}` },
+      }),
+      live,
+    );
+    save.addEventListener("click", () => void write(node, read(), save));
+    const clearBtn =
+      node.nullable === true && node.source === "declared"
+        ? holdWhenReadOnly(
+            el("button", {
+              class: "btn btn-ghost",
+              type: "button",
+              text: "Clear",
+              "aria-label": `Clear ${node.label}`,
+              dataset: { focusKey: `clear:${node.key}` },
+            }),
+            live,
+          )
+        : null;
+    clearBtn?.addEventListener("click", () => void write(node, CLEAR, clearBtn));
+    const help =
+      helpId === ""
+        ? null
+        : el("p", {
+            class: "muted field-help",
+            id: helpId,
+            text: node.writeOnly
+              ? `Value hidden. Type a new value to replace it.${node.help === null ? "" : ` ${node.help}`}`
+              : node.help,
+          });
+    const field = {
+      node,
+      slot,
+      input: node.kind === "list" ? null : input,
+      focusTarget: input ?? save,
+      described: [node.kind === "list" ? control : input],
+      baseIds: () => (helpId === "" ? [] : [helpId]),
+    };
+    describe(field.described[0], field.baseIds());
+    fields.set(node.key, field);
+    return el("div", { class: "form-field", dataset: { fieldKey: node.key } }, [
+      el("div", { class: "form-field-head" }, [
+        node.kind === "list"
+          ? el("span", { class: "form-label", id: labelId, text: node.label })
+          : el("label", { class: "form-label", for: id, id: labelId, text: node.label }),
+        fieldBadge(node),
+      ]),
+      help,
+      el("div", { class: "row-editor" }, [control, save, clearBtn]),
+      unsavedNote,
+      slot,
+      el("p", { class: "muted field-path" }, [
+        el("span", { text: "Setting " }),
+        el("code", { text: node.segments.join(".") }),
+      ]),
+    ]);
+  };
+
+  /** A setting edited in the JSON pane, with the reason it is. */
+  const jsonLeaf = (node) => {
+    const id = nextId("json");
+    const slot = el("p", { class: "field-issue", id: `${id}-issue`, hidden: true });
+    const whyId = `${id}-why`;
+    const button = jsonButton(node, "Edit as JSON…", [whyId]);
+    button.setAttribute("aria-label", `Edit as JSON… ${node.label}`);
+    fields.set(node.key, {
+      node,
+      slot,
+      input: null,
+      focusTarget: button,
+      described: [button],
+      baseIds: () => [whyId],
+    });
+    return el("div", { class: "form-field", dataset: { fieldKey: node.key } }, [
+      el("div", { class: "form-field-head" }, [
+        el("span", { class: "form-label", text: node.label }),
+        fieldBadge(node),
+      ]),
+      node.help === null ? null : el("p", { class: "muted field-help", text: node.help }),
+      el("p", { class: "muted", id: whyId, text: node.why }),
+      el("div", { class: "row-editor" }, [button]),
+      slot,
+      el("p", { class: "muted field-path" }, [
+        el("span", { text: "Setting " }),
+        el("code", { text: node.segments.join(".") }),
+      ]),
+    ]);
+  };
+
+  /**
+   * A block of settings: a fieldset named by its legend, its own JSON pane, its children.
+   * A block inside another that only the schema's defaults set is folded, named by its
+   * summary, so a declared block reads as what the file says.
+   */
+  const group = (node, top) => {
+    const id = nextId("group");
+    const slot = el("p", { class: "field-issue", id: `${id}-issue`, hidden: true });
+    const helpId = node.help === null ? "" : `${id}-help`;
+    const button = jsonButton(node, "Edit as JSON…", helpId === "" ? [] : [helpId]);
+    button.setAttribute("aria-label", `Edit as JSON… all of ${node.label}`);
+    fields.set(node.key, {
+      node,
+      slot,
+      input: null,
+      focusTarget: button,
+      described: [button],
+      baseIds: () => (helpId === "" ? [] : [helpId]),
+    });
+    const content = [
+      helpId === "" ? null : el("p", { class: "muted field-help", id: helpId, text: node.help }),
+      el("div", { class: "row-editor" }, [button]),
+      slot,
+      ...(node.children ?? []).map(render),
+    ];
+    if (top || node.source === "declared") {
+      return el("fieldset", { class: top ? "settings-block" : "settings-block nested" }, [
+        el("legend", { text: node.label }),
+        ...content,
+      ]);
+    }
+    const summaryId = `${id}-summary`;
+    return el("details", { class: "fold settings-fold" }, [
+      el("summary", { class: "fold-summary", id: summaryId }, [
+        el("span", { class: "form-label", text: node.label }),
+        el("span", { class: "muted", text: " using defaults" }),
+      ]),
+      el("fieldset", { class: "settings-block nested", "aria-labelledby": summaryId }, content),
+    ]);
+  };
+
+  const render = (node) =>
+    node.kind === "group" ? group(node, false) : node.kind === "json" ? jsonLeaf(node) : leaf(node);
+
+  const declared = (node) => node.source === "declared";
+  const topLeaves = model.groups.filter((n) => n.kind !== "group");
+  const topGroups = model.groups.filter((n) => n.kind === "group");
+  const shown = [];
+  const general = topLeaves.filter(declared);
+  if (general.length > 0) {
+    shown.push(
+      el("fieldset", { class: "settings-block" }, [
+        el("legend", { text: "General" }),
+        ...general.map(render),
+      ]),
+    );
+  }
+  for (const node of topGroups.filter(declared)) shown.push(group(node, true));
+  const rest = [
+    ...(topLeaves.some((n) => !declared(n))
+      ? [
+          el("fieldset", { class: "settings-block" }, [
+            el("legend", { text: "Other settings" }),
+            ...topLeaves.filter((n) => !declared(n)).map(render),
+          ]),
+        ]
+      : []),
+    ...topGroups.filter((n) => !declared(n)).map((n) => group(n, true)),
+  ];
+  for (const node of rest) defaultsPanel.appendChild(node);
+
   const addBlock = holdWhenReadOnly(
-    el("button", { class: "btn", type: "button", text: "Edit any path…" }),
+    el("button", {
+      class: "btn",
+      type: "button",
+      text: "Edit any path…",
+      dataset: { focusKey: "json:any" },
+    }),
     live,
   );
   addBlock.addEventListener("click", () => {
     if (isHeld(addBlock)) return;
-    valueDialog(ctx, { path: "", value: undefined, pathEditable: true, reload, live });
+    valueDialog(ctx, {
+      path: "",
+      value: undefined,
+      pathEditable: true,
+      reload,
+      live,
+      opener: addBlock,
+      form,
+    });
   });
-  const addForm = (lead) =>
-    el("div", { class: "add-form" }, [el("p", { class: "muted grow", text: lead }), addBlock]);
-  if (rows.length === 0) {
-    return card("Fields & trust tiers", dot("off", "no fields"), [
-      emptyState(
-        typeof trust.note === "string" ? trust.note : "This spec declares no editable fields",
-        typeof trust.verb === "string" ? trust.verb : "crewhaus init",
-      ),
-      addForm(
-        "A path this spec has not declared is still reachable — the server applies it with the same diff, tier and typed confirmation.",
-      ),
-    ]);
-  }
-  const confirmName = String(trust.confirmName ?? "");
-  const body = rows.map((row) => {
-    const path = String(row.path ?? "");
-    const current = valueByPath.get(path);
-    const editable = current !== undefined && !isContainer(current);
-    return el("tr", null, [
-      el("td", { class: "mono", text: path }),
-      el("td", null, [tierBadge(row)]),
-      el("td", { class: "muted", text: String(row.reason ?? "") }),
-      el("td", { class: "cell-actions" }, [
-        editable
-          ? row.tier === "auto-tunable"
-            ? autoTunableEditor(ctx, path, current, reload, live)
-            : humanOwnedActions(ctx, path, current, confirmName, reload, live)
-          : jsonPaneButton(ctx, path, current, reload, live),
-      ]),
-    ]);
-  });
-  return card(
-    "Fields & trust tiers",
-    dot(
-      "ok",
-      `${trust.autoTunableCount ?? 0} auto-tunable · ${trust.humanOwnedCount ?? 0} human-owned`,
-    ),
-    [
+
+  const inner = [
+    el("p", {
+      class: "muted",
+      text: "Each setting comes from the schema this harness is checked with. A save changes that one setting in crewhaus.yaml and leaves the rest of the file as it is.",
+    }),
+    body.effectiveTruncated === true
+      ? el("p", {
+          class: "reason",
+          text: "Showing the first 600 settings. Edit the rest in the JSON pane or in crewhaus.yaml.",
+        })
+      : null,
+    typeof body.effectiveNote === "string" && body.effectiveNote !== ""
+      ? el("p", { class: "reason" }, [dot("warn", "values unavailable"), body.effectiveNote])
+      : null,
+    model.why === null ? null : el("p", { class: "reason", text: model.why }),
+    issueBox,
+    el("div", { class: "settings-form" }, [
+      ...shown,
+      rest.length > 0 ? el("div", { class: "settings-defaults-toggle" }, [defaultsBtn]) : null,
+      rest.length > 0 ? defaultsPanel : null,
+    ]),
+    el("div", { class: "add-form" }, [
       el("p", {
-        class: "muted",
-        text: "Auto-tunable fields are the ones the optimizer may write, so the console may write them too. Everything else needs a review of the diff and a typed confirmation — the server enforces the same split.",
+        class: "muted grow",
+        text: "A setting this form does not show, or a field inside a list item, is reachable by its path: the same preview and the same confirmation.",
       }),
-      table(["Path", "Tier", "Why", ""], body, "Fields and trust tiers"),
-      addForm(
-        "Rows list what this spec DECLARES. A block it has never declared, or a field inside a list item, is reachable by path — same diff, same tier, same typed confirmation.",
-      ),
-    ],
-  );
+      addBlock,
+    ]),
+  ];
+  const state = settingsState(body, model.groups.length, live.readOnly.held);
+  const node = card("Settings", dot(state.tone, state.word), inner);
+  node.classList.add("settings-card");
+  // The answer to a read that already carried issues: place them now, without moving focus.
+  if (Array.isArray(body.issues) && body.issues.length > 0) form.showIssues(body.issues, false);
+  return node;
 }
 
-const isContainer = (value) => typeof value === "object" && value !== null;
-
-/** Inline input + Save for a path the optimizer is allowed to write. */
-function autoTunableEditor(ctx, path, current, reload, live) {
-  const input = el("input", {
-    class: "input",
-    type: "text",
-    value: typeof current === "string" ? current : JSON.stringify(current),
-    "aria-label": `value for ${path}`,
-  });
-  const save = holdWhenReadOnly(
-    el("button", { class: "btn btn-primary", type: "button", text: "Save" }),
+/**
+ * A list of values: one input per item, with buttons to move an item up or
+ * down and to remove it, and one to add an item. No dragging.
+ */
+function listEditor(node, id, labelId, initial, live, remember) {
+  const items = initial.map((v) => (node.itemKind === "select" ? v : v === null ? "" : String(v)));
+  const ul = el("ul", { class: "list-items" });
+  const wrap = el("div", { class: "list-editor", role: "group", "aria-labelledby": labelId }, [ul]);
+  const add = holdWhenReadOnly(
+    el("button", { class: "btn btn-ghost", type: "button", text: "Add an item", id: `${id}-add` }),
     live,
   );
-  save.addEventListener("click", async () => {
-    // Held with aria-disabled, not `disabled`: a disabled button drops focus
-    // to the page, and the answer may open a dialog that must return it here.
-    if (isHeld(save)) return;
-    save.setAttribute("aria-disabled", "true");
-    const edit = { path, value: coerce(input.value, current) };
-    // The revision this screen loaded: a spec changed since answers 412.
-    const res = await api.specPatch({ id: ctx.id }, { edit, expectedRev: live?.rev ?? "" });
-    save.removeAttribute("aria-disabled");
-    const conflict = {
-      opener: save,
-      draft: JSON.stringify(edit, null, 2),
-      retry: (rev) => api.specPatch({ id: ctx.id }, { edit, expectedRev: rev }),
-      reload,
-      done: reload,
-    };
-    if (reportWrite(res, `Saved ${path}`, conflict)) reload();
+  const changed = () => remember(items.slice());
+  const draw = (focus) => {
+    clear(ul);
+    items.forEach((value, index) => {
+      const n = index + 1;
+      let input;
+      if (node.itemKind === "select") {
+        const options = Array.isArray(node.itemOptions) ? node.itemOptions : [];
+        input = choiceSelect(`${id}-item-${n}`, options, value, optionText);
+        input.addEventListener("change", () => {
+          items[index] = input.value === "" ? undefined : options[Number(input.value)];
+          changed();
+        });
+      } else {
+        input = el("input", {
+          class: "input",
+          type: "text",
+          id: `${id}-item-${n}`,
+          autocomplete: "off",
+        });
+        input.value = String(value ?? "");
+        input.addEventListener("input", () => {
+          items[index] = input.value;
+          changed();
+        });
+      }
+      input.setAttribute("aria-label", `${node.label}, item ${n}`);
+      const button = (text, label, onPress) => {
+        const b = holdWhenReadOnly(
+          el("button", { class: "btn btn-ghost", type: "button", text, "aria-label": label }),
+          live,
+        );
+        b.addEventListener("click", () => {
+          if (isHeld(b)) return;
+          onPress();
+        });
+        return b;
+      };
+      const up =
+        index > 0
+          ? button("Up", `Move item ${n} up`, () => {
+              [items[index - 1], items[index]] = [items[index], items[index - 1]];
+              changed();
+              draw({ index: index - 1, what: "up" });
+            })
+          : null;
+      const down =
+        index < items.length - 1
+          ? button("Down", `Move item ${n} down`, () => {
+              [items[index + 1], items[index]] = [items[index], items[index + 1]];
+              changed();
+              draw({ index: index + 1, what: "down" });
+            })
+          : null;
+      const remove = button("Remove", `Remove item ${n}`, () => {
+        items.splice(index, 1);
+        changed();
+        draw({ index: Math.min(index, items.length - 1), what: "input" });
+      });
+      ul.appendChild(el("li", { class: "row-editor" }, [input, up, down, remove]));
+    });
+    if (focus !== undefined) {
+      const row = ul.children[focus.index];
+      const target =
+        row === undefined
+          ? add
+          : focus.what === "up"
+            ? (row.querySelector('[aria-label$=" up"]') ?? row.querySelector("input, select"))
+            : focus.what === "down"
+              ? (row.querySelector('[aria-label$=" down"]') ?? row.querySelector("input, select"))
+              : row.querySelector("input, select");
+      if (target instanceof HTMLElement) target.focus();
+    }
+  };
+  add.addEventListener("click", () => {
+    if (isHeld(add)) return;
+    items.push(node.itemKind === "select" ? undefined : "");
+    changed();
+    draw({ index: items.length - 1, what: "input" });
   });
-  return el("div", { class: "row-editor" }, [input, save]);
+  draw();
+  wrap.appendChild(add);
+  return {
+    node: wrap,
+    first: null,
+    read: () => items.filter((v) => v !== undefined),
+  };
 }
 
-/** Keep a number a number and a boolean a boolean — a form field is text,
- *  and the spec schema is not. */
-function coerce(text, current) {
-  if (typeof current === "number") {
-    const n = Number(text);
-    return Number.isNaN(n) ? text : n;
+/**
+ * Review an edit, then apply it: the server's preview says what would change and
+ * what the batch needs. A batch the optimizer could make takes one confirmation;
+ * any other takes the spec's name, typed. An issue the preview finds is placed
+ * beside its field instead.
+ */
+async function reviewAndApply(ctx, { edits, label, okMessage, live, opener, form, reload, done }) {
+  const preview = await api.specDiff({ id: ctx.id }, { edits });
+  if (!preview?.ok) {
+    toast(preview?.body?.error ?? `HTTP ${preview?.status ?? "?"}`);
+    return;
   }
-  if (typeof current === "boolean") return text === "true";
-  return text;
+  const issues = rejectedIssues(preview);
+  if (issues !== null) {
+    form?.showIssues(issues, true);
+    return;
+  }
+  const body = preview.body ?? {};
+  if (body.ok === false) {
+    toast(`${body.code ?? "refused"}: ${body.reason ?? "this edit does not apply"}`);
+    return;
+  }
+  const auto = body.autoApplicable === true;
+  const confirmName = String(body.confirmName ?? "");
+  if (!auto && confirmName === "") {
+    toast("The manager sent no spec name to confirm, so nothing was applied");
+    return;
+  }
+  const warning = escalationLead(body);
+  const previewRev = String(body.rev ?? live?.rev ?? "");
+  confirmAction({
+    level: auto ? "confirm" : "typed",
+    title: `Change ${label}`,
+    titleExtra: auto ? dot("ok", "saves directly") : dot("warn", "needs your confirmation"),
+    lead: auto
+      ? "Read the change, then apply it."
+      : `${warning === "" ? "" : `${warning} `}A person confirms this setting. Read the change (values that could be secret are hidden), then type the spec name to apply it.`,
+    detail: [pre(String(body.diff ?? ""))],
+    confirmName,
+    action: "Apply to the live spec",
+    onConfirm: async () => {
+      await applyEdits(ctx, {
+        edits,
+        ...(auto ? {} : { confirmName }),
+        expectedRev: previewRev,
+        label,
+        okMessage,
+        opener,
+        form,
+        reload,
+        done,
+      });
+    },
+  });
+}
+
+/**
+ * Apply a reviewed batch with `specEdit`, against the revision its preview read.
+ * A 412 opens the conflict view: an untyped batch may be sent again as it was,
+ * a typed one asks for the name again over a fresh diff.
+ */
+async function applyEdits(
+  ctx,
+  { edits, confirmName, expectedRev, label, okMessage, opener, form, reload, done },
+) {
+  const typed = typeof confirmName === "string";
+  const wrote = await api.specEdit(
+    { id: ctx.id },
+    { edits, ...(typed ? { confirmName } : {}), expectedRev },
+  );
+  const issues = rejectedIssues(wrote);
+  if (issues !== null && form) {
+    form.showIssues(issues, true);
+    return wrote;
+  }
+  const conflict = {
+    draft: JSON.stringify(edits, null, 2),
+    // The re-read goes back to the control that wrote, never to the page.
+    reload: () => reload(focusOf(opener)),
+    done,
+    ...(opener instanceof HTMLElement ? { opener } : {}),
+  };
+  if (typed) {
+    conflict.reconfirm = (rev) => reconfirmEdit(ctx, { edits, rev, label, okMessage, conflict });
+  } else {
+    conflict.retry = (rev) => api.specEdit({ id: ctx.id }, { edits, expectedRev: rev });
+  }
+  if (reportWrite(wrote, okMessage, conflict)) done();
+  return wrote;
 }
 
 // ---------------------------------------------------------------------------
@@ -621,12 +1319,22 @@ export function parseJsonValue(text) {
 }
 
 /** The one-edit batch a path + pane produce — or a refusal carrying the
- *  sentence to render, because "nothing happened" is not an answer. */
+ *  sentence to render, because "nothing happened" is not an answer. `path` is
+ *  dotted, or the segments themselves (a key may hold a `.`). Text that still
+ *  carries any masker's placeholder (`[redacted]`, `***`, `«NAME»`) is refused:
+ *  a masked read is a view, and is never written back. */
 export function editsFor(path, text) {
-  const segments = editPath(path);
+  const segments = Array.isArray(path) ? path.map(String) : editPath(path);
   if (segments.length === 0) return { ok: false, message: "a path is required" };
   const parsed = parseJsonValue(text);
   if (!parsed.ok) return { ok: false, message: `that is not valid JSON: ${parsed.message}` };
+  const marker = parsed.remove ? null : maskedMarkerOf(parsed.value);
+  if (marker !== null) {
+    return {
+      ok: false,
+      message: `Replace every hidden value (${marker}) with the real value first. A hidden value is never written back.`,
+    };
+  }
   // No `value` key at all ⇒ the server deletes the path. `value: undefined`
   // would not survive JSON.stringify, so the key is omitted deliberately.
   return {
@@ -636,30 +1344,31 @@ export function editsFor(path, text) {
   };
 }
 
-/** The row control for a path the inline editor cannot type: a container, or
- *  a declared path with no effective value to seed an input from. */
-function jsonPaneButton(ctx, path, current, reload, live) {
-  const open = holdWhenReadOnly(
-    el("button", { class: "btn btn-ghost", type: "button", text: "Edit as JSON…" }),
-    live,
-  );
-  open.addEventListener("click", () => {
-    if (isHeld(open)) return;
-    valueDialog(ctx, { path, value: current, pathEditable: false, reload, live });
-  });
-  return open;
-}
-
 /**
  * The pane. It writes NOTHING on its own: Preview asks `specDiff` what would
  * change and which tier the batch lands in, and only the answer decides what
  * the operator is offered — a plain Apply for an auto-tunable path (the
  * optimizer's own surface), or the typed confirmation for a human-owned one.
  * Both roads end at the same `specEdit` PUT, so the server remains the gate
- * and this screen stays the explanation.
+ * and this screen stays the explanation. An issue the preview or the write
+ * finds is shown here and placed beside its field in the form (`form`).
+ * Focus goes back to `opener` when a conflict view it opens closes.
  */
-function valueDialog(ctx, { path, value, pathEditable, reload, live }) {
+function valueDialog(
+  ctx,
+  { path, segments, value, hidden = [], pathEditable, reload, live, opener, form },
+) {
   let dialog = null;
+  // The form behind a modal cannot take focus: close the pane, then place the issues.
+  const formBehind =
+    form && typeof form.showIssues === "function"
+      ? {
+          showIssues: (issues, focusFirst) => {
+            if (focusFirst === true && dialog !== null) dialog.close();
+            form.showIssues(issues, focusFirst);
+          },
+        }
+      : null;
   const pathInput = el("input", {
     class: "input grow",
     type: "text",
@@ -678,8 +1387,11 @@ function valueDialog(ctx, { path, value, pathEditable, reload, live }) {
 
   const preview = el("button", { class: "btn btn-primary", type: "button", text: "Preview diff" });
   preview.addEventListener("click", async () => {
-    const target = pathInput.value.trim();
-    const batch = editsFor(target, editor.value);
+    const target = pathEditable || !Array.isArray(segments) ? pathInput.value.trim() : path;
+    const batch = editsFor(
+      pathEditable || !Array.isArray(segments) ? target : segments,
+      editor.value,
+    );
     clear(out);
     if (!batch.ok) {
       out.appendChild(el("p", { class: "reason", text: batch.message }));
@@ -699,6 +1411,25 @@ function valueDialog(ctx, { path, value, pathEditable, reload, live }) {
           text: `${body.code ?? "refused"}: ${body.reason ?? "this edit does not apply"}`,
         }),
       );
+      const issues = rejectedIssues(res);
+      if (issues !== null) {
+        out.appendChild(
+          el(
+            "ul",
+            { class: "issue-list" },
+            issues.map((issue) =>
+              el("li", null, [
+                dot("bad", String(issue?.message ?? "issue")),
+                el("code", {
+                  text: Array.isArray(issue?.path) ? issue.path.join(".") : "(root)",
+                }),
+              ]),
+            ),
+          ),
+        );
+        // Beside their fields too, so they are still there when this pane closes.
+        formBehind?.showIssues(issues, false);
+      }
       return;
     }
     if (batch.removing) {
@@ -710,33 +1441,23 @@ function valueDialog(ctx, { path, value, pathEditable, reload, live }) {
     // The revision the preview read: the write is checked against it.
     const previewRev = String(body.rev ?? live?.rev ?? "");
     const apply = async (extra) => {
-      const wrote = await api.specEdit(
-        { id: ctx.id },
-        { edits: batch.edits, ...extra, expectedRev: previewRev },
-      );
-      const typed = typeof extra.confirmName === "string";
-      const conflict = {
-        draft: JSON.stringify(batch.edits, null, 2),
+      const wrote = await applyEdits(ctx, {
+        edits: batch.edits,
+        ...(typeof extra.confirmName === "string" ? { confirmName: extra.confirmName } : {}),
+        expectedRev: previewRev,
+        label: target,
+        okMessage: `Applied ${target}. It is not active until the harness is rebuilt.`,
+        opener,
+        form: formBehind,
         reload,
-        done: reload,
-      };
-      if (typed) {
-        conflict.reconfirm = (rev) =>
-          reconfirmEdit(ctx, {
-            edits: batch.edits,
-            rev,
-            label: target,
-            okMessage: `Applied ${target}`,
-            conflict,
-          });
-      } else {
-        conflict.retry = (rev) =>
-          api.specEdit({ id: ctx.id }, { edits: batch.edits, expectedRev: rev });
-      }
-      if (reportWrite(wrote, `Applied ${target}`, conflict)) {
-        if (dialog !== null) dialog.close();
-        reload();
-      } else if (wrote?.status === 412 && dialog !== null) dialog.close();
+        done: () => {
+          if (dialog !== null) dialog.close();
+          // What the form held typed under this path is what was just replaced.
+          dropUnsavedUnder(ctx, batch.edits[0]?.path ?? []);
+          reload(focusOf(opener));
+        },
+      });
+      if (wrote?.status === 412 && dialog !== null) dialog.close();
     };
     if (body.autoApplicable === true) {
       const go = el("button", { class: "btn btn-primary", type: "button", text: "Apply" });
@@ -788,7 +1509,7 @@ function valueDialog(ctx, { path, value, pathEditable, reload, live }) {
         )
       ) {
         if (dialog !== null) dialog.close();
-        reload();
+        reload(focusOf(opener));
       }
     });
     out.appendChild(
@@ -815,6 +1536,18 @@ function valueDialog(ctx, { path, value, pathEditable, reload, live }) {
             pathInput,
           ])
         : el("p", { class: "muted mono", text: path }),
+      hidden.length === 0
+        ? null
+        : el("div", { class: "reason" }, [
+            el("p", {
+              text: "This screen hides a value here, so the pane starts empty. Writing here replaces all of it, hidden values included. To keep them, change one setting at a time in the form instead.",
+            }),
+            el(
+              "ul",
+              { class: "issue-list" },
+              hidden.map((p) => el("li", null, [el("code", { text: p })])),
+            ),
+          ]),
       el("p", {
         class: "muted",
         text: "The value is JSON. An empty pane deletes the path. Nothing is written until the diff below has been read.",
@@ -826,78 +1559,6 @@ function valueDialog(ctx, { path, value, pathEditable, reload, live }) {
     true,
   );
   return dialog;
-}
-
-/** "Review & apply" (diff → typed confirm) and "Propose" for a human-owned
- *  path. Neither writes anything before the operator has seen the diff. */
-function humanOwnedActions(ctx, path, current, confirmName, reload, live) {
-  const input = el("input", {
-    class: "input",
-    type: "text",
-    value: typeof current === "string" ? current : JSON.stringify(current),
-    "aria-label": `new value for ${path}`,
-  });
-  const review = holdWhenReadOnly(
-    el("button", { class: "btn", type: "button", text: "Review & apply" }),
-    live,
-  );
-  const propose = holdWhenReadOnly(
-    el("button", { class: "btn btn-ghost", type: "button", text: "Propose" }),
-    live,
-  );
-  const editFor = () => ({ path, value: coerce(input.value, current) });
-
-  review.addEventListener("click", async () => {
-    if (isHeld(review)) return;
-    const edits = [editFor()];
-    const preview = await api.specDiff({ id: ctx.id }, { edits });
-    if (!preview.ok) {
-      toast(preview.body?.error ?? `HTTP ${preview.status}`);
-      return;
-    }
-    const body = preview.body ?? {};
-    if (body.ok === false) {
-      toast(`${body.code ?? "refused"}: ${body.reason ?? "this edit does not apply"}`);
-      return;
-    }
-    const warning = escalationLead(body);
-    const previewRev = String(body.rev ?? live?.rev ?? "");
-    confirmModal({
-      title: `Change ${path}`,
-      lead: `${warning === "" ? "" : `${warning} `}This is a human-owned field. Read the diff — values are credential-redacted server-side — then type the spec name to apply it here, or close this and open a review instead.`,
-      detail: [pre(String(body.diff ?? ""))],
-      confirmName,
-      action: "Apply to the live spec",
-      onConfirm: async () => {
-        const res = await api.specEdit(
-          { id: ctx.id },
-          { edits, confirmName, expectedRev: previewRev },
-        );
-        const conflict = {
-          draft: JSON.stringify(edits, null, 2),
-          reload,
-          done: reload,
-        };
-        conflict.reconfirm = (rev) =>
-          reconfirmEdit(ctx, { edits, rev, label: path, okMessage: `Applied ${path}`, conflict });
-        if (reportWrite(res, `Applied ${path}`, conflict)) reload();
-      },
-    });
-  });
-
-  propose.addEventListener("click", async () => {
-    if (isHeld(propose)) return;
-    const res = await api.specPropose(
-      { id: ctx.id },
-      { edits: [editFor()], title: `hangar: ${path}` },
-    );
-    if (
-      reportWrite(res, "Proposal staged — the review bundle is a dry run until you open the PR")
-    ) {
-      reload();
-    }
-  });
-  return el("div", { class: "row-editor" }, [input, review, propose]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,12 +2154,14 @@ function wizardDialog(template) {
 // entry point
 // ---------------------------------------------------------------------------
 
-export async function renderSpecEdit(root, ctx) {
+export async function renderSpecEdit(root, ctx, opts = {}) {
   clear(root).appendChild(skeleton(6));
-  const reload = () => renderSpecEdit(root, ctx);
+  // `focusKey` names the control that wrote, so focus stays on it after the re-read.
+  const reload = (next) =>
+    renderSpecEdit(root, ctx, next !== null && typeof next === "object" ? next : {});
   const [schema, trust, versions, connectors, catalog, graders, dataset, templates] =
     await Promise.all([
-      api.specSchema({ id: ctx.id }),
+      call("specs.schema", { params: { h: ctx.id } }),
       api.specTrust({ id: ctx.id }),
       api.specVersions({ id: ctx.id }),
       api.mcpConnectors({ id: ctx.id }),
@@ -1509,12 +2172,6 @@ export async function renderSpecEdit(root, ctx) {
     ]);
   clear(root);
 
-  // path → effective value, so the field editor can seed its inputs from
-  // what the harness is actually running rather than from the raw text.
-  const valueByPath = new Map();
-  if (schema.ok && Array.isArray(schema.body?.effective)) {
-    for (const row of schema.body.effective) valueByPath.set(String(row.path), row.value);
-  }
   const confirmName = String(
     trust.body?.confirmName ?? connectors.body?.confirmName ?? versions.body?.confirmName ?? "",
   );
@@ -1534,11 +2191,11 @@ export async function renderSpecEdit(root, ctx) {
         : errorCard("Effective configuration", schema),
   );
   root.appendChild(
-    isStub(trust)
-      ? stubCard("Fields & trust tiers", trust)
-      : trust.ok
-        ? trustCard(ctx, trust.body ?? {}, valueByPath, reload, live)
-        : errorCard("Fields & trust tiers", trust),
+    isStub(schema)
+      ? stubCard("Settings", schema)
+      : schema.ok
+        ? settingsCard(ctx, schema.body ?? {}, trust.ok ? trust.body : null, live, reload)
+        : errorCard("Settings", schema),
   );
   root.appendChild(
     isStub(versions)
@@ -1571,14 +2228,65 @@ export async function renderSpecEdit(root, ctx) {
         ? wizardCard(templates.body ?? {})
         : errorCard("New harness", templates),
   );
+  if (typeof opts.focusKey === "string") {
+    const keyed = [...root.querySelectorAll("[data-focus-key]")];
+    const target = focusCandidates(opts.focusKey)
+      .map((key) =>
+        keyed.find((node) => node instanceof HTMLElement && node.dataset.focusKey === key),
+      )
+      .find((node) => node instanceof HTMLElement);
+    if (target instanceof HTMLElement) {
+      revealForFocus(target, root);
+      target.focus();
+    }
+  }
 }
 
-/** A route that failed for a reason that is not "not built yet". */
+/**
+ * The keys to try, in order, for focus after a re-read. A control can be gone
+ * after its own write (Clear removes the setting, so its Clear goes too): its
+ * field's Save, then its input, stands in.
+ */
+export function focusCandidates(focusKey) {
+  const key = String(focusKey ?? "");
+  const at = key.indexOf(":");
+  if (at < 0) return [key];
+  const kind = key.slice(0, at);
+  const rest = key.slice(at + 1);
+  if (kind === "clear") return [key, `save:${rest}`, `input:${rest}`];
+  if (kind === "save") return [key, `input:${rest}`];
+  if (kind === "input") return [key, `save:${rest}`];
+  return [key];
+}
+
+/** Open whatever hides a control (the "Using defaults" panel, a folded block) so it can take focus. */
+function revealForFocus(target, root) {
+  for (let at = target.parentElement; at !== null && at !== root; at = at.parentElement) {
+    if (at instanceof HTMLDetailsElement && !at.open) at.open = true;
+    if (at.hidden === true) {
+      at.hidden = false;
+      if (at.id !== "") {
+        for (const toggle of root.querySelectorAll("[aria-controls]")) {
+          if (toggle.getAttribute("aria-controls") === at.id) {
+            toggle.setAttribute("aria-expanded", "true");
+          }
+        }
+      }
+    }
+  }
+}
+
+/** A route that failed for a reason that is not "not built yet". A versioned-API answer carries its words in `error`. */
 function errorCard(title, res) {
+  const raw = res.body ?? res.error;
   return card(title, dot("bad", `HTTP ${res.status ?? "?"}`), [
-    el("p", { class: "muted", text: res.body?.error ?? "the manager could not answer" }),
-    res.body
-      ? collapsible([el("span", { class: "muted", text: "raw" })], [jsonPre(res.body)])
-      : null,
+    el("p", {
+      class: "muted",
+      text:
+        typeof res.error?.message === "string"
+          ? res.error.message
+          : (res.body?.error ?? "the manager could not answer"),
+    }),
+    raw ? collapsible([el("span", { class: "muted", text: "raw" })], [jsonPre(raw)]) : null,
   ]);
 }

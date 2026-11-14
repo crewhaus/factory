@@ -139,6 +139,8 @@ export const RUN_SCHEMA: ParseArgsSchema = {
     { name: "help", short: "h" },
     // Run once while the harness's operator has paused new work.
     { name: "ignore-pause", takesValue: false },
+    // A run the control API started: one turn from its input record.
+    { name: "input-file", takesValue: true },
   ],
 };
 

@@ -26,10 +26,11 @@ import {
 } from "@crewhaus/control-contract";
 import type { LeaseProbe } from "@crewhaus/control-records";
 import type { HarnessSupervisor } from "@crewhaus/harness-supervisor";
-import { AREA_RUNTIMES, compositionProblems } from "./areas";
+import { AREA_RUNTIMES, compositionProblems, delegatedActions } from "./areas";
 import { type Commands, createCommands, receiptOf, settledRow } from "./commands";
 import type { ControlCore, ControlMode } from "./context";
 import { type Decisions, createDecisions } from "./decisions";
+import { type Delegations, createDelegations } from "./delegations";
 import type { AreaRuntime, Executor, ExecutorStamp, Reconciler, Settlement } from "./executor";
 import { type JobAdapter, createJobAdapter } from "./jobs";
 import { type LedgerChoice, commandsLedgerOf, workspaceCommandsLedger } from "./ledgers";
@@ -63,14 +64,17 @@ export type ControlDeps = {
   readonly head?: "server" | "resident" | "cli";
   readonly onWarn?: (message: string) => void;
   /**
-   * Whether `actor` (a `prn_…`) still holds `permission` on what `target` (a ref) names:
-   * `true`, `false`, or `undefined` when it could not be determined. Home passes one over
-   * `authorize()` and a fresh access snapshot; without one, every command runs as accepted.
+   * Whether `actor` (a `prn_…`) still holds `permission` on what `target` (a ref) names,
+   * through exactly `credentialRef` (a `crd_…`) when the receipt names one: `true`, `false`,
+   * or `undefined` when it could not be determined. Home passes one over a fresh access
+   * snapshot; without one, a command whose receipt names a credential does not run, and
+   * recovery leaves such a receipt for a head that has one.
    */
   readonly authorizeActor?: (
     actor: string,
     permission: string,
     target: string,
+    credentialRef?: string,
   ) => boolean | undefined;
 };
 
@@ -80,6 +84,8 @@ export type ControlService = {
   readonly decisions: Decisions;
   /** The standing rules a head lists and ends. */
   readonly rules: Rules;
+  /** An owner's delegation rules: turned on, applied, and ended. */
+  readonly delegations: Delegations;
   readonly commands: Commands & {
     recover(scope: RecoverScope): Promise<RecoverCounts>;
     /** Settle what recovery left `unknown` by what its reconciler observes. Never on a read. */
@@ -135,24 +141,36 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
   const warn = deps.onWarn ?? ((message: string) => console.warn(message));
   let warnedUndetermined = false;
   /**
-   * A queued or recovered command's actor, checked again before it runs. A system actor, an
-   * unlinked local user and the Home's owner pass; a member whose authority is gone does not.
-   * An answer that could not be determined runs the command, with one warning.
+   * A command dispatched from its receipt, when it is submitted or recovered, runs only
+   * while the credential that submitted it, or for a receipt without one its actor, may
+   * still do it. A system actor and an unlinked local user
+   * pass, and so does the Home's owner on a receipt that names no credential; a receipt that
+   * names one is checked against it whoever submitted it. An answer that could not be
+   * determined runs the command, with one warning. A head with no `authorizeActor` runs no
+   * command whose receipt names a credential.
    */
   const actorRefused = (receipt: CommandReceipt): boolean => {
-    const authorizeActor = deps.authorizeActor;
-    if (authorizeActor === undefined || !isId("prn", receipt.actor)) return false;
+    if (!isId("prn", receipt.actor)) return false;
     const permission = (COMMAND_KINDS as Readonly<Record<string, { permission: string }>>)[
       receipt.kind
     ]?.permission;
     if (permission === undefined || permission === "public" || permission === "authenticated") {
       return false;
     }
-    const read = loadAccessSnapshot(deps.hangarRoot);
-    if (read.state === "present" && read.snapshot.owner === receipt.actor) return false;
+    const credentialRef = receipt.credentialRef;
+    const authorizeActor = deps.authorizeActor;
+    // A head that cannot check a credential does not run a command that names one.
+    if (authorizeActor === undefined) return credentialRef !== undefined;
+    if (credentialRef === undefined) {
+      const read = loadAccessSnapshot(deps.hangarRoot);
+      if (read.state === "present" && read.snapshot.owner === receipt.actor) return false;
+    }
     let answer: boolean | undefined;
     try {
-      answer = authorizeActor(receipt.actor, permission, receipt.target);
+      answer =
+        credentialRef === undefined
+          ? authorizeActor(receipt.actor, permission, receipt.target)
+          : authorizeActor(receipt.actor, permission, receipt.target, credentialRef);
     } catch {
       answer = undefined;
     }
@@ -191,6 +209,7 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
     releaseSupervisor: deps.releaseSupervisor ?? (() => undefined),
     drainRequest: deps.drainRequest,
     warn,
+    checksActors: deps.authorizeActor !== undefined,
     actorRefused,
     selfExecutor: () => {
       if (self !== undefined) return self;
@@ -239,13 +258,23 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
     );
   };
   const decisions = createDecisions({ hangarRoot: deps.hangarRoot, identity: deps.identity, now });
+  const delegations = createDelegations({
+    hangarRoot: deps.hangarRoot,
+    identity: deps.identity,
+    now,
+    decisions,
+    commands: { submit: commands.submit, settle },
+    actions: delegatedActions(areas),
+  });
   return {
     mode: options.mode,
     decisions,
     rules: createRules(decisions, now),
+    delegations,
     commands: {
       submit: commands.submit,
       get: commands.get,
+      replayOf: commands.replayOf,
       recover,
       reconcile,
       settle,

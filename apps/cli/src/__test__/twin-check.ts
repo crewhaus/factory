@@ -275,6 +275,25 @@ const changesNeedsOne = (sub: string, flag?: string): Requirement => ({
   ],
 });
 
+const delegationsNeeds = (
+  sub: string,
+  needs: { readonly rule?: true; readonly action?: true; readonly flags?: readonly string[] },
+): Requirement => ({
+  positionals: { min: 1, max: 1 },
+  flags: ["harness", ...(needs.flags ?? [])],
+  pins: [
+    { file: "delegations-cmd.ts", text: 'requireValue(sub, args, "harness")' },
+    ...(needs.rule === true ? [{ file: "delegations-cmd.ts", text: "ruleIdOf(verb, args)" }] : []),
+    ...(needs.action === true
+      ? [{ file: "delegations-cmd.ts", text: "actionOf(verb, args)" }]
+      : []),
+    ...(needs.flags ?? []).map((flag) => ({
+      file: "delegations-cmd.ts",
+      text: `requireValue(verb, args, "${flag}")`,
+    })),
+  ],
+});
+
 /**
  * The commands that parse but refuse to start without more, keyed by
  * `verb` or `verb sub`. A command shown in Home that misses one of these
@@ -430,6 +449,18 @@ export const REQUIRED: Readonly<Record<string, Requirement>> = {
   "people erase": peopleNeedsOne("erase", "<psn_…>"),
   "plugins grant": pluginNeedsOne(),
   "plugins revoke": pluginNeedsOne(),
+  "delegations show": delegationsNeeds("show", { rule: true }),
+  "delegations preview": delegationsNeeds("preview", { action: true }),
+  "delegations enable": delegationsNeeds("enable", { action: true, flags: ["confirm"] }),
+  "delegations propose": delegationsNeeds("propose", { action: true }),
+  "delegations change": delegationsNeeds("change", { rule: true, flags: ["confirm", "expect"] }),
+  "delegations pause": delegationsNeeds("pause", { rule: true }),
+  "delegations resume": delegationsNeeds("resume", { rule: true, flags: ["confirm", "expect"] }),
+  "delegations revoke": {
+    positionals: { max: 1 },
+    flags: ["harness"],
+    pins: [{ file: "delegations-cmd.ts", text: 'requireValue(sub, args, "harness")' }],
+  },
   "changes show": changesNeedsOne("show"),
   "changes check": changesNeedsOne("check"),
   "changes withdraw": changesNeedsOne("withdraw"),

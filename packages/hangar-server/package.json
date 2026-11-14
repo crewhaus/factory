@@ -52,7 +52,9 @@
   "devDependencies": {
     "@crewhaus/compiler": "workspace:*",
     "@crewhaus/eval-runner": "workspace:*",
-    "@crewhaus/quality-service": "workspace:*"
+    "@crewhaus/gateway-server": "workspace:*",
+    "@crewhaus/quality-service": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

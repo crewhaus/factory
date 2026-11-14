@@ -93,11 +93,14 @@ export type AuthVia = "bootstrap" | "session" | "service" | "personal" | "proxy"
 /**
  * What a scoped token may read: the run refs it names and the read acts it holds, until
  * `exp` (epoch ms), after which it reads nothing, on a request or on a stream it opened.
+ * `ep` is the minting service's scoped-token epoch it was minted under: once the service's
+ * epoch moves past it, it reads nothing either, on a request or on a stream it opened.
  */
 export type ScopedGrant = {
   readonly refs: readonly string[];
   readonly acts: readonly string[];
   readonly exp: number;
+  readonly ep: number;
 };
 
 export type Identified = { readonly principal: string; readonly via: AuthVia };
@@ -363,7 +366,9 @@ export async function authenticate(
             verified.reason,
             verified.reason === "token_expired"
               ? "This link's access has ended. Ask for a new one."
-              : "That token does not work here.",
+              : verified.reason === "token_revoked"
+                ? "This link's access was withdrawn. Ask for a new one."
+                : "That token does not work here.",
           ),
         );
       }
@@ -371,7 +376,7 @@ export async function authenticate(
         principal: verified.principal,
         via: "scoped",
         credential: verified.credential,
-        scoped: { refs: verified.refs, acts: verified.acts, exp: verified.exp },
+        scoped: { refs: verified.refs, acts: verified.acts, exp: verified.exp, ep: verified.ep },
       };
     } else if (UNACCEPTED_SECRET_RE.test(bearer)) {
       // An issued-secret shape Home never takes as a bearer; never compared as Home's key.

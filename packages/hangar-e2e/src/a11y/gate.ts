@@ -95,6 +95,7 @@ export const GATE_EXPECTS: Readonly<Record<string, string>> = {
   "#/h/:id/setup/credentials": "#view .tab-body table.fleet tbody tr",
   "#/h/:id/setup/plugins": "#view .tab-body .empty",
   "#/h/:id/setup/security": "#view .tab-body .card .card-title + *",
+  "#/h/:id/setup/delegations": "#view .tab-body .twin-cmd",
   "#/h/:id/setup/budget": "figure.chart",
   "#/h/:id/setup/deployment": "#view .tab-body .card .card-title + *",
   "#/h/:id/setup/files": '[role="region"][aria-label="Stores"]',

@@ -8,15 +8,19 @@
  * A receipt holds ids, refs, keyed digests and states: never an argument, an input or a
  * secret. Every row is the whole receipt, so the fold's current row is the receipt.
  *
- * A dispatched command runs only while its actor may still do it: before `accepted →
- * running`, a member's authority is checked again, so a command accepted from someone whose
- * access was withdrawn in between settles `rejected` and never runs.
+ * A dispatched command runs only while the credential that submitted it, or for a receipt
+ * without one its actor, may still do it: before `accepted → running`, and before recovery
+ * runs a `running` one again, that authority is checked again, so a command whose authority
+ * was withdrawn in between settles `rejected` (`failed`, once it had started) and does not
+ * run.
  */
 import { mkdirSync } from "node:fs";
 import {
   COMMAND_KINDS,
   type CommandReceipt,
   IDEMPOTENCY_VALUE_RE,
+  RECEIPT_AUTHORITY_KINDS,
+  type ReceiptAuthority,
   type ReceiptRetry,
   type ReceiptVia,
   isCommandKind,
@@ -31,13 +35,19 @@ import {
   appendClaim,
   casAppend,
   foldStates,
+  readClaim,
   withLedgerLock,
 } from "@crewhaus/control-records";
 import { storedActorFor } from "./actor";
 import type { ControlCore } from "./context";
 import type { Settlement } from "./executor";
-import { expireStaleClaim, fingerprintOf, idempotencyClaim } from "./idempotency";
-import { type LedgerChoice, ensureLedgerKey, ledgerFor } from "./ledgers";
+import {
+  IDEMPOTENCY_TTL_MS,
+  expireStaleClaim,
+  fingerprintOf,
+  idempotencyClaim,
+} from "./idempotency";
+import { type LedgerChoice, ensureLedgerKey, ledgerFor, readLedgerKey } from "./ledgers";
 import { type ControlRefusal, outcomeOf, refuse } from "./refusal";
 
 export type SubmitRequest = {
@@ -49,6 +59,12 @@ export type SubmitRequest = {
    * stands in (the CLI in direct mode, or a Home with sign-in turned off).
    */
   readonly actor?: string;
+  /**
+   * The credential (`crd_…`) `actor` authenticated with, when it used one. A command
+   * dispatched from its receipt, when it is submitted or recovered, is checked against
+   * exactly it. Given only with `actor`.
+   */
+  readonly credentialRef?: string;
   /** The most specific ref the request names. Absent: the receipt itself, `home/cmd/<id>`. */
   readonly target?: string;
   readonly ledger: LedgerChoice;
@@ -73,7 +89,26 @@ export type SubmitRequest = {
   readonly idempotent?: boolean;
   /** The command is carried out by a queued job, which moves the receipt. */
   readonly queued?: boolean;
+  /**
+   * The owner's rule a system actor acts under: copied onto the receipt and into its
+   * fingerprint. Only a system actor carries one.
+   */
+  readonly authority?: ReceiptAuthority;
 };
+
+/** Whether a receipt's authority is one of the closed kinds, naming a rule at a revision. */
+function authorityIsValid(authority: unknown): authority is ReceiptAuthority {
+  if (typeof authority !== "object" || authority === null || Array.isArray(authority)) return false;
+  const a = authority as Record<string, unknown>;
+  return (
+    Object.keys(a).every((key) => ["kind", "rule", "revision", "clause"].includes(key)) &&
+    (RECEIPT_AUTHORITY_KINDS as readonly unknown[]).includes(a["kind"]) &&
+    isId("rule", a["rule"]) &&
+    Number.isSafeInteger(a["revision"]) &&
+    (a["revision"] as number) >= 1 &&
+    (a["clause"] === undefined || a["clause"] === "rollback")
+  );
+}
 
 /** An inline effect: what it returns to the caller, and how the command ended. A missing
  *  `settle` leaves the receipt `accepted`, for work a job carries on. */
@@ -132,7 +167,21 @@ export type Commands = {
   ): Promise<SubmitAnswer<T | undefined>>;
   /** The receipt's current state, folded from the ledger. A pure read. */
   get(ledger: LedgerChoice | Ledger, id: string): CommandReceipt | undefined;
+  /**
+   * What `submit` would answer for a request whose idempotency key was already used,
+   * without writing anything: the first receipt (`replay`), or `reused` when the key named
+   * a different request. `undefined` when the request carries no key, or its key is
+   * fresh (or older than the seven days a key is honoured). A head asks this before it
+   * plans a command, so a retry is answered with the command it repeats, never with a
+   * refusal decided now.
+   */
+  replayOf(request: SubmitRequest): Promise<ReplayLookup | undefined>;
 };
+
+/** What {@link Commands.replayOf} found for a key already used. */
+export type ReplayLookup =
+  | { readonly kind: "replay"; readonly receipt: CommandReceipt }
+  | { readonly kind: "reused"; readonly refusal: ControlRefusal };
 
 /** The internals recovery and the job adapter share. */
 export type CommandsInternals = Commands & {
@@ -146,6 +195,27 @@ export type CommandsInternals = Commands & {
     harnessDir: string | undefined,
   ): Promise<CommandReceipt>;
 };
+
+/** What a request's fingerprint is made of. */
+function fingerprintInputOf(request: SubmitRequest): Parameters<typeof fingerprintOf>[1] {
+  return {
+    kind: request.kind,
+    target: request.target ?? "",
+    ...(request.params !== undefined ? { params: request.params } : {}),
+    ...(request.query !== undefined ? { query: request.query } : {}),
+    ...(request.body !== undefined ? { body: request.body } : {}),
+    ...(request.secretFields !== undefined ? { secretFields: request.secretFields } : {}),
+    ...(request.authority !== undefined ? { authority: request.authority } : {}),
+  };
+}
+
+/** The harness an idempotency key is scoped to: the target's, when it is a harness; else `home`. */
+function harnessScopeOf(target: string | undefined): string {
+  const parsed = target === undefined ? undefined : parseRef(target);
+  return parsed !== undefined && !("error" in parsed) && parsed.kind === "harness"
+    ? parsed.id
+    : "home";
+}
 
 export function createCommands(core: ControlCore): CommandsInternals {
   const iso = (ms: number): string => new Date(ms).toISOString();
@@ -285,6 +355,28 @@ export function createCommands(core: ControlCore): CommandsInternals {
         refusal: refuse("invalid", "the command's actor is not a principal or a system actor"),
       };
     }
+    if (request.authority !== undefined) {
+      if (!authorityIsValid(request.authority)) {
+        return { ok: false, refusal: refuse("invalid", "the command's authority is not a rule") };
+      }
+      if (request.actor === undefined || parseActor(request.actor)?.form !== "system") {
+        return {
+          ok: false,
+          refusal: refuse("invalid", "only a system actor acts under a rule's authority"),
+        };
+      }
+    }
+    if (request.credentialRef !== undefined) {
+      if (!isId("crd", request.credentialRef)) {
+        return { ok: false, refusal: refuse("invalid", "the command's credential is not one") };
+      }
+      if (request.actor === undefined) {
+        return {
+          ok: false,
+          refusal: refuse("invalid", "a command's credential is given with its actor"),
+        };
+      }
+    }
     const ledger = ledgerOf(request.ledger);
     if (request.ledger === "workspace") {
       try {
@@ -303,25 +395,14 @@ export function createCommands(core: ControlCore): CommandsInternals {
     const actor = request.actor ?? (await storedActorFor(core.hangarRoot, core.identity, key.hmac));
     let fingerprint: string;
     try {
-      fingerprint = await fingerprintOf(key.hmac, {
-        kind: request.kind,
-        target: request.target ?? "",
-        ...(request.params !== undefined ? { params: request.params } : {}),
-        ...(request.query !== undefined ? { query: request.query } : {}),
-        ...(request.body !== undefined ? { body: request.body } : {}),
-        ...(request.secretFields !== undefined ? { secretFields: request.secretFields } : {}),
-      });
+      fingerprint = await fingerprintOf(key.hmac, fingerprintInputOf(request));
     } catch {
       return { ok: false, refusal: refuse("invalid", "the request body cannot be fingerprinted") };
     }
     const now = core.now();
     const id = mintId("cmd", { now });
     const idempotent = kindIsIdempotent(request.kind, request.idempotent);
-    const parsedTarget = request.target === undefined ? undefined : parseRef(request.target);
-    const harnessScope =
-      parsedTarget !== undefined && !("error" in parsedTarget) && parsedTarget.kind === "harness"
-        ? parsedTarget.id
-        : "home";
+    const harnessScope = harnessScopeOf(request.target);
     const dedupeRef =
       request.dedupeClaim ??
       (request.idempotency === undefined
@@ -336,6 +417,7 @@ export function createCommands(core: ControlCore): CommandsInternals {
       kind: request.kind,
       target: request.target ?? `home/cmd/${id}`,
       actor,
+      ...(request.credentialRef !== undefined ? { credentialRef: request.credentialRef } : {}),
       via: request.via,
       ...(dedupeRef !== undefined ? { dedupeRef } : {}),
       fingerprint,
@@ -344,6 +426,7 @@ export function createCommands(core: ControlCore): CommandsInternals {
       executor: core.selfExecutor(),
       effects: request.queued === true ? [{ kind: "job", status: "unknown" }] : [],
       retry: retryFor(idempotent),
+      ...(request.authority !== undefined ? { authority: request.authority } : {}),
     };
 
     try {
@@ -431,7 +514,43 @@ export function createCommands(core: ControlCore): CommandsInternals {
     return { ok: true, replayed: false, receipt: accepted, value: undefined };
   };
 
-  return { submit, get, ledgerOf, move, dispatch };
+  const replayOf = async (request: SubmitRequest): Promise<ReplayLookup | undefined> => {
+    if (request.idempotency === undefined || !isCommandKind(request.kind)) return undefined;
+    if (!IDEMPOTENCY_VALUE_RE.test(request.idempotency)) return undefined;
+    if (request.target !== undefined && "error" in parseRef(request.target)) return undefined;
+    // No key yet: nothing was ever claimed in this ledger.
+    const key = await readLedgerKey(request.ledger, core.hangarRoot);
+    if (key.state !== "present") return undefined;
+    const actor = request.actor ?? (await storedActorFor(core.hangarRoot, core.identity, key.hmac));
+    const claim = idempotencyClaim(
+      { actor, harness: harnessScopeOf(request.target), kind: request.kind },
+      request.idempotency,
+    );
+    const ledger = ledgerOf(request.ledger);
+    const read = readClaim(ledger, claim);
+    if (!read.ok) return undefined;
+    const claimedAt = Date.parse(read.content.at);
+    if (Number.isFinite(claimedAt) && claimedAt < core.now() - IDEMPOTENCY_TTL_MS) return undefined;
+    let fingerprint: string;
+    try {
+      fingerprint = await fingerprintOf(key.hmac, fingerprintInputOf(request));
+    } catch {
+      return undefined;
+    }
+    const winner = read.content.record;
+    if (winner["fingerprint"] !== fingerprint || winner["kind"] !== request.kind) {
+      return {
+        kind: "reused",
+        refusal: refuse(
+          "idempotency_key_reused",
+          "this idempotency key was used for a different request",
+        ),
+      };
+    }
+    return { kind: "replay", receipt: get(ledger, String(winner["id"])) ?? receiptOf(winner) };
+  };
+
+  return { submit, get, ledgerOf, move, dispatch, replayOf };
 }
 
 /** The live directory of the harness a target names, when it names a registered one. */

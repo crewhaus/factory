@@ -4463,11 +4463,22 @@ describe("the release notes name what recorded managed runs and API input change
         "running",
       ]);
       expect((await call("sessions.list", {})).error?.code).toBe("unsupported");
+      // A sessionId outside the session grammar is refused before anything is written.
+      const before = rowsAt().length;
+      for (const sessionId of [`sess_${"f".repeat(5 * 1024)}`, "not-a-session"]) {
+        expect((await call("runs.create", { spec: "s", input: "hi", sessionId })).error?.code).toBe(
+          "bad_request",
+        );
+      }
+      expect(rowsAt()).toHaveLength(before);
     } finally {
       rmSync(harness, { recursive: true, force: true });
     }
     const bullet = bulletFor("A managed daemon records each run before its turn starts.");
     for (const word of [
+      "`bad_request`",
+      "`runs.clientRunId`",
+      "`conflict`",
       "`runs.cancel`",
       "`sessions.list`",
       "`input_blocked`",
@@ -4528,9 +4539,24 @@ describe("the release notes name what recorded managed runs and API input change
       rmSync(dir, { recursive: true, force: true });
     }
     expect(EXIT_CODES.input_blocked).toBe(41);
+    // A seed block whose text cannot be read is refused under the variable.
+    const { seedVerdict } = await import("../packages/runtime-core/src/input-origin");
+    _resetInputOriginForTest();
+    const base64 = {
+      role: "user",
+      content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } },
+      ],
+    };
+    expect(
+      (await seedVerdict({ seedMessages: [base64] }, { CREWHAUS_INPUT_ORIGIN: "api" })).kind,
+    ).toBe("blocked");
+    _resetInputOriginForTest();
     const bullet = bulletFor("A one-shot job the control API starts has its input checked");
     expect(bullet).toContain("`CREWHAUS_INPUT_ORIGIN=api`");
     expect(bullet).toContain("exit 41");
+    expect(bullet).toContain("a document's text included");
+    expect(bullet).toContain("cannot be read");
   }, 20_000); // imports the whole runtime the first time it runs
 
   test("a managed daemon with a file tool refuses a tenants root that is, lies inside or holds the harness", () => {

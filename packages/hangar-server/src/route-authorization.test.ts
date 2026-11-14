@@ -997,7 +997,7 @@ describe("an item about people is released only by a people domain", () => {
         credential: world.principals["portalCredential"] as string,
       },
       via: "scoped",
-      scoped: { refs: [`${world.a}/run/${RUN_OF_A}`], acts: ["run.events.read"], exp },
+      scoped: { refs: [`${world.a}/run/${RUN_OF_A}`], acts: ["run.events.read"], exp, ep: 0 },
     };
     const row = ROUTE_BY_KEY.get("runEvents") as RouteRow;
     const params = { id: world.a, runId: RUN_OF_A };
@@ -1005,6 +1005,47 @@ describe("an item about people is released only by a people domain", () => {
     const ended = authorizeRequest({ row, params, caller, view: viewAt(exp) });
     expect(ended.allow).toBe(false);
     expect(ended.allow === false ? ended.refusal.reason : undefined).toBe("scoped");
+  });
+
+  test("a scoped token reads nothing once its service's scoped epoch moves past it", () => {
+    const snapshot = snapshotOf(world.t);
+    const portal = world.principals["portal"] as string;
+    const exp = Date.parse("2026-11-11T00:15:00.000Z");
+    const viewOf = (at: AccessSnapshot): AccessView => ({
+      read: { state: "present", snapshot: at },
+      now: exp - 1,
+      domains: new Map(),
+      groupsOf: (id) => (id === world.a || id === world.b ? [] : undefined),
+      harnessIds: () => [world.a, world.b],
+    });
+    const bumped: AccessSnapshot = {
+      ...snapshot,
+      principals: snapshot.principals.map((p) => (p.id === portal ? { ...p, scopedEpoch: 1 } : p)),
+    };
+    const callerAt = (ep: number): Caller => ({
+      principal: portal,
+      actor: { principal: portal, credential: world.principals["portalCredential"] as string },
+      via: "scoped",
+      scoped: { refs: [`${world.a}/run/${RUN_OF_A}`], acts: ["run.events.read"], exp, ep },
+    });
+    const row = ROUTE_BY_KEY.get("runEvents") as RouteRow;
+    const params = { id: world.a, runId: RUN_OF_A };
+    const answer = (caller: Caller, at: AccessSnapshot) =>
+      authorizeRequest({ row, params, caller, view: viewOf(at) });
+    expect(answer(callerAt(0), snapshot).allow).toBe(true);
+    const withdrawn = answer(callerAt(0), bumped);
+    expect(withdrawn.allow).toBe(false);
+    expect(withdrawn.allow === false ? withdrawn.refusal.reason : undefined).toBe("scoped");
+    // A token minted under the new epoch reads as before.
+    expect(answer(callerAt(1), bumped).allow).toBe(true);
+    // Records that cannot be read answer nothing.
+    const unreadable = authorizeRequest({
+      row,
+      params,
+      caller: callerAt(0),
+      view: { ...viewOf(snapshot), read: { state: "absent" } },
+    });
+    expect(unreadable.allow).toBe(false);
   });
 
   test("the choke point hands a domain row's object ref to its checker, every time", () => {
@@ -1315,6 +1356,8 @@ describe("the versioned API: every served operation, for every role and credenti
     const device = DEVICE_APPROVAL.has(op.id);
     const harnessAbout = op.path.includes("{h}") || op.path.includes("{ref}");
     const cmdRow = op.path.includes("{cmd}");
+    // A run's id the matrix samples names no run this Home has: nothing to authorize against.
+    const runRow = op.path.includes("{run}");
     const member = (
       grants: Grants,
       opts: { personal?: boolean; readOnly?: boolean } = {},
@@ -1341,7 +1384,10 @@ describe("the versioned API: every served operation, for every role and credenti
         return refuse;
       }
       if (capped(op.permission)) return refuse;
-      if (cmdRow) return refuse; // names no receipt this Home has: nothing to authorize against
+      // A `{cmd}` alone names no receipt this Home has, and a sampled `{run}` no run: nothing
+      // to authorize against. A `{cmd}` under `{h}` (a delegation's watch) is authorized
+      // against that harness.
+      if ((cmdRow && !op.path.includes("{h}")) || runRow) return refuse;
       if (harnessAbout) return holds(best(grants.home, grants.a), op.permission) ? ALLOW : refuse;
       return [grants.home, grants.a, grants.b].some((role) => holds(role, op.permission))
         ? ALLOW
@@ -1367,7 +1413,7 @@ describe("the versioned API: every served operation, for every role and credenti
         if (isPublic) return ALLOW;
         if (device) return "403 session_required";
         if (op.permission === "authenticated") return ALLOW;
-        if (cmdRow) return "403 permission";
+        if (cmdRow || runRow) return "403 permission";
         return op.permission === "h.read" && harnessAbout ? ALLOW : "403 permission";
       }
       case "scoped":
@@ -1465,7 +1511,9 @@ describe("the versioned API: every served operation, for every role and credenti
   for (const cred of V1_CREDS) {
     test(`as ${cred}: every served operation is answered as the role table says`, async () => {
       const ops = await servedOps();
-      expect(ops.length).toBeGreaterThanOrEqual(45);
+      // The core's, and the delegation area's eleven.
+      expect(ops.length).toBeGreaterThanOrEqual(56);
+      expect(ops.filter((op) => op.id.startsWith("delegations."))).toHaveLength(11);
       const wrong: string[] = [];
       for (const op of ops) {
         const res = await world.t.fetchRaw(v1PathOf(op.path), {

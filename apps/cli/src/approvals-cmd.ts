@@ -429,12 +429,17 @@ function widenPreview(
   };
 }
 
+/** What a request asks for, in a line: an allow's pattern, or a delegation rule's action. */
+function termsLabel(terms: NonNullable<ResolveAnswer["proposal"]>["terms"]): string {
+  return terms.ruleKind === "allow" ? terms.pattern : `delegation of ${terms.action}`;
+}
+
 function ruleNote(answer: ResolveAnswer, harnessDir: string | undefined): string {
   if (answer.rule !== undefined) {
     return ` (standing rule ${answer.rule.id}: allows ${displayPattern(answer.rule.pattern)} until ${displayPattern(answer.rule.expiresAt)}; end it with \`crewhaus approvals revoke ${answer.rule.id}${harnessDir !== undefined ? ` --dir ${harnessDir}` : ""}\`)`;
   }
   if (answer.proposal !== undefined && answer.proposal.state === "pending") {
-    return ` (once — a standing rule is the owner's to make: asked the owner for ${displayPattern(answer.proposal.terms.pattern)} as ${answer.proposal.id})`;
+    return ` (once — a standing rule is the owner's to make: asked the owner for ${displayPattern(termsLabel(answer.proposal.terms))} as ${answer.proposal.id})`;
   }
   return "";
 }
@@ -754,7 +759,7 @@ export async function runApprovalsCommand(
     );
   } else if (isRequest) {
     out(
-      `${choice === "grant" ? "granted" : "denied"} ${id} — ${displayPattern(answer.proposal?.terms.pattern ?? "")}${ruleNote(answer, harnessDir)}\n`,
+      `${choice === "grant" ? "granted" : "denied"} ${id} — ${displayPattern(answer.proposal === undefined ? "" : termsLabel(answer.proposal.terms))}${ruleNote(answer, harnessDir)}\n`,
     );
   } else {
     const note = always

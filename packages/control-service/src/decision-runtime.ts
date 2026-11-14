@@ -5,7 +5,7 @@
  *
  * | Kind | What is observed |
  * |---|---|
- * | `decisions.resolve` | an `appr_`: its decision claim in the approvals ledger of the harness's session root; a `dec_`: its row in the harness's requests or change-adoption decisions |
+ * | `decisions.resolve` | an `appr_`: its decision claim in the approvals ledger of the harness's session root; a `dec_`: its row in the harness's requests, change-adoption or merge and rollout decisions |
  * | `decisions.supersede` | the `appr_`'s supersede claim |
  * | `decisions.defer` | the `appr_`'s `defer` line in the decision log, at or after the receipt was accepted |
  * | `rules.create` | the standing rule whose row carries this receipt's id |
@@ -24,6 +24,7 @@ import {
   parseRef,
 } from "@crewhaus/control-contract";
 import {
+  readActionDecisions,
   readChangeAdoptions,
   readClaim,
   readPage,
@@ -76,8 +77,17 @@ export function observeResolve(receipt: CommandReceipt, harnessDir: string): Obs
     const adoptions = readChangeAdoptions(harnessDir);
     const adoption =
       adoptions.state === "present" ? adoptions.rows.find((r) => r.id === id) : undefined;
-    if (adoption === undefined || adoption.state === "pending") return "unknown";
-    return compare(adoption.decidedByPrincipal, receipt.actor);
+    if (adoption !== undefined) {
+      if (adoption.state === "pending") return "unknown";
+      return compare(adoption.decidedByPrincipal, receipt.actor);
+    }
+    // And so is a merge or rollout decision: one a rule resolved names no person, so a
+    // person's receipt observes it as another's.
+    const actions = readActionDecisions(harnessDir);
+    const action = actions.state === "present" ? actions.rows.find((r) => r.id === id) : undefined;
+    if (action === undefined || action.state === "pending") return "unknown";
+    if (action.resolvedBy === "delegation") return isId("prn", receipt.actor) ? "other" : "unknown";
+    return compare(action.decidedByPrincipal, receipt.actor);
   }
   const claim = readClaim(approvalsLedgerOf(harnessDir), `decision/${id}`);
   if (!claim.ok) return "unknown";

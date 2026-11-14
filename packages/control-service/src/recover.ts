@@ -10,9 +10,15 @@
  * | a daemon start accepted before the machine booted | `unknown`: not started, the machine restarted; the installed service (`resident`) takes the accepted rows below instead |
  * | `accepted`, safe to repeat | run again |
  * | `accepted`, not safe to repeat | reconcile: done → `succeeded`, not done → run again |
- * | `running`, safe to repeat | the first recoverer to claim it runs it again |
+ * | `running`, safe to repeat | the first recoverer to claim it runs it again, or settles it `failed` (forbidden) when its submitter may no longer do it |
  * | `running`, not safe to repeat | reconcile: done → `succeeded`, not done → `failed` |
  * | no executor | `unknown`: interrupted, needs a decision |
+ *
+ * A head that cannot check a receipt's credential (one wired with no `authorizeActor`)
+ * leaves a receipt that names one as it is, for a head that can.
+ * A command is run again only while the credential that submitted it, or for a receipt
+ * without one its actor, may still do it: an `accepted` one that may not settles `rejected`
+ * (forbidden), a `running` one `failed` (forbidden).
  *
  * An inline effect never writes `running`, so an `accepted` receipt does not prove its
  * effect never started: that is why a kind that is not safe to repeat is reconciled first.
@@ -54,7 +60,7 @@ import {
 import type { ControlCore } from "./context";
 import { type RunSweep, executorDead } from "./executor";
 import { commandsLedgerOf, workspaceCommandsLedger } from "./ledgers";
-import { NEEDS_DECISION, NOT_STARTED_REBOOT, type Outcome, SUPERSEDED } from "./refusal";
+import { NEEDS_DECISION, NOT_STARTED_REBOOT, type Outcome, SUPERSEDED, outcomeOf } from "./refusal";
 
 export type RecoverScope = { readonly harness: string } | "all";
 
@@ -192,6 +198,11 @@ export function createRecover(
           continue;
         }
 
+        if (receipt.credentialRef !== undefined && !core.checksActors) {
+          // Only a head that can check the credential it names may run it again or settle it.
+          continue;
+        }
+
         if (superseded.has(receipt.id)) {
           // Running it now would undo what the operator asked for since.
           await settle(ledger, receipt, "unknown", SUPERSEDED);
@@ -257,6 +268,12 @@ export function createRecover(
             executor: core.selfExecutor(),
           });
           if (won.ok) {
+            // Run again only while its submitter may still do it.
+            if (core.actorRefused(receipt)) {
+              await settle(ledger, receipt, "failed", outcomeOf("forbidden"));
+              counts.redispatched += 1;
+              continue;
+            }
             await commands.dispatch(ledger, receipt, harnessDir);
             counts.redispatched += 1;
             continue;

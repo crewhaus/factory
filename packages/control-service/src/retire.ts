@@ -286,34 +286,54 @@ export function retireSteps(options: RetireStepsOptions): RetireSteps {
 
     async revokeConnections() {
       const revokers = options.revokers ?? [];
-      if (revokers.length === 0) {
+      const noConnections = (): RetireStepOutcome => {
         effect({ kind: "retire.connections", status: "skipped", note: "none registered" });
         return outcome(
           "revokeConnections",
           true,
           "none are registered here; revoke this harness's channel and service credentials where they were issued",
         );
-      }
+      };
+      if (revokers.length === 0) return noConnections();
       const ctx = {
         harnessDir,
         ...(options.harnessId !== undefined ? { harnessId: options.harnessId } : {}),
         actor: receipt.actor,
         now: options.now(),
+        cmd: receipt.id,
       };
       const failed: string[] = [];
+      // Revokers that ended something, and whether one of them ended a connection.
+      let acted = 0;
+      let connections = false;
       for (const revoker of revokers) {
         try {
           const done = await revoker.revoke(ctx);
           for (const e of done) effect(e);
+          if (done.length > 0) {
+            acted += 1;
+            if (revoker.connections === true) connections = true;
+          }
           if (done.some((e) => e.status === "failed")) failed.push(revoker.name);
         } catch (err) {
           effect({ kind: `retire.${revoker.name}`, status: "failed" });
           failed.push(`${revoker.name}: ${messageOf(err)}`);
         }
       }
-      return failed.length === 0
-        ? outcome("revokeConnections", true, `${revokers.length} revoker(s) ran`)
-        : outcome("revokeConnections", false, `failed: ${failed.join("; ")}`);
+      if (failed.length > 0) {
+        return outcome("revokeConnections", false, `failed: ${failed.join("; ")}`);
+      }
+      // Nothing to end here: the same answer as a Home with no revoker at all.
+      if (acted === 0) return noConnections();
+      if (!connections) {
+        effect({ kind: "retire.connections", status: "skipped", note: "none registered" });
+        return outcome(
+          "revokeConnections",
+          true,
+          `${acted} revoker(s) ran; no connections are registered here: revoke this harness's channel and service credentials where they were issued`,
+        );
+      }
+      return outcome("revokeConnections", true, `${acted} revoker(s) ran`);
     },
 
     async keepDisabled() {

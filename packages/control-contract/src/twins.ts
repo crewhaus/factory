@@ -5,10 +5,11 @@
  * a command line back to its params, so one type serves both directions.
  */
 import { DEFER_REASONS, OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
+import { DELEGATION_ACTIONS } from "./areas/delegation.js";
 import { PLUGIN_NAME_RE } from "./areas/integrations.js";
 import { PERSON_CHANGE_REASONS } from "./areas/quality.js";
 import type { CliTwin } from "./areas/types.js";
-import { APPROVAL_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
+import { APPROVAL_ID_RE, CANONICAL_RUN_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
 import { deepFreeze } from "./util.js";
 
 export type { CliTwin } from "./areas/types.js";
@@ -21,6 +22,7 @@ export const CLI_VERBS = deepFreeze({
   deploy: ["activate", "list"],
   access: ["members", "tokens", "revoke", "unlink"],
   commands: ["list", "show"],
+  runs: ["list", "show", "cancel"],
   people: [
     "init",
     "keys",
@@ -38,6 +40,7 @@ export const CLI_VERBS = deepFreeze({
   datasets: ["holdout"],
   "eval-report": ["baseline"],
   plugins: ["grants", "revoke"],
+  delegations: ["list", "show", "preview", "propose", "pause", "revoke", "apply"],
 } as const);
 
 /**
@@ -60,6 +63,11 @@ export const CLI_VERBS = deepFreeze({
  * ISO date and time with `Z` or an offset, and `{deferReason}` one of the reasons a
  * person may give to defer a decision. `{plugin}` is a plugin's name, the manifest
  * name grammar.
+ *
+ * `{delegationAction}` is one of the actions a delegation rule may cover.
+ *
+ * `{run}` is a run's canonical id (`run_` and 26 characters), the id the run ledger
+ * keys a run by; an execution's `run_<16 hex>` never fits it.
  */
 export const TWIN_PLACEHOLDERS = deepFreeze({
   "{hrn}": HARNESS_ID_RE,
@@ -89,6 +97,8 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{until}": /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/,
   "{deferReason}": new RegExp(`^(?:${DEFER_REASONS.join("|")})$`),
   "{plugin}": PLUGIN_NAME_RE,
+  "{delegationAction}": new RegExp(`^(?:${DELEGATION_ACTIONS.join("|")})$`),
+  "{run}": CANONICAL_RUN_ID_RE,
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

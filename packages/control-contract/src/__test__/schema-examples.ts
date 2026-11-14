@@ -210,7 +210,7 @@ export const EXAMPLES: Readonly<Record<string, unknown>> = {
   runCreateRequest: { input: "hello" },
   runCreated: { run: RUN, receipt: RECEIPT },
   runList: list(RUN),
-  runResult: { run: mintRunId(), state: "succeeded" },
+  runResult: { run: mintRunId(), state: "succeeded", sensitivity: "internal" },
   scopedTokenMintRequest: {
     refs: [`${HRN}/run/${mintRunId()}`],
     acts: ["run.events.read"],

@@ -63,6 +63,9 @@ export {
   CHANNEL_CONVERSATION_LABEL,
   CHANNEL_MESSAGE_LABEL,
   CHANNEL_SENDER_LABEL,
+  CONSEQUENCES_LABEL,
+  DELEGATION_HOST_LABEL,
+  DELEGATION_TERMS_LABEL,
   type DigestKeyRead,
   ensureDigestKey,
   keyedDigest,
@@ -127,6 +130,28 @@ export {
   writeHarnessIdentity,
 } from "./deployments";
 export {
+  type DelegationLogRead,
+  type DelegationScopeChoice,
+  appendDelegationLog,
+  createDelegationReader,
+  delegationLogLedger,
+  delegationLogLineOf,
+  delegationRuleOf,
+  delegationsLedger,
+  isDelegationTerms,
+  readDelegationLog,
+  readDelegations,
+  ruleUses,
+} from "./delegations";
+export type { CachedReader } from "./fail-closed";
+export {
+  ACTION_DECISION_TTL_MS,
+  type ActionDecisionRow,
+  type OpenActionDecision,
+  actionDecisionOf,
+  actionDecisionState,
+  openActionDecision,
+  readActionDecisions,
   type ChangeAdoptionRow,
   type ChangeAdoptionSubjectRow,
   type LedgerRead,

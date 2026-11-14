@@ -165,6 +165,7 @@ import {
 // tools on the edge). Imported via the `/tool-policy` SUBPATH so this offline
 // gate never drags the loop into the compiler-worker's CF bundle.
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
+import { lowerDelegation } from "./lower/delegation";
 import { lowerPlugins } from "./lower/plugins";
 import { lowerSchedule, parseDurationToMs } from "./lower/schedule";
 import { toolConfigWidenings } from "./tool-config-widening";
@@ -1504,6 +1505,7 @@ function lowerPermissions(spec: SpecWithPermissions): IrPermissions {
     // the runtime resolves with `askMode ?? "pause"`. NOT optimizer-reachable
     // (a safety control, excluded from OPTIMIZABLE_PATHS at the spec layer).
     ...(p.ask_mode !== undefined ? { askMode: p.ask_mode } : {}),
+    ...lowerDelegation(p),
     rules: (p.rules ?? []).map(
       (r: { type: IrPermissions["rules"][number]["type"]; pattern: string }) => ({
         type: r.type,

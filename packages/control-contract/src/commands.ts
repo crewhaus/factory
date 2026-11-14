@@ -1,4 +1,5 @@
 /** Command receipts and the closed registry of command kinds. */
+import type { ReceiptAuthorityKind } from "./areas/delegation.js";
 import { MODULES, type ModuleField } from "./areas/index.js";
 import type { CommandKindDecl } from "./areas/types.js";
 import type { CommandState } from "./machines.js";
@@ -56,6 +57,18 @@ export type ReceiptRetry = {
 };
 
 /**
+ * Whose standing authority a command ran under, beside its actor: an owner's delegation
+ * rule (or an assistant rule) at one revision. `clause: "rollback"` marks the rule's
+ * rollback clause, which outlives a pause or a revoke of the rule.
+ */
+export type ReceiptAuthority = {
+  readonly kind: ReceiptAuthorityKind;
+  readonly rule: string;
+  readonly revision: number;
+  readonly clause?: "rollback";
+};
+
+/**
  * What a command did, persisted before it is acknowledged. It carries refs and
  * digests only: no arguments, no inputs, no secrets. `actor` is a stored actor,
  * never a raw `local:` id. "Accepted" is never "done".
@@ -66,6 +79,12 @@ export type CommandReceipt = {
   readonly kind: string;
   readonly target: string;
   readonly actor: string;
+  /**
+   * The credential (`crd_…`) the caller authenticated with, when it used one: a command
+   * dispatched from this receipt, when it is submitted or recovered, is checked against
+   * exactly it.
+   */
+  readonly credentialRef?: string;
   readonly via: ReceiptVia;
   readonly dedupeRef?: string;
   readonly fingerprint: string;
@@ -81,4 +100,6 @@ export type CommandReceipt = {
   };
   readonly retry: ReceiptRetry;
   readonly winner?: string;
+  /** The rule a system actor acted under. Absent: the actor's own authority. */
+  readonly authority?: ReceiptAuthority;
 };

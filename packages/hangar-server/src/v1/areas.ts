@@ -21,13 +21,16 @@ import { ACCESS_HANDLERS } from "./access-ops";
 import { COMMAND_HANDLERS } from "./commands";
 import type { CapabilityProvider, RefResolver, V1Handler } from "./context";
 import { CONTROL_HANDLERS } from "./controls";
+import { CREATION_HANDLERS } from "./creation";
 import { DECISION_HANDLERS } from "./decisions";
+import { HOME_DELEGATION } from "./delegations";
 import { DEPLOYMENT_HANDLERS } from "./deployments";
 import { DEVICE_HANDLERS } from "./device";
 import { HARNESS_HANDLERS } from "./harnesses";
 import { HOME_INTEGRATIONS } from "./integrations";
 import { CORE_REF_RESOLVERS, META_HANDLERS } from "./meta";
 import { RULE_HANDLERS } from "./rules";
+import { RUN_HANDLERS } from "./runs";
 
 export type HomeAreaRuntime = {
   readonly area: string;
@@ -57,9 +60,13 @@ export const HOME_CORE: HomeAreaRuntime = {
     ...COMMAND_HANDLERS,
     ...ACCESS_HANDLERS,
     ...DEVICE_HANDLERS,
+    ...RUN_HANDLERS,
   },
   refResolvers: CORE_REF_RESOLVERS,
 };
+
+/** The creation area's entry: the spec's schema for the structured editor. */
+export const HOME_CREATION: HomeAreaRuntime = { area: "creation", handlers: CREATION_HANDLERS };
 
 export const HOME_AREAS: readonly HomeAreaRuntime[] = [
   HOME_CORE,
@@ -68,9 +75,9 @@ export const HOME_AREAS: readonly HomeAreaRuntime[] = [
 
   // HOME_COMPILER,
 
-  // HOME_CREATION,
+  HOME_CREATION,
 
-  // HOME_DELEGATION,
+  HOME_DELEGATION,
 
   // HOME_HOME,
 
@@ -108,12 +115,6 @@ export function receiversOf(areas: readonly HomeAreaRuntime[]): readonly Receive
  * change that serves one deletes its line.
  */
 export const V1_NOT_SERVED: Readonly<Record<string, string>> = {
-  "runs.list": "Listing runs through the API is not served yet.",
-  "runs.get": "Reading a run through the API is not served yet.",
-  "runs.create": "Starting runs through the API is not served yet.",
-  "runs.cancel": "Cancelling runs through the API is not served yet.",
-  "runs.resume": "Resuming runs through the API is not served yet.",
-  "runs.result": "Reading a run's result through the API is not served yet.",
   "runs.events": "Following a run's events through the API is not served yet.",
 
   "events.fleet": "Following Home's events through the API is not served yet.",

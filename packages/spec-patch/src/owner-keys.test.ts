@@ -73,6 +73,8 @@ describe("the lists derive from the table", () => {
       ["provability", "on_fail"],
       // A judge gate's protection: matched inside a step or a node.
       ["judge", "protected"],
+      // Who may act without asking: the delegation ceiling, wherever `permissions:` is.
+      ["permissions", "delegation"],
       ["transaction_policy", "defaultWriteApproval"],
       ["model_pool", "candidates"],
     ]);

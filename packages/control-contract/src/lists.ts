@@ -12,6 +12,8 @@ export const EMPTY_REASONS = deepFreeze([
   "not-indexed",
   "unreachable",
   "expired",
+  // The harness's active agreement does not allow it, so nothing can fill the list yet.
+  "not-allowed",
 ] as const);
 
 export type EmptyReason = (typeof EMPTY_REASONS)[number];

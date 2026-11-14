@@ -2705,6 +2705,219 @@
       ]
     },
     {
+      "verb": "delegations",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "sub": {
+        "list": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all",
+              "takesValue": false
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "preview": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "uses",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "enable": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "uses",
+              "takesValue": true
+            },
+            {
+              "name": "digest",
+              "takesValue": true
+            },
+            {
+              "name": "confirm",
+              "takesValue": true
+            },
+            {
+              "name": "proposal",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "propose": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "uses",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "change": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "days",
+              "takesValue": true
+            },
+            {
+              "name": "uses",
+              "takesValue": true
+            },
+            {
+              "name": "digest",
+              "takesValue": true
+            },
+            {
+              "name": "confirm",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "pause": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "reason",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "resume": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "digest",
+              "takesValue": true
+            },
+            {
+              "name": "confirm",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "revoke": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "all",
+              "takesValue": false
+            },
+            {
+              "name": "expect",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "apply": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        }
+      },
+      "flags": null
+    },
+    {
       "verb": "deploy",
       "kind": "legacy",
       "since": "0.8.0",
@@ -9507,15 +9720,75 @@
         {
           "name": "ignore-pause",
           "takesValue": false
+        },
+        {
+          "name": "input-file",
+          "takesValue": true
         }
       ]
     },
     {
       "verb": "runs",
-      "kind": "legacy",
+      "kind": "family",
       "since": "0.8.0",
       "status": "stable",
       "sub": {
+        "list": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "limit",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "create": {
+          "flags": [
+            {
+              "name": "input-file",
+              "takesValue": true
+            },
+            {
+              "name": "admission",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "cancel": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
         "resume": {
           "flags": [
             {
@@ -9576,75 +9849,12 @@
             },
             {
               "name": "help",
-              "short": "h",
               "takesValue": false
             }
           ]
         }
       },
-      "flags": [
-        {
-          "name": "spec",
-          "takesValue": true
-        },
-        {
-          "name": "model",
-          "takesValue": true
-        },
-        {
-          "name": "permission-mode",
-          "takesValue": true
-        },
-        {
-          "name": "ask-mode",
-          "takesValue": true
-        },
-        {
-          "name": "prompt",
-          "takesValue": true
-        },
-        {
-          "name": "justification-judge",
-          "takesValue": true
-        },
-        {
-          "name": "no-justification-audit",
-          "takesValue": false
-        },
-        {
-          "name": "egress-matcher",
-          "takesValue": true
-        },
-        {
-          "name": "egress-embedder",
-          "takesValue": true
-        },
-        {
-          "name": "budget-usd",
-          "takesValue": true
-        },
-        {
-          "name": "streaming",
-          "takesValue": false
-        },
-        {
-          "name": "trace",
-          "takesValue": true
-        },
-        {
-          "name": "user",
-          "takesValue": true
-        },
-        {
-          "name": "no-mcp-quarantine",
-          "takesValue": false
-        },
-        {
-          "name": "help",
-          "short": "h",
-          "takesValue": false
-        }
-      ]
+      "flags": null
     },
     {
       "verb": "sandbox",

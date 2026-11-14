@@ -50,6 +50,7 @@ import {
   runsOwnCode,
 } from "@crewhaus/harness-registry";
 import {
+  type ApiRunInput,
   type BinResolverDeps,
   type Clock,
   type DaemonRunfile,
@@ -63,8 +64,10 @@ import {
   type ProcessOps,
   type SpawnPlan,
   SpawnPlanError,
+  type StartResult,
   type SubmitInput,
   type SupervisorEvent,
+  type SupervisorOptions,
   type SupervisorSnapshot,
   buildSpawnPlan,
   controlTokenPath,
@@ -269,6 +272,13 @@ export type ProcessLayer = {
   readonly jobs: HomeJobQueue;
   /** The process seam every supervisor here acts through: what a read judges a runfile by. */
   readonly ops: ProcessOps;
+  /**
+   * Start one job for a run the control API queued, on a supervisor of its own whose plan
+   * passes `apiRun`: the run's id and its input file. Optional, for a layer a test builds.
+   */
+  startApiRun?(entry: HangarHarnessEntry, apiRun: ApiRunInput): Promise<StartResult>;
+  /** Stop the job a run started here is running; `false` when this layer holds none for it. */
+  stopApiRun?(entry: HangarHarnessEntry, runId: string): Promise<boolean>;
   /** Adopt every registered harness, then restore the job queue. */
   boot(): Promise<{ readonly adopted: number; readonly lost: number; readonly jobs: number }>;
   close(): void;
@@ -502,6 +512,81 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
     },
   };
 
+  /** How Home admits a person's start of a harness's build. */
+  const homeAdmit =
+    (entry: HangarHarnessEntry): SupervisorOptions["admit"] =>
+    async ({ harnessDir: dir, target: shape, entry: launched, ledgerAbsent, decideOnly }) => {
+      const command = currentCommand();
+      return admitExplicitStart(dir, shape, {
+        head: "home",
+        entry: launched,
+        ledgerAbsent,
+        decideOnly,
+        actor: command?.by ?? "sys:executor",
+        registryId: entry.id,
+        ...(command !== undefined ? { cmd: command.commandId } : {}),
+        now: options.now,
+      });
+    };
+
+  /** The supervisors of the API runs this layer started, by run id, until each one exits. */
+  const apiRuns = new Map<string, HarnessSupervisor>();
+
+  const startApiRun = async (
+    entry: HangarHarnessEntry,
+    apiRun: ApiRunInput,
+  ): Promise<StartResult> => {
+    const harnessDir = entry.dir;
+    const target = liveTarget(harnessDir) ?? entry.target;
+    const supervisor = createHarnessSupervisor({
+      harnessDir,
+      target,
+      ops,
+      clock,
+      ports,
+      managerVersion: options.managerVersion,
+      plan: () =>
+        buildSpawnPlan({
+          harnessDir,
+          target,
+          processEnv: options.env,
+          crewhausBin: resolveCrewhausBin(harnessDir),
+          apiRun,
+        }),
+      admit: homeAdmit(entry),
+      ...(options.noPreflight === true
+        ? {}
+        : {
+            gate: (gateOptions) =>
+              runPreflightGate({
+                harnessDir,
+                env: mergedSpawnEnv(options.env, harnessDir).env,
+                ...gateOptions,
+              }),
+          }),
+    });
+    const started = await supervisor.start();
+    if (!started.ok) {
+      supervisor.close();
+      return started;
+    }
+    apiRuns.set(apiRun.runId, supervisor);
+    const off = supervisor.subscribe((event: SupervisorEvent) => {
+      if (event.type !== "exit") return;
+      off();
+      apiRuns.delete(apiRun.runId);
+      // Its rows close after the exit: let them land before the supervisor goes.
+      void supervisor.idle().then(() => supervisor.close());
+    });
+    return started;
+  };
+
+  const stopApiRun = async (_entry: HangarHarnessEntry, runId: string): Promise<boolean> => {
+    const supervisor = apiRuns.get(runId);
+    if (supervisor === undefined) return false;
+    return (await supervisor.stop()).stopped;
+  };
+
   const build = (entry: HangarHarnessEntry): HarnessProcess => {
     const harnessDir = entry.dir;
     // The LIVE spec's target wins over the registry row, which is a cached
@@ -539,25 +624,7 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       plan,
       // Home's Start, Restart and group start run only the active build (a harness with no
       // deployment record yet is recorded at its first start).
-      admit: async ({
-        harnessDir: dir,
-        target: shape,
-        entry: launched,
-        ledgerAbsent,
-        decideOnly,
-      }) => {
-        const command = currentCommand();
-        return admitExplicitStart(dir, shape, {
-          head: "home",
-          entry: launched,
-          ledgerAbsent,
-          decideOnly,
-          actor: command?.by ?? "sys:executor",
-          registryId: entry.id,
-          ...(command !== undefined ? { cmd: command.commandId } : {}),
-          now: options.now,
-        });
-      },
+      admit: homeAdmit(entry),
       // The SAME prep the terminal head runs, built per start because
       // `.crewhaus/settings.json` is edited between starts like the spec is.
       // Without this the console's Restart button rebuilt the spawn plan and
@@ -656,6 +723,8 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
     },
     peek: (harnessDir) => handles.get(harnessDir),
     held: () => [...handles.values()],
+    startApiRun,
+    stopApiRun,
     jobs,
     ops,
     boot: async () => {

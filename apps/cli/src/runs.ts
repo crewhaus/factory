@@ -13,11 +13,21 @@
  * says which session a run, or a root run's newest run, belongs to
  * ({@link resolveRunsResumeTarget}).
  */
-import { existsSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import {
+  closeSync,
+  existsSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+} from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   CANONICAL_RUN_ID_RE,
   type CursorPosition,
+  EXECUTION_RUN_ID_RE,
   type Trigger,
   parseResumeScope,
 } from "@crewhaus/control-contract";
@@ -26,6 +36,7 @@ import {
   controlPaths,
   foldStates,
   harnessLedger,
+  newestRunRows,
   readPage,
 } from "@crewhaus/control-records";
 
@@ -81,6 +92,14 @@ export const RUNS_LEDGER_DIR = join(controlPaths(".").controlDir, "runs");
 export function runsLedgerAt(harnessDir: string): Ledger {
   return harnessLedger(harnessDir, { dir: RUNS_LEDGER_DIR }, { machine: "run" });
 }
+
+/** The run states a run never leaves. */
+const TERMINAL_RUN_STATES: ReadonlySet<string> = new Set([
+  "interrupted",
+  "succeeded",
+  "failed",
+  "cancelled",
+]);
 
 /** What a resume re-drives, and the run scope it runs in. */
 export type RunsResumeTarget = {
@@ -151,6 +170,25 @@ function newestParked(
   );
 }
 
+/**
+ * The session's newest run, when a command cancelled it (its `cancelled` row names the
+ * command, as a cancel through the control plane writes): that session is not resumed,
+ * since what its run waited on was withdrawn.
+ */
+function cancelledByCommand(
+  ledger: Ledger,
+  rows: readonly RunningRow[],
+  sessionId: string,
+): string | undefined {
+  const newest = rows.find((row) => row.session === sessionId);
+  if (newest === undefined) return undefined;
+  const fold = foldStates(ledger);
+  const last = fold.ok ? fold.objects.get(newest.id) : undefined;
+  return last?.state === "cancelled" && typeof last.record["cmd"] === "string"
+    ? newest.id
+    : undefined;
+}
+
 /** What a resume of `sessionId` continues, and the scope it re-enters. */
 function resumeOf(sessionId: string, parked: RunningRow | undefined): RunsResumeTarget {
   return {
@@ -170,8 +208,9 @@ function resumeOf(sessionId: string, parked: RunningRow | undefined): RunsResume
  * row, so every retained row is read (a fold keeps each run's last row only),
  * and the current states come from the fold.
  *
- * Throws `RunsError` naming the id when no run record here has it, and when
- * the records cannot be read whole.
+ * Throws `RunsError` naming the id when no run record here has it, when the
+ * run has ended (a cancelled run is never resumed), when a session's newest
+ * run was cancelled by a command, and when the records cannot be read whole.
  */
 export function resolveRunsResumeTarget(id: string, harnessDir: string): RunsResumeTarget {
   const ledger = runsLedgerAt(harnessDir);
@@ -184,10 +223,20 @@ export function resolveRunsResumeTarget(id: string, harnessDir: string): RunsRes
     } catch {
       return { sessionId: id };
     }
+    const cancelled = cancelledByCommand(ledger, rows, id);
+    if (cancelled !== undefined) {
+      throw new RunsError(`session ${id}'s run ${cancelled} was cancelled; nothing was resumed`);
+    }
     return resumeOf(id, newestParked(ledger, rows, id));
   }
   if (!isRunsRunId(id)) {
     throw new RunsError(`invalid id "${id}": expected a session (sess_<16 hex>) or a run id`);
+  }
+  // A run that ended is never re-driven: a cancel withdrew what it waited on.
+  const fold = foldStates(ledger);
+  const ended = fold.ok ? fold.objects.get(id)?.state : undefined;
+  if (ended !== undefined && TERMINAL_RUN_STATES.has(ended)) {
+    throw new RunsError(`run ${id} was ${ended}; nothing was resumed`);
   }
   const rows = runningRows(ledger, dir);
   const own = rows.find((row) => row.id === id && row.session !== undefined);
@@ -215,4 +264,92 @@ export function runsResumeScope(target: RunsResumeTarget): {
     ...(target.continues !== undefined ? { continues: target.continues } : {}),
     ...(target.resumeScope !== undefined ? { resumeScope: target.resumeScope } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// `crewhaus run <spec> --input-file <path>`
+// ---------------------------------------------------------------------------
+
+/** The input a run started through the control API reads, and who it serves. */
+export type RunInputRecord = {
+  readonly run: string;
+  readonly input: string;
+  readonly subject?: string;
+};
+
+const NOFOLLOW: number = fsConstants.O_NOFOLLOW ?? 0;
+
+/** The most bytes an input record holds. */
+const INPUT_RECORD_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Read the input record `crewhaus run --input-file` runs: a regular file (never a link)
+ * that lies, on disk, inside `<cwd>/.crewhaus/run/control/inputs/`, whose `run` is the run
+ * this process was started for. That run is `CREWHAUS_RUN_ID`, verified against the run
+ * ledger: its newest row is `queued` or `preparing` and names this process's execution
+ * (`CREWHAUS_EXECUTION_ID`). Anything else throws `RunsError`, before any model call.
+ */
+export function readRunInputRecord(
+  path: string,
+  cwd: string,
+  env: Readonly<Record<string, string | undefined>>,
+): RunInputRecord {
+  const inputs = join(cwd, controlPaths(cwd).inputsDir);
+  const at = isAbsolute(path) ? path : resolve(cwd, path);
+  let real: string;
+  let realInputs: string;
+  try {
+    if (lstatSync(at).isSymbolicLink()) throw new RunsError(`--input-file ${path} is a link`);
+    real = realpathSync(at);
+    realInputs = realpathSync(inputs);
+  } catch (err) {
+    if (err instanceof RunsError) throw err;
+    throw new RunsError(`--input-file ${path} could not be read: ${(err as Error).message}`);
+  }
+  const rel = relative(realInputs, real);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new RunsError(`--input-file must lie inside ${inputs}`);
+  }
+  let fd: number | undefined;
+  let body: Partial<Record<string, unknown>>;
+  try {
+    fd = openSync(real, fsConstants.O_RDONLY | NOFOLLOW);
+    const stats = fstatSync(fd);
+    if (!stats.isFile() || stats.size > INPUT_RECORD_MAX_BYTES) {
+      throw new RunsError(`--input-file ${path} is not an input record`);
+    }
+    body = JSON.parse(readFileSync(fd, "utf8")) as Partial<Record<string, unknown>>;
+  } catch (err) {
+    if (err instanceof RunsError) throw err;
+    throw new RunsError(`--input-file ${path} is not an input record: ${(err as Error).message}`);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  const run = body["run"];
+  const input = body["input"];
+  const subject = body["subject"];
+  if (
+    body["v"] !== 1 ||
+    typeof run !== "string" ||
+    typeof input !== "string" ||
+    input.trim() === ""
+  ) {
+    throw new RunsError(`--input-file ${path} is not an input record`);
+  }
+  const named = env["CREWHAUS_RUN_ID"];
+  const execution = env["CREWHAUS_EXECUTION_ID"];
+  if (named === undefined || !CANONICAL_RUN_ID_RE.test(named) || named !== run) {
+    throw new RunsError("--input-file names a run this process was not started for");
+  }
+  const newest = newestRunRows(runsLedgerAt(cwd)).get(run);
+  if (
+    execution === undefined ||
+    !EXECUTION_RUN_ID_RE.test(execution) ||
+    newest === undefined ||
+    (newest["state"] !== "queued" && newest["state"] !== "preparing") ||
+    newest["execution"] !== execution
+  ) {
+    throw new RunsError("--input-file names a run its records do not hand to this process");
+  }
+  return { run, input, ...(typeof subject === "string" && subject !== "" ? { subject } : {}) };
 }

@@ -246,6 +246,13 @@ export type RunResult = {
   readonly evaluationRefs?: readonly string[];
   readonly cost?: RunCost;
   readonly inspectionUrl?: string;
+  /**
+   * The most sensitive content the run's records name: `people` when they name a
+   * person's records, `restricted` when they name restricted evidence, else `internal`.
+   */
+  readonly sensitivity: "internal" | "restricted" | "people";
+  /** What the answer left out for this caller: `people` when it withheld a person's records. */
+  readonly hidden?: readonly string[];
 };
 
 // ---------------------------------------------------------------------------
@@ -348,6 +355,11 @@ export type Deployment = {
   readonly autostart?: boolean;
   readonly activatedBy?: string;
   readonly cmd?: string;
+  /**
+   * The agreement's delegation ceiling, copied from the build's IR when it was recorded.
+   * Read only from the active deployment; absent, nothing can be delegated.
+   */
+  readonly delegation?: Readonly<Record<string, unknown>>;
 };
 
 export type RetireStep = {

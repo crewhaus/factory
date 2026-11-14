@@ -521,8 +521,11 @@ export function ruleEndProblem(expiresAt: string, nowMs: number): string | undef
 
 /** One live standing rule, as `crewhaus approvals rules` lists it. */
 export type ListedRule = StandingRuleRow & { readonly verb: string };
-/** One request to the owner still waiting. */
-export type ListedProposal = ProposalRow & { readonly verbs: readonly string[] };
+/** One request to the owner for an `allow` rule, still waiting. */
+export type ListedProposal = ProposalRow & {
+  readonly terms: Extract<ProposalRow["terms"], { readonly ruleKind: "allow" }>;
+  readonly verbs: readonly string[];
+};
 
 export type RuleListing = {
   readonly rules: readonly ListedRule[];
@@ -583,8 +586,11 @@ export function createRules(decisions: Decisions, now: () => number): Rules {
           ...row,
           verb: `crewhaus approvals revoke ${row.id} --dir ${harnessDir}`,
         }));
+      // A request for a delegation rule is listed by `crewhaus delegations list`, which
+      // offers the consequences page: granting it here would make no rule.
       const proposals = rowsOf(readProposals(harnessDir), "The requests to the owner", unreadable)
         .filter((row) => proposalState(row, nowMs) === "pending")
+        .flatMap((row) => (row.terms.ruleKind === "allow" ? [{ ...row, terms: row.terms }] : []))
         .map((row) => ({
           ...row,
           verbs: [

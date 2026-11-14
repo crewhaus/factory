@@ -5,17 +5,25 @@
  * contract's `run` schema, and the ledger's fold shows no anomaly.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CANONICAL_RUN_ID_RE,
   type CursorPosition,
   EXECUTION_RUN_ID_RE,
+  mintId,
   mintRunId,
 } from "@crewhaus/control-contract";
 import { run as runSchema } from "@crewhaus/control-contract/schemas";
-import { append, foldStates, readPage } from "@crewhaus/control-records";
+import {
+  append,
+  controlPaths,
+  foldStates,
+  publishClaim,
+  readClaim,
+  readPage,
+} from "@crewhaus/control-records";
 import type { ProcessOps, SpawnRequest } from "./process-ops";
 import { RUN_LEDGER_DIR, runLedgerFor } from "./run-rows";
 import { writeRunfile } from "./runfiles";
@@ -81,6 +89,8 @@ function setup(
     readonly env?: string;
     /** Called inside the fake spawn, before the child exists. */
     readonly onSpawn?: (request: SpawnRequest) => void;
+    /** A run the control API queued: the plan starts it. */
+    readonly apiRun?: { readonly runId: string; readonly stdinFile?: string };
   } = {},
 ): Harness {
   const dir = tempHarness(target, options.env ?? "");
@@ -108,6 +118,7 @@ function setup(
         target,
         processEnv: {},
         ...(target === "channel" ? { ports: { port: 3000, controlPort: 3001 } } : {}),
+        ...(options.apiRun !== undefined ? { apiRun: options.apiRun } : {}),
       }),
     managerVersion: "0.9.0-test",
     newRunId: () => `run_${String(++seq).padStart(16, "0")}`,
@@ -384,5 +395,197 @@ describe("the sweep", () => {
     expect(rowsAt(h.dir)).toEqual([]);
     expect(existsSync(join(h.dir, RUN_LEDGER_DIR))).toBe(false);
     expect(existsSync(join(h.dir, ".crewhaus", "run", "control"))).toBe(false);
+  });
+});
+
+describe("a run the control API queued", () => {
+  const QUEUED = { kind: "api" } as const;
+  /** A queued API run and its input file, as the control service leaves them. */
+  function queueApiRun(dir: string, state = "queued"): { runId: string; stdinFile: string } {
+    const runId = mintRunId();
+    const inputs = join(dir, controlPaths(dir).inputsDir);
+    mkdirSync(inputs, { recursive: true });
+    const stdinFile = join(inputs, `${runId}.txt`);
+    writeFileSync(stdinFile, "Summarise the report.", { mode: 0o600 });
+    plant(dir, {
+      id: runId,
+      state: "queued",
+      trigger: QUEUED,
+      by: "sys:reconcile",
+      cmd: mintId("cmd"),
+    });
+    if (state === "waiting-for-approval") {
+      plant(dir, { id: runId, state: "preparing", trigger: QUEUED });
+      plant(dir, { id: runId, state: "running", trigger: QUEUED });
+      plant(dir, { id: runId, state: "waiting-for-approval", trigger: QUEUED });
+    } else if (state !== "queued") {
+      plant(dir, { id: runId, state: "running", trigger: QUEUED });
+    }
+    return { runId, stdinFile };
+  }
+  const inputsOf = (dir: string): string[] => {
+    const at = join(dir, controlPaths(dir).inputsDir);
+    return existsSync(at) ? readdirSync(at) : [];
+  };
+  async function startOn(
+    state: string,
+    prepare?: (dir: string, runId: string) => void,
+    onSpawn?: (dir: string) => void,
+  ) {
+    const dir = tempHarness("workflow");
+    const queued = queueApiRun(dir, state);
+    prepare?.(dir, queued.runId);
+    const clock = createFakeClock();
+    const ops = createFakeProcessOps({ now: clock.now });
+    const spawned: SpawnRequest[] = [];
+    const sup = createHarnessSupervisor({
+      harnessDir: dir,
+      target: "workflow",
+      ops: {
+        ...ops,
+        spawn: (request) => {
+          spawned.push(request);
+          onSpawn?.(dir);
+          return ops.spawn(request);
+        },
+      },
+      clock,
+      plan: () =>
+        buildSpawnPlan({ harnessDir: dir, target: "workflow", processEnv: {}, apiRun: queued }),
+      managerVersion: "0.9.0-test",
+      warn: () => undefined,
+    });
+    const result = await sup.start();
+    return { dir, ...queued, ops, sup, spawned, result };
+  }
+
+  test("preparing copies the queued trigger, names the execution and mints nothing; the child gets the run's id and origin", async () => {
+    let seenAtSpawn: Row[] = [];
+    const r = await startOn("queued", undefined, (dir) => {
+      seenAtSpawn = rowsAt(dir);
+    });
+    const { result, runId, stdinFile, dir } = r;
+    if (!result.ok)
+      throw new Error(
+        `start refused: ${result.reason} ${"error" in result ? result.error.message : ""}`,
+      );
+    expect(result.root).toBe(runId);
+    const ids = new Set(seenAtSpawn.map((row) => row["id"]));
+    expect([...ids]).toEqual([runId]);
+    expect(seenAtSpawn.map((row) => row["state"])).toEqual(["queued", "preparing"]);
+    const preparing = seenAtSpawn[1] as Row;
+    // What runtime-core's root check reads: the newest row is preparing and names this execution.
+    expect(preparing["execution"]).toBe(result.runId);
+    expect(preparing["trigger"]).toEqual(QUEUED);
+    const env = r.spawned[0]?.env ?? {};
+    expect(env["CREWHAUS_RUN_ID"]).toBe(runId);
+    expect(env["CREWHAUS_INPUT_ORIGIN"]).toBe("api");
+    expect(env["CREWHAUS_EXECUTION_ID"]).toBe(result.runId);
+    expect(r.spawned[0]?.stdinFile).toBe(stdinFile);
+    expect(readClaim(runLedgerFor(dir), `run/${runId}`).ok).toBe(true);
+    // The exit closes the API root, not a minted one; a terminal close removes the input.
+    const exited = nextExit(r.sup);
+    r.ops.last()?.exit(0);
+    await exited;
+    await r.sup.idle();
+    expect(statesOf(rowsAt(dir), runId)).toEqual(["queued", "preparing", "running", "succeeded"]);
+    expect(new Set(rowsAt(dir).map((row) => row["id"]))).toEqual(new Set([runId]));
+    expect(inputsOf(dir)).toEqual([]);
+    r.sup.close();
+  });
+
+  test("a run whose newest row is running is refused before the spawn", async () => {
+    const r = await startOn("running");
+    expect(r.result.ok).toBe(false);
+    expect(r.result.ok ? "" : r.result.reason).toBe("plan-failed");
+    expect(r.spawned).toHaveLength(0);
+    expect(statesOf(rowsAt(r.dir), r.runId)).toEqual(["queued", "running"]);
+    r.sup.close();
+  });
+
+  test("a queued run whose claim a cancel already holds is refused before the spawn", async () => {
+    const r = await startOn("queued", (dir, runId) => {
+      expect(publishClaim(runLedgerFor(dir), `run/${runId}`, { pid: 1, host: "h" }).ok).toBe(true);
+    });
+    expect(r.result.ok).toBe(false);
+    expect(r.spawned).toHaveLength(0);
+    expect(statesOf(rowsAt(r.dir), r.runId)).toEqual(["queued"]);
+    r.sup.close();
+  });
+
+  test("a resume of a parked run moves it to preparing; a park keeps the input, a terminal close removes it", async () => {
+    const r = await startOn("waiting-for-approval");
+    if (!r.result.ok) throw new Error(`start refused: ${r.result.reason}`);
+    expect(r.result.root).toBe(r.runId);
+    expect(r.spawned).toHaveLength(1);
+    const rows = rowsAt(r.dir).filter((row) => row["id"] === r.runId);
+    expect(rows.at(-1)?.["state"]).toBe("preparing");
+    expect(rows.at(-1)?.["execution"]).toBe(r.result.runId);
+    let exited = nextExit(r.sup);
+    r.ops.last()?.exit(36);
+    await exited;
+    await r.sup.idle();
+    expect(statesOf(rowsAt(r.dir), r.runId).at(-1)).toBe("waiting-for-approval");
+    expect(inputsOf(r.dir)).toEqual([`${r.runId}.txt`]);
+    // Resumed again and ended: the input goes.
+    const again = await r.sup.start();
+    expect(again.ok).toBe(true);
+    exited = nextExit(r.sup);
+    r.ops.last()?.exit(0);
+    await exited;
+    await r.sup.idle();
+    expect(statesOf(rowsAt(r.dir), r.runId).at(-1)).toBe("succeeded");
+    expect(inputsOf(r.dir)).toEqual([]);
+    r.sup.close();
+  });
+
+  test("the plan: argv is the closed vocabulary and the input text appears in neither argv nor env", () => {
+    const dir = tempHarness("cli");
+    const runId = mintRunId();
+    const inputFile = join(dir, controlPaths(dir).inputsDir, `${runId}.json`);
+    const plan = buildSpawnPlan({
+      harnessDir: dir,
+      target: "cli",
+      processEnv: {},
+      crewhausBin: "/bin/crewhaus",
+      apiRun: { runId, inputFile },
+    });
+    expect(plan.argv).toEqual([
+      "/bin/crewhaus",
+      "run",
+      join(dir, "crewhaus.yaml"),
+      "--input-file",
+      inputFile,
+    ]);
+    expect(plan.kind).toBe("job");
+    expect(plan.detached).toBe(true);
+    expect(plan.apiRun).toEqual({ runId });
+    expect(plan.env["CREWHAUS_INPUT_ORIGIN"]).toBe("api");
+    expect(() =>
+      buildSpawnPlan({
+        harnessDir: dir,
+        target: "cli",
+        processEnv: {},
+        apiRun: { runId, inputFile },
+      }),
+    ).toThrow("crewhaus");
+    expect(() =>
+      buildSpawnPlan({
+        harnessDir: dir,
+        target: "channel",
+        processEnv: {},
+        apiRun: { runId, inputFile },
+      }),
+    ).toThrow("starts no run");
+    const crew = tempHarness("crew");
+    writeFileSync(join(crew, "dist", "daemon.ts"), "// bundle\n");
+    const stdinFile = join(crew, "input.txt");
+    const crewPlan = buildSpawnPlan({
+      harnessDir: crew,
+      target: "crew",
+      processEnv: {},
+      apiRun: { runId, stdinFile },
+    });
+    expect(crewPlan.stdinFile).toBe(stdinFile);
   });
 });

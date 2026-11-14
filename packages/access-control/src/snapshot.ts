@@ -135,6 +135,19 @@ export function principalOf(snapshot: AccessSnapshot, id: string): PrincipalRow 
   return snapshot.principals.find((row) => row.id === id);
 }
 
+/**
+ * A service's scoped-token epoch: 0 for a principal that never bumped it, and for an
+ * unknown or removed one.
+ *
+ * First consumers: `mintScopedToken`, which writes it into the token, and
+ * `verifyScopedToken`, which refuses a token minted under a lower one.
+ */
+export function scopedEpochOf(snapshot: AccessSnapshot, principal: string): number {
+  const row = principalOf(snapshot, principal);
+  if (row === undefined || row.state !== "active") return 0;
+  return row.scopedEpoch ?? 0;
+}
+
 export function isActivePrincipal(snapshot: AccessSnapshot, id: string): boolean {
   return principalOf(snapshot, id)?.state === "active";
 }

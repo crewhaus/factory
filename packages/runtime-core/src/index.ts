@@ -322,6 +322,8 @@ import {
   storeFileRoots,
 } from "./state-roots";
 export { runSpecDirScope, runtimeStateRoots } from "./state-roots";
+/** Test seams of the API seed check, for a suite that drives a run entry from outside. */
+export { _resetInputOriginForTest, _setInputOriginClassifierForTest } from "./input-origin";
 import {
   type ServingModel,
   type ToolLimitVerdict,

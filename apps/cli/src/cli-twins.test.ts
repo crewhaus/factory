@@ -38,6 +38,7 @@ import {
   COMMAND_KINDS,
   OPERATIONS,
   mintId,
+  mintRunId,
   renderTwin,
 } from "@crewhaus/control-contract";
 import {
@@ -212,8 +213,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(48);
-    expect(pins).toBe(64);
+    expect(Object.keys(REQUIRED).length).toBe(56);
+    expect(pins).toBe(84);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -347,6 +348,7 @@ describe("the server's twins, by import", () => {
       crd: mintId("crd"),
       lnk: mintId("lnk"),
       cmd: mintId("cmd"),
+      run: mintRunId(),
     };
     const SAMPLES = [
       {
@@ -366,6 +368,7 @@ describe("the server's twins, by import", () => {
         until: "2026-12-01T09:00:00Z",
         deferReason: "scheduled",
         plugin: "notes-pane",
+        delegationAction: "merge",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -384,6 +387,7 @@ describe("the server's twins, by import", () => {
         until: "2026-12-01T09:00:00+01:00",
         deferReason: "other",
         plugin: "notes-pane",
+        delegationAction: "rollout",
       },
     ];
     const twins = [

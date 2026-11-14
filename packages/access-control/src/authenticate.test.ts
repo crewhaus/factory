@@ -506,3 +506,50 @@ describe("personal tokens", () => {
     ).toBe(false);
   });
 });
+
+describe("scoped tokens", () => {
+  test("a scoped token whose service's epoch moved on is refused as withdrawn", async () => {
+    const { homeFixture, ok } = await import("./test-helpers");
+    const { mintScopedToken } = await import("./scoped");
+    const fixture = await homeFixture();
+    const harness = fixture.addHarness("a");
+    const minted = ok(
+      await fixture.access.mintServiceToken(fixture.actor, {
+        service: "portal",
+        permissions: [],
+        harnesses: [harness.id],
+      }),
+    );
+    const scoped = await mintScopedToken(
+      fixture.root,
+      {
+        credential: minted.token.id,
+        refs: [`${harness.id}/run/run_0badcafe`],
+        acts: ["run.result.read"],
+      },
+      { now: fixture.clock.now },
+    );
+    if (!scoped.ok) throw new Error(scoped.message);
+    const signIn = openSignIn(fixture.root, { now: fixture.clock.now, localActor: LOCAL });
+    const check = () =>
+      authenticate(
+        request(bearer(scoped.token)),
+        LAN,
+        {},
+        { signIn, bootToken: undefined, now: fixture.clock.now },
+      );
+    // The grant carries the epoch it was minted under, so an open stream is checked by it too.
+    expect(await check()).toMatchObject({
+      kind: "principal",
+      principal: minted.principal,
+      via: "scoped",
+      scoped: { ep: 0 },
+    });
+    ok(await fixture.access.bumpScopedEpoch(fixture.actor, minted.principal));
+    const answer = await check();
+    expect(reasonOf(answer)).toBe("401 unauthenticated token_revoked");
+    expect(answer.kind === "refused" && answer.message).toBe(
+      "This link's access was withdrawn. Ask for a new one.",
+    );
+  });
+});
