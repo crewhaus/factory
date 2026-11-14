@@ -1,4 +1,4 @@
-import { HARNESS_COMMAND, TWINS } from "./shared.js";
+import { HARNESS_COMMAND, NOT_MODEL_BOUND, TWINS } from "./shared.js";
 
 export const CONTROL_OPERATIONS = [
   {
@@ -93,5 +93,6 @@ export const CONTROL_OPERATIONS = [
     noTwinReason:
       "`crewhaus retire` works from a spec path; this flow needs a typed name and a nonce.",
     qualifiers: [],
+    modelBound: { confirmName: NOT_MODEL_BOUND.name, nonce: NOT_MODEL_BOUND.nonce },
   },
 ] as const;

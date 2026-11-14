@@ -101,7 +101,9 @@ own key do. Their fold is tolerant: a torn line is skipped, never a reason to si
   run refs only, read acts only (`run.events.read`, `run.result.read`), each one the service may
   delegate on every ref's harness, for at most 15 minutes, signed with `access/keys/scoped.key` (0600).
   `verifyScopedToken` checks its MAC in constant time, its clock, and that the minting service token is
-  still live, so revoking that token ends every token it minted. Nothing about a token is stored.
+  still live, so revoking that token ends every token it minted. Each token carries the service's
+  scoped-token epoch it was minted under: `bumpScopedEpoch` moves the epoch up, which ends every scoped
+  token the service minted, on a request or on a stream it opened, while its own tokens stay live. Nothing about a token is stored.
 - **Domains and objects.** A domain's checker receives the object the request is about (`ref`) exactly
   as the caller named it, and no `ref` key at all when none was named: a checker that decides per object
   refuses then. `registerDomainIn` keeps every domain table to one set of rules.
@@ -120,7 +122,7 @@ own key do. Their fold is tolerant: a torn line is skipped, never a reason to si
 | Export | Does | First consumer |
 |---|---|---|
 | `ensureAccessSetUp(hangarRoot, {localActor, now?, displayName?})` | The bootstrap migration, idempotent and piece by piece: the owner, its `owner` grant over the whole Home, a `local` link from the OS user, and the bootstrap's digest | every mutating `crewhaus access` verb |
-| `openAccess(hangarRoot, {now?, harnesses?})` | A handle: `createInvite`, `grant`, `revoke`, `removeMember`, `link`, `unlink`, `mintServiceToken`, `sync`, `authorize`, `registerDomain`, `load` | `crewhaus access` |
+| `openAccess(hangarRoot, {now?, harnesses?})` | A handle: `createInvite`, `grant`, `revoke`, `removeMember`, `link`, `unlink`, `mintServiceToken`, `bumpScopedEpoch`, `sync`, `authorize`, `registerDomain`, `load` | `crewhaus access` |
 | `redeemInvite(hangarRoot, code, {now?, principal?})` | Spend an invite once: the claim on its end decides | the sign-in handle's `acceptInvite` |
 | `loadAccessSnapshot(hangarRoot)` | `absent` (no `access/`: one owner implied), `present` with a frozen snapshot, or `unreadable` naming the file | `crewhaus access members`, `tokens`, every mutation |
 | `authorize(snapshot, actor, permission, target, {now, domains?, ref?})` | Pure: `{allow: true, grant}` or `{allow: false, needs, role}`; a domain's checker gets `ref` unchanged | every mutating verb (`home.access.manage`), Home's choke point |
@@ -134,7 +136,8 @@ own key do. Their fold is tolerant: a torn line is skipped, never a reason to si
 | `ensureToken`, `tokenEquals`, `TOKEN_FILENAME`, `createBootTickets`, `BOOT_TICKET_TTL_MS` | Home's own key and the boot tickets, moved from hangar-server (which re-exports them for one release) | Home's boot |
 | `openSignIn(hangarRoot, {now?, localActor, harnesses?})` | The sign-in handle: boot tickets, exchange codes, challenges, `exchange`, `acceptInvite`, `signInWithDevice`, `refresh`, `signOut`, `verifyBearer`, `onEnd`, `checkSessions`, `scopedKey` | Home's sign-in routes |
 | `authenticate`, `hasForwardingHeaders`, `hostNameOf` | One request to at most one principal | Home's choke point |
-| `mintScopedToken`, `verifyScopedToken`, `SCOPED_TOKEN_TTL_MS`, `SCOPED_ACT_PERMISSIONS` | Scoped tokens for one run's reads | Home's route tests; `authenticate` |
+| `mintScopedToken`, `verifyScopedToken`, `SCOPED_TOKEN_TTL_MS`, `SCOPED_ACT_PERMISSIONS`, `scopedEpochOf`, `scopedEpochBumpRow` | Scoped tokens for one run's reads; a service's scoped-token epoch, and the one row that bumps it inside a change | Home's route tests; `authenticate` |
+| `queuedActorHolds(snapshot, {actor, credentialRef?}, permission, target, {now, domains?})` | Pure: whether a command's submitter may still do it when it is dispatched from its receipt; a receipt that names a credential is checked against exactly that credential | Home's re-check before a command is dispatched |
 | `noAuthRefusal(hangarRoot)` | Why `--no-auth` must not be used here, or nothing | `crewhaus hangar --no-auth` |
 | `rotateBootstrap(hangarRoot, {localActor, socketOnly?, tcp?, now?})` | Replace Home's own key | `crewhaus hangar rotate-token` |
 | `readOwnerSettings`, `writeOwnerBlock`, `SETTINGS_FILENAME`, `OWNER_BLOCKS` | The owner's settings blocks | Home's boot, `crewhaus access proxy` |

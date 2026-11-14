@@ -191,7 +191,23 @@ export type ControlClient = {
    * build does not enforce it.
    */
   reload(target: ControlTarget): Promise<ControlResult<ControlReloadBody>>;
+  /**
+   * Signal the abort of a run the daemon is running. A run it is not running, a parked
+   * one included, answers 404 `run_not_active`, read as `error` with that reason.
+   */
+  cancelRun(target: ControlTarget, runId: string): Promise<ControlResult<ControlCancelBody>>;
+  /**
+   * Wake the daemon's queued-runs follower now. A daemon with no follower answers 404
+   * `claim_unsupported`, read as `unsupported_by_bundle`.
+   */
+  claimRuns(target: ControlTarget): Promise<ControlResult<ControlClaimBody>>;
 };
+
+/** The `/control/v1/runs/{id}/cancel` body. */
+export type ControlCancelBody = { readonly runId: string; readonly cancelled: true };
+
+/** The `/control/v1/runs/claim` body. */
+export type ControlClaimBody = Readonly<Record<string, unknown>>;
 
 export const DEFAULT_CONTROL_TIMEOUT_MS = 5_000;
 
@@ -414,5 +430,11 @@ export function createControlClient(options: ControlClientOptions = {}): Control
         method: "POST",
         notFoundIsBundle: true,
       }),
+    cancelRun: (target, runId) =>
+      call<ControlCancelBody>(target, `/runs/${encodeURIComponent(runId)}/cancel`, {
+        method: "POST",
+      }),
+    claimRuns: (target) =>
+      call<ControlClaimBody>(target, "/runs/claim", { method: "POST", notFoundIsBundle: true }),
   };
 }

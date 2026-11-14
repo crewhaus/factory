@@ -1,4 +1,13 @@
-import { HARNESS_COMMAND, NO_RUNS_VERB, READ, STREAM_ONLY } from "./shared.js";
+import {
+  HARNESS_COMMAND,
+  NOT_MODEL_BOUND,
+  READ,
+  RUNS_CREATE_VERB,
+  RUNS_RESULT_VERB,
+  RUNS_RESUME_VERB,
+  STREAM_ONLY,
+  TWINS,
+} from "./shared.js";
 
 export const RUN_OPERATIONS = [
   {
@@ -9,8 +18,7 @@ export const RUN_OPERATIONS = [
     permission: "h.read",
     request: "listQuery",
     response: "runList",
-    cliTwin: null,
-    noTwinReason: NO_RUNS_VERB,
+    cliTwin: TWINS.runsList,
     qualifiers: ["creating-service"],
   },
   {
@@ -21,8 +29,7 @@ export const RUN_OPERATIONS = [
     permission: "h.read",
     request: "noBody",
     response: "run",
-    cliTwin: null,
-    noTwinReason: NO_RUNS_VERB,
+    cliTwin: TWINS.runsShow,
     qualifiers: ["creating-service"],
   },
   {
@@ -35,8 +42,12 @@ export const RUN_OPERATIONS = [
     request: "runCreateRequest",
     response: "runCreated",
     cliTwin: null,
-    noTwinReason: NO_RUNS_VERB,
+    noTwinReason: RUNS_CREATE_VERB,
     qualifiers: ["subject-assert"],
+    modelBound: {
+      input: { origin: "api", at: "run-entry" },
+      subject: NOT_MODEL_BOUND.subject,
+    },
   },
   {
     ...HARNESS_COMMAND,
@@ -45,8 +56,7 @@ export const RUN_OPERATIONS = [
     path: "/api/v1/runs/{run}/cancel",
     permission: "h.control",
     request: "emptyRequest",
-    cliTwin: null,
-    noTwinReason: NO_RUNS_VERB,
+    cliTwin: TWINS.runsCancel,
     qualifiers: ["creating-service"],
   },
   {
@@ -57,7 +67,7 @@ export const RUN_OPERATIONS = [
     permission: "h.run.submit",
     request: "emptyRequest",
     cliTwin: null,
-    noTwinReason: "`crewhaus runs resume` re-drives a cli session, not a hosted run.",
+    noTwinReason: RUNS_RESUME_VERB,
     qualifiers: ["creating-service"],
   },
   {
@@ -69,7 +79,7 @@ export const RUN_OPERATIONS = [
     request: "noBody",
     response: "runResult",
     cliTwin: null,
-    noTwinReason: NO_RUNS_VERB,
+    noTwinReason: RUNS_RESULT_VERB,
     qualifiers: [],
   },
   {

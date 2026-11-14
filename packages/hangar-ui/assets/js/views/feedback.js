@@ -496,7 +496,11 @@ function proposalRow(ctx, proposal, reload) {
       text: "Apply to the spec",
     });
     apply.addEventListener("click", async () => {
-      apply.disabled = true;
+      // Held with aria-disabled and this guard, never `disabled`: a disabled button
+      // drops focus to the page while the request runs, and the conflict view a 412
+      // opens gives focus back to this button when it closes.
+      if (apply.getAttribute("aria-disabled") === "true") return;
+      apply.setAttribute("aria-disabled", "true");
       const params = { id: ctx.id, adviceId: String(proposal.adviceId) };
       // The revision the preview read: the write is checked against it.
       await fire(
@@ -508,11 +512,11 @@ function proposalRow(ctx, proposal, reload) {
         {
           // The draft the server kept is what "Download my draft" saves.
           id: ctx.id,
-          opener: previewBtn,
+          opener: apply,
           retry: (rev) => call(api.adviceApply, params, { confirm: true, expectedRev: rev }),
         },
       );
-      apply.disabled = false;
+      apply.removeAttribute("aria-disabled");
     });
     holder.appendChild(el("div", { class: "editor-actions" }, [apply]));
   });

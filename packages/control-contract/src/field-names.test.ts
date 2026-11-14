@@ -73,6 +73,22 @@ describe("field names survive the masker", () => {
     expect(names.filter(isCredentialKey)).toEqual([]);
   });
 
+  test("the run fields and params added for the control API's runs survive the masker", () => {
+    for (const name of [
+      "sensitivity",
+      "hidden",
+      "idempotency",
+      "runId",
+      "inputFile",
+      "apiRun",
+      "stdinFile",
+    ]) {
+      expect(`${name} ${isCredentialKey(name)}`).toBe(`${name} false`);
+    }
+    // The name idempotency must never travel under: the masker eats it.
+    expect(isCredentialKey("idempotencyKey")).toBe(true);
+  });
+
   test("the names the masker would eat are not in use", () => {
     const seen = new Set<string>();
     for (const schema of Object.values(SCHEMAS)) walkFieldNames(schema, (name) => seen.add(name));

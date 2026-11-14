@@ -15,7 +15,7 @@ import { dirname, join } from "node:path";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ProviderAdapter, ProviderRequest } from "@crewhaus/adapter-anthropic";
 import { type ApproverProjection, mintId, mintRunId } from "@crewhaus/control-contract";
-import { append, controlPaths, foldStates } from "@crewhaus/control-records";
+import { append, controlPaths, foldStates, readPage } from "@crewhaus/control-records";
 import { RunFailedError } from "@crewhaus/errors";
 import { type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
 import {
@@ -807,6 +807,54 @@ describe("a supervised job's root scope", () => {
     const record = recordOf(parkedIdOf(parked));
     expect(record?.binding?.resumeScope).toBe(`run:${root}`);
     expect(record?.binding?.runId).toBe(parked.ctx.runId);
+  });
+
+  test("a root started again after its park continues its parked run: the grant is spent once, and nothing is asked again", async () => {
+    const ran: unknown[] = [];
+    const tools = [askedTool(ran)];
+    const root = mintRunId();
+    const at = () => new Date().toISOString();
+    const plantRoot = (state: string, execution: string) =>
+      expect(
+        append(runLedgerAt(harness), {
+          id: root,
+          state,
+          at: at(),
+          trigger: { kind: "api" },
+          execution,
+        }).ok,
+      ).toBe(true);
+    const first = `run_${randomBytes(8).toString("hex")}`;
+    plantRoot("queued", first);
+    plantRoot("preparing", first);
+    process.env["CREWHAUS_RUN_ID"] = root;
+    process.env["CREWHAUS_EXECUTION_ID"] = first;
+    const parked = await loop({ tools });
+    const id = parkedIdOf(parked);
+    expect(recordOf(id)?.binding?.runId).toBe(parked.ctx.runId);
+    // The job's process ends with the park; its supervisor closes the root parked.
+    plantRoot("waiting-for-approval", first);
+    const decided = await store.decide(
+      id,
+      { choice: "grant", actor: {} },
+      { authorize: allowSingleOwner },
+    );
+    expect(decided.outcome).toBe("decided");
+
+    // The resume: the root moves to preparing for a new execution, and the job runs again.
+    const second = `run_${randomBytes(8).toString("hex")}`;
+    plantRoot("preparing", second);
+    process.env["CREWHAUS_EXECUTION_ID"] = second;
+    const resumed = await loop({ tools });
+    expect(resumed.caught).toBeUndefined();
+    expect(ran).toEqual([{ x: 1 }]);
+    expect(resumed.events.filter((e) => e.kind === "approval_requested")).toHaveLength(0);
+    expect(recordOf(id)?.consumedByRun).toBe(resumed.ctx.runId);
+    // Its running row names the root and the run it continues.
+    const running = readPage(runLedgerAt(harness), { limit: 100 }).items.find(
+      (item) => item.record["id"] === resumed.ctx.runId && item.record["state"] === "running",
+    )?.record;
+    expect(running).toMatchObject({ parent: root, continues: parked.ctx.runId });
   });
 
   test("resumed before the grant, the re-park follows the new run, and the next resume spends the grant once", async () => {

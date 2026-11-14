@@ -1461,6 +1461,7 @@ import {
   RunsError,
   isRunsRunId,
   isRunsSessionId,
+  readRunInputRecord,
   resolveRunsResumeSpecPath,
   resolveRunsResumeTarget,
   runsResumeScope,
@@ -4442,6 +4443,21 @@ async function runRunCli(
     }
     oneShotPrompt = trimmed;
   }
+  // `--input-file <path>`: a run the control API started, one turn from its input record.
+  let inputSubject: string | undefined;
+  const inputFileFlag = args.flags["input-file"];
+  if (typeof inputFileFlag === "string") {
+    if (oneShotPrompt !== undefined) die("--input-file and --prompt are mutually exclusive");
+    if (ir.target !== "cli") die(`--input-file runs a cli harness (got "${ir.target}")`);
+    try {
+      const record = readRunInputRecord(inputFileFlag, process.cwd(), process.env);
+      oneShotPrompt = record.input;
+      inputSubject = record.subject;
+    } catch (err) {
+      if (err instanceof RunsError) die(err.message);
+      throw err;
+    }
+  }
 
   // Phase 3 §3.3 — the spec's `cli.banner`, printed on cold start. This used
   // to be codegen-only: a compiled bundle showed the brand, `crewhaus run`
@@ -5025,8 +5041,13 @@ async function runRunCli(
   // resume hint + the report's coded exit. Everything else propagates to
   // the `case "run"` catch → die() one-liner, exactly as before.
   let runFailure: RunFailedError | undefined;
+  // An input record's subject scopes the run: who it serves, never part of its prompt.
+  const runLoop = (loop: Parameters<typeof runChatLoop>[0]) =>
+    inputSubject === undefined
+      ? runChatLoop(loop)
+      : runWithScope({ subject: inputSubject }, () => runChatLoop(loop));
   try {
-    oneShotResult = await runChatLoop({
+    oneShotResult = await runLoop({
       model,
       instructions:
         mcpQuarantineNotice !== undefined
@@ -24025,19 +24046,17 @@ switch (subcommand) {
     }
     break;
   case "runs": {
-    // Loop contract 0.4 (Batch F, item 7, CLI half) — `runs resume <session>`
-    // re-drives a persisted session (the runtime half is runChatLoop's resume
-    // seam). `runs` is the run-lifecycle namespace (cf. the gateway's
-    // `runs.subscribe`); only `resume` is a CLI verb today.
-    const first = rest[0] ?? "";
-    const isHelp = first === "--help" || first === "-h";
-    if (!isHelp && first !== "resume") {
-      die(`runs action must be "resume" (got "${first}")`);
-    }
+    // A harness's runs and the run commands (./runs-cmd); `resume` is this file's.
     try {
-      await runRunsResume(parseFor(isHelp ? rest : rest.slice(1), RUNS_SCHEMA));
+      const { runRunsCommand } = await import("./runs-cmd");
+      const resume = (argv: readonly string[]) => runRunsResume(parseFor([...argv], RUNS_SCHEMA));
+      const out = await runRunsCommand(rest, { resume });
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
     } catch (err) {
       if (err instanceof CrewhausError) die(err);
+      if (err instanceof Error) die(err.message);
       throw err;
     }
     break;

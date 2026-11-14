@@ -246,6 +246,13 @@ export type RunResult = {
   readonly evaluationRefs?: readonly string[];
   readonly cost?: RunCost;
   readonly inspectionUrl?: string;
+  /**
+   * The most sensitive content the run's records name: `people` when they name a
+   * person's records, `restricted` when they name restricted evidence, else `internal`.
+   */
+  readonly sensitivity: "internal" | "restricted" | "people";
+  /** What the answer left out for this caller: `people` when it withheld a person's records. */
+  readonly hidden?: readonly string[];
 };
 
 // ---------------------------------------------------------------------------

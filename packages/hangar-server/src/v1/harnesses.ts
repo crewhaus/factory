@@ -17,6 +17,7 @@ import {
   readDeployments,
   readOperatorRecord,
 } from "@crewhaus/control-records";
+import { RUN_ADAPTER_SHAPES, runBundleRefusal } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
 import { pendingApprovalCount } from "../approvals";
 import { readTextCapped } from "../jsonl";
@@ -171,6 +172,41 @@ function fromDaemon(
     : { supported: false, reason: "This build does not support it.", verb: null };
 }
 
+/**
+ * `runs.create` for one harness, from the run adapter its shape has: a managed daemon
+ * answers for itself (a daemon that is not running is "unknown"); a job shape's build must
+ * be one that checks a run's input where the run starts; every other shape names its own
+ * intake.
+ */
+function runsCreateOf(
+  entry: HangarHarnessEntry,
+  dir: string | undefined,
+  status: DaemonStatus,
+  shape: CapabilityDescriptor | undefined,
+): CapabilityDescriptor {
+  const adapter = RUN_ADAPTER_SHAPES[entry.target as RunControlShape];
+  if (adapter === undefined || adapter === "daemon" || shape === undefined) {
+    return shape?.supported === false
+      ? shape
+      : {
+          supported: false,
+          reason: `A ${entry.target} harness does not start runs this way.`,
+          verb: null,
+        };
+  }
+  if (dir === undefined) return { supported: "unknown", reason: "The harness folder is missing." };
+  // The build is read first: a managed daemon that is offline still has a build on disk.
+  const old = runBundleRefusal(dir, entry.target);
+  if (old !== undefined) {
+    return { supported: false, reason: old.message, verb: old.verb ?? "crewhaus compile" };
+  }
+  if (adapter === "managed") {
+    if (!status.ok) return { supported: "unknown", reason: "The executor is offline." };
+    return fromDaemon("runs.create", shape, status);
+  }
+  return { supported: true };
+}
+
 const capabilities: V1Handler = async (ctx) => {
   const entry = harnessOf(ctx);
   const dir = liveDirOf(entry);
@@ -192,6 +228,16 @@ const capabilities: V1Handler = async (ctx) => {
       } as const);
     out[key] = fromDaemon(key, shape, status);
   }
+  // Starting a run: the adapter table decides, the one admission reads too.
+  out["runs.create"] = runsCreateOf(entry, dir, status, row?.["runs.create"]);
+  out["runs.clientRunId"] =
+    RUN_ADAPTER_SHAPES[entry.target as RunControlShape] === "managed"
+      ? fromDaemon("runs.clientRunId", undefined, status)
+      : {
+          supported: false,
+          reason: "Only a managed daemon takes a client's own run id.",
+          verb: null,
+        };
   const beat = dir === undefined ? undefined : heartbeatOf(dir);
   out["runs.ledger"] =
     beat?.runLedger === false

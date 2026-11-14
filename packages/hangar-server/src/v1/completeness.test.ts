@@ -46,10 +46,9 @@ describe("every operation is served exactly one way", () => {
     }
   });
 
-  test("the not-served map is exactly the runs, events and people operations", () => {
+  test("the not-served map is exactly a run's events, the event streams and the people operations", () => {
     const expected = OPERATIONS.filter(
-      (op) =>
-        op.id.startsWith("runs.") || op.id.startsWith("events.") || op.id.startsWith("people."),
+      (op) => op.id === "runs.events" || op.id.startsWith("events.") || op.id.startsWith("people."),
     ).map((op) => op.id);
     expect(Object.keys(V1_NOT_SERVED).sort()).toEqual(expected.sort());
     for (const reason of Object.values(V1_NOT_SERVED)) expect(reason).toMatch(/not served/);
@@ -95,12 +94,13 @@ describe("a not-served operation answers 501", () => {
 
   test("with its reason, and its twin when it has one", async () => {
     const h = await home.harness("alpha");
-    const res = await home.call("GET", `/api/v1/harnesses/${h.id}/runs`);
+    expect(h.id).toMatch(/^hrn_/);
+    const res = await home.call("GET", "/api/v1/people");
     expect(res.status).toBe(501);
     const error = res.body["error"] as Record<string, unknown>;
     expect(error["code"]).toBe("unsupported");
     expect(error["reason"]).toBe("not_served");
-    expect(error["message"]).toBe(V1_NOT_SERVED["runs.list"]);
+    expect(error["message"]).toBe(V1_NOT_SERVED["people.persons.list"]);
     // A not-served row with a twin names it, with the request's own params.
     const psn = "psn_01m76e6f05hp514w9j4v3qymka";
     const op = OPERATIONS.find((o) => o.id === "people.persons.get");

@@ -106,6 +106,13 @@ export {
   type VaultStateView,
 } from "./areas/people.js";
 export {
+  CREATION_MODULE,
+  type SpecEffectiveRow,
+  type SpecReadOnlyState,
+  type SpecSchemaIssue,
+  type SpecSchemaView,
+} from "./areas/creation.js";
+export {
   CHANGE_KINDS,
   CHANGE_REASONS,
   CHANGE_SOURCES,

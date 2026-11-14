@@ -5,8 +5,8 @@
  * secret, a name, a contact or a readable link subject: those live in `subjects.json`.
  *
  * Every field name tests false under the masker's `isCredentialKey` (`sha256`,
- * `prefixHint`, `subjectRef`, `contentRead`, `subjectAssert`), and `by` is always a stored
- * actor, never a raw `local:` id.
+ * `prefixHint`, `subjectRef`, `contentRead`, `subjectAssert`, `scopedEpoch`), and `by` is
+ * always a stored actor, never a raw `local:` id.
  */
 import {
   type Permission,
@@ -29,6 +29,11 @@ type RowBase = {
 export type PrincipalRow = RowBase & {
   readonly kind: PrincipalKind;
   readonly state: "active" | "removed";
+  /**
+   * A service's scoped-token epoch: a scoped token it minted under a lower one is refused.
+   * Absent means 0; only a service carries it, as a safe integer of at least 1.
+   */
+  readonly scopedEpoch?: number;
 };
 
 export type GrantRow = RowBase & {
@@ -133,7 +138,11 @@ const CHECKS: { readonly [K in keyof RowOf]: (row: Record<string, unknown>) => b
   principals: (row) =>
     base(row, "prn") &&
     (row["kind"] === "member" || row["kind"] === "service") &&
-    (row["state"] === "active" || row["state"] === "removed"),
+    (row["state"] === "active" || row["state"] === "removed") &&
+    optional(
+      row["scopedEpoch"],
+      (v) => row["kind"] === "service" && Number.isSafeInteger(v) && (v as number) >= 1,
+    ),
   grants: (row) =>
     base(row, "grt") &&
     isId("prn", row["principal"]) &&

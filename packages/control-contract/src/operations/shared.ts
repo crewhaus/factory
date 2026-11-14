@@ -57,11 +57,35 @@ export const TWINS = {
   accessUnlink: { argv: ["access", "unlink", "{lnk}"] },
   commandsShow: { argv: ["commands", "show", "{cmd}"] },
   commandsList: { argv: ["commands", "list", "--harness", "{hrn}"] },
+  runsList: { argv: ["runs", "list", "--harness", "{hrn}"] },
+  runsShow: { argv: ["runs", "show", "{run}", "--harness", "{hrn}"] },
+  runsCancel: { argv: ["runs", "cancel", "{run}", "--harness", "{hrn}"] },
 } as const;
 
 export const NO_VERB = "The CLI has no command for this.";
 export const API_ONLY = "Only API clients call this; the CLI needs no sign-in on its own machine.";
-export const NO_RUNS_VERB = "`crewhaus runs` only resumes a session.";
+/** Why starting a run through the API has no twin: the CLI reads its input from a file. */
+export const RUNS_CREATE_VERB =
+  "`crewhaus runs create <harness> --input-file <path>` starts a run from a file on Home's computer.";
+/** Why a run's result has no twin of its own. */
+export const RUNS_RESULT_VERB = "`crewhaus runs show <run>` shows how a run ended.";
+/** Why resuming a run through the API has no twin: the CLI resumes it by its id alone. */
+export const RUNS_RESUME_VERB = "`crewhaus runs resume <run>` resumes a run parked on a decision.";
+
+/** Why a free-text request field never reaches a model, by the field's job. */
+export const NOT_MODEL_BOUND = {
+  name: { none: true, reason: "Compared with the harness's name; no model reads it." },
+  nonce: {
+    none: true,
+    reason: "Matched against the nonce a dry run handed back; no model reads it.",
+  },
+  revision: { none: true, reason: "Compared with the decision's revision; no model reads it." },
+  note: { none: true, reason: "Kept for people; no model reads it." },
+  matched: { none: true, reason: "Matched against tool calls; no model reads it." },
+  subject: { none: true, reason: "Names who the work serves; no model reads it." },
+  signIn: { none: true, reason: "Checked by sign-in; no model reads it." },
+  label: { none: true, reason: "Shown to people; no model reads it." },
+} as const;
 /** Why a device sign-in step has no twin: `crewhaus login` runs both steps itself. */
 export const DEVICE_SIGN_IN =
   "`crewhaus login --server <url>` starts this sign-in and finishes it.";

@@ -6,6 +6,7 @@ import {
   CLI_VERBS,
   COMMAND_KINDS,
   CORE_MODULE,
+  CREATION_MODULE,
   OPERATIONS,
   PATH_PARAMS,
   PERMISSIONS,
@@ -899,8 +900,35 @@ describe("rows, pinned", () => {
     expect(coreRow("auth.acceptInvite").secretFields).toEqual(["code", "sessionSecret"]);
   });
 
-  test("no core row declares modelBound yet", () => {
-    expect(CORE.filter((op) => "modelBound" in op)).toEqual([]);
+  test("modelBound: the run input reaches a model at api on run entry, every other free text never", () => {
+    const declared = CORE.filter((op) => op.modelBound !== undefined).map((op) => [
+      op.id,
+      Object.keys(op.modelBound ?? {}).join(","),
+    ]);
+    expect(declared).toEqual([
+      ["controls.retire", "confirmName,nonce"],
+      ["runs.create", "input,subject"],
+      ["decisions.resolve", "expect,note"],
+      ["rules.create", "tool,pattern,reason"],
+      ["access.scopedTokens.mint", "subject"],
+      ["auth.session", "nonce,signature"],
+      ["auth.exchange", "code"],
+      ["auth.acceptInvite", "code,displayName"],
+      ["auth.device.lookup", "code"],
+      ["auth.device.decide", "code"],
+    ]);
+    expect(coreRow("runs.create").modelBound?.["input"]).toEqual({
+      origin: "api",
+      at: "run-entry",
+    });
+    for (const op of CORE) {
+      for (const [field, decl] of Object.entries(op.modelBound ?? {})) {
+        if (op.id === "runs.create" && field === "input") continue;
+        expect(`${op.id}.${field}: ${"none" in decl ? decl.none : "bound"}`).toBe(
+          `${op.id}.${field}: true`,
+        );
+      }
+    }
   });
 
   test("twins, every non-null one", () => {
@@ -921,6 +949,9 @@ describe("rows, pinned", () => {
       ["controls.restart", "daemon restart {hrn}"],
       ["controls.disable", "daemon disable {hrn}"],
       ["controls.enable", "daemon enable {hrn}"],
+      ["runs.list", "runs list --harness {hrn}"],
+      ["runs.get", "runs show {run} --harness {hrn}"],
+      ["runs.cancel", "runs cancel {run} --harness {hrn}"],
       ["decisions.get", "approvals show {appr} --dir {dir}"],
       ["decisions.resolve", "approvals {choice} {appr} --dir {dir}"],
       ["decisions.supersede", "approvals supersede {appr} --reason {supersedeReason} --dir {dir}"],
@@ -950,7 +981,13 @@ describe("rows, pinned", () => {
       "crewhaus approvals grant <id> --always",
     );
     expect(coreRow("runs.resume").cliTwin).toBeNull();
-    expect(coreRow("runs.resume").noTwinReason).toContain("cli session");
+    expect(coreRow("runs.resume").noTwinReason).toContain("crewhaus runs resume <run>");
+    expect(coreRow("runs.create").cliTwin).toBeNull();
+    expect(coreRow("runs.create").noTwinReason).toContain(
+      "crewhaus runs create <harness> --input-file <path>",
+    );
+    expect(coreRow("runs.result").cliTwin).toBeNull();
+    expect(coreRow("runs.result").noTwinReason).toContain("crewhaus runs show <run>");
   });
 
   test("idempotent command kinds", () => {
@@ -1121,5 +1158,28 @@ describe("device sign-in rows", () => {
     const polled = SCHEMAS["devicePolled"] as z.ZodTypeAny;
     expect(polled.safeParse({ state: "pending" }).success).toBe(true);
     expect(polled.safeParse({ state: "allowed" }).success).toBe(false);
+  });
+});
+
+describe("the creation area's rows", () => {
+  test("specs.schema reads one harness's spec schema, with no receipt and no twin", () => {
+    const op = row("specs.schema");
+    expect(op).toBeDefined();
+    expect([op.method, op.path, op.permission, op.receipt, op.idempotency]).toEqual([
+      "GET",
+      "/api/v1/harnesses/{h}/spec/schema",
+      "h.read",
+      "none",
+      "none",
+    ]);
+    expect([op.request, op.response]).toEqual(["noBody", "specSchemaView"]);
+    // No CLI command prints a schema, and a twin is never made up.
+    expect(op.cliTwin).toBeNull();
+    expect(op.noTwinReason).toBe("The CLI has no command for this.");
+    expect(op.qualifiers).toEqual([]);
+    expect(CREATION_MODULE.area).toBe("creation");
+    expect(CREATION_MODULE.operations.map((o) => o.id)).toEqual(["specs.schema"]);
+    // Not one of the core's own rows: the core's pins do not move.
+    expect(CORE.some((o) => o.id === "specs.schema")).toBe(false);
   });
 });

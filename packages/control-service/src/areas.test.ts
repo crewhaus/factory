@@ -71,6 +71,10 @@ describe("the composition", () => {
       "decisions.supersede",
       "deployments.activate",
       "rules.create",
+      // The run commands run inline; the sweep reads the run ledger.
+      "runs.cancel",
+      "runs.create",
+      "runs.resume",
     ]);
     // The decision kinds and the operator controls act on records alone: dispatched with
     // no supervisor.

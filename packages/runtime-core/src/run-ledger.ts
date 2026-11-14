@@ -47,7 +47,11 @@
  * and `CREWHAUS_EXECUTION_ID`. The value is honoured only when the ledger's
  * newest row for that id, in its newest 256 lines, is `queued` or `preparing`
  * for this execution; then the root's `running` row is written once and every
- * top-level loop names the root as its `parent`. A canonical run id that is not
+ * top-level loop names the root as its `parent`. A root that is started again
+ * after a park (a resume) has a top-level run still `waiting-for-approval` in
+ * those lines; every top-level loop it starts continues the newest such run,
+ * unless its context names the run it continues, so a grant decided for that
+ * park is spent by the resumed run. A canonical run id that is not
  * such a root is ignored with one warning, and the loops' rows use their own
  * ids. A value that is not shaped like a run id (a workflow's own durable-resume
  * key, which `target-workflow` documents setting here) is ignored silently.
@@ -122,6 +126,8 @@ type VerifiedRoot = {
   readonly trigger: Trigger;
   readonly execution: string;
   readonly workItem?: string;
+  /** The root's newest top-level run still parked: the run a resumed root's loops continue. */
+  readonly continues?: string;
 };
 
 /** One run this process has opened and not yet ended. */
@@ -137,6 +143,8 @@ type OpenRun = {
   readonly stopRollups: () => void;
   /** The scope its `running` row recorded: what a grant parked in it is bound to. */
   readonly resumeScope?: string;
+  /** The parked run it continues: the context's, else its verified root's parked run. */
+  readonly continues?: string;
   /** The verified root, work item and execution its `running` row recorded. */
   readonly parent?: string;
   readonly workItem?: string;
@@ -229,7 +237,7 @@ export function parkingRunIdOf(ctx: RunContext): string {
  * `continues`, so a call inside a sub-agent of a resumed run reads it from the top.
  */
 export function continuesOf(ctx: RunContext): string | undefined {
-  return openRunOf(ctx.runId)?.ctx.continues ?? ctx.continues;
+  return openRunOf(ctx.runId)?.continues ?? ctx.continues;
 }
 
 /**
@@ -261,7 +269,7 @@ export type RunFacts = {
 export function runFactsOf(ctx: RunContext, opts: RunRowsLoopOptions, sessionId: string): RunFacts {
   const run = openRuns.get(ctx.runId);
   if (run !== undefined) {
-    const continues = run.ctx.continues;
+    const continues = run.continues;
     return {
       trigger: run.trigger,
       ...(run.parent !== undefined ? { parent: run.parent } : {}),
@@ -380,6 +388,7 @@ export function openRunRows(args: {
     const trigger = ctx.trigger ?? root?.trigger ?? defaultTrigger(opts.sessionTarget);
     const resumeScope = ctx.resumeScope ?? defaultResumeScope(root, args.sessionId);
     const workItem = ctx.workItem ?? root?.workItem;
+    const continues = ctx.continues ?? root?.continues;
     const execution = executionId();
     const sessionAt = sessionBytes(args.sessionRootDir, args.sessionId);
     const written = append(ledger, {
@@ -391,7 +400,7 @@ export function openRunRows(args: {
       ...(sessionAt !== undefined ? { sessionAt } : {}),
       ...(resumeScope !== undefined ? { resumeScope } : {}),
       ...(root !== undefined ? { parent: root.id } : {}),
-      ...(ctx.continues !== undefined ? { continues: ctx.continues } : {}),
+      ...(continues !== undefined ? { continues } : {}),
       ...(workItem !== undefined ? { workItem } : {}),
       ...(execution !== undefined ? { execution } : {}),
       ...(args.subjectRef !== undefined ? { subjectRef: args.subjectRef } : {}),
@@ -411,6 +420,7 @@ export function openRunRows(args: {
       rollups,
       stopRollups: countRollups(args.bus, rollups),
       ...(resumeScope !== undefined ? { resumeScope } : {}),
+      ...(continues !== undefined ? { continues } : {}),
       ...(root !== undefined ? { parent: root.id } : {}),
       ...(workItem !== undefined ? { workItem } : {}),
       ...(execution !== undefined ? { execution } : {}),
@@ -685,25 +695,51 @@ function verifiedRoot(ledger: Ledger, logger: Logger): VerifiedRoot | undefined 
 
 function acceptRoot(ledger: Ledger, id: string, execution: string): VerifiedRoot | undefined {
   if (!CANONICAL_RUN_ID_RE.test(id) || !EXECUTION_RUN_ID_RE.test(execution)) return undefined;
-  let newest: Readonly<Record<string, unknown>> | undefined;
+  let items: ReadonlyArray<{ readonly record: Readonly<Record<string, unknown>> }>;
   try {
-    newest = readPage(ledger, { limit: ROOT_PAGE_LINES }).items.find(
-      (item) => item.record["id"] === id,
-    )?.record;
+    items = readPage(ledger, { limit: ROOT_PAGE_LINES }).items;
   } catch {
     return undefined;
   }
+  const newest = items.find((item) => item.record["id"] === id)?.record;
   if (newest === undefined) return undefined;
   const state = newest["state"];
   if (state !== "queued" && state !== "preparing") return undefined;
   if (newest["execution"] !== execution) return undefined;
   const workItem = newest["workItem"];
+  const continues = parkedChildOf(items, id);
   return {
     id,
     trigger: triggerOf(newest["trigger"]) ?? { kind: "cli" },
     execution,
     ...(isId("wi", workItem) ? { workItem: workItem as string } : {}),
+    ...(continues !== undefined ? { continues } : {}),
   };
+}
+
+/**
+ * The root's newest top-level run whose newest row is `waiting-for-approval`, in the
+ * same newest page the root was verified from: what a resumed root's loops continue, so
+ * a grant decided for its park is spent by the resumed run. `undefined` when the page
+ * shows none; the resumed run then asks again.
+ */
+function parkedChildOf(
+  items: ReadonlyArray<{ readonly record: Readonly<Record<string, unknown>> }>,
+  root: string,
+): string | undefined {
+  const newestState = new Map<string, unknown>();
+  const children: string[] = [];
+  for (const { record } of items) {
+    const runId = record["id"];
+    if (typeof runId !== "string") continue;
+    if (!newestState.has(runId)) newestState.set(runId, record["state"]);
+    if (record["state"] === "running" && record["parent"] === root && !children.includes(runId)) {
+      children.push(runId);
+    }
+  }
+  return children.find(
+    (child) => CANONICAL_RUN_ID_RE.test(child) && newestState.get(child) === "waiting-for-approval",
+  );
 }
 
 function triggerOf(value: unknown): Trigger | undefined {

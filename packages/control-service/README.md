@@ -159,6 +159,38 @@ with it: running, done, failed, cancelled (a running command that is cancelled i
 `cancelled`), and interrupted (`unknown`; a read-only job's is `failed`). A job row carries the
 command's id and who queued it (`commandId`, `by`).
 
+## Runs
+
+`runAdapterFor(target)` names the adapter that carries out a harness's runs, from one table
+(`RUN_ADAPTER_SHAPES`) that Home's `runs.create` capability reads too:
+
+| Shape | Adapter | How a run starts |
+|---|---|---|
+| cli | job | a `0600` record under `.crewhaus/run/control/inputs/`, then one `crewhaus run --input-file` job |
+| crew, workflow, graph | job | the input text in a `0600` file, read on stdin by one job |
+| managed | managed | queued for the daemon's follower under the tenant `home`, and the daemon woken |
+| every other shape | daemon | not started this way: the answer names the shape's own intake |
+
+Each operation is planned first (`createRun`, `cancelRun`, `resumeRun`): a refusal (the
+operator record, a build older than 0.9.0, a daemon that is not running, a run that ended)
+is answered before the command is accepted, so it writes nothing. The plan's effect runs
+once the receipt is written. A job's environment names its run (`CREWHAUS_RUN_ID`) and the
+origin of its input (`CREWHAUS_INPUT_ORIGIN=api`); its argv is a closed vocabulary.
+
+A cancel goes by the run's folded state: a queued run is cancelled once its claim is won
+(a run that already started is answered `running`); a running one is stopped by whoever
+holds it; a parked job run is cancelled with no daemon running, after what it waits on is
+withdrawn (`run-cancelled`, naming the run): the requests bound to it, to the top-level runs
+its job started under it (`childRunsOf`) and to the runs those continue. It and each of its
+parked runs end `cancelled`, so no id or session of theirs resumes. A parked managed run
+keeps its requests with its tenant, and is not cancelled here. A resume starts a parked job
+run the API started again under the same run once what it waited on is decided; the job's
+loops continue the run that parked, so the decided grant is spent once. The CLI twins are
+`crewhaus runs list|show|create|cancel|resume`.
+
+A repeated `Idempotency-Key` is answered before anything is planned: `commands.replayOf`
+reads the first receipt the key names, and writes nothing.
+
 ## Exits
 
 A CLI command refused by the control plane exits through `EXIT_FOR_ERROR` in `@crewhaus/control-contract`:

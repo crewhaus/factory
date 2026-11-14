@@ -25,10 +25,12 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gradersConfigHash, parseGradersConfig } from "@crewhaus/eval-grader";
 import { DELTA_090_KEYS } from "@crewhaus/spec-patch";
@@ -47,10 +49,13 @@ import {
   classifyPath,
   declaredPaths,
   effectiveConfig,
+  effectiveConfigOf,
   isAutoTunable,
   provenanceOf,
   registryDirName,
   renderDiff,
+  specSchemaView,
+  unknownKeyPaths,
 } from "./spec-edit";
 import { type TestServer, bootTestServer } from "./testkit";
 
@@ -399,6 +404,49 @@ describe("effective config", () => {
     expect(byPath.get("agent.model")?.source).toBe("declared");
     expect(byPath.get("compaction.threshold")?.source).toBe("default");
     expect(byPath.get("compaction.threshold")?.value).toBe(0.8);
+  });
+
+  test("the rows stop at 600 settings and say so; a 600-setting spec is whole", () => {
+    // Plain objects, not a parsed spec: a parse adds zod defaults, so it could never hold exactly 600.
+    const leaves = (n: number) =>
+      Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, i]));
+    const over = effectiveConfigOf({ block: leaves(601) }, "");
+    expect(over.rows).toHaveLength(600);
+    expect(over.truncated).toBe(true);
+    const exact = effectiveConfigOf({ block: leaves(600) }, "");
+    expect(exact.rows).toHaveLength(600);
+    expect(exact.truncated).toBe(false);
+    // The wrapper answers the same rows, and nothing counts them twice.
+    expect(effectiveConfig({ block: leaves(601) }, "")).toEqual(over.rows);
+  });
+
+  test("every row carries its segments, and a key holding a dot keeps them apart", () => {
+    const { rows } = effectiveConfigOf(
+      { models: { "claude-3.5": { tier: "fast" } }, name: "x" },
+      "name: x\n",
+    );
+    expect(rows.map((r) => r.segments)).toEqual([["models", "claude-3.5", "tier"], ["name"]]);
+    const dotted = rows.find((r) => r.segments.length === 3);
+    // The dotted path cannot say where the key ends; the segments can.
+    expect(dotted?.path).toBe("models.claude-3.5.tier");
+    expect(dotted?.path.split(".")).toHaveLength(4);
+  });
+
+  test("an absent spec's schema view says so, with the verb that makes one", async () => {
+    const dir = makeFixtureHarness(join(tmpdir(), `spec-view-${process.pid}-${Date.now()}`), {
+      noSpec: true,
+    });
+    const view = await specSchemaView({
+      entry: null,
+      harnessDir: dir,
+      adopted: false,
+      contain: (segments) => join(dir, ...segments),
+    });
+    expect(view["present"]).toBe(false);
+    expect(view["verb"]).toBe("crewhaus init");
+    expect(view["effectiveTruncated"]).toBe(false);
+    expect(view["effective"]).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test("a credential-carrying path renders redacted — the row's key is `value`, so the tree masker cannot see it", () => {
@@ -938,6 +986,82 @@ describe("the structured editor", () => {
       expect(body["ok"]).toBe(false);
       expect(body["code"]).toBe("edit_rejected");
       expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  type Issue = { path: string[]; message: string; code: string | null };
+  const issuesOf = (body: Record<string, unknown>): Issue[] => body["issues"] as Issue[];
+
+  test("an invalid edit is refused with the edited text's issues", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "edited-issues");
+      const id = await register(t, dir);
+      const before = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
+      const { status, body } = await t.api(
+        `/api/h/${id}/spec`,
+        put({ edits: [{ path: ["agent", "max_tokens"], value: "many" }], expectedRev: revOf(dir) }),
+      );
+      expect(status).toBe(200);
+      expect(body["code"]).toBe("edit_rejected");
+      // The spec as it was has no issue; the one named is the edit's.
+      const issues = issuesOf(body);
+      expect(issues.map((i) => `${i.path.join(".")} ${i.code}`)).toEqual([
+        "agent.max_tokens invalid_type",
+      ]);
+      expect(body["schemaSource"]).toBe("manager");
+      expect(String(body["schemaNote"])).toContain(`crewhaus harness adopt ${id}`);
+      expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("an added unknown key is refused naming it, by the write and by its preview", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "edited-unknown");
+      const id = await register(t, dir);
+      const edits = [{ path: ["agent", "zz_new"], value: 1 }];
+      const { body } = await t.api(
+        `/api/h/${id}/spec`,
+        put({ edits, confirmName: "spec-edit-fixture", expectedRev: revOf(dir) }),
+      );
+      expect(body["code"]).toBe("edit_rejected");
+      const [issue] = issuesOf(body);
+      expect(issue?.path).toEqual(["agent"]);
+      expect(issue?.code).toBe("unrecognized_keys");
+      expect(issue?.message).toContain("zz_new");
+      expect(unknownKeyPaths(issuesOf(body))).toContain("agent.zz_new");
+      // The preview the review step and the JSON pane read first says the same.
+      const diff = await t.api(`/api/h/${id}/spec/diff`, post({ edits }));
+      expect(diff.body["ok"]).toBe(false);
+      expect(diff.body["code"]).toBe("edit_rejected");
+      expect(issuesOf(diff.body)).toEqual(issuesOf(body));
+      expect(diff.body["schemaSource"]).toBe("manager");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a batch that does not apply even as YAML answers the issues of the spec as it was", async () => {
+    const t = boot();
+    try {
+      // A spec that already carries one issue, so the answer can be told apart from none.
+      const dir = specHarness(t, "edited-fallback", VALID_SPEC.replace("4096", "-5"));
+      const id = await register(t, dir);
+      const { body } = await t.api(
+        `/api/h/${id}/spec`,
+        put({
+          edits: [{ path: ["agent", "model", "x"], value: "y" }],
+          confirmName: "spec-edit-fixture",
+          expectedRev: revOf(dir),
+        }),
+      );
+      expect(body["code"]).toBe("edit_rejected");
+      expect(issuesOf(body).map((i) => i.path.join("."))).toEqual(["agent.max_tokens"]);
     } finally {
       await t.stop();
     }
@@ -1998,6 +2122,97 @@ describe("a whole step on the editor", () => {
       );
       expect(confirmed.status).toBe(200);
       expect(readFileSync(specPath, "utf8")).toContain("Bash");
+    } finally {
+      await t.stop();
+    }
+  });
+});
+
+describe("the settings form never writes back a value Home served masked", () => {
+  type FormNode = {
+    segments: string[];
+    kind: string;
+    seed?: unknown;
+    paneSeed?: unknown;
+    hidden: string[];
+    writeOnly: boolean;
+  };
+  type Form = {
+    formModel(schema: unknown, effective: unknown, trust: unknown): { groups: FormNode[] };
+    flatten(groups: FormNode[]): FormNode[];
+    fieldEdit(node: FormNode, input: unknown): { path: string[]; value?: unknown } | null;
+    carriesMasked(value: unknown): boolean;
+  };
+  type Pane = {
+    editsFor(path: readonly string[], text: string): { ok: boolean; edits?: unknown[] };
+  };
+  const ui = (rel: string) => new URL(`../../hangar-ui/assets/js/${rel}`, import.meta.url).href;
+
+  test("a .env value the spec also holds: its block's pane has no seed, and no edit built from the read reaches disk", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "scrubbed-seed");
+      // The harness's .env holds the spec's model string, so the scrubber names it.
+      writeFileSync(join(dir, ".env"), "FIXTURE_MODEL=anthropic/claude-sonnet-4\n");
+      const specPath = join(dir, "crewhaus.yaml");
+      const before = readFileSync(specPath, "utf8");
+      const id = await register(t, dir);
+      const read = await t.api(`/api/h/${id}/spec/schema`);
+      expect(read.status).toBe(200);
+      const trust = await t.api(`/api/h/${id}/spec/trust`);
+      const effective = read.body["effective"] as Array<{ path: string; value: unknown }>;
+      // Anti-vacuity: the read really came back scrubbed.
+      expect(effective.find((r) => r.path === "agent.model")?.value).toBe("«FIXTURE_MODEL»");
+
+      const form = (await import(ui("ui/schema-form.js"))) as Form;
+      const pane = (await import(ui("views/spec-edit.js"))) as Pane;
+      const model = form.formModel(read.body["schema"], effective, trust.body["paths"] ?? []);
+      const nodes = form.flatten(model.groups);
+      const at = (path: string) => nodes.find((n) => n.segments.join(".") === path) as FormNode;
+
+      const agent = at("agent");
+      expect(agent.kind).toBe("group");
+      expect(agent.writeOnly).toBe(true);
+      expect(agent.paneSeed).toBeUndefined();
+      expect(agent.hidden).toEqual(["agent.model"]);
+      // The masked read, with one setting changed, is what the pane would have sent.
+      const tampered = { ...(agent.seed as Record<string, unknown>), max_tokens: 2000 };
+      expect(pane.editsFor(["agent"], JSON.stringify(tampered)).ok).toBe(false);
+      // The model's own control starts empty and sends nothing from the read.
+      const modelNode = at("agent.model");
+      expect(modelNode.writeOnly).toBe(true);
+      expect(form.fieldEdit(modelNode, modelNode.seed)).toBeNull();
+      expect(form.fieldEdit(modelNode, "")).toBeNull();
+
+      // Every control, saved as it starts, sends nothing; one changed beside it saves alone.
+      for (const node of nodes) {
+        const start = node.writeOnly ? "" : node.seed;
+        const edit = form.fieldEdit(node, typeof start === "number" ? String(start) : start);
+        expect(`${node.segments.join(".")} ${edit === null}`).toBe(
+          `${node.segments.join(".")} true`,
+        );
+      }
+      const edit = form.fieldEdit(at("agent.max_tokens"), "2000");
+      expect(edit).toEqual({ path: ["agent", "max_tokens"], value: 2000 });
+      expect(form.carriesMasked(edit)).toBe(false);
+      const preview = await t.api(`/api/h/${id}/spec/diff`, post({ edits: [edit] }));
+      expect(preview.status).toBe(200);
+      const wrote = await t.api(
+        `/api/h/${id}/spec`,
+        put({
+          edits: [edit],
+          expectedRev: String(preview.body["rev"] ?? read.body["rev"]),
+          ...(preview.body["autoApplicable"] === true
+            ? {}
+            : { confirmName: String(preview.body["confirmName"]) }),
+        }),
+      );
+      expect(wrote.status).toBe(200);
+      const after = readFileSync(specPath, "utf8");
+      expect(after).toContain("max_tokens: 2000");
+      expect(after).toContain("model: anthropic/claude-sonnet-4");
+      expect(after.includes("«")).toBe(false);
+      expect(after).toBe(before.replace("max_tokens: 4096", "max_tokens: 2000"));
     } finally {
       await t.stop();
     }

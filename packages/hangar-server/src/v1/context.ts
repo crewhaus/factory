@@ -6,7 +6,9 @@
 import type { DeviceRequests } from "@crewhaus/access-control";
 import type { OperationRow, ReceiptVia } from "@crewhaus/control-contract";
 import type { ControlService } from "@crewhaus/control-service";
+import type { ControlClient, ControlTarget } from "@crewhaus/gateway-protocol/control-client";
 import type { HangarHarnessEntry, HangarRegistry } from "@crewhaus/harness-registry";
+import type { ApiRunInput, StartResult } from "@crewhaus/harness-supervisor";
 import type { HomeAccess, RequestAccess } from "../access";
 import type { TextScrubber } from "../mask";
 
@@ -35,6 +37,16 @@ export type V1Deps = {
   readonly daemonState: (entry: HangarHarnessEntry) => Promise<DaemonState>;
   /** The daemon's own control status, when one is reachable. */
   readonly daemonStatus: (entry: HangarHarnessEntry) => Promise<DaemonStatus>;
+  /**
+   * Start one job for a run the control API queued, through Home's supervisor: its plan
+   * passes `apiRun`. Absent: Home starts no jobs, and a job run is refused.
+   */
+  readonly startRunJob?: (entry: HangarHarnessEntry, apiRun: ApiRunInput) => Promise<StartResult>;
+  /** Stop the job a run Home started is running in; `false` when Home holds none for it. */
+  readonly stopRunJob?: (entry: HangarHarnessEntry, runId: string) => Promise<boolean>;
+  /** The control client Home reaches daemons with, and where a harness's daemon listens. */
+  readonly controlClient?: ControlClient;
+  readonly controlTarget?: (entry: HangarHarnessEntry) => Promise<ControlTarget>;
   /** Stop a harness's daemon the way `crewhaus daemon stop` does, for retire. */
   readonly stopDaemon: (entry: HangarHarnessEntry) => Promise<{
     readonly ok: boolean;
@@ -58,6 +70,8 @@ export type V1Context = {
   readonly via: ReceiptVia;
   /** The caller as a receipt's actor: a `prn_`, or absent for Home's own OS user. */
   readonly actor?: string;
+  /** The credential (`crd_…`) the caller authenticated with, when it used one. */
+  readonly credentialRef?: string;
   /** Every area's ref resolvers, by kind. */
   readonly refResolvers: ReadonlyMap<string, RefResolver>;
   /** Every area's capability providers. */

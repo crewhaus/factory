@@ -1,4 +1,4 @@
-import { HARNESS_COMMAND, READ, TWINS } from "./shared.js";
+import { HARNESS_COMMAND, NOT_MODEL_BOUND, READ, TWINS } from "./shared.js";
 
 export const RULE_OPERATIONS = [
   {
@@ -23,6 +23,11 @@ export const RULE_OPERATIONS = [
     noTwinReason:
       "A standing rule is made from a decision: `crewhaus approvals grant <id> --always`.",
     qualifiers: ["human-only"],
+    modelBound: {
+      tool: NOT_MODEL_BOUND.matched,
+      pattern: NOT_MODEL_BOUND.matched,
+      reason: NOT_MODEL_BOUND.note,
+    },
   },
   {
     ...HARNESS_COMMAND,

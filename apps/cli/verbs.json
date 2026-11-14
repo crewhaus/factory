@@ -9230,15 +9230,75 @@
         {
           "name": "ignore-pause",
           "takesValue": false
+        },
+        {
+          "name": "input-file",
+          "takesValue": true
         }
       ]
     },
     {
       "verb": "runs",
-      "kind": "legacy",
+      "kind": "family",
       "since": "0.8.0",
       "status": "stable",
       "sub": {
+        "list": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "limit",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "create": {
+          "flags": [
+            {
+              "name": "input-file",
+              "takesValue": true
+            },
+            {
+              "name": "admission",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "cancel": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
         "resume": {
           "flags": [
             {
@@ -9299,75 +9359,12 @@
             },
             {
               "name": "help",
-              "short": "h",
               "takesValue": false
             }
           ]
         }
       },
-      "flags": [
-        {
-          "name": "spec",
-          "takesValue": true
-        },
-        {
-          "name": "model",
-          "takesValue": true
-        },
-        {
-          "name": "permission-mode",
-          "takesValue": true
-        },
-        {
-          "name": "ask-mode",
-          "takesValue": true
-        },
-        {
-          "name": "prompt",
-          "takesValue": true
-        },
-        {
-          "name": "justification-judge",
-          "takesValue": true
-        },
-        {
-          "name": "no-justification-audit",
-          "takesValue": false
-        },
-        {
-          "name": "egress-matcher",
-          "takesValue": true
-        },
-        {
-          "name": "egress-embedder",
-          "takesValue": true
-        },
-        {
-          "name": "budget-usd",
-          "takesValue": true
-        },
-        {
-          "name": "streaming",
-          "takesValue": false
-        },
-        {
-          "name": "trace",
-          "takesValue": true
-        },
-        {
-          "name": "user",
-          "takesValue": true
-        },
-        {
-          "name": "no-mcp-quarantine",
-          "takesValue": false
-        },
-        {
-          "name": "help",
-          "short": "h",
-          "takesValue": false
-        }
-      ]
+      "flags": null
     },
     {
       "verb": "sandbox",

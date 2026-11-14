@@ -16,7 +16,7 @@
  * registered by the area that performs it.
  */
 import type { CommandReceipt } from "../commands.js";
-import { HARNESS_COMMAND, READ } from "../operations/shared.js";
+import { HARNESS_COMMAND, NOT_MODEL_BOUND, READ } from "../operations/shared.js";
 import { deepFreeze } from "../util.js";
 import type { AreaModule } from "./types.js";
 
@@ -476,6 +476,7 @@ export const DELEGATION_MODULE = {
       cliTwin: null,
       noTwinReason: TURN_ON,
       qualifiers: ["human-only"],
+      modelBound: { confirm: NOT_MODEL_BOUND.name },
     },
     {
       ...HARNESS_COMMAND,
@@ -499,6 +500,7 @@ export const DELEGATION_MODULE = {
       cliTwin: null,
       noTwinReason: TURN_ON,
       qualifiers: ["human-only"],
+      modelBound: { confirm: NOT_MODEL_BOUND.name },
     },
     {
       ...HARNESS_COMMAND,
@@ -511,6 +513,7 @@ export const DELEGATION_MODULE = {
       cliTwin: null,
       noTwinReason: TURN_ON,
       qualifiers: ["human-only"],
+      modelBound: { confirm: NOT_MODEL_BOUND.name },
     },
     {
       ...HARNESS_COMMAND,

@@ -274,6 +274,7 @@ export const commandReceipt = z
     kind: z.string().refine((kind) => isCommandKind(kind), "unknown command kind"),
     target: refString,
     actor: storedActor,
+    credentialRef: credentialId.optional(),
     via: oneOf(RECEIPT_VIA),
     dedupeRef: z.string().optional(),
     fingerprint: z.string(),
@@ -344,6 +345,8 @@ export const runResult = z
     evaluationRefs: z.array(z.string()).optional(),
     cost: runCost.optional(),
     inspectionUrl: z.string().optional(),
+    sensitivity: z.enum(["internal", "restricted", "people"]),
+    hidden: z.array(z.string()).optional(),
   })
   .passthrough();
 

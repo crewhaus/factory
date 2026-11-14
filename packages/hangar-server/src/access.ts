@@ -46,6 +46,7 @@ import {
   loadAccessSnapshot,
   recordUsage,
   registerDomainIn,
+  scopedEpochOf,
 } from "@crewhaus/access-control";
 import {
   PERMISSION_DECLS,
@@ -479,6 +480,11 @@ export type AuthorizeRequestInput = {
    * device or link (or its own part of a list), which `self.preferences` covers.
    */
   readonly selfScope?: true;
+  /**
+   * For a versioned-API row qualified `creating-service`: who started the run it names (a
+   * run list: the caller itself). A service whose principal it is may act on that run.
+   */
+  readonly runBy?: string;
   /** The request's `Origin` header. */
   readonly origin?: string | null;
   /** Whether an origin is Home's own. */
@@ -571,6 +577,10 @@ export function authorizeRequest(input: AuthorizeRequestInput): RequestAuthoriza
   }
   const verdict = authorizeCaller(caller, view, row.permission, target, ref);
   if (verdict.allow) return { allow: true };
+  // The service that started a run acts on it, whatever else it holds.
+  if (input.runBy !== undefined && caller.via === "service" && caller.principal === input.runBy) {
+    return { allow: true };
+  }
   if ("reason" in verdict) return { allow: false, refusal: TAB_ONLY_REFUSAL };
   return {
     allow: false,
@@ -587,8 +597,15 @@ function authorizeScoped(input: AuthorizeRequestInput): RequestAuthorization {
   const { row, params, caller, view } = input;
   const scoped = caller.scoped as ScopedGrant;
   const refused = { allow: false, refusal: SCOPED_REFUSAL } as const;
-  // Its end is checked here too, so a stream it opened closes when it ends.
+  // Its end and its service's epoch are checked here too, so a stream it opened closes when
+  // it ends or when its service's scoped tokens are ended.
   if (view.now >= scoped.exp) return refused;
+  if (
+    view.read.state !== "present" ||
+    scoped.ep < scopedEpochOf(view.read.snapshot, caller.principal)
+  ) {
+    return refused;
+  }
   if (row.method !== "GET" || row.scopedAct === undefined || row.ref === undefined) return refused;
   if (!scoped.acts.includes(row.scopedAct)) return refused;
   if (

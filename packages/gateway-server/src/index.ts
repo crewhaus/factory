@@ -65,7 +65,7 @@ import {
 } from "@crewhaus/gateway-protocol/body-limit";
 import { withInboundContent } from "@crewhaus/run-context";
 import { type Tenant, buildTenant, validateTenantId, withTenant } from "@crewhaus/tenancy";
-import { GatewayCodedError, isManagedRunHandler } from "./coded";
+import { GatewayCodedError, clientRunIdsOf, isManagedRunHandler } from "./coded";
 
 export { GatewayCodedError, MANAGED_RUN_HANDLER, isManagedRunHandler } from "./coded";
 
@@ -487,7 +487,12 @@ function intakeRefusalOf(
 }
 
 /** The wire codes a {@link GatewayCodedError} may answer with. */
-const CODED_ERRORS: ReadonlySet<string> = new Set([ErrorCode.InputBlocked, ErrorCode.Unsupported]);
+const CODED_ERRORS: ReadonlySet<string> = new Set([
+  ErrorCode.InputBlocked,
+  ErrorCode.Unsupported,
+  ErrorCode.BadRequest,
+  ErrorCode.Conflict,
+]);
 
 /**
  * A handler's coded refusal: a `GatewayCodedError` whose code is one
@@ -776,7 +781,7 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
       }
       const claims = verifyJwt(bearer, opts.jwtSecret, now);
       const tenant = tenantFor(claims);
-      const decoded = decodeRequest(envelope);
+      const decoded = decodeRequest(envelope, { clientRunIds: clientRunIdsOf(opts.handler) });
       id = decoded.id;
       // New work enters only while the operator record admits it: refused here,
       // before the SLO gate, with no reservation, classification, audit line or
@@ -923,7 +928,7 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
       }
       const claims = verifyJwt(bearer, opts.jwtSecret, now);
       const tenant = tenantFor(claims);
-      const decoded = decodeRequest(envelope);
+      const decoded = decodeRequest(envelope, { clientRunIds: clientRunIdsOf(opts.handler) });
       id = decoded.id;
       if (decoded.method !== "runs.subscribe") {
         return errorResponse(
@@ -1109,6 +1114,8 @@ export function statusFor(code: string): number {
       return 503;
     case ErrorCode.Unsupported:
       return 501;
+    case ErrorCode.Conflict:
+      return 409;
     default:
       return 200;
   }
@@ -1126,9 +1133,10 @@ export function statusFor(code: string): number {
  *   - a `RunFailedError` whose report class is `paused` or `disabled` (a loop
  *     the runtime refused at its start) → that code, as `handleEnvelope`
  *     answers it
- *   - a `GatewayCodedError` with `input_blocked` or `unsupported` (a
- *     managed-runs handler that recorded a refused input, or a method this
- *     daemon does not serve) → that code, its message and its data
+ *   - a `GatewayCodedError` with `input_blocked`, `unsupported`,
+ *     `bad_request` or `conflict` (a managed-runs handler that recorded a
+ *     refused input, a method this daemon does not serve, params it refuses,
+ *     or a run handle already taken) → that code, its message and its data
  *   - anything else → `internal_error`
  *
  * For any other handler `handleEnvelope` answers `input_blocked` itself,

@@ -69,6 +69,16 @@ describe("command kinds", () => {
   });
 });
 
+describe("the credential a receipt names", () => {
+  test("a receipt names a credential id, and only one", () => {
+    const credentialRef = "crd_0123456789abcdefghjkmnpqrs";
+    expect(parse({ ...RECEIPT, credentialRef })).toBe(true);
+    expect(parse({ ...RECEIPT, credentialRef: "prn_0123456789abcdefghjkmnpqrs" })).toBe(false);
+    expect(parse({ ...RECEIPT, credentialRef: "" })).toBe(false);
+    expect(parse(RECEIPT)).toBe(true);
+  });
+});
+
 describe("exits", () => {
   test("every error code has an exit, and nothing else does", () => {
     expect(Object.keys(EXIT_FOR_ERROR).sort()).toEqual(Object.keys(ERROR_CODES).sort());

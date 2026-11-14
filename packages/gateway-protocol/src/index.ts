@@ -25,6 +25,7 @@
  * `target-managed` (F2 — codegen).
  */
 
+import { CANONICAL_RUN_ID_RE } from "@crewhaus/control-contract";
 import { CrewhausError } from "@crewhaus/errors";
 import { z } from "zod";
 import { ProofBundle } from "./proof";
@@ -82,11 +83,14 @@ export type ResponseEnvelopeT = z.infer<typeof ResponseEnvelope>;
 // Method-specific schemas.
 // ---------------------------------------------------------------------------
 
+/** The longest `sessionId` a run request carries; a session id is far shorter. */
+export const SESSION_ID_MAX = 64;
+
 export const RunsCreateParams = z
   .object({
     spec: z.string().min(1),
     input: z.string(),
-    sessionId: z.string().min(1).optional(),
+    sessionId: z.string().min(1).max(SESSION_ID_MAX).optional(),
   })
   .strict();
 /**
@@ -114,10 +118,35 @@ export type RunsCreateResultT = z.infer<typeof RunsCreateResult>;
 
 export const RunsContinueParams = z
   .object({
-    sessionId: z.string().min(1),
+    sessionId: z.string().min(1).max(SESSION_ID_MAX),
     input: z.string(),
   })
   .strict();
+
+/**
+ * A client's own handle on a run: `idempotency`, 1-128 of `A-Z a-z 0-9 . _ : -`, makes a
+ * repeated request answer the run the first one started, and `runId`, a canonical run id
+ * (`run_` and 26 characters), names the run instead of the daemon minting one. Taken only
+ * by a daemon whose `/status` lists `runs.clientRunId`; elsewhere the params stay strict
+ * and both are refused.
+ */
+const clientRunFields = {
+  idempotency: z
+    .string()
+    .regex(/^[A-Za-z0-9._:-]{1,128}$/, "idempotency is 1-128 of A-Z a-z 0-9 . _ : -")
+    .optional(),
+  runId: z
+    .string()
+    .regex(CANONICAL_RUN_ID_RE, "runId must be a crewhaus run id: run_ and 26 characters")
+    .optional(),
+} as const;
+
+/** {@link RunsCreateParams} with a client's own run handle, for a daemon that lists `runs.clientRunId`. */
+export const RunsCreateParamsClientRun = RunsCreateParams.extend(clientRunFields).strict();
+/** {@link RunsContinueParams} with a client's own run handle, for a daemon that lists `runs.clientRunId`. */
+export const RunsContinueParamsClientRun = RunsContinueParams.extend(clientRunFields).strict();
+export type RunsCreateParamsClientRunT = z.infer<typeof RunsCreateParamsClientRun>;
+export type RunsContinueParamsClientRunT = z.infer<typeof RunsContinueParamsClientRun>;
 /** Same shape as {@link RunsCreateResult}: `reply`, and `proof` under `provability:`. */
 export const RunsContinueResult = z
   .object({
@@ -258,7 +287,24 @@ const PARAM_SCHEMAS: Record<MethodT, z.ZodType<unknown>> = {
   "feedback.submit": FeedbackSubmitParams,
 };
 
-export function decodeRequest(raw: unknown): RequestEnvelopeT & { method: MethodT } {
+/** How a request is decoded. */
+export type DecodeOptions = {
+  /**
+   * Take `idempotency` and `runId` on `runs.create` and `runs.continue`: set exactly when
+   * this daemon lists `runs.clientRunId`. Absent, those params are refused as strict.
+   */
+  readonly clientRunIds?: boolean;
+};
+
+const CLIENT_RUN_SCHEMAS: Partial<Record<MethodT, z.ZodType<unknown>>> = {
+  "runs.create": RunsCreateParamsClientRun,
+  "runs.continue": RunsContinueParamsClientRun,
+};
+
+export function decodeRequest(
+  raw: unknown,
+  options: DecodeOptions = {},
+): RequestEnvelopeT & { method: MethodT } {
   const parsed = RequestEnvelope.safeParse(raw);
   if (!parsed.success) {
     throw new GatewayProtocolError(
@@ -271,7 +317,9 @@ export function decodeRequest(raw: unknown): RequestEnvelopeT & { method: Method
   if (!m.success) {
     throw new GatewayProtocolError(`unknown method "${parsed.data.method}"`);
   }
-  const paramSchema = PARAM_SCHEMAS[m.data];
+  const paramSchema =
+    (options.clientRunIds === true ? CLIENT_RUN_SCHEMAS[m.data] : undefined) ??
+    PARAM_SCHEMAS[m.data];
   const params = paramSchema.safeParse(parsed.data.params);
   if (!params.success) {
     throw new GatewayProtocolError(
@@ -377,6 +425,11 @@ export const ErrorCode = {
    * listing, so `sessions.list` and `sessions.fork` answer this. HTTP 501.
    */
   Unsupported: "unsupported",
+  /**
+   * The request names something already taken: an `idempotency` value reused with other
+   * params, or a `runId` another run holds. Nothing ran. HTTP 409.
+   */
+  Conflict: "conflict",
 } as const;
 
 export type ErrorCodeT = (typeof ErrorCode)[keyof typeof ErrorCode];

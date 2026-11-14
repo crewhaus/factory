@@ -1,4 +1,11 @@
-import { API_ONLY, DEVICE_APPROVE, DEVICE_SIGN_IN, NOT_A_COMMAND, READ } from "./shared.js";
+import {
+  API_ONLY,
+  DEVICE_APPROVE,
+  DEVICE_SIGN_IN,
+  NOT_A_COMMAND,
+  NOT_MODEL_BOUND,
+  READ,
+} from "./shared.js";
 
 const SIGN_IN = {
   receipt: "none",
@@ -30,6 +37,7 @@ export const AUTH_OPERATIONS = [
     request: "authSessionRequest",
     response: "sessionIssued",
     qualifiers: [],
+    modelBound: { nonce: NOT_MODEL_BOUND.signIn, signature: NOT_MODEL_BOUND.signIn },
   },
   {
     ...SIGN_IN,
@@ -40,6 +48,7 @@ export const AUTH_OPERATIONS = [
     response: "sessionIssued",
     secretFields: ["code"],
     qualifiers: [],
+    modelBound: { code: NOT_MODEL_BOUND.signIn },
   },
   {
     id: "auth.acceptInvite",
@@ -54,6 +63,7 @@ export const AUTH_OPERATIONS = [
     cliTwin: null,
     noTwinReason: API_ONLY,
     qualifiers: [],
+    modelBound: { code: NOT_MODEL_BOUND.signIn, displayName: NOT_MODEL_BOUND.label },
   },
   {
     ...SIGN_IN,
@@ -108,6 +118,7 @@ export const AUTH_OPERATIONS = [
     cliTwin: null,
     noTwinReason: DEVICE_APPROVE,
     qualifiers: [],
+    modelBound: { code: NOT_MODEL_BOUND.signIn },
   },
   {
     id: "auth.device.decide",
@@ -122,5 +133,6 @@ export const AUTH_OPERATIONS = [
     cliTwin: null,
     noTwinReason: DEVICE_APPROVE,
     qualifiers: ["self"],
+    modelBound: { code: NOT_MODEL_BOUND.signIn },
   },
 ] as const;

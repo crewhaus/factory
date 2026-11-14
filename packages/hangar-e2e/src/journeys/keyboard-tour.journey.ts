@@ -22,9 +22,11 @@ import { HARNESSES_ROUTE, HOME_ROUTE, type RouteHarness, routeFor } from "../con
 import type { HomeAddress, Session } from "../session";
 import { settle } from "../settle";
 import {
+  SPEC_SAVE,
   a11yFleet,
   clearPrefs,
   conflictBody,
+  editSpecInstructions,
   freshVisit,
   mockRefusals,
   resetOverlays,
@@ -393,11 +395,19 @@ async function overlays(session: Session, harness: RouteHarness): Promise<void> 
   const { page } = session;
   const spec = routeFor("#/h/:id/setup/spec", harness);
   const overview = routeFor("#/h/:id", harness);
-  const cases: Array<{ route: string; trigger: string; overlay: string; key?: string }> = [
+  const cases: Array<{
+    route: string;
+    trigger: string;
+    overlay: string;
+    key?: string;
+    /** Bring the screen to where the trigger opens its overlay. */
+    prepare?: (page: Page) => Promise<void>;
+  }> = [
     { route: overview, trigger: 'button:text-is("Start")', overlay: "dialog[open]" },
     { route: spec, trigger: 'button:text-is("Pin to…")', overlay: "dialog[open]" },
     { route: spec, trigger: 'button:text-is("View")', overlay: "dialog[open]" },
-    { route: spec, trigger: 'button:text-is("Save")', overlay: "dialog[open]" },
+    // An unchanged Save sends nothing: the setting changes first.
+    { route: spec, trigger: SPEC_SAVE, overlay: "dialog[open]", prepare: editSpecInstructions },
     { route: HOME_ROUTE, trigger: "button.omni-open", overlay: "dialog.omni-panel[open]" },
     { route: HOME_ROUTE, trigger: "button.omni-open", overlay: "dialog.sheet[open]", key: "?" },
   ];
@@ -405,6 +415,7 @@ async function overlays(session: Session, harness: RouteHarness): Promise<void> 
   for (const c of cases) {
     await resetOverlays(page);
     await freshVisit(session, c.route);
+    await c.prepare?.(page);
     const escaped = await escapeFinding(
       page,
       c.trigger,
@@ -415,6 +426,7 @@ async function overlays(session: Session, harness: RouteHarness): Promise<void> 
       findings.push({ ...escaped, detail: `${c.trigger}: ${escaped.detail}` });
     }
     // Again, and Tab round the open dialog: nothing behind it may take focus.
+    await c.prepare?.(page);
     await page.locator(c.trigger).focus();
     await page.keyboard.press(c.key ?? "Enter");
     await waitFor(page, c.overlay, `${c.trigger} opening ${c.overlay}`);
@@ -817,8 +829,9 @@ async function conflictAsksAgain(session: Session, harness: RouteHarness): Promi
   });
   try {
     await freshVisit(session, routeFor("#/h/:id/setup/spec", harness));
-    const row = page.locator("tr", { has: page.locator("td.mono", { hasText: /^agent\.model$/ }) });
-    await row.getByRole("button", { name: "Review & apply" }).click();
+    // A human-owned setting: its form control changes, then "Review and apply".
+    await page.locator(`[data-focus-key='input:["agent","model"]']`).fill("claude-sonnet-5");
+    await page.locator(`[data-focus-key='save:["agent","model"]']`).click();
     const typed = "dialog[open] input[placeholder]";
     await waitFor(page, typed, "the typed confirm for a human-owned field");
     const name = (await page.locator(typed).getAttribute("placeholder")) ?? "";

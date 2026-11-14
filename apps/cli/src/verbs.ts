@@ -506,13 +506,6 @@ export const LEGACY_VERBS: readonly LegacyVerb[] = deepFreeze<LegacyVerb[]>([
   },
   { verb: "run", since: V0_8_0, schema: "RUN_SCHEMA" },
   {
-    verb: "runs",
-    since: V0_8_0,
-    schema: "RUNS_SCHEMA",
-    sub: { resume: null },
-    subCheckedBy: "dispatch",
-  },
-  {
     verb: "sandbox",
     since: V0_8_0,
     schema: "SANDBOX_SCHEMA",
