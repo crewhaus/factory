@@ -35,6 +35,7 @@ import { signSlackBody, verifySlackSignature } from "./verify.js";
 export { signSlackBody, verifySlackSignature } from "./verify.js";
 // Loop contract 0.4 (Batch C, G11) — Slack interactive approval surface.
 export {
+  ALWAYS_ALLOW_LINE,
   APPROVE_ACTION_ID,
   APPROVE_ALWAYS_ACTION_ID,
   DENY_ACTION_ID,
@@ -203,13 +204,24 @@ export interface ChannelAdapter {
   /**
    * G11 — ACK a resolved approval in-thread: replace the buttons with a
    * "decision recorded" line so it can't be clicked twice and the thread shows
-   * who decided. Best-effort — a failure here must not fail the resolution.
+   * where it was decided. `state` is the decision as it now stands, in words.
+   * Best-effort — a failure here must not fail the resolution.
    */
   ackApproval?(args: {
     interaction: Extract<ParsedInteraction, { kind: "approval_action" }>;
     decision: "grant" | "deny";
     by: string;
     toolName?: string;
+    state?: string;
+  }): Promise<void>;
+  /**
+   * 0.9.0 — answer the person who clicked, and only them (an ephemeral
+   * message), leaving the card as it is: why nothing was decided, or how the
+   * request stands now. Only adapters with interactive buttons implement it.
+   */
+  answerInteraction?(args: {
+    interaction: Extract<ParsedInteraction, { kind: "approval_action" }>;
+    text: string;
   }): Promise<void>;
 }
 
@@ -466,13 +478,15 @@ export function createSlackAdapter(
       decision: "grant" | "deny";
       by: string;
       toolName?: string;
+      state?: string;
     }): Promise<void> {
       const ack = buildApprovalAckMessage({
         decision: args.decision,
         by: args.by,
-        // #383 — an "Always allow" click acks as a standing approval.
+        // #383 — an "Always allow" click acks with the rule it made.
         ...(args.interaction.always === true ? { always: true } : {}),
         ...(args.toolName !== undefined ? { toolName: args.toolName } : {}),
+        ...(args.state !== undefined ? { state: args.state } : {}),
       });
       if (args.interaction.responseUrl !== undefined) {
         const res = await doFetch(args.interaction.responseUrl, {
@@ -519,6 +533,30 @@ export function createSlackAdapter(
             );
           }
         }
+      }
+    },
+
+    // 0.9.0 — answer only the person who clicked, through the interaction's
+    // `response_url`, leaving the card in place.
+    async answerInteraction(args: {
+      interaction: Extract<ParsedInteraction, { kind: "approval_action" }>;
+      text: string;
+    }): Promise<void> {
+      const responseUrl = args.interaction.responseUrl;
+      if (responseUrl === undefined) {
+        throw new SlackAdapterError("the click carried no response_url to answer on");
+      }
+      const res = await doFetch(responseUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({
+          response_type: "ephemeral",
+          replace_original: false,
+          text: args.text,
+        }),
+      });
+      if (!res.ok) {
+        throw new SlackAdapterError(`ephemeral answer failed: ${res.status} ${res.statusText}`);
       }
     },
   };

@@ -873,6 +873,14 @@ export type RunEvalOptions = {
   readonly invoker?: AgentInvoker;
   readonly cwd?: string;
   /**
+   * The directory of the spec this eval measures. The default invoker hands it
+   * to every sample's chat loop (`RunChatLoopOptions.specDir`), so that spec's
+   * record under `<specDir>/.crewhaus/run/spec` is on the runtime-state floor of
+   * every agent the eval starts. A caller-supplied `invoker` runs its own loop
+   * and does not read it.
+   */
+  readonly specDir?: string;
+  /**
    * How the default invoker imports a tool package when it wires the spec's
    * `tools:`. The CLI passes its literal loader table (a single-binary build
    * embeds only literal import specifiers); a compiled eval bundle passes the

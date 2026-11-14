@@ -28,19 +28,27 @@
  * run serves (`subject`), which no context carries: {@link currentSubject}
  * reads it, for the run row's keyed digest.
  *
+ * It can also name the run's id (`runId`), when a library recorded the work
+ * under one before the run's code started: the first context created inside
+ * with neither a `runId` nor a `parent` of its own takes it, and every later
+ * one such mints its own id and records the first as its `parent`, so one id
+ * names one run. A context given `runId` or `parent` is left as it is. An id
+ * that is not a canonical run id is dropped, with one warning naming the
+ * field. Nothing reads it from the environment.
+ *
  * One store, kept on `globalThis` under
  * `Symbol.for("@crewhaus/run-context/ambient")`, so two copies of this package
  * in one process (a bundle that duplicated it) share it. Two helpers open a
  * nested scope on it, {@link withInboundContent} and {@link runWithScope}, and
  * both follow one contract: copy the current store, and copy its shared slots
- * (`inbound`, and `run.continues`) BY REFERENCE (never a clone of their
- * `consumed`/`taken` flag), so a context created in the nested scope consumes
- * the same entries the outer one would. Only {@link withInboundContent}
- * replaces `inbound`; only a {@link runWithScope} that names `continues`
- * replaces that slot. Either helper nests inside the other.
+ * (`inbound`, `run.continues` and `run.runId`) BY REFERENCE (never a clone of
+ * their `consumed`/`taken` flag), so a context created in the nested scope
+ * consumes the same entries the outer one would. Only {@link withInboundContent}
+ * replaces `inbound`; only a {@link runWithScope} that names `continues` or
+ * `runId` replaces that slot. Either helper nests inside the other.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { Trigger } from "@crewhaus/control-contract";
+import { CANONICAL_RUN_ID_RE, type Trigger } from "@crewhaus/control-contract";
 import type { TrustOrigin } from "./index";
 
 /** Run input a library classified and kept, waiting for the run's first context. */
@@ -76,10 +84,21 @@ export type RunScope = {
    * envelope, and a run row holds only a keyed digest of it.
    */
   readonly subject?: string;
+  /**
+   * The run's id: taken by the first context created inside with no `runId` and no
+   * `parent` of its own; later ones record it as their `parent`.
+   */
+  readonly runId?: string;
 };
 
 /** Shared and mutable, like {@link InboundSlot}: the first context takes it. */
 type ContinuesSlot = { readonly id: string; taken: boolean };
+
+/**
+ * Shared and mutable: the first context with no id of its own takes `id`. `fits` is
+ * whether `id` is a canonical run id; one that is not is dropped, warned about once.
+ */
+type RunIdSlot = { readonly id: string; readonly fits: boolean; taken: boolean; warned: boolean };
 
 type RunFields = {
   readonly resumeScope?: string;
@@ -87,6 +106,7 @@ type RunFields = {
   readonly workItem?: string;
   readonly continues?: ContinuesSlot;
   readonly subject?: string;
+  readonly runId?: RunIdSlot;
 };
 
 type AmbientStore = { readonly inbound?: InboundSlot; readonly run?: RunFields };
@@ -143,6 +163,16 @@ export function runWithScope<T>(scope: RunScope, fn: () => T): T {
     ...(scope.workItem !== undefined ? { workItem: scope.workItem } : {}),
     ...(scope.continues !== undefined ? { continues: { id: scope.continues, taken: false } } : {}),
     ...(scope.subject !== undefined ? { subject: scope.subject } : {}),
+    ...(scope.runId !== undefined
+      ? {
+          runId: {
+            id: scope.runId,
+            fits: CANONICAL_RUN_ID_RE.test(scope.runId),
+            taken: false,
+            warned: false,
+          },
+        }
+      : {}),
   };
   return store.run({ ...current, run }, fn);
 }
@@ -180,4 +210,33 @@ export function takeAmbientRun(): AmbientRun {
     ...(run.workItem !== undefined ? { workItem: run.workItem } : {}),
     ...(continues !== undefined ? { continues } : {}),
   };
+}
+
+/** What a context with no id of its own takes from the scope's run id. */
+export type ScopeRunId =
+  /** It is the run: the scope's id is its id. */
+  | { readonly runId: string }
+  /** The run already has its context: this one records it as its parent. */
+  | { readonly parent: string }
+  /** The scope named an id that is not one: dropped, warned about by this caller. */
+  | { readonly dropped: true }
+  | Record<string, never>;
+
+/**
+ * The scope's run id for a context created with neither a `runId` nor a `parent`: the
+ * first such caller gets it as its id, later ones as their parent. A scope id that is not
+ * a canonical run id answers `dropped` once, and nothing after; `{}` with no scope id.
+ * `createRunContext` calls this once, and only for such a context.
+ */
+export function takeScopeRunId(): ScopeRunId {
+  const slot = ambient().getStore()?.run?.runId;
+  if (slot === undefined) return {};
+  if (!slot.fits) {
+    if (slot.warned) return {};
+    slot.warned = true;
+    return { dropped: true };
+  }
+  if (slot.taken) return { parent: slot.id };
+  slot.taken = true;
+  return { runId: slot.id };
 }

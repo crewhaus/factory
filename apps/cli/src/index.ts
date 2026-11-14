@@ -1640,7 +1640,7 @@ import {
   removeRunTokens,
   restoreStateArchive,
 } from "./state-backup";
-import { discloseSurfaceChange, withRunSpecDir } from "./surface-disclosure";
+import { discloseSurfaceChange, runSpecDirOf, withRunSpecDir } from "./surface-disclosure";
 // v0.3.0 Goal 3 — `doctor --probe`'s thredz check (wiki_stats round-trip
 // through the spec's synthesized/user-declared thredz MCP server).
 import { probeThredz, thredzProbeTarget, thredzProbeToCheck } from "./thredz-probe";
@@ -5926,7 +5926,8 @@ async function runServeMcp(args: ParsedArgs): Promise<void> {
     };
   }
 
-  const runtime = await buildServeRuntime(args, cliIr);
+  // The spec's real directory: its record is on the floor of every served turn.
+  const runtime = await buildServeRuntime(args, cliIr, runSpecDirOf(absSpec));
   const version = cliVersion();
   const handle = createMcpServer({
     invoke: runtime.invoke,
@@ -6017,6 +6018,7 @@ async function runServeMcp(args: ParsedArgs): Promise<void> {
 async function buildServeRuntime(
   args: ParsedArgs,
   ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+  specDir: string,
 ): Promise<{ invoke: McpInvoke; cleanup: () => Promise<void> }> {
   // Built-in tools (Section 14 per-tool config applied first).
   let tools: RegisteredTool[] = [];
@@ -6234,6 +6236,8 @@ async function buildServeRuntime(
     ...approvalRunOptions(args, ir.permissions),
     sessionName: ir.name,
     sessionTarget: ir.target,
+    // The served spec's record is on the floor of every turn, primary or sub-agent.
+    specDir,
     hooks,
     skills,
     slashCommands,
@@ -7461,6 +7465,8 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   const retryErrors = args.flags["no-retry"] !== true;
   const outDirArg = args.flags["out"];
   const absSpec = resolve(specPath);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(absSpec);
   await holdCliMutatingLease(dirname(absSpec), "optimize");
   // The spec as it was before this run: the base of the change it records.
   const changeBaseYaml = readFileSync(absSpec, "utf-8");
@@ -7923,6 +7929,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         opts: {
           // C33 — which CLI produced this run (reproducibility manifest).
           ...cliVersionOpt(),
+          specDir: runSpecDir,
           outDir: evalOutDir,
           concurrency,
           seed,
@@ -8430,6 +8437,7 @@ async function runOptimizeFromAdvice(opts: {
       opts: {
         // C33 — which CLI produced this run (reproducibility manifest).
         ...cliVersionOpt(),
+        specDir: runSpecDirOf(opts.absSpec),
         outDir: join(adviceDir, label),
         concurrency: opts.concurrency,
         seed: opts.seed,
@@ -8765,6 +8773,8 @@ function runFlywheelInit(args: ParsedArgs): void {
 async function runFlywheelRun(args: ParsedArgs): Promise<void> {
   const specPath = args.positional[0] ?? "crewhaus.yaml";
   const absSpec = resolve(specPath);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(absSpec);
   if (!existsSync(absSpec)) {
     die(
       `spec not found at ${absSpec} — run from the harness directory (standalone-harness convention) or pass <spec.yaml>`,
@@ -9050,6 +9060,7 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       opts: {
         // C33 — which CLI produced this run (reproducibility manifest).
         ...cliVersionOpt(),
+        specDir: runSpecDir,
         outDir: join(outRoot, label),
         concurrency: knobs.concurrency,
         seed: knobs.seed,
@@ -9102,6 +9113,7 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       opts: {
         // C33 — which CLI produced this run (reproducibility manifest).
         ...cliVersionOpt(),
+        specDir: runSpecDir,
         outDir: join(
           outRoot,
           "optimize",
@@ -10172,6 +10184,8 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   }
 
   const absSpec = resolve(specPath);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(absSpec);
   let yamlText: string;
   try {
     yamlText = readFileSync(absSpec, "utf-8");
@@ -10443,6 +10457,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
       gateRequested,
       promote,
       specSource: absSpec,
+      specDir: runSpecDir,
       datasetName: dataset.name,
       samples: await collectSamples(dataset.samples),
       datasetHash,
@@ -10509,6 +10524,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     opts: {
       // C33 — which CLI produced this run (reproducibility manifest).
       ...cliVersionOpt(),
+      specDir: runSpecDir,
       // The id the dataset's held-out use line already names.
       ...(evalRunId !== undefined ? { runId: evalRunId } : {}),
       // NEW-HUNT-6 — a resume writes into the run directory it re-opened;
@@ -11083,6 +11099,8 @@ async function runEvalMatrixCommand(opts: {
   readonly promote?: boolean;
   /** Resolved spec source path, for the recorded lineage's collision guard. */
   readonly specSource?: string;
+  /** The spec's real directory, named to the floor of every agent a cell starts. */
+  readonly specDir: string;
   readonly datasetName: string;
   readonly samples: ReadonlyArray<Sample>;
   readonly datasetHash: string;
@@ -11139,6 +11157,7 @@ async function runEvalMatrixCommand(opts: {
         opts: {
           // C33 — which CLI produced this run (reproducibility manifest).
           ...cliVersionOpt(),
+          specDir: opts.specDir,
           outDir: cellOutDir,
           datasetHash: opts.datasetHash,
           retryErrors: opts.retryErrors,
@@ -11404,6 +11423,8 @@ async function runModelScan(args: ParsedArgs): Promise<void> {
 
   const specPath = join(process.cwd(), "crewhaus.yaml");
   if (!existsSync(specPath)) die(`model-scan: no crewhaus.yaml in ${process.cwd()}`);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(specPath);
   const yamlText = readFileSync(specPath, "utf-8");
   let ir: ReturnType<typeof lower>;
   try {
@@ -11499,6 +11520,7 @@ async function runModelScan(args: ParsedArgs): Promise<void> {
         opts: {
           // C33 — which CLI produced this run (reproducibility manifest).
           ...cliVersionOpt(),
+          specDir: runSpecDir,
           outDir: cellOutDir,
           datasetHash,
           ...(concurrency !== undefined ? { concurrency } : {}),
@@ -11975,6 +11997,8 @@ async function runModelRightSize(args: ParsedArgs): Promise<void> {
   const specPath =
     typeof specArg === "string" ? resolve(specArg) : join(process.cwd(), "crewhaus.yaml");
   if (!existsSync(specPath)) die(`model right-size: no spec at ${specPath}`);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(specPath);
   const yamlText = readFileSync(specPath, "utf-8");
   let ir: ReturnType<typeof lower>;
   try {
@@ -12095,6 +12119,7 @@ async function runModelRightSize(args: ParsedArgs): Promise<void> {
       opts: {
         // C33 — which CLI produced this run (reproducibility manifest).
         ...cliVersionOpt(),
+        specDir: runSpecDir,
         outDir: cellDir,
         datasetHash,
         ...(concurrency !== undefined ? { concurrency } : {}),
@@ -19727,6 +19752,8 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
 
   // Read + validate the candidate spec (must be target: cli for eval).
   const absSpec = resolve(specPath);
+  // The spec's real directory, named to the floor of every agent an eval here starts.
+  const runSpecDir = runSpecDirOf(absSpec);
   let candidateYaml: string;
   try {
     candidateYaml = readFileSync(absSpec, "utf-8");
@@ -19893,6 +19920,7 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
       opts: {
         // C33 — which CLI produced this run (reproducibility manifest).
         ...cliVersionOpt(),
+        specDir: runSpecDir,
         datasetHash,
         ...(concurrency !== undefined ? { concurrency } : {}),
         ...(seed !== undefined ? { seed } : {}),

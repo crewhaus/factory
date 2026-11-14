@@ -361,3 +361,95 @@ describe("the origin chain of a context that adopts run input", () => {
     expect(warned).toHaveLength(1);
   });
 });
+
+describe("runWithScope's run id", () => {
+  /** A logger that counts its warnings, whatever child it is asked for. */
+  function counting() {
+    const warns: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const logger = {
+      debug: () => {},
+      info: () => {},
+      warn: (msg: string, fields?: Record<string, unknown>) => {
+        warns.push({ msg, ...(fields !== undefined ? { fields } : {}) });
+      },
+      error: () => {},
+      child: () => logger,
+    };
+    return { logger, warns };
+  }
+
+  test("the first context takes it; a later one mints its own and names it as parent", async () => {
+    const RUN = mintRunId();
+    const [first, second, third] = await runWithScope({ runId: RUN }, async () => {
+      await hop();
+      const a = createRunContext({ sessionId: "sess_0123456789abcdef" });
+      await hop();
+      return [a, createRunContext(), createRunContext()] as const;
+    });
+    expect(first.runId).toBe(RUN);
+    expect(first.sessionId).toBe("sess_0123456789abcdef");
+    expect("parent" in first).toBe(false);
+    expect(second.runId).not.toBe(RUN);
+    expect(second.runId).toMatch(/^run_[0-9a-hjkmnp-tv-z]{26}$/);
+    expect(second.parent).toBe(RUN);
+    expect(third.parent).toBe(RUN);
+    expect(third.runId).not.toBe(second.runId);
+  });
+
+  test("a context given runId or parent is left as it is, and does not take the id", async () => {
+    const RUN = mintRunId();
+    const OWN = mintRunId();
+    const PARENT = mintRunId();
+    const [given, child, first] = await runWithScope({ runId: RUN }, async () => [
+      createRunContext({ runId: OWN }),
+      createRunContext({ parent: PARENT }),
+      createRunContext(),
+    ]);
+    expect(given.runId).toBe(OWN);
+    expect("parent" in given).toBe(false);
+    expect(child.parent).toBe(PARENT);
+    expect(child.runId).not.toBe(RUN);
+    expect(first.runId).toBe(RUN);
+  });
+
+  test("outside a scope nothing changes", () => {
+    const a = createRunContext();
+    const b = createRunContext();
+    expect(a.runId).not.toBe(b.runId);
+    expect("parent" in a).toBe(false);
+    expect("parent" in b).toBe(false);
+  });
+
+  test("a nested scope keeps the outer id by reference; one that names its own replaces it", async () => {
+    const OUTER = mintRunId();
+    const INNER = mintRunId();
+    const [shared, own, after] = await runWithScope({ runId: OUTER }, async () => {
+      const a = runWithScope({ trigger: { kind: "channel" } }, () => createRunContext());
+      const b = runWithScope({ runId: INNER }, () => createRunContext());
+      return [a, b, createRunContext()] as const;
+    });
+    expect(shared.runId).toBe(OUTER);
+    expect(shared.trigger).toEqual({ kind: "channel" });
+    expect(own.runId).toBe(INNER);
+    // The outer slot was taken by the first context in it.
+    expect(after.parent).toBe(OUTER);
+  });
+
+  test("an id that is not a canonical run id is dropped, with one warning naming the field", async () => {
+    const { logger, warns } = counting();
+    const [first, second] = await runWithScope({ runId: "run_channel" }, async () => [
+      createRunContext({ logger }),
+      createRunContext({ logger }),
+    ]);
+    expect(first.runId).not.toBe("run_channel");
+    expect(first.runId).toMatch(/^run_[0-9a-hjkmnp-tv-z]{26}$/);
+    expect("parent" in first).toBe(false);
+    expect("parent" in second).toBe(false);
+    expect(warns).toEqual([
+      {
+        msg: "run lineage field dropped: it does not fit its grammar",
+        fields: { field: "runId" },
+      },
+    ]);
+  });
+});

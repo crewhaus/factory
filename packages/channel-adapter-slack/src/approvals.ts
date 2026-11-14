@@ -7,7 +7,12 @@
  * `block_actions` payload) back to the daemon's `/<adapter>/actions` route;
  * that request is signed with the SAME `v0:${ts}:${body}` HMAC machinery as
  * an events webhook, so the existing `verify()` authenticates it unchanged.
- * The gateway then resolves the approval in the store and ACKs in-thread.
+ * channel-adapter-base's `createApprovalActions` then decides it as the member
+ * the clicker's Slack account is linked to, and answers in-thread.
+ *
+ * Approve and Always allow are offered only when the whole request fits the
+ * card (`fitsCard`); otherwise the card says where to review it in full, and
+ * keeps Deny.
  *
  * This module is pure parse/build (no network, no `RunContext`): the adapter's
  * `postApproval` / `ackApproval` do the I/O, and the channel-generic store +
@@ -17,7 +22,7 @@
 /** Block Kit `action_id`s for the three buttons — the interaction parser keys
  *  on these, so they are part of the wire contract. */
 export const APPROVE_ACTION_ID = "crewhaus_approve";
-/** #383 — grant AND persist a standing `alwaysAllow` rule for the tool. */
+/** #383 — grant, and from the owner a 30-day rule for exactly this call. */
 export const APPROVE_ALWAYS_ACTION_ID = "crewhaus_approve_always";
 export const DENY_ACTION_ID = "crewhaus_deny";
 /** `block_id` prefix carrying the approval id (a redundant channel to the
@@ -38,7 +43,20 @@ export type ApprovalPromptContent = {
    * re-asked card reads exactly like the one the operator already decided.
    */
   readonly landsAt?: string;
+  /**
+   * 0.9.0 — the whole request fits on the card. Absent counts as not fitting: the
+   * card then offers no Approve and no Always allow, and says where to review it.
+   */
+  readonly fitsCard?: boolean;
+  /** 0.9.0 — the lowest class that may decide it; absent counts as `operator`. */
+  readonly requiredClass?: "operator" | "maintainer" | "owner";
+  /** 0.9.0 — where to review a request that does not fit: Home's address, or a host and a verb. */
+  readonly review?: { readonly url: string } | { readonly host: string; readonly verb: string };
 };
+
+/** What Always allow does, in one line under the buttons. */
+export const ALWAYS_ALLOW_LINE =
+  "Always allow makes a 30-day rule for exactly this call when the owner clicks it; anyone else allows it once and asks the owner.";
 
 /** A built Slack message: `text` is the notification/accessibility fallback,
  *  `blocks` the interactive Block Kit payload. */
@@ -47,18 +65,56 @@ export type SlackApprovalMessage = {
   readonly blocks: readonly unknown[];
 };
 
+/** The section that says where a request that does not fit the card is reviewed. */
+function reviewSection(content: ApprovalPromptContent): unknown {
+  const review = content.review;
+  const verb = `crewhaus approvals show ${content.approvalId}`;
+  const text =
+    review !== undefined && "url" in review
+      ? `*Review in Home*: <${review.url}|open the request> to see all of it before you approve.`
+      : review !== undefined
+        ? `*Review on ${review.host}*: \`${review.verb}\` shows all of it before you approve.`
+        : `*Review in full* with \`${verb}\` before you approve.`;
+  return { type: "section", text: { type: "mrkdwn", text } };
+}
+
+/** The class line for a request above `operator`, or `undefined`. */
+function classLine(requiredClass: ApprovalPromptContent["requiredClass"]): string | undefined {
+  if (requiredClass === "maintainer") return "Needs a maintainer";
+  if (requiredClass === "owner") return "Needs the owner";
+  return undefined;
+}
+
 /**
- * Build the Approve / Always allow / Deny Block Kit message for a parked
- * approval. Each button carries the `approvalId` in its `value`, and the
- * actions block's `block_id` carries it too (`crewhaus_approval:<id>`), so the
- * interaction parser can recover the id from either. "Always allow" (#383)
- * grants this call AND persists a standing `alwaysAllow` rule for the tool in
- * the harness's `.crewhaus/settings.json`, so a tool the loop calls repeatedly
- * with varying input stops re-prompting (a plain Approve is one-shot and keyed
- * on the exact input).
+ * Build the approval card for a parked approval. Each button carries the
+ * `approvalId` in its `value`, and the actions block's `block_id` carries it
+ * too (`crewhaus_approval:<id>`), so the interaction parser can recover the id
+ * from either. Approve grants this call once; Always allow (#383) grants it and,
+ * from the owner, makes a 30-day rule for exactly this call (anyone else's
+ * allows it once and asks the owner). Both appear only when the whole request
+ * fits the card (`fitsCard: true`); otherwise the card links to where it is
+ * reviewed in full and keeps Deny. A request above `operator` says which class
+ * it needs.
  */
 export function buildApprovalMessage(content: ApprovalPromptContent): SlackApprovalMessage {
   const text = `Approval needed: \`${content.toolName}\` wants to run (surface: ${content.surface})`;
+  const fits = content.fitsCard === true;
+  const needs = classLine(content.requiredClass);
+  const approve = [
+    {
+      type: "button",
+      action_id: APPROVE_ACTION_ID,
+      text: { type: "plain_text", text: "Approve" },
+      style: "primary",
+      value: content.approvalId,
+    },
+    {
+      type: "button",
+      action_id: APPROVE_ALWAYS_ACTION_ID,
+      text: { type: "plain_text", text: `Always allow ${truncateForButton(content.toolName)}` },
+      value: content.approvalId,
+    },
+  ];
   const blocks: unknown[] = [
     {
       type: "section",
@@ -78,23 +134,15 @@ export function buildApprovalMessage(content: ApprovalPromptContent): SlackAppro
           },
         ]
       : []),
+    ...(fits ? [] : [reviewSection(content)]),
+    ...(needs !== undefined
+      ? [{ type: "context", elements: [{ type: "mrkdwn", text: needs }] }]
+      : []),
     {
       type: "actions",
       block_id: `${APPROVAL_BLOCK_ID_PREFIX}${content.approvalId}`,
       elements: [
-        {
-          type: "button",
-          action_id: APPROVE_ACTION_ID,
-          text: { type: "plain_text", text: "Approve" },
-          style: "primary",
-          value: content.approvalId,
-        },
-        {
-          type: "button",
-          action_id: APPROVE_ALWAYS_ACTION_ID,
-          text: { type: "plain_text", text: `Always allow ${truncateForButton(content.toolName)}` },
-          value: content.approvalId,
-        },
+        ...(fits ? approve : []),
         {
           type: "button",
           action_id: DENY_ACTION_ID,
@@ -104,12 +152,13 @@ export function buildApprovalMessage(content: ApprovalPromptContent): SlackAppro
         },
       ],
     },
+    ...(fits ? [{ type: "context", elements: [{ type: "mrkdwn", text: ALWAYS_ALLOW_LINE }] }] : []),
     {
       type: "context",
       elements: [
         {
           type: "mrkdwn",
-          text: `id \`${content.approvalId}\` · or run \`crewhaus approvals grant ${content.approvalId}\` (add \`--always\` for a standing allow)`,
+          text: `id \`${content.approvalId}\` · or run \`crewhaus approvals grant ${content.approvalId}\` (\`--always\` makes a 30-day rule for exactly this call when the owner runs it; anyone else's allows it once and asks the owner)`,
         },
       ],
     },
@@ -119,22 +168,29 @@ export function buildApprovalMessage(content: ApprovalPromptContent): SlackAppro
 
 /**
  * The one-line "decision recorded" message the ACK replaces the buttons with,
- * so a resolved approval can't be clicked twice and the thread shows who
- * decided. Returned as text + a single context block (buttons removed).
+ * so a resolved approval can't be clicked twice and the thread shows where it
+ * was decided. Returned as text + a single context block (buttons removed).
+ * `state` is the decision as it now stands, in words (`Approved, and allowed
+ * for 30 days`); without it the line is worked out from `decision`.
  */
 export function buildApprovalAckMessage(args: {
   readonly decision: "grant" | "deny";
   readonly by: string;
   readonly toolName?: string;
-  /** #383 — the grant was recorded as a standing allow. */
+  /** #383 — the grant also made a 30-day rule for exactly this call. */
   readonly always?: boolean;
+  /** 0.9.0 — the current state, in words. */
+  readonly state?: string;
 }): SlackApprovalMessage {
   const always = args.decision === "grant" && args.always === true;
-  const verb = args.decision === "grant" ? (always ? "Approved (always)" : "Approved") : "Denied";
   const icon = args.decision === "grant" ? "✅" : "🚫";
   const tool = args.toolName !== undefined ? ` \`${args.toolName}\`` : "";
-  const suffix = always ? " — future calls run pre-approved" : "";
-  const text = `${icon} ${verb}${tool} by ${args.by}${suffix}`;
+  const verb = args.decision === "grant" ? (always ? "Approved (always)" : "Approved") : "Denied";
+  const suffix = always ? " — this exact call is allowed for 30 days" : "";
+  const text =
+    args.state !== undefined
+      ? `${icon}${tool !== "" ? `${tool}:` : ""} ${args.state}`
+      : `${icon} ${verb}${tool} by ${args.by}${suffix}`;
   return {
     text,
     blocks: [{ type: "context", elements: [{ type: "mrkdwn", text }] }],
@@ -148,10 +204,12 @@ export type ParsedInteraction =
       readonly kind: "approval_action";
       readonly approvalId: string;
       readonly decision: "grant" | "deny";
-      /** #383 — the click was "Always allow": grant + persist a standing rule. */
+      /** #383 — the click was "Always allow": a grant, and from the owner a 30-day rule for exactly this call. */
       readonly always?: boolean;
-      /** The Slack user who clicked (deciding identity). */
+      /** The Slack user who clicked. */
       readonly userId: string;
+      /** The clicker's workspace (`team.id`, else `user.team_id`); absent when Slack sends neither. */
+      readonly teamId?: string;
       readonly channelId?: string;
       /** ts of the message the buttons live on (for `chat.update` ACK). */
       readonly messageTs?: string;
@@ -216,6 +274,15 @@ export function parseSlackInteraction(body: string): ParsedInteraction {
       ? ((user as Record<string, unknown>)["id"] as string)
       : undefined;
   if (userId === undefined) return { kind: "skip" };
+  const team = p["team"];
+  const teamId =
+    typeof team === "object" &&
+    team !== null &&
+    typeof (team as Record<string, unknown>)["id"] === "string"
+      ? ((team as Record<string, unknown>)["id"] as string)
+      : typeof (user as Record<string, unknown>)["team_id"] === "string"
+        ? ((user as Record<string, unknown>)["team_id"] as string)
+        : undefined;
 
   const channel = p["channel"];
   const channelId =
@@ -255,6 +322,7 @@ export function parseSlackInteraction(body: string): ParsedInteraction {
     decision,
     ...(always ? { always: true } : {}),
     userId,
+    ...(teamId !== undefined && teamId.length > 0 ? { teamId } : {}),
     ...(channelId !== undefined ? { channelId } : {}),
     ...(messageTs !== undefined ? { messageTs } : {}),
     ...(threadTs !== undefined ? { threadTs } : {}),
