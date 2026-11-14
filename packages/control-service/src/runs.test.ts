@@ -258,7 +258,10 @@ describe("starting a run", () => {
       { kind: "run", ref: `${HRN}/run/${runId}`, status: "done" },
     ]);
     const file = join(r.harness, controlPaths(r.harness).inputsDir, `${runId}.json`);
-    expect(statSync(file).mode & 0o777).toBe(0o600);
+    // Windows reports 0666 for any writable file, so 0600 is a POSIX claim; owner
+    // read+write is what remains assertable there.
+    if (process.platform === "win32") expect(statSync(file).mode & 0o600).toBe(0o600);
+    else expect(statSync(file).mode & 0o777).toBe(0o600);
     expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({
       v: 1,
       run: runId,
