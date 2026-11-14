@@ -103,7 +103,12 @@ import {
 import { type Scrubber, createEnvScrubber, scrubbableEnvKeys } from "./scrub";
 import type { SupervisedChild } from "./shutdown";
 import { type SpawnPlan, isSupervisedClass, loadEnvChain, runClassFor } from "./spawn-contracts";
-import { automaticSpecRefusal, decideStart, operatorRefusal } from "./start-decision";
+import {
+  type StartRefusal,
+  automaticSpecRefusal,
+  decideStart,
+  operatorRefusal,
+} from "./start-decision";
 import {
   type LogPump,
   createLogPump,
@@ -1134,6 +1139,20 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       currentKind = plan.kind;
       currentPorts = plan.ports;
 
+      // The operator record again, after every step that may compile and before each
+      // hook and the spawn: a disable written meanwhile is honoured before the next one.
+      const refuseDisabled = (refusal: StartRefusal): StartRefusal => {
+        if (internal.automatic === true) {
+          lastExit = {
+            disposition: "crash",
+            title: "disabled by its operator; not restarted",
+            restartable: false,
+            unexpectedClean: false,
+          };
+        }
+        setState("stopped");
+        return refusal;
+      };
       const prepared: string[] = [];
       let activeOnly = false;
       // Read before any compile this start runs, which records what it built.
@@ -1143,11 +1162,20 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         // Inside the start slot, so two managers cannot recompile the same
         // bundle at once — a half-written `dist/` is exactly the state a
         // spawn must never meet.
-        const outcome = await runner.prepare();
+        // Asked after the compile, before the postCompile hook.
+        const halt: { refusal?: StartRefusal } = {};
+        const outcome = await runner.prepare(() => {
+          const refusal = operatorRefusal(options.harnessDir);
+          if (refusal !== undefined) halt.refusal = refusal;
+          return refusal === undefined;
+        });
+        if (halt.refusal !== undefined) return refuseDisabled(halt.refusal);
         if (!outcome.ok) {
           setState("stopped");
           return { ok: false, reason: "prepare-refused", refusal: outcome.refusal };
         }
+        const disabledAfterPrepare = operatorRefusal(options.harnessDir);
+        if (disabledAfterPrepare !== undefined) return refuseDisabled(disabledAfterPrepare);
         prepared.push(...outcome.notes);
         if (outcome.activeOnly === true) activeOnly = true;
         if (outcome.replan) {
@@ -1175,6 +1203,8 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       }
 
       if (runner !== undefined) {
+        const disabledBeforeHook = operatorRefusal(options.harnessDir);
+        if (disabledBeforeHook !== undefined) return refuseDisabled(disabledBeforeHook);
         // LAST. Everything the operator's own step depends on — the fresh
         // bundle, a passed preflight — is true by now, and nothing else
         // happens between this and the spawn.
@@ -1185,6 +1215,10 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         }
         prepared.push(...outcome.notes);
       }
+
+      // And once more after the last hook, before anything is activated or spawned.
+      const disabledNow = operatorRefusal(options.harnessDir);
+      if (disabledNow !== undefined) return refuseDisabled(disabledNow);
 
       // The build check, after every step that may write the bundle and before the run
       // id is minted, for a launch that runs a compiled bundle. An automatic start, and a

@@ -4,10 +4,19 @@
  * loop records nothing: no run row, no session log and no model call.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
+import { effectiveDecisionState } from "@crewhaus/control-contract";
 import {
   type IntakeVerdict,
   registerIntakeRoot,
@@ -16,7 +25,7 @@ import {
 import { EXIT_CODES, RunFailedError, isRunFailedError } from "@crewhaus/errors";
 import type { LogFields, Logger } from "@crewhaus/logging";
 import { createRunContext, retainRun } from "@crewhaus/run-context";
-import { generateApprovalId } from "@crewhaus/session-store";
+import { foldReadOnly, generateApprovalId } from "@crewhaus/session-store";
 import { admitLoop, loopAdmission } from "./admission";
 import { type RunChatLoopOptions, runChatLoop } from "./index";
 
@@ -241,21 +250,54 @@ describe("a granted request re-drives its parked call once while paused", () => 
     return file;
   }
 
-  function granted(sessionId: string, over: { parkedAt?: string; always?: true } = {}) {
-    const park = {
+  const logPath = (dir: string, sessionId: string): string =>
+    join(dir, "sessions", `${sessionId}.jsonl`);
+
+  /** The newest `ts` the session's log holds. */
+  function newestTs(dir: string, sessionId: string): number {
+    const lines = readFileSync(logPath(dir, sessionId), "utf8").split("\n").filter(Boolean);
+    const newest = Math.max(...lines.map((l) => (JSON.parse(l) as { ts: number }).ts));
+    expect(Number.isFinite(newest)).toBe(true);
+    return newest;
+  }
+
+  /** A park `ms` after the session's newest event: no wall clock decides the order. */
+  function parkAfter(dir: string, sessionId: string, ms = 1000): string {
+    return new Date(newestTs(dir, sessionId) + ms).toISOString();
+  }
+
+  /** Append one event-log line, in the log's own wire shape. */
+  function appendEvent(
+    dir: string,
+    sessionId: string,
+    ts: number,
+    kind: string,
+    payload: Record<string, unknown>,
+  ): string {
+    const line = `${JSON.stringify({ ts, version: 1, kind, payload })}\n`;
+    appendFileSync(logPath(dir, sessionId), line);
+    return line;
+  }
+
+  function parked(sessionId: string, parkedAt: string) {
+    return {
       id: generateApprovalId(),
       toolName: "Bash",
       inputHash: "h1",
       runId: "run_00000001",
       sessionId,
       surface: "channel",
-      createdAt: over.parkedAt ?? new Date().toISOString(),
+      createdAt: parkedAt,
     };
+  }
+
+  function granted(sessionId: string, over: { parkedAt: string; always?: true }) {
+    const park = parked(sessionId, over.parkedAt);
     const grant = {
       ...park,
       decision: "grant",
       decidedBy: "max",
-      decidedAt: new Date().toISOString(),
+      decidedAt: over.parkedAt,
       ...(over.always === true ? { always: true } : {}),
     };
     return { park, grant };
@@ -271,18 +313,29 @@ describe("a granted request re-drives its parked call once while paused", () => 
     return SESSION;
   }
 
-  test("paused and a one-time grant waiting in the resumed session: the re-drive runs", async () => {
+  const resumeLoop = (dir: string, model: ProviderAdapter, sessionId: string) =>
+    loop(dir, model, { sessionTarget: "channel", resume: { sessionId } });
+
+  const admitDirect = (dir: string, sessionId: string) =>
+    admitLoop({ sessionTarget: "channel", resume: { sessionId } }, () => join(dir, "sessions"));
+
+  /** The approval record's decision state as the store folds it now. */
+  function stateOf(dir: string, id: string): string | undefined {
+    const record = foldReadOnly(join(dir, "sessions")).records.find((r) => r.id === id);
+    return record === undefined
+      ? undefined
+      : effectiveDecisionState(record, null, Date.now()).state;
+  }
+
+  test("paused, and the session's newest event is the park of a one-time grant: the re-drive runs", async () => {
     const dir = harnessDir();
     const sessionId = await conversation(dir);
-    const { park, grant } = granted(sessionId);
+    const { park, grant } = granted(sessionId, { parkedAt: parkAfter(dir, sessionId) });
     writeApprovals(dir, [park, grant]);
     writeOperator(dir, { intake: { paused: true } });
     serve(dir);
     const model = countingAdapter();
-    const { result } = await loop(dir, model.adapter, {
-      sessionTarget: "channel",
-      resume: { sessionId },
-    });
+    const { result } = await resumeLoop(dir, model.adapter, sessionId);
     expect(result).toBe("done");
     expect(model.calls()).toBe(1);
   });
@@ -290,15 +343,13 @@ describe("a granted request re-drives its parked call once while paused", () => 
   test("a grant admits one loop: the next message in the conversation is refused while the grant stays unconsumed", async () => {
     const dir = harnessDir();
     const sessionId = await conversation(dir);
-    const { park, grant } = granted(sessionId);
+    const { park, grant } = granted(sessionId, { parkedAt: parkAfter(dir, sessionId) });
     const file = writeApprovals(dir, [park, grant]);
     const before = readFileSync(file, "utf8");
     writeOperator(dir, { intake: { paused: true } });
     serve(dir);
     // Admission reads the grants without writing them.
-    expect(
-      admitLoop({ sessionTarget: "channel", resume: { sessionId } }, () => join(dir, "sessions")),
-    ).toEqual({ admit: true });
+    expect(admitDirect(dir, sessionId)).toEqual({ admit: true });
     expect(readFileSync(file, "utf8")).toBe(before);
     const model = countingAdapter();
     for (const content of ["a second message", "a third message"]) {
@@ -314,41 +365,142 @@ describe("a granted request re-drives its parked call once while paused", () => 
     expect(readFileSync(file, "utf8")).toBe(before);
   });
 
-  test("two one-time grants in the session admit two loops, and no third", async () => {
+  test("a person's message after the park is refused as paused, and the grant waits for its re-drive", async () => {
     const dir = harnessDir();
     const sessionId = await conversation(dir);
-    const first = granted(sessionId);
-    const second = granted(sessionId);
+    const parkedAt = parkAfter(dir, sessionId);
+    const { park, grant } = granted(sessionId, { parkedAt });
+    const file = writeApprovals(dir, [park, grant]);
+    const approvals = readFileSync(file, "utf8");
+    const log = readFileSync(logPath(dir, sessionId), "utf8");
+    appendEvent(dir, sessionId, Date.parse(parkedAt) + 1000, "user_message", {
+      content: "a new request",
+    });
+    writeOperator(dir, { intake: { paused: true } });
+    serve(dir);
+    const model = countingAdapter();
+    expect((await resumeLoop(dir, model.adapter, sessionId)).result).toBe(PAUSED_TEXT);
+    expect(model.calls()).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe(approvals);
+    expect(stateOf(dir, park.id)).toBe("granted");
+    // The grant was not spent here: with the park the newest event again, one resume runs.
+    writeFileSync(logPath(dir, sessionId), log);
+    expect((await resumeLoop(dir, model.adapter, sessionId)).result).toBe("done");
+    expect(model.calls()).toBe(1);
+  });
+
+  test("a synthetic message after the park does not count: the re-drive runs", async () => {
+    const dir = harnessDir();
+    const sessionId = await conversation(dir);
+    const parkedAt = parkAfter(dir, sessionId);
+    const { park, grant } = granted(sessionId, { parkedAt });
+    writeApprovals(dir, [park, grant]);
+    appendEvent(dir, sessionId, Date.parse(parkedAt) + 1000, "user_message", {
+      content: "[system] The toolset changed while this session was idle: +ListTools.",
+      synthetic: true,
+      toolset: { added: ["ListTools"], removed: [] },
+    });
+    writeOperator(dir, { intake: { paused: true } });
+    serve(dir);
+    const model = countingAdapter();
+    expect((await resumeLoop(dir, model.adapter, sessionId)).result).toBe("done");
+    expect(model.calls()).toBe(1);
+  });
+
+  test("of two one-time grants only the newest park's admits, once", async () => {
+    const dir = harnessDir();
+    const sessionId = await conversation(dir);
+    const first = granted(sessionId, { parkedAt: parkAfter(dir, sessionId, 1000) });
+    const second = granted(sessionId, { parkedAt: parkAfter(dir, sessionId, 2000) });
     writeApprovals(dir, [first.park, first.grant, second.park, second.grant]);
     writeOperator(dir, { intake: { paused: true } });
     serve(dir);
     const model = countingAdapter();
     const results: string[] = [];
     for (let i = 0; i < 3; i += 1) {
-      const { result } = await loop(dir, model.adapter, {
-        sessionTarget: "channel",
-        resume: { sessionId },
-      });
-      results.push(result ?? "");
+      results.push((await resumeLoop(dir, model.adapter, sessionId)).result ?? "");
     }
-    expect(results).toEqual(["done", "done", PAUSED_TEXT]);
-    expect(model.calls()).toBe(2);
+    expect(results).toEqual(["done", PAUSED_TEXT, PAUSED_TEXT]);
+    expect(model.calls()).toBe(1);
+  });
+
+  test("an older grant under a newer pending park admits nothing", async () => {
+    const dir = harnessDir();
+    const sessionId = await conversation(dir);
+    const older = granted(sessionId, { parkedAt: parkAfter(dir, sessionId, 1000) });
+    const pending = parked(sessionId, parkAfter(dir, sessionId, 2000));
+    writeApprovals(dir, [older.park, older.grant, pending]);
+    writeOperator(dir, { intake: { paused: true } });
+    serve(dir);
+    const model = countingAdapter();
+    expect((await resumeLoop(dir, model.adapter, sessionId)).result).toBe(PAUSED_TEXT);
+    expect(model.calls()).toBe(0);
+  });
+
+  test("two parks with the same time admit nothing, and neither does one whose time does not parse", async () => {
+    const dir = harnessDir();
+    const sessionId = await conversation(dir);
+    const at = parkAfter(dir, sessionId);
+    const a = granted(sessionId, { parkedAt: at });
+    const b = granted(sessionId, { parkedAt: at });
+    writeApprovals(dir, [a.park, a.grant, b.park, b.grant]);
+    writeOperator(dir, { intake: { paused: true } });
+    serve(dir);
+    expect(admitDirect(dir, sessionId)).toEqual({ admit: false, reply: PAUSED_TEXT });
+    const c = granted(sessionId, { parkedAt: parkAfter(dir, sessionId, 3000) });
+    writeApprovals(dir, [c.park, c.grant, parked(sessionId, "not a time")]);
+    expect(admitDirect(dir, sessionId)).toEqual({ admit: false, reply: PAUSED_TEXT });
   });
 
   test("a standing (always) grant admits nothing while paused", async () => {
     const dir = harnessDir();
     const sessionId = await conversation(dir);
-    const { park, grant } = granted(sessionId, { always: true });
+    const { park, grant } = granted(sessionId, {
+      parkedAt: parkAfter(dir, sessionId),
+      always: true,
+    });
     writeApprovals(dir, [park, grant]);
     writeOperator(dir, { intake: { paused: true } });
     serve(dir);
     const model = countingAdapter();
-    const { result } = await loop(dir, model.adapter, {
-      sessionTarget: "channel",
-      resume: { sessionId },
-    });
-    expect(result).toBe(PAUSED_TEXT);
+    expect((await resumeLoop(dir, model.adapter, sessionId)).result).toBe(PAUSED_TEXT);
     expect(model.calls()).toBe(0);
+  });
+
+  test("a session log that is missing, is a directory or holds a line that does not parse admits nothing", async () => {
+    const dir = harnessDir();
+    const sessionId = await conversation(dir);
+    const log = readFileSync(logPath(dir, sessionId), "utf8");
+    const { park, grant } = granted(sessionId, { parkedAt: parkAfter(dir, sessionId) });
+    writeApprovals(dir, [park, grant]);
+    writeOperator(dir, { intake: { paused: true } });
+    serve(dir);
+    rmSync(logPath(dir, sessionId));
+    expect(admitDirect(dir, sessionId)).toEqual({ admit: false, reply: PAUSED_TEXT });
+    mkdirSync(logPath(dir, sessionId));
+    expect(admitDirect(dir, sessionId)).toEqual({ admit: false, reply: PAUSED_TEXT });
+    rmSync(logPath(dir, sessionId), { recursive: true });
+    writeFileSync(logPath(dir, sessionId), `${log}{ torn\n`);
+    expect(admitDirect(dir, sessionId)).toEqual({ admit: false, reply: PAUSED_TEXT });
+    // None of those spent the grant: the whole log admits it once.
+    writeFileSync(logPath(dir, sessionId), log);
+    expect(admitDirect(dir, sessionId)).toEqual({ admit: true });
+  });
+
+  test("a resumed session id outside the session grammar admits nothing and reads no log", () => {
+    const dir = harnessDir();
+    const sessionId = "../x";
+    // A log and a grant that would admit, at the path the id would name.
+    mkdirSync(join(dir, "sessions"), { recursive: true });
+    writeFileSync(
+      join(dir, "x.jsonl"),
+      `${JSON.stringify({ ts: 1, version: 1, kind: "user_message", payload: { content: "hi" } })}\n`,
+    );
+    const { park, grant } = granted(sessionId, { parkedAt: new Date().toISOString() });
+    writeApprovals(dir, [park, grant]);
+    writeOperator(dir, { intake: { paused: true } });
+    serve(dir);
+    expect(admitDirect(dir, sessionId)).toEqual({ admit: false, reply: PAUSED_TEXT });
   });
 
   test("a grant parked before the approval store's retention window admits nothing", async () => {
@@ -360,18 +512,14 @@ describe("a granted request re-drives its parked call once while paused", () => 
     writeOperator(dir, { intake: { paused: true } });
     serve(dir);
     const model = countingAdapter();
-    const { result } = await loop(dir, model.adapter, {
-      sessionTarget: "channel",
-      resume: { sessionId },
-    });
-    expect(result).toBe(PAUSED_TEXT);
+    expect((await resumeLoop(dir, model.adapter, sessionId)).result).toBe(PAUSED_TEXT);
     expect(model.calls()).toBe(0);
   });
 
   test("a grant asked in another resume scope admits nothing", async () => {
     const dir = harnessDir();
     const sessionId = await conversation(dir);
-    const { park, grant } = granted(sessionId);
+    const { park, grant } = granted(sessionId, { parkedAt: parkAfter(dir, sessionId) });
     writeApprovals(dir, [park, grant]);
     writeOperator(dir, { intake: { paused: true } });
     serve(dir);
@@ -388,21 +536,18 @@ describe("a granted request re-drives its parked call once while paused", () => 
   test("the same grant once consumed: refused", async () => {
     const dir = harnessDir();
     const sessionId = await conversation(dir);
-    const { park, grant } = granted(sessionId);
+    const parkedAt = parkAfter(dir, sessionId);
+    const { park, grant } = granted(sessionId, { parkedAt });
     const file = writeApprovals(dir, [
       park,
       grant,
-      { ...grant, consumedAt: new Date().toISOString(), consumedByRun: "run_00000002" },
+      { ...grant, consumedAt: parkedAt, consumedByRun: "run_00000002" },
     ]);
     const before = readFileSync(file, "utf8");
     writeOperator(dir, { intake: { paused: true } });
     serve(dir);
     const model = countingAdapter();
-    const { result } = await loop(dir, model.adapter, {
-      sessionTarget: "channel",
-      resume: { sessionId },
-    });
-    expect(result).toBe(PAUSED_TEXT);
+    expect((await resumeLoop(dir, model.adapter, sessionId)).result).toBe(PAUSED_TEXT);
     expect(model.calls()).toBe(0);
     expect(readFileSync(file, "utf8")).toBe(before);
   });
@@ -410,31 +555,26 @@ describe("a granted request re-drives its parked call once while paused", () => 
   test("a grant in another session does not admit this one", async () => {
     const dir = harnessDir();
     const sessionId = await conversation(dir);
-    const { park, grant } = granted("sess_00000000000000cd");
+    const { park, grant } = granted("sess_00000000000000cd", {
+      parkedAt: parkAfter(dir, sessionId),
+    });
     writeApprovals(dir, [park, grant]);
     writeOperator(dir, { intake: { paused: true } });
     serve(dir);
-    const { result } = await loop(dir, countingAdapter().adapter, {
-      sessionTarget: "channel",
-      resume: { sessionId },
-    });
+    const { result } = await resumeLoop(dir, countingAdapter().adapter, sessionId);
     expect(result).toBe(PAUSED_TEXT);
   });
 
   test("disabled, even with the granted request: refused", async () => {
     const dir = harnessDir();
     const sessionId = await conversation(dir);
-    const { park, grant } = granted(sessionId);
+    const { park, grant } = granted(sessionId, { parkedAt: parkAfter(dir, sessionId) });
     const file = writeApprovals(dir, [park, grant]);
     const before = readFileSync(file, "utf8");
     writeOperator(dir, { deployment: { disabled: true } });
     serve(dir);
     const model = countingAdapter();
-    const { result } = await loop(dir, model.adapter, {
-      sessionTarget: "channel",
-      resume: { sessionId },
-    });
-    expect(result).toBe(DISABLED_TEXT);
+    expect((await resumeLoop(dir, model.adapter, sessionId)).result).toBe(DISABLED_TEXT);
     expect(model.calls()).toBe(0);
     expect(readFileSync(file, "utf8")).toBe(before);
   });

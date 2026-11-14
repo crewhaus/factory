@@ -14,7 +14,7 @@
  * best-effort write-through) goes through `@crewhaus/watchme-store`'s own
  * API.
  */
-export { HARNESS_ID_RE, REGISTRY_FILENAME } from "./doc.js";
+export { HARNESS_ID_RE, REGISTRY_FILENAME, isWellFormedHome } from "./doc.js";
 export { hangarStateRoots, registryStateFiles, resolveHangarRoot } from "./hangar-root.js";
 export {
   HARNESS_IDENTITY_REL,

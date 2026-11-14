@@ -51,6 +51,7 @@ import {
   HARNESS_ID_RE,
   REGISTRY_FILENAME,
   fingerprintPath,
+  isWellFormedHome,
   mintHarnessId,
   normalizeDoc,
   sleepSync,
@@ -89,13 +90,14 @@ export type OpenHangarRegistryOptions = {
 };
 
 /**
- * Whether a row counts as adopted on this machine for a group start: it carries `home`; or,
- * never moved to another directory (`relocatedAt`), it was registered strictly before
- * `adoptionSince`, or `adoptionSince` is absent (no write from a registry that knows
- * adoption has happened, so every row predates it).
+ * Whether a row counts as adopted on this machine for a group start: it carries a
+ * well-formed `home` ({@link isWellFormedHome}); or, never moved to another directory
+ * (`relocatedAt`), it was registered strictly before `adoptionSince`, or `adoptionSince` is
+ * absent (no write from a registry that knows adoption has happened, so every row predates
+ * it).
  */
 export function isAdopted(entry: HangarHarnessEntry, adoptionSince: string | undefined): boolean {
-  if (entry.home !== undefined) return true;
+  if (isWellFormedHome(entry.home)) return true;
   if (typeof entry.relocatedAt === "string") return false;
   if (adoptionSince === undefined) return true;
   const registered = Date.parse(entry.registeredAt);
@@ -106,14 +108,15 @@ export function isAdopted(entry: HangarHarnessEntry, adoptionSince: string | und
 
 /**
  * Whether Home runs this harness's own code for it (its `node_modules/.bin/crewhaus` for
- * Home's jobs, its spec library for Home's spec checks): only when the row carries `home`,
- * which only `crewhaus harness adopt` writes and a relocation removes. A row counted as
+ * Home's jobs, its spec library for Home's spec checks): only when the row carries a
+ * well-formed `home` ({@link isWellFormedHome}), which only `crewhaus harness adopt` writes
+ * and a relocation removes. A row counted as
  * adopted for a group start because it predates adoption does not.
  *
  * First consumers: Home's job runner and its spec checks.
  */
 export function runsOwnCode(entry: HangarHarnessEntry): boolean {
-  return entry.home !== undefined;
+  return isWellFormedHome(entry.home);
 }
 
 /** A spec name as a slug: lower-kebab, letters and digits. */

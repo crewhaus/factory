@@ -22,6 +22,7 @@ import {
   ensureDigestKey,
   keyedDigest,
   readDeployments,
+  readDigestKey,
   readHarnessIdentity,
   writeHarnessIdentity,
 } from "@crewhaus/control-records";
@@ -232,6 +233,47 @@ export type ActivationAnswer =
     };
 
 /**
+ * The first protected-environment refusal activating `prepared` into `environment` makes,
+ * read-only: every other environment whose active build it replaces takes its quorum for
+ * this build, whatever the activation names and whichever gates it runs; and an activation
+ * that runs no gates of its own (a start activating what it found) takes the quorum of the
+ * environment it moves. Writes nothing. Undefined when no check refuses.
+ *
+ * First consumers: {@link activateDeployment} and a decide-only admission, so both decide
+ * from the same checks.
+ */
+async function activationGateRefusal(
+  harnessDir: string,
+  actives: readonly LedgerRecord[],
+  prepared: LedgerRecord,
+  environment: string | undefined,
+  gatesNotRun: boolean,
+  actor: string,
+  now: () => number,
+): Promise<{ readonly reason: string; readonly verb?: string } | undefined> {
+  for (const other of new Set(actives.map(environmentOf))) {
+    if (other === undefined || other === environment) continue;
+    const verdict = await protectedEnvironmentGate.check({
+      harnessDir,
+      deployment: { ...prepared, environment: other },
+      actor,
+      now: now(),
+    });
+    if (!verdict.ok) return verdict;
+  }
+  if (gatesNotRun && environment !== undefined) {
+    const verdict = await protectedEnvironmentGate.check({
+      harnessDir,
+      deployment: { ...prepared, environment },
+      actor,
+      now: now(),
+    });
+    if (!verdict.ok) return verdict;
+  }
+  return undefined;
+}
+
+/**
  * Activate a prepared deployment: run the activation gates against it, move it to `active`
  * with a compare-and-set, then move every other active deployment to `superseded`. Each row
  * restates the whole record. Writes `harness.json` when it is absent. A digest key that
@@ -295,46 +337,25 @@ export async function activateDeployment(request: ActivationRequest): Promise<Ac
     ...prepared,
     ...(environment !== undefined ? { environment } : {}),
   };
-  // Every protected environment whose active build this activation replaces takes its
-  // quorum for this build, whatever the activation names and whichever gates it runs.
-  for (const other of new Set(actives.map(environmentOf))) {
-    if (other === undefined || other === environment) continue;
-    const verdict = await protectedEnvironmentGate.check({
-      harnessDir: request.harnessDir,
-      deployment: { ...prepared, environment: other },
-      actor: request.actor,
-      now: now(),
-    });
-    if (!verdict.ok) {
-      return {
-        ok: false,
-        code: "conflict",
-        message: verdict.reason,
-        current: prepared,
-        ...(verdict.verb !== undefined ? { verb: verdict.verb } : {}),
-      };
-    }
+  const refused = await activationGateRefusal(
+    request.harnessDir,
+    actives,
+    prepared,
+    environment,
+    request.gates === GATES_NOT_RUN,
+    request.actor,
+    now,
+  );
+  if (refused !== undefined) {
+    return {
+      ok: false,
+      code: "conflict",
+      message: refused.reason,
+      current: prepared,
+      ...(refused.verb !== undefined ? { verb: refused.verb } : {}),
+    };
   }
   const gateNames: string[] = [];
-  if (request.gates === GATES_NOT_RUN && environment !== undefined) {
-    // A start that activates what it found never moves a protected environment without
-    // that environment's quorum.
-    const verdict = await protectedEnvironmentGate.check({
-      harnessDir: request.harnessDir,
-      deployment: candidate,
-      actor: request.actor,
-      now: now(),
-    });
-    if (!verdict.ok) {
-      return {
-        ok: false,
-        code: "conflict",
-        message: verdict.reason,
-        current: prepared,
-        ...(verdict.verb !== undefined ? { verb: verdict.verb } : {}),
-      };
-    }
-  }
   if (request.gates !== GATES_NOT_RUN) {
     for (const gate of request.gates) {
       const verdict = await gate.check({
@@ -576,7 +597,11 @@ export type AdmitOptions = {
   readonly cmd?: string;
   readonly now?: () => number;
   /** Decide every refusal without writing: answer `{ ok: true }` where the start would
-   *  record and activate. A restart asks this before it stops a running daemon. */
+   *  record and activate. The digest key, the deployment records, the build and every
+   *  protected-environment check the activation runs are decided from what is on disk now;
+   *  nothing is recorded or activated, and no key is created. A record another command
+   *  changes in between is still refused by the start itself. A restart asks this before it
+   *  stops a running daemon. */
   readonly decideOnly?: boolean;
 };
 
@@ -612,6 +637,53 @@ function preparedMatchingBuild(
   return undefined;
 }
 
+/** The id a decide-only admission gives a build no record names yet: never one `mintId`
+ *  mints, so no approval naming a deployment matches it, as none matches a fresh id. */
+const UNRECORDED_DEPLOYMENT_ID = "dep_unrecorded";
+
+/**
+ * {@link recordAndActivate}'s refusals, decided from the records, the digest key and the
+ * approvals on disk, writing nothing: a digest key that cannot be read refuses (an absent
+ * one is created only by the start itself), deployment records that cannot be read refuse,
+ * the build is the prepared record of exactly this build or the record the start would
+ * write for it, and every protected-environment check its activation runs is asked.
+ */
+async function decideRecordAndActivate(
+  harnessDir: string,
+  target: string,
+  options: AdmitOptions,
+): Promise<AdmitAnswer> {
+  const key = await readDigestKey(harnessDir);
+  if (key.state === "unreadable") {
+    return { ok: false, message: "the harness's digest key cannot be read; nothing was done" };
+  }
+  const read = readDeployments(harnessDir);
+  if (read.state === "unreadable") {
+    return { ok: false, message: `the deployment records can't be read: ${read.reason}` };
+  }
+  const records = read.state === "present" ? read.records : [];
+  const matching = preparedMatchingBuild(
+    harnessDir,
+    options.entry ?? resolvedEntryOf(harnessDir, target),
+  );
+  let prepared = matching === undefined ? undefined : records.find((r) => r["id"] === matching.id);
+  if (prepared === undefined) {
+    const current = currentBuildRecord(harnessDir, target, options.registryId);
+    if ("message" in current) return { ok: false, message: current.message };
+    prepared = { id: UNRECORDED_DEPLOYMENT_ID, ...current.record };
+  }
+  const refused = await activationGateRefusal(
+    harnessDir,
+    records.filter((r) => r["state"] === "active"),
+    prepared,
+    environmentOf(read.state === "present" ? read.active : undefined),
+    true,
+    options.actor,
+    options.now ?? (() => Date.now()),
+  );
+  return refused !== undefined ? { ok: false, message: refused.reason } : { ok: true };
+}
+
 async function recordAndActivate(
   harnessDir: string,
   target: string,
@@ -619,12 +691,7 @@ async function recordAndActivate(
   autostart: boolean,
 ): Promise<AdmitAnswer> {
   if (options.decideOnly === true) {
-    // What would be activated, decided without recording it.
-    if (preparedMatchingBuild(harnessDir, options.entry ?? resolvedEntryOf(harnessDir, target))) {
-      return { ok: true };
-    }
-    const current = currentBuildRecord(harnessDir, target, options.registryId);
-    return "message" in current ? { ok: false, message: current.message } : { ok: true };
+    return decideRecordAndActivate(harnessDir, target, options);
   }
   const now = options.now ?? (() => Date.now());
   // A prepared record of exactly this build (a compile's, with its boot inputs and policy
@@ -659,7 +726,10 @@ async function recordAndActivate(
  * | otherwise (Home, a group start, the server, the SDK) | refused: the build is not active |
  *
  * A build whose files hold a link is refused, naming it. With `decideOnly`, every refusal
- * is answered and nothing is recorded or activated.
+ * the start would make from the records, the digest key and the approvals on disk now is
+ * answered, and nothing is written: no record, no activation, no key, no `harness.json`. A
+ * record another command changes in between is still refused by the start itself, whose
+ * activation applies only while the active deployments are the ones it read.
  *
  * First consumers: the CLI's and Home's supervisor builders, as `SupervisorOptions.admit`.
  */

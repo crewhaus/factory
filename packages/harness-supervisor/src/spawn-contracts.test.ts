@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -483,6 +483,107 @@ describe("a loader setting an env file names never reaches the child, whatever i
       ),
     ]).toEqual(["A", "B", "C", "D", "E", "LD_PRELOAD"]);
   });
+});
+
+describe("on Windows a loader setting is one name in any letter case", () => {
+  const WIN_ENV = "bun_options=--preload ./x.ts\nPath=.\\bin\nNode_Options=--require x\n";
+  const MANAGER_PATH = "C:\\Windows\\system32";
+
+  function emptyDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "chsup-manager-"));
+    roots.push(dir);
+    return dir;
+  }
+
+  test("every spelling an env file uses is left out, and the manager's PATH is the one PATH", () => {
+    const dir = tempHarness({ env: WIN_ENV });
+    const spawn = buildSpawnEnv({
+      harnessRoot: dir,
+      managerCwd: emptyDir(),
+      processEnv: { Path: MANAGER_PATH },
+      platform: "win32",
+    });
+    const names = Object.keys(spawn.env).map((k) => k.toUpperCase());
+    expect(names).not.toContain("BUN_OPTIONS");
+    expect(names).not.toContain("NODE_OPTIONS");
+    const paths = Object.entries(spawn.env).filter(([k]) => k.toUpperCase() === "PATH");
+    expect(paths).toEqual([["Path", MANAGER_PATH]]);
+    // Named by an env file and left out, as written; the PATH the manager supplies is not.
+    expect(spawn.dropped).toEqual(["Node_Options", "bun_options"]);
+  });
+
+  test("a manager setting wins over an env file's spelling of the same name", () => {
+    const dir = tempHarness({ env: "api_url=http://from-the-file\n" });
+    const spawn = buildSpawnEnv({
+      harnessRoot: dir,
+      managerCwd: emptyDir(),
+      processEnv: { API_URL: "http://from-the-manager" },
+      platform: "win32",
+    });
+    const urls = Object.entries(spawn.env).filter(([k]) => k.toUpperCase() === "API_URL");
+    expect(urls).toEqual([["API_URL", "http://from-the-manager"]]);
+  });
+
+  test("a manager loader setting an env file names in another spelling is left out too", () => {
+    const dir = tempHarness({ env: "node_options=--require x\n" });
+    const spawn = buildSpawnEnv({
+      harnessRoot: dir,
+      managerCwd: emptyDir(),
+      processEnv: { NODE_OPTIONS: "--require x", Path: MANAGER_PATH },
+      platform: "win32",
+    });
+    expect(Object.keys(spawn.env).map((k) => k.toUpperCase())).not.toContain("NODE_OPTIONS");
+    expect(spawn.dropped).toEqual(["NODE_OPTIONS", "node_options"]);
+  });
+
+  test("elsewhere names are compared as written", () => {
+    const dir = tempHarness({ env: WIN_ENV });
+    const spawn = buildSpawnEnv({
+      harnessRoot: dir,
+      managerCwd: emptyDir(),
+      processEnv: { PATH: "/usr/bin" },
+      platform: "linux",
+    });
+    expect(spawn.env["bun_options"]).toBe("--preload ./x.ts");
+    expect(spawn.env["Node_Options"]).toBe("--require x");
+    expect(spawn.env["PATH"]).toBe("/usr/bin");
+    expect(spawn.dropped).toEqual([]);
+  });
+
+  test.skipIf(process.platform !== "win32")(
+    "a child spawned with the env runs no preload an env file names",
+    async () => {
+      const dir = tempHarness();
+      const marker = join(dir, "preloaded.marker");
+      const preload = join(dir, "x.ts");
+      writeFileSync(
+        preload,
+        `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "preloaded");\n`,
+      );
+      writeFileSync(join(dir, ".env"), `bun_options=--preload ${preload}\n`);
+      const managerCwd = emptyDir();
+      const spawn = buildSpawnEnv({
+        harnessRoot: dir,
+        managerCwd,
+        processEnv: { ...process.env },
+      });
+      const run = async (env: Record<string, string>): Promise<boolean> => {
+        rmSync(marker, { force: true });
+        const child = Bun.spawn([process.execPath, "-e", "0"], {
+          cwd: managerCwd,
+          env,
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        await child.exited;
+        return existsSync(marker);
+      };
+      // The probe can see a preload: the manager's own BUN_OPTIONS runs it.
+      expect(await run({ ...spawn.env, BUN_OPTIONS: `--preload ${preload}` })).toBe(true);
+      expect(await run(spawn.env)).toBe(false);
+    },
+    20_000, // two Bun subprocesses on a Windows runner
+  );
 });
 
 describe("shared fleet env files (manager.envFiles)", () => {

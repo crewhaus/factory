@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { REGISTRY_FILENAME } from "./doc";
+import { REGISTRY_FILENAME, isWellFormedHome, normalizeDoc } from "./doc";
 import { HARNESS_IDENTITY_REL, readHarnessIdentityFile } from "./identity";
 import { isAdopted, openHangarRegistry, runsOwnCode, slugOf } from "./registry";
 
@@ -166,9 +166,84 @@ describe("adoption", () => {
     expect(isAdopted(row("2026-11-11T00:00:00.000Z"), since)).toBe(true);
     expect(isAdopted(row(since), since)).toBe(false);
     expect(isAdopted(row("2026-11-13T00:00:00.000Z"), since)).toBe(false);
-    expect(isAdopted(row("2026-11-13T00:00:00.000Z", { adoptedAt: "t", by: "x" }), since)).toBe(
+    expect(isAdopted(row("2026-11-13T00:00:00.000Z", { adoptedAt: since, by: "x" }), since)).toBe(
       true,
     );
+  });
+});
+
+describe("only a well-formed home is adoption", () => {
+  const SINCE = "2026-11-12T00:00:00.000Z";
+  const STAMP = "2026-11-12T08:00:00.000Z";
+  const MALFORMED: readonly unknown[] = [
+    null,
+    false,
+    "yes",
+    {},
+    [],
+    { adoptedAt: 1, by: "x" },
+    { adoptedAt: "nope", by: "x" },
+    { adoptedAt: STAMP, by: "" },
+    { adoptedAt: STAMP },
+    { by: "x" },
+  ];
+  const row = (registeredAt: string, home: unknown) =>
+    ({ registeredAt, home }) as unknown as Parameters<typeof isAdopted>[0];
+
+  test("isWellFormedHome takes only {adoptedAt: a timestamp, by: a name}", () => {
+    for (const home of MALFORMED) expect(isWellFormedHome(home)).toBe(false);
+    expect(isWellFormedHome({ adoptedAt: STAMP, by: "prn_x" })).toBe(true);
+  });
+
+  test("a malformed home runs no own code, and adoption is decided by registration alone", () => {
+    for (const home of MALFORMED) {
+      expect(runsOwnCode(row("2026-11-13T00:00:00.000Z", home))).toBe(false);
+      // Registered after adoption began: not adopted.
+      expect(isAdopted(row("2026-11-13T00:00:00.000Z", home), SINCE)).toBe(false);
+      // Registered before it: counted as adopted for a group start, as any such row is.
+      expect(isAdopted(row("2026-11-11T00:00:00.000Z", home), SINCE)).toBe(true);
+    }
+    const adopted = row("2026-11-13T00:00:00.000Z", { adoptedAt: STAMP, by: "prn_x" });
+    expect(runsOwnCode(adopted)).toBe(true);
+    expect(isAdopted(adopted, SINCE)).toBe(true);
+  });
+
+  test("a registry loads a malformed home as no home, and a well-formed one as it is", () => {
+    const root = newRoot();
+    const reg = registry(root);
+    const dirs = MALFORMED.map((_, i) => harnessDir(root, `bad-${i}`));
+    for (const dir of dirs) reg.upsert({ dir, specName: "bot" });
+    const good = harnessDir(root, "good");
+    reg.upsert({ dir: good, specName: "good" });
+    const file = join(root, "registry", REGISTRY_FILENAME);
+    const doc = JSON.parse(readFileSync(file, "utf8")) as {
+      harnesses: Record<string, unknown>[];
+    };
+    const home = { adoptedAt: STAMP, by: "prn_x" };
+    for (const entry of doc.harnesses) {
+      const at = dirs.indexOf(entry["dir"] as string);
+      entry["home"] = at >= 0 ? MALFORMED[at] : home;
+    }
+    writeFileSync(file, JSON.stringify(doc));
+    const reread = registry(root).list();
+    for (const dir of dirs) {
+      const entry = reread.find((e) => e.dir === dir);
+      expect(entry).toBeDefined();
+      expect(entry !== undefined && "home" in entry).toBe(false);
+    }
+    expect(reread.find((e) => e.dir === good)?.home).toEqual(home);
+    const { doc: normalized } = normalizeDoc(
+      {
+        v: 2,
+        harnesses: [
+          { dir: good, home: "yes" },
+          { dir: dirs[0], home },
+        ],
+      },
+      { nowIso: STAMP, mint: () => "hrn_00000000000000cc" },
+    );
+    expect("home" in (normalized.harnesses.find((e) => e.dir === good) ?? {})).toBe(false);
+    expect(normalized.harnesses.find((e) => e.dir === dirs[0])?.home).toEqual(home);
   });
 });
 

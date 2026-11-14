@@ -516,6 +516,8 @@ export type SpawnEnvInput = {
   /** Caller-stamped variables that win over everything (ports, control
    *  token; the trace stamps are applied here too). */
   readonly extra?: Readonly<Record<string, string>>;
+  /** The platform whose name rules apply; `process.platform` when omitted. */
+  readonly platform?: NodeJS.Platform;
 };
 
 export type SpawnEnv = {
@@ -531,7 +533,9 @@ export type SpawnEnv = {
 /**
  * Loader and interpreter settings a supervised start takes only from the environment the
  * manager was started with, never from a harness's env files. Matched by exact name here
- * and by family in `LOADER_ENV_PREFIXES`; names are compared as written.
+ * and by family in `LOADER_ENV_PREFIXES`. On Windows, where an environment name is one
+ * name in any letter case, a name matches in any spelling; elsewhere names are compared as
+ * written.
  */
 export const LOADER_ENV_KEYS = [
   "BUN_OPTIONS",
@@ -573,10 +577,23 @@ export const LOADER_ENV_PREFIXES = ["GIT_CONFIG_", "LD_", "DYLD_", "BASH_FUNC_"]
 
 const LOADER_ENV_KEY_SET: ReadonlySet<string> = new Set(LOADER_ENV_KEYS);
 
-/** Whether a name is a loader setting a spawn takes only from the manager's environment. */
-export function isLoaderEnvKey(name: string): boolean {
+/** A name as `platform` compares it: upper-cased on Windows, as written elsewhere. */
+function envNameOn(platform: NodeJS.Platform): (name: string) => string {
+  return platform === "win32" ? (name) => name.toUpperCase() : (name) => name;
+}
+
+/**
+ * Whether a name is a loader setting a spawn takes only from the manager's environment. On
+ * Windows (`platform`, `process.platform` when omitted) every spelling of the name matches.
+ */
+export function isLoaderEnvKey(
+  name: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const compared = envNameOn(platform)(name);
   return (
-    LOADER_ENV_KEY_SET.has(name) || LOADER_ENV_PREFIXES.some((prefix) => name.startsWith(prefix))
+    LOADER_ENV_KEY_SET.has(compared) ||
+    LOADER_ENV_PREFIXES.some((prefix) => compared.startsWith(prefix))
   );
 }
 
@@ -611,9 +628,14 @@ export function dotenvAssignedNames(text: string): Set<string> {
 /**
  * The loader settings any of Bun's env files in `dirs` assigns, by name, whatever the value
  * and whichever mode would read the file. A caller leaves each one out by name, whatever
- * value it holds.
+ * value it holds. On Windows (`platform`, `process.platform` when omitted) the names are
+ * upper-cased, so every spelling of one setting is one name.
  */
-export function loaderKeysInEnvFiles(dirs: readonly string[]): Set<string> {
+export function loaderKeysInEnvFiles(
+  dirs: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+): Set<string> {
+  const compared = envNameOn(platform);
   const found = new Set<string>();
   for (const dir of new Set(dirs)) {
     for (const name of BUN_DOTENV_FILES) {
@@ -623,7 +645,9 @@ export function loaderKeysInEnvFiles(dirs: readonly string[]): Set<string> {
       } catch {
         continue;
       }
-      for (const key of dotenvAssignedNames(text)) if (isLoaderEnvKey(key)) found.add(key);
+      for (const key of dotenvAssignedNames(text)) {
+        if (isLoaderEnvKey(key, platform)) found.add(compared(key));
+      }
     }
   }
   return found;
@@ -634,35 +658,57 @@ export function loaderKeysInEnvFiles(dirs: readonly string[]): Set<string> {
  * `process.env`, then the manager's own stamps. The same record is what the
  * preflight gate must evaluate — checking a different env than the spawn
  * gets is how "it passed preflight and then died on a missing key" happens.
+ *
+ * On Windows (`platform`), names that differ only in letter case are one name: the env
+ * holds one spelling of each, the later source's, and a loader setting is taken only from
+ * the manager's environment, whatever spelling either side uses.
  */
 export function buildSpawnEnv(input: SpawnEnvInput): SpawnEnv {
+  const platform = input.platform ?? process.platform;
+  const compared = envNameOn(platform);
   const chain =
     input.envChain ?? loadEnvChain(input.harnessRoot, { nodeEnv: input.processEnv["NODE_ENV"] });
   const env: Record<string, string> = {};
+  // The spelling `env` holds for each compared name, so a later source replaces it.
+  const spelling = new Map<string, string>();
+  const set = (k: string, v: string): void => {
+    const name = compared(k);
+    const held = spelling.get(name);
+    if (held !== undefined && held !== k) Reflect.deleteProperty(env, held);
+    spelling.set(name, k);
+    env[k] = v;
+  };
   const dropped = new Set<string>();
   for (const [k, v] of Object.entries(chain.vars)) {
-    if (isLoaderEnvKey(k)) {
+    if (isLoaderEnvKey(k, platform)) {
       dropped.add(k);
       continue;
     }
-    env[k] = v;
+    set(k, v);
   }
+  const chainHolds = (k: string, v: string): boolean =>
+    Object.entries(chain.vars).some(([ck, cv]) => cv === v && compared(ck) === compared(k));
   // A loader setting any of Bun's env files in the harness or the manager's directory
   // assigns is left out by name, whatever its value. `PATH` is the one exception: the child
   // always runs with the manager's `PATH`.
-  const fromFiles = loaderKeysInEnvFiles([input.harnessRoot, input.managerCwd ?? process.cwd()]);
+  const fromFiles = loaderKeysInEnvFiles(
+    [input.harnessRoot, input.managerCwd ?? process.cwd()],
+    platform,
+  );
   for (const [k, v] of Object.entries(input.processEnv)) {
     if (typeof v !== "string") continue;
-    if (isLoaderEnvKey(k) && k !== "PATH" && (fromFiles.has(k) || chain.vars[k] === v)) {
+    const name = compared(k);
+    const loader = isLoaderEnvKey(k, platform);
+    if (loader && name !== "PATH" && (fromFiles.has(name) || chainHolds(k, v))) {
       dropped.add(k);
       continue;
     }
-    if (isLoaderEnvKey(k)) dropped.delete(k);
-    env[k] = v;
+    if (loader) for (const d of [...dropped]) if (compared(d) === name) dropped.delete(d);
+    set(k, v);
   }
-  env["CREWHAUS_TRACE"] = "json";
-  env["CREWHAUS_COST_TRACKING"] = "1";
-  for (const [k, v] of Object.entries(input.extra ?? {})) env[k] = v;
+  set("CREWHAUS_TRACE", "json");
+  set("CREWHAUS_COST_TRACKING", "1");
+  for (const [k, v] of Object.entries(input.extra ?? {})) set(k, v);
 
   const overrides: EnvOverride[] = [];
   for (const name of OVERRIDE_ENV_KEYS) {

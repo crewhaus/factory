@@ -5,7 +5,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { readOperatorRecord } from "@crewhaus/control-records";
 import { entryPointMode, gateEntryPoint } from "./operator-gate";
 import { resolveScheduleJob } from "./schedule-generate";
@@ -222,6 +222,82 @@ describe("gateEntryPoint", () => {
       expect(argv[0]).toBe(target === "flywheel" ? "flywheel" : "eval");
       expect(gate(dir, argv).exit).toBe(38);
     }
+  });
+});
+
+describe("the entry gate checks the spec's own directory and the working directory", () => {
+  test("a spec in a disabled harness, run from an enabled directory, exits 38 naming that harness", () => {
+    const disabled = harness("disabled");
+    const cwd = harness("absent");
+    for (const argv of [
+      ["serve", join(disabled, "crewhaus.yaml")],
+      ["dev", join(disabled, "crewhaus.yaml")],
+      ["run", join(disabled, "crewhaus.yaml"), "--prompt", "x"],
+      ["eval", join(disabled, "crewhaus.yaml"), "--dataset", "d"],
+      ["optimize", join(disabled, "crewhaus.yaml")],
+      ["flywheel", "run", join(disabled, "crewhaus.yaml")],
+      ["dream", "run", join(disabled, "crewhaus.yaml")],
+    ]) {
+      const got = gate(cwd, argv);
+      expect([argv[0], got.exit]).toEqual([argv[0], 38]);
+      expect(got.out).toBe(
+        "gate-fixture is disabled by its operator, so this doesn't run. `crewhaus daemon enable` allows it again.\n",
+      );
+    }
+    // A relative path names the same directory.
+    const sibling = relative(cwd, join(disabled, "crewhaus.yaml"));
+    expect(gate(cwd, ["serve", sibling]).exit).toBe(38);
+  });
+
+  test("a spec in an enabled harness, run from a disabled directory, still exits 38", () => {
+    const enabled = harness("absent");
+    expect(gate(harness("disabled"), ["serve", join(enabled, "crewhaus.yaml")]).exit).toBe(38);
+  });
+
+  test("a spec in an enabled harness, run from an enabled directory, passes the gate", () => {
+    const enabled = harness("absent");
+    const got = gate(harness("absent"), ["serve", join(enabled, "crewhaus.yaml")]);
+    expect(got).toEqual({ out: "" });
+  });
+
+  test("an eval suite is checked against each spec it runs, not the manifest's directory", () => {
+    const disabled = harness("disabled");
+    const cwd = harness("absent");
+    const disabledSpec = join(disabled, "crewhaus.yaml");
+    const suite = (spec: string | undefined, at: string = cwd): string => {
+      const path = join(at, "suite.yaml");
+      const entry = `      - name: e1\n        dataset: d.jsonl\n        graders: g.yaml\n        thresholds: { min_pass_rate: 0.5 }\n${spec === undefined ? "" : `        spec: ${JSON.stringify(spec)}\n`}`;
+      writeFileSync(path, `name: s\ntiers:\n  fast:\n${entry}`);
+      return path;
+    };
+    const refusal =
+      "gate-fixture is disabled by its operator, so this doesn't run. `crewhaus daemon enable` allows it again.\n";
+    // --spec overrides every entry's spec, so its directory is checked.
+    suite(undefined);
+    const overridden = gate(cwd, ["eval", "suite", "suite.yaml", "--spec", disabledSpec]);
+    expect(overridden).toEqual({ exit: 38, out: refusal });
+    // An entry's own spec, resolved from the working directory as the verb resolves it.
+    suite(relative(cwd, disabledSpec));
+    expect(gate(cwd, ["eval", "suite", "suite.yaml"])).toEqual({ exit: 38, out: refusal });
+    // --spec replaces the entry's spec: an enabled override runs.
+    const enabledSpec = join(harness("absent"), "crewhaus.yaml");
+    expect(gate(cwd, ["eval", "suite", "suite.yaml", "--spec", enabledSpec])).toEqual({ out: "" });
+    // The manifest's own directory is not a spec the suite runs.
+    const inDisabled = suite(join(cwd, "crewhaus.yaml"), disabled);
+    expect(gate(cwd, ["eval", "suite", inDisabled])).toEqual({ out: "" });
+  });
+
+  test("the stricter verdict decides: a disabled spec directory outranks a paused working directory", () => {
+    const disabled = harness("disabled");
+    const got = gate(harness("paused"), ["run", join(disabled, "crewhaus.yaml"), "--prompt", "x"]);
+    expect(got.exit).toBe(38);
+    expect(got.out).toContain("is disabled by its operator");
+    // A paused spec directory refuses a run, and --ignore-pause lifts both pauses.
+    const paused = harness("paused");
+    const argv = ["run", join(paused, "crewhaus.yaml"), "--prompt", "x"];
+    expect(gate(harness("absent"), argv).exit).toBe(39);
+    const ignored = gate(harness("paused"), [...argv, "--ignore-pause"]);
+    expect(ignored).toEqual({ out: "Running although new work is paused (--ignore-pause).\n" });
   });
 });
 
