@@ -161,3 +161,34 @@ describe("mintScopedToken and verifyScopedToken", () => {
     }
   });
 });
+
+describe("supervisor executions", () => {
+  test("a <hrn>/exec/run_<16 hex> ref mints, and verifies with that ref", async () => {
+    const { home, a, credential } = await serviceHome({ contentRead: true });
+    const ref = `${a.id}/exec/run_0123456789abcdef`;
+    const token = tokenOf(
+      await mintScopedToken(
+        home.root,
+        { credential, refs: [ref], acts: ["run.result.read"] },
+        { now: home.clock.now },
+      ),
+    );
+    const verified = await verifyScopedToken(
+      token,
+      home.snapshot(),
+      await ensureScopedKey(home.root),
+      home.clock.now(),
+    );
+    expect(verified.ok && verified.refs).toEqual([ref]);
+  });
+
+  test("an eval run's ref is refused as not a run", async () => {
+    const { home, a, credential } = await serviceHome();
+    const answer = await mintScopedToken(
+      home.root,
+      { credential, refs: [`${a.id}/evalrun/run_0123456789abcdef`], acts: ["run.result.read"] },
+      { now: home.clock.now },
+    );
+    expect(answer.ok === false && answer.reason).toBe("ref");
+  });
+});

@@ -239,6 +239,44 @@ export function domainOf(permission: string): string | undefined {
 }
 
 /**
+ * What a member's personal token may never do, whatever the member holds: manage access
+ * (which decides who signs in and mints every other token) or Home's own settings.
+ */
+const NOT_FROM_A_PERSONAL_TOKEN: ReadonlySet<string> = new Set([
+  "home.access.manage",
+  "home.settings.manage",
+]);
+
+/**
+ * The cap a personal token puts on its member: a refusal, or `undefined` when the token
+ * leaves the member's own answer standing. An actor that names a credential that is not
+ * the member's live personal token holds nothing.
+ */
+function personalCap(
+  snapshot: AccessSnapshot,
+  actor: AccessActor,
+  permission: string,
+  now: number,
+): AuthorizeVerdict | undefined {
+  if (!("credential" in actor)) return undefined;
+  const credential = snapshot.tokens.find((row) => row.id === actor.credential);
+  if (
+    credential === undefined ||
+    credential.principal !== actor.principal ||
+    credential.kind !== "personal" ||
+    !isLiveCredential(snapshot, credential, now)
+  ) {
+    return refuse(permission, null);
+  }
+  if (NOT_FROM_A_PERSONAL_TOKEN.has(permission)) return refuse(permission, null);
+  if (credential.readOnly === true) {
+    const floor = isPermission(permission) ? PERMISSION_DECLS[permission].floor : "none";
+    if (floor !== "viewer") return refuse(permission, null);
+  }
+  return undefined;
+}
+
+/**
  * Whether `actor` holds `permission` on `target`, over a snapshot read. An absent or
  * unreadable snapshot, a system or unknown actor, a removed principal and an unknown
  * permission are refused. A permission of a registered domain goes to that domain's
@@ -263,6 +301,12 @@ export function authorize(
     principal.kind === "member"
       ? roleAt(snapshot, principal.id, permission, target, options.now)
       : null;
+  // A member through a personal token: capped at the member's own grants, never managing
+  // access, and only reading when the token says so.
+  if (principal.kind === "member") {
+    const capped = personalCap(snapshot, actor, permission, options.now);
+    if (capped !== undefined) return refuse(permission, memberRole);
+  }
   const domain = domainOf(permission);
   if (domain !== undefined) {
     const checker = options.domains?.get(domain);

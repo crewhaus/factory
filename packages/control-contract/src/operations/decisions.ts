@@ -48,4 +48,16 @@ export const DECISION_OPERATIONS = [
     cliTwin: TWINS.approvalsSupersede,
     qualifiers: ["maintainer-or-above"],
   },
+  {
+    id: "decisions.defer",
+    method: "POST",
+    path: "/api/v1/decisions/{ref}/defer",
+    permission: "h.decision.resolve",
+    receipt: "harness",
+    idempotency: "accepted",
+    request: "decisionDeferRequest",
+    response: "decisionResolved",
+    cliTwin: TWINS.approvalsDefer,
+    qualifiers: [],
+  },
 ] as const;

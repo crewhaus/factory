@@ -16,6 +16,7 @@ import { timingSafeEqual } from "node:crypto";
 import {
   ISSUED_SECRET_RES,
   SCOPED_ACTS,
+  SCOPED_REF_KINDS,
   type ScopedAct,
   isId,
   parseRef,
@@ -62,7 +63,7 @@ export type ScopedClaims = {
 export type ScopedMintInput = {
   /** The service token the browser's token is minted from, `crd_…`. */
   readonly credential: string;
-  /** `<hrn_…>/run/<run id>` refs: what the token may read. */
+  /** `<hrn_…>/run/<run id>` and `<hrn_…>/exec/run_<16 hex>` refs: what the token may read. */
   readonly refs: readonly string[];
   readonly acts: readonly string[];
   /** At most 15 minutes; 15 by default. */
@@ -109,10 +110,15 @@ function isScopedAct(value: unknown): value is ScopedAct {
   return typeof value === "string" && (SCOPED_ACTS as readonly string[]).includes(value);
 }
 
-/** A run ref's harness, or `undefined` for anything that is not a run ref. */
+/**
+ * A run ref's harness, or `undefined` for anything that is not one. A run is named `run`
+ * and a supervisor's execution `exec` (`scopedRunRef`); no other kind is read.
+ */
 function runRefHarness(ref: unknown): string | undefined {
   const parsed = parseRef(ref);
-  if ("error" in parsed || parsed.kind !== "run") return undefined;
+  if ("error" in parsed || !(SCOPED_REF_KINDS as readonly string[]).includes(parsed.kind)) {
+    return undefined;
+  }
   return parsed.scope;
 }
 

@@ -72,10 +72,11 @@ import {
   ensureToken,
   loadAccessSnapshot,
   localActorOf,
+  openDeviceRequests,
   openSignIn,
   readOwnerSettings,
 } from "@crewhaus/access-control";
-import { DEPLOYMENT_ID_RE, parseRef } from "@crewhaus/control-contract";
+import { DEPLOYMENT_ID_RE, PROTOCOL_ID, parseRef } from "@crewhaus/control-contract";
 import {
   AREA_RUNTIMES,
   type RecoverCounts,
@@ -290,6 +291,7 @@ import {
 import { SIGN_IN_ROUTES, isSignInPath, serveSignIn } from "./sign-in-routes";
 import { BADGE_KEYS, capabilityBadges, specView } from "./spec-view";
 import { assetResponse } from "./static-cache";
+import { createV1Router, daemonStateOf } from "./v1/router";
 
 export type StaticAsset = {
   readonly body: string | Uint8Array;
@@ -581,6 +583,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     bootToken: tokenSetup?.token,
     now,
     domains: new Map(),
+    onWarn,
   };
   for (const [name, checker] of Object.entries(opts.domains ?? {})) {
     registerHomeDomain(homeAccess, name, checker);
@@ -2461,11 +2464,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     // the M3 route while `GET …/evals/run_…` falls through to the M2 branch
     // below untouched. A param that fails its shape guard does not match at
     // all, so a malformed id still meets the M1/M2 chain's own 400.
+    if (head === "v1") return await v1Router.handle(req, url, segs);
+
     const m3 = matchM3(method, ["api", ...segs]);
     if (m3 !== undefined) return await runM3(req, url, m3);
 
     if (head === "version" && rest.length === 0 && method === "GET") {
-      return json({ hangar: version, protocolV: PROTOCOL_V });
+      return json({ hangar: version, protocolV: PROTOCOL_V, api: [PROTOCOL_ID] });
     }
 
     // Mint a fresh single-use browser handoff. `crewhaus hangar open` reads
@@ -3084,6 +3089,36 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     return errResponse(404, "not found");
   };
 
+  // The versioned API: its operations are its routes, behind the same choke point.
+  const deviceRequests = openDeviceRequests(hangarRoot, { now });
+  const v1Router = createV1Router({
+    hangarRoot,
+    registry,
+    control: controlService,
+    home: homeAccess,
+    devices: deviceRequests,
+    now,
+    onWarn,
+    version,
+    ...(ownerSettings.baseUrl !== undefined ? { baseUrl: ownerSettings.baseUrl } : {}),
+    harnessScrub,
+    fleetScrub,
+    daemonState: async (entry) => daemonStateOf((await processFor(entry)).snapshot().state),
+    daemonStatus: async (entry) => {
+      const status = await control.status(controlTarget(await processFor(entry)));
+      return status.ok
+        ? { ok: true, body: status.body as unknown as Record<string, unknown> }
+        : { ok: false, reason: status.reason };
+    },
+    stopDaemon: async (entry) => {
+      const handle = await processFor(entry);
+      const stopped = await handle.supervisor.stop();
+      return stopped.stopped
+        ? { ok: true, detail: `stopped${stopped.forced ? " (forced)" : ""}` }
+        : { ok: false, detail: "a live daemon holds the runfile but was not adopted" };
+    },
+  });
+
   const withReceipt = createReceipts({
     control: controlService,
     harness: (id) => registry.get(id),
@@ -3212,7 +3247,29 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
     if (isSignInPath(pathname)) {
       if (noAuth) return errResponse(404, "not found");
-      return await serveSignIn(homeAccess, req, peer, pathname);
+      return await serveSignIn(homeAccess, req, peer, pathname, {
+        devices: deviceRequests,
+        ...(ownerSettings.baseUrl !== undefined ? { baseUrl: ownerSettings.baseUrl } : {}),
+        onInviteAccepted: async ({ principal }) => {
+          // Joining is on record, as the member who joined.
+          const answer = await controlService.commands.submit(
+            { kind: "auth.acceptInvite", actor: principal, ledger: "workspace", via: "home" },
+            async () => ({ settle: { state: "succeeded" }, value: undefined }),
+          );
+          if (!answer.ok)
+            onWarn(`hangar-server: a join was not recorded: ${answer.refusal.message}`);
+          return answer.ok ? answer.receipt : undefined;
+        },
+      });
+    }
+
+    // Discovery is answered before the gate for a caller with no credential at all, so a
+    // client learns how to sign in; a credential that is refused hears that refusal.
+    if (pathname === "/api/v1" && req.method === "GET" && !noAuth) {
+      const checked = await checkAccess(homeAccess, req, peer);
+      if (checked.answer.kind === "anonymous") return v1Router.discoverAnonymous();
+      const refused = refusalOf(checked.answer);
+      if (refused !== undefined) return refusalResponse(pathname, refused);
     }
 
     if (pathname === "/api" || pathname.startsWith("/api/")) {
@@ -3252,6 +3309,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         ...(matched.row.key === "runProof"
           ? { runProofHarness: proofOwner(matched.params["sessionId"], url) }
           : {}),
+        ...(matched.row.v1 === true ? v1Router.targetOf(matched, url, caller) : {}),
         origin: req.headers.get("origin"),
         ownOrigin,
       });

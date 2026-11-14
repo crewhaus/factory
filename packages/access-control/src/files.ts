@@ -130,6 +130,25 @@ function writeWhole(root: string, rel: string, text: string): WriteAnswer {
   return written.ok ? { ok: true } : { ok: false, reason: written.reason };
 }
 
+/**
+ * A small JSON object file under the Hangar root, read without following a link and
+ * capped. Absent, present or unreadable, with the reason naming the file, never a value.
+ *
+ * First consumers: the device sign-in requests and the usage record.
+ */
+export function readJsonFile(
+  root: string,
+  rel: string,
+  maxBytes: number,
+): FileRead<Record<string, unknown>> {
+  return readJsonObject(root, rel, maxBytes);
+}
+
+/** Rewrite a small JSON file whole, `0600`. The caller holds the file's own lock. */
+export function writeJsonFile(root: string, rel: string, value: unknown): WriteAnswer {
+  return writeWhole(root, rel, `${JSON.stringify(value)}\n`);
+}
+
 /** Rewrite `access/subjects.json`. Under the access lock only. */
 export function writeSubjects(root: string, subjects: Subjects): WriteAnswer {
   return writeWhole(root, accessPaths().subjects, subjectsText(subjects));

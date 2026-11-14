@@ -38,6 +38,7 @@ describe("the composition", () => {
       "controls.resume",
       "controls.start",
       "controls.stop",
+      "decisions.defer",
       "decisions.resolve",
       "decisions.supersede",
       "deployments.activate",
@@ -45,6 +46,7 @@ describe("the composition", () => {
       "rules.revoke",
     ]);
     expect(Object.keys(CORE_RUNTIME.reconcilers ?? {}).sort()).toEqual([
+      "auth.device.decide",
       "controls.disable",
       "controls.enable",
       "controls.pause",
@@ -63,6 +65,7 @@ describe("the composition", () => {
       "controls.enable",
       "controls.pause",
       "controls.resume",
+      "decisions.defer",
       "decisions.resolve",
       "decisions.supersede",
       "rules.create",

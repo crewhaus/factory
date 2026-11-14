@@ -1032,3 +1032,266 @@ describe("an item about people is released only by a people domain", () => {
     expect(calls).toHaveLength(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The versioned API: every served operation, through the same choke point
+// ---------------------------------------------------------------------------
+
+describe("the versioned API: every served operation, for every role and credential", () => {
+  type V1Cred = (typeof CREDS)[number] | "personalA" | "personalReadOnlyA";
+  const V1_CREDS: readonly V1Cred[] = [...CREDS, "personalA", "personalReadOnlyA"];
+  const extra: Record<string, Cred> = {};
+
+  beforeAll(async () => {
+    const { openDeviceRequests } = await import("@crewhaus/access-control");
+    const devices = openDeviceRequests(world.t.hangarRoot);
+    const collect = async (readOnly: boolean): Promise<string> => {
+      const start = await devices.start({ ...(readOnly ? { readOnly: true } : {}) });
+      if (!start.ok) throw new Error(start.reason);
+      const decided = await devices.decide({
+        caller: world.principals["maintainerA"] as string,
+        code: start.userCode,
+        choice: "allow",
+      });
+      if (!decided.ok) throw new Error(decided.reason);
+      const polled = await devices.poll(start.pollRef);
+      if (!polled.ok || polled.state !== "allowed") throw new Error("no personal token");
+      return polled.secret;
+    };
+    extra["personalA"] = { name: "personalA", headers: bearer(await collect(false)) };
+    extra["personalReadOnlyA"] = {
+      name: "personalReadOnlyA",
+      headers: bearer(await collect(true)),
+    };
+  }, 30_000);
+
+  const credOf = (name: V1Cred): Cred => (world.creds[name] ?? extra[name]) as Cred;
+
+  /** The served operations: a handler answers each. */
+  async function servedOps() {
+    const { OPERATIONS } = await import("@crewhaus/control-contract");
+    const { HOME_AREAS, handlersOf } = await import("./v1/areas");
+    const handlers = handlersOf(HOME_AREAS);
+    return OPERATIONS.filter((op) => handlers.has(op.id));
+  }
+
+  const ULID_SAMPLE = "01m76e6f05hp514w9j4v3qymka";
+  function v1PathOf(path: string): string {
+    return path.replace(/\{(\w+)\}/g, (_m, name: string) => {
+      if (name === "h") return world.a;
+      if (name === "ref") return `${world.a}/decision/appr_00000000000000a1`;
+      return `${name}_${ULID_SAMPLE}`;
+    });
+  }
+
+  const DEVICE_APPROVAL = new Set(["auth.device.lookup", "auth.device.decide"]);
+  const NOT_FROM_A_TOKEN = new Set(["home.access.manage", "home.settings.manage"]);
+
+  /** The choke point's answer for one operation, from the role matrix. */
+  function v1Expected(
+    op: { id: string; permission: string; path: string; qualifiers: readonly string[] },
+    cred: V1Cred,
+  ): string {
+    const row = {
+      key: op.id,
+      permission: op.permission,
+      path: op.path.replace("{h}", ":id"),
+    } as RouteRow;
+    const selfRow = op.qualifiers.includes("self") && op.id.startsWith("access.");
+    const isPublic = op.permission === "public";
+    const device = DEVICE_APPROVAL.has(op.id);
+    const harnessAbout = op.path.includes("{h}") || op.path.includes("{ref}");
+    const cmdRow = op.path.includes("{cmd}");
+    const member = (
+      grants: Grants,
+      opts: { personal?: boolean; readOnly?: boolean } = {},
+    ): string => {
+      if (isPublic) return ALLOW;
+      if (device && opts.personal === true) return "403 session_required";
+      if (op.permission === "authenticated") return ALLOW;
+      const decl = PERMISSION_DECLS[op.permission as keyof typeof PERMISSION_DECLS];
+      const capped = (permission: string): boolean =>
+        opts.personal === true &&
+        (NOT_FROM_A_TOKEN.has(permission) ||
+          (opts.readOnly === true &&
+            PERMISSION_DECLS[permission as keyof typeof PERMISSION_DECLS].floor !== "viewer"));
+      const refuse = "403 permission";
+      if (decl.scope === "home") {
+        const held = !capped(op.permission) && memberOutcome(row, grants) === ALLOW;
+        if (held) return ALLOW;
+        // One's own tokens, links and devices: any live grant covers them.
+        if (selfRow && Object.values(grants).length > 0) return ALLOW;
+        return refuse;
+      }
+      if (capped(op.permission)) return refuse;
+      if (cmdRow) return refuse; // names no receipt this Home has: nothing to authorize against
+      if (harnessAbout) return holds(best(grants.home, grants.a), op.permission) ? ALLOW : refuse;
+      return [grants.home, grants.a, grants.b].some((role) => holds(role, op.permission))
+        ? ALLOW
+        : refuse;
+    };
+    switch (cred) {
+      case "owner":
+      case "bootstrap":
+        return ALLOW;
+      case "maintainerA":
+        return member({ a: "maintainer" });
+      case "operatorA":
+        return member({ a: "operator" });
+      case "viewerA":
+        return member({ a: "viewer" });
+      case "memberB":
+        return member({ b: "maintainer" });
+      case "personalA":
+        return member({ a: "maintainer" }, { personal: true });
+      case "personalReadOnlyA":
+        return member({ a: "maintainer" }, { personal: true, readOnly: true });
+      case "service": {
+        if (isPublic) return ALLOW;
+        if (device) return "403 session_required";
+        if (op.permission === "authenticated") return ALLOW;
+        if (cmdRow) return "403 permission";
+        return op.permission === "h.read" && harnessAbout ? ALLOW : "403 permission";
+      }
+      case "scoped":
+        return isPublic ? ALLOW : "403 scoped";
+      case "scopedRevoked":
+      case "personal":
+        return "401 credential_unknown";
+      case "tabOnly":
+      case "tabOnlyOwner": {
+        if (isPublic) return ALLOW;
+        if (NOT_FROM_A_TOKEN.has(op.permission)) return "403 tab_only";
+        if (device) return "403 session_required";
+        if (op.permission === "authenticated") return ALLOW;
+        return member(cred === "tabOnly" ? { home: "viewer" } : { home: "owner" });
+      }
+      case "tabOnlyElsewhere":
+        return "403 tab_only";
+      case "forwardedBootstrap":
+        return "401 bootstrap_not_accepted_here";
+      case "rebindingHost":
+        return "421";
+      default:
+        throw new Error(`no model for ${cred}`);
+    }
+  }
+
+  function v1OutcomeOf(answer: Answer): string {
+    const { status, body } = answer;
+    if (status === 421) return "421";
+    const error =
+      typeof body["error"] === "object" && body["error"] !== null
+        ? (body["error"] as Record<string, unknown>)
+        : undefined;
+    const reason = String(error?.["reason"] ?? body["reason"]);
+    if (status === 401) return `401 ${reason}`;
+    if (status === 403 && body["code"] === "read_only") return ALLOW;
+    if (
+      status === 403 &&
+      ["permission", "scoped", "tab_only", "session_required"].includes(reason)
+    ) {
+      return `403 ${reason}`;
+    }
+    return ALLOW;
+  }
+
+  test("the model agrees with hand-written sentinels", async () => {
+    const ops = await servedOps();
+    const op = (id: string) => ops.find((o) => o.id === id) as (typeof ops)[number];
+    const sentinels: Record<string, Partial<Record<V1Cred, string>>> = {
+      "controls.pause": {
+        operatorA: ALLOW,
+        viewerA: "403 permission",
+        personalA: ALLOW,
+        personalReadOnlyA: "403 permission",
+      },
+      "access.members.list": {
+        owner: ALLOW,
+        maintainerA: "403 permission",
+        personalA: "403 permission",
+      },
+      "access.tokens.list": {
+        viewerA: ALLOW,
+        personalReadOnlyA: ALLOW,
+        service: "403 permission",
+        tabOnly: "403 tab_only",
+      },
+      "auth.device.decide": {
+        owner: ALLOW,
+        maintainerA: ALLOW,
+        personalA: "403 session_required",
+        service: "403 session_required",
+        tabOnly: "403 session_required",
+        scoped: "403 scoped",
+      },
+      "harnesses.get": {
+        viewerA: ALLOW,
+        memberB: "403 permission",
+        service: ALLOW,
+        personalReadOnlyA: ALLOW,
+      },
+      "meta.discover": { scoped: ALLOW, personal: "401 credential_unknown" },
+    };
+    let checked = 0;
+    for (const [id, byCred] of Object.entries(sentinels)) {
+      for (const [cred, outcome] of Object.entries(byCred)) {
+        expect(`${id} as ${cred}: ${v1Expected(op(id), cred as V1Cred)}`).toBe(
+          `${id} as ${cred}: ${outcome}`,
+        );
+        checked += 1;
+      }
+    }
+    expect(checked).toBeGreaterThanOrEqual(20);
+  });
+
+  for (const cred of V1_CREDS) {
+    test(`as ${cred}: every served operation is answered as the role table says`, async () => {
+      const ops = await servedOps();
+      expect(ops.length).toBeGreaterThanOrEqual(45);
+      const wrong: string[] = [];
+      for (const op of ops) {
+        const res = await world.t.fetchRaw(v1PathOf(op.path), {
+          method: op.method,
+          headers: { "content-type": "application/json", ...credOf(cred).headers },
+          ...(op.method === "GET" ? {} : { body: "{}" }),
+        });
+        const text = await res.text();
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(text) as Record<string, unknown>;
+        } catch {
+          body = { text };
+        }
+        const got = v1OutcomeOf({ status: res.status, body });
+        const want = v1Expected(op, cred);
+        if (got !== want) wrong.push(`${op.id} ${op.method} ${op.path}: ${got} (want ${want})`);
+      }
+      expect(wrong).toEqual([]);
+    }, 120_000); // ~50 requests through a live server
+  }
+
+  test("a personal token may revoke only itself", async () => {
+    const { v1Home } = await import("./__test__/v1-home");
+    const home = await v1Home();
+    try {
+      const sam = await home.member("Sam", "viewer");
+      const ana = await home.member("Ana", "viewer");
+      const other = await home.call("POST", `/api/v1/access/tokens/${ana.credential}/revoke`, {
+        body: {},
+        secret: sam.secret,
+      });
+      expect(other.status).toBe(404);
+      const own = await home.call("POST", `/api/v1/access/tokens/${sam.credential}/revoke`, {
+        body: {},
+        secret: sam.secret,
+      });
+      expect(own.status).toBe(200);
+      const after = await home.call("GET", "/api/v1/me", { secret: sam.secret });
+      expect(after.status).toBe(401);
+      expect((await home.call("GET", "/api/v1/me", { secret: ana.secret })).status).toBe(200);
+    } finally {
+      await home.t.stop();
+    }
+  }, 30_000);
+});

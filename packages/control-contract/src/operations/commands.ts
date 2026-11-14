@@ -1,4 +1,4 @@
-import { NO_VERB, READ } from "./shared.js";
+import { READ, TWINS } from "./shared.js";
 
 export const COMMAND_OPERATIONS = [
   {
@@ -9,8 +9,7 @@ export const COMMAND_OPERATIONS = [
     permission: "h.read",
     request: "noBody",
     response: "commandReceipt",
-    cliTwin: null,
-    noTwinReason: NO_VERB,
+    cliTwin: TWINS.commandsShow,
     qualifiers: ["workspace-target"],
   },
   {
@@ -21,8 +20,7 @@ export const COMMAND_OPERATIONS = [
     permission: "h.read",
     request: "listQuery",
     response: "commandList",
-    cliTwin: null,
-    noTwinReason: NO_VERB,
+    cliTwin: TWINS.commandsList,
     qualifiers: [],
   },
 ] as const;

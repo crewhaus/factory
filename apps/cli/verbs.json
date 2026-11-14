@@ -135,6 +135,14 @@
         "sync": {
           "flags": []
         },
+        "approve": {
+          "flags": [
+            {
+              "name": "deny",
+              "takesValue": false
+            }
+          ]
+        },
         "proxy": {
           "flags": [
             {
@@ -194,6 +202,42 @@
           "takesValue": false
         }
       ]
+    },
+    {
+      "verb": "api",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "bare": "call",
+      "sub": {
+        "call": {
+          "flags": [
+            {
+              "name": "param",
+              "takesValue": true,
+              "repeatable": true
+            },
+            {
+              "name": "body-file",
+              "takesValue": true
+            },
+            {
+              "name": "query",
+              "takesValue": true,
+              "repeatable": true
+            },
+            {
+              "name": "server",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        }
+      },
+      "flags": null
     },
     {
       "verb": "approvals",
@@ -1086,6 +1130,43 @@
           "takesValue": false
         }
       ]
+    },
+    {
+      "verb": "commands",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "sub": {
+        "list": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "limit",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        }
+      },
+      "flags": null
     },
     {
       "verb": "compile",
@@ -6133,6 +6214,50 @@
           "takesValue": false
         }
       ]
+    },
+    {
+      "verb": "login",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "bare": "device",
+      "sub": {
+        "device": {
+          "flags": [
+            {
+              "name": "server",
+              "takesValue": true
+            },
+            {
+              "name": "read-only",
+              "takesValue": false
+            },
+            {
+              "name": "allow-http",
+              "takesValue": false
+            }
+          ]
+        }
+      },
+      "flags": null
+    },
+    {
+      "verb": "logout",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "bare": "revoke",
+      "sub": {
+        "revoke": {
+          "flags": [
+            {
+              "name": "server",
+              "takesValue": true
+            }
+          ]
+        }
+      },
+      "flags": null
     },
     {
       "verb": "mcp",

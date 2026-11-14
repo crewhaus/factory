@@ -4,6 +4,7 @@
  */
 import type { Permission, Role } from "@crewhaus/control-contract";
 import type { CredentialRow, GrantRow, InviteRow, LinkRow, PrincipalKind } from "./records";
+import type { DeviceRow } from "./sign-in-records";
 import {
   type AccessSnapshot,
   displayNameOf,
@@ -64,6 +65,26 @@ export type TokenView = {
   readonly state: "active" | "revoked";
   readonly revokedAt?: string;
   readonly live: boolean;
+  /** A personal token that can only read. */
+  readonly readOnly?: true;
+  /** When it last authenticated, from the usage record; absent when never noted. */
+  readonly lastUsedAt?: string;
+};
+
+/** A browser's device key, as a list shows it: never the key itself. */
+export type DeviceView = {
+  readonly id: string;
+  readonly principal: string;
+  readonly createdAt: string;
+  readonly state: "active" | "revoked";
+  readonly revokedAt?: string;
+  readonly lastUsedAt?: string;
+};
+
+/** When each credential and device was last used: `usage.ts`'s record, or nothing. */
+export type LastUsed = {
+  readonly credentials: Readonly<Record<string, string>>;
+  readonly devices: Readonly<Record<string, string>>;
 };
 
 export type InviteView = {
@@ -112,7 +133,12 @@ export function linkView(row: LinkRow): LinkView {
   };
 }
 
-export function tokenView(snapshot: AccessSnapshot, row: CredentialRow, now: number): TokenView {
+export function tokenView(
+  snapshot: AccessSnapshot,
+  row: CredentialRow,
+  now: number,
+  usage?: LastUsed,
+): TokenView {
   return {
     id: row.id,
     principal: row.principal,
@@ -128,6 +154,8 @@ export function tokenView(snapshot: AccessSnapshot, row: CredentialRow, now: num
     state: row.state,
     ...optional("revokedAt", row.revokedAt),
     live: isLiveCredential(snapshot, row, now),
+    ...optional("readOnly", row.readOnly),
+    ...optional("lastUsedAt", usage?.credentials[row.id]),
   };
 }
 
@@ -179,8 +207,43 @@ export function listMembers(snapshot: AccessSnapshot, now: number): MemberView[]
  *
  * First consumer: `crewhaus access tokens`.
  */
-export function listTokens(snapshot: AccessSnapshot, now: number): TokenView[] {
-  return snapshot.tokens.map((row) => tokenView(snapshot, row, now));
+export function listTokens(snapshot: AccessSnapshot, now: number, usage?: LastUsed): TokenView[] {
+  return snapshot.tokens.map((row) => tokenView(snapshot, row, now, usage));
+}
+
+/**
+ * Every grant, live or not, with its role, scope and holder.
+ *
+ * First consumer: the control API's grant list.
+ */
+export function listGrants(snapshot: AccessSnapshot, now: number): GrantView[] {
+  return snapshot.grants.map((row) => grantView(snapshot, row, now));
+}
+
+/**
+ * Every identity link, with its provider and keyed subject digest; never the readable
+ * subject.
+ *
+ * First consumer: the control API's link list.
+ */
+export function listLinks(snapshot: AccessSnapshot): LinkView[] {
+  return snapshot.links.map(linkView);
+}
+
+/**
+ * Every browser device key, by its id and holder, with when it was last used.
+ *
+ * First consumer: the control API's device list.
+ */
+export function listDevices(devices: Iterable<DeviceRow>, usage?: LastUsed): DeviceView[] {
+  return [...devices].map((row) => ({
+    id: row.id,
+    principal: row.principal,
+    createdAt: row.at,
+    state: row.state,
+    ...optional("revokedAt", row.revokedAt),
+    ...optional("lastUsedAt", usage?.devices[row.id]),
+  }));
 }
 
 /**

@@ -9,6 +9,7 @@ export {
   DECISION_EXECUTORS,
   DECISION_RECONCILERS,
   type Observed,
+  observeDefer,
   observeResolve,
   observeRuleCreate,
   observeRuleRevoke,
@@ -132,6 +133,7 @@ export {
   reconcileOperatorControl,
   recordDesired,
 } from "./operator-controls";
+export { type ObjectPage, type ObjectPageOptions, pageObjects } from "./pages";
 export { type RecoverCounts, type RecoverScope, isJobReceipt } from "./recover";
 export {
   LIFECYCLE_FILE,

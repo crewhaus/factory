@@ -100,6 +100,12 @@ export type MutationOptions = {
   readonly projections: boolean;
   /** Set up runs before any principal exists, as the owner it creates. */
   readonly setup?: { readonly by: (snapshot: AccessSnapshot | undefined) => string };
+  /**
+   * A change a principal makes to what is its own (revoking its own token), or one a
+   * member already allowed (a device sign-in's token): the plan checks whose it is, so
+   * `home.access.manage` is not asked for. The actor must be an active principal.
+   */
+  readonly own?: true;
 };
 
 const HOME = { scope: "home" } as const;
@@ -121,6 +127,20 @@ function snapshotOf(read: AccessSnapshotRead): AccessSnapshot | Refusal | undefi
     return refusal("unreadable", `The access records cannot be read: ${read.reason}.`);
   }
   return read.state === "present" ? read.snapshot : undefined;
+}
+
+/**
+ * Run one change while the caller already holds the access lock (inside
+ * `withLedgerLock` on the principals ledger): the same checks, plan and writes as
+ * {@link runMutation}, without taking the lock again.
+ */
+export function runMutationLocked<T>(
+  ctx: AccessContext,
+  actor: AccessActor | undefined,
+  plan: (state: Planning) => Promise<Change<T> | Refusal> | Change<T> | Refusal,
+  options: MutationOptions,
+): Promise<Done<T> | Refusal> {
+  return runLocked(ctx, actor, plan, options);
 }
 
 /** Run one change under the access lock. */
@@ -164,15 +184,22 @@ async function runLocked<T>(
     if (snapshot === undefined) {
       return refusal("not-set-up", "Nobody else has access to this Home yet.");
     }
-    const verdict =
-      actor === undefined
-        ? undefined
-        : authorize(snapshot, actor, "home.access.manage", HOME, {
-            now,
-            domains: ctx.domains,
-          });
-    if (verdict?.allow !== true) {
-      return refusal("not-authorized", "Only this Home's owner can change who has access.");
+    if (options.own === true) {
+      const who = snapshot.principals.find((row) => row.id === actor?.principal);
+      if (who === undefined || who.state !== "active") {
+        return refusal("not-authorized", "Only an active member can do this.");
+      }
+    } else {
+      const verdict =
+        actor === undefined
+          ? undefined
+          : authorize(snapshot, actor, "home.access.manage", HOME, {
+              now,
+              domains: ctx.domains,
+            });
+      if (verdict?.allow !== true) {
+        return refusal("not-authorized", "Only this Home's owner can change who has access.");
+      }
     }
   }
   const by = options.setup?.by(snapshot) ?? (actor as AccessActor).principal;

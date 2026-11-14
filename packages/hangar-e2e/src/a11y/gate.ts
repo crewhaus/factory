@@ -68,6 +68,7 @@ export const GATE_EXPECTS: Readonly<Record<string, string>> = {
   "#/settings/notifications": '#view .page-body input[type="checkbox"]',
   "#/settings/home": "#view .page-body .card .dot-label",
   "#/settings/account": '#view .page-body button:text-is("Sign out")',
+  "#/device": '#view .page-body label[for="device-code"]',
   "#/h/:id": "figure.chart",
   "#/h/:id/overview/needs-you": "figure.chart",
   "#/h/:id/work": ".section-index a",

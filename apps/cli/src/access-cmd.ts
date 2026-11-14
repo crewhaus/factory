@@ -37,6 +37,7 @@ import {
   loadAccessSnapshot,
   localActorOf,
   openAccess,
+  openDeviceRequests,
   parseCidr,
   readOwnerSettings,
   writeOwnerBlock,
@@ -89,6 +90,8 @@ const ACCESS_USAGE_LINES: readonly string[] = [
   "                                               peers with a secret it sends (shown once), or",
   "                                               over Home's proxy socket with --socket",
   "  crewhaus access proxy --off                  stop trusting it",
+  "  crewhaus access approve <code> [--deny]      allow a sign-in from another computer that shows",
+  "                                               this code (`crewhaus login` there)",
   "",
   "  Roles: viewer, operator, maintainer, owner. <h> is a harness id or directory, and",
   "  <dur> is like 30m, 24h or 7d. These verbs work with Home stopped; a proxy change",
@@ -141,6 +144,7 @@ export const CLI_FAMILY = {
       },
     },
     sync: { flags: {} },
+    approve: { flags: { deny: "boolean" } },
     proxy: {
       flags: {
         header: "value",
@@ -872,6 +876,44 @@ async function proxyVerb(session: Session, argv: readonly string[]): Promise<Acc
 }
 
 /**
+ * `access approve <code> [--deny]`: allow (or deny) a sign-in from another computer, as
+ * the member this OS user is linked to, here on Home's computer. The token is that
+ * member's, minted only when the waiting `crewhaus login` collects it.
+ */
+async function approveVerb(
+  session: Session,
+  argv: readonly string[],
+): Promise<AccessCommandResult> {
+  const args = parseArgs("approve", argv, CLI_FAMILY.sub.approve.flags);
+  noPositional("approve", args, 1);
+  const code = args.positional[0];
+  if (code === undefined) throw new Error("access approve: name the code the other computer shows");
+  const acting = await actingPrincipal(session);
+  if ("ok" in acting) return refused(acting);
+  const deny = args.booleans.has("deny");
+  const devices = openDeviceRequests(session.root, { now: session.now });
+  const looked = await devices.lookup(acting.principal, code);
+  if (!looked.ok) return { lines: [...acting.lines, looked.message], exitCode: 1 };
+  const decided = await devices.decide({
+    caller: acting.principal,
+    code,
+    choice: deny ? "deny" : "allow",
+  });
+  if (!decided.ok) return { lines: [...acting.lines, decided.message], exitCode: 1 };
+  const what = looked.request.readOnly ? "a read-only sign-in" : "a sign-in";
+  const name = looked.request.clientName !== undefined ? ` from ${looked.request.clientName}` : "";
+  return {
+    lines: [
+      ...acting.lines,
+      deny
+        ? `Denied ${what}${name}.`
+        : `Allowed ${what}${name}. Its token lasts ${looked.request.tokenDays} days, and the other computer collects it now.`,
+    ],
+    exitCode: 0,
+  };
+}
+
+/**
  * Run one `crewhaus access` verb. Bare `access`, `--help` and `-h` print usage.
  */
 export async function runAccessCommand(
@@ -903,6 +945,8 @@ export async function runAccessCommand(
       return unlinkVerb(session, rest);
     case "mint":
       return mintVerb(session, rest);
+    case "approve":
+      return approveVerb(session, rest);
     case "sync":
       return syncVerb(session, rest);
     case "proxy":

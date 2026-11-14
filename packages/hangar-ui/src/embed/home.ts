@@ -49,6 +49,7 @@ import timeUiJs from "../../assets/js/ui/time.js" with { type: "text" };
 import toggleUiJs from "../../assets/js/ui/toggle.js" with { type: "text" };
 import tooltipUiJs from "../../assets/js/ui/tooltip.js" with { type: "text" };
 import utilJs from "../../assets/js/util.js" with { type: "text" };
+import v1Js from "../../assets/js/v1.js" with { type: "text" };
 import activityViewJs from "../../assets/js/views/activity.js" with { type: "text" };
 import advisorViewJs from "../../assets/js/views/advisor.js" with { type: "text" };
 import approvalsViewJs from "../../assets/js/views/approvals.js" with { type: "text" };
@@ -59,6 +60,7 @@ import costsViewJs from "../../assets/js/views/costs.js" with { type: "text" };
 import credsViewJs from "../../assets/js/views/creds.js" with { type: "text" };
 import dataViewJs from "../../assets/js/views/data.js" with { type: "text" };
 import deployViewJs from "../../assets/js/views/deploy.js" with { type: "text" };
+import deviceViewJs from "../../assets/js/views/device.js" with { type: "text" };
 import evalsLabViewJs from "../../assets/js/views/evals-lab.js" with { type: "text" };
 import evalsViewJs from "../../assets/js/views/evals.js" with { type: "text" };
 import feedbackViewJs from "../../assets/js/views/feedback.js" with { type: "text" };
@@ -120,6 +122,7 @@ export const homeAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/shapes.js": asset(shapesJs, "shapes.js"),
   "/assets/js/shell.js": asset(shellJs, "shell.js"),
   "/assets/js/sign-in.js": asset(signInJs, "sign-in.js"),
+  "/assets/js/v1.js": asset(v1Js, "v1.js"),
   "/assets/js/supervision.js": asset(supervisionJs, "supervision.js"),
   "/assets/js/ui/chart.js": asset(chartUiJs, "chart.js"),
   "/assets/js/ui/conflict.js": asset(conflictUiJs, "conflict.js"),
@@ -144,6 +147,7 @@ export const homeAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/views/creds.js": asset(credsViewJs, "creds.js"),
   "/assets/js/views/data.js": asset(dataViewJs, "data.js"),
   "/assets/js/views/deploy.js": asset(deployViewJs, "deploy.js"),
+  "/assets/js/views/device.js": asset(deviceViewJs, "device.js"),
   "/assets/js/views/evals-lab.js": asset(evalsLabViewJs, "evals-lab.js"),
   "/assets/js/views/evals.js": asset(evalsViewJs, "evals.js"),
   "/assets/js/views/feedback.js": asset(feedbackViewJs, "feedback.js"),

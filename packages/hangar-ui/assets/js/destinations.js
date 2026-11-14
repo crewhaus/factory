@@ -116,6 +116,16 @@ export const FLEET_AREAS = Object.freeze([
     },
   }),
   Object.freeze({
+    id: "device",
+    segment: "device",
+    title: "Sign in a device",
+    pages: [],
+    index: {
+      load: () => import("./views/device.js"),
+      render: (m, root, ctx) => m.renderDevice(root, ctx),
+    },
+  }),
+  Object.freeze({
     id: "settings",
     segment: "settings",
     title: "Settings",
