@@ -23,6 +23,14 @@
  * and a service principal never decides one, whatever its class. The first decision
  * wins; nothing is applied on a grant: adopting is the change's own command.
  *
+ * A local user or a principal decides on a harness with an approver projection only
+ * through the Home that wrote it: who they are comes from the access records under
+ * `deps.hangarRoot` when that is the root the projection names (`accessRoot`), and from
+ * nowhere otherwise.
+ *
+ * Superseding an approval answers the standing rules made from it that still stand. When
+ * the owner supersedes it as decided in error, those rules end with it.
+ *
  * The service writes no receipt itself: Home's receipts middleware does for its routes,
  * and the CLI wraps each call in `commands.submit`. A rule's own step can be wrapped in
  * a command of its own through `hooks.ruleCommand`, so its row carries that receipt.
@@ -56,6 +64,8 @@ import {
   readApproverProjection,
   readChangeAdoptions,
   readProposals,
+  readStandingRules,
+  ruleIsLive,
   storedLocalActor,
 } from "@crewhaus/control-records";
 import { readHarnessEnvFiles } from "@crewhaus/harness-supervisor";
@@ -66,6 +76,7 @@ import {
   type DeferAnswer,
   type SupersedeAnswer,
   createPendingApprovalStore,
+  foldReadOnly,
   needsClassReason,
   resolveHarnessSessionRoot,
 } from "@crewhaus/session-store";
@@ -77,7 +88,13 @@ import {
   resolveToolApproval,
 } from "./approval-resolve";
 import { isServiceActor } from "./deployments";
-import { type RuleWriteAnswer, createStandingRule } from "./rules";
+import {
+  type RuleWriteAnswer,
+  createStandingRule,
+  revokeStandingRule,
+  ruleEndProblem,
+  standingPatternFor,
+} from "./rules";
 
 // ---------------------------------------------------------------------------
 // Who is asking
@@ -129,6 +146,10 @@ export function principalOfActor(actor: DecisionActor, hangarRoot: string): Appr
   }
 }
 
+/** What a local user is told on a harness whose approver projection names no Home root. */
+const UNNAMED_ACCESS_ROOT =
+  "this harness's list of who may approve does not say which Home wrote it; rewrite it with `crewhaus access sync`";
+
 /** The actor as the approvals store takes it: a principal, or the local user for a digest. */
 function storeActorOf(actor: DecisionActor, who: ApprovalPrincipal): ApprovalActor {
   const display = actor.display !== undefined ? { display: actor.display } : {};
@@ -162,12 +183,25 @@ function field(root: unknown, ...path: string[]): unknown {
 }
 
 /**
- * The class a change to `.crewhaus/settings.json` needs: the owner's when it changes
- * what the agent may do or what runs around it (`permissions`, `hooks`,
- * `manager.hooks`), a maintainer's for anything else.
+ * The settings paths that decide what the agent may do, what runs around it, and which
+ * environment files (with the harness's credentials in them) it starts with:
+ * `permissions`, `hooks`, `manager.hooks` and `manager.envFiles`. Every surface that
+ * treats a settings change as a security change reads this one list.
+ */
+export const SECURITY_SETTINGS_PATHS: ReadonlyArray<readonly string[]> = Object.freeze(
+  [["permissions"], ["hooks"], ["manager", "hooks"], ["manager", "envFiles"]].map((path) =>
+    Object.freeze(path),
+  ),
+);
+
+/**
+ * The class a change to `.crewhaus/settings.json` needs: the owner's when it changes a
+ * path of {@link SECURITY_SETTINGS_PATHS} (what the agent may do, what runs around it,
+ * or `manager.envFiles`, the files that hold the harness's credentials), a maintainer's
+ * for anything else.
  */
 export function settingsWriteClass(before: unknown, after: unknown): "owner" | "maintainer" {
-  for (const path of [["permissions"], ["hooks"], ["manager", "hooks"]]) {
+  for (const path of SECURITY_SETTINGS_PATHS) {
     if (canonical(field(before, ...path)) !== canonical(field(after, ...path))) return "owner";
   }
   return "maintainer";
@@ -205,12 +239,49 @@ export type HarnessFound =
   | { readonly state: "none" };
 
 /**
+ * Every ancestor of a session root that holds `.crewhaus/`, nearest first: those of the
+ * root as written (`resolve`) and those of where it lands on disk (links followed), each
+ * directory once by its real path.
+ */
+function crewhausAncestors(rootDir: string): string[] {
+  const found: string[] = [];
+  const seen = new Set<string>();
+  for (const start of [resolve(rootDir), realOf(rootDir)]) {
+    for (let dir = dirname(start); ; dir = dirname(dir)) {
+      if (existsSync(join(dir, ".crewhaus"))) {
+        const real = realOf(dir);
+        if (!seen.has(real)) {
+          seen.add(real);
+          found.push(dir);
+        }
+      }
+      if (dirname(dir) === dir) break;
+    }
+  }
+  return found;
+}
+
+/**
+ * The nearest governed harness above a session root: an ancestor (as written, or where
+ * the root lands on disk) whose approver list is present or cannot be read. A session
+ * root inside it is decided only by the harness it belongs to, named with `--dir`.
+ */
+export function governedAncestorOf(
+  rootDir: string,
+  approvers: (harnessDir: string) => ApproverRead = readApproverProjection,
+): string | undefined {
+  return crewhausAncestors(rootDir).find((dir) => approvers(dir).state !== "absent");
+}
+
+/**
  * Which harness a session root belongs to, for a head that found the root through the
  * environment (a tenant scope, `CREWHAUS_SESSION_DIR`) rather than from a harness.
- * Candidates: the live registry rows, the working directory, and each ancestor of the
- * root that holds `.crewhaus/`. One matches when the session root its own environment
- * files give it is the root, or when the root lies inside its tenants root
- * (`<candidate>/.crewhaus/tenants`). A session root outside every harness matches none.
+ * Candidates: the live registry rows, the working directory, and each ancestor that
+ * holds `.crewhaus/` of the root as written and of where it lands on disk, so a root
+ * reached through a link is matched to the harness it lies in. One matches when the
+ * session root its own environment files give it is the root, or when the root lies
+ * inside its tenants root (`<candidate>/.crewhaus/tenants`). A session root outside
+ * every harness matches none.
  */
 export function harnessForSessionRoot(
   rootDir: string,
@@ -219,10 +290,7 @@ export function harnessForSessionRoot(
   const target = realOf(rootDir);
   const candidates: string[] = [...(options.registry?.() ?? [])];
   if (options.cwd !== undefined) candidates.push(options.cwd);
-  for (let dir = dirname(resolve(rootDir)); ; dir = dirname(dir)) {
-    if (existsSync(join(dir, ".crewhaus"))) candidates.push(dir);
-    if (dirname(dir) === dir) break;
-  }
+  candidates.push(...crewhausAncestors(rootDir));
   const matches = new Map<string, string>();
   for (const candidate of candidates) {
     const real = realOf(candidate);
@@ -271,6 +339,25 @@ export type ResolveRequest = {
 
 export type { ResolveAnswer, ResolveHooks } from "./approval-resolve";
 
+/** A standing rule made from a superseded approval. */
+export type DerivedRule = {
+  readonly id: string;
+  /** The supersede ended it. */
+  readonly revoked: boolean;
+  /** The verb that ends it, while it stands. */
+  readonly verb?: string;
+};
+
+/**
+ * A supersede's answer, and on a harness, once superseded, every standing rule made from
+ * the approval that still stood (`derivedRules`). `ruleError` says why one or more of
+ * them could not be read or ended; the supersede stands either way.
+ */
+export type DecisionSupersedeAnswer = SupersedeAnswer & {
+  readonly derivedRules?: readonly DerivedRule[];
+  readonly ruleError?: string;
+};
+
 export type SupersedeRequest = {
   readonly harnessDir?: string;
   readonly rootDir?: string;
@@ -293,12 +380,15 @@ export type DeferRequest = {
 
 export type Decisions = {
   resolve(request: ResolveRequest, hooks?: ResolveHooks): Promise<ResolveAnswer>;
-  supersede(request: SupersedeRequest): Promise<SupersedeAnswer>;
+  supersede(request: SupersedeRequest): Promise<DecisionSupersedeAnswer>;
   defer(request: DeferRequest): Promise<DeferAnswer>;
   /** Whether this actor may make and end standing rules on the harness. */
   mayManageRules(harnessDir: string | undefined, actor: DecisionActor): boolean;
-  /** The principal an actor decides as, when there is one. */
-  principalOf(actor: DecisionActor): ApprovalPrincipal;
+  /**
+   * The principal an actor decides as, when there is one; on `harnessDir`, a local user's
+   * only through the Home that wrote its approver projection.
+   */
+  principalOf(actor: DecisionActor, harnessDir?: string): ApprovalPrincipal;
   /** The stored actor a record in the harness names for this actor. */
   storedActorOf(harnessDir: string, actor: DecisionActor): Promise<string>;
 };
@@ -326,6 +416,29 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     authorizerOf(harnessDir, who, judged);
   const mayManage = (harnessDir: string | undefined, who: ApprovalPrincipal): boolean =>
     mayManageOn(harnessDir, who, judged);
+
+  /**
+   * Whom the authorizer judges on `harnessDir`. A local user or a principal on a harness
+   * with an approver projection is who this head's access records say only when the
+   * projection names this head's Hangar root as the one that wrote it, and nobody under
+   * another root; a projection that names no root refuses until `crewhaus access sync`
+   * rewrites it. The root is resolved to its real path once, and the records read are
+   * the ones under that same path.
+   */
+  const whoOn = (
+    actor: DecisionActor,
+    harnessDir: string | undefined,
+  ): { readonly who: ApprovalPrincipal } | { readonly refused: string } => {
+    const root = realOf(deps.hangarRoot);
+    const who = principalOfActor(actor, root);
+    // Nobody is nobody under every root: the authorizer says why.
+    if (who.principal === undefined || harnessDir === undefined) return { who };
+    const read = approvers(harnessDir);
+    if (read.state !== "present") return { who };
+    const { accessRoot } = read.projection;
+    if (accessRoot === undefined) return { refused: UNNAMED_ACCESS_ROOT };
+    return accessRoot === root ? { who } : { who: {} };
+  };
 
   /** The stored actor a rule or a request names: the principal, else a keyed digest. */
   const storedActor = async (
@@ -424,6 +537,32 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     return { outcome: "decided", record: null, adoption: decided };
   }
 
+  /**
+   * Whether a request to the owner still asks for exactly the rule its approval gives: the
+   * approval is in the store (`rootDir`, else the harness's own root), was granted and
+   * still stands (not superseded, not ended by the store's sweep), and its call's narrow
+   * rule is the request's tool and pattern.
+   */
+  const termsStillDerive = (
+    harnessDir: string,
+    rootDir: string | undefined,
+    row: ProposalRow,
+  ): boolean => {
+    let folded: ReturnType<typeof foldReadOnly>;
+    try {
+      folded = foldReadOnly(rootOf(harnessDir, rootDir));
+    } catch {
+      return false;
+    }
+    if (folded.state === "unreadable") return false;
+    const record = folded.records.find((r) => r.id === row.derivedFrom);
+    if (record === undefined || record.supersededBy !== undefined) return false;
+    if (record.decision !== "grant" || record.expiredAt !== undefined) return false;
+    const narrow = standingPatternFor(record.toolName, record.input, harnessDir);
+    if ("refused" in narrow) return false;
+    return record.toolName === row.terms.tool && narrow.pattern === row.terms.pattern;
+  };
+
   async function resolveProposal(
     request: ResolveRequest,
     who: ApprovalPrincipal,
@@ -463,12 +602,22 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
       return { outcome: "stale", record: null, proposal: row, reason: "the request is pending" };
     }
     if (request.choice === "grant") {
-      if (!(Date.parse(row.terms.expiresAt) > nowMs)) {
+      const endProblem = ruleEndProblem(row.terms.expiresAt, nowMs);
+      if (endProblem !== undefined) {
         return {
           outcome: "invalid",
           record: null,
           proposal: row,
-          reason: "the rule this request asks for would already have ended; ask for it again",
+          reason: `the rule this request asks for cannot be made (${endProblem}); ask for it again`,
+        };
+      }
+      if (!termsStillDerive(harnessDir, request.rootDir, row)) {
+        return {
+          outcome: "invalid",
+          record: null,
+          proposal: row,
+          reason:
+            "the approval this request came from is gone or no longer names this rule; ask for it again",
         };
       }
       try {
@@ -518,7 +667,9 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
   }
 
   async function resolve(request: ResolveRequest, hooks?: ResolveHooks): Promise<ResolveAnswer> {
-    const who = principalOfActor(request.actor, deps.hangarRoot);
+    const on = whoOn(request.actor, request.harnessDir);
+    if ("refused" in on) return { outcome: "forbidden", record: null, reason: on.refused };
+    const { who } = on;
     if (isId("dec", request.ref)) return resolveProposal(request, who, hooks);
     if (!APPROVAL_ID_RE.test(request.ref)) {
       return { outcome: "invalid", record: null, reason: `"${request.ref}" is not an approval id` };
@@ -550,19 +701,87 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     );
   }
 
+  /**
+   * The standing rules made from a superseded approval that still stand, each ended when
+   * the owner superseded it as decided in error, and otherwise named with its verb.
+   */
+  async function derivedRulesOf(
+    request: SupersedeRequest,
+    harnessDir: string,
+    who: ApprovalPrincipal,
+  ): Promise<Pick<DecisionSupersedeAnswer, "derivedRules" | "ruleError">> {
+    const listVerb = `crewhaus approvals rules --dir ${harnessDir}`;
+    const read = readStandingRules(harnessDir);
+    if (read.state === "unreadable") {
+      return {
+        derivedRules: [],
+        ruleError: `the standing rules cannot be read (${read.reason}); a rule made from ${request.ref} may still stand: ${listVerb}`,
+      };
+    }
+    const nowMs = deps.now();
+    const rows =
+      read.state === "present"
+        ? read.rows.filter(
+            (row) =>
+              row.derivedFrom === request.ref && row.state === "active" && ruleIsLive(row, nowMs),
+          )
+        : [];
+    const problems: string[] = [];
+    if (read.state === "present" && read.anomalies.length > 0) {
+      problems.push(
+        `part of the standing rules cannot be read; a rule made from ${request.ref} may still stand: ${listVerb}`,
+      );
+    }
+    const ends = request.reason === "decided-in-error" && mayManage(harnessDir, who);
+    let revokedBy: string | undefined;
+    const derivedRules: DerivedRule[] = [];
+    for (const row of rows) {
+      const verb = `crewhaus approvals revoke ${row.id} --dir ${harnessDir}`;
+      if (ends) {
+        try {
+          revokedBy ??= await storedActor(harnessDir, request.actor, who);
+          const ended = await revokeStandingRule({
+            harnessDir,
+            id: row.id,
+            revokedBy,
+            now: deps.now(),
+          });
+          if (ended.outcome === "revoked") {
+            derivedRules.push({ id: row.id, revoked: true });
+            continue;
+          }
+          problems.push(
+            `${row.id} could not be ended (${ended.outcome === "unavailable" ? ended.reason : ended.outcome}): ${verb}`,
+          );
+        } catch (err) {
+          problems.push(`${row.id} could not be ended (${(err as Error).message}): ${verb}`);
+        }
+      }
+      derivedRules.push({ id: row.id, revoked: false, verb });
+    }
+    return { derivedRules, ...(problems.length > 0 ? { ruleError: problems.join("; ") } : {}) };
+  }
+
   return {
     resolve,
     async supersede(request) {
-      const who = principalOfActor(request.actor, deps.hangarRoot);
+      const on = whoOn(request.actor, request.harnessDir);
+      if ("refused" in on) return { outcome: "forbidden", record: null, reason: on.refused };
+      const { who } = on;
       const store = storeFor(rootOf(request.harnessDir, request.rootDir));
-      return store.supersede(
+      const answer = await store.supersede(
         request.ref,
         { actor: storeActorOf(request.actor, who), via: request.via, reason: request.reason },
         { authorize: authorizerFor(request.harnessDir, who) },
       );
+      const { harnessDir } = request;
+      if (answer.outcome !== "superseded" || harnessDir === undefined) return answer;
+      return { ...answer, ...(await derivedRulesOf(request, harnessDir, who)) };
     },
     async defer(request) {
-      const who = principalOfActor(request.actor, deps.hangarRoot);
+      const on = whoOn(request.actor, request.harnessDir);
+      if ("refused" in on) return { outcome: "forbidden", record: null, reason: on.refused };
+      const { who } = on;
       const store = storeFor(rootOf(request.harnessDir, request.rootDir));
       return store.defer(
         request.ref,
@@ -575,10 +794,17 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
         { authorize: authorizerFor(request.harnessDir, who) },
       );
     },
-    mayManageRules: (harnessDir, actor) =>
-      mayManage(harnessDir, principalOfActor(actor, deps.hangarRoot)),
-    principalOf: (actor) => principalOfActor(actor, deps.hangarRoot),
-    storedActorOf: (harnessDir, actor) =>
-      storedActor(harnessDir, actor, principalOfActor(actor, deps.hangarRoot)),
+    mayManageRules: (harnessDir, actor) => {
+      const on = whoOn(actor, harnessDir);
+      return "who" in on && mayManage(harnessDir, on.who);
+    },
+    principalOf: (actor, harnessDir) => {
+      const on = whoOn(actor, harnessDir);
+      return "who" in on ? on.who : {};
+    },
+    storedActorOf: (harnessDir, actor) => {
+      const on = whoOn(actor, harnessDir);
+      return storedActor(harnessDir, actor, "who" in on ? on.who : {});
+    },
   };
 }

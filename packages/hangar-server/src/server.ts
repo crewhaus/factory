@@ -72,6 +72,7 @@ import {
   ensureToken,
   loadAccessSnapshot,
   localActorOf,
+  noAuthRefusal,
   openDeviceRequests,
   openSignIn,
   readOwnerSettings,
@@ -137,6 +138,8 @@ import {
   refusalResponse,
   registerHomeDomain,
   requestAccessFor,
+  requestAllows,
+  systemAccess,
   visibleToRequest,
   withRequestAccess,
   withholdPeople,
@@ -236,10 +239,12 @@ import {
 import { OMNI_LIMIT, type OmniIndex, createOmniIndex } from "./omnibox";
 import {
   DEMOS_DIR_ENV,
+  REGISTRY_MANAGE,
   StarterInstallError,
   demoAvailability,
+  gateOnboarding,
+  gateScanRoots,
   installStarter,
-  onboardingView,
   suggestScanRoots,
 } from "./onboarding";
 import {
@@ -408,6 +413,9 @@ export type HangarServer = {
    *  the access records have moved, every stream whose caller has lost
    *  access to it closes with `revoked`. Home runs it every 30 seconds on its own. */
   checkSessions(): void;
+  /** How many open run streams each session check authorizes again. A stream's check
+   *  ends with the stream, whatever closed it. */
+  openStreamChecks(): number;
   /**
    * Resolves once the boot sequence has run: port ledger open → `adopt()`
    * per registered harness → `jobQueue.restore()`. `Bun.serve` binds
@@ -518,7 +526,17 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   const hangarRoot =
     opts.root !== undefined ? resolve(opts.root) : join(homedir(), ".crewhaus", "hangar");
   const noAuth = opts.noAuth === true;
+  // Turning sign-in off makes every local process the owner: never while Home answers to
+  // anyone else. Decided before anything is read, written or bound.
+  const noAuthRefused = noAuth ? noAuthRefusal(hangarRoot) : undefined;
+  if (noAuthRefused !== undefined) throw new Error(`hangar-server: ${noAuthRefused}`);
   const hostname = opts.hostname ?? "127.0.0.1";
+  // Sign-in off answers on this computer only: never on another address, nor beside a LAN one.
+  if (noAuth && (!isLoopbackHostname(hostname) || opts.lanHost !== undefined)) {
+    throw new Error(
+      `hangar-server: sign-in off (--no-auth) answers on this computer only, and listening on ${opts.lanHost ?? hostname} exposes the console beyond loopback and REQUIRES auth — bind a loopback address, or start with sign-in on`,
+    );
+  }
 
   // ---- signing in: the owner's settings, the sign-in handle, the Host allowlist ----
   // The owner's `access` and `links` blocks are read once, here; a block that is not
@@ -675,12 +693,18 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
   /**
    * The abort signal for a live run stream: the client going away, or, for a stream
    * opened with a session, that session ending. The reason names the closing event.
+   * `dispose` ends the stream's re-check and its session listener; the stream calls it
+   * when it finishes, for every reason, and calling it again does nothing.
    */
-  const streamSignal = (req: Request): AbortSignal | undefined => {
+  const streamSignal = (
+    req: Request,
+  ): { readonly signal: AbortSignal | undefined; readonly dispose: () => void } => {
     const who = callers.get(req);
     const sessionRef = who?.kind === "principal" ? who.sessionRef : undefined;
     const decided = authorized.get(req);
-    if (sessionRef === undefined && decided === undefined) return req.signal;
+    if (sessionRef === undefined && decided === undefined) {
+      return { signal: req.signal, dispose: () => undefined };
+    }
     const ended = new AbortController();
     const stops: Array<() => void> = [];
     if (sessionRef !== undefined) {
@@ -704,12 +728,18 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       streamChecks.add(recheck);
       stops.push(() => streamChecks.delete(recheck));
     }
-    const stop = (): void => {
+    let disposed = false;
+    const dispose = (): void => {
+      if (disposed) return;
+      disposed = true;
       for (const s of stops) s();
     };
-    ended.signal.addEventListener("abort", stop, { once: true });
-    req.signal?.addEventListener("abort", stop, { once: true });
-    return req.signal === undefined ? ended.signal : AbortSignal.any([req.signal, ended.signal]);
+    ended.signal.addEventListener("abort", dispose, { once: true });
+    req.signal?.addEventListener("abort", dispose, { once: true });
+    return {
+      signal: req.signal === undefined ? ended.signal : AbortSignal.any([req.signal, ended.signal]),
+      dispose,
+    };
   };
 
   /**
@@ -801,18 +831,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     return read.state === "present" ? (read.snapshot.owner ?? label) : label;
   };
 
-  /** Whether this request's caller holds a permission on a harness, or the whole Home. */
-  const requestAllows = (permission: string, harness?: string): boolean => {
-    const access = currentRequestAccess();
-    if (access === undefined) return true;
-    return access.authorize(permission, harness !== undefined ? { harness } : undefined).allow;
-  };
-
-  /** The registry groups this request may see: those with a member it may read. */
+  /** The registry groups this request may see: those with a member it may read; none
+   *  outside a request. */
   const visibleGroups = (): ReturnType<HangarRegistry["listGroups"]> => {
-    const groups = registry.listGroups();
     const access = currentRequestAccess();
-    if (access === undefined || isOwnerCaller(access.caller, signIn.snapshot())) return groups;
+    if (access === undefined) return [];
+    const groups = registry.listGroups();
+    if (isOwnerCaller(access.caller, signIn.snapshot())) return groups;
     return groups.filter((group) =>
       registry.groupMembers(group.name).some((entry) => visibleToRequest(entry.id)),
     );
@@ -1791,6 +1816,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     const body =
       route.method === "POST" || route.method === "PUT" ? await readBody(req) : ({} as const);
     const dir = harnessDir;
+    /** The registered harnesses inside this one, real dirs resolved once per request. */
+    let nested: Array<{ readonly id: string; readonly real: string }> | undefined;
     const context: M3Context = {
       entry,
       harnessDir,
@@ -1825,6 +1852,21 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         return resolved;
       },
       harnesses: (): readonly M3Harness[] => liveHarnesses(),
+      // Every registered row, not only those this request may read: a harness the caller
+      // cannot see is still never read through the one that holds it.
+      nestedHarnessAt: (real) => {
+        if (dir === null) return undefined;
+        nested ??= (() => {
+          const own = realOr(dir);
+          return registry
+            .list()
+            .map((row) => ({ id: row.id, real: realOr(row.dir) }))
+            .filter((row) => row.real !== own && isWithin(own, row.real));
+        })();
+        const hit = nested.find((row) => isWithin(row.real, real));
+        if (hit === undefined) return undefined;
+        return { id: hit.id, visible: context.authorize("h.read", { harness: hit.id }).allow };
+      },
       process: async () => {
         if (entry === null) throw new HttpError(400, "not a per-harness route");
         return await processFor(entry);
@@ -2060,7 +2102,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           const body = await readBody(req);
           const lane = body["lane"];
           if (typeof lane !== "string" || !isControlLane(lane)) {
-            throw new HttpError(400, 'missing "lane" — one of: heartbeat, schedule');
+            throw new HttpError(400, 'missing "lane": heartbeat, schedule or schedule:<name>');
           }
           const reason = typeof body["reason"] === "string" ? body["reason"] : undefined;
           return jsonMasked(
@@ -2306,6 +2348,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       // terminal frame is what lets a client tell "finished" from "the
       // connection dropped", and it is what makes this testable with no
       // live process.
+      const stream = streamSignal(req);
       return runEventStream({
         harnessDir: dir,
         runId,
@@ -2317,7 +2360,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         scrub: harnessScrub(dir),
         ...(live ? { subscribe: handle.supervisor.subscribe } : {}),
         ...(opts.sseHeartbeatMs !== undefined ? { heartbeatMs: opts.sseHeartbeatMs } : {}),
-        signal: streamSignal(req),
+        ...(stream.signal !== undefined ? { signal: stream.signal } : {}),
+        dispose: stream.dispose,
       });
     }
     if (head === "control" && tail.length === 1 && tail[0] === "status") {
@@ -2650,7 +2694,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     }
 
     if (head === "registry" && rest[0] === "scan-roots" && rest.length === 1) {
-      if (method === "GET") return json({ scanRoots: registry.listScanRoots() });
+      if (method === "GET") {
+        return json(gateScanRoots(() => registry.listScanRoots(), requestAllows(REGISTRY_MANAGE)));
+      }
       if (method === "POST") {
         const body = await readBody(req);
         const dir = requireAbsoluteDir(body["dir"], "dir");
@@ -2704,13 +2750,16 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (head === "onboarding" && rest.length === 0) {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       return json(
-        onboardingView({
-          harnessCount: visibleEntries().length,
-          scanRootCount: registry.listScanRoots().length,
-          suggestions: suggestScanRoots(env, homedir(), cwd),
-          demo: demoAvailability(env, demosDir),
-          completedAt: settings.get().onboarding.completedAt,
-        }),
+        gateOnboarding(
+          {
+            harnessCount: visibleEntries().length,
+            completedAt: settings.get().onboarding.completedAt,
+            scanRootCount: () => registry.listScanRoots().length,
+            suggestions: () => suggestScanRoots(env, homedir(), cwd),
+            demo: () => demoAvailability(env, demosDir),
+          },
+          requestAllows(REGISTRY_MANAGE),
+        ),
       );
     }
 
@@ -3454,7 +3503,11 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     // process picture and the receipts the restore already moved.
     .then(async (booted) => ({
       ...booted,
-      commands: await controlService.commands.recover("all").catch((err) => {
+      // Outside any request: recovery reads every harness's ledger under its own name, and
+      // what it runs again is authorized as the actor who asked for it.
+      commands: await withRequestAccess(systemAccess("command-recovery"), () =>
+        controlService.commands.recover("all"),
+      ).catch((err) => {
         onWarn(
           `hangar-server: command recovery failed: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -3479,6 +3532,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     controlService,
     readOnly: readOnlyNow,
     checkSessions: checkStreams,
+    openStreamChecks: () => streamChecks.size,
     ready,
     stop: async () => {
       if (stopped) return;

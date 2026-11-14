@@ -1,0 +1,34 @@
+{
+  "batch-cron": {
+    "agent.ts": "06a7b302e435e1b2576277e29f23dac107522042dd100449f974b2e3d7e99599",
+    "README.md": "2137bf49f0fdb845998cf61a7a66224bc99b64109562b730934d4a16e035614d"
+  },
+  "batch-interval": {
+    "agent.ts": "b61fd06ecc51ba81e633a1a93fd87c47356dd7e33ecc5f9a97bdca2a5d87cb4d",
+    "README.md": "2137bf49f0fdb845998cf61a7a66224bc99b64109562b730934d4a16e035614d"
+  },
+  "channel-cron": {
+    "agent.ts": "bfebf6a53ea9b773c109471a198d912a498cd28950498343649a7b45eb23d603",
+    "session-router.ts": "d712670e1b9f733c5194a0bde65d6f5ca1d97e9779949a9221dd957a39a793d9",
+    "gateway.ts": "9c1ddd78ed9d5538bab1a64430931da42138c2b2bbcd07d54b7e15f3bb89e379",
+    "daemon.ts": "5af56d4ae5a5ba98a3fdaf1ec744bb92d66c565e80e0d3dfac90aa3d20a6084e",
+    "README.md": "5e4ef406ed614d645422bf50c0cb484b5b3a6b48439be80be60df3d662b7e04f"
+  },
+  "channel-interval": {
+    "agent.ts": "bfebf6a53ea9b773c109471a198d912a498cd28950498343649a7b45eb23d603",
+    "session-router.ts": "d712670e1b9f733c5194a0bde65d6f5ca1d97e9779949a9221dd957a39a793d9",
+    "gateway.ts": "9c1ddd78ed9d5538bab1a64430931da42138c2b2bbcd07d54b7e15f3bb89e379",
+    "daemon.ts": "218ab67ab332c1bb3f587539e1b57ac7e1b9f86a0be2629468b2c594a2b7bdf3",
+    "README.md": "5e4ef406ed614d645422bf50c0cb484b5b3a6b48439be80be60df3d662b7e04f"
+  },
+  "managed-cron": {
+    "agent.ts": "1385df3f2d18c5b902d3ba57f8079fbe317facd1b3a73a3bef2324425f0452c6",
+    "daemon.ts": "3891bbc518e7da264c6c7738d3cebf95e3690fda74547ee0e20bf7015d22af78",
+    "README.md": "79ed7c2dd168a6922763833103f033dff5d08c6f20b0d35b560cb85bd037ce90"
+  },
+  "managed-interval": {
+    "agent.ts": "1385df3f2d18c5b902d3ba57f8079fbe317facd1b3a73a3bef2324425f0452c6",
+    "daemon.ts": "015b65c1b4a3cc2410299d907b456a9176726f49aab65367498d29e6fdccfa6f",
+    "README.md": "79ed7c2dd168a6922763833103f033dff5d08c6f20b0d35b560cb85bd037ce90"
+  }
+}

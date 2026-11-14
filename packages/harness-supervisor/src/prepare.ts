@@ -94,6 +94,9 @@ export type PrepareOutcome =
       /** `manager.autoCompile` governed this build against an active deployment, so the
        *  start runs only the active deployment's build. */
       readonly activeOnly?: boolean;
+      /** The caller's `proceed` answered false after the compile, so the postCompile
+       *  hook did not run and the caller refuses the start. */
+      readonly halted?: true;
     }
   | { readonly ok: false; readonly refusal: PrepareRefusal };
 
@@ -399,8 +402,10 @@ export const SAVED_NOT_ACTIVE_NOTE =
 /**
  * `manager.autoCompile`'s compile: it rebuilds only the active revision. With an active
  * deployment, a saved spec whose revision is not the active one compiles nothing (the
- * start goes on to the build check with the active build); the active revision whose
- * build is missing or does not match recompiles, and the build check then decides. With
+ * start goes on to the build check with the active build); an active build whose files hold
+ * a link compiles nothing, and the build check refuses it, naming the link; the active
+ * revision whose build is missing or does not match recompiles, and the build check then
+ * decides. With
  * no deployment record it compiles a stale bundle, and the start's admission decides.
  */
 export async function compileActiveRevision(deps: PrepareDeps): Promise<PrepareOutcome> {
@@ -412,6 +417,13 @@ export async function compileActiveRevision(deps: PrepareDeps): Promise<PrepareO
       return { ok: true, replan: false, notes: [SAVED_NOT_ACTIVE_NOTE], activeOnly: true };
     case "active-build":
       return { ok: true, replan: false, notes: ["bundle: the active build"], activeOnly: true };
+    case "link":
+      return {
+        ok: true,
+        replan: false,
+        notes: ["bundle: the active build holds a link"],
+        activeOnly: true,
+      };
     case "rebuild": {
       const compiled = await compileBundle(deps, decision.was);
       return compiled.ok ? { ...compiled, activeOnly: true } : compiled;
@@ -424,6 +436,7 @@ type ActiveRevisionDecision =
   | { readonly kind: "no-active" }
   | { readonly kind: "saved-not-active" }
   | { readonly kind: "active-build" }
+  | { readonly kind: "link" }
   | { readonly kind: "rebuild"; readonly was: string };
 
 function activeRevisionDecision(deps: PrepareDeps): ActiveRevisionDecision {
@@ -440,7 +453,8 @@ function activeRevisionDecision(deps: PrepareDeps): ActiveRevisionDecision {
     if (saved !== undefined && saved !== active.specHash) return { kind: "saved-not-active" };
   }
   const check = verifyActiveBuild(deps.harnessDir, deps.target);
-  return check.ok ? { kind: "active-build" } : { kind: "rebuild", was: check.message };
+  if (check.ok) return { kind: "active-build" };
+  return check.reason === "link" ? { kind: "link" } : { kind: "rebuild", was: check.message };
 }
 
 /** What a start's compile step will do, decided without compiling. */
@@ -557,8 +571,10 @@ export type CompileMode = "explicit" | "auto" | false;
 
 export type PrepareRunner = {
   /** compile-if-stale, then the postCompile hook. Runs after the start slot
-   *  is claimed and BEFORE preflight, so preflight sees the fresh bundle. */
-  prepare(): Promise<PrepareOutcome>;
+   *  is claimed and BEFORE preflight, so preflight sees the fresh bundle.
+   *  `proceed`, when given, is asked after the compile and before the hook: false
+   *  runs no hook and answers `halted`. */
+  prepare(proceed?: () => boolean): Promise<PrepareOutcome>;
   /** The preSpawn hook. Runs after preflight and immediately before the
    *  spawn — the last chance to refuse. */
   preSpawn(): Promise<PrepareOutcome>;
@@ -602,7 +618,7 @@ export function createPrepareRunner(options: PrepareRunnerOptions): PrepareRunne
         ...(hooks.preSpawn !== undefined ? (["preSpawn"] as const) : []),
       ],
     },
-    prepare: async () => {
+    prepare: async (proceed) => {
       const notes: string[] = [];
       let replan = false;
       let activeOnly = false;
@@ -618,6 +634,15 @@ export function createPrepareRunner(options: PrepareRunnerOptions): PrepareRunne
       // ones that recompiled: its job is to make the bundle on disk correct,
       // and a bundle a console compile job replaced behind the operator's
       // back needs the patch just as much as one this start produced.
+      if (proceed !== undefined && !proceed()) {
+        return {
+          ok: true,
+          replan,
+          notes,
+          halted: true,
+          ...(activeOnly ? { activeOnly: true } : {}),
+        };
+      }
       const hooked = await runManagerHook("postCompile", hooks.postCompile, deps, hooks.timeoutMs);
       if (!hooked.ok) return hooked;
       notes.push(...hooked.notes);

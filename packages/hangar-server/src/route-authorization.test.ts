@@ -19,7 +19,16 @@
  * table of sentinel rows checks that computation independently.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type AccessSnapshot,
@@ -32,12 +41,13 @@ import {
   openSignIn,
 } from "@crewhaus/access-control";
 import { PERMISSION_DECLS, ROLES, ROLE_PERMISSIONS, type Role } from "@crewhaus/control-contract";
+import { specRev } from "@crewhaus/spec-patch/commit";
 import { acceptInvite, acceptInviteTabOnly, bearer, signInFromBootLink } from "./__test__/browser";
 import { type AccessView, type Caller, authorizeRequest, withholdPeople } from "./access";
 import { makeFixtureHarness } from "./fixture";
 import { matchRequest } from "./route-match";
 import { ROUTE_BY_KEY, ROUTE_TABLE, type RouteRow } from "./route-table";
-import { type TestServer, bootTestServer } from "./testkit";
+import { type BootOptions, type TestServer, bootTestServer } from "./testkit";
 
 // ---------------------------------------------------------------------------
 // The Home every credential is made on
@@ -107,8 +117,11 @@ function harnessWithData(t: TestServer, name: string): string {
   });
 }
 
-async function makeWorld(): Promise<World> {
-  const t = bootTestServer({ lanHost: "127.0.0.1" });
+async function makeWorld({
+  readOnly = true,
+  boot = {},
+}: { readOnly?: boolean; boot?: BootOptions } = {}): Promise<World> {
+  const t = bootTestServer({ lanHost: "127.0.0.1", ...boot });
   const owner = await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
   const aDir = harnessWithData(t, "alpha");
   const bDir = harnessWithData(t, "bravo");
@@ -190,12 +203,14 @@ async function makeWorld(): Promise<World> {
       headers: { ...bearer(t.token), host: "rebind.example.test" },
     },
   };
-  // On for the whole matrix: an allowed write is answered `read_only` and has no effect.
-  const engaged = await t.api("/api/read-only", {
-    method: "PUT",
-    body: JSON.stringify({ enabled: true }),
-  });
-  if (engaged.status !== 200) throw new Error(`read-only answered ${engaged.status}`);
+  if (readOnly) {
+    // On for the whole matrix: an allowed write is answered `read_only` and has no effect.
+    const engaged = await t.api("/api/read-only", {
+      method: "PUT",
+      body: JSON.stringify({ enabled: true }),
+    });
+    if (engaged.status !== 200) throw new Error(`read-only answered ${engaged.status}`);
+  }
   return {
     t,
     a,
@@ -216,7 +231,7 @@ async function makeWorld(): Promise<World> {
 
 beforeAll(async () => {
   world = await makeWorld();
-}, 60_000);
+}, 60_000); // a live server boot, and every invite accepted through the sign-in route
 
 afterAll(async () => {
   await world?.t.stop();
@@ -423,8 +438,12 @@ function ledgerLines(dir: string): number {
     );
 }
 
+function allLedgersOf(w: World): number {
+  return ledgerLines(w.aDir) + ledgerLines(w.bDir) + ledgerLines(w.t.hangarRoot);
+}
+
 function allLedgers(): number {
-  return ledgerLines(world.aDir) + ledgerLines(world.bDir) + ledgerLines(world.t.hangarRoot);
+  return allLedgersOf(world);
 }
 
 const CREDS = [
@@ -616,7 +635,7 @@ describe("a trusted proxy's identities", () => {
     } finally {
       await t.stop();
     }
-  }, 60_000);
+  }, 60_000); // a live server boot, then every row asked twice through the proxy's identity check
 });
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1049,198 @@ describe("an item about people is released only by a people domain", () => {
     const key: Caller = { principal: world.owner, actor: null, via: "bootstrap" };
     expect(authorizeRequest({ row, params, caller: key, view }).allow).toBe(false);
     expect(calls).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Read-only off: a refused write is refused by authorization alone
+// ---------------------------------------------------------------------------
+
+describe("with read-only off, a refused write is refused and changes nothing", () => {
+  let w: World;
+  let demosDir: string;
+  let cwd: string;
+  const ENV_VALUE = ["placeholder", "env", "value"].join("-");
+  const SET_VALUE = ["placeholder", "set", "across"].join("-");
+
+  beforeAll(async () => {
+    // Made before the boot: the world's own workspace does not exist until it boots.
+    demosDir = mkdtempSync(join(tmpdir(), "route-auth-demos-"));
+    mkdirSync(join(demosDir, "starters", "hello"), { recursive: true });
+    writeFileSync(join(demosDir, "starters", "hello", "crewhaus.yaml"), "name: hello\n");
+    cwd = mkdtempSync(join(tmpdir(), "route-auth-cwd-"));
+    w = await makeWorld({ readOnly: false, boot: { demosDir, cwd } });
+    writeFileSync(join(w.aDir, ".env"), `SHARED_TOKEN=${ENV_VALUE}\n`, { mode: 0o600 });
+  }, 60_000); // a live server boot, and every invite accepted through the sign-in route
+
+  afterAll(async () => {
+    await w?.t.stop();
+    for (const dir of [demosDir, cwd]) {
+      if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  const WRITES = ["procStart", "controlWake", "setPin", "credentialsSetAcross", "specEdit"];
+
+  const specOf = (): string => readFileSync(join(w.aDir, "crewhaus.yaml"), "utf8");
+  const envOf = (): string => readFileSync(join(w.aDir, ".env"), "utf8");
+  const registryOf = (): string => readFileSync(w.t.server.registryPath, "utf8");
+
+  /** A body each handler would act on: an empty one would be refused by the handler too. */
+  function validBody(key: string): Record<string, unknown> {
+    switch (key) {
+      case "procStart":
+      case "controlWake":
+        return {};
+      case "setPin":
+        return { pinned: true };
+      case "credentialsSetAcross":
+        return {
+          key: "SHARED_TOKEN",
+          value: SET_VALUE,
+          harnessIds: [w.a],
+          confirmName: "SHARED_TOKEN",
+        };
+      case "specEdit":
+        return {
+          edits: [{ path: "memory.enabled", value: false }],
+          confirmName: "alpha",
+          expectedRev: specRev(specOf()),
+        };
+      default:
+        throw new Error(`no body for ${key}`);
+    }
+  }
+
+  async function send(row: RouteRow, cred: Cred): Promise<Answer> {
+    const res = await w.t.fetchRaw(pathFor(row, w.a), {
+      method: row.method,
+      headers: { "content-type": "application/json", ...cred.headers },
+      body: JSON.stringify(validBody(row.key)),
+    });
+    const text = await res.text();
+    let body: Record<string, unknown> = {};
+    try {
+      body = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      body = { text };
+    }
+    return { status: res.status, body };
+  }
+
+  test("every refused credential is answered as the role table says, and nothing moves", async () => {
+    const before = {
+      ledgers: allLedgersOf(w),
+      registry: registryOf(),
+      spec: specOf(),
+      env: envOf(),
+      children: w.t.ops?.children.length,
+    };
+    const wrong: string[] = [];
+    let sent = 0;
+    for (const key of WRITES) {
+      const row = ROUTE_BY_KEY.get(key) as RouteRow;
+      expect(row).toBeDefined();
+      for (const cred of CREDS) {
+        const want = expected(row, cred);
+        if (want === ALLOW) continue;
+        const answer = await send(row, w.creds[cred] as Cred);
+        sent += 1;
+        const got = outcomeOf(row, answer);
+        if (got !== want) wrong.push(`${key} as ${cred}: ${got} (want ${want})`);
+        if (got === "403 permission") {
+          expect(`${key} as ${cred}: ${answer.body["code"]} ${answer.body["needs"]}`).toBe(
+            `${key} as ${cred}: forbidden ${row.permission}`,
+          );
+        }
+      }
+    }
+    expect(wrong).toEqual([]);
+    // Every write, by the members, the tokens and the refused connections alike.
+    expect(sent).toBeGreaterThanOrEqual(50);
+    expect({
+      ledgers: allLedgersOf(w),
+      registry: registryOf(),
+      spec: specOf(),
+      env: envOf(),
+      children: w.t.ops?.children.length,
+    }).toEqual(before);
+  }, 60_000); // ~60 requests through a live server
+
+  test("the owner's same writes do change them, so the pass above would see an effect", async () => {
+    const owner = w.creds["owner"] as Cred;
+    const before = {
+      ledgers: allLedgersOf(w),
+      registry: registryOf(),
+      spec: specOf(),
+      env: envOf(),
+    };
+    for (const key of ["setPin", "specEdit", "credentialsSetAcross"]) {
+      const answer = await send(ROUTE_BY_KEY.get(key) as RouteRow, owner);
+      expect(`${key}: ${answer.status}`).toBe(`${key}: 200`);
+    }
+    expect(registryOf()).not.toBe(before.registry);
+    expect(specOf()).not.toBe(before.spec);
+    expect(envOf()).not.toBe(before.env);
+    expect(envOf()).toContain(SET_VALUE);
+    expect(allLedgersOf(w)).toBeGreaterThan(before.ledgers);
+  });
+
+  test("onboarding and scan roots name places on this computer only to registry managers", async () => {
+    const root = join(w.t.workspace, "scan-here");
+    mkdirSync(root, { recursive: true });
+    const added = await w.t.fetchRaw("/api/registry/scan-roots", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(w.creds["owner"] as Cred).headers },
+      body: JSON.stringify({ dir: root }),
+    });
+    expect(added.status).toBe(201);
+    // Each path as it appears inside a JSON body (backslashes doubled on Windows).
+    const inJson = (path: string): string => JSON.stringify(path).slice(1, -1);
+    const places = {
+      home: inJson(homedir()),
+      cwd: inJson(cwd),
+      demos: inJson(demosDir),
+      root: inJson(root),
+    };
+    const read = async (who: string, path: string) => {
+      const res = await w.t.fetchRaw(path, { headers: (w.creds[who] as Cred).headers });
+      expect(`${who} ${path}: ${res.status}`).toBe(`${who} ${path}: 200`);
+      const text = await res.text();
+      return { text, body: JSON.parse(text) as Record<string, unknown> };
+    };
+
+    const ownerOnboarding = await read("owner", "/api/onboarding");
+    for (const place of [places.home, places.cwd, places.demos]) {
+      expect(ownerOnboarding.text.indexOf(place)).toBeGreaterThan(-1);
+    }
+    expect(ownerOnboarding.text).not.toContain(places.root);
+    expect(ownerOnboarding.body["scanRootCount"]).toBe(1);
+    expect(ownerOnboarding.body["note"]).toBeNull();
+    const ownerRoots = await read("owner", "/api/registry/scan-roots");
+    expect(ownerRoots.text.indexOf(places.root)).toBeGreaterThan(-1);
+
+    for (const who of ["viewerA", "memberB"]) {
+      const onboarding = await read(who, "/api/onboarding");
+      const roots = await read(who, "/api/registry/scan-roots");
+      for (const [name, place] of Object.entries(places)) {
+        expect(`${who} onboarding ${name}: ${onboarding.text.includes(place)}`).toBe(
+          `${who} onboarding ${name}: false`,
+        );
+        expect(`${who} scan roots ${name}: ${roots.text.includes(place)}`).toBe(
+          `${who} scan roots ${name}: false`,
+        );
+      }
+      expect(onboarding.body["firstBoot"]).toBe(false);
+      expect(onboarding.body["scanRootCount"]).toBeNull();
+      expect(onboarding.body["suggestions"]).toEqual([]);
+      expect((onboarding.body["demo"] as Record<string, unknown>)["source"]).toBeNull();
+      expect(typeof onboarding.body["note"]).toBe("string");
+      expect(onboarding.body["harnessCount"]).toBe(1);
+      expect(roots.body["scanRoots"]).toEqual([]);
+      expect(roots.body["needs"]).toBe("home.registry.manage");
+      expect(typeof roots.body["note"]).toBe("string");
+    }
   });
 });
 

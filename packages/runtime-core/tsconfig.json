@@ -36,6 +36,7 @@
     { "path": "../token-budget" },
     { "path": "../tool-catalog" },
     { "path": "../tool-executor" },
+    { "path": "../tool-fs" },
     { "path": "../tool-orchestrator" },
     { "path": "../tool-plan" },
     { "path": "../tool-state" },

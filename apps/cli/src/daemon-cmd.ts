@@ -37,7 +37,12 @@ import {
   EXIT_FOR_ERROR,
   EXIT_FOR_REJECTED_RECEIPT,
 } from "@crewhaus/control-contract";
-import { assertRunnable, ensureDigestKey, readHarnessIdentity } from "@crewhaus/control-records";
+import {
+  assertRunnable,
+  ensureDigestKey,
+  readDigestKey,
+  readHarnessIdentity,
+} from "@crewhaus/control-records";
 import {
   type ControlService,
   type OperatorControlKind,
@@ -152,6 +157,7 @@ const DAEMON_USAGE_LINES: readonly string[] = [
   "       [--tail N] [--follow] [--run <run_id>]",
   "  crewhaus daemon wake [<dir|hrn_id>]         one synthetic tick down the daemon's OWN timer",
   "       --lane heartbeat|schedule [--reason R] path, via crewhaus.control.v1",
+  "       (or --lane schedule:<name>)            for a named schedule lane",
   "  crewhaus daemon drain [<dir|hrn_id>]        stop intake, finish in-flight work, exit 0",
   "  crewhaus daemon pause [<dir|hrn_id>]        pause new work: nothing new starts until",
   "       [--quiet]                              resumed (--quiet: channels show no notice)",
@@ -354,13 +360,25 @@ export function supervisorFor(
         ?.list()
         .find((entry) => entry.dir === harnessDir)?.id;
       if (decideOnly) {
-        // A restart asking before it stops the daemon: decide, write nothing (no digest
-        // key is created and no actor is resolved).
+        // A restart asking before it stops the daemon: every refusal the start would make is
+        // decided as that start decides it, writing nothing. The actor is the one the start
+        // stores, resolved under the existing key; with no key yet there is none to key it.
+        const read = await readDigestKey(harnessDir);
+        if (read.state === "unreadable") {
+          return {
+            ok: false,
+            message: "the harness's digest key cannot be read; nothing was started",
+          };
+        }
+        const actor =
+          read.state === "present"
+            ? await storedActorFor(resolveHangarRoot(env), currentLocalIdentity(), read.hmac)
+            : "";
         return admitExplicitStart(harnessDir, target, {
           head,
           entry,
           ledgerAbsent,
-          actor: "",
+          actor,
           decideOnly: true,
           ...(registryId !== undefined ? { registryId } : {}),
           ...(opts.clock !== undefined ? { now: opts.clock.now } : {}),
@@ -1405,7 +1423,7 @@ async function daemonWake(
   const harness = resolveHarness(args.positional[0], opts);
   const laneFlag = args.flags.get("lane");
   if (typeof laneFlag !== "string" || !isControlLane(laneFlag)) {
-    throw new Error("daemon wake: --lane must be heartbeat or schedule");
+    throw new Error("daemon wake: --lane must be heartbeat, schedule or schedule:<name>");
   }
   const lane: ControlLane = laneFlag;
   const reasonFlag = args.flags.get("reason");

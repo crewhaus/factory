@@ -1,17 +1,44 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  rmdirSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join, relative } from "node:path";
 import { mintId } from "@crewhaus/control-contract";
-import { controlPaths, readProposals, readStandingRules } from "@crewhaus/control-records";
+import {
+  casAppend,
+  controlPaths,
+  decisionsLedger,
+  readApproverProjection,
+  readProposals,
+  readStandingRules,
+} from "@crewhaus/control-records";
 import { emptyRuleSet, evaluate, loadSettingsRules } from "@crewhaus/permission-engine";
-import { foldReadOnly } from "@crewhaus/session-store";
+import { foldReadOnly, generateApprovalId } from "@crewhaus/session-store";
 import type { DecisionActor } from "./decisions";
-import { harnessForSessionRoot, settingsWriteClass } from "./decisions";
+import {
+  SECURITY_SETTINGS_PATHS,
+  createDecisions,
+  governedAncestorOf,
+  harnessForSessionRoot,
+  settingsWriteClass,
+} from "./decisions";
 import {
   callValues,
   carriesCredential,
+  createStandingRule,
   legacyBroadAllows,
+  ruleEndProblem,
   standingPatternFor,
   widenedPatternProblem,
 } from "./rules";
@@ -117,7 +144,9 @@ describe("decisions.resolve by class", () => {
     const r = rig();
     const owner = await setUpOwner(r.hangarRoot);
     const member = linkLocalMember(r.hangarRoot, { username: "rae", hostname: "laptop" }, owner);
-    plantProjection(r.harness, owner, [{ principal: member, decide: "operator" }]);
+    plantProjection(r.harness, owner, [{ principal: member, decide: "operator" }], {
+      accessRoot: realpathSync(r.hangarRoot),
+    });
     const p = await park(r.harness, "Write", { path: "a.md" });
     const linked = await r.service.decisions.resolve({
       harnessDir: r.harness,
@@ -614,7 +643,7 @@ describe("harnessForSessionRoot", () => {
 });
 
 describe("settingsWriteClass", () => {
-  test("the owner's for permissions, hooks and manager.hooks; a maintainer's for the rest", () => {
+  test("the owner's for permissions, hooks, manager.hooks and manager.envFiles; a maintainer's for the rest", () => {
     const base = { manager: { envFiles: ["a"] }, alerts: { x: 1 } };
     expect(settingsWriteClass(base, { ...base, permissions: { rules: [] } })).toBe("owner");
     expect(settingsWriteClass(base, { ...base, hooks: [{ event: "stop", command: "x" }] })).toBe(
@@ -623,8 +652,19 @@ describe("settingsWriteClass", () => {
     expect(
       settingsWriteClass(base, { ...base, manager: { ...base.manager, hooks: { preSpawn: "x" } } }),
     ).toBe("owner");
-    expect(settingsWriteClass(base, { ...base, manager: { envFiles: ["b"] } })).toBe("maintainer");
+    expect(settingsWriteClass(base, { ...base, manager: { envFiles: ["b"] } })).toBe("owner");
+    expect(settingsWriteClass(base, { ...base, manager: { envFiles: ["a"], other: 1 } })).toBe(
+      "maintainer",
+    );
     expect(settingsWriteClass(base, { ...base, alerts: { x: 2 } })).toBe("maintainer");
+    // Every listed path is the owner's, and the list is the one other surfaces read.
+    expect(SECURITY_SETTINGS_PATHS.map((path) => path.join("."))).toEqual([
+      "permissions",
+      "hooks",
+      "manager.hooks",
+      "manager.envFiles",
+    ]);
+    expect(Object.isFrozen(SECURITY_SETTINGS_PATHS)).toBe(true);
     // Key order is not a change.
     expect(
       settingsWriteClass(
@@ -655,5 +695,605 @@ describe("the request store", () => {
     expect(text).not.toContain("Mallory");
     const read = readProposals(r.harness);
     expect(read.state === "present" && read.rows[0]?.kind).toBe("standing-rule-proposal");
+  });
+});
+
+describe("superseding an approval and the standing rules made from it", () => {
+  const call = (harness: string, path: string) => ({
+    toolName: "Write",
+    input: { path },
+    operativeValues: callValues("Write", { path }, harness) as never,
+    readOnly: false,
+    destructive: true,
+  });
+  const allowedNow = (harness: string, path: string): string =>
+    evaluate(call(harness, path), "default", {
+      ...emptyRuleSet,
+      settings: loadSettingsRules(harness, { now: () => NOW + 1000 }),
+    });
+  const ruleState = (harness: string, id: string): string | undefined => {
+    const read = readStandingRules(harness);
+    return read.state === "present" ? read.rows.find((row) => row.id === id)?.state : read.state;
+  };
+
+  async function ownerRule(r: ReturnType<typeof governed>, path: string) {
+    const p = await park(r.harness, "Write", { path });
+    const made = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: p.id,
+      choice: "grant",
+      actor: as(r.owner),
+      via: "cli",
+      always: true,
+    });
+    if (made.rule === undefined) throw new Error("no rule");
+    return { p, rule: made.rule };
+  }
+
+  test("the owner's supersede in error ends the rule its --always made, and the call is asked again", async () => {
+    const r = governed();
+    const { p, rule } = await ownerRule(r, "notes/a.md");
+    expect(allowedNow(r.harness, "notes/a.md")).toBe("allow");
+    const answer = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: p.id,
+      reason: "decided-in-error",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(answer.outcome).toBe("superseded");
+    expect(answer.derivedRules).toEqual([{ id: rule.id, revoked: true }]);
+    expect(answer.ruleError).toBeUndefined();
+    expect(ruleState(r.harness, rule.id)).toBe("revoked");
+    expect(allowedNow(r.harness, "notes/a.md")).toBe("ask");
+  });
+
+  test("a maintainer's policy-changed supersede leaves the rule standing and names its verb", async () => {
+    const r = governed();
+    const { p, rule } = await ownerRule(r, "notes/a.md");
+    const answer = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: p.id,
+      reason: "policy-changed",
+      actor: as(r.maintainer),
+      via: "cli",
+    });
+    expect(answer.outcome).toBe("superseded");
+    expect(answer.derivedRules).toEqual([
+      {
+        id: rule.id,
+        revoked: false,
+        verb: `crewhaus approvals revoke ${rule.id} --dir ${r.harness}`,
+      },
+    ]);
+    expect(ruleState(r.harness, rule.id)).toBe("active");
+    expect(allowedNow(r.harness, "notes/a.md")).toBe("allow");
+  });
+
+  test("the owner's policy-changed supersede, and a maintainer's in error, leave the rule standing", async () => {
+    const r = governed();
+    const first = await ownerRule(r, "notes/a.md");
+    const byOwner = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: first.p.id,
+      reason: "policy-changed",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(byOwner.derivedRules?.map((rule) => rule.revoked)).toEqual([false]);
+    const second = await ownerRule(r, "notes/b.md");
+    const byMaintainer = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: second.p.id,
+      reason: "decided-in-error",
+      actor: as(r.maintainer),
+      via: "cli",
+    });
+    expect(byMaintainer.derivedRules?.map((rule) => rule.revoked)).toEqual([false]);
+    expect(ruleState(r.harness, first.rule.id)).toBe("active");
+    expect(ruleState(r.harness, second.rule.id)).toBe("active");
+  });
+
+  test("a rule the owner granted from a member's request ends with the approval it came from", async () => {
+    const r = governed();
+    const p = await park(r.harness, "Write", { path: "notes/a.md" });
+    const asked = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: p.id,
+      choice: "grant",
+      actor: as(r.maintainer),
+      via: "cli",
+      always: true,
+    });
+    const granted = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: asked.proposal?.id ?? "",
+      choice: "grant",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    const id = granted.rule?.id ?? "";
+    expect(granted.rule?.derivedFrom).toBe(p.id);
+    const answer = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: p.id,
+      reason: "decided-in-error",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(answer.derivedRules).toEqual([{ id, revoked: true }]);
+    expect(ruleState(r.harness, id)).toBe("revoked");
+  });
+
+  test("a rule record that cannot be read is named, and the supersede stands", async () => {
+    const r = governed();
+    const { p } = await ownerRule(r, "notes/a.md");
+    const file = join(r.harness, controlPaths(r.harness).standingRulesFile);
+    rmSync(file);
+    mkdirSync(file);
+    const answer = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: p.id,
+      reason: "decided-in-error",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(answer.outcome).toBe("superseded");
+    expect(answer.derivedRules).toEqual([]);
+    expect(answer.ruleError).toContain(`crewhaus approvals rules --dir ${r.harness}`);
+  });
+
+  test("a rule record with a line that cannot be read is named, and the rule it holds still ends", async () => {
+    const r = governed();
+    const { p } = await ownerRule(r, "notes/a.md");
+    const file = join(r.harness, controlPaths(r.harness).standingRulesFile);
+    // A sealed line that does not parse: a gap the read reports.
+    writeFileSync(file, `${readFileSync(file, "utf8")}{ torn\n`);
+    const read = readStandingRules(r.harness);
+    expect(read.state === "present" && read.anomalies.length > 0).toBe(true);
+    const listed = r.service.rules.list(r.harness);
+    expect(listed.unreadable.join("\n")).toContain(
+      "a settings allow no readable rule names is not loaded",
+    );
+    const answer = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: p.id,
+      reason: "decided-in-error",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(answer.outcome).toBe("superseded");
+    expect(answer.derivedRules?.map((d) => d.revoked)).toEqual([true]);
+    expect(answer.ruleError).toContain(`crewhaus approvals rules --dir ${r.harness}`);
+  });
+});
+
+describe("a rule's pattern holds no control or bidirectional-text character", () => {
+  test("no narrow rule names such a call, and no wider pattern holds one", () => {
+    const harness = tempDir();
+    expect(standingPatternFor("Write", { path: "a\u001b[2Jb" }, harness)).toEqual({
+      refused: "not-representable",
+    });
+    expect(standingPatternFor("Write", { path: "a\u202eb.md" }, harness)).toEqual({
+      refused: "not-representable",
+    });
+    expect(widenedPatternProblem("Write", { path: "a.md" }, "Write(a\u202e*)", harness)).toContain(
+      "control or bidirectional-text characters",
+    );
+    expect(widenedPatternProblem("Write", { path: "a.md" }, "Write(a*)", harness)).toBeUndefined();
+  });
+
+  test("createStandingRule refuses one and writes nothing", async () => {
+    const harness = tempDir();
+    for (const pattern of ["Write(a\u202eb)", "Write(a\u0085b)", "Write(a\u001bb)"]) {
+      const answer = await createStandingRule({
+        harnessDir: harness,
+        tool: "Write",
+        pattern,
+        reason: "approval",
+        createdBy: mintId("prn"),
+        expiresAt: new Date(NOW + DAY).toISOString(),
+        now: NOW,
+      });
+      expect(answer.ok).toBe(false);
+    }
+    expect(readStandingRules(harness).state).toBe("absent");
+    expect(settingsOf(harness)).toBeUndefined();
+    expect(existsSync(join(harness, ".crewhaus"))).toBe(false);
+  });
+});
+
+describe("a request to the owner is granted only on the terms its approval gives", () => {
+  async function filed() {
+    const r = governed();
+    const p = await park(r.harness, "Write", { path: "notes/a.md" });
+    const asked = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: p.id,
+      choice: "grant",
+      actor: as(r.maintainer),
+      via: "cli",
+      always: true,
+    });
+    if (asked.proposal === undefined) throw new Error("no request filed");
+    return { ...r, p, honest: asked.proposal };
+  }
+  const pendingOf = (harness: string, id: string): string | undefined => {
+    const read = readProposals(harness);
+    return read.state === "present" ? read.rows.find((row) => row.id === id)?.state : read.state;
+  };
+
+  test("a planted whole-tool pattern, a far end and an approval no store holds are invalid, and write nothing", async () => {
+    const r = await filed();
+    const planted = [
+      { ...r.honest, terms: { ...r.honest.terms, pattern: "Write" } },
+      { ...r.honest, terms: { ...r.honest.terms, expiresAt: "9999-12-31T00:00:00.000Z" } },
+      { ...r.honest, derivedFrom: generateApprovalId() },
+      // The tool changed, the pattern kept.
+      { ...r.honest, terms: { ...r.honest.terms, tool: "Edit" } },
+    ].map((row) => ({ ...row, id: mintId("dec", { now: NOW }) }));
+    for (const row of planted) {
+      const filedRow = await casAppend(decisionsLedger(r.harness), row.id, null, row);
+      expect(filedRow.ok && filedRow.applied).toBe(true);
+    }
+    for (const row of planted) {
+      const answer = await r.service.decisions.resolve({
+        harnessDir: r.harness,
+        ref: row.id,
+        choice: "grant",
+        actor: as(r.owner),
+        via: "cli",
+      });
+      expect({ id: row.id, outcome: answer.outcome }).toEqual({ id: row.id, outcome: "invalid" });
+      expect(answer.reason).toContain("ask for it again");
+      expect(pendingOf(r.harness, row.id)).toBe("pending");
+    }
+    expect(readStandingRules(r.harness).state).toBe("absent");
+    expect(settingsOf(r.harness)).toBeUndefined();
+    // The honest request still grants.
+    const honest = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: r.honest.id,
+      choice: "grant",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(honest.outcome).toBe("decided");
+    expect(honest.rule?.pattern).toBe("Write(notes/a.md)");
+  });
+
+  test("a request derived from an approval nobody granted, or one denied, is invalid", async () => {
+    const r = await filed();
+    const waiting = await park(r.harness, "Write", { path: "notes/b.md" });
+    const denied = await park(r.harness, "Write", { path: "notes/c.md" });
+    const no = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: denied.id,
+      choice: "deny",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(no.outcome).toBe("decided");
+    const planted = [
+      { from: waiting.id, pattern: "Write(notes/b.md)" },
+      { from: denied.id, pattern: "Write(notes/c.md)" },
+    ].map(({ from, pattern }) => ({
+      ...r.honest,
+      id: mintId("dec", { now: NOW }),
+      derivedFrom: from,
+      terms: { ...r.honest.terms, pattern },
+    }));
+    for (const row of planted) {
+      await casAppend(decisionsLedger(r.harness), row.id, null, row);
+      const answer = await r.service.decisions.resolve({
+        harnessDir: r.harness,
+        ref: row.id,
+        choice: "grant",
+        actor: as(r.owner),
+        via: "cli",
+      });
+      expect({ from: row.derivedFrom, outcome: answer.outcome }).toEqual({
+        from: row.derivedFrom,
+        outcome: "invalid",
+      });
+      expect(pendingOf(r.harness, row.id)).toBe("pending");
+    }
+    expect(readStandingRules(r.harness).state).toBe("absent");
+    expect(settingsOf(r.harness)).toBeUndefined();
+  });
+
+  test("a request whose end holds control characters is not listed, not granted, and no rule keeps it", async () => {
+    const r = await filed();
+    // A date that parses, with a comment holding control characters.
+    const end = "Tue Dec 01 2026 00:00:00 GMT+0000 (\r\u001b[2K  dec_x  Read(README.md))";
+    expect(Number.isFinite(Date.parse(end))).toBe(true);
+    const row = {
+      ...r.honest,
+      id: mintId("dec", { now: NOW }),
+      terms: { ...r.honest.terms, expiresAt: end },
+    };
+    await casAppend(decisionsLedger(r.harness), row.id, null, row);
+    const listed = r.service.rules.list(r.harness);
+    expect(JSON.stringify(listed).includes(r.honest.id)).toBe(true);
+    expect(JSON.stringify(listed).includes("\u001b")).toBe(false);
+    expect(JSON.stringify(listed).includes(row.id)).toBe(false);
+    const answer = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: row.id,
+      choice: "grant",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(answer.outcome).not.toBe("decided");
+    expect(readStandingRules(r.harness).state).toBe("absent");
+    expect(ruleEndProblem(end, NOW)).toBe("the rule's end is not a time");
+    const made = await createStandingRule({
+      harnessDir: r.harness,
+      tool: "Write",
+      pattern: "Write(notes/a.md)",
+      reason: "approval",
+      createdBy: r.owner,
+      expiresAt: end,
+      now: NOW,
+    });
+    expect(made.ok).toBe(false);
+    expect(readStandingRules(r.harness).state).toBe("absent");
+  });
+
+  test("a request whose approval was superseded is invalid", async () => {
+    const r = await filed();
+    const sup = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: r.p.id,
+      reason: "policy-changed",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(sup.outcome).toBe("superseded");
+    const answer = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: r.honest.id,
+      choice: "grant",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(answer.outcome).toBe("invalid");
+    expect(pendingOf(r.harness, r.honest.id)).toBe("pending");
+    expect(readStandingRules(r.harness).state).toBe("absent");
+  });
+
+  test("a deny needs none of it", async () => {
+    const r = await filed();
+    const row = { ...r.honest, id: mintId("dec", { now: NOW }), derivedFrom: generateApprovalId() };
+    await casAppend(decisionsLedger(r.harness), row.id, null, row);
+    const answer = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: row.id,
+      choice: "deny",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(answer.outcome).toBe("decided");
+    expect(pendingOf(r.harness, row.id)).toBe("denied");
+  });
+
+  test("no rule lasts more than 365 days from when it is made", async () => {
+    const harness = tempDir();
+    const write = (expiresAt: string) =>
+      createStandingRule({
+        harnessDir: harness,
+        tool: "Write",
+        pattern: "Write(a.md)",
+        reason: "approval",
+        createdBy: mintId("prn"),
+        expiresAt,
+        now: NOW,
+      });
+    const past = await write(new Date(NOW + 365 * DAY + 1).toISOString());
+    expect(past.ok).toBe(false);
+    expect(readStandingRules(harness).state).toBe("absent");
+    expect((await write(new Date(NOW).toISOString())).ok).toBe(false);
+    expect((await write("not a time")).ok).toBe(false);
+    expect(ruleEndProblem(new Date(NOW + 365 * DAY).toISOString(), NOW)).toBeUndefined();
+    const longest = await write(new Date(NOW + 365 * DAY).toISOString());
+    expect(longest.ok).toBe(true);
+  });
+});
+
+describe("a local user decides only through the Home that wrote the harness's approver list", () => {
+  const RAE = { username: "rae", hostname: "laptop" } as const;
+  const local = { kind: "local", identity: RAE } as const;
+
+  async function homeWithMember() {
+    const r = rig();
+    const owner = await setUpOwner(r.hangarRoot);
+    const member = linkLocalMember(r.hangarRoot, RAE, owner);
+    return { ...r, owner, member };
+  }
+
+  test("principalOf names the member under the root that wrote it, and nobody under another", async () => {
+    const r = await homeWithMember();
+    const members = [{ principal: r.member, decide: "operator" }];
+    const ours = tempDir();
+    plantProjection(ours, r.owner, members, { accessRoot: realpathSync(r.hangarRoot) });
+    const theirs = tempDir();
+    plantProjection(theirs, r.owner, members, { accessRoot: tempDir("another-home-") });
+    expect(r.service.decisions.principalOf(local, ours)).toEqual({ principal: r.member });
+    expect(r.service.decisions.principalOf(local, theirs)).toEqual({});
+    expect(r.service.decisions.mayManageRules(theirs, local)).toBe(false);
+    // With no harness named, the access records answer as they are.
+    expect(r.service.decisions.principalOf(local)).toEqual({ principal: r.member });
+  });
+
+  test("a decision under another root is refused as having no principal, and nothing is decided", async () => {
+    const r = await homeWithMember();
+    plantProjection(r.harness, r.owner, [{ principal: r.member, decide: "operator" }], {
+      accessRoot: tempDir("another-home-"),
+    });
+    const p = await park(r.harness, "Write", { path: "a.md" });
+    const answer = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: p.id,
+      choice: "grant",
+      actor: local,
+      via: "cli",
+    });
+    expect(answer.outcome).toBe("forbidden");
+    expect(answer.reason).toContain("Sign in to Home, or ask its owner.");
+    const folded = foldReadOnly(join(r.harness, ".crewhaus", "sessions"));
+    expect(folded.records[0]?.decision).toBeUndefined();
+  });
+
+  test("a list that names no Home root asks for crewhaus access sync, for every decision", async () => {
+    const r = await homeWithMember();
+    plantProjection(r.harness, r.owner, [{ principal: r.member, decide: "maintainer" }], {
+      accessRoot: null,
+    });
+    const p = await park(r.harness, "Write", { path: "a.md" });
+    const decide = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: p.id,
+      choice: "grant",
+      actor: local,
+      via: "cli",
+    });
+    expect(decide.outcome).toBe("forbidden");
+    expect(decide.reason).toContain("crewhaus access sync");
+    const supersede = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: p.id,
+      reason: "other",
+      actor: local,
+      via: "cli",
+    });
+    expect(supersede.outcome).toBe("forbidden");
+    expect(supersede.reason).toContain("crewhaus access sync");
+    const defer = await r.service.decisions.defer({
+      harnessDir: r.harness,
+      ref: p.id,
+      until: new Date(NOW + DAY).toISOString(),
+      reason: "awaiting-information",
+      actor: local,
+      via: "cli",
+    });
+    expect(defer.outcome).toBe("forbidden");
+    expect(r.service.decisions.principalOf(local, r.harness)).toEqual({});
+    // A principal Home signed in is asked the same.
+    const byOwner = await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: p.id,
+      choice: "grant",
+      actor: as(r.owner),
+      via: "home",
+    });
+    expect(byOwner.outcome).toBe("forbidden");
+    expect(byOwner.reason).toContain("crewhaus access sync");
+    expect(
+      foldReadOnly(join(r.harness, ".crewhaus", "sessions")).records[0]?.decision,
+    ).toBeUndefined();
+  });
+
+  test("a principal under a Home root that did not write the list is forbidden, and nothing is decided", async () => {
+    const r = await homeWithMember();
+    plantProjection(r.harness, r.owner, [{ principal: r.member, decide: "operator" }], {
+      accessRoot: tempDir("another-home-"),
+    });
+    const p = await park(r.harness, "Write", { path: "a.md" });
+    for (const actor of [as(r.owner), as(r.member)]) {
+      const answer = await r.service.decisions.resolve({
+        harnessDir: r.harness,
+        ref: p.id,
+        choice: "grant",
+        actor,
+        via: "home",
+      });
+      expect(answer.outcome).toBe("forbidden");
+      expect(answer.reason).toContain("Sign in to Home, or ask its owner.");
+    }
+    const supersede = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: p.id,
+      reason: "other",
+      actor: as(r.owner),
+      via: "home",
+    });
+    expect(supersede.outcome).toBe("forbidden");
+    expect(r.service.decisions.mayManageRules(r.harness, as(r.owner))).toBe(false);
+    expect(r.service.decisions.principalOf(as(r.owner), r.harness)).toEqual({});
+    const folded = foldReadOnly(join(r.harness, ".crewhaus", "sessions"));
+    expect(folded.records[0]?.decision).toBeUndefined();
+  });
+
+  test("the Home root read is the one checked, even when its path is a link that moves", async () => {
+    // Root B links the stranger to A's owner; the harness's list names A. The decision
+    // service is given a link that leads to B, and moves to A each time the list is read.
+    const a = await homeWithMember();
+    const bRoot = tempDir("home-b-");
+    const ZED = { username: "zed", hostname: "laptop" } as const;
+    const bOwner = await setUpOwner(bRoot, { username: "bea", hostname: "laptop" });
+    // B's own records hold A's owner id as an active member, linked from ZED.
+    linkLocalMember(bRoot, ZED, bOwner, a.owner);
+    plantProjection(a.harness, a.owner, [], { accessRoot: realpathSync(a.hangarRoot) });
+    const p = await park(a.harness, "Write", { path: "a.md" });
+    const linkDir = tempDir("home-link-");
+    const link = join(linkDir, "root");
+    try {
+      symlinkSync(bRoot, link, "dir");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return;
+      throw err;
+    }
+    // Windows removes a directory link with rmdir; elsewhere it is an unlink.
+    const relink = (target: string): void => {
+      if (process.platform === "win32") rmdirSync(link);
+      else unlinkSync(link);
+      symlinkSync(target, link, "dir");
+    };
+    try {
+      relink(bRoot);
+    } catch (err) {
+      // A runner that cannot move a directory link cannot run this case.
+      if (process.platform === "win32") return;
+      throw err;
+    }
+    let flips = 0;
+    const decisions = createDecisions({
+      hangarRoot: link,
+      identity: ZED,
+      now: () => NOW,
+      approvers: (dir) => {
+        relink(flips++ % 2 === 0 ? a.hangarRoot : bRoot);
+        return readApproverProjection(dir);
+      },
+    });
+    const answer = await decisions.resolve({
+      harnessDir: a.harness,
+      ref: p.id,
+      choice: "grant",
+      actor: { kind: "local", identity: ZED },
+      via: "cli",
+    });
+    expect(answer.outcome).toBe("forbidden");
+    expect(
+      foldReadOnly(join(a.harness, ".crewhaus", "sessions")).records[0]?.decision,
+    ).toBeUndefined();
+  });
+});
+
+describe("a session root reached through a link", () => {
+  test("is matched to the harness it lies in, which governs it", () => {
+    const h = tempDir();
+    mkdirSync(join(h, ".crewhaus", "sessions"), { recursive: true });
+    plantProjection(h, mintId("prn"));
+    const link = join(tempDir(), "sessions");
+    try {
+      symlinkSync(join(h, ".crewhaus", "sessions"), link, "dir");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return;
+      throw err;
+    }
+    expect(harnessForSessionRoot(link, { cwd: tempDir() })).toEqual({ state: "one", dir: h });
+    expect(governedAncestorOf(link)).toBe(h);
+    expect(governedAncestorOf(join(tempDir(), "s"))).toBeUndefined();
   });
 });

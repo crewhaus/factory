@@ -126,6 +126,8 @@ import {
   resolveGatewaySecret,
 } from "../packages/gateway-server/src/managed-runs";
 import { groupPlan } from "../packages/hangar-server/src/group-ops";
+import { exclusionFor, isIdentityPath } from "../packages/hangar-server/src/inspect";
+import { gateOnboarding } from "../packages/hangar-server/src/onboarding";
 import {
   absolutePathEnv,
   homeCrewhausArgv,
@@ -163,6 +165,7 @@ import {
   evaluate,
   evaluateWithReason,
   loadSettingsRules,
+  narrowPatternFor,
 } from "../packages/permission-engine/src/index";
 import { buildReport, runPreflight, workspaceItems } from "../packages/preflight/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
@@ -882,7 +885,8 @@ describe("the release notes name every change a harness without provability: see
 
   test("the runtime-state floor: Hangar's directory is every root the environment names, and the default", () => {
     // Each variable names a root of its own, outside the workspace, so the
-    // roots the run protects there are exactly Hangar's. The expected set is
+    // roots the run protects there are exactly Hangar's and the user-level
+    // hooks file, `~/.crewhaus/settings.json`. The expected set is
     // written out here, not read from the code that makes it: a root added
     // there fails this until the notes and this list name it.
     const base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-home-")));
@@ -903,6 +907,7 @@ describe("the release notes name every change a harness without provability: see
         join(base, "registry", "harnesses.json"),
         join(homedir(), ".crewhaus", "hangar"),
         join(homedir(), ".crewhaus", "harnesses.json"),
+        join(homedir(), ".crewhaus", "settings.json"),
       ];
       expect(rootsDiffer(outside, expected)).toEqual({ unexpected: [], missing: [] });
       // The comparison reports a root nobody listed, and one that went missing.
@@ -928,11 +933,17 @@ describe("the release notes name every change a harness without provability: see
     for (const name of [
       "~/.crewhaus/hangar",
       "~/.crewhaus/harnesses.json",
+      "~/.crewhaus/settings.json",
       "CREWHAUS_HANGAR_ROOT",
       "CREWHAUS_REGISTRY_ROOT",
     ]) {
       expect({ name, named: floor.includes(`\`${name}\``) }).toEqual({ name, named: true });
     }
+    // The user-level hooks file is named once, as exactly that file.
+    expect(floor.split("`~/.crewhaus/settings.json`").length - 1).toBe(1);
+    expect(floor.replace(/\s+/g, " ")).toContain(
+      "the user-level hooks file `~/.crewhaus/settings.json`, exactly that file",
+    );
   });
 
   test("the runtime-state floor: a managed run's tenants root is named with the rest", () => {
@@ -3374,7 +3385,7 @@ describe("the release notes name what checking before acting changes for every h
         {
           dir: "/h",
           registeredAt: "2026-08-01T00:00:00.000Z",
-          home: { adoptedAt: "t", by: "x" },
+          home: { adoptedAt: "2026-08-02T00:00:00.000Z", by: "x" },
         } as never,
       ],
     };
@@ -3717,6 +3728,64 @@ describe("the release notes name what the decision service changes for every har
     expect(bullet).toContain("`crewhaus approvals grant <id> --always`");
     expect(bullet).toContain("`--days`");
     expect(bullet).toContain("`crewhaus approvals rules`");
+  });
+
+  test("a rule's pattern is printable, and a damaged rule record loads only the allows it names", async () => {
+    // A value with a control character is no rule, wherever a rule is proposed from.
+    expect(narrowPatternFor("Write", { path: "a\u001b[2Jb" }, undefined)).toEqual({
+      refused: "not-representable",
+    });
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-damaged-")));
+    try {
+      mkdirSync(join(dir, ".crewhaus", "run", "control"), { recursive: true });
+      writeFileSync(
+        join(dir, ".crewhaus", "settings.json"),
+        JSON.stringify({
+          permissions: {
+            rules: [
+              { type: "alwaysAllow", pattern: "Write(a.txt)" },
+              { type: "alwaysDeny", pattern: "Bash" },
+            ],
+          },
+        }),
+      );
+      // The whole record is one sealed line that does not parse.
+      writeFileSync(join(dir, ".crewhaus", "run", "control", "standing-rules.jsonl"), "{ torn\n");
+      expect(loadSettingsRules(dir)).toEqual([
+        { type: "alwaysDeny", pattern: "Bash", source: "settings" },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    // A tool whose approved calls hold such a value gets no allow proposal at
+    // all: none for the value, and none for the whole tool.
+    const { aggregateAsks, rankSuggestions, skippedSuggestions } = await import(
+      "../packages/harness-advice/src/permissions-suggest"
+    );
+    const { parseJsonlObjects } = await import("../packages/harness-advice/src/advise-rules");
+    const line = (kind: string, payload: unknown) =>
+      JSON.stringify({ ts: 1, version: 1, kind, payload });
+    const ask = line("permission", { toolName: "Bash", decision: "ask", askOutcome: "approved" });
+    const text = [
+      line("tool_use", { id: "toolu_1", name: "Bash", input: { command: "cat <<EOF\nx\nEOF" } }),
+      ask,
+      ask,
+      ask,
+    ].join("\n");
+    const aggregates = aggregateAsks([
+      { sessionId: "sess_00000000000000fb", objects: parseJsonlObjects(`${text}\n`) },
+    ]);
+    expect(
+      rankSuggestions(aggregates, new Map()).filter((g) => g.rule.type === "alwaysAllow"),
+    ).toEqual([]);
+    expect(skippedSuggestions(aggregates).map((k) => [k.toolName, k.reason])).toEqual([
+      ["Bash", "holds-control"],
+    ]);
+    const bullet = bulletFor("A standing rule's pattern is printable").replace(/\s+/g, " ");
+    expect(bullet).toContain("`crewhaus permissions suggest`");
+    expect(bullet).toContain("`standing-rules.jsonl`");
+    expect(bullet).toContain("denies and asks always load");
+    expect(bullet).toContain("gets no allow proposal");
   });
 
   test("crewhaus approvals leaves a receipt, refuses with 55, and an --always no rule can name decides nothing", async () => {
@@ -4855,6 +4924,29 @@ describe("run records, structured recall, context_assembled, ledger labels, comp
     }
   });
 
+  test("a graph node's upstream state is a workflow step's", async () => {
+    const { seedSourcesOf } = await import("../packages/runtime-core/src/run-records");
+    const upstream = {
+      role: "user" as const,
+      content: 'Upstream state:\n```json\n{"input":"x"}\n```',
+    };
+    expect(
+      seedSourcesOf({ sessionTarget: "graph-node", seedMessages: [upstream] }, {})(upstream),
+    ).toBe("workflow");
+    // The emitted graph names its node loops and their seeds this way.
+    const emitted = readFileSync(
+      join(ROOT, "packages/compiler/src/__fixtures__/model-wiring/graph-nodes.agent.ts.txt"),
+      "utf8",
+    );
+    const nodeLoops = emitted.split('sessionTarget: "graph-node",').length - 1;
+    const seeded = emitted.split("seedMessages: __seed,").length - 1;
+    expect(nodeLoops).toBe(3);
+    expect(seeded).toBe(nodeLoops);
+    const bullet = bulletFor("A graph node's upstream state is labelled as a workflow step's.");
+    expect(bullet).toContain("`(workflow step)`");
+    expect(bullet).toContain("`source`");
+  });
+
   test("a kept compaction summary is in the run's lineage at compaction", async () => {
     const { autoCompact } = await import("../packages/compaction-autocompact/src/index");
     const summary = "The weekly report goes to the finance list every Monday.";
@@ -4867,6 +4959,336 @@ describe("run records, structured recall, context_assembled, ledger labels, comp
     expect(bullet).toContain("`compaction`");
     expect(bullet).toContain("egress check");
   });
+});
+
+describe("Home's inspector, onboarding and a library start with sign-in off", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  test("the raw inspector answers an identity file as its projection, at any depth", () => {
+    expect(isIdentityPath([".crewhaus", "IDENTITY.json"])).toBe(true);
+    expect(isIdentityPath(["sub", ".crewhaus", "identity.json"])).toBe(true);
+    const bullet = bulletFor("shows a harness's identity file as its fingerprint");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("fingerprint");
+  });
+
+  test("the raw inspector refuses a nested harness's run files", () => {
+    expect(exclusionFor(["sub", ".crewhaus", "run", "control-token"])).not.toBeNull();
+    const bullet = bulletFor("refuses a nested harness's run, audit and key files");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("nested");
+  });
+
+  test("onboarding names places on this computer only to registry managers", () => {
+    const gated = gateOnboarding(
+      {
+        harnessCount: 0,
+        completedAt: null,
+        scanRootCount: () => 1,
+        suggestions: () => [{ dir: "/somewhere", exists: true, why: "planted" }],
+        demo: () => ({
+          available: true,
+          source: "/demos",
+          starters: ["hello"],
+          reason: null,
+          remedy: null,
+        }),
+      },
+      false,
+    );
+    expect(gated.suggestions).toEqual([]);
+    expect(gated.demo.source).toBeNull();
+    const bullet = bulletFor("sees scan-root paths, folder suggestions and the demo source");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("manage");
+  });
+
+  test("a library start with sign-in off is refused before Home binds", () => {
+    const source = readFileSync(join(ROOT, "packages/hangar-server/src/server.ts"), "utf8");
+    const refusal = source.indexOf("noAuthRefusal(hangarRoot)");
+    expect(refusal).toBeGreaterThan(-1);
+    expect(refusal).toBeLessThan(source.indexOf("Bun.serve("));
+    const loopback = source.indexOf("noAuth && (!isLoopbackHostname(hostname)");
+    expect(loopback).toBeGreaterThan(-1);
+    expect(loopback).toBeLessThan(source.indexOf("Bun.serve("));
+    const bullet = bulletFor("Starting Home from code with sign-in off fails");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("startHangarServer");
+    expect(bullet).toContain("--no-auth");
+    expect(bullet).toContain("beyond this computer");
+  });
+
+  test("the settings editor checks where its file really is before reading it", () => {
+    const source = readFileSync(join(ROOT, "packages/hangar-server/src/inspect.ts"), "utf8");
+    const write = source.indexOf("export const settingsWrite");
+    expect(write).toBeGreaterThan(-1);
+    const guard = source.indexOf("refuseSettingsPlace(ctx, def.segments, path);", write);
+    const read = source.indexOf("readTextCapped(path", write);
+    expect(guard).toBeGreaterThan(-1);
+    expect(read).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(read);
+    const bullet = bulletFor("settings editor reads and replaces only");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("settings.json");
+  });
+});
+
+describe("spans nest from turn to tool to check, and every check writes a verdict", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  /** A scripted adapter: one script of tool calls, then a closing answer. */
+  const scriptedCalls = (calls: ReadonlyArray<{ id: string; name: string; input: unknown }>) => {
+    let n = 0;
+    return {
+      providerId: "anthropic" as const,
+      features: {
+        caching: "explicit" as const,
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      estimateTokens: () => 0,
+      stream: () => {
+        n += 1;
+        const first = n === 1;
+        return (async function* () {
+          yield { kind: "message_start" as const };
+          if (first) {
+            for (const [index, call] of calls.entries()) {
+              yield {
+                kind: "content_block_start" as const,
+                index,
+                block: { type: "tool_use" as const, id: call.id, name: call.name, input: {} },
+              };
+              yield {
+                kind: "content_block_delta" as const,
+                index,
+                delta: {
+                  type: "input_json_delta" as const,
+                  partial_json: JSON.stringify(call.input),
+                },
+              };
+              yield { kind: "content_block_stop" as const, index };
+            }
+          } else {
+            yield {
+              kind: "content_block_start" as const,
+              index: 0,
+              block: { type: "text" as const, text: "" },
+            };
+            yield {
+              kind: "content_block_delta" as const,
+              index: 0,
+              delta: { type: "text_delta" as const, text: "done" },
+            };
+            yield { kind: "content_block_stop" as const, index: 0 };
+          }
+          yield {
+            kind: "message_delta" as const,
+            stopReason: first ? "tool_use" : "end_turn",
+            usage: { input: 1, output: 1 },
+          };
+          yield { kind: "message_stop" as const };
+        })();
+      },
+    };
+  };
+
+  type Line = { kind: string; payload: Record<string, unknown>; span?: string };
+  const linesOf = (dir: string, sessionId: string): Line[] =>
+    readFileSync(join(dir, "sessions", `${sessionId}.jsonl`), "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l) as Line);
+
+  test("three calls run at once each nest their checks under their own span, and the log closes every span", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { normalizeText } = await import("../packages/tool-text/src/index");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-spans-")));
+    try {
+      const runContext = createRunContext();
+      const events: Array<{
+        kind: string;
+        spanId: string;
+        parentSpanId?: string;
+        toolUseId?: string;
+      }> = [];
+      runContext.eventBus.subscribe((e) => {
+        events.push(e as (typeof events)[number]);
+      });
+      await runChatLoop({
+        model: "test-model",
+        instructions: "x",
+        tools: [normalizeText],
+        sessionRootDir: join(dir, "sessions"),
+        runLedgerDir: dir,
+        settingsDir: dir,
+        permissionMode: "bypass",
+        runContext,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        installSigintHandler: false,
+        spinner: false,
+        stdout: () => {},
+        _adapter: scriptedCalls(
+          ["a", "b", "c"].map((t) => ({
+            id: `tu_${t}`,
+            name: "NormalizeText",
+            input: { text: t },
+          })),
+        ) as never,
+      });
+      const starts = events.filter((e) => e.kind === "tool_call_start");
+      expect(starts).toHaveLength(3);
+      const spanOf = new Map(starts.map((s) => [s.toolUseId, s.spanId]));
+      const decisions = events.filter((e) => e.kind === "permission_decision");
+      expect(decisions).toHaveLength(3);
+      for (const d of decisions) expect(d.parentSpanId).toBe(spanOf.get(d.toolUseId) as string);
+      const closed = linesOf(dir, runContext.sessionId)
+        .filter((l) => l.kind === "span_closed")
+        .map((l) => l.payload["kind"]);
+      for (const kind of ["run", "turn", "model"]) expect(closed).toContain(kind);
+      expect(closed.filter((k) => k === "tool")).toHaveLength(3);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Trace spans nest from turn to tool to check.");
+    for (const word of [
+      "`span_closed`",
+      "`span`",
+      "`crewhaus.retry_of`",
+      "OTLP traces change shape",
+      "`CREWHAUS_RUN_STAMPS=0`",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  }, 20_000); // imports the whole runtime the first time it runs
+
+  test("the audit records carry exactly their documented keys, and a denied call's verdict names it", async () => {
+    const { runChatLoop } = await import("../packages/runtime-core/src/index");
+    const { normalizeText } = await import("../packages/tool-text/src/index");
+    const { APPROVALS_DIGEST_KEY_FILE } = await import("../packages/session-store/src/index");
+    const { ensureDigestKey } = await import("../packages/control-records/src/index");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-verdicts-")));
+    try {
+      mkdirSync(join(dir, "sessions"), { recursive: true });
+      await ensureDigestKey(join(dir, "sessions"), { file: APPROVALS_DIGEST_KEY_FILE });
+      const records: Array<{ kind: string; payload: Record<string, unknown> }> = [];
+      const sink = {
+        async append(input: { readonly kind: string; readonly payload: unknown }) {
+          records.push({ kind: input.kind, payload: input.payload as Record<string, unknown> });
+          return undefined;
+        },
+      };
+      const send = {
+        ...normalizeText,
+        name: "Send",
+        scope: "external" as const,
+        requireJustification: true,
+      };
+      const runContext = createRunContext();
+      const secret = "the vault code is 7741-alpha-omega";
+      tagContent(runContext, secret, "tool");
+      const common = {
+        model: "test-model",
+        instructions: "x",
+        sessionRootDir: join(dir, "sessions"),
+        runLedgerDir: dir,
+        settingsDir: dir,
+        singleTurn: true as const,
+        seedMessages: [{ role: "user" as const, content: "go" }],
+        installSigintHandler: false,
+        spinner: false,
+        stdout: () => {},
+      };
+      await runChatLoop({
+        ...common,
+        tools: [send],
+        permissionMode: "bypass",
+        runContext,
+        justificationJudge: async () => ({ allow: true, reason: "fits", judgeModel: "judge" }),
+        justificationAuditSink: sink,
+        egressAuditSink: sink,
+        resolveSinkScope: () => "external-configured",
+        _adapter: scriptedCalls([
+          { id: "tu_1", name: "Send", input: { text: secret, justification: "needed" } },
+        ]) as never,
+      });
+      const keysOf = (kind: string) =>
+        Object.keys(records.find((r) => r.kind === kind)?.payload ?? {}).sort();
+      expect(keysOf("permission_justification_evaluated")).toEqual(
+        [
+          "toolName",
+          "justification",
+          "verdict",
+          "reason",
+          "judgeModel",
+          "runId",
+          "sessionId",
+          "toolUseId",
+          "actionDigest",
+        ].sort(),
+      );
+      expect(keysOf("egress_decision")).toEqual(
+        [
+          "sinkId",
+          "sinkScope",
+          "verdict",
+          "originsFound",
+          "matchCount",
+          "runId",
+          "sessionId",
+          "toolUseId",
+          "actionDigest",
+        ].sort(),
+      );
+
+      const denied = createRunContext();
+      await runChatLoop({
+        ...common,
+        tools: [normalizeText],
+        permissionMode: "default",
+        permissionRules: {
+          flag: [],
+          settings: [],
+          yaml: [{ type: "alwaysDeny", pattern: "NormalizeText", source: "yaml" }],
+          hooks: [],
+          builtin: [],
+        },
+        runContext: denied,
+        _adapter: scriptedCalls([
+          { id: "tu_denied", name: "NormalizeText", input: { text: "x" } },
+        ]) as never,
+      });
+      const verdict = linesOf(dir, denied.sessionId).find(
+        (l) => l.kind === "verdict" && l.payload["gate"] === "permission",
+      );
+      expect(verdict?.payload).toMatchObject({
+        outcome: "deny",
+        on: { kind: "tool", toolUseId: "tu_denied", call: 1 },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const bullet = bulletFor("Every check writes a `verdict` line");
+    for (const word of [
+      "`verdict`",
+      "`toolUseId`",
+      "`runId`",
+      "`sessionId`",
+      "`actionDigest`",
+      "never a judge's or a hook's own words",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  }, 20_000); // imports the whole runtime the first time it runs
 });
 
 describe("the release notes name what retire and Home's drain change for every harness", () => {

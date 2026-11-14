@@ -110,6 +110,21 @@ describe("the standing-rule ledger", () => {
     expect(standingRuleOf(rule(bad, { createdBy: `local:#${"a".repeat(64)}` }))).toBeDefined();
   });
 
+  test("a rule's times are read only in the form the writers write", () => {
+    const id = mintId("rule");
+    expect(standingRuleOf(rule(id))).toBeDefined();
+    // A date that parses, with a comment holding control characters.
+    const commented = "Tue Dec 01 2026 00:00:00 GMT+0000 (\r\u001b[2K x)";
+    expect(Number.isFinite(Date.parse(commented))).toBe(true);
+    for (const expiresAt of [commented, "2026-12-01T00:00:00Z", "2026-12-01"]) {
+      expect({ expiresAt, row: standingRuleOf(rule(id, { expiresAt })) }).toEqual({
+        expiresAt,
+        row: undefined,
+      });
+    }
+    expect(standingRuleOf(rule(id, { createdAt: commented }))).toBeUndefined();
+  });
+
   test("live means active and before its end; an end that cannot be read has passed", () => {
     const row = standingRuleOf(rule(mintId("rule")));
     if (row === undefined) throw new Error("not a row");

@@ -4,7 +4,11 @@
  * keyboard refuses while new work is paused (exit 39, unless `--ignore-pause`) or the
  * harness is disabled (exit 38), and a verb that starts a server refuses while it is
  * disabled. The harness is the working directory, as every one of these verbs resolves
- * `.crewhaus` there.
+ * `.crewhaus` there, and also each other directory holding a spec the verb runs: the spec
+ * it is given as its first argument, or for `eval suite` its `--spec`, else each selected
+ * entry's spec, resolved as the verb resolves it. Every one of those operator records is
+ * checked and the stricter verdict decides (a disable over a pause; the working
+ * directory's when they refuse alike).
  *
  * | Verb | Mode |
  * |---|---|
@@ -29,9 +33,14 @@
  * dispatch switch.
  */
 import { readFileSync, statSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { EXIT_FOR_ERROR } from "@crewhaus/control-contract";
-import { type RunnableMode, assertRunnable, readOperatorRecord } from "@crewhaus/control-records";
+import {
+  type RunnableMode,
+  type RunnableVerdict,
+  assertRunnable,
+  readOperatorRecord,
+} from "@crewhaus/control-records";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import { type ParseArgsSchema, type ParsedArgs, parseArgs } from "@crewhaus/infra-utils";
 import {
@@ -44,6 +53,14 @@ import {
   RUN_SCHEMA,
   SERVE_SCHEMA,
 } from "./arg-schemas";
+import {
+  type SuiteEntry,
+  type SuiteManifest,
+  parseSuiteManifest,
+  parseTierFlag,
+  selectTier,
+  specForEntry,
+} from "./eval-suite";
 
 /** What a run that `--ignore-pause` let through prints on stderr. */
 export const IGNORE_PAUSE_NOTICE = "Running although new work is paused (--ignore-pause).";
@@ -191,9 +208,64 @@ export function entryRefusalLine(
 }
 
 /**
+ * The specs an `eval suite` runs, as the verb resolves them: `--spec` when it is given,
+ * else the spec of each entry in the selected tier (the entry's, else the manifest's).
+ * A manifest the verb cannot read or select from names none: the verb refuses it before
+ * any entry runs.
+ */
+function suiteSpecs(parsed: ParsedArgs, cwd: string): readonly string[] {
+  const override = parsed.flags["spec"];
+  if (typeof override === "string") return override === "" ? [] : [override];
+  const manifestPath = parsed.positional[0];
+  if (typeof manifestPath !== "string" || manifestPath === "") return [];
+  let entries: ReadonlyArray<SuiteEntry>;
+  let manifest: SuiteManifest;
+  try {
+    manifest = parseSuiteManifest(readFileSync(resolve(cwd, manifestPath), "utf8"));
+    const tier = parsed.flags["tier"];
+    entries = selectTier(manifest, parseTierFlag(typeof tier === "string" ? tier : undefined));
+  } catch {
+    return [];
+  }
+  const specs: string[] = [];
+  for (const entry of entries) {
+    try {
+      specs.push(specForEntry(manifest, entry));
+    } catch {
+      // An entry with no spec: the verb's preflight refuses the suite before any run.
+    }
+  }
+  return specs;
+}
+
+/**
+ * The directories, other than `cwd`, of the specs a gated verb runs: the spec it is given
+ * as its first positional, or for `eval suite` the specs {@link suiteSpecs} names. Empty
+ * when the verb's own schema refuses its argv.
+ */
+function specDirsOf(subcommand: string, rest: readonly string[], cwd: string): readonly string[] {
+  const branch = gatedBranch(subcommand, rest, cwd);
+  if (branch === undefined) return [];
+  const parsed = parsedFor(branch);
+  if (parsed === undefined) return [];
+  const specs =
+    branch.schema === EVAL_SUITE_SCHEMA ? suiteSpecs(parsed, cwd) : [parsed.positional[0]];
+  const here = resolve(cwd);
+  const dirs: string[] = [];
+  for (const spec of specs) {
+    if (typeof spec !== "string" || spec === "") continue;
+    const dir = dirname(resolve(cwd, spec));
+    if (dir !== here && !dirs.includes(dir)) dirs.push(dir);
+  }
+  return dirs;
+}
+
+/**
  * Refuse this invocation when the harness's operator record says so: print the line and
- * exit 38 (disabled) or 39 (paused). A run `--ignore-pause` let through prints a notice
- * and goes on. Returns when it may run.
+ * exit 38 (disabled) or 39 (paused). The working directory's record and the record of
+ * each other directory holding a spec the verb runs are all checked; the stricter verdict
+ * decides. A run `--ignore-pause` let through prints a notice and goes
+ * on. Returns when it may run.
  *
  * First consumer: the dispatch in `index.ts`.
  */
@@ -208,14 +280,32 @@ export function gateEntryPoint(
 ): void {
   const decided = decide(subcommand, rest, io.cwd);
   if (decided === undefined) return;
-  const verdict = assertRunnable(io.cwd, {
-    mode: decided.mode,
-    ignorePause: decided.ignorePause,
-  });
-  if (verdict.ok) {
-    if (verdict.pauseIgnored === true) io.write(`${IGNORE_PAUSE_NOTICE}\n`);
+  const dirs = [io.cwd, ...specDirsOf(subcommand, rest, io.cwd)];
+  let refused:
+    | { readonly dir: string; readonly verdict: RunnableVerdict & { ok: false } }
+    | undefined;
+  let pauseIgnored = false;
+  for (const dir of dirs) {
+    const verdict = assertRunnable(dir, {
+      mode: decided.mode,
+      ignorePause: decided.ignorePause,
+    });
+    if (verdict.ok) {
+      if (verdict.pauseIgnored === true) pauseIgnored = true;
+      continue;
+    }
+    // A disable outranks a pause; between equals the first (the working directory) stands.
+    if (
+      refused === undefined ||
+      (refused.verdict.exitName === "paused" && verdict.exitName === "disabled")
+    ) {
+      refused = { dir, verdict };
+    }
+  }
+  if (refused === undefined) {
+    if (pauseIgnored) io.write(`${IGNORE_PAUSE_NOTICE}\n`);
     return;
   }
-  io.write(`${entryRefusalLine(harnessName(io.cwd), verdict.reason, io.cwd)}\n`);
-  io.exit(EXIT_FOR_ERROR[verdict.exitName]);
+  io.write(`${entryRefusalLine(harnessName(refused.dir), refused.verdict.reason, refused.dir)}\n`);
+  io.exit(EXIT_FOR_ERROR[refused.verdict.exitName]);
 }

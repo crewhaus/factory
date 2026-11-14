@@ -7,9 +7,10 @@
  * and the process ops are fakes, so a refusal can only be the supervisor's own.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createPrepareRunner } from "./prepare";
 import { readRunfile } from "./runfiles";
 import { buildSpawnPlan } from "./spawn-contracts";
 import { type SupervisorOptions, createHarnessSupervisor } from "./supervisor";
@@ -401,5 +402,154 @@ describe("what the operator asked for is recorded", () => {
     if (!started.ok) throw new Error("unreachable");
     expect(started.desired).toBeUndefined();
     expect((await h.supervisor.stop()).desired).toBeUndefined();
+  });
+});
+
+describe("a disabled harness runs no compile, no hook and no daemon", () => {
+  const SETTINGS = {
+    manager: {
+      autoCompile: true,
+      hooks: { postCompile: "./patch.ts", preSpawn: ["bun", "run", "warm.ts"] },
+    },
+  };
+
+  /** A supervisor whose prepare steps spawn through `prepOps`, each child exiting 0. */
+  function prepared(
+    dir: string,
+    prepare?: SupervisorOptions["prepare"],
+    onPrepSpawn?: (argv: readonly string[]) => void,
+  ) {
+    const clock = createFakeClock();
+    const ops = createFakeProcessOps({ now: clock.now });
+    const raw = createFakeProcessOps();
+    const prepSpawns: string[][] = [];
+    const prepOps = {
+      ...raw,
+      spawn: (request: Parameters<typeof raw.spawn>[0]) => {
+        prepSpawns.push([...request.argv]);
+        onPrepSpawn?.(request.argv);
+        const spawned = raw.spawn(request);
+        raw.last()?.exit(0);
+        return spawned;
+      },
+    };
+    const supervisor = createHarnessSupervisor({
+      harnessDir: dir,
+      target: "channel",
+      ops,
+      clock,
+      plan: () =>
+        buildSpawnPlan({
+          harnessDir: dir,
+          target: "channel",
+          processEnv: {},
+          ports: { port: 3000, controlPort: 3001 },
+        }),
+      managerVersion: "0.9.0-test",
+      prepare:
+        prepare ??
+        (() =>
+          createPrepareRunner({
+            harnessDir: dir,
+            target: "channel",
+            ops: prepOps,
+            env: {},
+            crewhausBin: "/bin/crewhaus",
+          })),
+    });
+    return { ops, prepOps, prepSpawns, supervisor };
+  }
+
+  test("autoCompile and hooks on, a stale build: start and restart run no compile and no hook", async () => {
+    const dir = harness();
+    put(dir, ".crewhaus/settings.json", JSON.stringify(SETTINGS));
+    put(dir, "patch.ts", "// a hook\n");
+    const h = prepared(dir);
+    expect(await h.supervisor.start()).toMatchObject({ ok: true });
+    const spawnsWhileEnabled = h.prepSpawns.length;
+    expect(spawnsWhileEnabled).toBeGreaterThan(0);
+    operator(dir, DISABLED);
+    // The active build changes on disk, so an enabled start would compile it.
+    put(dir, "dist/daemon.ts", "// changed by hand\n");
+    const restarted = await h.supervisor.restart();
+    expect(restarted).toMatchObject({ ok: false, reason: "disabled", kept: true });
+    expect(h.prepSpawns).toHaveLength(spawnsWhileEnabled);
+    expect(h.ops.children).toHaveLength(1);
+    expect(h.ops.last()?.signals).toEqual([]);
+
+    const cold = harness();
+    put(cold, ".crewhaus/settings.json", JSON.stringify(SETTINGS));
+    put(cold, "patch.ts", "// a hook\n");
+    put(cold, "dist/daemon.ts", "// changed by hand\n");
+    operator(cold, DISABLED);
+    const c = prepared(cold);
+    expect(await c.supervisor.start()).toMatchObject({ ok: false, reason: "disabled" });
+    expect(c.prepSpawns).toEqual([]);
+    expect(c.ops.children).toEqual([]);
+    h.supervisor.close();
+    c.supervisor.close();
+  });
+
+  test("a disable written while a start prepares refuses it before its preSpawn hook or any daemon", async () => {
+    const dir = harness();
+    const preSpawnCalls: string[] = [];
+    const h = prepared(dir, () => ({
+      prepare: async () => {
+        operator(dir, DISABLED);
+        return { ok: true, replan: false, notes: [] };
+      },
+      preSpawn: async () => {
+        preSpawnCalls.push("preSpawn");
+        return { ok: true, replan: false, notes: [] };
+      },
+      forecast: () => ({ compileMayRun: true, activeOnly: false }),
+      configured: { compile: true, compileMode: "explicit", hooks: [] },
+    }));
+    const result = await h.supervisor.start();
+    expect(result).toMatchObject({ ok: false, reason: "disabled", exitName: "disabled" });
+    if (result.ok || result.reason !== "disabled") throw new Error("unreachable");
+    expect(result.message).toContain("crewhaus daemon enable");
+    expect(preSpawnCalls).toEqual([]);
+    expect(h.ops.children).toEqual([]);
+    expect(readRunfile(dir)).toBeUndefined();
+    expect(h.supervisor.snapshot().state).toBe("stopped");
+    // The start slot was released: once enabled, the next start runs.
+    operator(dir, {});
+    const h2 = prepared(dir);
+    expect(await h2.supervisor.start()).toMatchObject({ ok: true });
+    h.supervisor.close();
+    h2.supervisor.close();
+  });
+
+  test("a disable written while a start compiles refuses it before its postCompile and preSpawn hooks", async () => {
+    const dir = harness();
+    put(dir, ".crewhaus/settings.json", JSON.stringify(SETTINGS));
+    put(dir, "patch.ts", "// a hook\n");
+    // The spec is newer than the bundle, so the explicit compile runs.
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(dir, "crewhaus.yaml"), later, later);
+    const h = prepared(
+      dir,
+      () =>
+        createPrepareRunner({
+          harnessDir: dir,
+          target: "channel",
+          ops: h.prepOps,
+          env: {},
+          crewhausBin: "/bin/crewhaus",
+          compile: true,
+        }),
+      (argv) => {
+        if (argv.includes("compile")) operator(dir, DISABLED);
+      },
+    );
+    const result = await h.supervisor.start();
+    expect(result).toMatchObject({ ok: false, reason: "disabled", exitName: "disabled" });
+    // The compile ran (it was started while enabled); no hook and no daemon after it.
+    expect(h.prepSpawns.length).toBe(1);
+    expect(h.prepSpawns[0]).toContain("compile");
+    expect(h.ops.children).toEqual([]);
+    expect(h.supervisor.snapshot().state).toBe("stopped");
+    h.supervisor.close();
   });
 });

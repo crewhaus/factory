@@ -250,6 +250,80 @@ describe("healthz + status", () => {
 });
 
 describe("wake", () => {
+  describe("named schedule lanes (#513, #514)", () => {
+    const twoLanes = (plane: ControlPlane, ran: Record<string, number>) =>
+      ["discovery", "weekly-report"].map((name) =>
+        plane.lane({
+          lane: `schedule:${name}`,
+          cadence: name === "discovery" ? "every 7200000ms" : 'cron "0 17 * * 5" Europe/Berlin',
+          ownsSession: false,
+          run: async () => {
+            ran[name] = (ran[name] ?? 0) + 1;
+          },
+        }),
+      );
+
+    test("/status lists each named lane with its cadence", async () => {
+      const { plane } = harness();
+      twoLanes(plane, {});
+      const body = (await (await plane.fetch(req(`${CONTROL_PATH_PREFIX}/status`))).json()) as {
+        timers: Array<{ lane: string; cadence: string }>;
+      };
+      expect(body.timers.map(({ lane, cadence }) => ({ lane, cadence }))).toEqual([
+        { lane: "schedule:discovery", cadence: "every 7200000ms" },
+        { lane: "schedule:weekly-report", cadence: 'cron "0 17 * * 5" Europe/Berlin' },
+      ]);
+    });
+
+    test("a wake runs that lane's tick and no other, and counts as a schedule wake", async () => {
+      const { plane } = harness();
+      const ran: Record<string, number> = {};
+      const [discovery] = twoLanes(plane, ran);
+      const res = await plane.fetch(
+        req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane: "schedule:discovery" })),
+      );
+      expect(res.status).toBe(202);
+      expect(((await res.json()) as { lane: string }).lane).toBe("schedule:discovery");
+      await discovery?.settled();
+      expect(ran).toEqual({ discovery: 1 });
+      expect(plane.counters.scheduleWakes).toBe(1);
+    });
+
+    test("the bare schedule lane is not armed when only named lanes are", async () => {
+      const { plane } = harness();
+      twoLanes(plane, {});
+      const res = await plane.fetch(
+        req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane: "schedule" })),
+      );
+      expect(res.status).toBe(404);
+      expect(((await res.json()) as { code: string }).code).toBe("lane_not_armed");
+    });
+
+    for (const lane of ["schedule:Bad", "schedule:", "dream", "schedule:a_b", 7]) {
+      test(`refuses ${JSON.stringify(lane)} as no lane id`, async () => {
+        const { plane } = harness();
+        twoLanes(plane, {});
+        const res = await plane.fetch(req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane })));
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { code: string; error: string };
+        expect(body.code).toBe("bad_request");
+        expect(body.error).toContain("schedule:<name>");
+      });
+    }
+
+    test("lane() refuses an id outside the grammar and a second registration", () => {
+      const { plane } = harness();
+      twoLanes(plane, {});
+      const register = (lane: string) => () =>
+        plane.lane({ lane: lane as "schedule", cadence: "every 1ms", run: async () => {} });
+      expect(register("schedule:discovery")).toThrow(/already registered/);
+      expect(register("schedule:Bad")).toThrow(TypeError);
+      expect(register("schedule:Bad")).toThrow(/not a lane id/);
+      expect(register("heartbeat")).not.toThrow();
+      expect(register("heartbeat")).toThrow(/already registered/);
+    });
+  });
+
   test("rejects a lane the protocol does not define", async () => {
     const { plane } = harness();
     const res = await plane.fetch(
@@ -927,6 +1001,33 @@ describe("a lane's run scope", () => {
     expect(scheduled?.trigger).toEqual({ kind: "schedule", lane: "schedule" });
     // Outside a tick, no lane scope.
     expect("resumeScope" in createRunContext()).toBe(false);
+  });
+
+  test("a named lane's tick resumes in its own scope, triggered by the schedule", async () => {
+    const seen: RunContext[] = [];
+    const { plane } = harness();
+    const discovery = plane.lane({
+      lane: "schedule:discovery",
+      cadence: "every 7200000ms",
+      run: async () => {
+        seen.push(createRunContext());
+      },
+    });
+    await discovery.tick();
+    const res = await plane.fetch(
+      req(`${CONTROL_PATH_PREFIX}/wake`, wakeBody({ lane: "schedule:discovery" })),
+    );
+    expect(res.status).toBe(202);
+    await discovery.settled();
+    const [organic, woken] = seen;
+    expect(organic?.resumeScope).toBe("lane:schedule:discovery");
+    expect(organic?.trigger).toEqual({ kind: "schedule", lane: "schedule:discovery" });
+    expect(woken?.resumeScope).toBe("lane:schedule:discovery");
+    expect(woken?.trigger).toEqual({
+      kind: "schedule",
+      lane: "schedule:discovery",
+      synthetic: true,
+    });
   });
 });
 

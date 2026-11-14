@@ -642,8 +642,8 @@ describe("env files never supply a loader setting", () => {
     expect(spawn.env["PATH"]).toBe("/same/bin");
   });
 
-  test("isLoaderEnvKey: exact names and families, compared as written, no bare NODE_ or BUN_", () => {
-    for (const name of LOADER_ENV_KEYS) expect(isLoaderEnvKey(name)).toBe(true);
+  test("isLoaderEnvKey: exact names and families, compared as written off Windows, no bare NODE_ or BUN_", () => {
+    for (const name of LOADER_ENV_KEYS) expect(isLoaderEnvKey(name, "linux")).toBe(true);
     expect([...LOADER_ENV_PREFIXES]).toEqual(["GIT_CONFIG_", "LD_", "DYLD_", "BASH_FUNC_"]);
     for (const name of [
       "LD_LIBRARY_PATH",
@@ -651,7 +651,7 @@ describe("env files never supply a loader setting", () => {
       "BASH_FUNC_x%%",
       "GIT_CONFIG_KEY_0",
     ])
-      expect(isLoaderEnvKey(name)).toBe(true);
+      expect(isLoaderEnvKey(name, "linux")).toBe(true);
     for (const name of [
       "NODE_ENV",
       "BUN_ENV",
@@ -660,7 +660,12 @@ describe("env files never supply a loader setting", () => {
       "APP_TOKEN",
       "GIT_AUTHOR_NAME",
     ])
-      expect(isLoaderEnvKey(name)).toBe(false);
+      expect(isLoaderEnvKey(name, "linux")).toBe(false);
+    // On Windows every spelling of a loader name matches; other names still do not.
+    for (const name of ["path", "Path", "ld_preload", "bun_options", "Git_Config_Key_0"])
+      expect(isLoaderEnvKey(name, "win32")).toBe(true);
+    for (const name of ["node_env", "bun_env", "app_token"])
+      expect(isLoaderEnvKey(name, "win32")).toBe(false);
   });
 });
 

@@ -79,10 +79,11 @@ function ruleCovers(pattern: string, toolName: string, value: string): boolean {
 const NEWLINE = String.fromCharCode(10);
 
 /**
- * The path the task names: a `*`, a `?`, a `[`, a `{` and a newline, in one
- * value a human approved once.
+ * The path the task names: a `*`, a `?`, a `[`, a `{` and a space, in one
+ * value a human approved once. A value holding a control character (a
+ * newline) is no rule value at all: see the test for it below.
  */
-const HOSTILE_PATH = `notes/a*b?c[d]{e}${NEWLINE}secret.md`;
+const HOSTILE_PATH = "notes/a*b?c[d]{e} secret.md";
 
 // ---------------------------------------------------------------------------
 // the headline property
@@ -139,12 +140,12 @@ describe("a rule built from a value full of glob metacharacters", () => {
   test("the named decoys a raw splice would have let through are all refused", async () => {
     const pattern = await ruleForHostilePath();
     const decoys: Array<[string, string]> = [
-      ["`*` read as any-run", `notes/aXXXXb?c[d]{e}${NEWLINE}secret.md`],
-      ["`*` read as empty", `notes/ab?c[d]{e}${NEWLINE}secret.md`],
-      ["`?` read as any-char", `notes/a*bZc[d]{e}${NEWLINE}secret.md`],
-      ["`[d]` read as a character class", `notes/a*b?cd{e}${NEWLINE}secret.md`],
-      ["`{e}` read as a brace expansion", `notes/a*b?c[d]e${NEWLINE}secret.md`],
-      ["the newline read as any character", "notes/a*b?c[d]{e}Zsecret.md"],
+      ["`*` read as any-run", "notes/aXXXXb?c[d]{e} secret.md"],
+      ["`*` read as empty", "notes/ab?c[d]{e} secret.md"],
+      ["`?` read as any-char", "notes/a*bZc[d]{e} secret.md"],
+      ["`[d]` read as a character class", "notes/a*b?cd{e} secret.md"],
+      ["`{e}` read as a brace expansion", "notes/a*b?c[d]e secret.md"],
+      ["the space read as any character", "notes/a*b?c[d]{e}Zsecret.md"],
       ["a longer sibling", `${HOSTILE_PATH}.bak`],
       ["a path that merely starts the same", "notes/a"],
       ["the directory itself", "notes/"],
@@ -168,6 +169,35 @@ describe("a rule built from a value full of glob metacharacters", () => {
   test("the trailing-newline anchor holds: a value with the path plus a newline is not the path", async () => {
     const pattern = await ruleForHostilePath();
     expect(ruleCovers(pattern, "Read", `${HOSTILE_PATH}${NEWLINE}`)).toBe(false);
+  });
+
+  test("a value holding a newline gets no allow at all, and the answer names the tool", async () => {
+    askSession(tmp, "sess_1", {
+      toolName: "Read",
+      input: { path: `notes/a${NEWLINE}secret.md` },
+      approved: 3,
+    });
+    const raw = await permissionsSuggest.execute({});
+    const out = JSON.parse(raw) as SuggestResult & {
+      unknown: Array<{ field: string; reason: string }>;
+    };
+    expect(out.suggestions.filter((s) => s.type === "alwaysAllow")).toEqual([]);
+    const skipped = out.unknown.find((u) => u.field === "skipped");
+    expect(skipped?.reason).toContain("Read: a recorded call's value holds a control");
+    expect(raw.includes("secret.md")).toBe(false);
+  });
+
+  test("a multi-line Bash command approved again and again gets no Bash allow", async () => {
+    askSession(tmp, "sess_1", {
+      toolName: "Bash",
+      input: { command: `cat <<EOF${NEWLINE}x${NEWLINE}EOF` },
+      approved: 3,
+    });
+    const out = await suggest();
+    expect(
+      out.suggestions.filter((s) => s.toolName === "Bash" && s.type === "alwaysAllow"),
+    ).toEqual([]);
+    expect(out.diff?.additions ?? []).toEqual([]);
   });
 
   test("ApprovalStatus shows the same value back without mangling it", async () => {

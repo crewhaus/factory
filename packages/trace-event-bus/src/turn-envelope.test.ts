@@ -81,6 +81,73 @@ describe("TraceEventBus.envelope", () => {
   });
 });
 
+describe("TraceEventBus.envelope with a parent span", () => {
+  const now = new Date("2026-05-07T10:00:00.000Z");
+
+  test("parents to the named span, so concurrent calls each nest under their own", () => {
+    const bus = new TraceEventBus({ runId: "run_x", sessionId: "sess_x", env: {} });
+    const a = bus.envelope(now);
+    const b = bus.envelope(now);
+    expect(bus.envelope(now, { parentSpanId: a.spanId }).parentSpanId).toBe(a.spanId);
+    expect(bus.envelope(now, { parentSpanId: b.spanId }).parentSpanId).toBe(b.spanId);
+    // The bus's own current span is not moved by it.
+    expect(bus.currentSpanId).toBe(bus.rootSpanId);
+  });
+
+  test("an invalid or absent parent falls back to the current span", () => {
+    const bus = new TraceEventBus({ runId: "run_x", sessionId: "sess_x", env: {} });
+    const open = bus.startSpan("tool_call");
+    for (const parentSpanId of ["not-a-span", "0".repeat(16), "ABCDEF0123456789", undefined]) {
+      expect(bus.envelope(now, { parentSpanId }).parentSpanId).toBe(open.spanId);
+    }
+    open.end();
+  });
+
+  test("no options builds exactly the envelope it always did", () => {
+    const bus = new TraceEventBus({ runId: "run_x", sessionId: "sess_x", env: {}, agentId: "ag" });
+    bus.setTurnNumber(2);
+    const plain = bus.envelope(now);
+    expect(Object.keys(plain)).toEqual([
+      "runId",
+      "sessionId",
+      "turnNumber",
+      "traceId",
+      "spanId",
+      "parentSpanId",
+      "timestamp",
+      "agentId",
+    ]);
+    expect(plain.parentSpanId).toBe(bus.rootSpanId);
+    expect(plain.timestamp).toBe("2026-05-07T10:00:00.000Z");
+  });
+});
+
+describe("TraceEventBus.endEnvelope", () => {
+  test("keeps the start's span and parent, with a fresh timestamp and the current turn", () => {
+    const bus = new TraceEventBus({ runId: "run_x", sessionId: "sess_x", env: {} });
+    const parent = bus.envelope(new Date("2026-05-07T10:00:00.000Z"));
+    const start = bus.envelope(new Date("2026-05-07T10:00:00.000Z"), {
+      parentSpanId: parent.spanId,
+    });
+    bus.setTurnNumber(4);
+    // A span opened in between moves the current span; the end ignores it.
+    const other = bus.startSpan("other");
+    const end = bus.endEnvelope(start, new Date("2026-05-07T10:00:05.000Z"));
+    other.end();
+    expect(end.spanId).toBe(start.spanId);
+    expect(end.parentSpanId).toBe(parent.spanId);
+    expect(end.timestamp).toBe("2026-05-07T10:00:05.000Z");
+    expect(end.turnNumber).toBe(4);
+    expect(Object.keys(end)).toEqual(Object.keys(start));
+  });
+
+  test("a start with no parent ends with none", () => {
+    const bus = new TraceEventBus({ runId: "run_x", sessionId: "sess_x", env: {} });
+    const { parentSpanId: _dropped, ...start } = bus.envelope();
+    expect("parentSpanId" in bus.endEnvelope(start)).toBe(false);
+  });
+});
+
 describe("TraceEventBus async subscriber failures", () => {
   test("a rejecting async subscriber is caught during flush and counted", async () => {
     const errors: Array<{ msg: string; fields: Record<string, unknown> | undefined }> = [];

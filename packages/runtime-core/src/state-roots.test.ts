@@ -104,12 +104,16 @@ function followedOf(path: string): string {
   }
 }
 const DEFAULT_REGISTRY = join(homedir(), ".crewhaus", "harnesses.json");
+/** The user-level hooks file, a root beside Hangar's. */
+const USER_HOOKS = join(homedir(), ".crewhaus", "settings.json");
 const DEFAULT_SPELLINGS = [
   ...new Set([
     DEFAULT_HOME,
     followedOf(DEFAULT_HOME),
     DEFAULT_REGISTRY,
     followedOf(DEFAULT_REGISTRY),
+    USER_HOOKS,
+    followedOf(USER_HOOKS),
   ]),
 ];
 

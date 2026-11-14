@@ -8,6 +8,8 @@
  * with `--always` makes — goes through control-service's `decisions` and `rules`, the
  * same code Home's routes use, wrapped in a command whose receipt is written first, in
  * the harness's own command ledger.
+ * Receipts and control state are kept only in a known harness ({@link isKnownHarness}):
+ * in any other directory a change answers without writing anything there.
  *
  * A decision counts by who makes it: the local user, as the member Home's access
  * records link them to. `--by` is a label shown with the decision and grants no
@@ -17,6 +19,7 @@
  * The module has no side effect on import, and its I/O comes through `ApprovalsDeps`,
  * so a test drives it in-process.
  */
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import type { LocalIdentity } from "@crewhaus/access-control";
@@ -27,7 +30,7 @@ import {
   EXIT_FOR_REJECTED_RECEIPT,
   isId,
 } from "@crewhaus/control-contract";
-import { readApproverProjection } from "@crewhaus/control-records";
+import { readApproverProjection, readHarnessIdentity } from "@crewhaus/control-records";
 import {
   type ControlService,
   DEFAULT_RULE_DAYS,
@@ -38,11 +41,17 @@ import {
   type Settlement,
   callValues,
   currentLocalIdentity,
+  governedAncestorOf,
   harnessForSessionRoot,
   outcomeOf,
 } from "@crewhaus/control-service";
 import type { ParsedArgs } from "@crewhaus/infra-utils";
-import { emptyRuleSet, evaluate } from "@crewhaus/permission-engine";
+import {
+  DISPLAY_CONTROL_RE,
+  emptyRuleSet,
+  evaluate,
+  holdsDisplayControl,
+} from "@crewhaus/permission-engine";
 import {
   DEFAULT_TTL_DAYS,
   type PendingApproval,
@@ -78,6 +87,58 @@ export const NO_HARNESS_LINE =
 
 /** The sub-verbs that change something, and so refuse under an agent's tool. */
 const CHANGES: ReadonlySet<string> = new Set(["grant", "deny", "supersede", "defer", "revoke"]);
+
+/** Every control or bidirectional-text character {@link DISPLAY_CONTROL_RE} names. */
+const DISPLAY_CONTROLS = new RegExp(DISPLAY_CONTROL_RE.source, "gu");
+
+/** `text` with each control or bidirectional-text character written as `\uXXXX`. */
+function escapeControls(text: string): string {
+  return text.replace(
+    DISPLAY_CONTROLS,
+    (char) => `\\u${(char.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+/**
+ * A rule's pattern, or another value a rule's line prints (its end), as a line prints
+ * it: as it is, or, when it holds a control or bidirectional-text character, as a JSON
+ * string with every such character escaped, so a terminal shows what the value holds
+ * rather than acting on it.
+ */
+export function displayPattern(text: string): string {
+  return holdsDisplayControl(text) ? escapeControls(JSON.stringify(text)) : text;
+}
+
+/**
+ * Whether `dir` is a harness this CLI may keep receipts and control state in: a live
+ * registry row names it (by its real path), it has its own `harness.json`, or it holds
+ * a `.crewhaus/` directory (a link an operator made counts). A `crewhaus.yaml` alone
+ * does not: with no `.crewhaus/` there is no approval, rule or settings file to act on.
+ * Other heads that write a harness's control state may ask the same.
+ */
+export function isKnownHarness(dir: string, deps: Pick<ApprovalsDeps, "registryDirs">): boolean {
+  const realOrResolved = (path: string): string => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return resolve(path);
+    }
+  };
+  const real = realOrResolved(dir);
+  let rows: readonly string[] = [];
+  try {
+    rows = deps.registryDirs();
+  } catch {
+    // A registry that cannot be read names no harness.
+  }
+  if (rows.some((row) => realOrResolved(row) === real)) return true;
+  if (readHarnessIdentity(dir).state !== "absent") return true;
+  try {
+    return statSync(join(dir, ".crewhaus")).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 export type ApprovalsDeps = {
   readonly env: Readonly<Record<string, string | undefined>>;
@@ -188,8 +249,13 @@ type Located =
 
 /**
  * The store the run path writes to, and the harness whose approver list decides. An
- * explicit `--dir` wins. A root a tenant scope or `CREWHAUS_SESSION_DIR` names is
- * matched to the harness it belongs to; one that names none, or several, is said so.
+ * explicit `--dir` wins. With no scoped root, the working directory decides when it is a
+ * known harness ({@link isKnownHarness}); otherwise no harness does, and nothing is kept
+ * beside the decision. A root a tenant scope or `CREWHAUS_SESSION_DIR` names is matched
+ * to the harness it belongs to; one that names several is said so. One that names none
+ * is refused when it lies inside a harness that has an approver list (`--dir` names the
+ * harness that decides it), and is otherwise decided by the working directory only when
+ * that is a known harness with `.crewhaus/`.
  */
 function locate(args: ParsedArgs, deps: ApprovalsDeps, always: boolean): Located {
   const dir = str(args, "dir");
@@ -199,9 +265,19 @@ function locate(args: ParsedArgs, deps: ApprovalsDeps, always: boolean): Located
   }
   const scoped = deps.scopedSessionRoot();
   if (scoped === undefined) {
-    return { ok: true, rootDir: join(deps.cwd, SESSIONS_SUBDIR), harnessDir: deps.cwd };
+    return {
+      ok: true,
+      rootDir: join(deps.cwd, SESSIONS_SUBDIR),
+      harnessDir: isKnownHarness(deps.cwd, deps) ? deps.cwd : undefined,
+    };
   }
-  const found = harnessForSessionRoot(scoped, { registry: deps.registryDirs, cwd: deps.cwd });
+  // The working directory is a candidate only when it is a known harness with `.crewhaus/`:
+  // a directory that only names the root in an environment file decides nothing.
+  const cwdHolds = isKnownHarness(deps.cwd, deps) && existsSync(join(deps.cwd, ".crewhaus"));
+  const found = harnessForSessionRoot(scoped, {
+    registry: deps.registryDirs,
+    ...(cwdHolds ? { cwd: deps.cwd } : {}),
+  });
   if (found.state === "one") return { ok: true, rootDir: scoped, harnessDir: found.dir };
   if (found.state === "several") {
     const governed = found.dirs.some((d) => readApproverProjection(d).state !== "absent");
@@ -222,8 +298,16 @@ function locate(args: ParsedArgs, deps: ApprovalsDeps, always: boolean): Located
       message: `--always writes .crewhaus/settings.json under the HARNESS root, but the approvals store was located via CREWHAUS_SESSION_DIR/tenant scope (${scoped}), and no harness it belongs to was found. Re-run with --dir <harness root>.`,
     };
   }
+  const governed = governedAncestorOf(scoped);
+  if (governed !== undefined) {
+    return {
+      ok: false,
+      code: EXIT_FOR_ERROR.invalid,
+      message: `the approvals under ${scoped} lie inside ${governed}, a harness with a list of who may approve, and no harness names them as its own; pass --dir <harness> to say which harness decides them`,
+    };
+  }
   deps.stderr(`${NO_HARNESS_LINE}\n`);
-  return { ok: true, rootDir: scoped, harnessDir: deps.cwd };
+  return { ok: true, rootDir: scoped, harnessDir: cwdHolds ? deps.cwd : undefined };
 }
 
 /** Run `change` as a receipted command, after this process's one recovery of the harness. */
@@ -338,16 +422,19 @@ function widenPreview(
     count: covered.length,
     first: covered
       .slice(0, 5)
-      .map((record) => `  ${record.id}  ${JSON.stringify(masked(record.input ?? null))}`),
+      .map(
+        (record) =>
+          `  ${record.id}  ${escapeControls(JSON.stringify(masked(record.input ?? null)))}`,
+      ),
   };
 }
 
 function ruleNote(answer: ResolveAnswer, harnessDir: string | undefined): string {
   if (answer.rule !== undefined) {
-    return ` (standing rule ${answer.rule.id}: allows ${answer.rule.pattern} until ${answer.rule.expiresAt}; end it with \`crewhaus approvals revoke ${answer.rule.id}${harnessDir !== undefined ? ` --dir ${harnessDir}` : ""}\`)`;
+    return ` (standing rule ${answer.rule.id}: allows ${displayPattern(answer.rule.pattern)} until ${displayPattern(answer.rule.expiresAt)}; end it with \`crewhaus approvals revoke ${answer.rule.id}${harnessDir !== undefined ? ` --dir ${harnessDir}` : ""}\`)`;
   }
   if (answer.proposal !== undefined && answer.proposal.state === "pending") {
-    return ` (once — a standing rule is the owner's to make: asked the owner for ${answer.proposal.terms.pattern} as ${answer.proposal.id})`;
+    return ` (once — a standing rule is the owner's to make: asked the owner for ${displayPattern(answer.proposal.terms.pattern)} as ${answer.proposal.id})`;
   }
   return "";
 }
@@ -423,6 +510,11 @@ export async function runApprovalsCommand(
       `invalid approvalId "${id}" — expected appr_<16 hex>, or a request's dec_ id`,
     );
   }
+  // With no harness to keep it in, a store that is not there holds nothing to decide,
+  // and none is made.
+  if (harnessDir === undefined && APPROVAL_ID_RE.test(id) && !existsSync(rootDir)) {
+    return fail(EXIT_FOR_REJECTED_RECEIPT, `no approval "${id}" under ${rootDir}`);
+  }
   const display = str(args, "by") ?? deps.env["CREWHAUS_USER"] ?? "cli";
   const actor: DecisionActor = { kind: "local", identity: deps.identity, display };
   const hrn = harnessDir !== undefined ? deps.harnessIdOf(harnessDir) : undefined;
@@ -471,11 +563,30 @@ export async function runApprovalsCommand(
         `${id} cannot be replaced: ${answer.reason ?? "it is not open"}`,
       );
     }
+    const derived = answer.derivedRules ?? [];
+    const ruleNotes = derived
+      .map((rule) =>
+        rule.revoked
+          ? `; standing rule ${rule.id} ended`
+          : `; standing rule ${rule.id} still stands: ${rule.verb ?? `crewhaus approvals revoke ${rule.id}`}`,
+      )
+      .join("");
     out(
       json
-        ? `${JSON.stringify({ record: answer.record, fresh: answer.fresh }, null, 2)}\n`
-        : `superseded ${id} — ${answer.fresh.toolName}; ${answer.fresh.id} now waits for a decision: crewhaus approvals grant|deny ${answer.fresh.id}\n`,
+        ? `${JSON.stringify(
+            {
+              record: answer.record,
+              fresh: answer.fresh,
+              ...(answer.derivedRules !== undefined ? { derivedRules: answer.derivedRules } : {}),
+            },
+            null,
+            2,
+          )}\n`
+        : `superseded ${id} — ${answer.fresh.toolName}; ${answer.fresh.id} now waits for a decision: crewhaus approvals grant|deny ${answer.fresh.id}${ruleNotes}\n`,
     );
+    if (answer.ruleError !== undefined) {
+      return fail(1, `the supersede stands, but: ${answer.ruleError}`);
+    }
     return 0;
   }
 
@@ -562,7 +673,7 @@ export async function runApprovalsCommand(
       return fail(EXIT_FOR_REJECTED_RECEIPT, `no approval "${id}" under ${rootDir}`);
     const preview = widenPreview(rootDir, harnessDir, record.toolName, pattern);
     out(
-      `${pattern} also covers ${preview.count} approval(s) in this store${preview.count > 0 ? ":" : "."}\n`,
+      `${displayPattern(pattern)} also covers ${preview.count} approval(s) in this store${preview.count > 0 ? ":" : "."}\n`,
     );
     for (const line of preview.first) out(`${line}\n`);
     confirm = (
@@ -643,7 +754,7 @@ export async function runApprovalsCommand(
     );
   } else if (isRequest) {
     out(
-      `${choice === "grant" ? "granted" : "denied"} ${id} — ${answer.proposal?.terms.pattern ?? ""}${ruleNote(answer, harnessDir)}\n`,
+      `${choice === "grant" ? "granted" : "denied"} ${id} — ${displayPattern(answer.proposal?.terms.pattern ?? "")}${ruleNote(answer, harnessDir)}\n`,
     );
   } else {
     const note = always
@@ -673,21 +784,25 @@ async function listRules(harnessDir: string, deps: ApprovalsDeps, json: boolean)
   const lines: string[] = [];
   lines.push(listing.rules.length === 0 ? "standing rules: none" : "standing rules:");
   for (const rule of listing.rules) {
-    lines.push(`  ${rule.id}  ${rule.pattern}  until ${rule.expiresAt}`);
+    lines.push(
+      `  ${rule.id}  ${displayPattern(rule.pattern)}  until ${displayPattern(rule.expiresAt)}`,
+    );
     lines.push(`    ${rule.verb}`);
   }
   if (listing.proposals.length > 0) {
     lines.push("waiting for the owner:");
     for (const proposal of listing.proposals) {
-      lines.push(`  ${proposal.id}  ${proposal.terms.pattern}  until ${proposal.terms.expiresAt}`);
+      lines.push(
+        `  ${proposal.id}  ${displayPattern(proposal.terms.pattern)}  until ${displayPattern(proposal.terms.expiresAt)}`,
+      );
       for (const verb of proposal.verbs) lines.push(`    ${verb}`);
     }
   }
   if (listing.legacy.length > 0) {
     lines.push("whole-tool allows no record keeps:");
     for (const allow of listing.legacy) {
-      lines.push(`  ${allow.pattern}  — ${allow.note}`);
-      lines.push(`    ${allow.verb}`);
+      lines.push(`  ${displayPattern(allow.pattern)}  — ${allow.note}`);
+      lines.push(`    ${displayPattern(allow.verb)}`);
     }
   }
   for (const problem of listing.unreadable) lines.push(`note: ${problem}`);
@@ -713,30 +828,43 @@ async function revoke(args: ParsedArgs, harnessDir: string, deps: ApprovalsDeps)
       "give one of <rule_id> or --legacy <pattern> — see `crewhaus approvals`",
     );
   }
+  const known = isKnownHarness(harnessDir, deps);
   if (legacy !== undefined) {
+    // A directory that is no harness has no settings file to remove an allow from.
+    if (!known) {
+      return fail(
+        EXIT_FOR_REJECTED_RECEIPT,
+        `no allow ${displayPattern(legacy)} in the settings file`,
+      );
+    }
     const done = await receipted(deps, harnessDir, "rules.revoke", undefined, () =>
       deps.control.rules.revokeLegacy({ harnessDir, pattern: legacy, actor }),
     );
     if ("refused" in done) return fail(done.code, done.refused);
     const answer = done.value;
     if (answer.outcome === "removed") {
-      deps.stdout(`removed the allow ${legacy} from ${answer.path}\n`);
+      deps.stdout(`removed the allow ${displayPattern(legacy)} from ${answer.path}\n`);
       return 0;
     }
     if (answer.outcome === "forbidden") return fail(EXIT_FOR_ERROR.forbidden, answer.reason);
     if (answer.outcome === "recorded") {
       return fail(
         EXIT_FOR_REJECTED_RECEIPT,
-        `${legacy} is a standing rule: revoke it by its id (see \`crewhaus approvals rules\`)`,
+        `${displayPattern(legacy)} is a standing rule: revoke it by its id (see \`crewhaus approvals rules\`)`,
       );
     }
     if (answer.outcome === "not-found")
-      return fail(EXIT_FOR_REJECTED_RECEIPT, `no allow ${legacy} in the settings file`);
+      return fail(
+        EXIT_FOR_REJECTED_RECEIPT,
+        `no allow ${displayPattern(legacy)} in the settings file`,
+      );
     return fail(EXIT_FOR_REJECTED_RECEIPT, answer.reason);
   }
   const ruleId = id as string;
   if (!isId("rule", ruleId))
     return fail(EXIT_FOR_ERROR.invalid, `"${ruleId}" is not a rule id (rule_…)`);
+  // A directory that is no harness holds no standing rule.
+  if (!known) return fail(EXIT_FOR_REJECTED_RECEIPT, `no standing rule ${ruleId} in ${harnessDir}`);
   const hrn = deps.harnessIdOf(harnessDir);
   const done = await receipted(
     deps,
@@ -750,7 +878,7 @@ async function revoke(args: ParsedArgs, harnessDir: string, deps: ApprovalsDeps)
   switch (answer.outcome) {
     case "revoked":
       deps.stdout(
-        `revoked ${ruleId} — ${answer.rule.pattern}${answer.settingsRemoved ? "" : " (another live rule keeps the allow)"}\n`,
+        `revoked ${ruleId} — ${displayPattern(answer.rule.pattern)}${answer.settingsRemoved ? "" : " (another live rule keeps the allow)"}\n`,
       );
       return 0;
     case "forbidden":
@@ -766,8 +894,8 @@ async function revoke(args: ParsedArgs, harnessDir: string, deps: ApprovalsDeps)
 
 /**
  * Whether the local user may change what a harness's settings file allows: always on
- * a harness with no approver list, and otherwise only for its owner. `undefined` when
- * allowed, else why not.
+ * a harness with no approver list, and otherwise only for its owner, as the Home that
+ * wrote the list knows them. `undefined` when allowed, else why not.
  */
 export function settingsWriteRefusal(
   harnessDir: string,
@@ -777,6 +905,9 @@ export function settingsWriteRefusal(
   if (read.state === "absent") return undefined;
   if (read.state === "unreadable") {
     return `this harness's list of who may approve cannot be read (${read.reason}); rewrite it with \`crewhaus access sync\``;
+  }
+  if (read.projection.accessRoot === undefined) {
+    return "this harness's list of who may approve does not say which Home wrote it; rewrite it with `crewhaus access sync`";
   }
   return deps.control.decisions.mayManageRules(harnessDir, {
     kind: "local",

@@ -59,9 +59,9 @@ import {
   withdrawChange,
 } from "@crewhaus/quality-service";
 import { parseSpec } from "@crewhaus/spec";
-import { type SpecPatch, applySpecPatch } from "@crewhaus/spec-patch";
 import { AGENT_TOOL_ENV } from "./approvals-cmd";
 import { holdCliMutatingLease, holdsCliMutatingLease } from "./mutating-lease";
+import { OPTIMIZE_RUN_ID, readOptimizeCandidate } from "./optimize-proposal";
 import { localStoredActor, qualityControl, withQualityReceipt } from "./quality-receipts";
 import { currentCheckInstrument, hasExternalWriteTools, qualityRunners } from "./quality-runners";
 import type { CliFamily } from "./verbs";
@@ -224,10 +224,10 @@ function localMayDecide(session: Session, requiredClass: "maintainer" | "owner")
   const read = readApproverProjection(session.harnessDir);
   if (read.state === "absent") return true;
   if (read.state !== "present") return false;
-  const who = session.control.decisions.principalOf({
-    kind: "local",
-    identity: currentLocalIdentity(),
-  });
+  const who = session.control.decisions.principalOf(
+    { kind: "local", identity: currentLocalIdentity() },
+    session.harnessDir,
+  );
   if (who.service === true || who.principal === undefined) return false;
   return memberMayDecide(read.projection, who.principal, requiredClass, session.now());
 }
@@ -489,20 +489,8 @@ function receiptLines(
 }
 
 function readFrom(session: Session, from: string, specRel: string): string {
-  if (/^opt_[0-9a-f]+$/.test(from)) {
-    // An optimize run: its patches applied to the spec as it is now.
-    const dir = join(session.harnessDir, ".crewhaus", "optimize", from);
-    const listFile = join(dir, "patches.json");
-    const oneFile = join(dir, "patch.json");
-    let patches: SpecPatch[];
-    if (existsSync(listFile)) patches = JSON.parse(readFileSync(listFile, "utf8")) as SpecPatch[];
-    else if (existsSync(oneFile))
-      patches = [JSON.parse(readFileSync(oneFile, "utf8")) as SpecPatch];
-    else throw new Error(`changes propose: no optimize run ${from} under .crewhaus/optimize`);
-    let yaml = readFileSync(join(session.harnessDir, specRel), "utf8");
-    for (const patch of patches) yaml = applySpecPatch(yaml, patch).yaml;
-    return yaml;
-  }
+  // An optimize run: its patches applied to the spec as it is now.
+  if (OPTIMIZE_RUN_ID.test(from)) return readOptimizeCandidate(session.harnessDir, from, specRel);
   const path = resolve(session.harnessDir, from);
   if (!existsSync(path)) throw new Error(`changes propose: no file at ${path}`);
   return readFileSync(path, "utf8");
@@ -520,6 +508,8 @@ async function proposeVerb(
   if (kind !== "spec" && kind !== "graders" && kind !== "dataset") {
     throw new Error(`changes propose: --kind is spec, graders or dataset (got "${kind}")`);
   }
+  if (OPTIMIZE_RUN_ID.test(from) && kind !== "spec")
+    throw new Error("changes propose: an optimize run proposes a spec change (--kind spec)");
   const source = (args.values.get("source") ?? "manual") as ChangeSource;
   if (!(CHANGE_SOURCES as readonly string[]).includes(source)) {
     throw new Error(`changes propose: --source is one of ${CHANGE_SOURCES.join(", ")}`);
@@ -700,9 +690,9 @@ async function checkVerb(session: Session, argv: readonly string[]): Promise<Cha
   if (plan.isolation === "needs-live") {
     return {
       lines: [
-        "this harness has a tool that writes outside the process and no recorded tool results to replay;",
+        plan.isolationReason ??
+          "this harness has a tool that writes outside the process and no recorded tool results to replay",
         `  a maintainer can check it live: crewhaus changes check ${chg} --live --yes`,
-        "  or record a run first: crewhaus eval crewhaus.yaml --dataset <d> --graders <g> --record-tools <dir>",
       ],
       exitCode: 1,
     };
@@ -778,10 +768,10 @@ async function adoptVerb(session: Session, argv: readonly string[]): Promise<Cha
   await holdCliMutatingLease(session.harnessDir, "changes adopt", { env: session.env });
   await observe(session);
   const actor = await localStoredActor(session.harnessDir, session.control);
-  const principal = session.control.decisions.principalOf({
-    kind: "local",
-    identity: currentLocalIdentity(),
-  }).principal;
+  const principal = session.control.decisions.principalOf(
+    { kind: "local", identity: currentLocalIdentity() },
+    session.harnessDir,
+  ).principal;
   const answer = await withQualityReceipt<{ ok: boolean; lines: string[] }>(
     {
       harnessDir: session.harnessDir,
@@ -881,10 +871,10 @@ async function rollbackVerb(
   await holdCliMutatingLease(session.harnessDir, "changes rollback", { env: session.env });
   await observe(session);
   const actor = await localStoredActor(session.harnessDir, session.control);
-  const principal = session.control.decisions.principalOf({
-    kind: "local",
-    identity: currentLocalIdentity(),
-  }).principal;
+  const principal = session.control.decisions.principalOf(
+    { kind: "local", identity: currentLocalIdentity() },
+    session.harnessDir,
+  ).principal;
   const answer = await withQualityReceipt<{ ok: boolean; lines: string[] }>(
     {
       harnessDir: session.harnessDir,

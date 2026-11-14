@@ -73,7 +73,6 @@ import type {
   IrProfilePermissions,
   IrProvability,
   IrResearchV0,
-  IrSchedule,
   IrSecretRef,
   IrSecurity,
   IrSlackConfig,
@@ -166,6 +165,7 @@ import {
 // tools on the edge). Imported via the `/tool-policy` SUBPATH so this offline
 // gate never drags the loop into the compiler-worker's CF bundle.
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
+import { lowerSchedule, parseDurationToMs } from "./lower/schedule";
 import { toolConfigWidenings } from "./tool-config-widening";
 
 /**
@@ -479,8 +479,10 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   // durable-execution's `armSchedule`, managed via its per-tenant
   // setInterval/cron wake in `renderScheduleWake`), so — per this table's
   // delete-when-wired contract — schedule carries NO accepted-but-unwired row
-  // on any shape. channel + managed have no other unwired top-level keys, so
-  // they drop out of the table entirely; batch keeps only its continuity row.
+  // on any shape, in either form (the object, or the list of named lanes each
+  // daemon arms with `armScheduleLanes`, #514). channel + managed have no other
+  // unwired top-level keys, so they drop out of the table entirely; batch
+  // keeps only its continuity row.
   // Managed `agent.tools`/`tool_config` are NESTED keys the then top-level-only
   // ACCEPTED_BUT_UNWIRED mechanism did not track, matching how the other
   // shapes' nested `agent.tools` were handled.
@@ -1491,31 +1493,6 @@ function edgeToolConfigProblems(
 }
 
 type SpecWithPermissions = Exclude<Spec, { target: "eval" }>;
-/**
- * Phase 3 §3.1 — parse a duration string ("2h", "30m", "60s", "500ms";
- * v0.3.0 adds "90d") to milliseconds. Caller is expected to have already
- * regex-validated the format at the spec layer; this is the
- * deterministic numeric step. Shared by `heartbeat.every` and the v0.3.0
- * `memory.ttl` lowering.
- */
-const DURATION_UNIT_MS: Record<"ms" | "s" | "m" | "h" | "d", number> = {
-  ms: 1,
-  s: 1000,
-  m: 60 * 1000,
-  h: 60 * 60 * 1000,
-  d: 24 * 60 * 60 * 1000,
-};
-function parseDurationToMs(duration: string): number {
-  const m = duration.match(/^(\d+)(ms|s|m|h|d)$/);
-  if (!m) {
-    throw new Error(`invalid duration "${duration}" (caught past spec validation)`);
-  }
-  const n = Number.parseInt(m[1] ?? "0", 10);
-  // The capture group is statically one of the table's keys (the regex permits
-  // no other unit), so the lookup is total — no unreachable default arm.
-  return n * DURATION_UNIT_MS[m[2] as keyof typeof DURATION_UNIT_MS];
-}
-
 function lowerPermissions(spec: SpecWithPermissions): IrPermissions {
   const p = spec.permissions;
   if (p === undefined) return { rules: [] };
@@ -3594,55 +3571,6 @@ function lowerLimits(spec: SpecWithLimits): { limits?: IrLimits } {
             },
           }
         : {}),
-    },
-  };
-}
-
-/**
- * Loop contract 0.4 (Batch F, temporal contract / G84 schedule half) — lower
- * the `schedule:` block on the daemon-able shapes (channel/managed/batch).
- * The discriminated union carries through 1:1; durations (`jitter`, interval
- * `every`) normalize to ms at lower time (the daemon reads literal numbers)
- * while `cron` is verbatim (the daemon's cron parser owns validity beyond the
- * spec's field-count regex). Spread-return-{} discipline (Pillar 1): absent
- * from the IR when the spec omits the block, so every existing daemon bundle
- * stays byte-identical. The emitters wire it into the wake loop downstream
- * (temporal item); until then it rides ACCEPTED_BUT_UNWIRED.
- */
-type SpecSchedule =
-  | {
-      readonly kind: "cron";
-      readonly cron: string;
-      readonly timezone?: string;
-      readonly jitter?: string;
-      readonly instructions?: string;
-    }
-  | {
-      readonly kind: "interval";
-      readonly every: string;
-      readonly jitter?: string;
-      readonly instructions?: string;
-    };
-
-function lowerSchedule(schedule: SpecSchedule | undefined): { schedule?: IrSchedule } {
-  if (schedule === undefined) return {};
-  if (schedule.kind === "cron") {
-    return {
-      schedule: {
-        kind: "cron",
-        cron: schedule.cron,
-        ...(schedule.timezone !== undefined ? { timezone: schedule.timezone } : {}),
-        ...(schedule.jitter !== undefined ? { jitterMs: parseDurationToMs(schedule.jitter) } : {}),
-        ...(schedule.instructions !== undefined ? { instructions: schedule.instructions } : {}),
-      },
-    };
-  }
-  return {
-    schedule: {
-      kind: "interval",
-      everyMs: parseDurationToMs(schedule.every),
-      ...(schedule.jitter !== undefined ? { jitterMs: parseDurationToMs(schedule.jitter) } : {}),
-      ...(schedule.instructions !== undefined ? { instructions: schedule.instructions } : {}),
     },
   };
 }

@@ -14,16 +14,23 @@
  *      admitted is new work: the first loop of a crew or a graph is asked like any other.
  *   2. An open intake verdict admits.
  *   3. While paused, never while disabled, a loop that resumes a session is admitted
- *      once for each one-time grant waiting there, so a granted request re-drives its
- *      parked call: the grant is unconsumed, inside the approval store's retention
- *      window, asked in this loop's resume scope and not a standing ("always") allow,
- *      and no earlier loop in this process was admitted on it. The session root's
- *      approvals are read with `foldReadOnly`, which writes nothing.
+ *      once on a one-time grant waiting there only while that grant's park is the
+ *      session's newest approval record and no user message is logged after it. The
+ *      grant is unconsumed, inside the approval store's retention window, asked in this loop's
+ *      resume scope and not a standing ("always") allow; its record is the session's
+ *      newest approval record (a tie, or another record whose time does not parse,
+ *      admits neither); the session's log holds no user message later than the park (a
+ *      synthetic one does not count); and no earlier loop in this process was admitted
+ *      on it. A session log that is missing, cannot be read or holds a line that does not
+ *      parse admits nothing. The session root's approvals are read with `foldReadOnly`
+ *      and its log with one file read, and neither writes anything.
  *   4. Anything else is refused before any row, session write or model call: a channel
  *      turn answers the verdict's notice as its reply (an empty reply for a quiet pause,
  *      which the router does not send), and every other loop throws a `RunFailedError`
  *      whose class and exit are the verdict's `exitName`.
  */
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { effectiveDecisionState } from "@crewhaus/control-contract";
 import { type IntakeVerdict, intakeRoot, intakeVerdict } from "@crewhaus/control-records";
 import { EXIT_CODES, type FailureReport, RunFailedError } from "@crewhaus/errors";
@@ -32,6 +39,7 @@ import { isRunHeld } from "@crewhaus/run-context";
 import {
   DEFAULT_ROOT_DIR,
   DEFAULT_TTL_DAYS,
+  SESSION_ID_RE,
   foldReadOnly,
   recordInScope,
 } from "@crewhaus/session-store";
@@ -104,21 +112,67 @@ const MS_PER_DAY = 86_400_000;
 const grantsSpent = new Set<string>();
 
 /**
+ * Whether the session's event log (`<sessionRoot>/<sessionId>.jsonl`) holds no user
+ * message later than `parked` (epoch ms), a synthetic one aside. A log that is missing,
+ * cannot be read or holds a line that does not parse answers false. One read; nothing is
+ * created or written.
+ */
+function noUserMessageSince(sessionRoot: string, sessionId: string, parked: number): boolean {
+  let text: string;
+  try {
+    text = readFileSync(resolve(sessionRoot, `${sessionId}.jsonl`), "utf8");
+  } catch {
+    return false;
+  }
+  for (const line of text.split("\n")) {
+    if (line.trim() === "") continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      return false;
+    }
+    if (typeof event !== "object" || event === null) return false;
+    const { ts, kind, payload } = event as { ts?: unknown; kind?: unknown; payload?: unknown };
+    if (typeof ts !== "number" || !Number.isFinite(ts) || typeof kind !== "string") return false;
+    if (kind !== "user_message" || ts <= parked) continue;
+    const synthetic =
+      typeof payload === "object" &&
+      payload !== null &&
+      (payload as { synthetic?: unknown }).synthetic === true;
+    if (!synthetic) return false;
+  }
+  return true;
+}
+
+/**
  * Take the grant waiting in `sessionRoot` for a loop that resumes `sessionId` in
  * `resumeScope`, and answer whether there was one. A grant is taken when it is the
  * session's, asked in that scope (`recordInScope`), a one-time grant (never a standing
  * "always" allow), inside the store's retention window (`DEFAULT_TTL_DAYS` from its
- * park, the store's own `get` rule), `granted` now, and not yet taken in this process.
+ * park, the store's own `get` rule), `granted` now, and not yet taken in this process,
+ * and only while its park is the session's newest approval record (every other one of
+ * the session was created strictly earlier) and the session's log holds no user message
+ * after it ({@link noUserMessageSince}). A session id outside the session grammar takes
+ * nothing and reads no file. A grant not taken stays unconsumed.
  */
 function takeWaitingGrant(sessionRoot: string, sessionId: string, resumeScope: string): boolean {
+  if (!SESSION_ID_RE.test(sessionId)) return false;
   const now = Date.now();
   const cutoff = now - DEFAULT_TTL_DAYS * MS_PER_DAY;
-  for (const record of foldReadOnly(sessionRoot).records) {
-    if (record.sessionId !== sessionId || grantsSpent.has(record.id)) continue;
+  const records = foldReadOnly(sessionRoot).records.filter((r) => r.sessionId === sessionId);
+  for (const record of records) {
+    if (grantsSpent.has(record.id)) continue;
     if (record.always === true || !recordInScope(record, resumeScope)) continue;
     const parked = Date.parse(record.createdAt);
     if (!Number.isFinite(parked) || parked < cutoff) continue;
     if (effectiveDecisionState(record, null, now).state !== "granted") continue;
+    const newest = records.every((other) => {
+      if (other === record) return true;
+      const at = Date.parse(other.createdAt);
+      return Number.isFinite(at) && at < parked;
+    });
+    if (!newest || !noUserMessageSince(sessionRoot, sessionId, parked)) continue;
     grantsSpent.add(record.id);
     return true;
   }

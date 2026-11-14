@@ -1,6 +1,6 @@
 /** The approver projection: written only where someone else may decide, only when it moves. */
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mintId } from "@crewhaus/control-contract";
 import { approverProjection } from "@crewhaus/control-contract/schemas";
@@ -51,6 +51,7 @@ describe("where a projection is written", () => {
       governedSince: new Date(home.clock.now()).toISOString(),
       members: [{ principal: grant.principal, decide: "operator" }],
       links: [],
+      accessRoot: realpathSync(home.root),
     });
     expect(approverProjection.safeParse(read.projection).success).toBe(true);
     expect(JSON.stringify(read.projection)).not.toContain("local:");
@@ -601,5 +602,51 @@ describe("the Home address on the projection", () => {
     );
     expect("homeUrl" in readProjection(h)).toBe(false);
     expect(readProjection(h)["members"]).toHaveLength(1);
+  });
+});
+
+describe("the Home root on the projection", () => {
+  test("a written projection names the real path of the Hangar root whose records wrote it", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    ok(await home.access.link(home.actor, { subject: "slack:T0:U0", member: home.owner }));
+    expect(readProjection(h)["accessRoot"]).toBe(realpathSync(home.root));
+    const read = createApproverReader({ now: home.clock.now })(h.dir);
+    expect(read.state === "present" && read.projection.accessRoot).toBe(realpathSync(home.root));
+    expect(read.state === "present" && approverProjection.safeParse(read.projection).success).toBe(
+      true,
+    );
+  });
+
+  test("a file that names no root, or another root, is rewritten at the next sync", async () => {
+    const home = await homeFixture({ harnesses: [[]] });
+    const [h] = home.harnesses;
+    if (h === undefined) throw new Error("no harness");
+    ok(await home.access.link(home.actor, { subject: "slack:T0:U0", member: home.owner }));
+    const rewrite = (change: (body: Record<string, unknown>) => void): void => {
+      const body = readProjection(h);
+      change(body);
+      writeFileSync(projectionPath(h), `${JSON.stringify(body)}\n`);
+    };
+    rewrite((body) => {
+      Reflect.deleteProperty(body, "accessRoot");
+    });
+    const writes = countWrites();
+    home.clock.advance(HOUR);
+    ok(await home.access.sync(home.actor));
+    expect(writes).toEqual([h.id]);
+    expect(readProjection(h)["accessRoot"]).toBe(realpathSync(home.root));
+    rewrite((body) => {
+      body["accessRoot"] = join(home.root, "elsewhere");
+    });
+    home.clock.advance(HOUR);
+    ok(await home.access.sync(home.actor));
+    expect(writes).toEqual([h.id, h.id]);
+    expect(readProjection(h)["accessRoot"]).toBe(realpathSync(home.root));
+    // Nothing moved since: the next sync leaves the file as it is.
+    home.clock.advance(HOUR);
+    ok(await home.access.sync(home.actor));
+    expect(writes).toEqual([h.id, h.id]);
   });
 });

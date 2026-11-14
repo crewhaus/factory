@@ -82,6 +82,7 @@
  */
 import {
   existsSync,
+  lstatSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -89,8 +90,9 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { AREA_MODULES } from "@crewhaus/control-contract";
+import { SECURITY_SETTINGS_PATHS } from "@crewhaus/control-service";
 import { MAX_TEXT_BYTES } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
@@ -364,7 +366,10 @@ const PLACED: readonly InspectExclusion[] = [
  * sits (`approvals.d/keys` at any depth), because `CREWHAUS_SESSION_DIR` can
  * move the session root anywhere inside the harness.
  *
- * Every other row is matched by place: the path itself and everything below it.
+ * Every other row is matched by place: the path itself and everything below it. A row
+ * under `.crewhaus/` matches under EVERY `.crewhaus` segment in the path, so a harness
+ * nested inside this one (`apps/sub/.crewhaus/run/control-token`) has its run, audit and
+ * key files refused exactly like this harness's own.
  *
  * CASE-FOLDED, EVERY ONE. The default filesystem on darwin (APFS) and on
  * Windows (NTFS) is case-INSENSITIVE, so the OS resolves `.crewhaus/AUDIT`
@@ -385,10 +390,15 @@ export function exclusionFor(
     if (segment === ".env" || segment.startsWith(".env.")) return ENV_ROW;
     if (segment === "approvals.d" && lower[i + 1] === "keys") return DECISION_KEYS_ROW;
   }
+  const roots = lower.flatMap((segment, i) => (segment === ".crewhaus" ? [i] : []));
   for (const row of [...PLACED, ...extra]) {
     const prefix = segmentsOfPath(row.path);
-    if (prefix.length === 0 || prefix.length > lower.length) continue;
-    if (prefix.every((segment, i) => segment === lower[i])) return row;
+    if (prefix.length === 0) continue;
+    const starts = prefix[0] === ".crewhaus" ? roots : [0];
+    for (const at of starts) {
+      if (prefix.length > lower.length - at) continue;
+      if (prefix.every((segment, i) => segment === lower[at + i])) return row;
+    }
   }
   return null;
 }
@@ -406,17 +416,42 @@ export function resolvedExclusion(
   resolved: string,
   extra: readonly InspectExclusion[] = [],
 ): InspectExclusion | null {
+  const segments = realSegments(harnessDir, resolved);
+  return segments === undefined ? null : exclusionFor(segments, extra);
+}
+
+/**
+ * The place `resolved` really is, through every link, as segments relative to the
+ * harness's real directory; undefined when nothing is there, or it is the harness itself
+ * or outside it.
+ */
+function realSegments(harnessDir: string, resolved: string): string[] | undefined {
   let real: string;
   let root: string;
   try {
     real = realpathSync(resolved);
     root = realpathSync(harnessDir);
   } catch {
-    return null;
+    return undefined;
   }
   const rel = relative(root, real);
-  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return null;
-  return exclusionFor(sep === "/" ? rel.split("/") : rel.split(/[\\/]/), extra);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return undefined;
+  return sep === "/" ? rel.split("/") : rel.split(/[\\/]/);
+}
+
+/**
+ * Whether a harness-relative path names a harness's identity file: `.crewhaus/identity.json`
+ * at any depth, case-folded, so a nested harness's counts too.
+ *
+ * First consumer: {@link identityAnswer}.
+ */
+export function isIdentityPath(segments: readonly string[]): boolean {
+  const n = segments.length;
+  return (
+    n >= 2 &&
+    (segments[n - 1] as string).toLowerCase() === "identity.json" &&
+    (segments[n - 2] as string).toLowerCase() === ".crewhaus"
+  );
 }
 
 /** True when a harness-relative path is one of the exclusions. */
@@ -603,6 +638,11 @@ function listEntries(
       hidden.push(name);
       continue;
     }
+    // A name inside another registered harness is that harness's to show.
+    if (nestedHarnessOf(ctx, resolved) !== undefined) {
+      hidden.push(name);
+      continue;
+    }
     try {
       const stat = statSync(resolved);
       rows.push({
@@ -627,7 +667,9 @@ function listEntries(
 
 /**
  * Refuse a path that is excluded as asked for, or whose resolved place is: 403, naming the
- * reason and where the data IS available, and never the file's content.
+ * reason and where the data IS available, and never the file's content. A path whose real
+ * place is inside another harness registered with this Home is refused too: it names that
+ * harness only to a caller who may read it.
  */
 function refuseExcluded(ctx: M3Context, segments: readonly string[], resolved?: string): void {
   const excluded =
@@ -635,11 +677,34 @@ function refuseExcluded(ctx: M3Context, segments: readonly string[], resolved?: 
     (resolved !== undefined && ctx.harnessDir !== null
       ? resolvedExclusion(ctx.harnessDir, resolved)
       : null);
-  if (excluded === null) return;
+  if (excluded !== null) {
+    throw new HttpError(
+      403,
+      `${relPath(segments)} is excluded from every inspect route: ${excluded.reason}. See ${excluded.where}.`,
+    );
+  }
+  const nested = resolved === undefined ? undefined : nestedHarnessOf(ctx, resolved);
+  if (nested === undefined) return;
   throw new HttpError(
     403,
-    `${relPath(segments)} is excluded from every inspect route: ${excluded.reason}. See ${excluded.where}.`,
+    nested.visible
+      ? `${relPath(segments)} belongs to harness ${nested.id}, which is registered with this Home on its own — open it in that harness's inspector.`
+      : `${relPath(segments)} belongs to another harness registered with this Home, and is not served here.`,
   );
+}
+
+/** The registered harness inside this one that really holds `resolved`, if any. */
+function nestedHarnessOf(
+  ctx: M3Context,
+  resolved: string,
+): { readonly id: string; readonly visible: boolean } | undefined {
+  let real: string;
+  try {
+    real = realpathSync(resolved);
+  } catch {
+    return undefined;
+  }
+  return ctx.nestedHarnessAt(real);
 }
 
 /** `statSync` that answers undefined instead of throwing. */
@@ -807,6 +872,43 @@ function identityProjection(document: unknown): Record<string, unknown> {
   };
 }
 
+/** What a read of the identity file says beside its projection. */
+const IDENTITY_NOTE =
+  "this is a harness identity file: shown as its fingerprint and whether each key is present, as in the identity store";
+
+/**
+ * The answer for a read whose requested path, or the place it really is, is a harness's
+ * identity file: its projection, never its text and never a parser's message (either could
+ * carry key bytes). The file is read and parsed here, not through `readBody`. A file that
+ * does not parse projects to nothing. Undefined when the read is not of an identity file.
+ *
+ * First consumers: the raw read, a store entry's read and a skill's `SKILL.md`.
+ */
+function identityAnswer(
+  ctx: M3Context,
+  segments: readonly string[],
+  resolved: string,
+): InspectFileBody | undefined {
+  const real = ctx.harnessDir === null ? undefined : realSegments(ctx.harnessDir, resolved);
+  if (!isIdentityPath(segments) && (real === undefined || !isIdentityPath(real))) {
+    return undefined;
+  }
+  const { text, truncated } = readTextCapped(resolved, MAX_INSPECT_BYTES);
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  return {
+    document: identityProjection(parsed),
+    text: null,
+    parseError: null,
+    bytes: Buffer.byteLength(text, "utf8"),
+    truncated,
+  };
+}
+
 /** Permission rules + hooks, counted and named — what the settings screen
  *  shows above the raw document. */
 function settingsSummary(document: unknown): Record<string, unknown> {
@@ -895,6 +997,24 @@ export const inspectStore: M3Handler = (ctx) => {
       text: null,
       parseError: null,
       bytes: null,
+      modifiedAt: stat.modifiedAt,
+      summary: null,
+    };
+  }
+  // Another single-file store that leads to an identity file answers its projection too.
+  const identity = store === "identity" ? undefined : identityAnswer(ctx, def.segments, path);
+  if (identity !== undefined) {
+    return {
+      present: true,
+      note: IDENTITY_NOTE,
+      verb: null,
+      ...base,
+      entries: [],
+      truncated: identity.truncated,
+      document: identity.document,
+      text: null,
+      parseError: null,
+      bytes: identity.bytes,
       modifiedAt: stat.modifiedAt,
       summary: null,
     };
@@ -1006,7 +1126,9 @@ export const inspectEntry: M3Handler = (ctx) => {
       try {
         const skillPath = ctx.contain([...def.segments, name, skillFile.name]);
         refuseExcluded(ctx, [...def.segments, name, skillFile.name], skillPath);
-        body = readBody(skillPath, scrubberFor(ctx));
+        body =
+          identityAnswer(ctx, [...def.segments, name, skillFile.name], skillPath) ??
+          readBody(skillPath, scrubberFor(ctx));
       } catch {
         body = undefined;
       }
@@ -1029,10 +1151,16 @@ export const inspectEntry: M3Handler = (ctx) => {
       truncated: truncated || body?.truncated === true,
     };
   }
-  const body = readBody(path, scrubberFor(ctx));
+  const identity = identityAnswer(ctx, [...def.segments, name], path);
+  const body = identity ?? readBody(path, scrubberFor(ctx));
   return {
     present: true,
-    note: body.parseError === null ? null : `this file did not parse: ${body.parseError}`,
+    note:
+      identity !== undefined
+        ? IDENTITY_NOTE
+        : body.parseError === null
+          ? null
+          : `this file did not parse: ${body.parseError}`,
     verb: null,
     ...base,
     files: [],
@@ -1078,7 +1206,9 @@ function modelledStoreFor(segments: readonly string[]): InspectStore | null {
  * `GET /api/h/:id/inspect/raw` — the generic raw browser.
  *
  * `?path=` is harness-relative and resolved through the same containment
- * check as every other read. Refuse every {@link INSPECT_EXCLUSIONS} row. Directory paths list; file paths return capped, masked text.
+ * check as every other read. Refuse every {@link INSPECT_EXCLUSIONS} row, and every path
+ * whose real place is inside another registered harness. Directory paths list; file paths
+ * return capped, masked text, except an identity file, which answers its projection.
  * READ-ONLY — this route has no write twin, deliberately.
  */
 export const inspectRaw: M3Handler = (ctx) => {
@@ -1169,10 +1299,16 @@ export const inspectRaw: M3Handler = (ctx) => {
       truncated,
     };
   }
-  const body = readBody(path, scrubberFor(ctx));
+  const identity = identityAnswer(ctx, segments, path);
+  const body = identity ?? readBody(path, scrubberFor(ctx));
   return {
     present: true,
-    note: body.parseError === null ? null : `this file did not parse: ${body.parseError}`,
+    note:
+      identity !== undefined
+        ? IDENTITY_NOTE
+        : body.parseError === null
+          ? null
+          : `this file did not parse: ${body.parseError}`,
     verb: null,
     path: shown,
     kind: "file",
@@ -1280,17 +1416,6 @@ function serializeSettings(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-/**
- * The settings keys that decide what the agent may do, what runs, and which environment
- * files (with the credentials in them) the harness is started with.
- */
-const SECURITY_SETTINGS_PATHS: ReadonlyArray<readonly string[]> = [
-  ["permissions"],
-  ["hooks"],
-  ["manager", "hooks"],
-  ["manager", "envFiles"],
-];
-
 /** Which of {@link SECURITY_SETTINGS_PATHS} differ between two settings documents. */
 export function securityKeysChanged(beforeText: string, afterText: string): string[] {
   const parse = (text: string): unknown => {
@@ -1318,6 +1443,47 @@ export function securityKeysChanged(beforeText: string, afterText: string): stri
   ).map((path) => path.join("."));
 }
 
+/** Two segment lists name the same place, case-folded. */
+const sameSegments = (a: readonly string[] | undefined, b: readonly string[]): boolean =>
+  a !== undefined &&
+  a.length === b.length &&
+  a.every((part, i) => part.toLowerCase() === (b[i] as string).toLowerCase());
+
+/**
+ * The settings write reads and replaces only this harness's own `.crewhaus/settings.json`:
+ * a path an exclusion or another registered harness holds is refused (403), and a link, or
+ * a file whose real place is anywhere else, is neither shown nor replaced (409).
+ */
+function refuseSettingsPlace(ctx: M3Context, segments: readonly string[], path: string): void {
+  refuseExcluded(ctx, segments, path);
+  const harnessDir = ctx.harnessDir;
+  const refuse: () => never = () => {
+    throw new HttpError(
+      409,
+      `${relPath(segments)} is not this harness's own settings file here (it is a link, or it sits somewhere else), so it is neither shown nor replaced — edit it in the harness's own directory`,
+    );
+  };
+  if (harnessDir === null) refuse();
+  let link = false;
+  try {
+    link = lstatSync(path).isSymbolicLink();
+  } catch {
+    // Nothing is there: the folder that would hold it is checked below.
+  }
+  if (link) refuse();
+  if (existsSync(path)) {
+    if (!sameSegments(realSegments(harnessDir, path), segments)) refuse();
+    return;
+  }
+  const parent = dirname(path);
+  if (
+    existsSync(parent) &&
+    !sameSegments(realSegments(harnessDir, parent), segments.slice(0, -1))
+  ) {
+    refuse();
+  }
+}
+
 /**
  * `PUT /api/h/:id/inspect/settings` — edit `.crewhaus/settings.json`.
  *
@@ -1340,6 +1506,7 @@ export const settingsWrite: M3Handler = (ctx) => {
 
   const def = STORE_DEFS.settings;
   const path = ctx.contain(def.segments);
+  refuseSettingsPlace(ctx, def.segments, path);
   const existed = existsSync(path);
   const before = existed ? readTextCapped(path, MAX_INSPECT_BYTES) : { text: "", truncated: false };
   const after = serializeSettings(next);

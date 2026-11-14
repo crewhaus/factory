@@ -23,13 +23,20 @@ import {
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { append, foldStates } from "@crewhaus/control-records";
+import {
+  append,
+  casAppend,
+  controlPaths,
+  deploymentsLedger,
+  foldStates,
+  readDeployments,
+} from "@crewhaus/control-records";
 import { commandsLedgerOf } from "@crewhaus/control-service";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import type { Clock, ProcessOps, SpawnRequest, SpawnedProcess } from "@crewhaus/harness-supervisor";
 import { hashSpecSource } from "@crewhaus/harness-supervisor";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
-import { registryPinFreshness, runDaemonCommand } from "./daemon-cmd";
+import { registryPinFreshness, runDaemonCommand, supervisorFor } from "./daemon-cmd";
 
 // --- seams -----------------------------------------------------------------
 
@@ -1056,9 +1063,37 @@ describe("crewhaus daemon", () => {
   test("wake rejects a lane control.v1 does not define", async () => {
     const f = fixture();
     try {
-      await expect(runDaemonCommand(["wake", "--lane", "janitor"], f.opts)).rejects.toThrow(
-        /--lane must be heartbeat or schedule/,
-      );
+      for (const lane of ["janitor", "schedule:X", "schedule:"]) {
+        await expect(runDaemonCommand(["wake", "--lane", lane], f.opts)).rejects.toThrow(
+          /--lane must be heartbeat, schedule or schedule:<name>/,
+        );
+      }
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("wake --lane schedule:<name> reaches control.v1 with that lane", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      announceControl(f, 41_237);
+      const bodies: unknown[] = [];
+      const fetchSpy = (async (_input: string | URL | Request, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body ?? "{}")));
+        return new Response(JSON.stringify({ sessionId: "sess_abc", lane: "schedule:discovery" }), {
+          status: 202,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+      const out = await runDaemonCommand(["wake", "--lane", "schedule:discovery"], {
+        ...f.opts,
+        fetch: fetchSpy,
+      });
+      expect(out.exitCode).toBe(0);
+      expect(bodies).toHaveLength(1);
+      expect((bodies[0] as { lane: string }).lane).toBe("schedule:discovery");
+      expect(out.lines[0]).toContain("schedule:discovery");
     } finally {
       f.cleanup();
     }
@@ -1481,6 +1516,163 @@ describe("crewhaus daemon pause|resume|disable|enable", () => {
       expect(f.ops.children).toHaveLength(0);
     } finally {
       f.cleanup();
+    }
+  });
+});
+
+// --- a restart decides the start's admission before it stops ----------------
+
+/** The bytes of a path, or `null` when nothing is there. */
+function bytesAt(path: string): string | null {
+  return existsSync(path) ? readFileSync(path, "latin1") : null;
+}
+
+describe("crewhaus daemon restart decides the start's admission before it stops", () => {
+  const keyPath = (dir: string): string => join(dir, controlPaths(dir).digestKeyFile);
+  const ledgerPath = (dir: string): string => join(dir, controlPaths(dir).deploymentsFile);
+
+  /** A started daemon, then the records the test names in place of the start's own. */
+  async function liveDaemon(f: Fixture): Promise<FakeChild | undefined> {
+    expect((await runDaemonCommand(["start", "--no-preflight"], f.opts)).exitCode).toBe(0);
+    expect(f.ops.children).toHaveLength(1);
+    rmSync(ledgerPath(f.dir), { force: true });
+    return f.ops.last();
+  }
+
+  test("a digest key that cannot be read: the daemon keeps running, and nothing is written", async () => {
+    const f = fixture();
+    try {
+      const child = await liveDaemon(f);
+      writeFileSync(keyPath(f.dir), "this is not a digest key\n");
+      const key = bytesAt(keyPath(f.dir));
+      // The terminal head's own supervisor, so the restart reaches its admission.
+      const supervisor = supervisorFor(
+        { dir: f.dir, target: "channel", specName: "daemon-fixture" },
+        f.opts,
+        { enabled: false },
+      );
+      const result = await supervisor.restart();
+      expect(result).toMatchObject({
+        ok: false,
+        reason: "build-not-active",
+        message: "the harness's digest key cannot be read; nothing was started",
+        kept: true,
+      });
+      expect(child?.signals).toEqual([]);
+      expect(f.ops.children).toHaveLength(1);
+      expect(existsSync(ledgerPath(f.dir))).toBe(false);
+      expect(bytesAt(keyPath(f.dir))).toBe(key);
+      supervisor.close();
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a protected environment whose active build the start replaces: the daemon keeps running, and nothing is written", async () => {
+    const f = fixture();
+    try {
+      const child = await liveDaemon(f);
+      writeFileSync(
+        join(f.dir, ".crewhaus", "environments.json"),
+        JSON.stringify({ environments: { prod: { requireApproval: true } } }),
+      );
+      const ledger = deploymentsLedger(f.dir);
+      // prod activated first, so the active build is the unprotected staging one.
+      for (const [n, environment, activatedAt] of [
+        [1, "prod", "2026-01-01T00:00:00.000Z"],
+        [2, "staging", "2026-01-02T00:00:00.000Z"],
+      ] as const) {
+        const id = `dep_01${String(n).padStart(24, "0")}`;
+        const prepared = {
+          id,
+          state: "prepared",
+          artifact: {
+            digest: `sha256:${String(n).repeat(64)}`,
+            shape: "channel",
+            entry: "dist/daemon.ts",
+            bootInputs: [],
+          },
+        };
+        expect((await casAppend(ledger, id, null, prepared)).ok).toBe(true);
+        const moved = await casAppend(ledger, id, "prepared", {
+          ...prepared,
+          state: "active",
+          environment,
+          activatedAt,
+          activatedBy: "sys:test",
+          autostart: true,
+          gates: "not-run",
+          cmd: id,
+        });
+        expect(moved.ok && moved.applied).toBe(true);
+      }
+      const read = readDeployments(f.dir);
+      expect(read.state === "present" && read.active?.["environment"]).toBe("staging");
+      const before = bytesAt(ledgerPath(f.dir));
+      const key = bytesAt(keyPath(f.dir));
+      const out = await runDaemonCommand(["restart", "--no-preflight"], f.opts);
+      expect(out.exitCode).not.toBe(0);
+      expect(out.lines[0]).toStartWith("daemon-fixture: not restarted, it keeps running");
+      expect(out.lines.join("\n")).toContain(
+        'This build names no spec revision, so an approval for "prod" can\'t bind to it.',
+      );
+      expect(child?.signals).toEqual([]);
+      expect(f.ops.children).toHaveLength(1);
+      expect(bytesAt(ledgerPath(f.dir))).toBe(before);
+      expect(bytesAt(keyPath(f.dir))).toBe(key);
+    } finally {
+      f.cleanup();
+    }
+  });
+});
+
+// --- the operator record at every terminal entry point ----------------------
+
+describe("a disabled harness is refused at each terminal entry point and spawns nothing", () => {
+  test("a restart of a live daemon exits 38, and the daemon keeps running, never signalled", async () => {
+    const f = fixture();
+    try {
+      expect((await runDaemonCommand(["start", "--no-preflight"], f.opts)).exitCode).toBe(0);
+      const child = f.ops.last();
+      expect((await runDaemonCommand(["disable"], f.opts)).exitCode).toBe(0);
+      const out = await runDaemonCommand(["restart", "--no-preflight"], f.opts);
+      expect(out.exitCode).toBe(38);
+      expect(out.lines[0]).toStartWith("daemon-fixture: not restarted, it keeps running — ");
+      expect(out.lines[0]).toContain("crewhaus daemon enable");
+      expect(child?.signals).toEqual([]);
+      expect(f.ops.children).toHaveLength(1);
+      expect(f.ops.isAlive(child?.pid as number)).toBe(true);
+      const restart = receiptsOf(f.dir).find((r) => r["kind"] === "controls.restart");
+      expect((restart?.["outcome"] as { code?: string } | undefined)?.code).toBe("disabled");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a group start and a group restart refuse a disabled member and start the others", async () => {
+    const g = groupFixture();
+    try {
+      const off = g.dirOf("archivist");
+      expect((await runDaemonCommand(["disable", off], g.opts)).exitCode).toBe(0);
+      const started = await runDaemonCommand(
+        ["start", "--group", "crew", "--no-preflight"],
+        g.opts,
+      );
+      expect(started.exitCode).not.toBe(0);
+      const text = started.lines.join("\n");
+      // The disabled member is refused for being disabled, not skipped as not adopted.
+      expect(text).toContain("crewhaus daemon enable");
+      expect(text).not.toContain("not adopted on this machine");
+      expect(g.spawnedNames()).toEqual(["secretary", "chief"]);
+
+      const restarted = await runDaemonCommand(
+        ["restart", "--group", "crew", "--no-preflight"],
+        g.opts,
+      );
+      expect(restarted.lines.join("\n")).toContain("crewhaus daemon enable");
+      expect(g.spawnedNames().filter((n) => n === "archivist")).toEqual([]);
+    } finally {
+      g.cleanup();
     }
   });
 });

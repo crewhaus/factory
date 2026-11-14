@@ -17,15 +17,19 @@ export {
 } from "./decision-runtime";
 export {
   type DecisionActor,
+  type DecisionSupersedeAnswer,
   type Decisions,
   type DecisionsDeps,
   type DeferRequest,
+  type DerivedRule,
   type HarnessFound,
   type ResolveAnswer,
   type ResolveHooks,
   type ResolveRequest,
+  SECURITY_SETTINGS_PATHS,
   type SupersedeRequest,
   createDecisions,
+  governedAncestorOf,
   harnessForSessionRoot,
   principalOfActor,
   settingsWriteClass,
@@ -54,6 +58,7 @@ export {
   revokeStandingRule,
   ruleDaysProblem,
   ruleEnd,
+  ruleEndProblem,
   standingPatternFor,
   widenedPatternProblem,
 } from "./rules";

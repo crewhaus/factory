@@ -77,6 +77,7 @@ import {
   ensureRunDir,
   homeCrewhausArgv,
   isReadOnlyJob,
+  operatorRefusal,
   processOpsChild,
   readManagerSettings,
   readRunfile,
@@ -91,6 +92,7 @@ import {
 import { type PreflightItem, workspaceItems } from "@crewhaus/preflight";
 import { knownControlPort, parseControlPort } from "./control-client";
 import { mergedSpawnEnv } from "./env-file";
+import { HttpError } from "./http";
 import { currentCommand } from "./receipts";
 import { DEV_JOB_KIND, MCP_JOB_KIND } from "./runtime-ops";
 
@@ -183,15 +185,58 @@ export type HomeJobInput = SubmitInput & {
 /** The job queue as Home submits to it: every submission is checked first. */
 export type HomeJobQueue = Omit<JobQueue, "submit"> & {
   /**
-   * Enqueue a job, after the check a start makes of where it runs: a directory that holds
-   * the home directory needs `workspace.holds-home` in `acknowledge`, for this job, or
-   * {@link JobRefusedError} is thrown and nothing is enqueued. The acknowledgement is not
+   * Enqueue a job, after the checks a start makes of where it runs. A harness its operator
+   * disabled runs no job that runs its own code or runs or serves its spec
+   * ({@link jobRunsSpec}): an `HttpError` 409 `disabled` is thrown and nothing is enqueued.
+   * A directory that holds the home directory needs `workspace.holds-home` in
+   * `acknowledge`, for this job, or {@link JobRefusedError} is thrown and nothing is
+   * enqueued. The acknowledgement is not
    * kept: the job's record carries no trace of it, and the next job asks again.
    */
   submit(input: HomeJobInput): JobRecord;
-  /** Throw the refusal {@link HomeJobQueue.submit} would for these fields, enqueuing nothing. */
-  check(input: Pick<HomeJobInput, "harnessDir" | "acknowledge">): void;
+  /** Throw the refusal {@link HomeJobQueue.submit} would for these fields, enqueuing nothing.
+   *  Without `argv`, the job's verb is not known yet, so only the checks every job gets run. */
+  check(
+    input: Pick<HomeJobInput, "harnessDir" | "acknowledge"> & { readonly argv?: readonly string[] },
+  ): void;
 };
+
+/** The `eval` read verbs, which run no spec. */
+const EVAL_READ_VERBS: ReadonlySet<string> = new Set([
+  "coverage",
+  "plan",
+  "leaderboard",
+  "history",
+  "baseline",
+  "baselines",
+  "diff",
+]);
+
+/**
+ * Whether a job's `crewhaus` argv runs or serves the harness's spec: the verbs the CLI's
+ * entry gate checks (`serve`, `dev`, `run`, `optimize`, `eval` but its read verbs,
+ * `flywheel run`, `dream` but `status` and `init`).
+ *
+ * First consumer: {@link createProcessLayer}'s job check.
+ */
+export function jobRunsSpec(argv: readonly string[]): boolean {
+  const [verb, sub = ""] = argv;
+  switch (verb) {
+    case "serve":
+    case "dev":
+    case "run":
+    case "optimize":
+      return true;
+    case "eval":
+      return !EVAL_READ_VERBS.has(sub);
+    case "flywheel":
+      return sub === "run";
+    case "dream":
+      return sub !== "status" && sub !== "init";
+    default:
+      return false;
+  }
+}
 
 /** A Home job refused before it was enqueued, carrying the preflight item that refused it. */
 export class JobRefusedError extends Error {
@@ -418,7 +463,24 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
     ...(options.jobConcurrency !== undefined ? { concurrency: options.jobConcurrency } : {}),
   });
   // The env `/proc/start`'s gate checks; an empty directory is the server's own.
-  const check: HomeJobQueue["check"] = ({ harnessDir, acknowledge }) => {
+  const check: HomeJobQueue["check"] = ({ harnessDir, acknowledge, argv }) => {
+    // A disabled harness runs no job that runs its own code (every job of an adopted
+    // harness, which runs its own `crewhaus`) or runs or serves its spec.
+    if (harnessDir !== "") {
+      const entry = options.registry.list().find((row) => row.dir === harnessDir);
+      const ownCode = entry !== undefined && runsOwnCode(entry);
+      if (ownCode || (argv !== undefined && jobRunsSpec(argv))) {
+        const disabled = operatorRefusal(harnessDir);
+        if (disabled !== undefined && disabled.reason === "disabled") {
+          throw new HttpError(409, disabled.message, {
+            ok: false,
+            reason: "disabled",
+            message: disabled.message,
+            verb: "crewhaus daemon enable",
+          });
+        }
+      }
+    }
     const acknowledged = new Set(acknowledge ?? []);
     const refused = workspaceItems(harnessDir, mergedSpawnEnv(options.env, harnessDir).env).find(
       (item) => item.id === "workspace.holds-home" && !acknowledged.has(item.id),
@@ -431,6 +493,7 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
     submit: ({ acknowledge, ...input }) => {
       check({
         harnessDir: input.harnessDir,
+        argv: input.argv,
         ...(acknowledge !== undefined ? { acknowledge } : {}),
       });
       return queue.submit(input);

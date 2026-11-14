@@ -145,16 +145,23 @@ export const NARROW_WORDS: Readonly<Record<string, string>> = {
 
 /**
  * The authorizer a decision on a harness uses: the projection's, or, with no harness,
- * single-owner mode recording the principal when there is one.
+ * single-owner mode recording the principal when there is one. A service principal
+ * decides `operator` requests only, with a harness or without one.
  */
 export function authorizerFor(
   harnessDir: string | undefined,
   who: ApprovalPrincipal,
   deps: Judged,
 ): ApprovalAuthorizer {
-  return harnessDir !== undefined
-    ? principalAuthorizer(harnessDir, who, { reader: deps.approvers, now: deps.now })
-    : () => (who.principal !== undefined ? { ok: true, principal: who.principal } : { ok: true });
+  if (harnessDir !== undefined) {
+    return principalAuthorizer(harnessDir, who, { reader: deps.approvers, now: deps.now });
+  }
+  return ({ requiredClass }) => {
+    if (who.service === true && requiredClass !== "operator") {
+      return { ok: false, reason: needsClassReason(requiredClass) };
+    }
+    return who.principal !== undefined ? { ok: true, principal: who.principal } : { ok: true };
+  };
 }
 
 /**

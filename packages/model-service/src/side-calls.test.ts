@@ -283,6 +283,30 @@ describe("guide (§7.4)", () => {
     expect(responses()[0]?.turnNumber).toBe(3);
   });
 
+  test("its request and response share one span on the parent bus, nested under the turn the context names", async () => {
+    const opus = textAdapter("plan");
+    const guide = buildGuideSideCall(
+      { ...POOL, strategy: { guide: { model: STRONG, modelProfile: "strong" } } },
+      { _consultAdapters: new Map([[STRONG, opus]]) },
+    );
+    const { parent, seen } = watch();
+    const turn = parent.eventBus.envelope();
+    await guide?.run({ ...ctxOf(parent), parentSpanId: turn.spanId });
+    const pair = seen.filter((e) => e.kind === "model_request" || e.kind === "model_response");
+    expect(pair.map((e) => e.kind)).toEqual(["model_request", "model_response"]);
+    expect(pair[0]?.spanId).toBe(pair[1]?.spanId as string);
+    for (const e of pair) expect(e.parentSpanId).toBe(turn.spanId);
+
+    // Without a span the pair still matches, under the bus's current span.
+    const plain = watch();
+    await guide?.run(ctxOf(plain.parent));
+    const plainPair = plain.seen.filter(
+      (e) => e.kind === "model_request" || e.kind === "model_response",
+    );
+    expect(plainPair[0]?.spanId).toBe(plainPair[1]?.spanId as string);
+    expect(plainPair[0]?.parentSpanId).toBe(plain.parent.eventBus.rootSpanId);
+  });
+
   test("guide.budget_usd caps the guide's own spend: past it the call is skipped with a cause", async () => {
     const haiku = textAdapter("plan");
     const guide = buildGuideSideCall(

@@ -480,6 +480,7 @@ export const approverProjection = z
     ),
     links: z.array(z.object({ external: externalSubject, principal: principalId }).passthrough()),
     homeUrl: z.string().optional(),
+    accessRoot: z.string().optional(),
   })
   .passthrough();
 
