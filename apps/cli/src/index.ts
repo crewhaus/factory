@@ -1334,7 +1334,12 @@ import {
 // Item 3 (G32) — `plugins:` activation resolution for `run`/`dev` + the
 // `--plugins` override. Pure name resolution (unit-testable); the real
 // `activatePlugins` / dev spec-override wiring is below in this entry file.
-import { parsePluginsFlag, resolvePluginNames } from "./plugin-activation";
+import {
+  parsePluginsFlag,
+  pluginEntryNames,
+  resolvePluginNames,
+  withPluginsOverride,
+} from "./plugin-activation";
 // Item 4 (§59) — `crewhaus export claude-plugin` helpers: author / out-dir
 // resolution, the harness's authored `.crewhaus/` skills + commands (item 14),
 // and the post-emit smoke check (the emitted plugin.json / .mcp.json parse).
@@ -4682,7 +4687,7 @@ async function runRunCli(
     pluginSkillDirs = activated.skillDirs;
     pluginTools = activated.tools;
     process.stdout.write(
-      `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
+      `[plugins] ${activated.loaded.length} activated: ${pluginEntryNames(pluginNames)}\n`,
     );
   }
 
@@ -5486,9 +5491,7 @@ function devCompileAndEmit(
   // an empty override serializes `plugins: []`, which lowers to "activate none".
   if (pluginsOverride !== undefined) {
     try {
-      const doc = parseDocument(yamlText);
-      doc.set("plugins", [...pluginsOverride]);
-      yamlText = doc.toString();
+      yamlText = withPluginsOverride(yamlText, pluginsOverride);
     } catch (err) {
       return { ok: false, error: `--plugins override failed: ${(err as Error).message}` };
     }
@@ -6046,7 +6049,7 @@ async function buildServeRuntime(
     pluginSkillDirs = activated.skillDirs;
     pluginTools = activated.tools;
     process.stdout.write(
-      `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
+      `[plugins] ${activated.loaded.length} activated: ${pluginEntryNames(pluginNames)}\n`,
     );
   }
 

@@ -30,6 +30,14 @@ nothing about named lanes is the same bug as above.
 `{name, tools}` entry, so that form cannot move a byte of a spec that lists plain names.
 `plugins-entries.test.ts` holds it. Regenerate it under the same rule as the absent corpus.
 
+## The plugins entry form
+
+`plugins-grants.present.digests.json` pins what a `{name, tools}` entry compiles to: the same two
+specs, each with a name and then an entry whose tools arrive out of order with a repeat. The entry
+lowers with `tools` sorted and de-duplicated, and the emitted `names:` carries it as JSON beside the
+name. It pins a feature that is present, so a deliberate change to how entries are emitted moves it:
+regenerate it in that pull request and add a delta note below.
+
 ## When to regenerate
 
 Only for a deliberate emitter change, and never to quiet a failure you cannot explain. A pull request
@@ -71,3 +79,9 @@ does not. No other digest moves.
 sessionRouter})` after its handshake, capped read, `verify()` and `parseInbound`, both from
 `@crewhaus/channel-adapter-base`; it imports nothing from `@crewhaus/permission-engine`. No other
 digest moves.
+
+**Plugins entry form — new pins only.** `plugins:` takes a `{name, tools}` entry beside a plugin
+name on cli and channel. `plugins-strings.digests.json` was generated before the entry form existed
+and does not move; `plugins-grants.present.digests.json` is new. The emitters render `names:` as the
+JSON of the lowered list, as before, so a name list compiles to the same bytes. No other digest
+moves.

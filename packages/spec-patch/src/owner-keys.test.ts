@@ -10,6 +10,7 @@ import {
   HUMAN_OWNED_PATHS,
   OPTIMIZER_REFUSED_LEAVES,
   OPTIMIZER_REFUSED_ROOTS,
+  SECURITY_SURFACES,
   SpecPatchError,
   applySpecEdits,
   humanOwnedReason,
@@ -60,6 +61,7 @@ describe("the lists derive from the table", () => {
       ["intent"],
       ["evaluation", "protected"],
       ["provability", "protected"],
+      ["plugins"],
     ]);
     expect(Object.isFrozen(OPTIMIZER_REFUSED_ROOTS)).toBe(true);
   });
@@ -200,5 +202,52 @@ describe("applySpecEdits", () => {
     expect(yaml).toContain("# and this note");
     expect(spec.intent?.purpose).toBe("Keep it fast.");
     expect(parseSpec(yaml).intent?.purpose).toBe("Keep it fast.");
+  });
+});
+
+describe("plugins: is the owner's (#522)", () => {
+  const PLUGINS = DELTA_090_KEYS.find((key) => key.pattern.join(".") === "plugins");
+  const REASON = "what a plugin may load and drive unchecked is the owner's decision";
+
+  test("the row: root, refused, a security surface, with its reason", () => {
+    expect(PLUGINS).toEqual({
+      pattern: ["plugins"],
+      root: true,
+      refused: true,
+      security: true,
+      reason: REASON,
+      since: "0.9.0",
+    });
+  });
+
+  for (const target of ["cli", "channel"] as const) {
+    test(`${target}: validatePatch refuses the list and an entry's tools with the row's reason`, () => {
+      const spec = { target } as Spec;
+      for (const path of [["plugins"], ["plugins", "0", "tools"]]) {
+        let message = "";
+        try {
+          validatePatch(spec, { target, path, op: "replace", value: [] });
+        } catch (err) {
+          message = (err as Error).message;
+        }
+        expect(message).toContain(REASON);
+        expect(message).toContain("OPTIMIZER_REFUSED_ROOTS");
+      }
+    });
+  }
+
+  test("humanOwnedReason answers for a leaf deep inside an entry", () => {
+    expect(humanOwnedReason(["plugins", 0, "tools", 0])).toBe(REASON);
+    expect(humanOwnedReason(["plugins"])).toBe(REASON);
+  });
+
+  test("SECURITY_SURFACES has exactly one plugins row, the derived one", () => {
+    const rows = SECURITY_SURFACES.filter((row) => row.prefix.join(".") === "plugins");
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.reason).toBe(REASON);
+  });
+
+  test("a graph node called plugins stays tunable", () => {
+    expect(humanOwnedReason(["nodes", "plugins", "instructions"])).toBeUndefined();
   });
 });

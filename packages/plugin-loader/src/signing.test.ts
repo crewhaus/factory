@@ -270,6 +270,34 @@ describe("a signed notAfter ends a manifest (C108)", () => {
   });
 });
 
+describe("a signed integration section (#522)", () => {
+  const integration = {
+    protocol: "crewhaus.hangar.v1",
+    events: ["run"],
+    data: { reads: ["run.lifecycle"] },
+  } as PluginManifest["integration"];
+
+  test("a manifest signed with it loads as signed", async () => {
+    const code = "export default {};\n";
+    const path = install(code, { entrypointDigest: digestOf(code), integration });
+    expect((await loader().loader.load(path)).signed).toBe(true);
+  });
+
+  test("what it asks to read is signed: widening it after signing is refused as unverified", async () => {
+    const code = "export default {};\n";
+    const path = install(code, { entrypointDigest: digestOf(code), integration });
+    const m = JSON.parse(readFileSync(path, "utf8"));
+    writeFileSync(
+      path,
+      JSON.stringify({
+        ...m,
+        integration: { ...m.integration, data: { reads: ["run.lifecycle", "run.trace"] } },
+      }),
+    );
+    await expect(loader().loader.load(path)).rejects.toThrow(/signature does not verify/);
+  });
+});
+
 describe("where a signed plugin's code is staged (C108)", () => {
   /**
    * A package another local user planted in the shared temp directory, and

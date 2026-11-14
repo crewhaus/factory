@@ -1,6 +1,7 @@
 /**
  * Rewrites `absent-corpus.digests.json`, `schedule-object.digests.json`,
- * `schedule-lanes.present.digests.json` and `plugins-strings.digests.json`. Run it only for a deliberate emitter
+ * `schedule-lanes.present.digests.json`, `plugins-strings.digests.json` and
+ * `plugins-grants.present.digests.json`. Run it only for a deliberate emitter
  * change, and append a delta note to this directory's README:
  *
  *   bun packages/compiler/src/__fixtures__/delta-090/regenerate.ts
@@ -9,7 +10,7 @@ import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { ABSENT_CORPUS } from "../../absent-corpus";
 import { compile } from "../../index";
-import { PLUGINS_STRINGS_CORPUS } from "../../plugins-corpus";
+import { PLUGINS_GRANTS_CORPUS, PLUGINS_STRINGS_CORPUS } from "../../plugins-corpus";
 import { SCHEDULE_LANES_CORPUS, SCHEDULE_OBJECT_CORPUS } from "../../schedule-corpus";
 
 /** The date the corpus compiles at, so the model-sunset check cannot move a digest. */
@@ -45,4 +46,5 @@ if (import.meta.main) {
   write("schedule-object.digests.json", SCHEDULE_OBJECT_CORPUS);
   write("schedule-lanes.present.digests.json", SCHEDULE_LANES_CORPUS);
   write("plugins-strings.digests.json", PLUGINS_STRINGS_CORPUS);
+  write("plugins-grants.present.digests.json", PLUGINS_GRANTS_CORPUS);
 }

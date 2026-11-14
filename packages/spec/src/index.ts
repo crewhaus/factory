@@ -10,9 +10,11 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { DELTA_090_ISSUES, type SpecAddIssue } from "./blocks/delta-090";
 import { intentBlock } from "./blocks/intent";
+import { pluginsBlock } from "./blocks/plugins";
 import { scheduleBlockFrom } from "./blocks/schedule";
 
 export { DELTA_090_ISSUES, type SpecAddIssue };
+export { PLUGIN_ENTRY_TOOL_NAME_PATTERN } from "./blocks/plugins";
 
 // SECURITY (codegen-injection backstop, #147/#148): spec/role/node/step names
 // flow verbatim into generated source across ~14 emitters — `//` and `/* */`
@@ -2915,18 +2917,6 @@ const exposeBlock = z
   })
   .strict()
   .optional();
-
-/**
- * Item 3 (G32) — the `plugins:` list: names of installed marketplace plugins
- * whose contributions (tools / channels / models / graders / emitters, plus
- * skill dirs) this bundle loads at boot. Each entry is a plugin NAME resolved
- * against the pinned `plugin-registry` (the Ed25519 supply chain guards
- * install; this wires the previously-missing load path). Order is honoured
- * (load order). The `crewhaus run --plugins` flag overrides the list. Carried
- * on the codegen-serving shapes whose boot path reads the registry (cli +
- * channel).
- */
-const pluginsBlock = z.array(z.string().min(1)).optional();
 
 const cliSchema = z
   .object({

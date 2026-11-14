@@ -69,4 +69,14 @@ export const DELTA_090_KEYS: ReadonlyArray<OwnerKey> = Object.freeze([
     reason: "a schedule sets when this harness runs and what it spends; a person changes it",
     since: "0.9.0",
   } as const),
+  // Both forms of `plugins:` (#522): which plugins load, and which host tools
+  // each may drive without the permission engine asking.
+  Object.freeze({
+    pattern: Object.freeze(["plugins"]),
+    root: true,
+    refused: true,
+    security: true,
+    reason: "what a plugin may load and drive unchecked is the owner's decision",
+    since: "0.9.0",
+  } as const),
 ]);

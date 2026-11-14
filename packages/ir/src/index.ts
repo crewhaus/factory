@@ -3,6 +3,7 @@
  * In the slice, IR shape mirrors the spec; later passes (ir-passes module)
  * will perform optimization and target-specific lowering.
  */
+import type { IrPluginEntry } from "./plugins";
 import type { IrScheduleLane } from "./schedule-lanes";
 
 export type IrPermissionRule = {
@@ -1510,9 +1511,10 @@ export type IrV0 = {
   /** Item 1 (G30) — MCP-server projection config. Present when the spec
    *  declares `expose.mcp`; absent otherwise. */
   readonly expose?: IrExpose;
-  /** Item 3 (G32) — marketplace plugin names loaded at boot (`plugins:`).
-   *  Present (non-empty) only when the spec declares them; load order. */
-  readonly plugins?: readonly string[];
+  /** Item 3 (G32) — marketplace plugins loaded at boot (`plugins:`), as names
+   *  or `{name, tools}` entries (#522). Present (non-empty) only when the spec
+   *  declares them; load order. */
+  readonly plugins?: readonly IrPluginEntry[];
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -1924,9 +1926,10 @@ export type IrChannelV0 = {
   /** Item 1 (G30) — MCP-server projection config. Present when the spec
    *  declares `expose.mcp`; absent otherwise. */
   readonly expose?: IrExpose;
-  /** Item 3 (G32) — marketplace plugin names loaded at boot (`plugins:`).
-   *  Present (non-empty) only when the spec declares them; load order. */
-  readonly plugins?: readonly string[];
+  /** Item 3 (G32) — marketplace plugins loaded at boot (`plugins:`), as names
+   *  or `{name, tools}` entries (#522). Present (non-empty) only when the spec
+   *  declares them; load order. */
+  readonly plugins?: readonly IrPluginEntry[];
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -2844,6 +2847,9 @@ export type Bundle = {
 
 // Named schedule lanes (#514). See ./schedule-lanes.ts.
 export type { IrScheduleLane } from "./schedule-lanes";
+
+// `plugins:` entries (#522). See ./plugins.ts.
+export type { IrPluginEntry, IrPluginGrant } from "./plugins";
 
 // Generated-bundle README renderer (item 42) — pure functions over the IR,
 // shared by every target emitter. See ./readme.ts for the module docs.

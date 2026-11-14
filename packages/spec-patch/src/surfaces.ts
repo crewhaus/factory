@@ -76,7 +76,6 @@ export const SECURITY_SURFACES: ReadonlyArray<{
     reason:
       "watch-me is a consent + data-plane posture; the observer is never tuned by the loop it observes",
   },
-  { prefix: ["plugins"], reason: "plugins load third-party code into the agent at boot" },
   {
     prefix: ["expose"],
     reason: "expose publishes this bundle as an MCP server other clients can call",

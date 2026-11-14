@@ -26,3 +26,19 @@ function withEach(block: string, label: string): Record<string, string> {
 export const PLUGINS_STRINGS_CORPUS: Readonly<Record<string, string>> = Object.freeze(
   withEach(NAME_LIST, "strings"),
 );
+
+/**
+ * A name, then a `{name, tools}` entry whose tools arrive out of order with a
+ * repeat: the entry lowers with `tools` sorted and de-duplicated, and the
+ * emitted `names:` carries it as JSON beside the name.
+ */
+const MIXED_LIST = `plugins:
+  - notes
+  - name: weather-pane
+    tools: [Read, Bash, Read]
+`;
+
+/** cli and channel, each with the mixed list above. */
+export const PLUGINS_GRANTS_CORPUS: Readonly<Record<string, string>> = Object.freeze(
+  withEach(MIXED_LIST, "grants"),
+);
