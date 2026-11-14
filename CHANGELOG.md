@@ -154,10 +154,11 @@ these on: they reach every harness that uses what each one names.
   cannot be read, the project memory files the runtime loads there,
   `AGENTS.md`, `CLAUDE.md`, `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`,
   exactly those files, and the skill directories `.crewhaus/skills` and
-  `~/.crewhaus/skills`, which an operator edits; and Hangar's directory and
+  `~/.crewhaus/skills`, which an operator edits; Hangar's directory and
   registry:
   `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always, and wherever the
-  run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT` puts them. The floor
+  run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT` puts them; and the
+  user-level hooks file `~/.crewhaus/settings.json`, exactly that file. The floor
   also reads the directory a call keeps a tool's store in. In a working directory
   that holds `crewhaus.yaml` or `crewhaus.yml`, it also covers `dist`, `build` and
   `node_modules`; in a compiled non-interactive bundle running from that
@@ -530,6 +531,63 @@ these on: they reach every harness that uses what each one names.
   `propose/<id>` after it, and stops before any git step when the record
   cannot be written.
 
+- **The raw inspector shows a harness's identity file as its fingerprint and
+  key presence only**, by any path or link that leads to it. Home's raw file
+  browser, a store entry and a skill's `SKILL.md` answer
+  `.crewhaus/identity.json`, at any depth and in any letter case, as its
+  fingerprint and whether each key is present, as the identity store does.
+
+- **The raw inspector refuses a nested harness's run, audit and key files, and
+  paths inside another registered harness.** The inspector's exclusions under
+  `.crewhaus/` apply at every `.crewhaus` in a path, so
+  `apps/sub/.crewhaus/run/control-token` is refused like the harness's own. A
+  path whose real place is inside another harness registered with Home is
+  refused and left out of listings; that harness's own inspector reads it.
+
+- **Only someone who can manage Home's registry sees scan-root paths, folder
+  suggestions and the demo source in onboarding.** For anyone else,
+  `GET /api/onboarding` and `GET /api/registry/scan-roots` answer no
+  suggestions, no scan roots, an unknown scan-root count (`null`), no demo
+  source, and a note saying who to ask.
+
+- **Starting Home from code with sign-in off fails when a trusted proxy is set,
+  anyone other than the owner has access, or it would listen beyond this
+  computer**, as `crewhaus hangar --no-auth` does: `startHangarServer` with
+  `noAuth` throws before it binds anything unless it listens on a loopback
+  address only.
+
+- **Home's settings editor reads and replaces only a harness's own
+  `.crewhaus/settings.json`.** `PUT /api/h/:id/inspect/settings` refuses a
+  settings file that is a link or whose real place is elsewhere (409, edit it
+  in the harness's own directory), and one that an inspector exclusion or
+  another registered harness holds (403), before it shows or writes anything.
+
+- **Trace spans nest from turn to tool to check.** A turn's model calls and
+  tool calls nest under the turn's span, and each tool call's checks
+  (`permission_decision`, `hook_fired`, `approval_requested`) nest under that
+  call's own span, also when calls run at once. A turn's start and end share
+  one span id. A sub-agent's run nests under the Task call that started it,
+  and side calls under the turn or the Consult call. A retried model call is
+  a sibling of the call it retries and names it: `retryOf` on its
+  `model_request`, `crewhaus.retry_of` on its OpenTelemetry span. OTLP traces
+  change shape, so a dashboard that expects a flat tree sees depth. Every line
+  a run writes to its session log carries `span`, the span it belongs to, and
+  each span a run closes writes a `span_closed` line: its kind, parent, start,
+  duration and how it ended. `CREWHAUS_RUN_STAMPS=0` drops the `span_closed`
+  lines and the `span` keys; the nesting stays.
+
+- **Every check writes a `verdict` line that names what it judged.** Each
+  permission, justification, egress, post-tool, hook, approval, rate-limit,
+  loop, evaluation and provability decision writes one `verdict` line to the
+  session log, bound to the run, the check's span, the tool call (its id and
+  its number in the run) and the keyed action digest the approvals decision
+  log uses for the same action. The line holds outcome codes, rule ids and
+  ids: never tool input or model text, and never a judge's or a hook's own
+  words. `permission_decision`, `hook_fired` and `approval_requested` carry
+  `toolUseId`. The `permission_justification_evaluated` and `egress_decision`
+  audit records carry `runId`, `sessionId`, `toolUseId` and `actionDigest`.
+  `CREWHAUS_RUN_STAMPS=0` drops the `verdict` lines.
+
 - **`crewhaus retire` ends what a harness could still do, and refuses while
   its daemon runs.** With the daemon running, `crewhaus retire` stops nothing
   and says so; `--stop` stops it first. Before the backup it leaves the
@@ -579,6 +637,31 @@ these on: they reach every harness that uses what each one names.
 - **Slack approval clicks are answered once the decision is recorded.** The
   card update, the follow-up and the continued reply happen after the answer.
   Recompile a daemon to pick this up.
+
+- **A standing rule's pattern is printable, and a damaged rule record loads
+  only the allows it names.** `crewhaus permissions suggest`, the
+  `PermissionsSuggest` tool, `crewhaus approvals grant --always` and a wider
+  `--pattern` never make a rule whose pattern holds a control or
+  bidirectional-text character, a multi-line command's newline included (the
+  value "cannot be written as a rule"). A tool whose approved calls hold such
+  a value gets no allow proposal from `crewhaus permissions suggest` or
+  `PermissionsSuggest`, neither for that value nor for the whole tool, and
+  the report names the tool. `crewhaus approvals` prints any such pattern it
+  finds as an escaped string. While the harness's
+  standing-rule record (`standing-rules.jsonl` under `.crewhaus/run/control/`)
+  cannot be read in full, the `alwaysAllow` entries of
+  `.crewhaus/settings.json` load only where a readable row names them; denies
+  and asks always load, and a `.crewhaus` kept elsewhere through a link, which
+  holds no record, loads them as written.
+
+- **A graph node's upstream state is labelled as a workflow step's.** The
+  input a graph node receives — the run's state with earlier nodes' outputs,
+  and a retried node's judge feedback — is recorded with `source: "workflow"`
+  on its `user_message` line. In a loop that keeps a requirements ledger, an
+  evicted copy carries the same `source` on its `context_evicted` line and is
+  labelled `(workflow step)` in the ledger and in the compaction summarizer's
+  anchor: presented as written by an earlier step, with no more authority than
+  that source. The run's own input, carried in that state, is labelled with it.
 
 ## [0.8.2] - 2026-11-12
 

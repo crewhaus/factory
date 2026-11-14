@@ -203,6 +203,29 @@ describe("buildConsultRunner — the nested single-turn side call", () => {
     expect(parent.turnNumber).toBe(4);
   });
 
+  test("the side call nests under the Consult tool call's span the bridge names", async () => {
+    const opus = textAdapter("Consulted.");
+    const wired = wireModels(
+      { modelPool: DIRECTED_POOL },
+      { sessionRootDir: SESSION_ROOT, _consultAdapters: new Map([["claude-opus-4-1", opus]]) },
+    );
+    const consult = wired.hybridTools?.find((t) => t.name === "Consult");
+    const parent = createRunContext();
+    const seen: TraceEvent[] = [];
+    parent.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+    const toolCall = parent.eventBus.envelope();
+    await consult?.execute(
+      { question: "q" },
+      { bridge: { runContext: parent, parentSpanId: toolCall.spanId } },
+    );
+    const pair = seen.filter((e) => e.kind === "model_request" || e.kind === "model_response");
+    expect(pair).toHaveLength(2);
+    expect(pair[0]?.spanId).toBe(pair[1]?.spanId as string);
+    for (const e of pair) expect(e.parentSpanId).toBe(toolCall.spanId);
+  });
+
   test("end to end through wireModels: the Consult reply is classified at origin consult and lineage-tagged", async () => {
     const opus = textAdapter("A clean consulted reply about shipping.");
     const wired = wireModels(

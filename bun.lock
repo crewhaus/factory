@@ -1953,6 +1953,7 @@
       "devDependencies": {
         "@crewhaus/graph-engine": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-plan": "workspace:*",
         "@crewhaus/tool-state": "workspace:*",
       },

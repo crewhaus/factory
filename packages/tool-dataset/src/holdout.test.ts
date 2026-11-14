@@ -1,11 +1,12 @@
 /**
  * Agent dataset tools stay out of the holdout: `DatasetInspect` counts it and
  * checks its hashes but returns no id and no PII location from it, `DatasetLint`
- * leaves it out of the linted set, and `DatasetPut` writes no holdout itself and
- * carries a previous version's holdout forward without reading it back.
+ * leaves it out of the linted set, and `DatasetPut` writes no holdout itself,
+ * carries a previous version's holdout forward without reading it back, and
+ * answers the same whether or not an incoming id is held out.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createFileBackedRegistry } from "@crewhaus/dataset-registry";
@@ -219,7 +220,7 @@ describe("a case held out by a later version", () => {
     expect((JSON.parse(out) as Json).holdout).toMatchObject({ count: 1, excluded: true });
   });
 
-  test("DatasetPut based on the version it was cut from carries the newest holdout, and never puts it back", async () => {
+  test("DatasetPut based on the version it was cut from carries the newest holdout as it was, and keeps the caller's sample beside it", async () => {
     await seedCut();
     const out = await run(datasetPut, {
       name: "cases",
@@ -230,18 +231,126 @@ describe("a case held out by a later version", () => {
         { id: LATER_HELD, input: `my key is ${SECRET}` },
       ],
     });
-    expect(out).not.toContain(LATER_HELD);
     const result = JSON.parse(out) as Json;
     expect(result.wrote).toBe(true);
-    expect(result.holdout).toMatchObject({ count: 1, carriedForward: true, incomingLeftOut: 1 });
+    expect(result.holdout).toEqual({
+      count: 1,
+      carriedForward: true,
+      note: "the dataset's holdout is carried as it was — its rows are never returned to an agent",
+    });
+    expect(result.sampleCount).toBe(3);
     expect(result.stability.droppedCount).toBe(0);
+    const v2 = JSON.parse(
+      readFileSync(path.join(tmp, REGISTRY, "cases", "v2.json"), "utf8"),
+    ) as Json;
     const v3 = JSON.parse(
       readFileSync(path.join(tmp, REGISTRY, "cases", "v3.json"), "utf8"),
     ) as Json;
-    expect(v3.splits.holdout.map((s: Json) => s.id)).toEqual([LATER_HELD]);
-    const others = [...v3.splits.train, ...v3.splits.dev, ...(v3.splits.test ?? [])].map(
-      (s: Json) => s.id,
-    );
-    expect(others).not.toContain(LATER_HELD);
+    expect(v3.splits.holdout).toEqual(v2.splits.holdout);
+    const others = [...v3.splits.train, ...v3.splits.dev, ...(v3.splits.test ?? [])] as Json[];
+    expect(others.map((s) => s.id)).not.toContain(LATER_HELD);
+    expect(others.filter((s) => s.input === `my key is ${SECRET}`)).toHaveLength(1);
+  });
+});
+
+describe("DatasetPut answers the same whether or not an incoming id is held out", () => {
+  const X = "case-x";
+  const Z = "case-z";
+  const PUT = { id: X, input: `my key is ${SECRET}`, expected_output: "y" };
+
+  /** v1 lists `held` in train beside three other cases; v2 holds it out. */
+  async function seedHolding(held: string): Promise<void> {
+    const reg = createFileBackedRegistry({ rootDir: path.join(process.cwd(), REGISTRY) });
+    const rows = [
+      { id: "a-1", input: "one" },
+      { id: "a-2", input: "two" },
+    ];
+    await reg.put({
+      name: "cases",
+      version: "v1",
+      splits: {
+        train: [...rows, { id: held, input: "held case" }],
+        dev: [{ id: "d-1", input: "three" }],
+        test: [{ id: "t-1", input: "four" }],
+      },
+    });
+    await reg.put({
+      name: "cases",
+      version: "v2",
+      splits: {
+        train: rows,
+        dev: [{ id: "d-1", input: "three" }],
+        test: [{ id: "t-1", input: "four" }],
+        holdout: [{ id: held, input: "held case" }],
+      },
+    });
+  }
+
+  /** Run `input` against a registry holding out `held`, in its own directory. */
+  async function inRegistry(held: string, inputs: unknown[]): Promise<Json[]> {
+    const dir = path.join(tmp, held);
+    mkdirSync(dir, { recursive: true });
+    process.chdir(dir);
+    try {
+      if (!existsSync(path.join(dir, REGISTRY))) await seedHolding(held);
+      const outs: Json[] = [];
+      for (const input of inputs) outs.push(JSON.parse(await run(datasetPut, input)) as Json);
+      return outs;
+    } finally {
+      process.chdir(tmp);
+    }
+  }
+
+  const without = (r: Json, ...keys: string[]): Json => {
+    const copy = { ...r };
+    for (const k of keys) delete copy[k];
+    return copy;
+  };
+
+  test("a dry run returns the same result for a held-out id as for an unknown one, apart from the hash", async () => {
+    const input = { name: "cases", samples: [PUT, { id: "n-1", input: "five" }], dryRun: true };
+    const [a] = await inRegistry(X, [input]);
+    const [b] = await inRegistry(Z, [input]);
+    expect(a.wrote).toBe(false);
+    expect(without(a, "datasetHash")).toEqual(without(b, "datasetHash"));
+    expect(a.pii.hits.map((h: Json) => h.sampleId)).toContain(X);
+  });
+
+  test("a write returns the same result for a held-out id as for an unknown one, apart from the hash and time", async () => {
+    const input = { name: "cases", samples: [PUT, { id: "n-1", input: "five" }] };
+    const [a] = await inRegistry(X, [input]);
+    const [b] = await inRegistry(Z, [input]);
+    expect(a.wrote).toBe(true);
+    expect(without(a, "datasetHash", "createdAt")).toEqual(without(b, "datasetHash", "createdAt"));
+  });
+
+  test("the written version keeps the holdout as it was and stores the caller's sample under another id", async () => {
+    const [a] = await inRegistry(X, [{ name: "cases", samples: [PUT] }]);
+    expect(a.wrote).toBe(true);
+    const at = (v: string): Json =>
+      JSON.parse(readFileSync(path.join(tmp, X, REGISTRY, "cases", `${v}.json`), "utf8")) as Json;
+    const v3 = at("v3");
+    expect(v3.splits.holdout).toEqual(at("v2").splits.holdout);
+    const others = [...v3.splits.train, ...v3.splits.dev, ...(v3.splits.test ?? [])] as Json[];
+    const mine = others.filter((s) => s.input === PUT.input);
+    expect(mine).toHaveLength(1);
+    expect(mine[0].id).not.toBe(X);
+    expect(v3.splits.holdout.map((s: Json) => s.id)).not.toContain(mine[0].id);
+    expect(mine[0].expected_output).toBe("y");
+  });
+
+  test("the dataset hash is the same on repeated calls and does not single out a held-out id", async () => {
+    const content = { input: `my key is ${SECRET}`, expected_output: "y" };
+    const pair = [
+      { name: "cases", split: "train", samples: [{ id: X, ...content }], dryRun: true },
+      { name: "cases", split: "train", samples: [{ id: `${X}~v3`, ...content }], dryRun: true },
+    ];
+    const [a1, a2] = await inRegistry(X, pair);
+    const [b1, b2] = await inRegistry(Z, pair);
+    expect(a1.datasetHash).not.toBe(a2.datasetHash);
+    expect(b1.datasetHash).not.toBe(b2.datasetHash);
+    const [again1, again2] = await inRegistry(X, [pair[0], pair[0]]);
+    expect(again1).toEqual(again2);
+    expect(again1).toEqual(a1);
   });
 });

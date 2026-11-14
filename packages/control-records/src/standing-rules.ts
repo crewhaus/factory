@@ -165,6 +165,16 @@ function withoutBookkeeping(row: LedgerRecord): Record<string, unknown> {
 const isText = (value: unknown): value is string => typeof value === "string" && value !== "";
 const isTime = (value: unknown): value is string =>
   typeof value === "string" && Number.isFinite(Date.parse(value));
+/**
+ * A time in the one form the writers write (`Date.prototype.toISOString`): a
+ * standing rule's and a request's times are shown to a person, so a value that
+ * merely parses (a date with a comment in it) is not one.
+ */
+const isInstant = (value: unknown): value is string => {
+  if (typeof value !== "string") return false;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) && new Date(ms).toISOString() === value;
+};
 const optional = (value: unknown, check: (v: unknown) => boolean): boolean =>
   value === undefined || check(value);
 
@@ -185,13 +195,13 @@ export function standingRuleOf(row: LedgerRecord): StandingRuleRow | undefined {
     isStoredActor(r["createdBy"]) &&
     (r["reason"] === "approval" || r["reason"] === "proposal") &&
     optional(r["policyRevision"], isText) &&
-    isTime(r["createdAt"]) &&
-    isTime(r["expiresAt"]) &&
+    isInstant(r["createdAt"]) &&
+    isInstant(r["expiresAt"]) &&
     optional(r["cmd"], (v) => isId("cmd", v)) &&
     (r["state"] === "active" || r["state"] === "revoked" || r["state"] === "expired") &&
-    optional(r["revokedAt"], isTime) &&
+    optional(r["revokedAt"], isInstant) &&
     optional(r["revokedBy"], isStoredActor) &&
-    optional(r["expiredAt"], isTime);
+    optional(r["expiredAt"], isInstant);
   return ok ? (r as StandingRuleRow) : undefined;
 }
 
@@ -210,8 +220,8 @@ export function proposalOf(row: LedgerRecord): ProposalRow | undefined {
   const ok =
     isId("dec", r["id"]) &&
     r["kind"] === "standing-rule-proposal" &&
-    isTime(r["createdAt"]) &&
-    isTime(r["expiresAt"]) &&
+    isInstant(r["createdAt"]) &&
+    isInstant(r["expiresAt"]) &&
     (DECISION_CLASSES as readonly unknown[]).includes(r["requiredClass"]) &&
     isId("appr", r["derivedFrom"]) &&
     isStoredActor(r["proposedBy"]) &&
@@ -219,10 +229,10 @@ export function proposalOf(row: LedgerRecord): ProposalRow | undefined {
     t["ruleKind"] === "allow" &&
     isText(t["tool"]) &&
     isText(t["pattern"]) &&
-    isTime(t["expiresAt"]) &&
+    isInstant(t["expiresAt"]) &&
     (r["state"] === "pending" || r["state"] === "granted" || r["state"] === "denied") &&
     optional(r["decision"], (v) => v === "grant" || v === "deny") &&
-    optional(r["decidedAt"], isTime) &&
+    optional(r["decidedAt"], isInstant) &&
     optional(r["decidedByPrincipal"], isStoredActor) &&
     optional(r["rule"], (v) => isId("rule", v));
   return ok ? (r as ProposalRow) : undefined;

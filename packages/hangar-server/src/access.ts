@@ -222,7 +222,8 @@ export type Caller = {
    * turned off: those act as the owner, for every core permission and no domain's.
    */
   readonly actor: AccessActor | null;
-  readonly via: AuthVia | "no-auth";
+  /** How the caller came in; `system` for Home's own background work ({@link systemAccess}). */
+  readonly via: AuthVia | "no-auth" | "system";
   /** For a scoped token: exactly what it may read. */
   readonly scoped?: ScopedGrant;
   /** A session a page on plain HTTP made for itself. */
@@ -588,7 +589,7 @@ export function withRequestAccess<T>(access: RequestAccess, fn: () => T): T {
   return requestScope.run(access, fn);
 }
 
-/** The current request's authority, or `undefined` outside one (boot, recovery). */
+/** The current request's authority, or `undefined` outside one. */
 export function currentRequestAccess(): RequestAccess | undefined {
   return requestScope.getStore();
 }
@@ -596,27 +597,106 @@ export function currentRequestAccess(): RequestAccess | undefined {
 /**
  * Whether the current request may read this harness: every enumeration a fleet fold makes
  * goes through it, so a count, a badge, a snippet or a total never includes a harness the
- * caller cannot read. Outside a request (boot, recovery) every harness is visible.
+ * caller cannot read. Outside a request, nothing is visible: Home's own background work
+ * runs under {@link systemAccess}.
  *
  * First consumers: the registry enumerations in `server.ts`.
  */
 export function visibleToRequest(harness: string): boolean {
-  return requestScope.getStore()?.canRead(harness) ?? true;
+  return requestScope.getStore()?.canRead(harness) ?? false;
 }
 
-/** Whether the current request may read this harness's content; `true` outside a request. */
+/** Whether the current request may read this harness's content; `false` outside a request. */
 export function contentVisibleToRequest(harness: string): boolean {
-  return requestScope.getStore()?.canReadContent(harness) ?? true;
+  return requestScope.getStore()?.canReadContent(harness) ?? false;
+}
+
+/**
+ * Whether the current request's caller holds `permission` on a harness, or on the whole
+ * Home. Outside a request, nothing is allowed.
+ *
+ * First consumers: the handlers in `server.ts` that act on several harnesses or escalate.
+ */
+export function requestAllows(permission: string, harness?: string): boolean {
+  const access = requestScope.getStore();
+  if (access === undefined) return false;
+  return access.authorize(permission, harness !== undefined ? { harness } : undefined).allow;
+}
+
+/** The permissions Home's own background work holds: reading, and nothing else. */
+const SYSTEM_READS: ReadonlySet<string> = new Set(["home.read", "h.read", "h.read.content"]);
+
+/**
+ * The authority one named piece of Home's own background work runs under (command recovery
+ * at boot, for one): it reads every registered harness and its content, and is refused
+ * every other permission, so it never writes or decides on its own authority. Its caller
+ * is the `sys:<name>` principal, never Home's own key. Items about people are withheld
+ * from it.
+ *
+ * First consumer: command recovery in `startHangarServer`.
+ */
+export function systemAccess(name: string): RequestAccess {
+  const principal = `sys:${name}`;
+  const caller: Caller = { principal, actor: { principal }, via: "system" };
+  return {
+    caller,
+    authorize: (permission) =>
+      SYSTEM_READS.has(permission)
+        ? { allow: true, grant: principal }
+        : { allow: false, needs: permission, role: null },
+    canRead: () => true,
+    canReadContent: () => true,
+    peopleAllowed: () => false,
+  };
 }
 
 /** The sensitivity an item carries when it is about people. */
 export const PEOPLE_SENSITIVITY = "people";
 
+/** How deep {@link withholdPeople} walks an answer; the top-level object is depth 1. */
+export const PEOPLE_WALK_DEPTH = 16;
+
+/**
+ * What stands in for a part of an answer nested deeper than {@link PEOPLE_WALK_DEPTH} that
+ * holds an item about people: the part is withheld whole, and the rest of the answer is sent.
+ */
+export const PEOPLE_TOO_DEEP = "[withheld: nested too deep to check for people]";
+
+/** How a people item reads once serialized: the key and value need no escaping. */
+const PEOPLE_MARK = `"sensitivity":${JSON.stringify(PEOPLE_SENSITIVITY)}`;
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+};
+
+const isPeopleItem = (value: unknown): value is Record<string, unknown> =>
+  isPlainObject(value) && value["sensitivity"] === PEOPLE_SENSITIVITY;
+
+/**
+ * Whether a part of an answer may hold an item about people, read from the text it is sent
+ * as: inside a JSON string every quote is escaped, so the mark appears only where an object
+ * really carries it. A part that cannot be serialized counts as holding one.
+ */
+const mayHoldPeople = (value: unknown): boolean => {
+  try {
+    return (JSON.stringify(value) ?? "").includes(PEOPLE_MARK);
+  } catch {
+    return true;
+  }
+};
+
 /**
  * The one predicate at a fleet fold's exit: an item marked `sensitivity: "people"` in any
- * top-level list of the answer is released only when `allowed` says so; otherwise it is
- * withheld and the answer says `hidden: ["people"]`. An answer with nothing withheld is
- * returned as it was.
+ * list of the answer, at any depth, is released only when `allowed` says so; otherwise it
+ * is withheld, what it holds is not read, and the answer says `hidden: ["people"]` at its
+ * top. A part nested deeper than {@link PEOPLE_WALK_DEPTH} is checked whole: one that holds
+ * no item about people is sent as it is, and one that does is replaced by
+ * {@link PEOPLE_TOO_DEEP} and counts as withheld. Nothing past the cap is sent unchecked,
+ * and one deep part never keeps the rest of the answer from its caller. An answer with
+ * nothing withheld is returned as it was, the same object, and a part of it with nothing
+ * withheld is not copied.
  *
  * First consumer: `handle` in `server.ts`, on every row the table marks `filtered`.
  */
@@ -624,25 +704,46 @@ export function withholdPeople(
   body: unknown,
   allowed: (item: Readonly<Record<string, unknown>>) => boolean,
 ): unknown {
-  if (typeof body !== "object" || body === null || Array.isArray(body)) return body;
+  if (!isPlainObject(body)) return body;
   let withheld = false;
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(body)) {
-    if (!Array.isArray(value)) {
-      out[key] = value;
-      continue;
-    }
-    out[key] = value.filter((item) => {
-      const marked =
-        typeof item === "object" &&
-        item !== null &&
-        (item as Record<string, unknown>)["sensitivity"] === PEOPLE_SENSITIVITY;
-      if (!marked || allowed(item as Record<string, unknown>)) return true;
+  // `depth` is the depth of `value` itself; a container past the cap is checked whole.
+  const walk = (value: unknown, depth: number): unknown => {
+    const container = Array.isArray(value) || isPlainObject(value);
+    if (container && depth > PEOPLE_WALK_DEPTH) {
+      if (!mayHoldPeople(value)) return value;
       withheld = true;
-      return false;
-    });
-  }
+      return PEOPLE_TOO_DEEP;
+    }
+    if (Array.isArray(value)) {
+      let out: unknown[] | undefined;
+      for (const [index, item] of value.entries()) {
+        if (isPeopleItem(item) && !allowed(item)) {
+          withheld = true;
+          out ??= value.slice(0, index);
+          continue;
+        }
+        const next = walk(item, depth + 1);
+        if (out !== undefined) out.push(next);
+        else if (next !== item) {
+          out = value.slice(0, index);
+          out.push(next);
+        }
+      }
+      return out ?? value;
+    }
+    if (!isPlainObject(value)) return value;
+    let out: Record<string, unknown> | undefined;
+    for (const [key, child] of Object.entries(value)) {
+      const next = walk(child, depth + 1);
+      if (next !== child) {
+        out ??= { ...value };
+        out[key] = next;
+      }
+    }
+    return out ?? value;
+  };
+  const exited = walk(body, 1) as Record<string, unknown>;
   if (!withheld) return body;
-  const prior = Array.isArray(out["hidden"]) ? (out["hidden"] as unknown[]) : [];
-  return { ...out, hidden: [...new Set([...prior, PEOPLE_SENSITIVITY])] };
+  const prior = Array.isArray(exited["hidden"]) ? (exited["hidden"] as unknown[]) : [];
+  return { ...exited, hidden: [...new Set([...prior, PEOPLE_SENSITIVITY])] };
 }

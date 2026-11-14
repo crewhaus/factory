@@ -1,5 +1,7 @@
 /**
- * The four-lane timeline: heartbeat, schedule, dream, janitor.
+ * The lane timeline: heartbeat, schedule, dream, janitor — and, for a spec
+ * whose `schedule:` is a list (#514), one `schedule:<name>` row per named lane
+ * in place of the `schedule` row, in name order.
  *
  * THE ASYMMETRY THIS MODULE ENCODES. A daemon's schedulers are in-process
  * timers, so the **cadence** is knowable offline (it is declared in the
@@ -14,9 +16,11 @@
  *   - ONLINE, when the control plane answers: `lastFiredAt`, `lastOutcome`,
  *     `nextDueAt` from `/control/v1/status`.
  *
- * Two lanes are POKEABLE (`heartbeat`, `schedule`) because control.v1 arms
- * them; `dream` and `janitor` are read-only timer rows and say why. A lane
- * whose spec never declared it is `armed: false` — absent, not broken.
+ * The heartbeat and schedule lanes are POKEABLE (`heartbeat`, `schedule`,
+ * `schedule:<name>`) because control.v1 arms them; `dream` and `janitor` are
+ * read-only timer rows and say why. A lane whose spec never declared it is
+ * `armed: false` — absent, not broken. A named lane is listed when the spec
+ * declares it or the daemon's `/status` reports it.
  *
  * `dream` additionally has a durable offline signal the other lanes lack:
  * `.crewhaus/dream/<spec>/state.json`, which records the last consolidation
@@ -30,9 +34,10 @@ import { maskDeep } from "./mask";
 import { resolveInside } from "./safety";
 import { keyedScalar } from "./spec-lines";
 
-/** The lanes the timeline renders, in display order. */
+/** The fixed lanes the timeline renders, in display order. Named schedule lanes are not listed. */
 export const SCHEDULER_LANES = ["heartbeat", "schedule", "dream", "janitor"] as const;
-export type SchedulerLane = (typeof SCHEDULER_LANES)[number];
+/** A fixed lane, or a named schedule lane `schedule:<name>`. */
+export type SchedulerLane = (typeof SCHEDULER_LANES)[number] | `schedule:${string}`;
 
 export type SchedulerRow = {
   readonly lane: SchedulerLane;
@@ -69,9 +74,15 @@ export type SchedulersView = {
 // The lenient spec scan
 // ---------------------------------------------------------------------------
 
+/** One named schedule lane read off the spec text. */
+export type DeclaredScheduleLane = { readonly name: string; readonly cadence: string };
+
 export type DeclaredCadences = {
   readonly heartbeat?: string;
+  /** The object form's cadence. Absent for the list form. */
   readonly schedule?: string;
+  /** The list form's lanes, in name order. Absent for the object form. */
+  readonly scheduleLanes?: readonly DeclaredScheduleLane[];
   readonly dream?: string;
 };
 
@@ -123,6 +134,104 @@ function blockUnder(lines: readonly string[], key: string, atIndent: number): st
   return undefined;
 }
 
+/** The cadence of one schedule entry, object or list item. */
+function scheduleCadence(block: readonly string[]): string {
+  const cron = scalarIn(block, "cron");
+  const every = scalarIn(block, "every");
+  const tz = scalarIn(block, "timezone");
+  const jitter = scalarIn(block, "jitter");
+  const base =
+    cron !== undefined
+      ? `cron "${cron}"${tz !== undefined ? ` ${tz}` : " UTC"}`
+      : every !== undefined
+        ? `every ${every}`
+        : "declared (no trigger read)";
+  return jitter !== undefined ? `${base} ±${jitter}` : base;
+}
+
+/** True when a trimmed line opens a sequence item (`- …` or a bare `-`). */
+const isItemStart = (trimmed: string): boolean => trimmed === "-" || trimmed.startsWith("- ");
+
+/**
+ * The lines of a top-level `schedule:` that is a sequence, or undefined when it
+ * is not one. YAML allows the items at the key's own indent (`- name: x` at
+ * column 0), which an indented-block read would drop, so column-0 items count.
+ */
+function scheduleSequence(lines: readonly string[]): string[] | undefined {
+  const header = /^schedule\s*:\s*(?:#.*)?$/;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!header.test(lines[i] as string)) continue;
+    const body: string[] = [];
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const next = lines[j] as string;
+      const trimmed = next.trim();
+      if (trimmed === "" || trimmed.startsWith("#")) continue;
+      if (indentOf(next) === 0 && !isItemStart(trimmed)) break;
+      body.push(next);
+    }
+    const first = body[0];
+    return first !== undefined && isItemStart(first.trim()) ? body : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Split a flow mapping's inside (`name: a, kind: cron, cron: "0 9 * * 1,3"`) on
+ * the commas outside quotes, one `key: value` per line.
+ */
+function flowPairs(inside: string): string[] {
+  const out: string[] = [];
+  let quote: string | undefined;
+  let start = 0;
+  for (let i = 0; i < inside.length; i += 1) {
+    const ch = inside[i] as string;
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === ",") {
+      out.push(inside.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  out.push(inside.slice(start).trim());
+  return out.filter((pair) => pair !== "");
+}
+
+/** Lane-name grammar, the spec's and control.v1's. */
+const LANE_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
+
+/**
+ * The named lanes of a list-form `schedule:`, leniently: each item whose `name`
+ * reads as a lane name yields a lane, its cadence read when it can be and
+ * "declared (no trigger read)" when it cannot. An item with no readable name
+ * names no lane.
+ */
+function declaredScheduleLanes(sequence: readonly string[]): DeclaredScheduleLane[] {
+  const itemIndent = indentOf(sequence[0] ?? "");
+  const items: string[][] = [];
+  for (const line of sequence) {
+    const trimmed = line.trim();
+    if (indentOf(line) === itemIndent && isItemStart(trimmed)) {
+      const rest = trimmed.slice(1).trim();
+      if (rest.startsWith("{") && rest.endsWith("}")) {
+        items.push(flowPairs(rest.slice(1, -1)));
+      } else {
+        items.push(rest === "" ? [] : [rest]);
+      }
+      continue;
+    }
+    items[items.length - 1]?.push(trimmed);
+  }
+  const lanes = new Map<string, DeclaredScheduleLane>();
+  for (const item of items) {
+    const name = scalarIn(item, "name");
+    if (name === undefined || !LANE_NAME_RE.test(name) || lanes.has(name)) continue;
+    lanes.set(name, { name, cadence: scheduleCadence(item) });
+  }
+  return [...lanes.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
 /**
  * Read the declared cadences out of a spec's TEXT. Lenient by design: this
  * is a fleet view, and a harness whose spec is a version ahead of (or behind)
@@ -130,7 +239,12 @@ function blockUnder(lines: readonly string[], key: string, atIndent: number): st
  */
 export function declaredCadences(yamlText: string): DeclaredCadences {
   const lines = yamlText.split("\n");
-  const out: { heartbeat?: string; schedule?: string; dream?: string } = {};
+  const out: {
+    heartbeat?: string;
+    schedule?: string;
+    scheduleLanes?: DeclaredScheduleLane[];
+    dream?: string;
+  } = {};
 
   const heartbeat = blockUnder(lines, "heartbeat", 0);
   if (heartbeat !== undefined) {
@@ -138,19 +252,12 @@ export function declaredCadences(yamlText: string): DeclaredCadences {
     out.heartbeat = every !== undefined ? `every ${every}` : "declared (no interval read)";
   }
 
-  const schedule = blockUnder(lines, "schedule", 0);
-  if (schedule !== undefined) {
-    const cron = scalarIn(schedule, "cron");
-    const every = scalarIn(schedule, "every");
-    const tz = scalarIn(schedule, "timezone");
-    const jitter = scalarIn(schedule, "jitter");
-    const base =
-      cron !== undefined
-        ? `cron "${cron}"${tz !== undefined ? ` ${tz}` : " UTC"}`
-        : every !== undefined
-          ? `every ${every}`
-          : "declared (no trigger read)";
-    out.schedule = jitter !== undefined ? `${base} ±${jitter}` : base;
+  const sequence = scheduleSequence(lines);
+  if (sequence !== undefined) {
+    out.scheduleLanes = declaredScheduleLanes(sequence);
+  } else {
+    const schedule = blockUnder(lines, "schedule", 0);
+    if (schedule !== undefined) out.schedule = scheduleCadence(schedule);
   }
 
   const memory = blockUnder(lines, "memory", 0);
@@ -241,7 +348,7 @@ export function buildSchedulersView(input: BuildSchedulersInput): SchedulersView
   const draining = control?.draining === true;
 
   const pokeState = (
-    lane: "heartbeat" | "schedule",
+    lane: "heartbeat" | "schedule" | `schedule:${string}`,
     armed: boolean,
   ): { pokeable: boolean; pokeReason: string | null } => {
     if (!armed) {
@@ -306,6 +413,23 @@ export function buildSchedulersView(input: BuildSchedulersInput): SchedulersView
     declared.heartbeat !== undefined || reportFor(timers, "heartbeat") !== undefined;
   const scheduleArmed =
     declared.schedule !== undefined || reportFor(timers, "schedule") !== undefined;
+  // Named lanes: every lane the spec declares or the daemon reports, in name
+  // order. A list-form spec has no bare `schedule` lane, so that row is not
+  // shown for one.
+  const listForm = declared.scheduleLanes !== undefined;
+  const namedCadence = new Map<string, string | undefined>(
+    (declared.scheduleLanes ?? []).map((lane) => [lane.name, lane.cadence]),
+  );
+  for (const timer of timers ?? []) {
+    const name = timer.lane.startsWith("schedule:") ? timer.lane.slice("schedule:".length) : "";
+    if (LANE_NAME_RE.test(name) && !namedCadence.has(name)) namedCadence.set(name, undefined);
+  }
+  const namedRows = [...namedCadence.keys()]
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    .map((name) => {
+      const lane = `schedule:${name}` as const;
+      return row(lane, true, namedCadence.get(name), pokeState(lane, true), null);
+    });
   const dreams = dreamStates(input.harnessDir);
   const dreamArmed = declared.dream !== undefined || dreams.length > 0;
   const janitorArmed =
@@ -325,7 +449,18 @@ export function buildSchedulersView(input: BuildSchedulersInput): SchedulersView
         pokeState("heartbeat", heartbeatArmed),
         null,
       ),
-      row("schedule", scheduleArmed, declared.schedule, pokeState("schedule", scheduleArmed), null),
+      ...(listForm
+        ? []
+        : [
+            row(
+              "schedule",
+              scheduleArmed,
+              declared.schedule,
+              pokeState("schedule", scheduleArmed),
+              null,
+            ),
+          ]),
+      ...namedRows,
       row(
         "dream",
         dreamArmed,

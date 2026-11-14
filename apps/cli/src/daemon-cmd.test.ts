@@ -1063,9 +1063,37 @@ describe("crewhaus daemon", () => {
   test("wake rejects a lane control.v1 does not define", async () => {
     const f = fixture();
     try {
-      await expect(runDaemonCommand(["wake", "--lane", "janitor"], f.opts)).rejects.toThrow(
-        /--lane must be heartbeat or schedule/,
-      );
+      for (const lane of ["janitor", "schedule:X", "schedule:"]) {
+        await expect(runDaemonCommand(["wake", "--lane", lane], f.opts)).rejects.toThrow(
+          /--lane must be heartbeat, schedule or schedule:<name>/,
+        );
+      }
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("wake --lane schedule:<name> reaches control.v1 with that lane", async () => {
+    const f = fixture();
+    try {
+      await runDaemonCommand(["start", "--no-preflight"], f.opts);
+      announceControl(f, 41_237);
+      const bodies: unknown[] = [];
+      const fetchSpy = (async (_input: string | URL | Request, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body ?? "{}")));
+        return new Response(JSON.stringify({ sessionId: "sess_abc", lane: "schedule:discovery" }), {
+          status: 202,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+      const out = await runDaemonCommand(["wake", "--lane", "schedule:discovery"], {
+        ...f.opts,
+        fetch: fetchSpy,
+      });
+      expect(out.exitCode).toBe(0);
+      expect(bodies).toHaveLength(1);
+      expect((bodies[0] as { lane: string }).lane).toBe("schedule:discovery");
+      expect(out.lines[0]).toContain("schedule:discovery");
     } finally {
       f.cleanup();
     }

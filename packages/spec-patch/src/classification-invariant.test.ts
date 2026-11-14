@@ -374,6 +374,20 @@ describe("the owner-keys table — every leaf under a row is human-owned", () =>
       leavesUnder(shapes[0] as ZodTypeAny, intent as (typeof DELTA_090_KEYS)[number]).length,
     ).toBe(4);
   });
+
+  test("schedule yields leaves on exactly channel, managed and batch, in both forms", () => {
+    const schedule = DELTA_090_KEYS.find((row) => row.pattern.join(".") === "schedule");
+    expect(schedule).toBeDefined();
+    const row = schedule as (typeof DELTA_090_KEYS)[number];
+    const carrying = shapes.filter((shape) => leavesUnder(shape, row).length > 0);
+    expect(carrying.map(targetOf).sort()).toEqual(["batch", "channel", "managed"]);
+    for (const shape of carrying) {
+      const paths = leavesUnder(shape, row).map((path) => path.join("."));
+      // The object form's leaves, and the list form's (under an array index).
+      expect(paths.some((path) => path === "schedule.cron")).toBe(true);
+      expect(paths.some((path) => path !== "schedule.name" && path.endsWith(".name"))).toBe(true);
+    }
+  });
 });
 
 /**

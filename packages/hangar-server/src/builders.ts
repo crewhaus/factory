@@ -53,13 +53,14 @@ import {
   parseGradersConfig,
 } from "@crewhaus/eval-grader";
 import { applySpecEdits, isCredentialKey, maskCredentialTokens } from "@crewhaus/spec-patch";
-import { createSpecFile } from "@crewhaus/spec-patch/commit";
+import { createSpecFile, parseYamlOnly } from "@crewhaus/spec-patch/commit";
 import { MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
-import { type M3Context, type M3Handler, requireTypedConfirm } from "./m3";
+import { type M3Context, type M3Handler, requirePermission, requireTypedConfirm } from "./m3";
 import { maskSpecYaml, maskText } from "./mask";
 import {
+  SPEC_SECURITY_PERMISSION,
   commitSpecEdits,
   previewHomeEdits,
   readSpecFile,
@@ -497,16 +498,22 @@ export function newlyMaskedSpan(stored: string, incoming: string): string | null
  * Either way the result must parse (`parseGradersConfig`, 400 with the reason
  * and nothing written); when the file exists the write names the revision it
  * was computed from (`expectedRev`, 428 without one) and a stale one answers
- * 412 with `current.rev`; an edit that loosens a protected criterion needs the
- * spec's name typed and the security edit permission (409 with `needs`). The
- * response is what is on disk, with its revision (`hash`) and `gradersHash`.
+ * 412 with `current.rev`. An edit that loosens a protected criterion needs the
+ * security edit permission first (403 naming it, nothing written, whatever the
+ * body carries), then the spec's name typed (409 with `needs` until it
+ * matches): the typed name is a confirmation, never the authority. A stored
+ * file that does not parse cannot be compared, so any criterion it marks
+ * protected (or, when it is not readable YAML, the whole file) is treated as
+ * loosened. The response is what is on disk, with its revision (`hash`) and
+ * `gradersHash`.
  *
  * Two refusals guard the raw round trip, because the pane the console posts
  * back was prefilled from {@link graderCatalog} — a MASKED, CAPPED read:
  *
- *   - a body that introduces a mask span the stored file does not have is
- *     the masked view being saved over the real document. Persisting `***`
- *     would replace whatever it hid: silent data loss dressed up as safety.
+ *   - a result, from either form, that introduces a mask span the stored file
+ *     does not have is the masked view being saved over the real document.
+ *     Persisting `***` would replace whatever it hid: silent data loss dressed
+ *     up as safety.
  *   - a stored file past the read cap cannot be compared (and the pane only
  *     ever held its head), so the write is refused rather than allowed to
  *     truncate it.
@@ -552,13 +559,6 @@ export const graderWrite: M3Handler = (ctx) => {
   let next: string;
   if (typeof yaml === "string") {
     if (yaml.trim() === "") throw new HttpError(400, '"yaml" is empty');
-    const mark = newlyMaskedSpan(stored.text, yaml);
-    if (mark !== null) {
-      throw new HttpError(
-        409,
-        `this body introduces a masked span (${mark}) the stored ${GRADERS_PATH.join("/")} does not have — the editor pane is served MASKED, and saving it would replace what the mask hid. Edit the file with \`${GRADERS_VERB}\` or an editor.`,
-      );
-    }
     next = yaml.endsWith("\n") ? yaml : `${yaml}\n`;
   } else {
     if (!present) {
@@ -580,6 +580,13 @@ export const graderWrite: M3Handler = (ctx) => {
       throw new HttpError(400, `the edits do not apply: ${maskText(errMessage(err))}`);
     }
   }
+  const mark = newlyMaskedSpan(stored.text, next);
+  if (mark !== null) {
+    throw new HttpError(
+      409,
+      `this body introduces a masked span (${mark}) the stored ${GRADERS_PATH.join("/")} does not have — the editor pane is served MASKED, and saving it would replace what the mask hid. Edit the file with \`${GRADERS_VERB}\` or an editor.`,
+    );
+  }
   let after: GradersConfig;
   try {
     after = parseGradersConfig(next).config;
@@ -593,16 +600,29 @@ export const graderWrite: M3Handler = (ctx) => {
   } catch {
     before = undefined;
   }
-  const loosened = before !== undefined ? loosening(before, after) : [];
-  if (loosened.length > 0 && ctx.body["confirmName"] !== file.specName) {
-    const warning = loosened.map((l) => `${l.criterion}: ${l.reason}`).join("; ");
+  // What the owner must make: each loosening, and, when the stored file does
+  // not parse, every criterion it marks protected. "Cannot compare" is never
+  // "does not loosen".
+  const owed: { readonly path: string; readonly why: string }[] = (
+    before !== undefined ? loosening(before, after) : []
+  ).map((l) => ({ path: `criteria.${l.criterion}`, why: `${l.criterion}: ${l.reason}` }));
+  if (present && before === undefined) owed.push(...protectedInUnparsed(stored.text));
+  const loosenedPaths = [...new Set(owed.map((o) => o.path))];
+  if (owed.length > 0) {
+    requirePermission(ctx, SPEC_SECURITY_PERMISSION, {
+      paths: loosenedPaths,
+      message: "Only an owner of this harness can loosen a protected criterion.",
+    });
+  }
+  if (owed.length > 0 && ctx.body["confirmName"] !== file.specName) {
+    const warning = owed.map((o) => o.why).join("; ");
     throw new HttpError(
       409,
       `this change loosens a protected criterion (${warning}) — only the owner makes it: send "confirmName": "${file.specName}"`,
       {
-        needs: "h.spec.edit.security",
+        needs: SPEC_SECURITY_PERMISSION,
         warning,
-        paths: [...new Set(loosened.map((l) => `criteria.${l.criterion}`))],
+        paths: loosenedPaths,
         confirmName: file.specName,
       },
     );
@@ -627,6 +647,41 @@ export const graderWrite: M3Handler = (ctx) => {
     note: "runs scored after this write carry a new gradersHash — earlier runs keep the graders they were scored by",
   };
 };
+
+/**
+ * The criteria a stored graders file that does not parse marks protected,
+ * read as plain YAML with no schema, each as the owner's to change. A file
+ * that is not readable YAML, or whose `criteria` is not a list, owes the
+ * whole `criteria` block: what it protects cannot be told.
+ */
+function protectedInUnparsed(text: string): { path: string; why: string }[] {
+  const why =
+    "the stored graders file does not parse, so this change cannot be shown to keep its bar";
+  const whole = [{ path: "criteria", why: `criteria: ${why}` }];
+  let doc: unknown;
+  try {
+    doc = parseYamlOnly(text);
+  } catch {
+    return whole;
+  }
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return [];
+  const criteria = (doc as Record<string, unknown>)["criteria"];
+  if (criteria === undefined || criteria === null) return [];
+  if (!Array.isArray(criteria)) return whole;
+  const out: { path: string; why: string }[] = [];
+  for (const entry of criteria) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const mark = (entry as Record<string, unknown>)["protected"];
+    if (mark === undefined || mark === null || mark === false) continue;
+    const id = (entry as Record<string, unknown>)["id"];
+    out.push(
+      typeof id === "string"
+        ? { path: `criteria.${id}`, why: `${id}: ${why}` }
+        : { path: "criteria", why: `criteria: ${why}` },
+    );
+  }
+  return out;
+}
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);

@@ -28,7 +28,8 @@ function lastRow(harness: string, id = CMD): Record<string, unknown> | undefined
 async function governedByLocalOwner() {
   const r = rig();
   const owner = await setUpOwner(r.hangarRoot, IDENTITY);
-  plantProjection(r.harness, owner);
+  // The rig's Hangar root is a real path already: the projection names it as written.
+  plantProjection(r.harness, owner, [], { accessRoot: r.hangarRoot });
   return { ...r, owner };
 }
 

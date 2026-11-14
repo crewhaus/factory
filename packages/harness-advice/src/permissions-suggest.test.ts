@@ -16,6 +16,7 @@ import { z } from "zod";
 import { type SessionEvents, parseJsonlObjects } from "./advise-rules";
 import {
   type AskAggregate,
+  HOLDS_CONTROL_NOTE,
   MAX_RULE_VALUE_LENGTH,
   OPERATIVE_ARG_FIELDS,
   type SuggestToolLookup,
@@ -288,7 +289,6 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
       "git status && git log",
       "git status;",
       "echo `date`",
-      "cat <<EOF\nx\nEOF",
       "npm test 2>&1 | tail -5",
     ];
     for (const command of lines) {
@@ -314,6 +314,13 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
         false,
       );
     }
+    // A line holding a control character (a here-document's newline) is no rule value.
+    const multiLine = aggregateAsks(
+      [asked("Bash", { command: "cat <<EOF\nx\nEOF" })],
+      shellLookup,
+    ).get("Bash") as AskAggregate;
+    expect(multiLine.unscoped).toContain("holds-control");
+    expect(multiLine.argSamples).toEqual([]);
     // Without a declaration, the tool named Bash reads the same way.
     const legacy = aggregateAsks([asked("Bash", { command: "git status && git log" })]).get(
       "Bash",
@@ -342,6 +349,66 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
     const rm = aggregateAsks([asked("RemovePath", { path: "build" })]).get("RemovePath");
     expect(patternFor(rm as AskAggregate)).toBe("RemovePath");
     expect(blanketGrantNote(rm as AskAggregate)).toContain("does not declare");
+  });
+
+  describe("a recorded call whose value holds a control or bidirectional-text character", () => {
+    const shellBash = declared("Bash", [{ field: "command", kind: "command", shell: true }], {
+      command: z.string(),
+    });
+    const readings: Array<[string, SuggestToolLookup | undefined]> = [
+      ["the matcher's name table", undefined],
+      ["the tool's own declaration", suggestLookupFromTools({ bash: shellBash })],
+    ];
+    const values = [
+      ["a here-document", "cat <<EOF\nx\nEOF"],
+      ["a tab", "printf a\tb"],
+      ["an escape sequence", "echo a\u001b[2Jb"],
+      ["a bidirectional override", "echo a\u202eb"],
+    ];
+    for (const [label, bashLookup] of readings) {
+      for (const [what, command] of values) {
+        it(`gets no allow at all, scoped or for the whole tool, and is named (${what}, ${label})`, () => {
+          const aggs = aggregateAsks(
+            [asked("Bash", { command }, { command }, { command })],
+            bashLookup,
+          );
+          const agg = aggs.get("Bash") as AskAggregate;
+          expect(agg.approved).toBe(3);
+          expect(agg.unscoped).toContain("holds-control");
+          const suggestions = rankSuggestions(aggs, new Map([["Bash", false]]));
+          expect(suggestions.filter((g) => g.rule.type === "alwaysAllow")).toEqual([]);
+          const skipped = skippedSuggestions(aggs);
+          expect(skipped).toEqual([
+            { toolName: "Bash", reason: "holds-control", note: HOLDS_CONTROL_NOTE },
+          ]);
+          expect(JSON.stringify(skipped).includes(command)).toBe(false);
+        });
+      }
+    }
+
+    it("a credential among such calls is named first", () => {
+      const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+      const aggs = aggregateAsks([
+        asked(
+          "Bash",
+          { command: `curl -H "Authorization: Bearer ${token}" https://x.test` },
+          { command: "cat <<EOF\nx\nEOF" },
+          { command: "git status" },
+        ),
+      ]);
+      expect(skippedSuggestions(aggs).map((s) => s.reason)).toEqual(["carries-credential"]);
+    });
+
+    it("a tool with no such value keeps its scoped allow", () => {
+      const aggs = aggregateAsks([asked("Bash", { command: "git status" })]);
+      const [grant] = rankSuggestions(aggs, new Map());
+      expect(grant?.rule).toEqual({
+        type: "alwaysAllow",
+        pattern: "Bash(git status)",
+        source: "settings",
+      });
+      expect(skippedSuggestions(aggs)).toEqual([]);
+    });
   });
 
   describe("a recorded call that carries a credential", () => {

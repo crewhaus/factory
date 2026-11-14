@@ -256,6 +256,8 @@ export const ATTR = {
   CREWHAUS_EVAL_VERDICT: "crewhaus.eval.verdict",
   CREWHAUS_EVAL_GRADER_TYPE: "crewhaus.eval.grader_type",
   CREWHAUS_EVAL_RETRY_INDEX: "crewhaus.eval.retry_index",
+  /** The span of the failed model call a retried call re-runs (a sibling under the same turn). */
+  CREWHAUS_RETRY_OF: "crewhaus.retry_of",
   CREWHAUS_EVAL_MAX_RETRIES: "crewhaus.eval.max_retries",
   CREWHAUS_JUDGE_AT: "crewhaus.judge.at",
   CREWHAUS_JUDGE_VERDICT: "crewhaus.judge.verdict",
@@ -419,6 +421,7 @@ export function buildModelSpan(start: StartedModel, end: ModelResponseEvent): Ot
   if (paramsFingerprint !== undefined) {
     attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PARAMS_FINGERPRINT, paramsFingerprint));
   }
+  if (start.ev.retryOf !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_RETRY_OF, start.ev.retryOf));
   return {
     traceId: end.traceId,
     spanId: end.spanId,
@@ -506,6 +509,7 @@ export function buildAbandonedModelSpan(
   if (req.paramsFingerprint !== undefined) {
     attrs.push(attrStr(ATTR.CREWHAUS_MODEL_PARAMS_FINGERPRINT, req.paramsFingerprint));
   }
+  if (req.retryOf !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_RETRY_OF, req.retryOf));
   return {
     traceId: req.traceId,
     spanId: req.spanId,

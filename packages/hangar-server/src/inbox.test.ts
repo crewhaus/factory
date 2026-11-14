@@ -485,3 +485,62 @@ describe("review queue", () => {
     }
   }, 20_000);
 });
+
+describe("a deeply nested tool input", () => {
+  /** `inner`, wrapped in `levels` objects. */
+  const nest = (inner: Record<string, unknown>, levels: number): Record<string, unknown> => {
+    let out = inner;
+    for (let i = 0; i < levels; i += 1) out = { n: out };
+    return out;
+  };
+
+  test("keeps the fleet inbox answering, every harness's approval included", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      await register(t, inboxHarness(t, "deep-good"));
+      const deep = makeFixtureHarness(join(t.harnessesRoot, "deep-input"), {
+        specName: "deep-input",
+        approvals: [
+          {
+            id: "appr_00000000000000d1",
+            toolName: "SendMessage",
+            inputHash: "hash-deep",
+            input: nest({ leaf: "deep-leaf-marker" }, 20),
+            runId: "run_00000000000000d0",
+            sessionId: "sess_00000000000000dd",
+            surface: "daemon",
+            createdAt: iso(NOW - DAY),
+          },
+          {
+            id: "appr_00000000000000d2",
+            toolName: "SendMessage",
+            inputHash: "hash-deep-person",
+            input: nest({ items: [{ sensitivity: "people", ref: "deep-person-marker" }] }, 20),
+            runId: "run_00000000000000d0",
+            sessionId: "sess_00000000000000dd",
+            surface: "daemon",
+            createdAt: iso(NOW - DAY),
+          },
+        ],
+      });
+      await register(t, deep);
+      for (const path of ["/api/approvals", "/api/approvals?all=1"]) {
+        const res = await t.api(path);
+        expect(`${path}: ${res.status}`).toBe(`${path}: 200`);
+        const ids = (res.body["approvals"] as Array<{ id: string }>).map((a) => a.id).sort();
+        expect(ids).toEqual([
+          "appr_00000000000000b1",
+          "appr_00000000000000d1",
+          "appr_00000000000000d2",
+        ]);
+        const text = JSON.stringify(res.body);
+        // A deep part that holds no one is shown in full; one that holds a person is not.
+        expect(text).toContain("deep-leaf-marker");
+        expect(text).not.toContain("deep-person-marker");
+        expect(res.body["hidden"]).toEqual(["people"]);
+      }
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+});

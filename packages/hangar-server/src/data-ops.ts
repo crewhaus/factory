@@ -162,34 +162,44 @@ function verifyRecord(record: DatasetRecord): VerifyState {
 }
 
 type Burn = {
-  /** Recorded reads of the test split (release entries included). */
-  readonly count: number;
-  /** Recorded reads of the holdout. */
-  readonly holdout: number;
+  /** Recorded reads of the test split (release entries included); `null` when
+   *  the use ledger could not be read whole, so the count is unknown. */
+  readonly count: number | null;
+  /** Recorded reads of the holdout; `null` when the count is unknown. */
+  readonly holdout: number | null;
   readonly releases: ReadonlyArray<unknown>;
+  /** Why the counts are unknown, when they are. */
+  readonly note?: string;
 };
 
 /** Held-out reads of one version, from the use ledger beside it: test and
- *  holdout counted apart, a legacy `releases[]` entry counted once. A read:
- *  the ledger is contained to the harness and never written. */
+ *  holdout counted apart, a legacy `releases[]` entry counted once, and both
+ *  unknown (`null`, with a note) whenever the ledger could not be read whole.
+ *  Zero only when the harness has no dataset registry. A read: the ledger is
+ *  contained to the harness and never written. */
 function burn(ctx: M3Context, name: string, version: string, record: DatasetRecord): Burn {
   const releases = (record.releases ?? []).map((r) => ({ ...r }));
   const root = registryRoot(ctx);
-  const contained =
-    root !== undefined &&
-    safeContain(ctx, [...REGISTRY_SEGMENTS, name, `${version}.uses.jsonl`]) !== undefined;
-  if (!contained) {
-    return { count: releases.length, holdout: 0, releases };
+  if (root === undefined) return { count: releases.length, holdout: 0, releases };
+  const unknown: Burn = {
+    count: null,
+    holdout: null,
+    releases,
+    note: "the use ledger could not be read whole; the count is unknown",
+  };
+  if (safeContain(ctx, [...REGISTRY_SEGMENTS, name, `${version}.uses.jsonl`]) === undefined) {
+    return unknown;
   }
   try {
     const report = readHeldOutUses(root, name, version);
+    if (report.truncated || report.note !== undefined) return unknown;
     return {
       count: countHeldOutUses(report, "test"),
       holdout: countHeldOutUses(report, "holdout"),
       releases,
     };
   } catch {
-    return { count: releases.length, holdout: 0, releases };
+    return unknown;
   }
 }
 

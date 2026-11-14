@@ -77,6 +77,35 @@ describe("createIsolatedContext", () => {
     }
   });
 
+  test("the child's bus is rooted under the span the caller names, else the parent's current span", async () => {
+    const root = newTempRoot();
+    try {
+      const { parent } = await makeParent(root);
+      const subAgentSpan = parent.runContext.eventBus.envelope().spanId;
+      const named = await createIsolatedContext(parent, {
+        name: "named",
+        instructions: "i",
+        tools: [],
+        parentSpanId: subAgentSpan,
+      });
+      expect(named.runContext.eventBus.rootParentSpanId).toBe(subAgentSpan);
+      expect(named.runContext.eventBus.traceId).toBe(parent.runContext.eventBus.traceId);
+      const unnamed = await createIsolatedContext(parent, {
+        name: "unnamed",
+        instructions: "i",
+        tools: [],
+      });
+      expect(unnamed.runContext.eventBus.rootParentSpanId).toBe(
+        parent.runContext.eventBus.currentSpanId,
+      );
+      await named.close();
+      await unnamed.close();
+      await parent.eventLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("aborting the parent cascades to the child's abortTree", async () => {
     const root = newTempRoot();
     try {
@@ -311,6 +340,8 @@ describe("projectParentHandle (0.6.0 §10.2)", () => {
           throw new Error("unused");
         },
         runState: createStore({}),
+        parentSpanId: "0123456789abcdef",
+        recordSpanClosed: async () => {},
       };
       const handle = projectParentHandle(bridge);
       expect(handle.routing).toBe(routing);
@@ -327,6 +358,9 @@ describe("projectParentHandle (0.6.0 §10.2)", () => {
       // 0.7.1 — a child runs against the parent's sandbox backend.
       expect(handle.sandboxAvailable).toBe(true);
       expect(handle.sessionRootDir).toBe(root);
+      // The tool call's span and the span writer reach the spawner.
+      expect(handle.parentSpanId).toBe("0123456789abcdef");
+      expect(handle.recordSpanClosed).toBe(bridge.recordSpanClosed);
       for (const toolOnly of ["hooks", "subAgents", "spawnSubAgent", "crewMailbox", "runState"]) {
         expect(toolOnly in handle).toBe(false);
       }

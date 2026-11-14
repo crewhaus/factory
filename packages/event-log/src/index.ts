@@ -7,8 +7,10 @@
  * stamped onto every event so future migrations can fan out on it.
  *
  * A run-scoped handle (`openEventLog(id, { run })`) adds `run` after
- * `payload` on every line it appends: `{ ts, version: 1, kind, payload, run }`.
- * Readers that destructure `kind` and `payload` read both shapes.
+ * `payload` on every line it appends: `{ ts, version: 1, kind, payload, run }`,
+ * and `span` after `run` when the append names the span the line belongs to:
+ * `{ ts, version: 1, kind, payload, run, span }`. An unscoped handle writes
+ * neither. Readers that destructure `kind` and `payload` read every shape.
  *
  * Append semantics: each `append()` appends one line in place with mode
  * 0o600 (owner-only) per the `claude-code/utils/sessionStorage.ts`
@@ -42,6 +44,9 @@ import { appendContained, openForReadFd } from "@crewhaus/tool-safety/fs";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/sessions";
 const ID_REGEX = /^sess_[0-9a-f]{16}$/;
+/** A trace span id: 16 lowercase hex, never all zeros (W3C trace context, as the trace bus mints them). */
+const SPAN_ID_RE = /^[0-9a-f]{16}$/;
+const ZERO_SPAN_ID = "0".repeat(16);
 
 export type EventKind =
   | "user_message"
@@ -279,7 +284,20 @@ export type EventKind =
   // that predate them skip them. Payloads: `RunStampPayload`,
   // `ContextManifestPayload` below.
   | "run_stamp"
-  | "context_manifest";
+  | "context_manifest"
+  // How a run's spans nested and how long each took (`span_closed`, one per
+  // closed span: the run, each turn, model call, tool call, compaction,
+  // judge, provability pass and sub-agent), and what each check decided
+  // (`verdict`, one per gate firing: permission, justification, egress,
+  // post-tool, hook, approval, rate limit, loop, eval, provability), bound to
+  // the run, its span, the tool call's ordinal and the keyed action digest
+  // the decision log uses. Closed codes and ids, never tool input or model
+  // text. Written by runtime-core unless `CREWHAUS_RUN_STAMPS=0`.
+  // Non-conversational: `replayMessageHistory` ignores them, `--resume` is
+  // unaffected, and readers that predate them skip them. Payloads:
+  // `SpanClosedPayload`, `VerdictPayload` below.
+  | "span_closed"
+  | "verdict";
 
 /**
  * Payload for the `wiki_write` event kind (0.3.0 design §9): which article
@@ -325,13 +343,23 @@ export type Event = {
   readonly payload: unknown;
   /**
    * The run that wrote the line, on every line a run-scoped handle appends
-   * (`OpenEventLogOptions.run`), last on the line. Absent on a line an
+   * (`OpenEventLogOptions.run`), after `payload`. Absent on a line an
    * unscoped handle writes.
    */
   readonly run?: string;
+  /**
+   * The trace span the line belongs to, after `run`, when a run-scoped
+   * handle's append named one. Absent on a line an unscoped handle writes.
+   */
+  readonly span?: string;
 };
 
-export type AppendEvent = Pick<Event, "kind" | "payload">;
+/**
+ * One line to append. `span` names the trace span the line belongs to (16
+ * lowercase hex, not all zeros); a run-scoped handle writes it after `run`,
+ * an unscoped handle leaves it out.
+ */
+export type AppendEvent = Pick<Event, "kind" | "payload"> & { readonly span?: string };
 
 /** The grammar of a line's `run`: 1-128 of `[A-Za-z0-9._:-]`. */
 export const RUN_REF_RE = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -340,9 +368,9 @@ export type OpenEventLogOptions = {
   readonly rootDir?: string;
   readonly now?: () => number;
   /**
-   * Stamp every line this handle appends with `run`. It must match
-   * {@link RUN_REF_RE}; `openEventLog` throws otherwise. Unset, a line is
-   * exactly `{ts, version, kind, payload}`.
+   * Stamp every line this handle appends with `run`, and with the `span` an
+   * append names. It must match {@link RUN_REF_RE}; `openEventLog` throws
+   * otherwise. Unset, a line is exactly `{ts, version, kind, payload}`.
    */
   readonly run?: string;
 };
@@ -394,10 +422,18 @@ export async function openEventLog(
   return {
     async append(event: AppendEvent): Promise<void> {
       fence();
+      const span = event.span;
+      if (span !== undefined && (!SPAN_ID_RE.test(span) || span === ZERO_SPAN_ID)) {
+        throw new RuntimeError(
+          "event-log: invalid span — expected 16 lowercase hex characters, not all zeros",
+        );
+      }
       const wire: Event =
         run === undefined
           ? { ts: now(), version: 1, kind: event.kind, payload: event.payload }
-          : { ts: now(), version: 1, kind: event.kind, payload: event.payload, run };
+          : span === undefined
+            ? { ts: now(), version: 1, kind: event.kind, payload: event.payload, run }
+            : { ts: now(), version: 1, kind: event.kind, payload: event.payload, run, span };
       const line = `${JSON.stringify(wire)}\n`;
       const appended = appendContained(dirname(fullPath), basename(fullPath), line, {
         mode: 0o600,
@@ -659,6 +695,8 @@ export type ContextManifestPayload = {
   readonly turn: { readonly run: number; readonly session: number };
   /** 1-based ordinal of the call in the run. */
   readonly call: number;
+  /** Which attempt of its turn the call belongs to; written only for a re-run or a retried call. */
+  readonly attempt?: SpanAttempt;
   readonly blocks: readonly ContextManifestBlock[];
   readonly files?: readonly ContextManifestFile[];
   readonly recalled?: ContextManifestRecalled;
@@ -691,4 +729,144 @@ export type ContextManifestPayload = {
     };
   };
   readonly messages: { readonly count: number; readonly afterCompaction: boolean };
+};
+
+/** What a closed span covered. */
+export type SpanKind =
+  | "run"
+  | "turn"
+  | "model"
+  | "tool"
+  | "compaction"
+  | "judge"
+  | "provability"
+  | "subagent";
+
+/** How a span ended: `parked` waits on an approval; `denied` is a tool call a gate refused. */
+export type SpanStatus = "ok" | "error" | "aborted" | "parked" | "denied";
+
+/**
+ * Which attempt of its turn a model call belongs to. `index` 0 is the turn's
+ * first answer; a later index is a re-run (`cause`: an evaluation retry, a
+ * provability rerun, an escalation). `retryOf` names the span of the failed
+ * call that recovery retried (`cause: "recovery"`).
+ */
+export type SpanAttempt = {
+  readonly index: number;
+  readonly retryOf?: string;
+  readonly cause?: "recovery" | "eval" | "provability" | "escalation";
+};
+
+/** The run and session turn numbers of a turn. */
+export type SpanTurn = { readonly run: number; readonly session: number };
+
+/** Payload of a `span_closed` line: one span, closed. No text, only ids, codes and timings. */
+export type SpanClosedPayload = {
+  readonly v: 1;
+  readonly run: string;
+  readonly span: string;
+  /** The span this one nests under, when it has one. */
+  readonly parent?: string;
+  readonly kind: SpanKind;
+  /** The tool call a `tool` (or `subagent`) span ran. */
+  readonly toolUseId?: string;
+  /** A tool call's or model call's 1-based ordinal in the run. */
+  readonly call?: number;
+  readonly turn?: SpanTurn;
+  readonly attempt?: SpanAttempt;
+  /** ISO 8601. */
+  readonly startedAt: string;
+  readonly durationMs: number;
+  readonly status: SpanStatus;
+  /** The run failure's class (a `RunFailedError` class), when one ended the span. */
+  readonly failureClass?: string;
+};
+
+/** The check a verdict comes from. */
+export type VerdictGate =
+  | "permission"
+  | "justification"
+  | "egress"
+  | "post-tool"
+  | "hook"
+  | "approval"
+  | "rate-limit"
+  | "loop"
+  | "eval"
+  | "provability";
+
+/**
+ * Every outcome a gate writes, closed per gate. `approval` also types
+ * `expired` and `superseded`, which happen in the approvals store; a reader
+ * finds them in the decision log by its `inputDigest`, which is a tool
+ * verdict's `actionDigest`.
+ */
+export type VerdictOutcomes = {
+  readonly permission: "allow" | "deny" | "ask:approved" | "ask:denied" | "ask:parked";
+  readonly justification: "allow" | "deny";
+  readonly egress: "pass" | "warn" | "block";
+  readonly "post-tool": "redacted" | "warned";
+  readonly hook: "allow" | "deny";
+  readonly approval: "parked" | "consumed" | "refused" | "expired" | "superseded";
+  readonly "rate-limit": "deny";
+  readonly loop: "warn" | "justify" | "abort";
+  readonly eval: "pass" | "fail";
+  readonly provability: string;
+};
+
+/** What a verdict judged: one tool call, or a turn's answer. */
+export type VerdictSubject =
+  | {
+      readonly kind: "tool";
+      readonly toolUseId: string;
+      /** The call's 1-based ordinal in the run (provider tool ids can repeat). */
+      readonly call: number;
+      /**
+       * session-store's keyed action digest (`inputDigestOf` of the input the
+       * call ran), the decision log's `inputDigest` for the same action.
+       * Absent while the session root has no digest key, never a plain hash.
+       */
+      readonly actionDigest?: string;
+      /** The same digest of the input the model asked for, when an approval replay ran another. */
+      readonly requestedDigest?: string;
+    }
+  | { readonly kind: "answer"; readonly turn: SpanTurn; readonly attempt: number };
+
+/**
+ * Payload of a `verdict` line: one gate's decision. Outcomes, rule ids and
+ * ids only: a judge's or a hook's own words are never copied, and `reason`
+ * holds only text the runtime wrote.
+ */
+export type VerdictPayload = {
+  readonly v: 1;
+  readonly run: string;
+  /** The span the check belongs to: the tool call's, or the turn's, judge's or provability pass's. */
+  readonly span: string;
+  readonly on: VerdictSubject;
+  readonly gate: VerdictGate;
+  readonly outcome: VerdictOutcomes[VerdictGate];
+  readonly reason?: string;
+  readonly rules?: readonly string[];
+  /** The permission mode the run was in. */
+  readonly mode?: string;
+  readonly judge?: {
+    readonly model: string;
+    readonly confidence?: number;
+    readonly costUsdMicros?: number;
+  };
+  readonly score?: { readonly value: number; readonly threshold?: number };
+  readonly hook?: {
+    readonly event: string;
+    readonly matcher?: string;
+    readonly durationMs: number;
+  };
+  /** What the gate does next with a failing answer: re-run it, or hand it to a stronger model. */
+  readonly next?: "retry" | "escalate";
+  readonly refs?: {
+    /** The approval the verdict is about. */
+    readonly approval?: string;
+    readonly bundle?: { readonly path?: string; readonly hash: string };
+    /** The audit record written beside the verdict. */
+    readonly audit?: { readonly kind: string };
+  };
 };

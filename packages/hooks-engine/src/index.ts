@@ -104,6 +104,14 @@ export type RunHooksOptions = {
   readonly parentEnv?: NodeJS.ProcessEnv;
   /** Optional Section 15 trace bus. Each fired hook emits a `hook_fired` event. */
   readonly eventBus?: TraceEventBus;
+  /**
+   * The span each `hook_fired` event nests under (the tool call a `pre-tool`
+   * hook guards, the turn a `pre-model` hook runs in). Absent, the bus's
+   * current span is the parent.
+   */
+  readonly parentSpanId?: string;
+  /** The tool call the hooks fire for, stamped on each `hook_fired` event. */
+  readonly toolUseId?: string;
 };
 
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -118,6 +126,14 @@ export class HookConfigError extends CrewhausError {
 }
 
 /**
+ * The user-level hooks file, `~/.crewhaus/settings.json` under `homeDir`: the one
+ * {@link loadHooks} reads first, and the runtime-state floor keeps from an agent's tools.
+ */
+export function userSettingsFile(homeDir: string = homedir()): string {
+  return join(homeDir, SETTINGS_RELATIVE);
+}
+
+/**
  * Load and concatenate hooks from user + project `settings.json`. User entries
  * come first; project entries last. Missing files are not an error — returns
  * `[]` if neither path exists.
@@ -127,8 +143,7 @@ export class HookConfigError extends CrewhausError {
  */
 export async function loadHooks(opts: LoadHooksOptions = {}): Promise<HookDef[]> {
   const cwd = opts.cwd ?? process.cwd();
-  const home = opts.homeDir ?? homedir();
-  const userPath = join(home, SETTINGS_RELATIVE);
+  const userPath = userSettingsFile(opts.homeDir ?? homedir());
   const projectPath = join(cwd, SETTINGS_RELATIVE);
   const out: HookDef[] = [];
   // Skip the user file when it resolves to the same path as the project file
@@ -241,13 +256,14 @@ export async function runHooks(
     for (const r of results) {
       const allowed = r.decision.decision === "allow";
       bus.publish({
-        ...bus.envelope(),
+        ...bus.envelope(undefined, { parentSpanId: opts.parentSpanId }),
         kind: "hook_fired",
         event,
         ...(r.hook.matcher ? { matcher: r.hook.matcher } : {}),
         allowed,
         durationMs: r.durationMs,
         ...(r.decision.reason ? { reason: r.decision.reason } : {}),
+        ...(opts.toolUseId !== undefined ? { toolUseId: opts.toolUseId } : {}),
       });
     }
   }

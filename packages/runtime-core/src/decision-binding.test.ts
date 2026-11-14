@@ -348,6 +348,28 @@ describe("a grant is spent in the scope it was asked in", () => {
     expect(recordOf(granted.id)?.consumedByRun).toBe(tick.ctx.runId);
   });
 
+  test("a named schedule lane's next tick spends it, and another named lane asks again", async () => {
+    const ran: unknown[] = [];
+    const tools = [askedTool(ran)];
+    const granted = await runWithScope({ resumeScope: "lane:schedule:discovery" }, () =>
+      parkAndGrant(tools),
+    );
+    // A tick of another named lane is another scope: it parks a request of its own.
+    const other = await runWithScope({ resumeScope: "lane:schedule:weekly-report" }, () =>
+      loop({ tools }),
+    );
+    expect(parkedIdOf(other)).not.toBe(granted.id);
+    expect(ran).toEqual([]);
+    expect(recordOf(granted.id)?.consumedAt).toBeUndefined();
+    // The next tick of the lane it was asked in spends it.
+    const tick = await runWithScope({ resumeScope: "lane:schedule:discovery" }, () =>
+      loop({ tools }),
+    );
+    expect(tick.caught).toBeUndefined();
+    expect(ran).toEqual([{ x: 1 }]);
+    expect(recordOf(granted.id)?.consumedByRun).toBe(tick.ctx.runId);
+  });
+
   test("another conversation asks again with a new request, and the grant stays unspent", async () => {
     const ran: unknown[] = [];
     const tools = [askedTool(ran)];

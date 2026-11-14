@@ -228,6 +228,15 @@ export type CheckRunners = {
   readonly provabilityGraderNames?: ReadonlySet<string>;
   /** Whether the spec's compiled tools include one that writes outside the process. */
   readonly externalWriteTools?: (specYaml: string) => boolean;
+  /**
+   * The MCP servers the candidate adds or defines differently, and the tools it names
+   * that the base does not; `undefined` when that cannot be told. A recording of tool
+   * results is replayed for a check only when this answers an empty list.
+   */
+  readonly addedToolSurface?: (
+    baseYaml: string,
+    candidateYaml: string,
+  ) => ReadonlyArray<string> | undefined;
   /** The case ids a tool recording holds entries for; `undefined` when it cannot be
    *  read. Default: read `<dir>/tools.jsonl`. */
   readonly recordedSampleIds?: (dir: string) => ReadonlySet<string> | undefined;
@@ -286,6 +295,8 @@ export type CheckPlan = {
   readonly holdoutCases: number;
   readonly holdoutUses: number;
   readonly isolation: "regrade-only" | "recorded-tools" | "live" | "needs-live";
+  /** Why the check needs a live run, when `isolation` is `needs-live`. */
+  readonly isolationReason?: string;
   /** How the holdout runs are isolated, when there is a holdout to run. */
   readonly holdoutIsolation?: "recorded-tools" | "live" | "needs-live";
 };
@@ -370,6 +381,8 @@ async function resolveDataset(opts: CheckOptions, dataset: string): Promise<Reso
 type Isolation = {
   readonly isolation: "recorded-tools" | "live" | "needs-live";
   readonly replayToolsDir?: string;
+  /** Why, when `needs-live`. */
+  readonly reason?: string;
 };
 
 function writesOutside(opts: CheckOptions, specTexts: ReadonlyArray<string>): boolean {
@@ -377,16 +390,38 @@ function writesOutside(opts: CheckOptions, specTexts: ReadonlyArray<string>): bo
   return specTexts.some((text) => opts.runners.externalWriteTools?.(text) ?? false);
 }
 
+/**
+ * How the base and candidate runs are isolated. A recording of tool results is
+ * replayed only when the candidate adds no MCP server or tool the base lacks (the
+ * runner's `addedToolSurface` answers an empty list); when it adds one, or that
+ * cannot be told, the check runs live once a maintainer confirmed it, and needs a
+ * live run otherwise.
+ */
 function isolationOf(
   opts: CheckOptions,
-  specTexts: ReadonlyArray<string>,
+  [base, candidate]: readonly [base: string, candidate: string],
   recorded: RecordedRun | undefined,
 ): Isolation {
   const recording = recorded?.summary.config.toolRecording;
-  if (recording !== undefined)
-    return { isolation: "recorded-tools", replayToolsDir: recording.dir };
-  if (writesOutside(opts, specTexts) && opts.live === undefined) return { isolation: "needs-live" };
+  if (recording !== undefined) {
+    const added = opts.runners.addedToolSurface?.(base, candidate);
+    if (added !== undefined && added.length === 0) {
+      return { isolation: "recorded-tools", replayToolsDir: recording.dir };
+    }
+    if (opts.live !== undefined) return { isolation: "live" };
+    return { isolation: "needs-live", reason: addedSurfaceReason(added) };
+  }
+  if (writesOutside(opts, [base, candidate]) && opts.live === undefined) {
+    return { isolation: "needs-live", reason: NEEDS_LIVE_REASON };
+  }
   return { isolation: "live" };
+}
+
+/** Why recorded tool results cannot stand in for a candidate's tools. */
+function addedSurfaceReason(added: ReadonlyArray<string> | undefined): string {
+  return added === undefined
+    ? "which MCP servers and tools this change adds could not be determined, so recorded tool results cannot stand in for them; a maintainer can check it live (`crewhaus changes check --live`)"
+    : `this change adds an MCP server or tool (${added.join(", ")}) that recorded tool results cannot stand in for; a maintainer can check it live (\`crewhaus changes check --live\`)`;
 }
 
 /** The largest tool recording read to learn which cases it covers. */
@@ -446,7 +481,7 @@ export async function planCheck(opts: CheckOptions): Promise<CheckPlan | CheckAn
   if (row === undefined) return { ok: false, code: "not-found", reason: `no change ${opts.chg}` };
   const loaded = await loadInputs(opts.harnessDir, row);
   if (!loaded.ok) return { ok: false, code: loaded.code, reason: loaded.reason, row };
-  const { patch, candidateText, specYaml } = loaded.inputs;
+  const { patch, baseText, candidateText } = loaded.inputs;
   if (patch.kind === "dataset") {
     const cases = candidateText.split("\n").filter((l) => l.trim() !== "").length;
     return {
@@ -470,7 +505,7 @@ export async function planCheck(opts: CheckOptions): Promise<CheckPlan | CheckAn
     };
   }
   const recorded = opts.runners.recordedRun?.(dataset.name);
-  const texts = [specYaml, candidateText];
+  const texts: readonly [string, string] = [baseText, candidateText];
   const main = isolationOf(opts, texts, recorded);
   const holdoutCases = dataset.registry?.holdout ?? 0;
   const holdout =
@@ -484,6 +519,7 @@ export async function planCheck(opts: CheckOptions): Promise<CheckPlan | CheckAn
     holdoutCases,
     holdoutUses: holdoutCases > 0 ? 2 : 0,
     isolation: main.isolation,
+    ...(main.reason !== undefined ? { isolationReason: main.reason } : {}),
     ...(holdout !== undefined ? { holdoutIsolation: holdout.isolation } : {}),
   };
 }
@@ -671,12 +707,13 @@ async function runCheck(opts: CheckOptions): Promise<CheckAnswer> {
   const isolation: {
     readonly isolation: "regrade-only" | "recorded-tools" | "live" | "needs-live";
     readonly replayToolsDir?: string;
+    readonly reason?: string;
   } =
     patch.kind === "spec"
       ? isolationOf(opts, [baseText, candidateText], recorded)
       : { isolation: "regrade-only" };
   if (isolation.isolation === "needs-live") {
-    return { ok: false, code: "needs-live", reason: NEEDS_LIVE_REASON, row };
+    return { ok: false, code: "needs-live", reason: isolation.reason ?? NEEDS_LIVE_REASON, row };
   }
   // The holdout gets its own isolation, decided before anything runs or is counted.
   const holdoutIsolation =

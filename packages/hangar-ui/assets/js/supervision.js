@@ -609,6 +609,18 @@ export function controlOutcome(envelope) {
 /** Lanes control.v1 can actually poke; the other two are read-only rows. */
 export const POKEABLE_LANES = ["heartbeat", "schedule"];
 
+/** The name grammar of a named schedule lane (`schedule:<name>`). */
+const SCHEDULE_LANE_RE = /^schedule:[a-z][a-z0-9-]{0,31}$/;
+
+/**
+ * True for a lane an operator can wake: `heartbeat`, `schedule`, or a named
+ * schedule lane `schedule:<name>`. Whether it is armed right now is the row's
+ * `pokeable`, which the server decides.
+ */
+export function isWakeableLane(id) {
+  return typeof id === "string" && (POKEABLE_LANES.includes(id) || SCHEDULE_LANE_RE.test(id));
+}
+
 /**
  * One scheduler row + the view it came from → the lane's render model.
  *

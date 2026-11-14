@@ -6,6 +6,9 @@
  *
  * The real `runChatLoop` runs behind the `chatLoop` seam with a scripted model
  * whose one tool call records the protected roots the loop hands its tools.
+ *
+ * Also: what a candidate spec adds to the tool surface its base had: a recording of tool
+ * results stands in for a check only when this is empty.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -14,7 +17,7 @@ import { join } from "node:path";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
-import { qualityRunners } from "./quality-runners";
+import { addedToolSurface, qualityRunners } from "./quality-runners";
 
 const scratch: string[] = [];
 afterAll(() => {
@@ -139,6 +142,54 @@ async function checkedRoots(harness: string, spec: string | undefined): Promise<
   expect(seen).toHaveLength(1);
   return seen[0] ?? [];
 }
+
+function spec(tools: string[], servers: Record<string, string>): string {
+  const lines = [
+    "name: shop",
+    "target: cli",
+    "agent:",
+    "  model: claude-sonnet-4-5",
+    "  instructions: Help the customer.",
+    `tools: [${tools.join(", ")}]`,
+  ];
+  const names = Object.keys(servers);
+  if (names.length > 0) {
+    lines.push("mcp_servers:");
+    for (const name of names) {
+      lines.push(`  ${name}:`, "    transport: stdio", `    command: ${servers[name]}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+describe("addedToolSurface", () => {
+  const base = spec(["read"], { fs: "npx" });
+
+  test("equal specs add nothing", () => {
+    expect(addedToolSurface(base, base)).toEqual([]);
+  });
+
+  test("a spec that drops a tool adds nothing", () => {
+    expect(addedToolSurface(spec(["read", "write"], { fs: "npx" }), base)).toEqual([]);
+  });
+
+  test("a new MCP server is named", () => {
+    expect(addedToolSurface(base, spec(["read"], { fs: "npx", web: "npx" }))).toEqual(["web"]);
+  });
+
+  test("an MCP server under the same name with another command is named", () => {
+    expect(addedToolSurface(base, spec(["read"], { fs: "bunx" }))).toEqual(["fs"]);
+  });
+
+  test("a tool the base does not name is named", () => {
+    expect(addedToolSurface(base, spec(["read", "write"], { fs: "npx" }))).toEqual(["write"]);
+  });
+
+  test("a spec that cannot be read answers that it cannot tell", () => {
+    expect(addedToolSurface(base, "name: [unclosed\n")).toBeUndefined();
+    expect(addedToolSurface("target: 3\n", base)).toBeUndefined();
+  });
+});
 
 describe("a change check protects the checked spec's record", () => {
   test("a crewhaus.yaml reached through a link: its target directory's record is on the floor", async () => {

@@ -266,6 +266,11 @@ export type ApproverProjection = {
    * where a chat card sends a person to review a request in full.
    */
   readonly homeUrl?: string;
+  /**
+   * The real path of the Hangar root whose access records wrote this file. A local user's
+   * principal counts on this harness only when it comes from that root's records.
+   */
+  readonly accessRoot?: string;
 };
 
 // ---------------------------------------------------------------------------

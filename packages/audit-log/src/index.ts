@@ -102,6 +102,11 @@ export type AuditKind =
   // Pillar 3 sink-side fabric — egress-classifier emits one event per
   // external-tool invocation. Payload shape (informally; opaque JSON):
   //   { sinkId, sinkScope, verdict, originsFound, matchCount, originStack }
+  // runtime-core's tool-call record also carries `runId`, `sessionId`,
+  // `toolUseId` and, while the session root has its approvals digest key,
+  // `actionDigest` (session-store's `inputDigestOf`, the decision log's
+  // `inputDigest` for the same action), so the record joins its run, its
+  // tool call and that call's `verdict` lines by id.
   // The raw outbound payload is NEVER stored verbatim — only the lineage
   // summary. The egress-classifier's `summarizeEgress(result)` produces
   // the human-readable form that lands in the `payload_summary` field.
@@ -120,7 +125,9 @@ export type AuditKind =
   // `permission_decision` trace-bus event mirrors the same verdict + judge
   // identity for live observability. Payload shape (opaque JSON):
   //   { toolName, justification, verdict: "allow"|"deny", reason, judgeModel,
-  //     confidence? }
+  //     confidence?, runId, sessionId, toolUseId, actionDigest? }
+  // (`actionDigest` as on `egress_decision` above, present while the session
+  // root has its approvals digest key).
   // Stored verbatim because the justification IS the audit artifact;
   // redacting it would defeat the purpose. (`runtime-core` declares a minimal
   // structural `JustificationAuditSink` rather than importing this package, to

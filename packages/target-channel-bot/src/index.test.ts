@@ -2527,6 +2527,66 @@ describe("emitChannelBot — schedule: wake loop (Batch F, temporal contract)", 
   });
 });
 
+describe("emitChannelBot — named schedule lanes (#514)", () => {
+  // A quote, a backtick, `${x}` and a newline: the prompt must reach the
+  // output only as a quoted literal.
+  const TRICKY = 'Write the "weekly" report: `totals` for ${x}\nthen stop.';
+  const withLanes: IrChannelV0 = {
+    ...MIN_IR,
+    scheduleLanes: [
+      { name: "discovery", kind: "interval", everyMs: 7_200_000 },
+      {
+        name: "weekly-report",
+        kind: "cron",
+        cron: "0 17 * * 5",
+        timezone: "Europe/Berlin",
+        jitterMs: 60_000,
+        instructions: TRICKY,
+      },
+    ],
+  };
+  const daemon = fileMap(withLanes).get("daemon.ts") ?? "";
+  const count = (needle: string): number => daemon.split(needle).length - 1;
+
+  test("each lane is its own control lane, in name order, armed by one armScheduleLanes call", () => {
+    const discovery = daemon.indexOf('lane: "schedule:discovery"');
+    const weekly = daemon.indexOf('lane: "schedule:weekly-report"');
+    expect(discovery).toBeGreaterThan(-1);
+    expect(weekly).toBeGreaterThan(discovery);
+    expect(count("armScheduleLanes(")).toBe(1);
+    expect(daemon).not.toContain('lane: "schedule",');
+    expect(daemon).not.toContain("armSchedule(");
+    expect(daemon).toContain(
+      'import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";',
+    );
+  });
+
+  test("each wake runs a fresh-session turn with its lane's prompt, logged under the lane", () => {
+    expect(daemon).toContain("message: __scheduleLanes[0].instructions,");
+    expect(daemon).toContain("message: __scheduleLanes[1].instructions,");
+    expect(count("isNew: true,")).toBeGreaterThanOrEqual(2);
+    expect(daemon).toContain("[schedule:discovery] wake #");
+    expect(daemon).toContain("[schedule:weekly-report] wake #");
+    // The default prompt for a lane without instructions.
+    expect(daemon).toContain('"[scheduled wake] proceed with your standing instructions."');
+    // Drain and signal shutdown both cancel every lane.
+    expect(count("__scheduleLanesArmed?.cancel();")).toBe(2);
+  });
+
+  test("the prompt appears only as a quoted literal, and the file parses", () => {
+    expect(count(JSON.stringify(TRICKY))).toBe(1);
+    expect(count("${x}")).toBe(1);
+    expect(daemon).not.toContain(TRICKY);
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(daemon)).not.toThrow();
+  });
+
+  test("no lanes → nothing of the lane form is emitted", () => {
+    const plain = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(plain).not.toContain("__scheduleLanes");
+    expect(plain).not.toContain("armScheduleLanes");
+  });
+});
+
 describe("emitChannelBot — emitted scheduled daemon is syntactically valid TS", () => {
   test("Bun.Transpiler parses the scheduled daemon.ts", () => {
     const t = new Bun.Transpiler({ loader: "ts" });
