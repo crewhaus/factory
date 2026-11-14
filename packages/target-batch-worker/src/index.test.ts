@@ -487,6 +487,69 @@ describe("emitBatchWorker — schedule: wake loop (Batch F, temporal contract)",
   });
 });
 
+describe("emitBatchWorker — named schedule lanes (#514)", () => {
+  // A quote, a backtick, `${x}` and a newline: the prompt must reach the
+  // output only as a quoted literal.
+  const TRICKY = 'Write the "weekly" report: `totals` for ${x}\nthen stop.';
+  const withLanes: IrBatchV0 = {
+    ...baseIr,
+    scheduleLanes: [
+      { name: "discovery", kind: "interval", everyMs: 7_200_000 },
+      {
+        name: "weekly-report",
+        kind: "cron",
+        cron: "0 17 * * 5",
+        timezone: "Europe/Berlin",
+        jitterMs: 60_000,
+        instructions: TRICKY,
+      },
+    ],
+  };
+  const code = emitBatchWorker(withLanes, { readme: false }).files[0]?.content ?? "";
+  const count = (needle: string): number => code.split(needle).length - 1;
+
+  test("each lane is its own control lane, in name order, armed by one armScheduleLanes call", () => {
+    const discovery = code.indexOf('lane: "schedule:discovery"');
+    const weekly = code.indexOf('lane: "schedule:weekly-report"');
+    expect(discovery).toBeGreaterThan(-1);
+    expect(weekly).toBeGreaterThan(discovery);
+    expect(count("armScheduleLanes(")).toBe(1);
+    expect(code).not.toContain('lane: "schedule",');
+    expect(code).not.toContain("armSchedule(");
+    expect(code).toContain(
+      'import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";',
+    );
+  });
+
+  test("an in-memory lane worker keeps running: no idle exit", () => {
+    expect(code).not.toContain('"queue_idle"');
+    expect(code).toContain("const keepAliveMs = 200;");
+  });
+
+  test("each wake enqueues its lane's prompt, and its events name the lane", () => {
+    expect(code).toContain("await queue.enqueue(__scheduleLanes[0].instructions);");
+    expect(code).toContain("await queue.enqueue(__scheduleLanes[1].instructions);");
+    expect(code).toContain('lane: "discovery",');
+    expect(code).toContain('lane: "weekly-report",');
+    expect(code).toContain('emit({ kind: "schedule_armed", lane: __l.name');
+    // Drain and signal shutdown both cancel every lane.
+    expect(count("__scheduleLanesArmed?.cancel();")).toBe(2);
+  });
+
+  test("the prompt appears only as a quoted literal, and the file parses", () => {
+    expect(count(JSON.stringify(TRICKY))).toBe(1);
+    expect(count("${x}")).toBe(1);
+    expect(code).not.toContain(TRICKY);
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(code)).not.toThrow();
+  });
+
+  test("no lanes → nothing of the lane form is emitted", () => {
+    const plain = emitBatchWorker(baseIr, { readme: false }).files[0]?.content ?? "";
+    expect(plain).not.toContain("__scheduleLanes");
+    expect(plain).not.toContain("armScheduleLanes");
+  });
+});
+
 /**
  * Audit item 22 — the emitted worker's observable output (its stdout JSON
  * event stream) never contained a model reply: `onJobEnd` published only

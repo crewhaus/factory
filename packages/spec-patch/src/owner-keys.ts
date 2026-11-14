@@ -59,4 +59,14 @@ export const DELTA_090_KEYS: ReadonlyArray<OwnerKey> = Object.freeze([
     reason: "whether this gate may be loosened is the owner's decision",
     since: "0.9.0",
   } as const),
+  // Both forms of `schedule:` (#514): when a harness runs and what it spends.
+  // Never optimizable; no typed confirmation, since it is not a security bar.
+  Object.freeze({
+    pattern: Object.freeze(["schedule"]),
+    root: true,
+    refused: false,
+    security: false,
+    reason: "a schedule sets when this harness runs and what it spends; a person changes it",
+    since: "0.9.0",
+  } as const),
 ]);

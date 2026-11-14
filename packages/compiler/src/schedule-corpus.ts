@@ -33,3 +33,25 @@ export const SCHEDULE_OBJECT_CORPUS: Readonly<Record<string, string>> = Object.f
   ...withEach(CRON_OBJECT, "cron"),
   ...withEach(INTERVAL_OBJECT, "interval"),
 });
+
+/**
+ * Two named lanes, declared out of name order, the second holding a quote, a
+ * backtick, `${x}` and a newline in its instructions: the lane form lowers them
+ * sorted by name, and an emitter writes the instructions only as quoted data.
+ */
+const TWO_LANES = `schedule:
+  - name: weekly-report
+    kind: cron
+    cron: "0 17 * * 5"
+    timezone: Europe/Berlin
+    jitter: 1m
+    instructions: "Write the \\"weekly\\" report: \`totals\` for \${x}\\nthen stop."
+  - name: discovery
+    kind: interval
+    every: 2h
+`;
+
+/** Channel, managed and batch, each with the two lanes above. */
+export const SCHEDULE_LANES_CORPUS: Readonly<Record<string, string>> = Object.freeze(
+  withEach(TWO_LANES, "lanes"),
+);

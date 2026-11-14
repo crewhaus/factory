@@ -30,6 +30,7 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { isLaneId } from "@crewhaus/control-contract";
 import {
   CONTROL_PATH_PREFIX,
   CONTROL_PROTOCOL,
@@ -42,10 +43,16 @@ import {
 
 export type { ControlLane, ControlTimerReport };
 
+/**
+ * The two fixed lane ids. A daemon may also arm one `schedule:<name>` lane per
+ * named schedule (#513), which this list does not hold: {@link isControlLane}
+ * is the test for any lane id.
+ */
 export const CONTROL_LANES: readonly ControlLane[] = ["heartbeat", "schedule"];
 
+/** `heartbeat`, `schedule` or `schedule:<name>`: the daemon's own check, so the two cannot drift. */
 export function isControlLane(value: string): value is ControlLane {
-  return (CONTROL_LANES as readonly string[]).includes(value);
+  return isLaneId(value);
 }
 
 /** Why a control call did not succeed. Every one is renderable as a sentence. */

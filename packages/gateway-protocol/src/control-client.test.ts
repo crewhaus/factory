@@ -369,11 +369,19 @@ describe("the port", () => {
     expect(parseControlPort("listening on http://127.0.0.1:41777")).toBeUndefined();
   });
 
-  test("the two lanes, and nothing else, are lanes", () => {
+  test("the two fixed lanes and the named schedule lanes, and nothing else, are lanes", () => {
     expect([...CONTROL_LANES]).toEqual(["heartbeat", "schedule"]);
     expect(isControlLane("heartbeat")).toBe(true);
     expect(isControlLane("schedule")).toBe(true);
+    expect(isControlLane("schedule:discovery")).toBe(true);
+    expect(isControlLane(`schedule:a${"b".repeat(31)}`)).toBe(true);
     expect(isControlLane("janitor")).toBe(false);
+    expect(isControlLane("dream")).toBe(false);
     expect(isControlLane("")).toBe(false);
+    expect(isControlLane("schedule:")).toBe(false);
+    expect(isControlLane("schedule:Bad")).toBe(false);
+    expect(isControlLane("schedule:a_b")).toBe(false);
+    expect(isControlLane(`schedule:a${"b".repeat(32)}`)).toBe(false);
+    expect(isControlLane("heartbeat:x")).toBe(false);
   });
 });

@@ -1,7 +1,7 @@
 /**
- * Rewrites `absent-corpus.digests.json` and `schedule-object.digests.json`. Run
- * it only for a deliberate emitter change, and append a delta note to this
- * directory's README:
+ * Rewrites `absent-corpus.digests.json`, `schedule-object.digests.json` and
+ * `schedule-lanes.present.digests.json`. Run it only for a deliberate emitter
+ * change, and append a delta note to this directory's README:
  *
  *   bun packages/compiler/src/__fixtures__/delta-090/regenerate.ts
  */
@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { ABSENT_CORPUS } from "../../absent-corpus";
 import { compile } from "../../index";
-import { SCHEDULE_OBJECT_CORPUS } from "../../schedule-corpus";
+import { SCHEDULE_LANES_CORPUS, SCHEDULE_OBJECT_CORPUS } from "../../schedule-corpus";
 
 /** The date the corpus compiles at, so the model-sunset check cannot move a digest. */
 export const CORPUS_TODAY = "2026-09-04";
@@ -42,4 +42,5 @@ function write(name: string, corpus: Readonly<Record<string, string>>): void {
 if (import.meta.main) {
   write("absent-corpus.digests.json", ABSENT_CORPUS);
   write("schedule-object.digests.json", SCHEDULE_OBJECT_CORPUS);
+  write("schedule-lanes.present.digests.json", SCHEDULE_LANES_CORPUS);
 }

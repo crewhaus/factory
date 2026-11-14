@@ -1,5 +1,6 @@
 import type { Spec } from "../index";
 import { intentIssues } from "./intent";
+import { scheduleIssues } from "./schedule";
 
 /** Reports one cross-field issue: where it is, and what to do about it. */
 export type SpecAddIssue = (path: (string | number)[], message: string) => void;
@@ -11,4 +12,4 @@ export type SpecAddIssue = (path: (string | number)[], message: string) => void;
  * cannot move an existing spec's first error. Append, never reorder.
  */
 export const DELTA_090_ISSUES: ReadonlyArray<(data: Spec, custom: SpecAddIssue) => void> =
-  Object.freeze([intentIssues]);
+  Object.freeze([intentIssues, scheduleIssues]);

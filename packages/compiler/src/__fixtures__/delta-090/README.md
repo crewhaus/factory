@@ -13,6 +13,15 @@ with a cron `schedule:` object (timezone, jitter and instructions) and an interv
 generated before `schedule:` took a list, so the list form cannot move a byte of a spec that keeps the
 object form. `schedule-lanes.test.ts` holds it. Regenerate it under the same rule as the absent corpus.
 
+## The schedule list form
+
+`schedule-lanes.present.digests.json` pins what the list form compiles to: the same three specs, each
+with two named lanes declared out of name order (`weekly-report`, a cron lane whose instructions hold a
+quote, a backtick, `${x}` and a newline; then `discovery`, an interval lane). Unlike the files above it
+pins a feature that is present, so a deliberate change to how named lanes are emitted moves it:
+regenerate it in that pull request and add a delta note below. A change that moves it while touching
+nothing about named lanes is the same bug as above.
+
 ## When to regenerate
 
 Only for a deliberate emitter change, and never to quiet a failure you cannot explain. A pull request
