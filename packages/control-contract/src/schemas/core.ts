@@ -11,6 +11,7 @@ import {
   type CommandState,
   DECISION_CLASSES,
   DECISION_LOG_REASONS,
+  DELEGABLE_DECISION_KINDS,
   type DecisionState,
   type DeferReason,
   type DeploymentState,
@@ -26,6 +27,7 @@ import {
   PAGE_LIMIT_MAX,
   PROTOCOL_ID,
   QUALIFIERS,
+  RECEIPT_AUTHORITY_KINDS,
   RECEIPT_VIA,
   REF_MAX_LENGTH,
   ROLES,
@@ -308,6 +310,15 @@ export const commandReceipt = z
       })
       .passthrough(),
     winner: refString.optional(),
+    authority: z
+      .object({
+        kind: oneOf(RECEIPT_AUTHORITY_KINDS),
+        rule: ruleId,
+        revision: z.number().int().positive(),
+        clause: z.literal("rollback").optional(),
+      })
+      .strict()
+      .optional(),
   })
   .passthrough();
 
@@ -363,15 +374,36 @@ export const decisionOverlays = z
   .object({ assigned: z.object({ to: storedActor, at: timestamp }).strict().optional() })
   .strict();
 
-/** A standing-rule proposal's terms; `ruleKind` says which terms follow. */
-export const standingRuleTerms = z
+const delegationScopeValue = z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]);
+
+/** A delegation rule's terms: days, an optional use cap and the action's own scope fields. */
+export const delegationTerms = z
   .object({
-    ruleKind: z.literal("allow"),
-    tool: z.string(),
-    pattern: z.string(),
-    expiresAt: timestamp,
+    days: z.number().int().min(1).max(90),
+    maxUses: z.number().int().positive().optional(),
+    scope: z.record(delegationScopeValue).optional(),
   })
-  .passthrough();
+  .strict();
+
+/** A standing-rule proposal's terms; `ruleKind` says which terms follow. */
+export const standingRuleTerms = z.union([
+  z
+    .object({
+      ruleKind: z.literal("allow"),
+      tool: z.string(),
+      pattern: z.string(),
+      expiresAt: timestamp,
+    })
+    .passthrough(),
+  z
+    .object({
+      ruleKind: z.literal("delegate"),
+      action: z.string(),
+      terms: delegationTerms,
+      days: z.number().int().min(1).max(90),
+    })
+    .passthrough(),
+]);
 
 export const decision = z
   .object({
@@ -398,7 +430,15 @@ export const decision = z
     consumedAt: timestamp.optional(),
     consumedByRun: z.string().optional(),
     always: z.boolean().optional(),
-    kind: z.enum(["tool", "input", "standing-rule-proposal", "change-adoption"]).optional(),
+    kind: z
+      .enum([
+        "tool",
+        "input",
+        "standing-rule-proposal",
+        "change-adoption",
+        ...DELEGABLE_DECISION_KINDS,
+      ])
+      .optional(),
     decidedByPrincipal: storedActor.optional(),
     decidedVia: z.string().optional(),
     // A fresh request's id, or the run whose cancel withdrew this one (`run-cancelled`).
@@ -412,7 +452,13 @@ export const decision = z
     sensitivity: sensitivityName.optional(),
     ifUnanswered: oneOf(IF_UNANSWERED).optional(),
     expiredAt: timestamp.optional(),
-    resolvedBy: z.literal("policy").optional(),
+    resolvedBy: z.enum(["policy", "delegation"]).optional(),
+    delegation: z
+      .object({ rule: ruleId, revision: z.number().int().positive() })
+      .passthrough()
+      .optional(),
+    appliedBy: storedActor.optional(),
+    actionClass: z.literal("ship").optional(),
     agreementRevision: z.string().optional(),
     requiredClass: decisionClass.optional(),
     binding: decisionBinding.optional(),
@@ -429,13 +475,17 @@ export const decision = z
     proposedBy: storedActor.optional(),
     derivedFrom: decisionId.optional(),
     subject: z
-      .object({
-        chg: z.string().regex(/^chg_[0-9a-hjkmnp-tv-z]{26}$/),
-        patchDigest: z.string(),
-        baseRevision: z.string(),
-        evidenceDigest: z.string(),
-      })
-      .passthrough()
+      .union([
+        z
+          .object({
+            chg: z.string().regex(/^chg_[0-9a-hjkmnp-tv-z]{26}$/),
+            patchDigest: z.string(),
+            baseRevision: z.string(),
+            evidenceDigest: z.string(),
+          })
+          .passthrough(),
+        z.object({ ref: refString, revision: z.string().min(1) }).passthrough(),
+      ])
       .optional(),
   })
   .passthrough();
@@ -610,6 +660,7 @@ export const deployment = z
     autostart: z.boolean().optional(),
     activatedBy: storedActor.optional(),
     cmd: commandId.optional(),
+    delegation: z.object({}).passthrough().optional(),
   })
   .passthrough();
 
@@ -1001,8 +1052,11 @@ export const refResolved = z
   })
   .passthrough();
 
-/** Every core schema, by the id an operation row names it with. */
-export const CORE_SCHEMAS = {
+/**
+ * Every core schema, by the id an operation row names it with. Typed as a record: its
+ * literal type is longer than a declaration can hold.
+ */
+export const CORE_SCHEMAS: Readonly<Record<string, z.ZodTypeAny>> = {
   // Refined leaves.
   canonicalRunId,
   commandId,

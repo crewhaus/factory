@@ -52,7 +52,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan really reads the sources", () => {
-    expect(SOURCES.length).toBe(23);
+    expect(SOURCES.length).toBe(24);
     expect(imports.length).toBeGreaterThan(40);
     expect(imports.some((i) => i.path === "node:fs")).toBe(true);
     expect(imports.some((i) => i.path === "@crewhaus/tool-safety/fs")).toBe(true);
@@ -113,10 +113,28 @@ describe("what the package exports", () => {
   test("exactly the named surface", () => {
     expect(Object.keys(api).sort()).toEqual(
       [
+        "ACTION_DECISION_TTL_MS",
+        "CONSEQUENCES_LABEL",
+        "DELEGATION_HOST_LABEL",
+        "DELEGATION_TERMS_LABEL",
         "acquireMutatingLease",
+        "actionDecisionOf",
+        "actionDecisionState",
         "append",
         "appendClaim",
+        "appendDelegationLog",
         "appendPreparingRun",
+        "createDelegationReader",
+        "delegationLogLedger",
+        "delegationLogLineOf",
+        "delegationRuleOf",
+        "delegationsLedger",
+        "isDelegationTerms",
+        "openActionDecision",
+        "readActionDecisions",
+        "readDelegationLog",
+        "readDelegations",
+        "ruleUses",
         "CHANNEL_CONVERSATION_LABEL",
         "CHANNEL_MESSAGE_LABEL",
         "CHANNEL_SENDER_LABEL",

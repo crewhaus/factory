@@ -3,6 +3,7 @@
  * In the slice, IR shape mirrors the spec; later passes (ir-passes module)
  * will perform optimization and target-specific lowering.
  */
+import type { IrDelegationCeiling } from "./delegation";
 import type { IrScheduleLane } from "./schedule-lanes";
 
 export type IrPermissionRule = {
@@ -29,6 +30,8 @@ export type IrPermissions = {
    * (a safety control — excluded from `OPTIMIZABLE_PATHS`).
    */
   readonly askMode?: "pause" | "deny";
+  /** The delegation ceiling (`permissions.delegation`), only when the spec declares it. */
+  readonly delegation?: IrDelegationCeiling;
 };
 
 /**
@@ -2844,6 +2847,8 @@ export type Bundle = {
 
 // Named schedule lanes (#514). See ./schedule-lanes.ts.
 export type { IrScheduleLane } from "./schedule-lanes";
+// The delegation ceiling (#514). See ./delegation.ts.
+export type { IrDelegationCeiling } from "./delegation";
 
 // Generated-bundle README renderer (item 42) — pure functions over the IR,
 // shared by every target emitter. See ./readme.ts for the module docs.

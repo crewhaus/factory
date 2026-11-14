@@ -1,9 +1,21 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { AREA_RUNTIMES, activationGates, compositionProblems, retireRevokers } from "./areas";
+import {
+  AREA_RUNTIMES,
+  activationGates,
+  compositionProblems,
+  delegatedActions,
+  retireRevokers,
+} from "./areas";
 import { CORE_RUNTIME } from "./core-runtime";
-import type { ActivationGate, AreaRuntime, Executor, RetireRevoker } from "./executor";
+import type {
+  ActivationGate,
+  AreaRuntime,
+  DelegatedAction,
+  Executor,
+  RetireRevoker,
+} from "./executor";
 import { IDENTITY, fakeProbe, removeTempDirs, tempDir } from "./test-helpers";
 import { wireControl } from "./wire";
 
@@ -28,7 +40,7 @@ function wireWith(areas: readonly AreaRuntime[]) {
 describe("the composition", () => {
   test("the shipped composition passes, and the core registers daemon control, activation and decisions", () => {
     expect(compositionProblems(AREA_RUNTIMES)).toEqual([]);
-    expect(AREA_RUNTIMES.map((runtime) => runtime.area)).toEqual(["core"]);
+    expect(AREA_RUNTIMES.map((runtime) => runtime.area)).toEqual(["core", "delegation"]);
     expect(Object.keys(CORE_RUNTIME.executors ?? {}).sort()).toEqual([
       "controls.disable",
       "controls.drain",
@@ -76,8 +88,11 @@ describe("the composition", () => {
     expect(activationGates(AREA_RUNTIMES).map((gate) => gate.name)).toEqual([
       "protected-environment",
     ]);
-    // No area registers a retire revoker yet: the next one to do so changes this on purpose.
-    expect(retireRevokers(AREA_RUNTIMES)).toHaveLength(0);
+    // The delegation area's revoker ends every rule with the harness; the next area to
+    // register one changes this on purpose.
+    expect(retireRevokers(AREA_RUNTIMES).map((revoker) => revoker.name)).toEqual(["delegations"]);
+    // Nothing is delegable until an area registers an action.
+    expect(delegatedActions(AREA_RUNTIMES)).toEqual([]);
     expect(wireWith(AREA_RUNTIMES)).not.toThrow();
   });
 
@@ -176,6 +191,73 @@ describe("the composition", () => {
     ).not.toThrow();
   });
 
+  test("a delegated action named twice, resolving another kind, or acting through a kind with no executor is refused", () => {
+    const action: DelegatedAction = {
+      action: "merge",
+      decisionKind: "merge",
+      gates: {},
+      requiredGates: [],
+      scopeOf: () => undefined,
+      inScope: () => false,
+      oneAtATime: () => true,
+      planRollback: async () => undefined,
+      currentRevision: async () => undefined,
+      signals: async () => "unknown",
+      signalIds: [],
+      watchMs: () => 0,
+      previewTerms: async () => [],
+      executeKind: "quality.changes.withdraw",
+      rollbackKind: "quality.changes.decline",
+    };
+    const served: AreaRuntime = {
+      area: "quality",
+      executors: { "quality.changes.withdraw": noop, "quality.changes.decline": noop },
+    };
+    expect(
+      compositionProblems([
+        ...AREA_RUNTIMES,
+        served,
+        { area: "quality", delegatedActions: [action] },
+      ]),
+    ).toEqual([]);
+    expect(
+      compositionProblems([
+        ...AREA_RUNTIMES,
+        served,
+        { area: "quality", delegatedActions: [action] },
+        { area: "people", delegatedActions: [action] },
+      ]),
+    ).toEqual(['delegated action "merge" registered twice (areas "quality" and "people")']);
+    expect(
+      compositionProblems([
+        ...AREA_RUNTIMES,
+        served,
+        {
+          area: "quality",
+          delegatedActions: [{ ...action, decisionKind: "change-adoption" as never }],
+        },
+      ]),
+    ).toEqual([
+      'delegated action "merge" resolves "change-adoption", which no rule may resolve (area "quality")',
+    ]);
+    expect(
+      compositionProblems([
+        ...AREA_RUNTIMES,
+        served,
+        { area: "quality", delegatedActions: [{ ...action, decisionKind: "rollout" }] },
+      ]),
+    ).toEqual(['delegated action "merge" does not claim "rollout" (area "quality")']);
+    expect(
+      compositionProblems([
+        ...AREA_RUNTIMES,
+        { area: "quality", delegatedActions: [{ ...action, rollbackKind: "quality.nope" }] },
+      ]),
+    ).toEqual([
+      'delegated action "merge" acts through "quality.changes.withdraw", which has no executor (area "quality")',
+      'delegated action "merge" acts through "quality.nope", which no module declares (area "quality")',
+    ]);
+  });
+
   test("every problem is named in one error", () => {
     const problems = compositionProblems([
       { area: "nowhere", executors: { "controls.nope": noop, "controls.start": noop } },
@@ -190,7 +272,6 @@ describe("areas.ts keeps one guarded placeholder per area", () => {
     "ATTENTION",
     "COMPILER",
     "CREATION",
-    "DELEGATION",
     "HOME",
     "INSPECTION",
     "INTEGRATIONS",
@@ -203,7 +284,7 @@ describe("areas.ts keeps one guarded placeholder per area", () => {
   // A Windows checkout may carry CRLF line ends.
   const lines = readFileSync(join(import.meta.dir, "areas.ts"), "utf8").split(/\r?\n/);
 
-  test("twelve commented imports and twelve commented list entries, each between blank lines", () => {
+  test("eleven commented imports and eleven commented list entries, each between blank lines", () => {
     const imports = lines
       .map((line, at) => ({ line, at }))
       .filter(({ line }) =>
@@ -212,8 +293,8 @@ describe("areas.ts keeps one guarded placeholder per area", () => {
     const entries = lines
       .map((line, at) => ({ line, at }))
       .filter(({ line }) => /^ {2}\/\/ [A-Z]+_RUNTIME,$/.test(line));
-    expect(imports).toHaveLength(12);
-    expect(entries).toHaveLength(12);
+    expect(imports).toHaveLength(11);
+    expect(entries).toHaveLength(11);
     expect(imports.map(({ line }) => line.split(" ")[3])).toEqual(AREAS.map((a) => `${a}_RUNTIME`));
     expect(entries.map(({ line }) => line.trim().slice(3, -1))).toEqual(
       AREAS.map((a) => `${a}_RUNTIME`),

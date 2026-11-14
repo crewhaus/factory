@@ -33,6 +33,8 @@ export type HomePorts = {
   /** Attach a daemon this Home does not hold (a no-op without a runfile, or with a pid held). */
   adoptIfRunfile(harnessDir: string): Promise<void>;
   readonly control: Pick<ControlService["commands"], "recover" | "reconcile">;
+  /** One pass of a harness's delegation rules, as the scheduler. Never from a read. */
+  readonly delegations: Pick<ControlService["delegations"], "apply">;
   /** Evaluate the notification rules once and deliver what is due. */
   notificationsTick(): void;
 };

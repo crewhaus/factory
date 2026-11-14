@@ -22,6 +22,13 @@ pins a feature that is present, so a deliberate change to how named lanes are em
 regenerate it in that pull request and add a delta note below. A change that moves it while touching
 nothing about named lanes is the same bug as above.
 
+## The delegation ceiling
+
+`delegation.present.ir.json` is what `permissions.delegation` lowers to, as the IR's `permissions`
+for a cli spec that also declares a mode and a rule, compared as JSON text so a reordered key moves it
+(`delegation-ceiling.test.ts`). The key reaches no emitter: the same test compiles every shape that has
+`permissions:` with and without it and holds the files equal, so it adds no digest file here.
+
 ## When to regenerate
 
 Only for a deliberate emitter change, and never to quiet a failure you cannot explain. A pull request

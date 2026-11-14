@@ -157,6 +157,43 @@ describe("compile records a build of regular files only", () => {
   });
 });
 
+describe("compile records the delegation ceiling", () => {
+  function harnessWith(yamlText: string): string {
+    const harness = tmp("compile-record-ceiling-");
+    writeFileSync(join(harness, "crewhaus.yaml"), yamlText);
+    mkdirSync(join(harness, "dist"));
+    writeFileSync(join(harness, "dist", "agent.ts"), "// bundle\n");
+    return harness;
+  }
+  const record = (harness: string, yamlText: string) =>
+    recordCompiledBundle({
+      specPath: join(harness, "crewhaus.yaml"),
+      outDir: join(harness, "dist"),
+      yamlText,
+      written: [],
+      registryIdOf: () => undefined,
+    });
+  const base = readFileSync(join(WORKFLOW_FIXTURE, "crewhaus.yaml"), "utf8");
+  const prepared = (harness: string): Record<string, unknown> => {
+    const read = readDeployments(harness);
+    if (read.state !== "present") throw new Error(read.state);
+    return read.records[0] as Record<string, unknown>;
+  };
+
+  test("present: the prepared row carries it as the IR has it", async () => {
+    const yamlText = `${base.trimEnd()}\npermissions:\n  delegation:\n    max_days: 21\n`;
+    const harness = harnessWith(yamlText);
+    expect(await record(harness, yamlText)).toMatchObject({ recorded: true });
+    expect(prepared(harness)["delegation"]).toEqual({ maxDays: 21 });
+  });
+
+  test("absent: the prepared row has no delegation key", async () => {
+    const harness = harnessWith(base);
+    expect(await record(harness, base)).toMatchObject({ recorded: true });
+    expect(prepared(harness)).not.toHaveProperty("delegation");
+  });
+});
+
 describe("harnessBundleOf", () => {
   test("dist, build and the root are a harness's bundle directories; nothing else is", () => {
     const harness = tmp("compile-record-");

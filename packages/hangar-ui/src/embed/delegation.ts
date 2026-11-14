@@ -1,8 +1,10 @@
 /**
- * The delegation area's console modules, keyed by serve path. Empty until the
- * area adds a screen: it imports each new file `with { type: "text" }` here
- * and adds its row, and `../index.ts` already spreads this map.
+ * The delegation area's console modules, keyed by serve path. Each is imported
+ * `with { type: "text" }` here, and `../index.ts` already spreads this map.
  */
-import type { HangarAsset } from "./asset";
+import delegationsViewJs from "../../assets/js/views/delegations.js" with { type: "text" };
+import { type HangarAsset, asset } from "./asset";
 
-export const delegationAssets: Readonly<Record<string, HangarAsset>> = {};
+export const delegationAssets: Readonly<Record<string, HangarAsset>> = {
+  "/assets/js/views/delegations.js": asset(delegationsViewJs, "/assets/js/views/delegations.js"),
+};

@@ -6,10 +6,11 @@
  * sits between blank lines so two areas editing their own lines never conflict when one is
  * brought current with `main`. Keep the blanks.
  */
-import { AREA_MODULES, COMMAND_KINDS } from "@crewhaus/control-contract";
+import { AREA_MODULES, COMMAND_KINDS, DELEGABLE_DECISION_KINDS } from "@crewhaus/control-contract";
+import { ACTION_CLAIMS } from "@crewhaus/control-contract/delegation";
 import { CORE_RUNTIME } from "./core-runtime";
 import { PROTECTED_ENVIRONMENT_GATE } from "./deployments";
-import type { ActivationGate, AreaRuntime, RetireRevoker } from "./executor";
+import type { ActivationGate, AreaRuntime, DelegatedAction, RetireRevoker } from "./executor";
 
 // import { ATTENTION_RUNTIME } from "./areas/attention";
 
@@ -17,7 +18,7 @@ import type { ActivationGate, AreaRuntime, RetireRevoker } from "./executor";
 
 // import { CREATION_RUNTIME } from "./areas/creation";
 
-// import { DELEGATION_RUNTIME } from "./areas/delegation";
+import { DELEGATION_RUNTIME } from "./areas/delegation";
 
 // import { HOME_RUNTIME } from "./areas/home";
 
@@ -44,7 +45,7 @@ export const AREA_RUNTIMES: readonly AreaRuntime[] = [
 
   // CREATION_RUNTIME,
 
-  // DELEGATION_RUNTIME,
+  DELEGATION_RUNTIME,
 
   // HOME_RUNTIME,
 
@@ -66,8 +67,10 @@ export const AREA_RUNTIMES: readonly AreaRuntime[] = [
 /**
  * What is wrong with a composition, one line per problem: a kind no area module declares,
  * a kind registered twice, an area no module names, a kind that is not safe to repeat
- * with an executor but no reconciler, which recovery could only ever mark unknown, and a
- * retire revoker name registered twice.
+ * with an executor but no reconciler, which recovery could only ever mark unknown, a
+ * retire revoker name registered twice, and a delegated action named twice, resolving a
+ * decision kind no rule may resolve, or acting through a kind no module declares or no
+ * executor serves.
  */
 export function compositionProblems(areas: readonly AreaRuntime[]): readonly string[] {
   const problems: string[] = [];
@@ -141,7 +144,51 @@ export function compositionProblems(areas: readonly AreaRuntime[]): readonly str
       }
     }
   }
+  const actions = new Map<string, string>();
+  for (const runtime of areas) {
+    for (const action of runtime.delegatedActions ?? []) {
+      const where = `(area "${runtime.area}")`;
+      const first = actions.get(action.action);
+      if (first !== undefined) {
+        problems.push(
+          `delegated action "${action.action}" registered twice (areas "${first}" and "${runtime.area}")`,
+        );
+      } else {
+        actions.set(action.action, runtime.area);
+      }
+      const claims = (ACTION_CLAIMS as Readonly<Record<string, readonly string[]>>)[action.action];
+      if (!(DELEGABLE_DECISION_KINDS as readonly string[]).includes(action.decisionKind)) {
+        problems.push(
+          `delegated action "${action.action}" resolves "${action.decisionKind}", which no rule may resolve ${where}`,
+        );
+      } else if (claims === undefined || !claims.includes(action.decisionKind)) {
+        problems.push(
+          `delegated action "${action.action}" does not claim "${action.decisionKind}" ${where}`,
+        );
+      }
+      for (const kind of [action.executeKind, action.rollbackKind]) {
+        if (!Object.hasOwn(kinds, kind)) {
+          problems.push(
+            `delegated action "${action.action}" acts through "${kind}", which no module declares ${where}`,
+          );
+        } else if (!executors.has(kind)) {
+          problems.push(
+            `delegated action "${action.action}" acts through "${kind}", which has no executor ${where}`,
+          );
+        }
+      }
+    }
+  }
   return problems;
+}
+
+/**
+ * Every area's delegated actions, flattened in composition order.
+ *
+ * First consumer: the delegation service, which serves a rule only for one of these.
+ */
+export function delegatedActions(areas: readonly AreaRuntime[]): readonly DelegatedAction[] {
+  return areas.flatMap((runtime) => runtime.delegatedActions ?? []);
 }
 
 /** Every area's activation gates, flattened in composition order. */

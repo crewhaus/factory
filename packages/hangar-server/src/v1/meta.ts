@@ -20,8 +20,10 @@ import {
   parseId,
   parseRef,
 } from "@crewhaus/control-contract";
+import { ruleLabelOf } from "@crewhaus/control-contract/delegation";
 import {
   foldStates,
+  readDelegations,
   readDeployments,
   readStandingRules,
   runsLedger,
@@ -268,7 +270,22 @@ const resolveRule: RefResolver = async (ctx, ref) => {
   const { dir } = harnessDirOf(ctx, ref.scope);
   const read = readStandingRules(dir);
   const row = read.state === "present" ? read.rows.find((r) => r.id === ref.id) : undefined;
-  if (row === undefined) throw notFound("standing rule");
+  if (row === undefined) {
+    // A delegation rule is a `rule_` too, summarized from its closed label, never its terms.
+    const rules = readDelegations(dir);
+    const rule = rules.state === "present" ? rules.rows.find((r) => r.id === ref.id) : undefined;
+    if (rule === undefined) throw notFound("standing rule");
+    return {
+      status: 200,
+      body: {
+        kind: "rule",
+        ...hrefOf(ctx, `${ref.scope}/rule/${ref.id}`),
+        rev: `${rule.state}:${rule.revision}`,
+        summary: `A ${rule.state} delegation rule: ${ruleLabelOf(rule.action)}`,
+      },
+      scrubDir: dir,
+    };
+  }
   return {
     status: 200,
     body: {

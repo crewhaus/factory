@@ -829,6 +829,8 @@ describe("vocabulary", () => {
       "choice",
       "answered",
       "sensitivity",
+      "delegation",
+      "appliedBy",
     ]);
     expect(Object.isFrozen(DECISION_LOG_KEYS)).toBe(true);
     // Every reason list the core declares belongs to an event the log records.
@@ -850,5 +852,109 @@ describe("vocabulary", () => {
       expect.arrayContaining(["people-erased", "revision-changed"]),
     );
     expect(SYSTEM_SUPERSEDE_REASONS).not.toContain("other");
+  });
+});
+
+describe("verifyDecision, a delegated grant", () => {
+  const RULE = mintId("rule");
+  const DELEGATED: DecisionRecordView = {
+    id: mintId("dec"),
+    createdAt: BEFORE,
+    kind: "merge",
+    actionClass: "ship",
+    expiresAt: LATER,
+    decision: "grant",
+    decidedAt: BEFORE,
+    resolvedBy: "delegation",
+    delegation: { rule: RULE, revision: 2 },
+    appliedBy: "sys:scheduler",
+    subject: {
+      ref: "hrn_0123456789abcdef/work/wi_01JZ0000000000000000000000",
+      revision: "sha256:aa",
+    },
+  };
+  const LIVE = {
+    ruleState: { state: "active", revision: 2 },
+    ownerHolds: true,
+    subjectRevision: "sha256:aa",
+  } as const;
+  const delegated = (
+    record: Partial<DecisionRecordView> = {},
+    delegation: VerifyDecisionInput["delegation"] | null = LIVE,
+  ) =>
+    verifyDecision({
+      decision: { ...DELEGATED, ...record },
+      // No run binding and no decider is read: a consumer that matches nothing still passes.
+      consumer: { runId: "", resumeScope: "" },
+      approvers: { state: "unreadable" },
+      now: NOW,
+      ...(delegation !== null ? { delegation } : {}),
+    });
+
+  test("an active rule, an owner who holds, and the bound revision: ok", () => {
+    expect(delegated()).toEqual({ ok: true });
+  });
+
+  test("a rule that no longer applies, or an owner who lost authority, retires the grant", () => {
+    for (const state of ["suspended", "revoked", "expired", "exhausted"]) {
+      expect(delegated({}, { ...LIVE, ruleState: { state, revision: 2 } })).toEqual({
+        ok: false,
+        reason: "decider-not-authorized",
+        supersede: true,
+        supersedeReason: "rule-revoked",
+        detail: "the rule no longer applies",
+      });
+    }
+    for (const ownerHolds of [false, undefined]) {
+      expect(delegated({}, { ...LIVE, ownerHolds })).toMatchObject({
+        reason: "decider-not-authorized",
+        supersedeReason: "rule-revoked",
+      });
+    }
+  });
+
+  test("a moved subject or a newer rule revision is revision-changed", () => {
+    expect(delegated({}, { ...LIVE, subjectRevision: "sha256:bb" })).toEqual(
+      refused("revision-changed"),
+    );
+    expect(delegated({}, { ...LIVE, subjectRevision: undefined })).toEqual(
+      refused("revision-changed"),
+    );
+    expect(delegated({}, { ...LIVE, ruleState: { state: "active", revision: 3 } })).toMatchObject({
+      reason: "revision-changed",
+      supersedeReason: "revision-changed",
+    });
+  });
+
+  test("no rule state, no rule on the record, or a decider on it refuses", () => {
+    expect(delegated({}, null)).toMatchObject({
+      ok: false,
+      reason: "decider-not-authorized",
+      supersede: false,
+    });
+    expect(delegated({ delegation: undefined })).toMatchObject({
+      reason: "decider-not-authorized",
+      supersede: false,
+    });
+    expect(delegated({ decidedByPrincipal: "sys:scheduler" })).toMatchObject({
+      ok: false,
+      reason: "decider-not-authorized",
+      detail: "a delegated decision names no decider",
+    });
+    expect(delegated({ decidedByPrincipal: PRINCIPAL })).toMatchObject({
+      reason: "decider-not-authorized",
+    });
+  });
+
+  test("the shared checks still come first", () => {
+    expect(delegated({ consumedAt: BEFORE })).toEqual(refused("consumed"));
+    expect(delegated({ decision: "deny" })).toEqual(refused("not-a-grant"));
+    expect(delegated({ expiresAt: BEFORE })).toEqual(refused("expired"));
+  });
+
+  test("a fallback's record is still refused at the decider, as before", () => {
+    expect(withRecord({ resolvedBy: "policy" }, { delegation: LIVE })).toEqual(
+      refused("decider-not-authorized"),
+    );
   });
 });

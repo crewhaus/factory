@@ -1422,3 +1422,41 @@ describe("project memory and skills on a managed run", () => {
     expect(decide(cli, "AGENTS.md").decision).toBe("allow");
   });
 });
+
+describe("the delegation rules and their application log", () => {
+  const write = (path: string): ToolCallContext => ({
+    toolName: "Write",
+    input: { path },
+    operativeValues: [{ kind: "path", canonical: [path] }],
+    readOnly: false,
+    destructive: true,
+  });
+  const allowWrite: RuleSet = {
+    ...emptyRuleSet,
+    flag: [{ type: "alwaysAllow", pattern: "Write", source: "flag" }],
+  };
+
+  test("an agent's write to a harness's rules, a log segment, or Home's rules is refused by the floor", () => {
+    const cwd = tempDir("crewhaus-delegation-floor-");
+    const hangar = join(cwd, "hangar-home");
+    mkdirSync(hangar, { recursive: true });
+    const roots = runtimeStateRoots(undefined, undefined, cwd, { CREWHAUS_HANGAR_ROOT: hangar });
+    const targets = [
+      join(cwd, ".crewhaus", "run", "control", "delegations.jsonl"),
+      join(cwd, ".crewhaus", "run", "control", "delegation-log", "000001.jsonl"),
+      join(hangar, "control", "delegations.jsonl"),
+      join(hangar, "control", "delegation-log", "000001.jsonl"),
+    ];
+    for (const path of targets) {
+      const verdict = evaluateWithReason(write(path), "auto", allowWrite, {
+        protectedRoots: roots,
+      });
+      expect(`${relative(cwd, path)}:${verdict.decision}`).toBe(`${relative(cwd, path)}:deny`);
+    }
+    // A neighbour outside every root is left to the rules.
+    const outside = join(cwd, "notes", "delegations.jsonl");
+    expect(
+      evaluateWithReason(write(outside), "auto", allowWrite, { protectedRoots: roots }).decision,
+    ).toBe("allow");
+  });
+});

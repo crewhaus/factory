@@ -1339,7 +1339,9 @@ describe("the versioned API: every served operation, for every role and credenti
         return refuse;
       }
       if (capped(op.permission)) return refuse;
-      if (cmdRow) return refuse; // names no receipt this Home has: nothing to authorize against
+      // A `{cmd}` alone names no receipt this Home has: nothing to authorize against. One
+      // under `{h}` (a delegation's watch) is authorized against that harness.
+      if (cmdRow && !op.path.includes("{h}")) return refuse;
       if (harnessAbout) return holds(best(grants.home, grants.a), op.permission) ? ALLOW : refuse;
       return [grants.home, grants.a, grants.b].some((role) => holds(role, op.permission))
         ? ALLOW
@@ -1463,7 +1465,9 @@ describe("the versioned API: every served operation, for every role and credenti
   for (const cred of V1_CREDS) {
     test(`as ${cred}: every served operation is answered as the role table says`, async () => {
       const ops = await servedOps();
-      expect(ops.length).toBeGreaterThanOrEqual(45);
+      // The core's, and the delegation area's eleven.
+      expect(ops.length).toBeGreaterThanOrEqual(56);
+      expect(ops.filter((op) => op.id.startsWith("delegations."))).toHaveLength(11);
       const wrong: string[] = [];
       for (const op of ops) {
         const res = await world.t.fetchRaw(v1PathOf(op.path), {

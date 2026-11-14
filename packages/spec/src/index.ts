@@ -8,6 +8,7 @@ import {
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import { delegationBlock } from "./blocks/delegation";
 import { DELTA_090_ISSUES, type SpecAddIssue } from "./blocks/delta-090";
 import { intentBlock } from "./blocks/intent";
 import { scheduleBlockFrom } from "./blocks/schedule";
@@ -125,6 +126,7 @@ const permissionsBlock = z
      * of the optimizer's reach.
      */
     ask_mode: z.enum(["pause", "deny"]).optional(),
+    delegation: delegationBlock,
   })
   .strict()
   .optional();

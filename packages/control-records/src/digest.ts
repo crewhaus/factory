@@ -161,6 +161,28 @@ export const CHANNEL_MESSAGE_LABEL = "channel-message";
 export const CHANNEL_SENDER_LABEL = "channel-sender";
 
 /**
+ * The label of a delegation rule's consequences page digest (over the page's canonical
+ * material). Stored digests join forever: a pin.
+ *
+ * First consumer: control-service's delegation rules.
+ */
+export const CONSEQUENCES_LABEL = "delegation-consequences";
+
+/**
+ * The label of a delegation rule's terms digest. Stored digests join forever: a pin.
+ *
+ * First consumer: control-service's delegation rules.
+ */
+export const DELEGATION_TERMS_LABEL = "delegation-terms";
+
+/**
+ * The label of the host facts a delegation rule was turned on under. A pin.
+ *
+ * First consumer: control-service's delegation rules.
+ */
+export const DELEGATION_HOST_LABEL = "delegation-host";
+
+/**
  * What an append-only record holds for an unlinked local actor (`local:<user>@<host>`):
  * `local:#<keyedDigest(key, LOCAL_ACTOR_LABEL, [actor])>`, under the key of the root the
  * record lives in. One definition, so the decision log and the receipts join.

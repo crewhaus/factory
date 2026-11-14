@@ -299,6 +299,7 @@ export function retireSteps(options: RetireStepsOptions): RetireSteps {
         ...(options.harnessId !== undefined ? { harnessId: options.harnessId } : {}),
         actor: receipt.actor,
         now: options.now(),
+        cmd: receipt.id,
       };
       const failed: string[] = [];
       for (const revoker of revokers) {

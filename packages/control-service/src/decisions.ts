@@ -23,6 +23,15 @@
  * and a service principal never decides one, whatever its class. The first decision
  * wins; nothing is applied on a grant: adopting is the change's own command.
  *
+ * A `dec_` of kind `merge` or `rollout` asks whether a `ship`-class action may run. A
+ * person decides it the way a change adoption is decided; an owner's delegation rule may
+ * resolve it instead (`resolveDelegated`), through the same first-decision-wins claim,
+ * recorded as the rule's (`resolvedBy: "delegation"`), never as a person's. No surface's
+ * request can name `resolvedBy`.
+ *
+ * A request to the owner for a delegation rule (`terms.ruleKind: "delegate"`) is never
+ * granted here: an owner turns the rule on from its consequences page.
+ *
  * A local user or a principal decides on a harness with an approver projection only
  * through the Home that wrote it: who they are comes from the access records under
  * `deps.hangarRoot` when that is the root the projection names (`accessRoot`), and from
@@ -53,14 +62,17 @@ import {
   mintId,
 } from "@crewhaus/control-contract";
 import {
+  type ActionDecisionRow,
   type ApproverRead,
   type ChangeAdoptionRow,
   type ProposalRow,
+  actionDecisionState,
   casAppend,
   changeAdoptionState,
   decisionsLedger,
   ensureDigestKey,
   proposalState,
+  readActionDecisions,
   readApproverProjection,
   readChangeAdoptions,
   readProposals,
@@ -378,8 +390,31 @@ export type DeferRequest = {
   readonly via: ReceiptVia;
 };
 
+/** What a delegation rule's resolution of a decision asks for. */
+export type DelegatedResolveRequest = {
+  readonly harnessDir: string;
+  /** The `dec_` of kind `merge` or `rollout`. */
+  readonly ref: string;
+  /** The rule, at the revision whose terms and gates allowed it. */
+  readonly delegation: { readonly rule: string; readonly revision: number };
+  /** Who ran the pass: a stored actor or a system actor. It decided nothing. */
+  readonly appliedBy: string;
+};
+
+export type DelegatedResolveAnswer = {
+  readonly outcome: "decided" | "already-decided" | "expired" | "not-found" | "unavailable";
+  readonly decision?: ActionDecisionRow;
+  readonly reason?: string;
+};
+
 export type Decisions = {
   resolve(request: ResolveRequest, hooks?: ResolveHooks): Promise<ResolveAnswer>;
+  /**
+   * Resolve a pending `merge` or `rollout` decision as a delegation rule's: the same
+   * compare-and-set a person's decision takes, so the first decision wins. Only the
+   * delegation service calls this, after the rule's every check passed.
+   */
+  resolveDelegated(request: DelegatedResolveRequest): Promise<DelegatedResolveAnswer>;
   supersede(request: SupersedeRequest): Promise<DecisionSupersedeAnswer>;
   defer(request: DeferRequest): Promise<DeferAnswer>;
   /** Whether this actor may make and end standing rules on the harness. */
@@ -471,7 +506,7 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
   const mayDecideAdoption = (
     harnessDir: string,
     who: ApprovalPrincipal,
-    requiredClass: ChangeAdoptionRow["requiredClass"],
+    requiredClass: ChangeAdoptionRow["requiredClass"] | ActionDecisionRow["requiredClass"],
   ): boolean => {
     if (who.service === true) return false;
     const read = approvers(harnessDir);
@@ -537,6 +572,102 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     return { outcome: "decided", record: null, adoption: decided };
   }
 
+  async function resolveActionDecision(
+    request: ResolveRequest,
+    harnessDir: string,
+    who: ApprovalPrincipal,
+    row: ActionDecisionRow,
+  ): Promise<ResolveAnswer> {
+    const read = approvers(harnessDir);
+    if (read.state === "unreadable") {
+      return {
+        outcome: "forbidden",
+        record: null,
+        reason: `this harness's list of who may approve cannot be read (${read.reason}); rewrite it with \`crewhaus access sync\``,
+      };
+    }
+    if (who.service === true) {
+      return {
+        outcome: "forbidden",
+        record: null,
+        actionDecision: row,
+        reason: "a service credential never decides whether this runs; a person does",
+      };
+    }
+    if (!mayDecideAdoption(harnessDir, who, row.requiredClass)) {
+      return {
+        outcome: "forbidden",
+        record: null,
+        actionDecision: row,
+        reason: needsClassReason(row.requiredClass),
+      };
+    }
+    const nowMs = deps.now();
+    const state = actionDecisionState(row, nowMs);
+    if (state === "expired") return { outcome: "expired", record: null, actionDecision: row };
+    if (state !== "pending") {
+      return { outcome: "already-decided", record: null, actionDecision: row };
+    }
+    if (request.expect !== undefined && request.expect !== "pending") {
+      return {
+        outcome: "stale",
+        record: null,
+        actionDecision: row,
+        reason: "the decision is pending",
+      };
+    }
+    const by = await storedActor(harnessDir, request.actor, who);
+    const decided: ActionDecisionRow = {
+      ...row,
+      state: request.choice === "grant" ? "granted" : "denied",
+      decision: request.choice,
+      decidedAt: new Date(nowMs).toISOString(),
+      decidedByPrincipal: by,
+    };
+    // The first decision wins, a person's or a rule's: its generation claim decides.
+    const cas = await casAppend(decisionsLedger(harnessDir), row.id, "pending", decided);
+    if (!cas.ok) throw new Error(`control-service: the decision cannot be made: ${cas.reason}`);
+    if (!cas.applied) {
+      const current = readActionDecisions(harnessDir);
+      const winner =
+        current.state === "present" ? current.rows.find((r) => r.id === row.id) : undefined;
+      return { outcome: "already-decided", record: null, actionDecision: winner ?? row };
+    }
+    return { outcome: "decided", record: null, actionDecision: decided };
+  }
+
+  async function resolveDelegated(
+    request: DelegatedResolveRequest,
+  ): Promise<DelegatedResolveAnswer> {
+    const read = readActionDecisions(request.harnessDir);
+    if (read.state === "unreadable") return { outcome: "unavailable", reason: read.reason };
+    const row = read.state === "present" ? read.rows.find((r) => r.id === request.ref) : undefined;
+    if (row === undefined) return { outcome: "not-found" };
+    const nowMs = deps.now();
+    const state = actionDecisionState(row, nowMs);
+    if (state === "expired") return { outcome: "expired", decision: row };
+    if (state !== "pending") return { outcome: "already-decided", decision: row };
+    const decided: ActionDecisionRow = {
+      ...row,
+      state: "granted",
+      decision: "grant",
+      decidedAt: new Date(nowMs).toISOString(),
+      resolvedBy: "delegation",
+      delegation: { rule: request.delegation.rule, revision: request.delegation.revision },
+      appliedBy: request.appliedBy,
+    };
+    // The same claim a person's decision takes: whoever is first wins.
+    const cas = await casAppend(decisionsLedger(request.harnessDir), row.id, "pending", decided);
+    if (!cas.ok) return { outcome: "unavailable", reason: cas.reason };
+    if (!cas.applied) {
+      const current = readActionDecisions(request.harnessDir);
+      const winner =
+        current.state === "present" ? current.rows.find((r) => r.id === row.id) : undefined;
+      return { outcome: "already-decided", decision: winner ?? row };
+    }
+    return { outcome: "decided", decision: decided };
+  }
+
   /**
    * Whether a request to the owner still asks for exactly the rule its approval gives: the
    * approval is in the store (`rootDir`, else the harness's own root), was granted and
@@ -560,7 +691,12 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     if (record.decision !== "grant" || record.expiredAt !== undefined) return false;
     const narrow = standingPatternFor(record.toolName, record.input, harnessDir);
     if ("refused" in narrow) return false;
-    return record.toolName === row.terms.tool && narrow.pattern === row.terms.pattern;
+    const { terms } = row;
+    return (
+      terms.ruleKind === "allow" &&
+      record.toolName === terms.tool &&
+      narrow.pattern === terms.pattern
+    );
   };
 
   async function resolveProposal(
@@ -576,6 +712,10 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     const adoption =
       adoptions.state === "present" ? adoptions.rows.find((r) => r.id === request.ref) : undefined;
     if (adoption !== undefined) return resolveAdoption(request, harnessDir, who, adoption);
+    const actions = readActionDecisions(harnessDir);
+    const action =
+      actions.state === "present" ? actions.rows.find((r) => r.id === request.ref) : undefined;
+    if (action !== undefined) return resolveActionDecision(request, harnessDir, who, action);
     const read = approvers(harnessDir);
     if (read.state === "unreadable") {
       return {
@@ -601,8 +741,17 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     if (request.expect !== undefined && request.expect !== "pending") {
       return { outcome: "stale", record: null, proposal: row, reason: "the request is pending" };
     }
-    if (request.choice === "grant") {
-      const endProblem = ruleEndProblem(row.terms.expiresAt, nowMs);
+    const terms = row.terms;
+    if (request.choice === "grant" && terms.ruleKind === "delegate") {
+      return {
+        outcome: "invalid",
+        record: null,
+        proposal: row,
+        reason: `a delegation rule is turned on from its consequences page: crewhaus delegations enable ${terms.action} --proposal ${row.id} --harness <h> --confirm <name>`,
+      };
+    }
+    if (request.choice === "grant" && terms.ruleKind === "allow") {
+      const endProblem = ruleEndProblem(terms.expiresAt, nowMs);
       if (endProblem !== undefined) {
         return {
           outcome: "invalid",
@@ -645,18 +794,20 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
         current.state === "present" ? current.rows.find((r) => r.id === row.id) : undefined;
       return { outcome: "already-decided", record: null, proposal: winner ?? row };
     }
-    if (request.choice === "deny") return { outcome: "decided", record: null, proposal: decided };
+    if (request.choice === "deny" || terms.ruleKind !== "allow") {
+      return { outcome: "decided", record: null, proposal: decided };
+    }
     const made = await runRule(hooks, (cmd) =>
       createStandingRule({
         harnessDir,
         ...(ruleId !== undefined ? { id: ruleId } : {}),
-        tool: row.terms.tool,
-        pattern: row.terms.pattern,
+        tool: terms.tool,
+        pattern: terms.pattern,
         reason: "proposal",
-        derivedFrom: row.derivedFrom,
+        ...(row.derivedFrom !== undefined ? { derivedFrom: row.derivedFrom } : {}),
         proposal: row.id,
         createdBy: by,
-        expiresAt: row.terms.expiresAt,
+        expiresAt: terms.expiresAt,
         ...(cmd !== undefined ? { cmd } : {}),
         now: nowMs,
       }),
@@ -764,6 +915,7 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
 
   return {
     resolve,
+    resolveDelegated,
     async supersede(request) {
       const on = whoOn(request.actor, request.harnessDir);
       if ("refused" in on) return { outcome: "forbidden", record: null, reason: on.refused };

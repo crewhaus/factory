@@ -4,7 +4,27 @@
  * daemon, the supervisor's verbs), and a reconciler answers `unknown` whenever it cannot
  * observe the effect: nothing becomes `succeeded` without an observation.
  */
-import type { CommandReceipt, ReceiptEffect, ReceiptExecutor } from "@crewhaus/control-contract";
+import type {
+  CommandReceipt,
+  DelegableDecisionKind,
+  DelegationAction,
+  DelegationLogLine,
+  DelegationScope,
+  DelegationSubject,
+  DelegationTerms,
+  ReceiptEffect,
+  ReceiptExecutor,
+} from "@crewhaus/control-contract";
+import type {
+  ConsequenceLine,
+  GateId,
+  GateVerdict,
+  RollbackPlan,
+  ScopeFieldCheck,
+  SignalId,
+  SignalReading,
+  Watch,
+} from "@crewhaus/control-contract/delegation";
 import { type LeaseProbe, holderProvablyDead } from "@crewhaus/control-records";
 import type { HarnessSupervisor } from "@crewhaus/harness-supervisor";
 import type { Outcome } from "./refusal";
@@ -84,6 +104,8 @@ export type RetireRevokerContext = {
   /** The stored actor ref that retires it. */
   readonly actor: string;
   readonly now: number;
+  /** The retire's receipt, which a revoker's own records name. */
+  readonly cmd?: string;
 };
 
 /** One thing a revoker will end, as a retire's plan lists it. */
@@ -119,6 +141,79 @@ export type RunSweepContext = {
  */
 export type RunSweep = (harnessDir: string, ctx: RunSweepContext) => Promise<number>;
 
+/** What a delegated action's code is shown: the harness, and the time. */
+export type DelegatedActionContext = {
+  readonly harnessDir: string;
+  readonly now: number;
+};
+
+/** What a gate is asked to check: the exact revision a verdict binds to. */
+export type GateContext = DelegatedActionContext & {
+  readonly bindTo: string;
+};
+
+/**
+ * One held-out gate, evaluated by the control plane over evidence the agent cannot write.
+ * Fail-closed: only `pass` passes; a gate with no data answers `unknown` or `not-run`.
+ */
+export type Gate = {
+  evaluate(subject: DelegationSubject, ctx: GateContext): Promise<GateVerdict>;
+};
+
+/**
+ * What one action is narrowed to inside the active ceiling: the scope fields a rule may
+ * set, each with its check. Absent (`scopeOf` answers `undefined`): the ceiling does not
+ * allow the action at all.
+ */
+export type DelegatedActionScope = {
+  readonly fields: Readonly<Record<string, ScopeFieldCheck>>;
+  /** The ceiling's own members for this action, as the action reads them. */
+  readonly ceiling: Readonly<Record<string, unknown>>;
+};
+
+/**
+ * An action a delegation rule may cover: the decision kind it resolves, the gates it
+ * requires (never droppable, never read from a rule's terms), how it narrows to a scope,
+ * how it undoes itself and what it watches afterwards, and the two command kinds that act
+ * (`executeKind`) and undo (`rollbackKind`), whose executors the same composition
+ * registers. An area registers one; nothing is delegable until one is.
+ */
+export type DelegatedAction = {
+  readonly action: DelegationAction;
+  readonly decisionKind: DelegableDecisionKind;
+  readonly gates: Partial<Record<GateId, Gate>>;
+  readonly requiredGates: readonly GateId[];
+  /** The action's scope inside the active ceiling, or `undefined` when it allows none. */
+  scopeOf(ceiling: Readonly<Record<string, unknown>>): DelegatedActionScope | undefined;
+  /** Whether a rule's terms, inside the scope, hold this subject. */
+  inScope(terms: DelegationTerms, scope: DelegatedActionScope, subject: DelegationSubject): boolean;
+  /** The action's one-at-a-time condition, read from the application log. */
+  oneAtATime(log: readonly DelegationLogLine[], subject: DelegationSubject): boolean;
+  /** How the action would be undone; `undefined` when it cannot be planned. */
+  planRollback(
+    subject: DelegationSubject,
+    ctx: DelegatedActionContext,
+  ): Promise<RollbackPlan | undefined>;
+  /** The subject's revision now, read where the action reads it; `undefined` when unknown. */
+  currentRevision(
+    subject: DelegationSubject,
+    ctx: DelegatedActionContext,
+  ): Promise<string | undefined>;
+  /** What a watch's signals say on one read. A signal with no data is `unknown`. */
+  signals(watch: Watch, ctx: DelegatedActionContext): Promise<SignalReading>;
+  /** The signals a watch reads. */
+  readonly signalIds: readonly SignalId[];
+  /** How long a watch stays open after the action. */
+  watchMs(terms: DelegationTerms, scope: DelegationScope): number;
+  /** The host facts the consequences page states, from closed templates. */
+  previewTerms(
+    scope: DelegatedActionScope,
+    ctx: DelegatedActionContext,
+  ): Promise<readonly ConsequenceLine[]>;
+  readonly executeKind: string;
+  readonly rollbackKind: string;
+};
+
 /** An area's running code for the command kinds it owns. Later slots join this type. */
 export type AreaRuntime = {
   /** The area's name, as its module in control-contract declares it. */
@@ -136,6 +231,8 @@ export type AreaRuntime = {
   readonly retireRevokers?: readonly RetireRevoker[];
   /** Run once per harness each recovery visits, in composition order. */
   readonly runSweeps?: readonly RunSweep[];
+  /** The actions a delegation rule may cover, each served by this composition. */
+  readonly delegatedActions?: readonly DelegatedAction[];
 };
 
 /** An executor stamp, with `probed: false` when the probe could not say when it started. */

@@ -22,6 +22,7 @@ import { COMMAND_HANDLERS } from "./commands";
 import type { CapabilityProvider, RefResolver, V1Handler } from "./context";
 import { CONTROL_HANDLERS } from "./controls";
 import { DECISION_HANDLERS } from "./decisions";
+import { HOME_DELEGATION } from "./delegations";
 import { DEPLOYMENT_HANDLERS } from "./deployments";
 import { DEVICE_HANDLERS } from "./device";
 import { HARNESS_HANDLERS } from "./harnesses";
@@ -69,7 +70,7 @@ export const HOME_AREAS: readonly HomeAreaRuntime[] = [
 
   // HOME_CREATION,
 
-  // HOME_DELEGATION,
+  HOME_DELEGATION,
 
   // HOME_HOME,
 

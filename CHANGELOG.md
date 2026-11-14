@@ -442,6 +442,11 @@ these on: they reach every harness that uses what each one names.
   `provability.grounded.window_tokens`. A person can make any of these
   changes with `crewhaus propose` or by editing `crewhaus.yaml`.
 
+- **Only an owner sets how long delegation rules may last.** `crewhaus
+  optimize`, `crewhaus advise --apply` and Home's automatic apply never set or
+  change `permissions.delegation`, alone or inside a whole `permissions` value.
+  An owner sets it by editing `crewhaus.yaml`.
+
 - **An eval judge with no credentials leaves its cases not measured.** When
   a judge's model provider has no credentials, `crewhaus eval` records its
   cases as not measured (`no_judge_credentials`), never a pass or a fail:

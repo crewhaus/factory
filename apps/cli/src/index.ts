@@ -24381,6 +24381,21 @@ switch (subcommand) {
     }
     break;
   }
+  case "delegations": {
+    // An owner's delegation rules (./delegations-cmd), through the same control service
+    // Home uses; the verbs work with Home stopped.
+    try {
+      const { runDelegationsCommand } = await import("./delegations-cmd");
+      const out = await runDelegationsCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "commands": {
     // The receipts every change is recorded under, read from the command ledgers
     // (./commands-cmd), through the same control service the other verbs use.

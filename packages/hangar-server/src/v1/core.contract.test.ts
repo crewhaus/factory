@@ -12,7 +12,7 @@ import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import { casAppend, deploymentsLedger } from "@crewhaus/control-records";
 import { appendRunLedger, newRunId } from "@crewhaus/harness-supervisor";
 import { type V1Home, v1Home } from "../__test__/v1-home";
-import { HOME_AREAS, SIGN_IN_OPERATIONS, V1_NOT_SERVED, handlersOf } from "./areas";
+import { HOME_AREAS, HOME_CORE, SIGN_IN_OPERATIONS, V1_NOT_SERVED, handlersOf } from "./areas";
 
 type Schema = { safeParse(value: unknown): { success: boolean; error?: unknown } };
 const schemaOf = (id: string) => (SCHEMAS as unknown as Readonly<Record<string, Schema>>)[id];
@@ -222,7 +222,8 @@ describe("every served operation answers its row's shape", () => {
         body: { code: started.userCode, choice: "deny" },
       },
     };
-    const served = [...handlersOf(HOME_AREAS).keys()];
+    // The core's own handlers; an area's are asked in its own contract test.
+    const served = [...handlersOf([HOME_CORE]).keys()];
     expect(served.filter((id) => !(id in asks))).toEqual([]);
     const shapes: string[] = [];
     const ok: string[] = [];
