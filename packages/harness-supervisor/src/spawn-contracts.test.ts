@@ -555,11 +555,14 @@ describe("on Windows a loader setting is one name in any letter case", () => {
     async () => {
       const dir = tempHarness();
       const marker = join(dir, "preloaded.marker");
-      const preload = join(dir, "x.ts");
+      const preloadFile = join(dir, "x.ts");
       writeFileSync(
-        preload,
+        preloadFile,
         `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "preloaded");\n`,
       );
+      // Bun reads a backslash in an option value as an escape, so the path
+      // is written with forward slashes, which Windows accepts.
+      const preload = preloadFile.replaceAll("\\", "/");
       writeFileSync(join(dir, ".env"), `bun_options=--preload ${preload}\n`);
       const managerCwd = emptyDir();
       const spawn = buildSpawnEnv({
