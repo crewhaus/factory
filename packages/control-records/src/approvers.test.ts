@@ -197,6 +197,21 @@ describe("readApproverProjection", () => {
     }
   });
 
+  test("accessRoot is kept when it is an absolute path", () => {
+    const read = reader()(harnessWith({ ...PROJECTION, accessRoot: "/srv/home/hangar" }));
+    expect(read.state === "present" && read.projection.accessRoot).toBe("/srv/home/hangar");
+  });
+
+  test("an accessRoot that is not an absolute path is left out, and the file stays readable", () => {
+    for (const bad of [42, null, "", "hangar", "./hangar", { at: "/srv" }]) {
+      const read = reader()(harnessWith({ ...PROJECTION, accessRoot: bad }));
+      expect(read.state).toBe("present");
+      if (read.state !== "present") continue;
+      expect("accessRoot" in read.projection).toBe(false);
+      expect(read.projection.owner).toBe(PROJECTION.owner);
+    }
+  });
+
   test("a member's until is read: before it the member decides, after it the member does not", () => {
     const withUntil = (until: string) =>
       reader()(

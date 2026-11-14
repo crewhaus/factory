@@ -126,6 +126,14 @@ export class HookConfigError extends CrewhausError {
 }
 
 /**
+ * The user-level hooks file, `~/.crewhaus/settings.json` under `homeDir`: the one
+ * {@link loadHooks} reads first, and the runtime-state floor keeps from an agent's tools.
+ */
+export function userSettingsFile(homeDir: string = homedir()): string {
+  return join(homeDir, SETTINGS_RELATIVE);
+}
+
+/**
  * Load and concatenate hooks from user + project `settings.json`. User entries
  * come first; project entries last. Missing files are not an error — returns
  * `[]` if neither path exists.
@@ -135,8 +143,7 @@ export class HookConfigError extends CrewhausError {
  */
 export async function loadHooks(opts: LoadHooksOptions = {}): Promise<HookDef[]> {
   const cwd = opts.cwd ?? process.cwd();
-  const home = opts.homeDir ?? homedir();
-  const userPath = join(home, SETTINGS_RELATIVE);
+  const userPath = userSettingsFile(opts.homeDir ?? homedir());
   const projectPath = join(cwd, SETTINGS_RELATIVE);
   const out: HookDef[] = [];
   // Skip the user file when it resolves to the same path as the project file

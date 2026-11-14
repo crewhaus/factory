@@ -92,6 +92,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { AREA_MODULES } from "@crewhaus/control-contract";
+import { SECURITY_SETTINGS_PATHS } from "@crewhaus/control-service";
 import { MAX_TEXT_BYTES } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
@@ -1414,17 +1415,6 @@ export function settingsDiff(before: string, after: string): string[] {
 function serializeSettings(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
-
-/**
- * The settings keys that decide what the agent may do, what runs, and which environment
- * files (with the credentials in them) the harness is started with.
- */
-const SECURITY_SETTINGS_PATHS: ReadonlyArray<readonly string[]> = [
-  ["permissions"],
-  ["hooks"],
-  ["manager", "hooks"],
-  ["manager", "envFiles"],
-];
 
 /** Which of {@link SECURITY_SETTINGS_PATHS} differ between two settings documents. */
 export function securityKeysChanged(beforeText: string, afterText: string): string[] {

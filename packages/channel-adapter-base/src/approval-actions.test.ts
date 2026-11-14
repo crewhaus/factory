@@ -83,6 +83,8 @@ function plantProjection(
       governedSince: new Date(Date.now() - 86_400_000).toISOString(),
       members,
       links,
+      // The Home root this file's decision services run under (`<harness>/home`).
+      accessRoot: join(dir, "home"),
       ...extra,
     })}\n`,
   );

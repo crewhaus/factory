@@ -1073,14 +1073,15 @@ export const permissionsSuggest: RegisteredTool = buildTool({
         `${rejected.length} proposal(s) were refused because the rule would also match calls the human never approved (see rejected); those tools will keep asking until a human writes a rule by hand`,
       );
     }
-    // A tool a recorded call of which carried a credential gets no allow rule.
-    // The answer names the tool, never the value.
+    // A tool a recorded call of which carried a credential, or a value no
+    // rule's pattern can hold, gets no allow rule. The answer names the tool,
+    // never the value.
     const skipped = skippedSuggestions(aggregates, thresholds);
     if (skipped.length > 0) {
       unknowns.add(
         "skipped",
-        "screened each recorded call for a credential",
-        `${skipped.map((s) => s.toolName).join(", ")}: a recorded call carried a credential, so no allow rule is proposed; approve such calls one at a time`,
+        "screened each recorded call for a credential and for a value no rule can show",
+        skipped.map((s) => `${s.toolName}: ${s.note}`).join("; "),
       );
     }
 

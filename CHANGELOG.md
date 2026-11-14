@@ -154,10 +154,11 @@ these on: they reach every harness that uses what each one names.
   cannot be read, the project memory files the runtime loads there,
   `AGENTS.md`, `CLAUDE.md`, `CODE-COMPANION.md`, `AGENT.md` and `LESSONS.md`,
   exactly those files, and the skill directories `.crewhaus/skills` and
-  `~/.crewhaus/skills`, which an operator edits; and Hangar's directory and
+  `~/.crewhaus/skills`, which an operator edits; Hangar's directory and
   registry:
   `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always, and wherever the
-  run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT` puts them. The floor
+  run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT` puts them; and the
+  user-level hooks file `~/.crewhaus/settings.json`, exactly that file. The floor
   also reads the directory a call keeps a tool's store in. In a working directory
   that holds `crewhaus.yaml` or `crewhaus.yml`, it also covers `dist`, `build` and
   `node_modules`; in a compiled non-interactive bundle running from that
@@ -636,6 +637,22 @@ these on: they reach every harness that uses what each one names.
 - **Slack approval clicks are answered once the decision is recorded.** The
   card update, the follow-up and the continued reply happen after the answer.
   Recompile a daemon to pick this up.
+
+- **A standing rule's pattern is printable, and a damaged rule record loads
+  only the allows it names.** `crewhaus permissions suggest`, the
+  `PermissionsSuggest` tool, `crewhaus approvals grant --always` and a wider
+  `--pattern` never make a rule whose pattern holds a control or
+  bidirectional-text character, a multi-line command's newline included (the
+  value "cannot be written as a rule"). A tool whose approved calls hold such
+  a value gets no allow proposal from `crewhaus permissions suggest` or
+  `PermissionsSuggest`, neither for that value nor for the whole tool, and
+  the report names the tool. `crewhaus approvals` prints any such pattern it
+  finds as an escaped string. While the harness's
+  standing-rule record (`standing-rules.jsonl` under `.crewhaus/run/control/`)
+  cannot be read in full, the `alwaysAllow` entries of
+  `.crewhaus/settings.json` load only where a readable row names them; denies
+  and asks always load, and a `.crewhaus` kept elsewhere through a link, which
+  holds no record, loads them as written.
 
 - **A graph node's upstream state is labelled as a workflow step's.** The
   input a graph node receives — the run's state with earlier nodes' outputs,

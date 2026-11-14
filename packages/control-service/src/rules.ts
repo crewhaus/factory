@@ -39,6 +39,7 @@ import {
   appendSettingsRule,
   emptyRuleSet,
   evaluate,
+  holdsDisplayControl,
   loadSettingsRules,
   narrowPatternFor,
   parsePermissionsConfig,
@@ -158,9 +159,14 @@ export function standingPatternFor(
   return narrow;
 }
 
+/** Why a rule's pattern is refused for the characters it holds. */
+const DISPLAY_CONTROL_PROBLEM =
+  "a rule's pattern cannot hold control or bidirectional-text characters";
+
 /**
  * Why a wider pattern the owner typed is refused: it must be a rule for the same tool,
- * compile, and grant the call it is made from.
+ * hold no control or bidirectional-text character, compile, and grant the call it is
+ * made from.
  */
 export function widenedPatternProblem(
   toolName: string,
@@ -171,6 +177,7 @@ export function widenedPatternProblem(
   if (!pattern.startsWith(`${toolName}(`) || !pattern.endsWith(")")) {
     return `a wider rule names the same tool with an argument: ${toolName}(<glob>)`;
   }
+  if (holdsDisplayControl(pattern)) return DISPLAY_CONTROL_PROBLEM;
   if (carriesCredential(pattern)) return "a rule must not hold a credential";
   const values = callValues(toolName, input, harnessDir);
   const operativeValues = values === "no-scoping-argument" ? undefined : values;
@@ -257,10 +264,17 @@ function messageOf(err: unknown): string {
 /**
  * Make a standing rule, under the harness's control lock: end the expired ones, write
  * the row, then the settings entry. When the entry cannot be written the row is
- * revoked again, so no rule stands that allows nothing.
+ * revoked again, so no rule stands that allows nothing. A pattern or tool holding a
+ * control or bidirectional-text character, and an end that is not after `now` or is
+ * more than {@link MAX_RULE_DAYS} days after it, are refused before anything is written.
  */
 export async function createStandingRule(write: RuleWrite): Promise<RuleWriteAnswer> {
   const { harnessDir, now } = write;
+  if (holdsDisplayControl(write.pattern) || holdsDisplayControl(write.tool)) {
+    return { ok: false, reason: DISPLAY_CONTROL_PROBLEM };
+  }
+  const endProblem = ruleEndProblem(write.expiresAt, now);
+  if (endProblem !== undefined) return { ok: false, reason: endProblem };
   const ledger = standingRulesLedger(harnessDir);
   const answer = await withLedgerLock(ledger, async (): Promise<RuleWriteAnswer> => {
     try {
@@ -459,6 +473,24 @@ export function ruleEnd(nowMs: number, days: number): string {
   return iso(nowMs + days * DAY_MS);
 }
 
+/**
+ * Why a rule may not end at `expiresAt` when it is made at `nowMs`, or `undefined`: the
+ * end is a time in the form `Date.prototype.toISOString` writes, after `nowMs` and at
+ * most {@link MAX_RULE_DAYS} days after it.
+ */
+export function ruleEndProblem(expiresAt: string, nowMs: number): string | undefined {
+  const end = Date.parse(expiresAt);
+  // A rule's end is shown to a person: it is a time only in the one form the writers write.
+  if (!Number.isFinite(end) || new Date(end).toISOString() !== expiresAt) {
+    return "the rule's end is not a time";
+  }
+  if (end <= nowMs) return "the rule would already have ended";
+  if (end > nowMs + MAX_RULE_DAYS * DAY_MS) {
+    return `a standing rule lasts at most ${MAX_RULE_DAYS} days`;
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // The rules a head lists and ends
 // ---------------------------------------------------------------------------
@@ -515,7 +547,13 @@ export function createRules(decisions: Decisions, now: () => number): Rules {
     list(harnessDir) {
       const unreadable: string[] = [];
       const nowMs = now();
-      const rules = rowsOf(readStandingRules(harnessDir), "The standing rules", unreadable)
+      const ruleRead = readStandingRules(harnessDir);
+      if (ruleRead.state === "present" && ruleRead.anomalies.length > 0) {
+        unreadable.push(
+          `Part of the standing rules cannot be read (${ruleRead.anomalies.join("; ")}); a settings allow no readable rule names is not loaded`,
+        );
+      }
+      const rules = rowsOf(ruleRead, "The standing rules", unreadable)
         .filter((row) => ruleIsLive(row, nowMs))
         .map((row) => ({
           ...row,
