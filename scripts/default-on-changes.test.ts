@@ -5630,3 +5630,19 @@ describe("device sign-in", () => {
     expect(bullet).toContain("bidi");
   });
 });
+
+describe("the release notes name the tenant ids a managed daemon reserves", () => {
+  test("every reserved tenant id is named in the default-on list", async () => {
+    const { RESERVED_TENANT_IDS } = await import("../packages/gateway-server/src/coded");
+    expect(RESERVED_TENANT_IDS.size).toBeGreaterThan(0);
+    const later = defaultOnBullets(changelog, LATER_HEADINGS).join("\n");
+    for (const id of RESERVED_TENANT_IDS) {
+      expect(`${id}: ${later.includes(`\`${id}\``)}`).toBe(`${id}: true`);
+    }
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("refuses a client token whose `tenant_id`"),
+      ) ?? "";
+    expect(bullet).toContain("any letter case");
+  });
+});

@@ -128,7 +128,12 @@ import {
 } from "./coded";
 import type { ResolveRunEvents, RunHandler, RunInputVerdict, UsageDelta } from "./index";
 
-export { GatewayCodedError, MANAGED_RUN_HANDLER } from "./coded";
+export {
+  GatewayCodedError,
+  HOME_RUN_TENANT,
+  MANAGED_RUN_HANDLER,
+  RESERVED_TENANT_IDS,
+} from "./coded";
 
 /** What started a run this module records. */
 const API_TRIGGER: Trigger = Object.freeze({ kind: "api" });
@@ -444,6 +449,8 @@ export type QueueManagedRunOptions = {
   readonly sessionId?: string;
   /** Who queued it: a stored actor (`prn_…`, `sys:…` or `local:#<digest>`), never a raw `local:`. */
   readonly by: string;
+  /** The credential (`crd_…`) it was queued with, written on its `queued` row beside `by`. */
+  readonly byCredential?: string;
   /**
    * Who the run serves, as a verified source named them. Kept in the input
    * file only, which the follower removes once it has read it.
@@ -495,6 +502,9 @@ export function queueManagedRun(opts: QueueManagedRunOptions): QueueManagedRunAn
   if (opts.cmd !== undefined && !isId("cmd", opts.cmd)) {
     return { ok: false, reason: "cmd must be a command receipt id (cmd_…)" };
   }
+  if (opts.byCredential !== undefined && !isId("crd", opts.byCredential)) {
+    return { ok: false, reason: "byCredential must be a credential id (crd_…)" };
+  }
   const now = opts.now ?? Date.now;
   const record: QueuedInput = {
     v: 1,
@@ -531,6 +541,7 @@ export function queueManagedRun(opts: QueueManagedRunOptions): QueueManagedRunAn
     trigger: API_TRIGGER,
     tenant: opts.tenant,
     by: opts.by,
+    ...(opts.byCredential !== undefined ? { byCredential: opts.byCredential } : {}),
     ...(opts.deployment !== undefined ? { deployment: opts.deployment } : {}),
     ...(opts.cmd !== undefined ? { cmd: opts.cmd } : {}),
   });
@@ -666,6 +677,22 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
       return NO_ROWS;
     }
     return startRows(runId, tenantId, fields);
+  }
+
+  /**
+   * Whether a client-named run id is already taken: any run of any tenant in any state
+   * holds it on the ledger, or a queued input is saved under it. A ledger that cannot
+   * be folded, or an input path that cannot be checked, counts as taken.
+   */
+  function clientRunIdTaken(runId: string): boolean {
+    const folded = foldStates(ledger);
+    if (!folded.ok || folded.objects.has(runId)) return true;
+    try {
+      lstatSync(join(harnessDir, controlPaths(harnessDir).inputsDir, `${runId}.json`));
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ENOENT";
+    }
   }
 
   /** The claim an idempotency value takes: a digest of who asked and the value, never the value. */
@@ -910,6 +937,13 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
         return { runId: first["run"], sessionId: first["session"], tenantId: tenant.id };
       }
     }
+    const taken = async (): Promise<GatewayCodedError> => {
+      // Nothing runs under this value, so it names no run.
+      if (idemClaim !== undefined) await expireClaim(ledger, idemClaim, Number.POSITIVE_INFINITY);
+      return new GatewayCodedError(ErrorCode.Conflict, `run ${runId} is already taken`);
+    };
+    // A client-named id is only ever a new one: never a run or a queued input already held.
+    if (p.runId !== undefined && clientRunIdTaken(p.runId)) throw await taken();
     const subject = subjectOf(tenant, args.sub);
     const resumeScope = sessionScope(sessionId);
     const started = claimAndStart(
@@ -918,11 +952,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
       { session: sessionId, resumeScope },
       p.runId !== undefined,
     );
-    if (started === "taken") {
-      // Nothing runs under this value, so it names no run.
-      if (idemClaim !== undefined) await expireClaim(ledger, idemClaim, Number.POSITIVE_INFINITY);
-      throw new GatewayCodedError(ErrorCode.Conflict, `run ${runId} is already taken`);
-    }
+    if (started === "taken") throw await taken();
     const rows = started;
     const run: LiveRun = { tenantId: tenant.id, cancelled: false };
     live.set(runId, run);
