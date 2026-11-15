@@ -22,6 +22,7 @@ import {
   readApproverProjection,
   readProposals,
   readStandingRules,
+  standingRulesLedger,
 } from "@crewhaus/control-records";
 import { emptyRuleSet, evaluate, loadSettingsRules } from "@crewhaus/permission-engine";
 import { foldReadOnly, generateApprovalId } from "@crewhaus/session-store";
@@ -960,6 +961,26 @@ describe("superseding an approval and the standing rules made from it", () => {
     expect(answer.ruleError).toContain(`crewhaus approvals rules --dir ${r.harness}`);
   });
 
+  test("a rule lock that cannot be taken is named, and the supersede stands", async () => {
+    const r = governed();
+    const { p, rule } = await ownerRule(r, "notes/a.md");
+    const lock = join(r.harness, standingRulesLedger(r.harness).lock);
+    rmSync(lock, { force: true });
+    mkdirSync(lock, { recursive: true });
+    const answer = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: p.id,
+      reason: "decided-in-error",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(answer.outcome).toBe("superseded");
+    expect(answer.derivedRules).toEqual([]);
+    expect(answer.ruleError).toContain("not a lock file");
+    expect(answer.ruleError).toContain(`crewhaus approvals rules --dir ${r.harness}`);
+    expect(ruleState(r.harness, rule.id)).toBe("active");
+  });
+
   test("a rule record with a line that cannot be read is named, and the rule it holds still ends", async () => {
     const r = governed();
     const { p } = await ownerRule(r, "notes/a.md");
@@ -985,7 +1006,10 @@ describe("superseding an approval and the standing rules made from it", () => {
   });
 });
 
-describe("a rule's pattern holds no control or bidirectional-text character", () => {
+describe("a rule's pattern holds no control, bidirectional-text or other invisible character", () => {
+  // A zero-width space, a line separator and a tag character.
+  const invisible = ["\u200b", "\u2028", "\u{E0041}"];
+
   test("no narrow rule names such a call, and no wider pattern holds one", () => {
     const harness = tempDir();
     expect(standingPatternFor("Write", { path: "a\u001b[2Jb" }, harness)).toEqual({
@@ -995,14 +1019,28 @@ describe("a rule's pattern holds no control or bidirectional-text character", ()
       refused: "not-representable",
     });
     expect(widenedPatternProblem("Write", { path: "a.md" }, "Write(a\u202e*)", harness)).toContain(
-      "control or bidirectional-text characters",
+      "control, bidirectional-text or other invisible character",
     );
+    for (const char of invisible) {
+      expect(standingPatternFor("Write", { path: `a${char}b.md` }, harness)).toEqual({
+        refused: "not-representable",
+      });
+      expect(
+        widenedPatternProblem("Write", { path: "a.md" }, `Write(a${char}*)`, harness),
+      ).toContain("other invisible character");
+    }
     expect(widenedPatternProblem("Write", { path: "a.md" }, "Write(a*)", harness)).toBeUndefined();
   });
 
   test("createStandingRule refuses one and writes nothing", async () => {
     const harness = tempDir();
-    for (const pattern of ["Write(a\u202eb)", "Write(a\u0085b)", "Write(a\u001bb)"]) {
+    const patterns = [
+      "Write(a\u202eb)",
+      "Write(a\u0085b)",
+      "Write(a\u001bb)",
+      ...invisible.map((char) => `Write(a${char}b)`),
+    ];
+    for (const pattern of patterns) {
       const answer = await createStandingRule({
         harnessDir: harness,
         tool: "Write",
@@ -1013,6 +1051,7 @@ describe("a rule's pattern holds no control or bidirectional-text character", ()
         now: NOW,
       });
       expect(answer.ok).toBe(false);
+      expect(answer.ok ? undefined : answer.reason).toContain("other invisible character");
     }
     expect(readStandingRules(harness).state).toBe("absent");
     expect(settingsOf(harness)).toBeUndefined();
@@ -1177,6 +1216,40 @@ describe("a request to the owner is granted only on the terms its approval gives
     expect(answer.outcome).toBe("invalid");
     expect(pendingOf(r.harness, r.honest.id)).toBe("pending");
     expect(readStandingRules(r.harness).state).toBe("absent");
+  });
+
+  test("a request whose approval is superseded after the request is decided makes no rule", async () => {
+    const r = await filed();
+    const answer = await r.service.decisions.resolve(
+      {
+        harnessDir: r.harness,
+        ref: r.honest.id,
+        choice: "grant",
+        actor: as(r.owner),
+        via: "cli",
+      },
+      {
+        // The request is decided; its approval is superseded just before the rule is written.
+        ruleCommand: async (run) => {
+          const sup = await r.service.decisions.supersede({
+            harnessDir: r.harness,
+            ref: r.p.id,
+            reason: "decided-in-error",
+            actor: as(r.owner),
+            via: "cli",
+          });
+          expect(sup.outcome).toBe("superseded");
+          return run(undefined);
+        },
+      },
+    );
+    expect(answer.outcome).toBe("decided");
+    expect(answer.rule).toBeUndefined();
+    expect(answer.ruleError).toContain("ask for it again");
+    expect(pendingOf(r.harness, r.honest.id)).toBe("granted");
+    const rules = readStandingRules(r.harness);
+    expect(rules.state === "present" ? rules.rows : []).toEqual([]);
+    expect(JSON.stringify(settingsOf(r.harness) ?? {})).not.toContain("Write(notes/a.md)");
   });
 
   test("a deny needs none of it", async () => {

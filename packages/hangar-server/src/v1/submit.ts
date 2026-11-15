@@ -26,6 +26,8 @@ export type Submitted<T> = {
 type CommandInput<T> = {
   readonly target?: string;
   readonly ledger: LedgerChoice;
+  /** The harness directory a workspace-ledger command acts on (`SubmitRequest.onHarness`). */
+  readonly onHarness?: string;
   readonly effect?: InlineEffect<T>;
   /** The kind, when it is not the operation's id. */
   readonly kind?: string;
@@ -40,6 +42,7 @@ function requestOf(ctx: V1Context, input: CommandInput<unknown>): SubmitRequest 
       : {}),
     ...(input.target !== undefined ? { target: input.target } : {}),
     ledger: input.ledger,
+    ...(input.onHarness !== undefined ? { onHarness: input.onHarness } : {}),
     via: ctx.via,
     body: ctx.body,
     params: ctx.params,

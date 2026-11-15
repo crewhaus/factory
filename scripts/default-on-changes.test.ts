@@ -3769,6 +3769,10 @@ describe("the release notes name what the decision service changes for every har
     expect(narrowPatternFor("Write", { path: "a\u001b[2Jb" }, undefined)).toEqual({
       refused: "not-representable",
     });
+    // So is one with a zero-width space.
+    expect(narrowPatternFor("Write", { path: "a\u200bb" }, undefined)).toEqual({
+      refused: "not-representable",
+    });
     const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-damaged-")));
     try {
       mkdirSync(join(dir, ".crewhaus", "run", "control"), { recursive: true });
@@ -3820,6 +3824,9 @@ describe("the release notes name what the decision service changes for every har
     expect(bullet).toContain("`standing-rules.jsonl`");
     expect(bullet).toContain("denies and asks always load");
     expect(bullet).toContain("gets no allow proposal");
+    expect(bullet).toContain("zero-width space");
+    expect(bullet).toContain("line or paragraph separator");
+    expect(bullet).toContain("tag character");
   });
 
   test("crewhaus approvals leaves a receipt, refuses with 55, and an --always no rule can name decides nothing", async () => {

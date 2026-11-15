@@ -18,12 +18,14 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ensureAccessSetUp, localActorOf, openAccess } from "@crewhaus/access-control";
+import { mintId } from "@crewhaus/control-contract";
 import {
   append,
   casAppend,
@@ -32,7 +34,7 @@ import {
   foldStates,
   readDeployments,
 } from "@crewhaus/control-records";
-import { commandsLedgerOf } from "@crewhaus/control-service";
+import { commandsLedgerOf, currentLocalIdentity } from "@crewhaus/control-service";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import type { Clock, ProcessOps, SpawnRequest, SpawnedProcess } from "@crewhaus/harness-supervisor";
 import { hashSpecSource } from "@crewhaus/harness-supervisor";
@@ -1763,4 +1765,102 @@ describe("a disabled harness is refused at each terminal entry point and spawns 
       g.cleanup();
     }
   });
+});
+
+describe("a start on a harness with an approver list names a principal only from the Home that wrote it", () => {
+  /**
+   * Home A, owned by this process's user; Home B, another root whose records link this
+   * user to A's owner; and the fixture harness, whose approver list names A.
+   */
+  async function homes(f: Fixture) {
+    const identity = currentLocalIdentity();
+    const a = join(dirname(f.dir), "home-a");
+    const setUpA = await ensureAccessSetUp(a, { localActor: localActorOf(identity) });
+    if (!setUpA.ok) throw new Error(setUpA.reason);
+    const owner = setUpA.result.owner;
+    const b = join(dirname(f.dir), "home-b");
+    const setUpB = await ensureAccessSetUp(b, {
+      localActor: localActorOf({ username: "someone-else", hostname: "elsewhere" }),
+    });
+    if (!setUpB.ok) throw new Error(setUpB.reason);
+    const link = mintId("lnk");
+    const at = new Date().toISOString();
+    const by = setUpB.result.owner;
+    appendFileSync(
+      join(b, "access", "principals.jsonl"),
+      `${JSON.stringify({ id: owner, kind: "member", state: "active", at, by })}\n`,
+    );
+    appendFileSync(
+      join(b, "access", "links.jsonl"),
+      `${JSON.stringify({
+        id: link,
+        principal: owner,
+        provider: "local",
+        subjectRef: "e".repeat(64),
+        verifiedVia: "owner",
+        state: "active",
+        at,
+        by,
+      })}\n`,
+    );
+    const subjectsFile = join(b, "access", "subjects.json");
+    const subjects = JSON.parse(readFileSync(subjectsFile, "utf8")) as {
+      links: Record<string, string>;
+    };
+    subjects.links[link] = localActorOf(identity);
+    writeFileSync(subjectsFile, `${JSON.stringify(subjects, null, 2)}\n`);
+    const control = join(f.dir, ".crewhaus", "run", "control");
+    mkdirSync(control, { recursive: true });
+    writeFileSync(
+      join(control, "approvers.json"),
+      `${JSON.stringify({
+        v: 1,
+        epoch: 1,
+        generatedAt: at,
+        harness: "hrn_00000000000000d1",
+        owner,
+        governedSince: new Date(Date.now() - 86_400_000).toISOString(),
+        members: [],
+        links: [],
+        accessRoot: realpathSync(a),
+      })}\n`,
+    );
+    return { a, b, owner };
+  }
+
+  const startAs = async (f: Fixture, hangarRoot: string) => {
+    const out = await runDaemonCommand(["start", "--no-preflight"], {
+      ...f.opts,
+      env: { ...f.opts.env, CREWHAUS_HANGAR_ROOT: hangarRoot },
+    });
+    expect(out.exitCode).toBe(0);
+    const start = receiptsOf(f.dir).find((r) => r["kind"] === "controls.start");
+    const read = readDeployments(f.dir);
+    const active = read.state === "present" ? read.active : undefined;
+    return { actor: start?.["actor"], activatedBy: active?.["activatedBy"] };
+  };
+
+  test("under another Home's records the start and its activation record the keyed local actor", async () => {
+    const f = fixture();
+    try {
+      const { b } = await homes(f);
+      const { actor, activatedBy } = await startAs(f, b);
+      expect(actor).toMatch(/^local:#[0-9a-f]{64}$/);
+      expect(activatedBy).toMatch(/^local:#[0-9a-f]{64}$/);
+    } finally {
+      f.cleanup();
+    }
+  }, 20_000);
+
+  test("under the Home the approver list names, both record the owner", async () => {
+    const f = fixture();
+    try {
+      const { a, owner } = await homes(f);
+      const { actor, activatedBy } = await startAs(f, a);
+      expect(actor).toBe(owner);
+      expect(activatedBy).toBe(owner);
+    } finally {
+      f.cleanup();
+    }
+  }, 20_000);
 });

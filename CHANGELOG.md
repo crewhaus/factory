@@ -673,8 +673,10 @@ these on: they reach every harness that uses what each one names.
   only the allows it names.** `crewhaus permissions suggest`, the
   `PermissionsSuggest` tool, `crewhaus approvals grant --always` and a wider
   `--pattern` never make a rule whose pattern holds a control or
-  bidirectional-text character, a multi-line command's newline included (the
-  value "cannot be written as a rule"). A tool whose approved calls hold such
+  bidirectional-text character, an invisible format character such as a
+  zero-width space, a line or paragraph separator, or a tag character, a
+  multi-line command's newline included (the value "cannot be written as a
+  rule"). A tool whose approved calls hold such
   a value gets no allow proposal from `crewhaus permissions suggest` or
   `PermissionsSuggest`, neither for that value nor for the whole tool, and
   the report names the tool. `crewhaus approvals` prints any such pattern it

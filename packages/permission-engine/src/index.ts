@@ -1456,9 +1456,9 @@ export function removeSettingsRule(
  * - `several-places` — the call acted on more than one place, which one rule
  *   value cannot cover;
  * - `not-representable` — the value cannot be written as a rule value (a path
- *   outside the workspace, a parenthesis, a control or bidirectional-text
- *   character), or the rule written for it would not match the call it came
- *   from;
+ *   outside the workspace, a parenthesis, a control, bidirectional-text or
+ *   other invisible character), or the rule written for it would not match
+ *   the call it came from;
  * - `every-value` — the call acted on every value at once (a listing by
  *   prefix or pattern), which only a wildcard rule covers.
  *
@@ -1541,12 +1541,18 @@ export function narrowPatternFor(
 /**
  * A character a rule's pattern never holds: a C0 or C1 control (U+0000-U+001F,
  * U+007F-U+009F), a bidirectional embedding, override or isolate
- * (U+202A-U+202E, U+2066-U+2069), or a bidirectional mark (U+200E, U+200F,
- * U+061C). Each can make a pattern read differently from what it matches.
+ * (U+202A-U+202E, U+2066-U+2069), a bidirectional mark (U+200E, U+200F,
+ * U+061C), any other invisible format character (Unicode category Cf: the
+ * zero-width space, joiners, the word joiner, the soft hyphen and the byte
+ * order mark among them), the line and paragraph separators (U+2028, U+2029)
+ * or a tag character (U+E0000-U+E007F). Each can make a pattern read
+ * differently from what it matches. A no-break space and a variation selector
+ * are not among them. The expression carries the `u` flag: a reader that
+ * builds another from its `source` gives it the `u` flag too.
  */
 export const DISPLAY_CONTROL_RE =
   // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
-  /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+  /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\p{Cf}\p{Zl}\p{Zp}\u{E0000}-\u{E007F}]/u;
 
 /** Whether `text` holds a character of {@link DISPLAY_CONTROL_RE}. */
 export function holdsDisplayControl(text: string): boolean {
@@ -1557,8 +1563,9 @@ export function holdsDisplayControl(text: string): boolean {
  * The pattern for `value`, when the rule it writes grants the call it came
  * from. A parenthesis is refused: the pattern is split at its first `(`, and
  * a reader of a rule with nested parentheses cannot tell where the argument
- * ends. A control or bidirectional-text character is refused: a person reads
- * the pattern before it allows anything, and it must read as it matches.
+ * ends. A control, bidirectional-text or other invisible character
+ * ({@link DISPLAY_CONTROL_RE}) is refused: a person reads the pattern before
+ * it allows anything, and it must read as it matches.
  */
 function grantsItsCall(
   toolName: string,

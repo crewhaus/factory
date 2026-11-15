@@ -1,14 +1,16 @@
 /**
  * Standing rules through the API: the live rules of a harness, making one from a
  * decision, and ending one. Only the harness's owner makes or ends a rule, and never a
- * service. A rule is made from a decision the request names: its tool, and the narrowest
- * pattern that covers the call, unless the owner names a wider one the rule allows.
+ * service. A rule is made from a granted decision the request names that still stands
+ * (asked again under the rule lock): its tool, and the narrowest pattern that covers the
+ * call, unless the owner names a wider one the rule allows.
  */
 import {
   DEFAULT_RULE_DAYS,
   type DecisionActor,
   MAX_RULE_DAYS,
   type Settlement,
+  approvalStillStands,
   createStandingRule,
   outcomeOf,
   standingPatternFor,
@@ -16,6 +18,7 @@ import {
 } from "@crewhaus/control-service";
 import { CREDENTIAL_FORM_WORDS } from "@crewhaus/spec-patch";
 import { foldApprovals } from "../approvals";
+import { resolveSessionRoot } from "../sessions";
 import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { fleetSnapshot } from "./lists";
@@ -79,15 +82,16 @@ const create: V1Handler = async (ctx) => {
   const from = ctx.body["derivedFrom"];
   const record =
     typeof from === "string" ? foldApprovals(dir).approvals.find((a) => a.id === from) : undefined;
-  if (record === undefined) {
-    throw new V1Error({
+  const notStanding = () =>
+    new V1Error({
       status: 422,
       code: "invalid",
       reason: "derived_from",
-      message: "A standing rule is made from a decision: name it in derivedFrom.",
+      message:
+        "A standing rule is made from a granted decision that still stands: name it in derivedFrom.",
       verb: "crewhaus approvals grant <id> --always",
     });
-  }
+  if (record === undefined) throw notStanding();
   const tool = String(ctx.body["tool"]);
   const pattern = String(ctx.body["pattern"]);
   if (tool !== record.toolName) {
@@ -110,6 +114,9 @@ const create: V1Handler = async (ctx) => {
           : "No standing rule can name this call.",
     });
   }
+  // The decision is read where `foldApprovals` read it, and asked again under the rule lock.
+  const root = resolveSessionRoot(dir).root;
+  if (approvalStillStands(root, record.id) !== undefined) throw notStanding();
   if ("pattern" in narrow && narrow.pattern !== pattern) {
     const problem = widenedPatternProblem(record.toolName, record.input, pattern, dir);
     if (problem !== undefined) {
@@ -139,6 +146,7 @@ const create: V1Handler = async (ctx) => {
         pattern,
         reason: "approval",
         derivedFrom: record.id,
+        derivesFrom: () => approvalStillStands(root, record.id),
         createdBy: by,
         expiresAt: new Date(expiresAt).toISOString(),
         cmd: receipt.id,

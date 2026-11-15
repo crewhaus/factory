@@ -77,9 +77,9 @@ import { type SessionEvents, payloadOf } from "./advise-rules";
  *   so no sample, rule or report holds it. A tool with this reason gets no
  *   `alwaysAllow` proposal at all, neither scoped nor for the whole tool
  *   ({@link skippedSuggestions} names it);
- * - `holds-control` — a recorded call's operative value holds a control or
- *   bidirectional-text character (a multi-line command's newline is one),
- *   which a rule's pattern never holds. A tool with this reason gets no
+ * - `holds-control` — a recorded call's operative value holds a control,
+ *   bidirectional-text or other invisible character (a multi-line command's
+ *   newline is one), which a rule's pattern never holds. A tool with this reason gets no
  *   `alwaysAllow` proposal at all, neither scoped nor for the whole tool
  *   ({@link skippedSuggestions} names it).
  */
@@ -440,7 +440,7 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
     "carries-credential":
       "a recorded call carried a credential, which a rule must never hold, so no rule names its value",
     "holds-control":
-      "a recorded call's value holds a control or bidirectional-text character, which a rule's pattern never holds",
+      "a recorded call's value holds a control, bidirectional-text or other invisible character, which a rule's pattern never holds",
     undeclared: `${agg.toolName} does not declare which argument decides where it acts, so the proposal cannot be narrowed to the approved calls`,
     "no-scoping-argument": `${agg.toolName} has no argument that decides where it acts, so no rule can be narrower than the tool`,
     "not-parsed": "a recorded call no longer fits the tool's input, so what it acted on is unknown",
@@ -508,9 +508,9 @@ function noAllowReason(agg: AskAggregate): PermissionSkip["reason"] | undefined 
  * Read-only-ness comes from the tool map; an unknown tool defaults to false
  * (treated as non-read-only ⇒ ranked after read-only grants).
  *
- * A tool a recorded call of which carried a credential, or held a control or
- * bidirectional-text character in a value a rule is read against, gets no
- * `alwaysAllow`, neither scoped nor for the whole tool:
+ * A tool a recorded call of which carried a credential, or held a control,
+ * bidirectional-text or other invisible character in a value a rule is read
+ * against, gets no `alwaysAllow`, neither scoped nor for the whole tool:
  * {@link skippedSuggestions} names it.
  */
 export function rankSuggestions(
@@ -589,7 +589,7 @@ export const CARRIES_CREDENTIAL_NOTE =
 
 /** The note a tool skipped for `holds-control` carries. It names no value. */
 export const HOLDS_CONTROL_NOTE =
-  "a recorded call's value holds a control or bidirectional-text character (a newline is one), which no rule's pattern can show, so no allow rule is proposed; approve such calls one at a time";
+  "a recorded call's value holds a control, bidirectional-text or other invisible character (a newline is one), which no rule's pattern can show, so no allow rule is proposed; approve such calls one at a time";
 
 /**
  * The tools {@link rankSuggestions} would propose an `alwaysAllow` for, but

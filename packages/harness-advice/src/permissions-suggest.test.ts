@@ -352,7 +352,7 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
     expect(blanketGrantNote(rm as AskAggregate)).toContain("does not declare");
   });
 
-  describe("a recorded call whose value holds a control or bidirectional-text character", () => {
+  describe("a recorded call whose value holds a control, bidirectional-text or other invisible character", () => {
     const shellBash = declared("Bash", [{ field: "command", kind: "command", shell: true }], {
       command: z.string(),
     });
@@ -365,6 +365,9 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
       ["a tab", "printf a\tb"],
       ["an escape sequence", "echo a\u001b[2Jb"],
       ["a bidirectional override", "echo a\u202eb"],
+      ["a zero-width space", "echo a\u200bb"],
+      ["a line separator", "echo a\u2028b"],
+      ["a tag character", "echo a\u{E0041}b"],
     ];
     for (const [label, bashLookup] of readings) {
       for (const [what, command] of values) {

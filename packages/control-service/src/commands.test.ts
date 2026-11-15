@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  realpathSync,
   truncateSync,
   writeFileSync,
 } from "node:fs";
@@ -19,6 +20,7 @@ import {
   NOW,
   deferred,
   fakeProbe,
+  plantProjection,
   plantReceipt,
   removeTempDirs,
   rig,
@@ -424,6 +426,78 @@ describe("what a receipt holds", () => {
     if (!b.ok) throw new Error("refused");
     expect(isId("prn", b.receipt.actor)).toBe(true);
     expect(b.receipt.actor).toBe(setUp.result.localPrincipal as string);
+  });
+
+  test("on a harness whose approver list names another Home, a linked user is the keyed digest, and its retry replays", async () => {
+    const hangarRoot = tempDir("control-service-linked-");
+    const setUp = await ensureAccessSetUp(hangarRoot, { localActor: localActorOf(IDENTITY) });
+    if (!setUp.ok) throw new Error("access setup refused");
+    const linked = rig({ hangarRoot });
+    plantProjection(linked.harness, setUp.result.owner, [], {
+      accessRoot: tempDir("control-service-other-home-"),
+    });
+    const request = {
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness: linked.harness },
+      via: "cli" as const,
+      body: { grace: 5 },
+      idempotency: "retry-linked",
+    };
+    let effects = 0;
+    const effect = async () => {
+      effects += 1;
+      return { settle: { state: "succeeded" as const }, value: undefined };
+    };
+    const first = await linked.service.commands.submit(request, effect);
+    const second = await linked.service.commands.submit(request, effect);
+    if (!first.ok || !second.ok) throw new Error("refused");
+    expect(first.receipt.actor).toMatch(/^local:#[0-9a-f]{64}$/);
+    // The lookup a head makes before it plans a command finds the same claim.
+    const found = await linked.service.commands.replayOf(request);
+    expect(found?.kind === "replay" && found.receipt.id).toBe(first.receipt.id);
+    expect(second.replayed).toBe(true);
+    expect(second.receipt.id).toBe(first.receipt.id);
+    expect(effects).toBe(1);
+  });
+
+  test("a workspace-ledger command acting on a harness stores the actor that harness's approver list allows", async () => {
+    const hangarRoot = tempDir("control-service-linked-");
+    const setUp = await ensureAccessSetUp(hangarRoot, { localActor: localActorOf(IDENTITY) });
+    if (!setUp.ok) throw new Error("access setup refused");
+    const effect = async () => ({ settle: { state: "succeeded" as const }, value: undefined });
+    const retire = (harness: string, idempotency: string) => ({
+      kind: "controls.retire",
+      target: HRN,
+      ledger: "workspace" as const,
+      onHarness: harness,
+      via: "cli" as const,
+      body: { stop: false, force: false, forceUnverified: false },
+      idempotency,
+    });
+    const linked = rig({ hangarRoot });
+    plantProjection(linked.harness, setUp.result.owner, [], {
+      accessRoot: tempDir("control-service-other-home-"),
+    });
+    const foreign = await linked.service.commands.submit(
+      retire(linked.harness, "retire-foreign"),
+      effect,
+    );
+    if (!foreign.ok) throw new Error("refused");
+    expect(foreign.receipt.actor).toMatch(/^local:#[0-9a-f]{64}$/);
+    const found = await linked.service.commands.replayOf(retire(linked.harness, "retire-foreign"));
+    expect(found?.kind === "replay" && found.receipt.id).toBe(foreign.receipt.id);
+    // A harness whose list names this Home root names the linked principal.
+    const ownHome = rig({ hangarRoot });
+    plantProjection(ownHome.harness, setUp.result.owner, [], {
+      accessRoot: realpathSync(hangarRoot),
+    });
+    const own = await ownHome.service.commands.submit(
+      retire(ownHome.harness, "retire-own"),
+      effect,
+    );
+    if (!own.ok) throw new Error("refused");
+    expect(own.receipt.actor).toBe(setUp.result.localPrincipal as string);
   });
 
   test("every row validates as a receipt, and no field name is one the masker eats", async () => {

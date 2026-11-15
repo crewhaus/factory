@@ -162,6 +162,7 @@ export async function retireCommand(o: RetireCommandOptions): Promise<DaemonComm
       kind: "controls.retire",
       ...(harnessId !== undefined ? { target: `home/harness/${harnessId}` } : {}),
       ledger: "workspace",
+      onHarness: o.harnessDir,
       via: "cli",
       body: { stop: o.stop, force: o.force, forceUnverified: o.forceUnverified },
     },

@@ -5,6 +5,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   type Dirent,
+  appendFileSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -18,6 +19,7 @@ import {
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { type LocalIdentity, ensureAccessSetUp, localActorOf } from "@crewhaus/access-control";
 import { mintId } from "@crewhaus/control-contract";
 import {
   append,
@@ -160,7 +162,13 @@ function setUp(
         : ok("tombstoneRegistry"),
   };
   const retire = (
-    run: { stop?: boolean; dryRun?: boolean; harnessDir?: string; cwd?: string } = {},
+    run: {
+      stop?: boolean;
+      dryRun?: boolean;
+      harnessDir?: string;
+      cwd?: string;
+      opts?: Parameters<typeof retireCommand>[0]["opts"];
+    } = {},
   ) =>
     retireCommand({
       harnessDir: run.harnessDir ?? dir,
@@ -173,7 +181,7 @@ function setUp(
       dryRun: run.dryRun ?? false,
       forceUnverified: false,
       heavy,
-      opts: run.cwd !== undefined ? { ...opts, cwd: run.cwd } : opts,
+      opts: run.cwd !== undefined ? { ...(run.opts ?? opts), cwd: run.cwd } : (run.opts ?? opts),
     });
   return { root, dir, hangarRoot, registryRoot, row, ops, opts, calls, retire };
 }
@@ -319,6 +327,95 @@ describe("crewhaus retire", () => {
     expect(again.lines.join("\n")).toContain("crewhaus daemon enable");
     expect(s.ops.children).toHaveLength(1);
   }, 20_000); // an adopted daemon's exit is noticed on the pump's real-time poll
+});
+
+describe("who a retirement of a governed harness is recorded as", () => {
+  const OWNER: LocalIdentity = { username: "owner", hostname: "laptop" };
+
+  /** Plant an active `local` link from `identity` to `principal` in `hangarRoot`'s access records. */
+  function linkTo(hangarRoot: string, identity: LocalIdentity, principal: string, by: string) {
+    const link = mintId("lnk");
+    const at = new Date().toISOString();
+    const dir = join(hangarRoot, "access");
+    appendFileSync(
+      join(dir, "principals.jsonl"),
+      `${JSON.stringify({ id: principal, kind: "member", state: "active", at, by })}\n`,
+    );
+    appendFileSync(
+      join(dir, "links.jsonl"),
+      `${JSON.stringify({
+        id: link,
+        principal,
+        provider: "local",
+        subjectRef: "e".repeat(64),
+        verifiedVia: "owner",
+        state: "active",
+        at,
+        by,
+      })}\n`,
+    );
+    const file = join(dir, "subjects.json");
+    const subjects = JSON.parse(readFileSync(file, "utf8")) as { links: Record<string, string> };
+    subjects.links[link] = localActorOf(identity);
+    writeFileSync(file, `${JSON.stringify(subjects, null, 2)}\n`);
+  }
+
+  /**
+   * Retire a harness whose approver list Home A wrote: from A itself, or, when `foreign`, from
+   * another Home root whose records link the same user to A's owner.
+   */
+  async function retiredFrom(foreign: boolean) {
+    const s = setUp();
+    const a = await ensureAccessSetUp(s.hangarRoot, { localActor: localActorOf(OWNER) });
+    if (!a.ok) throw new Error(a.reason);
+    const control = join(s.dir, ".crewhaus", "run", "control");
+    mkdirSync(control, { recursive: true });
+    writeFileSync(
+      join(control, "approvers.json"),
+      `${JSON.stringify({
+        v: 1,
+        epoch: 1,
+        generatedAt: new Date().toISOString(),
+        harness: "hrn_00000000000000d1",
+        owner: a.result.owner,
+        governedSince: new Date(Date.now() - 86_400_000).toISOString(),
+        members: [],
+        links: [],
+        accessRoot: realpathSync(s.hangarRoot),
+      })}\n`,
+    );
+    let runFrom = s.hangarRoot;
+    if (foreign) {
+      runFrom = join(s.root, "other-home");
+      const b = await ensureAccessSetUp(runFrom, {
+        localActor: localActorOf({ username: "eve", hostname: "laptop" }),
+      });
+      if (!b.ok) throw new Error(b.reason);
+      linkTo(runFrom, OWNER, a.result.owner, b.result.owner);
+    }
+    const env = { ...s.opts.env, CREWHAUS_HANGAR_ROOT: runFrom };
+    const out = await s.retire({ opts: { ...s.opts, env, identity: OWNER } });
+    expect(out.exitCode).toBe(0);
+    const fold = foldStates(workspaceCommandsLedger(runFrom));
+    if (!fold.ok) throw new Error(fold.reason);
+    const receipt = [...fold.objects.values()][0]?.record as Record<string, unknown>;
+    const kept = JSON.parse(readFileSync(join(control, "operator.json"), "utf8")) as {
+      deployment?: { by?: string };
+    };
+    return { owner: a.result.owner, actor: receipt["actor"], by: kept.deployment?.by };
+  }
+
+  test("run from another Home root, it is the keyed local actor", async () => {
+    const { actor, by } = await retiredFrom(true);
+    expect(actor).toMatch(/^local:#[0-9a-f]{64}$/);
+    expect(by).toBe(actor as string);
+  }, 20_000); // two Homes' access records are set up
+
+  test("run from the Home root the list names, it is the owner", async () => {
+    const { owner, actor, by } = await retiredFrom(false);
+    expect(actor).toBe(owner);
+    expect(by).toBe(owner);
+  }, 20_000); // the Home's access records are set up
 });
 
 /** The workspace ledger's receipts, as written. */
