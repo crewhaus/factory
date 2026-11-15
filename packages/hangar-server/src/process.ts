@@ -42,7 +42,12 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { type LeaseHolder, type LeaseOptions, withMutatingLease } from "@crewhaus/control-records";
-import { admitExplicitStart, recordDesired } from "@crewhaus/control-service";
+import {
+  API_RUN_BUSY_MESSAGES,
+  type ApiRunCapacity,
+  admitExplicitStart,
+  recordDesired,
+} from "@crewhaus/control-service";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import {
   type HangarHarnessEntry,
@@ -53,6 +58,7 @@ import {
   type ApiRunInput,
   type BinResolverDeps,
   type Clock,
+  DEFAULT_JOB_CONCURRENCY,
   type DaemonRunfile,
   type HarnessSupervisor,
   type JobQueue,
@@ -118,6 +124,18 @@ export {
 /** How Home runs its own `crewhaus` for a job (from `@crewhaus/harness-supervisor`). */
 export { homeCrewhausArgv };
 
+/** How many API runs one harness holds live at once, unless the layer is told otherwise. */
+export const DEFAULT_API_RUNS_PER_HARNESS = DEFAULT_JOB_CONCURRENCY;
+
+/** How many API runs the whole Home holds live at once, unless the layer is told otherwise. */
+export const DEFAULT_API_RUNS_PER_HOME = 12;
+
+/** When an API run refused for a full cap is told to ask again. */
+export const API_RUN_RETRY_AFTER_MS = 10_000;
+
+/** What an API start of a run this layer already holds is answered. */
+const API_RUN_HELD_MESSAGE = "This run is already starting or running.";
+
 export type ProcessLayerOptions = {
   readonly registry: HangarRegistry;
   /** The manager's own environment — the base layer of every spawn env. */
@@ -148,6 +166,12 @@ export type ProcessLayerOptions = {
    *  --no-preflight`). */
   readonly noPreflight?: boolean;
   readonly pumpIntervalMs?: number;
+  /**
+   * How many API runs are live at once: on one harness (default
+   * {@link DEFAULT_API_RUNS_PER_HARNESS}) and on the whole Home (default
+   * {@link DEFAULT_API_RUNS_PER_HOME}). A run is live from its start until its job exits.
+   */
+  readonly apiRunLimits?: { readonly perHarness?: number; readonly perHome?: number };
 };
 
 /** One harness's supervision handle, memoized by harness dir. */
@@ -279,6 +303,8 @@ export type ProcessLayer = {
   startApiRun?(entry: HangarHarnessEntry, apiRun: ApiRunInput): Promise<StartResult>;
   /** Stop the job a run started here is running; `false` when this layer holds none for it. */
   stopApiRun?(entry: HangarHarnessEntry, runId: string): Promise<boolean>;
+  /** Whether one more API run fits under this layer's caps on a harness, right now. */
+  apiRunCapacity?(entry: HangarHarnessEntry): ApiRunCapacity;
   /** Adopt every registered harness, then restore the job queue. */
   boot(): Promise<{ readonly adopted: number; readonly lost: number; readonly jobs: number }>;
   close(): void;
@@ -529,12 +555,86 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       });
     };
 
-  /** The supervisors of the API runs this layer started, by run id, until each one exits. */
-  const apiRuns = new Map<string, HarnessSupervisor>();
+  /**
+   * The operator prep a start runs: the SAME prep the terminal head runs, built per start
+   * because `.crewhaus/settings.json` is edited between starts like the spec is. Home's
+   * Start and Restart and every API start run it.
+   */
+  const prepareFor =
+    (harnessDir: string, target: string): SupervisorOptions["prepare"] =>
+    () =>
+      createPrepareRunner({
+        harnessDir,
+        target,
+        ops,
+        env: mergedSpawnEnv(options.env, harnessDir).env as Record<string, string>,
+        crewhausBin: resolveCrewhausBin(harnessDir),
+        clock,
+      });
+
+  /**
+   * The API runs this layer holds, by run id: each from the moment its start is admitted
+   * until its job exits (or its start fails), with its supervisor once it has one.
+   */
+  const apiRuns = new Map<
+    string,
+    { readonly harnessDir: string; supervisor?: HarnessSupervisor }
+  >();
+  /** Each harness's API starts, chained: one prepares and spawns at a time. */
+  const apiStarts = new Map<string, Promise<void>>();
+  const perHarness = options.apiRunLimits?.perHarness ?? DEFAULT_API_RUNS_PER_HARNESS;
+  const perHome = options.apiRunLimits?.perHome ?? DEFAULT_API_RUNS_PER_HOME;
+
+  const apiRunCapacityOf = (harnessDir: string): ApiRunCapacity => {
+    let here = 0;
+    for (const held of apiRuns.values()) if (held.harnessDir === harnessDir) here += 1;
+    if (here >= perHarness) {
+      return { ok: false, scope: "harness", retryAfterMs: API_RUN_RETRY_AFTER_MS };
+    }
+    if (apiRuns.size >= perHome) {
+      return { ok: false, scope: "home", retryAfterMs: API_RUN_RETRY_AFTER_MS };
+    }
+    return { ok: true };
+  };
 
   const startApiRun = async (
     entry: HangarHarnessEntry,
     apiRun: ApiRunInput,
+  ): Promise<StartResult> => {
+    const harnessDir = entry.dir;
+    const refusedStart = (message: string): StartResult => ({
+      ok: false,
+      reason: "plan-failed",
+      stage: "spawn",
+      error: new Error(message),
+    });
+    // Reserved before the first await, so two starts in one tick count each other.
+    if (apiRuns.has(apiRun.runId)) return refusedStart(API_RUN_HELD_MESSAGE);
+    const capacity = apiRunCapacityOf(harnessDir);
+    if (!capacity.ok) return refusedStart(API_RUN_BUSY_MESSAGES[capacity.scope]);
+    const held: { readonly harnessDir: string; supervisor?: HarnessSupervisor } = { harnessDir };
+    apiRuns.set(apiRun.runId, held);
+    const previous = apiStarts.get(harnessDir) ?? Promise.resolve();
+    let done!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      done = resolve;
+    });
+    const turn = previous.then(() => gate);
+    apiStarts.set(harnessDir, turn);
+    try {
+      await previous;
+      return await startHeldApiRun(entry, apiRun, held);
+    } finally {
+      done();
+      if (apiStarts.get(harnessDir) === turn) apiStarts.delete(harnessDir);
+    }
+  };
+
+  /** One admitted API start, its turn on the harness come: prepare, then spawn. */
+  const startHeldApiRun = async (
+    entry: HangarHarnessEntry,
+    apiRun: ApiRunInput,
+    held: { readonly harnessDir: string; supervisor?: HarnessSupervisor },
   ): Promise<StartResult> => {
     const harnessDir = entry.dir;
     const target = liveTarget(harnessDir) ?? entry.target;
@@ -554,6 +654,7 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
           apiRun,
         }),
       admit: homeAdmit(entry),
+      prepare: prepareFor(harnessDir, target),
       ...(options.noPreflight === true
         ? {}
         : {
@@ -565,24 +666,43 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
               }),
           }),
     });
-    const started = await supervisor.start();
-    if (!started.ok) {
-      supervisor.close();
-      return started;
-    }
-    apiRuns.set(apiRun.runId, supervisor);
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      if (apiRuns.get(apiRun.runId) === held) apiRuns.delete(apiRun.runId);
+    };
+    // Watched before the start, so an exit is never missed: the run stays live until it.
     const off = supervisor.subscribe((event: SupervisorEvent) => {
       if (event.type !== "exit") return;
       off();
-      apiRuns.delete(apiRun.runId);
+      release();
       // Its rows close after the exit: let them land before the supervisor goes.
       void supervisor.idle().then(() => supervisor.close());
     });
+    let started: StartResult;
+    try {
+      started = await supervisor.start();
+    } catch (err) {
+      started = {
+        ok: false,
+        reason: "plan-failed",
+        stage: "spawn",
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+    if (!started.ok) {
+      off();
+      release();
+      supervisor.close();
+      return started;
+    }
+    if (!released) held.supervisor = supervisor;
     return started;
   };
 
   const stopApiRun = async (_entry: HangarHarnessEntry, runId: string): Promise<boolean> => {
-    const supervisor = apiRuns.get(runId);
+    const supervisor = apiRuns.get(runId)?.supervisor;
     if (supervisor === undefined) return false;
     return (await supervisor.stop()).stopped;
   };
@@ -625,20 +745,7 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       // Home's Start, Restart and group start run only the active build (a harness with no
       // deployment record yet is recorded at its first start).
       admit: homeAdmit(entry),
-      // The SAME prep the terminal head runs, built per start because
-      // `.crewhaus/settings.json` is edited between starts like the spec is.
-      // Without this the console's Restart button rebuilt the spawn plan and
-      // skipped operator prep entirely — the asymmetry that made "never use
-      // console compile jobs" a rule fleets had to remember.
-      prepare: () =>
-        createPrepareRunner({
-          harnessDir,
-          target,
-          ops,
-          env: mergedSpawnEnv(options.env, harnessDir).env as Record<string, string>,
-          crewhausBin: resolveCrewhausBin(harnessDir),
-          clock,
-        }),
+      prepare: prepareFor(harnessDir, target),
       ...(options.pumpIntervalMs !== undefined ? { pumpIntervalMs: options.pumpIntervalMs } : {}),
       ...(options.noPreflight === true
         ? {}
@@ -725,6 +832,7 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
     held: () => [...handles.values()],
     startApiRun,
     stopApiRun,
+    apiRunCapacity: (entry) => apiRunCapacityOf(entry.dir),
     jobs,
     ops,
     boot: async () => {

@@ -5,7 +5,7 @@
  */
 import type { DeviceRequests } from "@crewhaus/access-control";
 import type { OperationRow, ReceiptVia } from "@crewhaus/control-contract";
-import type { ControlService } from "@crewhaus/control-service";
+import type { ApiRunCapacity, ControlService } from "@crewhaus/control-service";
 import type { ControlClient, ControlTarget } from "@crewhaus/gateway-protocol/control-client";
 import type { HangarHarnessEntry, HangarRegistry } from "@crewhaus/harness-registry";
 import type { ApiRunInput, StartResult } from "@crewhaus/harness-supervisor";
@@ -46,6 +46,8 @@ export type V1Deps = {
   readonly startRunJob?: (entry: HangarHarnessEntry, apiRun: ApiRunInput) => Promise<StartResult>;
   /** Stop the job a run Home started is running in; `false` when Home holds none for it. */
   readonly stopRunJob?: (entry: HangarHarnessEntry, runId: string) => Promise<boolean>;
+  /** Whether Home has room for one more API job run on a harness. Absent: no cap is asked. */
+  readonly apiRunCapacity?: (entry: HangarHarnessEntry) => ApiRunCapacity;
   /** The control client Home reaches daemons with, and where a harness's daemon listens. */
   readonly controlClient?: ControlClient;
   readonly controlTarget?: (entry: HangarHarnessEntry) => Promise<ControlTarget>;
