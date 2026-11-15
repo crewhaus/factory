@@ -92,6 +92,13 @@ re-hashes the destination. Both report per-file mismatches, and both report an
 entry they could not hash as *unverifiable* rather than counting it as
 verified.
 
+**No run token in the archive.** Once the archived tree is verified,
+`HarnessRetire` removes a daemon's run bearer secrets (`run/control-token`,
+`run/gateway-jwt-secret`, `run/mcp-token`) from `<archive>/crewhaus-state`, as
+`crewhaus retire` does, and lists them as `runTokensLeftOut`. A daemon makes
+each again at start. If one cannot be removed, the retirement is still
+reported applied, with a follow-up naming the files to delete by hand.
+
 ## What each tool refuses
 
 **`HarnessRetire`**

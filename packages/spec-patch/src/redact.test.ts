@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { carriesCredential, isCredentialKey, maskCredentialTokens } from "./redact";
+import {
+  CREDENTIAL_FORM_WORDS,
+  type CredentialForm,
+  carriesCredential,
+  credentialFormIn,
+  isCredentialKey,
+  maskCredentialTokens,
+} from "./redact";
 
 describe("isCredentialKey (adversarial review F1)", () => {
   test("matches the credential-key set and close variants, case-insensitively", () => {
@@ -192,5 +200,187 @@ describe("carriesCredential", () => {
       });
     }
     expect(carriesCredential(`echo ${"a".repeat(50_000)}`)).toBe(false);
+  });
+});
+
+describe("credentialFormIn names the form a credential takes", () => {
+  // Built at run time from random parts: no credential-shaped literal sits in the source.
+  const short = (): string => randomBytes(6).toString("hex");
+  const long = (): string => randomBytes(20).toString("hex");
+  const token = ["sk", "ant", "api03", "x".repeat(24)].join("-");
+  const bearer = ["tok", "en", "0123456789abcdef0123456789abcdef"].join("");
+
+  const positives: ReadonlyArray<readonly [CredentialForm, string]> = [
+    ["flag", `deploy --token ${short()}`],
+    ["flag", `deploy --token=${short()}`],
+    ["flag", `psql --password=${short()}`],
+    ["flag", `cli --api-key ${short()}`],
+    ["flag", `cli --secret '${short()}'`],
+    ["flag", `curl --cookie "sid=${short()}" https://x.test`],
+    ["flag", `cli -token ${short()}`],
+    ["user-password", `curl -u admin:${short()} https://x.test`],
+    ["user-password", `curl --user=admin:${short()} https://x.test`],
+    ["user-password", `curl -uadmin:${short()} https://x.test`],
+    ["user-password", `sudo /usr/bin/curl -U proxy:${short()} https://x.test`],
+    ["user-password", `git status && curl --proxy-user "p:${short()}" https://x.test`],
+    ["attached-password", `mysql -uroot -p${short()} app`],
+    ["attached-password", `DB=1 mysqldump -p${short()} app`],
+    ["attached-password", `echo hi; mariadb -p'${short()}' app`],
+    ["header", `curl -H "Cookie: sid=${short()}" https://x.test`],
+    ["header", `curl -H "Set-Cookie: sid=${short()}" https://x.test`],
+    ["header", `curl -H "Proxy-Authorization: Basic ${short()}" https://x.test`],
+    ["header", `curl -H "X-Auth-User: admin" https://x.test`],
+    ["url-fragment", `https://x.test/cb#access_token=${short()}`],
+    ["url-fragment", `https://x.test/cb#state=1&sig=${short()}`],
+    ["url-token-user", `https://${long()}@x.test/o/r`],
+    ["signed-url", `https://bucket.x.test/o?X-Amz-Signature=${short()}`],
+    ["signed-url", `https://store.x.test/c?sv=1&sig=${short()}`],
+    ["signed-url", `https://x.test/o?X-Goog-Signature=${short()}`],
+    ["webhook-url", `https://hooks.slack.com/services/T0/B0/${short()}`],
+    ["webhook-url", `https://hooks.slack.com/workflows/${short()}`],
+    ["webhook-url", `https://hooks.slack.com/triggers/${short()}`],
+    ["webhook-url", `https://discord.com/api/webhooks/1/${short()}`],
+    ["webhook-url", `https://canary.discord.com/api/webhooks/1/${short()}`],
+    ["webhook-url", `https://api.telegram.org/bot1:${short()}/sendMessage`],
+    ["webhook-url", `https://discord.com/api/v10/webhooks/1/${short()}`],
+    ["webhook-url", `https://hooks.slack.com./services/T0/B0/${short()}`],
+    ["url-fragment", `https://app.x.test/#/reset?token=${short()}`],
+    ["user-password", `curl "https://api.x.test/v1?a=1&b=2" -u admin:${short()}`],
+    ["user-password", `curl 'https://x.test/(a)' -u admin:${short()}`],
+    ["attached-password", `mysql -e "select 1; select 2" -p${short()} app`],
+    ["user-password", `curl -sSu admin:${short()} https://x.test`],
+    ["user-password", `curl -su admin:${short()} https://x.test/a`],
+    ["user-password", `curl -sSLu admin:${short()} https://x.test/a`],
+    ["user-password", `FOO="a b" curl -u admin:${short()} https://x.test`],
+    ["user-password", `sudo -E curl -u admin:${short()} https://x.test`],
+    ["user-password", `sudo -u ops curl -u admin:${short()} https://x.test`],
+    ["attached-password", `sudo -E mysql -p${short()} app`],
+    ["attached-password", `sudo -u mysql mysql -p${short()}`],
+    ["user-password", `env -i curl -u admin:${short()} https://x.test`],
+    ["user-password", `time curl -u admin:${short()} https://x.test`],
+    ["user-password", `timeout 30 curl -u admin:${short()} https://x.test`],
+    ["user-password", `command curl -u admin:${short()} https://x.test`],
+    ["user-password", `xargs curl -u admin:${short()}`],
+    ["user-password", `bash -c "curl -u admin:${short()} https://x.test"`],
+    ["user-password", `"curl" -u admin:${short()} https://x.test`],
+    ["user-password", `CURL -u admin:${short()} https://x.test`],
+    ["user-password", `curl.exe -u admin:${short()} https://x.test`],
+    ["user-password", `C:\\Windows\\System32\\curl.exe -u admin:${short()} https://x.test`],
+    ["attached-password", `docker exec -i db mysql -uroot -p${short()} -e "select 1"`],
+    ["attached-password", `kubectl exec db -- mysql -p${short()}`],
+    ["header", `wget --header=X-Auth-Token:${short()} https://x.test`],
+    ["header", `wget --header=Cookie:sid=${short()} https://x.test`],
+  ];
+
+  const negatives: ReadonlyArray<string> = [
+    "cli --verbose",
+    "cli --token-file ./t",
+    "llm --max-tokens 5",
+    "docker login --password-stdin",
+    "pg --no-password db",
+    "gh --token $GH_TOKEN",
+    'gh --token "${GH_TOKEN}"',
+    "cli --token --verbose",
+    "curl -u admin https://x.test",
+    "docker run -u 1000:1000 img",
+    "mysql -p db",
+    "ssh -p2222 h",
+    "ssh -p 22 h",
+    "docker run -p 8080:80 img",
+    "nc -p 8080",
+    "curl -H 'Accept: text/plain' https://x.test",
+    "curl -H 'X-Request-Id: 1' https://x.test",
+    "https://x.test/#section-2",
+    "ssh://git@github.com/o/r",
+    "https://user@host.test/",
+    "https://x.test/?page=2",
+    "https://x.test/?signed=1",
+    "https://hooks.slack.com/",
+    "https://hooks.slack.com/services/",
+    "https://discord.com/channels/1",
+    "https://api.telegram.org/",
+    "wrangler deploy --env production",
+    "docker run --env NODE_ENV=production img",
+    "curl --headers x",
+    "curl --key client.pem https://x.test",
+    "ansible-playbook --private-key ~/.ssh/deploy site.yml",
+    "docker run -p 8080:80 mysql",
+    "curl -o out:put https://x.test",
+    "curl -H 'X-Request-Id: 1' -u admin https://x.test",
+    "wget --header=Accept:text/plain https://x.test",
+    "docker run --label=env:prod img",
+  ];
+
+  test("each form is found and named", () => {
+    for (const [form, value] of positives) {
+      expect({ value, form: credentialFormIn(value), carries: carriesCredential(value) }).toEqual({
+        value,
+        form,
+        carries: true,
+      });
+    }
+  });
+
+  test("an ordinary flag, header or URL passes", () => {
+    for (const value of negatives) {
+      expect({ value, form: credentialFormIn(value), carries: carriesCredential(value) }).toEqual({
+        value,
+        form: undefined,
+        carries: false,
+      });
+    }
+  });
+
+  const firstForms: ReadonlyArray<readonly [CredentialForm, string]> = [
+    ["token", `curl -H "x-api-key: ${token}" https://api.example.com`],
+    ["header", 'curl -H "Authorization: Basic abc" https://api.example.com'],
+    ["assignment", "API_TOKEN=abc123 ./deploy.sh"],
+    ["url-query", "https://api.example.com/items?access_token=abc123"],
+    ["token", `curl -H "Authorization: Bearer ${bearer}" https://x.test`],
+    ["url-password", "https://user:hunter2@example.com/items"],
+  ];
+
+  test("each value the first checks flag keeps its form", () => {
+    for (const [form, value] of firstForms) {
+      expect({ value, form: credentialFormIn(value) }).toEqual({ value, form });
+    }
+  });
+
+  test("every form has words, and every form has a row here", () => {
+    const named = new Set([...positives, ...firstForms].map(([form]) => form));
+    expect([...named].sort()).toEqual(Object.keys(CREDENTIAL_FORM_WORDS).sort());
+    for (const words of Object.values(CREDENTIAL_FORM_WORDS))
+      expect(words.length).toBeGreaterThan(0);
+  });
+
+  test("a long run of each form's lead characters is read correctly", () => {
+    // Correctness only: each answer is the one the grammar gives at any length.
+    const rows: ReadonlyArray<readonly [string, CredentialForm | undefined]> = [
+      ["--a".repeat(16_667), undefined],
+      [`${"--a".repeat(16_667)} --token abc`, "flag"],
+      [`${"--a ".repeat(12_500)}x`, undefined],
+      ["-p".repeat(25_000), undefined],
+      [`mysql ${"-p".repeat(25_000)}`, "attached-password"],
+      [`curl ${"-u ".repeat(16_667)}`, undefined],
+      ["|".repeat(50_000), undefined],
+      [`${"|".repeat(50_000)}curl -u a:b x`, "user-password"],
+      [`https://x.test/${"#".repeat(50_000)}`, undefined],
+      [`https://${"a".repeat(50_000)}@x.test/`, "url-token-user"],
+      [`${"x-auth ".repeat(7_143)}`, undefined],
+      [`${"x-auth-".repeat(7_143)}x: v`, "header"],
+      [`https://hooks.slack.com/services/${"/".repeat(50_000)}`, undefined],
+      ['"'.repeat(50_000), undefined],
+      [`${"'a b' ".repeat(8_334)}curl -u a:b x`, "user-password"],
+      ["\\".repeat(50_000), undefined],
+      [`curl ${"-sS".repeat(16_667)}`, undefined],
+      [`${"--header=".repeat(5_556)}`, undefined],
+      [`${"bash -c ".repeat(6_250)}"curl -u a:b x"`, "user-password"],
+    ];
+    for (const [value, form] of rows) {
+      expect({ value: value.slice(0, 40), form: credentialFormIn(value) }).toEqual({
+        value: value.slice(0, 40),
+        form,
+      });
+    }
   });
 });

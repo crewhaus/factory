@@ -183,6 +183,11 @@ That covers, specifically:
   baseline would propose additions that may already exist;
 - a `settings.json` holding a rule entry the reader does not recognise → the
   additions are still reported, but `diff.merged` is withheld. See below;
+- a `settings.json` holding a rule whose pattern holds a credential (the
+  `carriesCredential` screen from `@crewhaus/spec-patch` flags it) →
+  `diff.merged` is `null` and `diff.withheldRules` counts those rules, so no
+  answer holds the credential. `crewhaus permissions suggest --apply` in an
+  interactive terminal writes the file's rules unchanged;
 - `readOnly` on a suggestion for a tool that is not a builtin, when the caller
   did not name it in `readOnlyTools` → `null`, never `false`, with a line in the
   evidence saying that harness-advice's fail-closed "not read-only" is a default

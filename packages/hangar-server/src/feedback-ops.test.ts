@@ -15,6 +15,7 @@
  *     even where the optimizer may tune it.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { isOptimizable } from "@crewhaus/spec-patch";
@@ -788,5 +789,114 @@ describe("an advice proposal holding a hidden value's placeholder", () => {
     expect(applied.body["code"]).toBe("edit_rejected");
     expect(applied.body["applied"]).toBe(false);
     expect(readFileSync(specPath).equals(before)).toBe(true);
+  });
+});
+
+describe("an advice proposal whose value holds a credential", () => {
+  test("the feed shows it masked, and the apply refuses it and writes nothing", async () => {
+    // Built at run time from random parts: no credential-shaped literal sits in the source.
+    const sk = ["sk", "ant", "api03", randomBytes(12).toString("hex")].join("-");
+    const pw = randomBytes(8).toString("hex");
+    const value = `Use the key ${sk} when you call the API.`;
+    const t = boot();
+    const dir = loopHarness(t);
+    const specPath = join(dir, "crewhaus.yaml");
+    const row = (findingId: string, path: string[], v: string) => ({
+      findingId,
+      severity: "warn",
+      summary: "a proposal",
+      patch: { target: "cli", path, op: "replace", value: v, rationale: "a proposal" },
+    });
+    write(
+      dir,
+      [".crewhaus", "advice", "suggestions.json"],
+      `${JSON.stringify({
+        generatedAt: iso(NOW - DAY),
+        sessionIds: ["sess_00000000000000aa"],
+        suggestions: [
+          row("adv_raw", ["agent", "instructions"], value),
+          row("adv_raw_owned", ["agent", "model"], value),
+          row(
+            "adv_pair",
+            ["agent", "instructions"],
+            `Check the API with curl -u admin:${pw} https://x.test first.`,
+          ),
+        ],
+      })}\n`,
+    );
+    const id = await register(t, dir);
+    const before = readFileSync(specPath);
+
+    const feed = await t.api(`/api/h/${id}/feedback/advice`);
+    const shown = (feed.body["proposals"] as Array<{ adviceId: string; value: unknown }>).find(
+      (p) => p.adviceId === "adv_raw",
+    );
+    expect(String(shown?.value)).toContain("***");
+    expect(JSON.stringify(feed.body).includes(sk)).toBe(false);
+
+    for (const [adviceId, words] of [
+      ["adv_raw", "a credential-shaped token"],
+      ["adv_raw_owned", "a credential-shaped token"],
+      ["adv_pair", "a user:password pair"],
+    ] as const) {
+      for (const body of [{}, { confirm: true, expectedRev: specRev(before.toString("utf8")) }]) {
+        const answer = await t.api(`/api/h/${id}/feedback/advice/${adviceId}/apply`, {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        expect({ adviceId, status: answer.status, code: answer.body["code"] }).toEqual({
+          adviceId,
+          status: 409,
+          code: "edit_rejected",
+        });
+        expect(String(answer.body["reason"])).toContain(`holds a credential (${words})`);
+        const text = JSON.stringify(answer.body);
+        expect(text.includes(sk) || text.includes(pw)).toBe(false);
+      }
+    }
+    expect(readFileSync(specPath).equals(before)).toBe(true);
+  });
+
+  test("a value that holds no credential is written as the proposal holds it", async () => {
+    const value = "Call the staging API first, and say which endpoint you used.";
+    const t = boot();
+    const dir = loopHarness(t);
+    const specPath = join(dir, "crewhaus.yaml");
+    write(
+      dir,
+      [".crewhaus", "advice", "suggestions.json"],
+      `${JSON.stringify({
+        generatedAt: iso(NOW - DAY),
+        sessionIds: ["sess_00000000000000aa"],
+        suggestions: [
+          {
+            findingId: "adv_clean",
+            severity: "warn",
+            summary: "name the endpoint",
+            patch: {
+              target: "cli",
+              path: ["agent", "instructions"],
+              op: "replace",
+              value,
+              rationale: "a proposal",
+            },
+          },
+        ],
+      })}\n`,
+    );
+    const id = await register(t, dir);
+    const preview = await t.api(`/api/h/${id}/feedback/advice/adv_clean/apply`, {
+      method: "POST",
+      body: "{}",
+    });
+    expect(preview.status).toBe(200);
+    const applied = await t.api(`/api/h/${id}/feedback/advice/adv_clean/apply`, {
+      method: "POST",
+      body: JSON.stringify({ confirm: true, expectedRev: preview.body["rev"] }),
+    });
+    expect(applied.body["applied"]).toBe(true);
+    const written = readFileSync(specPath, "utf8");
+    expect(written).toContain(value);
+    expect(written).not.toContain("***");
   });
 });

@@ -400,6 +400,13 @@ these on: they reach every harness that uses what each one names.
   the value, so `--apply` never writes it to `.crewhaus/settings.json`. An
   `alwaysAsk` for recurring denials is still proposed, for the whole tool. A
   rule names a value of at most 8192 characters.
+- **`crewhaus permissions suggest` and the `PermissionsSuggest` tool show an
+  existing settings rule that holds a credential without its pattern.** The
+  diff prints `<type> <Tool>(… holds a credential)` for it, or
+  `<type> (… holds a credential)` when the text before its argument is not a
+  plain tool name. `--json` and the tool return `merged: null` with a
+  `withheldRules` count. `--apply` keeps the rule in `.crewhaus/settings.json`
+  unchanged.
 - **A managed daemon records each run before its turn starts.** `runs.create` and
   `runs.continue` write content-free rows to `.crewhaus/run/control/runs/` with a
   canonical run id (`run_` and 26 characters) and the tenant: `running` before
@@ -633,6 +640,12 @@ these on: they reach every harness that uses what each one names.
   nothing. `crewhaus state backup --include <glob>` keeps one, with a warning.
   The tarball is readable only by its owner. `crewhaus retire` also leaves them
   out of the state it keeps in its `--archive` directory.
+
+- **The `HarnessRetire` tool leaves a harness's run tokens out of the state it
+  keeps in its archive**, as `crewhaus retire` does:
+  `.crewhaus/run/control-token`, `.crewhaus/run/gateway-jwt-secret` and
+  `.crewhaus/run/mcp-token`, which a daemon makes again at start. Its answer
+  lists them as `runTokensLeftOut`.
 
 - **A Slack click decides an approval only for a linked member whose role can
   decide it.** An Approve, Always allow or Deny click on a channel daemon's card

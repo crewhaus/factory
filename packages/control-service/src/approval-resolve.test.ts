@@ -1,8 +1,10 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { mintId } from "@crewhaus/control-contract";
 import { readProposals, readStandingRules } from "@crewhaus/control-records";
+import { CREDENTIAL_FORM_WORDS } from "@crewhaus/spec-patch";
 import { authorizerFor, resolveToolApproval } from "./approval-resolve";
 import { NOW, park, plantProjection, removeTempDirs, rig, settingsOf } from "./test-helpers";
 
@@ -46,6 +48,36 @@ describe("resolveToolApproval, called directly", () => {
     expect(settingsOf(r.harness)).toEqual({
       permissions: { rules: [{ type: "alwaysAllow", pattern: "Write(notes/a.md)" }] },
     });
+  });
+
+  test("the owner's always over a call that carries a credential makes no rule, and names the form", async () => {
+    const r = rig();
+    const owner = mintId("prn");
+    plantProjection(r.harness, owner);
+    // Built at run time from random parts: no credential-shaped literal sits in the source.
+    const secret = randomBytes(6).toString("hex");
+    const p = await park(r.harness, "Bash", { command: `deploy --token ${secret}` });
+    const answer = await resolveToolApproval(
+      {
+        harnessDir: r.harness,
+        rootDir: sessions(r.harness),
+        ref: p.id,
+        choice: "grant",
+        who: { principal: owner },
+        storeActor: { principal: owner },
+        storedBy: async () => owner,
+        via: "slack",
+        always: true,
+      },
+      { now: () => NOW },
+    );
+    expect(answer.outcome).toBe("invalid");
+    expect(answer.reason).toContain(CREDENTIAL_FORM_WORDS.flag);
+    expect(answer.reason).toContain("(carries-credential)");
+    expect(answer.reason?.includes(secret)).toBe(false);
+    expect(settingsOf(r.harness)).toBeUndefined();
+    const rules = readStandingRules(r.harness);
+    expect(rules.state === "present" ? rules.rows.length : 0).toBe(0);
   });
 
   test("a member's always grants once and files one request to the owner", async () => {
