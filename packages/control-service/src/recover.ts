@@ -7,6 +7,7 @@
  * |---|---|
  * | a job's receipt | the job queue moves it; Home alone settles one no job row names |
  * | a control a later control of the same family on the same harness overtook | `unknown`: superseded, never run |
+ * | a disable or enable in a harness's ledger after which another command recorded a disable in the operator record | `unknown`: superseded, never run |
  * | a daemon start accepted before the machine booted | `unknown`: not started, the machine restarted; the installed service (`resident`) takes the accepted rows below instead |
  * | `accepted`, safe to repeat | run again |
  * | `accepted`, not safe to repeat | reconcile: done → `succeeded`, not done → run again |
@@ -26,6 +27,12 @@
  * an operator has started, stopped or drained the daemon since, re-running an older daemon
  * command would undo theirs, and the same holds for a pause or resume, and for a disable
  * or enable. The families are independent: a pause after a stop leaves the stop to run.
+ * The harness's operator record counts too: a disable another command recorded in its
+ * deployment block at or after a disable or enable was accepted is a later control of that
+ * family, wherever its receipt lives. A retire stamps it (`retireSteps`' `stopAndDisable`
+ * and `keepDisabled` write `cmd: <the controls.retire receipt's id>`), so a retire's disable
+ * outranks every earlier disable or enable on that harness that never finished. A recorded
+ * enable overtakes nothing here: the family rule alone decides what it outranks.
  *
  * | Family | Kinds |
  * |---|---|
@@ -49,6 +56,7 @@ import {
   foldStates,
   publishClaim,
   readClaim,
+  readOperatorRecord,
 } from "@crewhaus/control-records";
 import {
   type CommandsInternals,
@@ -128,6 +136,29 @@ export function supersededControls(
   return new Set(all.filter((id) => !keep.has(id)));
 }
 
+/**
+ * Whether a disable or enable from a harness's own ledger was overtaken by a disable the
+ * harness's operator record holds: its deployment block is a disable, names another command
+ * and was recorded at or after the receipt was accepted. Only `applyOperatorControl` and
+ * retire's `stopAndDisable` / `keepDisabled` write that block, so such a block is a disable
+ * an operator or a retire recorded once the receipt was already accepted, and running the
+ * receipt now could only undo it or repeat it. A block that records an enable, an absent or
+ * unreadable record, a block without `cmd` or `since`, or the receipt's own block leaves the
+ * receipt to the other rules.
+ */
+function deploymentOvertaken(receipt: CommandReceipt, dir: string | undefined): boolean {
+  if (dir === undefined || CONTROL_FAMILIES[receipt.kind] !== "deployment") return false;
+  const read = readOperatorRecord.refresh(dir);
+  if (read.state !== "present") return false;
+  const deployment = read.record.deployment;
+  if (deployment === null || deployment.disabled !== true) return false;
+  if (typeof deployment.cmd !== "string" || deployment.cmd === receipt.id) return false;
+  if (typeof deployment.since !== "string") return false;
+  const since = Date.parse(deployment.since);
+  const accepted = Date.parse(receipt.acceptedAt);
+  return Number.isFinite(since) && Number.isFinite(accepted) && since >= accepted;
+}
+
 export function createRecover(
   core: ControlCore,
   commands: CommandsInternals,
@@ -203,7 +234,7 @@ export function createRecover(
           continue;
         }
 
-        if (superseded.has(receipt.id)) {
+        if (superseded.has(receipt.id) || deploymentOvertaken(receipt, dir)) {
           // Running it now would undo what the operator asked for since.
           await settle(ledger, receipt, "unknown", SUPERSEDED);
           counts.unknown += 1;
