@@ -76,8 +76,10 @@ export async function hasExternalWriteTools(specYaml: string): Promise<boolean> 
 /**
  * The MCP servers a candidate spec adds or defines differently from the base (each
  * entry compared as canonical JSON of its compiled form), then the tool keys it names
- * that the base does not, by name; `[]` when it adds neither, and `undefined` when
- * either spec cannot be compiled, so the caller cannot be told it adds nothing.
+ * that the base does not, then each tool key whose `tool_config` entry differs from the
+ * base's (canonical JSON; a config on one side only differs), each named once; `[]` when
+ * the candidate's tools, servers and tool configs all match the base's, and `undefined`
+ * when either spec cannot be compiled, so the caller cannot be told it adds nothing.
  */
 export function addedToolSurface(
   baseYaml: string,
@@ -98,6 +100,23 @@ export function addedToolSurface(
     }
     const baseTools = new Set(base.tools);
     for (const key of candidate.tools) if (!baseTools.has(key)) added.push(key);
+    const baseConfigs = (base.toolConfigs ?? {}) as Record<string, unknown>;
+    const candidateConfigs = (candidate.toolConfigs ?? {}) as Record<string, unknown>;
+    const configKeys = [
+      ...Object.keys(candidateConfigs),
+      ...Object.keys(baseConfigs).filter((key) => !Object.hasOwn(candidateConfigs, key)),
+    ];
+    for (const key of configKeys) {
+      if (added.includes(key)) continue;
+      const inBase = Object.hasOwn(baseConfigs, key);
+      const inCandidate = Object.hasOwn(candidateConfigs, key);
+      if (
+        inBase !== inCandidate ||
+        canonicalJson(baseConfigs[key]) !== canonicalJson(candidateConfigs[key])
+      ) {
+        added.push(key);
+      }
+    }
     return added;
   } catch {
     return undefined;

@@ -16,6 +16,7 @@ import {
 } from "@crewhaus/control-service";
 import { readHarnessEnvFiles } from "@crewhaus/harness-supervisor";
 import { resolveHarnessSessionRoot } from "@crewhaus/session-store";
+import { systemAccess, withRequestAccess } from "../access";
 import type { V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { harnessOf, liveDirOr409 } from "./resolve";
@@ -136,6 +137,19 @@ const retire: V1Handler = async (ctx) => {
       message:
         "Ask for the plan again: retiring needs the nonce a dry run handed back, once, within ten minutes.",
     });
+  }
+  // Settle the harness's unfinished commands first, as the CLI's retire does, so the
+  // retire's disable is the latest word on it. Before the daemon check, which then judges
+  // the daemon as recovery leaves it. What recovery runs again runs as the actor who asked
+  // for it, under Home's own read scope, never this caller's. A courtesy, never a gate.
+  try {
+    await withRequestAccess(systemAccess("command-recovery"), () =>
+      ctx.deps.control.commands.recover({ harness: dir }),
+    );
+  } catch (err) {
+    ctx.deps.onWarn(
+      `hangar-server: retire's command recovery failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
   const stop = ctx.body["stop"] === true;
   const state = await ctx.deps.daemonState(entry);

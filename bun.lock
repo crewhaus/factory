@@ -2156,6 +2156,7 @@
       "name": "@crewhaus/spec-changelog",
       "version": "0.8.2",
       "dependencies": {
+        "@crewhaus/ir": "workspace:*",
         "@crewhaus/migration-engine": "workspace:*",
         "@crewhaus/migration-runner": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",

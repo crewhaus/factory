@@ -3,10 +3,11 @@
  * at its heart.
  *
  * `promotionCheck(base, candidate)` is pure. Runs that cannot be compared (the candidate
- * measured nothing or stopped at its budget, or the instrument changed) answer
- * `not_comparable` with the rule. Otherwise it is the strict run-history gate
- * (`gateRuns`, threshold 0), and every case the base measured fails with its id when
- * the candidate did not measure it, abstained on it, or left it out of its samples.
+ * measured nothing or stopped at its budget, or the instrument changed, a field recorded
+ * on one side only counting as changed) answer `not_comparable` with the rule. Otherwise
+ * it is the strict run-history gate (`gateRuns`, threshold 0), and every case the base
+ * measured fails with its id when the candidate did not measure it, abstained on it, or
+ * left it out of its samples.
  *
  * `checkChange` runs a change's check, dependency-inverted: the eval and the regrade are
  * injected (`CheckRunners`), so this package imports no CLI. By kind:
@@ -130,14 +131,17 @@ export function promotionCheck(
     };
   }
   if (opts.instrumentChange !== "expected") {
-    const changed = instrumentChanges(instrumentOf(base), instrumentOf(candidate)).filter(
-      (c) => c.unverified !== true,
-    );
+    // Two runs compare only on an instrument that is verifiably the same: a field
+    // recorded on one side only counts as changed.
+    const changed = instrumentChanges(instrumentOf(base), instrumentOf(candidate));
     if (changed.length > 0) {
+      const named = changed.map((c) =>
+        c.unverified === true ? `${c.field}, recorded on one side only` : c.field,
+      );
       return {
         comparison: "not_comparable",
         rule: "instrument",
-        reason: `the measuring instrument changed (${changed.map((c) => c.field).join(", ")})`,
+        reason: `the measuring instrument changed (${named.join("; ")})`,
         ...empty,
       };
     }
@@ -229,9 +233,10 @@ export type CheckRunners = {
   /** Whether the spec's compiled tools include one that writes outside the process. */
   readonly externalWriteTools?: (specYaml: string) => boolean;
   /**
-   * The MCP servers the candidate adds or defines differently, and the tools it names
-   * that the base does not; `undefined` when that cannot be told. A recording of tool
-   * results is replayed for a check only when this answers an empty list.
+   * The MCP servers the candidate adds or defines differently, the tools it names that
+   * the base does not, and the tools whose `tool_config` differs from the base's;
+   * `undefined` when that cannot be told. A recording of tool results is replayed for a
+   * check only when this answers an empty list.
    */
   readonly addedToolSurface?: (
     baseYaml: string,
@@ -392,8 +397,8 @@ function writesOutside(opts: CheckOptions, specTexts: ReadonlyArray<string>): bo
 
 /**
  * How the base and candidate runs are isolated. A recording of tool results is
- * replayed only when the candidate adds no MCP server or tool the base lacks (the
- * runner's `addedToolSurface` answers an empty list); when it adds one, or that
+ * replayed only when the candidate adds, or configures differently, no MCP server or
+ * tool (the runner's `addedToolSurface` answers an empty list); when it does, or that
  * cannot be told, the check runs live once a maintainer confirmed it, and needs a
  * live run otherwise.
  */
@@ -420,8 +425,8 @@ function isolationOf(
 /** Why recorded tool results cannot stand in for a candidate's tools. */
 function addedSurfaceReason(added: ReadonlyArray<string> | undefined): string {
   return added === undefined
-    ? "which MCP servers and tools this change adds could not be determined, so recorded tool results cannot stand in for them; a maintainer can check it live (`crewhaus changes check --live`)"
-    : `this change adds an MCP server or tool (${added.join(", ")}) that recorded tool results cannot stand in for; a maintainer can check it live (\`crewhaus changes check --live\`)`;
+    ? "which MCP servers and tools this change adds or configures differently could not be determined, so recorded tool results cannot stand in for them; a maintainer can check it live (`crewhaus changes check --live`)"
+    : `this change adds, or configures differently, an MCP server or tool (${added.join(", ")}) that recorded tool results cannot stand in for; a maintainer can check it live (\`crewhaus changes check --live\`)`;
 }
 
 /** The largest tool recording read to learn which cases it covers. */
@@ -820,11 +825,11 @@ async function runCheck(opts: CheckOptions): Promise<CheckAnswer> {
         let holdoutBaseDir = runDir("holdout-base");
         if (cached !== undefined && opts.runners.loadRun !== undefined) {
           const summary = await opts.runners.loadRun(join(harnessDir, cached.dir));
+          // Reused only when measured exactly as the new base: no field differs or is
+          // recorded on one side only.
           if (
             summary !== undefined &&
-            instrumentChanges(instrumentOf(summary), instrumentOf(base)).filter(
-              (c) => c.unverified !== true,
-            ).length === 0
+            instrumentChanges(instrumentOf(summary), instrumentOf(base)).length === 0
           ) {
             holdoutBase = summary;
             holdoutBaseDir = join(harnessDir, cached.dir);
