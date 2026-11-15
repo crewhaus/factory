@@ -8,11 +8,13 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -20,7 +22,7 @@ import { join } from "node:path";
 import { openAccess } from "@crewhaus/access-control";
 import { IDEMPOTENT_REPLAYED_HEADER, mintId, mintRunId } from "@crewhaus/control-contract";
 import { append, controlPaths, foldStates, readPage, runsLedger } from "@crewhaus/control-records";
-import { reconcileRunCreate } from "@crewhaus/control-service";
+import { projectOnce, reconcileRunCreate } from "@crewhaus/control-service";
 import {
   createPendingApprovalStore,
   foldReadOnly,
@@ -28,6 +30,7 @@ import {
   hashApprovalInput,
 } from "@crewhaus/session-store";
 import { type V1Home, v1Home } from "../__test__/v1-home";
+import { NEWEST_FOLD_LINES } from "./runs";
 
 let home: V1Home;
 
@@ -485,6 +488,88 @@ describe("a service starting runs", () => {
     };
     expect(shape(registered)).toEqual(shape(absent));
   });
+});
+
+describe("a list serves each run as it stands now", () => {
+  /** Each run's newest ledger row, by id. */
+  function newestStates(dir: string): Map<string, unknown> {
+    const out = new Map<string, unknown>();
+    for (const item of readPage(runsLedger(dir), { limit: 1000 }).items) {
+      const id = String(item.record["id"]);
+      if (!out.has(id)) out.set(id, item.record["state"]);
+    }
+    return out;
+  }
+
+  async function pages(h: { id: string }) {
+    const first = await home.call("GET", `/api/v1/harnesses/${h.id}/runs?limit=1`);
+    expect(first.status).toBe(200);
+    const second = await home.call(
+      "GET",
+      `/api/v1/harnesses/${h.id}/runs?limit=1&cursor=${String(first.body["next"])}`,
+    );
+    expect(second.status).toBe(200);
+    return { first: first.body, second: second.body };
+  }
+
+  test("a run whose newest row is newer than the page's cursor is served at that row, from the read model or the whole ledger", async () => {
+    const h = await home.harness("list-newest");
+    const [a, b] = [mintRunId(), mintRunId()];
+    const row = (id: string, state: string) =>
+      append(runsLedger(h.dir), {
+        id,
+        state,
+        at: new Date().toISOString(),
+        trigger: { kind: "api" },
+      });
+    row(b, "running"); // B enters
+    row(a, "queued"); // A enters, newest
+    row(b, "cancelled"); // B ends: newer than page 1's cursor
+    const check = async (freshness: string, ended: string) => {
+      const { first, second } = await pages(h);
+      const one = first["items"] as Record<string, unknown>[];
+      const two = second["items"] as Record<string, unknown>[];
+      expect(one.map((r) => [r["id"], r["state"]])).toEqual([[a, "queued"]]);
+      expect(two.map((r) => [r["id"], r["state"]])).toEqual([[b, ended]]);
+      expect([first["freshness"], second["freshness"]]).toEqual([freshness, freshness]);
+      expect(typeof second["asOf"]).toBe("string");
+      const newest = newestStates(h.dir);
+      for (const item of [...one, ...two]) {
+        expect([item["id"], item["state"]]).toEqual([item["id"], newest.get(String(item["id"]))]);
+      }
+    };
+    // With the read models projected; B's end then lands past what they saw.
+    await projectOnce({
+      hangarRoot: home.t.hangarRoot,
+      harnesses: [{ id: h.id, dir: h.dir }],
+      now: Date.now(),
+    });
+    await check("projection", "cancelled");
+    // A row the read model has not seen yet: the read catches up past its cursor.
+    row(b, "interrupted");
+    await check("projection", "interrupted");
+    // With no read model at all: the whole ledger, from its end.
+    rmSync(join(home.t.hangarRoot, "cache", "index"), { recursive: true, force: true });
+    await check("direct-fold", "interrupted");
+    expect(existsSync(join(home.t.hangarRoot, "cache", "index"))).toBe(false);
+  });
+
+  test("a fold that stops at its cap says so", async () => {
+    const h = await home.harness("list-capped");
+    const old = mintRunId();
+    append(runsLedger(h.dir), { id: old, state: "running", at: new Date().toISOString() });
+    // More newer lines than the fold reads, and none of them is a run's entry.
+    const lines = Array.from({ length: NEWEST_FOLD_LINES + 5 }, () =>
+      JSON.stringify({ id: mintRunId(), state: "succeeded", at: "2026-11-14T00:00:00.000Z" }),
+    ).join("\n");
+    appendFileSync(join(h.dir, controlPaths(h.dir).runsDir, "000001.jsonl"), `${lines}\n`);
+    const res = await home.call("GET", `/api/v1/harnesses/${h.id}/runs`);
+    expect((res.body["items"] as Record<string, unknown>[]).map((r) => r["id"])).toEqual([old]);
+    expect(res.body["truncated"]).toEqual({
+      reason: "fold_capped",
+      verb: `crewhaus runs list --harness ${h.id}`,
+    });
+  }, 20_000); // twenty thousand ledger lines read twice; slow on a loaded runner
 });
 
 describe("reading a run and its result", () => {

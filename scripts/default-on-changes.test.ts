@@ -5586,6 +5586,62 @@ describe("the release notes name what a channel daemon does with clicks and mess
   });
 });
 
+describe("the release notes name what the run pump's lease changes for every harness", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  test("a second pump over a run waits and appends nothing; the one that writes stamps ingestedAt", async () => {
+    const { createLogPump, readPumpLease, replayRunEvents } = await import(
+      "../packages/harness-supervisor/src/index"
+    );
+    const dir = mkdtempSync(join(tmpdir(), "default-on-pump-"));
+    try {
+      mkdirSync(join(dir, "logs"), { recursive: true });
+      const files = {
+        logFile: join(dir, "logs", "run.log"),
+        eventsFile: join(dir, "logs", "run.events.jsonl"),
+        cursorFile: join(dir, "logs", "run.cursor"),
+      };
+      // Both pids alive on this host, with fixed start times: neither lease is breakable.
+      const probe = {
+        isAlive: (pid: number) => pid === 100 || pid === 200,
+        startTimeMs: (pid: number) => (pid === 100 ? 1_000 : pid === 200 ? 2_000 : undefined),
+      };
+      const first = createLogPump({ ...files, pid: 100, probe });
+      const second = createLogPump({ ...files, pid: 200, probe });
+      writeFileSync(
+        files.logFile,
+        `${JSON.stringify({ kind: "turn_end", runId: "run_0123456789abcdef", turn: 1 })}\n`,
+      );
+      expect(first.pumpOnce().held).toBe(true);
+      const waited = second.pumpOnce();
+      expect(waited.held).toBe(false);
+      expect(waited.events).toEqual([]);
+      expect(readPumpLease(join(dir, "logs", "run.pump.lock"))?.pid).toBe(100);
+      const written = replayRunEvents(files.eventsFile);
+      expect(written).toHaveLength(1);
+      expect(typeof written[0]?.["ingestedAt"]).toBe("string");
+      first.close();
+      second.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    // Retention lists what it removes before it removes it.
+    const runfiles = readFileSync(
+      join(ROOT, "packages/harness-supervisor/src/runfiles.ts"),
+      "utf8",
+    );
+    expect(runfiles).toContain("!recordPruned(harnessDir, evict, now())");
+    const bullet = bulletFor("One manager writes a run's events at a time.");
+    expect(bullet).not.toBe("");
+    for (const word of ["lease", "`<run>.pump.lock`", "waits", "`ingestedAt`", "pruned.jsonl"]) {
+      expect(bullet).toContain(word);
+    }
+  });
+});
+
 describe("the release notes name the spec edits Home refuses for a hidden value's placeholder", () => {
   const bulletFor = (needle: string): string =>
     defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";

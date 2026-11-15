@@ -5,12 +5,14 @@
  */
 import type { DeviceRequests } from "@crewhaus/access-control";
 import type { OperationRow, ReceiptVia } from "@crewhaus/control-contract";
-import type { ApiRunCapacity, ControlService } from "@crewhaus/control-service";
+import type { ApiRunCapacity, ControlService, Projection } from "@crewhaus/control-service";
 import type { ControlClient, ControlTarget } from "@crewhaus/gateway-protocol/control-client";
 import type { HangarHarnessEntry, HangarRegistry } from "@crewhaus/harness-registry";
 import type { ApiRunInput, StartResult } from "@crewhaus/harness-supervisor";
-import type { HomeAccess, RequestAccess } from "../access";
+import type { Caller, HomeAccess, RequestAccess } from "../access";
 import type { TextScrubber } from "../mask";
+import type { StreamSourceDecl } from "./event-map";
+import type { StreamPlan, StreamTimings } from "./stream";
 
 /** The daemon's state as Home's supervisor sees it. */
 export type DaemonState = "running" | "starting" | "draining" | "stopped" | "crashed" | "unknown";
@@ -56,6 +58,22 @@ export type V1Deps = {
     readonly ok: boolean;
     readonly detail: string;
   }>;
+  /**
+   * An event stream's abort signal and its end: the client going away, its session
+   * ending, or its re-check refusing it. A stream calls `dispose` once it finishes, for
+   * every reason. Absent: a stream closes only when its client goes.
+   */
+  readonly streamSignal?: (req: Request) => {
+    readonly signal: AbortSignal | undefined;
+    readonly dispose: () => void;
+  };
+  /**
+   * The caller's authority as the access records stand now. A stream's reads run after
+   * its handler returned, so each batch decides on this, never on the request's own.
+   */
+  readonly accessNow?: (caller: Caller) => RequestAccess;
+  /** A stream's pacing, shortened by tests. */
+  readonly streamTimings?: StreamTimings;
 };
 
 export type V1Context = {
@@ -80,15 +98,32 @@ export type V1Context = {
   readonly refResolvers: ReadonlyMap<string, RefResolver>;
   /** Every area's capability providers. */
   readonly capabilityProviders: readonly CapabilityProvider[];
+  /** Every area's projections, with the area that registered each. */
+  readonly projections: ReadonlyArray<{
+    readonly area: string;
+    readonly projection: Projection<unknown>;
+  }>;
+  /** Every area's sources of a harness's event stream. */
+  readonly streamSources: readonly StreamSourceDecl[];
 };
 
-/** A handler's answer. `scrub` names the harness whose secrets the masker scrubs. */
-export type V1Answer = {
+/** A handler's answer with a body. `scrubDir` names the harness whose secrets the masker scrubs. */
+export type V1BodyAnswer = {
   readonly status: number;
   readonly body: unknown;
   readonly headers?: Readonly<Record<string, string>>;
   readonly scrubDir?: string;
 };
+
+/** A handler's answer: a body, or an event stream. */
+export type V1Answer =
+  | V1BodyAnswer
+  | {
+      readonly status: 200;
+      /** An event stream: the router sends it through the one stream writer. */
+      readonly stream: StreamPlan;
+      readonly scrubDir?: string;
+    };
 
 export type V1Handler = (ctx: V1Context) => Promise<V1Answer>;
 

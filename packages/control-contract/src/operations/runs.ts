@@ -94,5 +94,7 @@ export const RUN_OPERATIONS = [
     cliTwin: null,
     noTwinReason: STREAM_ONLY,
     qualifiers: ["content-fields"],
+    scopedAct: "run.events.read",
+    ref: { kind: "run", param: "run" },
   },
 ] as const;

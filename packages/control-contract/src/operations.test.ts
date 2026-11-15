@@ -12,6 +12,7 @@ import {
   PERMISSIONS,
   QUALIFIERS,
   TWIN_PLACEHOLDERS,
+  badScopedOperations,
   isPathParam,
   mintId,
   mintRunId,
@@ -1078,10 +1079,14 @@ describe("path params", () => {
     }
   });
 
-  test("{run}: canonical only", () => {
+  test("{run}: a canonical run id or a supervisor execution; hex8/base36 still refused", () => {
     expect(isPathParam("run", [mintRunId()])).toBe(true);
-    expect(isPathParam("run", ["run_0123456789abcdef"])).toBe(false);
+    expect(isPathParam("run", ["run_0123456789abcdef"])).toBe(true);
     expect(isPathParam("run", ["run_abcd1234"])).toBe(false);
+    expect(isPathParam("run", ["abcd1234"])).toBe(false);
+    expect(isPathParam("run", ["k3j9x2m1q8"])).toBe(false);
+    expect(isPathParam("run", ["run_0123456789ABCDEF"])).toBe(false);
+    expect(isPathParam("run", [mintRunId(), "x"])).toBe(false);
   });
 
   test("{ref}: three segments, or one bare id, a legacy hex16 included", () => {
@@ -1182,5 +1187,27 @@ describe("the creation area's rows", () => {
     expect(CREATION_MODULE.operations.map((o) => o.id)).toEqual(["specs.schema"]);
     // Not one of the core's own rows: the core's pins do not move.
     expect(CORE.some((o) => o.id === "specs.schema")).toBe(false);
+  });
+});
+
+describe("a scoped read names its act and its object", () => {
+  test("the run event stream is the one v1 row a scoped token reads, as run.events.read on {run}", () => {
+    expect(badScopedOperations(OPERATIONS)).toEqual([]);
+    const scoped = OPERATIONS.filter((op) => op.scopedAct !== undefined);
+    expect(scoped.map((op) => `${op.id}=${op.scopedAct}`)).toEqual(["runs.events=run.events.read"]);
+    const events = OPERATIONS.find((op) => op.id === "runs.events") as OperationRow;
+    expect(events.ref).toEqual({ kind: "run", param: "run" });
+    expect(events.path.includes(`{${events.ref?.param}}`)).toBe(true);
+  });
+
+  test("a scoped row that is not a GET, names no object, or names an act not in the list is refused", () => {
+    const events = OPERATIONS.find((op) => op.id === "runs.events") as OperationRow;
+    expect(badScopedOperations([{ ...events, id: "w", method: "POST" }])).toEqual(["w"]);
+    const { ref: _ref, ...noRef } = events;
+    expect(badScopedOperations([{ ...noRef, id: "r" }])).toEqual(["r"]);
+    expect(badScopedOperations([{ ...events, id: "n", scopedAct: "run.events.write" }])).toEqual([
+      "n",
+    ]);
+    expect(badScopedOperations([{ ...events, id: "ok" }])).toEqual([]);
   });
 });

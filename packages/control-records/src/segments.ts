@@ -24,7 +24,11 @@ const WATERMARK_MAX_BYTES = 4096;
 
 let rollBytes = ROLL_BYTES;
 
-/** Test seam: the roll threshold, so no test writes 8 MiB. Pass `undefined` to restore. */
+/**
+ * Test seam: the roll threshold, so no test writes 8 MiB. Pass `undefined` to restore.
+ *
+ * First consumer: this package's tests, then Home's stream tests, which roll a segment.
+ */
 export function _setRollBytesForTest(next: number | undefined): void {
   rollBytes = next ?? ROLL_BYTES;
 }
@@ -143,4 +147,19 @@ export function noSegments(records: { readonly file: string }): SafeFsFailure {
     records.file,
     `${JSON.stringify(records.file)} is a single-file ledger; it has no segments to drop`,
   );
+}
+
+/**
+ * The size of one segment by `lstat`, contained in the root: 0 when it is not there yet,
+ * `undefined` when it cannot be judged or is not a plain file. Opens nothing.
+ */
+export function segmentSize(source: RecordSource, seg: number): number | undefined {
+  const at = resolveContained(source.root, segmentRel(source.records, seg), { followLeaf: false });
+  if (!at.ok) return at.code === "not-found" ? 0 : undefined;
+  try {
+    const stats = lstatSync(at.real);
+    return stats.isFile() ? stats.size : undefined;
+  } catch (err) {
+    return (err as { code?: unknown }).code === "ENOENT" ? 0 : undefined;
+  }
 }

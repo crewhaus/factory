@@ -1,6 +1,6 @@
 /** What each `{param}` in an operation's path accepts. Closed. */
 import { PLUGIN_NAME_RE } from "../areas/integrations.js";
-import { CANONICAL_RUN_ID_RE, HARNESS_ID_RE, isId, parseId } from "../ids.js";
+import { CANONICAL_RUN_ID_RE, EXECUTION_RUN_ID_RE, HARNESS_ID_RE, isId, parseId } from "../ids.js";
 import { isRef } from "../refs.js";
 import { deepFreeze } from "../util.js";
 
@@ -34,8 +34,12 @@ export const PATH_PARAMS = deepFreeze({
   crd: prefixed("crd"),
   lnk: prefixed("lnk"),
   dev: prefixed("dev"),
+  // A canonical run, or a supervisor's execution (`run_<16 hex>`): a run stream follows
+  // either. Every other `{run}` operation reads the canonical ledger, so an execution is
+  // a run it does not know.
   run: (segments: readonly string[]): boolean =>
-    segments.length === 1 && CANONICAL_RUN_ID_RE.test(segments[0] ?? ""),
+    segments.length === 1 &&
+    (CANONICAL_RUN_ID_RE.test(segments[0] ?? "") || EXECUTION_RUN_ID_RE.test(segments[0] ?? "")),
   ref: refParam,
   psn: prefixed("psn"),
   pcl: prefixed("pcl"),

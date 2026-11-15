@@ -676,6 +676,16 @@ these on: they reach every harness that uses what each one names.
   anchor: presented as written by an earlier step, with no more authority than
   that source. The run's own input, carried in that state, is labelled with it.
 
+- **One manager writes a run's events at a time.** The supervisor copies a
+  run's output into `.crewhaus/run/logs/<run>.events.jsonl` only while it holds
+  that run's lease, `<run>.pump.lock` beside it. A second manager over the
+  same run, for example one that adopted it, waits: it appends nothing and
+  sees none of the run's events until the first lets go of the lease or has
+  exited. Each event line it writes carries `ingestedAt`, the time it was
+  copied, which Home's run detail shows with the rest of the line. Retention
+  lists the runs it removes in `.crewhaus/run/pruned.jsonl` before removing
+  them, and removes nothing when it cannot write that list.
+
 - **Home refuses a spec edit that would write a hidden value's placeholder.** A
   change to `crewhaus.yaml` through Home or its API is refused, and writes or
   stages nothing, when its new value or key holds `[redacted]` or a `«NAME»`

@@ -157,6 +157,9 @@ export type DaemonRunfile = {
  *  comparison would reject every adoption. Two seconds is far below any
  *  realistic pid-reuse window, and the argv fingerprint is the second
  *  independent guard. */
+/** Which runs retention removed: one `{v, at, runs}` line per prune, before its unlinks. */
+export const PRUNED_RUNS_NAME = "pruned.jsonl";
+
 export const START_TIME_TOLERANCE_MS = 2_000;
 
 /** One line of `<harness>/.crewhaus/run/runs.jsonl`.

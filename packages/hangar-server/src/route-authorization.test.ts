@@ -1519,12 +1519,24 @@ describe("the versioned API: every served operation, for every role and credenti
       expect(ops.filter((op) => op.id.startsWith("delegations."))).toHaveLength(11);
       const wrong: string[] = [];
       for (const op of ops) {
-        const res = await world.t.fetchRaw(v1PathOf(op.path), {
+        const controller = new AbortController();
+        const res = await fetch(`${world.t.base}${v1PathOf(op.path)}`, {
           method: op.method,
           headers: { "content-type": "application/json", ...credOf(cred).headers },
           ...(op.method === "GET" ? {} : { body: "{}" }),
+          signal: controller.signal,
         });
-        const text = await res.text();
+        let text: string;
+        if ((res.headers.get("content-type") ?? "").includes("text/event-stream")) {
+          // An event stream that was allowed: its first chunk, then the client goes.
+          const reader = res.body?.getReader();
+          await reader?.read();
+          controller.abort();
+          await reader?.cancel().catch(() => undefined);
+          text = "{}";
+        } else {
+          text = await res.text();
+        }
         let body: Record<string, unknown> = {};
         try {
           body = JSON.parse(text) as Record<string, unknown>;

@@ -6,14 +6,20 @@
  *
  * Only the slots something iterates are here: the sweeps Home's tick runs, the receivers
  * its ingress listener answers for, handlers by operation id, ref resolvers by ref kind,
- * and capability providers. Home's boot refuses a composition with a sweep named twice or
- * run more often than once a second; a receiver whose provider is named twice or is not a
- * provider name, whose origin is not a `TrustOrigin`, whose `via` is not a receipt door or
- * whose kind is not a receipt kind; a handler for an operation no module declares, a
- * handler or a ref kind registered twice, or an area with no module
+ * capability providers, the projections Home's projector keeps and the sources a
+ * harness's event stream follows. Home's boot refuses a composition with a sweep named
+ * twice or run more often than once a second; a receiver whose provider is named twice or
+ * is not a provider name, whose origin is not a `TrustOrigin`, whose `via` is not a
+ * receipt door or whose kind is not a receipt kind; a handler for an operation no module
+ * declares, a handler or a ref kind registered twice, or an area with no module; a
+ * projection named twice or with a name the index already takes; and a stream source that
+ * is not a cursor source, is registered twice, or keeps its records outside the harness
  * (`homeCompositionProblems`).
  */
-import { AREA_MODULES, OPERATIONS } from "@crewhaus/control-contract";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { AREA_MODULES, CURSOR_SOURCES, OPERATIONS } from "@crewhaus/control-contract";
+import { isProjectionName } from "@crewhaus/control-records";
+import { CORE_PROJECTIONS, type Projection } from "@crewhaus/control-service";
 import { type Receiver, receiverProblems } from "../ingress";
 import type { Sweep } from "../scheduler-host";
 import { CORE_SWEEPS, type HomePorts } from "../sweeps";
@@ -26,6 +32,8 @@ import { DECISION_HANDLERS } from "./decisions";
 import { HOME_DELEGATION } from "./delegations";
 import { DEPLOYMENT_HANDLERS } from "./deployments";
 import { DEVICE_HANDLERS } from "./device";
+import { CORE_STREAM_SOURCES, type StreamSourceDecl } from "./event-map";
+import { EVENT_HANDLERS } from "./events";
 import { HARNESS_HANDLERS } from "./harnesses";
 import { HOME_INTEGRATIONS } from "./integrations";
 import { CORE_REF_RESOLVERS, META_HANDLERS } from "./meta";
@@ -44,6 +52,10 @@ export type HomeAreaRuntime = {
   readonly refResolvers?: Readonly<Record<string, RefResolver>>;
   /** Capability keys this area answers for a harness. */
   readonly capabilityProviders?: readonly CapabilityProvider[];
+  /** The read models Home's projector keeps for this area, one file per harness each. */
+  readonly projections?: readonly Projection<unknown>[];
+  /** The sources a harness's event stream follows for this area, by cursor source name. */
+  readonly streamSources?: readonly StreamSourceDecl[];
 };
 
 /** The core's own entry: Home's control core, first. */
@@ -61,8 +73,11 @@ export const HOME_CORE: HomeAreaRuntime = {
     ...ACCESS_HANDLERS,
     ...DEVICE_HANDLERS,
     ...RUN_HANDLERS,
+    ...EVENT_HANDLERS,
   },
   refResolvers: CORE_REF_RESOLVERS,
+  projections: CORE_PROJECTIONS,
+  streamSources: CORE_STREAM_SOURCES,
 };
 
 /** The creation area's entry: the spec's schema for the structured editor. */
@@ -115,11 +130,6 @@ export function receiversOf(areas: readonly HomeAreaRuntime[]): readonly Receive
  * change that serves one deletes its line.
  */
 export const V1_NOT_SERVED: Readonly<Record<string, string>> = {
-  "runs.events": "Following a run's events through the API is not served yet.",
-
-  "events.fleet": "Following Home's events through the API is not served yet.",
-  "events.harness": "Following a harness's events through the API is not served yet.",
-
   "people.vault.setup": "People profiles are not served through the API yet.",
   "people.vault.get": "People profiles are not served through the API yet.",
   "people.vault.rotate": "People profiles are not served through the API yet.",
@@ -178,6 +188,38 @@ export function refResolversOf(
   return out;
 }
 
+/** Every projection, with the area that registered it, in composition order. */
+export function projectionsOf(
+  areas: readonly HomeAreaRuntime[],
+): ReadonlyArray<{ readonly area: string; readonly projection: Projection<unknown> }> {
+  return areas.flatMap((area) =>
+    (area.projections ?? []).map((projection) => ({ area: area.area, projection })),
+  );
+}
+
+/** Every stream source, in composition order. */
+export function streamSourcesOf(areas: readonly HomeAreaRuntime[]): readonly StreamSourceDecl[] {
+  return areas.flatMap((area) => area.streamSources ?? []);
+}
+
+/** A harness directory no source may escape, for the containment check. */
+const SAMPLE_HARNESS = resolve("/", "sample-harness");
+
+/** Why a source's records would land outside its harness, or `undefined`. */
+function sourceEscape(decl: StreamSourceDecl): string | undefined {
+  let source: ReturnType<StreamSourceDecl["source"]>;
+  try {
+    source = decl.source(SAMPLE_HARNESS);
+  } catch (err) {
+    return `cannot be placed: ${(err as Error).message}`;
+  }
+  const records = "file" in source.records ? source.records.file : source.records.dir;
+  if (isAbsolute(records)) return "names its records by an absolute path";
+  const rel = relative(SAMPLE_HARNESS, resolve(join(source.root, records)));
+  const inside = rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return inside ? undefined : "keeps its records outside the harness";
+}
+
 /** Every capability provider, in composition order. */
 export function capabilityProvidersOf(
   areas: readonly HomeAreaRuntime[],
@@ -189,8 +231,10 @@ export function capabilityProvidersOf(
  * What is wrong with a composition, one line per problem: a sweep named twice or run more
  * often than {@link MIN_SWEEP_EVERY_MS}; every receiver problem (`receiverProblems`); a
  * handler for an operation no module declares; a handler, a ref kind or a capability key
- * registered twice; an area no module names; and a not-served entry for an operation that
- * has a handler.
+ * registered twice; an area no module names; a not-served entry for an operation that
+ * has a handler; a projection registered twice or named like a name the index takes
+ * (`fleet-changes`, `fleet`, `refs`, a harness id); and a stream source registered twice,
+ * not a cursor source, or keeping its records outside a sample harness directory.
  */
 export function homeCompositionProblems(areas: readonly HomeAreaRuntime[]): readonly string[] {
   const problems: string[] = [];
@@ -227,6 +271,8 @@ export function homeCompositionProblems(areas: readonly HomeAreaRuntime[]): read
   const handlers = new Map<string, string>();
   const resolvers = new Map<string, string>();
   const capabilities = new Map<string, string>();
+  const projections = new Map<string, string>();
+  const sources = new Map<string, string>();
   for (const area of areas) {
     if (!known.has(area.area)) problems.push(`area "${area.area}" has no module`);
     for (const id of Object.keys(area.handlers ?? {})) {
@@ -261,6 +307,38 @@ export function homeCompositionProblems(areas: readonly HomeAreaRuntime[]): read
         );
       } else {
         capabilities.set(provider.key, area.area);
+      }
+    }
+    for (const projection of area.projections ?? []) {
+      if (!isProjectionName(projection.name)) {
+        problems.push(
+          `projection "${projection.name}" is not a name a projection may take (area "${area.area}")`,
+        );
+      }
+      const first = projections.get(projection.name);
+      if (first !== undefined) {
+        problems.push(
+          `projection "${projection.name}" registered twice (areas "${first}" and "${area.area}")`,
+        );
+      } else {
+        projections.set(projection.name, area.area);
+      }
+    }
+    for (const decl of area.streamSources ?? []) {
+      if (!(CURSOR_SOURCES as readonly string[]).includes(decl.name)) {
+        problems.push(`stream source "${decl.name}" is not a cursor source (area "${area.area}")`);
+      }
+      const first = sources.get(decl.name);
+      if (first !== undefined) {
+        problems.push(
+          `stream source "${decl.name}" registered twice (areas "${first}" and "${area.area}")`,
+        );
+      } else {
+        sources.set(decl.name, area.area);
+      }
+      const outside = sourceEscape(decl);
+      if (outside !== undefined) {
+        problems.push(`stream source "${decl.name}" ${outside} (area "${area.area}")`);
       }
     }
   }

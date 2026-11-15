@@ -9,9 +9,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { START_LOCK_MAX_AGE_MS } from "./runfiles";
 import { createEnvScrubber } from "./scrub";
 import {
   LOG_TAIL_LINES,
+  type LeaseProbe,
   completeUtf8Length,
   createLogPump,
   drain,
@@ -20,6 +22,7 @@ import {
   readCursor,
   readLogTail,
   readLogTailLines,
+  readPumpLease,
   replayRunEvents,
   scanBalanced,
   tailLines,
@@ -46,6 +49,9 @@ function pumpFiles(): PumpFiles {
     cursorFile: join(dir, "logs", "run.cursor"),
   };
 }
+
+/** A pid no process holds: a lease naming it is a manager that died. */
+const GONE_PID = 2_147_483_000;
 
 const EVENT = (extra: Record<string, unknown> = {}): string =>
   JSON.stringify({ kind: "turn_end", runId: "run_0123456789abcdef", turn: 1, ...extra });
@@ -198,7 +204,8 @@ describe("createLogPump", () => {
     const full = `start\n${EVENT({ turn: 1 })}\nmiddle\n${EVENT({ turn: 2 })}\nend\n`;
     // First manager: consumes the first half only.
     writeFileSync(files.logFile, full.slice(0, full.indexOf("middle")));
-    const first = createLogPump(files);
+    // The first manager's process is gone by the time the second starts.
+    const first = createLogPump({ ...files, pid: GONE_PID });
     const firstOut = first.pumpOnce();
 
     // The daemon keeps writing while the manager is dead.
@@ -219,7 +226,7 @@ describe("createLogPump", () => {
   test("reconcile drops events the previous manager wrote past its cursor", () => {
     const files = pumpFiles();
     writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\n`);
-    const first = createLogPump(files);
+    const first = createLogPump({ ...files, pid: GONE_PID });
     first.pumpOnce();
     // Simulate a crash between appending an event and writing the cursor.
     appendFileSync(files.eventsFile, `${EVENT({ turn: 99 })}\n`);
@@ -371,3 +378,106 @@ describe("forensics helpers", () => {
 function statSize(path: string): number {
   return readFileSync(path).length;
 }
+
+describe("the pump lease", () => {
+  /** A probe that knows exactly these pids, each with its start time. */
+  const probeOf = (alive: Readonly<Record<number, number>>): LeaseProbe => ({
+    isAlive: (pid) => Object.hasOwn(alive, pid),
+    startTimeMs: (pid) => alive[pid],
+  });
+  const LIVE = probeOf({ 100: 1_000, 200: 2_000 });
+
+  test("two pumps over one log: every event lands once, and the second does not hold", () => {
+    const files = pumpFiles();
+    const a = createLogPump({ ...files, pid: 100, probe: LIVE });
+    const b = createLogPump({ ...files, pid: 200, probe: LIVE });
+    const lines: string[] = [];
+    for (let turn = 1; turn <= 4; turn++) {
+      appendFileSync(files.logFile, `${EVENT({ turn })}\n`);
+      const first = turn % 2 === 0 ? b : a;
+      const second = turn % 2 === 0 ? a : b;
+      const one = first.pumpOnce();
+      const two = second.pumpOnce();
+      lines.push(`${one.held}/${two.held}`);
+    }
+    // `a` took the lease first and keeps it; `b` never consumed or wrote anything.
+    expect(lines).toEqual(["true/false", "false/true", "true/false", "false/true"]);
+    expect(replayRunEvents(files.eventsFile).map((e) => e["turn"])).toEqual([1, 2, 3, 4]);
+    expect(readPumpLease(`${files.dir}/logs/run.pump.lock`)?.pid).toBe(100);
+  });
+
+  test("a lease whose holder is gone is broken; a live one is held however old it is", () => {
+    const files = pumpFiles();
+    writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\n`);
+    const lock = join(files.dir, "logs", "run.pump.lock");
+    const old = new Date(Date.now() - 10 * START_LOCK_MAX_AGE_MS).toISOString();
+    writeFileSync(
+      lock,
+      JSON.stringify({ v: 1, pid: 100, pidStartTimeMs: 1_000, host: "here", at: old, pump: "x" }),
+    );
+    const blocked = createLogPump({ ...files, pid: 200, host: "here", probe: LIVE });
+    expect(blocked.pumpOnce()).toMatchObject({ held: false, events: [] });
+    // Another host's lease is held whatever this host's probe says.
+    writeFileSync(lock, JSON.stringify({ v: 1, pid: 999, host: "there", at: old, pump: "x" }));
+    expect(blocked.pumpOnce().held).toBe(false);
+    // The pid is reused by another process: its start time moved.
+    writeFileSync(
+      lock,
+      JSON.stringify({ v: 1, pid: 100, pidStartTimeMs: 50_000, host: "here", at: old, pump: "x" }),
+    );
+    expect(blocked.pumpOnce()).toMatchObject({ held: true });
+    expect(replayRunEvents(files.eventsFile)).toHaveLength(1);
+    // A dead holder, plainly.
+    const next = pumpFiles();
+    writeFileSync(next.logFile, `${EVENT({ turn: 2 })}\n`);
+    writeFileSync(
+      join(next.dir, "logs", "run.pump.lock"),
+      JSON.stringify({ v: 1, pid: 300, host: "here", at: old, pump: "y" }),
+    );
+    expect(createLogPump({ ...next, pid: 200, host: "here", probe: LIVE }).pumpOnce().held).toBe(
+      true,
+    );
+  });
+
+  test("a pump that takes the lease after another moved the cursor reads it again", () => {
+    const files = pumpFiles();
+    writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\n`);
+    const probe = probeOf({ 100: 1_000, 200: 2_000 });
+    // Built while nothing was pumped: its in-memory cursor is at 0.
+    const late = createLogPump({ ...files, pid: 200, probe });
+    const first = createLogPump({ ...files, pid: 100, probe });
+    expect(first.pumpOnce().events).toHaveLength(1);
+    expect(late.pumpOnce().held).toBe(false);
+    appendFileSync(files.logFile, `${EVENT({ turn: 2 })}\n`);
+    first.close();
+    expect(late.pumpOnce()).toMatchObject({ held: true });
+    expect(replayRunEvents(files.eventsFile).map((e) => e["turn"])).toEqual([1, 2]);
+  });
+
+  test("reconcile without the lease cuts nothing; close releases it, and only its own", () => {
+    const files = pumpFiles();
+    writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\n`);
+    const holder = createLogPump({ ...files, pid: 100, probe: LIVE });
+    holder.pumpOnce();
+    appendFileSync(files.eventsFile, `${EVENT({ turn: 99 })}\n`);
+    const other = createLogPump({ ...files, pid: 200, probe: LIVE });
+    other.reconcile();
+    expect(replayRunEvents(files.eventsFile).map((e) => e["turn"])).toEqual([1, 99]);
+    other.close();
+    expect(readPumpLease(join(files.dir, "logs", "run.pump.lock"))?.pid).toBe(100);
+    holder.close();
+    holder.close();
+    expect(readPumpLease(join(files.dir, "logs", "run.pump.lock"))).toBeUndefined();
+  });
+
+  test("every persisted line says when it was ingested, by the pump's clock", () => {
+    const files = pumpFiles();
+    writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\nprose\n${EVENT({ turn: 2 })}\n`);
+    const pump = createLogPump({ ...files, now: () => Date.parse("2026-11-14T00:00:00.000Z") });
+    const out = pump.pumpOnce();
+    expect(out.events.map((e) => e["ingestedAt"])).toEqual([undefined, undefined]);
+    const persisted = replayRunEvents(files.eventsFile);
+    expect(persisted).toHaveLength(2);
+    for (const line of persisted) expect(line["ingestedAt"]).toBe("2026-11-14T00:00:00.000Z");
+  });
+});

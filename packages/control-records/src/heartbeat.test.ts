@@ -3,9 +3,16 @@
  * only inside the harness.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, readdirSync, statSync, symlinkSync } from "node:fs";
+import {
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
-import { type Heartbeat, writeHeartbeat } from "./heartbeat";
+import { type Heartbeat, readHeartbeat, writeHeartbeat } from "./heartbeat";
 import { controlPaths } from "./paths";
 import { removeTempDirs, snapshotTree, tempDir } from "./test-helpers";
 
@@ -86,5 +93,35 @@ describe("writeHeartbeat", () => {
     mkdirSync(join(root, controlPaths(root).heartbeatFile), { recursive: true });
     const answer = writeHeartbeat(root, BEAT);
     expect(answer.ok).toBe(false);
+  });
+});
+
+describe("readHeartbeat", () => {
+  test("reads back what was written, and nothing when there is no beat", () => {
+    const root = tempDir();
+    expect(readHeartbeat(root)).toBeUndefined();
+    expect(writeHeartbeat(root, BEAT)).toEqual({ ok: true });
+    expect(readHeartbeat(root)).toEqual(BEAT);
+  });
+
+  test("an older beat reads as far as it goes; a field of the wrong type is left out", () => {
+    const root = tempDir();
+    mkdirSync(join(root, RUN_DIR), { recursive: true });
+    const file = join(root, controlPaths(root).heartbeatFile);
+    writeFileSync(file, JSON.stringify({ at: BEAT.at, paused: "yes", activeRuns: null }));
+    expect(readHeartbeat(root)).toEqual({ at: BEAT.at, activeRuns: null });
+    writeFileSync(file, "[1]");
+    expect(readHeartbeat(root)).toBeUndefined();
+    writeFileSync(file, JSON.stringify({ at: "x".repeat(20 * 1024) }));
+    expect(readHeartbeat(root)).toBeUndefined();
+  });
+
+  test("a beat that is a link is not read", () => {
+    const root = tempDir();
+    const outside = tempDir();
+    writeFileSync(join(outside, "beat.json"), JSON.stringify(BEAT));
+    mkdirSync(join(root, RUN_DIR), { recursive: true });
+    symlinkSync(join(outside, "beat.json"), join(root, controlPaths(root).heartbeatFile));
+    expect(readHeartbeat(root)).toBeUndefined();
   });
 });

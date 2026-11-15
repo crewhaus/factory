@@ -626,7 +626,10 @@ function authorizeScoped(input: AuthorizeRequestInput): RequestAuthorization {
   ) {
     return refused;
   }
-  const harness = params["id"];
+  // A legacy row names its harness in `:id`; a v1 row's harness is the one its `{run}`
+  // was found in, worked out before authorizing.
+  const harness =
+    row.v1 === true ? (input.targetHarness ?? undefined) : (params["id"] as string | undefined);
   const id = params[row.ref.param];
   if (harness === undefined || id === undefined) return refused;
   // The ref names a run as its grammar does: `run` for a run row's id, `exec` for a
@@ -793,6 +796,14 @@ export const PEOPLE_WALK_DEPTH = 16;
  */
 export const PEOPLE_TOO_DEEP = "[withheld: nested too deep to check for people]";
 
+/**
+ * What a whole answer becomes when it is a bare list and an item in it is withheld: a list
+ * has no place to say `hidden`, so it is never sent with the item dropped or kept.
+ */
+export const PEOPLE_WITHHELD_ANSWER: Readonly<{ hidden: readonly string[] }> = Object.freeze({
+  hidden: Object.freeze([PEOPLE_SENSITIVITY]),
+});
+
 /** How a people item reads once serialized: the key and value need no escaping. */
 const PEOPLE_MARK = `"sensitivity":${JSON.stringify(PEOPLE_SENSITIVITY)}`;
 
@@ -829,13 +840,18 @@ const mayHoldPeople = (value: unknown): boolean => {
  * nothing withheld is returned as it was, the same object, and a part of it with nothing
  * withheld is not copied.
  *
+ * An answer that is itself a list is walked the same way, but has no top to say `hidden`
+ * at: when anything in it is withheld, at any depth, the whole answer is
+ * {@link PEOPLE_WITHHELD_ANSWER}, never the list with an item dropped or kept. A list with
+ * nothing withheld is returned as it was.
+ *
  * First consumer: `handle` in `server.ts`, on every row the table marks `filtered`.
  */
 export function withholdPeople(
   body: unknown,
   allowed: (item: Readonly<Record<string, unknown>>) => boolean,
 ): unknown {
-  if (!isPlainObject(body)) return body;
+  if (!isPlainObject(body) && !Array.isArray(body)) return body;
   let withheld = false;
   // `depth` is the depth of `value` itself; a container past the cap is checked whole.
   const walk = (value: unknown, depth: number): unknown => {
@@ -875,6 +891,7 @@ export function withholdPeople(
   };
   const exited = walk(body, 1) as Record<string, unknown>;
   if (!withheld) return body;
+  if (Array.isArray(body)) return PEOPLE_WITHHELD_ANSWER;
   const prior = Array.isArray(exited["hidden"]) ? (exited["hidden"] as unknown[]) : [];
   return { ...exited, hidden: [...new Set([...prior, PEOPLE_SENSITIVITY])] };
 }

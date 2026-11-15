@@ -237,6 +237,32 @@ export const EXAMPLES: Readonly<Record<string, unknown>> = {
   triggerSource: { platform: "slack", conversationRef: "c".repeat(64), messageRef: "m".repeat(64) },
 };
 
+/** A stream's frame about itself, one per reason it can give. */
+function streamFrame(event: string, payload: Record<string, unknown>) {
+  const id = encodeCursor({
+    v: 1,
+    kind: "vector",
+    sources: { rows: [{ seg: 1, off: 128, tail: "0123abcd" }] },
+  });
+  return {
+    id,
+    event,
+    data: { v: 1, id, type: event, at: AT, ingestedAt: AT, sensitivity: "internal", payload },
+  };
+}
+
+/** One frame for every reason a stream frame gives (`STREAM_REASONS`). */
+export const STREAM_FRAME_EXAMPLES: readonly unknown[] = [
+  streamFrame("stream.gap", { reason: "evicted" }),
+  streamFrame("stream.gap", { reason: "unreadable" }),
+  streamFrame("stream.gap", { reason: "withheld", hidden: ["people"] }),
+  streamFrame("stream.reset", { reason: "diverged", earliest: CURSOR }),
+  streamFrame("stream.reset", { reason: "epoch" }),
+  streamFrame("stream.pause", { reason: "frame-cap", resumeFrom: CURSOR }),
+  streamFrame("stream.pause", { reason: "time-cap", resumeFrom: CURSOR }),
+  streamFrame("stream.pause", { reason: "execution", resumeFrom: CURSOR }),
+];
+
 /** An area's examples live in its own `__test__/<area>.examples.ts`, exporting `EXAMPLES`. */
 const areaExamples: readonly { readonly EXAMPLES: Readonly<Record<string, unknown>> }[] =
   await Promise.all(

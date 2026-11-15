@@ -73,7 +73,9 @@ export {
   logsDir,
   newRunId,
   patchRunLedger,
+  prunedRunsPath,
   pruneRuns,
+  readPrunedRuns,
   readRetentionPolicy,
   readRunLedger,
   readRunfile,
@@ -87,6 +89,7 @@ export {
   runfileExists,
   runfilePath,
   runLogPath,
+  runPumpLockPath,
   START_LOCK_MAX_AGE_MS,
   startLockIsStale,
   startLockPath,
@@ -115,10 +118,12 @@ export {
 
 export type {
   Drained,
+  LeaseProbe,
   LogPump,
   LogPumpOptions,
   LogTailOptions,
   PumpCursor,
+  PumpLease,
   PumpResult,
 } from "./trace-pump";
 export {
@@ -131,7 +136,11 @@ export {
   LOG_TAIL_MAX_CHARS,
   looksLikeEvent,
   parseAnnouncedControlPort,
+  PUMP_LEASE_PROBE,
+  pumpLeaseHolderDead,
+  pumpLockPathFor,
   readCursor,
+  readPumpLease,
   readLogTail,
   readLogTailLines,
   replayRunEvents,
