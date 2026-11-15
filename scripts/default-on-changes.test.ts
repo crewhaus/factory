@@ -5913,3 +5913,71 @@ describe("the plugins a harness's Panes tab names as waiting", () => {
     expect(bullet).toContain("home.read");
   });
 });
+
+describe("the release notes name the hook events a hook that cannot run denies", () => {
+  const MARKER = "exit 0 # cannot-start";
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("a gating hook that cannot be started denies, and a sibling's deny stands", async () => {
+    const { spyOn } = await import("bun:test");
+    const { aggregateDecisions, runHooks } = await import("../packages/hooks-engine/src/index");
+    const realSpawn = Bun.spawn.bind(Bun);
+    let throws = 0;
+    const spy = spyOn(Bun, "spawn").mockImplementation(((...args: unknown[]) => {
+      const first = args[0];
+      if (Array.isArray(first) && first[2] === MARKER) {
+        throws += 1;
+        throw Object.assign(new Error("spawn failed"), { code: "EMFILE" });
+      }
+      return (realSpawn as (...a: unknown[]) => unknown)(...args);
+    }) as unknown as typeof Bun.spawn);
+    try {
+      const results = await runHooks("pre-tool", { name: "Bash" }, [
+        { event: "pre-tool", command: MARKER },
+        { event: "pre-tool", command: `printf '{"decision":"deny","reason":"no"}\\n'` },
+      ]);
+      expect(throws).toBe(1);
+      expect(results.map((r) => r.decision.decision)).toEqual(["deny", "deny"]);
+      expect(results[0]?.decision.reason).toBe("hook could not run");
+      expect(aggregateDecisions(results).allowed).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("the bullet names every gating event and the reason", async () => {
+    const { HOOK_EVENTS, isGatingHookEvent } = await import("../packages/hooks-engine/src/index");
+    const bullet = bulletFor("A hook that cannot run denies the call it gates");
+    expect(bullet).not.toBe("");
+    const gating = HOOK_EVENTS.filter((e) => isGatingHookEvent(e));
+    expect(gating.length).toBeGreaterThan(0);
+    for (const event of gating) {
+      expect(`${event}: ${bullet.includes(`\`${event}\``)}`).toBe(`${event}: true`);
+    }
+    expect(bullet).toContain("hook could not run");
+  });
+
+  test("a hook's verdict is read from everything it wrote before it exited", async () => {
+    const { aggregateDecisions, runHooks } = await import("../packages/hooks-engine/src/index");
+    const bullet = bulletFor("A hook that cannot run denies the call it gates");
+    expect(bullet).toContain("everything it wrote before it exited");
+    // The backgrounded `sleep` keeps the hook's stdout open past the hook's exit.
+    const results = await runHooks("pre-tool", { name: "Bash" }, [
+      { event: "pre-tool", command: `printf '{"decision":"deny","reason":"no"}\\n'; sleep 2 &` },
+    ]);
+    expect(results.map((r) => r.decision)).toEqual([{ decision: "deny", reason: "no" }]);
+    expect(aggregateDecisions(results).allowed).toBe(false);
+  });
+
+  test("the runtime's hook firing denies a gating event it cannot fire", () => {
+    const source = readFileSync(join(ROOT, "packages/runtime-core/src/index.ts"), "utf8");
+    const start = source.indexOf("async function fireHook(");
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf("\n  }\n", start);
+    expect(end).toBeGreaterThan(-1);
+    const body = source.slice(start, end);
+    expect(body).toContain("isGatingHookEvent(event)");
+    expect(body).toContain("allowed: false");
+  });
+});

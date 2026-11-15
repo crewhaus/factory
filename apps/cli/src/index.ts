@@ -402,7 +402,7 @@ import type { StepOutcome } from "@crewhaus/harness-lifecycle/retire";
 // after a spec resolves. The hook never throws and honours
 // CREWHAUS_NO_REGISTRY=1, so call sites need no try/catch.
 import { registerHarnessHook } from "@crewhaus/harness-registry";
-import { loadHooks, runHooks } from "@crewhaus/hooks-engine";
+import { loadHooks } from "@crewhaus/hooks-engine";
 import {
   ArgParseError,
   type ParseArgsSchema,
@@ -555,7 +555,7 @@ import {
 // Item 31 — alert-watchdog delivery sink builder (audit append + settings.json
 // alert hook + webhook), in a side-effect-free module so it is unit-testable
 // (this entry file runs an argv switch on import).
-import { alertWebhookFromSettings, buildAlertSink } from "./alert-sink";
+import { alertWebhookFromSettings, buildAlertSink, settingsAlertHookRunner } from "./alert-sink";
 // Item 59 — approval-gated promotion. The protected-env policy + quorum
 // decision for `deploy promote --require-approval`, in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
@@ -4858,13 +4858,7 @@ async function runRunCli(
     const alertHooks = hooks.filter((h) => h.event === "alert");
     alertSink = buildAlertSink({
       audit: alertAudit,
-      ...(alertHooks.length > 0
-        ? {
-            runAlertHooks: async (event, payload, matcherKey): Promise<void> => {
-              await runHooks(event, payload, alertHooks, { matcherKey });
-            },
-          }
-        : {}),
+      ...(alertHooks.length > 0 ? { runAlertHooks: settingsAlertHookRunner(alertHooks) } : {}),
       ...(webhookUrl !== undefined ? { webhookUrl } : {}),
     });
   }
@@ -4910,7 +4904,7 @@ async function runRunCli(
             alert: async (event): Promise<void> => {
               const payload = { ...event.breach, sessionId: event.sessionId, rung: event.rung };
               if (alertHooks.length > 0) {
-                await runHooks("alert", payload, alertHooks, { matcherKey: "metric" });
+                await settingsAlertHookRunner(alertHooks)("alert", payload, "metric");
               }
               if (webhookUrl !== undefined) {
                 try {

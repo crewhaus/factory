@@ -64,7 +64,13 @@ import {
   type EventLog,
   openEventLog,
 } from "@crewhaus/event-log";
-import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
+import {
+  type HookDef,
+  type HookEvent,
+  aggregateDecisions,
+  isGatingHookEvent,
+  runHooks,
+} from "@crewhaus/hooks-engine";
 import {
   type Advertisement,
   type ModelProfile,
@@ -5673,8 +5679,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Section 11 — fire matching hooks for `event` and aggregate the result.
   // No-ops when no hooks are configured. The aggregated decision exposes
   // `allowed` / `reason` / `mutate`; v1 callers honour `mutate` only for
-  // `pre-slash` (the `expanded` field). Errors are caught and surfaced as
-  // a deny so a misbehaving hook implementation does not crash the run.
+  // `pre-slash` (the `expanded` field). For a gating event (`pre-tool`,
+  // `pre-model`, `pre-slash`; see `isGatingHookEvent`) a hook that cannot run,
+  // or a firing that fails, denies the call, and a deny another hook returned
+  // in the same firing stands. For an observational event the failure is
+  // logged and the run continues.
   const hooks = opts.hooks ?? [];
   // `at` names the span the hooks nest under and the tool call they fire for;
   // each hook that fires there writes a `hook` verdict (`./run-spans`).
@@ -5699,7 +5708,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         event,
         error: (err as Error).message,
       });
-      return { allowed: true };
+      return isGatingHookEvent(event)
+        ? { allowed: false, reason: "hook firing failed" }
+        : { allowed: true };
     }
     // The decision is settled before verdicts are recorded; a recording failure is logged and never changes it.
     if (at !== undefined) {
