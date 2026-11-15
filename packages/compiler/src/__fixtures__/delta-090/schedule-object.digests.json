@@ -1,24 +1,24 @@
 {
   "batch-cron": {
-    "agent.ts": "06a7b302e435e1b2576277e29f23dac107522042dd100449f974b2e3d7e99599",
+    "agent.ts": "23fa6b832912db15c787fe31c45484e4fb7c03dcb3052bd512f9e22e4743cd22",
     "README.md": "2137bf49f0fdb845998cf61a7a66224bc99b64109562b730934d4a16e035614d"
   },
   "batch-interval": {
-    "agent.ts": "b61fd06ecc51ba81e633a1a93fd87c47356dd7e33ecc5f9a97bdca2a5d87cb4d",
+    "agent.ts": "43eb4c8998218abb45414171b3f0574cd7ef77049052d83cfff80314c946e239",
     "README.md": "2137bf49f0fdb845998cf61a7a66224bc99b64109562b730934d4a16e035614d"
   },
   "channel-cron": {
     "agent.ts": "bfebf6a53ea9b773c109471a198d912a498cd28950498343649a7b45eb23d603",
     "session-router.ts": "d712670e1b9f733c5194a0bde65d6f5ca1d97e9779949a9221dd957a39a793d9",
     "gateway.ts": "9c1ddd78ed9d5538bab1a64430931da42138c2b2bbcd07d54b7e15f3bb89e379",
-    "daemon.ts": "5af56d4ae5a5ba98a3fdaf1ec744bb92d66c565e80e0d3dfac90aa3d20a6084e",
+    "daemon.ts": "6d078f1e3b945342513248853f35cee8923b87d65bc10baf31d245c868899640",
     "README.md": "5e4ef406ed614d645422bf50c0cb484b5b3a6b48439be80be60df3d662b7e04f"
   },
   "channel-interval": {
     "agent.ts": "bfebf6a53ea9b773c109471a198d912a498cd28950498343649a7b45eb23d603",
     "session-router.ts": "d712670e1b9f733c5194a0bde65d6f5ca1d97e9779949a9221dd957a39a793d9",
     "gateway.ts": "9c1ddd78ed9d5538bab1a64430931da42138c2b2bbcd07d54b7e15f3bb89e379",
-    "daemon.ts": "218ab67ab332c1bb3f587539e1b57ac7e1b9f86a0be2629468b2c594a2b7bdf3",
+    "daemon.ts": "48b2e130f3d1fd012f34ed09aa67cd49a7d40a0f1b4c5817a3c740f23d4b2cbf",
     "README.md": "5e4ef406ed614d645422bf50c0cb484b5b3a6b48439be80be60df3d662b7e04f"
   },
   "managed-cron": {

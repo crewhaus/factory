@@ -102,6 +102,7 @@ import {
   runCursorPath,
   runEventsPath,
   runLogPath,
+  runPumpLockPath,
   runfileExists,
   startLockIsStale,
   writeRunfile,
@@ -685,6 +686,8 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     // of a crashing run is never swallowed.
     if (pump !== undefined && endedRunId !== undefined) {
       const tailResult = pump.flush();
+      // Pumping this run ends here: its lease goes with it.
+      pump.close();
       if (tailResult.prose !== "" || tailResult.events.length > 0) {
         for (const event of tailResult.events) {
           if (event["kind"] === "run_failed") lastRunFailed = event;
@@ -734,6 +737,8 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
         options.harnessDir,
         options.retention ?? readRetentionPolicy(options.harnessDir),
         endedRunId !== undefined ? [endedRunId] : [],
+        clock.now,
+        options.ops,
       );
     } catch {
       // Retention is housekeeping — never fail a run over it.
@@ -991,6 +996,9 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       logFile: runLogPath(options.harnessDir, id),
       eventsFile: runEventsPath(options.harnessDir, id),
       cursorFile: runCursorPath(options.harnessDir, id),
+      lockFile: runPumpLockPath(options.harnessDir, id),
+      probe: options.ops,
+      pid: ownerPid,
       scrub,
       now: clock.now,
     });
@@ -1054,6 +1062,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       );
     }
     stopPump();
+    pump?.close();
     pump = undefined;
     pid = undefined;
     // We still hold the start lock here, so any runfile present is one we
@@ -1792,6 +1801,8 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     close: () => {
       closed = true;
       stopPump();
+      // This manager pumps no more: another one may take the run's lease at once.
+      pump?.close();
       if (restartTimer !== undefined) {
         clock.clearTimeout(restartTimer);
         restartTimer = undefined;

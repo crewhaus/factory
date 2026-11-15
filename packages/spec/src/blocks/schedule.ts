@@ -118,3 +118,113 @@ export function scheduleIssues(data: Spec, custom: SpecAddIssue): void {
     seen.add(lane.name);
   });
 }
+
+/**
+ * One cron field as the schedule runtime reads it (durable-execution's
+ * `parseField`): `"*"` for any value, otherwise the values it names. `*`, `?`,
+ * a field holding `L`, `W` or `#`, an unparsable number and a field whose
+ * every value is out of range all mean any value.
+ */
+function cronField(field: string, min: number, max: number): "*" | ReadonlySet<number> {
+  const trimmed = field.trim();
+  if (trimmed === "*" || trimmed === "?") return "*";
+  if (/[LW#]/i.test(trimmed)) return "*";
+  const out = new Set<number>();
+  for (const part of trimmed.split(",")) {
+    const slash = part.indexOf("/");
+    const rangeText = slash >= 0 ? part.slice(0, slash) : part;
+    const step = slash >= 0 ? Math.max(1, Number.parseInt(part.slice(slash + 1), 10) || 1) : 1;
+    let lo: number;
+    let hi: number;
+    if (rangeText === "*" || rangeText === "?" || rangeText === "") {
+      lo = min;
+      hi = max;
+    } else if (rangeText.includes("-")) {
+      const [a, b] = rangeText.split("-");
+      lo = Number.parseInt(a ?? "", 10);
+      hi = Number.parseInt(b ?? "", 10);
+    } else {
+      lo = Number.parseInt(rangeText, 10);
+      hi = slash >= 0 ? max : lo;
+    }
+    if (Number.isNaN(lo) || Number.isNaN(hi)) return "*";
+    // Walk only the values inside [min, max], as the runtime does.
+    let v = lo;
+    if (v < min) {
+      v = Number.isFinite(step) ? v + Math.ceil((min - v) / step) * step : Number.POSITIVE_INFINITY;
+    }
+    for (const end = Math.min(hi, max); v <= end; v += step) out.add(v);
+  }
+  return out.size === 0 ? "*" : out;
+}
+
+/** Days in each month, February counted as 29. */
+const MONTH_DAYS = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
+
+/**
+ * Why `cron` can never come round, or `undefined` when its days do. Only a
+ * restricted day-of-month with an open day-of-week can miss: when both are
+ * restricted the runtime fires on either, which comes round every week.
+ */
+function cronNeverFires(cron: string): string | undefined {
+  const fields = cron.trim().split(/\s+/);
+  const [, , , domR, monR, dowR] = fields.length >= 6 ? fields : ["0", ...fields];
+  const dom = cronField(domR ?? "*", 1, 31);
+  const dow = cronField(dowR ?? "*", 0, 7);
+  if (dom === "*" || dow !== "*") return undefined;
+  const mon = cronField(monR ?? "*", 1, 12);
+  const pairs: Array<readonly [number, number]> = [];
+  for (let m = 1; m <= 12; m++) {
+    if (mon !== "*" && !mon.has(m)) continue;
+    for (const d of dom) if (d <= (MONTH_DAYS[m - 1] ?? 0)) pairs.push([m, d]);
+  }
+  if (pairs.length === 0) return "can never fire: none of its months has that day.";
+  if (pairs.every(([m, d]) => m === 2 && d === 29)) {
+    return "fires only on 29 February, which can be more than a year away; add another day or month.";
+  }
+  return undefined;
+}
+
+/** True when this runtime's `Intl` knows `timezone`. */
+function knownTimeZone(timezone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A cron schedule's `timezone` is one the runtime knows, and its `cron` names
+ * a day that comes round: a day its months have, and not only 29 February.
+ * Checked for the object form and for every cron lane, in declared order, a
+ * lane's time zone before its cron. Each issue names the lane and the field.
+ */
+export function scheduleWakeIssues(data: Spec, custom: SpecAddIssue): void {
+  if (!("schedule" in data) || data.schedule === undefined) return;
+  const check = (
+    wake: { readonly kind: string; readonly cron?: string; readonly timezone?: string },
+    at: (string | number)[],
+    label: string,
+  ): void => {
+    if (wake.kind !== "cron" || wake.cron === undefined) return;
+    if (wake.timezone !== undefined && !knownTimeZone(wake.timezone)) {
+      custom(
+        [...at, "timezone"],
+        `${label}timezone ${JSON.stringify(wake.timezone)} is not a time zone this runtime knows; use an IANA name such as "Europe/Berlin".`,
+      );
+    }
+    const never = cronNeverFires(wake.cron);
+    if (never !== undefined) {
+      custom([...at, "cron"], `${label}cron ${JSON.stringify(wake.cron)} ${never}`);
+    }
+  };
+  if (Array.isArray(data.schedule)) {
+    data.schedule.forEach((lane, i) => {
+      check(lane, ["schedule", i], `schedule[${i}] (${JSON.stringify(lane.name)}): `);
+    });
+  } else {
+    check(data.schedule, ["schedule"], "schedule.");
+  }
+}

@@ -116,7 +116,7 @@ describe("every served operation answers its row's shape", () => {
   test("each handler, asked once", async () => {
     const seal = async () => (await makeSeal()).seal;
     const devices = openDeviceRequests(home.t.hangarRoot);
-    const started = await devices.start({});
+    const started = await devices.start({ requestedFrom: { via: "home" } });
     if (!started.ok) throw new Error(started.reason);
     const invited = await openAccess(home.t.hangarRoot).createInvite(
       { principal: home.owner },
@@ -250,8 +250,15 @@ describe("every served operation answers its row's shape", () => {
       },
       "plugins.revoke": { path: "/api/v1/plugins/notes-pane/revoke", body: {} },
     };
-    // The core's handlers and creation's; delegation's are asked in its own contract test.
-    const served = [...handlersOf([HOME_CORE, HOME_CREATION]).keys()];
+    // The core's handlers and creation's; delegation's are asked in its own contract test,
+    // and the event streams frame by frame in `events.test.ts`, which parses every frame.
+    const streamed = new Set(["runs.events", "events.harness", "events.fleet"]);
+    const served = [...handlersOf([HOME_CORE, HOME_CREATION]).keys()].filter(
+      (id) => !streamed.has(id),
+    );
+    expect(streamed.size).toBe(
+      [...handlersOf([HOME_CORE]).keys()].filter((id) => streamed.has(id)).length,
+    );
     expect(served.filter((id) => !(id in asks))).toEqual([]);
     const shapes: string[] = [];
     const ok: string[] = [];

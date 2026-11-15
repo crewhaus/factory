@@ -334,12 +334,23 @@ describe("emitManaged — named schedule lanes (#514)", () => {
     expect(weekly).toBeGreaterThan(discovery);
     expect(count("armScheduleLanes(")).toBe(1);
     expect(daemon).not.toContain('lane: "schedule",');
-    expect(daemon).toContain(
-      'import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";',
-    );
+    expect(daemon).toContain('import { armScheduleLanes } from "@crewhaus/durable-execution";');
+    expect(daemon).not.toContain("nextWakeDelayMs");
+    expect(count('__scheduleLanesArmed?.nextAt("discovery")')).toBe(1);
+    expect(count('__scheduleLanesArmed?.nextAt("weekly-report")')).toBe(1);
     // The lane form uses the shared scheduler, not the object form's local timers.
     expect(daemon).not.toContain("__scheduleTimer");
     expect(daemon).not.toContain("__cronMatches");
+  });
+
+  test("a lane id appears only inside a JSON string literal", () => {
+    for (const id of ["schedule:discovery", "schedule:weekly-report"]) {
+      expect(count(id)).toBeGreaterThan(0);
+      expect(count(id)).toBe(count(JSON.stringify(id)));
+    }
+    expect(daemon).toContain('const __laneId = "schedule:discovery";');
+    expect(daemon).toContain('const __laneId = "schedule:weekly-report";');
+    expect(count("formatRunFailure(__err.report, { prefix: `[${__laneId}]` })")).toBe(2);
   });
 
   test("arming stays behind CREWHAUS_SCHEDULE, and each lane fans out per tenant", () => {

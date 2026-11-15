@@ -35,6 +35,7 @@ import type { AreaRuntime, Executor, ExecutorStamp, Reconciler, Settlement } fro
 import { type JobAdapter, createJobAdapter } from "./jobs";
 import { type LedgerChoice, commandsLedgerOf, workspaceCommandsLedger } from "./ledgers";
 import { type ObjectPage, pageObjects } from "./pages";
+import { nudgeFromReceipt } from "./projector";
 import { type ReconcileCounts, createReconcile } from "./reconcile";
 import { type RecoverCounts, type RecoverScope, createRecover } from "./recover";
 import { type Rules, createRules } from "./rules";
@@ -272,13 +273,25 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
     commands: { submit: commands.submit, settle },
     actions: delegatedActions(areas),
   });
+  // The CLI writes receipts outside Home: once one is written to a harness's ledger, it
+  // tells Home's projector, which projects that harness first on its next pass.
+  const submit: Commands["submit"] =
+    options.mode === "direct"
+      ? async (request, effect) => {
+          const answer = await commands.submit(request, effect);
+          if (answer.ok && request.ledger !== "workspace") {
+            nudgeFromReceipt(deps.hangarRoot, answer.receipt.target, warn);
+          }
+          return answer;
+        }
+      : commands.submit;
   return {
     mode: options.mode,
     decisions,
     rules: createRules(decisions, now),
     delegations,
     commands: {
-      submit: commands.submit,
+      submit,
       get: commands.get,
       replayOf: commands.replayOf,
       recover,

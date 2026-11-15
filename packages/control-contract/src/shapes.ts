@@ -509,10 +509,22 @@ export type DeviceLookupRequest = {
   readonly code: string;
 };
 
+/**
+ * Where a device sign-in came from, as Home observed it: over TCP from `address`, through
+ * the trusted proxy with the address it reports, or on Home's own socket.
+ */
+export type DeviceRequestedFrom = {
+  readonly via: "direct" | "proxy" | "home";
+  readonly address?: string;
+};
+
 export type DeviceRequestView = {
   readonly state: "pending" | "allowed" | "denied" | "consumed" | "expired";
   readonly readOnly: boolean;
   readonly expiresAt: string;
+  /** When Home received it. */
+  readonly createdAt: string;
+  readonly requestedFrom: DeviceRequestedFrom;
   readonly clientName?: string;
   /** How many days the token lasts once collected. */
   readonly tokenDays: number;

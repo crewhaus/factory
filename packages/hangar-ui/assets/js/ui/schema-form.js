@@ -117,6 +117,18 @@ export function carriesMasked(value) {
 }
 
 const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** Names that address an object's prototype in plain data: never a setting of the form. */
+export const RESERVED_SEGMENTS = Object.freeze(["__proto__", "constructor", "prototype"]);
+
+/** Set an own property, never a prototype: a key is a plain key here. */
+const setOwn = (holder, key, value) =>
+  Object.defineProperty(holder, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
 const isLiteral = (v) =>
   v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean";
 
@@ -257,13 +269,23 @@ function withoutNull(doc, schema, open) {
  *   schema    — the document the server answers (`{$ref, definitions}`)
  *   effective — the effective rows (`{segments, value, source}`)
  *   trust     — the trust rows (`{segments, tier, securitySurface}`), declared paths only
+ *   opts      — `{truncated}`: true when the effective rows stopped at the server's cap
  *
  * Answers `{groups, counts, why}`: the root's settings in schema order, the
  * walk's tallies (`visited` equals `classified` by construction: every node
  * the walk enters is classified exactly once), and, when the root itself is
  * not a block of settings, why.
+ *
+ * While the rows are truncated, no node has a `paneSeed`: a whole-block write
+ * built from a capped read would drop every setting past the cap, so each
+ * block editor starts empty. Single values still seed their own controls.
+ * A node with no row of its own in a truncated read is `capped`: the form
+ * cannot tell an unset setting from one past the cap, so it offers no write
+ * for it and {@link fieldEdit} answers null.
+ * A row whose path holds a {@link RESERVED_SEGMENTS} name is never read.
  */
-export function formModel(schema, effective = [], trust = []) {
+export function formModel(schema, effective = [], trust = [], opts = {}) {
+  const truncated = opts?.truncated === true;
   const counts = { visited: 0, classified: 0, controls: 0, json: 0, groups: 0 };
   const rows = new Map();
   const prefixRows = [];
@@ -274,6 +296,7 @@ export function formModel(schema, effective = [], trust = []) {
         ? row.path.split(".")
         : null;
     if (segments === null || segments.length === 0) continue;
+    if (segments.some((seg) => RESERVED_SEGMENTS.includes(seg))) continue;
     const entry = { segments, value: row.value, source: row.source };
     rows.set(nodeKey(segments), entry);
     prefixRows.push(entry);
@@ -304,10 +327,11 @@ export function formModel(schema, effective = [], trust = []) {
     for (const r of below) {
       let at = out;
       const rest = r.segments.slice(segments.length);
+      // Own properties only, read and written: a key never reaches a prototype.
       for (const [i, seg] of rest.entries()) {
-        if (i === rest.length - 1) at[seg] = r.value;
+        if (i === rest.length - 1) setOwn(at, seg, r.value);
         else {
-          if (!isObject(at[seg])) at[seg] = {};
+          if (!(Object.hasOwn(at, seg) && isObject(at[seg]))) setOwn(at, seg, {});
           at = at[seg];
         }
       }
@@ -340,8 +364,10 @@ export function formModel(schema, effective = [], trust = []) {
       help: typeof help === "string" && help !== "" ? help : null,
       seed,
       // What the JSON pane starts from: what the file says, or the defaults when it
-      // says nothing; nothing at all when a value under it came back masked.
-      paneSeed: writeOnly ? undefined : declaredSeed !== undefined ? declaredSeed : seed,
+      // says nothing; nothing at all when a value under it came back masked, or when
+      // the rows stopped at the cap.
+      paneSeed:
+        truncated || writeOnly ? undefined : declaredSeed !== undefined ? declaredSeed : seed,
       hidden: hidden.length > 0 ? hidden : writeOnly ? [segments.join(".")] : [],
       source:
         exact !== undefined
@@ -355,6 +381,8 @@ export function formModel(schema, effective = [], trust = []) {
       security: tierRow?.securitySurface === true,
       badges: [],
       writeOnly,
+      // No row of its own in a capped read: what the file holds here is unknown, so nothing writes it.
+      capped: truncated && exact === undefined,
       nullable: false,
     };
   };
@@ -521,11 +549,13 @@ function coerceAs(kind, input) {
  * setting (`CLEAR`), or null when nothing would change: the value equals the
  * seed, nothing was typed, a hidden value's control was left empty, or the value
  * still carries any masker's placeholder (`[redacted]`, `***` or `«NAME»`): a
- * masked read is never written back.
+ * masked read is never written back. A `capped` node answers null for every
+ * input: a write is never built over a value the capped read did not show.
  * Coercion is by the node's kind, never by the seed's type.
  */
 export function fieldEdit(node, input) {
   if (!isObject(node) || !Array.isArray(node.segments) || node.segments.length === 0) return null;
+  if (node.capped === true) return null;
   const path = node.segments.map(String);
   if (input === CLEAR) return node.source === "declared" ? { path } : null;
   // A hidden value's control starts empty, and an empty one sends nothing, whatever its kind.

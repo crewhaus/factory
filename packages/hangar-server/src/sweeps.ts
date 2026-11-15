@@ -9,16 +9,20 @@
  * | `notifications` | 10 s | the rules people turned on are delivered, on the sinks they chose |
  * | `standing-rules` | 10 s | a standing rule past its end is ended |
  * | `claims` | 1 h | an idempotency key older than seven days can be used again |
+ * | `projector` | 2 s | every harness's read models under `cache/index/` follow its records, nudged harnesses first; each change they show is one line of the fleet's change log, which keeps its newest segments |
  *
  * Each step of `reconcile` is isolated: one that throws is warned about and the next runs.
  */
 import type { AccessHarness } from "@crewhaus/access-control";
 import { refreshApproverProjections } from "@crewhaus/access-control";
 import {
+  CORE_PROJECTIONS,
   type ControlService,
+  type Projection,
   commandsLedgerOf,
   endExpiredRules,
   expireIdempotencyClaims,
+  projectOnce,
   workspaceCommandsLedger,
 } from "@crewhaus/control-service";
 import type { Sweep } from "./scheduler-host";
@@ -37,6 +41,8 @@ export type HomePorts = {
   readonly delegations: Pick<ControlService["delegations"], "apply">;
   /** Evaluate the notification rules once and deliver what is due. */
   notificationsTick(): void;
+  /** The projections the projector keeps; the core's when absent. */
+  readonly projections?: readonly Projection<unknown>[];
 };
 
 /** Run one step, warning on a throw so the next step still runs. */
@@ -111,10 +117,27 @@ const claims: Sweep<HomePorts> = {
   },
 };
 
+const projector: Sweep<HomePorts> = {
+  name: "projector",
+  everyMs: 2_000,
+  run: async ({ home, now, warn }) => {
+    const report = await projectOnce({
+      hangarRoot: home.hangarRoot,
+      harnesses: home.liveHarnesses(),
+      projections: home.projections ?? CORE_PROJECTIONS,
+      now,
+    });
+    for (const failure of report.failed) {
+      warn(`the read model ${failure.at} was not updated: ${failure.reason}`);
+    }
+  },
+};
+
 /** The core's sweeps, in the order they run on a tick. */
 export const CORE_SWEEPS: readonly Sweep<HomePorts>[] = [
   reconcile,
   notifications,
   standingRules,
   claims,
+  projector,
 ];

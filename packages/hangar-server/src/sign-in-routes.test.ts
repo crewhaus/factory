@@ -4,9 +4,17 @@
  * and a sign-out. Every issuing answer is never cached and is unchanged by the masker.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
+import {
+  ensureAccessSetUp,
+  loadAccessSnapshot,
+  openAccess,
+  openDeviceRequests,
+  openSignIn,
+} from "@crewhaus/access-control";
+import { makeSeal } from "@crewhaus/control-contract/http";
 import {
   acceptInvite,
   acceptInviteTabOnly,
@@ -20,6 +28,7 @@ import {
   signInJs,
 } from "./__test__/browser";
 import { maskDeep } from "./mask";
+import { serveSignIn } from "./sign-in-routes";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const servers: TestServer[] = [];
@@ -346,5 +355,38 @@ describe("joining is on record", () => {
     const rows = joins(t);
     expect(rows.map((row) => row["state"])).toEqual(["accepted", "succeeded"]);
     expect(rows[0]?.["actor"]).toBe(joined.body["principal"]);
+  });
+});
+
+describe("a device sign-in", () => {
+  test("records where the request came from, as Home saw its peer", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sign-in-device-")));
+    try {
+      const localActor = "local:max@laptop";
+      const setUp = await ensureAccessSetUp(root, { localActor, now: () => Date.now() });
+      expect(setUp.ok).toBe(true);
+      const devices = openDeviceRequests(root);
+      const home = {
+        signIn: openSignIn(root, { localActor }),
+        config: {},
+        bootToken: undefined,
+        now: () => Date.now(),
+        domains: new Map(),
+      };
+      const pair = await makeSeal();
+      const res = await serveSignIn(
+        home,
+        new Request("http://127.0.0.1/api/v1/auth/device", json({ seal: pair.seal })),
+        { address: "203.0.113.5", listener: "tcp" },
+        "/api/v1/auth/device",
+        { devices },
+      );
+      expect(res.status).toBe(200);
+      expect(devices.read().map((row) => row.requestedFrom)).toEqual([
+        { via: "direct", address: "203.0.113.5" },
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

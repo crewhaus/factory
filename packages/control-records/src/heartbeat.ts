@@ -6,7 +6,11 @@
  */
 import { dirname } from "node:path";
 import { ensureDirContained, writeFileSafe } from "@crewhaus/tool-safety/fs";
+import { decodeStrict, parseObject, readRecordFile } from "./io";
 import { controlPaths } from "./paths";
+
+/** A beat is a few hundred bytes; past this it is not one. */
+const HEARTBEAT_MAX_BYTES = 16 * 1024;
 
 /** One beat. No field is named like a credential. */
 export type Heartbeat = {
@@ -64,4 +68,39 @@ export function writeHeartbeat(harnessDir: string, beat: Heartbeat): HeartbeatWr
   } catch (err) {
     return { ok: false, reason: (err as Error).message };
   }
+}
+
+/**
+ * The last beat, read tolerantly: contained in the harness, at most 16 KiB, a link at the
+ * leaf refused. Each field is kept only when it has its type, so a beat from an older
+ * daemon (one with no `operatorUnreadable`, say) reads as far as it goes. `undefined` when
+ * there is no beat, or it is not a JSON object. Creates nothing.
+ *
+ * First consumers: Home's overview and its projector.
+ */
+export function readHeartbeat(harnessDir: string): Partial<Heartbeat> | undefined {
+  let read: ReturnType<typeof readRecordFile>;
+  try {
+    read = readRecordFile(harnessDir, controlPaths(harnessDir).heartbeatFile, HEARTBEAT_MAX_BYTES);
+  } catch {
+    return undefined;
+  }
+  if (!read.ok || read.truncated) return undefined;
+  const text = decodeStrict(read.bytes);
+  const body = text === undefined ? undefined : parseObject(text);
+  if (body === undefined) return undefined;
+  const out: Record<string, unknown> = {};
+  if (body["v"] === 1) out["v"] = 1;
+  for (const key of ["pid", "activeRuns"] as const) {
+    if (typeof body[key] === "number") out[key] = body[key];
+  }
+  if (body["activeRuns"] === null) out["activeRuns"] = null;
+  if (typeof body["at"] === "string") out["at"] = body["at"];
+  if (typeof body["operatorRev"] === "number" || body["operatorRev"] === null) {
+    out["operatorRev"] = body["operatorRev"];
+  }
+  for (const key of ["paused", "disabled", "operatorUnreadable", "runLedger"] as const) {
+    if (typeof body[key] === "boolean") out[key] = body[key];
+  }
+  return out as Partial<Heartbeat>;
 }

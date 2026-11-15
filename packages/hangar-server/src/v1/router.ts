@@ -21,10 +21,11 @@ import {
   parseRef,
   renderTwin,
 } from "@crewhaus/control-contract";
+import { EXECUTION_RUN_ID_RE } from "@crewhaus/control-contract";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import { readRequestBodyCapped } from "@crewhaus/gateway-protocol/body-limit";
 import { HARNESS_ID_RE } from "@crewhaus/harness-registry";
-import { type Caller, currentRequestAccess } from "../access";
+import { type Caller, type RequestAccess, currentRequestAccess } from "../access";
 import { HttpError, json } from "../http";
 import { maskDeep } from "../mask";
 import type { RequestMatch } from "../route-match";
@@ -35,13 +36,16 @@ import {
   capabilityProvidersOf,
   handlersOf,
   homeCompositionProblems,
+  projectionsOf,
   refResolversOf,
+  streamSourcesOf,
 } from "./areas";
 import type { DaemonState, V1Context, V1Deps } from "./context";
-import { V1Error, v1ErrorBody } from "./errors";
+import { V1Error, v1ErrorBody, v1ErrorHeaders } from "./errors";
 import { OPERATION_BY_ID, matchOperation } from "./match";
 import { commandLedgerOf, entryOf } from "./resolve";
-import { findRun, startedRunIn } from "./runs";
+import { findExecution, findRun, startedRunIn } from "./runs";
+import { type StreamPlan, v1EventStream } from "./stream";
 
 const BINARY = "crewhaus";
 
@@ -69,8 +73,13 @@ export type V1Router = {
   ): {
     readonly targetHarness?: string | null;
     readonly selfScope?: true;
-    /** On a row qualified `creating-service`: who started the run it names (or, for a list, the caller). */
+    /**
+     * On a row qualified `creating-service`: who started the run it names (or, for a list,
+     * the caller). The credential in `runByCredential` decides.
+     */
     readonly runBy?: string;
+    /** On a row qualified `creating-service`: the credential that started the run it names (or, for a list, the caller's). */
+    readonly runByCredential?: string;
   };
   /** `GET /api/v1` for a caller who sent no credential: the protocol and how to sign in. */
   discoverAnonymous(): Response;
@@ -149,6 +158,8 @@ export function createV1Router(
   const handlers = handlersOf(areas);
   const refResolvers = refResolversOf(areas);
   const capabilityProviders = capabilityProvidersOf(areas);
+  const projections = projectionsOf(areas);
+  const streamSources = streamSourcesOf(areas);
 
   const exit = (status: number, body: unknown, scrubDir?: string, headers = {}): Response =>
     json(
@@ -157,13 +168,27 @@ export function createV1Router(
       { ...protocolHeaders(), "cache-control": "no-store", ...headers },
     );
 
+  /**
+   * A stream's answer: the one writer, with the scrubber `exit` would choose, the protocol
+   * headers, and the caller's authority as it stands at each batch.
+   */
+  const streamExit = (
+    plan: StreamPlan,
+    scrubDir: string | undefined,
+    access: RequestAccess,
+  ): Response =>
+    v1EventStream({
+      ...plan,
+      ...(deps.streamTimings ?? {}),
+      scrub: scrubDir === undefined ? deps.fleetScrub() : deps.harnessScrub(scrubDir),
+      // A Home that lends no fresh view (a test's) keeps the request's own.
+      accessNow: () => deps.accessNow?.(access.caller) ?? access,
+      headers: protocolHeaders(),
+      onWarn: deps.onWarn,
+    });
+
   const refuse = (error: V1Error): Response =>
-    exit(
-      error.input.status,
-      v1ErrorBody(error.input),
-      undefined,
-      error.input.status === 401 ? { "www-authenticate": "Bearer" } : {},
-    );
+    exit(error.input.status, v1ErrorBody(error.input), undefined, v1ErrorHeaders(error.input));
 
   const queryOf = (op: OperationRow, url: URL): Record<string, string> => {
     const allowed = new Set(QUERY_NAMES[op.request] ?? []);
@@ -323,6 +348,8 @@ export function createV1Router(
         via: viaOf(caller),
         refResolvers,
         capabilityProviders,
+        projections,
+        streamSources,
         ...(caller.actor !== null && isId("prn", caller.principal)
           ? {
               actor: caller.principal,
@@ -331,6 +358,7 @@ export function createV1Router(
           : {}),
       };
       const answer = await handler(ctx);
+      if ("stream" in answer) return streamExit(answer.stream, answer.scrubDir, access);
       return exit(answer.status, answer.body, answer.scrubDir, answer.headers ?? {});
     } catch (err) {
       if (err instanceof V1Error) return refuse(err);
@@ -361,21 +389,43 @@ export function createV1Router(
   const targetOf: V1Router["targetOf"] = (matched, url, caller) => {
     const op = OPERATION_BY_ID.get(matched.row.key);
     if (op === undefined) return {};
-    const out: { targetHarness?: string | null; selfScope?: true; runBy?: string } = {};
+    const out: {
+      targetHarness?: string | null;
+      selfScope?: true;
+      runBy?: string;
+      runByCredential?: string;
+    } = {};
     const { h, ref, cmd, run } = matched.params;
     const creating = op.qualifiers.includes("creating-service");
+    const credential =
+      caller.actor !== null && "credential" in caller.actor ? caller.actor.credential : undefined;
     if (h !== undefined) {
       const entry = entryOf(deps, h);
       out.targetHarness = entry?.id ?? null;
-      // A service that started a run there lists the runs it started, and no others; one
-      // that started none is refused as for a harness this Home does not have.
-      if (creating && caller.via === "service" && entry !== undefined) {
-        if (startedRunIn(entry, caller.principal)) out.runBy = caller.principal;
+      // A service credential that started a run there lists the runs it started, and no
+      // others; one that started none is refused as for a harness this Home does not have.
+      if (creating && caller.via === "service" && credential !== undefined && entry !== undefined) {
+        if (startedRunIn(entry, caller.principal, credential)) {
+          out.runBy = caller.principal;
+          out.runByCredential = credential;
+        }
+      }
+    } else if (run !== undefined && EXECUTION_RUN_ID_RE.test(run)) {
+      // A supervisor's execution is a stream's only: found in one harness's supervisor
+      // ledger, or none. Every other run operation reads canonical runs, so it has none.
+      if (op.id === "runs.events") {
+        const found = findExecution(deps, run, url.searchParams.get("harness") ?? undefined);
+        out.targetHarness = found?.entry.id ?? null;
+      } else {
+        out.targetHarness = null;
       }
     } else if (run !== undefined) {
       const found = findRun(deps, run, url.searchParams.get("harness") ?? undefined);
       out.targetHarness = found?.entry.id ?? null;
-      if (creating && found?.by !== undefined) out.runBy = found.by;
+      if (creating && found?.by !== undefined && found.byCredential !== undefined) {
+        out.runBy = found.by;
+        out.runByCredential = found.byCredential;
+      }
     } else if (ref !== undefined) {
       const parsed = parseRef(ref);
       if (!("error" in parsed)) {

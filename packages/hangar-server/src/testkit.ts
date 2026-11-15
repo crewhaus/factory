@@ -208,6 +208,8 @@ export type BootOptions = Omit<
   /** Write files under the fresh workspace before Home boots — the owner's
    *  `settings.json` blocks, which Home reads only at boot. */
   readonly prepare?: (dirs: { readonly workspace: string; readonly hangarRoot: string }) => void;
+  /** The built-in layer's caps on live API runs (`ProcessLayerOptions.apiRunLimits`). */
+  readonly apiRunLimits?: { readonly perHarness?: number; readonly perHome?: number };
 };
 
 /** Boot an isolated server on an ephemeral loopback port. */
@@ -227,6 +229,7 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
     controlClient,
     runJob,
     prepare,
+    apiRunLimits,
     ...rest
   } = opts;
   if (prepare !== undefined) {
@@ -270,6 +273,7 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
       clock,
       runJob: (job, ctx) => (wrappedRun ?? baseRun)(job, ctx),
       ...(preflight === true ? {} : { noPreflight: true }),
+      ...(apiRunLimits !== undefined ? { apiRunLimits } : {}),
       wrapJobStore: (store) => {
         jobStore = store;
         return {

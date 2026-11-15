@@ -177,6 +177,7 @@ describe("watermarks", () => {
       from: { seg: 1, off: 0 },
       to: { seg: 2, off: 0 },
       reason: "evicted",
+      after: { seg: 2, off: 0, tail: "" },
     });
     expect(lineNumbers(answer)).toEqual([2, 3]);
   });
@@ -209,6 +210,7 @@ describe("watermarks", () => {
         from: { seg: 2, off: vector.runs?.[0]?.off ?? -1 },
         to: { seg: 3, off: vector.runs?.[1]?.off ?? -1 },
         reason: "evicted",
+        after: vector.runs?.[1],
       },
     ]);
     // Segment 3 is not re-read from 0: it was already delivered.
@@ -233,6 +235,7 @@ describe("watermarks", () => {
         from: { seg: 1, off: 0 },
         to: { seg: 4, off: 0 },
         reason: "evicted",
+        after: { seg: 4, off: 0, tail: "" },
       },
     ]);
     expect(lineNumbers(answer)).toEqual([4]);

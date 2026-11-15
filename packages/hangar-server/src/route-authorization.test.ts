@@ -1298,7 +1298,10 @@ describe("the versioned API: every served operation, for every role and credenti
     const { openDeviceRequests } = await import("@crewhaus/access-control");
     const devices = openDeviceRequests(world.t.hangarRoot);
     const collect = async (readOnly: boolean): Promise<string> => {
-      const start = await devices.start({ ...(readOnly ? { readOnly: true } : {}) });
+      const start = await devices.start({
+        requestedFrom: { via: "home" },
+        ...(readOnly ? { readOnly: true } : {}),
+      });
       if (!start.ok) throw new Error(start.reason);
       const decided = await devices.decide({
         caller: world.principals["maintainerA"] as string,
@@ -1516,12 +1519,24 @@ describe("the versioned API: every served operation, for every role and credenti
       expect(ops.filter((op) => op.id.startsWith("delegations."))).toHaveLength(11);
       const wrong: string[] = [];
       for (const op of ops) {
-        const res = await world.t.fetchRaw(v1PathOf(op.path), {
+        const controller = new AbortController();
+        const res = await fetch(`${world.t.base}${v1PathOf(op.path)}`, {
           method: op.method,
           headers: { "content-type": "application/json", ...credOf(cred).headers },
           ...(op.method === "GET" ? {} : { body: "{}" }),
+          signal: controller.signal,
         });
-        const text = await res.text();
+        let text: string;
+        if ((res.headers.get("content-type") ?? "").includes("text/event-stream")) {
+          // An event stream that was allowed: its first chunk, then the client goes.
+          const reader = res.body?.getReader();
+          await reader?.read();
+          controller.abort();
+          await reader?.cancel().catch(() => undefined);
+          text = "{}";
+        } else {
+          text = await res.text();
+        }
         let body: Record<string, unknown> = {};
         try {
           body = JSON.parse(text) as Record<string, unknown>;
@@ -1632,7 +1647,10 @@ describe("the versioned API: every served operation, for every role and credenti
       expect(ivy).toMatch(/^prn_/);
       const devices = openDeviceRequests(home.t.hangarRoot);
       const token = async (readOnly: boolean) => {
-        const start = await devices.start({ ...(readOnly ? { readOnly: true } : {}) });
+        const start = await devices.start({
+          requestedFrom: { via: "home" },
+          ...(readOnly ? { readOnly: true } : {}),
+        });
         if (!start.ok) throw new Error(start.reason);
         const decided = await devices.decide({
           caller: ivy,

@@ -140,6 +140,10 @@
             {
               "name": "deny",
               "takesValue": false
+            },
+            {
+              "name": "yes",
+              "takesValue": false
             }
           ]
         },

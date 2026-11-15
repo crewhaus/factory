@@ -414,7 +414,7 @@ describe("personal tokens", () => {
       }),
     ).principal;
     const devices = openDeviceRequests(fixture.root, { now: fixture.clock.now });
-    const start = await devices.start({ readOnly });
+    const start = await devices.start({ readOnly, requestedFrom: { via: "home" } });
     if (!start.ok) throw new Error(start.reason);
     await devices.decide({ caller: member, code: start.userCode, choice: "allow" });
     const polled = await devices.poll(start.pollRef);

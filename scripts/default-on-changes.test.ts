@@ -73,6 +73,10 @@ import {
   createRuntimeBackedApprovalStore,
 } from "../packages/channel-adapter-base/src/index";
 import { cfWorkerUnwiredBlockWarnings, compile, lower } from "../packages/compiler/src/index";
+import {
+  SCHEDULE_LANES_CORPUS,
+  SCHEDULE_OBJECT_CORPUS,
+} from "../packages/compiler/src/schedule-corpus";
 import { createContinuityStore } from "../packages/continuity-store/src/index";
 import {
   DECISION_LOG_KEYS,
@@ -133,6 +137,7 @@ import {
   homeCrewhausArgv,
   jobCrewhausBin,
 } from "../packages/hangar-server/src/process";
+import { maskedPlaceholderPaths } from "../packages/hangar-server/src/spec-edit";
 import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import {
@@ -5578,5 +5583,214 @@ describe("the release notes name what a channel daemon does with clicks and mess
         b.includes("runtime-state floor also covers"),
       ),
     ).toHaveLength(1);
+  });
+});
+
+describe("the release notes name what the run pump's lease changes for every harness", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS)
+      .find((b) => b.includes(needle))
+      ?.replace(/\s+/g, " ") ?? "";
+
+  test("a second pump over a run waits and appends nothing; the one that writes stamps ingestedAt", async () => {
+    const { createLogPump, readPumpLease, replayRunEvents } = await import(
+      "../packages/harness-supervisor/src/index"
+    );
+    const dir = mkdtempSync(join(tmpdir(), "default-on-pump-"));
+    try {
+      mkdirSync(join(dir, "logs"), { recursive: true });
+      const files = {
+        logFile: join(dir, "logs", "run.log"),
+        eventsFile: join(dir, "logs", "run.events.jsonl"),
+        cursorFile: join(dir, "logs", "run.cursor"),
+      };
+      // Both pids alive on this host, with fixed start times: neither lease is breakable.
+      const probe = {
+        isAlive: (pid: number) => pid === 100 || pid === 200,
+        startTimeMs: (pid: number) => (pid === 100 ? 1_000 : pid === 200 ? 2_000 : undefined),
+      };
+      const first = createLogPump({ ...files, pid: 100, probe });
+      const second = createLogPump({ ...files, pid: 200, probe });
+      writeFileSync(
+        files.logFile,
+        `${JSON.stringify({ kind: "turn_end", runId: "run_0123456789abcdef", turn: 1 })}\n`,
+      );
+      expect(first.pumpOnce().held).toBe(true);
+      const waited = second.pumpOnce();
+      expect(waited.held).toBe(false);
+      expect(waited.events).toEqual([]);
+      expect(readPumpLease(join(dir, "logs", "run.pump.lock"))?.pid).toBe(100);
+      const written = replayRunEvents(files.eventsFile);
+      expect(written).toHaveLength(1);
+      expect(typeof written[0]?.["ingestedAt"]).toBe("string");
+      first.close();
+      second.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    // Retention lists what it removes before it removes it.
+    const runfiles = readFileSync(
+      join(ROOT, "packages/harness-supervisor/src/runfiles.ts"),
+      "utf8",
+    );
+    expect(runfiles).toContain("!recordPruned(harnessDir, evict, now())");
+    const bullet = bulletFor("One manager writes a run's events at a time.");
+    expect(bullet).not.toBe("");
+    for (const word of ["lease", "`<run>.pump.lock`", "waits", "`ingestedAt`", "pruned.jsonl"]) {
+      expect(bullet).toContain(word);
+    }
+  });
+});
+
+describe("the release notes name the spec edits Home refuses for a hidden value's placeholder", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("a placeholder is refused at the commit and at the preview, and the bullet says so", () => {
+    const names = new Set(["HELPER_TOKEN"]);
+    expect(maskedPlaceholderPaths("a: real\n", 'a: "[redacted]"\n', names)).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: real\n", "a: use «HELPER_TOKEN»\n", names)).toEqual([["a"]]);
+    // Text the file already holds at that path is kept, and `***` is ordinary text.
+    expect(maskedPlaceholderPaths('a: "[redacted]"\n', 'a: "[redacted]"\n', names)).toEqual([]);
+    expect(maskedPlaceholderPaths("a: real\n", 'a: "***"\n', names)).toEqual([]);
+    // Both doors every spec write and every preview pass through run the check.
+    const source = readFileSync(join(ROOT, "packages/hangar-server/src/spec-edit.ts"), "utf8");
+    const bodyOf = (signature: string, end: string): string => {
+      const at = source.indexOf(signature);
+      expect(at).toBeGreaterThan(-1);
+      const stop = source.indexOf(end, at);
+      expect(stop).toBeGreaterThan(at);
+      return source.slice(at, stop);
+    };
+    const commit = bodyOf("export async function commitHomeEdits(", "\n}\n");
+    const preview = bodyOf("export async function previewHomeEdits(", "\n}\n");
+    expect(commit).toContain("placeholderRefusal(ctx, before, yamlText)");
+    expect(preview.split("placeholderPreview(ctx, before, edits, preview)")).toHaveLength(3);
+    const bullet = bulletFor(
+      "Home refuses a spec edit that would write a hidden value's placeholder.",
+    );
+    expect(bullet).toContain("`[redacted]`");
+    expect(bullet).toContain("`«NAME»`");
+    expect(bullet).toContain("`edit_rejected`");
+  });
+});
+
+describe("the release notes name what a schedule's checks and next wake change", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+  const count = (text: string, needle: string): number => text.split(needle).length - 1;
+
+  test("a time zone the runtime does not know and a cron whose day never comes are refused", () => {
+    const object = SCHEDULE_OBJECT_CORPUS["managed-cron"];
+    expect(object).toBeDefined();
+    const managed = (object as string).replace("timezone: America/New_York", "timezone: Not/AZone");
+    expect(managed).toContain("timezone: Not/AZone");
+    expect(() => parseSpec(managed)).toThrow("Not/AZone");
+    const lanes = (SCHEDULE_LANES_CORPUS["channel-lanes"] as string).replace(
+      'cron: "0 17 * * 5"',
+      'cron: "0 0 31 2 *"',
+    );
+    expect(lanes).toContain('cron: "0 0 31 2 *"');
+    expect(() => parseSpec(lanes)).toThrow("can never fire");
+    const checks = bulletFor("A schedule's time zone and cron are checked when the spec compiles");
+    expect(checks).toContain("`timezone`");
+    expect(checks).toContain("`cron`");
+  });
+
+  test("every armed schedule's next wake is read from its timer", () => {
+    const daemons: Array<readonly [string, string]> = [];
+    const scan = (corpus: Readonly<Record<string, string>>, names: readonly string[]): void => {
+      for (const name of names) {
+        const yaml = corpus[name];
+        expect({ name, present: yaml !== undefined }).toEqual({ name, present: true });
+        const files = compile(yaml as string, { today: "2026-09-04" }).files;
+        // The batch worker's daemon is its agent.ts; channel and managed emit a daemon.ts.
+        const path = name.startsWith("batch") ? "agent.ts" : "daemon.ts";
+        daemons.push([name, files.find((f) => f.path === path)?.content ?? ""]);
+      }
+    };
+    scan(SCHEDULE_OBJECT_CORPUS, [
+      "channel-cron",
+      "channel-interval",
+      "batch-cron",
+      "batch-interval",
+    ]);
+    scan(SCHEDULE_LANES_CORPUS, ["channel-lanes", "managed-lanes", "batch-lanes"]);
+    for (const [name, text] of daemons) {
+      expect({ name, nextAt: count(text, ".nextAt(") > 0 }).toEqual({ name, nextAt: true });
+      expect({ name, arithmetic: count(text, "nextWakeDelayMs") }).toEqual({
+        name,
+        arithmetic: 0,
+      });
+    }
+    const wake = bulletFor("A schedule lane's next wake in `/control/v1/status`");
+    expect(wake).toContain("`nextDueAt`");
+    expect(wake).toContain("`CREWHAUS_SCHEDULE=0`");
+  });
+});
+
+describe("device sign-in", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("Home's device page never takes the code from its address", () => {
+    const source = readFileSync(join(ROOT, "packages/hangar-ui/assets/js/views/device.js"), "utf8");
+    expect(source).not.toContain("codeFromHash");
+    expect(source).not.toContain("location.hash");
+    const bullet = bulletFor("device sign-in page starts with an empty code field");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("types");
+  });
+
+  test("`crewhaus access approve` asks, or needs --yes, before it allows", () => {
+    const source = readFileSync(join(ROOT, "apps/cli/src/access-cmd.ts"), "utf8");
+    const start = source.indexOf("async function approveVerb(");
+    expect(start).toBeGreaterThan(-1);
+    const body = source.slice(start, source.indexOf("\n}\n", start));
+    const yes = body.indexOf('has("yes")');
+    const confirm = body.indexOf("await confirm(");
+    const allow = body.indexOf('choice: "allow"');
+    for (const at of [yes, confirm, allow]) expect(at).toBeGreaterThan(-1);
+    expect(yes).toBeLessThan(allow);
+    expect(confirm).toBeLessThan(allow);
+    const bullet = bulletFor("`crewhaus access approve` shows the request and asks");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("--yes");
+  });
+
+  test("one address has at most 4 device sign-ins waiting", async () => {
+    const { DEVICE_LIMITS } = await import("../packages/access-control/src/index");
+    expect(DEVICE_LIMITS.maxPendingPerPeer).toBe(4);
+    const bullet = bulletFor("device sign-ins waiting at once");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("4");
+  });
+
+  test("a device name with a bidi character is refused", async () => {
+    const { deviceStartRequest } = await import("../packages/control-contract/src/schemas/core");
+    const { SEAL } = await import("../packages/control-contract/src/__test__/schema-examples");
+    expect(deviceStartRequest.safeParse({ seal: SEAL, clientName: "a\u202eb" }).success).toBe(
+      false,
+    );
+    expect(deviceStartRequest.safeParse({ seal: SEAL, clientName: "ab" }).success).toBe(true);
+    const bullet = bulletFor("A device name with bidi or invisible formatting characters");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("bidi");
+  });
+});
+
+describe("the release notes name the tenant ids a managed daemon reserves", () => {
+  test("every reserved tenant id is named in the default-on list", async () => {
+    const { RESERVED_TENANT_IDS } = await import("../packages/gateway-server/src/coded");
+    expect(RESERVED_TENANT_IDS.size).toBeGreaterThan(0);
+    const later = defaultOnBullets(changelog, LATER_HEADINGS).join("\n");
+    for (const id of RESERVED_TENANT_IDS) {
+      expect(`${id}: ${later.includes(`\`${id}\``)}`).toBe(`${id}: true`);
+    }
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) =>
+        b.includes("refuses a client token whose `tenant_id`"),
+      ) ?? "";
+    expect(bullet).toContain("any letter case");
   });
 });

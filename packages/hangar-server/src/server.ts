@@ -322,10 +322,12 @@ import {
   type HomeAreaRuntime,
   V1_NOT_SERVED,
   homeCompositionProblems,
+  projectionsOf,
   receiversOf,
   sweepsOf,
 } from "./v1/areas";
 import { createV1Router, daemonStateOf } from "./v1/router";
+import type { StreamTimings } from "./v1/stream";
 
 export type StaticAsset = {
   readonly body: string | Uint8Array;
@@ -384,6 +386,9 @@ export type HangarServerOptions = {
    *  {@link SSE_HEARTBEAT_MS}. Tests shorten it to prove the frame exists
    *  without waiting out the real interval. */
   readonly sseHeartbeatMs?: number;
+  /** The versioned API's event streams' pacing: keep-alive, polling, caps and timers.
+   *  Tests shorten it, and drive a stream with fake timers. */
+  readonly streamTimings?: StreamTimings;
   /** M4 (HM-187): start in read-only mode. Persisted settings still apply —
    *  this only forces the mode ON at boot. */
   readonly readOnly?: boolean;
@@ -703,8 +708,17 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
   /** Who each `/api` request authenticated as, for the routes that care which credential. */
   const callers = new WeakMap<Request, Authenticated>();
-  /** The row, params and caller each `/api` request was authorized as, for its stream. */
-  const authorized = new WeakMap<Request, RequestMatch & { readonly caller: Caller }>();
+  /** What each `/api` request was authorized on, for its stream's re-check to decide alike. */
+  const authorized = new WeakMap<
+    Request,
+    RequestMatch & {
+      readonly caller: Caller;
+      readonly targetHarness?: string | null;
+      readonly selfScope?: true;
+      readonly runBy?: string;
+      readonly runProofHarness?: string | null;
+    }
+  >();
   /** Every open run stream's re-check: whether its caller may still read it. */
   const streamChecks = new Set<() => void>();
   let streamEpoch: string | undefined;
@@ -3320,6 +3334,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     ...(processes.stopApiRun !== undefined
       ? { stopRunJob: processes.stopApiRun.bind(processes) }
       : {}),
+    ...(processes.apiRunCapacity !== undefined
+      ? { apiRunCapacity: processes.apiRunCapacity.bind(processes) }
+      : {}),
     controlClient: control,
     controlTarget: async (entry) => controlTarget(await processFor(entry)),
     stopDaemon: async (entry) => {
@@ -3329,6 +3346,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         ? { ok: true, detail: `stopped${stopped.forced ? " (forced)" : ""}` }
         : { ok: false, detail: "a live daemon holds the runfile but was not adopted" };
     },
+    streamSignal,
+    accessNow: (caller) => requestAccessFor(caller, accessView(signIn.snapshot())),
+    ...(opts.streamTimings !== undefined ? { streamTimings: opts.streamTimings } : {}),
   });
 
   const withReceipt = createReceipts({
@@ -3530,6 +3550,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         matched.row.v1 === true &&
         caller.scoped === undefined &&
         Object.hasOwn(V1_NOT_SERVED, matched.row.key);
+      // What the row is decided on, worked out once: the open and every re-check use it.
+      const target = {
+        ...(matched.row.key === "runProof"
+          ? { runProofHarness: proofOwner(matched.params["sessionId"], url) }
+          : {}),
+        ...(matched.row.v1 === true ? v1Router.targetOf(matched, url, caller) : {}),
+      };
       const decided = notServedYet
         ? ({ allow: true } as const)
         : authorizeRequest({
@@ -3537,10 +3564,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
             params: matched.params,
             caller,
             view,
-            ...(matched.row.key === "runProof"
-              ? { runProofHarness: proofOwner(matched.params["sessionId"], url) }
-              : {}),
-            ...(matched.row.v1 === true ? v1Router.targetOf(matched, url, caller) : {}),
+            ...target,
             origin: req.headers.get("origin"),
             ownOrigin,
           });
@@ -3551,7 +3575,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       if (readOnlyNow() && isReadOnlyRefused(matched.row)) {
         return json(readOnlyRefusal(req.method, pathname, readOnlyLocked), 403);
       }
-      authorized.set(req, { ...matched, caller });
+      authorized.set(req, { ...matched, caller, ...target });
       const access = requestAccessFor(caller, view);
       return await withRequestAccess(access, async () => {
         try {
@@ -3595,6 +3619,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     },
     notificationsTick,
     delegations: controlService.delegations,
+    projections: projectionsOf(areas).map((row) => row.projection),
   };
   const scheduler = createSchedulerHost<HomePorts>({
     now,

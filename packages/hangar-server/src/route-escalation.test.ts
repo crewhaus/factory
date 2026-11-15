@@ -15,6 +15,7 @@ import { mintId } from "@crewhaus/control-contract";
 import { append, foldStates } from "@crewhaus/control-records";
 import { commandsLedgerOf } from "@crewhaus/control-service";
 import { mergedSpawnEnv } from "@crewhaus/harness-supervisor";
+import { parseSpec } from "@crewhaus/spec";
 import type { SpecEdit } from "@crewhaus/spec-patch";
 import { specRev } from "@crewhaus/spec-patch/commit";
 import { acceptInvite, acceptInviteTabOnly, bearer, signInFromBootLink } from "./__test__/browser";
@@ -39,6 +40,51 @@ const SPEC = (usd: number): string =>
     `  usd: ${usd}`,
     "",
   ].join("\n");
+
+/** A workflow whose `gate` step is a protected judge over `draft`, with `judge` lines added. */
+const GATED_WORKFLOW = (judge: readonly string[] = []): string =>
+  [
+    "name: escalation-fixture",
+    "target: workflow",
+    "model: anthropic/claude-sonnet-4",
+    "steps:",
+    "  - name: draft",
+    "    instructions: Draft it.",
+    "  - name: gate",
+    "    kind: judge",
+    "    judge:",
+    "      criteria: is it right",
+    "      protected: true",
+    ...judge.map((line) => `      ${line}`),
+    "",
+  ].join("\n");
+
+/** A graph whose protected judge node `gate` gates `draft` before `publish`. */
+const GATED_GRAPH = [
+  "name: escalation-fixture",
+  "target: graph",
+  "model: anthropic/claude-sonnet-4",
+  "entry: draft",
+  "nodes:",
+  "  draft:",
+  "    instructions: Draft it.",
+  "  gate:",
+  "    kind: judge",
+  "    judge:",
+  "      criteria: is it right",
+  "      protected: true",
+  "  publish:",
+  "    instructions: Publish it.",
+  "edges:",
+  "  - { from: draft, to: gate }",
+  "  - { from: gate, to: publish }",
+  "",
+].join("\n");
+
+/** {@link GATED_GRAPH} with a `start` node ahead of `draft`. */
+const GATED_GRAPH_FROM_START = GATED_GRAPH.replace("entry: draft", "entry: start")
+  .replace("nodes:\n", "nodes:\n  start:\n    instructions: Start.\n")
+  .replace("edges:\n", "edges:\n  - { from: start, to: draft }\n");
 
 const servers: TestServer[] = [];
 afterEach(async () => {
@@ -339,6 +385,120 @@ describe("spec writes that touch security or spending", () => {
     );
     expect([advice.status, advice.body["needs"]]).toEqual([403, "h.spec.edit.security"]);
     expect(specText(h)).toBe(before);
+  });
+  test("a protected judge gate's on_fail, criteria and wiring change only with the owner", async () => {
+    const h = await home();
+    const maintainer = await h.member("maintainer");
+    const path = join(h.dir, "crewhaus.yaml");
+    const cases = [
+      {
+        spec: GATED_WORKFLOW(),
+        edit: { path: "steps.1.judge.on_fail", value: "continue" },
+        key: "steps.gate.judge.on_fail",
+        written: (text: string) => expect(text).toContain("on_fail: continue"),
+      },
+      {
+        spec: GATED_WORKFLOW(),
+        edit: { path: "steps.1.judge.criteria", value: "anything goes" },
+        key: "steps.gate.judge.criteria",
+        written: (text: string) => expect(text).toContain("criteria: anything goes"),
+      },
+      {
+        spec: GATED_GRAPH,
+        edit: {
+          path: "edges",
+          value: [
+            { from: "draft", to: "publish" },
+            { from: "draft", to: "gate" },
+            { from: "gate", to: "publish" },
+          ],
+        },
+        key: "nodes.gate.judge.edges",
+        written: (text: string) =>
+          expect((parseSpec(text) as unknown as { edges: unknown[] }).edges[0]).toEqual({
+            from: "draft",
+            to: "publish",
+          }),
+      },
+      {
+        spec: GATED_GRAPH_FROM_START,
+        edit: {
+          path: "edges",
+          value: [
+            { from: "start", to: "publish" },
+            { from: "start", to: "draft" },
+            { from: "draft", to: "gate" },
+            { from: "gate", to: "publish" },
+          ],
+        },
+        key: "nodes.gate.judge.edges",
+        written: (text: string) =>
+          expect((parseSpec(text) as unknown as { edges: unknown[] }).edges[0]).toEqual({
+            from: "start",
+            to: "publish",
+          }),
+      },
+    ];
+    for (const c of cases) {
+      writeFileSync(path, c.spec);
+      const before = specText(h);
+      const named = {
+        edits: [c.edit],
+        confirmName: "escalation-fixture",
+        expectedRev: specRev(before),
+      };
+      const { confirmName: _name, ...unnamed } = named;
+      // A maintainer: 403 naming the permission, with or without the typed name.
+      for (const body of [named, unnamed]) {
+        const refused = await call(h, maintainer.headers, "PUT", `/api/h/${h.id}/spec`, body);
+        expect(refused.status).toBe(403);
+        expect([
+          refused.body["code"],
+          refused.body["reason"],
+          refused.body["needs"],
+          refused.body["role"],
+        ]).toEqual(["forbidden", "permission", "h.spec.edit.security", "maintainer"]);
+        expect(refused.body["paths"]).toEqual([c.key]);
+        expect(specText(h)).toBe(before);
+      }
+      // The owner: asked for the typed name, then the write once it matches.
+      const asked = await call(h, h.owner, "PUT", `/api/h/${h.id}/spec`, unnamed);
+      expect(asked.status).toBe(409);
+      expect(asked.body["needs"]).toBe("h.spec.edit.security");
+      expect(asked.body["paths"]).toContain(c.key);
+      expect(asked.body["confirmName"]).toBe("escalation-fixture");
+      expect(specText(h)).toBe(before);
+      const written = await call(h, h.owner, "PUT", `/api/h/${h.id}/spec`, named);
+      expect(written.status).toBe(200);
+      c.written(specText(h));
+    }
+  });
+
+  test("a stricter protected judge gate needs no security permission", async () => {
+    const h = await home();
+    const maintainer = await h.member("maintainer");
+    const path = join(h.dir, "crewhaus.yaml");
+    for (const [stored, edit, written] of [
+      [
+        GATED_WORKFLOW(["threshold: 0.7"]),
+        { path: "steps.1.judge.threshold", value: 0.9 },
+        "threshold: 0.9",
+      ],
+      [
+        GATED_WORKFLOW(["on_fail: continue"]),
+        { path: "steps.1.judge.on_fail", value: "halt" },
+        "on_fail: halt",
+      ],
+    ] as const) {
+      writeFileSync(path, stored);
+      const answer = await call(h, maintainer.headers, "PUT", `/api/h/${h.id}/spec`, {
+        edits: [edit],
+        confirmName: "escalation-fixture",
+        expectedRev: specRev(specText(h)),
+      });
+      expect(answer.status).toBe(200);
+      expect(specText(h)).toContain(written);
+    }
   });
 });
 
@@ -768,6 +928,117 @@ describe("handlers that escalate by what is asked", () => {
     const written = await call(h, h.owner, "POST", route, body);
     expect(written.status).toBe(200);
     expect(readFileSync(gradersPath, "utf8")).toBe(replacement);
+  });
+  test("under weighted, a grader added beside a protected criterion needs the owner", async () => {
+    const h = await home();
+    const maintainer = await h.member("maintainer");
+    const gradersPath = join(h.dir, "eval", "graders.yaml");
+    mkdirSync(dirname(gradersPath), { recursive: true });
+    const storedAs = (combine: string): string =>
+      [
+        `combine: ${combine}`,
+        ...(combine === "weighted" ? ["passing_threshold: 0.5"] : []),
+        "graders:",
+        "  - name: strict",
+        "    type: regex",
+        '    pattern: "^CITED:"',
+        "criteria:",
+        "  - id: citations",
+        "    protected: true",
+        "    measured_by: [strict]",
+        "",
+      ].join("\n");
+    const withAlways = (text: string): string =>
+      text.replace(
+        "graders:\n",
+        "graders:\n  - name: always\n    type: regex\n    pattern: ''\n    weight: 100\n",
+      );
+    const route = `/api/h/${h.id}/builders/graders`;
+    const rev = async (): Promise<string> =>
+      String((await call(h, h.owner, "GET", route)).body["hash"]);
+
+    const stored = storedAs("weighted");
+    const posted = withAlways(stored);
+    expect(posted).not.toBe(stored);
+    writeFileSync(gradersPath, stored);
+    // A maintainer: 403 naming the permission, with or without the typed name.
+    for (const extra of [{ confirmName: "escalation-fixture" }, {}]) {
+      const refused = await call(h, maintainer.headers, "POST", route, {
+        yaml: posted,
+        expectedRev: await rev(),
+        ...extra,
+      });
+      expect(refused.status).toBe(403);
+      expect([
+        refused.body["code"],
+        refused.body["reason"],
+        refused.body["needs"],
+        refused.body["role"],
+      ]).toEqual(["forbidden", "permission", "h.spec.edit.security", "maintainer"]);
+      expect(refused.body["paths"]).toEqual(["criteria.citations"]);
+      expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+    }
+    // The owner: asked for the typed name, then the write once it matches.
+    const asked = await call(h, h.owner, "POST", route, { yaml: posted, expectedRev: await rev() });
+    expect(asked.status).toBe(409);
+    expect(asked.body["needs"]).toBe("h.spec.edit.security");
+    expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+    const written = await call(h, h.owner, "POST", route, {
+      yaml: posted,
+      expectedRev: await rev(),
+      confirmName: "escalation-fixture",
+    });
+    expect(written.status).toBe(200);
+    expect(readFileSync(gradersPath, "utf8")).toBe(posted);
+
+    // Under all, a grader no criterion binds can only fail a case: a maintainer adds it.
+    const all = storedAs("all");
+    writeFileSync(gradersPath, all);
+    const added = await call(h, maintainer.headers, "POST", route, {
+      yaml: withAlways(all),
+      expectedRev: await rev(),
+      confirmName: "escalation-fixture",
+    });
+    expect(added.status).toBe(200);
+    expect(readFileSync(gradersPath, "utf8")).toBe(withAlways(all));
+
+    // Under weighted, a second grader under a bound grader's name is refused.
+    writeFileSync(gradersPath, stored);
+    const twice = posted.replace("name: always", "name: strict");
+    for (const who of [maintainer.headers, h.owner]) {
+      const refused = await call(h, who, "POST", route, {
+        yaml: twice,
+        expectedRev: await rev(),
+        confirmName: "escalation-fixture",
+      });
+      expect(refused.status).toBe(400);
+      expect(String(refused.body["error"])).toContain('grader "strict" is declared twice');
+      expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+    }
+
+    // Under weighted, the mode an unprotected criterion gives its grader is the owner's.
+    const observed = posted.concat(
+      "  - id: experiment\n    mode: observe\n    measured_by: [always]\n",
+    );
+    writeFileSync(gradersPath, observed);
+    const enforce = { edits: [{ op: "setMode", id: "experiment", value: "enforce" }] };
+    const forbidden = await call(h, maintainer.headers, "POST", route, {
+      ...enforce,
+      expectedRev: await rev(),
+    });
+    expect([forbidden.status, forbidden.body["needs"], forbidden.body["paths"]]).toEqual([
+      403,
+      "h.spec.edit.security",
+      ["criteria.citations"],
+    ]);
+    expect(readFileSync(gradersPath, "utf8")).toBe(observed);
+    const confirmed = await call(h, h.owner, "POST", route, {
+      ...enforce,
+      expectedRev: await rev(),
+      confirmName: "escalation-fixture",
+    });
+    expect(confirmed.status).toBe(200);
+    expect(readFileSync(gradersPath, "utf8")).not.toContain("mode: observe");
   });
 });
 
