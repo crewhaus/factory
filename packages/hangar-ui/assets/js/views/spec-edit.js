@@ -483,6 +483,11 @@ function renderValue(value) {
  */
 const unsaved = new Map();
 const unsavedKey = (ctx, node) => `${ctx.id}\u0000${node.key}`;
+
+/** The ids of the typed values kept now, a copy: a test seam, never a value. */
+export function unsavedEntryIds() {
+  return [...unsaved.keys()];
+}
 const seedMark = (node) => {
   try {
     return JSON.stringify(node.seed) ?? "";
@@ -611,7 +616,7 @@ export function settingsState(body, groupCount, held) {
  * write saves directly, any other is reviewed first (the server's preview says
  * what it needs), and an issue the schema finds is placed beside its field.
  */
-function settingsCard(ctx, body, trust, live, reload) {
+export function settingsCard(ctx, body, trust, live, reload) {
   // No spec in this harness: nothing to edit, so say why and name the command that makes one.
   const absent = settingsState(body, 0, false);
   if (absent.absent) {
@@ -622,7 +627,9 @@ function settingsCard(ctx, body, trust, live, reload) {
     return empty;
   }
   const trustRows = Array.isArray(trust?.paths) ? trust.paths : [];
-  const model = formModel(body.schema, body.effective, trustRows);
+  const model = formModel(body.schema, body.effective, trustRows, {
+    truncated: body.effectiveTruncated === true,
+  });
   const prefix = `sf${++formSeq}`;
   const fields = new Map();
   let seq = 0;
@@ -808,7 +815,11 @@ function settingsCard(ctx, body, trust, live, reload) {
     const helpId = node.help !== null || node.writeOnly ? `${id}-help` : "";
     const slot = el("p", { class: "field-issue", id: `${id}-issue`, hidden: true });
     const draftAt = unsavedKey(ctx, node);
-    const kept = keptValue(ctx, node);
+    // A typed replacement for a hidden value lives only in its control: it is never kept.
+    const secretText =
+      node.writeOnly === true && !["boolean", "select", "list"].includes(node.kind);
+    if (secretText) unsaved.delete(draftAt);
+    const kept = secretText ? undefined : keptValue(ctx, node);
     const current = kept !== undefined ? kept : node.writeOnly ? undefined : node.seed;
     const unsavedNote = el("p", {
       class: "muted field-unsaved",
@@ -846,20 +857,21 @@ function settingsCard(ctx, body, trust, live, reload) {
       control = list.node;
       input = list.first;
     } else {
-      const multiline = typeof current === "string" && current.includes("\n");
+      const multiline = !secretText && typeof current === "string" && current.includes("\n");
       input = multiline
         ? el("textarea", { class: "input notes", id, rows: 4, spellcheck: "false" })
         : el("input", {
             class: "input",
             id,
-            type: "text",
-            autocomplete: "off",
+            type: secretText ? "password" : "text",
+            autocomplete: secretText ? "new-password" : "off",
+            ...(secretText ? { spellcheck: "false" } : {}),
             ...(node.kind === "integer" ? { inputmode: "numeric" } : {}),
             ...(node.kind === "number" ? { inputmode: "decimal" } : {}),
           });
       input.value = current === undefined || current === null ? "" : String(current);
       read = () => input.value;
-      input.addEventListener("input", () => remember(input.value));
+      if (!secretText) input.addEventListener("input", () => remember(input.value));
       control = input;
     }
     if (input !== null && node.kind !== "list") {
@@ -921,6 +933,42 @@ function settingsCard(ctx, body, trust, live, reload) {
       help,
       el("div", { class: "row-editor" }, [control, save, clearBtn]),
       unsavedNote,
+      slot,
+      el("p", { class: "muted field-path" }, [
+        el("span", { text: "Setting " }),
+        el("code", { text: node.segments.join(".") }),
+      ]),
+    ]);
+  };
+
+  /**
+   * A setting the capped read gave no value for: the file may hold one the form
+   * never saw, so it offers no control, no Save and no Clear, and names the file.
+   */
+  const cappedLeaf = (node) => {
+    const id = nextId("capped");
+    const slot = el("p", { class: "field-issue", id: `${id}-issue`, hidden: true });
+    const whyId = `${id}-why`;
+    const why = el("p", {
+      class: "muted",
+      id: whyId,
+      text: "Not shown in this form. Edit it in crewhaus.yaml.",
+    });
+    fields.set(node.key, {
+      node,
+      slot,
+      input: null,
+      focusTarget: why,
+      described: [why],
+      baseIds: () => [],
+    });
+    return el("div", { class: "form-field", dataset: { fieldKey: node.key } }, [
+      el("div", { class: "form-field-head" }, [
+        el("span", { class: "form-label", text: node.label }),
+        fieldBadge(node),
+      ]),
+      node.help === null ? null : el("p", { class: "muted field-help", text: node.help }),
+      why,
       slot,
       el("p", { class: "muted field-path" }, [
         el("span", { text: "Setting " }),
@@ -1002,7 +1050,13 @@ function settingsCard(ctx, body, trust, live, reload) {
   };
 
   const render = (node) =>
-    node.kind === "group" ? group(node, false) : node.kind === "json" ? jsonLeaf(node) : leaf(node);
+    node.kind === "group"
+      ? group(node, false)
+      : node.kind === "json"
+        ? jsonLeaf(node)
+        : node.capped === true
+          ? cappedLeaf(node)
+          : leaf(node);
 
   const declared = (node) => node.source === "declared";
   const topLeaves = model.groups.filter((n) => n.kind !== "group");
@@ -1061,7 +1115,7 @@ function settingsCard(ctx, body, trust, live, reload) {
     body.effectiveTruncated === true
       ? el("p", {
           class: "reason",
-          text: "Showing the first 600 settings. Edit the rest in the JSON pane or in crewhaus.yaml.",
+          text: "This form shows only some of this spec's settings, so block editors start empty and a setting it does not show cannot be saved here. Edit the rest in crewhaus.yaml.",
         })
       : null,
     typeof body.effectiveNote === "string" && body.effectiveNote !== ""

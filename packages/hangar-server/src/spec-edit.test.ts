@@ -33,6 +33,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gradersConfigHash, parseGradersConfig } from "@crewhaus/eval-grader";
+import { parseSpec } from "@crewhaus/spec";
 import { DELTA_090_KEYS } from "@crewhaus/spec-patch";
 import { specRev } from "@crewhaus/spec-patch/commit";
 import {
@@ -51,6 +52,7 @@ import {
   effectiveConfig,
   effectiveConfigOf,
   isAutoTunable,
+  maskedPlaceholderPaths,
   provenanceOf,
   registryDirName,
   renderDiff,
@@ -2216,5 +2218,259 @@ describe("the settings form never writes back a value Home served masked", () =>
     } finally {
       await t.stop();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// a hidden value's placeholder is never written
+// ---------------------------------------------------------------------------
+
+describe("maskedPlaceholderPaths", () => {
+  const names = new Set(["HELPER_TOKEN"]);
+  const R = "[redacted]";
+
+  test("finds a placeholder in a key and in a string, at depth and in a sequence", () => {
+    const after = [
+      "a:",
+      "  b:",
+      `    c: "x ${R} y"`,
+      `  "${R}":`,
+      "    d: 1",
+      "list:",
+      "  - plain",
+      "  - see «HELPER_TOKEN» here",
+      "",
+    ].join("\n");
+    const found = maskedPlaceholderPaths("a: {}\n", after, names).map((p: string[]) => p.join("."));
+    expect(found.sort()).toEqual(["a.[redacted]", "a.b.c", "list.1"]);
+  });
+
+  test("text the file holds at the same path is kept; the same text elsewhere is not", () => {
+    const before = `a:\n  b: "${R}"\nlist:\n  - "${R}"\n  - z\n`;
+    expect(maskedPlaceholderPaths(before, before, names)).toEqual([]);
+    expect(maskedPlaceholderPaths(before, `a:\n  b: "${R}"\n  c: "${R}"\n`, names)).toEqual([
+      ["a", "c"],
+    ]);
+    // An index is a path: the item moved, so it is refused at its new place.
+    expect(maskedPlaceholderPaths(before, `list:\n  - z\n  - "${R}"\n`, names)).toEqual([
+      ["list", "1"],
+    ]);
+    // A key the file already holds is kept.
+    const keyed = `tool_config:\n  "${R}":\n    on: true\n`;
+    expect(maskedPlaceholderPaths(keyed, keyed, names)).toEqual([]);
+  });
+
+  test("with no file yet, any placeholder is refused", () => {
+    expect(maskedPlaceholderPaths(undefined, `a: "${R}"\n`, names)).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: [unclosed\n", `a: "${R}"\n`, names)).toEqual([["a"]]);
+  });
+
+  test("*** is never a placeholder, and text that is not YAML answers nothing", () => {
+    expect(maskedPlaceholderPaths("a: x\n", 'a: "***bold*** and ***"\n', names)).toEqual([]);
+    expect(maskedPlaceholderPaths("a: x\n", `a: [unclosed ${R}\n`, names)).toEqual([]);
+  });
+
+  test("a «NAME» counts only when it names one of the given names", () => {
+    expect(maskedPlaceholderPaths("a: x\n", "a: use «HELPER_TOKEN»\n", names)).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: x\n", "a: use «NOT_SET_ANYWHERE»\n", names)).toEqual([]);
+    expect(maskedPlaceholderPaths("a: x\n", "a: use «HELPER_TOKEN»\n", new Set())).toEqual([]);
+  });
+
+  test("the current file is read through its own properties only", () => {
+    const proto = Object.prototype as Record<string, unknown>;
+    try {
+      proto["k"] = R;
+      expect(maskedPlaceholderPaths("a: {}\n", `a:\n  k: "${R}"\n`, names)).toEqual([["a", "k"]]);
+    } finally {
+      Reflect.deleteProperty(Object.prototype, "k");
+    }
+  });
+
+  test("deep nesting and shared subtrees never throw", () => {
+    const deep = `${"[".repeat(2000)}"${R}"${"]".repeat(2000)}\n`;
+    expect(() => maskedPlaceholderPaths(undefined, deep, names)).not.toThrow();
+    const shared = ["base: &b", `  v: "${R}"`, "x: *b", "y: *b", ""].join("\n");
+    expect(maskedPlaceholderPaths(undefined, shared, names)).toEqual([
+      ["base", "v"],
+      ["x", "v"],
+      ["y", "v"],
+    ]);
+  });
+});
+
+describe("a spec edit holding a hidden value's placeholder", () => {
+  // A literal, never a real credential: built from parts.
+  const planted = ["fixture", "thredz", "value", "0123456789"].join("-");
+  const thredzSpec = `${VALID_SPEC}thredz:\n  api_key: ${planted}\n`;
+
+  test("the [redacted] a schema read shows is refused when sent back through PUT /spec", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "masked-put", thredzSpec);
+      const specPath = join(dir, "crewhaus.yaml");
+      const id = await register(t, dir);
+      const schema = await t.api(`/api/h/${id}/spec/schema`);
+      const row = (schema.body["effective"] as Array<{ path: string; value: unknown }>).find(
+        (r) => r.path === "thredz.api_key",
+      );
+      expect(row?.value).toBe("[redacted]");
+      const before = readFileSync(specPath);
+      const leaf = { path: ["thredz", "api_key"], value: row?.value };
+      const block = { path: ["thredz"], value: { api_key: row?.value } };
+      const sends = [
+        { edits: [leaf], expectedRev: revOf(dir), confirmName: "spec-edit-fixture" },
+        { edits: [block], expectedRev: revOf(dir), confirmName: "spec-edit-fixture" },
+        { edits: [leaf], expectedRev: revOf(dir) },
+      ];
+      for (const send of sends) {
+        const { body } = await t.api(`/api/h/${id}/spec`, put(send));
+        expect(body["code"]).toBe("edit_rejected");
+        const issues = body["issues"] as Array<{ path: string[]; code: string; message: string }>;
+        expect(issues.map((i) => [i.path.join("."), i.code])).toEqual([
+          ["thredz.api_key", "masked_placeholder"],
+        ]);
+        expect(issues[0]?.message).toContain("thredz.api_key");
+        expect(issues[0]?.message.includes("[redacted]")).toBe(false);
+        expect(readFileSync(specPath).equals(before)).toBe(true);
+      }
+      expect(existsSync(join(dir, ".crewhaus", "specs"))).toBe(false);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a «NAME» for one of the harness's .env values is refused through POST /spec/patch", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "masked-patch");
+      const specPath = join(dir, "crewhaus.yaml");
+      writeFileSync(
+        join(dir, ".env"),
+        `HELPER_TOKEN=${["helper", "fixture", "9f8e7d6c5b"].join("-")}\n`,
+      );
+      const id = await register(t, dir);
+      const before = readFileSync(specPath);
+      const refused = await t.api(
+        `/api/h/${id}/spec/patch`,
+        post({
+          edit: { path: "agent.instructions", value: "Call it with «HELPER_TOKEN»." },
+          expectedRev: revOf(dir),
+        }),
+      );
+      expect(refused.body["code"]).toBe("edit_rejected");
+      const issues = refused.body["issues"] as Array<{ path: string[]; code: string }>;
+      expect(issues.map((i) => [i.path.join("."), i.code])).toEqual([
+        ["agent.instructions", "masked_placeholder"],
+      ]);
+      expect(readFileSync(specPath).equals(before)).toBe(true);
+      // A «word» that names nothing this harness holds is ordinary text.
+      const written = await t.api(
+        `/api/h/${id}/spec/patch`,
+        post({
+          edit: { path: "agent.instructions", value: "Call it with «NOT_SET_ANYWHERE»." },
+          expectedRev: revOf(dir),
+        }),
+      );
+      expect(written.body["ok"]).toBe(true);
+      expect(readFileSync(specPath, "utf8")).toContain("«NOT_SET_ANYWHERE»");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("placeholder text the file already holds at that place is kept", async () => {
+    const t = boot();
+    try {
+      const yaml = VALID_SPEC.replace(
+        "  instructions: |\n    You are a fixture. Answer briefly.\n    Note: this line is prose, not a key.\n",
+        '  instructions: "[redacted]"\n',
+      );
+      expect(yaml).toContain('instructions: "[redacted]"');
+      const dir = specHarness(t, "masked-kept", yaml);
+      const specPath = join(dir, "crewhaus.yaml");
+      const id = await register(t, dir);
+      const patched = await t.api(
+        `/api/h/${id}/spec/patch`,
+        post({ edit: { path: "agent.max_tokens", value: 2000 }, expectedRev: revOf(dir) }),
+      );
+      expect(patched.body["ok"]).toBe(true);
+      const whole = await t.api(
+        `/api/h/${id}/spec`,
+        put({
+          edits: [
+            {
+              path: ["agent"],
+              value: {
+                model: "anthropic/claude-sonnet-4",
+                instructions: "[redacted]",
+                max_tokens: 3000,
+              },
+            },
+          ],
+          expectedRev: revOf(dir),
+          confirmName: "spec-edit-fixture",
+        }),
+      );
+      expect(whole.body["ok"]).toBe(true);
+      expect(readFileSync(specPath, "utf8")).toContain("max_tokens: 3000");
+      // A key holding the placeholder that the file does not hold is refused.
+      const before = readFileSync(specPath);
+      const keyed = await t.api(
+        `/api/h/${id}/spec`,
+        put({
+          edits: [{ path: ["tool_config"], value: { "[redacted]": {} } }],
+          expectedRev: revOf(dir),
+          confirmName: "spec-edit-fixture",
+        }),
+      );
+      expect(keyed.body["code"]).toBe("edit_rejected");
+      const issues = keyed.body["issues"] as Array<{ path: string[]; code: string }>;
+      expect(issues.map((i) => [i.path, i.code])).toEqual([
+        [["tool_config", "[redacted]"], "masked_placeholder"],
+      ]);
+      expect(readFileSync(specPath).equals(before)).toBe(true);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a preview and a proposal are refused the same way, and nothing is staged", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "masked-preview", thredzSpec);
+      const specPath = join(dir, "crewhaus.yaml");
+      const id = await register(t, dir);
+      const before = readFileSync(specPath);
+      const edits = [{ path: ["thredz", "api_key"], value: "[redacted]" }];
+      const diff = await t.api(`/api/h/${id}/spec/diff`, post({ edits }));
+      expect(diff.body["ok"]).toBe(false);
+      expect(diff.body["code"]).toBe("edit_rejected");
+      const rows = diff.body["issues"] as Array<{ path: string[]; code: string }>;
+      expect(rows.map((i) => [i.path.join("."), i.code])).toEqual([
+        ["thredz.api_key", "masked_placeholder"],
+      ]);
+      const proposed = await t.api(`/api/h/${id}/spec/propose`, post({ edits }));
+      expect(proposed.body["code"]).toBe("edit_rejected");
+      const named = proposed.body["issues"] as Array<{ path: string[]; code: string }>;
+      expect(named.map((i) => i.code)).toEqual(["masked_placeholder"]);
+      expect(existsSync(join(dir, ".crewhaus", "proposals"))).toBe(false);
+      expect(readFileSync(specPath).equals(before)).toBe(true);
+    } finally {
+      await t.stop();
+    }
+  });
+});
+
+describe("the effective rows of a parsed spec", () => {
+  test("a reserved name never becomes a row", () => {
+    const yaml = `${VALID_SPEC}tool_config:\n  mytool:\n    __proto__:\n      polluted: x\n    kept: y\n`;
+    const parsed = parseSpec(yaml) as unknown as {
+      tool_config: { mytool: Record<string, unknown> };
+    };
+    expect(Object.hasOwn(parsed.tool_config.mytool, "__proto__")).toBe(true);
+    const { rows } = effectiveConfigOf(parsed, yaml);
+    expect(rows.some((r) => r.path === "tool_config.mytool.kept")).toBe(true);
+    expect(rows.some((r) => r.segments.includes("__proto__"))).toBe(false);
+    expect(rows.some((r) => r.path.includes("polluted"))).toBe(false);
   });
 });

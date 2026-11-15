@@ -137,6 +137,7 @@ import {
   homeCrewhausArgv,
   jobCrewhausBin,
 } from "../packages/hangar-server/src/process";
+import { maskedPlaceholderPaths } from "../packages/hangar-server/src/spec-edit";
 import { createTestProcessOps } from "../packages/hangar-server/src/testkit";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import {
@@ -5582,6 +5583,39 @@ describe("the release notes name what a channel daemon does with clicks and mess
         b.includes("runtime-state floor also covers"),
       ),
     ).toHaveLength(1);
+  });
+});
+
+describe("the release notes name the spec edits Home refuses for a hidden value's placeholder", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("a placeholder is refused at the commit and at the preview, and the bullet says so", () => {
+    const names = new Set(["HELPER_TOKEN"]);
+    expect(maskedPlaceholderPaths("a: real\n", 'a: "[redacted]"\n', names)).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: real\n", "a: use «HELPER_TOKEN»\n", names)).toEqual([["a"]]);
+    // Text the file already holds at that path is kept, and `***` is ordinary text.
+    expect(maskedPlaceholderPaths('a: "[redacted]"\n', 'a: "[redacted]"\n', names)).toEqual([]);
+    expect(maskedPlaceholderPaths("a: real\n", 'a: "***"\n', names)).toEqual([]);
+    // Both doors every spec write and every preview pass through run the check.
+    const source = readFileSync(join(ROOT, "packages/hangar-server/src/spec-edit.ts"), "utf8");
+    const bodyOf = (signature: string, end: string): string => {
+      const at = source.indexOf(signature);
+      expect(at).toBeGreaterThan(-1);
+      const stop = source.indexOf(end, at);
+      expect(stop).toBeGreaterThan(at);
+      return source.slice(at, stop);
+    };
+    const commit = bodyOf("export async function commitHomeEdits(", "\n}\n");
+    const preview = bodyOf("export async function previewHomeEdits(", "\n}\n");
+    expect(commit).toContain("placeholderRefusal(ctx, before, yamlText)");
+    expect(preview.split("placeholderPreview(ctx, before, edits, preview)")).toHaveLength(3);
+    const bullet = bulletFor(
+      "Home refuses a spec edit that would write a hidden value's placeholder.",
+    );
+    expect(bullet).toContain("`[redacted]`");
+    expect(bullet).toContain("`«NAME»`");
+    expect(bullet).toContain("`edit_rejected`");
   });
 });
 

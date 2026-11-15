@@ -676,6 +676,15 @@ these on: they reach every harness that uses what each one names.
   anchor: presented as written by an earlier step, with no more authority than
   that source. The run's own input, carried in that state, is labelled with it.
 
+- **Home refuses a spec edit that would write a hidden value's placeholder.** A
+  change to `crewhaus.yaml` through Home or its API is refused, and writes or
+  stages nothing, when its new value or key holds `[redacted]` or a `«NAME»`
+  placeholder for one of the harness's secrets. The spec editor answers
+  `edit_rejected` naming the setting. This holds for the settings form, a
+  patch, a preview, a proposal, an advice apply, watch-me and the connector
+  builders. Text the file already holds at that place is kept as it is. Type
+  the real value, or edit `crewhaus.yaml`.
+
 - **A schedule's time zone and cron are checked when the spec compiles.** On
   channel, managed and batch, a `schedule:` (the single object and every named
   lane) is refused when its `timezone` is not one the runtime knows, or when
