@@ -21,11 +21,15 @@
  * the cache-marked prefix, so a hook can steer a call without a guide
  * model). Other events log `mutate` but do not apply it.
  *
- * Loading layer order: user hooks first, project hooks last. Project hooks
- * therefore evaluate "later" — but since aggregation short-circuits on the
- * first deny, in practice each hook runs in `Promise.all` and the first
- * deny in the array wins. Order is mostly for stability of `HookResult[]`
- * output across runs.
+ * Loading layer order: user hooks first, project hooks last. Every matching
+ * hook runs in parallel and settles on its own: one hook that fails never
+ * takes another hook's decision with it, and a hook that cannot be started
+ * counts as a deny (`hook could not run`). The first deny in the array wins,
+ * so order is mostly for stability of `HookResult[]` output across runs.
+ *
+ * Gating events (`pre-tool`, `pre-model`, `pre-slash`, and any event not
+ * listed in {@link OBSERVATIONAL_HOOK_EVENTS}) gate a call: see
+ * {@link isGatingHookEvent}.
  *
  * Lifecycle events fired by `runtime-core`:
  *   session-start | stop | pre-tool | post-tool | pre-model | post-model
@@ -69,6 +73,34 @@ export const HOOK_EVENTS = [
 export type HookEvent = (typeof HOOK_EVENTS)[number];
 
 const HOOK_EVENT_SET: ReadonlySet<string> = new Set(HOOK_EVENTS);
+
+/**
+ * The events whose hooks only observe: the runtime does not wait on their
+ * decision to make a call, so a hook for one of them that cannot run is logged
+ * and the run goes on. Every other event is gating.
+ */
+export const OBSERVATIONAL_HOOK_EVENTS: ReadonlySet<HookEvent> = new Set<HookEvent>([
+  "session-start",
+  "stop",
+  "post-tool",
+  "post-model",
+  "pre-compact",
+  "post-compact",
+  "alert",
+]);
+
+/**
+ * Whether `event` gates a call: a hook that cannot run, or a firing that fails,
+ * denies the call it guards. True for every event not listed in
+ * {@link OBSERVATIONAL_HOOK_EVENTS}, so an event added later gates its call until
+ * it is listed there.
+ */
+export function isGatingHookEvent(event: HookEvent): boolean {
+  return !OBSERVATIONAL_HOOK_EVENTS.has(event);
+}
+
+/** The reason a hook that cannot be started denies with. */
+const HOOK_COULD_NOT_RUN = "hook could not run";
 
 export type HookDef = {
   readonly event: HookEvent;
@@ -220,8 +252,12 @@ function validateHookEntry(value: unknown, path: string, index: number): HookDef
  * Run every hook matching `event` (and `payload[matcherKey]` against the
  * hook's matcher) in parallel. Each spawn gets a JSON-stringified payload
  * on stdin; the parsed JSON on stdout becomes the `HookDecision`. Malformed
- * output, non-zero exit, or timeout collapses into a synthetic
- * `decision: "deny"` so a misbehaving hook cannot silently pass.
+ * output, non-zero exit, timeout, or a hook that cannot be started collapses
+ * into a synthetic `decision: "deny"` so a misbehaving hook cannot silently
+ * pass. Each hook settles on its own and keeps its slot in the result, so a
+ * hook that cannot run leaves every other hook's decision in place. A hook's
+ * verdict is read from everything it wrote before it exited, even while a
+ * process it started keeps its output open.
  */
 export async function runHooks(
   event: HookEvent,
@@ -249,9 +285,24 @@ export async function runHooks(
   const logger = opts.logger;
   const bus = opts.eventBus;
   const env = buildHookEnv(opts.parentEnv ?? process.env);
-  const results = await Promise.all(
+  const start = Date.now();
+  const settled = await Promise.allSettled(
     filtered.map((hook) => runOne(hook, payload, env, logger, opts.signal)),
   );
+  const results: HookResult[] = settled.map((s, i) => {
+    if (s.status === "fulfilled") return s.value;
+    const hook = filtered[i] as HookDef;
+    const cause: unknown = s.reason;
+    logger?.warn(HOOK_COULD_NOT_RUN, {
+      command: hook.command,
+      error: cause instanceof Error ? cause.message : String(cause),
+    });
+    return {
+      hook,
+      decision: { decision: "deny", reason: HOOK_COULD_NOT_RUN },
+      durationMs: Date.now() - start,
+    };
+  });
   if (bus) {
     for (const r of results) {
       const allowed = r.decision.decision === "allow";
@@ -310,19 +361,25 @@ async function runOne(
     if (typeof stdin.end === "function") {
       stdin.end();
     }
-    // Start the reads but do not await them yet — if the hook's command
-    // forks a long-running grandchild (e.g. `sleep 30`), SIGKILL on `sh`
-    // leaves the orphan holding the pipe write-end open and `text()` never
-    // EOFs. Race against `proc.exited` and a small drain grace window.
-    const stdoutPromise = new Response(proc.stdout).text();
-    const stderrPromise = new Response(proc.stderr).text();
+    // A hook's verdict is read from everything it wrote before it exited.
+    // Both streams are collected chunk by chunk from the start. A command
+    // that forks a long-running grandchild (`notify &`, `sleep 30`) can keep
+    // a pipe's write end open past the hook's exit, so after the exit each
+    // stream gets a small drain grace window to reach EOF; whatever arrived
+    // by then is the hook's output, and the readers are released.
+    const stdoutStream = collectStream(proc.stdout);
+    const stderrStream = collectStream(proc.stderr);
     const exitCode = await proc.exited;
-    const drainFallback = (): Promise<string> =>
-      new Promise((resolve) => setTimeout(() => resolve(""), DRAIN_GRACE_MS));
-    const [stdoutText, stderrText] = await Promise.all([
-      Promise.race([stdoutPromise, drainFallback()]),
-      Promise.race([stderrPromise, drainFallback()]),
+    const drainGrace = (): Promise<void> =>
+      new Promise((resolve) => setTimeout(resolve, DRAIN_GRACE_MS));
+    await Promise.all([
+      Promise.race([stdoutStream.done, drainGrace()]),
+      Promise.race([stderrStream.done, drainGrace()]),
     ]);
+    const stdoutText = stdoutStream.text();
+    const stderrText = stderrStream.text();
+    stdoutStream.release();
+    stderrStream.release();
     const durationMs = Date.now() - start;
     if (timedOut) {
       logger?.warn("hook timeout", { command: hook.command, timeoutMs });
@@ -362,9 +419,61 @@ async function runOne(
       };
     }
     return { hook, decision, durationMs, stderr: stderrText };
+  } catch (err) {
+    // A hook that fails after it was started leaves no child behind.
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // Already exited.
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Read a hook's output stream chunk by chunk. `done` settles at EOF (or on a
+ * read error); `text()` decodes every chunk received so far, so output written
+ * before the hook exited is kept even while the pipe stays open; `release()`
+ * cancels the read so a lingering writer never holds the hook open.
+ */
+function collectStream(stream: unknown): {
+  readonly done: Promise<void>;
+  text(): string;
+  release(): void;
+} {
+  const chunks: Uint8Array[] = [];
+  const readable = stream as ReadableStream<Uint8Array> | undefined;
+  if (readable === undefined || readable === null || typeof readable.getReader !== "function") {
+    return { done: Promise.resolve(), text: () => "", release: () => {} };
+  }
+  const reader = readable.getReader();
+  const done = (async (): Promise<void> => {
+    try {
+      for (;;) {
+        const { done: eof, value } = await reader.read();
+        if (eof) return;
+        if (value !== undefined) chunks.push(value);
+      }
+    } catch {
+      // A read error or a cancel ends the stream; the chunks so far stand.
+    }
+  })();
+  return {
+    done,
+    text: () => {
+      const decoder = new TextDecoder();
+      let out = "";
+      for (const chunk of chunks) out += decoder.decode(chunk, { stream: true });
+      return out + decoder.decode();
+    },
+    release: () => {
+      reader.cancel().catch(() => {
+        // Already closed.
+      });
+    },
+  };
 }
 
 function parseDecision(stdout: string, hook: HookDef): HookDecision | null {

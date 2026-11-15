@@ -12,6 +12,12 @@
  * network/audit I/O happens at import time. `crewhaus run` wires the real
  * `openAuditLog`, `loadHooks`+`runHooks`, and `globalThis.fetch`.
  */
+import {
+  type HookDef,
+  type RunHooksOptions,
+  defaultLogger,
+  runHooks,
+} from "@crewhaus/hooks-engine";
 import type { AlertBreachPayload, AlertSink } from "@crewhaus/runtime-core";
 
 /** Minimal audit seam — structurally satisfied by `@crewhaus/audit-log`. */
@@ -28,6 +34,22 @@ export type AlertHookRunner = (
   payload: unknown,
   matcherKey: string,
 ) => Promise<void>;
+
+/**
+ * The settings.json `alert` hook runner `crewhaus run` wires into both the alert
+ * sink and the SLO sink's `alert` rung. Every hook runs with a logger, so an
+ * alert hook that cannot be started, exits non-zero or times out is logged
+ * (`hook could not run`, `hook nonzero exit`, `hook timeout`, with its
+ * command), and the delivery goes on to the next channel.
+ */
+export function settingsAlertHookRunner(
+  hooks: ReadonlyArray<HookDef>,
+  logger: NonNullable<RunHooksOptions["logger"]> = defaultLogger(),
+): AlertHookRunner {
+  return async (event, payload, matcherKey): Promise<void> => {
+    await runHooks(event, payload, hooks, { matcherKey, logger });
+  };
+}
 
 export type BuildAlertSinkOptions = {
   /** Durable audit log (undefined ⇒ no audit channel). */
