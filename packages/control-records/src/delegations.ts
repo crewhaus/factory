@@ -33,6 +33,7 @@ import {
   isStoredActor,
   parseActor,
 } from "@crewhaus/control-contract";
+import type { SafeFsFailure } from "@crewhaus/tool-safety/fs";
 import { type CachedReader, cachedPerPath } from "./fail-closed";
 import { type AppendAnswer, type LedgerRecord, foldStates, withLedgerLock } from "./ledger";
 import { type Ledger, controlPaths, harnessLedger } from "./paths";
@@ -341,6 +342,52 @@ export async function appendDelegationLog(
   );
 }
 
+/** What {@link withDelegationLog} hands its body: the log whole, and an append that holds the lock. */
+export type DelegationLogSection = {
+  /** Every application line, oldest first, read under the lock; a landed append joins it. */
+  readonly lines: readonly DelegationLogLine[];
+  /**
+   * Append one line inside the section, checked against the closed key set as
+   * {@link appendDelegationLog} checks it (a line outside it throws `TypeError` and writes
+   * nothing).
+   */
+  readonly append: (line: DelegationLogLine) => AppendAnswer;
+};
+
+/**
+ * Run `fn` holding the application log's lock, over the log read whole under that lock,
+ * so a check of the log and the line it writes are one step: no other writer's line lands
+ * between them. Answers what `fn` answers, or the lock's `SafeFsFailure`.
+ *
+ * The lock is the root's one control lock, which the decisions and the rules share, and it
+ * is not re-entrant: inside `fn` nothing may take it again. No `casAppend` or
+ * `casAppendLocked` on another ledger, no {@link appendDelegationLog}, nothing that opens or
+ * supersedes a decision: write through `append` only. Lock-free reads of the root's own
+ * records are fine inside `fn` (their writers take this same lock, so a read here is
+ * ordered with them); a host call or any other slow read is not.
+ *
+ * First consumer: control-service's delegated executor, which claims a rule's use here.
+ */
+export async function withDelegationLog<T>(
+  root: string,
+  fn: (section: DelegationLogSection) => Promise<T> | T,
+  scope: DelegationScopeChoice = "harness",
+): Promise<T | SafeFsFailure> {
+  return withLedgerLock(delegationLogLedger(root, scope), (lockedAppend) => {
+    const read = readDelegationLog(root, { scope });
+    const lines: DelegationLogLine[] = read.state === "present" ? [...read.lines] : [];
+    const append = (line: DelegationLogLine): AppendAnswer => {
+      if (delegationLogLineOf(line as unknown as Record<string, unknown>) === undefined) {
+        throw new TypeError("control-records: an application line outside its closed key set");
+      }
+      const answer = lockedAppend(line as unknown as LedgerRecord);
+      if (answer.ok) lines.push(line);
+      return answer;
+    };
+    return fn({ lines, append });
+  });
+}
+
 export type DelegationLogRead =
   | { readonly state: "absent" }
   | {
@@ -409,4 +456,54 @@ export function ruleUses(lines: readonly DelegationLogLine[], rule: string): num
   let uses = 0;
   for (const line of lines) if (line.event === "acted" && line.rule === rule) uses += 1;
   return uses;
+}
+
+/** The lines that close a claim: the action ran, or it was refused. */
+const CLOSES_CLAIM: ReadonlySet<string> = new Set(["acted", "refused"]);
+
+/** A claim no line has settled: where its `decided` line is, and the command that wrote it. */
+export type OpenClaim = { readonly at: number; readonly cmd: string | undefined };
+
+/**
+ * The claims still in flight, by decision. A decision's last `decided` line is open
+ * until an `acted` or `refused` line after it settles it, and only a line its own
+ * command wrote (the same `cmd`) settles it: a line any other writer logs for that
+ * decision leaves the claim counted. Pure.
+ *
+ * First consumers: {@link claimedLog}, and the delegated executor, which acts on no
+ * decision that already holds an open claim.
+ */
+export function openClaims(lines: readonly DelegationLogLine[]): Map<string, OpenClaim> {
+  const open = new Map<string, OpenClaim>();
+  lines.forEach((line, at) => {
+    if (line.decision === undefined) return;
+    if (line.event === "decided") {
+      open.set(line.decision, { at, cmd: line.cmd });
+      return;
+    }
+    if (!CLOSES_CLAIM.has(line.event)) return;
+    const claim = open.get(line.decision);
+    if (claim !== undefined && claim.cmd === line.cmd) open.delete(line.decision);
+  });
+  return open;
+}
+
+/**
+ * The application log as a use cap and a one-at-a-time condition read it: every claimed
+ * use counts. A decision with an open claim ({@link openClaims}) is in flight; its
+ * `decided` line reads here as `acted` (in this view only, never written), and an
+ * `outcome-unknown` line of an in-flight decision is left out, so each claim counts
+ * once. Settled lines are as they are. Pure.
+ *
+ * First consumers: the delegated executor's claim and the apply pass's checks.
+ */
+export function claimedLog(lines: readonly DelegationLogLine[]): DelegationLogLine[] {
+  const open = openClaims(lines);
+  const out: DelegationLogLine[] = [];
+  lines.forEach((line, at) => {
+    const claim = line.decision !== undefined ? open.get(line.decision) : undefined;
+    if (claim !== undefined && line.event === "outcome-unknown") return;
+    out.push(claim !== undefined && claim.at === at ? { ...line, event: "acted" } : line);
+  });
+  return out;
 }

@@ -78,6 +78,7 @@ export const DELEGATION_LOG_EVENTS = deepFreeze([
   "planned",
   "decided",
   "acted",
+  "outcome-unknown",
   "watch-started",
   "kept",
   "rolled-back",
@@ -278,6 +279,10 @@ export type DelegationProposalView = {
   readonly id: string;
   readonly action: DelegationAction;
   readonly days: number;
+  /** The request's use cap, when it asked for one. */
+  readonly maxUses?: number;
+  /** The request's scope, when it asked for one. */
+  readonly scope?: Readonly<Record<string, DelegationScopeValue>>;
   readonly createdAt: string;
   readonly expiresAt: string;
   readonly verb: string;
@@ -345,6 +350,8 @@ export type DelegationPreviewRequest = {
   /** For a rule that exists: the page that changes or resumes it. */
   readonly rule?: string;
   readonly mode?: "change" | "resume";
+  /** For a request that waits (`dec_`): the page that answers it, from its own terms. */
+  readonly proposal?: string;
 };
 
 /** The consequences page, server-rendered from closed templates. */

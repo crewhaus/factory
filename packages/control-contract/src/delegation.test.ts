@@ -37,6 +37,7 @@ import {
   SUSPEND_REASONS,
   SYSTEM_SUPERSEDE_REASONS,
   canTransition,
+  encodeCursor,
   mintId,
   renderTwin,
 } from "./index.js";
@@ -616,6 +617,7 @@ describe("the area module", () => {
       "planned",
       "decided",
       "acted",
+      "outcome-unknown",
       "watch-started",
       "kept",
       "rolled-back",
@@ -626,6 +628,8 @@ describe("the area module", () => {
     expect(DELEGATION_RULE_KEYS).not.toContain("note");
     expect(DELEGATION_LOG_KEYS).toContain("appliedBy");
     expect(DELEGATION_LOG_REASONS).toContain("rollback_unavailable");
+    expect(DELEGATION_LOG_REASONS).toContain("not-dispatched");
+    expect(DELEGATION_LOG_REASONS).toContain("decision-missing");
     expect(SYSTEM_SUPERSEDE_REASONS).toEqual(expect.arrayContaining(["rule-revoked", "paused"]));
     expect(DELEGATION_MODULE.commandKinds.map((k) => k.id).sort()).toEqual(
       DELEGATION_MODULE.operations
@@ -669,6 +673,37 @@ describe("the area module", () => {
       { kind: "delegation", rule, revision: 1, note: "x" },
     ]) {
       expect(schema?.safeParse({ ...receipt, authority }).success).toBe(false);
+    }
+  });
+
+  test("a listed request carries the use cap and scope it asked for", () => {
+    const schema = SCHEMAS["delegationList"];
+    const proposal = {
+      id: mintId("dec"),
+      action: "merge",
+      days: 7,
+      createdAt: "2026-11-14T12:00:00.000Z",
+      expiresAt: "2026-11-21T12:00:00.000Z",
+      verb: "crewhaus delegations enable merge --harness hrn_0123456789abcdef --days 7",
+    };
+    const list = {
+      items: [],
+      snapshotAt: encodeCursor({ v: 1, kind: "fleet", epoch: 0, seq: 0 }),
+      ceiling: { present: true, maxDays: 30 },
+      offers: [],
+      note: "n",
+    };
+    expect(
+      schema?.safeParse({
+        ...list,
+        proposals: [{ ...proposal, maxUses: 2, scope: { branches: ["main"] } }],
+      }).success,
+    ).toBe(true);
+    expect(schema?.safeParse({ ...list, proposals: [proposal] }).success).toBe(true);
+    for (const bad of [{ maxUses: 0 }, { maxUses: 1.5 }, { scope: { branches: [1] } }]) {
+      expect(schema?.safeParse({ ...list, proposals: [{ ...proposal, ...bad }] }).success).toBe(
+        false,
+      );
     }
   });
 

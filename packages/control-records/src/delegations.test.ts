@@ -4,12 +4,15 @@ import { join } from "node:path";
 import { type DelegationLogLine, type DelegationRuleRow, mintId } from "@crewhaus/control-contract";
 import {
   appendDelegationLog,
+  claimedLog,
   createDelegationReader,
   delegationLogLedger,
   delegationsLedger,
+  openClaims,
   readDelegationLog,
   readDelegations,
   ruleUses,
+  withDelegationLog,
 } from "./delegations";
 import { _setIoTapForTest } from "./io";
 import { casAppend } from "./ledger";
@@ -261,6 +264,91 @@ describe("application lines", () => {
     if (read.state !== "present") throw new Error(read.state);
     expect(read.lines).toHaveLength(1);
     expect(read.anomalies).toEqual(["a line is not an application line"]);
+  });
+});
+
+describe("a claim on the application log", () => {
+  // Bun's deadline, not a stopwatch: an append that took the lock again would never return.
+  test("a section reads the log whole and appends under the one lock it holds", async () => {
+    const dir = tempDir();
+    const ruleId = mintId("rule");
+    await appendDelegationLog(dir, line({ rule: ruleId, event: "checked", gates: [] }));
+    const answer = await withDelegationLog(dir, ({ lines, append }) => {
+      expect(lines.map((l) => l.event)).toEqual(["checked"]);
+      const first = append(line({ rule: ruleId, event: "decided", decision: mintId("dec") }));
+      const second = append(line({ rule: ruleId, event: "acted", cmd: mintId("cmd") }));
+      expect(lines.map((l) => l.event)).toEqual(["checked", "decided", "acted"]);
+      return [first.ok, second.ok];
+    });
+    expect(answer).toEqual([true, true]);
+    const read = readDelegationLog(dir);
+    expect(read.state === "present" ? read.lines.map((l) => l.event) : []).toEqual([
+      "checked",
+      "decided",
+      "acted",
+    ]);
+    // The lock was released: a plain append after the section lands.
+    expect((await appendDelegationLog(dir, line({ rule: ruleId }))).ok).toBe(true);
+  }, 5_000);
+
+  test("a line outside the closed key set throws inside the section and writes nothing", async () => {
+    const dir = tempDir();
+    await expect(
+      withDelegationLog(dir, ({ append }) =>
+        append({ ...line(), note: "free text" } as DelegationLogLine),
+      ),
+    ).rejects.toThrow("closed key set");
+    expect(readDelegationLog(dir)).toEqual({ state: "absent" });
+  }, 5_000);
+
+  test("a claimed use counts until its own acted or refused line closes it, an unknown outcome once", () => {
+    const ruleId = mintId("rule");
+    const dec = mintId("dec");
+    const cmd = mintId("cmd");
+    const decided = line({ rule: ruleId, event: "decided", decision: dec, cmd });
+    const unknown = line({ rule: ruleId, event: "outcome-unknown", decision: dec, cmd });
+    const planned = line({ rule: ruleId, event: "planned", decision: dec, plan: { kind: "x" } });
+    const view = claimedLog([planned, decided, unknown]);
+    expect(view.map((l) => l.event)).toEqual(["planned", "acted"]);
+    expect(ruleUses(view, ruleId)).toBe(1);
+    expect(ruleUses([planned, decided, unknown], ruleId)).toBe(0);
+    for (const closing of ["acted", "refused"] as const) {
+      const closed = [
+        planned,
+        decided,
+        unknown,
+        line({ rule: ruleId, event: closing, decision: dec, cmd }),
+      ];
+      expect(claimedLog(closed)).toEqual(closed);
+      expect(ruleUses(claimedLog(closed), ruleId)).toBe(closing === "acted" ? 1 : 0);
+      expect(openClaims(closed).size).toBe(0);
+    }
+    // Only the claim's own command settles it: a line with no command, or another's,
+    // leaves it counted.
+    for (const by of [undefined, mintId("cmd")]) {
+      for (const closing of ["acted", "refused"] as const) {
+        const foreign = line({
+          rule: ruleId,
+          event: closing,
+          decision: dec,
+          ...(by !== undefined ? { cmd: by } : {}),
+          ...(closing === "refused" ? { reason: "rollback_unavailable" } : {}),
+        });
+        const lines = [planned, decided, foreign];
+        expect([by, closing, openClaims(lines).get(dec)]).toEqual([by, closing, { at: 1, cmd }]);
+        expect(ruleUses(claimedLog(lines), ruleId)).toBe(closing === "acted" ? 2 : 1);
+      }
+    }
+    // A refusal before the claim does not close it; only a line after the last claim does.
+    const early = line({ rule: ruleId, event: "refused", decision: dec, reason: "paused" });
+    expect(ruleUses(claimedLog([early, decided]), ruleId)).toBe(1);
+    // Two decisions, one settled and one in flight: two uses.
+    const other = mintId("dec");
+    const settled = [
+      line({ rule: ruleId, event: "decided", decision: other, cmd }),
+      line({ rule: ruleId, event: "acted", decision: other, cmd }),
+    ];
+    expect(ruleUses(claimedLog([...settled, decided]), ruleId)).toBe(2);
   });
 });
 

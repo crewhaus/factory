@@ -131,17 +131,22 @@ export {
 } from "./deployments";
 export {
   type DelegationLogRead,
+  type DelegationLogSection,
   type DelegationScopeChoice,
+  type OpenClaim,
   appendDelegationLog,
+  claimedLog,
   createDelegationReader,
   delegationLogLedger,
   delegationLogLineOf,
   delegationRuleOf,
   delegationsLedger,
   isDelegationTerms,
+  openClaims,
   readDelegationLog,
   readDelegations,
   ruleUses,
+  withDelegationLog,
 } from "./delegations";
 export type { CachedReader } from "./fail-closed";
 export {

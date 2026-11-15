@@ -192,6 +192,8 @@ export const DELEGATION_LOG_REASONS = deepFreeze([
     "already-spent",
     "decision-expired",
     "regression",
+    "not-dispatched",
+    "decision-missing",
   ]),
 ] as const);
 

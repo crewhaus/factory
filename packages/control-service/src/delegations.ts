@@ -86,6 +86,7 @@ import {
   appendDelegationLog,
   casAppend,
   casAppendLocked,
+  claimedLog,
   createApproverReader,
   createDelegationReader,
   decisionsLedger,
@@ -95,6 +96,7 @@ import {
   intakeVerdict,
   keyedDigest,
   openActionDecision,
+  openClaims,
   proposalState,
   readActionDecisions,
   readDelegationLog,
@@ -105,6 +107,7 @@ import {
   readProposals,
   refreshOperatorRecord,
   ruleUses,
+  withDelegationLog,
   withLedgerLock,
 } from "@crewhaus/control-records";
 import type { Commands } from "./commands";
@@ -228,7 +231,12 @@ export type Delegations = {
   get(harness: DelegationHarness, rule: string): DelegationDetailAnswer;
   preview(
     harness: DelegationHarness,
-    request: { readonly action: DelegationAction; readonly terms?: DelegationTermsRequest },
+    request: {
+      readonly action: DelegationAction;
+      readonly terms?: DelegationTermsRequest;
+      /** A request that waits: the page answers it, drawn from the terms it asked for. */
+      readonly proposal?: string;
+    },
   ): Promise<PreviewAnswer>;
   enable(
     harness: DelegationHarness,
@@ -405,13 +413,16 @@ function carried(rule: DelegationRuleRow): DelegationRuleRow {
   return rest as DelegationRuleRow;
 }
 
-/** The rule as a list shows it, from its row and its application lines. */
+/**
+ * The rule as a list shows it, from its row and its application lines: its uses and state
+ * count every claimed use, and its last action is the last one that acted.
+ */
 export function ruleViewOf(
   rule: DelegationRuleRow,
   lines: readonly DelegationLogLine[],
   now: number,
 ): DelegationRuleView {
-  const uses = ruleUses(lines, rule.id);
+  const uses = ruleUses(claimedLog(lines), rule.id);
   const state = effectiveRuleState(rule, now, uses);
   let last: DelegationLogLine | undefined;
   for (const line of lines) if (line.event === "acted" && line.rule === rule.id) last = line;
@@ -558,11 +569,20 @@ async function reask(
 
 /**
  * The code every delegated action's executor runs first, around the action's own effect.
- * Uncached, it reads the rule, the decision, the active deployment, the operator record
- * and the approver list, and checks the grant with `verifyDecision`'s delegated branch.
- * Any failure leaves the grant unspent: it is logged `refused`, superseded, and asked
- * again for a person. Otherwise the grant is consumed, the effect runs, and `acted` is
- * logged with the command's id, which opens the watch.
+ * It reads the subject's current revision on its host first. Then, holding the
+ * application log's lock over the log read whole, it reads the rule, the decision, the
+ * active deployment, the operator record and the approver list, uncached, checks the
+ * grant with `verifyDecision`'s delegated branch, the use cap and the one-at-a-time
+ * condition, every claimed use counted (`claimedLog`), and writes its own `decided` line
+ * as the claim in the same step: two effects at once never both pass a cap of one, and a
+ * revoke, a pause or a change to the rule that lands before the claim wins. Any failure
+ * leaves the grant unspent: it is logged `refused`, superseded where a person must now
+ * decide, and asked again. A decision or rule the receipt names that is not on record is
+ * logged `refused` too. A decision that already holds an open claim is that claim's to
+ * settle: nothing is written for it and nothing acts. Otherwise the grant is consumed,
+ * the effect runs, and `acted` is logged with the command's id, which opens the watch. An
+ * effect whose outcome is unknown is logged `outcome-unknown`, and its claim keeps
+ * counting until a later `acted` or `refused` line of the same command settles it.
  *
  * First consumers: the areas that register a delegated action.
  */
@@ -578,93 +598,183 @@ export function delegatedExecutor(
     if (authority?.kind !== "delegation" || decisionId === undefined) {
       return { state: "rejected", outcome: outcomeOf("forbidden") };
     }
-    const rules = readDelegations(harnessDir);
-    const rule =
-      rules.state === "present" ? rules.rows.find((r) => r.id === authority.rule) : undefined;
-    const decisions = readActionDecisions(harnessDir);
-    const row =
-      decisions.state === "present" ? decisions.rows.find((r) => r.id === decisionId) : undefined;
-    if (rule === undefined || row === undefined) {
-      return { state: "rejected", outcome: outcomeOf("not_found") };
-    }
-    const lines = wholeLog(harnessDir);
-    /** Append one line; `true` only when it is on disk. */
-    const log = async (event: "refused" | "acted", reason?: string): Promise<boolean> => {
+    /** The decision row as last read: what a line says about its subject. */
+    let known: ActionDecisionRow | undefined;
+    /** One line about this decision under the receipt's authority. */
+    const lineOf = (event: DelegationLogLine["event"], reason?: string): DelegationLogLine => ({
+      v: 1,
+      at: iso(ctx.now()),
+      event,
+      rule: authority.rule,
+      revision: authority.revision,
+      decision: decisionId,
+      ...(known !== undefined ? { subject: known.subject } : {}),
+      cmd: receipt.id,
+      ...(known?.appliedBy !== undefined ? { appliedBy: known.appliedBy } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+    });
+    /** Append one line of this claim's own, after it landed; `true` only when it is on disk. */
+    const log = async (event: DelegationLogLine["event"], reason?: string): Promise<boolean> => {
       try {
-        const answer = await appendDelegationLog(harnessDir, {
-          v: 1,
-          at: iso(ctx.now()),
-          event,
-          rule: rule.id,
-          revision: authority.revision,
-          decision: row.id,
-          subject: row.subject,
-          cmd: receipt.id,
-          ...(row.appliedBy !== undefined ? { appliedBy: row.appliedBy } : {}),
-          ...(reason !== undefined ? { reason } : {}),
-        });
-        return answer.ok;
+        return (await appendDelegationLog(harnessDir, lineOf(event, reason))).ok;
       } catch {
         return false;
       }
     };
-    const state = effectiveRuleState(rule, now, ruleUses(lines, rule.id));
-    const ceiling = activeCeiling(harnessDir);
-    const bound =
-      ceiling.state === "present" &&
-      ceiling.ceiling.digest === rule.ceilingDigest &&
-      ceiling.ceiling.policyRevision === rule.policyRevision &&
-      row.delegation?.rule === authority.rule &&
-      row.delegation.revision === authority.revision;
-    const operator = intakeVerdict(harnessDir, { read: refreshOperatorRecord });
+    type Why = { readonly supersede?: Parameters<typeof reask>[2]; readonly reason: string };
+    /**
+     * Under the log's lock: nothing for a decision another command already claimed (that
+     * claim is settled by its own executor), otherwise the line `decide` answers, from the
+     * rows as they are inside the lock.
+     */
+    type Section =
+      | { readonly ok: false }
+      | { readonly ok: true; readonly held: true }
+      | {
+          readonly ok: true;
+          readonly held?: undefined;
+          readonly why?: Why;
+          readonly landed: boolean;
+          readonly row?: ActionDecisionRow;
+        };
+    const section = async (
+      decide: (lines: readonly DelegationLogLine[]) => {
+        readonly why?: Why;
+        readonly row?: ActionDecisionRow;
+      },
+    ): Promise<Section> => {
+      try {
+        const answer = await withDelegationLog(harnessDir, ({ lines, append }): Section => {
+          if (openClaims(lines).has(decisionId)) return { ok: true, held: true };
+          const { why, row } = decide(lines);
+          const written = append(
+            why !== undefined ? lineOf("refused", why.reason) : lineOf("decided"),
+          );
+          return {
+            ok: true,
+            ...(why !== undefined ? { why } : {}),
+            landed: written.ok,
+            ...(row !== undefined ? { row } : {}),
+          };
+        });
+        return answer.ok ? answer : { ok: false };
+      } catch {
+        return { ok: false };
+      }
+    };
+    /** A decision or rows to act under, read now and uncached. */
+    const rowsNow = () => {
+      const decisions = readActionDecisions(harnessDir);
+      const rules = readDelegations(harnessDir);
+      return {
+        row:
+          decisions.state === "present"
+            ? decisions.rows.find((r) => r.id === decisionId)
+            : undefined,
+        rule:
+          rules.state === "present" ? rules.rows.find((r) => r.id === authority.rule) : undefined,
+      };
+    };
+    const first = rowsNow();
+    known = first.row;
+    if (first.row === undefined || first.rule === undefined) {
+      // A decision or a rule that cannot be read is not one to act under: a person decides.
+      const refused = await section(() =>
+        first.row === undefined
+          ? { why: { reason: "decision-missing" } }
+          : { why: { supersede: "rule-revoked", reason: "rule-revoked" }, row: first.row },
+      );
+      if (refused.ok && refused.held !== true && refused.row?.state === "granted") {
+        await reask(harnessDir, refused.row, "rule-revoked", undefined, now);
+      }
+      return {
+        state: "rejected",
+        outcome: outcomeOf(refused.ok && refused.held === true ? "conflict" : "not_found"),
+      };
+    }
+    // The one slow read, the subject's revision on its host, comes before any check: the
+    // check reads every record again under the log's lock.
     let subjectRevision: string | undefined;
     try {
-      subjectRevision = await action.currentRevision(row.subject, ctxOf(harnessDir, now));
+      subjectRevision = await action.currentRevision(first.row.subject, ctxOf(harnessDir, now));
     } catch {
       subjectRevision = undefined;
     }
-    // A reader of its own: its first read is the file as it is now.
-    const holdsNow = ownerHolds(createApproverReader()(harnessDir), rule.owner, now);
-    const verdict = verifyDecision({
-      decision: recordViewOf(row),
-      consumer: { runId: "", resumeScope: "" },
-      approvers: { state: "absent" },
-      now,
-      delegation: {
-        ruleState: bound ? state : { state: "suspended", revision: state.revision },
-        ownerHolds: holdsNow,
-        subjectRevision,
-      },
+    // The check and the claim are one step under the log's lock, over the rule, the
+    // decision, the deployment, the operator record and the approver list as they are
+    // inside it: a revoke, a pause or a change that lands first always wins. Nothing in it
+    // runs a gate, reads the host or acts.
+    const claim = await section((lines) => {
+      const { row, rule } = rowsNow();
+      if (row === undefined) return { why: { reason: "decision-missing" } };
+      known = row;
+      if (rule === undefined) {
+        return { why: { supersede: "rule-revoked", reason: "rule-revoked" }, row };
+      }
+      const ceiling = activeCeiling(harnessDir);
+      const bound =
+        ceiling.state === "present" &&
+        ceiling.ceiling.digest === rule.ceilingDigest &&
+        ceiling.ceiling.policyRevision === rule.policyRevision &&
+        row.delegation?.rule === authority.rule &&
+        row.delegation.revision === authority.revision;
+      const operator = intakeVerdict(harnessDir, { read: refreshOperatorRecord });
+      // A reader of its own: its first read is the file as it is now.
+      const holdsNow = ownerHolds(createApproverReader()(harnessDir), rule.owner, now);
+      const view = claimedLog(lines);
+      const state = effectiveRuleState(rule, now, ruleUses(view, rule.id));
+      const verdict = verifyDecision({
+        decision: recordViewOf(row),
+        consumer: { runId: "", resumeScope: "" },
+        approvers: { state: "absent" },
+        now,
+        delegation: {
+          ruleState: bound ? state : { state: "suspended", revision: state.revision },
+          ownerHolds: holdsNow,
+          subjectRevision,
+        },
+      });
+      // One at a time, by the log as it is now: an action another decision claimed counts.
+      let alone = false;
+      try {
+        alone = action.oneAtATime(view, row.subject) === true;
+      } catch {
+        alone = false;
+      }
+      const why: Why | undefined =
+        operator.state !== "open"
+          ? { supersede: "paused", reason: "paused" }
+          : !verdict.ok
+            ? verdict.reason === "decider-not-authorized" &&
+              bound &&
+              holdsNow === true &&
+              state.state === "exhausted"
+              ? // The rule stands and its uses are spent: a person decides this one.
+                { supersede: "re-asked", reason: "uses-exhausted" }
+              : effectRefusal(verdict)
+            : !alone
+              ? { supersede: "re-asked", reason: "one-at-a-time" }
+              : undefined;
+      return { ...(why !== undefined ? { why } : {}), row };
     });
-    // One at a time, by the log as it is now: an action another decision started counts.
-    let alone = false;
-    try {
-      alone = action.oneAtATime(lines, row.subject) === true;
-    } catch {
-      alone = false;
+    if (!claim.ok || claim.held === true || !claim.landed) {
+      // Nothing was claimed: nothing is spent and nothing acts. A decision another command
+      // claimed is that command's to settle; any other one the pass hands back to a person.
+      return {
+        state: "rejected",
+        outcome: outcomeOf(claim.ok && claim.held === true ? "conflict" : "unavailable"),
+      };
     }
-    const why:
-      | { readonly supersede?: Parameters<typeof reask>[2]; readonly reason: string }
-      | undefined =
-      operator.state !== "open"
-        ? { supersede: "paused", reason: "paused" }
-        : !verdict.ok
-          ? verdict.reason === "decider-not-authorized" &&
-            bound &&
-            holdsNow === true &&
-            state.state === "exhausted"
-            ? // The rule stands and its uses are spent: a person decides this one.
-              { supersede: "re-asked", reason: "uses-exhausted" }
-            : effectRefusal(verdict)
-          : !alone
-            ? { supersede: "re-asked", reason: "one-at-a-time" }
-            : undefined;
-    if (why !== undefined) {
-      await log("refused", why.reason);
-      if (why.supersede !== undefined && row.state === "granted") {
+    const why = claim.why;
+    const row = claim.row;
+    if (why !== undefined || row === undefined) {
+      if (why?.supersede !== undefined && row?.state === "granted") {
         await reask(harnessDir, row, why.supersede, subjectRevision, now);
       }
-      return { state: "rejected", outcome: outcomeOf("conflict") };
+      return {
+        state: "rejected",
+        outcome: outcomeOf(row === undefined ? "not_found" : "conflict"),
+      };
     }
     const consumed = await casAppend(decisionsLedger(harnessDir), row.id, "granted", {
       ...row,
@@ -680,6 +790,23 @@ export function delegatedExecutor(
       settle = await run(ctx, row);
     } catch {
       settle = { state: "unknown", outcome: outcomeOf("internal") };
+    }
+    if (settle.state === "unknown") {
+      // Whether it acted is not known: the claim stays open and keeps counting.
+      if (!(await log("outcome-unknown"))) {
+        return {
+          ...settle,
+          effects: [
+            ...(settle.effects ?? []),
+            {
+              kind: "delegation.unknown",
+              status: "failed",
+              note: "the action's outcome is unknown; its line in the application log could not be written",
+            },
+          ],
+        };
+      }
+      return settle;
     }
     const recorded = await log(
       settle.state === "succeeded" ? "acted" : "refused",
@@ -854,6 +981,46 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
     return approved + refused + rolledBack === 0
       ? null
       : { days: EVIDENCE_DAYS, approved, refused, rolledBack };
+  };
+
+  /**
+   * Terms a change or a request answer is drawn from: each part the request gives, and
+   * the base's part where it gives none, so a part left out is kept.
+   */
+  const mergeTerms = (
+    base: DelegationTermsRequest | undefined,
+    request: DelegationTermsRequest | undefined,
+  ): DelegationTermsRequest => {
+    const days = request?.days !== undefined ? request.days : base?.days;
+    const maxUses = request?.maxUses !== undefined ? request.maxUses : base?.maxUses;
+    const scope = request?.scope !== undefined ? request.scope : base?.scope;
+    return {
+      ...(days !== undefined ? { days } : {}),
+      ...(maxUses !== undefined ? { maxUses } : {}),
+      ...(scope !== undefined ? { scope } : {}),
+    };
+  };
+
+  /**
+   * A request that waits for a delegation rule of this action, and the terms it asked for
+   * as `propose` stored them; a refusal when there is none, or it was answered.
+   */
+  const askedOf = (
+    dir: string,
+    id: string,
+    action: DelegationAction,
+  ): { readonly proposal: ProposalRow; readonly terms: DelegationTerms } | DelegationRefusal => {
+    if (!isId("dec", id)) return refusal("not-found", "No request for this rule waits here.");
+    const read = readProposals(dir);
+    const proposal = read.state === "present" ? read.rows.find((r) => r.id === id) : undefined;
+    const terms = proposal?.terms;
+    if (proposal === undefined || terms?.ruleKind !== "delegate" || terms.action !== action) {
+      return refusal("not-found", "No request for this rule waits here.");
+    }
+    if (proposalState(proposal, deps.now()) !== "pending") {
+      return refusal("already-decided", "That request has already been answered.");
+    }
+    return { proposal, terms: terms.terms };
   };
 
   /**
@@ -1060,7 +1227,11 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
     const rule = read.state === "present" ? read.rows.find((r) => r.id === id) : undefined;
     if (rule === undefined)
       return refusal("not-found", "This harness has no delegation rule by that id.");
-    return { rule, state: effectiveRuleState(rule, deps.now(), ruleUses(wholeLog(dir), id)) };
+    // Every claimed use counts, as the list and the effect count them.
+    return {
+      rule,
+      state: effectiveRuleState(rule, deps.now(), ruleUses(claimedLog(wholeLog(dir)), id)),
+    };
   };
 
   const confirmProblem = (
@@ -1193,8 +1364,9 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
     }
 
     // Owner authority, the policy and the ceiling, re-read every pass.
+    const claimedNow = claimedLog(lines);
     for (const rule of [...rules.values()]) {
-      if (effectiveRuleState(rule, now, ruleUses(lines, rule.id)).state !== "active") continue;
+      if (effectiveRuleState(rule, now, ruleUses(claimedNow, rule.id)).state !== "active") continue;
       if (plan.ceiling.state === "present") {
         if (plan.ceiling.ceiling.digest !== rule.ceilingDigest) {
           await suspend(rule, "ceiling-changed");
@@ -1222,11 +1394,13 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
     for (const decision of pending) {
       const served = deps.actions.find((a) => a.decisionKind === decision.kind);
       if (served === undefined) continue;
+      // Uses and one at a time count every claimed use, settled or not.
+      const view = claimedLog(lines);
       const candidates = [...rules.values()]
         .filter(
           (rule) =>
             rule.action === served.action &&
-            effectiveRuleState(rule, now, ruleUses(lines, rule.id)).state === "active",
+            effectiveRuleState(rule, now, ruleUses(view, rule.id)).state === "active",
         )
         .sort((a, b) => (a.id < b.id ? -1 : 1));
       if (candidates.length === 0) continue;
@@ -1250,14 +1424,14 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
       };
       let oneAtATime = false;
       try {
-        oneAtATime = served.oneAtATime(lines, decision.subject) === true;
+        oneAtATime = served.oneAtATime(view, decision.subject) === true;
       } catch {
         oneAtATime = false;
       }
       const input = {
         decision,
         rule,
-        ruleState: effectiveRuleState(rule, now, ruleUses(lines, rule.id)),
+        ruleState: effectiveRuleState(rule, now, ruleUses(view, rule.id)),
         ceiling:
           plan.ceiling.state === "present"
             ? {
@@ -1271,7 +1445,7 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
         operator,
         ownerHolds: ownerHolds(projection, rule.owner, now),
         now,
-        uses: ruleUses(lines, rule.id),
+        uses: ruleUses(view, rule.id),
         oneAtATime,
       };
       const refuse = async (
@@ -1339,7 +1513,7 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
       const answer = authorizeDelegated({
         ...input,
         rule: ruleNow,
-        ruleState: effectiveRuleState(ruleNow, deps.now(), ruleUses(lines, rule.id)),
+        ruleState: effectiveRuleState(ruleNow, deps.now(), ruleUses(claimedLog(lines), rule.id)),
         requiredGates: served.requiredGates,
         verdicts,
         now: deps.now(),
@@ -1381,9 +1555,9 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
         appliedBy,
       });
       if (resolved.outcome !== "decided") continue;
-      await log({ ...base, event: "decided" });
       counts.decided += 1;
-      await deps.commands.submit({
+      // The executor claims the use: its `decided` line is written under the log's lock.
+      const submitted = await deps.commands.submit({
         kind: served.executeKind,
         actor: "sys:executor",
         target: `${harness.id}/decision/${decision.id}`,
@@ -1394,6 +1568,18 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
       // The effect ran inline and logged what it did: the next decision counts it.
       const after = readDelegationLog(dir);
       if (after.state === "present") lines.splice(0, lines.length, ...after.lines);
+      // A grant no executor answered for goes back to a person. Once the executor wrote
+      // its line, that line is the answer.
+      if (!submitted.ok || !executorAnswered(lines, decision.id)) {
+        const reread = readActionDecisions(dir);
+        const granted =
+          reread.state === "present" ? reread.rows.find((r) => r.id === decision.id) : undefined;
+        if (granted?.state === "granted") {
+          await log({ ...base, event: "refused", reason: "not-dispatched" });
+          await reask(dir, granted, "re-asked", decision.subject.revision, now);
+          counts.refused += 1;
+        }
+      }
     }
 
     // Watches: open each action's, read its signals, keep or roll back.
@@ -1547,6 +1733,8 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
                   id: row.id,
                   action,
                   days: terms.days,
+                  ...(terms.terms.maxUses !== undefined ? { maxUses: terms.terms.maxUses } : {}),
+                  ...(terms.terms.scope !== undefined ? { scope: terms.terms.scope } : {}),
                   createdAt: row.createdAt,
                   expiresAt: row.expiresAt,
                   // Run as it is, it prints the page and the exact command that confirms it.
@@ -1669,11 +1857,20 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
     },
 
     async preview(harness, request) {
+      // A request's page is drawn from the terms it asked for, read whole here.
+      const asked =
+        request.proposal !== undefined
+          ? askedOf(harness.dir, request.proposal, request.action)
+          : undefined;
+      if (asked !== undefined && "ok" in asked) return asked;
       const parts = await pageFor(
         harness,
         request.action,
-        request.terms,
-        { kind: "enable" },
+        asked !== undefined ? mergeTerms(asked.terms, request.terms) : request.terms,
+        {
+          kind: "enable",
+          ...(request.proposal !== undefined ? { proposal: request.proposal } : {}),
+        },
         "read",
       );
       return "ok" in parts ? parts : { ok: true, page: parts.page };
@@ -1696,7 +1893,7 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
           : await pageFor(
               harness,
               rule.action,
-              request.terms ?? rule.terms,
+              mergeTerms(rule.terms, request.terms),
               { kind: "change", rule: rule.id, expect: rule.revision },
               "read",
             );
@@ -1707,13 +1904,19 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
       const dir = harness.dir;
       const no = ownerOnly(dir, request.actor);
       if (no !== undefined) return no;
-      if (request.proposal !== undefined && !isId("dec", request.proposal)) {
-        return refusal("not-found", "No request for this rule waits here.");
+      // A request is answered only on its own terms: found and checked before the page.
+      let proposal: ProposalRow | undefined;
+      let asked: DelegationTerms | undefined;
+      if (request.proposal !== undefined) {
+        const found = askedOf(dir, request.proposal, request.action);
+        if ("ok" in found) return found;
+        proposal = found.proposal;
+        asked = found.terms;
       }
       const parts = await pageFor(
         harness,
         request.action,
-        request.terms,
+        asked !== undefined ? mergeTerms(asked, request.terms) : request.terms,
         {
           kind: "enable",
           ...(request.proposal !== undefined ? { proposal: request.proposal } : {}),
@@ -1721,6 +1924,13 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
         "ensure",
       );
       if ("ok" in parts) return parts;
+      if (asked !== undefined && canonicalJson(parts.terms) !== canonicalJson(asked)) {
+        return refusal(
+          "precondition-failed",
+          "This request asked for other terms: answer it as asked, or turn on a new rule.",
+          { page: parts.page },
+        );
+      }
       if (parts.digest === undefined || request.consequencesDigest !== parts.digest) {
         return refusal(
           "precondition-failed",
@@ -1733,23 +1943,6 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
       const now = deps.now();
       const owner = await deps.decisions.storedActorOf(dir, request.actor);
       const id = mintId("rule", { now });
-      let proposal: ProposalRow | undefined;
-      if (request.proposal !== undefined) {
-        const read = readProposals(dir);
-        proposal =
-          read.state === "present" ? read.rows.find((r) => r.id === request.proposal) : undefined;
-        const terms = proposal?.terms;
-        if (
-          proposal === undefined ||
-          terms?.ruleKind !== "delegate" ||
-          terms.action !== request.action
-        ) {
-          return refusal("not-found", "No request for this rule waits here.");
-        }
-        if (proposalState(proposal, now) !== "pending") {
-          return refusal("already-decided", "That request has already been answered.");
-        }
-      }
       const row: DelegationRuleRow = {
         v: 1,
         at: iso(now),
@@ -1855,7 +2048,7 @@ export function createDelegations(deps: DelegationsDeps): Delegations {
       const parts = await pageFor(
         harness,
         rule.action,
-        request.terms ?? rule.terms,
+        mergeTerms(rule.terms, request.terms),
         { kind: "change", rule: rule.id, expect: rule.revision },
         "ensure",
       );
@@ -2163,6 +2356,21 @@ function openWatches(
     out.push({ line, watch });
   }
   return out;
+}
+
+/**
+ * Whether the executor wrote its line for this decision after the pass planned it: a
+ * `decided` claim or a `refused` line.
+ */
+function executorAnswered(lines: readonly DelegationLogLine[], decision: string): boolean {
+  let planned = -1;
+  lines.forEach((line, at) => {
+    if (line.decision === decision && line.event === "planned") planned = at;
+  });
+  if (planned < 0) return false;
+  return lines
+    .slice(planned + 1)
+    .some((l) => l.decision === decision && (l.event === "decided" || l.event === "refused"));
 }
 
 /**

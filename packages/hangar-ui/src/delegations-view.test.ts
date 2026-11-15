@@ -19,6 +19,7 @@ import {
   listModel,
   pageModel,
   routeOf,
+  termsBody,
   // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 } from "../assets/js/views/delegations.js";
 
@@ -310,6 +311,45 @@ describe("the consequences page", () => {
       "if (!hadDigest && fresh.ok && fresh.body.text === shown && digest !== undefined) {",
     );
     expect(SOURCE.match(/write\.run\(/g)).toHaveLength(2);
+  });
+
+  test("a page sends only the length it edits, never a term read from a served view", () => {
+    // A detail as Home serves it: token-shaped text in a scope reaches the view masked.
+    const served = {
+      terms: { days: 7, maxUses: 3, scope: { branches: ["release/***", "***"] } },
+    };
+    expect(termsBody(14, served.terms)).toEqual({ days: 14 });
+    expect(termsBody(7)).toEqual({ days: 7 });
+    expect(termsBody(undefined)).toEqual({});
+    // The preview and the write both send the terms one function builds.
+    expect(SOURCE.match(/= termsBody\(/g)).toHaveLength(1);
+    expect(SOURCE).toContain("const terms = termsBody(days);");
+    expect(SOURCE).toContain("    ...termsOf(),\n");
+    expect(SOURCE).toContain("const terms = termsOf();");
+    expect(SOURCE).not.toContain("{ terms: { days } }");
+    expect(SOURCE).not.toContain("base.scope");
+    expect(SOURCE).not.toContain("base?.scope");
+    expect(SOURCE).not.toContain("delegations.get");
+  });
+
+  test("a request page is answered as it was asked: its length shown, no terms sent", () => {
+    // The page is drawn by the server from the request's stored terms.
+    expect(SOURCE).toContain("const answering = route.proposal !== undefined;");
+    expect(SOURCE).toContain("? { action, proposal: route.proposal }");
+    expect(SOURCE).toContain('if (route.mode === "resume" || answering) return {};');
+    // Its length is read-only: no input is drawn, and no second request is filed from it.
+    expect(SOURCE).toContain("if (answering && days !== undefined) {");
+    expect(SOURCE).toContain(
+      '} else if (route.mode !== "resume" && !answering && (model.canConfirm || model.canAsk)) {',
+    );
+    expect(SOURCE).toContain("} else if (model.canAsk && !answering) {");
+    expect(SOURCE).toContain("DELEGATIONS_COPY.askedDays(days)");
+    expect(DELEGATIONS_COPY.askedDays(7)).toBe("Asked for 7 days.");
+    expect(DELEGATIONS_COPY.askedDays(1)).toBe("Asked for 1 day.");
+    // Turning it on names the request it answers.
+    expect(SOURCE).toContain(
+      "...(route.proposal !== undefined ? { proposal: route.proposal } : {}),",
+    );
   });
 
   test("after Pause or Turn off the list is reconciled by rule and focus stays on the row", () => {
