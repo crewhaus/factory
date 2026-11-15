@@ -5581,6 +5581,56 @@ describe("the release notes name what a channel daemon does with clicks and mess
   });
 });
 
+describe("device sign-in", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("Home's device page never takes the code from its address", () => {
+    const source = readFileSync(join(ROOT, "packages/hangar-ui/assets/js/views/device.js"), "utf8");
+    expect(source).not.toContain("codeFromHash");
+    expect(source).not.toContain("location.hash");
+    const bullet = bulletFor("device sign-in page starts with an empty code field");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("types");
+  });
+
+  test("`crewhaus access approve` asks, or needs --yes, before it allows", () => {
+    const source = readFileSync(join(ROOT, "apps/cli/src/access-cmd.ts"), "utf8");
+    const start = source.indexOf("async function approveVerb(");
+    expect(start).toBeGreaterThan(-1);
+    const body = source.slice(start, source.indexOf("\n}\n", start));
+    const yes = body.indexOf('has("yes")');
+    const confirm = body.indexOf("await confirm(");
+    const allow = body.indexOf('choice: "allow"');
+    for (const at of [yes, confirm, allow]) expect(at).toBeGreaterThan(-1);
+    expect(yes).toBeLessThan(allow);
+    expect(confirm).toBeLessThan(allow);
+    const bullet = bulletFor("`crewhaus access approve` shows the request and asks");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("--yes");
+  });
+
+  test("one address has at most 4 device sign-ins waiting", async () => {
+    const { DEVICE_LIMITS } = await import("../packages/access-control/src/index");
+    expect(DEVICE_LIMITS.maxPendingPerPeer).toBe(4);
+    const bullet = bulletFor("device sign-ins waiting at once");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("4");
+  });
+
+  test("a device name with a bidi character is refused", async () => {
+    const { deviceStartRequest } = await import("../packages/control-contract/src/schemas/core");
+    const { SEAL } = await import("../packages/control-contract/src/__test__/schema-examples");
+    expect(deviceStartRequest.safeParse({ seal: SEAL, clientName: "a\u202eb" }).success).toBe(
+      false,
+    );
+    expect(deviceStartRequest.safeParse({ seal: SEAL, clientName: "ab" }).success).toBe(true);
+    const bullet = bulletFor("A device name with bidi or invisible formatting characters");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("bidi");
+  });
+});
+
 describe("the release notes name the tenant ids a managed daemon reserves", () => {
   test("every reserved tenant id is named in the default-on list", async () => {
     const { RESERVED_TENANT_IDS } = await import("../packages/gateway-server/src/coded");

@@ -24,8 +24,9 @@
 import { parseLinkSubject } from "@crewhaus/control-contract";
 import { keyedDigest } from "@crewhaus/control-records";
 import { LINK_SUBJECT_LABEL, normalizeLinkSubject } from "./access";
-import { type Cidr, cidrContains, isLoopbackAddress, parseCidr } from "./addresses";
+import { type Cidr, cidrContains, isLoopbackAddress, parseCidr, parseIp } from "./addresses";
 import { tokenEquals } from "./bootstrap";
+import type { RequestedFrom } from "./device-requests";
 import { verifyScopedToken } from "./scoped";
 import { sha256Hex } from "./secrets";
 import type { SignInHandle } from "./sign-in";
@@ -223,6 +224,45 @@ async function proxyProven(request: Request, peer: Peer, proxy: TrustedProxy): P
   const secret = request.headers.get(PROXY_SECRET_HEADER);
   if (secret === null || secret === "") return false;
   return tokenEquals(await sha256Hex(secret), proxy.secretDigest);
+}
+
+/** The longest text an address takes: a full IPv6 address with an IPv4 tail. */
+const ADDRESS_TEXT_RE = /^[0-9A-Fa-f:.]{2,45}$/;
+
+/** An address as stored: only the characters of an address, and one `parseIp` reads. */
+function addressText(raw: string | null | undefined): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const zone = raw.indexOf("%");
+  const text = (zone === -1 ? raw : raw.slice(0, zone)).trim();
+  return ADDRESS_TEXT_RE.test(text) && parseIp(text) !== undefined ? text : undefined;
+}
+
+/**
+ * Where a request came from, as Home itself observed it: Home's own socket, the trusted
+ * proxy (once it proves itself, with the address it reports as the last
+ * `X-Forwarded-For` entry), or the TCP peer. A forwarding header from anything but the
+ * proven proxy is never read. Never throws.
+ *
+ * First consumer: `serveSignIn`, which records it on a waiting device sign-in.
+ */
+export async function requesterOf(
+  request: Request,
+  peer: Peer,
+  config: AuthenticateConfig,
+): Promise<RequestedFrom> {
+  try {
+    if (peer.listener === "home.sock") return { via: "home" };
+    const proxy = config.trustedProxy;
+    if (proxy !== undefined && (await proxyProven(request, peer, proxy))) {
+      const forwarded = request.headers.get("x-forwarded-for");
+      const address = addressText(forwarded === null ? undefined : forwarded.split(",").pop());
+      return address === undefined ? { via: "proxy" } : { via: "proxy", address };
+    }
+    const address = addressText(peer.address);
+    return address === undefined ? { via: "direct" } : { via: "direct", address };
+  } catch {
+    return { via: "direct" };
+  }
 }
 
 async function linkedPrincipal(

@@ -145,6 +145,7 @@ describe("what the package exports", () => {
         "openDeviceRequests",
         "readUsage",
         "recordUsage",
+        "requesterOf",
         "revokeOwnToken",
         "sealSecret",
         "shortCodeDigest",

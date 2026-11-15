@@ -1298,7 +1298,10 @@ describe("the versioned API: every served operation, for every role and credenti
     const { openDeviceRequests } = await import("@crewhaus/access-control");
     const devices = openDeviceRequests(world.t.hangarRoot);
     const collect = async (readOnly: boolean): Promise<string> => {
-      const start = await devices.start({ ...(readOnly ? { readOnly: true } : {}) });
+      const start = await devices.start({
+        requestedFrom: { via: "home" },
+        ...(readOnly ? { readOnly: true } : {}),
+      });
       if (!start.ok) throw new Error(start.reason);
       const decided = await devices.decide({
         caller: world.principals["maintainerA"] as string,
@@ -1632,7 +1635,10 @@ describe("the versioned API: every served operation, for every role and credenti
       expect(ivy).toMatch(/^prn_/);
       const devices = openDeviceRequests(home.t.hangarRoot);
       const token = async (readOnly: boolean) => {
-        const start = await devices.start({ ...(readOnly ? { readOnly: true } : {}) });
+        const start = await devices.start({
+          requestedFrom: { via: "home" },
+          ...(readOnly ? { readOnly: true } : {}),
+        });
         if (!start.ok) throw new Error(start.reason);
         const decided = await devices.decide({
           caller: ivy,
