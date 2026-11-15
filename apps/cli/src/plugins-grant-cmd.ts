@@ -8,6 +8,9 @@
  * Home's `plugins.grant` operation runs (`@crewhaus/hangar-server`'s plugin grants). A
  * request that names something the plugin does not ask for, a harness Home does not
  * know, or a generation that is not the live grant's, is refused before any receipt.
+ * A grant or revoke names each harness whose crewhaus.yaml loads the plugin beyond
+ * what the grant now serves: host tools are set there, and only an edit there and a
+ * rebuild stop them.
  *
  * Lists are comma-separated, the CLI's convention (`--plugins a,b`): the flag parser
  * keeps the last of a repeated flag, so `--panes a --panes b` would grant only `b`.
@@ -173,6 +176,24 @@ function harnessIdsOf(
   return { ok: true, ids };
 }
 
+/**
+ * One line per harness whose crewhaus.yaml loads the plugin beyond what its grant
+ * serves, with the host tools that entry hands it, then how to stop it there: a built
+ * harness keeps the list it was compiled with until it is rebuilt and restarted.
+ */
+function stillLoadedLines(name: string, outcome: GrantOutcome): string[] {
+  const list = outcome.ok ? (outcome.stillLoadedBy ?? []) : [];
+  if (list.length === 0) return [];
+  return [
+    ...list.map((h) =>
+      h.tools === null
+        ? `  still loaded by harness ${h.id} (its crewhaus.yaml could not be read; check its plugins: list)`
+        : `  still loaded by harness ${h.id} (host tools: ${h.tools.length === 0 ? "none" : h.tools.join(", ")})`,
+    ),
+    `  remove ${name} from plugins: in that crewhaus.yaml, then rebuild and restart the harness (crewhaus compile crewhaus.yaml -o dist) to stop it there`,
+  ];
+}
+
 function outcomeLine(
   name: string,
   outcome: GrantOutcome,
@@ -180,7 +201,7 @@ function outcomeLine(
 ): PluginsGrantResult {
   if (outcome.ok) {
     return {
-      lines: [`${verb} ${name} (generation ${outcome.gen})`],
+      lines: [`${verb} ${name} (generation ${outcome.gen})`, ...stillLoadedLines(name, outcome)],
       exitCode: 0,
     };
   }
@@ -275,6 +296,8 @@ export async function pluginGrantCommand(
       const outcome = await grantPlugin(hangarRoot, {
         row,
         grant,
+        // The owner sees every registered harness.
+        loadedBy: { row, harnesses: entries },
         by: receipt.actor,
         cmd: receipt.id,
       });
@@ -308,18 +331,22 @@ export async function pluginRevokeCommand(
   const hangarRoot = resolveHangarRoot(env as Record<string, string | undefined>);
   const read = inventoryOf(o, hangarRoot);
   if (!read.ok) return refuse(read.why);
-  if (!read.plugins.some((p) => p.name === name)) {
+  const row = read.plugins.find((p) => p.name === name);
+  if (row === undefined) {
     return refuse(`no plugin "${name}" is installed: crewhaus plugins install ${name}`);
   }
   if (liveGrantOf(read.grants, name) === undefined) {
     return refuse(`${name} has no live grant to remove`);
   }
+  const entries = (registryOf(env)?.list() ?? []).map((e) => ({ id: e.id, dir: e.dir }));
   const control = directControl(o.opts ?? {});
   const answer = await control.commands.submit<GrantOutcome>(
     { kind: "plugins.revoke", ledger: "workspace", via: "cli", body: {} },
     async (receipt) => {
       const outcome = await revokePlugin(hangarRoot, {
         plugin: name,
+        // The owner sees every registered harness.
+        loadedBy: { row, harnesses: entries },
         by: receipt.actor,
         cmd: receipt.id,
       });

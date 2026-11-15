@@ -1,21 +1,23 @@
 /**
  * The candidate spec of `crewhaus changes propose --from opt_<id>`.
  *
- * A proposal from an optimize run applies only settings the optimizer may tune, from a
- * run the CLI recorded:
+ * A proposal from an optimize run applies only patches the optimizer may make, from an
+ * optimize run directory whose report names that run, this spec and its target:
  *
- * - the run is one `crewhaus optimize` wrote: `.crewhaus/optimize/<id>/report.json` is a
- *   contained regular file (no link at the leaf, capped), and it names this run id and
- *   the current spec's target;
+ * - `.crewhaus/optimize/<id>/report.json` is a contained regular file (no link at the
+ *   leaf, capped) whose `runId` is `<id>`, whose `target` is the current spec's target,
+ *   and whose `specPath` is an absolute path that resolves (realpath) to the same file
+ *   as the spec being proposed;
  * - its patches (`patches.json`, else `patch.json`) are read the same way, and each one
  *   passes `validatePatch` (the target's `OPTIMIZABLE_PATHS`, the refused leaves, the
  *   target match) against the spec as the earlier patches left it, before it is applied.
+ *   `validatePatch` is the boundary: only a patch it admits is applied.
  *
  * Any refusal throws a one-line `Error` and no patch is applied, so the caller files
  * nothing.
  */
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { parseSpec } from "@crewhaus/spec";
 import { type SpecPatch, applySpecPatch, validatePatch } from "@crewhaus/spec-patch";
 import { openForReadSync } from "@crewhaus/tool-safety/fs";
@@ -48,10 +50,21 @@ function parseJson(text: string, what: string, label: string): unknown {
   }
 }
 
+/** Whether `recorded` is an absolute path that resolves to the same file as `spec`. */
+function namesSpec(recorded: unknown, spec: string): boolean {
+  if (typeof recorded !== "string" || !isAbsolute(recorded)) return false;
+  try {
+    return realpathSync.native(recorded) === realpathSync.native(spec);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The spec at `specRel` (relative to `harnessDir`) with the patches of optimize run
- * `runId` applied, in order. Throws when the run is not one the CLI recorded for this
- * spec's target, or when any patch is not one the optimizer may make.
+ * `runId` applied, in order. Throws unless the run directory's report names that run,
+ * this spec (its `specPath` resolves to the same file) and the spec's target, and unless
+ * every patch passes `validatePatch`, so only patches the optimizer may make are applied.
  */
 export function readOptimizeCandidate(
   harnessDir: string,
@@ -62,7 +75,8 @@ export function readOptimizeCandidate(
   const notRecorded = `${label}: no optimize run ${runId} recorded under .crewhaus/optimize`;
   if (!OPTIMIZE_RUN_ID.test(runId)) throw new Error(notRecorded);
   const root = join(harnessDir, ".crewhaus", "optimize");
-  const yaml = readFileSync(join(harnessDir, specRel), "utf8");
+  const specFile = join(harnessDir, specRel);
+  const yaml = readFileSync(specFile, "utf8");
   const target = parseSpec(yaml).target;
 
   const report = readRunFile(
@@ -77,7 +91,8 @@ export function readOptimizeCandidate(
     fields === null ||
     typeof fields !== "object" ||
     (fields as { runId?: unknown }).runId !== runId ||
-    (fields as { target?: unknown }).target !== target
+    (fields as { target?: unknown }).target !== target ||
+    !namesSpec((fields as { specPath?: unknown }).specPath, specFile)
   ) {
     throw new Error(notRecorded);
   }

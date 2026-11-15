@@ -9,8 +9,11 @@ import type { PluginGrantSet } from "@crewhaus/control-contract";
 import { outcomeOf } from "@crewhaus/control-service";
 import {
   type GrantOutcome,
+  type GrantableHarness,
   type PluginGrantInput,
   type PluginGrants,
+  type PluginStillLoaded,
+  asksOf,
   expectHolds,
   grantPlugin,
   grantProblem,
@@ -19,9 +22,11 @@ import {
   readPluginGrants,
   reviewVerbOf,
   revokePlugin,
+  servedOf,
   standingFrom,
+  stillLoadedBy,
 } from "../plugin-grants";
-import { type PluginRow, readPluginInventory } from "../plugins";
+import { type PluginRow, type PluginRowBase, readPluginInventory } from "../plugins";
 import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { acceptedAnswer, submitCommand } from "./submit";
@@ -57,8 +62,35 @@ function pluginOf(ctx: V1Context, grants: PluginGrants): PluginRow {
   return row;
 }
 
-function harnessesOf(ctx: V1Context) {
+function harnessesOf(ctx: {
+  readonly deps: Pick<V1Context["deps"], "registry">;
+}): GrantableHarness[] {
   return ctx.deps.registry.list().map((entry) => ({ id: entry.id, dir: entry.dir }));
+}
+
+/** What the plugin-grant answers read from a request: the registry, the Hangar root, the caller. */
+export type LoadedByContext = {
+  readonly deps: Pick<V1Context["deps"], "registry" | "hangarRoot">;
+  readonly access: Pick<V1Context["access"], "canRead">;
+};
+
+/** The registered harnesses this caller may read: the only ones a grant answer reads or names. */
+export function visibleHarnessesOf(ctx: LoadedByContext): GrantableHarness[] {
+  return harnessesOf(ctx).filter((h) => ctx.access.canRead(h.id));
+}
+
+/** The harnesses this caller may read whose crewhaus.yaml loads `row` beyond `served`. */
+export function stillLoadedFor(
+  ctx: LoadedByContext,
+  row: PluginRowBase,
+  served: PluginGrantSet,
+): PluginStillLoaded[] {
+  return stillLoadedBy(row, served, visibleHarnessesOf(ctx), ctx.deps.hangarRoot);
+}
+
+/** The same list read now, for an answer whose effect ran on an earlier request. */
+function stillLoadedNow(ctx: V1Context, row: PluginRowBase): readonly PluginStillLoaded[] {
+  return stillLoadedFor(ctx, row, servedOf(liveGrantOf(grantsOf(ctx), row.name), asksOf(row)));
 }
 
 function currentOf(grants: PluginGrants, plugin: string) {
@@ -166,6 +198,7 @@ const grant: V1Handler = async (ctx) => {
       const outcome = await grantPlugin(ctx.deps.hangarRoot, {
         row,
         grant: input,
+        loadedBy: { row, harnesses: visibleHarnessesOf(ctx) },
         by: receipt.actor,
         cmd: receipt.id,
         now: ctx.deps.now,
@@ -177,10 +210,13 @@ const grant: V1Handler = async (ctx) => {
   const refused =
     outcome === undefined ? undefined : refusalAfter(row.name, outcome, submitted.receipt);
   if (refused !== undefined) throw refused;
-  return acceptedAnswer(
-    submitted,
-    outcome?.ok === true ? { grant: { id: outcome.id, gen: outcome.gen } } : {},
-  );
+  if (outcome?.ok === true) {
+    return acceptedAnswer(submitted, {
+      grant: { id: outcome.id, gen: outcome.gen },
+      stillLoadedBy: outcome.stillLoadedBy ?? [],
+    });
+  }
+  return acceptedAnswer(submitted, { stillLoadedBy: stillLoadedNow(ctx, row) });
 };
 
 const revoke: V1Handler = async (ctx) => {
@@ -192,6 +228,7 @@ const revoke: V1Handler = async (ctx) => {
     effect: async (receipt) => {
       const outcome = await revokePlugin(ctx.deps.hangarRoot, {
         plugin: row.name,
+        loadedBy: { row, harnesses: visibleHarnessesOf(ctx) },
         by: receipt.actor,
         cmd: receipt.id,
         now: ctx.deps.now,
@@ -203,7 +240,9 @@ const revoke: V1Handler = async (ctx) => {
   const refused =
     outcome === undefined ? undefined : refusalAfter(row.name, outcome, submitted.receipt);
   if (refused !== undefined) throw refused;
-  return acceptedAnswer(submitted);
+  return acceptedAnswer(submitted, {
+    stillLoadedBy: outcome?.ok === true ? (outcome.stillLoadedBy ?? []) : stillLoadedNow(ctx, row),
+  });
 };
 
 export const PLUGIN_HANDLERS: Readonly<Record<string, V1Handler>> = {

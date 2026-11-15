@@ -283,4 +283,57 @@ describe("retire's own steps", () => {
       { kind: "retire.registry", status: "skipped", note: "not registered" },
     ]);
   });
+
+  test("retire marks only the registry row of its own directory", async () => {
+    const s = setUp();
+    // A directory with no row of its own, given another harness's id: no row is archived.
+    const elsewhere = retireSteps({
+      harnessDir: tempDir("control-service-copy-"),
+      harnessId: s.row.id,
+      hangarRoot: s.hangarRoot,
+      receipt: s.receipt,
+      stop: false,
+      now: () => NOW,
+      registry: s.registry,
+    });
+    expect(await elsewhere.archiveRegistryRow()).toEqual({
+      step: "archiveRegistryRow",
+      ok: true,
+      detail: "not registered in Home",
+    });
+    expect(elsewhere.effects()).toEqual([
+      { kind: "retire.registry", status: "skipped", note: "not registered" },
+    ]);
+    expect(s.registry.get(s.row.id)?.archived).toBeUndefined();
+    // Its own row, matched by its directory, is archived.
+    expect(await s.steps.archiveRegistryRow()).toMatchObject({ ok: true });
+    expect(s.registry.get(s.row.id)?.archived?.cmd).toBe(s.receipt.id);
+  });
+
+  test("a directory's row that carries another id than the harness's own is left as it is", async () => {
+    const s = setUp();
+    const other = s.registry.upsert({
+      dir: tempDir("control-service-other-"),
+      specName: "other",
+      target: "channel",
+    });
+    const mismatched = retireSteps({
+      harnessDir: s.harness,
+      harnessId: other.id,
+      hangarRoot: s.hangarRoot,
+      receipt: s.receipt,
+      stop: false,
+      now: () => NOW,
+      registry: s.registry,
+    });
+    expect(await mismatched.archiveRegistryRow()).toMatchObject({
+      ok: true,
+      detail: "not registered in Home",
+    });
+    expect(mismatched.effects()).toEqual([
+      { kind: "retire.registry", status: "skipped", note: "not registered" },
+    ]);
+    expect(s.registry.get(s.row.id)?.archived).toBeUndefined();
+    expect(s.registry.get(other.id)?.archived).toBeUndefined();
+  });
 });

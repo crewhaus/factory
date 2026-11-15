@@ -5,12 +5,14 @@
  * no harness and no spec hash, is served with its harness filled in.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { openAccess, openDeviceRequests } from "@crewhaus/access-control";
 import { OPERATIONS, mintId, mintRunId } from "@crewhaus/control-contract";
 import { makeSeal } from "@crewhaus/control-contract/http";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import { casAppend, deploymentsLedger } from "@crewhaus/control-records";
 import { appendRunLedger, newRunId } from "@crewhaus/harness-supervisor";
+import { CREDENTIAL_FORM_WORDS } from "@crewhaus/spec-patch";
 import { type V1Home, v1Home } from "../__test__/v1-home";
 import {
   HOME_AREAS,
@@ -393,5 +395,38 @@ describe("every served operation answers its row's shape", () => {
       const ways = [served.has(op.id), op.id in V1_NOT_SERVED, SIGN_IN_OPERATIONS.includes(op.id)];
       expect(`${op.id} ${ways.filter(Boolean).length}`).toBe(`${op.id} 1`);
     }
+  });
+});
+
+describe("a standing rule made from a call that carries a credential", () => {
+  test("is refused with the form it takes, and the answer holds no value", async () => {
+    // Built at run time from random parts: no credential-shaped literal sits in the source.
+    const secret = randomBytes(6).toString("hex");
+    const command = `curl -u admin:${secret} https://x.test`;
+    const id = "appr_00000000000000c1";
+    const beta = await home.harness("beta", {
+      specName: "beta",
+      approvals: [
+        {
+          id,
+          toolName: "Bash",
+          inputHash: "hash-beta",
+          input: { command },
+          runId: "run_00000000000000c0",
+          sessionId: "sess_00000000000000cc",
+          surface: "daemon",
+          createdAt: STAMP,
+        },
+      ],
+    });
+    const res = await home.call("POST", `/api/v1/harnesses/${beta.id}/standing-rules`, {
+      body: { tool: "Bash", pattern: `Bash(${command})`, derivedFrom: id, reason: "other" },
+    });
+    expect(res.status).toBe(422);
+    const error = res.body["error"] as { reason?: string; message?: string };
+    expect(error.reason).toBe("carries-credential");
+    expect(String(error.message)).toContain(CREDENTIAL_FORM_WORDS["user-password"]);
+    expect(JSON.stringify(res.body).includes(secret)).toBe(false);
+    expect(schemaOf("errorEnvelope")?.safeParse(res.body).success).toBe(true);
   });
 });

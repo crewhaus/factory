@@ -2,13 +2,21 @@
  * Retiring through the API: a dry run hands back a nonce bound to this harness and this
  * caller; the real run needs the harness's typed name and that nonce, once; a live daemon
  * needs `stop: true`; and a step that fails stops the retirement there, so the harness is
- * neither recorded as retired nor archived in Home, and its receipt says it failed.
+ * neither recorded as retired nor archived in Home, and its receipt says it failed. Before
+ * it acts, a retire settles the harness's unfinished commands, so its disable is the latest
+ * word on the harness.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
-import { foldStates } from "@crewhaus/control-records";
-import { LIFECYCLE_FILE, workspaceCommandsLedger } from "@crewhaus/control-service";
+import { mintId } from "@crewhaus/control-contract";
+import { append, assertRunnable, foldStates, readOperatorRecord } from "@crewhaus/control-records";
+import {
+  LIFECYCLE_FILE,
+  commandsLedgerOf,
+  workspaceCommandsLedger,
+} from "@crewhaus/control-service";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import { type V1Home, v1Home } from "../__test__/v1-home";
 import type { ProcessLayer } from "../process";
@@ -184,6 +192,52 @@ describe("retiring through the API", () => {
     const receipts = retireReceipts();
     expect(receipts).toHaveLength(before + 1);
     expect(receipts.at(-1)?.["state"]).toBe("failed");
+  });
+
+  test("a retire settles the harness's unfinished commands first, and its disable stands", async () => {
+    const h = await home.harness("stale");
+    // An enable a Home whose process is gone accepted an hour ago and never finished.
+    const enable = mintId("cmd");
+    const acceptedAt = new Date(Date.now() - 3_600_000).toISOString();
+    const planted = append(commandsLedgerOf(h.dir), {
+      v: 1,
+      id: enable,
+      kind: "controls.enable",
+      target: `home/harness/${h.id}`,
+      actor: home.owner,
+      via: "api",
+      fingerprint: "f".repeat(64),
+      state: "accepted",
+      acceptedAt,
+      executor: { pid: 2_147_483_000, startedAt: acceptedAt, host: hostname(), head: "server" },
+      effects: [],
+      retry: { retryable: true, safety: "idempotent" },
+    });
+    if (!planted.ok) throw new Error(planted.reason);
+    const nonce = await plan(h.id);
+    const res = await home.call("POST", path(h.id), {
+      body: { dryRun: false, confirmName: "stale", nonce },
+    });
+    expect(res.status).toBe(200);
+    const receipt = res.body["receipt"] as Record<string, unknown>;
+    expect(receipt["state"]).toBe("succeeded");
+    const enableState = () => {
+      const fold = foldStates(commandsLedgerOf(h.dir));
+      if (!fold.ok) throw new Error(fold.reason);
+      return fold.objects.get(enable)?.state;
+    };
+    // Settled before the retire acted: run again, then overtaken by the retire's disable.
+    expect(enableState()).toBe("succeeded");
+    const deployment = () => {
+      const read = readOperatorRecord.refresh(h.dir);
+      return read.state === "present" ? read.record.deployment : undefined;
+    };
+    expect(deployment()).toMatchObject({ disabled: true, cmd: receipt["id"] });
+    await home.t.server.controlService.commands.recover({ harness: h.dir });
+    expect(deployment()).toMatchObject({ disabled: true, cmd: receipt["id"] });
+    const verdict = assertRunnable(h.dir, { mode: "start", read: readOperatorRecord.refresh });
+    expect(verdict.ok).toBe(false);
+    expect(!verdict.ok && verdict.exitName).toBe("disabled");
   });
 
   test("every step done: recorded as retired and archived in Home", async () => {

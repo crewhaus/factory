@@ -256,6 +256,11 @@ these on: they reach every harness that uses what each one names.
   when its `specHash` matches the version's content. The refusal prints the
   value to record.
 
+- **`--check-pr` takes as a witness only a proposal PR that names the
+  candidate's exact spec revision.** `crewhaus propose` writes the revision
+  into the PR it opens, as a `Spec revision:` line. A proposal PR opened
+  before this release names none, so open it again with `crewhaus propose`.
+
 - **A supervised start takes loader and interpreter settings, `PATH` among
   them, only from the environment it was started with,** never from a harness's
   env files; `crewhaus harness show` lists any it left out. If a harness set
@@ -395,6 +400,13 @@ these on: they reach every harness that uses what each one names.
   the value, so `--apply` never writes it to `.crewhaus/settings.json`. An
   `alwaysAsk` for recurring denials is still proposed, for the whole tool. A
   rule names a value of at most 8192 characters.
+- **`crewhaus permissions suggest` and the `PermissionsSuggest` tool show an
+  existing settings rule that holds a credential without its pattern.** The
+  diff prints `<type> <Tool>(… holds a credential)` for it, or
+  `<type> (… holds a credential)` when the text before its argument is not a
+  plain tool name. `--json` and the tool return `merged: null` with a
+  `withheldRules` count. `--apply` keeps the rule in `.crewhaus/settings.json`
+  unchanged.
 - **A managed daemon records each run before its turn starts.** `runs.create` and
   `runs.continue` write content-free rows to `.crewhaus/run/control/runs/` with a
   canonical run id (`run_` and 26 characters) and the tenant: `running` before
@@ -629,6 +641,12 @@ these on: they reach every harness that uses what each one names.
   The tarball is readable only by its owner. `crewhaus retire` also leaves them
   out of the state it keeps in its `--archive` directory.
 
+- **The `HarnessRetire` tool leaves a harness's run tokens out of the state it
+  keeps in its archive**, as `crewhaus retire` does:
+  `.crewhaus/run/control-token`, `.crewhaus/run/gateway-jwt-secret` and
+  `.crewhaus/run/mcp-token`, which a daemon makes again at start. Its answer
+  lists them as `runTokensLeftOut`.
+
 - **A Slack click decides an approval only for a linked member whose role can
   decide it.** An Approve, Always allow or Deny click on a channel daemon's card
   counts once the clicker's Slack account is linked (`crewhaus access link
@@ -740,6 +758,13 @@ these on: they reach every harness that uses what each one names.
   daemon's handler. It is reserved for the runs Home starts on a managed
   daemon, so a deployment that issued tokens for a tenant named `home` issues
   them under another id.
+
+- **A harness's Panes tab lists only the plugins waiting to add a tab or
+  observer there.** `GET /api/h/:id/panes` lists in `waiting` an installed
+  plugin that declares a pane or a run observer, asks to see that harness, and
+  is not allowed there yet. Only a caller who can read Settings › Plugins
+  (`home.read`) gets the names; any other caller gets `waiting: []` and
+  `waitingCount`.
 
 ## [0.8.2] - 2026-11-12
 

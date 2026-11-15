@@ -2531,3 +2531,37 @@ describe("the effective rows of a parsed spec", () => {
     expect(rows.some((r) => r.path.includes("polluted"))).toBe(false);
   });
 });
+
+describe("the setting names the editor treats as credentials", () => {
+  test("the schema read names every credential-named setting, through the masker", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "credential-names");
+      const id = await register(t, dir);
+      const schema = await t.api(`/api/h/${id}/spec/schema`);
+      expect(schema.status).toBe(200);
+      const names = schema.body["credentialNames"] as string[];
+      expect(Array.isArray(names)).toBe(true);
+      expect(names).toContain("api_key");
+      expect(names.includes("name")).toBe(false);
+      expect(names.includes("model")).toBe(false);
+      expect([...names].sort()).toEqual(names);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a harness with no spec names none", async () => {
+    const dir = makeFixtureHarness(join(tmpdir(), `spec-names-${process.pid}-${Date.now()}`), {
+      noSpec: true,
+    });
+    const view = await specSchemaView({
+      entry: null,
+      harnessDir: dir,
+      adopted: false,
+      contain: (segments) => join(dir, ...segments),
+    });
+    expect(view["credentialNames"]).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});

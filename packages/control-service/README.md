@@ -86,6 +86,7 @@ the next touch. A claim whose receipt never landed is completed from the claim o
 |---|---|
 | a job's receipt | the job queue moves it; Home settles one no job row names as `unknown` |
 | a control a later control of the same family on the same harness overtook | `unknown`: superseded by a later command, never run |
+| a disable or enable in a harness's ledger after which another command recorded a disable in the operator record | `unknown`: superseded by a later command, never run |
 | a daemon start accepted before the machine booted | `unknown`: not started, the machine restarted |
 | `accepted`, safe to repeat | run again |
 | `accepted`, not safe to repeat | reconcile: done → `succeeded`, not done → run again, else `unknown` |
@@ -97,7 +98,11 @@ A control runs again only while it is the latest of its family on the harness: o
 started, stopped or drained the daemon since, re-running an older daemon command would undo theirs.
 The families are daemon (`controls.start`, `stop`, `restart`, `drain`), intake (`controls.pause`,
 `resume`) and deployment (`controls.disable`, `enable`), each on its own; `controls.retire` is in
-none, and has no executor, so it is never run again.
+none, and has no executor, so it is never run again. The harness's operator record counts as a later
+control of the deployment family: a disable another command recorded there at or after a disable or
+enable was accepted overtakes it. A retire stamps that block with its own receipt's id, so a retire's
+disable outranks every earlier disable or enable on that harness that never finished. A recorded
+enable overtakes nothing this way; the family rule alone decides what it outranks.
 
 It answers `{redispatched, reconciled, unknown}`, and `runsInterrupted` when a run sweep closed a
 run: the core's sweep marks a chat message a channel daemon accepted, and whose process died before
@@ -141,7 +146,8 @@ running, for the recovery after a reboot; both heads lend it to their supervisor
 and unspent grants with reason `retired`, revoke standing rules, run every area's retire revoker, then,
 after the archive, disable the harness again in its live directory (the archive took its operator
 record), append `harness.retired` to `<hangarRoot>/control/lifecycle.jsonl` and mark the registry row
-archived. An area registers a revoker in `AreaRuntime.retireRevokers`;
+of its own directory archived: the row whose directory is the harness's, by its spelling or its real
+location, and only when that row carries the harness's own id. An area registers a revoker in `AreaRuntime.retireRevokers`;
 `retireRevokers(areas)` lists them in composition order, and `wireControl` refuses a name registered
 twice. `controls.retire`'s reconciler reads the lifecycle record.
 

@@ -17,9 +17,18 @@
  *   a path of edges to it, in either document): the ordered edges leaving one
  *   of those nodes, the edges into the judge node, `entry` when it names one
  *   of those nodes, and the `parallel` groups that hold one.
- * - `evaluation` may raise `threshold`, make `on_fail` stricter
- *   (`note` < `retry` = `escalate` < `halt`), lower `max_retries` and clear
- *   `allow_self_judge`. Any change to a `grader` field is a loosening.
+ * - `evaluation` may raise `threshold`, lower `max_retries` and clear
+ *   `allow_self_judge`. `on_fail` may move from `note` to `retry`, `escalate`
+ *   or `halt`, and from `retry` or `escalate` to `halt`; a move between
+ *   `retry` and `escalate` is the owner's. Any change to a `grader` field is a
+ *   loosening.
+ * - While a protected `evaluation` or `provability` block's `on_fail` is
+ *   `escalate`, the escalations a turn may make are part of its bar: they may
+ *   rise, and any fall is a loosening, keyed
+ *   `agent.model_pool.strategy.max_escalations`. A turn makes
+ *   `agent.model_pool.strategy.max_escalations` of them (1 when absent), and
+ *   none without `agent.model_pool`, so removing the pool or its strategy
+ *   counts as that change too.
  * - `provability` may raise `level` (`off` < `cited` < `grounded` < `checked`
  *   < `proven`), `threshold` and `grounded.coverage`, and lower
  *   `grounded.window_tokens`. Any other change is a loosening.
@@ -40,9 +49,9 @@
  * {@link protectedBarChanges} reads two whole documents, so a value set at a
  * block, a whole `steps` list or one edit among many is judged the same way.
  * It names every loosening in a fixed order: evaluation, provability, the
- * workflow steps in document order, then the graph nodes in map order, and
- * within a block the order above. A bar that is not protected stays tunable
- * in both directions.
+ * escalation budget, the workflow steps in document order, then the graph
+ * nodes in map order, and within a block the order above. A bar that is not
+ * protected stays tunable in both directions.
  *
  * Workflow steps pair by name and occurrence: the k-th step named X before is
  * judged against the k-th step named X after, keyed `steps.X.judge` when X is
@@ -74,20 +83,33 @@ const DEFAULTS = {
   evaluationOnFail: "retry",
 } as const;
 
-/** Each ladder, loosest first: a value moves only to an equal or later rank. */
-const JUDGE_ON_FAIL: Readonly<Record<string, number>> = { continue: 0, retry_previous: 1, halt: 2 };
-const EVALUATION_ON_FAIL: Readonly<Record<string, number>> = {
-  note: 0,
-  retry: 1,
-  escalate: 1,
-  halt: 2,
+/**
+ * How a value may move without its owner: a ladder, loosest first, where a value moves
+ * only to an equal or later rank, or a partial order listing, for each value, the values
+ * it may move to (any move it does not list is the owner's).
+ */
+type Ladder =
+  | { readonly rank: Readonly<Record<string, number>> }
+  | { readonly tightensTo: Readonly<Record<string, ReadonlyArray<string>>> };
+
+const JUDGE_ON_FAIL: Ladder = { rank: { continue: 0, retry_previous: 1, halt: 2 } };
+/** `retry` and `escalate` are incomparable: either one only moves on to `halt`. */
+const EVALUATION_ON_FAIL: Ladder = {
+  tightensTo: {
+    note: ["retry", "escalate", "halt"],
+    retry: ["halt"],
+    escalate: ["halt"],
+    halt: [],
+  },
 };
-const PROVABILITY_LEVEL: Readonly<Record<string, number>> = {
-  off: 0,
-  cited: 1,
-  grounded: 2,
-  checked: 3,
-  proven: 4,
+const PROVABILITY_LEVEL: Ladder = {
+  rank: {
+    off: 0,
+    cited: 1,
+    grounded: 2,
+    checked: 3,
+    proven: 4,
+  },
 };
 
 /** The judge gate keys that change only with the owner, in the order they are named. */
@@ -171,24 +193,34 @@ function onlyFalls(
     : undefined;
 }
 
-/** A value on a ladder that may only move to an equal or later rank. */
+/** Whether `ladder` lets a value move from `before` to `after` without its owner. */
+function tightens(ladder: Ladder, before: unknown, after: unknown): boolean {
+  if (typeof before !== "string" || typeof after !== "string") return false;
+  if ("rank" in ladder) {
+    const rankBefore = Object.hasOwn(ladder.rank, before) ? ladder.rank[before] : undefined;
+    const rankAfter = Object.hasOwn(ladder.rank, after) ? ladder.rank[after] : undefined;
+    return rankBefore !== undefined && rankAfter !== undefined && rankAfter >= rankBefore;
+  }
+  if (!Object.hasOwn(ladder.tightensTo, before) || !Object.hasOwn(ladder.tightensTo, after)) {
+    return false;
+  }
+  return (ladder.tightensTo[before] ?? []).includes(after);
+}
+
+/** A value that may move without its owner only as its ladder allows. */
 function onlyStricter(
   key: string,
   was: Doc,
   now: Doc,
   field: string,
-  ladder: Readonly<Record<string, number>>,
+  ladder: Ladder,
   fallback: string,
   moves = "grows stricter",
 ): ProtectedBarChange | undefined {
   const before = was[field] ?? fallback;
   const after = now[field] ?? fallback;
   if (same(before, after)) return undefined;
-  const rankBefore = typeof before === "string" ? ladder[before] : undefined;
-  const rankAfter = typeof after === "string" ? ladder[after] : undefined;
-  if (rankBefore !== undefined && rankAfter !== undefined && rankAfter >= rankBefore) {
-    return undefined;
-  }
+  if (tightens(ladder, before, after)) return undefined;
   return {
     key,
     reason: `a protected ${key} only ${moves} (${String(before)} → ${String(after)})`,
@@ -498,6 +530,39 @@ function judgeWiringChange(name: string, id: string, was: Doc, now: Doc): Protec
 }
 
 /**
+ * The escalations a turn of `doc` may make: none without `agent.model_pool`,
+ * else its `strategy.max_escalations` (1 when absent).
+ */
+function escalationBudget(doc: Doc): number {
+  const pool = plain(plain(doc["agent"])?.["model_pool"]);
+  if (pool === undefined) return 0;
+  const cap = plain(pool["strategy"])?.["max_escalations"];
+  return typeof cap === "number" && Number.isFinite(cap) ? Math.max(0, Math.floor(cap)) : 1;
+}
+
+const ESCALATIONS_KEY = "agent.model_pool.strategy.max_escalations";
+
+/**
+ * The escalation budget's fall, when a protected block (each of `escalating`,
+ * named for the reason) escalates on a failing verdict after the change.
+ */
+function escalationBudgetChange(
+  escalating: ReadonlyArray<string>,
+  was: Doc,
+  now: Doc,
+): ProtectedBarChange | undefined {
+  if (escalating.length === 0) return undefined;
+  const before = escalationBudget(was);
+  const after = escalationBudget(now);
+  return after < before
+    ? {
+        key: ESCALATIONS_KEY,
+        reason: `the escalations a protected ${escalating.join(" and ")} with on_fail: escalate makes only rise (${before} → ${after})`,
+      }
+    : undefined;
+}
+
+/**
  * Every way `after` loosens a bar `before` protects, in the order the module
  * docblock gives; empty when none does. Both are parsed spec documents (schema
  * defaults applied or not, alike on both sides).
@@ -525,6 +590,19 @@ export function protectedBarChanges(before: unknown, after: unknown): ProtectedB
       ),
     );
   }
+
+  // A protected block that escalates after the change keeps its escalations.
+  const escalating = [
+    ...(evaluation?.["protected"] === true && plain(now["evaluation"])?.["on_fail"] === "escalate"
+      ? ["evaluation"]
+      : []),
+    ...(provability?.["protected"] === true &&
+    provabilityBlock(now["provability"])?.["on_fail"] === "escalate"
+      ? ["provability"]
+      : []),
+  ];
+  const budget = escalationBudgetChange(escalating, was, now);
+  if (budget !== undefined) out.push(budget);
 
   // Judge gates: workflow steps by name and occurrence, graph nodes by key.
   const stepsBefore = Array.isArray(was["steps"]) ? (was["steps"] as unknown[]).map(plain) : [];

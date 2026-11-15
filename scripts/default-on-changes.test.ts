@@ -2822,6 +2822,35 @@ describe("the release notes name what saved-is-not-deployed changes for every ha
     }
   });
 
+  test("--check-pr counts only a proposal PR that names the candidate's spec revision", async () => {
+    const { readPrCheckViaGh } = await import("../apps/cli/src/pr-witness");
+    const { specRevision } = await import("../packages/ir/src/policy");
+    const revision = specRevision("name: s\ntarget: cli\n");
+    const listed = (body: string) => () => ({
+      status: 0,
+      stdout: JSON.stringify([
+        {
+          number: 1,
+          url: "https://example.invalid/pr/1",
+          headRefName: "propose/chg_1",
+          title: "propose: s v1 (manual)",
+          body,
+          isCrossRepository: false,
+          reviewDecision: "APPROVED",
+          statusCheckRollup: [{ conclusion: "SUCCESS" }],
+        },
+      ]),
+    });
+    const query = { specName: "s", env: "prod", version: "v1", specHash: revision };
+    expect(readPrCheckViaGh(query, listed("Proposed change.\n")).conclusion).toBe("none");
+    expect(
+      readPrCheckViaGh(query, listed(`Proposed change.\nSpec revision: ${revision}\n`)).conclusion,
+    ).toBe("success");
+    const bullet = bulletFor("`--check-pr`");
+    expect(bullet).toContain("spec revision");
+    expect(bullet).toContain("`crewhaus propose`");
+  });
+
   test("loader settings come only from the manager's environment, PATH among them", () => {
     const bullet = bulletFor("A supervised start takes loader and interpreter settings");
     expect(bullet).toContain("`PATH`");
@@ -4120,6 +4149,57 @@ describe("the release notes name what permission suggestions and state backups l
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("permissions suggest shows a settings rule that holds a credential without its pattern", async () => {
+    const { applyToSettingsRoot, diffForDisplay, diffPermissions, formatSettingsDiff } =
+      await import("../packages/harness-advice/src/permissions-suggest");
+    // Built at runtime from parts, so no credential-shaped literal is committed.
+    const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+    const pattern = `Bash(curl -H "Authorization: Bearer ${token}" https://x.test)`;
+    const diff = diffPermissions([{ type: "alwaysAllow", pattern }], []);
+    const lines = formatSettingsDiff(diff);
+    expect(lines).toContain("    alwaysAllow Bash(… holds a credential)");
+    expect(lines.join("\n").includes(token)).toBe(false);
+    const view = diffForDisplay(diff);
+    expect(view.merged).toBeNull();
+    expect(view.withheldRules).toBe(1);
+    const written = applyToSettingsRoot({}, diff.merged) as { permissions: { rules: unknown[] } };
+    expect(written.permissions.rules).toEqual([{ type: "alwaysAllow", pattern }]);
+
+    const bullet = bulletFor("existing settings rule that holds a credential").replace(/\s+/g, " ");
+    for (const word of [
+      "`crewhaus permissions suggest`",
+      "`PermissionsSuggest`",
+      "`--apply`",
+      "holds a credential",
+    ]) {
+      expect(bullet).toContain(word);
+    }
+  });
+
+  test("the HarnessRetire tool removes the run tokens from the state it keeps in its archive", async () => {
+    const { RUN_TOKEN_FILES } = await import("../packages/harness-lifecycle/src/index");
+    expect([...RUN_TOKEN_FILES]).toEqual([
+      "run/control-token",
+      "run/gateway-jwt-secret",
+      "run/mcp-token",
+    ]);
+    const tool = readFileSync(join(ROOT, "packages", "tool-lifecycle", "src", "index.ts"), "utf8");
+    const calls = tool.split("removeRunTokens(archivedStateDir)");
+    expect(calls).toHaveLength(2);
+    const verifyAt = tool.indexOf("verifyAgainst(");
+    expect(verifyAt).toBeGreaterThan(-1);
+    expect(tool.indexOf("removeRunTokens(archivedStateDir)")).toBeGreaterThan(verifyAt);
+    const imports = tool.slice(0, tool.indexOf('} from "@crewhaus/harness-lifecycle";'));
+    expect(imports.slice(imports.lastIndexOf("import {"))).toContain("RUN_TOKEN_FILES,");
+
+    const bullet = bulletFor("The `HarnessRetire` tool leaves a harness's run tokens").replace(
+      /\s+/g,
+      " ",
+    );
+    expect(bullet).toContain("`HarnessRetire`");
+    for (const rel of RUN_TOKEN_FILES) expect(bullet).toContain(`\`.crewhaus/${rel}\``);
   });
 });
 
@@ -5799,5 +5879,27 @@ describe("the release notes name the tenant ids a managed daemon reserves", () =
         b.includes("refuses a client token whose `tenant_id`"),
       ) ?? "";
     expect(bullet).toContain("any letter case");
+  });
+});
+
+describe("the plugins a harness's Panes tab names as waiting", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("the panes route names waiting plugins only to a caller who can read Settings › Plugins", () => {
+    const source = readFileSync(join(ROOT, "packages/hangar-server/src/server.ts"), "utf8");
+    const start = source.indexOf('if (head === "panes" && tail.length === 0');
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf("throw new HttpError(404", start);
+    expect(end).toBeGreaterThan(-1);
+    const route = source.slice(start, end);
+    for (const needle of ["waitingOn(", 'requestAllows("home.read")', "waitingCount"]) {
+      const at = route.indexOf(needle);
+      expect(`${needle}: ${at > -1}`).toBe(`${needle}: true`);
+    }
+    const bullet = bulletFor("A harness's Panes tab lists only");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("waitingCount");
+    expect(bullet).toContain("home.read");
   });
 });

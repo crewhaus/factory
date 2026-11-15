@@ -1897,6 +1897,36 @@ export function narrowSchema(
 /** What a schema read needs of a request: the harness, its directory, whether it runs its own code here, and containment. */
 export type SpecView = Pick<M3Context, "entry" | "harnessDir" | "adopted" | "contain">;
 
+/** How deep {@link credentialNamesOf} walks a schema. */
+const CREDENTIAL_NAMES_DEPTH = 64;
+
+/**
+ * The setting names the editor keeps write-only: every property name under any
+ * `properties` object of `schema`, and every segment of the effective rows, that
+ * {@link isCredentialKey} holds to be a credential's name. Sorted and distinct.
+ */
+function credentialNamesOf(schema: unknown, effective: readonly EffectiveRow[]): string[] {
+  const names = new Set<string>();
+  const walk = (node: unknown, depth: number): void => {
+    if (depth > CREDENTIAL_NAMES_DEPTH || typeof node !== "object" || node === null) return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item, depth + 1);
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key === "properties" && typeof value === "object" && value !== null) {
+        for (const name of Object.keys(value)) if (isCredentialKey(name)) names.add(name);
+      }
+      walk(value, depth + 1);
+    }
+  };
+  walk(schema, 0);
+  for (const row of effective) {
+    for (const segment of row.segments) if (isCredentialKey(segment)) names.add(segment);
+  }
+  return [...names].sort();
+}
+
 /**
  * The schema the structured editor renders, plus the effective configuration.
  *
@@ -1935,6 +1965,7 @@ export async function specSchemaView(view: SpecView): Promise<Record<string, unk
       hash: file.hash,
       readOnly: null,
       truncated: false,
+      credentialNames: [],
     };
   }
   let schema: Record<string, unknown> | null = null;
@@ -1991,6 +2022,8 @@ export async function specSchemaView(view: SpecView): Promise<Record<string, unk
     /** This VIEW may show the head of an over-cap spec; the write path
      *  refuses it. The flag is what stops the two reading as the same file. */
     truncated: file.truncated,
+    /** The setting names the editor treats as credentials: never held, never offered back. */
+    credentialNames: credentialNamesOf(schema, effective),
   };
 }
 

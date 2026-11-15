@@ -143,7 +143,7 @@ async function checkedRoots(harness: string, spec: string | undefined): Promise<
   return seen[0] ?? [];
 }
 
-function spec(tools: string[], servers: Record<string, string>): string {
+function spec(tools: string[], servers: Record<string, string>, toolConfig?: string[]): string {
   const lines = [
     "name: shop",
     "target: cli",
@@ -159,6 +159,7 @@ function spec(tools: string[], servers: Record<string, string>): string {
       lines.push(`  ${name}:`, "    transport: stdio", `    command: ${servers[name]}`);
     }
   }
+  if (toolConfig !== undefined) lines.push("tool_config:", ...toolConfig.map((l) => `  ${l}`));
   return `${lines.join("\n")}\n`;
 }
 
@@ -183,6 +184,31 @@ describe("addedToolSurface", () => {
 
   test("a tool the base does not name is named", () => {
     expect(addedToolSurface(base, spec(["read", "write"], { fs: "npx" }))).toEqual(["write"]);
+  });
+
+  const webFetch = (domain: string) => ["webFetch:", "  allowed_domains:", `    - ${domain}`];
+
+  test("a tool configured differently is named", () => {
+    const before = spec(["read", "webFetch"], {}, webFetch("example.com"));
+    const after = spec(["read", "webFetch"], {}, webFetch("example.org"));
+    expect(addedToolSurface(before, after)).toEqual(["webFetch"]);
+  });
+
+  test("a tool config on one side only is named", () => {
+    const bare = spec(["read", "webFetch"], {});
+    const configured = spec(["read", "webFetch"], {}, webFetch("example.com"));
+    expect(addedToolSurface(bare, configured)).toEqual(["webFetch"]);
+    expect(addedToolSurface(configured, bare)).toEqual(["webFetch"]);
+  });
+
+  test("identical tool configs add nothing", () => {
+    const configured = spec(["read", "webFetch"], {}, webFetch("example.com"));
+    expect(addedToolSurface(configured, configured)).toEqual([]);
+  });
+
+  test("a new tool with its new config is named once", () => {
+    const after = spec(["read", "webFetch"], {}, webFetch("example.com"));
+    expect(addedToolSurface(spec(["read"], {}), after)).toEqual(["webFetch"]);
   });
 
   test("a spec that cannot be read answers that it cannot tell", () => {
