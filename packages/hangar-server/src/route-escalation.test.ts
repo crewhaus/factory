@@ -500,6 +500,61 @@ describe("spec writes that touch security or spending", () => {
       expect(specText(h)).toContain(written);
     }
   });
+
+  test("a protected evaluation's on_fail moves between retry and escalate only with the owner", async () => {
+    const h = await home();
+    const maintainer = await h.member("maintainer");
+    const path = join(h.dir, "crewhaus.yaml");
+    // `escalate` needs a model pool; the spec declares one and no cascade.
+    const pool = [
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: claude-haiku-4-5, tags: [cheap] }",
+      "      - { model: claude-opus-4-8, tags: [strong] }",
+      "",
+    ].join("\n");
+    const evaluated = (onFail: string): string =>
+      `${SPEC(5).replace("permissions:\n", `${pool}permissions:\n`)}evaluation:\n  grader: { type: llm_judge, criteria: answers briefly }\n  on_fail: ${onFail}\n  protected: true\n`;
+    writeFileSync(path, evaluated("retry"));
+    const before = specText(h);
+    const named = {
+      edits: [{ path: "evaluation.on_fail", value: "escalate" }],
+      confirmName: "escalation-fixture",
+      expectedRev: specRev(before),
+    };
+    const { confirmName: _name, ...unnamed } = named;
+    // A maintainer: 403 naming the permission, with or without the typed name.
+    for (const body of [named, unnamed]) {
+      const refused = await call(h, maintainer.headers, "PUT", `/api/h/${h.id}/spec`, body);
+      expect(refused.status).toBe(403);
+      expect([
+        refused.body["code"],
+        refused.body["reason"],
+        refused.body["needs"],
+        refused.body["role"],
+      ]).toEqual(["forbidden", "permission", "h.spec.edit.security", "maintainer"]);
+      expect(refused.body["paths"]).toEqual(["evaluation.on_fail"]);
+      expect(specText(h)).toBe(before);
+    }
+    // The owner: asked for the typed name, then the write once it matches.
+    const asked = await call(h, h.owner, "PUT", `/api/h/${h.id}/spec`, unnamed);
+    expect(asked.status).toBe(409);
+    expect(asked.body["needs"]).toBe("h.spec.edit.security");
+    expect(asked.body["paths"]).toContain("evaluation.on_fail");
+    expect(specText(h)).toBe(before);
+    const written = await call(h, h.owner, "PUT", `/api/h/${h.id}/spec`, named);
+    expect(written.status).toBe(200);
+    expect(specText(h)).toContain("on_fail: escalate");
+    // From note, escalate is stricter: a maintainer writes it.
+    writeFileSync(path, evaluated("note"));
+    const tighter = await call(h, maintainer.headers, "PUT", `/api/h/${h.id}/spec`, {
+      edits: [{ path: "evaluation.on_fail", value: "escalate" }],
+      confirmName: "escalation-fixture",
+      expectedRev: specRev(specText(h)),
+    });
+    expect(tighter.status).toBe(200);
+    expect(specText(h)).toContain("on_fail: escalate");
+  });
 });
 
 describe("handlers that escalate by what is asked", () => {

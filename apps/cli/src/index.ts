@@ -326,6 +326,7 @@ import {
   type PermissionSuggestion,
   aggregateAsks,
   applyToSettingsRoot,
+  diffForDisplay,
   diffPermissions,
   existingSettingsRules,
   formatSettingsDiff,
@@ -15755,7 +15756,7 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
           suggestions,
           rejected,
           skipped,
-          diff,
+          diff: diffForDisplay(diff),
           overrideCheck: {
             spec: overrideCheck.spec ?? null,
             ...(overrideCheck.unread !== undefined ? { unread: overrideCheck.unread } : {}),
@@ -20087,8 +20088,13 @@ async function enforceProtectedEnvGate(opts: {
     requireApproval: opts.args.flags["require-approval"] === true,
     ...(opts.args.flags["check-pr"] === true
       ? {
-          prCheck: () =>
-            readPrCheckViaGh({ specName: opts.name, env: opts.toEnv, version: opts.toVersion }),
+          prCheck: (specHash: string) =>
+            readPrCheckViaGh({
+              specName: opts.name,
+              env: opts.toEnv,
+              version: opts.toVersion,
+              specHash,
+            }),
         }
       : {}),
   });

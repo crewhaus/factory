@@ -322,8 +322,6 @@ import {
   storeFileRoots,
 } from "./state-roots";
 export { runSpecDirScope, runtimeStateRoots } from "./state-roots";
-/** Test seams of the API seed check, for a suite that drives a run entry from outside. */
-export { _resetInputOriginForTest, _setInputOriginClassifierForTest } from "./input-origin";
 import {
   type ServingModel,
   type ToolLimitVerdict,
@@ -5686,15 +5684,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     at?: HookAt,
   ): Promise<{ allowed: boolean; reason?: string; mutate?: Record<string, unknown> }> {
     if (hooks.length === 0) return { allowed: true };
+    let results: Awaited<ReturnType<typeof runHooks>>;
+    let decision: ReturnType<typeof aggregateDecisions>;
     try {
-      const results = await runHooks(event, payload, hooks, {
+      results = await runHooks(event, payload, hooks, {
         logger: runContext.logger,
         eventBus: bus,
         ...(at !== undefined ? { parentSpanId: at.span } : {}),
         ...(at?.toolUseId !== undefined ? { toolUseId: at.toolUseId } : {}),
       });
-      if (at !== undefined) await spans.hookVerdicts(at, event, results);
-      return aggregateDecisions(results);
+      decision = aggregateDecisions(results);
     } catch (err) {
       runContext.logger.warn("hook firing failed", {
         event,
@@ -5702,6 +5701,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
       return { allowed: true };
     }
+    // The decision is settled before verdicts are recorded; a recording failure is logged and never changes it.
+    if (at !== undefined) {
+      try {
+        await spans.hookVerdicts(at, event, results);
+      } catch (err) {
+        runContext.logger.warn("hook verdict recording failed", {
+          event,
+          error: (err as Error).message,
+        });
+      }
+    }
+    return decision;
   }
 
   // Feature #53 — auto-capture at teardown. Runs in the same finally where the

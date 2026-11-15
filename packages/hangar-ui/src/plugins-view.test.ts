@@ -9,12 +9,16 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import * as destinations from "../assets/js/destinations.js";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import { waitingNotice } from "../assets/js/views/panes.js";
 import {
+  LIMIT_SENTENCE,
   STATE_WORDS,
   grantBody,
   initialTicks,
   servesThisHarness,
   signatureWords,
+  stillLoadedLines,
   // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 } from "../assets/js/views/plugins.js";
 import { integrationsAssets } from "./embed/integrations";
@@ -102,9 +106,55 @@ describe("Settings › Plugins", () => {
     for (const banned of ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"]) {
       expect(SOURCE.includes(banned)).toBe(false);
     }
-    expect(SOURCE).toContain("They do not limit what its own code can do");
+    expect(LIMIT_SENTENCE).toBe(
+      "These choices decide what Home gives this plugin: tabs, run activity, reads and websites. Host tools are set in a harness's crewhaus.yaml when you choose Use in this harness, and Remove access does not change a harness that already loads it. A harness that loads it runs its code with that harness's own access.",
+    );
+    expect(SOURCE).toContain('legend: "Host tools it may be given in a harness"');
     for (const label of ["Allow selected", "Not now", "Remove access", "Use in this harness"]) {
       expect(SOURCE).toContain(`text: "${label}"`);
     }
+  });
+
+  test("the harnesses that still load a plugin are named by spec name, else by id", () => {
+    const harnesses = [{ id: "hrn_00000000000000a1", specName: "concierge" }];
+    expect(
+      stillLoadedLines(
+        [
+          { id: "hrn_00000000000000a1", tools: ["Bash"] },
+          { id: "hrn_00000000000000b2", tools: [] },
+          { id: "hrn_00000000000000c3", tools: null },
+        ],
+        harnesses,
+      ),
+    ).toEqual([
+      "concierge: host tools Bash",
+      "hrn_00000000000000b2: no host tools",
+      "hrn_00000000000000c3: its crewhaus.yaml could not be read",
+    ]);
+    expect(stillLoadedLines(undefined, harnesses)).toEqual([]);
+    expect(SOURCE).toContain(
+      "These harnesses still load it, because their crewhaus.yaml lists it:",
+    );
+    expect(SOURCE).toContain(
+      "Remove it from plugins: in each crewhaus.yaml, then rebuild and restart that harness.",
+    );
+  });
+
+  test("the panes notice names waiting plugins only when the answer carries their names", () => {
+    expect(waitingNotice({ waiting: ["notes-pane"], waitingCount: 1 })).toEqual({
+      title: "Waiting for your OK",
+      text: "notes-pane asks to add panels here.",
+      review: true,
+    });
+    const counted = waitingNotice({ waiting: [], waitingCount: 1 });
+    expect(counted).toEqual({
+      title: "Waiting for the owner's OK",
+      text: "A plugin asks to add panels here. The owner can allow it in Settings › Plugins.",
+      review: false,
+    });
+    expect(JSON.stringify(counted).includes("notes-pane")).toBe(false);
+    expect(waitingNotice({ waiting: [], waitingCount: 0 })).toBeNull();
+    // An answer without a count falls back to the names it carries.
+    expect(waitingNotice({ waiting: ["notes-pane"] })?.review).toBe(true);
   });
 });

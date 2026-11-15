@@ -9,6 +9,7 @@ import { appendFileSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "n
 import { join } from "node:path";
 import { openAccess } from "@crewhaus/access-control";
 import { decodeCursor, encodeCursor, mintId, mintRunId } from "@crewhaus/control-contract";
+import { makeSeal } from "@crewhaus/control-contract/http";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import {
   _setRollBytesForTest,
@@ -76,11 +77,11 @@ function parse(text: string): Frame[] {
 
 async function open(
   path: string,
-  opts: { secret?: string; headers?: Record<string, string> } = {},
+  opts: { secret?: string; headers?: Record<string, string>; on?: V1Home } = {},
 ): Promise<Feed> {
   // Not `fetchRaw`, whose own timeout signal would keep the connection open past `close`.
   const controller = new AbortController();
-  const res = await fetch(`${home.t.base}${path}`, {
+  const res = await fetch(`${(opts.on ?? home).t.base}${path}`, {
     headers: { ...bearer(opts.secret ?? home.session), ...(opts.headers ?? {}) },
     signal: controller.signal,
   });
@@ -663,6 +664,68 @@ describe("a stream ends its re-check, and closes when its caller loses access", 
     await feed.until(() => false, 1000);
     expect(feed.ended()).toBe(true);
   });
+
+  test("a member who loses h.read is closed with auth.revoked at the next batch, and is sent nothing written after", async () => {
+    const x = await home.harness("batch-x");
+    const member = await home.member("Bea", "viewer", { scope: `harness:${x.id}` });
+    const feed = await open(`/api/v1/harnesses/${x.id}/events`, { secret: member.secret });
+    expect(feed.status).toBe(200);
+    expect(await settled(() => home.t.server.openStreamChecks() > 0)).toBe(true);
+    const access = openAccess(home.t.hangarRoot);
+    const read = (await import("@crewhaus/access-control")).loadAccessSnapshot(home.t.hangarRoot);
+    if (read.state !== "present") throw new Error("no access records");
+    const grant = read.snapshot.grants.find(
+      (g) => g.principal === member.principal && g.scope === `harness:${x.id}`,
+    );
+    // Revoked through the library alone: no request reaches Home and no periodic check runs
+    // before the stream's own next batch decides.
+    const revoked = await access.revoke({ principal: home.owner }, grant?.id as string);
+    if (!revoked.ok) throw new Error(revoked.reason);
+    const run = mintRunId();
+    row(x.dir, run, "queued");
+    expect(await feed.until((f) => f.some((frame) => frame.event === "auth.revoked"))).toBe(true);
+    await feed.until(() => false, 1000);
+    expect(feed.ended()).toBe(true);
+    expect(events(feed.frames())).toEqual(["auth.revoked"]);
+    expect(JSON.stringify(feed.frames())).not.toContain(run);
+  });
+
+  test("a scoped token's run stream closes with auth.expired at the next batch past its end, and is sent nothing written after", async () => {
+    let clock = Date.now();
+    const own = await v1Home({
+      now: () => clock,
+      streamTimings: { pollMs: 10, heartbeatMs: 60_000 },
+    });
+    try {
+      const h = await own.harness("scoped-expiry");
+      const run = mintRunId();
+      row(h.dir, run, "running");
+      const service = await own.service("expiry-portal", [h.id], { contentRead: true });
+      const pair = await makeSeal();
+      const minted = await own.call("POST", "/api/v1/access/scoped-tokens", {
+        body: {
+          refs: [`${h.id}/run/${run}`],
+          acts: ["run.events.read"],
+          ttlSeconds: 300,
+          seal: pair.seal,
+        },
+        secret: service.secret,
+      });
+      expect(minted.status).toBe(200);
+      const token = await pair.open(minted.body["issued"], "access.scopedTokens.mint");
+      const feed = await open(`/api/v1/runs/${run}/events`, { secret: token, on: own });
+      expect(feed.status).toBe(200);
+      expect(await feed.until((f) => f.some((frame) => frame.event === "run.started"))).toBe(true);
+      clock += 600_000;
+      row(h.dir, run, "succeeded");
+      expect(await feed.until((f) => f.some((frame) => frame.event === "auth.expired"))).toBe(true);
+      await feed.until(() => false, 1000);
+      expect(feed.ended()).toBe(true);
+      expect(events(feed.frames())).toEqual(["run.started", "auth.expired"]);
+    } finally {
+      await own.t.stop();
+    }
+  }, 30_000); // a Home of its own, a service token and a stream; slow on a loaded runner
 
   test("a session that signs out closes its open stream with auth.revoked", async () => {
     const h = await home.harness("revoke-session");

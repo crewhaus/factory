@@ -15,13 +15,14 @@
  *      then disable the harness again in its live directory, so nothing starts it there;
  *   7. append `harness.retired` to Home's lifecycle record (`<hangarRoot>/control/
  *      lifecycle.jsonl`);
- *   8. mark the harness's registry row archived.
+ *   8. mark the registry row of the harness's own directory archived.
  *
  * Step 6 is the archive itself and the disable that follows it. Each step answers an outcome for the retirement log and
  * one receipt effect for the `controls.retire` receipt, which lives in Home's ledger: the
  * harness's own ledger moves into the archive with its state.
  */
-import { join } from "node:path";
+import { realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { CommandReceipt, ReceiptEffect } from "@crewhaus/control-contract";
 import {
   type LeaseProbe,
@@ -62,8 +63,10 @@ export type RetireStepOutcome = {
   readonly detail: string;
 };
 
-/** The registry write retire needs: harness-registry's `archive`. */
+/** The registry reads and writes retire needs: harness-registry's `list` and `archive`. */
 export type RetireRegistry = {
+  /** Every row, archived and missing included. */
+  list(): readonly { readonly id: string; readonly dir: string }[];
   archive(
     dirOrId: string,
     stamp: { readonly at: string; readonly by: string; readonly cmd: string },
@@ -106,6 +109,20 @@ export type RetireSteps = {
 };
 
 const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/** A path's real location, or its resolved spelling when it can't be followed (a gone dir). */
+const realOf = (path: string): string => {
+  try {
+    return realpathSync(resolve(path));
+  } catch {
+    return resolve(path);
+  }
+};
+
+/** Whether two paths name the same directory: the same resolved spelling, or the same
+ *  real location. */
+const sameDir = (a: string, b: string): boolean =>
+  resolve(a) === resolve(b) || realOf(a) === realOf(b);
 
 /**
  * The steps retire runs itself, for a harness and one `controls.retire` receipt.
@@ -394,10 +411,15 @@ export function retireSteps(options: RetireStepsOptions): RetireSteps {
       let row: unknown;
       try {
         const registry = options.registry;
-        row =
-          (options.harnessId !== undefined
-            ? registry?.archive(options.harnessId, stamp)
-            : undefined) ?? registry?.archive(harnessDir, stamp);
+        // Only the row of this directory, matched by its spelling first, then by where it
+        // really is. A row carrying another id than the harness's own is not this one.
+        const rows = registry?.list() ?? [];
+        const own =
+          rows.find((r) => resolve(r.dir) === resolve(harnessDir)) ??
+          rows.find((r) => sameDir(r.dir, harnessDir));
+        const mine =
+          own !== undefined && (options.harnessId === undefined || own.id === options.harnessId);
+        row = mine ? registry?.archive(own.dir, stamp) : undefined;
       } catch (err) {
         effect({ kind: "retire.registry", status: "failed" });
         return outcome("archiveRegistryRow", false, messageOf(err));

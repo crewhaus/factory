@@ -257,7 +257,7 @@ import {
   installStarter,
   suggestScanRoots,
 } from "./onboarding";
-import { readPluginGrants, servedPlugins, standingFrom } from "./plugin-grants";
+import { readPluginGrants, servedPlugins, standingFrom, waitingOn } from "./plugin-grants";
 import {
   defaultPluginsDir,
   panesForHarness,
@@ -731,11 +731,17 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
    * The abort signal for a live run stream: the client going away, or, for a stream
    * opened with a session, that session ending. The reason names the closing event.
    * `dispose` ends the stream's re-check and its session listener; the stream calls it
-   * when it finishes, for every reason, and calling it again does nothing.
+   * when it finishes, for every reason, and calling it again does nothing. `check`, present
+   * when the request was authorized, decides the request again on the access records as
+   * they stand now: `undefined` while it is allowed, else the event the stream closes with.
    */
   const streamSignal = (
     req: Request,
-  ): { readonly signal: AbortSignal | undefined; readonly dispose: () => void } => {
+  ): {
+    readonly signal: AbortSignal | undefined;
+    readonly dispose: () => void;
+    readonly check?: () => "auth.revoked" | "auth.expired" | undefined;
+  } => {
     const who = callers.get(req);
     const sessionRef = who?.kind === "principal" ? who.sessionRef : undefined;
     const decided = authorized.get(req);
@@ -773,9 +779,19 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     };
     ended.signal.addEventListener("abort", dispose, { once: true });
     req.signal?.addEventListener("abort", dispose, { once: true });
+    const check =
+      decided === undefined
+        ? undefined
+        : (): "auth.revoked" | "auth.expired" | undefined => {
+            const view = accessView(signIn.snapshot());
+            if (authorizeRequest({ ...decided, view }).allow) return undefined;
+            const scoped = decided.caller.scoped;
+            return scoped !== undefined && view.now >= scoped.exp ? "auth.expired" : "auth.revoked";
+          };
     return {
       signal: req.signal === undefined ? ended.signal : AbortSignal.any([req.signal, ended.signal]),
       dispose,
+      ...(check !== undefined ? { check } : {}),
     };
   };
 
@@ -2637,6 +2653,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (head === "panes" && tail.length === 0 && method === "GET") {
       liveDirOr404(entry);
       const { inventory, served } = pluginsNow();
+      // The plugins that would add a tab or an observer here once the owner allows it on
+      // this harness. Only a caller who can read Settings › Plugins learns their names;
+      // every caller gets the count, so the tab strip can say why it is empty.
+      const waiting = waitingOn(inventory, served, { id: entry.id, dir: entry.dir });
       return jsonMasked({
         id: entry.id,
         // Both extension points serve only what the plugin's owner granted on
@@ -2648,10 +2668,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           sandbox: row.sandbox,
         })),
         traceObservers: traceObservers(served, entry.id),
-        // Installed plugins that wait for the owner's OK, so the tab strip can say why it is empty.
-        waiting: inventory.plugins
-          .filter((p) => p.problems.length === 0 && p.grant.state === "waiting")
-          .map((p) => p.name),
+        waiting: requestAllows("home.read") ? waiting : [],
+        waitingCount: waiting.length,
         deferred: inventory.deferred,
       });
     }
@@ -3327,6 +3345,21 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         ? { ok: true, body: status.body as unknown as Record<string, unknown> }
         : { ok: false, reason: status.reason };
     },
+    // The read forms: what the runfile says is observed, and nothing is attached or cleared.
+    observedDaemonState: async (entry) => {
+      const { handle, observed } = observedFor(entry);
+      const snapshot = handle.snapshot();
+      return observed.state === "live" && snapshot.pid === undefined
+        ? "running"
+        : daemonStateOf(snapshot.state);
+    },
+    observedDaemonStatus: async (entry) => {
+      const { handle, observed } = observedFor(entry);
+      const status = await control.status(controlTarget(handle, observed));
+      return status.ok
+        ? { ok: true, body: status.body as unknown as Record<string, unknown> }
+        : { ok: false, reason: status.reason };
+    },
     // Runs the control API starts: one job each, on a supervisor of its own.
     ...(processes.startApiRun !== undefined
       ? { startRunJob: processes.startApiRun.bind(processes) }
@@ -3339,6 +3372,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       : {}),
     controlClient: control,
     controlTarget: async (entry) => controlTarget(await processFor(entry)),
+    observedControlTarget: async (entry) => {
+      const { handle, observed } = observedFor(entry);
+      return controlTarget(handle, observed);
+    },
     stopDaemon: async (entry) => {
       const handle = await processFor(entry);
       const stopped = await handle.supervisor.stop();

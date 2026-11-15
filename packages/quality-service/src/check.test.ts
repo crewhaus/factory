@@ -100,6 +100,27 @@ describe("promotionCheck", () => {
     expect(check.recoveries).toEqual(["b"]);
   });
 
+  test("a graders hash recorded on one side only makes the runs not comparable", () => {
+    const base = run("run_b", { a: "pass" }, { gradersHash: "g1" });
+    const candidate = run("run_c", { a: "pass" }, { gradersHash: undefined });
+    for (const [from, to] of [
+      [base, candidate],
+      [candidate, base],
+    ] as const) {
+      const check = promotionCheck(from, to);
+      expect(check).toMatchObject({ comparison: "not_comparable", rule: "instrument" });
+      expect(check.reason).toContain("gradersHash, recorded on one side only");
+    }
+  });
+
+  test("a graders hash recorded on one side only is not refused when the change is to the graders", () => {
+    const base = run("run_b", { a: "pass" }, { gradersHash: "g1" });
+    const candidate = run("run_c", { a: "pass" }, { gradersHash: undefined });
+    const check = promotionCheck(base, candidate, { instrumentChange: "expected" });
+    expect(check.rule).not.toBe("instrument");
+    expect(check.comparison).toBe("pass");
+  });
+
   test("runs measured with different graders are not comparable", () => {
     const base = run("run_b", { a: "pass" }, { gradersHash: "g1" });
     const candidate = run("run_c", { a: "pass" }, { gradersHash: "g2" });
@@ -147,7 +168,9 @@ describe("checking a spec change", () => {
     const plan = await planCheck({ harnessDir: dir, chg: row.id, runners, actor: ACTOR, now });
     if (!("kind" in plan)) throw new Error(JSON.stringify(plan));
     expect(plan.isolation).toBe("needs-live");
-    expect(plan.isolationReason).toContain("adds an MCP server or tool (fs)");
+    expect(plan.isolationReason).toContain(
+      "adds, or configures differently, an MCP server or tool (fs)",
+    );
     const refused = await checkChange({ harnessDir: dir, chg: row.id, runners, actor: ACTOR, now });
     if (refused.ok) throw new Error("checked");
     expect(refused.code).toBe("needs-live");
@@ -312,6 +335,73 @@ describe("the holdout", () => {
       "candidate",
       "holdout-candidate",
     ]);
+  });
+
+  test("a cached base holdout run is reused only when measured exactly as the new base", async () => {
+    for (const side of ["cached", "fresh"] as const) {
+      const dir = await harness({ holdout: true });
+      const first = await propose(dir);
+      const cache = new Map<string, ReturnType<typeof run>>();
+      const { runners, calls } = fakeRunners((_l, a) => allPass(a), {
+        loadRun: async (path) => cache.get(path),
+      });
+      let dropFromBase = false;
+      const wrapped: CheckRunners = {
+        ...runners,
+        evalSpec: async (args) => {
+          let summary = await runners.evalSpec(args);
+          if (dropFromBase && args.label === "base") {
+            const { gradersHash: _dropped, ...config } = summary.config;
+            summary = { ...summary, config };
+          }
+          cache.set(args.outDir, summary);
+          return summary;
+        },
+      };
+      const checked = await checkChange({
+        harnessDir: dir,
+        chg: first.id,
+        runners: wrapped,
+        actor: ACTOR,
+        now,
+      });
+      if (!checked.ok) throw new Error(checked.reason);
+      if (side === "cached") {
+        // The cached base holdout run records no graders hash; the new base does.
+        const key = [...cache.keys()].find((k) => k.endsWith("holdout-base"));
+        if (key === undefined) throw new Error("no cached holdout base");
+        const cachedRun = cache.get(key) as ReturnType<typeof run>;
+        const { gradersHash: _dropped, ...config } = cachedRun.config;
+        cache.set(key, { ...cachedRun, config });
+      } else {
+        // The new base records no graders hash; the cached base holdout run does.
+        dropFromBase = true;
+      }
+      const second = await propose(
+        dir,
+        SPEC.replace("Help the customer.", "Help the customer fast."),
+      );
+      const before = calls.evals.length;
+      const again = await checkChange({
+        harnessDir: dir,
+        chg: second.id,
+        runners: wrapped,
+        actor: ACTOR,
+        now,
+      });
+      if (!again.ok) throw new Error(again.reason);
+      expect(calls.evals.slice(before).map((e) => e.label)).toEqual([
+        "base",
+        "candidate",
+        "holdout-base",
+        "holdout-candidate",
+      ]);
+      const ref = readChange(dir, second.id)?.evidenceRef as string;
+      const evidence = JSON.parse(readFileSync(join(dir, ref), "utf8")) as {
+        holdout: { base: { reused: boolean } };
+      };
+      expect(evidence.holdout.base.reused).toBe(false);
+    }
   });
 
   test("a dataset with no holdout is adopted only with withoutHoldout", async () => {

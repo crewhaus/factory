@@ -52,6 +52,7 @@ import {
   type SettingsPermissionRule,
   type SuggestToolLookup,
   aggregateAsks,
+  diffForDisplay,
   diffPermissions,
   isArgScoped,
   rankSuggestions,
@@ -1091,6 +1092,7 @@ export const permissionsSuggest: RegisteredTool = buildTool({
       readonly additions: ReadonlyArray<SettingsPermissionRule>;
       readonly alreadyPresent: ReadonlyArray<SettingsPermissionRule>;
       readonly merged: ReadonlyArray<SettingsPermissionRule> | null;
+      readonly withheldRules?: number;
     } | null = null;
     const settingsJson: Record<string, unknown> = {
       path: settingsPath.value.rel,
@@ -1112,15 +1114,26 @@ export const permissionsSuggest: RegisteredTool = buildTool({
       if (settings.kind === "read" && settings.declaredEntries !== null) {
         settingsJson["declaredRuleEntries"] = settings.declaredEntries;
       }
-      const computed = diffPermissions(existing, verified);
+      // The returned view: an existing rule that holds a credential is
+      // counted, never returned.
+      const view = diffForDisplay(diffPermissions(existing, verified));
       const mergeUnsafe = settings.kind === "read" ? settings.mergeUnsafeReason : undefined;
       if (mergeUnsafe !== undefined) {
         unknowns.add("diff.merged", `read ${settingsPath.value.rel}`, mergeUnsafe);
       }
+      const withheld = view.withheldRules ?? 0;
+      if (withheld > 0) {
+        unknowns.add(
+          "diff.merged",
+          `read ${settingsPath.value.rel}`,
+          `${withheld} existing rule(s) hold a credential, so the merged list is not shown; \`crewhaus permissions suggest --apply\` in an interactive terminal writes it unchanged`,
+        );
+      }
       diff = {
-        additions: computed.additions,
-        alreadyPresent: computed.alreadyPresent,
-        merged: mergeUnsafe === undefined ? computed.merged : null,
+        additions: view.additions,
+        alreadyPresent: view.alreadyPresent,
+        merged: mergeUnsafe === undefined ? view.merged : null,
+        ...(withheld > 0 ? { withheldRules: withheld } : {}),
       };
     }
 

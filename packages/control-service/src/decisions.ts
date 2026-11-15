@@ -76,8 +76,6 @@ import {
   readApproverProjection,
   readChangeAdoptions,
   readProposals,
-  readStandingRules,
-  ruleIsLive,
   storedLocalActor,
 } from "@crewhaus/control-records";
 import { readHarnessEnvFiles } from "@crewhaus/harness-supervisor";
@@ -95,15 +93,17 @@ import {
 import {
   type ResolveAnswer,
   type ResolveHooks,
+  approvalStillStands,
   authorizerFor as authorizerOf,
   mayManage as mayManageOn,
   resolveToolApproval,
 } from "./approval-resolve";
 import { isServiceActor } from "./deployments";
 import {
+  type RuleDerivation,
   type RuleWriteAnswer,
   createStandingRule,
-  revokeStandingRule,
+  endDerivedRules,
   ruleEndProblem,
   standingPatternFor,
 } from "./rules";
@@ -157,6 +157,10 @@ export function principalOfActor(actor: DecisionActor, hangarRoot: string): Appr
     return {};
   }
 }
+
+/** What a request to the owner answers when its approval does not give the rule it asks for. */
+const TERMS_GONE =
+  "the approval this request came from is gone or no longer names this rule; ask for it again";
 
 /** What a local user is told on a harness whose approver projection names no Home root. */
 const UNNAMED_ACCESS_ROOT =
@@ -283,6 +287,24 @@ export function governedAncestorOf(
   approvers: (harnessDir: string) => ApproverRead = readApproverProjection,
 ): string | undefined {
   return crewhausAncestors(rootDir).find((dir) => approvers(dir).state !== "absent");
+}
+
+/**
+ * Every governed harness above a session root, with its approver read: each ancestor (as
+ * written, or where the root lands on disk) whose approver list is present or cannot be
+ * read, each directory once by its real path. Those of the root as written come first,
+ * each run nearest first.
+ */
+export function governedAncestorsOf(
+  rootDir: string,
+  approvers: (harnessDir: string) => ApproverRead = readApproverProjection,
+): Array<{ readonly dir: string; readonly read: ApproverRead }> {
+  const found: Array<{ readonly dir: string; readonly read: ApproverRead }> = [];
+  for (const dir of crewhausAncestors(rootDir)) {
+    const read = approvers(dir);
+    if (read.state !== "absent") found.push({ dir, read });
+  }
+  return found;
 }
 
 /**
@@ -679,16 +701,17 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     rootDir: string | undefined,
     row: ProposalRow,
   ): boolean => {
+    if (row.derivedFrom === undefined) return false;
+    const root = rootOf(harnessDir, rootDir);
+    if (approvalStillStands(root, row.derivedFrom) !== undefined) return false;
     let folded: ReturnType<typeof foldReadOnly>;
     try {
-      folded = foldReadOnly(rootOf(harnessDir, rootDir));
+      folded = foldReadOnly(root);
     } catch {
       return false;
     }
-    if (folded.state === "unreadable") return false;
     const record = folded.records.find((r) => r.id === row.derivedFrom);
-    if (record === undefined || record.supersededBy !== undefined) return false;
-    if (record.decision !== "grant" || record.expiredAt !== undefined) return false;
+    if (record === undefined) return false;
     const narrow = standingPatternFor(record.toolName, record.input, harnessDir);
     if ("refused" in narrow) return false;
     const { terms } = row;
@@ -761,13 +784,7 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
         };
       }
       if (!termsStillDerive(harnessDir, request.rootDir, row)) {
-        return {
-          outcome: "invalid",
-          record: null,
-          proposal: row,
-          reason:
-            "the approval this request came from is gone or no longer names this rule; ask for it again",
-        };
+        return { outcome: "invalid", record: null, proposal: row, reason: TERMS_GONE };
       }
       try {
         loadSettingsRules(harnessDir);
@@ -797,6 +814,15 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     if (request.choice === "deny" || terms.ruleKind !== "allow") {
       return { outcome: "decided", record: null, proposal: decided };
     }
+    // The approval is asked again under the rule lock, just before the row is written.
+    const derivation: RuleDerivation =
+      row.derivedFrom !== undefined
+        ? {
+            derivedFrom: row.derivedFrom,
+            derivesFrom: () =>
+              termsStillDerive(harnessDir, request.rootDir, row) ? undefined : TERMS_GONE,
+          }
+        : {};
     const made = await runRule(hooks, (cmd) =>
       createStandingRule({
         harnessDir,
@@ -804,7 +830,7 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
         tool: terms.tool,
         pattern: terms.pattern,
         reason: "proposal",
-        ...(row.derivedFrom !== undefined ? { derivedFrom: row.derivedFrom } : {}),
+        ...derivation,
         proposal: row.id,
         createdBy: by,
         expiresAt: terms.expiresAt,
@@ -854,7 +880,8 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
 
   /**
    * The standing rules made from a superseded approval that still stand, each ended when
-   * the owner superseded it as decided in error, and otherwise named with its verb.
+   * the owner superseded it as decided in error, and otherwise named with its verb. The
+   * rules are read, and ended, under the lock a rule is written under.
    */
   async function derivedRulesOf(
     request: SupersedeRequest,
@@ -862,51 +889,39 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     who: ApprovalPrincipal,
   ): Promise<Pick<DecisionSupersedeAnswer, "derivedRules" | "ruleError">> {
     const listVerb = `crewhaus approvals rules --dir ${harnessDir}`;
-    const read = readStandingRules(harnessDir);
+    const ends = request.reason === "decided-in-error" && mayManage(harnessDir, who);
+    const read = await endDerivedRules({
+      harnessDir,
+      ref: request.ref,
+      end: ends,
+      revokedBy: () => storedActor(harnessDir, request.actor, who),
+      now: deps.now,
+    });
     if (read.state === "unreadable") {
       return {
         derivedRules: [],
         ruleError: `the standing rules cannot be read (${read.reason}); a rule made from ${request.ref} may still stand: ${listVerb}`,
       };
     }
-    const nowMs = deps.now();
-    const rows =
-      read.state === "present"
-        ? read.rows.filter(
-            (row) =>
-              row.derivedFrom === request.ref && row.state === "active" && ruleIsLive(row, nowMs),
-          )
-        : [];
     const problems: string[] = [];
-    if (read.state === "present" && read.anomalies.length > 0) {
+    if (read.anomalies) {
       problems.push(
         `part of the standing rules cannot be read; a rule made from ${request.ref} may still stand: ${listVerb}`,
       );
     }
-    const ends = request.reason === "decided-in-error" && mayManage(harnessDir, who);
-    let revokedBy: string | undefined;
     const derivedRules: DerivedRule[] = [];
-    for (const row of rows) {
+    for (const { row, ended } of read.rules) {
       const verb = `crewhaus approvals revoke ${row.id} --dir ${harnessDir}`;
-      if (ends) {
-        try {
-          revokedBy ??= await storedActor(harnessDir, request.actor, who);
-          const ended = await revokeStandingRule({
-            harnessDir,
-            id: row.id,
-            revokedBy,
-            now: deps.now(),
-          });
-          if (ended.outcome === "revoked") {
-            derivedRules.push({ id: row.id, revoked: true });
-            continue;
-          }
-          problems.push(
-            `${row.id} could not be ended (${ended.outcome === "unavailable" ? ended.reason : ended.outcome}): ${verb}`,
-          );
-        } catch (err) {
-          problems.push(`${row.id} could not be ended (${(err as Error).message}): ${verb}`);
+      if (ended !== undefined) {
+        if (ended.outcome === "revoked") {
+          derivedRules.push({ id: row.id, revoked: true });
+          continue;
         }
+        const why =
+          ended.outcome === "unavailable" || ended.outcome === "failed"
+            ? ended.reason
+            : ended.outcome;
+        problems.push(`${row.id} could not be ended (${why}): ${verb}`);
       }
       derivedRules.push({ id: row.id, revoked: false, verb });
     }

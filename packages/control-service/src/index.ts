@@ -32,12 +32,14 @@ export {
   type SupersedeRequest,
   createDecisions,
   governedAncestorOf,
+  governedAncestorsOf,
   harnessForSessionRoot,
   principalOfActor,
   settingsWriteClass,
 } from "./decisions";
 export {
   DEFAULT_RULE_DAYS,
+  type DerivedRulesAnswer,
   type LegacyAllow,
   type LegacyRevokeAnswer,
   type LegacyRevokeOutcome,
@@ -45,6 +47,7 @@ export {
   type ListedRule,
   MAX_RULE_DAYS,
   type RevokeAnswer,
+  type RuleDerivation,
   type RuleListing,
   type RuleRevokeAnswer,
   type RuleWrite,
@@ -55,6 +58,7 @@ export {
   carriesCredential,
   createRules,
   createStandingRule,
+  endDerivedRules,
   endExpiredRules,
   legacyBroadAllows,
   revokeLegacyAllow,
@@ -66,9 +70,11 @@ export {
   widenedPatternProblem,
 } from "./rules";
 export {
+  APPROVAL_GONE,
   NARROW_WORDS,
   type ToolApprovalDeps,
   type ToolApprovalRequest,
+  approvalStillStands,
   resolveToolApproval,
 } from "./approval-resolve";
 export {
@@ -278,6 +284,7 @@ export {
   caughtUpModel,
   directFold,
   harnessOfTarget,
+  harnessApprovalsSource,
   harnessesOfRun,
   nudge,
   nudgeFromReceipt,

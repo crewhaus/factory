@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -22,9 +22,11 @@ import {
   readApproverProjection,
   readProposals,
   readStandingRules,
+  standingRulesLedger,
 } from "@crewhaus/control-records";
 import { emptyRuleSet, evaluate, loadSettingsRules } from "@crewhaus/permission-engine";
 import { foldReadOnly, generateApprovalId } from "@crewhaus/session-store";
+import { CREDENTIAL_FORM_WORDS, type CredentialForm } from "@crewhaus/spec-patch";
 import type { DecisionActor } from "./decisions";
 import {
   SECURITY_SETTINGS_PATHS,
@@ -417,18 +419,134 @@ describe("narrowing per operative kind", () => {
 describe("a value that carries a credential is never a rule", () => {
   // Built from parts at run time: no credential-shaped literal sits in the source.
   const token = ["sk", "ant", "api03", "x".repeat(24)].join("-");
-  const refusedCases: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
-    ["Bash", { command: `curl -H "x-api-key: ${token}" https://api.example.com` }],
-    ["Bash", { command: 'curl -H "Authorization: Basic abc" https://api.example.com' }],
-    ["Bash", { command: "API_TOKEN=abc123 ./deploy.sh" }],
-    ["WebFetch", { url: "https://api.example.com/items?access_token=abc123" }],
+  const refusedCases: ReadonlyArray<readonly [string, Record<string, unknown>, CredentialForm]> = [
+    ["Bash", { command: `curl -H "x-api-key: ${token}" https://api.example.com` }, "token"],
+    ["Bash", { command: 'curl -H "Authorization: Basic abc" https://api.example.com' }, "header"],
+    ["Bash", { command: "API_TOKEN=abc123 ./deploy.sh" }, "assignment"],
+    ["WebFetch", { url: "https://api.example.com/items?access_token=abc123" }, "url-query"],
   ];
-  for (const [tool, input] of refusedCases) {
+  for (const [tool, input, form] of refusedCases) {
     test(`${tool} ${JSON.stringify(input).slice(0, 40)}… is refused`, () => {
       const narrow = standingPatternFor(tool, input, tempDir());
-      expect(narrow).toEqual({ refused: "carries-credential" });
+      expect(narrow).toEqual({ refused: "carries-credential", form });
     });
   }
+
+  // Built at run time from random parts: no credential-shaped literal sits in the source.
+  const short = (): string => randomBytes(6).toString("hex");
+  const long = (): string => randomBytes(20).toString("hex");
+  const formRows: ReadonlyArray<readonly [CredentialForm, string, Record<string, string>]> = [
+    ["flag", "Bash", { command: `deploy --token ${short()}` }],
+    ["flag", "Bash", { command: `psql --password=${short()}` }],
+    ["flag", "Bash", { command: `cli --api-key ${short()}` }],
+    ["flag", "Bash", { command: `cli --secret ${short()}` }],
+    ["flag", "Bash", { command: `curl --cookie "sid=${short()}" https://x.test` }],
+    ["user-password", "Bash", { command: `curl -u admin:${short()} https://x.test` }],
+    ["attached-password", "Bash", { command: `mysql -uroot -p${short()} app` }],
+    ["header", "Bash", { command: `curl -H "Cookie: sid=${short()}" https://x.test` }],
+    ["header", "Bash", { command: `curl -H "X-Auth-User: admin" https://x.test` }],
+    ["url-fragment", "WebFetch", { url: `https://x.test/cb#access_token=${short()}` }],
+    ["url-token-user", "WebFetch", { url: `https://${long()}@x.test/o/r` }],
+    ["signed-url", "WebFetch", { url: `https://bucket.x.test/o?X-Amz-Signature=${short()}` }],
+    ["signed-url", "WebFetch", { url: `https://store.x.test/c?sv=1&sig=${short()}` }],
+    ["webhook-url", "WebFetch", { url: `https://hooks.slack.com/services/T0/B0/${short()}` }],
+    ["webhook-url", "WebFetch", { url: `https://discord.com/api/webhooks/1/${short()}` }],
+    ["webhook-url", "WebFetch", { url: `https://api.telegram.org/bot1:${short()}/sendMessage` }],
+    ["url-password", "WebFetch", { url: `https://u:${short()}@x.test/a` }],
+    [
+      "user-password",
+      "Bash",
+      { command: `curl "https://api.x.test/v1?a=1&b=2" -u admin:${short()}` },
+    ],
+    ["user-password", "Bash", { command: `curl 'https://x.test/(a)' -u admin:${short()}` }],
+    ["attached-password", "Bash", { command: `mysql -e "select 1; select 2" -p${short()} app` }],
+    ["user-password", "Bash", { command: `curl -sSu admin:${short()} https://x.test` }],
+    ["user-password", "Bash", { command: `timeout 30 curl -su admin:${short()} https://x.test` }],
+    ["user-password", "Bash", { command: `sudo -E curl -u admin:${short()} https://x.test` }],
+    ["user-password", "Bash", { command: `sudo -u ops curl -u admin:${short()} https://x.test` }],
+    ["user-password", "Bash", { command: `time curl -u admin:${short()} https://x.test` }],
+    ["user-password", "Bash", { command: `bash -c "curl -u admin:${short()} https://x.test"` }],
+    ["user-password", "Bash", { command: `CURL -u admin:${short()} https://x.test` }],
+    ["user-password", "Bash", { command: `curl.exe -u admin:${short()} https://x.test` }],
+    [
+      "attached-password",
+      "Bash",
+      { command: `docker exec -i db mysql -uroot -p${short()} -e "select 1"` },
+    ],
+    ["attached-password", "Bash", { command: `kubectl exec db -- mysql -p${short()}` }],
+    ["header", "Bash", { command: `wget --header=X-Auth-Token:${short()} https://x.test` }],
+    ["webhook-url", "WebFetch", { url: `https://discord.com/api/v10/webhooks/1/${short()}` }],
+    ["webhook-url", "WebFetch", { url: `https://hooks.slack.com./services/T0/B0/${short()}` }],
+  ];
+  const passRows: ReadonlyArray<readonly [string, Record<string, string>]> = [
+    ["Bash", { command: "cli --verbose" }],
+    ["Bash", { command: "cli --token-file ./t" }],
+    ["Bash", { command: "llm --max-tokens 5" }],
+    ["Bash", { command: "docker login --password-stdin" }],
+    ["Bash", { command: "pg --no-password db" }],
+    ["Bash", { command: "gh --token $GH_TOKEN" }],
+    ["Bash", { command: "curl -u admin https://x.test" }],
+    ["Bash", { command: "docker run -u 1000:1000 img" }],
+    ["Bash", { command: "mysql -p db" }],
+    ["Bash", { command: "ssh -p2222 h" }],
+    ["Bash", { command: "ssh -p 22 h" }],
+    ["Bash", { command: "docker run -p 8080:80 img" }],
+    ["Bash", { command: "nc -p 8080" }],
+    ["Bash", { command: "curl -H 'X-Request-Id: 1' https://x.test" }],
+    ["WebFetch", { url: "https://x.test/#section-2" }],
+    ["WebFetch", { url: "https://x.test/?signed=1" }],
+    ["WebFetch", { url: "https://hooks.slack.com/" }],
+    ["WebFetch", { url: "https://discord.com/channels/1" }],
+    ["Bash", { command: "wrangler deploy --env production" }],
+    ["Bash", { command: "docker run --env NODE_ENV=production img" }],
+    ["Bash", { command: "curl --key client.pem https://x.test" }],
+    ["Bash", { command: "docker run -p 8080:80 mysql" }],
+  ];
+
+  test("each form of credential is refused with the form it takes, never the value", () => {
+    const harness = tempDir();
+    for (const [form, tool, input] of formRows) {
+      expect({ input, narrow: standingPatternFor(tool, input, harness) }).toEqual({
+        input,
+        narrow: { refused: "carries-credential", form },
+      });
+    }
+  });
+
+  test("a call refused for another reason is refused for the credential it carries", () => {
+    // A parenthesis is not representable, and two places are not one: the credential is named first.
+    const harness = tempDir();
+    expect(
+      standingPatternFor("Bash", { command: `deploy --token ${short()} (x)` }, harness),
+    ).toEqual({ refused: "carries-credential", form: "flag" });
+    expect(
+      standingPatternFor("Bash", { command: `curl -u a:${short()} https://x.test/(a)` }, harness),
+    ).toEqual({ refused: "carries-credential", form: "user-password" });
+  });
+
+  test("an ordinary flag, header or URL still makes its rule", () => {
+    const harness = tempDir();
+    for (const [tool, input] of passRows) {
+      expect({ input, made: "pattern" in standingPatternFor(tool, input, harness) }).toEqual({
+        input,
+        made: true,
+      });
+    }
+  });
+
+  test("a wider pattern is refused with the form of credential it holds", () => {
+    const harness = tempDir();
+    for (const [form, tool, input] of formRows) {
+      const value = tool === "Bash" ? input["command"] : input["url"];
+      expect({
+        value,
+        problem: widenedPatternProblem(tool, input, `${tool}(${value})`, harness),
+      }).toEqual({
+        value,
+        problem: `a rule must not hold a credential (${CREDENTIAL_FORM_WORDS[form]})`,
+      });
+    }
+  });
 
   test("a value with no credential still makes its rule", () => {
     for (const [tool, input] of [
@@ -451,7 +569,7 @@ describe("a value that carries a credential is never a rule", () => {
         "WebFetch(https://example.com/**?token=abc)",
         harness,
       ),
-    ).toBe("a rule must not hold a credential");
+    ).toBe(`a rule must not hold a credential (${CREDENTIAL_FORM_WORDS["url-query"]})`);
   });
 });
 
@@ -843,6 +961,26 @@ describe("superseding an approval and the standing rules made from it", () => {
     expect(answer.ruleError).toContain(`crewhaus approvals rules --dir ${r.harness}`);
   });
 
+  test("a rule lock that cannot be taken is named, and the supersede stands", async () => {
+    const r = governed();
+    const { p, rule } = await ownerRule(r, "notes/a.md");
+    const lock = join(r.harness, standingRulesLedger(r.harness).lock);
+    rmSync(lock, { force: true });
+    mkdirSync(lock, { recursive: true });
+    const answer = await r.service.decisions.supersede({
+      harnessDir: r.harness,
+      ref: p.id,
+      reason: "decided-in-error",
+      actor: as(r.owner),
+      via: "cli",
+    });
+    expect(answer.outcome).toBe("superseded");
+    expect(answer.derivedRules).toEqual([]);
+    expect(answer.ruleError).toContain("not a lock file");
+    expect(answer.ruleError).toContain(`crewhaus approvals rules --dir ${r.harness}`);
+    expect(ruleState(r.harness, rule.id)).toBe("active");
+  });
+
   test("a rule record with a line that cannot be read is named, and the rule it holds still ends", async () => {
     const r = governed();
     const { p } = await ownerRule(r, "notes/a.md");
@@ -868,7 +1006,10 @@ describe("superseding an approval and the standing rules made from it", () => {
   });
 });
 
-describe("a rule's pattern holds no control or bidirectional-text character", () => {
+describe("a rule's pattern holds no control, bidirectional-text or other invisible character", () => {
+  // A zero-width space, a line separator and a tag character.
+  const invisible = ["\u200b", "\u2028", "\u{E0041}"];
+
   test("no narrow rule names such a call, and no wider pattern holds one", () => {
     const harness = tempDir();
     expect(standingPatternFor("Write", { path: "a\u001b[2Jb" }, harness)).toEqual({
@@ -878,14 +1019,28 @@ describe("a rule's pattern holds no control or bidirectional-text character", ()
       refused: "not-representable",
     });
     expect(widenedPatternProblem("Write", { path: "a.md" }, "Write(a\u202e*)", harness)).toContain(
-      "control or bidirectional-text characters",
+      "control, bidirectional-text or other invisible character",
     );
+    for (const char of invisible) {
+      expect(standingPatternFor("Write", { path: `a${char}b.md` }, harness)).toEqual({
+        refused: "not-representable",
+      });
+      expect(
+        widenedPatternProblem("Write", { path: "a.md" }, `Write(a${char}*)`, harness),
+      ).toContain("other invisible character");
+    }
     expect(widenedPatternProblem("Write", { path: "a.md" }, "Write(a*)", harness)).toBeUndefined();
   });
 
   test("createStandingRule refuses one and writes nothing", async () => {
     const harness = tempDir();
-    for (const pattern of ["Write(a\u202eb)", "Write(a\u0085b)", "Write(a\u001bb)"]) {
+    const patterns = [
+      "Write(a\u202eb)",
+      "Write(a\u0085b)",
+      "Write(a\u001bb)",
+      ...invisible.map((char) => `Write(a${char}b)`),
+    ];
+    for (const pattern of patterns) {
       const answer = await createStandingRule({
         harnessDir: harness,
         tool: "Write",
@@ -896,6 +1051,7 @@ describe("a rule's pattern holds no control or bidirectional-text character", ()
         now: NOW,
       });
       expect(answer.ok).toBe(false);
+      expect(answer.ok ? undefined : answer.reason).toContain("other invisible character");
     }
     expect(readStandingRules(harness).state).toBe("absent");
     expect(settingsOf(harness)).toBeUndefined();
@@ -1060,6 +1216,40 @@ describe("a request to the owner is granted only on the terms its approval gives
     expect(answer.outcome).toBe("invalid");
     expect(pendingOf(r.harness, r.honest.id)).toBe("pending");
     expect(readStandingRules(r.harness).state).toBe("absent");
+  });
+
+  test("a request whose approval is superseded after the request is decided makes no rule", async () => {
+    const r = await filed();
+    const answer = await r.service.decisions.resolve(
+      {
+        harnessDir: r.harness,
+        ref: r.honest.id,
+        choice: "grant",
+        actor: as(r.owner),
+        via: "cli",
+      },
+      {
+        // The request is decided; its approval is superseded just before the rule is written.
+        ruleCommand: async (run) => {
+          const sup = await r.service.decisions.supersede({
+            harnessDir: r.harness,
+            ref: r.p.id,
+            reason: "decided-in-error",
+            actor: as(r.owner),
+            via: "cli",
+          });
+          expect(sup.outcome).toBe("superseded");
+          return run(undefined);
+        },
+      },
+    );
+    expect(answer.outcome).toBe("decided");
+    expect(answer.rule).toBeUndefined();
+    expect(answer.ruleError).toContain("ask for it again");
+    expect(pendingOf(r.harness, r.honest.id)).toBe("granted");
+    const rules = readStandingRules(r.harness);
+    expect(rules.state === "present" ? rules.rows : []).toEqual([]);
+    expect(JSON.stringify(settingsOf(r.harness) ?? {})).not.toContain("Write(notes/a.md)");
   });
 
   test("a deny needs none of it", async () => {

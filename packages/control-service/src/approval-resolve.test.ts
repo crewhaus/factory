@@ -1,9 +1,21 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { mintId } from "@crewhaus/control-contract";
-import { readProposals, readStandingRules } from "@crewhaus/control-records";
-import { authorizerFor, resolveToolApproval } from "./approval-resolve";
+import {
+  readApproverProjection,
+  readProposals,
+  readStandingRules,
+} from "@crewhaus/control-records";
+import { createPendingApprovalStore } from "@crewhaus/session-store";
+import { CREDENTIAL_FORM_WORDS } from "@crewhaus/spec-patch";
+import {
+  APPROVAL_GONE,
+  approvalStillStands,
+  authorizerFor,
+  resolveToolApproval,
+} from "./approval-resolve";
 import { NOW, park, plantProjection, removeTempDirs, rig, settingsOf } from "./test-helpers";
 
 afterAll(removeTempDirs);
@@ -46,6 +58,36 @@ describe("resolveToolApproval, called directly", () => {
     expect(settingsOf(r.harness)).toEqual({
       permissions: { rules: [{ type: "alwaysAllow", pattern: "Write(notes/a.md)" }] },
     });
+  });
+
+  test("the owner's always over a call that carries a credential makes no rule, and names the form", async () => {
+    const r = rig();
+    const owner = mintId("prn");
+    plantProjection(r.harness, owner);
+    // Built at run time from random parts: no credential-shaped literal sits in the source.
+    const secret = randomBytes(6).toString("hex");
+    const p = await park(r.harness, "Bash", { command: `deploy --token ${secret}` });
+    const answer = await resolveToolApproval(
+      {
+        harnessDir: r.harness,
+        rootDir: sessions(r.harness),
+        ref: p.id,
+        choice: "grant",
+        who: { principal: owner },
+        storeActor: { principal: owner },
+        storedBy: async () => owner,
+        via: "slack",
+        always: true,
+      },
+      { now: () => NOW },
+    );
+    expect(answer.outcome).toBe("invalid");
+    expect(answer.reason).toContain(CREDENTIAL_FORM_WORDS.flag);
+    expect(answer.reason).toContain("(carries-credential)");
+    expect(answer.reason?.includes(secret)).toBe(false);
+    expect(settingsOf(r.harness)).toBeUndefined();
+    const rules = readStandingRules(r.harness);
+    expect(rules.state === "present" ? rules.rows.length : 0).toBe(0);
   });
 
   test("a member's always grants once and files one request to the owner", async () => {
@@ -274,5 +316,114 @@ describe("@crewhaus/control-service/approval-resolve loads no Home package", () 
         'import { a } from "./decisions";\nexport { b } from "@crewhaus/x";\nimport "./side";',
       ),
     ).toEqual(["./decisions", "@crewhaus/x", "./side"]);
+  });
+});
+
+describe("a standing rule is made only while the approval it comes from stands", () => {
+  const sessions = (harness: string) => join(harness, ".crewhaus", "sessions");
+  const supersede = async (harness: string, ref: string) => {
+    const store = createPendingApprovalStore({
+      rootDir: sessions(harness),
+      now: () => new Date(NOW),
+    });
+    const answer = await store.supersede(
+      ref,
+      { actor: {}, via: "cli", reason: "decided-in-error" },
+      {
+        authorize: authorizerFor(
+          harness,
+          {},
+          { approvers: readApproverProjection, now: () => NOW },
+        ),
+      },
+    );
+    expect(answer.outcome).toBe("superseded");
+  };
+  const noRuleFrom = (harness: string, ref: string) => {
+    const rules = readStandingRules(harness);
+    const rows = rules.state === "present" ? rules.rows : [];
+    expect(rows.filter((row) => row.derivedFrom === ref && row.state === "active")).toEqual([]);
+    expect(JSON.stringify(settingsOf(harness) ?? {})).not.toContain("alwaysAllow");
+  };
+  const grant = (harness: string, ref: string, storedBy: () => Promise<string>) => ({
+    harnessDir: harness,
+    rootDir: sessions(harness),
+    ref,
+    choice: "grant" as const,
+    who: {},
+    storeActor: {},
+    storedBy,
+    via: "cli" as const,
+    always: true,
+  });
+
+  test("an approval superseded once it is granted makes no rule, and the grant says why", async () => {
+    const r = rig();
+    const p = await park(r.harness, "Write", { path: "notes/a.md" });
+    const answer = await resolveToolApproval(
+      grant(r.harness, p.id, async () => {
+        // The grant is decided; it is superseded before the rule is written.
+        await supersede(r.harness, p.id);
+        return `local:#${"a".repeat(64)}`;
+      }),
+      { now: () => NOW },
+    );
+    expect(answer.outcome).toBe("decided");
+    expect(answer.rule).toBeUndefined();
+    expect(answer.ruleError).toBe(APPROVAL_GONE);
+    noRuleFrom(r.harness, p.id);
+  });
+
+  test("an approval superseded just before the rule's step runs makes no rule", async () => {
+    const r = rig();
+    const p = await park(r.harness, "Write", { path: "notes/a.md" });
+    const answer = await resolveToolApproval(
+      grant(r.harness, p.id, async () => `local:#${"a".repeat(64)}`),
+      { now: () => NOW },
+      {
+        ruleCommand: async (run) => {
+          await supersede(r.harness, p.id);
+          return run(undefined);
+        },
+      },
+    );
+    expect(answer.outcome).toBe("decided");
+    expect(answer.ruleError).toBe(APPROVAL_GONE);
+    noRuleFrom(r.harness, p.id);
+  });
+
+  test("an approval that stands makes its rule", async () => {
+    const r = rig();
+    const p = await park(r.harness, "Write", { path: "notes/a.md" });
+    const answer = await resolveToolApproval(
+      grant(r.harness, p.id, async () => `local:#${"a".repeat(64)}`),
+      { now: () => NOW },
+    );
+    expect(answer.rule?.derivedFrom).toBe(p.id);
+    expect(approvalStillStands(sessions(r.harness), p.id)).toBeUndefined();
+  });
+
+  test("approvalStillStands refuses a missing, pending, denied or superseded approval", async () => {
+    const r = rig();
+    const root = sessions(r.harness);
+    expect(approvalStillStands(root, "appr_missing")).toBe(APPROVAL_GONE);
+    const pending = await park(r.harness, "Write", { path: "notes/a.md" });
+    expect(approvalStillStands(root, pending.id)).toBe(APPROVAL_GONE);
+    const denied = await park(r.harness, "Write", { path: "notes/b.md" });
+    const no = await resolveToolApproval(
+      { ...grant(r.harness, denied.id, async () => ""), choice: "deny", always: false },
+      { now: () => NOW },
+    );
+    expect(no.outcome).toBe("decided");
+    expect(approvalStillStands(root, denied.id)).toBe(APPROVAL_GONE);
+    const granted = await park(r.harness, "Write", { path: "notes/c.md" });
+    const yes = await resolveToolApproval(
+      { ...grant(r.harness, granted.id, async () => ""), always: false },
+      { now: () => NOW },
+    );
+    expect(yes.outcome).toBe("decided");
+    expect(approvalStillStands(root, granted.id)).toBeUndefined();
+    await supersede(r.harness, granted.id);
+    expect(approvalStillStands(root, granted.id)).toBe(APPROVAL_GONE);
   });
 });

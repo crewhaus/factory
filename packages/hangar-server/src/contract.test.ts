@@ -582,6 +582,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["panes", "array"],
     ["traceObservers", "array"],
     ["waiting", "array"],
+    ["waitingCount", "number"],
     ["deferred", "object"],
   ],
   // views/library.js findPanel — discovery without registration
@@ -671,6 +672,8 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     // The revision every write sends back, and whether this spec takes writes here.
     ["rev", "string"],
     ["readOnly", "object|null"],
+    // The setting names the editor keeps write-only: never held, never offered back.
+    ["credentialNames", "array"],
   ),
   // Every declared path, badged. The reason travels with the badge so the
   // editor never shows a lock without saying who holds the key.

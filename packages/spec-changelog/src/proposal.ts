@@ -25,12 +25,17 @@
  *   - provenance: the source verb (`optimize`/`advise`/`manual`), the content
  *     hash of the proposed spec, and the run id when present.
  *
+ * The PR body carries one `Spec revision: sha256:<hex>` line, the proposed
+ * spec's `specRevision` (`@crewhaus/ir/policy`). `--check-pr` counts a proposal
+ * PR as a witness only for the candidate whose revision that line names.
+ *
  * The PR is opened on a fresh branch carrying ONLY the spec change + the
  * review bundle under `.crewhaus/proposals/<id>/`. The proposal is itself
  * audit-logged (`governance_proposal`) so its provenance is evidenced before
  * any human acts on it.
  */
 import { createHash } from "node:crypto";
+import { specRevision } from "@crewhaus/ir/policy";
 import { type SpecDiffEntry, diffSpecYaml } from "@crewhaus/spec-patch";
 import { renderChangelogEntry } from "./spec-changelog";
 
@@ -139,6 +144,8 @@ export type AssembledProposal = {
   readonly changelogEntry: string;
   readonly prTitle: string;
   readonly prBody: string;
+  /** `specRevision` of the proposed spec text: the PR body's `Spec revision:` line. */
+  readonly specRevision: string;
   /** Whether the proposed spec differs structurally from the current one. */
   readonly hasStructuralChange: boolean;
 };
@@ -187,6 +194,7 @@ export function assembleProposal(opts: AssembleProposalOptions): AssembledPropos
   });
 
   const prTitle = `propose: ${opts.specName} ${opts.proposedVersion} (${opts.source})`;
+  const revision = specRevision(opts.proposedYaml);
   const prBody = buildPrBody({
     specName: opts.specName,
     version: opts.proposedVersion,
@@ -195,6 +203,7 @@ export function assembleProposal(opts: AssembleProposalOptions): AssembledPropos
     ...(opts.evalDelta !== undefined ? { evalDelta: opts.evalDelta } : {}),
     ...(opts.runId !== undefined ? { runId: opts.runId } : {}),
     patchHash: provenance.patchHash,
+    specRevision: revision,
     ...(opts.change !== undefined ? { change: opts.change } : {}),
   });
 
@@ -204,6 +213,7 @@ export function assembleProposal(opts: AssembleProposalOptions): AssembledPropos
     changelogEntry,
     prTitle,
     prBody,
+    specRevision: revision,
     hasStructuralChange: diff.length > 0,
   };
 }
@@ -216,6 +226,7 @@ function buildPrBody(args: {
   evalDelta?: EvalDelta;
   runId?: string;
   patchHash: string;
+  specRevision: string;
   change?: string;
 }): string {
   const lines: string[] = [];
@@ -249,6 +260,8 @@ function buildPrBody(args: {
       `Change: \`${args.change}\` — check it with \`crewhaus changes check ${args.change}\``,
     );
   }
+  // One fixed line, nothing else on it: `--check-pr` reads it back (pr-witness).
+  lines.push(`Spec revision: ${args.specRevision}`);
   lines.push(`Patch hash: \`${args.patchHash.slice(0, 16)}…\``);
   lines.push("");
   lines.push(

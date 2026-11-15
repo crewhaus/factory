@@ -5,8 +5,9 @@
  * harness is disabled (exit 38), and a verb that starts a server refuses while it is
  * disabled. The harness is the working directory, as every one of these verbs resolves
  * `.crewhaus` there, and also each other directory holding a spec the verb runs: the spec
- * it is given as its first argument, or for `eval suite` its `--spec`, else each selected
- * entry's spec, resolved as the verb resolves it. Every one of those operator records is
+ * it is given as its first argument (or the one it runs by default), or for `eval suite` its `--spec`, else each selected
+ * entry's spec, resolved as the verb resolves it, and, for a spec reached through a link,
+ * the directory it resolves to. Every one of those operator records is
  * checked and the stricter verdict decides (a disable over a pause; the working
  * directory's when they refuse alike).
  *
@@ -32,7 +33,7 @@
  * Side-effect-free on import: `index.ts` calls {@link gateEntryPoint} once, before its
  * dispatch switch.
  */
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { EXIT_FOR_ERROR } from "@crewhaus/control-contract";
 import {
@@ -240,22 +241,33 @@ function suiteSpecs(parsed: ParsedArgs, cwd: string): readonly string[] {
 
 /**
  * The directories, other than `cwd`, of the specs a gated verb runs: the spec it is given
- * as its first positional, or for `eval suite` the specs {@link suiteSpecs} names. Empty
- * when the verb's own schema refuses its argv.
+ * as its first positional (for `flywheel run`, the default `crewhaus.yaml` it runs when it
+ * is given none), or for `eval suite` the specs {@link suiteSpecs} names, each
+ * where it is named and, when it can be followed, where it really is. Empty when the
+ * verb's own schema refuses its argv.
  */
 function specDirsOf(subcommand: string, rest: readonly string[], cwd: string): readonly string[] {
   const branch = gatedBranch(subcommand, rest, cwd);
   if (branch === undefined) return [];
   const parsed = parsedFor(branch);
   if (parsed === undefined) return [];
+  // `flywheel run` runs the working directory's `crewhaus.yaml` when it names none.
   const specs =
-    branch.schema === EVAL_SUITE_SCHEMA ? suiteSpecs(parsed, cwd) : [parsed.positional[0]];
+    branch.schema === EVAL_SUITE_SCHEMA
+      ? suiteSpecs(parsed, cwd)
+      : [parsed.positional[0] ?? (branch.schema === FLYWHEEL_SCHEMA ? "crewhaus.yaml" : undefined)];
   const here = resolve(cwd);
   const dirs: string[] = [];
   for (const spec of specs) {
     if (typeof spec !== "string" || spec === "") continue;
-    const dir = dirname(resolve(cwd, spec));
-    if (dir !== here && !dirs.includes(dir)) dirs.push(dir);
+    const named = resolve(cwd, spec);
+    const found = [dirname(named)];
+    try {
+      found.push(dirname(realpathSync(named)));
+    } catch {
+      // A dangling link or a missing file: only the directory it is named in.
+    }
+    for (const dir of found) if (dir !== here && !dirs.includes(dir)) dirs.push(dir);
   }
   return dirs;
 }

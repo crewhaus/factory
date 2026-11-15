@@ -2,15 +2,23 @@
  * Reads change nothing. Over a fleet holding everything a read could be tempted to act
  * on (a daemon started from a terminal that Home has not attached, a runfile whose daemon
  * is gone, a parked approval, OS and webhook rules turned on, access records with a
- * member), every GET row of the route table and `/healthz` leave every harness directory
- * and Home's directory byte-identical, fire no sink and attach nothing. Home's tick does
- * that work instead.
+ * member), every GET row of the route table, every GET operation of the versioned API and
+ * `/healthz` leave every harness directory and Home's directory byte-identical, fire no
+ * sink and attach nothing; the terminal-started daemon still shows as running and the
+ * stale runfile stays where it is. Home's tick does that work instead.
  */
 import { describe, expect, test } from "bun:test";
-import { type Dirent, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  type Dirent,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
 import { join, relative } from "node:path";
 import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
-import { mintRunId } from "@crewhaus/control-contract";
+import { OPERATIONS, mintId, mintRunId } from "@crewhaus/control-contract";
 import { append, runsLedger } from "@crewhaus/control-records";
 import { type HangarHarnessEntry, openHangarRegistry } from "@crewhaus/harness-registry";
 import { signInFromBootLink } from "./__test__/browser";
@@ -18,12 +26,18 @@ import { makeFixtureHarness } from "./fixture";
 import { type ProcessLayer, createProcessLayer } from "./process";
 import { OFF_MAP_OUTSIDE_API, ROUTE_TABLE } from "./route-table";
 import { type TestServer, bootTestServer } from "./testkit";
+import { V1_NOT_SERVED } from "./v1/areas";
 
 const NOW = Date.parse("2026-11-13T12:00:00.000Z");
 
 /** GET rows not driven here, each with why. */
 const EXCLUDED: ReadonlyArray<readonly [string, string]> = [
   ["/boot/:nonce", "a single-use sign-in exchange: spending it is its purpose"],
+];
+
+/** GET operations of the versioned API not driven here, each with why. */
+const EXCLUDED_OPERATIONS: ReadonlyArray<readonly [string, string]> = [
+  ["auth.challenge", "a sign-in row, driven above as the route-table row `authChallenge`"],
 ];
 
 /** Every file under `dir`, relative path to bytes; `skip` names top-level entries left out. */
@@ -83,7 +97,7 @@ function terminalManager(t: TestServer): ProcessLayer {
 }
 
 describe("GET routes change nothing", () => {
-  test("every GET row and /healthz leave the fleet and Home byte-identical", async () => {
+  test("every GET row, every v1 GET operation and /healthz leave the fleet and Home byte-identical", async () => {
     let adoptions = 0;
     const t = bootTestServer({
       now: () => NOW,
@@ -236,6 +250,67 @@ describe("GET routes change nothing", () => {
         expect([row.key, res.status < 500]).toEqual([row.key, true]);
         driven += 1;
       }
+      // Every GET operation of the versioned API, counted against the operation table.
+      const v1Excluded = new Set(EXCLUDED_OPERATIONS.map(([id]) => id));
+      const v1Gets = OPERATIONS.filter((op) => op.method === "GET");
+      for (const id of v1Excluded) expect(v1Gets.some((op) => op.id === id)).toBe(true);
+      const fill: Readonly<Record<string, string>> = {
+        h: live.id,
+        run: runId,
+        cmd: mintId("cmd"),
+        dep: mintId("dep"),
+        rule: mintId("rule"),
+        psn: mintId("psn"),
+        plugin: "notes-pane",
+      };
+      const refFor: Readonly<Record<string, string>> = {
+        "refs.resolve": `${live.id}/exec/${runId}`,
+        "decisions.get": `${live.id}/decision/appr_00000000000000d1`,
+      };
+      const v1Paths: Array<{ key: string; path: string }> = [];
+      for (const op of v1Gets.filter((row) => !v1Excluded.has(row.id))) {
+        const path = op.path.replace(/\{([A-Za-z]+)\}/g, (_m, name: string) => {
+          const value = name === "ref" ? refFor[op.id] : fill[name];
+          if (value === undefined) throw new Error(`${op.id}: no value for {${name}}`);
+          return value;
+        });
+        v1Paths.push({ key: op.id, path });
+        if (["harnesses.get", "harnesses.capabilities", "harnesses.health"].includes(op.id)) {
+          v1Paths.push({ key: `${op.id} (stale)`, path: path.replace(live.id, stale.id) });
+        }
+      }
+      let v1Driven = 0;
+      for (const row of v1Paths) {
+        const controller = new AbortController();
+        const res = await t.fetchRaw(row.path, {
+          headers: { authorization: `Bearer ${t.token}` },
+          signal: controller.signal,
+        });
+        let text = "";
+        if ((res.headers.get("content-type") ?? "").includes("text/event-stream")) {
+          const reader = res.body?.getReader();
+          await reader?.read();
+          controller.abort();
+          await reader?.cancel().catch(() => undefined);
+        } else {
+          text = await res.text();
+        }
+        const opId = row.key.replace(" (stale)", "");
+        if (Object.hasOwn(V1_NOT_SERVED, opId)) {
+          const reason = (JSON.parse(text) as { error?: { reason?: unknown } }).error?.reason;
+          expect([row.key, res.status, reason]).toEqual([row.key, 501, "not_served"]);
+        } else {
+          expect([row.key, res.status < 500]).toEqual([row.key, true]);
+        }
+        if (!row.key.endsWith("(stale)")) v1Driven += 1;
+      }
+      expect(v1Driven).toBe(v1Gets.length - EXCLUDED_OPERATIONS.length);
+      // The daemon started from the terminal shows as running, unattached.
+      const shown = await t.fetchRaw(`/api/v1/harnesses/${live.id}`, {
+        headers: { authorization: `Bearer ${t.token}` },
+      });
+      const display = ((await shown.json()) as { display?: { state?: unknown } }).display;
+      expect(display?.state).toBe("running");
       // The same reads over the harness whose daemon is gone.
       for (const tail of ["proc", `runs/${runId}`, "control/status", "schedulers"]) {
         await (
@@ -250,6 +325,7 @@ describe("GET routes change nothing", () => {
       expect(driven).toBe(ROUTE_TABLE.filter((row) => row.method === "GET").length + 1);
       expect(adoptions).toBe(0);
       expect((t.sinks?.os.length ?? 0) + (t.sinks?.webhook.length ?? 0)).toBe(sinksBefore);
+      expect(existsSync(join(stale.dir, ".crewhaus", "run", "daemon.json"))).toBe(true);
       const after = snapshot();
       expect(after.live).toEqual(before.live);
       expect(after.stale).toEqual(before.stale);
@@ -258,7 +334,7 @@ describe("GET routes change nothing", () => {
     } finally {
       await t.stop();
     }
-  }, 60_000); // a hundred and fifty reads over a live fleet; slow on a loaded runner
+  }, 90_000); // two hundred reads over a live fleet; slow on a loaded runner
 });
 
 describe("the v1 event streams change nothing", () => {

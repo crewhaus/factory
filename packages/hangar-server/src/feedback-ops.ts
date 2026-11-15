@@ -46,7 +46,13 @@ import {
   ratingsDatasetName,
   readDistillState,
 } from "@crewhaus/feedback-distill";
-import { applySpecEdits, diffSpecYaml } from "@crewhaus/spec-patch";
+import {
+  CREDENTIAL_FORM_WORDS,
+  applySpecEdits,
+  credentialFormIn,
+  diffSpecYaml,
+  isCredentialKey,
+} from "@crewhaus/spec-patch";
 import { parseYamlOnly, specRev } from "@crewhaus/spec-patch/commit";
 import { MAX_JSONL_LINES, SESSION_JSONL_RE } from "./constants";
 import {
@@ -543,10 +549,18 @@ function tierFor(target: string, path: readonly string[]): AdviceProposal["tier"
   return classifyPath(target, path).tier;
 }
 
-function readProposals(ctx: M3Context): AdviceProposal[] {
+/**
+ * One read of `suggestions.json`: each row's masked view (`proposal`, what the
+ * feed shows) beside the row's own value (`rawValue`, what an apply writes).
+ * The read is capped (`readJson`), and a cut file does not parse, so a write
+ * only ever comes from a whole file.
+ */
+function readProposalRows(
+  ctx: M3Context,
+): Array<{ readonly proposal: AdviceProposal; readonly rawValue: unknown }> {
   const file = asObject(readJson(ctx, [...ADVICE_SEGMENTS, "suggestions.json"]));
   const raw = Array.isArray(file?.["suggestions"]) ? (file?.["suggestions"] as unknown[]) : [];
-  const out: AdviceProposal[] = [];
+  const out: Array<{ readonly proposal: AdviceProposal; readonly rawValue: unknown }> = [];
   raw.forEach((entry, index) => {
     const row = asObject(entry);
     const patch = asObject(row?.["patch"]);
@@ -554,7 +568,7 @@ function readProposals(ctx: M3Context): AdviceProposal[] {
     const path = (Array.isArray(patch["path"]) ? patch["path"] : []).map((p) => String(p));
     const target = str(patch["target"]) ?? "";
     const tier = tierFor(target, path);
-    out.push({
+    const proposal: AdviceProposal = {
       adviceId: str(row["findingId"]) ?? `adv_${index + 1}`,
       severity: str(row["severity"]) ?? null,
       summary: maskText(str(row["summary"]) ?? ""),
@@ -568,9 +582,51 @@ function readProposals(ctx: M3Context): AdviceProposal[] {
         tier === "auto-tunable"
           ? "inside OPTIMIZABLE_PATHS for this target — the console may write it directly"
           : `${classifyPath(target, path).reason}; applying routes to \`crewhaus propose\` instead of writing the spec`,
-    });
+    };
+    out.push({ proposal, rawValue: patch["value"] });
   });
   return out;
+}
+
+function readProposals(ctx: M3Context): AdviceProposal[] {
+  return readProposalRows(ctx).map((r) => r.proposal);
+}
+
+/**
+ * The credential a proposal's own value holds, in words that never hold the value:
+ * a string `credentialFormIn` flags, a non-empty value under a key that names a
+ * credential (`isCredentialKey`, read only), or anything the feed's masker hides.
+ * The value is read, never changed.
+ */
+function credentialHeldBy(value: unknown): string | undefined {
+  const walk = (v: unknown): string | undefined => {
+    if (typeof v === "string") {
+      const form = credentialFormIn(v);
+      return form === undefined ? undefined : CREDENTIAL_FORM_WORDS[form];
+    }
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        const words = walk(item);
+        if (words !== undefined) return words;
+      }
+      return undefined;
+    }
+    if (typeof v === "object" && v !== null) {
+      for (const [k, item] of Object.entries(v as Record<string, unknown>)) {
+        if (isCredentialKey(k) && item !== null && item !== undefined && item !== "") {
+          return "a value under a key that names a credential";
+        }
+        const words = walk(item);
+        if (words !== undefined) return words;
+      }
+    }
+    return undefined;
+  };
+  const words = walk(value);
+  if (words !== undefined) return words;
+  return JSON.stringify(maskDeep(value)) !== JSON.stringify(value)
+    ? "a value the advice feed masks"
+    : undefined;
 }
 
 /** `GET /api/h/:id/feedback/advice` — the advisory feed. */
@@ -641,8 +697,10 @@ export const adviceRun: M3Handler = (ctx) => {
  */
 export const adviceApply: M3Handler = async (ctx) => {
   const adviceId = ctx.params["adviceId"] as string;
-  const proposal = readProposals(ctx).find((p) => p.adviceId === adviceId);
-  if (proposal === undefined) {
+  // The tier, the path and the value all come from this one read, made at apply
+  // time. The edit writes the row's own value; the masked view is only shown.
+  const row = readProposalRows(ctx).find((r) => r.proposal.adviceId === adviceId);
+  if (row === undefined) {
     // A typed refusal, not a 404: nothing about the request was malformed,
     // and the feed renders "that proposal is gone" beside the id it lost.
     return {
@@ -654,6 +712,7 @@ export const adviceApply: M3Handler = async (ctx) => {
       applied: false,
     };
   }
+  const { proposal, rawValue } = row;
   const before = readSpecYaml(ctx.harnessDir ?? "");
   if (before === "") {
     return {
@@ -663,9 +722,27 @@ export const adviceApply: M3Handler = async (ctx) => {
     };
   }
 
+  // The person who confirms an apply sees the masked view, so a value that holds a
+  // credential is never written from here: the spec editor or `crewhaus propose`
+  // carries it, where the value itself is what is reviewed.
+  const held = proposal.op === "remove" ? undefined : credentialHeldBy(rawValue);
+  if (held !== undefined) {
+    const reason = `this proposal's value holds a credential (${held}) — nothing was written`;
+    throw new HttpError(409, reason, {
+      ok: false,
+      code: "edit_rejected",
+      reason,
+      adviceId,
+      path: proposal.path,
+      applied: false,
+      route: "the spec editor or `crewhaus propose`",
+    });
+  }
+
+  // The rationale a version records stays the masked text: it is not the value.
   const edit = {
     path: proposal.path,
-    ...(proposal.op === "remove" ? {} : { value: proposal.value }),
+    ...(proposal.op === "remove" ? {} : { value: rawValue }),
     ...(proposal.rationale !== "" ? { rationale: proposal.rationale } : {}),
   };
   // A change to a security surface, or one that raises spending, is the security edit

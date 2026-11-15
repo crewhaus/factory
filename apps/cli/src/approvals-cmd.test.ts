@@ -25,6 +25,7 @@ import { type LocalIdentity, ensureAccessSetUp, localActorOf } from "@crewhaus/a
 import { mintId } from "@crewhaus/control-contract";
 import {
   foldStates,
+  readApproverProjection,
   readProposals,
   readStandingRules,
   writeHarnessIdentity,
@@ -378,6 +379,160 @@ describe("finding the harness when the store was found through the environment",
     expect(existsSync(join(cwd, ".crewhaus"))).toBe(false);
   }, 30_000);
 
+  /** Governed harness `g`, holding a harness `g/elsewhere` whose own session root is the root. */
+  async function nestedIn(governed: boolean) {
+    const { hangarRoot, owner } = await home();
+    const g = tmp("approvals-governed-");
+    if (governed) project(g, owner, [], hangarRoot);
+    const nested = join(g, "elsewhere");
+    mkdirSync(join(nested, ".crewhaus"), { recursive: true });
+    writeFileSync(join(nested, ".env"), "CREWHAUS_SESSION_DIR=sessions\n");
+    const root = join(nested, "sessions");
+    const p = await park(root);
+    return { hangarRoot, g, nested, root, p };
+  }
+
+  test("a harness nested in a governed harness does not decide the governed harness's roots", async () => {
+    const { hangarRoot, g, nested, root, p } = await nestedIn(true);
+    const r = rig(hangarRoot, tmp("approvals-elsewhere-"));
+    for (const argv of [
+      ["grant", p.id],
+      ["grant", p.id, "--always"],
+    ]) {
+      const answer = await r.run(argv, { identity: STRANGER, scopedSessionRoot: () => root });
+      expect([argv.join(" "), answer.code]).toEqual([argv.join(" "), 55]);
+      expect(answer.stderr).toContain("--dir");
+      expect(answer.stderr).toContain(g);
+    }
+    expect(foldReadOnly(root).records[0]?.decision).toBeUndefined();
+    expect(receipts(nested)).toEqual([]);
+    expect(receipts(g)).toEqual([]);
+    expect(readStandingRules(nested).state).toBe("absent");
+    expect(existsSync(join(nested, ".crewhaus", "settings.json"))).toBe(false);
+  }, 30_000);
+
+  test("a harness nested in an ungoverned directory decides its own roots", async () => {
+    const { hangarRoot, root, p } = await nestedIn(false);
+    const r = rig(hangarRoot, tmp("approvals-elsewhere-"));
+    const answer = await r.run(["grant", p.id], {
+      identity: STRANGER,
+      scopedSessionRoot: () => root,
+    });
+    expect(answer.code).toBe(0);
+    expect(foldReadOnly(root).records[0]?.decision).toBe("grant");
+  }, 30_000);
+
+  test("two ungoverned harnesses inside a governed one: refused", async () => {
+    const { hangarRoot, owner } = await home();
+    const g = tmp("approvals-governed-");
+    project(g, owner, [], hangarRoot);
+    const outer = join(g, "outer");
+    mkdirSync(join(outer, ".crewhaus"), { recursive: true });
+    writeFileSync(join(outer, ".env"), `CREWHAUS_SESSION_DIR=${join("inner", "s")}\n`);
+    const inner = join(outer, "inner");
+    mkdirSync(join(inner, ".crewhaus"), { recursive: true });
+    writeFileSync(join(inner, ".env"), "CREWHAUS_SESSION_DIR=s\n");
+    const r = rig(hangarRoot, tmp("approvals-elsewhere-"));
+    const root = join(inner, "s");
+    const p = await park(root);
+    const answer = await r.run(["grant", p.id], { scopedSessionRoot: () => root });
+    expect(answer.code).toBe(55);
+    expect(answer.stderr).toContain(g);
+    expect(answer.stderr).toContain("--dir");
+    expect(foldReadOnly(root).records[0]?.decision).toBeUndefined();
+  }, 30_000);
+
+  test("a --dir or working directory whose sessions link into a governed harness decides nothing", async () => {
+    const { hangarRoot, owner } = await home();
+    const g = tmp("approvals-governed-");
+    project(g, owner, [], hangarRoot);
+    const p = await park(sessionsOf(g));
+    const evil = tmp("approvals-evil-");
+    mkdirSync(join(evil, ".crewhaus"), { recursive: true });
+    try {
+      symlinkSync(sessionsOf(g), sessionsOf(evil), "dir");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return;
+      throw err;
+    }
+    const r = rig(hangarRoot, evil);
+    // `--dir g` names the governed harness: the stranger is refused by its list.
+    expect((await r.run(["grant", p.id, "--dir", g], { identity: STRANGER })).code).toBe(51);
+    for (const argv of [
+      ["grant", p.id, "--dir", evil],
+      ["grant", p.id],
+      ["grant", p.id, "--always"],
+    ]) {
+      const answer = await r.run(argv, { identity: STRANGER });
+      expect([argv.join(" "), answer.code]).toEqual([argv.join(" "), 55]);
+      expect(answer.stderr).toContain(`--dir ${g}`);
+    }
+    expect(foldReadOnly(sessionsOf(g)).records[0]?.decision).toBeUndefined();
+    expect(receipts(evil)).toEqual([]);
+    expect(readStandingRules(evil).state).toBe("absent");
+    expect(existsSync(join(evil, ".crewhaus", "settings.json"))).toBe(false);
+    // The owner, through the governed harness itself, decides.
+    const ownerRun = await r.run(["grant", p.id, "--dir", g]);
+    expect(ownerRun.code).toBe(0);
+    expect(foldReadOnly(sessionsOf(g)).records[0]?.decidedByPrincipal).toBe(owner);
+  }, 30_000);
+
+  test("--dir naming a harness nested in a governed harness decides nothing", async () => {
+    const { hangarRoot, g, nested } = await nestedIn(true);
+    const p = await park(sessionsOf(nested));
+    const r = rig(hangarRoot, tmp("approvals-elsewhere-"));
+    for (const identity of [STRANGER, OWNER_USER]) {
+      const answer = await r.run(["grant", p.id, "--dir", nested], { identity });
+      expect([identity.username, answer.code]).toEqual([identity.username, 55]);
+      expect(answer.stderr).toContain(`--dir ${g}`);
+    }
+    expect(foldReadOnly(sessionsOf(nested)).records[0]?.decision).toBeUndefined();
+    expect(receipts(nested)).toEqual([]);
+    // An ungoverned harness that lies inside no governed one decides with --dir.
+    const free = await nestedIn(false);
+    const q = await park(sessionsOf(free.nested));
+    const decided = await rig(free.hangarRoot, tmp("approvals-elsewhere-")).run([
+      "grant",
+      q.id,
+      "--dir",
+      free.nested,
+    ]);
+    expect(decided.code).toBe(0);
+    expect(foldReadOnly(sessionsOf(free.nested)).records[0]?.decision).toBe("grant");
+  }, 30_000);
+
+  test("a nested approver list another Home wrote does not decide a governed harness's roots", async () => {
+    const { hangarRoot, g, nested, root, p } = await nestedIn(true);
+    const b = join(tmp("approvals-other-home-"), "hangar");
+    const setUp = await ensureAccessSetUp(b, { localActor: localActorOf(STRANGER) });
+    if (!setUp.ok) throw new Error(setUp.reason);
+    project(nested, setUp.result.owner, [], b);
+    const r = rig(b, tmp("approvals-elsewhere-"));
+    for (const argv of [
+      ["grant", p.id],
+      ["grant", p.id, "--dir", nested],
+    ]) {
+      const answer = await r.run(argv, { identity: STRANGER, scopedSessionRoot: () => root });
+      expect([argv.join(" "), answer.code]).toEqual([argv.join(" "), 55]);
+      expect(answer.stderr).toContain(`--dir ${g}`);
+    }
+    expect(foldReadOnly(root).records[0]?.decision).toBeUndefined();
+    expect(receipts(nested)).toEqual([]);
+    expect(receipts(g)).toEqual([]);
+    expect(readStandingRules(nested).state).toBe("absent");
+    // A nested list written for the enclosing list's own Home root decides, by that Home.
+    const same = await nestedIn(true);
+    const enclosing = readApproverProjection(same.g);
+    if (enclosing.state !== "present") throw new Error("no enclosing list");
+    project(same.nested, enclosing.projection.owner, [], same.hangarRoot);
+    const decided = await rig(same.hangarRoot, tmp("approvals-elsewhere-")).run(
+      ["grant", same.p.id],
+      { scopedSessionRoot: () => same.root },
+    );
+    expect(decided.code).toBe(0);
+    expect(foldReadOnly(same.root).records[0]?.decidedByPrincipal).toBe(enclosing.projection.owner);
+  }, 30_000);
+
   test("a session root reached through a link is decided by the harness it lies in", async () => {
     const { hangarRoot, owner } = await home();
     const h = tmp("approvals-linked-");
@@ -509,6 +664,10 @@ describe("a local user's authority comes from the Home that wrote the approver l
     const always = await r.run(["grant", p.id, "--always"], fromB);
     expect(always.code).toBe(51);
     expect(foldReadOnly(sessionsOf(r.harness)).records[0]?.decision).toBeUndefined();
+    // Its receipts name the keyed local actor: B's link names nobody on this harness.
+    const refused = receipts(r.harness).filter((x) => x["kind"] === "decisions.resolve");
+    expect(refused.map((x) => x["state"])).toEqual(["rejected", "rejected"]);
+    for (const receipt of refused) expect(receipt["actor"]).toMatch(/^local:#[0-9a-f]{64}$/);
     expect(readStandingRules(r.harness).state).toBe("absent");
     // From A, the owner decides.
     const ownerRun = await r.run(["grant", p.id]);
@@ -534,7 +693,24 @@ describe("a rule's pattern prints as it is held", () => {
     expect(displayPattern("a\u0085b")).toBe('"a\\u0085b"');
     expect(displayPattern("a\u001b[2Jb")).toBe('"a\\u001b[2Jb"');
     expect(displayPattern("a\u202eb\u2066")).toBe('"a\\u202eb\\u2066"');
+    expect(displayPattern("a\u2028b")).toBe('"a\\u2028b"');
+    expect(displayPattern("a\u{E0041}b")).toBe('"a\\u{e0041}b"');
+    expect(displayPattern("a\u200bb")).toBe('"a\\u200bb"');
   });
+
+  test("a hand-written allow holding a zero-width space lists escaped", async () => {
+    const { hangarRoot } = await home();
+    const r = rig(hangarRoot);
+    mkdirSync(join(r.harness, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(r.harness, ".crewhaus", "settings.json"),
+      `${JSON.stringify({ permissions: { rules: [{ type: "alwaysAllow", pattern: "Write\u200b" }] } })}\n`,
+    );
+    const listed = await r.run(["rules"]);
+    expect(listed.code).toBe(0);
+    expect(listed.stdout.indexOf("Write\\u200b")).toBeGreaterThan(-1);
+    expect(listed.stdout.includes("\u200b")).toBe(false);
+  }, 30_000);
 
   test("a hand-written allow holding a bidirectional override lists escaped", async () => {
     const { hangarRoot } = await home();

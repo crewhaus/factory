@@ -11,7 +11,11 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { conflictModel } from "../assets/js/ui/conflict.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import { flatten, formModel } from "../assets/js/ui/schema-form.js";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import {
+  concealedPredicate,
+  draftOf,
   draftTextFor,
   editPath,
   editsFor,
@@ -396,7 +400,9 @@ describe("the settings form", () => {
 
   test("a block's pane never starts from a masked read, and says which values it hides", async () => {
     const source = await viewSource("spec-edit.js");
-    expect(source).toContain("value: node.writeOnly === true ? undefined : node.paneSeed,");
+    expect(source).toContain(
+      "value: node.writeOnly === true || node.concealed === true ? undefined : node.paneSeed,",
+    );
     expect(source).toContain(
       "hidden: node.writeOnly === true && Array.isArray(node.hidden) ? node.hidden : [],",
     );
@@ -751,5 +757,201 @@ describe("a value typed over a hidden one, rendered", () => {
     const notice = source.slice(at, source.indexOf("})", at));
     expect(notice).toContain("crewhaus.yaml");
     expect(notice.includes("JSON pane")).toBe(false);
+  });
+});
+
+describe("a hidden or credential's setting keeps nothing typed into it", () => {
+  const g = globalThis as Record<string, unknown>;
+  const saved = { document: g["document"], Node: g["Node"], HTMLElement: g["HTMLElement"] };
+  beforeAll(() => {
+    g["document"] = formDocument;
+    g["Node"] = FormNode;
+    g["HTMLElement"] = FormNode;
+  });
+  afterAll(() => {
+    g["document"] = saved.document;
+    g["Node"] = saved.Node;
+    g["HTMLElement"] = saved.HTMLElement;
+  });
+
+  // A typed value, built at runtime: it must never be found anywhere it is kept.
+  const TYPED = ["typed", "value", String(4242)].join("-");
+
+  /** A form over one `probe` block whose settings are those given, with the rows given. */
+  const bodyOf = (
+    properties: Record<string, unknown>,
+    effective: unknown[],
+    credentialNames: string[] = [],
+  ) => ({
+    present: true,
+    schema: {
+      $ref: "#/definitions/t",
+      definitions: {
+        t: {
+          type: "object",
+          properties: { probe: { type: "object", properties } },
+          additionalProperties: false,
+        },
+      },
+    },
+    effective,
+    effectiveTruncated: false,
+    credentialNames,
+    rev: "r1",
+  });
+  const render = (ctx: { id: string }, body: unknown): FormNode =>
+    settingsCard(ctx, body, null, { readOnly: { held: false } }, () => undefined) as FormNode;
+  const fieldFor = (card: FormNode, setting: string): FormNode => {
+    const field = card.find(
+      (n) => n.dataset["fieldKey"] !== undefined && n.textContent.includes(setting),
+    );
+    expect(field).toBeDefined();
+    return field as FormNode;
+  };
+  const idsFor = (ctx: { id: string }): string[] =>
+    (unsavedEntryIds() as string[]).filter((id) => id.startsWith(`${ctx.id}\u0000`));
+  const hidden = (segment: string) => ({
+    segments: ["probe", segment],
+    value: "[redacted]",
+    source: "declared",
+  });
+
+  test("a hidden text setting keeps nothing, and a re-render shows it empty", () => {
+    const ctx = { id: "h-wo-text" };
+    const body = bodyOf({ word: { type: "string" } }, [hidden("word")]);
+    const input = fieldFor(render(ctx, body), "probe.word").find((n) => n.tag === "input");
+    expect(input?.attrs["type"]).toBe("password");
+    (input as FormNode).value = TYPED;
+    input?.fire("input");
+    expect(idsFor(ctx)).toEqual([]);
+    expect(fieldFor(render(ctx, body), "probe.word").find((n) => n.tag === "input")?.value).toBe(
+      "",
+    );
+  });
+
+  test("a hidden yes-or-no setting keeps nothing, and a re-render shows it unset", () => {
+    const ctx = { id: "h-wo-bool" };
+    const body = bodyOf({ flag: { type: "boolean" } }, [hidden("flag")]);
+    const select = fieldFor(render(ctx, body), "probe.flag").find((n) => n.tag === "select");
+    expect(select).toBeDefined();
+    (select as FormNode).value = "0";
+    select?.fire("change");
+    expect(idsFor(ctx)).toEqual([]);
+    const again = fieldFor(render(ctx, body), "probe.flag").find((n) => n.tag === "select");
+    expect(again?.children[0]?.attrs["value"]).toBe("");
+    expect(again?.children.some((o) => (o as unknown as { selected?: boolean }).selected)).toBe(
+      false,
+    );
+  });
+
+  test("a hidden choice setting keeps nothing, and a re-render shows it unset", () => {
+    const ctx = { id: "h-wo-select" };
+    const body = bodyOf({ mode: { type: "string", enum: ["fast", "slow"] } }, [hidden("mode")]);
+    const select = fieldFor(render(ctx, body), "probe.mode").find((n) => n.tag === "select");
+    expect(select).toBeDefined();
+    (select as FormNode).value = "1";
+    select?.fire("change");
+    expect(idsFor(ctx)).toEqual([]);
+    const again = fieldFor(render(ctx, body), "probe.mode").find((n) => n.tag === "select");
+    expect(again?.children[0]?.attrs["value"]).toBe("");
+    expect(again?.children.some((o) => (o as unknown as { selected?: boolean }).selected)).toBe(
+      false,
+    );
+  });
+
+  test("a hidden list setting keeps nothing, and a re-render shows it with no items", () => {
+    const ctx = { id: "h-wo-list" };
+    const body = bodyOf({ names: { type: "array", items: { type: "string" } } }, [
+      { segments: ["probe", "names"], value: ["[redacted]"], source: "declared" },
+    ]);
+    const field = fieldFor(render(ctx, body), "probe.names");
+    const add = field.find((n) => n.tag === "button" && n.textContent === "Add an item");
+    expect(add).toBeDefined();
+    add?.fire("click");
+    const item = field.find((n) => n.tag === "input");
+    expect(item).toBeDefined();
+    (item as FormNode).value = TYPED;
+    item?.fire("input");
+    expect(idsFor(ctx)).toEqual([]);
+    expect(
+      fieldFor(render(ctx, body), "probe.names").find((n) => n.tag === "input"),
+    ).toBeUndefined();
+  });
+
+  test("an absent credential setting is a password field that keeps nothing", () => {
+    const ctx = { id: "h-credential" };
+    const body = bodyOf(
+      { api_key: { type: "string" }, label: { type: "string" } },
+      [{ segments: ["probe", "label"], value: "plain", source: "declared" }],
+      ["api_key"],
+    );
+    const input = fieldFor(render(ctx, body), "probe.api_key").find((n) => n.tag === "input");
+    expect(input?.attrs["type"]).toBe("password");
+    expect(input?.attrs["autocomplete"]).toBe("new-password");
+    (input as FormNode).value = TYPED;
+    input?.fire("input");
+    expect(idsFor(ctx)).toEqual([]);
+    expect(fieldFor(render(ctx, body), "probe.api_key").find((n) => n.tag === "input")?.value).toBe(
+      "",
+    );
+  });
+
+  test("a credential setting in the shape the masked schema arrives in is a concealed block", () => {
+    const schema = bodyOf({ api_key: { type: "[redacted]" } }, []).schema;
+    const nodeOf = (names?: string[]) =>
+      flatten(
+        formModel(schema, [], [], names === undefined ? {} : { credentialNames: names }).groups,
+      ).find(
+        (n: { key?: string; segments?: string[] }) => n.segments?.join(".") === "probe.api_key",
+      );
+    expect(nodeOf(["api_key"])).toMatchObject({ kind: "json", concealed: true });
+    expect(nodeOf()?.concealed).toBe(false);
+  });
+
+  test("a conflict draft holds no typed value of a credential's setting", async () => {
+    const model = formModel(bodyOf({ api_key: { type: "string" } }, []).schema, [], [], {
+      credentialNames: ["api_key"],
+    });
+    const concealedAt = concealedPredicate(model, ["api_key"]);
+    const edit = { path: ["probe", "api_key"], value: TYPED };
+    for (const text of [draftOf(edit, concealedAt), draftOf([edit], concealedAt)]) {
+      expect(text.includes(TYPED)).toBe(false);
+      expect(text).toContain("[redacted]");
+    }
+    expect(JSON.parse(draftOf(edit, concealedAt))).toEqual({
+      path: ["probe", "api_key"],
+      value: "[redacted]",
+    });
+    const block = draftOf(
+      [{ path: ["probe"], value: { api_key: TYPED, label: "x" } }],
+      concealedAt,
+    );
+    expect(JSON.parse(block)).toEqual([
+      { path: ["probe"], value: { api_key: "[redacted]", label: "x" } },
+    ]);
+    // With no test for what is a credential, every value is hidden.
+    expect(JSON.parse(draftOf({ path: ["probe", "label"], value: "x" }))).toEqual({
+      path: ["probe", "label"],
+      value: "[redacted]",
+    });
+    const offered = await draftTextFor({}, { draft: draftOf(edit, concealedAt) });
+    expect(offered.includes(TYPED)).toBe(false);
+  });
+
+  test("a write-only setting's path is hidden in a draft at and under it", () => {
+    const body = bodyOf({ word: { type: "string" } }, [hidden("word")]);
+    const model = formModel(body.schema, body.effective, [], {});
+    const concealedAt = concealedPredicate(model, []);
+    expect(concealedAt(["probe", "word"])).toBe(true);
+    expect(concealedAt(["probe", "other"])).toBe(false);
+    expect(JSON.parse(draftOf({ path: ["probe", "word"], value: TYPED }, concealedAt)).value).toBe(
+      "[redacted]",
+    );
+  });
+
+  test("both conflict drafts go through draftOf", async () => {
+    const source = await viewSource("spec-edit.js");
+    expect(source).toContain("draft: draftOf(edit, concealedAt),");
+    expect(source).toContain("draft: draftOf(edits, concealedAt),");
   });
 });

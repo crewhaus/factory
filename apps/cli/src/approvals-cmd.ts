@@ -20,7 +20,7 @@
  * so a test drives it in-process.
  */
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import type { LocalIdentity } from "@crewhaus/access-control";
 import {
@@ -42,6 +42,7 @@ import {
   callValues,
   currentLocalIdentity,
   governedAncestorOf,
+  governedAncestorsOf,
   harnessForSessionRoot,
   outcomeOf,
 } from "@crewhaus/control-service";
@@ -88,25 +89,38 @@ export const NO_HARNESS_LINE =
 /** The sub-verbs that change something, and so refuse under an agent's tool. */
 const CHANGES: ReadonlySet<string> = new Set(["grant", "deny", "supersede", "defer", "revoke"]);
 
-/** Every control or bidirectional-text character {@link DISPLAY_CONTROL_RE} names. */
+/** Every control, bidirectional-text or other invisible character {@link DISPLAY_CONTROL_RE} names. */
 const DISPLAY_CONTROLS = new RegExp(DISPLAY_CONTROL_RE.source, "gu");
 
-/** `text` with each control or bidirectional-text character written as `\uXXXX`. */
+/**
+ * `text` with each control, bidirectional-text or other invisible character written as
+ * `\uXXXX`, or as `\u{XXXXX}` above U+FFFF, in lowercase hex.
+ */
 function escapeControls(text: string): string {
-  return text.replace(
-    DISPLAY_CONTROLS,
-    (char) => `\\u${(char.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`,
-  );
+  return text.replace(DISPLAY_CONTROLS, (char) => {
+    const code = char.codePointAt(0) ?? 0;
+    const hex = code.toString(16);
+    return code > 0xffff ? `\\u{${hex}}` : `\\u${hex.padStart(4, "0")}`;
+  });
 }
 
 /**
  * A rule's pattern, or another value a rule's line prints (its end), as a line prints
- * it: as it is, or, when it holds a control or bidirectional-text character, as a JSON
- * string with every such character escaped, so a terminal shows what the value holds
- * rather than acting on it.
+ * it: as it is, or, when it holds a control, bidirectional-text or other invisible
+ * character, as a JSON string with every such character escaped, so a terminal shows
+ * what the value holds rather than acting on it.
  */
 export function displayPattern(text: string): string {
   return holdsDisplayControl(text) ? escapeControls(JSON.stringify(text)) : text;
+}
+
+/** `path` with its links followed, or as resolved when it cannot be. */
+function realOrResolved(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 /**
@@ -117,13 +131,6 @@ export function displayPattern(text: string): string {
  * Other heads that write a harness's control state may ask the same.
  */
 export function isKnownHarness(dir: string, deps: Pick<ApprovalsDeps, "registryDirs">): boolean {
-  const realOrResolved = (path: string): string => {
-    try {
-      return realpathSync(path);
-    } catch {
-      return resolve(path);
-    }
-  };
   const real = realOrResolved(dir);
   let rows: readonly string[] = [];
   try {
@@ -248,20 +255,91 @@ type Located =
   | { readonly ok: false; readonly code: number; readonly message: string };
 
 /**
+ * The refusal for a session root inside a governed harness that the harness it was
+ * matched to (or none) does not decide. `--dir` reaches only a harness's own store, so
+ * the advice names the governed harness, whose own approvals are the ones it decides.
+ */
+function liesInsideMessage(rootDir: string, governed: string): string {
+  return `the approvals under ${rootDir} lie inside ${governed}, a harness with a list of who may approve, and are decided only as that harness's own approvals; pass --dir ${governed} to decide those`;
+}
+
+/** Whether real path `child` is `parent` or lies inside it. */
+function insideReal(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/**
+ * Why the session root `rootDir` may not be decided with `harnessDir`'s approver list,
+ * or `undefined` when it may. Every governed harness above the root counts, both where
+ * the root is written and where it lands on disk: the root is decided only by one of
+ * them, and only when no other governed harness above the root lies inside it, and every
+ * other one names the same Home access root as its own list (so the same Home wrote
+ * both). A root inside no governed harness is not refused here. Harnesses are compared
+ * by their real paths.
+ */
+function governedRefusal(rootDir: string, harnessDir: string | undefined): string | undefined {
+  const governed = governedAncestorsOf(rootDir);
+  const nearest = governed[0];
+  if (nearest === undefined) return undefined;
+  const matched = harnessDir === undefined ? undefined : realOrResolved(harnessDir);
+  const own =
+    matched === undefined
+      ? undefined
+      : governed.find((above) => realOrResolved(above.dir) === matched);
+  if (matched === undefined || own === undefined) return liesInsideMessage(rootDir, nearest.dir);
+  const ownRoot = own.read.state === "present" ? own.read.projection.accessRoot : undefined;
+  for (const above of governed) {
+    if (above === own) continue;
+    if (insideReal(matched, realOrResolved(above.dir))) {
+      return liesInsideMessage(rootDir, above.dir);
+    }
+    const aboveRoot = above.read.state === "present" ? above.read.projection.accessRoot : undefined;
+    if (ownRoot === undefined || aboveRoot !== ownRoot) {
+      return liesInsideMessage(rootDir, above.dir);
+    }
+  }
+  return undefined;
+}
+
+/**
  * The store the run path writes to, and the harness whose approver list decides. An
  * explicit `--dir` wins. With no scoped root, the working directory decides when it is a
  * known harness ({@link isKnownHarness}); otherwise no harness does, and nothing is kept
  * beside the decision. A root a tenant scope or `CREWHAUS_SESSION_DIR` names is matched
- * to the harness it belongs to; one that names several is said so. One that names none
- * is refused when it lies inside a harness that has an approver list (`--dir` names the
- * harness that decides it), and is otherwise decided by the working directory only when
- * that is a known harness with `.crewhaus/`.
+ * to the harness it belongs to; one that names several is said so.
+ *
+ * Whichever way the root is found (`--dir`, the working directory or the environment), a
+ * root that lies inside a harness with an approver list is decided only by that harness
+ * ({@link governedRefusal}); otherwise it is refused (`--dir` names the harness whose own
+ * approvals it decides). A root the environment names that matches no harness and lies
+ * inside a governed one is refused too. A root that names none and lies inside no
+ * governed harness is decided by the working directory only when that is a known harness
+ * with `.crewhaus/`. A refusal writes nothing.
  */
 function locate(args: ParsedArgs, deps: ApprovalsDeps, always: boolean): Located {
+  const found = matchRoot(args, deps, always);
+  if (!found.ok) return found;
+  const refused = governedRefusal(found.rootDir, found.harnessDir);
+  if (refused !== undefined) {
+    return { ok: false, code: EXIT_FOR_ERROR.invalid, message: refused };
+  }
+  if (found.noHarness) deps.stderr(`${NO_HARNESS_LINE}\n`);
+  return { ok: true, rootDir: found.rootDir, harnessDir: found.harnessDir };
+}
+
+/** {@link locate}'s match, before the governed-harness check; `noHarness` asks for its line. */
+function matchRoot(
+  args: ParsedArgs,
+  deps: ApprovalsDeps,
+  always: boolean,
+):
+  | (Located & { readonly ok: false })
+  | (Located & { readonly ok: true; readonly noHarness: boolean }) {
   const dir = str(args, "dir");
   if (dir !== undefined) {
     const harnessDir = resolve(deps.cwd, dir);
-    return { ok: true, rootDir: join(harnessDir, SESSIONS_SUBDIR), harnessDir };
+    return { ok: true, rootDir: join(harnessDir, SESSIONS_SUBDIR), harnessDir, noHarness: false };
   }
   const scoped = deps.scopedSessionRoot();
   if (scoped === undefined) {
@@ -269,6 +347,7 @@ function locate(args: ParsedArgs, deps: ApprovalsDeps, always: boolean): Located
       ok: true,
       rootDir: join(deps.cwd, SESSIONS_SUBDIR),
       harnessDir: isKnownHarness(deps.cwd, deps) ? deps.cwd : undefined,
+      noHarness: false,
     };
   }
   // The working directory is a candidate only when it is a known harness with `.crewhaus/`:
@@ -278,7 +357,9 @@ function locate(args: ParsedArgs, deps: ApprovalsDeps, always: boolean): Located
     registry: deps.registryDirs,
     ...(cwdHolds ? { cwd: deps.cwd } : {}),
   });
-  if (found.state === "one") return { ok: true, rootDir: scoped, harnessDir: found.dir };
+  if (found.state === "one") {
+    return { ok: true, rootDir: scoped, harnessDir: found.dir, noHarness: false };
+  }
   if (found.state === "several") {
     const governed = found.dirs.some((d) => readApproverProjection(d).state !== "absent");
     if (governed || always) {
@@ -288,8 +369,7 @@ function locate(args: ParsedArgs, deps: ApprovalsDeps, always: boolean): Located
         message: `the approvals under ${scoped} belong to more than one harness (${found.dirs.join(", ")}); pass --dir <harness> to say which`,
       };
     }
-    deps.stderr(`${NO_HARNESS_LINE}\n`);
-    return { ok: true, rootDir: scoped, harnessDir: undefined };
+    return { ok: true, rootDir: scoped, harnessDir: undefined, noHarness: true };
   }
   if (always) {
     return {
@@ -298,16 +378,21 @@ function locate(args: ParsedArgs, deps: ApprovalsDeps, always: boolean): Located
       message: `--always writes .crewhaus/settings.json under the HARNESS root, but the approvals store was located via CREWHAUS_SESSION_DIR/tenant scope (${scoped}), and no harness it belongs to was found. Re-run with --dir <harness root>.`,
     };
   }
+  // The root matches no harness, so no governed harness above it names it as its own.
   const governed = governedAncestorOf(scoped);
   if (governed !== undefined) {
     return {
       ok: false,
       code: EXIT_FOR_ERROR.invalid,
-      message: `the approvals under ${scoped} lie inside ${governed}, a harness with a list of who may approve, and no harness names them as its own; pass --dir <harness> to say which harness decides them`,
+      message: liesInsideMessage(scoped, governed),
     };
   }
-  deps.stderr(`${NO_HARNESS_LINE}\n`);
-  return { ok: true, rootDir: scoped, harnessDir: cwdHolds ? deps.cwd : undefined };
+  return {
+    ok: true,
+    rootDir: scoped,
+    harnessDir: cwdHolds ? deps.cwd : undefined,
+    noHarness: true,
+  };
 }
 
 /** Run `change` as a receipted command, after this process's one recovery of the harness. */

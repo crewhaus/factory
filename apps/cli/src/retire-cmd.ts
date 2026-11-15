@@ -162,6 +162,7 @@ export async function retireCommand(o: RetireCommandOptions): Promise<DaemonComm
       kind: "controls.retire",
       ...(harnessId !== undefined ? { target: `home/harness/${harnessId}` } : {}),
       ledger: "workspace",
+      onHarness: o.harnessDir,
       via: "cli",
       body: { stop: o.stop, force: o.force, forceUnverified: o.forceUnverified },
     },
@@ -253,6 +254,18 @@ export async function retireCommand(o: RetireCommandOptions): Promise<DaemonComm
               `  left ${removed.length} run token file(s) out of the archived state (a daemon makes each again at start)`,
             );
           }
+        }
+        // Retire is done only when every step after the archive did its part.
+        if (result.postArchiveFailures.length > 0) {
+          if (result.postArchiveFailures.some((f) => f.step === "keepDisabled")) {
+            lines.push(
+              `  It is archived, but not disabled where it lives: run \`crewhaus daemon disable\` in ${o.harnessDir}.`,
+            );
+          }
+          return {
+            settle: { state: "failed", effects: effects.ordered, outcome: outcomeOf("internal") },
+            value: { lines, exitCode: 1 },
+          };
         }
         return {
           settle: { state: "succeeded", effects: effects.ordered },

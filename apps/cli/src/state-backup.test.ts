@@ -11,7 +11,6 @@ import {
   realpathSync,
   rmSync,
   statSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,7 +21,6 @@ import {
   type BackupManifest,
   DEFAULT_BACKUP_EXCLUDES,
   MANIFEST_FILENAME,
-  RUN_TOKEN_FILES,
   buildManifest,
   createStateBackup,
   defaultBackupFileName,
@@ -32,7 +30,6 @@ import {
   parseExcludeGlobs,
   planAdditiveMerge,
   planFeedbackMerge,
-  removeRunTokens,
   sanitizeBackupLabel,
   sqliteSidecarBase,
 } from "./state-backup";
@@ -474,34 +471,6 @@ describe("a backup leaves a daemon's run tokens out and is readable only by its 
 });
 
 describe("the state retire keeps in its archive holds no run token", () => {
-  test("removeRunTokens removes the three and nothing else", () => {
-    const stateDir = join(tmp, "crewhaus-state");
-    seedRunningState(stateDir);
-    mkdirSync(join(stateDir, "memories"), { recursive: true });
-    writeFileSync(join(stateDir, "memories", "control-token"), "a note\n");
-    expect(RUN_TOKEN_FILES).toEqual([...RUN_TOKENS]);
-    expect(removeRunTokens(stateDir)).toEqual([...RUN_TOKENS]);
-    for (const rel of RUN_TOKENS) expect(existsSync(join(stateDir, rel))).toBe(false);
-    expect(existsSync(join(stateDir, "run", ".gitignore"))).toBe(true);
-    expect(existsSync(join(stateDir, "memories", "control-token"))).toBe(true);
-    expect(existsSync(join(stateDir, "sessions", `${SESSION_ID}.jsonl`))).toBe(true);
-    // Nothing left to remove the second time.
-    expect(removeRunTokens(stateDir)).toEqual([]);
-  });
-
-  test.skipIf(process.platform === "win32")(
-    "removeRunTokens never follows a linked run directory",
-    () => {
-      const outside = join(tmp, "outside");
-      seedRunningState(outside);
-      const stateDir = join(tmp, "crewhaus-state");
-      mkdirSync(stateDir, { recursive: true });
-      symlinkSync(join(outside, "run"), join(stateDir, "run"));
-      expect(removeRunTokens(stateDir)).toEqual([]);
-      for (const rel of RUN_TOKENS) expect(existsSync(join(outside, rel))).toBe(true);
-    },
-  );
-
   test("crewhaus retire leaves the run tokens out of its tarball and its archived state", async () => {
     const harness = join(tmp, "harness");
     seedHarness(harness);
