@@ -103,7 +103,15 @@ export type CompiledCriterion = {
  */
 export function checkCriteria(config: GradersConfig): void {
   const criteria = config.criteria ?? [];
-  const graderNames = new Set(config.graders.map((g) => g.name));
+  const graderNames = new Set<string>();
+  for (const g of config.graders) {
+    // A criterion binds graders by name, so in a file with criteria each
+    // name is one grader.
+    if (criteria.length > 0 && graderNames.has(g.name)) {
+      throw new GraderError(`invalid graders config: grader "${g.name}" is declared twice`);
+    }
+    graderNames.add(g.name);
+  }
   const ids = new Set<string>();
   const boundBy = new Map<string, string>();
   for (const c of criteria) {
@@ -238,10 +246,14 @@ export type RunCriterionRecord = {
   readonly digest: string;
   /**
    * sha256 hex of what decides this criterion's verdict beyond its own
-   * entry: the criterion, the specs of the graders it binds, and the file's
-   * `combine`, `passing_threshold` and `per_model`. A change to the file's
-   * policy moves it even when {@link digest} stays. Absent on a record
-   * written before it existed.
+   * entry: the criterion, the specs of the graders that decide it, and the
+   * file's `combine`, `passing_threshold` and `per_model`. Under `combine:
+   * all` (or none) the graders that decide it are the ones it binds; under
+   * `any` or `weighted` every grader in the file folds into its verdict, so
+   * they are all of them, sorted by name, each with the mode and scope of the
+   * criterion that binds it. A change to the file's policy, or to any grader
+   * that decides it or how it votes, moves it even when {@link digest} stays.
+   * Absent on a record written before it existed.
    */
   readonly measuring?: string;
   readonly mode: CriterionMode;
@@ -255,6 +267,14 @@ export function runCriteriaRecord(
 ): ReadonlyArray<RunCriterionRecord> | undefined {
   const criteria = config.criteria ?? [];
   if (criteria.length === 0) return undefined;
+  // Under `any` or `weighted` every grader folds into each verdict, as its
+  // binding criterion's mode and scope let it vote.
+  const votes = votingStates(config);
+  const folded = isFolding(config.combine)
+    ? [...config.graders]
+        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+        .map((spec) => ({ spec, votes: votes(spec.name) }))
+    : undefined;
   return criteria.map((c) => {
     const specs = boundSpecsOf(config, c);
     return {
@@ -262,7 +282,7 @@ export function runCriteriaRecord(
       digest: criterionDigest(c, specs),
       measuring: stableDigest({
         criterion: c,
-        graders: specs,
+        graders: folded ?? specs,
         file: {
           combine: config.combine ?? "all",
           passing_threshold: config.passing_threshold ?? null,
@@ -297,8 +317,14 @@ function passingScoreOf(spec: GraderSpec | undefined): number | undefined {
  * key added), a grader it binds is unbound or removed, a bound judge changes
  * in any way but a raised scalar `passing_score`, a bound grader that is not a
  * judge changes, or the file's `combine`, `passing_threshold` (other than
- * raised) or `per_model` changes while it holds a protected criterion. A
- * change that only tightens returns nothing. Pure.
+ * raised) or `per_model` changes while it holds a protected criterion.
+ * Under `combine: any` or `weighted` (in either file) every grader folds into
+ * each criterion's verdict, so while `before` holds a protected criterion,
+ * adding or removing any grader (a name declared once more or once less
+ * included), or changing one no protected criterion binds (its weight
+ * included, and the mode and scope of the criterion that binds it, which
+ * decide whether it votes), loosens every protected criterion. A change
+ * that only tightens returns nothing. Pure.
  */
 export function loosening(before: GradersConfig, after: GradersConfig): Loosening[] {
   const out: Loosening[] = [];
@@ -351,10 +377,57 @@ export function loosening(before: GradersConfig, after: GradersConfig): Loosenin
       }
     }
   }
+  const protectedIds = (before.criteria ?? []).filter((c) => c.protected === true).map((c) => c.id);
+  // Under `any` or `weighted` every grader in the file folds into each
+  // verdict, so the grader set and every grader no protected criterion
+  // binds are the owner's too. A bound grader keeps its own check above.
+  const foldMode = isFolding(after.combine)
+    ? after.combine
+    : isFolding(before.combine)
+      ? before.combine
+      : undefined;
+  if (protectedIds.length > 0 && foldMode !== undefined) {
+    const foldReasons: string[] = [];
+    const wasByName = specsByName(before);
+    const nowByName = specsByName(after);
+    for (const [name, nowList] of nowByName) {
+      if ((wasByName.get(name)?.length ?? 0) < nowList.length) {
+        foldReasons.push(`grader "${name}" is added under combine: ${foldMode}`);
+      }
+    }
+    for (const [name, wasList] of wasByName) {
+      if ((nowByName.get(name)?.length ?? 0) < wasList.length) {
+        foldReasons.push(`grader "${name}" is removed under combine: ${foldMode}`);
+      }
+    }
+    const boundByProtected = new Set(
+      (before.criteria ?? []).filter((c) => c.protected === true).flatMap((c) => c.measured_by),
+    );
+    const votesBefore = votingStates(before);
+    const votesAfter = votingStates(after);
+    for (const [name, wasList] of wasByName) {
+      const nowList = nowByName.get(name);
+      if (nowList === undefined || nowList.length !== wasList.length) continue;
+      // A bound grader keeps its own check above, unless its name repeats.
+      if (boundByProtected.has(name) && wasList.length === 1) continue;
+      if (stableDigest(wasList) !== stableDigest(nowList)) {
+        foldReasons.push(`grader "${name}" changes under combine: ${foldMode}`);
+      } else if (
+        !boundByProtected.has(name) &&
+        stableDigest(votesBefore(name)) !== stableDigest(votesAfter(name))
+      ) {
+        foldReasons.push(
+          `grader "${name}" changes the mode or scope it votes with under combine: ${foldMode}`,
+        );
+      }
+    }
+    for (const criterion of protectedIds) {
+      for (const reason of foldReasons) out.push({ criterion, reason });
+    }
+  }
   // The file-level policy decides every criterion's verdict, so a file with
   // a protected criterion changes it only with the owner; a raised
   // `passing_threshold` under the same policy is the one tightening.
-  const protectedIds = (before.criteria ?? []).filter((c) => c.protected === true).map((c) => c.id);
   if (protectedIds.length > 0) {
     const fileReasons: string[] = [];
     if ((before.combine ?? "all") !== (after.combine ?? "all")) {
@@ -378,6 +451,32 @@ export function loosening(before: GradersConfig, after: GradersConfig): Loosenin
     }
   }
   return out;
+}
+
+/** Each grader name's specs, in file order: a name declared twice holds two. */
+function specsByName(config: GradersConfig): Map<string, GraderSpec[]> {
+  const out = new Map<string, GraderSpec[]>();
+  for (const g of config.graders) out.set(g.name, [...(out.get(g.name) ?? []), g]);
+  return out;
+}
+
+/**
+ * How each grader votes, by name: the mode and scope of the criterion that
+ * binds it, or an enforcing grader with no scope when none does.
+ */
+function votingStates(
+  config: GradersConfig,
+): (name: string) => { readonly mode: CriterionMode; readonly scope: unknown } {
+  const byGrader = criterionByGrader(config);
+  return (name) => {
+    const c = byGrader.get(name);
+    return { mode: c?.mode ?? "enforce", scope: c?.scope ?? null };
+  };
+}
+
+/** Whether a `combine` mode folds every grader into each verdict. */
+function isFolding(mode: GradersConfig["combine"]): mode is "any" | "weighted" {
+  return mode === "any" || mode === "weighted";
 }
 
 /** A judge's declared scalar passing score, `undefined` when it declares none. */

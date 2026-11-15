@@ -16,7 +16,7 @@
  * constant before it is initialized.
  */
 import { DELTA_090_KEYS } from "./owner-keys";
-import { protectedBarChange } from "./protected";
+import { protectedBarChanges } from "./protected";
 
 /** `"*"` inside a row's `prefix` matches any one segment. Equal to `WILDCARD_SEGMENT`. */
 export const SURFACE_WILDCARD = "*";
@@ -353,8 +353,9 @@ function budgetRaises(before: unknown, after: unknown): string[] {
  * budget (a higher `usd`, the cap or `usd` removed, a `session` scope widened,
  * `on_exceed` moved from `stop` to `degrade`) needs the security edit
  * permission. A first budget and a lowered one need nothing. Loosening a
- * protected quality bar (`protectedBarChange`) needs the security edit
- * permission too; tightening one needs nothing.
+ * protected quality bar (`protectedBarChanges`) needs the security edit
+ * permission too, as one escalation whose `paths` name every loosened key and
+ * whose reason gives each one's why; tightening one needs nothing.
  */
 export function escalationFor(before: unknown, after: unknown): SpecEscalation[] {
   const out: SpecEscalation[] = [];
@@ -367,12 +368,12 @@ export function escalationFor(before: unknown, after: unknown): SpecEscalation[]
   if (raised.length > 0) {
     out.push({ needs: "h.spec.edit.security", reason: BUDGET_RAISE_WARNING, paths: raised });
   }
-  const loosened = protectedBarChange(before, after);
-  if (loosened !== undefined) {
+  const loosened = protectedBarChanges(before, after);
+  if (loosened.length > 0) {
     out.push({
       needs: "h.spec.edit.security",
-      reason: `${PROTECTED_LOOSENING_WARNING} (${loosened.reason})`,
-      paths: [loosened.key],
+      reason: `${PROTECTED_LOOSENING_WARNING} (${loosened.map((l) => l.reason).join("; ")})`,
+      paths: loosened.map((l) => l.key),
     });
   }
   return out;

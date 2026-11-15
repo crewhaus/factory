@@ -444,8 +444,10 @@ these on: they reach every harness that uses what each one names.
   automatic apply never set or clear `evaluation.protected`,
   `provability.protected` or `judge.protected`, alone or inside a whole
   `steps`, `nodes` or `roles` value. On a protected block they only raise
-  `threshold` and `provability.grounded.coverage` and only lower
-  `provability.grounded.window_tokens`. A person can make any of these
+  `threshold` and `provability.grounded.coverage`, only lower
+  `provability.grounded.window_tokens` and a judge gate's or `evaluation`'s
+  `max_retries`, and change nothing else in it or in a `models:` profile its
+  judge reads. A person can make any of these
   changes with `crewhaus propose` or by editing `crewhaus.yaml`.
 
 - **Only an owner sets how long delegation rules may last.** `crewhaus

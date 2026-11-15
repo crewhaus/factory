@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { boundSpecsOf } from "./criteria";
+import { stableDigest } from "./graders-hash";
 import {
   applyGradersEdits,
   criterionDigest,
@@ -34,6 +36,29 @@ const BASE_DIGEST = "329b18330e90b8bcdb6187531dd56fe4d41332633ed5d25d18f08364c07
 const withCriteria = (criteria: string): string => `${BASE}criteria:\n${criteria}`;
 
 const hashOf = (yaml: string): string => gradersConfigHash(parseGradersConfig(yaml).config);
+
+/**
+ * A file whose protected criterion `citations` binds `strict`, beside a grader
+ * `style` no criterion binds, under `combine`.
+ */
+const FOLDED = (combine: "all" | "any" | "weighted"): string => `combine: ${combine}
+${combine === "weighted" ? "passing_threshold: 0.5\n" : ""}graders:
+  - name: strict
+    type: regex
+    pattern: "^CITED:"
+  - name: style
+    type: contains
+    substring: ok
+criteria:
+  - id: citations
+    protected: true
+    measured_by: [strict]
+`;
+
+/** A grader `always` (an empty regex) at weight 100, which no criterion binds. */
+const ALWAYS = "  - name: always\n    type: regex\n    pattern: ''\n    weight: 100\n";
+
+const withAlways = (yaml: string): string => yaml.replace("graders:\n", `graders:\n${ALWAYS}`);
 
 describe("criteria: the schema", () => {
   test("a full criterion parses and binds its graders", () => {
@@ -251,6 +276,57 @@ describe("digests", () => {
       expect(now?.measuring).toMatch(/^[0-9a-f]{64}$/);
       expect(now?.measuring).not.toBe(was?.measuring as string);
     }
+  });
+
+  test("under any or weighted, every grader in the file decides what measures a criterion", () => {
+    const recordOf = (text: string) => runCriteriaRecord(parseGradersConfig(text).config)?.[0];
+    const weighted = recordOf(FOLDED("weighted"));
+    const added = recordOf(withAlways(FOLDED("weighted")));
+    expect(added?.measuring).toMatch(/^[0-9a-f]{64}$/);
+    expect(added?.measuring).not.toBe(weighted?.measuring as string);
+    expect(added?.digest).toBe(weighted?.digest as string);
+    // Under all, a grader no criterion binds decides nothing for it.
+    const all = recordOf(FOLDED("all"));
+    const allAdded = recordOf(withAlways(FOLDED("all")));
+    expect(allAdded?.measuring).toBe(all?.measuring as string);
+    expect(allAdded?.digest).toBe(all?.digest as string);
+    // The file's grader order does not move it.
+    const any = FOLDED("any");
+    const reordered = any.replace(
+      '  - name: strict\n    type: regex\n    pattern: "^CITED:"\n  - name: style\n    type: contains\n    substring: ok\n',
+      '  - name: style\n    type: contains\n    substring: ok\n  - name: strict\n    type: regex\n    pattern: "^CITED:"\n',
+    );
+    expect(reordered).not.toBe(any);
+    expect(recordOf(reordered)?.measuring).toBe(recordOf(any)?.measuring as string);
+  });
+
+  test("under weighted, how each grader votes decides what measures a criterion", () => {
+    const recordOf = (text: string) => runCriteriaRecord(parseGradersConfig(text).config)?.[0];
+    const observing = (combine: "all" | "weighted", mode: "observe" | "enforce") =>
+      recordOf(
+        withAlways(FOLDED(combine)).concat(
+          `  - id: experiment\n    mode: ${mode}\n    measured_by: [always]\n`,
+        ),
+      );
+    const observed = observing("weighted", "observe");
+    expect(observing("weighted", "enforce")?.measuring).not.toBe(observed?.measuring as string);
+    expect(observing("weighted", "enforce")?.digest).toBe(observed?.digest as string);
+    expect(observing("all", "enforce")?.measuring).toBe(
+      observing("all", "observe")?.measuring as string,
+    );
+  });
+
+  test("under all, what measures a criterion hashes its bound graders and the file's policy", () => {
+    const config = parseGradersConfig(withAlways(FOLDED("all"))).config;
+    const c = config.criteria?.[0];
+    if (c === undefined) throw new Error("no criterion");
+    expect(runCriteriaRecord(config)?.[0]?.measuring).toBe(
+      stableDigest({
+        criterion: c,
+        graders: boundSpecsOf(config, c),
+        file: { combine: "all", passing_threshold: null, per_model: null },
+      }),
+    );
   });
 });
 
@@ -519,5 +595,145 @@ criteria:
     ).toEqual([]);
     const open = parseGradersConfig(withCriteria("  - id: ab\n    measured_by: [exact]\n")).config;
     expect(loosening(open, parseGradersConfig(BASE).config)).toEqual([]);
+  });
+  describe("under any or weighted, the graders a protected criterion does not bind are the owner's too", () => {
+    const loose = (was: string, now: string) =>
+      loosening(parseGradersConfig(was).config, parseGradersConfig(now).config);
+
+    test("an added grader loosens every protected criterion under any and weighted, not under all", () => {
+      for (const combine of ["any", "weighted"] as const) {
+        expect(loose(FOLDED(combine), withAlways(FOLDED(combine)))).toEqual([
+          {
+            criterion: "citations",
+            reason: `grader "always" is added under combine: ${combine}`,
+          },
+        ]);
+      }
+      expect(loose(FOLDED("all"), withAlways(FOLDED("all")))).toEqual([]);
+    });
+
+    test("under weighted, a grader removed, reweighted or changed loosens it", () => {
+      const weighted = FOLDED("weighted");
+      const style = "  - name: style\n    type: contains\n    substring: ok\n";
+      expect(weighted).toContain(style);
+      for (const [now, reason] of [
+        [weighted.replace(style, ""), 'grader "style" is removed under combine: weighted'],
+        [
+          weighted.replace(style, `${style}    weight: 5\n`),
+          'grader "style" changes under combine: weighted',
+        ],
+        [
+          weighted.replace("substring: ok", "substring: o"),
+          'grader "style" changes under combine: weighted',
+        ],
+      ] as const) {
+        expect(loose(weighted, now)).toEqual([{ criterion: "citations", reason }]);
+      }
+    });
+
+    test("one added grader loosens each protected criterion", () => {
+      const two = FOLDED("weighted")
+        .replace("graders:\n", "graders:\n  - name: exact\n    type: exact_match\n")
+        .concat("  - id: exacts\n    protected: true\n    measured_by: [exact]\n");
+      expect(loose(two, withAlways(two))).toEqual([
+        { criterion: "citations", reason: 'grader "always" is added under combine: weighted' },
+        { criterion: "exacts", reason: 'grader "always" is added under combine: weighted' },
+      ]);
+    });
+
+    test("under all, a grader no criterion binds is removed or reweighted freely", () => {
+      const all = FOLDED("all");
+      const style = "  - name: style\n    type: contains\n    substring: ok\n";
+      expect(loose(all, all.replace(style, ""))).toEqual([]);
+      expect(loose(all, all.replace(style, `${style}    weight: 5\n`))).toEqual([]);
+    });
+
+    test("a file with criteria declares each grader name once", () => {
+      const twice = withAlways(FOLDED("weighted")).replace("name: always", "name: strict");
+      expect(() => parseGradersConfig(twice)).toThrow(
+        'invalid graders config: grader "strict" is declared twice',
+      );
+      // Without criteria no grader is bound by name, and the file parses as before.
+      const plain = twice.slice(0, twice.indexOf("criteria:"));
+      expect(parseGradersConfig(plain).config.graders.map((g) => g.name)).toEqual([
+        "strict",
+        "strict",
+        "style",
+      ]);
+    });
+
+    test("a name declared once more is an added grader, and its specs are compared as a list", () => {
+      const was = parseGradersConfig(FOLDED("weighted")).config;
+      const strict = was.graders[0];
+      if (strict === undefined) throw new Error("no grader");
+      const again = { ...strict, pattern: "", weight: 100 } as typeof strict;
+      const added = { ...was, graders: [again, ...was.graders] };
+      expect(loosening(was, added)).toEqual([
+        { criterion: "citations", reason: 'grader "strict" is added under combine: weighted' },
+      ]);
+      expect(loosening(added, was)).toContainEqual({
+        criterion: "citations",
+        reason: 'grader "strict" is removed under combine: weighted',
+      });
+      // The same count of a repeated name, with another spec, is a change.
+      const swapped = { ...was, graders: [{ ...again, weight: 50 }, ...was.graders] };
+      expect(loosening(added, swapped)).toContainEqual({
+        criterion: "citations",
+        reason: 'grader "strict" changes under combine: weighted',
+      });
+    });
+
+    test("the mode and scope an unprotected criterion gives its graders are the owner's under any or weighted", () => {
+      const OBSERVED = (combine: "all" | "any" | "weighted", extra = "") =>
+        withAlways(FOLDED(combine)).concat(
+          `  - id: experiment\n    mode: observe\n${extra}    measured_by: [always]\n`,
+        );
+      const SCOPED = (combine: "all" | "any" | "weighted") =>
+        withAlways(FOLDED(combine)).concat(
+          "  - id: experiment\n    scope: { metadata: { family: [csv] } }\n    measured_by: [always]\n",
+        );
+      const reason = (combine: string) =>
+        `grader "always" changes the mode or scope it votes with under combine: ${combine}`;
+      for (const combine of ["any", "weighted"] as const) {
+        const observed = OBSERVED(combine);
+        const enforced = applyGradersEdits(observed, [
+          { op: "setMode", id: "experiment", value: "enforce" },
+        ]).yaml;
+        expect(loose(observed, enforced)).toEqual([
+          { criterion: "citations", reason: reason(combine) },
+        ]);
+        const unbound = withAlways(FOLDED(combine));
+        // Observing, or binding by a newly added observing criterion.
+        expect(loose(enforced, observed)).toEqual([
+          { criterion: "citations", reason: reason(combine) },
+        ]);
+        expect(loose(unbound, observed)).toEqual([
+          { criterion: "citations", reason: reason(combine) },
+        ]);
+        // A scope set or changed.
+        const scoped = SCOPED(combine);
+        expect(loose(unbound, scoped)).toEqual([
+          { criterion: "citations", reason: reason(combine) },
+        ]);
+        const narrowed = applyGradersEdits(scoped, [
+          { op: "setScope", id: "experiment", value: { metadata: { family: ["tsv"] } } },
+        ] as never).yaml;
+        expect(loose(scoped, narrowed)).toEqual([
+          { criterion: "citations", reason: reason(combine) },
+        ]);
+        // An enforcing criterion with no scope votes as an unbound grader does.
+        const named = applyGradersEdits(unbound, [
+          { op: "addCriterion", criterion: { id: "experiment", measured_by: ["always"] } },
+        ]).yaml;
+        expect(loose(unbound, named)).toEqual([]);
+      }
+      const observed = OBSERVED("all");
+      const enforced = applyGradersEdits(observed, [
+        { op: "setMode", id: "experiment", value: "enforce" },
+      ]).yaml;
+      expect(loose(observed, enforced)).toEqual([]);
+      expect(loose(enforced, observed)).toEqual([]);
+      expect(loose(withAlways(FOLDED("all")), SCOPED("all"))).toEqual([]);
+    });
   });
 });
