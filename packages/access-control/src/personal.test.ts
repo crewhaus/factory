@@ -17,7 +17,7 @@ async function setup() {
     }),
   ).principal;
   const devices = openDeviceRequests(home.root, { now: home.clock.now });
-  const start = await devices.start({});
+  const start = await devices.start({ requestedFrom: { via: "home" } });
   if (!start.ok) throw new Error(start.reason);
   await devices.decide({ caller: member, code: start.userCode, choice: "allow" });
   const polled = await devices.poll(start.pollRef);

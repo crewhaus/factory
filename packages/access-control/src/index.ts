@@ -79,6 +79,7 @@ export {
   authenticate,
   hasForwardingHeaders,
   hostNameOf,
+  requesterOf,
 } from "./authenticate";
 export {
   BOOT_TICKET_TTL_MS,
@@ -172,6 +173,7 @@ export {
   type DeviceRequestState,
   type DeviceRequests,
   type DeviceStart,
+  type RequestedFrom,
   openDeviceRequests,
 } from "./device-requests";
 export {

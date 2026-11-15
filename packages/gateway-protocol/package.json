@@ -25,6 +25,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@crewhaus/durable-execution": "workspace:*",
     "@crewhaus/provability": "workspace:*"
   },
   "license": "Apache-2.0",

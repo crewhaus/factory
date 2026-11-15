@@ -158,6 +158,7 @@ export { InMemoryIdempotencyStore };
 // for crash-resume exactly-once.
 export {
   type ArmedSchedule,
+  type ArmedScheduleLanes,
   type ArmScheduleHandlers,
   type ArmScheduleLanesHandlers,
   type WakeSchedule,

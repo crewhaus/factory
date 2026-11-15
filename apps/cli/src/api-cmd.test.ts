@@ -236,7 +236,7 @@ describe("crewhaus api --server", () => {
     );
     if (!granted.ok) throw new Error(granted.reason);
     const devices = openDeviceRequests(t.hangarRoot);
-    const start = await devices.start({});
+    const start = await devices.start({ requestedFrom: { via: "home" } });
     if (!start.ok) throw new Error(start.reason);
     await devices.decide({
       caller: granted.result.principal,

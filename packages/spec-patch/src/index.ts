@@ -56,7 +56,11 @@ export {
   maskCredentialTokens,
 } from "./redact";
 export { DELTA_090_KEYS, type OwnerKey } from "./owner-keys";
-export { type ProtectedBarChange, protectedBarChange } from "./protected";
+export {
+  type ProtectedBarChange,
+  protectedBarChange,
+  protectedBarChanges,
+} from "./protected";
 export * from "./surfaces";
 export {
   type AdmitBlockPatchOptions,
