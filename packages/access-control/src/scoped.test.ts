@@ -8,6 +8,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { append } from "@crewhaus/control-records";
+import { scopedEpochBumpRow } from "./access";
 import { authenticate } from "./authenticate";
 import { accessLedger, accessPaths } from "./paths";
 import {
@@ -350,6 +351,35 @@ describe("a service's scoped epoch", () => {
       scopedEpoch: 2,
     });
     expect(await codeOf(home.actor, minted.principal)).toBe("ended");
+  });
+
+  test("the planner bumps only an active service: a member is invalid and a removed service ended", async () => {
+    const { home, minted } = await serviceHome();
+    const state = {
+      snapshot: home.snapshot(),
+      now: home.clock.now(),
+      at: new Date(home.clock.now()).toISOString(),
+      by: home.owner,
+    };
+    const principalOf = (id: string) => {
+      const row = home.snapshot().principals.find((p) => p.id === id);
+      if (row === undefined) throw new Error("no principal");
+      return row;
+    };
+    const member = scopedEpochBumpRow(principalOf(home.owner), state);
+    expect(member).toMatchObject({ ok: false, code: "invalid" });
+    const service = principalOf(minted.principal);
+    expect(scopedEpochBumpRow({ ...service, state: "removed" }, state)).toMatchObject({
+      ok: false,
+      code: "ended",
+    });
+    const planned = scopedEpochBumpRow(service, state);
+    expect(planned).toEqual({
+      kind: "principals",
+      row: { ...service, scopedEpoch: 1, at: state.at, by: home.owner },
+    });
+    const twice = scopedEpochBumpRow({ ...service, scopedEpoch: 4 }, state);
+    expect("row" in twice ? twice.row["scopedEpoch"] : undefined).toBe(5);
   });
 
   test("a principals row whose epoch is on a member, 0 or fractional makes the records unreadable", async () => {

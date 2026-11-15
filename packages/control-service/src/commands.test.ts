@@ -798,7 +798,7 @@ describe("the actor is the caller, and is checked again before a command runs", 
     expect(r.supervisor.calls).not.toContain("stop");
   });
 
-  test("a credential without an actor, or one that is not a credential id, is refused before anything is written", async () => {
+  test("a credential without its principal, or one that is not a credential id, is refused before anything is written", async () => {
     const { service, harness } = rig();
     const withoutActor = await service.commands.submit({
       kind: "controls.stop",
@@ -808,6 +808,18 @@ describe("the actor is the caller, and is checked again before a command runs", 
       credentialRef: "crd_01jc0000000000000000000008",
     });
     expect(withoutActor.ok === false && withoutActor.refusal.code).toBe("invalid");
+    const underASystemActor = await service.commands.submit({
+      kind: "controls.stop",
+      target: HRN,
+      ledger: { harness },
+      via: "home",
+      actor: "sys:ingress",
+      credentialRef: "crd_01jc0000000000000000000008",
+    });
+    expect(underASystemActor.ok === false && underASystemActor.refusal).toEqual({
+      code: "invalid",
+      message: "a command's credential is given with its principal",
+    });
     const notACredential = await service.commands.submit({
       kind: "controls.stop",
       target: HRN,
@@ -818,6 +830,28 @@ describe("the actor is the caller, and is checked again before a command runs", 
     });
     expect(notACredential.ok === false && notACredential.refusal.code).toBe("invalid");
     expect(existsSync(join(harness, ".crewhaus", "run", "control", "commands"))).toBe(false);
+  });
+
+  test("a recovered receipt that names a credential under a system actor is rejected unasked", async () => {
+    const asked: unknown[] = [];
+    const r = rig({
+      authorizeActor: (...args) => {
+        asked.push(args);
+        return true;
+      },
+    });
+    const ledger = commandsLedgerOf(r.harness);
+    plantReceipt(ledger, {
+      id: "cmd_01jc00000000000000000000ab",
+      actor: "sys:ingress",
+      credentialRef: "crd_01jc0000000000000000000009",
+    });
+    await r.service.commands.recover({ harness: r.harness });
+    expect(asked).toEqual([]);
+    expect(r.supervisor.calls).not.toContain("stop");
+    const rows = rowsOf(ledger);
+    expect(rows.map((row) => row["state"])).toEqual(["accepted", "rejected"]);
+    expect((rows.at(-1)?.["outcome"] as { code?: string })?.code).toBe("forbidden");
   });
 
   test("an actor that is not a principal is refused before anything is written", async () => {

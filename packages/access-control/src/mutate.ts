@@ -1,9 +1,9 @@
 /**
  * The one way an access record changes. Under the access lock: load the snapshot, check
- * that the actor holds `home.access.manage`, plan the rows, check every row's size, rewrite
- * `subjects.json` when it changed, append the rows, move the access revision (above every
- * registered harness's approver file), and bring the governed harnesses' projections to the
- * new snapshot. Then release.
+ * that the actor holds `home.access.manage`, plan the rows, check every row's size and
+ * shape, rewrite `subjects.json` when it changed, append the rows, move the access revision
+ * (above every registered harness's approver file), and bring the governed harnesses'
+ * projections to the new snapshot. Then release.
  *
  * The lock is control-records' `withFileLock`, which is not re-entrant, so a mutation that
  * touches several ledgers takes it once and writes each ledger's rows with `append` while
@@ -21,7 +21,7 @@ import {
   highestProjectionEpoch,
   writeApproverProjections,
 } from "./projection";
-import { lineBytes } from "./records";
+import { isRowOf, lineBytes, stripBookkeeping } from "./records";
 import { type AccessSnapshot, type AccessSnapshotRead, loadAccessSnapshot } from "./snapshot";
 
 /** A ledger line of this many bytes or more is refused before anything is written. */
@@ -218,6 +218,15 @@ async function runLocked<T>(
       return refusal(
         "too-large",
         `This change makes a record of ${lineBytes(row)} bytes, over the ${MAX_ROW_BYTES}-byte limit; nothing was written.`,
+      );
+    }
+  }
+  // Every row lands well formed, so every change stays readable.
+  for (const { kind, row } of plannedRows) {
+    if (!isRowOf(kind, stripBookkeeping({ ...row }))) {
+      return refusal(
+        "invalid",
+        `This change plans a record that is not a well-formed ${kind} row; nothing was written.`,
       );
     }
   }

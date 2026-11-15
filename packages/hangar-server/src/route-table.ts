@@ -816,6 +816,23 @@ export const ROUTE_BY_KEY: ReadonlyMap<string, RouteRow> = new Map(
   ROUTE_TABLE.flatMap((row) => [row.key, ...(row.aliases ?? [])].map((key) => [key, row] as const)),
 );
 
+const LEGACY_KIND_PERMISSIONS: ReadonlyMap<string, string> = new Map(
+  ROUTE_TABLE.flatMap((row) =>
+    row.kind?.startsWith("legacy.") ? [[row.kind, row.permission] as const] : [],
+  ),
+);
+
+/**
+ * The permission a legacy route's receipt kind (`legacy.<key>`) needs: its route's. Any
+ * other string, a core kind or a kind no route writes, answers `undefined`.
+ *
+ * First consumer: Home's control service, which checks a job's command again before the
+ * job starts.
+ */
+export function legacyKindPermission(kind: string): string | undefined {
+  return LEGACY_KIND_PERMISSIONS.get(kind);
+}
+
 const TEMPLATES = ROUTE_TABLE.map((row) => {
   const segments = row.path.split("/").filter((s) => s !== "");
   return { row, segments, literals: segments.filter((s) => !s.startsWith(":")).length };

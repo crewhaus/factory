@@ -1209,11 +1209,15 @@ export type ScopedEpochResult = {
 /**
  * The one principals row that moves a service's scoped-token epoch up by one: every scoped
  * token it minted before stops verifying, and its own tokens stay live. A planner, so a
- * change that already holds the access lock can make it part of its own rows.
+ * change that already holds the access lock can make it part of its own rows. It plans a
+ * row only for an active service: a member is refused `invalid`, and a removed service
+ * `ended`.
  *
  * First consumer: {@link bumpScopedEpoch}.
  */
-export function scopedEpochBumpRow(row: PrincipalRow, state: Planning): PlannedRow {
+export function scopedEpochBumpRow(row: PrincipalRow, state: Planning): PlannedRow | Refusal {
+  if (row.kind !== "service") return refusal("invalid", "Only a service mints scoped tokens.");
+  if (row.state !== "active") return refusal("ended", "That service was removed.");
   const next: PrincipalRow = {
     ...row,
     scopedEpoch: (row.scopedEpoch ?? 0) + 1,
@@ -1242,11 +1246,8 @@ async function bumpScopedEpoch(
       const snapshot = requireSnapshot(state);
       const target = principalOf(snapshot, service);
       if (target === undefined) return refusal("not-found", "No member or service has that id.");
-      if (target.kind !== "service") {
-        return refusal("invalid", "Only a service mints scoped tokens.");
-      }
-      if (target.state !== "active") return refusal("ended", "That service was removed.");
       const planned = scopedEpochBumpRow(target, state);
+      if ("ok" in planned) return planned;
       return {
         rows: [planned],
         result: {

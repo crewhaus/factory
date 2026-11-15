@@ -247,6 +247,11 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
   // late: once the server exists, its job adapter moves receipts as it does in production.
   let jobStore: JobStore | undefined;
   let wrappedStore: JobStore | undefined;
+  // The runner is wrapped late too, so a job that carries a command is checked before it
+  // starts, as in production. By default a job never settles: the queue holds it `running`,
+  // which is the observable effect a submit assertion needs. Override for real work.
+  const baseRun: JobRunner = runJob ?? (() => new Promise<{ exitCode?: number }>(() => {}));
+  let wrappedRun: JobRunner | undefined;
   if (processLayer === undefined) {
     const testClock = createTestClock(now());
     clock = testClock;
@@ -263,9 +268,7 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
       managerVersion: "test",
       ops,
       clock,
-      // A job that never settles: the queue holds it `running`, which is the
-      // observable effect a submit assertion needs. Override for real work.
-      runJob: runJob ?? (() => new Promise<{ exitCode?: number }>(() => {})),
+      runJob: (job, ctx) => (wrappedRun ?? baseRun)(job, ctx),
       ...(preflight === true ? {} : { noPreflight: true }),
       wrapJobStore: (store) => {
         jobStore = store;
@@ -306,7 +309,10 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
     ...(controlClient !== undefined ? { controlClient } : {}),
     onWarn: collectWarn,
   });
-  if (jobStore !== undefined) wrappedStore = server.controlService.jobs.wrapStore(jobStore);
+  if (jobStore !== undefined) {
+    wrappedStore = server.controlService.jobs.wrapStore(jobStore);
+    wrappedRun = server.controlService.jobs.wrapRun(baseRun);
+  }
   const token = server.token ?? "";
 
   const fetchRaw = (path: string, init: RequestInit = {}): Promise<Response> =>

@@ -105,6 +105,7 @@ import {
 import { runDetail, runLogFile } from "@crewhaus/harness-supervisor/run-detail";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { hashSpecSource, readBundleSpecStamp } from "./bundle-manifest";
+import { cliAuthorizeActor } from "./control-authority";
 import { envChainLines } from "./env-chain-view";
 import { IGNORE_PAUSE_NOTICE, entryRefusalLine } from "./operator-gate";
 import type { CliFamily } from "./verbs";
@@ -594,6 +595,11 @@ export function directControl(opts: DaemonCommandOptions): ControlService {
       identity: opts.identity ?? currentLocalIdentity(),
       now: (opts.clock ?? systemClock).now,
       probe: withOwnStartTime(opts.ops ?? createProcessOps()),
+      authorizeActor: cliAuthorizeActor({
+        hangarRoot: resolveHangarRoot(env),
+        env,
+        now: (opts.clock ?? systemClock).now,
+      }),
     },
     { mode: "direct" },
   );

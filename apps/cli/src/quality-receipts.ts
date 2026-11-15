@@ -17,6 +17,7 @@ import {
 import type { PinOutcome } from "@crewhaus/eval-report";
 import { openHangarRegistry, resolveHangarRoot } from "@crewhaus/harness-registry";
 import { createProcessOps } from "@crewhaus/harness-supervisor";
+import { cliAuthorizeActor } from "./control-authority";
 
 export type QualityReceiptOptions = {
   readonly env?: Readonly<Record<string, string | undefined>>;
@@ -34,6 +35,11 @@ export function qualityControl(options: QualityReceiptOptions = {}): ControlServ
       identity: currentLocalIdentity(),
       ...(options.now !== undefined ? { now: options.now } : {}),
       probe: withOwnStartTime(createProcessOps()),
+      authorizeActor: cliAuthorizeActor({
+        hangarRoot: resolveHangarRoot(env),
+        env,
+        ...(options.now !== undefined ? { now: options.now } : {}),
+      }),
     },
     { mode: "direct" },
   );

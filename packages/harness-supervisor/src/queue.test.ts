@@ -59,6 +59,52 @@ describe("read-only classification", () => {
 });
 
 describe("createJobQueue", () => {
+  test("a runner that answers cancelled leaves the job cancelled, and the next job starts", async () => {
+    const store = createMemoryJobStore();
+    const ctl = controllable();
+    let declined = 0;
+    const queue = createJobQueue({
+      store,
+      run: async (job) => {
+        if (job.kind === "compile") {
+          declined += 1;
+          return { cancelled: true };
+        }
+        return await ctl.run(job);
+      },
+      concurrency: 1,
+    });
+    const first = queue.submit({ harnessDir: "/a", kind: "compile", argv: ["compile"] });
+    const second = queue.submit({ harnessDir: "/a", kind: "eval", argv: ["eval"] });
+    await tick();
+    expect(declined).toBe(1);
+    const row = store.read().find((job) => job.jobId === first.jobId);
+    expect(row?.state).toBe("cancelled");
+    expect(row !== undefined && "exitCode" in row).toBe(false);
+    expect(ctl.started).toEqual([second.jobId]);
+    ctl.finish(second.jobId);
+    await queue.idle();
+    expect(store.read().find((job) => job.jobId === second.jobId)?.state).toBe("done");
+  });
+
+  test("a job keeps the permissions its submit needed, and one submitted without any holds none", async () => {
+    const store = createMemoryJobStore();
+    const queue = createJobQueue({ store, run: controllable().run, concurrency: 1 });
+    const needed = queue.submit({
+      harnessDir: "/a",
+      kind: "compile",
+      argv: ["compile"],
+      commandId: "cmd_1",
+      needs: ["h.deploy"],
+    });
+    const none = queue.submit({ harnessDir: "/a", kind: "eval", argv: ["eval"], needs: [] });
+    const rows = store.read();
+    expect(needed.needs).toEqual(["h.deploy"]);
+    expect(rows.find((job) => job.jobId === needed.jobId)?.needs).toEqual(["h.deploy"]);
+    const plain = rows.find((job) => job.jobId === none.jobId);
+    expect(plain !== undefined && "needs" in plain).toBe(false);
+  });
+
   test("one mutating job per harness; the next one waits", async () => {
     const ctl = controllable();
     const queue = createJobQueue({ store: createMemoryJobStore(), run: ctl.run });

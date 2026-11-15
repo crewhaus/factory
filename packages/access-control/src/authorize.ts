@@ -364,6 +364,19 @@ export function queuedActorHolds(
   if (snapshot === undefined) return false;
   const { actor, credentialRef } = submitter;
   if (credentialRef !== undefined) {
+    // The credential is checked before any checker sees it: live, its actor's own, and of
+    // the kind its principal signs in with.
+    const credential = snapshot.tokens.find((row) => row.id === credentialRef);
+    const principal = principalOf(snapshot, actor);
+    if (
+      credential === undefined ||
+      principal === undefined ||
+      credential.principal !== actor ||
+      credential.kind !== (principal.kind === "service" ? "service" : "personal") ||
+      !isLiveCredential(snapshot, credential, options.now)
+    ) {
+      return false;
+    }
     return authorize(
       snapshot,
       { principal: actor, credential: credentialRef },
@@ -374,7 +387,12 @@ export function queuedActorHolds(
   }
   if (principalOf(snapshot, actor)?.kind === "service") {
     return snapshot.tokens
-      .filter((row) => row.principal === actor && row.kind === "service")
+      .filter(
+        (row) =>
+          row.principal === actor &&
+          row.kind === "service" &&
+          isLiveCredential(snapshot, row, options.now),
+      )
       .some(
         (row) =>
           authorize(snapshot, { principal: actor, credential: row.id }, permission, target, options)

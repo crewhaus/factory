@@ -15,6 +15,7 @@ import {
 import {
   type AccessTarget,
   type AuthorizeVerdict,
+  type DomainChecker,
   authorize,
   effectiveRole,
   queuedActorHolds,
@@ -497,6 +498,84 @@ describe("queuedActorHolds: a command answers to the credential that submitted i
     expect(holds(world(false), ALICE, undefined)).toBe(true);
     // A service token named for a member is the wrong kind.
     expect(holds(world(false), ALICE, A)).toBe(false);
+  });
+
+  /** A permissive checker for the `people` domain that counts how often it is asked. */
+  function countingDomains() {
+    const counter = { calls: 0 };
+    const domains = new Map<string, DomainChecker>([
+      [
+        "people",
+        () => {
+          counter.calls += 1;
+          return { allow: true, grant: "x" };
+        },
+      ],
+    ]);
+    return { counter, domains };
+  }
+
+  test("a domain's checker sees only its service's own live credential of the service kind", () => {
+    const { counter, domains } = countingDomains();
+    const OWN_PERSONAL = mintId("crd");
+    const ask = (
+      snapshot: AccessSnapshot,
+      credentialRef: string,
+      now = NOW,
+      actor: string = PORTAL,
+    ) => queuedActorHolds(snapshot, { actor, credentialRef }, "people.x", ON_H1, { now, domains });
+    const base = world(false);
+    const withOwnPersonal: AccessSnapshot = {
+      ...base,
+      tokens: [...base.tokens, token(OWN_PERSONAL, PORTAL, "personal")],
+    };
+    // Revoked; expired (A expires a minute after NOW); another service's; a member's
+    // personal token; a token of the wrong kind for a service.
+    expect(ask(world(true), A)).toBe(false);
+    expect(ask(base, A, NOW + 60_000)).toBe(false);
+    expect(ask(base, K)).toBe(false);
+    expect(ask(base, PERSONAL)).toBe(false);
+    expect(ask(withOwnPersonal, OWN_PERSONAL)).toBe(false);
+    expect(ask(base, mintId("crd"))).toBe(false);
+    expect(counter.calls).toBe(0);
+    expect(ask(base, A)).toBe(true);
+    expect(counter.calls).toBe(1);
+  });
+
+  test("a member's credential reaches a domain's checker only as its own live personal token", () => {
+    const { counter, domains } = countingDomains();
+    const ask = (snapshot: AccessSnapshot, credentialRef: string) =>
+      queuedActorHolds(snapshot, { actor: ALICE, credentialRef }, "people.x", ON_H1, {
+        now: NOW,
+        domains,
+      });
+    const base = world(false);
+    const revoked: AccessSnapshot = {
+      ...base,
+      tokens: base.tokens.map((row) =>
+        row.id === PERSONAL ? { ...row, state: "revoked" as const, revokedAt: AT } : row,
+      ),
+    };
+    expect(ask(revoked, PERSONAL)).toBe(false);
+    expect(ask(base, A)).toBe(false);
+    expect(counter.calls).toBe(0);
+  });
+
+  test("a service named with no credential holds a domain permission only through a live token", () => {
+    const { counter, domains } = countingDomains();
+    const base = world(false);
+    const kioskRevoked: AccessSnapshot = {
+      ...base,
+      tokens: base.tokens.map((row) =>
+        row.id === K ? { ...row, state: "revoked" as const, revokedAt: AT } : row,
+      ),
+    };
+    const ask = (snapshot: AccessSnapshot) =>
+      queuedActorHolds(snapshot, { actor: KIOSK }, "people.x", ON_H1, { now: NOW, domains });
+    expect(ask(kioskRevoked)).toBe(false);
+    expect(counter.calls).toBe(0);
+    expect(ask(base)).toBe(true);
+    expect(counter.calls).toBe(1);
   });
 
   test("an absent snapshot holds nothing", () => {

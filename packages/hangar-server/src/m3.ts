@@ -103,6 +103,7 @@
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
 import type { JobRecord } from "@crewhaus/harness-supervisor";
 import { type CallerVerdict, TAB_ONLY_MESSAGE, permissionMessage } from "./access";
+import { noteNeed } from "./command-context";
 import type { ControlClient } from "./control-client";
 import { HttpError } from "./http";
 import type { HarnessProcess, HomeJobQueue } from "./process";
@@ -261,7 +262,11 @@ export function requirePermission(
   } = {},
 ): void {
   const verdict = ctx.authorize(permission, options.target);
-  if (verdict.allow) return;
+  if (verdict.allow) {
+    // A job this request queues is checked for it again before it starts.
+    if (options.target === undefined) noteNeed(permission);
+    return;
+  }
   if ("reason" in verdict) {
     throw new HttpError(403, TAB_ONLY_MESSAGE, {
       code: "forbidden",
