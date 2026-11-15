@@ -175,29 +175,26 @@ describe("the inbox reads the newest end of a large approvals file", () => {
 });
 
 describe("where the file may be", () => {
-  test("a sessions directory linked outside the harness lists as the browser does", async () => {
+  test("a sessions directory linked outside the harness shows no approvals and says it is unreachable", async () => {
     if (process.platform === "win32") return; // the fixture moves the directory under a POSIX link
     const t = bootTestServer({ now: () => NOW });
     const outside = mkdtempSync(join(tmpdir(), "hangar-tail-outside-"));
     try {
       const dir = harness(t, "tail-linked-sessions");
-      const id = await register(t, dir);
+      await register(t, dir);
       const sessions = join(dir, ".crewhaus", "sessions");
       writeFileSync(approvalsPath(dir), jsonl([approval("appr_00000000000000c6")]));
+      // The fixture's row is read while the folder is inside the harness.
+      expect(foldApprovals(dir).approvals.map((a) => a.id)).toEqual(["appr_00000000000000c6"]);
       const moved = join(outside, "sessions");
       renameSync(sessions, moved);
       symlinkSync(moved, sessions);
 
-      const browser = await t.api(`/api/h/${id}/sessions`);
-      expect(browser.status).toBe(200);
-      const listed = (browser.body["sessions"] as readonly { readonly id: string }[]).map(
-        (s) => s.id,
-      );
-      expect(listed).toContain(SESSION);
-
+      expect(foldApprovals(dir)).toEqual({ approvals: [], truncated: false, unreachable: true });
+      expect(pendingApprovalCount(dir)).toBe(0);
       const inbox = await t.api("/api/approvals");
-      expect(rowsOf(inbox.body).map((r) => r.id)).toEqual(["appr_00000000000000c6"]);
-      expect(inbox.body["pending"]).toBe(1);
+      expect(rowsOf(inbox.body).map((r) => r.id)).toEqual([]);
+      expect(inbox.body["pending"]).toBe(0);
     } finally {
       await t.stop();
       rmSync(outside, { recursive: true, force: true });

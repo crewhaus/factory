@@ -11,8 +11,8 @@ import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
 import { readHarnessEnvFiles } from "@crewhaus/harness-supervisor";
 import {
   type PendingApproval,
+  containedSessionRoot,
   parseDeferUntil,
-  resolveHarnessSessionRoot,
 } from "@crewhaus/session-store";
 import { permissionMessage } from "../access";
 import { foldApprovals } from "../approvals";
@@ -128,9 +128,13 @@ function actorOf(ctx: V1Context): DecisionActor {
   };
 }
 
-function sessionRootOf(dir: string): string {
-  return resolveHarnessSessionRoot(dir, readHarnessEnvFiles(dir).vars).root;
+/** The harness's session root when it lies inside the harness, else `undefined`. */
+function sessionRootOf(dir: string): string | undefined {
+  return containedSessionRoot(dir, readHarnessEnvFiles(dir).vars);
 }
+
+/** A decision in a sessions folder outside its harness: nothing is decided, and it answers 404. */
+const UNREACHABLE: Settled = { outcome: "not-found", record: null };
 
 const list: V1Handler = async (ctx) => {
   const limit = ctx.query["limit"] === undefined ? 50 : Number(ctx.query["limit"]);
@@ -145,11 +149,13 @@ const list: V1Handler = async (ctx) => {
   const now = ctx.deps.now();
   const rows: Record<string, unknown>[] = [];
   const cut: string[] = [];
+  let unreachable = false;
   for (const entry of visibleHarnesses(ctx.deps)) {
     const dir = liveDirOf(entry);
     if (dir === undefined) continue;
     const folded = foldApprovals(dir);
     if (folded.truncated) cut.push(entry.id);
+    if (folded.unreachable === true) unreachable = true;
     const content = ctx.access.canReadContent(entry.id);
     for (const record of folded.approvals) rows.push(decisionView(record, entry.id, content, now));
   }
@@ -170,7 +176,15 @@ const list: V1Handler = async (ctx) => {
           }
         : {}),
       ...(items.length === 0
-        ? { empty: { reason: "no-data", remedy: "Nothing is waiting for a decision." } }
+        ? {
+            empty: unreachable
+              ? {
+                  reason: "unreachable",
+                  remedy:
+                    "A harness keeps its sessions folder outside its own folder, so Home shows no decisions from it. Keep the sessions folder inside the harness folder.",
+                }
+              : { reason: "no-data", remedy: "Nothing is waiting for a decision." },
+          }
         : {}),
     },
   };
@@ -358,42 +372,47 @@ function checkExpect(ctx: V1Context, located: Located): void {
   }
 }
 
-const resolve = decisionCommand(
-  async (ctx, located) =>
-    ctx.deps.control.decisions.resolve({
-      harnessDir: located.dir,
-      rootDir: sessionRootOf(located.dir),
-      ref: located.record.id,
-      choice: ctx.body["choice"] === "grant" ? "grant" : "deny",
-      actor: actorOf(ctx),
-      via: ctx.via,
-      ttlDays: MAX_TTL,
-    }),
-  checkExpect,
-);
-
-const supersede = decisionCommand(async (ctx, located) =>
-  ctx.deps.control.decisions.supersede({
+const resolve = decisionCommand(async (ctx, located) => {
+  const rootDir = sessionRootOf(located.dir);
+  if (rootDir === undefined) return UNREACHABLE;
+  return ctx.deps.control.decisions.resolve({
     harnessDir: located.dir,
-    rootDir: sessionRootOf(located.dir),
+    rootDir,
+    ref: located.record.id,
+    choice: ctx.body["choice"] === "grant" ? "grant" : "deny",
+    actor: actorOf(ctx),
+    via: ctx.via,
+    ttlDays: MAX_TTL,
+  });
+}, checkExpect);
+
+const supersede = decisionCommand(async (ctx, located) => {
+  const rootDir = sessionRootOf(located.dir);
+  if (rootDir === undefined) return UNREACHABLE;
+  return ctx.deps.control.decisions.supersede({
+    harnessDir: located.dir,
+    rootDir,
     ref: located.record.id,
     reason: String(ctx.body["reason"]),
     actor: actorOf(ctx),
     via: ctx.via,
-  }),
-);
+  });
+});
 
 const defer = decisionCommand(
-  async (ctx, located) =>
-    ctx.deps.control.decisions.defer({
+  async (ctx, located) => {
+    const rootDir = sessionRootOf(located.dir);
+    if (rootDir === undefined) return UNREACHABLE;
+    return ctx.deps.control.decisions.defer({
       harnessDir: located.dir,
-      rootDir: sessionRootOf(located.dir),
+      rootDir,
       ref: located.record.id,
       until: String(ctx.body["until"]),
       reason: String(ctx.body["reason"]),
       actor: actorOf(ctx),
       via: ctx.via,
-    }),
+    });
+  },
   (ctx) => {
     const when = parseDeferUntil(String(ctx.body["until"]), ctx.deps.now());
     if (typeof when === "string") {

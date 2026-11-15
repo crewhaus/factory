@@ -15,7 +15,7 @@ import {
   retireSteps,
 } from "@crewhaus/control-service";
 import { readHarnessEnvFiles } from "@crewhaus/harness-supervisor";
-import { resolveHarnessSessionRoot } from "@crewhaus/session-store";
+import { containedSessionRoot } from "@crewhaus/session-store";
 import { systemAccess, withRequestAccess } from "../access";
 import type { V1Handler } from "./context";
 import { V1Error } from "./errors";
@@ -176,7 +176,7 @@ const retire: V1Handler = async (ctx) => {
         stopDaemon: () => ctx.deps.stopDaemon(entry),
         now: ctx.deps.now,
         revokers: retireRevokers(AREA_RUNTIMES),
-        sessionRoot: resolveHarnessSessionRoot(dir, readHarnessEnvFiles(dir).vars).root,
+        sessionRoot: containedSessionRoot(dir, readHarnessEnvFiles(dir).vars) ?? null,
         registry: ctx.deps.registry,
         holder: { pid: process.pid },
       });

@@ -21,7 +21,7 @@
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { resolveHarnessSessionRoot } from "@crewhaus/session-store";
+import { containedSessionRoot, resolveHarnessSessionRoot } from "@crewhaus/session-store";
 import { maskCredentialTokens } from "@crewhaus/spec-patch";
 import { MAX_RAW_LINES, SESSION_ID_RE, SESSION_JSON_RE } from "./constants";
 import { readHarnessEnvFiles } from "./env-file";
@@ -38,6 +38,9 @@ export type SessionRootInfo = {
   /** True when an override was present but escaped the harness dir and was
    *  therefore ignored (the default root is used instead). */
   readonly overrideIgnored: boolean;
+  /** True when `root` lies inside the harness dir once every link is
+   *  followed. Approvals are read and decided only through a contained root. */
+  readonly contained: boolean;
 };
 
 /** Resolve where a harness's sessions live, honoring the `.env` override
@@ -45,6 +48,13 @@ export type SessionRootInfo = {
  *  reader: `@crewhaus/session-store`'s `resolveHarnessSessionRoot`. */
 export function resolveSessionRoot(harnessDir: string): SessionRootInfo {
   return resolveHarnessSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars);
+}
+
+/** The session root approvals are read from and decided in: the harness's own
+ *  when it lies inside the harness dir once every link is followed, else
+ *  `undefined` (unreachable). */
+export function approvalsRootOf(harnessDir: string): string | undefined {
+  return containedSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars);
 }
 
 export type SessionRow = {

@@ -38,7 +38,8 @@ import {
   withLedgerLock,
   writeOperatorRecord,
 } from "@crewhaus/control-records";
-import { expireOpenApprovals } from "@crewhaus/session-store";
+import { readHarnessEnvFiles } from "@crewhaus/harness-supervisor";
+import { containedSessionRoot, expireOpenApprovals } from "@crewhaus/session-store";
 import type { Reconciler, RetireRevoker } from "./executor";
 import { applyOperatorControl } from "./operator-controls";
 import { revokeStandingRule } from "./rules";
@@ -88,8 +89,12 @@ export type RetireStepsOptions = {
   readonly probe?: LeaseProbe;
   /** Every area's revokers, in composition order (`retireRevokers(AREA_RUNTIMES)`). */
   readonly revokers?: readonly RetireRevoker[];
-  /** Where the harness's tool approvals are parked; its `.crewhaus/sessions` by default. */
-  readonly sessionRoot?: string;
+  /**
+   * Where the harness's tool approvals are parked. Omitted, it is the harness's own
+   * session root when that lies inside the harness; `null` says it lies outside the
+   * harness, and then no approval is expired there.
+   */
+  readonly sessionRoot?: string | null;
   readonly registry?: RetireRegistry;
   /** The holder a run claim records: this process. */
   readonly holder?: Readonly<Record<string, unknown>>;
@@ -236,23 +241,34 @@ export function retireSteps(options: RetireStepsOptions): RetireSteps {
     },
 
     async expireDecisions() {
-      const root = options.sessionRoot ?? join(harnessDir, ".crewhaus", "sessions");
-      let expired: readonly string[];
-      try {
-        ({ expired } = await expireOpenApprovals(root, {
-          reason: "retired",
-          now: () => new Date(options.now()),
-        }));
-      } catch (err) {
-        effect({ kind: "retire.approvals", status: "failed" });
-        return outcome("expireDecisions", false, messageOf(err));
+      const root =
+        options.sessionRoot === undefined
+          ? containedSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars)
+          : (options.sessionRoot ?? undefined);
+      let expired: readonly string[] = [];
+      if (root === undefined) {
+        effect({
+          kind: "retire.approvals",
+          status: "skipped",
+          observed: "sessions folder outside the harness",
+        });
+      } else {
+        try {
+          ({ expired } = await expireOpenApprovals(root, {
+            reason: "retired",
+            now: () => new Date(options.now()),
+          }));
+        } catch (err) {
+          effect({ kind: "retire.approvals", status: "failed" });
+          return outcome("expireDecisions", false, messageOf(err));
+        }
+        effect({ kind: "retire.approvals", status: "done", observed: `${expired.length} expired` });
       }
       const proposals = readProposals(harnessDir);
       const waiting =
         proposals.state === "present"
           ? proposals.rows.filter((row) => proposalState(row, options.now()) === "pending").length
           : 0;
-      effect({ kind: "retire.approvals", status: "done", observed: `${expired.length} expired` });
       if (waiting > 0) {
         effect({
           kind: "retire.decisions",
@@ -263,10 +279,14 @@ export function retireSteps(options: RetireStepsOptions): RetireSteps {
       }
       const unreadable =
         proposals.state === "unreadable" ? "; the decision records can't be read" : "";
+      const approvals =
+        root === undefined
+          ? "no approval expired: the sessions folder is outside the harness"
+          : `${expired.length} approval(s) expired`;
       return outcome(
         "expireDecisions",
         true,
-        `${expired.length} approval(s) expired${
+        `${approvals}${
           waiting > 0 ? `; ${waiting} pending decision(s) to close by hand` : ""
         }${unreadable}`,
       );

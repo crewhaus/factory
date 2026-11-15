@@ -77,7 +77,7 @@ import {
   removeApiRunInput,
   resolveBundle,
 } from "@crewhaus/harness-supervisor";
-import { createPendingApprovalStore, resolveHarnessSessionRoot } from "@crewhaus/session-store";
+import { containedSessionRoot, createPendingApprovalStore } from "@crewhaus/session-store";
 import type { ReconcileContext, Reconciler, Reconciliation, Settlement } from "./executor";
 import { type Outcome, outcomeOf } from "./refusal";
 
@@ -556,6 +556,13 @@ const jobRunAdapter: RunAdapter = {
       );
     }
     const pending = await pendingFor(req.harnessDir, familyOf(row, children));
+    if (pending === undefined) {
+      return refused(
+        "conflict",
+        "decisions_unreachable",
+        "This run's sessions folder is outside the harness, so its decisions cannot be checked here. Keep the sessions folder inside the harness folder.",
+      );
+    }
     if (pending.length > 0) {
       return refused(
         "conflict",
@@ -681,19 +688,27 @@ function familyOf(row: RunRow, children: readonly ChildRun[]): string[] {
   return [...new Set(ids)];
 }
 
-/** The harness's approval store, at its session root. */
+/**
+ * The harness's approval store, at its session root; `undefined` when that root lies
+ * outside the harness, so nothing is read or written there.
+ */
 function approvalStoreOf(harnessDir: string) {
-  const root = resolveHarnessSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars).root;
-  return createPendingApprovalStore({ rootDir: root });
+  const root = containedSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars);
+  return root === undefined ? undefined : createPendingApprovalStore({ rootDir: root });
 }
 
-/** The pending requests bound to any of `runs`, by id. A read: it rewrites nothing. */
+/**
+ * The pending requests bound to any of `runs`, by id; `undefined` when the harness's
+ * sessions folder lies outside it, so they cannot be read. A read: it rewrites nothing.
+ */
 async function pendingFor(
   harnessDir: string,
   runs: readonly (string | undefined)[],
-): Promise<string[]> {
+): Promise<string[] | undefined> {
   const named = new Set(runs.filter((id): id is string => id !== undefined));
-  const live = await approvalStoreOf(harnessDir).list();
+  const store = approvalStoreOf(harnessDir);
+  if (store === undefined) return undefined;
+  const live = await store.list();
   return live
     .filter((record) => {
       const binding = record.binding as { readonly runId?: unknown } | undefined;
@@ -880,7 +895,7 @@ async function cancelParked(
       return { kind: "failed" as const, reason: "the run machine refuses the move" };
     }
     const record = { ...current.record, id: req.runId } as RunRow;
-    const withdrawn = await approvalStoreOf(req.harnessDir).supersedeRun?.(
+    const withdrawn = await approvalStoreOf(req.harnessDir)?.supersedeRun?.(
       familyOf(record, children),
       { reason: "run-cancelled", via: "system" },
     );

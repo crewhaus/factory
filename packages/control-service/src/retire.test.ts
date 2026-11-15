@@ -1,5 +1,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import { type CommandReceipt, mintId, mintRunId } from "@crewhaus/control-contract";
 import {
@@ -16,7 +24,7 @@ import { AREA_RUNTIMES, retireRevokers } from "./areas";
 import type { RetireRevoker } from "./executor";
 import { LIFECYCLE_FILE, reconcileRetire, retireSteps } from "./retire";
 import { createStandingRule } from "./rules";
-import { NOW, fakeProbe, park, removeTempDirs, tempDir } from "./test-helpers";
+import { NOW, fakeProbe, park, removeTempDirs, tempDir, treeBytes } from "./test-helpers";
 
 afterAll(removeTempDirs);
 
@@ -53,7 +61,12 @@ function queue(harness: string): string {
   return id;
 }
 
-function setUp(extra: { readonly revokers?: readonly RetireRevoker[] } = {}) {
+function setUp(
+  extra: {
+    readonly revokers?: readonly RetireRevoker[];
+    readonly sessionRoot?: string | null;
+  } = {},
+) {
   const hangarRoot = tempDir("control-service-home-");
   const harness = tempDir("control-service-harness-");
   const registry = openHangarRegistry({
@@ -73,9 +86,50 @@ function setUp(extra: { readonly revokers?: readonly RetireRevoker[] } = {}) {
     registry,
     holder: { pid: 1, host: "h" },
     ...(extra.revokers !== undefined ? { revokers: extra.revokers } : {}),
+    ...("sessionRoot" in extra ? { sessionRoot: extra.sessionRoot } : {}),
   });
   return { hangarRoot, harness, registry, row, receipt, steps };
 }
+
+describe("retire with the sessions folder outside the harness", () => {
+  test("expires no approval there, says so, and leaves the folder as it was", async () => {
+    const s = setUp();
+    const parked = await park(s.harness, "Write", { path: "out.txt" });
+    const sessions = join(s.harness, ".crewhaus", "sessions");
+    const other = tempDir("control-service-harness-b-");
+    mkdirSync(join(other, ".crewhaus"), { recursive: true });
+    const moved = join(other, ".crewhaus", "sessions");
+    renameSync(sessions, moved);
+    try {
+      symlinkSync(moved, sessions, "dir");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return;
+      throw err;
+    }
+    const before = [...treeBytes(moved)];
+    expect(await s.steps.expireDecisions()).toMatchObject({ ok: true });
+    expect(s.steps.effects()).toContainEqual({
+      kind: "retire.approvals",
+      status: "skipped",
+      observed: "sessions folder outside the harness",
+    });
+    expect([...treeBytes(moved)]).toEqual(before);
+    const store = createPendingApprovalStore({ rootDir: moved });
+    expect((await store.list()).map((r) => r.id)).toEqual([parked.id]);
+  });
+
+  test("a session root given as unreachable expires nothing", async () => {
+    const s = setUp({ sessionRoot: null });
+    await park(s.harness, "Write", { path: "out.txt" });
+    const sessions = join(s.harness, ".crewhaus", "sessions");
+    const before = [...treeBytes(sessions)];
+    expect(await s.steps.expireDecisions()).toMatchObject({ ok: true });
+    expect(s.steps.effects().map((e) => [e.kind, e.status])).toEqual([
+      ["retire.approvals", "skipped"],
+    ]);
+    expect([...treeBytes(sessions)]).toEqual(before);
+  });
+});
 
 describe("retire's own steps", () => {
   test("disable, queued runs, approvals, standing rules, the lifecycle line and the registry row", async () => {

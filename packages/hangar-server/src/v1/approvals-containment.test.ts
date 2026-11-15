@@ -3,9 +3,24 @@
  * harness's `.crewhaus/sessions` a link to another's, its event stream, the overview model
  * Home's projector folds for it and the fleet log the projector writes for it carry none
  * of the other harness's decisions.
+ *
+ * A harness reads and decides only the approvals inside its own folder: with its sessions
+ * folder outside it once every link is followed, it counts no open decisions, lists none,
+ * answers 404 for one, decides none, and leaves that folder byte for byte as it was. A
+ * sessions folder linked to another place inside the harness lists and resolves as usual.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import { mintRunId } from "@crewhaus/control-contract";
 import { append, fleetChangesLedger, readPage, runsLedger } from "@crewhaus/control-records";
@@ -17,10 +32,70 @@ import { type V1Home, v1Home } from "../__test__/v1-home";
 const AT = "2026-11-14T00:00:00.000Z";
 const B_FIRST = "appr_00000000000000b1";
 const B_SECOND = "appr_00000000000000b2";
+/** B's pending tool approval, in its `approvals.jsonl`. */
+const B_PENDING = "appr_00000000000000b9";
+/** C's pending tool approval, in a sessions folder linked inside C. */
+const C_PENDING = "appr_00000000000000c9";
+/** An id no harness holds. */
+const NOBODY = "appr_000000000000dead";
 
 let home: V1Home;
 let a: { id: string; dir: string };
 let b: { id: string; dir: string };
+let c: { id: string; dir: string };
+
+function approval(id: string) {
+  return {
+    id,
+    toolName: "SendMessage",
+    inputHash: `hash-${id}`,
+    input: { channel: "ops", text: `content of ${id}` },
+    runId: "run_00000000000000b0",
+    sessionId: "sess_00000000000000bb",
+    surface: "daemon",
+    createdAt: new Date(Date.now() - 60_000).toISOString(),
+  };
+}
+
+function receiptLines(dir: string, kind: string): Record<string, unknown>[] {
+  const at = join(dir, ".crewhaus", "run", "control", "commands");
+  if (!existsSync(at)) return [];
+  return readdirSync(at)
+    .filter((name) => name.endsWith(".jsonl"))
+    .sort()
+    .flatMap((name) => readFileSync(join(at, name), "utf8").split("\n"))
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((row) => row["kind"] === kind);
+}
+
+/** Every path under `root`, recursively, with its bytes, its link target, or `dir`. */
+function treeOf(root: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (at: string, rel: string): void => {
+    for (const name of readdirSync(at).sort()) {
+      const path = join(at, name);
+      const key = rel === "" ? name : `${rel}/${name}`;
+      const st = lstatSync(path);
+      if (st.isSymbolicLink()) out[key] = `link:${readlinkSync(path)}`;
+      else if (st.isDirectory()) {
+        out[key] = "dir";
+        walk(path, key);
+      } else out[key] = `file:${readFileSync(path).toString("base64")}`;
+    }
+  };
+  walk(root, "");
+  return out;
+}
+
+function rowsOf(body: Record<string, unknown>, key: string): Array<Record<string, unknown>> {
+  return body[key] as Array<Record<string, unknown>>;
+}
+
+/** The refs a decision list names, `<harness>/decision/<id>`. */
+function refsOf(body: Record<string, unknown>): string[] {
+  return rowsOf(body, "items").map((item) => `${item["harness"]}/decision/${item["id"]}`);
+}
 
 function park(dir: string, decision: string): void {
   const sessions = join(dir, ".crewhaus", "sessions");
@@ -38,10 +113,14 @@ function park(dir: string, decision: string): void {
 beforeAll(async () => {
   home = await v1Home({ streamTimings: { pollMs: 10, heartbeatMs: 60_000 } });
   a = await home.harness("linked-a");
-  b = await home.harness("parked-b");
+  b = await home.harness("parked-b", { approvals: [approval(B_PENDING)] });
   park(b.dir, B_FIRST);
   rmSync(join(a.dir, ".crewhaus", "sessions"), { recursive: true, force: true });
   symlinkSync(join(b.dir, ".crewhaus", "sessions"), join(a.dir, ".crewhaus", "sessions"));
+  c = await home.harness("inside-c", { approvals: [approval(C_PENDING)] });
+  mkdirSync(join(c.dir, "state"));
+  renameSync(join(c.dir, ".crewhaus", "sessions"), join(c.dir, "state", "sessions"));
+  symlinkSync(join(c.dir, "state", "sessions"), join(c.dir, ".crewhaus", "sessions"));
 }, 60_000);
 
 afterAll(async () => {
@@ -106,3 +185,104 @@ describe.skipIf(process.platform === "win32")("a linked sessions folder", () => 
     expect(JSON.stringify(forA)).not.toContain("appr_00000000000000b");
   });
 });
+
+describe.skipIf(process.platform === "win32")(
+  "a harness whose sessions folder lies outside it",
+  () => {
+    let viewer: { secret: string };
+    let decider: { secret: string };
+
+    beforeAll(async () => {
+      viewer = await home.member("Vi", "viewer", { scope: `harness:${a.id}` });
+      decider = await home.member("Dee", "operator", { scope: `harness:${a.id}` });
+    }, 60_000);
+
+    test("shows no pending approvals", async () => {
+      const own = await home.call("GET", `/api/v1/harnesses/${b.id}`);
+      expect(own.status).toBe(200);
+      expect(own.body["openDecisions"] as number).toBeGreaterThanOrEqual(1);
+      const got = await home.call("GET", `/api/v1/harnesses/${a.id}`, { secret: viewer.secret });
+      expect(got.status).toBe(200);
+      expect(got.body["openDecisions"]).toBe(0);
+    });
+
+    test("lists none of the folder's decisions, and the empty list says it is unreachable", async () => {
+      const own = await home.call("GET", "/api/v1/decisions");
+      expect(refsOf(own.body)).toContain(`${b.id}/decision/${B_PENDING}`);
+      const got = await home.call("GET", "/api/v1/decisions", { secret: viewer.secret });
+      expect(got.status).toBe(200);
+      expect(JSON.stringify(got.body["items"])).not.toContain(B_PENDING);
+      expect(rowsOf(got.body, "items")).toEqual([]);
+      expect((got.body["empty"] as Record<string, unknown>)["reason"]).toBe("unreachable");
+    });
+
+    test("a decision or ref in that folder answers 404, as an unknown id does", async () => {
+      for (const path of ["/api/v1/decisions", "/api/v1/refs"]) {
+        const got = await home.call("GET", `${path}/${a.id}/decision/${B_PENDING}`, {
+          secret: viewer.secret,
+        });
+        const unknown = await home.call("GET", `${path}/${a.id}/decision/${NOBODY}`, {
+          secret: viewer.secret,
+        });
+        expect({ path, status: got.status }).toEqual({ path, status: 404 });
+        expect(JSON.stringify(got.body)).toBe(JSON.stringify(unknown.body));
+      }
+    });
+
+    test("a decision in such a folder is refused and its files are unchanged", async () => {
+      const sessions = join(b.dir, ".crewhaus", "sessions");
+      const before = treeOf(sessions);
+      expect(Object.keys(before)).toContain("approvals.jsonl");
+      const target = `/api/v1/decisions/${a.id}/decision/${B_PENDING}/resolve`;
+      const asDecider = await home.call("POST", target, {
+        body: { choice: "grant" },
+        secret: decider.secret,
+      });
+      expect(asDecider.status).toBe(404);
+      const asOwner = await home.call("POST", target, { body: { choice: "grant" } });
+      expect(asOwner.status).toBe(404);
+      // Refused before a command is submitted: no receipt is written for either.
+      expect(receiptLines(a.dir, "decisions.resolve")).toEqual([]);
+      const legacy = await home.call("POST", `/api/h/${a.id}/approvals/${B_PENDING}/grant`, {
+        body: {},
+      });
+      expect(legacy.status).toBe(409);
+      expect(treeOf(sessions)).toEqual(before);
+      // The receipted route records its refusal in the harness's own ledger; nothing succeeded.
+      const named = receiptLines(a.dir, "decisions.resolve").filter((row) =>
+        String(row["target"]).endsWith(B_PENDING),
+      );
+      expect(named.map((row) => row["state"])).toEqual(["accepted", "rejected"]);
+    });
+
+    test("the fleet row counts no pending approvals for it", async () => {
+      const legacy = await home.call("GET", "/api/harnesses");
+      const rows = rowsOf(legacy.body, "harnesses");
+      const own = rows.find((r) => r["id"] === b.id);
+      expect(own?.["pendingApprovals"] as number).toBeGreaterThanOrEqual(1);
+      const linked = rows.find((r) => r["id"] === a.id);
+      expect(linked?.["pendingApprovals"]).toBe(0);
+    });
+
+    test("a harness whose sessions folder is its own, or linked inside it, lists and resolves as before", async () => {
+      const listed = await home.call("GET", "/api/v1/decisions");
+      const refs = refsOf(listed.body);
+      expect(refs).toContain(`${b.id}/decision/${B_PENDING}`);
+      expect(refs).toContain(`${c.id}/decision/${C_PENDING}`);
+      const own = `${b.id}/decision/${B_PENDING}`;
+      expect((await home.call("GET", `/api/v1/decisions/${own}`)).status).toBe(200);
+      expect((await home.call("GET", `/api/v1/refs/${own}`)).status).toBe(200);
+      const decided = await home.call("POST", `/api/v1/decisions/${own}/resolve`, {
+        body: { choice: "grant" },
+      });
+      expect(decided.status).toBe(200);
+      const inside = await home.call(
+        "POST",
+        `/api/v1/decisions/${c.id}/decision/${C_PENDING}/resolve`,
+        { body: { choice: "grant" } },
+      );
+      expect(inside.status).toBe(200);
+      expect((inside.body["decision"] as Record<string, unknown>)["state"]).toBe("granted");
+    });
+  },
+);

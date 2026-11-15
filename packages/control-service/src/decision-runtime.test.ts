@@ -1,7 +1,10 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mintId } from "@crewhaus/control-contract";
+import { mkdirSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
+import { type CommandReceipt, mintId } from "@crewhaus/control-contract";
 import { AREA_RUNTIMES, compositionProblems } from "./areas";
 import { CORE_RUNTIME } from "./core-runtime";
+import { observeResolve } from "./decision-runtime";
 import { commandsLedgerOf } from "./ledgers";
 import {
   IDENTITY,
@@ -12,6 +15,7 @@ import {
   rig,
   rowsOf,
   setUpOwner,
+  tempDir,
 } from "./test-helpers";
 
 afterAll(removeTempDirs);
@@ -68,6 +72,40 @@ describe("a CLI decision is a receipted command", () => {
 });
 
 describe("recovery observes what a receipt names, and never decides again", () => {
+  test("a harness whose sessions folder lies outside it observes no decision there", async () => {
+    const r = await governedByLocalOwner();
+    const p = await park(r.harness, "Write", { path: "a.md" });
+    await r.service.decisions.resolve({
+      harnessDir: r.harness,
+      ref: p.id,
+      choice: "grant",
+      actor: { kind: "principal", principal: r.owner },
+      via: "cli",
+    });
+    const linked = tempDir("control-service-harness-a-");
+    mkdirSync(join(linked, ".crewhaus"), { recursive: true });
+    try {
+      symlinkSync(
+        join(r.harness, ".crewhaus", "sessions"),
+        join(linked, ".crewhaus", "sessions"),
+        "dir",
+      );
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return;
+      throw err;
+    }
+    const receipt = {
+      id: CMD,
+      kind: "decisions.resolve",
+      target: `${HRN}/decision/${p.id}`,
+      actor: r.owner,
+      acceptedAt: new Date().toISOString(),
+    } as unknown as CommandReceipt;
+    // Through the harness whose folder it is, the decision is observed.
+    expect(observeResolve(receipt, r.harness)).toBe("same");
+    expect(observeResolve(receipt, linked)).toBe("unknown");
+  });
+
   test("the same member's claim settles it succeeded", async () => {
     const r = await governedByLocalOwner();
     const p = await park(r.harness, "Write", { path: "a.md" });

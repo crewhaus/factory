@@ -34,9 +34,9 @@ import {
 import { readHarnessEnvFiles } from "@crewhaus/harness-supervisor";
 import {
   approvalsLedger,
+  containedSessionRoot,
   parseDecisionClaim,
   parseSupersedeClaim,
-  resolveHarnessSessionRoot,
 } from "@crewhaus/session-store";
 import type { Executor, Reconciler, Reconciliation, Settlement } from "./executor";
 import { NEEDS_DECISION, outcomeOf } from "./refusal";
@@ -56,10 +56,10 @@ function targetId(receipt: CommandReceipt, kind: string): string | undefined {
   return ref.id;
 }
 
-function approvalsLedgerOf(harnessDir: string) {
-  return approvalsLedger(
-    resolveHarnessSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars).root,
-  );
+/** The harness's approvals decision log, or `undefined` when its sessions folder lies outside it. */
+function approvalsLedgerOf(harnessDir: string): ReturnType<typeof approvalsLedger> | undefined {
+  const root = containedSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars);
+  return root === undefined ? undefined : approvalsLedger(root);
 }
 
 /** Who decided what a `decisions.resolve` receipt names. */
@@ -89,7 +89,9 @@ export function observeResolve(receipt: CommandReceipt, harnessDir: string): Obs
     if (action.resolvedBy === "delegation") return isId("prn", receipt.actor) ? "other" : "unknown";
     return compare(action.decidedByPrincipal, receipt.actor);
   }
-  const claim = readClaim(approvalsLedgerOf(harnessDir), `decision/${id}`);
+  const ledger = approvalsLedgerOf(harnessDir);
+  if (ledger === undefined) return "unknown";
+  const claim = readClaim(ledger, `decision/${id}`);
   if (!claim.ok) return "unknown";
   const parsed = parseDecisionClaim(claim.content.record);
   return typeof parsed === "string" ? "unknown" : compare(parsed.decidedByPrincipal, receipt.actor);
@@ -99,7 +101,9 @@ export function observeResolve(receipt: CommandReceipt, harnessDir: string): Obs
 export function observeSupersede(receipt: CommandReceipt, harnessDir: string): Observed {
   const id = targetId(receipt, "decision");
   if (id === undefined || isId("dec", id)) return "unknown";
-  const claim = readClaim(approvalsLedgerOf(harnessDir), `supersede/${id}`);
+  const ledger = approvalsLedgerOf(harnessDir);
+  if (ledger === undefined) return "unknown";
+  const claim = readClaim(ledger, `supersede/${id}`);
   if (!claim.ok) return "unknown";
   const parsed = parseSupersedeClaim(claim.content.record);
   return typeof parsed === "string" ? "unknown" : compare(parsed.byPrincipal, receipt.actor);
@@ -118,6 +122,7 @@ export function observeDefer(receipt: CommandReceipt, harnessDir: string): Obser
   const id = targetId(receipt, "decision");
   if (id === undefined || isId("dec", id)) return "unknown";
   const ledger = approvalsLedgerOf(harnessDir);
+  if (ledger === undefined) return "unknown";
   const accepted = Date.parse(receipt.acceptedAt);
   let before: CursorPosition | undefined;
   for (;;) {
@@ -142,7 +147,7 @@ export function observeDefer(receipt: CommandReceipt, harnessDir: string): Obser
 }
 
 /** A deferral that is not found: another's when the request was decided or replaced since. */
-function settledElsewhere(ledger: ReturnType<typeof approvalsLedgerOf>, id: string): Observed {
+function settledElsewhere(ledger: ReturnType<typeof approvalsLedger>, id: string): Observed {
   for (const claim of [`decision/${id}`, `supersede/${id}`]) {
     if (readClaim(ledger, claim).ok) return "other";
   }
