@@ -49,6 +49,7 @@ import {
   needsClassReason,
   principalAuthorizer,
 } from "@crewhaus/session-store";
+import { CREDENTIAL_FORM_WORDS } from "@crewhaus/spec-patch";
 import {
   DEFAULT_RULE_DAYS,
   type RuleWriteAnswer,
@@ -253,10 +254,14 @@ export async function resolveToolApproval(
     } else {
       const narrow = standingPatternFor(record.toolName, record.input, harnessDir);
       if ("refused" in narrow) {
+        const words =
+          "form" in narrow
+            ? `the call's value carries a credential (${CREDENTIAL_FORM_WORDS[narrow.form]}), which a rule must not hold`
+            : (NARROW_WORDS[narrow.refused] ?? narrow.refused);
         return {
           outcome: "invalid",
           record,
-          reason: `no standing rule can name this call: ${NARROW_WORDS[narrow.refused] ?? narrow.refused} (${narrow.refused})`,
+          reason: `no standing rule can name this call: ${words} (${narrow.refused})`,
         };
       }
       rule = { tool: record.toolName, pattern: narrow.pattern, days };

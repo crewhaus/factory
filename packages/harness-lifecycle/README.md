@@ -6,6 +6,7 @@ stops.
 | Module | Answers |
 |---|---|
 | `retire` | the ordered, evidenced decommission of a harness |
+| `run-tokens` | which files are a daemon's run bearer secrets, and their removal from an archived state directory |
 | `retention` | which sessions and audit records are past their TTL |
 | `knowledge-sync` | what a harness and the fleet's shared store owe each other |
 

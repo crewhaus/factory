@@ -51,7 +51,6 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -66,20 +65,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { RUN_TOKEN_FILES } from "@crewhaus/harness-lifecycle";
 import { type FeedbackRecord, extractFeedbackRecords, mergeFeedback } from "./feedback";
+
+export { RUN_TOKEN_FILES, removeRunTokens } from "@crewhaus/harness-lifecycle";
 
 /** Manifest file name at the archive root (NOT restored into `.crewhaus`). */
 export const MANIFEST_FILENAME = "backup-manifest.json";
-
-/**
- * A daemon's run bearer secrets, relative to the state directory. A daemon
- * makes each again at every start, so a restore loses nothing without them.
- */
-export const RUN_TOKEN_FILES: readonly string[] = [
-  "run/control-token",
-  "run/gateway-jwt-secret",
-  "run/mcp-token",
-];
 
 /**
  * Files a backup leaves out unless `--include` names one, so a restore loses
@@ -87,31 +79,6 @@ export const RUN_TOKEN_FILES: readonly string[] = [
  * exactly (a file of the same name anywhere else is archived).
  */
 export const DEFAULT_BACKUP_EXCLUDES: readonly string[] = [...RUN_TOKEN_FILES];
-
-/**
- * Remove {@link RUN_TOKEN_FILES} from a state directory that is no longer
- * live (the copy `crewhaus retire` keeps in its archive), so it holds no run
- * token. A daemon makes each again at start. Only a file under a real `run/`
- * directory is removed (a link is removed, never followed). Returns the
- * removed paths, sorted.
- */
-export function removeRunTokens(stateDir: string): string[] {
-  const removed: string[] = [];
-  for (const rel of RUN_TOKEN_FILES) {
-    const parent = join(stateDir, dirname(rel));
-    const path = join(stateDir, rel);
-    try {
-      if (!lstatSync(parent).isDirectory()) continue;
-      const st = lstatSync(path);
-      if (!st.isFile() && !st.isSymbolicLink()) continue;
-    } catch {
-      continue;
-    }
-    rmSync(path, { force: true });
-    removed.push(rel);
-  }
-  return removed.sort();
-}
 
 /** First 16 bytes of every SQLite main database file: "SQLite format 3\\0"
  *  (spelled as code points so the source carries no literal NUL). */

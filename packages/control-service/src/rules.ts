@@ -46,7 +46,7 @@ import {
   removeSettingsRule,
   settingsFilePath,
 } from "@crewhaus/permission-engine";
-import { carriesCredential } from "@crewhaus/spec-patch";
+import { CREDENTIAL_FORM_WORDS, type CredentialForm, credentialFormIn } from "@crewhaus/spec-patch";
 import { lexicalPathValues, operativeValuesOf } from "@crewhaus/tool-executor";
 import { TOOL_REGISTRY } from "@crewhaus/tool-registry-manifest";
 import type { DecisionActor, Decisions } from "./decisions";
@@ -136,13 +136,59 @@ export type StandingPattern =
   | {
       /** The call's value carries a credential, which a rule must never hold. */
       readonly refused: "carries-credential";
+      /** The form it takes (`CREDENTIAL_FORM_WORDS` names it); never the value. */
+      readonly form: CredentialForm;
     };
+
+/** The strings of a field as recorded: the field itself, or each string of an array. */
+function recordedStrings(value: unknown): string[] {
+  const all = Array.isArray(value) ? value : [value];
+  return all.filter((v): v is string => typeof v === "string");
+}
+
+/**
+ * The first credential form a call carries in any value a rule is read against, before
+ * any narrowing: every `canonical` and `spellings` entry of its operative values, and
+ * each declared field's own string as recorded. A tool the manifest does not declare is
+ * read by every top-level string of its input, which holds the value the matcher's name
+ * table reads.
+ */
+function callCredentialForm(
+  toolName: string,
+  input: unknown,
+  values:
+    | ReadonlyArray<{
+        readonly canonical: readonly string[];
+        readonly spellings?: readonly string[];
+      }>
+    | undefined,
+): CredentialForm | undefined {
+  for (const v of values ?? []) {
+    for (const s of [...v.canonical, ...(v.spellings ?? [])]) {
+      const form = credentialFormIn(s);
+      if (form !== undefined) return form;
+    }
+  }
+  if (input === null || typeof input !== "object") return undefined;
+  const record = input as Record<string, unknown>;
+  const declared = manifestEntry(toolName)?.operativeArgs as OperativeArgs | undefined;
+  const fields = declared !== undefined ? declared.map((a) => a.field) : Object.keys(record);
+  for (const field of fields) {
+    if (!Object.hasOwn(record, field)) continue;
+    for (const s of recordedStrings(record[field])) {
+      const form = credentialFormIn(s);
+      if (form !== undefined) return form;
+    }
+  }
+  return undefined;
+}
 
 /**
  * The narrowest standing rule for an approved call, or why there is none. A tool the
  * manifest says takes no scoping argument is refused here; one it does not list falls
  * back to the matcher's name table, as `crewhaus permissions suggest` does. A rule's
- * pattern is the call's own value, so a value that carries a credential is refused:
+ * pattern is the call's own value, so a call that carries a credential in any value a
+ * rule is read against is refused, whatever its narrowing answers, with the form found:
  * the pattern would be written to `.crewhaus/settings.json` and the rule's record.
  */
 export function standingPatternFor(
@@ -152,9 +198,12 @@ export function standingPatternFor(
 ): StandingPattern {
   const values = callValues(toolName, input, harnessDir);
   if (values === "no-scoping-argument") return { refused: "no-scoping-argument" };
+  const carried = callCredentialForm(toolName, input, values);
+  if (carried !== undefined) return { refused: "carries-credential", form: carried };
   const narrow = narrowPatternFor(toolName, input, values);
-  if ("pattern" in narrow && carriesCredential(narrow.value)) {
-    return { refused: "carries-credential" };
+  if ("pattern" in narrow) {
+    const form = credentialFormIn(narrow.value);
+    if (form !== undefined) return { refused: "carries-credential", form };
   }
   return narrow;
 }
@@ -178,7 +227,10 @@ export function widenedPatternProblem(
     return `a wider rule names the same tool with an argument: ${toolName}(<glob>)`;
   }
   if (holdsDisplayControl(pattern)) return DISPLAY_CONTROL_PROBLEM;
-  if (carriesCredential(pattern)) return "a rule must not hold a credential";
+  const form = credentialFormIn(pattern);
+  if (form !== undefined) {
+    return `a rule must not hold a credential (${CREDENTIAL_FORM_WORDS[form]})`;
+  }
   const values = callValues(toolName, input, harnessDir);
   const operativeValues = values === "no-scoping-argument" ? undefined : values;
   // Read by the engine itself, as a settings allow and nothing else: a pattern that
