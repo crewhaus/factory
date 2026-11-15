@@ -48,9 +48,11 @@ import {
   isManagedRunHandler,
   signJwt,
   statusFor,
+  verifyJwt,
 } from "./index";
 import {
   type CreateManagedRunsOptions,
+  HOME_RUN_TENANT,
   type ManagedRuns,
   type ManagedTurn,
   type ManagedTurnArgs,
@@ -482,6 +484,97 @@ describe("a client's own run handle", () => {
     });
     expect(again.result).toEqual({ runId, sessionId, tenantId: "tenant-a" });
     expect(s.calls).toHaveLength(1);
+  });
+
+  /** A run Home queued, as Home queues one: its tenant, no claim yet. */
+  const homeQueued = (harnessDir: string): string => {
+    const answer = queueManagedRun({
+      harnessDir,
+      tenant: HOME_RUN_TENANT,
+      input: CLEAN,
+      by: "sys:scheduler",
+      env: {},
+    });
+    if (!answer.ok) throw new Error(answer.reason);
+    return answer.runId;
+  };
+  const inputFileOf = (harnessDir: string, runId: string): string =>
+    join(harnessDir, controlPaths(harnessDir).inputsDir, `${runId}.json`);
+
+  test("Home's queued run id cannot be taken by a client; Home's follower still runs it under Home's tenant", async () => {
+    const s = await served();
+    const id = homeQueued(s.harnessDir);
+    expect(statesOf(s.harnessDir, id)).toEqual(["queued"]);
+    const claims = controlFiles(s.harnessDir).filter((f) => f.path.endsWith(`/claims/run/${id}`));
+    expect(claims).toEqual([]);
+    const ask = () =>
+      s.call("runs.create", create(CLEAN, { runId: id, idempotency: "grab-1" }), {
+        tenant: "tenant-b",
+      });
+    const taken = await ask();
+    expect(taken.error).toMatchObject({ code: "conflict", message: `run ${id} is already taken` });
+    expect(statesOf(s.harnessDir, id)).toEqual(["queued"]);
+    expect(s.calls).toHaveLength(0);
+    // The value names no run: a retry is refused the same way, never answered as a replay.
+    const again = await ask();
+    expect(again.error).toMatchObject({ code: "conflict", message: `run ${id} is already taken` });
+    // A refused input writes no row under it either.
+    const blocked = await s.call("runs.create", create(PLANTED, { runId: id }), {
+      tenant: "tenant-b",
+    });
+    expect(blocked.error).toMatchObject({ code: "conflict" });
+    expect(statesOf(s.harnessDir, id)).toEqual(["queued"]);
+    expect(s.calls).toHaveLength(0);
+    await s.runs.claimQueued();
+    expect(statesOf(s.harnessDir, id)).toEqual(["queued", "running", "succeeded"]);
+    expect(s.calls).toHaveLength(1);
+    expect(s.calls[0]?.input).toBe(CLEAN);
+    expect(rowsOf(s.harnessDir, id).every((row) => row["tenant"] === HOME_RUN_TENANT)).toBe(true);
+    // A fresh client-named id still starts.
+    const fresh = mintRunId();
+    const named = await s.call("runs.create", create(CLEAN, { runId: fresh }), {
+      tenant: "tenant-b",
+    });
+    expect(named.result?.["runId"]).toBe(fresh);
+    expect(statesOf(s.harnessDir, fresh)).toEqual(["running", "succeeded"]);
+  });
+
+  test("a client-named id is taken by a recorded row alone, by a saved input alone, and when the ledger cannot be read", async () => {
+    const s = await served();
+    const before = s.calls.length;
+    const refusedFor = async (runId: string) => {
+      const answer = await s.call("runs.create", create(CLEAN, { runId }));
+      expect(answer.error).toMatchObject({
+        code: "conflict",
+        message: `run ${runId} is already taken`,
+      });
+    };
+    // A row, its input gone.
+    const rowOnly = homeQueued(s.harnessDir);
+    rmSync(inputFileOf(s.harnessDir, rowOnly));
+    await refusedFor(rowOnly);
+    expect(statesOf(s.harnessDir, rowOnly)).toEqual(["queued"]);
+    // An input, no row yet.
+    const fileOnly = mintRunId();
+    writeFileSync(inputFileOf(s.harnessDir, fileOnly), "{}\n", { mode: 0o600 });
+    await refusedFor(fileOnly);
+    expect(statesOf(s.harnessDir, fileOnly)).toEqual([]);
+    // A ledger that cannot be folded.
+    const segments = join(s.harnessDir, ".crewhaus", "run", "control", "runs");
+    const [segment] = readdirSync(segments).filter((f) => f.endsWith(".jsonl"));
+    const path = join(segments, segment as string);
+    const kept = join(s.harnessDir, "kept.jsonl");
+    writeFileSync(kept, readFileSync(path));
+    rmSync(path);
+    symlinkSync(kept, path);
+    expect(foldStates(runsLedger(s.harnessDir)).ok).toBe(false);
+    const unread = mintRunId();
+    const answer = await s.call("runs.create", create(CLEAN, { runId: unread }));
+    expect(answer.error).toMatchObject({
+      code: "conflict",
+      message: `run ${unread} is already taken`,
+    });
+    expect(s.calls).toHaveLength(before);
   });
 
   test("without the capability the params are refused as strict, and /status lists runs.clientRunId only with a follower", async () => {
@@ -1118,7 +1211,7 @@ describe("queued runs", () => {
     expect(statesOf(s.harnessDir, id)).toEqual(["queued"]);
   });
 
-  test("the writer refuses a raw local actor, a bad run id, a bad tenant and run rows off", () => {
+  test("the writer refuses a raw local actor, a bad run id, a bad tenant, a credential that is not one and run rows off", () => {
     const harnessDir = tempDir();
     const base = { harnessDir, tenant: "tenant-a", input: CLEAN, by: "sys:scheduler", env: {} };
     const refused = [
@@ -1126,11 +1219,69 @@ describe("queued runs", () => {
       queueManagedRun({ ...base, runId: "run_short" }),
       queueManagedRun({ ...base, tenant: "../escape" }),
       queueManagedRun({ ...base, env: { CREWHAUS_RUN_LEDGER: "0" } }),
+      queueManagedRun({ ...base, byCredential: "prn_x" }),
     ];
     for (const answer of refused) expect(answer.ok).toBe(false);
     expect(refused[0]).toMatchObject({ reason: expect.stringContaining("stored actor") });
+    expect(refused[4]).toEqual({
+      ok: false,
+      reason: "byCredential must be a credential id (crd_…)",
+    });
     expect(rowsAt(harnessDir)).toEqual([]);
     expect(existsSync(join(harnessDir, ".crewhaus/run/control/inputs"))).toBe(false);
+    // A credential id is written on the queued row beside who queued it.
+    const credential = mintId("crd");
+    const written = queueManagedRun({ ...base, by: mintId("prn"), byCredential: credential });
+    expect(written.ok).toBe(true);
+    expect(rowsAt(harnessDir)).toEqual([
+      expect.objectContaining({ state: "queued", byCredential: credential }),
+    ]);
+  });
+
+  test("a run Home queued is out of reach of every token the gateway accepts: no cancel while queued or running, and no stream", async () => {
+    const entered = deferred<RunContext>();
+    const release = deferred<void>();
+    const s = setup({}, async (args) => {
+      entered.resolve(args.runContext);
+      await release.promise;
+      return { reply: "Done." };
+    });
+    expect(() => verifyJwt(signJwt({ tenant_id: HOME_RUN_TENANT }, SECRET), SECRET)).toThrow(
+      "JWT tenant_id is reserved",
+    );
+    const accepted = ["tenant-b", "home-team", "Home2"];
+    for (const tenant of accepted) {
+      expect(verifyJwt(signJwt({ tenant_id: tenant }, SECRET), SECRET).tenant_id).toBe(tenant);
+    }
+    const id = queue(s.harnessDir, { tenant: HOME_RUN_TENANT });
+    for (const tenant of accepted) {
+      const res = await s.call("runs.cancel", { runId: id }, { tenant });
+      expect(`${tenant} ${JSON.stringify(res.result)}`).toBe(`${tenant} {"ok":false}`);
+    }
+    expect(statesOf(s.harnessDir, id)).toEqual(["queued"]);
+    const claiming = s.runs.claimQueued();
+    const ctx = await entered.promise;
+    expect(ctx.runId).toBe(id);
+    for (const tenant of accepted) {
+      const res = await s.call("runs.cancel", { runId: id }, { tenant });
+      expect(`${tenant} ${JSON.stringify(res.result)}`).toBe(`${tenant} {"ok":false}`);
+      const events = await s.runs.resolveRunEvents({
+        runId: id,
+        tenant: buildTenant(tenant, { tenantsRoot: s.tenantsRoot }),
+      });
+      expect(`${tenant} ${events === undefined}`).toBe(`${tenant} true`);
+    }
+    expect(ctx.abortSignal.aborted).toBe(false);
+    // Home's own tenant reaches its run's stream.
+    expect(
+      await s.runs.resolveRunEvents({
+        runId: id,
+        tenant: buildTenant(HOME_RUN_TENANT, { tenantsRoot: s.tenantsRoot }),
+      }),
+    ).toBeDefined();
+    release.resolve();
+    await claiming;
+    expect(statesOf(s.harnessDir, id)).toEqual(["queued", "running", "succeeded"]);
   });
 
   test("a queued run survives a restart: a new follower's start runs it", async () => {

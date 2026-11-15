@@ -161,7 +161,14 @@ export const EXAMPLES: Readonly<Record<string, unknown>> = {
   deviceLookupRequest: { code: "BCDF-GHJK" },
   devicePollRequest: { pollRef: "ab".repeat(32), seal: SEAL },
   devicePolled: { state: "pending" },
-  deviceRequestView: { state: "pending", readOnly: false, expiresAt: AT, tokenDays: 90 },
+  deviceRequestView: {
+    state: "pending",
+    readOnly: false,
+    expiresAt: AT,
+    createdAt: AT,
+    requestedFrom: { via: "direct", address: "203.0.113.5" },
+    tokenDays: 90,
+  },
   deviceStartRequest: { seal: SEAL },
   deviceStarted: {
     issued: ISSUED,

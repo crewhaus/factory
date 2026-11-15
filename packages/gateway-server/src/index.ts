@@ -4,6 +4,7 @@
  *
  * Auth: HS256 JWT bearer tokens. Token claims must include
  * `tenant_id`, an `iat` not in the future, and an `exp` in the future.
+ * A reserved tenant id (`RESERVED_TENANT_IDS`) is refused, in any letter case.
  * The signing secret is verified against `opts.jwtSecret`. Tokens are
  * NEVER minted by the daemon — they're issued by an external IDP and
  * the daemon only verifies. (For the smoke test we mint with the same
@@ -65,9 +66,20 @@ import {
 } from "@crewhaus/gateway-protocol/body-limit";
 import { withInboundContent } from "@crewhaus/run-context";
 import { type Tenant, buildTenant, validateTenantId, withTenant } from "@crewhaus/tenancy";
-import { GatewayCodedError, clientRunIdsOf, isManagedRunHandler } from "./coded";
+import {
+  GatewayCodedError,
+  RESERVED_TENANT_IDS,
+  clientRunIdsOf,
+  isManagedRunHandler,
+} from "./coded";
 
-export { GatewayCodedError, MANAGED_RUN_HANDLER, isManagedRunHandler } from "./coded";
+export {
+  GatewayCodedError,
+  HOME_RUN_TENANT,
+  MANAGED_RUN_HANDLER,
+  RESERVED_TENANT_IDS,
+  isManagedRunHandler,
+} from "./coded";
 
 export class GatewayServerError extends CrewhausError {
   override readonly name = "GatewayServerError";
@@ -168,6 +180,8 @@ export function verifyJwt(token: string, secret: string, now: () => number = Dat
     throw new GatewayServerError("JWT missing tenant_id claim");
   }
   validateTenantId(claims.tenant_id);
+  if (RESERVED_TENANT_IDS.has(claims.tenant_id.toLowerCase()))
+    throw new GatewayServerError("JWT tenant_id is reserved");
   const nowMs = now();
   // `exp` is mandatory — an absent (or non-numeric) `exp` must not mean
   // "never expires" (CWE-613).

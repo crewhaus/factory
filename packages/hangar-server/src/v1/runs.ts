@@ -5,9 +5,10 @@
  * every refusal (an operator record, an old build, a daemon that is not there, a run that
  * ended) is answered before anything is written; its effect runs once the receipt is.
  *
- * A service that started a run may read, list and cancel its own runs without reading the
- * whole harness (`creating-service`). A run whose records name a person's records answers
- * its result with `hidden: ["people"]` and no content unless the people domain releases it.
+ * The service credential that started a run may read, list and cancel that run without
+ * reading the whole harness (`creating-service`); no other credential of the service may.
+ * A run whose records name a person's records answers its result with `hidden: ["people"]`
+ * and no content unless the people domain releases it.
  */
 import {
   type CommandReceipt,
@@ -33,7 +34,7 @@ import { entryOf, harnessOf, liveDirOf, liveDirOr409 } from "./resolve";
 import { type Submitted, acceptedAnswer, replayedCommand, submitCommand } from "./submit";
 
 /** A ledger's own fields, never part of a run as served. */
-const BOOKKEEPING = new Set(["claim", "gen", "repaired"]);
+const BOOKKEEPING = new Set(["claim", "gen", "repaired", "byCredential"]);
 
 const TERMINAL = new Set(["interrupted", "succeeded", "failed", "cancelled"]);
 
@@ -55,6 +56,7 @@ type RunFound = {
   readonly dir: string;
   readonly rows: readonly LedgerRecord[];
   readonly by?: string;
+  readonly byCredential?: string;
 };
 
 /** A run's rows in one harness's newest lines, newest first; empty when none is there. */
@@ -68,13 +70,17 @@ function rowsIn(dir: string, runId: string): LedgerRecord[] {
   }
 }
 
-function byOf(rows: readonly LedgerRecord[]): string | undefined {
-  // The row it entered with names who asked for it.
+/** Who asked for a run, and with which credential: both from the row it entered with. */
+function byOf(rows: readonly LedgerRecord[]): { by?: string; byCredential?: string } {
   const entry = [...rows]
     .reverse()
     .find((row) => row["state"] === "queued" || row["state"] === "running");
   const by = entry?.["by"];
-  return typeof by === "string" ? by : undefined;
+  const byCredential = entry?.["byCredential"];
+  return {
+    ...(typeof by === "string" ? { by } : {}),
+    ...(typeof byCredential === "string" ? { byCredential } : {}),
+  };
 }
 
 /**
@@ -92,8 +98,7 @@ export function findRun(
     if (dir === undefined) return undefined;
     const rows = rowsIn(dir, runId);
     if (rows.length === 0) return undefined;
-    const by = byOf(rows);
-    return { entry, dir, rows, ...(by !== undefined ? { by } : {}) };
+    return { entry, dir, rows, ...byOf(rows) };
   };
   if (hint !== undefined) {
     const hinted = entryOf(deps, hint);
@@ -110,16 +115,16 @@ export function findRun(
 }
 
 /**
- * Whether `by` started a run recorded among a harness's newest run-ledger lines: what
- * lets a service list that harness's runs (its own only) without reading the harness.
- * Reads only.
+ * Whether `by` started a run recorded among a harness's newest run-ledger lines with the
+ * credential `credential`: what lets that credential list the harness's runs (its own
+ * only) without reading the harness. Reads only.
  */
-export function startedRunIn(entry: HangarHarnessEntry, by: string): boolean {
+export function startedRunIn(entry: HangarHarnessEntry, by: string, credential: string): boolean {
   const dir = liveDirOf(entry);
   if (dir === undefined) return false;
   try {
     return readPage(runsLedger(dir), { limit: RUN_LOOKUP_LINES }).items.some(
-      (item) => item.record["by"] === by,
+      (item) => item.record["by"] === by && item.record["byCredential"] === credential,
     );
   } catch {
     return false;
@@ -162,6 +167,7 @@ function refusalError(refusal: RunRefusal): V1Error {
     message: refusal.message,
     ...(refusal.verb !== undefined ? { verb: refusal.verb } : {}),
     ...(refusal.remedy !== undefined ? { remedy: refusal.remedy } : {}),
+    ...(refusal.retryAfterMs !== undefined ? { retryAfterMs: refusal.retryAfterMs } : {}),
   });
 }
 
@@ -171,6 +177,7 @@ async function homeFor(ctx: V1Context, entry: HangarHarnessEntry): Promise<RunHo
   const target = deps.controlTarget === undefined ? undefined : await deps.controlTarget(entry);
   const startRunJob = deps.startRunJob;
   const stopRunJob = deps.stopRunJob;
+  const apiRunCapacity = deps.apiRunCapacity;
   return {
     ...(startRunJob !== undefined
       ? { startRunJob: (_dir: string, apiRun) => startRunJob(entry, apiRun) }
@@ -178,6 +185,7 @@ async function homeFor(ctx: V1Context, entry: HangarHarnessEntry): Promise<RunHo
     ...(stopRunJob !== undefined
       ? { stopRunJob: (_dir: string, runId: string) => stopRunJob(entry, runId) }
       : {}),
+    ...(apiRunCapacity !== undefined ? { apiRunCapacity: () => apiRunCapacity(entry) } : {}),
     ...(deps.controlClient !== undefined ? { controlClient: deps.controlClient } : {}),
     ...(target !== undefined ? { controlTarget: () => target } : {}),
     now: deps.now,
@@ -213,7 +221,8 @@ const list: V1Handler = async (ctx) => {
       },
     };
   }
-  const own = ownOnly(ctx, entry.id) ? ctx.access.caller.principal : undefined;
+  // A service lists only the runs its own credential started; one with none lists nothing.
+  const own = ownOnly(ctx, entry.id) ? (ctx.credentialRef ?? "") : undefined;
   const ledger = runsLedger(dir);
   // Newest first, each run once, at the line it entered with, served as its newest row.
   const newest = new Map<string, LedgerRecord>();
@@ -236,7 +245,7 @@ const list: V1Handler = async (ctx) => {
       if (!newest.has(id)) newest.set(id, item.record);
       const state = String(item.record["state"]);
       if (seen.has(id) || (state !== "queued" && state !== "running")) continue;
-      if (own !== undefined && item.record["by"] !== own) continue;
+      if (own !== undefined && (own === "" || item.record["byCredential"] !== own)) continue;
       seen.add(id);
       items.push(servedRun(newest.get(id) ?? item.record, entry.id));
       if (items.length === paging.limit) {

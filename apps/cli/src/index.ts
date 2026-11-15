@@ -24364,8 +24364,11 @@ switch (subcommand) {
     // an argv switch on import); it throws plain Errors on bad arguments,
     // routed through die() like `daemon`.
     try {
-      const { runAccessCommand } = await import("./access-cmd");
-      const out = await runAccessCommand(rest);
+      const { runAccessCommand, terminalConfirm } = await import("./access-cmd");
+      const out = await runAccessCommand(
+        rest,
+        process.stdin.isTTY && process.stdout.isTTY ? { confirm: terminalConfirm } : {},
+      );
       for (const line of out.lines) process.stdout.write(`${line}\n`);
       if (out.exitCode !== 0) process.exit(out.exitCode);
     } catch (err) {

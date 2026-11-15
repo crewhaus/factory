@@ -82,10 +82,18 @@ async function submit<T>(
   kind: "runs.create" | "runs.cancel" | "runs.resume",
   runId: string,
   plan: RunPlan<T>,
+  who: { readonly actor?: string; readonly credentialRef?: string } = {},
 ): Promise<{ receipt?: CommandReceipt; value?: T; refusal?: string }> {
   if (!plan.ok) return { refusal: `${plan.refusal.code} ${plan.refusal.reason}` };
   const answer = await r.service.commands.submit<T>(
-    { kind, target: runRefOf(HRN, runId), ledger: { harness: r.harness }, via: "cli" },
+    {
+      kind,
+      target: runRefOf(HRN, runId),
+      ledger: { harness: r.harness },
+      via: "cli",
+      ...(who.actor !== undefined ? { actor: who.actor } : {}),
+      ...(who.credentialRef !== undefined ? { credentialRef: who.credentialRef } : {}),
+    },
     plan.effect,
   );
   if (!answer.ok) throw new Error(answer.refusal.message);
@@ -409,6 +417,8 @@ describe("starting a run", () => {
     expect(runRows(r.harness, runId)).toEqual([
       expect.objectContaining({ state: "queued", tenant: HOME_RUN_TENANT, cmd: done.receipt?.id }),
     ]);
+    // A receipt that names no credential queues a row that names none.
+    expect("byCredential" in (runRows(r.harness, runId)[0] ?? {})).toBe(false);
     expect(inputsOf(r.harness)).toEqual([`${runId}.json`]);
     expect(
       reconcileRunCreate(done.receipt as CommandReceipt, {
@@ -417,6 +427,107 @@ describe("starting a run", () => {
         now: () => NOW,
       }),
     ).toBe("done");
+  });
+
+  test("a run queued with a credential names that credential on its queued row, managed and job alike", async () => {
+    const r = rig({ authorizeActor: () => true });
+    const actor = mintId("prn");
+    const credentialRef = mintId("crd");
+    const offline = {
+      status: async () => ({ ok: false, code: "unreachable", status: 0, reason: "down" }),
+    } as unknown as ControlClient;
+    stamp(r.harness, "0.9.0", "daemon.ts");
+    const managedId = mintRunId();
+    const managed = await runAdapterFor("managed").createRun({
+      harnessDir: r.harness,
+      harness: HRN,
+      target: "managed",
+      runId: managedId,
+      input: "Summarise.",
+      admission: "queue",
+      home: { controlClient: offline, controlTarget: (harnessDir) => ({ harnessDir }) },
+    });
+    const queued = await submit(r, "runs.create", managedId, managed, { actor, credentialRef });
+    expect(queued.receipt?.state).toBe("succeeded");
+    expect(runRows(r.harness, managedId)).toEqual([
+      expect.objectContaining({ state: "queued", by: actor, byCredential: credentialRef }),
+    ]);
+    const s = starter();
+    const jobId = mintRunId();
+    const job = await runAdapterFor("cli").createRun({
+      harnessDir: r.harness,
+      harness: HRN,
+      target: "cli",
+      runId: jobId,
+      input: "Summarise.",
+      admission: "reject",
+      home: s.home,
+    });
+    const started = await submit(r, "runs.create", jobId, job, { actor, credentialRef });
+    expect(started.receipt?.state).toBe("succeeded");
+    expect(runRows(r.harness, jobId)[0]).toMatchObject({
+      state: "queued",
+      by: actor,
+      byCredential: credentialRef,
+    });
+  });
+
+  test("a head with no room for another API run refuses a create and a resume as busy before anything is written", async () => {
+    const r = rig();
+    const s = starter();
+    const home: RunHome = {
+      ...s.home,
+      apiRunCapacity: () => ({ ok: false, scope: "harness", retryAfterMs: 5000 }),
+    };
+    const created = await runAdapterFor("cli").createRun({
+      harnessDir: r.harness,
+      harness: HRN,
+      target: "cli",
+      runId: mintRunId(),
+      input: "x",
+      admission: "reject",
+      home,
+    });
+    expect(created.ok ? undefined : created.refusal).toMatchObject({
+      code: "unavailable",
+      reason: "busy",
+      retryAfterMs: 5000,
+    });
+    expect(inputsOf(r.harness)).toEqual([]);
+    expect(rowsOf(runsLedger(r.harness))).toEqual([]);
+    const { runId, approval } = await parkedRun(r);
+    // Decided, and built: only the cap stands in the way.
+    const store = createPendingApprovalStore({ rootDir: sessionRoot(r) });
+    expect(await store.resolve(approval.id, "grant", "sam")).not.toBeNull();
+    stamp(r.harness, "0.9.0");
+    const before = inputsOf(r.harness);
+    const resumed = await runAdapterFor("workflow").resumeRun({
+      harnessDir: r.harness,
+      harness: HRN,
+      target: "workflow",
+      runId,
+      home,
+    });
+    expect(resumed.ok ? undefined : resumed.refusal).toMatchObject({
+      code: "unavailable",
+      reason: "busy",
+      retryAfterMs: 5000,
+    });
+    expect(inputsOf(r.harness)).toEqual(before);
+    expect(statesOf(r.harness, runId).at(-1)).toBe("waiting-for-approval");
+    expect(receiptsOf(r.harness)).toEqual([]);
+    expect(s.starts).toEqual([]);
+    // With room, the same create is planned.
+    const roomy = await runAdapterFor("cli").createRun({
+      harnessDir: r.harness,
+      harness: HRN,
+      target: "cli",
+      runId: mintRunId(),
+      input: "x",
+      admission: "reject",
+      home: { ...s.home, apiRunCapacity: () => ({ ok: true }) },
+    });
+    expect(roomy.ok).toBe(true);
   });
 
   test("a managed build older than 0.9.0, or none, is refused before acceptance even when asked to queue: no row, no input, no receipt", async () => {

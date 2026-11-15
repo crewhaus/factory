@@ -99,7 +99,10 @@ export async function v1Home(opts: BootOptions = {}): Promise<V1Home> {
       );
       if (!granted.ok) throw new Error(granted.reason);
       const devices = openDeviceRequests(t.hangarRoot);
-      const start = await devices.start({ ...(o.readOnly === true ? { readOnly: true } : {}) });
+      const start = await devices.start({
+        requestedFrom: { via: "home" },
+        ...(o.readOnly === true ? { readOnly: true } : {}),
+      });
       if (!start.ok) throw new Error(start.reason);
       const decided = await devices.decide({
         caller: granted.result.principal,
