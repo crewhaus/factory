@@ -472,6 +472,45 @@ export async function expireClaim(
   });
 }
 
+/**
+ * Remove a claim only while it is held by the record whose id is `receiptId`: a
+ * compare-and-delete, so a caller gives up its own claim and never one a later writer
+ * holds. Under the ledger lock the claim is read again; a missing claim, and one held by
+ * any other id, are left alone (`removed: false`). A claim that cannot be read is a
+ * failure answer, and a link planted at the claim's name is neither followed nor
+ * removed. A generation claim is never removed and is refused.
+ *
+ * First consumer: Home's delivery receivers.
+ */
+export async function expireClaimHeldBy(
+  ledger: Ledger,
+  claim: string,
+  receiptId: string,
+): Promise<ExpireAnswer> {
+  const rel = claimRel(ledger, claim);
+  if (typeof rel !== "string") return rel;
+  if (claim.split("/")[0] === GENERATION_KIND) {
+    return refusal(
+      "invalid-path",
+      rel,
+      `${JSON.stringify(claim)} is a generation claim: never removed`,
+    );
+  }
+  return withLedgerLock<ExpireAnswer>(ledger, () => {
+    const read = readClaim(ledger, claim);
+    if (!read.ok) return read.code === "not-found" ? { ok: true, removed: false } : read;
+    if (read.content.record["id"] !== receiptId) return { ok: true, removed: false };
+    const resolved = resolveContained(ledger.root, rel, { followLeaf: false });
+    if (!resolved.ok) return resolved;
+    try {
+      unlinkSync(resolved.real);
+    } catch (err) {
+      return ioFailure(rel, err, "remove");
+    }
+    return { ok: true, removed: true };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Folds
 // ---------------------------------------------------------------------------
