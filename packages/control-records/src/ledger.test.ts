@@ -1,5 +1,14 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { _setIoTapForTest } from "./io";
 import {
@@ -8,6 +17,7 @@ import {
   appendClaim,
   casAppend,
   expireClaim,
+  expireClaimHeldBy,
   foldStates,
   listClaims,
   publishClaim,
@@ -804,6 +814,74 @@ describe("expiring a claim", () => {
     const answer = await expireClaim(ledger, "gen/d/1", T0 + 365 * 86_400_000);
     expect(answer).toMatchObject({ ok: false, code: "invalid-path" });
     expect(existsSync(claimFile(root, "gen/d/1.json"))).toBe(true);
+  });
+});
+
+describe("releasing a claim held by one record", () => {
+  const claimFile = (root: string, rel: string): string =>
+    join(root, ".crewhaus", "run", "control", "claims", rel);
+
+  test("a claim held by another id is kept", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root);
+    await appendClaim(ledger, { claim: "ingress/one", record: { id: "a" } });
+    const before = readFileSync(claimFile(root, "ingress/one.json"));
+    expect(await expireClaimHeldBy(ledger, "ingress/one", "b")).toEqual({
+      ok: true,
+      removed: false,
+    });
+    expect(readFileSync(claimFile(root, "ingress/one.json"))).toEqual(before);
+  });
+
+  test("a claim held by that id is removed, and its name can be claimed again", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root);
+    await appendClaim(ledger, { claim: "ingress/one", record: { id: "a" } });
+    expect(await expireClaimHeldBy(ledger, "ingress/one", "a")).toEqual({
+      ok: true,
+      removed: true,
+    });
+    expect(existsSync(claimFile(root, "ingress/one.json"))).toBe(false);
+    const again = await appendClaim(ledger, { claim: "ingress/one", record: { id: "c" } });
+    expect(again).toMatchObject({ ok: true, won: true });
+  });
+
+  test("a missing claim is nothing to remove", async () => {
+    const ledger = runsLedger(tempDir());
+    expect(await expireClaimHeldBy(ledger, "ingress/none", "a")).toEqual({
+      ok: true,
+      removed: false,
+    });
+  });
+
+  test("a generation claim is refused and kept", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root, "deployment");
+    await casAppend(ledger, "d", null, { state: "prepared" });
+    const answer = await expireClaimHeldBy(ledger, "gen/d/1", "d");
+    expect(answer).toMatchObject({ ok: false, code: "invalid-path" });
+    expect(existsSync(claimFile(root, "gen/d/1.json"))).toBe(true);
+  });
+
+  test("a link planted at the claim's name is neither followed nor removed", async () => {
+    const root = tempDir();
+    const ledger = runsLedger(root);
+    // A real claim file for the same id, outside the claims directory.
+    const outside = join(tempDir(), "elsewhere.json");
+    const content = `${JSON.stringify({
+      v: 1,
+      claim: "ingress/one",
+      at: new Date(0).toISOString(),
+      seg: 1,
+      record: { id: "a" },
+    })}\n`;
+    writeFileSync(outside, content);
+    mkdirSync(claimFile(root, "ingress"), { recursive: true });
+    symlinkSync(outside, claimFile(root, "ingress/one.json"));
+    const answer = await expireClaimHeldBy(ledger, "ingress/one", "a");
+    expect(answer.ok).toBe(false);
+    expect(lstatSync(claimFile(root, "ingress/one.json")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(outside, "utf8")).toBe(content);
   });
 });
 

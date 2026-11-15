@@ -108,6 +108,7 @@ export {
   type Commands,
   type InlineEffect,
   type ReplayLookup,
+  type SettleAnswer,
   type SubmitAnswer,
   type SubmitRequest,
   receiptOf,

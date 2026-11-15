@@ -872,7 +872,7 @@ describe("the actor is the caller, and is checked again before a command runs", 
     expect(existsSync(join(harness, ".crewhaus", "run", "control", "commands"))).toBe(false);
   });
 
-  test("settle moves an accepted receipt to its end, once", async () => {
+  test("settle moves an accepted receipt this head wrote to its end, once", async () => {
     const { service, hangarRoot } = rig();
     const answer = await service.commands.submit({
       kind: "legacy.hookDelivery",
@@ -884,19 +884,122 @@ describe("the actor is the caller, and is checked again before a command runs", 
     const settled = await service.commands.settle("workspace", answer.receipt.id, {
       state: "succeeded",
     });
-    expect(settled?.state).toBe("succeeded");
-    expect(
-      await service.commands.settle("workspace", answer.receipt.id, { state: "failed" }),
-    ).toBeUndefined();
-    expect(
-      await service.commands.settle("workspace", "cmd_01m76e6f05hp514w9j4v3qymkt", {
-        state: "failed",
-      }),
-    ).toBeUndefined();
+    expect(settled.ok && settled.receipt.state).toBe("succeeded");
     expect(rowsOf(workspaceCommandsLedger(hangarRoot)).map((row) => row["state"])).toEqual([
       "accepted",
       "succeeded",
     ]);
+  });
+
+  test("settle answers why it refuses, and every refusal leaves the receipt accepted", async () => {
+    const a = rig();
+    const deliver = (service: typeof a.service, actor: string) =>
+      service.commands.submit({
+        kind: "legacy.hookDelivery",
+        ledger: "workspace",
+        via: "github",
+        actor,
+      });
+    const ledger = workspaceCommandsLedger(a.hangarRoot);
+    const stateOf = (id: string) =>
+      rowsOf(ledger)
+        .filter((row) => row["id"] === id)
+        .map((row) => row["state"]);
+
+    const byPrincipal = await deliver(a.service, "prn_01jc0000000000000000000003");
+    if (!byPrincipal.ok) throw new Error(byPrincipal.refusal.message);
+    expect(
+      await a.service.commands.settle("workspace", byPrincipal.receipt.id, { state: "succeeded" }),
+    ).toEqual({ ok: false, reason: "not-a-system-actor" });
+    expect(stateOf(byPrincipal.receipt.id)).toEqual(["accepted"]);
+
+    const b = rig({ hangarRoot: a.hangarRoot, harness: a.harness, pid: 2000 });
+    const byOtherHead = await deliver(b.service, "sys:ingress");
+    if (!byOtherHead.ok) throw new Error(byOtherHead.refusal.message);
+    expect(
+      await a.service.commands.settle("workspace", byOtherHead.receipt.id, { state: "succeeded" }),
+    ).toEqual({ ok: false, reason: "another-head" });
+    expect(stateOf(byOtherHead.receipt.id)).toEqual(["accepted"]);
+
+    expect(
+      await a.service.commands.settle("workspace", "cmd_01m76e6f05hp514w9j4v3qymkt", {
+        state: "failed",
+      }),
+    ).toEqual({ ok: false, reason: "not-found" });
+
+    const own = await deliver(a.service, "sys:ingress");
+    if (!own.ok) throw new Error(own.refusal.message);
+    expect(
+      (await a.service.commands.settle("workspace", own.receipt.id, { state: "succeeded" })).ok,
+    ).toBe(true);
+    expect(
+      await a.service.commands.settle("workspace", own.receipt.id, { state: "failed" }),
+    ).toEqual({ ok: false, reason: "not-accepted" });
+    expect(stateOf(own.receipt.id)).toEqual(["accepted", "succeeded"]);
+  });
+
+  test("a delivery claim is answered as a replay eight days later", async () => {
+    const { service, hangarRoot, clock } = rig();
+    // The claim's `at` is stamped by the records layer's own clock: fake both.
+    clockSpy = spyOn(Date, "now").mockImplementation(() => clock.now);
+    const claim = `ingress/test-${"e".repeat(32)}`;
+    const deliver = () =>
+      service.commands.submit({
+        kind: "legacy.hookDelivery",
+        ledger: "workspace",
+        via: "github",
+        actor: "sys:ingress",
+        params: { provider: "test", delivery: "e".repeat(32) },
+        dedupeClaim: claim,
+      });
+    const first = await deliver();
+    clock.now += IDEMPOTENCY_TTL_MS + 86_400_000 + 60_000;
+    const later = await deliver();
+    if (!first.ok || !later.ok) throw new Error("refused");
+    expect(later.replayed).toBe(true);
+    expect(later.receipt.id).toBe(first.receipt.id);
+    expect(rowsOf(workspaceCommandsLedger(hangarRoot))).toHaveLength(1);
+    expect(
+      existsSync(join(hangarRoot, "control", "claims", "ingress", `test-${"e".repeat(32)}.json`)),
+    ).toBe(true);
+  });
+
+  test("only the ingress takes a delivery claim, and only of the delivery claim grammar", async () => {
+    const { service, hangarRoot } = rig();
+    const hex = "a".repeat(32);
+    const grammar = "a delivery claim is ingress/<provider>-<32 hex>";
+    const actorOnly = "only the ingress claims a delivery";
+    const cases: [string, string | undefined, string][] = [
+      [`idem/${hex}`, "sys:ingress", grammar],
+      ["recover/x", "sys:ingress", grammar],
+      ["gen/d/1", "sys:ingress", grammar],
+      [`ingress/Test-${hex}`, "sys:ingress", grammar],
+      [`ingress/test-${"a".repeat(31)}`, "sys:ingress", grammar],
+      [`ingress/test-${hex}`, "sys:scheduler", actorOnly],
+      [`ingress/test-${hex}`, "prn_01jc0000000000000000000003", actorOnly],
+      [`ingress/test-${hex}`, undefined, actorOnly],
+    ];
+    for (const [dedupeClaim, actor, message] of cases) {
+      const answer = await service.commands.submit({
+        kind: "legacy.hookDelivery",
+        ledger: "workspace",
+        via: "github",
+        ...(actor !== undefined ? { actor } : {}),
+        dedupeClaim,
+      });
+      expect(answer.ok === false && answer.refusal).toEqual({ code: "invalid", message });
+    }
+    expect(existsSync(join(hangarRoot, "control"))).toBe(false);
+    // The longest provider name the receivers' grammar allows.
+    const longest = `ingress/a${"b".repeat(31)}-${hex}`;
+    const taken = await service.commands.submit({
+      kind: "legacy.hookDelivery",
+      ledger: "workspace",
+      via: "github",
+      actor: "sys:ingress",
+      dedupeClaim: longest,
+    });
+    expect(taken.ok && taken.receipt.dedupeRef).toBe(longest);
   });
 
   test("a delivery claim accepts one receipt, and answers every later request as its replay", async () => {

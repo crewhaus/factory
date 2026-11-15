@@ -9,6 +9,7 @@
  * | `notifications` | 10 s | the rules people turned on are delivered, on the sinks they chose |
  * | `standing-rules` | 10 s | a standing rule past its end is ended |
  * | `claims` | 1 h | an idempotency key older than seven days can be used again |
+ * | `inbound` | 1 h | a delivery's raw body is kept only while its receipt is open |
  * | `projector` | 2 s | every harness's read models under `cache/index/` follow its records, nudged harnesses first; each change they show is one line of the fleet's change log, which keeps its newest segments |
  *
  * Each step of `reconcile` is isolated: one that throws is warned about and the next runs.
@@ -25,6 +26,7 @@ import {
   projectOnce,
   workspaceCommandsLedger,
 } from "@crewhaus/control-service";
+import { sweepInboundRecords } from "./ingress";
 import type { Sweep } from "./scheduler-host";
 
 /** What Home lends its sweeps. */
@@ -117,6 +119,15 @@ const claims: Sweep<HomePorts> = {
   },
 };
 
+const inbound: Sweep<HomePorts> = {
+  name: "inbound",
+  everyMs: 3_600_000,
+  run: async ({ home, now, warn }) => {
+    const swept = await sweepInboundRecords(home.hangarRoot, now, warn);
+    if (swept.truncated) warn("the inbound records are more than one sweep looks at");
+  },
+};
+
 const projector: Sweep<HomePorts> = {
   name: "projector",
   everyMs: 2_000,
@@ -139,5 +150,6 @@ export const CORE_SWEEPS: readonly Sweep<HomePorts>[] = [
   notifications,
   standingRules,
   claims,
+  inbound,
   projector,
 ];

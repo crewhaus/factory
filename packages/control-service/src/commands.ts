@@ -80,9 +80,10 @@ export type SubmitRequest = {
   /** The `Idempotency-Key` value, when the caller sent one. */
   readonly idempotency?: string;
   /**
-   * A claim name (`<kind>/<name>`) the head chose for a delivery that must be accepted
-   * exactly once, in place of an idempotency key's: a receiver's delivery id. The first
-   * request writes the receipt with the claim; every later one is answered as a replay.
+   * A receiver's delivery claim, `ingress/<provider>-<32 hex>`, in place of an idempotency
+   * key's: a delivery that must be accepted exactly once. Only `sys:ingress` takes one. The
+   * first request writes the receipt with the claim; every later one is answered as a
+   * replay, however late. A delivery claim is never expired.
    */
   readonly dedupeClaim?: string;
   /** Whether repeating is safe, for a legacy kind (a command kind declares its own). */
@@ -95,6 +96,15 @@ export type SubmitRequest = {
    */
   readonly authority?: ReceiptAuthority;
 };
+
+/**
+ * A delivery claim: `ingress/`, a receiver's provider name (its grammar is the receivers'
+ * own), `-`, and the first 32 hex of the delivery id's sha256.
+ */
+const DELIVERY_CLAIM_RE = /^ingress\/[a-z][a-z0-9-]{0,31}-[0-9a-f]{32}$/;
+
+/** The one actor that takes a delivery claim. */
+const DELIVERY_ACTOR = "sys:ingress";
 
 /** Whether a receipt's authority is one of the closed kinds, naming a rule at a revision. */
 function authorityIsValid(authority: unknown): authority is ReceiptAuthority {
@@ -159,6 +169,24 @@ export function settledRow(base: CommandReceipt, settle: Settlement, at: string)
     ...(settle.outcome !== undefined ? { outcome: settle.outcome } : {}),
   };
 }
+
+/**
+ * What `commands.settle` answers: the receipt as settled, or why it was not settled.
+ * `not-found`: no receipt by that id. `not-accepted`: it is in another state.
+ * `not-a-system-actor`: a principal or a person wrote it. `another-head`: another head
+ * wrote it. `not-written`: the move could not be written (warned).
+ */
+export type SettleAnswer =
+  | { readonly ok: true; readonly receipt: CommandReceipt }
+  | {
+      readonly ok: false;
+      readonly reason:
+        | "not-found"
+        | "not-accepted"
+        | "not-a-system-actor"
+        | "another-head"
+        | "not-written";
+    };
 
 export type Commands = {
   submit<T = undefined>(
@@ -342,6 +370,17 @@ export function createCommands(core: ControlCore): CommandsInternals {
         ),
       };
     }
+    if (request.dedupeClaim !== undefined) {
+      if (typeof request.dedupeClaim !== "string" || !DELIVERY_CLAIM_RE.test(request.dedupeClaim)) {
+        return {
+          ok: false,
+          refusal: refuse("invalid", "a delivery claim is ingress/<provider>-<32 hex>"),
+        };
+      }
+      if (request.actor !== DELIVERY_ACTOR) {
+        return { ok: false, refusal: refuse("invalid", "only the ingress claims a delivery") };
+      }
+    }
     if (request.target !== undefined && "error" in parseRef(request.target)) {
       return { ok: false, refusal: refuse("invalid", "the command's target is not a ref") };
     }
@@ -431,7 +470,8 @@ export function createCommands(core: ControlCore): CommandsInternals {
 
     try {
       if (dedupeRef !== undefined) {
-        await expireStaleClaim(ledger, dedupeRef, now);
+        // Only an idempotency key's claim is honoured for a while: a delivery claim is kept for good.
+        if (request.dedupeClaim === undefined) await expireStaleClaim(ledger, dedupeRef, now);
         const claimed = await appendClaim(ledger, {
           claim: dedupeRef,
           record: accepted as unknown as LedgerRecord,

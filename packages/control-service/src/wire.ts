@@ -23,11 +23,18 @@ import {
   type CursorPosition,
   MACHINES,
   isId,
+  parseActor,
 } from "@crewhaus/control-contract";
 import type { LeaseProbe } from "@crewhaus/control-records";
 import type { HarnessSupervisor } from "@crewhaus/harness-supervisor";
 import { AREA_RUNTIMES, compositionProblems, delegatedActions } from "./areas";
-import { type Commands, createCommands, receiptOf, settledRow } from "./commands";
+import {
+  type Commands,
+  type SettleAnswer,
+  createCommands,
+  receiptOf,
+  settledRow,
+} from "./commands";
 import type { ControlCore, ControlMode } from "./context";
 import { type Decisions, createDecisions } from "./decisions";
 import { type Delegations, createDelegations } from "./delegations";
@@ -95,14 +102,12 @@ export type ControlService = {
     reconcile(scope: RecoverScope): Promise<ReconcileCounts>;
     /**
      * Move an `accepted` receipt to its final state, for a head that wrote it with no
-     * effect and carried the work out itself (a receiver's delivery). The receipt as it
-     * stands after, or `undefined` when it is not there or was not `accepted`.
+     * effect and carried the work out itself (a receiver's delivery, a scheduled delegation
+     * pass). Settled only when the receipt's actor is a system actor and its executor stamp
+     * is this head's own: a receipt this head did not write is left for recovery. The
+     * answer names the receipt as settled, or why it was not.
      */
-    settle(
-      ledger: LedgerChoice,
-      id: string,
-      settlement: Settlement,
-    ): Promise<CommandReceipt | undefined>;
+    settle(ledger: LedgerChoice, id: string, settlement: Settlement): Promise<SettleAnswer>;
     /** One page of a ledger's receipts, newest first, each at its current state. A read. */
     list(
       choice: LedgerChoice,
@@ -116,6 +121,18 @@ export type ControlService = {
     of(choice: LedgerChoice): ReturnType<typeof commandsLedgerOf>;
   };
 };
+
+/** Whether two executor stamps name the same head, field by field. */
+function sameExecutor(a: unknown, b: ExecutorStamp): boolean {
+  if (typeof a !== "object" || a === null) return false;
+  const stamp = a as Partial<ExecutorStamp>;
+  return (
+    stamp.pid === b.pid &&
+    stamp.startedAt === b.startedAt &&
+    stamp.host === b.host &&
+    stamp.head === b.head
+  );
+}
 
 export type WireOptions = {
   readonly mode: ControlMode;
@@ -249,20 +266,26 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
     choice: LedgerChoice,
     id: string,
     settlement: Settlement,
-  ): Promise<CommandReceipt | undefined> => {
+  ): Promise<SettleAnswer> => {
     const ledger = commands.ledgerOf(choice);
     const current = commands.get(ledger, id);
-    if (current === undefined || current.state !== "accepted") return undefined;
+    if (current === undefined) return { ok: false, reason: "not-found" };
+    if (current.state !== "accepted") return { ok: false, reason: "not-accepted" };
+    if (parseActor(current.actor)?.form !== "system") {
+      return { ok: false, reason: "not-a-system-actor" };
+    }
+    if (!sameExecutor(current.executor, core.selfExecutor())) {
+      return { ok: false, reason: "another-head" };
+    }
     // From `accepted`, every final state is a move the machine allows.
-    return await commands.move(
-      ledger,
-      "accepted",
-      settledRow(
-        { ...current, startedAt: new Date(now()).toISOString() },
-        settlement,
-        new Date(now()).toISOString(),
-      ),
+    const next = settledRow(
+      { ...current, startedAt: new Date(now()).toISOString() },
+      settlement,
+      new Date(now()).toISOString(),
     );
+    const moved = await commands.move(ledger, "accepted", next);
+    if (moved === next) return { ok: true, receipt: next };
+    return { ok: false, reason: moved === undefined ? "not-written" : "not-accepted" };
   };
   const decisions = createDecisions({ hangarRoot: deps.hangarRoot, identity: deps.identity, now });
   const delegations = createDelegations({
