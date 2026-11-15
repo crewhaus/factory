@@ -54,6 +54,7 @@ import {
   setUpOwner,
   settingsOf,
   tempDir,
+  treeBytes,
 } from "./test-helpers";
 
 afterAll(removeTempDirs);
@@ -749,6 +750,53 @@ describe("harnessForSessionRoot", () => {
     const inner = harnessWithEnv(join(outer, "inner"), "s");
     const found = harnessForSessionRoot(join(inner, "s"), { registry: () => [outer, inner] });
     expect(found.state).toBe("several");
+  });
+
+  test("a harness that holds the root inside it answers before one whose sessions folder links to it from outside", () => {
+    const owner = harnessWithEnv(tempDir());
+    const sessions = join(owner, ".crewhaus", "sessions");
+    mkdirSync(sessions);
+    const linked = harnessWithEnv(tempDir());
+    try {
+      symlinkSync(sessions, join(linked, ".crewhaus", "sessions"), "dir");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return;
+      throw err;
+    }
+    expect(harnessForSessionRoot(sessions, { registry: () => [linked, owner] })).toEqual({
+      state: "one",
+      dir: owner,
+    });
+  });
+
+  test("a sessions folder outside every harness is still claimed by the harness whose folder it is", () => {
+    const g = harnessWithEnv(tempDir());
+    const outside = join(tempDir(), "sessions");
+    mkdirSync(outside);
+    try {
+      symlinkSync(outside, join(g, ".crewhaus", "sessions"), "dir");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return;
+      throw err;
+    }
+    expect(harnessForSessionRoot(outside, { registry: () => [g] })).toEqual({
+      state: "outside",
+      dirs: [g],
+    });
+  });
+
+  test("a harness whose sessions folder lies outside it still owns its tenants' roots", () => {
+    const g = harnessWithEnv(tempDir());
+    const outside = join(tempDir(), "sessions");
+    mkdirSync(outside);
+    try {
+      symlinkSync(outside, join(g, ".crewhaus", "sessions"), "dir");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return;
+      throw err;
+    }
+    const tenant = join(g, ".crewhaus", "tenants", "t1", "sessions");
+    expect(harnessForSessionRoot(tenant, { cwd: tempDir() })).toEqual({ state: "one", dir: g });
   });
 
   test("a root outside every harness matches none, even one an override points at", () => {
@@ -1485,5 +1533,76 @@ describe("a session root reached through a link", () => {
     expect(harnessForSessionRoot(link, { cwd: tempDir() })).toEqual({ state: "one", dir: h });
     expect(governedAncestorOf(link)).toBe(h);
     expect(governedAncestorOf(join(tempDir(), "s"))).toBeUndefined();
+  });
+});
+
+describe("a harness whose sessions folder lies outside it", () => {
+  /**
+   * A governed harness A whose `.crewhaus/sessions` is a link to harness B's, where a
+   * pending request is parked; `undefined` where links cannot be made.
+   */
+  async function linkedOut() {
+    const r = governed();
+    const b = tempDir("control-service-harness-b-");
+    const p = await park(b, "Write", { path: "a.md" });
+    const sessions = join(b, ".crewhaus", "sessions");
+    rmSync(join(r.harness, ".crewhaus", "sessions"), { recursive: true, force: true });
+    mkdirSync(join(r.harness, ".crewhaus"), { recursive: true });
+    try {
+      symlinkSync(sessions, join(r.harness, ".crewhaus", "sessions"), "dir");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return undefined;
+      throw err;
+    }
+    const snapshot = () => ({
+      bytes: [...treeBytes(sessions)],
+      paths: (readdirSync(sessions, { recursive: true }) as string[]).sort(),
+    });
+    return { ...r, b, p, sessions, snapshot, before: snapshot() };
+  }
+
+  test("a decision there is not found, and the folder is unchanged", async () => {
+    const f = await linkedOut();
+    if (f === undefined) return;
+    const answer = await f.service.decisions.resolve({
+      harnessDir: f.harness,
+      ref: f.p.id,
+      choice: "grant",
+      actor: as(f.owner),
+      via: "home",
+    });
+    expect(answer.outcome).toBe("not-found");
+    expect(answer.record).toBeNull();
+    expect(answer.reason).toBe("this harness's sessions folder is outside the harness");
+    expect(f.snapshot()).toEqual(f.before);
+  });
+
+  test("a supersede there is not found, and the folder is unchanged", async () => {
+    const f = await linkedOut();
+    if (f === undefined) return;
+    const answer = await f.service.decisions.supersede({
+      harnessDir: f.harness,
+      ref: f.p.id,
+      reason: "policy-changed",
+      actor: as(f.owner),
+      via: "home",
+    });
+    expect(answer.outcome).toBe("not-found");
+    expect(f.snapshot()).toEqual(f.before);
+  });
+
+  test("a deferral there is not found, and the folder is unchanged", async () => {
+    const f = await linkedOut();
+    if (f === undefined) return;
+    const answer = await f.service.decisions.defer({
+      harnessDir: f.harness,
+      ref: f.p.id,
+      until: new Date(NOW + DAY).toISOString(),
+      reason: "awaiting-information",
+      actor: as(f.owner),
+      via: "home",
+    });
+    expect(answer.outcome).toBe("not-found");
+    expect(f.snapshot()).toEqual(f.before);
   });
 });

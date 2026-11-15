@@ -85,6 +85,7 @@ import {
   type ApprovalPrincipal,
   type DeferAnswer,
   type SupersedeAnswer,
+  containedSessionRoot,
   createPendingApprovalStore,
   foldReadOnly,
   needsClassReason,
@@ -161,6 +162,9 @@ export function principalOfActor(actor: DecisionActor, hangarRoot: string): Appr
 /** What a request to the owner answers when its approval does not give the rule it asks for. */
 const TERMS_GONE =
   "the approval this request came from is gone or no longer names this rule; ask for it again";
+
+/** What a decision answers when the harness's sessions folder lies outside the harness. */
+const UNREACHABLE = "this harness's sessions folder is outside the harness";
 
 /** What a local user is told on a harness whose approver projection names no Home root. */
 const UNNAMED_ACCESS_ROOT =
@@ -252,6 +256,11 @@ function inside(parent: string, child: string): boolean {
 export type HarnessFound =
   | { readonly state: "one"; readonly dir: string }
   | { readonly state: "several"; readonly dirs: readonly string[] }
+  /**
+   * No harness holds the root inside it, but these harnesses' own session roots land on
+   * it from outside them: each still claims it, and none decides it alone.
+   */
+  | { readonly state: "outside"; readonly dirs: readonly string[] }
   | { readonly state: "none" };
 
 /**
@@ -314,8 +323,12 @@ export function governedAncestorsOf(
  * holds `.crewhaus/` of the root as written and of where it lands on disk, so a root
  * reached through a link is matched to the harness it lies in. One matches when the
  * session root its own environment files give it is the root, or when the root lies
- * inside its tenants root (`<candidate>/.crewhaus/tenants`). A session root outside
- * every harness matches none.
+ * inside its tenants root (`<candidate>/.crewhaus/tenants`).
+ *
+ * A candidate whose own session root is the root but lies outside the candidate is kept
+ * apart: a harness that holds the root inside it answers first (`one` or `several`), and
+ * only when none does are those candidates the answer (`outside`), so the caller can
+ * still weigh their approver lists. A session root no harness names matches none.
  */
 export function harnessForSessionRoot(
   rootDir: string,
@@ -326,21 +339,24 @@ export function harnessForSessionRoot(
   if (options.cwd !== undefined) candidates.push(options.cwd);
   candidates.push(...crewhausAncestors(rootDir));
   const matches = new Map<string, string>();
+  const outside = new Map<string, string>();
   for (const candidate of candidates) {
     const real = realOf(candidate);
-    if (matches.has(real) || !existsSync(candidate)) continue;
-    let own: string;
+    if (matches.has(real) || outside.has(real) || !existsSync(candidate)) continue;
+    let own: ReturnType<typeof resolveHarnessSessionRoot>;
     try {
-      own = resolveHarnessSessionRoot(candidate, readHarnessEnvFiles(candidate).vars).root;
+      own = resolveHarnessSessionRoot(candidate, readHarnessEnvFiles(candidate).vars);
     } catch {
       continue;
     }
     const tenants = realOf(join(candidate, ".crewhaus", "tenants"));
-    if (realOf(own) === target || inside(tenants, target)) matches.set(real, candidate);
+    if (inside(tenants, target)) matches.set(real, candidate);
+    else if (realOf(own.root) === target) (own.contained ? matches : outside).set(real, candidate);
   }
   const dirs = [...matches.values()];
   if (dirs.length === 1) return { state: "one", dir: dirs[0] as string };
-  return dirs.length === 0 ? { state: "none" } : { state: "several", dirs };
+  if (dirs.length > 1) return { state: "several", dirs };
+  return outside.size > 0 ? { state: "outside", dirs: [...outside.values()] } : { state: "none" };
 }
 
 // ---------------------------------------------------------------------------
@@ -454,11 +470,19 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
   const approvers = deps.approvers ?? readApproverProjection;
   const nowDate = (): Date => new Date(deps.now());
 
-  const rootOf = (harnessDir: string | undefined, rootDir: string | undefined): string => {
+  /**
+   * The session root a decision reads and writes: the caller's `rootDir` as given, else
+   * the harness's own when it lies inside the harness, else `undefined` (unreachable,
+   * so nothing is read, claimed or written there).
+   */
+  const rootOf = (
+    harnessDir: string | undefined,
+    rootDir: string | undefined,
+  ): string | undefined => {
     if (rootDir !== undefined) return rootDir;
     if (harnessDir === undefined)
       throw new Error("control-service: a decision needs a session root");
-    return resolveHarnessSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars).root;
+    return containedSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars);
   };
 
   const storeFor = (root: string, ttlDays?: number) =>
@@ -703,6 +727,7 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
   ): boolean => {
     if (row.derivedFrom === undefined) return false;
     const root = rootOf(harnessDir, rootDir);
+    if (root === undefined) return false;
     if (approvalStillStands(root, row.derivedFrom) !== undefined) return false;
     let folded: ReturnType<typeof foldReadOnly>;
     try {
@@ -852,10 +877,12 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
       return { outcome: "invalid", record: null, reason: `"${request.ref}" is not an approval id` };
     }
     const { harnessDir } = request;
+    const rootDir = rootOf(harnessDir, request.rootDir);
+    if (rootDir === undefined) return { outcome: "not-found", record: null, reason: UNREACHABLE };
     return resolveToolApproval(
       {
         ...(harnessDir !== undefined ? { harnessDir } : {}),
-        rootDir: rootOf(harnessDir, request.rootDir),
+        rootDir,
         ref: request.ref,
         choice: request.choice,
         who,
@@ -935,7 +962,9 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
       const on = whoOn(request.actor, request.harnessDir);
       if ("refused" in on) return { outcome: "forbidden", record: null, reason: on.refused };
       const { who } = on;
-      const store = storeFor(rootOf(request.harnessDir, request.rootDir));
+      const root = rootOf(request.harnessDir, request.rootDir);
+      if (root === undefined) return { outcome: "not-found", record: null, reason: UNREACHABLE };
+      const store = storeFor(root);
       const answer = await store.supersede(
         request.ref,
         { actor: storeActorOf(request.actor, who), via: request.via, reason: request.reason },
@@ -949,7 +978,9 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
       const on = whoOn(request.actor, request.harnessDir);
       if ("refused" in on) return { outcome: "forbidden", record: null, reason: on.refused };
       const { who } = on;
-      const store = storeFor(rootOf(request.harnessDir, request.rootDir));
+      const root = rootOf(request.harnessDir, request.rootDir);
+      if (root === undefined) return { outcome: "not-found", record: null, reason: UNREACHABLE };
+      const store = storeFor(root);
       return store.defer(
         request.ref,
         {

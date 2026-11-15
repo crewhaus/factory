@@ -782,6 +782,18 @@ these on: they reach every harness that uses what each one names.
   `pre-compact`, `post-compact` and `alert` the failure is logged and the run
   goes on.
 
+- **Home reads and decides a harness's approvals only inside that harness's
+  folder.** When the harness's sessions folder (`.crewhaus/sessions`, or where
+  `CREWHAUS_SESSION_DIR` moves it) lies outside the harness once every link is
+  followed, Home and its API read no approvals from it and decide none there:
+  the harness shows no pending approvals, `GET /api/v1/decisions` answers the
+  empty reason `unreachable`, a decision or ref in that folder answers 404, and
+  `POST /api/h/:id/approvals/:id/grant` answers 409. Cancelling a run or
+  retiring the harness, from Home or the CLI, withdraws or expires nothing
+  there, and resuming a parked run is refused with `decisions_unreachable`. A
+  sessions folder that links to another place inside the harness works as
+  before. Keep the sessions folder inside the harness folder.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read

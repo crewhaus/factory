@@ -1265,6 +1265,7 @@ export {
 export {
   type HarnessSessionRoot,
   SESSION_DIR_ENV,
+  containedSessionRoot,
   resolveHarnessSessionRoot,
 } from "./approvals/root";
 export {

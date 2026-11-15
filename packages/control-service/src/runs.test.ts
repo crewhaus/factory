@@ -12,8 +12,10 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -51,7 +53,18 @@ import {
   runRefOf,
   versionAtLeast,
 } from "./runs";
-import { HOST, NOW, type Rig, fakeProbe, park, removeTempDirs, rig, rowsOf } from "./test-helpers";
+import {
+  HOST,
+  NOW,
+  type Rig,
+  fakeProbe,
+  park,
+  removeTempDirs,
+  rig,
+  rowsOf,
+  tempDir,
+  treeBytes,
+} from "./test-helpers";
 
 afterEach(() => removeTempDirs());
 
@@ -164,6 +177,25 @@ async function parkedRun(
 }
 
 const sessionRoot = (r: Rig) => join(r.harness, ".crewhaus", "sessions");
+
+/**
+ * Move the rig harness's sessions folder into another harness and link it back, so the
+ * folder lies outside the rig harness; the moved folder, or `undefined` where links
+ * cannot be made.
+ */
+function linkSessionsOut(r: Rig): string | undefined {
+  const other = tempDir("control-service-harness-b-");
+  mkdirSync(join(other, ".crewhaus"), { recursive: true });
+  const moved = join(other, ".crewhaus", "sessions");
+  renameSync(sessionRoot(r), moved);
+  try {
+    symlinkSync(moved, sessionRoot(r), "dir");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EPERM") return undefined;
+    throw err;
+  }
+  return moved;
+}
 const approvalOf = (r: Rig, id: string) =>
   foldReadOnly(sessionRoot(r)).records.find((record) => record.id === id);
 
@@ -585,6 +617,33 @@ describe("starting a run", () => {
 });
 
 describe("cancelling a parked job run with no daemon", () => {
+  test("with its sessions folder outside the harness, the run is cancelled and the folder is unchanged", async () => {
+    const r = rig();
+    const { runId, approval } = await parkedRun(r);
+    const moved = linkSessionsOut(r);
+    if (moved === undefined) return;
+    const before = [...treeBytes(moved)];
+    const plan = await runAdapterFor("workflow").cancelRun({
+      harnessDir: r.harness,
+      harness: HRN,
+      target: "workflow",
+      runId,
+      home: {},
+    });
+    const done = await submit(r, "runs.cancel", runId, plan);
+    expect(done.receipt?.state).toBe("succeeded");
+    expect(done.receipt?.effects).toContainEqual({
+      kind: "decisions",
+      status: "done",
+      observed: "0 withdrawn",
+    });
+    expect(statesOf(r.harness, runId).at(-1)).toBe("cancelled");
+    expect([...treeBytes(moved)]).toEqual(before);
+    const still = foldReadOnly(moved).records.find((record) => record.id === approval.id);
+    expect(still?.supersededBy).toBeUndefined();
+    expect(still?.decision).toBeUndefined();
+  });
+
   test("its request is withdrawn naming the run, its last row is cancelled, its input is gone, and nothing re-drives it", async () => {
     const r = rig();
     const { runId, child, approval } = await parkedRun(r);
@@ -787,6 +846,28 @@ describe("cancelling a queued run races its start", () => {
 });
 
 describe("resuming a parked job run", () => {
+  test("with its sessions folder outside the harness, it is refused, nothing starts, and the folder is unchanged", async () => {
+    const r = rig();
+    const { runId } = await parkedRun(r);
+    const moved = linkSessionsOut(r);
+    if (moved === undefined) return;
+    const before = [...treeBytes(moved)];
+    const s = starter();
+    const answer = await runAdapterFor("workflow").resumeRun({
+      harnessDir: r.harness,
+      harness: HRN,
+      target: "workflow",
+      runId,
+      home: s.home,
+    });
+    expect(answer.ok ? "" : `${answer.refusal.code} ${answer.refusal.reason}`).toBe(
+      "conflict decisions_unreachable",
+    );
+    expect(answer.ok ? undefined : answer.refusal.verb).toBeUndefined();
+    expect(s.starts).toHaveLength(0);
+    expect([...treeBytes(moved)]).toEqual(before);
+  });
+
   test("a decided park is started again under the same run, with the same input file; a pending one is 409", async () => {
     const r = rig();
     const { runId, approval } = await parkedRun(r);

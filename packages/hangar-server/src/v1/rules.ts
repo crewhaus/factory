@@ -18,7 +18,7 @@ import {
 } from "@crewhaus/control-service";
 import { CREDENTIAL_FORM_WORDS } from "@crewhaus/spec-patch";
 import { foldApprovals } from "../approvals";
-import { resolveSessionRoot } from "../sessions";
+import { approvalsRootOf } from "../sessions";
 import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { fleetSnapshot } from "./lists";
@@ -115,7 +115,8 @@ const create: V1Handler = async (ctx) => {
     });
   }
   // The decision is read where `foldApprovals` read it, and asked again under the rule lock.
-  const root = resolveSessionRoot(dir).root;
+  const root = approvalsRootOf(dir);
+  if (root === undefined) throw notStanding();
   if (approvalStillStands(root, record.id) !== undefined) throw notStanding();
   if ("pattern" in narrow && narrow.pattern !== pattern) {
     const problem = widenedPatternProblem(record.toolName, record.input, pattern, dir);

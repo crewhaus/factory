@@ -307,7 +307,9 @@ function governedRefusal(rootDir: string, harnessDir: string | undefined): strin
  * explicit `--dir` wins. With no scoped root, the working directory decides when it is a
  * known harness ({@link isKnownHarness}); otherwise no harness does, and nothing is kept
  * beside the decision. A root a tenant scope or `CREWHAUS_SESSION_DIR` names is matched
- * to the harness it belongs to; one that names several is said so.
+ * to the harness it belongs to; one that names several is said so. A root that only
+ * harnesses whose own sessions folder lies outside them name is refused when any of them
+ * has an approver list, or with `--always` (`--dir` names the harness).
  *
  * Whichever way the root is found (`--dir`, the working directory or the environment), a
  * root that lies inside a harness with an approver list is decided only by that harness
@@ -370,6 +372,20 @@ function matchRoot(
       };
     }
     return { ok: true, rootDir: scoped, harnessDir: undefined, noHarness: true };
+  }
+  if (found.state === "outside") {
+    // Harnesses whose own sessions folder lands on the root from outside them: a governed
+    // one is decided only through --dir, never without an approver list.
+    const governed = found.dirs.some((d) => readApproverProjection(d).state !== "absent");
+    if (governed || always) {
+      return {
+        ok: false,
+        code: EXIT_FOR_ERROR.invalid,
+        message: `the approvals under ${scoped} lie outside ${found.dirs.join(", ")}, whose sessions folder they are; pass --dir <harness> to decide them as that harness's own`,
+      };
+    }
+    const one = found.dirs.length === 1 ? found.dirs[0] : undefined;
+    return { ok: true, rootDir: scoped, harnessDir: one, noHarness: one === undefined };
   }
   if (always) {
     return {

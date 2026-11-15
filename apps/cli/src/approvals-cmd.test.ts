@@ -559,6 +559,64 @@ describe("finding the harness when the store was found through the environment",
   }, 30_000);
 });
 
+describe("a sessions folder that lies outside the harness whose folder it is", () => {
+  /** A registered harness whose `.crewhaus/sessions` links to a folder outside every harness. */
+  function linkedOut(hangarRoot: string): { g: string; outside: string; r: Rig } | undefined {
+    const g = tmp("approvals-linked-out-");
+    mkdirSync(join(g, ".crewhaus"), { recursive: true });
+    const outside = join(tmp("approvals-outside-"), "sessions");
+    mkdirSync(outside, { recursive: true });
+    try {
+      symlinkSync(outside, sessionsOf(g), "dir");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return undefined;
+      throw err;
+    }
+    const r = rig(hangarRoot, tmp("approvals-elsewhere-"));
+    openHangarRegistry({ env: r.env }).upsert({ dir: g, specName: "g", target: "cli" });
+    return { g, outside, r };
+  }
+
+  test("named through the environment, a governed harness's approvals there are decided only with --dir", async () => {
+    const { hangarRoot, owner } = await home();
+    const at = linkedOut(hangarRoot);
+    if (at === undefined) return;
+    project(at.g, owner, [], hangarRoot);
+    const p = await park(at.outside);
+    const stranger = await at.r.run(["grant", p.id], {
+      identity: STRANGER,
+      scopedSessionRoot: () => at.outside,
+    });
+    expect(stranger.code).toBe(55);
+    expect(stranger.stderr).toContain("--dir");
+    const ownerRun = await at.r.run(["grant", p.id], { scopedSessionRoot: () => at.outside });
+    expect(ownerRun.code).toBe(55);
+    expect(foldReadOnly(at.outside).records[0]?.decision).toBeUndefined();
+    expect(receipts(at.g)).toEqual([]);
+    // Through --dir, the harness's own approver list decides: a stranger is refused.
+    const viaDir = await at.r.run(["grant", p.id, "--dir", at.g], { identity: STRANGER });
+    expect(viaDir.code).toBe(51);
+    expect(foldReadOnly(at.outside).records[0]?.decision).toBeUndefined();
+  }, 30_000);
+
+  test("an ungoverned harness's approvals there are decided as that harness's, and --always is refused", async () => {
+    const { hangarRoot } = await home();
+    const at = linkedOut(hangarRoot);
+    if (at === undefined) return;
+    const p = await park(at.outside);
+    const always = await at.r.run(["grant", p.id, "--always"], {
+      scopedSessionRoot: () => at.outside,
+    });
+    expect(always.code).toBe(55);
+    expect(foldReadOnly(at.outside).records[0]?.decision).toBeUndefined();
+    const once = await at.r.run(["grant", p.id], { scopedSessionRoot: () => at.outside });
+    expect(once.code).toBe(0);
+    expect(once.stderr).not.toContain(NO_HARNESS_LINE);
+    expect(foldReadOnly(at.outside).records[0]?.decision).toBe("grant");
+    expect(receipts(at.g).map((row) => row["kind"])).toEqual(["decisions.resolve"]);
+  }, 30_000);
+});
+
 describe("receipts and control state are kept only in a known harness", () => {
   test("in a plain directory, a change answers without creating .crewhaus/", async () => {
     const { hangarRoot } = await home();

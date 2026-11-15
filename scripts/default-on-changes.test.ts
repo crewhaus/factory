@@ -5981,3 +5981,44 @@ describe("the release notes name the hook events a hook that cannot run denies",
     expect(body).toContain("allowed: false");
   });
 });
+
+describe("a harness reads and decides only the approvals inside its own sessions folder", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("a sessions folder linked outside the harness is not contained, and the bullet says what that means", async () => {
+    const { containedSessionRoot, resolveHarnessSessionRoot } = await import(
+      "../packages/session-store/src/index"
+    );
+    if (process.platform !== "win32") {
+      const base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-sessions-")));
+      try {
+        const linked = join(base, "a");
+        const outside = join(base, "b", "sessions");
+        mkdirSync(join(linked, ".crewhaus"), { recursive: true });
+        mkdirSync(outside, { recursive: true });
+        symlinkSync(outside, join(linked, ".crewhaus", "sessions"));
+        expect(resolveHarnessSessionRoot(linked, {}).contained).toBe(false);
+        expect(containedSessionRoot(linked, {})).toBeUndefined();
+        const own = join(base, "c");
+        mkdirSync(join(own, ".crewhaus", "sessions"), { recursive: true });
+        expect(resolveHarnessSessionRoot(own, {}).contained).toBe(true);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    }
+    const approvals = readFileSync(join(ROOT, "packages/hangar-server/src/approvals.ts"), "utf8");
+    const fold = approvals.indexOf("export function foldApprovals(");
+    expect(fold).toBeGreaterThan(-1);
+    const end = approvals.indexOf("\n}\n", fold);
+    expect(end).toBeGreaterThan(-1);
+    expect(approvals.slice(fold, end).indexOf("approvalsRootOf(")).toBeGreaterThan(-1);
+    const runs = readFileSync(join(ROOT, "packages/control-service/src/runs.ts"), "utf8");
+    expect(runs.indexOf('"decisions_unreachable"')).toBeGreaterThan(-1);
+    const bullet = bulletFor("only inside that harness's folder");
+    expect(bullet).not.toBe("");
+    for (const needle of ["`unreachable`", "404", "409", "`decisions_unreachable`"]) {
+      expect(`${needle}: ${bullet.includes(needle)}`).toBe(`${needle}: true`);
+    }
+  });
+});

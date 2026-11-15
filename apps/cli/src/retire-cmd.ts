@@ -41,7 +41,7 @@ import {
   systemClock,
   verifyRunfile,
 } from "@crewhaus/harness-supervisor";
-import { resolveHarnessSessionRoot } from "@crewhaus/session-store";
+import { containedSessionRoot } from "@crewhaus/session-store";
 import {
   type DaemonCommandOptions,
   type DaemonCommandResult,
@@ -196,7 +196,7 @@ export async function retireCommand(o: RetireCommandOptions): Promise<DaemonComm
         now,
         probe: ops,
         revokers,
-        sessionRoot: resolveHarnessSessionRoot(o.harnessDir, loadEnvChain(o.harnessDir).vars).root,
+        sessionRoot: containedSessionRoot(o.harnessDir, loadEnvChain(o.harnessDir).vars) ?? null,
         ...(registry !== undefined ? { registry } : {}),
         holder: { pid: process.pid, host: hostname() },
       });

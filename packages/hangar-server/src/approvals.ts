@@ -38,7 +38,7 @@ import {
 import { MAX_JSONL_BYTES, MAX_JSONL_LINES } from "./constants";
 import { maskDeep } from "./mask";
 import { resolveContained } from "./safety";
-import { resolveSessionRoot } from "./sessions";
+import { approvalsRootOf } from "./sessions";
 
 export const APPROVALS_FILENAME = "approvals.jsonl";
 export { APPROVAL_ID_RE };
@@ -103,14 +103,17 @@ export function statusOf(a: PendingApproval): ApprovalRow["status"] {
 
 /** Fold one harness's approvals log the store's way: first decision wins, and
  *  the decision claims beside it outrank it. Never compacts, never evicts,
- *  never repairs. The log is contained at its RESOLVED session root, which may
- *  itself be a link, as the sessions browser's is; a log that is a link out of
- *  that root lists nothing. */
+ *  never repairs. The session root is contained in the harness: a root that
+ *  lies outside it once every link is followed is unreachable, lists nothing
+ *  and says `unreachable`, and nothing under it is read. Inside a contained
+ *  root, a log that is a link out of that root lists nothing. */
 export function foldApprovals(harnessDir: string): {
   readonly approvals: readonly PendingApproval[];
   readonly truncated: boolean;
+  readonly unreachable?: true;
 } {
-  const { root } = resolveSessionRoot(harnessDir);
+  const root = approvalsRootOf(harnessDir);
+  if (root === undefined) return { approvals: [], truncated: false, unreachable: true };
   const read = readTail(root, APPROVALS_FILENAME, {
     maxLines: MAX_JSONL_LINES,
     maxBytes: MAX_JSONL_BYTES,
@@ -177,6 +180,9 @@ export function approvalsInbox(
   };
 }
 
+/** Why a decision is refused when the harness's sessions folder is outside it. */
+const UNREACHABLE_REASON = "this harness's sessions folder is outside the harness";
+
 export type ResolveApprovalResult =
   | { readonly outcome: "resolved"; readonly approval: PendingApproval }
   | { readonly outcome: "not-found" }
@@ -196,8 +202,9 @@ export type ResolveApprovalResult =
  * `already-decided`. The decision is recorded as coming through Home, as the
  * member `actor` names, with Home's operator label as its display name.
  *
- * The session root is the harness's own, contained to it: one that leaves the
- * harness is refused before anything is read.
+ * The session root is the harness's own, contained to it: one that lies outside
+ * the harness once every link is followed answers `unreachable` before anything
+ * is read, and the decision service is never called.
  *
  * `ttlDays` is passed as `Number.MAX_SAFE_INTEGER` deliberately: `resolve`
  * folds the file to find the record, and a manager settling an approval that
@@ -213,9 +220,9 @@ export async function resolveApproval(args: {
   readonly actor: DecisionActor;
 }): Promise<ResolveApprovalResult> {
   if (!isApprovalId(args.approvalId)) return { outcome: "not-found" };
-  const { root } = resolveSessionRoot(args.harnessDir);
-  if (resolveContained(root, APPROVALS_FILENAME) === undefined) {
-    return { outcome: "unreachable", reason: "the session root escapes the harness dir" };
+  const root = approvalsRootOf(args.harnessDir);
+  if (root === undefined || resolveContained(root, APPROVALS_FILENAME) === undefined) {
+    return { outcome: "unreachable", reason: UNREACHABLE_REASON };
   }
   const answer = await args.decisions.resolve({
     harnessDir: args.harnessDir,

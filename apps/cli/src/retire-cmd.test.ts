@@ -32,6 +32,12 @@ import {
 import { commandsLedgerOf, retireSteps, workspaceCommandsLedger } from "@crewhaus/control-service";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import type { ProcessOps, SpawnedProcess } from "@crewhaus/harness-supervisor";
+import {
+  createPendingApprovalStore,
+  foldReadOnly,
+  generateApprovalId,
+  hashApprovalInput,
+} from "@crewhaus/session-store";
 import { directControl, harnessIdOf, runDaemonCommand } from "./daemon-cmd";
 import { type HeavyRetireSteps, retireCommand } from "./retire-cmd";
 
@@ -502,6 +508,47 @@ describe("retire marks only the registry row of its own directory", () => {
     expect(row?.archived).toMatchObject({ cmd: receipt["id"] });
   });
 });
+
+describe.skipIf(process.platform === "win32")(
+  "retiring a harness whose sessions folder lies outside it",
+  () => {
+    test("expires no approval there, says so in its receipt, and leaves that folder as it was", async () => {
+      const s = setUp();
+      const outside = join(s.root, "other", ".crewhaus", "sessions");
+      mkdirSync(outside, { recursive: true });
+      const id = generateApprovalId();
+      await createPendingApprovalStore({ rootDir: outside }).persist({
+        id,
+        toolName: "Write",
+        inputHash: hashApprovalInput("Write", { path: "a.md" }),
+        input: { path: "a.md" },
+        runId: "run_1",
+        sessionId: "sess_00000000deadbeef",
+        surface: "single-turn",
+        createdAt: new Date().toISOString(),
+      });
+      mkdirSync(join(s.dir, ".crewhaus"), { recursive: true });
+      symlinkSync(outside, join(s.dir, ".crewhaus", "sessions"), "dir");
+      const pendingIds = () =>
+        foldReadOnly(outside)
+          .records.filter((record) => record.decision === undefined)
+          .map((record) => record.id);
+      expect(pendingIds()).toEqual([id]);
+      const before = tree(outside);
+      const out = await s.retire();
+      expect(out.exitCode).toBe(0);
+      const receipt = workspaceReceipts(s.hangarRoot)[0] as Record<string, unknown>;
+      expect(receipt["state"]).toBe("succeeded");
+      expect(receipt["effects"]).toContainEqual({
+        kind: "retire.approvals",
+        status: "skipped",
+        observed: "sessions folder outside the harness",
+      });
+      expect(tree(outside)).toEqual(before);
+      expect(pendingIds()).toEqual([id]);
+    });
+  },
+);
 
 describe("a harness directory's id", () => {
   test("a copy whose harness.json names another directory's row has no id", () => {

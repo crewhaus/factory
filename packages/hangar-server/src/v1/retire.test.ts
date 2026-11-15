@@ -7,7 +7,15 @@
  * word on the harness.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { mintId } from "@crewhaus/control-contract";
@@ -18,6 +26,7 @@ import {
   workspaceCommandsLedger,
 } from "@crewhaus/control-service";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
+import { foldReadOnly } from "@crewhaus/session-store";
 import { type V1Home, v1Home } from "../__test__/v1-home";
 import type { ProcessLayer } from "../process";
 
@@ -254,3 +263,69 @@ describe("retiring through the API", () => {
     expect(retiredLines()).toHaveLength(lines + 1);
   });
 });
+
+/** Every path under `root`, recursively, with its bytes, its link target, or `dir`. */
+function treeOf(root: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (at: string, rel: string): void => {
+    for (const name of readdirSync(at).sort()) {
+      const path = join(at, name);
+      const key = rel === "" ? name : `${rel}/${name}`;
+      const st = lstatSync(path);
+      if (st.isSymbolicLink()) out[key] = `link:${readlinkSync(path)}`;
+      else if (st.isDirectory()) {
+        out[key] = "dir";
+        walk(path, key);
+      } else out[key] = `file:${readFileSync(path).toString("base64")}`;
+    }
+  };
+  walk(root, "");
+  return out;
+}
+
+describe.skipIf(process.platform === "win32")(
+  "retiring a harness whose sessions folder lies outside it",
+  () => {
+    test("expires no approval there, says so in its receipt, and leaves that folder as it was", async () => {
+      const pending = "appr_00000000000000e9";
+      const b = await home.harness("retire-kept-b", {
+        approvals: [
+          {
+            id: pending,
+            toolName: "SendMessage",
+            inputHash: `hash-${pending}`,
+            input: { channel: "ops", text: "kept" },
+            runId: "run_00000000000000e0",
+            sessionId: "sess_00000000000000ee",
+            surface: "daemon",
+            createdAt: new Date(Date.now() - 60_000).toISOString(),
+          },
+        ],
+      });
+      const a = await home.harness("retire-linked-a");
+      const sessionsB = join(b.dir, ".crewhaus", "sessions");
+      rmSync(join(a.dir, ".crewhaus", "sessions"), { recursive: true, force: true });
+      symlinkSync(sessionsB, join(a.dir, ".crewhaus", "sessions"));
+      const pendingIds = () =>
+        foldReadOnly(sessionsB)
+          .records.filter((record) => record.decision === undefined)
+          .map((record) => record.id);
+      expect(pendingIds()).toEqual([pending]);
+      const before = treeOf(sessionsB);
+      const nonce = await plan(a.id);
+      const res = await home.call("POST", path(a.id), {
+        body: { dryRun: false, confirmName: "retire-linked-a", nonce },
+      });
+      expect(res.status).toBe(200);
+      const receipt = res.body["receipt"] as Record<string, unknown>;
+      expect(receipt["state"]).toBe("succeeded");
+      expect(receipt["effects"]).toContainEqual({
+        kind: "retire.approvals",
+        status: "skipped",
+        observed: "sessions folder outside the harness",
+      });
+      expect(treeOf(sessionsB)).toEqual(before);
+      expect(pendingIds()).toEqual([pending]);
+    }, 30_000); // a whole retirement
+  },
+);
