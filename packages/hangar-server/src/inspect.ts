@@ -76,15 +76,21 @@
  *     carries no key-ish context word and the generic shape masker walks
  *     straight past it.
  *
- * `identity.json` never rides any of those paths verbatim: it is projected to
- * the fingerprint plus PRESENCE booleans for the key material, so the private
- * key cannot leave this process even if a masker regresses.
+ * A harness's identity file never rides any of those paths verbatim, by whatever
+ * path, link or view reaches it: it is projected to the fingerprint plus PRESENCE
+ * booleans for the key material, so the private key cannot leave this process
+ * even if a masker regresses. Which file that is, is decided from the one open
+ * file the bytes come from ({@link identityAnswer}).
  */
 import {
+  constants,
+  closeSync,
   existsSync,
+  fstatSync,
   lstatSync,
+  openSync,
+  readSync,
   readdirSync,
-  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -94,6 +100,7 @@ import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { AREA_MODULES } from "@crewhaus/control-contract";
 import { SECURITY_SETTINGS_PATHS } from "@crewhaus/control-service";
 import { MAX_TEXT_BYTES } from "./constants";
+import { realOr } from "./harness-paths";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
 import { replacePrivateKeyBlocks } from "./linear-mask";
@@ -407,7 +414,8 @@ export function exclusionFor(
  * The exclusion the path a request RESOLVES to trips: `resolved` (already contained)
  * taken through every link to its real place, made harness-relative with `relative()`,
  * and checked like a requested path. A link inside the harness to an excluded file trips
- * that file's row. Null when it trips none, or when nothing is there.
+ * that file's row, and so does a path below a link into an excluded folder, whether or not
+ * anything is there. Null when it trips none.
  *
  * First consumers: every inspect read and listing.
  */
@@ -421,19 +429,13 @@ export function resolvedExclusion(
 }
 
 /**
- * The place `resolved` really is, through every link, as segments relative to the
- * harness's real directory; undefined when nothing is there, or it is the harness itself
- * or outside it.
+ * The place `resolved` really is, or would be, through every existing link (`realOr`), as
+ * segments relative to the harness's real directory; undefined when it is the harness
+ * itself or outside it.
  */
 function realSegments(harnessDir: string, resolved: string): string[] | undefined {
-  let real: string;
-  let root: string;
-  try {
-    real = realpathSync(resolved);
-    root = realpathSync(harnessDir);
-  } catch {
-    return undefined;
-  }
+  const real = realOr(resolved);
+  const root = realOr(harnessDir);
   const rel = relative(root, real);
   if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return undefined;
   return sep === "/" ? rel.split("/") : rel.split(/[\\/]/);
@@ -511,8 +513,57 @@ export type InspectFileBody = {
   readonly truncated: boolean;
 };
 
+/** One file's bytes, read from a single open of it, and which file that open reached. */
+type OpenedRead = {
+  readonly text: string;
+  readonly truncated: boolean;
+  /** The open file's device and inode, when it is a regular file; null otherwise. */
+  readonly dev: bigint | null;
+  readonly ino: bigint | null;
+};
+
+const NOTHING_READ: OpenedRead = { text: "", truncated: false, dev: null, ino: null };
+
 /**
- * Read one already-contained file.
+ * Open `path` once and read at most {@link MAX_INSPECT_BYTES} from that open file.
+ *
+ * The open is non-blocking, and bytes are read only when the open file is a regular file:
+ * a named pipe, a directory or a device reads as empty and never waits. An open or read
+ * that fails reads as empty too. The device and inode come from the same open, so whatever
+ * decides how the bytes are answered is deciding about these bytes.
+ */
+function readOpened(path: string): OpenedRead {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+  } catch {
+    return NOTHING_READ;
+  }
+  try {
+    const stat = fstatSync(fd, { bigint: true });
+    if (!stat.isFile()) return NOTHING_READ;
+    const cap = BigInt(MAX_INSPECT_BYTES);
+    const take = stat.size > cap ? MAX_INSPECT_BYTES : Number(stat.size);
+    const buf = Buffer.alloc(take);
+    const read = take === 0 ? 0 : readSync(fd, buf, 0, take, 0);
+    return {
+      text: buf.subarray(0, read).toString("utf8"),
+      truncated: stat.size > cap,
+      dev: stat.dev,
+      ino: stat.ino,
+    };
+  } catch {
+    return NOTHING_READ;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** The `parseError` of a `.json` that does not parse: fixed, never the parser's words. */
+const JSON_PARSE_ERROR = "not valid JSON";
+
+/**
+ * Answer one already-contained file's bytes, already read.
  *
  * STRUCTURE FIRST, TEXT AS THE FALLBACK. `maskDeep` is key-based, so a
  * document served as a parsed tree gets credential-NAMED values redacted
@@ -527,10 +578,17 @@ export type InspectFileBody = {
  * out of a `.json` beside it, because no shape rule can see an opaque value
  * under an innocent key. A parsed document is not a safer document.
  *
- * Never throws: an unreadable file reads empty.
+ * A `.json` that does not parse answers `JSON_PARSE_ERROR`, a fixed string,
+ * and never the parser's message.
+ *
+ * It never opens the file: `path` only picks the `.jsonl` / `.json` rules. Never throws.
  */
-function readBody(path: string, scrub: TextScrubber): InspectFileBody {
-  const { text, truncated } = readTextCapped(path, MAX_INSPECT_BYTES);
+function readBody(
+  path: string,
+  read: { readonly text: string; readonly truncated: boolean },
+  scrub: TextScrubber,
+): InspectFileBody {
+  const { text, truncated } = read;
   const bytes = Buffer.byteLength(text, "utf8");
   if (text.trim() === "") {
     return { document: null, text: "", parseError: null, bytes, truncated };
@@ -576,10 +634,8 @@ function readBody(path: string, scrub: TextScrubber): InspectFileBody {
       bytes,
       truncated,
     };
-  } catch (err) {
-    return asText(
-      path.endsWith(".json") ? (err instanceof Error ? err.message : String(err)) : null,
-    );
+  } catch {
+    return asText(path.endsWith(".json") ? JSON_PARSE_ERROR : null);
   }
 }
 
@@ -693,18 +749,16 @@ function refuseExcluded(ctx: M3Context, segments: readonly string[], resolved?: 
   );
 }
 
-/** The registered harness inside this one that really holds `resolved`, if any. */
+/**
+ * The registered harness inside this one that holds `resolved`'s real place, or the place
+ * it would really be, through every existing link (`realOr`, as `nestedHarnessAt` resolves
+ * its rows), whether or not anything is there; undefined when none does.
+ */
 function nestedHarnessOf(
   ctx: M3Context,
   resolved: string,
 ): { readonly id: string; readonly visible: boolean } | undefined {
-  let real: string;
-  try {
-    real = realpathSync(resolved);
-  } catch {
-    return undefined;
-  }
-  return ctx.nestedHarnessAt(real);
+  return ctx.nestedHarnessAt(realOr(resolved));
 }
 
 /** `statSync` that answers undefined instead of throwing. */
@@ -877,36 +931,92 @@ const IDENTITY_NOTE =
   "this is a harness identity file: shown as its fingerprint and whether each key is present, as in the identity store";
 
 /**
- * The answer for a read whose requested path, or the place it really is, is a harness's
- * identity file: its projection, never its text and never a parser's message (either could
- * carry key bytes). The file is read and parsed here, not through `readBody`. A file that
- * does not parse projects to nothing. Undefined when the read is not of an identity file.
+ * The device and inode of this harness's own identity file, through every link; undefined
+ * when there is none, or when the filesystem reports no inode (an inode of 0 would match
+ * every file such a filesystem holds).
+ */
+function ownIdentityFile(ctx: M3Context): { dev: bigint; ino: bigint } | undefined {
+  if (ctx.harnessDir === null) return undefined;
+  try {
+    const stat = statSync(join(ctx.harnessDir, ".crewhaus", "identity.json"), {
+      bigint: true,
+      throwIfNoEntry: false,
+    });
+    if (stat === undefined || stat.ino === 0n) return undefined;
+    return { dev: stat.dev, ino: stat.ino };
+  } catch {
+    return undefined;
+  }
+}
+
+/** A parsed document that holds a private key at its top level. */
+function holdsPrivateKey(parsed: unknown): boolean {
+  return (
+    typeof parsed === "object" &&
+    parsed !== null &&
+    !Array.isArray(parsed) &&
+    typeof (parsed as Record<string, unknown>)["privateKey"] === "string"
+  );
+}
+
+/**
+ * The answer for a read of a harness's identity file: its projection, never its text and
+ * never a parser's message (either could carry key bytes). Decided from the open file the
+ * bytes were read from: by path (the requested path, or the place it really is, names an
+ * identity file), by being this harness's own identity file (the same device and inode,
+ * whatever the path or link), or by holding a private key. A file that does not parse
+ * projects to nothing. Undefined when the read is not of an identity file.
  *
- * First consumers: the raw read, a store entry's read and a skill's `SKILL.md`.
+ * First consumer: {@link readInspected}, so every view of a file answers the same.
  */
 function identityAnswer(
   ctx: M3Context,
   segments: readonly string[],
   resolved: string,
+  read: OpenedRead,
 ): InspectFileBody | undefined {
-  const real = ctx.harnessDir === null ? undefined : realSegments(ctx.harnessDir, resolved);
-  if (!isIdentityPath(segments) && (real === undefined || !isIdentityPath(real))) {
-    return undefined;
-  }
-  const { text, truncated } = readTextCapped(resolved, MAX_INSPECT_BYTES);
   let parsed: unknown = null;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(read.text);
   } catch {
     parsed = null;
   }
+  const real = ctx.harnessDir === null ? undefined : realSegments(ctx.harnessDir, resolved);
+  const byPath = isIdentityPath(segments) || (real !== undefined && isIdentityPath(real));
+  const own = byPath ? undefined : ownIdentityFile(ctx);
+  const byInode =
+    own !== undefined &&
+    read.ino !== null &&
+    read.ino !== 0n &&
+    read.dev === own.dev &&
+    read.ino === own.ino;
+  const byContent = !read.truncated && holdsPrivateKey(parsed);
+  if (!byPath && !byInode && !byContent) return undefined;
   return {
     document: identityProjection(parsed),
     text: null,
     parseError: null,
-    bytes: Buffer.byteLength(text, "utf8"),
-    truncated,
+    bytes: Buffer.byteLength(read.text, "utf8"),
+    truncated: read.truncated,
   };
+}
+
+/**
+ * Read one already-contained file for an inspect view: one open, and only that open's
+ * bytes are answered — as the identity projection when {@link identityAnswer} says it is
+ * an identity file, otherwise through `readBody`.
+ *
+ * First consumers: the store view, a store entry, a skill's `SKILL.md` and the raw read.
+ */
+function readInspected(
+  ctx: M3Context,
+  segments: readonly string[],
+  resolved: string,
+): { readonly body: InspectFileBody; readonly identity: boolean } {
+  const read = readOpened(resolved);
+  const identity = identityAnswer(ctx, segments, resolved, read);
+  if (identity !== undefined) return { body: identity, identity: true };
+  return { body: readBody(resolved, read, scrubberFor(ctx)), identity: false };
 }
 
 /** Permission rules + hooks, counted and named — what the settings screen
@@ -1001,25 +1111,25 @@ export const inspectStore: M3Handler = (ctx) => {
       summary: null,
     };
   }
-  // Another single-file store that leads to an identity file answers its projection too.
-  const identity = store === "identity" ? undefined : identityAnswer(ctx, def.segments, path);
-  if (identity !== undefined) {
+  // Every single-file store, the identity store included, that leads to an identity file
+  // answers its projection.
+  const { body, identity } = readInspected(ctx, def.segments, path);
+  if (identity) {
     return {
       present: true,
       note: IDENTITY_NOTE,
       verb: null,
       ...base,
       entries: [],
-      truncated: identity.truncated,
-      document: identity.document,
+      truncated: body.truncated,
+      document: body.document,
       text: null,
       parseError: null,
-      bytes: identity.bytes,
+      bytes: body.bytes,
       modifiedAt: stat.modifiedAt,
       summary: null,
     };
   }
-  const body = readBody(path, scrubberFor(ctx));
   return {
     present: true,
     note: body.parseError === null ? null : `this file did not parse: ${body.parseError}`,
@@ -1027,10 +1137,8 @@ export const inspectStore: M3Handler = (ctx) => {
     ...base,
     entries: [],
     truncated: body.truncated,
-    // identity.json is PROJECTED, never echoed: the file holds the private
-    // key, and presence is all a console ever needs of it.
-    document: store === "identity" ? identityProjection(body.document) : body.document,
-    text: store === "identity" ? null : body.text,
+    document: body.document,
+    text: body.text,
     parseError: body.parseError,
     bytes: body.bytes,
     modifiedAt: stat.modifiedAt,
@@ -1122,45 +1230,49 @@ export const inspectEntry: M3Handler = (ctx) => {
     const { rows, truncated } = listEntries(ctx, [...def.segments, name]);
     const skillFile = rows.find((r) => r.name === "SKILL.md" && r.kind === "file");
     let body: InspectFileBody | undefined;
+    let identity = false;
     if (skillFile !== undefined) {
       try {
         const skillPath = ctx.contain([...def.segments, name, skillFile.name]);
         refuseExcluded(ctx, [...def.segments, name, skillFile.name], skillPath);
-        body =
-          identityAnswer(ctx, [...def.segments, name, skillFile.name], skillPath) ??
-          readBody(skillPath, scrubberFor(ctx));
+        ({ body, identity } = readInspected(
+          ctx,
+          [...def.segments, name, skillFile.name],
+          skillPath,
+        ));
       } catch {
         body = undefined;
+        identity = false;
       }
     }
+    // A SKILL.md that leads to an identity file answers its projection, never its text.
     return {
       present: true,
-      note:
-        skillFile === undefined
+      note: identity
+        ? IDENTITY_NOTE
+        : skillFile === undefined
           ? "no SKILL.md here — open the individual files with the raw browser"
           : null,
       verb: null,
       ...base,
       kind: "dir",
       files: rows,
-      document: null,
-      text: body?.text ?? null,
+      document: identity ? (body?.document ?? null) : null,
+      text: identity ? null : (body?.text ?? null),
       parseError: null,
       bytes: null,
       modifiedAt: stat.modifiedAt,
       truncated: truncated || body?.truncated === true,
     };
   }
-  const identity = identityAnswer(ctx, [...def.segments, name], path);
-  const body = identity ?? readBody(path, scrubberFor(ctx));
+  const { body, identity } = readInspected(ctx, [...def.segments, name], path);
   return {
     present: true,
-    note:
-      identity !== undefined
-        ? IDENTITY_NOTE
-        : body.parseError === null
-          ? null
-          : `this file did not parse: ${body.parseError}`,
+    note: identity
+      ? IDENTITY_NOTE
+      : body.parseError === null
+        ? null
+        : `this file did not parse: ${body.parseError}`,
     verb: null,
     ...base,
     files: [],
@@ -1299,16 +1411,14 @@ export const inspectRaw: M3Handler = (ctx) => {
       truncated,
     };
   }
-  const identity = identityAnswer(ctx, segments, path);
-  const body = identity ?? readBody(path, scrubberFor(ctx));
+  const { body, identity } = readInspected(ctx, segments, path);
   return {
     present: true,
-    note:
-      identity !== undefined
-        ? IDENTITY_NOTE
-        : body.parseError === null
-          ? null
-          : `this file did not parse: ${body.parseError}`,
+    note: identity
+      ? IDENTITY_NOTE
+      : body.parseError === null
+        ? null
+        : `this file did not parse: ${body.parseError}`,
     verb: null,
     path: shown,
     kind: "file",

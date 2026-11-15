@@ -545,17 +545,21 @@ these on: they reach every harness that uses what each one names.
   cannot be written.
 
 - **The raw inspector shows a harness's identity file as its fingerprint and
-  key presence only**, by any path or link that leads to it. Home's raw file
-  browser, a store entry and a skill's `SKILL.md` answer
-  `.crewhaus/identity.json`, at any depth and in any letter case, as its
-  fingerprint and whether each key is present, as the identity store does.
+  key presence only**, by any path, link or view that leads to it. Home's raw
+  file browser, every store view (the identity store included), a store entry
+  and a skill's `SKILL.md` answer `.crewhaus/identity.json` (at any depth, in
+  any letter case, through a symbolic or hard link, and when it does not
+  parse) as its fingerprint and whether each key is present. A JSON file that
+  holds a top-level `privateKey` is answered the same way.
 
 - **The raw inspector refuses a nested harness's run, audit and key files, and
   paths inside another registered harness.** The inspector's exclusions under
   `.crewhaus/` apply at every `.crewhaus` in a path, so
   `apps/sub/.crewhaus/run/control-token` is refused like the harness's own. A
-  path whose real place is inside another harness registered with Home is
-  refused and left out of listings; that harness's own inspector reads it.
+  path whose real place, or would-be place, is inside another harness
+  registered with Home is refused whether or not anything is there, and is
+  left out of listings; that harness's own inspector reads it. A path through
+  a link into an excluded folder is refused the same way.
 
 - **Only someone who can manage Home's registry sees scan-root paths, folder
   suggestions and the demo source in onboarding.** For anyone else,

@@ -5004,6 +5004,8 @@ describe("Home's inspector, onboarding and a library start with sign-in off", ()
     const bullet = bulletFor("shows a harness's identity file as its fingerprint");
     expect(bullet).not.toBe("");
     expect(bullet).toContain("fingerprint");
+    expect(bullet).toContain("hard link");
+    expect(bullet).toContain("identity store");
   });
 
   test("the raw inspector refuses a nested harness's run files", () => {
@@ -5011,6 +5013,7 @@ describe("Home's inspector, onboarding and a library start with sign-in off", ()
     const bullet = bulletFor("refuses a nested harness's run, audit and key files");
     expect(bullet).not.toBe("");
     expect(bullet).toContain("nested");
+    expect(bullet).toContain("whether or not anything is there");
   });
 
   test("onboarding names places on this computer only to registry managers", () => {
