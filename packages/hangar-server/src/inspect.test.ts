@@ -18,7 +18,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  copyFileSync,
   existsSync,
+  linkSync,
   mkdirSync,
   readFileSync,
   rmSync,
@@ -365,6 +367,8 @@ describe("inspect — one entry", () => {
         "SKILL.md",
         "notes.md",
       ]);
+      expect(body["note"]).toBeNull();
+      expect(body["document"]).toBeNull();
     } finally {
       await t.stop();
     }
@@ -1020,6 +1024,22 @@ function linked(target: string, at: string): boolean {
   }
 }
 
+/** Make a hard link, or answer false where the OS or filesystem refuses one. */
+function hardLinked(target: string, at: string): boolean {
+  try {
+    linkSync(target, at);
+    return true;
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code !== "EPERM" && code !== "ENOTSUP") throw err;
+    return false;
+  }
+}
+
+/** The note every view of an identity file carries beside its projection. */
+const IDENTITY_NOTE_TEXT =
+  "this is a harness identity file: shown as its fingerprint and whether each key is present, as in the identity store";
+
 describe("the identity file, by any path that leads to it", () => {
   /** A run of each key's bytes: neither may appear anywhere in an answer. */
   const KEY_RUNS = ["Z".repeat(20), "A".repeat(20)];
@@ -1116,6 +1136,207 @@ describe("the identity file, by any path that leads to it", () => {
       expect(body["parseError"]).toBeNull();
       expect((body["document"] as Record<string, unknown>)["fingerprint"]).toBeNull();
       for (const run of KEY_RUNS) expect(JSON.stringify(body)).not.toContain(run);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("the identity store and a raw read answer a malformed identity file as its projection, with no parser message", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const file = join(dir, ".crewhaus", "identity.json");
+      const whole = readFileSync(file, "utf8");
+      // The private key's value unquoted, so the file does not parse.
+      const malformed = whole.replace(/"privateKey": "([^"]*)"/, '"privateKey": $1');
+      expect(malformed).not.toBe(whole);
+      writeFileSync(file, malformed);
+      const id = await register(t, dir);
+      const views = [
+        ["identity store", `/api/h/${id}/inspect/identity`],
+        ["raw", `/api/h/${id}/inspect/raw?path=${encodeURIComponent(".crewhaus/identity.json")}`],
+      ] as const;
+      for (const [label, url] of views) {
+        const { status, body } = await t.api(url);
+        expect(`${label}: ${status}`).toBe(`${label}: 200`);
+        expect(body["parseError"]).toBeNull();
+        expect(body["note"]).toBe(IDENTITY_NOTE_TEXT);
+        expect(body["text"]).toBeNull();
+        for (const run of KEY_RUNS) expect(JSON.stringify(body)).not.toContain(run);
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a hard link to the identity file answers its projection, by raw read and by store entry", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const file = join(dir, ".crewhaus", "identity.json");
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      if (!hardLinked(file, join(dir, "notes", "id.json"))) return;
+      if (!hardLinked(file, join(dir, ".crewhaus", "skills", "hid"))) return;
+      const id = await register(t, dir);
+      const raw = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/id.json")}`,
+      );
+      expectProjection("raw hard link", raw.status, raw.body);
+      expect(raw.body["note"]).toBe(IDENTITY_NOTE_TEXT);
+      const entry = await t.api(`/api/h/${id}/inspect/skills/hid`);
+      expectProjection("skills entry hard link", entry.status, entry.body);
+      expect(entry.body["note"]).toBe(IDENTITY_NOTE_TEXT);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a hard link to a torn identity file answers no key bytes and no parser message", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const file = join(dir, ".crewhaus", "identity.json");
+      // A filesystem that reports no inode cannot tell a hard link from another file.
+      if (statSync(file, { bigint: true }).ino === 0n) return;
+      const whole = readFileSync(file, "utf8");
+      const cut = whole.indexOf("Z".repeat(40));
+      expect(cut).toBeGreaterThan(-1);
+      writeFileSync(file, whole.slice(0, cut + 20));
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      if (!hardLinked(file, join(dir, "notes", "id.json"))) return;
+      const id = await register(t, dir);
+      const { status, body } = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/id.json")}`,
+      );
+      expect(status).toBe(200);
+      expect(body["text"]).toBeNull();
+      expect(body["parseError"]).toBeNull();
+      expect(body["note"]).toBe(IDENTITY_NOTE_TEXT);
+      expect((body["document"] as Record<string, unknown>)["fingerprint"]).toBeNull();
+      for (const run of KEY_RUNS) expect(JSON.stringify(body)).not.toContain(run);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a copy of the identity file answers its projection, and other JSON answers its document", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      copyFileSync(join(dir, ".crewhaus", "identity.json"), join(dir, "notes", "copy.json"));
+      writeFileSync(join(dir, "notes", "plain.json"), `${JSON.stringify({ note: "x" })}\n`);
+      const id = await register(t, dir);
+      const copy = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/copy.json")}`,
+      );
+      expectProjection("copy", copy.status, copy.body);
+      expect(copy.body["note"]).toBe(IDENTITY_NOTE_TEXT);
+      const plain = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/plain.json")}`,
+      );
+      expect(plain.status).toBe(200);
+      expect(plain.body["document"]).toEqual({ note: "x" });
+      expect(plain.body["note"]).toBeNull();
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a JSON file that does not parse answers a fixed parse error and no key bytes", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const whole = readFileSync(join(dir, ".crewhaus", "identity.json"), "utf8");
+      // The private key's value unquoted, so the file does not parse.
+      const malformed = whole.replace(/"privateKey": "([^"]*)"/, '"privateKey": $1');
+      expect(malformed).not.toBe(whole);
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      writeFileSync(join(dir, "notes", "copy.json"), malformed);
+      const id = await register(t, dir);
+      const { status, body } = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/copy.json")}`,
+      );
+      expect(status).toBe(200);
+      expect(body["parseError"]).toBe("not valid JSON");
+      expect(body["note"]).toBe("this file did not parse: not valid JSON");
+      for (const run of KEY_RUNS) expect(JSON.stringify(body)).not.toContain(run);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a named pipe in the tree answers empty without waiting for a writer", async () => {
+    if (process.platform === "win32") return;
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      if (Bun.spawnSync(["mkfifo", join(dir, "notes", "pipe")]).exitCode !== 0) return;
+      const id = await register(t, dir);
+      const { status, body } = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/pipe")}`,
+      );
+      expect(status).toBe(200);
+      expect(body["text"]).toBe("");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("every inspect view reads a file's bytes from one open of it", () => {
+    const source = readFileSync(join(import.meta.dir, "inspect.ts"), "utf8");
+    const at = (needle: string): number[] => {
+      const hits: number[] = [];
+      for (let i = source.indexOf(needle); i > -1; i = source.indexOf(needle, i + 1)) hits.push(i);
+      return hits;
+    };
+    const capped = at("readTextCapped(");
+    expect(capped.length).toBe(1);
+    const settingsWriteAt = source.indexOf("export const settingsWrite");
+    expect(settingsWriteAt).toBeGreaterThan(-1);
+    expect(capped[0] as number).toBeGreaterThan(settingsWriteAt);
+    const opens = at("openSync(");
+    expect(opens.length).toBe(1);
+    const helperAt = source.indexOf("function readOpened(");
+    const bodyAt = source.indexOf("function readBody(");
+    expect(helperAt).toBeGreaterThan(-1);
+    expect(bodyAt).toBeGreaterThan(-1);
+    expect(opens[0] as number).toBeGreaterThan(helperAt);
+    expect(opens[0] as number).toBeLessThan(bodyAt);
+  });
+
+  test("a skill whose SKILL.md links to the identity file answers its projection", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      mkdirSync(join(dir, ".crewhaus", "skills", "x"), { recursive: true });
+      if (!linked("../../identity.json", join(dir, ".crewhaus", "skills", "x", "SKILL.md"))) {
+        return;
+      }
+      const id = await register(t, dir);
+      const { status, body } = await t.api(`/api/h/${id}/inspect/skills/x`);
+      expect(status).toBe(200);
+      expect(body["kind"]).toBe("dir");
+      const doc = body["document"] as Record<string, unknown>;
+      expect(doc["fingerprint"]).toBe("a".repeat(64));
+      expect(doc["privateKeyPresent"]).toBe(true);
+      expect(body["note"]).toBe(IDENTITY_NOTE_TEXT);
+      expect(body["text"]).toBeNull();
+      expect(body["parseError"]).toBeNull();
+      expect((body["files"] as Array<{ name: string }>).map((f) => f.name)).toContain("SKILL.md");
+      for (const run of KEY_RUNS) expect(JSON.stringify(body)).not.toContain(run);
+
+      const file = join(dir, ".crewhaus", "identity.json");
+      const whole = readFileSync(file, "utf8");
+      const cut = whole.indexOf("Z".repeat(40));
+      expect(cut).toBeGreaterThan(-1);
+      writeFileSync(file, whole.slice(0, cut + 20));
+      const torn = await t.api(`/api/h/${id}/inspect/skills/x`);
+      expect(torn.status).toBe(200);
+      expect(torn.body["parseError"]).toBeNull();
+      expect(torn.body["text"]).toBeNull();
+      for (const run of KEY_RUNS) expect(JSON.stringify(torn.body)).not.toContain(run);
     } finally {
       await t.stop();
     }
@@ -1234,6 +1455,72 @@ describe("a harness inside the one being browsed", () => {
       const own = await t.api(`/api/h/${subId}/inspect/raw?path=${encodeURIComponent("notes.md")}`);
       expect(own.status).toBe(200);
       expect(String(own.body["text"])).toContain(marker);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a path inside a registered harness is refused whether or not anything is there", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const sub = makeFixtureHarness(join(dir, "apps", "sub"), { specName: "sub" });
+      writeFileSync(join(sub, "notes.md"), "sub notes\n");
+      const parent = await register(t, dir);
+      const subId = await register(t, sub);
+      const raw = (path: string) => `/api/h/${parent}/inspect/raw?path=${encodeURIComponent(path)}`;
+      const swapped = (text: string): string =>
+        text.replace("apps/sub/notes.md", "apps/sub/missing.md");
+
+      const existing = await t.api(raw("apps/sub/notes.md"));
+      const missing = await t.api(raw("apps/sub/missing.md"));
+      expect(missing.status).toBe(403);
+      expect(String(missing.body["error"])).toContain(subId);
+      expect(String(missing.body["error"])).toBe(swapped(String(existing.body["error"])));
+
+      // A missing path in the browsed harness's own tree is still an empty state.
+      const absent = await t.api(raw("notes/absent.md"));
+      expect(absent.status).toBe(200);
+      expect(absent.body["present"]).toBe(false);
+
+      await signInFromBootLink(t.fetchRaw, t.server.bootPath as string);
+      const read = loadAccessSnapshot(t.hangarRoot);
+      if (read.state !== "present") throw new Error("no access records");
+      const minted = await openAccess(t.hangarRoot).mintServiceToken(
+        { principal: read.snapshot.owner as string },
+        { service: "inspector", permissions: ["h.files.raw"], harnesses: [parent] },
+      );
+      if (!minted.ok) throw new Error(minted.reason);
+      const asToken = (path: string) =>
+        t.fetchRaw(raw(path), { headers: bearer(minted.result.secret) });
+      const tokenExisting = await asToken("apps/sub/notes.md");
+      const tokenMissing = await asToken("apps/sub/missing.md");
+      const text = await tokenMissing.text();
+      expect(tokenMissing.status).toBe(403);
+      expect(text).toContain("another harness registered with this Home");
+      expect(text).not.toContain(subId);
+      expect(text).toBe(swapped(await tokenExisting.text()));
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a path through a link into an excluded folder is refused whether or not anything is there", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      if (!linked("../.crewhaus/audit", join(dir, "notes", "aud"))) return;
+      const id = await register(t, dir);
+      const reason = INSPECT_EXCLUSIONS.find((r) => r.path === ".crewhaus/audit/")
+        ?.reason as string;
+      for (const path of ["notes/aud/missing.jsonl", "notes/aud/2026-08-01.jsonl"]) {
+        const { status, body } = await t.api(
+          `/api/h/${id}/inspect/raw?path=${encodeURIComponent(path)}`,
+        );
+        expect(`${path}: ${status}`).toBe(`${path}: 403`);
+        expect(String(body["error"])).toContain(reason);
+      }
     } finally {
       await t.stop();
     }
