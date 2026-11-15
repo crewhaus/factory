@@ -15,7 +15,14 @@ import { PLUGIN_NAME_RE } from "@crewhaus/control-contract";
 import { parseYamlOnly } from "@crewhaus/spec-patch/commit";
 import { HttpError } from "./http";
 import { type M3Handler, requireTypedConfirm } from "./m3";
-import { asksOf, liveGrantOf, readPluginGrants, servedOf, standingFrom } from "./plugin-grants";
+import {
+  PLUGIN_SHAPES,
+  asksOf,
+  liveGrantOf,
+  readPluginGrants,
+  servedOf,
+  standingFrom,
+} from "./plugin-grants";
 import { readPluginInventory, servesHarness } from "./plugins";
 import {
   commitSpecEdits,
@@ -24,9 +31,6 @@ import {
   requireEditable,
   requireWholeSpec,
 } from "./spec-edit";
-
-/** The shapes whose bundles load `plugins:`. */
-const PLUGIN_SHAPES = new Set(["cli", "channel"]);
 
 type Entry = string | { readonly name: string; readonly tools: readonly string[] };
 

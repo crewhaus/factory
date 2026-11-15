@@ -76,8 +76,12 @@ export function labelOf(key) {
 /** What the value-shape masker puts where a credential-shaped span was. */
 export const SHAPE_MASK = "***";
 
-/** What the harness's env scrubber puts where a value its `.env` holds was: `«NAME»`. */
-const SCRUBBED_RE = /«[A-Za-z_][A-Za-z0-9_]*»/;
+/**
+ * What the harness's scrubber puts where a value its `.env` or its spec's credentials
+ * hold was: `«NAME»`, the name an env variable's or a spec credential key's
+ * (`«BOT_TOKEN»`, `«x-api-key»`). The same shape the server refuses to write.
+ */
+const SCRUBBED_RE = /«[A-Za-z0-9_.-]{1,128}»/;
 
 /**
  * The first placeholder a masker left in a string, or null: the key-name
@@ -269,7 +273,9 @@ function withoutNull(doc, schema, open) {
  *   schema    — the document the server answers (`{$ref, definitions}`)
  *   effective — the effective rows (`{segments, value, source}`)
  *   trust     — the trust rows (`{segments, tier, securitySurface}`), declared paths only
- *   opts      — `{truncated}`: true when the effective rows stopped at the server's cap
+ *   opts      — `{truncated, credentialNames}`: `truncated` is true when the effective
+ *               rows stopped at the server's cap; `credentialNames` are the setting
+ *               names the server holds to be credentials
  *
  * Answers `{groups, counts, why}`: the root's settings in schema order, the
  * walk's tallies (`visited` equals `classified` by construction: every node
@@ -283,9 +289,14 @@ function withoutNull(doc, schema, open) {
  * cannot tell an unset setting from one past the cap, so it offers no write
  * for it and {@link fieldEdit} answers null.
  * A row whose path holds a {@link RESERVED_SEGMENTS} name is never read.
+ * A node with any segment in `credentialNames` is `concealed`: the editor keeps
+ * nothing typed into it and starts it empty, whether or not it holds a value.
  */
 export function formModel(schema, effective = [], trust = [], opts = {}) {
   const truncated = opts?.truncated === true;
+  const credentialNames = new Set(
+    Array.isArray(opts?.credentialNames) ? opts.credentialNames.map(String) : [],
+  );
   const counts = { visited: 0, classified: 0, controls: 0, json: 0, groups: 0 };
   const rows = new Map();
   const prefixRows = [];
@@ -381,6 +392,8 @@ export function formModel(schema, effective = [], trust = [], opts = {}) {
       security: tierRow?.securitySurface === true,
       badges: [],
       writeOnly,
+      // A credential's setting: nothing typed into it is kept, and it starts empty.
+      concealed: segments.some((seg) => credentialNames.has(String(seg))),
       // No row of its own in a capped read: what the file holds here is unknown, so nothing writes it.
       capped: truncated && exact === undefined,
       nullable: false,

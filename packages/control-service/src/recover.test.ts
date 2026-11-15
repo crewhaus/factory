@@ -2,15 +2,17 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CommandReceipt } from "@crewhaus/control-contract";
-import { publishClaim } from "@crewhaus/control-records";
+import { publishClaim, readOperatorRecord, writeOperatorRecord } from "@crewhaus/control-records";
 import { createMemoryJobStore } from "@crewhaus/harness-supervisor";
 import { CORE_RUNTIME, reconcileDaemonStart } from "./core-runtime";
 import { type AreaRuntime, type Reconciliation, executorDead, withOwnStartTime } from "./executor";
 import { commandsLedgerOf, workspaceCommandsLedger } from "./ledgers";
+import { retireSteps } from "./retire";
 import {
   BOOTED,
   HOST,
   NOW,
+  type Rig,
   fakeProbe,
   plantReceipt,
   removeTempDirs,
@@ -395,6 +397,125 @@ describe("a daemon command a later one overtook", () => {
     // The first stop's harness is registered with a live directory, so it runs again.
     expect(await r.service.commands.recover("all")).toMatchObject({ redispatched: 1 });
     expect(r.supervisor.calls).toContain("stop");
+  });
+});
+
+describe("a retire's disable outranks earlier unfinished deployment controls", () => {
+  const SUPERSEDED = { code: "interrupted", message: "superseded by a later command" };
+
+  /** Disable the harness as a retire does, under a workspace `controls.retire`; its id. */
+  async function retireDisable(r: Rig): Promise<string> {
+    const answer = await r.service.commands.submit(
+      { kind: "controls.retire", ledger: "workspace", via: "cli", body: {} },
+      async (receipt) => {
+        const steps = retireSteps({
+          harnessDir: r.harness,
+          hangarRoot: r.hangarRoot,
+          receipt,
+          stop: false,
+          now: () => r.clock.now,
+          probe: r.probe,
+        });
+        const disabled = await steps.stopAndDisable();
+        const kept = await steps.keepDisabled();
+        return {
+          settle: {
+            state: disabled.ok && kept.ok ? "succeeded" : "failed",
+            effects: [...steps.effects()],
+          },
+          value: undefined,
+        };
+      },
+    );
+    if (!answer.ok) throw new Error(answer.refusal.message);
+    return answer.receipt.id;
+  }
+
+  const deploymentOf = (harness: string) => {
+    const read = readOperatorRecord.refresh(harness);
+    return read.state === "present" ? read.record.deployment : undefined;
+  };
+
+  for (const mode of ["direct", "server"] as const) {
+    test(`an enable accepted before the retire settles superseded and the harness stays disabled (${mode})`, async () => {
+      const r = rig({ pid: 1000, mode });
+      plantReceipt(commandsLedgerOf(r.harness), {
+        id: CMD,
+        kind: "controls.enable",
+        acceptedAt: iso(NOW - 3_600_000),
+      });
+      const retired = await retireDisable(r);
+      expect(deploymentOf(r.harness)).toMatchObject({ disabled: true, cmd: retired });
+      r.clock.now = NOW + 60_000;
+      const counts = await r.service.commands.recover(
+        mode === "direct" ? { harness: r.harness } : "all",
+      );
+      expect(counts.unknown).toBeGreaterThanOrEqual(1);
+      expect(counts.redispatched).toBe(0);
+      expect(lastRow(r.harness)?.["state"]).toBe("unknown");
+      expect(lastRow(r.harness)?.["outcome"]).toEqual(SUPERSEDED);
+      expect(deploymentOf(r.harness)).toMatchObject({ disabled: true, cmd: retired });
+    });
+  }
+
+  test("an enable accepted after the retire's disable is the operator's, and runs again", async () => {
+    const r = rig({ pid: 1000 });
+    await retireDisable(r);
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: CMD,
+      kind: "controls.enable",
+      acceptedAt: iso(NOW + 30_000),
+    });
+    r.clock.now = NOW + 60_000;
+    expect(await r.service.commands.recover({ harness: r.harness })).toMatchObject({
+      unknown: 0,
+    });
+    expect(stateOf(r.harness)).toBe("succeeded");
+    expect(deploymentOf(r.harness)).toMatchObject({ disabled: false, cmd: CMD });
+  });
+
+  test("a disable accepted before a recorded enable's write runs again, and the harness ends disabled", async () => {
+    const r = rig({ pid: 1000 });
+    const ledger = commandsLedgerOf(r.harness);
+    const enable = "cmd_01m76e6f05hp514w9j4v3qymka";
+    plantReceipt(ledger, {
+      id: enable,
+      kind: "controls.enable",
+      acceptedAt: iso(NOW - 120_000),
+      state: "succeeded",
+    });
+    // The enable, accepted first, recorded its block after the disable below was accepted.
+    const written = await writeOperatorRecord(r.harness, {
+      deployment: {
+        disabled: false,
+        since: iso(NOW - 30_000),
+        by: `local:#${"a".repeat(64)}`,
+        cmd: enable,
+      },
+    });
+    expect(written.ok).toBe(true);
+    plantReceipt(ledger, { id: CMD, kind: "controls.disable", acceptedAt: iso(NOW - 60_000) });
+    expect(await r.service.commands.recover({ harness: r.harness })).toMatchObject({
+      redispatched: 1,
+      unknown: 0,
+    });
+    expect(stateOf(r.harness)).toBe("succeeded");
+    expect(deploymentOf(r.harness)).toMatchObject({ disabled: true, cmd: CMD });
+  });
+
+  test("an enable on a harness with no operator record runs again", async () => {
+    const r = rig({ pid: 1000 });
+    plantReceipt(commandsLedgerOf(r.harness), {
+      id: CMD,
+      kind: "controls.enable",
+      acceptedAt: iso(NOW - 3_600_000),
+    });
+    expect(deploymentOf(r.harness)).toBeUndefined();
+    expect(await r.service.commands.recover({ harness: r.harness })).toMatchObject({
+      unknown: 0,
+    });
+    expect(stateOf(r.harness)).toBe("succeeded");
+    expect(deploymentOf(r.harness)).toMatchObject({ disabled: false, cmd: CMD });
   });
 });
 

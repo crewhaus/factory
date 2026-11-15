@@ -15,6 +15,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/ir": "workspace:*",
     "@crewhaus/migration-engine": "workspace:*",
     "@crewhaus/migration-runner": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",

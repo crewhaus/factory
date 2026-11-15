@@ -22,7 +22,11 @@ afterEach(() => {
   for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function setUp() {
+/** A cli spec whose `plugins:` entry hands notes-pane the host tool Bash. */
+const LOADS_BASH =
+  "name: concierge\ntarget: cli\nplugins:\n  - name: notes-pane\n    tools: [Bash]\n";
+
+function setUp(opts: { readonly loadsOnA?: boolean } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "plugins-grant-cmd-")));
   roots.push(root);
   const registryRoot = join(root, "registry");
@@ -35,6 +39,14 @@ function setUp() {
     specName: "concierge",
     target: "cli",
   });
+  if (opts.loadsOnA === true) writeFileSync(join(harness, "crewhaus.yaml"), LOADS_BASH);
+  const other = join(root, "other");
+  mkdirSync(other, { recursive: true });
+  const otherRow = openHangarRegistry({ root: registryRoot, env: {} }).upsert({
+    dir: other,
+    specName: "other",
+    target: "cli",
+  });
   mkdirSync(join(pluginsDir, "notes-pane"), { recursive: true });
   writeFileSync(
     join(pluginsDir, "notes-pane", "plugin.json"),
@@ -45,16 +57,16 @@ function setUp() {
         { id: "board", title: "Board", file: "board.html" },
         { id: "graph", title: "Graph", file: "graph.html" },
       ],
-      permissions: { net: ["fetch:https://api.notes.test/**"], tools: ["Read"] },
+      permissions: { net: ["fetch:https://api.notes.test/**"], tools: ["Read", "Bash"] },
       integration: { events: ["run", "decision"] },
     }),
   );
-  const opts = { env: { CREWHAUS_REGISTRY_ROOT: registryRoot, CREWHAUS_HANGAR_ROOT: hangarRoot } };
+  const env = { env: { CREWHAUS_REGISTRY_ROOT: registryRoot, CREWHAUS_HANGAR_ROOT: hangarRoot } };
   const run = (
     action: "grants" | "grant" | "revoke",
     positional: string[],
     flags: Record<string, string | boolean> = {},
-  ) => runPluginGrants(action, { positional, flags }, pluginsDir, opts);
+  ) => runPluginGrants(action, { positional, flags }, pluginsDir, env);
   const receipts = (kind: string) => {
     const fold = foldStates(workspaceCommandsLedger(hangarRoot));
     return fold.ok ? [...fold.objects.values()].filter((o) => o.record["kind"] === kind).length : 0;
@@ -63,7 +75,7 @@ function setUp() {
     const fold = foldStates(pluginGrantsLedger(hangarRoot));
     return fold.ok ? fold.records : 0;
   };
-  return { hangarRoot, harness, id: row.id, run, receipts, rows };
+  return { hangarRoot, harness, id: row.id, otherId: otherRow.id, run, receipts, rows };
 }
 
 describe("crewhaus plugins grant", () => {
@@ -181,5 +193,44 @@ describe("the plugin name grammar is one grammar", () => {
       expect(`${name}: ${TWIN_PLACEHOLDERS["{plugin}"].test(name)}`).toBe(`${name}: ${want}`);
       expect(`${name}: ${PATH_PARAMS.plugin([name])}`).toBe(`${name}: ${want}`);
     }
+  });
+});
+
+describe("a grant or revoke names each harness whose crewhaus.yaml still loads the plugin", () => {
+  const STOP =
+    "  remove notes-pane from plugins: in that crewhaus.yaml, then rebuild and restart the harness (crewhaus compile crewhaus.yaml -o dist) to stop it there";
+
+  test("a revoke names the harness and its host tools, then how to stop it, then the receipt", async () => {
+    const { id, run } = setUp({ loadsOnA: true });
+    const granted = await run("grant", ["notes-pane"], { harness: id, tools: "Bash" });
+    expect(granted.lines).toHaveLength(2);
+    expect(granted.lines[1]).toMatch(/^receipt /);
+    const revoked = await run("revoke", ["notes-pane"]);
+    expect(revoked.exitCode).toBe(0);
+    expect(revoked.lines[0]).toBe("revoked notes-pane (generation 2)");
+    expect(revoked.lines[1]).toBe(`  still loaded by harness ${id} (host tools: Bash)`);
+    expect(revoked.lines[2]).toBe(STOP);
+    expect(revoked.lines[3]).toMatch(/^receipt /);
+  });
+
+  test("a grant on another harness only names the harness that loads it", async () => {
+    const { id, otherId, run } = setUp({ loadsOnA: true });
+    await run("grant", ["notes-pane"], { harness: id, tools: "Bash" });
+    await run("revoke", ["notes-pane"]);
+    const onB = await run("grant", ["notes-pane"], { harness: otherId, tools: "Bash" });
+    expect(onB.exitCode).toBe(0);
+    expect(onB.lines.slice(1, 3)).toEqual([
+      `  still loaded by harness ${id} (host tools: Bash)`,
+      STOP,
+    ]);
+  });
+
+  test("a revoke with no harness that loads it prints no such line", async () => {
+    const { id, run } = setUp();
+    await run("grant", ["notes-pane"], { harness: id, tools: "Bash" });
+    const revoked = await run("revoke", ["notes-pane"]);
+    expect(revoked.exitCode).toBe(0);
+    expect(revoked.lines).toHaveLength(2);
+    expect(revoked.lines.some((line) => line.includes("still loaded"))).toBe(false);
   });
 });

@@ -3,7 +3,8 @@
  * the changes to them, each a workspace command. Only someone who manages access sees
  * everyone's; anyone signed in sees and ends their own tokens, links and devices. A secret
  * leaves only sealed to the key the request carried. A scoped token is minted only by a
- * service, only for runs that exist in the harness each ref names.
+ * service, only for runs that exist in a harness the service may read; a ref in any other
+ * harness is refused before that harness's records are opened.
  */
 import {
   type AccessHandle,
@@ -25,12 +26,12 @@ import {
 import { type ErrorCode, parseRef } from "@crewhaus/control-contract";
 import { foldStates, runsLedger } from "@crewhaus/control-records";
 import { outcomeOf } from "@crewhaus/control-service";
-import { readRunLedger } from "@crewhaus/harness-supervisor";
 import { PERSONAL_SELF_MESSAGE } from "../access";
 import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { fleetSnapshot } from "./lists";
 import { entryOf, liveDirOf } from "./resolve";
+import { executionRowsIn } from "./runs";
 import { acceptedAnswer, submitCommand } from "./submit";
 
 type Seal = { readonly kty: "EC"; readonly crv: "P-256"; readonly x: string; readonly y: string };
@@ -484,13 +485,7 @@ function unknownRefs(ctx: V1Context, refs: readonly string[]): string[] {
       const fold = foldStates(runsLedger(dir));
       return !(fold.ok && fold.objects.has(parsed.id));
     }
-    if (parsed.kind === "exec") {
-      try {
-        return !readRunLedger(dir).some((row) => row.runId === parsed.id);
-      } catch {
-        return true;
-      }
-    }
+    if (parsed.kind === "exec") return executionRowsIn(dir, parsed.id).length === 0;
     return true;
   });
 }
@@ -508,6 +503,23 @@ const scopedMint: V1Handler = async (ctx) => {
     });
   }
   const refs = (ctx.body["refs"] as string[] | undefined) ?? [];
+  // A ref in a harness this service cannot read is refused as the mint itself refuses an
+  // act it does not hold, before any of that harness's records are looked at.
+  const acts = ctx.body["acts"];
+  const act = Array.isArray(acts) && typeof acts[0] === "string" ? acts[0] : "these acts";
+  for (const ref of refs) {
+    const parsed = parseRef(ref);
+    if ("error" in parsed) continue;
+    const entry = entryOf(ctx.deps, parsed.scope);
+    if (entry === undefined || !ctx.access.canRead(entry.id)) {
+      throw new V1Error({
+        status: 403,
+        code: "forbidden",
+        reason: "not-held",
+        message: `This service cannot delegate ${act} on ${parsed.scope}.`,
+      });
+    }
+  }
   const missing = unknownRefs(ctx, refs);
   if (missing.length > 0) {
     throw new V1Error({

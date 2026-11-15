@@ -6,7 +6,7 @@ import { existsSync } from "node:fs";
 import type { CommandReceipt } from "@crewhaus/control-contract";
 import type { LedgerChoice } from "@crewhaus/control-service";
 import { HARNESS_ID_RE, type HangarHarnessEntry, slugOf } from "@crewhaus/harness-registry";
-import { visibleToRequest } from "../access";
+import { type Caller, isOwnerCaller, visibleToRequest } from "../access";
 import type { V1Context, V1Deps } from "./context";
 import { V1Error } from "./errors";
 
@@ -81,6 +81,18 @@ export function commandLedgerOf(
   }
   const receipt = deps.control.commands.get("workspace", cmd);
   return receipt === undefined ? undefined : { receipt, ledger: "workspace" };
+}
+
+/**
+ * Whether the caller may see a receipt found by {@link commandLedgerOf} or in one harness's
+ * ledger: a harness's receipt is seen by whoever may read that harness (it is only looked
+ * for there), and a receipt in Home's own ledger only by its own actor and by the owner.
+ * `commands.get` and `refs.resolve` both decide by it.
+ */
+export function receiptVisible(deps: V1Deps, caller: Caller, found: FoundCommand): boolean {
+  if (found.harness !== undefined) return true;
+  if (found.receipt.actor === caller.principal) return true;
+  return isOwnerCaller(caller, deps.home.signIn.snapshot());
 }
 
 /** Every registered harness the current request may read, with its live directory. */

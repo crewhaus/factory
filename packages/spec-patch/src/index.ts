@@ -50,8 +50,11 @@ import {
 // can apply the SAME redaction to strings the differ never sees (rationales,
 // free-form provenance) without duplicating the pattern table a third time.
 export {
+  CREDENTIAL_FORM_WORDS,
+  type CredentialForm,
   REDACTED_VALUE,
   carriesCredential,
+  credentialFormIn,
   isCredentialKey,
   maskCredentialTokens,
 } from "./redact";

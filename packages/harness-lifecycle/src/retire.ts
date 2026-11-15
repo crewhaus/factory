@@ -354,6 +354,9 @@ export type RunRetirementResult = {
   readonly logPath?: string;
   /** True when the live .crewhaus was removed. */
   readonly removedState: boolean;
+  /** The post-archive steps that answered `ok: false`, in run order; `[]` when every one
+   *  did its part, and on a dry run. */
+  readonly postArchiveFailures: readonly StepOutcome[];
 };
 
 /**
@@ -364,7 +367,9 @@ export type RunRetirementResult = {
  * the audit/compliance gate is overridable only with `forceUnverified`). The
  * retirement log — every step + outcome — is written+fsynced INTO the archive
  * BEFORE the destructive move (and rewritten after) so a crash mid-remove
- * still leaves the evidence and the decommission is self-evidenced. Dry runs
+ * still leaves the evidence and the decommission is self-evidenced. Every
+ * post-archive step runs; a failure after the archive is never undone, and it
+ * is reported in `postArchiveFailures` for the caller to act on. Dry runs
  * execute nothing.
  */
 export async function runRetirement(opts: RunRetirementOptions): Promise<RunRetirementResult> {
@@ -384,6 +389,7 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
         archived: false,
       },
       removedState: false,
+      postArchiveFailures: [],
     };
   }
 
@@ -519,11 +525,15 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
   }
 
   // The state is archived: disable the harness again where it lives (the archive took its
-  // operator record), then record the retirement where Home keeps it. A failure here is
-  // logged, never undone: the harness is already retired.
+  // operator record), then record the retirement where Home keeps it. Every step runs; a
+  // failure here is never undone (the state is already archived), and it is reported in
+  // the result.
+  const postArchiveFailures: StepOutcome[] = [];
   for (const name of POST_ARCHIVE_STEPS) {
     const run = steps[name];
-    if (plan.steps.includes(name) && run !== undefined) record(await run());
+    if (!plan.steps.includes(name) || run === undefined) continue;
+    const outcome = record(await run());
+    if (!outcome.ok) postArchiveFailures.push(outcome);
   }
 
   const log: RetirementLog = {
@@ -539,7 +549,7 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
   // above is the crash-safety copy; this is the final, complete record).
   writeLogDurably(logPath, log);
 
-  return { log, logPath, removedState };
+  return { log, logPath, removedState, postArchiveFailures };
 }
 
 /** Write a retirement log and fsync it to disk before returning, so a crash

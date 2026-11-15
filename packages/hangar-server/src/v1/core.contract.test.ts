@@ -5,12 +5,14 @@
  * no harness and no spec hash, is served with its harness filled in.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { openAccess, openDeviceRequests } from "@crewhaus/access-control";
 import { OPERATIONS, mintId, mintRunId } from "@crewhaus/control-contract";
 import { makeSeal } from "@crewhaus/control-contract/http";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import { casAppend, deploymentsLedger } from "@crewhaus/control-records";
 import { appendRunLedger, newRunId } from "@crewhaus/harness-supervisor";
+import { CREDENTIAL_FORM_WORDS } from "@crewhaus/spec-patch";
 import { type V1Home, v1Home } from "../__test__/v1-home";
 import {
   HOME_AREAS,
@@ -92,6 +94,74 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await home?.t.stop();
+});
+
+describe("a command ref resolves only for a caller who may see its receipt", () => {
+  test("a viewer gets the unknown-ref answer for a Home receipt it may not see; its actor, the owner and a harness reader get theirs", async () => {
+    const own = await v1Home();
+    try {
+      const x = await own.harness("refs-x");
+      const y = await own.harness("refs-y");
+      const viewer = await own.member("Vic", "viewer");
+      // A second personal token of the same member, spent on a Home-ledger command of its own.
+      const devices = openDeviceRequests(own.t.hangarRoot);
+      const start = await devices.start({ requestedFrom: { via: "home" } });
+      if (!start.ok) throw new Error(start.reason);
+      const decided = await devices.decide({
+        caller: viewer.principal,
+        code: start.userCode,
+        choice: "allow",
+      });
+      if (!decided.ok) throw new Error(decided.reason);
+      const polled = await devices.poll(start.pollRef);
+      if (!polled.ok || polled.state !== "allowed") throw new Error("no second token");
+      const selfRevoked = await own.call(
+        "POST",
+        `/api/v1/access/tokens/${polled.token.id}/revoke`,
+        { body: {}, secret: polled.secret },
+      );
+      expect(selfRevoked.status).toBeLessThan(300);
+      const viewerCmd = (selfRevoked.body["receipt"] as { id: string }).id;
+      // The owner's invite: a receipt in Home's own ledger.
+      const invited = await own.call("POST", "/api/v1/access/invites", {
+        body: { role: "viewer", scope: "home", seal: (await makeSeal()).seal },
+      });
+      expect(invited.status).toBeLessThan(300);
+      const inviteCmd = (invited.body["receipt"] as { id: string }).id;
+      // The owner's pause of x: a receipt in x's own ledger.
+      const paused = await own.call("POST", `/api/v1/harnesses/${x.id}/controls/pause`, {
+        body: { quiet: true },
+      });
+      expect(paused.status).toBeLessThan(300);
+      const pauseCmd = (paused.body["receipt"] as { id: string }).id;
+
+      const asViewer = (ref: string) =>
+        own.call("GET", `/api/v1/refs/${ref}`, { secret: viewer.secret });
+      const unknown = mintId("cmd");
+      const seen = async (ref: string) => {
+        const res = await asViewer(ref);
+        return [res.status, JSON.stringify(res.body)];
+      };
+      // Home's ledger: the owner's receipt answers as an id that never existed.
+      const unknownAtHome = await seen(`home/cmd/${unknown}`);
+      expect(unknownAtHome[0]).toBe(404);
+      expect(await seen(`home/cmd/${inviteCmd}`)).toEqual(unknownAtHome);
+      // A harness ref looks in that harness's ledger only.
+      const unknownInX = await seen(`${x.id}/cmd/${unknown}`);
+      expect(unknownInX[0]).toBe(404);
+      expect(await seen(`${x.id}/cmd/${inviteCmd}`)).toEqual(unknownInX);
+      expect(await seen(`${y.id}/cmd/${pauseCmd}`)).toEqual(await seen(`${y.id}/cmd/${unknown}`));
+      // Whoever may see it gets it.
+      expect((await own.call("GET", `/api/v1/refs/home/cmd/${inviteCmd}`)).status).toBe(200);
+      const mine = await asViewer(`home/cmd/${viewerCmd}`);
+      expect([mine.status, mine.body["kind"]]).toEqual([200, "cmd"]);
+      const inX = await asViewer(`${x.id}/cmd/${pauseCmd}`);
+      expect([inX.status, inX.body["kind"]]).toEqual([200, "cmd"]);
+      expect(schemaOf("refResolved")?.safeParse(inX.body).success).toBe(true);
+    } finally {
+      await own.t.stop();
+    }
+  }, 30_000); // a Home of its own, a member, two tokens and a dozen requests; slow on a loaded runner
 });
 
 describe("a build recorded before its harness was registered", () => {
@@ -325,5 +395,38 @@ describe("every served operation answers its row's shape", () => {
       const ways = [served.has(op.id), op.id in V1_NOT_SERVED, SIGN_IN_OPERATIONS.includes(op.id)];
       expect(`${op.id} ${ways.filter(Boolean).length}`).toBe(`${op.id} 1`);
     }
+  });
+});
+
+describe("a standing rule made from a call that carries a credential", () => {
+  test("is refused with the form it takes, and the answer holds no value", async () => {
+    // Built at run time from random parts: no credential-shaped literal sits in the source.
+    const secret = randomBytes(6).toString("hex");
+    const command = `curl -u admin:${secret} https://x.test`;
+    const id = "appr_00000000000000c1";
+    const beta = await home.harness("beta", {
+      specName: "beta",
+      approvals: [
+        {
+          id,
+          toolName: "Bash",
+          inputHash: "hash-beta",
+          input: { command },
+          runId: "run_00000000000000c0",
+          sessionId: "sess_00000000000000cc",
+          surface: "daemon",
+          createdAt: STAMP,
+        },
+      ],
+    });
+    const res = await home.call("POST", `/api/v1/harnesses/${beta.id}/standing-rules`, {
+      body: { tool: "Bash", pattern: `Bash(${command})`, derivedFrom: id, reason: "other" },
+    });
+    expect(res.status).toBe(422);
+    const error = res.body["error"] as { reason?: string; message?: string };
+    expect(error.reason).toBe("carries-credential");
+    expect(String(error.message)).toContain(CREDENTIAL_FORM_WORDS["user-password"]);
+    expect(JSON.stringify(res.body).includes(secret)).toBe(false);
+    expect(schemaOf("errorEnvelope")?.safeParse(res.body).success).toBe(true);
   });
 });

@@ -50,7 +50,14 @@ import {
 } from "../dom.js";
 import { conflictView } from "../ui/conflict.js";
 import { confirmAction, openDialog } from "../ui/dialog.js";
-import { CLEAR, fieldEdit, formModel, issuesByField, maskedMarkerOf } from "../ui/schema-form.js";
+import {
+  CLEAR,
+  fieldEdit,
+  flatten,
+  formModel,
+  issuesByField,
+  maskedMarkerOf,
+} from "../ui/schema-form.js";
 import { call } from "../v1.js";
 
 // ---------------------------------------------------------------------------
@@ -212,6 +219,62 @@ export function reportWrite(res, okMessage, conflict = null) {
 }
 
 const nonEmpty = (v) => (typeof v === "string" && v !== "" ? v : null);
+
+const REDACTED = "[redacted]";
+
+/**
+ * The text of a refused edit (one edit, or a list) that "Download my draft" saves,
+ * with every value whose setting `concealedAt(segments)` holds hidden as
+ * `[redacted]`: the edit's own path, and each key nested in an object or list value
+ * by its full path. With no `concealedAt`, every value is hidden.
+ */
+export function draftOf(edits, concealedAt) {
+  const hides = typeof concealedAt === "function" ? concealedAt : () => true;
+  const hideIn = (value, segments, depth) => {
+    if (hides(segments)) return REDACTED;
+    if (depth > 64 || typeof value !== "object" || value === null) return value;
+    if (Array.isArray(value)) {
+      return value.map((item, i) => hideIn(item, [...segments, String(i)], depth + 1));
+    }
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      Object.defineProperty(out, key, {
+        value: hideIn(item, [...segments, key], depth + 1),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+    return out;
+  };
+  const one = (edit) => {
+    if (typeof edit !== "object" || edit === null || !Object.hasOwn(edit, "value")) return edit;
+    const path = Array.isArray(edit.path) ? edit.path.map(String) : [];
+    return { ...edit, value: hideIn(edit.value, path, 0) };
+  };
+  return JSON.stringify(Array.isArray(edits) ? edits.map(one) : one(edits), null, 2);
+}
+
+/**
+ * The editor's test for a setting it keeps nothing of: a path with a segment in
+ * `credentialNames`, or at or under a write-only or concealed setting of `model`
+ * (a group counts through its own settings, so its other settings stay readable).
+ */
+export function concealedPredicate(model, credentialNames) {
+  const names = new Set(Array.isArray(credentialNames) ? credentialNames.map(String) : []);
+  const roots = flatten(model?.groups)
+    .filter((node) => node?.kind !== "group")
+    .filter((node) => node?.writeOnly === true || node?.concealed === true)
+    .map((node) => (Array.isArray(node.segments) ? node.segments.map(String) : []))
+    .filter((segments) => segments.length > 0);
+  return (segments) => {
+    const path = Array.isArray(segments) ? segments.map(String) : [];
+    if (path.some((seg) => names.has(seg))) return true;
+    return roots.some(
+      (root) => root.length <= path.length && root.every((seg, i) => path[i] === seg),
+    );
+  };
+}
 
 /**
  * The text "Download my draft" saves: the caller's own copy of the refused
@@ -629,7 +692,9 @@ export function settingsCard(ctx, body, trust, live, reload) {
   const trustRows = Array.isArray(trust?.paths) ? trust.paths : [];
   const model = formModel(body.schema, body.effective, trustRows, {
     truncated: body.effectiveTruncated === true,
+    credentialNames: body.credentialNames,
   });
+  const concealedAt = concealedPredicate(model, body.credentialNames);
   const prefix = `sf${++formSeq}`;
   const fields = new Map();
   let seq = 0;
@@ -738,10 +803,12 @@ export function settingsCard(ctx, body, trust, live, reload) {
       valueDialog(ctx, {
         path: node.segments.join("."),
         segments: node.segments,
-        // Never a masked read: a node holding a hidden value starts empty and names it.
-        value: node.writeOnly === true ? undefined : node.paneSeed,
+        // Never a masked read: a node holding a hidden value, or a credential's, starts
+        // empty and names it.
+        value: node.writeOnly === true || node.concealed === true ? undefined : node.paneSeed,
         hidden: node.writeOnly === true && Array.isArray(node.hidden) ? node.hidden : [],
         pathEditable: false,
+        concealedAt,
         reload,
         live,
         opener: open,
@@ -788,7 +855,7 @@ export function settingsCard(ctx, body, trust, live, reload) {
       }
       const conflict = {
         opener,
-        draft: JSON.stringify(edit, null, 2),
+        draft: draftOf(edit, concealedAt),
         retry: (rev) => api.specPatch({ id: ctx.id }, { edit, expectedRev: rev }),
         reload: useDisk,
         done: saved,
@@ -803,6 +870,7 @@ export function settingsCard(ctx, body, trust, live, reload) {
       live,
       opener,
       form,
+      concealedAt,
       reload: useDisk,
       done: saved,
     });
@@ -815,19 +883,22 @@ export function settingsCard(ctx, body, trust, live, reload) {
     const helpId = node.help !== null || node.writeOnly ? `${id}-help` : "";
     const slot = el("p", { class: "field-issue", id: `${id}-issue`, hidden: true });
     const draftAt = unsavedKey(ctx, node);
-    // A typed replacement for a hidden value lives only in its control: it is never kept.
-    const secretText =
-      node.writeOnly === true && !["boolean", "select", "list"].includes(node.kind);
-    if (secretText) unsaved.delete(draftAt);
-    const kept = secretText ? undefined : keptValue(ctx, node);
-    const current = kept !== undefined ? kept : node.writeOnly ? undefined : node.seed;
+    // A value typed into a hidden or credential's setting, of any kind, lives only in
+    // its control: it is never kept, and the control starts empty.
+    const keepsNothing = node.writeOnly === true || node.concealed === true;
+    const secretText = keepsNothing && !["boolean", "select", "list"].includes(node.kind);
+    if (keepsNothing) unsaved.delete(draftAt);
+    const kept = keepsNothing ? undefined : keptValue(ctx, node);
+    const current = kept !== undefined ? kept : keepsNothing ? undefined : node.seed;
     const unsavedNote = el("p", {
       class: "muted field-unsaved",
       text: "Not saved yet.",
       hidden: kept === undefined,
     });
     const remember = (value) => {
-      unsaved.set(draftAt, { value, seed: seedMark(node), segments: node.segments.map(String) });
+      if (!keepsNothing) {
+        unsaved.set(draftAt, { value, seed: seedMark(node), segments: node.segments.map(String) });
+      }
       unsavedNote.hidden = false;
     };
     let input = null;
@@ -1104,6 +1175,7 @@ export function settingsCard(ctx, body, trust, live, reload) {
       live,
       opener: addBlock,
       form,
+      concealedAt,
     });
   });
 
@@ -1251,7 +1323,10 @@ function listEditor(node, id, labelId, initial, live, remember) {
  * any other takes the spec's name, typed. An issue the preview finds is placed
  * beside its field instead.
  */
-async function reviewAndApply(ctx, { edits, label, okMessage, live, opener, form, reload, done }) {
+async function reviewAndApply(
+  ctx,
+  { edits, label, okMessage, live, opener, form, concealedAt, reload, done },
+) {
   const preview = await api.specDiff({ id: ctx.id }, { edits });
   if (!preview?.ok) {
     toast(preview?.body?.error ?? `HTTP ${preview?.status ?? "?"}`);
@@ -1294,6 +1369,7 @@ async function reviewAndApply(ctx, { edits, label, okMessage, live, opener, form
         okMessage,
         opener,
         form,
+        concealedAt,
         reload,
         done,
       });
@@ -1304,11 +1380,13 @@ async function reviewAndApply(ctx, { edits, label, okMessage, live, opener, form
 /**
  * Apply a reviewed batch with `specEdit`, against the revision its preview read.
  * A 412 opens the conflict view: an untyped batch may be sent again as it was,
- * a typed one asks for the name again over a fresh diff.
+ * a typed one asks for the name again over a fresh diff. Its draft hides every
+ * value `concealedAt` holds to be a credential's or a hidden setting's (every
+ * value, when it is absent).
  */
 async function applyEdits(
   ctx,
-  { edits, confirmName, expectedRev, label, okMessage, opener, form, reload, done },
+  { edits, confirmName, expectedRev, label, okMessage, opener, form, concealedAt, reload, done },
 ) {
   const typed = typeof confirmName === "string";
   const wrote = await api.specEdit(
@@ -1321,7 +1399,7 @@ async function applyEdits(
     return wrote;
   }
   const conflict = {
-    draft: JSON.stringify(edits, null, 2),
+    draft: draftOf(edits, concealedAt),
     // The re-read goes back to the control that wrote, never to the page.
     reload: () => reload(focusOf(opener)),
     done,
@@ -1410,7 +1488,7 @@ export function editsFor(path, text) {
  */
 function valueDialog(
   ctx,
-  { path, segments, value, hidden = [], pathEditable, reload, live, opener, form },
+  { path, segments, value, hidden = [], pathEditable, reload, live, opener, form, concealedAt },
 ) {
   let dialog = null;
   // The form behind a modal cannot take focus: close the pane, then place the issues.
@@ -1503,6 +1581,7 @@ function valueDialog(
         okMessage: `Applied ${target}. It is not active until the harness is rebuilt.`,
         opener,
         form: formBehind,
+        concealedAt,
         reload,
         done: () => {
           if (dialog !== null) dialog.close();

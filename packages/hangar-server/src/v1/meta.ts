@@ -28,12 +28,19 @@ import {
   readStandingRules,
   runsLedger,
 } from "@crewhaus/control-records";
-import { readRunLedger } from "@crewhaus/harness-supervisor";
 import { specRevision } from "@crewhaus/ir/policy";
 import { foldApprovals } from "../approvals";
 import type { RefResolver, V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
-import { commandLedgerOf, entryOf, liveDirOf, visibleHarnesses } from "./resolve";
+import {
+  type FoundCommand,
+  commandLedgerOf,
+  entryOf,
+  liveDirOf,
+  receiptVisible,
+  visibleHarnesses,
+} from "./resolve";
+import { executionRowsIn } from "./runs";
 
 /** The operation table as discovery publishes it: data, never a handler. */
 function discoveryOperations() {
@@ -219,12 +226,7 @@ const resolveRun: RefResolver = async (ctx, ref) => {
 
 const resolveExec: RefResolver = async (ctx, ref) => {
   const { dir } = harnessDirOf(ctx, ref.scope);
-  let rows = 0;
-  try {
-    rows = readRunLedger(dir).filter((entry) => entry.runId === ref.id).length;
-  } catch {
-    rows = 0;
-  }
+  const rows = executionRowsIn(dir, ref.id).length;
   if (rows === 0) throw notFound("run");
   return {
     status: 200,
@@ -298,9 +300,15 @@ const resolveRule: RefResolver = async (ctx, ref) => {
   };
 };
 
+/**
+ * A command receipt: `home/cmd/<id>` wherever Home keeps it, `<hrn>/cmd/<id>` in that
+ * harness's own ledger only. A receipt the caller may not see answers as an unknown one.
+ */
 const resolveCommand: RefResolver = async (ctx, ref) => {
-  const found = commandLedgerOf(ctx.deps, ref.id, ref.scope === "home" ? undefined : ref.scope);
-  if (found === undefined) throw notFound("command");
+  const found = commandIn(ctx, ref);
+  if (found === undefined || !receiptVisible(ctx.deps, ctx.access.caller, found)) {
+    throw notFound("command");
+  }
   return {
     status: 200,
     body: {
@@ -339,6 +347,16 @@ const resolvePrincipal: RefResolver = async (ctx, ref) => {
   };
 };
 
+function commandIn(
+  ctx: V1Context,
+  ref: { readonly scope: string; readonly id: string },
+): FoundCommand | undefined {
+  if (ref.scope === "home") return commandLedgerOf(ctx.deps, ref.id);
+  const { id, dir } = harnessDirOf(ctx, ref.scope);
+  const receipt = ctx.deps.control.commands.get({ harness: dir }, ref.id);
+  return receipt === undefined ? undefined : { receipt, ledger: { harness: dir }, harness: id };
+}
+
 /** The core's ref resolvers, by kind. */
 export const CORE_REF_RESOLVERS: Readonly<Record<string, RefResolver>> = {
   harness: resolveHarness,
@@ -359,7 +377,7 @@ function bareRunCandidates(dir: string, harness: string, id: string) {
     out.push({ kind, ref, href: `/#/i/${ref}` });
   };
   if (existsSync(join(dir, ".crewhaus", "run", "logs", `${id}.log`))) at("exec");
-  else if (readRunLedgerSafe(dir).some((entry) => entry.runId === id)) at("exec");
+  else if (executionRowsIn(dir, id).length > 0) at("exec");
   const evals = join(dir, ".crewhaus", "evals");
   if (existsSync(evals) && readdirSafe(evals).some((name) => name.startsWith(id))) at("evalrun");
   if (existsSync(join(dir, ".crewhaus", "research", id))) {
@@ -370,14 +388,6 @@ function bareRunCandidates(dir: string, harness: string, id: string) {
     });
   }
   return out;
-}
-
-function readRunLedgerSafe(dir: string) {
-  try {
-    return readRunLedger(dir);
-  } catch {
-    return [];
-  }
 }
 
 function readdirSafe(dir: string): string[] {

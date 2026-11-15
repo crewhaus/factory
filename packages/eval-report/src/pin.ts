@@ -79,8 +79,9 @@ export type PinOptions = {
   readonly receipt?: string;
   /**
    * Pin only a run measured verifiably like the pin it replaces: an instrument
-   * field that differs, or is recorded on one side only, refuses the pin
-   * (`reanchor`, {@link sameInstrumentRefusal}), and the file is untouched.
+   * field that differs, or is recorded on one side only, refuses the pin, and so
+   * does a graders config (`gradersHash`) recorded on neither side (`reanchor`,
+   * {@link sameInstrumentRefusal}); the file is untouched.
    */
   readonly sameInstrumentOnly?: boolean;
   /**
@@ -237,7 +238,8 @@ export function manualRebaseline(
 
 /**
  * Why a caller that pins only same-instrument runs refuses this one: every field
- * {@link instrumentChanges} reports, a field recorded on one side only named as such.
+ * {@link instrumentChanges} reports, a field recorded on one side only named as such,
+ * and `gradersHash, not recorded` when neither side records a graders config.
  */
 export function reanchorRefusal(
   entry: RunIndexEntry,
@@ -247,6 +249,13 @@ export function reanchorRefusal(
   const named = changed.map((c) =>
     c.unverified === true ? `${c.field}, recorded on one side only` : c.field,
   );
+  if (
+    replaced !== undefined &&
+    replaced.gradersHash === undefined &&
+    entry.gradersHash === undefined
+  ) {
+    named.push("gradersHash, not recorded");
+  }
   return {
     code: "reanchor",
     reason: `run ${entry.runId} was measured differently from the pinned run ${replaced?.runId ?? "(none)"}${named.length > 0 ? ` (${named.join("; ")})` : ""} — moving the baseline onto it is a re-anchor, which a person makes: \`crewhaus eval --rebaseline --reason <code>\``,
@@ -258,13 +267,17 @@ export function reanchorRefusal(
  * verifiably like the pinned one may replace it: `undefined` when nothing is
  * replaced or it is the same run, else a `reanchor` refusal when any instrument
  * field differs or is recorded on one side only ({@link instrumentChanges},
- * unverified fields included).
+ * unverified fields included), or when the graders config (`gradersHash`) is
+ * recorded on neither side: a match is verified only on what both sides record.
  */
 export function sameInstrumentRefusal(
   entry: RunIndexEntry,
   replaced: BaselineEntry | undefined,
 ): PinRefusal | undefined {
   if (replaced === undefined || replaced.runId === entry.runId) return undefined;
+  if (replaced.gradersHash === undefined || entry.gradersHash === undefined) {
+    return reanchorRefusal(entry, replaced);
+  }
   return instrumentChanges(replaced, entry).length > 0
     ? reanchorRefusal(entry, replaced)
     : undefined;

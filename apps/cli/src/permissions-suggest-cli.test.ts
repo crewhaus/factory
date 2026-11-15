@@ -312,3 +312,31 @@ describe("crewhaus permissions suggest, screening each recorded call", () => {
     expect(text.stdout.includes(token)).toBe(false);
   }, 30_000);
 });
+
+describe("crewhaus permissions suggest, over a settings rule that holds a credential", () => {
+  test("the rule is shown by its tool name only, and the settings file is untouched", async () => {
+    // Built at runtime from parts, so no credential-shaped literal is committed.
+    const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+    const pattern = `Bash(curl -H "Authorization: Bearer ${token}" https://x.test)`;
+    seed([{ name: "Write", input: { path: "out/report.md", content: "x" } }]);
+    const settings = join(cwd, ".crewhaus", "settings.json");
+    const body = `${JSON.stringify({ permissions: { rules: [{ type: "alwaysAllow", pattern }] } }, null, 2)}\n`;
+    writeFileSync(settings, body);
+
+    const json = await suggest(true);
+    expect(json.exitCode).toBe(0);
+    expect(json.stdout.includes(token)).toBe(false);
+    const out = JSON.parse(json.stdout) as {
+      diff: { additions: unknown[]; merged: unknown; withheldRules?: number };
+    };
+    expect(out.diff.merged).toBeNull();
+    expect(out.diff.withheldRules).toBe(1);
+    expect(out.diff.additions).toEqual([{ type: "alwaysAllow", pattern: "Write(out/report.md)" }]);
+
+    const text = await suggest(false);
+    expect(text.exitCode).toBe(0);
+    expect(text.stdout.includes(token)).toBe(false);
+    expect(text.stdout).toContain("    alwaysAllow Bash(… holds a credential)");
+    expect(readFileSync(settings, "utf8")).toBe(body);
+  }, 30_000);
+});

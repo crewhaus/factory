@@ -283,6 +283,7 @@ export {
   caughtUpModel,
   directFold,
   harnessOfTarget,
+  harnessApprovalsSource,
   harnessesOfRun,
   nudge,
   nudgeFromReceipt,

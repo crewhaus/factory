@@ -73,8 +73,9 @@ import { type SessionEvents, payloadOf } from "./advise-rules";
  *   covers, and a proposal never writes one;
  * - `varied` — the calls acted on different places;
  * - `carries-credential` — `carriesCredential` (`@crewhaus/spec-patch`)
- *   flags a recorded call's value, so no sample, rule or report holds it. A
- *   tool with this reason gets no `alwaysAllow` proposal at all
+ *   flags any operative value of a recorded call, read before any narrowing,
+ *   so no sample, rule or report holds it. A tool with this reason gets no
+ *   `alwaysAllow` proposal at all, neither scoped nor for the whole tool
  *   ({@link skippedSuggestions} names it);
  * - `holds-control` — a recorded call's operative value holds a control,
  *   bidirectional-text or other invisible character (a multi-line command's
@@ -160,12 +161,19 @@ const unscoped = (reason: UnscopedReason): CallReading => ({ kind: "unscoped", r
  * as it always has. The value and the rule it proposes come from
  * permission-engine's `narrowPatternFor`, the one derivation the decision
  * service's standing rules use too.
+ *
+ * Every operative value the call carries is screened for a credential first,
+ * before any narrowing or refusal (for an undeclared tool, every top-level
+ * string of its input): a call that carries one is `carries-credential`,
+ * whatever else its reading would answer.
  */
 function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup): CallReading {
   const info = lookup?.(toolName);
   const declared = info?.operativeArgs;
   if (declared === undefined) {
-    if (undeclaredValueHoldsControl(toolName, input)) return unscoped("holds-control");
+    if (topLevelStrings(input).some(carriesCredential)) return unscoped("carries-credential");
+    const value = undeclaredValueOf(toolName, input);
+    if (value !== undefined && holdsDisplayControl(value)) return unscoped("holds-control");
     return readingOf(narrowPatternFor(toolName, input, undefined));
   }
   if (declared.length === 0) return unscoped("no-scoping-argument");
@@ -175,44 +183,92 @@ function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup):
       info.tool,
       withoutInjectedJustification(info.tool, input),
     );
-    if (!subject.ok) return unscoped("not-parsed");
+    if (!subject.ok) {
+      if (callCarriesCredential(declared, undefined, input)) return unscoped("carries-credential");
+      return unscoped("not-parsed");
+    }
     // An API the call leaves out is read from the tool_config the harness
     // ran with, which neither the log nor this process has: the value read
     // here would name an API the call may never have reached.
     const parsed = subject.input as Record<string, unknown> | null;
     if (declared.some((a) => isApiRootArg(a) && parsed?.[a.field] === undefined)) {
+      if (callCarriesCredential(declared, subject.operativeValues, input)) {
+        return unscoped("carries-credential");
+      }
       return unscoped("no-value");
     }
     values = subject.operativeValues ?? [];
   } else {
     values = operativeValuesOf(declared, input) ?? [];
   }
+  if (callCarriesCredential(declared, values, input)) return unscoped("carries-credential");
   if (values.some((v) => v.canonical.some(holdsDisplayControl))) return unscoped("holds-control");
   return readingOf(narrowPatternFor(toolName, input, values));
 }
 
 /**
- * Whether the value the matcher's name table reads for an undeclared tool
- * (its first non-empty operative field, as `narrowPatternFor` reads it)
- * holds a control, bidirectional-text or other invisible character.
+ * Whether a recorded call of a declared tool carries a credential in any value a
+ * rule is read against: every `canonical` and `spellings` entry of every
+ * operative value (`restrictOnly` ones too), and each declared field's own string
+ * in the input as recorded (each string of an array field), since a canonical
+ * form can leave part of a value out. `values` absent reads them from the input
+ * as recorded.
  */
-function undeclaredValueHoldsControl(toolName: string, input: unknown): boolean {
-  const fields = Object.hasOwn(MATCHER_OPERATIVE_ARG_FIELDS, toolName)
-    ? MATCHER_OPERATIVE_ARG_FIELDS[toolName]
-    : undefined;
-  if (fields === undefined || input === null || typeof input !== "object") return false;
+function callCarriesCredential(
+  declared: ReadonlyArray<OperativeArg>,
+  values: ReadonlyArray<OperativeValue> | undefined,
+  input: unknown,
+): boolean {
+  const read = values ?? operativeValuesOf(declared, input) ?? [];
+  for (const v of read) {
+    if (v.canonical.some(carriesCredential)) return true;
+    if ((v.spellings ?? []).some(carriesCredential)) return true;
+  }
+  if (input === null || typeof input !== "object") return false;
   const record = input as Record<string, unknown>;
-  for (const field of fields) {
-    const value = record[field];
-    if (typeof value === "string" && value.length > 0) return holdsDisplayControl(value);
+  for (const arg of declared) {
+    const raw = Object.hasOwn(record, arg.field) ? record[arg.field] : undefined;
+    const strings = Array.isArray(raw) ? raw : [raw];
+    for (const s of strings) if (typeof s === "string" && carriesCredential(s)) return true;
   }
   return false;
 }
 
 /**
+ * Every top-level string of an undeclared tool's input as recorded, and each string
+ * of a top-level array: the value the matcher's name table reads is among them, and
+ * a tool neither declared nor in that table is read by all of them.
+ */
+function topLevelStrings(input: unknown): string[] {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return [];
+  const out: string[] = [];
+  for (const field of Object.keys(input)) {
+    const raw = (input as Record<string, unknown>)[field];
+    for (const s of Array.isArray(raw) ? raw : [raw]) if (typeof s === "string") out.push(s);
+  }
+  return out;
+}
+
+/**
+ * The value the matcher's name table reads for an undeclared tool: its first
+ * non-empty operative field, as `narrowPatternFor` reads it.
+ */
+function undeclaredValueOf(toolName: string, input: unknown): string | undefined {
+  const fields = Object.hasOwn(MATCHER_OPERATIVE_ARG_FIELDS, toolName)
+    ? MATCHER_OPERATIVE_ARG_FIELDS[toolName]
+    : undefined;
+  if (fields === undefined || input === null || typeof input !== "object") return undefined;
+  const record = input as Record<string, unknown>;
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+/**
  * The longest rule value a proposal names, in characters: far longer than
- * any rule a person reviews. A longer value is `not-representable`, and the
- * credential screen never runs on it.
+ * any rule a person reviews. A longer value is `not-representable`.
  */
 export const MAX_RULE_VALUE_LENGTH = 8192;
 
@@ -660,10 +716,19 @@ export function formatSuggestionLines(suggestions: ReadonlyArray<PermissionSugge
   return lines;
 }
 
+/** A tool name as a withheld rule's line shows it. */
+const SHOWN_TOOL_NAME_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
+
 /**
  * A unified-diff-ish view of the settings.json permissions change: existing
  * rules as context, additions as `+` lines. Purely for human review — this
  * is NOT applied unless the user confirms `--apply` interactively.
+ *
+ * A rule whose pattern `carriesCredential` flags is shown by its type and tool
+ * name only, `<type> <Tool>(… holds a credential)`, or by its type alone,
+ * `<type> (… holds a credential)`, when the text before its argument is not a
+ * plain tool name or holds a credential itself: its pattern is never printed.
+ * `--apply` keeps it in the file as it is.
  */
 export function formatSettingsDiff(diff: PermissionsDiff): string[] {
   const lines: string[] = [".crewhaus/settings.json → permissions.rules:"];
@@ -674,6 +739,16 @@ export function formatSettingsDiff(diff: PermissionsDiff): string[] {
   const addKeys = new Set(diff.additions.map((r) => `${r.type} ${r.pattern}`));
   for (const r of diff.merged) {
     const isNew = addKeys.has(`${r.type} ${r.pattern}`);
+    if (carriesCredential(r.pattern)) {
+      const open = r.pattern.indexOf("(");
+      const tool = open === -1 ? "" : r.pattern.slice(0, open);
+      lines.push(
+        SHOWN_TOOL_NAME_RE.test(tool) && !carriesCredential(tool)
+          ? `  ${isNew ? "+" : " "} ${r.type} ${tool}(… holds a credential)`
+          : `  ${isNew ? "+" : " "} ${r.type} (… holds a credential)`,
+      );
+      continue;
+    }
     // Flag any UNESCAPED wildcard still present — such a rule matches multiple
     // values (an existing hand-authored broad rule or, defensively, a
     // suggestion that somehow kept a wildcard). Suggested rules escape their
@@ -693,6 +768,38 @@ export function formatSettingsDiff(diff: PermissionsDiff): string[] {
     lines.push("  (all suggestions already present — nothing to add)");
   }
   return lines;
+}
+
+/**
+ * {@link PermissionsDiff} as it is shown or returned: `merged` is `null`, with
+ * `withheldRules` counting them, when any rule in it holds a credential
+ * (`carriesCredential` flags its pattern). It is a view, never a source for a
+ * write: `--apply` writes the {@link PermissionsDiff}'s own `merged`.
+ */
+export type PermissionsDiffView = {
+  readonly additions: ReadonlyArray<SettingsPermissionRule>;
+  readonly alreadyPresent: ReadonlyArray<SettingsPermissionRule>;
+  readonly merged: ReadonlyArray<SettingsPermissionRule> | null;
+  /** How many rules in `merged` hold a credential; present only when `merged` is `null`. */
+  readonly withheldRules?: number;
+};
+
+/**
+ * The view of a diff that holds no credential: the diff itself when no rule in
+ * `merged` holds one, otherwise `merged: null` and the count of those rules.
+ * `additions` and `alreadyPresent` come from screened suggestions and pass through.
+ */
+export function diffForDisplay(diff: PermissionsDiff): PermissionsDiffView {
+  const withheld = diff.merged.filter((r) => carriesCredential(r.pattern)).length;
+  if (withheld === 0) {
+    return { additions: diff.additions, alreadyPresent: diff.alreadyPresent, merged: diff.merged };
+  }
+  return {
+    additions: diff.additions,
+    alreadyPresent: diff.alreadyPresent,
+    merged: null,
+    withheldRules: withheld,
+  };
 }
 
 /**

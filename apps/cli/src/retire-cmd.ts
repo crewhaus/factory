@@ -255,6 +255,18 @@ export async function retireCommand(o: RetireCommandOptions): Promise<DaemonComm
             );
           }
         }
+        // Retire is done only when every step after the archive did its part.
+        if (result.postArchiveFailures.length > 0) {
+          if (result.postArchiveFailures.some((f) => f.step === "keepDisabled")) {
+            lines.push(
+              `  It is archived, but not disabled where it lives: run \`crewhaus daemon disable\` in ${o.harnessDir}.`,
+            );
+          }
+          return {
+            settle: { state: "failed", effects: effects.ordered, outcome: outcomeOf("internal") },
+            value: { lines, exitCode: 1 },
+          };
+        }
         return {
           settle: { state: "succeeded", effects: effects.ordered },
           value: { lines, exitCode: 0 },

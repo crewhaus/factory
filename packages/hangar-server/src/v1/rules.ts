@@ -16,6 +16,7 @@ import {
   standingPatternFor,
   widenedPatternProblem,
 } from "@crewhaus/control-service";
+import { CREDENTIAL_FORM_WORDS } from "@crewhaus/spec-patch";
 import { foldApprovals } from "../approvals";
 import { resolveSessionRoot } from "../sessions";
 import type { V1Context, V1Handler } from "./context";
@@ -109,7 +110,10 @@ const create: V1Handler = async (ctx) => {
       status: 422,
       code: "invalid",
       reason: narrow.refused,
-      message: "No standing rule can name this call.",
+      message:
+        "form" in narrow
+          ? `No standing rule can name this call: it holds ${CREDENTIAL_FORM_WORDS[narrow.form]}.`
+          : "No standing rule can name this call.",
     });
   }
   if ("pattern" in narrow && narrow.pattern !== pattern) {

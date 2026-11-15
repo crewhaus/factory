@@ -35,7 +35,10 @@ import { NEWEST_FOLD_LINES } from "./runs";
 let home: V1Home;
 
 beforeAll(async () => {
-  home = await v1Home();
+  // Its fake jobs never exit, so the default caps would fill; the cap tests boot their own.
+  home = await v1Home({
+    apiRunLimits: { perHome: Number.MAX_SAFE_INTEGER, perHarness: Number.MAX_SAFE_INTEGER },
+  });
 }, 60_000);
 
 afterAll(async () => {
@@ -910,6 +913,58 @@ describe("Home holds a bounded number of API runs at once", () => {
         }
       }
       expect(statuses).toEqual([202, 202, 503]);
+    } finally {
+      await own.t.stop();
+    }
+  }, 30_000); // boots a Home of its own
+
+  test("a queued run cancelled while it waits for its turn gives up its place at once and runs no hook", async () => {
+    const own = await v1Home({ apiRunLimits: { perHarness: 2 } });
+    try {
+      const h = await own.harness("cancel-in-chain");
+      const bin = join(h.dir, "node_modules", ".bin");
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(join(bin, "crewhaus"), "#!/bin/sh\nexit 0\n");
+      chmodSync(join(bin, "crewhaus"), 0o755);
+      hookOf(h.dir, ["/usr/bin/false"]);
+      const create = () =>
+        own.call("POST", `/api/v1/harnesses/${h.id}/runs`, { body: { input: "x" } });
+      const hooks = () => (own.t.ops?.children ?? []).filter(isHook);
+      // The first start's hook holds the harness's turn; the second waits behind it.
+      const first = create();
+      const firstHook = await childWhere(own, 0, isHook);
+      const waiting = create();
+      let waitingRun: string | undefined;
+      for (let tick = 0; tick < 5000 && waitingRun === undefined; tick += 1) {
+        const ids = [...new Set(rowsOf(h.dir).map((row) => String(row["id"])))];
+        if (ids.length === 2) waitingRun = ids[1];
+        else await Bun.sleep(0);
+      }
+      if (waitingRun === undefined) throw new Error("the second run was never queued");
+      const cancelled = await own.call("POST", `/api/v1/runs/${waitingRun}/cancel`, { body: {} });
+      expect(cancelled.status).toBeLessThan(300);
+      // Its place is free while the first hook still runs: a third create is admitted.
+      const third = create();
+      let admitted = false;
+      for (let tick = 0; tick < 5000 && !admitted; tick += 1) {
+        admitted = new Set(rowsOf(h.dir).map((row) => String(row["id"]))).size === 3;
+        if (!admitted) await Bun.sleep(0);
+      }
+      expect(admitted).toBe(true);
+      expect(hooks()).toEqual([firstHook]);
+      firstHook.exit(0);
+      expect((await first).status).toBe(202);
+      expect((await waiting).status).toBe(503);
+      const thirdHook = await childWhere(
+        own,
+        own.t.ops?.children.indexOf(firstHook) ?? 0,
+        (c) => isHook(c) && c !== firstHook,
+      );
+      thirdHook.exit(0);
+      expect((await third).status).toBe(202);
+      // Two hooks ran, the first's and the third's: none for the cancelled run.
+      expect(hooks()).toHaveLength(2);
+      expect((own.t.ops?.children ?? []).filter(isJob)).toHaveLength(2);
     } finally {
       await own.t.stop();
     }
