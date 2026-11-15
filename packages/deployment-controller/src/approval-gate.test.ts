@@ -489,6 +489,24 @@ describe("evaluateProtectedEnvGate", () => {
     expect(answer.protected && answer.input.specHash).toBe(H);
   });
 
+  test("the PR reader is asked once, with the candidate's resolved specHash", async () => {
+    writeEnvConfig({ environments: { prod: { requireApproval: true } } });
+    const seen: unknown[][] = [];
+    const answer = await evaluateProtectedEnvGate({
+      harnessRoot: root,
+      specName: "c",
+      toEnv: "prod",
+      toVersion: "v1",
+      specHash: async () => H,
+      prCheck: (...args: unknown[]) => {
+        seen.push(args);
+        return { conclusion: "success" };
+      },
+    });
+    expect(seen).toEqual([[H]]);
+    expect(answer.protected && answer.input.prCheck?.conclusion).toBe("success");
+  });
+
   test("requireApproval protects an environment the config does not name", async () => {
     const answer = await evaluateProtectedEnvGate({
       harnessRoot: root,
