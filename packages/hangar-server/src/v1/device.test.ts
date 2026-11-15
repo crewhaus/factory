@@ -4,6 +4,7 @@
  * collects a personal token, sealed to that poll's key, that signs in as that member.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { DEVICE_LIMITS, isLoopbackAddress, openDeviceRequests } from "@crewhaus/access-control";
 import { makeSeal } from "@crewhaus/control-contract/http";
 import { type V1Home, v1Home } from "../__test__/v1-home";
 
@@ -56,6 +57,11 @@ describe("a device signs in with a short code", () => {
       clientName: "laptop",
       tokenDays: 90,
     });
+    // Where it came from is what Home saw on its own listener, and when it arrived.
+    const from = looked.body["requestedFrom"] as { via?: string; address?: string };
+    expect(from.via).toBe("direct");
+    expect(isLoopbackAddress(from.address)).toBe(true);
+    expect(Number.isNaN(Date.parse(String(looked.body["createdAt"])))).toBe(false);
     const pending = await poll(s.pollRef);
     expect(pending.res.body).toEqual({ state: "pending" });
     const allowed = await home.call("POST", "/api/v1/access/device-requests/decide", {
@@ -90,4 +96,51 @@ describe("a device signs in with a short code", () => {
     expect(refused.status).toBe(403);
     expect((refused.body["error"] as Record<string, unknown>)["reason"]).toBe("session_required");
   });
+});
+
+describe("a device's name", () => {
+  test("is refused with a bidi or invisible character, and nothing is recorded", async () => {
+    const before = openDeviceRequests(home.t.hangarRoot).read().length;
+    for (const clientName of ["lap\u202etop", "lap\u2066top", "lap\u200btop"]) {
+      const pair = await makeSeal();
+      const res = await home.call("POST", "/api/v1/auth/device", {
+        body: { seal: pair.seal, clientName },
+        secret: null,
+      });
+      expect(res.status).toBe(400);
+      expect((res.body["error"] as Record<string, unknown>)["reason"]).toBe("body_invalid");
+    }
+    expect(openDeviceRequests(home.t.hangarRoot).read()).toHaveLength(before);
+    // The name `crewhaus login` gives from a host name passes.
+    await start({ clientName: "crewhaus CLI on my-mac.local" });
+  });
+});
+
+describe("waiting sign-ins from one address", () => {
+  test("a fifth is refused with when to ask again", async () => {
+    const own = await v1Home();
+    try {
+      for (let i = 0; i < DEVICE_LIMITS.maxPendingPerPeer; i++) {
+        const pair = await makeSeal();
+        const res = await own.call("POST", "/api/v1/auth/device", {
+          body: { seal: pair.seal },
+          secret: null,
+        });
+        expect(res.status).toBe(200);
+      }
+      const pair = await makeSeal();
+      const fifth = await own.call("POST", "/api/v1/auth/device", {
+        body: { seal: pair.seal },
+        secret: null,
+      });
+      expect(fifth.status).toBe(429);
+      expect((fifth.body["error"] as Record<string, unknown>)["reason"]).toBe(
+        "too_many_pending_here",
+      );
+      expect(Number(fifth.headers.get("retry-after"))).toBeGreaterThan(0);
+    } finally {
+      await own.t.stop();
+    }
+    // It boots a Home of its own, so its waiting requests reach no other test.
+  }, 60_000);
 });

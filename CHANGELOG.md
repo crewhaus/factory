@@ -674,6 +674,29 @@ these on: they reach every harness that uses what each one names.
   anchor: presented as written by an earlier step, with no more authority than
   that source. The run's own input, carried in that state, is labelled with it.
 
+- **Home's device sign-in page starts with an empty code field; the member
+  types the code.** `#/device` never takes a code from its address. It shows
+  where Home saw the request come from and how long ago, apart from the name
+  the request gave, and a warning before Allow: allow only a sign-in you just
+  started yourself.
+
+- **`crewhaus access approve` shows the request and asks before allowing; with
+  no terminal it needs `--yes`.** It prints where Home saw the request come
+  from, when, the name it gave, what it may do and for how long, and the same
+  warning, then allows only on a yes at a terminal or with `--yes`. Without
+  either it exits 1 and the request keeps waiting. `--deny` asks nothing.
+
+- **One address can have at most 4 device sign-ins waiting at once.** The next
+  `POST /api/v1/auth/device` from it answers 429 `too_many_pending_here` with
+  `Retry-After`. An IPv6 address counts by its /64, and one /48 has at most 8
+  waiting. A trusted proxy's requests count by the address it reports and hold
+  at most half of Home's waiting slots.
+
+- **A device name with bidi or invisible formatting characters is refused.**
+  `POST /api/v1/auth/device` answers 400 `body_invalid` for a `clientName` that
+  holds a control or format character, bidi and zero-width ones among them, or
+  a line or paragraph separator.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read
