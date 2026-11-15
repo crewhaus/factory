@@ -674,6 +674,12 @@ these on: they reach every harness that uses what each one names.
   anchor: presented as written by an earlier step, with no more authority than
   that source. The run's own input, carried in that state, is labelled with it.
 
+- **A managed daemon refuses a client token whose `tenant_id` is `home`.** The
+  id is refused in any letter case, with 401, before the request reaches the
+  daemon's handler. It is reserved for the runs Home starts on a managed
+  daemon, so a deployment that issued tokens for a tenant named `home` issues
+  them under another id.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read

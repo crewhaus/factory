@@ -68,7 +68,7 @@ import {
   withLedgerLock,
 } from "@crewhaus/control-records";
 import type { ControlClient, ControlTarget } from "@crewhaus/gateway-protocol/control-client";
-import { queueManagedRun } from "@crewhaus/gateway-server/managed-runs";
+import { HOME_RUN_TENANT, queueManagedRun } from "@crewhaus/gateway-server/managed-runs";
 import {
   type ApiRunInput,
   type StartResult,
@@ -82,7 +82,7 @@ import type { ReconcileContext, Reconciler, Reconciliation, Settlement } from ".
 import { type Outcome, outcomeOf } from "./refusal";
 
 /** The tenant every run Home starts on a managed daemon serves. */
-export const HOME_RUN_TENANT = "home";
+export { HOME_RUN_TENANT };
 
 /** The oldest build that checks a run's input where the run starts. */
 export const RUNS_MIN_BUNDLE = "0.9.0";
@@ -116,6 +116,23 @@ export type RunRefusal = {
   readonly verb?: string;
   /** What to do instead. */
   readonly remedy?: string;
+  /** When to ask again, for a refusal that passes once capacity frees. */
+  readonly retryAfterMs?: number;
+};
+
+/**
+ * Whether a head has room for one more API run on a harness: room, or the cap that is
+ * full (one harness's, or the whole head's) and when to ask again.
+ */
+export type ApiRunCapacity =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly scope: "harness" | "home"; readonly retryAfterMs: number };
+
+/** What an API run past a full cap is answered, by the cap that is full. */
+export const API_RUN_BUSY_MESSAGES: Readonly<Record<"harness" | "home", string>> = {
+  harness:
+    "This harness is already running as many API runs as Home allows at once. Try again shortly.",
+  home: "Home is already running as many API runs as it allows at once. Try again shortly.",
 };
 
 /** What a planned effect returns: how the command ended, and what the caller is answered. */
@@ -139,6 +156,11 @@ export type RunHome = {
   readonly controlClient?: ControlClient;
   /** Where a harness's daemon's control plane is. */
   readonly controlTarget?: (harnessDir: string) => ControlTarget;
+  /**
+   * Whether the head has room for one more API job run on a harness, asked before anything
+   * is written, on every head that lends it.
+   */
+  readonly apiRunCapacity?: (harnessDir: string) => ApiRunCapacity;
   readonly now?: () => number;
 };
 
@@ -205,7 +227,7 @@ function refused<T>(
   code: ErrorCode,
   reason: string,
   message: string,
-  more: { readonly verb?: string; readonly remedy?: string } = {},
+  more: { readonly verb?: string; readonly remedy?: string; readonly retryAfterMs?: number } = {},
 ): RunPlan<T> {
   return { ok: false, refusal: { code, reason, message, ...more } };
 }
@@ -376,6 +398,15 @@ function bundleRefusal<T>(harnessDir: string, target: string): RunPlan<T> | unde
   return refusal === undefined ? undefined : { ok: false, refusal };
 }
 
+/** A full cap as a refusal, before anything is written; `undefined` when there is room. */
+function capacityRefusal<T>(home: RunHome, harnessDir: string): RunPlan<T> | undefined {
+  const capacity = home.apiRunCapacity?.(harnessDir);
+  if (capacity === undefined || capacity.ok) return undefined;
+  return refused("unavailable", "busy", API_RUN_BUSY_MESSAGES[capacity.scope], {
+    retryAfterMs: capacity.retryAfterMs,
+  });
+}
+
 const jobRunAdapter: RunAdapter = {
   shape: "job",
 
@@ -412,6 +443,8 @@ const jobRunAdapter: RunAdapter = {
         `A ${req.target} harness reads its input on stdin, which carries no subject.`,
       );
     }
+    const busy = capacityRefusal<RunCreateValue>(req.home, req.harnessDir);
+    if (busy !== undefined) return busy;
     const startRunJob = req.home.startRunJob;
     return {
       ok: true,
@@ -442,6 +475,7 @@ const jobRunAdapter: RunAdapter = {
           at: new Date(now()).toISOString(),
           trigger: API_TRIGGER,
           by: receipt.actor,
+          ...(receipt.credentialRef !== undefined ? { byCredential: receipt.credentialRef } : {}),
           cmd: receipt.id,
         };
         const queued = append(runsLedger(req.harnessDir), row);
@@ -535,6 +569,8 @@ const jobRunAdapter: RunAdapter = {
     }
     const old = bundleRefusal<RunActionValue>(req.harnessDir, req.target);
     if (old !== undefined) return old;
+    const busy = capacityRefusal<RunActionValue>(req.home, req.harnessDir);
+    if (busy !== undefined) return busy;
     const startRunJob = req.home.startRunJob;
     const inputs = join(req.harnessDir, controlPaths(req.harnessDir).inputsDir);
     const cli = req.target === "cli";
@@ -960,6 +996,7 @@ const managedRunAdapter: RunAdapter = {
           tenant: HOME_RUN_TENANT,
           input: req.input,
           by: receipt.actor,
+          ...(receipt.credentialRef !== undefined ? { byCredential: receipt.credentialRef } : {}),
           cmd: receipt.id,
           ...(req.subject !== undefined ? { subject: req.subject } : {}),
           ...(req.home.now !== undefined ? { now: req.home.now } : {}),
