@@ -11,7 +11,15 @@
  * explicit generous timeout per the CI rule.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureAccessSetUp, loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
@@ -1500,6 +1508,39 @@ describe("hangar and the installed service", () => {
         .lastRecovery,
     ).toEqual({ at: "2026-11-13T00:00:00.000Z", restarted: 1, skipped: 0 });
   });
+
+  test.skipIf(process.platform === "win32")(
+    "status shows no recovery report reached through a link that leads outside Home's directory",
+    async () => {
+      const ws = newWorkspace();
+      const outside = join(ws.root, "elsewhere");
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(
+        join(outside, "recovery.json"),
+        JSON.stringify({
+          v: 1,
+          at: "2026-11-13T00:00:00.000Z",
+          mode: "resident",
+          restarted: [{ harness: "hrn_0000000000000001", runId: "run_0000000000000001" }],
+          skipped: [],
+          failed: [],
+        }),
+      );
+      mkdirSync(join(ws.hangarRoot, "service"), { recursive: true });
+      symlinkSync(join(outside, "recovery.json"), join(ws.hangarRoot, "service", "recovery.json"));
+      const text = await runHangarCommand(["status"], { env: ws.env, service: service(ws) });
+      expect(text.exitCode).toBe(0);
+      expect(text.lines.join("\n")).not.toContain("last recovery");
+      const json = await runHangarCommand(["status", "--json"], {
+        env: ws.env,
+        service: service(ws),
+      });
+      expect(
+        (JSON.parse(json.lines.join("\n")) as { resident: { lastRecovery?: unknown } }).resident
+          .lastRecovery,
+      ).toBeUndefined();
+    },
+  );
 
   test("a lock with no mode is a window's", () => {
     const ws = newWorkspace();

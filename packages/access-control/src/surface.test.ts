@@ -113,6 +113,7 @@ describe("what the package exports", () => {
         "parseCidr",
         "readOwnerSettings",
         "rotateBootstrap",
+        "socketsSupported",
         "tokenEquals",
         "writeOwnerBlock",
         // Route authorization: every role and credential at Home's one choke point.
