@@ -4,13 +4,26 @@
  * into a temp Hangar root, and reads both back as Home does.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVENT_TAXONOMY, isId } from "@crewhaus/control-contract";
+import type { PluginGrantSet } from "@crewhaus/control-contract";
 import { foldStates } from "@crewhaus/control-records";
+import { findSpecPath } from "@crewhaus/harness-supervisor";
 import { PLUGIN_INTEGRATION_EVENT_FAMILIES } from "@crewhaus/plugin-sdk";
+import { MAX_TEXT_BYTES } from "./constants";
 import {
+  type GrantableHarness,
   SERVED_NOTHING,
   asksOf,
   grantPlugin,
@@ -23,6 +36,8 @@ import {
   servedOf,
   servedPlugins,
   standingFrom,
+  stillLoadedBy,
+  waitingOn,
 } from "./plugin-grants";
 import { type PluginRow, readPluginInventory } from "./plugins";
 
@@ -37,7 +52,12 @@ beforeEach(() => {
   mkdirSync(pluginsDir, { recursive: true });
   mkdirSync(hangarRoot, { recursive: true });
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+const locked: string[] = [];
+afterEach(() => {
+  // A test may leave a file or directory with no permissions; give them back before removing.
+  for (const left of locked.splice(0)) chmodSync(left, 0o755);
+  rmSync(root, { recursive: true, force: true });
+});
 
 const HRN_A = "hrn_00000000000000a1";
 const HRN_B = "hrn_00000000000000b2";
@@ -332,4 +352,240 @@ describe("a grant names only what the plugin asks for", () => {
 test("every event family a plugin may ask for is a family in the contract", () => {
   const families = new Set(Object.values(EVENT_TAXONOMY).map((entry) => entry.family));
   for (const family of PLUGIN_INTEGRATION_EVENT_FAMILIES) expect(families.has(family)).toBe(true);
+});
+
+/** A harness directory under the temp root, with a crewhaus.yaml when `spec` is given. */
+function harnessDir(id: string, spec?: string): GrantableHarness {
+  const dir = join(root, "harnesses", id);
+  mkdirSync(dir, { recursive: true });
+  if (spec !== undefined) writeFileSync(join(dir, "crewhaus.yaml"), spec);
+  return { id, dir };
+}
+
+/** A spec of one shape whose `plugins:` list is the YAML given. */
+const specWith = (plugins: string, target = "cli") =>
+  `name: probe\ntarget: ${target}\nagent:\n  model: x\nplugins: ${plugins}\n`;
+
+/** What Home serves: harnesses and host tools, nothing else. */
+const servedSet = (
+  harnesses: readonly string[] | "all",
+  tools: readonly string[],
+): PluginGrantSet => ({ ...SERVED_NOTHING, harnesses, tools }) as PluginGrantSet;
+
+/** A plugin that asks for the host tools given, and nothing else. */
+const toolsPlugin = (tools: readonly string[]) =>
+  install({ name: "probe-tools", version: "1.0.0", permissions: { tools } });
+
+describe("the harnesses whose crewhaus.yaml still loads a plugin", () => {
+  test("an entry outside what is served names its harness with every tool it hands", () => {
+    const r = toolsPlugin(["Bash"]);
+    const a = harnessDir(HRN_A, specWith('[{name: probe-tools, tools: ["Bash"]}]'));
+    expect(stillLoadedBy(r, SERVED_NOTHING, [a], hangarRoot)).toEqual([
+      { id: HRN_A, tools: ["Bash"] },
+    ]);
+    // The control case: served on A with Bash names nothing.
+    expect(stillLoadedBy(r, servedSet([HRN_A], ["Bash"]), [a], hangarRoot)).toEqual([]);
+    expect(stillLoadedBy(r, servedSet([HRN_B], ["Bash"]), [a], hangarRoot)).toEqual([
+      { id: HRN_A, tools: ["Bash"] },
+    ]);
+    expect(stillLoadedBy(r, servedSet([HRN_A], []), [a], hangarRoot)).toEqual([
+      { id: HRN_A, tools: ["Bash"] },
+    ]);
+    expect(stillLoadedBy(r, servedSet("all", ["Bash"]), [a], hangarRoot)).toEqual([]);
+  });
+
+  test("a bare name hands every host tool the manifest asks for", () => {
+    const r = toolsPlugin(["Read", "Bash"]);
+    const a = harnessDir(HRN_A, specWith("[probe-tools]"));
+    expect(stillLoadedBy(r, servedSet([HRN_A], ["Read"]), [a], hangarRoot)).toEqual([
+      { id: HRN_A, tools: ["Bash", "Read"] },
+    ]);
+  });
+
+  test("a listed tool the manifest does not ask for is not counted, and the first entry decides", () => {
+    const r = toolsPlugin(["Bash"]);
+    const a = harnessDir(HRN_A, specWith('[{name: probe-tools, tools: ["Bash", "Nope"]}]'));
+    expect(stillLoadedBy(r, servedSet([HRN_A], ["Bash"]), [a], hangarRoot)).toEqual([]);
+    const b = harnessDir(HRN_B, specWith("[{name: probe-tools, tools: []}, probe-tools]"));
+    expect(stillLoadedBy(r, servedSet([HRN_B], []), [b], hangarRoot)).toEqual([]);
+  });
+
+  test("only a cli or channel spec, among the harnesses given, is named", () => {
+    const r = toolsPlugin(["Bash"]);
+    const workflow = harnessDir("hrn_00000000000000c3", specWith("[probe-tools]", "workflow"));
+    const none = harnessDir("hrn_00000000000000d4");
+    const channel = harnessDir("hrn_00000000000000f6", specWith("[probe-tools]", "channel"));
+    harnessDir(HRN_A, specWith("[probe-tools]"));
+    expect(stillLoadedBy(r, SERVED_NOTHING, [workflow, none, channel], hangarRoot)).toEqual([
+      { id: "hrn_00000000000000f6", tools: ["Bash"] },
+    ]);
+  });
+
+  test("a spec file that resolves outside its harness is not read and names it with no tool list", () => {
+    if (process.platform === "win32") return; // the fixture plants a POSIX link
+    const r = toolsPlugin(["Bash"]);
+    const outside = join(root, "outside.yaml");
+    writeFileSync(outside, specWith("[probe-tools]", "workflow"));
+    const linked = harnessDir("hrn_00000000000000e5");
+    symlinkSync(outside, join(linked.dir, "crewhaus.yaml"));
+    // Even a workflow target behind the link is not read: the harness cannot tell.
+    expect(stillLoadedBy(r, servedSet("all", ["Bash"]), [linked], hangarRoot)).toEqual([
+      { id: "hrn_00000000000000e5", tools: null },
+    ]);
+  });
+
+  test("the shape and the entries come from the parsed spec, as the compiler reads them", () => {
+    const r = toolsPlugin(["Bash"]);
+    const entry = '[{name: probe-tools, tools: ["Bash"]}]';
+    const specs: Record<string, string> = {
+      quotedTargetKey: `name: probe\n"target": cli\nagent:\n  model: x\nplugins: ${entry}\n`,
+      foldedTarget: `name: probe\ntarget: >-\n  cli\nagent:\n  model: x\nplugins: ${entry}\n`,
+      taggedTarget: `name: probe\ntarget: !!str cli\nagent:\n  model: x\nplugins: ${entry}\n`,
+      escapedName: specWith('[{name: "\\x70robe-tools", tools: ["Bash"]}]'),
+    };
+    const ids = Object.keys(specs).map((_, i) => `hrn_0000000000000${i}a${i}`);
+    const given = Object.values(specs).map((spec, i) => harnessDir(ids[i] ?? "", spec));
+    expect(stillLoadedBy(r, SERVED_NOTHING, given, hangarRoot)).toEqual(
+      ids.map((id) => ({ id, tools: ["Bash"] })),
+    );
+  });
+
+  test("a spec past the read cap cannot tell, wherever its entry sits", () => {
+    const r = toolsPlugin(["Bash"]);
+    const pad = `# ${"x".repeat(78)}\n`.repeat(Math.ceil(MAX_TEXT_BYTES / 80) + 1);
+    const big = harnessDir(
+      HRN_A,
+      `name: probe\ntarget: cli\nagent:\n  model: x\n${pad}plugins: [{name: probe-tools, tools: ["Bash"]}]\n`,
+    );
+    const workflow = harnessDir(
+      HRN_B,
+      `name: probe\ntarget: workflow\n${pad}plugins: [probe-tools]\n`,
+    );
+    expect(stillLoadedBy(r, SERVED_NOTHING, [big, workflow], hangarRoot)).toEqual([
+      { id: HRN_A, tools: null },
+    ]);
+  });
+
+  test("a harness that builds from crewhaus.yml is read there", () => {
+    const r = toolsPlugin(["Bash"]);
+    const a = harnessDir(HRN_A);
+    writeFileSync(join(a.dir, "crewhaus.yml"), specWith('[{name: probe-tools, tools: ["Bash"]}]'));
+    expect(findSpecPath(a.dir)).toBe(join(a.dir, "crewhaus.yml"));
+    expect(stillLoadedBy(r, SERVED_NOTHING, [a], hangarRoot)).toEqual([
+      { id: HRN_A, tools: ["Bash"] },
+    ]);
+  });
+
+  test("a spec file that is there but cannot be read names its harness with no tool list", () => {
+    const r = toolsPlugin(["Bash"]);
+    const dirSpec = harnessDir(HRN_B);
+    mkdirSync(join(dirSpec.dir, "crewhaus.yaml"));
+    const given = [dirSpec];
+    const expected = [{ id: HRN_B, tools: null }];
+    // chmod 000 does not stop a read on Windows or for root.
+    if (process.platform !== "win32" && process.getuid?.() !== 0) {
+      const a = harnessDir(HRN_A, specWith('[{name: probe-tools, tools: ["Bash"]}]'));
+      const spec = join(a.dir, "crewhaus.yaml");
+      chmodSync(spec, 0o000);
+      locked.push(spec);
+      given.unshift(a);
+      expected.unshift({ id: HRN_A, tools: null });
+    }
+    expect(stillLoadedBy(r, servedSet("all", ["Bash"]), given, hangarRoot)).toEqual(expected);
+  });
+
+  test("a spec that mentions the plugin but cannot be read whole names its harness with no tool list", () => {
+    const r = toolsPlugin(["Bash"]);
+    const broken = harnessDir(HRN_A, "name: probe\ntarget: cli\nplugins: [probe-tools\n  : :\n");
+    const silent = harnessDir(HRN_B, "name: probe\ntarget: cli\nplugins: [other\n  : :\n");
+    const odd = harnessDir(
+      "hrn_00000000000000c3",
+      specWith('[{name: probe-tools, tools: "Bash"}]'),
+    );
+    expect(stillLoadedBy(r, servedSet("all", ["Bash"]), [broken, silent, odd], hangarRoot)).toEqual(
+      [
+        { id: HRN_A, tools: null },
+        { id: "hrn_00000000000000c3", tools: null },
+      ],
+    );
+  });
+});
+
+describe("the plugins waiting for the owner's OK on a harness", () => {
+  /** A plugin whose filesystem ask covers the harnesses under `root/harnesses/<glob>`. */
+  const seeing = (name: string, glob: string, extra: Record<string, unknown>) =>
+    install({
+      name,
+      version: "1.0.0",
+      permissions: { fs: [`read:${join(root, "harnesses")}/${glob}`] },
+      ...extra,
+    });
+
+  test("only a plugin with a tab or an observer, asking for this harness, and not served here", async () => {
+    const a = harnessDir(HRN_A, specWith("[]"));
+    const b = harnessDir(HRN_B, specWith("[]"));
+    const paned = seeing("paned", "**", {
+      panes: [{ id: "board", title: "Board", file: "board.html" }],
+    });
+    seeing("observer", "**", { onTraceEvent: true });
+    seeing("paneless", "**", {});
+    seeing("only-a", `${HRN_A}/**`, {
+      panes: [{ id: "board", title: "Board", file: "board.html" }],
+    });
+    const inventory = () => readPluginInventory(pluginsDir, standingFrom(grants()));
+    const now = () => servedPlugins(inventory(), grants());
+    expect(waitingOn(inventory(), now(), b).sort()).toEqual(["observer", "paned"]);
+    expect(waitingOn(inventory(), now(), a).sort()).toEqual(["observer", "only-a", "paned"]);
+    // A grant on A leaves it waiting on B, and not on A.
+    await grantPlugin(hangarRoot, {
+      row: paned,
+      grant: { ...SERVED_NOTHING, harnesses: [HRN_A], panes: ["board"] },
+      by: "prn_00000000000000000000000001",
+      cmd: "cmd_00000000000000000000000001",
+    });
+    expect(waitingOn(inventory(), now(), b)).toContain("paned");
+    expect(waitingOn(inventory(), now(), a)).not.toContain("paned");
+    // A revoked grant waits again.
+    await revokePlugin(hangarRoot, {
+      plugin: "paned",
+      by: "prn_00000000000000000000000001",
+      cmd: "cmd_00000000000000000000000002",
+    });
+    expect(waitingOn(inventory(), now(), a)).toContain("paned");
+  });
+});
+
+describe("a grant or revoke with loadedBy answers who still loads the plugin", () => {
+  test("a revoke names each given harness that loads it; without loadedBy the field is absent", async () => {
+    const r = toolsPlugin(["Bash"]);
+    const a = harnessDir(HRN_A, specWith('[{name: probe-tools, tools: ["Bash"]}]'));
+    const by = { by: "prn_00000000000000000000000001", cmd: "cmd_00000000000000000000000001" };
+    const granted = await grantPlugin(hangarRoot, {
+      row: r,
+      grant: { ...SERVED_NOTHING, harnesses: [HRN_A], tools: ["Bash"] },
+      loadedBy: { row: r, harnesses: [a] },
+      ...by,
+    });
+    expect(granted.ok && granted.stillLoadedBy).toEqual([]);
+    const narrowed = await grantPlugin(hangarRoot, {
+      row: r,
+      grant: { ...SERVED_NOTHING, harnesses: [HRN_A], tools: [], expect: 1 },
+      loadedBy: { row: r, harnesses: [a] },
+      ...by,
+    });
+    expect(narrowed.ok && narrowed.stillLoadedBy).toEqual([{ id: HRN_A, tools: ["Bash"] }]);
+    const revoked = await revokePlugin(hangarRoot, {
+      plugin: "probe-tools",
+      loadedBy: { row: r, harnesses: [a] },
+      ...by,
+    });
+    expect(revoked.ok && revoked.stillLoadedBy).toEqual([{ id: HRN_A, tools: ["Bash"] }]);
+    const plain = await grantPlugin(hangarRoot, {
+      row: r,
+      grant: { ...SERVED_NOTHING, harnesses: [], tools: [] },
+      ...by,
+    });
+    expect(plain.ok).toBe(true);
+    expect("stillLoadedBy" in plain).toBe(false);
+  });
 });
