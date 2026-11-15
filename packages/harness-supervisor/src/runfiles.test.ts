@@ -6,6 +6,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
@@ -394,6 +395,79 @@ describe("retention", () => {
     expect(() => statSync(runPumpLockPath(dir, ids[0] as string))).toThrow();
     expect(statSync(runPumpLockPath(dir, ids[1] as string)).isFile()).toBe(true);
   });
+});
+
+describe("the prune record and the pump lease are read without following or waiting", () => {
+  const ids = Array.from({ length: 3 }, (_, i) => `run_${String(i).padStart(16, "0")}`);
+
+  test("a linked prune record is not on record; a prune older than the lines read is not either", () => {
+    const dir = tempHarness();
+    ensureRunDir(dir);
+    const outside = join(tempHarness(), "elsewhere.jsonl");
+    writeFileSync(outside, `${JSON.stringify({ v: 1, at: "t", runs: [ids[0]] })}\n`);
+    symlinkSync(outside, prunedRunsPath(dir));
+    expect([...readPrunedRuns(dir)]).toEqual([]);
+    rmSync(prunedRunsPath(dir));
+    const filler = `${JSON.stringify({ v: 1, at: "t", runs: [] })}\n`.repeat(3);
+    writeFileSync(
+      prunedRunsPath(dir),
+      `${JSON.stringify({ v: 1, at: "t", runs: [ids[0]] })}\n${filler}`,
+    );
+    expect([...readPrunedRuns(dir, 3)]).toEqual([]);
+    expect([...readPrunedRuns(dir, 4)]).toEqual([ids[0]]);
+  });
+
+  // A FIFO with no writer would hold a blocking open forever, so each call runs in a
+  // child with a deadline: a call that waits is killed and fails the test.
+  test.skipIf(process.platform === "win32")(
+    "a FIFO at the prune record or the lease answers at once, refused",
+    () => {
+      const dir = tempHarness();
+      for (const id of ids) {
+        ensureRunDir(dir);
+        appendRunLedger(dir, {
+          runId: id,
+          kind: "daemon",
+          argv: ["bun"],
+          startedAt: "t",
+          logFile: `logs/${id}.log`,
+        });
+        writeFileSync(runLogPath(dir, id), "x".repeat(10));
+      }
+      const lease = runPumpLockPath(dir, ids[2] as string);
+      for (const fifo of [prunedRunsPath(dir), lease]) {
+        const made = Bun.spawnSync({ cmd: ["mkfifo", fifo], env: { ...process.env } });
+        expect(made.exitCode).toBe(0);
+      }
+      const script = join(tempHarness(), "probe.ts");
+      writeFileSync(
+        script,
+        [
+          `import { pruneRuns, readPrunedRuns } from ${JSON.stringify(join(import.meta.dir, "runfiles.ts"))};`,
+          `import { readPumpLease } from ${JSON.stringify(join(import.meta.dir, "trace-pump.ts"))};`,
+          `const dir = ${JSON.stringify(dir)};`,
+          "const pruned = readPrunedRuns(dir).size;",
+          "const removed = pruneRuns(dir, { runs: 1, bytes: 1e12 }).removedRuns.length;",
+          `const lease = readPumpLease(${JSON.stringify(lease)}) === undefined;`,
+          "console.log(JSON.stringify({ pruned, removed, lease }));",
+        ].join("\n"),
+      );
+      const child = Bun.spawnSync({
+        cmd: [process.execPath, script],
+        env: { ...process.env },
+        timeout: 10_000,
+      });
+      expect(child.exitCode).toBe(0);
+      expect(JSON.parse(child.stdout.toString().trim())).toEqual({
+        pruned: 0,
+        removed: 0,
+        lease: true,
+      });
+      // Nothing was removed: the record of what would be could not be written.
+      for (const id of ids) expect(statSync(runLogPath(dir, id)).size).toBe(10);
+    },
+    20_000, // a child process, with a deadline that only a waiting call reaches
+  );
 });
 
 describe("readRetentionPolicy", () => {

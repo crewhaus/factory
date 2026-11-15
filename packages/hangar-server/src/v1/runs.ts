@@ -10,15 +10,23 @@
  * its result with `hidden: ["people"]` and no content unless the people domain releases it.
  */
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import {
+  CANONICAL_RUN_ID_RE,
   type CommandReceipt,
   type CursorPosition,
   ERROR_CODES,
+  EXECUTION_RUN_ID_RE,
   type ErrorCode,
   mintRunId,
   parseRef,
 } from "@crewhaus/control-contract";
-import { type LedgerRecord, readPage, runsLedger } from "@crewhaus/control-records";
+import {
+  type LedgerRecord,
+  type RecordSource,
+  readPage,
+  runsLedger,
+} from "@crewhaus/control-records";
 import {
   RUNS_PROJECTION,
   type RunHome,
@@ -30,7 +38,7 @@ import {
   runRefOf,
 } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
-import { readPrunedRuns, readRunLedger, runEventsPath } from "@crewhaus/harness-supervisor";
+import { RUN_LEDGER_NAME, readPrunedRuns, runEventsPath } from "@crewhaus/harness-supervisor";
 import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { emptyOf, nextCursor, pagingOf, snapshotCursor } from "./lists";
@@ -92,6 +100,8 @@ export function findRun(
   runId: string,
   hint: string | undefined,
 ): RunFound | undefined {
+  // A canonical run's rows only: an execution id is never looked up in a run ledger.
+  if (!CANONICAL_RUN_ID_RE.test(runId)) return undefined;
   const at = (entry: HangarHarnessEntry): RunFound | undefined => {
     const dir = liveDirOf(entry);
     if (dir === undefined) return undefined;
@@ -133,25 +143,43 @@ export type ExecutionFound = {
   readonly dir: string;
   /** Retention removed its files, and its prune is on record. */
   readonly pruned: boolean;
+  /** Its supervisor ledger lines among the newest ones, newest first. */
+  readonly rows: readonly LedgerRecord[];
 };
 
+/** The supervisor ledger, `.crewhaus/run/runs.jsonl`, as one record file. */
+export function supervisorLedgerOf(dir: string): RecordSource {
+  return { root: dir, records: { file: join(".crewhaus", "run", RUN_LEDGER_NAME) } };
+}
+
+/** Execution `id`'s lines among a harness's newest supervisor ledger lines, newest first. */
+function executionRowsIn(dir: string, id: string): LedgerRecord[] {
+  try {
+    return readPage(supervisorLedgerOf(dir), { limit: RUN_LOOKUP_LINES })
+      .items.map((item) => item.record)
+      .filter((record) => record["runId"] === id);
+  } catch {
+    return [];
+  }
+}
+
 /**
- * The registered harness whose supervisor ledger (or prune record) names execution `id`:
- * the `?harness=` hint's, else the one harness that does. Two, or none, is `undefined`.
- * Reads only.
+ * The registered harness whose supervisor ledger (or prune record) names execution `id`
+ * among its newest lines: the `?harness=` hint's, else the one harness that does. Two, or
+ * none, is `undefined`. Each record is read contained and bounded. Reads only.
  */
 export function findExecution(
   deps: V1Context["deps"],
   id: string,
   hint: string | undefined,
 ): ExecutionFound | undefined {
+  if (!EXECUTION_RUN_ID_RE.test(id)) return undefined;
   const at = (entry: HangarHarnessEntry): ExecutionFound | undefined => {
     const dir = liveDirOf(entry);
     if (dir === undefined) return undefined;
+    const rows = executionRowsIn(dir, id);
     const pruned = readPrunedRuns(dir).has(id) && !existsSync(runEventsPath(dir, id));
-    if (pruned || readRunLedger(dir).some((row) => row.runId === id)) {
-      return { entry, dir, pruned };
-    }
+    if (pruned || rows.length > 0) return { entry, dir, pruned, rows };
     return undefined;
   };
   if (hint !== undefined) {
@@ -195,9 +223,10 @@ function notFound(): V1Error {
   });
 }
 
-/** The run the request's `{run}` names, or 404. */
+/** The run the request's `{run}` names, or 404. An execution id names no run here. */
 function runOf(ctx: V1Context): RunFound & { readonly runId: string } {
   const runId = String(ctx.params["run"]);
+  if (EXECUTION_RUN_ID_RE.test(runId)) throw notFound();
   const found = findRun(ctx.deps, runId, ctx.query["harness"]);
   if (found === undefined) throw notFound();
   return { ...found, runId };

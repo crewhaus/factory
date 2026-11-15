@@ -42,6 +42,7 @@ import {
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
+import { readPage } from "@crewhaus/control-records";
 import { type LeaseProbe, PUMP_LEASE_PROBE, pumpLeaseBreakable } from "./trace-pump";
 import {
   CONTROL_TOKEN_NAME,
@@ -615,10 +616,16 @@ function recordPruned(harnessDir: string, runs: readonly string[], at: number): 
   let fd: number | undefined;
   try {
     ensureRunDir(harnessDir);
-    const noFollow = constants.O_NOFOLLOW ?? 0;
+    const flag = (name: string): number =>
+      (constants as Record<string, number | undefined>)[name] ?? 0;
+    // A FIFO at the name fails at once (no reader) or opens and is refused below: never waited on.
     fd = openSync(
       prunedRunsPath(harnessDir),
-      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | noFollow,
+      constants.O_WRONLY |
+        constants.O_APPEND |
+        constants.O_CREAT |
+        flag("O_NOFOLLOW") |
+        flag("O_NONBLOCK"),
       0o600,
     );
     if (!fstatSync(fd).isFile()) return false;
@@ -632,28 +639,33 @@ function recordPruned(harnessDir: string, runs: readonly string[], at: number): 
   }
 }
 
+/** How many of `pruned.jsonl`'s newest lines {@link readPrunedRuns} looks in. */
+export const PRUNED_LOOKUP_LINES = 1000;
+
 /**
- * The run ids retention removed, from `pruned.jsonl`, newest prune last. A torn or
- * malformed line is skipped. Reads only.
+ * The run ids retention removed, from the newest `maxLines` lines of `pruned.jsonl`,
+ * oldest prune first. The record is read contained to the harness directory: a link at
+ * its name, a FIFO or anything else that is not a regular file is not on record, and
+ * neither is a line too long to be one. A torn or malformed line is skipped. Reads only.
  */
-export function readPrunedRuns(harnessDir: string): ReadonlySet<string> {
-  let text: string;
-  try {
-    text = readFileSync(prunedRunsPath(harnessDir), "utf8");
-  } catch {
-    return new Set();
-  }
+export function readPrunedRuns(
+  harnessDir: string,
+  maxLines = PRUNED_LOOKUP_LINES,
+): ReadonlySet<string> {
   const out = new Set<string>();
-  for (const line of text.split("\n")) {
-    if (line.trim() === "") continue;
-    try {
-      const parsed = JSON.parse(line) as { runs?: unknown };
-      if (Array.isArray(parsed.runs)) {
-        for (const id of parsed.runs) if (typeof id === "string") out.add(id);
-      }
-    } catch {
-      // A torn line: skipped.
-    }
+  let items: readonly { readonly record: Record<string, unknown> }[];
+  try {
+    items = readPage(
+      { root: harnessDir, records: { file: join(...RUN_DIR_SEGMENTS, PRUNED_RUNS_NAME) } },
+      { limit: maxLines },
+    ).items;
+  } catch {
+    return out;
+  }
+  for (const { record } of [...items].reverse()) {
+    const runs = record["runs"];
+    if (!Array.isArray(runs)) continue;
+    for (const id of runs) if (typeof id === "string") out.add(id);
   }
   return out;
 }

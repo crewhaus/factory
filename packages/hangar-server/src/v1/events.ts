@@ -42,7 +42,6 @@ import {
   runsLedger,
   snapshotAt,
 } from "@crewhaus/control-records";
-import { RUN_LEDGER_NAME, readPrunedRuns } from "@crewhaus/harness-supervisor";
 import type { RequestAccess } from "../access";
 import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
@@ -56,7 +55,7 @@ import {
   traceLineEvent,
 } from "./event-map";
 import { harnessOf, liveDirOf } from "./resolve";
-import { RUN_LOOKUP_LINES, findExecution, findRun } from "./runs";
+import { RUN_LOOKUP_LINES, findExecution, findRun, supervisorLedgerOf } from "./runs";
 import { type StreamBatch, type StreamFrame, type StreamPlan, streamEnvelope } from "./stream";
 
 /** What one batch of a stream reads per source. */
@@ -119,16 +118,22 @@ type VectorRead = {
   readonly frames: StreamFrame[];
   readonly vector: CursorSources;
   readonly more: boolean;
-  /** Items each source yielded: lines, gaps and resets. */
+  /** Items each source yielded and this batch read: lines, gaps and resets. */
   readonly yielded: ReadonlyMap<CursorSource, number>;
-  /** Set when `stopAt` stopped the batch at a line. */
-  readonly stopped: boolean;
+  /** The line `holdAt` held its source at, when it held one. */
+  readonly heldAt?: ResumeItem & { kind: "line" };
+  /** A source was reset: it is read again from where it now starts on the next batch. */
+  readonly reset: boolean;
 };
 
 /**
  * A reader over several sources from one vector. Each item moves the vector past it, and
  * each frame's id is the vector just past its item. A gap that does not move the vector
  * (a file that cannot be opened) is sent once per stream, not once per poll.
+ *
+ * `holdAt` can hold a source at one of its lines: that line and every later line of the
+ * same source are neither sent nor read past, so the next batch meets that line again,
+ * while the other sources go on.
  */
 function vectorReader(sources: readonly LineSource[], start: CursorSources | undefined) {
   const map: Record<string, RecordSource> = {};
@@ -146,37 +151,54 @@ function vectorReader(sources: readonly LineSource[], start: CursorSources | und
 
   return {
     vector: () => vector,
+    /** The frame a line sends with `id`, or `undefined` when it sends none. */
+    frameAt(
+      item: ResumeItem & { kind: "line" },
+      access: RequestAccess,
+      id: string,
+    ): StreamFrame | undefined {
+      const fields = byName.get(item.source)?.eventOf(item.record, access);
+      return fields === undefined ? undefined : frameOf(fields, id);
+    },
     read(
       access: RequestAccess,
-      stopAt?: (item: ResumeItem & { kind: "line" }) => boolean,
+      holdAt?: (item: ResumeItem & { kind: "line" }) => boolean,
     ): VectorRead {
       const answer = resume(map as ResumeSources, given, STREAM_CAPS);
       const frames: StreamFrame[] = [];
       const yielded = new Map<CursorSource, number>();
       const at = new Date().toISOString();
-      let stopped = false;
+      const held = new Set<CursorSource>();
+      let heldAt: (ResumeItem & { kind: "line" }) | undefined;
+      let reset = false;
       for (const item of answer.items) {
+        if (held.has(item.source)) continue;
+        if (item.kind === "line" && holdAt?.(item) === true) {
+          held.add(item.source);
+          heldAt ??= item;
+          continue;
+        }
         const before = vector;
         vector = advanceVector(vector, item);
         const id = encodeVector(vector) ?? encodeVector(answer.next);
-        yielded.set(item.source, (yielded.get(item.source) ?? 0) + 1);
+        const moved = JSON.stringify(before[item.source]) !== JSON.stringify(vector[item.source]);
+        // A gap that does not move the vector is not progress: it never counts as read.
+        if (item.kind !== "gap" || moved) {
+          yielded.set(item.source, (yielded.get(item.source) ?? 0) + 1);
+        }
         if (id === undefined) continue;
         if (item.kind === "line") {
           const fields = byName.get(item.source)?.eventOf(item.record, access);
           if (fields !== undefined) frames.push(frameOf(fields, id));
-          if (stopAt?.(item) === true) {
-            stopped = true;
-            break;
-          }
         } else if (item.kind === "gap") {
           const key = `${item.source}:${item.after.seg}:${item.after.off}:${item.reason}`;
-          const moved = JSON.stringify(before[item.source]) !== JSON.stringify(vector[item.source]);
           if (!moved && stuck.has(key)) continue;
-          if (!moved) stuck.add(key);
+          stuck.add(key);
           frames.push(
             streamEnvelope("stream.gap", id, at, { reason: item.reason, source: item.source }),
           );
         } else {
+          reset = true;
           const earliest =
             item.earliest === undefined
               ? undefined
@@ -190,10 +212,27 @@ function vectorReader(sources: readonly LineSource[], start: CursorSources | und
           );
         }
       }
-      if (!stopped) vector = answer.next;
+      if (held.size === 0) {
+        vector = answer.next;
+      } else {
+        // A held source stays where its hold began; the others are where the read ended.
+        const out: Partial<Record<CursorSource, CursorSources[CursorSource]>> = {};
+        for (const name of Object.keys({ ...answer.next, ...vector }) as CursorSource[]) {
+          const position = held.has(name) ? vector[name] : answer.next[name];
+          if (position !== undefined) out[name] = position;
+        }
+        vector = out as CursorSources;
+      }
       given = vector;
       const more = [...yielded.values()].some((count) => count >= STREAM_CAPS.maxLines);
-      return { frames, vector, more, yielded, stopped };
+      return {
+        frames,
+        vector,
+        more,
+        yielded,
+        reset,
+        ...(heldAt !== undefined ? { heldAt } : {}),
+      };
     },
   };
 }
@@ -279,15 +318,41 @@ function planOf(
   return { start, read, signal, dispose };
 }
 
-/** A canonical run's stream: its rows, and its trace for a caller who may read content. */
+/** The executions a run's rows (newest first) name, oldest first, each once. */
+function executionsInOrder(rows: readonly LedgerRecord[]): string[] {
+  const out: string[] = [];
+  for (const row of [...rows].reverse()) {
+    const execution = row["execution"];
+    if (typeof execution !== "string" || !EXECUTION_RUN_ID_RE.test(execution)) continue;
+    if (!out.includes(execution)) out.push(execution);
+  }
+  return out;
+}
+
+/**
+ * A canonical run's stream: its rows, and its trace for a caller who may read content.
+ *
+ * The trace read is one execution's. A fresh stream reads the newest one its rows name;
+ * a resumed one reads the execution its cursor's trace was read from, when the rows still
+ * name it, so nothing that file holds past the cursor is skipped. When a row names a later
+ * execution, that row is held back while the current trace is read to its end; then the
+ * row is sent and the stream pauses, and the reconnect reads the later execution's trace.
+ */
 function canonicalRunStream(ctx: V1Context, runId: string): StreamPlan & { scrubDir: string } {
   const found = findRun(ctx.deps, runId, ctx.query["harness"]);
   if (found === undefined) throw runUnknown();
   const cursor = resumeCursor(ctx, "vector");
   const harness = found.entry.id;
-  const execution = newestExecution(found.rows);
-  const session = execution === undefined ? newestSession(found.rows) : undefined;
+  const order = executionsInOrder(found.rows);
+  const newest = newestExecution(found.rows);
   const content = ctx.access.canReadContent(harness);
+  const followed = cursor?.kind === "vector" ? followedFiles(found.dir, runId, cursor.sources) : {};
+  // The execution this connection reads: on a resume, the one its cursor was reading.
+  const execution =
+    followed.execution !== undefined && order.includes(followed.execution)
+      ? followed.execution
+      : newest;
+  const session = execution === undefined ? newestSession(found.rows) : undefined;
   const noTrace = execution === undefined && session === undefined;
   const traceOf = (record: Readonly<Record<string, unknown>>, access: RequestAccess) => {
     if (!access.canReadContent(harness)) return undefined;
@@ -311,57 +376,79 @@ function canonicalRunStream(ctx: V1Context, runId: string): StreamPlan & { scrub
   } else if (content && session !== undefined) {
     sources.push({ name: "session", source: sessionSource(found.dir, session), eventOf: traceOf });
   }
-  // A trace or session position read from another file than the one opened now is
-  // dropped: that file is read from its start, never from an offset that is not its own.
+  // A trace or session position read from another file than the one opened now is not
+  // applied to this one: this one is read from its start, and the stream says first that
+  // what the other file held past the cursor is not sent.
   let resumed: CursorSources | undefined;
+  const missed: CursorSource[] = [];
   if (cursor?.kind === "vector") {
-    const followed = followedFiles(found.dir, runId, cursor.sources);
+    const foreign = (name: string): boolean =>
+      (name === "trace" && followed.execution !== execution) ||
+      (name === "session" && followed.session !== session);
+    for (const name of ["trace", "session"] as const) {
+      if (content && cursor.sources[name] !== undefined && foreign(name)) missed.push(name);
+    }
     resumed = Object.fromEntries(
-      Object.entries(cursor.sources).filter(
-        ([name]) =>
-          !(name === "trace" && followed.execution !== execution) &&
-          !(name === "session" && followed.session !== session),
-      ),
+      Object.entries(cursor.sources).filter(([name]) => !foreign(name)),
     ) as CursorSources;
   }
   const reader = vectorReader(sources, resumed);
   const start = encodeVector(reader.vector()) ?? OPENING;
-  // The executions the run's rows named when the stream opened: a row naming any other is
-  // a new one, and the stream pauses so the reconnect reads its trace.
-  const known = new Set(
-    found.rows.map((row) => row["execution"]).filter((e): e is string => typeof e === "string"),
-  );
-  let ended = false;
+  // A row naming an execution later than the one read is a move to it.
+  const at = order.indexOf(execution ?? "");
+  const later = (named: string): boolean => {
+    if (named === execution) return false;
+    const index = order.indexOf(named);
+    return index === -1 || (execution !== undefined && index > at);
+  };
+  // What the run's rows already record: a run that has ended ends its stream once its
+  // trace is read, whichever frame the stream resumed from.
+  let ended = TERMINAL_RUN_STATES.has(String(found.rows[0]?.["state"]));
   const plan = planOf(ctx, start, (access) => {
-    let moved = false;
     const batch = reader.read(access, (item) => {
       if (item.source !== "rows" || item.record["id"] !== runId) return false;
-      const state = item.record["state"];
-      if (typeof state === "string" && TERMINAL_RUN_STATES.has(state)) ended = true;
       const named = item.record["execution"];
-      // A later row names another execution: the reconnect reads that one's trace.
-      if (
-        content &&
-        typeof named === "string" &&
-        EXECUTION_RUN_ID_RE.test(named) &&
-        named !== execution &&
-        !known.has(named)
-      ) {
-        moved = true;
+      // Held back until the current trace is read: the reconnect reads the later one.
+      if (content && typeof named === "string" && EXECUTION_RUN_ID_RE.test(named) && later(named)) {
         return true;
       }
+      const state = item.record["state"];
+      if (typeof state === "string" && TERMINAL_RUN_STATES.has(state)) ended = true;
       return false;
     });
-    // Paused for a new execution: its trace is read from its start on the reconnect.
-    const { trace: _trace, session: _session, ...rows } = batch.vector;
-    const next = encodeVector(moved ? rows : batch.vector) ?? start;
+    const frames = batch.frames;
+    if (missed.length > 0) {
+      const opened = start;
+      for (const source of missed.splice(0)) {
+        frames.unshift(
+          streamEnvelope("stream.gap", opened, new Date().toISOString(), {
+            reason: "evicted",
+            source,
+          }),
+        );
+      }
+    }
     const traced = (batch.yielded.get("trace") ?? 0) + (batch.yielded.get("session") ?? 0);
+    const moving = batch.heldAt;
+    if (moving !== undefined) {
+      // The current trace still has lines: read on before moving.
+      if (traced > 0) {
+        return { frames, next: encodeVector(batch.vector) ?? start, more: true };
+      }
+      // Read to its end: send the held row, and pause with only the rows' place, so the
+      // reconnect reads the later execution's trace from its start.
+      const { trace: _trace, session: _session, ...rows } = batch.vector;
+      const past = advanceVector(rows, moving);
+      const id = encodeVector(past) ?? start;
+      const frame = reader.frameAt(moving, access, id);
+      if (frame !== undefined) frames.push(frame);
+      return { frames, next: id, pause: "execution" as const };
+    }
     return {
-      frames: batch.frames,
-      next,
+      frames,
+      next: encodeVector(batch.vector) ?? start,
       more: batch.more,
-      ...(moved ? { pause: "execution" as const } : {}),
-      ...(!moved && ended && traced === 0 && !batch.more ? { done: true } : {}),
+      ...(ended && traced === 0 && !batch.more && !batch.reset ? { done: true } : {}),
     };
   });
   return { ...plan, scrubDir: found.dir };
@@ -377,7 +464,7 @@ function executionStream(ctx: V1Context, execution: string): StreamPlan & { scru
   const sources: LineSource[] = [
     {
       name: "rows",
-      source: { root: found.dir, records: { file: join(".crewhaus", "run", RUN_LEDGER_NAME) } },
+      source: supervisorLedgerOf(found.dir),
       eventOf: (record) =>
         record["runId"] === execution ? executionLineEvent(record, harness) : undefined,
     },
@@ -394,7 +481,9 @@ function executionStream(ctx: V1Context, execution: string): StreamPlan & { scru
   const start = encodeVector(reader.vector()) ?? OPENING;
   // Retention removed what this execution wrote: said once, before its rows.
   let evicted = cursor === undefined && found.pruned;
-  let ended = false;
+  // What the ledger already records: an execution that has ended (or whose every line
+  // retention removed) ends its stream once its trace is read, wherever it resumed.
+  let ended = found.rows.some(executionLineEnds) || (found.pruned && found.rows.length === 0);
   const plan = planOf(ctx, start, (access) => {
     const batch = reader.read(access, (item) => {
       if (item.source === "rows" && item.record["runId"] === execution) {
@@ -414,7 +503,7 @@ function executionStream(ctx: V1Context, execution: string): StreamPlan & { scru
       frames,
       next: encodeVector(batch.vector) ?? start,
       more: batch.more,
-      ...(ended && traced === 0 && !batch.more ? { done: true } : {}),
+      ...(ended && traced === 0 && !batch.more && !batch.reset ? { done: true } : {}),
     };
   });
   return { ...plan, scrubDir: found.dir };

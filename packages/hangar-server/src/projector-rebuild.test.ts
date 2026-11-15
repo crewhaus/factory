@@ -130,8 +130,13 @@ describe("the read models", () => {
     _setIoTapForTest({ open: (given) => opened.push(given) });
     try {
       const fresh = await home.call("GET", "/api/v1/harnesses?limit=50");
-      expect((fresh.body["items"] as unknown[]).length).toBeGreaterThanOrEqual(20);
-      expect(opened.filter((given) => given.endsWith(".jsonl"))).toEqual([]);
+      const listed = (fresh.body["items"] as unknown[]).length;
+      expect(listed).toBeGreaterThanOrEqual(20);
+      // Parked tool approvals are counted from the approvals file at read time, once per
+      // row, as on every other surface; no ledger segment is opened.
+      const isApprovals = (given: string): boolean => given.endsWith("approvals.jsonl");
+      expect(opened.filter((given) => given.endsWith(".jsonl") && !isApprovals(given))).toEqual([]);
+      expect(opened.filter(isApprovals)).toHaveLength(listed);
       opened.length = 0;
       rmSync(index(), { recursive: true, force: true });
       const folded = await home.call("GET", "/api/v1/harnesses?limit=50");
@@ -139,8 +144,9 @@ describe("the read models", () => {
       expect(items.every((item) => item["freshness"] === "direct-fold")).toBe(true);
       const segments = opened.filter((given) => given.endsWith(".jsonl"));
       expect(segments.length).toBeGreaterThan(0);
-      // At most each of the overview's four sources' files, once per harness.
-      expect(segments.length).toBeLessThanOrEqual(items.length * 4);
+      // At most each of the overview's four sources' files, once per harness, and the
+      // approvals file once more for its count.
+      expect(segments.length).toBeLessThanOrEqual(items.length * 5);
     } finally {
       _setIoTapForTest(undefined);
     }

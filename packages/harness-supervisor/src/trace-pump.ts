@@ -27,8 +27,10 @@
  */
 import { randomBytes } from "node:crypto";
 import {
+  constants,
   closeSync,
   existsSync,
+  fstatSync,
   ftruncateSync,
   mkdirSync,
   openSync,
@@ -210,7 +212,9 @@ export type PumpCursor = {
 
 export function readCursor(path: string): PumpCursor | undefined {
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    const text = readSmallRecord(path);
+    if (text === undefined) return undefined;
+    const raw = JSON.parse(text) as Record<string, unknown>;
     const logOffset = raw["logOffset"];
     const eventsBytes = raw["eventsBytes"];
     if (typeof logOffset !== "number" || logOffset < 0) return undefined;
@@ -325,11 +329,50 @@ export function pumpLockPathFor(cursorFile: string): string {
     : `${cursorFile}.pump.lock`;
 }
 
+/** A lease or cursor is a few hundred bytes; anything past this is not one. */
+const SMALL_RECORD_MAX_BYTES = 64 * 1024;
+
+const READ_SMALL_FLAGS =
+  constants.O_RDONLY |
+  ((constants as Record<string, number | undefined>)["O_NOFOLLOW"] ?? 0) |
+  ((constants as Record<string, number | undefined>)["O_NONBLOCK"] ?? 0);
+
+/**
+ * A small record file's text: opened without following a link at its name and without
+ * waiting on a FIFO, read only when it is a regular file of at most `maxBytes`.
+ * `undefined` for anything else.
+ */
+export function readSmallRecord(
+  path: string,
+  maxBytes = SMALL_RECORD_MAX_BYTES,
+): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, READ_SMALL_FLAGS);
+    const stats = fstatSync(fd);
+    if (!stats.isFile() || stats.size > maxBytes) return undefined;
+    const buf = Buffer.alloc(stats.size);
+    let done = 0;
+    while (done < buf.length) {
+      const got = readSync(fd, buf, done, buf.length - done, done);
+      if (got === 0) break;
+      done += got;
+    }
+    return buf.subarray(0, done).toString("utf8");
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 /** Read a pump lease. Absent or not a lease reads as `undefined`. */
 export function readPumpLease(lockFile: string): PumpLease | undefined {
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(lockFile, "utf8"));
+    const text = readSmallRecord(lockFile);
+    if (text === undefined) return undefined;
+    raw = JSON.parse(text);
   } catch {
     return undefined;
   }

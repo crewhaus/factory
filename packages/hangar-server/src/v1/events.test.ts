@@ -5,7 +5,7 @@
  * re-check when it ends, and closes when its caller loses access.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { openAccess } from "@crewhaus/access-control";
 import { decodeCursor, encodeCursor, mintId, mintRunId } from "@crewhaus/control-contract";
@@ -699,5 +699,270 @@ describe("a stream ends its re-check, and closes when its caller loses access", 
     await feed.until((f) => f.some((frame) => frame.event === "auth.revoked"));
     await feed.until(() => false, 1000);
     expect(feed.ended()).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+const traceKinds = (frames: Frame[]) =>
+  frames
+    .filter((f) => f.event === "run.trace")
+    .map((f) => (f.data["payload"] as Record<string, unknown>)["traceKind"]);
+
+const pauseOf = (frames: Frame[]): string => {
+  const pause = frames.at(-1);
+  expect(pause?.event).toBe("stream.pause");
+  return (pause?.data["payload"] as Record<string, unknown>)["resumeFrom"] as string;
+};
+
+describe("a stream over a run that has ended ends wherever it resumes", () => {
+  test("resumed from the terminal frame's id, a run's stream ends with nothing more", async () => {
+    const h = await home.harness("ended-resume");
+    const run = mintRunId();
+    row(h.dir, run, "queued");
+    row(h.dir, run, "succeeded");
+    const first = await open(`/api/v1/runs/${run}/events`);
+    await first.until(() => false, 2000);
+    expect(first.ended()).toBe(true);
+    const terminal = first.frames().find((f) => f.event === "run.succeeded")?.id as string;
+    expect(terminal).toBeDefined();
+    const again = await open(`/api/v1/runs/${run}/events`, {
+      headers: { "last-event-id": terminal },
+    });
+    await again.until(() => false, 2000);
+    expect(again.ended()).toBe(true);
+    expect(again.frames()).toEqual([]);
+  });
+
+  test("resumed from an ended execution's terminal frame, it sends the trace left and ends", async () => {
+    const h = await home.harness("ended-exec-resume");
+    const id = `run_${"e".repeat(8)}${"0".repeat(7)}1`;
+    appendRunLedger(h.dir, {
+      runId: id,
+      kind: "daemon",
+      argv: ["crewhaus", "run"],
+      startedAt: AT,
+      logFile: `logs/${id}.log`,
+    });
+    patchRunLedger(h.dir, { runId: id, endedAt: AT, exitCode: 0 });
+    traceLine(h.dir, id, { kind: "turn_end", runId: id, timestamp: AT, ingestedAt: AT });
+    const first = await open(`/api/v1/runs/${id}/events`);
+    await first.until(() => false, 2000);
+    expect(first.ended()).toBe(true);
+    const terminal = first.frames().find((f) => f.event === "run.succeeded")?.id as string;
+    const again = await open(`/api/v1/runs/${id}/events`, {
+      headers: { "last-event-id": terminal },
+    });
+    await again.until(() => false, 2000);
+    expect(again.ended()).toBe(true);
+    expect(events(again.frames())).toEqual(["run.trace"]);
+  });
+
+  test("an execution only the prune record names says what was removed, and ends", async () => {
+    const h = await home.harness("pruned-only");
+    const id = `run_${"f".repeat(8)}${"0".repeat(7)}2`;
+    mkdirSync(runDir(h.dir), { recursive: true });
+    writeFileSync(prunedRunsPath(h.dir), `${JSON.stringify({ v: 1, at: AT, runs: [id] })}\n`);
+    const feed = await open(`/api/v1/runs/${id}/events`);
+    expect(feed.status).toBe(200);
+    await feed.until(() => false, 2000);
+    expect(feed.ended()).toBe(true);
+    expect(events(feed.frames())).toEqual(["stream.gap"]);
+  });
+});
+
+describe("a run that moves to another execution", () => {
+  test("the old trace's last lines are sent before the stream pauses for the new one", async () => {
+    const h = await home.harness("move-drain");
+    const run = mintRunId();
+    const one = "run_00000000000000d1";
+    const two = "run_00000000000000d2";
+    row(h.dir, run, "running", { execution: one });
+    traceLine(h.dir, one, { kind: "a", runId: run, timestamp: AT });
+    const feed = await open(`/api/v1/runs/${run}/events`);
+    await feed.until((f) => f.length >= 2);
+    // The old execution's last line and the row naming the new one land together.
+    traceLine(h.dir, one, { kind: "a-tail", runId: run, timestamp: AT });
+    row(h.dir, run, "running", { execution: two });
+    traceLine(h.dir, two, { kind: "b", runId: run, timestamp: AT });
+    await feed.until(() => false, 2000);
+    const resumeFrom = pauseOf(feed.frames());
+    row(h.dir, run, "succeeded");
+    const again = await open(`/api/v1/runs/${run}/events`, {
+      headers: { "last-event-id": resumeFrom },
+    });
+    await again.until(() => false, 2000);
+    expect(again.ended()).toBe(true);
+    const all = [...feed.frames(), ...again.frames()];
+    expect(traceKinds(all)).toEqual(["a", "a-tail", "b"]);
+    expect(states(all)).toEqual(["running", "running", "succeeded"]);
+    expect(events(all)).not.toContain("stream.gap");
+    everyFrameParses(all.filter((f) => f.event !== "stream.pause"));
+  });
+
+  test("a client away while the run moved reads the old trace past its cursor, then the new one", async () => {
+    const h = await home.harness("move-away");
+    const run = mintRunId();
+    const one = "run_00000000000000e1";
+    const two = "run_00000000000000e2";
+    row(h.dir, run, "running", { execution: one });
+    traceLine(h.dir, one, { kind: "a1", runId: run, timestamp: AT });
+    const first = await open(`/api/v1/runs/${run}/events`);
+    await first.until((f) => f.length >= 2);
+    await first.close();
+    const last = first.frames().at(-1)?.id as string;
+    // While it is away: one more line of the old trace, a park, and a resume elsewhere.
+    traceLine(h.dir, one, { kind: "a2-missed", runId: run, timestamp: AT });
+    row(h.dir, run, "waiting-for-approval");
+    row(h.dir, run, "running", { execution: two });
+    traceLine(h.dir, two, { kind: "b1", runId: run, timestamp: AT });
+    row(h.dir, run, "succeeded");
+    const back = await open(`/api/v1/runs/${run}/events`, { headers: { "last-event-id": last } });
+    await back.until(() => false, 2000);
+    const resumeFrom = pauseOf(back.frames());
+    const again = await open(`/api/v1/runs/${run}/events`, {
+      headers: { "last-event-id": resumeFrom },
+    });
+    await again.until(() => false, 2000);
+    expect(again.ended()).toBe(true);
+    const after = [...back.frames(), ...again.frames()];
+    expect(traceKinds(after)).toEqual(["a2-missed", "b1"]);
+    expect(states(after)).toEqual(["waiting-for-approval", "running", "succeeded"]);
+    expect(events(after)).not.toContain("stream.gap");
+  });
+});
+
+describe("a run that moves away from a trace that cannot be read", () => {
+  test("says so once and pauses for the new execution, without waiting on it", async () => {
+    const h = await home.harness("move-unreadable");
+    const run = mintRunId();
+    const one = "run_00000000000000d3";
+    const two = "run_00000000000000d4";
+    row(h.dir, run, "running", { execution: one });
+    // A directory where the old trace file would be: it can never be opened.
+    mkdirSync(runEventsPath(h.dir, one), { recursive: true });
+    row(h.dir, run, "running", { execution: two });
+    traceLine(h.dir, two, { kind: "b", runId: run, timestamp: AT });
+    // A fresh open reads the newest execution: resume from the first row's frame instead.
+    const first = await open(`/api/v1/runs/${run}/events`, {});
+    await first.until((f) => f.length >= 1);
+    await first.close();
+    const cursor = decodeCursor(first.frames()[0]?.id);
+    if (!cursor.ok || cursor.cursor.kind !== "vector") throw new Error("no vector cursor");
+    const rowsOnly = encodeCursor({
+      v: 1,
+      kind: "vector",
+      sources: { rows: cursor.cursor.sources.rows ?? [] },
+    });
+    const back = await open(`/api/v1/runs/${run}/events`, {
+      headers: { "last-event-id": rowsOnly },
+    });
+    expect(await back.until((f) => f.at(-1)?.event === "stream.pause", 2000)).toBe(true);
+    const gaps = back.frames().filter((f) => f.event === "stream.gap");
+    expect(gaps).toHaveLength(1);
+    expect(states(back.frames())).toEqual(["running"]);
+  });
+});
+
+describe("an execution's prune record is read contained and bounded", () => {
+  test("a linked prune record names no execution: its stream answers run_unknown", async () => {
+    const h = await home.harness("prune-link");
+    const id = "run_00000000000000f3";
+    const outside = join(home.t.harnessesRoot, "prune-link-elsewhere.jsonl");
+    writeFileSync(outside, `${JSON.stringify({ v: 1, at: AT, runs: [id] })}\n`);
+    mkdirSync(runDir(h.dir), { recursive: true });
+    symlinkSync(outside, prunedRunsPath(h.dir));
+    const res = await home.call("GET", `/api/v1/runs/${id}/events?harness=${h.id}`);
+    expect([res.status, (res.body["error"] as Record<string, unknown>)?.["reason"]]).toEqual([
+      404,
+      "run_unknown",
+    ]);
+  });
+
+  test("a prune older than the lines read names no execution", async () => {
+    const h = await home.harness("prune-long");
+    const id = "run_00000000000000f4";
+    mkdirSync(runDir(h.dir), { recursive: true });
+    const filler = `${JSON.stringify({ v: 1, at: AT, runs: [] })}\n`.repeat(1001);
+    writeFileSync(
+      prunedRunsPath(h.dir),
+      `${JSON.stringify({ v: 1, at: AT, runs: [id] })}\n${filler}`,
+    );
+    const res = await home.call("GET", `/api/v1/runs/${id}/events`);
+    expect([res.status, (res.body["error"] as Record<string, unknown>)?.["reason"]]).toEqual([
+      404,
+      "run_unknown",
+    ]);
+  });
+});
+
+describe("a {run} operation other than the stream is answered from canonical runs only", () => {
+  test("a run ledger row named like another harness's execution reaches no one through it", async () => {
+    const a = await home.harness("planted-a");
+    const b = await home.harness("planted-b");
+    const exec = "run_00000000deadbe01";
+    appendRunLedger(a.dir, {
+      runId: exec,
+      kind: "daemon",
+      argv: ["crewhaus", "run"],
+      startedAt: AT,
+      logFile: `logs/${exec}.log`,
+    });
+    row(b.dir, exec, "running", { session: "sess_00000000000000bb", execution: exec });
+    const member = await home.member("Planted", "maintainer", { scope: `harness:${a.id}` });
+    const ops = [
+      ["GET", `/api/v1/runs/${exec}`],
+      ["GET", `/api/v1/runs/${exec}/result`],
+      ["POST", `/api/v1/runs/${exec}/cancel`],
+      ["POST", `/api/v1/runs/${exec}/resume`],
+    ] as const;
+    for (const [method, path] of ops) {
+      const asMember = await home.call(method, path, {
+        secret: member.secret,
+        ...(method === "POST" ? { body: {} } : {}),
+      });
+      // The member hears what it hears for any run this Home does not have.
+      expect([path, asMember.status]).toEqual([path, 403]);
+      expect(JSON.stringify(asMember.body)).not.toContain(b.id);
+      const asOwner = await home.call(method, path, method === "POST" ? { body: {} } : {});
+      expect([
+        path,
+        asOwner.status,
+        (asOwner.body["error"] as Record<string, unknown>)?.["reason"],
+      ]).toEqual([path, 404, "run_unknown"]);
+    }
+    // The stream itself is A's execution, decided and served on A.
+    const feed = await open(`/api/v1/runs/${exec}/events`, { secret: member.secret });
+    expect(feed.status).toBe(200);
+    await feed.until((f) => f.length >= 1);
+    await feed.close();
+    expect(feed.frames()[0]?.data["harness"]).toBe(a.id);
+  });
+});
+
+describe("a frame cap that lands on a run's terminal frame", () => {
+  let capped: V1Home;
+  beforeAll(async () => {
+    capped = await v1Home({ streamTimings: { pollMs: 10, heartbeatMs: 60_000, maxFrames: 2 } });
+  }, 60_000);
+  afterAll(async () => {
+    await capped?.t.stop();
+  });
+
+  test("pauses there, and the reconnect from it ends", async () => {
+    const h = await capped.harness("cap-terminal");
+    const run = mintRunId();
+    row(h.dir, run, "queued");
+    row(h.dir, run, "succeeded");
+    const get = (path: string, headers: Record<string, string> = {}) =>
+      fetch(`${capped.t.base}${path}`, { headers: { ...bearer(capped.session), ...headers } });
+    const first = parse(await (await get(`/api/v1/runs/${run}/events`)).text());
+    expect(events(first)).toEqual(["run.queued", "run.succeeded", "stream.pause"]);
+    const resumeFrom = pauseOf(first);
+    // Read whole: the body ends only when the stream does.
+    const again = parse(
+      await (await get(`/api/v1/runs/${run}/events`, { "last-event-id": resumeFrom })).text(),
+    );
+    expect(again).toEqual([]);
   });
 });

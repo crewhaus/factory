@@ -5,6 +5,7 @@
  * projection); a fleet list counts only the harnesses the caller may read.
  */
 import {
+  APPROVAL_ID_RE,
   CAPABILITY_NAMES,
   type CapabilityDescriptor,
   type HarnessDisplayState,
@@ -27,6 +28,7 @@ import {
   servedOverview,
 } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
+import { pendingApprovalCount } from "../approvals";
 import type { DaemonStatus, V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { emptyOf, fleetSnapshot } from "./lists";
@@ -83,6 +85,14 @@ export async function overviewOf(ctx: V1Context, entry: HangarHarnessEntry) {
     model === undefined
       ? { operatorState: operatorStateOf(undefined, undefined) }
       : servedOverview(model.state);
+  // Tool approvals are counted from the approvals file, where every daemon parks them and
+  // where Home's other surfaces count them (a relocated session root included); the other
+  // open decisions come from the decision records.
+  const openDecisions =
+    dir === undefined || model === undefined
+      ? undefined
+      : pendingApprovalCount(dir) +
+        Object.keys(model.state.open).filter((id) => !APPROVAL_ID_RE.test(id)).length;
   // An area's own overview projections, beside the core's.
   const areas: Record<string, unknown> = {};
   if (dir !== undefined) {
@@ -99,6 +109,7 @@ export async function overviewOf(ctx: V1Context, entry: HangarHarnessEntry) {
     createdAt: entry.registeredAt,
     display: await displayOf(ctx, entry, dir),
     ...records,
+    ...(openDecisions !== undefined ? { openDecisions } : {}),
     ...(Object.keys(areas).length > 0 ? { areas } : {}),
     asOf: new Date(now).toISOString(),
     ...(model !== undefined ? { stale: model.stale } : {}),

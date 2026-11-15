@@ -401,9 +401,14 @@ export function createV1Router(
         if (startedRunIn(entry, caller.principal)) out.runBy = caller.principal;
       }
     } else if (run !== undefined && EXECUTION_RUN_ID_RE.test(run)) {
-      // A supervisor's execution: found in one harness's supervisor ledger, or none.
-      const found = findExecution(deps, run, url.searchParams.get("harness") ?? undefined);
-      out.targetHarness = found?.entry.id ?? null;
+      // A supervisor's execution is a stream's only: found in one harness's supervisor
+      // ledger, or none. Every other run operation reads canonical runs, so it has none.
+      if (op.id === "runs.events") {
+        const found = findExecution(deps, run, url.searchParams.get("harness") ?? undefined);
+        out.targetHarness = found?.entry.id ?? null;
+      } else {
+        out.targetHarness = null;
+      }
     } else if (run !== undefined) {
       const found = findRun(deps, run, url.searchParams.get("harness") ?? undefined);
       out.targetHarness = found?.entry.id ?? null;
