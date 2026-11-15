@@ -11,8 +11,13 @@
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { HOME_SOCKET, TOKEN_FILENAME } from "@crewhaus/access-control";
-import { loopbackBase, readHangarLock } from "./hangar-cmd";
+import {
+  HOME_SOCKET,
+  TOKEN_FILENAME,
+  isLoopbackAddress,
+  socketsSupported,
+} from "@crewhaus/access-control";
+import { defaultIsPidAlive, readHangarLock } from "./hangar-cmd";
 
 /** One kept sign-in: the token, the credential it is recorded as, and when it ends. */
 export type RemoteToken = {
@@ -206,19 +211,59 @@ export type Transport = {
   readonly token?: string;
 };
 
+/** What `localTransport` takes from the computer it runs on: injected in tests. */
+export type LocalTransportOptions = {
+  /** Whether the process holding Home's lock is running (default: signal 0). */
+  readonly isPidAlive?: (pid: number) => boolean;
+  /** The operating system, which decides whether Home has its own socket. */
+  readonly platform?: NodeJS.Platform;
+};
+
+/** Why `localTransport` sent nothing, and the control band's code for it. */
+export type LocalRefusal = {
+  readonly reason: string;
+  /** `unavailable`: no Home is set up or running here. `unauthenticated`: a Home runs
+   *  here, at an address this computer's key is not sent to. */
+  readonly code: "unavailable" | "unauthenticated";
+  /** What to do about it, when there is something to say. */
+  readonly hint?: string;
+};
+
+const NOT_RUNNING = "Home is not running on this computer. Start it with `crewhaus hangar`.";
+
+/** The loopback IP literal (127.0.0.0/8 or ::1) and port in a lock's `http://host:port`
+ *  address, as a base URL; `undefined` for any other host, `localhost` included. */
+function loopbackLiteralBase(url: string): string | undefined {
+  const match = /^http:\/\/(.+):(\d+)$/.exec(url);
+  if (match === null) return undefined;
+  const host = (match[1] as string).replace(/^\[(.*)\]$/, "$1");
+  if (!isLoopbackAddress(host)) return undefined;
+  return `http://${host.includes(":") ? `[${host}]` : host}:${match[2] as string}`;
+}
+
 /**
- * This computer's Home: its own socket when it is there, loopback otherwise, with Home's
- * own key. `undefined` when Home is not running here or its key cannot be read.
+ * This computer's Home, or why nothing was sent. With no running Home (no lock, its
+ * process gone, or no address in it) nothing is sent. On macOS and Linux, Home's own key
+ * travels only over Home's own socket (`0600`, inside Home's `0700` directory), and a
+ * running Home without its socket is refused here, with nothing sent. On Windows, where
+ * Home has no socket, the key goes over loopback only to a running Home whose address is
+ * a loopback IP: the address Home binds first, and holds for as long as it runs.
  */
 export function localTransport(
   hangarRoot: string,
   fetchImpl: typeof fetch = fetch,
-): Transport | { readonly reason: string } {
+  opts: LocalTransportOptions = {},
+): Transport | LocalRefusal {
+  const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
+  const platform = opts.platform ?? process.platform;
   let token: string;
   try {
     token = readFileSync(join(hangarRoot, TOKEN_FILENAME), "utf8").trim();
   } catch {
-    return { reason: "Home is not set up on this computer. Start it with `crewhaus hangar`." };
+    return {
+      reason: "Home is not set up on this computer. Start it with `crewhaus hangar`.",
+      code: "unavailable",
+    };
   }
   const sock = join(hangarRoot, HOME_SOCKET);
   if (existsSync(sock)) {
@@ -229,12 +274,24 @@ export function localTransport(
     };
   }
   const lock = readHangarLock(hangarRoot);
-  if (lock === undefined) {
-    return { reason: "Home is not running on this computer. Start it with `crewhaus hangar`." };
+  if (lock === undefined || !isPidAlive(lock.pid) || lock.url === "") {
+    return { reason: NOT_RUNNING, code: "unavailable" };
   }
-  return {
-    baseUrl: loopbackBase(lock.url, lock.port),
-    token,
-    fetch: (input, init) => fetchImpl(input, init),
-  };
+  // Where Home makes its own socket, its key is for that socket only.
+  if (socketsSupported(platform)) {
+    return {
+      reason: "Home is running without its own socket, so this computer's key was not sent.",
+      code: "unauthenticated",
+      hint: "Home makes no socket when it is started with --no-auth, or when the path to its directory is too long for one; its start-up warnings say which.",
+    };
+  }
+  const baseUrl = loopbackLiteralBase(lock.url);
+  if (baseUrl === undefined) {
+    return {
+      reason: `Home is listening at ${lock.url}, which is not a loopback address, so this computer's key was not sent.`,
+      code: "unauthenticated",
+      hint: "Start Home without --host or --lan, or sign in with `crewhaus login --server <url>` and pass --server.",
+    };
+  }
+  return { baseUrl, token, fetch: (input, init) => fetchImpl(input, init) };
 }

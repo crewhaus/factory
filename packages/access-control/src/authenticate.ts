@@ -47,6 +47,16 @@ export const HOME_SOCKET = "home.sock";
  */
 export const PROXY_SOCKET = "proxy.sock";
 
+/**
+ * Whether Home makes its own sockets on this platform: everywhere but Windows. One rule
+ * decides both where Home binds its socket and where a client expects one.
+ *
+ * First consumers: Home's listeners, and `crewhaus api` on this computer.
+ */
+export function socketsSupported(platform: string = process.platform): boolean {
+  return platform !== "win32";
+}
+
 /** Where a request arrived: Home's TCP listener, its own socket, or the proxy's socket. */
 export type Listener = "tcp" | "home.sock" | "proxy.sock";
 

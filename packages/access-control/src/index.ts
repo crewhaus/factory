@@ -69,6 +69,7 @@ export {
   BOOTSTRAP_PRINCIPAL,
   HOME_SOCKET,
   PROXY_SOCKET,
+  socketsSupported,
   type Identified,
   type Listener,
   PROXY_SECRET_HEADER,
