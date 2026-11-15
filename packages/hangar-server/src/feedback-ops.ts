@@ -706,12 +706,18 @@ export const adviceApply: M3Handler = async (ctx) => {
   if (proposal.tier !== "auto-tunable") throw humanOwnedRefusal(proposal.tierReason);
 
   const preview = await previewHomeEdits(ctx, before, [edit], check, { restrict: true });
-  if (preview.stage === "schema") {
+  if (preview.stage === "schema" || preview.stage === "placeholder") {
     return {
-      ...found("the harness's schema refuses this change — nothing was written", "crewhaus advise"),
+      ...found(
+        preview.stage === "schema"
+          ? "the harness's schema refuses this change — nothing was written"
+          : "this change holds the placeholder for a hidden value — nothing was written",
+        "crewhaus advise",
+      ),
       ok: false,
       code: "edit_rejected",
       reason: preview.error,
+      ...(preview.issues !== undefined ? { issues: preview.issues } : {}),
       adviceId,
       applied: false,
     };

@@ -116,7 +116,7 @@ describe("every served operation answers its row's shape", () => {
   test("each handler, asked once", async () => {
     const seal = async () => (await makeSeal()).seal;
     const devices = openDeviceRequests(home.t.hangarRoot);
-    const started = await devices.start({});
+    const started = await devices.start({ requestedFrom: { via: "home" } });
     if (!started.ok) throw new Error(started.reason);
     const invited = await openAccess(home.t.hangarRoot).createInvite(
       { principal: home.owner },

@@ -68,11 +68,13 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
+import { NON_SECRET_ENV_KEYS } from "@crewhaus/harness-supervisor";
 import { type Spec, parseSpec, parseSpecIssues, specJsonSchema } from "@crewhaus/spec";
 import { autoRegisterSpecVersion } from "@crewhaus/spec-changelog/spec-changelog";
 import {
   OPTIMIZABLE_PATHS,
   REDACTED_VALUE,
+  RESERVED_PATH_SEGMENTS,
   type SpecDiffEntry,
   type SpecEdit,
   applySpecEdits,
@@ -108,6 +110,7 @@ import {
   requireTypedConfirm,
 } from "./m3";
 import { maskDeep, maskSpecYaml, maskText } from "./mask";
+import { specCredentialValues } from "./runs";
 import { resolveContained } from "./safety";
 import { type ChildTimer, type SpawnChild, validateInHarness } from "./spec-validator-child";
 
@@ -700,6 +703,11 @@ export async function commitHomeEdits(
           if (state !== null) {
             return { ok: false, code: "read-only", reason: state.reason, paths: state.paths };
           }
+        }
+        // A hidden value's placeholder is never written, whoever sends it.
+        const masked = placeholderRefusal(ctx, before, yamlText);
+        if (masked !== undefined) return { ok: false, ...masked };
+        if (before !== undefined) {
           // On the text this commit writes, inside the lock: a change on a security surface
           // or a raise of spending needs the security edit permission, whatever the
           // caller's preview said.
@@ -759,6 +767,216 @@ function escalationBetween(before: string, after: string): ReturnType<typeof esc
   } catch {
     return [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// a hidden value's placeholder is never written
+// ---------------------------------------------------------------------------
+
+/** A `«NAME»` token as the env scrubber writes it; the name decides whether it is one. */
+const SCRUBBED_NAME_RE = /«([^«»\s]{1,128})»/g;
+
+/** The issue code every placeholder refusal carries. */
+const PLACEHOLDER_ISSUE_CODE = "masked_placeholder";
+
+/**
+ * How many nodes of the edited spec the placeholder scan visits. A spec this
+ * server writes is capped in bytes, but YAML aliases share a subtree between
+ * paths, so the scan counts nodes and refuses the whole change past this.
+ */
+const MAX_PLACEHOLDER_NODES = 200_000;
+
+/** Nothing at this path in the current file. */
+const ABSENT: unique symbol = Symbol("absent");
+
+/** Where a placeholder sits: in a mapping's key (`key`) or in a string value (`value`). */
+type PlaceholderHit = { readonly path: string[]; readonly kind: "key" | "value" | "budget" };
+
+/** Whether a text holds `[redacted]`, or a `«NAME»` token for a name in `names`. */
+function holdsPlaceholder(text: string, names: ReadonlySet<string>): boolean {
+  if (text.includes(REDACTED_VALUE)) return true;
+  for (const match of text.matchAll(SCRUBBED_NAME_RE)) {
+    if (names.has(match[1] ?? "")) return true;
+  }
+  return false;
+}
+
+/** A parsed tree, or `undefined` when the text is not YAML. Never throws. */
+function parsedTree(text: string): { tree: unknown } | undefined {
+  try {
+    return { tree: parseYamlOnly(text) };
+  } catch {
+    return undefined;
+  }
+}
+
+function placeholderHits(
+  before: string | undefined,
+  after: string,
+  names: ReadonlySet<string>,
+): PlaceholderHit[] {
+  const edited = parsedTree(after);
+  if (edited === undefined) return [];
+  const current = before === undefined ? undefined : parsedTree(before);
+  const hits: PlaceholderHit[] = [];
+  // The walk keeps, beside each node, the current file's node at the same path, read
+  // through own properties and in-range indexes only.
+  const stack: Array<{ node: unknown; prior: unknown; path: string[] }> = [
+    { node: edited.tree, prior: current === undefined ? {} : current.tree, path: [] },
+  ];
+  let visited = 0;
+  while (stack.length > 0) {
+    const { node, prior, path } = stack.pop() as (typeof stack)[number];
+    visited += 1;
+    if (visited > MAX_PLACEHOLDER_NODES) return [{ path: [], kind: "budget" }];
+    if (typeof node === "string") {
+      if (holdsPlaceholder(node, names) && prior !== node) hits.push({ path, kind: "value" });
+    } else if (Array.isArray(node)) {
+      const priorItems = Array.isArray(prior) ? prior : undefined;
+      for (let i = node.length - 1; i >= 0; i -= 1) {
+        stack.push({
+          node: node[i],
+          prior: priorItems !== undefined && i < priorItems.length ? priorItems[i] : ABSENT,
+          path: [...path, String(i)],
+        });
+      }
+    } else if (isPlainObject(node)) {
+      const priorMap = isPlainObject(prior) ? prior : undefined;
+      const keys = Object.keys(node);
+      for (let i = keys.length - 1; i >= 0; i -= 1) {
+        const key = keys[i] as string;
+        const known = priorMap !== undefined && Object.hasOwn(priorMap, key);
+        if (holdsPlaceholder(key, names) && !known) {
+          // The whole entry is refused under its key; nothing below it needs naming.
+          hits.push({ path: [...path, key], kind: "key" });
+          continue;
+        }
+        stack.push({
+          node: node[key],
+          prior: known ? (priorMap as Record<string, unknown>)[key] : ABSENT,
+          path: [...path, key],
+        });
+      }
+    }
+  }
+  return hits;
+}
+
+/**
+ * The paths at which `after` holds a hidden value's placeholder that `before`
+ * does not hold at the same path: `[redacted]`, or a `«NAME»` token naming one
+ * of `names`, in a string value or in a mapping's key, at any depth. Text the
+ * file already holds at that exact path (sequence indexes included) is kept.
+ * `***` is never a placeholder here: prose and globs use it.
+ *
+ * Pure, and never throws. An `after` that is not YAML answers `[]` (the
+ * commit's own parse refuses it); a `before` that is absent or not YAML is
+ * read as an empty mapping. A spec past the scan's node budget answers the
+ * root path, so it is refused whole.
+ *
+ * First consumers: {@link commitHomeEdits}' in-lock validation and
+ * {@link previewHomeEdits}.
+ */
+export function maskedPlaceholderPaths(
+  before: string | undefined,
+  after: string,
+  names: ReadonlySet<string>,
+): string[][] {
+  return placeholderHits(before, after, names).map((hit) => hit.path);
+}
+
+/**
+ * The names a `«NAME»` placeholder can carry for this harness: every key of
+ * the merged environment with a string value, except the operational ones the
+ * scrubber never replaces, plus the credential keys the spec itself holds.
+ * A name the scrubber might not emit is refused too; a name it can emit is
+ * never missed.
+ */
+export function placeholderNames(ctx: Pick<M3Context, "env" | "harnessDir">): Set<string> {
+  const names = new Set<string>();
+  for (const [key, value] of Object.entries(ctx.env ?? {})) {
+    if (typeof value === "string" && !NON_SECRET_ENV_KEYS.has(key)) names.add(key);
+  }
+  if (ctx.harnessDir !== null) {
+    for (const key of Object.keys(specCredentialValues(ctx.harnessDir))) names.add(key);
+  }
+  return names;
+}
+
+/** A path as the refusal names it: a segment holding placeholder text is not quoted. */
+function placeholderPathText(path: readonly string[]): string {
+  return path
+    .map((seg) => (seg.includes(REDACTED_VALUE) || /«[^«»]*»/.test(seg) ? "(hidden)" : seg))
+    .join(".");
+}
+
+/** The issue row that names one placeholder, for a newcomer; never the token or a value. */
+function placeholderIssue(hit: PlaceholderHit): EditIssueRow {
+  if (hit.kind === "budget") {
+    return {
+      path: [],
+      message:
+        "This spec is too large to check for hidden values here. Edit crewhaus.yaml instead.",
+      code: PLACEHOLDER_ISSUE_CODE,
+    };
+  }
+  if (hit.kind === "key") {
+    const parent = placeholderPathText(hit.path.slice(0, -1));
+    return {
+      path: hit.path,
+      message: `A setting name ${parent === "" ? "at the top of the spec" : `under ${parent}`} holds the placeholder for a hidden value. Type the real name, or leave it as it is.`,
+      code: PLACEHOLDER_ISSUE_CODE,
+    };
+  }
+  return {
+    path: hit.path,
+    message: `${placeholderPathText(hit.path)} holds the placeholder for a hidden value. Type the real value, or leave the setting as it is.`,
+    code: PLACEHOLDER_ISSUE_CODE,
+  };
+}
+
+/**
+ * The refusal of a change whose new text holds a hidden value's placeholder,
+ * or `undefined` when it holds none. The same rows and reason in a commit and
+ * in a preview.
+ */
+function placeholderRefusal(
+  ctx: Pick<M3Context, "env" | "harnessDir">,
+  before: string | undefined,
+  after: string,
+): { reason: string; paths: string[]; issues: EditIssueRow[] } | undefined {
+  const hits = placeholderHits(before, after, placeholderNames(ctx));
+  if (hits.length === 0) return undefined;
+  const issues = hits.map(placeholderIssue);
+  return {
+    reason: issues
+      .slice(0, 5)
+      .map((row) => row.message)
+      .join(" "),
+    paths: hits.map((hit) => placeholderPathText(hit.path)),
+    issues,
+  };
+}
+
+/** A preview refused because its edited text holds a placeholder, or `undefined`. */
+function placeholderPreview(
+  ctx: Pick<M3Context, "env" | "harnessDir">,
+  before: string,
+  edits: readonly SpecEdit[],
+  preview: SpecPreview,
+): SpecPreview | undefined {
+  if (!preview.ok || preview.yaml === null || edits.length === 0) return undefined;
+  const refused = placeholderRefusal(ctx, before, preview.yaml);
+  if (refused === undefined) return undefined;
+  return {
+    ok: false,
+    entries: [],
+    diff: "",
+    error: refused.reason,
+    yaml: null,
+    stage: "placeholder",
+    issues: refused.issues,
+  };
 }
 
 /** One issue row, as the editor anchors it to a field. */
@@ -1119,7 +1337,11 @@ export function effectiveConfigOf(
   const walk = (node: unknown, segments: string[]): void => {
     if (truncated) return;
     if (isPlainObject(node)) {
-      for (const [key, child] of Object.entries(node)) walk(child, [...segments, key]);
+      for (const [key, child] of Object.entries(node)) {
+        // A reserved name is never a setting: it is neither a row nor walked into.
+        if (RESERVED_PATH_SEGMENTS.includes(key)) continue;
+        walk(child, [...segments, key]);
+      }
       return;
     }
     if (segments.length === 0) return;
@@ -1266,8 +1488,11 @@ export type SpecPreview = {
   readonly error: string | null;
   /** The edited text, UNMASKED (a write source, never an answer); null when the batch does not apply. */
   readonly yaml: string | null;
-  /** Why it failed: the batch does not apply, or the harness's own schema refuses the result. */
-  readonly stage?: "apply" | "schema";
+  /** Why it failed: the batch does not apply, the harness's own schema refuses the result, or
+   *  the result holds a hidden value's placeholder. */
+  readonly stage?: "apply" | "schema" | "placeholder";
+  /** The rows that name each placeholder (stage `placeholder` only). */
+  readonly issues?: ReadonlyArray<EditIssueRow>;
 };
 
 export function previewSpecEdits(
@@ -1302,15 +1527,20 @@ export function previewSpecEdits(
  * by that schema in its child; otherwise this manager's schema decides.
  */
 export async function previewHomeEdits(
-  ctx: Pick<M3Context, "harnessDir" | "adopted" | "entry">,
+  ctx: Pick<M3Context, "harnessDir" | "adopted" | "entry" | "env">,
   before: string,
   edits: readonly SpecEdit[],
   check: SchemaCheck,
   opts: { readonly restrict?: boolean } = {},
 ): Promise<SpecPreview> {
-  if (check.source !== "harness") return previewSpecEdits(before, edits, opts);
+  if (check.source !== "harness") {
+    const preview = previewSpecEdits(before, edits, opts);
+    return placeholderPreview(ctx, before, edits, preview) ?? preview;
+  }
   const preview = previewSpecEdits(before, edits, { ...opts, parse: parseYamlOnly });
   if (!preview.ok || preview.yaml === null || edits.length === 0) return preview;
+  const masked = placeholderPreview(ctx, before, edits, preview);
+  if (masked !== undefined) return masked;
   const after = await checkSpec(ctx, preview.yaml, "issues");
   if (after.issues.length === 0) return preview;
   return {
@@ -1385,6 +1615,21 @@ async function applyBatch(
   if (gated && human.length > 0 && !confirmed) {
     // The interstitial's data: what would change, and why it is gated.
     const preview = await previewHomeEdits(ctx, file.text, edits, check);
+    if (preview.stage === "placeholder") {
+      return {
+        ...refusal("edit_rejected", preview.error ?? "", {
+          specName: file.specName,
+          target: file.target,
+          issues: preview.issues ?? [],
+          schemaSource: check.source,
+          schemaNote: check.note,
+          rev: file.rev,
+          hash: file.hash,
+          verb: "crewhaus compile crewhaus.yaml -o dist",
+        }),
+        tiers: { autoTunable: auto, humanOwned: human },
+      };
+    }
     const escalations = escalationsFor(file.text, edits);
     const warning = escalations.map((e) => e.reason).join(" ");
     throw new HttpError(
@@ -1606,7 +1851,9 @@ export const specDiff: M3Handler = async (ctx) => {
   const preview = await previewHomeEdits(ctx, file.text, edits, check);
   const escalations = escalationsFor(file.text, edits);
   // A refused preview names the edited text's issues, so the editor can put each beside its field.
-  const refused = preview.ok ? null : await editedIssues(ctx, file.text, edits, check, false);
+  const refused = preview.ok
+    ? null
+    : await editedIssues(ctx, file.text, edits, check, false, preview.issues);
   return {
     ok: preview.ok,
     ...(refused === null
@@ -2153,7 +2400,7 @@ export const specPropose: M3Handler = async (ctx) => {
   const preview = await previewHomeEdits(ctx, file.text, edits, check);
   if (!preview.ok || preview.yaml === null) {
     return refusal("edit_rejected", preview.error ?? "the batch does not apply", {
-      issues: issueRows(check),
+      issues: preview.issues ?? issueRows(check),
       verb: "crewhaus compile crewhaus.yaml -o dist",
     });
   }

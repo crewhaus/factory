@@ -858,7 +858,7 @@ describe("rows, pinned", () => {
       class: ["decisions.resolve"],
       "maintainer-or-above": ["decisions.supersede"],
       "subject-assert": ["runs.create"],
-      "creating-service": ["runs.cancel", "runs.get", "runs.list", "runs.resume"],
+      "creating-service": ["runs.cancel", "runs.get", "runs.list"],
       "human-only": ["deployments.activate", "rules.create", "rules.revoke"],
       self: [
         "access.devices.list",

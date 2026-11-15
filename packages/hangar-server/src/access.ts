@@ -482,9 +482,12 @@ export type AuthorizeRequestInput = {
   readonly selfScope?: true;
   /**
    * For a versioned-API row qualified `creating-service`: who started the run it names (a
-   * run list: the caller itself). A service whose principal it is may act on that run.
+   * run list: the caller itself). That service acts on the run only through the credential
+   * `runByCredential` names.
    */
   readonly runBy?: string;
+  /** For a versioned-API row qualified `creating-service`: the credential that started the run. */
+  readonly runByCredential?: string;
   /** The request's `Origin` header. */
   readonly origin?: string | null;
   /** Whether an origin is Home's own. */
@@ -577,8 +580,16 @@ export function authorizeRequest(input: AuthorizeRequestInput): RequestAuthoriza
   }
   const verdict = authorizeCaller(caller, view, row.permission, target, ref);
   if (verdict.allow) return { allow: true };
-  // The service that started a run acts on it, whatever else it holds.
-  if (input.runBy !== undefined && caller.via === "service" && caller.principal === input.runBy) {
+  // The credential that started a run acts on it, whatever else it holds.
+  const credential =
+    caller.actor !== null && "credential" in caller.actor ? caller.actor.credential : undefined;
+  if (
+    input.runBy !== undefined &&
+    input.runByCredential !== undefined &&
+    caller.via === "service" &&
+    caller.principal === input.runBy &&
+    credential === input.runByCredential
+  ) {
     return { allow: true };
   }
   if ("reason" in verdict) return { allow: false, refusal: TAB_ONLY_REFUSAL };

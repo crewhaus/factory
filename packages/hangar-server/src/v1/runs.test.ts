@@ -2,8 +2,9 @@
  * Runs through Home's versioned API, on fixture harnesses with Home's own fake process
  * seam (nothing is spawned): starting a run on a cli, crew, managed, channel and pipeline
  * harness, what the operator record and an old build refuse before anything is written, a
- * service's idempotency key, the subject permission, reading a run and its result, a
- * creating service's own list, cancelling and resuming.
+ * service's idempotency key, the subject permission, reading a run and its result, the
+ * runs a service credential started answering to that credential alone, cancelling and
+ * resuming, the operator prep every start runs, and how many API runs Home holds at once.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
@@ -12,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -70,6 +72,96 @@ function stamp(dir: string, entry: string, compiledWith: string): void {
 }
 
 const spawnedSince = (before: number) => (home.t.ops?.children ?? []).slice(before);
+
+/** A harness's `preSpawn` hook, which a start runs before its job (an empty object: none). */
+function hookOf(dir: string, preSpawn?: readonly string[]): void {
+  mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+  writeFileSync(
+    join(dir, ".crewhaus", "settings.json"),
+    JSON.stringify(preSpawn === undefined ? {} : { manager: { hooks: { preSpawn } } }),
+  );
+}
+
+type Child = NonNullable<V1Home["t"]["ops"]>["children"][number];
+
+/** The first child spawned on `on` since `from` that `matches`, waited for over a bounded count of ticks. */
+async function childWhere(
+  on: V1Home,
+  from: number,
+  matches: (child: Child) => boolean,
+): Promise<Child> {
+  for (let tick = 0; tick < 5000; tick += 1) {
+    const found = (on.t.ops?.children ?? []).slice(from).find(matches);
+    if (found !== undefined) return found;
+    await Bun.sleep(0);
+  }
+  throw new Error("no such child was spawned");
+}
+
+const isHook = (child: Child) => child.request.argv[0] === "/usr/bin/false";
+const isJob = (child: Child) => child.request.argv[1] === "run";
+
+/** The files saved under a harness's run inputs. */
+function inputsIn(dir: string): string[] {
+  const inputs = join(dir, controlPaths(dir).inputsDir);
+  return existsSync(inputs) ? readdirSync(inputs).sort() : [];
+}
+
+/**
+ * An API run parked as the runtime leaves one: the root's rows, its top-level loop's own
+ * run (`parent` the root) that parked, the root closed parked, its input file, and the
+ * request bound to the loop run. `queued` sets fields of the root's queued row.
+ */
+async function parkedRun(dir: string, queued: Record<string, unknown> = { by: "sys:reconcile" }) {
+  const runId = mintRunId();
+  const child = mintRunId();
+  const at = new Date().toISOString();
+  const ledger = runsLedger(dir);
+  const execution = "run_00000000000000aa";
+  const row = (id: string, state: string, more: Record<string, unknown> = {}) =>
+    append(ledger, { id, state, at, trigger: { kind: "api" }, ...more });
+  row(runId, "queued", queued);
+  row(runId, "preparing", { execution });
+  row(runId, "running", { execution });
+  row(child, "running", {
+    parent: runId,
+    session: "sess_00000000000000cc",
+    resumeScope: `run:${runId}`,
+    execution,
+  });
+  row(child, "waiting-for-approval");
+  row(runId, "waiting-for-approval", { execution });
+  const inputs = join(dir, controlPaths(dir).inputsDir);
+  mkdirSync(inputs, { recursive: true });
+  writeFileSync(join(inputs, `${runId}.json`), JSON.stringify({ v: 1, run: runId, input: "x" }), {
+    mode: 0o600,
+  });
+  const approval = generateApprovalId();
+  const store = createPendingApprovalStore({ rootDir: join(dir, ".crewhaus", "sessions") });
+  await store.persist({
+    id: approval,
+    toolName: "Bash",
+    inputHash: hashApprovalInput("Bash", { command: "ls" }),
+    runId: child,
+    sessionId: "sess_00000000000000cc",
+    surface: "single-turn",
+    createdAt: at,
+    binding: { runId: child, resumeScope: `run:${runId}` },
+  } as Parameters<typeof store.persist>[0]);
+  return { runId, child, approval, store };
+}
+
+/** A parked API run whose decision is made: only a start stands between it and running again. */
+async function decidedRun(dir: string, queued?: Record<string, unknown>) {
+  const parked = await parkedRun(dir, queued);
+  await parked.store.resolve(parked.approval, "grant", "owner");
+  return parked;
+}
+
+const newestState = (dir: string, runId: string) => {
+  const fold = foldStates(runsLedger(dir));
+  return fold.ok ? fold.objects.get(runId)?.state : "unreadable";
+};
 
 describe("starting a run", () => {
   test("a cli run: 202, a 0600 record with the subject, a queued row naming who and the receipt, and a closed-vocabulary spawn", async () => {
@@ -287,6 +379,7 @@ describe("a service starting runs", () => {
       at: new Date().toISOString(),
       trigger: { kind: "api" },
       by: svc.principal,
+      byCredential: svc.credential,
     });
     const cancel = () =>
       home.call("POST", `/api/v1/runs/${runId}/cancel`, {
@@ -322,10 +415,19 @@ describe("a service starting runs", () => {
     // Its token covers another harness only: what it may do here is what it started.
     const svc = await home.service("own", [elsewhere.id], { permissions: ["h.run.submit"] });
     const ledger = runsLedger(h.dir);
-    const [mineId, theirsId] = [mintRunId(), mintRunId()];
+    const [mineId, theirsId, unnamedId] = [mintRunId(), mintRunId(), mintRunId()];
     const at = new Date().toISOString();
     append(ledger, {
       id: mineId,
+      state: "queued",
+      at,
+      trigger: { kind: "api" },
+      by: svc.principal,
+      byCredential: svc.credential,
+    });
+    // Its own principal, but no credential named: nothing grants it.
+    append(ledger, {
+      id: unnamedId,
       state: "queued",
       at,
       trigger: { kind: "api" },
@@ -347,6 +449,9 @@ describe("a service starting runs", () => {
     expect(
       (await home.call("GET", `/api/v1/runs/${theirsId}`, { secret: svc.secret })).status,
     ).toBe(403);
+    expect(
+      (await home.call("GET", `/api/v1/runs/${unnamedId}`, { secret: svc.secret })).status,
+    ).toBe(403);
     const cancel = await home.call("POST", `/api/v1/runs/${mineId}/cancel`, {
       body: {},
       secret: svc.secret,
@@ -354,7 +459,7 @@ describe("a service starting runs", () => {
     expect(cancel.status).toBe(200);
     const all = await home.call("GET", `/api/v1/harnesses/${h.id}/runs`);
     expect((all.body["items"] as { id: string }[]).map((r) => r.id).sort()).toEqual(
-      [mineId, theirsId].sort(),
+      [mineId, theirsId, unnamedId].sort(),
     );
   });
 
@@ -515,50 +620,6 @@ describe("reading a run and its result", () => {
 });
 
 describe("cancelling and resuming", () => {
-  /**
-   * An API run parked as the runtime leaves one: the root's rows, its top-level loop's own
-   * run (`parent` the root) that parked, the root closed parked, its input file, and the
-   * request bound to the loop run.
-   */
-  async function parkedRun(dir: string) {
-    const runId = mintRunId();
-    const child = mintRunId();
-    const at = new Date().toISOString();
-    const ledger = runsLedger(dir);
-    const execution = "run_00000000000000aa";
-    const row = (id: string, state: string, more: Record<string, unknown> = {}) =>
-      append(ledger, { id, state, at, trigger: { kind: "api" }, ...more });
-    row(runId, "queued", { by: "sys:reconcile" });
-    row(runId, "preparing", { execution });
-    row(runId, "running", { execution });
-    row(child, "running", {
-      parent: runId,
-      session: "sess_00000000000000cc",
-      resumeScope: `run:${runId}`,
-      execution,
-    });
-    row(child, "waiting-for-approval");
-    row(runId, "waiting-for-approval", { execution });
-    const inputs = join(dir, controlPaths(dir).inputsDir);
-    mkdirSync(inputs, { recursive: true });
-    writeFileSync(join(inputs, `${runId}.json`), JSON.stringify({ v: 1, run: runId, input: "x" }), {
-      mode: 0o600,
-    });
-    const approval = generateApprovalId();
-    const store = createPendingApprovalStore({ rootDir: join(dir, ".crewhaus", "sessions") });
-    await store.persist({
-      id: approval,
-      toolName: "Bash",
-      inputHash: hashApprovalInput("Bash", { command: "ls" }),
-      runId: child,
-      sessionId: "sess_00000000000000cc",
-      surface: "single-turn",
-      createdAt: at,
-      binding: { runId: child, resumeScope: `run:${runId}` },
-    } as Parameters<typeof store.persist>[0]);
-    return { runId, child, approval, store };
-  }
-
   test("a pending park is 409 to resume; once decided it is started again under the same run", async () => {
     const h = await cliHarness("resume-run");
     const { runId, approval, store } = await parkedRun(h.dir);
@@ -590,5 +651,282 @@ describe("cancelling and resuming", () => {
     const again = await home.call("POST", `/api/v1/runs/${runId}/cancel`, { body: {} });
     expect(again.status).toBe(409);
     expect(errorOf(again.body)["reason"]).toBe("run_ended");
+  });
+});
+
+describe("a run answers to the credential that started it", () => {
+  /** The four run operations a service may be refused, each with its own key. */
+  const fourCalls = (runId: string, harness: string, secret: string) => [
+    () => home.call("GET", `/api/v1/runs/${runId}`, { secret }),
+    () => home.call("GET", `/api/v1/harnesses/${harness}/runs`, { secret }),
+    () =>
+      home.call("POST", `/api/v1/runs/${runId}/cancel`, {
+        body: {},
+        secret,
+        headers: { "Idempotency-Key": `cancel-${mintRunId()}` },
+      }),
+    () =>
+      home.call("POST", `/api/v1/runs/${runId}/resume`, {
+        body: {},
+        secret,
+        headers: { "Idempotency-Key": `resume-${mintRunId()}` },
+      }),
+  ];
+
+  test("a second token of the same service is refused the run its first token started, and nothing is written or spawned", async () => {
+    const h = await cliHarness("cred-owner");
+    const elsewhere = await home.harness("cred-owner-elsewhere");
+    const first = await home.service("owner-svc", [h.id], { permissions: ["h.run.submit"] });
+    const created = await home.call("POST", `/api/v1/harnesses/${h.id}/runs`, {
+      body: { input: "x" },
+      secret: first.secret,
+      headers: { "Idempotency-Key": "cred-owner-1" },
+    });
+    expect(created.status).toBe(202);
+    const served = created.body["run"] as Record<string, unknown>;
+    const runId = String(served["id"]);
+    expect("byCredential" in served).toBe(false);
+    const queued = rowsOf(h.dir).find((row) => row["id"] === runId && row["state"] === "queued");
+    expect(queued).toMatchObject({ by: first.principal, byCredential: first.credential });
+    const got = await home.call("GET", `/api/v1/runs/${runId}`, { secret: first.secret });
+    expect(got.status).toBe(200);
+    expect("byCredential" in got.body).toBe(false);
+    const listed = await home.call("GET", `/api/v1/harnesses/${h.id}/runs`, {
+      secret: first.secret,
+    });
+    expect((listed.body["items"] as { id: string }[]).map((r) => r.id)).toEqual([runId]);
+    expect(JSON.stringify(listed.body)).not.toContain("byCredential");
+
+    const second = await home.service("owner-svc", [elsewhere.id]);
+    expect(second.principal).toBe(first.principal);
+    expect(second.credential).not.toBe(first.credential);
+    const rows = rowsOf(h.dir).length;
+    const before = home.t.ops?.children.length ?? 0;
+    const statuses: number[] = [];
+    for (const call of fourCalls(runId, h.id, second.secret)) statuses.push((await call()).status);
+    expect(statuses).toEqual([403, 403, 403, 403]);
+    expect(rowsOf(h.dir)).toHaveLength(rows);
+    expect(spawnedSince(before)).toEqual([]);
+    expect(newestState(h.dir, runId)).toBe("preparing");
+  });
+
+  test("once the starting token is revoked, no token of the service acts on its run", async () => {
+    const h = await cliHarness("cred-revoked");
+    const elsewhere = await home.harness("cred-revoked-elsewhere");
+    const first = await home.service("revoked-svc", [h.id], { permissions: ["h.run.submit"] });
+    const created = await home.call("POST", `/api/v1/harnesses/${h.id}/runs`, {
+      body: { input: "x" },
+      secret: first.secret,
+      headers: { "Idempotency-Key": "cred-revoked-1" },
+    });
+    expect(created.status).toBe(202);
+    const runId = String((created.body["run"] as Record<string, unknown>)["id"]);
+    const second = await home.service("revoked-svc", [elsewhere.id]);
+    const revoked = await openAccess(home.t.hangarRoot).revoke(
+      { principal: home.owner },
+      first.credential,
+    );
+    expect(revoked.ok).toBe(true);
+    const third = await home.service("revoked-svc", [elsewhere.id], {
+      permissions: ["h.run.submit"],
+    });
+    expect(third.principal).toBe(first.principal);
+    const before = home.t.ops?.children.length ?? 0;
+    for (const token of [second, third]) {
+      const statuses: number[] = [];
+      for (const call of fourCalls(runId, h.id, token.secret)) {
+        statuses.push((await call()).status);
+      }
+      expect(statuses).toEqual([403, 403, 403, 403]);
+    }
+    // The revoked secret is refused at authentication.
+    const statuses: number[] = [];
+    for (const call of fourCalls(runId, h.id, first.secret)) statuses.push((await call()).status);
+    expect(statuses).toEqual([401, 401, 401, 401]);
+    expect(spawnedSince(before)).toEqual([]);
+  });
+
+  test("the starting credential reads, lists and cancels its run, but resumes it only while it may submit runs there", async () => {
+    const h = await cliHarness("cred-no-submit");
+    const elsewhere = await home.harness("cred-no-submit-elsewhere");
+    const token = await home.service("no-submit-svc", [elsewhere.id]);
+    const queued = { by: token.principal, byCredential: token.credential };
+    const toResume = await decidedRun(h.dir, queued);
+    const toCancel = await parkedRun(h.dir, queued);
+    const got = await home.call("GET", `/api/v1/runs/${toResume.runId}`, { secret: token.secret });
+    expect(got.status).toBe(200);
+    const listed = await home.call("GET", `/api/v1/harnesses/${h.id}/runs`, {
+      secret: token.secret,
+    });
+    expect(listed.status).toBe(200);
+    expect((listed.body["items"] as { id: string }[]).map((r) => r.id).sort()).toEqual(
+      [toResume.runId, toCancel.runId].sort(),
+    );
+    const before = home.t.ops?.children.length ?? 0;
+    const resumed = await home.call("POST", `/api/v1/runs/${toResume.runId}/resume`, {
+      body: {},
+      secret: token.secret,
+      headers: { "Idempotency-Key": "no-submit-resume" },
+    });
+    expect(resumed.status).toBe(403);
+    expect(errorOf(resumed.body)["needs"]).toBe("h.run.submit");
+    expect(spawnedSince(before)).toEqual([]);
+    expect(newestState(h.dir, toResume.runId)).toBe("waiting-for-approval");
+    const cancelled = await home.call("POST", `/api/v1/runs/${toCancel.runId}/cancel`, {
+      body: {},
+      secret: token.secret,
+      headers: { "Idempotency-Key": "no-submit-cancel" },
+    });
+    expect(cancelled.status).toBe(200);
+    expect((cancelled.body["receipt"] as Record<string, unknown>)["state"]).toBe("succeeded");
+  });
+});
+
+describe("every API start runs the harness's operator prep", () => {
+  test("a create whose preSpawn hook refuses runs only the hook, fails its receipt, and withdraws the run and its input", async () => {
+    const h = await cliHarness("prep-create");
+    hookOf(h.dir, ["/usr/bin/false"]);
+    const before = home.t.ops?.children.length ?? 0;
+    const pending = home.call("POST", `/api/v1/harnesses/${h.id}/runs`, { body: { input: "x" } });
+    const hook = await childWhere(home, before, isHook);
+    hook.exit(1);
+    const res = await pending;
+    expect(res.status).toBe(503);
+    expect(errorOf(res.body)["reason"]).toBe("not_started");
+    const spawned = spawnedSince(before);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]?.request.argv).toEqual(["/usr/bin/false"]);
+    const commands = await home.call("GET", `/api/v1/harnesses/${h.id}/commands`);
+    expect((commands.body["items"] as Record<string, unknown>[]).map((c) => c["state"])).toEqual([
+      "failed",
+    ]);
+    const runId = String(rowsOf(h.dir).find((row) => row["state"] === "queued")?.["id"]);
+    expect(rowsOf(h.dir).at(-1)).toMatchObject({
+      id: runId,
+      state: "cancelled",
+      reason: "not-started",
+    });
+    expect(inputsIn(h.dir)).toEqual([]);
+    // With no hook, the next create starts its job.
+    hookOf(h.dir);
+    const next = home.t.ops?.children.length ?? 0;
+    const started = await home.call("POST", `/api/v1/harnesses/${h.id}/runs`, {
+      body: { input: "x" },
+    });
+    expect(started.status).toBe(202);
+    expect(spawnedSince(next).filter(isJob)).toHaveLength(1);
+  });
+
+  test("a resume whose preSpawn hook refuses runs only the hook, fails its receipt, and leaves the run parked", async () => {
+    const h = await cliHarness("prep-resume");
+    hookOf(h.dir, ["/usr/bin/false"]);
+    const { runId } = await decidedRun(h.dir);
+    const before = home.t.ops?.children.length ?? 0;
+    const pending = home.call("POST", `/api/v1/runs/${runId}/resume`, { body: {} });
+    const hook = await childWhere(home, before, isHook);
+    hook.exit(1);
+    const res = await pending;
+    expect((res.body["receipt"] as Record<string, unknown>)["state"]).toBe("failed");
+    expect(spawnedSince(before)).toHaveLength(1);
+    expect(spawnedSince(before)[0]?.request.argv).toEqual(["/usr/bin/false"]);
+    expect(newestState(h.dir, runId)).toBe("waiting-for-approval");
+    expect(inputsIn(h.dir)).toEqual([`${runId}.json`]);
+  });
+});
+
+describe("Home holds a bounded number of API runs at once", () => {
+  // Each test boots a Home of its own, so the shared one's live runs do not count.
+  test("a harness's fourth live run, and a resume past the cap, are refused busy before anything is written; one exit makes room", async () => {
+    const own = await v1Home();
+    try {
+      const make = async (name: string) => {
+        const h = await own.harness(name);
+        const bin = join(h.dir, "node_modules", ".bin");
+        mkdirSync(bin, { recursive: true });
+        writeFileSync(join(bin, "crewhaus"), "#!/bin/sh\nexit 0\n");
+        chmodSync(join(bin, "crewhaus"), 0o755);
+        return h;
+      };
+      const h = await make("cap-harness");
+      const create = () =>
+        own.call("POST", `/api/v1/harnesses/${h.id}/runs`, { body: { input: "x" } });
+      for (let i = 0; i < 3; i += 1) expect((await create()).status).toBe(202);
+      const parked = await decidedRun(h.dir);
+      const receipts = async () =>
+        ((await own.call("GET", `/api/v1/harnesses/${h.id}/commands`)).body["items"] as unknown[])
+          .length;
+      const rows = rowsOf(h.dir).length;
+      const inputs = inputsIn(h.dir);
+      const children = own.t.ops?.children.length ?? 0;
+      const commands = await receipts();
+      const busy = await create();
+      expect(busy.status).toBe(503);
+      expect(busy.headers.get("retry-after")).toBe("10");
+      expect(errorOf(busy.body)).toMatchObject({
+        code: "unavailable",
+        reason: "busy",
+        retryAfterMs: 10_000,
+      });
+      const resumed = await own.call("POST", `/api/v1/runs/${parked.runId}/resume`, { body: {} });
+      expect(resumed.status).toBe(503);
+      expect(errorOf(resumed.body)).toMatchObject({ code: "unavailable", reason: "busy" });
+      expect(rowsOf(h.dir)).toHaveLength(rows);
+      expect(inputsIn(h.dir)).toEqual(inputs);
+      expect(own.t.ops?.children.length).toBe(children);
+      expect(await receipts()).toBe(commands);
+      // One job exits: its supervisor lets go of it, and the next create is taken.
+      own.t.ops?.children.find(isJob)?.exit(0);
+      let tries = 0;
+      let next = await create();
+      while (next.status === 503 && tries < 200) {
+        tries += 1;
+        await Bun.sleep(0);
+        next = await create();
+      }
+      expect(next.status).toBe(202);
+    } finally {
+      await own.t.stop();
+    }
+  }, 30_000); // boots a Home of its own
+
+  test("Home's own cap counts every harness's live runs", async () => {
+    const own = await v1Home({ apiRunLimits: { perHome: 2 } });
+    try {
+      const statuses: number[] = [];
+      for (const name of ["home-cap-1", "home-cap-2", "home-cap-3"]) {
+        const h = await own.harness(name);
+        const bin = join(h.dir, "node_modules", ".bin");
+        mkdirSync(bin, { recursive: true });
+        writeFileSync(join(bin, "crewhaus"), "#!/bin/sh\nexit 0\n");
+        chmodSync(join(bin, "crewhaus"), 0o755);
+        const res = await own.call("POST", `/api/v1/harnesses/${h.id}/runs`, {
+          body: { input: "x" },
+        });
+        statuses.push(res.status);
+        if (res.status === 503) {
+          expect(errorOf(res.body)).toMatchObject({ reason: "busy" });
+          expect(String(errorOf(res.body)["message"])).toStartWith("Home is already running");
+          expect(inputsIn(h.dir)).toEqual([]);
+        }
+      }
+      expect(statuses).toEqual([202, 202, 503]);
+    } finally {
+      await own.t.stop();
+    }
+  }, 30_000); // boots a Home of its own
+
+  test("two resumes of one parked run at once start one job", async () => {
+    const h = await cliHarness("double-resume");
+    const { runId } = await decidedRun(h.dir);
+    const before = home.t.ops?.children.length ?? 0;
+    const answers = await Promise.all([
+      home.call("POST", `/api/v1/runs/${runId}/resume`, { body: {} }),
+      home.call("POST", `/api/v1/runs/${runId}/resume`, { body: {} }),
+    ]);
+    expect(spawnedSince(before).filter(isJob)).toHaveLength(1);
+    const states = answers
+      .map((answer) => (answer.body["receipt"] as Record<string, unknown> | undefined)?.["state"])
+      .sort();
+    expect(states).toEqual(["failed", "succeeded"]);
   });
 });

@@ -496,6 +496,7 @@ describe("access proxy", () => {
     const secret = match?.[1] as string;
     expect(text.split(secret).length).toBe(2); // printed once
     expect(text).toContain("Restart Home");
+    expect(text).toContain("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;");
     const settings = settingsOf();
     const access = settings["access"] as {
       trustedProxy: Record<string, unknown>;
@@ -524,6 +525,7 @@ describe("access proxy", () => {
     const out = await run(["proxy", "--header", "x-auth-user", "--socket"]);
     expect(out.exitCode).toBe(0);
     expect(out.lines.join("\n")).toContain(join(hangarRoot, "proxy.sock"));
+    expect(out.lines.join("\n")).toContain("client's address to X-Forwarded-For");
     const proxy = (settingsOf()["access"] as { trustedProxy: Record<string, unknown> })
       .trustedProxy;
     expect(proxy["socket"]).toBe(true);
@@ -556,42 +558,115 @@ describe("access proxy", () => {
 });
 
 describe("access approve", () => {
-  test("allows a waiting sign-in as the local member, and the other computer collects it", async () => {
+  const WARNING =
+    "Allow only a sign-in you just started yourself, on a computer in front of you. Never allow a code someone sent you.";
+
+  /** Access set up with this OS user as the owner, as Home's first sign-in does, and one waiting sign-in. */
+  async function waiting(input: { clientName?: string } = {}) {
     const { ensureAccessSetUp, localActorOf, openDeviceRequests } = await import(
       "@crewhaus/access-control"
     );
-    // Access set up with this OS user as the owner, as Home's first sign-in does.
     const setUp = await ensureAccessSetUp(hangarRoot, {
       localActor: localActorOf(ME),
       now: () => clock,
     });
     expect(setUp.ok).toBe(true);
     const devices = openDeviceRequests(hangarRoot, { now: () => clock });
-    const start = await devices.start({ clientName: "laptop" });
+    const start = await devices.start({
+      ...input,
+      requestedFrom: { via: "direct", address: "203.0.113.5" },
+    });
     if (!start.ok) throw new Error(start.reason);
-    const allowed = await run(["approve", start.userCode.toLowerCase()]);
+    clock += 2 * 60_000;
+    const stateOf = () => devices.read()[0]?.state;
+    return { devices, start, stateOf };
+  }
+
+  test("allows a waiting sign-in with --yes, naming where it came from first", async () => {
+    const { devices, start } = await waiting({ clientName: "laptop" });
+    const allowed = await run(["approve", start.userCode.toLowerCase(), "--yes"]);
     expect(allowed.exitCode).toBe(0);
-    expect(allowed.lines.join("\n")).toContain("Allowed a sign-in from laptop");
+    const from = allowed.lines.findIndex((line) => line.includes("203.0.113.5"));
+    const done = allowed.lines.findIndex((line) => line.startsWith("Allowed"));
+    expect(from).toBeGreaterThan(-1);
+    expect(done).toBeGreaterThan(-1);
+    expect(from).toBeLessThan(done);
+    expect(allowed.lines.join("\n")).toContain("Asked from 203.0.113.5, 2m ago.");
+    expect(allowed.lines.join("\n")).toContain('Name it gave: "laptop"');
+    expect(allowed.lines.join("\n")).toContain("Allowed the sign-in");
+    expect(allowed.lines).toContain(WARNING);
     clock += 6_000;
     const polled = await devices.poll(start.pollRef);
     expect(polled.ok && polled.state).toBe("allowed");
   });
 
-  test("--deny denies it, and a wrong code is refused in words", async () => {
-    const { ensureAccessSetUp, localActorOf, openDeviceRequests } = await import(
-      "@crewhaus/access-control"
-    );
-    const setUp = await ensureAccessSetUp(hangarRoot, {
-      localActor: localActorOf(ME),
+  test("with no terminal and no --yes, nothing is allowed and the request still waits", async () => {
+    const { start, stateOf } = await waiting({ clientName: "laptop" });
+    const asked = await run(["approve", start.userCode]);
+    expect(asked.exitCode).toBe(1);
+    const text = asked.lines.join("\n");
+    expect(text).toContain("203.0.113.5");
+    expect(text).toContain("Name it gave");
+    expect(asked.lines).toContain(WARNING);
+    expect(text).toContain("Nothing was allowed: run it at a terminal to confirm, or add --yes.");
+    expect(stateOf()).toBe("pending");
+  });
+
+  test("at a terminal it allows only on a yes, after showing the request and the warning", async () => {
+    const { start, stateOf } = await waiting();
+    const seen: (readonly string[])[] = [];
+    const no = await runAccessCommand(["approve", start.userCode], {
+      env,
       now: () => clock,
+      identity: ME,
+      isPidAlive: () => false,
+      confirm: async (shown) => {
+        seen.push(shown);
+        return false;
+      },
     });
-    expect(setUp.ok).toBe(true);
-    const devices = openDeviceRequests(hangarRoot, { now: () => clock });
-    const start = await devices.start({});
-    if (!start.ok) throw new Error(start.reason);
-    const denied = await run(["approve", start.userCode, "--deny"]);
+    expect(no.exitCode).toBe(1);
+    expect(no.lines).toEqual(["Nothing was allowed."]);
+    expect(stateOf()).toBe("pending");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain(WARNING);
+    expect(seen[0]?.join("\n")).toContain("It gave no name.");
+
+    let asked = 0;
+    const yes = await runAccessCommand(["approve", start.userCode], {
+      env,
+      now: () => clock,
+      identity: ME,
+      isPidAlive: () => false,
+      confirm: async () => {
+        asked += 1;
+        return true;
+      },
+    });
+    expect(yes.exitCode).toBe(0);
+    expect(asked).toBe(1);
+    expect(yes.lines).toHaveLength(1);
+    expect(yes.lines[0]?.startsWith("Allowed the sign-in.")).toBe(true);
+    expect(stateOf()).toBe("allowed");
+  });
+
+  test("--deny denies it without asking, and a wrong code is refused in words", async () => {
+    const { start, stateOf } = await waiting();
+    let asked = 0;
+    const denied = await runAccessCommand(["approve", start.userCode, "--deny"], {
+      env,
+      now: () => clock,
+      identity: ME,
+      isPidAlive: () => false,
+      confirm: async () => {
+        asked += 1;
+        return true;
+      },
+    });
     expect(denied.exitCode).toBe(0);
-    expect(denied.lines.join("\n")).toContain("Denied");
+    expect(denied.lines.join("\n")).toContain("Denied the sign-in.");
+    expect(asked).toBe(0);
+    expect(stateOf()).toBe("denied");
     const wrong = await run(["approve", "BBBB-BBBB"]);
     expect(wrong.exitCode).toBe(1);
     expect(wrong.lines.join("\n")).toContain("does not match");

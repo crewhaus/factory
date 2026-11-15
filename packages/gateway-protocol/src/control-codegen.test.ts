@@ -16,6 +16,7 @@ import {
   renderPublicGateFetch,
   renderScheduleLanes,
   scheduleLaneCadence,
+  scheduleNextDueAtExpr,
 } from "./control-codegen";
 
 describe("renderControlImports", () => {
@@ -207,8 +208,12 @@ describe("renderScheduleLanes (#514)", () => {
     expect(count("armScheduleLanes(")).toBe(1);
     expect(out).toContain('await run("schedule:discovery", 0, __scheduleLanes[0].instructions);');
     expect(out).toContain(
-      "nextDueAt: () => new Date(Date.now() + nextWakeDelayMs(__scheduleLanes[1].wake, Date.now())).toISOString(),",
+      'nextDueAt: () => ((__at: number | undefined) => (__at === undefined || !(Math.abs(__at) <= 8.64e15) ? undefined : new Date(__at).toISOString()))(__scheduleLanesArmed?.nextAt("weekly-report")),',
     );
+    expect(out).toContain(
+      "let __scheduleLanesArmed: { cancel(): void; nextAt(name: string): number | undefined } | undefined;",
+    );
+    expect(out).not.toContain("nextWakeDelayMs");
     expect(out).toContain('["weekly-report", __scheduleLane1],');
     expect(out).toContain("report(__err, __name);");
   });
@@ -230,6 +235,7 @@ describe("renderScheduleLanes (#514)", () => {
     });
     const guard = guarded.indexOf('if (process.env.X !== "0") {');
     expect(guard).toBeGreaterThan(-1);
+    expect(guarded.indexOf("__control.lane({")).toBeGreaterThan(-1);
     expect(guarded.indexOf("__control.lane({")).toBeLessThan(guard);
     expect(guarded.indexOf("armScheduleLanes(")).toBeGreaterThan(guard);
   });
@@ -241,5 +247,63 @@ describe("renderScheduleLanes (#514)", () => {
     expect(
       scheduleLaneCadence({ name: "a", kind: "cron", cron: "* * * * *", instructions: "" }),
     ).toBe('cron "* * * * *" UTC');
+  });
+
+  test("the next-wake expression reads only the recorded fire time", () => {
+    expect(scheduleNextDueAtExpr("__schedule.nextAt()")).toBe(
+      "((__at: number | undefined) => (__at === undefined || !(Math.abs(__at) <= 8.64e15) ? undefined : new Date(__at).toISOString()))(__schedule.nextAt())",
+    );
+  });
+
+  test("the next wake is an ISO time, or absent when none is pending or the time is past what a Date holds", () => {
+    const js = new Bun.Transpiler({ loader: "ts" }).transformSync(
+      `export default (__value: number | undefined) => ${scheduleNextDueAtExpr("__value")};`,
+    );
+    const read = new Function(`${js.replace("export default", "return")}`)() as (
+      v: number | undefined,
+    ) => string | undefined;
+    expect(read(Date.parse("2026-11-20T16:00:00Z"))).toBe("2026-11-20T16:00:00.000Z");
+    expect(read(8.64e15)).toBe(new Date(8.64e15).toISOString());
+    expect(read(undefined)).toBeUndefined();
+    expect(read(8.64e15 + 1)).toBeUndefined();
+    expect(read(86_400_000 * 999_999_999_999)).toBeUndefined();
+    expect(read(Number.NaN)).toBeUndefined();
+  });
+
+  const outside: ReadonlyArray<readonly [string, string]> = [
+    ["a backtick", "a`b"],
+    ["a template placeholder", "a${x}"],
+    ["a double quote", 'a"b'],
+    ["an underscore", "a_b"],
+    ["an upper-case letter", "A"],
+    ["nothing", ""],
+    ["33 characters", `a${"b".repeat(32)}`],
+  ];
+  for (const [label, name] of outside) {
+    test(`a name with ${label} is outside the lane grammar and is refused before anything renders`, () => {
+      let bodies = 0;
+      const attempt = (): string =>
+        renderScheduleLanes({
+          lanes: [lanes[1] as ScheduleLaneEmit, { ...(lanes[0] as ScheduleLaneEmit), name }],
+          body: () => {
+            bodies += 1;
+            return "noop();";
+          },
+          onErrorBody: "",
+        });
+      expect(attempt).toThrow(TypeError);
+      expect(attempt).toThrow(JSON.stringify(name));
+      expect(bodies).toBe(0);
+    });
+  }
+
+  test("a 32-character name is inside the lane grammar", () => {
+    const name = `a${"b".repeat(31)}`;
+    const ok = renderScheduleLanes({
+      lanes: [{ ...(lanes[1] as ScheduleLaneEmit), name }],
+      body: () => "noop();",
+      onErrorBody: "",
+    });
+    expect(ok).toContain(`lane: "schedule:${name}"`);
   });
 });

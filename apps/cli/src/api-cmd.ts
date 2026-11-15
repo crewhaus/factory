@@ -1,11 +1,13 @@
 /**
  * `crewhaus api <operation>`: call one operation of Home's versioned API by its id.
  *
- * On this computer it uses Home's own key over Home's socket (loopback where there is
- * none). With `--server <url>` it uses the personal token `crewhaus login` kept for that
- * Home. Paths are built from the operation table Home publishes, so the CLI keeps no
- * route map. It prints the answer as Home sent it (a masked field stays masked) and
- * exits 0 on success, or with the control band's code for the error Home named.
+ * On this computer it reaches the running Home: on macOS and Linux Home's own key goes
+ * only over Home's own socket, and on Windows over loopback only to a running Home at a
+ * loopback IP address. Otherwise it sends nothing and says why. With
+ * `--server <url>` it uses the personal token `crewhaus login` kept for that Home. Paths
+ * are built from the operation table Home publishes, so the CLI keeps no route map. It
+ * prints the answer as Home sent it (a masked field stays masked) and exits 0 on success,
+ * or with the control band's code for the error Home named.
  *
  * Side-effect free on import; every I/O comes through `ApiDeps`, so a test drives it.
  */
@@ -43,6 +45,10 @@ export type ApiDeps = {
   readonly fetch?: typeof fetch;
   readonly secrets?: SecretsStore;
   readonly readStdin?: () => Promise<string>;
+  /** Whether the process holding Home's lock is running (default: signal 0). */
+  readonly isPidAlive?: (pid: number) => boolean;
+  /** The operating system, which decides whether Home has its own socket. */
+  readonly platform?: NodeJS.Platform;
 };
 
 /** What to print, and the exit: lines go to stdout on success and stderr otherwise. */
@@ -189,9 +195,16 @@ export async function runApiCommand(
       fetch: (i, init) => fetchImpl(i, init),
     };
   } else {
-    const local = localTransport(hangarRoot, fetchImpl);
-    if ("reason" in local)
-      return { lines: [`api: ${local.reason}`], exitCode: EXIT_FOR_ERROR.unavailable };
+    const local = localTransport(hangarRoot, fetchImpl, {
+      ...(deps.isPidAlive !== undefined ? { isPidAlive: deps.isPidAlive } : {}),
+      ...(deps.platform !== undefined ? { platform: deps.platform } : {}),
+    });
+    if ("reason" in local) {
+      return {
+        lines: [`api: ${local.reason}`, ...(local.hint !== undefined ? [`  ${local.hint}`] : [])],
+        exitCode: EXIT_FOR_ERROR[local.code],
+      };
+    }
     transport = local;
   }
   const client = createClient({

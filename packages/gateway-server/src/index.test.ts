@@ -8,6 +8,7 @@ import { ErrorCode } from "@crewhaus/gateway-protocol";
 import { type Tenant, buildTenant } from "@crewhaus/tenancy";
 import {
   GatewayServerError,
+  HOME_RUN_TENANT,
   PROTOCOL_VERSION,
   type RunEventSource,
   createGatewayServer,
@@ -92,6 +93,17 @@ describe("JWT round-trip", () => {
     const exp = Math.floor((Date.now() - 60_000) / 1000);
     const token = signJwt({ tenant_id: "tenant-a", exp }, SECRET);
     expect(() => verifyJwt(token, SECRET)).toThrow(/expired/);
+  });
+
+  test("a reserved tenant id is refused in any letter case; ids that only resemble it verify", () => {
+    for (const id of [HOME_RUN_TENANT, "HOME", "Home"]) {
+      expect(() => verifyJwt(signJwt({ tenant_id: id }, SECRET), SECRET)).toThrow(
+        "JWT tenant_id is reserved",
+      );
+    }
+    for (const id of ["home-team", "Home2", "tenant-b"]) {
+      expect(verifyJwt(signJwt({ tenant_id: id }, SECRET), SECRET).tenant_id).toBe(id);
+    }
   });
 
   test("rejects invalid tenant_id (path traversal)", () => {
@@ -479,6 +491,58 @@ describe("audit log", () => {
       tenantId: "tenant-a",
       sub: "user-42",
     });
+  });
+
+  test("a token for a reserved tenant is 401 before the handler, and writes no audit row", async () => {
+    let called = 0;
+    const { server } = makeServer(async () => {
+      called += 1;
+      return { ok: true };
+    });
+    const home = buildTenant(HOME_RUN_TENANT, { tenantsRoot: tmp });
+    const res = await server.handle({
+      bearer: signJwt({ tenant_id: HOME_RUN_TENANT }, SECRET),
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    expect(res).toMatchObject({
+      error: { code: "unauthorized", message: expect.stringMatching(/reserved/) },
+    });
+    expect(called).toBe(0);
+    const rows: unknown[] = [];
+    for await (const r of (await server.getAuditLog(home)).read()) rows.push(r);
+    expect(rows).toEqual([]);
+    // The same token on the stream path is refused alike, and opens nothing.
+    let resolved = 0;
+    const streaming = createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      resolveRunEvents: () => {
+        resolved += 1;
+        return undefined;
+      },
+      closeGraceMs: 0,
+    });
+    const sub = await streaming.subscribe({
+      bearer: signJwt({ tenant_id: HOME_RUN_TENANT }, SECRET),
+      body: {
+        protocol: PROTOCOL_VERSION,
+        id: "sub-1",
+        method: "runs.subscribe",
+        params: { runId: "run_x" },
+      },
+    });
+    expect(sub.status).toBe(401);
+    expect(await sub.json()).toMatchObject({ error: { code: "unauthorized" } });
+    expect(resolved).toBe(0);
+    const streamRows: unknown[] = [];
+    for await (const r of (await streaming.getAuditLog(home)).read()) streamRows.push(r);
+    expect(streamRows).toEqual([]);
   });
 
   test("getAuditLog memoises — the same log instance is returned per tenant", async () => {

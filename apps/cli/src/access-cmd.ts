@@ -43,6 +43,7 @@ import {
   writeOwnerBlock,
 } from "@crewhaus/access-control";
 import { type HangarRegistry, openHangarRegistry } from "@crewhaus/harness-registry";
+import { formatApprovalAge } from "./approvals-cli";
 import { defaultIsPidAlive, readHangarLock, resolveHangarRoot } from "./hangar-cmd";
 import type { CliFamily } from "./verbs";
 
@@ -62,6 +63,11 @@ export type AccessCommandOptions = {
   readonly openRegistry?: (env: Readonly<Record<string, string | undefined>>) => HangarRegistry;
   /** Whether Home's process is alive; tests inject one. */
   readonly isPidAlive?: (pid: number) => boolean;
+  /**
+   * Asks at a terminal: prints `shown`, then `question [y/N]`, and answers whether the
+   * person said yes. Absent, a verb that needs a yes treats the run as having no terminal.
+   */
+  readonly confirm?: (shown: readonly string[], question: string) => Promise<boolean>;
 };
 
 const ROLE_WORDS = ["viewer", "operator", "maintainer", "owner"] as const;
@@ -88,10 +94,14 @@ const ACCESS_USAGE_LINES: readonly string[] = [
   "  crewhaus access proxy --header <h> --peer <cidr>... --host <name>... [--socket]",
   "                                               trust a proxy's identity header: from the listed",
   "                                               peers with a secret it sends (shown once), or",
-  "                                               over Home's proxy socket with --socket",
+  "                                               over Home's proxy socket with --socket; the",
+  "                                               proxy must add each client's address to",
+  "                                               X-Forwarded-For",
   "  crewhaus access proxy --off                  stop trusting it",
-  "  crewhaus access approve <code> [--deny]      allow a sign-in from another computer that shows",
-  "                                               this code (`crewhaus login` there)",
+  "  crewhaus access approve <code> [--deny | --yes]",
+  "                                               allow a sign-in from another computer that shows",
+  "                                               this code (`crewhaus login` there); it shows the",
+  "                                               request and asks first, or allows with --yes",
   "",
   "  Roles: viewer, operator, maintainer, owner. <h> is a harness id or directory, and",
   "  <dur> is like 30m, 24h or 7d. These verbs work with Home stopped; a proxy change",
@@ -144,7 +154,7 @@ export const CLI_FAMILY = {
       },
     },
     sync: { flags: {} },
-    approve: { flags: { deny: "boolean" } },
+    approve: { flags: { deny: "boolean", yes: "boolean" } },
     proxy: {
       flags: {
         header: "value",
@@ -869,6 +879,9 @@ async function proxyVerb(session: Session, argv: readonly string[]): Promise<Acc
     lines.push(`Point the proxy at Home's proxy socket: ${join(session.root, "proxy.sock")}`);
   }
   lines.push(
+    "It must also add each client's address to X-Forwarded-For, as nginx does with",
+    "  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+    "Home shows the last address there when another computer asks to sign in.",
     "Each person still needs a link: `crewhaus access link proxy:<header>:<name> --member <name>`.",
     "Restart Home for this to take effect.",
   );
@@ -876,38 +889,122 @@ async function proxyVerb(session: Session, argv: readonly string[]): Promise<Acc
 }
 
 /**
- * `access approve <code> [--deny]`: allow (or deny) a sign-in from another computer, as
- * the member this OS user is linked to, here on Home's computer. The token is that
- * member's, minted only when the waiting `crewhaus login` collects it.
+ * Said before a sign-in is allowed, word for word what Home's device page says.
+ *
+ * First consumer: `access approve`.
+ */
+export const DEVICE_WARNING =
+  "Allow only a sign-in you just started yourself, on a computer in front of you. Never allow a code someone sent you.";
+
+/**
+ * One y/N question at the terminal, after the lines it is about.
+ *
+ * First consumer: the entry file, which hands it to `runAccessCommand` only when both
+ * stdin and stdout are a terminal.
+ */
+export async function terminalConfirm(
+  shown: readonly string[],
+  question: string,
+): Promise<boolean> {
+  const { createInterface } = await import("node:readline");
+  for (const line of shown) process.stdout.write(`${line}\n`);
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await new Promise<string>((resolve) =>
+      rl.question(`${question} [y/N] `, resolve),
+    );
+    return /^y(es)?$/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/** What Home observed about a waiting sign-in: where it came from, and how long ago. */
+function observedLine(
+  from: { readonly via: "direct" | "proxy" | "home"; readonly address?: string },
+  createdAt: string,
+  now: number,
+): string {
+  const ago = `${formatApprovalAge(createdAt, now)} ago`;
+  if (from.via === "home") return `Asked on this Home's own computer, ${ago}.`;
+  if (from.via === "proxy") {
+    return from.address !== undefined
+      ? `Asked through your proxy, which reports ${from.address}, ${ago}.`
+      : `Asked through your proxy, ${ago}.`;
+  }
+  return from.address !== undefined
+    ? `Asked from ${from.address}, ${ago}.`
+    : `Asked over the network, ${ago}.`;
+}
+
+/**
+ * `access approve <code> [--deny | --yes]`: allow (or deny) a sign-in from another
+ * computer, as the member this OS user is linked to, here on Home's computer. Before it
+ * allows anything it shows the request (where Home saw it come from, when, the name it
+ * gave, what it may do and for how long) and a warning, then allows only on a yes at a
+ * terminal or with `--yes`; with neither, nothing is allowed and it exits 1. `--deny`
+ * needs no yes. The token is the member's, minted only when the waiting `crewhaus login`
+ * collects it.
  */
 async function approveVerb(
   session: Session,
   argv: readonly string[],
+  confirm?: AccessCommandOptions["confirm"],
 ): Promise<AccessCommandResult> {
   const args = parseArgs("approve", argv, CLI_FAMILY.sub.approve.flags);
   noPositional("approve", args, 1);
   const code = args.positional[0];
   if (code === undefined) throw new Error("access approve: name the code the other computer shows");
+  const deny = args.booleans.has("deny");
+  const yes = args.booleans.has("yes");
+  if (deny && yes) throw new Error("access approve: give --deny or --yes, not both");
   const acting = await actingPrincipal(session);
   if ("ok" in acting) return refused(acting);
-  const deny = args.booleans.has("deny");
   const devices = openDeviceRequests(session.root, { now: session.now });
   const looked = await devices.lookup(acting.principal, code);
   if (!looked.ok) return { lines: [...acting.lines, looked.message], exitCode: 1 };
-  const decided = await devices.decide({
-    caller: acting.principal,
-    code,
-    choice: deny ? "deny" : "allow",
-  });
-  if (!decided.ok) return { lines: [...acting.lines, decided.message], exitCode: 1 };
-  const what = looked.request.readOnly ? "a read-only sign-in" : "a sign-in";
-  const name = looked.request.clientName !== undefined ? ` from ${looked.request.clientName}` : "";
+  const request = looked.request;
+  if (deny) {
+    const decided = await devices.decide({ caller: acting.principal, code, choice: "deny" });
+    if (!decided.ok) return { lines: [...acting.lines, decided.message], exitCode: 1 };
+    return { lines: [...acting.lines, "Denied the sign-in."], exitCode: 0 };
+  }
+  const shown = [
+    "A sign-in is waiting:",
+    `  ${observedLine(request.requestedFrom, request.createdAt, session.now())}`,
+    request.clientName !== undefined
+      ? `  Name it gave: "${request.clientName}"`
+      : "  It gave no name.",
+    request.readOnly
+      ? "  It can only read."
+      : "  It can do what you can do here, except manage who has access or allow sign-ins.",
+    `  Its access lasts ${request.tokenDays} days.`,
+    DEVICE_WARNING,
+  ];
+  let printed = false;
+  if (!yes) {
+    if (confirm === undefined) {
+      return {
+        lines: [
+          ...acting.lines,
+          ...shown,
+          "Nothing was allowed: run it at a terminal to confirm, or add --yes.",
+        ],
+        exitCode: 1,
+      };
+    }
+    if (!(await confirm([...acting.lines, ...shown], "Allow it?"))) {
+      return { lines: ["Nothing was allowed."], exitCode: 1 };
+    }
+    printed = true;
+  }
+  const decided = await devices.decide({ caller: acting.principal, code, choice: "allow" });
+  const before = printed ? [] : [...acting.lines, ...shown];
+  if (!decided.ok) return { lines: [...before, decided.message], exitCode: 1 };
   return {
     lines: [
-      ...acting.lines,
-      deny
-        ? `Denied ${what}${name}.`
-        : `Allowed ${what}${name}. Its token lasts ${looked.request.tokenDays} days, and the other computer collects it now.`,
+      ...before,
+      `Allowed the sign-in. Its token lasts ${request.tokenDays} days, and the other computer collects it now.`,
     ],
     exitCode: 0,
   };
@@ -946,7 +1043,7 @@ export async function runAccessCommand(
     case "mint":
       return mintVerb(session, rest);
     case "approve":
-      return approveVerb(session, rest);
+      return approveVerb(session, rest, opts.confirm);
     case "sync":
       return syncVerb(session, rest);
     case "proxy":

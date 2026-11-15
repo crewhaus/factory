@@ -14,6 +14,7 @@ import {
   renderControlTimer,
   renderPublicGateFetch,
   renderScheduleLanes,
+  scheduleNextDueAtExpr,
 } from "@crewhaus/gateway-protocol/control-codegen";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
@@ -2326,9 +2327,9 @@ try {
   // crashes the daemon. Absent `schedule:` emits NOTHING, so unscheduled
   // channel bundles stay byte-identical.
   const scheduleImport = ir.schedule
-    ? `import { armSchedule, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
+    ? `import { armSchedule } from "@crewhaus/durable-execution";\n`
     : ir.scheduleLanes
-      ? `import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
+      ? `import { armScheduleLanes } from "@crewhaus/durable-execution";\n`
       : "";
   const schedScopeField =
     (ir.schedule || ir.scheduleLanes) && ir.continuity !== undefined
@@ -2336,9 +2337,19 @@ try {
       : "";
   // The body of one schedule wake, for the single `schedule` lane and for each
   // named lane alike: a fresh-session turn with that lane's prompt, logged
-  // under the lane's id.
-  const scheduleTickBody = (laneId: string, instructionsVar: string, tickVar: string): string =>
-    `${tickVar}++;${ir.gateway ? "\n__heartbeatCount++; // gateway /status wake counter (heartbeat + schedule)" : ""}
+  // under the lane's id. The single lane's id is the emitter constant
+  // `schedule`; a named lane's id is bound once as a JSON string literal and
+  // reaches every log line only through that binding.
+  const scheduleTickBody = (
+    lane: { readonly fixed: "schedule" } | { readonly laneId: string },
+    instructionsVar: string,
+    tickVar: string,
+  ): string => {
+    // `laneId` sits inside emitted template literals; `prefix` is an expression.
+    const laneId = "fixed" in lane ? lane.fixed : "${__laneId}";
+    const prefix = "fixed" in lane ? `"[${lane.fixed}]"` : "`[${__laneId}]`";
+    const bind = "fixed" in lane ? "" : `const __laneId = ${escapeJsonString(lane.laneId)};\n`;
+    return `${bind}${tickVar}++;${ir.gateway ? "\n__heartbeatCount++; // gateway /status wake counter (heartbeat + schedule)" : ""}
 const __sessionId = __tick.sessionId;
 const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
 process.stdout.write(\`[${laneId}] wake #\${${tickVar}}\${__origin} (session \${__sessionId})\\n\`);
@@ -2358,12 +2369,13 @@ try {
   // outcome as \`error\` for /control/v1/status; the lane absorbs it there,
   // so the daemon keeps serving and armSchedule still re-arms.
   if (isRunFailedError(__err)) {
-    process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[${laneId}]" })}\\n\`);
+    process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: ${prefix} })}\\n\`);
   } else {
     process.stderr.write(\`[${laneId}] error: \${(__err as Error).message}\\n\`);
   }
   throw __err;
 }`;
+  };
   const scheduleBoot = ir.schedule
     ? `
   // Loop contract 0.4 (Batch F) — schedule: wake loop (cron|interval + jitter)
@@ -2374,11 +2386,11 @@ ${renderControlLane({
   lane: "schedule",
   varName: "__scheduleLane",
   cadence: describeSchedule(ir.schedule),
-  // Unlike a heartbeat, a schedule's next fire IS computable offline — this
-  // reports the same arithmetic armSchedule itself uses (jitter aside).
-  nextDueAtExpr: "new Date(Date.now() + nextWakeDelayMs(__scheduleSpec, Date.now())).toISOString()",
+  // The armed timer's recorded fire time, jitter included; absent while no
+  // timer is pending.
+  nextDueAtExpr: scheduleNextDueAtExpr("__schedule.nextAt()"),
   indent: "  ",
-  body: scheduleTickBody("schedule", "__scheduleInstructions", "__scheduleTick"),
+  body: scheduleTickBody({ fixed: "schedule" }, "__scheduleInstructions", "__scheduleTick"),
 })}  const __schedule = armSchedule(__scheduleSpec, {
     onWake: async () => {
       await __scheduleLane.tick();
@@ -2408,7 +2420,7 @@ ${renderScheduleLanes({
   })),
   indent: "  ",
   body: ({ laneId, index, instructionsVar }) =>
-    scheduleTickBody(laneId, instructionsVar, `__scheduleLaneTicks[${index}]`),
+    scheduleTickBody({ laneId }, instructionsVar, `__scheduleLaneTicks[${index}]`),
   onErrorBody:
     "process.stderr.write(`[schedule:${__name}] error: ${(__err as Error).message}\\n`);",
   afterArm:
