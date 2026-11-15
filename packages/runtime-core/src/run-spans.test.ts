@@ -998,6 +998,87 @@ describe("verdict lines", () => {
 });
 
 // ---------------------------------------------------------------------------
+// A hook's decision and its verdict line
+// ---------------------------------------------------------------------------
+
+describe("a hook's decision stands when its verdict cannot be recorded", () => {
+  const REASON = "guarded-by-policy";
+
+  /**
+   * One pre-tool hook on `Guarded` answering `decision`, whose `matcher` throws
+   * once the hook has fired: the first read after `hook_fired` is the verdict
+   * recorder's, so recording that hook's verdict fails.
+   */
+  async function guardedRun(decision: "allow" | "deny") {
+    let armed = false;
+    let executed = 0;
+    const guarded = buildTool({
+      name: "Guarded",
+      description: "a hook guards it",
+      inputSchema: z.object({}),
+      readOnly: true,
+      execute: async () => {
+        executed += 1;
+        return "ran";
+      },
+    });
+    const hook = {
+      event: "pre-tool" as const,
+      command: hookAnswering(decision, decision === "deny" ? REASON : undefined),
+      get matcher(): string {
+        if (armed) throw new Error("recording exploded");
+        return "Guarded";
+      },
+    };
+    const ctx = createRunContext();
+    const warn = spyOn(ctx.logger, "warn");
+    const off = ctx.eventBus.subscribe((e) => {
+      if (e.kind === "hook_fired") armed = true;
+    });
+    const adapter = scripted([[callTool("tu_g", "Guarded")], [say("done")]]);
+    try {
+      const r = await run(tempDir(), { tools: [guarded], hooks: [hook], _adapter: adapter }, ctx);
+      const results = (adapter.reqs[1]?.messages ?? []).flatMap((m) =>
+        typeof m.content === "string"
+          ? []
+          : m.content.filter(
+              (b): b is Extract<(typeof m.content)[number], { type: "tool_result" }> =>
+                b.type === "tool_result" && b.tool_use_id === "tu_g",
+            ),
+      );
+      const warned = warn.mock.calls.map((c) => c[0]);
+      return { r, armed: () => armed, executed: () => executed, results, warned };
+    } finally {
+      off();
+      warn.mockRestore();
+    }
+  }
+
+  test("a pre-tool hook's deny stands when its verdict cannot be recorded", async () => {
+    const g = await guardedRun("deny");
+    expect(g.r.caught).toBeUndefined();
+    expect(g.armed()).toBe(true);
+    expect(g.executed()).toBe(0);
+    expect(g.results).toHaveLength(1);
+    expect(g.results[0]?.is_error).toBe(true);
+    expect(g.results[0]?.content).toBe(`[blocked by hook] ${REASON}`);
+    expect(g.warned).toContain("hook verdict recording failed");
+    expect(g.warned).not.toContain("hook firing failed");
+  });
+
+  test("a pre-tool hook's allow stands when its verdict cannot be recorded", async () => {
+    const g = await guardedRun("allow");
+    expect(g.r.caught).toBeUndefined();
+    expect(g.armed()).toBe(true);
+    expect(g.executed()).toBe(1);
+    expect(g.results).toHaveLength(1);
+    expect(g.results[0]?.is_error).not.toBe(true);
+    expect(g.warned).toContain("hook verdict recording failed");
+    expect(g.warned).not.toContain("hook firing failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The action digest
 // ---------------------------------------------------------------------------
 
