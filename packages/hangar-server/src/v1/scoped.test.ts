@@ -116,6 +116,43 @@ describe("a scoped token for a supervisor's run", () => {
     ).toEqual([`${a.id}/exec/run_ffffffffffffffff`]);
   });
 
+  test("a ref in a harness the service cannot read is refused as not held, whether or not its run exists", async () => {
+    const onlyA = await home.service("portal-a", [a.id], { contentRead: true });
+    const there = canonicalRun(b.dir);
+    const answers: Array<[number, string]> = [];
+    for (const ref of [
+      `${b.id}/run/${there}`,
+      `${b.id}/run/${mintRunId()}`,
+      `${b.id}/exec/${runB}`,
+      `${b.id}/exec/run_ffffffffffffffff`,
+    ]) {
+      const { res } = await mint([ref], onlyA.secret, ["run.events.read"]);
+      const error = res.body["error"] as Record<string, unknown>;
+      expect([res.status, error["code"], error["reason"]]).toEqual([403, "forbidden", "not-held"]);
+      expect((error["details"] as Record<string, unknown> | undefined)?.["refs"]).toBeUndefined();
+      answers.push([res.status, JSON.stringify(res.body)]);
+    }
+    expect(answers[1]).toEqual(answers[0]);
+    expect(answers[3]).toEqual(answers[2]);
+    // A scope this Home does not have is refused alike.
+    const nowhere = await mint([`hrn_0123456789abcdef/run/${mintRunId()}`], onlyA.secret);
+    expect(nowhere.res.status).toBe(403);
+    expect((nowhere.res.body["error"] as Record<string, unknown>)["reason"]).toBe("not-held");
+    // In a harness it may read: a missing run is named, and an existing one mints.
+    const missing = mintRunId();
+    const gone = await mint([`${a.id}/run/${missing}`], onlyA.secret, ["run.events.read"]);
+    expect(gone.res.status).toBe(422);
+    const goneError = gone.res.body["error"] as Record<string, unknown>;
+    expect(goneError["reason"]).toBe("refs");
+    expect((goneError["details"] as Record<string, unknown>)["refs"]).toEqual([
+      `${a.id}/run/${missing}`,
+    ]);
+    const here = canonicalRun(a.dir);
+    const minted = await mint([`${a.id}/run/${here}`], onlyA.secret, ["run.events.read"]);
+    expect(minted.res.status).toBe(200);
+    expect(minted.token?.startsWith("chx_")).toBe(true);
+  });
+
   test("a session cannot mint one", async () => {
     const res = await mint([`${a.id}/exec/${runA}`], home.session);
     expect(res.res.status).toBe(403);
@@ -235,7 +272,7 @@ describe("a scoped token on the v1 run stream", () => {
     expect([opened.status, opened.reason]).toEqual([403, "scoped"]);
   });
 
-  test("its open stream outlives an access change that does not touch it, and closes once its service loses the content permission", async () => {
+  test("its open stream outlives an access change that does not touch it, and closes once its minting token is revoked", async () => {
     const run = canonicalRun(a.dir);
     const minter = await home.service("portal-2", [a.id], { contentRead: true });
     const { token } = await mint([`${a.id}/run/${run}`], minter.secret, ["run.events.read"]);

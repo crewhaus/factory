@@ -21,6 +21,7 @@ import { isOptimizable } from "@crewhaus/spec-patch";
 import { specRev } from "@crewhaus/spec-patch/commit";
 import { sessionKeyOf, tierFor } from "./feedback-ops";
 import { feedbackRecord, logLine, makeFixtureHarness } from "./fixture";
+import { classifyPath, isAutoTunable } from "./spec-edit";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
@@ -683,6 +684,64 @@ describe("the advisory feed", () => {
     expect(status).toBe(200);
     expect(body["applied"]).toBe(false);
     expect(body["present"]).toBe(false);
+  });
+});
+
+describe("an advice row whose target names no table row", () => {
+  test("such a row reads as human-owned, and the feed lists every proposal it can read", async () => {
+    // A path no security surface covers, so the lookup by target is what decides.
+    const path = ["agent", "instructions"];
+    expect(classifyPath("cli", path).securitySurface).toBe(false);
+    expect(isAutoTunable("constructor", path)).toBe(false);
+    expect(isAutoTunable("__proto__", path)).toBe(false);
+    expect(classifyPath("constructor", path).tier).toBe("human-owned");
+    expect(classifyPath("__proto__", path).tier).toBe("human-owned");
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "planted"), { specName: "planted" });
+    const row = (findingId: string, target: string) => ({
+      findingId,
+      severity: "info",
+      summary: `a proposal for ${findingId}`,
+      patch: {
+        target,
+        path: ["agent", "instructions"],
+        op: "replace",
+        value: "Answer in one line.",
+        rationale: "planted",
+      },
+    });
+    write(
+      dir,
+      [".crewhaus", "advice", "suggestions.json"],
+      `${JSON.stringify({
+        generatedAt: iso(NOW - DAY),
+        suggestions: [
+          row("adv_constructor", "constructor"),
+          row("adv_proto", "__proto__"),
+          {
+            findingId: "adv_valid",
+            severity: "warn",
+            summary: "the agent repeats itself",
+            patch: {
+              target: "cli",
+              path: ["agent", "instructions"],
+              op: "replace",
+              value: "Answer briefly.",
+              rationale: "observed repetition",
+            },
+          },
+        ],
+      })}\n`,
+    );
+    const id = await register(t, dir);
+    const res = await t.api(`/api/h/${id}/feedback/advice`);
+    expect(res.status).toBe(200);
+    const proposals = res.body["proposals"] as Array<{ adviceId: string; tier: string }>;
+    expect(proposals.map((p) => [p.adviceId, p.tier])).toEqual([
+      ["adv_constructor", "human-owned"],
+      ["adv_proto", "human-owned"],
+      ["adv_valid", "auto-tunable"],
+    ]);
   });
 });
 

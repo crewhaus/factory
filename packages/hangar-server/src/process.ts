@@ -47,6 +47,7 @@ import {
   type ApiRunCapacity,
   admitExplicitStart,
   recordDesired,
+  runRowOf,
 } from "@crewhaus/control-service";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import {
@@ -136,6 +137,38 @@ export const API_RUN_RETRY_AFTER_MS = 10_000;
 /** What an API start of a run this layer already holds is answered. */
 const API_RUN_HELD_MESSAGE = "This run is already starting or running.";
 
+/** What an API start is answered when, at its turn, its run is no longer waiting to start. */
+const API_RUN_NOT_STARTABLE_MESSAGE = "This run is no longer waiting to start.";
+
+/** The run states an API start may open a run from: a create's, and a resume's. */
+const API_STARTABLE_STATES: ReadonlySet<string> = new Set(["queued", "waiting-for-approval"]);
+
+/** Whether a run's newest row still lets an API start open it; an unreadable one does not. */
+function startableAtTurn(harnessDir: string, runId: string): boolean {
+  try {
+    const row = runRowOf(harnessDir, runId);
+    return row !== undefined && API_STARTABLE_STATES.has(String(row["state"]));
+  } catch {
+    return false;
+  }
+}
+
+/** The key an API run is held under: its harness and its run id, so a run id in one
+ *  harness never names another harness's run. */
+function apiRunKey(harnessDir: string, runId: string): string {
+  return `${harnessDir}\u0000${runId}`;
+}
+
+/** An API run this layer holds: from its admitted start until its job exits. */
+type HeldApiRun = {
+  readonly harnessDir: string;
+  supervisor?: HarnessSupervisor;
+  /** Its turn on the harness came: its preparation may be under way. */
+  turn?: true;
+  /** Withdrawn while it waited for its turn: it is refused when the turn comes. */
+  withdrawn?: true;
+};
+
 export type ProcessLayerOptions = {
   readonly registry: HangarRegistry;
   /** The manager's own environment — the base layer of every spawn env. */
@@ -175,6 +208,8 @@ export type ProcessLayerOptions = {
    * {@link DEFAULT_API_RUNS_PER_HOME}). A run is live from its start until its job exits.
    */
   readonly apiRunLimits?: { readonly perHarness?: number; readonly perHome?: number };
+  /** Builds an API run's supervisor (default `createHarnessSupervisor`): the seam tests use. */
+  readonly createApiSupervisor?: (options: SupervisorOptions) => HarnessSupervisor;
 };
 
 /** One harness's supervision handle, memoized by harness dir. */
@@ -575,15 +610,15 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       });
 
   /**
-   * The API runs this layer holds, by run id: each from the moment its start is admitted
-   * until its job exits (or its start fails), with its supervisor once it has one.
+   * The API runs this layer holds, by harness and run id (see {@link apiRunKey}): each
+   * from the moment its start is admitted until its job exits, its start settles without
+   * a job, or it is withdrawn while it waits for its turn; with its supervisor once it
+   * has one. A run id names a run in one harness only.
    */
-  const apiRuns = new Map<
-    string,
-    { readonly harnessDir: string; supervisor?: HarnessSupervisor }
-  >();
+  const apiRuns = new Map<string, HeldApiRun>();
   /** Each harness's API starts, chained: one prepares and spawns at a time. */
   const apiStarts = new Map<string, Promise<void>>();
+  const createApiSupervisor = options.createApiSupervisor ?? createHarnessSupervisor;
   const perHarness = options.apiRunLimits?.perHarness ?? DEFAULT_API_RUNS_PER_HARNESS;
   const perHome = options.apiRunLimits?.perHome ?? DEFAULT_API_RUNS_PER_HOME;
 
@@ -611,11 +646,12 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
       error: new Error(message),
     });
     // Reserved before the first await, so two starts in one tick count each other.
-    if (apiRuns.has(apiRun.runId)) return refusedStart(API_RUN_HELD_MESSAGE);
+    const key = apiRunKey(harnessDir, apiRun.runId);
+    if (apiRuns.has(key)) return refusedStart(API_RUN_HELD_MESSAGE);
     const capacity = apiRunCapacityOf(harnessDir);
     if (!capacity.ok) return refusedStart(API_RUN_BUSY_MESSAGES[capacity.scope]);
-    const held: { readonly harnessDir: string; supervisor?: HarnessSupervisor } = { harnessDir };
-    apiRuns.set(apiRun.runId, held);
+    const held: HeldApiRun = { harnessDir };
+    apiRuns.set(key, held);
     const previous = apiStarts.get(harnessDir) ?? Promise.resolve();
     let done!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -625,8 +661,16 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
     apiStarts.set(harnessDir, turn);
     try {
       await previous;
+      held.turn = true;
+      // The run is decided again at its turn: one cancelled, or withdrawn, while it
+      // waited runs no preparation and starts no job.
+      if (held.withdrawn === true || !startableAtTurn(harnessDir, apiRun.runId)) {
+        return refusedStart(API_RUN_NOT_STARTABLE_MESSAGE);
+      }
       return await startHeldApiRun(entry, apiRun, held);
     } finally {
+      // Every way out without a live job frees its place.
+      if (apiRuns.get(key) === held && held.supervisor === undefined) apiRuns.delete(key);
       done();
       if (apiStarts.get(harnessDir) === turn) apiStarts.delete(harnessDir);
     }
@@ -636,11 +680,11 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
   const startHeldApiRun = async (
     entry: HangarHarnessEntry,
     apiRun: ApiRunInput,
-    held: { readonly harnessDir: string; supervisor?: HarnessSupervisor },
+    held: HeldApiRun,
   ): Promise<StartResult> => {
     const harnessDir = entry.dir;
     const target = liveTarget(harnessDir) ?? entry.target;
-    const supervisor = createHarnessSupervisor({
+    const supervisor = createApiSupervisor({
       harnessDir,
       target,
       ops,
@@ -672,7 +716,8 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
     const release = (): void => {
       if (released) return;
       released = true;
-      if (apiRuns.get(apiRun.runId) === held) apiRuns.delete(apiRun.runId);
+      const key = apiRunKey(harnessDir, apiRun.runId);
+      if (apiRuns.get(key) === held) apiRuns.delete(key);
     };
     // Watched before the start, so an exit is never missed: the run stays live until it.
     const off = supervisor.subscribe((event: SupervisorEvent) => {
@@ -703,10 +748,23 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
     return started;
   };
 
-  const stopApiRun = async (_entry: HangarHarnessEntry, runId: string): Promise<boolean> => {
-    const supervisor = apiRuns.get(runId)?.supervisor;
-    if (supervisor === undefined) return false;
-    return (await supervisor.stop()).stopped;
+  /**
+   * Stop the job an API run is running in. A start still waiting for its turn is
+   * withdrawn and frees its place at once (`true`); one whose preparation is under way
+   * keeps its place until it settles (`false`), and its spawn opens only a run that is
+   * still startable. Only a run of `entry`'s own harness is ever stopped.
+   */
+  const stopApiRun = async (entry: HangarHarnessEntry, runId: string): Promise<boolean> => {
+    const key = apiRunKey(entry.dir, runId);
+    const held = apiRuns.get(key);
+    if (held === undefined || held.harnessDir !== entry.dir) return false;
+    if (held.supervisor === undefined) {
+      if (held.turn === true) return false;
+      held.withdrawn = true;
+      apiRuns.delete(key);
+      return true;
+    }
+    return (await held.supervisor.stop()).stopped;
   };
 
   const build = (entry: HangarHarnessEntry): HarnessProcess => {

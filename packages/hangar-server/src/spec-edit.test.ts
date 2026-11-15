@@ -36,6 +36,7 @@ import { gradersConfigHash, parseGradersConfig } from "@crewhaus/eval-grader";
 import { parseSpec } from "@crewhaus/spec";
 import { DELTA_090_KEYS } from "@crewhaus/spec-patch";
 import { specRev } from "@crewhaus/spec-patch/commit";
+import { v1Home } from "./__test__/v1-home";
 import {
   lintMcpEnv,
   looksLikeCredential,
@@ -2226,7 +2227,6 @@ describe("the settings form never writes back a value Home served masked", () =>
 // ---------------------------------------------------------------------------
 
 describe("maskedPlaceholderPaths", () => {
-  const names = new Set(["HELPER_TOKEN"]);
   const R = "[redacted]";
 
   test("finds a placeholder in a key and in a string, at depth and in a sequence", () => {
@@ -2241,46 +2241,55 @@ describe("maskedPlaceholderPaths", () => {
       "  - see «HELPER_TOKEN» here",
       "",
     ].join("\n");
-    const found = maskedPlaceholderPaths("a: {}\n", after, names).map((p: string[]) => p.join("."));
+    const found = maskedPlaceholderPaths("a: {}\n", after).map((p: string[]) => p.join("."));
     expect(found.sort()).toEqual(["a.[redacted]", "a.b.c", "list.1"]);
   });
 
   test("text the file holds at the same path is kept; the same text elsewhere is not", () => {
     const before = `a:\n  b: "${R}"\nlist:\n  - "${R}"\n  - z\n`;
-    expect(maskedPlaceholderPaths(before, before, names)).toEqual([]);
-    expect(maskedPlaceholderPaths(before, `a:\n  b: "${R}"\n  c: "${R}"\n`, names)).toEqual([
-      ["a", "c"],
-    ]);
+    expect(maskedPlaceholderPaths(before, before)).toEqual([]);
+    expect(maskedPlaceholderPaths(before, `a:\n  b: "${R}"\n  c: "${R}"\n`)).toEqual([["a", "c"]]);
     // An index is a path: the item moved, so it is refused at its new place.
-    expect(maskedPlaceholderPaths(before, `list:\n  - z\n  - "${R}"\n`, names)).toEqual([
-      ["list", "1"],
-    ]);
+    expect(maskedPlaceholderPaths(before, `list:\n  - z\n  - "${R}"\n`)).toEqual([["list", "1"]]);
     // A key the file already holds is kept.
     const keyed = `tool_config:\n  "${R}":\n    on: true\n`;
-    expect(maskedPlaceholderPaths(keyed, keyed, names)).toEqual([]);
+    expect(maskedPlaceholderPaths(keyed, keyed)).toEqual([]);
   });
 
   test("with no file yet, any placeholder is refused", () => {
-    expect(maskedPlaceholderPaths(undefined, `a: "${R}"\n`, names)).toEqual([["a"]]);
-    expect(maskedPlaceholderPaths("a: [unclosed\n", `a: "${R}"\n`, names)).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths(undefined, `a: "${R}"\n`)).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: [unclosed\n", `a: "${R}"\n`)).toEqual([["a"]]);
   });
 
   test("*** is never a placeholder, and text that is not YAML answers nothing", () => {
-    expect(maskedPlaceholderPaths("a: x\n", 'a: "***bold*** and ***"\n', names)).toEqual([]);
-    expect(maskedPlaceholderPaths("a: x\n", `a: [unclosed ${R}\n`, names)).toEqual([]);
+    expect(maskedPlaceholderPaths("a: x\n", 'a: "***bold*** and ***"\n')).toEqual([]);
+    expect(maskedPlaceholderPaths("a: x\n", `a: [unclosed ${R}\n`)).toEqual([]);
   });
 
-  test("a «NAME» counts only when it names one of the given names", () => {
-    expect(maskedPlaceholderPaths("a: x\n", "a: use «HELPER_TOKEN»\n", names)).toEqual([["a"]]);
-    expect(maskedPlaceholderPaths("a: x\n", "a: use «NOT_SET_ANYWHERE»\n", names)).toEqual([]);
-    expect(maskedPlaceholderPaths("a: x\n", "a: use «HELPER_TOKEN»\n", new Set())).toEqual([]);
+  test("a «NAME» of any shape the scrubber writes counts, whatever any environment holds", () => {
+    expect(maskedPlaceholderPaths("a: x\n", "a: use «HELPER_TOKEN»\n")).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: x\n", "a: use «NOT_SET_ANYWHERE»\n")).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: x\n", "a: use «_lower9»\n")).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: x\n", "a: use «9LEAD»\n")).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: x\n", '"«KEYED»": 1\n')).toEqual([["«KEYED»"]]);
+    // A spec credential key's name, as the scrubber writes it in a masked view.
+    expect(
+      maskedPlaceholderPaths("url: https://h/?k=v\n", "url: https://h/?k=«x-api-key»\n"),
+    ).toEqual([["url"]]);
+    expect(maskedPlaceholderPaths("a: x\n", "a: «bot.token»\n")).toEqual([["a"]]);
+    // A guillemet span of any other shape is ordinary text.
+    expect(maskedPlaceholderPaths("a: x\n", "a: «not a name» and «a/b» and «»\n")).toEqual([]);
+    // The same token the file already holds at that path is kept.
+    expect(maskedPlaceholderPaths("a: «KEPT»\n", "a: «KEPT»\n")).toEqual([]);
+    expect(maskedPlaceholderPaths("a: «x-api-key»\n", "a: «x-api-key»\n")).toEqual([]);
+    expect(maskedPlaceholderPaths("a: «bot.token»\n", "a: «bot.token»\n")).toEqual([]);
   });
 
   test("the current file is read through its own properties only", () => {
     const proto = Object.prototype as Record<string, unknown>;
     try {
       proto["k"] = R;
-      expect(maskedPlaceholderPaths("a: {}\n", `a:\n  k: "${R}"\n`, names)).toEqual([["a", "k"]]);
+      expect(maskedPlaceholderPaths("a: {}\n", `a:\n  k: "${R}"\n`)).toEqual([["a", "k"]]);
     } finally {
       Reflect.deleteProperty(Object.prototype, "k");
     }
@@ -2288,9 +2297,9 @@ describe("maskedPlaceholderPaths", () => {
 
   test("deep nesting and shared subtrees never throw", () => {
     const deep = `${"[".repeat(2000)}"${R}"${"]".repeat(2000)}\n`;
-    expect(() => maskedPlaceholderPaths(undefined, deep, names)).not.toThrow();
+    expect(() => maskedPlaceholderPaths(undefined, deep)).not.toThrow();
     const shared = ["base: &b", `  v: "${R}"`, "x: *b", "y: *b", ""].join("\n");
-    expect(maskedPlaceholderPaths(undefined, shared, names)).toEqual([
+    expect(maskedPlaceholderPaths(undefined, shared)).toEqual([
       ["base", "v"],
       ["x", "v"],
       ["y", "v"],
@@ -2339,7 +2348,7 @@ describe("a spec edit holding a hidden value's placeholder", () => {
     }
   });
 
-  test("a «NAME» for one of the harness's .env values is refused through POST /spec/patch", async () => {
+  test("a «NAME» placeholder is refused through POST /spec/patch, and a guillemet span of another shape is written", async () => {
     const t = boot();
     try {
       const dir = specHarness(t, "masked-patch");
@@ -2363,16 +2372,26 @@ describe("a spec edit holding a hidden value's placeholder", () => {
         ["agent.instructions", "masked_placeholder"],
       ]);
       expect(readFileSync(specPath).equals(before)).toBe(true);
-      // A «word» that names nothing this harness holds is ordinary text.
-      const written = await t.api(
+      // A name nothing holds has the same shape, and is refused the same way.
+      const unset = await t.api(
         `/api/h/${id}/spec/patch`,
         post({
           edit: { path: "agent.instructions", value: "Call it with «NOT_SET_ANYWHERE»." },
           expectedRev: revOf(dir),
         }),
       );
+      expect(unset.body["code"]).toBe("edit_rejected");
+      expect(readFileSync(specPath).equals(before)).toBe(true);
+      // A «word» that is not an env variable's shape is ordinary text.
+      const written = await t.api(
+        `/api/h/${id}/spec/patch`,
+        post({
+          edit: { path: "agent.instructions", value: "Call it with «not a name»." },
+          expectedRev: revOf(dir),
+        }),
+      );
       expect(written.body["ok"]).toBe(true);
-      expect(readFileSync(specPath, "utf8")).toContain("«NOT_SET_ANYWHERE»");
+      expect(readFileSync(specPath, "utf8")).toContain("«not a name»");
     } finally {
       await t.stop();
     }
@@ -2459,6 +2478,44 @@ describe("a spec edit holding a hidden value's placeholder", () => {
       await t.stop();
     }
   });
+});
+
+describe("a «NAME» placeholder is refused by its shape alone", () => {
+  test("a viewer's /spec/diff answer is the same for a name only Home's own environment sets and for a name nothing sets", async () => {
+    const home = await v1Home({
+      now: () => NOW,
+      env: { ONLY_IN_MANAGER_ENV: ["manager", "only", "4c3b2a"].join("-") },
+    });
+    try {
+      const dir = specHarness(home.t, "shape-only");
+      const id = await register(home.t, dir);
+      const viewer = await home.member("Vee", "viewer");
+      const before = readFileSync(join(dir, "crewhaus.yaml"));
+      const diffOf = (value: string) =>
+        home.call("POST", `/api/h/${id}/spec/diff`, {
+          secret: viewer.secret,
+          body: { edits: [{ path: ["agent", "instructions"], value }] },
+        });
+      const inEnv = await diffOf("Call it with «ONLY_IN_MANAGER_ENV».");
+      const unset = await diffOf("Call it with «NEVER_SET_ANYWHERE».");
+      expect(inEnv.status).toBe(200);
+      expect(inEnv.body["code"]).toBe("edit_rejected");
+      const rows = inEnv.body["issues"] as Array<{ path: string[]; code: string }>;
+      expect(rows.map((i) => [i.path.join("."), i.code])).toEqual([
+        ["agent.instructions", "masked_placeholder"],
+      ]);
+      expect([unset.status, JSON.stringify(unset.body)]).toEqual([
+        inEnv.status,
+        JSON.stringify(inEnv.body),
+      ]);
+      // Another shape is ordinary text.
+      const prose = await diffOf("Call it with «not a name».");
+      expect(prose.body["ok"]).toBe(true);
+      expect(readFileSync(join(dir, "crewhaus.yaml")).equals(before)).toBe(true);
+    } finally {
+      await home.t.stop();
+    }
+  }, 20_000); // a Home with sign-in, a member and three previews; slow on a loaded runner
 });
 
 describe("the effective rows of a parsed spec", () => {

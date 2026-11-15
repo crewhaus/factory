@@ -758,6 +758,13 @@ async function cancelPlan(
             value: { run: req.runId, problem: written.reason },
           };
         }
+        // A start the head holds for this run, still waiting for its turn, gives up its
+        // place now; whatever it answers, the run is cancelled.
+        try {
+          await req.home.stopRunJob?.(req.harnessDir, req.runId);
+        } catch {
+          // The cancelled row stands; the start refuses it at its turn.
+        }
         removeApiRunInput(req.harnessDir, req.runId);
         return {
           settle: {
