@@ -20087,8 +20087,13 @@ async function enforceProtectedEnvGate(opts: {
     requireApproval: opts.args.flags["require-approval"] === true,
     ...(opts.args.flags["check-pr"] === true
       ? {
-          prCheck: () =>
-            readPrCheckViaGh({ specName: opts.name, env: opts.toEnv, version: opts.toVersion }),
+          prCheck: (specHash: string) =>
+            readPrCheckViaGh({
+              specName: opts.name,
+              env: opts.toEnv,
+              version: opts.toVersion,
+              specHash,
+            }),
         }
       : {}),
   });

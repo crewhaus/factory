@@ -2822,6 +2822,35 @@ describe("the release notes name what saved-is-not-deployed changes for every ha
     }
   });
 
+  test("--check-pr counts only a proposal PR that names the candidate's spec revision", async () => {
+    const { readPrCheckViaGh } = await import("../apps/cli/src/pr-witness");
+    const { specRevision } = await import("../packages/ir/src/policy");
+    const revision = specRevision("name: s\ntarget: cli\n");
+    const listed = (body: string) => () => ({
+      status: 0,
+      stdout: JSON.stringify([
+        {
+          number: 1,
+          url: "https://example.invalid/pr/1",
+          headRefName: "propose/chg_1",
+          title: "propose: s v1 (manual)",
+          body,
+          isCrossRepository: false,
+          reviewDecision: "APPROVED",
+          statusCheckRollup: [{ conclusion: "SUCCESS" }],
+        },
+      ]),
+    });
+    const query = { specName: "s", env: "prod", version: "v1", specHash: revision };
+    expect(readPrCheckViaGh(query, listed("Proposed change.\n")).conclusion).toBe("none");
+    expect(
+      readPrCheckViaGh(query, listed(`Proposed change.\nSpec revision: ${revision}\n`)).conclusion,
+    ).toBe("success");
+    const bullet = bulletFor("`--check-pr`");
+    expect(bullet).toContain("spec revision");
+    expect(bullet).toContain("`crewhaus propose`");
+  });
+
   test("loader settings come only from the manager's environment, PATH among them", () => {
     const bullet = bulletFor("A supervised start takes loader and interpreter settings");
     expect(bullet).toContain("`PATH`");
