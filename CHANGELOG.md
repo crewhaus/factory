@@ -256,6 +256,11 @@ these on: they reach every harness that uses what each one names.
   when its `specHash` matches the version's content. The refusal prints the
   value to record.
 
+- **`--check-pr` takes as a witness only a proposal PR that names the
+  candidate's exact spec revision.** `crewhaus propose` writes the revision
+  into the PR it opens, as a `Spec revision:` line. A proposal PR opened
+  before this release names none, so open it again with `crewhaus propose`.
+
 - **A supervised start takes loader and interpreter settings, `PATH` among
   them, only from the environment it was started with,** never from a harness's
   env files; `crewhaus harness show` lists any it left out. If a harness set
