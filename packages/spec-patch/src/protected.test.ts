@@ -12,6 +12,7 @@ import {
   applySpecEdits,
   escalationFor,
   protectedBarChange,
+  protectedBarChanges,
   validatePatch,
 } from "./index";
 
@@ -363,5 +364,511 @@ steps:
       const extended = { steps: [...raised.steps, step("publish")] };
       expect(protectedBarChange(before, extended)).toBeUndefined();
     });
+  });
+});
+
+/** The keys `protectedBarChanges` names for a change. */
+const keysOf = (before: unknown, after: unknown): string[] =>
+  protectedBarChanges(before, after).map((c) => c.key);
+
+/** The one escalation a loosening of `paths` raises. */
+const securityFor = (paths: string[]) => [
+  {
+    needs: "h.spec.edit.security",
+    reason: expect.stringContaining("only the owner can make it"),
+    paths,
+  },
+];
+
+describe("a protected judge gate changes only by its tightenings without the owner", () => {
+  const yaml = WORKFLOW(PROTECTED_GATE);
+  const base = { criteria: "is it right", threshold: 0.7, protected: true };
+  /** The parsed workflow with its gate's judge set to `judge`. */
+  const docWith = (judge: Record<string, unknown>): Record<string, unknown> => ({
+    ...(parse(yaml) as Record<string, unknown>),
+    steps: stepsWith(judge),
+  });
+  const before = docWith(base);
+
+  test("each owner's field of a protected gate needs the owner, and is named", () => {
+    for (const [field, value] of [
+      ["criteria", "anything goes"],
+      ["model", "other-model"],
+      ["judges", ["a", "b", "c"]],
+      ["repeats", 3],
+      ["temperature", 0.5],
+      ["target", "transcript"],
+      ["escalate_to", "strong"],
+      ["on_fail", "continue"],
+      ["max_retries", 2],
+    ] as const) {
+      const key = `steps.gate.judge.${field}`;
+      const judge = { ...base, [field]: value };
+      expect(keysOf(before, docWith(judge))).toEqual([key]);
+      expect(escalationFor(before, docWith(judge))).toEqual(securityFor([key]));
+      refusedBoth(
+        yaml,
+        stepsWith(judge),
+        field === "max_retries" || field === "repeats"
+          ? /would loosen "steps\.gate\.judge\.(max_retries|repeats)"/
+          : /may not change|declares no model_pool/,
+      );
+    }
+  });
+
+  test("a raised max_retries or repeats on its own leaf needs the owner", () => {
+    for (const [field, value] of [
+      ["max_retries", 2],
+      ["repeats", 3],
+    ] as const) {
+      expect(() =>
+        validatePatch(parseSpec(yaml), {
+          target: "workflow",
+          path: ["steps", "1", "judge", field],
+          op: "replace",
+          value,
+        }),
+      ).toThrow(new RegExp(`would loosen "steps\\.gate\\.judge\\.${field}"`));
+    }
+  });
+
+  test("on_fail only grows stricter: continue, then retry_previous (the default), then halt", () => {
+    const at = (onFail?: string) =>
+      docWith(onFail === undefined ? base : { ...base, on_fail: onFail });
+    for (const [from, to] of [
+      ["halt", "retry_previous"],
+      ["retry_previous", "continue"],
+      [undefined, "continue"],
+    ] as const) {
+      expect(keysOf(at(from), at(to))).toEqual(["steps.gate.judge.on_fail"]);
+      expect(escalationFor(at(from), at(to))).toEqual(securityFor(["steps.gate.judge.on_fail"]));
+    }
+    expect(protectedBarChanges(at("halt"), at("retry_previous"))[0]?.reason).toContain(
+      "(halt → retry_previous)",
+    );
+    for (const [from, to] of [
+      ["continue", "halt"],
+      ["continue", "retry_previous"],
+      [undefined, "halt"],
+    ] as const) {
+      expect(protectedBarChanges(at(from), at(to))).toEqual([]);
+      expect(escalationFor(at(from), at(to))).toEqual([]);
+    }
+    // on_fail is a person's field: the optimizer moves it in neither direction, and a
+    // person's stricter on_fail needs no owner.
+    refusedBoth(
+      WORKFLOW(`${PROTECTED_GATE}\non_fail: continue`),
+      stepsWith({ ...base, on_fail: "halt" }),
+      /may not change/,
+    );
+  });
+
+  test("a lowered max_retries needs no owner; absent reads 1", () => {
+    const twice = WORKFLOW(`${PROTECTED_GATE}\nmax_retries: 2`);
+    expect(
+      protectedBarChanges(
+        docWith({ ...base, max_retries: 2 }),
+        docWith({ ...base, max_retries: 1 }),
+      ),
+    ).toEqual([]);
+    admittedBoth(twice, stepsWith({ ...base, max_retries: 1 }));
+    expect(protectedBarChanges(before, docWith({ ...base, max_retries: 1 }))).toEqual([]);
+    admittedBoth(yaml, stepsWith({ ...base, max_retries: 1 }));
+  });
+
+  test("a raised threshold, or another step's instructions, needs no owner", () => {
+    expect(protectedBarChanges(before, docWith({ ...base, threshold: 0.9 }))).toEqual([]);
+    const doc = parse(yaml) as { steps: Array<Record<string, unknown>> };
+    const drafted = {
+      ...doc,
+      steps: doc.steps.map((s) => (s["name"] === "draft" ? { ...s, instructions: "Again." } : s)),
+    };
+    expect(protectedBarChanges(doc, drafted)).toEqual([]);
+    expect(escalationFor(doc, drafted)).toEqual([]);
+  });
+
+  test("two loosenings in one change are both named, in order, in one escalation", () => {
+    const after = docWith({ ...base, on_fail: "continue", criteria: "anything goes" });
+    const keys = ["steps.gate.judge.on_fail", "steps.gate.judge.criteria"];
+    expect(keysOf(before, after)).toEqual(keys);
+    expect(protectedBarChange(before, after)?.key).toBe(keys[0] as string);
+    const escalations = escalationFor(before, after);
+    expect(escalations).toEqual(securityFor(keys));
+    expect(escalations[0]?.reason).toContain("; ");
+  });
+
+  test("a gate whose protection is cleared names only that", () => {
+    const { protected: _p, ...open } = base;
+    expect(keysOf(before, docWith({ ...open, on_fail: "continue" }))).toEqual([
+      "steps.gate.judge.protected",
+    ]);
+  });
+});
+
+describe("the wiring around a protected graph judge node is the owner's", () => {
+  const GRAPH = `name: g
+target: graph
+model: base-model
+entry: draft
+nodes:
+  draft:
+    instructions: Draft it.
+  gate:
+    kind: judge
+    judge:
+      criteria: is it right
+      protected: true
+  publish:
+    instructions: Publish it.
+  done:
+    instructions: Done.
+edges:
+  - { from: draft, to: gate }
+  - { from: gate, to: publish }
+`;
+  type Graph = Record<string, unknown> & { edges: Array<Record<string, unknown>> };
+  const before = parse(GRAPH) as Graph;
+  const KEY = "nodes.gate.judge.edges";
+  /** The graph with `change` applied, checked to parse as a spec. */
+  const graphWith = (change: Partial<Graph>): Graph => {
+    const after = { ...before, ...change } as Graph;
+    expect(() => parseSpec(JSON.stringify(after))).not.toThrow();
+    return after;
+  };
+  const ahead = [{ from: "draft", to: "publish" }, ...before.edges];
+
+  test("an edge added ahead of the upstream node's edge into the gate needs the owner", () => {
+    const after = graphWith({ edges: ahead });
+    expect(keysOf(before, after)).toEqual([KEY]);
+    expect(escalationFor(before, after)).toEqual(securityFor([KEY]));
+    expect(() =>
+      validatePatch(parseSpec(GRAPH), {
+        target: "graph",
+        path: ["edges"],
+        op: "replace",
+        value: ahead,
+      }),
+    ).toThrow();
+  });
+
+  test("a moved entry, a parallel group and a condition on the gate's edge need the owner", () => {
+    for (const after of [
+      graphWith({ entry: "publish" }),
+      graphWith({ parallel: [["draft", "publish"]] } as Partial<Graph>),
+      graphWith({
+        edges: [
+          { from: "draft", to: "gate", when: { key: "draft", exists: true } },
+          before.edges[1] as Record<string, unknown>,
+        ],
+      }),
+    ]) {
+      expect(keysOf(before, after)).toEqual([KEY]);
+      expect(escalationFor(before, after)).toEqual(securityFor([KEY]));
+    }
+  });
+
+  test("an edge between two other nodes needs no owner", () => {
+    const after = graphWith({ edges: [...before.edges, { from: "publish", to: "done" }] });
+    expect(protectedBarChanges(before, after)).toEqual([]);
+    expect(escalationFor(before, after)).toEqual([]);
+  });
+});
+
+describe("the wiring upstream of a protected graph judge node is the owner's", () => {
+  /** A graph `start → draft → gate → publish`, with `done` after it and `nodes` added. */
+  const graph = (
+    extraNodes = "",
+    edges = "  - { from: start, to: draft }\n  - { from: draft, to: gate }\n",
+  ) =>
+    parse(`name: g
+target: graph
+model: base-model
+entry: start
+nodes:
+  start:
+    instructions: Start.
+  draft:
+    instructions: Draft it.
+${extraNodes}  gate:
+    kind: judge
+    judge:
+      criteria: is it right
+      protected: true
+  publish:
+    instructions: Publish it.
+  done:
+    instructions: Done.
+edges:
+${edges}  - { from: gate, to: publish }
+`) as Record<string, unknown> & { edges: Array<Record<string, unknown>> };
+  const KEY = "nodes.gate.judge.edges";
+  const checked = (after: Record<string, unknown>) => {
+    expect(() => parseSpec(JSON.stringify(after))).not.toThrow();
+    return after;
+  };
+
+  test("each change to the edges, entry or parallel groups upstream of the gate needs the owner", () => {
+    const before = graph();
+    for (const after of [
+      { ...before, edges: [{ from: "start", to: "publish" }, ...before.edges] },
+      {
+        ...before,
+        edges: before.edges.map((e) =>
+          e["from"] === "start" ? { from: "start", to: "publish" } : e,
+        ),
+      },
+      { ...before, entry: "publish" },
+      { ...before, parallel: [["start", "publish"]] },
+    ]) {
+      expect(keysOf(before, checked(after))).toEqual([KEY]);
+      expect(escalationFor(before, after)).toEqual(securityFor([KEY]));
+    }
+    // Downstream of the gate stays free.
+    const after = checked({ ...before, edges: [...before.edges, { from: "publish", to: "done" }] });
+    expect(protectedBarChanges(before, after)).toEqual([]);
+  });
+
+  test("an edge ahead of a judge node that the protected gate judges needs the owner", () => {
+    // start → draft → check (a judge) → gate (protected) → publish.
+    const before = graph(
+      "  check:\n    kind: judge\n    judge:\n      criteria: is it drafted\n",
+      "  - { from: start, to: draft }\n  - { from: draft, to: check }\n  - { from: check, to: gate }\n",
+    );
+    const after = checked({
+      ...before,
+      edges: [{ from: "draft", to: "publish" }, ...before.edges],
+    });
+    expect(keysOf(before, after)).toEqual([KEY]);
+    expect(escalationFor(before, after)).toEqual(securityFor([KEY]));
+  });
+});
+
+describe("a protected judge reads its model profiles only as the owner set them", () => {
+  const W = (gate: string) => `name: w
+target: workflow
+model: base-model
+models:
+  judge: { model: judge-model, temperature: 0 }
+  other: { model: other-model, temperature: 0 }
+steps:
+  - name: draft
+    instructions: Draft it.
+  - name: gate
+    kind: judge
+    judge: { criteria: is it right, ${gate} }
+`;
+  const dial = (profile: string, field: string, value: unknown) => ({
+    target: "workflow" as const,
+    path: ["models", profile, field],
+    op: "replace" as const,
+    value,
+  });
+
+  test("a profile dial a protected gate reads needs the owner, at both entry points", () => {
+    const yaml = W("model: $judge, protected: true");
+    for (const [field, value] of [
+      ["temperature", 1.5],
+      ["max_tokens", 1],
+    ] as const) {
+      expect(() => validatePatch(parseSpec(yaml), dial("judge", field, value))).toThrow(
+        /would loosen "steps\.gate\.judge\.model"/,
+      );
+      expect(() =>
+        applySpecEdits(yaml, [{ path: ["models", "judge", field], value }], {
+          restrictToOptimizable: true,
+        }),
+      ).toThrow(/would loosen "steps\.gate\.judge\.model"/);
+    }
+    // A profile the gate does not read stays tunable.
+    expect(() => validatePatch(parseSpec(yaml), dial("other", "temperature", 1.5))).not.toThrow();
+    // An unprotected gate stays tunable.
+    expect(() =>
+      validatePatch(parseSpec(W("model: $judge")), dial("judge", "temperature", 1.5)),
+    ).not.toThrow();
+  });
+
+  test("a protected gate that names no model, or strongest, reads every profile", () => {
+    for (const gate of ["protected: true", "model: strongest, protected: true"]) {
+      expect(() => validatePatch(parseSpec(W(gate)), dial("other", "temperature", 1.5))).toThrow(
+        /would loosen "steps\.gate\.judge\.model"/,
+      );
+    }
+  });
+
+  test("a protected evaluation or provability judge reads its profiles only as the owner set them", () => {
+    const CLI = `name: c
+target: cli
+models:
+  strong: { model: claude-opus-4-8, tags: [strong] }
+  fast: { model: claude-sonnet-4-8, tags: [cheap] }
+agent: { model: $fast, instructions: hi }
+evaluation:
+  grader: { type: llm_judge, criteria: be good }
+  on_fail: halt
+  protected: true
+`;
+    expect(() =>
+      validatePatch(parseSpec(CLI), {
+        target: "cli",
+        path: ["models", "strong", "max_tokens"],
+        op: "replace",
+        value: 1,
+      }),
+    ).toThrow(/would loosen "evaluation\.grader\.model"/);
+    const models = (temperature: number) => ({
+      models: { waiver: { model: "m", temperature }, other: { model: "o", temperature } },
+    });
+    const p = (temperature: number) => ({
+      ...models(temperature),
+      provability: { level: "grounded", judge: { model: "$waiver" }, protected: true },
+    });
+    expect(keysOf(p(0), p(1))).toEqual(["provability.judge"]);
+    const onlyOther = {
+      ...p(0),
+      models: { ...models(0).models, other: { model: "o", temperature: 1 } },
+    };
+    expect(keysOf(p(0), onlyOther)).toEqual([]);
+  });
+});
+
+describe("a protected evaluation block changes only by its tightenings without the owner", () => {
+  const CLI = `name: c
+target: cli
+agent: { model: m, instructions: hi }
+evaluation:
+  grader: { type: llm_judge, criteria: be good }
+  protected: true
+`;
+  const evalDoc = (extra: Record<string, unknown>, grader: Record<string, unknown> = {}) => ({
+    evaluation: {
+      grader: { type: "llm_judge", criteria: "be good", ...grader },
+      protected: true,
+      ...extra,
+    },
+  });
+
+  test("on_fail only grows stricter: note, then retry or escalate, then halt", () => {
+    expect(keysOf(evalDoc({ on_fail: "halt" }), evalDoc({ on_fail: "note" }))).toEqual([
+      "evaluation.on_fail",
+    ]);
+    expect(keysOf(evalDoc({}), evalDoc({ on_fail: "note" }))).toEqual(["evaluation.on_fail"]);
+    expect(protectedBarChanges(evalDoc({ on_fail: "note" }), evalDoc({ on_fail: "halt" }))).toEqual(
+      [],
+    );
+    expect(
+      protectedBarChanges(evalDoc({ on_fail: "retry" }), evalDoc({ on_fail: "escalate" })),
+    ).toEqual([]);
+    expect(escalationFor(evalDoc({ on_fail: "halt" }), evalDoc({ on_fail: "note" }))).toEqual(
+      securityFor(["evaluation.on_fail"]),
+    );
+  });
+
+  test("max_retries only falls; absent reads 1", () => {
+    expect(keysOf(evalDoc({}), evalDoc({ max_retries: 3 }))).toEqual(["evaluation.max_retries"]);
+    expect(protectedBarChanges(evalDoc({ max_retries: 3 }), evalDoc({ max_retries: 1 }))).toEqual(
+      [],
+    );
+    expect(() =>
+      validatePatch(parseSpec(CLI), {
+        target: "cli",
+        path: ["evaluation", "max_retries"],
+        op: "replace",
+        value: 3,
+      }),
+    ).toThrow(/would loosen "evaluation\.max_retries"/);
+  });
+
+  test("any change to the grader needs the owner, field by field", () => {
+    expect(keysOf(evalDoc({}), evalDoc({}, { criteria: "anything" }))).toEqual([
+      "evaluation.grader.criteria",
+    ]);
+    expect(keysOf(evalDoc({}), evalDoc({}, { repeats: 3 }))).toEqual(["evaluation.grader.repeats"]);
+    expect(() =>
+      validatePatch(parseSpec(CLI), {
+        target: "cli",
+        path: ["evaluation", "grader", "repeats"],
+        op: "replace",
+        value: 3,
+      }),
+    ).toThrow(/would loosen/);
+  });
+
+  test("allow_self_judge is set only by the owner", () => {
+    expect(keysOf(evalDoc({}), evalDoc({ allow_self_judge: true }))).toEqual([
+      "evaluation.allow_self_judge",
+    ]);
+    expect(protectedBarChanges(evalDoc({ allow_self_judge: true }), evalDoc({}))).toEqual([]);
+  });
+});
+
+describe("a protected provability block changes only by its tightenings without the owner", () => {
+  const p = (extra: Record<string, unknown>) => ({
+    provability: { level: "grounded", protected: true, ...extra },
+  });
+  const CLI = `name: c
+target: cli
+agent: { model: m, instructions: hi }
+provability:
+  level: grounded
+  protected: true
+`;
+
+  test("level only rises along off, cited, grounded, checked, proven", () => {
+    expect(keysOf(p({ level: "proven" }), p({ level: "off" }))).toEqual(["provability.level"]);
+    expect(keysOf(p({ level: "grounded" }), p({ level: "cited" }))).toEqual(["provability.level"]);
+    expect(
+      protectedBarChanges(p({ level: "grounded" }), p({ level: "cited" }))[0]?.reason,
+    ).toContain("(grounded → cited)");
+    expect(protectedBarChanges(p({ level: "cited" }), p({ level: "proven" }))).toEqual([]);
+    expect(escalationFor(p({ level: "proven" }), p({ level: "off" }))).toEqual(
+      securityFor(["provability.level"]),
+    );
+  });
+
+  test("every field but the level and the three dials needs the owner", () => {
+    for (const [field, value] of [
+      ["on_fail", "note"],
+      ["max_retries", 0],
+      ["render", "none"],
+      ["sources", { allow: ["*.gov"] }],
+    ] as const) {
+      expect(keysOf(p({}), p({ [field]: value }))).toEqual([`provability.${field}`]);
+    }
+    expect(keysOf(p({}), p({ grounded: { independent: 2 } }))).toEqual(["provability.grounded"]);
+    // The dials on their own keep their own direction.
+    expect(keysOf(p({}), p({ grounded: { coverage: 0.9, window_tokens: 40 } }))).toEqual([]);
+    expect(() =>
+      validatePatch(parseSpec(CLI), {
+        target: "cli",
+        path: ["provability", "max_retries"],
+        op: "replace",
+        value: 2,
+      }),
+    ).toThrow(/would loosen/);
+  });
+});
+
+describe("an unprotected block stays tunable both ways for every field", () => {
+  test("judge, evaluation and provability fields move freely without protection", () => {
+    const gate = (judge: Record<string, unknown>) => ({ steps: stepsWith(judge) });
+    const base = { criteria: "is it right", threshold: 0.7 };
+    expect(
+      protectedBarChanges(
+        gate({ ...base, on_fail: "halt" }),
+        gate({ ...base, on_fail: "continue", criteria: "x", max_retries: 5, repeats: 3 }),
+      ),
+    ).toEqual([]);
+    const e = (extra: Record<string, unknown>) => ({
+      evaluation: { grader: { type: "llm_judge", criteria: "be good" }, ...extra },
+    });
+    expect(
+      protectedBarChanges(e({ on_fail: "halt" }), e({ on_fail: "note", allow_self_judge: true })),
+    ).toEqual([]);
+    expect(
+      protectedBarChanges(
+        { provability: { level: "proven" } },
+        { provability: { level: "off", render: "none" } },
+      ),
+    ).toEqual([]);
   });
 });
