@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { specRevision } from "@crewhaus/ir/policy";
 import {
   type GitPrDriver,
   type OpenedPr,
@@ -53,6 +54,27 @@ describe("assembleProposal", () => {
     expect(a.prBody).toContain("no auto-merge");
     // patchJson round-trips
     expect(JSON.parse(a.patchJson).specName).toBe("concierge");
+  });
+
+  test("the PR body names the proposed spec's exact revision on one line", () => {
+    const a = assembleProposal({
+      specName: "concierge",
+      currentYaml: CURRENT,
+      proposedYaml: PROPOSED,
+      source: "optimize",
+      proposedVersion: "v2",
+      now: NOW,
+    });
+    const expected = `Spec revision: ${specRevision(PROPOSED)}`;
+    const lines = a.prBody.split("\n");
+    expect(lines.filter((l) => l.startsWith("Spec revision:"))).toEqual([expected]);
+    expect(a.specRevision).toBe(specRevision(PROPOSED));
+    expect(a.specRevision).not.toBe(specRevision(CURRENT));
+    expect(lines.indexOf(expected)).toBeGreaterThan(-1);
+    expect(lines[lines.indexOf(expected) + 1]?.startsWith("Patch hash:")).toBe(true);
+    const patch = JSON.parse(a.patchJson) as Record<string, unknown>;
+    expect(JSON.stringify(patch)).not.toContain("specRevision");
+    expect(JSON.stringify(patch)).not.toContain(specRevision(PROPOSED));
   });
 
   test("carries watchme provenance (the `watchme synthesize --propose` handoff)", () => {

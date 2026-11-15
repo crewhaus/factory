@@ -3,7 +3,7 @@
  * and what each refusal exits with.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { readOperatorRecord } from "@crewhaus/control-records";
@@ -287,6 +287,37 @@ describe("the entry gate checks the spec's own directory and the working directo
     expect(gate(cwd, ["eval", "suite", inDisabled])).toEqual({ out: "" });
   });
 
+  test("a spec reached through a link is checked where it resolves", () => {
+    const disabled = harness("disabled");
+    const cwd = harness("absent");
+    symlinkSync(join(disabled, "crewhaus.yaml"), join(cwd, "link.yaml"));
+    const refusal =
+      "gate-fixture is disabled by its operator, so this doesn't run. `crewhaus daemon enable` allows it again.\n";
+    expect(gate(cwd, ["serve", "--mcp", "link.yaml"])).toEqual({ exit: 38, out: refusal });
+    expect(gate(cwd, ["run", "link.yaml", "--prompt", "x"])).toEqual({ exit: 38, out: refusal });
+  });
+
+  test("the spec a verb runs by default is checked where it resolves", () => {
+    const disabled = harness("disabled");
+    const cwd = harness("absent");
+    rmSync(join(cwd, "crewhaus.yaml"));
+    symlinkSync(join(disabled, "crewhaus.yaml"), join(cwd, "crewhaus.yaml"));
+    const refusal =
+      "gate-fixture is disabled by its operator, so this doesn't run. `crewhaus daemon enable` allows it again.\n";
+    expect(gate(cwd, ["flywheel", "run"])).toEqual({ exit: 38, out: refusal });
+    expect(gate(cwd, ["flywheel", "run", "crewhaus.yaml"])).toEqual({ exit: 38, out: refusal });
+  });
+
+  test("a dangling spec link is checked where it is named, and a link into an enabled harness passes", () => {
+    const cwd = harness("absent");
+    symlinkSync(join(cwd, "absent.yaml"), join(cwd, "gone.yaml"));
+    expect(gate(cwd, ["serve", "--mcp", "gone.yaml"])).toEqual({ out: "" });
+    const enabled = harness("absent");
+    symlinkSync(join(enabled, "crewhaus.yaml"), join(cwd, "link.yaml"));
+    expect(gate(cwd, ["serve", "--mcp", "link.yaml"])).toEqual({ out: "" });
+    expect(gate(cwd, ["run", "link.yaml", "--prompt", "x"])).toEqual({ out: "" });
+  });
+
   test("the stricter verdict decides: a disabled spec directory outranks a paused working directory", () => {
     const disabled = harness("disabled");
     const got = gate(harness("paused"), ["run", join(disabled, "crewhaus.yaml"), "--prompt", "x"]);
@@ -330,5 +361,12 @@ describe("the crewhaus binary", () => {
     const ignored = await cli(paused, ["run", "crewhaus.yaml", "--prompt", "x", "--ignore-pause"]);
     expect(ignored.stderr).toContain("Running although new work is paused (--ignore-pause).");
     expect(ignored.exitCode).not.toBe(39);
-  }, 20_000); // five CLI subprocesses, each loading the whole entry file
+
+    // A spec reached through a link into a disabled harness exits at the gate.
+    const enabled = harness("absent");
+    symlinkSync(join(disabled, "crewhaus.yaml"), join(enabled, "link.yaml"));
+    const linked = await cli(enabled, ["run", "link.yaml", "--prompt", "x"]);
+    expect(linked.exitCode).toBe(38);
+    expect(linked.stderr).toContain("is disabled by its operator");
+  }, 20_000); // six CLI subprocesses, each loading the whole entry file
 });

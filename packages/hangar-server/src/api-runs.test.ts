@@ -10,7 +10,7 @@ import { mintRunId } from "@crewhaus/control-contract";
 import { append, controlPaths, runsLedger } from "@crewhaus/control-records";
 import { type HangarHarnessEntry, openHangarRegistry } from "@crewhaus/harness-registry";
 import { makeFixtureHarness } from "./fixture";
-import type { ProcessLayer } from "./process";
+import { type ProcessLayer, createProcessLayer } from "./process";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const servers: TestServer[] = [];
@@ -159,5 +159,123 @@ describe("API runs on the process layer", () => {
       "This run is already starting or running.",
     );
     expect(t.ops?.children.length).toBe(spawned);
+  });
+
+  test("a run cancelled while it waits for its turn runs no hook and starts no job", async () => {
+    const { t, layer } = layered({ perHarness: 2 });
+    const entry = await harness(t, "cancel-wait", ["/usr/bin/false"]);
+    const start = layer().startApiRun;
+    if (start === undefined) throw new Error("no startApiRun");
+    const hooks = () => (t.ops?.children ?? []).filter(isHook);
+    const first = start(entry, queued(entry));
+    const later = queued(entry);
+    const second = start(entry, later);
+    await until(() => hooks().length, 1);
+    append(runsLedger(entry.dir), {
+      id: later.runId,
+      state: "cancelled",
+      at: new Date().toISOString(),
+      trigger: { kind: "api" },
+    });
+    hooks()[0]?.exit(1);
+    expect(await first).toMatchObject({ ok: false, reason: "prepare-refused" });
+    const refused = await second;
+    expect(refused).toMatchObject({ ok: false, reason: "plan-failed", stage: "spawn" });
+    expect("error" in refused ? refused.error.message : "").toBe(
+      "This run is no longer waiting to start.",
+    );
+    expect(hooks()).toHaveLength(1);
+    expect((t.ops?.children ?? []).filter(isJob)).toEqual([]);
+    expect(layer().apiRunCapacity?.(entry)).toEqual({ ok: true });
+  });
+
+  test("a start withdrawn while it waits frees its place at once; one whose preparation runs keeps it", async () => {
+    const { t, layer } = layered({ perHarness: 2 });
+    const entry = await harness(t, "withdraw", ["/usr/bin/false"]);
+    const l = layer();
+    const { startApiRun: start, stopApiRun: stop } = l;
+    if (start === undefined || stop === undefined) throw new Error("no API runs");
+    const hooks = () => (t.ops?.children ?? []).filter(isHook);
+    const runA = queued(entry);
+    const runB = queued(entry);
+    const first = start(entry, runA);
+    const second = start(entry, runB);
+    await until(() => hooks().length, 1);
+    expect(l.apiRunCapacity?.(entry)).toMatchObject({ ok: false, scope: "harness" });
+    expect(await stop(entry, runB.runId)).toBe(true);
+    expect(l.apiRunCapacity?.(entry)).toEqual({ ok: true });
+    // The first start's preparation is under way: it keeps its place.
+    expect(await stop(entry, runA.runId)).toBe(false);
+    const again = await start(entry, runA);
+    expect("error" in again ? again.error.message : "").toBe(
+      "This run is already starting or running.",
+    );
+    hooks()[0]?.exit(1);
+    expect(await first).toMatchObject({ ok: false, reason: "prepare-refused" });
+    expect(await second).toMatchObject({ ok: false, reason: "plan-failed", stage: "spawn" });
+    expect(hooks()).toHaveLength(1);
+    expect((t.ops?.children ?? []).filter(isJob)).toEqual([]);
+  });
+
+  test("a stop through one harness never touches another harness's start", async () => {
+    const { t, layer } = layered({ perHarness: 2 });
+    const x = await harness(t, "stop-x");
+    const y = await harness(t, "stop-y", ["/usr/bin/false"]);
+    const l = layer();
+    const { startApiRun: start, stopApiRun: stop } = l;
+    if (start === undefined || stop === undefined) throw new Error("no API runs");
+    const hooks = () => (t.ops?.children ?? []).filter(isHook);
+    const first = start(y, queued(y));
+    const waiting = queued(y);
+    const second = start(y, waiting);
+    await until(() => hooks().length, 1);
+    const before = l.apiRunCapacity?.(y);
+    expect(before).toMatchObject({ ok: false, scope: "harness" });
+    // The same run id, asked through the other harness.
+    expect(await stop(x, waiting.runId)).toBe(false);
+    expect(l.apiRunCapacity?.(y)).toEqual(before);
+    hooks()[0]?.exit(1);
+    expect(await first).toMatchObject({ ok: false, reason: "prepare-refused" });
+    // Its turn came and it ran its own preparation: nothing withdrew it.
+    await until(() => hooks().length, 2);
+    hooks()[1]?.exit(1);
+    expect(await second).toMatchObject({ ok: false, reason: "prepare-refused" });
+  });
+
+  test("a start whose supervisor cannot be built frees its place, and the run can be started again", async () => {
+    const { t } = layered({});
+    const entry = await harness(t, "no-supervisor");
+    const registry = openHangarRegistry({
+      root: t.registryRoot,
+      env: { CREWHAUS_WATCHME_ROOT: join(t.workspace, "watchme") },
+      now: Date.now,
+      onWarn: () => {},
+    });
+    const failing = createProcessLayer({
+      registry,
+      env: { CREWHAUS_WATCHME_ROOT: join(t.workspace, "watchme") },
+      now: Date.now,
+      onWarn: () => {},
+      hangarRoot: t.hangarRoot,
+      managerVersion: "test",
+      ...(t.ops !== undefined ? { ops: t.ops } : {}),
+      ...(t.clock !== undefined ? { clock: t.clock } : {}),
+      noPreflight: true,
+      apiRunLimits: { perHarness: 1 },
+      createApiSupervisor: () => {
+        throw new Error("boom");
+      },
+    });
+    try {
+      const start = failing.startApiRun;
+      if (start === undefined) throw new Error("no startApiRun");
+      const run = queued(entry);
+      await expect(start(entry, run)).rejects.toThrow("boom");
+      expect(failing.apiRunCapacity?.(entry)).toEqual({ ok: true });
+      await expect(start(entry, run)).rejects.toThrow("boom");
+      expect(failing.apiRunCapacity?.(entry)).toEqual({ ok: true });
+    } finally {
+      failing.close();
+    }
   });
 });

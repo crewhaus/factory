@@ -1,4 +1,3 @@
-import { isOwnerCaller } from "../access";
 /**
  * Command receipts through the API: one receipt, wherever it is kept, and a harness's
  * receipts, newest first, a page at a time over its command ledger. A receipt in Home's
@@ -7,7 +6,7 @@ import { isOwnerCaller } from "../access";
 import type { V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { emptyOf, nextCursor, pagingOf, snapshotCursor } from "./lists";
-import { commandLedgerOf, harnessOf, liveDirOf } from "./resolve";
+import { commandLedgerOf, harnessOf, liveDirOf, receiptVisible } from "./resolve";
 
 const get: V1Handler = async (ctx) => {
   const id = String(ctx.params["cmd"]);
@@ -18,12 +17,7 @@ const get: V1Handler = async (ctx) => {
     reason: "command_unknown",
     message: "No command has that id here.",
   });
-  if (found === undefined) throw missing;
-  if (found.harness === undefined) {
-    const caller = ctx.access.caller;
-    const own = found.receipt.actor === caller.principal;
-    if (!own && !isOwnerCaller(caller, ctx.deps.home.signIn.snapshot())) throw missing;
-  }
+  if (found === undefined || !receiptVisible(ctx.deps, ctx.access.caller, found)) throw missing;
   return { status: 200, body: found.receipt };
 };
 

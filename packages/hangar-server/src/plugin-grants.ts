@@ -20,6 +20,7 @@
  * Reads never write: a review folds the ledger and the manifests and computes the
  * state word ("waiting", "allowed", "asks-for-more", "revoked") at read time.
  */
+import { closeSync, existsSync, lstatSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
   type PluginGrantSet,
@@ -34,6 +35,12 @@ import {
   foldStates,
   withLedgerLock,
 } from "@crewhaus/control-records";
+import { readSpecHeader } from "@crewhaus/harness-inventory";
+import { SPEC_FILENAMES } from "@crewhaus/harness-supervisor";
+import { type PluginEntry, grantedBridgeTools } from "@crewhaus/plugin-loader";
+import { parseYamlOnly } from "@crewhaus/spec-patch/commit";
+import { MAX_TEXT_BYTES } from "./constants";
+import { harnessPathOf } from "./harness-paths";
 import {
   type PluginGrantStanding,
   type PluginInventory,
@@ -42,6 +49,7 @@ import {
   type ServedPlugin,
   netOriginsOf,
   pluginSeesHarness,
+  servesHarness,
 } from "./plugins";
 
 // What `crewhaus plugins grants|grant|revoke` reads beside the ledger, through this
@@ -279,6 +287,181 @@ export function servedPlugins(inventory: PluginInventory, grants: PluginGrants):
   }));
 }
 
+/** The shapes whose bundles load a spec's `plugins:` list. */
+export const PLUGIN_SHAPES: ReadonlySet<string> = new Set(["cli", "channel"]);
+
+/**
+ * A harness whose crewhaus.yaml loads a plugin beyond what Home serves it there.
+ * `tools` is every host tool that harness's entry hands the plugin, sorted, or null
+ * when its spec file could not be read whole.
+ */
+export type PluginStillLoaded = {
+  readonly id: string;
+  readonly tools: readonly string[] | null;
+};
+
+/** The name a `plugins:` item names, when it names one. */
+function entryNameOf(item: unknown): string | undefined {
+  if (typeof item === "string") return item;
+  if (typeof item === "object" && item !== null) {
+    const name = (item as { name?: unknown }).name;
+    return typeof name === "string" ? name : undefined;
+  }
+  return undefined;
+}
+
+/** A `plugins:` item as the loader reads it: a name, or `{name, tools}` with a list of names. */
+function asPluginEntry(item: unknown): PluginEntry | undefined {
+  if (typeof item === "string") return item;
+  if (typeof item !== "object" || item === null) return undefined;
+  const { name, tools } = item as { name?: unknown; tools?: unknown };
+  if (typeof name !== "string" || !isStringArray(tools)) return undefined;
+  return { name, tools };
+}
+
+/** A spec file's head, at most {@link MAX_TEXT_BYTES}, or undefined when it cannot be read. */
+function readSpecHead(path: string): { text: string; truncated: boolean } | undefined {
+  let fd: number | undefined;
+  try {
+    const stat = statSync(path);
+    if (!stat.isFile()) return undefined;
+    fd = openSync(path, "r");
+    const take = Math.min(stat.size, MAX_TEXT_BYTES);
+    const buf = Buffer.alloc(take);
+    const read = readSync(fd, buf, 0, take, 0);
+    return { text: buf.subarray(0, read).toString("utf8"), truncated: stat.size > MAX_TEXT_BYTES };
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/**
+ * The spec file a harness builds from, chosen as the supervisor chooses it
+ * (`crewhaus.yaml`, else `crewhaus.yml`): its name, `absent` when neither is there,
+ * or `unknown` when whether one is there cannot be told.
+ */
+function specFileOf(dir: string): string {
+  for (const name of SPEC_FILENAMES) {
+    const path = join(dir, name);
+    try {
+      lstatSync(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+      return "unknown";
+    }
+    // A link that leads nowhere is passed over by the supervisor too.
+    if (!existsSync(path)) continue;
+    return name;
+  }
+  return "absent";
+}
+
+/** Whether a spec's target may be a shape that loads `plugins:` (true when it cannot be told). */
+const mayLoadPlugins = (target: unknown): boolean =>
+  typeof target !== "string" || PLUGIN_SHAPES.has(target);
+
+/**
+ * The host tools one harness's spec hands `row` there, or `null` when it cannot tell,
+ * or `undefined` when the spec does not load it. The spec is the file the harness
+ * builds from (`crewhaus.yaml`, else `crewhaus.yml`); its shape and `plugins:` list
+ * come from the parsed document, as the compiler reads them. The first `plugins:`
+ * entry for the plugin decides, as it does in the bundle: a bare name hands it every
+ * host tool its manifest asks for; `{name, tools}` hands those listed that it asks
+ * for. A spec file that is there but cannot be read whole (unreadable, not a regular
+ * file, resolving outside its harness, or past the read cap) cannot tell, unless what
+ * can be read shows a shape that never loads `plugins:`.
+ */
+function toolsLoadedAt(
+  row: PluginRowBase,
+  harness: GrantableHarness,
+  hangarRoot: string,
+): readonly string[] | null | undefined {
+  const file = specFileOf(harness.dir);
+  if (file === "absent") return undefined;
+  if (file === "unknown") return null;
+  const at = harnessPathOf(harness.dir, hangarRoot, [file]);
+  // Nothing outside the harness is read, so a spec file that resolves there cannot tell.
+  if (!at.ok) return null;
+  const head = readSpecHead(at.path);
+  if (head === undefined) return null;
+  const { text, truncated } = head;
+  if (truncated) return mayLoadPlugins(readSpecHeader(text).target) ? null : undefined;
+  let doc: unknown;
+  try {
+    doc = parseYamlOnly(text) as unknown;
+  } catch {
+    // A spec that does not parse does not build; it cannot tell only when it mentions the plugin.
+    if (!text.includes(row.name)) return undefined;
+    return mayLoadPlugins(readSpecHeader(text).target) ? null : undefined;
+  }
+  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) return undefined;
+  const { target, plugins } = doc as { target?: unknown; plugins?: unknown };
+  if (!mayLoadPlugins(target)) return undefined;
+  if (plugins === undefined || plugins === null) return undefined;
+  if (!Array.isArray(plugins)) return null;
+  const first = plugins.find((item) => entryNameOf(item) === row.name);
+  if (first === undefined) return undefined;
+  const entry = asPluginEntry(first);
+  if (entry === undefined) return null;
+  return [...grantedBridgeTools(row.permissions.tools, entry).tools].sort();
+}
+
+/**
+ * The harnesses whose crewhaus.yaml loads `row` beyond what `served` covers: one the
+ * served view does not cover at all, or one whose entry hands the plugin a host tool
+ * outside `served.tools`. Each harness names the whole set its entry hands the plugin.
+ * Only cli and channel harnesses load `plugins:`, so any other shape and a harness
+ * with no spec file are never named. A harness whose spec file cannot be read whole
+ * (unreadable, not a regular file, resolving outside its directory, or past the read
+ * cap), one whose spec mentions the plugin but does not parse, and one whose entry is
+ * in neither form are named with `tools: null`: it could not be told. Only the
+ * harnesses given are read, so a caller passes those it may see. Reads only.
+ */
+export function stillLoadedBy(
+  row: PluginRowBase,
+  served: PluginGrantSet,
+  harnesses: readonly GrantableHarness[],
+  hangarRoot: string,
+): PluginStillLoaded[] {
+  const out: PluginStillLoaded[] = [];
+  const allowed = new Set(served.tools);
+  for (const harness of harnesses) {
+    const tools = toolsLoadedAt(row, harness, hangarRoot);
+    if (tools === undefined) continue;
+    const beyond =
+      tools === null ||
+      !servesHarness(served, harness.id) ||
+      tools.some((tool) => !allowed.has(tool));
+    if (beyond) out.push({ id: harness.id, tools: tools === null ? null : [...tools] });
+  }
+  return out;
+}
+
+/**
+ * The plugins waiting for the owner's OK on one harness: those with no problem that
+ * declare a pane or the trace observer, whose filesystem ask covers this harness, and
+ * that Home does not serve here (no grant, a revoked one, or one on other harnesses).
+ */
+export function waitingOn(
+  inventory: PluginInventory,
+  served: readonly ServedPlugin[],
+  harness: GrantableHarness,
+): string[] {
+  const views = new Map(served.map((s) => [s.plugin.name, s.served] as const));
+  return inventory.plugins
+    .filter((row) => row.problems.length === 0)
+    .filter(
+      (row) =>
+        row.panes.length > 0 ||
+        row.extensionPoints.some((e) => e.point === "onTraceEvent" && e.declared),
+    )
+    .filter((row) => asksOf(row, [harness]).harnesses.includes(harness.id))
+    .filter((row) => !servesHarness(views.get(row.name) ?? SERVED_NOTHING, harness.id))
+    .map((row) => row.name);
+}
+
 /** A served or granted set with its harness ids folded to those `visible` answers for. */
 function visibleSet(set: PluginGrantSet, visible: (id: string) => boolean): PluginGrantSet {
   return set.harnesses === "all" ? set : { ...set, harnesses: set.harnesses.filter(visible) };
@@ -383,7 +566,17 @@ export function expectHolds(
 }
 
 export type GrantOutcome =
-  | { readonly ok: true; readonly id: string; readonly gen: number; readonly row: PluginGrantRow }
+  | {
+      readonly ok: true;
+      readonly id: string;
+      readonly gen: number;
+      readonly row: PluginGrantRow;
+      /**
+       * The harnesses whose crewhaus.yaml loads the plugin beyond what the new row
+       * serves, when the caller asked with `loadedBy`.
+       */
+      readonly stillLoadedBy?: readonly PluginStillLoaded[];
+    }
   | {
       readonly ok: false;
       readonly code: "stale";
@@ -404,16 +597,50 @@ type Stamp = {
 const atOf = (stamp: Stamp): string => new Date(stamp.now?.() ?? Date.now()).toISOString();
 
 /**
+ * What a grant or revoke checks against harness specs once its row is written: the
+ * plugin's inventory row and the harnesses to read (those the caller may see).
+ */
+export type PluginLoadedBy = {
+  readonly row: PluginRowBase;
+  readonly harnesses: readonly GrantableHarness[];
+};
+
+/** An applied outcome with the harnesses that load the plugin beyond `served`. */
+function withStillLoaded(
+  hangarRoot: string,
+  outcome: GrantOutcome,
+  loadedBy: PluginLoadedBy | undefined,
+  served: (applied: PluginGrantObject, loadedBy: PluginLoadedBy) => PluginGrantSet,
+): GrantOutcome {
+  if (!outcome.ok || loadedBy === undefined) return outcome;
+  return {
+    ...outcome,
+    stillLoadedBy: stillLoadedBy(
+      loadedBy.row,
+      served(
+        { id: outcome.id, state: outcome.row.state, gen: outcome.gen, row: outcome.row },
+        loadedBy,
+      ),
+      loadedBy.harnesses,
+      hangarRoot,
+    ),
+  };
+}
+
+/**
  * Write one grant, under the ledger's lock: fold, find the plugin's live grant, hold
  * `expect` to its generation, then append through a compare-and-set on that object
  * (or on a new `pgt_` when there is no live grant). A stale `expect` appends nothing.
  * Validate the request with {@link grantProblem} first: this writes what it is given.
+ * With `loadedBy`, an applied grant also answers {@link stillLoadedBy} against what
+ * the new row serves, read after the lock is released.
  */
 export async function grantPlugin(
   hangarRoot: string,
   input: {
     readonly row: PluginRowBase;
     readonly grant: PluginGrantInput;
+    readonly loadedBy?: PluginLoadedBy;
   } & Stamp,
 ): Promise<GrantOutcome> {
   const ledger = pluginGrantsLedger(hangarRoot);
@@ -452,7 +679,10 @@ export async function grantPlugin(
     }
     return { ok: true, id, gen: cas.gen, row };
   });
-  return "path" in answer ? ioOutcome(answer) : answer;
+  if ("path" in answer) return ioOutcome(answer);
+  return withStillLoaded(hangarRoot, answer, input.loadedBy, (applied, loadedBy) =>
+    servedOf(applied, asksOf(loadedBy.row)),
+  );
 }
 
 /** A lock or directory refusal, as an outcome. */
@@ -463,10 +693,12 @@ function ioOutcome(failure: { readonly reason?: string }): GrantOutcome {
 /**
  * Revoke a plugin's live grant, under the ledger's lock. No live grant is a refusal,
  * never a row. The revoked object stays as history; the next grant starts a new one.
+ * With `loadedBy`, an applied revoke also answers {@link stillLoadedBy}: every given
+ * harness whose crewhaus.yaml loads the plugin, since nothing is served now.
  */
 export async function revokePlugin(
   hangarRoot: string,
-  input: { readonly plugin: string } & Stamp,
+  input: { readonly plugin: string; readonly loadedBy?: PluginLoadedBy } & Stamp,
 ): Promise<GrantOutcome> {
   const ledger = pluginGrantsLedger(hangarRoot);
   const answer = await withLedgerLock<GrantOutcome>(ledger, async () => {
@@ -495,5 +727,6 @@ export async function revokePlugin(
     if (!cas.applied) return { ok: false, code: "no-live-grant" };
     return { ok: true, id: live.id, gen: cas.gen, row };
   });
-  return "path" in answer ? ioOutcome(answer) : answer;
+  if ("path" in answer) return ioOutcome(answer);
+  return withStillLoaded(hangarRoot, answer, input.loadedBy, () => SERVED_NOTHING);
 }

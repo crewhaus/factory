@@ -37,6 +37,7 @@ export {
   readClaim,
   withLedgerLock,
   expireClaim,
+  expireClaimHeldBy,
   listClaims,
 } from "./ledger";
 export { type DropAnswer, dropSegmentsBefore } from "./retention";

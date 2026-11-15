@@ -23,6 +23,7 @@ import {
   aggregateAsks,
   applyToSettingsRoot,
   blanketGrantNote,
+  diffForDisplay,
   diffPermissions,
   existingSettingsRules,
   formatSettingsDiff,
@@ -331,7 +332,7 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
   it("a value its own rule would not match is proposed as a bare grant, and says why", () => {
     // A declared url that does not parse keeps no canonical spelling an
     // allow could read, so the rule `HttpRequest(<value>)` never fires.
-    const agg = aggFor("HttpRequest", { url: "https://u:p@example.com/x" });
+    const agg = aggFor("HttpRequest", { url: "https://u@example.com/x" });
     expect(patternFor(agg)).toBe("HttpRequest");
     expect(blanketGrantNote(agg)).toContain("its own rule would not match");
   });
@@ -351,7 +352,7 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
     expect(blanketGrantNote(rm as AskAggregate)).toContain("does not declare");
   });
 
-  describe("a recorded call whose value holds a control or bidirectional-text character", () => {
+  describe("a recorded call whose value holds a control, bidirectional-text or other invisible character", () => {
     const shellBash = declared("Bash", [{ field: "command", kind: "command", shell: true }], {
       command: z.string(),
     });
@@ -364,6 +365,9 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
       ["a tab", "printf a\tb"],
       ["an escape sequence", "echo a\u001b[2Jb"],
       ["a bidirectional override", "echo a\u202eb"],
+      ["a zero-width space", "echo a\u200bb"],
+      ["a line separator", "echo a\u2028b"],
+      ["a tag character", "echo a\u{E0041}b"],
     ];
     for (const [label, bashLookup] of readings) {
       for (const [what, command] of values) {
@@ -506,6 +510,191 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
       });
       expect(skippedSuggestions(aggs)).toEqual([]);
       expect(JSON.stringify(suggestions).includes(token)).toBe(false);
+    });
+
+    describe("a call whose value cannot be narrowed", () => {
+      const password = randomBytes(12).toString("hex");
+      const twoUrls = declared(
+        "UrlCopy",
+        [
+          { field: "source", kind: "url" },
+          { field: "target", kind: "url" },
+        ],
+        { source: z.string(), target: z.string() },
+      );
+      const httpGet = declared("HttpGet", [{ field: "url", kind: "url" }], { url: z.string() });
+      const strictBash: RegisteredTool = {
+        ...tool("StrictBash", false),
+        inputSchema: z.object({ command: z.string() }).strict() as never,
+        operativeArgs: [{ field: "command", kind: "command", shell: true }],
+      };
+      const apiCall = declared(
+        "ApiCall",
+        [
+          { field: "baseUrl", kind: "url", service: "baseUrl" },
+          { field: "next", kind: "url" },
+        ],
+        { baseUrl: z.string().optional(), next: z.string() },
+      );
+      const narrowLookup = suggestLookupFromTools({
+        bash: shellBash,
+        twoUrls,
+        httpGet,
+        strictBash,
+        apiCall,
+      });
+      const padded = `curl -H "Authorization: Bearer ${token}" https://x.test/${"a".repeat(MAX_RULE_VALUE_LENGTH)}`;
+      const shapes: ReadonlyArray<readonly [string, string, unknown, string]> = [
+        ["a parenthesis", "Bash", { command: `${credentialCommand}/(a)` }, token],
+        [
+          "several places",
+          "UrlCopy",
+          { source: `https://x.test/a?access_token=${token}`, target: "https://x.test/b" },
+          token,
+        ],
+        ["a value over the cap", "Bash", { command: padded }, token],
+        ["a userinfo URL", "HttpGet", { url: `https://u:${password}@x.test/a` }, password],
+        [
+          "an input that does not parse",
+          "StrictBash",
+          { command: credentialCommand, extra: 1 },
+          token,
+        ],
+        [
+          "a call that leaves its API out",
+          "ApiCall",
+          { next: `https://x.test/a?access_token=${token}` },
+          token,
+        ],
+      ];
+
+      for (const [what, name, input, secret] of shapes) {
+        it(`gets no allow at all, and no report holds its credential (${what})`, () => {
+          const aggs = aggregateAsks([asked(name, input, input, input)], narrowLookup);
+          const agg = aggs.get(name) as AskAggregate;
+          expect(agg.approved).toBe(3);
+          const suggestions = rankSuggestions(aggs, new Map([[name, false]]));
+          expect(
+            suggestions.filter((g) => g.toolName === name && g.rule.type === "alwaysAllow"),
+          ).toEqual([]);
+          const skipped = skippedSuggestions(aggs);
+          expect(skipped.map((k) => [k.toolName, k.reason])).toEqual([
+            [name, "carries-credential"],
+          ]);
+          const shown = [
+            JSON.stringify([...aggs.values()]),
+            JSON.stringify(suggestions),
+            JSON.stringify(skipped),
+            formatSuggestionLines(suggestions).join("\n"),
+            formatSettingsDiff(diffPermissions([], suggestions)).join("\n"),
+            blanketGrantNote(agg) ?? "",
+          ];
+          for (const text of shown) expect(text.includes(secret)).toBe(false);
+        });
+      }
+
+      it("gets no allow at all through the matcher's name table either", () => {
+        const input = { command: `${credentialCommand}/(a)` };
+        const aggs = aggregateAsks([asked("Bash", input, input, input)]);
+        const suggestions = rankSuggestions(aggs, new Map([["Bash", false]]));
+        expect(suggestions.filter((g) => g.rule.type === "alwaysAllow")).toEqual([]);
+        expect(skippedSuggestions(aggs).map((k) => [k.toolName, k.reason])).toEqual([
+          ["Bash", "carries-credential"],
+        ]);
+        expect(JSON.stringify([...aggs.values(), ...suggestions]).includes(token)).toBe(false);
+      });
+    });
+  });
+
+  describe("an existing rule that holds a credential", () => {
+    const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+    const pattern = `Bash(curl -H "Authorization: Bearer ${token}" https://x.test)`;
+    const root = {
+      hooks: { kept: true },
+      permissions: {
+        rules: [
+          { type: "alwaysAllow", pattern },
+          { type: "alwaysAsk", pattern: "Write(notes/a.md)" },
+        ],
+      },
+    };
+    const aggs = aggregateAsks([asked("Bash", { command: "git status" })]);
+    const suggestions = rankSuggestions(aggs, new Map([["Bash", false]]));
+
+    it("is shown by its type and tool name only, and --apply keeps it as it is", () => {
+      const diff = diffPermissions(existingSettingsRules(root), suggestions);
+      expect(diff.additions).toEqual([{ type: "alwaysAllow", pattern: "Bash(git status)" }]);
+      const lines = formatSettingsDiff(diff);
+      expect(lines).toContain("    alwaysAllow Bash(… holds a credential)");
+      expect(lines).toContain('    { type: alwaysAsk, pattern: "Write(notes/a.md)" }');
+      expect(lines.join("\n").includes(token)).toBe(false);
+
+      const view = diffForDisplay(diff);
+      expect(view.merged).toBeNull();
+      expect(view.withheldRules).toBe(1);
+      expect(view.additions).toEqual(diff.additions);
+      expect(JSON.stringify(view).includes(token)).toBe(false);
+
+      const written = applyToSettingsRoot(root, diff.merged) as {
+        permissions: { rules: unknown[] };
+      };
+      expect(written.permissions.rules).toContainEqual({ type: "alwaysAllow", pattern });
+      expect(written.permissions.rules).toHaveLength(3);
+    });
+
+    it("a new rule that holds one is shown the same way, marked new", () => {
+      const diff = {
+        additions: [{ type: "alwaysAllow" as const, pattern }],
+        alreadyPresent: [],
+        merged: [{ type: "alwaysAllow" as const, pattern }],
+      };
+      expect(formatSettingsDiff(diff)).toContain("  + alwaysAllow Bash(… holds a credential)");
+      const odd = { type: "alwaysDeny" as const, pattern: `not a tool name(Bearer ${token})` };
+      const withOdd = { additions: [], alreadyPresent: [], merged: [odd] };
+      expect(formatSettingsDiff(withOdd)).toContain("    alwaysDeny (… holds a credential)");
+    });
+
+    it("a rule whose tool part holds the credential is shown by its type alone", () => {
+      const sk = ["sk", "ant", "api03", randomBytes(16).toString("hex")].join("-");
+      const ghp = ["gh", "p_", randomBytes(18).toString("hex")].join("");
+      const diff = diffPermissions(
+        existingSettingsRules({
+          permissions: {
+            rules: [
+              { type: "alwaysAllow", pattern: sk },
+              { type: "alwaysDeny", pattern: `${ghp}(x)` },
+            ],
+          },
+        }),
+        [],
+      );
+      const lines = formatSettingsDiff(diff);
+      expect(lines).toContain("    alwaysAllow (… holds a credential)");
+      expect(lines).toContain("    alwaysDeny (… holds a credential)");
+      const text = lines.join("\n");
+      expect(text.includes(sk)).toBe(false);
+      expect(text.includes(ghp)).toBe(false);
+    });
+
+    it("a diff with no such rule is its own view", () => {
+      const plain = {
+        permissions: { rules: [{ type: "alwaysAsk", pattern: "Write(notes/a.md)" }] },
+      };
+      const diff = diffPermissions(existingSettingsRules(plain), suggestions);
+      const view = diffForDisplay(diff);
+      expect(view).toEqual(diff);
+      expect(Object.hasOwn(view, "withheldRules")).toBe(false);
+      expect(Object.keys(view)).toEqual(["additions", "alreadyPresent", "merged"]);
+    });
+
+    it("a rule that names a flag holding no credential stays in the view", () => {
+      const pattern = "Bash(wrangler deploy --env production)";
+      const withEnv = { permissions: { rules: [{ type: "alwaysAllow", pattern }] } };
+      const diff = diffPermissions(existingSettingsRules(withEnv), suggestions);
+      const view = diffForDisplay(diff);
+      expect(view.merged).toContainEqual({ type: "alwaysAllow", pattern });
+      expect(Object.hasOwn(view, "withheldRules")).toBe(false);
+      expect(formatSettingsDiff(diff).join("\n")).toContain(pattern);
     });
   });
 
@@ -784,5 +973,137 @@ describe("applyToSettingsRoot", () => {
     const parsed = parsePermissionsConfig(reparsed.permissions, "settings");
     expect(parsed.rules.map((r) => r.pattern).sort()).toEqual(["Read", "WebFetch"]);
     expect(parsed.rules.every((r) => r.type === "alwaysAllow")).toBe(true);
+  });
+});
+
+// -------- the credential screen's forms, as a suggestion reads them --------
+
+describe("a recorded call is screened for every form of credential", () => {
+  // Built at run time from random parts: no credential-shaped literal sits in the source.
+  const short = (): string => randomBytes(6).toString("hex");
+  const long = (): string => randomBytes(20).toString("hex");
+  const positives: ReadonlyArray<readonly [string, Record<string, string>]> = [
+    ["Bash", { command: `deploy --token ${short()}` }],
+    ["Bash", { command: `psql --password=${short()}` }],
+    ["Bash", { command: `cli --api-key ${short()}` }],
+    ["Bash", { command: `cli --secret ${short()}` }],
+    ["Bash", { command: `curl --cookie "sid=${short()}" https://x.test` }],
+    ["Bash", { command: `curl -u admin:${short()} https://x.test` }],
+    ["Bash", { command: `mysql -uroot -p${short()} app` }],
+    ["Bash", { command: `curl -H "Cookie: sid=${short()}" https://x.test` }],
+    ["Bash", { command: `curl -H "X-Auth-User: admin" https://x.test` }],
+    ["WebFetch", { url: `https://x.test/cb#access_token=${short()}` }],
+    ["WebFetch", { url: `https://${long()}@x.test/o/r` }],
+    ["WebFetch", { url: `https://bucket.x.test/o?X-Amz-Signature=${short()}` }],
+    ["WebFetch", { url: `https://store.x.test/c?sv=1&sig=${short()}` }],
+    ["WebFetch", { url: `https://hooks.slack.com/services/T0/B0/${short()}` }],
+    ["WebFetch", { url: `https://discord.com/api/webhooks/1/${short()}` }],
+    ["WebFetch", { url: `https://api.telegram.org/bot1:${short()}/sendMessage` }],
+    ["WebFetch", { url: `https://discord.com/api/v10/webhooks/1/${short()}` }],
+    ["WebFetch", { url: `https://hooks.slack.com./services/T0/B0/${short()}` }],
+    ["Bash", { command: `curl "https://api.x.test/v1?a=1&b=2" -u admin:${short()}` }],
+    ["Bash", { command: `curl 'https://x.test/(a)' -u admin:${short()}` }],
+    ["Bash", { command: `mysql -e "select 1; select 2" -p${short()} app` }],
+    ["Bash", { command: `curl -sSu admin:${short()} https://x.test` }],
+    ["Bash", { command: `curl -su admin:${short()} https://x.test/a` }],
+    ["Bash", { command: `sudo -E curl -u admin:${short()} https://x.test` }],
+    ["Bash", { command: `sudo -u ops curl -u admin:${short()} https://x.test` }],
+    ["Bash", { command: `sudo -E mysql -p${short()} app` }],
+    ["Bash", { command: `FOO="a b" curl -u admin:${short()} https://x.test` }],
+    ["Bash", { command: `env -i curl -u admin:${short()} https://x.test` }],
+    ["Bash", { command: `time curl -u admin:${short()} https://x.test` }],
+    ["Bash", { command: `timeout 30 curl -u admin:${short()} https://x.test` }],
+    ["Bash", { command: `xargs curl -u admin:${short()}` }],
+    ["Bash", { command: `bash -c "curl -u admin:${short()} https://x.test"` }],
+    ["Bash", { command: `CURL -u admin:${short()} https://x.test` }],
+    ["Bash", { command: `curl.exe -u admin:${short()} https://x.test` }],
+    ["Bash", { command: `docker exec -i db mysql -uroot -p${short()} -e "select 1"` }],
+    ["Bash", { command: `kubectl exec db -- mysql -p${short()}` }],
+    ["Bash", { command: `wget --header=X-Auth-Token:${short()} https://x.test` }],
+    ["Bash", { command: `wget --header=Cookie:sid=${short()} https://x.test` }],
+  ];
+  const negatives: ReadonlyArray<readonly [string, Record<string, string>]> = [
+    ["Bash", { command: "cli --verbose" }],
+    ["Bash", { command: "cli --token-file ./t" }],
+    ["Bash", { command: "llm --max-tokens 5" }],
+    ["Bash", { command: "docker login --password-stdin" }],
+    ["Bash", { command: "pg --no-password db" }],
+    ["Bash", { command: "gh --token $GH_TOKEN" }],
+    ["Bash", { command: "curl -u admin https://x.test" }],
+    ["Bash", { command: "docker run -u 1000:1000 img" }],
+    ["Bash", { command: "mysql -p db" }],
+    ["Bash", { command: "ssh -p2222 h" }],
+    ["Bash", { command: "ssh -p 22 h" }],
+    ["Bash", { command: "docker run -p 8080:80 img" }],
+    ["Bash", { command: "nc -p 8080" }],
+    ["Bash", { command: "curl -H 'X-Request-Id: 1' https://x.test" }],
+    ["WebFetch", { url: "https://x.test/#section-2" }],
+    ["WebFetch", { url: "https://user@host.test/" }],
+    ["WebFetch", { url: "https://x.test/?signed=1" }],
+    ["WebFetch", { url: "https://hooks.slack.com/" }],
+    ["WebFetch", { url: "https://discord.com/channels/1" }],
+    ["Bash", { command: "wrangler deploy --env production" }],
+    ["Bash", { command: "docker run --env NODE_ENV=production img" }],
+    ["Bash", { command: "curl --key client.pem https://x.test" }],
+    ["Bash", { command: "docker run -p 8080:80 mysql" }],
+  ];
+  const approvedThrice = (name: string, input: unknown) =>
+    session("sess_00000000000000ef", [
+      toolUse(name, input),
+      ask(name, "approved"),
+      ask(name, "approved"),
+      ask(name, "approved"),
+    ]);
+
+  it("a call that carries one gets no allow, and is named", () => {
+    for (const [name, input] of positives) {
+      const aggs = aggregateAsks([approvedThrice(name, input)]);
+      expect({
+        input,
+        skipped: skippedSuggestions(aggs).map((k) => [k.toolName, k.reason]),
+      }).toEqual({ input, skipped: [[name, "carries-credential"]] });
+      const allows = rankSuggestions(aggs, new Map()).filter((g) => g.rule.type === "alwaysAllow");
+      expect({ input, allows }).toEqual({ input, allows: [] });
+    }
+  });
+
+  it("an ordinary flag, header or URL is not skipped", () => {
+    for (const [name, input] of negatives) {
+      const aggs = aggregateAsks([approvedThrice(name, input)]);
+      expect({ input, skipped: skippedSuggestions(aggs) }).toEqual({ input, skipped: [] });
+    }
+  });
+
+  it("a quoted parenthesis before a curl password gives the tool no allow", () => {
+    const password = short();
+    const input = { command: `curl 'https://x.test/(a)' -u admin:${password}` };
+    const aggs = aggregateAsks([approvedThrice("Bash", input)]);
+    const suggestions = rankSuggestions(aggs, new Map([["Bash", false]]));
+    expect(suggestions.filter((g) => g.rule.type === "alwaysAllow")).toEqual([]);
+    expect(skippedSuggestions(aggs).map((k) => [k.toolName, k.reason])).toEqual([
+      ["Bash", "carries-credential"],
+    ]);
+    expect(JSON.stringify([...aggs.values(), ...suggestions]).includes(password)).toBe(false);
+  });
+
+  it("a tool neither declared nor in the name table is read by every string it is given", () => {
+    const gh = ["gh", "p_", randomBytes(18).toString("hex")].join("");
+    for (const [name, input] of [
+      ["mcp__srv__fetch", { url: `https://x.test/a?access_token=${short()}` }],
+      ["mcp__gh__create_issue", { title: "t", body: `use ${gh}` }],
+      ["mcp__srv__run", { args: ["--verbose", `--token=${short()}`] }],
+    ] as const) {
+      const aggs = aggregateAsks([approvedThrice(name, input)]);
+      const allows = rankSuggestions(aggs, new Map()).filter((g) => g.rule.type === "alwaysAllow");
+      expect({ name, allows }).toEqual({ name, allows: [] });
+      expect(skippedSuggestions(aggs).map((k) => [k.toolName, k.reason])).toEqual([
+        [name, "carries-credential"],
+      ]);
+    }
+    const plain = aggregateAsks([approvedThrice("mcp__srv__fetch", { url: "https://x.test/a" })]);
+    expect(skippedSuggestions(plain)).toEqual([]);
+    expect(
+      rankSuggestions(plain, new Map()).filter((g) => g.rule.type === "alwaysAllow"),
+    ).toHaveLength(1);
   });
 });

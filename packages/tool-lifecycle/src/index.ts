@@ -56,6 +56,7 @@ import {
   PULL_NEEDS_SPEC_REASON,
   RETENTION_CONFIG_RELPATH,
   RETIREMENT_LOG_FILENAME,
+  RUN_TOKEN_FILES,
   RetentionConfigError,
   type RetentionEnforcementReport,
   RetireError,
@@ -76,6 +77,7 @@ import {
   readHarnessMemories,
   readHarnessPrompts,
   readRetractions,
+  removeRunTokens,
   runRetentionExport,
   runRetentionPurge,
   runRetentionSweep,
@@ -511,6 +513,20 @@ export const harnessRetire: RegisteredTool = buildTool({
         };
       }
 
+      // The archived state keeps no run bearer secret: a daemon makes each again
+      // at start. Removed after the verification, which checks the whole move.
+      // The retirement has happened by now, so a failure here is a follow-up,
+      // never a failed retirement.
+      let runTokensLeftOut: string[] | undefined;
+      let runTokensFollowUp: string | undefined;
+      if (result.removedState) {
+        try {
+          runTokensLeftOut = removeRunTokens(archivedStateDir);
+        } catch (err) {
+          runTokensFollowUp = `the run token files could not be removed from <archiveDir>/${ARCHIVED_STATE_DIRNAME} (${(err as Error).message}); delete ${RUN_TOKEN_FILES.join(", ")} under it by hand`;
+        }
+      }
+
       return json({
         tool,
         status: "applied",
@@ -525,11 +541,13 @@ export const harnessRetire: RegisteredTool = buildTool({
         notPerformed,
         state: stateReport,
         verification,
+        ...(runTokensLeftOut !== undefined ? { runTokensLeftOut } : {}),
         followUps: [
           pinState.state === "absent"
             ? "no registry entry existed for this spec"
             : "the registry entry was NOT tombstoned by this tool — delete the registered versions with the CLI",
           "knowledge was not pushed — run the KnowledgeSync tool before retiring if the harness's lessons should outlive it",
+          ...(runTokensFollowUp !== undefined ? [runTokensFollowUp] : []),
         ],
       });
     } catch (err) {

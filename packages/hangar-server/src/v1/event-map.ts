@@ -13,7 +13,6 @@
  * The harness stream's sources are registered here as the core's `streamSources`: an
  * area that brings its own lines adds a source with its own mapping.
  */
-import { join } from "node:path";
 import {
   type CursorSource,
   EVENT_TAXONOMY,
@@ -27,8 +26,12 @@ import {
   deploymentsLedger,
   runsLedger,
 } from "@crewhaus/control-records";
-import { APPROVAL_LOG_EVENTS, commandsLedgerOf, stateEventOf } from "@crewhaus/control-service";
-import { approvalsLedger } from "@crewhaus/session-store";
+import {
+  APPROVAL_LOG_EVENTS,
+  commandsLedgerOf,
+  harnessApprovalsSource,
+  stateEventOf,
+} from "@crewhaus/control-service";
 
 /** An envelope without its cursor: the stream gives each one its `id`. */
 export type EnvelopeFields = Omit<EventEnvelope, "v" | "id">;
@@ -204,9 +207,5 @@ export const CORE_STREAM_SOURCES: readonly StreamSourceDecl[] = [
   { name: "commands", source: commandsLedgerOf, eventOf: commandRowEvent },
   { name: "deployments", source: deploymentsLedger, eventOf: deploymentRowEvent },
   { name: "decisions", source: decisionsLedger, eventOf: decisionRowEvent },
-  {
-    name: "approvals",
-    source: (dir) => approvalsLedger(join(dir, ".crewhaus", "sessions")),
-    eventOf: approvalLineEvent,
-  },
+  { name: "approvals", source: harnessApprovalsSource, eventOf: approvalLineEvent },
 ];

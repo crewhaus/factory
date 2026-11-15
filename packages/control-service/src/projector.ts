@@ -33,6 +33,7 @@ import {
   type Heartbeat,
   type LedgerRecord,
   type OperatorRead,
+  type RecordSource,
   type ResumeAnswer,
   type ResumeCaps,
   type ResumeItem,
@@ -52,8 +53,23 @@ import {
   writeIndexRecord,
   writeNudgeMarker,
 } from "@crewhaus/control-records";
-import { approvalsLedger } from "@crewhaus/session-store";
+import { DECISION_LOG_DIR } from "@crewhaus/session-store";
 import { APPROVAL_LOG_EVENTS, stateEventOf } from "./event-map";
+
+/**
+ * A harness's decision log as a read source, rooted at the harness itself: every path
+ * under it, `.crewhaus/sessions` included, is realpath-contained in the harness, so a
+ * read of it sees that harness's own decision log and no other's. For reads only; it
+ * takes no lock and no claim.
+ *
+ * First consumers: {@link OVERVIEW_PROJECTION} and Home's harness event stream.
+ */
+export function harnessApprovalsSource(harnessDir: string): RecordSource {
+  return {
+    root: harnessDir,
+    records: { dir: join(".crewhaus", "sessions", DECISION_LOG_DIR) },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // The operator state (what a harness's operator record and its daemon's beat say)
@@ -218,7 +234,7 @@ export const OVERVIEW_PROJECTION: Projection<OverviewState> = {
     runs: runsLedger(dir),
     deployments: deploymentsLedger(dir),
     decisions: decisionsLedger(dir),
-    approvals: approvalsLedger(join(dir, ".crewhaus", "sessions")),
+    approvals: harnessApprovalsSource(dir),
   }),
   fold(state, item) {
     if (item.kind !== "line") return state;

@@ -12,6 +12,7 @@
  * the rule-widening property on its own.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
@@ -749,6 +750,50 @@ describe("PermissionsSuggest", () => {
     expect(diff.merged).toBeNull();
     const unknown = out["unknown"] as Array<{ field: string; reason: string }>;
     expect(unknown.find((u) => u.field === "diff.merged")?.reason).toContain("silently drop");
+  });
+
+  test("an existing rule that holds a credential is counted, never returned", async () => {
+    // Built at run time from random parts: no credential-shaped literal sits in the source.
+    const token = ["tok", "en", randomBytes(16).toString("hex")].join("");
+    const pattern = `Bash(curl -H "Authorization: Bearer ${token}" https://x.test)`;
+    askSession(tmp, "sess_1", { toolName: "Read", input: { path: "a.md" }, approved: 3 });
+    writeSettings(
+      tmp,
+      JSON.stringify({
+        permissions: {
+          rules: [
+            { type: "alwaysAllow", pattern },
+            { type: "alwaysAsk", pattern: "Write(notes/a.md)" },
+          ],
+        },
+      }),
+    );
+    const raw = await call(permissionsSuggest, {});
+    expect(raw.includes(token)).toBe(false);
+    const out = JSON.parse(raw) as Record<string, unknown>;
+    const diff = out["diff"] as { additions: unknown[]; merged: unknown; withheldRules?: number };
+    expect(diff.additions).toEqual([{ type: "alwaysAllow", pattern: "Read(a.md)" }]);
+    expect(diff.merged).toBeNull();
+    expect(diff.withheldRules).toBe(1);
+    const unknown = out["unknown"] as Array<{ field: string; reason: string }>;
+    expect(unknown.find((u) => u.field === "diff.merged")?.reason).toContain("hold a credential");
+  });
+
+  test("a settings file with no rule that holds a credential returns its merged list", async () => {
+    askSession(tmp, "sess_1", { toolName: "Read", input: { path: "a.md" }, approved: 3 });
+    writeSettings(
+      tmp,
+      JSON.stringify({
+        permissions: { rules: [{ type: "alwaysAsk", pattern: "Write(notes/a.md)" }] },
+      }),
+    );
+    const out = await callJson(permissionsSuggest, {});
+    const diff = out["diff"] as Record<string, unknown>;
+    expect(diff["merged"]).toEqual([
+      { type: "alwaysAsk", pattern: "Write(notes/a.md)" },
+      { type: "alwaysAllow", pattern: "Read(a.md)" },
+    ]);
+    expect(Object.hasOwn(diff, "withheldRules")).toBe(false);
   });
 
   test("no sessions at all is an empty result that says the directory is missing", async () => {

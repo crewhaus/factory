@@ -2148,6 +2148,22 @@ describe("the listings that read requests narrow on the rule's kind", () => {
   });
 });
 
+describe("the scheduler's pass settles its own receipt", () => {
+  test("a pass that writes a rule row ends its delegations.apply receipt succeeded", async () => {
+    const t = await setup();
+    const ruleId = ruleOf(await enable(t));
+    // Past its end, the pass writes the rule's `expired` row.
+    t.r.clock.now = Date.parse(ruleState(t.r.harness, ruleId)?.expiresAt as string);
+    const summary = await t.service.apply(t.harness, { appliedBy: "sys:scheduler" });
+    expect(ruleState(t.r.harness, ruleId)?.state).toBe("expired");
+    const cmd = summary.cmd;
+    if (cmd === undefined) throw new Error("the pass wrote no receipt");
+    const rows = rowsOf(commandsLedgerOf(t.r.harness)).filter((row) => row["id"] === cmd);
+    expect(rows.map((row) => row["state"])).toEqual(["accepted", "succeeded"]);
+    expect(rows.at(-1)).toMatchObject({ kind: "delegations.apply", actor: "sys:scheduler" });
+  });
+});
+
 describe("a receipt's authority", () => {
   test("only a system actor carries one, of a closed kind, and it is fingerprinted", async () => {
     const t = await setup();

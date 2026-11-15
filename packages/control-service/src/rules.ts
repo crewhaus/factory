@@ -46,7 +46,7 @@ import {
   removeSettingsRule,
   settingsFilePath,
 } from "@crewhaus/permission-engine";
-import { carriesCredential } from "@crewhaus/spec-patch";
+import { CREDENTIAL_FORM_WORDS, type CredentialForm, credentialFormIn } from "@crewhaus/spec-patch";
 import { lexicalPathValues, operativeValuesOf } from "@crewhaus/tool-executor";
 import { TOOL_REGISTRY } from "@crewhaus/tool-registry-manifest";
 import type { DecisionActor, Decisions } from "./decisions";
@@ -136,13 +136,59 @@ export type StandingPattern =
   | {
       /** The call's value carries a credential, which a rule must never hold. */
       readonly refused: "carries-credential";
+      /** The form it takes (`CREDENTIAL_FORM_WORDS` names it); never the value. */
+      readonly form: CredentialForm;
     };
+
+/** The strings of a field as recorded: the field itself, or each string of an array. */
+function recordedStrings(value: unknown): string[] {
+  const all = Array.isArray(value) ? value : [value];
+  return all.filter((v): v is string => typeof v === "string");
+}
+
+/**
+ * The first credential form a call carries in any value a rule is read against, before
+ * any narrowing: every `canonical` and `spellings` entry of its operative values, and
+ * each declared field's own string as recorded. A tool the manifest does not declare is
+ * read by every top-level string of its input, which holds the value the matcher's name
+ * table reads.
+ */
+function callCredentialForm(
+  toolName: string,
+  input: unknown,
+  values:
+    | ReadonlyArray<{
+        readonly canonical: readonly string[];
+        readonly spellings?: readonly string[];
+      }>
+    | undefined,
+): CredentialForm | undefined {
+  for (const v of values ?? []) {
+    for (const s of [...v.canonical, ...(v.spellings ?? [])]) {
+      const form = credentialFormIn(s);
+      if (form !== undefined) return form;
+    }
+  }
+  if (input === null || typeof input !== "object") return undefined;
+  const record = input as Record<string, unknown>;
+  const declared = manifestEntry(toolName)?.operativeArgs as OperativeArgs | undefined;
+  const fields = declared !== undefined ? declared.map((a) => a.field) : Object.keys(record);
+  for (const field of fields) {
+    if (!Object.hasOwn(record, field)) continue;
+    for (const s of recordedStrings(record[field])) {
+      const form = credentialFormIn(s);
+      if (form !== undefined) return form;
+    }
+  }
+  return undefined;
+}
 
 /**
  * The narrowest standing rule for an approved call, or why there is none. A tool the
  * manifest says takes no scoping argument is refused here; one it does not list falls
  * back to the matcher's name table, as `crewhaus permissions suggest` does. A rule's
- * pattern is the call's own value, so a value that carries a credential is refused:
+ * pattern is the call's own value, so a call that carries a credential in any value a
+ * rule is read against is refused, whatever its narrowing answers, with the form found:
  * the pattern would be written to `.crewhaus/settings.json` and the rule's record.
  */
 export function standingPatternFor(
@@ -152,21 +198,24 @@ export function standingPatternFor(
 ): StandingPattern {
   const values = callValues(toolName, input, harnessDir);
   if (values === "no-scoping-argument") return { refused: "no-scoping-argument" };
+  const carried = callCredentialForm(toolName, input, values);
+  if (carried !== undefined) return { refused: "carries-credential", form: carried };
   const narrow = narrowPatternFor(toolName, input, values);
-  if ("pattern" in narrow && carriesCredential(narrow.value)) {
-    return { refused: "carries-credential" };
+  if ("pattern" in narrow) {
+    const form = credentialFormIn(narrow.value);
+    if (form !== undefined) return { refused: "carries-credential", form };
   }
   return narrow;
 }
 
 /** Why a rule's pattern is refused for the characters it holds. */
 const DISPLAY_CONTROL_PROBLEM =
-  "a rule's pattern cannot hold control or bidirectional-text characters";
+  "a rule's pattern cannot hold a control, bidirectional-text or other invisible character";
 
 /**
  * Why a wider pattern the owner typed is refused: it must be a rule for the same tool,
- * hold no control or bidirectional-text character, compile, and grant the call it is
- * made from.
+ * hold no control, bidirectional-text or other invisible character, compile, and grant
+ * the call it is made from.
  */
 export function widenedPatternProblem(
   toolName: string,
@@ -178,7 +227,10 @@ export function widenedPatternProblem(
     return `a wider rule names the same tool with an argument: ${toolName}(<glob>)`;
   }
   if (holdsDisplayControl(pattern)) return DISPLAY_CONTROL_PROBLEM;
-  if (carriesCredential(pattern)) return "a rule must not hold a credential";
+  const form = credentialFormIn(pattern);
+  if (form !== undefined) {
+    return `a rule must not hold a credential (${CREDENTIAL_FORM_WORDS[form]})`;
+  }
   const values = callValues(toolName, input, harnessDir);
   const operativeValues = values === "no-scoping-argument" ? undefined : values;
   // Read by the engine itself, as a settings allow and nothing else: a pattern that
@@ -260,6 +312,18 @@ function assertSettingsReadable(harnessDir: string): void {
   loadSettingsRules(harnessDir);
 }
 
+/**
+ * The decision a rule is made from, if any. A rule named by a decision always carries
+ * `derivesFrom`: asked under the rule lock, just before the row is written, it answers why
+ * that decision does not stand, or `undefined` when it does.
+ */
+export type RuleDerivation =
+  | { readonly derivedFrom?: undefined; readonly derivesFrom?: undefined }
+  | {
+      readonly derivedFrom: string;
+      readonly derivesFrom: () => string | undefined;
+    };
+
 export type RuleWrite = {
   readonly harnessDir: string;
   /** The rule's id, when the caller names it first (a request that names the rule it made). */
@@ -267,7 +331,6 @@ export type RuleWrite = {
   readonly tool: string;
   readonly pattern: string;
   readonly reason: StandingRuleReason;
-  readonly derivedFrom?: string;
   readonly proposal?: string;
   /** The stored actor that makes it. */
   readonly createdBy: string;
@@ -275,7 +338,7 @@ export type RuleWrite = {
   /** The receipt of the command that makes it. */
   readonly cmd?: string;
   readonly now: number;
-};
+} & RuleDerivation;
 
 export type RuleWriteAnswer =
   | { readonly ok: true; readonly rule: StandingRuleRow; readonly settingsPath: string }
@@ -286,11 +349,14 @@ function messageOf(err: unknown): string {
 }
 
 /**
- * Make a standing rule, under the harness's control lock: end the expired ones, write
- * the row, then the settings entry. When the entry cannot be written the row is
- * revoked again, so no rule stands that allows nothing. A pattern or tool holding a
- * control or bidirectional-text character, and an end that is not after `now` or is
- * more than {@link MAX_RULE_DAYS} days after it, are refused before anything is written.
+ * Make a standing rule, under the harness's control lock: end the expired ones, ask the
+ * decision the rule is made from whether it still stands (`derivesFrom`), write the row,
+ * then the settings entry. A decision that does not stand, or whose check throws, makes
+ * no row and no entry. When the entry cannot be written the row is revoked again, so no
+ * rule stands that allows nothing. A pattern or tool holding a control,
+ * bidirectional-text or other invisible character, and an end that is not after `now` or
+ * is more than {@link MAX_RULE_DAYS} days after it, are refused before anything is
+ * written.
  */
 export async function createStandingRule(write: RuleWrite): Promise<RuleWriteAnswer> {
   const { harnessDir, now } = write;
@@ -306,6 +372,15 @@ export async function createStandingRule(write: RuleWrite): Promise<RuleWriteAns
       await endExpiredLocked(harnessDir, now);
     } catch (err) {
       return { ok: false, reason: messageOf(err) };
+    }
+    if (write.derivedFrom !== undefined) {
+      let gone: string | undefined;
+      try {
+        gone = write.derivesFrom();
+      } catch (err) {
+        gone = messageOf(err);
+      }
+      if (gone !== undefined) return { ok: false, reason: gone };
     }
     const id = write.id ?? mintId("rule", { now });
     const policyRevision = policyRevisionOf(harnessDir);
@@ -368,45 +443,145 @@ export async function revokeStandingRule(input: {
   readonly now: number;
 }): Promise<RevokeAnswer> {
   const { harnessDir, id, now } = input;
-  const ledger = standingRulesLedger(harnessDir);
-  const answer = await withLedgerLock(ledger, async (): Promise<RevokeAnswer> => {
-    try {
-      assertSettingsReadable(harnessDir);
-      await endExpiredLocked(harnessDir, now);
-    } catch (err) {
-      return { outcome: "unavailable", reason: messageOf(err) };
-    }
-    const read = readStandingRules(harnessDir);
-    if (read.state === "unreadable") return { outcome: "unavailable", reason: read.reason };
-    const rows = read.state === "present" ? read.rows : [];
-    const current = rows.find((row) => row.id === id);
-    if (current === undefined) return { outcome: "not-found" };
-    if (current.state !== "active") return { outcome: "ended", rule: current };
-    const revoked: StandingRuleRow = {
-      ...current,
-      state: "revoked",
-      revokedAt: iso(now),
-      revokedBy: input.revokedBy,
-    };
-    const moved = await casAppendLocked(ledger, id, "active", revoked);
-    if (!moved.ok) return { outcome: "unavailable", reason: moved.reason };
-    if (!moved.applied) return { outcome: "ended", rule: current };
-    const stillNamed = rows.some(
-      (row) => row.id !== id && row.pattern === current.pattern && ruleIsLive(row, now),
-    );
-    if (stillNamed) return { outcome: "revoked", rule: revoked, settingsRemoved: false };
-    try {
-      const removed = removeSettingsRule(harnessDir, {
-        type: "alwaysAllow",
-        pattern: current.pattern,
-      });
-      return { outcome: "revoked", rule: revoked, settingsRemoved: removed.removed };
-    } catch (err) {
-      // The row stands revoked, and an entry the record names loads only while a row is live.
-      return { outcome: "unavailable", reason: messageOf(err) };
-    }
-  });
+  const answer = await withLedgerLock(
+    standingRulesLedger(harnessDir),
+    async (): Promise<RevokeAnswer> => {
+      try {
+        assertSettingsReadable(harnessDir);
+        await endExpiredLocked(harnessDir, now);
+      } catch (err) {
+        return { outcome: "unavailable", reason: messageOf(err) };
+      }
+      return revokeLocked(harnessDir, id, input.revokedBy, now);
+    },
+  );
   return lockRefused(answer) ? { outcome: "unavailable", reason: answer.reason } : answer;
+}
+
+/**
+ * End standing rule `id` under the lock the caller holds: the `revoked` row first, then
+ * the settings entry, unless another live rule names the same pattern. The rules are
+ * read here, so a rule ended earlier under the same lock counts as ended.
+ */
+async function revokeLocked(
+  harnessDir: string,
+  id: string,
+  revokedBy: string,
+  now: number,
+): Promise<RevokeAnswer> {
+  const ledger = standingRulesLedger(harnessDir);
+  const read = readStandingRules(harnessDir);
+  if (read.state === "unreadable") return { outcome: "unavailable", reason: read.reason };
+  const rows = read.state === "present" ? read.rows : [];
+  const current = rows.find((row) => row.id === id);
+  if (current === undefined) return { outcome: "not-found" };
+  if (current.state !== "active") return { outcome: "ended", rule: current };
+  const revoked: StandingRuleRow = {
+    ...current,
+    state: "revoked",
+    revokedAt: iso(now),
+    revokedBy,
+  };
+  const moved = await casAppendLocked(ledger, id, "active", revoked);
+  if (!moved.ok) return { outcome: "unavailable", reason: moved.reason };
+  if (!moved.applied) return { outcome: "ended", rule: current };
+  const stillNamed = rows.some(
+    (row) => row.id !== id && row.pattern === current.pattern && ruleIsLive(row, now),
+  );
+  if (stillNamed) return { outcome: "revoked", rule: revoked, settingsRemoved: false };
+  try {
+    const removed = removeSettingsRule(harnessDir, {
+      type: "alwaysAllow",
+      pattern: current.pattern,
+    });
+    return { outcome: "revoked", rule: revoked, settingsRemoved: removed.removed };
+  } catch (err) {
+    // The row stands revoked, and an entry the record names loads only while a row is live.
+    return { outcome: "unavailable", reason: messageOf(err) };
+  }
+}
+
+/** What {@link endDerivedRules} found and did. */
+export type DerivedRulesAnswer =
+  | { readonly state: "unreadable"; readonly reason: string }
+  | {
+      readonly state: "read";
+      /** Part of the rules file could not be read: a rule made from the decision may stand. */
+      readonly anomalies: boolean;
+      /** Each live rule made from the decision, and what ending it answered when it was ended. */
+      readonly rules: ReadonlyArray<{
+        readonly row: StandingRuleRow;
+        readonly ended?: RevokeAnswer | { readonly outcome: "failed"; readonly reason: string };
+      }>;
+    };
+
+/**
+ * The live standing rules made from decision `ref`, read under the harness's control
+ * lock (the one {@link createStandingRule} writes under), and, when `end` is set, each
+ * ended under that same lock. `revokedBy` is asked only when a rule is ended; when it
+ * throws, that rule's answer says so. A rule written before the lock is taken is seen
+ * here; one whose write waits for the lock asks its decision again under it. A lock that
+ * cannot be taken answers `unreadable`, never a rejection, so the caller can still name
+ * the verb that lists the rules.
+ */
+export async function endDerivedRules(input: {
+  readonly harnessDir: string;
+  readonly ref: string;
+  readonly end: boolean;
+  readonly revokedBy: () => Promise<string>;
+  readonly now: () => number;
+}): Promise<DerivedRulesAnswer> {
+  const { harnessDir, ref } = input;
+  const answer = await withLedgerLock(
+    standingRulesLedger(harnessDir),
+    async (): Promise<DerivedRulesAnswer> => {
+      const read = readStandingRules(harnessDir);
+      if (read.state === "unreadable") return { state: "unreadable", reason: read.reason };
+      const nowMs = input.now();
+      const live =
+        read.state === "present"
+          ? read.rows.filter(
+              (row) => row.derivedFrom === ref && row.state === "active" && ruleIsLive(row, nowMs),
+            )
+          : [];
+      const anomalies = read.state === "present" && read.anomalies.length > 0;
+      if (!input.end || live.length === 0) {
+        return { state: "read", anomalies, rules: live.map((row) => ({ row })) };
+      }
+      try {
+        assertSettingsReadable(harnessDir);
+        await endExpiredLocked(harnessDir, input.now());
+      } catch (err) {
+        const reason = messageOf(err);
+        return {
+          state: "read",
+          anomalies,
+          rules: live.map((row) => ({ row, ended: { outcome: "failed" as const, reason } })),
+        };
+      }
+      let revokedBy: string | undefined;
+      const rules: Array<{
+        readonly row: StandingRuleRow;
+        readonly ended: RevokeAnswer | { readonly outcome: "failed"; readonly reason: string };
+      }> = [];
+      for (const row of live) {
+        try {
+          revokedBy ??= await input.revokedBy();
+          rules.push({
+            row,
+            ended: await revokeLocked(harnessDir, row.id, revokedBy, input.now()),
+          });
+        } catch (err) {
+          rules.push({ row, ended: { outcome: "failed", reason: messageOf(err) } });
+        }
+      }
+      return { state: "read", anomalies, rules };
+    },
+  ).catch(
+    // A lock that cannot be taken, or a step that throws: a rule made from `ref` may stand.
+    (err: unknown): DerivedRulesAnswer => ({ state: "unreadable", reason: messageOf(err) }),
+  );
+  return lockRefused(answer) ? { state: "unreadable", reason: answer.reason } : answer;
 }
 
 /** An `alwaysAllow` in the settings file that no standing-rule record names, for a whole tool. */

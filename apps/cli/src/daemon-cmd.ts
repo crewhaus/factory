@@ -29,7 +29,15 @@
  * code. Bad arguments throw plain `Error`s; the entry file routes them
  * through `die()`.
  */
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import type { LocalIdentity } from "@crewhaus/access-control";
 import {
@@ -374,7 +382,12 @@ export function supervisorFor(
         }
         const actor =
           read.state === "present"
-            ? await storedActorFor(resolveHangarRoot(env), currentLocalIdentity(), read.hmac)
+            ? await storedActorFor(
+                resolveHangarRoot(env),
+                harnessDir,
+                currentLocalIdentity(),
+                read.hmac,
+              )
             : "";
         return admitExplicitStart(harnessDir, target, {
           head,
@@ -393,7 +406,12 @@ export function supervisorFor(
           message: "the harness's digest key cannot be read; nothing was started",
         };
       }
-      const actor = await storedActorFor(resolveHangarRoot(env), currentLocalIdentity(), key.hmac);
+      const actor = await storedActorFor(
+        resolveHangarRoot(env),
+        harnessDir,
+        currentLocalIdentity(),
+        key.hmac,
+      );
       return admitExplicitStart(harnessDir, target, {
         head,
         entry,
@@ -617,14 +635,37 @@ function targetFor(harness: ResolvedHarness, opts: DaemonCommandOptions): string
   return id !== undefined ? `home/harness/${id}` : undefined;
 }
 
-/** A harness directory's id: its registry row's, else the one its `harness.json` carries. Only reads. */
+/** Whether two paths name the same directory: the same resolved spelling, or the same real
+ *  location (a path that can't be followed keeps its resolved spelling). */
+function sameHarnessDir(a: string, b: string): boolean {
+  const real = (path: string): string => {
+    try {
+      return realpathSync(resolve(path));
+    } catch {
+      return resolve(path);
+    }
+  };
+  return resolve(a) === resolve(b) || real(a) === real(b);
+}
+
+/**
+ * A harness directory's id: the id of the registry row for this directory (by its resolved
+ * spelling, else by its real location), else the one its `harness.json` carries, but only
+ * when no registry row in another directory holds that id. A directory whose `harness.json`
+ * names another directory's row has no id here. When the registry can't be opened there is
+ * no row to compare, and the `harness.json` id stands. Only reads.
+ */
 export function harnessIdOf(dir: string, opts: DaemonCommandOptions): string | undefined {
-  const entry = openRegistrySafe(opts)
-    ?.list()
-    .find((e) => e.dir === dir);
+  const rows = openRegistrySafe(opts)?.list();
+  const entry =
+    rows?.find((e) => resolve(e.dir) === resolve(dir)) ??
+    rows?.find((e) => sameHarnessDir(e.dir, dir));
   if (entry !== undefined) return entry.id;
   const identity = readHarnessIdentity(dir);
-  return identity.state === "present" ? identity.identity.id : undefined;
+  if (identity.state !== "present") return undefined;
+  const id = identity.identity.id;
+  if (rows?.some((e) => e.id === id && !sameHarnessDir(e.dir, dir))) return undefined;
+  return id;
 }
 
 /** Every registered harness whose directory is there now, for a head that must find one. */

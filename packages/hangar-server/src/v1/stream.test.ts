@@ -132,7 +132,13 @@ function collect(res: Response) {
 
 function open(
   read: (access: RequestAccess) => StreamBatch,
-  more: { signal?: AbortSignal; maxFrames?: number; maxMs?: number; start?: string } = {},
+  more: {
+    signal?: AbortSignal;
+    maxFrames?: number;
+    maxMs?: number;
+    start?: string;
+    recheck?: () => "auth.revoked" | "auth.expired" | undefined;
+  } = {},
 ) {
   const clock = fakeClock();
   let disposed = 0;
@@ -151,6 +157,7 @@ function open(
     pollMs: 100,
     ...(more.maxFrames !== undefined ? { maxFrames: more.maxFrames } : {}),
     ...(more.maxMs !== undefined ? { maxMs: more.maxMs } : {}),
+    ...(more.recheck !== undefined ? { recheck: more.recheck } : {}),
   });
   return { res, clock, body: collect(res), disposed: () => disposed };
 }
@@ -278,6 +285,30 @@ describe("how a stream ends", () => {
       abort.abort(reason);
       await s.clock.advance(0);
       expect([reason, s.body.frames().map((f) => f.event)]).toEqual([reason, [event]]);
+      expect(s.body.done()).toBe(true);
+      expect(s.disposed()).toBe(1);
+    }
+  });
+
+  test("a re-check that refuses before a batch closes with its auth frame, and that batch is never read", async () => {
+    for (const refusal of ["auth.revoked", "auth.expired"] as const) {
+      let reads = 0;
+      let checks = 0;
+      const s = open(
+        () => {
+          reads += 1;
+          return { frames: [frameAt(reads)], next: idOf(reads) };
+        },
+        {
+          recheck: () => {
+            checks += 1;
+            return checks >= 2 ? refusal : undefined;
+          },
+        },
+      );
+      await s.clock.advance(1000);
+      expect([refusal, reads, checks]).toEqual([refusal, 1, 2]);
+      expect(s.body.frames().map((f) => f.event)).toEqual(["run.started", refusal]);
       expect(s.body.done()).toBe(true);
       expect(s.disposed()).toBe(1);
     }

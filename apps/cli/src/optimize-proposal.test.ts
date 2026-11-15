@@ -1,7 +1,7 @@
 /**
  * `crewhaus changes propose --from opt_<id>`: a proposal from an optimize run applies
- * only settings the optimizer may tune, from a run the CLI recorded, and a refusal
- * files nothing.
+ * only patches the optimizer may make, from an optimize run directory whose report names
+ * that run, this spec and its target, and a refusal files nothing.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import {
@@ -66,7 +66,11 @@ function harness(): { dir: string; root: string; env: Record<string, string> } {
 const runRel = (name: string): string => join(".crewhaus", "optimize", RUN, name);
 
 function report(dir: string, fields: Record<string, unknown> = {}): void {
-  put(dir, runRel("report.json"), JSON.stringify({ runId: RUN, target: "cli", ...fields }));
+  put(
+    dir,
+    runRel("report.json"),
+    JSON.stringify({ runId: RUN, target: "cli", specPath: join(dir, "crewhaus.yaml"), ...fields }),
+  );
 }
 
 /** Nothing was filed: no change row and no proposals directory. */
@@ -114,6 +118,54 @@ describe("a proposal from an optimize run", () => {
     put(dir, runRel("patches.json"), JSON.stringify([TUNED]));
     await expect(propose(dir, env)).rejects.toThrow(/no optimize run opt_ab12 recorded/);
     expectNothingFiled(dir);
+  });
+
+  test("a report.json naming another spec file of the same target is refused", async () => {
+    const { dir, env } = harness();
+    put(dir, "other.yaml", SPEC.replace("name: shop", "name: other"));
+    report(dir, { specPath: join(dir, "other.yaml") });
+    put(dir, runRel("patches.json"), JSON.stringify([TUNED]));
+    await expect(propose(dir, env)).rejects.toThrow(/no optimize run opt_ab12 recorded/);
+    expectNothingFiled(dir);
+  });
+
+  test("a report.json that names no spec file is refused", async () => {
+    const { dir, env } = harness();
+    for (const specPath of [undefined, null, 7, ""]) {
+      report(dir, { specPath });
+      put(dir, runRel("patches.json"), JSON.stringify([TUNED]));
+      await expect(propose(dir, env)).rejects.toThrow(/no optimize run opt_ab12 recorded/);
+      expectNothingFiled(dir);
+    }
+  });
+
+  test("a report.json whose spec path is relative is refused", async () => {
+    const { dir, env } = harness();
+    report(dir, { specPath: "crewhaus.yaml" });
+    put(dir, runRel("patches.json"), JSON.stringify([TUNED]));
+    await expect(propose(dir, env)).rejects.toThrow(/no optimize run opt_ab12 recorded/);
+    expectNothingFiled(dir);
+  });
+
+  test("a report.json whose spec path names a missing file is refused", async () => {
+    const { dir, env } = harness();
+    report(dir, { specPath: join(dir, "gone", "crewhaus.yaml") });
+    put(dir, runRel("patches.json"), JSON.stringify([TUNED]));
+    await expect(propose(dir, env)).rejects.toThrow(/no optimize run opt_ab12 recorded/);
+    expectNothingFiled(dir);
+  });
+
+  test("a spec path that reaches the spec through a linked directory names the spec", async () => {
+    const { dir, root, env } = harness();
+    symlinkSync(dir, join(root, "linked"));
+    report(dir, { specPath: join(root, "linked", "crewhaus.yaml") });
+    put(dir, runRel("patch.json"), JSON.stringify(TUNED));
+    const out = await propose(dir, env);
+    expect(out.exitCode).toBe(0);
+    const read = readChanges(dir);
+    if (read.state !== "present") throw new Error(read.state);
+    const expected = applySpecPatch(SPEC, TUNED as Parameters<typeof applySpecPatch>[1]).yaml;
+    expect(readChangeContent(dir, read.rows[0]?.id as string, "proposed.yaml")).toBe(expected);
   });
 
   test("a report.json that is a link is refused", async () => {

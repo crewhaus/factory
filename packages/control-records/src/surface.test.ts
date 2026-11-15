@@ -181,6 +181,7 @@ describe("what the package exports", () => {
         "dropSegmentsBefore",
         "ensureDigestKey",
         "expireClaim",
+        "expireClaimHeldBy",
         "foldStates",
         "harnessLedger",
         "holderProvablyDead",

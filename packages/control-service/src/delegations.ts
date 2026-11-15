@@ -33,7 +33,6 @@ import {
   loadAccessSnapshot,
 } from "@crewhaus/access-control";
 import {
-  type CommandReceipt,
   type DelegationAction,
   type DelegationList,
   type DelegationLogLine,
@@ -110,7 +109,7 @@ import {
   withDelegationLog,
   withLedgerLock,
 } from "@crewhaus/control-records";
-import type { Commands } from "./commands";
+import type { Commands, SettleAnswer } from "./commands";
 import type { DecisionActor, Decisions } from "./decisions";
 import { isServiceActor } from "./deployments";
 import type {
@@ -309,12 +308,15 @@ export type DelegationsDeps = {
   readonly now: () => number;
   readonly decisions: Decisions;
   readonly commands: Pick<Commands, "submit"> & {
-    /** Move an `accepted` receipt this service wrote to its final state. */
+    /**
+     * Move an `accepted` receipt this service wrote to its final state. A refused settle
+     * leaves the receipt `accepted`, for recovery.
+     */
     readonly settle?: (
       ledger: { readonly harness: string },
       id: string,
       settlement: Settlement,
-    ) => Promise<CommandReceipt | undefined>;
+    ) => Promise<SettleAnswer>;
   };
   /** The actions this composition serves (`delegatedActions(areas)`). */
   readonly actions: readonly DelegatedAction[];

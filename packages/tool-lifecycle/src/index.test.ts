@@ -18,8 +18,9 @@
  * time, only on work done.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -329,6 +330,83 @@ test("HarnessRetire archives the state, verifies every byte, and removes the liv
   const ran = (r["outcomes"] as Array<Json>).map((o) => o["step"]);
   expect(ran).toEqual(preview["steps"] as unknown[]);
 }, 20_000);
+
+test("HarnessRetire keeps the harness's state in its archive without its run tokens", async () => {
+  harness();
+  // Fresh random contents, so no token-shaped literal sits in the source.
+  const tokens: Record<string, string> = {};
+  for (const rel of ["run/control-token", "run/gateway-jwt-secret", "run/mcp-token"]) {
+    tokens[rel] = randomBytes(24).toString("hex");
+    write(`.crewhaus/${rel}`, tokens[rel] as string);
+  }
+  write(".crewhaus/run/.gitignore", "*\n");
+
+  const r = await callJson(harnessRetire, {
+    spec: "demo",
+    archiveDir: "archive",
+    dryRun: false,
+    acceptUnverified: true,
+  });
+  expect(r["status"]).toBe("applied");
+  expect(r["removedState"]).toBe(true);
+  expect(at(r, "verification", "performed")).toBe(true);
+  expect(at(r, "verification", "ok")).toBe(true);
+  expect(r["runTokensLeftOut"]).toEqual([
+    "run/control-token",
+    "run/gateway-jwt-secret",
+    "run/mcp-token",
+  ]);
+
+  const archived = path.join(tmp, "archive", ARCHIVED_STATE_DIRNAME);
+  for (const rel of Object.keys(tokens)) expect(existsSync(path.join(archived, rel))).toBe(false);
+  expect(existsSync(path.join(archived, "sessions/sess_00000000000000aa.json"))).toBe(true);
+  expect(existsSync(path.join(archived, "run/.gitignore"))).toBe(true);
+  const archive = path.join(tmp, "archive");
+  const files = tree(archive);
+  expect(files.length).toBeGreaterThan(0);
+  for (const rel of files) {
+    const text = readFileSync(path.join(archive, rel), "utf8");
+    for (const value of Object.values(tokens)) {
+      expect({ rel, holds: text.includes(value) }).toEqual({ rel, holds: false });
+    }
+  }
+  expect(JSON.stringify(r).includes(Object.values(tokens)[0] as string)).toBe(false);
+}, 20_000);
+
+test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+  "HarnessRetire still reports the retirement applied when the run tokens cannot be removed",
+  async () => {
+    harness();
+    write(".crewhaus/run/control-token", randomBytes(24).toString("hex"));
+    const runDir = path.join(tmp, ".crewhaus", "run");
+    chmodSync(runDir, 0o555);
+    try {
+      const r = await callJson(harnessRetire, {
+        spec: "demo",
+        archiveDir: "archive",
+        dryRun: false,
+        acceptUnverified: true,
+      });
+      expect(r["status"]).toBe("applied");
+      expect(r["removedState"]).toBe(true);
+      expect(r["runTokensLeftOut"]).toBeUndefined();
+      const followUps = r["followUps"] as string[];
+      expect(followUps.some((f) => f.includes("the run token files could not be removed"))).toBe(
+        true,
+      );
+    } finally {
+      const moved = path.join(tmp, "archive", ARCHIVED_STATE_DIRNAME, "run");
+      for (const dir of [runDir, moved]) {
+        try {
+          chmodSync(dir, 0o755);
+        } catch {
+          // Only one of the two exists.
+        }
+      }
+    }
+  },
+  20_000,
+);
 
 test("HarnessRetire aborts before moving anything when the registry cannot be tombstoned", async () => {
   harness();
