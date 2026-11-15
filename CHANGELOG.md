@@ -674,6 +674,20 @@ these on: they reach every harness that uses what each one names.
   anchor: presented as written by an earlier step, with no more authority than
   that source. The run's own input, carried in that state, is labelled with it.
 
+- **A schedule's time zone and cron are checked when the spec compiles.** On
+  channel, managed and batch, a `schedule:` (the single object and every named
+  lane) is refused when its `timezone` is not one the runtime knows, or when
+  its `cron` names only days its months do not have, such as `0 0 31 2 *`, or
+  only 29 February, while the day of the week is left open. The error names the
+  lane and the field (`schedule[1].timezone`).
+
+- **A schedule lane's next wake in `/control/v1/status` is its recorded fire
+  time.** The `nextDueAt` of a channel or batch `schedule` row and of every
+  `schedule:<name>` row is the fire time the armed schedule recorded, jitter
+  included; a status read does no schedule arithmetic. A lane with no pending
+  wake — in the middle of a wake, or not armed (a managed daemon started with
+  `CREWHAUS_SCHEDULE=0`) — has no `nextDueAt`.
+
 - **Home's device sign-in page starts with an empty code field; the member
   types the code.** `#/device` never takes a code from its address. It shows
   where Home saw the request come from and how long ago, apart from the name

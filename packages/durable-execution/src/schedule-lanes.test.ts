@@ -20,6 +20,8 @@ function fakeTimers() {
     counts,
     now: () => now,
     pending: () => pending.length,
+    /** The fire time of every pending timer, earliest first. */
+    pendingAts: () => pending.map((p) => p.at).sort((a, b) => a - b),
     setTimer: (fn: () => void, ms: number): unknown => {
       counts.set += 1;
       const id = nextId++;
@@ -176,4 +178,73 @@ describe("armScheduleLanes", () => {
       expect(t.counts.set).toBe(0);
     });
   }
+
+  test("a lane that cannot be armed leaves no lane armed", async () => {
+    const t = fakeTimers();
+    let wakes = 0;
+    const lanes: ReadonlyArray<WakeScheduleLane> = [
+      { name: "a", kind: "interval", everyMs: 1000 },
+      { name: "b", kind: "cron", cron: "0 17 * * 5", timezone: "Not/AZone" },
+      { name: "c", kind: "interval", everyMs: 3000 },
+    ];
+    expect(() =>
+      armScheduleLanes(lanes, {
+        onWake: () => {
+          wakes += 1;
+        },
+        now: t.now,
+        setTimer: t.setTimer,
+        clearTimer: t.clearTimer,
+      }),
+    ).toThrow(RangeError);
+    expect(t.pending()).toBe(0);
+    expect(t.counts.set).toBe(1);
+    expect(t.counts.clear).toBe(1);
+    await t.advanceTo(10_000);
+    expect(wakes).toBe(0);
+  });
+
+  test("nextAt(name) is each armed lane's pending fire time, jitter included", async () => {
+    const t = fakeTimers();
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const armed = armScheduleLanes(A_B, {
+      onWake: async (name) => {
+        if (name === "a") await held;
+      },
+      now: t.now,
+      setTimer: t.setTimer,
+      clearTimer: t.clearTimer,
+    });
+    expect(armed.nextAt("a")).toBe(1000);
+    expect(armed.nextAt("b")).toBe(3000);
+    expect(armed.nextAt("zzz")).toBeUndefined();
+    await t.advanceTo(1000);
+    // Lane a is in its wake: no timer is pending for it.
+    expect(armed.nextAt("a")).toBeUndefined();
+    expect(armed.nextAt("b")).toBe(3000);
+    release();
+    await t.advanceTo(1000);
+    expect(armed.nextAt("a")).toBe(2000);
+    armed.cancel();
+    expect(armed.nextAt("a")).toBeUndefined();
+    expect(armed.nextAt("b")).toBeUndefined();
+
+    const j = fakeTimers();
+    const jittered = armScheduleLanes(
+      [{ name: "a", kind: "interval", everyMs: 1000, jitterMs: 100 }],
+      {
+        onWake: () => {},
+        now: j.now,
+        rand: () => 1,
+        setTimer: j.setTimer,
+        clearTimer: j.clearTimer,
+      },
+    );
+    expect(j.pendingAts()).toEqual([1100]);
+    expect(jittered.nextAt("a")).toBe(1100);
+    jittered.cancel();
+  });
 });

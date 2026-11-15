@@ -73,6 +73,10 @@ import {
   createRuntimeBackedApprovalStore,
 } from "../packages/channel-adapter-base/src/index";
 import { cfWorkerUnwiredBlockWarnings, compile, lower } from "../packages/compiler/src/index";
+import {
+  SCHEDULE_LANES_CORPUS,
+  SCHEDULE_OBJECT_CORPUS,
+} from "../packages/compiler/src/schedule-corpus";
 import { createContinuityStore } from "../packages/continuity-store/src/index";
 import {
   DECISION_LOG_KEYS,
@@ -5578,6 +5582,60 @@ describe("the release notes name what a channel daemon does with clicks and mess
         b.includes("runtime-state floor also covers"),
       ),
     ).toHaveLength(1);
+  });
+});
+
+describe("the release notes name what a schedule's checks and next wake change", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+  const count = (text: string, needle: string): number => text.split(needle).length - 1;
+
+  test("a time zone the runtime does not know and a cron whose day never comes are refused", () => {
+    const object = SCHEDULE_OBJECT_CORPUS["managed-cron"];
+    expect(object).toBeDefined();
+    const managed = (object as string).replace("timezone: America/New_York", "timezone: Not/AZone");
+    expect(managed).toContain("timezone: Not/AZone");
+    expect(() => parseSpec(managed)).toThrow("Not/AZone");
+    const lanes = (SCHEDULE_LANES_CORPUS["channel-lanes"] as string).replace(
+      'cron: "0 17 * * 5"',
+      'cron: "0 0 31 2 *"',
+    );
+    expect(lanes).toContain('cron: "0 0 31 2 *"');
+    expect(() => parseSpec(lanes)).toThrow("can never fire");
+    const checks = bulletFor("A schedule's time zone and cron are checked when the spec compiles");
+    expect(checks).toContain("`timezone`");
+    expect(checks).toContain("`cron`");
+  });
+
+  test("every armed schedule's next wake is read from its timer", () => {
+    const daemons: Array<readonly [string, string]> = [];
+    const scan = (corpus: Readonly<Record<string, string>>, names: readonly string[]): void => {
+      for (const name of names) {
+        const yaml = corpus[name];
+        expect({ name, present: yaml !== undefined }).toEqual({ name, present: true });
+        const files = compile(yaml as string, { today: "2026-09-04" }).files;
+        // The batch worker's daemon is its agent.ts; channel and managed emit a daemon.ts.
+        const path = name.startsWith("batch") ? "agent.ts" : "daemon.ts";
+        daemons.push([name, files.find((f) => f.path === path)?.content ?? ""]);
+      }
+    };
+    scan(SCHEDULE_OBJECT_CORPUS, [
+      "channel-cron",
+      "channel-interval",
+      "batch-cron",
+      "batch-interval",
+    ]);
+    scan(SCHEDULE_LANES_CORPUS, ["channel-lanes", "managed-lanes", "batch-lanes"]);
+    for (const [name, text] of daemons) {
+      expect({ name, nextAt: count(text, ".nextAt(") > 0 }).toEqual({ name, nextAt: true });
+      expect({ name, arithmetic: count(text, "nextWakeDelayMs") }).toEqual({
+        name,
+        arithmetic: 0,
+      });
+    }
+    const wake = bulletFor("A schedule lane's next wake in `/control/v1/status`");
+    expect(wake).toContain("`nextDueAt`");
+    expect(wake).toContain("`CREWHAUS_SCHEDULE=0`");
   });
 });
 
