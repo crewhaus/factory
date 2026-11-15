@@ -19,6 +19,8 @@ import {
   AREA_MODULES,
   COMMAND_KINDS,
   type DelegationLogLine,
+  type DelegationSubject,
+  type DelegationTermsRequest,
   mintId,
 } from "@crewhaus/control-contract";
 import type {
@@ -48,14 +50,16 @@ import {
   type DelegationHarness,
   type DelegationRefusal,
   NOTHING_DELEGABLE,
+  createDelegations,
   delegatedExecutor,
   delegatedRollbackExecutor,
 } from "./delegations";
-import type { AreaRuntime, DelegatedAction } from "./executor";
+import type { AreaRuntime, DelegatedAction, DelegatedActionScope, Settlement } from "./executor";
 import { commandsLedgerOf } from "./ledgers";
 import {
   IDENTITY,
   NOW,
+  deferred,
   plantProjection,
   removeTempDirs,
   rig,
@@ -101,7 +105,9 @@ const KINDS = borrowedKinds();
 
 type Script = {
   verdicts: Partial<Record<GateId, Partial<GateVerdict> | "throw">>;
-  oneAtATime: boolean | ((log: readonly DelegationLogLine[]) => boolean);
+  oneAtATime:
+    | boolean
+    | ((log: readonly DelegationLogLine[], subject: DelegationSubject) => boolean);
   plan: RollbackPlan | undefined;
   revision: string | undefined;
   signal: SignalReading;
@@ -111,8 +117,14 @@ type Script = {
   /** Run while a gate answers, or while the rollback is planned. */
   duringGate?: () => Promise<void>;
   duringPlan?: () => Promise<void>;
+  /** Run while the effect reads the subject's revision, before it checks anything. */
+  duringRevision?: () => Promise<void>;
   /** Run inside the effect, after the grant is spent. */
   duringEffect?: () => Promise<void>;
+  /** What the effect settles as, after `duringEffect`; `succeeded` when unset. */
+  run?: () => Promise<Settlement>;
+  /** The scope fields the action's scope offers; none when unset. */
+  scopeFields?: DelegatedActionScope["fields"];
   /** What the host says, as the page's lines. */
   host?: { template: string; params?: Record<string, unknown> }[];
 };
@@ -157,15 +169,19 @@ function fakeAction(s: Script): { action: DelegatedAction; runtime: AreaRuntime 
     requiredGates: ["scope", "held_out"],
     scopeOf: (ceiling) =>
       typeof ceiling["merge"] === "object"
-        ? { fields: {}, ceiling: ceiling["merge"] as Record<string, unknown> }
+        ? { fields: s.scopeFields ?? {}, ceiling: ceiling["merge"] as Record<string, unknown> }
         : undefined,
     inScope: (_terms, _scope, subject) => subject.ref.startsWith(`${HRN}/`),
-    oneAtATime: (log) => (typeof s.oneAtATime === "function" ? s.oneAtATime(log) : s.oneAtATime),
+    oneAtATime: (log, subject) =>
+      typeof s.oneAtATime === "function" ? s.oneAtATime(log, subject) : s.oneAtATime,
     planRollback: async () => {
       await s.duringPlan?.();
       return s.plan;
     },
-    currentRevision: async () => s.revision,
+    currentRevision: async () => {
+      await s.duringRevision?.();
+      return s.revision;
+    },
     signals: async () => s.signal,
     signalIds: ["base-checks"],
     watchMs: () => 60_000,
@@ -179,7 +195,7 @@ function fakeAction(s: Script): { action: DelegatedAction; runtime: AreaRuntime 
       [KINDS.execute]: delegatedExecutor(action, async () => {
         s.effects += 1;
         await s.duringEffect?.();
-        return { state: "succeeded" };
+        return s.run !== undefined ? await s.run() : { state: "succeeded" };
       }),
       [KINDS.rollback]: delegatedRollbackExecutor(async () => {
         s.rollbacks += 1;
@@ -201,12 +217,12 @@ async function setup(
   options: { readonly ceiling?: Record<string, unknown> | null; readonly active?: boolean } = {},
 ) {
   const s = script();
-  const { runtime } = fakeAction(s);
+  const { action, runtime } = fakeAction(s);
   const r = rig({ areas: [...AREA_RUNTIMES, runtime] });
   const harness: DelegationHarness = { dir: r.harness, id: HRN, name: "codebase-steward" };
   const ceiling = options.ceiling === undefined ? { maxDays: 30, merge: {} } : options.ceiling;
   await deploy(r.harness, { ceiling, active: options.active ?? true, policy: POLICY, at: NOW });
-  return { r, s, harness, service: r.service.delegations };
+  return { r, s, action, harness, service: r.service.delegations };
 }
 
 const deployments = new Map<string, string>();
@@ -248,8 +264,9 @@ let seq = 0;
 /** Turn a rule on: the first try learns the page's digest, the second confirms it. */
 async function enable(
   t: Awaited<ReturnType<typeof setup>>,
-  terms: { days?: number; maxUses?: number } = {},
+  terms: DelegationTermsRequest = {},
   actor: DecisionActor = OWNER_LOCAL,
+  proposal?: string,
 ) {
   const first = await t.service.enable(t.harness, {
     action: "merge",
@@ -258,6 +275,7 @@ async function enable(
     confirm: "codebase-steward",
     actor,
     cmd: mintId("cmd"),
+    ...(proposal !== undefined ? { proposal } : {}),
   });
   if (first.ok || first.code !== "precondition-failed") return first;
   return t.service.enable(t.harness, {
@@ -267,6 +285,7 @@ async function enable(
     confirm: "codebase-steward",
     actor,
     cmd: mintId("cmd"),
+    ...(proposal !== undefined ? { proposal } : {}),
   });
 }
 
@@ -871,6 +890,8 @@ describe("the effect checks again before it acts", () => {
     });
     const mine = linesOf(t.r.harness).filter((l) => l.decision === d.id);
     expect(mine.at(-1)).toMatchObject({ event: "refused", reason });
+    // The executor's refusal is the one answer for the decision.
+    expect(mine.filter((l) => l.event === "refused")).toHaveLength(1);
     expect(mine.map((l) => l.event)).not.toContain("acted");
   }
 
@@ -975,6 +996,565 @@ describe("a pass sees what it just did", () => {
   });
 });
 
+/**
+ * Hold every effect until either pass settles, and for 200 ms at most: a second effect
+ * that starts while the first is held shows as a count, never as a timeout.
+ */
+function holdEffects(t: Awaited<ReturnType<typeof setup>>): () => void {
+  const held = deferred();
+  const timer = setTimeout(held.open, 200);
+  t.s.duringEffect = () => held.promise;
+  return () => {
+    clearTimeout(timer);
+    held.open();
+  };
+}
+
+/** Two passes at once, each releasing the held effects when it settles. */
+async function racedPasses(t: Awaited<ReturnType<typeof setup>>): Promise<void> {
+  const release = holdEffects(t);
+  await Promise.all([apply(t).finally(release), apply(t).finally(release)]);
+}
+
+/** A decision a person decides again: superseded, with a pending one in its place. */
+function handedBack(t: Awaited<ReturnType<typeof setup>>, id: string, reason: string): void {
+  const row = decisionRow(t.r.harness, id);
+  expect(row).toMatchObject({ state: "superseded", supersededReason: reason });
+  expect(decisionRow(t.r.harness, row?.supersededBy as string)).toMatchObject({
+    state: "pending",
+    kind: "merge",
+  });
+}
+
+describe("a use is counted when it is claimed", () => {
+  test("two passes at once under a cap of one use act once, and leave no claim open", async () => {
+    const t = await setup();
+    ruleOf(await enable(t, { maxUses: 1 }));
+    const a = await decision(t.r.harness);
+    const b = await decision(t.r.harness);
+    await racedPasses(t);
+    expect(t.s.effects).toBe(1);
+    const lines = linesOf(t.r.harness);
+    const acted = lines.filter((l) => l.event === "acted");
+    expect(acted).toHaveLength(1);
+    const decided = lines.filter((l) => l.event === "decided");
+    expect(decided).toHaveLength(1);
+    expect(decided[0]?.decision).toBe(acted[0]?.decision as string);
+    const other = acted[0]?.decision === a.id ? b : a;
+    expect(decisionRow(t.r.harness, acted[0]?.decision as string)?.state).toBe("consumed");
+    const theirs = lines.filter((l) => l.decision === other.id);
+    if (theirs.length > 0) {
+      expect(theirs.at(-1)).toMatchObject({ event: "refused", reason: "uses-exhausted" });
+    }
+    const row = decisionRow(t.r.harness, other.id);
+    expect(row?.state).not.toBe("consumed");
+    if (row?.state === "superseded") handedBack(t, other.id, "re-asked");
+    else expect(row?.state).toBe("pending");
+  });
+
+  test("two passes at once for a one-at-a-time action act once", async () => {
+    const t = await setup();
+    ruleOf(await enable(t));
+    t.s.oneAtATime = (log) => !log.some((l) => l.event === "acted");
+    const a = await decision(t.r.harness);
+    const b = await decision(t.r.harness);
+    await racedPasses(t);
+    expect(t.s.effects).toBe(1);
+    const lines = linesOf(t.r.harness);
+    expect(lines.filter((l) => l.event === "acted")).toHaveLength(1);
+    const states = [a, b].map((d) => decisionRow(t.r.harness, d.id)?.state);
+    expect(states.filter((state) => state === "consumed")).toHaveLength(1);
+  });
+
+  test("an action whose outcome is unknown keeps its use until it is settled", async () => {
+    const outcomes: readonly [string, () => Promise<Settlement>][] = [
+      [
+        "a run that throws",
+        async () => {
+          throw new Error("the host stopped answering");
+        },
+      ],
+      ["a run that settles unknown", async () => ({ state: "unknown" })],
+    ];
+    for (const [name, run] of outcomes) {
+      const t = await setup();
+      const ruleId = ruleOf(await enable(t, { maxUses: 1 }));
+      t.s.run = run;
+      const d = await decision(t.r.harness);
+      await apply(t);
+      expect([
+        name,
+        linesOf(t.r.harness)
+          .filter((l) => l.decision === d.id)
+          .map((l) => l.event),
+      ]).toEqual([name, ["checked", "planned", "decided", "outcome-unknown"]]);
+      expect(events(t.r.harness)).not.toContain("refused");
+      expect(events(t.r.harness)).not.toContain("watch-started");
+      const unknown = linesOf(t.r.harness).find((l) => l.event === "outcome-unknown");
+      expect(unknown?.cmd).toBeDefined();
+      expect(unknown?.reason).toBeUndefined();
+      const second = await decision(t.r.harness);
+      t.r.clock.now += 2000;
+      await apply(t);
+      expect([name, t.s.effects]).toEqual([name, 1]);
+      expect(decisionRow(t.r.harness, second.id)?.state).toBe("pending");
+      expect(t.service.list(t.harness).items[0]).toMatchObject({ uses: 1, state: "exhausted" });
+      // The rule's row is ended only by settled uses.
+      expect(ruleState(t.r.harness, ruleId)?.state).toBe("enabled");
+    }
+  });
+
+  test("an action whose outcome is unknown holds one at a time", async () => {
+    const t = await setup();
+    ruleOf(await enable(t));
+    t.s.oneAtATime = (log) => !log.some((l) => l.event === "acted");
+    t.s.run = async () => ({ state: "unknown" });
+    await decision(t.r.harness);
+    await apply(t);
+    const second = await decision(t.r.harness);
+    t.r.clock.now += 2000;
+    await apply(t);
+    expect(t.s.effects).toBe(1);
+    expect(decisionRow(t.r.harness, second.id)?.state).toBe("pending");
+  });
+
+  /**
+   * Hold every executor where it reads the subject's revision until two have arrived (or
+   * 200 ms passed), so both have read everything outside the lock before either claims.
+   */
+  function meetBeforeClaim(t: Awaited<ReturnType<typeof setup>>): () => number {
+    const met = deferred();
+    const timer = setTimeout(met.open, 200);
+    let arrived = 0;
+    t.s.duringRevision = async () => {
+      arrived += 1;
+      if (arrived >= 2) {
+        clearTimeout(timer);
+        met.open();
+      }
+      await met.promise;
+    };
+    return () => arrived;
+  }
+
+  test("two executors that both read before either claims act once, under a cap or one at a time", async () => {
+    for (const rule of ["a cap of one use", "one at a time"] as const) {
+      const t = await setup();
+      ruleOf(await enable(t, rule === "a cap of one use" ? { maxUses: 1 } : {}));
+      if (rule === "one at a time") t.s.oneAtATime = (log) => !log.some((l) => l.event === "acted");
+      await decision(t.r.harness);
+      await decision(t.r.harness);
+      const arrived = meetBeforeClaim(t);
+      await racedPasses(t);
+      expect([rule, arrived()]).toEqual([rule, 2]);
+      expect([rule, t.s.effects]).toEqual([rule, 1]);
+      const lines = linesOf(t.r.harness);
+      expect([rule, lines.filter((l) => l.event === "acted").length]).toEqual([rule, 1]);
+      expect([rule, lines.filter((l) => l.event === "decided").length]).toEqual([rule, 1]);
+    }
+  });
+
+  test("a claim that cannot be written: nothing is spent, nothing acts, and a person decides", async () => {
+    if (process.getuid?.() === 0) return; // root writes through a read-only file
+    const t = await setup();
+    ruleOf(await enable(t));
+    const d = await decision(t.r.harness);
+    const locked: string[] = [];
+    t.s.duringRevision = async () => {
+      t.s.duringRevision = undefined;
+      lockLog(t.r.harness, locked);
+    };
+    let summary: Awaited<ReturnType<typeof apply>>;
+    try {
+      summary = await apply(t);
+    } finally {
+      for (const file of locked) chmodSync(file, 0o644);
+    }
+    expect(locked.length).toBeGreaterThan(0);
+    expect(t.s.effects).toBe(0);
+    expect(summary).toMatchObject({ decided: 1, refused: 1 });
+    // The grant was never consumed: it went back to a person.
+    handedBack(t, d.id, "re-asked");
+    expect(events(t.r.harness)).not.toContain("decided");
+  });
+
+  test("a second execute for a claimed decision writes nothing, and its claim still counts", async () => {
+    for (const rule of ["a cap of one use", "one at a time"] as const) {
+      const t = await setup();
+      const ruleId = ruleOf(await enable(t, rule === "a cap of one use" ? { maxUses: 1 } : {}));
+      if (rule === "one at a time") t.s.oneAtATime = (log) => !log.some((l) => l.event === "acted");
+      const d1 = await decision(t.r.harness);
+      const held = deferred();
+      // A safety net only: the test opens it itself once the second pass is done.
+      const timer = setTimeout(held.open, 2_000);
+      let started!: () => void;
+      const acting = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      let running = 0;
+      let maxRunning = 0;
+      t.s.duringEffect = async () => {
+        running += 1;
+        maxRunning = Math.max(maxRunning, running);
+        started();
+        await held.promise;
+        running -= 1;
+      };
+      const first = apply(t);
+      await acting;
+      // The same decision is sent to its executor again while its effect runs.
+      const again = await t.r.service.commands.submit({
+        kind: KINDS.execute,
+        actor: "sys:executor",
+        target: `${HRN}/decision/${d1.id}`,
+        ledger: { harness: t.r.harness },
+        via: "system",
+        authority: { kind: "delegation", rule: ruleId, revision: 1 },
+      });
+      expect(again.ok).toBe(true);
+      expect(
+        linesOf(t.r.harness)
+          .filter((l) => l.decision === d1.id)
+          .map((l) => l.event),
+      ).toEqual(["checked", "planned", "decided"]);
+      const d2 = await decision(t.r.harness);
+      t.r.clock.now += 2000;
+      await apply(t);
+      expect([rule, t.s.effects, maxRunning]).toEqual([rule, 1, 1]);
+      expect(decisionRow(t.r.harness, d2.id)?.state).not.toBe("consumed");
+      clearTimeout(timer);
+      held.open();
+      await first;
+      expect(
+        linesOf(t.r.harness)
+          .filter((l) => l.decision === d1.id)
+          .map((l) => l.event),
+      ).toEqual(["checked", "planned", "decided", "acted", "watch-started"]);
+    }
+  });
+
+  test("a refusal another pass logs for a claimed decision does not free the cap", async () => {
+    const t = await setup();
+    ruleOf(await enable(t, { maxUses: 1 }));
+    const d1 = await decision(t.r.harness);
+    await decision(t.r.harness);
+    const release = holdEffects(t);
+    const holding = t.s.duringEffect;
+    const acting = deferred();
+    t.s.duringEffect = async () => {
+      acting.open();
+      await holding?.();
+    };
+    const real = t.action.planRollback;
+    let d1Plans = 0;
+    (t.action as { planRollback: typeof real }).planRollback = async (subject, ctx) => {
+      if (subject.ref === d1.subject.ref) {
+        d1Plans += 1;
+        if (d1Plans === 2) {
+          // The other pass plans d1 once d1 is acting, and cannot plan it: it logs a
+          // refusal of its own for d1.
+          await Promise.race([acting.promise, Bun.sleep(1_000)]);
+          return undefined;
+        }
+      }
+      return real(subject, ctx);
+    };
+    await Promise.all([apply(t).finally(release), apply(t).finally(release)]);
+    expect(d1Plans).toBe(2);
+    expect(
+      linesOf(t.r.harness).some(
+        (l) => l.decision === d1.id && l.event === "refused" && l.cmd === undefined,
+      ),
+    ).toBe(true);
+    expect(t.s.effects).toBe(1);
+  });
+});
+
+describe("a change that lands while the effect reads the subject wins", () => {
+  test("a revoke, a member's pause or a new revision of the rule: nothing acts", async () => {
+    const changes = {
+      revoke: async (t: Awaited<ReturnType<typeof setup>>, rule: string) => {
+        expect(
+          await t.service.revoke(t.harness, { rule, actor: OWNER_LOCAL, cmd: mintId("cmd") }),
+        ).toMatchObject({ ok: true });
+      },
+      pause: async (t: Awaited<ReturnType<typeof setup>>, rule: string) => {
+        expect(
+          await t.service.pause(t.harness, { rule, actor: OWNER_LOCAL, cmd: mintId("cmd") }),
+        ).toMatchObject({ ok: true });
+      },
+      change: async (t: Awaited<ReturnType<typeof setup>>, rule: string) => {
+        const page = await t.service.previewRule(t.harness, {
+          rule,
+          mode: "change",
+          terms: { days: 3 },
+        });
+        if (!page.ok) throw new Error("no page");
+        expect(
+          await t.service.update(t.harness, {
+            rule,
+            expect: 1,
+            terms: { days: 3 },
+            consequencesDigest: page.page.consequencesDigest as string,
+            confirm: "codebase-steward",
+            actor: OWNER_LOCAL,
+            cmd: mintId("cmd"),
+          }),
+        ).toMatchObject({ ok: true });
+      },
+    } as const;
+    for (const [name, land] of Object.entries(changes)) {
+      const t = await setup();
+      const ruleId = ruleOf(await enable(t, { maxUses: 5 }));
+      const d = await decision(t.r.harness);
+      let calls = 0;
+      t.s.duringRevision = async () => {
+        calls += 1;
+        await land(t, ruleId);
+      };
+      await apply(t);
+      expect([name, calls]).toEqual([name, 1]);
+      expect([name, t.s.effects]).toEqual([name, 0]);
+      expect([name, decisionRow(t.r.harness, d.id)?.state]).not.toEqual([name, "consumed"]);
+      const mine = linesOf(t.r.harness).filter((l) => l.decision === d.id);
+      expect([name, mine.some((l) => l.event === "decided")]).toEqual([name, false]);
+      expect([name, mine.at(-1)?.event]).toEqual([name, "refused"]);
+    }
+  });
+});
+
+describe("every grant acts, goes back to a person, or stays counted", () => {
+  /** The rig's delegation service with an execute submit that never reaches the executor. */
+  function undispatched(t: Awaited<ReturnType<typeof setup>>, answer: "refused" | "accepted") {
+    const submit: typeof t.r.service.commands.submit = async (request, effect) => {
+      if (request.kind !== KINDS.execute) return t.r.service.commands.submit(request, effect);
+      if (answer === "accepted") {
+        return t.r.service.commands.submit({ ...request, queued: true }, effect);
+      }
+      return {
+        ok: false,
+        refusal: { code: "unavailable", message: "the receipt could not be written" },
+      } as never;
+    };
+    return createDelegations({
+      hangarRoot: t.r.hangarRoot,
+      identity: IDENTITY,
+      now: () => t.r.clock.now,
+      decisions: t.r.service.decisions,
+      commands: { submit },
+      actions: [t.action],
+    });
+  }
+
+  for (const answer of ["refused", "accepted"] as const) {
+    test(`a grant the executor never answered goes back to a person (submit ${answer})`, async () => {
+      const t = await setup();
+      ruleOf(await enable(t));
+      const d = await decision(t.r.harness);
+      const summary = await undispatched(t, answer).apply(t.harness, {
+        appliedBy: "sys:scheduler",
+      });
+      expect(summary).toMatchObject({ decided: 1, refused: 1 });
+      expect(t.s.effects).toBe(0);
+      handedBack(t, d.id, "re-asked");
+      const mine = linesOf(t.r.harness).filter((l) => l.decision === d.id);
+      expect(mine.at(-1)).toMatchObject({ event: "refused", reason: "not-dispatched" });
+      expect(mine.map((l) => l.event)).not.toContain("decided");
+    });
+  }
+
+  test("a rule that is not on record at the effect: nothing acts and a person decides", async () => {
+    const t = await setup();
+    ruleOf(await enable(t));
+    const d = await decision(t.r.harness);
+    const ghost = mintId("rule");
+    const granted = await t.r.service.decisions.resolveDelegated({
+      harnessDir: t.r.harness,
+      ref: d.id,
+      delegation: { rule: ghost, revision: 1 },
+      appliedBy: "sys:scheduler",
+    });
+    expect(granted.outcome).toBe("decided");
+    await t.r.service.commands.submit({
+      kind: KINDS.execute,
+      actor: "sys:executor",
+      target: `${HRN}/decision/${d.id}`,
+      ledger: { harness: t.r.harness },
+      via: "system",
+      authority: { kind: "delegation", rule: ghost, revision: 1 },
+    });
+    expect(t.s.effects).toBe(0);
+    expect(linesOf(t.r.harness).filter((l) => l.decision === d.id)).toEqual([
+      expect.objectContaining({ event: "refused", reason: "rule-revoked", rule: ghost }),
+    ]);
+    handedBack(t, d.id, "rule-revoked");
+  });
+
+  test("a decision that is not on record at the effect: nothing acts, and it is logged", async () => {
+    const t = await setup();
+    const ruleId = ruleOf(await enable(t));
+    const missing = mintId("dec");
+    await t.r.service.commands.submit({
+      kind: KINDS.execute,
+      actor: "sys:executor",
+      target: `${HRN}/decision/${missing}`,
+      ledger: { harness: t.r.harness },
+      via: "system",
+      authority: { kind: "delegation", rule: ruleId, revision: 1 },
+    });
+    expect(t.s.effects).toBe(0);
+    expect(linesOf(t.r.harness)).toEqual([
+      expect.objectContaining({
+        event: "refused",
+        reason: "decision-missing",
+        rule: ruleId,
+        decision: missing,
+      }),
+    ]);
+  });
+});
+
+describe("terms are kept, and a request is answered on its own terms", () => {
+  const TERMS_SENTENCE =
+    "This request asked for other terms: answer it as asked, or turn on a new rule.";
+
+  test("a change that gives only a length keeps the use cap and the scope", async () => {
+    const t = await setup();
+    t.s.scopeFields = { branches: () => undefined };
+    const ruleId = ruleOf(await enable(t, { maxUses: 3, scope: { branches: ["main"] } }));
+    const short = await t.service.previewRule(t.harness, {
+      rule: ruleId,
+      mode: "change",
+      terms: { days: 7 },
+    });
+    const whole = await t.service.previewRule(t.harness, {
+      rule: ruleId,
+      mode: "change",
+      terms: { days: 7, maxUses: 3, scope: { branches: ["main"] } },
+    });
+    if (!short.ok || !whole.ok) throw new Error("no page");
+    expect(short.page.consequencesDigest).toBeDefined();
+    expect(short.page.consequencesDigest).toBe(whole.page.consequencesDigest as string);
+    const changed = await t.service.update(t.harness, {
+      rule: ruleId,
+      expect: 1,
+      terms: { days: 7 },
+      consequencesDigest: short.page.consequencesDigest as string,
+      confirm: "codebase-steward",
+      actor: OWNER_LOCAL,
+      cmd: mintId("cmd"),
+    });
+    expect(changed).toMatchObject({ ok: true });
+    const row = ruleState(t.r.harness, ruleId);
+    expect(row?.revision).toBe(2);
+    expect(row?.maxUses).toBe(3);
+    expect(row?.terms).toEqual({ days: 7, maxUses: 3, scope: { branches: ["main"] } });
+  });
+
+  test("a request is turned on only with the terms it asked for", async () => {
+    const t = await setup();
+    const proposed = await t.service.propose(t.harness, {
+      action: "merge",
+      terms: { days: 7, maxUses: 2 },
+      actor: OWNER_LOCAL,
+      cmd: mintId("cmd"),
+    });
+    if (!proposed.ok) throw new Error(proposed.reason);
+    const proposal = proposed.proposal as string;
+    expect(t.service.list(t.harness).proposals[0]).toMatchObject({
+      id: proposal,
+      days: 7,
+      maxUses: 2,
+    });
+    const ask = (consequencesDigest: string) =>
+      t.service.enable(t.harness, {
+        action: "merge",
+        terms: { maxUses: 3 },
+        consequencesDigest,
+        confirm: "codebase-steward",
+        actor: OWNER_LOCAL,
+        cmd: mintId("cmd"),
+        proposal,
+      });
+    const first = await ask("0".repeat(64));
+    expect(first).toMatchObject({
+      ok: false,
+      code: "precondition-failed",
+      reason: TERMS_SENTENCE,
+    });
+    const digest = first.ok ? undefined : first.page?.consequencesDigest;
+    expect(digest).toBeDefined();
+    expect(await ask(digest as string)).toMatchObject({ ok: false, reason: TERMS_SENTENCE });
+    const waiting = readProposals(t.r.harness);
+    expect(
+      waiting.state === "present" ? waiting.rows.find((r) => r.id === proposal)?.state : undefined,
+    ).toBe("pending");
+    expect(readDelegations(t.r.harness)).toMatchObject({ state: "absent" });
+
+    const answered = await enable(t, { days: 7 }, OWNER_LOCAL, proposal);
+    expect(answered).toMatchObject({ ok: true, proposal });
+    const ruleId = ruleOf(answered);
+    expect(ruleState(t.r.harness, ruleId)).toMatchObject({
+      maxUses: 2,
+      terms: { days: 7, maxUses: 2 },
+    });
+    const done = readProposals(t.r.harness);
+    expect(
+      done.state === "present" ? done.rows.find((r) => r.id === proposal)?.state : undefined,
+    ).toBe("granted");
+  });
+
+  test("a request's page is drawn from its own terms, and answering it sends none", async () => {
+    const t = await setup();
+    t.s.scopeFields = { branches: () => undefined };
+    const asked = { days: 7, maxUses: 2, scope: { branches: ["release/hotfix"] } };
+    const proposed = await t.service.propose(t.harness, {
+      action: "merge",
+      terms: asked,
+      actor: OWNER_LOCAL,
+      cmd: mintId("cmd"),
+    });
+    if (!proposed.ok) throw new Error(proposed.reason);
+    const proposal = proposed.proposal as string;
+    // The first answer makes the harness's digest key; the page is then read with its digest.
+    const first = await t.service.enable(t.harness, {
+      action: "merge",
+      consequencesDigest: "0".repeat(64),
+      confirm: "codebase-steward",
+      actor: OWNER_LOCAL,
+      cmd: mintId("cmd"),
+      proposal,
+    });
+    expect(first).toMatchObject({ ok: false, code: "precondition-failed" });
+    const page = await t.service.preview(t.harness, { action: "merge", proposal });
+    const whole = await t.service.preview(t.harness, { action: "merge", terms: asked });
+    if (!page.ok || !whole.ok) throw new Error("no page");
+    expect(page.page.consequencesDigest).toBeDefined();
+    expect(page.page.consequencesDigest).toBe(whole.page.consequencesDigest as string);
+    expect(page.page.consequencesDigest).toBe(
+      first.ok ? undefined : (first.page?.consequencesDigest as string),
+    );
+    const answered = await t.service.enable(t.harness, {
+      action: "merge",
+      consequencesDigest: page.page.consequencesDigest as string,
+      confirm: "codebase-steward",
+      actor: OWNER_LOCAL,
+      cmd: mintId("cmd"),
+      proposal,
+    });
+    expect(answered).toMatchObject({ ok: true, proposal });
+    expect(ruleState(t.r.harness, ruleOf(answered))?.terms).toEqual(asked);
+    // An answered request has no page to draw.
+    expect(await t.service.preview(t.harness, { action: "merge", proposal })).toMatchObject({
+      ok: false,
+      code: "already-decided",
+    });
+    expect(
+      await t.service.preview(t.harness, { action: "merge", proposal: mintId("dec") }),
+    ).toMatchObject({ ok: false, code: "not-found" });
+  });
+});
+
 /** Make every segment of the application log read-only; answers the files it locked. */
 function lockLog(harness: string, locked: string[]): void {
   const logDir = join(harness, controlPaths(harness).delegationLogDir);
@@ -1032,6 +1612,32 @@ describe("the rollback plan is on disk before anything acts", () => {
       .at(-1) as Record<string, unknown>;
     expect(final["effects"]).toContainEqual(
       expect.objectContaining({ kind: "delegation.acted", status: "failed" }),
+    );
+  });
+
+  test("an action whose unknown outcome could not be recorded says so on its receipt", async () => {
+    if (process.getuid?.() === 0) return; // root writes through a read-only file
+    const t = await setup();
+    ruleOf(await enable(t));
+    await decision(t.r.harness);
+    t.s.run = async () => ({ state: "unknown" });
+    const locked: string[] = [];
+    t.s.duringEffect = async () => {
+      t.s.duringEffect = undefined;
+      lockLog(t.r.harness, locked);
+    };
+    try {
+      await apply(t);
+    } finally {
+      for (const file of locked) chmodSync(file, 0o644);
+    }
+    expect(t.s.effects).toBe(1);
+    expect(events(t.r.harness)).not.toContain("outcome-unknown");
+    const final = rowsOf(commandsLedgerOf(t.r.harness))
+      .filter((r) => r["kind"] === KINDS.execute)
+      .at(-1) as Record<string, unknown>;
+    expect(final["effects"]).toContainEqual(
+      expect.objectContaining({ kind: "delegation.unknown", status: "failed" }),
     );
   });
 });

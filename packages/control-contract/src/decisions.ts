@@ -410,12 +410,13 @@ export type VerifyApprovers =
 
 /**
  * What a delegated grant is checked against, as its caller read it: the rule's computed
- * state (`effectiveRuleState` in `./delegation`), whether its enabling owner still holds
- * the owner's authority (`undefined`: it could not be told), and the subject's current
- * revision.
+ * state and revision (`effectiveRuleState` in `./delegation`), whether its enabling owner
+ * still holds the owner's authority (`undefined`: it could not be told), and the subject's
+ * current revision. The rule's revision is always given: a grant counts only under the
+ * revision it was made under.
  */
 export type VerifyDelegation = {
-  readonly ruleState: { readonly state: string; readonly revision?: number };
+  readonly ruleState: { readonly state: string; readonly revision: number };
   readonly ownerHolds: boolean | undefined;
   readonly subjectRevision: string | undefined;
 };
@@ -595,7 +596,10 @@ function verifyDelegated(
     return refuse(record, "decider-not-authorized", "the rule no longer applies", true);
   }
   const ruleRevision = delegation.ruleState.revision;
-  if (ruleRevision !== undefined && ruleRevision !== bound.revision) {
+  if (typeof ruleRevision !== "number") {
+    return refuse(record, "decider-not-authorized", "no rule revision was given");
+  }
+  if (ruleRevision !== bound.revision) {
     return refuse(record, "revision-changed", "the rule has a newer revision");
   }
   const subject = record.subject as Partial<DelegationSubject> | undefined;

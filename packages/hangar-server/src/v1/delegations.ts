@@ -10,7 +10,8 @@
  * principal: it calls the control service's port directly, never a handler here.
  */
 import { BOOTSTRAP_PRINCIPAL } from "@crewhaus/access-control";
-import type { DelegationTermsRequest } from "@crewhaus/control-contract";
+import { type DelegationTermsRequest, isId } from "@crewhaus/control-contract";
+import { readDelegations, withMutatingLease } from "@crewhaus/control-records";
 import {
   type DecisionActor,
   type DelegationHarness,
@@ -29,11 +30,18 @@ import { fleetSnapshot } from "./lists";
 import { harnessOf, liveDirOr409 } from "./resolve";
 import { acceptedAnswer, submitCommand } from "./submit";
 
-/** The caller as the delegation service takes them. Home's own key acts as its owner. */
+/**
+ * The caller as the delegation service takes them, as standing rules take them. Home's
+ * own key acts as the owner its access records name, or as Home's bootstrap owner while
+ * none do; a signed-in caller acts as their own principal. Every handler here reads it.
+ */
 function actorOf(ctx: V1Context): DecisionActor {
-  return ctx.access.caller.actor === null
-    ? { kind: "principal", principal: BOOTSTRAP_PRINCIPAL }
-    : { kind: "principal", principal: ctx.access.caller.principal };
+  const { caller } = ctx.access;
+  if (caller.actor !== null) return { kind: "principal", principal: caller.principal };
+  return {
+    kind: "principal",
+    principal: isId("prn", caller.principal) ? caller.principal : BOOTSTRAP_PRINCIPAL,
+  };
 }
 
 function harnessFor(ctx: V1Context): DelegationHarness {
@@ -210,6 +218,7 @@ const preview: V1Handler = async (ctx) => {
       : await ctx.deps.control.delegations.preview(harness, {
           action: ctx.body["action"] as never,
           ...(terms !== undefined ? { terms } : {}),
+          ...(typeof ctx.body["proposal"] === "string" ? { proposal: ctx.body["proposal"] } : {}),
         });
   if (!answer.ok) throw refusalError(answer);
   return { status: 200, body: answer.page, scrubDir: harness.dir };
@@ -317,35 +326,89 @@ const keep: V1Handler = async (ctx) => {
   );
 };
 
+/** The verb that applies a harness's rules from a terminal. */
+const applyVerb = (harness: DelegationHarness) =>
+  `crewhaus delegations apply --harness ${harness.id}`;
+
+/**
+ * One pass over a harness's rules, under its mutating lease, as `crewhaus delegations
+ * apply` takes it: one pass at a time per harness, and none while another long mutating
+ * job holds the harness. A held lease answers 409 naming only the holder's kind; nothing
+ * is written and no pass runs.
+ */
 const apply: V1Handler = async (ctx) => {
   const harness = harnessFor(ctx);
   const appliedBy = await ctx.deps.control.decisions.storedActorOf(harness.dir, actorOf(ctx));
-  const submitted = await submitCommand(ctx, {
-    target: `home/harness/${harness.id}`,
-    ledger: { harness: harness.dir },
-    effect: async (receipt) => {
-      const value = await ctx.deps.control.delegations.apply(harness, {
-        appliedBy,
-        cmd: receipt.id,
+  const held = await withMutatingLease(
+    harness.dir,
+    { head: "server", kind: "delegations.apply" },
+    () =>
+      submitCommand(ctx, {
+        target: `home/harness/${harness.id}`,
+        ledger: { harness: harness.dir },
+        effect: async (receipt) => {
+          const value = await ctx.deps.control.delegations.apply(harness, {
+            appliedBy,
+            cmd: receipt.id,
+          });
+          return { settle: { state: "succeeded" }, value };
+        },
+      }),
+    { waitMs: 0 },
+  );
+  if (!held.ok) {
+    if ("holder" in held) {
+      throw new V1Error({
+        status: 409,
+        code: "conflict",
+        reason: "harness_busy",
+        message: `This harness is busy (${held.holder.kind}): its rules were not applied. Try again when it finishes.`,
+        verb: applyVerb(harness),
       });
-      return { settle: { state: "succeeded" }, value };
-    },
-  });
-  return acceptedAnswer(submitted, {}, harness.dir);
+    }
+    throw new V1Error({
+      status: 503,
+      code: "unavailable",
+      reason: "unavailable",
+      message: "This harness's lease could not be read: its rules were not applied.",
+      verb: applyVerb(harness),
+    });
+  }
+  return acceptedAnswer(held.value, {}, harness.dir);
 };
 
-/** Home's minute sweep: one pass over every live harness, as the scheduler. */
+/**
+ * Home's minute sweep: one pass over every live harness that has a delegation rule, as
+ * the scheduler, each under the harness's mutating lease. A harness with no rule is left
+ * as it is: no lease is taken and nothing is written. A harness whose lease is held is
+ * passed over until the next minute, without a warning; any other lease failure is
+ * warned.
+ */
 export const DELEGATIONS_SWEEP: Sweep<HomePorts> = {
   name: "delegations",
   everyMs: 60_000,
   run: async ({ home, warn }) => {
     for (const harness of home.liveHarnesses()) {
+      // The same lock-free read a pass starts with: no rule, no pass.
+      const rules = readDelegations(harness.dir);
+      if (rules.state !== "present" || rules.rows.length === 0) continue;
       try {
-        await home.delegations.apply(
-          { dir: harness.dir, id: harness.id },
-          // The sweep's own principal is no actor a record names: the scheduler is.
-          { appliedBy: "sys:scheduler" },
+        const held = await withMutatingLease(
+          harness.dir,
+          { head: "server", kind: "delegations.apply" },
+          () =>
+            home.delegations.apply(
+              { dir: harness.dir, id: harness.id },
+              // The sweep's own principal is no actor a record names: the scheduler is.
+              { appliedBy: "sys:scheduler" },
+            ),
+          { waitMs: 0 },
         );
+        if (!held.ok && !("holder" in held)) {
+          warn(
+            `the delegation rules of ${harness.id} were not applied: its lease could not be taken (${held.code})`,
+          );
+        }
       } catch (err) {
         warn(
           `the delegation rules of ${harness.id} were not applied: ${err instanceof Error ? err.message : String(err)}`,

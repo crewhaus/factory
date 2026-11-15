@@ -194,8 +194,10 @@ export type DelegatedAction = {
   inScope(terms: DelegationTerms, scope: DelegatedActionScope, subject: DelegationSubject): boolean;
   /**
    * The action's one-at-a-time condition, read from the application log. Asked by the
-   * pass before a decision is taken, and again at the effect from the log as it is then,
-   * when the log also holds this decision's own `planned` and `decided` lines.
+   * pass before a decision is taken, and again at the effect under the application log's
+   * lock, over a log in which every claimed use whose outcome is not settled reads as
+   * `acted`. At the effect the log holds this decision's own `planned` line but not its
+   * `decided` line.
    */
   oneAtATime(log: readonly DelegationLogLine[], subject: DelegationSubject): boolean;
   /** How the action would be undone; `undefined` when it cannot be planned. */

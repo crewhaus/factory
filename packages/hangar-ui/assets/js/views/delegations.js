@@ -42,6 +42,7 @@ export const DELEGATIONS_COPY = Object.freeze({
   requests: "Asked for by a maintainer",
   reviewRequest: "Review request",
   requestGone: "This request is no longer waiting.",
+  askedDays: (days) => `Asked for ${days} ${days === 1 ? "day" : "days"}.`,
 });
 
 const MONTHS = Object.freeze([
@@ -275,6 +276,15 @@ function twin(command) {
   ]);
 }
 
+/**
+ * The terms a page sends: only what the page edits, the length chosen here. Every term
+ * the screen does not edit is kept by the server from the rule or the request it stores,
+ * so nothing read from a served view is ever written back.
+ */
+export function termsBody(days) {
+  return days !== undefined ? { days } : {};
+}
+
 function errorLine(error) {
   announce(`Not done: ${String(error?.message ?? "Something went wrong.")}`);
   return el("p", { class: "muted" }, [
@@ -471,9 +481,22 @@ async function drawPage(root, ctx, route) {
       ? list.body.proposals.find((p) => p.id === route.proposal)
       : undefined;
   let days = request !== undefined && Number.isInteger(request.days) ? request.days : undefined;
+  // A request is answered as it was asked: the server draws its page from the terms it
+  // stores, and the page sends none of its own.
+  const answering = route.proposal !== undefined;
+  /** The terms this page sends: none when it resumes or answers a request, or when nothing is chosen. */
+  const termsOf = () => {
+    if (route.mode === "resume" || answering) return {};
+    const terms = termsBody(days);
+    return Object.keys(terms).length > 0 ? { terms } : {};
+  };
   const previewBody = () => ({
-    ...(route.page === "rule" ? { action, rule: route.rule, mode: route.mode } : { action }),
-    ...(days !== undefined && route.mode !== "resume" ? { terms: { days } } : {}),
+    ...(route.page === "rule"
+      ? { action, rule: route.rule, mode: route.mode }
+      : answering
+        ? { action, proposal: route.proposal }
+        : { action }),
+    ...termsOf(),
   });
   let answer =
     action === undefined
@@ -521,7 +544,9 @@ async function drawPage(root, ctx, route) {
     }
     if (model.note !== null) root.appendChild(el("p", { class: "muted", text: model.note }));
     const status = el("p", { class: "muted", role: "status", "aria-live": "polite" });
-    if (route.mode !== "resume" && (model.canConfirm || model.canAsk)) {
+    if (answering && days !== undefined) {
+      root.appendChild(el("p", { class: "muted", text: DELEGATIONS_COPY.askedDays(days) }));
+    } else if (route.mode !== "resume" && !answering && (model.canConfirm || model.canAsk)) {
       const length = el("input", {
         id: "delegation-days",
         class: "input",
@@ -570,7 +595,7 @@ async function drawPage(root, ctx, route) {
       });
       turnOn.addEventListener("click", async () => {
         turnOn.disabled = true;
-        const terms = days !== undefined && route.mode !== "resume" ? { terms: { days } } : {};
+        const terms = termsOf();
         const bodyFor = (bound) =>
           route.page === "new"
             ? {
@@ -629,7 +654,7 @@ async function drawPage(root, ctx, route) {
         ]),
       );
       if (keepFocus) field.focus();
-    } else if (model.canAsk) {
+    } else if (model.canAsk && !answering) {
       const askButton = el("button", {
         class: "btn btn-primary",
         type: "button",
@@ -638,7 +663,7 @@ async function drawPage(root, ctx, route) {
       askButton.addEventListener("click", async () => {
         askButton.disabled = true;
         const done = await proposeAction.run({
-          body: { action, ...(days !== undefined ? { terms: { days } } : {}) },
+          body: { action, ...termsOf() },
         });
         askButton.disabled = false;
         status.textContent = done.ok

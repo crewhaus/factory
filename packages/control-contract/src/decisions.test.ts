@@ -913,6 +913,25 @@ describe("verifyDecision, a delegated grant", () => {
     }
   });
 
+  test("a delegated grant is checked against the rule revision it was made under", () => {
+    const unbound = { ...LIVE, ruleState: { state: "active" } } as unknown as NonNullable<
+      VerifyDecisionInput["delegation"]
+    >;
+    expect(delegated({}, unbound)).toEqual({
+      ok: false,
+      reason: "decider-not-authorized",
+      supersede: false,
+      detail: "no rule revision was given",
+    });
+    expect(delegated({}, { ...LIVE, ruleState: { state: "active", revision: 2 } })).toEqual({
+      ok: true,
+    });
+    expect(delegated({}, { ...LIVE, ruleState: { state: "active", revision: 1 } })).toMatchObject({
+      ok: false,
+      reason: "revision-changed",
+    });
+  });
+
   test("a moved subject or a newer rule revision is revision-changed", () => {
     expect(delegated({}, { ...LIVE, subjectRevision: "sha256:bb" })).toEqual(
       refused("revision-changed"),

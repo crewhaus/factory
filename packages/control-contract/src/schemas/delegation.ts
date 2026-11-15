@@ -97,6 +97,8 @@ export const delegationList = z
           id: decisionId,
           action,
           days: count,
+          maxUses: z.number().int().positive().optional(),
+          scope: z.record(scopeValue).optional(),
           createdAt: timestamp,
           expiresAt: timestamp,
           verb: z.string(),
@@ -179,6 +181,7 @@ export const delegationPreviewRequest = z
     terms: termsRequest.optional(),
     rule: ruleId.optional(),
     mode: z.enum(["change", "resume"]).optional(),
+    proposal: decisionId.optional(),
   })
   .strict();
 
