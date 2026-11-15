@@ -33,7 +33,9 @@
  *      being pinned. A record that names no `specHash` counts for nothing, and the
  *      refusal prints the value to record.
  *   2. A green PR check: an injected `PrCheckReader` resolves the merge/CI
- *      state of the proposal PR for this change. A `success` conclusion
+ *      state of the proposal PR for this change, given the candidate's
+ *      `specHash` so it counts only a PR that names that exact revision. A
+ *      `success` conclusion
  *      counts as one collective approval witness (a reviewed+green PR is the
  *      team's sign-off) — enough on its own only when `minApprovals <= 1`,
  *      otherwise it ADDS to the recorded-approval count.
@@ -192,12 +194,14 @@ export type PrCheckState = {
   readonly url?: string;
 };
 
-/** Reader seam: resolve the PR-check state for a (spec, env, version) change.
- *  Production drives `gh`; tests inject a fixed state. */
+/** Reader seam: resolve the PR-check state for a (spec, env, version) change whose
+ *  candidate spec text has the revision `specHash` (`specRevision`). Production drives
+ *  `gh`; tests inject a fixed state. */
 export type PrCheckReader = (args: {
   readonly specName: string;
   readonly env: string;
   readonly version: string;
+  readonly specHash: string;
 }) => Promise<PrCheckState>;
 
 /** One entry in a GitHub PR's `statusCheckRollup` — a StatusContext carries a
@@ -408,8 +412,9 @@ export type ProtectedEnvGateRequest = {
   readonly specHash: string | (() => Promise<string>);
   /** The caller asked for the gate whatever the config says (`--require-approval`). */
   readonly requireApproval?: boolean;
-  /** Consulted only when the environment is protected. */
-  readonly prCheck?: () => PrCheckState | Promise<PrCheckState>;
+  /** Consulted only when the environment is protected, with the candidate's resolved
+   *  `specHash`. */
+  readonly prCheck?: (specHash: string) => PrCheckState | Promise<PrCheckState>;
 };
 
 export type ProtectedEnvGateAnswer =
@@ -438,7 +443,7 @@ export async function evaluateProtectedEnvGate(
   const approvals = readApprovals(request.harnessRoot, request.specName, request.toEnv);
   const specHash =
     typeof request.specHash === "string" ? request.specHash : await request.specHash();
-  const prCheck = request.prCheck !== undefined ? await request.prCheck() : undefined;
+  const prCheck = request.prCheck !== undefined ? await request.prCheck(specHash) : undefined;
   const input: ApprovalDecisionInput = {
     specName: request.specName,
     toEnv: request.toEnv,

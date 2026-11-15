@@ -747,20 +747,179 @@ evaluation:
     },
   });
 
-  test("on_fail only grows stricter: note, then retry or escalate, then halt", () => {
-    expect(keysOf(evalDoc({ on_fail: "halt" }), evalDoc({ on_fail: "note" }))).toEqual([
-      "evaluation.on_fail",
-    ]);
-    expect(keysOf(evalDoc({}), evalDoc({ on_fail: "note" }))).toEqual(["evaluation.on_fail"]);
-    expect(protectedBarChanges(evalDoc({ on_fail: "note" }), evalDoc({ on_fail: "halt" }))).toEqual(
-      [],
-    );
-    expect(
-      protectedBarChanges(evalDoc({ on_fail: "retry" }), evalDoc({ on_fail: "escalate" })),
-    ).toEqual([]);
-    expect(escalationFor(evalDoc({ on_fail: "halt" }), evalDoc({ on_fail: "note" }))).toEqual(
+  test("on_fail only tightens: note to retry, escalate or halt, retry or escalate to halt", () => {
+    // A cli spec without a model pool or cascade.
+    const cli = (extra: Record<string, unknown>) => ({
+      name: "t",
+      target: "cli",
+      agent: { model: "claude-sonnet-4-5", instructions: "help" },
+      ...evalDoc(extra),
+    });
+    const owners: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+      [{ on_fail: "retry" }, { on_fail: "escalate" }],
+      [{ on_fail: "escalate" }, { on_fail: "retry" }],
+      [{}, { on_fail: "escalate" }],
+      [{ on_fail: "escalate" }, {}],
+      [{ on_fail: "halt" }, { on_fail: "note" }],
+      [{}, { on_fail: "note" }],
+      [{ on_fail: "halt" }, { on_fail: "escalate" }],
+    ];
+    for (const [was, now] of owners) {
+      expect(keysOf(cli(was), cli(now))).toEqual(["evaluation.on_fail"]);
+    }
+    const tighter: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+      [{ on_fail: "note" }, { on_fail: "escalate" }],
+      [{ on_fail: "note" }, { on_fail: "retry" }],
+      [{ on_fail: "note" }, { on_fail: "halt" }],
+      [{ on_fail: "retry" }, { on_fail: "halt" }],
+      [{}, { on_fail: "halt" }],
+      [{ on_fail: "escalate" }, { on_fail: "halt" }],
+      [{ on_fail: "retry" }, {}],
+    ];
+    for (const [was, now] of tighter) {
+      expect(protectedBarChanges(cli(was), cli(now))).toEqual([]);
+    }
+    expect(escalationFor(cli({ on_fail: "retry" }), cli({ on_fail: "escalate" }))).toEqual(
       securityFor(["evaluation.on_fail"]),
     );
+    expect(escalationFor(cli({ on_fail: "halt" }), cli({ on_fail: "note" }))).toEqual(
+      securityFor(["evaluation.on_fail"]),
+    );
+  });
+
+  test("a protected escalate's escalations only rise; absent reads 1, and none without a pool", () => {
+    const pooled = (
+      extra: Record<string, unknown>,
+      strategy: Record<string, unknown> | undefined,
+      pool = true,
+    ) => ({
+      name: "t",
+      target: "cli",
+      agent: {
+        model: "claude-sonnet-4-5",
+        instructions: "help",
+        ...(pool
+          ? {
+              model_pool: {
+                candidates: [{ model: "a" }, { model: "b" }],
+                ...(strategy !== undefined ? { strategy } : {}),
+              },
+            }
+          : {}),
+      },
+      ...evalDoc(extra),
+    });
+    const escalate = { on_fail: "escalate" };
+    const KEY = "agent.model_pool.strategy.max_escalations";
+    expect(
+      keysOf(pooled(escalate, { max_escalations: 1 }), pooled(escalate, { max_escalations: 0 })),
+    ).toEqual([KEY]);
+    expect(
+      protectedBarChange(
+        pooled(escalate, { max_escalations: 1 }),
+        pooled(escalate, { max_escalations: 0 }),
+      )?.reason,
+    ).toBe("the escalations a protected evaluation with on_fail: escalate makes only rise (1 → 0)");
+    // Absent reads 1; removing the strategy or the pool counts as the change.
+    expect(keysOf(pooled(escalate, undefined), pooled(escalate, { max_escalations: 0 }))).toEqual([
+      KEY,
+    ]);
+    expect(keysOf(pooled(escalate, { max_escalations: 3 }), pooled(escalate, undefined))).toEqual([
+      KEY,
+    ]);
+    expect(
+      keysOf(pooled(escalate, { max_escalations: 2 }), pooled(escalate, undefined, false)),
+    ).toEqual([KEY]);
+    // A move to escalate with no escalations left is caught too.
+    expect(
+      keysOf(
+        pooled({ on_fail: "note" }, { max_escalations: 1 }),
+        pooled(escalate, { max_escalations: 0 }),
+      ),
+    ).toEqual([KEY]);
+    // Raising them, or keeping them, tightens.
+    for (const [was, now] of [
+      [{ max_escalations: 1 }, { max_escalations: 2 }],
+      [undefined, { max_escalations: 1 }],
+      [{ max_escalations: 1 }, undefined],
+      [{ max_escalations: 0 }, { max_escalations: 0 }],
+    ] as const) {
+      expect(protectedBarChanges(pooled(escalate, was), pooled(escalate, now))).toEqual([]);
+    }
+    // Only a block that escalates after the change reads them.
+    expect(
+      protectedBarChanges(
+        pooled(escalate, { max_escalations: 1 }),
+        pooled({ on_fail: "halt" }, { max_escalations: 0 }),
+      ),
+    ).toEqual([]);
+    expect(
+      protectedBarChanges(
+        pooled({ on_fail: "retry" }, { max_escalations: 1 }),
+        pooled({ on_fail: "retry" }, { max_escalations: 0 }),
+      ),
+    ).toEqual([]);
+    // An evaluation block that is not protected stays tunable.
+    const open = (cap: number) => {
+      const doc = pooled(escalate, { max_escalations: cap });
+      return { ...doc, evaluation: { ...doc.evaluation, protected: false } };
+    };
+    expect(protectedBarChanges(open(1), open(0))).toEqual([]);
+    // A protected provability block that escalates reads them the same way.
+    const proven = (cap: number) => ({
+      ...pooled({}, { max_escalations: cap }),
+      evaluation: undefined,
+      provability: { level: "cited", on_fail: "escalate", protected: true },
+    });
+    expect(protectedBarChange(proven(1), proven(0))).toEqual({
+      key: KEY,
+      reason:
+        "the escalations a protected provability with on_fail: escalate makes only rise (1 → 0)",
+    });
+    expect(
+      escalationFor(
+        pooled(escalate, { max_escalations: 1 }),
+        pooled(escalate, { max_escalations: 0 }),
+      ),
+    ).toEqual(securityFor([KEY]));
+    // validatePatch, the optimizer's boundary, refuses the same patch.
+    const spec = parseSpec(`name: t
+target: cli
+agent:
+  model: claude-sonnet-4-5
+  instructions: help
+  model_pool:
+    candidates:
+      - model: claude-haiku-4-5
+      - model: claude-sonnet-4-5
+    strategy:
+      max_escalations: 1
+evaluation:
+  grader:
+    type: llm_judge
+    criteria: be good
+  on_fail: escalate
+  protected: true
+`);
+    const patch = (value: number) => ({
+      target: "cli" as const,
+      path: ["agent", "model_pool", "strategy", "max_escalations"],
+      op: "replace" as const,
+      value,
+    });
+    expect(() => validatePatch(spec, patch(0))).toThrow(
+      /would loosen "agent\.model_pool\.strategy\.max_escalations"/,
+    );
+    expect(() => validatePatch(spec, patch(2))).not.toThrow();
+  });
+
+  test("on_fail values outside the ladder move only with the owner", () => {
+    expect(keysOf(evalDoc({ on_fail: "note" }), evalDoc({ on_fail: "constructor" }))).toEqual([
+      "evaluation.on_fail",
+    ]);
+    expect(keysOf(evalDoc({ on_fail: "toString" }), evalDoc({ on_fail: "halt" }))).toEqual([
+      "evaluation.on_fail",
+    ]);
   });
 
   test("max_retries only falls; absent reads 1", () => {
