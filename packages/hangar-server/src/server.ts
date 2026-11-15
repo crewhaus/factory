@@ -257,7 +257,7 @@ import {
   installStarter,
   suggestScanRoots,
 } from "./onboarding";
-import { readPluginGrants, servedPlugins, standingFrom } from "./plugin-grants";
+import { readPluginGrants, servedPlugins, standingFrom, waitingOn } from "./plugin-grants";
 import {
   defaultPluginsDir,
   panesForHarness,
@@ -2637,6 +2637,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     if (head === "panes" && tail.length === 0 && method === "GET") {
       liveDirOr404(entry);
       const { inventory, served } = pluginsNow();
+      // The plugins that would add a tab or an observer here once the owner allows it on
+      // this harness. Only a caller who can read Settings › Plugins learns their names;
+      // every caller gets the count, so the tab strip can say why it is empty.
+      const waiting = waitingOn(inventory, served, { id: entry.id, dir: entry.dir });
       return jsonMasked({
         id: entry.id,
         // Both extension points serve only what the plugin's owner granted on
@@ -2648,10 +2652,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           sandbox: row.sandbox,
         })),
         traceObservers: traceObservers(served, entry.id),
-        // Installed plugins that wait for the owner's OK, so the tab strip can say why it is empty.
-        waiting: inventory.plugins
-          .filter((p) => p.problems.length === 0 && p.grant.state === "waiting")
-          .map((p) => p.name),
+        waiting: requestAllows("home.read") ? waiting : [],
+        waitingCount: waiting.length,
         deferred: inventory.deferred,
       });
     }

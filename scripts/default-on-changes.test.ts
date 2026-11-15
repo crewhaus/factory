@@ -5794,3 +5794,25 @@ describe("the release notes name the tenant ids a managed daemon reserves", () =
     expect(bullet).toContain("any letter case");
   });
 });
+
+describe("the plugins a harness's Panes tab names as waiting", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("the panes route names waiting plugins only to a caller who can read Settings › Plugins", () => {
+    const source = readFileSync(join(ROOT, "packages/hangar-server/src/server.ts"), "utf8");
+    const start = source.indexOf('if (head === "panes" && tail.length === 0');
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf("throw new HttpError(404", start);
+    expect(end).toBeGreaterThan(-1);
+    const route = source.slice(start, end);
+    for (const needle of ["waitingOn(", 'requestAllows("home.read")', "waitingCount"]) {
+      const at = route.indexOf(needle);
+      expect(`${needle}: ${at > -1}`).toBe(`${needle}: true`);
+    }
+    const bullet = bulletFor("A harness's Panes tab lists only");
+    expect(bullet).not.toBe("");
+    expect(bullet).toContain("waitingCount");
+    expect(bullet).toContain("home.read");
+  });
+});

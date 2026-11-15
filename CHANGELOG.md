@@ -738,6 +738,13 @@ these on: they reach every harness that uses what each one names.
   daemon, so a deployment that issued tokens for a tenant named `home` issues
   them under another id.
 
+- **A harness's Panes tab lists only the plugins waiting to add a tab or
+  observer there.** `GET /api/h/:id/panes` lists in `waiting` an installed
+  plugin that declares a pane or a run observer, asks to see that harness, and
+  is not allowed there yet. Only a caller who can read Settings › Plugins
+  (`home.read`) gets the names; any other caller gets `waiting: []` and
+  `waitingCount`.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read

@@ -5,9 +5,14 @@
  * A plugin's manifest asks; you allow; Home serves only what you allowed. The
  * review lists what the plugin asks for, one group per kind, unticked unless
  * the plugin was installed before plugins asked (then it is prefilled with what
- * it could see, under its own heading). These choices limit what CrewHaus hands
- * the plugin, not what its own code can do: a bundle that loads it runs its code
- * with the bundle's authority, and the screen says so.
+ * it could see, under its own heading). These choices decide what Home hands the
+ * plugin. Host tools are set in a harness's crewhaus.yaml when "Use in this
+ * harness" writes its entry, and Remove access leaves that entry as it is: after a
+ * grant or a revoke, the result names each harness whose crewhaus.yaml still loads
+ * it beyond what is allowed. Only an edit there and a rebuild stop it: a built
+ * harness keeps the list it was compiled with until it is rebuilt and restarted. A
+ * bundle that loads it runs its code with the bundle's authority, and the screen
+ * says so.
  *
  * The review and its writes go through Home's versioned API (`plugins.review`,
  * `plugins.grant`, `plugins.revoke`). After a write, the review and the card's
@@ -65,18 +70,38 @@ export function servesThisHarness(review, harnessId) {
 const STALE_NOTICE =
   "This plugin's access changed since you opened it. Your choices are kept; check them and allow again.";
 
-const LIMIT_SENTENCE =
-  "These choices limit what CrewHaus hands this plugin. They do not limit what its own code can do: a harness that loads it runs its code with the harness's own access.";
+export const LIMIT_SENTENCE =
+  "These choices decide what Home gives this plugin: tabs, run activity, reads and websites. Host tools are set in a harness's crewhaus.yaml when you choose Use in this harness, and Remove access does not change a harness that already loads it. A harness that loads it runs its code with that harness's own access.";
 
 const GROUPS = Object.freeze([
   { field: "panes", legend: "Tabs it may add" },
   { field: "events", legend: "Run activity it may receive" },
   { field: "reads", legend: "What it may read" },
   { field: "net", legend: "Websites its tabs may reach" },
-  { field: "tools", legend: "Host tools its tools may use" },
+  { field: "tools", legend: "Host tools it may be given in a harness" },
 ]);
 
 const asList = (value) => (Array.isArray(value) ? value.map(String) : []);
+
+/**
+ * One sentence per harness that still loads the plugin (`stillLoadedBy` on a grant
+ * or revoke answer), naming it by its spec name from `harnesses`, else its id.
+ * `tools: null` means its crewhaus.yaml could not be read.
+ */
+export function stillLoadedLines(list, harnesses) {
+  if (!Array.isArray(list)) return [];
+  const names = new Map(
+    (Array.isArray(harnesses) ? harnesses : []).map((h) => [String(h?.id), h?.specName]),
+  );
+  return list.map((item) => {
+    const id = String(item?.id ?? "");
+    const name = String(names.get(id) ?? id);
+    if (!Array.isArray(item?.tools)) return `${name}: its crewhaus.yaml could not be read`;
+    return item.tools.length === 0
+      ? `${name}: no host tools`
+      : `${name}: host tools ${item.tools.map(String).join(", ")}`;
+  });
+}
 
 /** The ticks a review starts with: what is granted, or what it could see before (legacy). */
 export function initialTicks(review) {
@@ -218,7 +243,7 @@ async function openReview(host, name, harnesses, opts = {}) {
     return;
   }
   if (card?.badgeSlot) clear(card.badgeSlot).appendChild(stateBadge(res.body?.state));
-  const outcome = result ? resultBlock(result.res, result.title) : null;
+  const outcome = result ? resultBlock(result.res, result.title, harnesses) : null;
   if (outcome) host.appendChild(outcome.node);
   const form = reviewForm(host, name, res.body, harnesses, keep ?? initialTicks(res.body), {
     card,
@@ -370,8 +395,12 @@ function reviewForm(host, name, review, harnesses, ticks, opts = {}) {
   return form;
 }
 
-/** A write's outcome: a heading that takes focus, and what happened. */
-function resultBlock(res, title) {
+/**
+ * A write's outcome: a heading that takes focus, and what happened. After a grant
+ * or a revoke, it also lists each harness whose crewhaus.yaml still loads the plugin
+ * beyond what is allowed, and how to stop it there.
+ */
+function resultBlock(res, title, harnesses = []) {
   const heading = el("h4", { tabindex: "-1", text: title });
   const node = el("div", { class: "plugin-result" }, [
     heading,
@@ -382,6 +411,26 @@ function resultBlock(res, title) {
         : (res.error?.message ?? "Home did not take it."),
     }),
   ]);
+  const lines = res.ok ? stillLoadedLines(res.body?.stillLoadedBy, harnesses) : [];
+  if (lines.length > 0) {
+    node.appendChild(
+      el("p", {
+        text: "These harnesses still load it, because their crewhaus.yaml lists it:",
+      }),
+    );
+    node.appendChild(
+      el(
+        "ul",
+        null,
+        lines.map((line) => el("li", { text: line })),
+      ),
+    );
+    node.appendChild(
+      el("p", {
+        text: "Remove it from plugins: in each crewhaus.yaml, then rebuild and restart that harness.",
+      }),
+    );
+  }
   return { node, focus: () => heading.focus() };
 }
 

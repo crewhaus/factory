@@ -46,6 +46,31 @@ export function paneSandbox(doc) {
 }
 
 /**
+ * What the empty tab strip says about plugins waiting for the owner's OK here, or
+ * `null` when none waits. Names come only to a caller who can read Settings ›
+ * Plugins, and only that caller gets the Review link; anyone else gets a count.
+ */
+export function waitingNotice(payload) {
+  const names = Array.isArray(payload?.waiting) ? payload.waiting.map(String) : [];
+  const count = typeof payload?.waitingCount === "number" ? payload.waitingCount : names.length;
+  if (names.length > 0) {
+    return {
+      title: "Waiting for your OK",
+      text: `${names.join(", ")} asks to add panels here.`,
+      review: true,
+    };
+  }
+  if (count > 0) {
+    return {
+      title: "Waiting for the owner's OK",
+      text: "A plugin asks to add panels here. The owner can allow it in Settings › Plugins.",
+      review: false,
+    };
+  }
+  return null;
+}
+
+/**
  * `flash` ({plugin, text}), after "Use in this harness" wrote the spec: the
  * re-rendered page shows that line in the plugin's card and moves focus to it,
  * since the button that opened the dialog is gone.
@@ -88,17 +113,19 @@ export async function renderPanes(root, ctx, flash) {
     ]),
   );
 
-  const waiting = Array.isArray(payload?.waiting) ? payload.waiting : [];
-  if (panes.length === 0 && waiting.length > 0) {
+  const notice = waitingNotice(payload);
+  if (panes.length === 0 && notice !== null) {
     root.appendChild(
       el("div", { class: "empty" }, [
-        el("div", { class: "empty-msg", text: "Waiting for your OK" }),
-        el("p", { class: "muted", text: `${waiting.join(", ")} asks to add panels here.` }),
-        el("a", {
-          class: "btn btn-primary",
-          href: hrefFleet("settings", "plugins"),
-          text: "Review",
-        }),
+        el("div", { class: "empty-msg", text: notice.title }),
+        el("p", { class: "muted", text: notice.text }),
+        notice.review
+          ? el("a", {
+              class: "btn btn-primary",
+              href: hrefFleet("settings", "plugins"),
+              text: "Review",
+            })
+          : null,
       ]),
     );
   } else if (panes.length === 0) {
