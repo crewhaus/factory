@@ -82,10 +82,8 @@ const create: V1Handler = async (ctx) => {
   const from = ctx.body["derivedFrom"];
   const record =
     typeof from === "string" ? foldApprovals(dir).approvals.find((a) => a.id === from) : undefined;
-  // The decision is read where `foldApprovals` read it, and asked again under the rule lock.
-  const root = resolveSessionRoot(dir).root;
-  if (record === undefined || approvalStillStands(root, record.id) !== undefined) {
-    throw new V1Error({
+  const notStanding = () =>
+    new V1Error({
       status: 422,
       code: "invalid",
       reason: "derived_from",
@@ -93,7 +91,7 @@ const create: V1Handler = async (ctx) => {
         "A standing rule is made from a granted decision that still stands: name it in derivedFrom.",
       verb: "crewhaus approvals grant <id> --always",
     });
-  }
+  if (record === undefined) throw notStanding();
   const tool = String(ctx.body["tool"]);
   const pattern = String(ctx.body["pattern"]);
   if (tool !== record.toolName) {
@@ -116,6 +114,9 @@ const create: V1Handler = async (ctx) => {
           : "No standing rule can name this call.",
     });
   }
+  // The decision is read where `foldApprovals` read it, and asked again under the rule lock.
+  const root = resolveSessionRoot(dir).root;
+  if (approvalStillStands(root, record.id) !== undefined) throw notStanding();
   if ("pattern" in narrow && narrow.pattern !== pattern) {
     const problem = widenedPatternProblem(record.toolName, record.input, pattern, dir);
     if (problem !== undefined) {
