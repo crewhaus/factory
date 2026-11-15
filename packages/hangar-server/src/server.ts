@@ -74,16 +74,16 @@ import {
   noAuthRefusal,
   openDeviceRequests,
   openSignIn,
-  queuedActorHolds,
   readOwnerSettings,
 } from "@crewhaus/access-control";
-import { DEPLOYMENT_ID_RE, PROTOCOL_ID, parseRef } from "@crewhaus/control-contract";
+import { DEPLOYMENT_ID_RE, PROTOCOL_ID } from "@crewhaus/control-contract";
 import {
   AREA_RUNTIMES,
   type RecoverCounts,
   activateDeployment,
   activationGates,
   currentLocalIdentity,
+  homeAuthorizeActor,
   isServiceActor,
   wireControl,
   withOwnStartTime,
@@ -283,11 +283,11 @@ import {
   restartAfterReboot,
   writeRecoveryReport,
 } from "./reboot-recovery";
-import { commandFields, createReceipts, currentCommand } from "./receipts";
+import { commandFields, createReceipts, currentCommand, noteNeed } from "./receipts";
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
 import { type RequestMatch, matchRequest } from "./route-match";
-import type { RouteRow } from "./route-table";
+import { type RouteRow, legacyKindPermission } from "./route-table";
 import {
   isLiveFeedState,
   isSupervisorRunId,
@@ -694,34 +694,14 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       // A command dispatched from its receipt, when it is submitted or recovered, runs only
       // while the credential that submitted it, or for a receipt without one its actor, may
       // still do it.
-      authorizeActor: (actor, permission, target, credentialRef) => {
-        const read = loadAccessSnapshot(hangarRoot);
-        if (read.state !== "present") return undefined;
-        const parsed = parseRef(target);
-        const harness =
-          "error" in parsed
-            ? undefined
-            : parsed.kind === "harness"
-              ? parsed.id
-              : parsed.scope !== "home"
-                ? parsed.scope
-                : undefined;
-        const at =
-          harness === undefined
-            ? ({ scope: "home" } as const)
-            : {
-                scope: "harness" as const,
-                harness,
-                groups: registry.get(harness)?.groups ?? [],
-              };
-        return queuedActorHolds(
-          read.snapshot,
-          credentialRef !== undefined ? { actor, credentialRef } : { actor },
-          permission,
-          at,
-          { now: now(), domains: homeAccess.domains },
-        );
-      },
+      authorizeActor: homeAuthorizeActor({
+        hangarRoot,
+        groupsOf: (hrn) => registry.get(hrn)?.groups ?? [],
+        now,
+        domains: homeAccess.domains,
+      }),
+      // A job's command is checked against its route's permission before the job starts.
+      permissionOf: legacyKindPermission,
     },
     { mode: homeMode === "resident" ? "resident" : "server" },
   );
@@ -830,6 +810,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       hangarRoot,
       managerVersion: version,
       wrapJobStore: controlService.jobs.wrapStore,
+      wrapJobRun: controlService.jobs.wrapRun,
       ...(opts.homeCrewhaus !== undefined ? { homeCrewhaus: opts.homeCrewhaus } : {}),
     });
   const control: ControlClient = opts.controlClient ?? createControlClient();
@@ -2399,6 +2380,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         // Each kind needs the permission its own route needs.
         const needed = JOB_KIND_PERMISSIONS[kind] ?? "h.job.run";
         if (!requestAllows(needed, entry.id)) throw forbiddenOn(needed, entry.id);
+        // The job starts only while its kind's permission still holds.
+        noteNeed(needed);
         let argv: string[];
         try {
           argv = jobArgv(

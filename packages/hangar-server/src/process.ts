@@ -161,6 +161,9 @@ export type ProcessLayerOptions = {
   readonly wrapJobStore?: (store: JobStore) => JobStore;
   /** Job executor. Defaults to spawning the `crewhaus` CLI through `ops`. */
   readonly runJob?: JobRunner;
+  /** Wraps the job executor (the given one or the default), so a job that carries a command
+   *  starts only while that command may still run. */
+  readonly wrapJobRun?: (run: JobRunner) => JobRunner;
   readonly jobConcurrency?: number;
   /** Skip the preflight gate entirely (tests, and `daemon start
    *  --no-preflight`). */
@@ -490,13 +493,12 @@ export function createProcessLayer(options: ProcessLayerOptions): ProcessLayer {
   const handles = new Map<string, HarnessProcess>();
 
   const store = options.jobStore ?? createFileJobStore(`${options.hangarRoot}/jobs.jsonl`);
+  const run =
+    options.runJob ??
+    defaultJobRunner(ops, (dir) => jobCrewhausBin(options.registry, dir, {}, options.homeCrewhaus));
   const queue = createJobQueue({
     store: options.wrapJobStore !== undefined ? options.wrapJobStore(store) : store,
-    run:
-      options.runJob ??
-      defaultJobRunner(ops, (dir) =>
-        jobCrewhausBin(options.registry, dir, {}, options.homeCrewhaus),
-      ),
+    run: options.wrapJobRun !== undefined ? options.wrapJobRun(run) : run,
     now: options.now,
     ...(options.jobConcurrency !== undefined ? { concurrency: options.jobConcurrency } : {}),
   });

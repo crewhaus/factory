@@ -23,6 +23,7 @@ import {
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { ensureAccessSetUp, localActorOf, openAccess } from "@crewhaus/access-control";
 import {
   append,
   casAppend,
@@ -1360,6 +1361,93 @@ describe("crewhaus daemon writes a receipt for every change", () => {
     } finally {
       f.cleanup();
       other.cleanup();
+    }
+  });
+});
+
+describe("a command the CLI recovers runs only while its actor may still do it", () => {
+  const IDENTITY = { username: "riley", hostname: "workbench" } as const;
+
+  /** Access records under the fixture's Home: the CLI's user owns it, and a member operates it. */
+  async function withAccess(f: Fixture) {
+    const hangarRoot = join(dirname(f.dir), "registry", "hangar");
+    const setUp = await ensureAccessSetUp(hangarRoot, { localActor: localActorOf(IDENTITY) });
+    if (!setUp.ok) throw new Error(setUp.reason);
+    const owner = setUp.result.owner;
+    const granted = await openAccess(hangarRoot).grant(
+      { principal: owner },
+      { member: "Morgan", create: true, role: "operator", scope: "home" },
+    );
+    if (!granted.ok) throw new Error(granted.reason);
+    return { hangarRoot, owner, member: granted.result.principal, grant: granted.result.grant.id };
+  }
+
+  /** An accepted stop from a process that died before it ran it, by `actor`. */
+  function plantStopBy(dir: string, id: string, actor: string): void {
+    const answer = append(commandsLedgerOf(dir), {
+      id,
+      v: 1,
+      kind: "controls.stop",
+      target: "home/harness/hrn_0123456789abcdef",
+      actor,
+      via: "home",
+      fingerprint: "f".repeat(64),
+      state: "accepted",
+      acceptedAt: new Date(Date.now() - 1000).toISOString(),
+      executor: {
+        pid: 999,
+        startedAt: new Date(Date.now() - 2000).toISOString(),
+        host: hostname(),
+        head: "server",
+      },
+      effects: [],
+      retry: { retryable: true, safety: "idempotent" },
+    });
+    if (!answer.ok) throw new Error(answer.reason);
+  }
+
+  const rowsFor = (dir: string, id: string) => {
+    const fold = foldStates(commandsLedgerOf(dir));
+    if (!fold.ok) throw new Error(fold.reason);
+    const object = fold.objects.get(id);
+    return {
+      state: object?.state,
+      outcome: (object?.record["outcome"] as { code?: string } | undefined)?.code,
+      startedAt: object?.record["startedAt"],
+    };
+  };
+
+  test("a member's stop whose grant was revoked is rejected, unrun; the owner's runs", async () => {
+    const revokedCase = fixture();
+    const ownerCase = fixture();
+    try {
+      const a = await withAccess(revokedCase);
+      const revoked = await openAccess(a.hangarRoot).revoke({ principal: a.owner }, a.grant);
+      if (!revoked.ok) throw new Error(revoked.reason);
+      plantStopBy(revokedCase.dir, "cmd_01m76e6f05hp514w9j4v3qymkm", a.member);
+      await runDaemonCommand(["stop"], { ...revokedCase.opts, identity: IDENTITY });
+      expect(rowsFor(revokedCase.dir, "cmd_01m76e6f05hp514w9j4v3qymkm")).toEqual({
+        state: "rejected",
+        outcome: "forbidden",
+        startedAt: undefined,
+      });
+      const ledger = readFileSync(
+        join(revokedCase.dir, ".crewhaus", "run", "control", "commands", "000001.jsonl"),
+        "utf8",
+      );
+      const running = ledger
+        .split("\n")
+        .filter((line) => line.includes("cmd_01m76e6f05hp514w9j4v3qymkm"))
+        .filter((line) => (JSON.parse(line) as { state?: string }).state === "running");
+      expect(running).toEqual([]);
+
+      const b = await withAccess(ownerCase);
+      plantStopBy(ownerCase.dir, "cmd_01m76e6f05hp514w9j4v3qymkn", b.owner);
+      await runDaemonCommand(["stop"], { ...ownerCase.opts, identity: IDENTITY });
+      expect(rowsFor(ownerCase.dir, "cmd_01m76e6f05hp514w9j4v3qymkn").state).toBe("succeeded");
+    } finally {
+      revokedCase.cleanup();
+      ownerCase.cleanup();
     }
   });
 });

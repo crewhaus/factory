@@ -31,8 +31,11 @@ export type ControlCore = {
   readonly warn: (message: string) => void;
   /** Whether this head checks a receipt's actor again before it runs (Home does). */
   readonly checksActors: boolean;
-  /** Whether a receipt's actor has lost the authority to do what it asked: checked before it runs. */
-  actorRefused(receipt: CommandReceipt): boolean;
+  /**
+   * Whether a receipt's actor has lost the authority to do what it asked: checked before it
+   * runs. `needed` asks about that permission in place of the kind's.
+   */
+  actorRefused(receipt: CommandReceipt, needed?: string): boolean;
   /** This process, as a receipt's executor. Stamped once. */
   selfExecutor(): ExecutorStamp;
 };

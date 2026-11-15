@@ -53,6 +53,7 @@ import {
   type Vault,
   openVault,
 } from "@crewhaus/people/vault";
+import { cliAuthorizeActor } from "./control-authority";
 import { resolveHangarRoot } from "./hangar-cmd";
 import type { CliFamily } from "./verbs";
 
@@ -408,6 +409,11 @@ function receiptsFor(session: Session): ReceiptsPort {
         probe: withOwnStartTime(createProcessOps()),
         supervisorFor: () => undefined,
         drainRequest: () => async () => undefined,
+        authorizeActor: cliAuthorizeActor({
+          hangarRoot: session.hangarRoot,
+          env: session.env,
+          now: session.now,
+        }),
       },
       { mode: "direct" },
     );

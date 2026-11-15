@@ -9,10 +9,17 @@ The design is in [module brief 325](https://github.com/crewhaus/docs/blob/main/m
 This package never enters a compiled harness and never imports `@crewhaus/hangar-server`.
 
 ```ts
-import { currentLocalIdentity, wireControl } from "@crewhaus/control-service";
+import { currentLocalIdentity, homeAuthorizeActor, wireControl } from "@crewhaus/control-service";
 
 const control = wireControl(
-  { hangarRoot, supervisorFor, drainRequest, identity: currentLocalIdentity(), probe: ops },
+  {
+    hangarRoot,
+    supervisorFor,
+    drainRequest,
+    identity: currentLocalIdentity(),
+    probe: ops,
+    authorizeActor: homeAuthorizeActor({ hangarRoot, groupsOf, now: Date.now }),
+  },
   { mode: "direct" },
 );
 await control.commands.recover({ harness: dir });
@@ -31,6 +38,12 @@ const answer = await control.commands.submit(
 
 A mode changes where calls land, never what a call does: `crewhaus daemon stop` and Home's Stop write
 the same receipt to the same ledger.
+
+Every head passes `homeAuthorizeActor({hangarRoot, groupsOf, now, domains?})` as `authorizeActor`: a
+command dispatched from its receipt, when it is submitted, recovered or started as a job, runs only
+while its actor still holds the permission over a fresh read of the access records, through exactly
+the live credential its receipt names when it names one. A receipt names a credential only together
+with its own principal. A head without domain checkers refuses a domain permission.
 
 ## Receipts
 
@@ -157,7 +170,14 @@ and `settingsWriteClass` says which class a settings change needs.
 `jobs.wrapStore(store)` wraps the job queue's store, so a command carried out by a queued job moves
 with it: running, done, failed, cancelled (a running command that is cancelled is `failed`, outcome
 `cancelled`), and interrupted (`unknown`; a read-only job's is `failed`). A job row carries the
-command's id and who queued it (`commandId`, `by`).
+command's id, who queued it and the permissions its submit needed (`commandId`, `by`, `needs`).
+
+`jobs.wrapRun(run)` wraps the queue's runner, so a job that carries a command starts only while its
+submitter may still do it, also when the queue's restore puts it back after a restart: its kind's
+permission and every permission in its `needs` must still hold, whatever state its receipt is in. A
+refused job never calls the runner: it ends `cancelled`, and a receipt that has not settled moves
+`accepted → rejected`, outcome `forbidden`. A legacy route's kind is checked against its route's
+permission (`permissionOf`).
 
 ## Runs
 

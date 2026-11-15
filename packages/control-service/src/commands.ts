@@ -370,10 +370,10 @@ export function createCommands(core: ControlCore): CommandsInternals {
       if (!isId("crd", request.credentialRef)) {
         return { ok: false, refusal: refuse("invalid", "the command's credential is not one") };
       }
-      if (request.actor === undefined) {
+      if (request.actor === undefined || !isId("prn", request.actor)) {
         return {
           ok: false,
-          refusal: refuse("invalid", "a command's credential is given with its actor"),
+          refusal: refuse("invalid", "a command's credential is given with its principal"),
         };
       }
     }

@@ -115,6 +115,7 @@ import {
 } from "@crewhaus/harness-supervisor";
 import { encodeQr, renderQrLines, renderedWidth } from "@crewhaus/qr-code";
 import { inviteAsLocalUser } from "./access-cmd";
+import { cliAuthorizeActor } from "./control-authority";
 import { dotenvRootRefusal } from "./hangar-env";
 import { rotateTokenVerb } from "./hangar-rotate";
 import {
@@ -1356,6 +1357,11 @@ function serviceDepsOf(opts: HangarCommandOptions, hangarRoot: string): ServiceD
             probe: withOwnStartTime(createProcessOps()),
             supervisorFor: () => undefined,
             drainRequest: () => async () => undefined,
+            authorizeActor: cliAuthorizeActor({
+              hangarRoot,
+              env,
+              ...(opts.now !== undefined ? { now: opts.now } : {}),
+            }),
           },
           { mode: "direct" },
         );

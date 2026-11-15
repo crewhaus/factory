@@ -160,6 +160,7 @@ export {
   idempotencyClaim,
 } from "./idempotency";
 export type { JobAdapter } from "./jobs";
+export { type HomeAuthorizeOptions, homeAuthorizeActor } from "./queued-authority";
 export {
   type LedgerChoice,
   WORKSPACE_DIGEST_KEY_FILE,

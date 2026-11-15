@@ -22,6 +22,7 @@ import {
   type RouteRow,
   badScopedRows,
   domainRowsWithoutRef,
+  legacyKindPermission,
   matchRoute,
 } from "./route-table";
 import { V1_ROWS } from "./v1/match";
@@ -349,5 +350,36 @@ describe("joining from an invite is on record", () => {
       expect(row?.receipt).toBe("none");
       expect(row?.path.startsWith("/api/v1/auth/")).toBe(true);
     }
+  });
+});
+
+describe("a legacy route's receipt kind needs its route's permission", () => {
+  test("every job row's kind answers the row's permission", () => {
+    const jobRows = ROUTE_TABLE.filter((row) => row.dispatch === "job");
+    expect(jobRows).toHaveLength(36);
+    for (const row of jobRows) {
+      expect(`${row.key} ${legacyKindPermission(row.kind as string)}`).toBe(
+        `${row.key} ${row.permission}`,
+      );
+    }
+    expect(legacyKindPermission("legacy.submitJob")).toBe("h.job.run");
+  });
+
+  test("a kind no route writes, and a core kind, answer nothing", () => {
+    expect(legacyKindPermission("legacy.hangarInstall")).toBeUndefined();
+    expect(legacyKindPermission("controls.stop")).toBeUndefined();
+    expect(legacyKindPermission("")).toBeUndefined();
+  });
+
+  test("no two rows give one legacy kind different permissions", () => {
+    const seen = new Map<string, string>();
+    for (const row of ROUTE_TABLE) {
+      if (row.kind === undefined || !row.kind.startsWith("legacy.")) continue;
+      expect(`${row.kind} ${seen.get(row.kind) ?? row.permission}`).toBe(
+        `${row.kind} ${row.permission}`,
+      );
+      seen.set(row.kind, row.permission);
+    }
+    expect(seen.size).toBeGreaterThan(36);
   });
 });
