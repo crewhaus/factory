@@ -374,7 +374,12 @@ export function supervisorFor(
         }
         const actor =
           read.state === "present"
-            ? await storedActorFor(resolveHangarRoot(env), currentLocalIdentity(), read.hmac)
+            ? await storedActorFor(
+                resolveHangarRoot(env),
+                harnessDir,
+                currentLocalIdentity(),
+                read.hmac,
+              )
             : "";
         return admitExplicitStart(harnessDir, target, {
           head,
@@ -393,7 +398,12 @@ export function supervisorFor(
           message: "the harness's digest key cannot be read; nothing was started",
         };
       }
-      const actor = await storedActorFor(resolveHangarRoot(env), currentLocalIdentity(), key.hmac);
+      const actor = await storedActorFor(
+        resolveHangarRoot(env),
+        harnessDir,
+        currentLocalIdentity(),
+        key.hmac,
+      );
       return admitExplicitStart(harnessDir, target, {
         head,
         entry,

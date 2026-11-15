@@ -566,7 +566,12 @@ async function harnessAdopt(
     throw new Error("harness adopt: the harness's digest key cannot be read; nothing was adopted");
   }
   const env = opts.env ?? process.env;
-  const by = await storedActorFor(resolveHangarRoot(env), currentLocalIdentity(), key0.hmac);
+  const by = await storedActorFor(
+    resolveHangarRoot(env),
+    entry.dir,
+    currentLocalIdentity(),
+    key0.hmac,
+  );
   const slugFlag = args.flags.get("slug");
   const adopted = reg.adopt(entry.id, by, typeof slugFlag === "string" ? { slug: slugFlag } : {});
   if (adopted === undefined) {

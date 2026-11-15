@@ -434,7 +434,7 @@ describe("narrowPatternFor", () => {
     expect(narrowPatternFor("Write", {}, [path("a(b)")])).toEqual({
       refused: "not-representable",
     });
-    // A control or bidirectional-text character: a pattern reads as it matches.
+    // A control, bidirectional-text or other invisible character: a pattern reads as it matches.
     for (const value of ["a\u001b[2Jb", "a\u0085b", "a\u202eb", "a\u2066b", "a\u007fb"]) {
       expect({ value, narrow: narrowPatternFor("Write", { path: value }, undefined) }).toEqual({
         value,
@@ -452,6 +452,23 @@ describe("narrowPatternFor", () => {
       expect(holdsDisplayControl(`a${char}b`)).toBe(true);
     }
     expect(holdsDisplayControl("a\u00a0b")).toBe(false);
+    // Invisible format characters, the line and paragraph separators and the tag block.
+    for (const value of [
+      "a\u200bb",
+      "a\u2028b",
+      "a\u2029b",
+      "a\u00adb",
+      "a\ufeffb",
+      "a\u{E0041}b",
+    ]) {
+      expect({ value, held: holdsDisplayControl(value) }).toEqual({ value, held: true });
+      expect({ value, narrow: narrowPatternFor("Write", {}, [path(value)]) }).toEqual({
+        value,
+        narrow: { refused: "not-representable" },
+      });
+    }
+    // A variation selector is not one: it stays allowed, as a no-break space does.
+    expect(holdsDisplayControl("a\ufe0fb")).toBe(false);
     expect(narrowPatternFor("Glob", {}, [path("src/*", { globPattern: true })])).toEqual({
       refused: "every-value",
     });

@@ -68,6 +68,12 @@ export type SubmitRequest = {
   /** The most specific ref the request names. Absent: the receipt itself, `home/cmd/<id>`. */
   readonly target?: string;
   readonly ledger: LedgerChoice;
+  /**
+   * The directory of the harness a request kept on Home's workspace ledger acts on, so the
+   * actor stored for it with no `actor` given is the one that harness's approver list
+   * allows. A request on a harness's own ledger acts on that harness.
+   */
+  readonly onHarness?: string;
   readonly via: ReceiptVia;
   /** What the request asks for: fingerprinted, never stored. */
   readonly body?: Readonly<Record<string, unknown>>;
@@ -207,6 +213,14 @@ function fingerprintInputOf(request: SubmitRequest): Parameters<typeof fingerpri
     ...(request.secretFields !== undefined ? { secretFields: request.secretFields } : {}),
     ...(request.authority !== undefined ? { authority: request.authority } : {}),
   };
+}
+
+/**
+ * The harness a request acts on, whose approver list decides which actor is stored for
+ * it: its ledger's harness, or the one a workspace-ledger request names in `onHarness`.
+ */
+function harnessOfLedger(request: SubmitRequest): string | undefined {
+  return request.ledger === "workspace" ? request.onHarness : request.ledger.harness;
 }
 
 /** The harness an idempotency key is scoped to: the target's, when it is a harness; else `home`. */
@@ -392,7 +406,9 @@ export function createCommands(core: ControlCore): CommandsInternals {
         refusal: refuse("unavailable", "the ledger's digest key cannot be read; nothing was done"),
       };
     }
-    const actor = request.actor ?? (await storedActorFor(core.hangarRoot, core.identity, key.hmac));
+    const actor =
+      request.actor ??
+      (await storedActorFor(core.hangarRoot, harnessOfLedger(request), core.identity, key.hmac));
     let fingerprint: string;
     try {
       fingerprint = await fingerprintOf(key.hmac, fingerprintInputOf(request));
@@ -521,7 +537,9 @@ export function createCommands(core: ControlCore): CommandsInternals {
     // No key yet: nothing was ever claimed in this ledger.
     const key = await readLedgerKey(request.ledger, core.hangarRoot);
     if (key.state !== "present") return undefined;
-    const actor = request.actor ?? (await storedActorFor(core.hangarRoot, core.identity, key.hmac));
+    const actor =
+      request.actor ??
+      (await storedActorFor(core.hangarRoot, harnessOfLedger(request), core.identity, key.hmac));
     const claim = idempotencyClaim(
       { actor, harness: harnessScopeOf(request.target), kind: request.kind },
       request.idempotency,

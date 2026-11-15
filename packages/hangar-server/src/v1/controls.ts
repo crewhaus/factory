@@ -151,6 +151,7 @@ const retire: V1Handler = async (ctx) => {
   const submitted = await submitCommand<RetireAnswer>(ctx, {
     target: `home/harness/${entry.id}`,
     ledger: "workspace",
+    onHarness: dir,
     effect: async (receipt) => {
       const steps = retireSteps({
         harnessDir: dir,

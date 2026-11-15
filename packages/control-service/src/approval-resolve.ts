@@ -190,6 +190,30 @@ const runRule = (
 ): Promise<RuleWriteAnswer> =>
   hooks?.ruleCommand !== undefined ? hooks.ruleCommand(run) : run(undefined);
 
+/** What a standing rule made from a decision that does not stand answers. */
+export const APPROVAL_GONE =
+  "the approval this rule comes from does not stand (withdrawn, ended or not granted), so no standing rule was made";
+
+/**
+ * Why tool approval `ref`, in the store at `rootDir`, does not stand as a grant a standing
+ * rule may be made from, or `undefined` when it does: the store reads, the record is in
+ * it, it was granted, and it was neither superseded nor ended. The store is read whole
+ * and never rewritten.
+ */
+export function approvalStillStands(rootDir: string, ref: string): string | undefined {
+  let folded: ReturnType<typeof foldReadOnly>;
+  try {
+    folded = foldReadOnly(rootDir);
+  } catch {
+    return APPROVAL_GONE;
+  }
+  if (folded.state === "unreadable") return APPROVAL_GONE;
+  const record = folded.records.find((r) => r.id === ref);
+  if (record === undefined || record.supersededBy !== undefined) return APPROVAL_GONE;
+  if (record.expiredAt !== undefined || record.decision !== "grant") return APPROVAL_GONE;
+  return undefined;
+}
+
 /**
  * Decide tool approval `request.ref` in the store at `request.rootDir`: the pattern a
  * standing rule would take is worked out first, the decision is made through the store's
@@ -305,6 +329,7 @@ export async function resolveToolApproval(
         pattern: made.pattern,
         reason: "approval",
         derivedFrom: request.ref,
+        derivesFrom: () => approvalStillStands(root, request.ref),
         createdBy: by,
         expiresAt,
         ...(cmd !== undefined ? { cmd } : {}),
