@@ -5,6 +5,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   type Dirent,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -12,16 +13,24 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { mintId } from "@crewhaus/control-contract";
-import { casAppend, delegationsLedger, foldStates } from "@crewhaus/control-records";
-import { workspaceCommandsLedger } from "@crewhaus/control-service";
+import {
+  append,
+  casAppend,
+  delegationsLedger,
+  foldStates,
+  readOperatorRecord,
+  writeHarnessIdentity,
+} from "@crewhaus/control-records";
+import { commandsLedgerOf, retireSteps, workspaceCommandsLedger } from "@crewhaus/control-service";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import type { ProcessOps, SpawnedProcess } from "@crewhaus/harness-supervisor";
-import { runDaemonCommand } from "./daemon-cmd";
+import { directControl, harnessIdOf, runDaemonCommand } from "./daemon-cmd";
 import { type HeavyRetireSteps, retireCommand } from "./retire-cmd";
 
 const roots: string[] = [];
@@ -96,7 +105,17 @@ function tree(dir: string): Map<string, string> {
   return out;
 }
 
-function setUp() {
+type StepAnswer = { step: string; ok: boolean; detail: string };
+
+function setUp(
+  over: {
+    /** Replaces the last step before the archive. */
+    readonly tombstoneRegistry?: (at: {
+      readonly root: string;
+      readonly dir: string;
+    }) => Promise<StepAnswer>;
+  } = {},
+) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "retire-cmd-")));
   roots.push(root);
   const dir = join(root, "harness");
@@ -129,21 +148,32 @@ function setUp() {
     complianceEvidence: ok("complianceEvidence"),
     auditVerify: ok("auditVerify"),
     pushKnowledge: ok("pushKnowledge"),
-    tombstoneRegistry: ok("tombstoneRegistry"),
+    tombstoneRegistry:
+      over.tombstoneRegistry !== undefined
+        ? async () => {
+            calls.push("tombstoneRegistry");
+            return (over.tombstoneRegistry as NonNullable<typeof over.tombstoneRegistry>)({
+              root,
+              dir,
+            });
+          }
+        : ok("tombstoneRegistry"),
   };
-  const retire = (over: { stop?: boolean; dryRun?: boolean } = {}) =>
+  const retire = (
+    run: { stop?: boolean; dryRun?: boolean; harnessDir?: string; cwd?: string } = {},
+  ) =>
     retireCommand({
-      harnessDir: dir,
+      harnessDir: run.harnessDir ?? dir,
       specName: "concierge",
       archiveDir: join(root, "archive"),
       pins: {},
       force: false,
       pushKnowledge: false,
-      stop: over.stop ?? false,
-      dryRun: over.dryRun ?? false,
+      stop: run.stop ?? false,
+      dryRun: run.dryRun ?? false,
       forceUnverified: false,
       heavy,
-      opts,
+      opts: run.cwd !== undefined ? { ...opts, cwd: run.cwd } : opts,
     });
   return { root, dir, hangarRoot, registryRoot, row, ops, opts, calls, retire };
 }
@@ -289,4 +319,185 @@ describe("crewhaus retire", () => {
     expect(again.lines.join("\n")).toContain("crewhaus daemon enable");
     expect(s.ops.children).toHaveLength(1);
   }, 20_000); // an adopted daemon's exit is noticed on the pump's real-time poll
+});
+
+/** The workspace ledger's receipts, as written. */
+function workspaceReceipts(hangarRoot: string): Record<string, unknown>[] {
+  const fold = foldStates(workspaceCommandsLedger(hangarRoot));
+  if (!fold.ok) throw new Error(fold.reason);
+  return [...fold.objects.values()].map((o) => o.record as Record<string, unknown>);
+}
+
+/** Home's lifecycle lines. */
+function lifecycleLines(hangarRoot: string): Record<string, unknown>[] {
+  return readFileSync(join(hangarRoot, "control", "lifecycle.jsonl"), "utf8")
+    .split("\n")
+    .filter((l) => l !== "")
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+describe("crewhaus retire is done only when every step after the archive did its part", () => {
+  test("a harness it cannot keep disabled where it lives is Not done, and the line names daemon disable", async () => {
+    // The last step before the archive leaves `.crewhaus` a link out of the harness, so
+    // the operator record can't be written where the harness lives.
+    const s = setUp({
+      tombstoneRegistry: async ({ root, dir }) => {
+        rmSync(join(dir, ".crewhaus"), { recursive: true, force: true });
+        symlinkSync(join(root, "absent"), join(dir, ".crewhaus"));
+        return { step: "tombstoneRegistry", ok: true, detail: "ok" };
+      },
+    });
+    const out = await s.retire();
+    expect(out.exitCode).not.toBe(0);
+    const receipts = workspaceReceipts(s.hangarRoot);
+    expect(receipts.map((r) => [r["kind"], r["state"]])).toEqual([["controls.retire", "failed"]]);
+    const receipt = receipts[0] as Record<string, unknown>;
+    expect(out.lines.at(-1)).toBe(`Not done (${receipt["id"]})`);
+    const text = out.lines.join("\n");
+    expect(text).toContain("✗ keepDisabled");
+    expect(out.lines.some((l) => l.includes("crewhaus daemon disable") && l.includes(s.dir))).toBe(
+      true,
+    );
+    expect((receipt["outcome"] as { code?: string } | undefined)?.code).toBe("internal");
+    expect(receipt["effects"]).toContainEqual({ kind: "retire.keep-disabled", status: "failed" });
+    // The steps after it still ran: the lifecycle line and the registry row landed.
+    expect(lifecycleLines(s.hangarRoot)).toContainEqual(
+      expect.objectContaining({ type: "harness.retired", cmd: receipt["id"] }),
+    );
+    const row = openHangarRegistry({ root: s.registryRoot, env: {} }).get(s.row.id);
+    expect(row?.archived).toMatchObject({ cmd: receipt["id"] });
+  });
+});
+
+describe("retire marks only the registry row of its own directory", () => {
+  test("a copy of a registered harness retires as itself: no row archived, no harness named", async () => {
+    const s = setUp();
+    expect(writeHarnessIdentity(s.dir, { id: s.row.id }).ok).toBe(true);
+    const copy = join(s.root, "copy");
+    cpSync(s.dir, copy, { recursive: true });
+    const out = await s.retire({ harnessDir: copy, cwd: copy });
+    expect(out.exitCode).toBe(0);
+    const registry = openHangarRegistry({ root: s.registryRoot, env: {} });
+    expect(registry.get(s.row.id)?.archived).toBeUndefined();
+    const receipts = workspaceReceipts(s.hangarRoot);
+    expect(receipts.map((r) => [r["kind"], r["state"]])).toEqual([
+      ["controls.retire", "succeeded"],
+    ]);
+    const receipt = receipts[0] as Record<string, unknown>;
+    // Given no target, the receipt names itself.
+    expect(receipt["target"]).toBe(`home/cmd/${receipt["id"]}`);
+    expect(out.lines.at(-1)).toBe(`Done (${receipt["id"]})`);
+    const lines = lifecycleLines(s.hangarRoot);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ type: "harness.retired", harness: null, cmd: receipt["id"] });
+  });
+
+  test("a harness retired through a link to its directory archives its own row", async () => {
+    const s = setUp();
+    expect(writeHarnessIdentity(s.dir, { id: s.row.id }).ok).toBe(true);
+    const link = join(s.root, "link");
+    symlinkSync(s.dir, link);
+    const out = await s.retire({ harnessDir: link, cwd: link });
+    expect(out.exitCode).toBe(0);
+    const receipt = workspaceReceipts(s.hangarRoot)[0] as Record<string, unknown>;
+    expect(receipt["target"]).toBe(`home/harness/${s.row.id}`);
+    const row = openHangarRegistry({ root: s.registryRoot, env: {} }).get(s.row.id);
+    expect(row?.archived).toMatchObject({ cmd: receipt["id"] });
+  });
+});
+
+describe("a harness directory's id", () => {
+  test("a copy whose harness.json names another directory's row has no id", () => {
+    const s = setUp();
+    expect(writeHarnessIdentity(s.dir, { id: s.row.id }).ok).toBe(true);
+    const copy = join(s.root, "copy");
+    cpSync(s.dir, copy, { recursive: true });
+    expect(harnessIdOf(copy, s.opts)).toBeUndefined();
+    expect(harnessIdOf(s.dir, s.opts)).toBe(s.row.id);
+  });
+
+  test("an unregistered harness answers its own harness.json id", () => {
+    const s = setUp();
+    const other = join(s.root, "other");
+    mkdirSync(other, { recursive: true });
+    const id = "hrn_0123456789abcdef";
+    expect(writeHarnessIdentity(other, { id }).ok).toBe(true);
+    expect(harnessIdOf(other, s.opts)).toBe(id);
+  });
+
+  test("a registered harness reached through a link answers its row's id", () => {
+    const s = setUp();
+    const link = join(s.root, "link");
+    symlinkSync(s.dir, link);
+    expect(harnessIdOf(link, s.opts)).toBe(s.row.id);
+  });
+});
+
+describe("a retire's disable outranks an earlier enable that never finished", () => {
+  test("after Home's retire disables the harness, crewhaus daemon start exits 38", async () => {
+    const s = setUp();
+    // A dead CLI's enable, accepted an hour ago and never finished.
+    const enable = mintId("cmd");
+    const planted = append(commandsLedgerOf(s.dir), {
+      id: enable,
+      v: 1,
+      kind: "controls.enable",
+      target: `home/harness/${s.row.id}`,
+      actor: `local:#${"a".repeat(64)}`,
+      via: "cli",
+      fingerprint: "f".repeat(64),
+      state: "accepted",
+      acceptedAt: new Date(Date.now() - 3_600_000).toISOString(),
+      executor: {
+        pid: 999_999,
+        startedAt: new Date(Date.now() - 3_600_000).toISOString(),
+        host: hostname(),
+        head: "cli",
+      },
+      effects: [],
+      retry: { retryable: true, safety: "idempotent" },
+    });
+    expect(planted.ok).toBe(true);
+    // Home's retire: stop and disable, then disable again where it lives, under its receipt.
+    const answer = await directControl(s.opts).commands.submit(
+      {
+        kind: "controls.retire",
+        target: `home/harness/${s.row.id}`,
+        ledger: "workspace",
+        via: "cli",
+        body: {},
+      },
+      async (receipt) => {
+        const steps = retireSteps({
+          harnessDir: s.dir,
+          harnessId: s.row.id,
+          hangarRoot: s.hangarRoot,
+          receipt,
+          stop: false,
+          now: () => Date.now(),
+          probe: s.ops,
+        });
+        const disabled = await steps.stopAndDisable();
+        const kept = await steps.keepDisabled();
+        return {
+          settle: {
+            state: disabled.ok && kept.ok ? "succeeded" : "failed",
+            effects: [...steps.effects()],
+          },
+          value: undefined,
+        };
+      },
+    );
+    expect(answer.ok && answer.receipt.state).toBe("succeeded");
+    const started = await runDaemonCommand(["start", "--no-preflight"], s.opts);
+    expect(started.exitCode).toBe(38);
+    expect(s.ops.children).toEqual([]);
+    const read = readOperatorRecord.refresh(s.dir);
+    expect(read.state === "present" && read.record.deployment?.disabled).toBe(true);
+    const fold = foldStates(commandsLedgerOf(s.dir));
+    if (!fold.ok) throw new Error(fold.reason);
+    const settled = fold.objects.get(enable);
+    expect(settled?.state).toBe("unknown");
+    expect(settled?.record["outcome"]).toMatchObject({ code: "interrupted" });
+  });
 });

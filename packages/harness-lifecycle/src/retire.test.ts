@@ -47,6 +47,7 @@ function stubSteps(
     failAudit?: boolean;
     failCompliance?: boolean;
     failPre?: "cancelQueuedRuns" | "revokeConnections";
+    failPost?: "keepDisabled" | "recordLifecycle" | "archiveRegistryRow";
   } = {},
 ): {
   steps: RetirementSteps;
@@ -73,9 +74,18 @@ function stubSteps(
       opts.failPre === "revokeConnections"
         ? fail("revokeConnections", "a revoker failed")
         : ok("revokeConnections"),
-    keepDisabled: async () => ok("keepDisabled"),
-    recordLifecycle: async () => ok("recordLifecycle"),
-    archiveRegistryRow: async () => ok("archiveRegistryRow"),
+    keepDisabled: async () =>
+      opts.failPost === "keepDisabled"
+        ? fail("keepDisabled", "the operator record can't be written")
+        : ok("keepDisabled"),
+    recordLifecycle: async () =>
+      opts.failPost === "recordLifecycle"
+        ? fail("recordLifecycle", "the lifecycle record is locked")
+        : ok("recordLifecycle"),
+    archiveRegistryRow: async () =>
+      opts.failPost === "archiveRegistryRow"
+        ? fail("archiveRegistryRow", "the registry is locked")
+        : ok("archiveRegistryRow"),
     backupState: async () =>
       opts.failBackup === true
         ? fail("backupState", "disk full")
@@ -172,6 +182,7 @@ describe("runRetirement — dry run", () => {
     const result = await runRetirement({ plan, steps, dryRun: true });
     expect(calls).toEqual([]);
     expect(result.removedState).toBe(false);
+    expect(result.postArchiveFailures).toEqual([]);
     expect(existsSync(join(root, ".crewhaus"))).toBe(true);
   });
 });
@@ -234,6 +245,7 @@ describe("runRetirement — real", () => {
     ]);
     // state moved into the archive + removed from the harness
     expect(result.removedState).toBe(true);
+    expect(result.postArchiveFailures).toEqual([]);
     expect(existsSync(stateDir)).toBe(false);
     expect(existsSync(join(archiveDir, "crewhaus-state", "marker"))).toBe(true);
     // retirement log evidenced into the archive
@@ -494,6 +506,25 @@ describe("a retire that ends what the harness could still do", () => {
     expect(result.removedState).toBe(true);
     expect(forced.calls).toContain("archiveRegistryRow");
   });
+
+  for (const failPost of ["keepDisabled", "recordLifecycle", "archiveRegistryRow"] as const) {
+    test(`every step after the archive runs, and a failed ${failPost} is reported in the result`, async () => {
+      const stateDir = join(root, ".crewhaus");
+      mkdirSync(stateDir, { recursive: true });
+      const plan = buildRetirementPlan(options());
+      const { steps, calls } = stubSteps({ failPost });
+      const result = await runRetirement({ plan, steps, dryRun: false });
+      expect(calls.slice(-3)).toEqual(["keepDisabled", "recordLifecycle", "archiveRegistryRow"]);
+      expect(result.removedState).toBe(true);
+      expect(result.postArchiveFailures).toHaveLength(1);
+      const failed = result.postArchiveFailures[0];
+      expect(failed?.step).toBe(failPost);
+      expect(failed?.ok).toBe(false);
+      const log = readRetirementLog(join(root, "archive"));
+      expect(log?.outcomes).toContainEqual(failed);
+      expect(log?.archived).toBe(true);
+    });
+  }
 });
 
 describe("a host that runs no control steps", () => {
