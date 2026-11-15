@@ -2484,11 +2484,13 @@ describe("emitChannelBot — schedule: wake loop (Batch F, temporal contract)", 
 
   test("cron schedule arms armSchedule with the WakeSchedule literal (no instructions)", () => {
     const daemon = fileMap(withCron()).get("daemon.ts") ?? "";
+    expect(daemon).toContain('import { armSchedule } from "@crewhaus/durable-execution";');
+    expect(daemon).not.toContain("nextWakeDelayMs");
+    // The literal is bound once and armed from the binding; control.v1's
+    // /status reads the armed timer's recorded fire time.
     expect(daemon).toContain(
-      'import { armSchedule, nextWakeDelayMs } from "@crewhaus/durable-execution";',
+      "nextDueAt: () => ((__at: number | undefined) => (__at === undefined || !(Math.abs(__at) <= 8.64e15) ? undefined : new Date(__at).toISOString()))(__schedule.nextAt()),",
     );
-    // The literal is bound once (control.v1's /status projects nextDueAt from
-    // the same object) and armed from the binding.
     expect(daemon).toContain(
       'const __scheduleSpec = {"kind":"cron","cron":"0 */6 * * *","timezone":"America/New_York","jitterMs":30000} as const;',
     );
@@ -2556,17 +2558,27 @@ describe("emitChannelBot — named schedule lanes (#514)", () => {
     expect(count("armScheduleLanes(")).toBe(1);
     expect(daemon).not.toContain('lane: "schedule",');
     expect(daemon).not.toContain("armSchedule(");
-    expect(daemon).toContain(
-      'import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";',
-    );
+    expect(daemon).toContain('import { armScheduleLanes } from "@crewhaus/durable-execution";');
+    expect(daemon).not.toContain("nextWakeDelayMs");
+    expect(count('__scheduleLanesArmed?.nextAt("discovery")')).toBe(1);
+    expect(count('__scheduleLanesArmed?.nextAt("weekly-report")')).toBe(1);
+  });
+
+  test("a lane id appears only inside a JSON string literal", () => {
+    for (const id of ["schedule:discovery", "schedule:weekly-report"]) {
+      expect(count(id)).toBeGreaterThan(0);
+      expect(count(id)).toBe(count(JSON.stringify(id)));
+    }
   });
 
   test("each wake runs a fresh-session turn with its lane's prompt, logged under the lane", () => {
     expect(daemon).toContain("message: __scheduleLanes[0].instructions,");
     expect(daemon).toContain("message: __scheduleLanes[1].instructions,");
     expect(count("isNew: true,")).toBeGreaterThanOrEqual(2);
-    expect(daemon).toContain("[schedule:discovery] wake #");
-    expect(daemon).toContain("[schedule:weekly-report] wake #");
+    expect(daemon).toContain('const __laneId = "schedule:discovery";');
+    expect(daemon).toContain('const __laneId = "schedule:weekly-report";');
+    expect(count("[${__laneId}] wake #")).toBe(2);
+    expect(count("formatRunFailure(__err.report, { prefix: `[${__laneId}]` })")).toBe(2);
     // The default prompt for a lane without instructions.
     expect(daemon).toContain('"[scheduled wake] proceed with your standing instructions."');
     // Drain and signal shutdown both cancel every lane.
@@ -2751,7 +2763,10 @@ describe("emitChannelBot — crewhaus.control.v1", () => {
   test("the schedule lane is armed through armSchedule and reports nextDueAt", () => {
     const daemon = fileMap(withLanes()).get("daemon.ts") ?? "";
     expect(daemon).toContain('const __scheduleLane = __control.lane({\n    lane: "schedule",');
-    expect(daemon).toContain("nextWakeDelayMs(__scheduleSpec, Date.now())");
+    expect(daemon).toContain(
+      "((__at: number | undefined) => (__at === undefined || !(Math.abs(__at) <= 8.64e15) ? undefined : new Date(__at).toISOString()))(__schedule.nextAt())",
+    );
+    expect(daemon).not.toContain("nextWakeDelayMs");
     expect(daemon).toContain("await __scheduleLane.tick();");
   });
 

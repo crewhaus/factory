@@ -13,6 +13,7 @@
  * so a caller can splice a block at any nesting depth without reflowing it.
  */
 
+import { isLaneId } from "@crewhaus/control-contract";
 import type { ControlLane } from "./control";
 
 /** Package specifier the emitted daemon imports the control runtime from. */
@@ -186,8 +187,22 @@ export type ScheduleLaneBodyContext = {
   readonly instructionsVar: string;
 };
 
-/** Identifier the armed lanes' cancel handle binds to: `{ cancel(): void } | undefined`. */
+/**
+ * Identifier the armed lanes' handle binds to:
+ * `{ cancel(): void; nextAt(name: string): number | undefined } | undefined`.
+ */
 export const SCHEDULE_LANES_ARMED_VAR = "__scheduleLanesArmed" as const;
+
+/**
+ * The `nextDueAt` expression for an armed schedule. `nextAtCall` is a JS
+ * expression evaluating to the armed timer's recorded fire time in epoch ms,
+ * or `undefined`; the result is that time as an ISO string, or `undefined`
+ * while no wake is pending or when the time is outside the range a `Date`
+ * holds. It reads the recorded value and does no schedule arithmetic.
+ */
+export function scheduleNextDueAtExpr(nextAtCall: string): string {
+  return `((__at: number | undefined) => (__at === undefined || !(Math.abs(__at) <= 8.64e15) ? undefined : new Date(__at).toISOString()))(${nextAtCall})`;
+}
 
 /** The cadence `/status` shows for a schedule: `cron "<expr>" <tz|UTC>` or `every <ms>ms`, then any jitter. */
 export function scheduleLaneCadence(lane: ScheduleLaneEmit): string {
@@ -227,11 +242,16 @@ function byName(a: ScheduleLaneEmit, b: ScheduleLaneEmit): number {
  * whatever order they arrive in, and every string is a JSON literal, so a lane's
  * instructions reach the output only as quoted data.
  *
- * The emitted daemon must import `armScheduleLanes` and `nextWakeDelayMs` from
- * `@crewhaus/durable-execution`. The cancel handle binds to
+ * Throws a `TypeError`, before anything renders, when a lane's name makes a
+ * `schedule:<name>` id outside control-contract's `isLaneId` grammar.
+ *
+ * The emitted daemon must import `armScheduleLanes` from
+ * `@crewhaus/durable-execution`. The armed handle binds to
  * {@link SCHEDULE_LANES_ARMED_VAR}, `undefined` until armed; with `armGuard` the
  * lanes are registered (so `/status` lists them) but armed only when the guard
- * holds. `afterArm` runs right after arming and may read `__scheduleLanes`.
+ * holds. Each lane's `nextDueAt` is its armed timer's recorded fire time, and
+ * absent while that lane has no pending timer. `afterArm` runs right after
+ * arming and may read `__scheduleLanes`.
  */
 export function renderScheduleLanes(opts: {
   readonly lanes: ReadonlyArray<ScheduleLaneEmit>;
@@ -247,6 +267,13 @@ export function renderScheduleLanes(opts: {
   readonly planeVar?: string;
   readonly indent?: string;
 }): string {
+  for (const lane of opts.lanes) {
+    if (typeof lane.name !== "string" || !isLaneId(`schedule:${lane.name}`)) {
+      throw new TypeError(
+        `renderScheduleLanes: lane name ${JSON.stringify(lane.name)} is not a lane name`,
+      );
+    }
+  }
   const lanes = [...opts.lanes].sort(byName);
   const literal = [
     "const __scheduleLanes = [",
@@ -263,7 +290,9 @@ export function renderScheduleLanes(opts: {
         lane: laneId,
         varName: `__scheduleLane${index}`,
         cadence: scheduleLaneCadence(lane),
-        nextDueAtExpr: `new Date(Date.now() + nextWakeDelayMs(__scheduleLanes[${index}].wake, Date.now())).toISOString()`,
+        nextDueAtExpr: scheduleNextDueAtExpr(
+          `${SCHEDULE_LANES_ARMED_VAR}?.nextAt(${q(lane.name)})`,
+        ),
         ...(opts.ownsSession !== undefined ? { ownsSession: opts.ownsSession } : {}),
         ...(opts.planeVar !== undefined ? { planeVar: opts.planeVar } : {}),
         body: opts.body({
@@ -297,7 +326,7 @@ export function renderScheduleLanes(opts: {
   const body = [
     literal,
     `${registrations}${byNameMap}`,
-    `let ${SCHEDULE_LANES_ARMED_VAR}: { cancel(): void } | undefined;`,
+    `let ${SCHEDULE_LANES_ARMED_VAR}: { cancel(): void; nextAt(name: string): number | undefined } | undefined;`,
     opts.armGuard !== undefined
       ? [`if (${opts.armGuard}) {`, indentBlock(arm, "  "), "}"].join("\n")
       : arm,

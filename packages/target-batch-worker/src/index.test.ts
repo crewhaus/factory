@@ -445,11 +445,13 @@ describe("emitBatchWorker — schedule: wake loop (Batch F, temporal contract)",
 
   test("interval schedule arms armSchedule and enqueues the wake prompt as a job", () => {
     const code = emitBatchWorker(withInterval).files[0]?.content ?? "";
+    expect(code).toContain('import { armSchedule } from "@crewhaus/durable-execution";');
+    expect(code).not.toContain("nextWakeDelayMs");
+    // The literal is bound once and armed from the binding; control.v1's
+    // /status reads the armed timer's recorded fire time.
     expect(code).toContain(
-      'import { armSchedule, nextWakeDelayMs } from "@crewhaus/durable-execution";',
+      "nextDueAt: () => ((__at: number | undefined) => (__at === undefined || !(Math.abs(__at) <= 8.64e15) ? undefined : new Date(__at).toISOString()))(__schedule.nextAt()),",
     );
-    // The literal is bound once (control.v1's /status projects nextDueAt from
-    // the same object) and armed from the binding.
     expect(code).toContain(
       'const __scheduleSpec = {"kind":"interval","everyMs":3600000} as const;',
     );
@@ -516,9 +518,10 @@ describe("emitBatchWorker — named schedule lanes (#514)", () => {
     expect(count("armScheduleLanes(")).toBe(1);
     expect(code).not.toContain('lane: "schedule",');
     expect(code).not.toContain("armSchedule(");
-    expect(code).toContain(
-      'import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";',
-    );
+    expect(code).toContain('import { armScheduleLanes } from "@crewhaus/durable-execution";');
+    expect(code).not.toContain("nextWakeDelayMs");
+    expect(count('__scheduleLanesArmed?.nextAt("discovery")')).toBe(1);
+    expect(count('__scheduleLanesArmed?.nextAt("weekly-report")')).toBe(1);
   });
 
   test("an in-memory lane worker keeps running: no idle exit", () => {
