@@ -2,17 +2,19 @@
 //
 // `runWorkerLoop` is the PURE core that `@crewhaus/runtime-core`'s
 // `runChatLoop` mixes with node-coupled services: the turn finite-state
-// machine, model-stream orchestration, tool dispatch+validation+permission
-// gating, tool_result feedback, budget/limit enforcement, loop detection, and
-// trace emission — with every host capability injected via `WorkerPlatform`.
+// machine, model-stream orchestration, tool dispatch and validation, a
+// permission decision before every tool call when `permissions` is given,
+// tool_result feedback, limit enforcement, loop detection, and trace emission
+// — with every host capability injected via `WorkerPlatform`.
 // It composes the SAME already-platform-neutral engine packages the Node loop
 // uses (`turn-state-machine`, `tool-executor`, `token-budget`,
 // `tool-loop-detection`) and streams through the SAME `ProviderAdapter`
 // interface, defaulting to the built-in edge Anthropic adapter over
 // `platform.fetch`.
 //
-// v1 SCOPE (per the agent-loops plan): tools + budget + limits + trace.
-// Compaction and recovery are deliberately OUT — they are Node-only services
+// v1 SCOPE (per the agent-loops plan): tools, permission decisions, limits and
+// trace. The loop keeps no spend meter and runs no hooks. Compaction and
+// recovery are deliberately OUT — they are Node-only services
 // in `runtime-core`. On the edge a run that outgrows its context window ends
 // with a classified `context_overflow` frame rather than compacting; there is
 // no mid-run summariser. The loop runs one user→assistant turn with its tool
@@ -44,7 +46,7 @@ import {
   isRunFailedError,
 } from "@crewhaus/errors";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { executeTool } from "@crewhaus/tool-executor";
+import { executeTool, preparePermissionSubject } from "@crewhaus/tool-executor";
 import { DEFAULT_THRESHOLD, DEFAULT_WINDOW_SIZE, detectLoop } from "@crewhaus/tool-loop-detection";
 import {
   type ToolUseBlock,
@@ -54,6 +56,7 @@ import {
 } from "@crewhaus/turn-state-machine";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { createEdgeAnthropicAdapter } from "./edge-anthropic";
+import { type WorkerPermissions, decideWorkerToolCall } from "./permissions";
 import type { WorkerPlatform } from "./platform";
 import { type TraceSink, type WorkerTraceEvent, noopTraceSink } from "./trace";
 
@@ -79,8 +82,9 @@ export type WorkerLimits = {
    *  `context_overflow` (no compaction on the edge). Default
    *  {@link DEFAULT_CONTEXT_LIMIT}. */
   readonly contextLimit?: number;
-  /** Whole-run wall-clock ceiling in ms, checked at each turn boundary
-   *  against `platform.now()`. Absent → no deadline. */
+  /** Wall-clock ceiling in ms for this call of the loop, measured from its
+   *  start and checked against `platform.now()` before each model call (a
+   *  call already in flight finishes). Absent → no deadline. */
   readonly deadlineMs?: number;
   /** Tool-loop detector tuning + escalation. */
   readonly loopDetection?: {
@@ -118,6 +122,13 @@ export type RunWorkerLoopOptions = {
   /** Permission allow-patterns forwarded to `executeTool` (tool name / input
    *  globs). Absent → every advertised tool is permitted. */
   readonly allowedToolPatterns?: ReadonlyArray<string>;
+  /**
+   * The spec's permission rules and mode, decided before every tool call
+   * ({@link decideWorkerToolCall}); a call they do not allow is refused with
+   * an error tool result and is never executed. Absent → every advertised
+   * tool is permitted (the cf-worker emitters always pass it).
+   */
+  readonly permissions?: WorkerPermissions;
   /** Cooperative-cancellation signal; forwarded to the model call and tools. */
   readonly signal?: AbortSignal;
   /** Trace sink for core (un-enveloped) events. Default: no-op. */
@@ -156,8 +167,8 @@ export type WorkerLoopResult = {
 
 /**
  * Run the loop and resolve with the terminal text + classified stop. NEVER
- * throws for a stop condition (deadline, budget, context overflow, loop
- * abort, provider error, unexpected tool throw) — every terminal condition
+ * throws for a stop condition (deadline, context overflow, loop abort,
+ * provider error, unexpected tool throw) — every terminal condition
  * resolves as a {@link WorkerLoopResult} carrying a `stopReason` and, for the
  * failing stops, a `FailureReport` — so a stateless worker serialises a
  * classified frame instead of a 500.
@@ -360,20 +371,34 @@ export async function runWorkerLoop(options: RunWorkerLoopOptions): Promise<Work
                 is_error: true,
               };
             } else {
-              const executed = await executeTool(tool, tu.input, {
-                toolUseId: tu.id,
-                ...(options.allowedToolPatterns !== undefined
-                  ? { allowedPatterns: options.allowedToolPatterns }
-                  : {}),
-                ...(options.signal !== undefined ? { signal: options.signal } : {}),
-              });
-              isError = executed.isError;
-              result = {
-                type: "tool_result",
-                tool_use_id: tu.id,
-                content: executed.content as CanonicalToolResultBlockParam["content"],
-                is_error: executed.isError,
-              };
+              const refusal =
+                options.permissions !== undefined
+                  ? permissionRefusal(tool, tu, options.permissions, emit)
+                  : undefined;
+              if (refusal !== undefined) {
+                isError = true;
+                result = {
+                  type: "tool_result",
+                  tool_use_id: tu.id,
+                  content: refusal,
+                  is_error: true,
+                };
+              } else {
+                const executed = await executeTool(tool, tu.input, {
+                  toolUseId: tu.id,
+                  ...(options.allowedToolPatterns !== undefined
+                    ? { allowedPatterns: options.allowedToolPatterns }
+                    : {}),
+                  ...(options.signal !== undefined ? { signal: options.signal } : {}),
+                });
+                isError = executed.isError;
+                result = {
+                  type: "tool_result",
+                  tool_use_id: tu.id,
+                  content: executed.content as CanonicalToolResultBlockParam["content"],
+                  is_error: executed.isError,
+                };
+              }
             }
             if (tool?.classifyOutput !== false) {
               result = await screenToolResult(tu.name, result, emit);
@@ -437,6 +462,53 @@ export async function runWorkerLoop(options: RunWorkerLoopOptions): Promise<Work
     iterations,
     ...(failure !== undefined ? { failure } : {}),
   };
+}
+
+// --------------------------------------------------------------------------
+// Permission decisions
+// --------------------------------------------------------------------------
+
+/**
+ * Decide one call under `permissions` before it runs: `undefined` when it may
+ * run, else the text of its error tool result. The rules are matched against
+ * the input as the tool's schema parses it, with its operative values read
+ * lexically (no filesystem). An input the schema refuses gets the schema's
+ * message and no decision: no rule was consulted, as on a Node run. Every
+ * decision, an allow included, is one `permission_decision` frame with the
+ * mode it was made in; an ask carries `askOutcome: "denied"`, since a worker
+ * has nobody to give the approval.
+ */
+function permissionRefusal(
+  tool: RegisteredTool,
+  tu: ToolUseBlock,
+  permissions: WorkerPermissions,
+  emit: TraceSink,
+): string | undefined {
+  const subject = preparePermissionSubject(tool, tu.input);
+  if (!subject.ok) return subject.reason;
+  const verdict = decideWorkerToolCall(
+    {
+      toolName: tu.name,
+      input: subject.input,
+      ...(subject.operativeValues !== undefined
+        ? { operativeValues: subject.operativeValues }
+        : {}),
+      readOnly: tool.readOnly,
+      requiresSandbox: tool.requiresSandbox,
+      requireJustification: tool.requireJustification,
+    },
+    permissions,
+  );
+  emit({
+    kind: "permission_decision",
+    toolName: tu.name,
+    decision: verdict.decision,
+    mode: verdict.mode,
+    ...(verdict.reason !== undefined ? { reason: verdict.reason } : {}),
+    ...(verdict.decision === "ask" ? { askOutcome: "denied" as const } : {}),
+  });
+  if (verdict.decision === "allow") return undefined;
+  return `tool denied: ${verdict.reason ?? `\`${tu.name}\` is not allowed on this worker`}`;
 }
 
 // --------------------------------------------------------------------------

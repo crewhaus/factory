@@ -2,6 +2,7 @@ import {
   type Bundle,
   type CompileWarning,
   SpecParseError,
+  assertCfWorkerSafetyEnforced,
   assertCfWorkerToolsEdgeSafe,
   assertToolScopesStrict,
   cfWorkerUnwiredBlockWarnings,
@@ -34,7 +35,11 @@ import { handleProviderProxy } from "./proxy";
  *      server-side (FR-002, Pillar 3): a spec reaching an outward sink (a
  *      `mcp__*` tool, or a built-in like Fetch / WebFetch / SendMessage)
  *      whose `scope: "external"` cannot be verified offline is refused with
- *      code "COMPILE" — mirroring `compile --strict`.
+ *      code "COMPILE" — mirroring `compile --strict`. With
+ *      `emitAs: "cf-worker"`, a spec that declares a safety setting the
+ *      worker does not enforce is refused with code "COMPILE" too, naming
+ *      each path (`assertCfWorkerSafetyEnforced`, the rule
+ *      `crewhaus compile --emit-as cf-worker` runs).
  *
  *   POST /validate { yaml: string }
  *      → 200 { ok: true }
@@ -176,13 +181,15 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
       // The edge tool gate, as `crewhaus compile --emit-as cf-worker` runs it:
       // host tools the edge always refused throw (400 COMPILE); any other
       // builtin the worker leaves out comes back as an edge-unsafe-tool
-      // warning beside the bundle instead of vanishing.
-      // And the answer gates the edge does not run (provability:,
-      // evaluation:), said rather than served ungated without a word.
+      // warning beside the bundle. Then the edge safety gate: a setting the
+      // worker does not enforce throws (400 COMPILE, naming each path), and
+      // its informational notices come back as warnings. And the answer
+      // gates the edge does not run (provability:, evaluation:) are said.
       const edgeWarnings = [
         ...collectCompileWarnings(spec),
         ...lowered.warnings,
         ...assertCfWorkerToolsEdgeSafe(ir),
+        ...assertCfWorkerSafetyEnforced(spec, ir),
         ...cfWorkerUnwiredBlockWarnings(ir),
       ];
       const allowedOrigins = Array.isArray(body.allowedOrigins)

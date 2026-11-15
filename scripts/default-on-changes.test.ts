@@ -50,8 +50,15 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { emitCfWorkerBundle } from "../apps/cli/src/cf-worker-emit";
 import { serveRequestRefusal } from "../apps/cli/src/serve-mcp";
-import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
+import {
+  CF_WORKER_ENFORCED_KEYS,
+  CF_WORKER_REFUSAL_REASONS,
+  cfWorkerUnwiredBlockWarnings,
+  lower,
+  parseSpec,
+} from "../packages/compiler/src/index";
 import { classifyEgress } from "../packages/egress-classifier/src/index";
 import {
   FEDERATION_VERSION,
@@ -62,7 +69,13 @@ import {
   createGatewayServer,
 } from "../packages/gateway-server/src/index";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
-import type { IrChannelV0, IrManagedV0 } from "../packages/ir/src/index";
+import type {
+  IrChannelV0,
+  IrGraphV0,
+  IrManagedV0,
+  IrV0,
+  IrWorkflowV0,
+} from "../packages/ir/src/index";
 import {
   type RuleSet,
   type ToolCallContext,
@@ -74,6 +87,9 @@ import { createRunContext, tagContent } from "../packages/run-context/src/index"
 import { credentialFileRoots, runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
 import { OPTIMIZER_REFUSED_LEAVES } from "../packages/spec-patch/src/index";
+import { emitCfWorkerCli } from "../packages/target-cf-worker-cli/src/index";
+import { emitCfWorkerGraph } from "../packages/target-cf-worker-graph/src/index";
+import { emitCfWorkerWorkflow } from "../packages/target-cf-worker-workflow/src/index";
 import { emitChannelBot } from "../packages/target-channel-bot/src/index";
 import { emitManaged } from "../packages/target-managed/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
@@ -1744,4 +1760,380 @@ describe("the release notes name the federation body limit", () => {
     expect(bullet).toContain("413 before the peer is authorized");
     expect(bullet).toContain("1 MiB");
   }, 20_000); // sends 1 MiB through a real socket; slow on a loaded CI runner
+});
+
+describe("the release notes name the cf-worker edge guarantees", () => {
+  const later = defaultOnBullets(changelog, LATER_HEADINGS);
+  const edgeBullets = later.filter((b) => b.includes("--emit-as cf-worker"));
+  const model = "claude-haiku-4-5";
+  const cliIr: IrV0 = {
+    version: 0,
+    name: "default-on-edge",
+    target: "cli",
+    agent: { model, instructions: "be helpful" },
+    tools: [],
+    toolConfigs: {},
+    mcp_servers: {},
+    permissions: { rules: [] },
+    subAgents: [],
+    compaction: {},
+  };
+  const step = (name: string) => ({ name, instructions: name, model, tools: [], toolConfigs: {} });
+  const workflowIr: IrWorkflowV0 = {
+    version: 0,
+    name: "default-on-edge",
+    target: "workflow",
+    steps: [step("one"), step("two")],
+    mcp_servers: {},
+    permissions: { rules: [] },
+    compaction: {},
+  };
+  const graphIr: IrGraphV0 = {
+    version: 0,
+    name: "default-on-edge",
+    target: "graph",
+    entry: "a",
+    nodes: [
+      { name: "a", instructions: "a", model, tools: [], toolConfigs: {} },
+      { name: "b", instructions: "b", model, tools: [], toolConfigs: {} },
+    ],
+    edges: [{ from: "a", to: "b" }],
+    permissions: { rules: [] },
+    compaction: {},
+  };
+  const workerOf = (bundle: { files: ReadonlyArray<{ path: string; content: string }> }) =>
+    bundle.files.find((f) => f.path === "worker.js")?.content ?? "";
+
+  test("Worker /chat: every shape's worker asks for its bearer, and a bullet names `CHAT_TOKEN`", async () => {
+    const { chatAuthRefusal } = await import("../packages/worker-runtime/src/index");
+    // The control: the right bearer passes.
+    expect(await chatAuthRefusal("Bearer t", "t")).toBeUndefined();
+    // The change: no bearer is answered 401, and an unset secret 503.
+    expect((await chatAuthRefusal(null, "t"))?.status).toBe(401);
+    expect((await chatAuthRefusal("Bearer t", undefined))?.status).toBe(503);
+    // Each shape's worker runs the check in fetch() before handleChat, and
+    // lets the header through CORS.
+    const workers = [
+      workerOf(emitCfWorkerCli(cliIr)),
+      workerOf(emitCfWorkerWorkflow(workflowIr)),
+      workerOf(emitCfWorkerGraph(graphIr)),
+    ];
+    let checked = 0;
+    for (const worker of workers) {
+      const check = worker.indexOf("chatAuthRefusal(");
+      const handle = worker.indexOf("handleChat(");
+      expect(check).toBeGreaterThan(-1);
+      expect(handle).toBeGreaterThan(-1);
+      expect(check).toBeLessThan(handle);
+      expect(worker).toContain('"Access-Control-Allow-Headers": "Content-Type, Authorization"');
+      checked += 1;
+    }
+    expect(checked).toBe(3);
+    const words = [
+      "`CHAT_TOKEN`",
+      "401",
+      "503",
+      "`NO_CHAT_TOKEN`",
+      "`cf_worker.public_chat`",
+      "`GET /health`",
+    ];
+    expect(later.filter((b) => words.every((word) => b.includes(word)))).toHaveLength(1);
+  });
+
+  test("Worker tools: a call no alwaysAllow rule covers is refused, and a bullet names `alwaysAllow`", async () => {
+    const { runWorkerLoop } = await import("../packages/worker-runtime/src/index");
+    const executionsUnder = async (
+      rules: ReadonlyArray<{ type: "alwaysAllow" | "alwaysDeny" | "alwaysAsk"; pattern: string }>,
+    ): Promise<number> => {
+      let executions = 0;
+      let calls = 0;
+      await runWorkerLoop({
+        platform: {
+          now: () => 0,
+          randomId: () => "id",
+          fetch: (() => Promise.reject(new Error("no network"))) as unknown as typeof fetch,
+        },
+        model: "claude-sonnet-4-5",
+        instructions: "x",
+        messages: [{ role: "user", content: "Summarise the attached report." }],
+        tools: [
+          {
+            name: "probe",
+            description: "probe",
+            inputSchema: { safeParse: (data: unknown) => ({ success: true, data }) } as never,
+            jsonSchema: { type: "object" },
+            execute: async () => {
+              executions += 1;
+              return "ran";
+            },
+            concurrencySafe: false,
+            readOnly: true,
+            destructive: false,
+            requiresSandbox: false,
+            classifyOutput: false,
+            scope: "internal",
+            requireJustification: false,
+          },
+        ],
+        permissions: { rules },
+        adapter: {
+          providerId: "anthropic",
+          features: {
+            caching: "explicit",
+            tool_use: true,
+            vision: true,
+            thinking: true,
+            web_search: false,
+          },
+          estimateTokens: () => 1,
+          async *stream() {
+            calls += 1;
+            yield { kind: "message_start", usage: { input: 1, output: 0 } };
+            if (calls === 1) {
+              yield {
+                kind: "content_block_start",
+                index: 0,
+                block: { type: "tool_use", id: "tu_1", name: "probe", input: {} },
+              };
+              yield { kind: "content_block_stop", index: 0 };
+              yield {
+                kind: "message_delta",
+                stopReason: "tool_use",
+                usage: { input: 0, output: 1 },
+              };
+            } else {
+              yield {
+                kind: "message_delta",
+                stopReason: "end_turn",
+                usage: { input: 0, output: 1 },
+              };
+            }
+            yield { kind: "message_stop" };
+          },
+        },
+      });
+      return executions;
+    };
+    // The control: an alwaysAllow rule runs the tool.
+    expect(await executionsUnder([{ type: "alwaysAllow", pattern: "probe" }])).toBe(1);
+    // The change: without one, it never runs.
+    expect(await executionsUnder([])).toBe(0);
+    const words = ["`alwaysAllow`", "`alwaysDeny`", "`alwaysAsk`", "plan"];
+    expect(later.filter((b) => words.every((word) => b.includes(word))).length).toBeGreaterThan(0);
+  });
+
+  test("Worker workflow: `limits.deadline_ms` bounds the whole run, and a bullet says so", () => {
+    const STAMP = "const runStartedAt = platform.now();";
+    const HANDED = "deadlineMs: Math.max(1, CONFIG.limits.deadlineMs - elapsed)";
+    // The control: without the key, no step is handed a deadline.
+    const plain = workerOf(emitCfWorkerWorkflow(workflowIr));
+    expect(plain).toContain("runWorkerLoop({");
+    expect(plain).not.toContain(STAMP);
+    expect(plain).not.toContain("deadlineMs");
+    // The change: the run's start is stamped once, and each step is handed what remains.
+    const bounded = workerOf(emitCfWorkerWorkflow({ ...workflowIr, limits: { deadlineMs: 1500 } }));
+    const stamp = bounded.indexOf(STAMP);
+    const handed = bounded.indexOf(HANDED);
+    expect(stamp).toBeGreaterThan(-1);
+    expect(handed).toBeGreaterThan(-1);
+    expect(stamp).toBeLessThan(handed);
+    expect(bounded.split(STAMP)).toHaveLength(2);
+    expect(
+      edgeBullets.filter((b) => b.includes("`limits.deadline_ms`") && b.includes("whole run")),
+    ).toHaveLength(1);
+  });
+
+  test("cf-worker compile: every setting the gate refuses is named", () => {
+    const cli = {
+      name: "default-on-edge",
+      target: "cli",
+      agent: { model, instructions: "be helpful" },
+    };
+    const workflow = {
+      name: "default-on-edge",
+      target: "workflow",
+      model,
+      steps: [
+        { name: "draft", instructions: "draft" },
+        { name: "final", instructions: "final" },
+      ],
+    };
+    const graph = {
+      name: "default-on-edge",
+      target: "graph",
+      model,
+      entry: "a",
+      nodes: { a: { instructions: "a" }, b: { instructions: "b" } },
+      edges: [{ from: "a", to: "b" }],
+    };
+    const pool = { policy: "static", candidates: [{ model }, { model: "claude-sonnet-4-6" }] };
+    /** Compile a spec object through `--emit-as cf-worker`: the message it is refused with, if any. */
+    const refusal = (spec: object): string | undefined => {
+      const parsed = parseSpec(JSON.stringify(spec));
+      try {
+        emitCfWorkerBundle(parsed, lower(parsed));
+        return undefined;
+      } catch (err) {
+        return (err as Error).message;
+      }
+    };
+    // The control: the plain specs build.
+    for (const base of [cli, workflow, graph]) expect(refusal(base)).toBeUndefined();
+    // One spec per refused row, and the name the notes give it.
+    const PLANTS: Readonly<Record<string, { readonly spec: object; readonly named: string }>> = {
+      hooks: {
+        spec: { ...cli, hooks: [{ event: "pre-tool", command: "exit 2" }] },
+        named: "`hooks`",
+      },
+      budget: { spec: { ...cli, budget: { usd: 1 } }, named: "`budget`" },
+      "security.justification": {
+        spec: { ...cli, security: { justification: { judge: "rule-based" } } },
+        named: "`security`",
+      },
+      "security.egressMatcher": {
+        spec: { ...cli, security: { egressMatcher: "substring" } },
+        named: "`security`",
+      },
+      "limits.turn_timeout_ms": {
+        spec: { ...cli, limits: { turn_timeout_ms: 1000 } },
+        named: "`limits.turn_timeout_ms`",
+      },
+      "limits.model_call_timeout_ms": {
+        spec: { ...cli, limits: { model_call_timeout_ms: 1000 } },
+        named: "`limits.model_call_timeout_ms`",
+      },
+      "agent.rate_limits": {
+        spec: { ...cli, agent: { ...cli.agent, rate_limits: { WebFetch: { rpm: 10 } } } },
+        named: "`agent.rate_limits`",
+      },
+      "agent.model_pool": {
+        spec: { ...cli, agent: { ...cli.agent, model_pool: pool } },
+        named: "`model_pool`",
+      },
+      "steps.*.model_pool": {
+        spec: { ...workflow, steps: [{ ...workflow.steps[0], model_pool: pool }] },
+        named: "`model_pool`",
+      },
+      "nodes.*.model_pool": {
+        spec: { ...graph, nodes: { ...graph.nodes, b: { instructions: "b", model_pool: pool } } },
+        named: "`model_pool`",
+      },
+      "limits.loop_detection.escalation": {
+        spec: { ...cli, limits: { loop_detection: { escalation: "justify" } } },
+        named: "`limits.loop_detection.escalation: justify`",
+      },
+    };
+    const rows = [
+      ...Object.keys(CF_WORKER_REFUSAL_REASONS),
+      ...CF_WORKER_ENFORCED_KEYS.filter((row) => row.refuse !== undefined).map((row) => row.path),
+    ];
+    expect(rows.filter((row) => PLANTS[row] === undefined)).toEqual([]);
+    expect(rows.length).toBe(Object.keys(PLANTS).length);
+    const unnamed: string[] = [];
+    for (const row of rows) {
+      const plant = PLANTS[row];
+      if (plant === undefined) continue;
+      expect(refusal(plant.spec)).toContain("cf-worker target cannot enforce");
+      if (!edgeBullets.some((b) => b.includes(plant.named))) unnamed.push(row);
+    }
+    expect(unnamed).toEqual([]);
+    // Judge gates and conditional edges are refused by the emitters, and named too.
+    const judge = { kind: "judge", judge: { criteria: "no secrets", threshold: 0.9 } };
+    const gates = [
+      refusal({ ...workflow, steps: [workflow.steps[0], { name: "gate", ...judge }] }),
+      refusal({ ...graph, nodes: { ...graph.nodes, b: judge } }),
+      refusal({ ...graph, edges: [{ from: "a", to: "b", when: { key: "a", exists: true } }] }),
+    ];
+    expect(gates[0]).toContain("does not run judge gates");
+    expect(gates[1]).toContain("does not run judge gates");
+    expect(gates[2]).toContain("does not evaluate edge conditions");
+    expect(edgeBullets.some((b) => b.includes("`kind: judge`") && b.includes("`when`"))).toBe(true);
+  });
+
+  /** The bullet that names the bearer, and the one that names the rule types. */
+  const chatBullets = later.filter(
+    (b) => b.includes("`CHAT_TOKEN`") && b.includes("`NO_CHAT_TOKEN`"),
+  );
+  const toolBullets = later.filter(
+    (b) => b.includes("`alwaysAllow`") && b.includes("`alwaysDeny`") && b.includes("`alwaysAsk`"),
+  );
+
+  test("Worker bundle: a worker's package.json pins the runtime its worker.js imports, and the bullets name `npm install`", async () => {
+    const runtime = await import("../packages/worker-runtime/src/index");
+    // The control: the runtime the bundles pin exports the bearer check.
+    expect(typeof runtime.chatAuthRefusal).toBe("function");
+    // The change: every shape's worker imports it from that runtime, pinned
+    // at the emitter's own version, so a bundle runs the runtime it was
+    // built against only once `npm install` has fetched it.
+    const IMPORT = /^import \{[^}]*\bchatAuthRefusal\b[^}]*\} from "@crewhaus\/worker-runtime";$/m;
+    const emitted = [
+      ["target-cf-worker-cli", emitCfWorkerCli(cliIr)],
+      ["target-cf-worker-workflow", emitCfWorkerWorkflow(workflowIr)],
+      ["target-cf-worker-graph", emitCfWorkerGraph(graphIr)],
+    ] as const;
+    let checked = 0;
+    for (const [pkg, bundle] of emitted) {
+      expect(workerOf(bundle)).toMatch(IMPORT);
+      const manifest = JSON.parse(
+        bundle.files.find((f) => f.path === "package.json")?.content ?? "{}",
+      ) as { dependencies?: Record<string, string> };
+      const version = (
+        JSON.parse(readFileSync(join(ROOT, "packages", pkg, "package.json"), "utf8")) as {
+          version: string;
+        }
+      ).version;
+      expect(manifest.dependencies?.["@crewhaus/worker-runtime"]).toBe(version);
+      checked += 1;
+    }
+    expect(checked).toBe(3);
+    expect(chatBullets).toHaveLength(1);
+    expect(toolBullets).toHaveLength(1);
+    for (const bullet of [...chatBullets, ...toolBullets])
+      expect(bullet).toContain("`npm install`");
+  });
+
+  test("Worker tools: a spec's alwaysAllow rule decides its local build too, and the bullet says so", () => {
+    const call: ToolCallContext = {
+      toolName: "WebFetch",
+      input: { url: "https://a.example/page" },
+      operativeValues: [{ kind: "url", canonical: ["https://a.example/page"] }],
+      readOnly: true,
+      destructive: false,
+    };
+    // The control: a local build asks before a WebFetch call no rule covers.
+    expect(evaluateWithReason(call, "default", { ...emptyRuleSet }, {}).decision).toBe("ask");
+    // The change: the rule a worker needs lets the local build run it unasked.
+    const allow: RuleSet = {
+      ...emptyRuleSet,
+      yaml: [{ type: "alwaysAllow", pattern: "WebFetch", source: "yaml" }],
+    };
+    expect(evaluateWithReason(call, "default", allow, {}).decision).toBe("allow");
+    expect(toolBullets).toHaveLength(1);
+    expect(toolBullets[0]).toContain("local build");
+    expect(toolBullets[0]).toContain("`--emit-as cf-worker`");
+  });
+
+  test("Worker workflow: no step starts once the run's deadline has passed, and a bullet says what to set it to", () => {
+    const STOPPED = "run deadline exceeded";
+    const BEFORE = "before this step started";
+    // The control: without the key, no step is stopped.
+    const plain = workerOf(emitCfWorkerWorkflow(workflowIr));
+    expect(plain).toContain("runWorkerLoop({");
+    expect(plain).not.toContain(STOPPED);
+    // The change: a step the deadline has passed ends the stream with an
+    // error frame that names it, and makes no model call.
+    const bounded = workerOf(emitCfWorkerWorkflow({ ...workflowIr, limits: { deadlineMs: 1500 } }));
+    const stopped = bounded.indexOf(STOPPED);
+    const call = bounded.indexOf("runWorkerLoop({");
+    expect(stopped).toBeGreaterThan(-1);
+    expect(call).toBeGreaterThan(-1);
+    expect(stopped).toBeLessThan(call);
+    expect(bounded).toContain(BEFORE);
+    expect(bounded.split(STOPPED)).toHaveLength(2);
+    expect(
+      edgeBullets.filter(
+        (b) => b.includes("`error` frame") && b.includes("the time the whole run may take"),
+      ),
+    ).toHaveLength(1);
+  });
 });

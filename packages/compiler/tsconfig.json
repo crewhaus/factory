@@ -15,6 +15,7 @@
     { "path": "../tool-builder" },
     { "path": "../tool-categories" },
     { "path": "../tool-permission-matcher" },
+    { "path": "../tool-registry-manifest" },
     { "path": "../target-batch-worker" },
     { "path": "../target-browser-driver" },
     { "path": "../target-channel-bot" },

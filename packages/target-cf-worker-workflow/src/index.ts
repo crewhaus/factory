@@ -2,7 +2,9 @@ import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
   type Bundle,
+  type BundleReadmeSection,
   type IrLimits,
+  type IrPermissions,
   type IrWorkflowStep,
   type IrWorkflowV0,
   renderBundleReadme,
@@ -32,13 +34,21 @@ const DEFAULT_ALLOWED_ORIGINS = ["https://studio.crewhaus.ai", "http://localhost
  * protocol, but instead of a single agent it runs the IR's steps sequentially
  * server-side, threading each step's terminal assistant text into the next.
  *
- * Loop contract 0.4 (Batch F, G12/G83) — each step now runs the SHARED
+ * Loop contract 0.4 (Batch F, G12/G83) — each step runs the SHARED
  * `runWorkerLoop` from `@crewhaus/worker-runtime` over a stateless
- * {@link WorkerPlatform}, so a step gains REAL tools (the edge-safe set),
- * budget, limits, and the Batch C trace frames THROUGH the shared runtime.
+ * {@link WorkerPlatform}. Through the shared runtime the worker carries real
+ * edge-safe tools decided by the spec's permission rules, the `limits:` keys
+ * the edge enforces, the `CHAT_TOKEN` bearer on `/chat`, and the trace
+ * frames. A tool runs only when an `alwaysAllow` rule covers the call, since
+ * a worker has nobody to approve one. `limits.deadline_ms` bounds the whole
+ * run, as a local workflow's does: the run's start is stamped once, no step
+ * starts after the deadline, and each step's loop gets the time that remains.
  * Host tools are rejected at compile time; a step that overflows its context
- * ends the run with a classified error frame (no compaction on the edge). The
- * `/chat` `text`/`done`/`error` vocabulary is byte-compatible.
+ * ends the run with a classified error frame (no compaction on the edge).
+ * `/chat` streams the `text`/`done`/`error` SSE vocabulary.
+ *
+ * A `kind: judge` step is refused with `TargetEmitError`: the worker runs no
+ * judge gate. Use the local `@crewhaus/target-workflow` for a gated workflow.
  */
 export function emitCfWorkerWorkflow(ir: IrWorkflowV0, opts: EmitOptions = {}): Bundle {
   if (ir.target !== "workflow") {
@@ -47,6 +57,12 @@ export function emitCfWorkerWorkflow(ir: IrWorkflowV0, opts: EmitOptions = {}): 
     );
   }
   for (const step of ir.steps) {
+    // A worker runs no judge gate, so a gate step is refused.
+    if (step.kind === "judge") {
+      throw new TargetEmitError(
+        `cf-worker-workflow does not run judge gates (step "${step.name}" is kind: judge); use the local workflow target for a gated workflow`,
+      );
+    }
     // Provider gate — the shared runtime's edge adapter POSTs each step's model
     // verbatim, so a non-Anthropic model string would 502 at runtime.
     assertAnthropicModel(step.model, `step "${step.name}"`);
@@ -54,6 +70,7 @@ export function emitCfWorkerWorkflow(ir: IrWorkflowV0, opts: EmitOptions = {}): 
   // Loop contract 0.4 (Batch F, G12/G83) — the edge-safety tool gate replaces
   // the old blanket "does not support tools" rejection, per step.
   const wiring = resolveWorkflowTools(ir.steps);
+  const publicChat = ir.cfWorker?.publicChat === true;
 
   const allowedOrigins =
     opts.allowedOrigins && opts.allowedOrigins.length > 0
@@ -61,14 +78,17 @@ export function emitCfWorkerWorkflow(ir: IrWorkflowV0, opts: EmitOptions = {}): 
       : DEFAULT_ALLOWED_ORIGINS;
   const files = [
     { path: "worker.js", content: renderWorker(ir, wiring, allowedOrigins) },
-    { path: "wrangler.toml", content: renderWrangler(ir) },
+    { path: "wrangler.toml", content: renderWrangler(ir, publicChat) },
     { path: "package.json", content: renderPackageJson(ir, wiring) },
   ];
   if (opts.readme !== false) {
     files.push({
       path: "README.md",
       content: renderBundleReadme(ir, {
-        ...CF_WORKER_README_OPTS,
+        ...cfWorkerReadmeOpts(
+          publicChat,
+          wiring.stepTools.some((tools) => tools !== "[]"),
+        ),
         unwiredTools: { names: new Set(wiring.unwired), note: CF_WORKER_UNWIRED_NOTE },
         toolFacts: readmeToolFacts(
           ir.steps.map((s) => ({ tools: s.tools, toolConfigs: s.toolConfigs })),
@@ -83,19 +103,81 @@ export function emitCfWorkerWorkflow(ir: IrWorkflowV0, opts: EmitOptions = {}): 
 const CF_WORKER_UNWIRED_NOTE =
   "left out of this worker — the edge runtime does not run it (see the compile warning)";
 
-const CF_WORKER_README_OPTS = {
-  usage: {
-    heading: "Deploy",
-    body: [
-      "```sh",
-      "npm install                              # resolve the crewhaus runtime + tools",
-      "wrangler secret put ANTHROPIC_API_KEY    # one-time Worker secret",
-      "wrangler deploy                          # bundles worker.js + its imports",
-      "```",
-    ].join("\n"),
-  },
-  includeWorkspaceNote: false,
-} as const;
+/**
+ * The README's Deploy steps and the sections that say how the worker is
+ * called and which tool calls it runs. `publicChat` is the spec's
+ * `cf_worker.public_chat`; `hasTools` says some step wires a tool.
+ */
+function cfWorkerReadmeOpts(
+  publicChat: boolean,
+  hasTools: boolean,
+): {
+  readonly usage: BundleReadmeSection;
+  readonly includeWorkspaceNote: false;
+  readonly extraSections: readonly BundleReadmeSection[];
+} {
+  const deploy = [
+    "```sh",
+    "npm install                              # resolve the crewhaus runtime + tools",
+    "wrangler secret put ANTHROPIC_API_KEY    # one-time Worker secret",
+    ...(publicChat
+      ? []
+      : ["wrangler secret put CHAT_TOKEN           # the bearer token POST /chat requires"]),
+    "wrangler deploy                          # bundles worker.js + its imports",
+    "```",
+    ...(publicChat
+      ? []
+      : [
+          "",
+          "Pick a long random `CHAT_TOKEN` (for example `openssl rand -base64 32`) and give it only to the clients that call this worker; for `wrangler dev`, put it in `.dev.vars`.",
+        ]),
+  ];
+  const curl = [
+    "```sh",
+    "curl -N https://<your-worker>.workers.dev/chat \\",
+    ...(publicChat ? [] : ['  -H "Authorization: Bearer $CHAT_TOKEN" \\']),
+    '  -H "Content-Type: application/json" \\',
+    `  -d '{"messages":[{"role":"user","content":"Hello"}]}'`,
+    "```",
+  ];
+  const calling = publicChat
+    ? [
+        "`POST /chat` answers without a token (`cf_worker.public_chat: true`): anyone with this worker's URL can run it on your `ANTHROPIC_API_KEY` and its tools. Put Cloudflare Access or a rate-limiting rule in front of it.",
+        "",
+        ...curl,
+        "",
+        '`GET /health` answers `{"ok":true}`.',
+      ]
+    : [
+        "Send the bearer token with every `POST /chat` request:",
+        "",
+        ...curl,
+        "",
+        'A missing or wrong token is answered with 401, and every `/chat` request is answered with 503 and the code `NO_CHAT_TOKEN` until `CHAT_TOKEN` is set. `GET /health` answers `{"ok":true}` without a token.',
+        "",
+        "A token written into a web page can be read by everyone who opens it: call the worker from a backend, or put Cloudflare Access in front of it.",
+      ];
+  return {
+    usage: { heading: "Deploy", body: deploy.join("\n") },
+    // A deployed Worker has no local `.crewhaus/` workspace.
+    includeWorkspaceNote: false,
+    extraSections: [
+      {
+        heading: "Calling the worker",
+        body: [
+          ...calling,
+          "",
+          "This worker keeps no spend meter: set a spending limit on the Anthropic account its key belongs to.",
+        ].join("\n"),
+      },
+      ...(hasTools ? [{ heading: "Tools on this worker", body: CF_WORKER_TOOLS_NOTE }] : []),
+    ],
+  };
+}
+
+/** The README's word on which tool calls the worker runs. */
+const CF_WORKER_TOOLS_NOTE =
+  "A tool runs on this worker only when an `alwaysAllow` rule in `permissions.rules` covers the call: `WebFetch`, or `WebFetch(https://api.example.com/**)` for one site. A matching `alwaysDeny` or `alwaysAsk` rule wins over any `alwaysAllow`. `mode: auto` reads as `default`, and `mode: plan` runs only read-only tools. Any other call returns an error to the model, because a worker has nobody to approve it.";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -163,8 +245,13 @@ export function resolveWorkflowTools(steps: readonly IrWorkflowStep[]): EdgeTool
   };
 }
 
-/** Map the IR's `limits:` block to the runWorkerLoop `limits` subset the edge
- *  honours (justify escalation degrades to warn). */
+/** The refusal for a `justify` escalation, which needs the intent gate. */
+const JUSTIFY_REFUSAL =
+  "limits.loop_detection.escalation: justify needs the intent gate, which a worker does not run — use warn or abort";
+
+/** Map the IR's `limits:` block to the runWorkerLoop `limits` the edge
+ *  enforces. A `justify` escalation needs the intent gate, which a worker does
+ *  not run, so it is refused with a `TargetEmitError`. */
 function renderLimits(limits: IrLimits | undefined): string {
   if (limits === undefined) return "undefined";
   const out: Record<string, unknown> = {};
@@ -176,13 +263,23 @@ function renderLimits(limits: IrLimits | undefined): string {
     if (limits.loopDetection.window !== undefined) ld["window"] = limits.loopDetection.window;
     if (limits.loopDetection.threshold !== undefined)
       ld["threshold"] = limits.loopDetection.threshold;
+    if (limits.loopDetection.escalation === "justify") throw new TargetEmitError(JUSTIFY_REFUSAL);
     if (limits.loopDetection.escalation !== undefined) {
-      ld["escalation"] =
-        limits.loopDetection.escalation === "justify" ? "warn" : limits.loopDetection.escalation;
+      ld["escalation"] = limits.loopDetection.escalation;
     }
     if (Object.keys(ld).length > 0) out["loopDetection"] = ld;
   }
   return Object.keys(out).length > 0 ? JSON.stringify(out) : "undefined";
+}
+
+/** The worker's `permissions`: the spec's mode, only when set, and its rules
+ *  in declared order. `askMode` is not carried: every ask is refused on a
+ *  worker, whatever it says. */
+function renderPermissions(permissions: IrPermissions): string {
+  return JSON.stringify({
+    ...(permissions.mode !== undefined ? { mode: permissions.mode } : {}),
+    rules: permissions.rules.map((rule) => ({ type: rule.type, pattern: rule.pattern })),
+  });
 }
 
 function edgeToolNote(unwired: readonly string[]): string {
@@ -212,6 +309,29 @@ function renderWorker(
     .join(",\n");
   const allowed = JSON.stringify(allowedOrigins);
   const limits = renderLimits(ir.limits);
+  const permissions = renderPermissions(ir.permissions);
+  const publicChat = ir.cfWorker?.publicChat === true;
+  // `limits.deadline_ms` bounds the whole run, so only a spec that declares
+  // it stamps the run's start and hands each step what remains.
+  const deadline = ir.limits?.deadlineMs !== undefined;
+  const runStart = deadline
+    ? `
+        // limits.deadline_ms bounds the whole run, as a local workflow's does:
+        // the run's start is stamped once, no step starts once the deadline
+        // has passed, and each step's loop gets the time that remains.
+        const runStartedAt = platform.now();`
+    : "";
+  const stepGuard = deadline
+    ? `
+          const elapsed = platform.now() - runStartedAt;
+          if (elapsed >= CONFIG.limits.deadlineMs) {
+            emit("error", { message: \`step "\${step.name}": run deadline exceeded: the run exceeded its \${CONFIG.limits.deadlineMs}ms deadline before this step started\` });
+            return;
+          }`
+    : "";
+  const stepLimits = deadline
+    ? "limits: { ...CONFIG.limits, deadlineMs: Math.max(1, CONFIG.limits.deadlineMs - elapsed) },"
+    : "...(CONFIG.limits ? { limits: CONFIG.limits } : {}),";
   // Loop contract 0.4 (Batch C, item 3). IrWorkflowV0 does not carry an
   // `observability` field today; the structural read keeps the gate
   // forward-compatible (defaults to trace-ON, honours an explicit off).
@@ -230,7 +350,7 @@ function renderWorker(
 
   return `// Generated by @crewhaus/target-cf-worker-workflow. Do not edit by hand.
 // Regenerate via the studio PWA or \`crewhaus compile --target cf-worker-workflow\`.
-${taxonomyWarning}${toolNote}import { runWorkerLoop, createEdgeAnthropicAdapter } from "@crewhaus/worker-runtime";
+${taxonomyWarning}${toolNote}import { runWorkerLoop, createEdgeAnthropicAdapter, chatAuthRefusal } from "@crewhaus/worker-runtime";
 ${toolImports}${toolInits}
 const CONFIG = {
   name: ${name},
@@ -240,6 +360,8 @@ ${steps}
   allowedOrigins: ${allowed},
   trace: ${traceEnabled},
   limits: ${limits},
+  permissions: ${permissions},
+  publicChat: ${publicChat},
 };
 
 // One real edge-safe RegisteredTool array per step, in step order.
@@ -253,9 +375,18 @@ export default {
 
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
-      return json({ ok: true, harness: CONFIG.name }, 200, cors);
+      return json({ ok: true }, 200, cors);
     }
     if (request.method === "POST" && url.pathname === "/chat") {
+      // The CHAT_TOKEN bearer is checked first: a request without it is
+      // answered before its body is read or the model key is looked up.
+      if (!CONFIG.publicChat) {
+        const refusal = await chatAuthRefusal(request.headers.get("authorization"), env.CHAT_TOKEN);
+        if (refusal) {
+          const headers = refusal.status === 401 ? { ...cors, "WWW-Authenticate": "Bearer" } : cors;
+          return json({ error: { code: refusal.code, message: refusal.message } }, refusal.status, headers);
+        }
+      }
       return handleChat(request, env, cors);
     }
     return json({ error: { code: "NOT_FOUND" } }, 404, cors);
@@ -304,11 +435,11 @@ async function handleChat(request, env, cors) {
       const total = CONFIG.steps.length;
 
       try {
-        let priorOutput = "";
+        let priorOutput = "";${runStart}
         for (let i = 0; i < total; i++) {
           const step = CONFIG.steps[i];
           const stepNum = i + 1;
-          const isLast = i === total - 1;
+          const isLast = i === total - 1;${stepGuard}
           // First step gets the user text; later steps get a synthetic message
           // embedding the prior step's output.
           const userContent =
@@ -354,7 +485,8 @@ async function handleChat(request, env, cors) {
             tools: STEP_TOOLS[i],
             maxTokens: step.maxTokens,
             ...(step.thinking ? { thinking: step.thinking } : {}),
-            ...(CONFIG.limits ? { limits: CONFIG.limits } : {}),
+            ${stepLimits}
+            permissions: CONFIG.permissions,
             emitTrace: trace,
           });
           if (result.failure) {
@@ -407,7 +539,7 @@ function buildCors(origin) {
   return {
     "Access-Control-Allow-Origin": allow,
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
     Vary: "Origin",
   };
 }
@@ -421,7 +553,7 @@ function json(body, status, cors) {
 `;
 }
 
-function renderWrangler(ir: IrWorkflowV0): string {
+function renderWrangler(ir: IrWorkflowV0, publicChat: boolean): string {
   const safeName = ir.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
   return `name = "${safeName}"
 main = "worker.js"
@@ -429,14 +561,22 @@ compatibility_date = "2026-05-01"
 compatibility_flags = ["nodejs_compat"]
 
 # worker.js imports @crewhaus/worker-runtime and the edge-safe tool packages;
-# \`wrangler deploy\` bundles them (run \`npm install\` first). ANTHROPIC_API_KEY
-# is a Worker Secret (never committed):
+# \`wrangler deploy\` bundles them (run \`npm install\` first). Its secrets are
+# Worker Secrets (never committed):
 #   wrangler secret put ANTHROPIC_API_KEY
-# The studio PWA sets this automatically via the Deploy flow.
+${chatTokenLine(publicChat)}
+# The studio PWA sets ANTHROPIC_API_KEY through its Deploy flow.
 
 [observability]
 enabled = true
 `;
+}
+
+/** The wrangler.toml line that names the `/chat` bearer, or says there is none. */
+function chatTokenLine(publicChat: boolean): string {
+  return publicChat
+    ? "# cf_worker.public_chat: POST /chat answers without a token"
+    : "#   wrangler secret put CHAT_TOKEN   # the bearer every POST /chat must send";
 }
 
 /**

@@ -141,6 +141,8 @@ agent:
   model: claude-haiku-4-5-20251001
   instructions: You are a helpful assistant.
 tools: [webFetch, gitStatus]
+permissions:
+  rules: [{ type: alwaysAllow, pattern: WebFetch }]
 `;
     const res = await worker.fetch(
       request("/compile", {
@@ -183,6 +185,8 @@ agent:
   model: claude-haiku-4-5-20251001
   instructions: You are a helpful assistant.
 tools: [webFetch]
+permissions:
+  rules: [{ type: alwaysAllow, pattern: WebFetch }]
 `;
     const gated = await compileEdge(`${head}provability:\n  level: grounded\n`);
     expect(gated.map((w) => [w.code, w.path])).toEqual([["accepted-but-unwired", "provability"]]);
@@ -193,6 +197,71 @@ tools: [webFetch]
     expect(parked.map((w) => w.code)).toContain("provability-inert-block");
     // Without either, nothing.
     expect(await compileEdge(head)).toEqual([]);
+  });
+
+  test("POST /compile emitAs:cf-worker refuses a safety setting the worker does not enforce, naming it", async () => {
+    const yaml = `
+name: spend
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+budget:
+  usd: 0.5
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("COMPILE");
+    expect(body.error.message).toContain(
+      "cf-worker target cannot enforce 1 safety setting(s) this spec declares:",
+    );
+    expect(body.error.message).toContain("  budget: a Cloudflare Worker keeps no spend meter");
+  });
+
+  test("POST /compile emitAs:cf-worker says which wired tools no alwaysAllow rule covers, and a public /chat", async () => {
+    const compileEdge = async (yaml: string) => {
+      const res = await worker.fetch(
+        request("/compile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+        }),
+        env,
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        bundle: { warnings?: Array<{ code: string; path: string; message: string }> };
+      };
+      return body.bundle.warnings ?? [];
+    };
+    const head = `
+name: edge
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+tools: [webFetch]
+`;
+    const unruled = await compileEdge(head);
+    expect(unruled.map((w) => [w.code, w.path])).toEqual([["edge-tool-needs-allow", "tools"]]);
+    expect(unruled[0]?.message).toContain("`WebFetch` runs on a Cloudflare Worker only when");
+    const publicChat = await compileEdge(
+      `${head}permissions:\n  rules: [{ type: alwaysAllow, pattern: WebFetch }]\ncf_worker:\n  public_chat: true\n`,
+    );
+    expect(publicChat.map((w) => [w.code, w.path])).toEqual([
+      ["edge-public-chat", "cf_worker.public_chat"],
+    ]);
+    expect(publicChat[0]?.message).toContain(
+      "/chat on this worker answers any caller without a token",
+    );
   });
 
   test("POST /compile emitAs:cf-worker with a workflow spec returns a worker.js bundle", async () => {

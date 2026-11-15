@@ -1485,6 +1485,12 @@ export const HUMAN_OWNED_PATHS: ReadonlyArray<{
     reason:
       "the waiver judge's roster is never auto-patched, its model is spend, and allow_self_judge is a measurement waiver",
   },
+  // -- who may call a deployed Cloudflare Worker --
+  {
+    pattern: ["cf_worker"],
+    reason:
+      "who may call a deployed worker's /chat is the owner's decision, which an eval cannot see",
+  },
 ]);
 
 /** A leaf path is human-owned when some {@link HUMAN_OWNED_PATHS} row matches it. */
@@ -1629,12 +1635,18 @@ export function wildcardPlacementIssues(
  * `transaction_policy` is whitelisted WHOLESALE so the optimizer can tune the
  * value ceiling and simulation against an eval, and an eval cannot see a human
  * approval go away. A block patch that carries the spec's value passes.
+ *
+ * `cf_worker.public_chat` is whether a deployed Cloudflare Worker's `/chat`
+ * answers without its `CHAT_TOKEN` bearer: the owner's decision, which an
+ * eval cannot see. No entry admits `cf_worker`; the row keeps a wider entry,
+ * a block patch and a `remove` from reaching it too.
  */
 export const OPTIMIZER_REFUSED_LEAVES: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
   Object.freeze(["model_pool", "learning", "seed"]),
   Object.freeze(["provability", "level"]),
   Object.freeze(["provability", "on_fail"]),
   Object.freeze(["transaction_policy", "defaultWriteApproval"]),
+  Object.freeze(["cf_worker", "public_chat"]),
 ]);
 
 /**
@@ -1651,6 +1663,8 @@ const REFUSED_LEAF_REASONS: Readonly<Record<string, string>> = Object.freeze({
     "what a below-floor answer becomes (retry / halt / note / escalate) is human-owned semantics the optimizer is graded under (design §9.2)",
   "transaction_policy.defaultWriteApproval":
     "who approves a write is human-owned, because an eval cannot see a human approval go away",
+  "cf_worker.public_chat":
+    "whether a deployed worker's /chat answers without a token is the owner's decision, and an eval cannot see it",
 });
 
 function refusedLeafReason(pattern: ReadonlyArray<string>): string {

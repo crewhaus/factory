@@ -604,6 +604,19 @@ export type LocatedRuleProblem = PermissionRuleProblem & {
   readonly path: string;
 };
 
+/** Which build the permission-rule findings are for. */
+export type PermissionRuleCheckOptions = {
+  /**
+   * A Cloudflare Worker's (`compile --emit-as cf-worker`). A worker reads the
+   * deny and ask rules of `permissions.rules` before its allow rules, so one
+   * listed below an allow decides every call it matches there, and the
+   * findings about that list's first-match order are not said. The edge
+   * notice `edge-tool-needs-allow` says when such a rule refuses every call
+   * to a wired tool.
+   */
+  readonly edge?: boolean;
+};
+
 /**
  * The permission rules of a spec that can never do what they say (see
  * `permissionRuleProblems`, and `shadowedPermissionRules` for a deny or ask
@@ -613,12 +626,14 @@ export type LocatedRuleProblem = PermissionRuleProblem & {
  * one the lowered spec lists, described by the live tool `resolveTool`
  * returns, falling back to the builtin manifest, so the check sees the same
  * declarations the runtime will; the tools a `thredz:` block registers are
- * known in a spec that has one.
+ * known in a spec that has one. For a worker's build (`opts.edge`), the
+ * shape's rules are read in the worker's order.
  */
 export function permissionRuleProblemsOf(
   spec: unknown,
   ir: IrNode,
   resolveTool: (name: string) => RegisteredTool | undefined,
+  opts: PermissionRuleCheckOptions = {},
 ): LocatedRuleProblem[] {
   const lists = specPermissionRuleLists(spec);
   if (lists.length === 0) return [];
@@ -646,11 +661,14 @@ export function permissionRuleProblemsOf(
     }
   }
   // A deny or ask that an allow above it in the same layer always beats —
-  // except in a plan-mode spec, which reads no allow, where it is a note.
+  // except in a plan-mode spec, which reads no allow, where it is a note. A
+  // worker reads the shape's deny and ask rules first, so on its build that
+  // list's order decides nothing.
   const permissions = (spec as { readonly permissions?: { readonly mode?: unknown } } | null)
     ?.permissions;
   const mode = typeof permissions?.mode === "string" ? permissions.mode : undefined;
   for (const p of shadowedPermissionRules(lists, mode !== undefined ? { mode } : {})) {
+    if (opts.edge === true && p.list === "permissions.rules") continue;
     const { shadowedBy: _allow, ...problem } = p;
     out.push({ ...problem, path: `${p.list}[${p.type} ${p.pattern}]` });
   }
@@ -672,11 +690,13 @@ const PERMISSION_RULE_NOTES: ReadonlySet<string> = new Set([
  *
  * `loadTools` imports every builtin package the CLI carries (about half a
  * second), so it is called only when the spec has a rule to check: a
- * rule-less compile does not pay for it.
+ * rule-less compile does not pay for it. `opts.edge` reads the rules as a
+ * Cloudflare Worker reads them (see {@link PermissionRuleCheckOptions}).
  */
 export async function permissionRuleWarnings(
   yamlText: string,
   loadTools: () => Promise<Readonly<Record<string, RegisteredTool>>>,
+  opts: PermissionRuleCheckOptions = {},
 ): Promise<Array<{ code: string; path: string; message: string }>> {
   let spec: Spec;
   let ir: IrNode;
@@ -694,13 +714,16 @@ export async function permissionRuleWarnings(
   // declared MCP server's tools), a `tool-not-known` one about a name a
   // plugin or custom tool may still supply, and a `shadowed-outside-plan` one
   // about a rule a plan-mode spec still fires, so --strict escalates none.
-  return permissionRuleProblemsOf(spec, ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
-    (p) => ({
-      code: PERMISSION_RULE_NOTES.has(p.code) ? "permission-rule-note" : "permission-rule",
-      path: p.list,
-      message: p.message,
-    }),
-  );
+  return permissionRuleProblemsOf(
+    spec,
+    ir,
+    (name) => toolMap[name] ?? byRegisteredName[name],
+    opts,
+  ).map((p) => ({
+    code: PERMISSION_RULE_NOTES.has(p.code) ? "permission-rule-note" : "permission-rule",
+    path: p.list,
+    message: p.message,
+  }));
 }
 
 /** Re-exported for the CLI wrapper's philosophy-alignment parity note. */

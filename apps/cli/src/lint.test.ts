@@ -509,6 +509,83 @@ permissions:
     ]);
   });
 
+  // 0.8.3: a Cloudflare Worker reads the deny and ask rules of
+  // permissions.rules before its allow rules, so on its build a deny listed
+  // below an allow decides every call it matches.
+  test("an edge build reads permissions.rules in the worker's order: a deny below an allow is not said to be dead there", async () => {
+    const yaml = `${validCli.replace(
+      "  instructions: hi\n",
+      `  instructions: hi
+  sub_agents:
+    fixer:
+      description: d
+      instructions: fix
+      tools: [WebFetch]
+      permissions:
+        allow: ['WebFetch']
+        deny: ['WebFetch(https://evil.example.net/**)']
+`,
+    )}tools: [webFetch]
+permissions:
+  rules:
+    - { type: alwaysAllow, pattern: WebFetch }
+    - { type: alwaysDeny, pattern: "WebFetch(https://evil.example.net/**)" }
+    - { type: alwaysAsk, pattern: "WebFetch(http://**)" }
+    - { type: alwaysDeny, pattern: webFetch }
+`;
+    /** Each finding as its code, its list and what it says of which rule. */
+    const said = (warnings: ReadonlyArray<{ code: string; path: string; message: string }>) =>
+      warnings.map((w) => [
+        w.code,
+        w.path,
+        /never fires outside plan mode|fires in this spec's plan mode/.test(w.message)
+          ? "order"
+          : "spelling",
+        /^rule "([^"]+)"/.exec(w.message)?.[1],
+      ]);
+    // A local build reads the first rule that matches, so the deny and the
+    // ask below the allow never fire there.
+    expect(said(await permissionRuleWarnings(yaml, async () => ({})))).toEqual([
+      ["permission-rule", "permissions.rules", "spelling", "webFetch"],
+      [
+        "permission-rule",
+        "permissions.rules",
+        "order",
+        "alwaysDeny WebFetch(https://evil.example.net/**)",
+      ],
+      ["permission-rule", "permissions.rules", "order", "alwaysAsk WebFetch(http://**)"],
+      [
+        "permission-rule",
+        "agent.sub_agents.fixer.permissions.deny",
+        "order",
+        "alwaysDeny WebFetch(https://evil.example.net/**)",
+      ],
+    ]);
+    // A worker reads every deny and ask first, so no order finding is said for
+    // its list. A rule naming the tool's key matches nothing on either build,
+    // and a sub-agent's lists are read the same way on both.
+    expect(said(await permissionRuleWarnings(yaml, async () => ({}), { edge: true }))).toEqual([
+      ["permission-rule", "permissions.rules", "spelling", "webFetch"],
+      [
+        "permission-rule",
+        "agent.sub_agents.fixer.permissions.deny",
+        "order",
+        "alwaysDeny WebFetch(https://evil.example.net/**)",
+      ],
+    ]);
+    // In a plan-mode spec the order is a note locally, and nothing on the edge.
+    const plan = yaml.replace("permissions:\n  rules:", "permissions:\n  mode: plan\n  rules:");
+    const notes = async (edge: boolean) =>
+      (await permissionRuleWarnings(plan, async () => ({}), { edge }))
+        .filter((w) => w.code === "permission-rule-note" && w.path === "permissions.rules")
+        .map((w) => /^rule "([^"]+)"/.exec(w.message)?.[1]);
+    expect(await notes(false)).toEqual([
+      "alwaysDeny WebFetch(https://evil.example.net/**)",
+      "alwaysAsk WebFetch(http://**)",
+    ]);
+    expect(await notes(true)).toEqual([]);
+  });
+
   // wave III review: a pool candidate carries its own deny/ask inline, read
   // the same way as a profile's, and neither lint nor PermissionAudit read
   // it. The lists now come from one reader both use.

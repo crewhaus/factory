@@ -2168,8 +2168,10 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     // lower() + the target-cf-worker-* emitters directly (mirroring the
     // compiler-worker's remote arm), not the local compile(). The offline
     // scope gate runs inside emitCfWorkerBundle (the same assertToolScopesStrict
-    // the Worker applies), and any emitter refusal (an unsupported target, a
-    // tool the edge doesn't yet run) is a CompilerError → clean one-liner.
+    // the Worker applies), and so does the edge safety gate, which reads the
+    // parsed spec. Any refusal (an unsupported target, a tool the edge does
+    // not run, a setting the worker does not enforce) is a CompilerError →
+    // clean one-liner, and nothing is written.
     try {
       const cfSpec = parseSpec(yamlText);
       // Lowered with its warnings, as compile() lowers: a parked
@@ -2177,7 +2179,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
       // any other lowering notice is said here too, and --strict fails on it
       // on the edge path exactly as on the local one.
       const cfLowered = lowerWithWarnings(cfSpec);
-      const emitted = emitCfWorkerBundle(cfLowered.ir, { readme });
+      const emitted = emitCfWorkerBundle(cfSpec, cfLowered.ir, { readme });
       // Warnings ride along like compile()'s: printed below, and escalated by
       // --strict before any file is written.
       bundle = {
@@ -2219,8 +2221,12 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // emits nothing.
   // 0.7.1 (permission-integration#12) — permission rules that can never do
   // what they say, the same check `crewhaus lint` runs. Remediable, so
-  // --strict fails on them like any other compile warning.
-  const warnings = [...bundle.warnings, ...(await permissionRuleWarnings(yamlText, loadToolMap))];
+  // --strict fails on them like any other compile warning. An edge build's
+  // rules are read in the worker's order: deny and ask rules first.
+  const warnings = [
+    ...bundle.warnings,
+    ...(await permissionRuleWarnings(yamlText, loadToolMap, { edge: emitCfWorker })),
+  ];
   for (const warning of warnings) {
     process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
   }
