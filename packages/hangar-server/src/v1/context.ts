@@ -37,10 +37,23 @@ export type V1Deps = {
   readonly baseUrl?: string;
   readonly harnessScrub: (dir: string) => TextScrubber;
   readonly fleetScrub: () => TextScrubber;
-  /** What Home's supervisor says the daemon is doing. */
+  /**
+   * What Home's supervisor says the daemon is doing, for an operation that acts on it:
+   * a daemon Home has not attached yet is attached first.
+   */
   readonly daemonState: (entry: HangarHarnessEntry) => Promise<DaemonState>;
-  /** The daemon's own control status, when one is reachable. */
+  /** The daemon's own control status, when one is reachable, for an operation that acts. */
   readonly daemonStatus: (entry: HangarHarnessEntry) => Promise<DaemonStatus>;
+  /**
+   * What the daemon is doing, for a read: observed, never attached, cleared or written.
+   * A live daemon Home does not hold yet is `running`.
+   */
+  readonly observedDaemonState: (entry: HangarHarnessEntry) => Promise<DaemonState>;
+  /**
+   * The daemon's own control status, for a read: a live daemon Home does not hold yet is
+   * asked at the port its runfile records. Nothing is attached, cleared or written.
+   */
+  readonly observedDaemonStatus: (entry: HangarHarnessEntry) => Promise<DaemonStatus>;
   /**
    * Start one job for a run the control API queued, through Home's supervisor: its plan
    * passes `apiRun`. Absent: Home starts no jobs, and a job run is refused.
@@ -53,6 +66,11 @@ export type V1Deps = {
   /** The control client Home reaches daemons with, and where a harness's daemon listens. */
   readonly controlClient?: ControlClient;
   readonly controlTarget?: (entry: HangarHarnessEntry) => Promise<ControlTarget>;
+  /**
+   * Where a harness's daemon listens, for a read: the port Home holds, or, for a live
+   * daemon it does not hold yet, the port its runfile records. Never attaches anything.
+   */
+  readonly observedControlTarget?: (entry: HangarHarnessEntry) => Promise<ControlTarget>;
   /** Stop a harness's daemon the way `crewhaus daemon stop` does, for retire. */
   readonly stopDaemon: (entry: HangarHarnessEntry) => Promise<{
     readonly ok: boolean;
@@ -61,11 +79,14 @@ export type V1Deps = {
   /**
    * An event stream's abort signal and its end: the client going away, its session
    * ending, or its re-check refusing it. A stream calls `dispose` once it finishes, for
-   * every reason. Absent: a stream closes only when its client goes.
+   * every reason, and calls `check` before every batch it reads: it answers the event the
+   * stream closes with when the request is no longer allowed. Absent: a stream closes
+   * only when its client goes.
    */
   readonly streamSignal?: (req: Request) => {
     readonly signal: AbortSignal | undefined;
     readonly dispose: () => void;
+    readonly check?: () => "auth.revoked" | "auth.expired" | undefined;
   };
   /**
    * The caller's authority as the access records stand now. A stream's reads run after

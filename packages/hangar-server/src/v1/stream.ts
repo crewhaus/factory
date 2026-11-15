@@ -11,7 +11,8 @@
  * - A cap of frames or of time ends the stream with `stream.pause {reason, resumeFrom}`,
  *   never with a terminal event: a client that reconnects from `resumeFrom` gets the next
  *   frame. A session that ends closes it with `auth.expired`, and a session or a re-check
- *   that refuses it with `auth.revoked`.
+ *   that refuses it with `auth.revoked`. The request is decided again before every batch
+ *   (`recheck`), so a batch is read only while the caller may still read it.
  * - `dispose` is called exactly once, whatever ends the stream: its own end, a cap, an
  *   abort, the client going away, or a read that throws.
  *
@@ -54,6 +55,11 @@ export type StreamPlan = {
   dispose(): void;
   /** The people exit; the default releases a people frame only where the caller may see it. */
   readonly exitFrame?: (frame: StreamFrame, access: RequestAccess, at: string) => StreamFrame;
+  /**
+   * The request decided again, before every batch: `undefined` while it is still allowed,
+   * else the event the stream closes with. A refused batch is never read.
+   */
+  readonly recheck?: () => "auth.revoked" | "auth.expired" | undefined;
 };
 
 export type StreamTimers = {
@@ -233,6 +239,11 @@ export function v1EventStream(options: V1StreamOptions): Response {
       const readOnce = async (): Promise<void> => {
         armed.read = undefined;
         if (closed) return;
+        const refused = options.recheck?.();
+        if (refused !== undefined) {
+          finish(refused);
+          return;
+        }
         const access = options.accessNow();
         let batch: StreamBatch;
         try {

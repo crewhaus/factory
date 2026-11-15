@@ -706,12 +706,15 @@ these on: they reach every harness that uses what each one names.
 
 - **Home refuses a spec edit that would write a hidden value's placeholder.** A
   change to `crewhaus.yaml` through Home or its API is refused, and writes or
-  stages nothing, when its new value or key holds `[redacted]` or a `«NAME»`
-  placeholder for one of the harness's secrets. The spec editor answers
-  `edit_rejected` naming the setting. This holds for the settings form, a
-  patch, a preview, a proposal, an advice apply, watch-me and the connector
-  builders. Text the file already holds at that place is kept as it is. Type
-  the real value, or edit `crewhaus.yaml`.
+  stages nothing, when its new value or key holds `[redacted]` or any `«NAME»`
+  word of a placeholder's shape (letters, digits, `_`, `.` or `-` between
+  guillemets) that the file does not already hold at that place. The shape
+  alone decides, whether or not the name is one of the harness's secrets, so a
+  single word quoted in guillemets, such as `«Bonjour»`, is refused too; `«two
+  words»` is ordinary text. The spec editor answers `edit_rejected` naming the
+  setting. This holds for the settings form, a patch, a preview, a proposal, an
+  advice apply, watch-me and the connector builders. Type the real value, or
+  edit `crewhaus.yaml`.
 
 - **A schedule's time zone and cron are checked when the spec compiles.** On
   channel, managed and batch, a `schedule:` (the single object and every named

@@ -76,8 +76,12 @@ export function labelOf(key) {
 /** What the value-shape masker puts where a credential-shaped span was. */
 export const SHAPE_MASK = "***";
 
-/** What the harness's env scrubber puts where a value its `.env` holds was: `«NAME»`. */
-const SCRUBBED_RE = /«[A-Za-z_][A-Za-z0-9_]*»/;
+/**
+ * What the harness's scrubber puts where a value its `.env` or its spec's credentials
+ * hold was: `«NAME»`, the name an env variable's or a spec credential key's
+ * (`«BOT_TOKEN»`, `«x-api-key»`). The same shape the server refuses to write.
+ */
+const SCRUBBED_RE = /«[A-Za-z0-9_.-]{1,128}»/;
 
 /**
  * The first placeholder a masker left in a string, or null: the key-name

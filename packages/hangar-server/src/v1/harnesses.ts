@@ -45,7 +45,7 @@ async function displayOf(ctx: V1Context, entry: HangarHarnessEntry, dir: string 
   }
   const operator = readOperatorRecord(dir);
   const record = operator.state === "present" ? operator.record : undefined;
-  const daemon = await ctx.deps.daemonState(entry);
+  const daemon = await ctx.deps.observedDaemonState(entry);
   const beat = daemon === "running" || daemon === "draining" ? heartbeatOf(dir) : undefined;
   const disabled = operator.state === "unreadable" || record?.deployment?.disabled === true;
   const paused = operator.state === "unreadable" || record?.intake?.paused === true;
@@ -229,7 +229,7 @@ const capabilities: V1Handler = async (ctx) => {
   const status: DaemonStatus =
     dir === undefined
       ? { ok: false, reason: "the harness folder is missing" }
-      : await ctx.deps.daemonStatus(entry);
+      : await ctx.deps.observedDaemonStatus(entry);
   const row = (
     SHAPE_RUN_CONTROLS as Readonly<Record<string, Record<string, CapabilityDescriptor>>>
   )[entry.target as RunControlShape];
@@ -284,7 +284,7 @@ const health: V1Handler = async (ctx) => {
   const dir = liveDirOf(entry);
   const beat = dir === undefined ? undefined : heartbeatOf(dir);
   const at = beat?.at === undefined ? Number.NaN : Date.parse(beat.at);
-  const status = dir === undefined ? undefined : await ctx.deps.daemonStatus(entry);
+  const status = dir === undefined ? undefined : await ctx.deps.observedDaemonStatus(entry);
   return {
     status: 200,
     body: {

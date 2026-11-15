@@ -84,8 +84,12 @@ export function resumeCursor(ctx: V1Context, kind: "vector" | "fleet"): Cursor |
   return decoded.cursor;
 }
 
-/** The stream's own abort signal and end, from Home, or the client's alone. */
-function signalOf(ctx: V1Context): { signal: AbortSignal | undefined; dispose: () => void } {
+/** The stream's own abort signal, end and per-batch check, from Home, or the client's alone. */
+function signalOf(ctx: V1Context): {
+  signal: AbortSignal | undefined;
+  dispose: () => void;
+  check?: () => "auth.revoked" | "auth.expired" | undefined;
+} {
   return ctx.deps.streamSignal?.(ctx.req) ?? { signal: ctx.req.signal, dispose: () => undefined };
 }
 
@@ -314,8 +318,8 @@ function planOf(
   start: string,
   read: (access: RequestAccess) => StreamBatch,
 ): StreamPlan {
-  const { signal, dispose } = signalOf(ctx);
-  return { start, read, signal, dispose };
+  const { signal, dispose, check } = signalOf(ctx);
+  return { start, read, signal, dispose, ...(check !== undefined ? { recheck: check } : {}) };
 }
 
 /** The executions a run's rows (newest first) name, oldest first, each once. */

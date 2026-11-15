@@ -249,9 +249,14 @@ describe("carriesMasked", () => {
     // Look-alikes that no masker writes.
     expect(carriesMasked("a ** b")).toBe(false);
     expect(carriesMasked("« not a name »")).toBe(false);
-    expect(carriesMasked("«1X»")).toBe(false);
+    expect(carriesMasked("«a/b»")).toBe(false);
+    // A spec credential key's name is a placeholder the scrubber writes.
+    expect(carriesMasked("«1x-token»")).toBe(true);
     expect(maskedMarkerOf({ a: "Use *** for calls" })).toBe("***");
     expect(maskedMarkerOf({ a: "«FIXTURE_MODEL»" })).toBe("«FIXTURE_MODEL»");
+    expect(maskedMarkerOf({ a: "https://h/?k=«x-api-key»" })).toBe("«x-api-key»");
+    expect(maskedMarkerOf({ a: "«bot.token»" })).toBe("«bot.token»");
+    expect(maskedMarkerOf({ a: "«not a name»" })).toBeNull();
     expect(maskedMarkerOf({ a: "plain" })).toBeNull();
   });
 });

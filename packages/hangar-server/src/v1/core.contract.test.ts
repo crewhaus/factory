@@ -96,6 +96,74 @@ afterAll(async () => {
   await home?.t.stop();
 });
 
+describe("a command ref resolves only for a caller who may see its receipt", () => {
+  test("a viewer gets the unknown-ref answer for a Home receipt it may not see; its actor, the owner and a harness reader get theirs", async () => {
+    const own = await v1Home();
+    try {
+      const x = await own.harness("refs-x");
+      const y = await own.harness("refs-y");
+      const viewer = await own.member("Vic", "viewer");
+      // A second personal token of the same member, spent on a Home-ledger command of its own.
+      const devices = openDeviceRequests(own.t.hangarRoot);
+      const start = await devices.start({ requestedFrom: { via: "home" } });
+      if (!start.ok) throw new Error(start.reason);
+      const decided = await devices.decide({
+        caller: viewer.principal,
+        code: start.userCode,
+        choice: "allow",
+      });
+      if (!decided.ok) throw new Error(decided.reason);
+      const polled = await devices.poll(start.pollRef);
+      if (!polled.ok || polled.state !== "allowed") throw new Error("no second token");
+      const selfRevoked = await own.call(
+        "POST",
+        `/api/v1/access/tokens/${polled.token.id}/revoke`,
+        { body: {}, secret: polled.secret },
+      );
+      expect(selfRevoked.status).toBeLessThan(300);
+      const viewerCmd = (selfRevoked.body["receipt"] as { id: string }).id;
+      // The owner's invite: a receipt in Home's own ledger.
+      const invited = await own.call("POST", "/api/v1/access/invites", {
+        body: { role: "viewer", scope: "home", seal: (await makeSeal()).seal },
+      });
+      expect(invited.status).toBeLessThan(300);
+      const inviteCmd = (invited.body["receipt"] as { id: string }).id;
+      // The owner's pause of x: a receipt in x's own ledger.
+      const paused = await own.call("POST", `/api/v1/harnesses/${x.id}/controls/pause`, {
+        body: { quiet: true },
+      });
+      expect(paused.status).toBeLessThan(300);
+      const pauseCmd = (paused.body["receipt"] as { id: string }).id;
+
+      const asViewer = (ref: string) =>
+        own.call("GET", `/api/v1/refs/${ref}`, { secret: viewer.secret });
+      const unknown = mintId("cmd");
+      const seen = async (ref: string) => {
+        const res = await asViewer(ref);
+        return [res.status, JSON.stringify(res.body)];
+      };
+      // Home's ledger: the owner's receipt answers as an id that never existed.
+      const unknownAtHome = await seen(`home/cmd/${unknown}`);
+      expect(unknownAtHome[0]).toBe(404);
+      expect(await seen(`home/cmd/${inviteCmd}`)).toEqual(unknownAtHome);
+      // A harness ref looks in that harness's ledger only.
+      const unknownInX = await seen(`${x.id}/cmd/${unknown}`);
+      expect(unknownInX[0]).toBe(404);
+      expect(await seen(`${x.id}/cmd/${inviteCmd}`)).toEqual(unknownInX);
+      expect(await seen(`${y.id}/cmd/${pauseCmd}`)).toEqual(await seen(`${y.id}/cmd/${unknown}`));
+      // Whoever may see it gets it.
+      expect((await own.call("GET", `/api/v1/refs/home/cmd/${inviteCmd}`)).status).toBe(200);
+      const mine = await asViewer(`home/cmd/${viewerCmd}`);
+      expect([mine.status, mine.body["kind"]]).toEqual([200, "cmd"]);
+      const inX = await asViewer(`${x.id}/cmd/${pauseCmd}`);
+      expect([inX.status, inX.body["kind"]]).toEqual([200, "cmd"]);
+      expect(schemaOf("refResolved")?.safeParse(inX.body).success).toBe(true);
+    } finally {
+      await own.t.stop();
+    }
+  }, 30_000); // a Home of its own, a member, two tokens and a dozen requests; slow on a loaded runner
+});
+
 describe("a build recorded before its harness was registered", () => {
   test("deployments.list and deployments.get fill its harness, and it parses", async () => {
     const list = await home.call("GET", `/api/v1/harnesses/${a.id}/deployments`);

@@ -157,8 +157,13 @@ export function supervisorLedgerOf(dir: string): RecordSource {
   return { root: dir, records: { file: join(".crewhaus", "run", RUN_LEDGER_NAME) } };
 }
 
-/** Execution `id`'s lines among a harness's newest supervisor ledger lines, newest first. */
-function executionRowsIn(dir: string, id: string): LedgerRecord[] {
+/**
+ * Execution `id`'s lines among a harness's newest supervisor ledger lines, newest first.
+ * The ledger is read as one contained record file (a regular file inside the harness,
+ * never through a link) and bounded to {@link RUN_LOOKUP_LINES} lines; a ledger that
+ * cannot be read that way answers `[]`.
+ */
+export function executionRowsIn(dir: string, id: string): LedgerRecord[] {
   try {
     return readPage(supervisorLedgerOf(dir), { limit: RUN_LOOKUP_LINES })
       .items.map((item) => item.record)

@@ -5727,12 +5727,16 @@ describe("the release notes name the spec edits Home refuses for a hidden value'
     defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
 
   test("a placeholder is refused at the commit and at the preview, and the bullet says so", () => {
-    const names = new Set(["HELPER_TOKEN"]);
-    expect(maskedPlaceholderPaths("a: real\n", 'a: "[redacted]"\n', names)).toEqual([["a"]]);
-    expect(maskedPlaceholderPaths("a: real\n", "a: use «HELPER_TOKEN»\n", names)).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: real\n", 'a: "[redacted]"\n')).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: real\n", "a: use «HELPER_TOKEN»\n")).toEqual([["a"]]);
+    // The shape decides: a name no secret carries is refused as well, and so is a spec
+    // credential key's name; a guillemet span of another shape is ordinary text.
+    expect(maskedPlaceholderPaths("a: real\n", "a: say «Bonjour»\n")).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: real\n", "a: k=«x-api-key»\n")).toEqual([["a"]]);
+    expect(maskedPlaceholderPaths("a: real\n", "a: «two words»\n")).toEqual([]);
     // Text the file already holds at that path is kept, and `***` is ordinary text.
-    expect(maskedPlaceholderPaths('a: "[redacted]"\n', 'a: "[redacted]"\n', names)).toEqual([]);
-    expect(maskedPlaceholderPaths("a: real\n", 'a: "***"\n', names)).toEqual([]);
+    expect(maskedPlaceholderPaths('a: "[redacted]"\n', 'a: "[redacted]"\n')).toEqual([]);
+    expect(maskedPlaceholderPaths("a: real\n", 'a: "***"\n')).toEqual([]);
     // Both doors every spec write and every preview pass through run the check.
     const source = readFileSync(join(ROOT, "packages/hangar-server/src/spec-edit.ts"), "utf8");
     const bodyOf = (signature: string, end: string): string => {
@@ -5744,13 +5748,16 @@ describe("the release notes name the spec edits Home refuses for a hidden value'
     };
     const commit = bodyOf("export async function commitHomeEdits(", "\n}\n");
     const preview = bodyOf("export async function previewHomeEdits(", "\n}\n");
-    expect(commit).toContain("placeholderRefusal(ctx, before, yamlText)");
-    expect(preview.split("placeholderPreview(ctx, before, edits, preview)")).toHaveLength(3);
+    expect(commit).toContain("placeholderRefusal(before, yamlText)");
+    expect(preview.split("placeholderPreview(before, edits, preview)")).toHaveLength(3);
     const bullet = bulletFor(
       "Home refuses a spec edit that would write a hidden value's placeholder.",
     );
     expect(bullet).toContain("`[redacted]`");
     expect(bullet).toContain("`«NAME»`");
+    expect(bullet).toContain("does not already hold at that place");
+    expect(bullet).toContain("whether or not the name is one of the harness's secrets");
+    expect(bullet).not.toContain("placeholder for one of the harness's secrets");
     expect(bullet).toContain("`edit_rejected`");
   });
 });
