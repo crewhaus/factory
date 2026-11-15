@@ -41,8 +41,13 @@ const doc = (properties: Record<string, unknown>, extra: Record<string, unknown>
   definitions: { t: { type: "object", properties, additionalProperties: false }, ...extra },
 });
 
-const nodesOf = (schema: unknown, effective: unknown[] = [], trust: unknown[] = []) => {
-  const model = formModel(schema, effective, trust);
+const nodesOf = (
+  schema: unknown,
+  effective: unknown[] = [],
+  trust: unknown[] = [],
+  opts: Record<string, unknown> = {},
+) => {
+  const model = formModel(schema, effective, trust, opts);
   const all = flatten(model.groups) as Node[];
   const at = (path: string) => all.find((n) => n.segments.join(".") === path) as Node;
   return { model, all, at };
@@ -380,5 +385,118 @@ describe("the JSON pane's starting value", () => {
     expect(pane("agent")).toEqual({ a: 1 });
     expect(at("agent").seed).toEqual({ a: 1, b: 2 });
     expect(pane("memory")).toEqual({ on: false });
+  });
+});
+
+describe("a capped read seeds no block editor", () => {
+  const schema = doc({
+    agent: { type: "object", properties: { a: { type: "integer" }, b: { type: "integer" } } },
+  });
+  const rows = [
+    { segments: ["agent", "a"], value: 1, source: "declared" },
+    { segments: ["agent", "b"], value: 2, source: "default" },
+  ];
+  const pane = (node: Node) => (node as unknown as { paneSeed: unknown }).paneSeed;
+
+  test("while the rows are truncated, a block's pane starts empty and its controls keep their values", () => {
+    const { at } = nodesOf(schema, rows, [], { truncated: true });
+    expect(at("agent")).toBeDefined();
+    expect(pane(at("agent"))).toBeUndefined();
+    expect(at("agent").seed).toEqual({ a: 1, b: 2 });
+    expect(at("agent.a").seed).toBe(1);
+  });
+
+  test("whole rows seed the pane from what the file declares", () => {
+    expect(pane(nodesOf(schema, rows, [], { truncated: false }).at("agent"))).toEqual({ a: 1 });
+    expect(pane(nodesOf(schema, rows).at("agent"))).toEqual({ a: 1 });
+  });
+
+  // Every leaf kind, so a capped read builds no write for any of them.
+  const leaves = doc({
+    agent: {
+      type: "object",
+      properties: {
+        model: { type: "string" },
+        deny_tools: { type: "array", items: { type: "string" } },
+        max_tokens: { type: "integer" },
+        stream: { type: "boolean" },
+        mode: { enum: ["a", "b"] },
+        label: { type: "string" },
+      },
+    },
+  });
+  const onlyModel = [{ segments: ["agent", "model"], value: "m", source: "declared" }];
+  const capped = (node: Node) => (node as unknown as { capped: unknown }).capped;
+
+  test("in a truncated read, a setting with no row of its own is capped and builds no edit", () => {
+    const { at } = nodesOf(leaves, onlyModel, [], { truncated: true });
+    const list = at("agent.deny_tools");
+    expect(list.kind).toBe("list");
+    expect(capped(list)).toBe(true);
+    expect(fieldEdit(list, ["x"])).toBeNull();
+    expect(fieldEdit(at("agent.label"), "typed")).toBeNull();
+    expect(fieldEdit(at("agent.max_tokens"), "5")).toBeNull();
+    expect(fieldEdit(at("agent.stream"), true)).toBeNull();
+    expect(fieldEdit(at("agent.mode"), "a")).toBeNull();
+    expect(fieldEdit(at("agent.label"), CLEAR)).toBeNull();
+    for (const path of ["agent.label", "agent.max_tokens", "agent.stream", "agent.mode"]) {
+      expect(capped(at(path))).toBe(true);
+    }
+    // A setting the capped read did return still edits.
+    expect(capped(at("agent.model"))).toBe(false);
+    expect(fieldEdit(at("agent.model"), "n")).toEqual({ path: ["agent", "model"], value: "n" });
+  });
+
+  test("with whole rows, the same list edits", () => {
+    const { at } = nodesOf(leaves, onlyModel, [], { truncated: false });
+    const list = at("agent.deny_tools");
+    expect(capped(list)).toBe(false);
+    expect(fieldEdit(list, ["x"])).toEqual({ path: ["agent", "deny_tools"], value: ["x"] });
+    expect(fieldEdit(at("agent.label"), "typed")).toEqual({
+      path: ["agent", "label"],
+      value: "typed",
+    });
+  });
+});
+
+describe("a reserved name never becomes part of the form", () => {
+  test("a row under __proto__ is not read, and builds nothing on a prototype", () => {
+    const schema = doc({
+      tool_config: { type: "object", additionalProperties: { type: "object" } },
+    });
+    try {
+      const { all, at } = nodesOf(schema, [
+        {
+          segments: ["tool_config", "mytool", "__proto__", "polluted"],
+          value: "yes",
+          source: "declared",
+        },
+        { segments: ["tool_config", "mytool", "kept"], value: "ok", source: "declared" },
+      ]);
+      expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+      const block = at("tool_config");
+      expect(block).toBeDefined();
+      const seed = block.seed as Record<string, Record<string, unknown>>;
+      expect(seed).toEqual({ mytool: { kept: "ok" } });
+      expect(Object.hasOwn(seed["mytool"] ?? {}, "__proto__")).toBe(false);
+      for (const node of all) {
+        expect(node.segments).not.toContain("__proto__");
+        expect(JSON.stringify(node.seed ?? null)).not.toContain("polluted");
+      }
+    } finally {
+      Reflect.deleteProperty(Object.prototype, "polluted");
+    }
+  });
+
+  test("constructor and prototype rows are not read either", () => {
+    const schema = doc({
+      tool_config: { type: "object", additionalProperties: { type: "object" } },
+    });
+    const { at } = nodesOf(schema, [
+      { segments: ["tool_config", "constructor", "x"], value: 1, source: "declared" },
+      { segments: ["tool_config", "a", "prototype"], value: 2, source: "declared" },
+      { segments: ["tool_config", "a", "b"], value: 3, source: "declared" },
+    ]);
+    expect(at("tool_config").seed).toEqual({ a: { b: 3 } });
   });
 });
