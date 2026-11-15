@@ -32,7 +32,7 @@ const SESSION_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-runtime-core-cov-"));
 // `runChatLoop` only invokes runHooks when `hooks.length > 0`. We control
 // the per-event decision via a scripted map so deny/mutate/throw paths are
 // reachable without spawning the hook commands. When `hooksThrows` is set,
-// runHooks rejects so the fireHook try/catch (lines 705-711) runs.
+// runHooks rejects so fireHook's catch runs.
 const hookScript: {
   byEvent: Map<
     string,
@@ -73,6 +73,7 @@ mock.module("@crewhaus/session-store", () => ({
 import * as realHooksEngineNS from "@crewhaus/hooks-engine";
 const realHooksEngineSnapshot = { ...realHooksEngineNS };
 mock.module("@crewhaus/hooks-engine", () => ({
+  isGatingHookEvent: realHooksEngineSnapshot.isGatingHookEvent,
   runHooks: async (event: string) => {
     if (hookScript.throws) throw new Error("hook firing exploded");
     const scripted = hookScript.byEvent.get(event);
@@ -314,8 +315,8 @@ describe("runChatLoop — lifecycle hooks", () => {
     expect(cap.writes.join("")).toContain("agent>");
   });
 
-  test("a throwing hook is caught and treated as allow (fireHook catch)", async () => {
-    hookScript.throws = true; // runHooks rejects → catch → { allowed: true }
+  test("a hook firing that fails denies a gating event and the run goes on past observational ones", async () => {
+    hookScript.throws = true; // every firing fails: observational events continue, gating ones deny
     const ctx = createRunContext();
     const warnSpy = spyOn(ctx.logger, "warn");
     const input = new PassThrough();
@@ -336,6 +337,11 @@ describe("runChatLoop — lifecycle hooks", () => {
     }
     const failed = warnSpy.mock.calls.filter((c) => c[0] === "hook firing failed");
     expect(failed.length).toBeGreaterThan(0);
+    const written = cap.writes.join("");
+    // session-start went on to the agent turn …
+    expect(written).toContain("agent>");
+    // … and the pre-model firing refused the model call.
+    expect(written).toContain("[blocked by hook] hook firing failed");
   });
 
   test("pre-model deny short-circuits the turn with a [blocked by hook] assistant message", async () => {

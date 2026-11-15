@@ -772,6 +772,16 @@ these on: they reach every harness that uses what each one names.
   (`home.read`) gets the names; any other caller gets `waiting: []` and
   `waitingCount`.
 
+- **A hook that cannot run denies the call it gates.** A `pre-tool`,
+  `pre-model` or `pre-slash` hook whose command cannot be started counts as a
+  deny (`[blocked by hook] hook could not run`), as does a firing that fails
+  (`hook firing failed`), and a deny another hook returned in the same firing
+  stands. Each hook settles on its own, and a hook's verdict is read from
+  everything it wrote before it exited, even while a process it started keeps
+  its output open. For `session-start`, `stop`, `post-tool`, `post-model`,
+  `pre-compact`, `post-compact` and `alert` the failure is logged and the run
+  goes on.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read
