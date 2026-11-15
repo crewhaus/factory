@@ -26,9 +26,11 @@
  * because the supervisor is the single writer of this directory.
  */
 import {
+  constants,
   appendFileSync,
   closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -40,11 +42,13 @@ import {
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
+import { type LeaseProbe, PUMP_LEASE_PROBE, pumpLeaseBreakable } from "./trace-pump";
 import {
   CONTROL_TOKEN_NAME,
   DEFAULT_RETENTION,
   type DaemonRunfile,
   LOGS_DIR_NAME,
+  PRUNED_RUNS_NAME,
   RUNFILE_NAME,
   RUNFILE_VERSION,
   RUN_DIR_SEGMENTS,
@@ -83,6 +87,16 @@ export function runEventsPath(harnessDir: string, runId: string): string {
 /** The pump's resume cursor for a run. */
 export function runCursorPath(harnessDir: string, runId: string): string {
   return join(logsDir(harnessDir), `${runId}.cursor`);
+}
+
+/** The run's pump lease: only the pump that holds it writes the run's events. */
+export function runPumpLockPath(harnessDir: string, runId: string): string {
+  return join(logsDir(harnessDir), `${runId}.pump.lock`);
+}
+
+/** `<harness>/.crewhaus/run/pruned.jsonl`: which runs retention removed, and when. */
+export function prunedRunsPath(harnessDir: string): string {
+  return join(runDir(harnessDir), PRUNED_RUNS_NAME);
 }
 
 /** `<harness>/.crewhaus/run/control-token`. */
@@ -482,11 +496,18 @@ const LEDGER_COMPACT_FACTOR = 3;
  *
  * `keepRunIds` protects live runs from a prune triggered by a burst of
  * short-lived siblings.
+ *
+ * Before the first file is removed, `{v, at, runs}` is appended to
+ * `pruned.jsonl` (stamped by `now`); when that cannot be written, nothing is
+ * removed. A run's `.pump.lock` goes with it only when its holder is provably
+ * gone (`probe`).
  */
 export function pruneRuns(
   harnessDir: string,
   policy: RetentionPolicy = DEFAULT_RETENTION,
   keepRunIds: readonly string[] = [],
+  now: () => number = Date.now,
+  probe: LeaseProbe = PUMP_LEASE_PROBE,
 ): PruneResult {
   const dir = logsDir(harnessDir);
   if (!existsSync(dir)) return { removedRuns: [], removedBytes: 0, compactedLedger: false };
@@ -534,15 +555,31 @@ export function pruneRuns(
     retainedBytes -= sizes.get(id) ?? 0;
   }
 
+  // What is removed is on record first: a reader that finds a run's files gone can say
+  // retention removed them. A marker that cannot be written removes nothing.
+  if (evict.length > 0 && !recordPruned(harnessDir, evict, now())) {
+    return { removedRuns: [], removedBytes: 0, compactedLedger: false };
+  }
   let removedBytes = 0;
   for (const id of evict) {
     for (const suffix of [".log", ".events.jsonl", ".cursor"]) {
       const path = join(dir, `${id}${suffix}`);
       try {
         removedBytes += statSync(path).size;
+        pruneSeams.beforeUnlink?.(path);
         rmSync(path);
       } catch {
         // Absent sibling file — nothing to remove.
+      }
+    }
+    // A pump lease goes with its run only when its holder is provably gone.
+    const lock = runPumpLockPath(harnessDir, id);
+    if (existsSync(lock) && pumpLeaseBreakable(lock, probe, now())) {
+      try {
+        pruneSeams.beforeUnlink?.(lock);
+        rmSync(lock);
+      } catch {
+        // Taken by a racing prune, or not ours to remove.
       }
     }
   }
@@ -559,6 +596,66 @@ export function pruneRuns(
     compactedLedger = true;
   }
   return { removedRuns: evict, removedBytes, compactedLedger };
+}
+
+type PruneSeams = { readonly beforeUnlink?: (path: string) => void };
+
+let pruneSeams: PruneSeams = {};
+
+/** Test seam: watch each unlink a prune makes. Pass `undefined` to restore. */
+export function _setPruneSeamsForTest(next: PruneSeams | undefined): void {
+  pruneSeams = next ?? {};
+}
+
+/**
+ * Append `{v: 1, at, runs}` to `pruned.jsonl`, at `0600`, refusing a link at its name.
+ * `false` when it could not be written.
+ */
+function recordPruned(harnessDir: string, runs: readonly string[], at: number): boolean {
+  let fd: number | undefined;
+  try {
+    ensureRunDir(harnessDir);
+    const noFollow = constants.O_NOFOLLOW ?? 0;
+    fd = openSync(
+      prunedRunsPath(harnessDir),
+      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | noFollow,
+      0o600,
+    );
+    if (!fstatSync(fd).isFile()) return false;
+    const line = `${JSON.stringify({ v: 1, at: new Date(at).toISOString(), runs })}\n`;
+    writeSync(fd, line);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/**
+ * The run ids retention removed, from `pruned.jsonl`, newest prune last. A torn or
+ * malformed line is skipped. Reads only.
+ */
+export function readPrunedRuns(harnessDir: string): ReadonlySet<string> {
+  let text: string;
+  try {
+    text = readFileSync(prunedRunsPath(harnessDir), "utf8");
+  } catch {
+    return new Set();
+  }
+  const out = new Set<string>();
+  for (const line of text.split("\n")) {
+    if (line.trim() === "") continue;
+    try {
+      const parsed = JSON.parse(line) as { runs?: unknown };
+      if (Array.isArray(parsed.runs)) {
+        for (const id of parsed.runs) if (typeof id === "string") out.add(id);
+      }
+    } catch {
+      // A torn line: skipped.
+    }
+  }
+  return out;
 }
 
 /** `run_x.log` / `run_x.events.jsonl` / `run_x.cursor` → `run_x`. */

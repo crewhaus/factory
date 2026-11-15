@@ -9,6 +9,7 @@
  * whole harness (`creating-service`). A run whose records name a person's records answers
  * its result with `hidden: ["people"]` and no content unless the people domain releases it.
  */
+import { existsSync } from "node:fs";
 import {
   type CommandReceipt,
   type CursorPosition,
@@ -19,13 +20,17 @@ import {
 } from "@crewhaus/control-contract";
 import { type LedgerRecord, readPage, runsLedger } from "@crewhaus/control-records";
 import {
+  RUNS_PROJECTION,
   type RunHome,
   type RunPlan,
   type RunRefusal,
+  caughtUpModel,
+  harnessesOfRun,
   runAdapterFor,
   runRefOf,
 } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
+import { readPrunedRuns, readRunLedger, runEventsPath } from "@crewhaus/harness-supervisor";
 import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { emptyOf, nextCursor, pagingOf, snapshotCursor } from "./lists";
@@ -99,7 +104,61 @@ export function findRun(
     const hinted = entryOf(deps, hint);
     return hinted === undefined ? undefined : at(hinted);
   }
+  // The read models' index first; the scan below when it does not settle it.
+  const indexed = harnessesOfRun(deps.hangarRoot, runId);
+  if (indexed !== undefined) {
+    const hits = indexed
+      .map((id) => deps.registry.get(id))
+      .filter(
+        (entry): entry is HangarHarnessEntry => entry !== undefined && entry.archived === undefined,
+      )
+      .map(at)
+      .filter((hit): hit is RunFound => hit !== undefined);
+    if (hits.length === 1) return hits[0];
+    if (hits.length > 1) return undefined;
+  }
   const found: RunFound[] = [];
+  for (const entry of deps.registry.list()) {
+    if (entry.archived !== undefined) continue;
+    const here = at(entry);
+    if (here !== undefined) found.push(here);
+    if (found.length > 1) return undefined;
+  }
+  return found[0];
+}
+
+/** A supervisor execution found in one harness: its ledger names it, or its prune does. */
+export type ExecutionFound = {
+  readonly entry: HangarHarnessEntry;
+  readonly dir: string;
+  /** Retention removed its files, and its prune is on record. */
+  readonly pruned: boolean;
+};
+
+/**
+ * The registered harness whose supervisor ledger (or prune record) names execution `id`:
+ * the `?harness=` hint's, else the one harness that does. Two, or none, is `undefined`.
+ * Reads only.
+ */
+export function findExecution(
+  deps: V1Context["deps"],
+  id: string,
+  hint: string | undefined,
+): ExecutionFound | undefined {
+  const at = (entry: HangarHarnessEntry): ExecutionFound | undefined => {
+    const dir = liveDirOf(entry);
+    if (dir === undefined) return undefined;
+    const pruned = readPrunedRuns(dir).has(id) && !existsSync(runEventsPath(dir, id));
+    if (pruned || readRunLedger(dir).some((row) => row.runId === id)) {
+      return { entry, dir, pruned };
+    }
+    return undefined;
+  };
+  if (hint !== undefined) {
+    const hinted = entryOf(deps, hint);
+    return hinted === undefined ? undefined : at(hinted);
+  }
+  const found: ExecutionFound[] = [];
   for (const entry of deps.registry.list()) {
     if (entry.archived !== undefined) continue;
     const here = at(entry);
@@ -215,9 +274,12 @@ const list: V1Handler = async (ctx) => {
   }
   const own = ownOnly(ctx, entry.id) ? ctx.access.caller.principal : undefined;
   const ledger = runsLedger(dir);
-  // Newest first, each run once, at the line it entered with, served as its newest row.
-  const newest = new Map<string, LedgerRecord>();
-  const items: Record<string, unknown>[] = [];
+  // Newest first, each run once, at the line it entered with.
+  const entries: Array<{
+    readonly id: string;
+    readonly record: LedgerRecord;
+    readonly at: CursorPosition;
+  }> = [];
   let snapshotAt: readonly CursorPosition[] | undefined;
   let gaps = 0;
   let before = paging.before;
@@ -233,13 +295,12 @@ const list: V1Handler = async (ctx) => {
     for (const item of page.items) {
       const id = item.record["id"];
       if (typeof id !== "string") continue;
-      if (!newest.has(id)) newest.set(id, item.record);
       const state = String(item.record["state"]);
       if (seen.has(id) || (state !== "queued" && state !== "running")) continue;
       if (own !== undefined && item.record["by"] !== own) continue;
       seen.add(id);
-      items.push(servedRun(newest.get(id) ?? item.record, entry.id));
-      if (items.length === paging.limit) {
+      entries.push({ id, record: item.record, at: item.at });
+      if (entries.length === paging.limit) {
         next = item.at;
         break outer;
       }
@@ -247,20 +308,25 @@ const list: V1Handler = async (ctx) => {
     if (page.next === undefined) break;
     before = page.next;
   }
+  // Each listed run as it stands now, from the run read model or the whole ledger: never
+  // from this page's lines alone.
+  const newest = newestRowsOf(ctx, entry.id, dir, entries);
+  const items = entries.map((e) => servedRun(newest.rows.get(e.id) ?? e.record, entry.id));
+  const verb = `crewhaus runs list --harness ${entry.id}`;
   return {
     status: 200,
     body: {
       items,
       ...(next !== undefined ? { next: nextCursor("runs", next) } : {}),
       snapshotAt: snapshotCursor("runs", snapshotAt ?? []),
+      asOf: new Date(ctx.deps.now()).toISOString(),
+      stale: newest.stale,
+      freshness: newest.freshness,
       ...(gaps > 0
-        ? {
-            truncated: {
-              reason: "unreadable_lines",
-              verb: `crewhaus runs list --harness ${entry.id}`,
-            },
-          }
-        : {}),
+        ? { truncated: { reason: "unreadable_lines", verb } }
+        : newest.capped
+          ? { truncated: { reason: "fold_capped", verb } }
+          : {}),
       ...emptyOf(
         items,
         own !== undefined ? "filtered" : "no-data",
@@ -272,6 +338,60 @@ const list: V1Handler = async (ctx) => {
     scrubDir: dir,
   };
 };
+
+/** How many ledger lines the fold from the end reads before it stops short. */
+export const NEWEST_FOLD_LINES = 20_000;
+
+/** The ledger position `a` is older than or at `b`. */
+function atOrBefore(a: CursorPosition, b: CursorPosition): boolean {
+  return a.seg < b.seg || (a.seg === b.seg && a.off <= b.off);
+}
+
+/**
+ * The newest row of each listed run: from the harness's run read model, caught up; for an
+ * id it does not hold (or with no model), from the ledger read from its end, newest first,
+ * down to the oldest listed entry or {@link NEWEST_FOLD_LINES} lines (`capped`).
+ */
+function newestRowsOf(
+  ctx: V1Context,
+  hrn: string,
+  dir: string,
+  entries: ReadonlyArray<{ readonly id: string; readonly at: CursorPosition }>,
+): {
+  readonly rows: ReadonlyMap<string, LedgerRecord>;
+  readonly capped: boolean;
+  readonly freshness: "projection" | "direct-fold";
+  /** The read model's own catch-up stopped at its caps. */
+  readonly stale: boolean;
+} {
+  const rows = new Map<string, LedgerRecord>();
+  const model = caughtUpModel(ctx.deps.hangarRoot, hrn, dir, RUNS_PROJECTION, ctx.deps.now());
+  const wanted = new Set<string>();
+  for (const { id } of entries) {
+    const row = model?.state.rows[id];
+    if (row !== undefined) rows.set(id, row);
+    else wanted.add(id);
+  }
+  const freshness = model === undefined ? ("direct-fold" as const) : ("projection" as const);
+  const stale = model?.stale ?? false;
+  const oldest = entries.at(-1)?.at;
+  if (wanted.size === 0 || oldest === undefined) return { rows, capped: false, freshness, stale };
+  const ledger = runsLedger(dir);
+  let before: CursorPosition | undefined;
+  let walked = 0;
+  for (;;) {
+    const page = readPage(ledger, { limit: 512, ...(before !== undefined ? { before } : {}) });
+    for (const item of page.items) {
+      if (atOrBefore(item.at, oldest)) return { rows, capped: false, freshness, stale };
+      walked += 1;
+      const id = item.record["id"];
+      if (typeof id === "string" && wanted.has(id) && !rows.has(id)) rows.set(id, item.record);
+      if (walked >= NEWEST_FOLD_LINES) return { rows, capped: true, freshness, stale };
+    }
+    if (page.next === undefined) return { rows, capped: false, freshness, stale };
+    before = page.next;
+  }
+}
 
 const get: V1Handler = async (ctx) => {
   const found = runOf(ctx);

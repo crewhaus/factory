@@ -40,6 +40,26 @@ export {
   listClaims,
 } from "./ledger";
 export { type DropAnswer, dropSegmentsBefore } from "./retention";
+export { type IoTap, _setIoTapForTest } from "./io";
+export { _setRollBytesForTest } from "./segments";
+export {
+  CACHE_INDEX_DIR,
+  type FleetAppend,
+  type FleetState,
+  type FleetStateRead,
+  type IndexRead,
+  RESERVED_INDEX_NAMES,
+  appendFleetChanges,
+  fleetChangesLedger,
+  isProjectionName,
+  keepFleetSegments,
+  projectionRel,
+  readFleetState,
+  readIndexRecord,
+  takeNudgeMarkers,
+  writeIndexRecord,
+  writeNudgeMarker,
+} from "./cache-index";
 export {
   type LedgerPage,
   type PageGap,
@@ -56,6 +76,8 @@ export {
   type ResumeCaps,
   type ResumeItem,
   type ResumeSources,
+  advanceVector,
+  positionsAtEnd,
   resume,
   snapshotAt,
 } from "./cursor";
@@ -101,7 +123,7 @@ export { type OperatorChange, type OperatorWrite, writeOperatorRecord } from "./
 export { type ApproverRead, createApproverReader, readApproverProjection } from "./approvers";
 export { type IntakeReason, type IntakeVerdict, intakeVerdict } from "./intake";
 export { intakeRoot, registerIntakeRoot, unregisterIntakeRoot } from "./intake-root";
-export { type Heartbeat, type HeartbeatWrite, writeHeartbeat } from "./heartbeat";
+export { type Heartbeat, type HeartbeatWrite, readHeartbeat, writeHeartbeat } from "./heartbeat";
 export {
   type HeldLease,
   type LeaseHead,

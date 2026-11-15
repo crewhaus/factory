@@ -4,8 +4,14 @@
  * once it has ended, and a replay of an `Idempotency-Key` answers the receipt it named.
  */
 import { type CommandReceipt, IDEMPOTENT_REPLAYED_HEADER } from "@crewhaus/control-contract";
-import type { InlineEffect, LedgerChoice, SubmitRequest } from "@crewhaus/control-service";
-import type { V1Answer, V1Context } from "./context";
+import {
+  type InlineEffect,
+  type LedgerChoice,
+  type SubmitRequest,
+  harnessOfTarget,
+  nudge,
+} from "@crewhaus/control-service";
+import type { V1BodyAnswer, V1Context } from "./context";
 import { V1Error } from "./errors";
 
 const TERMINAL = new Set(["succeeded", "failed", "rejected", "cancelled"]);
@@ -76,6 +82,9 @@ export async function submitCommand<T>(
 ): Promise<Submitted<T>> {
   const answer = await ctx.deps.control.commands.submit<T>(requestOf(ctx, input), input.effect);
   if (!answer.ok) throw refusalOf(answer.refusal);
+  // The read models of the harness it names are brought up to date first on the next pass.
+  const harness = harnessOfTarget(answer.receipt.target);
+  if (harness !== undefined) nudge("overview", harness);
   return answer.replayed
     ? { receipt: answer.receipt, replayed: true }
     : {
@@ -90,7 +99,7 @@ export function acceptedAnswer(
   submitted: Submitted<unknown>,
   extra: Readonly<Record<string, unknown>> = {},
   scrubDir?: string,
-): V1Answer {
+): V1BodyAnswer {
   return {
     status: TERMINAL.has(submitted.receipt.state) ? 200 : 202,
     body: { ...extra, receipt: submitted.receipt },

@@ -251,7 +251,11 @@ export {
   type EventFrame,
   type EventSensitivity,
   type EventType,
+  STREAM_REASONS,
+  type StreamFrameType,
+  type StreamReason,
   isEventType,
+  isStreamReason,
 } from "./events.js";
 export {
   APPROVAL_ID_PATTERN,
@@ -308,6 +312,7 @@ export {
   type OperationRow,
   QUALIFIERS,
   type Qualifier,
+  badScopedOperations,
 } from "./operations/index.js";
 export { PATH_PARAMS, type PathParam, isPathParam, pathParamSpans } from "./operations/params.js";
 export {

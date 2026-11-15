@@ -25,6 +25,7 @@
  * Zero loss and zero duplication are therefore properties of the cursor, not
  * of the manager staying alive.
  */
+import { randomBytes } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -34,12 +35,16 @@ import {
   readFileSync,
   readSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { appendFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { dirname } from "node:path";
 import { type Scrubber, noopScrubber, scrubDeep } from "./scrub";
+import { START_TIME_TOLERANCE_MS } from "./types";
 
 // ---------------------------------------------------------------------------
 // The splitter
@@ -238,6 +243,11 @@ export type PumpOutput = {
 export type PumpResult = PumpOutput & {
   /** Bytes newly consumed from the log. */
   readonly consumedBytes: number;
+  /**
+   * Whether this pump holds the run's pump lease. One that does not consumed nothing and
+   * wrote nothing; it tries again on its next call.
+   */
+  readonly held: boolean;
   /** True when the log shrank under us (an external rotation) and the pump
    *  restarted from byte 0 rather than reading garbage. */
   readonly restarted: boolean;
@@ -257,9 +267,149 @@ export type LogPumpOptions = {
   /** Max bytes to consume per pump (a burst-logging daemon must not stall
    *  the manager). The remainder is picked up by the next pump. */
   readonly maxChunkBytes?: number;
+  /** The run's pump lease (`<run>.pump.lock`). Default: beside the cursor file. */
+  readonly lockFile?: string;
+  /** Judges a lease's holder; default: `kill(pid, 0)`, with no start time. */
+  readonly probe?: LeaseProbe;
+  /** The pid this pump records as its holder. Default: this process. */
+  readonly pid?: number;
+  /** The host this pump records as its holder's. Default: this machine. */
+  readonly host?: string;
 };
 
 export const DEFAULT_MAX_CHUNK_BYTES = 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// The pump lease
+// ---------------------------------------------------------------------------
+
+/** How a lease's holder is judged. `undefined` is "the platform would not say". */
+export type LeaseProbe = {
+  readonly isAlive: (pid: number) => boolean | undefined;
+  readonly startTimeMs: (pid: number) => number | undefined;
+};
+
+/** One run's pump lease: who holds it. No field is named like a credential. */
+export type PumpLease = {
+  readonly v: 1;
+  readonly pid: number;
+  readonly pidStartTimeMs?: number;
+  readonly host: string;
+  readonly at: string;
+  /** This pump's own id, so two pumps in one process are told apart. */
+  readonly pump: string;
+};
+
+/** A lease that cannot be read is a writer mid-write for at most this long. */
+export const PUMP_LEASE_TORN_GRACE_MS = 60_000;
+
+/** The default probe: `kill(pid, 0)` decides life; no start time is known. */
+export const PUMP_LEASE_PROBE: LeaseProbe = {
+  isAlive: (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      const code = (err as { code?: unknown }).code;
+      if (code === "ESRCH") return false;
+      return code === "EPERM" ? true : undefined;
+    }
+  },
+  startTimeMs: () => undefined,
+};
+
+/** The lease file a pump uses when none is named: `<run>.pump.lock` beside its cursor. */
+export function pumpLockPathFor(cursorFile: string): string {
+  return cursorFile.endsWith(".cursor")
+    ? `${cursorFile.slice(0, -".cursor".length)}.pump.lock`
+    : `${cursorFile}.pump.lock`;
+}
+
+/** Read a pump lease. Absent or not a lease reads as `undefined`. */
+export function readPumpLease(lockFile: string): PumpLease | undefined {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(lockFile, "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  const pid = r["pid"];
+  if (typeof pid !== "number" || !Number.isInteger(pid)) return undefined;
+  if (typeof r["host"] !== "string" || typeof r["pump"] !== "string") return undefined;
+  if (typeof r["at"] !== "string") return undefined;
+  const start = r["pidStartTimeMs"];
+  return {
+    v: 1,
+    pid,
+    ...(typeof start === "number" ? { pidStartTimeMs: start } : {}),
+    host: r["host"],
+    at: r["at"],
+    pump: r["pump"],
+  };
+}
+
+/**
+ * Whether a lease's holder is provably gone: on this host, its pid is not alive, or its
+ * start time moved (the pid was reused). A lease from another host, or one whose probe
+ * would not say, is held. Its age never frees it: a pump runs as long as its run does.
+ */
+export function pumpLeaseHolderDead(
+  lease: PumpLease,
+  probe: LeaseProbe,
+  host: string = hostname(),
+  toleranceMs: number = START_TIME_TOLERANCE_MS,
+): boolean {
+  if (lease.host !== host) return false;
+  if (probe.isAlive(lease.pid) === false) return true;
+  if (lease.pidStartTimeMs !== undefined) {
+    const observed = probe.startTimeMs(lease.pid);
+    if (observed !== undefined && Math.abs(observed - lease.pidStartTimeMs) > toleranceMs) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether the lease file may be removed: there is none, its holder is provably gone, or
+ * it cannot be read and is older than {@link PUMP_LEASE_TORN_GRACE_MS} (no writer is
+ * still writing it).
+ */
+export function pumpLeaseBreakable(
+  lockFile: string,
+  probe: LeaseProbe,
+  now: number,
+  host: string = hostname(),
+): boolean {
+  const lease = readPumpLease(lockFile);
+  if (lease !== undefined) return pumpLeaseHolderDead(lease, probe, host);
+  try {
+    return now - statSync(lockFile).mtimeMs > PUMP_LEASE_TORN_GRACE_MS;
+  } catch {
+    return true;
+  }
+}
+
+/** Create the lease, exclusively, at `0600`. `false` when one is already there. */
+function createPumpLease(lockFile: string, lease: PumpLease): boolean {
+  let fd: number;
+  try {
+    mkdirSync(dirname(lockFile), { recursive: true, mode: 0o700 });
+    fd = openSync(lockFile, "wx", 0o600);
+  } catch {
+    return false;
+  }
+  try {
+    writeSync(fd, `${JSON.stringify(lease)}\n`);
+  } catch {
+    // Held either way; its contents only decide whether it may be broken.
+  } finally {
+    closeSync(fd);
+  }
+  return true;
+}
 
 export type LogPump = {
   /** Consume everything new, persist events, advance the cursor. */
@@ -269,29 +419,90 @@ export type LogPump = {
   cursor(): PumpCursor;
   /** Truncate the events file back to the cursor's recorded size. Called on
    *  adoption so events written after the last cursor write are re-emitted
-   *  exactly once instead of duplicated. */
+   *  exactly once instead of duplicated. Only while this pump holds the lease:
+   *  without it, it truncates nothing. */
   reconcile(): void;
+  /** Release the lease, when this pump holds it. Calling it again does nothing. */
+  close(): void;
 };
 
 /**
  * Create a pump over one run's captured log. Nothing is read on
  * construction; `pumpOnce()` is the only I/O, so a caller can drive it from
  * a timer, a watcher, or a test loop.
+ *
+ * Only the pump that holds the run's lease (`<run>.pump.lock`, an exclusive
+ * create naming its pid, start time, host and its own id) appends events and
+ * writes the cursor, so two managers over one run never write an event twice.
+ * A lease is broken only for a provably gone holder (see
+ * {@link pumpLeaseHolderDead}). A pump that takes the lease reads the cursor
+ * file again first: another pump may have moved it since.
  */
 export function createLogPump(options: LogPumpOptions): LogPump {
   const scrub = options.scrub ?? noopScrubber;
   const now = options.now ?? Date.now;
   const maxChunk = options.maxChunkBytes ?? DEFAULT_MAX_CHUNK_BYTES;
+  const lockFile = options.lockFile ?? pumpLockPathFor(options.cursorFile);
+  const probe = options.probe ?? PUMP_LEASE_PROBE;
+  const ownPid = options.pid ?? process.pid;
+  const ownHost = options.host ?? hostname();
+  const ownId = randomBytes(8).toString("hex");
+  let held = false;
   let cursor: PumpCursor = readCursor(options.cursorFile) ?? {
     logOffset: 0,
     eventsBytes: 0,
     updatedAt: "",
   };
 
+  /** Hold the lease, taking it when it is free or its holder is provably gone. */
+  const holdLease = (): boolean => {
+    if (held) {
+      // Still ours? A holder whose lease was broken stops writing at once.
+      if (readPumpLease(lockFile)?.pump === ownId) return true;
+      held = false;
+    }
+    const started = probe.startTimeMs(ownPid);
+    const lease: PumpLease = {
+      v: 1,
+      pid: ownPid,
+      ...(started !== undefined ? { pidStartTimeMs: started } : {}),
+      host: ownHost,
+      at: new Date(now()).toISOString(),
+      pump: ownId,
+    };
+    let taken = createPumpLease(lockFile, lease);
+    if (!taken && pumpLeaseBreakable(lockFile, probe, now(), ownHost)) {
+      try {
+        rmSync(lockFile, { force: true });
+      } catch {
+        return false;
+      }
+      taken = createPumpLease(lockFile, lease);
+    }
+    if (!taken) return false;
+    held = true;
+    // Another pump may have advanced the cursor since this one read it.
+    cursor = readCursor(options.cursorFile) ?? cursor;
+    return true;
+  };
+
+  const releaseLease = (): void => {
+    if (!held) return;
+    held = false;
+    if (readPumpLease(lockFile)?.pump !== ownId) return;
+    try {
+      rmSync(lockFile, { force: true });
+    } catch {
+      // Gone already, or not ours to remove: either way this pump holds nothing.
+    }
+  };
+
   const persistEvents = (events: ReadonlyArray<Record<string, unknown>>): number => {
     if (events.length === 0) return currentEventsBytes();
     mkdirSync(dirname(options.eventsFile), { recursive: true, mode: 0o700 });
-    const text = events.map((e) => `${JSON.stringify(e)}\n`).join("");
+    // When the line reached the events file: a reader's clock for what it was handed.
+    const ingestedAt = new Date(now()).toISOString();
+    const text = events.map((e) => `${JSON.stringify({ ...e, ingestedAt })}\n`).join("");
     appendFileSync(options.eventsFile, text, { mode: 0o600 });
     return currentEventsBytes();
   };
@@ -317,14 +528,16 @@ export function createLogPump(options: LogPumpOptions): LogPump {
     }
   };
 
-  const emptyResult = (restarted = false): PumpResult => ({
+  const emptyResult = (restarted = false, holding = true): PumpResult => ({
     prose: "",
     events: [],
     consumedBytes: 0,
     restarted,
+    held: holding,
   });
 
   const run = (force: boolean): PumpResult => {
+    if (!holdLease()) return emptyResult(false, false);
     let size: number;
     try {
       size = statSync(options.logFile).size;
@@ -368,6 +581,7 @@ export function createLogPump(options: LogPumpOptions): LogPump {
       events: scrubbedEvents,
       consumedBytes,
       restarted,
+      held: true,
     };
   };
 
@@ -376,6 +590,8 @@ export function createLogPump(options: LogPumpOptions): LogPump {
     flush: () => run(true),
     cursor: () => cursor,
     reconcile: () => {
+      // Only the holder may cut the file: a live original pump may still be writing it.
+      if (!holdLease()) return;
       // Drop anything the previous manager appended after its last cursor
       // write — those bytes will be re-derived from the log.
       if (!existsSync(options.eventsFile)) return;
@@ -393,6 +609,7 @@ export function createLogPump(options: LogPumpOptions): LogPump {
         closeSync(fd);
       }
     },
+    close: releaseLease,
   };
 }
 

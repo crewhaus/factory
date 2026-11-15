@@ -10,7 +10,7 @@ import { openRecordFd, requireCap } from "./io";
 import { classifyLine, offsetFits, scanForward, tailAt } from "./lines";
 import type { RecordSource } from "./paths";
 import { endPositions, firstPosition, isPositionList } from "./positions";
-import { isSingleFile, retainedSegments, segmentRel } from "./segments";
+import { isSingleFile, retainedSegments, segmentRel, segmentSize } from "./segments";
 
 /** The sources a call reads, keyed by their cursor name. A ledger is a source. */
 export type ResumeSources = Readonly<Partial<Record<CursorSource, RecordSource>>>;
@@ -25,6 +25,8 @@ export type ResumeItem =
       readonly seg: number;
       readonly off: number;
       readonly record: Record<string, unknown>;
+      /** The position just past this line: resuming from it reads the next item. */
+      readonly after: CursorPosition;
     }
   | {
       readonly kind: "gap";
@@ -34,6 +36,11 @@ export type ResumeItem =
       readonly reason: "evicted" | "unreadable";
       /** Why a whole file could not be opened, when that is what the gap is. */
       readonly detail?: string;
+      /**
+       * Where reading goes on past this gap: past an unreadable line, at the first retained
+       * position past evicted ones, and at the same place for a file that cannot be opened.
+       */
+      readonly after: CursorPosition;
     }
   | {
       readonly kind: "reset";
@@ -108,6 +115,11 @@ function readSegment(
     const size = opened.stats.size;
     if (!offsetFits(opened.fd, size, off, tail)) return { outcome: "diverged" };
     let capped = false;
+    const past = (end: number): CursorPosition => ({
+      seg,
+      off: end,
+      tail: tailAt(opened.fd, end),
+    });
     const scan = scanForward(opened.fd, off, size, caps.maxBytes, (line) => {
       const value = classifyLine(line);
       if (value.kind === "blank") return "go";
@@ -125,8 +137,9 @@ function readSegment(
       }
       budget.lines -= 1;
       budget.bytes += line.bytes;
+      const after = past(line.off + line.bytes);
       if (value.kind === "record") {
-        items.push({ kind: "line", source: name, seg, off: line.off, record: value.record });
+        items.push({ kind: "line", source: name, seg, off: line.off, record: value.record, after });
       } else {
         // A malformed line, or one past the cap: reported and read past, so none can wedge a reader.
         items.push({
@@ -135,6 +148,7 @@ function readSegment(
           from: { seg, off: line.off },
           to: { seg, off: line.off + line.bytes },
           reason: "unreadable",
+          after,
         });
       }
       if (budget.lines <= 0 || budget.bytes >= caps.maxBytes) {
@@ -181,6 +195,7 @@ function resumeSource(
           to: { seg: at.seg, off: at.off },
           reason: "unreadable",
           detail: retained.reason,
+          after: at,
         },
       ],
       next: keep,
@@ -216,6 +231,7 @@ function resumeSource(
         from: { seg: first.seg, off: first.off },
         to: { seg: to.seg, off: to.off },
         reason: "evicted",
+        after: to,
       });
       start = live.length > 0 ? live : [to];
     }
@@ -254,6 +270,7 @@ function resumeSource(
           to: { seg: position.seg, off: position.off },
           reason: "unreadable",
           detail: read.reason,
+          after: position,
         });
         reached.push(position);
         stopped = true;
@@ -312,4 +329,64 @@ export function resume(
     }
   }
   return { items, next, waiting };
+}
+
+/**
+ * The vector once `item` is delivered: its source's entry moves to the item's `after`,
+ * keeping, per source, the two highest segments' positions, ascending (the shape a vector
+ * holds). A line landing in the previous segment after a roll moves that segment's entry
+ * and keeps the newer one. Past an evicted gap, positions below it are dropped, so the gap
+ * is not reported again. A reset puts the source back at its `earliest`, or leaves it out
+ * when it has none. Pure: the vector given is not changed.
+ *
+ * First consumer: the resumable streams, which give every frame the vector just past it.
+ */
+export function advanceVector(vector: CursorSources, item: ResumeItem): CursorSources {
+  const out: Partial<Record<CursorSource, readonly CursorPosition[]>> = { ...vector };
+  if (item.kind === "reset") {
+    if (item.earliest === undefined) delete out[item.source];
+    else out[item.source] = [item.earliest];
+    return out;
+  }
+  const after = item.after;
+  const held = (vector[item.source] ?? []).filter(
+    (p) =>
+      p.seg !== after.seg &&
+      !(item.kind === "gap" && item.reason === "evicted" && p.seg < after.seg),
+  );
+  out[item.source] = [...held, after].sort((a, b) => a.seg - b.seg).slice(-2);
+  return out;
+}
+
+/**
+ * Whether each source's vector entry is already at its end, judged by size alone: the
+ * newest segment the entry names is as long as its offset and no newer segment exists. It
+ * opens no record file (a directory listing and a stat per entry), so a read that is
+ * fresh costs no segment read. A replaced file of the same size is not seen here; the
+ * next `resume` sees it. A source missing from the vector, or one that cannot be listed,
+ * is not at its end.
+ *
+ * First consumer: the read models, which fold only what lies past their cursor.
+ */
+export function positionsAtEnd(sources: ResumeSources, vector: CursorSources): boolean {
+  for (const name of Object.keys(sources) as CursorSource[]) {
+    const source = sources[name];
+    if (source === undefined) continue;
+    const held = vector[name];
+    const last = held?.[held.length - 1];
+    if (last === undefined) return false;
+    const retained = retainedSegments(source);
+    if (!retained.ok) return false;
+    const newest = retained.segs[retained.segs.length - 1];
+    if (newest === undefined) {
+      if (last.off !== 0) return false;
+      continue;
+    }
+    if (newest > last.seg) return false;
+    for (const position of held ?? []) {
+      const size = segmentSize(source, position.seg);
+      if (size === undefined || size !== position.off) return false;
+    }
+  }
+  return true;
 }

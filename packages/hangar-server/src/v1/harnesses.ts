@@ -1,7 +1,8 @@
 /**
  * Harnesses through the API: the fleet's overview rows, one harness, what it can do and
- * how it is. Every row is a direct fold of the harness's own records (no projection is
- * written by a read); a fleet list counts only the harnesses the caller may read.
+ * how it is. A row's records part comes from the harness's overview read model, caught up
+ * in memory, or a bounded fold of its records when there is none (no read writes a
+ * projection); a fleet list counts only the harnesses the caller may read.
  */
 import {
   CAPABILITY_NAMES,
@@ -12,41 +13,28 @@ import {
   SHAPE_RUN_CONTROLS,
 } from "@crewhaus/control-contract";
 import {
-  controlPaths,
+  type Heartbeat,
   readApproverProjection,
-  readDeployments,
+  readHeartbeat,
   readOperatorRecord,
 } from "@crewhaus/control-records";
-import { RUN_ADAPTER_SHAPES, runBundleRefusal } from "@crewhaus/control-service";
+import {
+  OVERVIEW_PROJECTION,
+  RUN_ADAPTER_SHAPES,
+  operatorStateOf,
+  readModel,
+  runBundleRefusal,
+  servedOverview,
+} from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
-import { pendingApprovalCount } from "../approvals";
-import { readTextCapped } from "../jsonl";
-import { resolveContained } from "../safety";
 import type { DaemonStatus, V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { emptyOf, fleetSnapshot } from "./lists";
 import { harnessOf, liveDirOf, visibleHarnesses } from "./resolve";
 
-type Beat = {
-  readonly at?: string;
-  readonly paused?: boolean;
-  readonly disabled?: boolean;
-  readonly runLedger?: boolean;
-  readonly activeRuns?: number | null;
-};
-
 /** The daemon's last heartbeat, read contained and capped; `undefined` when none is there. */
-export function heartbeatOf(dir: string): Beat | undefined {
-  const path = resolveContained(dir, controlPaths(dir).heartbeatFile);
-  if (path === undefined) return undefined;
-  const { text } = readTextCapped(path, 16 * 1024);
-  if (text === "") return undefined;
-  try {
-    const parsed = JSON.parse(text) as unknown;
-    return typeof parsed === "object" && parsed !== null ? (parsed as Beat) : undefined;
-  } catch {
-    return undefined;
-  }
+export function heartbeatOf(dir: string): Partial<Heartbeat> | undefined {
+  return readHeartbeat(dir);
 }
 
 async function displayOf(ctx: V1Context, entry: HangarHarnessEntry, dir: string | undefined) {
@@ -77,27 +65,44 @@ async function displayOf(ctx: V1Context, entry: HangarHarnessEntry, dir: string 
   };
 }
 
-/** One harness's overview row. */
+/**
+ * One harness's overview row: its records' part from the overview read model, caught up
+ * (or folded on the spot when there is none), and what the daemon is doing now. A missing
+ * folder says only that its operator state is unknown.
+ */
 export async function overviewOf(ctx: V1Context, entry: HangarHarnessEntry) {
   const dir = liveDirOf(entry);
-  const deployments = dir === undefined ? undefined : readDeployments(dir);
-  const active = deployments?.state === "present" ? deployments.active : undefined;
-  const artifact = active?.["artifact"] as { specHash?: unknown } | undefined;
+  const now = ctx.deps.now();
+  const model =
+    dir === undefined
+      ? undefined
+      : readModel(ctx.deps.hangarRoot, entry.id, dir, OVERVIEW_PROJECTION, now);
   const projection = dir === undefined ? undefined : readApproverProjection(dir);
   const owner = projection?.state === "present" ? projection.projection.owner : undefined;
-  const beat = dir === undefined ? undefined : heartbeatOf(dir);
+  const records =
+    model === undefined
+      ? { operatorState: operatorStateOf(undefined, undefined) }
+      : servedOverview(model.state);
+  // An area's own overview projections, beside the core's.
+  const areas: Record<string, unknown> = {};
+  if (dir !== undefined) {
+    for (const { area, projection: other } of ctx.projections) {
+      if (other.overview !== true || area === "core") continue;
+      const read = readModel(ctx.deps.hangarRoot, entry.id, dir, other, now);
+      areas[area] = { ...((areas[area] as object | undefined) ?? {}), [other.name]: read.state };
+    }
+  }
   return {
     id: entry.id,
     slug: entry.slug ?? entry.specName,
     ...(typeof owner === "string" ? { owner } : {}),
     createdAt: entry.registeredAt,
     display: await displayOf(ctx, entry, dir),
-    ...(typeof artifact?.specHash === "string" ? { deployedSpecHash: artifact.specHash } : {}),
-    ...(active !== undefined ? { activeDeployment: String(active["id"]) } : {}),
-    ...(dir !== undefined ? { openDecisions: pendingApprovalCount(dir) } : {}),
-    ...(typeof beat?.at === "string" ? { lastVerifiedContactAt: beat.at } : {}),
-    asOf: new Date(ctx.deps.now()).toISOString(),
-    freshness: "direct-fold" as const,
+    ...records,
+    ...(Object.keys(areas).length > 0 ? { areas } : {}),
+    asOf: new Date(now).toISOString(),
+    ...(model !== undefined ? { stale: model.stale } : {}),
+    freshness: model?.freshness ?? ("direct-fold" as const),
   };
 }
 

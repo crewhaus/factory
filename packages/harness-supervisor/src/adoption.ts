@@ -31,6 +31,7 @@ import {
   runCursorPath,
   runEventsPath,
   runLogPath,
+  runPumpLockPath,
 } from "./runfiles";
 import { type Scrubber, noopScrubber } from "./scrub";
 import { type LogPump, createLogPump, readLogTail } from "./trace-pump";
@@ -203,7 +204,9 @@ export type AdoptOptions = {
  * offset. `reconcile()` has already run, so the durable events file is
  * trimmed back to what the cursor accounts for — events written by the
  * previous manager after its last cursor write are re-derived from the log
- * instead of being duplicated.
+ * instead of being duplicated. It trims only when the pump took the run's
+ * lease: a previous manager that is still alive keeps it, and the returned
+ * pump waits (`held: false`) until it is free.
  */
 export function adoptRunning(harnessDir: string, options: AdoptOptions): AdoptionResult {
   const runfile = readRunfile(harnessDir);
@@ -241,9 +244,12 @@ export function adoptRunning(harnessDir: string, options: AdoptOptions): Adoptio
     logFile,
     eventsFile: runEventsPath(harnessDir, runfile.runId),
     cursorFile: runCursorPath(harnessDir, runfile.runId),
+    lockFile: runPumpLockPath(harnessDir, runfile.runId),
+    probe: options.ops,
     scrub,
     ...(options.now !== undefined ? { now: options.now } : {}),
   });
+  // Under the lease only: a live original pump keeps it, and its file is not cut.
   pump.reconcile();
   return { status: "adopted", runfile, verdict, pump, logFile };
 }

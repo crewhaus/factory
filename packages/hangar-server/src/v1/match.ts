@@ -36,6 +36,8 @@ export function rowOf(op: OperationRow): RouteRow {
     ...(kind !== undefined ? { kind } : {}),
     ...(op.secretFields !== undefined ? { secretFields: op.secretFields } : {}),
     ...(op.noReceiptReason !== undefined ? { noReceiptReason: op.noReceiptReason } : {}),
+    ...(op.scopedAct !== undefined ? { scopedAct: op.scopedAct } : {}),
+    ...(op.ref !== undefined ? { ref: op.ref } : {}),
     cliTwin: op.cliTwin,
     v1: true,
   };

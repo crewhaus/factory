@@ -22,7 +22,12 @@ export type IoTap = {
 
 let tap: IoTap = {};
 
-/** Test seam: count opens and reads. Pass `undefined` to restore. */
+/**
+ * Test seam: count opens and reads. Pass `undefined` to restore.
+ *
+ * First consumer: this package's tests, then Home's read-model tests, which count the
+ * segments a read opens.
+ */
 export function _setIoTapForTest(next: IoTap | undefined): void {
   tap = next ?? {};
 }

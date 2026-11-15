@@ -123,6 +123,13 @@ export type OperationRow = {
   readonly secretFields?: readonly string[];
   readonly noTwinReason?: string;
   readonly modelBound?: Readonly<Record<string, ModelBoundDecl>>;
+  /**
+   * The scoped act a scoped token reads this row with, one of `SCOPED_ACTS`. It sits only
+   * on a GET that names its object (`ref`).
+   */
+  readonly scopedAct?: string;
+  /** The object the row names: its ref kind, and the path param that carries its id. */
+  readonly ref?: { readonly kind: string; readonly param: string };
 };
 
 export type AreaModule = {

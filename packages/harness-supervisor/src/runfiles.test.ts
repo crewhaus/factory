@@ -8,11 +8,12 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   RUN_ID_RE,
   START_LOCK_MAX_AGE_MS,
+  _setPruneSeamsForTest,
   acquireStartLock,
   appendRunLedger,
   clearRunfile,
@@ -21,6 +22,8 @@ import {
   newRunId,
   patchRunLedger,
   pruneRuns,
+  prunedRunsPath,
+  readPrunedRuns,
   readRetentionPolicy,
   readRunLedger,
   readRunfile,
@@ -29,6 +32,7 @@ import {
   releaseStartLock,
   runDir,
   runLogPath,
+  runPumpLockPath,
   runfileExists,
   startLockIsStale,
   startLockPath,
@@ -339,6 +343,56 @@ describe("retention", () => {
   test("pruning an empty harness is a no-op", () => {
     const dir = tempHarness();
     expect(pruneRuns(dir)).toEqual({ removedRuns: [], removedBytes: 0, compactedLedger: false });
+  });
+
+  test("what is removed is on record before the first file goes, stamped by the clock given", () => {
+    const dir = tempHarness();
+    const ids = Array.from({ length: 3 }, (_, i) => `run_${String(i).padStart(16, "0")}`);
+    for (const id of ids) makeRun(dir, id, 10);
+    const seen: string[] = [];
+    _setPruneSeamsForTest({
+      beforeUnlink: () => {
+        if (seen.length === 0) seen.push(readFileSync(prunedRunsPath(dir), "utf8"));
+      },
+    });
+    try {
+      const at = Date.parse("2026-11-14T00:00:00.000Z");
+      const result = pruneRuns(dir, { runs: 1, bytes: DEFAULT_RETENTION.bytes }, [], () => at);
+      expect(result.removedRuns).toEqual(ids.slice(0, 2));
+      expect(seen.map((text) => JSON.parse(text))).toEqual([
+        { v: 1, at: "2026-11-14T00:00:00.000Z", runs: ids.slice(0, 2) },
+      ]);
+      expect([...readPrunedRuns(dir)]).toEqual(ids.slice(0, 2));
+      if (process.platform !== "win32") {
+        expect(statSync(prunedRunsPath(dir)).mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      _setPruneSeamsForTest(undefined);
+    }
+  });
+
+  test("a marker that cannot be written removes nothing", () => {
+    const dir = tempHarness();
+    const ids = Array.from({ length: 3 }, (_, i) => `run_${String(i).padStart(16, "0")}`);
+    for (const id of ids) makeRun(dir, id, 10);
+    mkdirSync(prunedRunsPath(dir));
+    const result = pruneRuns(dir, { runs: 1, bytes: DEFAULT_RETENTION.bytes });
+    expect(result).toEqual({ removedRuns: [], removedBytes: 0, compactedLedger: false });
+    for (const id of ids) expect(statSync(runLogPath(dir, id)).size).toBe(10);
+  });
+
+  test("a run's pump lease goes with it only when its holder is gone", () => {
+    const dir = tempHarness();
+    const ids = Array.from({ length: 3 }, (_, i) => `run_${String(i).padStart(16, "0")}`);
+    for (const id of ids) makeRun(dir, id, 10);
+    const lease = (pid: number) =>
+      JSON.stringify({ v: 1, pid, host: hostname(), at: "2020-01-01T00:00:00.000Z", pump: "p" });
+    writeFileSync(runPumpLockPath(dir, ids[0] as string), lease(100));
+    writeFileSync(runPumpLockPath(dir, ids[1] as string), lease(200));
+    const probe = { isAlive: (pid: number) => pid === 200, startTimeMs: () => undefined };
+    pruneRuns(dir, { runs: 1, bytes: DEFAULT_RETENTION.bytes }, [], Date.now, probe);
+    expect(() => statSync(runPumpLockPath(dir, ids[0] as string))).toThrow();
+    expect(statSync(runPumpLockPath(dir, ids[1] as string)).isFile()).toBe(true);
   });
 });
 

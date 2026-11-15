@@ -21,10 +21,11 @@ import {
   parseRef,
   renderTwin,
 } from "@crewhaus/control-contract";
+import { EXECUTION_RUN_ID_RE } from "@crewhaus/control-contract";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import { readRequestBodyCapped } from "@crewhaus/gateway-protocol/body-limit";
 import { HARNESS_ID_RE } from "@crewhaus/harness-registry";
-import { type Caller, currentRequestAccess } from "../access";
+import { type Caller, type RequestAccess, currentRequestAccess } from "../access";
 import { HttpError, json } from "../http";
 import { maskDeep } from "../mask";
 import type { RequestMatch } from "../route-match";
@@ -35,13 +36,16 @@ import {
   capabilityProvidersOf,
   handlersOf,
   homeCompositionProblems,
+  projectionsOf,
   refResolversOf,
+  streamSourcesOf,
 } from "./areas";
 import type { DaemonState, V1Context, V1Deps } from "./context";
 import { V1Error, v1ErrorBody } from "./errors";
 import { OPERATION_BY_ID, matchOperation } from "./match";
 import { commandLedgerOf, entryOf } from "./resolve";
-import { findRun, startedRunIn } from "./runs";
+import { findExecution, findRun, startedRunIn } from "./runs";
+import { type StreamPlan, v1EventStream } from "./stream";
 
 const BINARY = "crewhaus";
 
@@ -149,6 +153,8 @@ export function createV1Router(
   const handlers = handlersOf(areas);
   const refResolvers = refResolversOf(areas);
   const capabilityProviders = capabilityProvidersOf(areas);
+  const projections = projectionsOf(areas);
+  const streamSources = streamSourcesOf(areas);
 
   const exit = (status: number, body: unknown, scrubDir?: string, headers = {}): Response =>
     json(
@@ -156,6 +162,25 @@ export function createV1Router(
       status,
       { ...protocolHeaders(), "cache-control": "no-store", ...headers },
     );
+
+  /**
+   * A stream's answer: the one writer, with the scrubber `exit` would choose, the protocol
+   * headers, and the caller's authority as it stands at each batch.
+   */
+  const streamExit = (
+    plan: StreamPlan,
+    scrubDir: string | undefined,
+    access: RequestAccess,
+  ): Response =>
+    v1EventStream({
+      ...plan,
+      ...(deps.streamTimings ?? {}),
+      scrub: scrubDir === undefined ? deps.fleetScrub() : deps.harnessScrub(scrubDir),
+      // A Home that lends no fresh view (a test's) keeps the request's own.
+      accessNow: () => deps.accessNow?.(access.caller) ?? access,
+      headers: protocolHeaders(),
+      onWarn: deps.onWarn,
+    });
 
   const refuse = (error: V1Error): Response =>
     exit(
@@ -323,6 +348,8 @@ export function createV1Router(
         via: viaOf(caller),
         refResolvers,
         capabilityProviders,
+        projections,
+        streamSources,
         ...(caller.actor !== null && isId("prn", caller.principal)
           ? {
               actor: caller.principal,
@@ -331,6 +358,7 @@ export function createV1Router(
           : {}),
       };
       const answer = await handler(ctx);
+      if ("stream" in answer) return streamExit(answer.stream, answer.scrubDir, access);
       return exit(answer.status, answer.body, answer.scrubDir, answer.headers ?? {});
     } catch (err) {
       if (err instanceof V1Error) return refuse(err);
@@ -372,6 +400,10 @@ export function createV1Router(
       if (creating && caller.via === "service" && entry !== undefined) {
         if (startedRunIn(entry, caller.principal)) out.runBy = caller.principal;
       }
+    } else if (run !== undefined && EXECUTION_RUN_ID_RE.test(run)) {
+      // A supervisor's execution: found in one harness's supervisor ledger, or none.
+      const found = findExecution(deps, run, url.searchParams.get("harness") ?? undefined);
+      out.targetHarness = found?.entry.id ?? null;
     } else if (run !== undefined) {
       const found = findRun(deps, run, url.searchParams.get("harness") ?? undefined);
       out.targetHarness = found?.entry.id ?? null;
