@@ -22,11 +22,12 @@ import {
   _setManagedClassifierForTest,
   createManagedRuns,
 } from "@crewhaus/gateway-server/managed-runs";
+import { runChatLoop } from "@crewhaus/runtime-core";
+// runtime-core's package entry exports no test seam; this resolves to the module the run loads.
 import {
   _resetInputOriginForTest,
   _setInputOriginClassifierForTest,
-  runChatLoop,
-} from "@crewhaus/runtime-core";
+} from "../../../runtime-core/src/input-origin";
 import { type V1Home, v1Home } from "../__test__/v1-home";
 
 /** A zod schema as this walk reads it: by its type name, so this suite imports no zod. */

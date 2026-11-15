@@ -283,6 +283,36 @@ describe("a pin that keeps only same-instrument runs requires the instrument to 
     expect(sameInstrumentRefusal(entry({ runId: "run_b" }), undefined)).toBeUndefined();
   });
 
+  test("a graders hash recorded on neither side refuses the pin, and the file is byte-identical", () => {
+    const evalsDir = newTempRoot();
+    expect(pinRun(entry({ runId: "run_a" }), "t1", evalsDir).ok).toBe(true);
+    const before = readFileSync(join(evalsDir, BASELINES_FILENAME));
+    const outcome = pinRun(entry({ runId: "run_b" }), "t2", evalsDir, {
+      sameInstrumentOnly: true,
+      cmd: "x",
+    });
+    if (outcome.ok) throw new Error("pinned");
+    expect(outcome.refusal.code).toBe("reanchor");
+    expect(outcome.refusal.reason).toContain("(gradersHash, not recorded)");
+    expect(readFileSync(join(evalsDir, BASELINES_FILENAME)).equals(before)).toBe(true);
+  });
+
+  test("a first pin, and a re-pin of the same run, are made without a graders hash", () => {
+    const evalsDir = newTempRoot();
+    const opts = { sameInstrumentOnly: true, cmd: "x" };
+    expect(pinRun(entry({ runId: "run_a" }), "t1", evalsDir, opts).ok).toBe(true);
+    expect(pinRun(entry({ runId: "run_a" }), "t2", evalsDir, opts).ok).toBe(true);
+  });
+
+  test("two sides without a graders hash are refused when asked directly", () => {
+    const pinned = pinFromIndexEntry(entry({ runId: "run_a" }), "t");
+    if (!pinned.ok) throw new Error("expected a pin");
+    const refused = sameInstrumentRefusal(entry({ runId: "run_b" }), pinned.pin);
+    expect(refused?.code).toBe("reanchor");
+    expect(refused?.reason).toContain("gradersHash, not recorded");
+    expect(refused?.reason.split("gradersHash").length).toBe(2);
+  });
+
   test("a changed field is named without the one-sided note", () => {
     const pinned = pinFromIndexEntry(entry({ runId: "run_a", gradersHash: "g1" }), "t");
     if (!pinned.ok) throw new Error("expected a pin");

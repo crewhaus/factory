@@ -9,8 +9,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { foldStates } from "@crewhaus/control-records";
 import { workspaceCommandsLedger } from "@crewhaus/control-service";
+import { isCredentialKey } from "@crewhaus/spec-patch";
 import { type V1Home, v1Home } from "../__test__/v1-home";
-import { pluginGrantsLedger } from "../plugin-grants";
+import { SERVED_NOTHING, pluginGrantsLedger } from "../plugin-grants";
+import { readPluginInventory } from "../plugins";
+import { type LoadedByContext, stillLoadedFor } from "./plugins";
 
 let home: V1Home;
 let scratch: string;
@@ -210,5 +213,152 @@ describe("plugins through the API", () => {
     const again = await home.call("POST", `${P}/revoke`, { body: {} });
     expect(again.status).toBe(409);
     expect(receipts("plugins.revoke")).toHaveLength(receiptsBefore);
+  });
+});
+
+describe("a grant or revoke names each harness whose crewhaus.yaml still loads the plugin", () => {
+  let lhome: V1Home;
+  let lscratch: string;
+  let lplugins: string;
+  let la: { id: string; dir: string };
+  let lb: { id: string; dir: string };
+  const L = "/api/v1/plugins/tool-lens";
+  const NAMES = ["tool-lens", "paneless-probe", "only-a-probe"];
+  const board = [{ id: "board", title: "Board", file: "board.html" }];
+
+  const install = (name: string, manifest: Record<string, unknown>) => {
+    mkdirSync(join(lplugins, name), { recursive: true });
+    writeFileSync(
+      join(lplugins, name, "plugin.json"),
+      JSON.stringify({ name, version: "1.0.0", ...manifest }),
+    );
+    writeFileSync(join(lplugins, name, "board.html"), "<p>board</p>");
+  };
+
+  beforeAll(async () => {
+    lscratch = mkdtempSync(join(tmpdir(), "v1-plugins-loaded-"));
+    lplugins = join(lscratch, "plugins");
+    mkdirSync(lplugins, { recursive: true });
+    lhome = await v1Home({ pluginsDir: lplugins });
+    la = await lhome.harness("loaded-a");
+    lb = await lhome.harness("loaded-b");
+    // The harness root exists only once Home has booted; the inventory is read per request.
+    const everyHarness = `read:${lhome.t.harnessesRoot}/**`;
+    install("tool-lens", { panes: board, permissions: { fs: [everyHarness], tools: ["Bash"] } });
+    install("paneless-probe", { permissions: { fs: [everyHarness], tools: ["Bash"] } });
+    install("only-a-probe", { panes: board, permissions: { fs: [`read:${la.dir}/**`] } });
+  }, 60_000);
+
+  afterAll(async () => {
+    await lhome?.t.stop();
+    rmSync(lscratch, { recursive: true, force: true });
+  });
+
+  const body = (over: Record<string, unknown>) => ({
+    harnesses: [la.id],
+    panes: [],
+    events: [],
+    reads: [],
+    net: [],
+    tools: ["Bash"],
+    ...over,
+  });
+  const waiting = async (id: string) =>
+    (await lhome.call("GET", `/api/h/${id}/panes`)).body["waiting"] as string[];
+
+  test("a harness-scoped caller learns no plugin name from the panes route", async () => {
+    const bot = await lhome.service("bot", [lb.id], { permissions: ["h.read"] });
+    expect((await lhome.call("GET", "/api/plugins", { secret: bot.secret })).status).toBe(403);
+    const res = await lhome.call("GET", `/api/h/${lb.id}/panes`, { secret: bot.secret });
+    expect(res.status).toBe(200);
+    expect(res.body["waiting"]).toEqual([]);
+    const text = JSON.stringify(res.body);
+    for (const name of NAMES) expect(text.includes(name)).toBe(false);
+    // The owner's list for B: the count the token gets counts it, and nothing else.
+    const owners = await waiting(lb.id);
+    expect(owners).toEqual(["tool-lens"]);
+    expect(res.body["waitingCount"]).toBe(owners.length);
+  });
+
+  test("a plugin with no tab or observer, or that does not ask for this harness, is not waiting here", async () => {
+    const onB = await waiting(lb.id);
+    expect(onB.includes("paneless-probe")).toBe(false);
+    expect(onB.includes("only-a-probe")).toBe(false);
+    expect(await waiting(la.id)).toContain("only-a-probe");
+  });
+
+  test("a grant on A leaves the plugin waiting on B, and not on A", async () => {
+    const res = await lhome.call("PUT", `${L}/grant`, { body: body({ panes: ["board"] }) });
+    expect(res.status).toBe(200);
+    expect(res.body["stillLoadedBy"]).toEqual([]);
+    expect(await waiting(lb.id)).toContain("tool-lens");
+    expect(await waiting(la.id)).not.toContain("tool-lens");
+  });
+
+  test("a revoke names the harness that loads it, with the host tools its entry hands it", async () => {
+    const put = (extra: Record<string, unknown>) =>
+      lhome.call("PUT", `/api/h/${la.id}/builders/plugins/tool-lens`, {
+        body: { tools: ["Bash"], ...extra },
+      });
+    const dry = await put({});
+    expect(dry.status).toBe(200);
+    const wrote = await put({
+      dryRun: false,
+      confirmName: dry.body["confirmName"],
+      expectedRev: dry.body["rev"],
+    });
+    expect(wrote.status).toBe(200);
+    const revoked = await lhome.call("POST", `${L}/revoke`, { body: {} });
+    expect(revoked.status).toBe(200);
+    expect(revoked.body["stillLoadedBy"]).toEqual([{ id: la.id, tools: ["Bash"] }]);
+  });
+
+  test("a grant that leaves out the harness, or its host tool, names the harness", async () => {
+    const onB = await lhome.call("PUT", `${L}/grant`, { body: body({ harnesses: [lb.id] }) });
+    expect(onB.status).toBe(200);
+    expect(onB.body["stillLoadedBy"]).toEqual([{ id: la.id, tools: ["Bash"] }]);
+    const gen = (onB.body["grant"] as { gen: number }).gen;
+    const noTool = await lhome.call("PUT", `${L}/grant`, {
+      body: body({ tools: [], expect: gen }),
+    });
+    expect(noTool.status).toBe(200);
+    expect(noTool.body["stillLoadedBy"]).toEqual([{ id: la.id, tools: ["Bash"] }]);
+    const covered = await lhome.call("PUT", `${L}/grant`, {
+      body: body({ expect: (noTool.body["grant"] as { gen: number }).gen }),
+    });
+    expect(covered.status).toBe(200);
+    expect(covered.body["stillLoadedBy"]).toEqual([]);
+  });
+
+  test("a harness the caller cannot read is never read or named", () => {
+    const row = readPluginInventory(lplugins).plugins.find((p) => p.name === "tool-lens");
+    if (row === undefined) throw new Error("no tool-lens");
+    const ctx = (canRead: (id: string) => boolean): LoadedByContext => ({
+      deps: {
+        registry: { list: () => [{ id: la.id, dir: la.dir }] } as never,
+        hangarRoot: lhome.t.hangarRoot,
+      },
+      access: { canRead },
+    });
+    expect(
+      stillLoadedFor(
+        ctx((id) => id !== la.id),
+        row,
+        SERVED_NOTHING,
+      ),
+    ).toEqual([]);
+    expect(
+      stillLoadedFor(
+        ctx(() => true),
+        row,
+        SERVED_NOTHING,
+      ),
+    ).toEqual([{ id: la.id, tools: ["Bash"] }]);
+  });
+
+  test("the new answer fields are not credential names, so the masker shows them", () => {
+    expect(isCredentialKey("stillLoadedBy")).toBe(false);
+    expect(isCredentialKey("waitingCount")).toBe(false);
+    expect(isCredentialKey("credentialNames")).toBe(false);
   });
 });

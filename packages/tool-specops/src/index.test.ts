@@ -1455,6 +1455,54 @@ steps:
     BUDGET_MS,
   );
 
+  const ESCALATING = (maxEscalations: number) => `name: c
+target: cli
+agent:
+  model: claude-sonnet-4-5
+  instructions: Help.
+  model_pool:
+    candidates:
+      - model: claude-haiku-4-5
+      - model: claude-sonnet-4-5
+    strategy:
+      max_escalations: ${maxEscalations}
+evaluation:
+  grader:
+    type: llm_judge
+    criteria: answers briefly
+  on_fail: escalate
+  protected: true
+`;
+
+  it(
+    "keeps a protected escalate's escalations: lowering them is refused and nothing is written",
+    async () => {
+      writeFileSync(join(workspace, "crewhaus.yaml"), ESCALATING(1));
+      const patches = [{ path: ["agent", "model_pool", "strategy", "max_escalations"], value: 0 }];
+      for (const dryRun of [true, false]) {
+        const out = await run(specPatchApply, { path: "crewhaus.yaml", dryRun, patches });
+        expect({ ok: out["ok"], applied: out["applied"], wrote: out["wrote"] ?? false }).toEqual({
+          ok: false,
+          applied: 0,
+          wrote: false,
+        });
+        expect(JSON.stringify(out)).toContain("agent.model_pool.strategy.max_escalations");
+        expect(JSON.stringify(out)).toContain("only rise (1 → 0)");
+      }
+      expect(readFileSync(join(workspace, "crewhaus.yaml"), "utf8")).toBe(ESCALATING(1));
+
+      // Raising them is a tightening, so it is written.
+      const raised = await run(specPatchApply, {
+        path: "crewhaus.yaml",
+        dryRun: false,
+        patches: [{ path: ["agent", "model_pool", "strategy", "max_escalations"], value: 2 }],
+      });
+      expect(raised["ok"]).toBe(true);
+      expect(readFileSync(join(workspace, "crewhaus.yaml"), "utf8")).toBe(ESCALATING(2));
+    },
+    BUDGET_MS,
+  );
+
   it("ownedLeafChange names the loosened bar", () => {
     const doc = parse(WORKFLOW(0.7));
     expect(ownedLeafChange(doc, "workflow", ["steps"], "replace", stepsAt(0.5))).toEqual({

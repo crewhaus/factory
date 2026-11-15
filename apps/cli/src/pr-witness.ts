@@ -1,18 +1,21 @@
 /**
  * The PR witness for `--check-pr` (`spec pin`, `deploy promote`, `deploy rollback`):
- * the CI rollup of the open, approved proposal PR for the exact spec and version.
+ * the CI rollup of the open, approved proposal PR for the exact spec, version and spec
+ * revision.
  *
  * `crewhaus propose` opens its PR from a `propose/…` branch of the repository with the
- * title `propose: <specName> <version> (<source>)`. A PR witnesses a (spec, version)
- * only when all of these hold: its head is a `propose/` branch of this repository
- * (`isCrossRepository` is `false`), its title begins with exactly
- * `propose: <specName> <version> (`, and its review decision is `APPROVED`. The title
- * binds spec and version, whatever the body or branch names. When more than one open
- * PR is titled for the same spec and version, every one of them is weighed and the
- * least favourable answer stands, so no PR can turn another's red or pending check
- * green.
+ * title `propose: <specName> <version> (<source>)` and a body that carries one
+ * `Spec revision: sha256:<hex>` line, the proposed spec's `specRevision`. A PR witnesses a
+ * candidate only when all of these hold: its head is a `propose/` branch of this
+ * repository (`isCrossRepository` is `false`), its title begins with exactly
+ * `propose: <specName> <version> (`, its body holds exactly one line that begins with
+ * `Spec revision:` and that line names the candidate's revision (`sameRevision`), and
+ * its review decision is `APPROVED`. When more than one open PR matches, every one of
+ * them is weighed and the least favourable answer stands, so no PR can turn another's
+ * red or pending check green.
  */
 import { spawnSync } from "node:child_process";
+import { sameRevision } from "@crewhaus/ir/policy";
 import { type PrCheckReader, type PrCheckState, rollupConclusion } from "./approval-gate";
 
 /** The most open proposal PRs read. */
@@ -30,28 +33,47 @@ type ListedPr = {
   readonly url: string;
   readonly headRefName?: string;
   readonly title?: string;
+  readonly body?: string;
   readonly isCrossRepository?: boolean;
   readonly reviewDecision?: string | null;
   readonly statusCheckRollup?: Array<{ conclusion?: string; state?: string }>;
 };
 
-/** Whether `pr` is a proposal PR for exactly this spec and version, from a branch of
- *  this repository. An absent `isCrossRepository` is not taken as `false`. */
+/** The line prefix `crewhaus propose` writes the proposed spec's revision under. */
+export const SPEC_REVISION_LINE = "Spec revision:";
+
+/** The revision a PR body names: the value of its one `Spec revision:` line, or
+ *  `undefined` when the body has no such line or more than one. */
+export function specRevisionOfBody(body: unknown): string | undefined {
+  if (typeof body !== "string") return undefined;
+  const lines = body.split(/\r?\n/).filter((l) => l.startsWith(SPEC_REVISION_LINE));
+  if (lines.length !== 1) return undefined;
+  return (lines[0] as string).slice(SPEC_REVISION_LINE.length).trim();
+}
+
+/** Whether `pr` is a proposal PR for exactly this spec, version and spec revision, from
+ *  a branch of this repository: a `propose/` head, a title that begins with
+ *  `propose: <specName> <version> (`, and a body whose one `Spec revision:` line names
+ *  `specHash`. An absent `isCrossRepository` is not taken as `false`, and a malformed
+ *  or empty `specHash` matches no PR. */
 export function isProposalPrFor(
   pr: {
     readonly headRefName?: unknown;
     readonly title?: unknown;
+    readonly body?: unknown;
     readonly isCrossRepository?: unknown;
   },
   specName: string,
   version: string,
+  specHash: string,
 ): boolean {
   return (
     pr.isCrossRepository === false &&
     typeof pr.headRefName === "string" &&
     pr.headRefName.startsWith("propose/") &&
     typeof pr.title === "string" &&
-    pr.title.startsWith(`propose: ${specName} ${version} (`)
+    pr.title.startsWith(`propose: ${specName} ${version} (`) &&
+    sameRevision(specRevisionOfBody(pr.body), specHash)
   );
 }
 
@@ -79,7 +101,12 @@ function conclusionOf(pr: ListedPr): Conclusion {
  * `GITHUB_TOKEN`/`GH_TOKEN` in the environment authenticates gh.
  */
 export function readPrCheckViaGh(
-  query: { readonly specName: string; readonly env: string; readonly version: string },
+  query: {
+    readonly specName: string;
+    readonly env: string;
+    readonly version: string;
+    readonly specHash: string;
+  },
   spawn: GhSpawn = spawnSync,
 ): Awaited<ReturnType<PrCheckReader>> {
   try {
@@ -93,7 +120,7 @@ export function readPrCheckViaGh(
         "--search",
         "head:propose/",
         "--json",
-        "number,url,headRefName,title,isCrossRepository,reviewDecision,statusCheckRollup",
+        "number,url,headRefName,title,body,isCrossRepository,reviewDecision,statusCheckRollup",
         "--limit",
         String(PR_WITNESS_LIMIT),
       ],
@@ -102,10 +129,13 @@ export function readPrCheckViaGh(
     if (list.status !== 0 || typeof list.stdout !== "string") return { conclusion: "none" };
     const parsed = JSON.parse(list.stdout) as unknown;
     if (!Array.isArray(parsed)) return { conclusion: "none" };
-    // The title binds the witness to the exact spec and version; every match is weighed.
+    // Title and body bind the witness to the exact spec, version and revision; every
+    // match is weighed.
     const matches = (parsed as ListedPr[]).filter(
       (p) =>
-        p !== null && typeof p === "object" && isProposalPrFor(p, query.specName, query.version),
+        p !== null &&
+        typeof p === "object" &&
+        isProposalPrFor(p, query.specName, query.version, query.specHash),
     );
     let worst: { pr: ListedPr; conclusion: Conclusion } | undefined;
     for (const pr of matches) {
