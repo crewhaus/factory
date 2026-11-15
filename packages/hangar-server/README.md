@@ -81,8 +81,9 @@ by the other, and neither needs the other running.
   `<hangarRoot>/settings.json` (`crewhaus access proxy`) lets a reverse
   proxy name the person signing in with a header, which counts only from a
   listed peer that also sends `CrewHaus-Proxy-Secret`, or on
-  `<hangarRoot>/proxy.sock`. Boot refuses it unless Home listens on
-  loopback only. The header from anywhere else is stripped and noted,
+  `<hangarRoot>/proxy.sock`. The proxy adds each client's address to
+  `X-Forwarded-For`, and a device sign-in shows the last one there. Boot
+  refuses it unless Home listens on loopback only. The header from anywhere else is stripped and noted,
   content-free, in `access/security.jsonl`. Home reads the owner's
   `access` and `links` blocks at boot and never writes them.
 - **Page policy** — every page and asset carries `HOME_CSP` (scripts,

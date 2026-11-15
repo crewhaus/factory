@@ -43,6 +43,12 @@ export function clientRunIdsOf(handler: unknown): boolean {
   }
 }
 
+/** The tenant every run Home queues on a managed daemon serves. */
+export const HOME_RUN_TENANT = "home";
+
+/** Tenant ids no client token may carry, in any letter case: they belong to Home's own runs. */
+export const RESERVED_TENANT_IDS: ReadonlySet<string> = new Set([HOME_RUN_TENANT]);
+
 /** Whether `handler` carries {@link MANAGED_RUN_HANDLER}. */
 export function isManagedRunHandler(handler: unknown): boolean {
   return (

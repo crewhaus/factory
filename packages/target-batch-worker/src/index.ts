@@ -40,6 +40,7 @@ import {
   renderControlStart,
   renderControlTimer,
   renderScheduleLanes,
+  scheduleNextDueAtExpr,
 } from "@crewhaus/gateway-protocol/control-codegen";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
@@ -597,9 +598,9 @@ function renderAgent(ir: IrBatchV0): string {
   // `schedule:` emits nothing, so unscheduled worker bundles stay
   // byte-identical.
   const scheduleImport = ir.schedule
-    ? `import { armSchedule, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
+    ? `import { armSchedule } from "@crewhaus/durable-execution";\n`
     : ir.scheduleLanes
-      ? `import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";\n`
+      ? `import { armScheduleLanes } from "@crewhaus/durable-execution";\n`
       : "";
   // The body of one schedule wake, for the single `schedule` lane and for each
   // named lane alike: enqueue that lane's prompt as a job. A named lane's
@@ -631,7 +632,9 @@ ${renderControlLane({
   lane: "schedule",
   varName: "__scheduleLane",
   cadence: describeSchedule(ir.schedule),
-  nextDueAtExpr: "new Date(Date.now() + nextWakeDelayMs(__scheduleSpec, Date.now())).toISOString()",
+  // The armed timer's recorded fire time, jitter included; absent while no
+  // timer is pending.
+  nextDueAtExpr: scheduleNextDueAtExpr("__schedule.nextAt()"),
   indent: "  ",
   ownsSession: false,
   body: scheduleTickBody("__scheduleInstructions", "__scheduleTick"),

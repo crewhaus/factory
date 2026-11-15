@@ -17,8 +17,9 @@
  * month/weekday names, evaluated in an IANA timezone (default UTC). The
  * Quartz-style extensions (`L`, `W`, `#`) are not interpreted — a field
  * containing one is treated as a wildcard so the daemon never crashes on a
- * cron it cannot fully model; the spec's own `schedule.cron` regex is the
- * syntactic gate.
+ * cron it cannot fully model. The spec is the gate before this runtime: its
+ * `schedule.cron` regex checks the syntax, and it refuses a `timezone` the
+ * runtime does not know and a cron whose days its months never have.
  */
 
 /** IR's `IrSchedule` without `instructions` — the "when", never the "what". */
@@ -111,9 +112,13 @@ function parseField(
       hi = slash >= 0 ? max : lo;
     }
     if (Number.isNaN(lo) || Number.isNaN(hi)) return "*";
-    for (let v = lo; v <= hi; v += step) {
-      if (v >= min && v <= max) out.add(v);
+    // Walk only the values inside [min, max]: the first in-range value of
+    // `lo, lo+step, …`, up to the smaller of `hi` and `max`.
+    let v = lo;
+    if (v < min) {
+      v = Number.isFinite(step) ? v + Math.ceil((min - v) / step) * step : Number.POSITIVE_INFINITY;
     }
+    for (const end = Math.min(hi, max); v <= end; v += step) out.add(v);
   }
   return out.size === 0 ? "*" : out;
 }
@@ -136,6 +141,36 @@ const WEEKDAY_INDEX: Readonly<Record<string, number>> = {
   Sat: 6,
 };
 
+/** The most time zones {@link wallClock} keeps a formatter for. */
+const FORMATTER_CACHE_MAX = 16;
+const formatters = new Map<string, Intl.DateTimeFormat>();
+
+/**
+ * One `Intl.DateTimeFormat` per time zone, built on first use and reused
+ * after. It holds at most {@link FORMATTER_CACHE_MAX} zones, dropping the
+ * oldest first. A zone `Intl` rejects throws its `RangeError` and is never
+ * kept.
+ */
+function formatterFor(timezone: string): Intl.DateTimeFormat {
+  const cached = formatters.get(timezone);
+  if (cached !== undefined) return cached;
+  const made = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    hour12: false,
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "numeric",
+    weekday: "short",
+  });
+  if (formatters.size >= FORMATTER_CACHE_MAX) {
+    const oldest = formatters.keys().next().value;
+    if (oldest !== undefined) formatters.delete(oldest);
+  }
+  formatters.set(timezone, made);
+  return made;
+}
+
 /** Wall-clock fields of `date` in `timezone` (UTC when absent). */
 function wallClock(date: Date, timezone?: string): WallClock {
   if (timezone === undefined) {
@@ -147,15 +182,7 @@ function wallClock(date: Date, timezone?: string): WallClock {
       dow: date.getUTCDay(),
     };
   }
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    hour12: false,
-    month: "numeric",
-    day: "numeric",
-    hour: "numeric",
-    minute: "numeric",
-    weekday: "short",
-  }).formatToParts(date);
+  const parts = formatterFor(timezone).formatToParts(date);
   const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? "";
   const hour24 = Number.parseInt(get("hour"), 10);
   return {
@@ -257,15 +284,30 @@ export interface ArmScheduleHandlers {
 export interface ArmedSchedule {
   /** Stop the loop and clear any pending timer. Idempotent. */
   cancel(): void;
+  /**
+   * The recorded fire time of the next wake, in epoch ms, jitter included.
+   * `undefined` while no wake is pending: during a wake (until it re-arms)
+   * and after `cancel()`.
+   */
+  nextAt(): number | undefined;
 }
+
+/**
+ * The longest single timer {@link armSchedule} sets, in ms: the largest delay
+ * a JS timer holds. A later wake waits through several timers of at most this
+ * length and wakes once, at its recorded fire time.
+ */
+const MAX_TIMER_MS = 2_147_483_647;
 
 /**
  * Arm a self-rescheduling wake loop for `schedule`. Each tick computes its
  * OWN next delay (so cron drift and per-wake jitter stay correct across a
  * long-lived daemon) and re-arms only AFTER `onWake` resolves, so a slow tick
  * can never overlap itself. All timing seams (`now`/`rand`/`setTimer`) are
- * injectable for deterministic tests. Returns a cancel handle the daemon's
- * shutdown path calls.
+ * injectable for deterministic tests. Returns a handle: `cancel()` is what the
+ * daemon's shutdown path calls, and `nextAt()` is the next wake's recorded
+ * fire time, so reading it does no schedule arithmetic. No single timer is
+ * set for longer than {@link MAX_TIMER_MS}.
  */
 export function armSchedule(schedule: WakeSchedule, handlers: ArmScheduleHandlers): ArmedSchedule {
   const now = handlers.now ?? Date.now;
@@ -276,12 +318,23 @@ export function armSchedule(schedule: WakeSchedule, handlers: ArmScheduleHandler
 
   let cancelled = false;
   let handle: unknown;
+  let nextAtMs: number | undefined;
 
-  const scheduleNext = (): void => {
-    if (cancelled) return;
-    const delay = nextWakeDelayMs(schedule, now(), rand);
+  // Wait `ms` toward the recorded `nextAtMs`. A wait longer than one timer
+  // holds is set in parts: when a part ends before `nextAtMs`, the next part
+  // is set for what remains and `onWake` does not run.
+  const waitFor = (ms: number): void => {
+    const part = Math.min(ms, MAX_TIMER_MS);
     handle = setTimer(() => {
       if (cancelled) return;
+      if (part < ms && nextAtMs !== undefined) {
+        const remaining = nextAtMs - now();
+        if (remaining > 0) {
+          waitFor(remaining);
+          return;
+        }
+      }
+      nextAtMs = undefined;
       void (async () => {
         try {
           await handlers.onWake();
@@ -290,14 +343,26 @@ export function armSchedule(schedule: WakeSchedule, handlers: ArmScheduleHandler
         }
         scheduleNext();
       })();
-    }, delay);
+    }, part);
+  };
+
+  const scheduleNext = (): void => {
+    if (cancelled) return;
+    const from = now();
+    const delay = nextWakeDelayMs(schedule, from, rand);
+    nextAtMs = from + delay;
+    waitFor(delay);
   };
 
   scheduleNext();
   return {
     cancel(): void {
       cancelled = true;
+      nextAtMs = undefined;
       if (handle !== undefined) clearTimer(handle);
+    },
+    nextAt(): number | undefined {
+      return nextAtMs;
     },
   };
 }
@@ -316,6 +381,18 @@ export interface ArmScheduleLanesHandlers {
   readonly clearTimer?: (handle: unknown) => void;
 }
 
+/** The handle {@link armScheduleLanes} returns. */
+export interface ArmedScheduleLanes {
+  /** Stop every lane and clear its pending timer. Idempotent. */
+  cancel(): void;
+  /**
+   * Lane `name`'s {@link ArmedSchedule.nextAt}: its next wake's recorded
+   * fire time. `undefined` for an unknown name, while that lane is in a wake,
+   * and for every name after `cancel()`.
+   */
+  nextAt(name: string): number | undefined;
+}
+
 /** The most lanes one daemon arms; the spec's list form takes no more. */
 const MAX_SCHEDULE_LANES = 8;
 
@@ -328,13 +405,16 @@ const MAX_SCHEDULE_LANES = 8;
  * Throws a `TypeError`, before arming anything, for zero lanes, more than
  * eight, an empty name or a repeated one: the name is how a wake is
  * dispatched, so two lanes may not share one. The lane-name grammar itself is
- * the spec's and the control contract's. `cancel()` cancels every lane and is
- * idempotent.
+ * the spec's and the control contract's. Lanes arm in order; when arming one
+ * throws (a time zone or cron it cannot schedule), every lane already armed is
+ * cancelled and the same error is rethrown, so nothing stays armed and no
+ * later lane is armed. `cancel()` cancels every lane and is idempotent;
+ * `nextAt(name)` is that lane's recorded next fire time.
  */
 export function armScheduleLanes(
   lanes: ReadonlyArray<WakeScheduleLane>,
   handlers: ArmScheduleLanesHandlers,
-): ArmedSchedule {
+): ArmedScheduleLanes {
   if (lanes.length === 0) throw new TypeError("armScheduleLanes: at least one lane is required");
   if (lanes.length > MAX_SCHEDULE_LANES) {
     throw new TypeError(
@@ -352,23 +432,36 @@ export function armScheduleLanes(
     names.add(lane.name);
   }
 
-  const armed = lanes.map((lane) => {
+  const armed = new Map<string, ArmedSchedule>();
+  for (const lane of lanes) {
     const { name } = lane;
-    return armSchedule(lane, {
-      onWake: () => handlers.onWake(name),
-      onError: (err) => handlers.onError?.(err, name),
-      ...(handlers.now !== undefined ? { now: handlers.now } : {}),
-      ...(handlers.rand !== undefined ? { rand: handlers.rand } : {}),
-      ...(handlers.setTimer !== undefined ? { setTimer: handlers.setTimer } : {}),
-      ...(handlers.clearTimer !== undefined ? { clearTimer: handlers.clearTimer } : {}),
-    });
-  });
+    try {
+      armed.set(
+        name,
+        armSchedule(lane, {
+          onWake: () => handlers.onWake(name),
+          onError: (err) => handlers.onError?.(err, name),
+          ...(handlers.now !== undefined ? { now: handlers.now } : {}),
+          ...(handlers.rand !== undefined ? { rand: handlers.rand } : {}),
+          ...(handlers.setTimer !== undefined ? { setTimer: handlers.setTimer } : {}),
+          ...(handlers.clearTimer !== undefined ? { clearTimer: handlers.clearTimer } : {}),
+        }),
+      );
+    } catch (err) {
+      for (const one of armed.values()) one.cancel();
+      throw err;
+    }
+  }
   let cancelled = false;
   return {
     cancel(): void {
       if (cancelled) return;
       cancelled = true;
-      for (const one of armed) one.cancel();
+      for (const one of armed.values()) one.cancel();
+    },
+    nextAt(name: string): number | undefined {
+      if (cancelled) return undefined;
+      return armed.get(name)?.nextAt();
     },
   };
 }

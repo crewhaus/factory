@@ -53,15 +53,19 @@ export function v1ErrorBody(input: V1ErrorInput): { readonly error: Record<strin
   };
 }
 
-/** An error answer in the v1 envelope. */
-export function v1Error(input: V1ErrorInput, headers: Record<string, string> = {}): Response {
-  return json(v1ErrorBody(input), input.status, {
+/** The headers an error answer carries: `WWW-Authenticate` on a 401, `Retry-After` with a wait. */
+export function v1ErrorHeaders(input: V1ErrorInput): Record<string, string> {
+  return {
     ...(input.status === 401 ? { "www-authenticate": "Bearer" } : {}),
     ...(input.retryAfterMs !== undefined
       ? { "retry-after": String(Math.max(1, Math.ceil(input.retryAfterMs / 1000))) }
       : {}),
-    ...headers,
-  });
+  };
+}
+
+/** An error answer in the v1 envelope. */
+export function v1Error(input: V1ErrorInput, headers: Record<string, string> = {}): Response {
+  return json(v1ErrorBody(input), input.status, { ...v1ErrorHeaders(input), ...headers });
 }
 
 /** A handler's way to stop with a v1 error: the router answers it in the envelope. */

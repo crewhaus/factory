@@ -211,6 +211,8 @@ export {
   outcomeOf,
 } from "./refusal";
 export {
+  API_RUN_BUSY_MESSAGES,
+  type ApiRunCapacity,
   type CreateRunRequest,
   HOME_RUN_TENANT,
   RUN_ADAPTER_SHAPES,

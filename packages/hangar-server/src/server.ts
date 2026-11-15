@@ -3337,6 +3337,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     ...(processes.stopApiRun !== undefined
       ? { stopRunJob: processes.stopApiRun.bind(processes) }
       : {}),
+    ...(processes.apiRunCapacity !== undefined
+      ? { apiRunCapacity: processes.apiRunCapacity.bind(processes) }
+      : {}),
     controlClient: control,
     controlTarget: async (entry) => controlTarget(await processFor(entry)),
     stopDaemon: async (entry) => {
