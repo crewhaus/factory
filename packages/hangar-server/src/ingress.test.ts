@@ -19,7 +19,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { foldStates, publishClaim, withLedgerLock } from "@crewhaus/control-records";
+import * as records from "@crewhaus/control-records";
+import { foldStates, publishClaim } from "@crewhaus/control-records";
 import {
   IDEMPOTENCY_TTL_MS,
   outcomeOf,
@@ -44,6 +45,13 @@ afterAll(() => {
 });
 
 const SECRET = ["test", "signing", "secret"].join("-");
+
+/** Owner-only: the exact bits on POSIX; Windows reports only read and write. */
+function expectOwnerOnly(path: string): void {
+  const mode = statSync(path).mode & 0o777;
+  if (process.platform === "win32") expect(mode & 0o600).toBe(0o600);
+  else expect(mode).toBe(0o600);
+}
 
 function deferred(): { readonly promise: Promise<void>; open(): void } {
   let open: () => void = () => undefined;
@@ -259,10 +267,7 @@ describe("a delivery", () => {
       readFileSync(join(s.hangarRoot, "ingress", "test", `${digestOf("delivery-1")}.json`), "utf8"),
     ) as Record<string, unknown>;
     expect(record).toMatchObject({ v: 1, provider: "test", body: '{"n":1}', origin: "api" });
-    expect(
-      statSync(join(s.hangarRoot, "ingress", "test", `${digestOf("delivery-1")}.json`)).mode &
-        0o777,
-    ).toBe(0o600);
+    expectOwnerOnly(join(s.hangarRoot, "ingress", "test", `${digestOf("delivery-1")}.json`));
     gate.open();
     await s.ingress.idle();
     expect(s.receipts()[0]?.["state"]).toBe("succeeded");
@@ -532,7 +537,7 @@ describe("a delivery", () => {
     expect(s.receipts().map((row) => row["state"])).toEqual(["accepted"]);
     expect(existsSync(path)).toBe(true);
     expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ body: '{"n":1}' });
-    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expectOwnerOnly(path);
     gate.open();
     await s.ingress.idle();
     expect(count.handled).toBe(1);
@@ -702,7 +707,7 @@ describe("the inbound sweep", () => {
       },
     ],
   ] as const) {
-    test(`an old unclaimed body stays when it ${what} while the sweep waits for the ledger lock`, async () => {
+    test(`an old unclaimed body stays when it ${what} before the sweep takes the ledger lock`, async () => {
       const s = setUp(receiver());
       const dir = join(s.hangarRoot, "ingress", "test");
       mkdirSync(dir, { recursive: true });
@@ -712,14 +717,22 @@ describe("the inbound sweep", () => {
       const old = (clock.now - IDEMPOTENCY_TTL_MS - MINUTE) / 1000;
       utimesSync(path, old, old);
       const warnings: string[] = [];
-      let sweeping: Promise<unknown> | undefined;
-      const locked = await withLedgerLock(workspaceCommandsLedger(s.hangarRoot), () => {
-        // The sweep looks at the record, then waits for the lock this test holds.
-        sweeping = sweepInboundRecords(s.hangarRoot, clock.now, (m) => warnings.push(m));
+      // The sweep has looked at the record; the change lands before its lock is taken.
+      const real = records.withLedgerLock;
+      let changed = 0;
+      const lock = spyOn(records, "withLedgerLock").mockImplementation(((ledger, fn) => {
+        changed += 1;
         change(path, s.hangarRoot, digest);
-      });
-      expect(locked).toBeUndefined();
-      expect(await sweeping).toEqual({ checked: 1, removed: 0, truncated: false });
+        return real(ledger, fn);
+      }) as typeof real);
+      let swept: unknown;
+      try {
+        swept = await sweepInboundRecords(s.hangarRoot, clock.now, (m) => warnings.push(m));
+      } finally {
+        lock.mockRestore();
+      }
+      expect(changed).toBe(1);
+      expect(swept).toEqual({ checked: 1, removed: 0, truncated: false });
       expect(existsSync(path)).toBe(true);
       expect(warnings).toEqual([]);
     });
