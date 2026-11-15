@@ -13,6 +13,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -210,6 +211,24 @@ describe("install on macOS", () => {
     expect(out.exitCode).toBe(1);
     expect(out.lines.join("\n")).toContain("exited 5");
   });
+
+  test("a tab in CHVM_DIR is refused with exit 55, naming it, before anything is written or run", async () => {
+    const r = rig({ env: { PATH: "/p", CHVM_DIR: "/c\tx" } });
+    const out = await install(r.deps, { yes: true });
+    expect(out.exitCode).toBe(55);
+    expect(out.lines.join("\n")).toContain("CHVM_DIR");
+    expect(existsSync(plistPath(r.home))).toBe(false);
+    expect(r.ran).toEqual([]);
+    expect(r.receipts).toEqual([]);
+    expect(r.written).toEqual([]);
+  });
+
+  test("a $ in the program path is written as it is: launchd expands nothing", () => {
+    const r = rig({ which: () => "/opt/$HOME/crewhaus" });
+    const planned = planInstall(r.deps);
+    if (!planned.ok) throw new Error(planned.result.lines.join(" "));
+    expect(planned.plan.content).toContain("<string>/opt/$HOME/crewhaus</string>");
+  });
 });
 
 describe("install on Linux", () => {
@@ -232,6 +251,81 @@ describe("install on Linux", () => {
     // The linger hint is printed; loginctl never runs.
     expect(out.lines.join("\n")).toContain("loginctl enable-linger sam");
     expect(r.ran.some((argv) => argv[0] === "loginctl")).toBe(false);
+  });
+
+  const refusedBeforeAnything = async (r: Rig, named: string): Promise<void> => {
+    const out = await install(r.deps, { yes: true });
+    expect(out.exitCode).toBe(55);
+    expect(out.lines.join("\n")).toContain(named);
+    expect(existsSync(unitPath(r.home))).toBe(false);
+    expect(r.ran).toEqual([]);
+    expect(r.receipts).toEqual([]);
+    expect(r.written).toEqual([]);
+  };
+
+  test("a line break in PATH is refused before anything is written or run", async () => {
+    await refusedBeforeAnything(
+      rig({ platform: "linux", env: { PATH: "/usr/bin\nExecStartPre=/bin/true" } }),
+      "PATH",
+    );
+  });
+
+  test("a line break in CREWHAUS_HANGAR_ROOT is refused before anything is written or run", async () => {
+    await refusedBeforeAnything(
+      rig({ platform: "linux", env: { PATH: "/p", CREWHAUS_HANGAR_ROOT: "/h\n[Service]" } }),
+      "CREWHAUS_HANGAR_ROOT",
+    );
+  });
+
+  test("a line break in Home's directory or the program path is refused, naming it", async () => {
+    const r = rig({ platform: "linux" });
+    await refusedBeforeAnything(
+      rig({ platform: "linux", hangarRoot: join(r.home, "a\rb") }),
+      "Home's directory",
+    );
+    await refusedBeforeAnything(
+      rig({ platform: "linux", which: () => "/opt/a\u007fb/crewhaus" }),
+      "The program path",
+    );
+  });
+
+  test("a line break in CHVM_DIR is named as CHVM_DIR when the shim under it is the program", async () => {
+    const r = rig({ platform: "linux" });
+    const chvmDir = join(r.home, "c\nx");
+    const shim = join(chvmDir, "shims", "crewhaus");
+    mkdirSync(dirname(shim), { recursive: true });
+    writeFileSync(shim, "#!/bin/sh\n");
+    chmodSync(shim, 0o755);
+    const withShim = rig({
+      platform: "linux",
+      homedir: r.home,
+      env: { PATH: "/p", CHVM_DIR: chvmDir },
+    });
+    expect(serviceProgram(withShim.deps)).toEqual({ program: shim, from: "chvm" });
+    await refusedBeforeAnything(withShim, "CHVM_DIR");
+  });
+
+  test("a $ in the program path is refused on Linux", async () => {
+    await refusedBeforeAnything(
+      rig({ platform: "linux", which: () => "/opt/$HOME/crewhaus" }),
+      "The program path",
+    );
+  });
+
+  test("Home's directory with a space is written as it is after append:", () => {
+    // systemd.exec `append:path` takes the path as written and never unquotes it, so the
+    // path stays unquoted and a space inside it is kept.
+    const r = rig({ platform: "linux" });
+    const root = join(r.home, "my home", "hangar");
+    const planned = planInstall({ ...r.deps, hangarRoot: root });
+    if (!planned.ok) throw new Error(planned.result.lines.join(" "));
+    const lines = planned.plan.content.split("\n");
+    const log = join(root, "service", "resident.log");
+    expect(lines).toContain(`StandardOutput=append:${log}`);
+    expect(lines).toContain(`StandardError=append:${log}`);
+    for (const line of lines.filter((l) => l.includes("append:"))) {
+      expect(line).not.toContain('"');
+    }
   });
 });
 
@@ -331,4 +425,39 @@ describe("what status reads", () => {
       failed: 0,
     });
   });
+
+  const validReport = JSON.stringify({
+    v: 1,
+    at: "2026-11-13T00:00:00.000Z",
+    mode: "resident",
+    restarted: [{}],
+    skipped: [],
+    failed: [],
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a recovery report reached through a link that leads outside Home's directory is no report",
+    () => {
+      const r = rig();
+      const outside = join(r.home, "elsewhere");
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(join(outside, "recovery.json"), validReport);
+      mkdirSync(join(r.hangarRoot, "service"), { recursive: true });
+      symlinkSync(join(outside, "recovery.json"), join(r.hangarRoot, "service", "recovery.json"));
+      expect(readLastRecovery(r.hangarRoot)).toBeUndefined();
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "a service directory that is a link leading outside Home's directory holds no report",
+    () => {
+      const r = rig();
+      const outside = join(r.home, "elsewhere");
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(join(outside, "recovery.json"), validReport);
+      mkdirSync(r.hangarRoot, { recursive: true });
+      symlinkSync(outside, join(r.hangarRoot, "service"));
+      expect(readLastRecovery(r.hangarRoot)).toBeUndefined();
+    },
+  );
 });

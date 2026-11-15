@@ -4,16 +4,23 @@
  * allows or denies it. The token belongs to the member who allows it, and is made only
  * when the other computer collects it.
  *
- * The code is typed in any case, with or without its hyphen; a `?code=` in the page's
- * address fills it in. Every answer is said in words with its reason, status is a word
- * and an icon (never colour alone), the result heading takes focus and says how it
- * ended, a refused choice gives focus back to the button pressed, and the live region is
- * polite. DOM by `createElement` and `textContent` only.
+ * The code is typed in any case, with or without its hyphen, and the field always starts
+ * empty: the member types the code from the computer in front of them. The request shows
+ * what Home itself observed (where it came from, and when) apart from the name the
+ * request gave, and a plain warning comes before Allow. Every answer is said in words
+ * with its reason, status is a word and an icon (never colour alone), the result heading
+ * takes focus and says how it ended, a refused choice gives focus back to the button
+ * pressed, and the live region is polite. DOM by `createElement` and `textContent` only.
  */
 
 import { append, clear, el } from "../dom.js";
 import { announce } from "../ui/live.js";
+import { fmtRelativeTime } from "../util.js";
 import { call, createAction } from "../v1.js";
+
+/** Said before Allow, on this page and by `crewhaus access approve`. */
+export const DEVICE_WARNING =
+  "Allow only a sign-in you just started yourself, on a computer in front of you. Never allow a code someone sent you.";
 
 /** What each refusal says, in plain words. */
 export const DEVICE_MESSAGES = Object.freeze({
@@ -32,12 +39,21 @@ function messageOf(error) {
   return DEVICE_MESSAGES[error?.reason] ?? error?.message ?? "Something went wrong.";
 }
 
-/** A code from the page's address: `#/device?code=BCDF-GHJK`. */
-export function codeFromHash(hash) {
-  const at = typeof hash === "string" ? hash.indexOf("?") : -1;
-  if (at < 0) return "";
-  const value = new URLSearchParams(hash.slice(at + 1)).get("code") ?? "";
-  return /^[A-Za-z -]{1,16}$/.test(value) ? value : "";
+/**
+ * What Home itself observed about a request: where it came from, and how long ago. Never
+ * what the request says about itself.
+ */
+export function observedLine(request, nowMs) {
+  const ago = fmtRelativeTime(request?.createdAt, nowMs);
+  const from = request?.requestedFrom ?? {};
+  const address = typeof from.address === "string" && from.address !== "" ? from.address : "";
+  if (from.via === "home") return `Asked on this Home's own computer, ${ago}.`;
+  if (from.via === "proxy") {
+    return address !== ""
+      ? `Asked through your proxy, which reports ${address}, ${ago}.`
+      : `Asked through your proxy, ${ago}.`;
+  }
+  return address !== "" ? `Asked from ${address}, ${ago}.` : `Asked over the network, ${ago}.`;
 }
 
 /** The status line: an icon and a word, so it never rests on colour. */
@@ -76,7 +92,6 @@ export function renderDevice(root, _ctx) {
     maxlength: "16",
     "aria-describedby": "device-code-help",
   });
-  input.value = codeFromHash(typeof location !== "undefined" ? location.hash : "");
   const lookUp = el("button", { class: "btn btn-primary", type: "submit", text: "Look up" });
   const form = el("form", { class: "add-form device-form" }, [
     el("label", { for: "device-code", text: "Code shown on the other computer" }),
@@ -164,16 +179,18 @@ export function renderDevice(root, _ctx) {
     append(result, [
       heading,
       el("ul", { class: "check-list" }, [
-        el("li", {
-          text: request.clientName ? `From: ${request.clientName}` : "From: another computer",
-        }),
+        el("li", { text: observedLine(request, Date.now()) }),
+        request.clientName
+          ? el("li", {}, ["Name it gave: ", el("bdi", { text: request.clientName })])
+          : el("li", { text: "It gave no name." }),
         el("li", {
           text: request.readOnly
             ? "It will only be able to read."
-            : "It will be able to do what you can do here.",
+            : "It can do what you can do here, except manage who has access or allow sign-ins.",
         }),
         el("li", { text: `Its access lasts ${request.tokenDays} days, until you revoke it.` }),
       ]),
+      el("p", { class: "device-warning", text: DEVICE_WARNING }),
       el("div", { class: "editor-actions" }, [allow, deny]),
     ]);
     result.hidden = false;

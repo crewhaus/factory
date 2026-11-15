@@ -69,6 +69,7 @@ export {
   BOOTSTRAP_PRINCIPAL,
   HOME_SOCKET,
   PROXY_SOCKET,
+  socketsSupported,
   type Identified,
   type Listener,
   PROXY_SECRET_HEADER,
@@ -78,6 +79,7 @@ export {
   authenticate,
   hasForwardingHeaders,
   hostNameOf,
+  requesterOf,
 } from "./authenticate";
 export {
   BOOT_TICKET_TTL_MS,
@@ -171,6 +173,7 @@ export {
   type DeviceRequestState,
   type DeviceRequests,
   type DeviceStart,
+  type RequestedFrom,
   openDeviceRequests,
 } from "./device-requests";
 export {

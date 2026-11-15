@@ -29,6 +29,7 @@ import {
   type Peer,
   hasForwardingHeaders,
   hostNameOf,
+  requesterOf,
   sealSecret,
 } from "@crewhaus/access-control";
 import type { CommandReceipt } from "@crewhaus/control-contract";
@@ -197,6 +198,7 @@ export async function serveSignIn(
       const started = await devices.start({
         ...(input.clientName !== undefined ? { clientName: input.clientName } : {}),
         ...(input.readOnly === true ? { readOnly: true } : {}),
+        requestedFrom: await requesterOf(req, peer, home.config),
       });
       if (!started.ok) return deviceRefusal(pathname, started);
       const origin = extras.baseUrl ?? new URL(req.url).origin;

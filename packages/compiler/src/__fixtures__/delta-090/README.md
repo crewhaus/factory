@@ -91,3 +91,10 @@ name on cli and channel. `plugins-strings.digests.json` was generated before the
 and does not move; `plugins-grants.present.digests.json` is new. The emitters render `names:` as the
 JSON of the lowered list, as before, so a name list compiles to the same bytes. No other digest
 moves.
+
+**Schedule hardening delta — the lane form on channel, managed and batch, and the object form on channel and
+batch.** Each `nextDueAt` reads the armed timer's recorded fire time (`nextAt`) and no daemon imports
+`nextWakeDelayMs`; a named lane's tick body binds its lane id once as a JSON literal. Moved:
+`schedule-lanes.present.digests.json` (channel-lanes `daemon.ts`, managed-lanes `daemon.ts`, batch-lanes
+`agent.ts`) and `schedule-object.digests.json` (channel-cron and channel-interval `daemon.ts`, batch-cron and
+batch-interval `agent.ts`). No other digest moves.

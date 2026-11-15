@@ -14,9 +14,13 @@
  * finds, so switching versions never leaves the unit pointing at an old binary. Its output
  * goes to `<hangarRoot>/service/resident.log`. Install shows exactly the file it writes
  * and the commands it runs, then asks (`--yes` for scripts; with no terminal and no
- * `--yes` it writes nothing). A unit file it did not write (no marker line) is never
- * overwritten or removed. Uninstall stops the unit, removes only the file it wrote and
- * leaves every other file. Both are recorded as a receipt in Home's ledger.
+ * `--yes` it writes nothing). It refuses, before building any file, a PATH,
+ * `CREWHAUS_HANGAR_ROOT`, `CHVM_DIR`, program path or Home directory holding a control
+ * character (a line break, a tab, …), and on Linux a program path holding `$`; the log
+ * paths after systemd's `append:` are written as they are. A unit file it did not write
+ * (no marker line) is never overwritten or removed. Uninstall stops the unit, removes only
+ * the file it wrote and leaves every other file. Both are recorded as a receipt in Home's
+ * ledger.
  *
  * Side-effect free on import: the platform, home directory, user, environment, PATH
  * lookup, command runner, output and confirmation are all injected, and every command
@@ -26,6 +30,7 @@ import { constants, accessSync, existsSync, mkdirSync, readFileSync, rmSync } fr
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { EXIT_FOR_ERROR } from "@crewhaus/control-contract";
+import { resolveInside } from "@crewhaus/harness-supervisor";
 
 /** The first line of every unit file this verb writes, after any XML header. */
 export const PLIST_MARKER = "<!-- written by crewhaus hangar install -->";
@@ -179,7 +184,10 @@ export function plistContent(
 const quoted = (text: string): string =>
   `"${text.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%")}"`;
 
-/** The systemd user unit, every value quoted. */
+/**
+ * The systemd user unit: the program and every `Environment=` value quoted, and the log
+ * path after `append:` written as it is.
+ */
 export function systemdContent(
   program: string,
   logPath: string,
@@ -194,6 +202,8 @@ export function systemdContent(
     `ExecStart=${quoted(program)} hangar serve --resident`,
     "Restart=on-failure",
     ...env.map(([name, value]) => `Environment=${quoted(`${name}=${value}`)}`),
+    // systemd.exec `append:path` takes the path as written: it is not unquoted, so it is
+    // never quoted here.
     `StandardOutput=append:${logPath.replaceAll("%", "%%")}`,
     `StandardError=append:${logPath.replaceAll("%", "%%")}`,
     "",
@@ -209,6 +219,53 @@ export function carriesMarker(platform: NodeJS.Platform, text: string): boolean 
   return platform === "darwin"
     ? lines[0]?.startsWith("<?xml") === true && lines[1] === PLIST_MARKER
     : lines[0] === UNIT_MARKER;
+}
+
+/** Whether a value holds a character no service file may carry: a C0 control or DEL. */
+const holdsControlCharacter = (value: string): boolean => {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+};
+
+/**
+ * Why a value cannot go in the service file as written, or `undefined` when every one
+ * can: an environment value the unit carries (named by its variable), Home's directory or
+ * the program path holding a control character, or on Linux a program path holding `$`.
+ */
+export function serviceValueRefusal(
+  platform: NodeJS.Platform,
+  program: string,
+  hangarRoot: string,
+  env: Readonly<Record<string, string | undefined>>,
+): ServiceResult | undefined {
+  const refuse = (line: string): ServiceResult => ({
+    lines: [line],
+    exitCode: EXIT_FOR_ERROR.invalid,
+  });
+  const values: Array<[string, string]> = [
+    ...unitEnv(env),
+    ["Home's directory", hangarRoot],
+    ["the program path", program],
+  ];
+  for (const [name, value] of values) {
+    if (holdsControlCharacter(value)) {
+      const named = `${name.charAt(0).toUpperCase()}${name.slice(1)}`;
+      return refuse(
+        `${named} holds a line break or another control character, so it cannot go in the service file. Set it without one, then run this again.`,
+      );
+    }
+  }
+  // systemd.service "Command lines": the program to run is never a variable, and `$`
+  // is expanded in its arguments, so a program path holding one cannot be written as is.
+  if (platform === "linux" && program.includes("$")) {
+    return refuse(
+      "The program path holds a $, which systemd would expand in the service file. Install crewhaus at a path without one, then run this again.",
+    );
+  }
+  return undefined;
 }
 
 /** What install would write and run, or the refusal. Reads only. */
@@ -239,6 +296,8 @@ export function planInstall(
       },
     };
   }
+  const refused = serviceValueRefusal(deps.platform, found.program, deps.hangarRoot, deps.env);
+  if (refused !== undefined) return { ok: false, result: refused };
   const logPath = join(deps.hangarRoot, "service", "resident.log");
   const env = unitEnv(deps.env);
   if (deps.platform === "darwin") {
@@ -471,7 +530,9 @@ export async function uninstall(
 
 /**
  * The last boot's recovery report, read tolerantly for `hangar status`: a missing,
- * unreadable or unknown-version file is "no recovery report yet", never an error.
+ * unreadable or unknown-version file is "no recovery report yet", never an error. The
+ * report is read only from inside Home's directory: one reached through a link that
+ * leads outside it is no report.
  */
 export function readLastRecovery(hangarRoot: string):
   | {
@@ -482,10 +543,10 @@ export function readLastRecovery(hangarRoot: string):
       readonly failed: number;
     }
   | undefined {
+  const path = resolveInside(hangarRoot, ["service", "recovery.json"]);
+  if (path === undefined) return undefined;
   try {
-    const body = JSON.parse(
-      readFileSync(join(hangarRoot, "service", "recovery.json"), "utf8"),
-    ) as Record<string, unknown>;
+    const body = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
     if (body["v"] !== 1 || typeof body["at"] !== "string") return undefined;
     const count = (value: unknown): number => (Array.isArray(value) ? value.length : 0);
     return {

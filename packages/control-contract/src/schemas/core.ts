@@ -891,13 +891,16 @@ export const authRefreshRequest = z.object({ seal }).strict();
 // Signing in a device with a short code
 // ---------------------------------------------------------------------------
 
-/** What a device names itself on the page that allows it: a short label, never authority. */
+/**
+ * What a device names itself on the page that allows it: a short label, never authority.
+ * It holds no control or format character (bidi and invisible ones among them) and no
+ * line or paragraph separator, so it reads as what it is.
+ */
 const clientName = z
   .string()
   .min(1)
   .max(64)
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
-  .regex(/^[^\u0000-\u001f\u007f]+$/);
+  .regex(/^[^\p{Cc}\p{Cf}\u2028\u2029]+$/u);
 
 export const deviceStartRequest = z
   .object({ seal, clientName: clientName.optional(), readOnly: z.boolean().optional() })
@@ -932,6 +935,15 @@ export const deviceRequestView = z
     state: z.enum(["pending", "allowed", "denied", "consumed", "expired"]),
     readOnly: z.boolean(),
     expiresAt: timestamp,
+    /** When Home received it. */
+    createdAt: timestamp,
+    /** Where it came from, as Home observed it; never what the request says about itself. */
+    requestedFrom: z
+      .object({
+        via: z.enum(["direct", "proxy", "home"]),
+        address: z.string().min(1).max(64).optional(),
+      })
+      .strict(),
     clientName: z.string().optional(),
     tokenDays: count,
   })

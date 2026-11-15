@@ -14,7 +14,7 @@ describe("auth.device.decide recovery", () => {
     if (!setUp.ok) throw new Error(setUp.reason);
     const owner = setUp.result.owner;
     const devices = openDeviceRequests(root);
-    const start = await devices.start({});
+    const start = await devices.start({ requestedFrom: { via: "home" } });
     if (!start.ok) throw new Error(start.reason);
     const cmd = mintId("cmd");
     const decided = await devices.decide({

@@ -4,13 +4,22 @@
  * Rendered, it keeps the person's place: a lookup that fails gives the button back, and
  * after Allow or Deny focus is on the heading that says how it ended.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  spyOn,
+  test,
+} from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { resetDiscovery } from "../assets/js/v1.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { DEVICE_MESSAGES, codeFromHash, renderDevice } from "../assets/js/views/device.js";
+import { DEVICE_MESSAGES, DEVICE_WARNING, renderDevice } from "../assets/js/views/device.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { DEVICE_APPROVE_VERB, DEVICE_LOGIN_VERB } from "../assets/js/views/settings.js";
 import { homeAssets as CONSOLE_ASSETS } from "./embed/home";
@@ -62,10 +71,15 @@ describe("#/device", () => {
     expect(DEVICE_MESSAGES.session_required).toContain("over HTTPS");
   });
 
-  test("a code in the address fills the field; anything else does not", () => {
-    expect(codeFromHash("#/device?code=bcdf-ghjk")).toBe("bcdf-ghjk");
-    expect(codeFromHash("#/device")).toBe("");
-    expect(codeFromHash("#/device?code=<script>")).toBe("");
+  test("the page never reads its own address", () => {
+    expect(SOURCE).not.toContain("location.hash");
+    expect(SOURCE).not.toContain("codeFromHash");
+  });
+
+  test("the warning before Allow says, in plain words, to allow only your own sign-in", () => {
+    expect(DEVICE_WARNING).toBe(
+      "Allow only a sign-in you just started yourself, on a computer in front of you. Never allow a code someone sent you.",
+    );
   });
 
   test("status is a word and an icon; no markup is ever assigned", () => {
@@ -208,10 +222,15 @@ describe("#/device, rendered", () => {
     g["Node"] = saved.Node;
     g["fetch"] = saved.fetch;
   });
+  let lookedUpBody: Record<string, unknown> = {};
+  let clock: { mockRestore(): void } | undefined;
   beforeEach(() => {
     resetDiscovery();
     fakeBody.textContent = "";
     fakeDocument.activeElement = fakeBody;
+    lookedUpBody = LOOKED_UP;
+    // Two minutes after the request arrived.
+    clock = spyOn(Date, "now").mockReturnValue(CREATED + 2 * 60_000);
   });
 
   const TABLE = {
@@ -221,7 +240,23 @@ describe("#/device, rendered", () => {
       { id: "auth.device.decide", method: "POST", path: "/api/v1/access/device-requests/decide" },
     ],
   };
-  const LOOKED_UP = { clientName: "laptop", readOnly: false, tokenDays: 90 };
+  const CREATED = Date.parse("2026-11-14T10:00:00.000Z");
+  /** A name that pretends to be what Home observed. */
+  const POSING = "Asked from 10.0.0.1";
+  const LOOKED_UP = {
+    state: "pending",
+    clientName: POSING,
+    readOnly: false,
+    tokenDays: 90,
+    expiresAt: "2026-11-14T10:10:00.000Z",
+    createdAt: "2026-11-14T10:00:00.000Z",
+    requestedFrom: { via: "direct", address: "203.0.113.5" },
+  };
+  afterEach(() => clock?.mockRestore());
+
+  /** Every node under `node`, depth first, in document order. */
+  const walk = (node: FakeNode): FakeNode[] =>
+    node.children.flatMap((child) => [child, ...walk(child)]);
 
   function mount() {
     const root = new FakeNode("main");
@@ -280,7 +315,7 @@ describe("#/device, rendered", () => {
       url === "/api/v1"
         ? Response.json(TABLE)
         : url.endsWith("/lookup")
-          ? Response.json(LOOKED_UP)
+          ? Response.json(lookedUpBody)
           : decide(url);
     const page = mount();
     page.input.value = "BCDF-GHJK";
@@ -328,5 +363,69 @@ describe("#/device, rendered", () => {
     expect(allow.hidden).toBe(false);
     expect(page.status()).toContain(DEVICE_MESSAGES.code_used);
     expect(page.heading.textContent).toBe("A sign-in is waiting");
+  });
+
+  test("the code field starts empty whatever the address says", () => {
+    const saved = g["location"];
+    g["location"] = { hash: "#/device?code=BCDF-GHJK" };
+    try {
+      const page = mount();
+      expect(page.input.value).toBe("");
+    } finally {
+      g["location"] = saved;
+    }
+  });
+
+  test("the card shows what Home observed apart from the name the request gave", async () => {
+    const page = await lookedUp(() => Response.json({}));
+    const card = page.root.find(
+      (n) => n.tag === "section" && n.className.includes("device-result"),
+    );
+    if (card === undefined) throw new Error("no card");
+    expect(card.textContent).toContain("Asked from 203.0.113.5, 2m ago.");
+    const named = walk(card).filter((n) => n.ownText.includes(POSING));
+    expect(named).toHaveLength(1);
+    const [bdi] = named;
+    expect(bdi?.tag).toBe("bdi");
+    expect(bdi?.textContent).toBe(POSING);
+    expect(bdi?.parentNode?.textContent.startsWith("Name it gave: ")).toBe(true);
+  });
+
+  test("the warning comes before the Allow button", async () => {
+    const page = await lookedUp(() => Response.json({}));
+    const nodes = walk(page.root);
+    const warning = nodes.findIndex(
+      (n) => n.className === "device-warning" && n.textContent === DEVICE_WARNING,
+    );
+    const allow = nodes.findIndex(
+      (n) => n.tag === "button" && n.textContent === "Allow this sign-in",
+    );
+    expect(warning).toBeGreaterThan(-1);
+    expect(allow).toBeGreaterThan(-1);
+    expect(warning).toBeLessThan(allow);
+  });
+
+  test("a request through the proxy, or on Home's own computer, says so", async () => {
+    lookedUpBody = { ...LOOKED_UP, requestedFrom: { via: "proxy" } };
+    const proxied = await lookedUp(() => Response.json({}));
+    expect(proxied.root.textContent).toContain("Asked through your proxy, 2m ago.");
+    fakeBody.textContent = "";
+    lookedUpBody = {
+      ...LOOKED_UP,
+      requestedFrom: { via: "proxy", address: "198.51.100.7" },
+    };
+    const reported = await lookedUp(() => Response.json({}));
+    expect(reported.root.textContent).toContain(
+      "Asked through your proxy, which reports 198.51.100.7, 2m ago.",
+    );
+    fakeBody.textContent = "";
+    lookedUpBody = { ...LOOKED_UP, requestedFrom: { via: "home" } };
+    const own = await lookedUp(() => Response.json({}));
+    expect(own.root.textContent).toContain("Asked on this Home's own computer, 2m ago.");
+    fakeBody.textContent = "";
+    lookedUpBody = { ...LOOKED_UP, clientName: undefined, requestedFrom: { via: "direct" } };
+    const bare = await lookedUp(() => Response.json({}));
+    expect(bare.root.textContent).toContain("Asked over the network, 2m ago.");
+    expect(bare.root.textContent).toContain("It gave no name.");
   });
 });
