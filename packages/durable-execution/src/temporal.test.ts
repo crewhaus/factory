@@ -186,6 +186,237 @@ describe("armSchedule", () => {
     expect(arms).toBe(2); // re-armed despite the throw
     armed.cancel();
   });
+
+  test("nextAt() is the pending timer's fire time after the first arm and each re-arm", async () => {
+    let clock = 5000;
+    let fireNext: (() => void) | undefined;
+    const ats: number[] = [];
+    const armed = armSchedule(
+      { kind: "interval", everyMs: 1000 },
+      {
+        onWake: () => {},
+        now: () => clock,
+        setTimer: (fn, ms) => {
+          ats.push(clock + ms);
+          fireNext = fn;
+          return ats.length;
+        },
+        clearTimer: () => {},
+      },
+    );
+    expect(armed.nextAt()).toBe(6000);
+    expect(ats).toEqual([6000]);
+    clock = 6000;
+    fireNext?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(ats).toEqual([6000, 7000]);
+    expect(armed.nextAt()).toBe(7000);
+    armed.cancel();
+    expect(armed.nextAt()).toBeUndefined();
+  });
+
+  /** A fake clock and timer queue: `fire()` moves the clock to the pending timer and runs it. */
+  function partTimers(start: number) {
+    let clock = start;
+    let pending: { fn: () => void; at: number } | undefined;
+    const sets: number[] = [];
+    return {
+      sets,
+      now: () => clock,
+      setTimer: (fn: () => void, ms: number) => {
+        sets.push(ms);
+        pending = { fn, at: clock + ms };
+        return sets.length;
+      },
+      clearTimer: () => {
+        pending = undefined;
+      },
+      async fire(): Promise<void> {
+        const due = pending;
+        if (due === undefined) throw new Error("no timer pending");
+        pending = undefined;
+        clock = due.at;
+        due.fn();
+        for (let i = 0; i < 4; i++) await Promise.resolve();
+      },
+    };
+  }
+  const MAX_TIMER = 2_147_483_647;
+
+  test("a wake more than one timer away waits in parts and wakes once, at its recorded time", async () => {
+    const t = partTimers(Date.parse("2026-11-14T00:00:00Z"));
+    const wokeAt: number[] = [];
+    const armed = armSchedule(
+      { kind: "cron", cron: "0 0 1 1 *" },
+      {
+        onWake: () => {
+          wokeAt.push(t.now());
+        },
+        now: t.now,
+        setTimer: t.setTimer,
+        clearTimer: t.clearTimer,
+      },
+    );
+    const target = Date.parse("2027-01-01T00:00:00Z");
+    expect(armed.nextAt()).toBe(target);
+    expect(t.sets).toHaveLength(1);
+    await t.fire();
+    expect(wokeAt).toEqual([]);
+    expect(armed.nextAt()).toBe(target);
+    expect(t.sets).toHaveLength(2);
+    await t.fire();
+    expect(wokeAt).toEqual([target]);
+    expect(armed.nextAt()).toBe(Date.parse("2028-01-01T00:00:00Z"));
+    expect(t.sets.length).toBeGreaterThan(2);
+    for (const ms of t.sets) expect(ms).toBeLessThanOrEqual(MAX_TIMER);
+    armed.cancel();
+    expect(armed.nextAt()).toBeUndefined();
+  });
+
+  for (const [label, schedule] of [
+    ["a 30-day interval", { kind: "interval", everyMs: 30 * 24 * 60 * 60 * 1000 }],
+    ["a monthly cron", { kind: "cron", cron: "0 9 1 * *" }],
+  ] as const) {
+    test(`${label} sets no timer longer than one timer holds, and its first part does not wake`, async () => {
+      const t = partTimers(Date.parse("2026-11-02T00:00:00Z"));
+      let wakes = 0;
+      const armed = armSchedule(schedule, {
+        onWake: () => {
+          wakes += 1;
+        },
+        now: t.now,
+        setTimer: t.setTimer,
+        clearTimer: t.clearTimer,
+      });
+      const target = armed.nextAt();
+      await t.fire();
+      expect(wakes).toBe(0);
+      expect(armed.nextAt()).toBe(target);
+      await t.fire();
+      expect(wakes).toBe(1);
+      expect(t.sets.length).toBeGreaterThanOrEqual(3);
+      for (const ms of t.sets) expect(ms).toBeLessThanOrEqual(MAX_TIMER);
+      armed.cancel();
+    });
+  }
+
+  test("cancel() between parts clears the current timer and nothing wakes", async () => {
+    const t = partTimers(Date.parse("2026-11-14T00:00:00Z"));
+    let wakes = 0;
+    let cleared = 0;
+    const armed = armSchedule(
+      { kind: "cron", cron: "0 0 1 1 *" },
+      {
+        onWake: () => {
+          wakes += 1;
+        },
+        now: t.now,
+        setTimer: t.setTimer,
+        clearTimer: (h) => {
+          cleared += 1;
+          expect(h).toBe(2);
+          t.clearTimer();
+        },
+      },
+    );
+    await t.fire();
+    armed.cancel();
+    expect(cleared).toBe(1);
+    expect(armed.nextAt()).toBeUndefined();
+    await expect(t.fire()).rejects.toThrow("no timer pending");
+    expect(wakes).toBe(0);
+  });
+});
+
+describe("a cron field's numbers", () => {
+  // The crons are matched in a child bun process with its own deadline.
+  test("are read within the field's range", () => {
+    const huge = "9".repeat(400);
+    const from = "2026-11-14T00:00:00Z";
+    const pairs = [
+      [`0 0 ${huge} * *`, "0 0 * * *"],
+      ["0 0 1-9007199254740991 * *", "0 0 1-31 * *"],
+      ["0 0 1 2-9007199254740991 *", "0 0 1 2-12 *"],
+      [`0 0 1/${huge} * *`, "0 0 1 * *"],
+      [`0 ${huge}-3 * * *`, "0 * * * *"],
+    ] as const;
+    const crons = pairs.flat();
+    const code = [
+      `import { nextCronMatch } from ${JSON.stringify(`${import.meta.dir}/schedule.ts`)};`,
+      `const crons = ${JSON.stringify(crons)};`,
+      `console.log(JSON.stringify(crons.map((c) => nextCronMatch(c, new Date(${JSON.stringify(from)})).toISOString())));`,
+    ].join("\n");
+    const run = Bun.spawnSync({
+      cmd: [process.execPath, "-e", code],
+      env: { ...process.env },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 15_000,
+    });
+    expect({ exit: run.exitCode, stderr: run.stderr.toString() }).toEqual({ exit: 0, stderr: "" });
+    const out = JSON.parse(run.stdout.toString()) as string[];
+    expect(out).toHaveLength(crons.length);
+    for (let i = 0; i < pairs.length; i++) {
+      expect({ cron: crons[2 * i], at: out[2 * i] }).toEqual({
+        cron: crons[2 * i],
+        at: out[2 * i + 1],
+      });
+    }
+  }, 20_000); // runs a child bun process with a 15 s deadline
+});
+
+/**
+ * Run `fn` with `Intl.DateTimeFormat` swapped for a proxy that counts every
+ * construction, and return how many there were.
+ */
+function countFormatters(fn: () => void): number {
+  const original = Intl.DateTimeFormat;
+  let built = 0;
+  const counting = new Proxy(original, {
+    construct(target, args, newTarget) {
+      built += 1;
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+  try {
+    Intl.DateTimeFormat = counting;
+    fn();
+  } finally {
+    Intl.DateTimeFormat = original;
+  }
+  return built;
+}
+
+describe("nextCronMatch's time-zone formatter", () => {
+  test("one week of minutes in one time zone builds at most one formatter", () => {
+    let next: Date | undefined;
+    const built = countFormatters(() => {
+      next = nextCronMatch("0 17 * * 5", new Date("2026-11-14T00:00:00Z"), "Pacific/Chatham");
+    });
+    expect(built).toBeLessThanOrEqual(1);
+    expect(next?.toISOString()).toBe("2026-11-20T03:15:00.000Z");
+  });
+
+  test("the formatter cache holds at most 16 zones", () => {
+    const from = new Date("2026-11-14T00:00:00Z");
+    const others = [
+      ...Array.from({ length: 12 }, (_, i) => `Etc/GMT+${i + 1}`),
+      ...Array.from({ length: 4 }, (_, i) => `Etc/GMT-${i + 1}`),
+    ];
+    expect(others).toHaveLength(16);
+    nextCronMatch("* * * * *", from, "Asia/Kathmandu");
+    for (const zone of others) nextCronMatch("* * * * *", from, zone);
+    const built = countFormatters(() => {
+      nextCronMatch("* * * * *", from, "Asia/Kathmandu");
+    });
+    expect(built).toBe(1);
+  });
+
+  test("a time zone Intl rejects still throws a RangeError, every time", () => {
+    expect(() => nextCronMatch("0 17 * * 5", new Date(0), "Not/AZone")).toThrow(RangeError);
+    expect(() => nextCronMatch("0 17 * * 5", new Date(0), "Not/AZone")).toThrow(RangeError);
+  });
 });
 
 describe("FileIdempotencyStore + createIdempotencyStore", () => {

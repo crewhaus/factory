@@ -35,6 +35,7 @@ import type { AreaRuntime, Executor, ExecutorStamp, Reconciler, Settlement } fro
 import { type JobAdapter, createJobAdapter } from "./jobs";
 import { type LedgerChoice, commandsLedgerOf, workspaceCommandsLedger } from "./ledgers";
 import { type ObjectPage, pageObjects } from "./pages";
+import { nudgeFromReceipt } from "./projector";
 import { type ReconcileCounts, createReconcile } from "./reconcile";
 import { type RecoverCounts, type RecoverScope, createRecover } from "./recover";
 import { type Rules, createRules } from "./rules";
@@ -76,6 +77,8 @@ export type ControlDeps = {
     target: string,
     credentialRef?: string,
   ) => boolean | undefined;
+  /** The permission a receipt kind outside the composed command kinds needs (a legacy route's). */
+  readonly permissionOf?: (kind: string) => string | undefined;
 };
 
 export type ControlService = {
@@ -143,17 +146,21 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
   /**
    * A command dispatched from its receipt, when it is submitted or recovered, runs only
    * while the credential that submitted it, or for a receipt without one its actor, may
-   * still do it. A system actor and an unlinked local user
-   * pass, and so does the Home's owner on a receipt that names no credential; a receipt that
-   * names one is checked against it whoever submitted it. An answer that could not be
+   * still do it. A system actor and an unlinked local user pass on a receipt that names no
+   * credential; one that names a credential under any actor but a principal does not run.
+   * The Home's owner passes on a receipt that names no credential; a receipt that names one
+   * is checked against it whoever submitted it. An answer that could not be
    * determined runs the command, with one warning. A head with no `authorizeActor` runs no
-   * command whose receipt names a credential.
+   * command whose receipt names a credential. A permission given as `needed` is asked in
+   * place of the kind's: one more permission the command's submit needed.
    */
-  const actorRefused = (receipt: CommandReceipt): boolean => {
-    if (!isId("prn", receipt.actor)) return false;
-    const permission = (COMMAND_KINDS as Readonly<Record<string, { permission: string }>>)[
-      receipt.kind
-    ]?.permission;
+  const actorRefused = (receipt: CommandReceipt, needed?: string): boolean => {
+    if (!isId("prn", receipt.actor)) return receipt.credentialRef !== undefined;
+    const permission =
+      needed ??
+      (COMMAND_KINDS as Readonly<Record<string, { permission: string }>>)[receipt.kind]
+        ?.permission ??
+      deps.permissionOf?.(receipt.kind);
     if (permission === undefined || permission === "public" || permission === "authenticated") {
       return false;
     }
@@ -266,13 +273,25 @@ export function wireControl(deps: ControlDeps, options: WireOptions): ControlSer
     commands: { submit: commands.submit, settle },
     actions: delegatedActions(areas),
   });
+  // The CLI writes receipts outside Home: once one is written to a harness's ledger, it
+  // tells Home's projector, which projects that harness first on its next pass.
+  const submit: Commands["submit"] =
+    options.mode === "direct"
+      ? async (request, effect) => {
+          const answer = await commands.submit(request, effect);
+          if (answer.ok && request.ledger !== "workspace") {
+            nudgeFromReceipt(deps.hangarRoot, answer.receipt.target, warn);
+          }
+          return answer;
+        }
+      : commands.submit;
   return {
     mode: options.mode,
     decisions,
     rules: createRules(decisions, now),
     delegations,
     commands: {
-      submit: commands.submit,
+      submit,
       get: commands.get,
       replayOf: commands.replayOf,
       recover,

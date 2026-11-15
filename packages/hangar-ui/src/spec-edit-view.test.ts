@@ -7,7 +7,7 @@
  * server's segment array, what an empty pane means, what a batch looks like
  * — is pure, so it is proven here.
  */
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { conflictModel } from "../assets/js/ui/conflict.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
@@ -17,6 +17,8 @@ import {
   editsFor,
   parseJsonValue,
   readOnlyModel,
+  settingsCard,
+  unsavedEntryIds,
 } from "../assets/js/views/spec-edit.js";
 
 describe("editPath", () => {
@@ -112,7 +114,7 @@ describe("the view module's own hygiene", () => {
       new URL("../assets/js/views/spec-edit.js", import.meta.url),
     ).text();
     // The form is built from the schema; a node it cannot render opens the JSON pane.
-    expect(source.includes("formModel(body.schema, body.effective, trustRows)")).toBe(true);
+    expect(source.includes("formModel(body.schema, body.effective, trustRows, {")).toBe(true);
     expect(source.includes('jsonButton(node, "Edit as JSON…"')).toBe(true);
     expect(source.match(/const jsonLeaf = \(node\) =>/g)?.length).toBe(1);
     // …and one for a path the spec has not declared at all.
@@ -437,7 +439,7 @@ describe("the Settings card with no spec", () => {
     const at = source.indexOf("function settingsCard(");
     expect(at).toBeGreaterThan(-1);
     const early = source.indexOf("if (absent.absent) {", at);
-    const form = source.indexOf("formModel(body.schema, body.effective, trustRows)", at);
+    const form = source.indexOf("formModel(body.schema, body.effective, trustRows, {", at);
     const anyPath = source.indexOf('text: "Edit any path…"', at);
     expect(early).toBeGreaterThan(at);
     expect(form).toBeGreaterThan(early);
@@ -523,5 +525,231 @@ describe("focus after a watch-me or advice 412", () => {
     expect(handler).toContain('if (apply.getAttribute("aria-disabled") === "true") return;');
     expect(handler).toContain("opener: apply,");
     expect(handler.includes("opener: previewBtn")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The settings form, rendered against just enough DOM to read its controls
+// ---------------------------------------------------------------------------
+
+/** An element with the parts `el()` and the settings card touch. */
+class FormNode {
+  readonly children: FormNode[] = [];
+  readonly attrs: Record<string, string> = {};
+  readonly listeners: Record<string, Array<(event: unknown) => unknown>> = {};
+  readonly dataset: Record<string, string> = {};
+  readonly style = { setProperty: (): void => undefined } as Record<string, unknown>;
+  readonly classList = {
+    add: (...names: string[]): void => {
+      this.className = [...new Set([...this.className.split(" "), ...names])]
+        .filter((n) => n !== "")
+        .join(" ");
+    },
+    remove: (...names: string[]): void => {
+      this.className = this.className
+        .split(" ")
+        .filter((n) => n !== "" && !names.includes(n))
+        .join(" ");
+    },
+    toggle: (): boolean => false,
+    contains: (name: string): boolean => this.className.split(" ").includes(name),
+  };
+  className = "";
+  ownText = "";
+  value = "";
+  hidden = false;
+  disabled = false;
+  parentNode: FormNode | null = null;
+  constructor(readonly tag: string) {}
+  get textContent(): string {
+    return this.ownText + this.children.map((c) => c.textContent).join("");
+  }
+  set textContent(value: string) {
+    for (const child of this.children) child.parentNode = null;
+    this.children.length = 0;
+    this.ownText = value;
+  }
+  get firstChild(): FormNode | null {
+    return this.children[0] ?? null;
+  }
+  setAttribute(name: string, value: string): void {
+    this.attrs[name] = value;
+  }
+  getAttribute(name: string): string | null {
+    return this.attrs[name] ?? null;
+  }
+  removeAttribute(name: string): void {
+    delete this.attrs[name];
+  }
+  addEventListener(name: string, fn: (event: unknown) => unknown): void {
+    this.listeners[name] = [...(this.listeners[name] ?? []), fn];
+  }
+  appendChild<T extends FormNode>(child: T): T {
+    child.parentNode?.removeChild(child);
+    child.parentNode = this;
+    this.children.push(child);
+    return child;
+  }
+  append(...nodes: FormNode[]): void {
+    for (const node of nodes) this.appendChild(node);
+  }
+  removeChild(child: FormNode): void {
+    this.children.splice(this.children.indexOf(child), 1);
+    child.parentNode = null;
+  }
+  replaceChildren(...nodes: FormNode[]): void {
+    this.textContent = "";
+    this.append(...nodes);
+  }
+  focus(): void {}
+  querySelector(): FormNode | null {
+    return null;
+  }
+  querySelectorAll(): FormNode[] {
+    return [];
+  }
+  find(test: (node: FormNode) => boolean): FormNode | undefined {
+    for (const child of this.children) {
+      if (test(child)) return child;
+      const deeper = child.find(test);
+      if (deeper !== undefined) return deeper;
+    }
+    return undefined;
+  }
+  fire(name: string): void {
+    for (const fn of this.listeners[name] ?? []) fn({ preventDefault: (): void => undefined });
+  }
+}
+
+const formDocument = {
+  body: new FormNode("body"),
+  activeElement: null as FormNode | null,
+  createElement: (tag: string) => new FormNode(tag),
+  createTextNode: (value: string) => {
+    const node = new FormNode("#text");
+    node.ownText = value;
+    return node;
+  },
+  getElementById: (): FormNode | null => null,
+  querySelector: (): FormNode | null => null,
+  querySelectorAll: (): FormNode[] => [],
+};
+
+describe("a value typed over a hidden one, rendered", () => {
+  const g = globalThis as Record<string, unknown>;
+  const saved = { document: g["document"], Node: g["Node"], HTMLElement: g["HTMLElement"] };
+  beforeAll(() => {
+    g["document"] = formDocument;
+    g["Node"] = FormNode;
+    g["HTMLElement"] = FormNode;
+  });
+  afterAll(() => {
+    g["document"] = saved.document;
+    g["Node"] = saved.Node;
+    g["HTMLElement"] = saved.HTMLElement;
+  });
+
+  const bodyWith = (value: string) => ({
+    present: true,
+    schema: {
+      $ref: "#/definitions/t",
+      definitions: {
+        t: {
+          type: "object",
+          properties: {
+            thredz: {
+              type: "object",
+              properties: { api_secret_text: { type: "string" }, label: { type: "string" } },
+            },
+          },
+          additionalProperties: false,
+        },
+      },
+    },
+    effective: [
+      { segments: ["thredz", "api_secret_text"], value, source: "declared" },
+      { segments: ["thredz", "label"], value: "plain", source: "declared" },
+    ],
+    effectiveTruncated: false,
+    rev: "r1",
+  });
+  const render = (ctx: { id: string }, value: string): FormNode =>
+    settingsCard(
+      ctx,
+      bodyWith(value),
+      null,
+      { readOnly: { held: false } },
+      () => undefined,
+    ) as FormNode;
+  const inputFor = (card: FormNode, setting: string): FormNode => {
+    const field = card.find(
+      (n) => n.dataset["fieldKey"] !== undefined && n.textContent.includes(setting),
+    );
+    expect(field).toBeDefined();
+    const input = field?.find((n) => n.tag === "input" || n.tag === "textarea");
+    expect(input).toBeDefined();
+    return input as FormNode;
+  };
+  const idsFor = (ctx: { id: string }): string[] =>
+    (unsavedEntryIds() as string[]).filter((id) => id.startsWith(`${ctx.id}\u0000`));
+
+  test("a hidden value's replacement goes into a password field that keeps nothing", () => {
+    const ctx = { id: "h-hidden" };
+    const first = inputFor(render(ctx, "[redacted]"), "thredz.api_secret_text");
+    expect(first.tag).toBe("input");
+    expect(first.attrs["type"]).toBe("password");
+    expect(first.attrs["autocomplete"]).toBe("new-password");
+    expect(first.value).toBe("");
+    first.value = "typed-replacement";
+    first.fire("input");
+    expect(idsFor(ctx)).toEqual([]);
+    const again = inputFor(render(ctx, "[redacted]"), "thredz.api_secret_text");
+    expect(again.value).toBe("");
+  });
+
+  test("a plain setting's typed value is kept, so the seam sees entries", () => {
+    const ctx = { id: "h-plain" };
+    const plain = inputFor(render(ctx, "[redacted]"), "thredz.label");
+    expect(plain.attrs["type"]).toBe("text");
+    plain.value = "typed";
+    plain.fire("input");
+    expect(idsFor(ctx).length).toBe(1);
+    expect(inputFor(render(ctx, "[redacted]"), "thredz.label").value).toBe("typed");
+  });
+
+  test("in a capped read, a setting with no row of its own offers no control and no save", () => {
+    const body = {
+      ...bodyWith("plain"),
+      effective: [{ segments: ["thredz", "label"], value: "plain", source: "declared" }],
+      effectiveTruncated: true,
+    };
+    const card = settingsCard(
+      { id: "h-capped" },
+      body,
+      null,
+      { readOnly: { held: false } },
+      () => undefined,
+    ) as FormNode;
+    const fieldOf = (setting: string) =>
+      card.find((n) => n.dataset["fieldKey"] !== undefined && n.textContent.includes(setting));
+    const cappedField = fieldOf("thredz.api_secret_text");
+    expect(cappedField).toBeDefined();
+    expect(cappedField?.textContent).toContain("crewhaus.yaml");
+    expect(cappedField?.find((n) => n.tag === "input" || n.tag === "textarea")).toBeUndefined();
+    expect(cappedField?.find((n) => n.tag === "select")).toBeUndefined();
+    expect(cappedField?.find((n) => n.tag === "button")).toBeUndefined();
+    // The setting the read did return keeps its control and its save.
+    const shown = fieldOf("thredz.label");
+    expect(shown?.find((n) => n.tag === "input")?.value).toBe("plain");
+    expect(shown?.find((n) => n.tag === "button")).toBeDefined();
+  });
+
+  test("the notice for a capped read sends the rest to crewhaus.yaml", async () => {
+    const source = await viewSource("spec-edit.js");
+    const at = source.indexOf("body.effectiveTruncated === true\n");
+    expect(at).toBeGreaterThan(-1);
+    const notice = source.slice(at, source.indexOf("})", at));
+    expect(notice).toContain("crewhaus.yaml");
+    expect(notice.includes("JSON pane")).toBe(false);
   });
 });

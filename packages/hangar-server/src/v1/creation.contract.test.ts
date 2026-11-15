@@ -3,11 +3,13 @@
  * harness and its effective configuration, the same body the per-harness route answers,
  * carrying every field the editor reads, masked at the router's exit, refused for a
  * harness the caller cannot see as every harness read is, and 409 for a folder that is
- * gone.
+ * gone. A spec file that resolves outside its harness answers 404 `path_escapes`, one that
+ * resolves into Home's own records answers 403 `home_records`, and neither answer carries
+ * the bytes of the file it names.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import { type V1Home, v1Home } from "../__test__/v1-home";
 
@@ -114,5 +116,54 @@ describe("specs.schema", () => {
     const res = await home.call("GET", schemaPath(gone.id));
     expect(res.status).toBe(409);
     expect((res.body["error"] as Record<string, unknown>)["reason"]).toBe("harness_missing");
+  });
+
+  test("a spec file that resolves outside its harness answers 404 path_escapes, without its bytes", async () => {
+    const h = await home.harness("escapes", { noSpec: true });
+    const marker = `outside-only-${"5e".repeat(8)}`;
+    const outside = join(dirname(home.t.hangarRoot), "outside.yaml");
+    const instructions = "Only the outside file says this line.";
+    writeFileSync(
+      outside,
+      [`name: ${marker}`, "target: cli", "agent:", `  instructions: ${instructions}`, ""].join(
+        "\n",
+      ),
+    );
+    const link = join(h.dir, "crewhaus.yaml");
+    try {
+      symlinkSync(outside, link);
+      const res = await home.call("GET", schemaPath(h.id));
+      expect(res.status).toBe(404);
+      expect((res.body["error"] as Record<string, unknown>)["reason"]).toBe("path_escapes");
+      const text = JSON.stringify(res.body);
+      expect(text.includes(marker)).toBe(false);
+      expect(text.includes(instructions)).toBe(false);
+    } finally {
+      rmSync(link, { force: true });
+      rmSync(outside, { force: true });
+    }
+  });
+
+  test("a spec file that resolves into Home's own records answers 403 home_records", async () => {
+    // A harness registered around Home's own directory: its files can resolve into Home's records.
+    const around = dirname(home.t.hangarRoot);
+    const added = await home.t.api("/api/harnesses", {
+      method: "POST",
+      body: JSON.stringify({ dir: around }),
+    });
+    const id = (added.body["entry"] as { id: string } | undefined)?.id;
+    expect(id).toBeDefined();
+    const target = join(home.t.hangarRoot, "token");
+    expect(existsSync(target)).toBe(true);
+    const link = join(around, "crewhaus.yaml");
+    try {
+      symlinkSync(target, link);
+      const res = await home.call("GET", schemaPath(String(id)));
+      expect(res.status).toBe(403);
+      expect((res.body["error"] as Record<string, unknown>)["reason"]).toBe("home_records");
+      expect(JSON.stringify(res.body).includes(home.t.token)).toBe(false);
+    } finally {
+      rmSync(link, { force: true });
+    }
   });
 });

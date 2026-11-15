@@ -3,7 +3,13 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { unwrap } from "./__test__/checkers.js";
-import { ALL_EXAMPLES, EXAMPLES, RECEIPT, SEAL } from "./__test__/schema-examples.js";
+import {
+  ALL_EXAMPLES,
+  EXAMPLES,
+  RECEIPT,
+  SEAL,
+  STREAM_FRAME_EXAMPLES,
+} from "./__test__/schema-examples.js";
 import {
   API_PREFIX,
   CORE_MODULE,
@@ -26,10 +32,12 @@ import {
   RECEIPT_VIA,
   ROLES,
   ROLE_PERMISSIONS,
+  STREAM_REASONS,
   SYSTEM_SUPERSEDE_REASONS,
   isErrorCode,
   isEventType,
   isPermission,
+  isStreamReason,
   mintId,
 } from "./index.js";
 import {
@@ -318,6 +326,28 @@ describe("capability descriptors", () => {
     expect(parse({ "runs.create": validated })).toBe(false);
     expect(parse({ "runs.create": { supported: true } })).toBe(true);
     expect(parse({ "runs.nope": { supported: true } })).toBe(false);
+  });
+});
+
+describe("a stream's frames about itself", () => {
+  test("each reason a stream gives has a frame that parses, naming that reason", () => {
+    const seen: string[] = [];
+    for (const frame of STREAM_FRAME_EXAMPLES) {
+      const parsed = (SCHEMAS["eventFrame"] as z.ZodTypeAny).safeParse(frame);
+      if (!parsed.success) throw new Error(parsed.error.message);
+      const data = (frame as { data: { type: string; payload: { reason: unknown } } }).data;
+      expect([data.type, isStreamReason(data.type, data.payload.reason)]).toEqual([
+        data.type,
+        true,
+      ]);
+      seen.push(`${data.type}:${String(data.payload.reason)}`);
+    }
+    const every = Object.entries(STREAM_REASONS).flatMap(([type, reasons]) =>
+      reasons.map((reason) => `${type}:${reason}`),
+    );
+    expect(seen.sort()).toEqual(every.sort());
+    expect(isStreamReason("stream.gap", "diverged")).toBe(false);
+    expect(isStreamReason("run.queued", "evicted")).toBe(false);
   });
 });
 

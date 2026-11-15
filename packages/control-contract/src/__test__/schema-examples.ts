@@ -161,7 +161,14 @@ export const EXAMPLES: Readonly<Record<string, unknown>> = {
   deviceLookupRequest: { code: "BCDF-GHJK" },
   devicePollRequest: { pollRef: "ab".repeat(32), seal: SEAL },
   devicePolled: { state: "pending" },
-  deviceRequestView: { state: "pending", readOnly: false, expiresAt: AT, tokenDays: 90 },
+  deviceRequestView: {
+    state: "pending",
+    readOnly: false,
+    expiresAt: AT,
+    createdAt: AT,
+    requestedFrom: { via: "direct", address: "203.0.113.5" },
+    tokenDays: 90,
+  },
   deviceStartRequest: { seal: SEAL },
   deviceStarted: {
     issued: ISSUED,
@@ -229,6 +236,32 @@ export const EXAMPLES: Readonly<Record<string, unknown>> = {
   trigger: { kind: "api" },
   triggerSource: { platform: "slack", conversationRef: "c".repeat(64), messageRef: "m".repeat(64) },
 };
+
+/** A stream's frame about itself, one per reason it can give. */
+function streamFrame(event: string, payload: Record<string, unknown>) {
+  const id = encodeCursor({
+    v: 1,
+    kind: "vector",
+    sources: { rows: [{ seg: 1, off: 128, tail: "0123abcd" }] },
+  });
+  return {
+    id,
+    event,
+    data: { v: 1, id, type: event, at: AT, ingestedAt: AT, sensitivity: "internal", payload },
+  };
+}
+
+/** One frame for every reason a stream frame gives (`STREAM_REASONS`). */
+export const STREAM_FRAME_EXAMPLES: readonly unknown[] = [
+  streamFrame("stream.gap", { reason: "evicted" }),
+  streamFrame("stream.gap", { reason: "unreadable" }),
+  streamFrame("stream.gap", { reason: "withheld", hidden: ["people"] }),
+  streamFrame("stream.reset", { reason: "diverged", earliest: CURSOR }),
+  streamFrame("stream.reset", { reason: "epoch" }),
+  streamFrame("stream.pause", { reason: "frame-cap", resumeFrom: CURSOR }),
+  streamFrame("stream.pause", { reason: "time-cap", resumeFrom: CURSOR }),
+  streamFrame("stream.pause", { reason: "execution", resumeFrom: CURSOR }),
+];
 
 /** An area's examples live in its own `__test__/<area>.examples.ts`, exporting `EXAMPLES`. */
 const areaExamples: readonly { readonly EXAMPLES: Readonly<Record<string, unknown>> }[] =

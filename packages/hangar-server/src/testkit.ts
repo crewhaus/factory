@@ -208,6 +208,8 @@ export type BootOptions = Omit<
   /** Write files under the fresh workspace before Home boots — the owner's
    *  `settings.json` blocks, which Home reads only at boot. */
   readonly prepare?: (dirs: { readonly workspace: string; readonly hangarRoot: string }) => void;
+  /** The built-in layer's caps on live API runs (`ProcessLayerOptions.apiRunLimits`). */
+  readonly apiRunLimits?: { readonly perHarness?: number; readonly perHome?: number };
 };
 
 /** Boot an isolated server on an ephemeral loopback port. */
@@ -227,6 +229,7 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
     controlClient,
     runJob,
     prepare,
+    apiRunLimits,
     ...rest
   } = opts;
   if (prepare !== undefined) {
@@ -247,6 +250,11 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
   // late: once the server exists, its job adapter moves receipts as it does in production.
   let jobStore: JobStore | undefined;
   let wrappedStore: JobStore | undefined;
+  // The runner is wrapped late too, so a job that carries a command is checked before it
+  // starts, as in production. By default a job never settles: the queue holds it `running`,
+  // which is the observable effect a submit assertion needs. Override for real work.
+  const baseRun: JobRunner = runJob ?? (() => new Promise<{ exitCode?: number }>(() => {}));
+  let wrappedRun: JobRunner | undefined;
   if (processLayer === undefined) {
     const testClock = createTestClock(now());
     clock = testClock;
@@ -263,10 +271,9 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
       managerVersion: "test",
       ops,
       clock,
-      // A job that never settles: the queue holds it `running`, which is the
-      // observable effect a submit assertion needs. Override for real work.
-      runJob: runJob ?? (() => new Promise<{ exitCode?: number }>(() => {})),
+      runJob: (job, ctx) => (wrappedRun ?? baseRun)(job, ctx),
       ...(preflight === true ? {} : { noPreflight: true }),
+      ...(apiRunLimits !== undefined ? { apiRunLimits } : {}),
       wrapJobStore: (store) => {
         jobStore = store;
         return {
@@ -306,7 +313,10 @@ export function bootTestServer(opts: BootOptions = {}): TestServer {
     ...(controlClient !== undefined ? { controlClient } : {}),
     onWarn: collectWarn,
   });
-  if (jobStore !== undefined) wrappedStore = server.controlService.jobs.wrapStore(jobStore);
+  if (jobStore !== undefined) {
+    wrappedStore = server.controlService.jobs.wrapStore(jobStore);
+    wrappedRun = server.controlService.jobs.wrapRun(baseRun);
+  }
   const token = server.token ?? "";
 
   const fetchRaw = (path: string, init: RequestInit = {}): Promise<Response> =>

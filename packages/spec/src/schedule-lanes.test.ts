@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import { DELTA_090_ISSUES } from "./blocks/delta-090";
 import { intentIssues } from "./blocks/intent";
-import { scheduleIssues } from "./blocks/schedule";
+import { scheduleIssues, scheduleWakeIssues } from "./blocks/schedule";
 import { parseSpec, parseSpecIssues, specJsonSchema } from "./index";
 
 const CHANNEL =
@@ -168,4 +168,130 @@ describe("the object form's errors", () => {
       expect(first?.message).toBe(message);
     });
   }
+});
+
+describe("a schedule's time zone and cron are checked", () => {
+  /** One cron lane named `name`, after an interval lane, as the list form. */
+  const cronLanes = (cron: string, timezone?: string, name = "weekly-report"): string =>
+    `schedule:\n  - {name: discovery, kind: interval, every: 2h}\n  - {name: ${name}, kind: cron, cron: "${cron}"${timezone !== undefined ? `, timezone: ${timezone}` : ""}}\n`;
+  const objectCron = (cron: string, timezone?: string): string =>
+    `schedule:\n  kind: cron\n  cron: "${cron}"\n${timezone !== undefined ? `  timezone: ${timezone}\n` : ""}`;
+
+  test("a lane's time zone the runtime does not know is refused at that lane, naming it", () => {
+    const [first] = parseSpecIssues(`${CHANNEL}${cronLanes("0 17 * * 5", "Not/AZone")}`);
+    expect(first?.path).toEqual(["schedule", 1, "timezone"]);
+    expect(first?.message).toContain('"Not/AZone"');
+    expect(first?.message).toContain('"weekly-report"');
+    expect(first?.message).toContain("Europe/Berlin");
+  });
+
+  for (const [shape, yaml] of Object.entries(SHAPES)) {
+    test(`the object form's unknown time zone is refused on ${shape}`, () => {
+      const [first] = parseSpecIssues(`${yaml}${objectCron("0 17 * * 5", "Not/AZone")}`);
+      expect(first?.path).toEqual(["schedule", "timezone"]);
+      expect(first?.message).toContain('schedule.timezone "Not/AZone"');
+      expect(() => parseSpec(`${yaml}${objectCron("0 17 * * 5", "Not/AZone")}`)).toThrow(
+        "Not/AZone",
+      );
+    });
+  }
+
+  test("a lane's cron whose day its months never have is refused at that lane's cron", () => {
+    const issues = parseSpecIssues(
+      `${CHANNEL}schedule:\n  - {name: monthly, kind: cron, cron: "0 0 31 2 *"}\n`,
+    );
+    expect(issues[0]?.path).toEqual(["schedule", 0, "cron"]);
+    expect(issues[0]?.message).toContain('"monthly"');
+    expect(issues[0]?.message).toContain("can never fire");
+  });
+
+  test("the object form's cron whose day never comes is refused at schedule.cron", () => {
+    const [first] = parseSpecIssues(`${CHANNEL}${objectCron("0 0 31 2 *")}`);
+    expect(first?.path).toEqual(["schedule", "cron"]);
+    expect(first?.message).toContain('schedule.cron "0 0 31 2 *" can never fire');
+  });
+
+  for (const cron of ["0 0 30 2 *", "0 0 31 4,6,9,11 *", "0 0 0 31 2 *", "0 0 30-31 2 *"]) {
+    test(`"${cron}" is refused: none of its months has that day`, () => {
+      const [first] = parseSpecIssues(`${CHANNEL}${cronLanes(cron)}`);
+      expect(first?.path).toEqual(["schedule", 1, "cron"]);
+      expect(first?.message).toContain("can never fire");
+    });
+  }
+
+  test('"0 0 29 2 *" is refused with its own reason', () => {
+    const [first] = parseSpecIssues(`${CHANNEL}${cronLanes("0 0 29 2 *")}`);
+    expect(first?.path).toEqual(["schedule", 1, "cron"]);
+    expect(first?.message).toContain("fires only on 29 February");
+  });
+
+  for (const [cron, timezone] of [
+    ["0 17 * * 5", "Europe/Berlin"],
+    ["0 17 * * 5", "UTC"],
+    ["0 0 29 2,3 *", undefined],
+    ["0 0 31 2 1", undefined],
+    ["0 0 L 2 *", undefined],
+    ["0 0 31 * *", undefined],
+    ["0 0 29 * *", undefined],
+  ] as const) {
+    test(`"${cron}"${timezone !== undefined ? ` in ${timezone}` : ""} is accepted`, () => {
+      expect(parseSpecIssues(`${CHANNEL}${cronLanes(cron, timezone)}`)).toEqual([]);
+      expect(parseSpecIssues(`${CHANNEL}${objectCron(cron, timezone)}`)).toEqual([]);
+    });
+  }
+
+  test("an interval lane is never checked as a cron", () => {
+    expect(parseSpecIssues(`${CHANNEL}${lanes(["a", "b"])}`)).toEqual([]);
+  });
+
+  test("a lane's time zone is reported before its cron, and lanes in declared order", () => {
+    const issues = parseSpecIssues(
+      `${CHANNEL}schedule:\n  - {name: one, kind: cron, cron: "0 0 31 2 *", timezone: Not/AZone}\n  - {name: two, kind: cron, cron: "0 0 30 2 *"}\n`,
+    );
+    expect(issues.map((i) => i.path)).toEqual([
+      ["schedule", 0, "timezone"],
+      ["schedule", 0, "cron"],
+      ["schedule", 1, "cron"],
+    ]);
+  });
+
+  test("a repeated lane name is still reported before a bad time zone", () => {
+    const [first] = parseSpecIssues(
+      `${CHANNEL}schedule:\n  - {name: a, kind: interval, every: 1h}\n  - {name: a, kind: cron, cron: "0 17 * * 5", timezone: Not/AZone}\n`,
+    );
+    expect(first?.path).toEqual(["schedule", 1, "name"]);
+    expect(first?.message).toContain("must be unique");
+  });
+
+  // The specs are checked in a child bun process with its own deadline.
+  test("a cron field's numbers are read within the field's range", () => {
+    const huge = "9".repeat(400);
+    const crons = [
+      `0 0 ${huge} * *`,
+      "0 0 1-9007199254740991 * *",
+      "0 0 31 2-9007199254740991 *",
+      "0 0 30-9007199254740991 2 *",
+      `0 0 1/${huge} 2 *`,
+    ];
+    const specs = crons.map((cron) => `${CHANNEL}${objectCron(cron)}`);
+    const code = [
+      `import { parseSpecIssues } from ${JSON.stringify(`${import.meta.dir}/index.ts`)};`,
+      `const specs = ${JSON.stringify(specs)};`,
+      "console.log(JSON.stringify(specs.map((y) => parseSpecIssues(y).map((i) => i.path))));",
+    ].join("\n");
+    const run = Bun.spawnSync({
+      cmd: [process.execPath, "-e", code],
+      env: { ...process.env },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 15_000,
+    });
+    expect({ exit: run.exitCode, stderr: run.stderr.toString() }).toEqual({ exit: 0, stderr: "" });
+    expect(JSON.parse(run.stdout.toString())).toEqual([[], [], [], [["schedule", "cron"]], []]);
+  }, 20_000); // runs a child bun process with a 15 s deadline
+
+  test("the check runs last of the 0.9.0 checks, once", () => {
+    expect(DELTA_090_ISSUES.indexOf(scheduleWakeIssues)).toBe(DELTA_090_ISSUES.length - 1);
+    expect(DELTA_090_ISSUES.filter((check) => check === scheduleWakeIssues).length).toBe(1);
+  });
 });

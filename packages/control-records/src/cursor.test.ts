@@ -2,7 +2,7 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { renameSync, truncateSync, writeFileSync } from "node:fs";
 import { type CursorSources, decodeCursor, encodeCursor } from "@crewhaus/control-contract";
-import { resume, snapshotAt } from "./cursor";
+import { advanceVector, positionsAtEnd, resume, snapshotAt } from "./cursor";
 import { _setIoTapForTest } from "./io";
 import { append } from "./ledger";
 import { _setRollBytesForTest, segmentRel } from "./segments";
@@ -24,6 +24,12 @@ afterEach(() => {
   _setRollBytesForTest(undefined);
 });
 afterAll(removeTempDirs);
+
+/** The `tail` of the position just past `bytes`: what a resume checks it by. */
+function tailPast(bytes: string): string {
+  const window = Buffer.from(bytes).subarray(-64);
+  return createHash("sha256").update(window).digest("hex").slice(0, 8);
+}
 
 function roundTrips(sources: CursorSources): void {
   const decoded = decodeCursor(encodeCursor({ v: 1, kind: "vector", sources }));
@@ -67,6 +73,7 @@ describe("resume", () => {
       from: { seg: 1, off: a.length },
       to: { seg: 1, off: a.length + bad.length },
       reason: "unreadable",
+      after: { seg: 1, off: a.length + bad.length, tail: tailPast(`${a}${bad}`) },
     });
     append(runs, { n: 4 });
     const second = resume({ runs }, first.next, CAPS);
@@ -169,8 +176,16 @@ describe("resume", () => {
     append(deployments, { n: 2 });
     const { next } = resume({ runs }, undefined, CAPS);
     const answer = resume({ runs, deployments }, next, CAPS);
+    const line = jsonLine({ n: 2 });
     expect(answer.items).toEqual([
-      { kind: "line", source: "deployments", seg: 0, off: 0, record: { n: 2 } },
+      {
+        kind: "line",
+        source: "deployments",
+        seg: 0,
+        off: 0,
+        record: { n: 2 },
+        after: { seg: 0, off: line.length, tail: tailPast(line) },
+      },
     ]);
   });
 
@@ -251,7 +266,14 @@ describe("resume", () => {
       CAPS,
     );
     expect(answer.items).toEqual([
-      { kind: "line", source: "runs", seg: 1, off: 0, record: { n: 1 } },
+      {
+        kind: "line",
+        source: "runs",
+        seg: 1,
+        off: 0,
+        record: { n: 1 },
+        after: { seg: 1, off: jsonLine({ n: 1 }).length, tail: tailPast(jsonLine({ n: 1 })) },
+      },
       { kind: "reset", source: "decisions", reason: "diverged" },
       { kind: "reset", source: "nonsense" as never, reason: "diverged" },
     ]);
@@ -473,5 +495,114 @@ describe("snapshotAt", () => {
       roundTrips(answer.next);
       vector = answer.next;
     }
+  });
+});
+
+describe("each item's position, and the vector past it", () => {
+  /** Resume item by item, from the vector advanced past each one, and compare. */
+  function stepwise(sources: Parameters<typeof resume>[0], start: CursorSources | undefined) {
+    const whole = resume(sources, start, CAPS).items;
+    let vector: CursorSources = start ?? {};
+    for (const [index, item] of whole.entries()) {
+      if (item.kind === "reset") continue;
+      vector = advanceVector(vector, item);
+      roundTrips(vector);
+      const rest = resume(sources, vector, CAPS).items;
+      const strip = (i: (typeof whole)[number]) => JSON.stringify(i);
+      expect(rest.map(strip)).toEqual(whole.slice(index + 1).map(strip));
+    }
+    return whole;
+  }
+
+  test("every line's and gap's `after` resumes to exactly the next item", () => {
+    const root = tempDir();
+    const runs = runsLedger(root);
+    const deployments = deploymentsLedger(root);
+    plant(segmentPath(runs, 1), `${jsonLine({ n: 1 })}garbage\n${jsonLine({ n: 3 })}`);
+    append(deployments, { d: 1 });
+    append(deployments, { d: 2 });
+    const items = stepwise({ runs, deployments }, undefined);
+    expect(items.map((i) => i.kind)).toEqual(["line", "gap", "line", "line", "line"]);
+  });
+
+  test("across a roll, a line landing in the previous segment is delivered once", () => {
+    _setRollBytesForTest(1);
+    const root = tempDir();
+    const runs = runsLedger(root);
+    append(runs, { n: 1 }); // segment 1
+    append(runs, { n: 2 }); // past the threshold: segment 2
+    const start = snapshotAt({ runs });
+    expect(start.runs?.map((p) => p.seg)).toEqual([1, 2]);
+    // A late appender still holds segment 1, and a new line lands in segment 3.
+    writeFileSync(segmentPath(runs, 1), jsonLine({ n: 1.5 }), { flag: "a" });
+    append(runs, { n: 3 });
+    const items = stepwise({ runs }, start);
+    expect(items.map((i) => i.kind === "line" && i.record["n"])).toEqual([1.5, 3]);
+    let vector = start;
+    for (const item of items) vector = advanceVector(vector, item);
+    // The previous segment's entry moved, the newer one came in, two kept, ascending.
+    expect(vector.runs?.map((p) => p.seg)).toEqual([2, 3]);
+    expect(resume({ runs }, vector, CAPS).items).toEqual([]);
+  });
+
+  test("advanceVector keeps two ascending positions, moves the previous one in place, and is pure", () => {
+    const at = (seg: number, off: number) => ({ seg, off, tail: off === 0 ? "" : "0123abcd" });
+    const line = (seg: number, off: number) =>
+      ({ kind: "line", source: "runs", seg, off: 0, record: {}, after: at(seg, off) }) as const;
+    const given: CursorSources = { runs: [at(3, 10), at(4, 20)] };
+    const late = advanceVector(given, line(3, 50));
+    expect(late.runs).toEqual([at(3, 50), at(4, 20)]);
+    expect(given.runs).toEqual([at(3, 10), at(4, 20)]);
+    const newer = advanceVector(given, line(5, 7));
+    expect(newer.runs).toEqual([at(4, 20), at(5, 7)]);
+    expect(advanceVector({}, line(1, 9)).runs).toEqual([at(1, 9)]);
+    // Past an evicted gap, what lies below it is dropped, so it is never reported again.
+    const evicted = advanceVector(given, {
+      kind: "gap",
+      source: "runs",
+      from: { seg: 3, off: 10 },
+      to: { seg: 4, off: 20 },
+      reason: "evicted",
+      after: at(4, 20),
+    });
+    expect(evicted.runs).toEqual([at(4, 20)]);
+    // A reset goes back to its earliest, or leaves the source out.
+    expect(
+      advanceVector(given, {
+        kind: "reset",
+        source: "runs",
+        reason: "diverged",
+        earliest: at(1, 0),
+      }).runs,
+    ).toEqual([at(1, 0)]);
+    expect(
+      Object.keys(advanceVector(given, { kind: "reset", source: "runs", reason: "diverged" })),
+    ).toEqual([]);
+    for (const vector of [late, newer, evicted]) roundTrips(vector);
+  });
+});
+
+describe("positionsAtEnd", () => {
+  test("true at the end, false once a line lands or a segment rolls; it opens nothing", () => {
+    _setRollBytesForTest(64);
+    const root = tempDir();
+    const runs = runsLedger(root);
+    const deployments = deploymentsLedger(root);
+    append(runs, { n: 1 });
+    append(deployments, { d: 1 });
+    const end = resume({ runs, deployments }, undefined, CAPS).next;
+    const opened: string[] = [];
+    _setIoTapForTest({ open: (given) => opened.push(given) });
+    expect(positionsAtEnd({ runs, deployments }, end)).toBe(true);
+    expect(opened.filter((given) => given.endsWith(".jsonl"))).toEqual([]);
+    _setIoTapForTest(undefined);
+    append(deployments, { d: 2 });
+    expect(positionsAtEnd({ runs, deployments }, end)).toBe(false);
+    const again = resume({ runs, deployments }, end, CAPS).next;
+    expect(positionsAtEnd({ runs, deployments }, again)).toBe(true);
+    append(runs, { n: "x".repeat(80) });
+    append(runs, { n: 3 }); // a new segment
+    expect(positionsAtEnd({ runs, deployments }, again)).toBe(false);
+    expect(positionsAtEnd({ runs }, {})).toBe(false);
   });
 });

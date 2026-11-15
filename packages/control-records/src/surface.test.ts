@@ -52,7 +52,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan really reads the sources", () => {
-    expect(SOURCES.length).toBe(24);
+    expect(SOURCES.length).toBe(25);
     expect(imports.length).toBeGreaterThan(40);
     expect(imports.some((i) => i.path === "node:fs")).toBe(true);
     expect(imports.some((i) => i.path === "@crewhaus/tool-safety/fs")).toBe(true);
@@ -100,10 +100,15 @@ describe("what the sources import", () => {
 });
 
 describe("what the package exports", () => {
-  test("no test seam leaves through the entry point", () => {
+  test("only the two counting seams leave through the entry point", () => {
     const names = Object.keys(api);
     expect(names.length).toBeGreaterThan(20);
-    expect(names.filter((name) => name.startsWith("_"))).toEqual([]);
+    // Home's read-model and stream tests count the opens a read makes and roll a segment;
+    // every other seam stays internal.
+    expect(names.filter((name) => name.startsWith("_")).sort()).toEqual([
+      "_setIoTapForTest",
+      "_setRollBytesForTest",
+    ]);
   });
 
   test("composition stays internal", () => {
@@ -114,6 +119,23 @@ describe("what the package exports", () => {
     expect(Object.keys(api).sort()).toEqual(
       [
         "ACTION_DECISION_TTL_MS",
+        "CACHE_INDEX_DIR",
+        "RESERVED_INDEX_NAMES",
+        "_setIoTapForTest",
+        "_setRollBytesForTest",
+        "advanceVector",
+        "appendFleetChanges",
+        "fleetChangesLedger",
+        "isProjectionName",
+        "keepFleetSegments",
+        "positionsAtEnd",
+        "projectionRel",
+        "readFleetState",
+        "readHeartbeat",
+        "readIndexRecord",
+        "takeNudgeMarkers",
+        "writeIndexRecord",
+        "writeNudgeMarker",
         "CONSEQUENCES_LABEL",
         "DELEGATION_HOST_LABEL",
         "DELEGATION_TERMS_LABEL",
@@ -328,6 +350,20 @@ describe("no field name is one the masker would redact", () => {
       const refused = api.writeHeartbeat(join(root, "a-file"), beat);
       expect(refused.ok).toBe(false);
       fieldNames(refused, names);
+      fieldNames(api.readHeartbeat(root), names);
+
+      const hangar = tempDir();
+      fieldNames(await api.appendFleetChanges(hangar, [{ type: "harness.paused" }]), names);
+      fieldNames(api.readFleetState(hangar), names);
+      fieldNames(
+        api.resume({ runs: api.fleetChangesLedger(hangar) }, undefined, {
+          maxLines: 10,
+          maxBytes: 4096,
+        }),
+        names,
+      );
+      fieldNames(api.writeNudgeMarker(hangar, "overview", "hrn_0123456789abcdef"), names);
+      fieldNames(api.takeNudgeMarkers(hangar, ["overview"]), names);
 
       // Each expected name is really in the walk, so the assertion below can fail.
       for (const name of [
@@ -348,6 +384,9 @@ describe("no field name is one the masker would redact", () => {
         "activeRuns",
         "runLedger",
         "exitName",
+        "epoch",
+        "seq",
+        "after",
       ]) {
         expect(names.has(name)).toBe(true);
       }

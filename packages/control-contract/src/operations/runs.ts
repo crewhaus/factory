@@ -68,7 +68,7 @@ export const RUN_OPERATIONS = [
     request: "emptyRequest",
     cliTwin: null,
     noTwinReason: RUNS_RESUME_VERB,
-    qualifiers: ["creating-service"],
+    qualifiers: [],
   },
   {
     ...READ,
@@ -94,5 +94,7 @@ export const RUN_OPERATIONS = [
     cliTwin: null,
     noTwinReason: STREAM_ONLY,
     qualifiers: ["content-fields"],
+    scopedAct: "run.events.read",
+    ref: { kind: "run", param: "run" },
   },
 ] as const;

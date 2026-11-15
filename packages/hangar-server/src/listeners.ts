@@ -14,14 +14,14 @@
  */
 import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { HOME_SOCKET, PROXY_SOCKET, isLoopbackAddress } from "@crewhaus/access-control";
+import {
+  HOME_SOCKET,
+  PROXY_SOCKET,
+  isLoopbackAddress,
+  socketsSupported,
+} from "@crewhaus/access-control";
 
-export { HOME_SOCKET, PROXY_SOCKET };
-
-/** Whether sockets are created on this platform. */
-export function socketsSupported(platform: string = process.platform): boolean {
-  return platform !== "win32";
-}
+export { HOME_SOCKET, PROXY_SOCKET, socketsSupported };
 
 /** `localhost` or a loopback address. */
 export function isLoopbackHostname(hostname: string): boolean {

@@ -3,6 +3,8 @@
  * "not served yet" answer; never a silent 404.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { OPERATIONS } from "@crewhaus/control-contract";
 import { type V1Home, v1Home } from "../__test__/v1-home";
 import { SIGN_IN_ROUTES } from "../sign-in-routes";
@@ -46,10 +48,8 @@ describe("every operation is served exactly one way", () => {
     }
   });
 
-  test("the not-served map is exactly a run's events, the event streams and the people operations", () => {
-    const expected = OPERATIONS.filter(
-      (op) => op.id === "runs.events" || op.id.startsWith("events.") || op.id.startsWith("people."),
-    ).map((op) => op.id);
+  test("the not-served map is exactly the people operations", () => {
+    const expected = OPERATIONS.filter((op) => op.id.startsWith("people.")).map((op) => op.id);
     expect(Object.keys(V1_NOT_SERVED).sort()).toEqual(expected.sort());
     for (const reason of Object.values(V1_NOT_SERVED)) expect(reason).toMatch(/not served/);
   });
@@ -74,6 +74,58 @@ describe("every operation is served exactly one way", () => {
     ).toContain('handler for "me.get" registered twice (areas "core" and "core")');
     expect(homeCompositionProblems([{ area: "nowhere" }])).toEqual([
       'area "nowhere" has no module',
+    ]);
+  });
+
+  test("a projection named twice, or with a name the index takes, is refused", () => {
+    const overview = HOME_CORE.projections?.find((p) => p.name === "overview");
+    if (overview === undefined) throw new Error("no overview projection");
+    expect(
+      homeCompositionProblems([HOME_CORE, { area: "quality", projections: [overview] }]),
+    ).toEqual(['projection "overview" registered twice (areas "core" and "quality")']);
+    for (const name of ["fleet", "fleet-changes", "refs", "hrn_0123456789abcdef"]) {
+      expect(
+        homeCompositionProblems([{ area: "quality", projections: [{ ...overview, name }] }]),
+      ).toEqual([`projection "${name}" is not a name a projection may take (area "quality")`]);
+    }
+  });
+
+  test("a stream source named twice, not a cursor source, or outside its harness, is refused", () => {
+    const runs = HOME_CORE.streamSources?.find((s) => s.name === "runs");
+    if (runs === undefined) throw new Error("no runs source");
+    expect(
+      homeCompositionProblems([HOME_CORE, { area: "quality", streamSources: [runs] }]),
+    ).toEqual(['stream source "runs" registered twice (areas "core" and "quality")']);
+    expect(
+      homeCompositionProblems([
+        { area: "quality", streamSources: [{ ...runs, name: "evalruns" as never }] },
+      ]),
+    ).toEqual(['stream source "evalruns" is not a cursor source (area "quality")']);
+    const escaping = {
+      ...runs,
+      source: (dir: string) => ({ root: dir, records: { dir: join("..", "elsewhere") } }),
+    };
+    expect(homeCompositionProblems([{ area: "quality", streamSources: [escaping] }])).toEqual([
+      'stream source "runs" keeps its records outside the harness (area "quality")',
+    ]);
+    const absolute = {
+      ...runs,
+      source: (dir: string) => ({ root: dir, records: { file: join(tmpdir(), "x.jsonl") } }),
+    };
+    expect(homeCompositionProblems([{ area: "quality", streamSources: [absolute] }])).toEqual([
+      'stream source "runs" names its records by an absolute path (area "quality")',
+    ]);
+    const rooted = { ...runs, source: () => ({ root: tmpdir(), records: { dir: "d" } }) };
+    expect(homeCompositionProblems([{ area: "quality", streamSources: [rooted] }])).toEqual([
+      'stream source "runs" keeps its records outside the harness (area "quality")',
+    ]);
+    // The core's five, the approvals log under the sessions root included, stay inside.
+    expect(HOME_CORE.streamSources?.map((s) => s.name)).toEqual([
+      "runs",
+      "commands",
+      "deployments",
+      "decisions",
+      "approvals",
     ]);
     expect(
       homeCompositionProblems([
@@ -110,10 +162,7 @@ describe("a not-served operation answers 501", () => {
 
   // One operation from each not-served group, over HTTP as the owner: each says it is not
   // served yet, before any permission is asked, so nobody is told to ask for access.
-  for (const [id, path] of [
-    ["events.fleet", "/api/v1/events"],
-    ["people.persons.list", "/api/v1/people"],
-  ] as const) {
+  for (const [id, path] of [["people.persons.list", "/api/v1/people"]] as const) {
     test(`${id} answers 501 not_served to the owner`, async () => {
       const res = await home.call("GET", path);
       expect(res.status).toBe(501);

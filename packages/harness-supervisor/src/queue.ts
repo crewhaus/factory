@@ -77,6 +77,9 @@ export type JobRecord = {
   /** Who queued it, as a stored actor (`prn_…` or `local:#<digest>`), never a
    *  raw local user name. */
   readonly by?: string;
+  /** The permissions the command's submit needed, checked again before the job
+   *  starts. Only the first, `pending` row holds it. */
+  readonly needs?: readonly string[];
 };
 
 export type JobStore = {
@@ -174,7 +177,12 @@ export type JobRunContext = {
 export type JobRunner = (
   job: JobRecord,
   ctx: JobRunContext,
-) => Promise<{ exitCode?: number; error?: string }>;
+) => Promise<{
+  exitCode?: number;
+  error?: string;
+  /** The runner did not start the job; the queue records it `cancelled`. */
+  readonly cancelled?: true;
+}>;
 
 /** Build a {@link CancellableChild} from a pid and the process-ops adapter —
  *  the shape a spawning runner registers. Kept here so a runner does not
@@ -222,6 +230,8 @@ export type SubmitInput = {
   readonly commandId?: string;
   /** Who queued it, as a stored actor. */
   readonly by?: string;
+  /** The permissions the command's submit needed; kept on the job when any. */
+  readonly needs?: readonly string[];
 };
 
 export type JobQueue = {
@@ -407,7 +417,7 @@ export function createJobQueue(options: JobQueueOptions): JobQueue {
       state: "running",
       startedAt: started.startedAt as string,
     });
-    let outcome: { exitCode?: number; error?: string };
+    let outcome: Awaited<ReturnType<JobRunner>>;
     try {
       outcome = await options.run(started, {
         register: (child) => {
@@ -432,7 +442,7 @@ export function createJobQueue(options: JobQueueOptions): JobQueue {
       settle();
       return;
     }
-    if (entry.cancelled) {
+    if (entry.cancelled || outcome.cancelled === true) {
       options.store.append({
         jobId: job.jobId,
         state: "cancelled",
@@ -468,6 +478,7 @@ export function createJobQueue(options: JobQueueOptions): JobQueue {
         enqueuedAt: new Date(now()).toISOString(),
         ...(input.commandId !== undefined ? { commandId: input.commandId } : {}),
         ...(input.by !== undefined ? { by: input.by } : {}),
+        ...(input.needs !== undefined && input.needs.length > 0 ? { needs: [...input.needs] } : {}),
       };
       options.store.append(record);
       queued.push(record);

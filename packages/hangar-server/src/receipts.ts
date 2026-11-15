@@ -21,7 +21,6 @@
  * status and every field, and gains `receipt`, masked like the rest; a body that is not a
  * JSON object gains the `x-crewhaus-command` header instead.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync } from "node:fs";
 import {
   COMMAND_KINDS,
@@ -40,39 +39,16 @@ import {
   outcomeOf,
 } from "@crewhaus/control-service";
 import { HARNESS_ID_RE, type HangarHarnessEntry } from "@crewhaus/harness-registry";
+import { type CommandContext, commandContext } from "./command-context";
 import { HttpError, errResponse, json } from "./http";
 import { type TextScrubber, maskDeep } from "./mask";
 import { matchRequest } from "./route-match";
 import type { RouteRow } from "./route-table";
 
+export { commandFields, currentCommand, noteNeed } from "./command-context";
+
 /** The header a non-object answer carries the receipt's id in. */
 export const COMMAND_HEADER = "x-crewhaus-command";
-
-type CommandContext = {
-  readonly commandId: string;
-  readonly by: string;
-  /** Jobs this request queued. */
-  jobs: number;
-};
-
-const commandContext = new AsyncLocalStorage<CommandContext>();
-
-/**
- * The command the current request runs for, for a job it queues: `{commandId, by}`, or
- * nothing outside a receipted request. Spread into the queue's submit.
- */
-export function commandFields(): { readonly commandId?: string; readonly by?: string } {
-  const context = commandContext.getStore();
-  if (context === undefined) return {};
-  context.jobs += 1;
-  return { commandId: context.commandId, by: context.by };
-}
-
-/** The command the current request runs for, read only (it queues nothing). */
-export function currentCommand(): { readonly commandId: string; readonly by: string } | undefined {
-  const context = commandContext.getStore();
-  return context === undefined ? undefined : { commandId: context.commandId, by: context.by };
-}
 
 /** The error code an answer's status means. */
 export function codeForStatus(status: number): ErrorCode {
@@ -292,7 +268,12 @@ export function createReceipts(deps: ReceiptsDeps): WithReceipt {
         ...(row.dispatch === "job" ? { queued: true } : {}),
       },
       async (receipt) => {
-        const context: CommandContext = { commandId: receipt.id, by: receipt.actor, jobs: 0 };
+        const context: CommandContext = {
+          commandId: receipt.id,
+          by: receipt.actor,
+          jobs: 0,
+          needs: [],
+        };
         let response: Response;
         try {
           response = await commandContext.run(context, next);

@@ -22,8 +22,10 @@ import {
   type RouteRow,
   badScopedRows,
   domainRowsWithoutRef,
+  legacyKindPermission,
   matchRoute,
 } from "./route-table";
+import { V1_ROWS } from "./v1/match";
 
 type RouteDef = { readonly method: string; readonly path: string; readonly group?: string };
 
@@ -276,6 +278,20 @@ describe("the route table", () => {
     expect(badScopedRows([{ ...noRef, key: "r" }])).toEqual(["r"]);
   });
 
+  test("a scoped v1 row is the run event stream, as run.events.read on its {run}", () => {
+    const rows = [...V1_ROWS.values()];
+    expect(badScopedRows(rows)).toEqual([]);
+    const scoped = rows.filter((row) => row.scopedAct !== undefined);
+    expect(scoped.map((row) => `${row.key}=${row.scopedAct}`)).toEqual([
+      "runs.events=run.events.read",
+    ]);
+    expect(scoped[0]?.ref).toEqual({ kind: "run", param: "run" });
+    expect(scoped[0]?.v1).toBe(true);
+    // The copy is the contract's own: a row without one carries neither field.
+    expect("scopedAct" in (V1_ROWS.get("runs.get") as RouteRow)).toBe(false);
+    expect("ref" in (V1_ROWS.get("runs.get") as RouteRow)).toBe(false);
+  });
+
   test("the rows that carry a harness permission and name no harness are computed, not copied", () => {
     const fleet = ROUTE_TABLE.filter(
       (row) =>
@@ -334,5 +350,36 @@ describe("joining from an invite is on record", () => {
       expect(row?.receipt).toBe("none");
       expect(row?.path.startsWith("/api/v1/auth/")).toBe(true);
     }
+  });
+});
+
+describe("a legacy route's receipt kind needs its route's permission", () => {
+  test("every job row's kind answers the row's permission", () => {
+    const jobRows = ROUTE_TABLE.filter((row) => row.dispatch === "job");
+    expect(jobRows).toHaveLength(36);
+    for (const row of jobRows) {
+      expect(`${row.key} ${legacyKindPermission(row.kind as string)}`).toBe(
+        `${row.key} ${row.permission}`,
+      );
+    }
+    expect(legacyKindPermission("legacy.submitJob")).toBe("h.job.run");
+  });
+
+  test("a kind no route writes, and a core kind, answer nothing", () => {
+    expect(legacyKindPermission("legacy.hangarInstall")).toBeUndefined();
+    expect(legacyKindPermission("controls.stop")).toBeUndefined();
+    expect(legacyKindPermission("")).toBeUndefined();
+  });
+
+  test("no two rows give one legacy kind different permissions", () => {
+    const seen = new Map<string, string>();
+    for (const row of ROUTE_TABLE) {
+      if (row.kind === undefined || !row.kind.startsWith("legacy.")) continue;
+      expect(`${row.kind} ${seen.get(row.kind) ?? row.permission}`).toBe(
+        `${row.kind} ${row.permission}`,
+      );
+      seen.set(row.kind, row.permission);
+    }
+    expect(seen.size).toBeGreaterThan(36);
   });
 });

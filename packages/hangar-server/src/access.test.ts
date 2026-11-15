@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import {
   PEOPLE_TOO_DEEP,
   PEOPLE_WALK_DEPTH,
+  PEOPLE_WITHHELD_ANSWER,
   contentVisibleToRequest,
   currentRequestAccess,
   requestAllows,
@@ -135,6 +136,32 @@ describe("an item about people, at any depth", () => {
   test("hidden names people once, beside what the answer already hid", () => {
     const body = { hidden: ["content"], items: [{ sensitivity: "people", ref: PERSON }] };
     expect(withholdPeople(body, denied)).toEqual({ hidden: ["content", "people"], items: [] });
+  });
+});
+
+describe("an answer that is itself a list", () => {
+  test("a people item in it replaces the whole answer; it is never sent with the item dropped or kept", () => {
+    const body = [{ sensitivity: "people", ref: PERSON, name: "Ana" }, { x: 1 }];
+    const exited = withholdPeople(body, denied);
+    expect(exited).not.toBe(body);
+    expect(exited).toEqual(PEOPLE_WITHHELD_ANSWER);
+    expect(JSON.stringify(exited)).not.toContain("Ana");
+    expect(Object.isFrozen(PEOPLE_WITHHELD_ANSWER)).toBe(true);
+  });
+
+  test("a people item nested anywhere in it does the same", () => {
+    const nested = [{ x: 1 }, { items: [{ k: 1 }, { sensitivity: "people", ref: PERSON }] }];
+    expect(withholdPeople(nested, denied)).toEqual(PEOPLE_WITHHELD_ANSWER);
+    const deep = [wrap({ items: [{ sensitivity: "people", ref: PERSON }] }, PEOPLE_WALK_DEPTH)];
+    expect(withholdPeople(deep, denied)).toEqual(PEOPLE_WITHHELD_ANSWER);
+  });
+
+  test("a list with nothing withheld, or one the caller may see all of, is the same list", () => {
+    const plain = [{ x: 1 }, { items: [{ y: 2 }] }];
+    expect(withholdPeople(plain, denied)).toBe(plain);
+    const people = [{ sensitivity: "people", ref: PERSON }];
+    expect(withholdPeople(people, allowed)).toBe(people);
+    expect(withholdPeople([], denied)).toEqual([]);
   });
 });
 

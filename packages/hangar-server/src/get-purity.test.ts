@@ -10,6 +10,8 @@ import { describe, expect, test } from "bun:test";
 import { type Dirent, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
+import { mintRunId } from "@crewhaus/control-contract";
+import { append, runsLedger } from "@crewhaus/control-records";
 import { type HangarHarnessEntry, openHangarRegistry } from "@crewhaus/harness-registry";
 import { signInFromBootLink } from "./__test__/browser";
 import { makeFixtureHarness } from "./fixture";
@@ -257,4 +259,44 @@ describe("GET routes change nothing", () => {
       await t.stop();
     }
   }, 60_000); // a hundred and fifty reads over a live fleet; slow on a loaded runner
+});
+
+describe("the v1 event streams change nothing", () => {
+  test("a run's, a harness's and Home's stream, read to their first chunk, leave Home and the harness byte-identical, cache/index included", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      await t.server.ready;
+      const dir = makeFixtureHarness(join(t.harnessesRoot, "streamed"), { specName: "streamed" });
+      const res = await t.api("/api/harnesses", { method: "POST", body: JSON.stringify({ dir }) });
+      const id = (res.body["entry"] as { id: string }).id;
+      const run = mintRunId();
+      append(runsLedger(dir), { id: run, state: "running", at: new Date(NOW).toISOString() });
+      const before = { home: treeBytes(t.hangarRoot), harness: treeBytes(dir) };
+      let driven = 0;
+      for (const path of [
+        `/api/v1/runs/${run}/events`,
+        `/api/v1/harnesses/${id}/events`,
+        "/api/v1/events",
+      ]) {
+        const controller = new AbortController();
+        const answer = await fetch(`${t.base}${path}`, {
+          headers: { authorization: `Bearer ${t.token}` },
+          signal: controller.signal,
+        });
+        expect([path, answer.status]).toEqual([path, 200]);
+        expect(answer.headers.get("content-type") ?? "").toContain("text/event-stream");
+        const reader = answer.body?.getReader();
+        await reader?.read();
+        controller.abort();
+        await reader?.cancel().catch(() => undefined);
+        driven += 1;
+      }
+      expect(driven).toBe(3);
+      expect(treeBytes(t.hangarRoot)).toEqual(before.home);
+      expect(treeBytes(dir)).toEqual(before.harness);
+      expect(readdirSync(t.hangarRoot)).not.toContain("cache");
+    } finally {
+      await t.stop();
+    }
+  }, 30_000); // three streams over a booted Home; slow on a loaded runner
 });

@@ -18,6 +18,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { isOptimizable } from "@crewhaus/spec-patch";
+import { specRev } from "@crewhaus/spec-patch/commit";
 import { sessionKeyOf, tierFor } from "./feedback-ops";
 import { feedbackRecord, logLine, makeFixtureHarness } from "./fixture";
 import { type TestServer, bootTestServer } from "./testkit";
@@ -736,5 +737,56 @@ describe("the fleet rollup", () => {
     expect(loop.unprocessed).toBe(1);
     expect(loop.watermarkTs).toBe(iso(NOW - 2 * DAY));
     expect(String(body["scope"])).toContain("transcripts are not opened");
+  });
+});
+
+describe("an advice proposal holding a hidden value's placeholder", () => {
+  test("is refused at its preview and at its apply, and the spec is unchanged", async () => {
+    const t = boot();
+    const dir = loopHarness(t);
+    const specPath = join(dir, "crewhaus.yaml");
+    write(
+      dir,
+      [".crewhaus", "advice", "suggestions.json"],
+      `${JSON.stringify({
+        generatedAt: iso(NOW - DAY),
+        sessionIds: ["sess_00000000000000aa"],
+        suggestions: [
+          {
+            findingId: "adv_masked",
+            severity: "warn",
+            summary: "say the key out loud",
+            patch: {
+              target: "cli",
+              path: ["agent", "instructions"],
+              op: "replace",
+              value: "Use the key [redacted] when you call the API.",
+              rationale: "a proposal holding a placeholder",
+            },
+          },
+        ],
+      })}\n`,
+    );
+    const id = await register(t, dir);
+    const before = readFileSync(specPath);
+    const preview = await t.api(`/api/h/${id}/feedback/advice/adv_masked/apply`, {
+      method: "POST",
+      body: "{}",
+    });
+    expect(preview.status).not.toBe(409);
+    expect(preview.body["code"]).toBe("edit_rejected");
+    expect(preview.body["applied"]).toBe(false);
+    const issues = preview.body["issues"] as Array<{ path: string[]; code: string }>;
+    expect(issues.map((i) => [i.path.join("."), i.code])).toEqual([
+      ["agent.instructions", "masked_placeholder"],
+    ]);
+    const applied = await t.api(`/api/h/${id}/feedback/advice/adv_masked/apply`, {
+      method: "POST",
+      body: JSON.stringify({ confirm: true, expectedRev: specRev(before.toString("utf8")) }),
+    });
+    expect(applied.status).not.toBe(409);
+    expect(applied.body["code"]).toBe("edit_rejected");
+    expect(applied.body["applied"]).toBe(false);
+    expect(readFileSync(specPath).equals(before)).toBe(true);
   });
 });

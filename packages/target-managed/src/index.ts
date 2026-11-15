@@ -855,16 +855,22 @@ ${memBlock}${approvalsBoot}  return await runChatLoop({
 /**
  * The body of one schedule wake on this shape, for the single `schedule` lane
  * and for each named lane alike: one fresh-session turn per declared tenant
- * with that lane's prompt, logged under the lane's id.
+ * with that lane's prompt, logged under the lane's id. The single lane's id is
+ * the emitter constant `schedule`; a named lane's id is bound once as a JSON
+ * string literal and reaches every log line only through that binding.
  */
 function scheduleTickBody(
   ir: IrManagedV0,
-  laneId: string,
+  lane: { readonly fixed: "schedule" } | { readonly laneId: string },
   instructionsVar: string,
   tickVar: string,
 ): string {
   const wakeTenant = memoryFabric(ir).wired ? "\n        tenant: __tenant," : "";
-  return `const __tickNo = ${tickVar}++;
+  // `laneId` sits inside emitted template literals; `prefix` is an expression.
+  const laneId = "fixed" in lane ? lane.fixed : "${__laneId}";
+  const prefix = "fixed" in lane ? `"[${lane.fixed}]"` : "`[${__laneId}]`";
+  const bind = "fixed" in lane ? "" : `const __laneId = ${escapeJsonString(lane.laneId)};\n`;
+  return `${bind}const __tickNo = ${tickVar}++;
 const __origin = __tick.synthetic !== undefined ? \` (synthetic: \${__tick.synthetic.reason})\` : "";
 for (const __tenantId of Object.keys(TENANT_OVERRIDES)) {
   const __tenant = tenantOverrides[__tenantId];
@@ -886,7 +892,7 @@ for (const __tenantId of Object.keys(TENANT_OVERRIDES)) {
     // A dead provider account / classified failure for one tenant must not
     // stop the scheduler; render its report and keep ticking.
     if (isRunFailedError(__err)) {
-      process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: "[${laneId}]" })}\\n\`);
+      process.stderr.write(\`\${formatRunFailure(__err.report, { prefix: ${prefix} })}\\n\`);
     } else {
       process.stderr.write(
         \`[${laneId}] tenant \${__tenantId} tick #\${__tickNo} error: \${(__err as Error).message}\\n\`,
@@ -918,7 +924,7 @@ ${renderScheduleLanes({
   })),
   ownsSession: false,
   body: ({ laneId, index, instructionsVar }) =>
-    scheduleTickBody(ir, laneId, instructionsVar, `__scheduleLaneTicks[${index}]`),
+    scheduleTickBody(ir, { laneId }, instructionsVar, `__scheduleLaneTicks[${index}]`),
   onErrorBody: "console.error(`[schedule:${__name}] error: ${(__err as Error).message}`);",
   armGuard: 'process.env.CREWHAUS_SCHEDULE !== "0"',
   afterArm:
@@ -976,7 +982,7 @@ ${renderControlLane({
       : `every ${schedule.everyMs}ms`,
   ...(schedule.kind === "interval" ? { everyMs: schedule.everyMs } : {}),
   ownsSession: false,
-  body: scheduleTickBody(ir, "schedule", "__SCHEDULE_INSTRUCTIONS", "__scheduleTick"),
+  body: scheduleTickBody(ir, { fixed: "schedule" }, "__SCHEDULE_INSTRUCTIONS", "__scheduleTick"),
 })}async function __fireScheduledWake(): Promise<void> {
   await __scheduleLane.tick();
 }`;
@@ -1487,7 +1493,7 @@ if (__rootRefusal !== undefined) {
       : "";
   const scheduleLanesImport =
     ir.scheduleLanes !== undefined
-      ? 'import { armScheduleLanes, nextWakeDelayMs } from "@crewhaus/durable-execution";\n'
+      ? 'import { armScheduleLanes } from "@crewhaus/durable-execution";\n'
       : "";
 
   const tenantList = ir.tenants

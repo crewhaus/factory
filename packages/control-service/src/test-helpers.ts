@@ -128,6 +128,7 @@ export function rig(
       target: string,
       credentialRef?: string,
     ) => boolean | undefined;
+    readonly permissionOf?: (kind: string) => string | undefined;
   } = {},
 ): Rig {
   const hangarRoot = options.hangarRoot ?? tempDir("control-service-home-");
@@ -152,6 +153,7 @@ export function rig(
       host: HOST,
       onWarn: (m) => warnings.push(m),
       ...(options.authorizeActor !== undefined ? { authorizeActor: options.authorizeActor } : {}),
+      ...(options.permissionOf !== undefined ? { permissionOf: options.permissionOf } : {}),
     },
     {
       mode: options.mode ?? "direct",
