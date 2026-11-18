@@ -339,6 +339,19 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/attention": {
+      "name": "@crewhaus/attention",
+      "version": "0.8.3",
+      "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/harness-advice": "workspace:*",
+        "@crewhaus/preflight": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
+      },
+    },
     "packages/audit-encryption": {
       "name": "@crewhaus/audit-encryption",
       "version": "0.8.3",
@@ -4133,6 +4146,8 @@
     "@crewhaus/agent-context-isolation": ["@crewhaus/agent-context-isolation@workspace:packages/agent-context-isolation"],
 
     "@crewhaus/agent-handoff": ["@crewhaus/agent-handoff@workspace:packages/agent-handoff"],
+
+    "@crewhaus/attention": ["@crewhaus/attention@workspace:packages/attention"],
 
     "@crewhaus/audit-encryption": ["@crewhaus/audit-encryption@workspace:packages/audit-encryption"],
 

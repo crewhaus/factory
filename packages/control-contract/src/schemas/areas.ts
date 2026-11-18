@@ -6,7 +6,7 @@
 import type { z } from "zod";
 import { CORE_SCHEMAS } from "./core.js";
 
-// import { ATTENTION_SCHEMAS } from "./attention.js";
+import { ATTENTION_SCHEMAS } from "./attention.js";
 
 // import { COMPILER_SCHEMAS } from "./compiler.js";
 
@@ -33,7 +33,7 @@ import { PEOPLE_SCHEMAS } from "./people.js";
 export const AREA_SCHEMAS: readonly Readonly<Record<string, z.ZodTypeAny>>[] = [
   CORE_SCHEMAS,
 
-  // ATTENTION_SCHEMAS,
+  ATTENTION_SCHEMAS,
 
   // COMPILER_SCHEMAS,
 

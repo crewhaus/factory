@@ -36,7 +36,7 @@
  * never writes (reads never mutate — the trend is folded from durable
  * sources rather than from snapshots a read would have to persist).
  */
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, statSync } from "node:fs";
 import {
   baselineKeyFor,
   breakBoundaries,
@@ -50,12 +50,13 @@ import {
   type AdvisorInputs,
   type AdvisorItem,
   type DecisionRecord,
+  type OpenIncidentInput,
+  type PendingApprovalsInput,
   assembleFeed,
   deriveAdvisorItems as deriveWith,
 } from "@crewhaus/harness-advice/advisor";
-import { countOpenIncidents } from "@crewhaus/harness-inventory";
 import { runPreflight } from "@crewhaus/preflight";
-import { pendingApprovalCount } from "./approvals";
+import { foldApprovals, statusOf } from "./approvals";
 import { foldHarnessCosts } from "./costs";
 import { mergedSpawnEnv } from "./env-file";
 import {
@@ -104,6 +105,8 @@ import { specView } from "./spec-view";
 export {
   ADVISOR_SCREENS,
   ARM_SAMPLE_FLOOR,
+  type OpenIncidentInput,
+  type PendingApprovalsInput,
   type AdvisorAction,
   type AdvisorArm,
   type AdvisorInputs,
@@ -223,11 +226,48 @@ function appendAdvisorLine(ctx: M3Context, file: string, record: unknown): void 
 
 const ADVICE_SEGMENTS = [".crewhaus", "advice"] as const;
 
+/** The mined suggestions waiting in `.crewhaus/advice/suggestions.json`, as the advise pass writes them. */
 function countAdviceProposals(ctx: M3Context): number {
   const file = readJsonAt(safeContain(ctx, [...ADVICE_SEGMENTS, "suggestions.json"]));
   if (typeof file !== "object" || file === null) return 0;
-  const proposals = (file as Record<string, unknown>)["proposals"];
-  return Array.isArray(proposals) ? proposals.length : 0;
+  const suggestions = (file as Record<string, unknown>)["suggestions"];
+  return Array.isArray(suggestions) ? suggestions.length : 0;
+}
+
+const INCIDENT_SEGMENTS = [".crewhaus", "incidents"] as const;
+
+/** The open incident records (files not ending `.resolved.json`), each with when it was written. */
+function openIncidentsOf(ctx: M3Context): OpenIncidentInput[] {
+  const out: OpenIncidentInput[] = [];
+  for (const name of listNames(safeContain(ctx, [...INCIDENT_SEGMENTS]))) {
+    if (!name.endsWith(".json") || name.endsWith(".resolved.json")) continue;
+    const path = safeContain(ctx, [...INCIDENT_SEGMENTS, name]);
+    if (path === undefined) continue;
+    let at: string;
+    try {
+      at = new Date(statSync(path).mtimeMs).toISOString();
+    } catch {
+      continue;
+    }
+    out.push({ id: name.slice(0, -5), at });
+  }
+  return out;
+}
+
+/** The pending approvals and the newest of them; `null` when the session root is outside the harness. */
+function pendingApprovalsOf(dir: string): PendingApprovalsInput | null {
+  const folded = foldApprovals(dir);
+  if (folded.unreachable === true) return null;
+  let count = 0;
+  let newest: { id: string; createdAt: string } | undefined;
+  for (const approval of folded.approvals) {
+    if (statusOf(approval) !== "pending") continue;
+    count += 1;
+    if (newest === undefined || approval.createdAt > newest.createdAt) newest = approval;
+  }
+  return newest === undefined
+    ? { count: 0, newestId: "", newestAt: "" }
+    : { count, newestId: newest.id, newestAt: newest.createdAt };
 }
 
 async function gatherInputs(ctx: M3Context, dir: string): Promise<AdvisorInputs> {
@@ -310,9 +350,9 @@ async function gatherInputs(ctx: M3Context, dir: string): Promise<AdvisorInputs>
     evalsUnreadable: evals.unreadable !== null,
     baselinePinned: Object.keys(evals.baselines).length > 0,
     offers: launchOffers(dir, ctx.entry?.target),
-    openIncidents: countOpenIncidents(dir),
+    openIncidents: openIncidentsOf(ctx),
     procState,
-    pendingApprovals: pendingApprovalCount(dir),
+    pendingApprovals: pendingApprovalsOf(dir),
     budget: {
       declaredUsd: declaredBudgetUsd(yamlText),
       spentUsd: costs.totalUsdMicros / 1_000_000,
@@ -354,7 +394,10 @@ const requireDir = (ctx: M3Context): string => {
 export const advisorFeed: M3Handler = async (ctx) => {
   const dir = requireDir(ctx);
   const inputs = await gatherInputs(ctx, dir);
-  const { open, dismissed } = assembleFeed(deriveAdvisorItems(inputs), readDecisions(ctx));
+  const { open, dismissed, olderSpec } = assembleFeed(
+    deriveAdvisorItems(inputs),
+    readDecisions(ctx),
+  );
   const counts = {
     critical: open.filter((i) => i.severity === "critical").length,
     warn: open.filter((i) => i.severity === "warn").length,
@@ -371,6 +414,14 @@ export const advisorFeed: M3Handler = async (ctx) => {
     ),
     items: open,
     dismissed,
+    // Dismissals made on an older spec's issues, named by position: they hide nothing now.
+    olderSpec: olderSpec.map((line) => ({
+      itemId: line.itemId,
+      at: line.at,
+      by: line.by,
+      reason: line.reason ?? "",
+      note: "applied to an older spec",
+    })),
     open: open.length,
     optimal,
     counts,
@@ -988,22 +1039,7 @@ export const advisorIssues: M3Handler = (ctx) => {
 export const advisorFleet: M3Handler = async (ctx) => {
   const rows: Array<Record<string, unknown>> = [];
   for (const h of ctx.harnesses()) {
-    const subCtx: M3Context = {
-      ...ctx,
-      entry: null,
-      harnessDir: h.dir,
-      contain: (segments) => {
-        // The fleet fold reads OTHER harnesses' trees; each read is contained
-        // inside the harness it belongs to, exactly as the per-harness route
-        // would contain it.
-        const resolved = safeContainIn(h.dir, segments);
-        if (resolved === undefined) throw new HttpError(400, "path escapes the harness directory");
-        return resolved;
-      },
-      process: async () => {
-        throw new HttpError(400, "no process handle in a fleet fold");
-      },
-    };
+    const subCtx = harnessSubContext(ctx, h.dir);
     const inputs = await gatherInputs(subCtx, h.dir);
     const { open } = assembleFeed(deriveAdvisorItems(inputs), readDecisions(subCtx));
     const top = open[0];
@@ -1046,6 +1082,38 @@ export const advisorFleet: M3Handler = async (ctx) => {
     totals,
   };
 };
+
+/**
+ * A context for one harness this request did not name: every read contained inside that
+ * harness exactly as the per-harness route would contain it, and no process handle (a
+ * fold over other harnesses has none, so supervision items are left out).
+ */
+function harnessSubContext(ctx: M3Context, dir: string): M3Context {
+  return {
+    ...ctx,
+    entry: null,
+    harnessDir: dir,
+    contain: (segments) => {
+      const resolved = safeContainIn(dir, segments);
+      if (resolved === undefined) throw new HttpError(400, "path escapes the harness directory");
+      return resolved;
+    },
+    process: async () => {
+      throw new HttpError(400, "no process handle in a fleet fold");
+    },
+  };
+}
+
+/**
+ * One harness's open Advisor items, gathered and ranked with its ledger folded on, as the
+ * fleet board gathers them. Home's attention sweep calls it off the request path (it runs
+ * a preflight); no read does.
+ */
+export async function advisorOpenItems(ctx: M3Context, dir: string): Promise<AdvisorItem[]> {
+  const subCtx = harnessSubContext(ctx, dir);
+  const inputs = await gatherInputs(subCtx, dir);
+  return assembleFeed(deriveAdvisorItems(inputs), readDecisions(subCtx)).open;
+}
 
 /** `resolveInside` for a dir this request did not name — the same realpath
  *  containment the dispatcher applies, applied to a fleet-fold member. */

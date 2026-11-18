@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../control-contract" },
+    { "path": "../control-records" },
+    { "path": "../feedback-distill" },
+    { "path": "../harness-advice" },
+    { "path": "../preflight" },
+    { "path": "../session-store" },
+    { "path": "../tool-safety" }
+  ],
+  "include": ["src/**/*"]
+}

@@ -37,6 +37,11 @@ export type ListEnvelope<T> = {
   readonly snapshotAt: string;
   readonly truncated?: ListTruncated;
   readonly empty?: ListEmpty;
+  /**
+   * Harnesses whose records this list could not read here (a sessions folder outside its
+   * harness), named whether or not anything is listed, so a short list never reads as whole.
+   */
+  readonly unreachable?: readonly string[];
 };
 
 export type ListQuery = {

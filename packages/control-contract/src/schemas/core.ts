@@ -191,6 +191,7 @@ function listOf<T extends z.ZodTypeAny>(item: T) {
       snapshotAt: cursorString,
       truncated: listTruncated.optional(),
       empty: listEmpty.optional(),
+      unreachable: z.array(harnessId).optional(),
     })
     .passthrough();
 }
@@ -591,6 +592,7 @@ export const harnessOverview = z
     deployedSpecHash: z.string().optional(),
     activeDeployment: deploymentId.optional(),
     openDecisions: count.optional(),
+    approvalsUnreachable: z.literal(true).optional(),
     lastVerifiedContactAt: timestamp.optional(),
     asOf: timestamp.optional(),
     stale: z.boolean().optional(),

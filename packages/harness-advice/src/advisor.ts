@@ -9,7 +9,18 @@
  * Gathering the inputs, reading and appending the ledger file, and the job
  * vocabulary a quick action may queue stay with the server that runs them:
  * the twin table a job action shows arrives here as data.
+ *
+ * Every item id is keyed by its evidence: one item per open incident
+ * (`incident-<id>`), the newest pending approval (`approvals-pending-<appr>`),
+ * the budget's decile and period (`budget-near-<decile>-<period>`,
+ * `budget-exceeded-<period>`) and a digest of a spec issue's message
+ * (`spec-issue-<12 hex>`). A dismissal therefore hides only the evidence it was
+ * made on. A ledger line written for a count-keyed id hides an item only when
+ * that item's evidence is older than the line; a line written for a
+ * position-keyed spec issue hides nothing and is reported as applied to an
+ * older spec.
  */
+import { createHash } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // The item model
@@ -81,6 +92,8 @@ export type AdvisorItem = {
   readonly dismissal?: { readonly reason: string; readonly by: string; readonly at: string };
   /** The most recent acted record for this item, when one exists — so the
    *  feed shows "already queued yesterday, with this comment". */
+  /** When the newest evidence behind it was recorded (ISO), when the gatherer knows it. */
+  readonly evidenceAt?: string;
   readonly lastAction?: {
     readonly comment: string | null;
     readonly by: string;
@@ -168,9 +181,11 @@ export type AdvisorInputs = {
   readonly baselinePinned: boolean;
   /** Which measuring jobs can start here. An item never offers one that cannot. */
   readonly offers: { readonly eval: AdvisorLaunchOffer; readonly optimize: AdvisorLaunchOffer };
-  readonly openIncidents: number;
+  /** The open incident records, by id, with when each was written. */
+  readonly openIncidents: readonly OpenIncidentInput[];
   readonly procState: string | null;
-  readonly pendingApprovals: number;
+  /** The pending approvals, or `null` when they could not be read (nothing is raised). */
+  readonly pendingApprovals: PendingApprovalsInput | null;
   readonly budget: { readonly declaredUsd: number | null; readonly spentUsd: number };
   readonly adviceProposals: number;
   readonly overdueDreams: readonly string[];
@@ -186,6 +201,24 @@ export type AdvisorInputs = {
   /** Registry pins the running (or compiled) bundle was NOT built from. */
   readonly unservedPins: readonly UnservedPinInput[];
 };
+
+/** One unresolved incident record: its id (the file's stem) and when it was written. */
+export type OpenIncidentInput = { readonly id: string; readonly at: string };
+
+/** The pending approvals: how many, and the newest one. */
+export type PendingApprovalsInput = {
+  readonly count: number;
+  readonly newestId: string;
+  readonly newestAt: string;
+};
+
+/** The period a budget is counted over until a spec declares one. */
+export const BUDGET_PERIOD = "total";
+
+/** The first 12 hex characters of a spec issue's message digest: its id. */
+export function specIssueKey(message: string): string {
+  return createHash("sha256").update(message, "utf8").digest("hex").slice(0, 12);
+}
 
 /** One arm, reduced to what the ranking needs. */
 export type AdvisorArm = {
@@ -386,25 +419,27 @@ export function deriveAdvisorItems(
         : linkAction("Open evals", offer.verb),
     });
   }
-  if (inputs.openIncidents > 0) {
+  for (const incident of inputs.openIncidents) {
     open({
-      id: "incidents-open",
+      id: safeId(`incident-${incident.id}`),
       severity: "warn",
-      title: `${inputs.openIncidents} incident record${inputs.openIncidents === 1 ? "" : "s"} open`,
-      detail: "unresolved records under .crewhaus/incidents",
+      title: `incident record ${incident.id} is open`,
+      detail: "an unresolved record under .crewhaus/incidents",
       explain:
         "an incident file is written when something tripped a runtime guard; leaving it open means nobody has judged whether it can recur",
-      guidance: "review each record on the Security tab and resolve or escalate it",
+      guidance: "review the record on the Security tab and resolve or escalate it",
       screen: "security",
       source: "security",
       action: linkAction("Open security"),
+      evidenceAt: incident.at,
     });
   }
-  if (inputs.pendingApprovals > 0) {
+  const pending = inputs.pendingApprovals;
+  if (pending !== null && pending.count > 0) {
     open({
-      id: "approvals-pending",
+      id: safeId(`approvals-pending-${pending.newestId}`),
       severity: "warn",
-      title: `${inputs.pendingApprovals} approval${inputs.pendingApprovals === 1 ? "" : "s"} waiting`,
+      title: `${pending.count} approval${pending.count === 1 ? "" : "s"} waiting`,
       detail: "tool calls are parked for a human verdict",
       explain:
         "each parked call is a session holding its breath — the agent cannot finish that turn until someone grants or denies",
@@ -412,6 +447,7 @@ export function deriveAdvisorItems(
       screen: "approvals",
       source: "approvals",
       action: linkAction("Open approvals"),
+      evidenceAt: pending.newestAt,
     });
   }
   for (const spec of inputs.overdueDreams) {
@@ -435,7 +471,7 @@ export function deriveAdvisorItems(
     const ratio = spentUsd / declaredUsd;
     if (ratio >= 1) {
       open({
-        id: "budget-exceeded",
+        id: `budget-exceeded-${BUDGET_PERIOD}`,
         severity: "critical",
         title: "spend has exceeded the declared budget",
         detail: `$${spentUsd.toFixed(2)} spent against a $${declaredUsd.toFixed(2)} budget`,
@@ -448,7 +484,7 @@ export function deriveAdvisorItems(
       });
     } else if (ratio >= 0.8) {
       open({
-        id: "budget-near-limit",
+        id: `budget-near-${Math.min(9, Math.floor(ratio * 10))}-${BUDGET_PERIOD}`,
         severity: "warn",
         title: `spend is at ${Math.round(ratio * 100)}% of the declared budget`,
         detail: `$${spentUsd.toFixed(2)} of $${declaredUsd.toFixed(2)}`,
@@ -475,9 +511,13 @@ export function deriveAdvisorItems(
 
   // --- could it be better --------------------------------------------------
   if (!inputs.specUnreadable) {
-    for (const [i, issue] of inputs.specIssues.entries()) {
+    const seen = new Set<string>();
+    for (const issue of inputs.specIssues) {
+      const key = specIssueKey(issue.message);
+      if (seen.has(key)) continue;
+      seen.add(key);
       open({
-        id: `spec-issue-${i + 1}`,
+        id: `spec-issue-${key}`,
         severity: "warn",
         title: "the spec does not validate against this manager's schema",
         detail: issue.message,
@@ -730,18 +770,54 @@ export function foldDecisions(records: readonly DecisionRecord[]): {
   return { dismissed, acted };
 }
 
+/**
+ * The ids a 0.8 ledger keyed by count, and the family of evidence-keyed ids each one
+ * stood for. A line for one of them hides an item of its family only when the item's
+ * evidence is older than the line: a dismissal hides what it was made on, never what
+ * came after it. An item that does not say when its evidence was recorded (a budget
+ * item) is not hidden by such a line.
+ */
+export const LEGACY_ITEM_FAMILIES: ReadonlyArray<{
+  readonly legacy: string;
+  readonly prefix: string;
+}> = [
+  { legacy: "incidents-open", prefix: "incident-" },
+  { legacy: "approvals-pending", prefix: "approvals-pending-" },
+  { legacy: "budget-near-limit", prefix: "budget-near-" },
+  { legacy: "budget-exceeded", prefix: "budget-exceeded-" },
+];
+
+/** A spec issue's id by its position, as a 0.8 ledger wrote it. It names no issue now. */
+export const POSITIONAL_SPEC_ISSUE_RE = /^spec-issue-[0-9]{1,4}$/;
+
+/** The line for this item's legacy family that applies to it, if any. */
+function legacyLine(
+  item: AdvisorItem,
+  lines: ReadonlyMap<string, DecisionRecord>,
+): DecisionRecord | undefined {
+  const family = LEGACY_ITEM_FAMILIES.find((f) => item.id.startsWith(f.prefix));
+  if (family === undefined || item.evidenceAt === undefined) return undefined;
+  const line = lines.get(family.legacy);
+  if (line === undefined) return undefined;
+  const evidence = Date.parse(item.evidenceAt);
+  const at = Date.parse(line.at);
+  return Number.isFinite(evidence) && Number.isFinite(at) && evidence < at ? line : undefined;
+}
+
 /** Derived items with the ledger folded on: dismissals attach and drop items
- *  into the dismissed list; acted records ride along as `lastAction`. */
+ *  into the dismissed list; acted records ride along as `lastAction`.
+ *  `olderSpec` lists the dismissals in force for spec issues named by their
+ *  position: they were made on an older spec, and hide nothing now. */
 export function assembleFeed(
   items: AdvisorItem[],
   records: readonly DecisionRecord[],
-): { open: AdvisorItem[]; dismissed: AdvisorItem[] } {
+): { open: AdvisorItem[]; dismissed: AdvisorItem[]; olderSpec: DecisionRecord[] } {
   const folded = foldDecisions(records);
   const open: AdvisorItem[] = [];
   const dismissed: AdvisorItem[] = [];
   for (const item of items) {
-    const dismissal = folded.dismissed.get(item.id);
-    const acted = folded.acted.get(item.id);
+    const dismissal = folded.dismissed.get(item.id) ?? legacyLine(item, folded.dismissed);
+    const acted = folded.acted.get(item.id) ?? legacyLine(item, folded.acted);
     const withAction =
       acted !== undefined
         ? {
@@ -768,5 +844,8 @@ export function assembleFeed(
       open.push(withAction);
     }
   }
-  return { open, dismissed };
+  const olderSpec = [...folded.dismissed.values()].filter((line) =>
+    POSITIONAL_SPEC_ISSUE_RE.test(line.itemId),
+  );
+  return { open, dismissed, olderSpec };
 }
