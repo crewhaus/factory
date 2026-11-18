@@ -70,7 +70,7 @@ import {
 import { hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AuditLog } from "@crewhaus/audit-log";
-import { boundaryRuleIds, classifyBoundary } from "@crewhaus/boundary-classifier";
+import { boundaryRuleIds } from "@crewhaus/boundary-classifier";
 import {
   CANONICAL_RUN_ID_RE,
   EXECUTION_RUN_ID_RE,
@@ -127,6 +127,7 @@ import {
   type ManagedRunPlane,
 } from "./coded";
 import type { ResolveRunEvents, RunHandler, RunInputVerdict, UsageDelta } from "./index";
+import { classifyManagedInput } from "./managed-classify";
 
 export {
   GatewayCodedError,
@@ -188,18 +189,6 @@ export type ManagedControl = Pick<ControlPlane, "onClaim" | "onActiveRuns"> &
   Partial<Pick<ControlPlane, "clientRunIds">> & {
     readonly counters: { turns: number };
   };
-
-type Classify = typeof classifyBoundary;
-
-let classify: Classify = classifyBoundary;
-
-/**
- * Test seam: count or script the classifier a run's input meets, a request's and a
- * queued run's alike. `undefined` restores it.
- */
-export function _setManagedClassifierForTest(next: Classify | undefined): void {
-  classify = next ?? classifyBoundary;
-}
 
 /** A method the daemon serves beyond the runs, such as `feedback.submit`. */
 export type ManagedMethod = (args: {
@@ -842,7 +831,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     if (typeof input !== "string") {
       throw new GatewayCodedError(ErrorCode.BadRequest, "params.input must be a string");
     }
-    const boundary = await classify(input, { origin: "api" });
+    const boundary = await classifyManagedInput(input, { origin: "api" });
     const rules = boundaryRuleIds(boundary.verdict);
     const verdict: RunInputVerdict = {
       action: boundary.action,
@@ -1111,7 +1100,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
         }
         // A queued input enters here, never through a request: classified at
         // "api" before anything runs, and kept text tags the run's context.
-        const boundary = await classify(input.input, { origin: "api" });
+        const boundary = await classifyManagedInput(input.input, { origin: "api" });
         if (boundary.action === "redact") {
           await rows.end({ state: "failed", failureClass: "input_blocked" }, subject);
           return;

@@ -18,11 +18,10 @@ import { type BoundaryResult, classifyBoundary } from "@crewhaus/boundary-classi
 import { OPERATIONS, type OperationRow } from "@crewhaus/control-contract";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import { controlPaths } from "@crewhaus/control-records";
-import {
-  _setManagedClassifierForTest,
-  createManagedRuns,
-} from "@crewhaus/gateway-server/managed-runs";
+import { createManagedRuns } from "@crewhaus/gateway-server/managed-runs";
 import { runChatLoop } from "@crewhaus/runtime-core";
+// gateway-server's published entries export no test seam; this is the module managed-runs loads.
+import { _setManagedClassifierForTest } from "../../../gateway-server/src/managed-classify";
 // runtime-core's package entry exports no test seam; this resolves to the module the run loads.
 import {
   _resetInputOriginForTest,
