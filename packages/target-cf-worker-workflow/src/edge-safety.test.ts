@@ -19,6 +19,8 @@ import {
 } from "./test-helpers";
 
 const SRC_DIR = import.meta.dir;
+/** A test that drives the worker spawns a `bun` subprocess per request, slow by construction on CI runners. */
+const DRIVE_DEADLINE_MS = 20_000;
 /** The worker's secret and the right bearer for it, made at run time. */
 const CHAT_TOKEN = `chat-${crypto.randomUUID()}`;
 const AUTHORIZED = { authorization: `Bearer ${CHAT_TOKEN}`, "content-type": "application/json" };
@@ -64,110 +66,154 @@ const webFetchChat = (worker: string) =>
 describe("cf-worker workflow — /chat answers only with the CHAT_TOKEN bearer", () => {
   const worker = workerOf(baseIr);
 
-  test("no Authorization header: 401 with a Bearer challenge, and no model call", async () => {
-    const r = await drive(SRC_DIR, worker, { env: ENV, body: chatBody(), turns: [textTurn("x")] });
-    expect(r.error).toBeUndefined();
-    expect(r.status).toBe(401);
-    expect(r.headers["www-authenticate"]).toBe("Bearer");
-    expect(r.calls).toBe(0);
-  });
-
-  test("a wrong token gets the identical 401", async () => {
-    const missing = await drive(SRC_DIR, worker, { env: ENV, body: chatBody() });
-    const wrong = await drive(SRC_DIR, worker, {
-      headers: { authorization: `Bearer chat-${crypto.randomUUID()}` },
-      env: ENV,
-      body: chatBody(),
-    });
-    expect(wrong.status).toBe(401);
-    expect(wrong.raw).toBe(missing.raw);
-    expect(wrong.calls).toBe(0);
-  });
-
-  test("with CHAT_TOKEN unset or empty, every request is answered 503 NO_CHAT_TOKEN", async () => {
-    for (const env of [
-      { ANTHROPIC_API_KEY: "sk-test" },
-      { ANTHROPIC_API_KEY: "sk-test", CHAT_TOKEN: "" },
-    ]) {
-      const r = await drive(SRC_DIR, worker, { headers: AUTHORIZED, env, body: chatBody() });
-      expect(r.status).toBe(503);
-      expect((JSON.parse(r.raw) as { error: { code: string } }).error.code).toBe("NO_CHAT_TOKEN");
+  test(
+    "no Authorization header: 401 with a Bearer challenge, and no model call",
+    async () => {
+      const r = await drive(SRC_DIR, worker, {
+        env: ENV,
+        body: chatBody(),
+        turns: [textTurn("x")],
+      });
+      expect(r.error).toBeUndefined();
+      expect(r.status).toBe(401);
+      expect(r.headers["www-authenticate"]).toBe("Bearer");
       expect(r.calls).toBe(0);
-    }
-  });
+    },
+    DRIVE_DEADLINE_MS,
+  );
 
-  test("the right token is served as an event stream", async () => {
-    const r = await chat(worker, { turns: [textTurn("a"), textTurn("b"), textTurn("c")] });
-    expect(r.status).toBe(200);
-    expect(r.headers["content-type"]).toContain("text/event-stream");
-    expect(r.calls).toBe(3);
-  });
+  test(
+    "a wrong token gets the identical 401",
+    async () => {
+      const missing = await drive(SRC_DIR, worker, { env: ENV, body: chatBody() });
+      const wrong = await drive(SRC_DIR, worker, {
+        headers: { authorization: `Bearer chat-${crypto.randomUUID()}` },
+        env: ENV,
+        body: chatBody(),
+      });
+      expect(wrong.status).toBe(401);
+      expect(wrong.raw).toBe(missing.raw);
+      expect(wrong.calls).toBe(0);
+    },
+    DRIVE_DEADLINE_MS,
+  );
 
-  test("a CORS-simple text/plain POST from another origin, without a token, gets 401", async () => {
-    const r = await drive(SRC_DIR, worker, {
-      headers: { origin: "https://evil.example", "content-type": "text/plain;charset=UTF-8" },
-      env: ENV,
-      body: chatBody(),
-    });
-    expect(r.status).toBe(401);
-    expect(r.calls).toBe(0);
-  });
+  test(
+    "with CHAT_TOKEN unset or empty, every request is answered 503 NO_CHAT_TOKEN",
+    async () => {
+      for (const env of [
+        { ANTHROPIC_API_KEY: "sk-test" },
+        { ANTHROPIC_API_KEY: "sk-test", CHAT_TOKEN: "" },
+      ]) {
+        const r = await drive(SRC_DIR, worker, { headers: AUTHORIZED, env, body: chatBody() });
+        expect(r.status).toBe(503);
+        expect((JSON.parse(r.raw) as { error: { code: string } }).error.code).toBe("NO_CHAT_TOKEN");
+        expect(r.calls).toBe(0);
+      }
+    },
+    DRIVE_DEADLINE_MS,
+  );
 
-  test("OPTIONS allows the Authorization header", async () => {
-    const r = await drive(SRC_DIR, worker, { method: "OPTIONS", env: ENV });
-    expect(r.status).toBe(204);
-    expect(r.headers["access-control-allow-headers"]).toContain("Authorization");
-  });
+  test(
+    "the right token is served as an event stream",
+    async () => {
+      const r = await chat(worker, { turns: [textTurn("a"), textTurn("b"), textTurn("c")] });
+      expect(r.status).toBe(200);
+      expect(r.headers["content-type"]).toContain("text/event-stream");
+      expect(r.calls).toBe(3);
+    },
+    DRIVE_DEADLINE_MS,
+  );
 
-  test('GET /health answers exactly {"ok":true}', async () => {
-    const r = await drive(SRC_DIR, worker, { method: "GET", path: "/health", env: ENV });
-    expect(r.status).toBe(200);
-    expect(r.raw).toBe('{"ok":true}');
-  });
+  test(
+    "a CORS-simple text/plain POST from another origin, without a token, gets 401",
+    async () => {
+      const r = await drive(SRC_DIR, worker, {
+        headers: { origin: "https://evil.example", "content-type": "text/plain;charset=UTF-8" },
+        env: ENV,
+        body: chatBody(),
+      });
+      expect(r.status).toBe(401);
+      expect(r.calls).toBe(0);
+    },
+    DRIVE_DEADLINE_MS,
+  );
 
-  test("a public build answers with no CHAT_TOKEN and no header", async () => {
-    const r = await drive(SRC_DIR, workerOf({ ...baseIr, cfWorker: { publicChat: true } }), {
-      env: { ANTHROPIC_API_KEY: "sk-test" },
-      body: chatBody(),
-      turns: [textTurn("a"), textTurn("b"), textTurn("c")],
-    });
-    expect(r.status).toBe(200);
-    expect(r.calls).toBe(3);
-  });
+  test(
+    "OPTIONS allows the Authorization header",
+    async () => {
+      const r = await drive(SRC_DIR, worker, { method: "OPTIONS", env: ENV });
+      expect(r.status).toBe(204);
+      expect(r.headers["access-control-allow-headers"]).toContain("Authorization");
+    },
+    DRIVE_DEADLINE_MS,
+  );
+
+  test(
+    'GET /health answers exactly {"ok":true}',
+    async () => {
+      const r = await drive(SRC_DIR, worker, { method: "GET", path: "/health", env: ENV });
+      expect(r.status).toBe(200);
+      expect(r.raw).toBe('{"ok":true}');
+    },
+    DRIVE_DEADLINE_MS,
+  );
+
+  test(
+    "a public build answers with no CHAT_TOKEN and no header",
+    async () => {
+      const r = await drive(SRC_DIR, workerOf({ ...baseIr, cfWorker: { publicChat: true } }), {
+        env: { ANTHROPIC_API_KEY: "sk-test" },
+        body: chatBody(),
+        turns: [textTurn("a"), textTurn("b"), textTurn("c")],
+      });
+      expect(r.status).toBe(200);
+      expect(r.calls).toBe(3);
+    },
+    DRIVE_DEADLINE_MS,
+  );
 });
 
 describe("cf-worker workflow — a tool runs only when an alwaysAllow rule covers the call", () => {
-  test("no rules: WebFetch is refused as needing approval, with no request and no DNS lookup", async () => {
-    const r = await webFetchChat(workerOf(toolFlow(["webFetch"], { rules: [] })));
-    expect(r.calls).toBe(2);
-    expect(r.outbound).toEqual([]);
-    expect(r.dnsLookups).toBe(0);
-    const [result] = toolResults(r.modelBodies[1]);
-    expect(result?.["is_error"]).toBe(true);
-    expect(resultText(result)).toContain("needs approval, and this worker has nobody to give it");
-    const decision = parseSse(r.raw).find(
-      (e) => e.name === "trace" && e.data["kind"] === "permission_decision",
-    );
-    expect(decision?.data).toMatchObject({ toolName: "WebFetch", decision: "ask" });
-  });
-
-  test("a deny with an allow, in either order, is refused with no request", async () => {
-    const deny = { type: "alwaysDeny" as const, pattern: "WebFetch" };
-    const allow = { type: "alwaysAllow" as const, pattern: "WebFetch" };
-    for (const rules of [
-      [deny, allow],
-      [allow, deny],
-    ]) {
-      const r = await webFetchChat(workerOf(toolFlow(["webFetch"], { rules })));
+  test(
+    "no rules: WebFetch is refused as needing approval, with no request and no DNS lookup",
+    async () => {
+      const r = await webFetchChat(workerOf(toolFlow(["webFetch"], { rules: [] })));
+      expect(r.calls).toBe(2);
       expect(r.outbound).toEqual([]);
       expect(r.dnsLookups).toBe(0);
-      expect(toolResults(r.modelBodies[1])[0]?.["is_error"]).toBe(true);
-    }
-    // The control: the allow alone runs it.
-    const ran = await webFetchChat(workerOf(toolFlow(["webFetch"], { rules: [allow] })));
-    expect(ran.outbound).toHaveLength(1);
-    expect(toolResults(ran.modelBodies[1])[0]?.["is_error"]).toBe(false);
-  });
+      const [result] = toolResults(r.modelBodies[1]);
+      expect(result?.["is_error"]).toBe(true);
+      expect(resultText(result)).toContain("needs approval, and this worker has nobody to give it");
+      const decision = parseSse(r.raw).find(
+        (e) => e.name === "trace" && e.data["kind"] === "permission_decision",
+      );
+      expect(decision?.data).toMatchObject({ toolName: "WebFetch", decision: "ask" });
+    },
+    DRIVE_DEADLINE_MS,
+  );
+
+  test(
+    "a deny with an allow, in either order, is refused with no request",
+    async () => {
+      const deny = { type: "alwaysDeny" as const, pattern: "WebFetch" };
+      const allow = { type: "alwaysAllow" as const, pattern: "WebFetch" };
+      for (const rules of [
+        [deny, allow],
+        [allow, deny],
+      ]) {
+        const r = await webFetchChat(workerOf(toolFlow(["webFetch"], { rules })));
+        expect(r.outbound).toEqual([]);
+        expect(r.dnsLookups).toBe(0);
+        expect(toolResults(r.modelBodies[1])[0]?.["is_error"]).toBe(true);
+      }
+      // The control: the allow alone runs it.
+      const ran = await webFetchChat(workerOf(toolFlow(["webFetch"], { rules: [allow] })));
+      expect(ran.outbound).toHaveLength(1);
+      expect(toolResults(ran.modelBodies[1])[0]?.["is_error"]).toBe(false);
+    },
+    DRIVE_DEADLINE_MS,
+  );
 });
 
 describe("cf-worker workflow — limits.deadline_ms bounds the whole run", () => {
@@ -179,21 +225,29 @@ describe("cf-worker workflow — limits.deadline_ms bounds the whole run", () =>
       clockStep: 1000,
     });
 
-  test("a step that would start past the deadline is not started, and the run says so", async () => {
-    const r = await run({ deadlineMs: 1500 });
-    expect(r.calls).toBe(2);
-    const events = parseSse(r.raw);
-    expect(events.some((e) => e.name === "done")).toBe(false);
-    expect(events.find((e) => e.name === "error")?.data["message"]).toBe(
-      'step "three": run deadline exceeded: the run exceeded its 1500ms deadline before this step started',
-    );
-  });
+  test(
+    "a step that would start past the deadline is not started, and the run says so",
+    async () => {
+      const r = await run({ deadlineMs: 1500 });
+      expect(r.calls).toBe(2);
+      const events = parseSse(r.raw);
+      expect(events.some((e) => e.name === "done")).toBe(false);
+      expect(events.find((e) => e.name === "error")?.data["message"]).toBe(
+        'step "three": run deadline exceeded: the run exceeded its 1500ms deadline before this step started',
+      );
+    },
+    DRIVE_DEADLINE_MS,
+  );
 
-  test("without deadline_ms every step runs", async () => {
-    const r = await run(undefined);
-    expect(r.calls).toBe(3);
-    expect(parseSse(r.raw).some((e) => e.name === "done")).toBe(true);
-  });
+  test(
+    "without deadline_ms every step runs",
+    async () => {
+      const r = await run(undefined);
+      expect(r.calls).toBe(3);
+      expect(parseSse(r.raw).some((e) => e.name === "done")).toBe(true);
+    },
+    DRIVE_DEADLINE_MS,
+  );
 
   test("the run's start is stamped once and each step is handed what remains", () => {
     const worker = workerOf({ ...baseIr, limits: { deadlineMs: 1500 } });
