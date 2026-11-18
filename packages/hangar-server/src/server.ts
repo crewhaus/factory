@@ -314,6 +314,7 @@ import {
   readOnlyRefusal,
 } from "./settings";
 import { SIGN_IN_ROUTES, isSignInPath, serveSignIn } from "./sign-in-routes";
+import { SPEC_SECURITY_PERMISSION } from "./spec-edit";
 import { BADGE_KEYS, capabilityBadges, specView } from "./spec-view";
 import { assetResponse } from "./static-cache";
 import type { HomePorts } from "./sweeps";
@@ -2465,15 +2466,22 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           runId,
           nowIso: new Date(now()).toISOString(),
           ...(typeof confirmName === "string" ? { confirmName } : {}),
+          // A pin that changes a protected criterion needs the security edit permission
+          // on this harness; outside a request nothing is allowed.
+          authorize: () =>
+            requestAllows(SPEC_SECURITY_PERMISSION, entry.id)
+              ? { allow: true, principal: requestCaller().principal }
+              : { allow: false },
         });
         if (result.outcome === "rejected") throw new HttpError(409, result.reason);
+        if (result.outcome === "forbidden") throw forbiddenOn(SPEC_SECURITY_PERMISSION, entry.id);
         if (result.outcome === "needs_owner") {
           // The owner's escalation, as a protected criterion's loosening asks:
           // answered, not thrown, so its fields reach the caller.
           return jsonMasked(
             {
               error: result.reason,
-              needs: "h.spec.edit.security",
+              needs: SPEC_SECURITY_PERMISSION,
               confirmName: result.confirmName,
             },
             409,

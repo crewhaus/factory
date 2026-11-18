@@ -319,6 +319,8 @@ export type BaselineEntry = {
      * gone, or cases inside its scope are) and the harness's owner allowed it.
      */
     readonly protectedChange?: true;
+    /** The principal that allowed a `protectedChange` re-anchor. */
+    readonly by?: string;
     /** The command receipt (`cmd_…`) the re-anchor was made under. */
     readonly receipt?: string;
   };
