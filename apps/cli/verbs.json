@@ -9864,7 +9864,47 @@
               "takesValue": false
             },
             {
+              "name": "ignore-pause",
+              "takesValue": false
+            },
+            {
               "name": "help",
+              "takesValue": false
+            }
+          ]
+        },
+        "inspect": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "run",
+              "takesValue": true
+            },
+            {
+              "name": "timeline",
+              "takesValue": true
+            },
+            {
+              "name": "why",
+              "takesValue": true
+            },
+            {
+              "name": "context",
+              "takesValue": true
+            },
+            {
+              "name": "limit",
+              "takesValue": true
+            },
+            {
+              "name": "before",
+              "takesValue": true
+            },
+            {
+              "name": "json",
               "takesValue": false
             }
           ]

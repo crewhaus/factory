@@ -7,22 +7,28 @@
  * `.crewhaus` there, and also each other directory holding a spec the verb runs: the spec
  * it is given as its first argument (or the one it runs by default), or for `eval suite` its `--spec`, else each selected
  * entry's spec, resolved as the verb resolves it, and, for a spec reached through a link,
- * the directory it resolves to. Every one of those operator records is
+ * the directory it resolves to (for `runs resume`, its `--spec`, else the `crewhaus.yaml`
+ * it resumes with by default). Every one of those operator records is
  * checked and the stricter verdict decides (a disable over a pause; the working
  * directory's when they refuse alike).
  *
  * | Verb | Mode |
  * |---|---|
- * | `run --prompt` (or `--input-file`) | run |
- * | `run` otherwise: the REPL, whose person at the keyboard is the operator | interactive |
+ * | `run --prompt` (or `--input-file`), `runs resume --prompt` | run |
+ * | `run` otherwise and `runs resume` without `--prompt`: the REPL, whose person at the keyboard is the operator | interactive |
  * | `eval` on its run path, and `eval suite` | run |
  * | `flywheel run`, `optimize`, `dream run` (and a bare `dream <spec>`) | run |
  * | `serve`, `dev` | start |
  *
+ * `runs resume` is gated exactly as `run`: only the REPL (no `--prompt`) is interactive.
+ * A flag a later change adds that resumes without a person at the keyboard must take the
+ * run mode, and be added to this gate's tests.
+ *
  * `daemon submit` checks inside its own verb, and `daemon start|restart` are refused by
- * the supervisor itself. Not gated: `loadtest`, `runs resume`, a `--help` call, and the
- * read-only `eval` branches (`coverage`, `plan`, `leaderboard`, and the report aliases),
- * which this mirrors from the dispatch exactly, its is-it-a-spec-file guard included.
+ * the supervisor itself. Not gated: `loadtest`, the other `runs` sub-verbs, a `--help`
+ * call, and the read-only `eval` branches (`coverage`, `plan`, `leaderboard`, and the
+ * report aliases), which this mirrors from the dispatch exactly, its is-it-a-spec-file
+ * guard included.
  *
  * The flags that decide (`--help`, `--prompt`, `--ignore-pause`) are read the way the
  * dispatch reads them: the verb's own schema parses the same argv slice the dispatch
@@ -51,6 +57,7 @@ import {
   EVAL_SUITE_SCHEMA,
   FLYWHEEL_SCHEMA,
   OPTIMIZE_SCHEMA,
+  RUNS_SCHEMA,
   RUN_SCHEMA,
   SERVE_SCHEMA,
 } from "./arg-schemas";
@@ -103,6 +110,21 @@ function gatedBranch(subcommand: string, rest: readonly string[], cwd: string): 
             ? "run"
             : "interactive",
       };
+    case "runs":
+      // `runs resume` follows `run`: a prompt is a turn with no one at the keyboard; without
+      // one it is the REPL. An argv that does not parse (an `--input-file`, say) takes the
+      // stricter mode. A flag a later change adds that resumes without a person at the
+      // keyboard must take the run mode here, and be added to this gate's tests.
+      return rest[0] === "resume"
+        ? {
+            schema: RUNS_SCHEMA,
+            argv: rest.slice(1),
+            mode: (parsed) =>
+              parsed === undefined || typeof parsed.flags["prompt"] === "string"
+                ? "run"
+                : "interactive",
+          }
+        : undefined;
     case "eval": {
       const first = rest[0] ?? "";
       if (first === "coverage") return undefined;
@@ -240,9 +262,25 @@ function suiteSpecs(parsed: ParsedArgs, cwd: string): readonly string[] {
 }
 
 /**
- * The directories, other than `cwd`, of the specs a gated verb runs: the spec it is given
- * as its first positional (for `flywheel run`, the default `crewhaus.yaml` it runs when it
- * is given none), or for `eval suite` the specs {@link suiteSpecs} names, each
+ * The specs a gated verb runs, as it names them: its first positional (for `flywheel run`,
+ * the default `crewhaus.yaml` when it names none), for `runs resume` its `--spec` (else
+ * the `crewhaus.yaml` it resumes with; its positional is the session or run, never a
+ * spec), or for `eval suite` the specs {@link suiteSpecs} names.
+ */
+function specsOf(branch: Gated, parsed: ParsedArgs, cwd: string): readonly (string | undefined)[] {
+  if (branch.schema === EVAL_SUITE_SCHEMA) return suiteSpecs(parsed, cwd);
+  if (branch.schema === RUNS_SCHEMA) {
+    const spec = parsed.flags["spec"];
+    return [typeof spec === "string" && spec !== "" ? spec : "crewhaus.yaml"];
+  }
+  // `flywheel run` runs the working directory's `crewhaus.yaml` when it names none.
+  return [
+    parsed.positional[0] ?? (branch.schema === FLYWHEEL_SCHEMA ? "crewhaus.yaml" : undefined),
+  ];
+}
+
+/**
+ * The directories, other than `cwd`, of the specs a gated verb runs ({@link specsOf}), each
  * where it is named and, when it can be followed, where it really is. Empty when the
  * verb's own schema refuses its argv.
  */
@@ -251,11 +289,7 @@ function specDirsOf(subcommand: string, rest: readonly string[], cwd: string): r
   if (branch === undefined) return [];
   const parsed = parsedFor(branch);
   if (parsed === undefined) return [];
-  // `flywheel run` runs the working directory's `crewhaus.yaml` when it names none.
-  const specs =
-    branch.schema === EVAL_SUITE_SCHEMA
-      ? suiteSpecs(parsed, cwd)
-      : [parsed.positional[0] ?? (branch.schema === FLYWHEEL_SCHEMA ? "crewhaus.yaml" : undefined)];
+  const specs = specsOf(branch, parsed, cwd);
   const here = resolve(cwd);
   const dirs: string[] = [];
   for (const spec of specs) {

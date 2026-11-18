@@ -1,0 +1,46 @@
+{
+  "name": "@crewhaus/run-inspect",
+  "version": "0.8.3",
+  "type": "module",
+  "description": "Explains a run from its records: pure folds over a run's session log, run rows and decision log into a summary, a timeline, a span tree, why a step happened and the context each model call got, each field saying how it is known",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
+    "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/feedback-distill": "workspace:*",
+    "@crewhaus/session-store": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/spec-patch": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/run-inspect"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/run-inspect#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

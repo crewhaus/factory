@@ -107,6 +107,7 @@
         "@crewhaus/regression-runner": "workspace:*",
         "@crewhaus/routing-store": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/run-inspect": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
         "@crewhaus/sandbox-image-registry": "workspace:*",
@@ -1904,6 +1905,20 @@
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
+      },
+    },
+    "packages/run-inspect": {
+      "name": "@crewhaus/run-inspect",
+      "version": "0.8.3",
+      "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/spec-patch": "workspace:*",
       },
     },
     "packages/runtime-core": {
@@ -4410,6 +4425,8 @@
     "@crewhaus/rules-engine": ["@crewhaus/rules-engine@workspace:packages/rules-engine"],
 
     "@crewhaus/run-context": ["@crewhaus/run-context@workspace:packages/run-context"],
+
+    "@crewhaus/run-inspect": ["@crewhaus/run-inspect@workspace:packages/run-inspect"],
 
     "@crewhaus/runtime-core": ["@crewhaus/runtime-core@workspace:packages/runtime-core"],
 

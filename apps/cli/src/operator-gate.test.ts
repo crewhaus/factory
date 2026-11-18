@@ -64,6 +64,8 @@ function gate(dir: string, argv: readonly string[]): { exit?: number; out: strin
 const ROWS: ReadonlyArray<{ readonly argv: readonly string[]; readonly mode: string }> = [
   { argv: ["run", "crewhaus.yaml", "--prompt", "x"], mode: "run" },
   { argv: ["run", "crewhaus.yaml"], mode: "interactive" },
+  { argv: ["runs", "resume", "sess_x", "--prompt", "x"], mode: "run" },
+  { argv: ["runs", "resume", "sess_x"], mode: "interactive" },
   { argv: ["eval", "crewhaus.yaml", "--dataset", "d"], mode: "run" },
   { argv: ["eval", "suite", "suite.yaml"], mode: "run" },
   { argv: ["flywheel", "run"], mode: "run" },
@@ -93,7 +95,7 @@ describe("entryPointMode", () => {
     }
   });
 
-  test("the read verbs, init, status, loadtest, runs resume and --help are not gated", () => {
+  test("the read verbs, init, status, loadtest, the other runs verbs and --help are not gated", () => {
     const dir = harness("disabled");
     for (const argv of [
       ["eval", "coverage"],
@@ -106,7 +108,10 @@ describe("entryPointMode", () => {
       ["dream", "status", "crewhaus.yaml"],
       ["dream", "init", "crewhaus.yaml"],
       ["loadtest", "crewhaus.yaml"],
-      ["runs", "resume", "sess_x"],
+      ["runs", "inspect", "run_00000000000000000000000001"],
+      ["runs", "list"],
+      ["runs", "resume", "--help"],
+      ["runs", "resume", "sess_x", "--prompt", "x", "-h"],
       ["eval", "crewhaus.yaml", "--help"],
       ["run", "crewhaus.yaml", "--prompt", "x", "-h"],
       ["compile", "crewhaus.yaml"],
@@ -222,6 +227,68 @@ describe("gateEntryPoint", () => {
       expect(argv[0]).toBe(target === "flywheel" ? "flywheel" : "eval");
       expect(gate(dir, argv).exit).toBe(38);
     }
+  });
+});
+
+describe("runs resume follows the operator record exactly as run does", () => {
+  const NOTICE = "Running although new work is paused (--ignore-pause).\n";
+  const DISABLED =
+    "gate-fixture is disabled by its operator, so this doesn't run. `crewhaus daemon enable` allows it again.\n";
+
+  test("disabled: refused with or without --prompt", () => {
+    const dir = harness("disabled");
+    expect(gate(dir, ["runs", "resume", "sess_x", "--prompt", "x"])).toEqual({
+      exit: 38,
+      out: DISABLED,
+    });
+    expect(gate(dir, ["runs", "resume", "sess_x"])).toEqual({ exit: 38, out: DISABLED });
+    expect(gate(dir, ["runs", "resume", "sess_x", "--prompt", "x", "--ignore-pause"]).exit).toBe(
+      38,
+    );
+  });
+
+  test("paused: a --prompt turn exits 39 unless --ignore-pause, which prints the notice; the REPL runs", () => {
+    const dir = harness("paused");
+    const refused = gate(dir, ["runs", "resume", "sess_x", "--prompt", "x"]);
+    expect(refused.exit).toBe(39);
+    expect(refused.out).toBe(
+      "New work is paused on gate-fixture. `crewhaus daemon resume` reopens it, or pass --ignore-pause to run this once.\n",
+    );
+    expect(gate(dir, ["runs", "resume", "sess_x", "--prompt", "x", "--ignore-pause"])).toEqual({
+      out: NOTICE,
+    });
+    expect(gate(dir, ["runs", "resume", "sess_x"])).toEqual({ out: "" });
+    // --ignore-pause read as the verb reads it: a prompt's value is not the flag.
+    expect(gate(dir, ["runs", "resume", "sess_x", "--prompt", "--ignore-pause"]).exit).toBe(39);
+    // An argv the verb's parser refuses takes the stricter mode.
+    expect(gate(dir, ["runs", "resume", "sess_x", "--input-file", "in.txt"]).exit).toBe(39);
+  });
+
+  test("its --spec directory is checked as well as the working directory, through a link too", () => {
+    const disabled = harness("disabled");
+    const cwd = harness("absent");
+    const spec = join(disabled, "crewhaus.yaml");
+    expect(gate(cwd, ["runs", "resume", "sess_x", "--spec", spec, "--prompt", "x"])).toEqual({
+      exit: 38,
+      out: DISABLED,
+    });
+    expect(gate(cwd, ["runs", "resume", "sess_x", "--spec", spec]).exit).toBe(38);
+    expect(gate(cwd, ["runs", "resume", "sess_x", "--spec", relative(cwd, spec)]).exit).toBe(38);
+    symlinkSync(spec, join(cwd, "linked.yaml"));
+    expect(gate(cwd, ["runs", "resume", "sess_x", "--spec", "linked.yaml"]).exit).toBe(38);
+    // The session or run id is never read as a spec.
+    expect(gate(cwd, ["runs", "resume", spec, "--prompt", "x"])).toEqual({ out: "" });
+    // The default spec is the working directory's crewhaus.yaml, wherever it leads.
+    const viaDefault = harness("absent");
+    rmSync(join(viaDefault, "crewhaus.yaml"));
+    symlinkSync(spec, join(viaDefault, "crewhaus.yaml"));
+    expect(gate(viaDefault, ["runs", "resume", "sess_x"]).exit).toBe(38);
+  });
+
+  test("help and the read-only runs verbs are not gated on a disabled harness", () => {
+    const dir = harness("disabled");
+    expect(gate(dir, ["runs", "resume", "--help"])).toEqual({ out: "" });
+    expect(gate(dir, ["runs", "inspect", "run_00000000000000000000000001"])).toEqual({ out: "" });
   });
 });
 
@@ -369,4 +436,31 @@ describe("the crewhaus binary", () => {
     expect(linked.exitCode).toBe(38);
     expect(linked.stderr).toContain("is disabled by its operator");
   }, 20_000); // six CLI subprocesses, each loading the whole entry file
+
+  test("runs resume exits 38 when disabled, with or without --prompt; 39 when paused, and --ignore-pause gets past the gate", async () => {
+    const session = "sess_0123456789abcdef";
+    const disabled = harness("disabled");
+    for (const argv of [
+      ["runs", "resume", session, "--prompt", "x"],
+      ["runs", "resume", session],
+    ]) {
+      const got = await cli(disabled, argv);
+      expect([argv.join(" "), got.exitCode]).toEqual([argv.join(" "), 38]);
+      expect(got.stderr).toContain("is disabled by its operator");
+    }
+    const paused = harness("paused");
+    const refused = await cli(paused, ["runs", "resume", session, "--prompt", "x"]);
+    expect(refused.exitCode).toBe(39);
+    expect(refused.stderr).toContain("New work is paused on gate-fixture.");
+    const ignored = await cli(paused, [
+      "runs",
+      "resume",
+      session,
+      "--prompt",
+      "x",
+      "--ignore-pause",
+    ]);
+    expect(ignored.stderr).toContain("Running although new work is paused (--ignore-pause).");
+    expect(ignored.exitCode).not.toBe(39);
+  }, 20_000); // four CLI subprocesses, each loading the whole entry file
 });

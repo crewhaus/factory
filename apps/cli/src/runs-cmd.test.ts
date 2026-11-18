@@ -266,6 +266,26 @@ describe("crewhaus runs list, show and create", () => {
   });
 });
 
+describe("crewhaus runs inspect: the family row", () => {
+  test("--help prints the family's usage, which names inspect and its flags", async () => {
+    const out = await runRunsCommand(["inspect", "--help"], { env, cwd: dir });
+    expect(out.exitCode).toBe(0);
+    const usage = out.lines.join("\n");
+    expect(usage).toContain("crewhaus runs inspect <run|session>");
+    expect(usage).toContain("--timeline key|full");
+    expect(usage).toContain("[--ignore-pause]");
+    expect(out.lines).toEqual((await runRunsCommand(["--help"], { env, cwd: dir })).lines);
+  });
+
+  test("an unknown flag is refused, naming the flags inspect takes", async () => {
+    await expect(
+      runRunsCommand(["inspect", mintRunId(), "--full"], { env, cwd: dir }),
+    ).rejects.toThrow(
+      'runs inspect: unknown flag "--full" (expected: --harness, --run, --timeline, --why, --context, --limit, --before, --json)',
+    );
+  });
+});
+
 describe("crewhaus run --input-file: the input record", () => {
   const EXECUTION = "run_00000000000000cc";
   function record(runId: string, body: Record<string, unknown> = {}): string {

@@ -256,6 +256,7 @@
     { "path": "./packages/report-writer" },
     { "path": "./packages/routing-store" },
     { "path": "./packages/run-context" },
+    { "path": "./packages/run-inspect" },
     { "path": "./packages/session-store" },
     { "path": "./packages/smoke-harness" },
     { "path": "./packages/state-store" },
