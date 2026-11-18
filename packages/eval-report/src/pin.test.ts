@@ -379,6 +379,93 @@ describe("a pin over a changed protected criterion needs the owner, on every pat
     expect(asked).toBe(1);
   });
 
+  test("the mark names the principal that allowed it, and only when the check names one", () => {
+    const root = newTempRoot();
+    pinRun(guarded("run_a", "d1"), "t1", root);
+    const named = pinRun(guarded("run_b", "d2"), "t2", root, {
+      cmd: "test",
+      ownerCheck: () => ({ ok: true, principal: "prn_x" }),
+    });
+    expect(named.ok && named.pin.rebaselined).toEqual({
+      from: "run_a",
+      reason: "manual",
+      cmd: "test",
+      protectedChange: true,
+      by: "prn_x",
+    });
+    expect(
+      readBaselines(root)[baselineKeyFor(lineageOfEntry(guarded("run_b", "d2")))]?.rebaselined,
+    ).toEqual({ from: "run_a", reason: "manual", cmd: "test", protectedChange: true, by: "prn_x" });
+    const unnamed = pinRun(guarded("run_c", "d3"), "t3", root, {
+      cmd: "test",
+      ownerCheck: () => ({ ok: true }),
+    });
+    expect(unnamed.ok && unnamed.pin.rebaselined).toEqual({
+      from: "run_b",
+      reason: "manual",
+      cmd: "test",
+      protectedChange: true,
+    });
+  });
+
+  test("a caller's own re-anchor mark keeps its fields and gains the allowing principal", () => {
+    const root = newTempRoot();
+    pinRun(guarded("run_a", "d1"), "t1", root);
+    const outcome = pinRun(guarded("run_b", "d2"), "t2", root, {
+      rebaselined: {
+        from: "run_a",
+        reason: "cases-changed",
+        cmd: "crewhaus eval",
+        receipt: "cmd_1",
+      },
+      ownerCheck: () => ({ ok: true, principal: "prn_x" }),
+    });
+    expect(outcome.ok && outcome.pin.rebaselined).toEqual({
+      from: "run_a",
+      reason: "cases-changed",
+      cmd: "crewhaus eval",
+      receipt: "cmd_1",
+      protectedChange: true,
+      by: "prn_x",
+    });
+  });
+
+  test("a later row of the pinned run that records another protected digest needs the owner", () => {
+    const root = newTempRoot();
+    expect(pinRun(guarded("run_a", "d1"), "t1", root).ok).toBe(true);
+    const before = readFileSync(join(root, BASELINES_FILENAME), "utf8");
+    let asked = 0;
+    const refused = pinRun(guarded("run_a", "d2"), "t2", root, {
+      cmd: "test",
+      ownerCheck: () => {
+        asked += 1;
+        return { ok: false, reason: "not the owner" };
+      },
+    });
+    expect(asked).toBe(1);
+    expect(!refused.ok && refused.refusal.code).toBe("protected");
+    expect(!refused.ok && refused.refusal.reason).toContain(
+      "protected criterion dates is measured differently",
+    );
+    expect(readFileSync(join(root, BASELINES_FILENAME), "utf8")).toBe(before);
+    const allowed = pinRun(guarded("run_a", "d2"), "t3", root, {
+      cmd: "test",
+      ownerCheck: () => ({ ok: true, principal: "prn_x" }),
+    });
+    expect(allowed.ok && allowed.pin.rebaselined).toEqual({
+      from: "run_a",
+      reason: "manual",
+      cmd: "test",
+      protectedChange: true,
+      by: "prn_x",
+    });
+    // The same row again changes nothing protected, so it needs nobody.
+    const same = pinRun(guarded("run_a", "d2"), "t4", root, {
+      ownerCheck: () => ({ ok: false, reason: "never asked" }),
+    });
+    expect(same.ok).toBe(true);
+  });
+
   test("a plan that names the pin it replaces is refused the same way", () => {
     const replaced = pinFromIndexEntry(guarded("run_a", "d1"), "t1");
     if (!replaced.ok) throw new Error("expected a pin");

@@ -310,6 +310,7 @@ export {
   pinBaseline,
   pinSession,
   readPins,
+  type PinBaselineAuthorizer,
   type PinBaselineResult,
   type PinSessionResult,
 } from "./actions";

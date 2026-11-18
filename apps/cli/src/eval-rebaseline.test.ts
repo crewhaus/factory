@@ -3,10 +3,25 @@
  * refusals the CLI makes before any dataset load or model spend.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REBASELINE_CMD, REBASELINE_REASONS, parseRebaseline } from "./eval-rebaseline";
+import { governedHome, project, removeGovernedDirs } from "./__test__/governed";
+import {
+  REBASELINE_CMD,
+  REBASELINE_REASONS,
+  parseRebaseline,
+  reanchorDirRefusal,
+} from "./eval-rebaseline";
 
 const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 const REPO_ROOT = join(import.meta.dir, "../../..");
@@ -21,6 +36,7 @@ function newTempRoot(): string {
 }
 afterAll(() => {
   for (const dir of TMP_ROOTS) rmSync(dir, { recursive: true, force: true });
+  removeGovernedDirs();
 });
 
 const SPAWN_CWD = newTempRoot();
@@ -28,9 +44,10 @@ const REGISTRY_ROOT = newTempRoot();
 
 async function runCli(
   args: ReadonlyArray<string>,
+  cwd: string = SPAWN_CWD,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
-    cwd: SPAWN_CWD,
+    cwd,
     env: {
       PATH: process.env["PATH"] ?? "",
       CREWHAUS_REGISTRY_ROOT: join(REGISTRY_ROOT, "registry"),
@@ -134,6 +151,65 @@ describe("crewhaus eval --rebaseline — refused before anything runs", () => {
       const got = await runCli(["eval", "--voice", ...args]);
       expect(got.exitCode).toBe(1);
       expect(got.stderr).toContain(`--voice does not support ${args[0]}`);
+    }
+  }, 20_000);
+});
+
+describe("a re-anchor runs from the spec's own directory, whose eval history it writes", () => {
+  test("the spec's directory, or a link to it, may re-anchor; any other directory may not", () => {
+    const harness = realpathSync(newTempRoot());
+    writeFileSync(join(harness, "crewhaus.yaml"), "name: shop\n");
+    const elsewhere = realpathSync(newTempRoot());
+    const link = join(elsewhere, "to-harness");
+    symlinkSync(harness, link);
+    expect(reanchorDirRefusal("crewhaus.yaml", harness, "--rebaseline")).toBeUndefined();
+    expect(reanchorDirRefusal("crewhaus.yaml", link, "--rebaseline")).toBeUndefined();
+    // The spec named from another directory, or a link to it in another directory.
+    const linked = join(elsewhere, "crewhaus.yaml");
+    symlinkSync(join(harness, "crewhaus.yaml"), linked);
+    for (const [spec, cwd] of [
+      [join(harness, "crewhaus.yaml"), elsewhere],
+      [linked, harness],
+      ["crewhaus.yaml", join(harness, "missing")],
+    ] as const) {
+      for (const flag of ["--rebaseline", "--regrade-baseline"] as const) {
+        const refused = reanchorDirRefusal(spec, cwd, flag);
+        expect(refused).toContain(`${flag} re-anchors the baseline in the eval history`);
+        expect(refused).toContain("runs from the spec's own directory");
+      }
+    }
+  });
+
+  test("from a governed harness, a spec outside it is refused before anything runs, and the pins keep their bytes", async () => {
+    const home = await governedHome({ username: "owner", hostname: "elsewhere.invalid" });
+    const harness = realpathSync(newTempRoot());
+    copyFileSync(HELLO_SPEC, join(harness, "crewhaus.yaml"));
+    project(harness, home.owner, [], home.hangarRoot);
+    const evalsDir = join(harness, ".crewhaus", "evals");
+    mkdirSync(evalsDir, { recursive: true });
+    const pins = `${JSON.stringify({ "hello::smoke": { runId: "run_0000000000000001" } })}\n`;
+    writeFileSync(join(evalsDir, "baselines.json"), pins);
+    const outside = realpathSync(newTempRoot());
+    copyFileSync(HELLO_SPEC, join(outside, "crewhaus.yaml"));
+    for (const flags of [
+      ["--rebaseline", "--reason", "instrument-changed"],
+      ["--regrade-baseline"],
+    ]) {
+      const got = await runCli(
+        [
+          "eval",
+          join(outside, "crewhaus.yaml"),
+          "--dataset",
+          "d.jsonl",
+          "--graders",
+          "g.yaml",
+          ...flags,
+        ],
+        harness,
+      );
+      expect(got.exitCode).toBe(1);
+      expect(got.stderr).toContain(`${flags[0]} re-anchors the baseline in the eval history`);
+      expect(readFileSync(join(evalsDir, "baselines.json"), "utf8")).toBe(pins);
     }
   }, 20_000);
 });

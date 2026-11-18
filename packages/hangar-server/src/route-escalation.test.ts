@@ -1205,3 +1205,98 @@ describe("who a record names as its actor", () => {
     }
   }, 20_000);
 });
+
+describe("a baseline pin that changes a protected criterion", () => {
+  const OLD = "run_00000000000000e1";
+  const NEW = "run_00000000000000e2";
+  const SAME = "run_00000000000000e3";
+
+  /** Seed the harness's eval index, one row per `[runId, digest]` of protected criterion `dates`. */
+  function seedIndex(h: Home, rows: ReadonlyArray<readonly [string, string]>): string {
+    const evalsDir = join(h.dir, ".crewhaus", "evals");
+    mkdirSync(evalsDir, { recursive: true });
+    const lines = rows.map(([runId, digest]) =>
+      JSON.stringify({
+        runId,
+        specName: "escalation-fixture",
+        specHash: "h",
+        datasetName: "smoke",
+        datasetHash: "d",
+        passRate: 1,
+        meanScore: 1,
+        sampleCount: 1,
+        protectedCriteria: [{ id: "dates", digest }],
+        ts: "2026-11-01T00:00:00.000Z",
+        outDir: join(evalsDir, runId),
+      }),
+    );
+    writeFileSync(join(evalsDir, "index.jsonl"), `${lines.join("\n")}\n`);
+    return evalsDir;
+  }
+  const pinsOf = (evalsDir: string): string =>
+    readFileSync(join(evalsDir, "baselines.json"), "utf8");
+
+  test("needs the security permission; the typed name only confirms, and the pin names who allowed it", async () => {
+    const h = await home();
+    const maintainer = await h.member("maintainer");
+    const evalsDir = seedIndex(h, [
+      [OLD, "d1"],
+      [NEW, "d2"],
+    ]);
+    const route = `/api/h/${h.id}/evals/baseline`;
+    expect((await call(h, h.owner, "POST", route, { runId: OLD })).status).toBe(200);
+    const pins = pinsOf(evalsDir);
+
+    // A maintainer: 403 naming the permission, with or without the typed name.
+    for (const body of [{ runId: NEW }, { runId: NEW, confirmName: "escalation-fixture" }]) {
+      const refused = await call(h, maintainer.headers, "POST", route, body);
+      expect(refused.status).toBe(403);
+      expect([
+        refused.body["code"],
+        refused.body["reason"],
+        refused.body["needs"],
+        refused.body["role"],
+      ]).toEqual(["forbidden", "permission", "h.spec.edit.security", "maintainer"]);
+      expect(pinsOf(evalsDir)).toBe(pins);
+    }
+
+    // The owner: the typed-name interstitial, then the pin once the name matches.
+    const asked = await call(h, h.owner, "POST", route, { runId: NEW });
+    expect(asked.status).toBe(409);
+    expect([asked.body["needs"], asked.body["confirmName"]]).toEqual([
+      "h.spec.edit.security",
+      "escalation-fixture",
+    ]);
+    expect(pinsOf(evalsDir)).toBe(pins);
+    const confirmed = await call(h, h.owner, "POST", route, {
+      runId: NEW,
+      confirmName: "escalation-fixture",
+    });
+    expect(confirmed.status).toBe(200);
+    const baseline = confirmed.body["baseline"] as Record<string, unknown>;
+    expect(baseline["runId"]).toBe(NEW);
+    expect(baseline["rebaselined"]).toMatchObject({
+      cmd: "hangar",
+      protectedChange: true,
+      by: h.ownerId,
+    });
+  });
+
+  test("a pin that changes no protected criterion needs only the quality permission", async () => {
+    const h = await home();
+    const maintainer = await h.member("maintainer");
+    seedIndex(h, [
+      [OLD, "d1"],
+      [SAME, "d1"],
+    ]);
+    const route = `/api/h/${h.id}/evals/baseline`;
+    // A lineage with no pin yet, then a run measured with the same protected criteria.
+    for (const runId of [OLD, SAME]) {
+      const pinned = await call(h, maintainer.headers, "POST", route, { runId });
+      expect(pinned.status).toBe(200);
+      const baseline = pinned.body["baseline"] as Record<string, unknown>;
+      expect(baseline["runId"]).toBe(runId);
+      expect(baseline["rebaselined"]).toBeUndefined();
+    }
+  });
+});

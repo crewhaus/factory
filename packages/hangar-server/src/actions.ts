@@ -130,7 +130,17 @@ export type PinBaselineResult =
   | { readonly outcome: "ok"; readonly baseline: BaselineEntry }
   | { readonly outcome: "rejected"; readonly reason: string }
   /** The pin changes a protected criterion: the owner confirms with the spec's name. */
-  | { readonly outcome: "needs_owner"; readonly reason: string; readonly confirmName: string };
+  | { readonly outcome: "needs_owner"; readonly reason: string; readonly confirmName: string }
+  /** The pin changes a protected criterion, and the caller may not make that change. */
+  | { readonly outcome: "forbidden"; readonly reason: string };
+
+/**
+ * Whether the request's caller may re-anchor over a protected criterion on this
+ * harness, and who they are, for the pin's record.
+ */
+export type PinBaselineAuthorizer = () =>
+  | { readonly allow: true; readonly principal?: string }
+  | { readonly allow: false };
 
 /**
  * Re-pin the eval baseline to an existing run of THIS harness. The entry is
@@ -139,8 +149,12 @@ export type PinBaselineResult =
  * ones the run was measured under.
  *
  * A pin that changes a protected criterion the replaced pin was measured with
- * is the owner's: it is refused (`needs_owner`) until the request carries the
- * typed confirmation, the run's spec name, and then marked `protectedChange`.
+ * (its digest moved, or it is gone or unprotected, as the run index records
+ * them) is the owner's. `authorize` is asked first, and only for such a pin: a caller
+ * it does not allow is refused (`forbidden`) and nothing is written, whatever
+ * the request carries. An allowed caller is asked (`needs_owner`) for the typed
+ * confirmation, the run's spec name, which only confirms the change; the pin is
+ * then marked `protectedChange`, naming the principal `authorize` gave as `by`.
  */
 export function pinBaseline(args: {
   readonly harnessDir: string;
@@ -148,6 +162,8 @@ export function pinBaseline(args: {
   readonly nowIso: string;
   /** The typed confirmation for a pin that changes a protected criterion. */
   readonly confirmName?: string;
+  /** Whether the caller may make a pin that changes a protected criterion. */
+  readonly authorize: PinBaselineAuthorizer;
 }): PinBaselineResult {
   const evalsDir = resolveInside(args.harnessDir, [".crewhaus", "evals"]);
   if (evalsDir === undefined) {
@@ -171,14 +187,27 @@ export function pinBaseline(args: {
     };
   }
   let pinned: ReturnType<typeof pinRun>;
+  let forbidden = false;
+  const forbiddenReason =
+    "re-anchoring over a protected criterion needs the security edit permission on this harness";
   try {
     const specName = run.specName;
     pinned = pinRun(run, args.nowIso, evalsDir, {
       cmd: "hangar",
-      ownerCheck: () =>
-        args.confirmName === specName
-          ? { ok: true }
-          : { ok: false, reason: `confirm with the spec's name, "${specName}"` },
+      ownerCheck: () => {
+        // The permission decides; the typed name only confirms.
+        const verdict = args.authorize();
+        if (!verdict.allow) {
+          forbidden = true;
+          return { ok: false, reason: forbiddenReason };
+        }
+        if (args.confirmName !== specName) {
+          return { ok: false, reason: `confirm with the spec's name, "${specName}"` };
+        }
+        return verdict.principal !== undefined
+          ? { ok: true, principal: verdict.principal }
+          : { ok: true };
+      },
     });
   } catch (err) {
     // eval-report refuses a pin file that is a link, a FIFO or not a JSON
@@ -187,6 +216,7 @@ export function pinBaseline(args: {
     if (err instanceof ReportError) return { outcome: "rejected", reason: err.message };
     throw err;
   }
+  if (forbidden) return { outcome: "forbidden", reason: forbiddenReason };
   if (!pinned.ok) {
     return pinned.refusal.code === "protected"
       ? { outcome: "needs_owner", reason: pinned.refusal.reason, confirmName: run.specName }

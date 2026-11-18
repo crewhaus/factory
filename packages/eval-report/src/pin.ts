@@ -165,10 +165,12 @@ export function pinFromIndexEntry(
   const refusal = pinRefusal(entry, opts);
   if (refusal !== undefined) return { ok: false, refusal };
   // A protected criterion the replaced pin was measured with, changed here,
-  // is the owner's to re-anchor over, whichever path pins.
+  // is the owner's to re-anchor over, whichever path pins, and whichever row
+  // of a run it is: a later row of the pinned run that records other digests
+  // changes them just the same.
   const replaced = opts.replaced;
   const moved =
-    replaced !== undefined && replaced.runId !== entry.runId
+    replaced !== undefined
       ? protectedDigestChanges(replaced.protectedCriteria, entry.protectedCriteria)
       : [];
   let rebaselined = opts.rebaselined;
@@ -189,6 +191,7 @@ export function pinFromIndexEntry(
     rebaselined = {
       ...(rebaselined ?? { from: replaced?.runId, reason: "manual", cmd: opts.cmd ?? "unknown" }),
       protectedChange: true,
+      ...(check.principal !== undefined ? { by: check.principal } : {}),
     };
   }
   return {

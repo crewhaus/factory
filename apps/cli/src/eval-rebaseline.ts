@@ -7,6 +7,8 @@
  * Side-effect-free, so the unit tests drive it directly; `index.ts` dies with
  * the refusal.
  */
+import { realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import type { RebaselineReason } from "@crewhaus/eval-report";
 
 /** The codes `--reason` takes. */
@@ -67,4 +69,30 @@ export function parseRebaseline(flags: Readonly<Record<string, unknown>>): Rebas
     }
   }
   return { ok: true, rebaseline: { reason: reason as CliRebaselineReason, cmd: REBASELINE_CMD } };
+}
+
+/**
+ * Why a re-anchor (`--rebaseline` or `--regrade-baseline`, named by `flag`) of
+ * the spec at `specPath` is refused from `cwd`, or `undefined` when it may run:
+ * the run history it re-anchors is the one under the working directory, so the
+ * working directory must be the spec's own (links resolved). The owner check,
+ * the receipt and the pin then all bind to that one harness.
+ */
+export function reanchorDirRefusal(
+  specPath: string,
+  cwd: string,
+  flag: "--rebaseline" | "--regrade-baseline",
+): string | undefined {
+  const specDir = dirname(resolve(cwd, specPath));
+  const realOf = (dir: string): string | undefined => {
+    try {
+      return realpathSync(dir);
+    } catch {
+      return undefined;
+    }
+  };
+  const here = realOf(cwd);
+  const there = realOf(specDir);
+  if (here !== undefined && here === there) return undefined;
+  return `${flag} re-anchors the baseline in the eval history of the directory it runs in, so it runs from the spec's own directory: cd ${specDir}`;
 }
