@@ -36,6 +36,7 @@ import shapesJs from "../../assets/js/shapes.js" with { type: "text" };
 import shellJs from "../../assets/js/shell.js" with { type: "text" };
 import signInJs from "../../assets/js/sign-in.js" with { type: "text" };
 import supervisionJs from "../../assets/js/supervision.js" with { type: "text" };
+import badgesUiJs from "../../assets/js/ui/badges.js" with { type: "text" };
 import chartUiJs from "../../assets/js/ui/chart.js" with { type: "text" };
 import conflictUiJs from "../../assets/js/ui/conflict.js" with { type: "text" };
 import dialogUiJs from "../../assets/js/ui/dialog.js" with { type: "text" };
@@ -125,6 +126,7 @@ export const homeAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/sign-in.js": asset(signInJs, "sign-in.js"),
   "/assets/js/v1.js": asset(v1Js, "v1.js"),
   "/assets/js/supervision.js": asset(supervisionJs, "supervision.js"),
+  "/assets/js/ui/badges.js": asset(badgesUiJs, "badges.js"),
   "/assets/js/ui/chart.js": asset(chartUiJs, "chart.js"),
   "/assets/js/ui/conflict.js": asset(conflictUiJs, "conflict.js"),
   "/assets/js/ui/dialog.js": asset(dialogUiJs, "dialog.js"),

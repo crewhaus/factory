@@ -5878,6 +5878,18 @@
         },
         "fork": {
           "flags": []
+        },
+        "capabilities": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "shape",
+              "takesValue": true
+            }
+          ]
         }
       },
       "flags": null

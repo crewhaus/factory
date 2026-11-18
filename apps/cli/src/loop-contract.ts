@@ -5,8 +5,9 @@
  * tuning knobs) plus the compile-warning formatter. Side-effect-free so this
  * is unit-testable (the entry file runs an argv switch on import). The
  * codegen mirror lives in `@crewhaus/target-cli` (renderLimitsFields /
- * renderCompactionTuningFields / renderSpecHooks and the thinking/streaming/
- * rateLimits fields); keep the two in sync.
+ * renderSpecHooks and the thinking/streaming/rateLimits fields); keep the two
+ * in sync. The compaction options are not mirrored: both sides take them from
+ * runtime-core's twin (`@crewhaus/runtime-core/compaction-codegen`).
  *
  * Option-name contract (all real `RunChatLoopOptions` knobs — the return
  * type is a `Pick` over runtime-core's own options so a rename there fails
@@ -17,7 +18,8 @@
  * `limits.loop_detection` → `loopDetection`, `agent.thinking` → `thinking`,
  * `agent.rate_limits` → `rateLimits`, `compaction.threshold` →
  * `compactionThreshold`, `compaction.snip_keep_head`/`snip_keep_tail` →
- * `snipKeepHead`/`snipKeepTail`, (0.6.0 PR 9a) `agent.temperature` →
+ * `snipKeepHead`/`snipKeepTail`, `compaction.curate` (with its dials) →
+ * `curate`, (0.6.0 PR 9a) `agent.temperature` →
  * `temperature`, and (0.6.0 PR 8b) `evaluation:` →
  * `evaluation` — since 0.8.0 together with `provability:` → `provability`,
  * through {@link gateRunOptions}.
@@ -31,7 +33,6 @@ import {
 } from "@crewhaus/evaluation-service";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import type {
-  IrCompaction,
   IrEvaluation,
   IrHook,
   IrLimits,
@@ -47,6 +48,10 @@ import {
   wireModels,
 } from "@crewhaus/model-service";
 import type { RunChatLoopOptions } from "@crewhaus/runtime-core";
+import {
+  type CompactionSettings,
+  compactionRunOptions,
+} from "@crewhaus/runtime-core/compaction-codegen";
 
 /**
  * The loop-contract fragment spread into `runChatLoop(...)` — a `Pick` over
@@ -69,6 +74,7 @@ export type LoopContractRunOptions = Pick<
   | "compactionParams"
   | "snipKeepHead"
   | "snipKeepTail"
+  | "curate"
   | "evaluation"
 >;
 
@@ -82,10 +88,7 @@ export type LoopContractIrSlice = {
     readonly temperature?: number;
     readonly rateLimits?: IrRateLimits;
   };
-  readonly compaction?: Pick<
-    IrCompaction,
-    "threshold" | "snipKeepHead" | "snipKeepTail" | "params"
-  >;
+  readonly compaction?: CompactionSettings;
 };
 
 /** Valid `--ask-mode` values, mirroring `VALID_PERMISSION_MODES`. */
@@ -144,15 +147,20 @@ export function loopContractRunOptions(ir: LoopContractIrSlice): LoopContractRun
     ...(ir.agent?.thinking !== undefined ? { thinking: ir.agent.thinking } : {}),
     ...(ir.agent?.temperature !== undefined ? { temperature: ir.agent.temperature } : {}),
     ...(rateLimits !== undefined && Object.keys(rateLimits).length > 0 ? { rateLimits } : {}),
-    ...(compaction?.threshold !== undefined ? { compactionThreshold: compaction.threshold } : {}),
-    // 0.6.0 §4.2 — the compaction profile's pinned request params, honoured
-    // by `@crewhaus/compaction-autocompact`'s summarisation call. Mirror:
-    // the cli / channel-bot emitters render `compactionParams` beside
-    // `compactionModel`.
-    ...(compaction?.params !== undefined ? { compactionParams: compaction.params } : {}),
-    ...(compaction?.snipKeepHead !== undefined ? { snipKeepHead: compaction.snipKeepHead } : {}),
-    ...(compaction?.snipKeepTail !== undefined ? { snipKeepTail: compaction.snipKeepTail } : {}),
+    ...(compaction !== undefined ? compactionWithoutModel(compaction) : {}),
   };
+}
+
+/**
+ * The compaction options from runtime-core's twin (the same rule a compiled
+ * cli, channel or managed bundle renders), less `compactionModel`: both
+ * interpreter sites set that one themselves, beside the primary model.
+ */
+function compactionWithoutModel(
+  compaction: CompactionSettings,
+): Omit<ReturnType<typeof compactionRunOptions>, "compactionModel"> {
+  const { compactionModel: _model, ...rest } = compactionRunOptions(compaction);
+  return rest;
 }
 
 /**

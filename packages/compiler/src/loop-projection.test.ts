@@ -82,3 +82,28 @@ describe("projectLoop — structural invariants over the goldens", () => {
     ]);
   });
 });
+
+describe("projectLoop — the curated label shows only where curation runs", () => {
+  const updateSummary = (yaml: string): string => {
+    const projection = projectLoop(lower(parseSpec(yaml)));
+    const update = projection.ring?.segments.find((s) => s.id === "update");
+    expect(update).toBeDefined();
+    return update?.summary ?? "";
+  };
+
+  test("cli with curate: true says (curated)", () => {
+    expect(
+      updateSummary(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\ncompaction:\n  curate: true",
+      ),
+    ).toContain("compaction (curated)");
+  });
+
+  test("voice with curate: true does not", () => {
+    const summary = updateSummary(
+      "name: v\ntarget: voice\nagent: {model: m, instructions: i}\nvoice: {provider: openai}\ncompaction:\n  curate: true",
+    );
+    expect(summary).toContain("compaction");
+    expect(summary).not.toContain("(curated)");
+  });
+});

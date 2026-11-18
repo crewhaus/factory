@@ -228,6 +228,12 @@ export function normalizeRows(feed) {
       supervision: typeof src.supervision === "string" ? src.supervision : null,
       pendingApprovals: typeof src.pendingApprovals === "number" ? src.pendingApprovals : 0,
       capabilities: caps,
+      // What each declared badge does on the row's shape (an object keyed by
+      // badge), so the table can say which ones the shape does not use.
+      badgeSupport:
+        src.badgeSupport && typeof src.badgeSupport === "object" && !Array.isArray(src.badgeSupport)
+          ? src.badgeSupport
+          : {},
       budgeted: typeof src.budgeted === "boolean" ? src.budgeted : caps.includes("budget"),
       cachedAt:
         typeof src.cachedAt === "string"

@@ -29,6 +29,7 @@ import {
   type SessionEvents,
   payloadOf,
 } from "@crewhaus/harness-advice/advise-rules";
+import { SUPPORT_MANIFEST } from "@crewhaus/ir/support";
 import type { Spec } from "@crewhaus/spec";
 
 /** Default number of most-recent sessions the doctor report scans. */
@@ -62,6 +63,8 @@ export type ContextPressureReport = {
     readonly present: boolean;
     readonly maxTokens?: number;
     readonly compactionCurate?: boolean;
+    /** The spec's shape, when `compaction.curate` is on and that shape does not run it. */
+    readonly compactionCurateNotUsedOn?: string;
     readonly compactionDedupeThreshold?: number;
     readonly compactionRelevanceTopK?: number;
   };
@@ -166,6 +169,14 @@ export function buildContextPressureReport(
     typeof compactionBlock?.["relevanceTopK"] === "number"
       ? compactionBlock["relevanceTopK"]
       : undefined;
+  // Curation runs only on the shapes the support manifest says it is wired on.
+  const target = specField<string>(spec, "target");
+  const curateNotUsedOn =
+    curate === true &&
+    typeof target === "string" &&
+    SUPPORT_MANIFEST.features["compaction.curate"]?.cells[target]?.status !== "wired"
+      ? target
+      : undefined;
 
   // The SAME thresholds the advise rules fire on — when the report says
   // "tripped", `crewhaus advise` will emit a patch for it.
@@ -189,6 +200,7 @@ export function buildContextPressureReport(
       present: spec !== undefined,
       ...(maxTokens !== undefined ? { maxTokens } : {}),
       ...(curate !== undefined ? { compactionCurate: curate } : {}),
+      ...(curateNotUsedOn !== undefined ? { compactionCurateNotUsedOn: curateNotUsedOn } : {}),
       ...(dedupe !== undefined ? { compactionDedupeThreshold: dedupe } : {}),
       ...(topK !== undefined ? { compactionRelevanceTopK: topK } : {}),
     },
@@ -230,11 +242,13 @@ export function formatContextPressureLines(report: ContextPressureReport): strin
       }`,
     );
     const curate =
-      report.spec.compactionCurate === true
-        ? "on"
-        : report.spec.compactionCurate === false
-          ? "off (explicit)"
-          : "off (default)";
+      report.spec.compactionCurateNotUsedOn !== undefined
+        ? `not used on ${report.spec.compactionCurateNotUsedOn} harnesses`
+        : report.spec.compactionCurate === true
+          ? "on"
+          : report.spec.compactionCurate === false
+            ? "off (explicit)"
+            : "off (default)";
     const curatorKnobs = [
       ...(report.spec.compactionDedupeThreshold !== undefined
         ? [`dedupeThreshold ${report.spec.compactionDedupeThreshold}`]

@@ -5,6 +5,10 @@ import type { HookDef } from "@crewhaus/hooks-engine";
 import type { IrModelPool, IrProvability } from "@crewhaus/ir";
 import { modelWiringFragmentFromIr, wireModels } from "@crewhaus/model-service";
 import type { RunEvaluation } from "@crewhaus/runtime-core";
+import {
+  type CompactionSettings,
+  compactionRunOptions,
+} from "@crewhaus/runtime-core/compaction-codegen";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { collectCrewhausDeps } from "./bundle-manifest";
 import {
@@ -461,6 +465,39 @@ describe("loopContractRunOptions (loop contract 0.4, Batch A)", () => {
         compaction: { threshold: 0.8, snipKeepHead: 6, snipKeepTail: 30 },
       }),
     ).toEqual({ compactionThreshold: 0.8, snipKeepHead: 6, snipKeepTail: 30 });
+  });
+
+  test("curation reaches `crewhaus run` and `serve` as a compiled bundle renders it", () => {
+    expect(loopContractRunOptions({ compaction: { curate: true } })).toEqual({ curate: {} });
+    expect(loopContractRunOptions({ compaction: { curate: true, relevanceTopK: 4 } })).toEqual({
+      curate: { relevanceTopK: 4 },
+    });
+    expect(loopContractRunOptions({ compaction: { curate: false, relevanceTopK: 4 } })).toEqual({});
+  });
+
+  test("every compaction combination equals runtime-core's twin, less compactionModel", () => {
+    const values: Required<CompactionSettings> = {
+      model: "claude-haiku-4-5",
+      params: { maxTokens: 256 },
+      threshold: 0.7,
+      snipKeepHead: 2,
+      snipKeepTail: 8,
+      curate: true,
+      dedupeThreshold: 0.9,
+      relevanceTopK: 3,
+    };
+    const fields = Object.keys(values) as (keyof CompactionSettings)[];
+    let checked = 0;
+    for (let mask = 0; mask < 1 << fields.length; mask += 1) {
+      const c: Record<string, unknown> = {};
+      fields.forEach((field, bit) => {
+        if ((mask & (1 << bit)) !== 0) c[field] = values[field];
+      });
+      const { compactionModel: _model, ...expected } = compactionRunOptions(c);
+      expect(loopContractRunOptions({ compaction: c })).toEqual(expected);
+      checked += 1;
+    }
+    expect(checked).toBe(256);
   });
 });
 

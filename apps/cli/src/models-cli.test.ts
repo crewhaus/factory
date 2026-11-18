@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { lower } from "@crewhaus/compiler";
 import type { PricingTable, SunsetTable } from "@crewhaus/cost-tracker";
 import { DEFAULT_PRICING } from "@crewhaus/cost-tracker";
+import { SUPPORT_MANIFEST } from "@crewhaus/ir/support";
 import { parseSpec } from "@crewhaus/spec";
 import { enumerateModelSlots } from "./model-slots";
 import {
@@ -446,4 +447,29 @@ describe("the optional adapter imports are statically analysable (compiled-binar
       expect(manifest.optionalDependencies?.[pkg]).toBeDefined();
     }
   });
+});
+
+describe("SHAPE_MODEL_MATRIX agrees with the support manifest the compiler generates", () => {
+  const COLUMNS = [
+    ["cascade", "model_pool.strategy.cascade"],
+    ["guideShadow", "model_pool.strategy.guide"],
+    ["committee", "model_pool.strategy.committee"],
+    ["consultEscalate", "model_pool.strategy.model_directed"],
+  ] as const;
+
+  for (const shape of SUPPORT_MANIFEST.shapes) {
+    test(`${shape}: emit-wired cells are wired, the rest are not used or not accepted`, () => {
+      const row = SHAPE_MODEL_MATRIX[shape] as unknown as Record<string, string> | undefined;
+      expect(row, shape).toBeDefined();
+      for (const [column, feature] of COLUMNS) {
+        const said = row?.[column] as string;
+        const status = SUPPORT_MANIFEST.features[feature]?.cells[shape]?.status;
+        const expected = said.startsWith("emit-wired") ? ["wired"] : ["unwired", "rejected"];
+        expect(
+          `${column}: ${expected.includes(status as string)}`,
+          `${column} says "${said}", the compiler ${status}`,
+        ).toBe(`${column}: true`);
+      }
+    });
+  }
 });

@@ -12,7 +12,7 @@ import type { AreaModule } from "./types.js";
 
 // import { ATTENTION_MODULE } from "./attention.js";
 
-// import { COMPILER_MODULE } from "./compiler.js";
+import { COMPILER_MODULE } from "./compiler.js";
 
 import { CREATION_MODULE } from "./creation.js";
 
@@ -39,7 +39,7 @@ export const AREA_MODULES = [
 
   // ATTENTION_MODULE,
 
-  // COMPILER_MODULE,
+  COMPILER_MODULE,
 
   CREATION_MODULE,
 

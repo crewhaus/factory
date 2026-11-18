@@ -3,7 +3,7 @@
  * on this checkout, and each fails when seeded with the regression it catches.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DELTA_090_KEYS, type OwnerKey } from "@crewhaus/spec-patch";
@@ -105,10 +105,23 @@ describe("renderSubpathImportFindings", () => {
   const FILE = "packages/thing/src/render.ts";
   const ENTRY = { file: FILE, allow: ["@crewhaus/ir", "./types"], label: "render imports" };
 
-  test("the shipped list is empty, so a checkout has nothing to report", () => {
-    expect(RENDER_SUBPATH_IMPORTS).toEqual([]);
-    expect(renderSubpathImportFindings(REPO_ROOT)).toEqual([]);
-    expect(renderSubpathImportFindings(tree({}, false))).toEqual([]);
+  test("the shipped list holds the compaction codegen twin, and it passes on this checkout", () => {
+    expect(RENDER_SUBPATH_IMPORTS.map((entry) => entry.file)).toEqual([
+      "packages/runtime-core/src/compaction-codegen.ts",
+    ]);
+    const findings = renderSubpathImportFindings(REPO_ROOT);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.pass).toBe(true);
+    expect(findings[0]?.label).toBe("compaction codegen imports nothing");
+  });
+
+  test("a copy of the twin that imports anything fails", () => {
+    const file = "packages/runtime-core/src/compaction-codegen.ts";
+    const source = readFileSync(join(REPO_ROOT, file), "utf8");
+    const root = tree({ [file]: `import { readFileSync } from "node:fs";\n${source}` });
+    const [finding] = renderSubpathImportFindings(root);
+    expect(finding?.pass).toBe(false);
+    expect(finding?.reason).toContain("node:fs");
   });
 
   test("an import on the allow-list passes", () => {

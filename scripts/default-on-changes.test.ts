@@ -73,12 +73,16 @@ import {
   createApprovalActions,
   createRuntimeBackedApprovalStore,
 } from "../packages/channel-adapter-base/src/index";
+import { ABSENT_CORPUS } from "../packages/compiler/src/absent-corpus";
 import {
   CF_WORKER_ENFORCED_KEYS,
   CF_WORKER_REFUSAL_REASONS,
+  type UnwiredKey,
   cfWorkerUnwiredBlockWarnings,
+  collectCompileWarnings,
   compile,
   lower,
+  unwiredRows,
 } from "../packages/compiler/src/index";
 import {
   SCHEDULE_LANES_CORPUS,
@@ -210,7 +214,7 @@ import {
   applySpecEdits,
   validatePatch,
 } from "../packages/spec-patch/src/index";
-import { parseSpec } from "../packages/spec/src/index";
+import { type Spec, parseSpec } from "../packages/spec/src/index";
 import { emitCfWorkerCli } from "../packages/target-cf-worker-cli/src/index";
 import { emitCfWorkerGraph } from "../packages/target-cf-worker-graph/src/index";
 import { emitCfWorkerWorkflow } from "../packages/target-cf-worker-workflow/src/index";
@@ -6412,5 +6416,115 @@ describe("the release notes name the cf-worker edge guarantees", () => {
         (b) => b.includes("`error` frame") && b.includes("the time the whole run may take"),
       ),
     ).toHaveLength(1);
+  });
+});
+
+describe("0.9.0 — compaction where it is accepted, and settings a shape ignores", () => {
+  test("curation and managed's compaction settings reach the bundle, and a bullet names them", () => {
+    const cli = compile(`${ABSENT_CORPUS.cli}compaction: {curate: true}\n`, { readme: false });
+    expect(cli.files.find((f) => f.path === "agent.ts")?.content ?? "").toContain("curate: {},");
+    const managed = compile(`${ABSENT_CORPUS.managed}compaction: {threshold: 0.7}\n`, {
+      readme: false,
+    });
+    const run = managed.files.find((f) => f.content.includes("export async function runOneTurn"));
+    expect(run?.content ?? "").toContain("compactionThreshold: 0.7,");
+    expect(
+      defaultOnBullets(changelog, LATER_HEADINGS).some(
+        (b) => b.includes("`compaction.curate`") && b.includes("managed"),
+      ),
+    ).toBe(true);
+  });
+
+  /** The setting a row is about: its first segment that is not a shape's own structure. */
+  const settingOf = (path: string): string =>
+    path
+      .split(/[.[\]]/)
+      .filter((s) => s !== "" && s !== "*")
+      .find((s) => !["agent", "steps", "nodes", "roles"].includes(s)) ?? path;
+
+  /** Each 0.9.0 row no later bullet names by its setting and its shape. */
+  const unnamedRows = (
+    rows: ReadonlyArray<{ readonly shape: string; readonly row: UnwiredKey }>,
+    later: readonly string[],
+  ): string[] =>
+    rows
+      .filter(({ row }) => row.since === "0.9.0")
+      .filter(({ shape, row }) => {
+        const key = new RegExp(`\`${settingOf(row.path)}[\`.]`);
+        const shapeWord = new RegExp(`(^|[^a-z-])${shape}([^a-z-]|$)`);
+        return !later.some((b) => key.test(b) && shapeWord.test(b));
+      })
+      .map(({ shape, row }) => `${shape}: ${row.path}`);
+
+  const everyRow = (): Array<{ readonly shape: string; readonly row: UnwiredKey }> =>
+    (Object.keys(ABSENT_CORPUS) as Spec["target"][]).flatMap((target) => [
+      ...unwiredRows(target).map((row) => ({ shape: target as string, row })),
+      ...unwiredRows(target, { emitAs: "cf-worker" }).map((row) => ({
+        shape: "Cloudflare Worker",
+        row,
+      })),
+    ]);
+
+  test("every setting a shape newly says it ignores is named with that shape", () => {
+    const later = defaultOnBullets(changelog, LATER_HEADINGS);
+    const rows = everyRow();
+    expect(rows.filter(({ row }) => row.since === "0.9.0").length).toBeGreaterThan(0);
+    expect(unnamedRows(rows, later)).toEqual([]);
+    // The check bites: a planted row no bullet names is reported.
+    const planted = { shape: "voice", row: { path: "planted.key", message: "m", since: "0.9.0" } };
+    expect(unnamedRows([...rows, planted as never], later)).toEqual(["voice: planted.key"]);
+  });
+
+  test("a local build warns for cf_worker.public_chat, a Worker build does not, and a bullet names it", () => {
+    for (const shape of ["cli", "workflow", "graph"] as const) {
+      const yaml = `${ABSENT_CORPUS[shape]}cf_worker: { public_chat: true }\n`;
+      const local = compile(yaml, { readme: false }).warnings.filter(
+        (w) => w.path === "cf_worker.public_chat",
+      );
+      expect(
+        local.map((w) => w.code),
+        shape,
+      ).toEqual(["accepted-but-unwired"]);
+      const parsed = parseSpec(yaml);
+      const edge = [
+        ...collectCompileWarnings(parsed),
+        ...emitCfWorkerBundle(parsed, lower(parsed)).warnings,
+      ].filter((w) => w.path === "cf_worker.public_chat");
+      expect(
+        edge.map((w) => w.code),
+        shape,
+      ).toEqual(["edge-public-chat"]);
+    }
+    const later = defaultOnBullets(changelog, LATER_HEADINGS).filter((b) =>
+      b.includes("`cf_worker.public_chat`"),
+    );
+    expect(later.some((b) => b.includes("--emit-as cf-worker") && b.includes("cli"))).toBe(true);
+  });
+
+  test("a pool's cascade where nothing escalates to it warns, and a bullet names each shape", () => {
+    const pool = {
+      candidates: [
+        { model: "claude-haiku-4-5", tags: ["cheap"] },
+        { model: "claude-opus-4-8", tags: ["strong"] },
+      ],
+      strategy: { cascade: { draft: "cheap", escalate_to: "strong" } },
+    };
+    const shapes = ["pipeline", "research", "batch", "browser"] as const;
+    for (const shape of shapes) {
+      const spec = { ...(Bun.YAML.parse(ABSENT_CORPUS[shape]) as Record<string, unknown>) };
+      spec["agent"] = { ...(spec["agent"] as object), model_pool: pool };
+      const codes = compile(JSON.stringify(spec), { readme: false }).warnings.filter((w) =>
+        w.path.endsWith("strategy.cascade"),
+      );
+      expect(
+        codes.map((w) => w.code),
+        shape,
+      ).toEqual(["model-plan-ignored-on-shape"]);
+    }
+    const later = defaultOnBullets(changelog, LATER_HEADINGS).filter((b) =>
+      b.includes("`strategy.cascade`"),
+    );
+    expect(later.length).toBe(1);
+    for (const shape of [...shapes, "crew"]) expect(later[0], shape).toContain(shape);
   });
 });

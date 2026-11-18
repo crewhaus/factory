@@ -579,20 +579,21 @@ const compactionBlock = z
      *  TAIL of the transcript by `compaction-snip`. When omitted the snip
      *  package's default applies. */
     snip_keep_tail: z.number().int().positive().optional(),
-    /** Pillar 2 — opt in to the pre-compaction curator pass. Defaults
-     *  to `false` when omitted; the IR carries the user's choice
-     *  verbatim so target emitters can wire `@crewhaus/compaction-curator`
-     *  on the runtime path. See docs/MODULE-CATALOG.md R6 + recipe 52. */
+    /** Pillar 2 — opt in to the pre-compaction curator pass, which drops
+     *  exact repeats of a message. Defaults to `false` when omitted.
+     *  Takes effect on cli, channel and managed harnesses and in `crewhaus
+     *  run` / `serve`; other shapes warn that they do not use it. See
+     *  docs/MODULE-CATALOG.md R6 + recipe 52. */
     curate: z.boolean().optional(),
-    /** Cosine-similarity threshold above which two items are considered
-     *  duplicates by the curator. Defaults to 0.92 in the curator
-     *  itself; spec-level override targets per-corpus tuning. Must be
-     *  in (0, 1] — values outside that range can't be cosine outputs. */
+    /** Embedding-similarity threshold above which two items are
+     *  considered duplicates by the curator. Defaults to 0.92 in the
+     *  curator itself. Must be in (0, 1]. Read only with `curate: true`
+     *  and an injected embedder: a compiled harness passes none and drops
+     *  exact repeats, and the compiler notes the setting. */
     dedupeThreshold: z.number().gt(0).lte(1).optional(),
     /** Max items the curator keeps after the relevance reorder. When
-     *  omitted, the curator only reorders (no top-K trim). Spec-level
-     *  override is the natural knob for RAG pipelines that want a hard
-     *  cap on retrieved chunks per turn. */
+     *  omitted, the curator only reorders (no top-K trim). Read only with
+     *  `curate: true`. */
     relevanceTopK: z.number().int().positive().optional(),
   })
   .strict()
@@ -1796,8 +1797,9 @@ const memoryDreamBlock = z
  * EMBEDDER RESOLUTION ORDER (Batch E, G76) — coherent across the three
  * embedder knobs, applied by the runtime/emitters (the IR carries the raw
  * declared strings):
- *   - fact-store recall + the compaction curator: `memory.embedder` →
- *     `memory.wiki.embedder` → (none ⇒ BM25-only lexical);
+ *   - fact-store recall: `memory.embedder` → `memory.wiki.embedder` →
+ *     (none ⇒ BM25-only lexical). The compaction curator uses neither: it
+ *     drops exact repeats (the `compaction-curate-lexical` note says so);
  *   - the wiki semantic tier: `memory.wiki.embedder` → `memory.embedder` →
  *     (none ⇒ BM25-only);
  *   - agent-shape RAG (the `knowledge:` block): `knowledge.embedder` →

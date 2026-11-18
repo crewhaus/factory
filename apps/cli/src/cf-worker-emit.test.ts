@@ -199,3 +199,19 @@ describe("emitCfWorkerBundle", () => {
     expect([...CF_WORKER_EMIT_TARGETS]).toEqual(["cli", "workflow", "graph"]);
   });
 });
+
+describe("observability.trace on a cli Worker build", () => {
+  test("level off changes the worker and warns nothing", () => {
+    const off = emitCfWorkerBundle(
+      ...ir(`${CLI_SPEC}observability:\n  trace:\n    level: "off"\n`),
+      {
+        readme: false,
+      },
+    );
+    const plain = emitCfWorkerBundle(...ir(CLI_SPEC), { readme: false });
+    const worker = (b: typeof off) => b.files.find((f) => f.path === "worker.js")?.content;
+    expect(worker(off)).toBeDefined();
+    expect(worker(off)).not.toBe(worker(plain));
+    expect(off.warnings.filter((w) => w.path.startsWith("observability"))).toEqual([]);
+  });
+});

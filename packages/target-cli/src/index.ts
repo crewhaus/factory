@@ -20,6 +20,7 @@ import {
   renderModelWiringFields,
   renderSubAgentDef,
 } from "@crewhaus/model-service";
+import { renderCompactionFields } from "@crewhaus/runtime-core/compaction-codegen";
 import {
   BUILTIN_TOOLS,
   BuiltinToolError,
@@ -725,29 +726,11 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
     ir.agent.rateLimits !== undefined && Object.keys(ir.agent.rateLimits).length > 0
       ? `\n  rateLimits: ${JSON.stringify(ir.agent.rateLimits)},`
       : "";
-  // Thread `compaction.model` so the compiled bundle's auto-compaction
-  // summarizes on the spec's chosen model. The compiler already resolved the
-  // `cheapest` sentinel to a concrete id, so this is a raw model string
-  // (escaped like `model:`). Empty when the spec omits it, keeping existing
-  // bundles byte-identical.
-  const compactionModelField =
-    ir.compaction.model !== undefined
-      ? `\n  compactionModel: ${escapeJsonString(ir.compaction.model)},`
-      : "";
-  // 0.6.0 §4.2 — the compaction profile's pinned request params
-  // (`max_tokens` / `thinking` / `temperature`), honoured by the summariser's
-  // own request. A lowered numbers-and-literals object, so `JSON.stringify`
-  // needs no escaping; absent when the slot named no profile.
-  const compactionParamsField =
-    ir.compaction.params !== undefined
-      ? `\n  compactionParams: ${JSON.stringify(ir.compaction.params)},`
-      : "";
-  // Loop contract 0.4 (Batch A) — compaction tuning knobs, mapped onto the
-  // runtime's existing options (`compactionThreshold` + the snip window).
-  // Numbers only; each key absent when the spec omits it so the runtime's
-  // own defaults (0.85 / 4 / 20) stay authoritative and pre-existing bundles
-  // stay byte-identical.
-  const compactionTuningFields = renderCompactionTuningFields(ir);
+  // The `compaction:` block (model, profile params, threshold, the snip
+  // window, curation) through runtime-core's codegen twin, the same rule
+  // `crewhaus run` spreads: each option only when the spec declared it, so a
+  // spec without the block keeps its bundle bytes and the runtime's defaults.
+  const compactionFields = renderCompactionFields(ir.compaction, "  ");
   // Loop contract 0.4 (Batch A) — hard runtime ceilings from the `limits:`
   // block. Empty when the spec omits it.
   const limitsFields = renderLimitsFields(ir);
@@ -796,7 +779,7 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${thinkingField}${temperatureField}${streamingField}${rateLimitsField}${compactionModelField}${compactionParamsField}${compactionTuningFields}${limitsFields}${failoverFields}${hybridFields}${failureTaxonomyField}${budgetField}${evaluation.field}${sloField}${toolsField}${permField}${sandboxField}
+  sessionTarget: "cli",${maxTokensField}${thinkingField}${temperatureField}${streamingField}${rateLimitsField}${compactionFields}${limitsFields}${failoverFields}${hybridFields}${failureTaxonomyField}${budgetField}${evaluation.field}${sloField}${toolsField}${permField}${sandboxField}
   hooks: ${specHooks.hooksExpr},
   skills: __skills,
   slashCommands: __slashCommands,${feedbackField}${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${justification.field}${memory.field}
@@ -937,28 +920,6 @@ function renderLimitsFields(ir: IrV0): string {
   }
   if (limits.loopDetection !== undefined) {
     pieces.push(`\n  loopDetection: ${JSON.stringify(limits.loopDetection)},`);
-  }
-  return pieces.join("");
-}
-
-/**
- * Loop contract 0.4 (Batch A) — render the compaction tuning knobs onto the
- * runtime's EXISTING options: `compaction.threshold` → `compactionThreshold`,
- * `compaction.snip_keep_head`/`snip_keep_tail` → `snipKeepHead`/`snipKeepTail`.
- * Numbers only. Each key is emitted only when the spec declared it so the
- * runtime defaults (0.85 / 4 / 20) stay authoritative and pre-existing
- * bundles stay byte-identical.
- */
-function renderCompactionTuningFields(ir: IrV0): string {
-  const pieces: string[] = [];
-  if (ir.compaction.threshold !== undefined) {
-    pieces.push(`\n  compactionThreshold: ${ir.compaction.threshold},`);
-  }
-  if (ir.compaction.snipKeepHead !== undefined) {
-    pieces.push(`\n  snipKeepHead: ${ir.compaction.snipKeepHead},`);
-  }
-  if (ir.compaction.snipKeepTail !== undefined) {
-    pieces.push(`\n  snipKeepTail: ${ir.compaction.snipKeepTail},`);
   }
   return pieces.join("");
 }

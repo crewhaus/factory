@@ -28,6 +28,7 @@ import {
   renderHybridWiringFields,
   renderModelWiringFields,
 } from "@crewhaus/model-service";
+import { renderCompactionFields } from "@crewhaus/runtime-core/compaction-codegen";
 import {
   BuiltinToolError,
   type ResolvedTools,
@@ -818,6 +819,8 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
   // none of them, so pre-0.6.0 managed bundles stay byte-identical.
   const hybridFields = renderHybridWiringFields(ir.agent, "    ", ir.name);
   const hybridImport = hybridFields.length > 0 ? `\n${HYBRID_WIRING_IMPORT}` : "";
+  // `runOneTurn` renders the `compaction:` block through runtime-core's codegen
+  // twin, as the cli and channel bundles do: each option only when declared.
   const permissionImports =
     permissionsField.length > 0
       ? `\nimport { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";${
@@ -841,7 +844,7 @@ export type ManagedAgentArgs = {
 export async function runOneTurn(args: ManagedAgentArgs): Promise<string> {
 ${memBlock}${approvalsBoot}  return await runChatLoop({
     model: ${escapeJsonString(ir.agent.model)},
-    instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentLoopFields(ir)}${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderSandboxField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderSloField(ir)}
+    instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentLoopFields(ir)}${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderSandboxField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir.compaction, "    ")}${renderHooksField(ir)}${renderSloField(ir)}
     sessionName: args.sessionId,
     sessionTarget: "managed",
     seedMessages: [{ role: "user", content: args.input }],

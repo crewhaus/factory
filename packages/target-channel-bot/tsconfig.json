@@ -14,6 +14,7 @@
     { "path": "../memory-service" },
     { "path": "../model-router" },
     { "path": "../model-service" },
+    { "path": "../runtime-core" },
     { "path": "../tool-categories" }
   ]
 }

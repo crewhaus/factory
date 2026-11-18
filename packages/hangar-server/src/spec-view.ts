@@ -22,6 +22,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type SpecHeader, readSpecHeader } from "@crewhaus/harness-inventory";
+import { readBundleStamp, resolveBundle } from "@crewhaus/harness-supervisor";
+import { type SupportStatus, featureSupport } from "@crewhaus/ir/support";
 import { parseSpecIssues } from "@crewhaus/spec";
 import { mergedSpawnEnv } from "./env-file";
 import { maskSpecYaml } from "./mask";
@@ -90,6 +92,101 @@ export function capabilityBadges(yamlText: string): Record<BadgeKey, boolean> {
       );
   }
   return out;
+}
+
+/** The support-manifest feature each badge stands for. */
+const BADGE_FEATURES: Readonly<Record<BadgeKey, string>> = {
+  memory: "memory",
+  wiki: "memory.wiki",
+  dream: "memory.dream",
+  thredz: "thredz",
+  watchme: "watchme",
+  feedback: "feedback",
+  budget: "budget",
+};
+
+/** What one declared badge does on the harness's shape, as its build was compiled. */
+export type BadgeSupport = {
+  readonly status: SupportStatus | "unknown" | "recompile";
+  readonly reason?: string;
+};
+
+export type BadgeSupportView = {
+  /** One entry per declared badge. */
+  readonly badgeSupport: Partial<Record<BadgeKey, BadgeSupport>>;
+  /** Present when the build cannot be read against this release's manifest. */
+  readonly badgeNote?: string;
+  /** The command that answers `badgeNote`, when one does (`crewhaus compile`). */
+  readonly badgeVerb?: string;
+};
+
+/**
+ * Whether each declared badge takes effect on the harness's shape, from the
+ * support manifest and the crewhaus version its bundle was compiled with: a
+ * block a shape accepts and does not use reads `unwired` with the reason. A
+ * harness with no build, or one compiled before the manifest existed, reads
+ * `unknown` with a note (`badgeNote`) and the command that answers it
+ * (`badgeVerb`, `crewhaus compile`); a build by a newer CrewHaus, or a shape
+ * this one does not know, reads `unknown` with a note and no command.
+ */
+export function badgeSupport(
+  badges: Readonly<Record<BadgeKey, boolean>>,
+  target: string,
+  compiledWith: string | undefined,
+): BadgeSupportView {
+  const declared = BADGE_KEYS.filter((key) => badges[key]);
+  const support = featureSupport({
+    shape: target,
+    declared: declared.map((key) => ({ feature: BADGE_FEATURES[key], path: BADGE_FEATURES[key] })),
+    ...(compiledWith !== undefined ? { compiledWith } : {}),
+  });
+  const out: Partial<Record<BadgeKey, BadgeSupport>> = {};
+  for (const key of declared) {
+    const answer = support.features.find((f) => f.feature === BADGE_FEATURES[key]);
+    if (answer === undefined) continue;
+    out[key] = {
+      status: answer.status,
+      ...(answer.reason !== undefined && support.basis === "manifest"
+        ? { reason: answer.reason }
+        : {}),
+    };
+  }
+  return {
+    badgeSupport: out,
+    ...(support.basis === "unknown" && support.note !== undefined && declared.length > 0
+      ? {
+          badgeNote: support.note,
+          ...(support.verb !== undefined ? { badgeVerb: support.verb } : {}),
+        }
+      : {}),
+  };
+}
+
+/** The crewhaus version stamped on the harness's compiled bundle, or undefined (no build). */
+export function bundleCompiledWith(harnessDir: string, target: string): string | undefined {
+  const location = resolveBundle(harnessDir, target);
+  if (location === undefined) return undefined;
+  return readBundleStamp(location.bundleDir)?.compiledWith;
+}
+
+/**
+ * A harness detail's badges and what each does there: the lenient badge scan,
+ * then {@link badgeSupport} for the shape the spec names (the registry's
+ * `fallbackTarget` when its header does not read).
+ */
+export function detailBadges(
+  yamlText: string,
+  harnessDir: string,
+  fallbackTarget: string,
+): { readonly badges: Record<BadgeKey, boolean> } & BadgeSupportView {
+  const badges = capabilityBadges(yamlText);
+  let shape = fallbackTarget;
+  try {
+    shape = readSpecHeader(yamlText).target ?? fallbackTarget;
+  } catch {
+    // A header that does not read: the registry's shape stands in.
+  }
+  return { badges, ...badgeSupport(badges, shape, bundleCompiledWith(harnessDir, shape)) };
 }
 
 /** Every `$VAR` / `${VAR}` name a spec text references. */

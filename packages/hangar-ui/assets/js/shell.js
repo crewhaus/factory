@@ -34,6 +34,7 @@ import {
 import { SECTIONS, sectionById, subViewGroups, subViewOf } from "./sections/index.js";
 import { shapeAccentVars, shapeLabel } from "./shapes.js";
 import { procRow } from "./supervision.js";
+import { badgeStrip } from "./ui/badges.js";
 import { announce } from "./ui/live.js";
 
 /** Where the releases and the docs live, linked from Help. */
@@ -893,7 +894,7 @@ function harnessHeader(detail, route, ctx) {
             copyBtn(dir, "copy"),
           ])
         : null,
-      badgeStrip(detail.badges),
+      badgeStrip(detail.badges, detail.badgeSupport, detail.badgeNote, target, detail.badgeVerb),
       supervisionStrip(ctx),
     ],
   );
@@ -955,16 +956,4 @@ function supervisionStrip(ctx) {
     }
   }
   return strip;
-}
-
-/** Capability-badge chips from the detail payload's `badges` booleans. */
-function badgeStrip(badges) {
-  if (!badges || typeof badges !== "object") return null;
-  const active = Object.keys(badges).filter((k) => badges[k] === true);
-  if (active.length === 0) return null;
-  return el(
-    "div",
-    { class: "safety-strip", "aria-label": "capabilities" },
-    active.map((k) => el("span", { class: "chip", text: k })),
-  );
 }

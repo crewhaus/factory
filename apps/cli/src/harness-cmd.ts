@@ -60,16 +60,31 @@ import {
   openHangarRegistry,
   resolveHangarRoot,
 } from "@crewhaus/harness-registry";
-import { buildSpawnEnv, harnessHookDisclosures, loadEnvChain } from "@crewhaus/harness-supervisor";
+import {
+  buildSpawnEnv,
+  harnessHookDisclosures,
+  loadEnvChain,
+  readBundleStamp,
+  resolveBundle,
+} from "@crewhaus/harness-supervisor";
+import {
+  type HarnessFeatureSupport,
+  SUPPORT_MANIFEST,
+  declaredFeatures,
+  featureSupport,
+  shapeCells,
+} from "@crewhaus/ir/support";
 import { preflightHarness } from "@crewhaus/preflight";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
+import { parse as parseYaml } from "yaml";
 import { envChainLines } from "./env-chain-view";
 import type { CliFamily } from "./verbs";
 
 /** What a verb returns: lines for stdout + the process exit code. */
 export type HarnessCommandResult = {
   readonly lines: readonly string[];
-  readonly exitCode: 0 | 1;
+  /** 2: a bad argument the verb answers itself (an unknown `--shape`). */
+  readonly exitCode: 0 | 1 | 2;
 };
 
 export type HarnessCommandOptions = {
@@ -114,6 +129,12 @@ const HARNESS_USAGE_LINES: readonly string[] = [
   "                                                    has none",
   "  crewhaus harness fork <dir>                       give a copied harness its own id (a fresh",
   "                                                    harness.json) and register it",
+  "  crewhaus harness capabilities [<dir|hrn_id>] [--json]",
+  "                                                    which of the harness's settings take",
+  "                                                    effect on its shape, as its bundle was",
+  "                                                    compiled (default: the current directory);",
+  "                                                    --shape <shape> lists every setting for a",
+  "                                                    shape without a harness. Reads only.",
   "",
   "  The registry is one JSON file, <registry-root>/harnesses.json",
   "  (CREWHAUS_REGISTRY_ROOT, default ~/.crewhaus). CREWHAUS_NO_REGISTRY=1",
@@ -163,6 +184,7 @@ export const CLI_FAMILY = {
     preflight: { flags: { json: "boolean" } },
     adopt: { flags: { slug: "value" } },
     fork: { flags: {} },
+    capabilities: { flags: { json: "boolean", shape: "value" } },
   },
 } as const satisfies CliFamily;
 
@@ -928,6 +950,137 @@ async function harnessPreflight(
 }
 
 // ---------------------------------------------------------------------------
+// capabilities
+// ---------------------------------------------------------------------------
+
+/** Each feature once, in the order first declared. */
+function uniqueFeatures(
+  features: HarnessFeatureSupport["features"],
+): HarnessFeatureSupport["features"] {
+  const seen = new Set<string>();
+  return features.filter((f) => {
+    if (seen.has(f.feature)) return false;
+    seen.add(f.feature);
+    return true;
+  });
+}
+
+/**
+ * The three-line answer: what takes effect, what is not used and why, what
+ * needs a recompile; and a fourth, only when some setting's effect is not
+ * recorded, naming it. A build that cannot be read prints its note, and the
+ * command that answers it when one does.
+ */
+function capabilityLines(name: string, support: HarnessFeatureSupport): string[] {
+  const built =
+    support.compiledWith !== undefined
+      ? `built with crewhaus ${support.compiledWith}`
+      : "no build yet";
+  const lines = [`${name} (${support.shape}) · ${built}`];
+  if (support.basis === "unknown") {
+    lines.push(`  ${support.note ?? "Recompile to check which settings take effect."}`);
+    if (support.verb !== undefined) lines.push(`  run: ${support.verb}`);
+    return lines;
+  }
+  const features = uniqueFeatures(support.features);
+  const pick = (statuses: readonly string[]) => features.filter((f) => statuses.includes(f.status));
+  const effect = pick(["wired", "degraded", "authoring"]).map((f) => f.feature);
+  const unused = pick(["unwired", "rejected"]);
+  const recompile = pick(["recompile"]).map((f) => f.feature);
+  const unknown = pick(["unknown"]);
+  lines.push(`  Takes effect:   ${effect.length > 0 ? effect.join(", ") : "—"}`);
+  if (unused.length === 0) {
+    lines.push("  Not used here:  —");
+  } else {
+    unused.forEach((f, i) => {
+      const why = f.reason !== undefined ? ` — ${f.reason}` : "";
+      lines.push(`  ${i === 0 ? "Not used here:  " : "                "}${f.feature}${why}`);
+    });
+  }
+  lines.push(`  Recompile for:  ${recompile.length > 0 ? recompile.join(", ") : "—"}`);
+  unknown.forEach((f, i) => {
+    const why = f.reason !== undefined ? ` — ${f.reason}` : "";
+    lines.push(`  ${i === 0 ? "Not checked:    " : "                "}${f.feature}${why}`);
+  });
+  return lines;
+}
+
+/**
+ * `crewhaus harness capabilities [<dir|hrn_id>] [--json] [--shape <shape>]` —
+ * what a harness's declared settings do on its shape, read from the support
+ * manifest and the version its bundle was compiled with. Reads the spec and
+ * the bundle's stamp, and writes nothing.
+ */
+function harnessCapabilities(reg: HangarRegistry, argv: readonly string[]): HarnessCommandResult {
+  const args = parseVerbArgs("capabilities", argv, CLI_FAMILY.sub.capabilities.flags);
+  const json = boolFlag(args, "json");
+  const shape = strFlag(args, "shape");
+  if (shape !== undefined) {
+    if (!SUPPORT_MANIFEST.shapes.includes(shape)) {
+      return {
+        lines: [
+          `harness capabilities: unknown shape "${shape}" (expected: ${SUPPORT_MANIFEST.shapes.join(", ")})`,
+        ],
+        exitCode: 2,
+      };
+    }
+    const cells = shapeCells(shape);
+    if (json) {
+      return {
+        lines: jsonLines({
+          schema: 1,
+          shape,
+          generatedBy: SUPPORT_MANIFEST.generatedBy,
+          features: cells.map(({ feature, cell }) => ({ feature, ...cell })),
+        }),
+        exitCode: 0,
+      };
+    }
+    const width = Math.max(...cells.map((c) => c.feature.length));
+    return {
+      lines: [
+        `${shape} harnesses (crewhaus ${SUPPORT_MANIFEST.generatedBy}):`,
+        ...cells.map(
+          ({ feature, cell }) =>
+            `  ${feature.padEnd(width)}  ${cell.status}${cell.reason !== undefined && cell.status !== "rejected" ? ` — ${cell.reason}` : ""}`,
+        ),
+      ],
+      exitCode: 0,
+    };
+  }
+  const key = args.positional[0];
+  const entry = key !== undefined ? reg.get(key) : undefined;
+  const dir = entry !== undefined ? entry.dir : resolve(key ?? ".");
+  const specPath = join(dir, HARNESS_SPEC_FILENAME);
+  if (!existsSync(specPath)) {
+    throw new Error(
+      `harness capabilities: no ${HARNESS_SPEC_FILENAME} in ${dir}${key === undefined ? " (pass a harness directory or hrn_ id)" : ""}`,
+    );
+  }
+  let spec: unknown;
+  try {
+    spec = parseYaml(readFileSync(specPath, "utf8"));
+  } catch (err) {
+    throw new Error(
+      `harness capabilities: ${specPath} is not valid YAML (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+  const record = (spec ?? {}) as { readonly name?: unknown; readonly target?: unknown };
+  const target = typeof record.target === "string" ? record.target : (entry?.target ?? "unknown");
+  const location = resolveBundle(dir, target);
+  const compiledWith =
+    location !== undefined ? readBundleStamp(location.bundleDir)?.compiledWith : undefined;
+  const support = featureSupport({
+    shape: target,
+    declared: declaredFeatures(spec),
+    ...(compiledWith !== undefined ? { compiledWith } : {}),
+  });
+  if (json) return { lines: jsonLines(support), exitCode: 0 };
+  const name = typeof record.name === "string" ? record.name : (entry?.specName ?? dir);
+  return { lines: capabilityLines(name, support), exitCode: 0 };
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -977,6 +1130,8 @@ export async function runHarnessCommand(
       return await harnessAdopt(reg, rest, opts);
     case "fork":
       return harnessFork(reg, rest);
+    case "capabilities":
+      return harnessCapabilities(reg, rest);
     default:
       throw new Error(
         `unknown harness verb "${verb}" (expected: ${Object.keys(CLI_FAMILY.sub).join(" | ")})`,

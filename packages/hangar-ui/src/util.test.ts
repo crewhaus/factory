@@ -128,6 +128,16 @@ describe("normalizeRows", () => {
     expect(a[0].missingSince).toBeNull();
   });
 
+  test("a row carries what each badge does on its shape, else an empty map", () => {
+    const support = { watchme: { status: "unwired", reason: "not on managed" } };
+    const [kept] = util.normalizeRows([{ id: "hrn_0123456789abcdef", badgeSupport: support }]);
+    expect(kept.badgeSupport).toEqual(support);
+    const [missing] = util.normalizeRows([{ id: "hrn_0123456789abcdef" }]);
+    expect(missing.badgeSupport).toEqual({});
+    const [junk] = util.normalizeRows([{ id: "hrn_0123456789abcdef", badgeSupport: ["x"] }]);
+    expect(junk.badgeSupport).toEqual({});
+  });
+
   test("junk feeds normalize to empty, junk rows to safe defaults", () => {
     expect(util.normalizeRows(null)).toEqual([]);
     expect(util.normalizeRows({ nope: 1 })).toEqual([]);

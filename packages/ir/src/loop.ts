@@ -162,6 +162,15 @@ export type LoopProjection = {
 /** Single-agent shapes rendered as the seven-component ring. */
 export const RING_TARGETS: readonly string[] = ["cli", "channel", "managed"];
 
+/**
+ * The shapes whose loops run `compaction.curate`, so the ring says
+ * "(curated)" only there. The support manifest (`@crewhaus/ir/support`,
+ * generated from the compiler) is the source of truth; this module is reached
+ * from the package's main entry and does not load it, so a test holds the two
+ * equal.
+ */
+export const CURATE_WIRED_TARGETS: readonly string[] = ["cli", "channel", "managed"];
+
 /** Step/node/role shapes rendered as a node canvas. */
 export const CANVAS_TARGETS: readonly string[] = [
   "workflow",
@@ -305,7 +314,7 @@ type RingView = {
   readonly transactionPolicy?: boolean;
 };
 
-function ringSegmentsFromView(view: RingView): LoopSegment[] {
+function ringSegmentsFromView(target: string, view: RingView): LoopSegment[] {
   const tools = view.tools ?? [];
   const toolsKey = view.toolsKey ?? "tools";
 
@@ -434,7 +443,8 @@ function ringSegmentsFromView(view: RingView): LoopSegment[] {
   }
   if (view.compaction !== undefined && Object.keys(view.compaction).length > 0) {
     updKeys.push("compaction");
-    updParts.push(`compaction${view.compaction.curate === true ? " (curated)" : ""}`);
+    const curated = view.compaction.curate === true && CURATE_WIRED_TARGETS.includes(target);
+    updParts.push(`compaction${curated ? " (curated)" : ""}`);
   }
   const update = segment(
     "update",
@@ -974,7 +984,7 @@ function fallbackRingView(ir: IrNode): RingView {
 // --- projectLoop -------------------------------------------------------------------
 
 function ringProjection(target: string, view: RingView, warnings: string[]): LoopProjection {
-  const segments = ringSegmentsFromView(view);
+  const segments = ringSegmentsFromView(target, view);
   // Guardrails-first: the defaults-only Stop warning applies to the true
   // ring families (their loop really does run to the iteration cap).
   // Fallback targets have their own boundaries (call length, page budget,

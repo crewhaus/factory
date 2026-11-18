@@ -209,21 +209,21 @@ export type IrCompaction = {
    *  transcript TAIL by `compaction-snip` (spec `compaction.snip_keep_tail`).
    *  Snip package default when absent. */
   readonly snipKeepTail?: number;
-  /** Pillar 2 — RESERVED, not yet wired at runtime. Intended to make
-   *  target emitters wire `compaction-curator` as a pre-pass before the
-   *  autocompact threshold check, but no emitter or runtime-core path
-   *  consumes this field today — setting it is currently a no-op. The
-   *  spec layer accepts this verbatim (validated in `packages/spec`) and
-   *  it lowers here unchanged so the value round-trips once wiring lands;
-   *  the IR holds it as an opt-in flag with no default so emitters can
-   *  eventually distinguish "user said false" from "user didn't say". */
+  /** Pillar 2 — `true` runs the curation pass before compaction. It takes
+   *  effect on cli, channel and managed harnesses (their bundles render it
+   *  through `@crewhaus/runtime-core/compaction-codegen`) and in `crewhaus
+   *  run` / `serve`; it drops exact repeats of a message (no embedder is
+   *  passed). Other shapes warn that they do not use it. Lowered
+   *  verbatim with no default, so `false` and absent stay distinguishable. */
   readonly curate?: boolean;
-  /** Cosine threshold for the curator's dedupe pass. Curator's own
-   *  default (0.92, `DEFAULT_DEDUPE_THRESHOLD` in
-   *  `@crewhaus/compaction-curator`) applies when undefined. */
+  /** Similarity threshold for the curator's embedding dedupe, read only
+   *  when `curate` is true and an embedder is injected (a compiled harness
+   *  injects none, and the compiler notes it). Curator's own default (0.92,
+   *  `DEFAULT_DEDUPE_THRESHOLD` in `@crewhaus/compaction-curator`) applies
+   *  when undefined. */
   readonly dedupeThreshold?: number;
-  /** Top-K cap for the curator's relevance reorder. Undefined means
-   *  reorder without trimming. */
+  /** Top-K cap for the curator's relevance reorder, read only when `curate`
+   *  is true. Undefined means reorder without trimming. */
   readonly relevanceTopK?: number;
 };
 

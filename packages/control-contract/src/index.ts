@@ -3,6 +3,8 @@
  * surface shares. Types, data, minters and a few pure functions. This entry opens
  * no file, makes no network call and imports no package; zod is in `./schemas`.
  */
+export { COMPILER_MODULE } from "./areas/compiler.js";
+export { COMPILER_FEATURE_KEYS } from "./areas/compiler-features.generated.js";
 export { CORE_MODULE, DEFER_REASONS } from "./areas/core.js";
 export {
   DELEGABLE_DECISION_KINDS,

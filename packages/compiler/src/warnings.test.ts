@@ -223,7 +223,7 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
     expect(result.warnings).toEqual([]);
   });
 
-  test("Batch-C keys never warn — observability + permissions.ask_mode are wired-in-batch", () => {
+  test("Batch-C keys: observability + permissions.ask_mode warn nowhere they are read", () => {
     // cli with the full observability control block + ask_mode.
     const cli = compile(
       [
@@ -245,7 +245,8 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
     );
     expect(cli.warnings).toEqual([]);
 
-    // crew — the shape Batch C newly joins to the observability carriers.
+    // crew carries the block but its bundle renders none of it, so it says so
+    // (#514); its `ask_mode` is read and does not warn.
     const crew = compile(
       [
         "name: cr",
@@ -262,7 +263,9 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
         "    enabled: false",
       ].join("\n"),
     );
-    expect(crew.warnings).toEqual([]);
+    expect(crew.warnings.map((w) => [w.code, w.path])).toEqual([
+      ["accepted-but-unwired", "observability"],
+    ]);
   });
 
   test("0.8.0: provability warns on crew only — cli/channel/managed/research are wired, and off is an opt-out", () => {

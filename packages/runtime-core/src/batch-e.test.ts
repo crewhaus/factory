@@ -21,6 +21,7 @@ import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { createLogger } from "@crewhaus/logging";
 import { createRunContext } from "@crewhaus/run-context";
 import type { CurateEvent, TraceEvent } from "@crewhaus/trace-event-bus";
+import { compactionRunOptions } from "./compaction-codegen";
 import { runChatLoop } from "./index";
 
 const SHARED_SESSION_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-batch-e-tests-"));
@@ -247,6 +248,91 @@ describe("Batch E — active-context curation (Item 1 / G19)", () => {
     const events = curateEvents(seen);
     expect(events).toHaveLength(1);
     expect(events[0]?.embedded).toBe(false);
+    expect(events[0]?.dropped).toBe(1);
+  });
+
+  test("the options a compiled `compaction: {curate: true}` renders run the lexical pass", async () => {
+    const adapter = capturingAdapter({ text: "ok" });
+    const runContext = createRunContext();
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => seen.push(e));
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: adapter,
+      runContext,
+      singleTurn: true,
+      seedMessages: dupSeed(),
+      contextLimit: 550,
+      ...compactionRunOptions({ curate: true, snipKeepHead: 1, snipKeepTail: 1 }),
+    });
+    const events = curateEvents(seen);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.embedded).toBe(false);
+    expect(events[0]?.dropped).toBeGreaterThan(0);
+  });
+
+  test("without an embedder, a later message built from the same words in another order is kept", async () => {
+    const adapter = capturingAdapter({ text: "ok" });
+    const runContext = createRunContext();
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => seen.push(e));
+    const grant =
+      "alice gets read access and bob gets write access to the production billing database starting today";
+    const correction =
+      "No: alice gets write access and bob gets read access to the production billing database starting today";
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: adapter,
+      runContext,
+      singleTurn: true,
+      seedMessages: [
+        { role: "user", content: block("H") },
+        { role: "user", content: grant.padEnd(400, " ") },
+        { role: "assistant", content: block("A") },
+        { role: "user", content: correction.padEnd(400, " ") },
+        { role: "assistant", content: block("A") },
+        { role: "user", content: block("Q") },
+      ],
+      contextLimit: 650,
+      ...compactionRunOptions({ curate: true, snipKeepHead: 1, snipKeepTail: 1 }),
+    });
+    const events = curateEvents(seen);
+    expect(events).toHaveLength(1);
+    // Only the exact repeat of block "A" is dropped; both instructions survive.
+    expect(events[0]?.dropped).toBe(1);
+    const sent = (adapter.captures[0]?.messages ?? []).map((m) =>
+      typeof m.content === "string" ? m.content : "",
+    );
+    expect(sent.some((t) => t.startsWith(grant))).toBe(true);
+    expect(sent.some((t) => t.startsWith(correction))).toBe(true);
+  });
+
+  test("without an embedder, an exact repeat is dropped across case and whitespace", async () => {
+    const adapter = capturingAdapter({ text: "ok" });
+    const runContext = createRunContext();
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => seen.push(e));
+    const line = "Summarise the open tickets for the billing team.";
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: adapter,
+      runContext,
+      singleTurn: true,
+      seedMessages: [
+        { role: "user", content: block("H") },
+        { role: "user", content: `${line} ${block("B")}` },
+        { role: "assistant", content: block("C") },
+        { role: "user", content: `  ${line.toUpperCase()}\n\n${block("B").toUpperCase()} ` },
+        { role: "user", content: block("Q") },
+      ],
+      contextLimit: 600,
+      ...compactionRunOptions({ curate: true, snipKeepHead: 1, snipKeepTail: 1 }),
+    });
+    const events = curateEvents(seen);
+    expect(events).toHaveLength(1);
     expect(events[0]?.dropped).toBe(1);
   });
 
