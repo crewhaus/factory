@@ -427,6 +427,15 @@ export const REQUIRED: Readonly<Record<string, Requirement>> = {
     positionals: { min: 1, max: 1 },
     pins: [{ file: "commands-cmd.ts", text: '"commands show: name a command, cmd_…"' }],
   },
+  "inbox show": {
+    positionals: { min: 1, max: 1 },
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: 'if (raw === undefined) return fail("invalid", SHOW_NEEDS_ONE);',
+      },
+    ],
+  },
   "people add": {
     positionals: { max: 0 },
     flags: ["kind"],

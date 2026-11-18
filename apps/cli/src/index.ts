@@ -24466,6 +24466,21 @@ switch (subcommand) {
     }
     break;
   }
+  case "inbox": {
+    // One inbox for every decision and problem across this machine's harnesses
+    // (./inbox-cmd), read the way Home reads it; it works with Home stopped.
+    try {
+      const { runInboxCommand } = await import("./inbox-cmd");
+      const out = await runInboxCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "people": {
     // People profiles, kept in an encrypted vault under the Hangar root, outside every
     // harness. The verbs read and write the vault themselves, so they work with Home
