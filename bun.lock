@@ -1305,6 +1305,7 @@
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/feedback-distill": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
+        "@crewhaus/harness-advice": "workspace:*",
         "@crewhaus/harness-inventory": "workspace:*",
         "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/harness-supervisor": "workspace:*",
