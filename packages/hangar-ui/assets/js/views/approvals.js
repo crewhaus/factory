@@ -85,6 +85,7 @@ async function draw(host, view) {
   const pending = payload && typeof payload.pending === "number" ? payload.pending : 0;
   const truncated =
     payload && Array.isArray(payload.truncatedHarnesses) ? payload.truncatedHarnesses : [];
+  const unreachable = unreachableNames(payload);
   const reload = () => draw(host, view);
 
   view.rollup.textContent = `${pending} pending · ${rows.length} shown`;
@@ -95,6 +96,19 @@ async function draw(host, view) {
         text: `${truncated.length} harness log${truncated.length === 1 ? " was" : "s were"} capped mid-read — older entries are not shown.`,
       }),
     );
+  }
+  if (unreachable.length > 0) {
+    body.appendChild(el("p", { class: "muted", text: unreachableNote(unreachable) }));
+  }
+  if (rows.length === 0 && unreachable.length > 0) {
+    body.appendChild(
+      emptyFor({
+        cause: "unreachable",
+        subject: "every harness's approvals",
+        detail: "Nothing else is waiting for a decision.",
+      }),
+    );
+    return;
   }
   if (rows.length === 0) {
     body.appendChild(
@@ -118,6 +132,35 @@ async function draw(host, view) {
     prompt: (row, action) => `${action === "grant" ? "Grant" : "Deny"} ${row.toolName}?`,
     perform: decide,
   });
+}
+
+/** The names of the harnesses whose approvals could not be read. Pure. */
+export function unreachableNames(payload) {
+  const list =
+    payload && Array.isArray(payload.unreachableHarnesses) ? payload.unreachableHarnesses : [];
+  return list
+    .map((h) =>
+      typeof h === "string"
+        ? h
+        : h && typeof h.specName === "string" && h.specName !== ""
+          ? h.specName
+          : h && typeof h.id === "string"
+            ? h.id
+            : null,
+    )
+    .filter((name) => name !== null);
+}
+
+/** One sentence naming them, so the list never reads as complete. Pure. */
+export function unreachableNote(names) {
+  if (names.length === 0) return "";
+  const list =
+    names.length === 1
+      ? names[0]
+      : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  return names.length === 1
+    ? `Couldn't read the approvals of ${list}: its sessions folder is outside its folder.`
+    : `Couldn't read the approvals of ${list}: each keeps its sessions folder outside its folder.`;
 }
 
 async function decide(row, action, reload) {

@@ -5,9 +5,11 @@
  * of the other harness's decisions.
  *
  * A harness reads and decides only the approvals inside its own folder: with its sessions
- * folder outside it once every link is followed, it counts no open decisions, lists none,
- * answers 404 for one, decides none, and leaves that folder byte for byte as it was. A
- * sessions folder linked to another place inside the harness lists and resolves as usual.
+ * folder outside it once every link is followed, it lists none of them, answers 404 for
+ * one, decides none, and leaves that folder byte for byte as it was. Its approvals are
+ * reported as unknown, never as a count: its detail, its fleet rows and the approvals
+ * inbox say so, and every decision list names it whether or not anything else is listed.
+ * A sessions folder linked to another place inside the harness lists and resolves as usual.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
@@ -197,23 +199,42 @@ describe.skipIf(process.platform === "win32")(
       decider = await home.member("Dee", "operator", { scope: `harness:${a.id}` });
     }, 60_000);
 
-    test("shows no pending approvals", async () => {
+    test("reports its approvals as unknown, with no count, in its detail and its fleet row", async () => {
       const own = await home.call("GET", `/api/v1/harnesses/${b.id}`);
       expect(own.status).toBe(200);
       expect(own.body["openDecisions"] as number).toBeGreaterThanOrEqual(1);
+      expect(own.body["approvalsUnreachable"]).toBeUndefined();
       const got = await home.call("GET", `/api/v1/harnesses/${a.id}`, { secret: viewer.secret });
       expect(got.status).toBe(200);
-      expect(got.body["openDecisions"]).toBe(0);
+      expect(got.body["approvalsUnreachable"]).toBe(true);
+      expect("openDecisions" in got.body).toBe(false);
+      const list = await home.call("GET", "/api/v1/harnesses");
+      const row = rowsOf(list.body, "items").find((r) => r["id"] === a.id);
+      expect(row?.["approvalsUnreachable"]).toBe(true);
+      expect(row !== undefined && "openDecisions" in row).toBe(false);
+      const ownRow = rowsOf(list.body, "items").find((r) => r["id"] === b.id);
+      expect(ownRow?.["openDecisions"] as number).toBeGreaterThanOrEqual(1);
     });
 
-    test("lists none of the folder's decisions, and the empty list says it is unreachable", async () => {
+    test("lists none of the folder's decisions and names the harness, listed beside others or alone", async () => {
       const own = await home.call("GET", "/api/v1/decisions");
       expect(refsOf(own.body)).toContain(`${b.id}/decision/${B_PENDING}`);
+      expect(own.body["unreachable"]).toEqual([a.id]);
+      expect(own.body["empty"]).toBeUndefined();
       const got = await home.call("GET", "/api/v1/decisions", { secret: viewer.secret });
       expect(got.status).toBe(200);
       expect(JSON.stringify(got.body["items"])).not.toContain(B_PENDING);
       expect(rowsOf(got.body, "items")).toEqual([]);
+      expect(got.body["unreachable"]).toEqual([a.id]);
       expect((got.body["empty"] as Record<string, unknown>)["reason"]).toBe("unreachable");
+    });
+
+    test("the approvals inbox names it, so the inbox never reads as complete", async () => {
+      const inbox = await home.call("GET", "/api/approvals");
+      expect(inbox.status).toBe(200);
+      const named = inbox.body["unreachableHarnesses"] as Array<{ id: string }>;
+      expect(named.map((h) => h.id)).toEqual([a.id]);
+      expect(JSON.stringify(inbox.body["approvals"])).toContain(B_PENDING);
     });
 
     test("a decision or ref in that folder answers 404, as an unknown id does", async () => {
@@ -255,13 +276,15 @@ describe.skipIf(process.platform === "win32")(
       expect(named.map((row) => row["state"])).toEqual(["accepted", "rejected"]);
     });
 
-    test("the fleet row counts no pending approvals for it", async () => {
+    test("the legacy fleet row says its approvals are unknown, never 0", async () => {
       const legacy = await home.call("GET", "/api/harnesses");
       const rows = rowsOf(legacy.body, "harnesses");
       const own = rows.find((r) => r["id"] === b.id);
       expect(own?.["pendingApprovals"] as number).toBeGreaterThanOrEqual(1);
+      expect(own?.["approvalsUnreachable"]).toBeUndefined();
       const linked = rows.find((r) => r["id"] === a.id);
-      expect(linked?.["pendingApprovals"]).toBe(0);
+      expect(linked?.["pendingApprovals"]).toBeNull();
+      expect(linked?.["approvalsUnreachable"]).toBe(true);
     });
 
     test("a harness whose sessions folder is its own, or linked inside it, lists and resolves as before", async () => {

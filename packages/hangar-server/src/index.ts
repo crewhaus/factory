@@ -274,6 +274,7 @@ export {
   foldApprovals,
   isApprovalId,
   pendingApprovalCount,
+  pendingApprovalsOf,
   resolveApproval,
   type ApprovalRow,
   type ApprovalsView,

@@ -15,6 +15,9 @@ export const RECENT_ACTIVITY_MS = 48 * HOUR_MS;
 /** Default transcript retention used for the TTL countdown column. */
 export const DEFAULT_SESSION_TTL_DAYS = 30;
 
+/** Said where a harness's approvals cannot be read: never a count of 0. */
+export const APPROVALS_UNKNOWN = "Approvals unknown";
+
 /** Parse an ISO timestamp to epoch ms, or null when absent/invalid. */
 export function parseTs(iso) {
   if (typeof iso !== "string" || iso === "") return null;
@@ -226,7 +229,14 @@ export function normalizeRows(feed) {
       // read, null when the dir is missing) and the parked-approval count —
       // neither opens a transcript, so the feed stays a fold.
       supervision: typeof src.supervision === "string" ? src.supervision : null,
-      pendingApprovals: typeof src.pendingApprovals === "number" ? src.pendingApprovals : 0,
+      // A harness whose approvals cannot be read has no count: `null`, said as unknown.
+      pendingApprovals:
+        typeof src.pendingApprovals === "number"
+          ? src.pendingApprovals
+          : src.approvalsUnreachable === true
+            ? null
+            : 0,
+      approvalsUnreachable: src.approvalsUnreachable === true,
       capabilities: caps,
       // What each declared badge does on the row's shape (an object keyed by
       // badge), so the table can say which ones the shape does not use.

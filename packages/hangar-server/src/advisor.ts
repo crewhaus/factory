@@ -255,7 +255,7 @@ function openIncidentsOf(ctx: M3Context): OpenIncidentInput[] {
 }
 
 /** The pending approvals and the newest of them; `null` when the session root is outside the harness. */
-function pendingApprovalsOf(dir: string): PendingApprovalsInput | null {
+function pendingApprovalsInput(dir: string): PendingApprovalsInput | null {
   const folded = foldApprovals(dir);
   if (folded.unreachable === true) return null;
   let count = 0;
@@ -352,7 +352,7 @@ async function gatherInputs(ctx: M3Context, dir: string): Promise<AdvisorInputs>
     offers: launchOffers(dir, ctx.entry?.target),
     openIncidents: openIncidentsOf(ctx),
     procState,
-    pendingApprovals: pendingApprovalsOf(dir),
+    pendingApprovals: pendingApprovalsInput(dir),
     budget: {
       declaredUsd: declaredBudgetUsd(yamlText),
       spentUsd: costs.totalUsdMicros / 1_000_000,

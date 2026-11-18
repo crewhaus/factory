@@ -42,7 +42,7 @@ import {
   uptimeLabel,
 } from "../supervision.js";
 import { timeEl } from "../ui/time.js";
-import { dirTail, fmtUsd, normalizeRows } from "../util.js";
+import { APPROVALS_UNKNOWN, dirTail, fmtUsd, normalizeRows } from "../util.js";
 import { actionTwin } from "./control.js";
 import { renderJobs } from "./jobs.js";
 import { procActionBar } from "./proc.js";
@@ -307,13 +307,19 @@ function boardRow(feedRow, proc, nowMs, reload) {
         el("a", { class: "name-link", href: hrefHarness(feedRow.id, "runs"), text: name }),
       ]),
       el("div", { class: "sub mono", title: feedRow.dir, text: dirTail(feedRow.dir, 2) }),
-      feedRow.pendingApprovals > 0
-        ? el("a", {
+      feedRow.approvalsUnreachable
+        ? el("span", {
             class: "chip chip-warn",
-            href: hrefGlobal("approvals"),
-            text: `${feedRow.pendingApprovals} approval${feedRow.pendingApprovals === 1 ? "" : "s"} waiting`,
+            title: "Its sessions folder is outside its folder, so its approvals can't be read.",
+            text: APPROVALS_UNKNOWN,
           })
-        : null,
+        : feedRow.pendingApprovals > 0
+          ? el("a", {
+              class: "chip chip-warn",
+              href: hrefGlobal("approvals"),
+              text: `${feedRow.pendingApprovals} approval${feedRow.pendingApprovals === 1 ? "" : "s"} waiting`,
+            })
+          : null,
     ]),
     el("td", null, [
       dot(row.pill.dot, row.pill.label),
