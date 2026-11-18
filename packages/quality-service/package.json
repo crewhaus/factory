@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/quality-service",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "type": "module",
   "description": "Change records for a harness's spec, graders and cases: a held-out promotion check, adoption through a decision, and the watch after activation",
   "main": "src/index.ts",
