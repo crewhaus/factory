@@ -12,6 +12,7 @@
  * of the sessions whose runs failed with no structured cause, at most 200 failures. When
  * they cannot be read the runs group by class alone, and the item says so.
  */
+import { SESSION_ID_RE, isId } from "@crewhaus/control-contract";
 import { NON_FAILURE_CLASSES, clusterFailures } from "@crewhaus/harness-advice/failure-clusters";
 import { containedSessionRoot } from "@crewhaus/session-store";
 import { type CauseFacts, causeOf } from "../causes";
@@ -37,9 +38,6 @@ export const PROVIDER_LIMIT_WINDOW_MS = 3_600_000;
 /** The failure classes whose runs group by a structured cause, never by message. */
 const STRUCTURED = new Set(["auth", "billing", "rate_limit", "crewhaus_budget", "spec"]);
 
-const SESSION_RE = /^sess_[0-9a-f]{16}$/;
-const DEPLOYMENT_RE = /^dep_[0-9a-hjkmnp-tv-z]{26}$/;
-
 const str = (value: unknown): string | undefined =>
   typeof value === "string" && value !== "" ? value : undefined;
 
@@ -63,8 +61,8 @@ export function foldRunLine(
     ...(str(record["failureClass"]) !== undefined
       ? { failureClass: record["failureClass"] as string }
       : {}),
-    ...(session !== undefined && SESSION_RE.test(session) ? { session } : {}),
-    ...(deployment !== undefined && DEPLOYMENT_RE.test(deployment) ? { deployment } : {}),
+    ...(session !== undefined && SESSION_ID_RE.test(session) ? { session } : {}),
+    ...(deployment !== undefined && isId("dep", deployment) ? { deployment } : {}),
     ...(specHash !== undefined ? { specHash } : {}),
   };
   if (before === undefined) {
