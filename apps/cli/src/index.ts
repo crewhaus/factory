@@ -901,7 +901,7 @@ import { EvalPlanError, planSampleSize, renderEvalPlan } from "./eval-plan";
 // 0.8.0 §9.1 — the block `eval --provability <level>` measures when the spec
 // parks its provability: block at level: off (lowered to none otherwise).
 import { parkedProvabilityBlock } from "./eval-provability";
-import { parseRebaseline } from "./eval-rebaseline";
+import { parseRebaseline, reanchorDirRefusal } from "./eval-rebaseline";
 import {
   parseRegrade,
   provabilityGraderNamesOf,
@@ -9949,6 +9949,15 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   // `--regrade-baseline`: gate against the baseline's answers regraded.
   const regradeParsed = parseRegrade(args.flags);
   if (!regradeParsed.ok) die(regradeParsed.error);
+  // A re-anchor writes this directory's eval history: it runs from the spec's own.
+  if (rebaseline !== undefined || regradeParsed.regradeBaseline === true) {
+    const refused = reanchorDirRefusal(
+      specPath,
+      process.cwd(),
+      rebaseline !== undefined ? "--rebaseline" : "--regrade-baseline",
+    );
+    if (refused !== undefined) die(refused);
+  }
 
   // Item 30 — model-drift sentinel. --baseline points at the frozen run dir to
   // diff against; incompatible with lineage/matrix flags (a sentinel is a
@@ -10820,8 +10829,9 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     // the run directory).
     ...(rebaseline !== undefined ? { rebaseline } : {}),
     provabilityGraderNames,
-    // A re-anchor over a protected criterion needs this harness's owner.
-    ownerCheck: () => ownerCheck(dirname(absSpec), undefined, process.env),
+    // A re-anchor over a protected criterion needs the owner of the harness
+    // whose eval history is written: the one under the working directory.
+    ownerCheck: () => ownerCheck(process.cwd(), undefined, process.env),
     // A re-anchor is a quality decision: it runs under a command receipt in the
     // harness's own ledger, and the pin's mark names that receipt. A receipt that
     // cannot be written keeps the baseline.

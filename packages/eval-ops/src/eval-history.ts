@@ -440,7 +440,9 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   const protectedGate = (
     base: EvalRunSummary,
     flag: string,
-  ): { readonly refused: string } | { readonly mark?: { readonly protectedChange: true } } => {
+  ):
+    | { readonly refused: string }
+    | { readonly mark?: { readonly protectedChange: true; readonly by?: string } } => {
     const changes = protectedChanges(base, summary);
     if (changes.length === 0) return {};
     const check = askOwner();
@@ -449,7 +451,12 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
         refused: `${flag}: ${changes.join("; ")} — re-anchoring over a protected criterion needs this harness's owner (${check.reason})`,
       };
     }
-    return { mark: { protectedChange: true } };
+    return {
+      mark: {
+        protectedChange: true,
+        ...(check.principal !== undefined ? { by: check.principal } : {}),
+      },
+    };
   };
 
   // Build + append the index entry through eval-report's shared recorder —
@@ -1094,7 +1101,7 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
         if (added.length > 0) write(`[eval]   cases added: ${added.join(", ")}`);
       }
     }
-    let protectedMark: { readonly protectedChange: true } | undefined;
+    let protectedMark: { readonly protectedChange: true; readonly by?: string } | undefined;
     if (replacedSummary !== undefined) {
       const owner = protectedGate(replacedSummary, "--rebaseline");
       if ("refused" in owner) {
@@ -1116,7 +1123,10 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
         write(`[eval] baseline kept: ${replaced.runId}`);
         return { gateFailed: true, gateReason: refused, refused };
       }
-      protectedMark = { protectedChange: true };
+      protectedMark = {
+        protectedChange: true,
+        ...(check.principal !== undefined ? { by: check.principal } : {}),
+      };
     }
     warnReplayedPin();
     let outcome: ReturnType<typeof pinRun>;

@@ -13,16 +13,25 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { lower } from "@crewhaus/compiler";
+import { currentLocalIdentity } from "@crewhaus/control-service";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { parseGradersConfig, runCriteriaRecord } from "@crewhaus/eval-grader";
 import { hashDatasetFile, recordEvalRun } from "@crewhaus/eval-report";
 import { runEval } from "@crewhaus/eval-runner";
 import { parseSpec } from "@crewhaus/spec";
+import {
+  governedHome,
+  governedTmp,
+  linkTo,
+  project,
+  removeGovernedDirs,
+} from "./__test__/governed";
 import { CRITERIA_HISTORY_REL, gradersRevision, runCriteriaCommand } from "./criteria-cmd";
 
 const TMP: string[] = [];
 afterAll(() => {
   for (const dir of TMP) rmSync(dir, { recursive: true, force: true });
+  removeGovernedDirs();
 });
 
 const SPEC = `name: shop
@@ -477,5 +486,81 @@ criteria:
     const out = await run(dir, ["preview", edits, "--dataset", "eval/dataset.jsonl"]);
     expect(out.exitCode).toBe(0);
     expect(out.lines.join("\n")).toContain("j1: pass → skipped");
+  });
+});
+
+describe("criteria apply on a governed harness, through the default owner check", () => {
+  const loosen = [{ op: "setMode", id: "answers-match", value: "observe" }];
+  const apply = (dir: string, env: Record<string, string>) =>
+    run(
+      dir,
+      ["apply", editsFile(dir, loosen), "--expect", gradersRevision(GRADERS), "--confirm", "shop"],
+      { env },
+    );
+  const envFor = (hangarRoot: string): Record<string, string> => ({
+    CREWHAUS_HANGAR_ROOT: hangarRoot,
+    CREWHAUS_REGISTRY_ROOT: governedTmp("crewhaus-criteria-registry-"),
+  });
+  const gradersOf = (dir: string) => readFileSync(join(dir, "eval", "graders.yaml"), "utf8");
+
+  test("a local user the Home does not link to the owner writes nothing", async () => {
+    const a = await governedHome({ username: "owner", hostname: "elsewhere.invalid" });
+    const dir = harness();
+    project(dir, a.owner, [], a.hangarRoot);
+    const out = await apply(dir, envFor(a.hangarRoot));
+    expect(out.exitCode).toBe(1);
+    expect(out.lines.join("\n")).toContain("not this harness's owner in the Home that manages it");
+    expect(gradersOf(dir)).toBe(GRADERS);
+    expect(existsSync(join(dir, CRITERIA_HISTORY_REL))).toBe(false);
+  });
+
+  test("a local user linked to the owner only under another Hangar root writes nothing", async () => {
+    const a = await governedHome({ username: "owner", hostname: "elsewhere.invalid" });
+    const b = await governedHome({ username: "eve", hostname: "elsewhere.invalid" });
+    linkTo(b.hangarRoot, currentLocalIdentity(), a.owner, b.owner);
+    const dir = harness();
+    project(dir, a.owner, [], a.hangarRoot);
+    const out = await apply(dir, envFor(b.hangarRoot));
+    expect(out.exitCode).toBe(1);
+    expect(out.lines.join("\n")).toContain("not this harness's owner in the Home that manages it");
+    expect(gradersOf(dir)).toBe(GRADERS);
+    expect(existsSync(join(dir, CRITERIA_HISTORY_REL))).toBe(false);
+  });
+
+  test("a spec in a directory inside the governed harness is governed by its owner", async () => {
+    const a = await governedHome({ username: "owner", hostname: "elsewhere.invalid" });
+    const dir = harness();
+    project(dir, a.owner, [], a.hangarRoot);
+    writeFileSync(join(dir, "eval", "crewhaus.yaml"), SPEC.replace("name: shop", "name: inner"));
+    const out = await run(
+      dir,
+      [
+        "apply",
+        editsFile(dir, loosen),
+        "--expect",
+        gradersRevision(GRADERS),
+        "--spec",
+        "eval/crewhaus.yaml",
+        "--confirm",
+        "inner",
+      ],
+      { env: envFor(a.hangarRoot) },
+    );
+    expect(out.exitCode).toBe(1);
+    expect(out.lines.join("\n")).toContain("not this harness's owner in the Home that manages it");
+    expect(gradersOf(dir)).toBe(GRADERS);
+    expect(existsSync(join(dir, "eval", CRITERIA_HISTORY_REL))).toBe(false);
+    expect(existsSync(join(dir, CRITERIA_HISTORY_REL))).toBe(false);
+  });
+
+  test("the owner's edit is written, and its history line names them", async () => {
+    const a = await governedHome(currentLocalIdentity());
+    const dir = harness();
+    project(dir, a.owner, [], a.hangarRoot);
+    const out = await apply(dir, envFor(a.hangarRoot));
+    expect(out.exitCode).toBe(0);
+    expect(gradersOf(dir)).toContain("mode: observe");
+    const line = JSON.parse(readFileSync(join(dir, CRITERIA_HISTORY_REL), "utf8").trim());
+    expect(line.by).toBe(a.owner);
   });
 });

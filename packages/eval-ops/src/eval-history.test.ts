@@ -2491,6 +2491,54 @@ describe("finishEvalRun — re-anchoring over a protected criterion", () => {
     }
   });
 
+  test("a re-anchor whose protected criterion's cases are gone names who allowed it", async () => {
+    for (const principal of ["prn_x", undefined]) {
+      const ctx = newCtx();
+      await finish(
+        ctx,
+        makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1), makeSample("b", true, 1)], {
+          criteria: protectedRecord("c1"),
+        }),
+      );
+      // This run holds case a only, under the same criterion digest.
+      const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], {
+        criteria: protectedRecord("c1"),
+      });
+      const result = await rebaseline(ctx, next, {
+        ownerCheck: () => (principal !== undefined ? { ok: true, principal } : { ok: true }),
+      });
+      expect(result).toEqual({ gateFailed: false, rebaselined: true });
+      const pin = getBaseline("concierge", "smoke", ctx.evalsDir);
+      expect(pin?.runId).toBe("run_bbbb2222bbbb2222");
+      expect(pin?.rebaselined).toEqual({
+        from: "run_aaaa1111aaaa1111",
+        reason: "instrument-changed",
+        cmd: "crewhaus eval --rebaseline",
+        protectedChange: true,
+        ...(principal !== undefined ? { by: principal } : {}),
+      });
+    }
+  });
+
+  test("a re-anchor over a baseline that cannot be read names who allowed it", async () => {
+    const ctx = newCtx();
+    const base = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)], {
+      criteria: protectedRecord("c1"),
+    });
+    await finish(ctx, base);
+    rmSync(join(base.outDir, "results.json"));
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)], {
+      criteria: protectedRecord("c1"),
+    });
+    const result = await rebaseline(ctx, next, {
+      ownerCheck: () => ({ ok: true, principal: "prn_x" }),
+    });
+    expect(result).toEqual({ gateFailed: false, rebaselined: true });
+    const pin = getBaseline("concierge", "smoke", ctx.evalsDir);
+    expect(pin?.rebaselined?.protectedChange).toBe(true);
+    expect(pin?.rebaselined?.by).toBe("prn_x");
+  });
+
   test("a file-level change that decides a protected criterion needs the owner, though its own digest stays", async () => {
     const ctx = newCtx();
     await finish(
