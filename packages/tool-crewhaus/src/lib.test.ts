@@ -113,6 +113,13 @@ describe("spec view", () => {
     expect(JSON.stringify(v.mcpServers)).not.toContain("supersecret");
   });
 
+  test("publicChat is in the view only when cf_worker.public_chat is true", () => {
+    expect(view(`${CLI_SPEC}\ncf_worker:\n  public_chat: true`).publicChat).toBe(true);
+    for (const block of ["", "\ncf_worker:\n  public_chat: false", "\ncf_worker: {}"]) {
+      expect("publicChat" in view(`${CLI_SPEC}${block}`)).toBe(false);
+    }
+  });
+
   test("counts the shape's containers", () => {
     const v = view(CLI_SPEC);
     expect(v.counts["mcpServers"]).toBe(1);
@@ -300,6 +307,34 @@ describe("spec diff", () => {
     expect(added.some((c) => c.kind === "mcp-server-added" && c.widens)).toBe(true);
     const removed = diffSpecViews(view(CLI_SPEC), view(noServer));
     expect(removed.every((c) => !c.widens)).toBe(true);
+  });
+
+  test("turning on cf_worker.public_chat widens; turning it off, or declaring it false, does not", () => {
+    const on = `${CLI_SPEC}\ncf_worker:\n  public_chat: true`;
+    const off = `${CLI_SPEC}\ncf_worker:\n  public_chat: false`;
+    const leaf = (from: string, to: string, widens: boolean) => ({
+      kind: "cf-worker-public-chat",
+      path: "cf_worker.public_chat",
+      from,
+      to,
+      widens,
+    });
+    // The block arriving with public_chat: true.
+    expect(diffSpecViews(view(CLI_SPEC), view(on))).toEqual([
+      { kind: "block-added", path: "cf_worker", to: "cf_worker", widens: false },
+      leaf("false", "true", true),
+    ]);
+    // A block that held false, turned on; and turned off again.
+    expect(diffSpecViews(view(off), view(on))).toEqual([leaf("false", "true", true)]);
+    expect(diffSpecViews(view(on), view(off))).toEqual([leaf("true", "false", false)]);
+    // Declaring it false, or an empty block, grants nothing; nor does removing a true one.
+    expect(diffSpecViews(view(CLI_SPEC), view(off))).toEqual([
+      { kind: "block-added", path: "cf_worker", to: "cf_worker", widens: false },
+    ]);
+    expect(diffSpecViews(view(CLI_SPEC), view(`${CLI_SPEC}\ncf_worker: {}`))).toEqual([
+      { kind: "block-added", path: "cf_worker", to: "cf_worker", widens: false },
+    ]);
+    expect(diffSpecViews(view(on), view(CLI_SPEC)).some((c) => c.widens)).toBe(false);
   });
 
   test("identical specs produce no changes at all", () => {

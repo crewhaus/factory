@@ -303,7 +303,8 @@ describe("the cf-worker flavour refuses precisely what the edge cannot run", () 
     test(`${shape}: every compute builtin is a named warning and is left out`, () => {
       const yaml = withTools(shape, ["all-compute"]);
       if (yaml === undefined) throw new Error(`${shape} has no tool site`);
-      const bundle = emitCfWorkerBundle(lower(parseSpec(yaml)));
+      const spec = parseSpec(yaml);
+      const bundle = emitCfWorkerBundle(spec, lower(spec));
       expect(bundle.warnings).toHaveLength(toolsInCategory("compute").length);
       for (const w of bundle.warnings) {
         expect(w.code).toBe("edge-unsafe-tool");
@@ -318,7 +319,8 @@ describe("the cf-worker flavour refuses precisely what the edge cannot run", () 
     test(`${shape}: a host tool the edge has always refused still fails the compile`, () => {
       const yaml = withTools(shape, SELECTORS);
       if (yaml === undefined) throw new Error(`${shape} has no tool site`);
-      expect(() => emitCfWorkerBundle(lower(parseSpec(yaml)))).toThrow(
+      const spec = parseSpec(yaml);
+      expect(() => emitCfWorkerBundle(spec, lower(spec))).toThrow(
         /cf-worker target cannot run \d+ host tool\(s\): tool "\w+"/,
       );
     });

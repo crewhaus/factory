@@ -77,6 +77,8 @@ describe("the lists derive from the table", () => {
       ["permissions", "delegation"],
       ["transaction_policy", "defaultWriteApproval"],
       ["model_pool", "candidates"],
+      // Whether a deployed worker's /chat answers without its bearer.
+      ["cf_worker", "public_chat"],
     ]);
   });
 

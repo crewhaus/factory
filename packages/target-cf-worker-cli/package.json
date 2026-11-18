@@ -20,7 +20,8 @@
     "@crewhaus/worker-runtime": "workspace:*"
   },
   "devDependencies": {
-    "@crewhaus/tool-todo": "workspace:*"
+    "@crewhaus/tool-todo": "workspace:*",
+    "@crewhaus/tool-web": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

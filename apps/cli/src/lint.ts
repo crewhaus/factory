@@ -1,12 +1,18 @@
 import {
   type CompileWarning,
   type IrNode,
+  KNOWN_TOOLS,
+  type LocatedRuleProblem,
+  type PermissionRuleCheckOptions,
   checkShapeTools,
   collectCompileWarnings,
   lower,
   lowerWithWarnings,
+  permissionRuleFindings,
+  permissionRuleProblemsOf,
   provabilityOf,
   sandboxOnlyProvabilityCheckers,
+  thredzToolNamesOf,
 } from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
 import { wantsProofCheckTools } from "@crewhaus/evaluation-service";
@@ -37,23 +43,11 @@ import {
   builtinToolsFor,
   toolsInCategory,
 } from "@crewhaus/tool-categories";
-import {
-  type PermissionRuleProblem,
-  type RuleToolDescriptor,
-  permissionRuleProblems,
-  shadowedPermissionRules,
-  specPermissionRuleLists,
-} from "@crewhaus/tool-permission-matcher";
-import {
-  NON_CLI_TOOL_FLAGS,
-  RUNTIME_TOOL_NAMES,
-  THREDZ_TOOL_NAMES,
-  TOOL_FLAGS,
-  TOOL_FLAGS_BY_NAME,
-} from "@crewhaus/tool-registry-manifest/flags";
+import { specPermissionRuleLists } from "@crewhaus/tool-permission-matcher";
+import { RUNTIME_TOOL_NAMES, THREDZ_TOOL_NAMES } from "@crewhaus/tool-registry-manifest/flags";
 import { type Document, type Scalar, isAlias, isMap, isScalar, isSeq, parseDocument } from "yaml";
 import { auditModelPlan } from "./model-plan-lint";
-import { auditSpecToolNames, collectToolNames, nonCliBuiltinFlags } from "./scope-audit";
+import { auditSpecToolNames, collectToolNames } from "./scope-audit";
 
 /**
  * Item 41 — `crewhaus lint`. A check-only command: `parseSpec` +
@@ -561,109 +555,17 @@ function unknownExecutionTools(
 }
 
 /**
- * Every tool a rule can name, as the rule checker needs them: the builtins,
- * with their flags, and the tools the runtime registers without a spec
- * listing them (`Skill`, `ListTools`, the browser shape's `Type`, …), by name.
- * Without the second half a real tool name reads as a typo of a builtin, and
- * the "fix" for `alwaysAllow Skill` was `Shell`.
+ * The permission-rule findings live in `@crewhaus/compiler`
+ * (`permission-rules.ts`), so the hosted edge compile returns what this CLI
+ * prints. Re-exported here so the CLI's import sites are unchanged.
  */
-export const KNOWN_TOOLS: ReadonlyArray<RuleToolDescriptor> = [
-  ...Object.values(TOOL_FLAGS),
-  ...Object.values(NON_CLI_TOOL_FLAGS),
-  ...RUNTIME_TOOL_NAMES.map((name) => ({ name })),
-];
-
-/**
- * The tools a spec's `thredz:` block registers under their bare names
- * (`goal_list`, `task_complete`, …; the messaging set too when a block says
- * `messaging: true`), or none when the spec has no block. A crew carries a
- * block per role as well as the crew-wide one.
- */
-export function thredzToolNamesOf(ir: IrNode): string[] {
-  const blocks: Array<{ readonly messaging?: unknown }> = [];
-  const top = (ir as { readonly thredz?: { readonly messaging?: unknown } }).thredz;
-  if (top !== undefined) blocks.push(top);
-  const roles = (ir as { readonly roles?: unknown }).roles;
-  if (Array.isArray(roles)) {
-    for (const role of roles) {
-      const block = (role as { readonly thredz?: { readonly messaging?: unknown } } | null)?.thredz;
-      if (block !== undefined) blocks.push(block);
-    }
-  }
-  if (blocks.length === 0) return [];
-  return [
-    ...THREDZ_TOOL_NAMES.memory,
-    ...(blocks.some((b) => b.messaging === true) ? THREDZ_TOOL_NAMES.messaging : []),
-  ];
-}
-
-/** A rule that can never do what it says, and where the spec holds it. */
-export type LocatedRuleProblem = PermissionRuleProblem & {
-  /** The list that holds the rule, e.g. `models.fast.permissions.deny`. */
-  readonly list: string;
-  /** `<list>[<type> <pattern>]`, e.g. `models.fast.permissions.deny[alwaysDeny fetch]`. */
-  readonly path: string;
+export {
+  KNOWN_TOOLS,
+  type LocatedRuleProblem,
+  type PermissionRuleCheckOptions,
+  permissionRuleProblemsOf,
+  thredzToolNamesOf,
 };
-
-/**
- * The permission rules of a spec that can never do what they say (see
- * `permissionRuleProblems`, and `shadowedPermissionRules` for a deny or ask
- * an allow above it always beats), in every list the spec carries (see
- * `specPermissionRuleLists`: the shape's rules, each model profile's and
- * pool candidate's deny/ask, each sub-agent's allow/deny). A granted tool is
- * one the lowered spec lists, described by the live tool `resolveTool`
- * returns, falling back to the builtin manifest, so the check sees the same
- * declarations the runtime will; the tools a `thredz:` block registers are
- * known in a spec that has one.
- */
-export function permissionRuleProblemsOf(
-  spec: unknown,
-  ir: IrNode,
-  resolveTool: (name: string) => RegisteredTool | undefined,
-): LocatedRuleProblem[] {
-  const lists = specPermissionRuleLists(spec);
-  if (lists.length === 0) return [];
-  const node = ir as { readonly mcp_servers?: Readonly<Record<string, unknown>> };
-  const granted: RuleToolDescriptor[] = [];
-  for (const name of collectToolNames(ir)) {
-    const live = resolveTool(name);
-    const described =
-      live ?? TOOL_FLAGS[name] ?? TOOL_FLAGS_BY_NAME.get(name) ?? nonCliBuiltinFlags(name);
-    if (described === undefined) continue;
-    granted.push({
-      name: described.name,
-      key: name,
-      ...(described.operativeArgs !== undefined ? { operativeArgs: described.operativeArgs } : {}),
-    });
-  }
-  const thredz = thredzToolNamesOf(ir);
-  const known =
-    thredz.length === 0 ? KNOWN_TOOLS : [...KNOWN_TOOLS, ...thredz.map((name) => ({ name }))];
-  const mcpServers = Object.keys(node.mcp_servers ?? {});
-  const out: LocatedRuleProblem[] = [];
-  for (const list of lists) {
-    for (const p of permissionRuleProblems({ rules: list.rules, granted, known, mcpServers })) {
-      out.push({ ...p, list: list.path, path: `${list.path}[${p.type} ${p.pattern}]` });
-    }
-  }
-  // A deny or ask that an allow above it in the same layer always beats —
-  // except in a plan-mode spec, which reads no allow, where it is a note.
-  const permissions = (spec as { readonly permissions?: { readonly mode?: unknown } } | null)
-    ?.permissions;
-  const mode = typeof permissions?.mode === "string" ? permissions.mode : undefined;
-  for (const p of shadowedPermissionRules(lists, mode !== undefined ? { mode } : {})) {
-    const { shadowedBy: _allow, ...problem } = p;
-    out.push({ ...problem, path: `${p.list}[${p.type} ${p.pattern}]` });
-  }
-  return out;
-}
-
-/** Rule findings that inform without saying the rule is dead: never escalated by --strict. */
-const PERMISSION_RULE_NOTES: ReadonlySet<string> = new Set([
-  "builtin-not-reached",
-  "tool-not-known",
-  "shadowed-outside-plan",
-]);
 
 /**
  * The permission rules in a spec that can never do what they say, as compile
@@ -673,11 +575,14 @@ const PERMISSION_RULE_NOTES: ReadonlySet<string> = new Set([
  *
  * `loadTools` imports every builtin package the CLI carries (about half a
  * second), so it is called only when the spec has a rule to check: a
- * rule-less compile does not pay for it.
+ * rule-less compile does not pay for it. The live tools describe each listed
+ * tool, by spec key or registered name. `opts.edge` reads the rules as a
+ * Cloudflare Worker reads them (see {@link PermissionRuleCheckOptions}).
  */
 export async function permissionRuleWarnings(
   yamlText: string,
   loadTools: () => Promise<Readonly<Record<string, RegisteredTool>>>,
+  opts: PermissionRuleCheckOptions = {},
 ): Promise<Array<{ code: string; path: string; message: string }>> {
   let spec: Spec;
   let ir: IrNode;
@@ -691,17 +596,7 @@ export async function permissionRuleWarnings(
   const toolMap = await loadTools();
   const byRegisteredName: Record<string, RegisteredTool> = {};
   for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
-  // A `builtin-not-reached` note is about a rule that still fires (on a
-  // declared MCP server's tools), a `tool-not-known` one about a name a
-  // plugin or custom tool may still supply, and a `shadowed-outside-plan` one
-  // about a rule a plan-mode spec still fires, so --strict escalates none.
-  return permissionRuleProblemsOf(spec, ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
-    (p) => ({
-      code: PERMISSION_RULE_NOTES.has(p.code) ? "permission-rule-note" : "permission-rule",
-      path: p.list,
-      message: p.message,
-    }),
-  );
+  return permissionRuleFindings(spec, ir, (name) => toolMap[name] ?? byRegisteredName[name], opts);
 }
 
 /** Re-exported for the CLI wrapper's philosophy-alignment parity note. */

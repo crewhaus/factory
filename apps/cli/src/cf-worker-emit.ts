@@ -19,21 +19,26 @@
  * typed IR variant, narrowed on the `target` discriminant — never the raw
  * spec.
  *
- * What the edge leaves out of a spec is said as a warning, never dropped in
- * silence: builtins it cannot run (`edge-unsafe-tool`) and the answer gates
- * it does not wire (`cfWorkerUnwiredBlockWarnings`, the compiler's rule, which
- * the hosted compile applies too).
+ * A worker is built only from settings it enforces: the compiler's edge gate
+ * (`assertCfWorkerSafetyEnforced`, which the hosted compile runs too) refuses
+ * a safety setting the worker does not enforce, naming each path, and says
+ * which wired tools no `alwaysAllow` rule covers. What else the edge leaves
+ * out of a spec is said as a warning: builtins it cannot run
+ * (`edge-unsafe-tool`) and the answer gates it does not wire
+ * (`cfWorkerUnwiredBlockWarnings`).
  */
 import {
   type Bundle,
   type CompileResult,
   type CompileWarning,
+  assertCfWorkerSafetyEnforced,
   assertCfWorkerToolsEdgeSafe,
   assertToolScopesStrict,
   cfWorkerUnwiredBlockWarnings,
 } from "@crewhaus/compiler";
 import { CompilerError } from "@crewhaus/errors";
 import type { IrNode } from "@crewhaus/ir";
+import type { Spec } from "@crewhaus/spec";
 import { emitCfWorkerCli } from "@crewhaus/target-cf-worker-cli";
 import { emitCfWorkerGraph } from "@crewhaus/target-cf-worker-graph";
 import { emitCfWorkerWorkflow } from "@crewhaus/target-cf-worker-workflow";
@@ -54,14 +59,21 @@ export type CfWorkerEmitOptions = {
 };
 
 /**
- * Lowered-IR → cf-worker `Bundle`, mirroring the compiler-worker's cf-worker
- * emit arm. Runs the SAME offline sink-scope gate the Worker applies
- * (`assertToolScopesStrict`, since this bypasses `compile()`'s built-in one),
- * then dispatches on the IR's `target` discriminant. Throws `CompilerError`
- * (a `CrewhausError`, so the CLI routes it through `die()` for a clean
- * one-liner) on an unsupported target.
+ * Parsed spec + its lowered IR → cf-worker `Bundle`, mirroring the
+ * compiler-worker's cf-worker emit arm. Runs the SAME offline sink-scope gate
+ * the Worker applies (`assertToolScopesStrict`: this path does not go through
+ * `compile()`, which runs its own), the edge tool gate and the edge safety gate,
+ * then dispatches on the IR's `target` discriminant. The spec is required:
+ * the safety gate reads what the author wrote. Throws `CompilerError` (a
+ * `CrewhausError`, so the CLI routes it through `die()` for a clean
+ * one-liner) on an unsupported target or a setting the worker does not
+ * enforce.
  */
-export function emitCfWorkerBundle(ir: IrNode, opts: CfWorkerEmitOptions = {}): CompileResult {
+export function emitCfWorkerBundle(
+  spec: Spec,
+  ir: IrNode,
+  opts: CfWorkerEmitOptions = {},
+): CompileResult {
   // The target first: a tool finding on a shape the edge cannot emit at all
   // would send the operator to fix tools, only to meet this error next.
   if (!(CF_WORKER_EMIT_TARGETS as ReadonlyArray<string>).includes(ir.target)) {
@@ -75,9 +87,14 @@ export function emitCfWorkerBundle(ir: IrNode, opts: CfWorkerEmitOptions = {}): 
   assertToolScopesStrict(ir);
   // The edge tool gate: host tools the edge has always refused, and builtins
   // no shape can run, throw; any other builtin the worker does not wire is an
-  // `edge-unsafe-tool` warning (the CLI prints it, and --strict escalates it)
-  // rather than a silent omission.
-  const warnings = [...assertCfWorkerToolsEdgeSafe(ir), ...cfWorkerUnwiredBlockWarnings(ir)];
+  // `edge-unsafe-tool` warning (the CLI prints it, and --strict escalates it).
+  // Then the edge safety gate: a setting the worker does not enforce throws,
+  // and its informational notices ride along.
+  const warnings = [
+    ...assertCfWorkerToolsEdgeSafe(ir),
+    ...assertCfWorkerSafetyEnforced(spec, ir),
+    ...cfWorkerUnwiredBlockWarnings(ir),
+  ];
   const bundle = emitFor(ir, opts);
   return { files: bundle.files, warnings };
 }

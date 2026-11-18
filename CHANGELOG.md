@@ -794,6 +794,68 @@ these on: they reach every harness that uses what each one names.
   sessions folder that links to another place inside the harness works as
   before. Keep the sessions folder inside the harness folder.
 
+## [0.8.3] - 2026-11-15
+
+A Cloudflare Worker built with `crewhaus compile --emit-as cf-worker` answers
+`POST /chat` only with its bearer token, runs a tool only when an `alwaysAllow`
+rule covers the call, and is built only from settings the worker enforces.
+
+### Changed
+
+#### Before you upgrade
+
+**Changes that can affect a harness without opting in.** No spec has to turn
+these on: they reach every harness that uses what each one names.
+
+- **A Cloudflare Worker answers `POST /chat` only with its bearer token.** A
+  worker built with `crewhaus compile --emit-as cf-worker` serves `/chat` to a
+  request carrying `Authorization: Bearer <token>` that matches its
+  `CHAT_TOKEN` Worker secret, compared in constant time. A missing or wrong
+  token is answered with 401, and while `CHAT_TOKEN` is unset every `/chat`
+  request is answered with 503 and the code `NO_CHAT_TOKEN`. `OPTIONS` and
+  `GET /health` answer without a token; `/health` returns `{"ok":true}`.
+  Browser clients may send the header (CORS allows `Authorization`). A worker
+  meant to answer anyone sets `cf_worker.public_chat` to `true` in its spec, a
+  key `crewhaus optimize` never changes, and the compile warns. To pick this
+  up, recompile, run `npm install` in the bundle (its `package.json` pins the
+  `@crewhaus/worker-runtime` its `worker.js` imports), run
+  `wrangler secret put CHAT_TOKEN` (for `wrangler dev`, put the token in
+  `.dev.vars`), have your clients send the token, and redeploy.
+
+- **A tool runs on a Cloudflare Worker only when an `alwaysAllow` rule covers
+  the call.** Before every tool call the worker decides with the spec's
+  `permissions.rules` and `permissions.mode`: a matching `alwaysDeny` or
+  `alwaysAsk` rule wins over any `alwaysAllow`, `mode: auto` reads as
+  `default`, and `mode: plan` runs only read-only tools. Any other call gets an
+  error tool result saying it needs approval and the worker has nobody to give
+  it, and the tool does not run. The compile names each listed tool that a rule
+  without arguments, or the mode, refuses on every call. Add a rule such as
+  `{ type: alwaysAllow, pattern: WebFetch }` for each tool the worker should
+  run (a rule names a tool by its registered name, `WebFetch`, not by its
+  `webFetch` key), then recompile, run `npm install` in the bundle and
+  redeploy. A spec's rules decide its local build too, where that rule lets the
+  tool run without asking: for a spec you also build locally, scope the rule
+  to what the worker needs, such as `WebFetch(https://api.example.com/**)`, or
+  keep it in a spec you compile only with `--emit-as cf-worker`.
+
+- **`--emit-as cf-worker` builds a worker only from settings the worker
+  enforces.** The compile stops, naming each path and why, when the spec
+  declares `hooks`, `budget`, `security`, `agent.rate_limits`, a `model_pool`,
+  `limits.turn_timeout_ms`, `limits.model_call_timeout_ms`,
+  `limits.loop_detection.escalation: justify`, a workflow step or graph node of
+  `kind: judge`, or a graph edge with `when`. This holds for the CLI and for
+  `@crewhaus/compiler-worker`'s `POST /compile`; redeploy a compiler worker you
+  run yourself. The worker enforces `permissions` as above, and
+  `limits.max_tool_iterations`, `limits.context_limit`, `limits.deadline_ms`
+  (checked before each model call; on a workflow it bounds the whole run, as a
+  local workflow's does), `limits.max_concurrent_tools` (it runs one tool call
+  at a time) and `limits.loop_detection`. A workflow worker starts no step
+  once `limits.deadline_ms` has passed since the run began, and its stream
+  ends with an `error` frame naming that step: set it to the time the whole
+  run may take. To cap spend, set a spending limit on the Anthropic account the
+  worker's key belongs to. Keep other settings in a spec you compile without
+  `--emit-as cf-worker`.
+
 ## [0.8.2] - 2026-11-12
 
 A channel daemon's webhook routes and a managed daemon's federation route read

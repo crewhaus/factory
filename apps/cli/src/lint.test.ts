@@ -2,7 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type IrNode, provabilityOf } from "@crewhaus/compiler";
+import {
+  KNOWN_TOOLS as COMPILER_KNOWN_TOOLS,
+  type IrNode,
+  permissionRuleProblemsOf as compilerPermissionRuleProblemsOf,
+  thredzToolNamesOf as compilerThredzToolNamesOf,
+  lower,
+  parseSpec,
+  permissionRuleFindings,
+  provabilityOf,
+} from "@crewhaus/compiler";
 import { wantsProofCheckTools } from "@crewhaus/evaluation-service";
 import {
   buildEvidenceIndex,
@@ -12,9 +21,9 @@ import {
 } from "@crewhaus/provability";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { rateLimitStatus } from "@crewhaus/tool-codehost";
-import { THREDZ_TOOL_NAMES } from "@crewhaus/tool-registry-manifest/flags";
 import { INFORMATIONAL_COMPILE_WARNING_CODES } from "./compile-warnings";
 import {
+  KNOWN_TOOLS,
   type LintFinding,
   PROVABILITY_SOURCE_CATEGORIES,
   applyLintFixes,
@@ -23,6 +32,7 @@ import {
   formatLintText,
   levenshtein,
   nearestToolName,
+  permissionRuleProblemsOf,
   permissionRuleWarnings,
   runLint,
   suggestSafeName,
@@ -509,6 +519,25 @@ permissions:
     ]);
   });
 
+  // The findings themselves are the compiler's (permission-rules.test.ts
+  // there); the CLI hands them its live tools and the edge reading.
+  test("compile's rule check is the compiler's findings, read with the CLI's tools and the edge flag", async () => {
+    const yaml = `${validCli}tools: [webFetch]
+permissions:
+  rules:
+    - { type: alwaysAllow, pattern: WebFetch }
+    - { type: alwaysDeny, pattern: "WebFetch(https://evil.example.net/**)" }
+    - { type: alwaysDeny, pattern: webFetch }
+`;
+    const spec = parseSpec(yaml);
+    const ir = lower(spec);
+    for (const edge of [false, true]) {
+      const warnings = await permissionRuleWarnings(yaml, async () => ({}), { edge });
+      expect(warnings).toEqual(permissionRuleFindings(spec, ir, undefined, { edge }));
+      expect(warnings.length).toBe(edge ? 1 : 2);
+    }
+  });
+
   // wave III review: a pool candidate carries its own deny/ask inline, read
   // the same way as a profile's, and neither lint nor PermissionAudit read
   // it. The lists now come from one reader both use.
@@ -588,21 +617,11 @@ ${rules}
     ]);
   });
 
-  test("a crew role's own thredz: block registers the same tools", () => {
-    const ir = (roles: unknown[], top?: unknown) =>
-      ({
-        target: "crew",
-        roles,
-        ...(top !== undefined ? { thredz: top } : {}),
-      }) as unknown as IrNode;
-    const memory = [...THREDZ_TOOL_NAMES.memory];
-    const all = [...memory, ...THREDZ_TOOL_NAMES.messaging];
-    expect(thredzToolNamesOf(ir([{ name: "a" }]))).toEqual([]);
-    expect(thredzToolNamesOf(ir([{ name: "a", thredz: {} }]))).toEqual(memory);
-    expect(
-      thredzToolNamesOf(ir([{ name: "a" }, { name: "b", thredz: { messaging: true } }])),
-    ).toEqual(all);
-    expect(thredzToolNamesOf(ir([], { messaging: true }))).toEqual(all);
+  test("the rule checker's names are the compiler's, re-exported", () => {
+    expect(thredzToolNamesOf).toBe(compilerThredzToolNamesOf);
+    expect(permissionRuleProblemsOf).toBe(compilerPermissionRuleProblemsOf);
+    expect(KNOWN_TOOLS).toBe(COMPILER_KNOWN_TOOLS);
+    expect(KNOWN_TOOLS.length).toBeGreaterThan(100);
   });
 
   test("a rule naming a tool nothing knows gets a note, not a fix", () => {

@@ -1421,6 +1421,17 @@ export type IrCliOptions = {
   readonly banner?: IrCliBanner;
 };
 
+/**
+ * Who may call a Cloudflare Worker build's `POST /chat`, lowered from the
+ * spec's `cf_worker:` block on cli, workflow and graph. Present only when the
+ * spec sets `public_chat: true`, and then the worker answers `/chat` without
+ * the `CHAT_TOKEN` bearer; absent, every `/chat` request needs it. A local
+ * bundle has no `/chat`, so only the cf-worker emitters read this.
+ */
+export type IrCfWorker = {
+  readonly publicChat: true;
+};
+
 export type IrV0 = {
   readonly version: 0;
   readonly name: string;
@@ -1523,6 +1534,9 @@ export type IrV0 = {
   readonly wallets?: readonly IrWalletBinding[];
   readonly contracts?: readonly IrContractBinding[];
   readonly transactionPolicy?: IrTransactionPolicy;
+  /** A Cloudflare Worker build's `/chat` callers (spec `cf_worker`). Present
+   *  only when the spec sets `public_chat: true`. */
+  readonly cfWorker?: IrCfWorker;
 };
 
 /**
@@ -1606,6 +1620,9 @@ export type IrWorkflowV0 = {
   /** v0.3.0 — carried when the spec declares `continuity:` (NOT default-on
    *  here); target-workflow prints the ignored-note comment. */
   readonly continuity?: IrContinuity;
+  /** A Cloudflare Worker build's `/chat` callers (spec `cf_worker`). Present
+   *  only when the spec sets `public_chat: true`. */
+  readonly cfWorker?: IrCfWorker;
 };
 
 /**
@@ -2165,6 +2182,9 @@ export type IrGraphV0 = {
   readonly wallets?: readonly IrWalletBinding[];
   readonly contracts?: readonly IrContractBinding[];
   readonly transactionPolicy?: IrTransactionPolicy;
+  /** A Cloudflare Worker build's `/chat` callers (spec `cf_worker`). Present
+   *  only when the spec sets `public_chat: true`. */
+  readonly cfWorker?: IrCfWorker;
 };
 
 /**

@@ -2960,3 +2960,48 @@ describe("Batch E — knowledge block (agent-shape RAG, G22)", () => {
     ).toThrow(SpecParseError);
   });
 });
+
+describe("the cf_worker: block", () => {
+  const SHAPES: Record<string, string> = {
+    cli: "name: c\ntarget: cli\nagent: { model: m, instructions: i }\n",
+    workflow: "name: w\ntarget: workflow\nmodel: m\nsteps:\n  - { name: s1, instructions: go }\n",
+    graph: "name: g\ntarget: graph\nmodel: m\nentry: a\nnodes:\n  a: { instructions: x }\n",
+  };
+
+  test("parses on cli, workflow and graph, true and false alike", () => {
+    for (const [shape, head] of Object.entries(SHAPES)) {
+      for (const value of [true, false]) {
+        const spec = parseSpec(`${head}cf_worker:\n  public_chat: ${value}\n`) as {
+          target: string;
+          cf_worker?: { public_chat?: boolean };
+        };
+        expect(`${spec.target}:${spec.cf_worker?.public_chat}`).toBe(`${shape}:${value}`);
+      }
+      const empty = parseSpec(`${head}cf_worker: {}\n`) as { cf_worker?: object };
+      expect(empty.cf_worker).toEqual({});
+    }
+  });
+
+  test("every other shape refuses it", () => {
+    const channel = [
+      "name: ch",
+      "target: channel",
+      "agent: { model: m, instructions: i }",
+      "channels:",
+      "  slack: { botToken: $SLACK_BOT_TOKEN, signingSecret: $SLACK_SIGNING_SECRET }",
+      "routing: { sessionKey: thread }",
+    ].join("\n");
+    expect(parseSpec(channel).target).toBe("channel");
+    expect(() => parseSpec(`${channel}\ncf_worker: { public_chat: true }\n`)).toThrow(
+      SpecParseError,
+    );
+  });
+
+  test("public_chat takes a boolean, and the block takes no other key", () => {
+    const head = SHAPES["cli"] ?? "";
+    expect(() => parseSpec(`${head}cf_worker:\n  public_chat: "yes"\n`)).toThrow(SpecParseError);
+    expect(() => parseSpec(`${head}cf_worker:\n  public_chat: true\n  extra: x\n`)).toThrow(
+      SpecParseError,
+    );
+  });
+});

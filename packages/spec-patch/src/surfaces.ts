@@ -110,6 +110,7 @@ export const SECURITY_SURFACES: ReadonlyArray<{
   },
   { prefix: ["hooks"], reason: "hooks run commands on the machine at lifecycle points" },
   { prefix: ["security"], reason: "the security block is the harness's own defence configuration" },
+  { prefix: ["cf_worker"], reason: "decides who may call a deployed worker's /chat" },
   { prefix: ["wallets"], reason: "wallets hold funds" },
   { prefix: ["chains"], reason: "chain bindings decide which network is written to" },
   { prefix: ["contracts"], reason: "contract bindings decide which addresses are called" },

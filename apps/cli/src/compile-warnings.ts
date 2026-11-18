@@ -55,6 +55,15 @@
 //
 // permission-rule-note: a glob such as `*write*` that still fires on a
 // declared MCP server's tools is not dead, it merely misses a builtin.
+//
+// 0.8.3 — the cf-worker edge's three notices are informational. A worker
+// decides each tool call at run time, and refuses a call no alwaysAllow rule
+// covers, or one a deny or ask rule or plan mode refuses: edge-tool-needs-allow
+// says which wired tool is refused on every call, and a spec may list a tool
+// on purpose for its local build. edge-permission-mode
+// says a worker reads mode auto as default, which no edit to the edge build
+// changes. edge-public-chat says the owner chose cf_worker.public_chat, a
+// decision --strict must not overrule.
 export const INFORMATIONAL_COMPILE_WARNING_CODES: readonly string[] = [
   "channel-reactions-join",
   "channel-plugins-at-start",
@@ -69,6 +78,9 @@ export const INFORMATIONAL_COMPILE_WARNING_CODES: readonly string[] = [
   "model-capabilities-unknown",
   "model-strongest-crosses-provider",
   "model-sunset",
+  "edge-permission-mode",
+  "edge-tool-needs-allow",
+  "edge-public-chat",
 ];
 
 /** Lays codes out comma-separated, one help line per ~72 columns. */

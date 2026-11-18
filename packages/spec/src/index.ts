@@ -2920,6 +2920,35 @@ const exposeBlock = z
   .strict()
   .optional();
 
+/**
+ * The `cf_worker:` block (cli, workflow and graph): settings only a
+ * Cloudflare Worker build (`crewhaus compile --emit-as cf-worker`) reads.
+ *
+ *   - `public_chat: true` serves the worker's `POST /chat` without the
+ *     `CHAT_TOKEN` bearer, so anyone who finds its URL can run the agent on
+ *     its `ANTHROPIC_API_KEY` and its tools. Absent or `false`, every `/chat`
+ *     request needs the bearer.
+ *
+ * Who may call a deployed worker is the owner's decision: the optimizer never
+ * changes it (`OPTIMIZER_REFUSED_LEAVES` in spec-patch), and the edge compile
+ * warns when `public_chat` is set. A local bundle has no `/chat`, so a local
+ * build is the same with or without the block. Every other shape refuses it.
+ */
+const cfWorkerBlock = z
+  .object({
+    public_chat: z
+      .boolean()
+      .optional()
+      .describe(
+        "Cloudflare Worker builds (--emit-as cf-worker) only: public_chat: true serves POST /chat without the CHAT_TOKEN bearer",
+      ),
+  })
+  .strict()
+  .optional()
+  .describe(
+    "settings only a Cloudflare Worker build (--emit-as cf-worker) reads; without public_chat: true, POST /chat needs the CHAT_TOKEN bearer",
+  );
+
 const cliSchema = z
   .object({
     name: safeName,
@@ -2989,6 +3018,7 @@ const cliSchema = z
     wallets: walletsBlock,
     contracts: contractsBlock,
     transaction_policy: transactionPolicyBlock,
+    cf_worker: cfWorkerBlock,
   })
   .strict();
 
@@ -3062,6 +3092,7 @@ const workflowSchema = z
     wallets: walletsBlock,
     contracts: contractsBlock,
     transaction_policy: transactionPolicyBlock,
+    cf_worker: cfWorkerBlock,
   })
   .strict();
 
@@ -3388,6 +3419,7 @@ const graphSchema = z
     wallets: walletsBlock,
     contracts: contractsBlock,
     transaction_policy: transactionPolicyBlock,
+    cf_worker: cfWorkerBlock,
   })
   .strict();
 

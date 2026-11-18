@@ -23,6 +23,7 @@ import type {
   IrBatchV0,
   IrBrowserV0,
   IrBudget,
+  IrCfWorker,
   IrChainBinding,
   IrChainFinality,
   IrChainGameV0,
@@ -157,9 +158,20 @@ import {
   toolConfigProblems,
 } from "@crewhaus/tool-categories";
 import {
+  compilePattern,
   shadowedPermissionRules,
   specPermissionRuleLists,
 } from "@crewhaus/tool-permission-matcher";
+import { TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
+// 0.8.3 — the decision a worker makes before every tool call, imported via
+// the `/permissions` SUBPATH for the same reason as `/tool-policy` below: the
+// edge gate asks it which wired tool the worker refuses on every call.
+import {
+  type WorkerPermissionRule,
+  type WorkerPermissions,
+  type WorkerToolDecision,
+  decideWorkerToolCall,
+} from "@crewhaus/worker-runtime/permissions";
 // Loop contract 0.4 (Batch F, G12/G83) — the cf-worker edge-safety tool policy
 // lives in `@crewhaus/worker-runtime` (the runtime that would execute the
 // tools on the edge). Imported via the `/tool-policy` SUBPATH so this offline
@@ -285,7 +297,13 @@ export type LowerOptions = {
  * `"provability-research-rung-unreachable"` (a research floor of `checked` /
  * `proven`, which no report can meet) — all five remediable, so `crewhaus
  * compile --strict` escalates them (apps/cli/src/compile-warnings.ts lists
- * the informational codes that it does not), `path` the spec key it concerns
+ * the informational codes that it does not), and the cf-worker edge's three
+ * informational notices: `"edge-permission-mode"` (a worker reads mode
+ * `auto` as `default`), `"edge-tool-needs-allow"` (a wired builtin whose
+ * every call the worker refuses: no `alwaysAllow` rule covers it, or a deny
+ * or ask rule, plan mode or its own flags refuse it whatever allows it) and
+ * `"edge-public-chat"` (`cf_worker.public_chat` serves `/chat` without a
+ * token); `path` the spec key it concerns
  * (dot-joined), `message` the human explanation. Additive: every existing
  * `compile()` consumer that only reads `.files` keeps working unchanged. A
  * warning code added from 0.9.0 is classified on purpose in
@@ -1346,9 +1364,10 @@ function ungrantedSubAgentTools(ir: IrNode): ReadonlyArray<CompileWarning> {
 
 /**
  * 0.8.0 (design/0.8.0-provability-release.md §0, §1, §3; review I40) — the
- * answer gates a spec declares that the edge worker does not run, said
- * rather than dropped. The cf-worker emitters wire tools, budget, limits and
- * trace; a `provability:` block lowers onto the IR and the worker never reads
+ * answer gates a spec declares that the edge worker does not run, each said
+ * as a warning. The cf-worker emitters wire tools, the permission rules, the
+ * `limits:` keys {@link assertCfWorkerSafetyEnforced} admits, and trace; a
+ * `provability:` block lowers onto the IR and the worker never reads
  * it, so a spec that says `grounded` deployed a worker serving every answer
  * unverified — no gate, no footer, no bundle — with no word from the CLI,
  * the hosted compiler or `--strict`. §1: an answer that does not carry proof
@@ -1379,6 +1398,393 @@ export function cfWorkerUnwiredBlockWarnings(ir: IrNode): CompileWarning[] {
       path: "evaluation",
       message:
         "the cf-worker edge does not run the in-loop evaluation judge: the worker's answers are served ungraded. Compile without --emit-as to grade them, or remove the block",
+    });
+  }
+  return warnings;
+}
+
+/**
+ * Where a spec restrains its tools or its run: the roots the cf-worker edge
+ * gate ({@link assertCfWorkerSafetyEnforced}) walks. The five safety blocks
+ * come first, then the two places outside them where a spec restrains tools:
+ * an agent's `rate_limits`, and every `model_pool`, whose candidates carry
+ * their own permissions, tools, rate limits and spend caps. `*` stands for an
+ * array index or a record key. `models:` is not a root: a profile's
+ * restraints reach a model only through a `model_pool`, and a single-model
+ * slot that names a narrowing profile is refused at lowering.
+ */
+export const CF_WORKER_GATED_ROOTS: ReadonlyArray<string> = Object.freeze([
+  "permissions",
+  "hooks",
+  "limits",
+  "budget",
+  "security",
+  "agent.rate_limits",
+  "agent.model_pool",
+  "steps.*.model_pool",
+  "nodes.*.model_pool",
+]);
+
+/** A setting under a gated root that a Cloudflare Worker build enforces. */
+export type CfWorkerEnforcedKey = {
+  /** The leaf's spec path, dot-joined. */
+  readonly path: string;
+  /**
+   * `config`: the worker reads the declared value, so a build that declares
+   * it differs from one that does not. `construction`: the worker meets any
+   * value the schema admits by how it runs, so the build is the same either
+   * way.
+   */
+  readonly enforcedBy: "config" | "construction";
+  /** How the worker enforces it. */
+  readonly how: string;
+  /** Values of the leaf the worker cannot honour, each refused with `reason`. */
+  readonly refuse?: { readonly values: ReadonlyArray<string>; readonly reason: string };
+};
+
+/**
+ * The allow-list of the edge gate: every leaf under a gated root that a
+ * Cloudflare Worker build enforces, and how. A declared leaf with no row here
+ * is refused, so a key the schema gains later is refused until a row proves
+ * the worker enforces it.
+ */
+export const CF_WORKER_ENFORCED_KEYS: ReadonlyArray<CfWorkerEnforcedKey> = Object.freeze([
+  {
+    path: "permissions.mode",
+    enforcedBy: "config",
+    how: "CONFIG.permissions.mode, read before every tool call; auto reads as default",
+  },
+  {
+    path: "permissions.rules",
+    enforcedBy: "config",
+    how: "CONFIG.permissions.rules, decided before every tool call, deny and ask rules before allow rules",
+  },
+  {
+    path: "permissions.ask_mode",
+    enforcedBy: "construction",
+    how: "every ask is refused on a worker, whatever ask_mode says: deny's behaviour, and the safe reading of pause, since a worker has no store to park a call in",
+  },
+  {
+    path: "permissions.delegation.max_days",
+    enforcedBy: "construction",
+    how: "a worker applies no delegation rule — the ceiling bounds rules a local Home reads from its deployment record, and a worker refuses every call no alwaysAllow rule covers — so every ceiling is met",
+  },
+  {
+    path: "limits.max_tool_iterations",
+    enforcedBy: "config",
+    how: "CONFIG.limits.maxToolIterations caps the model-to-tool cycles of each loop",
+  },
+  {
+    path: "limits.context_limit",
+    enforcedBy: "config",
+    how: "CONFIG.limits.contextLimit ends a loop whose context reaches it",
+  },
+  {
+    path: "limits.deadline_ms",
+    enforcedBy: "config",
+    how: "CONFIG.limits.deadlineMs, checked before each model call (a call in flight finishes); a workflow is bounded as a whole run",
+  },
+  {
+    path: "limits.max_concurrent_tools",
+    enforcedBy: "construction",
+    how: "the worker runs one tool call at a time, and its steps and nodes one after another, so every cap the schema admits (at least 1) is met",
+  },
+  {
+    path: "limits.loop_detection.window",
+    enforcedBy: "config",
+    how: "CONFIG.limits.loopDetection.window",
+  },
+  {
+    path: "limits.loop_detection.threshold",
+    enforcedBy: "config",
+    how: "CONFIG.limits.loopDetection.threshold",
+  },
+  {
+    path: "limits.loop_detection.escalation",
+    enforcedBy: "config",
+    how: "CONFIG.limits.loopDetection.escalation, warn or abort",
+    refuse: {
+      values: ["justify"],
+      reason: "justify needs the intent gate, which a worker does not run — use warn or abort",
+    },
+  },
+]);
+
+const CF_WORKER_POOL_REFUSAL =
+  "a worker serves one model per agent, step or node; its candidates' permissions, tools, rate limits and spend caps would not apply";
+
+/**
+ * Why the edge gate refuses a setting, by spec path (`*`: any array index or
+ * record key). Messages only, never decisions: what is refused is whatever
+ * {@link CF_WORKER_ENFORCED_KEYS} does not admit. A refused leaf is reported
+ * at the longest row that holds it, else at the leaf itself with
+ * {@link CF_WORKER_DEFAULT_REFUSAL}.
+ */
+export const CF_WORKER_REFUSAL_REASONS: Readonly<Record<string, string>> = Object.freeze({
+  hooks: "a Cloudflare Worker has no process to run a hook command",
+  budget:
+    "a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to",
+  "security.justification": "a Cloudflare Worker runs no intent gate",
+  "security.egressMatcher": "a Cloudflare Worker runs no egress check",
+  "limits.turn_timeout_ms":
+    "a Cloudflare Worker arms no per-turn timer; limits.deadline_ms is checked before each model call",
+  "limits.model_call_timeout_ms": "a Cloudflare Worker arms no per-call timer",
+  "agent.rate_limits": "a stateless worker keeps no call counts across requests",
+  "agent.model_pool": CF_WORKER_POOL_REFUSAL,
+  "steps.*.model_pool": CF_WORKER_POOL_REFUSAL,
+  "nodes.*.model_pool": CF_WORKER_POOL_REFUSAL,
+});
+
+/** The reason for a refused leaf no {@link CF_WORKER_REFUSAL_REASONS} row holds. */
+export const CF_WORKER_DEFAULT_REFUSAL = "the cf-worker edge does not enforce it";
+
+type SpecSegment = string | number;
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** `["steps", 0, "model_pool"]` → `steps[0].model_pool`, as `toolSitesOf` spells a path. */
+function specPathText(path: ReadonlyArray<SpecSegment>): string {
+  return path
+    .map((seg, i) => (typeof seg === "number" ? `[${seg}]` : i === 0 ? seg : `.${seg}`))
+    .join("");
+}
+
+/** Every value at `pattern` (`*`: each array index or record key), with its path. */
+function valuesAtPattern(
+  value: unknown,
+  pattern: ReadonlyArray<string>,
+  at: ReadonlyArray<SpecSegment> = [],
+): Array<{ readonly path: ReadonlyArray<SpecSegment>; readonly value: unknown }> {
+  if (value === undefined) return [];
+  const [head, ...rest] = pattern;
+  if (head === undefined) return [{ path: at, value }];
+  if (head === "*") {
+    if (Array.isArray(value)) return value.flatMap((v, i) => valuesAtPattern(v, rest, [...at, i]));
+    if (isRecord(value)) {
+      return Object.entries(value).flatMap(([k, v]) => valuesAtPattern(v, rest, [...at, k]));
+    }
+    return [];
+  }
+  return isRecord(value) ? valuesAtPattern(value[head], rest, [...at, head]) : [];
+}
+
+/**
+ * The leaves a block declares: objects are descended, and a non-empty array
+ * or a scalar is one leaf. An empty array or object declares nothing.
+ */
+function declaredLeaves(
+  value: unknown,
+  path: ReadonlyArray<SpecSegment>,
+  out: Array<{ readonly path: ReadonlyArray<SpecSegment>; readonly value: unknown }>,
+): void {
+  if (value === undefined) return;
+  if (Array.isArray(value)) {
+    if (value.length > 0) out.push({ path, value });
+    return;
+  }
+  if (isRecord(value)) {
+    for (const [key, child] of Object.entries(value)) declaredLeaves(child, [...path, key], out);
+    return;
+  }
+  out.push({ path, value });
+}
+
+/** Whether `pattern` (`*`: any one segment) names the first segments of `path`. */
+function patternHolds(pattern: ReadonlyArray<string>, path: ReadonlyArray<SpecSegment>): boolean {
+  return (
+    pattern.length <= path.length &&
+    pattern.every((seg, i) => seg === "*" || seg === String(path[i]))
+  );
+}
+
+/**
+ * The spec's permissions as they reach EVERY call of one tool on a worker,
+ * whatever its arguments. A rule with no argument glob, and one whose
+ * pattern does not compile, is kept as written: the worker reads it the same
+ * way for every call. A deny or an ask whose argument glob is `**` is kept as
+ * a rule of its tool half when the tool declares an operative argument
+ * (`flags.operativeArgs`): every call of such a tool carries a value there,
+ * and `**` matches every value. Any other deny or ask with an argument glob
+ * is left out, since it may not reach every call. An allow with an argument
+ * glob covers some calls, so it is read as an allow of its tool half.
+ *
+ * So a tool is named as refused on every call only when the rules match
+ * every call the worker can receive.
+ */
+function rulesForEveryCall(
+  permissions: IrPermissions | undefined,
+  flags: { readonly operativeArgs?: ReadonlyArray<unknown> } | undefined,
+): WorkerPermissions {
+  const everyCallCarriesAValue = (flags?.operativeArgs?.length ?? 0) > 0;
+  const rules: WorkerPermissionRule[] = [];
+  for (const rule of permissions?.rules ?? []) {
+    let compiled: ReturnType<typeof compilePattern>;
+    try {
+      compiled = compilePattern(rule.pattern);
+    } catch {
+      rules.push(rule);
+      continue;
+    }
+    if (compiled.argGlob === null) rules.push(rule);
+    else if (rule.type === "alwaysAllow") {
+      rules.push({ type: "alwaysAllow", pattern: compiled.toolGlob });
+    } else if (compiled.argGlob === "**" && everyCallCarriesAValue) {
+      rules.push({ type: rule.type, pattern: compiled.toolGlob });
+    }
+  }
+  return { ...(permissions?.mode !== undefined ? { mode: permissions.mode } : {}), rules };
+}
+
+/** A wired tool a worker refuses on every call, and why. */
+type EdgeToolRefusal = {
+  /** The tool's registered name. */
+  readonly name: string;
+  /** The worker's decision for every call of it; `reason` says why. */
+  readonly decision: WorkerToolDecision;
+  /**
+   * Whether an `alwaysAllow` rule for the tool would let a call run: false
+   * when a deny or ask rule, plan mode or the tool's own flags refuse every
+   * call whatever allows it.
+   */
+  readonly allowWouldRun: boolean;
+};
+
+/**
+ * Whether a worker refuses every call of the builtin `key`: the worker's own
+ * {@link decideWorkerToolCall}, over {@link rulesForEveryCall} and the
+ * tool's manifest flags. Undefined when some call runs.
+ */
+function edgeToolRefusal(
+  key: string,
+  permissions: IrPermissions | undefined,
+): EdgeToolRefusal | undefined {
+  const name = registeredToolName(key);
+  const flags = Object.hasOwn(TOOL_FLAGS, key) ? TOOL_FLAGS[key] : undefined;
+  if (name === undefined || flags === undefined) return undefined;
+  const everyCall = rulesForEveryCall(permissions, flags);
+  const call = {
+    toolName: name,
+    input: {},
+    readOnly: flags.readOnly,
+    requiresSandbox: flags.requiresSandbox,
+    requireJustification: flags.requireJustification,
+  };
+  const decision = decideWorkerToolCall(call, everyCall);
+  if (decision.decision === "allow") return undefined;
+  const withAllow = decideWorkerToolCall(call, {
+    ...everyCall,
+    rules: [...everyCall.rules, { type: "alwaysAllow", pattern: name }],
+  });
+  return { name, decision, allowWouldRun: withAllow.decision === "allow" };
+}
+
+/**
+ * 0.8.3 — the cf-worker edge gate: a Cloudflare Worker build is made only
+ * from settings the worker enforces. It reads the PARSED SPEC, so every path
+ * is what the author wrote, and walks {@link CF_WORKER_GATED_ROOTS} (roots in
+ * table order, keys in the order the parsed spec holds them). A declared leaf
+ * that {@link CF_WORKER_ENFORCED_KEYS} does not admit, or admits with a value
+ * it refuses, is refused: it THROWS one `CompilerError` naming every refused
+ * path once, with its reason ({@link CF_WORKER_REFUSAL_REASONS}).
+ *
+ * What it returns is informational, and `--strict` never escalates it:
+ *   - `edge-permission-mode` when `permissions.mode` is `auto`, which a worker
+ *     reads as `default`;
+ *   - `edge-tool-needs-allow` at a tool site, for a builtin the worker wires
+ *     and refuses on every call, as the worker's own `decideWorkerToolCall`
+ *     decides it over the rules that reach every call of the tool
+ *     ({@link rulesForEveryCall}) and the tool's manifest flags: no
+ *     `alwaysAllow` rule covers it (an allow whose pattern does not compile
+ *     covers nothing), or a deny or ask rule with no argument glob (or with
+ *     `**`, on a tool whose every call carries an operative argument), plan
+ *     mode or the tool's own flags refuse it whatever allows it. The message
+ *     says which;
+ *   - `edge-public-chat` when `cf_worker.public_chat` serves `/chat` without
+ *     the `CHAT_TOKEN` bearer.
+ *
+ * Called by both cf-worker emit paths (`crewhaus compile --emit-as cf-worker`
+ * and the compiler-worker's `POST /compile { emitAs: "cf-worker" }`), after
+ * {@link assertCfWorkerToolsEdgeSafe}, so the rule has one home.
+ */
+export function assertCfWorkerSafetyEnforced(
+  spec: Spec,
+  ir: IrNode,
+): ReadonlyArray<CompileWarning> {
+  const refused = new Map<string, string>();
+  for (const root of CF_WORKER_GATED_ROOTS) {
+    for (const block of valuesAtPattern(spec, root.split("."))) {
+      const leaves: Array<{ readonly path: ReadonlyArray<SpecSegment>; readonly value: unknown }> =
+        [];
+      declaredLeaves(block.value, block.path, leaves);
+      for (const leaf of leaves) {
+        const text = specPathText(leaf.path);
+        const enforced = CF_WORKER_ENFORCED_KEYS.find((row) => {
+          const segs = row.path.split(".");
+          return segs.length === leaf.path.length && patternHolds(segs, leaf.path);
+        });
+        if (enforced !== undefined) {
+          if (enforced.refuse?.values.includes(String(leaf.value)) === true && !refused.has(text)) {
+            refused.set(text, enforced.refuse.reason);
+          }
+          continue;
+        }
+        let at = text;
+        let reason = CF_WORKER_DEFAULT_REFUSAL;
+        let longest = -1;
+        for (const [row, why] of Object.entries(CF_WORKER_REFUSAL_REASONS)) {
+          const segs = row.split(".");
+          if (segs.length > longest && patternHolds(segs, leaf.path)) {
+            longest = segs.length;
+            at = specPathText(leaf.path.slice(0, segs.length));
+            reason = why;
+          }
+        }
+        if (!refused.has(at)) refused.set(at, reason);
+      }
+    }
+  }
+  if (refused.size > 0) {
+    throw new CompilerError(
+      [
+        `cf-worker target cannot enforce ${refused.size} safety setting(s) this spec declares:`,
+        ...[...refused].map(([path, reason]) => `  ${path}: ${reason}`),
+        "Remove them, or keep them in a spec you compile without --emit-as cf-worker.",
+      ].join("\n"),
+    );
+  }
+
+  const warnings: CompileWarning[] = [];
+  const permissions = (ir as { readonly permissions?: IrPermissions }).permissions;
+  if (permissions?.mode === "auto") {
+    warnings.push({
+      code: "edge-permission-mode",
+      path: "permissions.mode",
+      message:
+        "a Cloudflare Worker has nobody to ask, so it reads mode auto as default: a tool runs there only when an alwaysAllow rule covers the call",
+    });
+  }
+  for (const site of toolSitesOf(ir)) {
+    for (const key of new Set(site.tools)) {
+      if (checkBuiltinTool(key, "cf-worker").kind !== "ok") continue;
+      const refusal = edgeToolRefusal(key, permissions);
+      if (refusal === undefined) continue;
+      warnings.push({
+        code: "edge-tool-needs-allow",
+        path: site.path,
+        message: refusal.allowWouldRun
+          ? `\`${refusal.name}\` runs on a Cloudflare Worker only when an alwaysAllow rule covers the call, and none does: every call to it is refused. Add { type: alwaysAllow, pattern: ${refusal.name} } to permissions.rules, or remove the tool`
+          : `every call to \`${refusal.name}\` on a Cloudflare Worker is refused, whatever alwaysAllow rule covers it: ${refusal.decision.reason}. Remove the tool, or change the setting that refuses it`,
+      });
+    }
+  }
+  if ((ir as { readonly cfWorker?: IrCfWorker }).cfWorker?.publicChat === true) {
+    warnings.push({
+      code: "edge-public-chat",
+      path: "cf_worker.public_chat",
+      message:
+        "/chat on this worker answers any caller without a token: anyone who finds its URL can run the agent on its ANTHROPIC_API_KEY and its tools. Put Cloudflare Access or a rate limit in front of it, or remove cf_worker.public_chat",
     });
   }
   return warnings;
@@ -5294,6 +5700,17 @@ function lowerChainFinality(
   return { kind: "safe" };
 }
 
+/**
+ * The `cf_worker:` block (cli, workflow, graph), lowered only when
+ * `public_chat` is `true`: a block that sets `false`, and none, lower to
+ * nothing, so the IR and every bundle are the same bytes as without it.
+ */
+function lowerCfWorker(spec: {
+  readonly cf_worker?: { readonly public_chat?: boolean | undefined } | undefined;
+}): { cfWorker?: IrCfWorker } {
+  return spec.cf_worker?.public_chat === true ? { cfWorker: { publicChat: true } } : {};
+}
+
 function lowerChainSubsystem(spec: SpecChainSubsystem): IrChainSubsystem {
   const out: IrChainSubsystem = {};
   if (spec.chains !== undefined) {
@@ -5724,6 +6141,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
             }
           : {}),
         ...lowerChainSubsystem(spec),
+        ...lowerCfWorker(spec),
       } satisfies IrV0;
     }
     case "workflow": {
@@ -5797,6 +6215,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         // prints the ignored-note comment.
         ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
         ...lowerChainSubsystem(spec),
+        ...lowerCfWorker(spec),
       } satisfies IrWorkflowV0;
     }
     case "channel": {
@@ -5980,6 +6399,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         ...lowerChainSubsystem(spec),
+        ...lowerCfWorker(spec),
       } satisfies IrGraphV0;
     }
     case "managed": {
@@ -6579,3 +6999,16 @@ function emit(ir: IrNode, opts: EmitReadmeOptions = {}): Bundle {
 
 export type { Bundle, IrV0, IrWorkflowV0, IrChannelV0, IrNode } from "@crewhaus/ir";
 export { type Spec, parseSpec, SpecParseError } from "@crewhaus/spec";
+export {
+  KNOWN_TOOLS,
+  type LocatedRuleProblem,
+  PERMISSION_RULE_NOTES,
+  type PermissionRuleCheckOptions,
+  type PermissionRuleFinding,
+  type RuleToolResolver,
+  collectIrToolNames,
+  nonCliBuiltinFlags,
+  permissionRuleFindings,
+  permissionRuleProblemsOf,
+  thredzToolNamesOf,
+} from "./permission-rules";

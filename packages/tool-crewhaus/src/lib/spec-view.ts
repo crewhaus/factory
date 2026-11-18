@@ -149,6 +149,13 @@ export type SpecView = {
   readonly tools: readonly string[];
   readonly mcpServers: readonly McpServerView[];
   readonly permissions: PermissionsView;
+  /**
+   * Present when the spec sets `cf_worker.public_chat: true`: a Cloudflare
+   * Worker build then serves `POST /chat` without its `CHAT_TOKEN` bearer.
+   * Absent otherwise, since `public_chat: false` and no block build the same
+   * worker.
+   */
+  readonly publicChat?: true;
   /** Shape sizes a fleet table wants: step/role/node counts and so on. */
   readonly counts: Readonly<Record<string, number>>;
 };
@@ -814,6 +821,7 @@ export function buildSpecView(parsed: unknown, models: readonly ModelSlot[]): Sp
     tools,
     mcpServers,
     permissions,
+    ...(asRecord(spec["cf_worker"])?.["public_chat"] === true ? { publicChat: true as const } : {}),
     counts: counts(spec, mcpServers.length, permissions.rules.length),
   };
 }
@@ -839,7 +847,9 @@ export type SpecChange = {
  * Top-level blocks whose ARRIVAL grants the harness a new outward reach, and
  * which therefore count as widening. Every other block change is reported as
  * a plain change: `memory` or `compaction` appearing alters behaviour but
- * grants no new capability.
+ * grants no new capability. `cf_worker` is read by its leaf instead: a
+ * `public_chat` that turns true widens, whether the block arrives with it or
+ * already held `false`, and a block that arrives without it grants nothing.
  */
 export const WIDENING_BLOCKS: ReadonlySet<string> = new Set([
   "chains",
@@ -1083,6 +1093,21 @@ export function diffSpecViews(before: SpecView, after: SpecView): SpecChange[] {
       from: key,
       // Dropping a deny or an ask removes a guard; dropping an allow does not.
       widens: key.startsWith("alwaysDeny ") || key.startsWith("alwaysAsk "),
+    });
+  }
+
+  // cf_worker.public_chat: true serves a worker's POST /chat without its
+  // CHAT_TOKEN bearer, so anyone with the URL can run the agent. Turning it
+  // on widens; turning it off does not.
+  const fromPublic = before.publicChat === true;
+  const toPublic = after.publicChat === true;
+  if (fromPublic !== toPublic) {
+    push({
+      kind: "cf-worker-public-chat",
+      path: "cf_worker.public_chat",
+      from: String(fromPublic),
+      to: String(toPublic),
+      widens: toPublic,
     });
   }
 

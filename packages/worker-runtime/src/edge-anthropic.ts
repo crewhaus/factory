@@ -18,7 +18,7 @@ import type {
  * canonical {@link StreamEvent}s. It is the formalisation of the "minimal
  * inlined SSE client" the three cf-worker emitters carry today — except it
  * yields the full canonical stream (text AND tool_use AND thinking), so the
- * loop above it gains real tools/budget/limits/trace.
+ * loop above it gains real tools/limits/trace.
  *
  * Node-free by construction: the only host capability it uses is
  * `platform.fetch`. It `import type`s the canonical wire shapes from
