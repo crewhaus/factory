@@ -2352,6 +2352,7 @@
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
       },
       "devDependencies": {
@@ -2398,6 +2399,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
       },
       "peerDependencies": {
@@ -2468,6 +2470,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
         "@crewhaus/tool-registry-manifest": "workspace:*",
       },

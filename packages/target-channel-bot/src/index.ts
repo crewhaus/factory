@@ -35,6 +35,7 @@ import {
   renderModelWiringFields,
   renderSubAgentDef,
 } from "@crewhaus/model-service";
+import { renderCompactionFields } from "@crewhaus/runtime-core/compaction-codegen";
 import {
   BuiltinToolError,
   LOOP_TOOL_NAMES,
@@ -291,40 +292,6 @@ function renderFailureTaxonomyField(ir: IrChannelV0): string {
 function renderBudgetField(ir: IrChannelV0): string {
   if (ir.budget === undefined) return "";
   return `\n        budget: ${JSON.stringify(ir.budget)},`;
-}
-
-/**
- * Thread `compaction.model` so a channel bot's auto-compaction summarizes on
- * the spec's chosen model instead of the primary. The compiler already
- * resolved the `cheapest` sentinel to a concrete id. Loop contract 0.4
- * (Batch A) adds the tuning knobs alongside it: `compaction.threshold` →
- * `compactionThreshold` (context-fill fraction that triggers autocompact)
- * and `snip_keep_head`/`snip_keep_tail` → `snipKeepHead`/`snipKeepTail`
- * (messages preserved verbatim by `compaction-snip`). Each field is emitted
- * only when the spec declared it — the runtime owns every default — so
- * existing bundles stay byte-identical. Mirror: target-cli renders the same
- * fields.
- */
-function renderCompactionFields(ir: IrChannelV0): string {
-  const pieces: string[] = [];
-  if (ir.compaction.model !== undefined) {
-    pieces.push(`\n        compactionModel: ${escapeJsonString(ir.compaction.model)},`);
-  }
-  // 0.6.0 §4.2 — the compaction profile's pinned request params, honoured by
-  // the summariser's own request. Mirror: target-cli renders the same field.
-  if (ir.compaction.params !== undefined) {
-    pieces.push(`\n        compactionParams: ${JSON.stringify(ir.compaction.params)},`);
-  }
-  if (ir.compaction.threshold !== undefined) {
-    pieces.push(`\n        compactionThreshold: ${ir.compaction.threshold},`);
-  }
-  if (ir.compaction.snipKeepHead !== undefined) {
-    pieces.push(`\n        snipKeepHead: ${ir.compaction.snipKeepHead},`);
-  }
-  if (ir.compaction.snipKeepTail !== undefined) {
-    pieces.push(`\n        snipKeepTail: ${ir.compaction.snipKeepTail},`);
-  }
-  return pieces.join("");
 }
 
 /**
@@ -1173,7 +1140,7 @@ export function createAgent(config: AgentConfig): Agent {
       const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });${memTurnBlock}${evaluationTurnBlock}
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
-        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelWiringFields(ir.agent, "        ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderSandboxField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
+        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelWiringFields(ir.agent, "        ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderSandboxField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir.compaction, "        ")}
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),

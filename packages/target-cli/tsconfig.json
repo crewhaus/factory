@@ -12,6 +12,7 @@
     { "path": "../ir" },
     { "path": "../memory-service" },
     { "path": "../model-service" },
+    { "path": "../runtime-core" },
     { "path": "../tool-categories" }
   ]
 }

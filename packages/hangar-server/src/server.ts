@@ -315,7 +315,14 @@ import {
 } from "./settings";
 import { SIGN_IN_ROUTES, isSignInPath, serveSignIn } from "./sign-in-routes";
 import { SPEC_SECURITY_PERMISSION } from "./spec-edit";
-import { BADGE_KEYS, capabilityBadges, specView } from "./spec-view";
+import {
+  BADGE_KEYS,
+  badgeSupport,
+  bundleCompiledWith,
+  capabilityBadges,
+  detailBadges,
+  specView,
+} from "./spec-view";
 import { assetResponse } from "./static-cache";
 import type { HomePorts } from "./sweeps";
 import {
@@ -1080,6 +1087,12 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       // as-of time for whichever rollup figures (fresh or stale) exist.
       const badges = capabilityBadges(yamlText);
       const capabilities = BADGE_KEYS.filter((k) => badges[k]);
+      const rowTarget = header.target ?? entry.target;
+      const support = badgeSupport(
+        badges,
+        rowTarget,
+        missing ? undefined : bundleCompiledWith(entry.dir, rowTarget),
+      );
       const evalHealthy = missing
         ? null
         : evalHealthyFlag(
@@ -1104,6 +1117,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         lastSeen: entry.lastSeen,
         missingSince: entry.missingSince,
         capabilities,
+        ...support,
         evalHealthy,
         // M2 fleet columns: is it supervised right now, and is anything
         // parked on a human? Both are cheap (a runfile stat, a folded
@@ -1157,7 +1171,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       inventory,
       health,
       preflight: { ok: report.ok, ...counts },
-      badges: capabilityBadges(yamlText),
+      ...detailBadges(yamlText, dir, entry.target),
       envFiles: merged.envFiles,
       memory: { facts, articles },
       rollup: cache.get(entry.id, dir, now()),

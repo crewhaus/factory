@@ -308,6 +308,14 @@ export type LowerOptions = {
  * `compile()` consumer that only reads `.files` keeps working unchanged. A
  * warning code added from 0.9.0 is classified on purpose in
  * apps/cli/src/compile-warnings.ts, as informational or failing `--strict`.
+ * From 0.9.0, on the shapes whose loops read `compaction:`, two informational
+ * notes: `"compaction-curate-lexical"` (curation is on and a memory embedder is
+ * declared; the pass drops only exact repeats and does not use it) and
+ * `"compaction-curate-knobs-unused"` (`dedupeThreshold` or `relevanceTopK`
+ * without `compaction.curate: true`, or `dedupeThreshold` with it: there is no
+ * embedding comparison for it to tune). On pipeline, `"ask-mode-eval-entry-only"`:
+ * `permissions.ask_mode` is read by the eval entry `--with-eval-harness` builds,
+ * and the pipeline REPL asks a person at its prompt.
  */
 export type CompileWarning = {
   readonly code: string;
@@ -369,9 +377,29 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
       ...collectCompileWarnings(spec),
       ...lowered.warnings,
       ...shapeTools.warnings,
+      ...localBuildUnreadWarnings(spec),
       ...(opts.applyIrPasses === true ? ruleOrderWarnings(spec) : []),
     ],
   };
+}
+
+/**
+ * The settings only a Cloudflare Worker build reads, said by a local build
+ * (#514): `cf_worker.public_chat: true` serves a worker's `POST /chat` without
+ * its bearer, and a local bundle has no `/chat`, so a local build is the same
+ * without it. `compile()` only: both edge paths read the block, and lint does
+ * not say it, since the same spec may be built either way.
+ */
+export function localBuildUnreadWarnings(spec: Spec): CompileWarning[] {
+  const block = (spec as { readonly cf_worker?: { readonly public_chat?: boolean } }).cf_worker;
+  if (block?.public_chat !== true) return [];
+  return [
+    {
+      code: "accepted-but-unwired",
+      path: "cf_worker.public_chat",
+      message: `cf_worker.public_chat is accepted on the ${spec.target} shape but only a Cloudflare Worker build (--emit-as cf-worker) reads it — a local build serves no /chat. Compile with --emit-as cf-worker to use it, or remove the setting`,
+    },
+  ];
 }
 
 /**
@@ -471,14 +499,64 @@ const unwired = (path: string, shape: string, detail: string, since?: "0.9.0"): 
   ...(since !== undefined ? { since } : {}),
 });
 
+/**
+ * The shapes with an in-loop gate that escalates on a pool's
+ * `strategy.cascade`: the `evaluation:` and `provability:` gates of cli,
+ * channel and managed, and the judge steps and nodes of workflow and graph.
+ */
+const CASCADE_READ_TARGETS: ReadonlySet<string> = new Set([
+  "cli",
+  "workflow",
+  "channel",
+  "graph",
+  "managed",
+]);
+
+/** `compaction:`'s sub-keys, as a spec spells them. */
+const COMPACTION_SUB_KEYS = [
+  "model",
+  "threshold",
+  "snip_keep_head",
+  "snip_keep_tail",
+  "curate",
+  "dedupeThreshold",
+  "relevanceTopK",
+] as const;
+
+/**
+ * The shapes whose loops read `compaction:`: their bundles render it through
+ * runtime-core's codegen twin, and `crewhaus run` / `serve` spread the same
+ * options on cli. Every other shape that accepts the block says so, one row per
+ * sub-key (#514).
+ */
+export const COMPACTION_WIRED_TARGETS: ReadonlyArray<Spec["target"]> = [
+  "cli",
+  "channel",
+  "managed",
+];
+
+/** One 0.9.0 row per `compaction:` sub-key, for a shape whose loop does not read the block. */
+const compactionRows = (shape: string, detail: string): UnwiredKey[] =>
+  COMPACTION_SUB_KEYS.map((sub) => unwired(`compaction.${sub}`, shape, detail, "0.9.0"));
+
+/** A shape whose emitter calls `runChatLoop` without rendering the block. */
+const compactsWithDefaults = (shape: string): UnwiredKey[] =>
+  compactionRows(shape, `the ${shape} loop compacts with the runtime's defaults`);
+
 const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArray<UnwiredKey>>>> = {
   workflow: [
     unwired("continuity", "workflow", "the generated bundle prints the ignored-note comment"),
+    ...compactsWithDefaults("workflow"),
   ],
+  graph: compactsWithDefaults("graph"),
+  pipeline: compactsWithDefaults("pipeline"),
   // Loop contract 0.4 (Batch E, G23) — thredz is now emit-WIRED on
   // channel + managed (connectThredz ported from the cli emitter), so their
   // rows are gone; research + crew stay carried-with-note this batch.
-  research: [unwired("thredz", "research", "the generated daemon prints the ignored-note comment")],
+  research: [
+    unwired("thredz", "research", "the generated daemon prints the ignored-note comment"),
+    ...compactsWithDefaults("research"),
+  ],
   // 0.5.0 — crew's row is DELETED, not silenced: thredz is emit-wired on crew
   // now, with the per-role fan-out. The table's contract is that a row exists
   // only while the shape really does ignore the block.
@@ -493,6 +571,8 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
       "crew",
       "the crew orchestrator's synthesis turn is not exposed to the gate yet, so no answer is verified and no proof bundle is written (design/0.8.0-provability-release.md §12 item 2)",
     ),
+    ...compactsWithDefaults("crew"),
+    unwired("observability", "crew", "the crew bundle renders none of its settings", "0.9.0"),
   ],
   // Loop contract 0.4 (Batch F) — the `schedule:` block is now emit-WIRED on
   // channel/managed/batch: each daemon arms its wake loop (channel + batch via
@@ -506,7 +586,10 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   // Managed `agent.tools`/`tool_config` are NESTED keys the then top-level-only
   // ACCEPTED_BUT_UNWIRED mechanism did not track, matching how the other
   // shapes' nested `agent.tools` were handled.
-  batch: [unwired("continuity", "batch", "the generated bundle prints the ignored-note comment")],
+  batch: [
+    unwired("continuity", "batch", "the generated bundle prints the ignored-note comment"),
+    ...compactsWithDefaults("batch"),
+  ],
   // "Watch me" (design/watch-me.md §6.3) — the `watchme:` block is WIRED on
   // cli (interpreter env stamp + target-cli bundle preamble) and channel
   // (target-channel-bot's existing G26 env-stamp emitter), so neither shape
@@ -525,10 +608,24 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
     unwired("tools", "voice", "the realtime voice loop does not register a tool catalog"),
     unwired("tool_config", "voice", "the realtime voice loop does not register a tool catalog"),
     unwired("continuity", "voice", "the generated daemon prints the ignored-note comment"),
+    ...compactionRows("voice", "the realtime voice loop does not compact"),
+    unwired(
+      "failure_taxonomy",
+      "voice",
+      "the realtime voice loop runs no recovery engine, so no failure is classified",
+      "0.9.0",
+    ),
+    unwired(
+      "permissions",
+      "voice",
+      "the realtime voice loop does not register a tool catalog, so no tool call reaches the rules",
+      "0.9.0",
+    ),
   ],
   browser: [
     unwired("mcp_servers", "browser", "no MCP host is booted in the browser daemon"),
     unwired("continuity", "browser", "the generated daemon prints the ignored-note comment"),
+    ...compactsWithDefaults("browser"),
   ],
   // shape-reach#7 — onchain / onchain-game run no agent loop yet (the
   // emitters wire the chain adapter and trigger metadata only), so a tools:
@@ -541,6 +638,14 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
       "the onchain daemon runs no agent loop yet, so nothing registers them",
     ),
     unwired("tool_config", "onchain", "the onchain daemon runs no agent loop yet"),
+    ...compactionRows("onchain", "the onchain daemon runs no agent loop yet"),
+    unwired("failure_taxonomy", "onchain", "the onchain daemon runs no agent loop yet", "0.9.0"),
+    unwired(
+      "permissions",
+      "onchain",
+      "the onchain daemon runs no agent loop yet, so no tool call reaches the rules",
+      "0.9.0",
+    ),
   ],
   "onchain-game": [
     unwired("mcp_servers", "onchain-game", "no MCP host is booted in the onchain-game daemon"),
@@ -550,6 +655,19 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
       "the onchain-game daemon runs no agent loop yet, so nothing registers them",
     ),
     unwired("tool_config", "onchain-game", "the onchain-game daemon runs no agent loop yet"),
+    ...compactionRows("onchain-game", "the onchain-game daemon runs no agent loop yet"),
+    unwired(
+      "failure_taxonomy",
+      "onchain-game",
+      "the onchain-game daemon runs no agent loop yet",
+      "0.9.0",
+    ),
+    unwired(
+      "permissions",
+      "onchain-game",
+      "the onchain-game daemon runs no agent loop yet, so no tool call reaches the rules",
+      "0.9.0",
+    ),
   ],
 };
 
@@ -607,8 +725,20 @@ export function unwiredWarnings(spec: Spec, rows: ReadonlyArray<UnwiredKey>): Co
   return out;
 }
 
-/** A shape's accepted-but-unwired rows, as copies: the table itself stays private. */
-export function unwiredRows(target: Spec["target"]): ReadonlyArray<UnwiredKey> {
+/**
+ * A shape's accepted-but-unwired rows, as copies: the table itself stays
+ * private. With `emitAs: "cf-worker"`, the rows a Cloudflare Worker build adds
+ * on top (`cfWorkerUnwiredBlockWarnings` raises them from the lowered IR): the
+ * settings the edge does not read. A key a workflow or graph spec's own rows
+ * already name (compaction) is not repeated, since an edge build also prints those.
+ */
+export function unwiredRows(
+  target: Spec["target"],
+  opts: { readonly emitAs?: "cf-worker" } = {},
+): ReadonlyArray<UnwiredKey> {
+  if (opts.emitAs === "cf-worker") {
+    return cfWorkerRows(target);
+  }
   return (ACCEPTED_BUT_UNWIRED[target] ?? []).map((row) => ({ ...row }));
 }
 
@@ -620,6 +750,17 @@ export function unwiredRows(target: Spec["target"]): ReadonlyArray<UnwiredKey> {
  */
 export function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
   const out = unwiredWarnings(spec, ACCEPTED_BUT_UNWIRED[spec.target] ?? []);
+  // #514 — on pipeline, the eval entry `--with-eval-harness` builds reads
+  // `permissions.ask_mode`; the pipeline REPL asks a person at its prompt, the
+  // runtime's default. Informational: an ask always reaches a person.
+  if (spec.target === "pipeline" && specDeclares(spec, "permissions.ask_mode")) {
+    out.push({
+      code: "ask-mode-eval-entry-only",
+      path: "permissions.ask_mode",
+      message:
+        "permissions.ask_mode is read on pipeline by the eval entry that --with-eval-harness builds; the pipeline REPL asks a person at its prompt",
+    });
+  }
   // Item 1 (G30) / #394 — `expose:` is wired on cli (via `crewhaus serve
   // --mcp`) and, from 0.5.4, on channel (the bundle mounts its own endpoint).
   // MANAGED still carries it unwired, and the gap is not incidental: the
@@ -776,7 +917,51 @@ export function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning
   // makes `mcp__<server>__<tool>` ambiguous. 0.7.0 ran such keys, so it is a
   // warning here rather than a parse error.
   for (const w of mcpServerNameWarnings(spec)) out.push({ code: "mcp-server-name", ...w });
+  out.push(...compactionCurateNotes(spec));
   return out;
+}
+
+/**
+ * #514 — two notes about curation on the shapes that run it. The pass is
+ * handed no embedder, so it drops only exact repeats: a declared
+ * `memory.embedder` (or `memory.wiki.embedder`) does not reach it
+ * (`compaction-curate-lexical`), and `dedupeThreshold`, which tunes the
+ * embedding comparison, has nothing to tune (`compaction-curate-knobs-unused`).
+ * Without `compaction.curate: true` neither dial runs at all (the same code).
+ * Both informational: curation works either way, and `--strict` passes.
+ */
+function compactionCurateNotes(spec: Spec): CompileWarning[] {
+  if (!COMPACTION_WIRED_TARGETS.includes(spec.target)) return [];
+  const compaction = (spec as { readonly compaction?: { readonly curate?: unknown } }).compaction;
+  if (compaction?.curate === true) {
+    const out: CompileWarning[] = [];
+    const embedder = ["memory.embedder", "memory.wiki.embedder"].find((path) =>
+      specDeclares(spec, path),
+    );
+    if (embedder !== undefined) {
+      out.push({
+        code: "compaction-curate-lexical",
+        path: "compaction.curate",
+        message: `compaction.curate drops only exact repeats and does not use ${embedder}, so two messages that say the same thing in different words are both kept`,
+      });
+    }
+    if (specDeclares(spec, "compaction.dedupeThreshold")) {
+      out.push({
+        code: "compaction-curate-knobs-unused",
+        path: "compaction.dedupeThreshold",
+        message:
+          "compaction.dedupeThreshold tunes an embedding comparison, and this harness curates without embeddings: it drops only exact repeats, so the setting has nothing to tune — remove it",
+      });
+    }
+    return out;
+  }
+  return ["dedupeThreshold", "relevanceTopK"]
+    .filter((dial) => specDeclares(spec, `compaction.${dial}`))
+    .map((dial) => ({
+      code: "compaction-curate-knobs-unused",
+      path: `compaction.${dial}`,
+      message: `compaction.${dial} tunes the curation pass, which runs only with compaction.curate: true — turn curation on, or remove this setting`,
+    }));
 }
 
 /**
@@ -1377,6 +1562,9 @@ function ungrantedSubAgentTools(ir: IrNode): ReadonlyArray<CompileWarning> {
  * not wire (crew's `provability:`), which `--strict` escalates — so a strict
  * edge compile fails instead of shipping ungated.
  *
+ * From 0.9.0 a cli spec's `compaction:` settings warn the same way, one row
+ * per declared sub-key: the edge does not compact (#514).
+ *
  * Called beside {@link assertCfWorkerToolsEdgeSafe} by both cf-worker emit
  * paths (`crewhaus compile --emit-as cf-worker` and the compiler-worker's
  * `POST /compile { emitAs: "cf-worker" }`), so the rule has one home.
@@ -1400,7 +1588,190 @@ export function cfWorkerUnwiredBlockWarnings(ir: IrNode): CompileWarning[] {
         "the cf-worker edge does not run the in-loop evaluation judge: the worker's answers are served ungraded. Compile without --emit-as to grade them, or remove the block",
     });
   }
+  warnings.push(...cfWorkerUnreadWarnings(ir));
   return warnings;
+}
+
+/** The shapes a Cloudflare Worker build compiles. */
+type CfWorkerShape = "cli" | "workflow" | "graph";
+
+/**
+ * One setting a Cloudflare Worker build does not read: the shapes whose edge
+ * build ignores it, the row's path (`*` for a step, node or role), why it does
+ * nothing there, and the concrete paths a lowered IR declares it at.
+ */
+type CfWorkerUnread = {
+  readonly shapes: ReadonlyArray<CfWorkerShape>;
+  readonly path: string;
+  readonly detail: string;
+  readonly declaredAt: (ir: IrNode) => ReadonlyArray<string>;
+};
+
+const cfWorkerRow = (shape: CfWorkerShape, entry: CfWorkerUnread): UnwiredKey => ({
+  path: entry.path,
+  message: `${entry.path} is accepted on a ${shape} spec but the cf-worker edge does not wire it — ${entry.detail}. Compile without --emit-as to use it, or remove the setting`,
+  since: "0.9.0",
+});
+
+/** A field of the lowered IR, read structurally (each shape carries its own). */
+const irField = (ir: IrNode, key: string): unknown =>
+  (ir as unknown as Record<string, unknown>)[key];
+
+/** `[path]` when `present`, else none. */
+const at = (path: string, present: boolean): ReadonlyArray<string> => (present ? [path] : []);
+
+const nonEmpty = (value: unknown): boolean =>
+  Array.isArray(value)
+    ? value.length > 0
+    : typeof value === "object" && value !== null
+      ? Object.keys(value).length > 0
+      : value !== undefined;
+
+/** The edge does not compact: each declared `compaction:` sub-key of a cli spec. */
+const compactionUnread = (
+  sub: (typeof COMPACTION_SUB_KEYS)[number],
+  declared: (c: IrCompaction) => boolean,
+): CfWorkerUnread => ({
+  shapes: ["cli"],
+  path: `compaction.${sub}`,
+  detail:
+    "the worker does not compact, so a run that outgrows its context window ends with an error",
+  declaredAt: (ir) => at(`compaction.${sub}`, ir.target === "cli" && declared(ir.compaction)),
+});
+
+/** A chain block: the edge runs no chain tool, so nothing reads it. */
+const chainUnread = (path: string, field: string): CfWorkerUnread => ({
+  shapes: ["cli", "workflow", "graph"],
+  path,
+  detail: "the worker runs no chain tool, so nothing reads it",
+  declaredAt: (ir) => at(path, nonEmpty(irField(ir, field))),
+});
+
+/** A cli spec's block the worker does not read, with why. */
+const cliUnread = (path: string, field: string, detail: string): CfWorkerUnread => ({
+  shapes: ["cli"],
+  path,
+  detail,
+  declaredAt: (ir) => at(path, ir.target === "cli" && nonEmpty(irField(ir, field))),
+});
+
+/**
+ * The `observability:` sub-blocks the worker does not read. It reads
+ * `observability.trace` (`level: off` turns its trace stream off), so that
+ * sub-block has no row.
+ */
+const OBSERVABILITY_UNREAD: ReadonlyArray<readonly [keyof IrObservability, string]> = [
+  ["slo", "the worker tracks no service-level objective"],
+  ["metrics", "the worker publishes no metrics"],
+  ["cost", "the worker keeps no cost tracker"],
+  ["alerts", "the worker raises no alerts"],
+  ["incidents", "the worker opens no incidents"],
+  ["otel", "the worker exports no OpenTelemetry data"],
+];
+
+/** A cli spec's `observability.<sub>` the worker does not read. */
+const observabilityUnread = (sub: keyof IrObservability, detail: string): CfWorkerUnread => ({
+  shapes: ["cli"],
+  path: `observability.${sub}`,
+  detail,
+  declaredAt: (ir) =>
+    at(`observability.${sub}`, ir.target === "cli" && ir.observability?.[sub] !== undefined),
+});
+
+/** The continuity a cli spec gets when it declares none. */
+const CLI_DEFAULT_CONTINUITY = {
+  plan: true,
+  proof: "ladder",
+  ledger: true,
+  handoff: true,
+  scope: "spec",
+};
+
+/**
+ * What a Cloudflare Worker build of a cli, workflow or graph spec does not
+ * read (#514): the edge compacts nothing, keeps no state between requests and
+ * starts no host process. Workflow and graph edge builds also run
+ * `collectCompileWarnings`, so a key their own rows already name (compaction,
+ * workflow continuity) is not listed for them here. A safety setting is never
+ * a row here: the edge gate ({@link assertCfWorkerSafetyEnforced}) admits it
+ * because the worker enforces it, or refuses the build.
+ */
+const CF_WORKER_UNREAD: ReadonlyArray<CfWorkerUnread> = [
+  compactionUnread(
+    "model",
+    (c) => c.model !== undefined || c.modelProfile !== undefined || c.params !== undefined,
+  ),
+  compactionUnread("threshold", (c) => c.threshold !== undefined),
+  compactionUnread("snip_keep_head", (c) => c.snipKeepHead !== undefined),
+  compactionUnread("snip_keep_tail", (c) => c.snipKeepTail !== undefined),
+  compactionUnread("curate", (c) => c.curate === true),
+  compactionUnread("dedupeThreshold", (c) => c.dedupeThreshold !== undefined),
+  compactionUnread("relevanceTopK", (c) => c.relevanceTopK !== undefined),
+  {
+    shapes: ["cli", "workflow", "graph"],
+    path: "failure_taxonomy",
+    detail: "the worker runs no recovery engine, so no failure is classified",
+    declaredAt: (ir) => at("failure_taxonomy", nonEmpty(irField(ir, "failureTaxonomy"))),
+  },
+  chainUnread("chains", "chains"),
+  chainUnread("contracts", "contracts"),
+  chainUnread("wallets", "wallets"),
+  chainUnread("transaction_policy", "transactionPolicy"),
+  {
+    shapes: ["cli", "workflow"],
+    path: "mcp_servers",
+    detail: "the worker starts no MCP server",
+    declaredAt: (ir) => at("mcp_servers", nonEmpty(irField(ir, "mcp_servers"))),
+  },
+  {
+    shapes: ["graph"],
+    path: "parallel",
+    detail: "the worker runs a linear graph, one node after another",
+    declaredAt: (ir) => at("parallel", ir.target === "graph" && nonEmpty(ir.parallel)),
+  },
+  {
+    shapes: ["cli"],
+    path: "continuity",
+    detail: "the worker keeps no plan, ledger or handoff between requests",
+    declaredAt: (ir) =>
+      at(
+        "continuity",
+        ir.target === "cli" &&
+          ir.continuity !== undefined &&
+          JSON.stringify(ir.continuity) !== JSON.stringify(CLI_DEFAULT_CONTINUITY),
+      ),
+  },
+  cliUnread("cli", "cli", "the worker has no terminal, so it shows no banner"),
+  cliUnread("expose", "expose", "the worker mounts no MCP endpoint"),
+  cliUnread("feedback", "feedback", "the worker asks for no rating and records none"),
+  cliUnread("knowledge", "knowledge", "the worker registers no Retrieve tool"),
+  cliUnread("learning", "learning", "the worker keeps no wiki to study into"),
+  cliUnread("memory", "memory", "the worker keeps no memory between requests"),
+  ...OBSERVABILITY_UNREAD.map(([sub, detail]) => observabilityUnread(sub, detail)),
+  cliUnread("plugins", "plugins", "the worker loads no plugins"),
+  cliUnread("thredz", "thredz", "the worker connects to no Thredz server"),
+  cliUnread("watchme", "watchme", "the worker captures no runs"),
+];
+
+/** The settings a Cloudflare Worker build of `shape` does not read, as table rows. */
+function cfWorkerRows(shape: Spec["target"]): UnwiredKey[] {
+  return CF_WORKER_UNREAD.filter((entry) =>
+    (entry.shapes as ReadonlyArray<string>).includes(shape),
+  ).map((entry) => cfWorkerRow(shape as CfWorkerShape, entry));
+}
+
+/** One warning per concrete path a lowered IR declares a setting the edge does not read at. */
+function cfWorkerUnreadWarnings(ir: IrNode): CompileWarning[] {
+  return CF_WORKER_UNREAD.filter((entry) =>
+    (entry.shapes as ReadonlyArray<string>).includes(ir.target),
+  ).flatMap((entry) => {
+    const row = cfWorkerRow(ir.target as CfWorkerShape, entry);
+    return entry.declaredAt(ir).map((path) => ({
+      code: "accepted-but-unwired",
+      path,
+      message: row.message.replace(entry.path, path),
+    }));
+  });
 }
 
 /**
@@ -3738,7 +4109,16 @@ function lowerModelFailover(
     if (mp.strategy !== undefined) {
       // 0.6.0 PR 9c consumes `cascade` (`evaluation.on_fail: escalate` re-runs
       // on `escalate_to`, `clean_prompt` picks the snapshot, `max_escalations`
-      // caps the rungs) straight off the blob, so it pends nowhere.
+      // caps the rungs) straight off the blob. Only an in-loop gate escalates,
+      // so a shape with none carries it and nothing reads it (#514).
+      if (mp.strategy.cascade !== undefined && !CASCADE_READ_TARGETS.has(ctx.target)) {
+        warn(
+          ctx,
+          "model-plan-ignored-on-shape",
+          `${poolPath}.strategy.cascade`,
+          `${poolPath}.strategy.cascade is lowered into the pool blob, but nothing escalates to it on a ${ctx.target} spec: only an in-loop gate's on_fail: escalate reads it, and no gate on this shape escalates`,
+        );
+      }
       for (const key of ["guide", "shadow", "committee"] as const) {
         if (mp.strategy[key] === undefined) continue;
         closureUnwired(`strategy.${key}`, "sideCalls", "side call");

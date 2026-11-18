@@ -25,6 +25,7 @@ import type { Sweep } from "../scheduler-host";
 import { CORE_SWEEPS, type HomePorts } from "../sweeps";
 import { ACCESS_HANDLERS } from "./access-ops";
 import { COMMAND_HANDLERS } from "./commands";
+import { HOME_COMPILER } from "./compiler";
 import type { CapabilityProvider, RefResolver, V1Handler } from "./context";
 import { CONTROL_HANDLERS } from "./controls";
 import { CREATION_HANDLERS } from "./creation";
@@ -88,7 +89,7 @@ export const HOME_AREAS: readonly HomeAreaRuntime[] = [
 
   // HOME_ATTENTION,
 
-  // HOME_COMPILER,
+  HOME_COMPILER,
 
   HOME_CREATION,
 

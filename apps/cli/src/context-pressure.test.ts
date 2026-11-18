@@ -219,3 +219,31 @@ describe("formatContextPressureLines", () => {
     expect(tunedText).toContain("spec compaction.curate: off (explicit)");
   });
 });
+
+describe("formatContextPressureLines — curation where it runs", () => {
+  const curated = (head: string[]): string =>
+    formatContextPressureLines(
+      buildContextPressureReport([], {
+        spec: specOf([...head, "compaction:", "  curate: true", ""].join("\n")),
+      }),
+    ).join("\n");
+
+  test("a cli spec with curate: true says on", () => {
+    expect(
+      curated(["name: h", "target: cli", "agent:", "  model: m", "  instructions: i"]),
+    ).toContain("spec compaction.curate: on");
+  });
+
+  test("a workflow spec with curate: true says its shape does not use it", () => {
+    const text = curated([
+      "name: w",
+      "target: workflow",
+      "model: m",
+      "steps:",
+      "  - name: draft",
+      "    instructions: write it",
+    ]);
+    expect(text).toContain("spec compaction.curate: not used on workflow harnesses");
+    expect(text).not.toContain("spec compaction.curate: on");
+  });
+});

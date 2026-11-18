@@ -88,7 +88,13 @@ export type RenderSubpathImports = {
  * request that adds it, so a bundle never pulls a store or a key module in
  * through a helper it renders.
  */
-export const RENDER_SUBPATH_IMPORTS: ReadonlyArray<RenderSubpathImports> = Object.freeze([]);
+export const RENDER_SUBPATH_IMPORTS: ReadonlyArray<RenderSubpathImports> = Object.freeze([
+  Object.freeze({
+    file: "packages/runtime-core/src/compaction-codegen.ts",
+    allow: Object.freeze([]),
+    label: "compaction codegen imports nothing",
+  }),
+]);
 
 /** One finding per entry: every import in the module is on its allow-list. */
 export function renderSubpathImportFindings(

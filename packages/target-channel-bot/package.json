@@ -20,6 +20,7 @@
     "@crewhaus/memory-service": "workspace:*",
     "@crewhaus/model-router": "workspace:*",
     "@crewhaus/model-service": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/tool-categories": "workspace:*"
   },
   "devDependencies": {

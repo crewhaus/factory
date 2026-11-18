@@ -794,6 +794,35 @@ these on: they reach every harness that uses what each one names.
   sessions folder that links to another place inside the harness works as
   before. Keep the sessions folder inside the harness folder.
 
+- **Context curation works where it is accepted, and managed harnesses use
+  their compaction settings.** Setting `compaction.curate` to `true` now trims
+  repeated context before compaction on cli, channel and managed harnesses and
+  in `crewhaus run` and `crewhaus serve`, dropping exact repeats of a message
+  (no embeddings), so a message whose words differ in any way is kept.
+  `compaction.dedupeThreshold` tunes an embedding comparison these harnesses do
+  not run, and the compiler notes it. Managed harnesses now apply
+  `compaction.model`, `threshold`, `snip_keep_head` and `snip_keep_tail`.
+  Recompile to pick this up.
+
+- **Settings a shape ignores now say so, so `compile --strict` fails on
+  them.** An `accepted-but-unwired` warning is printed for `compaction` on
+  workflow, graph, pipeline, crew, research, batch, voice, browser, onchain
+  and onchain-game harnesses and in a Cloudflare Worker build of a cli
+  harness; for `permissions` on voice, onchain and onchain-game (which run no
+  tools for those rules to govern); for `failure_taxonomy` on voice, onchain
+  and onchain-game (which run no recovery engine); and for `observability` on
+  crew. A `model-plan-ignored-on-shape` warning is printed for a model pool's
+  `strategy.cascade` on pipeline, crew, research, batch and browser, where no
+  gate escalates to it. A Cloudflare Worker build also warns for `chains`,
+  `contracts`, `wallets`, `transaction_policy` and `failure_taxonomy` on cli,
+  workflow and graph specs; for `mcp_servers` on cli and workflow; for
+  `parallel` on graph; and on cli for `continuity`, `cli`, `expose`,
+  `feedback`, `knowledge`, `learning`, `memory`, `observability` (every
+  sub-block but `trace`), `plugins`, `thredz` and `watchme`. A build without
+  `--emit-as cf-worker` warns for `cf_worker.public_chat` on cli, workflow and
+  graph specs, which only a Cloudflare Worker build reads. Removing the setting
+  changes nothing the harness does.
+
 ## [0.8.3] - 2026-11-15
 
 A Cloudflare Worker built with `crewhaus compile --emit-as cf-worker` answers

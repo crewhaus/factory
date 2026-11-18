@@ -27,6 +27,7 @@ import {
 import { hrefGlobal, hrefHarness } from "../router.js";
 import { shapeAccentVars, shapeLabel } from "../shapes.js";
 import { procStatePill } from "../supervision.js";
+import { libraryChip } from "../ui/badges.js";
 import { confirmAction } from "../ui/dialog.js";
 import { reconcile } from "../ui/keyed.js";
 import {
@@ -753,7 +754,7 @@ function harnessRow(ctl) {
       "td",
       { class: "cell-caps" },
       row.capabilities.length > 0
-        ? row.capabilities.map((c) => el("span", { class: "chip", text: c }))
+        ? row.capabilities.map((c) => libraryChip(c, row.badgeSupport))
         : el("span", { class: "muted", text: "—" }),
     ),
     el(

@@ -2369,9 +2369,10 @@ export type RunChatLoopOptions = {
    * (spec `compaction.curate`, lowered from `IrCompaction`; presence GATES the
    * pass). Once the pre-turn compaction ladder decides the context is already
    * approaching the limit, the runtime runs `@crewhaus/compaction-curator`
-   * BEFORE snip→autocompact: it drops semantically-duplicate transcript
-   * messages (embedding cosine when an `embedder` is injected, a BM25-family
-   * lexical fallback when not) and — when `relevanceTopK` is set — keeps only
+   * BEFORE snip→autocompact: it drops duplicate transcript messages
+   * (embedding cosine at `dedupeThreshold` when an `embedder` is injected;
+   * without one, only exact repeats, compared with case and whitespace
+   * folded) and — when `relevanceTopK` is set — keeps only
    * the top-K most relevant to the latest user message, re-sorted back into
    * transcript order (the curator's relevance ranking SELECTS survivors; it
    * never scrambles the conversation, and messages carrying tool_use/tool_result
@@ -2380,8 +2381,8 @@ export type RunChatLoopOptions = {
    * entirely. Every pass publishes a `curate` trace event
    * (`before`/`after`/`dropped`/`bytesSaved`/`embedded`). The embedder is
    * INJECTED (runtime-core carries no embedder dependency): callers resolve it
-   * from `memory.embedder ?? memory.wiki.embedder`; absent → lexical dedupe
-   * (`embedded: false`). Absent block → no curation, byte-identical to a
+   * from `memory.embedder ?? memory.wiki.embedder`; absent → exact-repeat
+   * dedupe (`embedded: false`). Absent block → no curation, byte-identical to a
    * pre-0.4 runtime.
    */
   curate?: {
@@ -12934,7 +12935,7 @@ function curatorItemText(m: Anthropic.MessageParam): string {
 
 const LEXICAL_TOKEN_RE = /[a-z0-9]+/gi;
 
-/** Item 1 / G19 — token set for the BM25-family lexical fallback. */
+/** Item 1 / G19 — token set for the no-embedder `relevanceTopK` ranking. */
 function lexicalTokens(text: string): Set<string> {
   const out = new Set<string>();
   const matches = text.toLowerCase().match(LEXICAL_TOKEN_RE);
@@ -12942,8 +12943,9 @@ function lexicalTokens(text: string): Set<string> {
   return out;
 }
 
-/** Jaccard overlap of two token sets (the lexical similarity used by the
- *  no-embedder curation path). Two empty sets are identical (1). */
+/** Jaccard overlap of two token sets (how the no-embedder `relevanceTopK`
+ *  trim ranks a message against the latest user message). Two empty sets are
+ *  identical (1). */
 function jaccard(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 && b.size === 0) return 1;
   if (a.size === 0 || b.size === 0) return 0;
@@ -12954,34 +12956,32 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   return union === 0 ? 0 : inter / union;
 }
 
+/** A message's text with case and runs of whitespace folded, for the exact-repeat test. */
+function normalizedText(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
 /**
- * Item 1 / G19 — order-preserving lexical dedupe, the BM25-family fallback
- * when no embedder resolves (a vector store is unavailable). Mirrors the
- * curator's cosine `dedupeBySimilarity` structure but over token-set Jaccard:
- * an item is dropped when a PRIOR kept item's Jaccard >= threshold, so the
- * first occurrence (the head of the conversation, which carries goal-setting
- * context) always wins.
+ * Item 1 / G19 — order-preserving dedupe when no embedder resolves (a vector
+ * store is unavailable): an item is dropped only when its text, with case and
+ * whitespace folded, is identical to a PRIOR kept item's, so the first
+ * occurrence (the head of the conversation, which carries goal-setting
+ * context) wins and a message whose words differ in any way, or in their
+ * order, is always kept. `dedupeThreshold` tunes the embedder's cosine
+ * comparison and is not read here.
  */
-function lexicalDedupe(
-  texts: ReadonlyArray<string>,
-  threshold: number,
-): { kept: number[]; dropped: number[] } {
-  const tokenSets = texts.map(lexicalTokens);
+function exactRepeatDedupe(texts: ReadonlyArray<string>): { kept: number[]; dropped: number[] } {
+  const seen = new Set<string>();
   const kept: number[] = [];
   const dropped: number[] = [];
   for (let i = 0; i < texts.length; i++) {
-    let isDuplicate = false;
-    const ti = tokenSets[i];
-    if (ti !== undefined) {
-      for (const k of kept) {
-        const tk = tokenSets[k];
-        if (tk !== undefined && jaccard(ti, tk) >= threshold) {
-          isDuplicate = true;
-          break;
-        }
-      }
+    const key = normalizedText(texts[i] ?? "");
+    if (seen.has(key)) {
+      dropped.push(i);
+    } else {
+      seen.add(key);
+      kept.push(i);
     }
-    (isDuplicate ? dropped : kept).push(i);
   }
   return { kept, dropped };
 }
@@ -13003,7 +13003,7 @@ type CurateOutcome = {
 
 /**
  * Item 1 / G19 — the active-context curation pass. Runs `curate()` (cosine,
- * when an embedder is injected) or the lexical fallback over the CURATABLE
+ * when an embedder is injected) or the exact-repeat dedupe over the CURATABLE
  * middle messages (pure-text, outside the snip-protected head/tail), then
  * REBUILDS the transcript keeping survivors in their original order. The
  * curator's relevance ranking is used only to SELECT which messages survive a
@@ -13051,7 +13051,7 @@ async function curateActiveContext(
     });
     keepLocal = [...result.originalIndices].sort((a, b) => a - b);
   } else {
-    const { kept } = lexicalDedupe(texts, threshold);
+    const { kept } = exactRepeatDedupe(texts);
     let survivors = kept;
     if (
       cfg.relevanceTopK !== undefined &&
@@ -13308,7 +13308,7 @@ type CompactArgs = {
   /**
    * Item 1 / G19 — active-context curation config (opt-in; presence runs the
    * pre-pass, gated by the caller on `ir.compaction.curate`). Embedder is
-   * injected by the caller; absent → the BM25-family lexical fallback.
+   * injected by the caller; absent → the exact-repeat dedupe.
    */
   curate?: CurateConfig;
   /** Item 1 / G19 — reports one curation pass so the caller publishes the

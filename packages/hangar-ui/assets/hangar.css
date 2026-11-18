@@ -435,6 +435,33 @@ a.chip {
 .chip-tool {
   font-family: var(--mono);
 }
+/* A declared block the harness's shape does not use: said in words, the
+   chip only dims (status is never colour alone). The "Why?" disclosure
+   wraps, so the strip reflows at narrow widths. */
+.chip-off {
+  border-style: dashed;
+  color: var(--ink-3);
+}
+.badge-off {
+  white-space: normal;
+}
+.badge-why {
+  display: inline;
+  margin-left: 4px;
+}
+.badge-why > summary {
+  display: inline;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.badge-reason {
+  display: block;
+  margin-top: 2px;
+}
+.badge-note {
+  margin: 4px 0 0;
+  font-size: 0.8125rem;
+}
 
 .dot-pair {
   display: inline-flex;

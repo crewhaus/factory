@@ -318,6 +318,71 @@ describe("ruleCompactionThrash", () => {
     expect(suggestion?.kind === "advice" && suggestion.text).toContain("already enabled");
     expect(suggestion?.kind === "advice" && suggestion.text).toContain("sub-agent");
   });
+
+  it("on a workflow, which does not run curation, the advice never names it", () => {
+    const workflow = parseSpec(
+      "name: w\ntarget: workflow\nmodel: claude-sonnet-4-6\nsteps:\n  - name: draft\n    instructions: write it\n",
+    );
+    const findings = ruleCompactionThrash(
+      buildAdviceContext([session(SESSION_A, compactions(3))]),
+      {
+        spec: workflow,
+      },
+    );
+    const suggestion = findings[0]?.suggestion;
+    expect(suggestion?.kind).toBe("advice");
+    expect(suggestion?.kind === "advice" && suggestion.text).not.toContain("curate");
+    // The workflow loop compacts with the runtime's defaults: no window to widen.
+    expect(suggestion?.kind === "advice" && suggestion.text).not.toContain("compaction window");
+    expect(suggestion?.kind === "advice" && suggestion.text).toContain("sub-agent");
+  });
+
+  it("names only what the curator does: exact repeats, never a semantic pass", () => {
+    const ctx = buildAdviceContext([session(SESSION_A, compactions(4))]);
+    const channel = parseSpec(
+      [
+        "name: c",
+        "target: channel",
+        "agent: {model: claude-sonnet-4-6, instructions: help}",
+        "channels:",
+        "  slack: {botToken: $SLACK_BOT_TOKEN, signingSecret: $SLACK_SIGNING_SECRET}",
+        "routing: {sessionKey: thread}",
+        "",
+      ].join("\n"),
+    );
+    // cli with curation on (advice), and channel with it off (advice: its row is not optimizable).
+    for (const spec of [CLI_SPEC_TUNED, channel]) {
+      const suggestion = ruleCompactionThrash(ctx, { spec })[0]?.suggestion;
+      expect(suggestion?.kind).toBe("advice");
+      const text = suggestion?.kind === "advice" ? suggestion.text : "";
+      expect(text).toContain("exact repeats");
+      expect(text.toLowerCase()).not.toContain("semantic");
+      expect(text).toContain("compaction window");
+    }
+  });
+
+  it("on a channel harness, which runs it, curation is named (its row is not optimizable)", () => {
+    const channel = parseSpec(
+      [
+        "name: c",
+        "target: channel",
+        "agent: {model: claude-sonnet-4-6, instructions: help}",
+        "channels:",
+        "  slack: {botToken: $SLACK_BOT_TOKEN, signingSecret: $SLACK_SIGNING_SECRET}",
+        "routing: {sessionKey: thread}",
+        "",
+      ].join("\n"),
+    );
+    const findings = ruleCompactionThrash(
+      buildAdviceContext([session(SESSION_A, compactions(3))]),
+      {
+        spec: channel,
+      },
+    );
+    const suggestion = findings[0]?.suggestion;
+    expect(suggestion?.kind).toBe("advice");
+    expect(suggestion?.kind === "advice" && suggestion.text).toContain("compaction.curate");
+  });
 });
 
 describe("rulePermissionChurn", () => {

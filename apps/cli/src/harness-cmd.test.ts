@@ -496,3 +496,110 @@ describe("CREWHAUS_NO_REGISTRY", () => {
     expect((await run(["list"])).lines[0]).toContain("no harnesses registered");
   });
 });
+
+describe("harness capabilities", () => {
+  /** A managed harness declaring watchme and curation, with a bundle stamped `compiledWith`. */
+  function seedManaged(compiledWith: string | undefined): string {
+    const dir = join(root, "steward");
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(
+      join(dir, "crewhaus.yaml"),
+      [
+        "name: support-steward",
+        "target: managed",
+        "agent: {model: claude-opus-4-7, instructions: Serve tenants.}",
+        "tenants:",
+        "  - {id: acme, budget: {maxInputTokens: 100000, maxOutputTokens: 20000}}",
+        "watchme: {enabled: true}",
+        "compaction: {curate: true}",
+        "",
+      ].join("\n"),
+    );
+    if (compiledWith !== undefined) {
+      writeFileSync(join(dir, "dist", "daemon.ts"), "// compiled\n");
+      writeFileSync(
+        join(dir, "dist", "package.json"),
+        JSON.stringify({
+          name: "crewhaus-compiled-bundle",
+          version: "0.0.0",
+          crewhaus: { specHash: "0".repeat(64), compiledWith },
+        }),
+      );
+    }
+    return dir;
+  }
+
+  test("--json prints what each declared setting does, and writes nothing", async () => {
+    const dir = seedManaged("0.9.0");
+    const out = await run(["capabilities", dir, "--json"]);
+    expect(out.exitCode).toBe(0);
+    const support = JSON.parse(out.lines.join("\n"));
+    expect(support.schema).toBe(1);
+    expect(support.shape).toBe("managed");
+    expect(support.basis).toBe("manifest");
+    expect(support.compiledWith).toBe("0.9.0");
+    const byFeature = Object.fromEntries(
+      (support.features as Array<{ feature: string; status: string }>).map((f) => [
+        f.feature,
+        f.status,
+      ]),
+    );
+    expect(byFeature["watchme"]).toBe("unwired");
+    expect(byFeature["compaction.curate"]).toBe("wired");
+    expect(existsSync(regRoot)).toBe(false);
+  });
+
+  test("the text answer says what takes effect, what is not used and why, and what needs a recompile", async () => {
+    const out = await run(["capabilities", seedManaged("0.9.0")]);
+    expect(out.lines[0]).toBe("support-steward (managed) · built with crewhaus 0.9.0");
+    expect(out.lines.find((l) => l.startsWith("  Takes effect:"))).toContain("compaction.curate");
+    const unused = out.lines.find((l) => l.startsWith("  Not used here:"));
+    expect(unused).toContain("watchme — ");
+    expect(unused).toContain("managed");
+    expect(out.lines.at(-1)).toBe("  Recompile for:  —");
+  });
+
+  test("a build from before the manifest reads unknown, and names crewhaus compile", async () => {
+    const old = await run(["capabilities", seedManaged("0.8.4")]);
+    expect(old.lines).toEqual([
+      "support-steward (managed) · built with crewhaus 0.8.4",
+      "  Built with CrewHaus 0.8.4. Recompile to check which settings take effect.",
+      "  run: crewhaus compile",
+    ]);
+  });
+
+  test("a build by a newer CrewHaus reads unknown, and names no command to run", async () => {
+    const newer = await run(["capabilities", seedManaged("0.10.0")]);
+    expect(newer.lines).toEqual([
+      "support-steward (managed) · built with crewhaus 0.10.0",
+      "  Built with a newer CrewHaus (0.10.0) than this one (0.9.0). Update this CrewHaus to check which settings take effect.",
+    ]);
+  });
+
+  test("--shape lists every setting's cell for a shape, without a harness", async () => {
+    const out = await run(["capabilities", "--shape", "managed"]);
+    expect(out.exitCode).toBe(0);
+    expect(out.lines[0]).toContain("managed harnesses");
+    expect(out.lines.find((l) => l.trimStart().startsWith("watchme"))).toContain("unwired");
+    const json = JSON.parse(
+      (await run(["capabilities", "--shape", "cli", "--json"])).lines.join("\n"),
+    );
+    expect(json.shape).toBe("cli");
+    expect(
+      (json.features as Array<{ feature: string; status: string }>).find(
+        (f) => f.feature === "compaction.curate",
+      )?.status,
+    ).toBe("wired");
+  });
+
+  test("an unknown shape exits 2, naming the shapes", async () => {
+    const out = await run(["capabilities", "--shape", "spaceship"]);
+    expect(out.exitCode).toBe(2);
+    expect(out.lines[0]).toContain('unknown shape "spaceship"');
+    expect(out.lines[0]).toContain("managed");
+  });
+
+  test("a directory with no spec is refused", async () => {
+    await expect(run(["capabilities", join(root, "nowhere")])).rejects.toThrow("no crewhaus.yaml");
+  });
+});

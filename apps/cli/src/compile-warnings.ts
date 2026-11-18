@@ -64,6 +64,11 @@
 // says a worker reads mode auto as default, which no edit to the edge build
 // changes. edge-public-chat says the owner chose cf_worker.public_chat, a
 // decision --strict must not overrule.
+// 0.9.0 — compaction-curate-lexical and compaction-curate-knobs-unused are
+// informational: curation runs either way (it drops exact repeats), and a dial
+// it does not read changes nothing a person relies on. ask-mode-eval-entry-only
+// too: on pipeline the REPL asks a person at its prompt, the runtime's default,
+// and the eval entry `--with-eval-harness` builds reads the setting.
 export const INFORMATIONAL_COMPILE_WARNING_CODES: readonly string[] = [
   "channel-reactions-join",
   "channel-plugins-at-start",
@@ -81,6 +86,9 @@ export const INFORMATIONAL_COMPILE_WARNING_CODES: readonly string[] = [
   "edge-permission-mode",
   "edge-tool-needs-allow",
   "edge-public-chat",
+  "compaction-curate-lexical",
+  "compaction-curate-knobs-unused",
+  "ask-mode-eval-entry-only",
 ];
 
 /** Lays codes out comma-separated, one help line per ~72 columns. */

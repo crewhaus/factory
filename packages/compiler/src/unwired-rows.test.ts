@@ -4,9 +4,22 @@
  * read do not parse: it is the walk that is under test.
  */
 import { describe, expect, test } from "bun:test";
-import type { Spec } from "@crewhaus/spec";
+import { type Spec, parseSpec } from "@crewhaus/spec";
+import { CORPUS_TODAY } from "./__fixtures__/delta-090/regenerate";
 import { ABSENT_CORPUS } from "./absent-corpus";
-import { collectCompileWarnings, specDeclares, unwiredRows, unwiredWarnings } from "./index";
+import {
+  CF_WORKER_GATED_ROOTS,
+  type CompileWarning,
+  assertCfWorkerSafetyEnforced,
+  cfWorkerUnwiredBlockWarnings,
+  collectCompileWarnings,
+  compile,
+  lower,
+  lowerWithWarnings,
+  specDeclares,
+  unwiredRows,
+  unwiredWarnings,
+} from "./index";
 
 const spec = (fields: Record<string, unknown>): Spec => fields as unknown as Spec;
 
@@ -88,18 +101,41 @@ describe("specDeclares — a top-level key reads as it always did", () => {
 });
 
 describe("unwiredRows", () => {
-  test("a shape's rows come back, and no row carries since yet", () => {
+  test("a shape's rows come back; every row with since is a 0.9.0 row, and no older row has one", () => {
     expect(unwiredRows("crew").map((row) => row.path)).toContain("provability");
     const targets = Object.keys(ABSENT_CORPUS) as Spec["target"][];
     expect(targets.length).toBe(14);
-    const rows = targets.flatMap((target) => unwiredRows(target));
-    // Every row the table holds today, read through the view: one is enough to show it reads.
-    expect(rows.length).toBeGreaterThan(0);
-    for (const row of rows) expect("since" in row, row.path).toBe(false);
+    const rows = targets.flatMap((target) => [
+      ...unwiredRows(target),
+      ...unwiredRows(target, { emitAs: "cf-worker" }),
+    ]);
+    const stamped = rows.filter((row) => "since" in row);
+    expect(stamped.length).toBeGreaterThan(0);
+    for (const row of stamped) expect(row.since, row.path).toBe("0.9.0");
+    // The rows 0.8.x already printed carry none: since marks what this release added.
+    const older = rows.filter((row) => !("since" in row)).map((row) => row.path);
+    expect(older).toContain("provability");
+    expect(older).toContain("watchme");
+    expect(older.filter((path) => path.startsWith("compaction"))).toEqual([]);
   });
 
   test("a shape with no rows answers empty", () => {
     expect(unwiredRows("cli")).toEqual([]);
+  });
+
+  test("a Cloudflare Worker build adds the cli edge's compaction rows; workflow and graph keep their own", () => {
+    const edge = (target: Spec["target"]) =>
+      unwiredRows(target, { emitAs: "cf-worker" }).map((row) => row.path);
+    expect(edge("cli").filter((path) => path.startsWith("compaction"))).toEqual(COMPACTION_PATHS);
+    expect(edge("workflow").filter((path) => path.startsWith("compaction"))).toEqual([]);
+    expect(edge("graph").filter((path) => path.startsWith("compaction"))).toEqual([]);
+    expect(edge("channel")).toEqual([]);
+    for (const target of ["cli", "workflow", "graph"] as const) {
+      for (const row of unwiredRows(target, { emitAs: "cf-worker" })) {
+        expect(row.since, row.path).toBe("0.9.0");
+        expect(row.message, row.path).toContain("the cf-worker edge does not wire it");
+      }
+    }
   });
 
   test("the rows are copies: changing one leaves the table as it was", () => {
@@ -138,5 +174,244 @@ describe("unwiredWarnings", () => {
     expect(unwiredWarnings(spec({ compaction: {} }), [ROW])).toEqual([]);
     expect(unwiredWarnings(spec({ compaction: { curate: false } }), [ROW])).toEqual([]);
     expect(unwiredWarnings(spec({}), [ROW])).toEqual([]);
+  });
+});
+
+const COMPACTION_PATHS = [
+  "compaction.model",
+  "compaction.threshold",
+  "compaction.snip_keep_head",
+  "compaction.snip_keep_tail",
+  "compaction.curate",
+  "compaction.dedupeThreshold",
+  "compaction.relevanceTopK",
+];
+
+/** A value for each sub-key that parses and is not an opt-out. */
+const COMPACTION_VALUES: Readonly<Record<string, string>> = {
+  model: "claude-haiku-4-5",
+  threshold: "0.7",
+  snip_keep_head: "2",
+  snip_keep_tail: "9",
+  curate: "true",
+  dedupeThreshold: "0.8",
+  relevanceTopK: "3",
+};
+
+const IGNORING_COMPACTION: ReadonlyArray<Spec["target"]> = [
+  "workflow",
+  "graph",
+  "pipeline",
+  "crew",
+  "research",
+  "batch",
+  "voice",
+  "browser",
+  "onchain",
+  "onchain-game",
+];
+
+describe("compaction: a shape that does not read it says so, field by field", () => {
+  for (const target of IGNORING_COMPACTION) {
+    for (const [sub, value] of Object.entries(COMPACTION_VALUES)) {
+      test(`${target}: compaction.${sub}`, () => {
+        const yaml = `${ABSENT_CORPUS[target]}compaction:\n  ${sub}: ${value}\n`;
+        const rows = unwiredRows(target).filter((row) => row.path === `compaction.${sub}`);
+        expect(rows.map((row) => row.since)).toEqual(["0.9.0"]);
+        const warnings = compile(yaml, { readme: false, today: CORPUS_TODAY }).warnings.filter(
+          (w) => w.path.startsWith("compaction"),
+        );
+        expect(warnings).toEqual([
+          { code: "accepted-but-unwired", path: `compaction.${sub}`, message: rows[0]?.message },
+        ]);
+      });
+    }
+  }
+
+  for (const target of ["cli", "channel", "managed"] as const) {
+    test(`${target} reads the block: no row, no warning`, () => {
+      expect(unwiredRows(target).filter((row) => row.path.startsWith("compaction"))).toEqual([]);
+      const block = Object.entries(COMPACTION_VALUES)
+        .map(([sub, value]) => `  ${sub}: ${value}`)
+        .join("\n");
+      const yaml = `${ABSENT_CORPUS[target]}compaction:\n${block}\n`;
+      // Only the note that the embedding threshold has nothing to tune: no embedder is passed.
+      expect(
+        compile(yaml, { readme: false, today: CORPUS_TODAY }).warnings.map((w) => [w.code, w.path]),
+      ).toEqual([["compaction-curate-knobs-unused", "compaction.dedupeThreshold"]]);
+    });
+  }
+
+  test("an empty block warns nothing", () => {
+    for (const target of IGNORING_COMPACTION) {
+      const yaml = `${ABSENT_CORPUS[target]}compaction: {}\n`;
+      const warnings = compile(yaml, { readme: false, today: CORPUS_TODAY }).warnings;
+      expect(warnings.filter((w) => w.path.startsWith("compaction"))).toEqual([]);
+    }
+  });
+
+  test("each row's reason is true of its shape", () => {
+    const detail = (target: Spec["target"]): string =>
+      unwiredRows(target).find((row) => row.path === "compaction.threshold")?.message ?? "";
+    for (const target of [
+      "workflow",
+      "graph",
+      "pipeline",
+      "crew",
+      "research",
+      "batch",
+      "browser",
+    ] as const) {
+      expect(detail(target)).toContain(`the ${target} loop compacts with the runtime's defaults`);
+    }
+    expect(detail("voice")).toContain("the realtime voice loop does not compact");
+    expect(detail("onchain")).toContain("the onchain daemon runs no agent loop yet");
+    expect(detail("onchain-game")).toContain("the onchain-game daemon runs no agent loop yet");
+  });
+});
+
+describe("compaction on a Cloudflare Worker build", () => {
+  const edgeWarnings = (target: Spec["target"], block: string): CompileWarning[] => {
+    const spec = parseSpec(`${ABSENT_CORPUS[target]}${block}`);
+    const lowered = lowerWithWarnings(spec, { today: CORPUS_TODAY });
+    return [
+      ...collectCompileWarnings(spec),
+      ...lowered.warnings,
+      ...cfWorkerUnwiredBlockWarnings(lowered.ir),
+    ];
+  };
+
+  test("a cli spec warns at the declared sub-key", () => {
+    const warnings = edgeWarnings("cli", "compaction: {threshold: 0.7}\n");
+    expect(warnings.map((w) => [w.code, w.path])).toEqual([
+      ["accepted-but-unwired", "compaction.threshold"],
+    ]);
+    const row = unwiredRows("cli", { emitAs: "cf-worker" }).find(
+      (r) => r.path === "compaction.threshold",
+    );
+    expect(warnings[0]?.message).toBe(row?.message);
+  });
+
+  test("a compaction model, by name or profile params, is one row", () => {
+    const warnings = edgeWarnings("cli", "compaction: {model: claude-haiku-4-5, curate: true}\n");
+    expect(warnings.map((w) => w.path)).toEqual(["compaction.model", "compaction.curate"]);
+    expect(edgeWarnings("cli", "compaction: {curate: false}\n")).toEqual([]);
+  });
+
+  test("a workflow spec through the whole edge path warns at that path exactly once", () => {
+    const warnings = edgeWarnings("workflow", "compaction: {threshold: 0.7}\n");
+    expect(warnings.filter((w) => w.path === "compaction.threshold")).toHaveLength(1);
+  });
+});
+
+describe("the other settings a Cloudflare Worker build of a cli spec does not read", () => {
+  const edgeWarnings = (target: Spec["target"], block: string): CompileWarning[] => {
+    const spec = parseSpec(`${ABSENT_CORPUS[target]}${block}`);
+    const lowered = lowerWithWarnings(spec, { today: CORPUS_TODAY });
+    return [
+      ...collectCompileWarnings(spec),
+      ...lowered.warnings,
+      ...cfWorkerUnwiredBlockWarnings(lowered.ir),
+    ];
+  };
+
+  test("a safety setting is never a row: the edge gate enforces it or refuses the build", () => {
+    const gated = (path: string): boolean =>
+      CF_WORKER_GATED_ROOTS.some((root) => {
+        const segs = root.split(".");
+        const parts = path.split(/[.[\]]/).filter((p) => p !== "");
+        return segs.every((seg, i) => seg === "*" || seg === parts[i]);
+      });
+    for (const target of ["cli", "workflow", "graph"] as const) {
+      const rows = unwiredRows(target, { emitAs: "cf-worker" }).map((r) => r.path);
+      expect(rows.length, target).toBeGreaterThan(0);
+      expect(rows.filter(gated), target).toEqual([]);
+    }
+    expect(gated("steps[0].model_pool")).toBe(true);
+    expect(gated("security.justification")).toBe(true);
+    for (const block of [
+      "security: {justification: {judge: claude}}\n",
+      "security: {egressMatcher: semantic}\n",
+    ]) {
+      const spec = parseSpec(`${ABSENT_CORPUS.cli}${block}`);
+      expect(() => assertCfWorkerSafetyEnforced(spec, lower(spec)), block).toThrow(
+        "cf-worker target cannot enforce",
+      );
+    }
+  });
+
+  test("observability warns per sub-block it does not read, and never for trace", () => {
+    const warnings = edgeWarnings(
+      "cli",
+      "observability: {slo: {error_rate: 0.05}, metrics: {enabled: true}, trace: {level: off}}\n",
+    );
+    expect(warnings.map((w) => [w.code, w.path])).toEqual([
+      ["accepted-but-unwired", "observability.slo"],
+      ["accepted-but-unwired", "observability.metrics"],
+    ]);
+    expect(edgeWarnings("cli", "observability: {trace: {level: off}}\n")).toEqual([]);
+    const rows = unwiredRows("cli", { emitAs: "cf-worker" }).map((r) => r.path);
+    expect(rows.filter((p) => p.startsWith("observability"))).toEqual([
+      "observability.slo",
+      "observability.metrics",
+      "observability.cost",
+      "observability.alerts",
+      "observability.incidents",
+      "observability.otel",
+    ]);
+  });
+
+  test("failure_taxonomy warns on every edge shape, once", () => {
+    const block = "failure_taxonomy: [{class: net, pattern: ETIMEDOUT, recovery: retry}]\n";
+    for (const target of ["cli", "workflow", "graph"] as const) {
+      const warnings = edgeWarnings(target, block).filter((w) => w.path === "failure_taxonomy");
+      expect(
+        warnings.map((w) => w.code),
+        target,
+      ).toEqual(["accepted-but-unwired"]);
+      expect(warnings[0]?.message, target).toContain("no recovery engine");
+    }
+  });
+});
+
+describe("failure_taxonomy on a shape that runs no recovery engine", () => {
+  const block = "failure_taxonomy: [{class: net, pattern: ETIMEDOUT, recovery: retry}]\n";
+  for (const target of ["voice", "onchain", "onchain-game"] as const) {
+    test(`${target} warns, with since`, () => {
+      const row = unwiredRows(target).find((r) => r.path === "failure_taxonomy");
+      expect(row?.since).toBe("0.9.0");
+      const warnings = compile(`${ABSENT_CORPUS[target]}${block}`, {
+        readme: false,
+        today: CORPUS_TODAY,
+      }).warnings.filter((w) => w.path === "failure_taxonomy");
+      expect(warnings).toEqual([
+        { code: "accepted-but-unwired", path: "failure_taxonomy", message: row?.message },
+      ]);
+    });
+  }
+});
+
+describe("permissions.ask_mode on pipeline", () => {
+  const yaml = `${ABSENT_CORPUS.pipeline}permissions:\n  ask_mode: deny\n`;
+
+  test("has no unused-setting row: the eval entry reads it", () => {
+    expect(unwiredRows("pipeline").filter((r) => r.path.startsWith("permissions"))).toEqual([]);
+  });
+
+  test("an eval-harness build renders it, and the only warning is the informational note", () => {
+    const built = compile(yaml, { readme: false, today: CORPUS_TODAY, evalEntry: true });
+    const agent = built.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agent).toContain('askMode: "deny"');
+    const without = compile(ABSENT_CORPUS.pipeline, {
+      readme: false,
+      today: CORPUS_TODAY,
+      evalEntry: true,
+    });
+    expect(without.files.find((f) => f.path === "agent.ts")?.content).not.toContain(
+      'askMode: "deny"',
+    );
+    expect(built.warnings.map((w) => [w.code, w.path])).toEqual([
+      ["ask-mode-eval-entry-only", "permissions.ask_mode"],
+    ]);
   });
 });

@@ -475,6 +475,8 @@ describe("/api/harnesses rows + rollup cache", () => {
       lastSeen: iso(NOW),
       missingSince: null,
       capabilities: [],
+      // No badge is declared, so there is nothing to say about any (#514).
+      badgeSupport: {},
       evalHealthy: null, // runs exist but no baseline is pinned: not measured
       // M2 fleet columns: no supervisor has been created for this harness
       // (nothing has driven it), and nothing is parked on a human.

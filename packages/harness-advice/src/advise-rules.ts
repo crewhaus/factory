@@ -15,6 +15,7 @@
  * context slice for each missing kind and simply produce no findings — the
  * rules only fire where the data now exists.
  */
+import { SUPPORT_MANIFEST } from "@crewhaus/ir/support";
 import { type ProofClaim, claimReasons } from "@crewhaus/provability";
 import type { ArmStats } from "@crewhaus/routing-store";
 import type { Spec } from "@crewhaus/spec";
@@ -869,15 +870,16 @@ export const ruleTruncationPressure: AdviceRule = (ctx, opts) => {
 
 /**
  * Compaction thrash: any single session compacting ≥ threshold times.
- * Loop contract 0.4 (Batch E, G19) — `compaction.curate` is now WIRED at
- * runtime: runtime-core's `maybeCompact` runs the `@crewhaus/compaction-curator`
- * pass (semantic dedupe + relevance trim) before each compaction when the flag
- * is set. It is listed in OPTIMIZABLE_PATHS and lowers to IR
- * (`packages/ir/src/index.ts`, `IrCompaction.curate`), so enabling it has a
- * real effect the `optimize --from-advice` eval gate can measure — the rule
- * therefore PROPOSES `compaction.curate: true` (through `patchOrAdvice`, so the
- * OPTIMIZABLE_PATHS whitelist stays the floor) when curation is off, and stays
- * advice-only (with the remaining structural remedies) once it is already on.
+ * `compaction.curate` runs the curation pass (it drops exact repeats of a
+ * message, plus a relevance trim when `relevanceTopK` is set) before
+ * compaction on the shapes the support manifest (`@crewhaus/ir/support`) says
+ * it is wired on: cli, channel and managed harnesses. There the rule PROPOSES
+ * `compaction.curate: true` when curation is off (through `patchOrAdvice`, so
+ * OPTIMIZABLE_PATHS stays the floor: only the cli row is optimizable) and stays
+ * advice-only with the structural remedies once it is on. On a shape that does
+ * not run it, the advice never names curation. Widening the compaction window
+ * is offered only where the manifest says the shape reads the window
+ * (`compaction.threshold`).
  */
 export const ruleCompactionThrash: AdviceRule = (ctx, opts) => {
   const t = resolveThresholds(opts);
@@ -893,31 +895,47 @@ export const ruleCompactionThrash: AdviceRule = (ctx, opts) => {
   const spec = opts?.spec;
   const compaction = specField<Record<string, unknown>>(spec, "compaction");
   const curateOn = compaction?.["curate"] === true;
-  const suggestion: AdviceSuggestion = curateOn
+  const wiredHere = (feature: string): boolean =>
+    spec === undefined ||
+    SUPPORT_MANIFEST.features[feature]?.cells[spec.target]?.status === "wired";
+  const curateRuns = wiredHere("compaction.curate");
+  const remedies = [
+    ...(wiredHere("compaction.threshold") ? ["widen the compaction window"] : []),
+    "trim which tools are available (fewer tools per turn means less context to summarize)",
+    "split the work across a sub-agent so each session carries less history",
+  ];
+  const remedyList =
+    remedies.length > 1
+      ? `${remedies.slice(0, -1).join(", ")}, or ${remedies.at(-1) as string}`
+      : (remedies[0] as string);
+  const capitalized = `${remedyList.charAt(0).toUpperCase()}${remedyList.slice(1)}`;
+  const thrashing =
+    "Sessions are compacting repeatedly, which burns tokens on re-summarization and loses context each pass.";
+  const curatorDoes =
+    "drops exact repeats (and trims low-relevance context when `compaction.relevanceTopK` is set) before each compaction";
+  const suggestion: AdviceSuggestion = !curateRuns
     ? {
         kind: "advice",
-        text:
-          "compaction.curate is already enabled and sessions still thrash. The curator trims duplicate and " +
-          "low-relevance context before each compaction, but it cannot prevent compaction on a genuinely large " +
-          "history — widen the compaction window, trim which tools are available (fewer tools per turn means " +
-          "less context to summarize), or split the work across a sub-agent so each session carries less history.",
+        text: `${thrashing} ${capitalized}.`,
       }
-    : patchOrAdvice(
-        spec,
-        {
-          target: spec?.target ?? "cli",
-          // `add` the leaf when absent; `replace` when a `compaction.curate:
-          // false` is present (the `curateOn` branch above already handled the
-          // already-true case). `applySpecPatch` creates the `compaction` parent.
-          op: compaction?.["curate"] !== undefined ? "replace" : "add",
-          path: ["compaction", "curate"],
-          value: true,
-        },
-        "Sessions are compacting repeatedly, which burns tokens on re-summarization and loses context each " +
-          "pass. Enable `compaction.curate` to run the active-context curator (semantic dedupe + relevance " +
-          "trim) before each compaction, so less context needs summarizing. You can also widen the compaction " +
-          "window, trim which tools are available, or split the work across a sub-agent.",
-      );
+    : curateOn
+      ? {
+          kind: "advice",
+          text: `compaction.curate is already enabled and sessions still thrash. The curator ${curatorDoes}, but it cannot prevent compaction on a genuinely large history — ${remedyList}.`,
+        }
+      : patchOrAdvice(
+          spec,
+          {
+            target: spec?.target ?? "cli",
+            // `add` the leaf when absent; `replace` when a `compaction.curate:
+            // false` is present (the `curateOn` branch above already handled the
+            // already-true case). `applySpecPatch` creates the `compaction` parent.
+            op: compaction?.["curate"] !== undefined ? "replace" : "add",
+            path: ["compaction", "curate"],
+            value: true,
+          },
+          `${thrashing} Enable \`compaction.curate\` to run the curator, which ${curatorDoes}, so less context needs summarizing. You can also ${remedyList}.`,
+        );
   return [
     {
       id: "compaction-thrash",
