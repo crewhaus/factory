@@ -16,15 +16,15 @@
  */
 
 /**
- * The minimal durable key/value surface the loop needs for pending-approval
- * parking and tool-call idempotency. Deliberately a subset of the Cloudflare
- * Workers KV binding (and trivially satisfiable by an in-memory `Map` in
- * tests or a Durable Object's storage): the loop never assumes list, TTL
- * metadata, or transactions.
+ * A minimal durable key/value surface, reserved for a stateful worker:
+ * `runWorkerLoop` reads no storage, and a call its permission rules leave to
+ * approval is refused. Deliberately a subset of the Cloudflare Workers KV
+ * binding (and trivially satisfiable by an in-memory `Map` in tests or a
+ * Durable Object's storage): it never assumes list, TTL metadata, or
+ * transactions.
  *
  * OPTIONAL on {@link WorkerPlatform}: a stateless worker (request→response,
- * no binding) omits it, and the loop degrades to no parking / no
- * idempotency rather than failing to boot.
+ * no binding) omits it.
  */
 export interface KVLike {
   get(key: string): Promise<string | null>;
@@ -49,7 +49,8 @@ export interface KVLike {
  *   // storage omitted — stateless
  * };
  * ```
- * A stateful worker additionally passes `storage: env.APPROVALS_KV`.
+ * A stateful worker may additionally pass `storage` (a KV binding); it is
+ * reserved, and the loop reads none.
  */
 export interface WorkerPlatform {
   /**
@@ -65,8 +66,9 @@ export interface WorkerPlatform {
    */
   randomId(): string;
   /**
-   * Durable key/value storage for pending-approval persistence and tool
-   * idempotency. Absent on stateless workers → those features no-op.
+   * Durable key/value storage, reserved: `runWorkerLoop` reads no storage,
+   * and a call its permission rules leave to approval is refused. Absent on
+   * a stateless worker.
    */
   storage?: KVLike;
   /**

@@ -71,39 +71,12 @@ export function auditSpecToolNames(
 }
 
 /**
- * The manifest's flags for a builtin no cli bundle carries, by spec key or by
- * registered name (a sub-agent list uses the name) — for describing a rule's
- * tool, not for vouching for a sink's scope (see `auditSpecToolNames`).
+ * The rule checker's name sources live in `@crewhaus/compiler`, so the
+ * hosted edge compile reads tool names the way this CLI does. They are
+ * re-exported here so the CLI's import sites are unchanged:
+ * `nonCliBuiltinFlags` describes a builtin no cli bundle carries (for a
+ * rule's tool, not for vouching for a sink's scope — see
+ * `auditSpecToolNames`), and `collectToolNames` is every tool name a lowered
+ * IR references, as the spec spells it.
  */
-export function nonCliBuiltinFlags(name: string): (typeof NON_CLI_TOOL_FLAGS)[string] | undefined {
-  if (Object.hasOwn(NON_CLI_TOOL_FLAGS, name)) return NON_CLI_TOOL_FLAGS[name];
-  return Object.values(NON_CLI_TOOL_FLAGS).find((flags) => flags.name === name);
-}
-
-/**
- * FR-002 — collect every tool NAME referenced anywhere in a lowered IR,
- * variant-agnostically. The IR is a JSON-serializable discriminated union
- * (14 variants); some carry tools at the top level (`IrV0.tools`), others
- * nest them under steps / nodes / stages / sub-agents. Rather than couple to
- * each variant's shape, walk the serialized object and gather every string
- * under a `tools` key. Deterministic and dedup'd.
- */
-export function collectToolNames(ir: unknown): string[] {
-  const names = new Set<string>();
-  const visit = (node: unknown): void => {
-    if (Array.isArray(node)) {
-      for (const item of node) visit(item);
-      return;
-    }
-    if (node !== null && typeof node === "object") {
-      for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-        if (key === "tools" && Array.isArray(value)) {
-          for (const v of value) if (typeof v === "string") names.add(v);
-        }
-        visit(value);
-      }
-    }
-  };
-  visit(ir);
-  return [...names];
-}
+export { collectIrToolNames as collectToolNames, nonCliBuiltinFlags } from "@crewhaus/compiler";

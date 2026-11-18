@@ -593,6 +593,7 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
+        "@crewhaus/tool-registry-manifest": "workspace:*",
         "@crewhaus/worker-runtime": "workspace:*",
       },
       "devDependencies": {
@@ -2304,6 +2305,7 @@
       },
       "devDependencies": {
         "@crewhaus/tool-todo": "workspace:*",
+        "@crewhaus/tool-web": "workspace:*",
       },
     },
     "packages/target-cf-worker-graph": {
@@ -2319,6 +2321,7 @@
       },
       "devDependencies": {
         "@crewhaus/tool-todo": "workspace:*",
+        "@crewhaus/tool-web": "workspace:*",
       },
     },
     "packages/target-cf-worker-workflow": {
@@ -2334,6 +2337,7 @@
       },
       "devDependencies": {
         "@crewhaus/tool-todo": "workspace:*",
+        "@crewhaus/tool-web": "workspace:*",
       },
     },
     "packages/target-channel-bot": {
@@ -4032,11 +4036,13 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
         "@crewhaus/tool-loop-detection": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
         "@crewhaus/turn-state-machine": "workspace:*",
         "zod-to-json-schema": "^3.23.5",
       },
       "devDependencies": {
+        "@crewhaus/permission-engine": "workspace:*",
         "zod": "^3.23.8",
       },
     },

@@ -330,6 +330,21 @@ describe("SpecDiff", () => {
     expect(result.changes.map((c) => c.kind)).toEqual(["mcp-server"]);
   });
 
+  test("turning on cf_worker.public_chat widens, and turning it off does not", async () => {
+    const off = `${CLI_SPEC}\ncf_worker:\n  public_chat: false`;
+    const on = `${CLI_SPEC}\ncf_worker:\n  public_chat: true`;
+    type Diff = { widens: boolean; changes: Array<{ kind: string }> };
+    const turnedOn = await callJson<Diff>(specDiff, { before: { spec: off }, after: { spec: on } });
+    expect(turnedOn.widens).toBe(true);
+    expect(turnedOn.changes.map((c) => c.kind)).toEqual(["cf-worker-public-chat"]);
+    const turnedOff = await callJson<Diff>(specDiff, {
+      before: { spec: on },
+      after: { spec: off },
+    });
+    expect(turnedOff.widens).toBe(false);
+    expect(turnedOff.changes.map((c) => c.kind)).toEqual(["cf-worker-public-chat"]);
+  });
+
   test("an unchanged pair reports no changes", async () => {
     const result = await callJson<{ changed: boolean }>(specDiff, {
       before: { spec: CLI_SPEC },

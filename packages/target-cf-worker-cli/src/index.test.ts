@@ -20,6 +20,8 @@ import { TargetEmitError, emitCfWorkerCli, resolveEdgeTools } from "./index";
  */
 
 const SRC_DIR = import.meta.dir;
+/** The worker's `CHAT_TOKEN` for every drive below, made at run time. */
+const CHAT_TOKEN = `chat-${crypto.randomUUID()}`;
 
 const workerCode = (ir: IrV0): string =>
   emitCfWorkerCli(ir).files.find((f) => f.path === "worker.js")?.content ?? "";
@@ -83,10 +85,14 @@ try {
     const worker = (await import(workerPath)).default;
     const req = new Request("https://harness.example/chat", {
       method: "POST",
-      headers: { "content-type": "application/json", origin: "https://studio.crewhaus.ai" },
+      headers: {
+        "content-type": "application/json",
+        origin: "https://studio.crewhaus.ai",
+        authorization: "Bearer " + job.chatToken,
+      },
       body: JSON.stringify(job.body ?? { messages: [{ role: "user", content: "hi" }] }),
     });
-    const res = await worker.fetch(req, { ANTHROPIC_API_KEY: "sk-test" });
+    const res = await worker.fetch(req, { ANTHROPIC_API_KEY: "sk-test", CHAT_TOKEN: job.chatToken });
     result.status = res.status;
     result.raw = await res.text();
     result.calls = calls;
@@ -113,7 +119,8 @@ async function runJob(
 ): Promise<BuildResult & DriveResult> {
   const dir = mkdtempSync(join(SRC_DIR, ".cfw-run-"));
   writeFileSync(join(dir, "worker.mjs"), code);
-  writeFileSync(join(dir, "job.json"), JSON.stringify(job));
+  // Every drive sends the worker's bearer: /chat answers nothing without it.
+  writeFileSync(join(dir, "job.json"), JSON.stringify({ chatToken: CHAT_TOKEN, ...job }));
   writeFileSync(join(dir, "driver.mjs"), DRIVER_SRC);
   try {
     const proc = Bun.spawn([process.execPath, join(dir, "driver.mjs")], {
@@ -313,14 +320,24 @@ describe("emitCfWorkerCli — config threading", () => {
     expect(worker).toContain("limits: undefined");
   });
 
-  test("loop-detection justify escalation degrades to warn on the edge", () => {
+  test("a justify escalation is refused: it needs the intent gate, which a worker does not run", () => {
     const ir: IrV0 = {
       ...baseIr,
       limits: { loopDetection: { window: 6, threshold: 3, escalation: "justify" } },
     };
-    expect(workerCode(ir)).toContain(
-      '"loopDetection":{"window":6,"threshold":3,"escalation":"warn"}',
+    expect(() => emitCfWorkerCli(ir)).toThrow(TargetEmitError);
+    expect(() => emitCfWorkerCli(ir)).toThrow(
+      "limits.loop_detection.escalation: justify needs the intent gate, which a worker does not run — use warn or abort",
     );
+    // warn and abort are carried as declared.
+    for (const escalation of ["warn", "abort"] as const) {
+      expect(
+        workerCode({
+          ...baseIr,
+          limits: { loopDetection: { window: 6, threshold: 3, escalation } },
+        }),
+      ).toContain(`"loopDetection":{"window":6,"threshold":3,"escalation":"${escalation}"}`);
+    }
   });
 });
 
@@ -533,7 +550,12 @@ describe("emitCfWorkerCli — /chat SSE through the shared runtime", () => {
   });
 
   test("a REAL tool round-trip runs through the loop (tool_call frames + two model calls)", async () => {
-    const r = await runJob(workerCode({ ...baseIr, tools: ["todoWrite"] }), {
+    const ir: IrV0 = {
+      ...baseIr,
+      tools: ["todoWrite"],
+      permissions: { rules: [{ type: "alwaysAllow", pattern: "TodoWrite" }] },
+    };
+    const r = await runJob(workerCode(ir), {
       mode: "drive",
       turns: [
         toolTurn("tu_1", "TodoWrite", {

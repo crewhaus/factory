@@ -122,17 +122,18 @@ describe("a cf-worker bundle registers only blocks its registrars accept", () =>
     };
     for (const c of cases) {
       const host = refusal(() => compile(spec(c.key, c.bad)));
-      const edge = refusal(() => emitCfWorkerBundle(lower(parseSpec(spec(c.key, c.bad)))));
+      const bad = parseSpec(spec(c.key, c.bad));
+      const edge = refusal(() => emitCfWorkerBundle(bad, lower(bad)));
       expect({ key: c.key, refused: host !== undefined, edge }).toEqual({
         key: c.key,
         refused: true,
         edge: host,
       });
       // The same block, well formed, is registered by the worker.
+      const good = parseSpec(spec(c.key, c.good));
       const worker =
-        emitCfWorkerBundle(lower(parseSpec(spec(c.key, c.good)))).files.find(
-          (f) => f.path === "worker.js",
-        )?.content ?? "";
+        emitCfWorkerBundle(good, lower(good)).files.find((f) => f.path === "worker.js")?.content ??
+        "";
       expect({ key: c.key, registers: worker.includes(`${c.symbol}(`) }).toEqual({
         key: c.key,
         registers: true,

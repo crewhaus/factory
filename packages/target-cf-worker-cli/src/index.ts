@@ -1,6 +1,13 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import { type Bundle, type IrLimits, type IrV0, renderBundleReadme } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type BundleReadmeSection,
+  type IrLimits,
+  type IrPermissions,
+  type IrV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 import { parseModelString } from "@crewhaus/model-router";
 import { readmeToolFacts, resolveBuiltinTools } from "@crewhaus/tool-categories";
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
@@ -25,16 +32,18 @@ const DEFAULT_ALLOWED_ORIGINS = ["https://studio.crewhaus.ai", "http://localhost
  * `@crewhaus/target-cli`'s `emitCli`: same IR shape in, different generated
  * artifacts out.
  *
- * Loop contract 0.4 (Batch F, G12/G83) — the emitted worker no longer inlines
- * a bespoke Anthropic SSE client. It imports `@crewhaus/worker-runtime` and
- * runs the SHARED `runWorkerLoop` over a stateless {@link WorkerPlatform}
- * (injected clock, `crypto.randomUUID`, the platform `fetch`; storage absent),
- * so the deployed worker gains REAL tools (the edge-safe set), budget, limits,
- * and the Batch C trace frames THROUGH the shared runtime — the payoff of the
- * G12 node-free guarantee. Host tools are rejected at compile time; a run that
+ * Loop contract 0.4 (Batch F, G12/G83) — the emitted worker imports
+ * `@crewhaus/worker-runtime` and runs the SHARED `runWorkerLoop` over a
+ * stateless {@link WorkerPlatform} (injected clock, `crypto.randomUUID`, the
+ * platform `fetch`; storage absent). Through the shared runtime the worker
+ * carries real edge-safe tools decided by the spec's permission rules, the
+ * `limits:` keys the edge enforces, the `CHAT_TOKEN` bearer on `/chat`, and
+ * the trace frames — the payoff of the G12 node-free guarantee. A tool runs
+ * only when an `alwaysAllow` rule covers the call, since a worker has nobody
+ * to approve one. Host tools are rejected at compile time; a run that
  * outgrows its context window ends with a classified error frame (no
- * compaction on the edge). The `/chat` `text`/`done`/`error` SSE vocabulary is
- * byte-compatible with the inlined client it replaces.
+ * compaction on the edge). `/chat` streams the `text`/`done`/`error` SSE
+ * vocabulary, with `trace` frames beside it.
  *
  * Bundle contents:
  *   - `worker.js`        — entrypoint (ES module Worker) that imports the
@@ -56,6 +65,7 @@ export function emitCfWorkerCli(ir: IrV0, opts: EmitOptions = {}): Bundle {
   // tools (bash/fs/code-exec/device) hard-fail; unrecognised custom tools are
   // permitted with a warning surfaced in the generated worker.
   const wiring = resolveEdgeTools(ir.tools, ir.toolConfigs);
+  const publicChat = ir.cfWorker?.publicChat === true;
 
   const allowedOrigins =
     opts.allowedOrigins && opts.allowedOrigins.length > 0
@@ -63,7 +73,7 @@ export function emitCfWorkerCli(ir: IrV0, opts: EmitOptions = {}): Bundle {
       : DEFAULT_ALLOWED_ORIGINS;
   const files = [
     { path: "worker.js", content: renderWorker(ir, wiring, allowedOrigins) },
-    { path: "wrangler.toml", content: renderWrangler(ir) },
+    { path: "wrangler.toml", content: renderWrangler(ir, publicChat) },
     { path: "package.json", content: renderPackageJson(ir, wiring) },
   ];
   // Item 42 — generated bundle README; default ON. The default per-target
@@ -73,7 +83,7 @@ export function emitCfWorkerCli(ir: IrV0, opts: EmitOptions = {}): Bundle {
     files.push({
       path: "README.md",
       content: renderBundleReadme(ir, {
-        ...CF_WORKER_README_OPTS,
+        ...cfWorkerReadmeOpts(publicChat, wiring.toolsExpr !== "[]"),
         unwiredTools: { names: new Set(wiring.unwired), note: CF_WORKER_UNWIRED_NOTE },
         toolFacts: readmeToolFacts([{ tools: ir.tools, toolConfigs: ir.toolConfigs }]),
       }),
@@ -86,20 +96,81 @@ export function emitCfWorkerCli(ir: IrV0, opts: EmitOptions = {}): Bundle {
 const CF_WORKER_UNWIRED_NOTE =
   "left out of this worker — the edge runtime does not run it (see the compile warning)";
 
-const CF_WORKER_README_OPTS = {
-  usage: {
-    heading: "Deploy",
-    body: [
-      "```sh",
-      "npm install                              # resolve the crewhaus runtime + tools",
-      "wrangler secret put ANTHROPIC_API_KEY    # one-time Worker secret",
-      "wrangler deploy                          # bundles worker.js + its imports",
-      "```",
-    ].join("\n"),
-  },
-  // A deployed Worker has no local `.crewhaus/` workspace.
-  includeWorkspaceNote: false,
-} as const;
+/**
+ * The README's Deploy steps and the sections that say how the worker is
+ * called and which tool calls it runs. `publicChat` is the spec's
+ * `cf_worker.public_chat`; `hasTools` says the worker wires a tool.
+ */
+function cfWorkerReadmeOpts(
+  publicChat: boolean,
+  hasTools: boolean,
+): {
+  readonly usage: BundleReadmeSection;
+  readonly includeWorkspaceNote: false;
+  readonly extraSections: readonly BundleReadmeSection[];
+} {
+  const deploy = [
+    "```sh",
+    "npm install                              # resolve the crewhaus runtime + tools",
+    "wrangler secret put ANTHROPIC_API_KEY    # one-time Worker secret",
+    ...(publicChat
+      ? []
+      : ["wrangler secret put CHAT_TOKEN           # the bearer token POST /chat requires"]),
+    "wrangler deploy                          # bundles worker.js + its imports",
+    "```",
+    ...(publicChat
+      ? []
+      : [
+          "",
+          "Pick a long random `CHAT_TOKEN` (for example `openssl rand -base64 32`) and give it only to the clients that call this worker; for `wrangler dev`, put it in `.dev.vars`.",
+        ]),
+  ];
+  const curl = [
+    "```sh",
+    "curl -N https://<your-worker>.workers.dev/chat \\",
+    ...(publicChat ? [] : ['  -H "Authorization: Bearer $CHAT_TOKEN" \\']),
+    '  -H "Content-Type: application/json" \\',
+    `  -d '{"messages":[{"role":"user","content":"Hello"}]}'`,
+    "```",
+  ];
+  const calling = publicChat
+    ? [
+        "`POST /chat` answers without a token (`cf_worker.public_chat: true`): anyone with this worker's URL can run it on your `ANTHROPIC_API_KEY` and its tools. Put Cloudflare Access or a rate-limiting rule in front of it.",
+        "",
+        ...curl,
+        "",
+        '`GET /health` answers `{"ok":true}`.',
+      ]
+    : [
+        "Send the bearer token with every `POST /chat` request:",
+        "",
+        ...curl,
+        "",
+        'A missing or wrong token is answered with 401, and every `/chat` request is answered with 503 and the code `NO_CHAT_TOKEN` until `CHAT_TOKEN` is set. `GET /health` answers `{"ok":true}` without a token.',
+        "",
+        "A token written into a web page can be read by everyone who opens it: call the worker from a backend, or put Cloudflare Access in front of it.",
+      ];
+  return {
+    usage: { heading: "Deploy", body: deploy.join("\n") },
+    // A deployed Worker has no local `.crewhaus/` workspace.
+    includeWorkspaceNote: false,
+    extraSections: [
+      {
+        heading: "Calling the worker",
+        body: [
+          ...calling,
+          "",
+          "This worker keeps no spend meter: set a spending limit on the Anthropic account its key belongs to.",
+        ].join("\n"),
+      },
+      ...(hasTools ? [{ heading: "Tools on this worker", body: CF_WORKER_TOOLS_NOTE }] : []),
+    ],
+  };
+}
+
+/** The README's word on which tool calls the worker runs. */
+const CF_WORKER_TOOLS_NOTE =
+  "A tool runs on this worker only when an `alwaysAllow` rule in `permissions.rules` covers the call: `WebFetch`, or `WebFetch(https://api.example.com/**)` for one site. A matching `alwaysDeny` or `alwaysAsk` rule wins over any `alwaysAllow`. `mode: auto` reads as `default`, and `mode: plan` runs only read-only tools. Any other call returns an error to the model, because a worker has nobody to approve it.";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -177,9 +248,14 @@ export function resolveEdgeTools(
   };
 }
 
+/** The refusal for a `justify` escalation, which needs the intent gate. */
+const JUSTIFY_REFUSAL =
+  "limits.loop_detection.escalation: justify needs the intent gate, which a worker does not run — use warn or abort";
+
 /** Render the worker's `limits` argument to `runWorkerLoop` from the IR's
- *  `limits:` block — the v1 subset the edge honours. `justify` escalation (a
- *  Node-only intent gate) degrades to the safe `warn`. */
+ *  `limits:` block: the keys the edge enforces. A `justify` escalation needs
+ *  the intent gate, which a worker does not run, so it is refused with a
+ *  `TargetEmitError`. */
 function renderLimits(limits: IrLimits | undefined): string {
   if (limits === undefined) return "undefined";
   const out: Record<string, unknown> = {};
@@ -192,13 +268,23 @@ function renderLimits(limits: IrLimits | undefined): string {
     if (limits.loopDetection.threshold !== undefined) {
       ld["threshold"] = limits.loopDetection.threshold;
     }
+    if (limits.loopDetection.escalation === "justify") throw new TargetEmitError(JUSTIFY_REFUSAL);
     if (limits.loopDetection.escalation !== undefined) {
-      ld["escalation"] =
-        limits.loopDetection.escalation === "justify" ? "warn" : limits.loopDetection.escalation;
+      ld["escalation"] = limits.loopDetection.escalation;
     }
     if (Object.keys(ld).length > 0) out["loopDetection"] = ld;
   }
   return Object.keys(out).length > 0 ? JSON.stringify(out) : "undefined";
+}
+
+/** The worker's `permissions`: the spec's mode, only when set, and its rules
+ *  in declared order. `askMode` is not carried: every ask is refused on a
+ *  worker, whatever it says. */
+function renderPermissions(permissions: IrPermissions): string {
+  return JSON.stringify({
+    ...(permissions.mode !== undefined ? { mode: permissions.mode } : {}),
+    rules: permissions.rules.map((rule) => ({ type: rule.type, pattern: rule.pattern })),
+  });
 }
 
 /** The generated `edge-unsafe-tool` note comment for permitted-but-unwired
@@ -223,6 +309,8 @@ function renderWorker(ir: IrV0, wiring: EdgeToolWiring, allowedOrigins: readonly
   const thinking =
     ir.agent.thinking !== undefined ? JSON.stringify(ir.agent.thinking) : "undefined";
   const limits = renderLimits(ir.limits);
+  const permissions = renderPermissions(ir.permissions);
+  const publicChat = ir.cfWorker?.publicChat === true;
   // Loop contract 0.4 (Batch C, item 3) — the /chat SSE carries `trace` events
   // in the TraceEvent vocabulary. `observability.trace: off` suppresses them;
   // every other level (default "ring", "pretty", "json") emits. Baked as a
@@ -241,7 +329,7 @@ function renderWorker(ir: IrV0, wiring: EdgeToolWiring, allowedOrigins: readonly
 
   return `// Generated by @crewhaus/target-cf-worker-cli. Do not edit by hand.
 // Regenerate via the studio PWA or \`crewhaus compile --target cf-worker-cli\`.
-${taxonomyWarning}${toolNote}import { runWorkerLoop, createEdgeAnthropicAdapter } from "@crewhaus/worker-runtime";
+${taxonomyWarning}${toolNote}import { runWorkerLoop, createEdgeAnthropicAdapter, chatAuthRefusal } from "@crewhaus/worker-runtime";
 ${toolImports}${toolInits}
 const CONFIG = {
   name: ${name},
@@ -252,6 +340,8 @@ const CONFIG = {
   maxTokens: ${maxTokens},
   thinking: ${thinking},
   limits: ${limits},
+  permissions: ${permissions},
+  publicChat: ${publicChat},
 };
 
 // The edge-safe tool set the shared loop runs (empty when the spec declares no
@@ -266,9 +356,18 @@ export default {
 
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
-      return json({ ok: true, harness: CONFIG.name }, 200, cors);
+      return json({ ok: true }, 200, cors);
     }
     if (request.method === "POST" && url.pathname === "/chat") {
+      // The CHAT_TOKEN bearer is checked first: a request without it is
+      // answered before its body is read or the model key is looked up.
+      if (!CONFIG.publicChat) {
+        const refusal = await chatAuthRefusal(request.headers.get("authorization"), env.CHAT_TOKEN);
+        if (refusal) {
+          const headers = refusal.status === 401 ? { ...cors, "WWW-Authenticate": "Bearer" } : cors;
+          return json({ error: { code: refusal.code, message: refusal.message } }, refusal.status, headers);
+        }
+      }
       return handleChat(request, env, cors);
     }
     return json({ error: { code: "NOT_FOUND" } }, 404, cors);
@@ -345,6 +444,7 @@ async function handleChat(request, env, cors) {
           maxTokens: CONFIG.maxTokens,
           ...(CONFIG.thinking ? { thinking: CONFIG.thinking } : {}),
           ...(CONFIG.limits ? { limits: CONFIG.limits } : {}),
+          permissions: CONFIG.permissions,
           emitTrace: trace,
         });
         // A failing stop (context_overflow / timeout / provider error) resolves
@@ -392,7 +492,7 @@ function buildCors(origin) {
   return {
     "Access-Control-Allow-Origin": allow,
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
     Vary: "Origin",
   };
 }
@@ -406,7 +506,7 @@ function json(body, status, cors) {
 `;
 }
 
-function renderWrangler(ir: IrV0): string {
+function renderWrangler(ir: IrV0, publicChat: boolean): string {
   const safeName = ir.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
   return `name = "${safeName}"
 main = "worker.js"
@@ -414,14 +514,22 @@ compatibility_date = "2026-05-01"
 compatibility_flags = ["nodejs_compat"]
 
 # worker.js imports @crewhaus/worker-runtime and the edge-safe tool packages;
-# \`wrangler deploy\` bundles them (run \`npm install\` first). ANTHROPIC_API_KEY
-# is a Worker Secret (never committed):
+# \`wrangler deploy\` bundles them (run \`npm install\` first). Its secrets are
+# Worker Secrets (never committed):
 #   wrangler secret put ANTHROPIC_API_KEY
-# The studio PWA sets this automatically via the Deploy flow.
+${chatTokenLine(publicChat)}
+# The studio PWA sets ANTHROPIC_API_KEY through its Deploy flow.
 
 [observability]
 enabled = true
 `;
+}
+
+/** The wrangler.toml line that names the `/chat` bearer, or says there is none. */
+function chatTokenLine(publicChat: boolean): string {
+  return publicChat
+    ? "# cf_worker.public_chat: POST /chat answers without a token"
+    : "#   wrangler secret put CHAT_TOKEN   # the bearer every POST /chat must send";
 }
 
 /**

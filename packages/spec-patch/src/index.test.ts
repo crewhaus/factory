@@ -717,6 +717,8 @@ agent:
       ["transaction_policy", "defaultWriteApproval"],
       // The candidate roster a person declared (#514).
       ["model_pool", "candidates"],
+      // Whether a deployed worker's /chat answers without its bearer.
+      ["cf_worker", "public_chat"],
     ]);
   });
 
@@ -1475,5 +1477,55 @@ describe("who approves a write stays as the spec has it", () => {
         value: { defaultWriteApproval: "none" },
       }),
     ).toThrow(/would change "transaction_policy.defaultWriteApproval"/);
+  });
+});
+
+describe("who may call a deployed worker's /chat stays as the spec has it", () => {
+  const PUBLIC_YAML = `${CLI_YAML}cf_worker:
+  public_chat: true
+`;
+  const LEAF = ["cf_worker", "public_chat"];
+
+  test("the row names a real spec path", () => {
+    const spec = parseSpec(PUBLIC_YAML) as Spec & { cf_worker?: { public_chat?: boolean } };
+    expect(spec.cf_worker?.public_chat).toBe(true);
+    expect(specHasPath(PUBLIC_YAML, LEAF)).toBe(true);
+    expect(OPTIMIZER_REFUSED_LEAVES).toContainEqual(LEAF);
+  });
+
+  test("the leaf is refused on every target, with its own reason", () => {
+    for (const target of Object.keys(OPTIMIZABLE_PATHS) as Array<keyof typeof OPTIMIZABLE_PATHS>) {
+      expect(isOptimizable(target, LEAF)).toBe(false);
+    }
+    const spec = parseSpec(PUBLIC_YAML);
+    let message = "";
+    try {
+      validatePatch(spec, { target: "cli", path: LEAF, op: "replace", value: false });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain(
+      "whether a deployed worker's /chat answers without a token is the owner's decision, and an eval cannot see it",
+    );
+    expect(message).toContain("OPTIMIZER_REFUSED_LEAVES");
+    expect(message).not.toContain("add it to");
+  });
+
+  test("a block patch that sets, changes or removes it is refused, and the block is human-owned", () => {
+    const spec = parseSpec(PUBLIC_YAML);
+    for (const patch of [
+      { op: "replace", value: { public_chat: false } },
+      { op: "replace", value: {} },
+      { op: "remove" },
+    ] as const) {
+      expect(() => validatePatch(spec, { target: "cli", path: ["cf_worker"], ...patch })).toThrow(
+        SpecPatchError,
+      );
+      expect(refusedLeafChange(spec, { path: ["cf_worker"], ...patch })?.reason).toContain(
+        "the owner's decision",
+      );
+    }
+    expect(humanOwnedReason(LEAF)).toContain("who may call a deployed worker's /chat");
+    expect(humanOwnedReason(["cf_worker"])).toBeDefined();
   });
 });

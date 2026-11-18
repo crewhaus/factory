@@ -3659,6 +3659,94 @@ describe("crewhaus compile --emit-as cf-worker (item 6)", () => {
     expect(existsSync(join(strictOut, "worker.js"))).toBe(false);
   }, 20_000);
 
+  test("a safety setting the worker does not enforce fails the edge compile, naming it, and writes nothing", async () => {
+    const spec = join(tmp, "hooked.yaml");
+    writeFileSync(
+      spec,
+      'name: hooked\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\nhooks:\n  - { event: pre-tool, command: "exit 2" }\n',
+    );
+    const out = join(tmp, "hooked-edge");
+    const result = await runCli([
+      "compile",
+      spec,
+      "-o",
+      out,
+      "--emit-as",
+      "cf-worker",
+      "--no-register",
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(
+      "cf-worker target cannot enforce 1 safety setting(s) this spec declares:",
+    );
+    expect(result.stderr).toContain(
+      "hooks: a Cloudflare Worker has no process to run a hook command",
+    );
+    expect(existsSync(join(out, "worker.js"))).toBe(false);
+  }, 20_000);
+
+  test("cf_worker.public_chat is said, and does not fail --strict", async () => {
+    const spec = join(tmp, "public.yaml");
+    writeFileSync(
+      spec,
+      "name: public\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\ncf_worker:\n  public_chat: true\n",
+    );
+    const out = join(tmp, "public-edge");
+    const result = await runCli([
+      "compile",
+      spec,
+      "-o",
+      out,
+      "--emit-as",
+      "cf-worker",
+      "--strict",
+      "--no-register",
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain(
+      "warning[edge-public-chat] cf_worker.public_chat: /chat on this worker answers any caller without a token",
+    );
+    expect(existsSync(join(out, "worker.js"))).toBe(true);
+    expect(readFileSync(join(out, "worker.js"), "utf8")).toContain("publicChat: true,");
+  }, 20_000);
+
+  // 0.8.3: a worker reads deny and ask rules before allow rules, so a deny
+  // below an allow decides the calls it matches on the edge build.
+  test("a deny below an allow is said to be dead on the local build only, and the edge build passes --strict", async () => {
+    const spec = join(tmp, "ordered.yaml");
+    writeFileSync(
+      spec,
+      'name: ordered\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\ntools: [webFetch]\npermissions:\n  rules:\n    - { type: alwaysAllow, pattern: WebFetch }\n    - { type: alwaysDeny, pattern: "WebFetch(https://evil.example.net/**)" }\n',
+    );
+    const DEAD =
+      'rule "alwaysDeny WebFetch(https://evil.example.net/**)" never fires outside plan mode';
+    const local = await runCli([
+      "compile",
+      spec,
+      "-o",
+      join(tmp, "ordered-local"),
+      "--strict",
+      "--no-register",
+    ]);
+    expect(local.exitCode).toBe(1);
+    expect(local.stderr).toContain(DEAD);
+    const out = join(tmp, "ordered-edge");
+    const edge = await runCli([
+      "compile",
+      spec,
+      "-o",
+      out,
+      "--emit-as",
+      "cf-worker",
+      "--strict",
+      "--no-register",
+    ]);
+    expect(edge.exitCode).toBe(0);
+    expect(edge.stderr).not.toContain("never fires");
+    expect(edge.stderr).not.toContain("permission-rule");
+    expect(existsSync(join(out, "worker.js"))).toBe(true);
+  }, 20_000);
+
   test("--emit-as local is the default bundle (byte path unchanged)", async () => {
     const result = await runCli([
       "compile",

@@ -1685,6 +1685,12 @@ export const HUMAN_OWNED_PATHS: ReadonlyArray<{
     reason:
       "the waiver judge's roster is never auto-patched, its model is spend, and allow_self_judge is a measurement waiver",
   },
+  // -- who may call a deployed Cloudflare Worker --
+  {
+    pattern: ["cf_worker"],
+    reason:
+      "who may call a deployed worker's /chat is the owner's decision, which an eval cannot see",
+  },
   // Every owner-keys row, derived: a new key adds its row to that table only.
   ...DELTA_090_KEYS.map((key) => ({
     pattern: key.pattern,
@@ -1849,6 +1855,11 @@ export function wildcardPlacementIssues(
  * may change it either. A value that carries the roster as the spec has it
  * passes.
  *
+ * `cf_worker.public_chat` is whether a deployed Cloudflare Worker's `/chat`
+ * answers without its `CHAT_TOKEN` bearer: the owner's decision, which an
+ * eval cannot see. No entry admits `cf_worker`; the row keeps a wider entry,
+ * a block patch and a `remove` from reaching it too.
+ *
  * A row matches with wildcards (`"*"` = any one segment) through
  * {@link refusedLeafIn}.
  */
@@ -1859,6 +1870,7 @@ export const OPTIMIZER_REFUSED_LEAVES: ReadonlyArray<ReadonlyArray<string>> = Ob
   ...DELTA_090_KEYS.filter((key) => key.refused && key.root !== true).map((key) => key.pattern),
   Object.freeze(["transaction_policy", "defaultWriteApproval"]),
   Object.freeze(["model_pool", "candidates"]),
+  Object.freeze(["cf_worker", "public_chat"]),
 ]);
 
 /**
@@ -1890,6 +1902,8 @@ const REFUSED_LEAF_REASONS: Readonly<Record<string, string>> = Object.freeze({
     "who approves a write is human-owned, because an eval cannot see a human approval go away",
   "model_pool.candidates":
     "the candidate roster is the set a person declared; learning picks within it, never changes it",
+  "cf_worker.public_chat":
+    "whether a deployed worker's /chat answers without a token is the owner's decision, and an eval cannot see it",
 });
 
 /** Why a refused row is refused, in the words a refusal shows. */

@@ -14,6 +14,8 @@ import { TargetEmitError, emitCfWorkerGraph, resolveGraphTools } from "./index";
  */
 
 const SRC_DIR = import.meta.dir;
+/** The worker's `CHAT_TOKEN` for every drive below, made at run time. */
+const CHAT_TOKEN = `chat-${crypto.randomUUID()}`;
 
 const workerCode = (ir: IrGraphV0): string =>
   emitCfWorkerGraph(ir).files.find((f) => f.path === "worker.js")?.content ?? "";
@@ -90,10 +92,14 @@ try {
     const worker = (await import(workerPath)).default;
     const req = new Request("https://harness.example/chat", {
       method: "POST",
-      headers: { "content-type": "application/json", origin: "https://studio.crewhaus.ai" },
+      headers: {
+        "content-type": "application/json",
+        origin: "https://studio.crewhaus.ai",
+        authorization: "Bearer " + job.chatToken,
+      },
       body: JSON.stringify(job.body ?? { messages: [{ role: "user", content: "go" }] }),
     });
-    const res = await worker.fetch(req, { ANTHROPIC_API_KEY: "sk-test" });
+    const res = await worker.fetch(req, { ANTHROPIC_API_KEY: "sk-test", CHAT_TOKEN: job.chatToken });
     result.status = res.status;
     result.raw = await res.text();
     result.calls = calls;
@@ -118,7 +124,8 @@ type JobResult = {
 async function runJob(code: string, job: Record<string, unknown>): Promise<JobResult> {
   const dir = mkdtempSync(join(SRC_DIR, ".cfw-run-"));
   writeFileSync(join(dir, "worker.mjs"), code);
-  writeFileSync(join(dir, "job.json"), JSON.stringify(job));
+  // Every drive sends the worker's bearer: /chat answers nothing without it.
+  writeFileSync(join(dir, "job.json"), JSON.stringify({ chatToken: CHAT_TOKEN, ...job }));
   writeFileSync(join(dir, "driver.mjs"), DRIVER_SRC);
   try {
     const proc = Bun.spawn([process.execPath, join(dir, "driver.mjs")], {
@@ -567,6 +574,7 @@ describe("emitCfWorkerGraph — /chat SSE through the shared runtime", () => {
       entry: "only",
       nodes: [node("only", "i", { tools: ["todoWrite"] })],
       edges: [],
+      permissions: { rules: [{ type: "alwaysAllow", pattern: "TodoWrite" }] },
     };
     const r = await runJob(workerCode(ir), {
       mode: "drive",
@@ -579,11 +587,12 @@ describe("emitCfWorkerGraph — /chat SSE through the shared runtime", () => {
     });
     expect(r.error).toBeUndefined();
     expect(r.calls).toBe(2);
-    const kinds = parseSse(r.raw ?? "")
-      .filter((e) => e.name === "trace")
-      .map((e) => e.data["kind"]);
+    const traces = parseSse(r.raw ?? "").filter((e) => e.name === "trace");
+    const kinds = traces.map((e) => e.data["kind"]);
     expect(kinds).toContain("tool_call_start");
     expect(kinds).toContain("tool_call_end");
+    // The tool ran: its alwaysAllow rule covers the call.
+    expect(traces.find((e) => e.data["kind"] === "tool_call_end")?.data["isError"]).toBe(false);
   });
 
   test("the final node's node_end precedes done", async () => {

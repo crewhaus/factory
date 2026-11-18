@@ -13,6 +13,7 @@
     { "path": "../tool-catalog" },
     { "path": "../tool-executor" },
     { "path": "../tool-loop-detection" },
+    { "path": "../tool-permission-matcher" },
     { "path": "../trace-event-bus" },
     { "path": "../turn-state-machine" }
   ]

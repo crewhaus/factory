@@ -145,6 +145,18 @@ describe("trust tiers", () => {
     }
   });
 
+  test("who may call a deployed worker's /chat is a human-owned SECURITY surface", () => {
+    for (const target of ["cli", "workflow", "graph"] as const) {
+      for (const path of [["cf_worker"], ["cf_worker", "public_chat"]]) {
+        const row = classifyPath(target, path);
+        expect(`${target}:${path.join(".")}:${row.tier}:${row.securitySurface}`).toBe(
+          `${target}:${path.join(".")}:human-owned:true`,
+        );
+        expect(row.reason).toContain("decides who may call a deployed worker's /chat");
+      }
+    }
+  });
+
   test("a SECURITY surface stays human-owned even when OPTIMIZABLE_PATHS lists it", () => {
     // `transaction_policy`, `chains`, `security.*` and the `model_pool`
     // policy knobs are in BOTH tables. Reading OPTIMIZABLE_PATHS first made
