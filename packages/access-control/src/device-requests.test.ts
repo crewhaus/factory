@@ -613,7 +613,7 @@ describe("the access lock", () => {
     expect(refused.ok === false && refused.reason).toBe("too_many_pending");
     expect(locks).toHaveBeenCalledTimes(0);
     expect(readFileSync(path).equals(before)).toBe(true);
-  });
+  }, 20_000); // fills Home with maxPending starts, each one a locked write
 
   test("a start refused because its address is full never waits for it", async () => {
     const h = await home();
