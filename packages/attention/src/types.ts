@@ -28,11 +28,21 @@ export type HarnessFacts = {
   advisorSnapshot?(dir: string): AdvisorSnapshot | undefined;
 };
 
+/**
+ * One Advisor finding as the inbox keeps it: its evidence-keyed id, severity, the screen
+ * and signal family it came from, its quick action and when its evidence was recorded.
+ * The Advisor's prose, a dismissal's reason and an action's comment are not kept.
+ */
+export type AdvisorFinding = Pick<
+  AdvisorItem,
+  "id" | "severity" | "screen" | "source" | "action" | "status" | "evidenceAt"
+>;
+
 /** The Advisor's open items for one harness, as one sweep gathered them. */
 export type AdvisorSnapshot = {
   /** When they were gathered. */
   readonly at: string;
-  readonly items: readonly AdvisorItem[];
+  readonly items: readonly AdvisorFinding[];
 };
 
 // ---------------------------------------------------------------------------
@@ -61,6 +71,8 @@ export type ApprovalFact = {
   readonly consumedAt?: string;
   readonly supersededBy?: string;
   readonly expiredAt?: string;
+  /** `people` when the request is about a person's records. */
+  readonly sensitivity?: string;
 };
 
 /** One `dec_` decision, its newest row. */

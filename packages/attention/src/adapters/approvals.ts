@@ -78,6 +78,7 @@ export function approvalFactOf(record: PendingApproval): ApprovalFact {
     ...pick("consumedAt"),
     ...pick("supersededBy"),
     ...pick("expiredAt"),
+    ...pick("sensitivity"),
   } as ApprovalFact;
 }
 
@@ -270,6 +271,8 @@ export function approvalItems(
           : undefined;
     const fallback = shown.find((fact) => fact.ifUnanswered !== undefined)?.ifUnanswered;
     const binding = shown.length === 1 ? first.bindingDigest : undefined;
+    // An ask about people carries the mark Home's exit withholds such items by.
+    const people = shown.some((fact) => fact.sensitivity === "people");
     const content = ctx.content && open;
     const body =
       content && bodies !== undefined
@@ -320,6 +323,7 @@ export function approvalItems(
         state: open ? "open" : (settled?.state ?? "expired"),
         ...(settled?.resolution !== undefined ? { resolution: settled.resolution } : {}),
         ...(binding !== undefined ? { binding: { digestPrefix: binding.slice(0, 12) } } : {}),
+        ...(people ? { sensitivity: "people" as const } : {}),
         ...(asked > 1 || refused !== undefined
           ? {
               asks: {

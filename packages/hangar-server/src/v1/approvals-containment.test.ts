@@ -8,7 +8,8 @@
  * folder outside it once every link is followed, it lists none of them, answers 404 for
  * one, decides none, and leaves that folder byte for byte as it was. Its approvals are
  * reported as unknown, never as a count: its detail, its fleet rows and the approvals
- * inbox say so, and every decision list names it whether or not anything else is listed.
+ * inbox say so, and every decision list and the attention inbox name it whether or not
+ * anything else is listed.
  * A sessions folder linked to another place inside the harness lists and resolves as usual.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -227,6 +228,27 @@ describe.skipIf(process.platform === "win32")(
       expect(rowsOf(got.body, "items")).toEqual([]);
       expect(got.body["unreachable"]).toEqual([a.id]);
       expect((got.body["empty"] as Record<string, unknown>)["reason"]).toBe("unreachable");
+    });
+
+    test("the inbox lists the other harness's request and names this one, listed beside others or alone", async () => {
+      const sessions = join(b.dir, ".crewhaus", "sessions");
+      const before = { own: treeOf(b.dir), linked: treeOf(sessions) };
+      const own = await home.call("GET", "/api/v1/attention");
+      expect(own.status).toBe(200);
+      const items = rowsOf(own.body, "items");
+      const asks = items.filter((item) => item["kind"] === "permission");
+      expect(asks.map((item) => item["harness"])).toContain(b.id);
+      expect(asks.map((item) => item["harness"])).not.toContain(a.id);
+      expect(JSON.stringify(own.body["items"])).toContain(B_PENDING);
+      expect(own.body["unreachable"]).toEqual([a.id]);
+      expect(own.body["empty"]).toBeUndefined();
+      const got = await home.call("GET", "/api/v1/attention", { secret: viewer.secret });
+      expect(got.status).toBe(200);
+      expect(JSON.stringify(got.body["items"])).not.toContain(B_PENDING);
+      expect(got.body["unreachable"]).toEqual([a.id]);
+      expect((got.body["empty"] as Record<string, unknown>)["reason"]).toBe("unreachable");
+      expect(treeOf(b.dir)).toEqual(before.own);
+      expect(treeOf(sessions)).toEqual(before.linked);
     });
 
     test("the approvals inbox names it, so the inbox never reads as complete", async () => {

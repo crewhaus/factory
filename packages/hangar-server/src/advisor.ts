@@ -1115,6 +1115,51 @@ export async function advisorOpenItems(ctx: M3Context, dir: string): Promise<Adv
   return assembleFeed(deriveAdvisorItems(inputs), readDecisions(subCtx)).open;
 }
 
+/** What Home lends the attention sweep's gatherer: no request, no caller, and no command runs. */
+export type AdvisorSweepHome = Pick<
+  M3Context,
+  "env" | "now" | "warn" | "control" | "jobs" | "operator" | "hangarRoot"
+>;
+
+/**
+ * One harness's open Advisor findings off the request path, for Home's attention sweep:
+ * gathered in a context built as the fleet board builds one per harness (every read
+ * contained in that harness, no process handle), with no caller, every permission
+ * refused and every job refused. It runs a preflight, so only the sweep calls it.
+ */
+export async function advisorSweepItems(
+  home: AdvisorSweepHome,
+  harness: { readonly id: string; readonly dir: string },
+): Promise<AdvisorItem[]> {
+  const refuse = (): never => {
+    throw new HttpError(400, "the Advisor sweep runs no command");
+  };
+  const ctx: M3Context = {
+    entry: null,
+    harnessDir: harness.dir,
+    adopted: false,
+    params: {},
+    query: new URLSearchParams(),
+    body: {},
+    env: home.env,
+    now: home.now,
+    operator: home.operator,
+    principal: "sys:attention-advisor",
+    authorize: (permission) => ({ allow: false, needs: permission, role: null }),
+    contain: refuse,
+    harnesses: () => [],
+    nestedHarnessAt: () => undefined,
+    process: async () => refuse(),
+    control: home.control,
+    jobs: home.jobs,
+    submitJob: refuse,
+    checkJob: refuse,
+    warn: home.warn,
+    ...(home.hangarRoot !== undefined ? { hangarRoot: home.hangarRoot } : {}),
+  };
+  return advisorOpenItems(ctx, harness.dir);
+}
+
 /** `resolveInside` for a dir this request did not name — the same realpath
  *  containment the dispatcher applies, applied to a fleet-fold member. */
 function safeContainIn(dir: string, segments: readonly string[]): string | undefined {

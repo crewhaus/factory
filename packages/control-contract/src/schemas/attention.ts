@@ -28,6 +28,8 @@ const timestamp = z
 const count = z.number().int().nonnegative();
 const percentile = z.number().nonnegative().nullable();
 const attentionRef = z.string().regex(/^home\/attention\/att_[0-9a-hjkmnp-tv-z]{26}$/);
+/** A harness by its id or its name: never free text. */
+const harnessName = z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/);
 
 const text = z
   .object({
@@ -92,6 +94,7 @@ export const attentionItem = z
     previous: attentionRef.optional(),
     body: z.unknown(),
     bodyWithheld: z.literal(true).optional(),
+    sensitivity: z.literal("people").optional(),
     freshness,
   })
   .passthrough();
@@ -99,11 +102,12 @@ export const attentionItem = z
 export const attentionList = listEnvelope.extend({
   items: z.array(attentionItem),
   advisorUnchecked: z.array(harnessId).optional(),
+  names: z.array(z.object({ id: harnessId, name: z.string() }).passthrough()).optional(),
 });
 
 export const attentionListQuery = z
   .object({
-    harness: z.string().min(1).optional(),
+    harness: harnessName.optional(),
     kind: oneOf(ATTENTION_KINDS).optional(),
     band: oneOf(ATTENTION_BANDS).optional(),
     state: z.enum(["open", "all"]).optional(),
@@ -114,7 +118,7 @@ export const attentionListQuery = z
 
 export const attentionMetricsQuery = z
   .object({
-    harness: z.string().min(1).optional(),
+    harness: harnessName.optional(),
     since: z
       .string()
       .regex(/^[1-9][0-9]{0,4}[dhm]$/)

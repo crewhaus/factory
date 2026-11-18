@@ -37,6 +37,20 @@ The env chain arrives through a facts port (`HarnessFacts`), so this package nev
 env file and never sees a value; a tool input is a `body`, read at serve time for a caller
 who may read the harness's content, and never kept in the saved model.
 
+## The Advisor's findings
+
+No read gathers them: Home's sweep does, a few harnesses a minute, and keeps each harness's
+findings in its own index (`readAdvisorSnapshot`, `withAdvisorSnapshots`). A snapshot keeps
+ids, severities, screens, actions and evidence times, never the Advisor's prose. A harness
+Home has not checked yet is named in the list's `advisorUnchecked`.
+
+## One list, for Home and the terminal
+
+`attentionListBody` is the page Home's `attention.list` answers and `crewhaus inbox list
+--json` prints: the items, the harnesses that could not be read (named whether or not
+anything is listed), each mentioned harness's name, and why an empty list is empty.
+`sentenceOf` turns a closed text id into the words a terminal prints.
+
 ## Producers
 
 Another area adds items of its own kinds with `registerProducer(kind, producer)`. The kind

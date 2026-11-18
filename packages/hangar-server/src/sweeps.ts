@@ -26,6 +26,7 @@ import {
   projectOnce,
   workspaceCommandsLedger,
 } from "@crewhaus/control-service";
+import type { AdvisorItem } from "@crewhaus/harness-advice/advisor";
 import { sweepInboundRecords } from "./ingress";
 import type { Sweep } from "./scheduler-host";
 
@@ -45,6 +46,14 @@ export type HomePorts = {
   notificationsTick(): void;
   /** The projections the projector keeps; the core's when absent. */
   readonly projections?: readonly Projection<unknown>[];
+  /**
+   * One harness's open Advisor findings, gathered as its Advisor feed gathers them (a
+   * preflight among them). Only the attention sweep calls it; no read does. Absent: no
+   * findings are gathered.
+   */
+  advisorItems?(harness: { readonly id: string; readonly dir: string }): Promise<
+    readonly AdvisorItem[]
+  >;
 };
 
 /** Run one step, warning on a throw so the next step still runs. */

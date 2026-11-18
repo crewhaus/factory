@@ -390,7 +390,12 @@ export {
 // detail and the job vocabulary are the `./run-detail` and `./job-kinds`
 // subpaths.
 export type { HarnessEnvFiles } from "./env-file";
-export { mergedSpawnEnv, readHarnessEnvFiles } from "./env-file";
+export {
+  envNameSource,
+  harnessEnvFacts,
+  mergedSpawnEnv,
+  readHarnessEnvFiles,
+} from "./env-file";
 export type { EnvWriteResult } from "./env-writer";
 export {
   ENV_ASSIGN_RE,

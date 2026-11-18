@@ -279,6 +279,8 @@ export type AttentionItem = {
   readonly body?: unknown;
   /** There is content this caller may not read. */
   readonly bodyWithheld?: true;
+  /** `people` when it is about a person's records: Home withholds it from a caller who may not see those. */
+  readonly sensitivity?: "people";
   readonly freshness: AttentionFreshness;
 };
 
@@ -302,6 +304,8 @@ export type AttentionList = {
   readonly unreachable?: readonly string[];
   /** Harnesses Home has not gathered Advisor findings for yet. */
   readonly advisorUnchecked?: readonly string[];
+  /** The name of every harness this answer mentions, for display. */
+  readonly names?: ReadonlyArray<{ readonly id: string; readonly name: string }>;
 };
 
 export type AttentionMetricsQuery = {

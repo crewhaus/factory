@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../access-control" },
+    { "path": "../attention" },
     { "path": "../boundary-classifier" },
     { "path": "../spec-registry" },
     { "path": "../memory-store" },

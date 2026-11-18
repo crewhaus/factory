@@ -324,8 +324,8 @@ export type TaxonomyProposal = {
 
 /** Default recovery action per `FailureClass` — CrewHaus's own ceilings and
  *  hard provider failures `fail`; transient/tool failures `retry`; a context
- *  overflow `compact`. A human refines before adopting. `provability` (0.8.0,
- *  design §5.1 — exit 37) is a configured evidence floor beside `evaluation`:
+ *  overflow `compact`. A human refines before adopting. `provability` (0.8.0)
+ *  is a configured evidence floor beside `evaluation` (exit 37):
  *  the spec's own `on_fail: halt` chose to stop the run, so a retry is not
  *  the draft's to suggest. `input_blocked` fails too: a retry of the same
  *  input meets the same verdict. */

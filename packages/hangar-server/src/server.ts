@@ -155,6 +155,7 @@ import {
   parseSince,
   recoveryItems,
 } from "./activity";
+import { advisorSweepItems } from "./advisor";
 import {
   type ApprovalHarness,
   approvalsInbox,
@@ -433,6 +434,8 @@ export type HangarServerOptions = {
   readonly areas?: readonly HomeAreaRuntime[];
   /** The timers Home's tick arms; injected in tests, which drive `scheduler.tick()`. */
   readonly schedulerTimers?: SchedulerTimers;
+  /** Gathers one harness's Advisor findings for the attention sweep; injected in tests. */
+  readonly advisorItems?: HomePorts["advisorItems"];
   /** When the machine last booted, epoch ms; injected in tests. */
   readonly hostBootedAt?: () => number;
 };
@@ -3695,6 +3698,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     notificationsTick,
     delegations: controlService.delegations,
     projections: projectionsOf(areas).map((row) => row.projection),
+    advisorItems:
+      opts.advisorItems ??
+      ((harness) =>
+        advisorSweepItems(
+          { env, now, warn: onWarn, control, jobs: processes.jobs, operator, hangarRoot },
+          harness,
+        )),
   };
   const scheduler = createSchedulerHost<HomePorts>({
     now,

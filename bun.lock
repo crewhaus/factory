@@ -22,6 +22,7 @@
         "@crewhaus/access-control": "workspace:*",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/agent-context-isolation": "workspace:*",
+        "@crewhaus/attention": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
@@ -1288,6 +1289,8 @@
       "name": "hangar-e2e",
       "version": "0.0.0",
       "devDependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/hangar-server": "workspace:*",
         "@crewhaus/hangar-ui": "workspace:*",
         "@crewhaus/harness-registry": "workspace:*",
@@ -1304,6 +1307,7 @@
       "version": "0.8.3",
       "dependencies": {
         "@crewhaus/access-control": "workspace:*",
+        "@crewhaus/attention": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/continuity-store": "workspace:*",

@@ -6,9 +6,8 @@
  * request is an item of its own.
  */
 import type { AttentionChoice, AttentionKind } from "@crewhaus/control-contract";
-import type { AdvisorItem } from "@crewhaus/harness-advice/advisor";
 import { draftItem, msOf } from "../items";
-import type { AdvisorSnapshot, Drafted, ItemContext } from "../types";
+import type { AdvisorFinding, AdvisorSnapshot, Drafted, ItemContext } from "../types";
 
 /** The item kind an Advisor finding is, or `null` for one the inbox leaves out. */
 export function advisorKindOf(id: string): AttentionKind | null {
@@ -24,7 +23,7 @@ const DECILE_RE = /^budget-near-(\d+)-(.+)$/;
 const EXCEEDED_RE = /^budget-exceeded-(.+)$/;
 
 /** The closed title a finding shows, with its params: ids and names from its id only. */
-export function advisorTitleOf(item: AdvisorItem): {
+export function advisorTitleOf(item: AdvisorFinding): {
   readonly template: string;
   readonly params: Readonly<Record<string, string | number>>;
 } {
@@ -82,7 +81,7 @@ export function advisorTitleOf(item: AdvisorItem): {
   return { template: "advisor.other", params: { screen: item.screen } };
 }
 
-function choicesOf(item: AdvisorItem): AttentionChoice[] {
+function choicesOf(item: AdvisorFinding): AttentionChoice[] {
   const action = item.action;
   if (action === null) return [];
   return [

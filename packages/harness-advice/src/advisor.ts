@@ -90,10 +90,10 @@ export type AdvisorItem = {
   readonly status: "open" | "dismissed";
   /** Present when status === "dismissed": the recorded reasoning. */
   readonly dismissal?: { readonly reason: string; readonly by: string; readonly at: string };
-  /** The most recent acted record for this item, when one exists — so the
-   *  feed shows "already queued yesterday, with this comment". */
   /** When the newest evidence behind it was recorded (ISO), when the gatherer knows it. */
   readonly evidenceAt?: string;
+  /** The most recent acted record for this item, when one exists — so the
+   *  feed shows "already queued yesterday, with this comment". */
   readonly lastAction?: {
     readonly comment: string | null;
     readonly by: string;
@@ -189,7 +189,7 @@ export type AdvisorInputs = {
   readonly budget: { readonly declaredUsd: number | null; readonly spentUsd: number };
   readonly adviceProposals: number;
   readonly overdueDreams: readonly string[];
-  // ---- 0.6.0 (design §8.3) — the hybrid-routing signals -------------------
+  // ---- 0.6.0 — the hybrid-routing signals ---------------------------------
   /** The learned scoreboard and the pool that feeds it. `null` = not pooled. */
   readonly routing: RoutingInputs | null;
   /** Folded from the session logs' durable routing lines. */

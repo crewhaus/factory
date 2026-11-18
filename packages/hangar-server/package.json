@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@crewhaus/access-control": "workspace:*",
+    "@crewhaus/attention": "workspace:*",
     "@crewhaus/audit-log": "workspace:*",
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/continuity-store": "workspace:*",

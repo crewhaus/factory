@@ -32,7 +32,9 @@
  */
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { APPROVALS_FILENAME, foldApprovals, statusOf } from "./approvals";
+import { APPROVAL_TTL_MS, emptyModel, harnessAttention, refreshModel } from "@crewhaus/attention";
+import { harnessEnvFacts } from "@crewhaus/harness-supervisor";
+import { APPROVALS_FILENAME } from "./approvals";
 import { MAX_JSONL_LINES, SAFE_SEGMENT_RE, SESSION_JSON_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
 import { MENU_ACTION_PROVIDERS } from "./menu/actions";
@@ -254,6 +256,19 @@ const href = (id: string, section: string, sub: string, ...rest: string[]): stri
 
 /** Where every pending approval is decided: Home's Needs-you page. */
 export const APPROVALS_HREF = "#/home/needs-you?type=approvals";
+
+/** The env chain as the inbox fold asks of it: where the sessions folder is. */
+const OMNI_FACTS = harnessEnvFacts();
+
+/** A request's state, in the words its menu row says it. */
+const ASK_STATE_WORDS: Readonly<Record<string, string>> = {
+  open: "waiting for a decision",
+  assigned: "waiting for a decision",
+  deferred: "deferred",
+  resolved: "decided",
+  expired: "expired",
+  superseded: "replaced by a newer request",
+};
 /** The harness list, where groups and tags are browsed. */
 export const HARNESSES_HREF = "#/harnesses";
 
@@ -447,20 +462,33 @@ export function buildHarnessEntries(
     });
   }
 
-  // Pending approvals, folded the inbox's way at the resolved session root
-  // (read-only: never listed through the store, which compacts), and
-  // "pending" decided by the inbox's own rule.
-  for (const approval of foldApprovals(dir).approvals) {
-    if (statusOf(approval) !== "pending") continue;
-    const approvalId = approval.id;
-    if (typeof approvalId !== "string" || approvalId === "") continue;
-    const toolName = approval.toolName;
+  // Requests waiting on a person, and the ones decided within their time to live, as the
+  // inbox folds them at the contained session root (read-only and capped: never listed
+  // through the store, which compacts). Each names its state in words and opens its item.
+  const asked = harnessAttention(
+    refreshModel(emptyModel(), dir, OMNI_FACTS),
+    {
+      harness: id,
+      dir,
+      now: nowMs,
+      content: false,
+      freshness: { asOf: indexedAt, mode: "direct-fold" },
+    },
+    { facts: OMNI_FACTS },
+  );
+  for (const { item } of asked.items) {
+    if (item.source.kind !== "approval") continue;
+    const settled = item.resolution === undefined ? undefined : Date.parse(item.resolution.at);
+    const recent = settled !== undefined && nowMs - settled <= APPROVAL_TTL_MS;
+    if (item.state !== "open" && !recent) continue;
+    const att = item.ref.slice(item.ref.lastIndexOf("/") + 1);
+    const tool = item.title.params["tool"];
     push({
       kind: "approval",
-      id: approvalId,
-      title: typeof toolName === "string" && toolName !== "" ? toolName : approvalId,
-      subtitle: `approval · ${specName}`,
-      href: APPROVALS_HREF,
+      id: att,
+      title: typeof tool === "string" && tool !== "" ? tool : att,
+      subtitle: `${ASK_STATE_WORDS[item.state] ?? item.state} · ${specName}`,
+      href: `#/home/needs-you?item=${att}`,
       harnessId: id,
     });
   }

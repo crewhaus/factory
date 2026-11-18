@@ -13,6 +13,17 @@ export {
   advisorTitleOf,
 } from "./adapters/advisor";
 export {
+  ADVISOR_FINDINGS_MAX,
+  ADVISOR_SNAPSHOT_MAX_BYTES,
+  ADVISOR_SNAPSHOT_NAME,
+  advisorSnapshotRecord,
+  advisorSnapshotRel,
+  findingOf,
+  parseAdvisorSnapshot,
+  readAdvisorSnapshot,
+  withAdvisorSnapshots,
+} from "./advisor-snapshot";
+export {
   APPROVAL_TTL_MS,
   approvalItemRef,
   approvalKeyOf,
@@ -61,6 +72,14 @@ export {
   effectiveAttentionState,
 } from "./lifecycle";
 export {
+  LIST_VERB,
+  type ListBodyOptions,
+  UNREACHABLE_REMEDY,
+  attentionListBody,
+  emptyReasonOf,
+  namesIn,
+} from "./list-body";
+export {
   type AttentionMetricsBody,
   REASK_WINDOW_MS,
   metricsOf,
@@ -86,7 +105,9 @@ export {
   SESSION_CAPS,
 } from "./read";
 export { type AttentionSearchDocument, searchDocumentsOf } from "./search";
+export { ATTENTION_SENTENCES, UNKNOWN_SENTENCE, classWordOf, sentenceOf } from "./sentences";
 export type {
+  AdvisorFinding,
   AdvisorSnapshot,
   ApprovalFact,
   AttentionModel,

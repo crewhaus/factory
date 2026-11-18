@@ -32,6 +32,7 @@ type ItemExtras = Partial<
     | "previous"
     | "body"
     | "bodyWithheld"
+    | "sensitivity"
   >
 >;
 
@@ -84,6 +85,7 @@ export function draftItem(spec: ItemSpec): Drafted {
     ...pick("resolution"),
     ...pick("cause"),
     ...pick("binding"),
+    ...pick("sensitivity"),
     evidenceRev: evidenceRevOf(spec.revision),
     since: spec.since,
     ...pick("asks"),
