@@ -28,6 +28,7 @@ export async function gatedTemplates(): Promise<readonly string[]> {
  */
 export const TOURED_TEMPLATES: readonly string[] = [
   "#/harnesses",
+  "#/home/needs-you",
   "#/home/needs-you?type=approvals",
   "#/home/needs-you?type=review",
   "#/home/changes",

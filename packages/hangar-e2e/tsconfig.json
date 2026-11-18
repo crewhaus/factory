@@ -6,6 +6,8 @@
     "lib": ["ESNext", "DOM", "DOM.Iterable"]
   },
   "references": [
+    { "path": "../control-contract" },
+    { "path": "../control-records" },
     { "path": "../hangar-server" },
     { "path": "../hangar-ui" },
     { "path": "../harness-registry" },

@@ -1,9 +1,10 @@
 /**
  * Needs you (`#/home/needs-you`): everything waiting on a person, in one
- * place. All stacks the approvals inbox, the review queue and the fleet
- * advice, each in its own section under its own heading; `?type=` shows one.
- * Each section loads and fails on its own, and each list keeps the keys it
- * has always had while it has focus.
+ * place. All is Home's inbox, one list in three bands across the harnesses
+ * you can see (`views/attention.js`); `?type=` opens the approvals inbox, the
+ * review queue or the fleet advice, where items are acted on. Each section
+ * loads and fails on its own, and each list keeps its own keys while it has
+ * focus.
  */
 
 import { NEEDS_YOU_FILTERS } from "../destinations.js";
@@ -12,14 +13,23 @@ import { hrefFleet } from "../router.js";
 import { emptyFor } from "../ui/empty.js";
 import { renderAdvisorBoard } from "./advisor.js";
 import { renderApprovals } from "./approvals.js";
+import { renderAttention } from "./attention.js";
 import { renderReview } from "./review.js";
 
-/** Filter id → the screen that draws it. */
+/** Filter id → the screen that draws it; `all` is the inbox. */
 const DRAW = {
+  all: renderAttention,
   approvals: renderApprovals,
   review: renderReview,
   advice: renderAdvisorBoard,
 };
+
+/** The sections a filter shows: the inbox for All, else that one screen. Pure. */
+export function needsYouSections(current) {
+  return current === null
+    ? [{ id: "all", label: "Everything waiting on you" }]
+    : NEEDS_YOU_FILTERS.filter((f) => f.id === current);
+}
 
 /** The filter a route asks for, or null for All. Pure. */
 export function needsYouFilter(route) {
@@ -50,8 +60,7 @@ function filterNav(current) {
 
 export async function renderNeedsYou(root, ctx = {}) {
   const current = needsYouFilter(ctx.route);
-  const shown =
-    current === null ? NEEDS_YOU_FILTERS : NEEDS_YOU_FILTERS.filter((f) => f.id === current);
+  const shown = needsYouSections(current);
   clear(root).appendChild(filterNav(current));
   const hosts = shown.map((filter) => {
     const headingId = `needs-you-${filter.id}`;
