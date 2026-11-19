@@ -26,6 +26,11 @@ export type AttentionReader = {
   stamp(root: string, rel: string): string;
   /** The newest complete lines of a file, contained in `root`. */
   tail(root: string, rel: string, caps: ReadCaps): TailRead;
+  /**
+   * What a file is once every link is followed (device and inode), so a file reached by
+   * several names is read once; `undefined` when it is not there or lands outside `root`.
+   */
+  identity?(root: string, rel: string): string | undefined;
 };
 
 export const DEFAULT_READER: AttentionReader = {
@@ -41,5 +46,15 @@ export const DEFAULT_READER: AttentionReader = {
   },
   tail(root, rel, caps) {
     return readTail(root, rel, { ...caps, followLeafSymlink: true });
+  },
+  identity(root, rel) {
+    const contained = resolveContained(root, rel);
+    if (contained.ok !== true) return undefined;
+    try {
+      const stats = statSync(contained.real);
+      return `${stats.dev}:${stats.ino}`;
+    } catch {
+      return undefined;
+    }
   },
 };

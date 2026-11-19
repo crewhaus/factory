@@ -9,8 +9,11 @@
  * the older spec's group is superseded by the newer one.
  *
  * Failure messages are read from the contained session root, the newest part of the logs
- * of the sessions whose runs failed with no structured cause, at most 200 failures. When
- * they cannot be read the runs group by class alone, and the item says so.
+ * of the sessions whose runs failed with no structured cause: the sessions of the newest
+ * such runs only, at most {@link FAILURE_SESSIONS_MAX} of them and
+ * {@link FAILURE_READ_BYTES} in all, each file once however many names reach it, and at
+ * most 200 failures clustered. Past a cap the section says `truncated`. When they cannot
+ * be read the runs group by class alone, and the item says so.
  */
 import { SESSION_ID_RE, isId } from "@crewhaus/control-contract";
 import { NON_FAILURE_CLASSES, clusterFailures } from "@crewhaus/harness-advice/failure-clusters";
@@ -18,7 +21,7 @@ import { containedSessionRoot } from "@crewhaus/session-store";
 import { type CauseFacts, causeOf } from "../causes";
 import { digestPrefix } from "../ids";
 import { msOf } from "../items";
-import { type AttentionReader, SESSION_CAPS } from "../read";
+import { type AttentionReader, READ_CAPS, SESSION_CAPS } from "../read";
 import {
   type AttentionModel,
   type FailureSignature,
@@ -31,6 +34,12 @@ import {
 
 /** At most this many failure messages are clustered per harness. */
 export const FAILURES_MAX = 200;
+
+/** At most this many session logs are read for failure messages per harness, newest first. */
+export const FAILURE_SESSIONS_MAX = 50;
+
+/** At most this many bytes of session logs are read for failure messages per harness. */
+export const FAILURE_READ_BYTES = READ_CAPS.maxBytes;
 
 /** Rate-limit failures this close together are one episode. */
 export const PROVIDER_LIMIT_WINDOW_MS = 3_600_000;
@@ -76,15 +85,37 @@ export function foldRunLine(
   return state;
 }
 
-/** The sessions whose failed runs carry no structured cause: their messages group them. */
-function messageSessions(model: AttentionModel): string[] {
+/**
+ * The sessions whose failed runs carry no structured cause, the newest runs' first, at
+ * most {@link FAILURE_SESSIONS_MAX}: their messages group them. `capped` when more were
+ * left out.
+ */
+function messageSessions(model: AttentionModel): { sessions: string[]; capped: boolean } {
+  const rows = Object.values(model.runs)
+    .filter(
+      (row) =>
+        row.state === "failed" &&
+        row.session !== undefined &&
+        !STRUCTURED.has(row.failureClass ?? "unknown"),
+    )
+    .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : a.id < b.id ? -1 : 1));
   const out = new Set<string>();
-  for (const row of Object.values(model.runs)) {
-    if (row.state !== "failed" || row.session === undefined) continue;
-    if (STRUCTURED.has(row.failureClass ?? "unknown")) continue;
-    out.add(row.session);
+  let capped = false;
+  for (const row of rows) {
+    if (out.has(row.session as string)) continue;
+    if (out.size >= FAILURE_SESSIONS_MAX) {
+      capped = true;
+      break;
+    }
+    out.add(row.session as string);
   }
-  return [...out].sort();
+  return { sessions: [...out], capped };
+}
+
+/** The size a stamp records, or 0 when it records none. */
+function sizeOf(stamp: string): number {
+  const size = Number(stamp.split(":")[0]);
+  return Number.isFinite(size) && size > 0 ? size : 0;
 }
 
 /**
@@ -98,7 +129,7 @@ export function readFailuresSection(
   reader: AttentionReader,
   prev: AttentionModel["failures"] | undefined,
 ): AttentionModel["failures"] {
-  const sessions = messageSessions(model);
+  const { sessions, capped } = messageSessions(model);
   if (sessions.length === 0) {
     if (prev !== undefined && prev.stamp === "none") return prev;
     return { stamp: "none", facts: [] };
@@ -108,10 +139,8 @@ export function readFailuresSection(
     if (prev?.unreadable === true && prev.stamp === "unreachable") return prev;
     return { stamp: "unreachable", facts: [], unreadable: true };
   }
-  const stamp = digestPrefix(
-    [root, ...sessions.map((s) => `${s}=${reader.stamp(root, `${s}.jsonl`)}`)].join("\n"),
-    32,
-  );
+  const stamps = sessions.map((s) => reader.stamp(root, `${s}.jsonl`));
+  const stamp = digestPrefix([root, ...sessions.map((s, i) => `${s}=${stamps[i]}`)].join("\n"), 32);
   if (prev !== undefined && prev.stamp === stamp) return prev;
   const records: {
     source: "run_failed";
@@ -121,10 +150,27 @@ export function readFailuresSection(
     ts?: number;
   }[] = [];
   let unreadable = false;
-  for (const session of sessions) {
-    const read = reader.tail(root, `${session}.jsonl`, SESSION_CAPS);
+  let truncated = capped;
+  let budget = FAILURE_READ_BYTES;
+  const seen = new Set<string>();
+  for (const [i, session] of sessions.entries()) {
+    const rel = `${session}.jsonl`;
+    // A file reached by more than one name is read once.
+    const identity = reader.identity?.(root, rel);
+    if (identity !== undefined) {
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+    }
+    if (budget <= 0) {
+      truncated = true;
+      break;
+    }
+    const maxBytes = Math.min(SESSION_CAPS.maxBytes, budget);
+    budget -= Math.min(sizeOf(stamps[i] ?? ""), maxBytes);
+    const read = reader.tail(root, rel, { ...SESSION_CAPS, maxBytes });
     if (read.state === "refused") unreadable = true;
     if (read.state !== "read") continue;
+    if (read.truncated && maxBytes < SESSION_CAPS.maxBytes) truncated = true;
     for (const event of read.records) {
       if (event["kind"] !== "run_failed") continue;
       const payload = (
@@ -152,7 +198,7 @@ export function readFailuresSection(
   return {
     stamp,
     facts: signatures,
-    ...(records.length > FAILURES_MAX ? { truncated: true as const } : {}),
+    ...(truncated || records.length > FAILURES_MAX ? { truncated: true as const } : {}),
     ...(unreadable ? { unreadable: true as const } : {}),
   };
 }
