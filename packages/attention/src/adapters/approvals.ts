@@ -12,11 +12,13 @@
  * none.
  */
 import { join } from "node:path";
-import type {
-  AttentionChoice,
-  AttentionKind,
-  DecisionClass,
-  DecisionRecordView,
+import {
+  APPROVAL_ID_RE,
+  type AttentionChoice,
+  type AttentionKind,
+  type DecisionClass,
+  type DecisionRecordView,
+  IF_UNANSWERED,
 } from "@crewhaus/control-contract";
 import {
   DEFAULT_APPROVALS_FILENAME,
@@ -26,7 +28,7 @@ import {
   foldWithClaims,
 } from "@crewhaus/session-store";
 import { attRefOf, digestPrefix } from "../ids";
-import { classOf, draftItem, higherClass, isoOf, msOf, shellWord } from "../items";
+import { classOf, dirFits, draftItem, higherClass, isoOf, msOf, twinOf } from "../items";
 import { effectiveAttentionState } from "../lifecycle";
 import { type AttentionReader, READ_CAPS } from "../read";
 import type {
@@ -52,10 +54,23 @@ type ApprovalsSection = AttentionModel["approvals"];
 const str = (value: unknown): string | undefined =>
   typeof value === "string" && value !== "" ? value : undefined;
 
-/** The parts of a request the inbox keeps: ids, names, classes and times. */
+/** What a digest a request carries may hold: the characters of an item key, nothing else. */
+const DIGEST_RE = /^[A-Za-z0-9_.-]{1,128}$/;
+
+/** Whether a request's id is one the store mints: only those become items. */
+export function isApprovalRecord(record: Pick<PendingApproval, "id">): boolean {
+  return typeof record.id === "string" && APPROVAL_ID_RE.test(record.id);
+}
+
+/**
+ * The parts of a request the inbox keeps: ids, names, classes and times. A digest outside
+ * its grammar and a fallback outside its closed list are left out.
+ */
 export function approvalFactOf(record: PendingApproval): ApprovalFact {
   const r = record as unknown as Readonly<Record<string, unknown>>;
   const pick = (name: string) => (str(r[name]) === undefined ? {} : { [name]: r[name] });
+  const token = (name: string) =>
+    typeof r[name] === "string" && DIGEST_RE.test(r[name] as string) ? { [name]: r[name] } : {};
   return {
     id: record.id,
     kind: r["kind"] === "input" ? "input" : "tool",
@@ -63,12 +78,14 @@ export function approvalFactOf(record: PendingApproval): ApprovalFact {
     createdAt: record.createdAt,
     runId: record.runId,
     sessionId: record.sessionId,
-    ...pick("askDigest"),
+    ...token("askDigest"),
     ...(record.requiredClass !== undefined ? { requiredClass: classOf(record.requiredClass) } : {}),
     ...pick("expiresAt"),
     ...pick("deferredUntil"),
-    ...pick("ifUnanswered"),
-    ...pick("bindingDigest"),
+    ...((IF_UNANSWERED as readonly unknown[]).includes(r["ifUnanswered"])
+      ? { ifUnanswered: r["ifUnanswered"] }
+      : {}),
+    ...token("bindingDigest"),
     ...(record.decision === "grant" || record.decision === "deny"
       ? { decision: record.decision }
       : {}),
@@ -103,7 +120,7 @@ export function readApprovalsSection(
   const read = reader.tail(root, DEFAULT_APPROVALS_FILENAME, READ_CAPS);
   const base = { stamp, ...(relocated ? { relocated: true as const } : {}) };
   if (read.state !== "read") return { ...base, facts: [] };
-  const records = foldWithClaims(root, read.records).records;
+  const records = foldWithClaims(root, read.records).records.filter(isApprovalRecord);
   return {
     ...base,
     facts: records.map(approvalFactOf),
@@ -125,7 +142,7 @@ export function approvalBodies(
   const read = reader.tail(root, DEFAULT_APPROVALS_FILENAME, READ_CAPS);
   if (read.state !== "read") return out;
   for (const record of foldWithClaims(root, read.records).records) {
-    if (ids.has(record.id)) out.set(record.id, record.input ?? null);
+    if (isApprovalRecord(record) && ids.has(record.id)) out.set(record.id, record.input ?? null);
   }
   return out;
 }
@@ -165,6 +182,12 @@ function stateOf(fact: ApprovalFact, now: number) {
   );
 }
 
+/** The command that answers one request: the approvals area's own template. */
+const APPROVALS_CHOICE = { argv: ["approvals", "{choice}", "{appr}", "--dir", "{dir}"] } as const;
+
+/** Said where a request's id or folder fits no command. */
+const UNRECOGNISED = "This request's id or folder fits no command; decide it in Home.";
+
 function choicesOf(
   records: readonly ApprovalFact[],
   dir: string,
@@ -189,11 +212,10 @@ function choicesOf(
         nullReason: "This harness keeps its sessions folder elsewhere; decide it in Home.",
       };
     }
-    return {
-      id: choice,
-      needs,
-      cliTwin: `crewhaus approvals ${choice} ${one.id} --dir ${shellWord(dir)}`,
-    };
+    const cliTwin = twinOf(APPROVALS_CHOICE, { choice, appr: one.id, dir });
+    return cliTwin !== undefined && dirFits(dir)
+      ? { id: choice, needs, cliTwin }
+      : { id: choice, needs, cliTwin: null, nullReason: UNRECOGNISED };
   });
 }
 

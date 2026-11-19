@@ -5,8 +5,8 @@
  * id winning, as the queue's own reader folds it.
  */
 import { join } from "node:path";
-import { isReviewQueueEntry } from "@crewhaus/feedback-distill";
-import { draftItem, msOf, shellWord } from "../items";
+import { REVIEW_KINDS, isReviewQueueEntry } from "@crewhaus/feedback-distill";
+import { dirFits, draftItem, msOf, shellWord } from "../items";
 import { type AttentionReader, READ_CAPS } from "../read";
 import type { AttentionModel, Drafted, ItemContext, ReviewFact } from "../types";
 
@@ -18,13 +18,27 @@ const SETTLED_KEPT_MS = 30 * 86_400_000;
 
 type ReviewSection = AttentionModel["review"];
 
+/**
+ * The ids the queue's own minter (`reviewEntryId`) gives: `rev_`, a review kind, and
+ * id-safe tokens. An entry with any other id is not listed.
+ */
+export const REVIEW_ENTRY_ID_RE = new RegExp(
+  `^rev_(?:${REVIEW_KINDS.join("|")})_[A-Za-z0-9._-]{0,256}$`,
+);
+
 function latestById(records: readonly unknown[]) {
   const byId = new Map<string, Record<string, unknown>>();
   for (const record of records) {
-    if (isReviewQueueEntry(record))
+    if (isReviewQueueEntry(record) && REVIEW_ENTRY_ID_RE.test(record.id))
       byId.set(record.id, record as unknown as Record<string, unknown>);
   }
   return byId;
+}
+
+/** The command that resolves one entry, or `undefined` when its id or folder fits none. */
+function resolveTwin(dir: string, id: string): string | undefined {
+  if (!dirFits(dir) || !REVIEW_ENTRY_ID_RE.test(id)) return undefined;
+  return `cd ${shellWord(dir)} && crewhaus review resolve ${shellWord(id)}`;
 }
 
 /** The review section, re-read only when the queue changed; `prev` itself when it did not. */
@@ -61,6 +75,18 @@ export function reviewBodies(dir: string, reader: AttentionReader): ReadonlyMap<
   return out;
 }
 
+function resolveChoice(dir: string, id: string) {
+  const cliTwin = resolveTwin(dir, id);
+  return cliTwin !== undefined
+    ? { id: "resolve", needs: "operator" as const, cliTwin }
+    : {
+        id: "resolve",
+        needs: "operator" as const,
+        cliTwin: null,
+        nullReason: "This harness's folder fits no command; resolve it in Home's Review.",
+      };
+}
+
 /** One item per open entry, and (settled) per entry resolved in the last 30 days. */
 export function reviewItems(
   section: ReviewSection,
@@ -86,15 +112,7 @@ export function reviewItems(
         count: 0,
         evidence: [{ kind: "review", ref: fact.id, label: fact.reviewKind }],
         revision: [{ id: fact.id, state: fact.status }],
-        choices: open
-          ? [
-              {
-                id: "resolve",
-                needs: "operator",
-                cliTwin: `cd ${shellWord(ctx.dir)} && crewhaus review resolve ${fact.id}`,
-              },
-            ]
-          : [],
+        choices: open ? [resolveChoice(ctx.dir, fact.id)] : [],
         requiredClass: "operator",
         state: open ? "open" : "resolved",
         ...(open

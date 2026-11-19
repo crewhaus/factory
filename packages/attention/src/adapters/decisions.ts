@@ -9,11 +9,13 @@ import {
   type AttentionChoice,
   type AttentionKind,
   type AttentionText,
+  DELEGATION_ACTIONS,
   type DecisionClass,
   type DecisionRecordView,
+  IF_UNANSWERED,
   isId,
 } from "@crewhaus/control-contract";
-import { classOf, draftItem, msOf, shellWord } from "../items";
+import { classOf, dirFits, draftItem, msOf, shellWord, twinOf } from "../items";
 import { effectiveAttentionState } from "../lifecycle";
 import type { AttentionModel, DecisionFact, Drafted, ItemContext, MetricDecision } from "../types";
 
@@ -28,7 +30,16 @@ const obj = (value: unknown): Readonly<Record<string, unknown>> | undefined =>
     ? (value as Readonly<Record<string, unknown>>)
     : undefined;
 
-/** A decisions-ledger row as the inbox keeps it, or `undefined` when it is not one. */
+/** What a decision's kind may be: a lowercase word, so no message or path fits. */
+const DECISION_KIND_RE = /^[a-z][a-z0-9-]{0,63}$/;
+
+const oneOf = (list: readonly string[], value: unknown): string | undefined =>
+  typeof value === "string" && list.includes(value) ? value : undefined;
+
+/**
+ * A decisions-ledger row as the inbox keeps it, or `undefined` when it is not one. A rule
+ * kind, a delegation action or a fallback outside its closed list is left out.
+ */
 export function decisionFactOf(
   record: Readonly<Record<string, unknown>>,
 ): DecisionFact | undefined {
@@ -36,14 +47,21 @@ export function decisionFactOf(
   const kind = str(record["kind"]);
   const state = str(record["state"]);
   const createdAt = str(record["createdAt"]);
-  if (!isId("dec", id) || kind === undefined || state === undefined || createdAt === undefined) {
+  if (
+    !isId("dec", id) ||
+    kind === undefined ||
+    !DECISION_KIND_RE.test(kind) ||
+    state === undefined ||
+    createdAt === undefined
+  ) {
     return undefined;
   }
   const terms = obj(record["terms"]);
   const subject = obj(record["subject"]);
   const pick = (name: string) => (str(record[name]) === undefined ? {} : { [name]: record[name] });
-  const ruleKind = str(terms?.["ruleKind"]);
-  const action = str(terms?.["action"]);
+  const ruleKind = oneOf(["allow", "delegate"], terms?.["ruleKind"]);
+  const action = oneOf(DELEGATION_ACTIONS, terms?.["action"]);
+  const ifUnanswered = oneOf(IF_UNANSWERED, record["ifUnanswered"]);
   const chg = str(subject?.["chg"]);
   return {
     id: id as string,
@@ -64,7 +82,7 @@ export function decisionFactOf(
     ...pick("supersededAt"),
     ...pick("expiredAt"),
     ...pick("deferredUntil"),
-    ...pick("ifUnanswered"),
+    ...(ifUnanswered !== undefined ? { ifUnanswered } : {}),
     ...(ruleKind !== undefined ? { ruleKind } : {}),
     ...(ruleKind === "delegate" && action !== undefined ? { delegationAction: action } : {}),
     ...(chg !== undefined && isId("chg", chg) ? { chg } : {}),
@@ -121,26 +139,38 @@ function choicesOf(
   needs: DecisionClass,
 ): AttentionChoice[] {
   if (fact.kind === "standing-rule-proposal" && fact.ruleKind === "delegate") {
+    const cliTwin =
+      fact.delegationAction === undefined
+        ? undefined
+        : twinOf(DELEGATIONS_PREVIEW, { delegationAction: fact.delegationAction, hrn: harness });
     return [
-      {
-        id: "review",
-        needs,
-        cliTwin:
-          fact.delegationAction !== undefined
-            ? `crewhaus delegations preview ${fact.delegationAction} --harness ${harness}`
-            : null,
-        ...(fact.delegationAction === undefined
-          ? { nullReason: "Open the request in Home to see what it would allow." }
-          : {}),
-      },
+      cliTwin !== undefined
+        ? { id: "review", needs, cliTwin }
+        : {
+            id: "review",
+            needs,
+            cliTwin: null,
+            nullReason: "This request names no action a rule may cover, so nothing can preview it.",
+          },
     ];
   }
   if (fact.kind === "standing-rule-proposal") {
-    return (["grant", "deny"] as const).map((choice) => ({
-      id: choice,
-      needs,
-      cliTwin: `crewhaus approvals ${choice} ${fact.id} --dir ${shellWord(dir)}`,
-    }));
+    // A `dec_` id has no placeholder of its own: it is checked here, and quoted.
+    const fits = isId("dec", fact.id) && dirFits(dir);
+    return (["grant", "deny"] as const).map((choice) =>
+      fits
+        ? {
+            id: choice,
+            needs,
+            cliTwin: `crewhaus approvals ${choice} ${shellWord(fact.id)} --dir ${shellWord(dir)}`,
+          }
+        : {
+            id: choice,
+            needs,
+            cliTwin: null,
+            nullReason: "This request's folder fits no command; decide it in Home.",
+          },
+    );
   }
   if (fact.kind === "change-adoption") {
     return [
@@ -159,9 +189,14 @@ function choicesOf(
     id: choice,
     needs,
     cliTwin: null,
-    nullReason: "Home decides this request; the CLI has no command for it.",
+    nullReason: "This can't be decided from Home or the CLI yet.",
   }));
 }
+
+/** The command that shows what a delegation rule would allow: the delegation area's own. */
+const DELEGATIONS_PREVIEW = {
+  argv: ["delegations", "preview", "{delegationAction}", "--harness", "{hrn}"],
+} as const;
 
 /** The items of one harness's `dec_` decisions, open and (settled) from the last 30 days. */
 export function decisionItems(

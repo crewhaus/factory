@@ -10,8 +10,12 @@ import {
   type AttentionKind,
   type AttentionSourceKind,
   type AttentionText,
+  type CliTwin,
   type DecisionClass,
+  TWIN_PLACEHOLDERS,
+  type TwinParams,
   attentionBandOf,
+  renderTwin,
 } from "@crewhaus/control-contract";
 import { type RevisionPart, attRefOf, evidenceRevOf } from "./ids";
 import type { Drafted } from "./types";
@@ -117,6 +121,22 @@ export function classOf(value: unknown): DecisionClass {
 export function shellWord(text: string): string {
   if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(text)) return text;
   return `'${text.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * A command line from a closed template: every value is checked against its placeholder's
+ * grammar (`renderTwin`) and every word is shell-quoted. `undefined` when a value does not
+ * fit, so text a harness wrote never becomes a command.
+ */
+export function twinOf(twin: CliTwin, params: TwinParams): string | undefined {
+  const rendered = renderTwin(twin, params);
+  if (!("argv" in rendered)) return undefined;
+  return ["crewhaus", ...rendered.argv].map(shellWord).join(" ");
+}
+
+/** Whether a directory fits a command's `{dir}`: no control character, no leading `-`. */
+export function dirFits(dir: string): boolean {
+  return TWIN_PLACEHOLDERS["{dir}"].test(dir);
 }
 
 /** A time in ms, or `undefined` for one that does not parse. */

@@ -216,7 +216,31 @@ function unreachableLines(ids: readonly string[], names: ReadonlyMap<string, str
   );
 }
 
+// biome-ignore lint/suspicious/noControlCharactersInRegex: removing control characters is the point
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/g;
+
+/** A printed line with no C0 or C1 control character, so text a harness wrote cannot drive the terminal. */
+export function printable(line: string): string {
+  return line.replace(CONTROL_RE, "");
+}
+
+/**
+ * JSON output with DEL and the C1 controls escaped as well: `JSON.stringify` escapes C0
+ * inside strings itself, and its own line breaks stay.
+ */
+function jsonSafe(text: string): string {
+  return text.replace(
+    /[\u007f-\u009f]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
 export async function runInboxCommand(argv: readonly string[], deps: InboxDeps = {}): Promise<Out> {
+  const out = await inboxCommand(argv, deps);
+  return { ...out, lines: out.lines.map(argv.includes("--json") ? jsonSafe : printable) };
+}
+
+async function inboxCommand(argv: readonly string[], deps: InboxDeps): Promise<Out> {
   if (argv.includes("--help") || argv.includes("-h")) return { lines: USAGE, exitCode: 0 };
   const first = argv[0];
   const sub = first === undefined || first.startsWith("-") ? "list" : first;
