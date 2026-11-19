@@ -26,6 +26,7 @@ import {
   DECLINE_REASONS,
   WORK_BASES,
   WORK_CLOSE_OUTCOMES,
+  WORK_DELIVERY_KINDS,
   WORK_KINDS,
   WORK_SOURCE_LABEL,
   type WorkBasis,
@@ -57,10 +58,14 @@ import {
   ACCEPT_RULE,
   HARNESS_CLOSE_OUTCOMES,
   HARNESS_SOURCE_KINDS,
+  OUTCOME_ACTOR,
+  OUTCOME_RULE,
+  PR_CLOSED_REASON,
   type WorkMove,
   mayMove,
 } from "./actors";
-import { checkProposal, hasObservedEvidence, parseAssessment } from "./assessment";
+import { checkProposal, parseAssessment } from "./assessment";
+import { verifiedObservedEvidence } from "./evidence";
 import { type FoldedWorkItem, type WorkFold, foldWork } from "./fold";
 import {
   REVISION_MAX_BYTES,
@@ -144,6 +149,17 @@ export type WorkTransition = {
   readonly note?: string;
 };
 
+/** What `apply` changes at once; each part is optional, at least one is given. */
+export type WorkApply = {
+  /** Link this run. `whileOpen` skips the link on a closed item instead of refusing it. */
+  readonly link?: { readonly run: string; readonly whileOpen?: boolean };
+  readonly note?: string;
+  /** An edit of the item's fields, at the revision the caller read. */
+  readonly edit?: Omit<WorkPatch, "note">;
+  readonly deliver?: { readonly kind: WorkDeliveryKind; readonly ref: string };
+  readonly close?: WorkTransition & { readonly outcome: WorkCloseOutcome };
+};
+
 /** The owner's accept policy, from `tool_config.work.accept`. */
 export type WorkAcceptPolicy = { readonly accept?: readonly WorkKind[] };
 
@@ -174,6 +190,12 @@ export type WorkStore = {
     options?: { readonly policy?: WorkAcceptPolicy },
   ): Promise<WorkWrite>;
   update(wi: string, patch: WorkPatch, actor: WorkActor): Promise<WorkWrite>;
+  /**
+   * A link, a note or an edit, a delivery and a close as one write: every check first
+   * (the close's legality included), then one revision and its lines under one lock. A
+   * refused call writes nothing, so a retry duplicates nothing.
+   */
+  apply(wi: string, change: WorkApply, actor: WorkActor): Promise<WorkWrite>;
   transition(
     wi: string,
     to: "open" | "closed",
@@ -228,6 +250,67 @@ const CRITERIA_MAX = 20;
 const CRITERION_MAX = 500;
 const NOTE_MAX = 4096;
 const REF_MAX = 500;
+
+/** The notes one item keeps at most; the next is refused `item_full`. */
+export const NOTES_MAX = 100;
+/** The deliveries one item records at most; the next is refused `item_full`. */
+export const DELIVERED_MAX = 100;
+/**
+ * The most bytes one character of a text field can take in a revision file: JSON writes
+ * a control character or a lone surrogate as `\uXXXX`.
+ */
+const CHAR_MAX_BYTES = 6;
+/**
+ * The room a revision keeps for a person's edit. Text limits count characters, not bytes,
+ * so notes and deliveries well under their counts can still fill a revision; an append
+ * (a note or a delivery) is refused once the revision would grow past
+ * {@link APPEND_MAX_BYTES}, which leaves room for a person to set the title, the goal and
+ * every criterion at their limits, plus the JSON around them.
+ */
+export const EDIT_RESERVE_BYTES =
+  (TITLE_MAX + GOAL_MAX + CRITERIA_MAX * CRITERION_MAX) * CHAR_MAX_BYTES + CRITERIA_MAX * 8 + 256;
+/** The largest revision a note or a delivery may grow an item to. */
+export const APPEND_MAX_BYTES = REVISION_MAX_BYTES - EDIT_RESERVE_BYTES;
+
+/** A revision as it is written: one JSON line. */
+function serialized(revision: WorkRevision): string {
+  return `${JSON.stringify(revision)}\n`;
+}
+
+/**
+ * Whether a revision fits: a note or a delivery under its count and within
+ * {@link APPEND_MAX_BYTES}, as is any write but a person's edit; a person's edit is held
+ * only to the file limit itself (`writeRevision`).
+ */
+function fitProblem(
+  revision: WorkRevision,
+  appends: { readonly note: boolean; readonly delivery: boolean; readonly budget: boolean },
+): WorkRefusal | undefined {
+  if (appends.note && (revision.notes?.length ?? 0) > NOTES_MAX) {
+    return refusal(
+      "conflict",
+      "item_full",
+      `This item has ${NOTES_MAX} notes, the most it keeps; a person can still edit or close it.`,
+    );
+  }
+  if (appends.delivery && (revision.delivered?.length ?? 0) > DELIVERED_MAX) {
+    return refusal(
+      "conflict",
+      "item_full",
+      `This item records ${DELIVERED_MAX} deliveries, the most it keeps.`,
+    );
+  }
+  if (!appends.note && !appends.delivery && !appends.budget) return undefined;
+  const bytes = Buffer.byteLength(serialized(revision));
+  if (bytes > APPEND_MAX_BYTES) {
+    return refusal(
+      "conflict",
+      "item_full",
+      `This item's notes and deliveries fill the ${Math.floor(APPEND_MAX_BYTES / 1024)} KiB they may take; a person can still edit or close it.`,
+    );
+  }
+  return undefined;
+}
 
 function refusal(
   code: WorkRefusalCode,
@@ -333,6 +416,146 @@ function fieldsProblem(
   return undefined;
 }
 
+/** A delivery's problem, or `undefined`. */
+function deliveryProblem(delivery: {
+  readonly kind: unknown;
+  readonly ref: unknown;
+}): WorkRefusal | undefined {
+  if (!(WORK_DELIVERY_KINDS as readonly unknown[]).includes(delivery.kind)) {
+    return refusal(
+      "invalid",
+      "invalid_field",
+      `A delivery is one of ${WORK_DELIVERY_KINDS.join(", ")}.`,
+      { field: "deliver.kind" },
+    );
+  }
+  return textProblem("deliver.ref", delivery.ref, REF_MAX);
+}
+
+/** The problem with a move's options themselves, before any state is read. */
+function transitionInputProblem(opts: WorkTransition): WorkRefusal | undefined {
+  if (opts.note !== undefined) {
+    const p = textProblem("note", opts.note, NOTE_MAX);
+    if (p !== undefined) return p;
+  }
+  if (opts.supersededBy !== undefined && !isId("wi", opts.supersededBy)) {
+    return refusal("invalid", "invalid_field", "supersededBy names a work item (wi_…).", {
+      field: "supersededBy",
+    });
+  }
+  return undefined;
+}
+
+/** A move the rules allow: which move it is, the line's event and the outcome it closes with. */
+type MoveDecision = {
+  readonly move: WorkMove;
+  readonly event: WorkLogLine["event"];
+  readonly outcome?: WorkCloseOutcome;
+};
+
+/**
+ * Whether `actor` may move `item` to `to` with these options, read from the folded log:
+ * the machine's moves, the actor rules, the reasons a close or a decline needs, the rule a
+ * system acceptance or reopen runs under, and `supersededBy` naming another item of this
+ * harness. `transition` and `apply` both decide through it.
+ */
+function moveDecision(
+  item: FoldedWorkItem,
+  to: "open" | "closed",
+  opts: WorkTransition,
+  actor: WorkActor,
+  rule: string | undefined,
+  fold: WorkFold,
+): MoveDecision | WorkRefusal {
+  const from = item.state;
+  let move: WorkMove;
+  let event: WorkLogLine["event"];
+  let outcome: WorkCloseOutcome | undefined;
+  if (to === "open" && from === "proposed") {
+    move = "accept";
+    event = "accepted";
+  } else if (to === "open" && from === "closed") {
+    move = "reopen";
+    event = "reopened";
+  } else if (to === "closed" && from === "proposed") {
+    move = "decline";
+    event = "declined";
+    outcome = opts.supersededBy !== undefined ? "superseded" : "declined";
+    if (!(DECLINE_REASONS as readonly unknown[]).includes(opts.reasonCode)) {
+      return refusal(
+        "invalid",
+        "invalid_field",
+        `A decline gives a reason: ${DECLINE_REASONS.join(", ")}.`,
+        { field: "reason" },
+      );
+    }
+  } else if (to === "closed" && from === "open") {
+    outcome = opts.outcome ?? "done";
+    if (!(WORK_CLOSE_OUTCOMES as readonly string[]).includes(outcome)) {
+      return refusal("invalid", "invalid_field", "outcome is not one an item closes with.", {
+        field: "outcome",
+      });
+    }
+    move = outcome === "cancelled" ? "cancel" : "close";
+    event = "closed";
+    if (outcome === "declined" && actor.role !== "system") return forbidden(actor, "decline");
+    if (actor.role === "harness") {
+      if (!HARNESS_CLOSE_OUTCOMES.includes(outcome)) return forbidden(actor, move);
+      if (typeof opts.reasonCode !== "string" || !/^[a-z][a-z0-9-]{0,39}$/.test(opts.reasonCode)) {
+        return refusal(
+          "invalid",
+          "reason_required",
+          "Closing an item says why: give a reason code.",
+          { field: "reasonCode" },
+        );
+      }
+    }
+  } else {
+    return refusal(
+      "conflict",
+      to === "open" ? (from === "open" ? "not_proposed" : "not_closed") : "already_closed",
+      `This item is ${from}, so it cannot move to ${to} this way.`,
+      { current: from },
+    );
+  }
+  if (!mayMove(actor.role, move)) return forbidden(actor, move);
+  if (actor.role === "system" && move === "accept" && rule === undefined) {
+    return refusal(
+      "forbidden",
+      "rule_required",
+      "The runtime accepts only under the owner's policy.",
+    );
+  }
+  if (actor.role === "system" && move === "reopen") {
+    const closedBy = [...item.history].reverse().find((l) => l.event === "closed");
+    if (rule !== OUTCOME_RULE) {
+      return refusal(
+        "forbidden",
+        "rule_required",
+        "The runtime reopens an item only when its pull request is reopened.",
+      );
+    }
+    if (closedBy?.by !== OUTCOME_ACTOR || closedBy.reasonCode !== PR_CLOSED_REASON) {
+      return refusal(
+        "forbidden",
+        "not_closed_by_outcome",
+        "The runtime reopens only an item it closed because its pull request was closed.",
+      );
+    }
+  }
+  if (opts.supersededBy !== undefined) {
+    if (opts.supersededBy === item.id || !fold.items.has(opts.supersededBy)) {
+      return refusal(
+        "invalid",
+        "invalid_field",
+        "supersededBy names another work item of this harness.",
+        { field: "supersededBy" },
+      );
+    }
+  }
+  return { move, event, ...(outcome !== undefined ? { outcome } : {}) };
+}
+
 /**
  * The first problem with the fields an input or a patch sets, or `undefined`: what the
  * store would refuse them for. A head asks before it writes a receipt.
@@ -376,9 +599,19 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
    * Write one revision, exclusively, `0600`; never over an existing one. `named` is the
    * newest revision a log line names, given only under the ledger's lock: a file above it
    * is one no line names (a writer that stopped between its revision and its line), so it
-   * is removed and written again instead of blocking every later edit of the item.
+   * is removed and written again instead of blocking every later edit of the item. The
+   * revision is serialized first: one past `REVISION_MAX_BYTES` is refused `item_full`
+   * before any file exists.
    */
   function writeRevision(revision: WorkRevision, named?: number): WorkRefusal | undefined {
+    const body = serialized(revision);
+    if (Buffer.byteLength(body) > REVISION_MAX_BYTES) {
+      return refusal(
+        "invalid",
+        "item_full",
+        `An item's content is at most ${REVISION_MAX_BYTES / 1024} KiB; this change would pass it.`,
+      );
+    }
     const dir = ensureDirContained(harnessDir, itemDirOf(harnessDir, revision.wi), { mode: 0o700 });
     if (!dir.ok) return refusal("unavailable", "store_unwritable", dir.reason);
     const rel = revisionRelOf(harnessDir, revision.wi, revision.rev);
@@ -395,7 +628,7 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
         : refusal("unavailable", "store_unwritable", created.reason);
     }
     try {
-      writeSync(created.fd, `${JSON.stringify(revision)}\n`);
+      writeSync(created.fd, body);
     } catch (err) {
       return refusal("unavailable", "store_unwritable", (err as Error).message);
     } finally {
@@ -445,6 +678,30 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
     if (stray.length > 0)
       throw new Error(`work log line has keys outside the set: ${stray.join(", ")}`);
     return out;
+  }
+
+  function moveLine(
+    wi: string,
+    to: "open" | "closed",
+    moved: MoveDecision,
+    opts: WorkTransition,
+    actor: WorkActor,
+    rule: string | undefined,
+    rev: number | undefined,
+  ): WorkLogLine {
+    return line(
+      {
+        id: wi,
+        state: to,
+        event: moved.event,
+        ...(rev !== undefined ? { rev } : {}),
+        ...(moved.outcome !== undefined ? { outcome: moved.outcome } : {}),
+        ...(opts.reasonCode !== undefined ? { reasonCode: opts.reasonCode } : {}),
+        ...(opts.supersededBy !== undefined ? { supersededBy: opts.supersededBy } : {}),
+        ...(rule !== undefined ? { rule } : {}),
+      },
+      actor,
+    );
   }
 
   function actorProblem(actor: WorkActor): WorkRefusal | undefined {
@@ -553,13 +810,22 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
     return fold;
   }
 
-  /** Append one line under the lock after a whole fold; `decide` refuses or names the line. */
+  /**
+   * Append lines under the lock after a whole fold; `decide` refuses or names the lines
+   * (one `line`, or `lines` in order) and the revision they name.
+   */
   async function locked(
     wi: string,
     decide: (
       item: FoldedWorkItem,
       fold: WorkFold,
-    ) => WorkRefusal | { readonly line?: WorkLogLine; readonly revision?: WorkRevision },
+    ) =>
+      | WorkRefusal
+      | {
+          readonly line?: WorkLogLine;
+          readonly lines?: readonly WorkLogLine[];
+          readonly revision?: WorkRevision;
+        },
   ): Promise<WorkWrite> {
     const answer = await withLedgerLock<WorkWrite>(ledger, (lockedAppend) => {
       const fold = wholeFold();
@@ -570,15 +836,17 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
       }
       const decided = decide(item, fold);
       if ("ok" in decided) return decided;
-      if (decided.line === undefined) return { ok: true, item, wrote: false };
+      const lines = decided.lines ?? (decided.line !== undefined ? [decided.line] : []);
+      if (lines.length === 0) return { ok: true, item, wrote: false };
       if (decided.revision !== undefined) {
         const problem = writeRevision(decided.revision, item.rev);
         if (problem !== undefined) return problem;
       }
-      const written = lockedAppend(decided.line as unknown as LedgerRecord);
-      if (!written.ok) {
+      for (const [i, next] of lines.entries()) {
+        const written = lockedAppend(next as unknown as LedgerRecord);
+        if (written.ok) continue;
         // No line names the revision this call wrote: remove it, so the next edit can.
-        if (decided.revision !== undefined) {
+        if (i === 0 && decided.revision !== undefined) {
           removeRevision(decided.revision.wi, decided.revision.rev);
         }
         return refusal("unavailable", "store_unwritable", written.reason);
@@ -758,11 +1026,19 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
             })();
       if (!written.ok || !written.wrote) return written;
       // The owner's accept policy: a listed kind is accepted by the runtime, except a
-      // feature or a speculative proposal of any kind with no observed evidence, which
-      // waits for a person.
+      // feature or a speculative proposal of any kind with no observed evidence this
+      // harness's records hold (never the proposing run itself), which waits for a person.
       const accept = opts.policy?.accept ?? [];
       const needsObserved = input.kind === "feature" || input.basis === "speculative";
-      if (accept.includes(input.kind) && (!needsObserved || hasObservedEvidence(assessment))) {
+      const verified = (): boolean => {
+        const folded = foldWork(harnessDir);
+        return verifiedObservedEvidence(assessment, {
+          harnessDir,
+          ...(actor.run !== undefined ? { run: actor.run } : {}),
+          ...(folded.ok ? { fold: folded } : {}),
+        });
+      };
+      if (accept.includes(input.kind) && (!needsObserved || verified())) {
         const accepted = await store.transition(
           written.item.id,
           "open",
@@ -857,6 +1133,12 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
         }
         next["fieldOrigins"] = origins;
         const revision = next as WorkRevision;
+        const fit = fitProblem(revision, {
+          note: note !== undefined,
+          delivery: false,
+          budget: actor.role !== "person",
+        });
+        if (fit !== undefined) return fit;
         if (
           item.state === "proposed" &&
           (fields.kind !== undefined || fields.basis !== undefined || assessment !== undefined)
@@ -892,94 +1174,11 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
     async transition(wi, to, opts, actor, rule) {
       const bad = actorProblem(actor);
       if (bad !== undefined) return bad;
-      if (opts.note !== undefined) {
-        const p = textProblem("note", opts.note, NOTE_MAX);
-        if (p !== undefined) return p;
-      }
-      if (opts.supersededBy !== undefined && !isId("wi", opts.supersededBy)) {
-        return refusal("invalid", "invalid_field", "supersededBy names a work item (wi_…).", {
-          field: "supersededBy",
-        });
-      }
+      const optsBad = transitionInputProblem(opts);
+      if (optsBad !== undefined) return optsBad;
       return locked(wi, (item, fold) => {
-        const from = item.state;
-        let move: WorkMove;
-        let event: WorkLogLine["event"];
-        let outcome: WorkCloseOutcome | undefined;
-        if (to === "open" && from === "proposed") {
-          move = "accept";
-          event = "accepted";
-        } else if (to === "open" && from === "closed") {
-          move = "reopen";
-          event = "reopened";
-        } else if (to === "closed" && from === "proposed") {
-          move = "decline";
-          event = "declined";
-          outcome = opts.supersededBy !== undefined ? "superseded" : "declined";
-          if (!(DECLINE_REASONS as readonly unknown[]).includes(opts.reasonCode)) {
-            return refusal(
-              "invalid",
-              "invalid_field",
-              `A decline gives a reason: ${DECLINE_REASONS.join(", ")}.`,
-              {
-                field: "reason",
-              },
-            );
-          }
-        } else if (to === "closed" && from === "open") {
-          outcome = opts.outcome ?? "done";
-          if (!(WORK_CLOSE_OUTCOMES as readonly string[]).includes(outcome)) {
-            return refusal("invalid", "invalid_field", "outcome is not one an item closes with.", {
-              field: "outcome",
-            });
-          }
-          move = outcome === "cancelled" ? "cancel" : "close";
-          event = "closed";
-          if (outcome === "declined" && actor.role !== "system") return forbidden(actor, "decline");
-          if (actor.role === "harness") {
-            if (!HARNESS_CLOSE_OUTCOMES.includes(outcome)) return forbidden(actor, move);
-            if (
-              typeof opts.reasonCode !== "string" ||
-              !/^[a-z][a-z0-9-]{0,39}$/.test(opts.reasonCode)
-            ) {
-              return refusal(
-                "invalid",
-                "reason_required",
-                "Closing an item says why: give a reason code.",
-                {
-                  field: "reasonCode",
-                },
-              );
-            }
-          }
-        } else {
-          return refusal(
-            "conflict",
-            to === "open" ? (from === "open" ? "not_proposed" : "not_closed") : "already_closed",
-            `This item is ${from}, so it cannot move to ${to} this way.`,
-            { current: from },
-          );
-        }
-        if (!mayMove(actor.role, move)) return forbidden(actor, move);
-        if (actor.role === "system" && move === "accept" && rule === undefined) {
-          return refusal(
-            "forbidden",
-            "rule_required",
-            "The runtime accepts only under the owner's policy.",
-          );
-        }
-        if (opts.supersededBy !== undefined) {
-          if (opts.supersededBy === wi || !fold.items.has(opts.supersededBy)) {
-            return refusal(
-              "invalid",
-              "invalid_field",
-              "supersededBy names another work item of this harness.",
-              {
-                field: "supersededBy",
-              },
-            );
-          }
-        }
+        const moved = moveDecision(item, to, opts, actor, rule, fold);
+        if ("ok" in moved) return moved;
         let revision: WorkRevision | undefined;
         if (opts.note !== undefined) {
           const current = readRevision(wi, item.rev);
@@ -1001,23 +1200,235 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
               { by: actor.by, at: stampNow(), text: opts.note, origin },
             ],
           };
+          const fit = fitProblem(revision, { note: true, delivery: false, budget: true });
+          if (fit !== undefined) return fit;
         }
         return {
           ...(revision !== undefined ? { revision } : {}),
-          line: line(
-            {
-              id: wi,
-              state: to,
-              event,
-              ...(revision !== undefined ? { rev: revision.rev } : {}),
-              ...(outcome !== undefined ? { outcome } : {}),
-              ...(opts.reasonCode !== undefined ? { reasonCode: opts.reasonCode } : {}),
-              ...(opts.supersededBy !== undefined ? { supersededBy: opts.supersededBy } : {}),
-              ...(rule !== undefined ? { rule } : {}),
-            },
-            actor,
-          ),
+          line: moveLine(wi, to, moved, opts, actor, rule, revision?.rev),
         };
+      });
+    },
+
+    async apply(wi, change, actor) {
+      const bad = actorProblem(actor);
+      if (bad !== undefined) return bad;
+      const { link, note, edit, deliver, close } = change;
+      if (
+        link === undefined &&
+        note === undefined &&
+        edit === undefined &&
+        deliver === undefined &&
+        close === undefined
+      ) {
+        return refusal(
+          "invalid",
+          "nothing_to_change",
+          "Say what changes: a link, a note, an edit, a delivery or a close.",
+        );
+      }
+      const editing =
+        edit !== undefined &&
+        Object.entries(edit).some(([key, value]) => key !== "expect" && value !== undefined);
+      if (edit !== undefined && !editing) {
+        return refusal("invalid", "nothing_to_change", "An edit says which field changes.");
+      }
+      for (const [wanted, move] of [
+        [link !== undefined, "link"],
+        [editing, "edit"],
+        [note !== undefined, "note"],
+        [deliver !== undefined, "deliver"],
+      ] as const) {
+        if (wanted && !mayMove(actor.role, move)) return forbidden(actor, move);
+      }
+      if (link !== undefined && !CANONICAL_RUN_ID_RE.test(link.run)) {
+        return refusal("invalid", "invalid_field", "A run is named by its canonical id (run_…).", {
+          field: "run",
+        });
+      }
+      const { expect: expected, ...fields } = edit ?? { expect: 0 };
+      const problem = fieldsProblem({ ...fields, ...(note !== undefined ? { note } : {}) });
+      if (problem !== undefined) return problem;
+      let assessment: WorkRevision["assessment"];
+      if (fields.assessment !== undefined) {
+        const parsed = parseAssessment(fields.assessment, stampNow());
+        if (!parsed.ok) {
+          return refusal("invalid", parsed.code, parsed.message, { field: parsed.field });
+        }
+        assessment = parsed.assessment;
+      }
+      if (deliver !== undefined) {
+        const p = deliveryProblem(deliver);
+        if (p !== undefined) return p;
+      }
+      if (close !== undefined) {
+        const p = transitionInputProblem(close);
+        if (p !== undefined) return p;
+      }
+      return locked(wi, (item, fold) => {
+        // Every check before anything is written: the close's legality, then the edit's.
+        const moved =
+          close !== undefined
+            ? moveDecision(item, "closed", close, actor, undefined, fold)
+            : undefined;
+        if (moved !== undefined && "ok" in moved) return moved;
+        if (editing) {
+          if (
+            actor.role === "harness" &&
+            (item.state !== "proposed" || item.openedVia !== "tool")
+          ) {
+            return refusal(
+              "forbidden",
+              "not_its_proposal",
+              "The harness edits only its own proposals, before anyone accepts them.",
+              { current: item.state },
+            );
+          }
+          if (!Number.isSafeInteger(expected) || expected !== item.rev) {
+            return refusal(
+              "precondition_failed",
+              "stale_revision",
+              `This item is at revision ${item.rev}; read it again before you change it.`,
+              { current: item.rev },
+            );
+          }
+        }
+        let linkLine: WorkLogLine | undefined;
+        if (link !== undefined && !item.runs.includes(link.run)) {
+          if (item.state === "closed") {
+            if (link.whileOpen !== true) {
+              return refusal(
+                "conflict",
+                "closed",
+                "This item is closed; reopen it to link a run.",
+                {
+                  current: item.state,
+                },
+              );
+            }
+          } else {
+            linkLine = line({ id: wi, state: item.state, event: "linked", run: link.run }, actor);
+          }
+        }
+        let revision: WorkRevision | undefined;
+        const writesContent = editing || note !== undefined || deliver !== undefined;
+        if (writesContent) {
+          const current = readRevision(wi, item.rev);
+          if (current === undefined) {
+            return refusal(
+              "unavailable",
+              "content_unreadable",
+              "The item's content could not be read.",
+            );
+          }
+          const origin = originOfRole(actor.role);
+          const origins: Partial<Record<WorkTextField, TrustOrigin>> = { ...current.fieldOrigins };
+          const next: Record<string, unknown> = {
+            ...current,
+            rev: item.rev + 1,
+            at: stampNow(),
+            by: actor.by,
+          };
+          if (fields.title !== undefined) {
+            next["title"] = oneLine(fields.title);
+            origins.title = origin;
+          }
+          if (fields.goal !== undefined) {
+            next["goal"] = fields.goal;
+            origins.goal = origin;
+          }
+          if (fields.acceptance !== undefined) {
+            next["acceptance"] = [...fields.acceptance];
+            origins.acceptance = origin;
+          }
+          if (assessment !== undefined) {
+            next["assessment"] = assessment;
+            origins.assessment = origin;
+          }
+          for (const key of ["kind", "basis", "parent"] as const) {
+            if (fields[key] !== undefined) next[key] = fields[key];
+          }
+          if (note !== undefined) {
+            const added: WorkNote = { by: actor.by, at: stampNow(), text: note, origin };
+            next["notes"] = [...(current.notes ?? []), added];
+          }
+          if (deliver !== undefined) {
+            const added: WorkDelivery = {
+              kind: deliver.kind,
+              ref: deliver.ref,
+              at: stampNow(),
+              origin,
+            };
+            next["delivered"] = [...(current.delivered ?? []), added];
+          }
+          next["fieldOrigins"] = origins;
+          revision = next as WorkRevision;
+          const fit = fitProblem(revision, {
+            note: note !== undefined,
+            delivery: deliver !== undefined,
+            budget: actor.role !== "person" || note !== undefined || deliver !== undefined,
+          });
+          if (fit !== undefined) return fit;
+          if (
+            item.state === "proposed" &&
+            (fields.kind !== undefined || fields.basis !== undefined || assessment !== undefined)
+          ) {
+            const proposal = checkProposal({
+              kind: revision.kind,
+              basis: revision.basis,
+              assessment: revision.assessment,
+            });
+            if (!proposal.ok) {
+              return refusal("invalid", proposal.code, proposal.message, {
+                field: proposal.field,
+              });
+            }
+          }
+          if (Buffer.byteLength(serialized(revision)) > REVISION_MAX_BYTES) {
+            return refusal(
+              "invalid",
+              "item_full",
+              `An item's content is at most ${REVISION_MAX_BYTES / 1024} KiB; this change would pass it.`,
+            );
+          }
+        }
+        const lines: WorkLogLine[] = [];
+        if (linkLine !== undefined) lines.push(linkLine);
+        if (revision !== undefined && (editing || note !== undefined)) {
+          lines.push(
+            line(
+              {
+                id: wi,
+                state: item.state,
+                event: "updated",
+                rev: revision.rev,
+                ...(fields.kind !== undefined ? { kind: fields.kind } : {}),
+                ...(fields.basis !== undefined ? { basis: fields.basis } : {}),
+                ...(fields.parent !== undefined ? { parent: fields.parent } : {}),
+                ...(fields.priority !== undefined ? { priority: fields.priority } : {}),
+              },
+              actor,
+            ),
+          );
+        }
+        if (revision !== undefined && deliver !== undefined) {
+          lines.push(
+            line(
+              {
+                id: wi,
+                state: item.state,
+                event: "delivered",
+                rev: revision.rev,
+                delivered: { kind: deliver.kind },
+              },
+              actor,
+            ),
+          );
+        }
+        if (close !== undefined && moved !== undefined) {
+          lines.push(moveLine(wi, "closed", moved, close, actor, undefined, undefined));
+        }
+        return { ...(revision !== undefined ? { revision } : {}), lines };
       });
     },
 
@@ -1080,17 +1491,7 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
         actorProblem(actor) ??
         (mayMove(actor.role, "deliver") ? undefined : forbidden(actor, "deliver"));
       if (bad !== undefined) return bad;
-      if (!["report", "answer", "artifact"].includes(delivery.kind)) {
-        return refusal(
-          "invalid",
-          "invalid_field",
-          "A delivery is a report, an answer or an artifact.",
-          {
-            field: "deliver.kind",
-          },
-        );
-      }
-      const p = textProblem("deliver.ref", delivery.ref, REF_MAX);
+      const p = deliveryProblem(delivery);
       if (p !== undefined) return p;
       return locked(wi, (item) => {
         const current = readRevision(wi, item.rev);
@@ -1114,6 +1515,8 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
           by: actor.by,
           delivered: [...(current.delivered ?? []), added],
         };
+        const fit = fitProblem(revision, { note: false, delivery: true, budget: true });
+        if (fit !== undefined) return fit;
         return {
           revision,
           line: line(

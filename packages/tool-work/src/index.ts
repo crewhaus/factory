@@ -564,7 +564,7 @@ export function createWorkTools(deps: WorkToolsDeps = {}): {
   const workUpdate = buildTool({
     name: "WorkUpdate",
     description:
-      "Update a work item: add a note, link this run, record what you delivered, change your own proposal before it is accepted, or close an accepted item as done, failed or superseded with a reason code. You cannot accept, decline or cancel work.",
+      "Update a work item: add a note, link this run, record what you delivered, change your own proposal before it is accepted, or close an accepted item as done, failed or superseded with a reason code. You cannot accept, decline or cancel work. One call is one change: if any part is refused, nothing is written. An item keeps at most 100 notes and 100 deliveries, and their text has a size budget; once full, further notes or deliveries are refused.",
     inputSchema: updateInput,
     readOnly: false,
     destructive: true,
@@ -585,71 +585,52 @@ export function createWorkTools(deps: WorkToolsDeps = {}): {
         throw new WorkToolError("Say what to change: note, link, deliver, edit or close.");
       // A run started for this item links on its first update, while the item is not
       // closed: after a close the run still records a note or a delivery. Only an
-      // explicit link is refused on a closed item.
-      let implicit = false;
-      if (input.link !== true && rc?.workItem === wi) {
-        const read = store.get(wi);
-        implicit = !("ok" in read) && read.item.state !== "closed";
+      // explicit link is refused on a closed item. One write: every check first, so a
+      // refused call writes nothing and a retry duplicates nothing.
+      if (input.link === true && actor.run === undefined) {
+        throw new WorkToolError("This run has no id a work item can link to.");
       }
-      const linkRun = input.link === true || implicit;
-      if (linkRun) {
-        if (actor.run === undefined) {
-          if (input.link === true)
-            throw new WorkToolError("This run has no id a work item can link to.");
-        } else {
-          const linked = await store.link(wi, actor.run, actor);
-          if (!linked.ok) fail(linked);
-        }
-      }
-      if (input.edit !== undefined) {
-        const { expect, ...edit } = input.edit;
-        const written = await store.update(
-          wi,
-          {
-            expect,
-            ...(edit as Omit<typeof edit, "kind" | "basis">),
-            ...(edit.kind !== undefined ? { kind: edit.kind as FoldedWorkItem["kind"] } : {}),
-            ...(edit.basis !== undefined
-              ? { basis: edit.basis as NonNullable<FoldedWorkItem["basis"]> }
-              : {}),
-            ...(input.note !== undefined ? { note: input.note } : {}),
-          },
-          actor,
-        );
-        if (!written.ok) fail(written);
-      } else if (input.note !== undefined) {
-        // A note needs no guard of its own: one retry covers a write that landed between.
-        for (let attempt = 0; ; attempt++) {
-          const read = store.get(wi);
-          if ("ok" in read) fail(read);
-          const written = await store.update(
-            wi,
-            { expect: read.item.rev, note: input.note },
-            actor,
-          );
-          if (written.ok) break;
-          if (written.code !== "precondition_failed" || attempt > 0) fail(written);
-        }
-      }
-      if (input.deliver !== undefined) {
-        const written = await store.deliver(wi, input.deliver, actor);
-        if (!written.ok) fail(written);
-      }
-      if (input.close !== undefined) {
-        const written = await store.transition(
-          wi,
-          "closed",
-          {
-            outcome: input.close.outcome,
-            reasonCode: input.close.reasonCode,
-            ...(input.close.supersededBy !== undefined
-              ? { supersededBy: workIdOf(input.close.supersededBy) }
-              : {}),
-          },
-          actor,
-        );
-        if (!written.ok) fail(written);
-      }
+      const link =
+        actor.run === undefined
+          ? undefined
+          : input.link === true
+            ? { run: actor.run }
+            : rc?.workItem === wi
+              ? { run: actor.run, whileOpen: true }
+              : undefined;
+      const edit = input.edit;
+      const written = await store.apply(
+        wi,
+        {
+          ...(link !== undefined ? { link } : {}),
+          ...(input.note !== undefined ? { note: input.note } : {}),
+          ...(edit !== undefined
+            ? {
+                edit: {
+                  ...(edit as Omit<typeof edit, "kind" | "basis">),
+                  ...(edit.kind !== undefined ? { kind: edit.kind as FoldedWorkItem["kind"] } : {}),
+                  ...(edit.basis !== undefined
+                    ? { basis: edit.basis as NonNullable<FoldedWorkItem["basis"]> }
+                    : {}),
+                },
+              }
+            : {}),
+          ...(input.deliver !== undefined ? { deliver: input.deliver } : {}),
+          ...(input.close !== undefined
+            ? {
+                close: {
+                  outcome: input.close.outcome,
+                  reasonCode: input.close.reasonCode,
+                  ...(input.close.supersededBy !== undefined
+                    ? { supersededBy: workIdOf(input.close.supersededBy) }
+                    : {}),
+                },
+              }
+            : {}),
+        },
+        actor,
+      );
+      if (!written.ok) fail(written);
       const after = store.get(wi);
       if ("ok" in after) fail(after);
       return JSON.stringify({ work: wi, state: after.item.state });

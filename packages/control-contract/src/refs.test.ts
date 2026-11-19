@@ -155,9 +155,11 @@ describe("actors", () => {
       "sys:executor",
       "sys:slo",
       "sys:ingress",
+      "sys:outcomes",
     ]);
     expect(parseActor("sys:ingress")).toEqual({ form: "system", id: "sys:ingress" });
     expect(isStoredActor("sys:ingress")).toBe(true);
+    expect(isStoredActor("sys:outcomes")).toBe(true);
   });
 
   for (const bad of [

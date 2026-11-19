@@ -253,6 +253,80 @@ describe("writes through the tools", () => {
     ).rejects.toThrow("closed");
   });
 
+  test("a run started for an item a person already closed records its delivery and note, and is not linked", async () => {
+    const dir = harness();
+    const tools = createWorkTools({ harnessDir: dir, classify: countingClassifier().classify });
+    const store = openWorkStore(dir);
+    const created = await store.create({ title: "Fix the CSV import", kind: "fix" }, PERSON);
+    if (!created.ok) throw new Error(created.message);
+    const wi = created.item.id;
+    const closed = await store.transition(wi, "closed", { outcome: "done" }, PERSON);
+    if (!closed.ok) throw new Error(closed.message);
+    const rc = rcFor(wi);
+    await tools.workUpdate.execute(
+      { work: wi, deliver: { kind: "report", ref: "reports/csv.md" } },
+      { runContext: rc },
+    );
+    await tools.workUpdate.execute({ work: wi, note: "Shipped." }, { runContext: rc });
+    const read = store.get(wi);
+    if ("ok" in read) throw new Error(read.message);
+    expect(read.item.runs).toEqual([]);
+    expect(read.revision?.delivered?.map((d) => d.ref)).toEqual(["reports/csv.md"]);
+    expect(read.revision?.notes?.map((n) => n.text)).toEqual(["Shipped."]);
+    expect(read.item.history.map((line) => line.event)).toEqual([
+      "opened",
+      "closed",
+      "delivered",
+      "updated",
+    ]);
+  });
+
+  test("a refused close writes nothing, and the retry records the note once", async () => {
+    const dir = harness();
+    const tools = createWorkTools({ harnessDir: dir, classify: countingClassifier().classify });
+    const store = openWorkStore(dir);
+    const make = async (title: string): Promise<string> => {
+      const created = await store.create({ title, kind: "fix" }, PERSON);
+      if (!created.ok) throw new Error(created.message);
+      return created.item.id;
+    };
+    const wi = await make("Fix the CSV import");
+    const wider = await make("Fix every import");
+    const rc = rcFor(wi);
+    const call = (supersededBy: string) =>
+      tools.workUpdate.execute(
+        {
+          work: wi,
+          note: "Folded into the wider fix.",
+          deliver: { kind: "report", ref: "reports/csv.md" },
+          close: { outcome: "superseded", reasonCode: "folded", supersededBy },
+        },
+        { runContext: rc },
+      );
+    const before = store.get(wi);
+    if ("ok" in before) throw new Error(before.message);
+    await expect(call(mintId("wi"))).rejects.toThrow("supersededBy");
+    const unchanged = store.get(wi);
+    if ("ok" in unchanged) throw new Error(unchanged.message);
+    expect(unchanged.item.history.length).toBe(before.item.history.length);
+    expect(unchanged.item.rev).toBe(1);
+    expect(unchanged.item.runs).toEqual([]);
+    await call(wider);
+    const after = store.get(wi);
+    if ("ok" in after) throw new Error(after.message);
+    expect(after.item.state).toBe("closed");
+    expect(after.item.runs).toEqual([rc.runId]);
+    expect(after.revision?.notes?.map((n) => n.text)).toEqual(["Folded into the wider fix."]);
+    expect(after.revision?.delivered?.length).toBe(1);
+    expect(after.item.history.map((line) => line.event)).toEqual([
+      "opened",
+      "linked",
+      "updated",
+      "delivered",
+      "closed",
+    ]);
+  });
+
   test("a managed tenant's run neither reads nor changes the work list; Home's own runs do", async () => {
     const dir = harness();
     const tools = createWorkTools({ harnessDir: dir, classify: countingClassifier().classify });

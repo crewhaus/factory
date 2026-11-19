@@ -116,6 +116,8 @@ export const SYSTEM_ACTORS = deepFreeze([
   "sys:slo",
   // A verified delivery from a receiver, before its area links it to a member.
   "sys:ingress",
+  // The pull request tracker, closing or reopening a work item as its pull request moves.
+  "sys:outcomes",
 ] as const);
 
 /** The OS user who owns a Hangar root. A person identifier: never stored raw. */
