@@ -87,4 +87,22 @@ export const DELTA_090_KEYS: ReadonlyArray<OwnerKey> = Object.freeze([
     reason: "who may act without asking is the owner's decision",
     since: "0.9.0",
   } as const),
+  // A model's declared price (#514): no root, so it is a refused leaf under
+  // any profile name; the `models` prefix already makes it a security surface.
+  Object.freeze({
+    pattern: Object.freeze(["models", "*", "price"]),
+    refused: true,
+    security: false,
+    reason: "a price is what budgets are measured with; only a person sets it",
+    since: "0.9.0",
+  } as const),
+  // A harness-wide spending period (#514): human-owned, never optimizable.
+  Object.freeze({
+    pattern: Object.freeze(["budget", "period"]),
+    root: true,
+    refused: false,
+    security: false,
+    reason: "a spending period is a person's decision",
+    since: "0.9.0",
+  } as const),
 ]);

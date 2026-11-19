@@ -1031,3 +1031,34 @@ describe("an unprotected block stays tunable both ways for every field", () => {
     ).toEqual([]);
   });
 });
+
+describe("a spending period that lets the harness spend more needs the security edit", () => {
+  const period = (p: unknown) => ({ budget: { usd: 5, period: p } });
+  const raises = (before: unknown, after: unknown): readonly string[] =>
+    escalationFor(before, after).find((e) => e.needs === "h.spec.edit.security")?.paths ?? [];
+
+  test("a higher period.usd, a shorter period and a removed period each raise", () => {
+    expect(
+      raises(period({ every: "month", usd: 50 }), period({ every: "month", usd: 80 })),
+    ).toEqual(["budget.period.usd"]);
+    expect(raises(period({ every: "month", usd: 50 }), period({ every: "week", usd: 50 }))).toEqual(
+      ["budget.period.every"],
+    );
+    expect(raises(period({ every: "week", usd: 50 }), period({ every: "day", usd: 50 }))).toEqual([
+      "budget.period.every",
+    ]);
+    expect(raises(period({ every: "month", usd: 50 }), { budget: { usd: 5 } })).toEqual([
+      "budget.period",
+    ]);
+  });
+
+  test("a first period, a lower one and a longer one raise nothing", () => {
+    expect(raises({ budget: { usd: 5 } }, period({ every: "month", usd: 50 }))).toEqual([]);
+    expect(
+      raises(period({ every: "month", usd: 50 }), period({ every: "month", usd: 20 })),
+    ).toEqual([]);
+    expect(raises(period({ every: "day", usd: 50 }), period({ every: "month", usd: 50 }))).toEqual(
+      [],
+    );
+  });
+});

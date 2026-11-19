@@ -3,7 +3,16 @@
  * and what each refusal exits with.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { readOperatorRecord } from "@crewhaus/control-records";
@@ -399,6 +408,47 @@ describe("the entry gate checks the spec's own directory and the working directo
   });
 });
 
+describe("a used-up budget period", () => {
+  /** A harness whose period is used up until an hour from now, optionally paused too. */
+  function exhausted(state: State): string {
+    const dir = harness(state);
+    writeFileSync(
+      join(dir, ".crewhaus", "run", "control", "budget-state.json"),
+      JSON.stringify({
+        v: 1,
+        periodId: "month-2026-11-01",
+        exhaustedAt: "2026-11-18T00:00:00.000Z",
+        renewsAt: new Date(Date.now() + 3_600_000).toISOString(),
+      }),
+    );
+    return dir;
+  }
+
+  test("every run-mode verb exits 33 at admission, --ignore-pause included, and says how to raise it", () => {
+    const dir = exhausted("absent");
+    for (const row of ROWS.filter((r) => r.mode === "run")) {
+      for (const extra of [[], ["--ignore-pause"]]) {
+        const { exit, out } = gate(dir, [...row.argv, ...extra]);
+        expect([row.argv.join(" "), exit]).toEqual([row.argv.join(" "), 33]);
+        expect(out).toContain("has used its budget for this period");
+        expect(out).toContain("crewhaus budget extend");
+      }
+    }
+  });
+
+  test("the REPL and the servers still start", () => {
+    const dir = exhausted("absent");
+    for (const row of ROWS.filter((r) => r.mode !== "run")) {
+      expect(gate(dir, row.argv).exit).toBeUndefined();
+    }
+  });
+
+  test("a disable outranks the budget, and the budget outranks a pause", () => {
+    expect(gate(exhausted("disabled"), ["run", "crewhaus.yaml", "--prompt", "x"]).exit).toBe(38);
+    expect(gate(exhausted("paused"), ["run", "crewhaus.yaml", "--prompt", "x"]).exit).toBe(33);
+  });
+});
+
 describe("the crewhaus binary", () => {
   const cli = async (dir: string, args: readonly string[]) => {
     const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
@@ -463,4 +513,109 @@ describe("the crewhaus binary", () => {
     expect(ignored.stderr).toContain("Running although new work is paused (--ignore-pause).");
     expect(ignored.exitCode).not.toBe(39);
   }, 20_000); // four CLI subprocesses, each loading the whole entry file
+});
+
+describe("the run stamp records --ignore-pause", () => {
+  const sse = (obj: unknown): string => `data: ${JSON.stringify(obj)}\n\n`;
+  const reply = (text: string): string => {
+    const base = {
+      id: "chatcmpl-stub",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "stub",
+    };
+    return [
+      sse({
+        ...base,
+        choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }],
+      }),
+      sse({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+      sse({
+        ...base,
+        choices: [],
+        usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+      }),
+      "data: [DONE]\n\n",
+    ].join("");
+  };
+  // A loopback provider, so the run reaches its first turn and writes its stamp.
+  const stub = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: (req) =>
+      req.method === "POST" && new URL(req.url).pathname.endsWith("/chat/completions")
+        ? new Response(reply("ok"), { headers: { "content-type": "text/event-stream" } })
+        : new Response("not found", { status: 404 }),
+  });
+  afterAll(() => stub.stop(true));
+
+  function stubHarness(state: State): string {
+    const dir = harness(state);
+    writeFileSync(
+      join(dir, "crewhaus.yaml"),
+      [
+        "name: gate-fixture",
+        "target: cli",
+        "agent:",
+        `  model: local/stub@http://127.0.0.1:${stub.port}/v1`,
+        "  instructions: Reply briefly.",
+        "",
+      ].join("\n"),
+    );
+    return dir;
+  }
+
+  const runOnce = async (
+    dir: string,
+    args: readonly string[],
+    env: Record<string, string> = {},
+  ) => {
+    const proc = Bun.spawn([process.execPath, CLI_PATH, "run", "crewhaus.yaml", ...args], {
+      cwd: dir,
+      env: { PATH: process.env["PATH"] ?? "", HOME: dir, CREWHAUS_NO_REGISTRY: "1", ...env },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    return { stderr, exitCode };
+  };
+
+  /** Every `run_stamp` payload in the harness's session logs. */
+  const stamps = (dir: string): Record<string, unknown>[] => {
+    const sessions = join(dir, ".crewhaus", "sessions");
+    const out: Record<string, unknown>[] = [];
+    for (const name of readdirSync(sessions)) {
+      if (!name.endsWith(".jsonl")) continue;
+      for (const line of readFileSync(join(sessions, name), "utf8").split("\n")) {
+        if (line === "") continue;
+        const parsed = JSON.parse(line) as { kind?: string; payload?: Record<string, unknown> };
+        if (parsed.kind === "run_stamp" && parsed.payload !== undefined) out.push(parsed.payload);
+      }
+    }
+    return out;
+  };
+
+  test("a paused harness run with --ignore-pause says so; an open one, even with the variable exported, does not", async () => {
+    const paused = stubHarness("paused");
+    const ignored = await runOnce(paused, ["--prompt", "x", "--ignore-pause"]);
+    expect(ignored.exitCode).toBe(0);
+    const [pausedStamp] = stamps(paused);
+    expect(pausedStamp?.["intake"]).toEqual({ pauseIgnored: true });
+
+    const open = stubHarness("absent");
+    expect((await runOnce(open, ["--prompt", "x"])).exitCode).toBe(0);
+    const [openStamp] = stamps(open);
+    expect(openStamp).toBeDefined();
+    expect(openStamp !== undefined && "intake" in openStamp).toBe(false);
+
+    const exported = stubHarness("absent");
+    const forged = await runOnce(exported, ["--prompt", "x"], {
+      CREWHAUS_INTAKE_PAUSE_IGNORED: "1",
+    });
+    expect(forged.exitCode).toBe(0);
+    const [exportedStamp] = stamps(exported);
+    expect(exportedStamp).toBeDefined();
+    expect(exportedStamp !== undefined && "intake" in exportedStamp).toBe(false);
+  }, 20_000); // three CLI subprocesses, each loading the whole entry file
 });

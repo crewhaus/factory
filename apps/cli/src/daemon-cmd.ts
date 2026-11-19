@@ -354,7 +354,11 @@ export function supervisorFor(
   opts: DaemonCommandOptions,
   gate: { readonly enabled: boolean; readonly force?: boolean; readonly acknowledge?: string[] },
   prep: { readonly compile?: boolean } = {},
-  run: { readonly briefFile?: string; readonly apiRun?: ApiRunInput } = {},
+  run: {
+    readonly briefFile?: string;
+    readonly apiRun?: ApiRunInput;
+    readonly pauseIgnored?: boolean;
+  } = {},
   head: StartHead = "cli-direct",
 ): HarnessSupervisor {
   const env = opts.env ?? process.env;
@@ -440,6 +444,8 @@ export function supervisorFor(
         ...(run.briefFile !== undefined ? { briefFile: run.briefFile } : {}),
         // A run the control API queued: its id and its input file, never its text.
         ...(run.apiRun !== undefined ? { apiRun: run.apiRun } : {}),
+        // `--ignore-pause` let this start past a paused intake: the run's stamp says so.
+        ...(run.pauseIgnored === true ? { pauseIgnored: true } : {}),
       }),
     // Built per start, like the plan: `.crewhaus/settings.json` is edited
     // between starts exactly as the spec is.
@@ -1139,7 +1145,7 @@ async function daemonSubmit(
   const runnable = assertRunnable(harness.dir, { mode: "run", ignorePause });
   if (!runnable.ok) {
     return {
-      lines: [entryRefusalLine(harness.specName, runnable.reason, harness.dir)],
+      lines: [entryRefusalLine(harness.specName, runnable.reason, harness.dir, runnable.renewsAt)],
       exitCode: EXIT_FOR_ERROR[runnable.exitName],
     };
   }
@@ -1188,7 +1194,7 @@ async function daemonSubmit(
       : args.flags.get("no-compile") === true
         ? { compile: false }
         : {},
-    { briefFile },
+    { briefFile, ...(runnable.pauseIgnored === true ? { pauseIgnored: true } : {}) },
   );
   try {
     const result = await supervisor.start();

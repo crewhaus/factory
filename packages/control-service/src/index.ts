@@ -192,6 +192,12 @@ export {
   reconcileOperatorControl,
   recordDesired,
 } from "./operator-controls";
+export {
+  type BudgetExtendAnswer,
+  type BudgetExtendInput,
+  applyBudgetExtend,
+  budgetTopupWritten,
+} from "./budget";
 export { type ObjectPage, type ObjectPageOptions, pageObjects } from "./pages";
 export type { ReconcileCounts } from "./reconcile";
 export { type RecoverCounts, type RecoverScope, isJobReceipt } from "./recover";

@@ -66,15 +66,18 @@ export type LoopAdmissionInputs = {
   readonly verdict: () => IntakeVerdict;
   /**
    * Whether a one-time grant waits for this loop's re-drive. Asked only while paused,
-   * and only when its answer decides: a `true` admits the loop on that grant.
+   * and only when its answer decides: a `true` with `take` admits the loop on that
+   * grant and spends it; without `take` (a used-up budget stands beside the pause) it
+   * only looks, and the grant stays for after renewal.
    */
-  readonly grantWaiting: () => boolean;
+  readonly grantWaiting: (take: boolean) => boolean;
   readonly sessionTarget: string | undefined;
 };
 
 const TITLE: Readonly<Record<ClosedVerdict["exitName"], string>> = {
   paused: "paused by its operator",
   disabled: "disabled by its operator",
+  crewhaus_budget: "its budget for this period is used up",
 };
 
 /**
@@ -85,22 +88,39 @@ export function loopAdmission(inputs: LoopAdmissionInputs): LoopDecision {
   if (!inputs.served || inputs.continuing) return { admit: true };
   const verdict = inputs.verdict();
   if (verdict.state === "open") return { admit: true };
-  if (verdict.code === "paused" && inputs.grantWaiting()) return { admit: true };
-  if (inputs.sessionTarget === "channel") {
-    return { admit: false, code: verdict.code, reply: verdict.notice ?? "" };
+  let code = verdict.code;
+  let exitName = verdict.exitName;
+  let notice = verdict.notice;
+  if (verdict.code === "paused") {
+    // A grant lifts a pause only. With a used-up budget beside it the code still
+    // reads `paused` (operator reasons win it), so the grant must not lift the
+    // budget too: the loop is refused for the budget, and the grant is kept.
+    const budgetHeld = verdict.reasons.some((r) => r.kind === "budget");
+    if (!budgetHeld && inputs.grantWaiting(true)) return { admit: true };
+    if (budgetHeld && inputs.grantWaiting(false)) {
+      code = "budget_exceeded";
+      exitName = "crewhaus_budget";
+      notice = BUDGET_NOTICE;
+    }
   }
-  const title = TITLE[verdict.exitName];
+  if (inputs.sessionTarget === "channel") {
+    return { admit: false, code, reply: notice ?? "" };
+  }
+  const title = TITLE[exitName];
   return {
     admit: false,
-    code: verdict.code,
+    code,
     report: {
-      class: verdict.exitName,
+      class: exitName,
       title,
-      detail: verdict.notice ?? title,
-      exitCode: EXIT_CODES[verdict.exitName],
+      detail: notice ?? title,
+      exitCode: EXIT_CODES[exitName],
     },
   };
 }
+
+/** What a budget-only refusal says (control-records' fixed budget notice). */
+const BUDGET_NOTICE = "Its budget for this period is used up; this message was not processed.";
 
 const MS_PER_DAY = 86_400_000;
 
@@ -156,7 +176,12 @@ function noUserMessageSince(sessionRoot: string, sessionId: string, parked: numb
  * after it ({@link noUserMessageSince}). A session id outside the session grammar takes
  * nothing and reads no file. A grant not taken stays unconsumed.
  */
-function takeWaitingGrant(sessionRoot: string, sessionId: string, resumeScope: string): boolean {
+function takeWaitingGrant(
+  sessionRoot: string,
+  sessionId: string,
+  resumeScope: string,
+  take = true,
+): boolean {
   if (!SESSION_ID_RE.test(sessionId)) return false;
   const now = Date.now();
   const cutoff = now - DEFAULT_TTL_DAYS * MS_PER_DAY;
@@ -173,7 +198,7 @@ function takeWaitingGrant(sessionRoot: string, sessionId: string, resumeScope: s
       return Number.isFinite(at) && at < parked;
     });
     if (!newest || !noUserMessageSince(sessionRoot, sessionId, parked)) continue;
-    grantsSpent.add(record.id);
+    if (take) grantsSpent.add(record.id);
     return true;
   }
   return false;
@@ -243,12 +268,13 @@ export function admitLoop(
     served: root !== undefined,
     continuing: ctx !== undefined && (ctx.parent !== undefined || admittedAndHeld(ctx.runId)),
     verdict: (): IntakeVerdict => (root === undefined ? { state: "open" } : intakeVerdict(root)),
-    grantWaiting: () =>
+    grantWaiting: (take) =>
       resume !== undefined &&
       takeWaitingGrant(
         sessionRoot() ?? DEFAULT_ROOT_DIR,
         resume.sessionId,
         ctx?.resumeScope ?? `session:${resume.sessionId}`,
+        take,
       ),
     sessionTarget: opts.sessionTarget,
   });

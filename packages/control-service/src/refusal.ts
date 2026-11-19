@@ -43,6 +43,7 @@ export const OUTCOME_MESSAGES: Readonly<Record<ErrorCode, string>> = Object.free
   disabled: "refused: the harness is disabled",
   unavailable: "not done: it could not be reached, try again later",
   rate_limited: "not done: too many requests, try again later",
+  budget_exceeded: "refused: the budget for this period is used up",
   internal: "not done: it stopped with an error",
 });
 

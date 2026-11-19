@@ -801,6 +801,12 @@ export type SpawnPlanInput = {
    * that started it has gone.
    */
   readonly briefFile?: string;
+  /**
+   * True when `--ignore-pause` let this start past a paused intake. The
+   * supervisor stamps it into the child's environment as one fixed boolean
+   * (recording only: the run's `run_stamp` says so; it gates nothing).
+   */
+  readonly pauseIgnored?: boolean;
   /** control.v1 bearer. Stamped into the ENV — never into argv, which every
    *  process on the machine can read. */
   readonly controlToken?: string;
@@ -871,6 +877,8 @@ export type SpawnPlan = {
   readonly controlTokenPath?: string;
   /** A run the control API started: the supervisor opens its root under this id. */
   readonly apiRun?: { readonly runId: string };
+  /** `--ignore-pause` let this start past a paused intake (see {@link SpawnPlanInput}). */
+  readonly pauseIgnored?: true;
 };
 
 /** Raised when a plan cannot be built (no bundle, no spec). Carries a
@@ -955,6 +963,7 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
     supervised: isSupervisedClass(runClass),
     ports: input.ports ?? {},
     ...(input.controlTokenPath !== undefined ? { controlTokenPath: input.controlTokenPath } : {}),
+    ...(input.pauseIgnored === true ? { pauseIgnored: true as const } : {}),
   } as const;
 
   if (runClass === "mcp-server") {

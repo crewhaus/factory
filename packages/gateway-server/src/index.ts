@@ -72,6 +72,7 @@ import {
   clientRunIdsOf,
   isManagedRunHandler,
 } from "./coded";
+import { estimateRunUsage } from "./estimate";
 
 export {
   GatewayCodedError,
@@ -458,7 +459,9 @@ export const DEFAULT_CLOSE_GRACE_MS = 10_000;
 /**
  * `data.retryAfter` (seconds), sent as `Retry-After`, on a `paused` refusal
  * whose verdict names no retry time of its own. A `disabled` refusal carries
- * none: nothing comes back by waiting.
+ * none: nothing comes back by waiting. A `budget_exceeded` refusal never takes
+ * this default: it carries the seconds until its period renews, or none (a
+ * run's own cap has no renewal to wait for).
  */
 export const PAUSED_RETRY_AFTER_SECONDS = 30;
 
@@ -472,7 +475,10 @@ function intakeClosedError(
   closed: { readonly code: string; readonly notice: string | null; readonly retryAfter?: number },
 ): ResponseEnvelopeT {
   const retryAfter =
-    closed.retryAfter ?? (closed.code === "disabled" ? undefined : PAUSED_RETRY_AFTER_SECONDS);
+    closed.retryAfter ??
+    (closed.code === "disabled" || closed.code === ErrorCode.BudgetExceeded
+      ? undefined
+      : PAUSED_RETRY_AFTER_SECONDS);
   return encodeError(
     id,
     closed.code,
@@ -483,9 +489,10 @@ function intakeClosedError(
 
 /**
  * A loop the runtime refused at its start because intake closed meanwhile: a
- * `RunFailedError` whose report class is `paused` or `disabled`. Checked by
- * shape, not `instanceof`, because a bundle can carry two copies of
- * `@crewhaus/errors`.
+ * `RunFailedError` whose report class is `paused` or `disabled`, or
+ * `crewhaus_budget` (a used-up budget period, or the run's own cap), which
+ * answers the wire code `budget_exceeded`. Checked by shape, not
+ * `instanceof`, because a bundle can carry two copies of `@crewhaus/errors`.
  */
 function intakeRefusalOf(
   err: unknown,
@@ -493,9 +500,15 @@ function intakeRefusalOf(
   const report = (err as { report?: { class?: unknown; detail?: unknown } } | null | undefined)
     ?.report;
   if (typeof report !== "object" || report === null) return undefined;
-  if (report.class !== "paused" && report.class !== "disabled") return undefined;
+  const code =
+    report.class === "crewhaus_budget"
+      ? ErrorCode.BudgetExceeded
+      : report.class === "paused" || report.class === "disabled"
+        ? report.class
+        : undefined;
+  if (code === undefined) return undefined;
   return {
-    code: report.class,
+    code,
     notice: typeof report.detail === "string" ? report.detail : null,
   };
 }
@@ -643,8 +656,6 @@ export interface GatewayServer {
     readonly peerCertSubject?: string;
   }): Promise<{ status: number; body: string }>;
 }
-
-const ZERO_USAGE: UsageDelta = { input: 0, output: 0 };
 
 export function createGatewayServer(opts: CreateGatewayServerOptions): GatewayServer {
   // Budget accounting (recorded usage + in-flight reservations) lives behind
@@ -824,9 +835,11 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
       // check-and-reserve is a single atomic store operation so concurrent
       // requests — including ones in OTHER processes sharing a durable
       // store — can't all slip past the cap.
+      // An injected estimate wins; otherwise a run request reserves its input and an
+      // output ceiling (`./estimate`), and every other method reserves nothing.
       const estimate =
         opts.estimateUsage?.({ method: decoded.method, params: decoded.params, tenant }) ??
-        ZERO_USAGE;
+        estimateRunUsage({ method: decoded.method, params: decoded.params });
       const reservation = await budget.tryReserve(tenant.id, estimate, tenant.budget);
       if (!reservation.ok) {
         throw new GatewayServerError(
@@ -1147,6 +1160,9 @@ export function statusFor(code: string): number {
  *   - a `RunFailedError` whose report class is `paused` or `disabled` (a loop
  *     the runtime refused at its start) → that code, as `handleEnvelope`
  *     answers it
+ *   - a `RunFailedError` whose report class is `crewhaus_budget` (a used-up
+ *     budget period, or the run's own cap stop) → `budget_exceeded`, with no
+ *     `retryAfter`: a run's own cap has no renewal to wait for
  *   - a `GatewayCodedError` with `input_blocked`, `unsupported`,
  *     `bad_request` or `conflict` (a managed-runs handler that recorded a
  *     refused input, a method this daemon does not serve, params it refuses,

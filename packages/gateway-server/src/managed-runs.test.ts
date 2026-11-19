@@ -1204,6 +1204,24 @@ describe("queued runs", () => {
     ]);
   });
 
+  test("a queued run whose estimate is past the tenant's remaining tokens ends crewhaus_budget, with no turn", async () => {
+    const budgetStore = new InMemoryBudgetStore();
+    const s = setup({ budgetStore });
+    // Room for the input, not for the output ceiling the run's estimate reserves.
+    await budgetStore.recordUsage("tenant-a", {
+      input: 0,
+      output: s.tenantA.budget.maxOutputTokens - 1,
+    });
+    const id = queue(s.harnessDir);
+    await s.runs.claimQueued();
+    expect(s.calls).toHaveLength(0);
+    expect(rowsOf(s.harnessDir, id).map((r) => [r["state"], r["failureClass"]])).toEqual([
+      ["queued", undefined],
+      ["running", undefined],
+      ["failed", "crewhaus_budget"],
+    ]);
+  });
+
   test("a follower of another deployment leaves it", async () => {
     const s = setup({ env: { CREWHAUS_DEPLOYMENT_ID: mintId("dep") } });
     const id = queue(s.harnessDir, { deployment: mintId("dep") });

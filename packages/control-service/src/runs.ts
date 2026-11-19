@@ -320,6 +320,21 @@ function operatorRefusal<T>(
     };
   }
   if (queue) return { paused: true };
+  // The budget alone: its own code and words, never the pause's.
+  if (intake.code === "budget_exceeded") {
+    return {
+      plan: refused(
+        "budget_exceeded",
+        "budget",
+        "This harness has used its budget for this period, so it starts nothing new until the period renews.",
+        {
+          verb: "crewhaus budget extend",
+          ...(intake.retryAfter !== undefined ? { retryAfterMs: intake.retryAfter * 1000 } : {}),
+        },
+      ),
+      paused: false,
+    };
+  }
   return {
     plan: refused("paused", "paused", "This harness is paused, so it starts nothing new.", {
       verb: "crewhaus daemon resume",

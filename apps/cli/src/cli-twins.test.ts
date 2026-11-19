@@ -374,6 +374,8 @@ describe("the server's twins, by import", () => {
         plugin: "notes-pane",
         delegationAction: "merge",
         ...INBOX,
+        usd: "50",
+        budgetReason: "planned-work",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -394,6 +396,8 @@ describe("the server's twins, by import", () => {
         plugin: "notes-pane",
         delegationAction: "rollout",
         ...INBOX,
+        usd: "12.5",
+        budgetReason: "other",
       },
     ];
     const twins = [

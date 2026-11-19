@@ -91,6 +91,19 @@ export {
   type SuspendReason,
 } from "./areas/delegation.js";
 export { AREA_MODULES } from "./areas/index.js";
+export { RUNTIME_MODULE } from "./areas/runtime.js";
+export {
+  BUDGET_CAPABILITY_KEYS,
+  BUDGET_EXTEND_REASONS,
+  BUDGET_PERIOD_EVERY,
+  type BudgetExtendAnswer,
+  type BudgetExtendReason,
+  type BudgetExtendRequest,
+  type BudgetFoldView,
+  type BudgetHistory,
+  type BudgetPeriodView,
+  type BudgetRead,
+} from "./areas/runtime-budget.js";
 export {
   AUDIENCE_BASES,
   AUDIENCE_VARIATIONS,

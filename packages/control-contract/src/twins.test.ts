@@ -67,6 +67,8 @@ const SAMPLES = [
     delegationAction: "merge",
     run: RUN,
     att: ATT,
+    usd: "50",
+    budgetReason: "planned-work",
   },
   {
     hrn: HRN,
@@ -88,6 +90,8 @@ const SAMPLES = [
     delegationAction: "rollout",
     run: RUN,
     att: ATT,
+    usd: "12.5",
+    budgetReason: "other",
   },
 ];
 
@@ -219,6 +223,8 @@ test("the placeholders, pinned, with empty flags", () => {
     "{delegationAction}",
     "{run}",
     "{att}",
+    "{usd}",
+    "{budgetReason}",
   ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
 });

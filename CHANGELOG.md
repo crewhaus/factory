@@ -832,6 +832,43 @@ these on: they reach every harness that uses what each one names.
   order. A Cloudflare Worker build does not check the order of
   `permissions.rules`, which a worker reads deny-first.
 
+- **A model with no price has an unknown cost, never $0.** Run summaries, the
+  session log's cost lines, `crewhaus cost-summary`, Home's cost views and the
+  optimizer's report count a call to a model nothing can price as unknown: a
+  total that includes one reads `+ unknown`, and `cost-summary --format json`
+  and Home's costs route carry `unpricedCalls`. Budget gates still let such a
+  call run, and a budgeted run publishes `budget_unpriced` once per model. A
+  price declared in `models.<name>.price` makes the cost known, and the
+  optimizer may never change it, `models.*.price`. The price is ignored, with
+  an `accepted-but-unwired` warning, on voice, eval, onchain and onchain-game
+  harnesses and in a Cloudflare Worker build. Home's harness signal
+  `budgetUsedRatio` is now empty unless the spec declares `budget.period`.
+
+- **Every model call in a budgeted run reserves its worst case first.** Before
+  a call is sent, its worst case (its request at about four characters a
+  token, plus its `max_tokens`) is reserved against the run's cap: it is
+  admitted while the spend so far plus the other calls in flight stays under
+  the cap, and it settles to its real cost when it answers. Sub-agents spend
+  from their parent's budget as they go, so calls made at the same time pass
+  the cap by at most one call. A call that is not admitted ends the run with
+  exit 33, as reaching the cap does, and nothing of it is logged.
+
+- **Managed tenant budgets reserve an estimate of each request instead of
+  zero.** A `runs.create` or `runs.continue` request, and a queued run,
+  reserves its input at about four characters a token plus an output ceiling
+  against the tenant's budget while it runs. One past what the tenant has left
+  is refused with 429 `budget_exceeded`, or for a queued run ends as
+  `crewhaus_budget`. A bundle that supplies its own `estimateUsage` keeps it.
+
+- **A used-up budget period closes intake until it renews.** With
+  `budget.period` declared, a period whose limit is used up writes
+  `budget-state.json` under `.crewhaus/run/control/`, and new work is refused
+  with `budget_exceeded` (exit 33), naming when the period renews and
+  `crewhaus budget extend`. `--ignore-pause`, `crewhaus daemon resume` and SLO
+  recovery never lift it, and renewal never lifts a pause. A daemon keeps
+  answering with the notice, and its refusal carries `Retry-After` until the
+  renewal.
+
 ## [0.8.3] - 2026-11-15
 
 A Cloudflare Worker built with `crewhaus compile --emit-as cf-worker` answers

@@ -1979,6 +1979,52 @@ describe("crewhaus cost-summary", () => {
     expect(out.byProvider["anthropic"]).toBe(750);
   }, 20_000);
 
+  test("a call with no price makes the total unknown, never $0; an all-priced log says nothing", async () => {
+    const priced = {
+      ts: 2,
+      version: 1,
+      kind: "cost_accrual",
+      payload: { provider: "anthropic", modelId: "claude-sonnet-4-6", costUsdMicros: 1_200_000 },
+    };
+    seedSession([
+      priced,
+      {
+        ts: 3,
+        version: 1,
+        kind: "cost_accrual",
+        payload: { provider: "openai", modelId: "qwen3", costUsdMicros: 0, unpriced: true },
+      },
+      // A sub-agent's roll-up with two unknown calls of its own.
+      {
+        ts: 4,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "openai",
+          modelId: "qwen3",
+          costUsdMicros: 0,
+          role: "subagent",
+          summary: true,
+          unpricedCalls: 2,
+        },
+      },
+    ]);
+    const json = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(JSON.parse(json.stdout).unpricedCalls).toBe(3);
+    const text = await runCli(["cost-summary", "--session", SESSION_ID], { cwd: tmp });
+    expect(text.stdout).toContain("total: $1.2000 + unknown");
+
+    seedSession([priced]);
+    const pricedJson = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect("unpricedCalls" in JSON.parse(pricedJson.stdout)).toBe(false);
+    const pricedText = await runCli(["cost-summary", "--session", SESSION_ID], { cwd: tmp });
+    expect(pricedText.stdout).not.toContain("unknown");
+  }, 20_000); // four CLI subprocesses
+
   test("still reads flat (non-enveloped) cost_accrual lines for back-compat", async () => {
     seedSession([{ kind: "cost_accrual", provider: "openai", costUsdMicros: 1000 }]);
     const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {

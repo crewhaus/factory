@@ -627,6 +627,12 @@ export type RunStampPayload = {
     readonly watchme: boolean;
     readonly runLedger: boolean;
   };
+  /**
+   * How the run got past a closed intake. Present only when an operator's
+   * `--ignore-pause` let it start while the harness was paused; a run
+   * admitted by an open intake carries no `intake` key. Recording only.
+   */
+  readonly intake?: { readonly pauseIgnored: true };
 };
 
 /** One system region of a model request, in request order. */

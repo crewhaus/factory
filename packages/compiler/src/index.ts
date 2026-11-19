@@ -177,7 +177,9 @@ import {
 // tools on the edge). Imported via the `/tool-policy` SUBPATH so this offline
 // gate never drags the loop into the compiler-worker's CF bundle.
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
+import { lowerBudgetPeriod } from "./lower/budget-period";
 import { lowerDelegation } from "./lower/delegation";
+import { lowerDeclaredPricing, lowerModelPrice, priceOverridesTable } from "./lower/model-price";
 import { lowerPlugins } from "./lower/plugins";
 import { lowerSchedule, parseDurationToMs } from "./lower/schedule";
 import { PERMISSION_RULE_NOTES } from "./permission-rules";
@@ -547,6 +549,10 @@ const compactionRows = (shape: string, detail: string): UnwiredKey[] =>
 const compactsWithDefaults = (shape: string): UnwiredKey[] =>
   compactionRows(shape, `the ${shape} loop compacts with the runtime's defaults`);
 
+/** Why a shape without the model-wiring fragment ignores a declared price. */
+const PRICE_UNWIRED =
+  "its loop does not take the model-wiring fragment, so its calls are priced with the installed table";
+
 const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArray<UnwiredKey>>>> = {
   workflow: [
     unwired("continuity", "workflow", "the generated bundle prints the ignored-note comment"),
@@ -607,8 +613,10 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
       "the managed daemon does not stamp CREWHAUS_WATCHME, so capture stays off until its loop wiring lands (design/watch-me.md §6.3)",
     ),
   ],
+  eval: [unwired("models.*.price", "eval", PRICE_UNWIRED, "0.9.0")],
   voice: [
     unwired("mcp_servers", "voice", "no MCP host is booted in the voice daemon"),
+    unwired("models.*.price", "voice", PRICE_UNWIRED, "0.9.0"),
     unwired("tools", "voice", "the realtime voice loop does not register a tool catalog"),
     unwired("tool_config", "voice", "the realtime voice loop does not register a tool catalog"),
     unwired("continuity", "voice", "the generated daemon prints the ignored-note comment"),
@@ -636,6 +644,7 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   // list registers nothing. Say so, the way voice does.
   onchain: [
     unwired("mcp_servers", "onchain", "no MCP host is booted in the onchain daemon"),
+    unwired("models.*.price", "onchain", "the onchain daemon runs no agent loop yet", "0.9.0"),
     unwired(
       "tools",
       "onchain",
@@ -653,6 +662,12 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   ],
   "onchain-game": [
     unwired("mcp_servers", "onchain-game", "no MCP host is booted in the onchain-game daemon"),
+    unwired(
+      "models.*.price",
+      "onchain-game",
+      "the onchain-game daemon runs no agent loop yet",
+      "0.9.0",
+    ),
     unwired(
       "tools",
       "onchain-game",
@@ -693,6 +708,19 @@ export function specDeclares(spec: Spec, path: string): boolean {
   const leaf = segments.pop() as string;
   let holder = spec as unknown as Record<string, unknown>;
   for (const [depth, segment] of segments.entries()) {
+    // `*` is any key or index: declared when any child declares the rest.
+    if (segment === "*") {
+      const rest = segments
+        .slice(depth + 1)
+        .concat(leaf)
+        .join(".");
+      return Object.values(holder).some(
+        (child) =>
+          typeof child === "object" &&
+          child !== null &&
+          specDeclares(child as unknown as Spec, rest),
+      );
+    }
     const ancestor = holder[segment];
     if (typeof ancestor !== "object" || ancestor === null || Array.isArray(ancestor)) return false;
     if ((ancestor as { enabled?: unknown }).enabled === false) return false;
@@ -1755,6 +1783,18 @@ const CF_WORKER_UNREAD: ReadonlyArray<CfWorkerUnread> = [
   cliUnread("plugins", "plugins", "the worker loads no plugins"),
   cliUnread("thredz", "thredz", "the worker connects to no Thredz server"),
   cliUnread("watchme", "watchme", "the worker captures no runs"),
+  {
+    shapes: ["cli", "workflow", "graph"],
+    path: "models.*.price",
+    detail: "the worker keeps no cost tracker, so nothing prices a call",
+    declaredAt: (ir) =>
+      at(
+        "models.*.price",
+        Object.values(
+          (irField(ir, "models") as Record<string, IrModelProfile> | undefined) ?? {},
+        ).some((profile) => profile.price !== undefined),
+      ),
+  },
 ];
 
 /** The settings a Cloudflare Worker build of `shape` does not read, as table rows. */
@@ -3399,7 +3439,16 @@ function lowerProfile(name: string, profile: SpecModelProfile, ctx: LowerContext
     model,
     ...(profile.tags !== undefined ? { tags: [...profile.tags] } : {}),
     ...lowerProfileFields(profile, ctx, path),
+    ...lowerModelPrice(profile.price),
   };
+  if (profile.price !== undefined && priceOverridesTable(model)) {
+    warn(
+      ctx,
+      "model-price-overrides-table",
+      `${path}.price`,
+      `${path}.price replaces the installed pricing table's price for ${model}: this harness's budgets and totals use the declared price`,
+    );
+  }
   validateModelMember(lowered, ctx, path, "profile");
   return lowered;
 }
@@ -4253,6 +4302,7 @@ type SpecWithBudget = {
       | { readonly action: "degrade"; readonly model: string };
     readonly scope?: "run" | "session";
     readonly judge_share?: number;
+    readonly period?: Parameters<typeof lowerBudgetPeriod>[0];
   };
 };
 
@@ -4280,6 +4330,7 @@ function lowerBudget(spec: SpecWithBudget, ctx: LowerContext): { budget?: IrBudg
       onExceed,
       ...(b.scope !== undefined ? { scope: b.scope } : {}),
       ...(b.judge_share !== undefined ? { judgeShare: b.judge_share } : {}),
+      ...lowerBudgetPeriod(b.period),
     },
   };
 }
@@ -6474,6 +6525,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
           ...(spec.agent.streaming !== undefined ? { streaming: spec.agent.streaming } : {}),
           ...lowerRateLimits(spec.agent.rate_limits),
           ...lowerModelFailover(spec.agent, ctx, "agent"),
+          ...lowerDeclaredPricing(ctx.registry),
           ...servingSlotFailover(agentSlot),
         },
         tools: spec.tools ?? [],
@@ -6585,6 +6637,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
             // Item 9 (G37) — per-step model routing (failover/tiers/pool),
             // reusing the cli agent block's lowering verbatim.
             ...lowerModelFailover(s, ctx, `steps[${i}]`),
+            ...lowerDeclaredPricing(ctx.registry),
             ...servingSlotFailover(slot),
           };
         }),
@@ -6632,6 +6685,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
           ...servingSlotFields(agentSlot),
           ...lowerRateLimits(spec.agent.rate_limits),
           ...lowerModelFailover(spec.agent, ctx, "agent"),
+          ...lowerDeclaredPricing(ctx.registry),
           ...servingSlotFailover(agentSlot),
         },
         tools: spec.agent.tools ?? [],
@@ -6751,6 +6805,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
             // 0.6.0 §7.7 — per-node model routing (graph nodes carried none
             // before), the cli agent block's lowering verbatim.
             ...lowerModelFailover(node, ctx, `nodes.${name}`),
+            ...lowerDeclaredPricing(ctx.registry),
             ...servingSlotFailover(slot),
             ...(node.hitl !== undefined ? { hitlPrompt: node.hitl.prompt } : {}),
           };
@@ -6815,6 +6870,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
           ...servingSlotFields(agentSlot),
           ...lowerRateLimits(spec.agent.rate_limits),
           ...lowerModelFailover(spec.agent, ctx, "agent"),
+          ...lowerDeclaredPricing(ctx.registry),
           ...servingSlotFailover(agentSlot),
         },
         tenants: spec.tenants.map((t) => ({
@@ -6880,6 +6936,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
           ...servingSlotFields(agentSlot),
           // Adaptive model routing — lowers model_pool when declared.
           ...lowerModelFailover(spec.agent, ctx, "agent"),
+          ...lowerDeclaredPricing(ctx.registry),
         },
         retrieve: {
           embedderModel: spec.retrieve.embedderModel,
@@ -7008,6 +7065,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
           ...servingSlotFields(agentSlot),
           // Adaptive model routing — lowers model_pool when declared.
           ...lowerModelFailover(spec.agent, ctx, "agent"),
+          ...lowerDeclaredPricing(ctx.registry),
         },
         goal: spec.goal,
         branchingFactor: spec.branchingFactor,
@@ -7053,6 +7111,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
           ...servingSlotFields(agentSlot),
           // Adaptive model routing — lowers model_pool when declared.
           ...lowerModelFailover(spec.agent, ctx, "agent"),
+          ...lowerDeclaredPricing(ctx.registry),
         },
         queue: {
           adapter: spec.queue.adapter,
@@ -7134,6 +7193,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
           ...servingSlotFields(agentSlot),
           // Adaptive model routing — lowers model_pool when declared.
           ...lowerModelFailover(spec.agent, ctx, "agent"),
+          ...lowerDeclaredPricing(ctx.registry),
         },
         driver: {
           backend: spec.driver.backend,
@@ -7342,6 +7402,7 @@ function lowerCrewRole(
     // Item 9 (G37) — per-role model routing (failover/tiers/pool), reusing the
     // cli agent block's lowering verbatim.
     ...lowerModelFailover(role, ctx, path),
+    ...lowerDeclaredPricing(ctx.registry),
     ...servingSlotFailover(slot),
   };
 }

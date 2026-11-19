@@ -2,7 +2,8 @@
  * How a control-plane refusal ends a CLI process: the band 50-56 of
  * `@crewhaus/errors`' `EXIT_CODES`. This entry imports no package, so the numbers
  * are written here and a test in the control service holds them to that table.
- * `disabled` and `paused` end with 38 and 39, the operator-state codes.
+ * `disabled` and `paused` end with 38 and 39, the operator-state codes, and
+ * `budget_exceeded` with 33, the budget-cap code.
  */
 import type { ErrorCode } from "./errors.js";
 import { deepFreeze } from "./util.js";
@@ -25,6 +26,7 @@ export const EXIT_FOR_ERROR: Readonly<Record<ErrorCode, number>> = deepFreeze({
   not_found: 56,
   disabled: 38,
   paused: 39,
+  budget_exceeded: 33,
   internal: 1,
 });
 

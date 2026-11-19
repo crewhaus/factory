@@ -9,6 +9,7 @@ import { DEFER_REASONS, OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
 import { DELEGATION_ACTIONS } from "./areas/delegation.js";
 import { PLUGIN_NAME_RE } from "./areas/integrations.js";
 import { PERSON_CHANGE_REASONS } from "./areas/quality.js";
+import { BUDGET_EXTEND_REASONS } from "./areas/runtime-budget.js";
 import type { CliTwin } from "./areas/types.js";
 import { APPROVAL_ID_RE, CANONICAL_RUN_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
 import { deepFreeze } from "./util.js";
@@ -43,6 +44,7 @@ export const CLI_VERBS = deepFreeze({
   plugins: ["grants", "revoke"],
   delegations: ["list", "show", "preview", "propose", "pause", "revoke", "apply"],
   inbox: ["list", "show", "stats"],
+  budget: ["show", "history", "extend"],
 } as const);
 
 /**
@@ -58,7 +60,8 @@ export const CLI_VERBS = deepFreeze({
  * record's id, `{rev}` a content revision (`sha256:` and 64 hex), `{changeReason}`
  * a reason a person may give to decline or withdraw a change, `{dataset}` a
  * dataset name, `{fraction}` a holdout share above 0 and at most 0.5, and
- * `{evalRun}` an eval run's id.
+ * `{evalRun}` an eval run's id. `{usd}` is a raise in dollars, and `{budgetReason}`
+ * one of the reasons a person may give for it.
  *
  * `{grt}`, `{inv}`, `{crd}` and `{lnk}` are a grant's, an invite's, a token's and a
  * link's ids, and `{cmd}` a command receipt's, each its own id grammar. `{until}` is an
@@ -104,6 +107,9 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{delegationAction}": new RegExp(`^(?:${DELEGATION_ACTIONS.join("|")})$`),
   "{run}": CANONICAL_RUN_ID_RE,
   "{att}": ATTENTION_ID_RE,
+  // A raise in dollars: a positive amount with at most two decimals, never a flag.
+  "{usd}": /^(?:0|[1-9][0-9]{0,6})(?:\.[0-9]{1,2})?$/,
+  "{budgetReason}": new RegExp(`^(?:${BUDGET_EXTEND_REASONS.join("|")})$`),
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

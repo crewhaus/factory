@@ -427,6 +427,12 @@ export const DEFAULT_PUMP_INTERVAL_MS = 250;
 export const DEPLOYMENT_ID_ENV = "CREWHAUS_DEPLOYMENT_ID";
 /** The active deployment's spec revision, stamped beside it. */
 export const SPEC_HASH_ENV = "CREWHAUS_SPEC_HASH";
+/**
+ * Set to `"1"` when `--ignore-pause` let the start past a paused intake, from
+ * the plan alone (runtime-core's `INTAKE_PAUSE_IGNORED_ENV` names the same
+ * variable; the run's `run_stamp` records it).
+ */
+export const INTAKE_PAUSE_IGNORED_ENV = "CREWHAUS_INTAKE_PAUSE_IGNORED";
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -937,6 +943,8 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     const stamped: Record<string, string> = { ...plan.env };
     Reflect.deleteProperty(stamped, DEPLOYMENT_ID_ENV);
     Reflect.deleteProperty(stamped, SPEC_HASH_ENV);
+    Reflect.deleteProperty(stamped, INTAKE_PAUSE_IGNORED_ENV);
+    if (plan.pauseIgnored === true) stamped[INTAKE_PAUSE_IGNORED_ENV] = "1";
     if (deployment !== undefined) {
       stamped[DEPLOYMENT_ID_ENV] = deployment.id;
       if (deployment.specHash !== undefined) stamped[SPEC_HASH_ENV] = deployment.specHash;

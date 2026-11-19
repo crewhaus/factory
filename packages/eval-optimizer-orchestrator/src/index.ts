@@ -33,6 +33,7 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import type { SpendLedgerPort } from "@crewhaus/cost-tracker/spend";
 import { CrewhausError } from "@crewhaus/errors";
 import type { Sample } from "@crewhaus/eval-dataset";
 import {
@@ -55,12 +56,7 @@ import {
 } from "@crewhaus/spec-patch";
 import { commitSpec, parseYamlOnly, specRev } from "@crewhaus/spec-patch/commit";
 import type { CostAccrualEvent, ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
-import {
-  BudgetMeter,
-  type SpendSummary,
-  type StoppedReason,
-  actualCallMicros,
-} from "./budget-gate";
+import { BudgetMeter, type SpendSummary, type StoppedReason } from "./budget-gate";
 import { formatStageNames, listOptimizableStages } from "./stages";
 
 export class OptimizeSpecError extends CrewhausError {
@@ -138,6 +134,14 @@ export type OptimizeSpecOptions = {
    * in unit tests.
    */
   readonly traceBus?: TraceEventBus;
+  /**
+   * The harness's budget period ledger, when its spec declares
+   * `budget.period` (`@crewhaus/control-records/budget` opens it with
+   * trigger `optimize`). Each mutation call reserves its worst case there
+   * before it is issued and settles its real cost after; a used-up period
+   * stops the search as `--budget-usd` does. Absent: no period.
+   */
+  readonly spendLedger?: SpendLedgerPort;
   /**
    * D43 — declared numeric dials the search may step alongside the
    * instruction rewrite. Each `path` must be in this target's
@@ -377,9 +381,17 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
   let stoppedEarly = false;
   const gatedMutator: MutationProvider | undefined =
     opts.mutator !== undefined
-      ? wrapWithBudgetGate(opts.mutator, meter, opts.traceBus, modelInfo, runId, () => {
-          stoppedEarly = true;
-        })
+      ? wrapWithBudgetGate(
+          opts.mutator,
+          meter,
+          opts.traceBus,
+          modelInfo,
+          runId,
+          () => {
+            stoppedEarly = true;
+          },
+          opts.spendLedger,
+        )
       : undefined;
 
   const result = await optimize(basePrompt, {
@@ -423,6 +435,7 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
       cachedReadTokens: 0,
       costUsdMicros: spend.totalUsdMicros,
       summary: true,
+      ...(spend.unpricedCalls !== undefined ? { unpricedCalls: spend.unpricedCalls } : {}),
     };
     opts.traceBus.publish(totalAccrual);
   }
@@ -664,6 +677,7 @@ function wrapWithBudgetGate(
   modelInfo: { provider: ProviderId; modelId: string },
   runId: string,
   onStop: () => void,
+  ledger: SpendLedgerPort | undefined,
 ): MutationProvider {
   let tripped = false;
   return {
@@ -686,35 +700,65 @@ function wrapWithBudgetGate(
         // never issued, so no spend is incurred for this iteration.
         return { prompt: state.best.prompt, mutations: [] };
       }
-      const mutation = await base.next(state);
-      if (mutation.usage !== undefined) {
-        meter.record(state.iteration, mutation.usage);
-        if (traceBus !== undefined) {
-          const accrual: CostAccrualEvent = {
-            ...traceBus.envelope(),
-            runId,
-            kind: "cost_accrual",
-            provider: modelInfo.provider,
-            modelId: modelInfo.modelId,
-            inputTokens: mutation.usage.input,
-            outputTokens: mutation.usage.output,
-            cachedReadTokens: mutation.usage.cacheRead ?? 0,
-            costUsdMicros: actualCallMicrosFor(mutation.usage, modelInfo),
-          };
-          traceBus.publish(accrual);
+      // The harness's budget period, when one is declared: the call reserves
+      // its worst case there first, exactly as a run's model calls do.
+      const reservation = `rsv_${runId}_${state.iteration}`;
+      if (ledger !== undefined) {
+        const estimate = meter.estimate(inputChars);
+        if (estimate !== undefined) {
+          for (;;) {
+            const answer = await ledger.reserve({
+              id: reservation,
+              usdMicros: estimate,
+              meta: { run: runId, model: modelInfo.modelId },
+            });
+            if (answer.admit) break;
+            if (answer.on === "others") {
+              await answer.settled;
+              continue;
+            }
+            tripped = true;
+            onStop();
+            return { prompt: state.best.prompt, mutations: [] };
+          }
         }
+      }
+      let mutation: ProviderMutation;
+      try {
+        mutation = await base.next(state);
+      } catch (err) {
+        await ledger?.release(reservation);
+        throw err;
+      }
+      if (mutation.usage === undefined) {
+        await ledger?.release(reservation);
+        return mutation;
+      }
+      const micros = meter.record(state.iteration, mutation.usage);
+      await ledger?.settle({
+        id: reservation,
+        usdMicros: micros ?? null,
+        meta: { run: runId, model: modelInfo.modelId },
+      });
+      if (traceBus !== undefined) {
+        const accrual: CostAccrualEvent = {
+          ...traceBus.envelope(),
+          runId,
+          kind: "cost_accrual",
+          provider: modelInfo.provider,
+          modelId: modelInfo.modelId,
+          inputTokens: mutation.usage.input,
+          outputTokens: mutation.usage.output,
+          cachedReadTokens: mutation.usage.cacheRead ?? 0,
+          // An unknown cost is flagged, with 0 only as a placeholder.
+          costUsdMicros: micros ?? 0,
+          ...(micros === undefined ? { unpriced: true } : {}),
+        };
+        traceBus.publish(accrual);
       }
       return mutation;
     },
   };
-}
-
-/** Price one call's usage for the trace-bus event (mirrors the meter's math). */
-function actualCallMicrosFor(
-  usage: { input: number; output: number; cacheRead?: number },
-  modelInfo: { provider: ProviderId; modelId: string },
-): number {
-  return actualCallMicros(usage, modelInfo.provider, modelInfo.modelId);
 }
 
 // Re-export the spec-patch types so callers don't need a second import.

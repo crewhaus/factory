@@ -38,6 +38,7 @@ import type { EffectiveParams } from "@crewhaus/adapter-anthropic";
 import type {
   CapabilityRequirement,
   CapabilityTable,
+  DeclaredPricing,
   PricingTable,
   SunsetEntry,
   SunsetTable,
@@ -611,6 +612,11 @@ export type ParamProjection = (input: {
 
 export type AuditModelSlotsOptions = {
   readonly pricing?: PricingTable;
+  /**
+   * The spec's own prices (`models.<name>.price`), by model string. A slot
+   * whose model has one passes the pricing check, labelled "declared".
+   */
+  readonly declared?: DeclaredPricing;
   readonly capabilities?: CapabilityTable;
   readonly sunsets?: SunsetTable;
   /** The clock the sunset check reads (`--today`). Default: now. */
@@ -632,6 +638,26 @@ function requirementOf(slot: EnumeratedModelSlot): CapabilityRequirement | undef
 }
 
 /**
+ * The spec's declared prices, read off whichever model-wiring block carries
+ * them (every block carries the same record): `undefined` when none is declared.
+ */
+export function declaredPricingOfIr(ir: IrNode): DeclaredPricing | undefined {
+  const blocks: unknown[] = [];
+  const node = ir as unknown as Record<string, unknown>;
+  blocks.push(node["agent"]);
+  if (Array.isArray(node["steps"])) blocks.push(...node["steps"]);
+  for (const key of ["nodes", "roles"]) {
+    const map = node[key];
+    if (typeof map === "object" && map !== null) blocks.push(...Object.values(map));
+  }
+  for (const block of blocks) {
+    const declared = (block as { declaredPricing?: DeclaredPricing } | undefined)?.declaredPricing;
+    if (declared !== undefined) return declared;
+  }
+  return undefined;
+}
+
+/**
  * The whole audit, per slot: pricing coverage, `requires:` against the
  * capability table, per-(provider, knob) parameter acceptance, and the
  * sunset watch. Pure; the caller supplies tables, clock and projector.
@@ -647,36 +673,52 @@ export function auditModelSlots(
   const out: ModelAuditFinding[] = [];
 
   for (const slot of slots) {
-    const parsed = parsedModelForTables(slot.model);
-    if (parsed === undefined) {
-      out.push({
-        slot: slot.label,
-        model: slot.model,
-        kind: "pricing",
-        severity: "warn",
-        detail:
-          "routed to a provider outside the pricing/capability tables (local, azure, a named host, or unparseable) — cost tracking reports $0 and every capability is unknown; declare `capabilities:` on the profile to state what the model can do",
-      });
-      continue;
-    }
-    // --- pricing coverage
-    const row = resolvePricing(pricing, parsed.provider, parsed.modelId);
-    out.push(
-      row === undefined
-        ? {
-            slot: slot.label,
-            model: slot.model,
-            kind: "pricing",
-            severity: "fail",
-            detail: `no pricing row for ${parsed.provider}/${parsed.modelId} — cost-tracker silently bills it $0, so every budget, reward and cost report understates this arm`,
-          }
+    // A price the spec declares for this model is the one every run uses.
+    const declared = opts.declared?.[slot.model];
+    const declaredFinding: ModelAuditFinding | undefined =
+      declared === undefined
+        ? undefined
         : {
             slot: slot.label,
             model: slot.model,
             kind: "pricing",
             severity: "pass",
-            detail: `$${row.inputPer1M}/1M in, $${row.outputPer1M}/1M out`,
-          },
+            detail: `declared: $${declared.inputPer1M}/1M in, $${declared.outputPer1M}/1M out (models.<name>.price)`,
+          };
+    const parsed = parsedModelForTables(slot.model);
+    if (parsed === undefined) {
+      out.push(
+        declaredFinding ?? {
+          slot: slot.label,
+          model: slot.model,
+          kind: "pricing",
+          severity: "warn",
+          detail:
+            "routed to a provider outside the pricing/capability tables (local, azure, a named host, or unparseable) — its cost is unknown, never $0: add a price with `models.<name>.price`; every capability is unknown too, so declare `capabilities:` on the profile to state what the model can do",
+        },
+      );
+      continue;
+    }
+    // --- pricing coverage
+    const row = resolvePricing(pricing, parsed.provider, parsed.modelId);
+    out.push(
+      declaredFinding !== undefined
+        ? declaredFinding
+        : row === undefined
+          ? {
+              slot: slot.label,
+              model: slot.model,
+              kind: "pricing",
+              severity: "fail",
+              detail: `no pricing row for ${parsed.provider}/${parsed.modelId} — its cost is unknown, so every budget, reward and cost report says "unknown" for this arm; add a price with models.<name>.price`,
+            }
+          : {
+              slot: slot.label,
+              model: slot.model,
+              kind: "pricing",
+              severity: "pass",
+              detail: `$${row.inputPer1M}/1M in, $${row.outputPer1M}/1M out`,
+            },
     );
 
     // --- declared `requires:` against the capability table

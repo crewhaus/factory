@@ -207,17 +207,37 @@ function harnessName(harnessDir: string): string {
   return basename(resolve(harnessDir));
 }
 
+/** A renewal instant as a person reads it: `1 Dec 2026`, in UTC. */
+function renewalDate(renewsAt: string | undefined): string | undefined {
+  const at = renewsAt === undefined ? Number.NaN : Date.parse(renewsAt);
+  if (!Number.isFinite(at)) return undefined;
+  return new Date(at).toLocaleDateString("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+}
+
 /**
- * The one line a refused entry point prints.
+ * The one line a refused entry point prints. A used-up budget names when its
+ * period renews (`renewsAt`) and the verb that raises it.
  *
  * First consumers: {@link gateEntryPoint} and `crewhaus daemon submit`.
  */
 export function entryRefusalLine(
   name: string,
-  reason: "disabled" | "paused" | "unreadable",
+  reason: Extract<RunnableVerdict, { ok: false }>["reason"],
   harnessDir: string,
+  renewsAt?: string,
 ): string {
   switch (reason) {
+    case "budget": {
+      const when = renewalDate(renewsAt);
+      return `${name} has used its budget for this period, so this doesn't run${
+        when !== undefined ? ` until it renews on ${when}` : ""
+      }. \`crewhaus budget extend --usd <amount> --reason <code>\` raises the limit.`;
+    }
     case "disabled":
       return `${name} is disabled by its operator, so this doesn't run. \`crewhaus daemon enable\` allows it again.`;
     case "paused":
@@ -306,12 +326,20 @@ function specDirsOf(subcommand: string, rest: readonly string[], cwd: string): r
   return dirs;
 }
 
+/** Which refusal decides between directories: the higher rank. */
+const RANK: Readonly<Record<Extract<RunnableVerdict, { ok: false }>["exitName"], number>> = {
+  paused: 0,
+  budget_exceeded: 1,
+  disabled: 2,
+};
+
 /**
  * Refuse this invocation when the harness's operator record says so: print the line and
- * exit 38 (disabled) or 39 (paused). The working directory's record and the record of
+ * exit 38 (disabled), 33 (its budget period is used up) or 39 (paused). The working directory's record and the record of
  * each other directory holding a spec the verb runs are all checked; the stricter verdict
  * decides. A run `--ignore-pause` let through prints a notice and goes
- * on. Returns when it may run.
+ * on. Returns when it may run, saying whether `--ignore-pause` let it past a
+ * paused intake (the caller records that on the run's `run_stamp`).
  *
  * First consumer: the dispatch in `index.ts`.
  */
@@ -323,9 +351,9 @@ export function gateEntryPoint(
     readonly write: (line: string) => void;
     readonly exit: (code: number) => void;
   },
-): void {
+): { readonly pauseIgnored: boolean } {
   const decided = decide(subcommand, rest, io.cwd);
-  if (decided === undefined) return;
+  if (decided === undefined) return { pauseIgnored: false };
   const dirs = [io.cwd, ...specDirsOf(subcommand, rest, io.cwd)];
   let refused:
     | { readonly dir: string; readonly verdict: RunnableVerdict & { ok: false } }
@@ -340,18 +368,19 @@ export function gateEntryPoint(
       if (verdict.pauseIgnored === true) pauseIgnored = true;
       continue;
     }
-    // A disable outranks a pause; between equals the first (the working directory) stands.
-    if (
-      refused === undefined ||
-      (refused.verdict.exitName === "paused" && verdict.exitName === "disabled")
-    ) {
+    // A disable outranks a used-up budget, which outranks a pause; between equals the
+    // first (the working directory) stands.
+    if (refused === undefined || RANK[verdict.exitName] > RANK[refused.verdict.exitName]) {
       refused = { dir, verdict };
     }
   }
   if (refused === undefined) {
     if (pauseIgnored) io.write(`${IGNORE_PAUSE_NOTICE}\n`);
-    return;
+    return { pauseIgnored };
   }
-  io.write(`${entryRefusalLine(harnessName(refused.dir), refused.verdict.reason, refused.dir)}\n`);
+  io.write(
+    `${entryRefusalLine(harnessName(refused.dir), refused.verdict.reason, refused.dir, refused.verdict.renewsAt)}\n`,
+  );
   io.exit(EXIT_FOR_ERROR[refused.verdict.exitName]);
+  return { pauseIgnored: false };
 }

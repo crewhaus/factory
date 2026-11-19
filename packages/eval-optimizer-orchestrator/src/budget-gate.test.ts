@@ -23,9 +23,9 @@ describe("estimateCallMicros", () => {
     expect(micros).toBe(600);
   });
 
-  test("returns 0 for an unknown model id (cannot price → do not block)", () => {
+  test("an unknown model id has an unknown estimate, not $0", () => {
     const micros = estimateCallMicros(100000, 800, 2048, "anthropic", "no-such-model-9");
-    expect(micros).toBe(0);
+    expect(micros).toBeUndefined();
   });
 });
 
@@ -42,9 +42,9 @@ describe("actualCallMicros", () => {
     expect(micros).toBe(3000);
   });
 
-  test("returns 0 for an unknown model id", () => {
+  test("an unknown model id has an unknown cost, not $0", () => {
     const micros = actualCallMicros({ input: 9999, output: 9999 }, "anthropic", "__rule-based__");
-    expect(micros).toBe(0);
+    expect(micros).toBeUndefined();
   });
 });
 
@@ -87,12 +87,22 @@ describe("BudgetMeter", () => {
     expect(meter.wouldExceed(4000)).toBe(true);
   });
 
-  test("an unpriceable placeholder model never trips even with a tiny budget", () => {
+  test("an unpriced model never trips the gate, and the summary says its cost is unknown", () => {
     // Mirrors the rule-based path: resolveMutatorModel returns "__rule-based__".
     const meter = new BudgetMeter(1, "anthropic", "__rule-based__", 2048, 0);
+    expect(meter.estimate(1_000_000)).toBeUndefined();
     expect(meter.wouldExceed(1_000_000)).toBe(false);
-    meter.record(1, { input: 1_000_000, output: 1_000_000 });
+    expect(meter.record(1, { input: 1_000_000, output: 1_000_000 })).toBeUndefined();
     expect(meter.spentMicros).toBe(0);
-    expect(meter.summary("iterations-cap").totalUsd).toBe("$0.0000");
+    const summary = meter.summary("iterations-cap");
+    expect(summary.totalUsd).toBe("$0.0000 + unknown");
+    expect(summary.unpricedCalls).toBe(1);
+    expect(summary.perIteration[0]?.unpriced).toBe(true);
+    // A meter that recorded nothing has no unknown part.
+    const quiet = new BudgetMeter(1, "anthropic", "__rule-based__", 2048, 0).summary(
+      "iterations-cap",
+    );
+    expect(quiet.totalUsd).toBe("$0.0000");
+    expect("unpricedCalls" in quiet).toBe(false);
   });
 });

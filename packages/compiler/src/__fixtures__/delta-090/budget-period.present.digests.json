@@ -1,0 +1,17 @@
+{
+  "channel-period": {
+    "agent.ts": "bfb0bb407a5a775a38d2458aeb916e93f03494e45612d296774c75ae02744663",
+    "session-router.ts": "d712670e1b9f733c5194a0bde65d6f5ca1d97e9779949a9221dd957a39a793d9",
+    "gateway.ts": "9c1ddd78ed9d5538bab1a64430931da42138c2b2bbcd07d54b7e15f3bb89e379",
+    "daemon.ts": "c5d38293807f09c9a8778f374f641c19312ca4cdc13064337ae59307cb09bbe7",
+    "README.md": "5e4ef406ed614d645422bf50c0cb484b5b3a6b48439be80be60df3d662b7e04f"
+  },
+  "cli-period": {
+    "agent.ts": "5713ac6aa28812ecf04b3ee33947dbbe7e73b5faf8d1e0ed7b4e2237409cce1b",
+    "README.md": "90a1da88dc7a62c525ee8d2e94852a3183a256cd64dd1643210867ce6f937f2c"
+  },
+  "workflow-period": {
+    "agent.ts": "d0ff6c945b5742340e62b6f8bf4874f22c4779692f014fb04dd39d049355074c",
+    "README.md": "b1c80e63f4c6480c0598179bcb194f2f068dfb751286a771df00f532f9d5c419"
+  }
+}

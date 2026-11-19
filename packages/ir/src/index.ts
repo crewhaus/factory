@@ -3,7 +3,9 @@
  * In the slice, IR shape mirrors the spec; later passes (ir-passes module)
  * will perform optimization and target-specific lowering.
  */
+import type { IrBudgetPeriod } from "./budget-period";
 import type { IrDelegationCeiling } from "./delegation";
+import type { IrDeclaredPricing, IrModelPrice } from "./model-price";
 import type { IrPluginEntry } from "./plugins";
 import type { IrScheduleLane } from "./schedule-lanes";
 
@@ -348,6 +350,8 @@ export type IrModelProfile = {
   readonly capabilities?: IrModelCapabilities;
   readonly fallbacks?: readonly string[];
   readonly circuitBreaker?: IrCircuitBreaker;
+  /** The profile's declared price (`price`), only when declared. Never on a candidate or a slot. */
+  readonly price?: IrModelPrice;
 };
 
 /**
@@ -368,7 +372,7 @@ export type IrModelProfiles = Readonly<Record<string, IrModelProfile>>;
  * FIRST and spreads every 0.6.0 key after them, so `JSON.stringify` of a
  * plain candidate is byte-identical to 0.5.x (the key-order guard).
  */
-export type IrModelPoolCandidate = IrModelProfile & {
+export type IrModelPoolCandidate = Omit<IrModelProfile, "price"> & {
   readonly tags: readonly string[];
   readonly enabled?: false;
 };
@@ -681,6 +685,8 @@ export type IrBudget = {
       };
   readonly scope?: "run" | "session";
   readonly judgeShare?: number;
+  /** `budget.period`: the harness-wide limit per period, only when declared. */
+  readonly period?: IrBudgetPeriod;
 };
 
 /**
@@ -1465,6 +1471,8 @@ export type IrV0 = {
     readonly modelTiers?: IrModelTiers;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** Every declared model price, keyed by model string (only when one is declared). */
+    readonly declaredPricing?: IrDeclaredPricing;
     /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
      *  Absent unless the slot was declared as a `$profile` reference. */
     readonly modelProfile?: string;
@@ -1575,6 +1583,8 @@ export type IrWorkflowStep = {
    *  PolicyRouter decides per step against the shared routing-store
    *  scoreboard). Absent → single-model. */
   readonly modelPool?: IrModelPool;
+  /** Every declared model price, keyed by model string (only when one is declared). */
+  readonly declaredPricing?: IrDeclaredPricing;
   /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
   readonly modelProfile?: string;
   /** 0.6.0 §4.1 — sampling temperature (spec `steps[].temperature`, or the
@@ -1881,6 +1891,8 @@ export type IrChannelV0 = {
     readonly modelTiers?: IrModelTiers;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** Every declared model price, keyed by model string (only when one is declared). */
+    readonly declaredPricing?: IrDeclaredPricing;
     /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
      *  Absent unless the slot was declared as a `$profile` reference. */
     readonly modelProfile?: string;
@@ -1998,6 +2010,8 @@ export type IrManagedV0 = {
     readonly modelTiers?: IrModelTiers;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** Every declared model price, keyed by model string (only when one is declared). */
+    readonly declaredPricing?: IrDeclaredPricing;
     /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
      *  Absent unless the slot was declared as a `$profile` reference. */
     readonly modelProfile?: string;
@@ -2095,6 +2109,8 @@ export type IrGraphNode = {
   readonly circuitBreaker?: IrCircuitBreaker;
   readonly modelTiers?: IrModelTiers;
   readonly modelPool?: IrModelPool;
+  /** Every declared model price, keyed by model string (only when one is declared). */
+  readonly declaredPricing?: IrDeclaredPricing;
   /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
   readonly modelProfile?: string;
   /** 0.6.0 §4.1 — sampling temperature (spec `nodes.<n>.temperature`, or the
@@ -2220,6 +2236,8 @@ export type IrPipelineV0 = {
     readonly instructions: string;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** Every declared model price, keyed by model string (only when one is declared). */
+    readonly declaredPricing?: IrDeclaredPricing;
     /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
      *  Absent unless the slot was declared as a `$profile` reference. */
     readonly modelProfile?: string;
@@ -2297,6 +2315,8 @@ export type IrCrewRole = {
    *  compiler leaves `scope` unstamped so pre-0.6.0 pooled roles stay
    *  byte-identical). */
   readonly modelPool?: IrModelPool;
+  /** Every declared model price, keyed by model string (only when one is declared). */
+  readonly declaredPricing?: IrDeclaredPricing;
   /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from. */
   readonly modelProfile?: string;
   /** 0.6.0 §4.1 — sampling temperature (spec `roles.<r>.temperature`, or the
@@ -2414,6 +2434,8 @@ export type IrResearchV0 = {
     readonly maxTokens?: number;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** Every declared model price, keyed by model string (only when one is declared). */
+    readonly declaredPricing?: IrDeclaredPricing;
     /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
      *  Absent unless the slot was declared as a `$profile` reference. */
     readonly modelProfile?: string;
@@ -2497,6 +2519,8 @@ export type IrBatchV0 = {
     readonly maxTokens?: number;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** Every declared model price, keyed by model string (only when one is declared). */
+    readonly declaredPricing?: IrDeclaredPricing;
     /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
      *  Absent unless the slot was declared as a `$profile` reference. */
     readonly modelProfile?: string;
@@ -2621,6 +2645,8 @@ export type IrBrowserV0 = {
     readonly maxTokens?: number;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
+    /** Every declared model price, keyed by model string (only when one is declared). */
+    readonly declaredPricing?: IrDeclaredPricing;
     /** 0.6.0 §4.2 — provenance: the `models:` profile `model` resolved from.
      *  Absent unless the slot was declared as a `$profile` reference. */
     readonly modelProfile?: string;
@@ -2867,6 +2893,11 @@ export type Bundle = {
     readonly content: string;
   }>;
 };
+
+// Declared model prices (#514). See ./model-price.ts.
+export type { IrDeclaredPricing, IrModelPrice } from "./model-price";
+// Budget periods (#514). See ./budget-period.ts.
+export type { IrBudgetPeriod } from "./budget-period";
 
 // Named schedule lanes (#514). See ./schedule-lanes.ts.
 export type { IrScheduleLane } from "./schedule-lanes";

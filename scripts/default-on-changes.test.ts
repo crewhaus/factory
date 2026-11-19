@@ -6543,3 +6543,102 @@ describe("the permission rule-order check does a bounded amount of work", () => 
     expect(bullets.length).toBe(1);
   }, 20_000); // 1,000 rules: CI runners are slower on allocation-heavy work
 });
+
+describe("0.9.0 — spend is never a guessed $0", () => {
+  const later = (): readonly string[] => defaultOnBullets(changelog, LATER_HEADINGS);
+
+  test("an unpriced response is an unknown call, budget_unpriced has one publish site, and a bullet names both", async () => {
+    const { TraceEventBus } = await import("../packages/trace-event-bus/src/index");
+    const { createCostTracker } = await import("../packages/cost-tracker/src/index");
+    const bus = new TraceEventBus({ runId: "run_unpriced", sessionId: "sess_unpriced" });
+    const tracker = createCostTracker(bus, { suppressEvents: true });
+    bus.publish({
+      ...bus.envelope(),
+      kind: "model_response",
+      model: "no-such-model",
+      provider: "openai",
+      usage: { input: 10, output: 5 },
+      stopReason: "end_turn",
+      durationMs: 1,
+    } as never);
+    expect(tracker.getRunCost("run_unpriced").unpricedCalls).toBe(1);
+    tracker.unsubscribe();
+    // One publish site in runtime-core.
+    const dir = join(ROOT, "packages", "runtime-core", "src");
+    const sites = readdirSync(dir)
+      .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))
+      .flatMap((f) => [...readFileSync(join(dir, f), "utf8").matchAll(/kind: "budget_unpriced"/g)]);
+    expect(sites).toHaveLength(1);
+    expect(
+      later().some(
+        (b) =>
+          b.includes("`budget_unpriced`") &&
+          b.includes("`+ unknown`") &&
+          b.includes("`models.*.price`"),
+      ),
+    ).toBe(true);
+  });
+
+  test("two reservations against a cap one fits admit one, the stream call reserves first, and a bullet says so", async () => {
+    const { createSpendMeter } = await import("../packages/cost-tracker/src/spend");
+    const { DEFAULT_PRICING } = await import("../packages/cost-tracker/src/index");
+    const meter = createSpendMeter({ capMicros: 100, pricing: DEFAULT_PRICING });
+    // Each call's worst case is the whole cap: the first is admitted, the second waits on it.
+    const a = await meter.reserve("a", 100);
+    const b = await meter.reserve("b", 100);
+    expect([a.admit, b.admit]).toEqual([true, false]);
+    // The reservation sits before the stream call in the loop.
+    const loop = readFileSync(join(ROOT, "packages", "runtime-core", "src", "index.ts"), "utf8");
+    const reserve = loop.indexOf("await reserveModelCall(");
+    const stream = loop.indexOf("const reqStream = turnAdapter.stream(req);");
+    expect(reserve).toBeGreaterThan(-1);
+    expect(stream).toBeGreaterThan(reserve);
+    expect(later().some((b) => b.includes("reserves its worst case first"))).toBe(true);
+  });
+
+  test("managed tenant budgets reserve an estimate, and a bullet names `estimateUsage`", () => {
+    const source = readFileSync(
+      join(ROOT, "packages", "gateway-server", "src", "managed-runs.ts"),
+      "utf8",
+    );
+    expect(source).toContain("export const estimateUsage");
+    expect(source).toContain("tryReserve(tenant.id, estimate, tenant.budget)");
+    expect(later().some((b) => b.includes("`estimateUsage`") && b.includes("instead of"))).toBe(
+      true,
+    );
+  });
+
+  test("an exhausted budget period closes intake with budget_exceeded, and a bullet says what never lifts it", async () => {
+    const { intakeVerdict } = await import("../packages/control-records/src/index");
+    const harness = mkdtempSync(join(tmpdir(), "default-on-budget-"));
+    try {
+      const control = join(harness, ".crewhaus", "run", "control");
+      mkdirSync(control, { recursive: true });
+      writeFileSync(
+        join(control, "budget-state.json"),
+        `${JSON.stringify({
+          v: 1,
+          periodId: "month-2026-11-01",
+          exhaustedAt: "2026-11-18T00:00:00.000Z",
+          renewsAt: new Date(Date.now() + 3_600_000).toISOString(),
+        })}\n`,
+      );
+      const verdict = intakeVerdict(harness);
+      expect(verdict.state).toBe("closed");
+      if (verdict.state === "closed") {
+        expect(verdict.code).toBe("budget_exceeded");
+        expect(verdict.exitName).toBe("crewhaus_budget");
+      }
+    } finally {
+      rmSync(harness, { recursive: true, force: true });
+    }
+    expect(
+      later().some(
+        (b) =>
+          b.includes("`budget_exceeded`") &&
+          b.includes("`--ignore-pause`") &&
+          b.includes("`crewhaus daemon resume`"),
+      ),
+    ).toBe(true);
+  });
+});

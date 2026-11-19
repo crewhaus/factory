@@ -154,3 +154,42 @@ describe("the `summary: true` split", () => {
     expect(costs.byProfile.find((p) => p.profile === "fast")?.usdMicros).toBe(900);
   });
 });
+
+describe("unknown cost (#516)", () => {
+  test("an unpriced accrual counts one unknown call and marks its model; a priced fold says none", () => {
+    const costs = fold([
+      accrual({ costUsdMicros: 100, inputTokens: 4, outputTokens: 2 }),
+      accrual({ modelId: "qwen3", provider: "openai", costUsdMicros: 0, unpriced: true }),
+    ]);
+    expect(costs.unpricedCalls).toBe(1);
+    expect(costs.byModel.find((r) => r.modelId === "qwen3")?.unpriced).toBe(true);
+    expect("unpriced" in (costs.byModel.find((r) => r.modelId === "m") ?? {})).toBe(false);
+    // The day it happened carries the count, so the chart never draws it as $0.
+    expect(costs.days.find((d) => d.unpricedCalls !== undefined)?.unpricedCalls).toBe(1);
+    const priced = fold([accrual({ costUsdMicros: 100 })]);
+    expect(priced.unpricedCalls).toBe(0);
+    expect(priced.days.every((d) => !("unpricedCalls" in d))).toBe(true);
+  });
+
+  test("a child log plus the parent's roll-up counts the child's unknown calls once", () => {
+    const costs = foldSessions([
+      {
+        id: "sess_00000000000000aa",
+        log: [
+          accrual({ costUsdMicros: 100 }),
+          // The parent's roll-up of the child: skipped, its count with it.
+          accrual({ costUsdMicros: 0, role: "subagent", summary: true, unpricedCalls: 2 }),
+        ],
+      },
+      {
+        id: "sess_00000000000000bb",
+        log: [
+          accrual({ modelId: "qwen3", costUsdMicros: 0, unpriced: true }),
+          accrual({ modelId: "qwen3", costUsdMicros: 0, unpriced: true }),
+        ],
+      },
+    ]);
+    expect(costs.unpricedCalls).toBe(2);
+    expect(costs.rollups).toBe(1);
+  });
+});

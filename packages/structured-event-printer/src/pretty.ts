@@ -218,5 +218,7 @@ function formatBody(ev: TraceEvent): string {
       }`;
     case "context_assembled":
       return `blocks=${ev.blocks} recalled=${ev.recalled.included} redacted=${ev.recalled.redacted} warned=${ev.recalled.warned} tools=${ev.tools.advertised}/${ev.tools.inSpec} messages=${ev.messages}`;
+    case "budget_unpriced":
+      return `provider=${ev.provider} model=${ev.modelId}${ev.role !== undefined ? ` role=${ev.role}` : ""} cost=unknown`;
   }
 }

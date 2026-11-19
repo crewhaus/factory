@@ -1608,6 +1608,28 @@ describe("crewhaus daemon pause|resume|disable|enable", () => {
       f.cleanup();
     }
   });
+
+  test("a submit --ignore-pause let through tells its run so; any other submit does not", async () => {
+    const f = crewFixture();
+    try {
+      writeFileSync(join(f.dir, "brief.md"), "a brief\n");
+      const open = await runDaemonCommand(
+        ["submit", "--brief-file", "brief.md", "--no-preflight", "--ignore-pause"],
+        { ...f.opts, env: { ...f.opts.env, CREWHAUS_INTAKE_PAUSE_IGNORED: "1" } },
+      );
+      expect(open.exitCode).toBe(0);
+      expect(f.ops.last()?.request.env["CREWHAUS_INTAKE_PAUSE_IGNORED"]).toBeUndefined();
+      await runDaemonCommand(["pause"], f.opts);
+      const ignored = await runDaemonCommand(
+        ["submit", "--brief-file", "brief.md", "--no-preflight", "--ignore-pause"],
+        f.opts,
+      );
+      expect(ignored.exitCode).toBe(0);
+      expect(f.ops.last()?.request.env["CREWHAUS_INTAKE_PAUSE_IGNORED"]).toBe("1");
+    } finally {
+      f.cleanup();
+    }
+  });
 });
 
 // --- a restart decides the start's admission before it stops ----------------

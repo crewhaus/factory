@@ -344,6 +344,35 @@ function budgetRaises(before: unknown, after: unknown): string[] {
     raised.push("budget.on_exceed");
   }
   // `judge_share` divides the cap; it never raises it.
+  raised.push(...periodRaises(was["period"], now["period"]));
+  return raised;
+}
+
+/** How long each period lasts, for {@link periodRaises}: a shorter one renews sooner. */
+const PERIOD_LENGTH: Readonly<Record<string, number>> = { day: 1, week: 2, month: 3 };
+
+/**
+ * The `budget.period` paths a change raises: a higher `usd`, a shorter
+ * `every` (month to week to day renews the limit sooner), and a removed
+ * period. A first period is a new limit, not a raise.
+ */
+function periodRaises(before: unknown, after: unknown): string[] {
+  const was = plainObject(before);
+  if (was === undefined) return [];
+  const now = plainObject(after);
+  if (now === undefined) return ["budget.period"];
+  const raised: string[] = [];
+  const usdBefore = was["usd"];
+  const usdAfter = now["usd"];
+  if (typeof usdBefore === "number") {
+    if (usdAfter === undefined) raised.push("budget.period.usd");
+    else if (typeof usdAfter === "number" && usdAfter > usdBefore) raised.push("budget.period.usd");
+  }
+  const lengthBefore = PERIOD_LENGTH[String(was["every"])];
+  const lengthAfter = PERIOD_LENGTH[String(now["every"])];
+  if (lengthBefore !== undefined && (lengthAfter === undefined || lengthAfter < lengthBefore)) {
+    raised.push("budget.period.every");
+  }
   return raised;
 }
 
@@ -352,7 +381,8 @@ function budgetRaises(before: unknown, after: unknown): string[] {
  * schema defaults not applied). A changed `name:` needs the name typed again,
  * because history, baselines and memory are kept under the name. Raising the
  * budget (a higher `usd`, the cap or `usd` removed, a `session` scope widened,
- * `on_exceed` moved from `stop` to `degrade`) needs the security edit
+ * `on_exceed` moved from `stop` to `degrade`, a higher or shorter
+ * `budget.period`, or the period removed) needs the security edit
  * permission. A first budget and a lowered one need nothing. Loosening a
  * protected quality bar (`protectedBarChanges`) needs the security edit
  * permission too, as one escalation whose `paths` name every loosened key and

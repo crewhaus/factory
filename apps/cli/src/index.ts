@@ -463,6 +463,7 @@ import { openScoreboard } from "@crewhaus/routing-store";
 import { createRunContext, runWithScope } from "@crewhaus/run-context";
 import {
   type AgentIdentityFile,
+  INTAKE_PAUSE_IGNORED_ENV,
   type RunChatLoopOptions,
   resolveSessionRootDir,
   runChatLoop,
@@ -669,6 +670,7 @@ import {
 // argv switch on import). The block's exit-rating half lives in the RUNTIME
 // (@crewhaus/runtime-core's exit-rating module) so compiled bundles get it too.
 import { DISTILL_STATE_RELPATH, maybeAutoDistill } from "./autodistill";
+import { optimizeSpendLedger } from "./budget-cmd";
 // 0.7.1 — the oldest supported Bun and doctor's check of it, in a module the
 // floor guard (scripts/bun-floor.test.ts) can import.
 import { checkBunVersion } from "./bun-floor";
@@ -1289,6 +1291,7 @@ import {
   auditModelSlots,
   auditionReadiness,
   buildSunsetProposal,
+  declaredPricingOfIr,
   formatModelsAudit,
   formatModelsExplain,
   formatModelsList,
@@ -8178,6 +8181,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
           traceBus,
           ...(stageMutator !== undefined ? { mutator: stageMutator } : {}),
           ...(stageBudget !== undefined ? { budgetUsd: stageBudget } : {}),
+          ...optimizeSpendLedger(optimizeSpecPath),
         });
         process.stdout.write(
           `[optimize] stage ${stage.name} score: ${r.scoreBefore.toFixed(3)} → ${r.scoreAfter.toFixed(3)} ` +
@@ -8286,6 +8290,8 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         traceBus,
         ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
         ...(budgetUsd !== undefined ? { budgetUsd } : {}),
+        // The harness's spending period, when its spec declares one.
+        ...optimizeSpendLedger(optimizeSpecPath),
       }),
     );
 
@@ -9208,6 +9214,8 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       traceBus,
       budgetUsd: knobs.budgetUsd,
       ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
+      // The harness's spending period, when its spec declares one.
+      ...optimizeSpendLedger(absSpec),
     });
     optimizeResult = result;
     process.stdout.write(
@@ -10260,6 +10268,9 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     }
   }
   const evalIr: typeof ir = parkedBlock !== undefined ? { ...ir, provability: parkedBlock } : ir;
+  // The spec's declared prices (`models.<name>.price`): the eval meters and
+  // reports with the same table every run of the harness prices with.
+  const evalPricing = defaultMatrixPricing(ir.agent.declaredPricing);
 
   let gradersYaml: string;
   try {
@@ -10282,7 +10293,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   // so the vocabulary cannot differ between the CLI and library paths.
   // 0.8.0 §9.1 — with the same pricing runEval gets, for provability.* costs.
   const graderRegistry = await graderRegistryForCompiled(compiled, {
-    pricing: defaultMatrixPricing(),
+    pricing: evalPricing,
   });
 
   // The run's id, known before the dataset is read so a held-out use line
@@ -10426,7 +10437,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     process.stdout.write(
       `[eval] regrading ${source.runId}: ${samples.length} case(s), ${compiled.length} grader(s), recorded answers only — no agent calls\n`,
     );
-    const pricing = defaultMatrixPricing();
+    const pricing = evalPricing;
     const judgeCost = (s: EvalRunSummary): number | undefined => {
       const micros = evalRunCost(s, pricing).judgeMicros;
       return micros !== undefined ? micros / 1_000_000 : undefined;
@@ -10594,7 +10605,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
       ...(evalProvability !== undefined ? { provability: evalProvability } : {}),
       // The file's criteria, recorded with the run (absent without any).
       ...(criteriaRecord !== undefined ? { criteria: criteriaRecord } : {}),
-      pricing: defaultMatrixPricing(),
+      pricing: evalPricing,
     },
   }).catch((err: unknown) => {
     if (cassetteOrResume && err instanceof CrewhausError) die(err.message);
@@ -10652,7 +10663,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     const sentinelRetried = summary.samples.filter((s) => s.retried === true).length;
     for (const line of evalRunOutputLines(summary, {
       retriedCount: sentinelRetried,
-      pricing: defaultMatrixPricing(),
+      pricing: evalPricing,
     })) {
       process.stdout.write(`${line}\n`);
     }
@@ -10718,7 +10729,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     retriedCount,
     // C35 — the cost line: agent spend as before, plus the newly metered
     // judge spend, through the same pricing table as the matrix est_$ column.
-    pricing: defaultMatrixPricing(),
+    pricing: evalPricing,
   })) {
     process.stdout.write(`${line}\n`);
   }
@@ -10780,7 +10791,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   // A pricing miss anywhere (agent model or ANY judge model) leaves the
   // total undefined — the cost gate then warns instead of failing on an
   // undercount nobody can verify.
-  const cost = evalRunCost(summary, defaultMatrixPricing());
+  const cost = evalRunCost(summary, evalPricing);
   const costUsd = cost.totalMicros !== undefined ? cost.totalMicros / 1_000_000 : undefined;
   const agentCostUsd = cost.agentMicros !== undefined ? cost.agentMicros / 1_000_000 : undefined;
   const judgeCostUsd = cost.judgeMicros !== undefined ? cost.judgeMicros / 1_000_000 : undefined;
@@ -10853,7 +10864,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     ...(regradeParsed.regradeBaseline === true
       ? {
           regradeBaseline: async (pin: BaselineEntry) => {
-            const pricing = defaultMatrixPricing();
+            const pricing = evalPricing;
             const regraded = await regradeRecordedRun({
               ir: evalIr,
               sourceDir: pin.outDir,
@@ -11800,8 +11811,10 @@ async function runModelsCli(argv: readonly string[]): Promise<void> {
   const slots = enumerateModelSlots(ir);
   const pricing = loadUserPricing();
   const today = args.today !== undefined ? new Date(`${args.today}T12:00:00Z`) : new Date();
+  const declared = declaredPricingOfIr(ir);
   const findings = auditModelSlots(slots, {
     pricing,
+    ...(declared !== undefined ? { declared } : {}),
     sunsets: effectiveSunsets(pricing),
     today,
     project: await buildParamProjection(),
@@ -15038,6 +15051,9 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
   const byRole: Record<string, number> = {};
   const byProfile: Record<string, number> = {};
   let count = 0;
+  // Calls nothing could price: their cost is unknown, never $0, so a total
+  // that includes one reads "+ unknown".
+  let unpricedCalls = 0;
   const totalCache: CacheStats = {
     inputTokens: 0,
     outputTokens: 0,
@@ -15076,6 +15092,8 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
         outputTokens?: number;
         cachedReadTokens?: number;
         cacheCreationTokens?: number;
+        unpriced?: boolean;
+        unpricedCalls?: number;
       };
       const e = parsed as AccrualFields & { payload?: AccrualFields };
       const provider = e.payload?.provider ?? e.provider;
@@ -15094,6 +15112,14 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
       const role = e.payload?.role ?? e.role;
       const summary = (e.payload?.summary ?? e.summary) === true;
       if (summary && (typeof role !== "string" || role === "")) continue;
+      // A per-call accrual flagged `unpriced` is one unknown call; a nested
+      // run's roll-up says how many of its calls were.
+      const nestedUnknown = e.payload?.unpricedCalls ?? e.unpricedCalls;
+      if (summary && typeof nestedUnknown === "number" && nestedUnknown > 0) {
+        unpricedCalls += nestedUnknown;
+      } else if (!summary && (e.payload?.unpriced ?? e.unpriced) === true) {
+        unpricedCalls += 1;
+      }
       if (typeof provider === "string" && typeof micros === "number") {
         totalMicros += micros;
         byProvider[provider] = (byProvider[provider] ?? 0) + micros;
@@ -15175,12 +15201,20 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
         cacheHitRatio: cacheHitRatio(totalCache),
         cacheSavingsUsdMicros: totalSavings,
         cacheByModel,
+        // Additive, present only when some call's cost is unknown.
+        ...(unpricedCalls > 0 ? { unpricedCalls } : {}),
       })}\n`,
     );
   } else {
     process.stdout.write(`session: ${session}\n`);
     process.stdout.write(`accrual events: ${count}\n`);
-    process.stdout.write(`total: $${totalDollars.toFixed(4)}\n`);
+    process.stdout.write(
+      `total: $${totalDollars.toFixed(4)}${
+        unpricedCalls > 0
+          ? ` + unknown (${unpricedCalls} call${unpricedCalls === 1 ? "" : "s"} with no price; \`crewhaus models audit\`)`
+          : ""
+      }\n`,
+    );
     for (const [p, m] of Object.entries(byProvider)) {
       process.stdout.write(`  ${p}: $${(m / 1_000_000).toFixed(4)}\n`);
     }
@@ -24032,11 +24066,18 @@ const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
 
-gateEntryPoint(subcommand, rest, {
-  cwd: process.cwd(),
-  write: (line) => process.stderr.write(line),
-  exit: (code) => process.exit(code),
-});
+// The run stamp's pause override comes from this gate alone: an inherited value is
+// cleared first, so a shell export never records one.
+Reflect.deleteProperty(process.env, INTAKE_PAUSE_IGNORED_ENV);
+if (
+  gateEntryPoint(subcommand, rest, {
+    cwd: process.cwd(),
+    write: (line) => process.stderr.write(line),
+    exit: (code) => process.exit(code),
+  }).pauseIgnored
+) {
+  process.env[INTAKE_PAUSE_IGNORED_ENV] = "1";
+}
 
 switch (subcommand) {
   case "compile":
@@ -24444,6 +24485,20 @@ switch (subcommand) {
     try {
       const { runDelegationsCommand } = await import("./delegations-cmd");
       const out = await runDelegationsCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "budget": {
+    // A harness's spending period (./budget-cmd): read, and raised through the control service.
+    try {
+      const { runBudgetCommand } = await import("./budget-cmd");
+      const out = await runBudgetCommand(rest);
       const sink = out.exitCode === 0 ? process.stdout : process.stderr;
       for (const line of out.lines) sink.write(`${line}\n`);
       if (out.exitCode !== 0) process.exit(out.exitCode);

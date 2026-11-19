@@ -1,7 +1,8 @@
 /**
  * Rewrites `absent-corpus.digests.json`, `schedule-object.digests.json`,
- * `schedule-lanes.present.digests.json`, `plugins-strings.digests.json` and
- * `plugins-grants.present.digests.json`. Run it only for a deliberate emitter
+ * `schedule-lanes.present.digests.json`, `plugins-strings.digests.json`,
+ * `plugins-grants.present.digests.json`, `budget-period.present.digests.json`
+ * and `models-price.present.digests.json`. Run it only for a deliberate emitter
  * change, and append a delta note to this directory's README:
  *
  *   bun packages/compiler/src/__fixtures__/delta-090/regenerate.ts
@@ -12,6 +13,7 @@ import { ABSENT_CORPUS } from "../../absent-corpus";
 import { compile } from "../../index";
 import { PLUGINS_GRANTS_CORPUS, PLUGINS_STRINGS_CORPUS } from "../../plugins-corpus";
 import { SCHEDULE_LANES_CORPUS, SCHEDULE_OBJECT_CORPUS } from "../../schedule-corpus";
+import { BUDGET_PERIOD_CORPUS, MODELS_PRICE_CORPUS } from "../../spend-corpus";
 
 /** The date the corpus compiles at, so the model-sunset check cannot move a digest. */
 export const CORPUS_TODAY = "2026-09-04";
@@ -47,4 +49,6 @@ if (import.meta.main) {
   write("schedule-lanes.present.digests.json", SCHEDULE_LANES_CORPUS);
   write("plugins-strings.digests.json", PLUGINS_STRINGS_CORPUS);
   write("plugins-grants.present.digests.json", PLUGINS_GRANTS_CORPUS);
+  write("budget-period.present.digests.json", BUDGET_PERIOD_CORPUS);
+  write("models-price.present.digests.json", MODELS_PRICE_CORPUS);
 }

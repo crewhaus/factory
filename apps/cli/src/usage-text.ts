@@ -438,6 +438,8 @@ export function usageText(): string {
     "  inbox [list] [--harness <h>] [--kind <kind>] [--band <band>] [--all] [--json]",
     "                                       everything waiting on a person, across your harnesses",
     "  inbox show <att_> [--json] | stats [--harness <h>] [--since 30d] [--json]",
+    "  budget show | history [--harness <h>] [--json]   a harness's spending period: spend, renewal",
+    "       extend --usd <amount> --reason <code> [--harness <h>]   raise this period's limit",
     "  delegations <verb> ...               what a harness may do on its own, under an owner's rule:",
     "       list [--harness <h>] [--all] | show <rule> | preview <action> --harness <h>",
     "       enable <action> --harness <h>   prints the page and the command that confirms it",

@@ -56,17 +56,18 @@ const TARGETS = Object.keys(WHOLE["definitions"] as Record<string, unknown>).fil
 const PINNED: Readonly<Record<string, readonly [controls: number, json: number]>> = {
   // `plugins:` on cli and channel takes a name or a `{name, tools}` entry, so it is a JSON node.
   // `cf_worker.public_chat` on cli, workflow and graph is one control.
-  cli: [169, 22],
-  workflow: [36, 11],
-  channel: [180, 23],
-  graph: [37, 11],
-  managed: [156, 18],
+  // `budget.period` adds its four keys on every shape with a `budget:`.
+  cli: [173, 22],
+  workflow: [40, 11],
+  channel: [184, 23],
+  graph: [41, 11],
+  managed: [160, 18],
   pipeline: [70, 7],
-  crew: [83, 15],
-  research: [112, 17],
-  batch: [87, 15],
+  crew: [87, 15],
+  research: [116, 17],
+  batch: [91, 15],
   voice: [26, 6],
-  browser: [81, 11],
+  browser: [85, 11],
   eval: [15, 3],
   onchain: [26, 9],
   "onchain-game": [44, 6],
