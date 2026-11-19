@@ -46,9 +46,13 @@ const errorOf = (body: Record<string, unknown>) =>
     unknown
   >;
 
-function approval(id: string) {
+type DecisionClass = "operator" | "maintainer" | "owner";
+const CLASS_RANK: Record<DecisionClass, number> = { operator: 1, maintainer: 2, owner: 3 };
+
+function approval(id: string, requiredClass?: DecisionClass) {
   return {
     id,
+    ...(requiredClass !== undefined ? { requiredClass } : {}),
     toolName: "SendMessage",
     inputHash: `hash-${id}`,
     input: { channel: "ops", text: `content of ${id}` },
@@ -198,13 +202,41 @@ function chokeOf(op: { readonly permission: string }, model: Model): string {
 }
 
 /**
- * The decision service's answer past the choke point: a service decides only what an
- * operator may, so an operation that needs a maintainer or above is refused it there.
+ * The highest decision class a credential's principal reaches on a governed harness, as the
+ * approver list names it: the owner every class, a member its role's (a viewer none), a
+ * service only an operator's.
  */
-function serviceLayerOf(op: { readonly qualifiers: readonly string[] }, model: Model): string {
-  return model.kind === "service" && op.qualifiers.includes("maintainer-or-above")
-    ? "403 decider"
-    : ALLOW;
+function reachOf(model: Model): DecisionClass | null {
+  switch (model.kind) {
+    case "owner":
+      return "owner";
+    case "member":
+      return model.role === "viewer" ? null : (model.role as DecisionClass);
+    case "service":
+      return "operator";
+    case "scoped":
+      return null;
+  }
+}
+
+/**
+ * The decision service's answer past the choke point, from the operation's qualifiers: `class`
+ * needs the approval's own class, `maintainer-or-above` a maintainer's, and any other decision
+ * operation a principal the approver list names. Runs and controls have no such layer.
+ */
+function deciderLayerOf(
+  op: { readonly id: string; readonly qualifiers: readonly string[] },
+  model: Model,
+  approvalClass: DecisionClass,
+): string {
+  if (!op.id.startsWith("decisions.")) return ALLOW;
+  const needs: DecisionClass = op.qualifiers.includes("class")
+    ? approvalClass
+    : op.qualifiers.includes("maintainer-or-above")
+      ? "maintainer"
+      : "operator";
+  const reach = reachOf(model);
+  return reach !== null && CLASS_RANK[reach] >= CLASS_RANK[needs] ? ALLOW : "403 decider";
 }
 
 // ---------------------------------------------------------------------------
@@ -241,9 +273,39 @@ describe("the versioned API's decision, run and control operations, with effects
       "worker",
       "scoped",
     ] as const;
-    const approvalsFor = (offset: number) => names.map((_, k) => approval(apprId(offset + k + 1)));
+    // One parked approval per credential for each decision case: a resolve at each class, and
+    // a supersede and a defer of an operator-class one.
+    const cases = [
+      ...(["operator", "maintainer", "owner"] as const).map((cls, n) => ({
+        op: "decisions.resolve" as OpId,
+        label: `decisions.resolve(${cls})`,
+        cls,
+        offset: 0x100 + n * 0x100,
+      })),
+      {
+        op: "decisions.supersede" as OpId,
+        label: "decisions.supersede",
+        cls: "operator" as const,
+        offset: 0x400,
+      },
+      {
+        op: "decisions.defer" as OpId,
+        label: "decisions.defer",
+        cls: "operator" as const,
+        offset: 0x500,
+      },
+      ...(["runs.create", "runs.cancel", "controls.pause"] as const).map((op) => ({
+        op: op as OpId,
+        label: op,
+        cls: "operator" as const,
+        offset: 0,
+      })),
+    ];
+    expect(cases.map((c) => c.op).filter((op, k, all) => all.indexOf(op) === k)).toEqual([...OPS]);
     const dec = await home.harness("matrix-decisions", {
-      approvals: [...approvalsFor(0x100), ...approvalsFor(0x200), ...approvalsFor(0x300)],
+      approvals: cases
+        .filter((c) => c.offset > 0)
+        .flatMap((c) => names.map((_, k) => approval(apprId(c.offset + k + 1), c.cls))),
     });
     const runs = await cliHarness(home, "matrix-runs");
     const pause = await home.harness("matrix-pause");
@@ -304,6 +366,18 @@ describe("the versioned API's decision, run and control operations, with effects
     ];
     expect(creds.map((c) => c.name)).toEqual([...names]);
 
+    // Govern the harnesses the way Home's access routes and its reconcile sweep do: each one's
+    // approver list is written from the access records, so the decision service judges every
+    // member by the class the list gives it.
+    const synced = await openAccess(home.t.hangarRoot, {
+      harnesses: () =>
+        [dec, runs, pause, other].map((h) => ({ id: h.id, dir: h.dir, groups: [] as string[] })),
+    }).sync({ principal: home.owner });
+    if (!synced.ok) throw new Error(synced.reason);
+    for (const h of [dec, runs, pause, other]) {
+      expect(existsSync(join(h.dir, ".crewhaus", "run", "control", "approvers.json"))).toBe(true);
+    }
+
     // One cancellable run per credential, started by nobody in particular.
     const cancelRuns = new Map<string, string>();
     for (const cred of creds) {
@@ -324,22 +398,20 @@ describe("the versioned API's decision, run and control operations, with effects
         (n, dir) => n + receiptLines(dir).length,
         0,
       );
-    const offsetOf: Record<string, number> = {
-      "decisions.resolve": 0x100,
-      "decisions.supersede": 0x200,
-      "decisions.defer": 0x300,
-    };
     const until = new Date(Date.now() + 86_400_000).toISOString();
     let cells = 0;
     let allowed = 0;
     let refused = 0;
     const wrong: string[] = [];
-    for (const op of ops) {
+    let classRefusals = 0;
+    for (const c of cases) {
+      const op = ops[OPS.indexOf(c.op)] as (typeof ops)[number];
       for (const [k, cred] of creds.entries()) {
         cells += 1;
         const choke = chokeOf(op, cred.model);
-        const want = choke === ALLOW ? serviceLayerOf(op, cred.model) : choke;
-        const target = apprId((offsetOf[op.id] ?? 0) + k + 1);
+        const want = choke === ALLOW ? deciderLayerOf(op, cred.model, c.cls) : choke;
+        if (choke === ALLOW && want !== ALLOW) classRefusals += 1;
+        const target = apprId(c.offset + k + 1);
         const path = (() => {
           switch (op.id as OpId) {
             case "decisions.resolve":
@@ -385,7 +457,7 @@ describe("the versioned API's decision, run and control operations, with effects
         const res = await home.call("POST", path, {
           body,
           secret: cred.secret,
-          headers: { "Idempotency-Key": `matrix-${op.id}-${cred.name}` },
+          headers: { "Idempotency-Key": `matrix-${c.label.replace(/[()]/g, "-")}-${cred.name}` },
         });
         const error = errorOf(res.body);
         const got =
@@ -394,7 +466,7 @@ describe("the versioned API's decision, run and control operations, with effects
             : res.status === 403
               ? `403 ${String(error["reason"])}`
               : `${res.status} ${String(error["reason"] ?? error["code"])}`;
-        const cell = `${op.id} as ${cred.name}`;
+        const cell = `${c.label} as ${cred.name}`;
         if (got !== want) wrong.push(`${cell}: ${got} (want ${want})`);
 
         // The effect, counted.
@@ -407,7 +479,11 @@ describe("the versioned API's decision, run and control operations, with effects
         const effect = (() => {
           switch (op.id as OpId) {
             case "decisions.resolve":
-              return `claims+${after.claims - files.claims} decides+${after.decides - files.decides} decision=${record?.decision}`;
+              return `claims+${after.claims - files.claims} decides+${after.decides - files.decides} decision=${record?.decision}${
+                record?.decision !== undefined
+                  ? ` by=${record.decidedByPrincipal === cred.principal}`
+                  : ""
+              }`;
             case "decisions.supersede":
               return `claims+${after.claims - files.claims} supersedes+${after.supersedes - files.supersedes} superseded=${record?.supersededBy !== undefined}`;
             case "decisions.defer":
@@ -429,7 +505,7 @@ describe("the versioned API's decision, run and control operations, with effects
           switch (op.id as OpId) {
             case "decisions.resolve":
               return on
-                ? "claims+1 decides+1 decision=grant"
+                ? "claims+1 decides+1 decision=grant by=true"
                 : "claims+0 decides+0 decision=undefined";
             case "decisions.supersede":
               return on
@@ -469,12 +545,14 @@ describe("the versioned API's decision, run and control operations, with effects
     }
     expect(wrong).toEqual([]);
     // A matrix that shrinks fails here: every operation, by every credential.
-    expect(cells).toBe(OPS.length * names.length);
-    expect(cells).toBe(54);
+    expect(cells).toBe(cases.length * names.length);
+    expect(cells).toBe(72);
+    // The decision service's own layer is exercised, past the choke point, on class and role.
+    expect(classRefusals).toBeGreaterThanOrEqual(4);
     // Not hollow: both sides are exercised on every operation.
     expect(allowed).toBeGreaterThanOrEqual(OPS.length * 2);
     expect(refused).toBeGreaterThanOrEqual(OPS.length * 4);
-  }, 120_000); // nine credentials minted through device sign-in, then 54 writes through a live server
+  }, 120_000); // nine credentials minted through device sign-in, then 72 writes through a live server
 });
 
 // ---------------------------------------------------------------------------

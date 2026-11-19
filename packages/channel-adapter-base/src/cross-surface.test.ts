@@ -443,6 +443,8 @@ describe("the deny matrix over Slack", () => {
     const rows: Row[] = [
       { name: "unlinked", clicker: { user: "U-nobody" }, answer: "link" },
       { name: "no workspace id", clicker: owner, team: null, answer: "link" },
+      // The linked owner's own user id, clicking from another workspace: a different person.
+      { name: "another workspace", clicker: owner, team: "T-OTHER", answer: "link" },
       // The approver list names only those who may decide, so a viewer's link is not on it.
       { name: "linked viewer", clicker: viewer, answer: "link" },
       { name: "linked operator", clicker: operator, decides: "operator", answer: "refusal" },
@@ -583,7 +585,8 @@ describe("the deny matrix over Slack", () => {
               }
               if (heard.length !== 0) wrong.push(`${cell}: heard ${JSON.stringify(heard)}`);
             } else if (row.answer === "link") {
-              const subject = row.team === null ? undefined : `slack:${TEAM}:${row.clicker.user}`;
+              const subject =
+                row.team === null ? undefined : `slack:${row.team ?? TEAM}:${row.clicker.user}`;
               if (JSON.stringify(heard) !== JSON.stringify([linkAnswer(subject)])) {
                 wrong.push(`${cell}: heard ${JSON.stringify(heard)}`);
               }
@@ -602,8 +605,9 @@ describe("the deny matrix over Slack", () => {
     expect(wrong).toEqual([]);
     // A matrix that shrinks fails here.
     expect(cells).toBe(rows.length * DECISION_CLASSES.length * ACTIONS.length);
-    expect(cells).toBe(72);
-    // Not hollow: operator 1 class, maintainer 2, owner 3, each by three actions.
+    expect(cells).toBe(81);
+    // Not hollow: operator 1 class, maintainer 2, owner 3, each by three actions; no other
+    // row decides anything.
     expect(allowed).toBe((1 + 2 + 3) * ACTIONS.length);
-  }, 120_000); // five members granted, linked and listed, then 72 clicks, each under the store's lock
+  }, 120_000); // five members granted, linked and listed, then 81 clicks, each under the store's lock
 });

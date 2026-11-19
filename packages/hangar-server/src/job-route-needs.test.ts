@@ -12,15 +12,18 @@
  *   checked on an explicit target, that target is the route's own harness and `noteNeed(P)`
  *   follows in the same function;
  * - a bare `ctx.authorize(P)` is followed by `noteNeed(P)` in the same function;
- * - every check comes before the function queues its job.
+ * - every check comes before the function queues its job;
+ * - a check the guard cannot read is a failure, never a pass: options that are not an inline
+ *   literal of known keys, `authorize` reached any way but `ctx.authorize(…)`,
+ *   `requirePermission` under another name, and a call into a relative import it cannot read.
  *
  * The rows come from the route table, the handlers from the M3 table, and the modules from
- * the M3 table's imports: nothing here is a hand-kept list of routes. A planted handler
- * proves the checker can fail.
+ * every non-test source under `src`, subdirectories included: nothing here is a hand-kept
+ * list of routes. Planted handlers prove the checker can fail.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, posix, sep } from "node:path";
 import { M3_ROUTES } from "./m3-routes";
 import { ROUTE_TABLE } from "./route-table";
 
@@ -188,24 +191,93 @@ function closeParen(masked: string, open: number): number {
   return masked.length;
 }
 
-/** A call's arguments, as source text, split at its top-level commas. */
-function argsAt(src: string, masked: string, open: number): string[] {
-  const close = closeParen(masked, open);
-  const args: string[] = [];
+/**
+ * The spans of the comma-separated parts between `from` and `to` (exclusive), split at
+ * top-level commas of the masked text, each trimmed, empty parts dropped.
+ */
+function partSpans(src: string, masked: string, from: number, to: number): [number, number][] {
+  const spans: [number, number][] = [];
   let depth = 0;
-  let from = open + 1;
-  for (let k = open + 1; k < close; k += 1) {
+  let start = from;
+  const push = (end: number) => {
+    let a = start;
+    let b = end;
+    while (a < b && /\s/.test(src[a] as string)) a += 1;
+    while (b > a && /\s/.test(src[b - 1] as string)) b -= 1;
+    if (b > a) spans.push([a, b]);
+  };
+  for (let k = from; k < to; k += 1) {
     const c = masked[k];
     if (c === "(" || c === "{" || c === "[") depth += 1;
     else if (c === ")" || c === "}" || c === "]") depth -= 1;
     else if (c === "," && depth === 0) {
-      args.push(src.slice(from, k).trim());
-      from = k + 1;
+      push(k);
+      start = k + 1;
     }
   }
-  const last = src.slice(from, close).trim();
-  if (last !== "") args.push(last);
-  return args;
+  push(to);
+  return spans;
+}
+
+/** A call's argument spans, split at its top-level commas. */
+function argSpans(src: string, masked: string, open: number): [number, number][] {
+  return partSpans(src, masked, open + 1, closeParen(masked, open));
+}
+
+/** A call's arguments, as source text, split at its top-level commas. */
+function argsAt(src: string, masked: string, open: number): string[] {
+  return argSpans(src, masked, open).map(([a, b]) => src.slice(a, b));
+}
+
+/** The option keys `requirePermission` takes that name no target. */
+const NON_TARGET_OPTIONS = new Set(["paths", "message"]);
+
+/**
+ * What a `requirePermission` options argument says, read only when it is an inline object
+ * literal of plain `key: value` / shorthand properties. Anything else (a variable, a call, a
+ * spread, a computed or quoted key, a shorthand `target`, a key the guard does not know) is
+ * options the guard cannot read, and so cannot clear.
+ */
+type Options =
+  | { readonly readable: true; readonly target: string | undefined }
+  | { readonly readable: false; readonly why: string };
+
+function readOptions(src: string, masked: string, [from, to]: [number, number]): Options {
+  const text = src.slice(from, to);
+  if (masked[from] !== "{" || closeBrace(masked, from) !== to - 1) {
+    return { readable: false, why: `options it builds elsewhere (${text})` };
+  }
+  let target: string | undefined;
+  for (const [a, b] of partSpans(src, masked, from + 1, to - 1)) {
+    const part = src.slice(a, b);
+    const keyed = /^([A-Za-z_$][\w$]*)\s*:\s*([\s\S]*)$/.exec(part);
+    const shorthand = /^[A-Za-z_$][\w$]*$/.test(part);
+    const key = keyed !== null ? (keyed[1] as string) : shorthand ? part : undefined;
+    if (key === undefined) return { readable: false, why: `options it cannot read (${part})` };
+    if (key === "target") {
+      if (keyed === null) return { readable: false, why: "a target it names by variable" };
+      target = (keyed[2] as string).replace(/\s+/g, " ").trim();
+      continue;
+    }
+    if (!NON_TARGET_OPTIONS.has(key)) {
+      return { readable: false, why: `an option it does not know (${key})` };
+    }
+  }
+  return { readable: true, target };
+}
+
+/** The offset of the `}` that closes the `{` at `open`, in masked text. */
+function closeBrace(masked: string, open: number): number {
+  let depth = 0;
+  for (let k = open; k < masked.length; k += 1) {
+    const c = masked[k];
+    if (c === "{") depth += 1;
+    else if (c === "}") {
+      depth -= 1;
+      if (depth === 0) return k;
+    }
+  }
+  return masked.length;
 }
 
 type Unit = {
@@ -221,9 +293,20 @@ type Module = {
   readonly src: string;
   readonly masked: string;
   readonly units: ReadonlyMap<string, Unit>;
-  /** Local name → [sibling module, its exported name]. */
+  /**
+   * Local name → [module path, its exported name], for every named import (or re-export)
+   * from a relative specifier. The path is resolved against this module's directory, relative
+   * to `src`, without an extension; it may name no module the walk can read.
+   */
   readonly imports: ReadonlyMap<string, readonly [string, string]>;
+  /** Local names bound by a default or namespace import from a relative specifier. */
+  readonly opaque: ReadonlyMap<string, string>;
 };
+
+/** A relative specifier, resolved against the importing module's directory. */
+function resolveSpecifier(module: string, spec: string): string {
+  return posix.normalize(posix.join(posix.dirname(module), spec)).replace(/\.(?:ts|js)$/, "");
+}
 
 const DECLARATION_RE =
   /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?\s+([A-Za-z_$][\w$]*)|(?:const|let|var)\s+([A-Za-z_$][\w$]*))/;
@@ -252,9 +335,10 @@ function readModule(name: string, src: string): Module {
     units.set(s.name, { module: name, name: s.name, from: s.at, to });
   });
   const imports = new Map<string, readonly [string, string]>();
-  const IMPORT_RE = /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*"\.\/([\w.-]+)"/g;
+  const IMPORT_RE =
+    /(?:^|\n)\s*(?:import|export)\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]*)\}\s*from\s*"(\.{1,2}\/[^"]+)"/g;
   for (const m of src.matchAll(IMPORT_RE)) {
-    const from = (m[2] as string).replace(/\.ts$/, "");
+    const from = resolveSpecifier(name, m[2] as string);
     for (const part of (m[1] as string).split(",")) {
       const spec = part.trim().replace(/^type\s+/, "");
       if (spec === "") continue;
@@ -262,7 +346,13 @@ function readModule(name: string, src: string): Module {
       imports.set((local ?? orig).trim(), [from, orig.trim()]);
     }
   }
-  return { name, src, masked, units, imports };
+  const opaque = new Map<string, string>();
+  const OPAQUE_RE =
+    /(?:^|\n)\s*import\s+(?!type\s)(?:\*\s+as\s+([A-Za-z_$][\w$]*)|([A-Za-z_$][\w$]*))[^"]*?from\s*"(\.{1,2}\/[^"]+)"/g;
+  for (const m of src.matchAll(OPAQUE_RE)) {
+    opaque.set((m[1] ?? m[2]) as string, resolveSpecifier(name, m[3] as string));
+  }
+  return { name, src, masked, units, imports, opaque };
 }
 
 // ---------------------------------------------------------------------------
@@ -305,12 +395,49 @@ type Facts = {
 
 type Violation = { readonly route: string; readonly handler: string; readonly why: string };
 
-function unitFacts(mod: Module, unit: Unit, resolve: (local: string) => Unit | undefined): Facts {
+/** What a local name a function calls resolves to. */
+type Resolved = Unit | { readonly unreadable: string } | undefined;
+
+/**
+ * Every `authorize` in masked text that is not a member call (`x.authorize(` or
+ * `x.authorize?.(`): a destructuring, an alias, a bare call, `.call`/`.bind`, a property
+ * that is assigned. Offsets are the text's own.
+ */
+function authorizeOutsideMemberCalls(masked: string, from = 0, to = masked.length): number[] {
+  const out: number[] = [];
+  const text = masked.slice(from, to);
+  for (const m of text.matchAll(/\bauthorize\b/g)) {
+    const at = m.index as number;
+    const before = text.slice(0, at);
+    const after = text.slice(at + "authorize".length);
+    const member = /(?:\?\.|\.)\s*$/.test(before) && /^\s*(?:\?\.\s*)?\(/.test(after);
+    if (!member) out.push(from + at);
+  }
+  return out;
+}
+
+/** Every `requirePermission` in masked text that is not called directly by that name. */
+function requirePermissionNotCalled(masked: string, from = 0, to = masked.length): number[] {
+  const out: number[] = [];
+  const text = masked.slice(from, to);
+  for (const m of text.matchAll(/\brequirePermission\b/g)) {
+    const at = m.index as number;
+    const before = text.slice(0, at);
+    const after = text.slice(at + "requirePermission".length);
+    const called = !/[.?]\s*$/.test(before) && /^\s*\(/.test(after);
+    const declared = /\bfunction\s+$/.test(before);
+    if (!called && !declared) out.push(from + at);
+  }
+  return out;
+}
+
+function unitFacts(mod: Module, unit: Unit, resolve: (local: string) => Resolved): Facts {
   const { src, masked } = mod;
   const body = masked.slice(unit.from, unit.to);
   const sites: Site[] = [];
   const problems: string[] = [];
-  const where = (at: number) => `${unit.module}.ts:${src.slice(0, at).split("\n").length}`;
+  const lineOf = (at: number) => src.slice(0, at).split("\n").length;
+  const where = (at: number) => `${unit.module}.ts:${lineOf(at)}`;
   const noteNeedsAfter = (at: number, permission: string): boolean => {
     for (const m of body.slice(at - unit.from).matchAll(/\bnoteNeed\s*\(/g)) {
       const open = at + (m.index as number) + m[0].length - 1;
@@ -318,8 +445,30 @@ function unitFacts(mod: Module, unit: Unit, resolve: (local: string) => Unit | u
     }
     return false;
   };
-  // Every identifier followed by `(`: a call, a check or a job submission.
-  for (const m of body.matchAll(/([.?]*)\b([A-Za-z_$][\w$]*)\s*\(/g)) {
+  // `authorize` reached any way but a member call, and `requirePermission` used any way but
+  // a direct call, are checks the guard cannot follow: one problem per function.
+  const loose = authorizeOutsideMemberCalls(masked, unit.from, unit.to);
+  if (loose.length > 0) {
+    problems.push(
+      `${unit.module}.ts:${loose.map(lineOf).join(",")} uses authorize other than as ctx.authorize(…)`,
+    );
+  }
+  const aliased = requirePermissionNotCalled(masked, unit.from, unit.to);
+  if (aliased.length > 0) {
+    problems.push(
+      `${unit.module}.ts:${aliased.map(lineOf).join(",")} uses requirePermission other than by calling it`,
+    );
+  }
+  // A default or namespace import from a sibling module is a body the walk cannot read by name.
+  for (const [local, path] of mod.opaque) {
+    if (new RegExp(`(?<![\\w$.])${local.replace(/\$/g, "\\$")}(?![\\w$])`).test(body)) {
+      problems.push(
+        `${unit.module}.${unit.name} uses ${local} from ${path}, which the guard cannot read`,
+      );
+    }
+  }
+  // Every identifier followed by `(` or `?.(`: a call, a check or a job submission.
+  for (const m of body.matchAll(/([.?]*)\b([A-Za-z_$][\w$]*)\s*(?:\?\.\s*)?\(/g)) {
     const name = m[2] as string;
     const member = (m[1] as string).includes(".");
     const at = unit.from + (m.index as number) + (m[1] as string).length;
@@ -332,12 +481,14 @@ function unitFacts(mod: Module, unit: Unit, resolve: (local: string) => Unit | u
       sites.push({ kind: "submit", at, text: name });
       continue;
     }
-    if (member && name === "authorize") {
+    if (name === "authorize") {
       const args = argsAt(src, masked, open);
       const permission = args[0] ?? "";
       sites.push({ kind: "check", at, text: `authorize(${permission})` });
+      // A non-member call is already a problem above.
+      if (!member) continue;
       if (args.length >= 2) {
-        const target = args[1] as string;
+        const target = (args[1] as string).replace(/\s+/g, " ").trim();
         if (!OWN_HARNESS_RE.test(target) || !noteNeedsAfter(at, permission)) {
           problems.push(`${where(at)} checks ${permission} on ${target}`);
         }
@@ -348,18 +499,19 @@ function unitFacts(mod: Module, unit: Unit, resolve: (local: string) => Unit | u
     }
     if (member) continue;
     if (name === "requirePermission") {
-      const args = argsAt(src, masked, open);
-      const permission = args[1] ?? "";
-      const options = args[2];
+      const spans = argSpans(src, masked, open);
+      const permission = spans[1] !== undefined ? src.slice(...spans[1]) : "";
       sites.push({ kind: "check", at, text: `requirePermission(${permission})` });
-      const target = options !== undefined ? /\btarget\s*:\s*(\{[^}]*\})/.exec(options) : null;
-      const shorthand = options !== undefined && /[{,]\s*target\s*[,}]/.test(options);
-      if (shorthand) {
-        problems.push(`${where(at)} checks ${permission} on a target it names`);
-      } else if (target !== null) {
-        const t = (target[1] as string).replace(/\s+/g, " ").trim();
-        if (!OWN_HARNESS_RE.test(t) || !noteNeedsAfter(at, permission)) {
-          problems.push(`${where(at)} checks ${permission} on ${t}`);
+      if (spans.length > 3) {
+        problems.push(`${where(at)} checks ${permission} with arguments it cannot read`);
+      } else if (spans[2] !== undefined) {
+        const options = readOptions(src, masked, spans[2]);
+        if (!options.readable) {
+          problems.push(`${where(at)} checks ${permission} with ${options.why}`);
+        } else if (options.target !== undefined) {
+          if (!OWN_HARNESS_RE.test(options.target) || !noteNeedsAfter(at, permission)) {
+            problems.push(`${where(at)} checks ${permission} on ${options.target}`);
+          }
         }
       }
       continue;
@@ -370,6 +522,12 @@ function unitFacts(mod: Module, unit: Unit, resolve: (local: string) => Unit | u
     }
     if (PRIMITIVES.has(name)) continue;
     const callee = resolve(name);
+    if (callee !== undefined && "unreadable" in callee) {
+      problems.push(
+        `${where(at)} calls ${name} from ${callee.unreadable}, which the guard cannot read`,
+      );
+      continue;
+    }
     if (callee !== undefined && !(callee.module === unit.module && callee.name === unit.name)) {
       sites.push({ kind: "call", at, text: name, callee });
     }
@@ -395,14 +553,20 @@ function checkJobHandlers(
     read.set(name, mod);
     return mod;
   };
-  const unitOf = (module: string, name: string, seen = new Set<string>()): Unit | undefined => {
+  /** A module path as written, or its `index` when it names a directory. */
+  const located = (path: string): string | undefined =>
+    modules.has(path) ? path : modules.has(`${path}/index`) ? `${path}/index` : undefined;
+  const unitOf = (module: string, name: string, seen = new Set<string>()): Resolved => {
     const mod = moduleOf(module);
     if (mod === undefined || seen.has(`${module}.${name}`)) return undefined;
     seen.add(`${module}.${name}`);
     const own = mod.units.get(name);
     if (own !== undefined) return own;
     const imported = mod.imports.get(name);
-    return imported !== undefined ? unitOf(imported[0], imported[1], seen) : undefined;
+    if (imported === undefined) return undefined;
+    const target = located(imported[0]);
+    if (target === undefined) return { unreadable: imported[0] };
+    return unitOf(target, imported[1], seen);
   };
   const facts = new Map<string, Facts>();
   const factsOf = (unit: Unit): Facts => {
@@ -442,7 +606,7 @@ function checkJobHandlers(
   const reached = new Set<string>();
   for (const h of handlers) {
     const root = unitOf(h.module, h.fn);
-    if (root === undefined) {
+    if (root === undefined || "unreadable" in root) {
       violations.push({ route: h.route, handler: h.fn, why: `no ${h.fn} in ${h.module}.ts` });
       continue;
     }
@@ -488,9 +652,20 @@ function checkJobHandlers(
 // The real tree
 // ---------------------------------------------------------------------------
 
-const SOURCE_FILES = readdirSync(SRC).filter(
-  (name) => name.endsWith(".ts") && !name.endsWith(".test.ts") && !name.endsWith(".d.ts"),
-);
+/**
+ * Every non-test source under `src`, subdirectories included (test helpers under
+ * `__test__/` are not served code), keyed by its path relative to `src` with `/` separators
+ * and no extension: the names relative imports resolve to.
+ */
+const SOURCE_FILES = (readdirSync(SRC, { recursive: true }) as string[])
+  .map((name) => name.split(sep).join("/"))
+  .filter(
+    (name) =>
+      name.endsWith(".ts") &&
+      !name.endsWith(".test.ts") &&
+      !name.endsWith(".d.ts") &&
+      !name.split("/").includes("__test__"),
+  );
 const MODULES = new Map(
   SOURCE_FILES.map((name) => [name.replace(/\.ts$/, ""), readFileSync(join(SRC, name), "utf8")]),
 );
@@ -510,22 +685,48 @@ function jobHandlers() {
   });
 }
 
-/** Every call in non-test sources matching `re`, as `<file>:<line> <function>`. */
-function hits(re: RegExp, keep: (args: string[]) => boolean): string[] {
+/** The function a source offset sits in, or `(top level)`. */
+function unitAt(mod: Module, at: number): string {
+  const unit = [...mod.units.values()].find((u) => u.from <= at && at < u.to);
+  return `${mod.name}.ts ${unit?.name ?? "(top level)"}`;
+}
+
+/**
+ * Every call in non-test sources matching `re` (which ends at the call's `(`), as
+ * `<file> <function>`. A function's own declaration is not a call.
+ */
+function hits(re: RegExp, keep: (src: string, masked: string, open: number) => boolean): string[] {
   const out: string[] = [];
   for (const [name, src] of MODULES) {
     const mod = readModule(name, src);
     for (const m of mod.masked.matchAll(re)) {
+      if (/\bfunction\s+$/.test(mod.masked.slice(0, m.index as number))) continue;
       const open = (m.index as number) + m[0].length - 1;
-      if (!keep(argsAt(src, mod.masked, open))) continue;
-      const unit = [...mod.units.values()].find(
-        (u) => u.from <= (m.index as number) && (m.index as number) < u.to,
-      );
-      out.push(`${name}.ts ${unit?.name ?? "(top level)"}`);
+      if (!keep(src, mod.masked, open)) continue;
+      out.push(unitAt(mod, m.index as number));
     }
   }
   return out.sort();
 }
+
+/** Every place `find` reports in a non-test source, as `<file> <function>`. */
+function places(find: (masked: string) => number[]): string[] {
+  const out: string[] = [];
+  for (const [name, src] of MODULES) {
+    const mod = readModule(name, src);
+    for (const at of find(mod.masked)) out.push(unitAt(mod, at));
+  }
+  return out.sort();
+}
+
+/** A `requirePermission` call whose options the guard cannot clear as naming no target. */
+const namesOrHidesATarget = (src: string, masked: string, open: number): boolean => {
+  const spans = argSpans(src, masked, open);
+  if (spans.length > 3) return true;
+  if (spans[2] === undefined) return false;
+  const options = readOptions(src, masked, spans[2]);
+  return !options.readable || options.target !== undefined;
+};
 
 describe("every job route carries what it checked into the job's start-time check", () => {
   test("the job rows come from the route table, and every one but the jobs route is an M3 handler", () => {
@@ -584,26 +785,78 @@ describe("every job route carries what it checked into the job's start-time chec
 
   test("the checks that name a target, or skip noting the need, are the reviewed ones, and no job handler reaches them", () => {
     // `requirePermission` with a target option: one, a workspace write that queues nothing.
+    // Every call is counted whose third argument is anything but an inline literal of
+    // non-target options (a variable, a spread, a call, or a target in any form).
+    expect(hits(/\brequirePermission\s*\(/g, namesOrHidesATarget)).toEqual([
+      "creds-ops.ts credentialsSetAcross",
+    ]);
+    // The calls with options the guard reads and clears: spec paths and a message only.
     expect(
-      hits(/\brequirePermission\s*\(/g, (args) =>
-        args[2] !== undefined ? /\btarget\b/.test(args[2]) : false,
+      hits(
+        /\brequirePermission\s*\(/g,
+        (src, masked, open) =>
+          argSpans(src, masked, open)[2] !== undefined && !namesOrHidesATarget(src, masked, open),
       ),
-    ).toEqual(["creds-ops.ts credentialsSetAcross"]);
+    ).toEqual([
+      "builders.ts graderWrite",
+      "inspect.ts settingsWrite",
+      "spec-edit.ts requireSpecEditAuthority",
+    ]);
+    // `requirePermission` used any way but a direct call (an alias, a value passed on):
+    // none outside its own import lines.
+    expect(
+      places(requirePermissionNotCalled).filter((place) => !place.endsWith("(top level)")),
+    ).toEqual([]);
     expect(
       JOB_ROWS.some((row) => M3_BY_KEY.get(row.key)?.handler.name === "credentialsSetAcross"),
     ).toBe(false);
     // `ctx.authorize` with a second argument: only inside `requirePermission` itself.
-    expect(hits(/\bctx\.authorize\s*\(/g, (args) => args.length >= 2)).toEqual([
-      "m3.ts requirePermission",
+    expect(
+      hits(
+        /\bctx\.authorize\s*(?:\?\.\s*)?\(/g,
+        (src, masked, open) => argSpans(src, masked, open).length >= 2,
+      ),
+    ).toEqual(["m3.ts requirePermission"]);
+    // `authorize` anywhere but a member call `x.authorize(…)` (destructured, aliased, called
+    // bare, through `.call`/`.bind`, or defined): the reviewed places only. Each is the access
+    // library's own import and call, a type's member, or a context that defines `authorize`
+    // for the code it calls (the server's request context, the advisor sweep's deny-all
+    // context, Home's access views). The walk fails any job route that reaches one.
+    expect(places(authorizeOutsideMemberCalls)).toEqual([
+      "access.ts (top level)",
+      "access.ts (top level)",
+      "access.ts authorizeCaller",
+      "access.ts requestAccessFor",
+      "access.ts systemAccess",
+      "actions.ts pinBaseline",
+      "advisor.ts advisorSweepItems",
+      "m3.ts (top level)",
+      "server.ts startHangarServer",
+      "server.ts startHangarServer",
     ]);
     // The server's own access plumbing (the choke point, the request context and the
-    // per-harness visibility probe) authorizes by other names, outside any handler.
+    // per-harness visibility probe) and the v1 operations, which are not job rows, authorize
+    // by other names, outside any M3 handler.
     expect(
-      [...new Set(hits(/\b(?:access\??|context)\.authorize\s*\(/g, () => true))].sort(),
-    ).toEqual(["access.ts requestAllows", "server.ts startHangarServer"].sort());
+      [...new Set(hits(/\b(?:access\??|context)\.authorize\s*(?:\?\.\s*)?\(/g, () => true))].sort(),
+    ).toEqual(
+      [
+        "access.ts requestAllows",
+        "server.ts startHangarServer",
+        "v1/access-ops.ts manages",
+        "v1/decisions.ts decisionCommand",
+        "v1/delegations.ts list",
+        "v1/meta.ts me",
+        "v1/meta.ts resolvePrincipal",
+        "v1/runs.ts create",
+      ].sort(),
+    );
     // A bare `ctx.authorize(P)` that does not note the need: two, both in the spec editor's
     // commit path, which only inline routes reach.
-    const bare = hits(/\bctx\.authorize\s*\(/g, (args) => args.length === 1);
+    const bare = hits(
+      /\bctx\.authorize\s*(?:\?\.\s*)?\(/g,
+      (src, masked, open) => argSpans(src, masked, open).length === 1,
+    );
     expect(bare).toEqual(["spec-edit.ts commitHomeEdits", "spec-edit.ts homeCommitFailure"]);
     const { reached } = checkJobHandlers(MODULES, jobHandlers());
     expect(reached.has("spec-edit.commitHomeEdits")).toBe(false);
@@ -741,6 +994,130 @@ describe("the checker can fail", () => {
     ).violations;
     expect(found).toHaveLength(1);
     expect(found[0]?.why).toContain("planted-helper.ts");
+  });
+
+  test("options the guard cannot read as naming no target are one violation each", () => {
+    const shapes = {
+      "an options variable": [
+        "  const opts = { target: { harness: other } };",
+        '  requirePermission(ctx, "h.secrets.write", opts);',
+      ],
+      "a target held in a variable": [
+        "  const t = { harness: other };",
+        '  requirePermission(ctx, "h.secrets.write", { target: t });',
+      ],
+      "a spread": [
+        "  const o = { target: { harness: other } };",
+        '  requirePermission(ctx, "h.secrets.write", { ...o });',
+      ],
+      "a target a call makes": [
+        '  requirePermission(ctx, "h.secrets.write", { target: targetOf(other) });',
+      ],
+      "a shorthand target": [
+        "  const target = { harness: other };",
+        '  requirePermission(ctx, "h.secrets.write", { target });',
+      ],
+      "a quoted target key": [
+        '  requirePermission(ctx, "h.secrets.write", { "target": { harness: other } });',
+      ],
+      "an option the guard does not know": [
+        '  requirePermission(ctx, "h.secrets.write", { scope: other });',
+      ],
+      "requirePermission under another name": [
+        "  const check = requirePermission;",
+        '  check(ctx, "h.secrets.write");',
+      ],
+    };
+    for (const [shape, lines] of Object.entries(shapes)) {
+      const found = check(PLANTED(lines.join("\n")));
+      expect(`${shape}: ${found.length}`).toBe(`${shape}: 1`);
+      expect(found[0]?.handler).toBe("plantedRun");
+    }
+    // Spec paths and a message are read and cleared.
+    expect(
+      check(
+        PLANTED('  requirePermission(ctx, "h.secrets.write", { paths: ["a"], message: "no" });'),
+      ),
+    ).toEqual([]);
+  });
+
+  test("authorize reached any way but ctx.authorize(…) is one violation each", () => {
+    const shapes = {
+      "a destructured authorize": [
+        "  const { authorize } = ctx;",
+        '  if (!authorize("h.secrets.write", { harness: other }).allow) throw new Error("no");',
+      ],
+      "an aliased authorize": [
+        "  const may = ctx.authorize;",
+        '  if (!may("h.secrets.write", { harness: other }).allow) throw new Error("no");',
+      ],
+      "authorize through .call": [
+        '  if (!ctx.authorize.call(ctx, "h.secrets.write", { harness: other }).allow) throw new Error("no");',
+      ],
+      "an optional call with a target": [
+        '  if (!ctx.authorize?.("h.secrets.write", { harness: other }).allow) throw new Error("no");',
+      ],
+    };
+    for (const [shape, lines] of Object.entries(shapes)) {
+      const found = check(PLANTED(lines.join("\n")));
+      expect(`${shape}: ${found.length}`).toBe(`${shape}: 1`);
+    }
+  });
+
+  test("a check in a helper under a subdirectory, or behind an import it cannot read, is found", () => {
+    const helper = [
+      'import { requirePermission, type M3Handler } from "../m3";',
+      "",
+      "export function writeAcross(ctx: Parameters<M3Handler>[0], other: string): void {",
+      '  requirePermission(ctx, "h.secrets.write", { target: { harness: other } });',
+      "}",
+      "",
+    ].join("\n");
+    const handler = (from: string) =>
+      [
+        'import type { M3Handler } from "./m3";',
+        `import { writeAcross } from "${from}";`,
+        "",
+        "export const plantedRun: M3Handler = (ctx) => {",
+        '  writeAcross(ctx, String(ctx.body["other"]));',
+        '  return { job: ctx.submitJob("doctor", ["doctor"]) };',
+        "};",
+        "",
+      ].join("\n");
+    const run = (from: string) =>
+      checkJobHandlers(
+        new Map([...MODULES, ["planted", handler(from)], ["v1/zz-across", helper]]),
+        [{ route: "plantedRow", module: "planted", fn: "plantedRun" }],
+      ).violations;
+    const nested = run("./v1/zz-across");
+    expect(nested).toHaveLength(1);
+    expect(nested[0]?.why).toContain("v1/zz-across.ts");
+    const unreadable = run("./v1/nowhere");
+    expect(unreadable).toHaveLength(1);
+    expect(unreadable[0]?.why).toContain("cannot read");
+    // A namespace import is a body the walk cannot read by name.
+    const namespaced = checkJobHandlers(
+      new Map([
+        ...MODULES,
+        [
+          "planted",
+          [
+            'import type { M3Handler } from "./m3";',
+            'import * as across from "./v1/zz-across";',
+            "",
+            "export const plantedRun: M3Handler = (ctx) => {",
+            '  across.writeAcross(ctx, String(ctx.body["other"]));',
+            '  return { job: ctx.submitJob("doctor", ["doctor"]) };',
+            "};",
+            "",
+          ].join("\n"),
+        ],
+        ["v1/zz-across", helper],
+      ]),
+      [{ route: "plantedRow", module: "planted", fn: "plantedRun" }],
+    ).violations;
+    expect(namespaced).toHaveLength(1);
+    expect(namespaced[0]?.why).toContain("cannot read");
   });
 
   test("the masker keeps code and blanks what is not", () => {
