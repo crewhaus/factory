@@ -8,7 +8,7 @@ import type { OperationRow, ReceiptVia } from "@crewhaus/control-contract";
 import type { ApiRunCapacity, ControlService, Projection } from "@crewhaus/control-service";
 import type { ControlClient, ControlTarget } from "@crewhaus/gateway-protocol/control-client";
 import type { HangarHarnessEntry, HangarRegistry } from "@crewhaus/harness-registry";
-import type { ApiRunInput, StartResult } from "@crewhaus/harness-supervisor";
+import type { ApiRunInput, JobRecord, StartResult } from "@crewhaus/harness-supervisor";
 import type { Caller, HomeAccess, RequestAccess } from "../access";
 import type { TextScrubber } from "../mask";
 import type { ThredzTasksRead } from "../thredz";
@@ -60,6 +60,15 @@ export type V1Deps = {
    * passes `apiRun`. Absent: Home starts no jobs, and a job run is refused.
    */
   readonly startRunJob?: (entry: HangarHarnessEntry, apiRun: ApiRunInput) => Promise<StartResult>;
+  /**
+   * Queue the job that writes a harness's archive (`crewhaus state backup --out <path>`),
+   * carrying out the command named. Absent: Home starts no jobs, and an export is refused.
+   */
+  readonly submitExportJob?: (
+    entry: HangarHarnessEntry,
+    argv: readonly string[],
+    command: { readonly commandId: string; readonly by: string },
+  ) => JobRecord;
   /** Stop the job a run Home started is running in; `false` when Home holds none for it. */
   readonly stopRunJob?: (entry: HangarHarnessEntry, runId: string) => Promise<boolean>;
   /** Whether Home has room for one more API job run on a harness. Absent: no cap is asked. */

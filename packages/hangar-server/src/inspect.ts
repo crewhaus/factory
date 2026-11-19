@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 /**
  * M3 · INSPECT — the raw browsers that make "inspect ALL captured data"
  * literally true, plus the `settings.json` editor.
@@ -87,6 +88,7 @@ import {
   closeSync,
   existsSync,
   fstatSync,
+  fsyncSync,
   lstatSync,
   openSync,
   readSync,
@@ -94,15 +96,14 @@ import {
   renameSync,
   rmSync,
   statSync,
-  writeFileSync,
+  writeSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { AREA_MODULES } from "@crewhaus/control-contract";
 import { SECURITY_SETTINGS_PATHS } from "@crewhaus/control-service";
 import { MAX_TEXT_BYTES } from "./constants";
-import { realOr } from "./harness-paths";
+import { realOr, realThroughLinks } from "./harness-paths";
 import { HttpError } from "./http";
-import { readTextCapped } from "./jsonl";
 import { replacePrivateKeyBlocks } from "./linear-mask";
 import type { M3Context, M3Handler } from "./m3";
 import { requirePermission, requireTypedConfirm } from "./m3";
@@ -429,12 +430,17 @@ export function resolvedExclusion(
 }
 
 /**
- * The place `resolved` really is, or would be, through every existing link (`realOr`), as
- * segments relative to the harness's real directory; undefined when it is the harness
- * itself or outside it.
+ * The place `resolved` leads, through every link, a link at its name included whether or
+ * not its target exists (`realThroughLinks`), as segments relative to the harness's real
+ * directory; undefined when it is the harness itself or outside it.
  */
 function realSegments(harnessDir: string, resolved: string): string[] | undefined {
-  const real = realOr(resolved);
+  return segmentsUnder(harnessDir, realThroughLinks(resolved));
+}
+
+/** `real` (a place already taken through every link) as segments relative to the
+ *  harness's real directory; undefined when it is the harness itself or outside it. */
+function segmentsUnder(harnessDir: string, real: string): string[] | undefined {
   const root = realOr(harnessDir);
   const rel = relative(root, real);
   if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return undefined;
@@ -728,18 +734,26 @@ function listEntries(
  * harness only to a caller who may read it.
  */
 function refuseExcluded(ctx: M3Context, segments: readonly string[], resolved?: string): void {
-  const excluded =
-    exclusionFor(segments) ??
-    (resolved !== undefined && ctx.harnessDir !== null
-      ? resolvedExclusion(ctx.harnessDir, resolved)
-      : null);
-  if (excluded !== null) {
-    throw new HttpError(
-      403,
-      `${relPath(segments)} is excluded from every inspect route: ${excluded.reason}. See ${excluded.where}.`,
-    );
-  }
-  const nested = resolved === undefined ? undefined : nestedHarnessOf(ctx, resolved);
+  const asked = exclusionFor(segments);
+  if (asked !== null) throw excludedError(segments, asked);
+  if (resolved !== undefined) refuseReal(ctx, segments, realThroughLinks(resolved));
+}
+
+const excludedError = (segments: readonly string[], excluded: InspectExclusion): HttpError =>
+  new HttpError(
+    403,
+    `${relPath(segments)} is excluded from every inspect route: ${excluded.reason}. See ${excluded.where}.`,
+  );
+
+/**
+ * Refuse `real`, a place already taken through every link, when it is excluded or inside
+ * another harness registered with this Home: the same 403 {@link refuseExcluded} answers.
+ */
+function refuseReal(ctx: M3Context, segments: readonly string[], real: string): void {
+  const under = ctx.harnessDir === null ? undefined : segmentsUnder(ctx.harnessDir, real);
+  const excluded = under === undefined ? null : exclusionFor(under);
+  if (excluded !== null) throw excludedError(segments, excluded);
+  const nested = ctx.nestedHarnessAt(real);
   if (nested === undefined) return;
   throw new HttpError(
     403,
@@ -750,15 +764,15 @@ function refuseExcluded(ctx: M3Context, segments: readonly string[], resolved?: 
 }
 
 /**
- * The registered harness inside this one that holds `resolved`'s real place, or the place
- * it would really be, through every existing link (`realOr`, as `nestedHarnessAt` resolves
- * its rows), whether or not anything is there; undefined when none does.
+ * The registered harness inside this one that holds the place `resolved` leads, through
+ * every link, a link at its name included whether or not its target exists
+ * (`realThroughLinks`); undefined when none does.
  */
 function nestedHarnessOf(
   ctx: M3Context,
   resolved: string,
 ): { readonly id: string; readonly visible: boolean } | undefined {
-  return ctx.nestedHarnessAt(realOr(resolved));
+  return ctx.nestedHarnessAt(realThroughLinks(resolved));
 }
 
 /** `statSync` that answers undefined instead of throwing. */
@@ -909,12 +923,17 @@ export const inspectIndex: M3Handler = (ctx) => {
 // GET /api/h/:id/inspect/:store
 // ---------------------------------------------------------------------------
 
+/** What a key fingerprint is: 64 lowercase hex digits. */
+const FINGERPRINT_RE = /^[0-9a-f]{64}$/;
+
 /** Project `identity.json` to the fingerprint plus PRESENCE booleans. The
- *  key material never leaves this process, masker or no masker. */
+ *  key material never leaves this process, masker or no masker, and the
+ *  fingerprint is shown only when it is one. */
 function identityProjection(document: unknown): Record<string, unknown> {
   const doc =
     typeof document === "object" && document !== null ? (document as Record<string, unknown>) : {};
-  const fingerprint = typeof doc["agentId"] === "string" ? doc["agentId"] : null;
+  const agentId = doc["agentId"];
+  const fingerprint = typeof agentId === "string" && FINGERPRINT_RE.test(agentId) ? agentId : null;
   return {
     fingerprint,
     fingerprintShort: fingerprint === null ? null : `sha256:${fingerprint.slice(0, 16)}…`,
@@ -949,6 +968,9 @@ function ownIdentityFile(ctx: M3Context): { dev: bigint; ino: bigint } | undefin
   }
 }
 
+/** A `"privateKey"` member, as JSON text spells one. */
+const PRIVATE_KEY_MEMBER_RE = /"privateKey"\s*:/;
+
 /** A parsed document that holds a private key at its top level. */
 function holdsPrivateKey(parsed: unknown): boolean {
   return (
@@ -964,8 +986,9 @@ function holdsPrivateKey(parsed: unknown): boolean {
  * never a parser's message (either could carry key bytes). Decided from the open file the
  * bytes were read from: by path (the requested path, or the place it really is, names an
  * identity file), by being this harness's own identity file (the same device and inode,
- * whatever the path or link), or by holding a private key. A file that does not parse
- * projects to nothing. Undefined when the read is not of an identity file.
+ * whatever the path or link), or by holding a private key: parsed, or, for a `.json` that
+ * does not parse or was cut short, a `"privateKey"` member in its text. A file that does
+ * not parse projects to nothing. Undefined when the read is not of an identity file.
  *
  * First consumer: {@link readInspected}, so every view of a file answers the same.
  */
@@ -990,7 +1013,10 @@ function identityAnswer(
     read.ino !== 0n &&
     read.dev === own.dev &&
     read.ino === own.ino;
-  const byContent = !read.truncated && holdsPrivateKey(parsed);
+  const whole = !read.truncated && parsed !== null;
+  const byContent = whole
+    ? holdsPrivateKey(parsed)
+    : resolved.toLowerCase().endsWith(".json") && PRIVATE_KEY_MEMBER_RE.test(read.text);
   if (!byPath && !byInode && !byContent) return undefined;
   return {
     document: identityProjection(parsed),
@@ -1001,10 +1027,57 @@ function identityAnswer(
   };
 }
 
+/** Where a read is when the test seam runs: before its open, or after it and before the
+ *  open file is approved. */
+export type InspectReadPhase = "before-open" | "before-approval";
+
+let openHook: ((resolved: string, phase: InspectReadPhase) => void) | undefined;
+
 /**
- * Read one already-contained file for an inspect view: one open, and only that open's
- * bytes are answered — as the identity projection when {@link identityAnswer} says it is
- * an identity file, otherwise through `readBody`.
+ * Test seam: run `hook` before a checked path is opened, and again after the open and
+ * before the open file is approved. Pass `undefined` to restore.
+ */
+export function _setInspectOpenHookForTest(
+  hook: ((resolved: string, phase: InspectReadPhase) => void) | undefined,
+): void {
+  openHook = hook;
+}
+
+/**
+ * Whether the open file `opened` is the file `resolved` leads to now, checked after the
+ * open: `resolved` is taken through every link once, that one place passes the exclusion
+ * and nested-harness checks (the same 403 as before the open), and its device and inode
+ * equal the open file's. Whatever the path leads to by the time this runs, the bytes
+ * answered are those of a file that passed the checks.
+ */
+function approvedRead(
+  ctx: M3Context,
+  segments: readonly string[],
+  resolved: string,
+  opened: OpenedRead,
+): OpenedRead {
+  if (opened.dev === null || opened.ino === null) return NOTHING_READ;
+  const real = realThroughLinks(resolved);
+  if (ctx.harnessDir !== null && segmentsUnder(ctx.harnessDir, real) === undefined) {
+    return NOTHING_READ;
+  }
+  refuseReal(ctx, segments, real);
+  try {
+    const stat = statSync(real, { bigint: true, throwIfNoEntry: false });
+    return stat !== undefined && stat.dev === opened.dev && stat.ino === opened.ino
+      ? opened
+      : NOTHING_READ;
+  } catch {
+    return NOTHING_READ;
+  }
+}
+
+/**
+ * Read one already-checked file for an inspect view: one open, and only that open's
+ * bytes are answered, and only once the open file is approved after the open
+ * ({@link approvedRead}); anything else reads as empty. Answered as the identity
+ * projection when {@link identityAnswer} says it is an identity file, otherwise through
+ * `readBody`.
  *
  * First consumers: the store view, a store entry, a skill's `SKILL.md` and the raw read.
  */
@@ -1013,7 +1086,10 @@ function readInspected(
   segments: readonly string[],
   resolved: string,
 ): { readonly body: InspectFileBody; readonly identity: boolean } {
-  const read = readOpened(resolved);
+  openHook?.(resolved, "before-open");
+  const opened = readOpened(resolved);
+  openHook?.(resolved, "before-approval");
+  const read = approvedRead(ctx, segments, resolved, opened);
   const identity = identityAnswer(ctx, segments, resolved, read);
   if (identity !== undefined) return { body: identity, identity: true };
   return { body: readBody(resolved, read, scrubberFor(ctx)), identity: false };
@@ -1192,6 +1268,13 @@ export const inspectEntry: M3Handler = (ctx) => {
   try {
     path = ctx.contain([...def.segments, name]);
   } catch {
+    if (ctx.harnessDir !== null) {
+      refuseExcluded(
+        ctx,
+        [...def.segments, name],
+        join(ctx.harnessDir, [...def.segments, name].join(sep)),
+      );
+    }
     return {
       present: false,
       note: `"${name}" resolves outside the harness directory and is not readable from here`,
@@ -1350,6 +1433,11 @@ export const inspectRaw: M3Handler = (ctx) => {
   try {
     path = ctx.contain(segments);
   } catch {
+    // A link is answered by where it leads, whether or not anything is there: one into
+    // an excluded folder or a registered harness inside this one is refused as that is.
+    if (ctx.harnessDir !== null) {
+      refuseExcluded(ctx, segments, join(ctx.harnessDir, segments.join(sep)));
+    }
     return {
       present: false,
       note: `${shown} resolves outside the harness directory and is not readable from here`,
@@ -1559,6 +1647,14 @@ const sameSegments = (a: readonly string[] | undefined, b: readonly string[]): b
   a.length === b.length &&
   a.every((part, i) => part.toLowerCase() === (b[i] as string).toLowerCase());
 
+/** The 409 for a settings file that is not this harness's own, regular settings file. */
+function notOwnSettingsFile(segments: readonly string[]): never {
+  throw new HttpError(
+    409,
+    `${relPath(segments)} is not this harness's own settings file here (it is a link, or it sits somewhere else), so it is neither shown nor replaced — edit it in the harness's own directory`,
+  );
+}
+
 /**
  * The settings write reads and replaces only this harness's own `.crewhaus/settings.json`:
  * a path an exclusion or another registered harness holds is refused (403), and a link, or
@@ -1567,12 +1663,7 @@ const sameSegments = (a: readonly string[] | undefined, b: readonly string[]): b
 function refuseSettingsPlace(ctx: M3Context, segments: readonly string[], path: string): void {
   refuseExcluded(ctx, segments, path);
   const harnessDir = ctx.harnessDir;
-  const refuse: () => never = () => {
-    throw new HttpError(
-      409,
-      `${relPath(segments)} is not this harness's own settings file here (it is a link, or it sits somewhere else), so it is neither shown nor replaced — edit it in the harness's own directory`,
-    );
-  };
+  const refuse: () => never = () => notOwnSettingsFile(segments);
   if (harnessDir === null) refuse();
   let link = false;
   try {
@@ -1591,6 +1682,90 @@ function refuseSettingsPlace(ctx: M3Context, segments: readonly string[], path: 
     !sameSegments(realSegments(harnessDir, parent), segments.slice(0, -1))
   ) {
     refuse();
+  }
+}
+
+let tempNameHook: ((path: string) => string) | undefined;
+
+/**
+ * Test seam: choose the name of the settings write's new file beside `path`. Pass
+ * `undefined` to restore the random name.
+ */
+export function _setSettingsTempNameForTest(hook: ((path: string) => string) | undefined): void {
+  tempNameHook = hook;
+}
+
+/**
+ * Replace the settings file at `path` with `text`: the bytes go into a NEW regular file
+ * beside it, under a random name, created by this call alone (exclusive, never through a
+ * link, never waiting), synced, and renamed over `path` once the place is checked again.
+ * Anything already at the new file's name refuses the write (500) and is left as it was;
+ * on any failure only the file this call created is removed.
+ */
+function writeSettingsFile(
+  ctx: M3Context,
+  segments: readonly string[],
+  path: string,
+  text: string,
+): void {
+  const tmp = tempNameHook?.(path) ?? `${path}.${randomBytes(8).toString("hex")}.hangar-tmp`;
+  const failed = (err: unknown): HttpError =>
+    new HttpError(
+      500,
+      `could not write ${relPath(segments)}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  let fd: number;
+  try {
+    fd = openSync(
+      tmp,
+      constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        (constants.O_NOFOLLOW ?? 0) |
+        (constants.O_NONBLOCK ?? 0),
+      0o600,
+    );
+  } catch (err) {
+    throw failed(err);
+  }
+  let created: { readonly dev: number; readonly ino: number } | undefined;
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error("the new file is not a regular file");
+    created = { dev: stat.dev, ino: stat.ino };
+    const bytes = Buffer.from(text, "utf8");
+    let at = 0;
+    while (at < bytes.length) at += writeSync(fd, bytes, at, bytes.length - at);
+    fsyncSync(fd);
+  } catch (err) {
+    closeSync(fd);
+    removeCreated(tmp, created);
+    throw failed(err);
+  }
+  closeSync(fd);
+  try {
+    refuseSettingsPlace(ctx, segments, path);
+    renameSync(tmp, path);
+  } catch (err) {
+    removeCreated(tmp, created);
+    if (err instanceof HttpError) throw err;
+    throw failed(err);
+  }
+}
+
+/** Remove `tmp` only when it is still the regular file this write created. */
+function removeCreated(
+  tmp: string,
+  created: { readonly dev: number; readonly ino: number } | undefined,
+): void {
+  if (created === undefined) return;
+  try {
+    const now = lstatSync(tmp);
+    if (now.isFile() && now.dev === created.dev && now.ino === created.ino) {
+      rmSync(tmp, { force: true });
+    }
+  } catch {
+    // Already gone: nothing of this write is left.
   }
 }
 
@@ -1618,7 +1793,19 @@ export const settingsWrite: M3Handler = (ctx) => {
   const path = ctx.contain(def.segments);
   refuseSettingsPlace(ctx, def.segments, path);
   const existed = existsSync(path);
-  const before = existed ? readTextCapped(path, MAX_INSPECT_BYTES) : { text: "", truncated: false };
+  // One open of the file this write would replace: only a regular file that is not an
+  // identity file, by name, inode or content, is shown in the diff or replaced.
+  let before: { readonly text: string; readonly truncated: boolean } = {
+    text: "",
+    truncated: false,
+  };
+  if (existed) {
+    const read = readOpened(path);
+    if (read.dev === null || identityAnswer(ctx, def.segments, path, read) !== undefined) {
+      notOwnSettingsFile(def.segments);
+    }
+    before = read;
+  }
   const after = serializeSettings(next);
   const diff = settingsDiff(before.text, after);
   // Permission rules, hooks and the environment files decide what the agent may do, what
@@ -1686,24 +1873,9 @@ export const settingsWrite: M3Handler = (ctx) => {
     );
   }
 
-  // Atomic: write beside the target, then rename. A crash mid-write leaves
+  // Atomic: write a new file beside the target, then rename. A crash mid-write leaves
   // the old file intact rather than a half-written permission set.
-  const tmp = `${path}.hangar-tmp`;
-  try {
-    writeFileSync(tmp, after, { mode: 0o600 });
-    renameSync(tmp, path);
-  } catch (err) {
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-      // The temp file is already gone, or the directory is unwritable — the
-      // thrown error below is the operator's signal either way.
-    }
-    throw new HttpError(
-      500,
-      `could not write ${relPath(def.segments)}: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
+  writeSettingsFile(ctx, def.segments, path, after);
   return {
     applied: true,
     dryRun: false,

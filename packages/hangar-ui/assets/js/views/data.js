@@ -30,6 +30,7 @@ import {
   toast,
 } from "../dom.js";
 import { fmtCount, fmtRelativeTime } from "../util.js";
+import { twinGroup, writeTwin } from "./control.js";
 
 export async function renderData(root, ctx) {
   clear(root).appendChild(skeleton(4));
@@ -467,5 +468,10 @@ function growthCard(ctx, reload) {
     }),
     form,
     out,
+    twinGroup([
+      writeTwin("datasetMine", ctx, "Mine"),
+      writeTwin("datasetSynthesize", ctx, "Synthesize"),
+      writeTwin("datasetRefreshGoldens", ctx, "Refresh goldens"),
+    ]),
   ]);
 }

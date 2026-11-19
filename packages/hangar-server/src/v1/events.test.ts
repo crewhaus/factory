@@ -1029,3 +1029,72 @@ describe("a frame cap that lands on a run's terminal frame", () => {
     expect(again).toEqual([]);
   });
 });
+
+describe.skipIf(process.platform === "win32")(
+  "a run's session trace comes only from the harness's own sessions folder",
+  () => {
+    const SESS = "sess_00000000000000bb";
+
+    /** A harness with a run whose rows name {@link SESS}, and that session's trace at `at`. */
+    async function sessionRun(name: string, sessions: (dir: string) => string) {
+      const h = await home.harness(name);
+      const run = mintRunId();
+      const folder = sessions(h.dir);
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(
+        join(folder, `${SESS}.events.jsonl`),
+        `${JSON.stringify({ kind: "turn_start", runId: run, timestamp: AT })}\n`,
+      );
+      row(h.dir, run, "running", { session: SESS });
+      return { h, run };
+    }
+
+    async function framesOf(run: string): Promise<Frame[]> {
+      const feed = await open(`/api/v1/runs/${run}/events`);
+      expect(feed.status).toBe(200);
+      // The run's row arrives first; the trace, or the word that it is unreadable, with it.
+      await feed.until((f) => f.some((x) => x.event.startsWith("run.") && x.event !== "run.trace"));
+      await feed.until(() => false, 300);
+      await feed.close();
+      return feed.frames();
+    }
+
+    /** Point `dir`'s sessions folder at `target`, and answer `target`. */
+    function linkSessions(dir: string, target: string): string {
+      const sessions = join(dir, ".crewhaus", "sessions");
+      rmSync(sessions, { recursive: true, force: true });
+      mkdirSync(target, { recursive: true });
+      symlinkSync(target, sessions);
+      return target;
+    }
+
+    test("its own folder's trace is streamed", async () => {
+      const { run } = await sessionRun("session-own", (dir) => join(dir, ".crewhaus", "sessions"));
+      const frames = await framesOf(run);
+      expect(frames.filter((f) => f.event === "run.trace")).toHaveLength(1);
+      expect(frames.some((f) => f.event === "stream.gap")).toBe(false);
+    });
+
+    for (const [label, where] of [
+      [
+        "a folder linked out of the harness",
+        (dir: string) => join(dir, "..", "elsewhere-sessions"),
+      ],
+      [
+        "a folder linked into a harness nested in it",
+        (dir: string) => join(dir, "b", ".crewhaus", "sessions"),
+      ],
+    ] as const) {
+      test(`${label} is never opened, and the stream says the trace is unreadable`, async () => {
+        const { run } = await sessionRun(`session-${label.length}`, (dir) =>
+          linkSessions(dir, where(dir)),
+        );
+        const frames = await framesOf(run);
+        expect(frames.filter((f) => f.event === "run.trace")).toEqual([]);
+        const gap = frames.find((f) => f.event === "stream.gap");
+        expect(gap?.data["payload"]).toEqual({ reason: "unreadable", source: "session" });
+        everyFrameParses(frames);
+      });
+    }
+  },
+);

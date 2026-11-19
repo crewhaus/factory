@@ -46,6 +46,7 @@ import { confirmAction } from "../ui/dialog.js";
 import { bindDraft, draftKey } from "../ui/draft.js";
 import { panelNav } from "../ui/panels.js";
 import { fmtCount, fmtPct, fmtRelativeTime, fmtUsd, usdFromMicros } from "../util.js";
+import { writeTwin } from "./control.js";
 import { openConflict } from "./spec-edit.js";
 
 const PANELS = [
@@ -584,6 +585,7 @@ function forgetControl(ctx, spec, factId, host, reload) {
     });
   });
   wrap.appendChild(open);
+  wrap.appendChild(writeTwin("memoryForget", ctx, "Forget"));
   return wrap;
 }
 
@@ -648,6 +650,7 @@ function sweepCard(ctx, spec, host, reload) {
     }),
     plan,
     body,
+    writeTwin("memorySweep", ctx, "Sweep"),
   ]);
 }
 
@@ -746,6 +749,7 @@ function migrateCard(ctx) {
     }),
     el("div", { class: "editor-actions" }, [dry, name.node, real]),
     out,
+    writeTwin("memoryMigrate", ctx, "Migrate"),
   ]);
 }
 
@@ -980,6 +984,7 @@ function trashCard(trash, ctx, host, reload) {
       text: `clearing continuity moves files here — restorable by timestamp, purged after ${String(trash?.purgeAfterDays ?? 7)} days`,
     }),
     table(["Snapshot", "Age", "Files", "State", ""], rows),
+    writeTwin("continuityRestore", ctx, "Restore"),
   ]);
 }
 
@@ -1059,6 +1064,7 @@ async function drawReflect(host, ctx, reload, state) {
         : noRows
           ? empty(data, "No wiki articles yet")
           : reflectTable(data, ctx, host, reload, state, controls),
+      controls.rowArchive && !noRows ? writeTwin("wikiArchive", ctx, "Archive") : null,
       ...(Array.isArray(filters.available) && filters.available.length > 0
         ? [
             el("p", {
@@ -1432,6 +1438,7 @@ function editorCard(ctx, host, reload, state, row) {
     ]),
     status,
     conflict,
+    writeTwin("wikiWrite", ctx, "Save"),
     signals,
   ]);
 }
@@ -1462,6 +1469,7 @@ function signalsControl(ctx, row, host, reload, state) {
       class: "muted gated-why",
       text: "signals are metadata: no version bump, no snapshot, the body untouched",
     }),
+    writeTwin("wikiSignals", ctx, "Verified"),
   ]);
 }
 
@@ -1888,6 +1896,7 @@ function toggleControl(ctx, analytics, host, reload) {
       { id: ctx.id, reload: () => void rerenderWatchme(host, ctx, reload) },
     );
   });
+  wrap.appendChild(writeTwin("watchmeToggle", ctx, "Watch"));
   return wrap;
 }
 
@@ -2014,6 +2023,7 @@ function proposalBlock(proposal, ctx, host, reload, rev) {
         ? el("p", { class: "muted", text: "this proposal changes nothing in the live spec" })
         : table(["", "Path", "Tier", "Now", "Proposed", "Why"], rows),
       el("div", { class: "editor-actions" }, [nameField.node, apply]),
+      writeTwin("watchmeApply", ctx, "Apply"),
       collapsible(
         [el("span", { class: "muted", text: "the proposed spec" })],
         [el("pre", { class: "rawjson", tabindex: "0", text: String(proposal.yaml ?? "") })],
@@ -2068,6 +2078,7 @@ function publishCard(ctx) {
     }),
     el("div", { class: "editor-actions" }, [dry, nameField.node, real]),
     out,
+    writeTwin("watchmePublish", ctx, "Publish"),
   ]);
 }
 
@@ -2292,6 +2303,7 @@ async function knowledgePanel(host, ctx, reload) {
         class: "muted",
         text: "push is the one direction that can leak: it redacts on the way out and drops anything still credential-shaped",
       }),
+      writeTwin("knowledgeSync", ctx, "Sync"),
       out,
     ]),
   );

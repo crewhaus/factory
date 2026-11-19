@@ -148,6 +148,23 @@ function write(
   };
 }
 
+/**
+ * The note beside each write that has no core command kind: its command-line
+ * equivalent, or why there is none. Read from the table's own rows, so a
+ * route and its note are never served apart.
+ */
+export function twinNotesOf(
+  table: readonly RouteRow[] = ROUTE_TABLE,
+): Readonly<Record<string, string>> {
+  const notes: Record<string, string> = {};
+  for (const row of table) {
+    if (row.receipt !== "none" && row.cliTwin === null && row.note !== undefined) {
+      notes[row.key] = row.note;
+    }
+  }
+  return notes;
+}
+
 /** Routes under `/api` the server answers that the console's map does not name. */
 export const OFF_MAP_KEYS: readonly string[] = [
   "setGroupsAll",
@@ -322,6 +339,7 @@ export const ROUTE_TABLE: readonly RouteRow[] = [
   read("plugins", "/api/plugins", "home.read", ["filtered"]),
   read("pluginPane", "/api/plugins/:plugin/panes/:pane", "home.read", ["filtered"]),
   read("panes", "/api/h/:id/panes", "h.read"),
+  read("twinNotes", "/api/twin-notes", "home.read"),
 
   // ---- spec ----
   write("specEdit", "harness", "PUT", "/api/h/:id/spec", "h.spec.edit"),

@@ -32,6 +32,7 @@ import {
   toast,
 } from "../dom.js";
 import { fmtRelativeTime } from "../util.js";
+import { HOME_WIDE, twinGroup, writeTwin } from "./control.js";
 
 /**
  * Read one M3 route. The generated wrappers answer `{ ok, status, body }`
@@ -154,6 +155,9 @@ function envCards(body, ctx, reload) {
   nodes.push(
     el("p", { class: "muted", text: `writes go to ${String(body.editTarget ?? ".env")} (0600)` }),
   );
+  if (keys.length > 0) {
+    nodes.push(twinGroup([writeTwin("envSet", ctx, "Set"), writeTwin("envUnset", ctx, "Unset")]));
+  }
 
   const ambient = Array.isArray(body.ambient) ? body.ambient : [];
   if (ambient.length > 0) {
@@ -346,6 +350,7 @@ function doctorCard(body, ctx, reload) {
   if (typeof body.probeNote === "string") {
     nodes.push(el("p", { class: "muted", text: body.probeNote }));
   }
+  nodes.push(writeTwin("doctorRun", ctx, "Run doctor"));
   return nodes;
 }
 
@@ -616,5 +621,6 @@ function setAcrossForm(harnesses, keys, reload) {
     }),
     el("div", { class: "chip-group" }, boxes),
     el("div", { class: "row-editor" }, [datalist, keyInput, valueInput, confirmInput, apply]),
+    writeTwin("credentialsSetAcross", HOME_WIDE, "Set"),
   ]);
 }

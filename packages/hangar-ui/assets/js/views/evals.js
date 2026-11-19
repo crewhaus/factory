@@ -7,6 +7,7 @@
 
 import { api } from "../api.js";
 import { clear, dot, el, emptyState, jsonPre, scrollRegion, skeleton, toast } from "../dom.js";
+import { actionBar } from "../inspect/actions.js";
 import { hrefHarness } from "../router.js";
 import {
   fmtRelativeTime,
@@ -80,6 +81,19 @@ export function drawHistory(root, ctx, data, reload) {
             href: hrefHarness(ctx.id, "evals", runId),
             text: runId || "(run)",
           }),
+          /^run_[0-9a-f]{16}$/.test(runId)
+            ? actionBar({
+                ref: `${ctx.id}/evalrun/${runId}`,
+                label: `evaluation run ${runId}`,
+                ...(typeof ctx.dir === "string" && ctx.dir !== "" ? { dir: ctx.dir } : {}),
+                operation: {
+                  id: "exports.evalResults",
+                  params: { h: ctx.id, run: runId },
+                  query: { format: "csv" },
+                },
+                exports: { evalRun: runId },
+              })
+            : null,
         ]),
         el("td", { class: "mono", text: String(run.datasetName ?? run.dataset ?? "—") }),
         el("td", null, [passDot(run)]),

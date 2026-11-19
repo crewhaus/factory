@@ -50,8 +50,11 @@
  * `settings.json` is shared with the runtime's own `hooks`/`permissions`
  * blocks, and this reader must never be the thing that drops them.
  */
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { readHarnessRecordText } from "./contained-read";
+
+/** The most of `settings.json` the manager reads; a larger file reads as no settings. */
+export const MANAGER_SETTINGS_MAX_BYTES = 1024 * 1024;
 
 /** Where the block lives, relative to the harness root. */
 export const MANAGER_SETTINGS_SEGMENTS = [".crewhaus", "settings.json"] as const;
@@ -96,11 +99,20 @@ const EMPTY: ManagerSettings = {
   hooks: { timeoutMs: DEFAULT_HOOK_TIMEOUT_MS },
 };
 
-/** The raw `manager` object, or undefined when there isn't a usable one. */
+/**
+ * The raw `manager` object, or undefined when there isn't a usable one. The file is read
+ * only as a regular file inside the harness, without waiting on it.
+ */
 export function readManagerBlock(harnessDir: string): Record<string, unknown> | undefined {
+  const text = readHarnessRecordText(
+    harnessDir,
+    join(harnessDir, ...MANAGER_SETTINGS_SEGMENTS),
+    MANAGER_SETTINGS_MAX_BYTES,
+  );
+  if (text === undefined) return undefined;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(join(harnessDir, ...MANAGER_SETTINGS_SEGMENTS), "utf8"));
+    parsed = JSON.parse(text);
   } catch {
     return undefined;
   }

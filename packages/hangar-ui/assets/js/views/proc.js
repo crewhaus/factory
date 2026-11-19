@@ -145,6 +145,9 @@ export function procActionBar(id, dir, row, reload) {
       });
     }
     bar.appendChild(remedy);
+    if (planError.action.jobKind !== null) {
+      bar.appendChild(actionTwin("job", { dir, kind: planError.action.jobKind }));
+    }
   }
 
   const reasons = el("div", { class: "proc-reasons" });

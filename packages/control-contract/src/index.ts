@@ -229,6 +229,16 @@ export {
   type PluginReviewState,
 } from "./areas/integrations.js";
 export {
+  EXPORT_FORMATS,
+  type EvalResultsExport,
+  type ExportFormat,
+  HOME_MODULE,
+  type HarnessExportList,
+  type HarnessExportRow,
+  type HarnessExportStarted,
+  type SpecExport,
+} from "./areas/home.js";
+export {
   CREATION_MODULE,
   type SpecEffectiveRow,
   type SpecReadOnlyState,

@@ -1429,6 +1429,8 @@ export const TWIN_ACTIONS = [
   "adjudicate",
   "baseline",
   "job",
+  "eval-export",
+  "state-backup",
 ];
 
 /**
@@ -1521,6 +1523,18 @@ export function cliTwinFor(action, args = {}) {
       return typeof a.kind === "string" && Object.hasOwn(JOB_COMMANDS, a.kind)
         ? [...prefix, JOB_COMMANDS[a.kind]].join(" ")
         : null;
+    case "eval-export":
+      // One evaluation run's rows, written where the CLI runs; the format is a closed pair.
+      return at([
+        "eval-report",
+        "export",
+        "--runs",
+        quotedOr(a.runDir, "<run-dir>"),
+        "--format",
+        a.format === "csv" || a.format === "jsonl" ? a.format : "csv|jsonl",
+      ]);
+    case "state-backup":
+      return at(["state", "backup", "--out", quotedOr(a.out, "<path>")]);
     default:
       return null;
   }

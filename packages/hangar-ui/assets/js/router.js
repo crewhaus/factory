@@ -14,6 +14,10 @@
  *   #/settings[/<page>]                 Settings
  *   #/h/<id>                            a harness's Overview
  *   #/h/<id>/<section>[/<sub>[/…rest]]  section ∈ overview | work | quality | knowledge | setup
+ *   #/i/<scope>/<kind>/<id>             an object link: opens the object where it lives,
+ *                                       with the inspector over it
+ *   #/i/<id>[?harness=<h>]              a bare id: Home says where it lives
+ *   …?inspect=<ref>                     on any route: the inspector over that view
  *
  * The fleet pages come from `destinations.js` and the harness sub-views from
  * `sections/*.js`, so a new page is a table row, not a router edit. Ids in
@@ -228,6 +232,79 @@ export function redirectFor(hash) {
   return null;
 }
 
+/** The longest ref Home reads (`REF_MAX_LENGTH`). */
+export const REF_MAX_LENGTH = 200;
+
+/** A harness id: `hrn_` and 16 hex (`HARNESS_ID_RE`). */
+const HARNESS_SCOPE_RE = /^hrn_[0-9a-f]{16}$/;
+
+/**
+ * The shape of a ref, `<scope>/<kind>/<id>`, as `{scope, kind, id}`, or null.
+ * Only the shape: at most {@link REF_MAX_LENGTH} characters, no whitespace, no
+ * `%`, three segments, the scope `home` or a harness id. Whether the kind exists
+ * and the id fits it is Home's to say when it resolves the ref, so this never
+ * refuses a ref Home would accept.
+ */
+export function refShape(text) {
+  if (typeof text !== "string" || text.length > REF_MAX_LENGTH) return null;
+  if (/\s/.test(text) || text.includes("%")) return null;
+  const parts = text.split("/");
+  if (parts.length !== 3 || parts.some((p) => p === "")) return null;
+  const [scope, kind, id] = parts;
+  if (scope !== "home" && !HARNESS_SCOPE_RE.test(scope)) return null;
+  return { scope, kind, id };
+}
+
+/** A bare id's shape: one segment, no whitespace, no `%`, within the length. */
+function bareShape(text) {
+  return (
+    typeof text === "string" && text !== "" && text.length <= REF_MAX_LENGTH && !/[\s%/]/.test(text)
+  );
+}
+
+function parseInspect(parts, query, raw) {
+  const rest = parts.slice(1);
+  if (rest.length === 3) {
+    const ref = rest.join("/");
+    if (refShape(ref) === null) return { view: "notfound", hash: raw };
+    return { view: "inspect-ref", ref, bare: false, query };
+  }
+  if (rest.length === 1 && bareShape(rest[0])) {
+    return { view: "inspect-ref", ref: rest[0], bare: true, query };
+  }
+  return { view: "notfound", hash: raw };
+}
+
+/** An object link's address: `#/i/<ref>`, its segments encoded. */
+export function hrefInspect(ref, harness = null) {
+  const path = `#/i/${String(ref).split("/").map(encodeURIComponent).join("/")}`;
+  return harness === null ? path : `${path}?harness=${encodeURIComponent(harness)}`;
+}
+
+/** `hash` with `?inspect=<ref>` set: the inspector over that view. */
+export function withInspect(hash, ref) {
+  const raw = typeof hash === "string" ? hash : "";
+  const at = raw.indexOf("?");
+  const path = at === -1 ? raw : raw.slice(0, at);
+  const kept = (at === -1 ? "" : raw.slice(at + 1))
+    .split("&")
+    .filter((pair) => pair !== "" && safeDecode(pair.split("=")[0]) !== "inspect");
+  const pairs = [...kept, `inspect=${encodeURIComponent(ref)}`];
+  return `${path}?${pairs.join("&")}`;
+}
+
+/** `hash` without its `?inspect=`: the view the inspector was over. */
+export function withoutInspect(hash) {
+  const raw = typeof hash === "string" ? hash : "";
+  const at = raw.indexOf("?");
+  if (at === -1) return raw;
+  const kept = raw
+    .slice(at + 1)
+    .split("&")
+    .filter((pair) => pair !== "" && safeDecode(pair.split("=")[0]) !== "inspect");
+  return kept.length === 0 ? raw.slice(0, at) : `${raw.slice(0, at)}?${kept.join("&")}`;
+}
+
 function fleetRoute(area, sub, query) {
   return { view: area, section: null, sub, rest: [], query };
 }
@@ -265,6 +342,7 @@ function parseHarness(id, tail, query, raw) {
  *   fleet:    { view: <area>, section: null, sub: <page id> | null, rest: [], query }
  *   harness:  { view: "harness", id, section, sub, rest, query,
  *               runId?, sampleId?, sessionId?, wikiSlug? }
+ *   link:     { view: "inspect-ref", ref, bare, query }
  *   unknown:  { view: "notfound", hash }
  */
 export function parseRoute(hash) {
@@ -277,6 +355,7 @@ export function parseRoute(hash) {
     if (parts.length < 2) return { view: "notfound", hash: raw };
     return parseHarness(parts[1], parts.slice(2), query, raw);
   }
+  if (parts[0] === "i") return parseInspect(parts, query, raw);
   const area = FLEET_AREAS.find((a) => a.segment === parts[0]);
   if (area === undefined) return { view: "notfound", hash: raw };
   if (parts.length === 1) return fleetRoute(area.id, null, query);
@@ -336,6 +415,7 @@ export function hrefLibrary() {
 export function routeTemplate(route) {
   if (!route || typeof route !== "object") return null;
   if (route.view === "notfound") return null;
+  if (route.view === "inspect-ref") return route.bare === true ? "#/i/:id" : "#/i/:ref";
   if (route.view === "harness") {
     const base = route.section === "overview" && route.sub === null ? "#/h/:id" : null;
     if (base !== null) return base;
@@ -457,6 +537,7 @@ export function screenLabel(screen) {
  */
 export function pageTitle(route, names = {}) {
   if (!route || route.view === "notfound") return "Nothing at this address — Hangar";
+  if (route.view === "inspect-ref") return "Opening a link — Hangar";
   if (route.view === "harness") {
     const section = sectionById(route.section);
     const page =

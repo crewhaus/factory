@@ -48,6 +48,7 @@ import { confirmAction } from "../ui/dialog.js";
 import { emptyFor } from "../ui/empty.js";
 import { panelNav } from "../ui/panels.js";
 import { clampText, fmtRelativeTime } from "../util.js";
+import { twinGroup, writeTwin } from "./control.js";
 
 /** The sub-tabs of the Thredz tab, in display order. */
 const PANELS = [
@@ -502,6 +503,7 @@ function newArticleCard(ctx, open) {
       text: "New articles are private unless you say otherwise — the hosted API would default them to shared, and this console does not inherit that.",
     }),
     form,
+    writeTwin("thredzWikiWrite", ctx, "Create"),
   ]);
 }
 
@@ -659,6 +661,7 @@ function editorCard(ctx, slug, article, version, reload) {
       text: "Writes carry the version you read; a create is private unless you say otherwise. The title is edited in the workspace, never echoed from here.",
     }),
     form,
+    writeTwin("thredzWikiWrite", ctx, "Save"),
   ]);
 }
 
@@ -704,6 +707,7 @@ function versionsCard(ctx, slug, payload, reload) {
       rows.length === 0
         ? emptyState("No recorded versions yet", null)
         : table(["Version", "Message", "When", ""], rows),
+      rows.length === 0 ? null : writeTwin("thredzWikiRollback", ctx, "Roll back"),
     ],
     fetchedChip(payload),
   );
@@ -827,6 +831,12 @@ async function renderRecordsPanel(host, ctx, state = { type: "", status: "", tag
               null,
             )
           : table(["Title", "Type", "Status", "Tags", "Updated", ""], rows),
+        rows.length === 0
+          ? null
+          : twinGroup([
+              writeTwin("thredzRecordDelete", ctx, "Delete"),
+              writeTwin("thredzRecordRestore", ctx, "Restore"),
+            ]),
       ],
       fetchedChip(payload),
     ),
@@ -878,6 +888,7 @@ function recordCreateCard(ctx, schemas, reload) {
       text: "Schema validation happens in the workspace; its message is shown here word for word.",
     }),
     form,
+    writeTwin("thredzRecordCreate", ctx, "Create"),
   ]);
 }
 
@@ -1011,6 +1022,7 @@ async function renderPlanPanel(host, ctx) {
               null,
             )
           : table(["Task", "Status", "Priority", "Tags", "Deadline", ""], taskRows),
+        taskRows.length === 0 ? null : writeTwin("thredzTaskUpdate", ctx, "Update"),
       ],
       fetchedChip(tasks),
     ),
@@ -1350,6 +1362,7 @@ function addCardCard(ctx, dashboardId, payload, reload) {
       text: "A KPI card needs both an aggregation and an aggregation field. Record filters take `tags` as an array; task and goal filters take a singular `tag`.",
     }),
     form,
+    writeTwin("thredzCardCreate", ctx, "Add card"),
   ]);
 }
 
@@ -1556,6 +1569,7 @@ function listenerCreateForm(ctx, reload) {
       class: "muted",
       text: "Creates are idempotency-keyed, so a replayed request cannot duplicate the automation.",
     }),
+    writeTwin("thredzListenerCreate", ctx, "Create"),
   ]);
 }
 
@@ -1747,6 +1761,7 @@ function keyCreateCard(ctx, reload) {
       text: "Mint the key in the Thredz account portal, then paste it here once. The manager forwards it and never stores, logs or returns it — which is also why it can never show you a key you have lost.",
     }),
     form,
+    writeTwin("thredzKeyCreate", ctx, "Register"),
   ]);
 }
 
@@ -1791,6 +1806,7 @@ function renderRotate(host, ctx, key, reload) {
         text: "Rotation registers a REPLACEMENT key with the same owner, permissions and wiki grant. It does not delete the old key — this console ships no hard-delete affordance, so retiring the old value stays a deliberate act in the Thredz account portal.",
       }),
       form,
+      writeTwin("thredzKeyRotate", ctx, "Rotate"),
     ]),
   );
 }

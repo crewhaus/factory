@@ -47,6 +47,11 @@ export async function renderCosts(root, ctx) {
   const costs = data?.costs && typeof data.costs === "object" ? data.costs : null;
   const models = Array.isArray(costs?.byModel) ? costs.byModel : [];
   const days = Array.isArray(costs?.days) ? costs.days : [];
+  // Unobtainable is not zero: when the logs could not be read, the cost is unknown.
+  if (costs !== null && typeof costs.unknown === "string" && costs.unknown !== "") {
+    root.appendChild(emptyState(`Cost unknown: ${costs.unknown}`, null));
+    return;
+  }
   if (costs === null || (models.length === 0 && costs.calls === 0)) {
     root.appendChild(
       emptyState("No cost data yet. Cost tracking is on by default.", "crewhaus run crewhaus.yaml"),

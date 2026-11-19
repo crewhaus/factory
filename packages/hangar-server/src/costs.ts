@@ -44,7 +44,7 @@ import { readdirSync, statSync } from "node:fs";
 import { SESSION_JSONL_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
 import { resolveContained } from "./safety";
-import { resolveSessionRoot } from "./sessions";
+import { reachableSessionRoot } from "./sessions";
 
 export type ModelCostRow = {
   readonly provider: string;
@@ -130,6 +130,12 @@ export type HarnessCosts = {
   readonly days: readonly DailyCostRow[];
   /** Session files whose read hit a cap (the totals are floors, not lies). */
   readonly truncatedFiles: number;
+  /**
+   * Why the cost is unknown, when it is: the sessions folder is unreachable, so no
+   * log was read and every total here stands for nothing, never for $0. Null when
+   * the logs were read.
+   */
+  readonly unknown: string | null;
 };
 
 type AccrualFields = {
@@ -182,10 +188,11 @@ const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
 /** Fold every `sess_*.jsonl` under the harness's resolved session root. */
 export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCosts {
-  const { root } = resolveSessionRoot(harnessDir);
+  const reach = reachableSessionRoot(harnessDir);
+  const root = reach.reachable ? reach.root : "";
   let files: string[];
   try {
-    files = readdirSync(root).filter((f) => SESSION_JSONL_RE.test(f));
+    files = reach.reachable ? readdirSync(root).filter((f) => SESSION_JSONL_RE.test(f)) : [];
   } catch {
     files = [];
   }
@@ -299,5 +306,6 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
       ...(b.unpricedCalls > 0 ? { unpricedCalls: b.unpricedCalls } : {}),
     })),
     truncatedFiles,
+    unknown: reach.reachable ? null : reach.note,
   };
 }

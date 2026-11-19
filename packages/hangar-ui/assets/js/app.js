@@ -20,7 +20,7 @@ import { createNavigator } from "./navigation.js";
 import { notifications } from "./notify.js";
 import { openOmnibox } from "./omnibox.js";
 import { applyPrefs, applyTheme, readPrefs, readTheme } from "./prefs.js";
-import { parseRoute, startRouter } from "./router.js";
+import { parseRoute, startRouter, withoutInspect } from "./router.js";
 import {
   afterRoute,
   drawNav,
@@ -83,7 +83,15 @@ const navigator = createNavigator({
  *  every later navigation moves focus to the new page's heading. */
 let navigatedBefore = false;
 
+/** The address of the page on screen, without its `?inspect=`, once it has drawn. */
+let drawnPage = null;
+
+/** The current address without its `?inspect=`. */
+const pageOf = () => withoutInspect(window.location.hash || "#/");
+
 function dispatch(route) {
+  const page = pageOf();
+  drawnPage = null;
   drawNav(route);
   // The screens that bind `?` for their own inbox sheet. Tracked here rather
   // than sniffed from the DOM so the ownership rule stays a pure input to the
@@ -91,7 +99,16 @@ function dispatch(route) {
   keyState = { ...keyState, inboxMounted: inboxKindOf(route) };
   viewStale = false;
   return navigator.navigate(route).then((outcome) => {
-    if (outcome === "done") navigatedBefore = true;
+    if (outcome === "done") {
+      navigatedBefore = true;
+      if (page === pageOf()) drawnPage = page;
+    }
+    // `?inspect=<ref>` opens the inspector over the page it drew; no inspect, none open.
+    if (outcome === "done" && route.view !== "inspect-ref") {
+      void import("./inspect/panel.js").then((panel) =>
+        panel.inspectAfterRoute(route, document.getElementById("view")),
+      );
+    }
     return outcome;
   });
 }
@@ -107,7 +124,8 @@ function dispatch(route) {
  * whether single-key shortcuts are on (Readability).
  *
  * Escape closes an open tooltip first and claims nothing else, so a tooltip
- * inside a dialog never takes the dialog with it.
+ * inside a dialog never takes the dialog with it. An Escape nothing else
+ * claimed, with no dialog open, closes the inspector beside the page.
  */
 function installKeyboard() {
   document.addEventListener("keydown", (event) => {
@@ -124,6 +142,16 @@ function installKeyboard() {
     else if (effect === "close-omnibox") closeOverlay();
     else if (effect === "toggle-sheet") drawSheet();
     else if (effect === "close-sheet") drawSheet();
+    else if (
+      event.key === "Escape" &&
+      !claimed &&
+      !event.defaultPrevented &&
+      document.querySelector("dialog[open]") === null &&
+      document.querySelector("#view > aside.inspector") !== null
+    ) {
+      event.preventDefault();
+      void import("./inspect/panel.js").then((panel) => panel.closeInspector());
+    }
   });
 }
 
@@ -274,6 +302,20 @@ async function boot() {
       });
     });
     startRouter((route) => {
+      // Only `?inspect=` changed: the inspector opens or closes over the page as it
+      // is, and focus goes back to what opened it. The page is not drawn again.
+      if (
+        route.view !== "inspect-ref" &&
+        !viewStale &&
+        drawnPage !== null &&
+        pageOf() === drawnPage
+      ) {
+        const opener = document.activeElement;
+        void import("./inspect/panel.js").then((panel) =>
+          panel.inspectAfterRoute(route, document.getElementById("view"), { opener }),
+        );
+        return;
+      }
       dispatch(route);
     });
   };

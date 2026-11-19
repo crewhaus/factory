@@ -1219,7 +1219,7 @@ describe("CLI twins", () => {
         `${action}: string`,
       );
     }
-    expect(sup.TWIN_ACTIONS).toHaveLength(12);
+    expect(sup.TWIN_ACTIONS).toHaveLength(14);
   });
 
   test("an action with no CLI verb says so instead of inventing one", () => {

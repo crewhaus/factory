@@ -29,16 +29,17 @@ import { SESSION_JSONL_RE, SESSION_JSON_RE } from "./constants";
 import { type HarnessCosts, foldHarnessCosts } from "./costs";
 import { readJsonlCapped } from "./jsonl";
 import { resolveContained } from "./safety";
-import { resolveSessionRoot } from "./sessions";
+import { reachableSessionRoot } from "./sessions";
 
 export type HarnessRollup = {
   readonly digest: string;
   readonly cachedAt: string;
   readonly lastEval: LastEval | null;
-  readonly sessionCount: number;
+  /** Null when the sessions folder is unreachable: the count is unknown, not zero. */
+  readonly sessionCount: number | null;
   readonly feedbackCount: number;
-  /** USD micros accrued in the trailing 7 days. */
-  readonly spend7d: number;
+  /** USD micros accrued in the trailing 7 days; null when unknown (the sessions folder is unreachable). */
+  readonly spend7d: number | null;
   readonly costBreakdown: HarnessCosts;
 };
 
@@ -79,9 +80,11 @@ function dirLines(dir: string, filter?: (name: string) => boolean): string[] {
  * Stats only — no content reads.
  */
 export function computeRollupDigest(harnessDir: string): string {
-  const { root } = resolveSessionRoot(harnessDir);
-  const lines: string[] = [`root:${root}`];
-  lines.push(...dirLines(root, (n) => SESSION_JSON_RE.test(n) || SESSION_JSONL_RE.test(n)));
+  const reach = reachableSessionRoot(harnessDir);
+  const lines: string[] = [reach.reachable ? `root:${reach.root}` : "root:unreachable"];
+  if (reach.reachable) {
+    lines.push(...dirLines(reach.root, (n) => SESSION_JSON_RE.test(n) || SESSION_JSONL_RE.test(n)));
+  }
   // From the harness dir, not dirname(root): an overridden session root can
   // sit anywhere, and its parent is not part of this harness.
   lines.push(
@@ -105,9 +108,11 @@ function countSessionFiles(sessionRoot: string): number {
 /** Distinct rated turns, the way `crewhaus distill` folds them: feedback
  *  events in the RESOLVED session root's logs plus bare records under
  *  `.crewhaus/feedback/*.jsonl`, merged per (sessionId, turnNumber). */
-function countFeedbackRecords(harnessDir: string, sessionRoot: string): number {
+function countFeedbackRecords(harnessDir: string, sessionRoot: string | undefined): number {
   const objects: unknown[] = [];
-  for (const dir of [sessionRoot, join(harnessDir, ".crewhaus", "feedback")]) {
+  const dirs = [join(harnessDir, ".crewhaus", "feedback")];
+  if (sessionRoot !== undefined) dirs.unshift(sessionRoot);
+  for (const dir of dirs) {
     let names: string[];
     try {
       names = readdirSync(dir);
@@ -127,7 +132,8 @@ function countFeedbackRecords(harnessDir: string, sessionRoot: string): number {
 /** Compute the expensive rollup from scratch (the cache-miss path). */
 export function computeRollup(harnessDir: string, nowMs: number): HarnessRollup {
   const digest = computeRollupDigest(harnessDir);
-  const { root } = resolveSessionRoot(harnessDir);
+  const reach = reachableSessionRoot(harnessDir);
+  const root = reach.reachable ? reach.root : undefined;
   const costs = foldHarnessCosts(harnessDir, nowMs);
   let lastEval: LastEval | null = null;
   try {
@@ -139,9 +145,9 @@ export function computeRollup(harnessDir: string, nowMs: number): HarnessRollup 
     digest,
     cachedAt: new Date(nowMs).toISOString(),
     lastEval,
-    sessionCount: countSessionFiles(root),
+    sessionCount: root === undefined ? null : countSessionFiles(root),
     feedbackCount: countFeedbackRecords(harnessDir, root),
-    spend7d: costs.spend7dUsdMicros,
+    spend7d: costs.unknown === null ? costs.spend7dUsdMicros : null,
     costBreakdown: costs,
   };
 }

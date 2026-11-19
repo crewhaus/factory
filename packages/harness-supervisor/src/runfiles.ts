@@ -42,7 +42,9 @@ import {
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
-import { readPage } from "@crewhaus/control-records";
+import { openRecordFd, readAt, readPage, readRecordFile } from "@crewhaus/control-records";
+import { readHarnessRecordText } from "./contained-read";
+import { MANAGER_SETTINGS_MAX_BYTES } from "./manager-settings";
 import { type LeaseProbe, PUMP_LEASE_PROBE, pumpLeaseBreakable } from "./trace-pump";
 import {
   CONTROL_TOKEN_NAME,
@@ -164,15 +166,38 @@ export function writeRunfile(harnessDir: string, runfile: DaemonRunfile): void {
   );
 }
 
+/** The most a small run record (`daemon.json`, `supervision.json`) is read to. */
+const RUN_RECORD_MAX_BYTES = 64 * 1024;
+
+/**
+ * A small record in the run directory, opened only as a regular file inside
+ * the harness, without blocking and without following a link at its name.
+ * Anything else, and a record larger than any the supervisor writes, reads as
+ * `undefined`; `missing` says the record is simply not there.
+ */
+function readRunRecord(
+  harnessDir: string,
+  name: string,
+): { readonly text: string } | { readonly missing: boolean } {
+  const read = readRecordFile(harnessDir, join(runDir(harnessDir), name), RUN_RECORD_MAX_BYTES);
+  if (!read.ok) return { missing: read.code === "not-found" };
+  if (read.truncated) return { missing: false };
+  return { text: read.text };
+}
+
 /**
  * Read `daemon.json`. Absent, unreadable, unparseable, or shape-invalid all
  * read as "no runfile" — a corrupt runfile must never wedge a harness shut,
- * and the caller's next start simply overwrites it.
+ * and the caller's next start simply overwrites it. It is read only as a
+ * regular file inside the harness: a named pipe, a device or a link reads as
+ * no runfile, and the read never waits on one.
  */
 export function readRunfile(harnessDir: string): DaemonRunfile | undefined {
+  const record = readRunRecord(harnessDir, RUNFILE_NAME);
+  if (!("text" in record)) return undefined;
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(join(runDir(harnessDir), RUNFILE_NAME), "utf8"));
+    raw = JSON.parse(record.text);
   } catch {
     return undefined;
   }
@@ -239,16 +264,14 @@ export type SupervisionRead =
   | { readonly state: "present"; readonly record: SupervisionRecord }
   | { readonly state: "unreadable" };
 
-/** The persisted restart window. Tolerant: anything but a well-formed record is unreadable. */
+/**
+ * The persisted restart window. Tolerant: anything but a well-formed record,
+ * read as a regular file inside the harness, is unreadable.
+ */
 export function readSupervisionRecord(harnessDir: string): SupervisionRead {
-  let text: string;
-  try {
-    text = readFileSync(join(runDir(harnessDir), SUPERVISION_FILE_NAME), "utf8");
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "ENOENT"
-      ? { state: "absent" }
-      : { state: "unreadable" };
-  }
+  const record = readRunRecord(harnessDir, SUPERVISION_FILE_NAME);
+  if (!("text" in record)) return record.missing ? { state: "absent" } : { state: "unreadable" };
+  const text = record.text;
   try {
     const parsed = JSON.parse(text) as { v?: unknown; restarts?: unknown };
     if (parsed.v !== 1 || !Array.isArray(parsed.restarts)) return { state: "unreadable" };
@@ -407,19 +430,46 @@ export function patchRunLedger(harnessDir: string, patch: RunLedgerPatch): void 
   });
 }
 
+/** How much of the run ledger one read takes at a time. */
+const LEDGER_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * The run ledger's text, opened only as a regular file inside the harness
+ * (a link at its name is followed only while it stays inside) and without
+ * blocking, then read to the size its descriptor reports. Anything else
+ * reads as empty.
+ */
+function readLedgerText(harnessDir: string): string {
+  const opened = openRecordFd(harnessDir, join(runDir(harnessDir), RUN_LEDGER_NAME), true);
+  if (!opened.ok) return "";
+  try {
+    const size = opened.stats.size;
+    const decoder = new TextDecoder();
+    const chunk = new Uint8Array(Math.min(LEDGER_CHUNK_BYTES, Math.max(size, 1)));
+    let text = "";
+    for (let at = 0; at < size; ) {
+      const got = readAt(opened.fd, chunk, Math.min(chunk.length, size - at), at);
+      if (got === 0) break;
+      text += decoder.decode(chunk.subarray(0, got), { stream: true });
+      at += got;
+    }
+    return text + decoder.decode();
+  } catch {
+    return "";
+  } finally {
+    closeSync(opened.fd);
+  }
+}
+
 /**
  * Read the ledger, folded by `runId` (later lines win) and ordered by first
  * appearance. Torn lines are skipped, never fatal — a manager killed
  * mid-append leaves a partial final line and the rest of the history must
- * still read.
+ * still read. A ledger that is not a regular file inside the harness reads
+ * as no rows.
  */
 export function readRunLedger(harnessDir: string): RunLedgerEntry[] {
-  let text: string;
-  try {
-    text = readFileSync(join(runDir(harnessDir), RUN_LEDGER_NAME), "utf8");
-  } catch {
-    return [];
-  }
+  const text = readLedgerText(harnessDir);
   const byId = new Map<string, RunLedgerEntry>();
   for (const line of text.split("\n")) {
     if (line.trim() === "") continue;
@@ -456,14 +506,21 @@ export function recentRuns(harnessDir: string, limit: number): RunLedgerEntry[] 
  * Read `manager.logRetention` from `<harness>/.crewhaus/settings.json`,
  * falling back to the defaults (20 runs / 50 MB). Any read or shape problem
  * degrades to the defaults — retention is never a reason to refuse a spawn.
+ * The file is read only as a regular file inside the harness, without waiting.
  */
 export function readRetentionPolicy(
   harnessDir: string,
   defaults: RetentionPolicy = DEFAULT_RETENTION,
 ): RetentionPolicy {
+  const text = readHarnessRecordText(
+    harnessDir,
+    join(harnessDir, ".crewhaus", "settings.json"),
+    MANAGER_SETTINGS_MAX_BYTES,
+  );
+  if (text === undefined) return defaults;
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(join(harnessDir, ".crewhaus", "settings.json"), "utf8"));
+    raw = JSON.parse(text);
   } catch {
     return defaults;
   }

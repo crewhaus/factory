@@ -20,8 +20,11 @@
  * target exists) are resolved, the part that is absent is re-appended, and the
  * result must lie inside. A directory that does not exist yet is honoured; a link
  * inside the harness that points out of it, or that cannot be resolved, is not.
+ * Nor is a place inside another harness nested in this one: walking up from the
+ * root's real place, the nearest directory that holds a `.crewhaus` folder must
+ * be the harness itself.
  */
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 /** The variable that moves a harness's session root. */
@@ -66,10 +69,37 @@ function present(path: string): boolean {
   }
 }
 
+/** `dir` holds a `.crewhaus` folder: it is a harness's directory. */
+function holdsHarnessFolder(dir: string): boolean {
+  try {
+    return statSync(join(dir, ".crewhaus")).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Walking up from `real` to `realRoot`, the first directory that holds a `.crewhaus`
+ * folder is `realRoot` itself (or there is none before it): `real` is not another
+ * harness nested in this one, nor inside one.
+ */
+function notInNestedHarness(realRoot: string, real: string): boolean {
+  let at = real;
+  while (inside(realRoot, at)) {
+    if (at === realRoot) return true;
+    if (holdsHarnessFolder(at)) return false;
+    const parent = dirname(at);
+    if (parent === at) return true;
+    at = parent;
+  }
+  return true;
+}
+
 /**
  * `candidate` (absolute, or relative to `rootDir`) when it realpath-contains inside
- * `rootDir`, as given (not resolved through links); `undefined` when the root cannot
- * be read, the candidate escapes it, or a present part of it (a dangling link, say)
+ * `rootDir`, and not inside another harness nested in it, as given (not resolved
+ * through links); `undefined` when the root cannot be read, the candidate escapes
+ * it or lies in a nested harness, or a present part of it (a dangling link, say)
  * cannot be resolved.
  */
 function containedTarget(rootDir: string, candidate: string): string | undefined {
@@ -85,7 +115,7 @@ function containedTarget(rootDir: string, candidate: string): string | undefined
   const realExisting = realOf(existing);
   if (realExisting === undefined) return undefined;
   const mapped = realExisting + target.slice(existing.length);
-  return inside(realRoot, mapped) ? target : undefined;
+  return inside(realRoot, mapped) && notInNestedHarness(realRoot, mapped) ? target : undefined;
 }
 
 /**

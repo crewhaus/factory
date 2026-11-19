@@ -339,6 +339,54 @@ export function screenStates(harness: RouteHarness): readonly ScreenState[] {
       },
     },
     {
+      template: "#/h/:id",
+      state: "inspector open",
+      route: h("#/h/:id"),
+      // An object link: the harness's page with the inspector over it, a side panel on a
+      // wide screen and a full-screen dialog on a narrow one.
+      open: async (page) => {
+        await page.evaluate((hash) => {
+          globalThis.location.hash = hash;
+        }, `#/i/home/harness/${harness.id}`);
+        await waitFor(page, "aside.inspector h2, dialog.inspector[open] h2", "the inspector");
+      },
+    },
+    {
+      template: "#/h/:id/work/runs",
+      state: "run inspector open",
+      route: h("#/h/:id/work/runs"),
+      open: async (page) => {
+        await page.evaluate(
+          (hash) => {
+            globalThis.location.hash = hash;
+          },
+          `#/i/${harness.id}/exec/${harness.runId ?? ""}`,
+        );
+        await waitFor(page, "aside.inspector h2, dialog.inspector[open] h2", "the run's inspector");
+      },
+    },
+    {
+      template: HARNESSES_ROUTE,
+      state: "More open",
+      route: HARNESSES_ROUTE,
+      // A row's More list, wholly on the screen at every width.
+      open: async (page) => {
+        await page.locator(".action-bar .more-menu > summary").first().click();
+        await waitFor(page, ".more-menu[open] .more-list", "a row's More list");
+        const box = await page.evaluate(async () => {
+          // The list is placed when the menu's toggle event has run: two frames on.
+          for (let i = 0; i < 2; i++) await new Promise((r) => requestAnimationFrame(r));
+          const r = (
+            document.querySelector(".more-menu[open] .more-list") as HTMLElement
+          ).getBoundingClientRect();
+          return { left: r.left, right: r.right, width: globalThis.innerWidth };
+        });
+        if (box.left < 0 || box.right > box.width) {
+          throw new Error(`the More list lies outside the screen: ${JSON.stringify(box)}`);
+        }
+      },
+    },
+    {
       template: "#/h/:id/work/items",
       state: "add work typed",
       route: h("#/h/:id/work/items"),

@@ -24,6 +24,7 @@ import {
   toast,
   withTip,
 } from "../dom.js";
+import { actionBar } from "../inspect/actions.js";
 import { hrefGlobal, hrefHarness } from "../router.js";
 import { shapeAccentVars, shapeLabel } from "../shapes.js";
 import { procStatePill } from "../supervision.js";
@@ -43,6 +44,7 @@ import {
   rollupLine,
   sortRows,
 } from "../util.js";
+import { HOME_WIDE, twinGroup, writeTwin } from "./control.js";
 import { renderOnboarding, shouldOnboard } from "./onboarding.js";
 
 const state = {
@@ -362,6 +364,7 @@ function groupForm(groups, reload, onCancel) {
     input,
     el("button", { class: "btn btn-primary", type: "submit", text: "Add" }),
     el("button", { class: "btn btn-ghost", type: "button", text: "Cancel", onClick: onCancel }),
+    writeTwin("addGroup", HOME_WIDE, "Add"),
   ]);
   form.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -430,7 +433,18 @@ function renderToolbar(reload) {
     el("button", { class: "btn btn-primary", type: "button", text: "Add harness…" }),
     "Register one harness by its directory — the default gesture.",
   );
-  const bar = el("div", { class: "toolbar" }, [search, addBtn, findBtn, rootBtn, scanBtn]);
+  const bar = el("div", { class: "toolbar" }, [
+    search,
+    addBtn,
+    findBtn,
+    rootBtn,
+    scanBtn,
+    twinGroup([
+      writeTwin("addHarness", HOME_WIDE, "Add"),
+      writeTwin("addScanRoot", HOME_WIDE, "Add scan root"),
+      writeTwin("scan", HOME_WIDE, "Scan"),
+    ]),
+  ]);
 
   // The find panel: candidates from GET /api/registry/discover, each with an
   // Add. Only one open at a time, sharing the openedForm slot with the two
@@ -512,6 +526,7 @@ function renderToolbar(reload) {
       });
       panel.appendChild(el("div", { class: "missing-actions" }, [addAll]));
     }
+    if (candidates.length > 0) panel.appendChild(writeTwin("addHarness", HOME_WIDE, "Add"));
     bar.after(panel);
     openedForm = panel;
   });
@@ -603,6 +618,10 @@ function missingCard(row, reload) {
     ]),
     el("div", { class: "missing-dir mono", text: row.dir }),
     el("div", { class: "missing-actions" }, [relocate, removeBtn]),
+    twinGroup([
+      writeTwin("relocate", row, "Relocate"),
+      writeTwin("removeHarness", row, "Remove entry"),
+    ]),
   ]);
 }
 
@@ -710,6 +729,13 @@ function harnessRow(ctl) {
         el("a", { href: hrefHarness(row.id), class: "name-link", text: name }),
       ]),
       el("div", { class: "sub mono", title: row.dir, text: dirTail(row.dir, 2) }),
+      actionBar({
+        ref: `home/harness/${row.id}`,
+        label: `${name} (${row.id})`,
+        ...(typeof row.dir === "string" ? { dir: row.dir } : {}),
+        operation: { id: "harnesses.get", params: { h: row.id } },
+        exports: { spec: true, harness: true },
+      }),
     ]),
     el("td", null, [
       el("span", {
@@ -842,6 +868,13 @@ function editorRow(row, groups, reload) {
     ]),
     el("div", { class: "editor-actions" }, [
       el("button", { class: "btn btn-primary", type: "submit", text: "Save" }),
+    ]),
+    twinGroup([
+      writeTwin("setTags", row, "Tags"),
+      writeTwin("setNotes", row, "Notes"),
+      writeTwin("setGroups", row, "Groups"),
+      writeTwin("setHidden", row, "Hidden"),
+      writeTwin("setPin", row, "Pin"),
     ]),
   ]);
   form.addEventListener("submit", (e) => {

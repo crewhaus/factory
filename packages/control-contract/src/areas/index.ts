@@ -18,7 +18,7 @@ import { CREATION_MODULE } from "./creation.js";
 
 import { DELEGATION_MODULE } from "./delegation.js";
 
-// import { HOME_MODULE } from "./home.js";
+import { HOME_MODULE } from "./home.js";
 
 // import { INSPECTION_MODULE } from "./inspection.js";
 
@@ -45,7 +45,7 @@ export const AREA_MODULES = [
 
   DELEGATION_MODULE,
 
-  // HOME_MODULE,
+  HOME_MODULE,
 
   // INSPECTION_MODULE,
 

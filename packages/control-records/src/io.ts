@@ -32,19 +32,34 @@ export function _setIoTapForTest(next: IoTap | undefined): void {
   tap = next ?? {};
 }
 
-/** Open a record for a streaming read. The caller must `closeSync(fd)`. */
+/**
+ * Open a record for a streaming read: contained to `root`, without waiting, a regular
+ * file only. The caller must `closeSync(fd)`.
+ *
+ * First consumers: this package's segment readers, then harness-supervisor's run records
+ * (`runs.jsonl`, `settings.json`).
+ */
 export function openRecordFd(root: string, given: string, followLeafSymlink = false): ContainedFd {
   tap.open?.(given);
   return openForReadFd(root, given, { followLeafSymlink });
 }
 
-/** Read at most `maxBytes` of a small whole-file record. A link at the leaf is refused. */
+/**
+ * Read at most `maxBytes` of a small whole-file record. A link at the leaf is refused.
+ *
+ * First consumers: this package's small records, then harness-supervisor's `daemon.json`
+ * and `supervision.json`.
+ */
 export function readRecordFile(root: string, given: string, maxBytes: number): ContainedRead {
   tap.open?.(given);
   return openForReadSync(root, given, { maxBytes, followLeafSymlink: false });
 }
 
-/** Read `length` bytes at `position`, fewer only at the end of the file. */
+/**
+ * Read `length` bytes at `position`, fewer only at the end of the file.
+ *
+ * First consumers: this package's segment readers, then harness-supervisor's run records.
+ */
 export function readAt(fd: number, into: Uint8Array, length: number, position: number): number {
   tap.read?.(position, length);
   let done = 0;

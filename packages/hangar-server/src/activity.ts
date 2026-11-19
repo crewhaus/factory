@@ -32,7 +32,7 @@ import { SESSION_JSON_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
 import { maskText } from "./mask";
 import { resolveContained, resolveInside } from "./safety";
-import { resolveSessionRoot } from "./sessions";
+import { reachableSessionRoot } from "./sessions";
 import { liveWikiSegments } from "./store-layout";
 
 /** The activity kinds a digest emits. */
@@ -67,6 +67,8 @@ export type ActivityDigest = {
   readonly items: readonly ActivityItem[];
   /** True when the per-harness item cap cut the digest short. */
   readonly truncated: boolean;
+  /** Harnesses whose sessions folder is unreachable, so no session activity is shown for them. */
+  readonly sessionsUnreachable: readonly { readonly harnessId: string; readonly note: string }[];
 };
 
 export type ActivityHarness = {
@@ -102,7 +104,12 @@ function listSafe(dir: string): string[] {
 export function harnessActivity(
   harness: ActivityHarness,
   sinceMs: number,
-): { readonly items: ActivityItem[]; readonly truncated: boolean } {
+): {
+  readonly items: ActivityItem[];
+  readonly truncated: boolean;
+  /** Why no session activity is read: the sessions folder is unreachable. */
+  readonly sessionsNote?: string;
+} {
   const items: ActivityItem[] = [];
   const push = (kind: ActivityKind, atMs: number, label: string, ref: string | null): void => {
     if (!Number.isFinite(atMs) || atMs < sinceMs) return;
@@ -117,9 +124,10 @@ export function harnessActivity(
   };
   const dir = harness.dir;
 
-  // sessions — mtimes only, never a transcript read
-  const { root } = resolveSessionRoot(dir);
-  for (const name of listSafe(root)) {
+  // sessions — mtimes only, never a transcript read, and only from the harness's own folder
+  const reach = reachableSessionRoot(dir);
+  const root = reach.reachable ? reach.root : "";
+  for (const name of reach.reachable ? listSafe(root) : []) {
     if (!SESSION_JSON_RE.test(name)) continue;
     const path = resolveContained(root, name);
     if (path === undefined) continue;
@@ -246,7 +254,11 @@ export function harnessActivity(
 
   items.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
   const truncated = items.length > MAX_ACTIVITY_PER_HARNESS;
-  return { items: items.slice(0, MAX_ACTIVITY_PER_HARNESS), truncated };
+  return {
+    items: items.slice(0, MAX_ACTIVITY_PER_HARNESS),
+    truncated,
+    ...(reach.reachable ? {} : { sessionsNote: reach.note }),
+  };
 }
 
 /** What Home's last boot did to harnesses, as its recovery report records it. */
@@ -304,15 +316,24 @@ export function activityDigest(
   extra: readonly ActivityItem[] = [],
 ): ActivityDigest {
   const all: ActivityItem[] = [...extra];
+  const sessionsUnreachable: { harnessId: string; note: string }[] = [];
   let truncated = false;
   for (const harness of harnesses) {
     const one = harnessActivity(harness, sinceMs);
     if (one.truncated) truncated = true;
+    if (one.sessionsNote !== undefined) {
+      sessionsUnreachable.push({ harnessId: harness.id, note: one.sessionsNote });
+    }
     all.push(...one.items);
   }
   all.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
   if (all.length > MAX_ACTIVITY_ITEMS) truncated = true;
-  return { since: iso(sinceMs), items: all.slice(0, MAX_ACTIVITY_ITEMS), truncated };
+  return {
+    since: iso(sinceMs),
+    items: all.slice(0, MAX_ACTIVITY_ITEMS),
+    truncated,
+    sessionsUnreachable,
+  };
 }
 
 /** Parse a `?since=` value: an ISO timestamp, epoch ms, or `<N>d`/`<N>h`.

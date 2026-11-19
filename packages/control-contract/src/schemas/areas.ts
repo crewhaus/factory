@@ -14,7 +14,7 @@ import { CREATION_SCHEMAS } from "./creation.js";
 
 import { DELEGATION_SCHEMAS } from "./delegation.js";
 
-// import { HOME_SCHEMAS } from "./home.js";
+import { HOME_SCHEMAS } from "./home.js";
 
 // import { INSPECTION_SCHEMAS } from "./inspection.js";
 
@@ -41,7 +41,7 @@ export const AREA_SCHEMAS: readonly Readonly<Record<string, z.ZodTypeAny>>[] = [
 
   DELEGATION_SCHEMAS,
 
-  // HOME_SCHEMAS,
+  HOME_SCHEMAS,
 
   // INSPECTION_SCHEMAS,
 

@@ -48,7 +48,7 @@ import { readJsonlCapped, readTextCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
 import { resolveContained } from "./safety";
 import { readSpecYaml } from "./schedulers";
-import { resolveSessionRoot } from "./sessions";
+import { reachableSessionRoot } from "./sessions";
 import { registryDirName } from "./spec-edit";
 import { asRecord, asString, at, readYamlLoose } from "./yaml-scan";
 
@@ -471,8 +471,10 @@ export function readRouteTimeline(path: string): RouteTimeline {
 
 /** Session ids whose log carries at least one routing line, newest first. */
 function sessionsWithRouting(dir: string): Array<{ id: string; routingLines: number }> {
-  const { root } = resolveSessionRoot(dir);
+  const reach = reachableSessionRoot(dir);
   const out: Array<{ id: string; routingLines: number }> = [];
+  if (!reach.reachable) return out;
+  const root = reach.root;
   let names: string[];
   try {
     names = readdirSync(root).filter((f) => SESSION_JSONL_RE.test(f));
@@ -521,7 +523,9 @@ export const modelsOverview: M3Handler = (ctx) => {
     byRole: costs.byRole,
     byProfile: costs.byProfile,
     byModel: costs.byModel,
+    unknown: costs.unknown,
   };
+  const sessionsReach = reachableSessionRoot(dir);
   const note =
     registry.length === 0 && !pool.declared
       ? "no models: registry and no model_pool anywhere in the spec — this harness serves one declared model"
@@ -540,6 +544,7 @@ export const modelsOverview: M3Handler = (ctx) => {
     freeze: readFreeze(ctx),
     priors: readPriors(ctx),
     sessions: sessionsWithRouting(dir),
+    sessionsNote: sessionsReach.reachable ? null : sessionsReach.note,
     guidance:
       pool.declared && pool.policy === "learned"
         ? "the learned policy exploits the starred arm in each band; `crewhaus route freeze` pins it"
@@ -557,8 +562,18 @@ export const modelsOverview: M3Handler = (ctx) => {
 export const modelRoutes: M3Handler = (ctx) => {
   const dir = requireDir(ctx);
   const sessionId = ctx.params["sess"] as string;
-  const { root } = resolveSessionRoot(dir);
-  const path = resolveContained(root, `${sessionId}.jsonl`);
+  const reach = reachableSessionRoot(dir);
+  if (!reach.reachable) {
+    return {
+      ...absent(reach.note, null),
+      sessionId,
+      entries: [],
+      counts: {},
+      truncated: false,
+      kinds: ROUTING_EVENT_KINDS,
+    };
+  }
+  const path = resolveContained(reach.root, `${sessionId}.jsonl`);
   if (path === undefined || !existsSync(path)) {
     return {
       ...absent(
@@ -750,6 +765,8 @@ export type RouteStats = {
   readonly escalations: number;
   readonly stages: number;
   readonly sessions: number;
+  /** Why the counts are unknown (the sessions folder is unreachable); null when read. */
+  readonly unknown?: string;
 };
 
 /** Stage names that mean "the cheap lane handed this turn upward". */
@@ -757,7 +774,11 @@ const ESCALATION_STAGES = new Set(["escalate", "escalation"]);
 
 /** Fold `model_route` / `model_stage` counts over the harness's session logs. */
 export function foldRouteStats(harnessDir: string): RouteStats {
-  const { root } = resolveSessionRoot(harnessDir);
+  const reach = reachableSessionRoot(harnessDir);
+  if (!reach.reachable) {
+    return { decisions: 0, escalations: 0, stages: 0, sessions: 0, unknown: reach.note };
+  }
+  const root = reach.root;
   let files: string[];
   try {
     files = readdirSync(root).filter((f) => SESSION_JSONL_RE.test(f));
